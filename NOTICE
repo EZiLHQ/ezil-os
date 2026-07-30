@@ -1,0 +1,23 @@
+EZiL-OS
+Copyright (C) 2026 EZiL <contact@ezil.work>
+
+This product is licensed under the GNU Affero General Public License v3.0
+(AGPL-3.0). See the LICENSE file at the root of this repository for the
+full license text.
+
+This repository contains only original EZiL code plus ordinary, unmodified
+third-party dependencies and container-image components (Apache Guacamole,
+Neko, VS Code, Google Chrome, the Cloudflare Sandbox SDK, and their
+transitive npm dependencies). No source code from any prior project has
+been copied into this repository.
+
+For the complete list of third-party components this repository actually
+uses, their licenses, and what each is used for — including a voluntary
+acknowledgement of the Onlook and Puter projects as design/architectural
+influences on EZiL, with no code carried from either — see ATTRIBUTIONS.md
+at the root of this repository.
+
+Nothing in this NOTICE modifies or waives the terms of any individual
+third-party license. Where this NOTICE and an upstream project's own
+license or notice conflict, the upstream project's own terms control for
+that project's code.
