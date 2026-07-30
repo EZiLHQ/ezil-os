@@ -8,6 +8,9 @@ dist-ssr/
 dist-electron/
 !worker/bootstrap/dist
 !worker/bootstrap/dist/workspace-bootstrap.mjs
+app/.next/
+app/next-env.d.ts
+app/tsconfig.tsbuildinfo
 
 # Env / secrets — never commit these
 .env
