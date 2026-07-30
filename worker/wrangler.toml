@@ -1,0 +1,107 @@
+name = "ezil-os-worker"
+main = "src/index.ts"
+compatibility_date = "2026-06-24"
+compatibility_flags = ["nodejs_compat"]
+
+# ── Cloudflare Sandbox container ─────────────────────────────────────────────
+# Runs the EBuilder browser-desktop image (Xvfb + Chrome + x11vnc + guacd +
+# Tomcat/Apache Guacamole, plus the neko desktop-mode stage). instance_type
+# "standard-3" (2 vCPU / 8 GiB / 16 GB disk) — upgraded from standard-1 (user-
+# approved) to remove CPU starvation: no GPU in Cloudflare Containers, Chrome
+# AND VS Code Electron both run --disable-gpu (see Dockerfile/start-neko.sh),
+# so ALL rendering and the WebRTC video encode are software, sharing what was
+# previously half a physical core (standard-1) across Xvfb, two Electron/GUI
+# apps, and the user's own dev-server compile. Account limits (1,500 vCPU /
+# 6 TiB) mean there is no platform ceiling on this — `max_instances` below is
+# a self-imposed concurrency cap, not a resource one. Cost/active-hour and the
+# standard-1 vs standard-3 comparison are documented in the wave-2 report, not
+# repeated here to avoid this comment drifting out of sync with actual
+# Cloudflare pricing.
+[[containers]]
+class_name = "Sandbox"
+image = "./Dockerfile"
+instance_type = "standard-3"
+max_instances = 20
+
+# ── Durable Object binding (backs each Sandbox container) ─────────────────────
+[[durable_objects.bindings]]
+class_name = "Sandbox"
+name = "Sandbox"
+
+# ── Migration registering the Sandbox DO (SQLite storage) ─────────────────────
+[[migrations]]
+new_sqlite_classes = ["Sandbox"]
+tag = "v1"
+
+# ── R2 bucket binding (credential-less workspace mount path) ─────────────────
+# Backs the persistent sandbox workspace. When this binding is present,
+# `ensureWorkspaceMount` prefers `@cloudflare/sandbox`'s R2 egress mount mode
+# (no S3 access keys needed — the Worker's own R2 binding is used, resolved
+# server-side by the Sandbox Durable Object). The `SANDBOX_WORKSPACE_S3_*`
+# vars below remain a fallback for endpoints that are not native R2 (e.g.
+# local Supabase Storage's S3-compatible endpoint).
+[[r2_buckets]]
+binding = "SANDBOX_WORKSPACE_R2_BUCKET"
+bucket_name = "ezil-sandbox-workspaces"
+experimental_remote = true
+
+[dev]
+port = 8787
+local_protocol = "http"
+
+# ── Neko ICE policy (relay-only, fail-closed) ────────────────────────────────
+# `relay` requires a working TURN relay (checkIceConfig fails closed when no
+# TURN provider is configured). The neko server sits behind Cloudflare's
+# HTTP/WS-only edge with no publicly reachable UDP, so media MUST traverse the
+# Cloudflare Realtime TURN relay minted per-session from
+# SANDBOX_NEKO_TURN_KEY_ID + SANDBOX_NEKO_TURN_API_TOKEN (secrets, by name).
+[vars]
+SANDBOX_NEKO_ICE_POLICY = "relay"
+
+# ── Custom domain + wildcard route ────────────────────────────────────────────
+# The @cloudflare/sandbox port proxy requires one-label wildcard subdomains
+# (e.g. https://<port>-<sandbox-id>.ezil.org) to route preview traffic to the
+# running container's exposed port. workers.dev subdomains do not support
+# this pattern, so the wildcard subdomain (not the apex) is routed to this
+# Worker on the ezil.org zone.
+[[routes]]
+pattern = "*.ezil.org/*"
+zone_name = "ezil.org"
+
+# HMAC secret for authenticating EBuilder → Worker calls.
+# Set in production with:  wrangler secret put SANDBOX_HMAC_SECRET
+# When unset (local dev), the Worker skips HMAC verification.
+# ── Neko WebRTC / Cloudflare Realtime TURN (secrets by NAME only) ────────────
+# `neko` desktop-mode media (VS Code pixels + input) travels over WebRTC, which
+# needs a TURN relay behind Cloudflare's HTTP/WS-only edge. The Worker mints
+# short-lived, per-session ephemeral credentials at request time from a
+# long-lived Cloudflare Realtime TURN key, then passes only the ephemeral
+# iceServers into the sandbox process env. The long-lived API token NEVER enters
+# source, git, API responses, or logs — set it as a Worker secret by name:
+#   wrangler secret put SANDBOX_NEKO_TURN_API_TOKEN   # long-lived TURN key API token (secret)
+# The TURN key id is a resource identifier (not a secret); it may be set as a
+# secret too, or as a [vars] entry:
+#   wrangler secret put SANDBOX_NEKO_TURN_KEY_ID
+# Policy + optional TTL bound (defaults/ceiling 1800s = session lifetime):
+#   SANDBOX_NEKO_ICE_POLICY        'relay' | 'production' (fail closed w/o TURN) | 'diagnostic' (default)
+#   SANDBOX_NEKO_TURN_TTL_SECONDS  optional, clamped to [300, 1800]
+#   SANDBOX_NEKO_TURN_URLS         optional static pre-shared TURN URL fallback (non-Cloudflare)
+# [vars] intentionally omitted — secrets must not live in source.
+
+
+# ── S3-compatible workspace bucket (mounted via @cloudflare/sandbox mountBucket) ──
+# Set these as wrangler secrets/vars to give each sandbox a persistent,
+# S3-backed workspace (source of truth after first-seed). Names are generic
+# so any S3-compatible endpoint works (Cloudflare R2, AWS S3, local Supabase
+# Storage's S3-compatible endpoint for dev, etc.) — prefixed
+# `SANDBOX_WORKSPACE_S3_*` to avoid colliding with unrelated AWS/Bedrock vars.
+#   wrangler secret put SANDBOX_WORKSPACE_S3_ENDPOINT
+#   wrangler secret put SANDBOX_WORKSPACE_S3_BUCKET
+#   wrangler secret put SANDBOX_WORKSPACE_S3_ACCESS_KEY_ID
+#   wrangler secret put SANDBOX_WORKSPACE_S3_SECRET_ACCESS_KEY
+# Optional:
+#   SANDBOX_WORKSPACE_S3_PREFIX     — override the per-sandbox prefix (defaults to `/<sandboxId>`)
+#   SANDBOX_WORKSPACE_S3_PROVIDER   — 's3' | 'r2' | 'gcs' (defaults to 's3')
+#   SANDBOX_WORKSPACE_MOUNT_PATH    — in-container mount point (defaults to `/workspace`)
+# When unset, the Worker skips the workspace bucket mount entirely (desktop
+# preview still works; no persistent workspace is attached).

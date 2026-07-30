@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  EZiL OS — explicit Openbox root menu for the neko desktop.
+
+  Provides a usable, provable root menu (right-click on the desktop) with
+  entries to focus either mandatory application. Each entry invokes the same
+  deterministic /usr/local/bin/neko-switch-app.sh helper used by the keyboard
+  shortcuts and the validators, so menu, shortcut, and test drive one code path.
+-->
+<openbox_menu xmlns="http://openbox.org/3.4/menu">
+  <menu id="root-menu" label="EZiL OS">
+    <item label="Focus VS Code">
+      <action name="Execute"><command>/usr/local/bin/neko-switch-app.sh vscode</command></action>
+    </item>
+    <item label="Focus Browser">
+      <action name="Execute"><command>/usr/local/bin/neko-switch-app.sh chromium</command></action>
+    </item>
+    <separator/>
+    <item label="Reconfigure Openbox">
+      <action name="Reconfigure"/>
+    </item>
+  </menu>
+</openbox_menu>

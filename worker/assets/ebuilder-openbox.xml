@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  EZiL OS — explicit, testable Openbox configuration for the neko desktop.
+
+  The pinned neko image's /etc/neko/openbox.xml has NO keyboard section and NO
+  root menu, so app-switching there relied entirely on out-of-band wmctrl calls
+  and was unproven. This config makes the desktop's window management explicit
+  and machine-checkable:
+
+    * Keyboard shortcuts that switch between the two mandatory apps by invoking
+      the same deterministic /usr/local/bin/neko-switch-app.sh helper the
+      validators use, plus a standard Alt-Tab window cycle.
+    * An explicit root menu (ebuilder-menu.xml) with entries to focus either
+      app, so the desktop is usable and the menu is provably present.
+
+  validate-neko-desktop.sh asserts this file is the live Openbox rc AND that it
+  contains the expected keybind/menu wiring, so "shortcuts + root menu exist"
+  becomes positive evidence rather than an assumption.
+-->
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+
+<applications>
+  <!-- Keep the pinned image's intent: VS Code maximized/undecorated/focused. -->
+  <application type="normal" class="Code">
+    <decor>no</decor>
+    <maximized>true</maximized>
+    <focus>yes</focus>
+    <layer>normal</layer>
+  </application>
+  <!-- The mandatory native browser (Google Chrome). Maximize + focus so its
+       window is a full, focusable top-level surface. -->
+  <application type="normal" class="Google-chrome">
+    <decor>no</decor>
+    <maximized>true</maximized>
+    <focus>yes</focus>
+    <layer>normal</layer>
+  </application>
+</applications>
+
+<focus>
+  <focusNew>yes</focusNew>
+  <followMouse>no</followMouse>
+  <focusLast>yes</focusLast>
+</focus>
+
+<placement>
+  <policy>Smart</policy>
+  <center>yes</center>
+  <monitor>Primary</monitor>
+</placement>
+
+<keyboard>
+  <!-- Explicit, deterministic app-switch shortcuts. Both invoke the same
+       helper the validators drive, so the bound key and the tested code path
+       are identical. -->
+  <keybind key="W-1">
+    <action name="Execute"><command>/usr/local/bin/neko-switch-app.sh vscode</command></action>
+  </keybind>
+  <keybind key="W-2">
+    <action name="Execute"><command>/usr/local/bin/neko-switch-app.sh chromium</command></action>
+  </keybind>
+  <keybind key="W-c">
+    <action name="Execute"><command>/usr/local/bin/neko-switch-app.sh vscode</command></action>
+  </keybind>
+  <keybind key="W-e">
+    <action name="Execute"><command>/usr/local/bin/neko-switch-app.sh chromium</command></action>
+  </keybind>
+  <!-- Standard window cycling. -->
+  <keybind key="A-Tab">
+    <action name="NextWindow"/>
+  </keybind>
+  <keybind key="A-S-Tab">
+    <action name="PreviousWindow"/>
+  </keybind>
+</keyboard>
+
+<menu>
+  <file>/etc/neko/ebuilder-menu.xml</file>
+</menu>
+
+<mouse>
+  <context name="Root">
+    <mousebind button="Right" action="Press">
+      <action name="ShowMenu"><menu>root-menu</menu></action>
+    </mousebind>
+  </context>
+</mouse>
+
+</openbox_config>

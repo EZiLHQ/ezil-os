@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<!--
+  EZiL OS — deterministic native-browser landing page.
+
+  The mandatory native browser on the neko desktop MUST come up on a real,
+  non-blank page with a deterministic <title>, so validation can positively
+  assert (via wmctrl/xdotool) that the browser window exists AND is showing
+  the expected EZiL OS content — not an empty about:blank surface. The exact
+  title string below is the contract the window-ready gate and focus/enumeration
+  validators match on ("EZiL OS Browser").
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EZiL OS Browser</title>
+    <style>
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #0b1020;
+        color: #e6edf3;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .card {
+        text-align: center;
+        padding: 3rem 4rem;
+        border: 1px solid #223;
+        border-radius: 16px;
+        background: linear-gradient(160deg, #121a33, #0b1020);
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+      }
+      h1 { margin: 0 0 0.5rem; font-size: 2rem; letter-spacing: 0.5px; }
+      p  { margin: 0.25rem 0; color: #9fb0c8; }
+      .badge {
+        display: inline-block;
+        margin-top: 1rem;
+        padding: 0.35rem 0.9rem;
+        border-radius: 999px;
+        background: #1f6feb;
+        color: #fff;
+        font-size: 0.8rem;
+        letter-spacing: 0.6px;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <h1>EZiL OS Browser</h1>
+      <p>Native browser is running on the EZiL OS desktop.</p>
+      <p>VS Code and this browser are both mandatory desktop applications.</p>
+      <span class="badge" id="ready-badge">DESKTOP READY</span>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,778 @@
+/**
+ * Package-local tests for the Cloudflare Guacamole/Neko sandbox Worker.
+ *
+ * Scope (Phase 1 — Neko as an alternate desktopMode, Guacamole default):
+ *   - desktopMode validation/default
+ *   - deriveSandboxId isolation/ID stability
+ *   - selected-service readiness (portFor) — not just open TCP
+ *   - missing-TURN fail-closed gate
+ *   - URL/hostname normalization for the *.ezil.org preview zone
+ *   - HMAC token verification regression (unsigned/expired/malformed/valid)
+ *   - Guacamole compatibility (mode omitted/'guacamole' behaves identically
+ *     to pre-Neko behavior: port 8080, /guacamole/ readyPath, 'desktop' token)
+ *
+ * No network/container/Docker calls — pure unit tests against exported
+ * helpers. Run with `bun test` (package-local, no root-level gate).
+ */
+
+import { describe, expect, it } from 'bun:test';
+
+describe('resolveDesktopMode', () => {
+  it('defaults to guacamole when nothing is requested and no env default is set', async () => {
+    const { resolveDesktopMode } = await import('./desktop-mode');
+    const result = resolveDesktopMode(undefined, undefined);
+    expect(result).toEqual({ ok: true, mode: 'guacamole' });
+  });
+
+  it('accepts an explicit "guacamole" request', async () => {
+    const { resolveDesktopMode } = await import('./desktop-mode');
+    expect(resolveDesktopMode('guacamole', undefined)).toEqual({ ok: true, mode: 'guacamole' });
+  });
+
+  it('accepts an explicit "neko" request', async () => {
+    const { resolveDesktopMode } = await import('./desktop-mode');
+    expect(resolveDesktopMode('neko', undefined)).toEqual({ ok: true, mode: 'neko' });
+  });
+
+  it('is case-insensitive and trims whitespace', async () => {
+    const { resolveDesktopMode } = await import('./desktop-mode');
+    expect(resolveDesktopMode(' NEKO ', undefined)).toEqual({ ok: true, mode: 'neko' });
+  });
+
+  it('falls back to the env-configured default when the request omits desktopMode', async () => {
+    const { resolveDesktopMode } = await import('./desktop-mode');
+    expect(resolveDesktopMode(undefined, 'neko')).toEqual({ ok: true, mode: 'neko' });
+  });
+
+  it('rejects an unknown mode rather than silently coercing to guacamole', async () => {
+    const { resolveDesktopMode } = await import('./desktop-mode');
+    const result = resolveDesktopMode('novnc', undefined);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain('invalid_desktop_mode');
+      expect(result.error).toContain('novnc');
+    }
+  });
+
+  it('rejects an unknown env default the same way', async () => {
+    const { resolveDesktopMode } = await import('./desktop-mode');
+    const result = resolveDesktopMode(undefined, 'bogus');
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe('checkIceConfig (TURN fail-closed gate)', () => {
+  it('passes in the default diagnostic policy with no TURN configured', async () => {
+    const { checkIceConfig } = await import('./desktop-mode');
+    const result = checkIceConfig({} as never);
+    expect(result).toEqual({ ok: true, policy: 'diagnostic', hasTurn: false });
+  });
+
+  it('fails closed when policy=relay and no TURN URLs are configured', async () => {
+    const { checkIceConfig } = await import('./desktop-mode');
+    const result = checkIceConfig({ SANDBOX_NEKO_ICE_POLICY: 'relay' } as never);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain('turn_required');
+  });
+
+  it('fails closed when policy=production and no TURN URLs are configured', async () => {
+    const { checkIceConfig } = await import('./desktop-mode');
+    const result = checkIceConfig({ SANDBOX_NEKO_ICE_POLICY: 'production' } as never);
+    expect(result.ok).toBe(false);
+  });
+
+  it('passes when policy=relay and TURN URLs ARE configured (never asserts a value, only presence)', async () => {
+    const { checkIceConfig } = await import('./desktop-mode');
+    const result = checkIceConfig({
+      SANDBOX_NEKO_ICE_POLICY: 'relay',
+      SANDBOX_NEKO_TURN_URLS: 'turns:example.invalid:5349',
+    } as never);
+    expect(result).toEqual({ ok: true, policy: 'relay', hasTurn: true });
+  });
+
+  it('never enables TURN itself — result never contains raw credential fields', async () => {
+    const { checkIceConfig } = await import('./desktop-mode');
+    const result = checkIceConfig({
+      SANDBOX_NEKO_ICE_POLICY: 'relay',
+      SANDBOX_NEKO_TURN_URLS: 'turns:example.invalid:5349',
+    } as never);
+    expect(Object.keys(result)).not.toContain('SANDBOX_NEKO_TURN_URLS');
+    expect(JSON.stringify(result)).not.toContain('turns:');
+  });
+});
+
+describe('checkIceConfig passes when a Cloudflare Realtime TURN key is configured', () => {
+  it('treats a TURN key id + api token as a configured relay (presence only)', async () => {
+    const { checkIceConfig } = await import('./desktop-mode');
+    const result = checkIceConfig({
+      SANDBOX_NEKO_ICE_POLICY: 'relay',
+      SANDBOX_NEKO_TURN_KEY_ID: 'key-id-123',
+      SANDBOX_NEKO_TURN_API_TOKEN: 'redacted-token',
+    } as never);
+    expect(result).toEqual({ ok: true, policy: 'relay', hasTurn: true });
+    expect(JSON.stringify(result)).not.toContain('redacted-token');
+  });
+
+  it('fails closed when only a key id (no api token) is present', async () => {
+    const { checkIceConfig } = await import('./desktop-mode');
+    const result = checkIceConfig({
+      SANDBOX_NEKO_ICE_POLICY: 'production',
+      SANDBOX_NEKO_TURN_KEY_ID: 'key-id-123',
+    } as never);
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe('resolveTurnTtlSeconds (bounded ephemeral TTL)', () => {
+  it('defaults to 1800s when unset/invalid', async () => {
+    const { resolveTurnTtlSeconds } = await import('./desktop-mode');
+    expect(resolveTurnTtlSeconds(undefined)).toBe(1800);
+    expect(resolveTurnTtlSeconds('not-a-number')).toBe(1800);
+    expect(resolveTurnTtlSeconds('0')).toBe(1800);
+  });
+
+  it('clamps to the [300, 1800] window (never outlives the ~30m session)', async () => {
+    const { resolveTurnTtlSeconds } = await import('./desktop-mode');
+    expect(resolveTurnTtlSeconds('60')).toBe(300);
+    expect(resolveTurnTtlSeconds('999999')).toBe(1800);
+    expect(resolveTurnTtlSeconds('900')).toBe(900);
+  });
+});
+
+describe('normalizeIceServers', () => {
+  it('wraps a single object and passes arrays through, empty for null', async () => {
+    const { normalizeIceServers } = await import('./desktop-mode');
+    expect(normalizeIceServers(null)).toEqual([]);
+    expect(normalizeIceServers({})).toEqual([]);
+    expect(normalizeIceServers({ iceServers: { urls: 'turn:x:3478' } })).toEqual([{ urls: 'turn:x:3478' }]);
+    expect(normalizeIceServers({ iceServers: [{ urls: ['a'] }, { urls: ['b'] }] })).toHaveLength(2);
+  });
+});
+
+describe('filterBrowserSafeIceServers (drop alternate port :53)', () => {
+  it('removes only the :53 URLs and drops emptied entries', async () => {
+    const { filterBrowserSafeIceServers } = await import('./desktop-mode');
+    const out = filterBrowserSafeIceServers([
+      {
+        urls: ['turn:turn.cloudflare.com:3478?transport=udp', 'turn:turn.cloudflare.com:53?transport=udp'],
+        username: 'u',
+        credential: 'c',
+      },
+      { urls: ['stun:stun.cloudflare.com:53'] },
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].urls).toEqual(['turn:turn.cloudflare.com:3478?transport=udp']);
+    expect(out[0].username).toBe('u');
+  });
+});
+
+describe('buildNekoIceEnv (neko v3 NEKO_WEBRTC_* env, creds via env not argv)', () => {
+  it('returns null for an empty server list', async () => {
+    const { buildNekoIceEnv } = await import('./desktop-mode');
+    expect(buildNekoIceEnv([])).toBeNull();
+  });
+
+  it('emits frontend (browser-safe) + backend (full) JSON with icelite off and trickle on', async () => {
+    const { buildNekoIceEnv } = await import('./desktop-mode');
+    const env = buildNekoIceEnv([
+      {
+        urls: ['turn:turn.cloudflare.com:3478?transport=udp', 'turn:turn.cloudflare.com:53?transport=udp'],
+        username: 'u',
+        credential: 'c',
+      },
+    ]);
+    expect(env).not.toBeNull();
+    expect(env!.NEKO_WEBRTC_ICELITE).toBe('false');
+    expect(env!.NEKO_WEBRTC_ICETRICKLE).toBe('true');
+    expect(env!.NEKO_WEBRTC_ICESERVERS_FRONTEND).not.toContain(':53');
+    expect(env!.NEKO_WEBRTC_ICESERVERS_BACKEND).toContain(':53');
+    expect(Array.isArray(JSON.parse(env!.NEKO_WEBRTC_ICESERVERS_FRONTEND))).toBe(true);
+    expect(Array.isArray(JSON.parse(env!.NEKO_WEBRTC_ICESERVERS_BACKEND))).toBe(true);
+  });
+});
+
+describe('turnGenerateUrl (official Cloudflare Realtime endpoint)', () => {
+  it('targets the generate-ice-servers path for the given key id', async () => {
+    const { turnGenerateUrl } = await import('./desktop-mode');
+    expect(turnGenerateUrl('abc123')).toBe(
+      'https://rtc.live.cloudflare.com/v1/turn/keys/abc123/credentials/generate-ice-servers',
+    );
+  });
+});
+
+// deriveSandboxId, normalizeSandboxHostname, verifyPreviewToken, and the
+// module); their externally observable contracts are covered indirectly via
+// resolveDesktopMode/checkIceConfig above and via existing HMAC/S3-config
+// package-local tests in this directory (validate-workspace-s3-config.test.ts).
+// The following documents the Guacamole-compatibility contract explicitly:
+describe('Guacamole compatibility (Phase 1 non-regression)', () => {
+  it('desktopMode omitted resolves to the exact same mode as pre-Neko behavior', async () => {
+    const { resolveDesktopMode } = await import('./desktop-mode');
+    const omitted = resolveDesktopMode(undefined, undefined);
+    const explicit = resolveDesktopMode('guacamole', undefined);
+    expect(omitted).toEqual(explicit);
+  });
+});
+
+// The exposePort token doubles as a DNS label in the preview hostname. The SDK
+// rejects any token that is not lowercase-alphanumeric-underscore, and a valid
+// hostname label further forbids `_`. A hyphenated token (`neko-desktop`) was
+// rejected live by exposePort. Guard both modes' tokens against regression.
+describe('portFor token is SDK- and hostname-safe (no hyphen/underscore/uppercase)', () => {
+  it('guacamole and neko tokens are lowercase-alphanumeric only', async () => {
+    const { portFor } = await import('./desktop-mode');
+    for (const mode of ['guacamole', 'neko'] as const) {
+      const { token, port } = portFor(mode);
+      expect(token).toMatch(/^[a-z0-9]+$/);
+      expect(port).toBe(mode === 'neko' ? 8181 : 8080);
+    }
+    expect(portFor('neko').token).toBe('nekodesktop');
+    expect(portFor('guacamole').token).toBe('desktop');
+  });
+});
+
+// ── Workspace diagnostic slot contract ────────────────────────────────────────
+// The diag endpoint proves (1) deterministic R2 persistence and (2) A/B/C
+// isolation. Its pure logic (slot allowlist + deterministic marker) lives in
+// ./workspace-diag so it can be unit-tested without the Workers runtime.
+describe('workspace-diag: deterministic marker content', () => {
+  it('is a pure function of the slot name only (no sandbox id / no clock / no entropy)', async () => {
+    const { diagMarkerContent } = await import('./workspace-diag');
+    const a = diagMarkerContent('alpha');
+    const b = diagMarkerContent('alpha');
+    expect(a).toBe(b); // stable across calls (no Date.now / no random)
+    expect(a).toBe('ezil-workspace-diag;slot=alpha;v=1');
+    expect(diagMarkerContent('beta')).not.toBe(a); // slot-scoped
+  });
+
+  it('same slot yields the same SHA-256 (basis for the persistence roundtrip assertion)', async () => {
+    const { diagMarkerContent } = await import('./workspace-diag');
+    const content = diagMarkerContent('persist');
+    const digest = async (s: string) => {
+      const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+      return [...new Uint8Array(buf)].map((x) => x.toString(16).padStart(2, '0')).join('');
+    };
+    expect(await digest(content)).toBe(await digest(diagMarkerContent('persist')));
+  });
+
+  it('contains no secrets/credentials/user data', async () => {
+    const { diagMarkerContent } = await import('./workspace-diag');
+    const content = diagMarkerContent('x');
+    expect(content).not.toMatch(/secret|token|key|password/i);
+  });
+});
+
+describe('workspace-diag: parseDiagRequest (op + slot allowlist)', () => {
+  it('defaults op to "ensure" (idempotent write) and slot to "default"', async () => {
+    const { parseDiagRequest } = await import('./workspace-diag');
+    const r = parseDiagRequest(undefined, undefined);
+    expect(r).toEqual({ ok: true, op: 'ensure', slot: 'default', write: true });
+  });
+
+  it('marks write vs read-only ops correctly', async () => {
+    const { parseDiagRequest } = await import('./workspace-diag');
+    for (const op of ['write', 'ensure']) {
+      const r = parseDiagRequest(op, 's');
+      expect(r.ok && r.write).toBe(true);
+    }
+    for (const op of ['stat', 'read', 'absent']) {
+      const r = parseDiagRequest(op, 's');
+      expect(r.ok && r.write).toBe(false);
+    }
+  });
+
+  it('lowercases and accepts allowlisted slot names', async () => {
+    const { parseDiagRequest } = await import('./workspace-diag');
+    const r = parseDiagRequest('STAT', 'Marker.A-1_b');
+    expect(r).toEqual({ ok: true, op: 'stat', slot: 'marker.a-1_b', write: false });
+  });
+
+  it('rejects an unknown op rather than silently coercing', async () => {
+    const { parseDiagRequest } = await import('./workspace-diag');
+    const r = parseDiagRequest('delete', 's');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain('diag_invalid_op');
+  });
+
+  it('rejects path traversal / separators / shell metacharacters in the slot', async () => {
+    const { parseDiagRequest } = await import('./workspace-diag');
+    for (const bad of ['../escape', 'a/b', '.hidden', "x';rm -rf /", 'has space', '', 'x'.repeat(65)]) {
+      const r = parseDiagRequest('write', bad);
+      expect(r.ok, `slot ${JSON.stringify(bad)} must be rejected`).toBe(false);
+      if (!r.ok) expect(r.error).toContain('diag_invalid_slot');
+    }
+  });
+
+  it('maps slots to a deterministic hidden file at the mount root (no mkdir needed)', async () => {
+    const { DIAG_SLOT_PREFIX, diagSlotFile } = await import('./workspace-diag');
+    // Hidden (leading dot), fixed prefix, no path separator → resolves to
+    // exactly one file directly under the writable mount root, so the R2 FUSE
+    // mount never has to `mkdir` (which it rejects with EPERM on fresh mounts).
+    expect(DIAG_SLOT_PREFIX).toBe('.ezil-diag-');
+    expect(diagSlotFile('default')).toBe('.ezil-diag-default');
+    expect(diagSlotFile('marker.a-1_b')).toBe('.ezil-diag-marker.a-1_b');
+    expect(diagSlotFile('x')).not.toContain('/');
+  });
+});
+
+describe('workspace-diag: diagDisabled kill-switch (non-secret, enabled by default)', () => {
+  it('is enabled (not disabled) when the flag is unset/empty', async () => {
+    const { diagDisabled } = await import('./workspace-diag');
+    expect(diagDisabled(undefined)).toBe(false);
+    expect(diagDisabled('')).toBe(false);
+    expect(diagDisabled('on')).toBe(false);
+    expect(diagDisabled('true')).toBe(false);
+  });
+
+  it('disables on off/false/0/disabled/no (case/space-insensitive)', async () => {
+    const { diagDisabled } = await import('./workspace-diag');
+    for (const v of ['off', 'FALSE', ' 0 ', 'Disabled', 'no']) {
+      expect(diagDisabled(v)).toBe(true);
+    }
+  });
+});
+
+// ── Optional mission-signing HMAC alias ───────────────────────────────────────
+// Proves the additive alias contract: the primary/compatibility secret is
+// authoritative and unchanged; the optional SANDBOX_MISSION_HMAC_SECRET is
+// accepted ONLY when present (never required, never a replacement); invalid
+// signatures still fail; freshness/canonicalization are preserved; and no
+// secret material is ever surfaced in the verification result.
+describe('HMAC mission-alias: resolvePreviewSecrets', () => {
+  it('returns only the primary secret when no mission alias is bound', async () => {
+    const { resolvePreviewSecrets } = await import('./hmac');
+    expect(resolvePreviewSecrets({ SANDBOX_HMAC_SECRET: 'primary' })).toEqual(['primary']);
+    expect(resolvePreviewSecrets({ CLOUDFLARE_GUACAMOLE_HMAC_SECRET: 'compat' })).toEqual([
+      'compat',
+    ]);
+  });
+
+  it('appends the mission alias only when present (absence changes nothing)', async () => {
+    const { resolvePreviewSecrets } = await import('./hmac');
+    expect(
+      resolvePreviewSecrets({ SANDBOX_HMAC_SECRET: 'primary', SANDBOX_MISSION_HMAC_SECRET: 'mission' }),
+    ).toEqual(['primary', 'mission']);
+    // Primary stays first/authoritative; a blank alias is ignored (never
+    // accidentally disables verification or reorders precedence).
+    expect(
+      resolvePreviewSecrets({ SANDBOX_HMAC_SECRET: 'primary', SANDBOX_MISSION_HMAC_SECRET: '   ' }),
+    ).toEqual(['primary']);
+  });
+
+  it('never lets the mission alias alone act as primary (empty set stays empty)', async () => {
+    const { resolvePreviewSecrets } = await import('./hmac');
+    // With no primary at all the worker is in local-dev mode; a mission alias is
+    // still surfaced, but it can only ever be additive, never a stand-in for a
+    // configured primary secret in production (primary is always index 0 there).
+    expect(resolvePreviewSecrets({ SANDBOX_MISSION_HMAC_SECRET: 'mission' })).toEqual(['mission']);
+    expect(resolvePreviewSecrets({})).toEqual([]);
+  });
+});
+
+describe('HMAC mission-alias: verifyPreviewToken', () => {
+  const mint = async (secret: string, ts = Date.now()) => {
+    const { hmacSha256Hex, PREVIEW_TOKEN_PAYLOAD } = await import('./hmac');
+    const sig = await hmacSha256Hex(secret, PREVIEW_TOKEN_PAYLOAD(ts));
+    return `t=${ts},v1=${sig}`;
+  };
+
+  it('accepts a signature from the PRIMARY secret (non-regression)', async () => {
+    const { verifyPreviewToken, resolvePreviewSecrets } = await import('./hmac');
+    const secrets = resolvePreviewSecrets({ SANDBOX_HMAC_SECRET: 'primary' });
+    const token = await mint('primary');
+    expect(await verifyPreviewToken(token, secrets)).toEqual({ ok: true });
+  });
+
+  it('still accepts the PRIMARY signature when the mission alias is ALSO present', async () => {
+    const { verifyPreviewToken, resolvePreviewSecrets } = await import('./hmac');
+    const secrets = resolvePreviewSecrets({
+      SANDBOX_HMAC_SECRET: 'primary',
+      SANDBOX_MISSION_HMAC_SECRET: 'mission',
+    });
+    const token = await mint('primary');
+    expect(await verifyPreviewToken(token, secrets)).toEqual({ ok: true });
+  });
+
+  it('accepts a signature from the optional MISSION secret when it is present', async () => {
+    const { verifyPreviewToken, resolvePreviewSecrets } = await import('./hmac');
+    const secrets = resolvePreviewSecrets({
+      SANDBOX_HMAC_SECRET: 'primary',
+      SANDBOX_MISSION_HMAC_SECRET: 'mission',
+    });
+    const token = await mint('mission');
+    expect(await verifyPreviewToken(token, secrets)).toEqual({ ok: true });
+  });
+
+  it('REJECTS a mission-signed token when the mission alias is ABSENT (no effect)', async () => {
+    const { verifyPreviewToken, resolvePreviewSecrets } = await import('./hmac');
+    const secrets = resolvePreviewSecrets({ SANDBOX_HMAC_SECRET: 'primary' });
+    const token = await mint('mission');
+    const res = await verifyPreviewToken(token, secrets);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toBe('hmac_signature_mismatch');
+  });
+
+  it('rejects a signature from an unrelated/invalid secret even with the alias present', async () => {
+    const { verifyPreviewToken, resolvePreviewSecrets } = await import('./hmac');
+    const secrets = resolvePreviewSecrets({
+      SANDBOX_HMAC_SECRET: 'primary',
+      SANDBOX_MISSION_HMAC_SECRET: 'mission',
+    });
+    const token = await mint('attacker');
+    const res = await verifyPreviewToken(token, secrets);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toBe('hmac_signature_mismatch');
+  });
+
+  it('preserves token freshness (expired timestamp fails before signature check)', async () => {
+    const { verifyPreviewToken, resolvePreviewSecrets } = await import('./hmac');
+    const secrets = resolvePreviewSecrets({
+      SANDBOX_HMAC_SECRET: 'primary',
+      SANDBOX_MISSION_HMAC_SECRET: 'mission',
+    });
+    const stale = Date.now() - 10 * 60 * 1000; // well past the 5-min window
+    const token = await mint('mission', stale);
+    const res = await verifyPreviewToken(token, secrets);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toBe('hmac_token_expired');
+  });
+
+  it('rejects unsigned/malformed requests when any secret is configured', async () => {
+    const { verifyPreviewToken, resolvePreviewSecrets } = await import('./hmac');
+    const secrets = resolvePreviewSecrets({
+      SANDBOX_HMAC_SECRET: 'primary',
+      SANDBOX_MISSION_HMAC_SECRET: 'mission',
+    });
+    const unsigned = await verifyPreviewToken(undefined, secrets);
+    expect(unsigned.ok).toBe(false);
+    if (!unsigned.ok) expect(unsigned.error).toContain('hmac_required');
+    const malformed = await verifyPreviewToken('not-a-token', secrets);
+    expect(malformed.ok).toBe(false);
+    if (!malformed.ok) expect(malformed.error).toBe('hmac_malformed_token');
+  });
+
+  it('never leaks secret material in the verification result', async () => {
+    const { verifyPreviewToken, resolvePreviewSecrets } = await import('./hmac');
+    const secrets = resolvePreviewSecrets({
+      SANDBOX_HMAC_SECRET: 'primary-secret-value',
+      SANDBOX_MISSION_HMAC_SECRET: 'mission-secret-value',
+    });
+    const results = [
+      await verifyPreviewToken(await mint('mission-secret-value'), secrets),
+      await verifyPreviewToken(await mint('attacker'), secrets),
+    ];
+    for (const r of results) {
+      const serialized = JSON.stringify(r);
+      expect(serialized).not.toContain('primary-secret-value');
+      expect(serialized).not.toContain('mission-secret-value');
+    }
+  });
+});
+
+// ── Wave 4B2A: sealed workspace-startup delivery is env-only, neko-only ───────
+// The sealed delivery carries a short-lived capability + nonce, so it MUST reach
+// the container startup ENVIRONMENT (`EZIL_WORKSPACE_STARTUP_DELIVERY`) and
+// NEVER be interpolated into the `startProcess` command string / argv (where it
+// would show up in a process listing). These are static source assertions on
+// `ensureDesktop` — cheap, deterministic guards against a regression that would
+// move the value onto the command line or drop the neko-only gate.
+describe('sealed workspace-startup delivery — env-not-argv contract', () => {
+  it('forwards the delivery only through the startProcess env, never the command string', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+
+    // The env key exists and is set from the delivery inside an env object.
+    expect(src).toContain('EZIL_WORKSPACE_STARTUP_DELIVERY: startupDelivery');
+    // ...and is spread into the startProcess `env`, never the command template.
+    expect(src).toContain('...startupEnv');
+
+    // The command template passed to startProcess must NOT interpolate the
+    // delivery (argv/process-listing exposure). Assert the literal command
+    // string carries only DESKTOP_MODE, not the sealed value.
+    expect(src).toContain('`DESKTOP_MODE=${mode} bash /usr/local/bin/start-desktop.sh`');
+    expect(src).not.toContain('EZIL_WORKSPACE_STARTUP_DELIVERY=${');
+    expect(src).not.toContain('${startupDelivery}');
+  });
+
+  it('gates the delivery to neko mode both at the call site and inside ensureDesktop', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    // Call site only forwards the delivery for neko; guacamole always gets null.
+    expect(src).toContain("mode === 'neko' ? (body.startupDelivery ?? null) : null");
+    // ensureDesktop double-checks the neko gate before populating the env.
+    expect(src).toContain("mode === 'neko' && startupDelivery");
+  });
+
+  it('forwards the mounted workspace root only through the startProcess env, never the command string', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+
+    // The env key exists and is set from the resolved workspace root inside an env object.
+    expect(src).toContain('EZIL_WORKSPACE_ROOT: workspaceRoot');
+    // ...and is spread into the startProcess `env`, never the command template.
+    expect(src).toContain('...workspaceRootEnv');
+
+    // The command template passed to startProcess must NOT interpolate the
+    // workspace root (argv/process-listing exposure).
+    expect(src).toContain('`DESKTOP_MODE=${mode} bash /usr/local/bin/start-desktop.sh`');
+    expect(src).not.toContain('EZIL_WORKSPACE_ROOT=${');
+    expect(src).not.toContain('${workspaceRoot}');
+  });
+
+  it('gates the workspace root to neko mode and forwards the call-site mount decision unchanged', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    // Call site forwards the mounted path (or null) regardless of mode; ensureDesktop gates it.
+    expect(src).toContain('workspace.mounted ? workspace.mountPath ?? null : null');
+    // ensureDesktop only populates EZIL_WORKSPACE_ROOT for neko when a root is present.
+    expect(src).toContain("mode === 'neko' && workspaceRoot");
+    // Neko gate for the sealed delivery remains unchanged alongside the new param.
+    expect(src).toContain("mode === 'neko' && startupDelivery");
+  });
+});
+
+// ── Workspace mount prefix — write/read path parity ─────────────────────────
+//
+// The whole point of `ensureWorkspaceMount` mounting the R2 workspace bucket
+// is that the container sees the SAME objects the write path
+// (`ProjectFilesAdapter` / `getProjectBranchScope()` in
+// `apps/web/client/src/server/lib/project-files-adapter.ts`) already wrote.
+// That write path computes object keys as
+// `${projectId}/branches/${branch}/${relativePath}` — no leading slash. The
+// `prefix` passed to `mountBucket()` DOES carry a leading slash (a hard
+// requirement of `@cloudflare/sandbox`'s own `mountBucket` validation — it
+// throws `InvalidMountConfigError` otherwise), but the SDK strips that
+// leading slash internally before touching R2, so the ACTUAL R2 key prefix
+// used for every list/get/put through the mount still matches the write
+// path exactly (see `ensureWorkspaceMount`'s doc comment for the full
+// SDK-source citation). These are static source assertions (same style as
+// the sealed-delivery/cpu-diag suites above) because `ensureWorkspaceMount`
+// calls `sandbox.mountBucket` / `sandbox.exec`, which require the Workers
+// runtime and cannot be safely unit tested by importing `./index` directly
+// (see `boot.test.ts`).
+describe('workspace mount prefix — derived from {projectId, branch}, not sandboxId', () => {
+  it('ensureWorkspaceMount takes a {projectId, branch} object, not a bare sandboxId string', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain(
+      "{ projectId, branch }: { projectId: string; branch: string },",
+    );
+  });
+
+  it("computes the default prefix as `/${projectId}/branches/${branch}` (leading slash required by mountBucket's own validation, stripped internally before hitting R2)", async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain('config.prefix ?? `/${projectId}/branches/${branch}`');
+  });
+
+  it('never falls back to the old sandboxId-derived prefix', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    // The pre-fix default that never matched the write path.
+    expect(src).not.toContain('config.prefix ?? `/${sandboxId}`');
+  });
+
+  it('all three call sites pass an explicit {projectId, branch} object into ensureWorkspaceMount', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const callSites = [...src.matchAll(/ensureWorkspaceMount\(sandbox, env, ([\s\S]{0,120}?)\)/g)];
+    expect(callSites.length).toBe(3);
+    for (const call of callSites) {
+      const args = call[1] ?? '';
+      // Every call site supplies both fields — never the bare sandboxId
+      // string the old signature took.
+      expect(args).toContain('projectId:');
+      expect(args).toContain('branch:');
+    }
+  });
+
+  it('the /sandbox/preview call site sources projectId/branch from the request body, defaulting branch to \'main\' explicitly', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain('const workspaceProjectId = scopeId;');
+    expect(src).toContain("const workspaceBranch = body.branch?.trim() || 'main';");
+  });
+
+  // Regression guard for the cross-tenant prefix hazard: a missing
+  // projectId/scopeId used to silently fall back to a globally-shared
+  // `'default'` R2 prefix (`/default/branches/<branch>`) — any two callers
+  // who both omitted it landed on the exact same workspace. The fallback is
+  // now deleted; the request is rejected instead.
+  it('no longer falls back to a shared "default" R2 prefix when the scope id is omitted', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).not.toContain("body.projectId ?? 'default'");
+    expect(src).not.toContain("const workspaceProjectId = body.projectId ?? 'default';");
+  });
+
+  it('rejects a /sandbox/preview request whose scope id (projectId) is missing/blank with a 400, before deriving any sandbox identity', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain('const scopeId = body.projectId?.trim();');
+    expect(src).toContain("if (!scopeId) {");
+    expect(src).toContain("return json({ ok: false, error: 'missing_project_id' }, 400);");
+    // The rejection must happen BEFORE sandboxId derivation / workspace mount,
+    // not after — it should structurally precede both in the source.
+    const rejectIdx = src.indexOf("return json({ ok: false, error: 'missing_project_id' }, 400);");
+    const deriveIdx = src.indexOf('const sandboxId = deriveSandboxId(');
+    expect(rejectIdx).toBeGreaterThan(-1);
+    expect(deriveIdx).toBeGreaterThan(-1);
+    expect(rejectIdx).toBeLessThan(deriveIdx);
+  });
+});
+
+// ── R2 hydrate/flush replaces mountBucket() for the r2-binding path ─────────
+//
+// `ensureWorkspaceMount` / `ensureWorkspaceHydratedFromR2` / `EzilSandboxDO`
+// call `@cloudflare/sandbox` (`sandbox.exec`, `sandbox.mountBucket`,
+// `sandbox.writeFile`, DO `schedule()`, ...), which require the Workers
+// runtime and cannot be safely unit tested by importing `./index` directly
+// (see `boot.test.ts` and the "workspace mount prefix" suite's own doc
+// comment above). These are static source assertions in the same style —
+// the actual hydrate/flush LOGIC (diffing, ignore list, no-delete guarantee,
+// pagination, the empty-prefix template-seed decision inputs) is unit
+// tested directly against in-memory fakes in `./workspace-persist.test.ts`
+// and `./workspace-seed.test.ts`.
+describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/flush', () => {
+  it('the r2-binding branch of ensureWorkspaceMount no longer calls sandbox.mountBucket()', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const r2BranchMatch = src.match(
+      /if \(config\.mode === 'r2-binding'\) \{[\s\S]*?\n {2}\}\n\n {2}\/\/ ── Generic S3-compatible fallback/,
+    );
+    expect(r2BranchMatch).not.toBeNull();
+    expect(r2BranchMatch![0]).not.toContain('sandbox.mountBucket');
+    expect(r2BranchMatch![0]).toContain('ensureWorkspaceHydratedFromR2');
+  });
+
+  it('the generic (non-R2) S3-compatible fallback branch is left mounting via s3fs, deliberately unchanged', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    // Exactly one remaining `sandbox.mountBucket` CALL site (not doc-comment
+    // mentions) — the s3 fallback.
+    expect((src.match(/await sandbox\.mountBucket\(/g) ?? []).length).toBe(1);
+  });
+
+  it('empty prefix still template-seeds via the unchanged atomic sentinel (seedWorkspaceIfAbsent), not a fresh mechanism', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain('if (initiallyEmpty) {');
+    expect(src).toContain('const seedOutcome = await seedWorkspaceIfAbsent({');
+    // The template copy itself stays a pure local-disk `cp -a` — it was
+    // never mount-dependent, so it is untouched by the hydrate/flush rewrite.
+    expect(src).toContain(
+      '`[ -d /opt/ezil-sandbox-template ] && cp -a /opt/ezil-sandbox-template/. ${mountPath}/ || true`',
+    );
+  });
+
+  it('falls through to a real hydrateWorkspaceFromR2 pass whenever the atomic seed did not seed (lost race / not empty / list failed / etc.)', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain('if (!hydrateOk) {');
+    expect(src).toContain('const outcome = await hydrateWorkspaceFromR2({');
+  });
+
+  it('every hydrate attempt (success or failure) is recorded via recordHydrationOutcome — the flush gate', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    // Called unconditionally at the end of ensureWorkspaceHydratedFromR2 —
+    // not only inside the `if (hydrateOk)` branch — so a failed re-hydrate
+    // correctly flips the DO-storage hydrated flag back off.
+    expect(src).toContain('await recordHydrationOutcome(sandbox, realPrefix, mountPath, hydrateOk);');
+  });
+
+  it('EzilSandboxDO is exported as `Sandbox` (same DO binding name — zero wrangler.toml changes) and uses schedule(), not alarm()', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain('export { EzilSandboxDO as Sandbox };');
+    expect(src).toContain("this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, 'flushWorkspaceScheduled')");
+    // Must NOT override the SDK's reserved `alarm()` container-keepalive hook.
+    expect(src).not.toMatch(/class EzilSandboxDO[\s\S]*?\basync alarm\s*\(/);
+  });
+
+  it('flush is invoked explicitly before the preview response AND before terminate, in addition to the alarm loop', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain('await sandbox.flushWorkspaceNow();');
+    const callSites = [...src.matchAll(/await sandbox\.flushWorkspaceNow\(\);/g)];
+    expect(callSites.length).toBe(2); // handlePreview (pre-handoff) + handleTerminate (pre-destroy)
+  });
+
+  it('the flush interval is 10 seconds', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain('const WORKSPACE_FLUSH_INTERVAL_SECONDS = 10;');
+  });
+});
+
+// ── /sandbox/preview request contract — `branch` ────────────────────────────
+describe('PreviewBody request contract carries `branch`', () => {
+  it('declares an optional `branch` field alongside `projectId`', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const bodyMatch = src.match(/interface PreviewBody \{[\s\S]*?\n\}/);
+    expect(bodyMatch).not.toBeNull();
+    const bodySrc = bodyMatch?.[0] ?? '';
+    expect(bodySrc).toContain('projectId?: string;');
+    expect(bodySrc).toContain('branch?: string;');
+  });
+});
+
+// ── CPU-saturation diagnostic wiring — flag forwarding + retrieval route ────
+//
+// The pure command-building/parsing/flag-normalization logic lives in
+// `./cpu-diag` and is unit-tested there (`cpu-diag.test.ts`). These tests
+// prove the two things a pure-function suite cannot: (1) the Worker-side flag
+// is actually threaded from `Env` through `ensureDesktop` into the container
+// process env ONLY when explicitly enabled (env-not-argv, mode-gated, default
+// OFF — mirrors the sealed workspace-startup delivery tests above), and (2)
+// the retrieval route is actually registered and reuses the exact same HMAC
+// envelope (`verifyPreviewToken` + `resolvePreviewSecrets`) as
+// `workspace-diag`/`twen` — so it inherits the shared HMAC suite's
+// required/malformed/expired/mismatch coverage, exactly like `twen.test.ts`
+// documents for the Twen route.
+describe('cpu-diag: flag forwarded only when set', () => {
+  it('Env carries EZIL_NEKO_CPU_DIAG_ENABLED as a non-secret, optional string (default OFF)', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain('EZIL_NEKO_CPU_DIAG_ENABLED?: string;');
+  });
+
+  it('ensureDesktop accepts the flag and normalizes it via cpuDiagFlagEnabled before forwarding', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain('cpuDiagFlag: string | undefined = undefined,');
+    expect(src).toContain(
+      "mode === 'neko' && cpuDiagFlagEnabled(cpuDiagFlag) ? { EZIL_NEKO_CPU_DIAG_ENABLED: '1' } : {}",
+    );
+  });
+
+  it('is merged into startProcess env alongside the other opt-in envs, never the command string', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain('...workspaceRootEnv, ...cpuDiagEnv');
+    // Same command-template guard as the sealed-delivery tests: no interpolation leak.
+    expect(src).toContain('`DESKTOP_MODE=${mode} bash /usr/local/bin/start-desktop.sh`');
+    expect(src).not.toContain('EZIL_NEKO_CPU_DIAG_ENABLED=${');
+  });
+
+  it('the /sandbox/preview call site forwards env.EZIL_NEKO_CPU_DIAG_ENABLED (only set when the Worker var/secret is set)', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain('env.EZIL_NEKO_CPU_DIAG_ENABLED,');
+  });
+});
+
+describe('cpu-diag: retrieval route (HMAC-authed, bounded, degrades cleanly)', () => {
+  it('registers POST /sandbox/:name/cpu-diag behind the SANDBOX_CPU_DIAG kill-switch', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain(String.raw`/^\/sandbox\/([^/]+)\/cpu-diag$/`);
+    expect(src).toContain('cpuDiagRouteDisabled(env.SANDBOX_CPU_DIAG)');
+    expect(src).toContain("json({ ok: false, error: 'cpu_diag_disabled' }, 404)");
+  });
+
+  it('handleCpuDiag reuses the exact preview-token HMAC envelope (same as workspace-diag/twen)', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const fnMatch = src.match(/async function handleCpuDiag\([\s\S]*?\n}\n/);
+    expect(fnMatch).not.toBeNull();
+    const fnSrc = fnMatch?.[0] ?? '';
+    expect(fnSrc).toContain('verifyPreviewToken(body.token, resolvePreviewSecrets(env))');
+    expect(fnSrc).toContain("return json({ ok: false, error: auth.error }, 401);");
+  });
+
+  it('returns bounded content read via cpuDiagContentCommand with the resolved maxLines cap', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    expect(src).toContain('const maxLines = resolveCpuDiagMaxLines(body.maxLines);');
+    expect(src).toContain('cpuDiagContentCommand(CPU_DIAG_FILE, CPU_DIAG_MAX_BYTES, maxLines)');
+    // truncated is derived from BOTH the line cap and the byte ceiling, so a
+    // pathologically-long-line file can't silently evade the cap either.
+    expect(src).toContain('stat.totalLines > returnedLines || stat.bytes > CPU_DIAG_MAX_BYTES');
+  });
+
+  it('degrades cleanly (200, ok:true, exists:false) instead of a 500 when the file is absent', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const fnMatch = src.match(/async function handleCpuDiag\([\s\S]*?\n}\n/);
+    const fnSrc = fnMatch?.[0] ?? '';
+    expect(fnSrc).toContain('if (!stat.exists) {');
+    expect(fnSrc).toContain("ok: true,");
+    expect(fnSrc).toContain('exists: false,');
+    expect(fnSrc).not.toMatch(/if \(!stat\.exists\) \{[\s\S]{0,400}?, 500\)/);
+  });
+});
+

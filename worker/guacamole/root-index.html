@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>EBuilder preview</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      display: flex; align-items: center; justify-content: center;
+      background: #0b0d12; color: #e6e8ee;
+      font: 500 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    }
+    .box { text-align: center; max-width: 30rem; padding: 2rem; }
+    .spinner {
+      width: 40px; height: 40px; margin: 0 auto 1.25rem;
+      border: 3px solid rgba(255,255,255,.15); border-top-color: #5b8cff;
+      border-radius: 50%; animation: spin .9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    h1 { font-size: 1.05rem; font-weight: 600; margin: 0 0 .35rem; }
+    p  { margin: .25rem 0; color: #99a0b3; font-size: .85rem; }
+    a  { color: #7ea2ff; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <div class="spinner" id="spinner"></div>
+    <h1 id="title">Starting live preview…</h1>
+    <p id="detail">Connecting to the browser desktop through Apache Guacamole.</p>
+    <p id="fallback" class="hidden">
+      Taking longer than expected — <a href="/guacamole/">open the Guacamole client</a>.
+    </p>
+  </div>
+
+  <script>
+    // EBuilder auto-connect shim.
+    //
+    // Loads ONLY genuine Apache Guacamole resources (no noVNC anywhere):
+    //   1. POST /guacamole/api/tokens  (username=preview) → auth token + data source(s)
+    //   2. GET  /guacamole/api/session/data/<ds>/connections → discover the
+    //      single "desktop" connection identifier (works regardless of the file
+    //      auth data-source name, which we never hard-code)
+    //   3. redirect this frame to the Guacamole HTML5 client, deep-linked to that
+    //      connection: /guacamole/#/client/<clientId>?token=<token>
+    //
+    // On any failure it falls back to the real Guacamole login UI at /guacamole/.
+    (function () {
+      'use strict';
+
+      var GUAC = '/guacamole';
+      var USER = 'preview';
+      var PASS = 'preview';
+      var MAX_ATTEMPTS = 6;      // ~ retry while Tomcat finishes warming the webapp
+      var RETRY_DELAY_MS = 1500;
+
+      function fail(reason) {
+        // Surface the genuine Guacamole login instead of a dead end.
+        try { console.warn('[ebuilder-preview] falling back to /guacamole/:', reason); } catch (e) {}
+        window.location.replace(GUAC + '/');
+      }
+
+      function showFallbackHint() {
+        var el = document.getElementById('fallback');
+        if (el) el.classList.remove('hidden');
+      }
+
+      // Guacamole client identifier = base64( id \0 'c' \0 dataSource ).
+      function clientId(id, dataSource) {
+        return btoa(id + '\u0000' + 'c' + '\u0000' + dataSource);
+      }
+
+      function getToken() {
+        var body = 'username=' + encodeURIComponent(USER) +
+                   '&password=' + encodeURIComponent(PASS);
+        return fetch(GUAC + '/api/tokens', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body,
+          credentials: 'same-origin'
+        }).then(function (r) {
+          if (!r.ok) throw new Error('tokens HTTP ' + r.status);
+          return r.json();
+        });
+      }
+
+      // Try each candidate data source until one exposes a connection.
+      function findConnection(token, sources) {
+        var i = 0;
+        function next() {
+          if (i >= sources.length) throw new Error('no connections in any data source');
+          var ds = sources[i++];
+          return fetch(GUAC + '/api/session/data/' + encodeURIComponent(ds) +
+                       '/connections?token=' + encodeURIComponent(token), {
+            credentials: 'same-origin'
+          }).then(function (r) {
+            return r.ok ? r.json() : {};
+          }).then(function (map) {
+            var ids = map && typeof map === 'object' ? Object.keys(map) : [];
+            if (ids.length) return { id: ids[0], dataSource: ds };
+            return next();
+          }).catch(function () { return next(); });
+        }
+        return next();
+      }
+
+      function connect() {
+        return getToken().then(function (auth) {
+          var token = auth && auth.authToken;
+          if (!token) throw new Error('missing authToken');
+
+          // Prefer the primary data source, then any others advertised.
+          var sources = [];
+          if (auth.dataSource) sources.push(auth.dataSource);
+          (auth.availableDataSources || []).forEach(function (ds) {
+            if (sources.indexOf(ds) === -1) sources.push(ds);
+          });
+          if (!sources.length) sources.push('default');
+
+          return findConnection(token, sources).then(function (conn) {
+            var id = clientId(conn.id, conn.dataSource);
+            // Navigate THIS frame (the EBuilder canvas iframe) into the client.
+            window.location.replace(
+              GUAC + '/#/client/' + encodeURIComponent(id) +
+              '?token=' + encodeURIComponent(token)
+            );
+          });
+        });
+      }
+
+      function attempt(n) {
+        connect().catch(function (err) {
+          if (n + 1 >= MAX_ATTEMPTS) return fail(err);
+          if (n + 1 === Math.floor(MAX_ATTEMPTS / 2)) showFallbackHint();
+          setTimeout(function () { attempt(n + 1); }, RETRY_DELAY_MS);
+        });
+      }
+
+      if (window.fetch && window.btoa) {
+        attempt(0);
+      } else {
+        fail('browser too old for auto-connect');
+      }
+    })();
+  </script>
+</body>
+</html>

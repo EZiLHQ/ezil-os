@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  EBuilder preview desktop — Apache Guacamole file-based auth.
+
+  Defines a single "preview" user whose only connection ("desktop") is a VNC
+  session to the local x11vnc backend started by start-desktop.sh. The root
+  landing page (Tomcat ROOT/index.html) authenticates as this user through the
+  Guacamole REST API and deep-links straight into the "desktop" connection, so
+  the EBuilder canvas shows the live browser with no manual login.
+
+  These credentials never leave the container: guacd and x11vnc are bound to
+  loopback only, and the connection is reached exclusively via the Guacamole
+  WebSocket tunnel that the Worker proxies.
+-->
+<user-mapping>
+    <authorize username="preview" password="preview">
+        <connection name="desktop">
+            <protocol>vnc</protocol>
+            <!-- x11vnc backend: loopback, no password (-nopw), RFB port 5901. -->
+            <param name="hostname">127.0.0.1</param>
+            <param name="port">5901</param>
+            <param name="color-depth">24</param>
+        </connection>
+    </authorize>
+</user-mapping>

@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output (except intentionally-committed, pre-built bundles the
+# Docker image COPYs at build time)
+dist/
+dist-ssr/
+dist-electron/
+!worker/bootstrap/dist
+!worker/bootstrap/dist/workspace-bootstrap.mjs
+
+# Env / secrets — never commit these
+.env
+.env.production
+.env.development
+.env.test
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Cloudflare Workers local runtime state (wrangler dev)
+.wrangler/
+.wrangler/state/
+.wrangler/tmp/
+
+# OS / editor cruft
+.DS_Store
+*.log

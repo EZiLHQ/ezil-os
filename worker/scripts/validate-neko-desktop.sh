@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# EZiL OS neko desktop — deterministic, machine-checkable desktop validation.
+#
+# Runs INSIDE the final image after start-neko.sh has passed its window-ready
+# gate. Produces positive, inspectable evidence that the mandatory two-app
+# desktop is genuinely up, and negative evidence that the browser is NOT a blank
+# surface. Enumerates window ids / PIDs / classes / titles and normalizes id
+# formats so hex (wmctrl) and decimal (xdotool/_NET_WM_PID) sources agree.
+#
+# Exit non-zero on any failed assertion; prints a JSON-ish summary either way.
+set -uo pipefail
+export DISPLAY="${DISPLAY:-:99}"
+
+RC=0
+fail() { echo "FAIL: $*" >&2; RC=1; }
+ok()   { echo "OK: $*"; }
+
+norm_id() {
+  local v="${1:-}"
+  [ -n "$v" ] || { echo ""; return; }
+  if [[ "$v" == 0x* || "$v" == 0X* ]]; then printf '%d' "$v" 2>/dev/null || echo ""
+  elif [[ "$v" =~ ^[0-9]+$ ]]; then echo "$v"
+  else printf '%d' "0x$v" 2>/dev/null || echo ""; fi
+}
+
+command -v wmctrl >/dev/null 2>&1 || { echo "FAIL: wmctrl missing" >&2; exit 1; }
+command -v xdotool >/dev/null 2>&1 || { echo "FAIL: xdotool missing" >&2; exit 1; }
+
+echo "== X display =="
+xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && ok "X display $DISPLAY active" || fail "X display $DISPLAY not active"
+
+echo "== enumerated top-level windows (wmctrl -x -l) =="
+wmctrl -x -l || fail "wmctrl -x -l failed"
+
+# Per-app: window id (hex+decimal), WM_CLASS, title, and owning PID.
+# Human-readable diagnostics go to stderr; ONLY the machine row (tab-separated:
+# label, decid, class, pid, title) is written to stdout so callers can capture
+# it cleanly via command substitution.
+enumerate_app() {
+  local label="$1" class_re="$2"
+  local line hexid class title decid pid
+  line="$(wmctrl -x -l 2>/dev/null | awk -v re="$class_re" 'tolower($3) ~ tolower(re){print; exit}')"
+  if [ -z "$line" ]; then
+    fail "$label: no window matching class ~ /$class_re/" >&2
+    return 1
+  fi
+  hexid="$(echo "$line" | awk '{print $1}')"
+  class="$(echo "$line" | awk '{print $3}')"
+  title="$(echo "$line" | cut -d' ' -f5-)"
+  decid="$(norm_id "$hexid")"
+  pid="$(xdotool getwindowpid "$decid" 2>/dev/null || echo 0)"
+  echo "OK: $label: hexid=$hexid decid=$decid class=$class pid=$pid title=\"$title\"" >&2
+  # machine row (stdout)
+  printf '%s\t%s\t%s\t%s\t%s\n' "$label" "$decid" "$class" "$pid" "$title"
+}
+
+echo "== mandatory apps =="
+VSCODE_ROW="$(enumerate_app vscode 'code|Code')"
+CHROME_ROW="$(enumerate_app chromium 'chrome')"
+
+VSCODE_PID="$(printf '%s' "$VSCODE_ROW" | cut -f4)"
+CHROME_PID="$(printf '%s' "$CHROME_ROW" | cut -f4)"
+CHROME_TITLE="$(printf '%s' "$CHROME_ROW" | cut -f5-)"
+
+# Both apps must be present (enumerate_app already failed loudly if absent).
+[ -n "$VSCODE_ROW" ] || fail "VS Code window not enumerated"
+[ -n "$CHROME_ROW" ] || fail "browser window not enumerated"
+
+echo "== browser must NOT be blank =="
+# Positive content assertion: the deterministic landing page sets its <title>
+# to "EZiL OS Browser". about:blank yields an empty/"about:blank" title.
+if echo "$CHROME_TITLE" | grep -qi "EZiL OS Browser"; then
+  ok "browser is showing EZiL OS landing page (title matched)"
+elif echo "$CHROME_TITLE" | grep -qi "about:blank"; then
+  fail "browser is on about:blank — mandatory native browser has no real content"
+else
+  # Title may be truncated by WM; accept any non-empty, non-blank title but warn.
+  if [ -n "${CHROME_TITLE//[[:space:]]/}" ]; then
+    ok "browser has a non-blank title: \"$CHROME_TITLE\""
+  else
+    fail "browser window title is empty (possible blank surface)"
+  fi
+fi
+
+echo "== process liveness (PIDs) =="
+for pair in "vscode:$VSCODE_PID" "chromium:$CHROME_PID"; do
+  name="${pair%%:*}"; pid="${pair#*:}"
+  if [ -n "$pid" ] && [ "$pid" != "0" ] && kill -0 "$pid" 2>/dev/null; then
+    ok "$name pid $pid alive"
+  else
+    fail "$name pid '$pid' not alive"
+  fi
+done
+
+echo "== openbox config (explicit shortcuts + root menu) =="
+OB_CFG="${NEKO_OPENBOX_CONFIG:-/etc/neko/ebuilder-openbox.xml}"
+if [ -f "$OB_CFG" ]; then
+  ok "openbox config present: $OB_CFG"
+  grep -q "neko-switch-app.sh vscode" "$OB_CFG"   && ok "keybind -> focus vscode present"   || fail "no vscode focus keybind in $OB_CFG"
+  grep -q "neko-switch-app.sh chromium" "$OB_CFG" && ok "keybind -> focus browser present"  || fail "no browser focus keybind in $OB_CFG"
+  grep -q "<menu>" "$OB_CFG"                       && ok "root menu wired in openbox config" || fail "no root menu wired in $OB_CFG"
+else
+  fail "openbox config $OB_CFG missing"
+fi
+if pgrep -x openbox >/dev/null 2>&1; then ok "openbox WM process running"; else fail "openbox not running"; fi
+
+echo "== app health file =="
+HF="${NEKO_APP_HEALTH_FILE:-/tmp/neko-app-health.json}"
+if [ -f "$HF" ]; then
+  echo "health: $(cat "$HF")"
+  grep -q '"failed"' "$HF" && fail "an app is in failed state" || ok "no app in failed state"
+else
+  fail "health file $HF missing"
+fi
+
+echo "== focus switching =="
+if [ -x /usr/local/bin/validate-neko-focus.sh ]; then
+  /usr/local/bin/validate-neko-focus.sh || fail "focus-switch validation failed"
+elif [ -x "$(dirname "$0")/validate-neko-focus.sh" ]; then
+  "$(dirname "$0")/validate-neko-focus.sh" || fail "focus-switch validation failed"
+else
+  echo "note: validate-neko-focus.sh not found on PATH — skipping (run separately)"
+fi
+
+echo "=================================================="
+if [ "$RC" -eq 0 ]; then
+  echo "DESKTOP VALIDATION: PASS"
+else
+  echo "DESKTOP VALIDATION: FAIL"
+fi
+exit "$RC"

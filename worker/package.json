@@ -1,0 +1,23 @@
+{
+  "name": "@ezil-os/worker",
+  "version": "0.2.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "description": "Cloudflare Worker (@cloudflare/sandbox) that provisions a real, persistent browser/VS Code desktop (Chrome + Apache Guacamole HTML5 client, or the Neko desktop) for the EZiL OS computer",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8787",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "@cloudflare/sandbox": "0.12.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241218.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.0.0"
+  }
+}
