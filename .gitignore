@@ -21,6 +21,8 @@ app/tsconfig.tsbuildinfo
 .env.development.local
 .env.test.local
 .env.production.local
+# ...except the checked-in, names-only template
+!.env.example
 
 # Cloudflare Workers local runtime state (wrangler dev)
 .wrangler/
