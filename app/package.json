@@ -30,7 +30,8 @@
     "postgres": "^3.4.5",
     "@supabase/supabase-js": "^2.47.10",
     "@supabase/ssr": "^0.5.2",
-    "motion": "^11.15.0"
+    "motion": "^11.15.0",
+    "sonner": "^1.7.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
