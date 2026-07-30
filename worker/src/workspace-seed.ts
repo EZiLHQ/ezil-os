@@ -101,6 +101,44 @@ export function sentinelKeyFor(mountPrefix: string): string {
   return real ? `${real}/${SEED_SENTINEL_FILENAME}` : SEED_SENTINEL_FILENAME;
 }
 
+// ── Template-copy command + its "the image was built without the template"
+// loud-failure signal ───────────────────────────────────────────────────────
+//
+// The template copy used to be a single `[ -d /opt/ezil-sandbox-template ]
+// && cp -a ... || true` shell one-liner. That `|| true` exists so a missing
+// template directory never fails boot (a workspace with no starter files
+// still beats no boot at all) — but it ALSO meant a genuinely missing
+// template (e.g. the Dockerfile's COPY step silently not shipping it, which
+// is exactly what happened in production for weeks) produced no signal
+// whatsoever: `sandbox.exec()` returns success either way, the emptiness
+// check passed, and every new workspace booted to a silently empty desktop.
+//
+// Fix: keep the "never fail boot" contract, but make the two outcomes
+// (copied vs. missing) distinguishable on stdout so the caller can log the
+// missing case LOUDLY via `console.error`/`deps.log` instead of it
+// disappearing into an untested `|| true`.
+
+/** Marker line `buildTemplateCopyCommand`'s shell prints when the baked-in template directory is absent. */
+export const TEMPLATE_MISSING_MARKER = 'EZIL_TEMPLATE_MISSING';
+
+/**
+ * Shell command that copies the image's baked-in starter template
+ * (`/opt/ezil-sandbox-template`, `COPY`'d there by the Dockerfile) into
+ * `targetPath` when present, or prints `TEMPLATE_MISSING_MARKER` on stdout
+ * when it is not — never throws/fails on a missing template (still
+ * boot-safe), but always reports which branch it took. Callers MUST check
+ * the returned `ExecResult.stdout` with `templateWasMissing()` and log
+ * loudly on a hit.
+ */
+export function buildTemplateCopyCommand(targetPath: string): string {
+  return `if [ -d /opt/ezil-sandbox-template ]; then cp -a /opt/ezil-sandbox-template/. ${targetPath}/; else echo ${TEMPLATE_MISSING_MARKER}; fi`;
+}
+
+/** True when `buildTemplateCopyCommand`'s stdout reports the template directory was missing from the image. */
+export function templateWasMissing(stdout: string | undefined | null): boolean {
+  return (stdout ?? '').includes(TEMPLATE_MISSING_MARKER);
+}
+
 export type SeedOutcome =
   | { seeded: true }
   | {

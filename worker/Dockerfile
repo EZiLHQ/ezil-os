@@ -203,6 +203,27 @@ RUN chmod +x /usr/local/bin/validate-neko-focus.sh /usr/local/bin/validate-neko-
 COPY bootstrap/dist/workspace-bootstrap.mjs /usr/local/lib/ezil/workspace-bootstrap.mjs
 RUN test -f /usr/local/lib/ezil/workspace-bootstrap.mjs
 
+# ── Wave A2: starter workspace template ──────────────────────────────────────
+# Baked-in starter project, copied into every genuinely-new (empty) workspace
+# by `seedWorkspaceIfAbsent`/`ensureWorkspaceHydratedFromR2`'s `copyTemplate`
+# (`src/index.ts`, `src/workspace-seed.ts`) — the ONLY thing standing between
+# a new user and a completely empty desktop on first boot. This directory was
+# previously referenced by that copy step (`cp -a
+# /opt/ezil-sandbox-template/.`) but never actually shipped in the image, so
+# the guarded `[ -d ... ] || true` check silently no-op'd on every boot; see
+# `src/workspace-seed.ts`'s `buildTemplateCopyCommand`/`templateWasMissing`
+# for the loud-failure signal that now catches this if it ever regresses.
+# Deliberately tiny — source only, no `node_modules` (`bun install`
+# regenerates it on first dev-server launch; see `docs/PLATFORM-NOTES.md` §2
+# on why object storage must never see `node_modules`). The `dev` script MUST
+# stay `next dev --port 3002` — this is the exact command `desktop-mode.ts`'s
+# `APP_PREVIEW_PORT` doc comment and this file's own EXPOSE 3002 comment below
+# both reference by name.
+COPY sandbox-template /opt/ezil-sandbox-template
+RUN test -f /opt/ezil-sandbox-template/package.json \
+  && test -f /opt/ezil-sandbox-template/README.md \
+  && test -f /opt/ezil-sandbox-template/pages/index.js
+
 # Required so `wrangler dev` can proxy the exposed port locally. 8080 serves the
 # Apache Guacamole HTML5 client (Tomcat); guacd (4822) and x11vnc (5901) stay
 # internal to the container. 8181 serves the alternate `neko` mode's HTTP UI +

@@ -286,7 +286,12 @@ import {
   PROJECT_FILES_MAX_PUT_REQUEST_BYTES,
   PROJECT_FILES_MAX_CONTROL_REQUEST_BYTES,
 } from './project-files';
-import { seedWorkspaceIfAbsent, realR2KeyPrefix } from './workspace-seed';
+import {
+  seedWorkspaceIfAbsent,
+  realR2KeyPrefix,
+  buildTemplateCopyCommand,
+  templateWasMissing,
+} from './workspace-seed';
 import {
   hydrateWorkspaceFromR2,
   flushWorkspaceToR2,
@@ -963,9 +968,17 @@ async function ensureWorkspaceMount(
   try {
     const check = await sandbox.exec(`[ -z "$(ls -A ${config.mountPath} 2>/dev/null)" ] && echo empty || echo seeded`);
     if (check.stdout?.trim() === 'empty') {
-      await sandbox.exec(
-        `[ -d /opt/ezil-sandbox-template ] && cp -a /opt/ezil-sandbox-template/. ${config.mountPath}/ || true`,
-      );
+      const copyResult = await sandbox.exec(buildTemplateCopyCommand(config.mountPath));
+      if (templateWasMissing(copyResult.stdout)) {
+        // Loud, not silent: the previous `[ -d ... ] && ... || true` guard
+        // swallowed this exact case for weeks — a missing baked-in template
+        // meant every new workspace booted to a silently empty desktop. Boot
+        // still must not fail on it (see workspace-seed.ts's doc comment),
+        // but it must never again pass without a trace in `wrangler tail`.
+        console.error(
+          `[ensureWorkspaceMount] LOUD: /opt/ezil-sandbox-template is missing from this container image — workspace at ${config.mountPath} was left EMPTY instead of seeded with starter files. The image was built without the template baked in; check the Dockerfile's COPY step.`,
+        );
+      }
     }
   } catch (err) {
     // Seeding is best-effort; a failure here should not block the preview.
@@ -1079,9 +1092,19 @@ async function ensureWorkspaceHydratedFromR2(
   }
 
   const copyTemplate = async () => {
-    await sandbox.exec(
-      `[ -d /opt/ezil-sandbox-template ] && cp -a /opt/ezil-sandbox-template/. ${mountPath}/ || true`,
-    );
+    const result = await sandbox.exec(buildTemplateCopyCommand(mountPath));
+    if (templateWasMissing(result.stdout)) {
+      // Loud, not silent: the previous `[ -d ... ] && ... || true` guard
+      // swallowed this exact case for weeks — a missing baked-in template
+      // meant every genuinely-new workspace won the seed race and then
+      // copied nothing, booting to a silently empty desktop with no trace
+      // anywhere. Still must not fail boot (the sentinel is already
+      // committed by this point — see this function's doc comment), but it
+      // must never again pass without a trace in `wrangler tail`.
+      console.error(
+        `[ensureWorkspaceMount] LOUD: /opt/ezil-sandbox-template is missing from this container image — new workspace at ${mountPath} was NOT seeded with starter files (boot continues). The image was built without the template baked in; check the Dockerfile's COPY step.`,
+      );
+    }
   };
 
   let hydrateOk = false;

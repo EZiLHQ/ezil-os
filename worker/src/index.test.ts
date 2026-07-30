@@ -646,9 +646,11 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
     expect(src).toContain('const seedOutcome = await seedWorkspaceIfAbsent({');
     // The template copy itself stays a pure local-disk `cp -a` — it was
     // never mount-dependent, so it is untouched by the hydrate/flush rewrite.
-    expect(src).toContain(
-      '`[ -d /opt/ezil-sandbox-template ] && cp -a /opt/ezil-sandbox-template/. ${mountPath}/ || true`',
-    );
+    // The exact shell command now lives in `buildTemplateCopyCommand()`
+    // (`./workspace-seed`) so the missing-template case can be detected and
+    // logged loudly instead of silently swallowed by `|| true`.
+    expect(src).toContain('await sandbox.exec(buildTemplateCopyCommand(mountPath));');
+    expect(src).toContain('templateWasMissing(result.stdout)');
   });
 
   it('falls through to a real hydrateWorkspaceFromR2 pass whenever the atomic seed did not seed (lost race / not empty / list failed / etc.)', async () => {
