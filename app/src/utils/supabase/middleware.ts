@@ -11,9 +11,19 @@ import { env } from '@/env';
  * an unauthenticated visitor to /login) happens separately in each
  * protected layout (see app/computers/layout.tsx, app/computer/layout.tsx)
  * — this function's only job is keeping the session cookie current.
+ *
+ * Also stamps an `x-pathname` request header with the current path, so a
+ * protected layout can build an accurate `returnUrl` back to wherever the
+ * unauthenticated visitor was trying to go (see `utils/constants.ts`'s
+ * `getReturnUrlQueryParam`).
  */
 export async function updateSession(request: NextRequest) {
-    let response = NextResponse.next({ request });
+    // Clone (never mutate) the incoming headers — `request.headers` may be
+    // an immutable Headers instance depending on runtime.
+    const requestHeaders = new Headers(request.headers);
+    requestHeaders.set('x-pathname', request.nextUrl.pathname);
+
+    let response = NextResponse.next({ request: { headers: requestHeaders } });
 
     const supabase = createServerClient(
         env.NEXT_PUBLIC_SUPABASE_URL,
@@ -27,7 +37,7 @@ export async function updateSession(request: NextRequest) {
                     for (const { name, value } of cookiesToSet) {
                         request.cookies.set(name, value);
                     }
-                    response = NextResponse.next({ request });
+                    response = NextResponse.next({ request: { headers: requestHeaders } });
                     for (const { name, value, options } of cookiesToSet) {
                         response.cookies.set(name, value, options);
                     }
