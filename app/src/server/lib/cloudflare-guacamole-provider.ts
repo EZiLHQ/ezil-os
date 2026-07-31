@@ -583,6 +583,189 @@ export function composeBrowserDesktopUrl(rawUrl: string, hmacSecret: string, san
     return url.toString();
 }
 
+// ─── Is there actually a desktop at the other end of that URL? ────────────────
+//
+// 🔴 THE HANDOFF BLIND SPOT THIS SECTION CLOSES.
+//
+// `requestGuacamolePreview` resolving `ok: true` means one thing only: the
+// Worker registered a preview port and handed back a URL. It does NOT mean a
+// browser pointed at that URL gets a desktop. The two are genuinely separable,
+// and were observed separated live on 2026-07-31: the Worker reported
+// `guacamoleRunning: true` while every request to the preview host returned
+// **HTTP 500 "Proxy routing error"**.
+//
+// That is not a contradiction. `worker/src/sandbox-control.ts`'s
+// `describeDesktopStatus` derives `guacamoleRunning` from
+// `sandbox.getExposedPorts()`, which reads Durable Object storage plus
+// `ctx.container.running` and never issues a request through the edge. A port
+// registered in DO storage whose EDGE ROUTE is broken reports running forever.
+// So the container-side signal, which is the one the boot contract already
+// trusts, structurally cannot see this failure.
+//
+// An iframe cannot see it either: the `load` event fires for a 500 error page
+// exactly as it does for a working desktop, and cross-origin script has no
+// access to the status code or the document. The browser has NO honest signal
+// here at all.
+//
+// The one place that does is the server, which can make a plain HTTP request
+// to the preview origin and read the status code. That path is not
+// hypothetical: `enableImplicitHosting` below has always made exactly this
+// call (`POST {origin}/api/login`) from the app server, and its success is
+// what puts `implicit_hosting: true` on the wire at Neko's websocket init.
+
+/**
+ * What a probe of the desktop origin actually observed.
+ *
+ * `alive: true` is the ONLY value that may be turned into a "ready"/"Live"
+ * claim anywhere in the product. Everything else — including "we could not
+ * tell" — is not a confirmation, and callers must not launder it into one.
+ * There is deliberately no third `unknown` variant: a probe that could not
+ * answer is `alive: false, reason: 'unreachable'`, because the question the
+ * caller is asking is "may I claim this is working?" and the answer to that
+ * is unambiguously no.
+ */
+export type DesktopFrameProbe =
+    | { alive: true; status: number }
+    | {
+          alive: false;
+          /**
+           * `http_error`  — the origin answered with >= 400. The observed 500
+           *                 "Proxy routing error" lands here.
+           * `unreachable` — no answer at all (transport failure or our own
+           *                 timeout elapsed). Not evidence of health.
+           * `bad_url`     — the string we were handed is not a URL we can probe.
+           */
+          reason: 'http_error' | 'unreachable' | 'bad_url';
+          status?: number;
+          detail?: string;
+      };
+
+/**
+ * Whole budget for one desktop-frame probe. Short on purpose: this sits on the
+ * desktop-open critical path, the origin is a Cloudflare edge hostname that
+ * either routes or does not, and a slow answer is not a healthy desktop.
+ */
+export const DESKTOP_FRAME_PROBE_TIMEOUT_MS = 6_000;
+
+/**
+ * Ask the desktop origin, over plain HTTP, whether it is serving.
+ *
+ * The query string is DROPPED before the request: the composed browser URL
+ * carries the per-sandbox Neko credential in `?pwd=`, and this probe's URL can
+ * end up in a server log or an upstream trace. Origin + path is the same
+ * document either way — Neko serves its SPA shell at `/` regardless of the
+ * auto-connect params, so nothing about the answer changes.
+ *
+ * "Alive" is `status < 400`, i.e. the origin answered without an error status.
+ * That is deliberately the weakest claim the status line can support, and it
+ * is exactly the claim the product needs to stop making falsely. It does not
+ * assert the bytes are a working Neko client; it asserts the edge route
+ * exists and the thing behind it is not erroring, which is precisely what was
+ * false during the live failure.
+ *
+ * NEVER THROWS.
+ */
+export async function probeDesktopFrame(
+    rawUrl: string,
+    timeoutMs: number = DESKTOP_FRAME_PROBE_TIMEOUT_MS,
+): Promise<DesktopFrameProbe> {
+    let target: string;
+    try {
+        const u = new URL(rawUrl);
+        if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+            return { alive: false, reason: 'bad_url', detail: 'unsupported_protocol' };
+        }
+        target = `${u.origin}${u.pathname}`;
+    } catch {
+        return { alive: false, reason: 'bad_url', detail: 'unparseable' };
+    }
+
+    try {
+        const res = await fetch(target, {
+            method: 'GET',
+            headers: { Accept: 'text/html,*/*' },
+            // A redirect that lands somewhere healthy is healthy; follow it
+            // (the default) rather than treating a 302 as a status to judge.
+            redirect: 'follow',
+            cache: 'no-store',
+            signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (res.status >= 400) {
+            return { alive: false, reason: 'http_error', status: res.status };
+        }
+        return { alive: true, status: res.status };
+    } catch (err) {
+        const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+        return { alive: false, reason: 'unreachable', detail: detail.slice(0, 200) };
+    }
+}
+
+/**
+ * May this server fetch `candidateUrl` on behalf of a caller who owns
+ * `sandboxId`?
+ *
+ * This exists because the post-handoff re-confirmation (`confirmFrame` in
+ * `routers/cloudflare-guacamole.ts`) is driven by the browser, which has to
+ * name the URL its iframe is actually pointed at — and a server that fetches a
+ * client-named URL is a server-side request forgery primitive unless something
+ * pins the target. Two independent conditions do:
+ *
+ *  1. The hostname's FIRST label must contain `-<sandboxId>-`. The SDK composes
+ *     preview hostnames as `` `${port}-${sandboxId}-${token}.${host}` ``
+ *     (`worker/src/index.ts` `normalizeSandboxHostname`), and `sandboxId` comes
+ *     from `deriveGuacamoleSandboxId(authenticatedUserId, ownedComputerId)`.
+ *     A caller therefore cannot name another user's sandbox, let alone an
+ *     unrelated first label. Port and token are NOT hardcoded here on purpose —
+ *     they live in `worker/src/desktop-mode.ts` `portFor()` and would be a
+ *     drift trap on this side of the wire.
+ *  2. The REST of the hostname must be the Worker's own host, or that host with
+ *     its first label removed. Those are the only two possibilities the Worker
+ *     itself can produce: `normalizeSandboxHostname` passes the request host
+ *     through, collapsing any host under `PREVIEW_ZONE_ROOT` to the bare zone
+ *     root first. Matched exactly — never as a loose suffix, which would accept
+ *     `…-nekodesktop.org` for a Worker on `ezil.org`.
+ *
+ * Both must hold. `8181-guac-a-b-nekodesktop.evil.com` fails (2);
+ * `8181-guac-SOMEONE-ELSE-nekodesktop.ezil.org` fails (1).
+ *
+ * @param workerHost   hostname of `CLOUDFLARE_GUACAMOLE_WORKER_URL` — server config, never client input
+ * @param sandboxId    `deriveGuacamoleSandboxId(userId, computerId)` for the AUTHENTICATED owner
+ * @param candidateUrl the URL the browser says its iframe is showing
+ */
+export function isOwnDesktopOrigin(
+    workerHost: string,
+    sandboxId: string,
+    candidateUrl: string,
+): boolean {
+    if (!workerHost || !sandboxId) return false;
+
+    let host: string;
+    try {
+        const u = new URL(candidateUrl);
+        if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+        host = u.hostname.toLowerCase();
+    } catch {
+        return false;
+    }
+
+    const dot = host.indexOf('.');
+    if (dot <= 0) return false;
+    const firstLabel = host.slice(0, dot);
+    const rest = host.slice(dot + 1);
+
+    // (1) this caller's own sandbox, as a whole hyphen-delimited run.
+    if (!firstLabel.includes(`-${sandboxId.toLowerCase()}-`)) return false;
+
+    // (2) our own Worker's host, or its zone root after the one-label collapse.
+    const wh = workerHost.toLowerCase().replace(/:\d+$/, '');
+    const whDot = wh.indexOf('.');
+    const zoneRoot = whDot > 0 ? wh.slice(whDot + 1) : '';
+    // A single-label collapse target (`localhost`) is legitimate; an empty one
+    // is not, and a bare TLD is never reachable here because `zoneRoot` is
+    // produced by removing exactly one label, never by matching a suffix.
+    return rest === wh || (zoneRoot !== '' && rest === zoneRoot);
+}
+
 // ─── Taking control of your own computer ──────────────────────────────────────
 
 /**

@@ -24,6 +24,15 @@ import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/sh
  *                          container. Safe to call every 2s while a boot is
  *                          in flight, which is the one real mid-boot signal
  *                          the shell has (see `boot-phases`).
+ *   GET  ?computerId=...&confirm=frame&frameUrl=...
+ *                        — the POST-HANDOFF check. Asks the desktop origin
+ *                          itself, over HTTP, whether it is serving. This is
+ *                          the only signal that can tell a desktop from a 500
+ *                          error page: the status poll above reads Durable
+ *                          Object state and never crosses the edge, and the
+ *                          iframe's `load` event fires for both. Also cheap —
+ *                          one GET to an edge hostname, no Worker call, no
+ *                          container wake.
  *   POST { computerId }  — the long one. Starts/attaches the desktop and
  *                          resolves only at the end, success or a specific
  *                          error.
@@ -42,13 +51,31 @@ async function shellCaller(req: Request) {
     return { ctx, caller: appRouter.createCaller(ctx) };
 }
 
-/** Cheap health poll for a computer's sandbox. Never wakes it. */
+/**
+ * Cheap health poll for a computer's sandbox — or, with `confirm=frame`, the
+ * post-handoff check that the desktop origin is really serving. Neither wakes
+ * a container.
+ */
 export async function GET(req: Request) {
     try {
         const { ctx, caller } = await shellCaller(req);
         if (!ctx.user) return shellUnauthenticated();
 
-        const computerId = new URL(req.url).searchParams.get('computerId') ?? '';
+        const params = new URL(req.url).searchParams;
+        const computerId = params.get('computerId') ?? '';
+
+        if (params.get('confirm') === 'frame') {
+            // `frameUrl` is client-supplied and is pinned server-side to this
+            // user's own sandbox origin inside the procedure — see
+            // `isOwnDesktopOrigin`. Forwarded as given, like every other input
+            // on this route: the procedure's zod schema is the one validator.
+            const confirmation = await caller.cloudflareGuacamole.confirmFrame({
+                computerId,
+                frameUrl: params.get('frameUrl') ?? '',
+            });
+            return shellJson({ ok: true, ...confirmation });
+        }
+
         const status = await caller.cloudflareGuacamole.status({ computerId });
 
         return shellJson(status);

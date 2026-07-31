@@ -45,9 +45,56 @@ describe('computeBootUiState — never fabricates progress', () => {
         expect(state.kind).toBe('not_configured');
     });
 
-    it('reports ready only once the single preview request has actually resolved ok', () => {
-        const state = computeBootUiState({ requestStatus: 'success', elapsedMs: 999 });
+    it('reports ready only once the preview request resolved ok AND the frame was confirmed', () => {
+        const state = computeBootUiState({
+            requestStatus: 'success',
+            elapsedMs: 999,
+            frameConfirmed: true,
+        });
         expect(state).toEqual({ kind: 'ready' });
+    });
+
+    // 🔴 THE REGRESSION GUARD FOR THE HANDOFF BLIND SPOT.
+    // `success` means the Worker handed back a URL. On 2026-07-31 that URL
+    // served HTTP 500 "Proxy routing error" and both surfaces reported success
+    // over it, because this branch used to return `ready` unconditionally. It
+    // must now be impossible to reach `ready` without a positive observation of
+    // the desktop origin itself.
+    it('CANNOT report ready on a successful request whose frame was refuted', () => {
+        expect(
+            computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: false }),
+        ).toEqual({ kind: 'failed', reason: 'desktop_unreachable' });
+    });
+
+    it('CANNOT report ready when nobody looked at the frame at all — fails closed', () => {
+        // A caller that forgot to thread the observation gets a visible,
+        // retryable failure, never an unearned `ready`.
+        expect(computeBootUiState({ requestStatus: 'success', elapsedMs: 0 })).toEqual({
+            kind: 'failed',
+            reason: 'desktop_unreachable',
+        });
+    });
+
+    it('accepts nothing but a literal `true` as a frame confirmation', () => {
+        for (const junk of [1, 'true', 'yes', {}, [], 'ok'] as unknown[]) {
+            expect(
+                computeBootUiState({
+                    requestStatus: 'success',
+                    elapsedMs: 0,
+                    frameConfirmed: junk as boolean,
+                }),
+            ).toEqual({ kind: 'failed', reason: 'desktop_unreachable' });
+        }
+    });
+
+    it('maps a server-reported desktop_unreachable error code to its own copy, not to "unknown"', () => {
+        expect(
+            computeBootUiState({
+                requestStatus: 'error',
+                elapsedMs: 0,
+                errorCode: 'desktop_unreachable',
+            }),
+        ).toEqual({ kind: 'failed', reason: 'desktop_unreachable' });
     });
 
     it('while pending, never marks a phase confirmed from elapsed time alone', () => {
@@ -143,6 +190,7 @@ describe('computeBootUiState — never fabricates progress', () => {
 
     it('invents no new failure copy for them — every reason still resolves to existing strings', () => {
         expect(Object.keys(BOOT_FAILURE_COPY).sort()).toEqual([
+            'desktop_unreachable',
             'sandbox_crashed',
             'timeout',
             'unknown',

@@ -200,7 +200,7 @@ export function openSession () {
  * shell that composed its own URL would produce a desktop that renders
  * perfectly and silently ignores every click.
  *
- * @returns {Promise<{ok: true, url: string, controlMode?: string, mode?: string, workspace?: any}
+ * @returns {Promise<{ok: true, url: string, frameConfirmed: boolean, controlMode?: string, mode?: string, workspace?: any}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
 export async function openDesktop (computerId) {
@@ -238,10 +238,44 @@ export async function openDesktop (computerId) {
     return {
         ok: true,
         url: data.guacamoleUrl,
+        // 🔴 Whether the SERVER observed the desktop origin answering, before
+        // it handed this URL over. Strict `=== true`, and never defaulted to
+        // true: a response that omits the field is a server that did not check,
+        // and `computeBootUiState` must treat that as "not confirmed" rather
+        // than inherit the old assumption that a URL implies a desktop.
+        frameConfirmed: data.frame?.confirmed === true,
         controlMode: data.controlMode,
         mode: data.mode,
         workspace: data.workspace,
     };
+}
+
+/**
+ * `GET /api/shell/desktop?confirm=frame` — ask the server to check, right now,
+ * that the URL the iframe is showing is a desktop and not an error page.
+ *
+ * 🔴 WHY THE `load` EVENT IS NOT THIS. An iframe fires `load` for an HTTP 500
+ * error page exactly as it does for a working desktop, and cross-origin script
+ * cannot read the status code or the document. On 2026-07-31 the preview host
+ * returned 500 "Proxy routing error" and the shell hid its boot panel over it
+ * on `load`. The browser has no honest signal here; the server does, because it
+ * can make a plain HTTP request to that origin and read the status line.
+ *
+ * Cheap: one GET to an edge hostname. No Worker call, no container wake.
+ *
+ * @returns {Promise<boolean | undefined>} `true` = the origin answered without
+ *   an error status. `false` = it answered with one, or did not answer at all.
+ *   `undefined` = OUR request never landed, which is not an observation of the
+ *   desktop and must not be read as either verdict.
+ */
+export async function confirmFrame (computerId, frameUrl) {
+    if ( ! computerId || ! frameUrl ) return undefined;
+    const url = `${endpoint('desktop')}?computerId=${encodeURIComponent(computerId)}`
+        + `&confirm=frame&frameUrl=${encodeURIComponent(frameUrl)}`;
+    const res = await request(url, { timeoutMs: STATUS_TIMEOUT_MS });
+    if ( ! res.ok ) return undefined;
+    if ( res.data?.ok !== true ) return undefined;
+    return res.data.confirmed === true;
 }
 
 /**
@@ -266,7 +300,7 @@ export default {
     get, set, del,
     payload,
     readSession, openSession,
-    openDesktop, desktopRunning,
+    openDesktop, desktopRunning, confirmFrame,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
 };
