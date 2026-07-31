@@ -78,6 +78,20 @@ type RequestStatus = 'not_configured' | 'pending' | 'success' | 'error';
 const EZIL_OS_LABEL = 'EZiL OS';
 
 /**
+ * Shown ONLY when the server could not put the desktop into implicit-hosting
+ * mode (`controlMode === 'manual'` — see `enableImplicitHosting` in
+ * `server/lib/cloudflare-guacamole-provider.ts`). In that state a click on the
+ * desktop is silently ignored, and the only way in is Neko's own mouse icon,
+ * which `embed=1` keeps visible in the video's top-right corner. Saying so is
+ * the honest fallback; the alternative is a computer that appears broken.
+ *
+ * When implicit hosting IS on — the normal case — nothing is rendered, because
+ * there is nothing to explain: you click your computer and it is yours.
+ */
+export const CONTROL_HINT_COPY =
+    'Click the mouse icon at the top right of the desktop to take control of this computer.';
+
+/**
  * Map the worker/provider's own error-code strings onto the plain-language
  * taxonomy `boot-phases.ts` renders. Anything not recognized collapses to
  * `unknown` rather than guessing.
@@ -102,6 +116,7 @@ function toBootErrorCode(raw: string | undefined): BootErrorCode {
 
 export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareGuacamoleCanvasProps) {
     const [reloadKey, setReloadKey] = useState(0);
+    const [controlHintDismissed, setControlHintDismissed] = useState(false);
     const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
     // Wall-clock start of the CURRENT boot attempt (a ref — mutated only from
@@ -221,6 +236,10 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
     const handleReload = useCallback(() => {
         attemptStartedAtRef.current = null;
         setElapsedMs(0);
+        // A reload is a fresh boot, and implicit hosting is re-attempted with
+        // it — so a previously-dismissed hint must be allowed to come back if
+        // the new attempt still lands in 'manual'.
+        setControlHintDismissed(false);
         setReloadKey((k) => k + 1);
         void previewQuery.refetch();
     }, [previewQuery]);
@@ -256,10 +275,11 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
         return <BootProgressPanel progress={bootUiState} />;
     }
 
-    const { guacamoleUrl, workspace } = previewQuery.data as {
+    const { guacamoleUrl, workspace, controlMode } = previewQuery.data as {
         ok: true;
         guacamoleUrl: string;
         workspace?: WorkspaceStatus;
+        controlMode?: 'implicit' | 'manual';
     };
 
     return (
@@ -303,6 +323,24 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
                 allow="clipboard-read; clipboard-write; fullscreen"
                 style={{ display: 'block' }}
             />
+
+            {controlMode === 'manual' && !controlHintDismissed && (
+                <div
+                    className="absolute bottom-2 left-2 z-10 flex max-w-sm items-start gap-2 rounded-md border border-yellow-700/40 bg-yellow-950/40 px-2.5 py-1.5"
+                    data-testid="cf-guacamole-control-hint"
+                >
+                    <span className="text-[11px] leading-snug text-yellow-200/90">{CONTROL_HINT_COPY}</span>
+                    <button
+                        type="button"
+                        onClick={() => setControlHintDismissed(true)}
+                        className="shrink-0 text-[11px] leading-none text-yellow-200/60 hover:text-yellow-100"
+                        title="Dismiss"
+                        data-testid="cf-guacamole-control-hint-dismiss"
+                    >
+                        ✕
+                    </button>
+                </div>
+            )}
 
             <button
                 type="button"

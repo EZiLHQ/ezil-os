@@ -1,7 +1,12 @@
+import { createHmac } from 'node:crypto';
+
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
     classifyWorkerHttpFailure,
+    composeBrowserDesktopUrl,
+    deriveNekoAdminValue,
+    enableImplicitHosting,
     isRetryablePreviewErrorCode,
     requestGuacamolePreview,
     type CloudflareGuacamoleConfig,
@@ -234,5 +239,214 @@ describe('requestGuacamolePreview — the failure carries its own retryability',
         const result = (await requestGuacamolePreview(CONFIG, 'secret', INPUT)) as GuacamolePreviewError;
         expect(result.errorCode).toBe('custom_domain_required');
         expect(result.retryable).toBe(false);
+    });
+});
+
+// ─── Taking control of your own computer ──────────────────────────────────────
+//
+// The desktop was look-but-don't-touch: `implicitHosting:false` in the pinned
+// image's `/etc/neko/neko.yaml` reduces a click on the desktop to a 5s shake
+// animation on a component `embed=1` does not render — i.e. to nothing. The
+// only way anyone ever gained control was by calling `$accessor.remote.request()`
+// from inside the iframe, which no real user can do.
+//
+// These tests defend the two things that make the fix trustworthy rather than
+// merely present:
+//   1. the flip MERGES — Neko's `settingsSet` is a whole-object replace, and a
+//      hand-written body silently resets every field it omits (observed live:
+//      posting without `heartbeat_interval` reset the room's 10 to 0);
+//   2. it can NEVER take a working desktop down with it, and when it does fail
+//      it says so, so the UI can show the fallback instead of shipping a
+//      computer that ignores clicks in silence.
+
+/** A Neko room-settings payload with the shape the live server actually returns. */
+const LIVE_SETTINGS = {
+    private_mode: false,
+    locked_logins: false,
+    locked_controls: false,
+    control_protection: false,
+    implicit_hosting: false,
+    inactive_cursors: false,
+    merciful_reconnect: true,
+    heartbeat_interval: 10,
+    plugins: null,
+};
+
+const DESKTOP_URL = 'https://8181-guac-abc-def-nekodesktop.ezil.org/?usr=EZiL&pwd=x&embed=1';
+
+/**
+ * Route a stubbed `fetch` by path so each leg of the handshake (login ->
+ * read -> write -> logout) can be asserted independently.
+ */
+function stubNeko(handlers: Record<string, () => Response>) {
+    const calls: { url: string; method: string; body?: string }[] = [];
+    const spy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        calls.push({ url, method, body: typeof init?.body === 'string' ? init.body : undefined });
+        const key = `${method} ${new URL(url).pathname}`;
+        const handler = handlers[key];
+        if (!handler) return new Response('not stubbed', { status: 404 });
+        return handler();
+    });
+    vi.stubGlobal('fetch', spy);
+    return { calls };
+}
+
+const okJson = (body: unknown) =>
+    new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+describe('deriveNekoAdminValue — must byte-match the Worker, and never be the user value', () => {
+    it("uses the Worker's exact payload shape `ezil-neko:admin:<sandboxId>:v1`", () => {
+        // Drift guard against worker/src/hmac.ts's deriveNekoValue(). If the
+        // two ever disagree, the admin login below 401s and control silently
+        // falls back to manual on every single boot.
+        const expected = createHmac('sha256', 'shared-secret')
+            .update('ezil-neko:admin:guac-u-c:v1')
+            .digest('hex')
+            .toLowerCase()
+            .slice(0, 32);
+        expect(deriveNekoAdminValue('shared-secret', 'guac-u-c')).toBe(expected);
+    });
+
+    it('never equals the regular-user value the browser is given', () => {
+        // The browser receives the USER value in the iframe URL's `pwd`. If
+        // the admin value collided with it, that URL would hand out admin.
+        const admin = deriveNekoAdminValue('shared-secret', 'guac-u-c');
+        const browserUrl = composeBrowserDesktopUrl('https://d.example/', 'shared-secret', 'guac-u-c');
+        expect(new URL(browserUrl).searchParams.get('pwd')).not.toBe(admin);
+        expect(browserUrl).not.toContain(admin);
+    });
+});
+
+describe('composeBrowserDesktopUrl — embed=1 is load-bearing, not cosmetic', () => {
+    it('keeps embed=1 (it hides Neko\'s own branding AND keeps the control button visible)', () => {
+        // `.video-menu li.extra-control { display:none }` above 768px, and the
+        // button only escapes that class in embed mode. Dropping the param
+        // would remove the fallback affordance the manual hint points at.
+        const url = new URL(composeBrowserDesktopUrl('https://d.example/', 'secret', 'guac-u-c'));
+        expect(url.searchParams.get('embed')).toBe('1');
+        expect(url.searchParams.get('usr')).toBe('EZiL');
+    });
+});
+
+describe('enableImplicitHosting — a click on your own computer must just work', () => {
+    it('reads the live settings and writes back a MERGE, changing exactly one field', async () => {
+        const { calls } = stubNeko({
+            'POST /api/login': () => okJson({ id: 'm1', token: 'tok-abc', profile: {}, state: {} }),
+            'GET /api/room/settings': () => okJson(LIVE_SETTINGS),
+            'POST /api/room/settings': () => new Response(null, { status: 204 }),
+            'POST /api/logout': () => new Response(null, { status: 200 }),
+        });
+
+        expect(await enableImplicitHosting(DESKTOP_URL, 'admin-pwd')).toBe('implicit');
+
+        const write = calls.find((c) => c.method === 'POST' && c.url.includes('/api/room/settings'));
+        expect(write).toBeDefined();
+        const sent = JSON.parse(write!.body!) as typeof LIVE_SETTINGS;
+        expect(sent.implicit_hosting).toBe(true);
+        // Everything else survives verbatim — this is the assertion that would
+        // have caught the live heartbeat_interval 10 -> 0 clobber.
+        expect(sent).toEqual({ ...LIVE_SETTINGS, implicit_hosting: true });
+    });
+
+    it('talks to the DESKTOP origin, not the Worker, and does so before the browser has the URL', async () => {
+        const { calls } = stubNeko({
+            'POST /api/login': () => okJson({ token: 'tok' }),
+            'GET /api/room/settings': () => okJson(LIVE_SETTINGS),
+            'POST /api/room/settings': () => new Response(null, { status: 204 }),
+            'POST /api/logout': () => new Response(null, { status: 200 }),
+        });
+        await enableImplicitHosting(DESKTOP_URL, 'admin-pwd');
+        for (const call of calls) {
+            expect(new URL(call.url).origin).toBe('https://8181-guac-abc-def-nekodesktop.ezil.org');
+        }
+    });
+
+    it('does not write at all when the container already has implicit hosting on', async () => {
+        // The durable fix is a flag on the container's own `neko serve`. When
+        // that lands this must become a no-op, not a redundant write.
+        const { calls } = stubNeko({
+            'POST /api/login': () => okJson({ token: 'tok' }),
+            'GET /api/room/settings': () => okJson({ ...LIVE_SETTINGS, implicit_hosting: true }),
+            'POST /api/logout': () => new Response(null, { status: 200 }),
+        });
+        expect(await enableImplicitHosting(DESKTOP_URL, 'admin-pwd')).toBe('implicit');
+        expect(calls.some((c) => c.method === 'POST' && c.url.includes('/api/room/settings'))).toBe(false);
+    });
+
+    it('releases the admin session it opened, so no phantom member is left in the room', async () => {
+        const { calls } = stubNeko({
+            'POST /api/login': () => okJson({ token: 'tok' }),
+            'GET /api/room/settings': () => okJson(LIVE_SETTINGS),
+            'POST /api/room/settings': () => new Response(null, { status: 204 }),
+            'POST /api/logout': () => new Response(null, { status: 200 }),
+        });
+        await enableImplicitHosting(DESKTOP_URL, 'admin-pwd');
+        expect(calls.some((c) => c.method === 'POST' && c.url.endsWith('/api/logout'))).toBe(true);
+    });
+
+    it.each([
+        ['a rejected admin credential', { 'POST /api/login': () => new Response('{}', { status: 401 }) }],
+        [
+            'a login that returns no token',
+            { 'POST /api/login': () => okJson({ id: 'm1' }) },
+        ],
+        [
+            'settings that cannot be read',
+            {
+                'POST /api/login': () => okJson({ token: 'tok' }),
+                'GET /api/room/settings': () => new Response('nope', { status: 500 }),
+            },
+        ],
+        [
+            'a write the server refuses',
+            {
+                'POST /api/login': () => okJson({ token: 'tok' }),
+                'GET /api/room/settings': () => okJson(LIVE_SETTINGS),
+                'POST /api/room/settings': () => new Response('nope', { status: 500 }),
+                'POST /api/logout': () => new Response(null, { status: 200 }),
+            },
+        ],
+        [
+            'a non-JSON body where settings should be',
+            {
+                'POST /api/login': () => okJson({ token: 'tok' }),
+                'GET /api/room/settings': () => new Response('<html>proxy error</html>', { status: 200 }),
+                'POST /api/logout': () => new Response(null, { status: 200 }),
+            },
+        ],
+    ])('reports manual (never throws) on %s', async (_label, handlers) => {
+        stubNeko(handlers as Record<string, () => Response>);
+        await expect(enableImplicitHosting(DESKTOP_URL, 'admin-pwd')).resolves.toBe('manual');
+    });
+
+    it('reports manual when the desktop is unreachable, rather than failing the boot', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () => {
+                throw new Error('fetch failed');
+            }),
+        );
+        await expect(enableImplicitHosting(DESKTOP_URL, 'admin-pwd')).resolves.toBe('manual');
+    });
+
+    it('reports manual on an unparseable desktop URL without issuing a request', async () => {
+        const spy = vi.fn();
+        vi.stubGlobal('fetch', spy);
+        await expect(enableImplicitHosting('not a url', 'admin-pwd')).resolves.toBe('manual');
+        expect(spy).not.toHaveBeenCalled();
+    });
+
+    it('never returns the admin credential or the session token to its caller', async () => {
+        stubNeko({
+            'POST /api/login': () => okJson({ token: 'tok-secret' }),
+            'GET /api/room/settings': () => okJson(LIVE_SETTINGS),
+            'POST /api/room/settings': () => new Response(null, { status: 204 }),
+            'POST /api/logout': () => new Response(null, { status: 200 }),
+        });
+        const mode = await enableImplicitHosting(DESKTOP_URL, 'admin-pwd-secret');
+        expect(mode).toBe('implicit');
+        expect(JSON.stringify(mode)).not.toContain('secret');
     });
 });
