@@ -92,6 +92,18 @@ export const CONTROL_HINT_COPY =
     'Click the mouse icon at the top right of the desktop to take control of this computer.';
 
 /**
+ * The hint appears for exactly one reason and disappears for exactly two.
+ * Extracted so the rule is testable without a DOM: a nag that shows up on a
+ * healthy desktop, or that refuses to go away, is its own defect.
+ */
+export function shouldShowControlHint(
+    controlMode: 'implicit' | 'manual' | undefined,
+    dismissed: boolean,
+): boolean {
+    return controlMode === 'manual' && !dismissed;
+}
+
+/**
  * Map the worker/provider's own error-code strings onto the plain-language
  * taxonomy `boot-phases.ts` renders. Anything not recognized collapses to
  * `unknown` rather than guessing.
@@ -324,7 +336,7 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
                 style={{ display: 'block' }}
             />
 
-            {controlMode === 'manual' && !controlHintDismissed && (
+            {shouldShowControlHint(controlMode, controlHintDismissed) && (
                 <div
                     className="absolute bottom-2 left-2 z-10 flex max-w-sm items-start gap-2 rounded-md border border-yellow-700/40 bg-yellow-950/40 px-2.5 py-1.5"
                     data-testid="cf-guacamole-control-hint"
