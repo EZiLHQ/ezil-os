@@ -135,10 +135,17 @@ throwaway key without touching the production `SANDBOX_HMAC_SECRET`. It is:
 ```
 
 
-Then point EBuilder at the deployed Worker:
+Then point the app at the deployed Worker:
 ```
-CLOUDFLARE_GUACAMOLE_WORKER_URL=https://cf-guacamole-sandbox.<your-account>.workers.dev
+CLOUDFLARE_GUACAMOLE_WORKER_URL=https://os.ezil.work
 ```
+
+This URL **must be on the preview zone** (`PREVIEW_ZONE_ROOT` in `src/index.ts`,
+`ezil.work`), not a `*.workers.dev` host. The Worker derives the preview
+hostname from the inbound request's own `Host`, and `@cloudflare/sandbox`'s
+`exposePort()` throws `CustomDomainRequiredError` for anything ending in
+`.workers.dev` — a workers.dev URL here boots the container and then fails at
+desktop exposure every time.
 
 Notes:
 - `wrangler.toml` uses `instance_type = "standard"` (Chrome + Tomcat + a JVM need
