@@ -11,8 +11,10 @@
  * `server/lib/cloudflare-guacamole-provider.ts` and
  * `worker/src/index.ts`'s `deriveSandboxId` / `ensureWorkspaceMount`).
  *
- * Procedures: list / create / get / rename / touch. No delete procedure —
- * deletion is soft-delete only and out of scope for this wave.
+ * Procedures: list / create / get / rename / touch / delete. `delete` is
+ * SOFT delete only — it stamps `deleted_at` and never issues a SQL DELETE;
+ * see `./computer-store.ts` for the full rationale and the type-level
+ * guarantee that enforces it.
  *
  * Carried near-verbatim from EBuilder's
  * `apps/web/client/src/server/api/routers/computer.ts` (authored
@@ -25,19 +27,31 @@
  */
 
 import { TRPCError } from '@trpc/server';
-import { and, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { computers } from '@/server/db/schema';
+import {
+    deriveGuacamoleSandboxId,
+    newCorrelationId,
+    requestGuacamoleSandboxTerminate,
+    resolveCloudflareGuacamoleConfig,
+} from '@/server/lib/cloudflare-guacamole-provider';
+import {
+    liveComputersOf,
+    liveOwnedComputer,
+    MAX_COMPUTERS_PER_USER,
+    pickFreeSlot,
+    softDeleteComputer,
+} from './computer-store';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 /**
- * Hard cap on live (non-soft-deleted) computers per user. Lives here (and,
- * as a CHECK constraint, in the schema/migration) rather than only in the
- * partial unique index, so raising it later is a small, explicit,
- * one-place change.
+ * Re-exported from `./computer-store.ts` (which owns them, so the row-level
+ * rules stay importable without pulling in `../trpc` -> `@/server/db` ->
+ * `@/env`). These two import paths are long-standing public API of this
+ * module, so they keep working unchanged.
  */
-export const MAX_COMPUTERS_PER_USER = 2;
+export { MAX_COMPUTERS_PER_USER, pickFreeSlot };
 
 /** Typed, friendly error thrown when a user is already at the computer cap. */
 function computerLimitError(): TRPCError {
@@ -55,32 +69,30 @@ function isUniqueViolation(error: unknown): boolean {
 }
 
 /**
- * Pick the lowest-numbered free slot (1..MAX_COMPUTERS_PER_USER) given the
- * slots already occupied by the caller's live computers. Returns `null`
- * when every slot is taken. Pure and exported so slot-assignment behavior
- * (including the "always fill the lowest free slot, e.g. after deleting
- * slot 1" case) can be unit tested directly, without a database.
+ * Ask the desktop Worker to tear down this computer's sandbox. Best effort
+ * and never throws: the provider helper already swallows and logs its own
+ * transport errors, and a provider that isn't configured at all is a no-op
+ * rather than a failure.
  */
-export function pickFreeSlot(takenSlots: readonly number[]): number | null {
-    const taken = new Set(takenSlots);
-    for (let slot = 1; slot <= MAX_COMPUTERS_PER_USER; slot++) {
-        if (!taken.has(slot)) {
-            return slot;
-        }
-    }
-    return null;
-}
-
-/** Standard "live" (non-soft-deleted) row filter, scoped to the caller. */
-function ownedLiveComputer(userId: string, id: string) {
-    return and(eq(computers.id, id), eq(computers.userId, userId), isNull(computers.deletedAt));
+async function terminateComputerSandbox(userId: string, computerId: string): Promise<void> {
+    const config = resolveCloudflareGuacamoleConfig();
+    if (!config.isConfigured) return;
+    await requestGuacamoleSandboxTerminate(
+        config,
+        deriveGuacamoleSandboxId(userId, computerId),
+        newCorrelationId(),
+    );
 }
 
 export const computerRouter = createTRPCRouter({
-    /** List the authenticated user's live computers, lowest slot first. */
+    /**
+     * List the authenticated user's live computers, lowest slot first.
+     * Soft-deleted rows are excluded by `liveComputersOf`'s `deleted_at IS
+     * NULL` half — a deleted computer is gone from this list immediately.
+     */
     list: protectedProcedure.query(async ({ ctx }) => {
         return ctx.db.query.computers.findMany({
-            where: and(eq(computers.userId, ctx.user.id), isNull(computers.deletedAt)),
+            where: liveComputersOf(ctx.user.id),
             orderBy: (row, { asc }) => [asc(row.slot)],
         });
     }),
@@ -103,7 +115,7 @@ export const computerRouter = createTRPCRouter({
         )
         .mutation(async ({ ctx, input }) => {
             const existing = await ctx.db.query.computers.findMany({
-                where: and(eq(computers.userId, ctx.user.id), isNull(computers.deletedAt)),
+                where: liveComputersOf(ctx.user.id),
                 columns: { slot: true },
             });
 
@@ -147,7 +159,7 @@ export const computerRouter = createTRPCRouter({
         .input(z.object({ id: z.string().uuid() }))
         .query(async ({ ctx, input }) => {
             const computer = await ctx.db.query.computers.findFirst({
-                where: ownedLiveComputer(ctx.user.id, input.id),
+                where: liveOwnedComputer(ctx.user.id, input.id),
             });
 
             if (!computer) {
@@ -172,7 +184,7 @@ export const computerRouter = createTRPCRouter({
             const [updated] = await ctx.db
                 .update(computers)
                 .set({ name: input.name.trim() })
-                .where(ownedLiveComputer(ctx.user.id, input.id))
+                .where(liveOwnedComputer(ctx.user.id, input.id))
                 .returning();
 
             if (!updated) {
@@ -193,7 +205,7 @@ export const computerRouter = createTRPCRouter({
             const [updated] = await ctx.db
                 .update(computers)
                 .set({ lastOpenedAt: new Date() })
-                .where(ownedLiveComputer(ctx.user.id, input.id))
+                .where(liveOwnedComputer(ctx.user.id, input.id))
                 .returning();
 
             if (!updated) {
@@ -201,5 +213,39 @@ export const computerRouter = createTRPCRouter({
             }
 
             return updated;
+        }),
+
+    /**
+     * SOFT delete a computer, freeing its slot.
+     *
+     * Without this, a user who has created `MAX_COMPUTERS_PER_USER`
+     * computers is permanently stuck: `create` refuses a third and nothing
+     * can release a slot.
+     *
+     * Order matters and is enforced in `softDeleteComputer`: ownership check
+     * -> terminate the sandbox (which flushes the workspace to R2 and only
+     * then destroys the container) -> stamp `deleted_at`. Freeing the slot
+     * falls out of the stamp via the partial unique index; nothing else is
+     * written, and **no SQL DELETE is ever issued** — the row id IS the R2
+     * workspace prefix, so removing the row would orphan the user's files
+     * forever (see `./computer-store.ts`).
+     */
+    delete: protectedProcedure
+        .input(z.object({ id: z.string().uuid() }))
+        .mutation(async ({ ctx, input }) => {
+            const deleted = await softDeleteComputer(ctx.db, {
+                userId: ctx.user.id,
+                computerId: input.id,
+                terminateSandbox: () => terminateComputerSandbox(ctx.user.id, input.id),
+            });
+
+            if (!deleted) {
+                // Missing, already deleted, or someone else's — one
+                // indistinguishable NOT_FOUND, same anti-enumeration
+                // contract as `get`.
+                throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+            }
+
+            return deleted;
         }),
 });

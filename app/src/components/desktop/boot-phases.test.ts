@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+    BOOT_FAILURE_COPY,
     BOOT_PHASES,
     LONG_BOOT_MS,
     TYPICAL_BOOT_MS,
@@ -120,6 +121,33 @@ describe('computeBootUiState — never fabricates progress', () => {
             kind: 'failed',
             reason: 'unknown',
         });
+    });
+
+    it('gives the deterministic family the generic copy, never "retrying usually fixes this"', () => {
+        // These four are our bug or our misconfiguration and cannot be
+        // retried away, so `sandbox_crashed` — whose copy promises a retry
+        // will help — would be a lie. They take `unknown`, whose "if it keeps
+        // happening, let us know" is the true thing to say.
+        for (const errorCode of [
+            'bad_request',
+            'unauthorized',
+            'preconditions_unmet',
+            'custom_domain_required',
+        ] as const) {
+            expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode })).toEqual({
+                kind: 'failed',
+                reason: 'unknown',
+            });
+        }
+    });
+
+    it('invents no new failure copy for them — every reason still resolves to existing strings', () => {
+        expect(Object.keys(BOOT_FAILURE_COPY).sort()).toEqual([
+            'sandbox_crashed',
+            'timeout',
+            'unknown',
+            'worker_unreachable',
+        ]);
     });
 });
 

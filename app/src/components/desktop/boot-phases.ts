@@ -124,8 +124,18 @@ export interface BootFailureState {
 
 export type BootUiState = BootProgressState | BootReadyState | BootNotConfiguredState | BootFailureState;
 
-/** The error codes `requestGuacamolePreview` can genuinely produce, plus `timeout`. */
+/**
+ * The error codes `requestGuacamolePreview` can genuinely produce, plus
+ * `timeout`. Kept in lockstep with `GuacamolePreviewErrorCode` — including
+ * the four DETERMINISTIC codes, which have no honest specific copy of their
+ * own (see `classifyFailure`) but must still be representable, or this union
+ * silently stops mirroring the thing it claims to mirror.
+ */
 export type BootErrorCode =
+    | 'bad_request'
+    | 'unauthorized'
+    | 'preconditions_unmet'
+    | 'custom_domain_required'
     | 'connection_refused'
     | 'fetch_failed'
     | 'sandbox_runtime_blocked'
@@ -161,6 +171,20 @@ function classifyFailure(errorCode: BootErrorCode | undefined): BootFailureReaso
             return 'sandbox_crashed';
         case 'timeout':
             return 'timeout';
+        // The deterministic family — a malformed request, a rejected HMAC
+        // signature, an unmet Worker precondition, a `.workers.dev` host the
+        // Sandbox SDK refuses to expose a port on. All four are OUR bug or
+        // OUR misconfiguration, not something the user did or can influence,
+        // and none is a crash. `sandbox_crashed`'s copy ("Retrying usually
+        // fixes this") would be a straight lie for them, so they take the
+        // generic `unknown` copy, whose second clause ("if it keeps
+        // happening, let us know") is exactly right. Deliberately NOT given
+        // invented copy of their own: there is nothing true to say that the
+        // generic text doesn't already say.
+        case 'bad_request':
+        case 'unauthorized':
+        case 'preconditions_unmet':
+        case 'custom_domain_required':
         case 'worker_http_error':
         case 'unknown':
         default:

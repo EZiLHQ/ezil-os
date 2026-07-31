@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 
 import { Routes } from '@/utils/constants';
@@ -40,11 +40,17 @@ export function ComputerRow({
     computer,
     onCreate,
     isCreating,
+    onDelete,
+    isDeleting = false,
 }: {
     slot: number;
     computer?: ComputerRowData;
     onCreate: () => void;
     isCreating: boolean;
+    /** Opens the delete confirmation. Filled rows only. */
+    onDelete?: () => void;
+    /** True while this row's delete mutation is in flight. */
+    isDeleting?: boolean;
 }) {
     const router = useRouter();
     const navigatingRef = useRef(false);
@@ -81,9 +87,25 @@ export function ComputerRow({
                         </div>
                     </div>
                 </div>
-                <span className="rounded-full border border-white/15 bg-black/30 px-3 py-1 text-xs font-medium text-offwhite opacity-0 transition-opacity group-hover:opacity-100">
-                    Open
-                </span>
+                <div className="flex shrink-0 items-center gap-2">
+                    {/* "Open" is a hover affordance; "Deleting…" is status,
+                        so it stays visible whether or not the pointer is
+                        over the row. */}
+                    <span
+                        className={`rounded-full border border-white/15 bg-black/30 px-3 py-1 text-xs font-medium text-offwhite transition-opacity ${
+                            isDeleting ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                        }`}
+                    >
+                        {isDeleting ? 'Deleting…' : 'Open'}
+                    </span>
+                    {onDelete ? (
+                        <RowMenu
+                            computerName={computer.name}
+                            disabled={isDeleting}
+                            onDelete={onDelete}
+                        />
+                    ) : null}
+                </div>
             </div>
         );
     }
@@ -106,6 +128,93 @@ export function ComputerRow({
             </div>
             <PlusIcon className="h-4 w-4 text-gray-500" />
         </button>
+    );
+}
+
+/**
+ * The row's overflow menu. Lives INSIDE the row's `role="button"` element,
+ * so every handler here stops propagation — a click on "Delete computer"
+ * that bubbled up would open the computer it is about to delete. Escape and
+ * a click anywhere else close it.
+ */
+function RowMenu({
+    computerName,
+    disabled,
+    onDelete,
+}: {
+    computerName: string;
+    disabled: boolean;
+    onDelete: () => void;
+}) {
+    const [open, setOpen] = useState(false);
+    const containerRef = useRef<HTMLDivElement>(null);
+
+    useEffect(() => {
+        if (!open) return;
+        const onDocPointerDown = (e: MouseEvent) => {
+            if (!containerRef.current?.contains(e.target as Node)) setOpen(false);
+        };
+        const onKeyDown = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') setOpen(false);
+        };
+        document.addEventListener('mousedown', onDocPointerDown);
+        document.addEventListener('keydown', onKeyDown);
+        return () => {
+            document.removeEventListener('mousedown', onDocPointerDown);
+            document.removeEventListener('keydown', onKeyDown);
+        };
+    }, [open]);
+
+    return (
+        <div
+            ref={containerRef}
+            className="relative"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => e.stopPropagation()}
+        >
+            <button
+                type="button"
+                aria-haspopup="menu"
+                aria-expanded={open}
+                aria-label={`More actions for ${computerName}`}
+                data-testid="computer-row-menu-button"
+                disabled={disabled}
+                onClick={() => setOpen((v) => !v)}
+                className="flex h-8 w-8 items-center justify-center rounded-md text-gray-500 opacity-70 transition-colors hover:bg-white/10 hover:text-offwhite focus-visible:opacity-100 group-hover:opacity-100 disabled:opacity-40"
+            >
+                <DotsIcon className="h-4 w-4" />
+            </button>
+
+            {open ? (
+                <div
+                    role="menu"
+                    className="absolute right-0 top-10 z-20 w-48 overflow-hidden rounded-md border border-white/10 bg-charcoal-light py-1 shadow-xl"
+                >
+                    <button
+                        type="button"
+                        role="menuitem"
+                        data-testid="computer-row-delete"
+                        onClick={() => {
+                            setOpen(false);
+                            onDelete();
+                        }}
+                        className="block w-full px-3 py-2 text-left text-sm text-red-400 transition-colors hover:bg-red-500/10"
+                    >
+                        Delete computer
+                    </button>
+                </div>
+            ) : null}
+        </div>
+    );
+}
+
+function DotsIcon(props: React.SVGProps<SVGSVGElement>) {
+    return (
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" {...props}>
+            <circle cx="5" cy="12" r="2" />
+            <circle cx="12" cy="12" r="2" />
+            <circle cx="19" cy="12" r="2" />
+        </svg>
     );
 }
 
