@@ -66,6 +66,63 @@ import registry from './apps/registry.js';
 
 const PHASE = 'ezil-os:boot';
 
+/**
+ * ── 🔴 THE HYDRATION CONTRACT ───────────────────────────────────────────────
+ * `/os` is a React (Next.js App Router) document. React OWNS `<body>` and
+ * `<div id="ezil-os-root">`: it rendered them on the server and it will
+ * re-check them, node by node, when its own chunks arrive and it hydrates.
+ *
+ * If anything mutates a node React owns BEFORE that check, React finds a tree
+ * it did not render, reports a hydration mismatch (minified error #418) and
+ * REGENERATES THE WHOLE TREE from its own copy — deleting every element the
+ * shell built. `suppressHydrationWarning` suppresses the warning, not the
+ * regeneration. MEASURED on the production build with 900ms of latency on
+ * `/_next/static/chunks/**`: 4 of 5 loads ended as a blank white page.
+ *
+ * So the shell does not touch a React-owned node until React says it has
+ * hydrated. The host page opts into that handshake by marking its mount point
+ * (`data-awaits-hydration="react"`, see `app/src/app/os/page.tsx`) and
+ * dispatching `ezil:hydrated` from a client effect. A page with NO marker —
+ * the headless tests, any future bare host — mounts immediately, exactly as
+ * before; nothing is waiting for an event that will never arrive.
+ *
+ * Two independent guards back it up, because a handshake that can be missed
+ * must not be the only thing standing between a user and a blank page:
+ *   - the wait is CAPPED (`HYDRATION_CAP_MS`), so a page whose React never
+ *     loads still gets an OS;
+ *   - the mount is REBUILDABLE (`ensure_intact`), so if the desktop is ever
+ *     removed from the document — by a late hydration, by a future mutation
+ *     nobody predicted — the shell notices and builds it again. The failure
+ *     mode degrades to "boots twice", never to "blank forever".
+ */
+const HYDRATION_ATTR = 'data-awaits-hydration';
+const HYDRATION_EVENT = 'ezil:hydrated';
+/**
+ * How long to wait for `ezil:hydrated` before mounting anyway.
+ *
+ * Above the observed hydration time on a badly delayed production load (~1.1s
+ * with 900ms of artificial latency on React's chunks) and far below anything a
+ * user would sit through. Past it we accept a possible wipe — which
+ * `ensure_intact` then repairs — rather than leave the page with no OS on it
+ * because a script we do not control never ran.
+ */
+const HYDRATION_CAP_MS = 3_000;
+/**
+ * A mount that keeps disappearing is a bug, not a retry loop. One initial
+ * mount plus three rebuilds, then stop and say so.
+ */
+const MAX_MOUNT_ATTEMPTS = 4;
+
+/** Set while `mount()` is in flight, so a rebuild cannot race a build. */
+let mounting = false;
+let mount_attempts = 0;
+/** The current app list + launch context, for listeners bound exactly once. */
+let current_apps = [];
+let current_ctx = null;
+let start_click_bound = false;
+/** Watches for the desktop being removed from the document. */
+let removal_observer = null;
+
 export const shell = {
     version: 1,
     session,
@@ -93,7 +150,31 @@ export const shell = {
     desktop: null,
 
     booted: false,
+    /**
+     * True while a built desktop is believed to be on screen.
+     *
+     * 🔴 NOT a latch. It used to be one, and that made a single lost race
+     * unrecoverable: React deleted the desktop, `mounted` stayed true, every
+     * re-entry into `mount()` returned early, and the user sat on a blank page
+     * for the rest of the session. It is now cleared by `ensure_intact()` the
+     * moment the desktop is no longer in the document, and by `mount()` itself
+     * if the build throws. Nothing can set it true and walk away.
+     */
     mounted: false,
+    /** Mount attempts so far, including rebuilds. Observability, not state. */
+    get mountAttempts () { return mount_attempts; },
+
+    /**
+     * Rebuild the desktop if it is missing. Safe to call at any time: it does
+     * nothing when the OS is intact, and it resets the attempt budget so a
+     * user (or a console) always has a way back. This is the manual half of
+     * the same guarantee `ensure_intact` gives automatically.
+     */
+    recover () {
+        mount_attempts = 0;
+        ensure_intact('recover() called');
+        return shell.mounted;
+    },
 };
 
 /**
@@ -109,6 +190,14 @@ export const shell = {
  * Without the class the generic `.window-body-app { height: calc(100% - 30px) }`
  * wins and the full-bleed desktop iframe is 30 pixels short of the viewport
  * for its entire life.
+ *
+ * 🔴 Called from `mount()`, NEVER from `boot()`. `<body>` is React's element on
+ * `/os` and writing to it before hydration is what destroyed the shell — see
+ * THE HYDRATION CONTRACT at the top of this file. The class cannot move onto
+ * an EZiL-owned wrapper instead, because `UIWindow.js:51` appends every window
+ * to `<body>` directly: a wrapper inside `#ezil-os-root` would not be an
+ * ancestor of the windows, and ~40 `.device-* .window-*` rules would stop
+ * matching.
  */
 function set_device_class () {
     let cls = 'device-desktop';
@@ -131,7 +220,11 @@ function set_device_class () {
  * here, so it is an empty container and any icons come later, from apps.
  *
  * Reuses an existing `.desktop` if one is already in the document, so a second
- * call (or a host page that pre-rendered one) cannot produce two.
+ * call cannot produce two — and so the one `/os` renders SERVER-SIDE (inside
+ * `#ezil-os-root`, see `app/src/app/os/page.tsx`) is adopted rather than
+ * duplicated. That server-rendered node is why the wallpaper is on screen
+ * before any script runs, and why the shell has nothing to append into a
+ * React-owned element in the common case.
  */
 function mount_desktop_root () {
     const existing = document.querySelector('.desktop');
@@ -176,9 +269,12 @@ function open_start_menu (apps, ctx, el_anchor) {
 }
 
 /**
- * Everything after the globals: the desktop, the taskbar, and exactly one
- * window. Not awaited by `boot()` — the caller's frame must not be held open
- * by window construction.
+ * Everything after the globals: the device class, the desktop, the taskbar,
+ * and exactly one window. Not awaited by `boot()` — the caller's frame must
+ * not be held open by window construction.
+ *
+ * 🔴 Runs only after the host page has hydrated (or declared it will not).
+ * Everything below writes to DOM React owns.
  */
 async function mount (payload) {
     if ( shell.mounted ) {
@@ -187,6 +283,18 @@ async function mount (payload) {
     }
     shell.mounted = true;
 
+    try {
+        await build(payload);
+    } catch ( err ) {
+        // 🔴 A build that threw half-way must not leave the shell believing it
+        // is mounted — that is how `mounted` became a one-way door. Clear it,
+        // and let `ensure_intact` decide whether to try again.
+        shell.mounted = false;
+        throw err;
+    }
+}
+
+async function build (payload) {
     const t0 = performance.now();
     const ctx = {
         payload,
@@ -194,12 +302,21 @@ async function mount (payload) {
         desktopState: payload.desktopState,
     };
 
+    set_device_class();
     shell.desktop = mount_desktop_root();
+    watch_for_removal();
     const apps = registry.resolve(payload);
+    current_apps = apps;
+    current_ctx = ctx;
 
     // The taskbar. Built BEFORE the window, so it exists for
     // `exit_fullpage_mode` to un-hide rather than have to re-create, and so
     // the first paint already has a dock in it.
+    //
+    // On a REBUILD (see `ensure_intact`) any taskbar still in the document is
+    // an orphan of the mount that was destroyed — `UITaskbar` appends
+    // unconditionally, so it has to go or the dock is drawn twice.
+    $('.taskbar').remove();
     await UITaskbar({});
 
     // Pinned items, created up front rather than left to `UIWindow` — an app
@@ -223,9 +340,15 @@ async function mount (payload) {
         });
     }
 
-    window.addEventListener('ezil:start-click', (e) => {
-        open_start_menu(apps, ctx, e.detail?.element);
-    });
+    // Bound ONCE, whatever happens afterwards: a rebuild that re-bound it
+    // would open one Start menu per rebuild. It reads the current app list
+    // from module state instead of closing over this call's copy.
+    if ( ! start_click_bound ) {
+        start_click_bound = true;
+        window.addEventListener('ezil:start-click', (e) => {
+            open_start_menu(current_apps, current_ctx, e.detail?.element);
+        });
+    }
 
     console.info(`[${PHASE}] desktop + taskbar painted in ${(performance.now() - t0).toFixed(1)}ms`);
 
@@ -240,6 +363,137 @@ async function mount (payload) {
         return;
     }
     await registry.launch(first.id, ctx);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// The hydration handshake and the rebuild guard. See THE HYDRATION CONTRACT
+// at the top of this file for why any of this exists.
+// ───────────────────────────────────────────────────────────────────────────
+
+/** `/os`'s mount point, or null on a bare page. */
+function host_element () {
+    return document.getElementById('ezil-os-root');
+}
+
+/**
+ * Does the host page say React is going to hydrate it? Opt-IN: an unmarked
+ * page (the headless tests, a bare host) mounts immediately, so nothing ever
+ * waits on an event that is never coming.
+ */
+function awaits_hydration () {
+    return host_element()?.getAttribute(HYDRATION_ATTR) === 'react';
+}
+
+/**
+ * Call `fn` when it is safe to write to React-owned DOM: as soon as the host
+ * page reports it has hydrated, immediately if it never will, or at
+ * `HYDRATION_CAP_MS` if the signal never arrives.
+ */
+function when_hydrated (fn) {
+    if ( ! awaits_hydration() ) {
+        fn('host does not hydrate');
+        return;
+    }
+    // The effect may have run before this bundle did — the flag is the
+    // already-happened form of the event, and one of the two always applies.
+    if ( globalThis.__EZIL_HYDRATED__ ) {
+        fn('host already hydrated');
+        return;
+    }
+
+    let fired = false;
+    const go = (how) => {
+        if ( fired ) return;
+        fired = true;
+        clearTimeout(timer);
+        window.removeEventListener(HYDRATION_EVENT, on_signal);
+        fn(how);
+    };
+    const on_signal = () => go('host hydrated');
+    window.addEventListener(HYDRATION_EVENT, on_signal);
+    const timer = setTimeout(() => go(`no hydration signal in ${HYDRATION_CAP_MS}ms`), HYDRATION_CAP_MS);
+}
+
+/** Is a desktop this shell built still on screen? */
+function is_intact () {
+    return shell.mounted
+        && !! shell.desktop
+        && shell.desktop.isConnected
+        && !! document.querySelector('.taskbar');
+}
+
+/**
+ * Start a mount, unless one is already running, already succeeded, or has
+ * failed too many times. The attempt budget is what makes this terminate: no
+ * path through here can loop.
+ */
+function begin_mount (why) {
+    if ( mounting || shell.mounted || ! shell.payload ) return;
+    if ( mount_attempts >= MAX_MOUNT_ATTEMPTS ) {
+        console.error(
+            `[${PHASE}] the desktop could not be kept on screen after ${mount_attempts} attempts (${why}).`
+            + ' Not trying again — reload the page, or call ezil.recover().',
+        );
+        return;
+    }
+    mount_attempts += 1;
+    mounting = true;
+    void mount(shell.payload)
+        .catch((err) => { console.error(`[${PHASE}] mount failed (${why})`, err); })
+        .finally(() => {
+            mounting = false;
+            // The desktop can be destroyed WHILE it is being built; re-check
+            // once the build has settled rather than trusting that it stuck.
+            ensure_intact(`mount settled (${why})`);
+        });
+}
+
+/**
+ * The guard that makes a lost race survivable: if the desktop this shell built
+ * is no longer in the document, build it again.
+ *
+ * 🔴 This is the reason `shell.mounted` can no longer strand the app. Whatever
+ * removes the desktop — a late React hydration, a future host-page change, a
+ * script nobody has written yet — the shell notices and rebuilds, bounded by
+ * `MAX_MOUNT_ATTEMPTS`. The worst case is a desktop that boots twice.
+ */
+function ensure_intact (why) {
+    if ( ! shell.booted || ! shell.payload ) return;
+    // A mount in flight re-checks itself when it settles; interrupting it now
+    // would build a second desktop on top of the first.
+    if ( mounting || is_intact() ) return;
+
+    if ( shell.mounted ) {
+        console.warn(`[${PHASE}] the desktop is no longer in the document (${why}); rebuilding it`);
+        shell.mounted = false;
+        shell.desktop = null;
+        // The windows of the destroyed desktop were never closed — their
+        // `$.fn.close` teardown did not run, so they are still holding timers
+        // and, possibly, an in-flight container boot. Tell them to stop before
+        // the rebuilt desktop opens its own.
+        window.dispatchEvent(new CustomEvent('ezil:teardown'));
+    }
+    begin_mount(why);
+}
+
+/**
+ * Notice the desktop being removed. Two containers are enough to see every
+ * way it can happen: React regenerating the page removes `#ezil-os-root` from
+ * `<body>`, and React re-writing the host's contents removes `.desktop` from
+ * `#ezil-os-root`. `childList` only, no subtree — dragging a window must not
+ * pay for this.
+ */
+function watch_for_removal () {
+    if ( typeof MutationObserver === 'undefined' ) return;
+    if ( ! removal_observer ) {
+        removal_observer = new MutationObserver(() => ensure_intact('DOM mutation'));
+    }
+    // Re-armed on every mount: after a regeneration the host element is a NEW
+    // node, and an observer still watching the old detached one sees nothing.
+    removal_observer.disconnect();
+    if ( document.body ) removal_observer.observe(document.body, { childList: true });
+    const host = host_element();
+    if ( host ) removal_observer.observe(host, { childList: true });
 }
 
 /**
@@ -261,14 +515,22 @@ export function boot () {
         return shell;
     }
 
+    // 🔴 Nothing in here may write to the DOM. `install_globals` touches only
+    // `window` and localStorage; the listeners below add no nodes. The device
+    // class moved into `mount()` for exactly this reason — see THE HYDRATION
+    // CONTRACT at the top of the file.
     install_globals();
-    set_device_class();
 
     // Snapping, drag-target detection and the mouseover-window z-order probe
     // all read state that only this handler maintains.
     document.addEventListener('mousemove', (e) => {
         update_mouse_position(e.clientX, e.clientY);
     });
+
+    // Every hydration — the first one, and any re-render React does after a
+    // mismatch — is a moment the desktop may have just been deleted. Bound
+    // permanently, not `{ once: true }`.
+    window.addEventListener(HYDRATION_EVENT, () => ensure_intact('host hydrated'));
 
     shell.booted = true;
 
@@ -282,9 +544,11 @@ export function boot () {
     console.info(
         `[${PHASE}] shell ready (v${shell.version}) in ${(performance.now() - t0).toFixed(1)}ms`,
     );
-    // Not awaited: `boot()` returns as soon as the OS is on screen.
-    void mount(payload).catch((err) => {
-        console.error(`[${PHASE}] mount failed`, err);
+    // Not awaited: `boot()` returns as soon as the OS is on screen — or, on a
+    // React host, as soon as the desktop is SCHEDULED to go on screen.
+    when_hydrated((why) => {
+        console.info(`[${PHASE}] mounting (${why})`);
+        begin_mount(why);
     });
     return shell;
 }

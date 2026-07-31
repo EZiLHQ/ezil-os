@@ -6,6 +6,7 @@ import { appRouter } from '@/server/api/root';
 import { createTRPCContext } from '@/server/api/trpc';
 import { bootPayloadScript, buildShellBootPayload } from '@/server/shell/boot-payload';
 import { Routes, getReturnUrlQueryParam } from '@/utils/constants';
+import { HydrationSignal } from './hydration-signal';
 
 /**
  * `/os` — the host page for the EZiL OS shell.
@@ -16,31 +17,51 @@ import { Routes, getReturnUrlQueryParam } from '@/utils/constants';
  * that bundle on screen fast and hand it a boot payload so it never has to ask
  * the server who the user is.
  *
- * ── The budget: paint in under 200ms ────────────────────────────────────────
- * The rule that makes it achievable is that this page NEVER AWAITS THE
- * CONTAINER. A cold desktop boot is ~22s (docs/PLATFORM-NOTES.md §11), so any
- * page that waits for `cloudflareGuacamole.previewUrl` before its first byte
- * is a page with a 22-second TTFB. This page calls only:
+ * ── The budget, and what it actually costs ──────────────────────────────────
+ * The rule that keeps it bounded is that this page NEVER AWAITS THE CONTAINER.
+ * A cold desktop boot is ~22s (docs/PLATFORM-NOTES.md §11), so any page that
+ * waits for `cloudflareGuacamole.previewUrl` before its first byte is a page
+ * with a 22-second TTFB. This page calls only:
  *
  *   - `computer.getOrCreateDefault` — one indexed read for a returning user;
  *   - `cloudflareGuacamole.isConfigured` — a pure environment-variable read,
  *     no network at all;
  *
- * and it runs them CONCURRENTLY with the session lookup, so the wall clock is
- * one Supabase auth round trip plus one database round trip, not three in
- * series. Booting the desktop is the shell's job, over
- * `POST /api/shell/desktop`, after the page is already on screen.
+ * concurrently with each other (they cannot start before the session lookup —
+ * both need the resolved user), so the wall clock is one Supabase auth round
+ * trip plus one database round trip, not three in series. Booting the desktop
+ * is the shell's job, over `POST /api/shell/desktop`, after the page is
+ * already on screen.
  *
- * ── Two known costs, both deliberate ────────────────────────────────────────
+ * 🔴 MEASURED, `next start` on the dev host, median of 8 warm loads, an aim of
+ * <200ms: TTFB 414ms; desktop + taskbar + window on screen at 488ms. The two
+ * remaining terms are both pure network and both irreducible in this file:
+ * `supabase.auth.getUser()` is 154ms and the computer lookup is 240ms against
+ * a Supabase instance a long way from this host (a bare `select 1` on the same
+ * pool is 120ms). 154 + 240 accounts for 394ms of the 414ms.
+ *
+ * So <200ms is NOT reachable here by rearranging awaits — the arithmetic is
+ * out of room. It needs one of: local JWT verification instead of the Auth
+ * round trip (this project already issues ES256 tokens, so
+ * `supabase.auth.getClaims()` would verify in-process — a change to the app's
+ * revocation semantics, not to this page); a cached/co-located database; or an
+ * app deployed in the database's region, where that 240ms is single digits.
+ * Do not claim the target is met until one of those has been measured.
+ *
+ * ── Three known costs, all deliberate ───────────────────────────────────────
  * 1. This page inherits the root layout (`src/app/layout.tsx`), so React and
  *    `TRPCReactProvider` are still shipped and hydrated even though this page
- *    has no client component of its own. Removing them means giving `/os` its
- *    own root layout, which in Next's App Router requires moving EVERY route
- *    into route groups — a change that touches `/computers` and
- *    `/computer/[id]`, which have to keep working as the fallback. It is the
- *    right follow-up, but not a change to make in the same breath as landing
- *    the shell.
- * 2. `<script src>` tags rendered by React execute on a real document load,
+ *    has no UI of its own. That is what makes the hydration handshake below
+ *    necessary. Removing them means giving `/os` its own root layout, which in
+ *    Next's App Router requires moving EVERY route into route groups — a
+ *    change that touches `/computers` and `/computer/[id]`, which have to keep
+ *    working as the fallback. It is the right follow-up, but not a change to
+ *    make in the same breath as landing the shell.
+ * 2. 🔴 React hydrates this document, and until it has, the shell may not
+ *    touch `<body>` or `#ezil-os-root`. See the mount point below and
+ *    `hydration-signal.tsx`. This is not a style preference: getting it wrong
+ *    produced a permanently blank page on 4 of 5 loads under load.
+ * 3. `<script src>` tags rendered by React execute on a real document load,
  *    but NOT when React inserts them during a client-side navigation. So the
  *    entry point into `/os` must be a full page load (a plain `<a href>` or a
  *    redirect), never a `<Link>` prefetch-and-swap. Nothing links here yet;
@@ -122,13 +143,39 @@ export default async function Page() {
             <link rel="stylesheet" href="/os/bundle.min.css" precedence="default" />
 
             {/*
-              * The shell's mount point. `suppressHydrationWarning` because the
-              * bundle below may populate this element BEFORE React hydrates —
-              * from React's point of view the server HTML and the live DOM
-              * would then disagree, and that disagreement is the intended
-              * behaviour here, not a bug to warn about.
+              * The shell's mount point — and its wallpaper, rendered here on
+              * the server rather than appended by the bundle.
+              *
+              * 🔴 `data-awaits-hydration="react"` is a CONTRACT, not a hint.
+              * It tells the shell that this page is a React document and that
+              * it must not touch `<body>` or this element until
+              * `<HydrationSignal>` below says React has committed. Without the
+              * handshake the shell mutates first, React finds a tree it did
+              * not render, reports minified error #418 and REGENERATES THE
+              * WHOLE TREE — deleting the desktop and leaving a blank white
+              * page. MEASURED on this production build with 900ms of latency
+              * on `/_next/static/chunks/**`: 4 of 5 loads destroyed.
+              * `suppressHydrationWarning` suppresses the warning, not the
+              * regeneration; it is kept only to silence the innerHTML compare.
+              *
+              * `dangerouslySetInnerHTML` (with a constant string) is how React
+              * is told this subtree is not its business: an element with it
+              * gets no child fibers, so React neither hydrates nor reconciles
+              * whatever the shell builds inside. The markup itself is the
+              * `.desktop.ezil-desktop` root the shell would otherwise create —
+              * `mount_desktop_root()` in `shell/ezil/boot.js` adopts an
+              * existing one — so the wallpaper is painted from the HTML, with
+              * no JavaScript at all, instead of after the 616KB bundle runs.
+              * 🔴 The class pair is duplicated from `shell/ezil/ui/
+              * ezil-shell.css`; change it here and there together.
               */}
-            <div id="ezil-os-root" suppressHydrationWarning />
+            <div
+                id="ezil-os-root"
+                data-awaits-hydration="react"
+                suppressHydrationWarning
+                dangerouslySetInnerHTML={{ __html: '<div class="desktop ezil-desktop"></div>' }}
+            />
+            <HydrationSignal />
 
             {/*
               * Order is load-bearing: the payload must exist before the bundle

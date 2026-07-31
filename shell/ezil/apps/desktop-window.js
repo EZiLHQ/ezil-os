@@ -268,14 +268,27 @@ export async function openDesktopWindow (ctx = {}) {
     }
 
     // ── teardown ───────────────────────────────────────────────────────────
-    // `$.fn.close` awaits this before it dismantles anything, so it is the one
-    // place guaranteed to run exactly once per close.
-    el_window.on_before_exit = async () => {
+    /** Everything that must stop, whichever way this window ends. */
+    const dispose = () => {
         disposed = true;
         stop_timers();
         observer.disconnect();
+        window.removeEventListener('ezil:teardown', dispose);
+    };
+
+    // `$.fn.close` awaits this before it dismantles anything, so it is the one
+    // place guaranteed to run exactly once per close.
+    el_window.on_before_exit = async () => {
+        dispose();
         return true;
     };
+
+    // The other way a window ends: something removed it from the document
+    // without closing it, and the shell is rebuilding the desktop (see
+    // `ensure_intact` in ../boot.js). `$.fn.close` never runs in that case, so
+    // without this the orphan keeps polling and its in-flight boot keeps
+    // racing the rebuilt window for the same container.
+    window.addEventListener('ezil:teardown', dispose);
 
     void start_boot();
     return el_window;
