@@ -158,6 +158,15 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
     push('the window keeps its own head, so there is an ordinary way out',
         window.$(win).find('.window-head').css('display') !== 'none',
         window.$(win).find('.window-head').css('display'));
+    // 🔴 UIWindow.js:346 renders this ONLY for a resizable window. OBSERVED in
+    // Chromium: with `is_resizable: false` the head came out with a close
+    // button and nothing else, so "put my computer aside while it boots" would
+    // have meant closing it. `is_resizable: true` is carried for this button.
+    push('🔴 ...and that head has a MINIMISE button, not just a close',
+        win?.querySelectorAll('.window-head .window-minimize-btn').length === 1
+        && win?.querySelectorAll('.window-head .window-close-btn').length === 1,
+        `min=${win?.querySelectorAll('.window-head .window-minimize-btn').length}`
+        + ` close=${win?.querySelectorAll('.window-head .window-close-btn').length}`);
     push('UIWindow did NOT create a second taskbar item',
         $$(window, '.taskbar-item[data-app="desktop"]').length === 1);
     push('pinned item counts the open window',

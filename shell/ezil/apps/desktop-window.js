@@ -128,13 +128,17 @@ export async function openDesktopWindow (ctx = {}) {
         // read as "an app starting" rather than "the OS is this window".
         width: 560,
         height: 400,
-        // 🔴 `is_fullpage: true` used to force this off (UIWindow.js:114-118)
-        // and we still need it off: nothing removes jQuery UI's resize handles
-        // on the way into full-bleed, so a resizable window would keep them at
-        // the viewport edges and let a stray drag shrink the live desktop.
-        // Same reason for the maximize button, which would fight `go_fullbleed`
-        // for the same geometry.
-        is_resizable: false,
+        // 🔴 Resizable — and NOT because anyone needs to resize a boot panel.
+        // `UIWindow.js:346` renders the head's MINIMISE button only when
+        // `is_resizable && show_minimize_button && !is_embedded`. OBSERVED in
+        // Chromium with `is_resizable: false`: the head came out with a close
+        // button and nothing else, which would leave "get this out of my way
+        // while my computer boots" as a thing the user can only do by closing
+        // the window. `ezil-shell.css` hides the resize handles once the window
+        // is full-bleed, so a stray drag still cannot shrink the live desktop.
+        is_resizable: true,
+        // The maximize button would fight `go_fullbleed` for the same geometry
+        // and leave `data-is_maximized` set behind a full-bleed window.
         show_maximize_button: false,
         stay_on_top: true,
         single_instance: true,
