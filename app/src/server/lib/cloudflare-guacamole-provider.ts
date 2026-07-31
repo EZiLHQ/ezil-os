@@ -437,7 +437,22 @@ export function deriveGuacamoleSandboxId(userId: string, computerId: string): st
  * in the composed Neko URL's `pwd` query field for this exact preview iframe.
  */
 function deriveNekoRegularUserValue(hmacSecret: string, sandboxId: string): string {
-    const payload = `ezil-neko:user:${sandboxId}:v1`;
+    return deriveNekoRoleValue(hmacSecret, 'user', sandboxId);
+}
+
+/**
+ * Same derivation for the ADMIN role. Used only server-side, to log in to the
+ * container's own Neko HTTP API (see `enableImplicitHosting` below). It is
+ * NEVER placed in a URL, returned to the browser, or logged.
+ *
+ *   payload = `ezil-neko:admin:<sandboxId>:v1`
+ */
+export function deriveNekoAdminValue(hmacSecret: string, sandboxId: string): string {
+    return deriveNekoRoleValue(hmacSecret, 'admin', sandboxId);
+}
+
+function deriveNekoRoleValue(hmacSecret: string, role: 'user' | 'admin', sandboxId: string): string {
+    const payload = `ezil-neko:${role}:${sandboxId}:v1`;
     return createHmac('sha256', hmacSecret).update(payload).digest('hex').toLowerCase().slice(0, 32);
 }
 
@@ -449,6 +464,25 @@ function deriveNekoRegularUserValue(hmacSecret: string, sandboxId: string): stri
  * When no `hmacSecret` is configured (local dev), falls back to Neko's
  * built-in local default member password so a keyless environment still
  * auto-connects; the raw HMAC secret is NEVER placed in the URL.
+ *
+ * `embed=1` is deliberate and load-bearing — it is what makes this look like
+ * the user's own computer instead of somebody else's app. In the pinned
+ * client bundle (`/var/www/js/app.*.js`) it drives:
+ *
+ *   get videoOnly() { return this.isCastMode || this.isEmbedMode }
+ *
+ * and `videoOnly` is what suppresses Neko's header (which contains an
+ * `<a href="https://github.com/m1k1o/neko">` logo), member list, chat sidebar,
+ * emote bar and toast overlay, leaving only the desktop.
+ *
+ * It ALSO — counter-intuitively — is what keeps Neko's own in-video control
+ * button reachable. The button renders as
+ * `<li :class="extraControls || 'extra-control'">`, `extraControls` is bound
+ * to embed mode, and the stylesheet says
+ * `.video-menu li.extra-control { display: none }` above 768px. In embed mode
+ * the class binding evaluates to the boolean `true`, which Vue 2 stringifies
+ * to `''` — so the button carries no class and stays visible at every width.
+ * Dropping `embed=1` would hide it on desktop. Do not remove this param.
  */
 export function composeBrowserDesktopUrl(rawUrl: string, hmacSecret: string, sandboxId: string): string {
     const url = new URL(rawUrl);
@@ -457,4 +491,123 @@ export function composeBrowserDesktopUrl(rawUrl: string, hmacSecret: string, san
     url.searchParams.set('pwd', pwd);
     url.searchParams.set('embed', '1');
     return url.toString();
+}
+
+// ─── Taking control of your own computer ──────────────────────────────────────
+
+/**
+ * Outcome of trying to put the desktop into implicit-hosting mode.
+ *
+ *   'implicit' — the user just clicks the desktop and it is theirs; the click
+ *                itself is replayed, so the handshake is invisible.
+ *   'manual'   — we could not enable it. The desktop still works, but the
+ *                user must first click Neko's small mouse icon in the video's
+ *                top-right corner. The UI says so rather than leaving them to
+ *                discover that their computer ignores them.
+ */
+export type DesktopControlMode = 'implicit' | 'manual';
+
+/** Whole time budget for the control-mode handshake, on the desktop-open critical path. */
+const IMPLICIT_HOSTING_BUDGET_MS = 8_000;
+
+/** The one field we change. Every other setting is read back and preserved verbatim. */
+type NekoRoomSettings = Record<string, unknown> & { implicit_hosting?: boolean };
+
+/**
+ * Make the computer respond to a plain click, the way a computer should.
+ *
+ * WHY THIS EXISTS. Neko is built for *shared* browsing, so control is a
+ * request/grant handshake between members. This product is a single-user
+ * computer: there is exactly one member, and asking them to request control of
+ * their own machine is pure friction. Neko has a switch for precisely this —
+ * `session.implicit_hosting` — but the pinned image's baked
+ * `/etc/neko/neko.yaml` turns it OFF (`# default setting for legacy API`),
+ * overriding Neko's own default of ON.
+ *
+ * With it OFF, the shipped client's `implicitHostingRequest()` reduces a click
+ * to `$emit('control-attempt')`, whose only effect is a 5s shake animation on
+ * `<neko-controls>` — a component `embed=1` does not even render. So a click
+ * on the desktop does nothing at all, silently, forever.
+ *
+ * With it ON, the same handler calls `remote.request()` AND buffers the
+ * mousedown/mouseup, replaying them from `onControlChange` once control lands.
+ * The user experiences one ordinary click.
+ *
+ * HOW. Neko exposes the flag on its own admin API. We log in with the
+ * per-sandbox admin credential the Worker already derives, read the CURRENT
+ * settings, flip exactly one field, and write the merged object back —
+ * `settingsSet` is a whole-object replace, so a hand-written body silently
+ * resets everything it omits (observed live: posting without
+ * `heartbeat_interval` reset the room's 10 to 0).
+ *
+ * ORDERING. The client reads `implicit_hosting` exactly once, from the legacy
+ * `system/init` websocket message; there is no live update path. This runs
+ * server-side BEFORE the preview URL is handed to the browser, so the flag is
+ * already true by the time the iframe connects.
+ *
+ * NEVER THROWS, and never blocks a working desktop: any failure returns
+ * 'manual' and the caller renders a visible fallback affordance. Nothing about
+ * the admin credential or the session token is logged or returned.
+ *
+ * (The durable fix is one flag on the container's own `neko serve` invocation
+ * — `--session.implicit_hosting=true` in `worker/scripts/start-neko.sh`. When
+ * that lands, this becomes a cheap no-op: the read below already reports
+ * `true` and it returns without writing.)
+ */
+export async function enableImplicitHosting(
+    desktopUrl: string,
+    adminPassword: string,
+): Promise<DesktopControlMode> {
+    let origin: string;
+    try {
+        origin = new URL(desktopUrl).origin;
+    } catch {
+        return 'manual';
+    }
+
+    const deadline = AbortSignal.timeout(IMPLICIT_HOSTING_BUDGET_MS);
+    let token: string | null = null;
+
+    try {
+        const loginRes = await fetch(`${origin}/api/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 'ezil-os-control', password: adminPassword }),
+            signal: deadline,
+        });
+        if (!loginRes.ok) return 'manual';
+        const login = (await loginRes.json()) as { token?: unknown };
+        if (typeof login.token !== 'string' || login.token.length === 0) return 'manual';
+        token = login.token;
+
+        const auth = { Authorization: `Bearer ${token}` };
+
+        const currentRes = await fetch(`${origin}/api/room/settings`, { headers: auth, signal: deadline });
+        if (!currentRes.ok) return 'manual';
+        const current = (await currentRes.json()) as NekoRoomSettings;
+        if (current.implicit_hosting === true) return 'implicit';
+
+        const setRes = await fetch(`${origin}/api/room/settings`, {
+            method: 'POST',
+            headers: { ...auth, 'Content-Type': 'application/json' },
+            // Merge, never replace — see the doc comment above.
+            body: JSON.stringify({ ...current, implicit_hosting: true }),
+            signal: deadline,
+        });
+        return setRes.ok ? 'implicit' : 'manual';
+    } catch {
+        // Timeout, transport failure, non-JSON body — all mean the same thing
+        // to the user, and none of them may take the desktop down with them.
+        return 'manual';
+    } finally {
+        if (token) {
+            // Don't leave a phantom admin session in the room. Best effort:
+            // its failure changes nothing the user can perceive.
+            void fetch(`${origin}/api/logout`, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${token}` },
+                signal: AbortSignal.timeout(3_000),
+            }).catch(() => undefined);
+        }
+    }
 }

@@ -36,6 +36,8 @@ import { computers } from '@/server/db/schema';
 import {
     composeBrowserDesktopUrl,
     deriveGuacamoleSandboxId,
+    deriveNekoAdminValue,
+    enableImplicitHosting,
     getGuacamoleSandboxStatus,
     newCorrelationId,
     requestGuacamolePreview,
@@ -166,6 +168,29 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 sandboxId,
             );
 
+            // Make the desktop respond to a plain click before the browser is
+            // told where it is. This is one person's own computer, so control
+            // must not be a handshake — see `enableImplicitHosting`. It runs
+            // HERE, not in the browser, for two reasons: the admin credential
+            // must never leave the server, and the client reads the flag once
+            // at websocket init, so it has to be true before the iframe
+            // exists. It never throws; a failure downgrades to 'manual' and
+            // the canvas says so out loud rather than shipping a desktop that
+            // silently ignores clicks.
+            const controlMode =
+                result.mode === 'local-dev-stub'
+                    ? ('manual' as const)
+                    : await enableImplicitHosting(
+                          result.guacamoleUrl,
+                          hmacSecret ? deriveNekoAdminValue(hmacSecret, sandboxId) : 'admin',
+                      );
+            if (controlMode !== 'implicit') {
+                console.warn('[cloudflareGuacamole.previewUrl] implicit hosting unavailable', {
+                    correlationId,
+                    computerId: input.computerId,
+                });
+            }
+
             return {
                 ok: true as const,
                 correlationId,
@@ -174,6 +199,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 provider: 'cloudflare-guacamole' as const,
                 mode: result.mode,
                 workspace: result.workspace,
+                controlMode,
             };
         }),
 
