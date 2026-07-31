@@ -141,9 +141,23 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
     push('desktop window opened', !!win);
     push('🔴 EXACTLY ONE window',
         $$(window, '.window').length === 1, `${$$(window, '.window').length} windows`);
-    push('window is fullpage + stay_on_top',
-        win?.getAttribute('data-is_fullpage') === '1' && win?.getAttribute('data-stay_on_top') === 'true',
-        `fullpage=${win?.getAttribute('data-is_fullpage')} sot=${win?.getAttribute('data-stay_on_top')}`);
+    push('window is stay_on_top',
+        win?.getAttribute('data-stay_on_top') === 'true', win?.getAttribute('data-stay_on_top'));
+
+    // 🔴 THE BOOT-TIME CHROME CONTRACT. This window used to be created with
+    // `is_fullpage: true`, so UIWindow called `enter_fullpage_mode` 50ms later
+    // and `$('.taskbar').hide()` took the dock away from the first frame — for
+    // the whole ~26s container boot the user had a full-bleed boot panel and a
+    // 54x15px drawer tongue. Full-bleed is now earned, not assumed.
+    push('🔴 the window opens WINDOWED, not full-bleed',
+        win?.getAttribute('data-is_fullpage') === '0'
+        && !win?.classList.contains('ezil-fullbleed'),
+        `fullpage=${win?.getAttribute('data-is_fullpage')} class="${win?.className}"`);
+    push('🔴 the TASKBAR IS ON SCREEN while the container boots',
+        window.$('.taskbar').css('display') !== 'none', window.$('.taskbar').css('display'));
+    push('the window keeps its own head, so there is an ordinary way out',
+        window.$(win).find('.window-head').css('display') !== 'none',
+        window.$(win).find('.window-head').css('display'));
     push('UIWindow did NOT create a second taskbar item',
         $$(window, '.taskbar-item[data-app="desktop"]').length === 1);
     push('pinned item counts the open window',
@@ -197,23 +211,41 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
     push('and it confirms "connecting", the phase the signal actually means',
         confirmed?.getAttribute('data-phase') === 'connecting', confirmed?.getAttribute('data-phase'));
 
-    // The drawer — the only chrome once the taskbar is hidden.
+    // The drawer — the only chrome once the taskbar is hidden. It is attached
+    // up front (so `go_fullbleed` cannot fire without an exit existing) but it
+    // must NOT have played its intro: while the window has a head and a
+    // taskbar, the tongue is a worse duplicate of controls already on screen.
     const drawer = $1(window, '.window[data-app="desktop"] .ezil-app-drawer');
     push('control drawer attached to the window', !!drawer);
     push('drawer carries Minimise and Close',
         !!drawer?.querySelector('.dashboard-app-drawer-minimize')
         && !!drawer?.querySelector('.dashboard-app-drawer-close'));
+    push('🔴 the drawer does NOT introduce itself while the window is windowed',
+        drawer?.classList.contains('collapsed') === true, drawer?.className);
 
     // Let the preview land.
     release_preview();
     const swapped = await until(() => iframe.getAttribute('src') === URL_OK);
     push('🔴 iframe is navigated only after previewUrl RESOLVED', !!swapped, iframe.getAttribute('src'));
     push('panel reports ready', $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'ready');
+    push('and the taskbar is STILL there — the frame has not loaded yet',
+        window.$('.taskbar').css('display') !== 'none', window.$('.taskbar').css('display'));
 
-    // ── minimise, with the taskbar hidden ──────────────────────────────────
-    window.enter_fullpage_mode(win);       // what UIWindow does after 50ms
-    push('fullpage mode hides the taskbar (the reason the drawer exists)',
+    // ── the handoff: the desktop earns the viewport ────────────────────────
+    // jsdom never loads an external iframe (VERIFIED: no `load` event ever
+    // fires for a cross-origin src), so the browser's own signal is raised
+    // here by hand. The 4s belt-and-braces timer in `desktop-window.js` would
+    // otherwise be what this test measured.
+    iframe.dispatchEvent(new window.Event('load'));
+    const fullbled = await until(() => win.classList.contains('ezil-fullbleed'), 2000);
+    push('🔴 full-bleed happens when the DESKTOP FRAME lands, not before', !!fullbled,
+        win.className);
+    push('...and only then is the taskbar hidden (the reason the drawer exists)',
         window.$('.taskbar').css('display') === 'none', window.$('.taskbar').css('display'));
+    push('the panel is retired in the same beat, so chrome is never traded for nothing',
+        $1(window, '.ezil-boot')?.hidden === true);
+    push('close() now knows it owes the user a taskbar back',
+        win.getAttribute('data-is_fullpage') === '1', win.getAttribute('data-is_fullpage'));
 
     window.$(drawer.querySelector('.dashboard-app-drawer-minimize')).trigger('click');
     const taskbar_back = await until(() => window.$('.taskbar').css('display') !== 'none');
@@ -228,8 +260,10 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
     window.$('.taskbar-item[data-app="desktop"]').trigger('click');
     const restored = await until(() => !['1', 'true'].includes(win.getAttribute('data-is_minimized')));
     push('taskbar click restores the window', !!restored);
-    const refullpaged = await until(() => win.getAttribute('data-is_fullpage') === '1', 2000);
-    push('restore returns to full-bleed (not a 680x380 box)', !!refullpaged);
+    const refullpaged = await until(
+        () => win.getAttribute('data-is_fullpage') === '1' && win.classList.contains('ezil-fullbleed'), 2000);
+    push('restore returns to full-bleed (not a 680x380 box)', !!refullpaged,
+        `fullpage=${win.getAttribute('data-is_fullpage')} class="${win.className}"`);
 
     // 🔴 Regression guard for the missing `remove_taskbar_item`: before it was
     // restored, this threw INSIDE $.fn.close, leaving an unclosable window.
@@ -264,6 +298,17 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
     push('phase list is hidden on failure', $1(window, '.ezil-boot-phases')?.hidden === true);
     const retry = $1(window, '.ezil-boot-retry');
     push('Retry is offered', !!retry && $1(window, '.ezil-boot-actions')?.hidden === false);
+
+    // 🔴 A boot that never succeeded must never have cost the user their OS.
+    // Under the old `is_fullpage: true` this failure panel was full-bleed with
+    // the taskbar hidden behind it.
+    const failed_win = $1(window, '.window[data-app="desktop"]');
+    push('🔴 a FAILED boot leaves the taskbar on screen',
+        window.$('.taskbar').css('display') !== 'none', window.$('.taskbar').css('display'));
+    push('...and the failure panel sits in a window, not over the whole viewport',
+        failed_win?.classList.contains('ezil-fullbleed') === false
+        && failed_win?.getAttribute('data-is_fullpage') === '0',
+        `class="${failed_win?.className}" fullpage=${failed_win?.getAttribute('data-is_fullpage')}`);
 
     window.$(retry).trigger('click');
     const retried = await until(() => attempts >= 2);
