@@ -36,7 +36,10 @@ import {
     requestGuacamoleSandboxTerminate,
     resolveCloudflareGuacamoleConfig,
 } from '@/server/lib/cloudflare-guacamole-provider';
+import { computerCreateError } from './computer-errors';
 import {
+    createComputerInLowestFreeSlot,
+    getOrCreateDefaultComputer,
     liveComputersOf,
     liveOwnedComputer,
     MAX_COMPUTERS_PER_USER,
@@ -52,21 +55,6 @@ import { createTRPCRouter, protectedProcedure } from '../trpc';
  * module, so they keep working unchanged.
  */
 export { MAX_COMPUTERS_PER_USER, pickFreeSlot };
-
-/** Typed, friendly error thrown when a user is already at the computer cap. */
-function computerLimitError(): TRPCError {
-    return new TRPCError({ code: 'FORBIDDEN', message: 'computer_limit_reached' });
-}
-
-/** True for a Postgres unique-violation error (SQLSTATE 23505). */
-function isUniqueViolation(error: unknown): boolean {
-    return (
-        typeof error === 'object' &&
-        error !== null &&
-        'code' in error &&
-        (error as { code?: unknown }).code === '23505'
-    );
-}
 
 /**
  * Ask the desktop Worker to tear down this computer's sandbox.
@@ -113,8 +101,12 @@ export const computerRouter = createTRPCRouter({
      * where a concurrent duplicate request (e.g. a double-click) wins the
      * same slot first: the partial unique index on `(user_id, slot) WHERE
      * deleted_at IS NULL` turns that race into a Postgres unique violation,
-     * which is caught here and converted to the SAME typed error rather
-     * than surfacing as a raw 500.
+     * which `createComputerInLowestFreeSlot` converts to the SAME typed
+     * reason rather than surfacing as a raw 500.
+     *
+     * The body moved to `./computer-store.ts` unchanged when
+     * `getOrCreateDefault` below needed the identical slot-pick + race
+     * handling; one implementation, so the two entry points cannot drift.
      */
     create: protectedProcedure
         .input(
@@ -123,45 +115,48 @@ export const computerRouter = createTRPCRouter({
             }),
         )
         .mutation(async ({ ctx, input }) => {
-            const existing = await ctx.db.query.computers.findMany({
-                where: liveComputersOf(ctx.user.id),
-                columns: { slot: true },
+            const outcome = await createComputerInLowestFreeSlot(ctx.db, {
+                userId: ctx.user.id,
+                name: input.name,
             });
 
-            const slot = pickFreeSlot(existing.map((row) => row.slot));
-            if (slot === null) {
-                throw computerLimitError();
+            if (!outcome.ok) {
+                throw computerCreateError(outcome.reason);
             }
 
-            try {
-                const [created] = await ctx.db
-                    .insert(computers)
-                    .values({
-                        userId: ctx.user.id,
-                        slot,
-                        name: input.name?.trim() || 'Computer',
-                    })
-                    .returning();
-
-                if (!created) {
-                    throw new TRPCError({
-                        code: 'INTERNAL_SERVER_ERROR',
-                        message: 'Failed to create computer.',
-                    });
-                }
-
-                return created;
-            } catch (err) {
-                if (isUniqueViolation(err)) {
-                    // Lost the race for this slot to a concurrent create —
-                    // report the identical friendly, typed error instead of
-                    // letting the raw Postgres unique-violation bubble up as
-                    // an opaque 500.
-                    throw computerLimitError();
-                }
-                throw err;
-            }
+            return outcome.computer;
         }),
+
+    /**
+     * Return the caller's LOWEST-slot live computer, creating one only if
+     * they have none. This is how the EZiL OS shell (`/os`) boots: a user
+     * arrives and gets a computer, without ever being shown a list or a
+     * "create" button.
+     *
+     * A mutation because it can write. `/os` calls it during render anyway
+     * (see `src/app/os/page.tsx`) — that is safe precisely because it is
+     * idempotent: a user with a computer gets it back after ONE indexed
+     * read, so a repeat render, a refresh or a route prefetch can never
+     * produce a second row.
+     *
+     * `created` reports what actually happened, never an assumption. See
+     * `getOrCreateDefaultComputer` for the concurrent-double-create race:
+     * the loser of the slot race re-reads and returns the winner's row, and
+     * only a re-read that still finds nothing raises the same typed
+     * `computer_limit_reached` this router has always raised.
+     *
+     * Takes no input on purpose — a computer created here is named with the
+     * same default `create` uses, and the shell has no name to offer at boot.
+     */
+    getOrCreateDefault: protectedProcedure.mutation(async ({ ctx }) => {
+        const outcome = await getOrCreateDefaultComputer(ctx.db, { userId: ctx.user.id });
+
+        if (!outcome.ok) {
+            throw computerCreateError(outcome.reason);
+        }
+
+        return { computer: outcome.computer, created: outcome.created };
+    }),
 
     /** Fetch a single computer by id. Ownership-scoped: never returns another user's row. */
     get: protectedProcedure

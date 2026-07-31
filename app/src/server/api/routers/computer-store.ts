@@ -36,7 +36,7 @@ import { and, eq, isNull, type ExtractTablesWithRelations, type SQL } from 'driz
 import type { PgDatabase, PgQueryResultHKT } from 'drizzle-orm/pg-core';
 
 import * as schema from '@/server/db/schema';
-import { computers } from '@/server/db/schema';
+import { computers, type Computer } from '@/server/db/schema';
 
 /**
  * Hard cap on live (non-soft-deleted) computers per user. Lives here (and,
@@ -64,6 +64,22 @@ export const MAX_COMPUTERS_PER_USER = 2;
 export type ComputerStoreDb = Pick<
     PgDatabase<PgQueryResultHKT, typeof schema, ExtractTablesWithRelations<typeof schema>>,
     'query' | 'update'
+>;
+
+/**
+ * The database surface the CREATE path is given: relational reads (`query`)
+ * and `insert`.
+ *
+ * A separate type from `ComputerStoreDb` on purpose. The soft-delete surface
+ * above is documented as "`query` + `update`, and `delete` is absent ON
+ * PURPOSE"; widening THAT type to also carry `insert` would blur the one
+ * sentence a future reader most needs to be able to trust. So the create
+ * path gets its own equally-narrow `Pick<>` — which, note, also has no
+ * `delete`. Every database surface in this module is delete-free.
+ */
+export type ComputerCreateDb = Pick<
+    PgDatabase<PgQueryResultHKT, typeof schema, ExtractTablesWithRelations<typeof schema>>,
+    'query' | 'insert'
 >;
 
 /**
@@ -101,6 +117,151 @@ export function liveComputersOf(userId: string): SQL | undefined {
  */
 export function liveOwnedComputer(userId: string, id: string): SQL | undefined {
     return and(eq(computers.id, id), eq(computers.userId, userId), isNull(computers.deletedAt));
+}
+
+// ── Creating, and the get-or-create the OS shell boots through ──────────────
+
+/** True for a Postgres unique-violation error (SQLSTATE 23505). */
+export function isUniqueViolation(error: unknown): boolean {
+    return (
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        (error as { code?: unknown }).code === '23505'
+    );
+}
+
+/**
+ * Why the create path returns an outcome instead of throwing: this module is
+ * deliberately free of `../trpc`, so it cannot mint a `TRPCError`. The router
+ * maps each reason to the SAME typed error it has always thrown — see
+ * `computerCreateError` in `./computer.ts`.
+ *
+ * `computer_limit_reached` covers BOTH ways a user can be at the cap: the
+ * plain read said every slot was taken, and the read said otherwise but a
+ * concurrent insert won the slot first (SQLSTATE 23505 on the partial unique
+ * index `(user_id, slot) WHERE deleted_at IS NULL`). Collapsing them here is
+ * the point — a double-click must not be able to produce a raw 500 or a
+ * third computer.
+ */
+export type CreateComputerOutcome =
+    | { ok: true; computer: Computer }
+    | { ok: false; reason: 'computer_limit_reached' | 'insert_returned_no_row' };
+
+/** The lowest-slot LIVE computer owned by `userId`, or undefined if they have none. */
+export async function findLowestLiveComputer(
+    db: ComputerCreateDb,
+    userId: string,
+): Promise<Computer | undefined> {
+    return db.query.computers.findFirst({
+        where: liveComputersOf(userId),
+        orderBy: (row, { asc }) => [asc(row.slot)],
+    });
+}
+
+/**
+ * Insert one computer into the caller's lowest free slot.
+ *
+ * The single implementation of "make a computer", shared by
+ * `computer.create` and `computer.getOrCreateDefault` so the cap and the
+ * race handling below cannot drift between the two entry points.
+ */
+export async function createComputerInLowestFreeSlot(
+    db: ComputerCreateDb,
+    { userId, name }: { userId: string; name?: string },
+): Promise<CreateComputerOutcome> {
+    const existing = await db.query.computers.findMany({
+        where: liveComputersOf(userId),
+        columns: { slot: true },
+    });
+
+    const slot = pickFreeSlot(existing.map((row) => row.slot));
+    if (slot === null) {
+        return { ok: false, reason: 'computer_limit_reached' };
+    }
+
+    try {
+        const [created] = await db
+            .insert(computers)
+            .values({ userId, slot, name: name?.trim() || 'Computer' })
+            .returning();
+
+        if (!created) {
+            return { ok: false, reason: 'insert_returned_no_row' };
+        }
+
+        return { ok: true, computer: created };
+    } catch (err) {
+        if (isUniqueViolation(err)) {
+            // Lost the race for this slot to a concurrent create — report the
+            // identical friendly, typed reason instead of letting the raw
+            // Postgres unique-violation bubble up as an opaque 500.
+            return { ok: false, reason: 'computer_limit_reached' };
+        }
+        throw err;
+    }
+}
+
+export interface GetOrCreateDefaultComputerResult {
+    computer: Computer;
+    /** True only when THIS call inserted the row. Never guessed. */
+    created: boolean;
+}
+
+export type GetOrCreateDefaultComputerOutcome =
+    | ({ ok: true } & GetOrCreateDefaultComputerResult)
+    | { ok: false; reason: 'computer_limit_reached' | 'insert_returned_no_row' };
+
+/**
+ * "Open my computer" — the operation the OS shell boots through.
+ *
+ * Returns the caller's LOWEST-slot live computer, creating one only if they
+ * have none. Idempotent by construction: a user who already has a computer
+ * gets it back after exactly ONE indexed read, and never a second row.
+ *
+ * ## The race
+ *
+ * Two tabs (or a page and its prefetch) can reach the empty-user path at the
+ * same instant. Both read zero live computers, both pick slot 1, and the
+ * partial unique index turns the loser's insert into SQLSTATE 23505 —
+ * surfaced by `createComputerInLowestFreeSlot` as `computer_limit_reached`.
+ *
+ * For a get-or-create, that reason is not yet an answer: the loser's user is
+ * not at the cap, they simply lost a slot to their own other tab. So the
+ * loser RE-READS. If the winner's row is now visible — the overwhelmingly
+ * common case — it is returned with `created: false`, which is exactly what
+ * get-or-create promises: one row, both callers served, no duplicate and no
+ * 500.
+ *
+ * The re-read is allowed to come back empty (the winner's row soft-deleted in
+ * the microseconds between), and then there is nothing true left to return.
+ * The cap reason stands and the router raises the same typed
+ * `computer_limit_reached` FORBIDDEN that `create` raises. That is a
+ * deliberate choice of the honest failure over an invented one: the caller
+ * gets a typed, retryable refusal rather than a fabricated row or a 500.
+ */
+export async function getOrCreateDefaultComputer(
+    db: ComputerCreateDb,
+    { userId, name }: { userId: string; name?: string },
+): Promise<GetOrCreateDefaultComputerOutcome> {
+    const existing = await findLowestLiveComputer(db, userId);
+    if (existing) {
+        return { ok: true, computer: existing, created: false };
+    }
+
+    const outcome = await createComputerInLowestFreeSlot(db, { userId, name });
+    if (outcome.ok) {
+        return { ok: true, computer: outcome.computer, created: true };
+    }
+
+    if (outcome.reason === 'computer_limit_reached') {
+        const winner = await findLowestLiveComputer(db, userId);
+        if (winner) {
+            return { ok: true, computer: winner, created: false };
+        }
+    }
+
+    return outcome;
 }
 
 export interface SoftDeleteComputerInput {
