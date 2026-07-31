@@ -56,17 +56,79 @@ browser — the browser only ever speaks the Guacamole protocol to the web app.
 | --- | --- |
 | `GET /health` | `{ ok, service, mode }` |
 | `POST /sandbox/preview` | `{ ok, guacamoleUrl, expiresAt, provider, mode, sandboxId }` |
-| `GET /sandbox/:name/status` | `{ ok, sandboxName, guacamoleRunning, mode }` |
-| `DELETE /sandbox/:name` | `{ ok, sandboxName, terminated, mode }` |
+| `GET /sandbox/:name/status` | `{ ok, sandboxName, guacamoleRunning, mode, desktopRunning, runningModes, modeSource }` |
+| `DELETE /sandbox/:name` | `{ ok, sandboxName, terminated, stopped, outcome, wasRunning, runningAfter, mode }` |
 
 `guacamoleUrl` is the exposed container root (`https://<port>-<id>-desktop.<host>/`),
 which serves the auto-connect landing page that redirects into
 `/guacamole/#/client/<id>?token=…`.
 
-`POST /sandbox/preview` is authenticated with the same HMAC token envelope the
-EBuilder control plane mints (`t=<unix_ms>,v1=<hex_hmac_sha256>` over
-`${ts}.POST./sandbox/preview.`). When no secret is configured the Worker runs in
-local-dev mode and skips verification.
+### Authentication
+
+One HMAC envelope gates every mutating route: `t=<unix_ms>,v1=<hex_hmac_sha256>`
+over `${ts}.POST./sandbox/preview.`, verified against `SANDBOX_HMAC_SECRET` /
+`CLOUDFLARE_GUACAMOLE_HMAC_SECRET` (plus the optional mission alias below).
+When no secret is configured the Worker runs in local-dev mode and skips
+verification.
+
+| Route | Credential |
+| --- | --- |
+| `GET /health` | none (read-only) |
+| `GET /sandbox/:name/status` | none — see the note below |
+| `POST /sandbox/preview` | HMAC token in the JSON body (`token`) |
+| `POST /sandbox/:name/{workspace-diag,cpu-diag,twen}` | HMAC token in the JSON body |
+| `POST /project-files/*` | HMAC token in the JSON body |
+| `DELETE /sandbox/:name` | **HMAC token** — `Authorization: Bearer <token>` (preferred), `?token=`, or a JSON body `{token}` |
+| `GET /preview-bootstrap` (preview host) | sandboxId-bound bootstrap token in `?token=` |
+| `GET /preview-status` (preview host) | `ezil_preview` cookie **or** the sandboxId-bound bootstrap token |
+| `GET /preview`, `/preview-ws`, `/preview-inspector.js` (preview host) | `ezil_preview` cookie |
+
+`GET /sandbox/:name/status` is deliberately left open: it is read-only, reads
+only Durable Object storage (it can never wake or bill a container), and
+discloses nothing beyond whether a desktop is currently serving under a name
+the caller must already know. Gating it would require the app to sign its
+poll; do both together if you want it closed.
+
+> **Callers must sign `DELETE`.** This route previously had *no* authorization
+> at all — an unsigned `DELETE` returned `ok:true`, and the sandbox name is
+> plainly visible in the desktop iframe's `src`, so anyone who saw a URL could
+> destroy that session. `app/src/server/lib/cloudflare-guacamole-provider.ts`'s
+> `requestGuacamoleSandboxTerminate()` currently sends no token and will now
+> get a 401; add
+> `headers: { authorization: \`Bearer ${mintSandboxPreviewToken(hmacSecret)}\` }`
+> to that `fetch` (it already imports the minting helper it uses for
+> `/sandbox/preview`). Terminate is best-effort in the app and sandboxes
+> auto-sleep after 30m regardless, so an unsigned destructive endpoint is by
+> far the worse of the two states to be in while that lands.
+
+### Reading a `DELETE` response
+
+`terminated` is `true` **only** when a container was observed running before
+the call and observed gone after it. `outcome` says which happened:
+
+| `outcome` | meaning |
+| --- | --- |
+| `destroyed` | a running container was torn down by this call |
+| `not_running` | nothing was running under this name — **nothing was destroyed** |
+| `still_running` | `destroy()` returned but the container is still up (HTTP 500) |
+| `destroy_failed` | `destroy()` threw (HTTP 500) |
+
+`not_running` is what a mistyped or mis-derived sandbox name reports. The name
+is `guac-<userId16>-<scopeId16>` (`deriveSandboxId`) — **not** the preview
+hostname label, which additionally carries the port token
+(`…-desktop` / `…-nekodesktop` / `…-app`). Sending the hostname label used to
+return `terminated: true` while the real container kept running.
+
+### Reading a `/status` response
+
+`mode` is **detected** from the live exposed-port list when the caller omits
+`?desktopMode=` (`modeSource: "detected"`), so a neko desktop reports
+`mode: "neko"` rather than defaulting to `guacamole`. `guacamoleRunning` means
+"the desktop port for the reported `mode` is exposed" — always read it together
+with `mode`. An explicit `?desktopMode=` is still answered literally
+(`modeSource: "requested"`). `desktopRunning` / `runningModes` are additive and
+report every desktop that is actually up regardless of which one was asked
+about.
 
 ## Quick start (local dev)
 
@@ -213,7 +275,16 @@ Notes:
   suggesting the renamed tier (e.g. `standard-1`) — update only after confirming
   the valid value with `wrangler containers` for your account.
 - Sandboxes auto-sleep after 30m idle; `DELETE /sandbox/:name` calls `destroy()`
-  for explicit teardown.
+  for explicit teardown, then re-reads `ctx.container.running` and reports what
+  actually happened (see "Reading a `DELETE` response" above).
+- The periodic workspace flush loop **must** be cancelled on teardown.
+  `@cloudflare/containers`' `alarm()` runs every due schedule *before* it checks
+  `container.running`, and the flush walks the workspace over container RPCs —
+  which auto-start a stopped container. An un-cancelled loop therefore
+  resurrects whatever `destroy()` just killed, within one flush interval.
+  `EzilSandboxDO.destroy()` tombstones the sandbox (`ezil:workspaceTerminated`)
+  and calls `deleteSchedules()`; the next successful hydrate clears the
+  tombstone and the loop restarts.
 
 ## Validation
 
