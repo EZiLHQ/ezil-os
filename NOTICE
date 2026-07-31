@@ -5,17 +5,30 @@ This product is licensed under the GNU Affero General Public License v3.0
 (AGPL-3.0). See the LICENSE file at the root of this repository for the
 full license text.
 
-This repository contains only original EZiL code plus ordinary, unmodified
-third-party dependencies and container-image components (Apache Guacamole,
-Neko, VS Code, Google Chrome, the Cloudflare Sandbox SDK, and their
-transitive npm dependencies). No source code from any prior project has
-been copied into this repository.
+This repository contains original EZiL code, ordinary unmodified third-party
+dependencies and container-image components (Apache Guacamole, Neko, VS Code,
+Google Chrome, the Cloudflare Sandbox SDK, and their transitive npm
+dependencies), and a modified fork of the Puter web desktop
+(https://github.com/HeyPuter/puter), which is licensed AGPL-3.0-only.
+
+Puter-derived source is confined to shell/src/ and HAS BEEN MODIFIED by
+EZiL: the cloud backend it originally depended on — identity, filesystem,
+key-value preferences, app metadata and realtime — is removed and replaced
+with EZiL's own local implementations. The file-by-file record of what was
+taken, what was changed, and when is shell/PUTER-PROVENANCE.md, and that
+record — not this summary — is authoritative about what is present at any
+given commit.
+
+This software is a modified version of Puter software and is not endorsed by
+Puter Technologies Inc. Puter is a trademark of Puter Technologies Inc.;
+EZiL-OS is not affiliated with, sponsored by, or endorsed by Puter
+Technologies Inc., and carries none of its logos or marks.
 
 For the complete list of third-party components this repository actually
 uses, their licenses, and what each is used for — including a voluntary
-acknowledgement of the Onlook and Puter projects as design/architectural
-influences on EZiL, with no code carried from either — see ATTRIBUTIONS.md
-at the root of this repository.
+acknowledgement of the Onlook project as a design/architectural influence on
+EZiL, with no code carried from it — see ATTRIBUTIONS.md at the root of this
+repository.
 
 Nothing in this NOTICE modifies or waives the terms of any individual
 third-party license. Where this NOTICE and an upstream project's own

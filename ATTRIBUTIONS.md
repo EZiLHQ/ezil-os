@@ -6,16 +6,59 @@ whose code, binary, or container-image component is actually present in
 this repository, states the license each one carries, and flags anything
 that constrains redistribution.
 
-**This is a clean-start repository.** Unlike an earlier, unpublished
-prototype this project grew out of, EZiL-OS carries **no third-party
-application source code** — only ordinary, unmodified runtime dependencies
-and container-image components, listed below. If you believe an
-attribution is missing or inaccurate, please open an issue — under-crediting
-an upstream project is treated as a bug in this repository.
+**Third-party application source code is confined to one directory.**
+EZiL-OS incorporates a **modified fork of the Puter web desktop**, and every
+file derived from it lives under [`shell/src/`](./shell/src). Nothing outside
+that directory derives from another project's application source; the rest of
+this repository is EZiL-authored code plus ordinary, unmodified runtime
+dependencies and container-image components, listed below.
+
+[`shell/PUTER-PROVENANCE.md`](./shell/PUTER-PROVENANCE.md) is the
+file-by-file index of what was taken verbatim, what was taken and modified,
+and what was written fresh. **It is authoritative over any summary in this
+file** — as of this writing the `shell/` tree is scaffolded but not yet
+populated, so the index, not this paragraph, is where to check what is
+actually present.
+
+If you believe an attribution is missing or inaccurate, please open an issue
+— under-crediting an upstream project is treated as a bug in this repository.
 
 ---
 
-## 1. Desktop / sandbox container image (`worker/Dockerfile`)
+## 1. Forked application source (`shell/`)
+
+### Puter (`HeyPuter/puter`)
+- **URL:** https://github.com/HeyPuter/puter
+- **License:** **AGPL-3.0-only** (verified via GitHub Licenses API).
+- **Used for:** The browser desktop shell — window manager, taskbar, desktop
+  surface, and their CSS. EZiL-OS is licensed AGPL-3.0-only itself, so there
+  is no licence conflict and no relicensing: the fork stays AGPL-3.0-only and
+  this repository's own terms already satisfy it.
+- **🔴 MODIFIED.** This is a fork, not a dependency. Puter's GUI talks to a
+  cloud backend for identity, files, key-value preferences, app metadata and
+  realtime; **none of that backend exists in EZiL-OS.** The shell runs in the
+  browser and talks only to EZiL's own Worker and container. Removed or
+  replaced wholesale: `puter.kv` (→ browser `localStorage`, see
+  `shell/ezil/session.js`), `puter.fs`, `puter.apps`, `puter.auth`, socket.io
+  realtime, `services/*`, `IPC.js`, and the entire `src/backend` tree. The
+  `:root` design tokens the chrome derives from are overridden by
+  `shell/src/css/ezil-tokens.css`. Puter's webpack build is not used; see
+  `shell/build-shell.sh`.
+- **Modification notice (AGPL-3.0 §5(a)):** this software is a modified
+  version of Puter software and is **not endorsed by Puter Technologies
+  Inc.** Per-file records of what changed, and when, are in
+  [`shell/PUTER-PROVENANCE.md`](./shell/PUTER-PROVENANCE.md).
+- **Trademarks:** Puter's `TRADEMARK.md` grants **no trademark rights**, and
+  explicitly requires a modified distribution to remove Puter's logos.
+  Accordingly EZiL-OS carries no Puter logos, names or marks in its shipped
+  UI or branding; the Puter word mark appears in this repository only in
+  attribution and provenance prose, which is the use that policy permits.
+  Puter is a trademark of Puter Technologies Inc. EZiL-OS is not affiliated
+  with, sponsored by, or endorsed by Puter Technologies Inc.
+
+---
+
+## 2. Desktop / sandbox container image (`worker/Dockerfile`)
 
 ### Apache Guacamole (`apache/guacamole-client`, `apache/guacamole-server`)
 - **URL:** https://guacamole.apache.org/
@@ -71,7 +114,7 @@ an upstream project is treated as a bug in this repository.
 
 ---
 
-## 2. `worker/` npm dependencies (`worker/package.json`, `worker/bun.lock`)
+## 3. `worker/` npm dependencies (`worker/package.json`, `worker/bun.lock`)
 
 | Package | License | Used for |
 |---|---|---|
@@ -95,7 +138,7 @@ No GPL, LGPL, AGPL, SSPL, or "non-commercial only" dependency was found in
 
 ---
 
-## 3. Voluntary acknowledgements (no code carried, no license obligation)
+## 4. Voluntary acknowledgements (no code carried, no license obligation)
 
 Nothing in this section is required by any license. It is here because the
 lineage is real and we'd rather over-credit than under-credit.
@@ -105,10 +148,9 @@ lineage is real and we'd rather over-credit than under-credit.
 - **License:** Apache-2.0 (verified against upstream's `LICENSE.md`).
 - **Relationship:** EZiL-OS's predecessor prototype was architecturally
   built on top of Onlook, an open-source AI-first visual React editor.
-  **This repository (EZiL-OS) carries no Onlook code** — it is a
-  clean-start repository containing only `worker/` (a Cloudflare Worker
-  and container image) and `docs/`, neither of which derives from or
-  contains any Onlook source. Because no code is carried, Onlook's
+  **This repository (EZiL-OS) carries no Onlook code** — it was started
+  clean, and none of `app/`, `worker/`, `shell/` or `docs/` derives from
+  or contains any Onlook source. Because no code is carried, Onlook's
   Apache-2.0 license imposes **no obligation** on this repository.
   **We credit Onlook anyway, voluntarily**, because the architectural
   lineage — the idea of a persistent, streamed, real desktop/editor
@@ -116,28 +158,20 @@ lineage is real and we'd rather over-credit than under-credit.
   erasing that history would be dishonest even though it isn't legally
   required.
 
-### Puter (`HeyPuter/puter`)
-- **URL:** https://github.com/HeyPuter/puter
-- **License:** AGPL-3.0 (verified via GitHub Licenses API).
-- **Relationship:** Puter was studied as a **design and product reference**
-  for "a real computer in your browser" UX patterns during EZiL-OS's
-  design phase. **No code from Puter has been copied into this
-  repository.** As with Onlook, this credit is **entirely voluntary** —
-  no license obligation is triggered by studying a product's UX. If code
-  is ever incorporated from Puter, this file must be updated at that time
-  to say so explicitly and to carry forward Puter's AGPL-3.0 terms for
-  that code (conveniently compatible with EZiL-OS's own AGPL-3.0 license).
+> **Puter used to be listed here.** It no longer belongs in a "no code
+> carried" section: EZiL-OS now forks it, so the credit is a licence
+> obligation rather than a courtesy. See **§1** above.
 
 ---
 
-## 4. UNVERIFIED items carried forward
+## 5. UNVERIFIED items carried forward
 
 These could not be independently confirmed as of this writing. They are
 marked UNVERIFIED rather than guessed at, and should be re-checked before
 anyone relies on an assumed license:
 
 - **`neko-apps` (`m1k1o/neko-apps`)** — no upstream `LICENSE` file found.
-  See §1 above.
+  See §2 above.
 - **`onlook-dev/admin`** — not publicly accessible; license could not be
   checked. Not relevant to this repository's own license posture since no
   code from it is present here, but carried forward from prior research in
@@ -145,7 +179,7 @@ anyone relies on an assumed license:
 
 ---
 
-## 5. Method
+## 6. Method
 
 - Licenses for container-image components (Guacamole, Neko, neko-apps, VS
   Code, Chrome) were verified against upstream project pages/release
@@ -157,6 +191,13 @@ anyone relies on an assumed license:
   the npm registry page or from memory.
 - `worker/src/`, `worker/scripts/`, and `worker/bootstrap/` were searched
   for literal `onlook`/`puter` references; no real hits were found (only
-  incidental substring matches inside the word "computer").
+  incidental substring matches inside the word "computer"). That search
+  predates `shell/` and says nothing about it — `shell/` is Puter-derived
+  by design, and its provenance is tracked per file in
+  `shell/PUTER-PROVENANCE.md` rather than by grep.
+- Puter's own `TRADEMARK.md` was read in full to establish that the
+  copyright grant carries **no trademark licence**, and that a modified
+  distribution must remove Puter's logos and state that it is modified and
+  unendorsed. Both requirements are discharged in §1 and in `NOTICE`.
 - Anything that could not be independently confirmed is marked
   **UNVERIFIED** above, with what was checked, rather than guessed at.
