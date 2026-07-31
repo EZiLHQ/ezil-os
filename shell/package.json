@@ -1,0 +1,14 @@
+{
+  "name": "ezil-os-shell",
+  "private": true,
+  "_comment_type": "Deliberately NOT \"type\": \"module\". Setting it makes esbuild treat every vendored UMD lib under src/lib as ESM, so jQuery and isMobile stop exporting a default and build-shell.sh FAILS. load-test.mjs is .mjs and is ESM without it.",
+  "description": "Build + smoke-test harness for the EZiL-OS browser shell. Not a published package, and not a dependency of app/ or worker/ - it exists so load-test.mjs has somewhere to declare jsdom.",
+  "scripts": {
+    "build": "./build-shell.sh",
+    "check": "./build-shell.sh --check",
+    "test": "node load-test.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1"
+  }
+}
