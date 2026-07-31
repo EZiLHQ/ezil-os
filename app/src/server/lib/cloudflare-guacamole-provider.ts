@@ -370,24 +370,114 @@ export async function requestGuacamolePreview(
     }
 }
 
-/** Request termination of a named sandbox. Non-blocking: errors are logged, not thrown. */
+/**
+ * Result of a `DELETE /sandbox/:name` request.
+ *
+ * `ok` is true ONLY when the Worker positively confirmed no container is
+ * running under this name — its `outcome` was `destroyed` (a running
+ * container was torn down) or `not_running` (idempotent: nothing was running,
+ * so there was nothing to destroy). It is false for `still_running` /
+ * `destroy_failed`, for a non-2xx HTTP response (including 401 — an unsigned
+ * or wrongly-signed request), and for a transport failure. A caller must
+ * check `ok`, never just that this function resolved without throwing — a
+ * resolved promise here is NOT the same thing as a confirmed teardown.
+ */
+export interface GuacamoleTerminateResult {
+    ok: boolean;
+    /** True only when a running container was actually torn down by this call. */
+    terminated: boolean;
+    /** The Worker's own outcome discriminator, when it answered at all (`destroyed` | `not_running` | `still_running` | `destroy_failed`). */
+    outcome?: string;
+    error?: string;
+}
+
+/**
+ * Request termination of a named sandbox.
+ *
+ * Signed with the SAME HMAC envelope every other mutating Worker route uses
+ * (`mintSandboxPreviewToken`, already used for `/sandbox/preview` above) —
+ * sent as `Authorization: Bearer <token>`, the transport
+ * `worker/src/index.ts`'s `authorizeSignedControlRequest` prefers for a
+ * body-less DELETE. This is not a new scheme; see that function's doc
+ * comment and `worker/README.md`'s "Callers must sign DELETE" note.
+ *
+ * Never throws: a transport failure or an unconfirmed/non-2xx response comes
+ * back as `{ ok: false, ... }`, exactly like every other Worker-call helper
+ * in this file. UNLIKE the defect this replaces, the failure is now visible
+ * to the caller (logged AND returned) instead of a silently discarded 401 —
+ * `fetch` resolves normally for 4xx/5xx, so a caller that only checked for a
+ * thrown exception never noticed the Worker had rejected the request.
+ */
 export async function requestGuacamoleSandboxTerminate(
     config: CloudflareGuacamoleConfig,
+    hmacSecret: string,
     sandboxName: string,
     correlationId: string = newCorrelationId(),
-): Promise<void> {
-    if (!config.isConfigured) return;
+): Promise<GuacamoleTerminateResult> {
+    if (!config.isConfigured) {
+        // No provider configured -> no sandbox to tear down. Not a failure.
+        return { ok: true, terminated: false };
+    }
+
+    const token = mintSandboxPreviewToken(hmacSecret);
+
     try {
-        await fetch(`${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}`, {
+        const res = await fetch(`${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}`, {
             method: 'DELETE',
-            headers: { [CORRELATION_HEADER]: correlationId },
+            headers: { Authorization: `Bearer ${token}`, [CORRELATION_HEADER]: correlationId },
             signal: AbortSignal.timeout(10_000),
         });
+
+        // The Worker answers `still_running`/`destroy_failed` as HTTP 500 (see
+        // `worker/src/index.ts`'s `handleTerminate`: `report.ok ? 200 : 500`),
+        // so a non-2xx response can still carry a meaningful JSON body — parse
+        // it either way rather than only on the 2xx path, or the most useful
+        // field (`outcome`) is lost on exactly the responses where it matters.
+        const text = await res.text().catch(() => '');
+        let data: { ok?: unknown; terminated?: unknown; outcome?: unknown; error?: unknown } = {};
+        try {
+            data = text ? (JSON.parse(text) as typeof data) : {};
+        } catch {
+            // Non-JSON body (e.g. an edge/proxy error page) — fall through
+            // with an empty `data`; the raw text still reaches the log/error.
+        }
+
+        if (!res.ok) {
+            console.warn('[cloudflare-guacamole] terminate request rejected', {
+                sandboxName,
+                status: res.status,
+                outcome: data.outcome,
+                body: text.slice(0, 300),
+            });
+            return {
+                ok: false,
+                terminated: false,
+                outcome: typeof data.outcome === 'string' ? data.outcome : undefined,
+                error: typeof data.error === 'string' ? data.error : `worker_http_${res.status}: ${text.slice(0, 300)}`,
+            };
+        }
+
+        const ok = data.ok === true;
+        if (!ok) {
+            console.warn('[cloudflare-guacamole] terminate not confirmed', {
+                sandboxName,
+                outcome: data.outcome,
+                error: data.error,
+            });
+        }
+        return {
+            ok,
+            terminated: data.terminated === true,
+            outcome: typeof data.outcome === 'string' ? data.outcome : undefined,
+            error: typeof data.error === 'string' ? data.error : undefined,
+        };
     } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
         console.warn('[cloudflare-guacamole] terminate request failed (non-fatal):', {
             sandboxName,
-            error: err instanceof Error ? err.message : String(err),
+            error: message,
         });
+        return { ok: false, terminated: false, error: message };
     }
 }
 
