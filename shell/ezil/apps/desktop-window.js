@@ -61,11 +61,16 @@ function is_minimized (el) {
  * @param {object} ctx.payload      `window.__EZIL_BOOT__`
  * @param {object} ctx.computer     `payload.computer`
  * @param {object} ctx.desktopState `payload.desktopState`
+ * @param {string} [ctx.icon]       The launching descriptor's icon, so the
+ *   window head, the taskbar item and the control tray all show the same
+ *   image as the dock the user clicked. `registry.launch` supplies it.
  * @returns {Promise<HTMLElement|null>}
  */
 export async function openDesktopWindow (ctx = {}) {
     const computer = ctx.computer ?? ctx.payload?.computer ?? null;
     const desktop_state = ctx.desktopState ?? ctx.payload?.desktopState ?? {};
+    // The computer's own name, not the app's: the window IS that machine, and
+    // a user with two computers must be able to tell which one they are in.
     const title = computer?.name || 'Linux Desktop';
 
     if ( ! computer?.id ) {
@@ -81,7 +86,7 @@ export async function openDesktopWindow (ctx = {}) {
     const el_window = await UIWindow({
         title,
         app: 'desktop',
-        icon: window.icons?.['app.svg'],
+        icon: ctx.icon,
         // 🔴 Navigated exactly once, after previewUrl resolves. See header.
         iframe_url: 'about:blank',
         is_fullpage: true,
@@ -242,7 +247,7 @@ export async function openDesktopWindow (ctx = {}) {
     // before they can leave.
     const drawer = attach_app_drawer(el_window, {
         title,
-        icon: window.icons?.['app.svg'],
+        icon: ctx.icon,
         actions: [
             {
                 id: 'minimize',
