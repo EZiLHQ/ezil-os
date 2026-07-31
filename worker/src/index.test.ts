@@ -810,6 +810,15 @@ describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => 
     .filter((line) => /^\s*pattern\s*=/.test(line))
     .map((line) => line.match(/"([^"]+)"/)?.[1] ?? '');
 
+  // 2026-07-31: the feature can be in a deliberate, fully-off state — no zone
+  // has been verified safe to route sandbox previews on (see the matching
+  // comment in wrangler.toml: ezil.work was a mistake and got unbound,
+  // ezil.org is the production Worker's zone, zlsocial.ai turned out to be
+  // live too). That is intentional and must stay easy to represent, but the
+  // marker below is the ONLY thing that may waive "at least one route" — an
+  // accidental drop of every route with no marker still fails loudly.
+  const routesDisabled = /PREVIEW_ROUTES_DISABLED/.test(wranglerSrc);
+
   it('declares PREVIEW_ZONE_ROOT as a literal (not a template/env lookup)', () => {
     expect(zoneRoot).toBeTruthy();
     // A .workers.dev host makes the SDK throw CustomDomainRequiredError, which
@@ -817,7 +826,14 @@ describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => 
     expect(zoneRoot?.endsWith('.workers.dev')).toBe(false);
   });
 
-  it('has at least one enabled route, and every route is on PREVIEW_ZONE_ROOT', () => {
+  it('has at least one enabled route, and every route is on PREVIEW_ZONE_ROOT — unless explicitly disabled', () => {
+    if (routesDisabled) {
+      // Disabled means NOTHING is declared — a partial route list with the
+      // marker still present would be a silent half-broken state, not a
+      // clean "off".
+      expect(patterns.length).toBe(0);
+      return;
+    }
     expect(patterns.length).toBeGreaterThan(0);
     for (const pattern of patterns) {
       const host = pattern.split('/')[0];
@@ -828,7 +844,8 @@ describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => 
     }
   });
 
-  it('routes every preview hostname the Worker can mint (token coverage)', async () => {
+  it('routes every preview hostname the Worker can mint (token coverage) — unless explicitly disabled', async () => {
+    if (routesDisabled) return; // no routes declared at all; nothing to cover yet.
     const { portFor, appPortFor } = await import('./desktop-mode');
     const tokens = [
       portFor('guacamole').token,

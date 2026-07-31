@@ -1451,29 +1451,46 @@ function toGuacamoleUrl(exposedUrl: string, requestProtocol: string): string {
  * (`http://localhost:8787`), so this only repairs the direct-IP edge case
  * without changing the documented/production hostname path.
  *
- * Zone-root collapse: Cloudflare Universal SSL (the free, no-purchase cert
- * this Worker relies on for `*.ezil.work`) only covers the zone apex plus ONE
- * wildcard label — it does NOT cover a second-level wildcard like
- * `*.os.ezil.work`. Verified empirically, not assumed: the zone's certificate
- * pack lists exactly `['ezil.work', '*.ezil.work']`, an SNI handshake for
- * `probe123.ezil.work` succeeds, and one for `a.b.ezil.work` fails with TLS
- * alert 40 (handshake_failure). The SDK composes preview hostnames as
- * `${port}-${sandboxId}-${token}.${host}`, so if an inbound API request
- * itself already arrives on a single-label `*.ezil.work` subdomain (which is
- * exactly what the Worker's own API entrypoint `os.ezil.work` is), passing
- * that host straight through would produce a two-level preview hostname with
- * no valid certificate. To guarantee every preview URL is a single label
- * under the zone (`<port>-<sandboxId>-<token>.ezil.work`), any inbound host
- * under `PREVIEW_ZONE_ROOT` is collapsed to the bare zone root before being
- * handed to `exposePort`/`getExposedPorts`.
+ * Zone-root collapse: Cloudflare Universal SSL (the free, no-purchase cert a
+ * zone here would rely on) only covers the zone apex plus ONE wildcard label
+ * — it does NOT cover a second-level wildcard like `*.os.<zone>`. Verified
+ * empirically against `ezil.work` while that zone was still in use here: its
+ * certificate pack listed exactly `['ezil.work', '*.ezil.work']`, an SNI
+ * handshake for `probe123.ezil.work` succeeded, and one for `a.b.ezil.work`
+ * failed with TLS alert 40 (handshake_failure) — the same one-label-only
+ * limit applies to whatever zone replaces it. The SDK composes preview
+ * hostnames as `${port}-${sandboxId}-${token}.${host}`, so if an inbound API
+ * request itself already arrives on a single-label `*.<zone>` subdomain
+ * (e.g. an API entrypoint like `os.<zone>`), passing that host straight
+ * through would produce a two-level preview hostname with no valid
+ * certificate. To guarantee every preview URL is a single label under the
+ * zone (`<port>-<sandboxId>-<token>.<zone>`), any inbound host under
+ * `PREVIEW_ZONE_ROOT` is collapsed to the bare zone root before being handed
+ * to `exposePort`/`getExposedPorts`.
  *
  * PREVIEW_ZONE_ROOT must stay in lockstep with the `[[routes]]` block in
  * `wrangler.toml` — if they disagree, every preview URL points at a hostname
  * this Worker is not routed on. `index.test.ts` has a drift guard that reads
  * `wrangler.toml` and asserts both the zone and that every `portFor`/
  * `appPortFor` token has a matching route pattern.
+ *
+ * 2026-07-31 correction — PREVIEW_ROUTES_DISABLED: this used to be
+ * `'ezil.work'`, the company's main production website, routed there by
+ * mistake. The owner said not to touch it; those routes and their DNS
+ * records have been removed from Cloudflare (see `wrangler.toml`'s matching
+ * comment for the removal record and why the obvious alternatives —
+ * `ezil.org` (owned by the production `cf-guacamole-sandbox` Worker) and
+ * `zlsocial.ai` (independently re-verified live: proxied apex site + a bare
+ * `*.zlsocial.ai` wildcard tunnel catch-all + several more live tunnels) —
+ * are not safe replacements either. `unset.invalid` is an RFC 2606 reserved,
+ * never-resolvable placeholder: it keeps this constant a truthy, non-
+ * `.workers.dev` literal (so it still typechecks and satisfies the "declares
+ * a literal" drift-guard test) without referencing any real zone. There are
+ * currently zero `[[routes]]` in `wrangler.toml`, so this code path never
+ * actually matches a live request either way. Restore a real zone here (and
+ * in `wrangler.toml`) once one is verified genuinely unused.
  */
-const PREVIEW_ZONE_ROOT = 'ezil.work';
+const PREVIEW_ZONE_ROOT = 'unset.invalid';
 
 function normalizeSandboxHostname(host: string): string {
   const [hostname, port] = host.split(':');

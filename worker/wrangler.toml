@@ -58,62 +58,50 @@ local_protocol = "http"
 [vars]
 SANDBOX_NEKO_ICE_POLICY = "relay"
 
-# ── Custom domain + preview routes (zone: ezil.work) ─────────────────────────
-# The @cloudflare/sandbox port proxy composes preview hostnames as
-# `<port>-<sandboxId>-<token>.<host>` and hard-refuses any host ending in
-# `.workers.dev` (`CustomDomainRequiredError`, sandbox SDK — the ONLY hostname
-# check it makes). So the Worker needs a real zone with one-label wildcard
-# subdomains, and the app must CALL the Worker on that zone: `src/index.ts`
-# derives the preview host from the inbound request's own Host header via
-# `normalizeSandboxHostname(new URL(request.url).host)`.
+# ── Custom domain + preview routes: PREVIEW_ROUTES_DISABLED ──────────────────
+# (see `worker/src/index.ts`'s `PREVIEW_ZONE_ROOT` doc comment for the full
+# hostname-composition background — `<port>-<sandboxId>-<token>.<host>` — and
+# why the sandbox SDK requires a real zone rather than a `*.workers.dev` host.)
 #
-# Why ezil.work and not ezil.org / zlsocial.ai — each verified against live DNS:
+# 2026-07-31 correction: an earlier version of this file routed
+# `*-desktop`/`*-nekodesktop`/`*-app` on **ezil.work** — the company's main
+# production website — plus a `custom_domain` entry for `os.ezil.work`. The
+# owner has explicitly said: do not touch ezil.work. That routing has been
+# removed from this file AND unbound from the zone in Cloudflare (routes,
+# custom domain, and the `*.ezil.work` / `os.ezil.work` DNS records this
+# feature had added — see the removal commit for the exact API calls run).
+# ezil.work's pre-existing production DNS (apex, www, pehlachance.*, MX, etc.)
+# was left untouched throughout and is unaffected by this.
+#
+# No replacement zone has been assigned. All three zones on this Cloudflare
+# account were checked and none is safe to route sandbox previews on:
 #   ezil.org    — `*.ezil.org/*` is owned by the live production Worker
-#                 `cf-guacamole-sandbox` (sandbox.ezil.org). OFF LIMITS.
-#   zlsocial.ai — NOT unused. Orange-clouded and live: a `*.zlsocial.ai`
-#                 wildcard tunnel catch-all, plus sandboxes / sandboxes-worker /
-#                 `*.sandboxes-worker` / sparkiq / universe-dev. A wildcard
-#                 Worker route there would shadow all of them.
-#   ezil.work   — zero pre-existing Worker routes. Its four live sites
-#                 (apex + www + pehlachance.prototype + pehlachance.proposals,
-#                 Vercel/Firebase) are all GREY-clouded: they resolve to
-#                 non-Cloudflare origin IPs, never enter the Cloudflare edge,
-#                 and therefore cannot be intercepted by ANY Worker route on
-#                 this zone. Only two hostnames here are proxied at all
-#                 (dev-test, sparkiq — both Cloudflare Tunnel CNAMEs, both
-#                 returning 530 with their tunnels down).
+#                 `cf-guacamole-sandbox` (sandbox.ezil.org). OFF LIMITS
+#                 (explicit task boundary — never touch this Worker/route).
+#   ezil.work   — the mistake above. Owner: do not touch. OFF LIMITS.
+#   zlsocial.ai — considered as a replacement, then independently re-verified
+#                 live via the Cloudflare API on 2026-07-31: it has an
+#                 orange-clouded (proxied) apex website, a BARE wildcard
+#                 `*.zlsocial.ai` CNAME to a live Cloudflare Tunnel
+#                 (catch-all — matches any subdomain, including any preview
+#                 hostname shape this Worker would mint), and several more
+#                 live proxied tunnel CNAMEs (`sandboxes`, `sandboxes-worker`,
+#                 `*.sandboxes-worker`, `sparkiq`, `universe-dev`). Any Worker
+#                 route added here — even a narrow suffix pattern — could
+#                 shadow whatever that catch-all tunnel serves for unmatched
+#                 hostnames, which cannot be verified from outside the
+#                 tunnel's own ingress config. This fails the "not in use"
+#                 bar this zone would need to clear, so it was NOT used.
 #
-# Why token-scoped patterns instead of a bare `*.ezil.work/*`:
-# a bare wildcard WOULD capture dev-test.ezil.work and sparkiq.ezil.work. They
-# serve nothing today, but they are real configured tunnels — a wildcard would
-# silently steal them the moment either is restarted. The three patterns below
-# match only the sandbox preview hostname shapes (the exhaustive token set from
-# `desktop-mode.ts`: `portFor` -> desktop/nekodesktop, `appPortFor` -> app), so
-# this Worker shadows NOTHING on the zone. Cost of the narrower form: a NEW
-# exposed-port token needs a new route here — `index.test.ts`'s drift guard
-# fails the build if a token has no matching pattern.
-#
-# Requires DNS `*.ezil.work` proxied (A 192.0.2.0, TEST-NET dummy origin — the
-# origin is never contacted because every matched host is served by the
-# Worker). Mirrors the existing `*.ezil.org` record on the production zone.
-# Nested wildcards are impossible on a Free zone: Universal SSL covers exactly
-# `['ezil.work','*.ezil.work']` (one label). `*.os.ezil.work` has no cert —
-# an SNI probe for `a.b.ezil.work` fails with TLS alert 40.
-[[routes]]
-pattern = "os.ezil.work"
-custom_domain = true
-
-[[routes]]
-pattern = "*-desktop.ezil.work/*"
-zone_name = "ezil.work"
-
-[[routes]]
-pattern = "*-nekodesktop.ezil.work/*"
-zone_name = "ezil.work"
-
-[[routes]]
-pattern = "*-app.ezil.work/*"
-zone_name = "ezil.work"
+# Until a genuinely unused zone (or an explicit go-ahead on zlsocial.ai after
+# inspecting its tunnel ingress rules) is available, the desktop preview
+# feature has no custom domain to route on and is intentionally left
+# disabled here rather than risk a repeat of the ezil.work mistake. Deploying
+# with zero `[[routes]]` entries is safe: it uploads the Worker script but
+# binds it to no zone, so it cannot intercept traffic anywhere. See
+# `worker/src/index.test.ts`'s drift-guard tests for how this disabled state
+# is asserted (they require this exact `PREVIEW_ROUTES_DISABLED` marker to be
+# present, so silently losing routes by accident still fails the build).
 
 # HMAC secret for authenticating EBuilder → Worker calls.
 # Set in production with:  wrangler secret put SANDBOX_HMAC_SECRET
