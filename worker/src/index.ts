@@ -1452,19 +1452,28 @@ function toGuacamoleUrl(exposedUrl: string, requestProtocol: string): string {
  * without changing the documented/production hostname path.
  *
  * Zone-root collapse: Cloudflare Universal SSL (the free, no-purchase cert
- * this Worker relies on for `*.ezil.org`) only covers the zone apex plus ONE
+ * this Worker relies on for `*.ezil.work`) only covers the zone apex plus ONE
  * wildcard label — it does NOT cover a second-level wildcard like
- * `*.foo.ezil.org`. The SDK composes preview hostnames as
+ * `*.os.ezil.work`. Verified empirically, not assumed: the zone's certificate
+ * pack lists exactly `['ezil.work', '*.ezil.work']`, an SNI handshake for
+ * `probe123.ezil.work` succeeds, and one for `a.b.ezil.work` fails with TLS
+ * alert 40 (handshake_failure). The SDK composes preview hostnames as
  * `${port}-${sandboxId}-${token}.${host}`, so if an inbound API request
- * itself already arrives on a single-label `*.ezil.org` subdomain (e.g.
- * `api.ezil.org`, or a caller-chosen host used only to reach this Worker),
- * passing that host straight through would produce a two-level preview
- * hostname with no valid certificate. To guarantee every preview URL is a
- * single label under the zone (`<port>-<sandboxId>.ezil.org`), any inbound
- * host under `PREVIEW_ZONE_ROOT` is collapsed to the bare zone root before
- * being handed to `exposePort`/`getExposedPorts`.
+ * itself already arrives on a single-label `*.ezil.work` subdomain (which is
+ * exactly what the Worker's own API entrypoint `os.ezil.work` is), passing
+ * that host straight through would produce a two-level preview hostname with
+ * no valid certificate. To guarantee every preview URL is a single label
+ * under the zone (`<port>-<sandboxId>-<token>.ezil.work`), any inbound host
+ * under `PREVIEW_ZONE_ROOT` is collapsed to the bare zone root before being
+ * handed to `exposePort`/`getExposedPorts`.
+ *
+ * PREVIEW_ZONE_ROOT must stay in lockstep with the `[[routes]]` block in
+ * `wrangler.toml` — if they disagree, every preview URL points at a hostname
+ * this Worker is not routed on. `index.test.ts` has a drift guard that reads
+ * `wrangler.toml` and asserts both the zone and that every `portFor`/
+ * `appPortFor` token has a matching route pattern.
  */
-const PREVIEW_ZONE_ROOT = 'ezil.org';
+const PREVIEW_ZONE_ROOT = 'ezil.work';
 
 function normalizeSandboxHostname(host: string): string {
   const [hostname, port] = host.split(':');

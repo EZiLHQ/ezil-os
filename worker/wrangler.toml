@@ -58,22 +58,62 @@ local_protocol = "http"
 [vars]
 SANDBOX_NEKO_ICE_POLICY = "relay"
 
-# ── Custom domain + wildcard route ────────────────────────────────────────────
-# The @cloudflare/sandbox port proxy requires one-label wildcard subdomains
-# (e.g. https://<port>-<sandbox-id>.ezil.org) to route preview traffic to the
-# running container's exposed port. workers.dev subdomains do not support
-# this pattern, so the wildcard subdomain (not the apex) is routed to this
-# Worker on the ezil.org zone.
-# DISABLED for the Wave A3 initial deploy — this route is currently claimed by the
-# live Worker `cf-guacamole-sandbox` (serving neko.ezil.org / sandbox.ezil.org in
-# production). Two Workers cannot own the same route; claiming it here would either
-# fail or silently steal production traffic. Moving this route to ezil-os-worker is
-# a separate, explicitly-approved cutover step — not part of this deploy, which
-# verifies health via the *.workers.dev URL only. Re-enable only as part of that
-# cutover.
-# [[routes]]
-# pattern = "*.ezil.org/*"
-# zone_name = "ezil.org"
+# ── Custom domain + preview routes (zone: ezil.work) ─────────────────────────
+# The @cloudflare/sandbox port proxy composes preview hostnames as
+# `<port>-<sandboxId>-<token>.<host>` and hard-refuses any host ending in
+# `.workers.dev` (`CustomDomainRequiredError`, sandbox SDK — the ONLY hostname
+# check it makes). So the Worker needs a real zone with one-label wildcard
+# subdomains, and the app must CALL the Worker on that zone: `src/index.ts`
+# derives the preview host from the inbound request's own Host header via
+# `normalizeSandboxHostname(new URL(request.url).host)`.
+#
+# Why ezil.work and not ezil.org / zlsocial.ai — each verified against live DNS:
+#   ezil.org    — `*.ezil.org/*` is owned by the live production Worker
+#                 `cf-guacamole-sandbox` (sandbox.ezil.org). OFF LIMITS.
+#   zlsocial.ai — NOT unused. Orange-clouded and live: a `*.zlsocial.ai`
+#                 wildcard tunnel catch-all, plus sandboxes / sandboxes-worker /
+#                 `*.sandboxes-worker` / sparkiq / universe-dev. A wildcard
+#                 Worker route there would shadow all of them.
+#   ezil.work   — zero pre-existing Worker routes. Its four live sites
+#                 (apex + www + pehlachance.prototype + pehlachance.proposals,
+#                 Vercel/Firebase) are all GREY-clouded: they resolve to
+#                 non-Cloudflare origin IPs, never enter the Cloudflare edge,
+#                 and therefore cannot be intercepted by ANY Worker route on
+#                 this zone. Only two hostnames here are proxied at all
+#                 (dev-test, sparkiq — both Cloudflare Tunnel CNAMEs, both
+#                 returning 530 with their tunnels down).
+#
+# Why token-scoped patterns instead of a bare `*.ezil.work/*`:
+# a bare wildcard WOULD capture dev-test.ezil.work and sparkiq.ezil.work. They
+# serve nothing today, but they are real configured tunnels — a wildcard would
+# silently steal them the moment either is restarted. The three patterns below
+# match only the sandbox preview hostname shapes (the exhaustive token set from
+# `desktop-mode.ts`: `portFor` -> desktop/nekodesktop, `appPortFor` -> app), so
+# this Worker shadows NOTHING on the zone. Cost of the narrower form: a NEW
+# exposed-port token needs a new route here — `index.test.ts`'s drift guard
+# fails the build if a token has no matching pattern.
+#
+# Requires DNS `*.ezil.work` proxied (A 192.0.2.0, TEST-NET dummy origin — the
+# origin is never contacted because every matched host is served by the
+# Worker). Mirrors the existing `*.ezil.org` record on the production zone.
+# Nested wildcards are impossible on a Free zone: Universal SSL covers exactly
+# `['ezil.work','*.ezil.work']` (one label). `*.os.ezil.work` has no cert —
+# an SNI probe for `a.b.ezil.work` fails with TLS alert 40.
+[[routes]]
+pattern = "os.ezil.work"
+custom_domain = true
+
+[[routes]]
+pattern = "*-desktop.ezil.work/*"
+zone_name = "ezil.work"
+
+[[routes]]
+pattern = "*-nekodesktop.ezil.work/*"
+zone_name = "ezil.work"
+
+[[routes]]
+pattern = "*-app.ezil.work/*"
+zone_name = "ezil.work"
 
 # HMAC secret for authenticating EBuilder → Worker calls.
 # Set in production with:  wrangler secret put SANDBOX_HMAC_SECRET
