@@ -16,6 +16,8 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 describe('resolveDesktopMode', () => {
   it('defaults to guacamole when nothing is requested and no env default is set', async () => {
@@ -778,3 +780,79 @@ describe('cpu-diag: retrieval route (HMAC-authed, bounded, degrades cleanly)', (
   });
 });
 
+
+// ── Preview-zone routing drift guard ──────────────────────────────────────────
+// `PREVIEW_ZONE_ROOT` in index.ts and the `[[routes]]` block in wrangler.toml
+// are two independent statements of the SAME fact: which hostnames this Worker
+// answers on. If they disagree, every preview URL the Worker mints points at a
+// hostname it is not routed on — the container boots, the desktop starts, and
+// the user gets a Cloudflare error page. There is no runtime signal for this;
+// the only place it can be caught is here.
+//
+// The routes are deliberately token-scoped (`*-<token>.<zone>/*`) rather than a
+// bare `*.<zone>/*`, so that this Worker shadows no existing hostname on the
+// zone (see the rationale block in wrangler.toml). That safety costs one thing:
+// a NEW exposed-port token silently stops being routed. The second assertion
+// below is what makes that failure loud — it enumerates every token the Worker
+// can actually pass to `exposePort` and requires a matching route pattern.
+describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => {
+  const wranglerSrc = readFileSync(
+    fileURLToPath(new URL('../wrangler.toml', import.meta.url)),
+    'utf8',
+  );
+  const indexSrc = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+
+  const zoneRoot = indexSrc.match(/^const PREVIEW_ZONE_ROOT = '([^']+)';$/m)?.[1];
+  // Only uncommented `pattern = "..."` lines count — a commented-out route
+  // routes nothing.
+  const patterns = wranglerSrc
+    .split('\n')
+    .filter((line) => /^\s*pattern\s*=/.test(line))
+    .map((line) => line.match(/"([^"]+)"/)?.[1] ?? '');
+
+  it('declares PREVIEW_ZONE_ROOT as a literal (not a template/env lookup)', () => {
+    expect(zoneRoot).toBeTruthy();
+    // A .workers.dev host makes the SDK throw CustomDomainRequiredError, which
+    // is the exact failure this whole route change exists to fix.
+    expect(zoneRoot?.endsWith('.workers.dev')).toBe(false);
+  });
+
+  it('has at least one enabled route, and every route is on PREVIEW_ZONE_ROOT', () => {
+    expect(patterns.length).toBeGreaterThan(0);
+    for (const pattern of patterns) {
+      const host = pattern.split('/')[0];
+      expect(
+        host === zoneRoot || host.endsWith(`.${zoneRoot}`),
+        `route "${pattern}" is not under PREVIEW_ZONE_ROOT "${zoneRoot}"`,
+      ).toBe(true);
+    }
+  });
+
+  it('routes every preview hostname the Worker can mint (token coverage)', async () => {
+    const { portFor, appPortFor } = await import('./desktop-mode');
+    const tokens = [
+      portFor('guacamole').token,
+      portFor('neko').token,
+      appPortFor('neko')?.token,
+    ].filter((t): t is string => typeof t === 'string');
+
+    for (const token of tokens) {
+      // A preview host is `<port>-<sandboxId>-<token>.<zone>`; a route covers it
+      // if it is the bare zone wildcard or the token-scoped wildcard.
+      const covered = patterns.some(
+        (p) => p === `*.${zoneRoot}/*` || p === `*-${token}.${zoneRoot}/*`,
+      );
+      expect(covered, `no wrangler.toml route covers preview token "${token}"`).toBe(true);
+    }
+  });
+
+  it('keeps every preview host ONE label under the zone (Universal SSL limit)', () => {
+    // Universal SSL on a Free zone covers exactly [apex, *.apex]. A nested
+    // wildcard has no certificate (verified live: SNI for `a.b.<zone>` fails
+    // with TLS alert 40), so the collapse in normalizeSandboxHostname must
+    // return the BARE zone root, never a subdomain of it.
+    const fn = indexSrc.match(/function normalizeSandboxHostname\([\s\S]*?\n}\n/)?.[0] ?? '';
+    expect(fn).toContain('hostname.endsWith(`.${PREVIEW_ZONE_ROOT}`)');
+    expect(fn).toContain('return port ? `${PREVIEW_ZONE_ROOT}:${port}` : PREVIEW_ZONE_ROOT;');
+  });
+});
