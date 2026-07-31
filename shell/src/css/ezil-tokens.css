@@ -1,0 +1,61 @@
+/* ezil-tokens.css — EZiL chrome palette.
+ *
+ * WRITTEN FRESH for EZiL-OS. Not copied from Puter. It exists to *override*
+ * the `:root` custom-property block Puter declares in its own `style.css`
+ * (upstream `src/gui/src/css/style.css`, around lines 86-116), from which the
+ * entire window / taskbar / sidebar chrome derives.
+ *
+ * It lives under `shell/src/css/` — the Puter-derived tree — purely so the
+ * cascade works: `build-shell.sh` concatenates every `shell/src/css/*.css`
+ * first and then every `ezil-*.css` last, so these declarations land after
+ * upstream's and win on source order at equal specificity. Its provenance is
+ * "written fresh" and is recorded that way in `shell/PUTER-PROVENANCE.md`.
+ *
+ * Upstream mutates these at runtime from `services/ThemeService.js`
+ * (a per-user theme persisted in Puter's cloud key-value store). That whole
+ * service is stripped from this fork — see the LOCAL CODE ONLY rule — so in
+ * EZiL-OS these tokens are static, and this file is the single place the
+ * chrome's colour is decided.
+ *
+ * Palette source of truth: `app/src/app/globals.css` (`@theme inline`).
+ *   --color-charcoal        #161616   desktop / deepest surface
+ *   --color-charcoal-light  #1f1f1f   raised chrome
+ *   --color-offwhite        #f5f5f4   text on chrome
+ *   --color-teal            #00adb5   accent / selection
+ */
+
+:root {
+    /* Chrome base. Upstream is a light chrome (hsl 210 41.18% 93.33%);
+       EZiL's is dark. hsl(183, 6%, 12%) resolves to ~#1d2020, i.e. the brand
+       --color-charcoal-light (#1f1f1f) carrying a faint cast of the brand
+       teal's hue so that --primary-hue stays a meaningful knob. For an exactly
+       neutral #1f1f1f instead, set --primary-saturation to 0%. */
+    --primary-hue: 183;
+    --primary-saturation: 6%;
+    --primary-lightness: 12%;
+
+    /* Upstream 0.8. Raised because a dark chrome over a dark desktop needs
+       more opacity to stay legible: the taskbar derives 0.73 x this. */
+    --primary-alpha: 0.88;
+
+    /* Foreground on the chrome. Upstream's light theme uses #373e44 and its
+       ThemeService swaps to `white` when light_text is on; EZiL uses the brand
+       off-white rather than pure white. */
+    --primary-color: #f5f5f4;
+
+    /* Icons in the chrome are authored dark-on-light upstream, so a dark
+       chrome must invert them. Matches ThemeService's light_text branch. */
+    --primary-color-icon: invert(1);
+
+    /* Effectively unused upstream (its only consumer in style.css/dashboard.css
+       is commented out). Upstream's light_text branch picks #5a5d61aa; that is
+       a light-chrome value, so EZiL sets a dark-chrome-correct one instead.
+       Revisit in Wave 1 if the sidebar CSS turns out to consume it. */
+    --primary-color-sidebar-item: #f5f5f4cc;
+
+    /* Selection / focus accent. These three resolve to exactly #00adb5, the
+       brand teal, via --select-color's own hsl() in upstream's style.css. */
+    --select-hue: 182.65;
+    --select-saturation: 100%;
+    --select-lightness: 35.49%;
+}

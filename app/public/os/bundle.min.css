@@ -1,0 +1,5 @@
+/*! EZiL-OS shell — AGPL-3.0-only. Contains code derived from Puter
+ * (https://github.com/HeyPuter/puter), AGPL-3.0-only, MODIFIED by EZiL.
+ * Not endorsed by or affiliated with Puter Technologies Inc.
+ * See ATTRIBUTIONS.md and shell/PUTER-PROVENANCE.md. */
+:root{--primary-hue:183;--primary-saturation:6%;--primary-lightness:12%;--primary-alpha:0.88;--primary-color:#f5f5f4;--primary-color-icon:invert(1);--primary-color-sidebar-item:#f5f5f4cc;--select-hue:182.65;--select-saturation:100%;--select-lightness:35.49%}
