@@ -137,15 +137,28 @@ throwaway key without touching the production `SANDBOX_HMAC_SECRET`. It is:
 
 Then point the app at the deployed Worker:
 ```
-CLOUDFLARE_GUACAMOLE_WORKER_URL=https://os.ezil.work
+CLOUDFLARE_GUACAMOLE_WORKER_URL=https://ezil-os-worker.ezil-builder.workers.dev
 ```
 
-This URL **must be on the preview zone** (`PREVIEW_ZONE_ROOT` in `src/index.ts`,
-`ezil.work`), not a `*.workers.dev` host. The Worker derives the preview
-hostname from the inbound request's own `Host`, and `@cloudflare/sandbox`'s
-`exposePort()` throws `CustomDomainRequiredError` for anything ending in
-`.workers.dev` — a workers.dev URL here boots the container and then fails at
-desktop exposure every time.
+**2026-07-31 correction — preview routing is currently disabled, no zone assigned:**
+this used to be `https://os.ezil.work`, but that zone was the company's main
+production website, routed there by mistake; the routes, custom domain, and
+extra DNS records have been removed (see `wrangler.toml`'s
+`PREVIEW_ROUTES_DISABLED` comment for the full record and why the obvious
+alternatives — `ezil.org` (the production `cf-guacamole-sandbox` Worker's
+zone) and `zlsocial.ai` (independently re-verified live: proxied apex site +
+a bare wildcard tunnel catch-all + several more live tunnels) — are not safe
+replacements either.
+
+Until a genuinely unused zone is assigned (`PREVIEW_ZONE_ROOT` in
+`src/index.ts` + a matching `[[routes]]` block in `wrangler.toml`), the
+`workers.dev` URL above is reachable for basic checks (`/health`, auth/
+validation error paths) but the actual desktop-preview flow will fail at the
+`exposePort()` step: `@cloudflare/sandbox` throws `CustomDomainRequiredError`
+for any host ending in `.workers.dev` — the Worker derives the preview
+hostname from the inbound request's own `Host`, so it needs a real zone with
+one-label wildcard subdomains, not a `*.workers.dev` host, before end-to-end
+preview will work again.
 
 Notes:
 - `wrangler.toml` uses `instance_type = "standard"` (Chrome + Tomcat + a JVM need
