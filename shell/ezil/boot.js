@@ -102,6 +102,13 @@ export function boot () {
     return shell;
 }
 
+// `boot` is attached to the same object the global points at. Without this,
+// `globalThis.ezil` looks like the entry point but has no way to start —
+// esbuild's `--global-name` puts the module's exports on `globalThis.EzilShell`
+// instead, and a caller reaching for `ezil.boot()` gets "not a function".
+// Caught by the headless load test, not by `node --check`.
+shell.boot = boot;
+
 if ( typeof globalThis !== 'undefined' ) {
     globalThis.ezil = shell;
 }
