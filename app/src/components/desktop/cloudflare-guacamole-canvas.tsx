@@ -1,8 +1,21 @@
 'use client';
 
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api } from '@/trpc/react';
+import {
+    BOOT_FAILURE_COPY,
+    BOOT_NOT_CONFIGURED_COPY,
+    BOOT_PHASES,
+    BOOT_PROGRESS_HEADLINE,
+    BOOT_PROGRESS_LONG_SUBTEXT,
+    BOOT_PROGRESS_SUBTEXT,
+    computeBootUiState,
+    phaseVisualState,
+    type BootErrorCode,
+    type BootProgressState,
+    type PhaseVisualState,
+} from './boot-phases';
 
 /**
  * CloudflareGuacamoleCanvas
@@ -15,10 +28,23 @@ import { api } from '@/trpc/react';
  *
  * Architecture:
  *   this component (iframe)
- *     -> cloudflareGuacamole.previewUrl (tRPC)
+ *     -> cloudflareGuacamole.previewUrl (tRPC)  — one long POST /sandbox/preview,
+ *        resolves only at the end (success or a specific error)
+ *     -> cloudflareGuacamole.status (tRPC)      — cheap GET /sandbox/:id/status,
+ *        polled ONLY while the preview request above is in flight, to pick up
+ *        one real mid-boot fact (`guacamoleRunning`) without waking anything
+ *        extra (the preview request is already doing that)
  *     -> server/lib/cloudflare-guacamole-provider.ts
  *     -> worker/ (Cloudflare Worker, @cloudflare/sandbox container)
  *           -> Neko desktop (port 8080)
+ *
+ * The ~22s cold boot (docs/PLATFORM-NOTES.md §11) is shown honestly via
+ * `./boot-phases.ts`: phase progress is a time-based ESTIMATE anchored to the
+ * measured reference boot, and is never rendered as confirmed unless backed
+ * by the real `guacamoleRunning` signal above or the final request settling.
+ * See that module's doc comment for the full honesty rationale, including why
+ * `/preview-status`'s `no_package_json`/`port_not_listening`/`crashed`/
+ * `crash_looping` taxonomy does not apply to this desktop-boot path.
  *
  * Carried and simplified from EBuilder's
  * `apps/web/client/src/components/desktop/cloudflare-guacamole-canvas.tsx`
@@ -44,20 +70,44 @@ type WorkspaceStatus = {
     detail?: string;
 };
 
-type LoadState =
-    | { phase: 'loading' }
-    | { phase: 'ready'; guacamoleUrl: string; workspace?: WorkspaceStatus }
-    | { phase: 'not_configured' }
-    | { phase: 'worker_unreachable'; rawError?: string }
-    | { phase: 'sandbox_runtime_blocked' }
-    | { phase: 'error'; message: string };
+/** Overall status of the single, one-shot `POST /sandbox/preview` request. */
+type RequestStatus = 'not_configured' | 'pending' | 'success' | 'error';
 
 /** Human-readable label for the product's sole desktop preview mode. */
 const EZIL_OS_LABEL = 'EZiL OS';
 
+/**
+ * Map the worker/provider's own error-code strings onto the plain-language
+ * taxonomy `boot-phases.ts` renders. Anything not recognized collapses to
+ * `unknown` rather than guessing.
+ */
+function toBootErrorCode(raw: string | undefined): BootErrorCode {
+    switch (raw) {
+        case 'connection_refused':
+        case 'fetch_failed':
+        case 'sandbox_runtime_blocked':
+        case 'sandbox_start_failed':
+        case 'worker_http_error':
+        case 'timeout':
+            return raw;
+        default:
+            return 'unknown';
+    }
+}
+
 export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareGuacamoleCanvasProps) {
     const [reloadKey, setReloadKey] = useState(0);
     const iframeRef = useRef<HTMLIFrameElement | null>(null);
+
+    // Wall-clock start of the CURRENT boot attempt (a ref — mutated only from
+    // inside effects/handlers, never read during render) and ms elapsed since
+    // it (state, updated only from the interval callback below). Neither
+    // `Date.now()` nor a ref read ever happens in the render body itself, to
+    // keep the component pure. Only ever used to pick which phase to
+    // HIGHLIGHT as an estimate — never to assert a phase is actually done
+    // (see boot-phases.ts).
+    const attemptStartedAtRef = useRef<number | null>(null);
+    const [elapsedMs, setElapsedMs] = useState(0);
 
     const isConfiguredQuery = api.cloudflareGuacamole.isConfigured.useQuery(undefined, {
         staleTime: 5 * 60 * 1000,
@@ -76,54 +126,33 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
         },
     );
 
-    // Derived, not stored — `loadState` is a pure function of the two
-    // queries above, so it's computed with `useMemo` rather than mirrored
-    // into `useState` via an effect (which would cause an extra render on
-    // every query transition for no benefit).
-    const loadState: LoadState = useMemo(() => {
+    const { requestStatus, errorCode } = useMemo<{
+        requestStatus: RequestStatus;
+        errorCode?: BootErrorCode;
+    }>(() => {
         if (isConfiguredQuery.isLoading) {
-            return { phase: 'loading' };
+            return { requestStatus: 'pending' };
         }
         if (!isConfiguredQuery.data?.isConfigured) {
-            return { phase: 'not_configured' };
+            return { requestStatus: 'not_configured' };
         }
         if (previewQuery.isLoading) {
-            return { phase: 'loading' };
+            return { requestStatus: 'pending' };
         }
         if (previewQuery.error) {
-            const code = (previewQuery.error as { data?: { code?: string } }).data?.code;
-            if (code === 'BAD_GATEWAY') {
-                return { phase: 'worker_unreachable', rawError: previewQuery.error.message };
-            }
-            return {
-                phase: 'error',
-                message: `Failed to get ${EZIL_OS_LABEL} preview URL. Check server logs.`,
-            };
+            // A thrown TRPCError means the Worker returned something outside
+            // the operational error codes it classifies for us — we don't
+            // have a more specific genuine code to report than "unknown".
+            return { requestStatus: 'error', errorCode: 'unknown' };
         }
         if (!previewQuery.data) {
-            return { phase: 'loading' };
+            return { requestStatus: 'pending' };
         }
         if (!previewQuery.data.ok) {
-            const errData = previewQuery.data as { ok: false; error?: string; errorCode?: string };
-            if (errData.errorCode === 'connection_refused' || errData.errorCode === 'fetch_failed') {
-                return { phase: 'worker_unreachable', rawError: errData.error };
-            }
-            if (
-                errData.errorCode === 'sandbox_runtime_blocked' ||
-                errData.errorCode === 'sandbox_start_failed'
-            ) {
-                return { phase: 'sandbox_runtime_blocked' };
-            }
-            return {
-                phase: 'error',
-                message: errData.error ?? `${EZIL_OS_LABEL} provider returned an error.`,
-            };
+            const errData = previewQuery.data as { ok: false; errorCode?: string };
+            return { requestStatus: 'error', errorCode: toBootErrorCode(errData.errorCode) };
         }
-        return {
-            phase: 'ready',
-            guacamoleUrl: previewQuery.data.guacamoleUrl,
-            workspace: previewQuery.data.workspace,
-        };
+        return { requestStatus: 'success' };
     }, [
         isConfiguredQuery.isLoading,
         isConfiguredQuery.data,
@@ -132,16 +161,54 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
         previewQuery.data,
     ]);
 
+    // The cheap, non-waking status probe — polled ONLY while a boot attempt
+    // is genuinely in flight. This is the one real mid-boot signal available;
+    // see boot-phases.ts's module doc.
+    const sandboxStatusQuery = api.cloudflareGuacamole.status.useQuery(
+        { computerId },
+        {
+            enabled: requestStatus === 'pending',
+            refetchInterval: 2_000,
+            refetchOnWindowFocus: false,
+            retry: false,
+        },
+    );
+    const confirmedGuacamoleRunning =
+        sandboxStatusQuery.data?.ok === true ? sandboxStatusQuery.data.guacamoleRunning : undefined;
+
+    // Tick every 500ms while pending so the time-based estimate advances.
+    // `Date.now()` and the ref mutation only ever happen inside this effect
+    // (the mount of the first `setInterval` tick, and the interval's own
+    // callback) — never in the render body — to keep the component pure.
+    useEffect(() => {
+        if (requestStatus !== 'pending') return;
+        if (attemptStartedAtRef.current === null) {
+            attemptStartedAtRef.current = Date.now();
+        }
+        const startedAt = attemptStartedAtRef.current;
+        const id = setInterval(() => {
+            setElapsedMs(Date.now() - startedAt);
+        }, 500);
+        return () => clearInterval(id);
+    }, [requestStatus]);
+
+    const bootUiState = useMemo(
+        () => computeBootUiState({ requestStatus, elapsedMs, confirmedGuacamoleRunning, errorCode }),
+        [requestStatus, elapsedMs, confirmedGuacamoleRunning, errorCode],
+    );
+
     const handleReload = useCallback(() => {
+        attemptStartedAtRef.current = null;
+        setElapsedMs(0);
         setReloadKey((k) => k + 1);
         void previewQuery.refetch();
     }, [previewQuery]);
 
-    if (loadState.phase === 'not_configured') {
+    if (bootUiState.kind === 'not_configured') {
         return (
             <Panel testId="cf-guacamole-not-configured" tone="neutral">
-                <p className="mb-1 font-medium text-white">EZiL OS desktop</p>
-                <p className="mb-3 text-xs text-neutral-400">This computer&apos;s desktop provider is not configured.</p>
+                <p className="mb-1 font-medium text-white">{BOOT_NOT_CONFIGURED_COPY.title}</p>
+                <p className="mb-3 text-xs text-neutral-400">{BOOT_NOT_CONFIGURED_COPY.body}</p>
                 <p className="text-xs text-neutral-500">
                     Set{' '}
                     <code className="rounded bg-neutral-800 px-1 py-0.5 text-orange-400">
@@ -153,59 +220,26 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
         );
     }
 
-    if (loadState.phase === 'worker_unreachable') {
+    if (bootUiState.kind === 'failed') {
+        const copy = BOOT_FAILURE_COPY[bootUiState.reason];
+        const tone = bootUiState.reason === 'sandbox_crashed' ? 'warning' : 'error';
         return (
-            <Panel testId="cf-guacamole-worker-down" tone="error" onRetry={handleReload}>
-                <p className="mb-2 font-semibold text-white">Desktop worker unreachable</p>
-                {loadState.rawError && (
-                    <p className="mb-2 truncate rounded border border-neutral-700/50 bg-neutral-900/60 px-3 py-2 font-mono text-[10px] text-neutral-500">
-                        {loadState.rawError.slice(0, 120)}
-                    </p>
-                )}
-                <p className="text-xs text-neutral-400">
-                    The worker that runs this computer isn&apos;t reachable right now. Try again in a
-                    moment.
-                </p>
+            <Panel testId={`cf-guacamole-failed-${bootUiState.reason}`} tone={tone} onRetry={handleReload}>
+                <p className="mb-2 font-semibold text-white">{copy.title}</p>
+                <p className="text-xs text-neutral-400">{copy.body}</p>
             </Panel>
         );
     }
 
-    if (loadState.phase === 'sandbox_runtime_blocked') {
-        return (
-            <Panel testId="cf-guacamole-runtime-blocked" tone="warning" onRetry={handleReload}>
-                <p className="mb-2 font-semibold text-white">Desktop runtime unavailable</p>
-                <p className="text-xs text-neutral-400">
-                    The worker is reachable but the sandbox runtime failed to start. Retrying often
-                    resolves this.
-                </p>
-            </Panel>
-        );
+    if (bootUiState.kind === 'progress') {
+        return <BootProgressPanel progress={bootUiState} />;
     }
 
-    if (loadState.phase === 'error') {
-        return (
-            <Panel testId="cf-guacamole-error" tone="error" onRetry={handleReload}>
-                <p className="mb-2 font-semibold text-white">{EZIL_OS_LABEL} preview error</p>
-                <p className="text-xs text-neutral-400">{loadState.message}</p>
-            </Panel>
-        );
-    }
-
-    if (loadState.phase === 'loading') {
-        return (
-            <div
-                className="relative flex h-full w-full items-center justify-center bg-neutral-950"
-                data-testid="cf-guacamole-loading"
-            >
-                <div className="flex flex-col items-center gap-2 text-neutral-400">
-                    <div className="h-6 w-6 animate-spin rounded-full border-2 border-neutral-600 border-t-teal" />
-                    <span className="text-xs">Starting {EZIL_OS_LABEL} sandbox…</span>
-                </div>
-            </div>
-        );
-    }
-
-    const { guacamoleUrl, workspace } = loadState;
+    const { guacamoleUrl, workspace } = previewQuery.data as {
+        ok: true;
+        guacamoleUrl: string;
+        workspace?: WorkspaceStatus;
+    };
 
     return (
         <div
@@ -262,6 +296,90 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
     );
 }
 
+/**
+ * The boot-progress screen shown for the ~22s cold start. Every phase is
+ * drawn from `BOOT_PHASES`; its visual state (`upcoming` / `current` /
+ * `passed` / `confirmed`) comes from `phaseVisualState`, which is the ONLY
+ * thing allowed to decide whether a checkmark appears. `passed`/`current`
+ * are time-based estimates and deliberately never render a checkmark —
+ * only `confirmed` (backed by a real `guacamoleRunning` observation) does.
+ */
+function BootProgressPanel({ progress }: { progress: BootProgressState }) {
+    return (
+        <div
+            className="relative flex h-full w-full items-center justify-center bg-neutral-950"
+            data-testid="cf-guacamole-boot-progress"
+            data-current-phase={progress.currentPhase}
+            data-confirmed={progress.confirmed}
+        >
+            <div className="flex w-full max-w-xs flex-col gap-4">
+                <div className="text-center">
+                    <p className="text-sm font-medium text-white">{BOOT_PROGRESS_HEADLINE}</p>
+                    <p className="mt-1 text-xs text-neutral-500">{BOOT_PROGRESS_SUBTEXT}</p>
+                    {progress.isRunningLong && (
+                        <p className="mt-1 text-xs text-neutral-500" data-testid="cf-guacamole-boot-long-wait">
+                            {BOOT_PROGRESS_LONG_SUBTEXT}
+                        </p>
+                    )}
+                </div>
+
+                <ol className="flex flex-col gap-2.5">
+                    {BOOT_PHASES.map((phase) => {
+                        const visual = phaseVisualState(phase.id, progress);
+                        return (
+                            <li
+                                key={phase.id}
+                                className="flex items-center gap-2.5"
+                                data-testid={`cf-guacamole-boot-phase-${phase.id}`}
+                                data-phase-state={visual}
+                            >
+                                <PhaseIndicator visual={visual} />
+                                <span
+                                    className={
+                                        visual === 'upcoming'
+                                            ? 'text-xs text-neutral-600'
+                                            : visual === 'confirmed'
+                                              ? 'text-xs font-medium text-emerald-300'
+                                              : visual === 'current'
+                                                ? 'text-xs font-medium text-white'
+                                                : 'text-xs text-neutral-500'
+                                    }
+                                >
+                                    {phase.label}
+                                </span>
+                            </li>
+                        );
+                    })}
+                </ol>
+            </div>
+        </div>
+    );
+}
+
+function PhaseIndicator({ visual }: { visual: PhaseVisualState }) {
+    if (visual === 'confirmed') {
+        return (
+            <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-400">
+                <CheckIcon className="h-2.5 w-2.5" />
+            </span>
+        );
+    }
+    if (visual === 'current') {
+        return (
+            <span className="relative flex h-4 w-4 shrink-0 items-center justify-center">
+                <span className="absolute h-4 w-4 animate-ping rounded-full bg-teal/40" />
+                <span className="relative h-2 w-2 rounded-full bg-teal" />
+            </span>
+        );
+    }
+    if (visual === 'passed') {
+        // Estimated-complete only — a dimmer filled dot, deliberately NOT a
+        // checkmark, so it never reads as a confirmed observation.
+        return <span className="h-2 w-2 shrink-0 rounded-full bg-neutral-500" />;
+    }
+    return <span className="h-2 w-2 shrink-0 rounded-full border border-neutral-700" />;
+}
+
 function Panel({
     children,
     testId,
@@ -314,6 +432,14 @@ function ReloadIcon(props: React.SVGProps<SVGSVGElement>) {
                 strokeLinejoin="round"
                 d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
             />
+        </svg>
+    );
+}
+
+function CheckIcon(props: React.SVGProps<SVGSVGElement>) {
+    return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={3} aria-hidden="true" {...props}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
         </svg>
     );
 }
