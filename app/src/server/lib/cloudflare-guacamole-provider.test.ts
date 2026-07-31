@@ -9,6 +9,7 @@ import {
     enableImplicitHosting,
     isRetryablePreviewErrorCode,
     requestGuacamolePreview,
+    requestGuacamoleSandboxTerminate,
     type CloudflareGuacamoleConfig,
     type GuacamolePreviewError,
     type GuacamolePreviewErrorCode,
@@ -239,6 +240,90 @@ describe('requestGuacamolePreview — the failure carries its own retryability',
         const result = (await requestGuacamolePreview(CONFIG, 'secret', INPUT)) as GuacamolePreviewError;
         expect(result.errorCode).toBe('custom_domain_required');
         expect(result.retryable).toBe(false);
+    });
+});
+
+describe('requestGuacamoleSandboxTerminate — the regression: an unsigned, unchecked DELETE that lied', () => {
+    it('signs the request the same way as /sandbox/preview, as Authorization: Bearer', async () => {
+        const fetchSpy = stubWorkerResponse(
+            200,
+            JSON.stringify({ ok: true, terminated: true, outcome: 'destroyed' }),
+        );
+
+        await requestGuacamoleSandboxTerminate(CONFIG, 'secret', 'guac-u-c', 'cid-1');
+
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+        const [url, init] = fetchSpy.mock.calls[0] as unknown as [RequestInfo, RequestInit];
+        expect(String(url)).toContain('/sandbox/guac-u-c');
+        expect(init.method).toBe('DELETE');
+        const headers = init.headers as Record<string, string>;
+        expect(headers.Authorization).toMatch(/^Bearer t=\d+,v1=[0-9a-f]+$/);
+    });
+
+    it('reports ok:true, terminated:true for a confirmed destroy', async () => {
+        stubWorkerResponse(200, JSON.stringify({ ok: true, terminated: true, outcome: 'destroyed' }));
+        const result = await requestGuacamoleSandboxTerminate(CONFIG, 'secret', 'guac-u-c');
+        expect(result).toEqual({ ok: true, terminated: true, outcome: 'destroyed', error: undefined });
+    });
+
+    it('reports ok:true, terminated:false for the idempotent not_running outcome', async () => {
+        stubWorkerResponse(200, JSON.stringify({ ok: true, terminated: false, outcome: 'not_running' }));
+        const result = await requestGuacamoleSandboxTerminate(CONFIG, 'secret', 'guac-u-c');
+        expect(result.ok).toBe(true);
+        expect(result.terminated).toBe(false);
+        expect(result.outcome).toBe('not_running');
+    });
+
+    it('THE REGRESSION: a 401 (unsigned/rejected) is reported as ok:false, never silently discarded', async () => {
+        // Before the fix, this function sent no token at all, never checked
+        // `res.ok`, and returned `void` — a caller had no way to learn a 401
+        // had happened, and `softDeleteComputer` reported `sandboxTerminated:
+        // true` regardless. `fetch` resolving normally on a 4xx is exactly why
+        // an unchecked status silently passes: the `catch` block never fires.
+        stubWorkerResponse(401, JSON.stringify({ ok: false, error: 'hmac_signature_mismatch' }));
+        const result = await requestGuacamoleSandboxTerminate(CONFIG, 'wrong-secret', 'guac-u-c');
+        expect(result.ok).toBe(false);
+        expect(result.error).toBe('hmac_signature_mismatch');
+    });
+
+    it('reports ok:false for still_running (HTTP 500) — a slow/incomplete teardown is not success', async () => {
+        stubWorkerResponse(
+            500,
+            JSON.stringify({
+                ok: false,
+                terminated: false,
+                outcome: 'still_running',
+                error: 'container_still_running_after_destroy',
+            }),
+        );
+        const result = await requestGuacamoleSandboxTerminate(CONFIG, 'secret', 'guac-u-c');
+        expect(result.ok).toBe(false);
+        expect(result.outcome).toBe('still_running');
+        expect(result.error).toBe('container_still_running_after_destroy');
+    });
+
+    it('reports ok:false, never throws, on a transport failure', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () => {
+                throw new TypeError('fetch failed');
+            }),
+        );
+        const result = await requestGuacamoleSandboxTerminate(CONFIG, 'secret', 'guac-u-c');
+        expect(result.ok).toBe(false);
+        expect(result.error).toContain('fetch failed');
+    });
+
+    it('is a no-op success when the provider is not configured — nothing to tear down', async () => {
+        const fetchSpy = vi.fn();
+        vi.stubGlobal('fetch', fetchSpy);
+        const result = await requestGuacamoleSandboxTerminate(
+            { workerUrl: '', hasHmacSecret: false, isConfigured: false },
+            '',
+            'guac-u-c',
+        );
+        expect(result).toEqual({ ok: true, terminated: false });
+        expect(fetchSpy).not.toHaveBeenCalled();
     });
 });
 

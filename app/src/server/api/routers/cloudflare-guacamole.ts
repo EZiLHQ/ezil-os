@@ -232,9 +232,21 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 return { ok: false as const, error: 'provider_not_configured', provider: 'cloudflare-guacamole' as const };
             }
 
+            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
             const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
-            await requestGuacamoleSandboxTerminate(config, sandboxName, correlationId);
-            return { ok: true as const, sandboxName, correlationId, provider: 'cloudflare-guacamole' as const };
+            const result = await requestGuacamoleSandboxTerminate(config, hmacSecret, sandboxName, correlationId);
+            // Report what the Worker actually confirmed, not a hardcoded
+            // success — `result.ok` is false for still_running/destroy_failed,
+            // a rejected signature, or an unreachable Worker.
+            return {
+                ok: result.ok,
+                terminated: result.terminated,
+                outcome: result.outcome,
+                error: result.error,
+                sandboxName,
+                correlationId,
+                provider: 'cloudflare-guacamole' as const,
+            };
         }),
 });

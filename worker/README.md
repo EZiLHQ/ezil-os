@@ -92,14 +92,17 @@ poll; do both together if you want it closed.
 > **Callers must sign `DELETE`.** This route previously had *no* authorization
 > at all — an unsigned `DELETE` returned `ok:true`, and the sandbox name is
 > plainly visible in the desktop iframe's `src`, so anyone who saw a URL could
-> destroy that session. `app/src/server/lib/cloudflare-guacamole-provider.ts`'s
-> `requestGuacamoleSandboxTerminate()` currently sends no token and will now
-> get a 401; add
-> `headers: { authorization: \`Bearer ${mintSandboxPreviewToken(hmacSecret)}\` }`
-> to that `fetch` (it already imports the minting helper it uses for
-> `/sandbox/preview`). Terminate is best-effort in the app and sandboxes
-> auto-sleep after 30m regardless, so an unsigned destructive endpoint is by
-> far the worse of the two states to be in while that lands.
+> destroy that session. FIXED:
+> `app/src/server/lib/cloudflare-guacamole-provider.ts`'s
+> `requestGuacamoleSandboxTerminate()` now sends
+> `Authorization: Bearer ${mintSandboxPreviewToken(hmacSecret)}` and, just as
+> importantly, checks `res.ok` — a bare unsigned `fetch` used to resolve
+> normally on the resulting 401 (fetch does not throw on 4xx/5xx), so the
+> caller's `try/catch` never fired and the failure was invisible. The function
+> now returns a typed `{ ok, terminated, outcome, error }` result, and its two
+> callers (`computer.ts`'s soft-delete path, `cloudflare-guacamole.ts`'s
+> `terminate` mutation) only report `sandboxTerminated: true` when `ok` is
+> actually `true`.
 
 ### Reading a `DELETE` response
 

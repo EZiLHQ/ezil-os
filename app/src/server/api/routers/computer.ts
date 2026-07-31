@@ -69,19 +69,28 @@ function isUniqueViolation(error: unknown): boolean {
 }
 
 /**
- * Ask the desktop Worker to tear down this computer's sandbox. Best effort
- * and never throws: the provider helper already swallows and logs its own
- * transport errors, and a provider that isn't configured at all is a no-op
- * rather than a failure.
+ * Ask the desktop Worker to tear down this computer's sandbox.
+ *
+ * Throws when the Worker did not CONFIRM the teardown (rejected the signed
+ * request, answered `still_running`/`destroy_failed`, or was unreachable) —
+ * `softDeleteComputer`'s try/catch (see `./computer-store.ts`) turns that
+ * into `sandboxTerminated: false` and logs it, while the soft delete itself
+ * still proceeds. A provider that isn't configured at all is a no-op rather
+ * than a failure, since there is no sandbox to tear down.
  */
 async function terminateComputerSandbox(userId: string, computerId: string): Promise<void> {
     const config = resolveCloudflareGuacamoleConfig();
     if (!config.isConfigured) return;
-    await requestGuacamoleSandboxTerminate(
+    const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+    const result = await requestGuacamoleSandboxTerminate(
         config,
+        hmacSecret,
         deriveGuacamoleSandboxId(userId, computerId),
         newCorrelationId(),
     );
+    if (!result.ok) {
+        throw new Error(`sandbox_terminate_not_confirmed: ${result.error ?? result.outcome ?? 'unknown'}`);
+    }
 }
 
 export const computerRouter = createTRPCRouter({
