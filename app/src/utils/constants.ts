@@ -4,6 +4,13 @@ export const Routes = {
     LOGIN: '/login',
     COMPUTERS: '/computers',
     COMPUTER: '/computer',
+    /**
+     * The EZiL OS shell. Added as a route, NOT yet as anyone's destination:
+     * `/computers` remains where login lands and remains the fallback if the
+     * shell is unavailable. Flipping the entry point is a separate, deliberate
+     * change.
+     */
+    OS: '/os',
 } as const;
 
 /** Query param carrying the URL to return to after a successful login. */
