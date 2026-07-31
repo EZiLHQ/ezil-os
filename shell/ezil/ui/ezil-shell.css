@@ -299,3 +299,20 @@ body.device-phone {
 .ezil-desktop-window:not(.ezil-fullbleed) .ezil-app-drawer {
     display: none;
 }
+
+/* 🔴 The other half of the same trade. The desktop window is created
+ * `is_resizable: true` for ONE reason — `UIWindow.js:346` renders the head's
+ * minimise button only for a resizable window, and while the window is
+ * windowed that button is the ordinary way to put your computer aside and use
+ * the OS. Nothing in `enter_fullpage_mode` takes the handles away, so a
+ * full-bleed window would carry eight jQuery UI drag targets around the edge of
+ * the live desktop, and one stray drag from the screen edge would shrink it.
+ *
+ * `display: none` rather than `resizable('disable')`: jQuery UI's disable puts
+ * `ui-state-disabled` on the WINDOW, and its theme sheet gives that
+ * `pointer-events: none` and reduced opacity — which would dim the desktop and
+ * swallow every click into it. Hiding the handle elements removes the only
+ * thing resizable binds to and touches nothing else. */
+.ezil-desktop-window.ezil-fullbleed > .ui-resizable-handle {
+    display: none;
+}
