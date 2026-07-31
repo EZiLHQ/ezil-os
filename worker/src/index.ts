@@ -1274,14 +1274,41 @@ const WORKSPACE_TERMINATED_KEY = 'ezil:workspaceTerminated';
 const WORKSPACE_FLUSH_CALLBACK = 'flushWorkspaceScheduled';
 
 /**
- * How long `terminateSandbox()` waits for `ctx.container.running` to go false
- * after `destroy()` settles, before reporting `still_running`.
+ * Backstop ceiling (ms) for `terminateSandbox()`'s primary confirmation
+ * signal — `ctx.container.monitor()` settling (see that method for why this
+ * is preferred over polling `.running` directly).
  *
- * `destroy()` is a SIGKILL and the runtime flag is expected to flip by the
- * time it resolves; this short poll exists only so a slow control-plane
- * acknowledgement is not mis-reported as a failed teardown. Bounded small on
- * purpose — a terminate that cannot be confirmed quickly SHOULD report that it
- * could not be confirmed rather than block the caller.
+ * WHY THIS EXISTS, and why it replaced a blind poll of `.running`: live
+ * observation showed 1 in 5 signed DELETEs reporting HTTP 500
+ * `still_running` even though the NEXT preview open was a genuine cold
+ * first-run boot — proof `destroy()` had actually landed. The bug was never
+ * in `buildTerminateReport`'s decision (still-running-after-destroy IS a
+ * real failure, in principle); it was in what `runningAfter` was measured
+ * from. `ctx.container.running` is a synchronous flag on the SAME native
+ * `Container` binding `@cloudflare/containers` itself awaits via
+ * `.monitor()` before updating its own internal state (see
+ * `setupMonitorCallbacks` in `@cloudflare/containers/dist/lib/container.js`)
+ * — i.e. the flag can lag the actual "process has exited" event by more than
+ * a fixed short poll window allows for. `monitor()` IS that event: its
+ * promise settles (fulfilled on a clean exit, rejected otherwise — a SIGKILL
+ * from `destroy()` is not a clean exit) exactly when the container process
+ * is gone, so awaiting it is waiting for the real signal instead of guessing
+ * how long a control-plane acknowledgement takes. This constant is only a
+ * safety ceiling in case that promise never settles (e.g. it was already
+ * captured against an instance that raced ahead of us) — generous on
+ * purpose, since it backstops an event-driven wait rather than being the
+ * measurement itself.
+ */
+const TERMINATE_MONITOR_BACKSTOP_MS = 10_000;
+
+/**
+ * After the monitor-based wait above (or immediately, when nothing was
+ * running to monitor in the first place), do one final short poll of
+ * `ctx.container.running` for the ground-truth postcondition
+ * `buildTerminateReport` needs. This is now a SECONDARY check absorbing only
+ * the last sliver of lag between "the monitor promise settled" and "the
+ * `.running` flag itself flipped" — it is deliberately short because the
+ * primary wait above is what does the real work.
  */
 const TERMINATE_CONFIRM_TIMEOUT_MS = 3_000;
 const TERMINATE_CONFIRM_INTERVAL_MS = 250;
@@ -1544,12 +1571,16 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    *
    * Ordered so the answer is OBSERVED, never assumed:
    *   1. read `ctx.container.running` BEFORE anything (`wasRunning`);
-   *   2. flush ONLY if a container is actually up — flushing a sleeping
+   *   2. IF running, capture `ctx.container.monitor()` — the promise that
+   *      settles exactly when THIS container instance's process exits —
+   *      before anything else touches it;
+   *   3. flush ONLY if a container is actually up — flushing a sleeping
    *      sandbox would cold-boot it (~20s) purely to kill it again;
-   *   3. tombstone + cancel the flush loop (see `destroy()` above);
-   *   4. `destroy()`;
-   *   5. re-read `ctx.container.running`, briefly polling, and report what was
-   *      actually observed via `buildTerminateReport`.
+   *   4. tombstone + cancel the flush loop (see `destroy()` above);
+   *   5. `destroy()`;
+   *   6. await the captured monitor promise (bounded), THEN briefly poll
+   *      `ctx.container.running` as a final ground-truth check, and report
+   *      what was actually observed via `buildTerminateReport`.
    *
    * A name that never ran anything now reports `terminated: false,
    * outcome: 'not_running'` instead of a bogus `terminated: true` — which is
@@ -1559,6 +1590,28 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    */
   async terminateSandbox(): Promise<TerminateReport> {
     const wasRunning = this.containerIsRunning();
+
+    // Capture the container's own exit signal BEFORE `destroy()` is issued
+    // below, while we know for certain this instance is the one running —
+    // see `TERMINATE_MONITOR_BACKSTOP_MS`'s doc comment for why this is the
+    // signal to wait on rather than polling `.running` alone. `ctx.container`
+    // is the exact same native binding `@cloudflare/containers` itself calls
+    // `.monitor()` on internally (`this.container = ctx.container` in its
+    // constructor), so this is not reaching into anything private.
+    let monitorPromise: Promise<void> | undefined;
+    if (wasRunning) {
+      try {
+        monitorPromise = this.ctx.container?.monitor();
+      } catch (err) {
+        // Never let this optimization block termination — fall back to the
+        // polling loop below unchanged if `.monitor()` itself is unavailable.
+        console.error(
+          `[terminateSandbox] monitor() capture failed, falling back to polling only: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
 
     if (wasRunning) {
       // EXPLICIT flush before destroy — the container filesystem (and anything
@@ -1587,6 +1640,26 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       console.error(`[terminateSandbox] destroy() failed: ${destroyError}`);
     }
 
+    if (monitorPromise) {
+      // Either settlement — fulfilled OR rejected — means the container
+      // process is gone. A SIGKILL from `destroy()` above is not a clean
+      // exit, so a rejection here is the EXPECTED path, not a new failure;
+      // this is why both branches resolve rather than propagating the
+      // rejection. Raced against a bounded backstop so a promise that never
+      // settles cannot hang termination forever.
+      await Promise.race([
+        monitorPromise.then(
+          () => undefined,
+          () => undefined,
+        ),
+        new Promise<void>((resolve) => setTimeout(resolve, TERMINATE_MONITOR_BACKSTOP_MS)),
+      ]);
+    }
+
+    // Final ground-truth check: absorbs only the last sliver of lag between
+    // the monitor promise settling and `.running` itself flipping false (or
+    // covers the case where there was nothing to monitor at all, e.g.
+    // `wasRunning` was already false).
     let runningAfter = this.containerIsRunning();
     const deadline = Date.now() + TERMINATE_CONFIRM_TIMEOUT_MS;
     while (runningAfter && Date.now() < deadline) {
