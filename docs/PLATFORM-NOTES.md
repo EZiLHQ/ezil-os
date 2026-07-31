@@ -211,6 +211,50 @@ Two things this exposes that are easy to miss:
   verify the JWT in-process and remove the remaining 154ms, at the cost of not seeing a
   revocation until the token expires.
 
+## 16. `guacamoleRunning: true` and an HTTP 500 preview host are not a contradiction
+
+Observed live 2026-07-31: the Worker's `/sandbox/:id/status` reported
+`guacamoleRunning: true` while every request to the preview host returned
+**HTTP 500 `Proxy routing error`**. Both are correct. They describe different
+things, and nothing in the stack made that obvious.
+
+`describeDesktopStatus` derives `guacamoleRunning` from
+`sandbox.getExposedPorts()`, which reads **Durable Object storage plus
+`ctx.container.running`** and never issues a request through the edge. A port
+registered in DO storage whose *edge route* is broken therefore reports healthy
+indefinitely. **The container-side signal structurally cannot see a routing
+failure.**
+
+The 500 itself is not Cloudflare's. It is `@cloudflare/sandbox`'s own catch-all
+in `proxyToSandbox` (`dist/index.js`):
+
+```js
+} catch (error) {
+  createProxyLogger(request).error("Proxy routing error", ...);
+  return new Response("Proxy routing error", { status: 500 });
+}
+```
+
+Two consequences worth knowing before you spend an hour on it:
+- **The body carries no diagnostic information by construction.** Every failure
+  inside `sandbox.fetch(previewRequest)` — the DO fetch, not the container —
+  collapses to the same nine bytes. The real error goes only to the logger, so
+  per §11 it exists **only in `wrangler tail`**, and only while you are
+  attached.
+- **The status line is the only thing you can read from outside**, which is
+  exactly what the frame-honesty check keys on: `probeDesktopFrame` treats
+  `status >= 400` as not-alive rather than trying to interpret a body that was
+  designed not to say anything.
+
+Product consequence, and the reason this note exists: **an iframe cannot see it
+either.** `load` fires for that 500 page exactly as it does for a working
+desktop, and cross-origin script can read neither the status code nor the
+document. So the browser has no honest signal about its own frame at all —
+only the server does, by fetching the origin itself. Anything that claims
+"ready", "Live", or hides a boot panel must be gated on that server-side
+observation. See `probeDesktopFrame` / `confirmFrame` and
+`computeBootUiState`'s `success` branch.
+
 ---
 
 ## Method notes
