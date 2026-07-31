@@ -1,0 +1,183 @@
+/**
+ * The EZiL OS shell's boot payload — `window.__EZIL_BOOT__`.
+ *
+ * ONE definition, TWO transports:
+ *   - `/os` (src/app/os/page.tsx) inlines it in the HTML, so the shell has
+ *     everything it needs in its first paint and makes zero requests to find
+ *     out who it is or which computer it owns;
+ *   - `/api/shell/session` returns the identical object as JSON, for the
+ *     rehydrate path (a shell that started without the inline copy, or one
+ *     re-checking after a long idle).
+ *
+ * Both go through this module, so the two can never disagree about the shape.
+ *
+ * ── Why it is plain JSON, not superjson ─────────────────────────────────────
+ * The shell is jQuery. Bundling `@trpc/client` + `superjson` into it to talk
+ * to our own server would be a second authorization implementation and a
+ * second serialization format, for no gain. So every date crosses as an ISO
+ * 8601 string and every field is JSON-native. The AUTHORIZATION stays single:
+ * both transports call the same tRPC procedures through
+ * `appRouter.createCaller`, so `protectedProcedure` and the ownership-scoped
+ * row filters are the only gate in either direction.
+ *
+ * ── What is deliberately NOT in here ────────────────────────────────────────
+ * Per-user desktop preferences — window positions, icon layout, wallpaper
+ * choice. Upstream Puter reads those from its cloud key-value store
+ * (`puter.kv`); this fork has no such backend, and preferences are
+ * browser-local through `shell/ezil/session.js` (localStorage). The server
+ * genuinely does not know them, so the payload does not pretend to.
+ *
+ * No secret is representable here: no Worker URL, no HMAC secret, no preview
+ * URL. `desktopState` carries booleans the browser can already obtain from
+ * `cloudflareGuacamole.isConfigured`, and nothing else.
+ */
+
+import type { Computer } from '@/server/db/schema';
+
+/** The HTTP surface the shell talks to. Declared once; the Route Handlers live at these paths. */
+export const SHELL_API_ROUTES = {
+    /** GET = read the current session (never writes). POST = get-or-create the default computer. */
+    session: '/api/shell/session',
+    /** GET = cheap status poll. POST = start/attach the desktop (a COLD BOOT, ~22s). */
+    desktop: '/api/shell/desktop',
+} as const;
+
+export interface ShellBootUser {
+    id: string;
+    /** Supabase can return a user with no email (other identity providers). Never faked. */
+    email: string | null;
+}
+
+export interface ShellBootComputer {
+    id: string;
+    name: string;
+    slot: number;
+    /** ISO 8601. */
+    createdAt: string;
+    /** ISO 8601, or null if never opened. */
+    lastOpenedAt: string | null;
+    /**
+     * True only when THIS boot created the row — i.e. the user's very first
+     * computer, one second old. The shell can use it to decide whether an
+     * empty workspace is expected (a new computer boots empty — see
+     * docs/RUNBOOK.md A2) rather than a sign something was lost.
+     */
+    isNew: boolean;
+}
+
+/**
+ * An app the shell may show. This is the SERVER's registry: an entry exists
+ * only if the host can actually launch it today. Right now that is exactly
+ * one thing — the streamed Linux desktop — and listing anything else would be
+ * an icon that does nothing.
+ */
+export interface ShellBootApp {
+    id: string;
+    name: string;
+    /** Icon key the shell resolves against `/os/icons.js`. */
+    icon: string;
+    kind: 'desktop';
+}
+
+export const SHELL_APPS: readonly ShellBootApp[] = [
+    { id: 'desktop', name: 'Linux Desktop', icon: 'desktop', kind: 'desktop' },
+];
+
+export interface ShellDesktopState {
+    provider: 'cloudflare-guacamole';
+    /** Whether the desktop Worker is configured at all. From `cloudflareGuacamole.isConfigured`. */
+    configured: boolean;
+    /** Whether a signing secret is present. A configured Worker without one will reject every call. */
+    hasHmacSecret: boolean;
+    /**
+     * ALWAYS 'idle' at boot. The page never asks the container anything — see
+     * `src/app/os/page.tsx` — so at this instant the server has no observation
+     * of whether the desktop is up, and refuses to imply one. The shell moves
+     * this along only from real answers to `SHELL_API_ROUTES.desktop`.
+     */
+    status: 'idle';
+    endpoints: typeof SHELL_API_ROUTES;
+}
+
+export interface ShellBootPayload {
+    user: ShellBootUser;
+    computer: ShellBootComputer;
+    apps: readonly ShellBootApp[];
+    desktopState: ShellDesktopState;
+}
+
+/** The same payload with no computer — the read-only `GET /api/shell/session` answer. */
+export type ShellSessionPayload = Omit<ShellBootPayload, 'computer'> & {
+    computer: ShellBootComputer | null;
+};
+
+export interface DesktopProviderInfo {
+    isConfigured: boolean;
+    hasHmacSecret: boolean;
+}
+
+export function toShellBootComputer(computer: Computer, isNew: boolean): ShellBootComputer {
+    return {
+        id: computer.id,
+        name: computer.name,
+        slot: computer.slot,
+        createdAt: computer.createdAt.toISOString(),
+        lastOpenedAt: computer.lastOpenedAt?.toISOString() ?? null,
+        isNew,
+    };
+}
+
+export function toShellDesktopState(provider: DesktopProviderInfo | null): ShellDesktopState {
+    return {
+        provider: 'cloudflare-guacamole',
+        // A provider lookup that FAILED is reported as not configured, never
+        // as configured-and-fine. The shell's honest "not configured" panel is
+        // a better answer than a desktop that silently never arrives.
+        configured: provider?.isConfigured === true,
+        hasHmacSecret: provider?.hasHmacSecret === true,
+        status: 'idle',
+        endpoints: SHELL_API_ROUTES,
+    };
+}
+
+export function buildShellBootPayload(input: {
+    user: { id: string; email?: string | null };
+    computer: Computer;
+    isNew: boolean;
+    provider: DesktopProviderInfo | null;
+}): ShellBootPayload {
+    return {
+        user: { id: input.user.id, email: input.user.email ?? null },
+        computer: toShellBootComputer(input.computer, input.isNew),
+        apps: SHELL_APPS,
+        desktopState: toShellDesktopState(input.provider),
+    };
+}
+
+/**
+ * Serialize the payload for inlining inside a `<script>` element.
+ *
+ * Escaping `<` is the whole job and it is not optional. An unescaped `<` lets
+ * any string that reaches this payload close the script element (`</script>`)
+ * or open an HTML comment (`<!--`) and take over the document. The only
+ * user-controlled strings here are the computer name and the email address —
+ * both of which a user can set — so this is a live injection surface, not a
+ * theoretical one. `<` is valid inside a JSON string and parses back to
+ * `<`, so the shell sees the original text unchanged.
+ *
+ * U+2028/U+2029 are legal inside JS string literals since ES2019 and legal
+ * JSON either way, but they are escaped too: this string is also embedded in
+ * HTML, and cheap belt-and-braces beats a subtle parse failure on an old
+ * engine.
+ */
+export function serializeBootPayload(payload: ShellBootPayload | ShellSessionPayload): string {
+    return JSON.stringify(payload)
+        .replace(/</g, '\\u003c')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
+}
+
+/** The exact inline script body `/os` emits. Kept here so the escaping above cannot be bypassed. */
+export function bootPayloadScript(payload: ShellBootPayload): string {
+    return `window.__EZIL_BOOT__=${serializeBootPayload(payload)};`;
+}
