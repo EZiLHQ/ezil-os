@@ -284,3 +284,18 @@ body.device-phone {
        top edge of the screen — the Fitts's-law edge every OS puts chrome on. */
     cursor: pointer;
 }
+
+/* 🔴 The drawer exists only to replace chrome that full-bleed took away. A
+ * WINDOWED desktop window still has its own head — a titlebar with minimise
+ * and close, which is where a user looks first — and a taskbar underneath it.
+ * Showing a 54x15px tongue on top of that is a second, worse copy of controls
+ * that are already there, and it spends the tongue's discoverability on a
+ * moment nobody needs it.
+ *
+ * `.ezil-fullbleed` is written by `go_fullbleed` / `minimise_to_taskbar` in
+ * shell/ezil/apps/desktop-window.js — NOT `data-is_fullpage`, which upstream's
+ * `exit_fullpage_mode` removes. Specificity (0,3,0) and source order both beat
+ * `dashboard.css`'s `.dashboard-app-drawer`. */
+.ezil-desktop-window:not(.ezil-fullbleed) .ezil-app-drawer {
+    display: none;
+}

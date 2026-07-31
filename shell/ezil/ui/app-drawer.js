@@ -48,6 +48,13 @@ const PHASE = 'ezil-os:drawer';
  *   Rendered left-to-right BEFORE the close button. Wave 1 passes minimise;
  *   Settings drops in here with no change to this file.
  * @param {Function} [options.on_close] Defaults to closing the window.
+ * @param {boolean} [options.flash_on_attach=true] Play the intro on attach.
+ *   Upstream always does, because upstream's drawer only ever exists on a
+ *   chrome-less window. EZiL attaches it to a window that is still WINDOWED
+ *   (its own head is the chrome, and CSS keeps the drawer hidden until the
+ *   window goes full-bleed), so the caller plays the intro at the moment the
+ *   drawer becomes the only way out instead. See `go_fullbleed` in
+ *   ../apps/desktop-window.js.
  * @returns {HTMLElement|null} the drawer element, or null if it could not attach.
  */
 export function attach_app_drawer (el_window, options = {}) {
@@ -193,7 +200,9 @@ export function attach_app_drawer (el_window, options = {}) {
     $(el_window).append($drawer);
     // Two frames so the collapsed state paints first and the intro morphs out
     // of the tongue instead of popping in fully open. (Upstream.)
-    requestAnimationFrame(() => requestAnimationFrame(flash));
+    if ( options.flash_on_attach !== false ) {
+        requestAnimationFrame(() => requestAnimationFrame(flash));
+    }
 
     return drawer;
 }
