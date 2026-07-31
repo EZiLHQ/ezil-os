@@ -104,8 +104,8 @@
         }
       },
       "foreignKeys": {
-        "ezil_computers_user_id_users_id_fk": {
-          "name": "ezil_computers_user_id_users_id_fk",
+        "ezil_computers_user_id_fkey": {
+          "name": "ezil_computers_user_id_fkey",
           "tableFrom": "ezil_computers",
           "tableTo": "users",
           "schemaTo": "auth",

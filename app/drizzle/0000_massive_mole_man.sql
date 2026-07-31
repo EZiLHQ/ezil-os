@@ -21,7 +21,15 @@ CREATE TABLE "ezil_computers" (
 --> statement-breakpoint
 ALTER TABLE "ezil_computers" ENABLE ROW LEVEL SECURITY;
 --> statement-breakpoint
-ALTER TABLE "ezil_computers" ADD CONSTRAINT "ezil_computers_user_id_users_id_fk" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE cascade ON UPDATE cascade;
+-- Constraint name is `..._fkey` (Postgres/Supabase's own default naming),
+-- not drizzle-kit's usual `..._users_id_fk` — this table's `user_id` FK was
+-- repointed live, directly against the database, from an earlier
+-- (incorrect) reference to `public.users` to this one against
+-- `auth.users(id)`, which is what actually blocked every fresh signup from
+-- creating a computer (a new Supabase Auth user only ever exists in
+-- `auth.users`). Named here to match what is now live rather than
+-- reintroducing the drizzle-kit name this file never actually ran under.
+ALTER TABLE "ezil_computers" ADD CONSTRAINT "ezil_computers_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE cascade ON UPDATE cascade;
 --> statement-breakpoint
 CREATE UNIQUE INDEX "ezil_computers_user_slot_uidx" ON "ezil_computers" USING btree ("user_id","slot") WHERE "ezil_computers"."deleted_at" is null;
 --> statement-breakpoint

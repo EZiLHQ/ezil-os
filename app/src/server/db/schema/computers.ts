@@ -1,6 +1,7 @@
 import { relations, sql } from 'drizzle-orm';
 import {
     check,
+    foreignKey,
     jsonb,
     pgTable,
     smallint,
@@ -36,14 +37,23 @@ import { authUsers } from './auth-users';
  * `userId` foreign key, which now references this repo's own minimal
  * `auth.users` reference (`./auth-users`) instead of EBuilder's Onlook-era
  * `public.users` mirror table, which this fresh repo does not carry.
+ *
+ * The `userId` FK is named EXPLICITLY (`ezil_computers_user_id_fkey`,
+ * Postgres/Supabase's own default naming) rather than left to drizzle-kit's
+ * usual auto-derived `..._users_id_fk` — this FK was, for a time, wrongly
+ * pointed at `public.users` live (blocking every fresh signup: a new
+ * Supabase Auth user only ever exists in `auth.users`) and was repointed
+ * directly against the database rather than by regenerating a migration.
+ * Naming it here matches what is actually live (see
+ * `drizzle/0000_massive_mole_man.sql`) so a future `drizzle-kit generate`
+ * diffs against the real constraint name instead of proposing a spurious
+ * rename.
  */
 export const computers = pgTable(
     'ezil_computers',
     {
         id: uuid('id').primaryKey().defaultRandom(),
-        userId: uuid('user_id')
-            .notNull()
-            .references(() => authUsers.id, { onDelete: 'cascade', onUpdate: 'cascade' }),
+        userId: uuid('user_id').notNull(),
         name: text('name').notNull().default('Computer'),
         // 1 | 2 — see the CHECK constraint. Cap enforced in the schema, not
         // just application code, so a concurrent double-click racing
@@ -64,6 +74,13 @@ export const computers = pgTable(
             .on(table.userId, table.slot)
             .where(sql`${table.deletedAt} is null`),
         check('ezil_computers_slot_chk', sql`${table.slot} in (1, 2)`),
+        foreignKey({
+            name: 'ezil_computers_user_id_fkey',
+            columns: [table.userId],
+            foreignColumns: [authUsers.id],
+        })
+            .onDelete('cascade')
+            .onUpdate('cascade'),
     ],
 ).enableRLS();
 
