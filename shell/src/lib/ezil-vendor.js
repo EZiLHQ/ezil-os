@@ -6,6 +6,8 @@
 //
 //   jquery       -> via ./ezil-jquery.js, which also publishes the globals
 //   jquery-ui    -> reads the bare global `jQuery` at evaluation time
+//   dragster     -> NOT upstream's plugin; an EZiL reimplementation. See the
+//                   header of ./ezil-dragster.js for why it had to exist.
 //   html-entities-> assigns window.html_encode / window.html_decode
 //   isMobile     -> UMD; esbuild takes its CJS branch, so we publish it here
 //
@@ -17,6 +19,7 @@
 
 import './ezil-jquery.js';
 import './jquery-ui-1.13.2/jquery-ui.min.js';
+import './ezil-dragster.js';
 import './html-entities.js';
 import isMobile from './isMobile.min.js';
 

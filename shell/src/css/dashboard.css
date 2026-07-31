@@ -1,0 +1,275 @@
+/**
+ * Copyright (C) 2024-present Puter Technologies Inc.
+ *
+ * This file is part of Puter.
+ *
+ * Puter is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+/* MODIFIED BY EZIL 2026-07-31: the `.dashboard-app-drawer*` rules only, taken
+ * from upstream `src/gui/src/css/dashboard.css` (4,809 lines at upstream commit
+ * 5a15719). UIWindow.js renders the app-drawer chrome (`.dashboard-app-drawer`,
+ * `-grabber`, `-controls`, `-minimize`, `-close`, `-toggle`, `-clip`) when a
+ * window is opened in dashboard mode, so those rules must exist. The other
+ * ~4,650 lines are Puter's Dashboard tabs (TabFiles, TabApps, ...), which are
+ * on the DO-NOT-TAKE list and are backed by `puter.fs` / `puter.apps`. */
+
+.dashboard-app-drawer {
+    /* The morph's two shapes. --open-w is DERIVED from the part sizes —
+       the controls row is laid out with the same variables, so the open
+       surface always fits its content exactly and breakpoints only
+       override parts. --safe-top keeps content below a notch in
+       standalone/fullscreen display modes while the surface stays flush
+       with the physical edge. */
+    --safe-top: env(safe-area-inset-top, 0px);
+    --icon: 20px;
+    --btn: 26px;
+    --title-w: 150px;
+    --i2t: 8px;   /* icon → title gap */
+    --t2b: 6px;   /* title → buttons gap */
+    --controls-h: 40px;
+    /* With no visible handle when open, the tray hugs the controls row:
+       --open-h leaves just enough glass below the buttons to balance the
+       padding above them (plus ~2px the bottom corner radius eats
+       optically). The bare dismiss strip fills exactly that leftover —
+       it must never rise past the buttons' bottom edge at
+       (controls-h + btn)/2, because the toggle stacks OVER the controls
+       layer and would steal their clicks. */
+    --strip-h: 9px;
+    --open-w: calc(12px + var(--icon) + var(--i2t) + var(--title-w) + var(--t2b) + var(--btn) + 2px + var(--btn) + 10px);
+    --open-h: 42px;
+    --shut-w: 56px;
+    --shut-h: 16px;
+
+    position: absolute;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 500;
+    width: var(--open-w);
+    height: calc(var(--open-h) + var(--safe-top));
+    border-radius: 0 0 16px 16px;
+    background: rgba(24, 24, 28, 0.62);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    backdrop-filter: blur(14px) saturate(140%);
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    border-top: none;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28), 0 1px 3px rgba(0, 0, 0, 0.2);
+    color: #fff;
+    -webkit-user-select: none;
+    user-select: none;
+    transition:
+        width 0.45s cubic-bezier(0.34, 1.2, 0.4, 1),
+        height 0.45s cubic-bezier(0.34, 1.2, 0.4, 1),
+        border-radius 0.45s ease,
+        opacity 0.2s ease;
+}
+.dashboard-app-drawer.collapsed {
+    width: var(--shut-w);
+    height: calc(var(--shut-h) + var(--safe-top));
+    border-radius: 0 0 12px 12px;
+    /* Subtle but findable over both light and dark app content — the
+       white hairline border carries the dark-on-dark case. */
+    opacity: 0.7;
+    transition:
+        width 0.3s cubic-bezier(0.5, 0.05, 0.25, 1),
+        height 0.3s cubic-bezier(0.5, 0.05, 0.25, 1),
+        border-radius 0.3s ease,
+        opacity 0.2s ease 0.08s;
+}
+.dashboard-app-drawer-clip {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    border-radius: inherit;
+    pointer-events: none;
+}
+.dashboard-app-drawer-controls {
+    position: absolute;
+    top: var(--safe-top);
+    left: 50%;
+    transform: translateX(-50%);
+    box-sizing: border-box;
+    width: var(--open-w);
+    height: var(--controls-h);
+    display: flex;
+    align-items: center;
+    padding: 0 10px 0 12px;
+    transition:
+        opacity 0.25s ease 0.1s,
+        filter 0.25s ease 0.1s,
+        transform 0.45s cubic-bezier(0.34, 1.2, 0.4, 1);
+}
+.dashboard-app-drawer.collapsed .dashboard-app-drawer-controls {
+    opacity: 0;
+    filter: blur(5px);
+    transform: translateX(-50%) scale(0.82);
+    visibility: hidden;
+    transition:
+        opacity 0.12s ease,
+        filter 0.12s ease,
+        transform 0.3s cubic-bezier(0.5, 0.05, 0.25, 1),
+        visibility 0s linear 0.3s;
+}
+.dashboard-app-drawer-toggle {
+    position: absolute;
+    inset: calc(var(--safe-top) + var(--open-h) - var(--strip-h)) 0 0 0;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: none;
+    margin: 0;
+    padding: 0;
+    cursor: pointer;
+    transition: inset 0.45s cubic-bezier(0.34, 1.2, 0.4, 1);
+}
+.dashboard-app-drawer.collapsed .dashboard-app-drawer-toggle {
+    inset: var(--safe-top) 0 0 0;
+    transition: inset 0.3s cubic-bezier(0.5, 0.05, 0.25, 1);
+}
+.dashboard-app-drawer-toggle::after {
+    content: '';
+    position: absolute;
+    inset: 0 -14px -14px;
+}
+.dashboard-app-drawer-grabber {
+    width: 24px;
+    height: 3px;
+    border-radius: 2px;
+    background: rgba(255, 255, 255, 0.6);
+    opacity: 0;
+    transition: width 0.3s ease, background-color 0.15s ease, opacity 0.12s ease;
+}
+.dashboard-app-drawer.collapsed .dashboard-app-drawer-grabber {
+    width: 20px;
+    background: rgba(255, 255, 255, 0.78);
+    opacity: 1;
+    transition: width 0.3s ease, background-color 0.15s ease, opacity 0.18s ease 0.14s;
+}
+@media (hover: hover) {
+.dashboard-app-drawer-toggle:hover .dashboard-app-drawer-grabber {
+        background: rgba(255, 255, 255, 0.95);
+    }
+}
+.dashboard-app-drawer-icon {
+    /* Sized to balance the buttons and the tray; radius stays 25% of the
+       icon for the app-icon look. Square icons only — cover guards
+       against a non-square one. */
+    width: var(--icon);
+    height: var(--icon);
+    border-radius: 5px;
+    object-fit: cover;
+    display: block;
+    flex: none;
+    margin-right: var(--i2t);
+}
+.dashboard-app-drawer-title {
+    font-size: 12px;
+    font-weight: 500;
+    /* Roomy enough for descenders: overflow:hidden (needed for the
+       ellipsis) clips vertically too, so a line-height of 1 cut the
+       tails off g/p/y. The flex container centers the taller box. */
+    line-height: 1.35;
+    color: rgba(255, 255, 255, 0.92);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    /* FIXED title box (not a cap): every app's tray is the same width, so
+       the minimize/close buttons sit at the same screen position in every
+       app — they're operated by muscle memory. Left-aligned against the
+       icon: the tray is asymmetric (one icon left, two buttons right), so
+       a centered title lands off the tray's true center and reads as
+       misaligned against the centered tongue below. Icon + title cluster
+       as the identity on the left, controls cluster on the right. */
+    flex: none;
+    width: var(--title-w);
+    text-align: left;
+    margin-right: var(--t2b);
+}
+.dashboard-app-drawer-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--btn);
+    height: var(--btn);
+    flex: none;
+    background: none;
+    border: none;
+    border-radius: 50%;
+    padding: 0;
+    margin: 0;
+    color: rgba(255, 255, 255, 0.9);
+    cursor: pointer;
+    /* The clip layer is pointer-events:none so stray clicks fall through
+       to the surface; the buttons opt back in. */
+    pointer-events: auto;
+    transition: background-color 0.12s ease;
+}
+.dashboard-app-drawer-minimize {
+    margin-right: 2px;
+}
+.dashboard-app-drawer-btn svg {
+    width: 14px;
+    height: 14px;
+    flex: none;
+}
+@media (hover: hover) {
+.dashboard-app-drawer-btn:hover {
+        background-color: rgba(255, 255, 255, 0.16);
+    }
+}
+.dashboard-app-drawer-btn:active {
+    background-color: rgba(255, 255, 255, 0.26);
+}
+.dashboard-app-drawer-toggle:focus-visible,
+.dashboard-app-drawer-btn:focus-visible {
+    outline: 2px solid rgba(255, 255, 255, 0.9);
+    outline-offset: 1px;
+}
+@media (pointer: coarse) {
+.dashboard-app-drawer {
+        --btn: 36px;
+        --controls-h: 48px;
+        --strip-h: 8px;
+        --open-h: 50px;
+        --shut-w: 68px;
+        --shut-h: 20px;
+    }
+.dashboard-app-drawer-grabber {
+        width: 28px;
+        height: 4px;
+    }
+.dashboard-app-drawer.collapsed .dashboard-app-drawer-grabber {
+        width: 24px;
+    }
+.dashboard-app-drawer-toggle::after {
+        inset: 0 -16px -18px;
+    }
+}
+@media (max-width: 500px) {
+.dashboard-app-drawer {
+        --title-w: 0px;
+        --t2b: 0px;
+    }
+.dashboard-app-drawer-title {
+        display: none;
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+.dashboard-app-drawer,
+    .dashboard-app-drawer * {
+        transition: none !important;
+    }
+}

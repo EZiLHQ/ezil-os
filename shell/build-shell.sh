@@ -44,8 +44,35 @@ banner="/*! EZiL-OS shell — AGPL-3.0-only. Contains code derived from Puter
 
 # List css inputs in cascade order: Puter-derived first, EZiL overrides last,
 # then anything under shell/ezil. Emits nothing if a tree has no .css yet.
+#
+# The first four are ordered EXPLICITLY, not alphabetically, because the
+# cascade depends on it and a `sort` gets it wrong. Upstream Puter loads them
+# in this order (see its src/gui/src/static-assets.js `css_paths`):
+#
+#   normalize.css   reset, must be first
+#   jquery-ui.css   vendor widget theme
+#   style.css       Puter's chrome, which deliberately OVERRIDES jQuery UI's
+#                   .ui-resizable-* handles -- so it must come after it
+#   dashboard.css   dashboard-mode chrome, layered on top of style.css
+#
+# A plain `find | sort` puts lib/jquery-ui last (l > c), which lets the vendor
+# theme win over the window chrome and leaves resize handles mispositioned.
+# Anything not named here is appended afterwards in sorted order, so adding a
+# sheet does not silently drop it.
 css_inputs() {
-  find "$here/src" -name '*.css' -not -name 'ezil-*.css' -type f 2>/dev/null | sort
+  local ordered=(
+    "$here/src/css/normalize.css"
+    "$here/src/lib/jquery-ui-1.13.2/jquery-ui.min.css"
+    "$here/src/css/style.css"
+    "$here/src/css/dashboard.css"
+  )
+  local f
+  for f in "${ordered[@]}"; do
+    [[ -f "$f" ]] && printf '%s\n' "$f"
+  done
+  # Remaining Puter-derived sheets, if any, then the EZiL overrides.
+  find "$here/src" -name '*.css' -not -name 'ezil-*.css' -type f 2>/dev/null | sort \
+    | grep -vxF -f <(printf '%s\n' "${ordered[@]}") || true
   find "$here/src" -name 'ezil-*.css' -type f 2>/dev/null | sort
   find "$here/ezil" -name '*.css' -type f 2>/dev/null | sort
 }
