@@ -1,0 +1,315 @@
+/**
+ * Tests for the shell's copy of the boot-phase logic
+ * (`./boot-phases.shell.js`, bound for `shell/ezil/boot-phases.js`).
+ *
+ * The first four `describe` blocks are the original suite from
+ * `./boot-phases.test.ts`, re-pointed at the JS module — they travel with it.
+ * The final block does NOT travel: it is the drift guard, and it only works
+ * while both copies live in the same tree. Drop it when the module moves.
+ */
+
+import { describe, expect, it } from 'vitest';
+
+import * as original from './boot-phases';
+import {
+    BOOT_FAILURE_COPY,
+    BOOT_PHASES,
+    LONG_BOOT_MS,
+    TYPICAL_BOOT_MS,
+    classifyPreviewFetchError,
+    computeBootUiState,
+    estimatePhaseForElapsedMs,
+    phaseVisualState,
+} from './boot-phases.shell.js';
+import * as ported from './boot-phases.shell.js';
+
+type BootProgressState = original.BootProgressState;
+
+describe('estimatePhaseForElapsedMs', () => {
+    it('starts at "waking" immediately', () => {
+        expect(estimatePhaseForElapsedMs(0)).toBe('waking');
+        expect(estimatePhaseForElapsedMs(299)).toBe('waking');
+    });
+
+    it('moves to "mounting" once container_start elapses (~0.3s)', () => {
+        expect(estimatePhaseForElapsedMs(300)).toBe('mounting');
+        expect(estimatePhaseForElapsedMs(3_000)).toBe('mounting');
+    });
+
+    it('moves to "starting" once workspace_mount elapses (~6.2s cumulative)', () => {
+        expect(estimatePhaseForElapsedMs(6_200)).toBe('starting');
+        expect(estimatePhaseForElapsedMs(15_000)).toBe('starting');
+    });
+
+    it('moves to "connecting" once desktop_ready_wait elapses (~21.5s cumulative)', () => {
+        expect(estimatePhaseForElapsedMs(21_500)).toBe('connecting');
+        expect(estimatePhaseForElapsedMs(60_000)).toBe('connecting');
+    });
+
+    it('TYPICAL_BOOT_MS matches the measured reference total from PLATFORM-NOTES §11', () => {
+        // container_start (0.3s) + workspace_mount (5.9s) + desktop_ready_wait (15.3s) = 21.5s
+        expect(TYPICAL_BOOT_MS).toBe(21_500);
+    });
+});
+
+describe('computeBootUiState — never fabricates progress', () => {
+    it('reports not_configured distinctly from a failure', () => {
+        const state = computeBootUiState({ requestStatus: 'not_configured', elapsedMs: 0 });
+        expect(state.kind).toBe('not_configured');
+    });
+
+    it('reports ready only once the single preview request has actually resolved ok', () => {
+        const state = computeBootUiState({ requestStatus: 'success', elapsedMs: 999 });
+        expect(state).toEqual({ kind: 'ready' });
+    });
+
+    it('while pending, never marks a phase confirmed from elapsed time alone', () => {
+        const state = computeBootUiState({ requestStatus: 'pending', elapsedMs: 25_000 });
+        expect(state.kind).toBe('progress');
+        const progress = state as BootProgressState;
+        expect(progress.confirmed).toBe(false);
+        // Estimate has run past the typical total, so it settles on the last phase —
+        // but "on the last phase" and "confirmed" are not the same claim.
+        expect(progress.currentPhase).toBe('connecting');
+    });
+
+    it('treats an undefined status poll as "no information", not as guacamoleRunning: false', () => {
+        const withUndefined = computeBootUiState({ requestStatus: 'pending', elapsedMs: 1_000 });
+        const withExplicitFalse = computeBootUiState({
+            requestStatus: 'pending',
+            elapsedMs: 1_000,
+            confirmedGuacamoleRunning: false,
+        });
+        // Both fall back to the time estimate — the point is only that a
+        // present-but-false observation must not be treated any more
+        // confidently than absence of an observation.
+        expect(withUndefined).toEqual(withExplicitFalse);
+    });
+
+    it('upgrades to a confirmed "connecting" phase the instant guacamoleRunning is genuinely observed, even ahead of the timer', () => {
+        const state = computeBootUiState({
+            requestStatus: 'pending',
+            elapsedMs: 2_000, // timer alone would still say "mounting"
+            confirmedGuacamoleRunning: true,
+        });
+        expect(state).toEqual({
+            kind: 'progress',
+            currentPhase: 'connecting',
+            confirmed: true,
+            isRunningLong: false,
+        });
+    });
+
+    it('flags a long-running boot past LONG_BOOT_MS without claiming anything is wrong', () => {
+        const state = computeBootUiState({ requestStatus: 'pending', elapsedMs: LONG_BOOT_MS });
+        expect(state.kind).toBe('progress');
+        expect((state as BootProgressState).isRunningLong).toBe(true);
+    });
+
+    it('maps genuine Worker error codes to plain-language failure reasons', () => {
+        expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'connection_refused' })).toEqual({
+            kind: 'failed',
+            reason: 'worker_unreachable',
+        });
+        expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'fetch_failed' })).toEqual({
+            kind: 'failed',
+            reason: 'worker_unreachable',
+        });
+        expect(
+            computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'sandbox_runtime_blocked' }),
+        ).toEqual({ kind: 'failed', reason: 'sandbox_crashed' });
+        expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'sandbox_start_failed' })).toEqual({
+            kind: 'failed',
+            reason: 'sandbox_crashed',
+        });
+        expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'timeout' })).toEqual({
+            kind: 'failed',
+            reason: 'timeout',
+        });
+        expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'worker_http_error' })).toEqual({
+            kind: 'failed',
+            reason: 'unknown',
+        });
+        expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0 })).toEqual({
+            kind: 'failed',
+            reason: 'unknown',
+        });
+    });
+
+    it('gives the deterministic family the generic copy, never "retrying usually fixes this"', () => {
+        // These four are our bug or our misconfiguration and cannot be
+        // retried away, so `sandbox_crashed` — whose copy promises a retry
+        // will help — would be a lie. They take `unknown`, whose "if it keeps
+        // happening, let us know" is the true thing to say.
+        for (const errorCode of [
+            'bad_request',
+            'unauthorized',
+            'preconditions_unmet',
+            'custom_domain_required',
+        ] as const) {
+            expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode })).toEqual({
+                kind: 'failed',
+                reason: 'unknown',
+            });
+        }
+    });
+
+    it('invents no new failure copy for them — every reason still resolves to existing strings', () => {
+        expect(Object.keys(BOOT_FAILURE_COPY).sort()).toEqual([
+            'sandbox_crashed',
+            'timeout',
+            'unknown',
+            'worker_unreachable',
+        ]);
+    });
+});
+
+describe('phaseVisualState — only "confirmed" is a real observation', () => {
+    const estimatedProgress: BootProgressState = {
+        kind: 'progress',
+        currentPhase: 'starting',
+        confirmed: false,
+        isRunningLong: false,
+    };
+
+    it('marks earlier phases "passed" (estimated-complete), not confirmed', () => {
+        expect(phaseVisualState('waking', estimatedProgress)).toBe('passed');
+        expect(phaseVisualState('mounting', estimatedProgress)).toBe('passed');
+    });
+
+    it('marks the active phase "current" when not backed by a real signal', () => {
+        expect(phaseVisualState('starting', estimatedProgress)).toBe('current');
+    });
+
+    it('marks later phases "upcoming"', () => {
+        expect(phaseVisualState('connecting', estimatedProgress)).toBe('upcoming');
+    });
+
+    it('marks the active phase "confirmed" only when progress.confirmed is true', () => {
+        const confirmedProgress: BootProgressState = {
+            kind: 'progress',
+            currentPhase: 'connecting',
+            confirmed: true,
+            isRunningLong: false,
+        };
+        expect(phaseVisualState('connecting', confirmedProgress)).toBe('confirmed');
+        // Every phase before it is still just an estimate, not a checkmark.
+        expect(phaseVisualState('starting', confirmedProgress)).toBe('passed');
+    });
+
+    it('covers every phase in BOOT_PHASES', () => {
+        expect(BOOT_PHASES.map((p) => p.id)).toEqual(['waking', 'mounting', 'starting', 'connecting']);
+    });
+});
+
+describe('classifyPreviewFetchError — only a real AbortSignal.timeout counts as "timeout"', () => {
+    it('classifies a DOMException named TimeoutError (what AbortSignal.timeout actually throws)', () => {
+        const err = Object.assign(new Error('The operation was aborted due to timeout'), {
+            name: 'TimeoutError',
+        });
+        expect(classifyPreviewFetchError(err)).toBe('timeout');
+    });
+
+    it('does not classify an unrelated error as a timeout', () => {
+        expect(classifyPreviewFetchError(new Error('ECONNREFUSED'))).toBeUndefined();
+        expect(classifyPreviewFetchError('not an error')).toBeUndefined();
+        expect(classifyPreviewFetchError(undefined)).toBeUndefined();
+    });
+});
+
+// ─── DRIFT GUARD — does not travel to `shell/` ──────────────────────────────
+//
+// The port was a module-format conversion, and this is what keeps that claim
+// true. It compares the two copies input by input rather than reading them:
+// a "small improvement" made to one and not the other fails here, which is
+// the failure mode that matters, because the two copies are read by different
+// people at different times and the honesty rules live in the branches.
+
+describe('the port is a module-format conversion and nothing more', () => {
+    const ELAPSED_SWEEP = [0, 1, 299, 300, 3_000, 6_199, 6_200, 21_499, 21_500, 34_999, 35_000, 120_000];
+    const REQUEST_STATUSES = ['not_configured', 'pending', 'success', 'error'] as const;
+    const CONFIRMED = [undefined, false, true] as const;
+    const ERROR_CODES = [
+        undefined,
+        'bad_request',
+        'unauthorized',
+        'preconditions_unmet',
+        'custom_domain_required',
+        'connection_refused',
+        'fetch_failed',
+        'sandbox_runtime_blocked',
+        'sandbox_start_failed',
+        'worker_http_error',
+        'timeout',
+        'unknown',
+    ] as const;
+
+    it('exports exactly the same names', () => {
+        expect(Object.keys(ported).sort()).toEqual(Object.keys(original).sort());
+    });
+
+    it('agrees on every constant and every user-facing string', () => {
+        expect(ported.BOOT_PHASES).toEqual(original.BOOT_PHASES);
+        expect(ported.TYPICAL_BOOT_MS).toBe(original.TYPICAL_BOOT_MS);
+        expect(ported.LONG_BOOT_MS).toBe(original.LONG_BOOT_MS);
+        expect(ported.BOOT_PROGRESS_HEADLINE).toBe(original.BOOT_PROGRESS_HEADLINE);
+        expect(ported.BOOT_PROGRESS_SUBTEXT).toBe(original.BOOT_PROGRESS_SUBTEXT);
+        expect(ported.BOOT_PROGRESS_LONG_SUBTEXT).toBe(original.BOOT_PROGRESS_LONG_SUBTEXT);
+        expect(ported.BOOT_FAILURE_COPY).toEqual(original.BOOT_FAILURE_COPY);
+        expect(ported.BOOT_NOT_CONFIGURED_COPY).toEqual(original.BOOT_NOT_CONFIGURED_COPY);
+    });
+
+    it('agrees on estimatePhaseForElapsedMs across the whole timeline', () => {
+        for (const elapsedMs of ELAPSED_SWEEP) {
+            expect(ported.estimatePhaseForElapsedMs(elapsedMs)).toBe(
+                original.estimatePhaseForElapsedMs(elapsedMs),
+            );
+        }
+    });
+
+    it('agrees on computeBootUiState for every combination of inputs', () => {
+        let compared = 0;
+        for (const requestStatus of REQUEST_STATUSES) {
+            for (const elapsedMs of ELAPSED_SWEEP) {
+                for (const confirmedGuacamoleRunning of CONFIRMED) {
+                    for (const errorCode of ERROR_CODES) {
+                        const input = { requestStatus, elapsedMs, confirmedGuacamoleRunning, errorCode };
+                        expect(ported.computeBootUiState(input)).toEqual(
+                            original.computeBootUiState(input),
+                        );
+                        compared++;
+                    }
+                }
+            }
+        }
+        // Guards against the sweep silently collapsing to nothing.
+        expect(compared).toBe(
+            REQUEST_STATUSES.length * ELAPSED_SWEEP.length * CONFIRMED.length * ERROR_CODES.length,
+        );
+    });
+
+    it('agrees on phaseVisualState for every phase against every progress state', () => {
+        for (const phase of original.BOOT_PHASES) {
+            for (const current of original.BOOT_PHASES) {
+                for (const confirmed of [false, true]) {
+                    const progress: BootProgressState = {
+                        kind: 'progress',
+                        currentPhase: current.id,
+                        confirmed,
+                        isRunningLong: false,
+                    };
+                    expect(ported.phaseVisualState(phase.id, progress)).toBe(
+                        original.phaseVisualState(phase.id, progress),
+                    );
+                }
+            }
+        }
+    });
+
+    it('agrees on classifyPreviewFetchError', () => {
+        const timeout = Object.assign(new Error('aborted'), { name: 'TimeoutError' });
+        for (const err of [timeout, new Error('boom'), 'string', undefined, null, 42]) {
+            expect(ported.classifyPreviewFetchError(err)).toBe(original.classifyPreviewFetchError(err));
+        }
+    });
+});
