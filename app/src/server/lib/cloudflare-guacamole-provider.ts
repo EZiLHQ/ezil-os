@@ -159,8 +159,24 @@ export interface GuacamolePreviewSuccess {
 /**
  * Structured error codes for preview failures, used to render actionable UI
  * instead of a generic error panel.
+ *
+ * The four deterministic codes (`bad_request`, `unauthorized`,
+ * `preconditions_unmet`, `custom_domain_required`) exist because every
+ * non-2xx Worker response used to collapse into `worker_http_error`, which
+ * the router then threw as a `BAD_GATEWAY` — and a thrown error is exactly
+ * what TanStack Query retries. A `400 missing_project_id` or an HMAC
+ * signature mismatch was therefore attempted three times before the user saw
+ * anything. See `isRetryablePreviewErrorCode` below.
  */
 export type GuacamolePreviewErrorCode =
+    /** Worker rejected the request as malformed — `missing_project_id`, `invalid_json_body`, unknown desktop mode. Deterministic. */
+    | 'bad_request'
+    /** Worker rejected our HMAC envelope — unsigned, malformed, expired, or signature mismatch. Deterministic. */
+    | 'unauthorized'
+    /** Worker is missing a precondition it cannot acquire mid-request (e.g. no ICE/TURN configuration, HTTP 412). Deterministic. */
+    | 'preconditions_unmet'
+    /** `@cloudflare/sandbox` refused to expose a port because the host is a `.workers.dev` domain (`CustomDomainRequiredError`). Deterministic. */
+    | 'custom_domain_required'
     | 'connection_refused'
     | 'fetch_failed'
     | 'sandbox_runtime_blocked'
@@ -169,13 +185,95 @@ export type GuacamolePreviewErrorCode =
     | 'timeout'
     | 'unknown';
 
+/**
+ * Failures where a second, byte-identical attempt returns the identical
+ * answer. This is the CLOSED set, and retryable is the default, deliberately:
+ * an unrecognized code (a future addition here, or one arriving from the
+ * Worker on the wire) then costs at most a duplicate request, rather than
+ * silently hardening a transient blip into a user-visible failure.
+ *
+ * Enumerated, with reasons:
+ *   bad_request           — the Worker rejected the request itself (`400
+ *                           missing_project_id`, `invalid_json_body`, bad
+ *                           desktop mode). Resending it changes nothing.
+ *   unauthorized          — our HMAC envelope was rejected. A secret mismatch
+ *                           does not heal between attempts.
+ *   preconditions_unmet   — deployment-level config the request cannot supply.
+ *   custom_domain_required— the host is a `.workers.dev` domain; the SDK will
+ *                           refuse to expose a port on it every single time.
+ *   sandbox_runtime_blocked—the container runtime is blocked at the platform
+ *                           level (`setsockoptint`); retrying has never once
+ *                           resolved it.
+ *
+ * Everything else is retryable, notably: connection_refused / fetch_failed
+ * (the Worker never answered — it may next time), sandbox_start_failed
+ * (containers vanish without notice, `docs/PLATFORM-NOTES.md` §8, and a
+ * restart genuinely can succeed), timeout (a cold-start race that ran past
+ * our budget), and worker_http_error (now only ever a 5xx/408/429 — see
+ * `classifyWorkerHttpFailure`).
+ */
+const DETERMINISTIC_PREVIEW_ERROR_CODES: ReadonlySet<string> = new Set<GuacamolePreviewErrorCode>([
+    'bad_request',
+    'unauthorized',
+    'preconditions_unmet',
+    'custom_domain_required',
+    'sandbox_runtime_blocked',
+]);
+
+/** True when re-sending the identical preview request could plausibly change the answer. */
+export function isRetryablePreviewErrorCode(code: GuacamolePreviewErrorCode | undefined): boolean {
+    if (!code) return true; // unclassified — safe direction is one duplicate request
+    return !DETERMINISTIC_PREVIEW_ERROR_CODES.has(code);
+}
+
+/**
+ * Match the message `@cloudflare/sandbox` puts on `CustomDomainRequiredError`
+ * (`exposePort` throws it verbatim for any `.workers.dev` hostname). The
+ * Worker's own catch-all returns `err.message` with a 500, so the class name
+ * is NOT on the wire — the message text is the only signal, and it must be
+ * recognized or a permanently-misrouted deployment reads as a retryable 5xx.
+ * The name is matched too, for the paths that stringify the error instead.
+ */
+const CUSTOM_DOMAIN_REQUIRED_RE = /CustomDomainRequiredError|Port exposure requires a custom domain/i;
+
+/**
+ * Classify a non-2xx response from the Worker. Body text is matched before
+ * status, because the two failures that arrive with a misleading status
+ * (`setsockoptint` and `CustomDomainRequiredError`, both surfaced as the
+ * Worker's catch-all 500) are deterministic and must not be retried as 5xx.
+ */
+export function classifyWorkerHttpFailure(status: number, body: string): GuacamolePreviewErrorCode {
+    if (/setsockoptint/i.test(body)) return 'sandbox_runtime_blocked';
+    if (CUSTOM_DOMAIN_REQUIRED_RE.test(body)) return 'custom_domain_required';
+    // 408/429 are the 4xx statuses that mean "later", not "never" — leave them
+    // in the retryable bucket rather than treating them as a bad request.
+    if (status === 408 || status === 429) return 'worker_http_error';
+    if (status === 401 || status === 403) return 'unauthorized';
+    if (status === 412) return 'preconditions_unmet';
+    if (status >= 400 && status < 500) return 'bad_request';
+    return 'worker_http_error';
+}
+
 export interface GuacamolePreviewError {
     ok: false;
     error: string;
     errorCode?: GuacamolePreviewErrorCode;
+    /**
+     * Whether re-sending the identical request could plausibly change the
+     * answer. Travels WITH the failure rather than being re-derived by each
+     * caller, so a caller cannot forget to ask — the tRPC router reads it to
+     * decide whether to surface the error immediately or let it be retried.
+     * Always set by `previewError` below; never hand-written.
+     */
+    retryable: boolean;
 }
 
 export type GuacamolePreviewResult = GuacamolePreviewSuccess | GuacamolePreviewError;
+
+/** The single construction site for a preview failure, so `retryable` is always consistent with `errorCode`. */
+function previewError(error: string, errorCode?: GuacamolePreviewErrorCode): GuacamolePreviewError {
+    return { ok: false, error, errorCode, retryable: isRetryablePreviewErrorCode(errorCode) };
+}
 
 /**
  * Call the Worker's `/sandbox/preview` endpoint. Returns a typed result —
@@ -190,10 +288,13 @@ export async function requestGuacamolePreview(
     correlationId: string = newCorrelationId(),
 ): Promise<GuacamolePreviewResult> {
     if (!config.isConfigured) {
-        return {
-            ok: false,
-            error: 'cloudflare_guacamole_not_configured: set CLOUDFLARE_GUACAMOLE_WORKER_URL',
-        };
+        // Deterministic by definition: no amount of retrying supplies a
+        // missing env var. (The router checks `isConfigured` before it ever
+        // gets here — this is the direct-caller guard.)
+        return previewError(
+            'cloudflare_guacamole_not_configured: set CLOUDFLARE_GUACAMOLE_WORKER_URL',
+            'preconditions_unmet',
+        );
     }
 
     const token = mintSandboxPreviewToken(hmacSecret);
@@ -210,10 +311,10 @@ export async function requestGuacamolePreview(
 
         if (!res.ok) {
             const text = await res.text();
-            const errorCode: GuacamolePreviewErrorCode = /setsockoptint/i.test(text)
-                ? 'sandbox_runtime_blocked'
-                : 'worker_http_error';
-            return { ok: false, error: `worker_http_${res.status}: ${text.slice(0, 300)}`, errorCode };
+            return previewError(
+                `worker_http_${res.status}: ${text.slice(0, 300)}`,
+                classifyWorkerHttpFailure(res.status, text),
+            );
         }
 
         const data = (await res.json()) as GuacamolePreviewResult;
@@ -224,11 +325,16 @@ export async function requestGuacamolePreview(
             if (!existing) {
                 if (/setsockoptint/i.test(errMsg)) {
                     errorCode = 'sandbox_runtime_blocked';
+                } else if (CUSTOM_DOMAIN_REQUIRED_RE.test(errMsg)) {
+                    // Same deterministic failure as the 500 path above — the
+                    // classification must not depend on which status it
+                    // happened to arrive with.
+                    errorCode = 'custom_domain_required';
                 } else if (/sandbox.*start|container.*start/i.test(errMsg)) {
                     errorCode = 'sandbox_start_failed';
                 }
             }
-            return { ok: false, error: errMsg, errorCode };
+            return previewError(errMsg, errorCode);
         }
         return data;
     } catch (err) {
@@ -260,7 +366,7 @@ export async function requestGuacamolePreview(
             errorCode = 'fetch_failed';
         }
 
-        return { ok: false, error: msg, errorCode };
+        return previewError(msg, errorCode);
     }
 }
 

@@ -1,10 +1,12 @@
 'use client';
 
+import { useState } from 'react';
 import { toast } from 'sonner';
 
 import { api } from '@/trpc/react';
 import { MAX_COMPUTERS_PER_USER } from '@/utils/constants';
 import { ComputerRow } from './computer-row';
+import { DeleteComputerDialog } from './delete-computer-dialog';
 
 /**
  * `/computers` — always renders exactly `MAX_COMPUTERS_PER_USER` rows,
@@ -19,11 +21,21 @@ import { ComputerRow } from './computer-row';
  * surfaced is a genuine race (two tabs both try to fill the last slot at
  * once) — the loser's `create` call gets the server's typed
  * `computer_limit_reached` error, shown as a toast on that click.
+ *
+ * Deleting is the ONLY way a slot is ever freed — without it a user with
+ * both slots filled is permanently stuck with the two computers they first
+ * made. It sits behind the row's overflow menu rather than on the row's
+ * main surface (which opens the computer), and behind a confirmation that
+ * states plainly what deleting does and does not do — see
+ * `../_lib/delete-copy.ts`, where every clause is tied to the code it
+ * describes.
  */
 export function SelectComputers() {
     const utils = api.useUtils();
     const { data: computers, isLoading, error, refetch } = api.computer.list.useQuery();
     const { mutateAsync: createComputer, isPending: isCreating } = api.computer.create.useMutation();
+    const { mutateAsync: deleteComputer, isPending: isDeleting } = api.computer.delete.useMutation();
+    const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
 
     const handleCreate = async () => {
         try {
@@ -36,6 +48,24 @@ export function SelectComputers() {
                 return;
             }
             toast.error('Failed to create computer. Please try again.');
+        }
+    };
+
+    const handleDelete = async (id: string) => {
+        try {
+            await deleteComputer({ id });
+            setConfirmingDeleteId(null);
+            await utils.computer.list.invalidate();
+        } catch (err) {
+            const code = (err as { data?: { code?: string } } | undefined)?.data?.code;
+            if (code === 'NOT_FOUND') {
+                // Already gone (another tab, or a stale list). The slot is
+                // free either way, so this is a refresh, not an error.
+                setConfirmingDeleteId(null);
+                await utils.computer.list.invalidate();
+                return;
+            }
+            toast.error('Failed to delete computer. Please try again.');
         }
     };
 
@@ -73,6 +103,7 @@ export function SelectComputers() {
     }
 
     const bySlot = new Map((computers ?? []).map((c) => [c.slot, c]));
+    const confirming = (computers ?? []).find((c) => c.id === confirmingDeleteId);
 
     return (
         <div className="mx-auto w-full max-w-2xl px-6 py-8">
@@ -85,9 +116,23 @@ export function SelectComputers() {
                         computer={bySlot.get(slot)}
                         onCreate={handleCreate}
                         isCreating={isCreating}
+                        onDelete={() => setConfirmingDeleteId(bySlot.get(slot)?.id ?? null)}
+                        isDeleting={isDeleting && confirmingDeleteId === bySlot.get(slot)?.id}
                     />
                 ))}
             </div>
+
+            {confirming ? (
+                <DeleteComputerDialog
+                    name={confirming.name}
+                    slot={confirming.slot}
+                    isDeleting={isDeleting}
+                    onCancel={() => {
+                        if (!isDeleting) setConfirmingDeleteId(null);
+                    }}
+                    onConfirm={() => void handleDelete(confirming.id)}
+                />
+            ) : null}
         </div>
     );
 }

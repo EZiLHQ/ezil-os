@@ -131,9 +131,20 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     computerId: input.computerId,
                     error: logSafe,
                     errorCode: result.errorCode,
+                    retryable: result.retryable,
                 });
 
-                if (result.errorCode && OPERATIONAL_ERROR_CODES.has(result.errorCode)) {
+                // Throwing is not neutral: a thrown error is the only thing
+                // TanStack Query retries, so anything thrown here is
+                // re-attempted before the user sees a word. Right for a
+                // transient failure, wrong for a deterministic one — a `400
+                // missing_project_id`, a rejected HMAC signature, a
+                // `CustomDomainRequiredError` all return the same answer
+                // however many times they are asked. So `retryable: false`
+                // comes back as a VALUE, which cannot be retried by
+                // construction, alongside the operational codes that already
+                // did. See `isRetryablePreviewErrorCode` in the provider.
+                if (result.errorCode && (!result.retryable || OPERATIONAL_ERROR_CODES.has(result.errorCode))) {
                     return {
                         ok: false as const,
                         error: logSafe,

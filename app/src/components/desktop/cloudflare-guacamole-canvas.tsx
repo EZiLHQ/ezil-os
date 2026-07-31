@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api } from '@/trpc/react';
+import { DESKTOP_PREVIEW_RETRIES, retryTransientOnly } from '@/trpc/retry-policy';
 import {
     BOOT_FAILURE_COPY,
     BOOT_NOT_CONFIGURED_COPY,
@@ -83,6 +84,10 @@ const EZIL_OS_LABEL = 'EZiL OS';
  */
 function toBootErrorCode(raw: string | undefined): BootErrorCode {
     switch (raw) {
+        case 'bad_request':
+        case 'unauthorized':
+        case 'preconditions_unmet':
+        case 'custom_domain_required':
         case 'connection_refused':
         case 'fetch_failed':
         case 'sandbox_runtime_blocked':
@@ -122,7 +127,15 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
             refetchInterval: 50 * 60 * 1000,
             refetchOnWindowFocus: false,
             staleTime: 0,
-            retry: 2,
+            // Retry ONLY what a second identical attempt could fix. A blanket
+            // `retry: 2` meant a deterministic failure — a `400
+            // missing_project_id`, a bad HMAC signature, a
+            // `CustomDomainRequiredError`, an ownership rejection — burned
+            // three attempts plus 1s+2s of backoff before the user saw a
+            // word, for an answer that was fixed from the first request.
+            // Transient failures (5xx, transport, cold-start races) still
+            // retry exactly as before. See `@/trpc/retry-policy`.
+            retry: retryTransientOnly(DESKTOP_PREVIEW_RETRIES),
         },
     );
 
@@ -170,6 +183,14 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
             enabled: requestStatus === 'pending',
             refetchInterval: 2_000,
             refetchOnWindowFocus: false,
+            // Already correct, and deliberately NOT switched to
+            // `retryTransientOnly`: this is a 2s poll, so the next refetch IS
+            // the retry. Adding a retry budget on top would stack duplicate
+            // in-flight probes against a container that is mid-boot, and a
+            // deterministic failure here (ownership rejection) would still be
+            // re-asked every 2s regardless. `false` is the honest answer for
+            // both families — see `@/trpc/retry-policy` for the rule this
+            // satisfies.
             retry: false,
         },
     );
