@@ -52,6 +52,7 @@ const OPERATIONAL_ERROR_CODES = new Set([
     'fetch_failed',
     'sandbox_runtime_blocked',
     'sandbox_start_failed',
+    'timeout',
 ]);
 
 /** Ownership check shared by every procedure below — never trust a bare computerId. */

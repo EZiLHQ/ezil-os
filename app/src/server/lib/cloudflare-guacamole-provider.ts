@@ -166,6 +166,7 @@ export type GuacamolePreviewErrorCode =
     | 'sandbox_runtime_blocked'
     | 'sandbox_start_failed'
     | 'worker_http_error'
+    | 'timeout'
     | 'unknown';
 
 export interface GuacamolePreviewError {
@@ -238,7 +239,16 @@ export async function requestGuacamolePreview(
         const combined = `${msg} ${causeMsg}`;
 
         let errorCode: GuacamolePreviewErrorCode = 'unknown';
-        if (
+        if (err instanceof Error && err.name === 'TimeoutError') {
+            // Real, not fabricated: this fires only when our own
+            // `AbortSignal.timeout(SANDBOX_COLD_START_TIMEOUT_MS)` above
+            // actually elapses (verified against Node's undici fetch —
+            // AbortSignal.timeout rejects with a DOMException named exactly
+            // 'TimeoutError'). Distinct from a network-level ETIMEDOUT below,
+            // which is the remote end being slow to connect, not our own
+            // budget running out.
+            errorCode = 'timeout';
+        } else if (
             /ECONNREFUSED/i.test(combined) ||
             causeCode === 'ECONNREFUSED' ||
             /connection refused/i.test(combined)
