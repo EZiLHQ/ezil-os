@@ -158,6 +158,59 @@ upstream fixes it.
 - **Serverless multiplies DB pools.** Each warm instance *and each route bundle* carries
   its own. Cap the pool, set a non-zero `idle_timeout`, and prefer a transaction pooler.
 
+## 14. React hydration DELETES DOM that a non-React script created first
+
+Mount a non-React UI (our jQuery shell) into a React document and the ordering is a
+race you will eventually lose. If anything mutates a node React rendered — a class on
+`<body>`, a child of the mount point — **before** React hydrates, React reports a
+mismatch (minified error **#418**) and **regenerates the whole tree from its own copy**,
+deleting everything the other script built.
+
+**`suppressHydrationWarning` suppresses the warning, not the regeneration.** And the
+wreckage is worse than a repaint: React re-creates `<script src>` tags, and a
+re-inserted script **never executes again**, so nothing can re-boot the page. Any
+`mounted` latch then keeps it dead. The user gets a permanently blank white page.
+
+It hides on a warm localhost, where React wins every time. Delay **only**
+`/_next/static/chunks/**` — what a real network, or a repeat visit with the app's own
+assets cached, produces — and it appears: 150ms 3/3 fine, 300ms 1/3 destroyed, 900ms
+**4/5 destroyed**, on the production build. `next dev` lost ~75% of loads.
+
+Three rules, in order of how much they buy:
+1. **Do not touch React-owned DOM before hydration.** Have the page tell the script
+   when it has hydrated (a `useEffect` + an event), and cap the wait so a page whose
+   React never loads still works.
+2. **`dangerouslySetInnerHTML` is the "not your business" marker.** An element with it
+   gets no child fibers, so React neither hydrates nor reconciles its contents. It is
+   the only supported way to hand a subtree to a foreign renderer.
+3. **Make the mount rebuildable.** Watch for your root leaving the document and build
+   it again, bounded. The failure mode must degrade to "boots twice", never "blank
+   forever" — a guarantee that survives the next unforeseen mutation.
+
+## 15. The Supabase SSR middleware duplicates an auth round trip you already pay
+
+The stock recipe calls `supabase.auth.getUser()` in middleware. Every protected surface
+then calls it again, and middleware **completes before** a Server Component renders, so
+the two are strictly serial and never overlap. **MEASURED: `GET /auth/v1/user` is 154ms**
+from the app host — ~318ms of duplicate network in the TTFB of every authenticated page.
+
+Middleware performs no authorization here; its only job is refreshing a cookie a Server
+Component cannot write. `getSession()` does that job and goes to the network **only when
+the token has actually expired**. The warning about `getSession()` on the server is about
+*trusting* what it returns — discard it and there is nothing to trust.
+
+Two things this exposes that are easy to miss:
+- **The standard matcher covers your static assets.** It excludes `_next/static` and
+  image extensions — so `/os/bundle.min.js` and `/os/bundle.min.css` were each paying
+  the round trip too.
+- **Measure the floor before promising one.** After the fix, `/os` TTFB is 414ms, of
+  which 154ms is one auth round trip and 240ms is one computer lookup (a bare
+  `select 1` on the same pool is 120ms from this host). A <200ms target is a
+  *geography* problem — app and database in one region — not an await-ordering problem.
+  This project already issues **ES256** tokens, so `supabase.auth.getClaims()` would
+  verify the JWT in-process and remove the remaining 154ms, at the cost of not seeing a
+  revocation until the token expires.
+
 ---
 
 ## Method notes
