@@ -1,6 +1,7 @@
 import Link from 'next/link';
 
 import { CloudflareGuacamoleCanvas } from '@/components/desktop/cloudflare-guacamole-canvas';
+import { DesktopStatusBadge, DesktopStatusProvider } from '@/components/desktop/desktop-status';
 import { api } from '@/trpc/server';
 import { Routes } from '@/utils/constants';
 import { resolveComputerPageState } from './access';
@@ -44,25 +45,31 @@ export default async function Page({ params }: { params: Promise<{ id: string }>
     void api.computer.touch({ id: computer.id }).catch(() => {});
 
     return (
-        <div className="flex h-screen w-screen flex-col overflow-hidden bg-neutral-950">
-            <header className="flex h-11 shrink-0 items-center justify-between border-b border-white/10 bg-black px-3">
-                <Link
-                    href={Routes.COMPUTERS}
-                    className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-offwhite"
-                >
-                    <BackIcon className="h-3.5 w-3.5" />
-                    Your computers
-                </Link>
-                <span className="text-xs font-medium text-offwhite">{computer.name}</span>
-                <span className="flex items-center gap-1.5 rounded-full border border-teal/30 bg-teal/10 px-2 py-0.5 text-[10px] font-medium text-teal">
-                    <span className="h-1.5 w-1.5 rounded-full bg-teal" />
-                    Live
-                </span>
-            </header>
-            <div className="min-h-0 flex-1">
-                <CloudflareGuacamoleCanvas computerId={computer.id} sessionId={computer.id} />
+        // 🔴 The status pill used to be a static `Live` literal right here: not
+        // derived from anything, green before the preview request had even been
+        // issued, and still green over an HTTP 500 from the desktop host on
+        // 2026-07-31. It now renders only what the canvas actually observed —
+        // the provider is the seam between this server component's chrome and
+        // the client component that holds the observation. See
+        // `components/desktop/desktop-status.tsx`.
+        <DesktopStatusProvider>
+            <div className="flex h-screen w-screen flex-col overflow-hidden bg-neutral-950">
+                <header className="flex h-11 shrink-0 items-center justify-between border-b border-white/10 bg-black px-3">
+                    <Link
+                        href={Routes.COMPUTERS}
+                        className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-offwhite"
+                    >
+                        <BackIcon className="h-3.5 w-3.5" />
+                        Your computers
+                    </Link>
+                    <span className="text-xs font-medium text-offwhite">{computer.name}</span>
+                    <DesktopStatusBadge />
+                </header>
+                <div className="min-h-0 flex-1">
+                    <CloudflareGuacamoleCanvas computerId={computer.id} sessionId={computer.id} />
+                </div>
             </div>
-        </div>
+        </DesktopStatusProvider>
     );
 }
 

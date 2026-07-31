@@ -15,6 +15,22 @@
  *      already being woken by that request) and gives one real mid-boot
  *      fact: whether the desktop process has come up.
  *
+ * ── The third signal, added after the contract was found to stop early ─────
+ * The two signals above both describe the CONTAINER. Neither can see whether
+ * the preview URL actually routes: `guacamoleRunning` is derived from
+ * `sandbox.getExposedPorts()`, which reads Durable Object storage and never
+ * goes through the edge. Observed live on 2026-07-31 — `guacamoleRunning: true`
+ * while every request to the preview host returned HTTP 500 "Proxy routing
+ * error", and both surfaces reported success over it. The iframe cannot close
+ * the gap either: its `load` event fires for a 500 error page exactly as it
+ * does for a working desktop.
+ *
+ *   3. A server-side HTTP probe of the DESKTOP ORIGIN itself
+ *      (`probeDesktopFrame`, reached here as `frameConfirmed`). This is the
+ *      only signal in the system that can distinguish a desktop from an error
+ *      page, and `computeBootUiState` now requires it before it will say
+ *      `ready`.
+ *
  * Everything shown before those signals land is a TIME-BASED ESTIMATE,
  * anchored to the measured reference boot in PLATFORM-NOTES §11
  * (container_start ~0.3s, workspace_mount ~5.9s, desktop_ready_wait ~15.3s,
@@ -114,8 +130,18 @@ export interface BootNotConfiguredState {
  * runtime itself failed to start, via `sandbox_runtime_blocked` /
  * `sandbox_start_failed`). `timeout` is real: it fires only when this app's
  * own client-side `AbortSignal.timeout` actually elapses.
+ *
+ * `desktop_unreachable` is the one added after the boot contract was found to
+ * stop at the handoff: the preview request succeeded, and then the desktop
+ * origin itself either answered with an error status or did not answer. See
+ * `computeBootUiState`'s `success` branch.
  */
-export type BootFailureReason = 'worker_unreachable' | 'sandbox_crashed' | 'timeout' | 'unknown';
+export type BootFailureReason =
+    | 'worker_unreachable'
+    | 'sandbox_crashed'
+    | 'desktop_unreachable'
+    | 'timeout'
+    | 'unknown';
 
 export interface BootFailureState {
     kind: 'failed';
@@ -141,6 +167,7 @@ export type BootErrorCode =
     | 'sandbox_runtime_blocked'
     | 'sandbox_start_failed'
     | 'worker_http_error'
+    | 'desktop_unreachable'
     | 'timeout'
     | 'unknown';
 
@@ -158,6 +185,13 @@ export interface ComputeBootUiStateInput {
     confirmedGuacamoleRunning?: boolean;
     /** Present only when `requestStatus === 'error'`. */
     errorCode?: BootErrorCode;
+    /**
+     * Whether the DESKTOP ORIGIN itself has been observed answering — not the
+     * Worker, and not the iframe's `load` event. Read only when
+     * `requestStatus === 'success'`. `undefined` means no observation exists
+     * yet and is NOT a pass; see the `success` branch.
+     */
+    frameConfirmed?: boolean;
 }
 
 /** Map a genuine error code to the plain-language failure taxonomy this UI renders. */
@@ -169,6 +203,8 @@ function classifyFailure(errorCode: BootErrorCode | undefined): BootFailureReaso
         case 'sandbox_runtime_blocked':
         case 'sandbox_start_failed':
             return 'sandbox_crashed';
+        case 'desktop_unreachable':
+            return 'desktop_unreachable';
         case 'timeout':
             return 'timeout';
         // The deterministic family — a malformed request, a rejected HMAC
@@ -202,7 +238,29 @@ export function computeBootUiState(input: ComputeBootUiStateInput): BootUiState 
         return { kind: 'not_configured' };
     }
     if (input.requestStatus === 'success') {
-        return { kind: 'ready' };
+        // 🔴 `success` means the PREVIEW REQUEST resolved ok — the Worker
+        // registered a port and handed back a URL. It has never meant that a
+        // browser pointed at that URL gets a desktop, and on 2026-07-31 the
+        // two were observed apart: `guacamoleRunning: true` while the preview
+        // host returned HTTP 500 "Proxy routing error". Both this app's
+        // surfaces then reported success over it, because this branch was the
+        // end of the contract.
+        //
+        // So `ready` now requires a SECOND, independent, positive observation
+        // of the desktop origin itself (`probeDesktopFrame` in
+        // `server/lib/cloudflare-guacamole-provider.ts`, reached from the
+        // shell as `frameConfirmed`). Strict `=== true`, for the same reason
+        // `confirmed` below is: nothing truthy off the wire may stand in for
+        // a real observation.
+        //
+        // Fail CLOSED, and fail TERMINALLY. `undefined` — a caller that never
+        // threaded the flag, or a confirmation that never landed — is not a
+        // pass, and it does not become an endless spinner either: it becomes a
+        // visible, retryable failure, because "we cannot confirm your desktop"
+        // is a true statement and a permanent progress bar is not.
+        return input.frameConfirmed === true
+            ? { kind: 'ready' }
+            : { kind: 'failed', reason: 'desktop_unreachable' };
     }
     if (input.requestStatus === 'error') {
         return { kind: 'failed', reason: classifyFailure(input.errorCode) };
@@ -276,6 +334,15 @@ export const BOOT_FAILURE_COPY: Record<BootFailureReason, BootFailureCopy> = {
     sandbox_crashed: {
         title: "Your computer didn't start",
         body: 'Something went wrong while starting the machine itself. Retrying usually fixes this.',
+    },
+    // Covers both halves of the same honest statement — the display answered
+    // with an error, or it did not answer at all. The copy deliberately does
+    // not guess which, and does not blame the machine: the container may well
+    // be up (it usually is), and it is the route to its display that is not
+    // working.
+    desktop_unreachable: {
+        title: "Your desktop isn't answering",
+        body: "Your computer started, but we couldn't reach its display. This is usually temporary — try again.",
     },
     timeout: {
         title: 'This is taking too long',

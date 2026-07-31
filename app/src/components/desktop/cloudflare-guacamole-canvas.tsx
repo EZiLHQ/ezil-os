@@ -17,6 +17,7 @@ import {
     type BootProgressState,
     type PhaseVisualState,
 } from './boot-phases';
+import { desktopSurfaceStatus, useReportDesktopStatus } from './desktop-status';
 
 /**
  * CloudflareGuacamoleCanvas
@@ -201,6 +202,48 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
         previewQuery.data,
     ]);
 
+    // ── Is the thing the iframe is pointed at actually a desktop? ───────────
+    // 🔴 `requestStatus === 'success'` only ever meant "the Worker gave us a
+    // URL". On 2026-07-31 that URL served HTTP 500 "Proxy routing error" and
+    // this canvas rendered the error page with a green "Live" pill over it,
+    // because nothing downstream of the preview request asked the desktop
+    // origin anything. `previewUrl` now probes that origin server-side before
+    // it returns (`frame.confirmed`), and this query re-asks afterwards — the
+    // 500 was observed appearing MID-SESSION, so a check that only runs before
+    // the handoff would still go stale.
+    //
+    // Deliberately NOT on a background interval: one confirmation at handoff
+    // plus one whenever the user comes back to the tab is what this contract
+    // needs, and a per-minute poll to an edge host from every open tab is a
+    // cost with no honesty gained. The pill reports what was last observed,
+    // and coming back to look at it re-observes.
+    const previewOk = previewQuery.data?.ok === true ? previewQuery.data : undefined;
+    const guacamoleUrl = previewOk?.guacamoleUrl;
+
+    const frameQuery = api.cloudflareGuacamole.confirmFrame.useQuery(
+        { computerId, frameUrl: guacamoleUrl ?? '' },
+        {
+            enabled: requestStatus === 'success' && typeof guacamoleUrl === 'string' && guacamoleUrl !== '',
+            refetchOnWindowFocus: true,
+            staleTime: 0,
+            // Same reasoning as the status poll below: this answer is a point
+            // observation, and a retry budget would only stack duplicate GETs
+            // against a host we already failed to reach. A negative answer is
+            // meant to be believed, not re-asked until it agrees.
+            retry: false,
+        },
+    );
+
+    /**
+     * The frame observation `computeBootUiState` gates `ready` on.
+     *
+     * Prefer the LATER of the two (this query), fall back to the one
+     * `previewUrl` made server-side before handing the URL over. Never
+     * defaulted to `true`: if neither exists, the boot state stays unconfirmed
+     * and the UI says so.
+     */
+    const frameConfirmed = frameQuery.data?.confirmed ?? previewOk?.frame?.confirmed;
+
     // The cheap, non-waking status probe — polled ONLY while a boot attempt
     // is genuinely in flight. This is the one real mid-boot signal available;
     // see boot-phases.ts's module doc.
@@ -241,9 +284,21 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
     }, [requestStatus]);
 
     const bootUiState = useMemo(
-        () => computeBootUiState({ requestStatus, elapsedMs, confirmedGuacamoleRunning, errorCode }),
-        [requestStatus, elapsedMs, confirmedGuacamoleRunning, errorCode],
+        () =>
+            computeBootUiState({
+                requestStatus,
+                elapsedMs,
+                confirmedGuacamoleRunning,
+                errorCode,
+                frameConfirmed,
+            }),
+        [requestStatus, elapsedMs, confirmedGuacamoleRunning, errorCode, frameConfirmed],
     );
+
+    // Publish what we observed, so the page's status pill can stop being a
+    // decoration. `live` is reachable only from `kind: 'ready'`, which is
+    // reachable only from a confirmed frame — see `desktopSurfaceStatus`.
+    useReportDesktopStatus(desktopSurfaceStatus(bootUiState.kind));
 
     const handleReload = useCallback(() => {
         attemptStartedAtRef.current = null;
@@ -254,7 +309,11 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
         setControlHintDismissed(false);
         setReloadKey((k) => k + 1);
         void previewQuery.refetch();
-    }, [previewQuery]);
+        // The frame observation belongs to the OLD attempt. Re-ask, or a retry
+        // after a transient outage would keep rendering the stale "not
+        // answering" verdict over a desktop that had come back.
+        void frameQuery.refetch();
+    }, [previewQuery, frameQuery]);
 
     if (bootUiState.kind === 'not_configured') {
         return (
@@ -287,7 +346,11 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
         return <BootProgressPanel progress={bootUiState} />;
     }
 
-    const { guacamoleUrl, workspace, controlMode } = previewQuery.data as {
+    // `kind: 'ready'` is only produced with a confirmed frame, so reaching here
+    // means the preview request succeeded AND the desktop origin was observed
+    // answering. The cast mirrors that narrowing for the fields the union's
+    // failure arms do not carry.
+    const { workspace, controlMode } = previewQuery.data as {
         ok: true;
         guacamoleUrl: string;
         workspace?: WorkspaceStatus;

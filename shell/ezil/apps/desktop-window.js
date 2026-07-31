@@ -34,7 +34,8 @@
 //
 // So the window opens WINDOWED now — over the wallpaper and a real taskbar —
 // and takes the viewport only once there is a desktop in it to take it with
-// (`go_fullbleed`, called from `reveal`). Three things follow:
+// (`go_fullbleed`, called from `settle_frame` once the server has CONFIRMED
+// the frame is a desktop — see that function). Three things follow:
 //   - a boot that FAILS or is unconfigured never hides the taskbar: the
 //     failure panel and its Retry sit in an ordinary window, on an OS the
 //     user can still use;
@@ -43,6 +44,20 @@
 //     hidden (CSS, keyed off `.ezil-fullbleed`) until it is the only chrome;
 //   - if the drawer could not attach we simply never go full-bleed, rather
 //     than going full-bleed and backing out of it.
+//
+// ── 🔴 `load` is NOT proof that a desktop arrived ───────────────────────────
+// An iframe fires `load` for an HTTP 500 error page exactly as it does for a
+// working desktop, and cross-origin script cannot read its status code or its
+// document. Observed 2026-07-31: the preview host returned 500 "Proxy routing
+// error", `load` fired, and this window reported `ready` and hid its boot panel
+// over it. The Worker could not have caught it either — its `guacamoleRunning`
+// comes out of Durable Object storage and never crosses the edge, so it said
+// `true` the whole time.
+//
+// The browser has no honest signal here. The SERVER does: it can make a plain
+// HTTP request to the desktop origin and read the status line. So `load` is now
+// the TRIGGER to ask (`session.confirmFrame`), never the answer. See
+// `settle_frame`.
 //
 // ── 🔴 The taskbar is hidden; the drawer is the only way out ────────────────
 // Once full-bleed, `enter_fullpage_mode` has hidden the taskbar AND the window
@@ -64,6 +79,25 @@ const PHASE = 'ezil-os:desktop';
 const TICK_MS = 250;
 /** How often the cheap status probe runs. It does NOT wake a container. */
 const POLL_MS = 2_000;
+
+/**
+ * The post-handoff frame confirmation (`settle_frame`). These three govern
+ * asking the question, never answering it — no elapsed time here can produce a
+ * "ready", only another attempt to obtain a real answer.
+ *
+ * FALLBACK: when to ask if the iframe never fires `load` at all. Same 4s the
+ * old blind reveal used, so a frame that silently never loads is settled on the
+ * same schedule it used to be revealed on — the difference is that it is now
+ * settled by an ANSWER rather than by the timer itself.
+ *
+ * ATTEMPTS/RETRY: how many times to re-ask when OUR OWN request fails to land
+ * (offline, a 502 from our host). That is not an observation of the desktop, so
+ * it must not be recorded as one in either direction; three tries 1.5s apart is
+ * enough to ride out a blip without leaving the user staring at a panel.
+ */
+const FRAME_CONFIRM_FALLBACK_MS = 4_000;
+const FRAME_CONFIRM_ATTEMPTS = 3;
+const FRAME_CONFIRM_RETRY_MS = 1_500;
 
 const MINIMISE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"'
     + ' stroke-linecap="round" aria-hidden="true"><line x1="5" y1="17" x2="19" y2="17"/></svg>';
@@ -284,29 +318,101 @@ export async function openDesktopWindow (ctx = {}) {
         }
 
         console.info(`[${PHASE}] desktop ready in ${Math.round(performance.now() - t0)}ms`
-            + ` (${Math.round(performance.now() - t_open)}ms since the window opened)`);
-        progress.render(computeBootUiState({ requestStatus: 'success', elapsedMs: 0 }));
+            + ` (${Math.round(performance.now() - t_open)}ms since the window opened;`
+            + ` frame confirmed server-side: ${res.frameConfirmed === true})`);
+        progress.render(computeBootUiState({
+            requestStatus: 'success',
+            elapsedMs: 0,
+            // 🔴 Not a constant, and not defaulted to true. `openDesktop`
+            // reports this only when the SERVER observed the desktop origin
+            // answering, before it handed the URL over. If it is false,
+            // `computeBootUiState` renders the failure panel instead of
+            // `ready` — see its `success` branch.
+            frameConfirmed: res.frameConfirmed,
+        }));
 
         // 🔴 The single navigation. Everything above had to have finished.
         el_iframe.src = res.url;
-        // Hide the panel only once the frame has something to show, so the
-        // swap is desktop-for-progress rather than progress-for-white. If the
-        // load event never fires we still get out of the way — a stuck panel
-        // over a working desktop would be a worse failure than a blank frame.
-        //
-        // 🔴 This is also where the desktop earns the viewport. One function,
-        // so "the panel is gone" and "the taskbar is gone" can never come
-        // apart: there is no state in which the OS chrome has been taken away
-        // and the thing it was taken away for is not on screen.
-        let revealed = false;
-        const reveal = (why) => {
-            if ( disposed || revealed ) return;
-            revealed = true;
-            progress.el.hidden = true;
-            go_fullbleed(why);
+        settle_frame(my_attempt, res.url);
+    }
+
+    // ── the handoff ────────────────────────────────────────────────────────
+    /**
+     * 🔴 THE PANEL COMES DOWN — AND THE VIEWPORT IS TAKEN — ON AN OBSERVATION,
+     * NEVER ON AN EVENT OR A TIMER.
+     *
+     * This replaced the one hole in the whole honesty contract:
+     *
+     *     el_iframe.addEventListener('load', () => reveal(...), { once: true });
+     *     setTimeout(() => reveal(...), 4_000);
+     *
+     * An iframe fires `load` for an HTTP 500 error page exactly as it does for
+     * a working desktop, and cross-origin script cannot read the status code or
+     * the document — so `load` only ever proved that the browser finished
+     * fetching *something*. The 4s timer proved nothing at all. On 2026-07-31
+     * the preview host returned 500 "Proxy routing error" and this window hid
+     * its boot panel over the error page and reported ready; with `reveal` now
+     * also calling `go_fullbleed`, it would hand the whole viewport to it too.
+     *
+     * `load` is KEPT — it is the earliest moment worth asking the question. It
+     * is no longer the answer. The answer comes from the server, which can make
+     * a plain HTTP request to the desktop origin and read its status line
+     * (`session.confirmFrame`). Same demotion for the timer: a frame that never
+     * fires `load` still gets asked about on a schedule; it never gets believed
+     * on one.
+     *
+     * Three outcomes, all of them honest:
+     *   confirmed — panel down, viewport handed over, exactly as before.
+     *   refuted   — panel STAYS, failure copy + Retry, window stays windowed on
+     *               a usable OS. The user is told their display is not
+     *               answering rather than handed an error page full-screen.
+     *   no answer — retried a bounded number of times, then treated as refuted.
+     *               "We could not confirm your desktop" is a true statement;
+     *               an indefinite spinner is not more honest, and Retry re-runs
+     *               the whole boot.
+     */
+    function settle_frame (my_attempt, url) {
+        let settled = false;
+        let asks = 0;
+
+        const ask = async () => {
+            if ( settled || disposed || my_attempt !== attempt ) return;
+            asks++;
+            const seen = await session.confirmFrame(computer.id, url);
+            if ( settled || disposed || my_attempt !== attempt ) return;
+
+            if ( seen === undefined ) {
+                // OUR request never landed. That is not an observation of the
+                // desktop, so it decides nothing — ask again, bounded.
+                if ( asks < FRAME_CONFIRM_ATTEMPTS ) {
+                    setTimeout(() => { void ask(); }, FRAME_CONFIRM_RETRY_MS);
+                    return;
+                }
+                console.warn(`[${PHASE}] gave up confirming the frame after ${asks} tries`);
+            }
+
+            settled = true;
+
+            if ( seen === true ) {
+                // 🔴 The one path to the viewport. "The panel is gone" and "the
+                // taskbar is gone" stay one decision, and that decision now
+                // rests on a real HTTP answer from the desktop's own origin.
+                progress.el.hidden = true;
+                go_fullbleed('frame confirmed by the server');
+                return;
+            }
+
+            console.error(`[${PHASE}] the frame is not a desktop (confirmFrame -> ${String(seen)})`);
+            show_panel();
+            progress.render(computeBootUiState({
+                requestStatus: 'success',
+                elapsedMs: 0,
+                frameConfirmed: false,
+            }));
         };
-        el_iframe.addEventListener('load', () => reveal('desktop frame loaded'), { once: true });
-        setTimeout(() => reveal('frame load never fired (4s)'), 4_000);
+
+        el_iframe.addEventListener('load', () => { void ask(); }, { once: true });
+        setTimeout(() => { void ask(); }, FRAME_CONFIRM_FALLBACK_MS);
     }
 
     // ── minimise ───────────────────────────────────────────────────────────
