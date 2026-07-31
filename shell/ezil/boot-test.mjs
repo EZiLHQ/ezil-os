@@ -61,11 +61,13 @@ async function until (fn, ms = 4000, step = 25) {
  * Boot a fresh shell in a fresh DOM.
  * @param {(url: string, init: object) => object} handler returns the JSON body
  *   for a given request, or throws to simulate a transport failure.
+ * @param {object} payload `window.__EZIL_BOOT__`.
+ * @param {string} body the host page's markup. Defaults to a BARE host (no
+ *   React); scenario 5 passes what `/os` actually renders.
  */
-function boot_shell (handler, payload = PAYLOAD) {
+function boot_shell (handler, payload = PAYLOAD, body = '<div id="ezil-os-root"></div>') {
     const dom = new JSDOM(
-        '<!doctype html><html><head></head><body class="min-h-full flex flex-col">'
-        + '<div id="ezil-os-root"></div></body></html>',
+        `<!doctype html><html><head></head><body class="min-h-full flex flex-col">${body}</body></html>`,
         { runScripts: 'outside-only', pretendToBeVisual: true, url: 'https://ezil.local/os' },
     );
     const { window } = dom;
@@ -302,6 +304,78 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
         && dom.window.ezil?.mounted === false
         && dom.window.document.querySelectorAll('.desktop, .window, .taskbar').length === 0,
         `booted=${dom.window.ezil?.booted} mounted=${dom.window.ezil?.mounted}`);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 5 — a REACT host (what `/os` really is)
+//
+// The defect this locks down: the shell used to write to <body> and
+// #ezil-os-root the moment it evaluated. On a React document that happens
+// before hydration, React finds a tree it did not render, and REGENERATES the
+// whole page — deleting the desktop. Measured on the production build with
+// 900ms of latency on React's chunks: 4 of 5 loads ended blank, permanently,
+// because `mounted` stayed true and nothing could re-boot.
+//
+// Two properties are asserted here, and both have to hold:
+//   1. with `data-awaits-hydration="react"` on the mount point, the shell
+//      touches NOTHING until the page says it has hydrated;
+//   2. if the desktop is destroyed anyway, the shell REBUILDS it.
+// ───────────────────────────────────────────────────────────────────────────
+{
+    const OS_BODY = '<div id="ezil-os-root" data-awaits-hydration="react">'
+        + '<div class="desktop ezil-desktop"></div></div>';
+    const { window } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            return { ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko' };
+        }
+        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
+        return { ok: true };
+    }, PAYLOAD, OS_BODY);
+
+    await sleep(250);
+    push('🔴 React host: the shell mutates NOTHING before hydration',
+        window.ezil.booted === true && window.ezil.mounted === false
+        && $$(window, '.taskbar, .window').length === 0
+        && !window.document.body.classList.contains('device-desktop'),
+        `mounted=${window.ezil.mounted} body="${window.document.body.className}"`
+        + ` nodes=${$$(window, '.taskbar, .window').length}`);
+    push('the server-rendered wallpaper is already there, untouched',
+        $$(window, '#ezil-os-root > .desktop.ezil-desktop').length === 1);
+
+    window.dispatchEvent(new window.Event('ezil:hydrated'));
+    const tb = await until(() => $1(window, '.taskbar'));
+    push('...and mounts as soon as the page says it has hydrated',
+        !!tb && window.document.body.classList.contains('device-desktop'),
+        window.document.body.className);
+    push('it adopted the server-rendered desktop instead of adding a second',
+        $$(window, '.desktop').length === 1, `${$$(window, '.desktop').length} .desktop nodes`);
+    const win = await until(() => $1(window, '.window[data-app="desktop"]'));
+    push('the desktop window opened on the React host', !!win);
+
+    // Now do exactly what React does when it regenerates the tree: replace the
+    // mount point with a fresh copy of the server markup, drop the windows,
+    // and put <body>'s class list back to what the server sent.
+    const fresh = window.document.createElement('div');
+    fresh.id = 'ezil-os-root';
+    fresh.setAttribute('data-awaits-hydration', 'react');
+    fresh.innerHTML = '<div class="desktop ezil-desktop"></div>';
+    $1(window, '#ezil-os-root').replaceWith(fresh);
+    for (const el of $$(window, '.window')) el.remove();
+    window.document.body.className = 'min-h-full flex flex-col';
+    push('the simulated regeneration really did destroy the desktop',
+        $$(window, '.taskbar, .window').length === 0);
+
+    const rebuilt = await until(() => $1(window, '.taskbar'));
+    push('🔴 a destroyed desktop rebuilds itself — `mounted` is not a latch',
+        !!rebuilt, `attempts=${window.ezil.mountAttempts}`);
+    push('the rebuild is not a duplicate',
+        $$(window, '.taskbar').length === 1 && $$(window, '.desktop').length === 1,
+        `${$$(window, '.taskbar').length} taskbars, ${$$(window, '.desktop').length} desktops`);
+    push('the device class is back on <body>',
+        window.document.body.classList.contains('device-desktop'), window.document.body.className);
+    const rewin = await until(() => $1(window, '.window[data-app="desktop"]'));
+    push('the desktop window is back too', !!rewin);
+    push('and exactly one of them is open', $$(window, '.window[data-app="desktop"]').length === 1);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
