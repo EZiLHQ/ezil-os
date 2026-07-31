@@ -810,14 +810,32 @@ describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => 
     .filter((line) => /^\s*pattern\s*=/.test(line))
     .map((line) => line.match(/"([^"]+)"/)?.[1] ?? '');
 
-  // 2026-07-31: the feature can be in a deliberate, fully-off state — no zone
-  // has been verified safe to route sandbox previews on (see the matching
-  // comment in wrangler.toml: ezil.work was a mistake and got unbound,
-  // ezil.org is the production Worker's zone, zlsocial.ai turned out to be
-  // live too). That is intentional and must stay easy to represent, but the
-  // marker below is the ONLY thing that may waive "at least one route" — an
-  // accidental drop of every route with no marker still fails loudly.
+  // The feature CAN be put into a deliberate, fully-off state (no zone
+  // verified safe to route sandbox previews on) by adding a
+  // `PREVIEW_ROUTES_DISABLED` marker string to wrangler.toml and dropping
+  // every `[[routes]]` entry — see git history (2026-07-31, pre-ezil.org
+  // rollout) for what that looked like when `ezil.work` had to be unwound and
+  // no replacement zone was yet approved. As of the 2026-07-31 ezil.org
+  // rollout, three narrow, owner-approved, token-scoped routes are live (see
+  // wrangler.toml's rationale comment), so this marker is absent and
+  // `routesDisabled` below is `false` — the assertions past this point
+  // require full route + token coverage, not the disabled short-circuit.
   const routesDisabled = /PREVIEW_ROUTES_DISABLED/.test(wranglerSrc);
+
+  it('is NOT in the disabled state (real ezil.org routes are live)', () => {
+    expect(routesDisabled).toBe(false);
+    expect(zoneRoot).toBe('ezil.org');
+  });
+
+  it('declares exactly the three owner-approved narrow suffix routes on ezil.org', () => {
+    expect(new Set(patterns)).toEqual(
+      new Set(['*-app.ezil.org/*', '*-desktop.ezil.org/*', '*-nekodesktop.ezil.org/*']),
+    );
+    // Never the bare zone wildcard — that would shadow `sandbox.ezil.org` /
+    // `neko.ezil.org` (and everything else on the zone), which is exactly the
+    // production-takeover this whole narrow-suffix design avoids.
+    expect(patterns).not.toContain('*.ezil.org/*');
+  });
 
   it('declares PREVIEW_ZONE_ROOT as a literal (not a template/env lookup)', () => {
     expect(zoneRoot).toBeTruthy();
@@ -871,5 +889,34 @@ describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => 
     const fn = indexSrc.match(/function normalizeSandboxHostname\([\s\S]*?\n}\n/)?.[0] ?? '';
     expect(fn).toContain('hostname.endsWith(`.${PREVIEW_ZONE_ROOT}`)');
     expect(fn).toContain('return port ? `${PREVIEW_ZONE_ROOT}:${port}` : PREVIEW_ZONE_ROOT;');
+  });
+});
+
+// ── /health distinguishing marker ─────────────────────────────────────────────
+// The legacy `cf-guacamole-sandbox` script and this Worker (`ezil-os-worker`)
+// are two SEPARATE deployed Cloudflare Worker scripts that can both end up
+// routed on the same zone. Both return `service: 'cf-guacamole-sandbox'` —
+// that field is an external contract, carried forward on purpose, so unknown
+// consumers matching on it never break. Left alone, that makes the two
+// Workers' `/health` responses byte-identical, which makes it impossible to
+// tell which one served any given request — the exact thing route-precedence
+// verification needs to observe. `build` is the fix: an additive field only
+// this Worker sets, never removed without a replacement, that a live curl can
+// grep for.
+describe('/health distinguishing marker (route-precedence observability)', () => {
+  const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+  const fnMatch = src.match(/if \(method === 'GET' && path === '\/health'\) \{[\s\S]*?\n {4}\}/);
+  const fnSrc = fnMatch?.[0] ?? '';
+
+  it('has a /health handler', () => {
+    expect(fnMatch).not.toBeNull();
+  });
+
+  it('keeps the external `service` contract string unchanged', () => {
+    expect(fnSrc).toContain("service: 'cf-guacamole-sandbox'");
+  });
+
+  it('adds a `build` marker that distinguishes this Worker from the legacy script', () => {
+    expect(fnSrc).toContain("build: 'ezil-os'");
   });
 });

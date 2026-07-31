@@ -140,25 +140,31 @@ Then point the app at the deployed Worker:
 CLOUDFLARE_GUACAMOLE_WORKER_URL=https://ezil-os-worker.ezil-builder.workers.dev
 ```
 
-**2026-07-31 correction — preview routing is currently disabled, no zone assigned:**
-this used to be `https://os.ezil.work`, but that zone was the company's main
-production website, routed there by mistake; the routes, custom domain, and
-extra DNS records have been removed (see `wrangler.toml`'s
-`PREVIEW_ROUTES_DISABLED` comment for the full record and why the obvious
-alternatives — `ezil.org` (the production `cf-guacamole-sandbox` Worker's
-zone) and `zlsocial.ai` (independently re-verified live: proxied apex site +
-a bare wildcard tunnel catch-all + several more live tunnels) — are not safe
-replacements either.
+**2026-07-31 — preview routing is live on `ezil.org` (narrow suffix routes):**
+this used to point briefly at `https://os.ezil.work`, the company's main
+production website, routed there by mistake; that routing was fully removed
+(routes, custom domain, DNS records). After that, preview routing sat
+disabled for a while because the obvious replacement, `ezil.org`, looked
+off-limits (`*.ezil.org/*` is bound to the live production Worker
+`cf-guacamole-sandbox`, serving `sandbox.ezil.org` / `neko.ezil.org`) and
+`zlsocial.ai` turned out to have its own live bare wildcard tunnel catch-all.
 
-Until a genuinely unused zone is assigned (`PREVIEW_ZONE_ROOT` in
-`src/index.ts` + a matching `[[routes]]` block in `wrangler.toml`), the
-`workers.dev` URL above is reachable for basic checks (`/health`, auth/
-validation error paths) but the actual desktop-preview flow will fail at the
-`exposePort()` step: `@cloudflare/sandbox` throws `CustomDomainRequiredError`
-for any host ending in `.workers.dev` — the Worker derives the preview
-hostname from the inbound request's own `Host`, so it needs a real zone with
-one-label wildcard subdomains, not a `*.workers.dev` host, before end-to-end
-preview will work again.
+The owner then approved adding three **narrow, token-scoped suffix routes**
+on `ezil.org` alongside the existing bare `*.ezil.org/*` production route:
+`*-app.ezil.org/*`, `*-desktop.ezil.org/*`, `*-nekodesktop.ezil.org/*` — see
+`wrangler.toml`'s route-block comment for the most-specific-wins rationale
+and `src/index.ts`'s `PREVIEW_ZONE_ROOT` doc comment for the composition
+details. Each route was added ONE at a time with a live byte-level
+before/after diff of `sandbox.ezil.org`/`neko.ezil.org` (unchanged throughout)
+before adding the next. `PREVIEW_ZONE_ROOT` is `'ezil.org'` again.
+
+The `workers.dev` URL above remains the app's primary entrypoint for
+`/health`, `POST /sandbox/preview`, etc. (`workers_dev = true` is set
+explicitly in `wrangler.toml`, since it would otherwise default to disabled
+once `[[routes]]` entries exist) — only the dynamically-minted per-sandbox
+preview hostnames (`<port>-<sandboxId>-<token>.ezil.org`) go over the new
+zone routes, because `@cloudflare/sandbox` throws `CustomDomainRequiredError`
+for any preview host ending in `.workers.dev`.
 
 Notes:
 - `wrangler.toml` uses `instance_type = "standard"` (Chrome + Tomcat + a JVM need
