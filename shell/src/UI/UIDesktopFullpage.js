@@ -16,9 +16,9 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-// MODIFIED BY EZIL 2026-07-31: extracted three functions from upstream
+// MODIFIED BY EZIL 2026-07-31: extracted four functions from upstream
 // `src/gui/src/UI/UIDesktop.js` (2,479 lines, at upstream commit 5a15719,
-// approximately lines 2405-2450) and nothing else.
+// approximately lines 2388-2450) and nothing else.
 //
 // UIDesktop.js is Puter's *filesystem* desktop: it builds an item container
 // over `puter.fs`, wires socket.io for realtime `item.added`/`trash.is_empty`
@@ -43,6 +43,36 @@
 // box, `window.window_border_radius` -- is upstream's, unchanged.
 
 import UITaskbar from './UITaskbar.js';
+
+// 🔴 The extraction originally started at upstream L2405 and MISSED this
+// function by seventeen lines. It is not optional and it is not dead code:
+//
+//   `UIWindow.js:3633`      ($.fn.close) calls it on every window close
+//   `UITaskbarItem.js:247`  calls it from "Remove from Taskbar"
+//
+// Its absence was invisible while the shell opened no app windows —
+// `parseInt(undefined)` is NaN and `NaN === 1` is false, so close() never
+// reached the call. The moment an app window exists (which auto-creates a
+// taskbar item, UIWindow.js:596), closing it throws a ReferenceError INSIDE
+// `$.fn.close` BEFORE `delete_window_element` runs: the taskbar item stays,
+// the window stays on screen, and it is now unclosable. Verbatim from
+// upstream L2388-2403.
+window.remove_taskbar_item = function (item) {
+    $(item).find('*').fadeOut(100, function () {
+
+    });
+
+    $(item).animate({ width: 0 }, 200, function () {
+        $(item).remove();
+
+        // Adjust taskbar item sizes after removing an item
+        if ( window.adjust_taskbar_item_sizes ) {
+            setTimeout(() => {
+                window.adjust_taskbar_item_sizes();
+            }, 10);
+        }
+    });
+};
 
 window.enter_fullpage_mode = (el_window) => {
     $('.taskbar').hide();
@@ -93,6 +123,7 @@ window.reset_window_size_and_position = (el_window) => {
 };
 
 export default {
+    remove_taskbar_item: window.remove_taskbar_item,
     enter_fullpage_mode: window.enter_fullpage_mode,
     exit_fullpage_mode: window.exit_fullpage_mode,
     reset_window_size_and_position: window.reset_window_size_and_position,

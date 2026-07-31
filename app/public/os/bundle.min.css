@@ -792,3 +792,39 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 @media (prefers-reduced-motion:reduce){
 .dashboard-app-drawer,.dashboard-app-drawer *{transition:none!important}
 }
+#ezil-os-root{position:fixed;inset:0}
+.desktop.ezil-desktop{position:fixed;inset:0;width:100%;height:100%!important;background-color:#161616;background-image:radial-gradient(120% 80% at 78% 8%,rgba(0,173,181,.2) 0,rgba(0,173,181,0) 62%),radial-gradient(90% 70% at 10% 96%,rgba(0,173,181,.1) 0,rgba(0,173,181,0) 60%),linear-gradient(168deg,#1b1e1e 0,#161616 46%,#101111 100%)}
+body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;background-color:#161616}
+.ezil-desktop-window .window-body{background-color:#101111;position:relative;overflow:hidden}
+.ezil-desktop-window .window-app-iframe{background-color:#101111}
+.ezil-boot{position:absolute;inset:0;z-index:2;display:flex;align-items:center;justify-content:center;padding:24px;background-color:#101111;color:#f5f5f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;-webkit-user-select:none;user-select:none;overflow:hidden}
+.ezil-boot[hidden]{display:none}
+.ezil-boot-panel{width:100%;max-width:340px;text-align:left}
+.ezil-boot-mark{width:28px;height:28px;margin-bottom:18px;border-radius:8px;background:linear-gradient(140deg,#00adb5 0,#007e84 100%);box-shadow:0 0 24px rgba(0,173,181,.35)}
+.ezil-boot-title{margin:0 0 6px;font-size:18px;font-weight:600;line-height:1.3;color:#f5f5f4}
+.ezil-boot-sub{margin:0 0 22px;font-size:13px;line-height:1.5;color:#9ca3a3}
+.ezil-boot-phases{list-style:none;margin:0;padding:0}
+.ezil-boot-phase{display:flex;align-items:center;gap:10px;padding:5px 0;font-size:13px;line-height:1.4;color:#6b7272;transition:color .25s}
+.ezil-boot-dot{position:relative;flex:0 0 auto;width:14px;height:14px;border-radius:50%;border:1.5px solid #3a3f3f;box-sizing:border-box;transition:border-color .25s,background-color .25s}
+.ezil-boot-check{position:absolute;inset:-1px;width:100%;height:100%;opacity:0;color:#101111;transition:opacity .2s}
+.ezil-boot-phase[data-state=passed]{color:#7f8686}
+.ezil-boot-phase[data-state=passed] .ezil-boot-dot{border-color:#4d5353;background-color:#2a2e2e}
+.ezil-boot-phase[data-state=current]{color:#f5f5f4}
+.ezil-boot-phase[data-state=current] .ezil-boot-dot{border-color:#00adb5;animation:1.4s ease-in-out infinite ezil-boot-pulse}
+.ezil-boot-phase[data-state=confirmed]{color:#f5f5f4}
+.ezil-boot-phase[data-state=confirmed] .ezil-boot-dot{border-color:#00adb5;background-color:#00adb5}
+.ezil-boot-phase[data-state=confirmed] .ezil-boot-check{opacity:1}
+@keyframes ezil-boot-pulse{
+0%,100%{box-shadow:0 0 0 0 rgba(0,173,181,.45)}
+50%{box-shadow:0 0 0 5px rgba(0,173,181,0)}
+}
+@media (prefers-reduced-motion:reduce){
+.ezil-boot-phase[data-state=current] .ezil-boot-dot{animation:none}
+}
+.ezil-boot-actions{margin-top:4px}
+.ezil-boot-actions[hidden]{display:none}
+.ezil-boot-retry{appearance:none;border:none;border-radius:6px;padding:9px 16px;font:inherit;font-size:13px;font-weight:500;color:#101111;background-color:#00adb5;cursor:pointer}
+.ezil-boot-retry:hover{opacity:.9}
+.ezil-boot-retry:focus-visible{outline:#f5f5f4 solid 2px;outline-offset:2px}
+.ezil-app-drawer{z-index:600}
+.ezil-app-drawer.collapsed .dashboard-app-drawer-toggle{cursor:pointer}
