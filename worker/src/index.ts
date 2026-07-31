@@ -1474,23 +1474,29 @@ function toGuacamoleUrl(exposedUrl: string, requestProtocol: string): string {
  * `wrangler.toml` and asserts both the zone and that every `portFor`/
  * `appPortFor` token has a matching route pattern.
  *
- * 2026-07-31 correction — PREVIEW_ROUTES_DISABLED: this used to be
- * `'ezil.work'`, the company's main production website, routed there by
- * mistake. The owner said not to touch it; those routes and their DNS
- * records have been removed from Cloudflare (see `wrangler.toml`'s matching
- * comment for the removal record and why the obvious alternatives —
- * `ezil.org` (owned by the production `cf-guacamole-sandbox` Worker) and
- * `zlsocial.ai` (independently re-verified live: proxied apex site + a bare
- * `*.zlsocial.ai` wildcard tunnel catch-all + several more live tunnels) —
- * are not safe replacements either. `unset.invalid` is an RFC 2606 reserved,
- * never-resolvable placeholder: it keeps this constant a truthy, non-
- * `.workers.dev` literal (so it still typechecks and satisfies the "declares
- * a literal" drift-guard test) without referencing any real zone. There are
- * currently zero `[[routes]]` in `wrangler.toml`, so this code path never
- * actually matches a live request either way. Restore a real zone here (and
- * in `wrangler.toml`) once one is verified genuinely unused.
+ * History: this was briefly `'ezil.work'` (the company's main production
+ * website), routed there by mistake and unwound (routes + DNS records
+ * removed from Cloudflare). It was then set to the RFC 2606 placeholder
+ * `'unset.invalid'` while zero zones were verified safe — `ezil.org` looked
+ * off-limits because `*.ezil.org/*` is bound to the live production Worker
+ * `cf-guacamole-sandbox` (serves `sandbox.ezil.org` / `neko.ezil.org`), and
+ * `zlsocial.ai` turned out to have its own live bare wildcard tunnel
+ * catch-all.
+ *
+ * 2026-07-31, later same day — restored to `'ezil.org'`. The owner approved
+ * adding narrow, token-scoped suffix routes on `ezil.org` alongside the
+ * existing `*.ezil.org/*` production route, on the basis that Cloudflare
+ * Workers routes match most-specific-first: `*-app.ezil.org/*`,
+ * `*-desktop.ezil.org/*`, and `*-nekodesktop.ezil.org/*` only win for hosts
+ * that literally end in one of those three suffixes, so `sandbox.ezil.org`
+ * and `neko.ezil.org` (which don't) keep resolving to `cf-guacamole-sandbox`
+ * exactly as before. Verified live, one route at a time, with a byte-level
+ * before/after diff of `sandbox.ezil.org`/`neko.ezil.org` after each addition
+ * (unchanged throughout) before the next route was added — see the
+ * `wrangler.toml` route block below for the three patterns and the rollout
+ * rationale.
  */
-const PREVIEW_ZONE_ROOT = 'unset.invalid';
+const PREVIEW_ZONE_ROOT = 'ezil.org';
 
 function normalizeSandboxHostname(host: string): string {
   const [hostname, port] = host.split(':');
@@ -2858,7 +2864,23 @@ export default {
     }
 
     if (method === 'GET' && path === '/health') {
-      return json({ ok: true, service: 'cf-guacamole-sandbox', mode: 'production', supportedDesktopModes: DESKTOP_MODES });
+      // `service` is an external contract carried forward unchanged from the
+      // legacy script name — unknown consumers may match on it, so it stays
+      // `cf-guacamole-sandbox` even though this Worker's own name is
+      // `ezil-os-worker`. That means the OLD (still-live, separately
+      // deployed) `cf-guacamole-sandbox` script and this NEW Worker return an
+      // otherwise byte-identical body, which made route-precedence
+      // verification during the 2026-07-31 ezil.org preview-route rollout
+      // impossible (can't tell which Worker answered a given request). `build`
+      // is the added, additive distinguishing marker: only THIS Worker sets
+      // it, so its presence/absence is what verification greps for.
+      return json({
+        ok: true,
+        service: 'cf-guacamole-sandbox',
+        mode: 'production',
+        supportedDesktopModes: DESKTOP_MODES,
+        build: 'ezil-os',
+      });
     }
 
     if (method === 'POST' && path === '/sandbox/preview') {

@@ -3,6 +3,17 @@ main = "src/index.ts"
 compatibility_date = "2026-06-24"
 compatibility_flags = ["nodejs_compat"]
 
+# `workers_dev` defaults to disabled the moment any `[[routes]]` is present
+# (see the routes block below) — but the app's own primary API surface
+# (`POST /sandbox/preview`, `GET /health`, `DELETE /sandbox/:id`, etc. — see
+# `CLOUDFLARE_GUACAMOLE_WORKER_URL` in `app/.env.local`) calls this Worker on
+# a STABLE hostname that is NOT one of the three narrow preview-suffix routes
+# below (those only match dynamically-minted `<port>-<sandboxId>-<token>`
+# preview hostnames). Keeping `workers_dev = true` explicit here preserves
+# that stable entrypoint alongside the zone routes; the two are independent
+# and both active at once is normal.
+workers_dev = true
+
 # ── Cloudflare Sandbox container ─────────────────────────────────────────────
 # Runs the EBuilder browser-desktop image (Xvfb + Chrome + x11vnc + guacd +
 # Tomcat/Apache Guacamole, plus the neko desktop-mode stage). instance_type
@@ -58,50 +69,60 @@ local_protocol = "http"
 [vars]
 SANDBOX_NEKO_ICE_POLICY = "relay"
 
-# ── Custom domain + preview routes: PREVIEW_ROUTES_DISABLED ──────────────────
+# ── Custom domain + preview routes: LIVE on ezil.org (narrow suffix routes) ──
 # (see `worker/src/index.ts`'s `PREVIEW_ZONE_ROOT` doc comment for the full
 # hostname-composition background — `<port>-<sandboxId>-<token>.<host>` — and
 # why the sandbox SDK requires a real zone rather than a `*.workers.dev` host.)
 #
-# 2026-07-31 correction: an earlier version of this file routed
-# `*-desktop`/`*-nekodesktop`/`*-app` on **ezil.work** — the company's main
-# production website — plus a `custom_domain` entry for `os.ezil.work`. The
-# owner has explicitly said: do not touch ezil.work. That routing has been
-# removed from this file AND unbound from the zone in Cloudflare (routes,
-# custom domain, and the `*.ezil.work` / `os.ezil.work` DNS records this
-# feature had added — see the removal commit for the exact API calls run).
-# ezil.work's pre-existing production DNS (apex, www, pehlachance.*, MX, etc.)
-# was left untouched throughout and is unaffected by this.
+# 2026-07-31 correction (superseded below): an earlier version of this file
+# routed `*-desktop`/`*-nekodesktop`/`*-app` on **ezil.work** — the company's
+# main production website — plus a `custom_domain` entry for `os.ezil.work`.
+# The owner said not to touch ezil.work; that routing was removed from this
+# file AND unbound from the zone in Cloudflare. ezil.work remains untouched
+# and off-limits.
 #
-# No replacement zone has been assigned. All three zones on this Cloudflare
-# account were checked and none is safe to route sandbox previews on:
-#   ezil.org    — `*.ezil.org/*` is owned by the live production Worker
-#                 `cf-guacamole-sandbox` (sandbox.ezil.org). OFF LIMITS
-#                 (explicit task boundary — never touch this Worker/route).
-#   ezil.work   — the mistake above. Owner: do not touch. OFF LIMITS.
-#   zlsocial.ai — considered as a replacement, then independently re-verified
-#                 live via the Cloudflare API on 2026-07-31: it has an
-#                 orange-clouded (proxied) apex website, a BARE wildcard
-#                 `*.zlsocial.ai` CNAME to a live Cloudflare Tunnel
-#                 (catch-all — matches any subdomain, including any preview
-#                 hostname shape this Worker would mint), and several more
-#                 live proxied tunnel CNAMEs (`sandboxes`, `sandboxes-worker`,
-#                 `*.sandboxes-worker`, `sparkiq`, `universe-dev`). Any Worker
-#                 route added here — even a narrow suffix pattern — could
-#                 shadow whatever that catch-all tunnel serves for unmatched
-#                 hostnames, which cannot be verified from outside the
-#                 tunnel's own ingress config. This fails the "not in use"
-#                 bar this zone would need to clear, so it was NOT used.
+# 2026-07-31, later same day — owner-approved narrow suffix routes on
+# **ezil.org**: `ezil.org` is production's zone — `*.ezil.org/*` is bound to
+# the live `cf-guacamole-sandbox` Worker (serves `sandbox.ezil.org` and
+# `neko.ezil.org`; NEVER touch that Worker or its route). The owner approved
+# adding narrow, token-scoped suffix routes alongside it — `*-app.ezil.org/*`,
+# `*-desktop.ezil.org/*`, `*-nekodesktop.ezil.org/*` — on the basis that
+# Cloudflare Workers routes match most-specific-first: a longer/more specific
+# pattern always wins over a shorter wildcard for the hosts it covers, so
+# these three suffix patterns win ONLY for hosts literally ending in
+# `-app`/`-desktop`/`-nekodesktop` before `.ezil.org`, and every other
+# `*.ezil.org` host (including `sandbox.ezil.org`/`neko.ezil.org`, which do
+# not end in any of those suffixes) keeps resolving to the existing
+# `*.ezil.org/*` route unchanged. No DNS change was needed: the zone's
+# existing orange-clouded `*.ezil.org` wildcard A record already proxies
+# every subdomain (that's how `sandbox`/`neko` reach the Worker today with no
+# dedicated DNS record of their own), so a preview hostname under any of
+# these three suffixes reaches Cloudflare's edge the same way and the route
+# table alone decides which Worker answers.
 #
-# Until a genuinely unused zone (or an explicit go-ahead on zlsocial.ai after
-# inspecting its tunnel ingress rules) is available, the desktop preview
-# feature has no custom domain to route on and is intentionally left
-# disabled here rather than risk a repeat of the ezil.work mistake. Deploying
-# with zero `[[routes]]` entries is safe: it uploads the Worker script but
-# binds it to no zone, so it cannot intercept traffic anywhere. See
-# `worker/src/index.test.ts`'s drift-guard tests for how this disabled state
-# is asserted (they require this exact `PREVIEW_ROUTES_DISABLED` marker to be
-# present, so silently losing routes by accident still fails the build).
+# Rolled out ONE route at a time with a live-request diff before/after each
+# addition (see the worker README / rollout notes for the verification
+# transcript). `zlsocial.ai` was independently found to be unsafe (a bare
+# `*.zlsocial.ai` wildcard tunnel catch-all already lives there) and remains
+# unused for this feature.
+#
+# `worker/src/index.test.ts`'s drift-guard tests assert `PREVIEW_ZONE_ROOT` in
+# `index.ts` and every token (`desktop`/`nekodesktop`/`app`) from
+# `desktop-mode.ts`'s `portFor`/`appPortFor` has a matching route pattern here
+# — so an accidentally-dropped route (or a newly added exposed-port token with
+# no matching route) fails the build loudly instead of silently 404ing in
+# production.
+[[routes]]
+pattern = "*-app.ezil.org/*"
+zone_name = "ezil.org"
+
+[[routes]]
+pattern = "*-desktop.ezil.org/*"
+zone_name = "ezil.org"
+
+[[routes]]
+pattern = "*-nekodesktop.ezil.org/*"
+zone_name = "ezil.org"
 
 # HMAC secret for authenticating EBuilder → Worker calls.
 # Set in production with:  wrangler secret put SANDBOX_HMAC_SECRET
