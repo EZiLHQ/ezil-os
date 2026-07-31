@@ -114,8 +114,22 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
             // Held open so the PENDING state is observable — the whole point
             // of the panel is what it shows during the ~22s wait.
             await preview_gate;
-            return { ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko' };
+            return {
+                ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko',
+                // The server says it reached the desktop origin before handing
+                // the URL over. Never defaulted: `session.openDesktop` reads
+                // `data.frame?.confirmed === true`, so a stub that omits this
+                // is a server that did not check, and the shell must not take
+                // the viewport for it.
+                frame: { confirmed: true },
+            };
         }
+        // 🔴 The post-handoff question, and it MUST be matched before the
+        // generic status poll below — they share a path and differ only by
+        // `confirm=frame`. Answering it with the poll's body means
+        // `confirmFrame` sees no `confirmed` field, reads it as "no answer",
+        // and the shell correctly refuses to hand over the viewport.
+        if (url.includes('confirm=frame')) return { ok: true, confirmed: true };
         if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: guac_running };
         return { ok: true };
     });
@@ -246,6 +260,9 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
     // here by hand. The 4s belt-and-braces timer in `desktop-window.js` would
     // otherwise be what this test measured.
     iframe.dispatchEvent(new window.Event('load'));
+    const asked = await until(() => seen.some(r => r.url.includes('confirm=frame')), 2000);
+    push('🔴 `load` only triggers the QUESTION — the server is asked first', !!asked,
+        JSON.stringify(seen.filter(r => r.url.includes('confirm=')).map(r => `${r.method} ${r.url}`)));
     const fullbled = await until(() => win.classList.contains('ezil-fullbleed'), 2000);
     push('🔴 full-bleed happens when the DESKTOP FRAME lands, not before', !!fullbled,
         win.className);
@@ -380,8 +397,12 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
         + '<div class="desktop ezil-desktop"></div></div>';
     const { window } = boot_shell(async (url, init) => {
         if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
-            return { ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko' };
+            return {
+                ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko',
+                frame: { confirmed: true },
+            };
         }
+        if (url.includes('confirm=frame')) return { ok: true, confirmed: true };
         if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
         return { ok: true };
     }, PAYLOAD, OS_BODY);
