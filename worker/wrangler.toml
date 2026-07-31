@@ -4,14 +4,17 @@ compatibility_date = "2026-06-24"
 compatibility_flags = ["nodejs_compat"]
 
 # `workers_dev` defaults to disabled the moment any `[[routes]]` is present
-# (see the routes block below) — but the app's own primary API surface
-# (`POST /sandbox/preview`, `GET /health`, `DELETE /sandbox/:id`, etc. — see
-# `CLOUDFLARE_GUACAMOLE_WORKER_URL` in `app/.env.local`) calls this Worker on
-# a STABLE hostname that is NOT one of the three narrow preview-suffix routes
-# below (those only match dynamically-minted `<port>-<sandboxId>-<token>`
-# preview hostnames). Keeping `workers_dev = true` explicit here preserves
-# that stable entrypoint alongside the zone routes; the two are independent
-# and both active at once is normal.
+# (see the routes block below), so keep it explicit — the `*.workers.dev` host
+# stays reachable as a DIAGNOSTIC entrypoint (`GET /health` answers there).
+#
+# It is NOT the app's entrypoint, and must never be put in
+# `CLOUDFLARE_GUACAMOLE_WORKER_URL`. `normalizeSandboxHostname()` derives each
+# sandbox's preview hostname from the INBOUND request's own Host, so a
+# workers.dev caller mints workers.dev preview hosts and `exposePort()` throws
+# ("Port exposure requires a custom domain") after the container has already
+# booted. The app must call this Worker on a host that one of the routes below
+# matches; the committed value is `https://api-desktop.ezil.org` (see
+# `app/.env.example` and `README.md`).
 workers_dev = true
 
 # ── Cloudflare Sandbox container ─────────────────────────────────────────────

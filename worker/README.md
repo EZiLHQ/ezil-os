@@ -135,9 +135,10 @@ throwaway key without touching the production `SANDBOX_HMAC_SECRET`. It is:
 ```
 
 
-Then point the app at the deployed Worker:
+Then point the app at the deployed Worker. This value **must be a host on the
+preview zone** — a `*.workers.dev` URL here cannot work (see below):
 ```
-CLOUDFLARE_GUACAMOLE_WORKER_URL=https://ezil-os-worker.ezil-builder.workers.dev
+CLOUDFLARE_GUACAMOLE_WORKER_URL=https://api-desktop.ezil.org
 ```
 
 **2026-07-31 — preview routing is live on `ezil.org` (narrow suffix routes):**
@@ -158,13 +159,53 @@ details. Each route was added ONE at a time with a live byte-level
 before/after diff of `sandbox.ezil.org`/`neko.ezil.org` (unchanged throughout)
 before adding the next. `PREVIEW_ZONE_ROOT` is `'ezil.org'` again.
 
-The `workers.dev` URL above remains the app's primary entrypoint for
-`/health`, `POST /sandbox/preview`, etc. (`workers_dev = true` is set
-explicitly in `wrangler.toml`, since it would otherwise default to disabled
-once `[[routes]]` entries exist) — only the dynamically-minted per-sandbox
-preview hostnames (`<port>-<sandboxId>-<token>.ezil.org`) go over the new
-zone routes, because `@cloudflare/sandbox` throws `CustomDomainRequiredError`
-for any preview host ending in `.workers.dev`.
+### The app entrypoint must be on the preview zone — `workers.dev` cannot work
+
+An earlier revision of this file claimed the `*.workers.dev` URL "remains the
+app's primary entrypoint" and that only the minted per-sandbox preview
+hostnames use the zone. **That was false, and it cost a full end-to-end run.**
+
+`normalizeSandboxHostname()` (`src/index.ts`) derives the preview hostname from
+the **inbound request's own `Host`** — so whichever host the app calls the
+Worker on is the host every preview URL gets minted under. Call it on
+`https://ezil-os-worker.ezil-builder.workers.dev` and `POST /sandbox/preview`
+boots the container and then dies, verbatim:
+
+```
+Port exposure requires a custom domain. .workers.dev domains do not support
+wildcard subdomains required for port proxying.
+```
+
+`@cloudflare/sandbox` refuses any preview host ending in `.workers.dev`
+(`CustomDomainRequiredError`). The container has already started by the time
+`exposePort` runs, so this surfaces late — as a ~26s boot failure
+(`cf-guacamole-failed-unknown`), not as a config error at startup.
+
+`https://api-desktop.ezil.org` is therefore the committed value (it is in
+`app/.env.example`). It works because it ends in `-desktop.ezil.org`, so the
+`*-desktop.ezil.org/*` route above sends it to this Worker, and
+`normalizeSandboxHostname` collapses any host under `PREVIEW_ZONE_ROOT` to the
+bare zone root before `exposePort` composes
+`<port>-<sandboxId>-<token>.ezil.org` — a single label under the zone, which
+Universal SSL covers. Any other host matching one of the three routes would do
+equally well; **a host that matches none of them will 404 or hit the wrong
+Worker.**
+
+Verified live (2026-07-31):
+`GET https://api-desktop.ezil.org/health` → `{"ok":true,…,"build":"ezil-os"}`
+(this Worker), while `GET https://sandbox.ezil.org/health` still returns the
+old production Worker's payload with **no** `build` field — the narrow routes
+did not capture production.
+
+`workers_dev = true` stays set explicitly in `wrangler.toml` (it would
+otherwise default to disabled once `[[routes]]` entries exist), and the
+`*.workers.dev` URL remains useful as a **diagnostic** entrypoint: `GET /health`
+answers there. It is not an app entrypoint — every request that ends in
+`exposePort` fails on it. Do not put it in `CLOUDFLARE_GUACAMOLE_WORKER_URL`.
+
+(The local-dev `http://localhost:8787` above is a separate, still-valid case:
+`localhost` is not under `PREVIEW_ZONE_ROOT`, so it passes through unchanged
+and preview hosts are minted as `<port>-<id>-desktop.localhost:8787`.)
 
 Notes:
 - `wrangler.toml` uses `instance_type = "standard"` (Chrome + Tomcat + a JVM need
