@@ -156,7 +156,11 @@ function mount_desktop_root () {
 function open_start_menu (apps, ctx, el_anchor) {
     const items = apps.map(app => ({
         html: app.name,
-        icon: window.icons?.[app.icon],
+        // 🔴 `UIContextMenu`'s `icon` is interpolated as RAW HTML, not used as
+        // an `<img src>` — upstream passes emoji ("📋", "📂"). OBSERVED in
+        // Chromium: handing it the descriptor's data URI printed the entire
+        // URI as visible text next to the app name. It has to be markup.
+        icon: `<img src="${html_encode(app.icon)}" alt="" style="width:16px;height:16px;border-radius:3px;vertical-align:middle">`,
         onClick: () => { void registry.launch(app.id, ctx); },
     }));
     if ( items.length === 0 ) items.push({ html: 'Nothing to open', disabled: true });
@@ -208,7 +212,7 @@ async function mount (payload) {
         UITaskbarItem({
             app: app.id,
             name: app.name,
-            icon: window.icons?.[app.icon],
+            icon: app.icon,
             keep_in_taskbar: true,
             lock_keep_in_taskbar: true,
             open_windows_count: 0,

@@ -39,8 +39,19 @@
 .desktop.ezil-desktop {
     position: fixed;
     inset: 0;
-    width: 100%;
-    height: 100% !important;
+    /* `auto` on both axes so `inset: 0` sizes the box and the taskbar-position
+     * classes' margins are still honoured (a user who moves the dock to the
+     * left edge gets their 50px gutter back). Both need to beat an upstream
+     * `!important`: `style.css:220` pins `height: calc(100vh - 60px)
+     * !important` — a figure that assumes upstream's 10px toolbar, which this
+     * fork does not have.
+     *
+     * MEASURED in Chromium at 1440x900: without `box-sizing`, `.device-desktop
+     * .desktop`'s `padding-top: 5px` made the surface 905px tall against a
+     * 900px viewport. Nothing in the ported sheets sets box-sizing at all. */
+    box-sizing: border-box;
+    width: auto;
+    height: auto !important;
     background-color: #161616;
     background-image:
         radial-gradient(120% 80% at 78% 8%, rgba(0, 173, 181, 0.20) 0%, rgba(0, 173, 181, 0) 62%),

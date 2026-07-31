@@ -69,13 +69,27 @@ async function UITaskbar (options) {
     options = options ?? {};
     options.content = options.content ?? '';
 
-    // Upstream read this from `puter.kv`; EZiL keeps it in localStorage. The
-    // 'first visit ever' branch is preserved, including its 'left' default.
+    // Upstream read this from `puter.kv`; EZiL keeps it in localStorage.
+    //
+    // MODIFIED BY EZIL 2026-07-31: the first-visit default is 'bottom', not
+    // upstream's 'left'. OBSERVED in Chromium at 1440x900 before the change:
+    // a new user got a 50px full-height bar down the left edge, while the
+    // `.taskbar` rules the same stylesheet applies unconditionally (`position:
+    // fixed; bottom: 5px; left: 50%; transform: translateX(-50%);
+    // border-radius: 10px; backdrop-filter: blur(10px)`) describe a centred
+    // floating dock. Two other ported behaviours assume that dock as well:
+    // `exit_fullpage_mode` restores `.desktop` to `calc(100vh -
+    // taskbar_height)`, which only subtracts correctly for a horizontal bar,
+    // and `update_maximized_window_for_taskbar` reserves height, not width.
+    // So 'left' was the one setting that made three other pieces of ported
+    // code wrong at once — on a user's FIRST EVER visit, which is the single
+    // impression that matters most. A returning user's stored choice, and the
+    // context menu that changes it, are untouched.
     let taskbar_position;
 
     if ( window.first_visit_ever ) {
-        session.set('taskbar_position', 'left');
-        taskbar_position = 'left';
+        session.set('taskbar_position', 'bottom');
+        taskbar_position = 'bottom';
     } else {
         taskbar_position = session.get('taskbar_position');
         if ( ! taskbar_position ) {

@@ -793,7 +793,7 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .dashboard-app-drawer,.dashboard-app-drawer *{transition:none!important}
 }
 #ezil-os-root{position:fixed;inset:0}
-.desktop.ezil-desktop{position:fixed;inset:0;width:100%;height:100%!important;background-color:#161616;background-image:radial-gradient(120% 80% at 78% 8%,rgba(0,173,181,.2) 0,rgba(0,173,181,0) 62%),radial-gradient(90% 70% at 10% 96%,rgba(0,173,181,.1) 0,rgba(0,173,181,0) 60%),linear-gradient(168deg,#1b1e1e 0,#161616 46%,#101111 100%)}
+.desktop.ezil-desktop{position:fixed;inset:0;box-sizing:border-box;width:auto;height:auto!important;background-color:#161616;background-image:radial-gradient(120% 80% at 78% 8%,rgba(0,173,181,.2) 0,rgba(0,173,181,0) 62%),radial-gradient(90% 70% at 10% 96%,rgba(0,173,181,.1) 0,rgba(0,173,181,0) 60%),linear-gradient(168deg,#1b1e1e 0,#161616 46%,#101111 100%)}
 body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;background-color:#161616}
 .ezil-desktop-window .window-body{background-color:#101111;position:relative;overflow:hidden}
 .ezil-desktop-window .window-app-iframe{background-color:#101111}

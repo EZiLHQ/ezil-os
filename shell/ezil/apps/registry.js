@@ -33,10 +33,39 @@ import { openDesktopWindow } from './desktop-window.js';
 const PHASE = 'ezil-os:apps';
 
 /**
+ * The Desktop app's icon. EZiL-authored, inline, and NOT a `window.icons`
+ * lookup, for two reasons:
+ *
+ *   1. There is no icon in the ported set that means "your Linux computer".
+ *      The nearest, `app.svg`, is a manila folder — OBSERVED in Chromium
+ *      rendering as a folder in both the dock and the control tray, which
+ *      reads as "a place to put files", the one thing this app is not.
+ *   2. `shell/src/icons/` is the Puter-DERIVED tree, enumerated file by file
+ *      in PUTER-PROVENANCE.md, and `build-shell.sh` globs exactly that
+ *      directory. Dropping an EZiL-authored SVG into it would put unattributed
+ *      work inside the attribution record; changing the build's glob to add a
+ *      second directory is a bigger change than the icon is worth.
+ *
+ * A data URI in the descriptor sidesteps both. `UITaskbarItem` and
+ * `attach_app_drawer` each take a raw `src` string, so nothing else changes.
+ * URI-encoded rather than base64 so it stays readable in a diff.
+ */
+const DESKTOP_ICON = 'data:image/svg+xml,' + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">'
+    + '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">'
+    + '<stop offset="0" stop-color="#1f4d50"/><stop offset="1" stop-color="#12292b"/>'
+    + '</linearGradient></defs>'
+    + '<rect width="48" height="48" rx="11" fill="url(#g)"/>'
+    + '<rect x="9.5" y="12.5" width="29" height="19" rx="2.5" fill="none" stroke="#00adb5" stroke-width="2.4"/>'
+    + '<path d="M19 37h10M24 31.5V37" fill="none" stroke="#00adb5" stroke-width="2.4" stroke-linecap="round"/>'
+    + '</svg>',
+);
+
+/**
  * @typedef {object} AppDescriptor
  * @property {string} id             Matches `data-app` on the window and the taskbar item.
  * @property {string} name           User-facing. Shown in the taskbar tooltip and the drawer.
- * @property {string} icon           Key into `window.icons` (see build-shell.sh's icons.js).
+ * @property {string} icon           An `<img src>` value, ready to use.
  * @property {boolean} pinned        Sits in the taskbar whether or not it is open.
  * @property {boolean} single_instance  A second launch focuses the first window.
  * @property {(ctx: object) => Promise<HTMLElement|null>} open
@@ -47,10 +76,7 @@ export const APPS = [
     {
         id: 'desktop',
         name: 'Linux Desktop',
-        // 'app.svg' rather than a bespoke desktop glyph: the icon set is the
-        // 21 files ported from upstream, and inventing a 22nd here would mean
-        // an icon in the bundle with no provenance line.
-        icon: 'app.svg',
+        icon: DESKTOP_ICON,
         pinned: true,
         // 🔴 Two windows competing for one cold container is the worst
         // possible first run: both show a boot spinner, one of them is lying,
@@ -131,7 +157,10 @@ export async function launch (id, ctx = {}) {
     }
 
     try {
-        return await app.open(ctx);
+        // The descriptor's own icon travels with the launch, so the window
+        // head, the taskbar item and the control tray cannot show a different
+        // image from the dock tile the user just clicked.
+        return await app.open({ ...ctx, icon: app.icon, appName: app.name });
     } catch ( err ) {
         // A throwing `open` must not leave the caller (a taskbar click, a
         // Start press) believing something is on its way.
