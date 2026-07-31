@@ -8,7 +8,11 @@
  * HTTP API (consumed by apps/web/.../cloudflare-guacamole-provider.ts):
  *   GET    /health                 → { ok, service, mode }
  *   POST   /sandbox/preview        → { ok, guacamoleUrl, expiresAt, provider, mode, sandboxId }
- *   GET    /sandbox/:name/status   → { ok, sandboxName, guacamoleRunning, mode }
+ *   GET    /sandbox/:name/status   → { ok, sandboxName, guacamoleRunning, mode,
+ *                                     desktopRunning, runningModes, modeSource }
+ *          (`mode` is DETECTED from the live exposed-port list when the caller
+ *          omits `?desktopMode=`; `guacamoleRunning` means "the desktop port
+ *          for the reported `mode` is exposed" — read the two together)
  *   POST   /sandbox/:name/workspace-diag → { ok, sandboxId, op, slot, exists, bytes, sha256, expectedSha256, matches, wrote }
  *          (HMAC-gated diagnostic: mounts the R2 workspace bucket and operates on
  *          named, allowlisted marker slots to prove deterministic R2 persistence
@@ -18,7 +22,13 @@
  *          `/tmp/neko-cpu-diag.jsonl` — see `EZIL_NEKO_CPU_DIAG_ENABLED` /
  *          `handleCpuDiag`; bounded/tail-capped; degrades cleanly with
  *          `exists: false` when the sampler was never enabled)
- *   DELETE /sandbox/:name          → { ok, sandboxName, terminated, mode }
+ *   DELETE /sandbox/:name          → { ok, sandboxName, terminated, stopped, outcome,
+ *                                     wasRunning, runningAfter, mode }
+ *          (HMAC-gated with the SAME token envelope as `/sandbox/preview` —
+ *          present it as `Authorization: Bearer <token>`, `?token=`, or a JSON
+ *          body `{token}`. `terminated` is true ONLY when a running container
+ *          was observed before and observed gone after; `outcome` is one of
+ *          destroyed | not_running | still_running | destroy_failed)
  *
  * How it works:
  *   1. `proxyToSandbox(request, env)` runs first. It intercepts requests to the
@@ -265,6 +275,7 @@ import {
   shouldTriggerDevserverRestart,
   effectiveDevserverPhase,
   buildDevserverRestartCommand,
+  readCookie,
   DEVSERVER_PHASE_FILE,
   DEVSERVER_MODE_FILE,
   DEVSERVER_RESTART_COUNT_FILE,
@@ -286,6 +297,25 @@ import {
   PROJECT_FILES_MAX_PUT_REQUEST_BYTES,
   PROJECT_FILES_MAX_CONTROL_REQUEST_BYTES,
 } from './project-files';
+// Pure control-surface helpers (signed-token extraction, honest terminate
+// reporting, truthful desktop-status derivation) — see `./sandbox-control`.
+// Re-exported as functions only; the module's `const`s stay unexported here
+// (workerd rejects non-function top-level exports of the entrypoint — see the
+// note above `DESKTOP_MODES`).
+export {
+  extractSignedToken,
+  buildTerminateReport,
+  describeDesktopStatus,
+  type TerminateOutcome,
+  type TerminateReport,
+  type DesktopStatus,
+} from './sandbox-control';
+import {
+  extractSignedToken,
+  buildTerminateReport,
+  describeDesktopStatus,
+  type TerminateReport,
+} from './sandbox-control';
 import {
   seedWorkspaceIfAbsent,
   realR2KeyPrefix,
@@ -370,6 +400,9 @@ import {
   verifyPreviewToken,
   deriveNekoCredentials,
   resolveNekoDerivationSecret,
+  verifyPreviewCookie,
+  verifyPreviewBootstrapToken,
+  PREVIEW_COOKIE_NAME,
 } from './hmac';
 import { LifecycleTimeline, newCorrelationId } from './observability';
 
@@ -467,6 +500,13 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
 interface EzilWorkspacePersistRpc {
   recordWorkspaceHydration(params: { prefix: string; mountPath: string; hydrated: boolean }): Promise<void>;
   flushWorkspaceNow(): Promise<FlushOutcome>;
+  /**
+   * Observe → flush → cancel the flush loop → destroy → RE-OBSERVE, returning
+   * what actually happened. Runs entirely inside the DO because only there is
+   * `ctx.container.running` (the ground truth for "is a container alive under
+   * this name") readable. See `EzilSandboxDO.terminateSandbox`.
+   */
+  terminateSandbox(): Promise<TerminateReport>;
 }
 
 /** Open (or create) the Sandbox DO for an id with consistent options. */
@@ -1213,6 +1253,38 @@ async function ensureWorkspaceHydratedFromR2(
 const WORKSPACE_FLUSH_CONTEXT_KEY = 'ezil:workspaceFlushContext';
 const WORKSPACE_HYDRATED_KEY = 'ezil:workspaceHydrated';
 const WORKSPACE_FLUSH_LOOP_STARTED_KEY = 'ezil:workspaceFlushLoopStarted';
+/**
+ * Set by `terminateSandbox()`/`destroy()`; cleared by the next successful boot
+ * (`recordWorkspaceHydration`). While set, the periodic flush loop MUST NOT
+ * run and MUST NOT reschedule itself.
+ *
+ * Why this exists — the container-resurrection bug this fixes:
+ * `@cloudflare/containers`' `alarm()` executes every DUE schedule BEFORE it
+ * checks `this.container.running`, and `runWorkspaceFlush()` walks the
+ * workspace over container RPCs. `Sandbox.containerFetch()` **auto-starts a
+ * stopped container** (`startAndWaitForPorts`). So a genuinely destroyed
+ * container was brought back to life by its own flush alarm within one
+ * `WORKSPACE_FLUSH_INTERVAL_SECONDS` window — teardown could never stick.
+ * `destroy()` in the SDK deletes only its OWN storage keys (`portTokens`,
+ * `tunnels*`), so nothing upstream cancels our schedule; we must do it here.
+ */
+const WORKSPACE_TERMINATED_KEY = 'ezil:workspaceTerminated';
+
+/** The `schedule()` callback name for the periodic workspace flush — also the key `deleteSchedules()` cancels by. */
+const WORKSPACE_FLUSH_CALLBACK = 'flushWorkspaceScheduled';
+
+/**
+ * How long `terminateSandbox()` waits for `ctx.container.running` to go false
+ * after `destroy()` settles, before reporting `still_running`.
+ *
+ * `destroy()` is a SIGKILL and the runtime flag is expected to flip by the
+ * time it resolves; this short poll exists only so a slow control-plane
+ * acknowledgement is not mis-reported as a failed teardown. Bounded small on
+ * purpose — a terminate that cannot be confirmed quickly SHOULD report that it
+ * could not be confirmed rather than block the caller.
+ */
+const TERMINATE_CONFIRM_TIMEOUT_MS = 3_000;
+const TERMINATE_CONFIRM_INTERVAL_MS = 250;
 
 interface WorkspaceFlushContext {
   /** R2 key prefix, NO leading slash — e.g. `${projectId}/branches/${branch}`. */
@@ -1373,6 +1445,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   async recordWorkspaceHydration(params: { prefix: string; mountPath: string; hydrated: boolean }): Promise<void> {
     await this.ctx.storage.put(WORKSPACE_FLUSH_CONTEXT_KEY, { prefix: params.prefix, mountPath: params.mountPath });
     await this.ctx.storage.put(WORKSPACE_HYDRATED_KEY, params.hydrated);
+    // A hydrate attempt means this sandbox is booting again, so any previous
+    // explicit terminate is over: clear the tombstone BEFORE the loop-start
+    // check below, or the flush loop would stay permanently disabled for a
+    // sandbox that was terminated once and later re-created under the same
+    // deterministic name (the normal case — `deriveSandboxId` is stable).
+    await this.ctx.storage.delete(WORKSPACE_TERMINATED_KEY);
     if (!params.hydrated) return;
 
     const started = (await this.ctx.storage.get<boolean>(WORKSPACE_FLUSH_LOOP_STARTED_KEY)) ?? false;
@@ -1380,7 +1458,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
     await this.ctx.storage.put(WORKSPACE_FLUSH_LOOP_STARTED_KEY, true);
     try {
-      await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, 'flushWorkspaceScheduled');
+      await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK);
     } catch (err) {
       console.error(
         `[ezil-boot] phase=workspace_flush event=schedule_failed error=${err instanceof Error ? err.message : String(err)}`,
@@ -1391,11 +1469,28 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     }
   }
 
-  /** The `schedule()` callback — self-perpetuating: always reschedules, even after a failed cycle. */
+  /**
+   * The `schedule()` callback — self-perpetuating: always reschedules, even
+   * after a failed cycle… EXCEPT once this sandbox has been explicitly
+   * terminated, where it must do neither.
+   *
+   * See `WORKSPACE_TERMINATED_KEY`: `runWorkspaceFlush` reaches into the
+   * container, and a container RPC AUTO-STARTS a stopped container, so an
+   * un-cancelled loop resurrects whatever `destroy()` just killed. The
+   * tombstone is checked here as well as cancelled in `destroy()` because a
+   * schedule row may already be due/in-flight when destroy runs.
+   */
   async flushWorkspaceScheduled(): Promise<void> {
+    const terminated = (await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)) ?? false;
+    if (terminated) {
+      bootLog('workspace_flush', 'end', { status: 'skipped', detail: 'terminated,trigger=alarm' });
+      // Leave the loop marked stopped so the next successful hydrate restarts it.
+      await this.ctx.storage.put(WORKSPACE_FLUSH_LOOP_STARTED_KEY, false);
+      return;
+    }
     await this.runWorkspaceFlush('alarm');
     try {
-      await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, 'flushWorkspaceScheduled');
+      await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK);
     } catch (err) {
       console.error(
         `[ezil-boot] phase=workspace_flush event=reschedule_failed error=${err instanceof Error ? err.message : String(err)}`,
@@ -1406,6 +1501,105 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   /** Explicit, on-demand flush — see class doc comment for the two call sites. */
   async flushWorkspaceNow(): Promise<FlushOutcome> {
     return this.runWorkspaceFlush('explicit');
+  }
+
+  /** True when a container is actually alive under this DO right now. */
+  private containerIsRunning(): boolean {
+    return this.ctx.container?.running === true;
+  }
+
+  /**
+   * Tombstone this sandbox and cancel the periodic flush loop so nothing can
+   * wake the container back up after teardown. Idempotent.
+   */
+  private async cancelWorkspaceFlushLoop(): Promise<void> {
+    await this.ctx.storage.put(WORKSPACE_TERMINATED_KEY, true);
+    await this.ctx.storage.put(WORKSPACE_FLUSH_LOOP_STARTED_KEY, false);
+    try {
+      // Drops any pending `container_schedules` row for this callback so the
+      // next alarm has nothing to run. Best-effort: the tombstone check at the
+      // top of `flushWorkspaceScheduled` is the backstop if this throws.
+      this.deleteSchedules(WORKSPACE_FLUSH_CALLBACK);
+    } catch (err) {
+      console.error(
+        `[ezil-boot] phase=workspace_flush event=cancel_schedule_failed error=${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Every teardown path goes through here, including a bare `sandbox.destroy()`
+   * from anywhere else in this Worker — so the flush loop can never outlive the
+   * container it flushes.
+   */
+  override async destroy(): Promise<void> {
+    await this.cancelWorkspaceFlushLoop();
+    await super.destroy();
+  }
+
+  /**
+   * The `DELETE /sandbox/:name` implementation, run inside the DO.
+   *
+   * Ordered so the answer is OBSERVED, never assumed:
+   *   1. read `ctx.container.running` BEFORE anything (`wasRunning`);
+   *   2. flush ONLY if a container is actually up — flushing a sleeping
+   *      sandbox would cold-boot it (~20s) purely to kill it again;
+   *   3. tombstone + cancel the flush loop (see `destroy()` above);
+   *   4. `destroy()`;
+   *   5. re-read `ctx.container.running`, briefly polling, and report what was
+   *      actually observed via `buildTerminateReport`.
+   *
+   * A name that never ran anything now reports `terminated: false,
+   * outcome: 'not_running'` instead of a bogus `terminated: true` — which is
+   * exactly the signal that would have surfaced the live incident where
+   * DELETEs were sent to `<sandboxId>-nekodesktop` (the preview-hostname
+   * label) rather than `<sandboxId>`.
+   */
+  async terminateSandbox(): Promise<TerminateReport> {
+    const wasRunning = this.containerIsRunning();
+
+    if (wasRunning) {
+      // EXPLICIT flush before destroy — the container filesystem (and anything
+      // unflushed on it) is gone the moment `destroy()` returns. Best-effort:
+      // a flush failure must never block termination (that would let a stuck
+      // flush leak a container indefinitely), but it MUST be logged loudly.
+      try {
+        await this.runWorkspaceFlush('explicit');
+      } catch (err) {
+        console.error(
+          `[terminateSandbox] pre-destroy flush failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    await this.cancelWorkspaceFlushLoop();
+
+    let destroyError: string | undefined;
+    try {
+      // `super.destroy()` — `this.destroy()` would re-run the cancel above
+      // harmlessly, but going straight to the SDK keeps this method the single
+      // ordered sequence it documents.
+      await super.destroy();
+    } catch (err) {
+      destroyError = err instanceof Error ? err.message : String(err);
+      console.error(`[terminateSandbox] destroy() failed: ${destroyError}`);
+    }
+
+    let runningAfter = this.containerIsRunning();
+    const deadline = Date.now() + TERMINATE_CONFIRM_TIMEOUT_MS;
+    while (runningAfter && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, TERMINATE_CONFIRM_INTERVAL_MS));
+      runningAfter = this.containerIsRunning();
+    }
+
+    const report = buildTerminateReport({ wasRunning, runningAfter, destroyError });
+    bootLog('terminate', 'end', {
+      status: report.ok ? 'ok' : 'error',
+      detail: `outcome=${report.outcome},wasRunning=${wasRunning},runningAfter=${runningAfter}`,
+    });
+    return report;
   }
 }
 
@@ -1833,21 +2027,59 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
   }
 }
 
+/**
+ * `GET /sandbox/:name/status` — the cheap, non-waking readiness probe the boot
+ * UI polls.
+ *
+ * DEFECT FIXED HERE (live: a neko desktop that was actively streaming video
+ * reported `{"guacamoleRunning":false,"mode":"guacamole"}`): the mode used to
+ * be resolved from `?desktopMode=` / `SANDBOX_DEFAULT_DESKTOP_MODE` ALONE.
+ * The app's `getGuacamoleSandboxStatus()` sends no `desktopMode`, and
+ * `SANDBOX_DEFAULT_DESKTOP_MODE` is unset in `wrangler.toml`, so the mode was
+ * always `guacamole` and the port compared was always 8080 — a neko sandbox
+ * (8181) could never match. `guacamoleRunning` was therefore permanently
+ * `false`, and since it is the ONLY signal `computeBootUiState` promotes a
+ * phase to `confirmed` on, no checkmark could ever appear.
+ *
+ * The fix is to read the mode off the live exposed-port list, which was
+ * already being fetched and is ground truth (`getCurrentPreviewPorts()`
+ * returns `[]` unless the container is healthy AND running, and touches only
+ * DO storage — so this route still never wakes a container).
+ *
+ * WIRE CONTRACT: `ok`, `sandboxName`, `guacamoleRunning` and `mode` keep their
+ * names and their meanings (`guacamoleRunning` has always meant "the desktop
+ * port for the reported `mode` is exposed" — see `describeDesktopStatus`).
+ * `desktopRunning`, `runningModes` and `modeSource` are additive.
+ */
 async function handleStatus(env: Env, url: URL, sandboxName: string, requestedMode?: string): Promise<Response> {
   const modeResult = resolveDesktopMode(requestedMode, env.SANDBOX_DEFAULT_DESKTOP_MODE);
   if (!modeResult.ok) {
     return json({ ok: false, error: modeResult.error }, 400);
   }
-  const mode = modeResult.mode;
+  // An EXPLICIT `?desktopMode=` still answers the caller's literal question
+  // ("is <mode> up?"); only an omitted one is now detected from live state.
+  const explicitMode = requestedMode?.trim() ? modeResult.mode : undefined;
   try {
     const sandbox = openSandbox(env, sandboxName);
     const exposed = await sandbox.getExposedPorts(normalizeSandboxHostname(url.host));
-    const { port } = portFor(mode);
-    const guacamoleRunning = exposed.some((p) => p.port === port);
-    return json({ ok: true, sandboxName, guacamoleRunning, mode });
+    const status = describeDesktopStatus(exposed, explicitMode, modeResult.mode);
+    return json({
+      ok: true,
+      sandboxName,
+      guacamoleRunning: status.guacamoleRunning,
+      mode: status.mode,
+      desktopRunning: status.desktopRunning,
+      runningModes: status.runningModes,
+      modeSource: status.modeSource,
+    });
   } catch (err) {
     return json(
-      { ok: false, sandboxName, error: err instanceof Error ? err.message : String(err), mode },
+      {
+        ok: false,
+        sandboxName,
+        error: err instanceof Error ? err.message : String(err),
+        mode: modeResult.mode,
+      },
       500,
     );
   }
@@ -2625,6 +2857,34 @@ async function handleAppPreview(request: Request, env: Env, url: URL): Promise<R
   }
 
   if (request.method === 'GET' && path === '/preview-status') {
+    // Was the ONE unauthenticated route on this hostname (its module doc still
+    // described it as such, inherited from the Azure daemon it was ported
+    // from) — but it has since become MUTATING: `probeAppPreviewStatus` calls
+    // `shouldTriggerDevserverRestart()` and, when that fires, executes
+    // `buildDevserverRestartCommand()` in the container, restarting the user's
+    // dev server. It also `exec`s unconditionally, and a container RPC
+    // AUTO-STARTS a stopped container — so an anonymous GET could restart a
+    // dev server and cold-boot (bill) a container.
+    //
+    // Gated with the SAME credentials its four sibling routes on this exact
+    // hostname already use — no new scheme: the `ezil_preview` cookie minted
+    // by `/preview-bootstrap` (the browser that renders the preview always has
+    // it: `Path=/`, `SameSite=None`, `Secure`), or, for a server-side poller,
+    // the same sandboxId-bound `?token=` bootstrap token `/preview-bootstrap`
+    // itself verifies. Local dev (no secret configured) is unaffected: both
+    // verifiers short-circuit to "allowed" exactly as before.
+    const cookie = readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME);
+    const cookieOk = await verifyPreviewCookie(cookie, secrets, sandboxId);
+    if (!cookieOk) {
+      const tokenAuth = await verifyPreviewBootstrapToken(
+        url.searchParams.get('token') ?? undefined,
+        secrets,
+        sandboxId,
+      );
+      if (!tokenAuth.ok) {
+        return json({ ok: false, error: tokenAuth.error }, 401);
+      }
+    }
     try {
       const sandbox = openSandbox(env, sandboxId);
       const status = await probeAppPreviewStatus(sandbox, env);
@@ -2709,6 +2969,48 @@ async function authorizeProjectFilesRequest(
   body: Record<string, unknown>,
 ): Promise<Response | null> {
   const token = typeof body.token === 'string' ? body.token : undefined;
+  const auth = await verifyPreviewToken(token, resolvePreviewSecrets(env));
+  if (!auth.ok) return json({ ok: false, error: auth.error }, 401);
+  return null;
+}
+
+/**
+ * Verify the SAME shared HMAC envelope on a control request that carries no
+ * JSON body of its own (`DELETE /sandbox/:name`).
+ *
+ * This is deliberately NOT a new scheme: the token is the exact
+ * `t=<unix_ms>,v1=<hex>` envelope minted for `POST /sandbox/preview` and
+ * verified by `verifyPreviewToken` / `resolvePreviewSecrets` — identical to
+ * `authorizeProjectFilesRequest` above and to `/sandbox/:id/{workspace-diag,
+ * cpu-diag,twen}`. Only the transport differs: a body-less method has nowhere
+ * to put a JSON field, so `Authorization: Bearer <token>` (preferred — keeps
+ * the token out of URLs and request logs) and `?token=<token>` (the existing
+ * `/preview-bootstrap` precedent) are accepted too, in that order. A JSON body
+ * with `{"token":…}` still works if a caller sends one.
+ *
+ * Local-dev behavior is inherited unchanged from `verifyPreviewToken`: with no
+ * secret configured, verification is skipped.
+ *
+ * Returns a 401 `Response` on failure, `null` on success.
+ */
+async function authorizeSignedControlRequest(request: Request, env: Env, url: URL): Promise<Response | null> {
+  let body: unknown;
+  // A body is optional here; a malformed one is simply not a token source.
+  // Never let body parsing decide the auth outcome — `extractSignedToken`
+  // falls through to the header/query sources.
+  try {
+    const raw = await request.clone().text();
+    if (raw.trim() !== '') body = JSON.parse(raw);
+  } catch {
+    body = undefined;
+  }
+
+  const token = extractSignedToken({
+    authorization: request.headers.get('authorization'),
+    query: url.searchParams.get('token'),
+    body,
+  });
+
   const auth = await verifyPreviewToken(token, resolvePreviewSecrets(env));
   if (!auth.ok) return json({ ok: false, error: auth.error }, 401);
   return null;
@@ -2803,30 +3105,52 @@ async function handleProjectFilesList(request: Request, env: Env): Promise<Respo
   return json(result);
 }
 
+/**
+ * `DELETE /sandbox/:name` — HMAC-gated (see the route wiring in `fetch()`) and
+ * HONEST.
+ *
+ * What this replaces: the previous implementation flushed, called
+ * `sandbox.destroy()`, and returned `{ terminated: true }` UNCONDITIONALLY —
+ * with no authorization at all, and with no check that anything had in fact
+ * been running. Because `getSandbox()` happily materializes a brand-new,
+ * never-started Durable Object for ANY name, a DELETE aimed at a wrong name
+ * (live incident: `<sandboxId>-nekodesktop`, the preview-hostname label, in
+ * place of `<sandboxId>`) destroyed an empty DO and still answered
+ * `ok:true, terminated:true` while the real container kept running.
+ *
+ * Now the DO itself observes `ctx.container.running` before and after and
+ * reports what actually happened (`terminated` / `stopped` / `outcome`); a
+ * container still alive after `destroy()` is a 500, not a success.
+ * `mode: 'production'` is retained verbatim for wire compatibility.
+ */
 async function handleTerminate(env: Env, sandboxName: string): Promise<Response> {
   try {
     const sandbox = openSandbox(env, sandboxName);
-    // EXPLICIT flush before destroy() — the container filesystem (and
-    // anything unflushed on it) is gone the moment `destroy()` returns.
-    // Best-effort: a flush failure here must never block termination (that
-    // would let a stuck flush leak a container indefinitely), but it MUST be
-    // logged loudly — never a bare `catch {}`. Worst case on failure is the
-    // same bounded exposure the periodic alarm already accepts (see
-    // `EzilSandboxDO`'s flush-interval doc comment), not a new hazard.
-    try {
-      await sandbox.flushWorkspaceNow();
-    } catch (err) {
-      console.error(
-        `[handleTerminate] pre-destroy flushWorkspaceNow failed (sandboxName=${sandboxName}): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
-    await sandbox.destroy();
-    return json({ ok: true, sandboxName, terminated: true, mode: 'production' });
+    const report = await sandbox.terminateSandbox();
+    return json(
+      {
+        ok: report.ok,
+        sandboxName,
+        terminated: report.terminated,
+        stopped: report.stopped,
+        outcome: report.outcome,
+        wasRunning: report.wasRunning,
+        runningAfter: report.runningAfter,
+        mode: 'production',
+        ...(report.error ? { error: report.error } : {}),
+      },
+      report.ok ? 200 : 500,
+    );
   } catch (err) {
     return json(
-      { ok: false, sandboxName, error: err instanceof Error ? err.message : String(err) },
+      {
+        ok: false,
+        sandboxName,
+        terminated: false,
+        stopped: false,
+        outcome: 'destroy_failed',
+        error: err instanceof Error ? err.message : String(err),
+      },
       500,
     );
   }
@@ -2953,6 +3277,17 @@ export default {
 
     const deleteMatch = path.match(/^\/sandbox\/([^/]+)$/);
     if (method === 'DELETE' && deleteMatch) {
+      // HMAC-gated with the SAME envelope every other mutating route on this
+      // Worker uses (`verifyPreviewToken` / `resolvePreviewSecrets`).
+      //
+      // This route used to have NO authorization check whatsoever while every
+      // `/project-files/*` route called `authorizeProjectFilesRequest` —
+      // verified live: an unauthenticated DELETE returned `ok:true`. The
+      // sandbox name is plainly visible in the desktop iframe's `src`, so
+      // anyone who saw a URL could destroy that session. See
+      // `authorizeSignedControlRequest` for where the token may be presented.
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
       return handleTerminate(env, decodeURIComponent(deleteMatch[1]));
     }
 

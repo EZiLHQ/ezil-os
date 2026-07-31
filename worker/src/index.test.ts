@@ -672,16 +672,36 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
   it('EzilSandboxDO is exported as `Sandbox` (same DO binding name — zero wrangler.toml changes) and uses schedule(), not alarm()', async () => {
     const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
     expect(src).toContain('export { EzilSandboxDO as Sandbox };');
-    expect(src).toContain("this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, 'flushWorkspaceScheduled')");
+    // The callback name is a single constant so `schedule()` and
+    // `deleteSchedules()` can never drift apart (a mismatch would leave the
+    // resurrection-causing schedule row uncancelled — see WORKSPACE_TERMINATED_KEY).
+    expect(src).toContain("const WORKSPACE_FLUSH_CALLBACK = 'flushWorkspaceScheduled';");
+    expect(src).toContain('this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK)');
+    expect(src).toContain('this.deleteSchedules(WORKSPACE_FLUSH_CALLBACK);');
     // Must NOT override the SDK's reserved `alarm()` container-keepalive hook.
     expect(src).not.toMatch(/class EzilSandboxDO[\s\S]*?\basync alarm\s*\(/);
   });
 
-  it('flush is invoked explicitly before the preview response AND before terminate, in addition to the alarm loop', async () => {
+  it('flush is invoked explicitly before the preview response, and before destroy inside terminateSandbox', async () => {
     const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    // handlePreview's pre-handoff flush is still a Worker-side RPC.
     expect(src).toContain('await sandbox.flushWorkspaceNow();');
     const callSites = [...src.matchAll(/await sandbox\.flushWorkspaceNow\(\);/g)];
-    expect(callSites.length).toBe(2); // handlePreview (pre-handoff) + handleTerminate (pre-destroy)
+    expect(callSites.length).toBe(1); // handlePreview (pre-handoff) only
+
+    // Terminate's pre-destroy flush moved INSIDE the DO (`terminateSandbox`),
+    // where `ctx.container.running` is readable, and is now conditional on a
+    // container actually being up: flushing a sleeping sandbox would cold-boot
+    // it (~20s) purely in order to kill it again.
+    const terminateBody = src.match(/async terminateSandbox\(\)[\s\S]*?\n  \}/)?.[0] ?? '';
+    expect(terminateBody).not.toBe('');
+    expect(terminateBody).toContain('const wasRunning = this.containerIsRunning();');
+    expect(terminateBody).toContain('if (wasRunning) {');
+    expect(terminateBody).toContain("await this.runWorkspaceFlush('explicit');");
+    // …and the flush must come BEFORE destroy, not after.
+    expect(terminateBody.indexOf("await this.runWorkspaceFlush('explicit');")).toBeLessThan(
+      terminateBody.indexOf('await super.destroy();'),
+    );
   });
 
   it('the flush interval is 10 seconds', async () => {
