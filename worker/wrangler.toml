@@ -64,9 +64,16 @@ SANDBOX_NEKO_ICE_POLICY = "relay"
 # running container's exposed port. workers.dev subdomains do not support
 # this pattern, so the wildcard subdomain (not the apex) is routed to this
 # Worker on the ezil.org zone.
-[[routes]]
-pattern = "*.ezil.org/*"
-zone_name = "ezil.org"
+# DISABLED for the Wave A3 initial deploy — this route is currently claimed by the
+# live Worker `cf-guacamole-sandbox` (serving neko.ezil.org / sandbox.ezil.org in
+# production). Two Workers cannot own the same route; claiming it here would either
+# fail or silently steal production traffic. Moving this route to ezil-os-worker is
+# a separate, explicitly-approved cutover step — not part of this deploy, which
+# verifies health via the *.workers.dev URL only. Re-enable only as part of that
+# cutover.
+# [[routes]]
+# pattern = "*.ezil.org/*"
+# zone_name = "ezil.org"
 
 # HMAC secret for authenticating EBuilder → Worker calls.
 # Set in production with:  wrangler secret put SANDBOX_HMAC_SECRET
