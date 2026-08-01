@@ -342,3 +342,42 @@
     color: #8a8a88;
     margin: 0 0 18px;
 }
+
+/* ── the Settings button inside the full-bleed control drawer ─────────────
+ *
+ * 🔴 The one exception to this file's "ezil-settings-* only" rule, and it is
+ * deliberate. `shell/src/css/dashboard.css` (Puter-derived, NOT owned by this
+ * task) sizes the drawer's open width from a calc written for EXACTLY two
+ * buttons:
+ *
+ *   --open-w: calc(12px + --icon + --i2t + --title-w + --t2b
+ *                  + --btn + 2px + --btn + 10px);          dashboard.css:52
+ *
+ * and `.dashboard-app-drawer-clip` is `overflow: hidden`. Adding a third
+ * button without widening the tray puts it outside the clip — present in the
+ * DOM, invisible and unclickable on screen, which for a guarantee whose whole
+ * point is "the user can always reach Delete" is worse than not adding it,
+ * because it would pass a DOM-level test.
+ *
+ * Scoped to the marker class `drawer-action.js` sets, so a drawer WITHOUT the
+ * Settings button keeps upstream's exact geometry. Redefining the TOTAL rather
+ * than any of the parts is what keeps dashboard.css's `(pointer: coarse)` and
+ * `(max-width: 500px)` overrides of `--btn` / `--title-w` / `--t2b` working:
+ * custom properties in a calc resolve at use time, so those media queries
+ * still flow through this formula unchanged.
+ *
+ * This is the only rule in the shell that targets `dashboard-app-drawer*` from
+ * outside dashboard.css. build-shell.sh concatenates `ezil/**\/*.css` last, so
+ * it wins on order as well as on specificity. */
+.dashboard-app-drawer.ezil-has-settings-action {
+    --open-w: calc(
+        12px + var(--icon) + var(--i2t) + var(--title-w) + var(--t2b)
+        + var(--btn) + 2px + var(--btn) + 2px + var(--btn) + 10px
+    );
+}
+
+/* Matches the spacing dashboard.css gives `.dashboard-app-drawer-minimize`,
+ * so the three buttons are evenly set rather than two-then-a-gap. */
+.dashboard-app-drawer-settings {
+    margin-right: 2px;
+}

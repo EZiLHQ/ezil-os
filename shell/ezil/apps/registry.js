@@ -18,15 +18,22 @@
 // open is fixed at build time, and pretending otherwise would mean a network
 // round trip whose answer never changes.
 //
-// ── The one rule ────────────────────────────────────────────────────────────
-// 🔴 An entry exists only if BOTH sides agree it can be launched today:
+// ── The one rule, and its one exception ─────────────────────────────────────
+// 🔴 A HOSTED entry exists only if BOTH sides agree it can be launched today:
 // this array (the client knows how to draw it) AND `payload.apps` (the server
 // confirms it can actually serve it — `SHELL_APPS` in
 // `app/src/server/shell/boot-payload.ts`). `resolve()` below intersects the
 // two. An icon that opens nothing is worse than a missing icon, because the
 // user spends their attention finding out.
 //
-// Wave 1 therefore has exactly one entry: the streamed Linux desktop.
+// 🔴 The exception is `shell_local: true` — see `resolve()`. An app that runs
+// ENTIRELY in this bundle has no server side to agree with: there is nothing
+// the host could fail to provision, so gating it on a server list cannot
+// prevent a broken icon, it can only produce a missing one. `desktop` is
+// hosted (a Cloudflare container per computer) and stays gated exactly as
+// before; `settings` and `preview` are shell-local.
+//
+// Wave 1 had exactly one entry: the streamed Linux desktop.
 //
 // MODIFIED BY EZIL 2026-08-01: added two entries. `settings` is the Settings
 // window (`../ui/Settings/index.js`) — computer management, appearance, and
@@ -36,16 +43,16 @@
 // placeholder `open()` so THIS file's own build never depends on a sibling
 // task's file existing yet — see `PREVIEW_PLACEHOLDER_NOTE` below for why,
 // and `PUTER-PROVENANCE.md` / the wave-a-t3 report for the full account.
-// Also exports `settingsDrawerAction()`: the full-bleed desktop window's
-// control drawer (`apps/desktop-window.js`, not owned by this task) needs a
-// Settings button so a user whose only desktop is stuck full-bleed can still
-// reach delete — this is the ready-to-consume action descriptor for that
-// drawer's `actions` array. Wiring it in is one line in a file this task
-// does not own; see that file's own comment ("Settings drops in here in a
-// later wave") and this task's report.
+//
+// MODIFIED BY EZIL 2026-08-01 (round 2): both new entries are `shell_local`,
+// and `launch()` now puts a Settings button in the control drawer of any
+// window that declares `wants_settings_in_drawer`. Both changes exist for the
+// same reason — round 1 built a Settings window that no real boot could
+// reach. See the two 🔴 blocks below and `../ui/Settings/drawer-action.js`.
 
 import { openDesktopWindow } from './desktop-window.js';
 import { openSettingsWindow } from '../ui/Settings/index.js';
+import { ensureSettingsDrawerButton, SETTINGS_DRAWER_SVG } from '../ui/Settings/drawer-action.js';
 import UIWindow from '../../src/UI/UIWindow.js';
 
 const PHASE = 'ezil-os:apps';
@@ -138,6 +145,12 @@ async function openPreviewPlaceholder (ctx = {}) {
  * @property {string} icon           An `<img src>` value, ready to use.
  * @property {boolean} pinned        Sits in the taskbar whether or not it is open.
  * @property {boolean} single_instance  A second launch focuses the first window.
+ * @property {boolean} [shell_local] Runs entirely in this bundle; `resolve()`
+ *   does not require the server to list it. See "The one rule, and its one
+ *   exception" at the top of this file.
+ * @property {boolean} [wants_settings_in_drawer] This app's window carries an
+ *   `attach_app_drawer` control tray and goes full-bleed, so the tray must
+ *   carry a Settings button. See `../ui/Settings/drawer-action.js`.
  * @property {(ctx: object) => Promise<HTMLElement|null>} open
  */
 
@@ -154,6 +167,12 @@ export const APPS = [
         // again by `UIWindow`'s own `single_instance` option, because the
         // guard has to hold even if something opens the window directly.
         single_instance: true,
+        // Hosted: a Cloudflare container has to exist for this to open, so it
+        // stays on the server side of the two-sided handshake.
+        shell_local: false,
+        // 🔴 This is the app that hides the taskbar. Its tray must carry the
+        // way back to Settings — see ../ui/Settings/drawer-action.js.
+        wants_settings_in_drawer: true,
         open: openDesktopWindow,
     },
     {
@@ -167,6 +186,20 @@ export const APPS = [
         // visible; see `settingsDrawerAction()` below for the full-bleed case.
         pinned: true,
         single_instance: true,
+        // 🔴 Shell-local, and this flag is the whole reason Settings is
+        // reachable at all. `SHELL_APPS` in
+        // `app/src/server/shell/boot-payload.ts` is
+        // `[{ id: 'desktop', ... }]` — an explicit, non-empty list, so
+        // `resolve()`'s intersection is authoritative and used to drop
+        // `settings` out of EVERY real boot. OBSERVED in round 1: a complete,
+        // building, passing Settings window that no `/os` page could ever
+        // show. Settings has no server side to provision — it is this
+        // bundle's own DOM over `/api/trpc`, which already exists — so
+        // requiring the server to announce it was never the right rule for
+        // it. Adding `settings` to `SHELL_APPS` would ALSO fix it and is
+        // strictly redundant with this; that file is not owned by this task,
+        // and this flag makes the shell correct without it.
+        shell_local: true,
         open: openSettingsWindow,
     },
     {
@@ -175,6 +208,10 @@ export const APPS = [
         icon: SETTINGS_ICON,
         pinned: false,
         single_instance: true,
+        // Same reasoning as `settings`: whatever T4 lands runs in this
+        // bundle. If Preview ever grows a host-side dependency, this is the
+        // flag to clear.
+        shell_local: true,
         // See PREVIEW_PLACEHOLDER_NOTE above — replace this, not the entry.
         open: openPreviewPlaceholder,
     },
@@ -182,11 +219,16 @@ export const APPS = [
 
 /**
  * The `{id,label,svg,onClick}` shape `attach_app_drawer`'s `actions` array
- * expects (`../ui/app-drawer.js`) — built here, not in `desktop-window.js`,
- * because that file is outside this task's ownership. See
- * `PREVIEW_PLACEHOLDER_NOTE`'s sibling note above `SETTINGS_ICON` and this
- * task's report for why the actual wiring (one line inside
- * `desktop-window.js`'s `actions: [...]`) is not done here.
+ * expects (`../ui/app-drawer.js`).
+ *
+ * 🔴 NOT the mechanism the guarantee rests on — `launch()` below injects the
+ * button directly, because the `actions` array literal lives in
+ * `desktop-window.js`, outside this task's owned paths, and a change there
+ * would be discarded at merge. This export is the CLEAN seam for whoever does
+ * own that file: dropping `settingsDrawerAction(ctx)` into its `actions`
+ * array makes the declarative path the real one, and
+ * `ensureSettingsDrawerButton` detects the button already present and stands
+ * down. Neither path can produce two buttons.
  *
  * @param {object} ctx Passed through to `launch('settings', ctx)` unchanged.
  * @returns {{id: string, label: string, svg: string, onClick: () => void}}
@@ -195,10 +237,7 @@ export function settingsDrawerAction (ctx = {}) {
     return {
         id: 'settings',
         label: 'Settings',
-        svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
-            + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
-            + '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/>'
-            + '</svg>',
+        svg: SETTINGS_DRAWER_SVG,
         onClick: () => { void launch('settings', ctx); },
     };
 }
@@ -209,14 +248,22 @@ export function getApp (id) {
 }
 
 /**
- * The apps this boot may actually show: the intersection of what this file
- * knows how to draw and what the server said it can serve.
+ * The apps this boot may actually show: every shell-local app, plus the
+ * intersection of the HOSTED apps this file knows how to draw with the ones
+ * the server said it can serve.
  *
  * A payload with no `apps` array at all is treated as "the server did not
  * say", and we fall back to the full list rather than rendering an empty
  * taskbar — an older/rehydrated payload should degrade to the previous
  * behaviour, not to a shell with nothing in it. A payload that DOES carry an
- * `apps` array is authoritative, including when it is empty.
+ * `apps` array is authoritative about HOSTED apps, including when it is empty.
+ *
+ * 🔴 Order is preserved from `APPS`, which `boot.js` depends on: it opens
+ * `apps[0]` as the one window of the boot. `desktop` is first in `APPS` and
+ * so stays first here whenever it is served — adding shell-local entries
+ * cannot change which window a normal boot opens. (If `desktop` is NOT served,
+ * the boot now opens Settings instead of nothing at all, which is the right
+ * answer: the user's next move is to look at their computers.)
  *
  * @param {object|null} payload `window.__EZIL_BOOT__`
  * @returns {AppDescriptor[]}
@@ -229,14 +276,17 @@ export function resolve (payload) {
     }
 
     const ids = new Set(served.map(a => a?.id).filter(Boolean));
-    const allowed = APPS.filter(a => ids.has(a.id));
+    const allowed = APPS.filter(a => a.shell_local === true || ids.has(a.id));
 
     // Say so, loudly, in both directions. Either mismatch is a real bug in a
     // two-sided registry and neither is visible from the UI: a client-only
     // app is a button that fails, a server-only app is a capability nobody
-    // can reach.
+    // can reach. Shell-local apps are excluded from the first check by
+    // definition — the server is not expected to know about them.
     for ( const a of APPS ) {
-        if ( ! ids.has(a.id) ) console.warn(`[${PHASE}] "${a.id}" is not served by this deployment; hiding it`);
+        if ( a.shell_local !== true && ! ids.has(a.id) ) {
+            console.warn(`[${PHASE}] "${a.id}" is not served by this deployment; hiding it`);
+        }
     }
     for ( const id of ids ) {
         if ( ! getApp(id) ) console.warn(`[${PHASE}] server offers "${id}" but this shell cannot open it`);
@@ -267,7 +317,18 @@ export async function launch (id, ctx = {}) {
             // is harmless.
             console.info(`[${PHASE}] "${id}" is already open; restoring it`);
             $existing.showWindow();
-            return $existing.get(0);
+            const el_existing = $existing.get(0);
+            // Belt and braces: the first open already did this, but a window
+            // that somehow lost its button (a re-attached drawer, a rebuild)
+            // must not stay without one. Idempotent — see drawer-action.js.
+            if ( app.wants_settings_in_drawer && el_existing ) {
+                ensureSettingsDrawerButton(
+                    el_existing,
+                    () => { void launch('settings', ctx); },
+                    { expected: true },
+                );
+            }
+            return el_existing;
         }
     }
 
@@ -275,7 +336,27 @@ export async function launch (id, ctx = {}) {
         // The descriptor's own icon travels with the launch, so the window
         // head, the taskbar item and the control tray cannot show a different
         // image from the dock tile the user just clicked.
-        return await app.open({ ...ctx, icon: app.icon, appName: app.name });
+        const el_window = await app.open({ ...ctx, icon: app.icon, appName: app.name });
+
+        // 🔴 GUARANTEE #1. A window that hides the taskbar must carry its own
+        // way back to Settings, or deleting a broken computer becomes
+        // unreachable. Done HERE, after `open` resolves, because that is the
+        // first moment inside an owned file at which the drawer provably
+        // exists: `openDesktopWindow` attaches it synchronously
+        // (`desktop-window.js:474`) and returns at :523 with no `await`
+        // between the two. `ensureSettingsDrawerButton` is idempotent, so the
+        // "already open, just refocus" path above and a later rebuild both
+        // no-op. See `../ui/Settings/drawer-action.js` for why this is an
+        // injection rather than one line in that file's `actions` array.
+        if ( app.wants_settings_in_drawer && el_window ) {
+            ensureSettingsDrawerButton(
+                el_window,
+                () => { void launch('settings', ctx); },
+                { expected: true },
+            );
+        }
+
+        return el_window;
     } catch ( err ) {
         // A throwing `open` must not leave the caller (a taskbar click, a
         // Start press) believing something is on its way.
