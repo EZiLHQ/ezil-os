@@ -115,7 +115,54 @@ async function UITaskbar (options) {
         $('.desktop').addClass(`desktop-taskbar-position-${taskbar_position}`);
     }
 
-    $('.desktop').append(h);
+    // 🔴 ROOT CAUSE, not a z-index number: `.taskbar` used to be appended
+    // inside `.desktop`, and in `/os`'s real DOM `.desktop.ezil-desktop`
+    // (`shell/ezil/ui/ezil-shell.css`) sits inside `#ezil-os-root` — and BOTH
+    // of those are `position: fixed`. Per the CSS stacking spec (and MDN's
+    // "what creates a stacking context" list), `position: fixed` — unlike
+    // `relative`/`absolute` — creates a new stacking context UNCONDITIONALLY,
+    // even with `z-index: auto`. That is the one entry on that list this fork
+    // assumed away (see the now-stale comment this replaces, and the header
+    // comment on `#ezil-os-root` in ezil-shell.css: "A positioned element with
+    // z-index: auto does not create a stacking context" — true for
+    // relative/absolute, false for fixed/sticky).
+    //
+    // The effect: `#ezil-os-root` and `.desktop` each open their own stacking
+    // context with z-index:auto, which places their ENTIRE subtree — taskbar
+    // included — in the root context's "z-index:auto / 0" paint bucket. Every
+    // `.window` (UIWindow.js's `focusWindow`/`window_zindex_base`) gets an
+    // explicit POSITIVE z-index, which paints in the bucket ABOVE that one —
+    // always, regardless of how the two magnitudes compare. MEASURED: raising
+    // `.taskbar`'s own z-index to 2147483647 (CSS's max) still lost to a
+    // window at z-index 5, because 99999 vs 5 is a comparison the browser
+    // never makes — `.taskbar`'s 99999 only ever competes against its
+    // siblings INSIDE `.desktop`'s trapped stacking context, and `.desktop`'s
+    // whole context is beneath any positively-z-indexed sibling of
+    // `#ezil-os-root` at the root level. Escalating the number (this file
+    // used to have one at 99999, `style.css` has four more at 999999,
+    // 9999999, 999999999, 9999999999) cannot fix a bucket problem — it is
+    // exactly the "fighting it by escalation" this codebase already shows
+    // scars of.
+    //
+    // The fix is structural, not numeric: give the taskbar a stacking
+    // ancestor it does NOT share with the wallpaper. `.window` elements are
+    // appended straight to `<body>` (`UIWindow.js`'s `el_body`), which is
+    // `position: static` and creates no stacking context of its own, so its
+    // positioned children compete directly in the ROOT context. Appending
+    // `.taskbar` there too — instead of inside the fixed-position `.desktop`
+    // — puts it in the exact same bucket as every window, where its
+    // z-index actually means something again. `.desktop`'s OWN box (the
+    // wallpaper) is deliberately left where it is and deliberately NOT given
+    // a z-index bump of its own: it covers the full viewport, and promoting
+    // its stacking context would paint the wallpaper's background OVER every
+    // window instead of just raising the dock.
+    //
+    // Two selectors elsewhere assumed `.taskbar` lives inside `.desktop` in
+    // the DOM (a CSS descendant combinator in `style.css`'s hover rule, and a
+    // jQuery UI `tooltip({items})` selector in `UITaskbarItem.js`) — both
+    // rewritten alongside this to use `:has()` instead of nesting, so they
+    // keep the same truth value without depending on where `.taskbar` lives.
+    $('body').append(h);
 
     //---------------------------------------------
     // add `Start` to taskbar

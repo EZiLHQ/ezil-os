@@ -1315,6 +1315,35 @@ async function UIWindow (options) {
         }
     });
 
+    // 🔴 DEFECT B — click-to-focus. Upstream wires this document-globally in
+    // `UIDesktop.js`'s `initgui` (a `mousedown` listener that raises whatever
+    // window the click landed in); this fork ported `UIWindow.js` whole but
+    // only `UIDesktopFullpage.js` out of `UIDesktop.js` (see that file's own
+    // header), so the raise-on-click half never came along. `$.fn.focusWindow`
+    // itself is intact and reachable from every OTHER path (open, the
+    // taskbar, dblclick-to-maximize, the drag-over "dragster" timeout at
+    // ~L3910), but a plain, unmodified mousedown on a window's own titlebar
+    // or body left its z-index untouched — MEASURED: two windows at
+    // different z, a real click on either one's `.window-head` or
+    // `.window-body` did nothing.
+    //
+    // Bound on the head and the body specifically (not `el_window` as a
+    // whole), matching the brief and nothing more of `UIDesktop.js`. No
+    // `preventDefault()`/`stopPropagation()`, and no interference with
+    // `.draggable()`/`.resizable()`'s OWN mousedown handlers on these same
+    // elements (jQuery dispatches every bound handler; `focusWindow()` only
+    // reorders z-index and toggles `window-active`/iframe pointer-events, so
+    // a drag or a resize that starts on the same mousedown proceeds exactly
+    // as it did before this handler existed) or with native text selection
+    // inside the body (selection is a browser default action this handler
+    // never touches).
+    $(el_window_head).on('mousedown', function () {
+        $(el_window).focusWindow();
+    });
+    $(el_window_body).on('mousedown', function () {
+        $(el_window).focusWindow();
+    });
+
     // on_close event
     $(el_window).on('remove', function (e) {
         // if on_close callback is set, call it

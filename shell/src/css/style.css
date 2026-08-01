@@ -1496,7 +1496,15 @@ span.header-sort-icon img {
     margin-left: 25px;
     z-index: 999999999 !important;
 }
-.desktop:not(.desktop-selectable-active) .taskbar .taskbar-item:hover .taskbar-icon {
+/* 🔴 Was ".desktop:not(.desktop-selectable-active) .taskbar ..." — see
+ * `UITaskbar.js`'s comment on why `.taskbar` is now appended to `<body>`
+ * instead of inside `.desktop` (a `position: fixed` element unconditionally
+ * opens a stacking context, which was trapping the taskbar's z-index no
+ * matter how high it went — a stacking-context bug, not a z-index-number
+ * one). `:has()` keeps this rule's original truth value — "no
+ * `.desktop.desktop-selectable-active` exists" — without requiring `.taskbar`
+ * to be a DOM descendant of `.desktop`. */
+body:not(:has(.desktop.desktop-selectable-active)) .taskbar .taskbar-item:hover .taskbar-icon {
     background-color: rgb(255 255 255 / 40%);
     transition: background-color 0.2s;
 }
