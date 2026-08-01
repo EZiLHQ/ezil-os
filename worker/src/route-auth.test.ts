@@ -478,6 +478,173 @@ describe('GET /preview-status is no longer anonymous', () => {
   });
 });
 
+// ── POST /sandbox/:name/focus ────────────────────────────────────────────────
+// Mirrors the `DELETE /sandbox/:name` coverage above: same shared HMAC
+// envelope (`authorizeSignedControlRequest`), but with the additional
+// closed-enum `app` body field this route adds on top.
+
+describe('POST /sandbox/:name/focus is HMAC-gated with a closed-enum `app`', () => {
+  it('REJECTS an unsigned request with 401 and never execs', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus`, {
+        method: 'POST',
+        body: JSON.stringify({ app: 'vscode' }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+    expect(calls.exec).toBe(0);
+  });
+
+  it('ACCEPTS a signed request via `Authorization: Bearer` and execs neko-switch-app.sh vscode', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ app: 'vscode' }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(body.app).toBe('vscode');
+    expect(calls.exec).toBe(1);
+  });
+
+  it('ACCEPTS `chromium` too', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ app: 'chromium' }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    expect(calls.exec).toBe(1);
+  });
+
+  it('REJECTS an app outside the closed enum, even when properly signed', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ app: 'firefox' }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json() as { error: string }).error).toContain('invalid_focus_app');
+    expect(calls.exec).toBe(0);
+  });
+
+  it('REJECTS a shell-metacharacter injection attempt in `app`, even when properly signed', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ app: 'vscode; rm -rf /' }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(400);
+    expect(calls.exec).toBe(0);
+  });
+
+  it('ACCEPTS a signed request via `?token=` (the /preview-bootstrap precedent)', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const token = encodeURIComponent(await mintToken());
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus?token=${token}`, {
+        method: 'POST',
+        body: JSON.stringify({ app: 'vscode' }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    expect(calls.exec).toBe(1);
+  });
+
+  it('rejects a token signed with the WRONG secret', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken('a-different-secret')}` },
+        body: JSON.stringify({ app: 'vscode' }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+    expect(calls.exec).toBe(0);
+  });
+
+  it('the kill switch (SANDBOX_FOCUS=off) hard-disables the route with a 404, before auth runs', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ app: 'vscode' }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_FOCUS: 'off' },
+    );
+    expect(res.status).toBe(404);
+    expect(calls.exec).toBe(0);
+  });
+
+  it('still works keyless in local dev (no secret configured), unchanged', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus`, {
+        method: 'POST',
+        body: JSON.stringify({ app: 'vscode' }),
+      }),
+      { Sandbox: binding },
+    );
+    expect(res.status).toBe(200);
+    expect(calls.exec).toBe(1);
+  });
+
+  it('surfaces a non-zero exec exit code as a 500, not a false success', async () => {
+    // A one-off binding whose `exec` fails, rather than `fakeSandboxNamespace`'s
+    // always-succeeds fake — everything else routes through the same Proxy
+    // fallback that binding uses for RPCs this test doesn't care about.
+    const failingBinding = {
+      idFromName: (name: string) => ({ name }),
+      get: () =>
+        new Proxy(
+          {},
+          {
+            get(_t, prop) {
+              if (prop === 'exec') return async () => ({ exitCode: 1, stdout: '', stderr: 'no such display' });
+              if (typeof prop !== 'string' || prop === 'then') return undefined;
+              return async () => undefined;
+            },
+          },
+        ),
+    };
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ app: 'vscode' }),
+      }),
+      { Sandbox: failingBinding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { ok: boolean; error: string };
+    expect(body.ok).toBe(false);
+    expect(body.error).toContain('focus_switch_failed');
+  });
+});
+
 // ── Whole-surface guard ─────────────────────────────────────────────────────
 
 describe('no other mutating route is reachable unauthenticated', () => {
@@ -487,6 +654,7 @@ describe('no other mutating route is reachable unauthenticated', () => {
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/workspace-diag` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/cpu-diag` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/twen` },
+      { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus` },
       { method: 'POST', url: `https://api-desktop.ezil.org/project-files/put` },
       { method: 'POST', url: `https://api-desktop.ezil.org/project-files/delete` },
       { method: 'POST', url: `https://api-desktop.ezil.org/project-files/list` },
