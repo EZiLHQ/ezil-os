@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from 'next/server';
 
-import { Routes } from '@/utils/constants';
+import { Routes, safeReturnUrl } from '@/utils/constants';
 import { createClient } from '@/utils/supabase/server';
 
 /**
@@ -10,11 +10,19 @@ import { createClient } from '@/utils/supabase/server';
  * it for a session, then send the browser on to `returnUrl` (defaulting to
  * `/computers` — this app has no chat editor, so there is no alternate
  * landing destination to branch on).
+ *
+ * 🔴 This is a ROUTE HANDLER, so its 302 is a real HTTP redirect that the
+ * browser follows as a document load. That matters for `/os`, whose shell is
+ * a separate application delivered as `<script src>` tags and therefore only
+ * boots on a document load — see `login/actions.ts` and
+ * docs/PLATFORM-NOTES.md §17. Do not "modernise" this into a server action
+ * with `redirect()`; that would turn it into a client-side navigation and
+ * break the OAuth route into `/os`.
  */
 export async function GET(request: NextRequest) {
     const { searchParams, origin } = new URL(request.url);
     const code = searchParams.get('code');
-    const returnUrl = searchParams.get('returnUrl') || Routes.COMPUTERS;
+    const returnUrl = safeReturnUrl(searchParams.get('returnUrl'));
 
     if (code) {
         const supabase = await createClient();

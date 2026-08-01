@@ -14,6 +14,8 @@ const initialState: AuthActionResult = {};
 export function LoginForm({ returnUrl }: { returnUrl: string }) {
     const [mode, setMode] = useState<'sign-in' | 'sign-up'>('sign-in');
     const [signUpDone, setSignUpDone] = useState(false);
+    /** Set once we have started leaving; keeps the button from re-arming. */
+    const [leaving, setLeaving] = useState(false);
 
     const action = mode === 'sign-in' ? signInWithPassword : signUpWithPassword;
     const [state, formAction, isPending] = useActionState(async (
@@ -24,8 +26,32 @@ export function LoginForm({ returnUrl }: { returnUrl: string }) {
         if (mode === 'sign-up' && !result.error) {
             setSignUpDone(true);
         }
+        if (result.redirectTo) {
+            setLeaving(true);
+            /*
+             * 🔴 A DOCUMENT LOAD, deliberately — this is the whole point of
+             * the action returning a value instead of calling `redirect()`.
+             *
+             * `redirect()` from a server action is performed by Next's App
+             * Router as a client-side navigation. `/os` is the host document
+             * for a separate jQuery application delivered as `<script src>`
+             * tags, and a script element React inserts during a client-side
+             * navigation NEVER EXECUTES. The result is a page with the
+             * wallpaper on it and no OS behind it, forever. See
+             * `actions.ts`'s `signInWithPassword` and
+             * docs/PLATFORM-NOTES.md §17.
+             *
+             * `assign` rather than `replace` so Back still returns to the
+             * login page the user came from. The value is already narrowed to
+             * a same-origin path by `safeReturnUrl` on the server; it is not
+             * re-derived from anything the client controls.
+             */
+            window.location.assign(result.redirectTo);
+        }
         return result;
     }, initialState);
+
+    const busy = isPending || leaving;
 
     return (
         <div className="space-y-6">
@@ -86,10 +112,10 @@ export function LoginForm({ returnUrl }: { returnUrl: string }) {
                     {state.error && <p className="text-small text-red-400">{state.error}</p>}
                     <button
                         type="submit"
-                        disabled={isPending}
+                        disabled={busy}
                         className="w-full rounded-md bg-teal px-4 py-2.5 text-sm font-medium text-black transition-opacity hover:opacity-90 disabled:opacity-50"
                     >
-                        {isPending
+                        {busy
                             ? 'Please wait…'
                             : mode === 'sign-in'
                               ? 'Sign in'
