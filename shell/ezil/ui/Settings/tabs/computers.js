@@ -203,7 +203,11 @@ function render ($win) {
         html += rowHtml(slot, bySlot.get(slot));
     }
     $list.html(html);
-    $list.find('[data-role="rename-input"]').trigger('focus').trigger('select');
+    // `.trigger('select')` only fires the 'select' EVENT, not the browser's
+    // actual text-selection — that needs the native method, hence `.get(0)`.
+    const $renameInput = $list.find('[data-role="rename-input"]');
+    $renameInput.trigger('focus');
+    $renameInput.get(0)?.select();
 }
 
 async function load ($win) {
