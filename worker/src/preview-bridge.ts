@@ -59,9 +59,16 @@ import {
   verifyPreviewBootstrapToken,
   verifyPreviewCookie,
 } from './hmac';
-import { APP_PREVIEW_PORT, APP_PREVIEW_TOKEN } from './desktop-mode';
+import { APP_PREVIEW_PORT, APP_PREVIEW_TOKEN, CODE_PREVIEW_PORT, CODE_PREVIEW_TOKEN } from './desktop-mode';
 
 // ── Hostname parsing ─────────────────────────────────────────────────────────
+
+/**
+ * Which container-side surface a bridge hostname resolves to. `'app'` is the
+ * user's own dev server (`APP_PREVIEW_PORT`); `'code'` is code-server
+ * (`CODE_PREVIEW_PORT`) — see `desktop-mode.ts`'s doc comments for both.
+ */
+export type BridgeTarget = 'app' | 'code';
 
 /**
  * Parse `<port>-<sandboxId>-<token>.<rest>` the same way the SDK's own
@@ -70,29 +77,37 @@ import { APP_PREVIEW_PORT, APP_PREVIEW_TOKEN } from './desktop-mode';
  * of the subdomain, so a `sandboxId` that itself contains hyphens (this
  * Worker's `guac-<user>-<project>` ids always do) is parsed correctly.
  *
- * Returns the sandboxId only when the port AND token match the app-preview
- * constants (`APP_PREVIEW_PORT` / `APP_PREVIEW_TOKEN`) — any other exposed
- * port/token (desktop, guacamole) is intentionally NOT matched here; those
- * stay on the existing raw `proxyToSandbox` path, unchanged.
+ * Generalized (was `parseAppPreviewHost`, app-only) to also recognize the
+ * code-server bridge port/token, returning WHICH surface matched as `target`.
+ * Returns `null` for any other exposed port/token (desktop, guacamole) —
+ * those intentionally stay on the existing raw `proxyToSandbox` path,
+ * unchanged.
  */
-export function parseAppPreviewHost(hostname: string): { sandboxId: string } | null {
+export function parseBridgeHost(hostname: string): { sandboxId: string; target: BridgeTarget } | null {
   const dotIndex = hostname.indexOf('.');
   const subdomain = dotIndex === -1 ? hostname : hostname.slice(0, dotIndex);
 
   const firstHyphen = subdomain.indexOf('-');
   if (firstHyphen === -1) return null;
   const portStr = subdomain.slice(0, firstHyphen);
-  if (!/^\d{1,5}$/.test(portStr) || Number(portStr) !== APP_PREVIEW_PORT) return null;
+  if (!/^\d{1,5}$/.test(portStr)) return null;
+  const portNum = Number(portStr);
+
+  let target: BridgeTarget;
+  if (portNum === APP_PREVIEW_PORT) target = 'app';
+  else if (portNum === CODE_PREVIEW_PORT) target = 'code';
+  else return null;
 
   const rest = subdomain.slice(firstHyphen + 1);
   const lastHyphen = rest.lastIndexOf('-');
   if (lastHyphen === -1) return null;
   const sandboxId = rest.slice(0, lastHyphen);
   const token = rest.slice(lastHyphen + 1);
-  if (token !== APP_PREVIEW_TOKEN) return null;
+  const expectedToken = target === 'app' ? APP_PREVIEW_TOKEN : CODE_PREVIEW_TOKEN;
+  if (token !== expectedToken) return null;
   if (sandboxId.length === 0) return null;
 
-  return { sandboxId };
+  return { sandboxId, target };
 }
 
 // ── Response header rewriting ────────────────────────────────────────────────
@@ -118,23 +133,41 @@ const STRIP_RESPONSE_HEADERS = new Set([
 ]);
 
 /**
- * Rewrite a `Set-Cookie` value emitted by the dev server so it survives the
- * proxy hop: force `Path=/preview`, `SameSite=None`, `Secure`; drop any
+ * Rewrite a `Set-Cookie` value emitted by the upstream so it survives the
+ * proxy hop AND survives being read inside a cross-site iframe: force
+ * `Path=<cookiePath>`, `SameSite=None`, `Secure`, `Partitioned`; drop any
  * `Domain=` so the browser defaults to the proxy's own origin. Mirrors
- * `preview_bridge.py`'s `_rewrite_set_cookie`.
+ * `preview_bridge.py`'s `_rewrite_set_cookie`, plus two corrections.
+ *
+ * 1. `Partitioned` (CHIPS). This is the SAME gap `handlePreviewBootstrap`'s own
+ *    `ezil_preview` cookie had: a `SameSite=None` cookie with no `Partitioned`
+ *    is blocked outright by Chrome in a third-party iframe. Every upstream
+ *    cookie the previewed app or code-server sets went through here and was
+ *    forced to `SameSite=None` without it, so app session/CSRF cookies would
+ *    have silently vanished the moment the shell embedded the window
+ *    cross-site — the same invisible failure, one layer down. Valid to add
+ *    unconditionally here: `Partitioned` requires `Secure` (forced below) and
+ *    is invalid with `Domain=` (dropped above).
+ *
+ * 2. `cookiePath`. `/preview` is right for the app-preview host, where the
+ *    proxy really is mounted under `/preview`. It is WRONG for the code-server
+ *    host, which is served from `/` (see `handleCodeBridge`) — a cookie pinned
+ *    to `/preview` there would never be sent back on any root-absolute
+ *    code-server request, i.e. silently dropped.
  */
-export function rewriteSetCookie(value: string): string {
+export function rewriteSetCookie(value: string, cookiePath: string = '/preview'): string {
   const parts = value.split(';').map((p) => p.trim()).filter(Boolean);
   if (parts.length === 0) return value;
   const rebuilt: string[] = [parts[0] as string];
   let sawPath = false;
   let sawSameSite = false;
   let sawSecure = false;
+  let sawPartitioned = false;
   for (const p of parts.slice(1)) {
     const lower = p.toLowerCase();
     if (lower.startsWith('domain=')) continue;
     if (lower.startsWith('path=')) {
-      rebuilt.push('Path=/preview');
+      rebuilt.push(`Path=${cookiePath}`);
       sawPath = true;
       continue;
     }
@@ -148,11 +181,17 @@ export function rewriteSetCookie(value: string): string {
       sawSecure = true;
       continue;
     }
+    if (lower === 'partitioned') {
+      rebuilt.push('Partitioned');
+      sawPartitioned = true;
+      continue;
+    }
     rebuilt.push(p);
   }
-  if (!sawPath) rebuilt.push('Path=/preview');
+  if (!sawPath) rebuilt.push(`Path=${cookiePath}`);
   if (!sawSameSite) rebuilt.push('SameSite=None');
   if (!sawSecure) rebuilt.push('Secure');
+  if (!sawPartitioned) rebuilt.push('Partitioned');
   return rebuilt.join('; ');
 }
 
@@ -175,8 +214,12 @@ export function stripFrameAncestors(value: string): string | null {
  * Copy upstream response headers, applying the same rewrites as
  * `preview_bridge.py`'s `_rewrite_response_headers`: drop hop-by-hop and
  * frame-blocking headers, strip CSP `frame-ancestors`, rewrite `Set-Cookie`.
+ *
+ * `cookiePath` is the `Path=` every rewritten upstream cookie is pinned to —
+ * `/preview` for the app-preview host, `/` for the code-server host, which is
+ * served from the root (see `rewriteSetCookie`).
  */
-export function rewriteResponseHeaders(upstream: Headers): Headers {
+export function rewriteResponseHeaders(upstream: Headers, cookiePath: string = '/preview'): Headers {
   const out = new Headers();
   upstream.forEach((value, key) => {
     const lower = key.toLowerCase();
@@ -187,7 +230,7 @@ export function rewriteResponseHeaders(upstream: Headers): Headers {
       return;
     }
     if (lower === 'set-cookie') {
-      out.append(key, rewriteSetCookie(value));
+      out.append(key, rewriteSetCookie(value, cookiePath));
       return;
     }
     out.append(key, value);
@@ -195,23 +238,107 @@ export function rewriteResponseHeaders(upstream: Headers): Headers {
   return out;
 }
 
+// ── Query-param fallback for the `ezil_preview` cookie (CHIPS / 3p-cookie gap) ──
+//
+// Root cause this fixes: `handlePreviewBootstrap` sets `ezil_preview` with
+// `SameSite=None` (needed because the preview host is a DIFFERENT origin than
+// whatever site embeds it in an iframe — a genuinely third-party context).
+// Chrome's CHIPS proposal blocks a `SameSite=None` cookie from being usable in
+// a third-party iframe UNLESS it is also `Partitioned` (see the `Partitioned`
+// attribute added to `handlePreviewBootstrap` below); Firefox partitions it
+// automatically; Safari's ITP blocks third-party cookies outright and does not
+// implement CHIPS/`Partitioned` at all — no cookie attribute makes it stick
+// there. In every one of these failure modes the symptom is IDENTICAL and
+// silent: the bootstrap 302 succeeds, the browser never persists (or never
+// sends) the cookie, and every subsequent `/preview/*` request 401s — the
+// window just looks broken, with nothing in the response body to explain why.
+//
+// This query param is the fallback: `handlePreviewBootstrap` mints the SAME
+// cookie value and embeds it here on the redirect `Location`, so the very
+// first `/preview/<path>` request succeeds even in a browser that drops the
+// cookie outright. `RUNTIME_SHIM` (below) then propagates it onto same-origin
+// `fetch`/`XMLHttpRequest`/HMR-`WebSocket` calls the previewed page makes
+// client-side, so SPA navigation/asset-fetching keeps working without a
+// cookie for the lifetime of that page load. It is verified with the exact
+// same `verifyPreviewCookie` the cookie itself uses — same value shape, same
+// HMAC, same sandboxId binding — so it carries no weaker guarantee than the
+// cookie it stands in for. Always stripped before forwarding to the upstream
+// dev server so the app itself never sees this internal auth parameter.
+//
+// Declared here (before `RUNTIME_SHIM`, which embeds it verbatim into the
+// injected client-side script via `JSON.stringify`) rather than down with
+// `resolvePreviewAuth`/`stripPreviewQueryParam` below — `RUNTIME_SHIM`'s
+// initializer runs at module-load time, top-to-bottom, so referencing a
+// `const` declared later in the file would throw `ReferenceError` (temporal
+// dead zone) the instant this module is imported, breaking every route.
+export const PREVIEW_COOKIE_QUERY_PARAM = 'ezil_pv';
+
 // ── HTML shim injection ──────────────────────────────────────────────────────
 
 /**
  * Runtime shim injected into every HTML response. Rewrites the Next.js/Vite
- * HMR WebSocket URL to flow through `/preview-ws/...`, and loads the inspector
- * script. Ported verbatim (semantics-preserving) from `preview_bridge.py`'s
- * `_RUNTIME_SHIM`.
+ * HMR WebSocket URL to flow through `/preview-ws/...`, loads the inspector
+ * script, and — when the current page was reached via the `ezil_pv`
+ * query-param fallback (see `PREVIEW_COOKIE_QUERY_PARAM`'s module doc in this
+ * file: the `ezil_preview` cookie a browser dropped outright, e.g. Safari
+ * ITP) — propagates that same fallback value onto same-origin
+ * `fetch`/`XMLHttpRequest`/WebSocket calls the page makes itself, so
+ * client-side navigation and asset/data fetching keep working for the
+ * lifetime of that page load without ever needing the cookie. No-op (reads
+ * `null`, patches nothing) when the page was reached normally with a working
+ * cookie — this never changes behavior for the common case. Ported verbatim
+ * (semantics-preserving) from `preview_bridge.py`'s `_RUNTIME_SHIM`, plus the
+ * fallback-propagation addition.
  */
 export const RUNTIME_SHIM = `
 <script>
 (function () {
+  var FALLBACK_PARAM = ${JSON.stringify(PREVIEW_COOKIE_QUERY_PARAM)};
+  var fallbackValue = null;
+  try {
+    fallbackValue = new URLSearchParams(window.location.search).get(FALLBACK_PARAM);
+  } catch (e) { fallbackValue = null; }
+
+  if (fallbackValue) {
+    var origFetch = window.fetch;
+    if (origFetch) {
+      window.fetch = function (input, init) {
+        try {
+          var reqUrl = (typeof Request !== 'undefined' && input instanceof Request) ? input.url : input;
+          var u = new URL(reqUrl, window.location.href);
+          if (u.host === window.location.host && !u.searchParams.has(FALLBACK_PARAM)) {
+            u.searchParams.set(FALLBACK_PARAM, fallbackValue);
+            input = (typeof Request !== 'undefined' && input instanceof Request) ? new Request(u.toString(), input) : u.toString();
+          }
+        } catch (e) { /* fall through with original input */ }
+        return origFetch.call(this, input, init);
+      };
+    }
+
+    if (typeof XMLHttpRequest !== 'undefined') {
+      var origOpen = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function (method, reqUrl) {
+        try {
+          var u = new URL(reqUrl, window.location.href);
+          if (u.host === window.location.host && !u.searchParams.has(FALLBACK_PARAM)) {
+            u.searchParams.set(FALLBACK_PARAM, fallbackValue);
+            reqUrl = u.toString();
+          }
+        } catch (e) { /* fall through with original url */ }
+        var rest = Array.prototype.slice.call(arguments, 2);
+        return origOpen.apply(this, [method, reqUrl].concat(rest));
+      };
+    }
+  }
+
   var origWS = window.WebSocket;
   window.WebSocket = function (url, protocols) {
     try {
       var u = new URL(url, window.location.href);
+      var sameOrigin = u.host === window.location.host;
+      var changed = false;
       if (
-        u.host === window.location.host &&
+        sameOrigin &&
         (u.pathname.indexOf('/_next/') === 0 ||
          u.pathname.indexOf('/__nextjs') === 0 ||
          u.pathname.indexOf('/_next/turbopack') === 0 ||
@@ -220,8 +347,13 @@ export const RUNTIME_SHIM = `
          u.pathname.indexOf('/__webpack_hmr') === 0)
       ) {
         u.pathname = '/preview-ws' + u.pathname;
-        url = u.toString();
+        changed = true;
       }
+      if (fallbackValue && sameOrigin && !u.searchParams.has(FALLBACK_PARAM)) {
+        u.searchParams.set(FALLBACK_PARAM, fallbackValue);
+        changed = true;
+      }
+      if (changed) url = u.toString();
     } catch (e) { /* fall through with original url */ }
     return protocols ? new origWS(url, protocols) : new origWS(url);
   };
@@ -478,6 +610,39 @@ export function stripPreviewCookie(cookieHeader: string | null): string | undefi
   return kept.length > 0 ? kept.join('; ') : undefined;
 }
 
+// ── Query-param fallback for the `ezil_preview` cookie ──────────────────────
+// `PREVIEW_COOKIE_QUERY_PARAM` is declared up near `RUNTIME_SHIM` (see the
+// doc comment there for why, and for the full failure mode this closes).
+
+/**
+ * Resolve preview auth from a request: the `ezil_preview` cookie if present
+ * and valid, else the `?ezil_pv=` query-string fallback. Cookie takes
+ * precedence when both are present and valid — the fallback exists only for
+ * the browsers/paths that never had a cookie to begin with.
+ */
+export async function resolvePreviewAuth(
+  request: Request,
+  url: URL,
+  secrets: string[],
+  sandboxId: string,
+): Promise<boolean> {
+  const cookie = readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME);
+  if (await verifyPreviewCookie(cookie, secrets, sandboxId)) return true;
+  const fallback = url.searchParams.get(PREVIEW_COOKIE_QUERY_PARAM) ?? undefined;
+  if (!fallback) return false;
+  return verifyPreviewCookie(fallback, secrets, sandboxId);
+}
+
+/** Strip the `ezil_pv` fallback query param before forwarding a request upstream. */
+export function stripPreviewQueryParam(search: string): string {
+  if (!search) return search;
+  const params = new URLSearchParams(search);
+  if (!params.has(PREVIEW_COOKIE_QUERY_PARAM)) return search;
+  params.delete(PREVIEW_COOKIE_QUERY_PARAM);
+  const rebuilt = params.toString();
+  return rebuilt ? `?${rebuilt}` : '';
+}
+
 // ── Container fetch — minimal structural interface (mockable in tests) ──────
 
 /** The one method this module needs from `Sandbox<unknown>` — kept minimal so tests can fake it. */
@@ -513,17 +678,36 @@ export async function handlePreviewBootstrap(
 
   let destPath = url.searchParams.get('path') || '/';
   if (!destPath.startsWith('/')) destPath = `/${destPath}`;
-  const location = `/preview${destPath}`;
 
   const cookie = await mintPreviewCookie(cookieSecret, sandboxId);
+  // `Partitioned` (CHIPS) is what lets Chrome/Edge actually send this
+  // `SameSite=None` cookie back on a third-party-iframe request at all —
+  // without it, current/upcoming Chrome versions block the cookie outright
+  // for a cross-site embed, not just "don't partition it". Firefox partitions
+  // automatically regardless. Safari implements neither CHIPS nor
+  // `SameSite=None` third-party cookies, so `Partitioned` is a no-op there —
+  // that gap is exactly what `PREVIEW_COOKIE_QUERY_PARAM` below covers. See
+  // the module doc above `PREVIEW_COOKIE_QUERY_PARAM` for the full failure
+  // mode this closes.
   const cookieAttrs = [
     `${PREVIEW_COOKIE_NAME}=${cookie}`,
     `Max-Age=${PREVIEW_COOKIE_TTL_S}`,
     'HttpOnly',
     'Secure',
     'SameSite=None',
+    'Partitioned',
     'Path=/',
   ].join('; ');
+
+  // Belt-and-suspenders: embed the SAME cookie value as a `?ezil_pv=` query
+  // param on the redirect target, so the very first `/preview/<path>`
+  // request succeeds even in a browser that drops the `Set-Cookie` above
+  // entirely (Safari ITP) — see `resolvePreviewAuth`. `RUNTIME_SHIM` then
+  // carries it forward onto same-origin client-side requests for the rest of
+  // that page load.
+  const locationUrl = new URL(`/preview${destPath}`, url);
+  locationUrl.searchParams.set(PREVIEW_COOKIE_QUERY_PARAM, cookie);
+  const location = `${locationUrl.pathname}${locationUrl.search}`;
 
   return new Response(null, {
     status: 302,
@@ -537,11 +721,24 @@ export async function handlePreviewBootstrap(
 // ── /preview and /preview/<path> ─────────────────────────────────────────────
 
 /**
- * Cookie-gate + reverse-proxy an HTTP request into the container's dev server.
- * `containerFetch` reaches the port directly — it does NOT require the port
- * to have been registered via `exposePort()` (that's a separate, orthogonal
- * public-hostname registration; see the deviation note in the report re:
- * "expose the application port").
+ * Cookie-gate + reverse-proxy an HTTP request into the container's dev server
+ * (`target: 'app'`) or code-server (`target: 'code'`). `containerFetch`
+ * reaches the port directly — it does NOT require the port to have been
+ * registered via `exposePort()` (that's a separate, orthogonal public-hostname
+ * registration; see the deviation note in the report re: "expose the
+ * application port").
+ *
+ * `port`/`target` default to the original app-preview values so every
+ * pre-existing call site (and its tests) keeps working unchanged.
+ *
+ * `target === 'code'` NEVER gets `RUNTIME_SHIM` injected, even for an
+ * `text/html` response: the shim monkey-patches `window.WebSocket` to rewrite
+ * Next.js/Vite HMR paths through `/preview-ws/...`, and code-server's own
+ * WebSocket traffic (extension host, integrated terminal, editor sync) is NOT
+ * an HMR channel — rewriting/wrapping it breaks the extension host
+ * immediately and silently (it just never connects). This is a known, narrow
+ * landmine: keep this check target-based, never port-based or content-type
+ * heuristic-based, so it can't regress if the ports are ever renumbered.
  */
 export async function handlePreviewProxy(
   request: Request,
@@ -549,9 +746,11 @@ export async function handlePreviewProxy(
   sandboxId: string,
   secrets: string[],
   appPath: string,
+  port: number = APP_PREVIEW_PORT,
+  target: BridgeTarget = 'app',
 ): Promise<Response> {
-  const cookie = readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME);
-  const authorized = await verifyPreviewCookie(cookie, secrets, sandboxId);
+  const url = new URL(request.url);
+  const authorized = await resolvePreviewAuth(request, url, secrets, sandboxId);
   if (!authorized) {
     return new Response(
       JSON.stringify({ ok: false, error: 'preview_cookie_missing_or_invalid: re-fetch /preview-bootstrap' }),
@@ -559,9 +758,9 @@ export async function handlePreviewProxy(
     );
   }
 
-  const url = new URL(request.url);
   const targetPath = `/${appPath.replace(/^\/+/, '')}`;
-  const targetUrl = `http://127.0.0.1:${APP_PREVIEW_PORT}${targetPath}${url.search}`;
+  const forwardSearch = stripPreviewQueryParam(url.search);
+  const targetUrl = `http://127.0.0.1:${port}${targetPath}${forwardSearch}`;
 
   const forwardHeaders = new Headers(request.headers);
   forwardHeaders.delete('host');
@@ -580,20 +779,22 @@ export async function handlePreviewProxy(
 
   let upstream: Response;
   try {
-    upstream = await sandbox.containerFetch(targetUrl, init, APP_PREVIEW_PORT);
+    upstream = await sandbox.containerFetch(targetUrl, init, port);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     // Connection-refused / not-yet-listening is the common case — surface the
     // explicit "waiting for dev server" diagnostic rather than a hard 502.
-    return buildDiagnosticResponse('port_not_listening', APP_PREVIEW_PORT, message);
+    return buildDiagnosticResponse('port_not_listening', port, message);
   }
 
   const contentType = upstream.headers.get('content-type') ?? '';
-  const outHeaders = rewriteResponseHeaders(upstream.headers);
+  // code-server is served from `/` on its own bridge host, not from
+  // `/preview` — pinning its cookies to `/preview` would silently drop them.
+  const outHeaders = rewriteResponseHeaders(upstream.headers, target === 'code' ? '/' : '/preview');
 
   if (contentType.includes('text/html')) {
     const bodyText = await upstream.text();
-    const injected = injectRuntimeShim(bodyText);
+    const injected = target === 'code' ? bodyText : injectRuntimeShim(bodyText);
     outHeaders.set('cache-control', 'no-cache, no-store');
     return new Response(injected, { status: upstream.status, headers: outHeaders });
   }
@@ -608,8 +809,7 @@ export async function handlePreviewInspectorJs(
   sandboxId: string,
   secrets: string[],
 ): Promise<Response> {
-  const cookie = readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME);
-  const authorized = await verifyPreviewCookie(cookie, secrets, sandboxId);
+  const authorized = await resolvePreviewAuth(request, new URL(request.url), secrets, sandboxId);
   if (!authorized) {
     return new Response(
       JSON.stringify({ ok: false, error: 'preview_cookie_missing_or_invalid: re-fetch /preview-bootstrap' }),
@@ -710,16 +910,17 @@ export async function handlePreviewWsProxy(
   sandboxId: string,
   secrets: string[],
   appPath: string,
+  port: number = APP_PREVIEW_PORT,
 ): Promise<Response> {
-  const cookie = readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME);
-  const authorized = await verifyPreviewCookie(cookie, secrets, sandboxId);
+  const url = new URL(request.url);
+  const authorized = await resolvePreviewAuth(request, url, secrets, sandboxId);
   if (!authorized) {
     return new Response('invalid preview cookie', { status: 401 });
   }
 
-  const url = new URL(request.url);
   const targetPath = `/${appPath.replace(/^\/+/, '')}`;
-  const targetUrl = `http://127.0.0.1:${APP_PREVIEW_PORT}${targetPath}${url.search}`;
+  const forwardSearch = stripPreviewQueryParam(url.search);
+  const targetUrl = `http://127.0.0.1:${port}${targetPath}${forwardSearch}`;
 
   const forwardHeaders = new Headers(request.headers);
   forwardHeaders.delete('host');
@@ -734,7 +935,7 @@ export async function handlePreviewWsProxy(
     upstream = await sandbox.containerFetch(
       targetUrl,
       { method: request.method, headers: forwardHeaders },
-      APP_PREVIEW_PORT,
+      port,
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

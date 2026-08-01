@@ -110,11 +110,13 @@ SANDBOX_NEKO_ICE_POLICY = "relay"
 # unused for this feature.
 #
 # `worker/src/index.test.ts`'s drift-guard tests assert `PREVIEW_ZONE_ROOT` in
-# `index.ts` and every token (`desktop`/`nekodesktop`/`app`) from
-# `desktop-mode.ts`'s `portFor`/`appPortFor` has a matching route pattern here
-# — so an accidentally-dropped route (or a newly added exposed-port token with
-# no matching route) fails the build loudly instead of silently 404ing in
-# production.
+# `index.ts` and every token (`desktop`/`nekodesktop`/`app`/`code`) from
+# `desktop-mode.ts`'s `portFor`/`appPortFor`/`codePortFor` has a matching route
+# pattern here — and, in the other direction, that no route here binds a token
+# the Worker cannot mint. So an accidentally-dropped route, a newly added
+# exposed-port token with no matching route, and a stale orphan route all fail
+# the build loudly instead of silently 404ing (or silently shadowing something)
+# in production.
 [[routes]]
 pattern = "*-app.ezil.org/*"
 zone_name = "ezil.org"
@@ -125,6 +127,20 @@ zone_name = "ezil.org"
 
 [[routes]]
 pattern = "*-nekodesktop.ezil.org/*"
+zone_name = "ezil.org"
+
+# `*-code.ezil.org/*` — the code-server (VS Code Web) bridge host,
+# `<CODE_PREVIEW_PORT>-<sandboxId>-code.ezil.org` (`desktop-mode.ts`'s
+# `codePortFor`, port 8443). Same narrow-suffix, most-specific-wins rationale
+# as the three routes above: it matches ONLY hosts literally ending in `-code`
+# before `.ezil.org`, so `sandbox.ezil.org` / `neko.ezil.org` and the existing
+# `*.ezil.org/*` binding on the legacy `cf-guacamole-sandbox` Worker are
+# untouched. Every request on this host is answered by `handleCodeBridge`
+# (`src/index.ts`) behind the `ezil_preview` cookie / `ezil_pv` gate — it never
+# falls through to `proxyToSandbox`'s raw forward, which matters more here than
+# anywhere else because code-server runs `--auth none` inside the container.
+[[routes]]
+pattern = "*-code.ezil.org/*"
 zone_name = "ezil.org"
 
 # HMAC secret for authenticating EBuilder → Worker calls.
