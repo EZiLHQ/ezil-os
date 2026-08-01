@@ -7,9 +7,12 @@ import {
     APP_PREVIEW_PORT,
     APP_PREVIEW_TOKEN,
     classifyWorkerHttpFailure,
+    CODE_PREVIEW_PORT,
+    CODE_PREVIEW_TOKEN,
     composeAppPreviewBootstrapUrl,
     composeAppPreviewOrigin,
     composeBrowserDesktopUrl,
+    composeCodePreviewOrigin,
     deriveNekoAdminValue,
     enableImplicitHosting,
     isRetryablePreviewErrorCode,
@@ -614,6 +617,33 @@ describe('composeAppPreviewOrigin — derives the app-preview hostname from the 
 
     it('returns null for a hostname with no label to strip', () => {
         expect(composeAppPreviewOrigin('https://localhost/', 'guac-a-b')).toBeNull();
+    });
+});
+
+describe('composeCodePreviewOrigin — the code-server counterpart of composeAppPreviewOrigin', () => {
+    it('mirrors the ${CODE_PREVIEW_PORT}-${sandboxId}-${CODE_PREVIEW_TOKEN} hostname pattern', () => {
+        const origin = composeCodePreviewOrigin('https://8181-guac-abc-def-nekodesktop.ezil.org/', 'guac-abc-def');
+        expect(origin).toBe(`https://${CODE_PREVIEW_PORT}-guac-abc-def-${CODE_PREVIEW_TOKEN}.ezil.org`);
+    });
+
+    it('uses the code label, not the app label — the two bridges must never collide', () => {
+        const origin = composeCodePreviewOrigin('https://8181-guac-a-b-nekodesktop.ezil.org/', 'guac-a-b');
+        expect(origin).toContain('-code.');
+        expect(origin).not.toContain('-app.');
+        expect(CODE_PREVIEW_PORT).not.toBe(APP_PREVIEW_PORT);
+    });
+
+    it('preserves protocol and local-dev port, same as composeAppPreviewOrigin', () => {
+        const origin = composeCodePreviewOrigin('http://8181-guac-a-b-nekodesktop.localhost:8787/', 'guac-a-b');
+        expect(origin).toBe(`http://${CODE_PREVIEW_PORT}-guac-a-b-${CODE_PREVIEW_TOKEN}.localhost:8787`);
+    });
+
+    it('returns null for an unparseable guacamoleUrl, never throws', () => {
+        expect(composeCodePreviewOrigin('not a url', 'guac-a-b')).toBeNull();
+    });
+
+    it('returns null for a hostname with no label to strip', () => {
+        expect(composeCodePreviewOrigin('https://localhost/', 'guac-a-b')).toBeNull();
     });
 });
 

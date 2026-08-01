@@ -56,6 +56,13 @@ export const SHELL_API_ROUTES = {
      */
     previewUrl: '/api/shell/preview-url',
     /**
+     * POST = mint a fresh code-server window URL (a 5-minute-TTL bootstrap
+     * token). Same call-per-window-open, refetch-while-open rules as
+     * `previewUrl` above — see `cloudflareGuacamole.codePreviewUrl`'s doc
+     * comment. MODIFIED BY EZIL 2026-08-01 (T7).
+     */
+    codePreviewUrl: '/api/shell/code-preview-url',
+    /**
      * POST = foreground an app inside the container's X session
      * (`{ computerId, app }`). The shell's in-stream switcher FEATURE-DETECTS
      * this key: `shell/ezil/apps/desktop-window.js` reads
