@@ -48,6 +48,7 @@ import {
     mintAppPreviewBootstrapToken,
     newCorrelationId,
     probeDesktopFrame,
+    readWorkerBridgeUrl,
     requestGuacamoleFocusApp,
     requestGuacamolePreview,
     requestGuacamoleSandboxTerminate,
@@ -354,6 +355,48 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     ok: false as const,
                     error: result.appPreviewExpose.error ?? 'app_preview_expose_failed',
                     errorCode: 'app_preview_unavailable' as const,
+                    provider: 'cloudflare-guacamole' as const,
+                };
+            }
+
+            // 🔴 PREFER THE WORKER'S OWN COMPOSED URL, and read `null` vs
+            // `undefined` as the Worker means them.
+            //
+            // `handlePreview` now composes the whole
+            // `…/preview-bootstrap?token=…` URL from the hostname
+            // `exposePreviewPort` ACTUALLY produced, so it cannot disagree
+            // with the Worker's per-request zone-collapse decision the way a
+            // second implementation over here can. It also documents the
+            // three-state field deliberately:
+            //
+            //   string     — use it verbatim;
+            //   null       — this Worker knows about the field and is saying
+            //                the port is NOT exposed. That is a real negative,
+            //                and composing our own URL to paper over it would
+            //                hand the user a window that cannot load;
+            //   undefined  — the Worker predates the field. App and Worker are
+            //                separate deploy targets, so this is a real state
+            //                and not a hypothetical: fall back to composing
+            //                the URL here, exactly as before.
+            const verdict = readWorkerBridgeUrl(result.appPreviewUrl);
+            if (verdict.kind === 'refuse') {
+                console.error('[cloudflareGuacamole.appPreviewUrl] worker reports the app-preview port is not exposed', {
+                    correlationId,
+                    computerId: input.computerId,
+                });
+                return {
+                    ok: false as const,
+                    error: 'app_preview_port_not_exposed',
+                    errorCode: 'app_preview_unavailable' as const,
+                    provider: 'cloudflare-guacamole' as const,
+                };
+            }
+            if (verdict.kind === 'use') {
+                return {
+                    ok: true as const,
+                    correlationId,
+                    appPreviewUrl: verdict.url,
+                    expiresAt: Date.now() + APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
                     provider: 'cloudflare-guacamole' as const,
                 };
             }

@@ -51,6 +51,7 @@ import {
     APP_PREVIEW_TOKEN,
     isOwnDesktopOrigin,
     probeDesktopFrame,
+    readWorkerBridgeUrl,
     type DesktopFrameProbe,
 } from './cloudflare-guacamole-provider';
 
@@ -325,5 +326,66 @@ describe('isOwnDesktopOrigin — the bridge origins are inside the pin, and fore
         ]) {
             expect(isOwnDesktopOrigin(WORKER_HOST, SANDBOX, target)).toBe(false);
         }
+    });
+});
+
+/**
+ * THE FIELD-NAMING RECONCILIATION between the app and the Worker.
+ *
+ * The app-API task typed `appPreviewExpose` and composed the bootstrap URL
+ * itself, flagging in its report that it could not see the Worker task's final
+ * shape. The Worker task then landed `appPreviewUrl` / `codePreviewUrl` —
+ * fully composed URLs — and documented `null` vs omitted as load-bearing:
+ * "`null` (never omitted) when the corresponding port wasn't exposed, so the
+ * caller can tell 'not available' from 'field doesn't exist yet'".
+ *
+ * Nothing on the app side read either field, so there were two independent
+ * implementations of one wire format and no test that they agreed.
+ */
+describe('readWorkerBridgeUrl — the Worker’s three-state answer, read as three states', () => {
+    it('a composed URL is used verbatim', () => {
+        const url = 'https://3002-guac-a-b-app.ezil.org/preview-bootstrap?token=t=1,v1=a';
+        expect(readWorkerBridgeUrl(url)).toEqual({ kind: 'use', url });
+    });
+
+    it('🔴 `null` is a REAL NEGATIVE — the port is not exposed, do not paper over it', () => {
+        // Collapsing this into `compose` hands the user a URL for a port that
+        // is not exposed: a window that loads nothing, with no error to show.
+        expect(readWorkerBridgeUrl(null)).toEqual({ kind: 'refuse' });
+        expect(readWorkerBridgeUrl('')).toEqual({ kind: 'refuse' });
+    });
+
+    it('🔴 `undefined` means an OLDER WORKER — fall back, never refuse', () => {
+        // Collapsing this into `refuse` breaks every preview against a Worker
+        // deployed before the field existed. App and Worker are separate
+        // deploy targets, so that is routine during a rollout.
+        expect(readWorkerBridgeUrl(undefined)).toEqual({ kind: 'compose' });
+    });
+
+    it('the two absent-ish values are NOT the same answer', () => {
+        expect(readWorkerBridgeUrl(null)).not.toEqual(readWorkerBridgeUrl(undefined));
+    });
+});
+
+/**
+ * A drift guard over the actual Worker source: if `handlePreview` ever starts
+ * OMITTING the field instead of sending `null`, the distinction above becomes
+ * unobservable and every "not exposed" silently becomes "old Worker".
+ */
+describe('the Worker really does emit appPreviewUrl as string|null, never omitted', () => {
+    it('handlePreview builds and returns both bridge URLs', async () => {
+        const { readFileSync } = await import('node:fs');
+        const { fileURLToPath } = await import('node:url');
+        const src = readFileSync(
+            fileURLToPath(new URL('../../../../worker/src/index.ts', import.meta.url)),
+            'utf8',
+        );
+        // `buildBridgeUrl` returns `Promise<string | null>` and both fields are
+        // assigned from it unconditionally, then included in the response.
+        expect(src).toMatch(/buildBridgeUrl\s*=\s*async\s*\([^)]*\):\s*Promise<string \| null>/);
+        expect(src).toMatch(/const appPreviewUrl = await buildBridgeUrl\(appPreviewExpose\)/);
+        expect(src).toMatch(/const codePreviewUrl = await buildBridgeUrl\(codePreviewExpose\)/);
+        expect(src).toMatch(/^\s*appPreviewUrl,\s*$/m);
+        expect(src).toMatch(/^\s*codePreviewUrl,\s*$/m);
     });
 });
