@@ -838,6 +838,67 @@ async function runViewport (vp) {
     }
 
     /**
+     * 🔴 GAP 3 FOLLOW-UP (round 8's verifier: "nw and e resize checks: 100%
+     * SKIP, every viewport, every run"). Root cause, found by instrumenting
+     * jQuery UI's own `resizestart`/`resize`/`resizestop` events on the live
+     * target: dragging ANY resize handle — `se`, `nw`, and plain `e` all
+     * independently confirmed, on a FRESH window each time — drives the
+     * window's `height` to a large NEGATIVE `ui.size.height` (CSS then clamps
+     * the rendered box to 0). It reproduces on the very first direction tried
+     * and has nothing to do with which direction that is; MEASURED via a
+     * `resizestart/resize/resizestop` listener attached before the drag:
+     * `{"type":"resize","size":{"w":764,"h":-149},...}` on a window whose
+     * `top` was still its DEFAULT cascade value,
+     * `calc(15% + Npx)` (`default_window_top`, UIWindow.js ~L86) — never
+     * dragged into a plain-pixel position. `-149` is exactly that window's
+     * own `top` in px, which is the fingerprint of jQuery reading a CSS
+     * `calc()` string back through `.css('top')`/`.position()` where it
+     * expects a number.
+     *
+     * Because the three-direction loop below reuses ONE window instance
+     * sequentially, whichever direction runs FIRST corrupts it (collapses to
+     * height 0) and every direction after that finds a degenerate window and
+     * SKIPs — a skip that reads as "not applicable" when the real story is
+     * "already broken by the test's own prior step". `['se','nw','e']` order
+     * meant `se` always ran on the one clean window and always looked like a
+     * PASS (its own assertion only checked "some dimension changed by
+     * >1px", which a collapse to a negative height satisfies), while `nw`
+     * and `e` never got a fresh window to test at all.
+     *
+     * The fix: capture `resizeTarget`'s OWN `style.cssText` once, before any
+     * direction runs (it is still pristine and never-resized at that point
+     * — the opening loop and the round-robin sweep above only click/focus
+     * it, never drag it), then `resetWindowStyle` re-applies that exact
+     * string before every direction so each of the three starts from
+     * IDENTICAL geometry — same `calc()` `top` (the exact condition that
+     * reproduces the defect — see above), same width/height, same screen
+     * position. A close+reopen BETWEEN directions was tried first and
+     * rejected: `UIWindow.js`'s cascade offset (`default_window_top`)
+     * advances on every `open()`, including relaunches, so relaunching
+     * before each of 3 directions walked the target across the screen and
+     * into occlusion by `preview`/`code` (still sitting at THEIR original,
+     * un-advanced cascade position) — `nw` specifically skipped again, but
+     * now for a genuinely different reason (real occlusion by a neighbor)
+     * than before (self-corruption). A style reset carries no cascade
+     * counter and cannot drift the window anywhere.
+     */
+    /** Re-applies a previously captured `style.cssText` to `app`'s window —
+     * see the doc block above for why this, and not a close+reopen, is what
+     * runs BETWEEN directions. A pure style write, no relaunch: it cannot
+     * advance the cascade counter and cannot change which app is topmost
+     * (z-index travels with the captured string, but `ensureNotTopmost`
+     * re-evaluates and re-buries live z-order right before every direction
+     * regardless, so a stale z-index here is harmless). */
+    async function resetWindowStyle (app, cssText) {
+        if ( ! cssText ) return;
+        await page.evaluate(([a, css]) => {
+            const win = document.querySelector(`.window[data-app="${a}"]`);
+            if ( win ) win.style.cssText = css;
+        }, [app, cssText]);
+        await settle(app);
+    }
+
+    /**
      * 🔴 GAP 3 REGRESSION TEST. `UIWindow.js` binds `focusWindow()` to
      * `mousedown` on `.ui-resizable-handle` (delegated on `el_window`, since
      * jQuery UI's `.resizable()` appends each handle as a DIRECT CHILD of the
@@ -892,6 +953,18 @@ async function runViewport (vp) {
             }
             return null; // the whole handle is currently covered by another window
         }, [app, handleDir]);
+        if ( ( ! handle || ! before ) && process.env.DEBUG_RESIZE_HANDLE ) {
+            // Diagnostic only, same convention as `DEBUG_CONSOLE` above: not
+            // asserted, just enough geometry printed to tell "handle genuinely
+            // absent/zero-size" apart from "handle exists but every sampled
+            // pixel is occluded" without re-instrumenting this by hand again.
+            const dbg = await page.evaluate(([a, dir]) => {
+                const win = document.querySelector(`.window[data-app="${a}"]`);
+                const el = win?.querySelector(`.ui-resizable-${dir}`);
+                return { winRect: win?.getBoundingClientRect(), handleRect: el?.getBoundingClientRect() };
+            }, [app, handleDir]);
+            console.error(`DEBUG_RESIZE_HANDLE ${app} ${handleDir}:`, JSON.stringify(dbg));
+        }
         if ( ! handle || ! before ) {
             skip(`${label}: ${app}'s "${handleDir}" resize-handle raise+resize test (no visible resize handle right now — not resizable, or full-bleed hides it by design)`);
             return;
@@ -917,9 +990,45 @@ async function runViewport (vp) {
             zAfterDown === app, `afterDown=${zAfterDown}`);
         coveredIds.add(app);
 
-        const resized = !! after && (Math.abs(after.width - before.width) > 1 || Math.abs(after.height - before.height) > 1);
-        push(`${label}: dragging ${app}'s "${handleDir}" resize handle actually resizes it`,
-            resized, `before=${JSON.stringify(before)} after=${JSON.stringify(after)}`);
+        // 🔴 GAP 3 FOLLOW-UP, PART 2 — a REAL defect this exact check used to
+        // wave through. The old assertion was `Math.abs(width delta) > 1 ||
+        // Math.abs(height delta) > 1` — ANY dimension moving by more than a
+        // pixel in EITHER direction counted as "actually resizes it". MEASURED
+        // on baseline: dragging `se` by (+30,+30) produced
+        // `after.height === 0` (the window's height collapsed entirely — see
+        // `closeAndReopenFresh`'s doc block for the root cause) while width
+        // grew from 760 to 790, and the old OR-check called that a PASS. A
+        // window that is 790 wide and 0 tall is not "resized", it is broken,
+        // and a check that cannot tell the difference has no discriminating
+        // power over the one failure mode this test exists to catch.
+        //
+        // The fix asserts what a correct resize actually looks like for
+        // WHICHEVER axes this specific handle direction touches:
+        //   1. the window never collapses to a degenerate size on EITHER
+        //      axis, even the axis this handle isn't supposed to touch;
+        //   2. the axis (or axes) this handle direction resizes grew by a
+        //      substantial, direction-correct amount (every `DELTA` above is
+        //      an outward drag, so the resized axis must GROW, not shrink);
+        //   3. the axis this handle does NOT touch stays put (proves the
+        //      resize is precise to the handle grabbed, not a side effect).
+        const AFFECTS = {
+            n: { w: false, h: true }, s: { w: false, h: true },
+            e: { w: true, h: false }, w: { w: true, h: false },
+            ne: { w: true, h: true }, nw: { w: true, h: true },
+            se: { w: true, h: true }, sw: { w: true, h: true },
+        }[handleDir] ?? { w: true, h: true };
+        const MIN_GROWTH = 10; // drag is 30px; generous slack for containment/snapping
+        const STABLE = 3; // an untouched axis should not move at all beyond noise
+        const notDegenerate = !! after && after.width > 0 && after.height > 0;
+        const widthOk = ! after ? false
+            : AFFECTS.w ? (after.width - before.width) > MIN_GROWTH
+                : Math.abs(after.width - before.width) <= STABLE;
+        const heightOk = ! after ? false
+            : AFFECTS.h ? (after.height - before.height) > MIN_GROWTH
+                : Math.abs(after.height - before.height) <= STABLE;
+        const resized = notDegenerate && widthOk && heightOk;
+        push(`${label}: dragging ${app}'s "${handleDir}" resize handle actually resizes it (grows the axis it owns, leaves the other alone, never collapses)`,
+            resized, `before=${JSON.stringify(before)} after=${JSON.stringify(after)} affects=${JSON.stringify(AFFECTS)}`);
         coveredIds.add(app);
     }
 
@@ -1118,7 +1227,24 @@ async function runViewport (vp) {
         // per-app raise check in this file (`otherAppIds` loop, round-robin)
         // already excludes it for the same reason.
         const resizeContenders = [...otherAppIds];
+        // 🔴 `resizeTarget` is STILL its own pristine, never-resized self
+        // here — the "otherAppIds" opening loop and the round-robin sweep
+        // above only ever click/focus it, never drag it — so its CURRENT
+        // `style.cssText` (captured once, before any direction runs) IS the
+        // fresh baseline. `resetWindowStyle` re-applies that captured string
+        // before every direction so each of the three starts from IDENTICAL
+        // geometry instead of inheriting whatever the previous drag left
+        // behind. Without this, only the FIRST direction in the list ever
+        // saw an uncorrupted window and the other two SKIPped — exactly what
+        // made `nw` and `e` read as "100% SKIP, every viewport, every run"
+        // before this fix: they were never actually exercised, not "not
+        // applicable". (A per-direction close+reopen was tried first and
+        // rejected — see `closeAndReopenFresh`'s doc block for why an extra
+        // relaunch, even just once, is already one cascade step too many.)
+        const pristineStyle = await page.evaluate(
+            (a) => document.querySelector(`.window[data-app="${a}"]`)?.style.cssText, resizeTarget);
         for ( const dir of ['se', 'nw', 'e'] ) {
+            await resetWindowStyle(resizeTarget, pristineStyle);
             await testResizeHandleRaisesAndResizes(resizeTarget, dir, resizeContenders, `${VP} resize-handle regression`);
         }
     }
