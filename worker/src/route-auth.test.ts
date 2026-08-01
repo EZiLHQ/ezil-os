@@ -50,6 +50,8 @@ interface CallLog {
   flushWorkspaceNow: number;
   getExposedPorts: number;
   exec: number;
+  /** Every `containerFetch(url, init, port)` the route table actually made. */
+  containerFetch: Array<{ url: string; port: number; headers: Record<string, string> }>;
 }
 
 /**
@@ -60,10 +62,34 @@ interface CallLog {
 function fakeSandboxNamespace(options: {
   exposedPorts?: Array<{ port: number; url: string; status: string }>;
   terminateResult?: Record<string, unknown>;
+  /** Upstream response the fake container returns for `containerFetch`. */
+  containerResponse?: () => Response;
 }): { binding: unknown; calls: CallLog } {
-  const calls: CallLog = { terminateSandbox: 0, destroy: 0, flushWorkspaceNow: 0, getExposedPorts: 0, exec: 0 };
+  const calls: CallLog = {
+    terminateSandbox: 0,
+    destroy: 0,
+    flushWorkspaceNow: 0,
+    getExposedPorts: 0,
+    exec: 0,
+    containerFetch: [],
+  };
 
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
+    containerFetch: async (...args: unknown[]) => {
+      const [url, init, port] = args as [string, RequestInit | undefined, number];
+      const headers: Record<string, string> = {};
+      new Headers(init?.headers).forEach((v, k) => {
+        headers[k] = v;
+      });
+      calls.containerFetch.push({ url, port, headers });
+      return (
+        options.containerResponse?.() ??
+        new Response('<html><head></head><body>upstream</body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html; charset=utf-8' },
+        })
+      );
+    },
     terminateSandbox: async () => {
       calls.terminateSandbox++;
       return (
@@ -642,6 +668,222 @@ describe('POST /sandbox/:name/focus is HMAC-gated with a closed-enum `app`', () 
     const body = (await res.json()) as { ok: boolean; error: string };
     expect(body.ok).toBe(false);
     expect(body.error).toContain('focus_switch_failed');
+  });
+});
+
+// ── code-server bridge host, whole journey through the REAL route table ─────
+//
+// The failure this block exists to catch: code-server is launched with
+// `--auth none` and no proxy base-path, so it emits ROOT-ABSOLUTE asset URLs
+// and opens its extension-host WebSocket at the root. A dispatcher that only
+// understands `/preview*` 404s every one of those and the editor renders
+// blank, with a completely green unit suite — this project's signature
+// "correct in isolation, broken in composition" failure. Every assertion here
+// runs through `worker.fetch()`, not through the handler functions directly.
+
+const CODE_HOST = `8443-${SANDBOX_NAME}-code.ezil.org`;
+const APP_HOST = `3002-${SANDBOX_NAME}-app.ezil.org`;
+
+async function bootstrapCodeHost(
+  worker: { fetch(request: Request, env: unknown): Promise<Response> },
+  binding: unknown,
+): Promise<{ cookie: string; fallbackParam: string; location: string; res: Response }> {
+  const { mintPreviewBootstrapToken } = await import('./hmac');
+  const token = await mintPreviewBootstrapToken(SECRET, SANDBOX_NAME);
+  const res = await worker.fetch(
+    new Request(`https://${CODE_HOST}/preview-bootstrap?token=${encodeURIComponent(token)}`),
+    { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+  );
+  const setCookie = res.headers.get('set-cookie') ?? '';
+  const cookie = /ezil_preview=([^;]+)/.exec(setCookie)?.[1] ?? '';
+  const location = res.headers.get('location') ?? '';
+  const fallbackParam = new URLSearchParams(location.split('?')[1] ?? '').get('ezil_pv') ?? '';
+  return { cookie, fallbackParam, location, res };
+}
+
+describe('code-server bridge host (8443-<id>-code.ezil.org)', () => {
+  it('bootstraps with a CHIPS-partitioned cookie AND the ezil_pv fallback on the redirect', async () => {
+    const { binding } = fakeSandboxNamespace({});
+    const { res, cookie, fallbackParam, location } = await bootstrapCodeHost(worker, binding);
+
+    expect(res.status).toBe(302);
+    const setCookie = res.headers.get('set-cookie') ?? '';
+    // All four are load-bearing together: without `Partitioned`, Chrome drops
+    // a SameSite=None cookie in a cross-site iframe outright.
+    expect(setCookie).toContain('Partitioned');
+    expect(setCookie).toContain('SameSite=None');
+    expect(setCookie).toContain('Secure');
+    expect(setCookie).toContain('HttpOnly');
+    expect(location.startsWith('/preview/')).toBe(true);
+    // The fallback carries the SAME value as the cookie, so it can never be a
+    // weaker credential than the cookie it stands in for.
+    expect(fallbackParam).toBe(cookie);
+    expect(cookie.length).toBeGreaterThan(0);
+  });
+
+  it('proxies /preview/ to port 8443 and does NOT inject RUNTIME_SHIM', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const { cookie } = await bootstrapCodeHost(worker, binding);
+
+    const res = await worker.fetch(
+      new Request(`https://${CODE_HOST}/preview/`, { headers: { cookie: `ezil_preview=${cookie}` } }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+
+    expect(res.status).toBe(200);
+    expect(calls.containerFetch).toHaveLength(1);
+    expect(calls.containerFetch[0].port).toBe(8443);
+    expect(calls.containerFetch[0].url).toBe('http://127.0.0.1:8443/');
+    const body = await res.text();
+    // 🔴 The known landmine: RUNTIME_SHIM monkey-patches window.WebSocket and
+    // would break code-server's extension host instantly.
+    expect(body).not.toContain('window.WebSocket');
+    expect(body).not.toContain('/preview-ws');
+    expect(body).toContain('upstream');
+  });
+
+  it('proxies ROOT-ABSOLUTE code-server asset paths instead of 404ing them', async () => {
+    const { binding, calls } = fakeSandboxNamespace({
+      containerResponse: () =>
+        new Response('console.log(1)', { status: 200, headers: { 'content-type': 'application/javascript' } }),
+    });
+    const { cookie } = await bootstrapCodeHost(worker, binding);
+
+    for (const assetPath of [
+      '/_static/out/vs/workbench/workbench.web.main.js',
+      '/stable-abc123/static/out/media/letterpress-dark.svg',
+      '/manifest.json',
+      '/healthz',
+    ]) {
+      calls.containerFetch.length = 0;
+      const res = await worker.fetch(
+        new Request(`https://${CODE_HOST}${assetPath}`, { headers: { cookie: `ezil_preview=${cookie}` } }),
+        { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+      );
+      expect(`${assetPath} -> ${res.status}`).toBe(`${assetPath} -> 200`);
+      expect(calls.containerFetch).toHaveLength(1);
+      expect(calls.containerFetch[0].url).toBe(`http://127.0.0.1:8443${assetPath}`);
+      expect(calls.containerFetch[0].port).toBe(8443);
+    }
+  });
+
+  it('preserves the query string (minus ezil_pv) on a proxied code-server request', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const { cookie, fallbackParam } = await bootstrapCodeHost(worker, binding);
+
+    await worker.fetch(
+      new Request(
+        `https://${CODE_HOST}/?folder=/home/neko/project&ezil_pv=${encodeURIComponent(fallbackParam)}`,
+        { headers: { cookie: `ezil_preview=${cookie}` } },
+      ),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+
+    expect(calls.containerFetch).toHaveLength(1);
+    expect(calls.containerFetch[0].url).toContain('folder=');
+    // The internal auth parameter must never reach code-server itself.
+    expect(calls.containerFetch[0].url).not.toContain('ezil_pv');
+  });
+
+  it('routes a WebSocket upgrade at the ROOT to the WS proxy on 8443', async () => {
+    // code-server opens its extension-host / terminal sockets at the base
+    // path, NOT under `/preview-ws/` (RUNTIME_SHIM, which performs that
+    // rewrite for Next/Vite HMR, is deliberately never injected here) — so
+    // the upgrade must be detected by header, not by path prefix.
+    const { binding, calls } = fakeSandboxNamespace({
+      containerResponse: () => new Response(null, { status: 101 }),
+    });
+    const { cookie } = await bootstrapCodeHost(worker, binding);
+
+    const res = await worker.fetch(
+      new Request(`https://${CODE_HOST}/?type=ExtensionHost&reconnectionToken=abc`, {
+        headers: { cookie: `ezil_preview=${cookie}`, upgrade: 'websocket', connection: 'Upgrade' },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+
+    expect(res.status).toBe(101);
+    expect(calls.containerFetch).toHaveLength(1);
+    expect(calls.containerFetch[0].port).toBe(8443);
+    expect(calls.containerFetch[0].headers.upgrade).toBe('websocket');
+  });
+
+  it('🔴 the catch-all opens NO hole: every code-host path 401s without auth', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    for (const p of ['/', '/preview/', '/_static/x.js', '/stable-abc/static/y.css', '/healthz']) {
+      const res = await worker.fetch(new Request(`https://${CODE_HOST}${p}`), {
+        Sandbox: binding,
+        SANDBOX_HMAC_SECRET: SECRET,
+      });
+      expect(`${p} -> ${res.status}`).toBe(`${p} -> 401`);
+    }
+    // code-server runs `--auth none`, so "the request never reached the
+    // container" is the assertion that matters, not just the status code.
+    expect(calls.containerFetch).toHaveLength(0);
+  });
+
+  it('accepts the ezil_pv query fallback when the browser dropped the cookie entirely', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const { fallbackParam } = await bootstrapCodeHost(worker, binding);
+
+    const res = await worker.fetch(
+      new Request(`https://${CODE_HOST}/_static/x.js?ezil_pv=${encodeURIComponent(fallbackParam)}`),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    expect(calls.containerFetch).toHaveLength(1);
+  });
+
+  it('rejects an ezil_pv minted for a DIFFERENT sandbox', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const { mintPreviewCookie } = await import('./hmac');
+    const foreign = await mintPreviewCookie(SECRET, 'guac-1111111111111111-2222222222222222');
+    const res = await worker.fetch(
+      new Request(`https://${CODE_HOST}/_static/x.js?ezil_pv=${encodeURIComponent(foreign)}`),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+    expect(calls.containerFetch).toHaveLength(0);
+  });
+
+  it('leaves the APP host 404 contract untouched (no accidental catch-all there)', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const { mintPreviewBootstrapToken } = await import('./hmac');
+    const token = await mintPreviewBootstrapToken(SECRET, SANDBOX_NAME);
+    const boot = await worker.fetch(
+      new Request(`https://${APP_HOST}/preview-bootstrap?token=${encodeURIComponent(token)}`),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    const cookie = /ezil_preview=([^;]+)/.exec(boot.headers.get('set-cookie') ?? '')?.[1] ?? '';
+    expect(cookie.length).toBeGreaterThan(0);
+
+    const res = await worker.fetch(
+      new Request(`https://${APP_HOST}/_next/static/chunk.js`, {
+        headers: { cookie: `ezil_preview=${cookie}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(404);
+    expect(calls.containerFetch).toHaveLength(0);
+  });
+
+  it('still injects RUNTIME_SHIM on the APP host (no cross-target regression)', async () => {
+    const { binding } = fakeSandboxNamespace({});
+    const { mintPreviewBootstrapToken } = await import('./hmac');
+    const token = await mintPreviewBootstrapToken(SECRET, SANDBOX_NAME);
+    const boot = await worker.fetch(
+      new Request(`https://${APP_HOST}/preview-bootstrap?token=${encodeURIComponent(token)}`),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    const cookie = /ezil_preview=([^;]+)/.exec(boot.headers.get('set-cookie') ?? '')?.[1] ?? '';
+
+    const res = await worker.fetch(
+      new Request(`https://${APP_HOST}/preview/`, { headers: { cookie: `ezil_preview=${cookie}` } }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    const body = await res.text();
+    expect(body).toContain('window.WebSocket');
+    expect(body).toContain('/preview-ws');
   });
 });
 
