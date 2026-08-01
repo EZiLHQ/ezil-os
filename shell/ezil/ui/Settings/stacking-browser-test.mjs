@@ -1250,6 +1250,92 @@ async function runViewport (vp) {
     }
 
     // ═════════════════════════════════════════════════════════════════════
+    // 🔴 D3 INDEPENDENT COVERAGE (round 8's verifier: "Reverting both
+    // `?.contentWindow?.` guards changes nothing — 452/456, identical. D3
+    // is only visible through D2's race, so if D2 is ever fixed
+    // differently, D3 silently loses all coverage.").
+    //
+    // `$.fn.focusWindow` (`UIWindow.js`) does
+    // `$app_iframe.get(0)?.contentWindow?.postMessage({msg:'focus'}, '*')`
+    // — guarded per that file's own comment because "a detached iframe (a
+    // window mid-close, or one that was reopened while its old iframe
+    // hadn't finished teardown) has `contentWindow === null`". The ONLY
+    // path the rest of this suite reaches that state through is D2's race
+    // (a close/reopen landing in a narrow timing window) — so today, D3's
+    // entire coverage is a side effect of D2's, and disappears the moment
+    // D2 is fixed by any means that closes the race instead of by keeping
+    // this exact guard.
+    //
+    // This reproduces D3's OWN failure condition directly, with no close,
+    // no reopen, no timing window: detach a real window (with a real
+    // iframe already loaded) from the live document with a plain
+    // `Element.remove()` — the same end state D2's race produces (an
+    // iframe whose `contentWindow` the spec sets to `null` the instant its
+    // node is disconnected from the document) — then call `.focusWindow()`
+    // on it directly, the exact code path the guard lives in. `$(el).find()`
+    // and `.hasClass()` both still work on a detached subtree, so this
+    // reaches the SAME line D2 does; only the reason `contentWindow` is
+    // null differs (direct detachment vs. a race), which is exactly what
+    // makes this coverage independent of D2's fix.
+    // ═════════════════════════════════════════════════════════════════════
+    {
+        const d3TargetId = await page.evaluate((ids) => {
+            for ( const id of ids ) {
+                const win = document.querySelector(`.window[data-app="${id}"]`);
+                if ( win && win.querySelector('.window-app-iframe') ) return id;
+            }
+            return null;
+        }, otherAppIds);
+        if ( d3TargetId ) {
+            // 🔴 The `try`/`catch` is IN the page, not around this
+            // `page.evaluate()` call: `.focusWindow()` throws SYNCHRONOUSLY
+            // inside the evaluated function when the guard is missing, which
+            // Playwright surfaces as a REJECTED `evaluate()` call (not a
+            // `pageerror` event — that only fires for exceptions the page's
+            // own event loop never catches, e.g. inside a real click
+            // handler or a timer, not inside a script this harness is
+            // directly awaiting). Left uncaught here, that rejection would
+            // abort this ENTIRE viewport's run ("harness threw without
+            // completing") — confirmed as an OBSERVED failure mode:
+            // reverting the guard while this `try` was still outside the
+            // evaluate() call up-front crashed the whole `[1440x900]`
+            // (and every later) viewport instead of producing one isolated,
+            // readable FAIL, losing every check after it for that viewport.
+            // Catching inside the page turns "the mechanism is broken" into
+            // exactly one clean, isolated result — same principle as every
+            // other risky operation in this file, which never trusts an
+            // emulation/DOM effect without reading back a real signal for it.
+            const result = await page.evaluate((a) => {
+                const win = document.querySelector(`.window[data-app="${a}"]`);
+                if ( ! win ) return { targetMissing: true };
+                win.remove();
+                try {
+                    $(win).focusWindow();
+                    return { threw: false };
+                } catch ( e ) {
+                    return { threw: true, message: String(e?.message ?? e) };
+                }
+            }, d3TargetId);
+            push(`${VP} D3 regression: focusWindow() on a window detached directly from the document (no D2 race involved) does not throw`,
+                result.threw === false, `target=${d3TargetId} result=${JSON.stringify(result)}`);
+
+            // We bypassed `.close()` entirely (a raw DOM `.remove()`, not
+            // real teardown), so this app's taskbar item / bookkeeping never
+            // ran its close path. Relaunch it fresh so every check AFTER
+            // this one — which assumes every `otherAppIds` entry is a real,
+            // on-screen window — still finds one.
+            await page.evaluate(({ a, ctx }) => window.ezil.registry.launch(a, ctx), {
+                a: d3TargetId,
+                ctx: { payload: PAYLOAD, computer: PAYLOAD.computer, desktopState: PAYLOAD.desktopState },
+            });
+            await until((a) => !! document.querySelector(`.window[data-app="${a}"]`), d3TargetId, 6000, 50);
+            await settle(d3TargetId);
+        } else {
+            skip(`${VP} D3 regression: focusWindow() on a detached iframe (no window with a .window-app-iframe found among ${JSON.stringify(otherAppIds)})`);
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
     // Restore the boot app — regression check: it must still be able to
     // reclaim the screen, and an ordinary window opened earlier must not
     // have made it permanently unreachable. See the original file's
