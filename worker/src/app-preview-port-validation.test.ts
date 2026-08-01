@@ -1,7 +1,8 @@
 /**
- * Regression test: `APP_PREVIEW_PORT` must pass the REAL `@cloudflare/sandbox`
- * SDK's own `validatePort()` — not a hand-copied reimplementation of its
- * reserved-port rules. A hand-copied reimplementation is exactly how the
+ * Regression test: EVERY port this Worker hands to `exposePort()` —
+ * `APP_PREVIEW_PORT` and `CODE_PREVIEW_PORT` — must pass the REAL
+ * `@cloudflare/sandbox` SDK's own `validatePort()`, not a hand-copied
+ * reimplementation of its reserved-port rules. A hand-copied reimplementation is exactly how the
  * original bug went unnoticed: `APP_PREVIEW_PORT` was `3000`, which
  * `validatePort()` has always rejected (3000 is reserved for the SDK's own
  * sandbox control plane — see `desktop-mode.ts`'s doc comment on
@@ -33,7 +34,7 @@ import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { APP_PREVIEW_PORT } from './desktop-mode';
+import { APP_PREVIEW_PORT, CODE_PREVIEW_PORT, appPortFor, codePortFor, portFor } from './desktop-mode';
 
 plugin({
   name: 'stub-cloudflare-workers-for-validate-port-test',
@@ -93,5 +94,48 @@ describe('APP_PREVIEW_PORT vs. the real @cloudflare/sandbox SDK', () => {
     expect(validatePort!(1023)).toBe(false); // below the allowed range
     expect(validatePort!(1024)).toBe(true); // bottom of the allowed range
     expect(validatePort!(65536)).toBe(false); // above the allowed range
+  });
+});
+
+// The code-server bridge port (`codePortFor`, `preview-bridge.ts`'s
+// `parseBridgeHost` target `'code'`) is exposed through the exact same
+// `exposePreviewPort()` -> `sandbox.exposePort()` call as the app-preview
+// port, so it is subject to the identical SDK rule. It was added without this
+// check; that is precisely the shape of the original 3000 bug (a port that
+// looks fine, is never validated against the SDK, and fails only at runtime
+// inside `ensureDesktop`'s best-effort try/catch — i.e. silently).
+describe('CODE_PREVIEW_PORT vs. the real @cloudflare/sandbox SDK', () => {
+  it("passes the SDK's own validatePort()", async () => {
+    const mod = (await import(chunkPath)) as Record<string, unknown>;
+    const validatePort = mod[validatePortAlias] as ((port: number) => boolean) | undefined;
+    expect(typeof validatePort).toBe('function');
+    expect(validatePort!(CODE_PREVIEW_PORT)).toBe(true);
+  });
+
+  it('collides with no other port this Worker exposes or reserves', () => {
+    // 3000 = SDK control plane, 8080 = guacamole/Tomcat, 8181 = neko WebRTC,
+    // 3002 = the user's own dev server. A collision here is not a test-only
+    // concern: two `exposePort()` calls on the same port inside one sandbox
+    // fight over the same token registration.
+    const reserved = new Set<number>([
+      3000,
+      portFor('guacamole').port,
+      portFor('neko').port,
+      APP_PREVIEW_PORT,
+    ]);
+    expect(reserved.has(CODE_PREVIEW_PORT)).toBe(false);
+    expect(CODE_PREVIEW_PORT).toBe(8443);
+  });
+
+  it('pairs a distinct token with a distinct port for every neko-mode exposure', () => {
+    const exposures = [portFor('neko'), appPortFor('neko'), codePortFor('neko')].filter(
+      (e): e is { port: number; token: string } => e !== null,
+    );
+    expect(new Set(exposures.map((e) => e.port)).size).toBe(exposures.length);
+    expect(new Set(exposures.map((e) => e.token)).size).toBe(exposures.length);
+    // Hostname-label constraint (see `portFor`'s doc comment): the SDK's
+    // `exposePort` rejects anything outside `[a-z0-9_]+`, and a DNS label
+    // further forbids `_`.
+    for (const { token } of exposures) expect(token).toMatch(/^[a-z0-9]+$/);
   });
 });
