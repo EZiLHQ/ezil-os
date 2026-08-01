@@ -54,7 +54,7 @@
 //
 // ── Guarantee #2 (a drift test for `/computers`) — NOT ADDED, same reason.
 // A Next.js route test belongs under `app/`, which this task does not own.
-import UIWindow from '../../src/UI/UIWindow.js';
+import UIWindow from '../../../src/UI/UIWindow.js';
 import TabComputers from './tabs/computers.js';
 import TabAppearance from './tabs/appearance.js';
 import TabAbout from './tabs/about.js';

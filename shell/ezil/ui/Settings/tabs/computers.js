@@ -13,9 +13,9 @@
 // something different here than it does on `/computers`.
 import { deleteComputerCopy } from '../../../../../app/src/app/computers/_lib/delete-copy.ts';
 
-import UIAlert from '../../../src/UI/UIAlert.js';
-import registry from '../../apps/registry.js';
-import session from '../../session.js';
+import UIAlert from '../../../../src/UI/UIAlert.js';
+import registry from '../../../apps/registry.js';
+import session from '../../../session.js';
 import trpc from '../trpc.js';
 
 const PHASE = 'ezil-os:settings/computers';
