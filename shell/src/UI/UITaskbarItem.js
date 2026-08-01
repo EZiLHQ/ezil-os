@@ -378,7 +378,17 @@ function UITaskbarItem (options) {
 
     $(el_taskbar_item).tooltip({
         // only show tooltip if desktop is not selectable active
-        items: ".desktop:not(.desktop-selectable-active) .taskbar:not(.children-have-open-contextmenu) .taskbar-item:not([data-app='separator'])",
+        // 🔴 Was ".desktop:not(.desktop-selectable-active) .taskbar ..." — a
+        // descendant combinator that assumed `.taskbar` lives inside
+        // `.desktop` in the DOM. `UITaskbar.js` now appends `.taskbar`
+        // straight to `<body>` (see its comment: `.desktop`'s real-world
+        // wrapper, `#ezil-os-root`, is `position: fixed`, which ALWAYS opens
+        // a stacking context and was trapping the taskbar's z-index no
+        // matter how high it went). `:has()` keeps the exact same truth
+        // value — "no `.desktop.desktop-selectable-active` exists anywhere
+        // on the page" — without requiring `.taskbar` to be a descendant of
+        // `.desktop`.
+        items: "body:not(:has(.desktop.desktop-selectable-active)) .taskbar:not(.children-have-open-contextmenu) .taskbar-item:not([data-app='separator'])",
         position: {
             my: tooltipPosition.my,
             at: tooltipPosition.at,
