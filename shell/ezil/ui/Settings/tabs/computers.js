@@ -181,7 +181,7 @@ function rowHtml (slot, computer) {
 }
 
 function render ($win) {
-    const $list = $win.find('[data-role="computers-list"]');
+    const $list = $win.find('[data-role="slot-list"]');
     if ( $list.length === 0 ) return; // pane not mounted (wrong tab active) — nothing to draw yet
 
     if ( loading && computers.length === 0 ) {
@@ -311,7 +311,7 @@ async function handleDelete (computer, $win) {
 }
 
 function bind ($win, ctx) {
-    const $list = $win.find('[data-role="computers-list"]');
+    const $list = $win.find('[data-role="slot-list"]');
 
     $list.on('click', '[data-action="create"]', () => { void handleCreate($win); });
     $list.on('click', '[data-action="retry"]', () => { void load($win); });
@@ -355,13 +355,13 @@ export default {
 
     html () {
         return `
-            <div class="ezil-settings-computers">
+            <div class="ezil-settings-pane-body">
                 <p class="ezil-settings-lead">
                     Up to ${MAX_COMPUTERS_PER_USER} computers. Deleting one shuts its desktop down and
                     frees the slot — your files stay in storage, but the computer itself can't be
                     reopened.
                 </p>
-                <div class="ezil-settings-computer-list" data-role="computers-list">
+                <div class="ezil-settings-slot-list" data-role="slot-list">
                     <div class="ezil-settings-loading">Loading your computers…</div>
                 </div>
             </div>`;

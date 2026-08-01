@@ -163,5 +163,22 @@ export default {
 
 // ── the module-level side effect described in the header ───────────────────
 // Runs once, at import time, independent of whether Settings is ever opened.
-whenDesktopReady(() => applyWallpaper(currentWallpaperId()));
-applyAccent(currentAccentId()); // `:root` always exists; no need to wait.
+//
+// 🔴 Both wait for `.desktop`, not just the wallpaper. `applyAccent` only
+// needs `document.documentElement`, which exists immediately — but this
+// module evaluates as part of `boot.js`'s import chain, i.e. BEFORE
+// `boot()` even runs, which on `/os` is BEFORE the hydration handshake
+// `boot.js`'s own header describes at length (`ezil:hydrated` /
+// `HYDRATION_CAP_MS`). `<html>` is inside the React tree Next's root layout
+// renders, so mutating it pre-hydration is exactly the class of "wrote to a
+// React-owned node before React checked it" this fork has already been
+// burned by three times. Piggy-backing both effects on the SAME signal
+// `.desktop`'s existence already gives for free (`.desktop` is only ever
+// created inside `mount()`, which `boot.js` itself gates on hydration) costs
+// nothing here — a theme colour appearing a few hundred ms after the
+// wallpaper is imperceptible — and removes the risk entirely rather than
+// arguing about how forgiving React's attribute-level reconciliation is.
+whenDesktopReady(() => {
+    applyWallpaper(currentWallpaperId());
+    applyAccent(currentAccentId());
+});
