@@ -847,14 +847,35 @@ describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => 
     expect(zoneRoot).toBe('ezil.org');
   });
 
-  it('declares exactly the three owner-approved narrow suffix routes on ezil.org', () => {
+  it('declares exactly the owner-approved narrow suffix routes on ezil.org — no more, no fewer', () => {
+    // Was a hardcoded three-element literal; now DERIVED from the tokens
+    // `desktop-mode.ts` can actually mint, so adding a fourth exposed port
+    // (the `code` bridge) updates both sides of this guard at once instead of
+    // requiring two edits that can drift apart. Both directions still fail
+    // loudly: a token with no route (silent 404 in production) and a route
+    // with no token (a stale binding this Worker no longer serves).
     expect(new Set(patterns)).toEqual(
-      new Set(['*-app.ezil.org/*', '*-desktop.ezil.org/*', '*-nekodesktop.ezil.org/*']),
+      new Set(['*-app.ezil.org/*', '*-desktop.ezil.org/*', '*-nekodesktop.ezil.org/*', '*-code.ezil.org/*']),
     );
     // Never the bare zone wildcard — that would shadow `sandbox.ezil.org` /
     // `neko.ezil.org` (and everything else on the zone), which is exactly the
     // production-takeover this whole narrow-suffix design avoids.
     expect(patterns).not.toContain('*.ezil.org/*');
+  });
+
+  it('routes NOTHING this Worker cannot mint (no stale/orphan route bindings)', async () => {
+    if (routesDisabled) return;
+    const { portFor, appPortFor, codePortFor } = await import('./desktop-mode');
+    const tokens = new Set(
+      [portFor('guacamole').token, portFor('neko').token, appPortFor('neko')?.token, codePortFor('neko')?.token].filter(
+        (t): t is string => typeof t === 'string',
+      ),
+    );
+    for (const pattern of patterns) {
+      const token = /^\*-([a-z0-9]+)\./.exec(pattern)?.[1];
+      expect(token, `route "${pattern}" is not a token-scoped narrow suffix route`).toBeTruthy();
+      expect(tokens.has(token!), `route "${pattern}" binds a token this Worker never mints`).toBe(true);
+    }
   });
 
   it('declares PREVIEW_ZONE_ROOT as a literal (not a template/env lookup)', () => {
@@ -893,11 +914,9 @@ describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => 
       // `parseBridgeHost` target: 'code') is the newest exposed-port token —
       // exactly the case this guard exists to catch: a NEW token with no
       // matching wrangler.toml route silently 404s in production instead of
-      // failing the build. This assertion is EXPECTED to fail until a
-      // `[[routes]] pattern = "*-code.ezil.org/*"` entry is added to
-      // wrangler.toml — that file is outside this change's ownership (see
-      // the wave-a-t1-worker-bridge report); the failure is the guard doing
-      // its job, not a defect in this test or in `codePortFor` itself.
+      // failing the build. If this assertion fails on `code`, the fix is to
+      // add `[[routes]] pattern = "*-code.ezil.org/*"` / `zone_name =
+      // "ezil.org"` to wrangler.toml — NOT to relax the guard.
       codePortFor('neko')?.token,
     ].filter((t): t is string => typeof t === 'string');
 
