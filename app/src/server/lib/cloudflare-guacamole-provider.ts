@@ -12,11 +12,16 @@
  *
  * Carried and simplified from EBuilder's
  * `apps/web/client/src/server/lib/cloudflare-guacamole-provider.ts`
- * (authored post-Onlook-import, listed as safe to carry). Dropped from the
- * source on purpose, since none of it is wired in this app:
+ * (authored post-Onlook-import, listed as safe to carry). Originally dropped
+ * from the source on purpose, since none of it was wired in this app:
  *   - The app-preview ("Option D" dev-server iframe) bootstrap/status path
- *     — the source file's own doc comment says this is "NOT wired in this
- *     wave" even there; this repo has no dev-server-in-sandbox story at all.
+ *     — the source file's own doc comment said this was "NOT wired in this
+ *     wave" even there, and this repo had no dev-server-in-sandbox story at
+ *     all. NOW WIRED (the "App-preview (Option D) bootstrap token + URL"
+ *     section below + `routers/cloudflare-guacamole.ts`'s `appPreviewUrl`):
+ *     the Worker side (`worker/src/preview-bridge.ts`, `desktop-mode.ts`'s
+ *     `appPortFor`, `hmac.ts`'s `mintPreviewBootstrapToken` family) already
+ *     existed; this is the app-side minting server that contract calls for.
  *   - Twen workspace orchestration — a forward-looking capability with no
  *     UI surface anywhere, carried or otherwise.
  *   - The dual Guacamole/Neko `desktopMode` switch and the Azure
@@ -153,6 +158,25 @@ export interface GuacamolePreviewSuccess {
         mounted: boolean;
         mountPath?: string;
         detail?: string;
+    };
+    /**
+     * Outcome of the Worker's best-effort app-preview (Option D) raw-port
+     * exposure step (`AppPreviewExposeResult`, `worker/src/index.ts`).
+     *
+     * 🔴 `attempted: false` is NOT a negative signal on its own. It means
+     * either (a) `desktopMode` has no app-preview surface at all
+     * (guacamole mode), OR (b) the desktop port was already exposed from a
+     * PRIOR call, in which case `ensureDesktop`'s fast path skips
+     * re-attempting the app-preview expose too and reports `attempted:
+     * false` even when a previous call already exposed it successfully.
+     * The only trustworthy NEGATIVE is `attempted: true, exposed: false` —
+     * see `cloudflareGuacamole.appPreviewUrl`'s doc comment for how that
+     * distinction is used.
+     */
+    appPreviewExpose?: {
+        attempted: boolean;
+        exposed: boolean;
+        error?: string;
     };
 }
 
@@ -510,6 +534,143 @@ export function deriveGuacamoleSandboxId(userId: string, computerId: string): st
     const base = userId.replace(/[^a-z0-9]/gi, '').slice(0, 16);
     const scope = computerId.replace(/[^a-z0-9]/gi, '').slice(0, 16);
     return `guac-${base}-${scope}`;
+}
+
+// ─── App-preview (Option D) bootstrap token + URL ──────────────────────────────
+//
+// The "second worker's tRPC procedure" `worker/src/hmac.ts`'s own module doc
+// names as the minting side of the `/preview-bootstrap` contract:
+//
+//   "unlike Azure's payload, this Worker's payload ALSO binds sandboxId ...
+//    the minting server (the "second worker"'s tRPC procedure) MUST include
+//    the exact sandboxId the token is meant to unlock."
+//
+// This is that minting server. `mintAppPreviewBootstrapToken` below MUST stay
+// byte-for-byte identical to `worker/src/hmac.ts`'s `mintPreviewBootstrapToken`
+// / `PREVIEW_BOOTSTRAP_TOKEN_PAYLOAD` — a drift here is a silent 401 on every
+// app-preview window, since the Worker verifies against its own copy of the
+// same payload string. Deliberately a SEPARATE implementation rather than an
+// import from `worker/src`: this app deploys to Vercel (Node runtime) and the
+// Worker deploys to Cloudflare via wrangler — different build/deploy targets,
+// same pattern this file already follows for `deriveGuacamoleSandboxId`
+// (mirrors the Worker's own `deriveSandboxId`) and `deriveNekoAdminValue`
+// (mirrors `deriveNekoCredentials`).
+
+/**
+ * In-container port the user's dev server listens on. MUST match
+ * `worker/src/desktop-mode.ts`'s `APP_PREVIEW_PORT`.
+ */
+export const APP_PREVIEW_PORT = 3002;
+
+/**
+ * Preview-URL token label for the app port. MUST match
+ * `worker/src/desktop-mode.ts`'s `APP_PREVIEW_TOKEN`.
+ */
+export const APP_PREVIEW_TOKEN = 'app';
+
+/**
+ * Freshness window for a minted `/preview-bootstrap` token. MUST match
+ * `worker/src/hmac.ts`'s `PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS` (5 min) — the
+ * Worker is the one that actually enforces this; this constant only has to
+ * agree so `expiresAt` on the wire tells the truth.
+ */
+export const APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS = 5 * 60 * 1000;
+
+/**
+ * Mint a `/preview-bootstrap?token=...` token scoped to one sandbox.
+ *
+ * Token format: `t=<unix_ms>,v1=<hex_hmac_sha256>`
+ * Payload:      `${timestamp}.GET./preview-bootstrap.${sandboxId}.`
+ * (byte-for-byte `worker/src/hmac.ts`'s `PREVIEW_BOOTSTRAP_TOKEN_PAYLOAD`.)
+ *
+ * Minted PER WINDOW-OPEN (`cloudflareGuacamole.appPreviewUrl`), never baked
+ * into `/api/shell/session`'s boot payload: the 5-minute TTL means a token
+ * minted once at session/boot time could already be stale by the time a user
+ * actually opens the window, and stale again if the window stays open
+ * longer than the TTL — see that procedure's doc comment for the refetch
+ * cadence this is designed around.
+ *
+ * When `hmacSecret` is empty (local dev without a secret), returns the same
+ * plaintext "local-dev" placeholder `mintSandboxPreviewToken` uses; the
+ * Worker's `verifyPreviewBootstrapToken` has an identical local-dev branch
+ * that accepts any token when no secret is configured.
+ */
+export function mintAppPreviewBootstrapToken(
+    hmacSecret: string,
+    sandboxId: string,
+    now: number = Date.now(),
+): string {
+    if (!hmacSecret) {
+        return 'local-dev';
+    }
+    const payload = `${now}.GET./preview-bootstrap.${sandboxId}.`;
+    const sig = createHmac('sha256', hmacSecret).update(payload).digest('hex');
+    return `t=${now},v1=${sig}`;
+}
+
+/**
+ * Derive the app-preview origin (scheme + hostname, no path) from the
+ * DESKTOP preview URL the SAME `/sandbox/preview` call already returned.
+ *
+ * Deliberately reuses `guacamoleUrl`'s own hostname suffix rather than
+ * recomputing it from `CLOUDFLARE_GUACAMOLE_WORKER_URL`: the Worker's own
+ * `normalizeSandboxHostname` (`worker/src/index.ts`) decides, per request,
+ * whether to collapse the inbound host to its configured zone root, and
+ * `guacamoleUrl` already carries whatever it decided for THIS request. A
+ * second, independent implementation of that zone-collapse decision would
+ * silently drift the moment the Worker's zone config changes; reusing the
+ * host this call actually observed cannot drift by construction.
+ *
+ * `${APP_PREVIEW_PORT}-${sandboxId}-${APP_PREVIEW_TOKEN}` mirrors the exact
+ * `${port}-${sandboxId}-${token}` hostname pattern `worker/src/desktop-mode.ts`
+ * documents for `@cloudflare/sandbox`'s `exposePort`/`getExposedPorts` — the
+ * desktop hostname in `guacamoleUrl` is the SAME pattern with the desktop's
+ * own port/token in place of the app-preview ones.
+ *
+ * Returns `null` for a `guacamoleUrl` this cannot parse, or one whose
+ * hostname has no label to strip — never expected from a real Worker
+ * response; a defensive `null` here, not a throw, on a malformed upstream
+ * value.
+ */
+export function composeAppPreviewOrigin(guacamoleUrl: string, sandboxId: string): string | null {
+    let parsed: URL;
+    try {
+        parsed = new URL(guacamoleUrl);
+    } catch {
+        return null;
+    }
+    const dot = parsed.hostname.indexOf('.');
+    if (dot <= 0) return null;
+    const zoneSuffix = parsed.hostname.slice(dot + 1);
+    if (!zoneSuffix) return null;
+    // `URL#hostname` never includes the port — a local `wrangler dev` desktop
+    // URL like `http://8181-...-nekodesktop.localhost:8787/` would otherwise
+    // silently lose `:8787` here, producing an app-preview URL that points at
+    // the wrong (default) port. `URL#port` carries it separately; re-attach
+    // it when present.
+    const zoneHost = parsed.port ? `${zoneSuffix}:${parsed.port}` : zoneSuffix;
+    const host = `${APP_PREVIEW_PORT}-${sandboxId}-${APP_PREVIEW_TOKEN}.${zoneHost}`;
+    return `${parsed.protocol}//${host}`;
+}
+
+/**
+ * Compose the full `/preview-bootstrap` URL the shell opens in its
+ * app-preview window: `appPreviewOrigin` (from `composeAppPreviewOrigin`)
+ * plus the freshly minted token. `path` defaults to the dev server's root —
+ * see `worker/src/preview-bridge.ts`'s module doc for the `GET
+ * /preview-bootstrap?token=...&path=/foo` contract this composes against.
+ */
+export function composeAppPreviewBootstrapUrl(
+    appPreviewOrigin: string,
+    token: string,
+    path: string = '/',
+): string {
+    const url = new URL('/preview-bootstrap', appPreviewOrigin);
+    url.searchParams.set('token', token);
+    if (path && path !== '/') {
+        url.searchParams.set('path', path);
+    }
+    return url.toString();
 }
 
 // ─── Neko browser auto-connect URL composition ─────────────────────────────────
