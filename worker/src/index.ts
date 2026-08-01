@@ -3072,6 +3072,64 @@ async function probeAppPreviewStatus(sandbox: Sandbox<unknown>, env: Env) {
 }
 
 /**
+ * Everything on the code-server bridge host except `/preview-bootstrap`.
+ *
+ * 🔴 Why this is a CATCH-ALL and the app-preview host is not.
+ *
+ * code-server is launched by the container's `start-codeserver.sh` with
+ * `--bind-addr 127.0.0.1:8443 --auth none` and NO proxy base-path flag, so it
+ * believes it is mounted at `/`. It emits root-absolute asset URLs
+ * (`/_static/...`, `/stable-<commit>/...`, `/manifest.json`, …) and opens its
+ * extension-host / integrated-terminal WebSockets against that same root.
+ * Under the app-preview dispatcher's contract — where anything outside
+ * `/preview*` is a deliberate 404 — every one of those requests would 404 and
+ * the editor would render as a blank page with no error anywhere in the
+ * response body. That is the exact "correct in isolation, broken in
+ * composition" failure this project keeps shipping, so the code host takes the
+ * opposite default: EVERY path is proxied to code-server.
+ *
+ * That widening does NOT widen the auth surface. `handlePreviewProxy` /
+ * `handlePreviewWsProxy` gate every single request through
+ * `resolvePreviewAuth` (HMAC'd `ezil_preview` cookie, or the `ezil_pv`
+ * query-param fallback, both bound to this `sandboxId`), and this host never
+ * falls through to `proxyToSandbox`'s raw unauthenticated forward — see the
+ * call site in `fetch()`. Given code-server runs `--auth none`, that gate is
+ * the ONLY thing standing between the public internet and a root shell in the
+ * container, which is why the catch-all routes through the gated proxies
+ * rather than around them.
+ *
+ * A leading `/preview` is stripped when present so BOTH entry shapes work: the
+ * bootstrap redirect lands on `/preview/` (shared with the app host), and
+ * code-server's own root-absolute follow-up requests arrive bare.
+ *
+ * WebSocket upgrades are detected by header and sent to
+ * `handlePreviewWsProxy`, not by the `/preview-ws/` path prefix the app host
+ * uses — code-server never rewrites its socket URLs through that prefix (and
+ * must not: `RUNTIME_SHIM`, which is what performs that rewrite for Next/Vite
+ * HMR, is deliberately never injected for `target === 'code'`).
+ */
+async function handleCodeBridge(
+  request: Request,
+  env: Env,
+  url: URL,
+  sandboxId: string,
+  secrets: string[],
+  port: number,
+): Promise<Response> {
+  const path = url.pathname;
+  let codePath = path;
+  if (codePath === '/preview') codePath = '/';
+  else if (codePath.startsWith('/preview/')) codePath = codePath.slice('/preview'.length);
+
+  const sandbox = openSandbox(env, sandboxId);
+  const upgrade = (request.headers.get('upgrade') ?? '').toLowerCase();
+  if (upgrade === 'websocket') {
+    return handlePreviewWsProxy(request, sandbox, sandboxId, secrets, codePath, port);
+  }
+  return handlePreviewProxy(request, sandbox, sandboxId, secrets, codePath, port, 'code');
+}
+
+/**
  * Dispatcher for BOTH bridge hostnames: the app-preview host
  * (`<APP_PREVIEW_PORT>-<id>-app.<zone>`, the user's own dev server) and the
  * code-server host (`<CODE_PREVIEW_PORT>-<id>-code.<zone>`, VS Code Web).
@@ -3081,8 +3139,8 @@ async function probeAppPreviewStatus(sandbox: Sandbox<unknown>, env: Env) {
  * `/preview-status` and `/preview-inspector.js` are APP-ONLY: the dev-server
  * phase-file probing and the element-inspector postMessage bridge both only
  * make sense against the user's own app, never against code-server. A
- * `target === 'code'` request to either falls through to the final 404
- * exactly like any other out-of-contract path on this hostname.
+ * `target === 'code'` request to either is proxied to code-server like any
+ * other path on that host (see `handleCodeBridge`), never handled here.
  *
  * (Renamed from `handleAppPreview` — was app-preview-only before this
  * generalization; `parseAppPreviewHost` → `parseBridgeHost` in
@@ -3100,6 +3158,8 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
     const cookieSecret = resolveNekoDerivationSecret(env) ?? undefined;
     return handlePreviewBootstrap(url, sandboxId, secrets, cookieSecret);
   }
+
+  if (target === 'code') return handleCodeBridge(request, env, url, sandboxId, secrets, port);
 
   if (target === 'app' && request.method === 'GET' && path === '/preview-status') {
     // Was the ONE unauthenticated route on this hostname (its module doc still
