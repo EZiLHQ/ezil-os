@@ -708,16 +708,32 @@ async function ensureDesktop(
   const exposed = await sandbox.getExposedPorts(hostname);
   const already = exposed.find((p) => p.port === port);
   if (already) {
-    // Fast path: desktop already exposed from a prior call — the app-preview
-    // AND code-preview re-exposure below is skipped here too (pre-existing
-    // behavior, unrelated to this fix), so report both as not attempted
-    // rather than silently implying success.
+    // Fast path: desktop already exposed from a prior call, so the
+    // re-exposure work below is skipped (pre-existing behavior) — `attempted`
+    // stays `false` and is never reported as an attempt that succeeded.
+    //
+    // 🔴 But the bridge URLs must NOT go null here. `getExposedPorts` is the
+    // authoritative list of what is currently exposed, and it was already
+    // fetched above, so read the app/code ports straight out of it. Reporting
+    // `exposed: false` on this path — as this did before — meant every WARM
+    // `/sandbox/preview` call (i.e. every call after the first, which is most
+    // of them) returned `appPreviewUrl: null` / `codePreviewUrl: null` even
+    // though both ports were exposed and serving. The shell would then have a
+    // working preview window on the very first open of a project and an empty
+    // one on every subsequent open, with a 200 and no error anywhere.
+    // `exposed: true` here is an OBSERVATION from `getExposedPorts`, not an
+    // assumption.
+    const alreadyExposeResult = (p: { port: number } | null): AppPreviewExposeResult => {
+      if (!p) return { attempted: false, exposed: false };
+      const hit = exposed.find((e) => e.port === p.port);
+      return hit ? { attempted: false, exposed: true, url: hit.url } : { attempted: false, exposed: false };
+    };
     bootLog('container_start', 'end', { status: 'skipped', detail: 'already_exposed', cumulativeMs: Date.now() - bootT0 });
     bootLog('ready', 'end', { status: 'ok', cumulativeMs: Date.now() - bootT0, detail: 'already_exposed' });
     return {
       url: already.url,
-      appPreviewExpose: { attempted: false, exposed: false },
-      codePreviewExpose: { attempted: false, exposed: false },
+      appPreviewExpose: alreadyExposeResult(appPortFor(mode)),
+      codePreviewExpose: alreadyExposeResult(codePortFor(mode)),
     };
   }
 
@@ -2133,6 +2149,17 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
     // desktop preview itself is already ready. `appPreviewUrl`/`codePreviewUrl`
     // are `null` (never omitted) when the corresponding port wasn't exposed,
     // so the caller can tell "not available" from "field doesn't exist yet".
+    //
+    // 🔴 CALLER CONTRACT — these URLs are SHORT-LIVED. The embedded `token` is
+    // a `/preview-bootstrap` token, valid for `PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS`
+    // (5 minutes, `./hmac.ts`) from the moment THIS response is produced. It is
+    // single-purpose, not a session: navigating to it exchanges it for the
+    // hour-long `ezil_preview` cookie. So a caller must NAVIGATE to the URL
+    // promptly — stashing it in client state and opening the window on a later
+    // user click will 401 at the bootstrap with `preview_bootstrap_token_expired`
+    // and render an empty window with no visible cause. A caller that needs a
+    // window opened later must re-request `/sandbox/preview` (idempotent — the
+    // already-exposed fast path makes it cheap) rather than reuse a stale URL.
     const bootstrapSecret = resolvePreviewSecrets(env)[0] ?? 'local-dev';
     const buildBridgeUrl = async (exposed: AppPreviewExposeResult): Promise<string | null> => {
       if (!exposed.exposed || !exposed.url) return null;
