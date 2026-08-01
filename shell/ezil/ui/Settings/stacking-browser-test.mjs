@@ -402,17 +402,65 @@ async function runViewport (vp) {
         }, app);
     }
 
-    /** Returns null (not a zero-size point) when the titlebar does not exist
-     * or is hidden — e.g. a full-bleed window's own `.window-head` is
-     * `display:none` (`enter_fullpage_mode`). Clicking (0,0) of a hidden
-     * element would silently hit whatever's actually there instead. */
+    /**
+     * Returns null (not a zero-size point) when the titlebar does not exist,
+     * is hidden — e.g. a full-bleed window's own `.window-head` is
+     * `display:none` (`enter_fullpage_mode`) — OR when no part of it is
+     * currently a pixel THIS window actually owns.
+     *
+     * 🔴 THE FIX for the defect documented in the file header (round 6's
+     * verifier): the previous version always returned the geometric midpoint
+     * of `.window-head`'s own rect, with no regard for what is CURRENTLY
+     * painted there. Cascaded windows overlap — a later, larger window can
+     * sit entirely inside an earlier one's footprint for several launches —
+     * so "the midpoint of app's own titlebar rect" and "a pixel app is
+     * visibly on top at" are DIFFERENT claims, and only the second one is
+     * true 100% of the time a real user could click it. Confirmed
+     * unsatisfiable on baseline: preview's titlebar midpoint (e.g. (380,
+     * 184.2) at 1280x860) sits inside settings' rect (290..1050 x 149..709)
+     * while settings sits at a higher z — so `elementFromPoint` there
+     * resolves to settings NO MATTER what z-order dance precedes the click,
+     * because the two windows genuinely overlap at that exact pixel. A test
+     * that clicks it and asserts "preview raised" can never pass; that is a
+     * broken assertion, not a product bug (no user drags a mouse to a pixel
+     * their target app does not visibly occupy).
+     *
+     * The fix: scan the titlebar strip left-to-right at its vertical center
+     * for A pixel that `elementFromPoint` currently attributes to `app`
+     * itself, and click THAT one. If the entire strip is covered by some
+     * other window, return null — the caller's existing `skip()` path is the
+     * honest outcome, not a fabricated pass and not a permanent fail.
+     */
     async function titlebarPoint (app) {
         return page.evaluate((a) => {
             const el = document.querySelector(`.window[data-app="${a}"] .window-head`);
             if ( ! el ) return null;
             const r = el.getBoundingClientRect();
             if ( r.width === 0 || r.height === 0 ) return null;
-            return [r.left + Math.min(40, r.width / 2), r.top + r.height / 2];
+            const y = r.top + r.height / 2;
+            // 🔴 A titlebar strip is not UNIFORMLY safe to click even where
+            // it belongs to `app`: `.window-action-btn` (minimize/close, see
+            // `UIWindow.js`) lives INSIDE `.window-head` too, and a scan that
+            // does not exclude it can walk straight into the close button —
+            // "raising" the window by deleting it, which then reads as z=null
+            // (element gone) rather than a raise. Only a plain drag/title
+            // pixel counts as a titlebar click for this test.
+            const ownsPixel = (x) => {
+                const hit = document.elementFromPoint(x, y);
+                if ( hit?.closest?.('.window-action-btn') ) return false;
+                const win = hit?.closest?.('.window');
+                return !! win && win.getAttribute('data-app') === a;
+            };
+            // Prefer the original midpoint-ish spot (cheapest, and the only
+            // point checked before this fix) so unaffected windows keep
+            // clicking exactly where they always did.
+            const preferred = r.left + Math.min(40, r.width / 2);
+            if ( ownsPixel(preferred) ) return [preferred, y];
+            const STEP = 6;
+            for ( let x = r.left + 3; x <= r.right - 3; x += STEP ) {
+                if ( ownsPixel(x) ) return [x, y];
+            }
+            return null;
         }, app);
     }
 
@@ -496,7 +544,7 @@ async function runViewport (vp) {
             push(`${label}: titlebar hit-tests INTO ${app}`, hitTb.inWindow === app,
                 `${app} z=${z} titlebar-hit=${JSON.stringify(hitTb)}`);
         } else {
-            skip(`${label}: titlebar hit test for ${app} (no visible titlebar — full-bleed hides it by design)`);
+            skip(`${label}: titlebar hit test for ${app} (no titlebar pixel this window owns — either full-bleed hides it by design, or another window fully occludes it)`);
         }
         if ( bp ) {
             push(`${label}: a button inside ${app} hit-tests INTO ${app}`, hitBp.inWindow === app,
@@ -539,13 +587,169 @@ async function runViewport (vp) {
         }
     }
 
+    /**
+     * 🔴 THE INSIDE-THE-WINDOW CHECK. Round 4-5's harnesses proved WHERE
+     * windows sit (paint order, taskbar occlusion). Round 6 shipped a defect
+     * in WHAT a window shows: `hidden = true` next to an inline
+     * `display:flex` (inline beats the UA `[hidden]{display:none}`) left
+     * `.ezil-code-unavailable` painted over a working iframe, and every app
+     * test used `textContent` as its oracle — blind to CSS, under jsdom,
+     * which has no cascade. This is that check, generalised, in a real
+     * browser, registry-driven — no `if (app === 'code')` anywhere below.
+     *
+     * The structural contract this leans on is shared by every iframe-backed
+     * app in the registry (`desktop-window.js`, `preview.js`, `code.js`, all
+     * three grepped): `UIWindow` gives every app a `.window-body`, and each
+     * of those three appends its real content (`.window-app-iframe`,
+     * created by `UIWindow` itself) and its own loading/error panels
+     * (`BootProgress`'s `.ezil-boot`, `.ezil-{code,preview}-unavailable`) as
+     * DIRECT CHILDREN of that same `.window-body`, each `position:absolute;
+     * inset:0` (verified in `ezil-shell.css`) — i.e. genuinely stacked on
+     * top of one another, not just adjacent in the DOM. Nothing here reads
+     * an app's class name; it reads the SHAPE every app already commits to.
+     *
+     * "The app reports success" is read the same structural way, not by
+     * app id: `iframe_url: 'about:blank'` at window creation, and `src` is
+     * assigned exactly once, to a real (or fake-but-real-shaped) URL, only
+     * on the success path (grepped: all three do this). So "src moved off
+     * about:blank" IS the app-agnostic success signal — checking it earlier
+     * would mean asserting through a boot panel that has every right to be
+     * there, which is not this defect.
+     *
+     * Once ready, this hit-tests the iframe's own on-screen center AND scans
+     * every other element inside `.window-body` for one that is (a)
+     * genuinely visible per COMPUTED style — not the `hidden` IDL property,
+     * which is exactly the property the round-6 bug defeats — and (b)
+     * geometrically overlapping the iframe. Either the hit misses the
+     * iframe, or an occluder is found: both are the same defect, caught two
+     * ways for the same reason `assertHitTestsIntoSelf` checks both a
+     * titlebar point and a button point.
+     *
+     * A window with no `.window-app-iframe` at all (Settings — plain DOM
+     * content, no boot phase) gets the weaker but still real form of the
+     * same claim: its `.window-body` center must hit-test into ITS OWN
+     * window, not something stacked over it.
+     */
+    async function checkContentPainted (app, label) {
+        const res = await page.evaluate((a) => {
+            const win = document.querySelector(`.window[data-app="${a}"]`);
+            if ( ! win ) return { skip: true, reason: 'window not found' };
+            const body = win.querySelector('.window-body');
+            if ( ! body ) return { skip: true, reason: 'no .window-body on this window' };
+            const bRect = body.getBoundingClientRect();
+            if ( bRect.width === 0 || bRect.height === 0 ) {
+                return { skip: true, reason: 'window-body has zero size (minimized or hidden)' };
+            }
+
+            const iframe = win.querySelector('.window-app-iframe');
+            const overlaps = (r1, r2) => r1.left < r2.right && r1.right > r2.left && r1.top < r2.bottom && r1.bottom > r2.top;
+            const isVisible = (el) => {
+                const cs = getComputedStyle(el);
+                const r = el.getBoundingClientRect();
+                return cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity) !== 0
+                    && r.width > 0 && r.height > 0;
+            };
+
+            if ( iframe ) {
+                const src = iframe.getAttribute('src') || '';
+                if ( src === '' || src === 'about:blank' ) {
+                    return { skip: true, reason: `iframe still on "${src || '(no src yet)'}"  — app has not committed to real content yet (a boot/loading panel legitimately owns the screen here)` };
+                }
+                const iRect = iframe.getBoundingClientRect();
+                const occluders = Array.from(body.querySelectorAll('*'))
+                    .filter((el) => el !== iframe && ! iframe.contains(el) && ! el.contains(iframe))
+                    .filter((el) => isVisible(el) && overlaps(el.getBoundingClientRect(), iRect))
+                    .map((el) => ({ tag: el.tagName, cls: el.className }));
+                const cx = iRect.left + iRect.width / 2;
+                const cy = iRect.top + iRect.height / 2;
+                const hitEl = document.elementFromPoint(cx, cy);
+                const hitIsIframe = hitEl === iframe;
+                return {
+                    skip: false,
+                    pass: occluders.length === 0 && hitIsIframe,
+                    detail: { src, hitIsIframe, hitTag: hitEl?.tagName ?? null, hitCls: hitEl?.className ?? null, occluders },
+                };
+            }
+
+            // No iframe: a plain in-DOM content window. Its real content IS
+            // whatever `.window-body` paints — assert the center of that
+            // region resolves into THIS window, not one stacked over it.
+            const cx = bRect.left + bRect.width / 2;
+            const cy = bRect.top + bRect.height / 2;
+            const hitEl = document.elementFromPoint(cx, cy);
+            const hitWin = hitEl?.closest?.('.window');
+            return {
+                skip: false,
+                pass: !! hitWin && hitWin.getAttribute('data-app') === a,
+                detail: { hitTag: hitEl?.tagName ?? null, hitCls: hitEl?.className ?? null, hitOwnerApp: hitWin ? hitWin.getAttribute('data-app') : null },
+            };
+        }, app);
+
+        const name = `${label}: ${app}'s content region shows its own real content, unoccluded`;
+        if ( res.skip ) {
+            skip(name, res.reason);
+            return;
+        }
+        push(name, res.pass, JSON.stringify(res.detail));
+    }
+
+    /**
+     * Poll `checkContentPainted`'s own underlying state until it stops
+     * changing (or a timeout elapses) before trusting it — same reasoning as
+     * `settle()` for geometry: `confirmFrame`'s round trip and the
+     * hide-the-boot-panel it triggers are asynchronous, so the FIRST read
+     * after `src` goes live can catch the panel mid-fade-out. Returns
+     * whichever state it last observed; a state that never stabilizes is
+     * still evaluated (not silently dropped) because "still visibly
+     * flapping after 2s" is itself worth knowing, not worth hiding.
+     */
+    async function settleContentPainted (app, { timeout = 2000, step = 60 } = {}) {
+        const read = () => page.evaluate((a) => {
+            const win = document.querySelector(`.window[data-app="${a}"]`);
+            const iframe = win?.querySelector('.window-app-iframe');
+            if ( ! iframe ) return 'no-iframe';
+            const src = iframe.getAttribute('src') || '';
+            if ( src === '' || src === 'about:blank' ) return `not-ready:${src}`;
+            const body = win.querySelector('.window-body');
+            const iRect = iframe.getBoundingClientRect();
+            const overlaps = (r1, r2) => r1.left < r2.right && r1.right > r2.left && r1.top < r2.bottom && r1.bottom > r2.top;
+            const isVisible = (el) => {
+                const cs = getComputedStyle(el);
+                const r = el.getBoundingClientRect();
+                return cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity) !== 0 && r.width > 0 && r.height > 0;
+            };
+            const occluderCount = Array.from(body.querySelectorAll('*'))
+                .filter((el) => el !== iframe && ! iframe.contains(el) && ! el.contains(iframe))
+                .filter((el) => isVisible(el) && overlaps(el.getBoundingClientRect(), iRect)).length;
+            return `ready:${occluderCount}`;
+        }, app);
+        let prev = await read();
+        const deadline = Date.now() + timeout;
+        while ( Date.now() < deadline ) {
+            await sleep(step);
+            const cur = await read();
+            if ( cur === prev ) return true;
+            prev = cur;
+        }
+        return false;
+    }
+
     /** 🔴 THE CLICK-TO-RAISE CHECK, via a real trusted click at the titlebar's
      * actual screen position — see file header for why not `.focusWindow()`. */
     async function raiseByTitlebarClick (app, contenders, label) {
         await ensureNotTopmost(app, contenders);
         const tb = await titlebarPoint(app);
         if ( ! tb ) {
-            skip(`${label}: raise ${app} by clicking its titlebar (no visible titlebar)`);
+            // 🔴 Justified, not a cop-out: `titlebarPoint` just scanned the
+            // ENTIRE titlebar strip and found no pixel currently attributed
+            // to `app` — either the titlebar does not exist/is hidden
+            // (full-bleed), or `app`'s titlebar is presently, entirely
+            // covered by another window's rect. In the second case NO click
+            // coordinate could make this assertion pass (see the doc block
+            // on `titlebarPoint`), so failing it would be an unsatisfiable
+            // gate, not a real signal — `raiseByTaskbarItemClick` still
+            // covers "can a user raise this window" via the other real path.
+            skip(`${label}: raise ${app} by clicking its titlebar (no titlebar pixel this window owns right now — either hidden by full-bleed, or fully occluded by another window's overlapping rect)`);
             return;
         }
         await page.mouse.click(tb[0], tb[1]);
@@ -650,10 +854,14 @@ async function runViewport (vp) {
         const fullbleed = await page.evaluate((id) =>
             document.querySelector(`.window[data-app="${id}"]`)?.classList.contains('ezil-fullbleed') === true, bootAppId);
         push(`${VP} boot app "${bootAppId}" reached full-bleed`, fullbleed, `z=${await zIndexOf(bootAppId)}`);
+        await settleContentPainted(bootAppId);
+        await checkContentPainted(bootAppId, `${VP} boot app "${bootAppId}" (full-bleed)`);
     } else {
         await settle(bootAppId);
         await assertHitTestsIntoSelf(bootAppId, `${VP} boot app "${bootAppId}"`);
         await checkTaskbarReachable(`${VP} boot app "${bootAppId}" alone`);
+        await settleContentPainted(bootAppId);
+        await checkContentPainted(bootAppId, `${VP} boot app "${bootAppId}" alone`);
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -679,6 +887,8 @@ async function runViewport (vp) {
             push(`${VP} SCENARIO: Settings opened from the full-bleed drawer`,
                 !! (await page.evaluate(() => !! document.querySelector('.window[data-app="settings"]'))));
             await assertHitTestsIntoSelf('settings', `${VP} Settings (full-bleed, opened from drawer)`);
+            await settleContentPainted('settings');
+            await checkContentPainted('settings', `${VP} Settings (full-bleed, opened from drawer)`);
             coveredIds.add('settings');
         }
     }
@@ -718,6 +928,8 @@ async function runViewport (vp) {
 
         await assertHitTestsIntoSelf(id, `${VP} "${id}" (just opened)`);
         await checkTaskbarReachable(`${VP} after opening "${id}"`);
+        await settleContentPainted(id);
+        await checkContentPainted(id, `${VP} "${id}" (just opened)`);
 
         const soFar = [...coveredIds];
         await raiseByTitlebarClick(id, soFar, `${VP} "${id}"`);
