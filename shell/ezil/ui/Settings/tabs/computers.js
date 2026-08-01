@@ -75,6 +75,27 @@ function timeAgo (input) {
     return date.toLocaleDateString();
 }
 
+/**
+ * 🔴 `UIAlert`'s `type: 'warning'`/`'error'` look up `window.icons['warning-
+ * sign.svg']` / `['danger.svg']` — neither is among the 21 icons this fork
+ * actually ported (`shell/src/icons/`, see `PUTER-PROVENANCE.md`; only
+ * `'success'` -> `c-check.svg` survived the prune). OBSERVED: without an
+ * explicit override, `body_icon` comes back `undefined` and the dialog
+ * renders `<img src="undefined">` — not a crash, just a broken image next
+ * to the text. Passing `body_icon` explicitly sidesteps it without adding a
+ * file to that Puter-derived, provenance-tracked directory for two dialogs —
+ * the same reasoning `registry.js`'s `DESKTOP_ICON`/`SETTINGS_ICON` already
+ * give for using an inline data URI instead.
+ */
+const ALERT_WARNING_ICON = 'data:image/svg+xml,' + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#e0a030" stroke-width="2">'
+    + '<path d="M12 3 2 20h20L12 3Z" stroke-linejoin="round"/><path d="M12 10v4M12 17h.01" stroke-linecap="round"/></svg>',
+);
+const ALERT_ERROR_ICON = 'data:image/svg+xml,' + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#d32f2f" stroke-width="2">'
+    + '<circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6" stroke-linecap="round"/></svg>',
+);
+
 /** `UIAlert`'s message goes through `html_encode` and then selectively
  * un-escapes `<p>`/`<strong>`/`<br>` — see `UIAlert.js`. Building the message
  * out of real `<p>` tags (rather than one blob) is what makes that survive
@@ -87,6 +108,7 @@ async function confirmDelete (copy) {
     const value = await UIAlert({
         message: alertMessage(copy),
         type: 'warning',
+        body_icon: ALERT_WARNING_ICON,
         buttons: [
             { label: copy.confirmLabel, value: 'confirm', type: 'danger' },
             { label: copy.cancelLabel, value: 'cancel', type: 'secondary' },
@@ -96,7 +118,12 @@ async function confirmDelete (copy) {
 }
 
 function reportError (message) {
-    void UIAlert({ message, type: 'error', buttons: [{ label: 'OK', value: true, type: 'primary' }] });
+    void UIAlert({
+        message,
+        type: 'error',
+        body_icon: ALERT_ERROR_ICON,
+        buttons: [{ label: 'OK', value: true, type: 'primary' }],
+    });
 }
 
 /**
