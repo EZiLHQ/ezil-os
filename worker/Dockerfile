@@ -64,6 +64,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       default-jre-headless \
       python3 \
       wget \
+      curl \
       unzip \
       ca-certificates \
       dbus-x11 \
@@ -111,7 +112,14 @@ COPY scripts/start-neko.sh /usr/local/bin/start-neko.sh
 # "Dev server (Option D app preview)" section for why it's placed there and
 # why it never blocks boot.
 COPY scripts/start-devserver.sh /usr/local/bin/start-devserver.sh
-RUN chmod +x /usr/local/bin/start-desktop.sh /usr/local/bin/start-neko.sh /usr/local/bin/start-devserver.sh
+# Idempotent code-server launcher (pid-file + port probe), ported from the
+# Sandboxes reference — see that file's own doc comment. Not on start-neko.sh's
+# own mandatory boot path (which supervises code-server directly for restart-
+# budget/health-file parity with the native browser — see start-neko.sh's
+# "code-server" launch section), but shipped here as a standalone, idempotent
+# utility for on-demand/manual relaunch.
+COPY scripts/start-codeserver.sh /usr/local/bin/start-codeserver.sh
+RUN chmod +x /usr/local/bin/start-desktop.sh /usr/local/bin/start-neko.sh /usr/local/bin/start-devserver.sh /usr/local/bin/start-codeserver.sh
 # ── Alternate `neko` desktop mode (Phase 1, opt-in via desktopMode) ──────────
 # Guacamole above remains the default/rollback path — nothing above this
 # comment is changed by Neko's presence. The pinned Neko + VS Code runtime
@@ -166,17 +174,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #   /usr/bin/neko    — the Neko Go application server
 #   /var/www         — the Neko HTML5 client bundle (served on 8181)
 #   /etc/neko        — neko.yaml, xorg.conf, openbox.xml, plugins
-#   /usr/share/code  — the pinned VS Code build (+ /usr/bin/code launcher)
+#
+# NOTE: the pinned image's /usr/share/code (Electron VS Code) is deliberately
+# NOT copied — see the code-server install below, which replaces it in this
+# SAME commit. The two must never coexist: Electron VS Code was a second
+# Chromium-family renderer compositing into this same Xvfb display, captured
+# by the same software vp8enc encoder as the native browser, plus its own
+# extension host — on a machine this container no longer runs (see the
+# instance_type history in wrangler.toml). code-server serves the IDE over
+# plain HTTP and renders nothing into Xvfb.
 COPY --from=neko /usr/bin/neko   /usr/bin/neko
 COPY --from=neko /var/www        /var/www
 COPY --from=neko /etc/neko       /etc/neko
-COPY --from=neko /usr/share/code /usr/share/code
 RUN chmod +x /usr/bin/neko \
-  && ln -sf /usr/share/code/bin/code /usr/bin/code \
   && if ldd /usr/bin/neko | grep -qi "not found"; then echo "ERROR: neko has unresolved shared libraries:" >&2; ldd /usr/bin/neko | grep -i "not found" >&2; exit 1; fi \
   && test -x /usr/bin/neko \
   && test -d /var/www \
   && test -f /etc/neko/neko.yaml
+
+# ── code-server (replaces the pinned Electron VS Code build above) ───────────
+# Installed via the official installer, which on Debian/Ubuntu fetches and
+# installs the .deb release from GitHub (detected automatically; see
+# https://code-server.dev/install.sh). Binds to 127.0.0.1:8443 only — never
+# 0.0.0.0 — with `--auth none`; start-neko.sh/start-codeserver.sh launch it,
+# and the only inbound path is the existing HMAC/cookie-gated containerFetch
+# proxy. This RUN step must stay in the SAME commit as the /usr/share/code
+# COPY removal above so the two IDEs are never both present in one image.
+RUN curl -fsSL https://code-server.dev/install.sh | sh \
+  && test -x /usr/bin/code-server
 
 # ── EZiL OS desktop assets + deterministic validators ────────────────────────
 # Explicit Openbox config (app-switch keybindings + root menu), the mandatory
