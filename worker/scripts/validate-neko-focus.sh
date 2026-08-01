@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# Deterministic, machine-checkable proof that focus-switching between the two
-# mandatory neko apps (VS Code, native browser) actually changes the active X
-# window — not just that the focus helper exited 0.
+# Deterministic, machine-checkable proof of focus-switching behavior on the
+# neko desktop, after the code-server swap (Electron VS Code removed — see
+# start-neko.sh and the Dockerfile).
 #
 # Usage (run inside the neko container, after start-neko.sh has reached the
 # window-ready gate): scripts/validate-neko-focus.sh
 #
-# Captures `xdotool getactivewindow` at each step and asserts:
-#   1. VS Code and Chrome windows are both enumerated in `wmctrl -x -l`.
-#   2. Focusing VS Code changes the active window id to the VS Code window.
-#   3. Focusing the browser changes the active window id to the browser window.
-#   4. Focusing VS Code again changes it back.
+# Captures `xdotool getactivewindow` and asserts:
+#   1. The native browser window is enumerated in `wmctrl -x -l`.
+#   2. Focusing the browser via neko-switch-app.sh actually changes the
+#      active window id to the enumerated browser window (not just that the
+#      helper exited 0).
+#   3. `neko-switch-app.sh vscode` degrades GRACEFULLY: it exits non-zero
+#      (no window to find — code-server is a plain HTTP server, not an X
+#      client) but does NOT crash the shell, hang, or disturb the already-
+#      focused browser window. This is the automated version of the manual
+#      check the code-server migration brief asked for ("W-1/W-c simply find
+#      no window — confirm that is true rather than assuming it").
 #
 # ID NORMALIZATION (critical): `wmctrl -x -l` prints window ids in hex
 # (0x03600003) while `xdotool getactivewindow` prints the same id in DECIMAL
@@ -54,36 +60,39 @@ command -v xdotool >/dev/null 2>&1 || fail "xdotool not installed"
 echo "== enumerated windows (wmctrl -x -l: id / class / title) =="
 wmctrl -x -l || fail "wmctrl -x -l failed"
 
-vscode_id="$(win_id_for 'code|Code')"
 chrome_id="$(win_id_for 'chrome')"
-
-[ -n "$vscode_id" ] || fail "no enumerated VS Code window found in wmctrl -x -l"
 [ -n "$chrome_id" ] || fail "no enumerated browser window found in wmctrl -x -l"
-
-echo "expected vscode window id (decimal): $vscode_id"
 echo "expected chrome window id (decimal): $chrome_id"
 
+echo "== focusing the native browser actually changes the active window =="
 before="$(active_id)"
 echo "active window BEFORE any focus (decimal): $before"
-
-/usr/local/bin/neko-switch-app.sh vscode
-sleep 1
-after_vscode="$(active_id)"
-echo "active window AFTER focusing vscode (decimal): $after_vscode"
-[ "$after_vscode" = "$vscode_id" ] || fail "active window after focusing vscode ($after_vscode) does not match enumerated vscode window ($vscode_id)"
 
 /usr/local/bin/neko-switch-app.sh chromium
 sleep 1
 after_chrome="$(active_id)"
 echo "active window AFTER focusing browser (decimal): $after_chrome"
 [ "$after_chrome" = "$chrome_id" ] || fail "active window after focusing browser ($after_chrome) does not match enumerated browser window ($chrome_id)"
-[ "$after_chrome" != "$after_vscode" ] || fail "active window did not change between vscode and browser focus ($after_chrome == $after_vscode)"
 
-/usr/local/bin/neko-switch-app.sh vscode
-sleep 1
-back_to_vscode="$(active_id)"
-echo "active window AFTER focusing vscode again (decimal): $back_to_vscode"
-[ "$back_to_vscode" = "$vscode_id" ] || fail "active window after re-focusing vscode ($back_to_vscode) does not match enumerated vscode window ($vscode_id)"
-[ "$back_to_vscode" != "$after_chrome" ] || fail "active window did not change back from browser to vscode ($back_to_vscode == $after_chrome)"
+echo "== neko-switch-app.sh vscode degrades gracefully (no window, no crash) =="
+# code-server (which replaced Electron VS Code) is a plain HTTP server with no
+# X window, so this MUST fail (no window found) — a SUCCESSFUL exit here would
+# mean something unexpectedly still matches the vscode class regex, which
+# would itself be a regression worth catching.
+/usr/local/bin/neko-switch-app.sh vscode >/tmp/neko-switch-vscode.out 2>&1
+vscode_helper_rc=$?
+if [ "$vscode_helper_rc" -eq 0 ]; then
+  fail "neko-switch-app.sh vscode unexpectedly SUCCEEDED — code-server should have no matching X window (see /tmp/neko-switch-vscode.out)"
+fi
+grep -qi "no window found for vscode" /tmp/neko-switch-vscode.out \
+  || fail "neko-switch-app.sh vscode did not fail with the expected 'no window found' message (got: $(cat /tmp/neko-switch-vscode.out))"
+echo "OK: neko-switch-app.sh vscode exited non-zero (rc=$vscode_helper_rc) with the expected 'no window found' message — confirmed no-op, not a crash"
 
-echo "PASS: active-window identity changed correctly in both directions (vscode=$vscode_id, chrome=$chrome_id)"
+# The graceful no-op must not have disturbed the already-focused browser
+# window (the fail-closed case here would be the shell/WM state getting
+# corrupted by the failed helper invocation).
+after_noop="$(active_id)"
+echo "active window AFTER the vscode no-op attempt (decimal): $after_noop"
+[ "$after_noop" = "$chrome_id" ] || fail "active window changed unexpectedly after the vscode no-op ($after_noop != $chrome_id) — graceful degradation should leave focus untouched"
+
+echo "PASS: browser focus-switch works, and vscode focus-switch degrades gracefully (no window, no crash, no side effect) (chrome=$chrome_id)"
