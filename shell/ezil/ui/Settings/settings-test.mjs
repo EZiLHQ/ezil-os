@@ -82,6 +82,14 @@ window.fetch = async (url, opts = {}) => {
     // Snapshot the DOM AS THE REQUEST GOES OUT. This is the whole delete-order
     // assertion: after the fact, both orderings look the same.
     rec.domAtCall.desktopWindows = window.document.querySelectorAll('.window[data-app="desktop"]').length;
+    // 🔴 Same snapshot for Preview/Code — the app-name-selector defect
+    // (`DESKTOP_SELECTOR`-only closing) is invisible to a check that only
+    // ever counts `data-app="desktop"`. Section 5d below is the regression:
+    // it fails if a future edit reintroduces an app-name-keyed selector for
+    // the delete/switch close, because these three counts would stop
+    // dropping to zero together.
+    rec.domAtCall.previewWindows = window.document.querySelectorAll('.window[data-app="preview"]').length;
+    rec.domAtCall.codeWindows = window.document.querySelectorAll('.window[data-app="code"]').length;
     calls.push(rec);
 
     const json = (body, status = 200) => ({
@@ -412,6 +420,81 @@ const delA = calls.filter(c => c.url.includes('computer.delete')).pop();
 push('🔴 an un-attributable desktop is closed BEFORE delete (fails safe)',
     delA?.domAtCall.desktopWindows === 0 && qa('.window[data-app="desktop"]').length === 0,
     `${delA?.domAtCall.desktopWindows} at request time`);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5d. 🔴 THE REGRESSION: DELETE MUST CLOSE PREVIEW AND CODE TOO, NOT JUST
+//     THE DESKTOP. This is the exact defect `DESKTOP_SELECTOR`-only closing
+//     shipped: Preview/Code are container windows on the same sandbox as the
+//     desktop, but a different `data-app`, so an app-name-keyed selector
+//     misses them by construction. If `closeSandboxWindows()` in
+//     `tabs/computers.js` ever regresses to matching on `data-app` again,
+//     THIS is the check that catches it — desktopWindows would still drop to
+//     0 while previewWindows/codeWindows do not.
+// ═══════════════════════════════════════════════════════════════════════════
+const C = { id: 'c-c', name: 'Gamma', slot: 1, createdAt: new Date().toISOString(), lastOpenedAt: null };
+listRows = [C];
+await ezil.registry.launch('desktop', { ...ctx, computer: C });
+await settle(6);
+await ezil.registry.launch('preview', { ...ctx, computer: C });
+await settle(6);
+await ezil.registry.launch('code', { ...ctx, computer: C });
+await settle(6);
+
+push('desktop + preview + code are all open, all stamped for c-c',
+    q('.window[data-app="desktop"][data-ezil-computer-id="c-c"]') !== null
+    && q('.window[data-app="preview"][data-ezil-computer-id="c-c"]') !== null
+    && q('.window[data-app="code"][data-ezil-computer-id="c-c"]') !== null);
+
+await reopenSettings();
+const rowC = qa('.window[data-app="settings"] .ezil-settings-row').find(r => r.getAttribute('data-id') === 'c-c');
+click(rowC?.querySelector('[data-action="delete"]'));
+await settle(6);
+await confirmTheDialog();
+const delC = calls.filter(c => c.url.includes('computer.delete')).pop();
+push('🔴 THE REGRESSION CHECK: desktop, preview AND code were all closed BEFORE computer.delete went out',
+    delC?.domAtCall.desktopWindows === 0 && delC?.domAtCall.previewWindows === 0 && delC?.domAtCall.codeWindows === 0,
+    `desktop=${delC?.domAtCall.desktopWindows} preview=${delC?.domAtCall.previewWindows} code=${delC?.domAtCall.codeWindows} at request time`);
+push('all three are gone from the document afterwards',
+    qa('.window[data-app="desktop"]').length === 0
+    && qa('.window[data-app="preview"]').length === 0
+    && qa('.window[data-app="code"]').length === 0);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5e. 🔴 SWITCH MUST ALSO RE-TARGET PREVIEW AND CODE, NOT JUST THE DESKTOP.
+//     Same defect, the other call site: switching computers left Preview/Code
+//     streaming the OLD container because `switchTo()` only ever closed the
+//     desktop window.
+// ═══════════════════════════════════════════════════════════════════════════
+const D = { id: 'c-d', name: 'Delta', slot: 1, createdAt: new Date().toISOString(), lastOpenedAt: null };
+const E = { id: 'c-e', name: 'Epsilon', slot: 2, createdAt: new Date().toISOString(), lastOpenedAt: null };
+listRows = [D, E];
+await ezil.registry.launch('desktop', { ...ctx, computer: D });
+await settle(6);
+await ezil.registry.launch('preview', { ...ctx, computer: D });
+await settle(6);
+await ezil.registry.launch('code', { ...ctx, computer: D });
+await settle(6);
+push('before switching: desktop + preview + code all stream c-d',
+    q('.window[data-app="desktop"][data-ezil-computer-id="c-d"]') !== null
+    && q('.window[data-app="preview"][data-ezil-computer-id="c-d"]') !== null
+    && q('.window[data-app="code"][data-ezil-computer-id="c-d"]') !== null);
+
+await reopenSettings();
+const rowE = qa('.window[data-app="settings"] .ezil-settings-row').find(r => r.getAttribute('data-id') === 'c-e');
+click(rowE?.querySelector('[data-action="switch"]'));
+await settle(20, 40);
+
+// `switchTo()` only relaunches the desktop for the new computer — it does
+// not reopen Preview/Code for it — so the correct end state is that the OLD
+// ones are gone entirely, not merely re-stamped.
+push('🔴 switching away closes the OLD preview window (not left streaming c-d)',
+    qa('.window[data-app="preview"]').length === 0,
+    `${qa('.window[data-app="preview"]').length} preview window(s) remain`);
+push('🔴 switching away closes the OLD code window (not left streaming c-d)',
+    qa('.window[data-app="code"]').length === 0,
+    `${qa('.window[data-app="code"]').length} code window(s) remain`);
+push('the desktop now streams the NEW computer (c-e)',
+    q('.window[data-app="desktop"][data-ezil-computer-id="c-e"]') !== null);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 6. LOCAL CODE ONLY.
