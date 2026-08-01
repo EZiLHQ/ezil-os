@@ -439,9 +439,27 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
     const win = await until(() => $1(window, '.window[data-app="desktop"]'));
     push('the desktop window opened on the React host', !!win);
 
+    // Capture what the shell was actually tracking BEFORE the regeneration, so
+    // the "did this really get destroyed" check is about the shell's own
+    // bookkeeping (`ezil.desktop`, `ezil.mountAttempts`) rather than about a
+    // DOM node whose lifetime is no longer coupled to it.
+    const stale_desktop = window.ezil.desktop;
+    const attempts_before = window.ezil.mountAttempts;
+
     // Now do exactly what React does when it regenerates the tree: replace the
     // mount point with a fresh copy of the server markup, drop the windows,
     // and put <body>'s class list back to what the server sent.
+    //
+    // 🔴 Deliberately NOT touching `.taskbar` here. `UITaskbar` is appended
+    // straight to `<body>` (see UITaskbar.js's stacking-context fix) precisely
+    // so it lives OUTSIDE the React-owned subtree rooted at `#ezil-os-root`.
+    // A real React regeneration of that subtree cannot and does not remove a
+    // sibling it never rendered — VERIFIED in a real browser: after replacing
+    // `#ezil-os-root`, the pre-existing taskbar is untouched (still 1), only
+    // the windows and the `.desktop` this shell was tracking are gone. An
+    // assertion that expected `.taskbar` to vanish here was stale from before
+    // the reparent, and — worse — made the WAIT below pass on the orphaned
+    // taskbar's mere presence instead of on a real rebuild ever happening.
     const fresh = window.document.createElement('div');
     fresh.id = 'ezil-os-root';
     fresh.setAttribute('data-awaits-hydration', 'react');
@@ -450,14 +468,33 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
     for (const el of $$(window, '.window')) el.remove();
     window.document.body.className = 'min-h-full flex flex-col';
     push('the simulated regeneration really did destroy the desktop',
-        $$(window, '.taskbar, .window').length === 0);
+        $$(window, '.window').length === 0 && stale_desktop?.isConnected === false,
+        `windows=${$$(window, '.window').length} tracked-desktop-connected=${stale_desktop?.isConnected}`);
+    push('...but the taskbar — outside the React-owned subtree — is untouched by it',
+        $$(window, '.taskbar').length === 1, `${$$(window, '.taskbar').length} taskbars`);
 
-    const rebuilt = await until(() => $1(window, '.taskbar'));
+    // 🔴 Wait for a REAL rebuild, not for "a `.taskbar` exists" — that is true
+    // the instant after the line above runs, because the orphaned taskbar is
+    // still sitting in `<body>` and `build()` only clears+recreates it partway
+    // through its own async rebuild. Polling on mere presence would resolve on
+    // the ORPHAN before `mount()` ever re-ran, and the very next assertion
+    // (device class reapplied) would then be checked before the rebuild had a
+    // chance to run — exactly how this went stale. `mountAttempts` incrementing
+    // is the one signal that cannot be satisfied by anything left over from
+    // the destroyed mount.
+    const rebuilt = await until(() => window.ezil.mountAttempts > attempts_before
+        && $1(window, '.window[data-app="desktop"]'));
     push('🔴 a destroyed desktop rebuilds itself — `mounted` is not a latch',
         !!rebuilt, `attempts=${window.ezil.mountAttempts}`);
+    push('the rebuild adopted a genuinely new desktop node, not the disconnected one',
+        !!window.ezil.desktop && window.ezil.desktop !== stale_desktop && window.ezil.desktop.isConnected,
+        `same-node=${window.ezil.desktop === stale_desktop} connected=${window.ezil.desktop?.isConnected}`);
     push('the rebuild is not a duplicate',
         $$(window, '.taskbar').length === 1 && $$(window, '.desktop').length === 1,
         `${$$(window, '.taskbar').length} taskbars, ${$$(window, '.desktop').length} desktops`);
+    push('...nor is the pinned taskbar item',
+        $$(window, '.taskbar-item[data-app="desktop"]').length === 1,
+        `${$$(window, '.taskbar-item[data-app="desktop"]').length} items`);
     push('the device class is back on <body>',
         window.document.body.classList.contains('device-desktop'), window.document.body.className);
     const rewin = await until(() => $1(window, '.window[data-app="desktop"]'));
