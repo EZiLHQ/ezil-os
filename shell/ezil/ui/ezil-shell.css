@@ -112,6 +112,35 @@ body.device-phone {
     display: none;
 }
 
+/* ── the "not available in this deployment" panels ────────────────────────
+ * `code.js` and `preview.js` build these and retire them with `hidden`, the
+ * same way. Their styles live HERE rather than in an inline `Object.assign`
+ * for exactly the reason documented above: an inline `display` beats the UA's
+ * `[hidden] { display: none }`, and the panel then never hides no matter what
+ * the code sets. Both windows shipped precisely that bug — an opaque white
+ * failure page painted over a working iframe, invisible during boot because
+ * `.ezil-boot` covered it, and revealed the moment the boot panel retired on
+ * SUCCESS. Keep these declarations out of inline style. */
+.ezil-code-unavailable,
+.ezil-preview-unavailable {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 24px;
+    text-align: center;
+    background: #fff;
+    color: #333;
+}
+
+.ezil-code-unavailable[hidden],
+.ezil-preview-unavailable[hidden] {
+    display: none;
+}
+
 .ezil-boot-panel {
     width: 100%;
     max-width: 340px;
