@@ -238,3 +238,41 @@ export const APP_PREVIEW_TOKEN = 'app';
 export function appPortFor(mode: DesktopMode): { port: number; token: string } | null {
   return mode === 'neko' ? { port: APP_PREVIEW_PORT, token: APP_PREVIEW_TOKEN } : null;
 }
+
+// ── Code-server bridge port (VS Code in the browser, alongside the app preview) ──
+//
+// The `neko` desktop-mode image runs code-server (VS Code Web) for its editor
+// surface. Historically the ONLY way to reach it was through the full neko
+// WebRTC pixel-stream (`portFor('neko')`, port 8181) — heavier, higher-latency,
+// and coupled to the whole desktop session. This gives code-server its own
+// direct iframe-over-reverse-proxy bridge, mirroring `appPortFor` exactly, so
+// the shell can embed a plain "code" window the same way it embeds a preview
+// window, without going through WebRTC at all.
+
+/**
+ * In-container port code-server listens on. Deliberately distinct from every
+ * other reserved port on this stack: 3000 is the `@cloudflare/sandbox` SDK's
+ * own control plane (see `APP_PREVIEW_PORT`'s doc comment / platform notes
+ * §5 — `validatePort(3000) === false`), 3002 is the user's own dev server
+ * (`APP_PREVIEW_PORT`), 8080 is guacamole (`portFor('guacamole')`), 8181 is
+ * the neko WebRTC/noVNC stream (`portFor('neko')`). 8443 collides with none
+ * of them.
+ */
+export const CODE_PREVIEW_PORT = 8443;
+
+/**
+ * Preview-URL token for the code-server bridge port. Lowercase-alphanumeric
+ * only — see `portFor()`'s doc comment for why (SDK + hostname-label
+ * constraints: `@cloudflare/sandbox`'s `exposePort` rejects anything outside
+ * `[a-z0-9_]+`, and a valid hostname label further forbids `_`).
+ */
+export const CODE_PREVIEW_TOKEN = 'code';
+
+/**
+ * Resolve the code-server bridge port/token for a desktop mode, or `null`
+ * when the mode has no code-server surface (`guacamole` streams the whole X
+ * desktop and has no separate code-server process to bridge to).
+ */
+export function codePortFor(mode: DesktopMode): { port: number; token: string } | null {
+  return mode === 'neko' ? { port: CODE_PREVIEW_PORT, token: CODE_PREVIEW_TOKEN } : null;
+}

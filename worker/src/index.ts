@@ -157,6 +157,15 @@ interface Env extends SandboxEnv {
   SANDBOX_TWEN?: string;
 
   /**
+   * Non-secret kill-switch for the window-focus control route
+   * (`POST /sandbox/:name/focus`, see `handleFocus` / `validateFocusApp`).
+   * Enabled by default (HMAC-gated, closed enum body, no arbitrary shell
+   * input); set to `off`/`false`/`0`/`disabled`/`no` to hard-disable the
+   * surface (returns 404) without a code change.
+   */
+  SANDBOX_FOCUS?: string;
+
+  /**
    * Non-secret opt-in flag forwarded verbatim into the container process env
    * as `EZIL_NEKO_CPU_DIAG_ENABLED` (see `ensureDesktop` + `cpu-diag.ts`),
    * which gates `scripts/start-neko.sh`'s in-container CPU sampler. DEFAULT
@@ -231,7 +240,9 @@ import {
   checkIceConfig,
   portFor,
   appPortFor,
+  codePortFor,
   APP_PREVIEW_PORT,
+  CODE_PREVIEW_PORT,
   DESKTOP_MODES,
   type DesktopMode,
   hasTurnConfigured,
@@ -243,7 +254,7 @@ import {
   type TurnCredentialsResponse,
 } from './desktop-mode';
 export {
-  parseAppPreviewHost,
+  parseBridgeHost,
   handlePreviewBootstrap,
   handlePreviewProxy,
   handlePreviewWsProxy,
@@ -261,9 +272,10 @@ export {
   injectRuntimeShim,
   type PreviewStatus,
   type DevserverRestartDecision,
+  type BridgeTarget,
 } from './preview-bridge';
 import {
-  parseAppPreviewHost,
+  parseBridgeHost,
   handlePreviewBootstrap,
   handlePreviewProxy,
   handlePreviewWsProxy,
@@ -306,14 +318,21 @@ export {
   extractSignedToken,
   buildTerminateReport,
   describeDesktopStatus,
+  validateFocusApp,
+  buildFocusAppCommand,
+  focusDisabled,
   type TerminateOutcome,
   type TerminateReport,
   type DesktopStatus,
+  type FocusApp,
 } from './sandbox-control';
 import {
   extractSignedToken,
   buildTerminateReport,
   describeDesktopStatus,
+  validateFocusApp,
+  buildFocusAppCommand,
+  focusDisabled,
   type TerminateReport,
 } from './sandbox-control';
 import {
@@ -402,6 +421,7 @@ import {
   resolveNekoDerivationSecret,
   verifyPreviewCookie,
   verifyPreviewBootstrapToken,
+  mintPreviewBootstrapToken,
   PREVIEW_COOKIE_NAME,
 } from './hmac';
 import { LifecycleTimeline, newCorrelationId } from './observability';
@@ -624,6 +644,13 @@ export interface AppPreviewExposeResult {
   attempted: boolean;
   exposed: boolean;
   error?: string;
+  /**
+   * The raw exposed base URL (`https://<port>-<id>-<token>.<host>`) when
+   * `exposed` is `true`. Used by `handlePreview` to build `appPreviewUrl` — a
+   * ready-to-embed `/preview-bootstrap?token=...` URL — without re-deriving
+   * the hostname composition itself.
+   */
+  url?: string;
 }
 
 /**
@@ -675,19 +702,23 @@ async function ensureDesktop(
   startupDelivery: string | null = null,
   workspaceRoot: string | null = null,
   cpuDiagFlag: string | undefined = undefined,
-): Promise<{ url: string; appPreviewExpose: AppPreviewExposeResult }> {
+): Promise<{ url: string; appPreviewExpose: AppPreviewExposeResult; codePreviewExpose: AppPreviewExposeResult }> {
   const bootT0 = Date.now();
   const { port, readyPath } = portFor(mode);
   const exposed = await sandbox.getExposedPorts(hostname);
   const already = exposed.find((p) => p.port === port);
   if (already) {
     // Fast path: desktop already exposed from a prior call — the app-preview
-    // port re-exposure below is skipped here too (pre-existing behavior,
-    // unrelated to this fix), so report it as not attempted rather than
-    // silently implying success.
+    // AND code-preview re-exposure below is skipped here too (pre-existing
+    // behavior, unrelated to this fix), so report both as not attempted
+    // rather than silently implying success.
     bootLog('container_start', 'end', { status: 'skipped', detail: 'already_exposed', cumulativeMs: Date.now() - bootT0 });
     bootLog('ready', 'end', { status: 'ok', cumulativeMs: Date.now() - bootT0, detail: 'already_exposed' });
-    return { url: already.url, appPreviewExpose: { attempted: false, exposed: false } };
+    return {
+      url: already.url,
+      appPreviewExpose: { attempted: false, exposed: false },
+      codePreviewExpose: { attempted: false, exposed: false },
+    };
   }
 
   bootLog('container_start', 'start');
@@ -812,8 +843,8 @@ async function ensureDesktop(
     bootLog('app_preview_expose', 'start');
     appPreviewExpose = { attempted: true, exposed: false };
     try {
-      await exposePreviewPort(sandbox, hostname, appPreview.port, appPreview.token);
-      appPreviewExpose = { attempted: true, exposed: true };
+      const exposedAppUrl = await exposePreviewPort(sandbox, hostname, appPreview.port, appPreview.token);
+      appPreviewExpose = { attempted: true, exposed: true, url: exposedAppUrl };
       bootLog('app_preview_expose', 'end', { status: 'ok', cumulativeMs: Date.now() - bootT0 });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -825,8 +856,34 @@ async function ensureDesktop(
     }
   }
 
+  // Same best-effort, non-blocking, never-silent contract as the app-preview
+  // exposure just above, for the code-server bridge port (`codePortFor`, see
+  // `desktop-mode.ts`). Also neko-only (guacamole has no code-server
+  // process). A failure here never blocks the desktop preview response —
+  // `handleBridgeHost`'s cookie-gated proxy reaches code-server via
+  // `containerFetch` regardless of whether this raw exposure succeeds, same
+  // as the app-preview port.
+  const codePreview = codePortFor(mode);
+  let codePreviewExpose: AppPreviewExposeResult = { attempted: false, exposed: false };
+  if (codePreview) {
+    bootLog('code_preview_expose', 'start');
+    codePreviewExpose = { attempted: true, exposed: false };
+    try {
+      const exposedCodeUrl = await exposePreviewPort(sandbox, hostname, codePreview.port, codePreview.token);
+      codePreviewExpose = { attempted: true, exposed: true, url: exposedCodeUrl };
+      bootLog('code_preview_expose', 'end', { status: 'ok', cumulativeMs: Date.now() - bootT0 });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      codePreviewExpose = { attempted: true, exposed: false, error: message };
+      bootLog('code_preview_expose', 'end', { status: 'error', cumulativeMs: Date.now() - bootT0 });
+      console.error(
+        `[ensureDesktop] code-preview port expose failed (hostname=${hostname}, port=${codePreview.port}): ${message}`,
+      );
+    }
+  }
+
   bootLog('ready', 'end', { status: 'ok', phaseMs: Date.now() - bootT0, cumulativeMs: Date.now() - bootT0 });
-  return { url: desktopUrl, appPreviewExpose };
+  return { url: desktopUrl, appPreviewExpose, codePreviewExpose };
 }
 
 // ── S3 workspace bucket mount ───────────────────────────────────────────────
@@ -2036,7 +2093,7 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
     );
 
     const desktopDone = tl.stage('preview_lifecycle', 'sandbox.preview.desktop_ready');
-    const { url: exposedUrl, appPreviewExpose } = await ensureDesktop(
+    const { url: exposedUrl, appPreviewExpose, codePreviewExpose } = await ensureDesktop(
       sandbox,
       normalizeSandboxHostname(url.host),
       mode,
@@ -2058,6 +2115,45 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
         error: appPreviewExpose.error,
       });
     }
+    if (codePreviewExpose.attempted && !codePreviewExpose.exposed) {
+      tl.event('preview_lifecycle', 'sandbox.preview.code_preview_expose_failed', 'error', {
+        error: codePreviewExpose.error,
+      });
+    }
+
+    // A ready-to-embed URL the caller can hand STRAIGHT to a window/iframe:
+    // `<https://<port>-<id>-<token>.<host>>/preview-bootstrap?token=<bootstrap>`.
+    // Without this, the caller ("the second worker"'s tRPC layer — see
+    // `hmac.ts`'s module doc) had to separately mint its own bootstrap token
+    // and re-derive the exact same hostname composition this Worker already
+    // computed inside `exposePreviewPort`; now it can skip both steps and
+    // just navigate to the URL. Best-effort/non-fatal, matching every other
+    // "surface, never throw" convention in this handler: a mint failure here
+    // must never fail the whole `/sandbox/preview` response, since the
+    // desktop preview itself is already ready. `appPreviewUrl`/`codePreviewUrl`
+    // are `null` (never omitted) when the corresponding port wasn't exposed,
+    // so the caller can tell "not available" from "field doesn't exist yet".
+    const bootstrapSecret = resolvePreviewSecrets(env)[0] ?? 'local-dev';
+    const buildBridgeUrl = async (exposed: AppPreviewExposeResult): Promise<string | null> => {
+      if (!exposed.exposed || !exposed.url) return null;
+      try {
+        const bootstrapToken = await mintPreviewBootstrapToken(bootstrapSecret, sandboxId);
+        const bridgeUrl = new URL(exposed.url);
+        bridgeUrl.pathname = '/preview-bootstrap';
+        bridgeUrl.search = '';
+        bridgeUrl.searchParams.set('token', bootstrapToken);
+        return bridgeUrl.toString();
+      } catch (err) {
+        console.error(
+          `[handlePreview] bridge URL mint failed (sandboxId=${sandboxId}): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        return null;
+      }
+    };
+    const appPreviewUrl = await buildBridgeUrl(appPreviewExpose);
+    const codePreviewUrl = await buildBridgeUrl(codePreviewExpose);
 
     // EXPLICIT flush before handing the ready preview URL back to the caller
     // (in addition to the alarm-driven periodic flush — see
@@ -2090,6 +2186,9 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
       turnRelay: mode === 'neko' ? Boolean(iceEnv) : undefined,
       workspace,
       appPreviewExpose,
+      codePreviewExpose,
+      appPreviewUrl,
+      codePreviewUrl,
     });
   } catch (err) {
     tl.event('preview_lifecycle', 'sandbox.preview.failed', 'error', { error: err });
@@ -2806,6 +2905,61 @@ async function handleTwen(request: Request, env: Env, sandboxName: string): Prom
   }
 }
 
+// ── Window-focus control ─────────────────────────────────────────────────────
+//
+// POST /sandbox/:name/focus  { token, app: 'vscode' | 'chromium' }
+//   Switches which app is foregrounded inside the `neko` desktop-mode
+//   container. Gated with the SAME shared-HMAC envelope as the body-less
+//   control routes (`DELETE /sandbox/:name`) — see
+//   `authorizeSignedControlRequest`'s doc comment for the three places the
+//   token may be presented. `app` is a CLOSED ENUM (`validateFocusApp`,
+//   `./sandbox-control.ts`) — never a free string — so it can be
+//   interpolated into the in-container `neko-switch-app.sh` invocation with
+//   no shell-injection surface.
+//
+// Response: { ok, sandboxId, app } on success; { ok: false, error } otherwise.
+async function handleFocus(request: Request, env: Env, sandboxName: string): Promise<Response> {
+  let body: unknown = {};
+  try {
+    const raw = await request.text();
+    if (raw.trim() !== '') body = JSON.parse(raw);
+  } catch {
+    return json({ ok: false, error: 'invalid_json_body' }, 400);
+  }
+
+  const rawApp =
+    body !== null && typeof body === 'object' && !Array.isArray(body)
+      ? (body as Record<string, unknown>).app
+      : undefined;
+  const validated = validateFocusApp(rawApp);
+  if (!validated.ok) {
+    return json({ ok: false, error: validated.error }, 400);
+  }
+  const { app } = validated;
+
+  try {
+    const sandbox = openSandbox(env, sandboxName);
+    const result = await sandbox.exec(buildFocusAppCommand(app));
+    if (result.exitCode !== 0) {
+      return json(
+        {
+          ok: false,
+          sandboxId: sandboxName,
+          app,
+          error: `focus_switch_failed: exit=${result.exitCode} stderr=${result.stderr?.trim().slice(-300)}`,
+        },
+        500,
+      );
+    }
+    return json({ ok: true, sandboxId: sandboxName, app });
+  } catch (err) {
+    return json(
+      { ok: false, sandboxId: sandboxName, app, error: err instanceof Error ? err.message : String(err) },
+      500,
+    );
+  }
+}
+
 // ── Option D: app-preview reverse proxy dispatcher ───────────────────────────
 //
 // Handles every path under the app-preview hostname
@@ -2917,19 +3071,37 @@ async function probeAppPreviewStatus(sandbox: Sandbox<unknown>, env: Env) {
   return buildPreviewStatus(portUp, hasPackageJson, reportedPhase, hydrationComplete, devserverMode);
 }
 
-async function handleAppPreview(request: Request, env: Env, url: URL): Promise<Response | null> {
-  const route = parseAppPreviewHost(url.hostname);
+/**
+ * Dispatcher for BOTH bridge hostnames: the app-preview host
+ * (`<APP_PREVIEW_PORT>-<id>-app.<zone>`, the user's own dev server) and the
+ * code-server host (`<CODE_PREVIEW_PORT>-<id>-code.<zone>`, VS Code Web).
+ * `parseBridgeHost` tells us which; `port` is resolved once here and threaded
+ * through to every handler that needs to reach the right container port.
+ *
+ * `/preview-status` and `/preview-inspector.js` are APP-ONLY: the dev-server
+ * phase-file probing and the element-inspector postMessage bridge both only
+ * make sense against the user's own app, never against code-server. A
+ * `target === 'code'` request to either falls through to the final 404
+ * exactly like any other out-of-contract path on this hostname.
+ *
+ * (Renamed from `handleAppPreview` — was app-preview-only before this
+ * generalization; `parseAppPreviewHost` → `parseBridgeHost` in
+ * `./preview-bridge.ts` is the corresponding rename there.)
+ */
+async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<Response | null> {
+  const route = parseBridgeHost(url.hostname);
   if (!route) return null;
-  const { sandboxId } = route;
+  const { sandboxId, target } = route;
   const path = url.pathname;
   const secrets = resolvePreviewSecrets(env);
+  const port = target === 'app' ? APP_PREVIEW_PORT : CODE_PREVIEW_PORT;
 
   if (request.method === 'GET' && path === '/preview-bootstrap') {
     const cookieSecret = resolveNekoDerivationSecret(env) ?? undefined;
     return handlePreviewBootstrap(url, sandboxId, secrets, cookieSecret);
   }
 
-  if (request.method === 'GET' && path === '/preview-status') {
+  if (target === 'app' && request.method === 'GET' && path === '/preview-status') {
     // Was the ONE unauthenticated route on this hostname (its module doc still
     // described it as such, inherited from the Azure daemon it was ported
     // from) — but it has since become MUTATING: `probeAppPreviewStatus` calls
@@ -2967,23 +3139,23 @@ async function handleAppPreview(request: Request, env: Env, url: URL): Promise<R
     }
   }
 
-  if (request.method === 'GET' && path === '/preview-inspector.js') {
+  if (target === 'app' && request.method === 'GET' && path === '/preview-inspector.js') {
     return handlePreviewInspectorJs(request, sandboxId, secrets);
   }
 
   if (path === '/preview-ws' || path.startsWith('/preview-ws/')) {
     const sandbox = openSandbox(env, sandboxId);
     const appPath = path === '/preview-ws' ? '/' : path.slice('/preview-ws'.length);
-    return handlePreviewWsProxy(request, sandbox, sandboxId, secrets, appPath);
+    return handlePreviewWsProxy(request, sandbox, sandboxId, secrets, appPath, port);
   }
 
   if (path === '/preview' || path.startsWith('/preview/')) {
     const sandbox = openSandbox(env, sandboxId);
     const appPath = path === '/preview' ? '/' : path.slice('/preview'.length);
-    return handlePreviewProxy(request, sandbox, sandboxId, secrets, appPath);
+    return handlePreviewProxy(request, sandbox, sandboxId, secrets, appPath, port, target);
   }
 
-  // Anything else on the app-preview hostname is outside the Option D
+  // Anything else on either bridge hostname is outside the Option D
   // contract — deliberately 404, never falls through to a raw unauthenticated
   // forward (see `fetch()`'s call site doc comment).
   return json({ ok: false, error: `not_found: ${request.method} ${path}` }, 404);
@@ -3233,19 +3405,20 @@ async function handleTerminate(env: Env, sandboxName: string): Promise<Response>
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // 0) Option D app-preview hostname (`<APP_PREVIEW_PORT>-<id>-app.<zone>`):
-    //    handled ENTIRELY by our own token/cookie-gated dispatcher, BEFORE
-    //    `proxyToSandbox` gets a chance to raw-forward it. This hostname is
+    // 0) Option D bridge hostnames — app-preview (`<APP_PREVIEW_PORT>-<id>-app.<zone>`)
+    //    AND code-server (`<CODE_PREVIEW_PORT>-<id>-code.<zone>`): handled
+    //    ENTIRELY by our own token/cookie-gated dispatcher, BEFORE
+    //    `proxyToSandbox` gets a chance to raw-forward it. Both hostnames are
     //    also registered via `exposePort()` (see `ensureDesktop`) so
-    //    `getExposedPorts()` reports it and the URL scheme matches every other
-    //    exposed port — but that registration is ONLY for discoverability;
-    //    traffic to it must never bypass the cookie/token auth below by
-    //    falling through to the SDK's raw pass-through. Returns `null` (not a
-    //    Response) for hostnames outside the app-preview pattern, in which
-    //    case the request continues to the normal `proxyToSandbox` path below
-    //    unchanged.
-    const appPreview = await handleAppPreview(request, env, new URL(request.url));
-    if (appPreview) return appPreview;
+    //    `getExposedPorts()` reports them and the URL scheme matches every
+    //    other exposed port — but that registration is ONLY for
+    //    discoverability; traffic to it must never bypass the cookie/token
+    //    auth below by falling through to the SDK's raw pass-through. Returns
+    //    `null` (not a Response) for hostnames outside both bridge patterns,
+    //    in which case the request continues to the normal `proxyToSandbox`
+    //    path below unchanged.
+    const bridgeResponse = await handleBridgeHost(request, env, new URL(request.url));
+    if (bridgeResponse) return bridgeResponse;
 
     // 1) Route exposed-port preview traffic (incl. WebSocket upgrades) into the
     //    container. Returns null for everything else.
@@ -3323,6 +3496,20 @@ export default {
         return json({ ok: false, error: 'twen_disabled' }, 404);
       }
       return handleTwen(request, env, decodeURIComponent(twenMatch[1]));
+    }
+
+    const focusMatch = path.match(/^\/sandbox\/([^/]+)\/focus$/);
+    if (method === 'POST' && focusMatch) {
+      // Window-focus control. HMAC-gated (SAME envelope as `DELETE
+      // /sandbox/:name`), closed-enum body (`validateFocusApp` — never a free
+      // string). Operators can hard-disable it WITHOUT a code change via
+      // `SANDBOX_FOCUS=off`.
+      if (focusDisabled(env.SANDBOX_FOCUS)) {
+        return json({ ok: false, error: 'focus_disabled' }, 404);
+      }
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      return handleFocus(request, env, decodeURIComponent(focusMatch[1]));
     }
 
     if (method === 'POST' && path.startsWith('/project-files/')) {
