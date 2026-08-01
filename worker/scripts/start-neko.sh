@@ -2,32 +2,38 @@
 # EBuilder Cloudflare Sandbox — alternate `neko` desktop-mode boot sequence.
 #
 # Phase 1 (see infra/neko-standalone for the validated standalone reference):
-# starts the pinned Neko + VS Code application server inside THIS sandbox
-# container on NEKO_HTTP_PORT (8181 by default — deliberately distinct from
-# Guacamole's 8080 so both modes can coexist in the same image without a
-# port collision; see `NEKO_PORT` in src/index.ts).
+# starts the pinned Neko application server inside THIS sandbox container on
+# NEKO_HTTP_PORT (8181 by default — deliberately distinct from Guacamole's
+# 8080 so both modes can coexist in the same image without a port collision;
+# see `NEKO_PORT` in src/index.ts).
 #
 # Pinned inputs (baked into the image at build time — must match
 # infra/neko-standalone/.env / build.sh exactly):
 #   neko:      d74052bb844c43a0cc3c2386d083f7505dc483a2
 #   neko-apps: 049931d7638f9db8598f29c369d2fb7cd2c6e4b4
 #
-# The Neko runtime (the `neko` Go server, its /var/www client bundle, the
-# /etc/neko config, and the pinned VS Code build) is COPY'd from the pinned
-# ezil-neko-vscode image into this Ubuntu 22.04 Sandbox base by the Dockerfile's
-# multi-stage `neko` build stage. This script does NOT build or fetch Neko at
-# runtime: Cloudflare Sandbox containers have no docker-in-docker, so the pinned
-# neko-apps image build happens at IMAGE BUILD time only, matching the
-# already-validated infra/neko-standalone build path.
+# The Neko runtime (the `neko` Go server, its /var/www client bundle, and the
+# /etc/neko config) is COPY'd from the pinned ezil-neko-vscode image into this
+# Ubuntu 22.04 Sandbox base by the Dockerfile's multi-stage `neko` build
+# stage. This script does NOT build or fetch Neko at runtime: Cloudflare
+# Sandbox containers have no docker-in-docker, so the pinned neko-apps image
+# build happens at IMAGE BUILD time only, matching the already-validated
+# infra/neko-standalone build path. NOTE: that pinned image's own Electron
+# VS Code build is deliberately NOT copied — see the Dockerfile and the
+# "code-server launch" section below; code-server is installed separately.
 #
 # Runtime layout on the Ubuntu base:
 #   Xvfb :99         virtual X display (dummy framebuffer)
 #   openbox          lightweight window manager (config /etc/neko/openbox.xml)
 #   pulseaudio       audio server (best-effort; media is WebRTC-gated)
-#   code             the pinned VS Code build (best-effort; pixels are
-#                    delivered over WebRTC, which requires TURN — see below)
+#   code-server      the IDE, served over plain HTTP on 127.0.0.1:8443 — NOT
+#                    an X client, so it is never part of the Xvfb/WebRTC
+#                    pixel stream (replaces the pinned image's Electron VS
+#                    Code build; see the Dockerfile and this script's
+#                    "code-server launch" section for why)
 #   neko serve       the Neko application server on NEKO_HTTP_PORT (8181):
-#                    HTTP UI + WebSocket signaling. The Worker fronts this via
+#                    HTTP UI + WebSocket signaling for the native browser's
+#                    pixel stream. The Worker fronts this via
 #                    proxyToSandbox().
 #
 # WebRTC media (audio/video/input over datachannels) requires a TURN relay in
@@ -184,9 +190,10 @@ if [ ! -x "$NEKO_BIN" ]; then
   exit 1
 fi
 
-# ── Mandatory app preflight (native browser + VS Code, contract requirement) ──
-# The authoritative EZiL OS contract requires BOTH a native browser and VS Code
-# on the neko desktop — neither is optional, and there is no app/desktop
+# ── Mandatory app preflight (native browser + code-server, contract requirement) ──
+# The authoritative EZiL OS contract requires BOTH a native browser and
+# code-server (which replaced Electron VS Code) on the neko desktop — neither
+# is optional, and there is no app/desktop
 # fallback. Both executables MUST be validated to exist BEFORE any background
 # app or `neko serve` is started, so a missing binary fails Neko startup
 # cleanly instead of silently degrading to a "best-effort skip" (the prior,
@@ -233,8 +240,9 @@ log "mandatory app preflight passed: browser=$(basename "$CHROME_BIN") codeserve
 phase_end container_start ok
 
 # ── Workspace hydration (sealed startup delivery → /home/neko/project) ────────
-# The canonical project workspace root. VS Code opens EXACTLY this directory,
-# and — when a sealed startup delivery is present — it is hydrated from the
+# The canonical project workspace root. code-server (formerly Electron VS
+# Code) opens EXACTLY this directory, and — when a sealed startup delivery is
+# present — it is hydrated from the
 # durable branch BEFORE readiness so the desktop never shows an empty/partial
 # tree. Overridable via EZIL_WORKSPACE_ROOT (kept in lockstep with the bootstrap
 # bundle, which defaults to the same path).
@@ -262,7 +270,7 @@ if [ -n "${EZIL_WORKSPACE_STARTUP_DELIVERY:-}" ]; then
     exit 1
   fi
   log "hydrating workspace at $WORKSPACE_ROOT from sealed startup delivery (before readiness)"
-  # Capture the resolved VS Code target root from the bundle's final stdout line;
+  # Capture the resolved code-server target root from the bundle's final stdout line;
   # its stderr (safe stage/outcome logs) is teed into the neko log.
   if _bootstrap_root="$(bun "$WORKSPACE_BOOTSTRAP_BIN" 2> >(tee -a "$LOG" >&2))"; then
     _bootstrap_root="$(printf '%s' "$_bootstrap_root" | tail -n1 | tr -d '[:space:]')"
@@ -275,7 +283,7 @@ if [ -n "${EZIL_WORKSPACE_STARTUP_DELIVERY:-}" ]; then
       # invoked without an explicit argv override).
       export EZIL_WORKSPACE_ROOT="$WORKSPACE_ROOT"
     fi
-    log "workspace hydration succeeded — VS Code target root=$WORKSPACE_ROOT"
+    log "workspace hydration succeeded — code-server target root=$WORKSPACE_ROOT"
     phase_end workspace_hydration ok
   else
     log "ERROR: workspace hydration failed (sealed delivery present) — failing closed"
@@ -283,7 +291,7 @@ if [ -n "${EZIL_WORKSPACE_STARTUP_DELIVERY:-}" ]; then
     exit 1
   fi
 else
-  log "no sealed workspace-startup delivery present — skipping hydration (legacy/pre-ready path), VS Code root=$WORKSPACE_ROOT"
+  log "no sealed workspace-startup delivery present — skipping hydration (legacy/pre-ready path), code-server root=$WORKSPACE_ROOT"
   phase_end workspace_hydration skipped
 fi
 
@@ -301,7 +309,7 @@ fi
 #
 # Placed HERE — after $WORKSPACE_ROOT is fully finalized (hydration above, if
 # any, has already resolved/relocated it) and BEFORE both start-devserver.sh's
-# dependency install below and VS Code opening the workspace further down —
+# dependency install below and code-server opening the workspace further down —
 # so neither ever sees node_modules/.next resolve onto the FUSE mount.
 # Idempotent (containers re-mount their R2 bucket and re-run this script
 # across restarts: re-pointing an already-correct symlink is a no-op) and
@@ -355,7 +363,7 @@ fi
 # — deliberately. start-devserver.sh is itself non-blocking: it backgrounds
 # dependency install and the dev-server process and returns almost
 # immediately (`starting`/`already-running`), so invoking it here adds no
-# measurable delay and can never serialize behind, or gate, VS Code/Chrome
+# measurable delay and can never serialize behind, or gate, code-server/Chrome
 # readiness or `neko serve` binding its own port below. A slow or crashing
 # dev server therefore never prevents the desktop from becoming ready — its
 # real state is written to /tmp/devserver.phase (crashed/timeout/running/…)
