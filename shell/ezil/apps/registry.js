@@ -338,6 +338,28 @@ export async function launch (id, ctx = {}) {
         // image from the dock tile the user just clicked.
         const el_window = await app.open({ ...ctx, icon: app.icon, appName: app.name });
 
+        // 🔴 Stamp WHICH computer this window is for, on the window itself.
+        //
+        // Settings has to know whether the open desktop window is streaming
+        // the computer the user just asked to delete — get that wrong and
+        // either the user watches their OS die mid-frame (deleted without
+        // closing) or an unrelated desktop is closed out from under them.
+        // Round 1 answered it from a module-level variable seeded at IMPORT
+        // time from `session.payload()`, which is empty on the rehydrate path
+        // and stale after any switch; the end-to-end harness caught the
+        // guarantee silently not firing because of it
+        // (`../ui/Settings/settings-test.mjs`).
+        //
+        // The window element is the honest place for it: it is created and
+        // destroyed with the thing it describes, it survives module state
+        // being wrong, and it is readable by anything that can see the DOM.
+        // Written here rather than in `desktop-window.js` because that file is
+        // not owned by this task — and here is strictly better anyway, since
+        // `launch` is the one place that knows both the app and the ctx.
+        if ( el_window && ctx?.computer?.id ) {
+            el_window.setAttribute('data-ezil-computer-id', String(ctx.computer.id));
+        }
+
         // 🔴 GUARANTEE #1. A window that hides the taskbar must carry its own
         // way back to Settings, or deleting a broken computer becomes
         // unreachable. Done HERE, after `open` resolves, because that is the
