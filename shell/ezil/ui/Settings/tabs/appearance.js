@@ -24,7 +24,7 @@
 // against `ezil-shell.css` / `ezil-tokens.css` (files this task does not
 // own): an inline style wins over any external stylesheet rule regardless of
 // which one the build concatenates first or last.
-import session from '../../session.js';
+import session from '../../../session.js';
 
 const APPEARANCE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
     + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
