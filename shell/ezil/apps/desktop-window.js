@@ -102,6 +102,67 @@ const FRAME_CONFIRM_RETRY_MS = 1_500;
 const MINIMISE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"'
     + ' stroke-linecap="round" aria-hidden="true"><line x1="5" y1="17" x2="19" y2="17"/></svg>';
 
+// ── App switching (in-stream) ───────────────────────────────────────────────
+// `POST /sandbox/:id/focus { app }` changes which app is behind the stream —
+// the SAME feature `apps/preview.js` exposes for the HTTP reverse-proxy
+// window, offered here too because it is the same underlying sandbox. This
+// is a small, deliberate DUPLICATION of `preview.js`'s `requestFocus` /
+// timing constants rather than a shared import: neither file is a library
+// for the other, and `session.js` (where a shared helper would naturally
+// live) belongs to a parallel task. Keep the two in lockstep by inspection —
+// see `preview.js`'s matching comment.
+//
+// 🔴 Feature-detected via `desktopState.endpoints.focus`, exactly like
+// `preview.js`. If a deployment has not wired that key, no switcher is drawn
+// — see `requestFocus`'s header there for why a guessed URL is worse than no
+// button.
+const FOCUS_TIMEOUT_MS = 8_000;
+/** PLATFORM-NOTES §7: 15fps + `keyframe-max-dist=25`, encoder-bound. An ESTIMATE, not a promise. */
+const FOCUS_LEGIBLE_ESTIMATE_MS = 1_700;
+const FOCUS_APPS = [
+    {
+        id: 'vscode',
+        label: 'Switch to VS Code',
+        svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"'
+            + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+            + '<polyline points="9 8 5 12 9 16"/><polyline points="15 8 19 12 15 16"/></svg>',
+    },
+    {
+        id: 'chromium',
+        label: 'Switch to Chromium',
+        svg: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"'
+            + ' aria-hidden="true"><circle cx="12" cy="12" r="7.5"/><circle cx="12" cy="12" r="2.2"/></svg>',
+    },
+];
+
+/**
+ * `POST` a focus-switch request. Byte-identical contract to `preview.js`'s
+ * `requestFocus` — see that file's header for the three-way result meaning.
+ * @returns {Promise<boolean|undefined>}
+ */
+async function requestFocus (endpointUrl, computerId, app) {
+    let res;
+    try {
+        res = await fetch(endpointUrl, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ computerId, app }),
+            signal: AbortSignal.timeout ? AbortSignal.timeout(FOCUS_TIMEOUT_MS) : undefined,
+        });
+    } catch {
+        return undefined;
+    }
+    if ( ! res.ok ) return false;
+    let data = null;
+    try {
+        data = await res.json();
+    } catch {
+        return false;
+    }
+    return data?.ok === true;
+}
+
 /** `data-is_minimized` is written as 1/0 at creation and true/false later. */
 function is_minimized (el) {
     const v = $(el).attr('data-is_minimized');
@@ -459,6 +520,55 @@ export async function openDesktopWindow (ctx = {}) {
     });
     observer.observe(el_window, { attributes: true, attributeFilter: ['data-is_minimized'] });
 
+    // ── app switching wiring ─────────────────────────────────────────────────
+    // See the constants block above for the feature-detection rule. Only
+    // computed once, up front, so the drawer either offers real buttons or
+    // none — never buttons that are wired up after the fact.
+    const focus_endpoint = session.payload()?.desktopState?.endpoints?.focus;
+    let switch_in_flight = false;
+
+    /**
+     * Two-phase honest status, surfaced in the drawer's own title slot while
+     * it is expanded (the drawer has no separate status area — see
+     * `attach_app_drawer`'s markup, which is upstream-derived and not this
+     * task's to restructure). Restores the real title when done; the
+     * collapse timers already hide it the rest of the time.
+     */
+    async function switchApp (app, label, el) {
+        if ( switch_in_flight || disposed || ! focus_endpoint ) return;
+        switch_in_flight = true;
+        const el_title = el.querySelector('.dashboard-app-drawer-title');
+        const restore_title = () => { if ( el_title ) el_title.textContent = title; };
+        if ( el_title ) el_title.textContent = `Switching to ${label.replace(/^Switch to /, '')}…`;
+
+        const t0 = performance.now();
+        const ok = await requestFocus(focus_endpoint, computer.id, app);
+        if ( disposed ) { switch_in_flight = false; return; }
+
+        if ( ok !== true ) {
+            if ( el_title ) {
+                el_title.textContent = ok === undefined ? "Couldn't reach the switch" : 'Switch was refused';
+                setTimeout(restore_title, 2_500);
+            }
+            switch_in_flight = false;
+            return;
+        }
+
+        // Real signal (round trip) done; the encoder is not. Wait out the
+        // rest of the measured floor before saying anything is visible.
+        const remaining = Math.max(0, FOCUS_LEGIBLE_ESTIMATE_MS - (performance.now() - t0));
+        await new Promise((r) => setTimeout(r, remaining));
+        if ( disposed ) { switch_in_flight = false; return; }
+        // This is a live WebRTC/Neko stream, not a static iframe: the encoder
+        // catching up is what makes the switch visible, and there is nothing
+        // here to reload. Only the label is honest progress.
+        if ( el_title ) {
+            el_title.textContent = `Should be showing ${label.replace(/^Switch to /, '')} now`;
+            setTimeout(restore_title, 2_500);
+        }
+        switch_in_flight = false;
+    }
+
     // ── the control tray ───────────────────────────────────────────────────
     // Attached AFTER the window exists and BEFORE the boot starts, so that
     // whether there IS a way out of full-bleed is known before we could ever
@@ -471,20 +581,31 @@ export async function openDesktopWindow (ctx = {}) {
     // teaches where the controls live on a moment the user has no use for it.
     // `go_fullbleed` plays it instead, when the drawer becomes the only way
     // out.
+    const drawer_actions = [
+        {
+            id: 'minimize',
+            label: 'Minimise',
+            svg: MINIMISE_SVG,
+            onClick: minimise_to_taskbar,
+        },
+        // Settings drops in here in a later wave — the drawer renders
+        // whatever this array contains, in order, before Close.
+    ];
+    if ( focus_endpoint ) {
+        for ( const app of FOCUS_APPS ) {
+            drawer_actions.push({
+                id: `focus-${app.id}`,
+                label: app.label,
+                svg: app.svg,
+                onClick: (el) => { void switchApp(app.id, app.label, el); },
+            });
+        }
+    }
     const drawer = attach_app_drawer(el_window, {
         title,
         icon: ctx.icon,
         flash_on_attach: false,
-        actions: [
-            {
-                id: 'minimize',
-                label: 'Minimise',
-                svg: MINIMISE_SVG,
-                onClick: minimise_to_taskbar,
-            },
-            // Settings drops in here in a later wave — the drawer renders
-            // whatever this array contains, in order, before Close.
-        ],
+        actions: drawer_actions,
     });
     if ( ! drawer ) {
         // The drawer failing to attach means a full-bleed window with no exit.
