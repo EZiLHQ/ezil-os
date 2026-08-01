@@ -243,6 +243,12 @@ const VIEWPORTS = [
     { name: '1920x1080', width: 1920, height: 1080 },
 ];
 
+// GAP 2's close/reopen intervals — see `runCloseReopenSweep`'s doc block
+// (below) for why these five. Declared here (module top-level, `const`, no
+// TDZ) because it is read from the top-level execution flow just below,
+// before the module reaches `runCloseReopenSweep`'s own textual definition.
+const CLOSE_REOPEN_INTERVALS_MS = [20, 50, 112, 250, 500];
+
 const browser = await chromium.launch();
 const allPageErrors = [];
 let anyHardFailure = false;
@@ -254,6 +260,20 @@ for ( const vp of VIEWPORTS ) {
         anyHardFailure = true;
         push(`[${vp.name}] harness threw without completing`, false, String(err?.stack ?? err));
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GAP 2 — close, then reopen, every registered app. See the file's own
+// header note (top) and `runCloseReopenSweep`'s doc block for what this
+// closes: seven rounds of harnesses covered React, an entry path, a soft
+// navigation, paint order, the new window missing from the paint test, what
+// a window paints inside itself — and NEVER an app closed and reopened.
+// ═══════════════════════════════════════════════════════════════════════════
+try {
+    await runCloseReopenSweep();
+} catch ( err ) {
+    anyHardFailure = true;
+    push('[close-reopen] harness threw without completing', false, String(err?.stack ?? err));
 }
 
 await browser.close();
@@ -286,6 +306,10 @@ async function runViewport (vp) {
         if ( process.env.DEBUG_CONSOLE ) console.log('CONSOLE:', msg.type(), msg.text());
         if ( msg.type() !== 'error' ) return;
         if ( /Failed to load resource.*404/.test(msg.text()) ) return;
+        // The GAP 1 mutation self-test (see near the GUARD, below) is
+        // EXPECTED to log console noise for its deliberately-broken dummy
+        // ids; it must not register as a spurious "uncaught page error".
+        if ( process.env.MUTATION_PROVE_GAP1 && /zz-mutation/.test(msg.text()) ) return;
         page_errors.push(msg.text());
     });
 
@@ -543,12 +567,18 @@ async function runViewport (vp) {
         if ( tb ) {
             push(`${label}: titlebar hit-tests INTO ${app}`, hitTb.inWindow === app,
                 `${app} z=${z} titlebar-hit=${JSON.stringify(hitTb)}`);
+            // 🔴 GAP 1 FIX: coverage is recorded HERE, at the one real
+            // per-app assertion, never by loop membership — see the GUARD's
+            // own comment block near the bottom of this file for why that
+            // distinction is the entire fix.
+            coveredIds.add(app);
         } else {
             skip(`${label}: titlebar hit test for ${app} (no titlebar pixel this window owns — either full-bleed hides it by design, or another window fully occludes it)`);
         }
         if ( bp ) {
             push(`${label}: a button inside ${app} hit-tests INTO ${app}`, hitBp.inWindow === app,
                 `button-hit=${JSON.stringify(hitBp)}`);
+            coveredIds.add(app);
         } else {
             skip(`${label}: button-inside hit test for ${app} (no visible interactive control found)`);
         }
@@ -691,6 +721,7 @@ async function runViewport (vp) {
             return;
         }
         push(name, res.pass, JSON.stringify(res.detail));
+        coveredIds.add(app); // 🔴 GAP 1 FIX — see assertHitTestsIntoSelf's comment.
     }
 
     /**
@@ -758,6 +789,7 @@ async function runViewport (vp) {
         const top = topmostOf(z);
         push(`${label}: a real click on ${app}'s titlebar raises it to the top`,
             top === app, `clicked-at=${JSON.stringify(tb)} z=${JSON.stringify(z)}`);
+        coveredIds.add(app); // 🔴 GAP 1 FIX — see assertHitTestsIntoSelf's comment.
     }
 
     /** Same signal, via the taskbar item — the OTHER real path a user has to
@@ -785,6 +817,7 @@ async function runViewport (vp) {
         const top = topmostOf(z);
         push(`${label}: a real click on ${app}'s taskbar item raises/restores it to the top`,
             top === app, `clicked-at=${JSON.stringify(p)} z=${JSON.stringify(z)}`);
+        coveredIds.add(app); // 🔴 GAP 1 FIX — see assertHitTestsIntoSelf's comment.
     }
 
     /** Minimize whatever app is passed — tries the ordinary titlebar minimize
@@ -802,6 +835,92 @@ async function runViewport (vp) {
             );
             btn?.click();
         }, app);
+    }
+
+    /**
+     * 🔴 GAP 3 REGRESSION TEST. `UIWindow.js` binds `focusWindow()` to
+     * `mousedown` on `.ui-resizable-handle` (delegated on `el_window`, since
+     * jQuery UI's `.resizable()` appends each handle as a DIRECT CHILD of the
+     * window, not of `.window-head`/`.window-body`) so grabbing a BURIED
+     * window's resize handle both raises it AND still lets the resize
+     * proceed — see that file's own comment block next to the binding.
+     * Nothing in any of the eight shell suites asserted this before this
+     * test: deleting the binding turns nothing red anywhere. Covers more
+     * than one handle direction — the only prior verification of this
+     * mechanism ever grabbed "se".
+     *
+     * Two independent claims, asserted separately so a failure names which
+     * one broke: (1) the window is topmost immediately on `mousedown`,
+     * before any drag movement — proving raise is bound to the handle
+     * itself, not incidentally caused by the resize completing; (2) the
+     * window's rect actually changed size after the drag — proving the
+     * `.resizable()` mechanism itself still works (no
+     * `preventDefault()`/`stopPropagation()` regression on the same handler).
+     */
+    async function testResizeHandleRaisesAndResizes (app, handleDir, contenders, label) {
+        await ensureNotTopmost(app, contenders);
+        const before = await rectOf(app);
+        // 🔴 Same reasoning as `titlebarPoint` above (see its own doc block):
+        // "the geometric midpoint of the handle's own rect" and "a pixel
+        // this window is CURRENTLY visibly on top at" are different claims
+        // once windows overlap — and burying `app` a moment ago is exactly
+        // what can put a contender on top of its resize handle's corner/edge
+        // too. Scan the handle's own rect for a pixel `app` actually owns
+        // right now; only that pixel is a real click target.
+        const handle = await page.evaluate(([a, dir]) => {
+            const win = document.querySelector(`.window[data-app="${a}"]`);
+            if ( ! win || win.classList.contains('ezil-fullbleed') ) return null;
+            const el = win.querySelector(`.ui-resizable-${dir}`);
+            if ( ! el ) return null;
+            const r = el.getBoundingClientRect();
+            if ( r.width === 0 || r.height === 0 ) return null;
+            const ownsPixel = (x, y) => {
+                const hit = document.elementFromPoint(x, y);
+                const hitWin = hit?.closest?.('.window');
+                return !! hitWin && hitWin.getAttribute('data-app') === a;
+            };
+            const cx = r.left + r.width / 2;
+            const cy = r.top + r.height / 2;
+            if ( ownsPixel(cx, cy) ) return { x: cx, y: cy };
+            const STEPS = 5;
+            for ( let i = 0; i <= STEPS; i++ ) {
+                for ( let j = 0; j <= STEPS; j++ ) {
+                    const x = r.left + (r.width * i) / STEPS;
+                    const y = r.top + (r.height * j) / STEPS;
+                    if ( ownsPixel(x, y) ) return { x, y };
+                }
+            }
+            return null; // the whole handle is currently covered by another window
+        }, [app, handleDir]);
+        if ( ! handle || ! before ) {
+            skip(`${label}: ${app}'s "${handleDir}" resize-handle raise+resize test (no visible resize handle right now — not resizable, or full-bleed hides it by design)`);
+            return;
+        }
+
+        await page.mouse.move(handle.x, handle.y);
+        await page.mouse.down();
+        // Raise must happen on mousedown ITSELF, before any drag movement —
+        // read z-order now, not after the drag completes.
+        await sleep(50);
+        const zAfterDown = topmostOf(await allZIndexes(contenders));
+
+        const DELTA = {
+            n: [0, -30], s: [0, 30], e: [30, 0], w: [-30, 0],
+            ne: [30, -30], nw: [-30, -30], se: [30, 30], sw: [-30, 30],
+        }[handleDir] ?? [30, 30];
+        await page.mouse.move(handle.x + DELTA[0], handle.y + DELTA[1], { steps: 8 });
+        await page.mouse.up();
+        await settle(app);
+        const after = await rectOf(app);
+
+        push(`${label}: grabbing ${app}'s "${handleDir}" resize handle raises it (buried -> top on mousedown)`,
+            zAfterDown === app, `afterDown=${zAfterDown}`);
+        coveredIds.add(app);
+
+        const resized = !! after && (Math.abs(after.width - before.width) > 1 || Math.abs(after.height - before.height) > 1);
+        push(`${label}: dragging ${app}'s "${handleDir}" resize handle actually resizes it`,
+            resized, `before=${JSON.stringify(before)} after=${JSON.stringify(after)}`);
+        coveredIds.add(app);
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -841,12 +960,29 @@ async function runViewport (vp) {
     const otherAppIds = resolvedApps.slice(1);
     const bootAppDescriptor = registryApps.find((a) => a.id === bootAppId);
 
+    // 🔴 GAP 1 FIX (round 7's verifier: the coverage guard could not fail).
+    // `coveredIds` is populated ONLY inside the four real per-app assertion
+    // helpers above (`assertHitTestsIntoSelf`, `checkContentPainted`,
+    // `raiseByTitlebarClick`, `raiseByTaskbarItemClick`) at the exact moment
+    // each one actually `push()`es a real PASS/FAIL for that app — never by
+    // this loop merely reaching or opening an id. The old code did
+    // `coveredIds.add(id)` unconditionally, over the SAME list the GUARD
+    // later compared it against, which made "every resolved app got a
+    // scenario" true by construction — it could not have failed no matter
+    // what the loop body did or skipped. See the MUTATION SELF-TEST block
+    // near the GUARD below for the runnable proof.
+    //
+    // `openIds` is a SEPARATE, unrelated bookkeeping set: only for building
+    // the "contenders" list passed to z-index "topmost" comparisons below
+    // (raise-by-click needs `id` itself in that list to ever register as
+    // topmost). It has nothing to do with the coverage guard and must never
+    // be read by it.
     const coveredIds = new Set();
+    const openIds = new Set();
 
     // ── boot app: opened by boot.js itself (`apps[0]`), not by this harness ──
     const bootWinOk = await until((id) => !! document.querySelector(`.window[data-app="${id}"]`), bootAppId);
     push(`${VP} boot app "${bootAppId}" window opened`, !! bootWinOk);
-    coveredIds.add(bootAppId);
 
     if ( bootAppDescriptor?.wants_settings_in_drawer ) {
         await until((id) => document.querySelector(`.window[data-app="${id}"]`)?.classList.contains('ezil-fullbleed'), bootAppId);
@@ -889,7 +1025,9 @@ async function runViewport (vp) {
             await assertHitTestsIntoSelf('settings', `${VP} Settings (full-bleed, opened from drawer)`);
             await settleContentPainted('settings');
             await checkContentPainted('settings', `${VP} Settings (full-bleed, opened from drawer)`);
-            coveredIds.add('settings');
+            // 🔴 no manual `coveredIds.add('settings')` here — the two calls
+            // above already recorded it themselves, for real, if and only if
+            // they actually asserted something. See the GAP 1 comment block.
         }
     }
 
@@ -920,18 +1058,23 @@ async function runViewport (vp) {
             await until((a) => !! document.querySelector(`.window[data-app="${a}"]`), id, 8000, 50);
         }
         await settle(id);
-        coveredIds.add(id);
 
         const opened = await page.evaluate((a) => !! document.querySelector(`.window[data-app="${a}"]`), id);
         push(`${VP} SCENARIO: "${id}" window opened`, opened);
+        // 🔴 GAP 1 FIX: `continue` here now genuinely means "not covered" —
+        // nothing below adds `id` to `coveredIds` (or even `openIds`) unless
+        // this line is passed. The old code added to `coveredIds`
+        // unconditionally BEFORE this exact check, which is the tautology
+        // round 7's verifier found.
         if ( ! opened ) continue;
+        openIds.add(id); // bookkeeping only — see the comment where this Set is declared.
 
         await assertHitTestsIntoSelf(id, `${VP} "${id}" (just opened)`);
         await checkTaskbarReachable(`${VP} after opening "${id}"`);
         await settleContentPainted(id);
         await checkContentPainted(id, `${VP} "${id}" (just opened)`);
 
-        const soFar = [...coveredIds];
+        const soFar = [...openIds];
         await raiseByTitlebarClick(id, soFar, `${VP} "${id}"`);
         await raiseByTaskbarItemClick(id, soFar, `${VP} "${id}"`);
     }
@@ -985,6 +1128,81 @@ async function runViewport (vp) {
     }
 
     // ═════════════════════════════════════════════════════════════════════
+    // GAP 3 REGRESSION — a BURIED window's resize handle must both raise it
+    // (UIWindow.js's `$(el_window).on('mousedown', '.ui-resizable-handle', …)`
+    // binding) AND still resize it (jQuery UI's own `.resizable()`, wired
+    // separately). Deleting that binding turned nothing red anywhere in the
+    // eight shell suites before this test existed — see this file's own
+    // report for the mutation proof (a scratch copy with the binding
+    // removed). Exercised on more than one handle direction: the only prior
+    // verification of this binding ever grabbed "se".
+    // ═════════════════════════════════════════════════════════════════════
+    if ( otherAppIds.length > 0 ) {
+        const resizeTarget = otherAppIds[0];
+        // 🔴 NOT `[bootAppId, ...otherAppIds]`: the full-bleed boot app is
+        // `data-stay_on_top="true"` (`UIWindow.js` ~L122-124, set whenever
+        // `window.is_fullpage_mode`), which pins its z-index to a fixed
+        // ~99999999 band that NEVER changes on focus (`window_zindex_base`,
+        // ~L4111-4114) and is always higher than any ordinary window's
+        // small counter-based z-index. Including it here would make
+        // "settings/preview/code is topmost" permanently unsatisfiable —
+        // the exact "broken assertion, not a product bug" trap this file's
+        // own `titlebarPoint` doc block warns about. Every OTHER real
+        // per-app raise check in this file (`otherAppIds` loop, round-robin)
+        // already excludes it for the same reason.
+        const resizeContenders = [...otherAppIds];
+        for ( const dir of ['se', 'nw', 'e'] ) {
+            await testResizeHandleRaisesAndResizes(resizeTarget, dir, resizeContenders, `${VP} resize-handle regression`);
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // 🔴 MUTATION SELF-TEST for the GUARD immediately below. Opt-in
+    // (`MUTATION_PROVE_GAP1=1`, first viewport only) so ordinary runs are
+    // unaffected — this is a standing, re-runnable proof that the guard can
+    // still fail, not a permanent extra scenario. Round 7's verifier found
+    // the previous guard could NEVER fail: `coveredIds.add(id)` ran
+    // unconditionally, over the very list (`resolvedApps`) it was later
+    // compared against, so the two were identical by construction.
+    //
+    //   (a) "zz-mutation-unexercised" is spliced into `resolvedApps` ONLY —
+    //       it is never opened, never asserted, never added to `coveredIds`
+    //       by anything. This is the purest form of "a registered app this
+    //       run never exercised": if the GUARD still passes with this id
+    //       unaccounted for, `coveredIds` is being derived FROM
+    //       `resolvedApps` (the exact tautology), not from real assertions.
+    //   (b) "zz-mutation-noassert" is a REAL `.window[data-app]` element
+    //       (so "opened" is genuinely true) with no titlebar, no button, no
+    //       taskbar item and no `.window-body`. It is run through the ACTUAL
+    //       shipped assertion helpers (not a stand-in), each of which can
+    //       only `skip()` it. This proves "opened but never actually
+    //       asserted" does not buy coverage either.
+    //
+    // Both must appear in `notCovered` and make the GUARD FAIL. If either
+    // does not, the guard is tautological again.
+    // ═════════════════════════════════════════════════════════════════════
+    if ( process.env.MUTATION_PROVE_GAP1 && vp === VIEWPORTS[0] ) {
+        resolvedApps.push('zz-mutation-unexercised');
+
+        await page.evaluate(() => {
+            const el = document.createElement('div');
+            el.className = 'window';
+            el.setAttribute('data-app', 'zz-mutation-noassert');
+            document.body.appendChild(el);
+        });
+        resolvedApps.push('zz-mutation-noassert');
+        const dummyContenders = [...openIds, 'zz-mutation-noassert'];
+        await assertHitTestsIntoSelf('zz-mutation-noassert', `${VP} MUTATION SELF-TEST`);
+        await checkContentPainted('zz-mutation-noassert', `${VP} MUTATION SELF-TEST`);
+        await raiseByTitlebarClick('zz-mutation-noassert', dummyContenders, `${VP} MUTATION SELF-TEST`);
+        await raiseByTaskbarItemClick('zz-mutation-noassert', dummyContenders, `${VP} MUTATION SELF-TEST`);
+        push(`${VP} MUTATION SELF-TEST: the unassertable dummy recorded ZERO real assertions`,
+            ! coveredIds.has('zz-mutation-noassert'),
+            `coveredIds has it = ${coveredIds.has('zz-mutation-noassert')}`);
+        await page.evaluate(() => document.querySelector('.window[data-app="zz-mutation-noassert"]')?.remove());
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
     // 🔴 THE GUARD. Fails if this harness's own loop skipped a registered,
     // resolved app — the exact shape of bug that let the Code window ship
     // untested. Also fails if `resolve()` itself silently dropped a
@@ -1005,5 +1223,277 @@ async function runViewport (vp) {
     push(`${VP} no uncaught page errors during this viewport's run`, page_errors.length === 0, JSON.stringify(page_errors));
     allPageErrors.push(...page_errors);
 
+    await page.close();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GAP 2 — THE MISSING SEVENTH OMISSION: close, then reopen, every registered
+// app, at several real-time intervals.
+// ═══════════════════════════════════════════════════════════════════════════
+// Round 7's verifier, verbatim: "React → an entry path → a soft navigation →
+// paint order → the new window missing from the paint test → what a window
+// paints inside itself → an app closed and reopened." Every earlier round
+// (this file, `boot-test.mjs`, `settings-test.mjs`) opens windows and leaves
+// them open for the rest of the run. None of them ever closes one and then
+// asks the shell to open it again.
+//
+// The five intervals below straddle a REAL boundary in `$.fn.close`
+// (`UIWindow.js`): closing the last window of an app schedules the matching
+// `.taskbar-item`'s removal via `window.remove_taskbar_item`, whose own
+// `.animate({width:0}, 200, callback)` does not call `$(item).remove()`
+// until ~200ms later — regardless of `window.animate_window_closing` (which
+// only affects the WINDOW's own removal, not the taskbar item's). A reopen
+// inside that window reuses the about-to-be-deleted taskbar item (`launch()`
+// only creates a fresh one when `$('.taskbar-item[data-app]').length === 0`);
+// a reopen after it has already elapsed gets a clean new one. 20/50/112ms
+// sit below that boundary, 250/500ms sit above it — this is not a blind
+// sweep, it is the reproduction shape for the exact defect class this task
+// was told about (D1: a stale animate callback deletes a taskbar item out
+// from under a window that reused it; D2: `close()`'s internal teardown is
+// not fully awaited before its promise resolves, so a fast reopen can race
+// it; D3: a deferred `focusWindow()` call — `showWindow`'s own 80ms delayed
+// re-focus, or a stray one from an earlier click — can fire against an
+// iframe that this close/reopen cycle has since detached, hitting the
+// unguarded `contentWindow.postMessage` at `UIWindow.js` ~L4176).
+//
+// This function does not diagnose which one fires when — that is the
+// sibling task's job (`UIWindow.js`/`UIDesktopFullpage.js`/`registry.js`,
+// none of which this file may touch). Its only job is to make the failure
+// visible: exactly 1 window, exactly 1 taskbar item, the window visible,
+// minimise-then-restore working, and zero uncaught page errors, after every
+// close/reopen pair, for every registered app, at every interval.
+// (`CLOSE_REOPEN_INTERVALS_MS` itself is declared near the top of this file,
+// module scope, so it is initialized before the top-level execution flow
+// calls this function — see that declaration's own comment.)
+
+async function runCloseReopenSweep () {
+    const VP = '[close-reopen]';
+    const page = await browser.newPage({ viewport: { width: 1280, height: 860 } });
+    const page_errors = [];
+    page.on('pageerror', (e) => page_errors.push(String(e)));
+    page.on('console', (msg) => {
+        if ( process.env.DEBUG_CONSOLE ) console.log('CONSOLE:', msg.type(), msg.text());
+        if ( msg.type() !== 'error' ) return;
+        if ( /Failed to load resource.*404/.test(msg.text()) ) return;
+        page_errors.push(msg.text());
+    });
+
+    await page.route('**/*', async (route) => {
+        const req = route.request();
+        const url = req.url();
+        if ( url === `${HOST}/os` ) {
+            await route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
+            return;
+        }
+        if ( url.includes('/api/') ) {
+            const body = stub(url, req.method(), req.postData());
+            await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+            return;
+        }
+        if ( url.startsWith(HOST) ) {
+            await route.fulfill({ status: 404, body: '' });
+            return;
+        }
+        await route.continue();
+    });
+
+    await page.goto(`${HOST}/os`, { waitUntil: 'load' });
+    await page.evaluate((p) => { window.__EZIL_BOOT__ = p; }, PAYLOAD);
+    await page.addScriptTag({ content: icons });
+    await page.addScriptTag({ content: bundle });
+
+    // ── minimal, self-contained per-page helpers (deliberately NOT shared
+    // with `runViewport`'s closures — this function owns its own page) ──────
+    async function until (fn, arg, ms = 6000, step = 50) {
+        const deadline = Date.now() + ms;
+        for ( ;; ) {
+            const v = await page.evaluate(fn, arg);
+            if ( v ) return v;
+            if ( Date.now() > deadline ) return null;
+            await sleep(step);
+        }
+    }
+
+    async function settle (app, { timeout = 1000, step = 60 } = {}) {
+        const read = () => page.evaluate((a) => {
+            const el = document.querySelector(`.window[data-app="${a}"]`);
+            if ( ! el ) return null;
+            const r = el.getBoundingClientRect();
+            return `${r.top.toFixed(1)}|${r.left.toFixed(1)}|${r.width.toFixed(1)}|${r.height.toFixed(1)}`;
+        }, app);
+        let prev = await read();
+        const deadline = Date.now() + timeout;
+        while ( Date.now() < deadline ) {
+            await sleep(step);
+            const cur = await read();
+            if ( cur !== null && cur === prev ) return true;
+            prev = cur;
+        }
+        return false;
+    }
+
+    /** Real close path: the titlebar close button when it exists and is
+     * visible, else the full-bleed control drawer's close button (a plain
+     * DOM `.click()` — the drawer only REVEALS its buttons on hover, which
+     * is not the affordance under test here), else `$.fn.close()` directly
+     * as a last resort (never reached by any currently-registered app, kept
+     * so this sweep degrades gracefully instead of hanging on a future one
+     * that has neither). */
+    async function closeApp (a) {
+        await page.evaluate((app) => {
+            const win = document.querySelector(`.window[data-app="${app}"]`);
+            if ( ! win ) return;
+            const closeBtn = win.querySelector('.window-close-btn');
+            if ( closeBtn && closeBtn.offsetParent !== null ) { closeBtn.click(); return; }
+            const drawerClose = win.querySelector('.dashboard-app-drawer-close');
+            if ( drawerClose ) { drawerClose.click(); return; }
+            $(win).close();
+        }, a);
+    }
+
+    /** Real reopen path: the SAME registry entry point every other launch in
+     * this file goes through — never a direct DOM/constructor call. */
+    async function reopenApp (a) {
+        await page.evaluate(({ app, ctx }) => window.ezil.registry.launch(app, ctx), {
+            app: a, ctx: { payload: PAYLOAD, computer: PAYLOAD.computer, desktopState: PAYLOAD.desktopState },
+        });
+    }
+
+    async function minimizeApp (a) {
+        await page.evaluate((app) => {
+            const $win = $(`.window[data-app="${app}"]`);
+            const $btn = $win.find('.window-minimize-btn');
+            if ( $btn.length && $btn.is(':visible') ) { $btn.trigger('click'); return; }
+            const drawer = document.querySelector(`.window[data-app="${app}"] .dashboard-app-drawer`);
+            const btn = drawer?.querySelector(
+                '.dashboard-app-drawer-btn:not(.dashboard-app-drawer-settings):not(.dashboard-app-drawer-close)',
+            );
+            btn?.click();
+        }, a);
+    }
+
+    async function taskbarItemPoint (a) {
+        return page.evaluate((app) => {
+            const el = document.querySelector(`.taskbar-item[data-app="${app}"]`);
+            if ( ! el ) return null;
+            const r = el.getBoundingClientRect();
+            if ( r.width === 0 || r.height === 0 ) return null;
+            return [r.left + r.width / 2, r.top + r.height / 2];
+        }, a);
+    }
+
+    await until(() => Array.isArray(window.ezil?.registry?.APPS) && window.ezil.registry.APPS.length > 0, undefined);
+    const resolvedApps = await page.evaluate(() => window.ezil.registry.resolve(window.__EZIL_BOOT__).map((a) => a.id));
+    push(`${VP} registry resolved at least one app for close/reopen coverage`, resolvedApps.length > 0,
+        `resolved=${JSON.stringify(resolvedApps)}`);
+
+    for ( const id of resolvedApps ) {
+        // The boot app (apps[0]) is already open from boot.js itself; every
+        // other resolved app needs an initial launch before its own sweep.
+        const already = await page.evaluate((a) => !! document.querySelector(`.window[data-app="${a}"]`), id);
+        if ( ! already ) {
+            await reopenApp(id);
+            await until((a) => !! document.querySelector(`.window[data-app="${a}"]`), id, 8000, 50);
+        }
+        await settle(id);
+
+        for ( const interval of CLOSE_REOPEN_INTERVALS_MS ) {
+            const label = `${VP} "${id}" close, wait ${interval}ms, reopen`;
+            const errorsBefore = page_errors.length;
+
+            await closeApp(id);
+            await sleep(interval);
+            await reopenApp(id);
+            await until((a) => !! document.querySelector(`.window[data-app="${a}"]`), id, 8000, 50);
+            await settle(id);
+
+            const state = await page.evaluate((a) => {
+                const wins = document.querySelectorAll(`.window[data-app="${a}"]`);
+                const items = document.querySelectorAll(`.taskbar-item[data-app="${a}"]`);
+                const win = wins[0] ?? null;
+                const cs = win ? getComputedStyle(win) : null;
+                const r = win ? win.getBoundingClientRect() : null;
+                return {
+                    windowCount: wins.length,
+                    taskbarItemCount: items.length,
+                    visible: !! win && cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0,
+                };
+            }, id);
+
+            push(`${label}: exactly 1 window`, state.windowCount === 1, `windowCount=${state.windowCount}`);
+            push(`${label}: exactly 1 taskbar item`, state.taskbarItemCount === 1, `taskbarItemCount=${state.taskbarItemCount}`);
+            push(`${label}: the reopened window is visible`, state.visible, JSON.stringify(state));
+
+            // 🔴 `.fullpage-mode .window-minimize-btn { display: none }`
+            // (`shell/src/css/style.css`) hides EVERY window's minimize
+            // button, site-wide, whenever the boot app is in full-bleed mode
+            // — not just the full-bleed window's own button. That is a real,
+            // pre-existing, already-documented shell characteristic (see
+            // this file's own `buttonPointInside` comment), independent of
+            // close/reopen and out of scope for D1/D2/D3 — it is CSS, not
+            // `UIWindow.js`/`UIDesktopFullpage.js`/`registry.js`. Ordinary
+            // (non-drawer) windows have no other way to minimize, so when
+            // neither affordance is currently reachable this is a SKIP, not
+            // a FAIL — same reasoning `checkTaskbarReachable` above uses for
+            // "the taskbar is legitimately hidden by full-bleed mode".
+            const minimizeAffordance = state.windowCount >= 1 ? await page.evaluate((a) => {
+                const win = document.querySelector(`.window[data-app="${a}"]`);
+                const btn = win?.querySelector('.window-minimize-btn');
+                const btnReachable = !! btn && getComputedStyle(btn).display !== 'none'
+                    && btn.getBoundingClientRect().width > 0;
+                const drawerBtn = win?.querySelector(
+                    '.dashboard-app-drawer-btn:not(.dashboard-app-drawer-settings):not(.dashboard-app-drawer-close)',
+                );
+                return btnReachable || !! drawerBtn;
+            }, id) : false;
+
+            let minimized = false;
+            if ( minimizeAffordance ) {
+                await minimizeApp(id);
+                minimized = !! await until(
+                    (a) => document.querySelector(`.window[data-app="${a}"]`)?.getAttribute('data-is_minimized') === 'true',
+                    id, 2000, 30,
+                );
+                push(`${label}: minimise works`, minimized);
+            } else {
+                skip(`${label}: minimise (no reachable minimize affordance right now — full-bleed mode hides ordinary minimize buttons site-wide; a pre-existing shell characteristic, not part of this close/reopen sweep)`);
+            }
+
+            if ( minimized ) {
+                const p = await taskbarItemPoint(id);
+                if ( p ) {
+                    await page.mouse.click(p[0], p[1]);
+                } else {
+                    await page.evaluate((a) => {
+                        const w = $(`.window[data-app="${a}"]`);
+                        if ( w.length ) w.showWindow();
+                    }, id);
+                }
+                await sleep(200);
+                await settle(id);
+                const restored = await page.evaluate((a) => {
+                    const win = document.querySelector(`.window[data-app="${a}"]`);
+                    if ( ! win ) return { exists: false };
+                    const cs = getComputedStyle(win);
+                    const r = win.getBoundingClientRect();
+                    return {
+                        exists: true,
+                        minimized: win.getAttribute('data-is_minimized'),
+                        visible: cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0,
+                    };
+                }, id);
+                push(`${label}: restore works`,
+                    restored.exists && restored.minimized !== 'true' && restored.visible, JSON.stringify(restored));
+            } else {
+                skip(`${label}: restore (minimise never completed — nothing to restore)`);
+            }
+
+            const cycleErrors = page_errors.slice(errorsBefore);
+            push(`${label}: zero uncaught page errors during this close/reopen cycle`,
+                cycleErrors.length === 0, JSON.stringify(cycleErrors));
+        }
+    }
+
+    allPageErrors.push(...page_errors);
     await page.close();
 }
