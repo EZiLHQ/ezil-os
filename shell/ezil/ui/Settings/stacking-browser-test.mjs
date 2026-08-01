@@ -309,7 +309,9 @@ async function runViewport (vp) {
         // The GAP 1 mutation self-test (see near the GUARD, below) is
         // EXPECTED to log console noise for its deliberately-broken dummy
         // ids; it must not register as a spurious "uncaught page error".
-        if ( process.env.MUTATION_PROVE_GAP1 && /zz-mutation/.test(msg.text()) ) return;
+        // Unconditional (not opt-in) since round 8: the self-test itself is
+        // no longer opt-in either — see that block's own comment.
+        if ( /zz-mutation/.test(msg.text()) ) return;
         page_errors.push(msg.text());
     });
 
@@ -1369,40 +1371,56 @@ async function runViewport (vp) {
     }
 
     // ═════════════════════════════════════════════════════════════════════
-    // 🔴 MUTATION SELF-TEST for the GUARD immediately below. Opt-in
-    // (`MUTATION_PROVE_GAP1=1`, first viewport only) so ordinary runs are
-    // unaffected — this is a standing, re-runnable proof that the guard can
-    // still fail, not a permanent extra scenario. Round 7's verifier found
-    // the previous guard could NEVER fail: `coveredIds.add(id)` ran
-    // unconditionally, over the very list (`resolvedApps`) it was later
+    // 🔴 MUTATION SELF-TEST for the GUARD immediately below — STANDING, runs
+    // by default (first viewport only; the guard mechanism itself doesn't
+    // vary by viewport, so proving it once per run is enough). Round 7's
+    // verifier found the previous guard could NEVER fail: `coveredIds.add(id)`
+    // ran unconditionally, over the very list (`resolvedApps`) it was later
     // compared against, so the two were identical by construction.
     //
-    //   (a) "zz-mutation-unexercised" is spliced into `resolvedApps` ONLY —
-    //       it is never opened, never asserted, never added to `coveredIds`
-    //       by anything. This is the purest form of "a registered app this
-    //       run never exercised": if the GUARD still passes with this id
-    //       unaccounted for, `coveredIds` is being derived FROM
-    //       `resolvedApps` (the exact tautology), not from real assertions.
+    // 🔴 ROUND 8 FOLLOW-UP: this used to be opt-in behind
+    // `MUTATION_PROVE_GAP1=1`, so an ORDINARY run never executed it and a
+    // reintroduced tautology would go uncaught — "the guard against
+    // tautologies is itself unenforced". It is a real `push()`ed assertion
+    // now, not a side channel a human has to remember to invoke and read by
+    // hand. The reason it WAS opt-in: the previous version spliced both
+    // dummy ids directly into the SHARED `resolvedApps` array that "THE
+    // GUARD" below also reads, with no cleanup — running it unconditionally
+    // would have made the REAL guard permanently FAIL on every ordinary
+    // run too (both dummies stay uncovered forever), masking any genuine
+    // coverage regression behind this self-inflicted one. Fixed by
+    // computing the self-test's own predicate over a LOCAL copy of
+    // `resolvedApps` and asserting it directly — the shared `resolvedApps`
+    // is never mutated, so the real GUARD's own evaluation right after this
+    // block is completely unaffected by this one running every time.
+    //
+    //   (a) "zz-mutation-unexercised" — a plain string, added only to the
+    //       LOCAL copy below. Never opened, never asserted, never added to
+    //       `coveredIds` by anything. The purest form of "a registered app
+    //       this run never exercised": if the GUARD's predicate still
+    //       treats a resolved list containing it as fully covered,
+    //       `coveredIds` is being derived FROM `resolvedApps` (the exact
+    //       tautology), not from real assertions.
     //   (b) "zz-mutation-noassert" is a REAL `.window[data-app]` element
     //       (so "opened" is genuinely true) with no titlebar, no button, no
     //       taskbar item and no `.window-body`. It is run through the ACTUAL
-    //       shipped assertion helpers (not a stand-in), each of which can
-    //       only `skip()` it. This proves "opened but never actually
-    //       asserted" does not buy coverage either.
+    //       shipped assertion helpers (not a stand-in, and against the REAL,
+    //       shared `coveredIds` — proving those helpers genuinely never add
+    //       an id they couldn't actually assert anything about), each of
+    //       which can only `skip()` it. This proves "opened but never
+    //       actually asserted" does not buy coverage either.
     //
-    // Both must appear in `notCovered` and make the GUARD FAIL. If either
-    // does not, the guard is tautological again.
+    // Both must appear in the LOCAL `notCovered` and make the LOCAL guard
+    // predicate false. If either does not, the real GUARD below is
+    // tautological again.
     // ═════════════════════════════════════════════════════════════════════
-    if ( process.env.MUTATION_PROVE_GAP1 && vp === VIEWPORTS[0] ) {
-        resolvedApps.push('zz-mutation-unexercised');
-
+    if ( vp === VIEWPORTS[0] ) {
         await page.evaluate(() => {
             const el = document.createElement('div');
             el.className = 'window';
             el.setAttribute('data-app', 'zz-mutation-noassert');
             document.body.appendChild(el);
         });
-        resolvedApps.push('zz-mutation-noassert');
         const dummyContenders = [...openIds, 'zz-mutation-noassert'];
         await assertHitTestsIntoSelf('zz-mutation-noassert', `${VP} MUTATION SELF-TEST`);
         await checkContentPainted('zz-mutation-noassert', `${VP} MUTATION SELF-TEST`);
@@ -1412,6 +1430,19 @@ async function runViewport (vp) {
             ! coveredIds.has('zz-mutation-noassert'),
             `coveredIds has it = ${coveredIds.has('zz-mutation-noassert')}`);
         await page.evaluate(() => document.querySelector('.window[data-app="zz-mutation-noassert"]')?.remove());
+
+        // The GUARD's own predicate, re-evaluated over a LOCAL copy carrying
+        // both dummies — see the block comment above for why this must be a
+        // local copy and not the shared `resolvedApps`.
+        const selfTestResolvedApps = [...resolvedApps, 'zz-mutation-unexercised', 'zz-mutation-noassert'];
+        const selfTestNotCovered = selfTestResolvedApps.filter((id) => ! coveredIds.has(id));
+        const selfTestGuardWouldPass = selfTestNotCovered.length === 0
+            && coveredIds.size >= selfTestResolvedApps.length;
+        push(`${VP} MUTATION SELF-TEST: the coverage GUARD correctly fails when a resolved-but-unexercised app and an assertion-less dummy are injected`,
+            selfTestNotCovered.includes('zz-mutation-unexercised')
+                && selfTestNotCovered.includes('zz-mutation-noassert')
+                && ! selfTestGuardWouldPass,
+            `notCovered=${JSON.stringify(selfTestNotCovered)} guardWouldPass=${selfTestGuardWouldPass}`);
     }
 
     // ═════════════════════════════════════════════════════════════════════
