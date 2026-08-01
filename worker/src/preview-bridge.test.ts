@@ -305,7 +305,42 @@ describe('stripFrameAncestors', () => {
 describe('rewriteSetCookie', () => {
   it('adds missing attributes when the dev server sets a bare cookie', () => {
     const out = rewriteSetCookie('foo=bar');
-    expect(out).toBe('foo=bar; Path=/preview; SameSite=None; Secure');
+    // `Partitioned` is not cosmetic: every cookie here is forced to
+    // `SameSite=None`, and Chrome blocks a `SameSite=None` cookie outright in
+    // a third-party iframe unless it is also partitioned. Without it the
+    // previewed app's own session/CSRF cookies vanish the moment the shell
+    // embeds the window cross-site — the same silent failure the
+    // `ezil_preview` cookie had.
+    expect(out).toBe('foo=bar; Path=/preview; SameSite=None; Secure; Partitioned');
+  });
+
+  it('does not duplicate attributes the upstream already set', () => {
+    const out = rewriteSetCookie('foo=bar; Path=/api; SameSite=Lax; Secure; Partitioned; HttpOnly');
+    expect(out).toBe('foo=bar; Path=/preview; SameSite=None; Secure; Partitioned; HttpOnly');
+    expect(out.match(/Partitioned/g)).toHaveLength(1);
+    expect(out.match(/Secure/g)).toHaveLength(1);
+    expect(out.match(/Path=/g)).toHaveLength(1);
+  });
+
+  it('drops Domain= (Partitioned is invalid with a Domain attribute)', () => {
+    const out = rewriteSetCookie('foo=bar; Domain=.example.com');
+    expect(out).not.toContain('Domain');
+    expect(out).toContain('Partitioned');
+  });
+
+  it('pins the code-server host cookies to `/`, not `/preview`', () => {
+    // code-server is served from the ROOT of its own bridge host
+    // (`handleCodeBridge`); a `/preview`-scoped cookie would never be sent
+    // back on any of its root-absolute requests.
+    expect(rewriteSetCookie('foo=bar', '/')).toBe('foo=bar; Path=/; SameSite=None; Secure; Partitioned');
+    expect(rewriteSetCookie('foo=bar; Path=/deep/nested', '/')).toContain('Path=/;');
+  });
+
+  it('rewriteResponseHeaders threads the cookie path through', () => {
+    const upstream = new Headers();
+    upstream.append('set-cookie', 'a=1');
+    expect(rewriteResponseHeaders(upstream).get('set-cookie')).toContain('Path=/preview');
+    expect(rewriteResponseHeaders(upstream, '/').get('set-cookie')).toContain('Path=/');
   });
 });
 
