@@ -884,11 +884,21 @@ describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => 
 
   it('routes every preview hostname the Worker can mint (token coverage) — unless explicitly disabled', async () => {
     if (routesDisabled) return; // no routes declared at all; nothing to cover yet.
-    const { portFor, appPortFor } = await import('./desktop-mode');
+    const { portFor, appPortFor, codePortFor } = await import('./desktop-mode');
     const tokens = [
       portFor('guacamole').token,
       portFor('neko').token,
       appPortFor('neko')?.token,
+      // `codePortFor` (code-server bridge, `./preview-bridge.ts`'s
+      // `parseBridgeHost` target: 'code') is the newest exposed-port token —
+      // exactly the case this guard exists to catch: a NEW token with no
+      // matching wrangler.toml route silently 404s in production instead of
+      // failing the build. This assertion is EXPECTED to fail until a
+      // `[[routes]] pattern = "*-code.ezil.org/*"` entry is added to
+      // wrangler.toml — that file is outside this change's ownership (see
+      // the wave-a-t1-worker-bridge report); the failure is the guard doing
+      // its job, not a defect in this test or in `codePortFor` itself.
+      codePortFor('neko')?.token,
     ].filter((t): t is string => typeof t === 'string');
 
     for (const token of tokens) {
@@ -938,5 +948,99 @@ describe('/health distinguishing marker (route-precedence observability)', () =>
 
   it('adds a `build` marker that distinguishes this Worker from the legacy script', () => {
     expect(fnSrc).toContain("build: 'ezil-os'");
+  });
+});
+
+// ── Bridge-host generalization (app-preview + code-server) ─────────────────
+// `parseAppPreviewHost` -> `parseBridgeHost`, `handleAppPreview` ->
+// `handleBridgeHost`. Static source assertions on the wiring
+// `route-auth.test.ts` doesn't already cover end to end (no live sandbox
+// fixture makes it worth standing up a real container-fetch fake just for
+// this), mirroring this file's existing precedent for verifying generated
+// code and call-site wiring (see the cpu-diag/sealed-delivery describe
+// blocks above).
+describe('bridge-host dispatcher: generalized to app-preview AND code-server', () => {
+  const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+
+  it('renamed handleAppPreview -> handleBridgeHost (no dangling old name)', () => {
+    expect(src).toContain('async function handleBridgeHost(');
+    expect(src).not.toContain('function handleAppPreview(');
+  });
+
+  it('resolves `target` from parseBridgeHost and threads `port` into every handler that needs it', () => {
+    expect(src).toContain('const route = parseBridgeHost(url.hostname);');
+    expect(src).toContain("const { sandboxId, target } = route;");
+    expect(src).toContain("const port = target === 'app' ? APP_PREVIEW_PORT : CODE_PREVIEW_PORT;");
+    expect(src).toContain('handlePreviewWsProxy(request, sandbox, sandboxId, secrets, appPath, port)');
+    expect(src).toContain('handlePreviewProxy(request, sandbox, sandboxId, secrets, appPath, port, target)');
+  });
+
+  it('gates /preview-status and /preview-inspector.js to target: app only', () => {
+    expect(src).toContain("target === 'app' && request.method === 'GET' && path === '/preview-status'");
+    expect(src).toContain("target === 'app' && request.method === 'GET' && path === '/preview-inspector.js'");
+  });
+
+  it('ensureDesktop best-effort-exposes the code-server port alongside the app-preview port', () => {
+    expect(src).toContain('const codePreview = codePortFor(mode);');
+    expect(src).toContain('let codePreviewExpose: AppPreviewExposeResult');
+    expect(src).toContain('return { url: desktopUrl, appPreviewExpose, codePreviewExpose };');
+  });
+
+  it('the fetch() entrypoint call site was renamed too (no dangling `handleAppPreview` call)', () => {
+    expect(src).toContain('await handleBridgeHost(request, env, new URL(request.url));');
+  });
+});
+
+// ── handlePreview returns appPreviewUrl / codePreviewUrl ────────────────────
+describe('handlePreview response carries ready-to-embed bridge URLs', () => {
+  const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+
+  it('mints a bootstrap token and builds appPreviewUrl/codePreviewUrl from the exposed bridge URL', () => {
+    expect(src).toContain('const appPreviewUrl = await buildBridgeUrl(appPreviewExpose);');
+    expect(src).toContain('const codePreviewUrl = await buildBridgeUrl(codePreviewExpose);');
+    expect(src).toContain("bridgeUrl.pathname = '/preview-bootstrap';");
+    expect(src).toContain("bridgeUrl.searchParams.set('token', bootstrapToken);");
+  });
+
+  it('includes both URLs (never omitted, null when not available) in the JSON response', () => {
+    expect(src).toContain('appPreviewExpose,\n      codePreviewExpose,\n      appPreviewUrl,\n      codePreviewUrl,');
+  });
+
+  it('a mint failure is caught and degrades to null rather than failing the whole /sandbox/preview response', () => {
+    const fnMatch = src.match(/const buildBridgeUrl = async[\s\S]*?\n {4}\};/);
+    expect(fnMatch).not.toBeNull();
+    expect(fnMatch?.[0]).toContain('} catch (err) {');
+    expect(fnMatch?.[0]).toContain('return null;');
+  });
+});
+
+// ── POST /sandbox/:id/focus wiring ──────────────────────────────────────────
+// Route-level auth/enum/kill-switch behavior is covered end-to-end in
+// `route-auth.test.ts` against the real `fetch()` table; these assertions
+// pin the specific wiring choices the brief called out (closed enum, the
+// existing `authorizeSignedControlRequest` gate, a kill switch).
+describe('POST /sandbox/:id/focus wiring', () => {
+  const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+
+  it('registers the route behind the SANDBOX_FOCUS kill-switch, gated by authorizeSignedControlRequest', () => {
+    expect(src).toContain(String.raw`/^\/sandbox\/([^/]+)\/focus$/`);
+    expect(src).toContain('focusDisabled(env.SANDBOX_FOCUS)');
+    expect(src).toContain("json({ ok: false, error: 'focus_disabled' }, 404)");
+    // Same gate DELETE /sandbox/:name uses — no new auth scheme introduced.
+    const focusBlock = src.match(/const focusMatch[\s\S]*?\n {4}\}\n/)?.[0] ?? '';
+    expect(focusBlock).toContain('await authorizeSignedControlRequest(request, env, url);');
+  });
+
+  it('validates `app` through the closed-enum validateFocusApp, never a free string', () => {
+    expect(src).toContain('const validated = validateFocusApp(rawApp);');
+    expect(src).not.toMatch(/exec\(`\/usr\/local\/bin\/neko-switch-app\.sh \$\{[^}]*rawApp/);
+  });
+
+  it('execs the exact neko-switch-app.sh command via buildFocusAppCommand (no raw string interpolation)', () => {
+    expect(src).toContain('await sandbox.exec(buildFocusAppCommand(app));');
+  });
+
+  it('Env carries SANDBOX_FOCUS as a non-secret, optional string', () => {
+    expect(src).toContain('SANDBOX_FOCUS?: string;');
   });
 });
