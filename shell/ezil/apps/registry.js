@@ -49,9 +49,18 @@
 // window that declares `wants_settings_in_drawer`. Both changes exist for the
 // same reason — round 1 built a Settings window that no real boot could
 // reach. See the two 🔴 blocks below and `../ui/Settings/drawer-action.js`.
+//
+// MODIFIED BY EZIL 2026-08-01 (Wave B / T7): added `code` — the Code window
+// (`../apps/code.js`), the icon the whole "code-server replaced Electron VS
+// Code" migration had been missing an entry point for. Same shape as
+// `preview`: `shell_local: true` for the identical reason (a real host route
+// backs it, `/api/shell/code-preview-url`, but it is not a provisioned
+// capability the server could offer to one user and not another — the window
+// itself says so honestly when it cannot serve one).
 
 import { openDesktopWindow } from './desktop-window.js';
 import { openPreviewWindow } from './preview.js';
+import { openCodeWindow } from './code.js';
 import { openSettingsWindow } from '../ui/Settings/index.js';
 import { ensureSettingsDrawerButton, SETTINGS_DRAWER_SVG } from '../ui/Settings/drawer-action.js';
 
@@ -113,6 +122,18 @@ const PREVIEW_ICON = 'data:image/svg+xml,' + encodeURIComponent(
     + '<path d="M10 18h28" fill="none" stroke="#00adb5" stroke-width="2.4"/>'
     + '<circle cx="14.5" cy="14.5" r="1.3" fill="#00adb5"/>'
     + '<circle cx="19" cy="14.5" r="1.3" fill="#00adb5"/>'
+    + '</svg>',
+);
+
+/** Code's icon — the same construction and the same reasoning as the three above. */
+const CODE_ICON = 'data:image/svg+xml,' + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">'
+    + '<defs><linearGradient id="gc" x1="0" y1="0" x2="0" y2="1">'
+    + '<stop offset="0" stop-color="#1f4d50"/><stop offset="1" stop-color="#12292b"/>'
+    + '</linearGradient></defs>'
+    + '<rect width="48" height="48" rx="11" fill="url(#gc)"/>'
+    + '<path d="M19 16l-7 8 7 8M29 16l7 8-7 8" fill="none" stroke="#00adb5"'
+    + ' stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>'
     + '</svg>',
 );
 
@@ -211,6 +232,28 @@ export const APPS = [
         // not have resolved. Both files are in this tree now, so the import
         // is real and the stub is gone.
         open: openPreviewWindow,
+    },
+    {
+        id: 'code',
+        name: 'Code',
+        icon: CODE_ICON,
+        // Not pinned, same reasoning as `preview`: reachable from the Start
+        // menu, not a dock permanent.
+        pinned: false,
+        single_instance: true,
+        // 🔴 Shell-local, and for the SAME reason `preview` is — see that
+        // entry's comment. code-server is a feature the Worker can genuinely
+        // fail to serve for one deployment (no `codePreviewUrl` field, no
+        // exposed port) and the window says so
+        // (`show_unavailable()` in `../apps/code.js`); it is not a capability
+        // the server list could withhold from one user and not another.
+        shell_local: true,
+        // 🔴 Wave B / T7 — the whole point of the container swap from
+        // Electron VS Code to code-server: an HTTP window, not a focus
+        // target inside the streamed desktop. See `../apps/code.js`'s file
+        // header for why "focus code in the stream" is not a smaller version
+        // of this feature but a different, impossible one.
+        open: openCodeWindow,
     },
 ];
 
