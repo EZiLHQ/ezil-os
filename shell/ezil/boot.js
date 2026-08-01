@@ -165,6 +165,23 @@ export const shell = {
     get mountAttempts () { return mount_attempts; },
 
     /**
+     * 🔴 Set — and left set — when this shell has given up putting a desktop
+     * on screen. `null` while there is still any prospect of one.
+     *
+     * A LATCH, deliberately, unlike `mounted`. The host page's watchdog
+     * (`app/src/app/os/boot-watchdog.tsx`) has to be able to learn about a
+     * surrender that happened before it was listening: the bundle is
+     * `defer`red and can exhaust its budget before React has run a single
+     * effect. So `give_up()` both fires `ezil:stalled` for a listener that is
+     * already there and records it here for one that arrives later.
+     *
+     * Without this the page keeps showing a wallpaper and nothing else,
+     * indefinitely — an OS that looks like it is still loading and never will
+     * be. The console.error below is not a user-visible failure state.
+     */
+    stalled: null,
+
+    /**
      * Rebuild the desktop if it is missing. Safe to call at any time: it does
      * nothing when the OS is intact, and it resets the attempt budget so a
      * user (or a console) always has a way back. This is the manual half of
@@ -172,10 +189,27 @@ export const shell = {
      */
     recover () {
         mount_attempts = 0;
+        shell.stalled = null;
         ensure_intact('recover() called');
         return shell.mounted;
     },
 };
+
+/**
+ * Stop trying, and make sure somebody other than the console finds out.
+ *
+ * The host page turns this into words on screen; a bare page (the headless
+ * tests) has no listener and simply carries the latch. Either way the shell
+ * never leaves a wallpaper standing in for an OS it has stopped building.
+ */
+function give_up (reason, detail) {
+    if ( shell.stalled ) return;
+    shell.stalled = { reason, ...detail };
+    console.error(`[${PHASE}] giving up: ${reason}`, shell.stalled);
+    if ( typeof window !== 'undefined' && typeof CustomEvent === 'function' ) {
+        window.dispatchEvent(new CustomEvent('ezil:stalled', { detail: shell.stalled }));
+    }
+}
 
 /**
  * Upstream (`initgui.js:952-968`) writes this with
@@ -434,6 +468,10 @@ function begin_mount (why) {
             `[${PHASE}] the desktop could not be kept on screen after ${mount_attempts} attempts (${why}).`
             + ' Not trying again — reload the page, or call ezil.recover().',
         );
+        // 🔴 Bounded AND legible. Exhausting the budget used to be visible
+        // only in the console, which meant the user was left looking at the
+        // server-rendered wallpaper with no OS on it and no way to know.
+        give_up('mount-budget-exhausted', { attempts: mount_attempts, why });
         return;
     }
     mount_attempts += 1;

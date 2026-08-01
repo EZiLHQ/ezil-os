@@ -1,0 +1,118 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
+import { describe, expect, it } from 'vitest';
+
+/**
+ * 🔴 THE ENTRY CONTRACT FOR `/os`, pinned against the source that has to
+ * honour it.
+ *
+ * `/os` is not a React route. It is the host document for a separate
+ * jQuery/webpack application delivered as an inline boot payload plus two
+ * `<script src>` tags, and **a `<script>` element React inserts during a
+ * client-side navigation is never executed by the browser**
+ * (docs/PLATFORM-NOTES.md §17). So any path into `/os` that is a client-side
+ * navigation lands the user on a page that will never boot.
+ *
+ * `redirect()` inside a server action IS a client-side navigation — the
+ * App Router performs it, not the browser. That is exactly how
+ * `/login?returnUrl=%2Fos` produced a permanently dead page: MEASURED 30s
+ * after sign-in, `bundleFetched: 0`, `window.ezil` undefined, no taskbar, no
+ * visible text, and a full-screen wallpaper still on screen.
+ *
+ * These assertions read the source because the property is about which
+ * MECHANISM the code uses, and no runtime assertion can see that: a test that
+ * called the action would need a real Supabase session, and a test that
+ * mocked one would be asserting against the mock. The failure mode this
+ * guards is a future contributor "tidying up" the return value back into a
+ * `redirect()`, which type-checks, lints, passes every behavioural test, and
+ * breaks the login path.
+ */
+
+const here = path.dirname(new URL(import.meta.url).pathname);
+const read = (p: string) => readFileSync(path.resolve(here, p), 'utf8');
+
+const actions = read('./actions.ts');
+const form = read('./login-form.tsx');
+const callback = read('../auth/callback/route.ts');
+const osPage = read('../os/page.tsx');
+
+/** The body of one exported function, from its signature to the next one. */
+function functionBody(source: string, name: string): string {
+    const start = source.indexOf(`export async function ${name}(`);
+    expect(start, `${name} not found`).toBeGreaterThan(-1);
+    const rest = source.slice(start + 1);
+    const next = rest.indexOf('\nexport ');
+    return next === -1 ? rest : rest.slice(0, next);
+}
+
+/** Strip comments, so documenting the trap does not read as falling into it. */
+function code(source: string): string {
+    return source
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .split('\n')
+        .filter(line => !line.trim().startsWith('*') && !line.trim().startsWith('//'))
+        .join('\n');
+}
+
+describe('the sign-in path lands on a DOCUMENT load', () => {
+    it('🔴 signInWithPassword does not call redirect()', () => {
+        expect(code(functionBody(actions, 'signInWithPassword'))).not.toMatch(/\bredirect\(/);
+    });
+
+    it('it returns the destination instead, for the client to navigate to', () => {
+        expect(functionBody(actions, 'signInWithPassword')).toMatch(/return \{ redirectTo: returnUrl \}/);
+    });
+
+    it('and the form performs that navigation as a real document load', () => {
+        expect(code(form)).toMatch(/window\.location\.assign\(result\.redirectTo\)/);
+        // Not the router: `router.push` reproduces the exact defect.
+        expect(code(form)).not.toMatch(/useRouter|router\.(push|replace)/);
+    });
+
+    it('the destination is narrowed to a same-origin path before it is returned', () => {
+        // It reaches `window.location.assign`, so an unfiltered value is an
+        // open redirect. See `safeReturnUrl` and its tests.
+        expect(functionBody(actions, 'signInWithPassword')).toMatch(/safeReturnUrl\(/);
+    });
+});
+
+describe('the OAuth path lands on a DOCUMENT load', () => {
+    it('/auth/callback stays a route handler, whose 302 the browser follows', () => {
+        expect(callback).toMatch(/export async function GET\(/);
+        expect(callback).toMatch(/NextResponse\.redirect\(/);
+        // A server action here would silently become a client-side navigation.
+        expect(code(callback)).not.toMatch(/'use server'/);
+        expect(code(callback)).not.toMatch(/from 'next\/navigation'/);
+    });
+
+    it('and it narrows returnUrl too', () => {
+        expect(callback).toMatch(/safeReturnUrl\(/);
+    });
+});
+
+describe('/os checks its own arrival, because senders are a convention', () => {
+    it('renders the watchdog', () => {
+        expect(code(osPage)).toMatch(/<BootWatchdog \/>/);
+    });
+
+    it('still emits the boot payload before the bundle, in that order', () => {
+        const body = code(osPage);
+        const payload = body.indexOf('bootPayloadScript(payload)');
+        const icons = body.indexOf('src="/os/icons.js"');
+        const bundle = body.indexOf('src="/os/bundle.min.js"');
+        expect(payload).toBeGreaterThan(-1);
+        expect(payload).toBeLessThan(icons);
+        expect(icons).toBeLessThan(bundle);
+    });
+
+    it('nothing in the app links to /os with a client-side <Link>', () => {
+        // Not a style rule: a <Link href="/os"> is the same defect as the
+        // server-action redirect. If one is ever added deliberately, the
+        // watchdog turns it into one reload rather than a dead page — but it
+        // should be a deliberate act, so this fails first.
+        for (const [name, source] of Object.entries({ form, callback, osPage, actions })) {
+            expect(code(source), name).not.toMatch(/<Link[^>]*href=["'{]*\/os["'}]/);
+        }
+    });
+});

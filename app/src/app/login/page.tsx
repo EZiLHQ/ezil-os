@@ -1,6 +1,6 @@
 import Link from 'next/link';
 
-import { MAX_COMPUTERS_PER_USER, RETURN_URL_PARAM, Routes } from '@/utils/constants';
+import { MAX_COMPUTERS_PER_USER, RETURN_URL_PARAM, Routes, safeReturnUrl } from '@/utils/constants';
 import { DesktopVisual } from './desktop-visual';
 import { LoginForm } from './login-form';
 
@@ -18,8 +18,10 @@ export default async function LoginPage({
     searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
     const params = await searchParams;
-    const returnUrlParam = params[RETURN_URL_PARAM];
-    const returnUrl = (Array.isArray(returnUrlParam) ? returnUrlParam[0] : returnUrlParam) ?? Routes.COMPUTERS;
+    // Narrowed here, at the edge, so the value handed to the form (and from
+    // there to `window.location.assign`) can only ever be a path on this
+    // origin. See `safeReturnUrl`.
+    const returnUrl = safeReturnUrl(params[RETURN_URL_PARAM]);
 
     return (
         <div className="flex h-screen w-screen justify-center bg-black">

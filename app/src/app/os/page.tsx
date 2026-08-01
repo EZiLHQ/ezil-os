@@ -6,6 +6,7 @@ import { appRouter } from '@/server/api/root';
 import { createTRPCContext } from '@/server/api/trpc';
 import { bootPayloadScript, buildShellBootPayload } from '@/server/shell/boot-payload';
 import { Routes, getReturnUrlQueryParam } from '@/utils/constants';
+import { BootWatchdog } from './boot-watchdog';
 import { HydrationSignal } from './hydration-signal';
 
 /**
@@ -61,11 +62,25 @@ import { HydrationSignal } from './hydration-signal';
  *    touch `<body>` or `#ezil-os-root`. See the mount point below and
  *    `hydration-signal.tsx`. This is not a style preference: getting it wrong
  *    produced a permanently blank page on 4 of 5 loads under load.
- * 3. `<script src>` tags rendered by React execute on a real document load,
+ * 3. 🔴 `<script src>` tags rendered by React execute on a real document load,
  *    but NOT when React inserts them during a client-side navigation. So the
- *    entry point into `/os` must be a full page load (a plain `<a href>` or a
- *    redirect), never a `<Link>` prefetch-and-swap. Nothing links here yet;
- *    whoever flips the entry point owns that constraint.
+ *    entry point into `/os` must be a full page load, never a `<Link>`
+ *    prefetch-and-swap and never a server action's `redirect()` (which the
+ *    App Router performs as a client-side navigation — this is what broke
+ *    `/login?returnUrl=%2Fos`; see docs/PLATFORM-NOTES.md §17).
+ *
+ *    That constraint is now enforced in two independent places, because one
+ *    of them is a convention and conventions do not survive contact with a
+ *    new contributor:
+ *      - the SENDERS use document loads. `login/actions.ts` returns the
+ *        destination instead of redirecting to it and the form navigates with
+ *        `window.location.assign`; `/auth/callback` is a route handler whose
+ *        302 the browser follows itself.
+ *      - the ARRIVAL checks. `<BootWatchdog>` below notices a page that was
+ *        entered by a client-side navigation and has no boot payload, and
+ *        reloads exactly once — and if the shell still does not appear, it
+ *        SAYS SO instead of leaving the wallpaper up. A future `<Link>` here
+ *        would cost one reload, not a dead page.
  */
 
 export const metadata = {
@@ -176,6 +191,17 @@ export default async function Page() {
                 dangerouslySetInnerHTML={{ __html: '<div class="desktop ezil-desktop"></div>' }}
             />
             <HydrationSignal />
+
+            {/*
+              * 🔴 The wallpaper above is served whether or not the shell ever
+              * boots, so on its own it is a full-screen claim that the OS is
+              * on its way — the same "asserting health it has not confirmed"
+              * failure this project closed on the desktop frame. This is what
+              * makes that claim falsifiable: it draws nothing while the boot
+              * is working, and replaces the silence with a real, worded
+              * failure and a way out if it is not. Renders `null` until then.
+              */}
+            <BootWatchdog />
 
             {/*
               * Order is load-bearing: the payload must exist before the bundle
