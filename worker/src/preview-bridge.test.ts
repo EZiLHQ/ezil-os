@@ -24,7 +24,7 @@
 import { describe, expect, it } from 'bun:test';
 
 import {
-  parseAppPreviewHost,
+  parseBridgeHost,
   rewriteResponseHeaders,
   rewriteSetCookie,
   stripFrameAncestors,
@@ -33,6 +33,11 @@ import {
   stripPreviewCookie,
   handlePreviewBootstrap,
   handlePreviewProxy,
+  handlePreviewWsProxy,
+  handlePreviewInspectorJs,
+  resolvePreviewAuth,
+  stripPreviewQueryParam,
+  PREVIEW_COOKIE_QUERY_PARAM,
   buildPreviewStatus,
   parseDevserverPhase,
   parseDevserverPhaseRecord,
@@ -55,42 +60,60 @@ import {
   verifyPreviewCookie,
   PREVIEW_COOKIE_NAME,
 } from './hmac';
-import { APP_PREVIEW_PORT, APP_PREVIEW_TOKEN, appPortFor } from './desktop-mode';
+import {
+  APP_PREVIEW_PORT,
+  APP_PREVIEW_TOKEN,
+  CODE_PREVIEW_PORT,
+  CODE_PREVIEW_TOKEN,
+  appPortFor,
+  codePortFor,
+} from './desktop-mode';
 
 // ── Hostname parsing ─────────────────────────────────────────────────────────
 
-describe('parseAppPreviewHost', () => {
+describe('parseBridgeHost', () => {
   it('parses the app-preview hostname, including a hyphenated sandboxId', () => {
     const sandboxId = 'guac-user1-proj1';
     const host = `${APP_PREVIEW_PORT}-${sandboxId}-${APP_PREVIEW_TOKEN}.ezil.org`;
-    expect(parseAppPreviewHost(host)).toEqual({ sandboxId });
+    expect(parseBridgeHost(host)).toEqual({ sandboxId, target: 'app' });
+  });
+
+  it('parses the code-server bridge hostname, including a hyphenated sandboxId', () => {
+    const sandboxId = 'guac-user1-proj1';
+    const host = `${CODE_PREVIEW_PORT}-${sandboxId}-${CODE_PREVIEW_TOKEN}.ezil.org`;
+    expect(parseBridgeHost(host)).toEqual({ sandboxId, target: 'code' });
   });
 
   it('rejects a different port', () => {
     const host = `8181-guac-user1-proj1-app.ezil.org`;
-    expect(parseAppPreviewHost(host)).toBeNull();
+    expect(parseBridgeHost(host)).toBeNull();
   });
 
   it('rejects a different token (e.g. the desktop token on the app port)', () => {
     const host = `${APP_PREVIEW_PORT}-guac-user1-proj1-nekodesktop.ezil.org`;
-    expect(parseAppPreviewHost(host)).toBeNull();
+    expect(parseBridgeHost(host)).toBeNull();
+  });
+
+  it('rejects the app token on the code-server port and vice versa', () => {
+    expect(parseBridgeHost(`${CODE_PREVIEW_PORT}-guac-user1-proj1-${APP_PREVIEW_TOKEN}.ezil.org`)).toBeNull();
+    expect(parseBridgeHost(`${APP_PREVIEW_PORT}-guac-user1-proj1-${CODE_PREVIEW_TOKEN}.ezil.org`)).toBeNull();
   });
 
   it('rejects a hostname with no hyphen at all', () => {
-    expect(parseAppPreviewHost('ezil.org')).toBeNull();
+    expect(parseBridgeHost('ezil.org')).toBeNull();
   });
 
   it('rejects an empty sandboxId', () => {
     const host = `${APP_PREVIEW_PORT}-${APP_PREVIEW_TOKEN}.ezil.org`;
     // firstHyphen splits "3002" from "app.ezil.org" (no sandboxId segment) —
     // rest="app", lastHyphen===-1 → null.
-    expect(parseAppPreviewHost(host)).toBeNull();
+    expect(parseBridgeHost(host)).toBeNull();
   });
 
   it('handles a bare hostname with no dot (local dev without a domain)', () => {
     const sandboxId = 'guac-user1-proj1';
     const host = `${APP_PREVIEW_PORT}-${sandboxId}-${APP_PREVIEW_TOKEN}`;
-    expect(parseAppPreviewHost(host)).toEqual({ sandboxId });
+    expect(parseBridgeHost(host)).toEqual({ sandboxId, target: 'app' });
   });
 });
 
@@ -101,6 +124,23 @@ describe('appPortFor', () => {
 
   it('resolves to null for guacamole mode (no app-preview surface)', () => {
     expect(appPortFor('guacamole')).toBeNull();
+  });
+});
+
+describe('codePortFor', () => {
+  it('resolves the code-server bridge port/token for neko mode', () => {
+    expect(codePortFor('neko')).toEqual({ port: CODE_PREVIEW_PORT, token: CODE_PREVIEW_TOKEN });
+  });
+
+  it('resolves to null for guacamole mode (no code-server surface)', () => {
+    expect(codePortFor('guacamole')).toBeNull();
+  });
+
+  it('never collides with any other reserved port on the stack', () => {
+    expect(CODE_PREVIEW_PORT).not.toBe(3000); // @cloudflare/sandbox control plane
+    expect(CODE_PREVIEW_PORT).not.toBe(APP_PREVIEW_PORT); // user's own dev server
+    expect(CODE_PREVIEW_PORT).not.toBe(8080); // guacamole
+    expect(CODE_PREVIEW_PORT).not.toBe(8181); // neko WebRTC/noVNC
   });
 });
 
@@ -265,7 +305,42 @@ describe('stripFrameAncestors', () => {
 describe('rewriteSetCookie', () => {
   it('adds missing attributes when the dev server sets a bare cookie', () => {
     const out = rewriteSetCookie('foo=bar');
-    expect(out).toBe('foo=bar; Path=/preview; SameSite=None; Secure');
+    // `Partitioned` is not cosmetic: every cookie here is forced to
+    // `SameSite=None`, and Chrome blocks a `SameSite=None` cookie outright in
+    // a third-party iframe unless it is also partitioned. Without it the
+    // previewed app's own session/CSRF cookies vanish the moment the shell
+    // embeds the window cross-site — the same silent failure the
+    // `ezil_preview` cookie had.
+    expect(out).toBe('foo=bar; Path=/preview; SameSite=None; Secure; Partitioned');
+  });
+
+  it('does not duplicate attributes the upstream already set', () => {
+    const out = rewriteSetCookie('foo=bar; Path=/api; SameSite=Lax; Secure; Partitioned; HttpOnly');
+    expect(out).toBe('foo=bar; Path=/preview; SameSite=None; Secure; Partitioned; HttpOnly');
+    expect(out.match(/Partitioned/g)).toHaveLength(1);
+    expect(out.match(/Secure/g)).toHaveLength(1);
+    expect(out.match(/Path=/g)).toHaveLength(1);
+  });
+
+  it('drops Domain= (Partitioned is invalid with a Domain attribute)', () => {
+    const out = rewriteSetCookie('foo=bar; Domain=.example.com');
+    expect(out).not.toContain('Domain');
+    expect(out).toContain('Partitioned');
+  });
+
+  it('pins the code-server host cookies to `/`, not `/preview`', () => {
+    // code-server is served from the ROOT of its own bridge host
+    // (`handleCodeBridge`); a `/preview`-scoped cookie would never be sent
+    // back on any of its root-absolute requests.
+    expect(rewriteSetCookie('foo=bar', '/')).toBe('foo=bar; Path=/; SameSite=None; Secure; Partitioned');
+    expect(rewriteSetCookie('foo=bar; Path=/deep/nested', '/')).toContain('Path=/;');
+  });
+
+  it('rewriteResponseHeaders threads the cookie path through', () => {
+    const upstream = new Headers();
+    upstream.append('set-cookie', 'a=1');
+    expect(rewriteResponseHeaders(upstream).get('set-cookie')).toContain('Path=/preview');
+    expect(rewriteResponseHeaders(upstream, '/').get('set-cookie')).toContain('Path=/');
   });
 });
 
@@ -288,6 +363,27 @@ describe('injectRuntimeShim', () => {
     const html = '<head lang="en"><title>x</title></head>';
     const out = injectRuntimeShim(html);
     expect(out).toContain('preview-inspector.js');
+  });
+
+  // ── Client-side fallback-param propagation (Safari ITP / no-cookie case) ───
+  // Static assertions on the generated shim source — mirrors this project's
+  // precedent for verifying generated code (see `index.test.ts`'s
+  // `expect(src).toContain(...)` guards) since there is no DOM/jsdom
+  // available in this package's plain `bun test` runner to execute it.
+  it('embeds PREVIEW_COOKIE_QUERY_PARAM as the client-side fallback param name', () => {
+    const out = injectRuntimeShim('<html><head></head><body></body></html>');
+    expect(out).toContain(JSON.stringify(PREVIEW_COOKIE_QUERY_PARAM));
+  });
+
+  it('patches fetch and XMLHttpRequest to propagate the fallback param', () => {
+    const out = injectRuntimeShim('<html><head></head><body></body></html>');
+    expect(out).toContain('window.fetch = function');
+    expect(out).toContain('XMLHttpRequest.prototype.open = function');
+  });
+
+  it('still rewrites the HMR WebSocket path (no regression from the fallback addition)', () => {
+    const out = injectRuntimeShim('<html><head></head><body></body></html>');
+    expect(out).toContain("u.pathname = '/preview-ws' + u.pathname");
   });
 });
 
@@ -604,7 +700,9 @@ describe('handlePreviewBootstrap', () => {
     );
     const res = await handlePreviewBootstrap(url, SID, [SECRET], SECRET);
     expect(res.status).toBe(302);
-    expect(res.headers.get('location')).toBe('/preview/about');
+    // Path is unchanged; the fallback query param (`ezil_pv`, see below) is
+    // ADDITIVE — asserted separately.
+    expect(new URL(res.headers.get('location')!, 'https://example.com').pathname).toBe('/preview/about');
     const setCookie = res.headers.get('set-cookie');
     expect(setCookie).toContain(`${PREVIEW_COOKIE_NAME}=${SID}.`);
     expect(setCookie).toContain('HttpOnly');
@@ -618,7 +716,7 @@ describe('handlePreviewBootstrap', () => {
       `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}`,
     );
     const res = await handlePreviewBootstrap(url, SID, [SECRET], SECRET);
-    expect(res.headers.get('location')).toBe('/preview/');
+    expect(new URL(res.headers.get('location')!, 'https://example.com').pathname).toBe('/preview/');
   });
 
   it('returns 401 on an invalid token', async () => {
@@ -627,6 +725,115 @@ describe('handlePreviewBootstrap', () => {
     );
     const res = await handlePreviewBootstrap(url, SID, [SECRET], SECRET);
     expect(res.status).toBe(401);
+  });
+
+  // ── CHIPS (Partitioned) + query-param fallback ──────────────────────────────
+  // Root cause: without `Partitioned`, Chrome/Edge can refuse to send this
+  // `SameSite=None` cookie back at all in a third-party-iframe context, and
+  // Safari's ITP blocks third-party cookies outright regardless of any
+  // attribute — in both cases the bootstrap 302 "succeeds" while every
+  // subsequent `/preview/*` request silently 401s. These assertions pin the
+  // fix: the cookie is `Partitioned`, AND the same auth value is ALSO on the
+  // redirect target as a query param so the very first request never depends
+  // on the cookie having landed.
+  it('sets Partitioned on the cookie (CHIPS) so a 3p-iframe context can use it at all', async () => {
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    const url = new URL(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}`,
+    );
+    const res = await handlePreviewBootstrap(url, SID, [SECRET], SECRET);
+    const setCookie = res.headers.get('set-cookie');
+    expect(setCookie).toContain('Partitioned');
+    // Still carries every pre-existing attribute — Partitioned is additive.
+    expect(setCookie).toContain('SameSite=None');
+    expect(setCookie).toContain('Secure');
+    expect(setCookie).toContain('HttpOnly');
+  });
+
+  it('embeds the SAME cookie value as an `ezil_pv` query-param fallback on the redirect target', async () => {
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    const url = new URL(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}&path=%2Fabout`,
+    );
+    const res = await handlePreviewBootstrap(url, SID, [SECRET], SECRET);
+    const location = res.headers.get('location')!;
+    const setCookie = res.headers.get('set-cookie')!;
+    const cookieValue = setCookie.split(';')[0]!.split('=').slice(1).join('=');
+    expect(location.startsWith('/preview/about?')).toBe(true);
+    const locUrl = new URL(location, 'https://example.com');
+    expect(locUrl.searchParams.get(PREVIEW_COOKIE_QUERY_PARAM)).toBe(cookieValue);
+  });
+
+  it('preserves an existing query string in `path` alongside the fallback param', async () => {
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    const url = new URL(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}&path=${encodeURIComponent('/about?x=1')}`,
+    );
+    const res = await handlePreviewBootstrap(url, SID, [SECRET], SECRET);
+    const locUrl = new URL(res.headers.get('location')!, 'https://example.com');
+    expect(locUrl.pathname).toBe('/preview/about');
+    expect(locUrl.searchParams.get('x')).toBe('1');
+    expect(locUrl.searchParams.has(PREVIEW_COOKIE_QUERY_PARAM)).toBe(true);
+  });
+});
+
+// ── Query-param fallback auth (resolvePreviewAuth / stripPreviewQueryParam) ──
+
+describe('resolvePreviewAuth', () => {
+  const SECRET = 'test-primary-secret';
+  const SID = 'guac-user1-proj1';
+
+  it('accepts a valid cookie with no fallback param present', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const request = new Request('https://example.ezil.org/preview/', {
+      headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` },
+    });
+    const ok = await resolvePreviewAuth(request, new URL(request.url), [SECRET], SID);
+    expect(ok).toBe(true);
+  });
+
+  it('accepts a valid `ezil_pv` query param when there is no cookie at all (Safari ITP case)', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const request = new Request(`https://example.ezil.org/preview/?${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`);
+    const ok = await resolvePreviewAuth(request, new URL(request.url), [SECRET], SID);
+    expect(ok).toBe(true);
+  });
+
+  it('rejects when neither the cookie nor the query param is valid', async () => {
+    const request = new Request(`https://example.ezil.org/preview/?${PREVIEW_COOKIE_QUERY_PARAM}=garbage`);
+    const ok = await resolvePreviewAuth(request, new URL(request.url), [SECRET], SID);
+    expect(ok).toBe(false);
+  });
+
+  it('rejects a fallback param minted for a DIFFERENT sandboxId (no cross-tenant reuse)', async () => {
+    const cookie = await mintPreviewCookie(SECRET, 'guac-user2-proj1');
+    const request = new Request(`https://example.ezil.org/preview/?${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`);
+    const ok = await resolvePreviewAuth(request, new URL(request.url), [SECRET], SID);
+    expect(ok).toBe(false);
+  });
+
+  it('prefers a valid cookie over the query param when both are present', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const request = new Request(`https://example.ezil.org/preview/?${PREVIEW_COOKIE_QUERY_PARAM}=garbage`, {
+      headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` },
+    });
+    const ok = await resolvePreviewAuth(request, new URL(request.url), [SECRET], SID);
+    expect(ok).toBe(true);
+  });
+});
+
+describe('stripPreviewQueryParam', () => {
+  it('removes only the fallback param, keeping every other query param intact', () => {
+    expect(stripPreviewQueryParam(`?a=1&${PREVIEW_COOKIE_QUERY_PARAM}=xyz&b=2`)).toBe('?a=1&b=2');
+  });
+
+  it('returns an empty string when the fallback param was the only one', () => {
+    expect(stripPreviewQueryParam(`?${PREVIEW_COOKIE_QUERY_PARAM}=xyz`)).toBe('');
+  });
+
+  it('is a no-op when the param is absent', () => {
+    expect(stripPreviewQueryParam('?a=1&b=2')).toBe('?a=1&b=2');
+    expect(stripPreviewQueryParam('')).toBe('');
   });
 });
 
@@ -687,5 +894,179 @@ describe('handlePreviewProxy', () => {
     expect(res.status).toBe(503);
     const body = await res.text();
     expect(body).toContain('Dev server not running');
+  });
+
+  it('accepts a valid `ezil_pv` query param when the cookie is missing (Safari ITP fallback)', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const sandbox = fakeContainerFetcher(() => new Response('ok'));
+    const request = new Request(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview/?${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`,
+    );
+    const res = await handlePreviewProxy(request, sandbox, SID, [SECRET], '/');
+    expect(res.status).toBe(200);
+  });
+
+  it('strips the `ezil_pv` fallback param before forwarding upstream', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const sandbox = fakeContainerFetcher((url) => {
+      expect(url).not.toContain(PREVIEW_COOKIE_QUERY_PARAM);
+      expect(url).toContain('keep=1');
+      return new Response('ok');
+    });
+    const request = new Request(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview/?keep=1&${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`,
+    );
+    const res = await handlePreviewProxy(request, sandbox, SID, [SECRET], '/');
+    expect(res.status).toBe(200);
+  });
+
+  // ── Generalized `port`/`target` parameters (code-server bridge) ────────────
+  describe('with an explicit port and target: code', () => {
+    it('proxies to the given port instead of APP_PREVIEW_PORT', async () => {
+      const cookie = await mintPreviewCookie(SECRET, SID);
+      const sandbox = fakeContainerFetcher((url) => {
+        expect(url).toContain(`127.0.0.1:${CODE_PREVIEW_PORT}/`);
+        return new Response('<html><head></head><body>code-server</body></html>', {
+          headers: { 'content-type': 'text/html; charset=utf-8' },
+        });
+      });
+      const request = new Request(
+        `https://${CODE_PREVIEW_PORT}-${SID}-${CODE_PREVIEW_TOKEN}.ezil.org/preview/`,
+        { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } },
+      );
+      const res = await handlePreviewProxy(request, sandbox, SID, [SECRET], '/', CODE_PREVIEW_PORT, 'code');
+      expect(res.status).toBe(200);
+    });
+
+    it('NEVER injects RUNTIME_SHIM into an HTML response — code-server WebSocket traffic is not HMR', async () => {
+      const cookie = await mintPreviewCookie(SECRET, SID);
+      const sandbox = fakeContainerFetcher(
+        () =>
+          new Response('<html><head><title>vscode</title></head><body>code-server</body></html>', {
+            headers: { 'content-type': 'text/html; charset=utf-8' },
+          }),
+      );
+      const request = new Request(
+        `https://${CODE_PREVIEW_PORT}-${SID}-${CODE_PREVIEW_TOKEN}.ezil.org/preview/`,
+        { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } },
+      );
+      const res = await handlePreviewProxy(request, sandbox, SID, [SECRET], '/', CODE_PREVIEW_PORT, 'code');
+      const body = await res.text();
+      expect(body).not.toContain('preview-inspector.js');
+      expect(body).not.toContain('window.WebSocket');
+      expect(body).toBe('<html><head><title>vscode</title></head><body>code-server</body></html>');
+    });
+
+    it('still injects RUNTIME_SHIM for target: app (the default) — no regression', async () => {
+      const cookie = await mintPreviewCookie(SECRET, SID);
+      const sandbox = fakeContainerFetcher(
+        () =>
+          new Response('<html><head></head><body>app</body></html>', {
+            headers: { 'content-type': 'text/html; charset=utf-8' },
+          }),
+      );
+      const request = new Request(
+        `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview/`,
+        { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } },
+      );
+      const res = await handlePreviewProxy(request, sandbox, SID, [SECRET], '/');
+      const body = await res.text();
+      expect(body).toContain('preview-inspector.js');
+    });
+  });
+});
+
+describe('handlePreviewWsProxy', () => {
+  const SECRET = 'test-primary-secret';
+  const SID = 'guac-user1-proj1';
+
+  it('returns 401 without a valid cookie', async () => {
+    const sandbox: ContainerFetcher = {
+      async containerFetch() {
+        throw new Error('should not be reached');
+      },
+    };
+    const request = new Request(`https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-ws/`);
+    const res = await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/');
+    expect(res.status).toBe(401);
+  });
+
+  it('defaults to APP_PREVIEW_PORT when no port is given', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    let seenPort: number | undefined;
+    const sandbox: ContainerFetcher = {
+      async containerFetch(_req, _init, port) {
+        seenPort = port;
+        return new Response('no upgrade');
+      },
+    };
+    const request = new Request(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-ws/`,
+      { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } },
+    );
+    await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/');
+    expect(seenPort).toBe(APP_PREVIEW_PORT);
+  });
+
+  it('reaches the code-server port when an explicit port is given', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    let seenPort: number | undefined;
+    const sandbox: ContainerFetcher = {
+      async containerFetch(_req, _init, port) {
+        seenPort = port;
+        return new Response('no upgrade');
+      },
+    };
+    const request = new Request(
+      `https://${CODE_PREVIEW_PORT}-${SID}-${CODE_PREVIEW_TOKEN}.ezil.org/preview-ws/`,
+      { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } },
+    );
+    await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/', CODE_PREVIEW_PORT);
+    expect(seenPort).toBe(CODE_PREVIEW_PORT);
+  });
+
+  it('accepts the `ezil_pv` query-param fallback when the cookie is missing', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const sandbox: ContainerFetcher = {
+      async containerFetch() {
+        return new Response('no upgrade');
+      },
+    };
+    const request = new Request(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-ws/?${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`,
+    );
+    const res = await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/');
+    expect(res.status).toBe(200); // no `webSocket` on the fake Response -> passthrough, not 401
+  });
+});
+
+describe('handlePreviewInspectorJs', () => {
+  const SECRET = 'test-primary-secret';
+  const SID = 'guac-user1-proj1';
+
+  it('returns 401 without a valid cookie', async () => {
+    const request = new Request(`https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-inspector.js`);
+    const res = await handlePreviewInspectorJs(request, SID, [SECRET]);
+    expect(res.status).toBe(401);
+  });
+
+  it('serves the inspector script with a valid cookie', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const request = new Request(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-inspector.js`,
+      { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } },
+    );
+    const res = await handlePreviewInspectorJs(request, SID, [SECRET]);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('application/javascript');
+  });
+
+  it('accepts the `ezil_pv` query-param fallback when the cookie is missing', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const request = new Request(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-inspector.js?${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`,
+    );
+    const res = await handlePreviewInspectorJs(request, SID, [SECRET]);
+    expect(res.status).toBe(200);
   });
 });

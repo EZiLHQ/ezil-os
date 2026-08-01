@@ -178,3 +178,73 @@ describe('describeDesktopStatus (the /status confirmation signal)', () => {
     }
   });
 });
+
+describe('validateFocusApp (POST /sandbox/:id/focus — a closed enum, never a free string)', () => {
+  it('accepts the exact enum values', async () => {
+    const { validateFocusApp } = await import('./sandbox-control');
+    expect(validateFocusApp('vscode')).toEqual({ ok: true, app: 'vscode' });
+    expect(validateFocusApp('chromium')).toEqual({ ok: true, app: 'chromium' });
+  });
+
+  it('trims surrounding whitespace before matching', async () => {
+    const { validateFocusApp } = await import('./sandbox-control');
+    expect(validateFocusApp('  vscode  ')).toEqual({ ok: true, app: 'vscode' });
+  });
+
+  it('rejects an unknown app name rather than passing it through', async () => {
+    const { validateFocusApp } = await import('./sandbox-control');
+    const result = validateFocusApp('firefox');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain('invalid_focus_app');
+  });
+
+  it('rejects a shell-metacharacter injection attempt', async () => {
+    const { validateFocusApp } = await import('./sandbox-control');
+    const result = validateFocusApp('vscode; rm -rf /');
+    expect(result.ok).toBe(false);
+  });
+
+  it('rejects non-string input (missing field, number, object, array)', async () => {
+    const { validateFocusApp } = await import('./sandbox-control');
+    for (const bad of [undefined, null, 42, {}, ['vscode']]) {
+      const result = validateFocusApp(bad);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain('focus_app_missing_or_not_a_string');
+    }
+  });
+
+  it('is case-sensitive (no silent normalization of casing)', async () => {
+    const { validateFocusApp } = await import('./sandbox-control');
+    expect(validateFocusApp('VSCode').ok).toBe(false);
+  });
+});
+
+describe('buildFocusAppCommand', () => {
+  it('builds the exact neko-switch-app.sh invocation for each enum value', async () => {
+    const { buildFocusAppCommand } = await import('./sandbox-control');
+    expect(buildFocusAppCommand('vscode')).toBe('/usr/local/bin/neko-switch-app.sh vscode');
+    expect(buildFocusAppCommand('chromium')).toBe('/usr/local/bin/neko-switch-app.sh chromium');
+  });
+});
+
+describe('focusDisabled (kill switch for POST /sandbox/:id/focus)', () => {
+  it('is enabled (not disabled) by default — unset/undefined', async () => {
+    const { focusDisabled } = await import('./sandbox-control');
+    expect(focusDisabled(undefined)).toBe(false);
+    expect(focusDisabled('')).toBe(false);
+  });
+
+  it('recognizes every documented disable spelling, case-insensitively', async () => {
+    const { focusDisabled } = await import('./sandbox-control');
+    for (const spelling of ['off', 'OFF', 'false', '0', 'disabled', 'no', '  off  ']) {
+      expect(focusDisabled(spelling)).toBe(true);
+    }
+  });
+
+  it('treats any other value as enabled (not disabled)', async () => {
+    const { focusDisabled } = await import('./sandbox-control');
+    expect(focusDisabled('on')).toBe(false);
+    expect(focusDisabled('true')).toBe(false);
+    expect(focusDisabled('1')).toBe(false);
+  });
+});
