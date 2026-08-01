@@ -1552,17 +1552,38 @@ async function runCloseReopenSweep () {
 
             // 🔴 `.fullpage-mode .window-minimize-btn { display: none }`
             // (`shell/src/css/style.css`) hides EVERY window's minimize
-            // button, site-wide, whenever the boot app is in full-bleed mode
-            // — not just the full-bleed window's own button. That is a real,
-            // pre-existing, already-documented shell characteristic (see
-            // this file's own `buttonPointInside` comment), independent of
-            // close/reopen and out of scope for D1/D2/D3 — it is CSS, not
-            // `UIWindow.js`/`UIDesktopFullpage.js`/`registry.js`. Ordinary
-            // (non-drawer) windows have no other way to minimize, so when
-            // neither affordance is currently reachable this is a SKIP, not
-            // a FAIL — same reasoning `checkTaskbarReachable` above uses for
-            // "the taskbar is legitimately hidden by full-bleed mode".
-            const minimizeAffordance = state.windowCount >= 1 ? await page.evaluate((a) => {
+            // button, site-wide, whenever ANY window is full-bleed — not
+            // just that window's own. That is a real, pre-existing,
+            // already-documented shell characteristic (see this file's own
+            // `buttonPointInside` comment), independent of close/reopen and
+            // out of scope for D1/D2/D3 — it is CSS, not
+            // `UIWindow.js`/`UIDesktopFullpage.js`/`registry.js`.
+            //
+            // 🔴 ROUND 8 FOLLOW-UP: "30 of 40 are SKIPs. Find why they skip
+            // and make them real." Cause: `boot.js` opens the full-bleed app
+            // (`desktop`, `wants_settings_in_drawer`) FIRST, and nothing in
+            // this sweep ever exits full-bleed mode before iterating the
+            // OTHER apps — so `settings`/`preview`/`code` NEVER once see a
+            // reachable minimize button (only `desktop`'s own iteration,
+            // via its drawer, ever did — the 10 non-skipped checks in the
+            // old 40). That is not "no such thing as minimizing Preview" —
+            // a real user CAN reach it, the same way this file's own boot
+            // flow does (see `runViewport`'s "Expose the REAL taskbar"
+            // section): minimize the full-bleed app first. So when `id`
+            // itself isn't the full-bleed one and its minimize affordance is
+            // unreachable ONLY because something else is full-bleed, this
+            // exits full-bleed mode via that SAME real mechanism, tests the
+            // REAL affordance, then restores the full-bleed app afterward —
+            // so every later interval/app in this loop still starts from
+            // the same "desktop full-bleed" baseline as before this detour,
+            // and D1/D2/D3's own window/taskbar/visible counts (already
+            // captured above, BEFORE this block runs) are never touched by
+            // it.
+            const isFullbleed = (a) => page.evaluate(
+                (app) => !! document.querySelector(`.window[data-app="${app}"]`)?.classList.contains('ezil-fullbleed'), a);
+            const currentFullbleedAppId = () => page.evaluate(
+                () => document.querySelector('.window.ezil-fullbleed')?.getAttribute('data-app') ?? null);
+            const readMinimizeAffordance = () => page.evaluate((a) => {
                 const win = document.querySelector(`.window[data-app="${a}"]`);
                 const btn = win?.querySelector('.window-minimize-btn');
                 const btnReachable = !! btn && getComputedStyle(btn).display !== 'none'
@@ -1571,7 +1592,24 @@ async function runCloseReopenSweep () {
                     '.dashboard-app-drawer-btn:not(.dashboard-app-drawer-settings):not(.dashboard-app-drawer-close)',
                 );
                 return btnReachable || !! drawerBtn;
-            }, id) : false;
+            }, id);
+
+            let minimizeAffordance = state.windowCount >= 1 ? await readMinimizeAffordance() : false;
+            let blockerId = null;
+            if ( ! minimizeAffordance && state.windowCount >= 1 && ! await isFullbleed(id) ) {
+                blockerId = await currentFullbleedAppId();
+                if ( blockerId && blockerId !== id ) {
+                    await minimizeApp(blockerId);
+                    await until(
+                        (a) => document.querySelector(`.window[data-app="${a}"]`)?.getAttribute('data-is_minimized') === 'true',
+                        blockerId, 2000, 30,
+                    );
+                    await sleep(80); // exit_fullpage_mode's own geometry transition — same wait `runViewport` uses for the same reason
+                    minimizeAffordance = await readMinimizeAffordance();
+                } else {
+                    blockerId = null; // nothing full-bleed found to blame; leave the SKIP path honest below
+                }
+            }
 
             let minimized = false;
             if ( minimizeAffordance ) {
@@ -1582,7 +1620,7 @@ async function runCloseReopenSweep () {
                 );
                 push(`${label}: minimise works`, minimized);
             } else {
-                skip(`${label}: minimise (no reachable minimize affordance right now — full-bleed mode hides ordinary minimize buttons site-wide; a pre-existing shell characteristic, not part of this close/reopen sweep)`);
+                skip(`${label}: minimise (no reachable minimize affordance right now — full-bleed mode hides ordinary minimize buttons site-wide, and no full-bleed app was found to minimize out of the way; a pre-existing shell characteristic, not part of this close/reopen sweep)`);
             }
 
             if ( minimized ) {
@@ -1612,6 +1650,25 @@ async function runCloseReopenSweep () {
                     restored.exists && restored.minimized !== 'true' && restored.visible, JSON.stringify(restored));
             } else {
                 skip(`${label}: restore (minimise never completed — nothing to restore)`);
+            }
+
+            // Put the full-bleed app we minimized to unblock `id` back the
+            // way it was, via a REAL taskbar click (the taskbar is visible
+            // right now precisely because it's minimized) — so the NEXT
+            // interval/app in this loop starts from the same baseline every
+            // iteration before this one did.
+            if ( blockerId ) {
+                const bp = await taskbarItemPoint(blockerId);
+                if ( bp ) {
+                    await page.mouse.click(bp[0], bp[1]);
+                } else {
+                    await page.evaluate((a) => {
+                        const w = $(`.window[data-app="${a}"]`);
+                        if ( w.length ) w.showWindow();
+                    }, blockerId);
+                }
+                await until((a) => document.querySelector(`.window[data-app="${a}"]`)?.classList.contains('ezil-fullbleed'), blockerId, 3000, 50);
+                await settle(blockerId);
             }
 
             const cycleErrors = page_errors.slice(errorsBefore);
