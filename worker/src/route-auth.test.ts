@@ -52,6 +52,8 @@ interface CallLog {
   exec: number;
   /** Every `containerFetch(url, init, port)` the route table actually made. */
   containerFetch: Array<{ url: string; port: number; headers: Record<string, string> }>;
+  /** Every `exposePort(port, {hostname, token})` the route table actually made. */
+  exposePort: Array<{ port: number; token: string; hostname: string }>;
 }
 
 /**
@@ -64,7 +66,18 @@ function fakeSandboxNamespace(options: {
   terminateResult?: Record<string, unknown>;
   /** Upstream response the fake container returns for `containerFetch`. */
   containerResponse?: () => Response;
+  /**
+   * Opt in to a container fake complete enough for `ensureDesktop` to run to
+   * completion (`startProcess`/`waitForPort`/`exposePort`), so `POST
+   * /sandbox/preview` can be exercised end to end. Return `false` for a port
+   * to make that ONE exposure fail the way the real SDK does (throw), which
+   * is how the app/code best-effort branches are reached without also killing
+   * the mandatory desktop-port exposure.
+   */
+  exposePort?: (port: number) => boolean;
 }): { binding: unknown; calls: CallLog } {
+  /** The sandbox id the Worker actually opened the DO with. */
+  let openedWith = SANDBOX_NAME;
   const calls: CallLog = {
     terminateSandbox: 0,
     destroy: 0,
@@ -72,6 +85,7 @@ function fakeSandboxNamespace(options: {
     getExposedPorts: 0,
     exec: 0,
     containerFetch: [],
+    exposePort: [],
   };
 
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
@@ -118,6 +132,31 @@ function fakeSandboxNamespace(options: {
       calls.exec++;
       return { exitCode: 0, stdout: '', stderr: '' };
     },
+    // Only wired when `options.exposePort` is supplied — otherwise the Proxy's
+    // `async () => undefined` default keeps every pre-existing test's
+    // behaviour byte-identical.
+    ...(options.exposePort
+      ? {
+          startProcess: async () => ({
+            waitForPort: async () => undefined,
+            getLogs: async () => ({ stdout: '', stderr: '' }),
+          }),
+          exposePort: async (...args: unknown[]) => {
+            const [port, opts] = args as [number, { hostname: string; token: string }];
+            if (!options.exposePort!(port)) {
+              throw new Error(`fake exposePort refused port ${port}`);
+            }
+            calls.exposePort.push({ port, token: opts.token, hostname: opts.hostname });
+            // Compose the hostname the same way the real SDK does — from the
+            // sandbox id the Worker actually opened the DO with, NOT a test
+            // constant. `handlePreviewBootstrap` re-parses that id out of the
+            // hostname and verifies the bootstrap token against it, so a fake
+            // that invents an id would make the round-trip test below pass or
+            // fail for the wrong reason.
+            return { url: `https://${port}-${openedWith}-${opts.token}.${opts.hostname}` };
+          },
+        }
+      : {}),
   };
 
   const stub = new Proxy(
@@ -132,7 +171,13 @@ function fakeSandboxNamespace(options: {
   );
 
   return {
-    binding: { idFromName: (name: string) => ({ name }), get: () => stub },
+    binding: {
+      idFromName: (name: string) => {
+        openedWith = name;
+        return { name };
+      },
+      get: () => stub,
+    },
     calls,
   };
 }
@@ -668,6 +713,93 @@ describe('POST /sandbox/:name/focus is HMAC-gated with a closed-enum `app`', () 
     const body = (await res.json()) as { ok: boolean; error: string };
     expect(body.ok).toBe(false);
     expect(body.error).toContain('focus_switch_failed');
+  });
+});
+
+// ── POST /sandbox/preview hands back ready-to-embed bridge URLs ─────────────
+//
+// Exercised through the REAL route table with a container fake complete enough
+// for `ensureDesktop` to run to completion, rather than by asserting on the
+// source text of `handlePreview` — the whole point of the field is that a
+// caller can navigate straight to it, and only a real response proves the
+// composed URL is well-formed.
+
+describe('POST /sandbox/preview returns appPreviewUrl + codePreviewUrl', () => {
+  async function preview(env: Record<string, unknown>, binding: unknown) {
+    const res = await worker.fetch(
+      new Request('https://api-desktop.ezil.org/sandbox/preview', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          token: await mintToken(),
+          projectId: 'proj-1',
+          userId: 'user-1',
+          desktopMode: 'neko',
+        }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, ...env },
+    );
+    return { res, body: (await res.json()) as Record<string, unknown> };
+  }
+
+  it('exposes 3002/app AND 8443/code and returns a bootstrap URL for each', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
+    const { res, body } = await preview({}, binding);
+
+    expect(res.status).toBe(200);
+    expect(body.ok).toBe(true);
+
+    // Both bridge ports were actually exposed, with the tokens the routes bind.
+    const exposures = calls.exposePort.map((e) => `${e.port}/${e.token}`);
+    expect(exposures).toContain('3002/app');
+    expect(exposures).toContain('8443/code');
+
+    const appPreviewUrl = new URL(String(body.appPreviewUrl));
+    const codePreviewUrl = new URL(String(body.codePreviewUrl));
+    expect(appPreviewUrl.hostname.startsWith('3002-')).toBe(true);
+    expect(appPreviewUrl.hostname.endsWith('-app.ezil.org')).toBe(true);
+    expect(codePreviewUrl.hostname.startsWith('8443-')).toBe(true);
+    expect(codePreviewUrl.hostname.endsWith('-code.ezil.org')).toBe(true);
+    for (const u of [appPreviewUrl, codePreviewUrl]) {
+      expect(u.protocol).toBe('https:');
+      expect(u.pathname).toBe('/preview-bootstrap');
+      expect(u.searchParams.get('token')).toMatch(/^t=\d+,v1=[0-9a-f]+$/);
+    }
+  });
+
+  it('the returned URL is one the bridge host itself accepts (round trip)', async () => {
+    // The strongest available check short of a live container: take the URL
+    // `/sandbox/preview` handed back and feed it to `fetch()` again. A wrong
+    // secret, a wrong sandboxId binding, or a malformed hostname all fail here
+    // and cannot be papered over by a source-text assertion.
+    const { binding } = fakeSandboxNamespace({ exposePort: () => true });
+    const { body } = await preview({}, binding);
+
+    for (const field of ['appPreviewUrl', 'codePreviewUrl'] as const) {
+      const res = await worker.fetch(new Request(String(body[field])), {
+        Sandbox: binding,
+        SANDBOX_HMAC_SECRET: SECRET,
+      });
+      expect(`${field} -> ${res.status}`).toBe(`${field} -> 302`);
+      expect(res.headers.get('set-cookie')).toContain('Partitioned');
+      expect(res.headers.get('location')).toContain('ezil_pv=');
+    }
+  });
+
+  it('is null (never absent) when the port could not be exposed', async () => {
+    // Desktop port (8181) still exposes; the two bridge ports throw, which is
+    // exactly the shape of the original port-3000 reservation bug. The preview
+    // response must still be a 200 — the desktop itself is up.
+    const { binding } = fakeSandboxNamespace({ exposePort: (port) => port === 8181 });
+    const { res, body } = await preview({}, binding);
+    expect(res.status).toBe(200);
+    expect('appPreviewUrl' in body).toBe(true);
+    expect('codePreviewUrl' in body).toBe(true);
+    expect(body.appPreviewUrl).toBeNull();
+    expect(body.codePreviewUrl).toBeNull();
+    // …and the failure is surfaced, not swallowed.
+    expect((body.codePreviewExpose as { attempted: boolean; exposed: boolean }).attempted).toBe(true);
+    expect((body.codePreviewExpose as { attempted: boolean; exposed: boolean }).exposed).toBe(false);
   });
 });
 
