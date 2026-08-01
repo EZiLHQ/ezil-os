@@ -67,6 +67,27 @@ Live end-to-end, in this order, each gating the next:
 - **No GPU.** All rendering and encoding is software, competing with the compiler.
 - **Containers can vanish without notice.** Persistence must stay eager; the 10s flush is
   the design response.
+- **`/os`'s first paint has a ~400-650ms floor, not the <200ms this project informally
+  aimed at.** A protected page has to know the visitor really is who their cookie claims
+  before it can decide to render anything (redirecting to `/login` otherwise), and that
+  decision has to be made before the first byte goes out — there is no way to paint first
+  and redirect later without either trusting an unverified session or moving the
+  auth-vs-redirect decision to the client. So one Supabase Auth round trip
+  (`supabase.auth.getUser()`, 150-300ms depending on host/network, up to ~700ms observed
+  on a loaded shared dev host) plus one database lookup for the user's computer
+  (~120-240ms) are both on the critical path before anything paints. MEASURED,
+  production build, localhost, zero client network latency, median of 8 warm loads:
+  **TTFB 410ms, taskbar on screen 618ms** (see `docs/PLATFORM-NOTES.md` §15 and §17).
+  Streaming the wallpaper ahead of that lookup was considered and rejected: `/os` is not
+  a React page, it is two `<script src>` tags that must run deterministically, and
+  resolving them behind a React Suspense boundary reintroduces the exact hazard §14
+  documents — content a streaming response inserts after the initial parse is not
+  guaranteed to execute the same way a parser-inserted `<script>` does. Getting under
+  200ms for real needs one of: local JWT verification (`supabase.auth.getClaims()` —
+  this project already issues ES256 tokens, so this is possible; the cost is not seeing a
+  revocation until the token expires) or deploying the app in the database's region.
+  Neither is a change made here. Until one of those lands, **the honest target for `/os`
+  is 400-650ms, not <200ms** — treat a number in that range as success, not as a miss.
 - **`max_instances`** is committed at 20; the owner answered 3. At 2 computers/user, 3
   supports exactly one person. **Needs settling before real users.**
 
