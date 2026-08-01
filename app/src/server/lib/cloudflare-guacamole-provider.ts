@@ -177,7 +177,41 @@ export interface GuacamolePreviewSuccess {
         attempted: boolean;
         exposed: boolean;
         error?: string;
+        /** The raw exposed base URL, when the Worker has one. Added Wave A. */
+        url?: string;
     };
+
+    /**
+     * 🔴 THE COMPOSED URL, STRAIGHT FROM THE WORKER — prefer this over
+     * recomputing it. RECONCILED Wave A.
+     *
+     * `worker/src/index.ts`'s `handlePreview` now mints the bootstrap token
+     * and composes the full `…/preview-bootstrap?token=…` URL itself, from the
+     * hostname `exposePreviewPort` ACTUALLY produced. This app also knows how
+     * to build that URL (`composeAppPreviewOrigin` +
+     * `mintAppPreviewBootstrapToken`), and two independent implementations of
+     * one wire format is precisely the drift this codebase keeps getting bitten
+     * by: the app would have to re-derive the Worker's per-request zone-collapse
+     * decision, and be wrong the moment its zone config changed.
+     *
+     * So `cloudflareGuacamole.appPreviewUrl` uses THIS when present and falls
+     * back to composing its own only when it is absent. The fallback is not
+     * dead code and must not be deleted: app and Worker are separate deploy
+     * targets, so an app release can reach a Worker that predates this field.
+     *
+     * `null` (never omitted) means the port was not exposed — the Worker
+     * distinguishes "not available" from "this Worker is too old to say", and
+     * so does the caller.
+     */
+    appPreviewUrl?: string | null;
+
+    /**
+     * The same, for the code-server bridge (`CODE_PREVIEW_PORT` 8443 /
+     * `CODE_PREVIEW_TOKEN` 'code'). Typed here so the shape is recorded in one
+     * place; nothing in the app reads it yet — opening a code-server window is
+     * a feature, not a seam. See the Wave A seams report.
+     */
+    codePreviewUrl?: string | null;
 }
 
 /**
@@ -784,6 +818,44 @@ export function composeAppPreviewOrigin(guacamoleUrl: string, sandboxId: string)
     const zoneHost = parsed.port ? `${zoneSuffix}:${parsed.port}` : zoneSuffix;
     const host = `${APP_PREVIEW_PORT}-${sandboxId}-${APP_PREVIEW_TOKEN}.${zoneHost}`;
     return `${parsed.protocol}//${host}`;
+}
+
+/**
+ * What the Worker's own `appPreviewUrl` field is telling us.
+ *
+ *   'use'      — a composed URL arrived; use it verbatim.
+ *   'refuse'   — the Worker KNOWS about the field and said `null`: the port is
+ *                not exposed. A real negative.
+ *   'compose'  — the field is absent, so this Worker predates it. Compose the
+ *                URL on this side, as before.
+ */
+export type WorkerBridgeUrlVerdict =
+    | { kind: 'use'; url: string }
+    | { kind: 'refuse' }
+    | { kind: 'compose' };
+
+/**
+ * Read the Worker's three-state `appPreviewUrl` field.
+ *
+ * 🔴 The three states are the whole point, and collapsing any two of them is a
+ * bug with a different symptom each way:
+ *
+ *   - treating `null` as `undefined` composes a URL for a port that is not
+ *     exposed — a window that loads nothing, with no error to show;
+ *   - treating `undefined` as `null` refuses to open a preview against any
+ *     Worker deployed before this field existed. The app and the Worker are
+ *     separate deploy targets, so that combination is routine during a
+ *     rollout, not a corner case.
+ *
+ * `handlePreview` in `worker/src/index.ts` is explicit that it emits `null`
+ * "(never omitted) when the corresponding port wasn't exposed, so the caller
+ * can tell 'not available' from 'field doesn't exist yet'". This is the caller
+ * honouring that.
+ */
+export function readWorkerBridgeUrl(value: string | null | undefined): WorkerBridgeUrlVerdict {
+    if (value === undefined) return { kind: 'compose' };
+    if (value === null || value === '') return { kind: 'refuse' };
+    return { kind: 'use', url: value };
 }
 
 /**
