@@ -235,6 +235,9 @@ describe('toShellDesktopState — never implies an observation it does not have'
             session: '/api/shell/session',
             desktop: '/api/shell/desktop',
             previewUrl: '/api/shell/preview-url',
+            // MODIFIED BY EZIL 2026-08-01 (T7): the code-server counterpart of
+            // `previewUrl` — see `cloudflareGuacamole.codePreviewUrl`.
+            codePreviewUrl: '/api/shell/code-preview-url',
             focus: '/api/shell/focus',
         });
     });
