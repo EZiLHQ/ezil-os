@@ -29,7 +29,15 @@
  *
  * No secret is representable here: no Worker URL, no HMAC secret, no preview
  * URL. `desktopState` carries booleans the browser can already obtain from
- * `cloudflareGuacamole.isConfigured`, and nothing else.
+ * `cloudflareGuacamole.isConfigured`, and nothing else. `SHELL_API_ROUTES`
+ * below is a ROUTE PATH, same-origin and relative — never a preview URL
+ * itself. `previewUrl` in particular is deliberately absent from every
+ * payload this module builds: an app-preview bootstrap token has a
+ * 5-minute TTL (`APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS`,
+ * `cloudflare-guacamole-provider.ts`), so baking one in here — built once,
+ * possibly minutes before a window is actually opened — would hand the
+ * shell a token that is dead on arrival. The shell calls the route fresh,
+ * per window-open, instead.
  */
 
 import type { Computer } from '@/server/db/schema';
@@ -40,6 +48,13 @@ export const SHELL_API_ROUTES = {
     session: '/api/shell/session',
     /** GET = cheap status poll. POST = start/attach the desktop (a COLD BOOT, ~22s). */
     desktop: '/api/shell/desktop',
+    /**
+     * POST = mint a fresh app-preview window URL (a 5-minute-TTL bootstrap
+     * token). Call PER WINDOW-OPEN, and refetch roughly every 50s while the
+     * window stays open — see `cloudflareGuacamole.appPreviewUrl`'s doc
+     * comment for why this must never be cached across a long idle.
+     */
+    previewUrl: '/api/shell/preview-url',
 } as const;
 
 export interface ShellBootUser {
