@@ -157,20 +157,22 @@ function desktopStreams (id) {
 
 /**
  * Does sandbox window `el` (any of desktop/preview/code/future — anything
- * `sandboxWindowEls()` matched) stream computer `id`?
+ * `sandboxWindowEls()` matched) stream computer `id`? `el` is always a real,
+ * currently-open window — the "no window at all" case `desktopStreams()`
+ * handles by returning `false` does not arise here, since callers only ever
+ * pass elements `sandboxWindowEls()` actually found.
  *
  * @returns {true|false|'unknown'} `false` ONLY when positively known NOT to.
- *   Same fail-safe shape as `desktopStreams()`, generalised: a window's own
- *   stamp wins when present; a missing stamp falls back to the desktop hint
- *   (safe across window types — see the comment on `activeComputerId`), and
- *   only reports `'unknown'` when even that hint is absent.
+ *   Same fallback chain as `openDesktopComputerId()`, applied to any window:
+ *   the window's own stamp wins when present; a falsy stamp (missing OR
+ *   stripped) falls back to `activeComputerId`, and `activeComputerId`
+ *   itself being falsy (`null` OR `undefined` — both mean "no known active
+ *   computer", not "positively none") is what makes the result 'unknown'
+ *   rather than a false negative.
  */
 function windowStreams (el, id) {
-    const own = el.getAttribute('data-ezil-computer-id');
-    if ( own ) return own === id;
-    if ( activeComputerId === undefined ) return 'unknown';
-    if ( activeComputerId === null ) return false;
-    return activeComputerId === id;
+    const own = el.getAttribute('data-ezil-computer-id') || activeComputerId || undefined;
+    return own === undefined ? 'unknown' : own === id;
 }
 
 function timeAgo (input) {
