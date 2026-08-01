@@ -182,6 +182,19 @@ export interface GuacamolePreviewSuccess {
     };
 
     /**
+     * The same, for the code-server bridge (`CODE_PREVIEW_PORT` 8443). Read by
+     * `cloudflareGuacamole.codePreviewUrl` exactly as `appPreviewExpose` is
+     * read by `.appPreviewUrl` — same three-state reasoning, same "only
+     * `attempted: true, exposed: false` is a real negative" rule.
+     */
+    codePreviewExpose?: {
+        attempted: boolean;
+        exposed: boolean;
+        error?: string;
+        url?: string;
+    };
+
+    /**
      * 🔴 THE COMPOSED URL, STRAIGHT FROM THE WORKER — prefer this over
      * recomputing it. RECONCILED Wave A.
      *
@@ -207,9 +220,9 @@ export interface GuacamolePreviewSuccess {
 
     /**
      * The same, for the code-server bridge (`CODE_PREVIEW_PORT` 8443 /
-     * `CODE_PREVIEW_TOKEN` 'code'). Typed here so the shape is recorded in one
-     * place; nothing in the app reads it yet — opening a code-server window is
-     * a feature, not a seam. See the Wave A seams report.
+     * `CODE_PREVIEW_TOKEN` 'code'). MODIFIED BY EZIL 2026-08-01 (T7): this
+     * field is now read, by `cloudflareGuacamole.codePreviewUrl` — see that
+     * procedure and `composeCodePreviewOrigin` below for the fallback path.
      */
     codePreviewUrl?: string | null;
 }
@@ -736,6 +749,21 @@ export const APP_PREVIEW_PORT = 3002;
 export const APP_PREVIEW_TOKEN = 'app';
 
 /**
+ * In-container port code-server listens on. MUST match
+ * `worker/src/desktop-mode.ts`'s `CODE_PREVIEW_PORT`. MODIFIED BY EZIL
+ * 2026-08-01 (T7): added alongside the app-preview constants above, for
+ * `composeCodePreviewOrigin`'s fallback path — see that function's doc
+ * comment for why a fallback is needed at all.
+ */
+export const CODE_PREVIEW_PORT = 8443;
+
+/**
+ * Preview-URL token label for the code-server port. MUST match
+ * `worker/src/desktop-mode.ts`'s `CODE_PREVIEW_TOKEN`.
+ */
+export const CODE_PREVIEW_TOKEN = 'code';
+
+/**
  * Freshness window for a minted `/preview-bootstrap` token. MUST match
  * `worker/src/hmac.ts`'s `PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS` (5 min) — the
  * Worker is the one that actually enforces this; this constant only has to
@@ -817,6 +845,36 @@ export function composeAppPreviewOrigin(guacamoleUrl: string, sandboxId: string)
     // it when present.
     const zoneHost = parsed.port ? `${zoneSuffix}:${parsed.port}` : zoneSuffix;
     const host = `${APP_PREVIEW_PORT}-${sandboxId}-${APP_PREVIEW_TOKEN}.${zoneHost}`;
+    return `${parsed.protocol}//${host}`;
+}
+
+/**
+ * The code-server counterpart of `composeAppPreviewOrigin` — byte-for-byte
+ * the same derivation, against `CODE_PREVIEW_PORT`/`CODE_PREVIEW_TOKEN`
+ * instead of the app-preview pair. MODIFIED BY EZIL 2026-08-01 (T7).
+ *
+ * Kept as a SEPARATE function rather than a parameterised one so a reader of
+ * `cloudflareGuacamole.codePreviewUrl` sees a call that names what it derives,
+ * matching the existing `appPreviewUrl` / `composeAppPreviewOrigin` pairing.
+ * Not the primary path in practice — `handlePreview` already composes and
+ * returns `codePreviewUrl` on the wire (see `readWorkerBridgeUrl` below), so
+ * this only runs against a Worker deployed before that field existed. See
+ * `composeAppPreviewOrigin`'s doc comment for the full reasoning, which
+ * applies here unchanged.
+ */
+export function composeCodePreviewOrigin(guacamoleUrl: string, sandboxId: string): string | null {
+    let parsed: URL;
+    try {
+        parsed = new URL(guacamoleUrl);
+    } catch {
+        return null;
+    }
+    const dot = parsed.hostname.indexOf('.');
+    if (dot <= 0) return null;
+    const zoneSuffix = parsed.hostname.slice(dot + 1);
+    if (!zoneSuffix) return null;
+    const zoneHost = parsed.port ? `${zoneSuffix}:${parsed.port}` : zoneSuffix;
+    const host = `${CODE_PREVIEW_PORT}-${sandboxId}-${CODE_PREVIEW_TOKEN}.${zoneHost}`;
     return `${parsed.protocol}//${host}`;
 }
 
