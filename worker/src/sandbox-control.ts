@@ -45,6 +45,60 @@ export interface SignedTokenSources {
   body?: unknown;
 }
 
+// ── Window-focus control (`POST /sandbox/:id/focus`) ────────────────────────
+//
+// Switches which app is foregrounded inside the `neko` desktop-mode container
+// (`/usr/local/bin/neko-switch-app.sh <app>`). The ONLY caller-supplied input
+// is `app`, and it is validated against a closed enum here — NEVER accepted as
+// a free string — so it can be interpolated into the in-container command with
+// no shell-injection surface, mirroring the same "strict allowlist, never
+// arbitrary input" contract `./twen.ts` documents for its own `op`/
+// `operationId` fields.
+
+/** The only two apps `neko-switch-app.sh` knows how to foreground. */
+export const FOCUS_APPS = ['vscode', 'chromium'] as const;
+export type FocusApp = (typeof FOCUS_APPS)[number];
+
+/**
+ * Validate the caller-supplied `app` field of `POST /sandbox/:id/focus`.
+ * Rejects anything outside the closed enum explicitly (never silently
+ * coerced/defaulted) — a typo or an attempted injection is a 400, not a
+ * guess.
+ */
+export function validateFocusApp(raw: unknown): { ok: true; app: FocusApp } | { ok: false; error: string } {
+  if (typeof raw !== 'string') {
+    return { ok: false, error: `focus_app_missing_or_not_a_string: expected one of ${FOCUS_APPS.join(', ')}` };
+  }
+  const trimmed = raw.trim();
+  if ((FOCUS_APPS as readonly string[]).includes(trimmed)) {
+    return { ok: true, app: trimmed as FocusApp };
+  }
+  return { ok: false, error: `invalid_focus_app: '${trimmed}' (expected one of: ${FOCUS_APPS.join(', ')})` };
+}
+
+/**
+ * Build the exact in-container command for `POST /sandbox/:id/focus`. Safe to
+ * interpolate `app` directly — `validateFocusApp` guarantees it is EXACTLY
+ * `'vscode'` or `'chromium'` (a closed, hardcoded enum), never caller-shaped
+ * free text.
+ */
+export function buildFocusAppCommand(app: FocusApp): string {
+  return `/usr/local/bin/neko-switch-app.sh ${app}`;
+}
+
+/**
+ * Non-secret production kill-switch for `POST /sandbox/:id/focus`. Enabled by
+ * default (HMAC-gated via `authorizeSignedControlRequest`, closed-enum body,
+ * no arbitrary shell input); set to `off`/`false`/`0`/`disabled`/`no` to
+ * hard-disable the route (returns 404) without a code change — same
+ * vocabulary as `./workspace-diag`'s `diagDisabled` and `./twen`'s
+ * `twenDisabled`.
+ */
+export function focusDisabled(flag: string | undefined): boolean {
+  if (!flag) return false;
+  return ['off', 'false', '0', 'disabled', 'no'].includes(flag.trim().toLowerCase());
+}
+
 /** Read the shared HMAC token from a control request. Returns `undefined` when absent everywhere. */
 export function extractSignedToken(sources: SignedTokenSources): string | undefined {
   const authorization = sources.authorization?.trim();
