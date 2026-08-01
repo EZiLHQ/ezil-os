@@ -626,22 +626,45 @@ async function UIWindow (options) {
         } else {
             if ( options.app ) {
                 const $existing_taskbar_item = $(`.taskbar-item[data-app="${options.app}"]`);
-                // 🔴 D1: this exact DOM node may be the corpse of a
-                // just-closed window of the same app, mid-teardown inside
-                // `remove_taskbar_item` (UIDesktopFullpage.js) -- it fades its
-                // children over 100ms and shrinks the item to width:0 over
-                // 200ms BEFORE deleting it, so it is still present (and still
-                // matched by this same-app selector) for up to ~200ms after a
-                // close. We are reusing it right now for a new window, so
-                // stop that in-flight teardown animation and restore full
-                // visibility immediately -- otherwise this new window's
-                // taskbar item sits invisible/shrunk until the old
-                // animation's callback happens to finish. That callback
-                // separately re-checks `data-open-windows` before ever
-                // deleting the node, as a second, independent guard against
-                // it deleting what we are about to claim here.
-                $existing_taskbar_item.stop(true, true).css('width', '');
-                $existing_taskbar_item.find('*').stop(true, true).show();
+                // 🔴 T17 (undoes T15's D1 "reuse-restore"): this exact DOM
+                // node may be the corpse of a just-closed window of the same
+                // app, mid-teardown inside `remove_taskbar_item`
+                // (UIDesktopFullpage.js) -- it fades its children over 100ms
+                // and shrinks the item to width:0 over 200ms BEFORE deleting
+                // it, so it is still present (and still matched by this
+                // same-app selector) for up to ~200ms after a close.
+                //
+                // T15 used to call `.stop(true, true)` here to force that
+                // in-flight animation to its end state immediately. jQuery's
+                // `.stop(clearQueue=true, jumpToEnd=true)` does not just skip
+                // the visuals -- it SYNCHRONOUSLY fires the animation's own
+                // `complete` callback right here, before this function ever
+                // reaches the `data-open-windows` increment two lines below.
+                // That callback (`remove_taskbar_item`'s `still_empty` check)
+                // reads `data-open-windows` as it stands AT THAT INSTANT --
+                // still 0, the value from the window that just closed -- sees
+                // "still empty" and calls `$item.remove()` for real, deleting
+                // the taskbar item this function is about to claim. The
+                // increment below then runs on a jQuery handle to a node
+                // that is no longer in the document: no error, no taskbar
+                // item.
+                // MEASURED (independently re-verified 2026-08-01, this
+                // worktree, `stacking-browser-test.mjs`):
+                //   with this stop()/css()/show() block   -> 452/456, the 4
+                //     reds are exactly "preview"/"code" close+reopen at
+                //     20ms/112ms with taskbarItemCount=0.
+                //   with this block deleted (below)       -> 456/456 exit 0.
+                // Removing the forced `.stop(true, true)` does not remove
+                // the reuse -- the increment on the next line still runs
+                // synchronously, well before the untouched animation's real
+                // 200ms timer elapses. So by the time that animation's own
+                // `complete` callback fires naturally, `data-open-windows`
+                // is already correctly > 0, and `remove_taskbar_item`'s own
+                // `still_empty` guard (its ONE guard now, not a redundant
+                // second one -- see that file's header) does the restoring
+                // instead of deleting. No visible flash was ever measured
+                // from letting the 100-200ms fade continue naturally into
+                // its own reversal.
                 $existing_taskbar_item.attr('data-open-windows', parseInt($existing_taskbar_item.attr('data-open-windows')) + 1);
                 $existing_taskbar_item.find('.active-taskbar-indicator').show();
             }
@@ -3704,8 +3727,37 @@ $.fn.close = async function (options) {
     return this;
 };
 
+// 🔴 T17 (data-closing must ALWAYS clear): this used to be a bare `{ ... }`
+// block with two early-return sites that manually `removeAttr('data-closing')`
+// before returning `false` (the "close was vetoed, window stays alive"
+// cases) -- and NOTHING clearing it on any exception thrown from anywhere
+// else in this function. `$(this).attr('data-closing', '1')` is stamped
+// SYNCHRONOUSLY by the caller (`$.fn.close`, above) before this function
+// even starts; if anything in here throws before either the veto paths or
+// `delete_window_element()` (which removes the whole element, taking the
+// attribute with it) is reached, the attribute is stuck at "1" forever on a
+// window that never actually closed. That window then becomes permanently
+// invisible to every `:not([data-closing="1"])` lookup this codebase uses to
+// answer "is app X already open" (`UIWindow.js`'s own single_instance check
+// above, `registry.js`'s `launch()`) -- a caller that asks will always
+// conclude the app isn't open and try to launch a fresh one, forever, next
+// to a real, live, un-closeable window.
+// MEASURED consequence (see registry.js): `closeSandboxWindows`'s 3-second
+// budget then expires deterministically waiting for a window that will never
+// report closed, degrades to a `console.warn`, and the caller proceeds to
+// `computer.delete` with a live streaming window into the container about to
+// be destroyed -- the exact defect Wave C existed to fix, invisible against
+// stubbed endpoints, real against a live one.
+// Fix: `try/finally`. The attribute is now cleared on every exit from this
+// function -- normal return, early return, or a throw from anywhere in the
+// body -- not just the two paths a previous author happened to instrument.
+// Calling `removeAttr` after `delete_window_element()` already removed the
+// element entirely is a harmless no-op (the attribute goes with the
+// detached node either way); the only case that matters is the one this
+// fixes -- a THROW that leaves the element attached with the stamp still on
+// it.
 async function close_one_window (options) {
-    {
+    try {
         const el_iframe = $(this).find('.window-app-iframe');
         const app_uses_sdk = el_iframe.length > 0 && el_iframe.attr('data-appUsesSDK') === 'true';
 
@@ -3716,11 +3768,9 @@ async function close_one_window (options) {
             if ( ! options.bypass_iframe_messaging ) {
                 const resp = await window.sendWindowWillCloseMsg(el_iframe.get(0));
                 if ( ! resp.msg ) {
-                    // App declined the close: this window is NOT going away,
-                    // so it must stop looking closed to the world -- undo the
-                    // synchronous `data-closing` stamp `$.fn.close` set before
-                    // this ever awaited anything.
-                    $(this).removeAttr('data-closing');
+                    // App declined the close: this window is NOT going away.
+                    // The `finally` below clears `data-closing` on this
+                    // return same as on every other exit from this function.
                     return false;
                 }
             }
@@ -3734,8 +3784,8 @@ async function close_one_window (options) {
         if ( this.on_before_exit ) {
             if ( ! await this.on_before_exit() ) {
                 // Same reasoning as the sendWindowWillCloseMsg case above:
-                // the close was vetoed, so this window is staying alive.
-                $(this).removeAttr('data-closing');
+                // the close was vetoed, so this window is staying alive --
+                // `finally` clears the stamp.
                 return false;
             }
         }
@@ -3828,20 +3878,45 @@ async function close_one_window (options) {
             $(`.window-menubar-global[data-window-id="${win_id}"]`).remove();
 
             // remove DOM element
+            //
+            // 🔴 T17: both animated branches below used to fire-and-forget
+            // `.animate()`/`.fadeOut()` with a completion callback that
+            // `close_one_window` never awaited -- so this `async function`
+            // would reach its end (and, now, the `finally` that clears
+            // `data-closing`) up to 300ms/80ms BEFORE `delete_window_element`
+            // actually ran. That window of time is exactly the D2 race this
+            // file's header already fixed once for the non-animated case:
+            // with `data-closing` cleared early, a relaunch or the
+            // single_instance check could find this dying-but-still-DOM-
+            // attached window, decide it is a normal open window, and try to
+            // reuse/focus it -- right before the deferred callback deletes it
+            // out from under that decision. Neither branch is reachable in
+            // this fork today (`window.animate_window_closing` is never set,
+            // no app passes `on_close_shrink_to_target`), but a `finally`
+            // that clears the stamp unconditionally must not silently
+            // reintroduce D2 for whoever wires either one up. Awaiting a
+            // Promise around the same callback keeps the animation and the
+            // DOM removal exactly as they were, it just makes this function
+            // (and therefore the `try/finally` around it) not resolve until
+            // teardown is REALLY done, same as the plain `else` branch below
+            // always has.
             if ( options?.shrink_to_target ) {
                 // get target location
                 const target_pos = $(options.shrink_to_target).position();
                 const target_size = $(options.shrink_to_target).get(0).getBoundingClientRect();
 
                 // animate window to target location
-                $(this).animate({
-                    width: '1',
-                    height: '1',
-                    top: target_pos.top + target_size.height / 2,
-                    left: target_pos.left + target_size.width / 2,
-                }, 300, () => {
-                    // remove DOM element
-                    delete_window_element(this);
+                await new Promise((resolve) => {
+                    $(this).animate({
+                        width: '1',
+                        height: '1',
+                        top: target_pos.top + target_size.height / 2,
+                        left: target_pos.left + target_size.width / 2,
+                    }, 300, () => {
+                        // remove DOM element
+                        delete_window_element(this);
+                        resolve();
+                    });
                 });
             }
             else if ( window.animate_window_closing ) {
@@ -3851,8 +3926,11 @@ async function close_one_window (options) {
                     'transform': 'scale(0)',
                 });
                 // remove DOM element after fadeout animation
-                $(this).fadeOut(80, function () {
-                    delete_window_element(this);
+                await new Promise((resolve) => {
+                    $(this).fadeOut(80, function () {
+                        delete_window_element(this);
+                        resolve();
+                    });
                 });
             } else {
                 delete_window_element(this);
@@ -3869,6 +3947,14 @@ async function close_one_window (options) {
             $('.desktop').find('.item-blurred').removeClass('item-blurred');
             window.active_item_container = $('.desktop.item-container').get(0);
         }
+    } finally {
+        // See the big comment at the top of this function: this now runs on
+        // EVERY exit -- normal completion, an early `return false` veto, or
+        // an exception thrown anywhere above -- so `data-closing` can never
+        // stick. Calling `removeAttr` after `delete_window_element()` already
+        // detached the node is a harmless no-op (the attribute leaves with
+        // the node either way).
+        $(this).removeAttr('data-closing');
     }
 }
 
@@ -4450,7 +4536,15 @@ function pop_dashboard_app_url (app_name, options) {
         // Same window lookup and minimized guard as the popstate handler.
         // On the close path the window is already gone — the URL repair
         // above was the part that still mattered.
-        const $win = $(`.window[data-app="${html_encode(app_name)}"]`).last();
+        //
+        // 🔴 T17: `:not([data-closing="1"])` -- same reasoning as the
+        // single_instance check and `registry.js`'s `launch()` (search this
+        // file for `data-closing` for the full writeup): without it, this
+        // 400ms-delayed fallback could still find and `hideWindow()` a
+        // window that is mid-teardown inside `$.fn.close` (normally gone in
+        // well under 400ms, but a stuck `data-closing` from a throw, or
+        // ordinary scheduling jitter, means "gone by now" is not guaranteed).
+        const $win = $(`.window[data-app="${html_encode(app_name)}"]:not([data-closing="1"])`).last();
         if ( $win.length
             && $win.attr('data-is_minimized') !== '1'
             && $win.attr('data-is_minimized') !== 'true' ) {
@@ -4499,7 +4593,10 @@ window.addEventListener('popstate', () => {
     // windows are simply gone — close consumed its entry already, or the
     // entry went stale mid-stack).
     if ( prev_app ) {
-        const $prev_win = $(`.window[data-app="${html_encode(prev_app)}"]`);
+        // 🔴 T17: `:not([data-closing="1"])` -- do not act on a window
+        // that is mid-teardown inside `$.fn.close`; see the writeup at the
+        // single_instance check above and `registry.js`'s `launch()`.
+        const $prev_win = $(`.window[data-app="${html_encode(prev_app)}"]:not([data-closing="1"])`);
         if ( $prev_win.length ) {
             const $win = $prev_win.last();
             const minimized = $win.attr('data-is_minimized');
@@ -4524,7 +4621,17 @@ window.addEventListener('popstate', () => {
         // ...and landed on another app's entry (Forward, or Back across
         // two stacked apps): restore its window — or relaunch it if it
         // was closed, so the entry behaves as a live deep link.
-        const $new_win = $(`.window[data-app="${html_encode(new_app)}"]`);
+        //
+        // 🔴 T17: `:not([data-closing="1"])` -- THIS is a genuine "is app X
+        // already open" restore-vs-relaunch decision, the exact shape of
+        // race the single_instance check (above, this file) and
+        // `registry.js`'s `launch()` were hardened against for D2. Without
+        // the guard, landing here while the same app is mid-close would find
+        // the dying window, `showWindow()`/`focusWindow()` it instead of
+        // relaunching, and then the in-flight close would delete it out from
+        // under that restore moments later -- silently swallowing the
+        // navigation, same failure shape D2 fixed for a relaunch race.
+        const $new_win = $(`.window[data-app="${html_encode(new_app)}"]:not([data-closing="1"])`);
         if ( $new_win.length ) {
             const $win = $new_win.last();
             const minimized = $win.attr('data-is_minimized');
