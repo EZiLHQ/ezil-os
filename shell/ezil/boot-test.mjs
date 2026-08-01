@@ -155,8 +155,20 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
     push('desktop window opened', !!win);
     push('🔴 EXACTLY ONE window',
         $$(window, '.window').length === 1, `${$$(window, '.window').length} windows`);
-    push('window is stay_on_top',
-        win?.getAttribute('data-stay_on_top') === 'true', win?.getAttribute('data-stay_on_top'));
+    // 🔴 THE STACKING CONTRACT. This window used to be created with
+    // `stay_on_top: true`, which put it in UIWindow's hardcoded 99999999+ z band
+    // (`window_zindex_base`, UIWindow.js:4066) that no ordinary window can ever
+    // out-rank — and `focusWindow()` skips re-raising stay_on_top windows
+    // (UIWindow.js:4089) while the minimise/restore path grows the band further.
+    // Settings and Preview (both `stay_on_top: false`) became permanently
+    // unreachable behind the desktop. The desktop now lives in the ordinary
+    // band: last-focused wins. Pin the ABSENCE of the runaway band, not a
+    // boolean — the guarantee is reachability.
+    const winZ = Number(win?.style?.zIndex ?? 0);
+    push('window is NOT stay_on_top (no unreachable z band)',
+        win?.getAttribute('data-stay_on_top') === 'false', win?.getAttribute('data-stay_on_top'));
+    push('🔴 desktop z-index is an ordinary counter, not the 99999999+ band',
+        Number.isFinite(winZ) && winZ < 99999999, `z-index=${win?.style?.zIndex || '(unset)'}`);
 
     // 🔴 THE BOOT-TIME CHROME CONTRACT. This window used to be created with
     // `is_fullpage: true`, so UIWindow called `enter_fullpage_mode` 50ms later
