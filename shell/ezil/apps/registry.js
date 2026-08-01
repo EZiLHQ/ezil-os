@@ -350,7 +350,17 @@ export async function launch (id, ctx = {}) {
     }
 
     if ( app.single_instance ) {
-        const $existing = $(`.window[data-app="${id}"]`);
+        // 🔴 D2: `:not([data-closing="1"])` excludes a window mid-teardown
+        // from `$.fn.close` (UIWindow.js). That flag is stamped SYNCHRONOUSLY
+        // the instant `.close()` is called, before any of its own
+        // await-ing teardown runs, specifically so a relaunch landing
+        // anywhere in that window -- 20ms later, same tick, doesn't matter --
+        // cannot mistake a dying window for a live one here, "restore" it,
+        // and then have the in-flight close delete it anyway. MEASURED
+        // before this fix: real close-button click + relaunch 20ms later ->
+        // 0 windows, nothing on screen (the relaunch was silently swallowed
+        // by exactly this check).
+        const $existing = $(`.window[data-app="${id}"]:not([data-closing="1"])`);
         if ( $existing.length > 0 ) {
             // Already open. It may be minimised, buried, or right there — all
             // three want the same thing, and `showWindow` on a visible window
