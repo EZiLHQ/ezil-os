@@ -151,10 +151,18 @@ async function UIWindow (options) {
     options.custom_path = options.custom_path ?? null;
 
     // if only one instance is allowed, bring focus to the window that is already open
+    //
+    // 🔴 D2: `:not([data-closing="1"])` excludes a window that is mid-teardown
+    // from `$.fn.close` (stamped synchronously the instant `.close()` is
+    // called, before any of its await-ing teardown runs -- see that
+    // function's header). Without this, a relaunch racing a close found the
+    // dying window here, focused it instead of opening a new one, and then
+    // the in-flight close deleted it out from under the "restored" focus --
+    // the relaunch was silently swallowed.
     if ( options.single_instance && options.app !== '' ) {
-        let $already_open_window =  $(`.window[data-app="${html_encode(options.app)}"]`);
+        let $already_open_window = $(`.window[data-app="${html_encode(options.app)}"]:not([data-closing="1"])`);
         if ( $already_open_window.length ) {
-            $(`.window[data-app="${html_encode(options.app)}"]`).focusWindow();
+            $already_open_window.focusWindow();
             return;
         }
     }
@@ -617,8 +625,25 @@ async function UIWindow (options) {
             }
         } else {
             if ( options.app ) {
-                $(`.taskbar-item[data-app="${options.app}"]`).attr('data-open-windows', parseInt($(`.taskbar-item[data-app="${options.app}"]`).attr('data-open-windows')) + 1);
-                $(`.taskbar-item[data-app="${options.app}"] .active-taskbar-indicator`).show();
+                const $existing_taskbar_item = $(`.taskbar-item[data-app="${options.app}"]`);
+                // 🔴 D1: this exact DOM node may be the corpse of a
+                // just-closed window of the same app, mid-teardown inside
+                // `remove_taskbar_item` (UIDesktopFullpage.js) -- it fades its
+                // children over 100ms and shrinks the item to width:0 over
+                // 200ms BEFORE deleting it, so it is still present (and still
+                // matched by this same-app selector) for up to ~200ms after a
+                // close. We are reusing it right now for a new window, so
+                // stop that in-flight teardown animation and restore full
+                // visibility immediately -- otherwise this new window's
+                // taskbar item sits invisible/shrunk until the old
+                // animation's callback happens to finish. That callback
+                // separately re-checks `data-open-windows` before ever
+                // deleting the node, as a second, independent guard against
+                // it deleting what we are about to claim here.
+                $existing_taskbar_item.stop(true, true).css('width', '');
+                $existing_taskbar_item.find('*').stop(true, true).show();
+                $existing_taskbar_item.attr('data-open-windows', parseInt($existing_taskbar_item.attr('data-open-windows')) + 1);
+                $existing_taskbar_item.find('.active-taskbar-indicator').show();
             }
         }
     }
@@ -3636,9 +3661,51 @@ window.sidebar_item_droppable = (el_window) => {
 };
 
 // closes a window
+//
+// 🔴 D2 fix (close/reopen race): `$(this).each(async function () {...})` --
+// the shape this used to have -- is NOT awaited by jQuery's `.each`, which
+// only understands synchronous callbacks. `$.fn.close` returned before any
+// of the teardown below had actually run, so a relaunch racing a close
+// (registry.js's `launch()`, or this file's own single_instance check
+// earlier in this file) could find the half-dead window, decide it was
+// "already open", and try to restore it -- only for the in-flight close to
+// delete that same element moments later, swallowing the relaunch entirely
+// (MEASURED: real close-button click + relaunch 20ms later -> 0 windows,
+// nothing on screen). Two changes fix that:
+//   1. Every closing target is stamped `data-closing="1"` SYNCHRONOUSLY,
+//      before any `await`, so `:not([data-closing="1"])` window lookups
+//      (registry.js `launch()`, and the single_instance check earlier in
+//      this file) stop seeing it the instant `.close()` is called -- not
+//      whenever its (previously unawaited) teardown happened to finish.
+//   2. The per-window teardown runs in a real `for` loop over real
+//      `await`s, so a caller that DOES await `.close()` gets a promise
+//      that resolves only once the DOM element is actually gone.
+// Idempotent: a second `.close()` on an already-closing element (or a
+// concurrent one racing it) is a no-op skip, not a second teardown --
+// otherwise two overlapping closes could each decrement the taskbar's
+// open-window counter, or each try to remove an already-removed DOM node.
 $.fn.close = async function (options) {
     options = options || {};
-    $(this).each(async function () {
+    const el_targets = [];
+    this.each(function () {
+        if ( $(this).attr('data-closing') === '1' ) {
+            return; // already closing (or a concurrent close()) -- no-op
+        }
+        $(this).attr('data-closing', '1');
+        el_targets.push(this);
+    });
+
+    for ( const el_target of el_targets ) {
+        // eslint-disable-next-line no-await-in-loop -- teardown must be
+        // sequential per window; this is not a batch of independent work.
+        await close_one_window.call(el_target, options);
+    }
+
+    return this;
+};
+
+async function close_one_window (options) {
+    {
         const el_iframe = $(this).find('.window-app-iframe');
         const app_uses_sdk = el_iframe.length > 0 && el_iframe.attr('data-appUsesSDK') === 'true';
 
@@ -3649,6 +3716,11 @@ $.fn.close = async function (options) {
             if ( ! options.bypass_iframe_messaging ) {
                 const resp = await window.sendWindowWillCloseMsg(el_iframe.get(0));
                 if ( ! resp.msg ) {
+                    // App declined the close: this window is NOT going away,
+                    // so it must stop looking closed to the world -- undo the
+                    // synchronous `data-closing` stamp `$.fn.close` set before
+                    // this ever awaited anything.
+                    $(this).removeAttr('data-closing');
                     return false;
                 }
             }
@@ -3660,7 +3732,12 @@ $.fn.close = async function (options) {
         }
 
         if ( this.on_before_exit ) {
-            if ( ! await this.on_before_exit() ) return false;
+            if ( ! await this.on_before_exit() ) {
+                // Same reasoning as the sendWindowWillCloseMsg case above:
+                // the close was vetoed, so this window is staying alive.
+                $(this).removeAttr('data-closing');
+                return false;
+            }
         }
 
         // Process window close if this is a window
@@ -3792,10 +3869,8 @@ $.fn.close = async function (options) {
             $('.desktop').find('.item-blurred').removeClass('item-blurred');
             window.active_item_container = $('.desktop.item-container').get(0);
         }
-    });
-
-    return this;
-};
+    }
+}
 
 window.scale_window = (el_window) => {
     //maximize
@@ -4173,14 +4248,22 @@ $.fn.focusWindow = function (event) {
             $app_iframe.get(0)?.focus({ preventScroll: true });
             $app_iframe.get(0)?.contentWindow?.focus({ preventScroll: true });
             // todo check if iframe is using SDK before sending messages
-            $app_iframe.get(0).contentWindow.postMessage({ msg: 'focus' }, '*');
+            // 🔴 D3: was unguarded (`.get(0).contentWindow.postMessage(...)`)
+            // while the two lines immediately above already use
+            // `?.contentWindow?.`. A detached iframe (a window mid-close, or
+            // one that was reopened while its old iframe hadn't finished
+            // teardown) has `contentWindow === null`, so this threw an
+            // uncaught `TypeError: Cannot read properties of null (reading
+            // 'postMessage')` -- reproduced on the D2 close/relaunch-race
+            // path before that race was fixed. Same fix, same guard style.
+            $app_iframe.get(0)?.contentWindow?.postMessage({ msg: 'focus' }, '*');
             var rect = $app_iframe.get(0).getBoundingClientRect();
             // send click event to iframe, if this focus event was triggered by a click or similar mouse event
             if (
                 event !== undefined &&
                 (event.type === 'click' || event.type === 'dblclick' || event.type === 'contextmenu' || event.type === 'mousedown' || event.type === 'mouseup' || event.type === 'mousemove')
             ) {
-                $app_iframe.get(0).contentWindow.postMessage({ msg: 'click', x: (window.mouseX - rect.left), y: (window.mouseY - rect.top) }, '*');
+                $app_iframe.get(0)?.contentWindow?.postMessage({ msg: 'click', x: (window.mouseX - rect.left), y: (window.mouseY - rect.top) }, '*');
             }
         }
         // set active_item_container
