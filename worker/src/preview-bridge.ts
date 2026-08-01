@@ -133,23 +133,41 @@ const STRIP_RESPONSE_HEADERS = new Set([
 ]);
 
 /**
- * Rewrite a `Set-Cookie` value emitted by the dev server so it survives the
- * proxy hop: force `Path=/preview`, `SameSite=None`, `Secure`; drop any
+ * Rewrite a `Set-Cookie` value emitted by the upstream so it survives the
+ * proxy hop AND survives being read inside a cross-site iframe: force
+ * `Path=<cookiePath>`, `SameSite=None`, `Secure`, `Partitioned`; drop any
  * `Domain=` so the browser defaults to the proxy's own origin. Mirrors
- * `preview_bridge.py`'s `_rewrite_set_cookie`.
+ * `preview_bridge.py`'s `_rewrite_set_cookie`, plus two corrections.
+ *
+ * 1. `Partitioned` (CHIPS). This is the SAME gap `handlePreviewBootstrap`'s own
+ *    `ezil_preview` cookie had: a `SameSite=None` cookie with no `Partitioned`
+ *    is blocked outright by Chrome in a third-party iframe. Every upstream
+ *    cookie the previewed app or code-server sets went through here and was
+ *    forced to `SameSite=None` without it, so app session/CSRF cookies would
+ *    have silently vanished the moment the shell embedded the window
+ *    cross-site — the same invisible failure, one layer down. Valid to add
+ *    unconditionally here: `Partitioned` requires `Secure` (forced below) and
+ *    is invalid with `Domain=` (dropped above).
+ *
+ * 2. `cookiePath`. `/preview` is right for the app-preview host, where the
+ *    proxy really is mounted under `/preview`. It is WRONG for the code-server
+ *    host, which is served from `/` (see `handleCodeBridge`) — a cookie pinned
+ *    to `/preview` there would never be sent back on any root-absolute
+ *    code-server request, i.e. silently dropped.
  */
-export function rewriteSetCookie(value: string): string {
+export function rewriteSetCookie(value: string, cookiePath: string = '/preview'): string {
   const parts = value.split(';').map((p) => p.trim()).filter(Boolean);
   if (parts.length === 0) return value;
   const rebuilt: string[] = [parts[0] as string];
   let sawPath = false;
   let sawSameSite = false;
   let sawSecure = false;
+  let sawPartitioned = false;
   for (const p of parts.slice(1)) {
     const lower = p.toLowerCase();
     if (lower.startsWith('domain=')) continue;
     if (lower.startsWith('path=')) {
-      rebuilt.push('Path=/preview');
+      rebuilt.push(`Path=${cookiePath}`);
       sawPath = true;
       continue;
     }
@@ -163,11 +181,17 @@ export function rewriteSetCookie(value: string): string {
       sawSecure = true;
       continue;
     }
+    if (lower === 'partitioned') {
+      rebuilt.push('Partitioned');
+      sawPartitioned = true;
+      continue;
+    }
     rebuilt.push(p);
   }
-  if (!sawPath) rebuilt.push('Path=/preview');
+  if (!sawPath) rebuilt.push(`Path=${cookiePath}`);
   if (!sawSameSite) rebuilt.push('SameSite=None');
   if (!sawSecure) rebuilt.push('Secure');
+  if (!sawPartitioned) rebuilt.push('Partitioned');
   return rebuilt.join('; ');
 }
 
@@ -190,8 +214,12 @@ export function stripFrameAncestors(value: string): string | null {
  * Copy upstream response headers, applying the same rewrites as
  * `preview_bridge.py`'s `_rewrite_response_headers`: drop hop-by-hop and
  * frame-blocking headers, strip CSP `frame-ancestors`, rewrite `Set-Cookie`.
+ *
+ * `cookiePath` is the `Path=` every rewritten upstream cookie is pinned to —
+ * `/preview` for the app-preview host, `/` for the code-server host, which is
+ * served from the root (see `rewriteSetCookie`).
  */
-export function rewriteResponseHeaders(upstream: Headers): Headers {
+export function rewriteResponseHeaders(upstream: Headers, cookiePath: string = '/preview'): Headers {
   const out = new Headers();
   upstream.forEach((value, key) => {
     const lower = key.toLowerCase();
@@ -202,7 +230,7 @@ export function rewriteResponseHeaders(upstream: Headers): Headers {
       return;
     }
     if (lower === 'set-cookie') {
-      out.append(key, rewriteSetCookie(value));
+      out.append(key, rewriteSetCookie(value, cookiePath));
       return;
     }
     out.append(key, value);
@@ -760,7 +788,9 @@ export async function handlePreviewProxy(
   }
 
   const contentType = upstream.headers.get('content-type') ?? '';
-  const outHeaders = rewriteResponseHeaders(upstream.headers);
+  // code-server is served from `/` on its own bridge host, not from
+  // `/preview` — pinning its cookies to `/preview` would silently drop them.
+  const outHeaders = rewriteResponseHeaders(upstream.headers, target === 'code' ? '/' : '/preview');
 
   if (contentType.includes('text/html')) {
     const bodyText = await upstream.text();
