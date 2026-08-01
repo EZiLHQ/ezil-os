@@ -5,10 +5,11 @@
  * Cloudflare Worker that actually runs their desktop.
  *
  * Procedures:
- *   cloudflareGuacamole.isConfigured — check whether env vars are present
- *   cloudflareGuacamole.previewUrl   — get/create a desktop preview URL
- *   cloudflareGuacamole.status       — health-check a computer's sandbox
- *   cloudflareGuacamole.terminate    — request sandbox teardown
+ *   cloudflareGuacamole.isConfigured  — check whether env vars are present
+ *   cloudflareGuacamole.previewUrl    — get/create a desktop preview URL
+ *   cloudflareGuacamole.appPreviewUrl — mint a fresh app-preview window URL
+ *   cloudflareGuacamole.status        — health-check a computer's sandbox
+ *   cloudflareGuacamole.terminate     — request sandbox teardown
  *
  * Security:
  *   - The Worker URL and HMAC secret NEVER reach the browser.
@@ -34,12 +35,16 @@ import { z } from 'zod';
 
 import { computers } from '@/server/db/schema';
 import {
+    APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
+    composeAppPreviewBootstrapUrl,
+    composeAppPreviewOrigin,
     composeBrowserDesktopUrl,
     deriveGuacamoleSandboxId,
     deriveNekoAdminValue,
     enableImplicitHosting,
     getGuacamoleSandboxStatus,
     isOwnDesktopOrigin,
+    mintAppPreviewBootstrapToken,
     newCorrelationId,
     probeDesktopFrame,
     requestGuacamolePreview,
@@ -243,6 +248,137 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 // as `false` — the guard above returns early — but typed as
                 // the observation it is, not as a constant.
                 frame: { confirmed: frame.alive, status: frame.status, observedAt: Date.now() },
+            };
+        }),
+
+    /**
+     * Mint a fresh app-preview ("Option D" dev-server) window URL for the
+     * given computer's sandbox.
+     *
+     * 🔴 Called PER WINDOW-OPEN, and refetched roughly every 50s by the
+     * client while the window stays open — NEVER cached in
+     * `/api/shell/session`'s boot payload. The minted bootstrap token has a
+     * 5-minute TTL (`APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS`); a token
+     * minted once at boot and used minutes later — or held across a
+     * long-open window without ever being refreshed — would already be
+     * expired by the time it is actually used. Refetching well inside the
+     * TTL keeps a fresh token ready for every reload the window might need,
+     * without ever running the clock down to the wire.
+     *
+     * Reuses the exact SAME `/sandbox/preview` Worker call `previewUrl`
+     * above makes (idempotent, and cheap once the desktop is warm —
+     * `ensureDesktop`'s already-exposed fast path in `worker/src/index.ts` —
+     * but able to cold-boot the container on the very first call), which is
+     * why `../../../app/api/shell/preview-url/route.ts` needs the same
+     * extended `maxDuration` as `../desktop/route.ts`.
+     */
+    appPreviewUrl: protectedProcedure
+        .input(z.object({ computerId: z.string().uuid() }))
+        .query(async ({ ctx, input }) => {
+            await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+
+            const config = resolveCloudflareGuacamoleConfig();
+            if (!config.isConfigured) {
+                return {
+                    ok: false as const,
+                    error: 'cloudflare_guacamole_not_configured',
+                    provider: 'cloudflare-guacamole' as const,
+                };
+            }
+
+            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+            const correlationId = newCorrelationId();
+
+            const result = await requestGuacamolePreview(
+                config,
+                hmacSecret,
+                {
+                    // Same correlation convention as `../desktop/route.ts`'s
+                    // POST handler: defaulting sessionId to the computer id
+                    // when the shell has no separate session concept for it.
+                    sessionId: input.computerId,
+                    userId: ctx.user.id,
+                    projectId: input.computerId,
+                    desktopMode: 'neko',
+                },
+                correlationId,
+            );
+
+            if (!result.ok) {
+                const logSafe = result.error.slice(0, 200);
+                console.error('[cloudflareGuacamole.appPreviewUrl] worker error', {
+                    correlationId,
+                    computerId: input.computerId,
+                    error: logSafe,
+                    errorCode: result.errorCode,
+                    retryable: result.retryable,
+                });
+
+                // Same value-vs-throw split as `previewUrl` above — a thrown
+                // error is what TanStack Query (and this route's own client
+                // poller) retries, which is wrong for a deterministic
+                // rejection and right for a transient one.
+                if (result.errorCode && (!result.retryable || OPERATIONAL_ERROR_CODES.has(result.errorCode))) {
+                    return {
+                        ok: false as const,
+                        error: logSafe,
+                        errorCode: result.errorCode,
+                        provider: 'cloudflare-guacamole' as const,
+                    };
+                }
+
+                throw new TRPCError({
+                    code: 'BAD_GATEWAY',
+                    message: `Desktop Worker returned an error (correlationId=${correlationId}). Check server logs for details.`,
+                });
+            }
+
+            const sandboxId = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
+
+            // The ONE authoritative NEGATIVE signal `appPreviewExpose` can
+            // give: exposure was attempted THIS call and failed. On the
+            // warm/fast path the Worker reports `attempted: false` even when
+            // a PRIOR call already exposed the port successfully (see
+            // `GuacamolePreviewSuccess.appPreviewExpose`'s doc comment in the
+            // provider) — so `attempted: false` is never treated as a
+            // failure here, only an OBSERVED failure is.
+            if (result.appPreviewExpose?.attempted && !result.appPreviewExpose.exposed) {
+                console.error('[cloudflareGuacamole.appPreviewUrl] app-preview port exposure failed', {
+                    correlationId,
+                    computerId: input.computerId,
+                    error: result.appPreviewExpose.error,
+                });
+                return {
+                    ok: false as const,
+                    error: result.appPreviewExpose.error ?? 'app_preview_expose_failed',
+                    errorCode: 'app_preview_unavailable' as const,
+                    provider: 'cloudflare-guacamole' as const,
+                };
+            }
+
+            const appPreviewOrigin = composeAppPreviewOrigin(result.guacamoleUrl, sandboxId);
+            if (!appPreviewOrigin) {
+                console.error('[cloudflareGuacamole.appPreviewUrl] could not derive an app-preview origin', {
+                    correlationId,
+                    computerId: input.computerId,
+                });
+                return {
+                    ok: false as const,
+                    error: 'app_preview_origin_unresolvable',
+                    errorCode: 'app_preview_unavailable' as const,
+                    provider: 'cloudflare-guacamole' as const,
+                };
+            }
+
+            const token = mintAppPreviewBootstrapToken(hmacSecret, sandboxId);
+            const appPreviewUrl = composeAppPreviewBootstrapUrl(appPreviewOrigin, token);
+
+            return {
+                ok: true as const,
+                correlationId,
+                appPreviewUrl,
+                expiresAt: Date.now() + APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
+                provider: 'cloudflare-guacamole' as const,
             };
         }),
 

@@ -3,11 +3,17 @@ import { createHmac } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+    APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
+    APP_PREVIEW_PORT,
+    APP_PREVIEW_TOKEN,
     classifyWorkerHttpFailure,
+    composeAppPreviewBootstrapUrl,
+    composeAppPreviewOrigin,
     composeBrowserDesktopUrl,
     deriveNekoAdminValue,
     enableImplicitHosting,
     isRetryablePreviewErrorCode,
+    mintAppPreviewBootstrapToken,
     requestGuacamolePreview,
     requestGuacamoleSandboxTerminate,
     type CloudflareGuacamoleConfig,
@@ -533,5 +539,102 @@ describe('enableImplicitHosting — a click on your own computer must just work'
         const mode = await enableImplicitHosting(DESKTOP_URL, 'admin-pwd-secret');
         expect(mode).toBe('implicit');
         expect(JSON.stringify(mode)).not.toContain('secret');
+    });
+});
+
+// ─── App-preview (Option D) bootstrap token + URL ──────────────────────────────
+//
+// `mintAppPreviewBootstrapToken` MUST byte-for-byte match
+// `worker/src/hmac.ts`'s `mintPreviewBootstrapToken` /
+// `PREVIEW_BOOTSTRAP_TOKEN_PAYLOAD` — a drift here is a silent 401 on every
+// app-preview window, since the Worker verifies against its own copy of the
+// same payload string. The reference vector below is computed independently
+// (`node:crypto`, not the function under test) precisely so this suite would
+// catch that drift instead of just re-deriving the same bug twice.
+
+describe('mintAppPreviewBootstrapToken — byte-for-byte match with worker/src/hmac.ts', () => {
+    it('signs the exact payload the Worker verifies against: "${ts}.GET./preview-bootstrap.${sandboxId}."', () => {
+        const now = 1_700_000_000_000;
+        const token = mintAppPreviewBootstrapToken('shared-secret', 'guac-u-c', now);
+
+        const expectedPayload = `${now}.GET./preview-bootstrap.guac-u-c.`;
+        const expectedSig = createHmac('sha256', 'shared-secret').update(expectedPayload).digest('hex');
+
+        expect(token).toBe(`t=${now},v1=${expectedSig}`);
+    });
+
+    it('binds sandboxId into the signature — two sandboxes never share a valid token', () => {
+        const now = 1_700_000_000_000;
+        const a = mintAppPreviewBootstrapToken('shared-secret', 'guac-u-a', now);
+        const b = mintAppPreviewBootstrapToken('shared-secret', 'guac-u-b', now);
+        expect(a).not.toBe(b);
+    });
+
+    it('changes signature when the secret changes, at the same timestamp and sandboxId', () => {
+        const now = 1_700_000_000_000;
+        const a = mintAppPreviewBootstrapToken('secret-a', 'guac-u-c', now);
+        const b = mintAppPreviewBootstrapToken('secret-b', 'guac-u-c', now);
+        expect(a).not.toBe(b);
+    });
+
+    it('falls back to the plaintext "local-dev" placeholder when no secret is configured', () => {
+        // Matches `mintSandboxPreviewToken`'s own local-dev branch, and the
+        // Worker's `verifyPreviewBootstrapToken` local-dev branch that
+        // accepts any token when no secret is configured.
+        expect(mintAppPreviewBootstrapToken('', 'guac-u-c')).toBe('local-dev');
+    });
+
+    it('defaults `now` to the current time and produces a well-formed envelope', () => {
+        const token = mintAppPreviewBootstrapToken('shared-secret', 'guac-u-c');
+        expect(token).toMatch(/^t=\d+,v1=[0-9a-f]{64}$/);
+    });
+});
+
+describe('composeAppPreviewOrigin — derives the app-preview hostname from the OBSERVED desktop URL', () => {
+    it('mirrors the ${port}-${sandboxId}-${token} hostname pattern, reusing the desktop URL\'s own zone suffix', () => {
+        const origin = composeAppPreviewOrigin('https://8181-guac-abc-def-nekodesktop.ezil.org/', 'guac-abc-def');
+        expect(origin).toBe(`https://${APP_PREVIEW_PORT}-guac-abc-def-${APP_PREVIEW_TOKEN}.ezil.org`);
+    });
+
+    it('preserves the desktop URL\'s protocol (http in local dev, https in production)', () => {
+        const origin = composeAppPreviewOrigin('http://8181-guac-a-b-nekodesktop.localhost:8787/', 'guac-a-b');
+        expect(origin).toBe(`http://${APP_PREVIEW_PORT}-guac-a-b-${APP_PREVIEW_TOKEN}.localhost:8787`);
+    });
+
+    it('never invents a zone from CLOUDFLARE_GUACAMOLE_WORKER_URL — it reuses whatever the Worker actually returned', () => {
+        // A worker that (for whatever reason) collapsed to a different zone
+        // than expected must still be followed exactly, not second-guessed.
+        const origin = composeAppPreviewOrigin('https://8181-guac-x-y-nekodesktop.some-other-zone.example/', 'guac-x-y');
+        expect(origin).toBe(`https://${APP_PREVIEW_PORT}-guac-x-y-${APP_PREVIEW_TOKEN}.some-other-zone.example`);
+    });
+
+    it('returns null for an unparseable guacamoleUrl, never throws', () => {
+        expect(composeAppPreviewOrigin('not a url', 'guac-a-b')).toBeNull();
+    });
+
+    it('returns null for a hostname with no label to strip', () => {
+        expect(composeAppPreviewOrigin('https://localhost/', 'guac-a-b')).toBeNull();
+    });
+});
+
+describe('composeAppPreviewBootstrapUrl', () => {
+    it('builds /preview-bootstrap with the token, defaulting path to root (no path param)', () => {
+        const url = composeAppPreviewBootstrapUrl('https://3002-guac-a-b-app.ezil.org', 't=1,v1=abc');
+        const parsed = new URL(url);
+        expect(parsed.origin).toBe('https://3002-guac-a-b-app.ezil.org');
+        expect(parsed.pathname).toBe('/preview-bootstrap');
+        expect(parsed.searchParams.get('token')).toBe('t=1,v1=abc');
+        expect(parsed.searchParams.has('path')).toBe(false);
+    });
+
+    it('forwards a non-root path as the ?path= query param', () => {
+        const url = composeAppPreviewBootstrapUrl('https://3002-guac-a-b-app.ezil.org', 't=1,v1=abc', '/dashboard');
+        expect(new URL(url).searchParams.get('path')).toBe('/dashboard');
+    });
+});
+
+describe('APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS', () => {
+    it('is 5 minutes, matching worker/src/hmac.ts\'s PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS', () => {
+        expect(APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS).toBe(5 * 60 * 1000);
     });
 });

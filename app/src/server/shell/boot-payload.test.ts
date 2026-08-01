@@ -234,6 +234,7 @@ describe('toShellDesktopState — never implies an observation it does not have'
         expect(toShellDesktopState(null).endpoints).toEqual({
             session: '/api/shell/session',
             desktop: '/api/shell/desktop',
+            previewUrl: '/api/shell/preview-url',
         });
     });
 });
