@@ -57,13 +57,53 @@ import UITaskbar from './UITaskbar.js';
 // `$.fn.close` BEFORE `delete_window_element` runs: the taskbar item stays,
 // the window stays on screen, and it is now unclosable. Verbatim from
 // upstream L2388-2403.
+// MODIFIED BY EZIL 2026-08-01: D1 fix (close-then-reopen loses its taskbar
+// item). This used to unconditionally `$(item).remove()` once its 300ms of
+// fade+shrink animation finished. `item` is a specific, already-resolved DOM
+// node (the taskbar-item `<div>` for one app), NOT a re-run selector, so the
+// bug was never "wrong node" -- it was TRUSTING STALE INTENT: the node is
+// captured and this removal scheduled at the moment `$.fn.close`
+// (UIWindow.js) decides the app's last window is closing (its
+// `data-open-windows` count just hit zero). But the DOM node itself is not
+// removed until this animation's completion callback fires, up to ~200ms
+// later. If the same app is relaunched inside that window, UIWindow.js's
+// window-creation code finds this SAME still-present node (its own
+// same-app-taskbar-item selector matches it, since it hasn't been removed
+// yet) and reuses it for the new window, bumping `data-open-windows` back to
+// 1. This callback then ran anyway and deleted that node -- deleting the
+// reopened window's only taskbar item.
+// MEASURED: reopen at ~112ms -> windows=1, taskbarItems=0.
+//
+// Fix: re-check LIVE state at the moment of removal, not the state that was
+// true when this animation was scheduled. If something has since claimed
+// this node (`data-open-windows` > 0), it is no longer this callback's to
+// delete -- undo the fade/shrink instead of finishing the removal. (The
+// window-creation reuse path in UIWindow.js ALSO stops and restores this
+// animation the instant it reclaims the node, so in practice this branch is
+// the last-resort safety net, not the primary fix -- belt and braces, since
+// this project has been bitten before by fixes that only worked from one
+// side of a race.)
 window.remove_taskbar_item = function (item) {
-    $(item).find('*').fadeOut(100, function () {
+    const $item = $(item);
+    if ( $item.length === 0 ) {
+        return;
+    }
+
+    $item.find('*').fadeOut(100, function () {
 
     });
 
-    $(item).animate({ width: 0 }, 200, function () {
-        $(item).remove();
+    $item.animate({ width: 0 }, 200, function () {
+        const still_empty = (parseInt($item.attr('data-open-windows')) || 0) === 0;
+        if ( ! still_empty ) {
+            // Reclaimed by a newer window since this removal was scheduled:
+            // undo the shrink/fade instead of deleting it out from under it.
+            $item.stop(true, true).css('width', '');
+            $item.find('*').stop(true, true).show();
+            return;
+        }
+
+        $item.remove();
 
         // Adjust taskbar item sizes after removing an item
         if ( window.adjust_taskbar_item_sizes ) {
