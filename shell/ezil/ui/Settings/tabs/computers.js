@@ -50,6 +50,54 @@ let busyId = null; // a switch/delete in flight for this computer id
 const DESKTOP_SELECTOR = '.window[data-app="desktop"]';
 
 /**
+ * 🔴 EVERY window bound to a computer sandbox — not a hardcoded app list.
+ * This is what `closeSandboxWindows()` below closes on delete/switch, and it
+ * is the fix for the defect that shipped `DESKTOP_SELECTOR`-only closing:
+ * Preview (Wave A) and Code (Wave B) are container windows on the exact same
+ * sandbox as the desktop, opened with the same `ctx.computer` and stamped
+ * with the same `data-ezil-computer-id` by `registry.launch()` — but they
+ * are a DIFFERENT `data-app` value, so any selector keyed on `data-app`
+ * misses them by construction, today and for every future window a next wave
+ * adds. MEASURED (CDP `Fetch.requestPaused`, request aborted, nothing
+ * deleted): at the instant `computer.delete` left the browser, the DOM still
+ * held a live `{app:'preview', src:'http://3002-guac-…-app.'}` iframe into
+ * the sandbox about to be destroyed.
+ *
+ * Matched structurally, on an actual `.window-app-iframe` inside it — the
+ * element `UIWindow` builds for every app that passes `iframe_url`
+ * (`desktop-window.js`, `preview.js`, `code.js` all do, identically:
+ * `el_window.querySelector('.window-app-iframe')`). This is what a "streams
+ * the sandbox" window IS, mechanically — not an app name, and not the
+ * `data-ezil-computer-id` stamp either, deliberately:
+ *
+ *   - It is NOT an app name, because that is exactly the bug this replaces:
+ *     any selector keyed on `data-app` misses every current and future
+ *     iframe-backed app that isn't literally `"desktop"`.
+ *   - It is NOT the `data-ezil-computer-id` stamp, for two independent
+ *     reasons. First, `registry.launch()` stamps it on ANY window opened
+ *     with `ctx.computer.id` set, including Settings itself — reachable
+ *     from a sandbox window's own control drawer with that window's ctx
+ *     (`registry.js`'s `settingsDrawerAction`). Settings is a plain
+ *     DOM+trpc pane, not an iframe into the container, and it is also the
+ *     exact window issuing this very delete/switch call — matching on the
+ *     stamp alone would try to close its caller out from under itself.
+ *     Second, and just as important: requiring the stamp to be PRESENT would
+ *     silently exclude a window whose stamp is missing or has been stripped
+ *     from being considered a sandbox window AT ALL — exactly the "unknown
+ *     ownership" case `windowStreams()` below exists to fail safe on (see
+ *     `../settings-test.mjs`'s round-1 regression). A window's OWN presence
+ *     as a candidate must not depend on the attribute whose absence is the
+ *     scenario being defended against.
+ */
+const SANDBOX_WINDOW_SELECTOR = '.window';
+
+/** @returns {HTMLElement[]} every currently open sandbox-bound window. */
+function sandboxWindowEls () {
+    return $(SANDBOX_WINDOW_SELECTOR).toArray()
+        .filter(el => el.querySelector('.window-app-iframe') !== null);
+}
+
+/**
  * The computer id the single 'desktop' app window currently streams, as far
  * as module state knows. Only ever a HINT — `desktopStreams()` below is the
  * authority.
@@ -66,7 +114,12 @@ const DESKTOP_SELECTOR = '.window[data-app="desktop"]';
  *
  * One id is enough because there is at most one desktop window ever: the
  * 'desktop' app is `single_instance` (`registry.js`), enforced three ways
- * (there too, and again inside `UIWindow` itself).
+ * (there too, and again inside `UIWindow` itself). It also doubles as the
+ * fallback hint for ANY sandbox window (not just the desktop) whose own
+ * stamp is missing — see `windowStreams()` below — because every sandbox
+ * window open at once shares one computer: `ctx.computer` is fixed for the
+ * whole boot/switch cycle (`boot.js`'s `build()`), so a desktop streaming
+ * `c-1` never coexists with a Preview or Code streaming anything else.
  */
 let activeComputerId;
 
@@ -100,6 +153,26 @@ function desktopStreams (id) {
     if ( open === null ) return false;
     if ( open === undefined ) return 'unknown';
     return open === id;
+}
+
+/**
+ * Does sandbox window `el` (any of desktop/preview/code/future — anything
+ * `sandboxWindowEls()` matched) stream computer `id`? `el` is always a real,
+ * currently-open window — the "no window at all" case `desktopStreams()`
+ * handles by returning `false` does not arise here, since callers only ever
+ * pass elements `sandboxWindowEls()` actually found.
+ *
+ * @returns {true|false|'unknown'} `false` ONLY when positively known NOT to.
+ *   Same fallback chain as `openDesktopComputerId()`, applied to any window:
+ *   the window's own stamp wins when present; a falsy stamp (missing OR
+ *   stripped) falls back to `activeComputerId`, and `activeComputerId`
+ *   itself being falsy (`null` OR `undefined` — both mean "no known active
+ *   computer", not "positively none") is what makes the result 'unknown'
+ *   rather than a false negative.
+ */
+function windowStreams (el, id) {
+    const own = el.getAttribute('data-ezil-computer-id') || activeComputerId || undefined;
+    return own === undefined ? 'unknown' : own === id;
 }
 
 function timeAgo (input) {
@@ -169,36 +242,49 @@ function reportError (message) {
 }
 
 /**
- * 🔴 Close whatever the single 'desktop' app window currently shows, and
- * WAIT for it to actually leave the document — not just for `.close()`'s
- * promise to settle.
+ * 🔴 THE GUARANTEE, generalised. Close every open sandbox window (desktop,
+ * Preview, Code, whatever a future wave adds) that streams computer `id` —
+ * or, with no `id` (the switch path, where we are leaving EVERY currently
+ * open window behind regardless of whose it was), every sandbox window,
+ * full stop. WAIT for each to actually leave the document — not just for
+ * `.close()`'s promise to settle.
  *
  * `$.fn.close` (`UIWindow.js`) is itself `async`, but its body runs its real
  * work inside `$(this).each(async function () {...})`, and jQuery's `.each`
  * does not await an async callback — it starts it and moves on. So the
  * promise `.close()` returns can resolve before `on_before_exit` (which
- * `desktop-window.js` uses to stop its poll timers and its in-flight boot)
- * has actually finished. Polling for the node's removal is what this
- * function is actually waiting for; the bounded timeout is the same
- * "don't hang forever on our own defensive check" shape used throughout
- * this fork (see `desktop-window.js`'s `FRAME_CONFIRM_*` constants).
+ * `desktop-window.js`/`preview.js`/`code.js` each use to stop their poll
+ * timers and in-flight boot) has actually finished. Polling for the nodes'
+ * removal is what this function is actually waiting for; the bounded
+ * timeout is the same "don't hang forever on our own defensive check" shape
+ * used throughout this fork (see `desktop-window.js`'s `FRAME_CONFIRM_*`
+ * constants).
+ *
+ * @param {string} [id] Close only windows streaming this computer (fails
+ *   safe: 'unknown' ownership closes too — see `windowStreams()`). Omitted
+ *   entirely closes every open sandbox window unconditionally.
  */
-async function closeDesktopWindows () {
-    const $wins = $(DESKTOP_SELECTOR);
+async function closeSandboxWindows (id) {
+    const targets = () => sandboxWindowEls()
+        .filter(el => id === undefined || windowStreams(el, id) !== false);
+
+    const $wins = $(targets());
     if ( $wins.length === 0 ) {
-        activeComputerId = null;
+        if ( openDesktopComputerId() === null ) activeComputerId = null;
         return;
     }
     await Promise.all($wins.toArray().map(el => Promise.resolve($(el).close())));
     const deadline = Date.now() + 3000;
-    while ( $(DESKTOP_SELECTOR).length > 0 && Date.now() < deadline ) {
+    while ( targets().length > 0 && Date.now() < deadline ) {
         await new Promise(r => setTimeout(r, 50));
     }
-    if ( $(DESKTOP_SELECTOR).length > 0 ) {
-        console.warn(`[${PHASE}] a desktop window did not close within the wait budget`);
-    } else {
-        activeComputerId = null;
+    if ( targets().length > 0 ) {
+        console.warn(`[${PHASE}] a sandbox window did not close within the wait budget`);
     }
+    // The desktop specifically drives `activeComputerId` (see its own
+    // comment): re-check it directly rather than assume it was among the
+    // windows this call targeted.
+    if ( openDesktopComputerId() === null ) activeComputerId = null;
 }
 
 function rowHtml (slot, computer) {
@@ -320,12 +406,16 @@ async function switchTo (computer, ctx, $win) {
     busyId = computer.id;
     render($win);
     try {
-        // 🔴 Same reason as delete: only one 'desktop' window can exist
-        // (single_instance) and it is currently streaming a DIFFERENT
-        // container. Closing it first means its client-side teardown runs
-        // on purpose, instead of the iframe being yanked out from under a
-        // window that `registry.launch` would otherwise just re-focus.
-        await closeDesktopWindows();
+        // 🔴 Same reason as delete, generalised: EVERY open sandbox window
+        // (desktop AND Preview AND Code — single_instance only bounds each
+        // app to one window each, not the count of apps open at once) is
+        // currently streaming a DIFFERENT container, about to switch out
+        // from under it. Closing them all first means each one's own
+        // client-side teardown runs on purpose, instead of its iframe being
+        // yanked out from under a window that `registry.launch` would
+        // otherwise just re-focus. No `id` argument: we are leaving whatever
+        // is open behind regardless of which computer it belonged to.
+        await closeSandboxWindows();
         activeComputerId = computer.id;
         const desktopState = ctx?.payload?.desktopState ?? {};
         await registry.launch('desktop', { ...ctx, computer, desktopState });
@@ -367,22 +457,27 @@ async function handleDelete (computer, $win) {
     try {
         // 🔴 THE GUARANTEE. `computer.delete` -> `terminateComputerSandbox`
         // (`app/src/server/api/routers/computer.ts`) destroys the very
-        // sandbox any open desktop window is streaming. Closing the window
-        // FIRST means the client tears its own connection down on its own
-        // terms; calling delete first would leave the user watching their
-        // OS die mid-frame while the iframe reconnect-loops against a
-        // container that no longer exists.
+        // sandbox ANY open sandbox window is streaming — the desktop, but
+        // just as much Preview or Code, since all three are container
+        // windows on the same sandbox (see `SANDBOX_WINDOW_SELECTOR`'s
+        // comment for the measured defect this replaced: a live Preview
+        // iframe still pointed at the container the instant `computer.delete`
+        // left the browser, because closing was keyed on `data-app="desktop"`
+        // and Preview is a different `data-app`). Closing every sandbox
+        // window FIRST means each one's client tears its own connection down
+        // on its own terms; calling delete first would leave the user
+        // watching windows die mid-frame while their iframes reconnect-loop
+        // against a container that no longer exists.
         //
-        // 🔴 FAILS SAFE. The window is closed unless the open desktop is
-        // POSITIVELY known to be a different computer. The two errors here
-        // are not symmetric: closing a window we did not have to close costs
-        // one reopen, while not closing one we should have is precisely the
-        // failure this guarantee exists to prevent. Round 1 had this
-        // backwards — it closed only on a positive match against a variable
-        // that was empty on the rehydrate path.
-        if ( desktopStreams(computer.id) !== false ) {
-            await closeDesktopWindows();
-        }
+        // 🔴 FAILS SAFE. `closeSandboxWindows(computer.id)` closes a window
+        // unless it is POSITIVELY known to stream a different computer (see
+        // `windowStreams()`). The two errors here are not symmetric: closing
+        // a window we did not have to close costs one reopen, while not
+        // closing one we should have is precisely the failure this guarantee
+        // exists to prevent. Round 1 had this backwards — it closed only on
+        // a positive match against a variable that was empty on the
+        // rehydrate path.
+        await closeSandboxWindows(computer.id);
 
         const res = await trpc.mutate('computer.delete', { id: computer.id });
         if ( ! res.ok && res.code !== 'NOT_FOUND' ) {
