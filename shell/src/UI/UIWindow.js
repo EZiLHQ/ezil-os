@@ -1343,6 +1343,25 @@ async function UIWindow (options) {
     $(el_window_body).on('mousedown', function () {
         $(el_window).focusWindow();
     });
+    // 🔴 DEFECT B — the same click-to-focus gap, on the resize handles.
+    // jQuery UI's `.resizable()` (wired further below) appends each
+    // `.ui-resizable-handle` as a direct child of `el_window` ITSELF, not of
+    // `el_window_head` or `el_window_body` — so neither binding above ever
+    // sees a mousedown that starts on an edge/corner handle. MEASURED: grab a
+    // buried window's resize handle and it stays buried while it resizes
+    // underneath the window on top of it.
+    //
+    // Delegated to `el_window` (not bound on each handle directly) so it
+    // matches handles that do not exist yet at this point in `UIWindow` —
+    // `.resizable()` is only called later, and only when `options.is_resizable`
+    // — without caring about that ordering. Same non-interference argument as
+    // the two handlers above: no `preventDefault()`/`stopPropagation()`, so
+    // jQuery UI's own mousedown handling on the handle (which starts the
+    // resize) runs exactly as before; this only reorders z-index and toggles
+    // `window-active`/iframe pointer-events.
+    $(el_window).on('mousedown', '.ui-resizable-handle', function () {
+        $(el_window).focusWindow();
+    });
 
     // on_close event
     $(el_window).on('remove', function (e) {
