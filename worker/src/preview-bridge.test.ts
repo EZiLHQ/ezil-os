@@ -34,6 +34,7 @@ import {
   handlePreviewBootstrap,
   handlePreviewProxy,
   handlePreviewWsProxy,
+  handlePreviewInspectorJs,
   resolvePreviewAuth,
   stripPreviewQueryParam,
   PREVIEW_COOKIE_QUERY_PARAM,
@@ -1001,5 +1002,36 @@ describe('handlePreviewWsProxy', () => {
     );
     const res = await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/');
     expect(res.status).toBe(200); // no `webSocket` on the fake Response -> passthrough, not 401
+  });
+});
+
+describe('handlePreviewInspectorJs', () => {
+  const SECRET = 'test-primary-secret';
+  const SID = 'guac-user1-proj1';
+
+  it('returns 401 without a valid cookie', async () => {
+    const request = new Request(`https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-inspector.js`);
+    const res = await handlePreviewInspectorJs(request, SID, [SECRET]);
+    expect(res.status).toBe(401);
+  });
+
+  it('serves the inspector script with a valid cookie', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const request = new Request(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-inspector.js`,
+      { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } },
+    );
+    const res = await handlePreviewInspectorJs(request, SID, [SECRET]);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('application/javascript');
+  });
+
+  it('accepts the `ezil_pv` query-param fallback when the cookie is missing', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const request = new Request(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-inspector.js?${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`,
+    );
+    const res = await handlePreviewInspectorJs(request, SID, [SECRET]);
+    expect(res.status).toBe(200);
   });
 });
