@@ -39,8 +39,18 @@
 // `shell/src/css/dashboard.css:52` derives the tray's open width from a calc
 // sized for EXACTLY two buttons, and `.dashboard-app-drawer-clip` is
 // `overflow:hidden`. A third button would be clipped and unclickable, which is
-// indistinguishable from not shipping it. `MARKER_CLASS` below is what
-// `settings.css` (owned, concatenated last) hangs the widened `--open-w` on.
+// indistinguishable from not shipping it.
+//
+// MODIFIED BY EZIL 2026-08-01 (wave-a seams): this was originally fixed by a
+// hand-written `--open-w` for exactly THREE buttons, hung on `MARKER_CLASS` in
+// `settings.css`. The app switcher then made it four and would have clipped
+// again — a landmine that re-arms every time anyone adds a button. The width
+// is now derived from the actual button count by `sync_drawer_width`
+// (`../app-drawer.js`), which this file calls after injecting. `MARKER_CLASS`
+// survives as a state marker (the idempotency check and `settings-test.mjs`
+// both read it); it no longer carries any geometry.
+
+import { sync_drawer_width } from '../app-drawer.js';
 
 const PHASE = 'ezil-os:settings/drawer';
 
@@ -118,6 +128,12 @@ function inject (drawer, el_window, onOpen) {
     else controls.appendChild(btn);
 
     drawer.classList.add(MARKER_CLASS);
+    // 🔴 The tray's open width is derived from its button COUNT (see
+    // `sync_drawer_width` in ../app-drawer.js). This injection happens after
+    // `attach_app_drawer` has already sized it, so the count must be
+    // re-published or the button lands outside `overflow: hidden` — present in
+    // the DOM, invisible on screen, and passing every DOM-level test.
+    sync_drawer_width(drawer);
     console.info(`[${PHASE}] Settings button attached to the control drawer`);
     return true;
 }
