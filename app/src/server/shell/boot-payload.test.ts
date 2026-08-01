@@ -235,7 +235,26 @@ describe('toShellDesktopState — never implies an observation it does not have'
             session: '/api/shell/session',
             desktop: '/api/shell/desktop',
             previewUrl: '/api/shell/preview-url',
+            focus: '/api/shell/focus',
         });
+    });
+
+    /**
+     * 🔴 `focus` is not documentation, it is a FEATURE FLAG, and this test
+     * exists so nobody removes it thinking otherwise.
+     *
+     * `shell/ezil/apps/desktop-window.js` draws its in-stream app switcher if
+     * and only if `desktopState.endpoints.focus` is truthy — the deliberate
+     * "never POST to a URL this file invented" rule. For the whole of Wave A
+     * the key did not exist, so the switcher was silently never drawn even
+     * though the Worker route it needs was built and tested. Deleting the key
+     * would put it straight back in that state, silently, with every test
+     * still green except this one.
+     */
+    it('carries `focus`, the key the shell in-stream switcher feature-detects on', () => {
+        expect(toShellDesktopState({ isConfigured: true, hasHmacSecret: true }).endpoints.focus).toBe(
+            '/api/shell/focus',
+        );
     });
 });
 

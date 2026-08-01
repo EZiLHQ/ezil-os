@@ -42,11 +42,13 @@ import {
     deriveGuacamoleSandboxId,
     deriveNekoAdminValue,
     enableImplicitHosting,
+    FOCUSABLE_APPS,
     getGuacamoleSandboxStatus,
     isOwnDesktopOrigin,
     mintAppPreviewBootstrapToken,
     newCorrelationId,
     probeDesktopFrame,
+    requestGuacamoleFocusApp,
     requestGuacamolePreview,
     requestGuacamoleSandboxTerminate,
     resolveCloudflareGuacamoleConfig,
@@ -486,6 +488,50 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 outcome: result.outcome,
                 error: result.error,
                 sandboxName,
+                correlationId,
+                provider: 'cloudflare-guacamole' as const,
+            };
+        }),
+
+    /**
+     * Foreground an app inside the computer's X session.
+     *
+     * The one thing to notice about the input schema: `app` is
+     * `z.enum(FOCUSABLE_APPS)` — the PRODUCT's enum, not the Worker's. See
+     * `FOCUSABLE_APPS` in the provider for why they differ and why narrowing
+     * belongs here. A client asking for anything else (including the Worker's
+     * still-legal `'vscode'`) is rejected by zod as a 400 before a Worker call
+     * is made, so the browser can never be handed a control that is guaranteed
+     * to fail.
+     *
+     * Returns the outcome as a VALUE on a 200, like `terminate` above: a focus
+     * switch that the container refused is a real answer the UI must render
+     * honestly, not an exception for a client to retry.
+     */
+    focusApp: protectedProcedure
+        .input(
+            z.object({
+                computerId: z.string().uuid(),
+                app: z.enum(FOCUSABLE_APPS),
+            }),
+        )
+        .mutation(async ({ ctx, input }) => {
+            await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+
+            const config = resolveCloudflareGuacamoleConfig();
+            if (!config.isConfigured) {
+                return { ok: false as const, error: 'provider_not_configured', provider: 'cloudflare-guacamole' as const };
+            }
+
+            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+            const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
+            const correlationId = newCorrelationId();
+            const result = await requestGuacamoleFocusApp(config, hmacSecret, sandboxName, input.app, correlationId);
+
+            return {
+                ok: result.ok,
+                app: input.app,
+                error: result.error,
                 correlationId,
                 provider: 'cloudflare-guacamole' as const,
             };
