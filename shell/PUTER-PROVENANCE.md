@@ -203,6 +203,24 @@ upstream.
 | `build-shell.sh` | — | Bundles `src/` + `ezil/` to `app/public/os/`. Its CSS cascade order is explicit, not sorted: upstream's `style.css` deliberately overrides jQuery UI's `.ui-resizable-*` rules, so alphabetical order inverts the cascade. |
 | `load-test.mjs` | — | Headless jsdom load of the **built** bundle: boots the shell, constructs a real window, taskbar and context menu, and asserts every `puter.*` stub rejects. Found three defects a green build and `node --check` both passed. |
 | `package.json` | — | Exists only so `load-test.mjs` has somewhere to declare jsdom. Not a dependency of `app/` or `worker/`. |
+| `ezil/ui/Settings/drawer-action.js` | 155 | Puts a Settings button in the full-bleed window's control drawer. **Reproduces no upstream code** — it builds one `<button>` with the class names `ui/app-drawer.js` already uses (`dashboard-app-drawer-btn`), because `src/css/dashboard.css` is the ported extract that styles exactly those selectors. See the "one exception" note below. |
+| `ezil/ui/Settings/settings-test.mjs` | — | End-to-end jsdom harness for the **built** bundle: opens the desktop window, drives Settings the way a person does, and asserts ORDERING (delete closes the container window before `computer.delete` goes out). Found that guarantee silently not firing; mutation-tested in both directions. Sibling of `load-test.mjs`, kept next to the feature it covers. |
+| `ezil/ui/Settings/computers-drift.test.{tsx,vitest.config.ts}` | — | Renders the `/computers` page — the escape hatch when the shell fails to boot — with `react-dom/server`, so a later "the OS took over, delete this page" cleanup fails a test instead of stranding a user at the 2-computer cap. Runs against `app/`'s module graph from outside it; see the config's header. |
+| `ezil/ui/Settings/{server-only,next-navigation}.stub.ts` | — | Two tiny module stubs the drift test aliases in. Not shipped: nothing under `ezil/ui/Settings/*.stub.ts` is reachable from `ezil/boot.js`, so esbuild never sees them. |
+
+#### 🔴 The one place EZiL code styles a Puter-derived selector from outside `src/`
+
+`ezil/ui/Settings/settings.css` ends with a rule on
+`.dashboard-app-drawer.ezil-has-settings-action`. Every other rule in that file
+is `ezil-settings-*`-prefixed, on purpose. This one is not, and the reason is
+recorded here rather than only in the CSS: `src/css/dashboard.css:52`
+(Puter-derived) derives the drawer's open width from a `calc()` written for
+exactly two buttons, and the tray clips its overflow. EZiL adds a third button,
+so the total has to be redefined. It is redefined **on a marker class**, so a
+drawer without EZiL's button keeps upstream's geometry byte-for-byte, and the
+TOTAL is redefined rather than any of its parts, so upstream's
+`(pointer: coarse)` and `(max-width: 500px)` overrides of `--btn` / `--title-w`
+/ `--t2b` still flow through unchanged. `dashboard.css` itself is untouched.
 
 ---
 

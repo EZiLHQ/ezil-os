@@ -15,6 +15,13 @@
  * declared in the Next app's own stylesheet, not in anything this shell
  * bundle ships — depending on them would make this window's colours a
  * silent function of which page happens to have loaded first.
+ *
+ * MODIFIED BY EZIL 2026-08-01: added the one rule in this file that is NOT
+ * `ezil-settings-*`-prefixed — `.dashboard-app-drawer.ezil-has-settings-action`
+ * at the bottom, which widens the Puter-derived control tray so EZiL's third
+ * button is not clipped. `shell/src/css/dashboard.css` itself is untouched;
+ * see PUTER-PROVENANCE.md, "The one place EZiL code styles a Puter-derived
+ * selector from outside `src/`".
  */
 
 .ezil-settings-window .window-body {
