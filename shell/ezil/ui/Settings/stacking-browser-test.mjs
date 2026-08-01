@@ -1095,6 +1095,35 @@ async function runViewport (vp) {
     }
 
     // ═════════════════════════════════════════════════════════════════════
+    // GAP 3 REGRESSION — a BURIED window's resize handle must both raise it
+    // (UIWindow.js's `$(el_window).on('mousedown', '.ui-resizable-handle', …)`
+    // binding) AND still resize it (jQuery UI's own `.resizable()`, wired
+    // separately). Deleting that binding turned nothing red anywhere in the
+    // eight shell suites before this test existed — see this file's own
+    // report for the mutation proof (a scratch copy with the binding
+    // removed). Exercised on more than one handle direction: the only prior
+    // verification of this binding ever grabbed "se".
+    // ═════════════════════════════════════════════════════════════════════
+    if ( otherAppIds.length > 0 ) {
+        const resizeTarget = otherAppIds[0];
+        // 🔴 NOT `[bootAppId, ...otherAppIds]`: the full-bleed boot app is
+        // `data-stay_on_top="true"` (`UIWindow.js` ~L122-124, set whenever
+        // `window.is_fullpage_mode`), which pins its z-index to a fixed
+        // ~99999999 band that NEVER changes on focus (`window_zindex_base`,
+        // ~L4111-4114) and is always higher than any ordinary window's
+        // small counter-based z-index. Including it here would make
+        // "settings/preview/code is topmost" permanently unsatisfiable —
+        // the exact "broken assertion, not a product bug" trap this file's
+        // own `titlebarPoint` doc block warns about. Every OTHER real
+        // per-app raise check in this file (`otherAppIds` loop, round-robin)
+        // already excludes it for the same reason.
+        const resizeContenders = [...otherAppIds];
+        for ( const dir of ['se', 'nw', 'e'] ) {
+            await testResizeHandleRaisesAndResizes(resizeTarget, dir, resizeContenders, `${VP} resize-handle regression`);
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
     // Restore the boot app — regression check: it must still be able to
     // reclaim the screen, and an ordinary window opened earlier must not
     // have made it permanently unreachable. See the original file's
@@ -1125,35 +1154,6 @@ async function runViewport (vp) {
                 const r = document.querySelector(`.window[data-app="${id}"]`).getBoundingClientRect();
                 return r.width >= window.innerWidth - 1 && r.height >= 0;
             }, bootAppId));
-    }
-
-    // ═════════════════════════════════════════════════════════════════════
-    // GAP 3 REGRESSION — a BURIED window's resize handle must both raise it
-    // (UIWindow.js's `$(el_window).on('mousedown', '.ui-resizable-handle', …)`
-    // binding) AND still resize it (jQuery UI's own `.resizable()`, wired
-    // separately). Deleting that binding turned nothing red anywhere in the
-    // eight shell suites before this test existed — see this file's own
-    // report for the mutation proof (a scratch copy with the binding
-    // removed). Exercised on more than one handle direction: the only prior
-    // verification of this binding ever grabbed "se".
-    // ═════════════════════════════════════════════════════════════════════
-    if ( otherAppIds.length > 0 ) {
-        const resizeTarget = otherAppIds[0];
-        // 🔴 NOT `[bootAppId, ...otherAppIds]`: the full-bleed boot app is
-        // `data-stay_on_top="true"` (`UIWindow.js` ~L122-124, set whenever
-        // `window.is_fullpage_mode`), which pins its z-index to a fixed
-        // ~99999999 band that NEVER changes on focus (`window_zindex_base`,
-        // ~L4111-4114) and is always higher than any ordinary window's
-        // small counter-based z-index. Including it here would make
-        // "settings/preview/code is topmost" permanently unsatisfiable —
-        // the exact "broken assertion, not a product bug" trap this file's
-        // own `titlebarPoint` doc block warns about. Every OTHER real
-        // per-app raise check in this file (`otherAppIds` loop, round-robin)
-        // already excludes it for the same reason.
-        const resizeContenders = [...otherAppIds];
-        for ( const dir of ['se', 'nw', 'e'] ) {
-            await testResizeHandleRaisesAndResizes(resizeTarget, dir, resizeContenders, `${VP} resize-handle regression`);
-        }
     }
 
     // ═════════════════════════════════════════════════════════════════════
