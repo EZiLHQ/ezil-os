@@ -505,6 +505,139 @@ export async function requestGuacamoleSandboxTerminate(
     }
 }
 
+// ─── Window-focus control (POST /sandbox/:name/focus) ─────────────────────────
+
+/**
+ * The apps this product will ask the container to focus.
+ *
+ * 🔴 THIS IS DELIBERATELY NARROWER THAN THE WORKER'S ENUM, and the difference
+ * is the whole point. `worker/src/sandbox-control.ts`'s `validateFocusApp`
+ * accepts `'vscode' | 'chromium'`, because the Worker is a generic primitive
+ * over `/usr/local/bin/neko-switch-app.sh` and has no business deciding which
+ * apps a given container image ships.
+ *
+ * The image no longer ships one of them. Wave A's container task replaced
+ * Electron VS Code with **code-server**, which is an HTTP server on
+ * `127.0.0.1:8443`, not an X client — so it never appears in `wmctrl -x -l`
+ * and can never be focused. `neko-switch-app.sh`'s own heredoc in
+ * `worker/scripts/start-neko.sh` says so ("The `vscode` case now has no window
+ * to ever find … prints an ERROR to stderr and exits 1"), and
+ * `worker/scripts/validate-neko-focus.sh` ASSERTS that non-zero exit as the
+ * correct behaviour. `handleFocus` turns a non-zero exit into HTTP 500.
+ *
+ * So offering `'vscode'` here would be a control that fails 100% of the time —
+ * the exact class of thing the container task deleted from
+ * `worker/assets/ebuilder-menu.xml` ("Focus VS Code", a visible menu item that
+ * silently did nothing). The reconciliation is to narrow at THIS layer, where
+ * the product decision lives, and leave the Worker's generic enum alone.
+ *
+ * Reaching code-server is a different mechanism entirely, not a focus call:
+ * it is served over the code bridge host (`CODE_PREVIEW_PORT` 8443 /
+ * `CODE_PREVIEW_TOKEN` 'code'), which `worker/src/index.ts` `handleCodeBridge`
+ * already proxies. Wiring a window for it is a feature, not a seam; see the
+ * Wave A seams report.
+ *
+ * TO RE-ADD an app: put its id here AND confirm it has a real X window in the
+ * shipped image (`validate-neko-focus.sh` is the check). Both, or neither.
+ */
+export const FOCUSABLE_APPS = ['chromium'] as const;
+
+export type FocusableApp = (typeof FOCUSABLE_APPS)[number];
+
+/** Type guard for the closed enum above. */
+export function isFocusableApp(value: unknown): value is FocusableApp {
+    return typeof value === 'string' && (FOCUSABLE_APPS as readonly string[]).includes(value);
+}
+
+export interface GuacamoleFocusResult {
+    ok: boolean;
+    /** The Worker's own error string, when it answered at all. */
+    error?: string;
+}
+
+/**
+ * Ask the Worker to foreground an app inside the container's X session.
+ *
+ * Signed with the SAME HMAC envelope as `DELETE /sandbox/:name` and
+ * `POST /sandbox/preview` (`mintSandboxPreviewToken`), presented as
+ * `Authorization: Bearer` — the transport `authorizeSignedControlRequest`
+ * prefers precisely because it keeps the token out of URLs and request logs.
+ * No new auth scheme.
+ *
+ * NEVER THROWS. A transport failure, a 401, a `SANDBOX_FOCUS=off` 404 or a
+ * non-zero `neko-switch-app.sh` exit all come back as `{ ok: false, error }`.
+ * A resolved promise is NOT a confirmed focus switch — callers must read `ok`,
+ * and the shell must never claim the pixel changed on the strength of it (the
+ * round trip is a real completion signal for the REQUEST; the encoder catching
+ * up is a separate, estimated thing).
+ */
+export async function requestGuacamoleFocusApp(
+    config: CloudflareGuacamoleConfig,
+    hmacSecret: string,
+    sandboxName: string,
+    app: FocusableApp,
+    correlationId: string = newCorrelationId(),
+): Promise<GuacamoleFocusResult> {
+    if (!config.isConfigured) {
+        return { ok: false, error: 'provider_not_configured' };
+    }
+
+    const token = mintSandboxPreviewToken(hmacSecret);
+    const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/focus`;
+
+    try {
+        const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                [CORRELATION_HEADER]: correlationId,
+            },
+            body: JSON.stringify({ app }),
+            // Generous against the measured 150-400ms round trip, and well
+            // under any route budget: this must not sit on a slow path.
+            signal: AbortSignal.timeout(15_000),
+        });
+
+        // The Worker answers a failed switch as 500 WITH a JSON body carrying
+        // the reason, so parse either way — same reasoning as
+        // `requestGuacamoleSandboxTerminate`.
+        const text = await res.text().catch(() => '');
+        let data: { ok?: unknown; error?: unknown } = {};
+        try {
+            data = text ? (JSON.parse(text) as typeof data) : {};
+        } catch {
+            // Non-JSON (an edge error page). The raw text still reaches the log.
+        }
+
+        if (!res.ok || data.ok !== true) {
+            console.warn('[cloudflare-guacamole] focus request rejected', {
+                sandboxName,
+                app,
+                status: res.status,
+                body: text.slice(0, 300),
+            });
+            return {
+                ok: false,
+                error:
+                    typeof data.error === 'string'
+                        ? data.error
+                        : `worker_http_${res.status}: ${text.slice(0, 300)}`,
+            };
+        }
+
+        return { ok: true };
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn('[cloudflare-guacamole] focus request failed (non-fatal):', {
+            sandboxName,
+            app,
+            error: message,
+        });
+        return { ok: false, error: message };
+    }
+}
+
 /** Health-check the named sandbox. */
 export async function getGuacamoleSandboxStatus(
     config: CloudflareGuacamoleConfig,

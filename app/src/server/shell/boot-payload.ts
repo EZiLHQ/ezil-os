@@ -55,6 +55,16 @@ export const SHELL_API_ROUTES = {
      * comment for why this must never be cached across a long idle.
      */
     previewUrl: '/api/shell/preview-url',
+    /**
+     * POST = foreground an app inside the container's X session
+     * (`{ computerId, app }`). The shell's in-stream switcher FEATURE-DETECTS
+     * this key: `shell/ezil/apps/desktop-window.js` reads
+     * `desktopState.endpoints.focus` and draws no switcher at all when it is
+     * absent, rather than POST to a URL it invented. So this entry is not
+     * documentation — it is the switch that turns the control on, and it must
+     * only be present while `src/app/api/shell/focus/route.ts` exists.
+     */
+    focus: '/api/shell/focus',
 } as const;
 
 export interface ShellBootUser {
