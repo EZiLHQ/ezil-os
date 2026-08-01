@@ -786,6 +786,33 @@ describe('POST /sandbox/preview returns appPreviewUrl + codePreviewUrl', () => {
     }
   });
 
+  it('🔴 still returns both URLs on a WARM call (desktop already exposed)', async () => {
+    // The second and every subsequent /sandbox/preview for a project takes
+    // ensureDesktop's already-exposed fast path, which skips re-exposure. If
+    // that path reports the bridge ports as not-exposed, the URLs go null and
+    // the shell gets a working window on the first open of a project and an
+    // empty one forever after — a 200 with no error anywhere. `getExposedPorts`
+    // is the authority and is already fetched on that path.
+    const host = 'ezil.org';
+    const id = 'guac-warmwarmwarmwarm-poolpoolpoolpool';
+    const { binding, calls } = fakeSandboxNamespace({
+      exposedPorts: [
+        { port: 8181, url: `https://8181-${id}-nekodesktop.${host}`, status: 'open' },
+        { port: 3002, url: `https://3002-${id}-app.${host}`, status: 'open' },
+        { port: 8443, url: `https://8443-${id}-code.${host}`, status: 'open' },
+      ],
+    });
+    const { res, body } = await preview({}, binding);
+
+    expect(res.status).toBe(200);
+    // Fast path really was taken: nothing was re-exposed.
+    expect(calls.exposePort).toHaveLength(0);
+    expect(String(body.appPreviewUrl)).toContain(`3002-${id}-app.${host}/preview-bootstrap?token=`);
+    expect(String(body.codePreviewUrl)).toContain(`8443-${id}-code.${host}/preview-bootstrap?token=`);
+    expect((body.codePreviewExpose as { attempted: boolean; exposed: boolean }).attempted).toBe(false);
+    expect((body.codePreviewExpose as { attempted: boolean; exposed: boolean }).exposed).toBe(true);
+  });
+
   it('is null (never absent) when the port could not be exposed', async () => {
     // Desktop port (8181) still exposes; the two bridge ports throw, which is
     // exactly the shape of the original port-3000 reservation bug. The preview
