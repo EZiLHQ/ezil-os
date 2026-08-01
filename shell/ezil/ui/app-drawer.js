@@ -57,6 +57,43 @@ const PHASE = 'ezil-os:drawer';
  *   ../apps/desktop-window.js.
  * @returns {HTMLElement|null} the drawer element, or null if it could not attach.
  */
+/**
+ * Tell the stylesheet how many buttons the tray is actually carrying.
+ *
+ * 🔴 WHY THIS EXISTS — a real defect, found in composition, twice over.
+ * `src/css/dashboard.css` (Puter-derived, and not ours to restructure) sizes
+ * the open tray from a calc written for EXACTLY two buttons:
+ *
+ *   --open-w: calc(12px + --icon + --i2t + --title-w + --t2b + --btn + 2px + --btn + 10px)
+ *
+ * and `.dashboard-app-drawer-clip` is `overflow: hidden`. Any third button is
+ * therefore present in the DOM, and invisible and unclickable on screen. The
+ * Settings task hit this and widened the calc by hand, for exactly three. Then
+ * the app switcher arrived and made it four, which would have silently clipped
+ * again — and, being a DOM-level pass, would have gone on passing every test.
+ *
+ * A hand-written constant for N buttons is a landmine that re-arms itself
+ * every time someone adds one. So the count becomes DATA: this writes
+ * `--btn-count` on the drawer, and `ezil-shell.css` derives `--open-w` from it
+ * with the same formula generalised. Both call sites that can change the
+ * count — `attach_app_drawer` below and `Settings/drawer-action.js`, which
+ * injects after the fact — call this, and it is idempotent.
+ *
+ * Only the TOTAL is redefined, never any part, so dashboard.css's
+ * `(pointer: coarse)` and `(max-width: 500px)` overrides of `--btn` /
+ * `--title-w` / `--t2b` still flow through the calc unchanged: custom
+ * properties in a calc resolve at use time.
+ *
+ * @param {HTMLElement|null} drawer the `.dashboard-app-drawer` element
+ */
+export function sync_drawer_width (drawer) {
+    if ( ! drawer ) return;
+    const n = drawer.querySelectorAll('.dashboard-app-drawer-btn').length;
+    // A drawer with no buttons is not a state this produces (Close is
+    // unconditional), but never write a 0 that would collapse the calc.
+    drawer.style.setProperty('--btn-count', String(Math.max(1, n)));
+}
+
 export function attach_app_drawer (el_window, options = {}) {
     if ( ! el_window ) {
         console.error(`[${PHASE}] refusing to attach to a null window`);
@@ -144,6 +181,8 @@ export function attach_app_drawer (el_window, options = {}) {
             + '<line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>',
         onClick: options.on_close ?? ((el) => { $(el).close(); }),
     }, 'dashboard-app-drawer-close');
+
+    sync_drawer_width(drawer);
 
     // Hover pulls the drawer open and leaving lets it settle — mouse only: a
     // touch tap synthesizes a pointerenter right before its click, which would

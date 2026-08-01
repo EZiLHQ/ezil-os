@@ -316,3 +316,38 @@ body.device-phone {
 .ezil-desktop-window.ezil-fullbleed > .ui-resizable-handle {
     display: none;
 }
+
+/* ── the control tray's open width, derived from its button count ──────────
+ *
+ * 🔴 REPLACES A LANDMINE THAT RE-ARMED ITSELF. `src/css/dashboard.css:52`
+ * (Puter-derived) sizes the tray with a calc written out longhand for EXACTLY
+ * two buttons, and `.dashboard-app-drawer-clip` is `overflow: hidden`, so an
+ * extra button is present in the DOM and invisible on screen — a failure that
+ * passes every DOM-level test. The Settings wave hit this and rewrote the calc
+ * longhand for exactly three. The app switcher then made it four.
+ *
+ * The count is now DATA: `sync_drawer_width()` (`app-drawer.js`) writes
+ * `--btn-count` on the drawer whenever the button set changes — at attach, and
+ * again after `Settings/drawer-action.js` injects — and this generalises
+ * dashboard.css's own formula over it. `n` buttons occupy `n * --btn` plus the
+ * `(n - 1)` 2px gaps between them, which is exactly what the two-button
+ * original spells out.
+ *
+ * Only the TOTAL is redefined. dashboard.css's `(pointer: coarse)` and
+ * `(max-width: 500px)` overrides of `--btn` / `--title-w` / `--t2b` still flow
+ * through unchanged, because custom properties inside a calc resolve at use
+ * time, not at declaration time.
+ *
+ * The `2` fallback reproduces upstream's geometry exactly for any drawer that
+ * never got a count — this rule can only ever widen a tray, never break one.
+ *
+ * Same specificity as dashboard.css's own `.dashboard-app-drawer`; it wins on
+ * source order, because build-shell.sh concatenates `ezil/**` last. */
+.dashboard-app-drawer {
+    --open-w: calc(
+        12px + var(--icon) + var(--i2t) + var(--title-w) + var(--t2b)
+        + var(--btn) * var(--btn-count, 2)
+        + 2px * (var(--btn-count, 2) - 1)
+        + 10px
+    );
+}

@@ -51,9 +51,9 @@
 // reach. See the two 🔴 blocks below and `../ui/Settings/drawer-action.js`.
 
 import { openDesktopWindow } from './desktop-window.js';
+import { openPreviewWindow } from './preview.js';
 import { openSettingsWindow } from '../ui/Settings/index.js';
 import { ensureSettingsDrawerButton, SETTINGS_DRAWER_SVG } from '../ui/Settings/drawer-action.js';
-import UIWindow from '../../src/UI/UIWindow.js';
 
 const PHASE = 'ezil-os:apps';
 
@@ -102,41 +102,19 @@ const SETTINGS_ICON = 'data:image/svg+xml,' + encodeURIComponent(
     + '</svg>',
 );
 
-/**
- * 🔴 PREVIEW_PLACEHOLDER_NOTE — read before replacing this.
- *
- * The brief for this task ("wave-a/t3-shell-settings") says to register a
- * Preview entry here because "T4 writes the preview app file itself but
- * does not own the registry" — i.e. this file's job is to add the entry,
- * a DIFFERENT task's job is to write what it opens. At the time this was
- * written, no such file exists yet anywhere under `shell/` (checked: no
- * `*preview*` path in this tree). Waves run in separate git worktrees off
- * the same base commit, so T4's file living in ITS worktree does not make
- * it exist in THIS one — importing it statically here (`import { x } from
- * './preview-window.js'`) would make esbuild fail to resolve it and break
- * this task's own build, for a task this one does not control the timing
- * of.
- *
- * So this stays a self-contained placeholder — a real, working window, not
- * a silent no-op — until whoever lands the real Preview app replaces the
- * body of `open` below with an import of it. That is a one-line change
- * here, in a file this task DOES own, so it is not blocked on anyone.
- */
-async function openPreviewPlaceholder (ctx = {}) {
-    return UIWindow({
-        title: 'Preview',
-        app: 'preview',
-        icon: ctx.icon,
-        body_content: '<div style="padding:24px;color:#b9b9b7;font:13px sans-serif;">'
-            + 'Preview is not built yet in this deployment.</div>',
-        width: 420,
-        height: 220,
-        is_resizable: true,
-        single_instance: true,
-        show_in_taskbar: true,
-        window_class: 'ezil-preview-window',
-    });
-}
+/** Preview's icon — the same construction and the same reasoning as the two above. */
+const PREVIEW_ICON = 'data:image/svg+xml,' + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">'
+    + '<defs><linearGradient id="gp" x1="0" y1="0" x2="0" y2="1">'
+    + '<stop offset="0" stop-color="#1f4d50"/><stop offset="1" stop-color="#12292b"/>'
+    + '</linearGradient></defs>'
+    + '<rect width="48" height="48" rx="11" fill="url(#gp)"/>'
+    + '<rect x="10" y="11" width="28" height="26" rx="3" fill="none" stroke="#00adb5" stroke-width="2.4"/>'
+    + '<path d="M10 18h28" fill="none" stroke="#00adb5" stroke-width="2.4"/>'
+    + '<circle cx="14.5" cy="14.5" r="1.3" fill="#00adb5"/>'
+    + '<circle cx="19" cy="14.5" r="1.3" fill="#00adb5"/>'
+    + '</svg>',
+);
 
 /**
  * @typedef {object} AppDescriptor
@@ -205,15 +183,34 @@ export const APPS = [
     {
         id: 'preview',
         name: 'Preview',
-        icon: SETTINGS_ICON,
+        // Was `SETTINGS_ICON` — a placeholder entry inherited the gear, so
+        // Start listed two identical icons with different names.
+        icon: PREVIEW_ICON,
+        // Not pinned: the dock is for the two things a session is built
+        // around. `boot.js`'s Start menu lists every resolved app regardless
+        // of `pinned`, so this is reachable in one click from there —
+        // verified by `preview-test.mjs`, because "reachable" is exactly the
+        // kind of claim that turns out to be false.
         pinned: false,
         single_instance: true,
-        // Same reasoning as `settings`: whatever T4 lands runs in this
-        // bundle. If Preview ever grows a host-side dependency, this is the
-        // flag to clear.
+        // 🔴 Shell-local, and it has to stay that way for this to be
+        // reachable at all. `SHELL_APPS` in
+        // `app/src/server/shell/boot-payload.ts` is `[{id:'desktop'}]`, an
+        // explicit non-empty list, so `resolve()`'s intersection would
+        // otherwise drop `preview` out of every real boot — the exact defect
+        // the Settings task found on itself. The window IS backed by a host
+        // route (`/api/shell/preview-url`), but that route is not a
+        // PROVISIONED CAPABILITY the server could fail to offer for one user
+        // and not another; when it cannot serve a preview the window says so
+        // (`show_unavailable()`). A missing icon cannot say anything.
         shell_local: true,
-        // See PREVIEW_PLACEHOLDER_NOTE above — replace this, not the entry.
-        open: openPreviewPlaceholder,
+        // 🔴 The real window, at last. This entry pointed at a
+        // `openPreviewPlaceholder` stub ("Preview is not built yet in this
+        // deployment") for the whole of Wave A, because the file it needed
+        // was being written in a sibling worktree and a static import would
+        // not have resolved. Both files are in this tree now, so the import
+        // is real and the stub is gone.
+        open: openPreviewWindow,
     },
 ];
 

@@ -119,6 +119,8 @@ export function payload () {
 export const ENDPOINTS = {
     session: '/api/shell/session',
     desktop: '/api/shell/desktop',
+    previewUrl: '/api/shell/preview-url',
+    focus: '/api/shell/focus',
 };
 
 /** The payload carries its own endpoint map; prefer it, fall back to the mirror. */
@@ -251,6 +253,90 @@ export async function openDesktop (computerId) {
 }
 
 /**
+ * `POST /api/shell/preview-url` — mint a FRESH app-preview window URL.
+ *
+ * 🔴 CALL THIS AT WINDOW-OPEN, EVERY TIME. NEVER STASH THE RESULT.
+ *
+ * The URL it returns is `…/preview-bootstrap?token=…`, and that token is good
+ * for FIVE MINUTES (`APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS`, enforced by the
+ * Worker's `verifyPreviewBootstrapToken`). This is the whole reason the URL is
+ * not in the boot payload: that payload is built once, at page load, and a
+ * user who opens a Preview window ten minutes later would navigate to a dead
+ * token and get a blank window plus `preview_bootstrap_token_expired`. There
+ * is nothing in the failure a user could act on and nothing in the UI that
+ * could explain it.
+ *
+ * The protection is structural, not a TTL check: there is no cache here, no
+ * module-level variable holding a URL, and nothing on `session.payload()` to
+ * read one from. The only way to obtain one is to call this, and the only
+ * honest place to call it is immediately before navigating a frame to it.
+ *
+ * This can be SLOW — it may cold-boot the container (~22s measured), exactly
+ * like `openDesktop`, so it takes the same budget.
+ *
+ * @returns {Promise<{ok: true, url: string, expiresAt?: number}
+ *                  | {ok: false, errorCode: string, message?: string}>}
+ */
+export async function previewUrl (computerId) {
+    if ( ! computerId ) {
+        return { ok: false, errorCode: 'bad_request', message: 'No computer to preview.' };
+    }
+    const res = await request(endpoint('previewUrl'), {
+        method: 'POST',
+        body: { computerId },
+        timeoutMs: DESKTOP_BOOT_TIMEOUT_MS,
+    });
+
+    if ( ! res.ok ) {
+        if ( res.code === 'TIMEOUT' ) return { ok: false, errorCode: 'timeout', message: res.message };
+        if ( res.code === 'NETWORK' ) return { ok: false, errorCode: 'fetch_failed', message: res.message };
+        if ( res.code === 'UNAUTHORIZED' ) return { ok: false, errorCode: 'unauthorized', message: res.message };
+        return { ok: false, errorCode: 'unknown', message: res.message };
+    }
+
+    const data = res.data ?? {};
+    if ( data.ok !== true ) {
+        return { ok: false, errorCode: data.errorCode ?? 'unknown' };
+    }
+    if ( typeof data.appPreviewUrl !== 'string' || data.appPreviewUrl === '' ) {
+        // Reported success with nothing to show. Loud, not silent — same rule
+        // as `openDesktop` above.
+        console.error('[ezil-os:session] appPreviewUrl returned ok with no URL');
+        return { ok: false, errorCode: 'unknown' };
+    }
+    return { ok: true, url: data.appPreviewUrl, expiresAt: data.expiresAt };
+}
+
+/**
+ * `POST /api/shell/focus` — raise an app's window inside the container's X
+ * session, changing what the desktop stream shows.
+ *
+ * `app` is validated SERVER-side against `FOCUSABLE_APPS`
+ * (`app/src/server/lib/cloudflare-guacamole-provider.ts`) and anything else is
+ * a 400. The shell does not keep its own copy of that list to check against:
+ * two lists is how they drift, and the whole reason this endpoint needed
+ * reconciling in the first place was three copies of an app enum disagreeing.
+ *
+ * @returns {Promise<boolean|undefined>} `true`/`false` is a real answer from
+ *   the server. `undefined` means OUR request never landed (offline, timeout)
+ *   and must not be read as either verdict. Even `true` only means the request
+ *   completed — nothing here can observe that the pixel changed, and no caller
+ *   may claim it did.
+ */
+export async function focusApp (computerId, app, timeoutMs = STATUS_TIMEOUT_MS) {
+    if ( ! computerId || ! app ) return false;
+    const res = await request(endpoint('focus'), {
+        method: 'POST',
+        body: { computerId, app },
+        timeoutMs,
+    });
+    // A transport failure is not an observation of the container.
+    if ( ! res.ok && (res.code === 'TIMEOUT' || res.code === 'NETWORK') ) return undefined;
+    if ( ! res.ok ) return false;
+    return res.data?.ok === true;
+}
+
+/**
  * `GET /api/shell/desktop?confirm=frame` — ask the server to check, right now,
  * that the URL the iframe is showing is a desktop and not an error page.
  *
@@ -301,6 +387,7 @@ export default {
     payload,
     readSession, openSession,
     openDesktop, desktopRunning, confirmFrame,
+    previewUrl, focusApp,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
 };
