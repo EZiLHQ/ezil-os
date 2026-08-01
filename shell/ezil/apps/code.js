@@ -238,13 +238,11 @@ export async function openCodeWindow (ctx = {}) {
     // BootProgress state, and blurring them would say something untrue. No
     // Retry: the next attempt fails identically until the deployment changes.
     const el_unavailable = document.createElement('div');
+    // Styles live in `ezil-shell.css`, NOT inline: an inline `display` beats
+    // the UA's `[hidden] { display: none }`, so `hidden = true` below would
+    // hide nothing and this panel would paint over a working iframe forever.
     el_unavailable.className = 'ezil-code-unavailable';
     el_unavailable.hidden = true;
-    Object.assign(el_unavailable.style, {
-        position: 'absolute', inset: '0', display: 'flex', flexDirection: 'column',
-        alignItems: 'center', justifyContent: 'center', gap: '8px', padding: '24px',
-        textAlign: 'center', background: '#fff', color: '#333',
-    });
     el_unavailable.innerHTML = `
         <div style="font-size:15px;font-weight:600;">Code isn't available yet</div>
         <div style="font-size:13px;max-width:32em;opacity:0.75;">
