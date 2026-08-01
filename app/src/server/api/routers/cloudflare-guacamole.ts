@@ -5,11 +5,12 @@
  * Cloudflare Worker that actually runs their desktop.
  *
  * Procedures:
- *   cloudflareGuacamole.isConfigured  — check whether env vars are present
- *   cloudflareGuacamole.previewUrl    — get/create a desktop preview URL
- *   cloudflareGuacamole.appPreviewUrl — mint a fresh app-preview window URL
- *   cloudflareGuacamole.status        — health-check a computer's sandbox
- *   cloudflareGuacamole.terminate     — request sandbox teardown
+ *   cloudflareGuacamole.isConfigured   — check whether env vars are present
+ *   cloudflareGuacamole.previewUrl     — get/create a desktop preview URL
+ *   cloudflareGuacamole.appPreviewUrl  — mint a fresh app-preview window URL
+ *   cloudflareGuacamole.codePreviewUrl — mint a fresh code-server window URL
+ *   cloudflareGuacamole.status         — health-check a computer's sandbox
+ *   cloudflareGuacamole.terminate      — request sandbox teardown
  *
  * Security:
  *   - The Worker URL and HMAC secret NEVER reach the browser.
@@ -39,6 +40,7 @@ import {
     composeAppPreviewBootstrapUrl,
     composeAppPreviewOrigin,
     composeBrowserDesktopUrl,
+    composeCodePreviewOrigin,
     deriveGuacamoleSandboxId,
     deriveNekoAdminValue,
     enableImplicitHosting,
@@ -422,6 +424,159 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 ok: true as const,
                 correlationId,
                 appPreviewUrl,
+                expiresAt: Date.now() + APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
+                provider: 'cloudflare-guacamole' as const,
+            };
+        }),
+
+    /**
+     * Mint a fresh code-server window URL for the given computer's sandbox.
+     *
+     * MODIFIED BY EZIL 2026-08-01 (T7): this is `appPreviewUrl` above, applied
+     * to the code-server bridge instead of the app-preview one — same Worker
+     * call, same bootstrap-token contract, same three-state
+     * `readWorkerBridgeUrl` reasoning, same "call per window-open, never
+     * cache" rule (the whole gap this task closes: the Worker has returned
+     * `codePreviewUrl` since Wave A and nothing on the app side ever read it —
+     * see `cloudflare-guacamole-provider.ts`'s `GuacamolePreviewSuccess`
+     * doc comment).
+     *
+     * Deliberately a SEPARATE procedure rather than a parameterised
+     * `previewUrl({computerId, target})`: the two bridges differ in exactly
+     * the fields read off `result` (`codePreviewExpose`/`codePreviewUrl` vs.
+     * `appPreviewExpose`/`appPreviewUrl`) and in the fallback compose helper
+     * (`composeCodePreviewOrigin` vs. `composeAppPreviewOrigin`) — a shared
+     * implementation would need a runtime branch on every one of those, for a
+     * function this short. Two readable procedures beat one branchy one.
+     *
+     * Reuses the exact SAME `/sandbox/preview` Worker call `appPreviewUrl`
+     * makes — the Worker mints/returns both bridge URLs on one round trip —
+     * which is why `../../../app/api/shell/code-preview-url/route.ts` needs
+     * the same extended `maxDuration` as `../preview-url/route.ts`.
+     */
+    codePreviewUrl: protectedProcedure
+        .input(z.object({ computerId: z.string().uuid() }))
+        .query(async ({ ctx, input }) => {
+            await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+
+            const config = resolveCloudflareGuacamoleConfig();
+            if (!config.isConfigured) {
+                return {
+                    ok: false as const,
+                    error: 'cloudflare_guacamole_not_configured',
+                    provider: 'cloudflare-guacamole' as const,
+                };
+            }
+
+            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+            const correlationId = newCorrelationId();
+
+            const result = await requestGuacamolePreview(
+                config,
+                hmacSecret,
+                {
+                    sessionId: input.computerId,
+                    userId: ctx.user.id,
+                    projectId: input.computerId,
+                    desktopMode: 'neko',
+                },
+                correlationId,
+            );
+
+            if (!result.ok) {
+                const logSafe = result.error.slice(0, 200);
+                console.error('[cloudflareGuacamole.codePreviewUrl] worker error', {
+                    correlationId,
+                    computerId: input.computerId,
+                    error: logSafe,
+                    errorCode: result.errorCode,
+                    retryable: result.retryable,
+                });
+
+                if (result.errorCode && (!result.retryable || OPERATIONAL_ERROR_CODES.has(result.errorCode))) {
+                    return {
+                        ok: false as const,
+                        error: logSafe,
+                        errorCode: result.errorCode,
+                        provider: 'cloudflare-guacamole' as const,
+                    };
+                }
+
+                throw new TRPCError({
+                    code: 'BAD_GATEWAY',
+                    message: `Desktop Worker returned an error (correlationId=${correlationId}). Check server logs for details.`,
+                });
+            }
+
+            const sandboxId = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
+
+            // Same rule as `appPreviewUrl`'s `appPreviewExpose` check above:
+            // `attempted: false` is never a negative on its own (either
+            // guacamole mode has no code-server surface, or a prior call
+            // already exposed it and the fast path skipped re-attempting).
+            // Only an OBSERVED `attempted: true, exposed: false` is refused.
+            if (result.codePreviewExpose?.attempted && !result.codePreviewExpose.exposed) {
+                console.error('[cloudflareGuacamole.codePreviewUrl] code-preview port exposure failed', {
+                    correlationId,
+                    computerId: input.computerId,
+                    error: result.codePreviewExpose.error,
+                });
+                return {
+                    ok: false as const,
+                    error: result.codePreviewExpose.error ?? 'code_preview_expose_failed',
+                    errorCode: 'code_preview_unavailable' as const,
+                    provider: 'cloudflare-guacamole' as const,
+                };
+            }
+
+            // Prefer the Worker's own composed URL; fall back to composing
+            // ours only when this Worker predates the field. See
+            // `readWorkerBridgeUrl`'s doc comment — same three-state contract
+            // `appPreviewUrl` above already relies on.
+            const verdict = readWorkerBridgeUrl(result.codePreviewUrl);
+            if (verdict.kind === 'refuse') {
+                console.error('[cloudflareGuacamole.codePreviewUrl] worker reports the code-preview port is not exposed', {
+                    correlationId,
+                    computerId: input.computerId,
+                });
+                return {
+                    ok: false as const,
+                    error: 'code_preview_port_not_exposed',
+                    errorCode: 'code_preview_unavailable' as const,
+                    provider: 'cloudflare-guacamole' as const,
+                };
+            }
+            if (verdict.kind === 'use') {
+                return {
+                    ok: true as const,
+                    correlationId,
+                    codePreviewUrl: verdict.url,
+                    expiresAt: Date.now() + APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
+                    provider: 'cloudflare-guacamole' as const,
+                };
+            }
+
+            const codePreviewOrigin = composeCodePreviewOrigin(result.guacamoleUrl, sandboxId);
+            if (!codePreviewOrigin) {
+                console.error('[cloudflareGuacamole.codePreviewUrl] could not derive a code-preview origin', {
+                    correlationId,
+                    computerId: input.computerId,
+                });
+                return {
+                    ok: false as const,
+                    error: 'code_preview_origin_unresolvable',
+                    errorCode: 'code_preview_unavailable' as const,
+                    provider: 'cloudflare-guacamole' as const,
+                };
+            }
+
+            const token = mintAppPreviewBootstrapToken(hmacSecret, sandboxId);
+            const codePreviewUrl = composeAppPreviewBootstrapUrl(codePreviewOrigin, token);
+
+            return {
+                ok: true as const,
+                correlationId,
+                codePreviewUrl,
                 expiresAt: Date.now() + APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
                 provider: 'cloudflare-guacamole' as const,
             };
