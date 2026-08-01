@@ -1,0 +1,390 @@
+/* settings.css — EZiL-authored. Not Puter code.
+ *
+ * Chrome for the Settings window ONLY, under classes prefixed
+ * `ezil-settings-*` so nothing here can collide with the ported
+ * `dashboard-*` rules in `shell/src/css/dashboard.css` (not owned by this
+ * task, and styling a different thing — the full-bleed control drawer, not
+ * a sidebar). `build-shell.sh`'s `css_inputs` glob picks this file up
+ * automatically (`find "$here/ezil" -name '*.css'`), so no build-script
+ * change was needed.
+ *
+ * Palette matches `ezil-tokens.css`'s documented source of truth
+ * (`app/src/app/globals.css`'s `@theme inline`): charcoal #161616,
+ * charcoal-light #1f1f1f, offwhite #f5f5f4, teal #00adb5. Hardcoded rather
+ * than read via `var(--color-*)` because those custom properties are
+ * declared in the Next app's own stylesheet, not in anything this shell
+ * bundle ships — depending on them would make this window's colours a
+ * silent function of which page happens to have loaded first.
+ *
+ * MODIFIED BY EZIL 2026-08-01: added the one rule in this file that is NOT
+ * `ezil-settings-*`-prefixed — `.dashboard-app-drawer.ezil-has-settings-action`
+ * at the bottom, which widens the Puter-derived control tray so EZiL's third
+ * button is not clipped. `shell/src/css/dashboard.css` itself is untouched;
+ * see PUTER-PROVENANCE.md, "The one place EZiL code styles a Puter-derived
+ * selector from outside `src/`".
+ */
+
+.ezil-settings-window .window-body {
+    background: #161616;
+    color: #f5f5f4;
+}
+
+.ezil-settings {
+    display: flex;
+    height: 100%;
+    width: 100%;
+    font-size: 13px;
+}
+
+/* ── sidebar ────────────────────────────────────────────────────────────── */
+
+.ezil-settings-sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 176px;
+    flex-shrink: 0;
+    padding: 12px 8px;
+    background: #1a1a1a;
+    border-right: 1px solid rgba(245, 245, 244, 0.08);
+    overflow-y: auto;
+}
+
+.ezil-settings-tab {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 8px 10px;
+    border: none;
+    background: transparent;
+    color: #b9b9b7;
+    border-radius: 6px;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.ezil-settings-tab:hover {
+    background: rgba(245, 245, 244, 0.06);
+    color: #f5f5f4;
+}
+
+.ezil-settings-tab.active {
+    background: rgba(0, 173, 181, 0.16);
+    color: #f5f5f4;
+}
+
+.ezil-settings-tab-icon {
+    display: inline-flex;
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+}
+
+.ezil-settings-tab-icon svg {
+    width: 100%;
+    height: 100%;
+}
+
+.ezil-settings-tab.active .ezil-settings-tab-icon {
+    color: #00adb5;
+}
+
+/* ── content ────────────────────────────────────────────────────────────── */
+
+.ezil-settings-content {
+    flex: 1;
+    min-width: 0;
+    overflow-y: auto;
+    padding: 20px 24px 24px;
+}
+
+.ezil-settings-pane {
+    display: none;
+}
+
+.ezil-settings-pane.active {
+    display: block;
+}
+
+.ezil-settings-content h3 {
+    margin: 0 0 6px;
+    font-size: 16px;
+    font-weight: 600;
+    color: #f5f5f4;
+}
+
+.ezil-settings-content h4 {
+    margin: 0 0 6px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #8a8a88;
+}
+
+.ezil-settings-lead {
+    margin: 0 0 16px;
+    color: #b9b9b7;
+    line-height: 1.5;
+}
+
+.ezil-settings-section {
+    margin: 0 0 22px;
+}
+
+.ezil-settings-section p {
+    margin: 0 0 8px;
+    line-height: 1.55;
+    color: #cfcfce;
+}
+
+.ezil-settings-section a {
+    color: #00adb5;
+}
+
+.ezil-settings-section code {
+    background: rgba(245, 245, 244, 0.08);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 0.9em;
+}
+
+.ezil-settings-muted {
+    color: #7d7d7b;
+}
+
+/* ── buttons ────────────────────────────────────────────────────────────── */
+
+.ezil-settings-btn {
+    padding: 6px 12px;
+    border-radius: 6px;
+    border: 1px solid rgba(245, 245, 244, 0.15);
+    background: rgba(245, 245, 244, 0.04);
+    color: #f5f5f4;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.ezil-settings-btn:hover:not(:disabled) {
+    background: rgba(245, 245, 244, 0.1);
+}
+
+.ezil-settings-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.ezil-settings-btn-primary {
+    background: #00adb5;
+    border-color: #00adb5;
+    color: #06181a;
+    font-weight: 600;
+}
+
+.ezil-settings-btn-primary:hover:not(:disabled) {
+    background: #05c2cb;
+}
+
+.ezil-settings-btn-danger {
+    color: #ff8a80;
+    border-color: rgba(255, 138, 128, 0.35);
+}
+
+.ezil-settings-btn-danger:hover:not(:disabled) {
+    background: rgba(255, 138, 128, 0.12);
+}
+
+.ezil-settings-pill {
+    padding: 3px 10px;
+    border-radius: 999px;
+    background: rgba(0, 173, 181, 0.18);
+    color: #4fd8de;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+/* ── computers tab ──────────────────────────────────────────────────────── */
+
+.ezil-settings-slot-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.ezil-settings-loading,
+.ezil-settings-error {
+    padding: 14px;
+    color: #b9b9b7;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.ezil-settings-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    border-radius: 8px;
+    border: 1px solid rgba(245, 245, 244, 0.1);
+    background: #1f1f1f;
+}
+
+.ezil-settings-row.active {
+    border-color: rgba(0, 173, 181, 0.5);
+}
+
+.ezil-settings-row-empty {
+    border-style: dashed;
+    background: transparent;
+}
+
+.ezil-settings-row-slot {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    flex-shrink: 0;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.3);
+    color: #8a8a88;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.ezil-settings-row-meta {
+    flex: 1;
+    min-width: 0;
+}
+
+.ezil-settings-row-name {
+    font-weight: 500;
+    color: #f5f5f4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.ezil-settings-row-sub {
+    font-size: 11px;
+    color: #8a8a88;
+    margin-top: 2px;
+}
+
+.ezil-settings-row-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.ezil-settings-rename-form {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1;
+    min-width: 0;
+}
+
+.ezil-settings-input {
+    flex: 1;
+    min-width: 0;
+    padding: 6px 8px;
+    border-radius: 6px;
+    border: 1px solid rgba(0, 173, 181, 0.5);
+    background: #161616;
+    color: #f5f5f4;
+    font: inherit;
+}
+
+.ezil-settings-input:focus {
+    outline: none;
+    border-color: #00adb5;
+}
+
+/* ── appearance tab ─────────────────────────────────────────────────────── */
+
+.ezil-settings-swatch-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.ezil-settings-swatch {
+    position: relative;
+    width: 84px;
+    height: 52px;
+    border-radius: 8px;
+    border: 2px solid transparent;
+    cursor: pointer;
+    padding: 0;
+    overflow: hidden;
+}
+
+.ezil-settings-swatch.active {
+    border-color: #f5f5f4;
+    box-shadow: 0 0 0 2px #00adb5;
+}
+
+.ezil-settings-swatch-label {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 2px 6px;
+    font-size: 10px;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.45);
+    text-align: left;
+}
+
+/* ── about tab ──────────────────────────────────────────────────────────── */
+
+.ezil-settings-about-version {
+    color: #8a8a88;
+    margin: 0 0 18px;
+}
+
+/* ── the Settings button inside the full-bleed control drawer ─────────────
+ *
+ * 🔴 The one exception to this file's "ezil-settings-* only" rule, and it is
+ * deliberate. `shell/src/css/dashboard.css` (Puter-derived, NOT owned by this
+ * task) sizes the drawer's open width from a calc written for EXACTLY two
+ * buttons:
+ *
+ *   --open-w: calc(12px + --icon + --i2t + --title-w + --t2b
+ *                  + --btn + 2px + --btn + 10px);          dashboard.css:52
+ *
+ * and `.dashboard-app-drawer-clip` is `overflow: hidden`. Adding a third
+ * button without widening the tray puts it outside the clip — present in the
+ * DOM, invisible and unclickable on screen, which for a guarantee whose whole
+ * point is "the user can always reach Delete" is worse than not adding it,
+ * because it would pass a DOM-level test.
+ *
+ * Scoped to the marker class `drawer-action.js` sets, so a drawer WITHOUT the
+ * Settings button keeps upstream's exact geometry. Redefining the TOTAL rather
+ * than any of the parts is what keeps dashboard.css's `(pointer: coarse)` and
+ * `(max-width: 500px)` overrides of `--btn` / `--title-w` / `--t2b` working:
+ * custom properties in a calc resolve at use time, so those media queries
+ * still flow through this formula unchanged.
+ *
+ * This is the only rule in the shell that targets `dashboard-app-drawer*` from
+ * outside dashboard.css. build-shell.sh concatenates `ezil/**\/*.css` last, so
+ * it wins on order as well as on specificity. */
+.dashboard-app-drawer.ezil-has-settings-action {
+    --open-w: calc(
+        12px + var(--icon) + var(--i2t) + var(--title-w) + var(--t2b)
+        + var(--btn) + 2px + var(--btn) + 2px + var(--btn) + 10px
+    );
+}
+
+/* Matches the spacing dashboard.css gives `.dashboard-app-drawer-minimize`,
+ * so the three buttons are evenly set rather than two-then-a-gap. */
+.dashboard-app-drawer-settings {
+    margin-right: 2px;
+}

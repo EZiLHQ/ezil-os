@@ -73,6 +73,7 @@ port that still references them is unfinished:
 | `src/gui/src/helpers/launch_app.js` (805) | Removed — `puter.apps` + IPC. Stubbed to a rejection |
 | `src/gui/src/UI/UIItem.js` (1,911) | Removed — a filesystem entry icon |
 | `src/gui/src/UI/Dashboard/Tab*` (7,000+) | Removed |
+| `src/gui/src/UI/Dashboard/UIDashboard.js` (789) | Not ported verbatim — never copied into `src/`. Its tab-shell SHAPE (sidebar-of-tabs, the active-tab click handler, the one-`UIWindow`-many-tab-objects structure) was read from the reference clone and re-implemented fresh as `ezil/ui/Settings/index.js`. No upstream bytes exist in that file; see "Structurally adapted" below for what that means in practice. |
 | `src/gui/src/globals.js` (285) | Replaced by `src/ezil-globals.js`, not ported |
 | `src/gui/src/helpers.js` (3,623) | Not ported; only `uuidv4` (4 lines) cherry-picked |
 | `src/gui/src/UI/UIWindow*.js` dialogs (~30 files) | Removed — login, signup, 2FA, publish, settings, task manager, feedback, QR, … all cloud-backed |
@@ -161,6 +162,28 @@ Pruning happens later, in an isolated commit, once the shell demonstrably
 works. Bundle size is not the constraint today; a subtly broken window manager
 is.
 
+### Structurally adapted (no upstream bytes copied)
+
+Distinct from both tables above: nothing in the file below is upstream text,
+byte-identical or otherwise — it contains no Puter copyright header and
+carries none of Puter's AGPL notices, because none of Puter's copyrighted
+expression is IN it. What was taken is the STRUCTURE, from reading the
+reference clone, not from copying it. Listed here anyway, in the interest of
+over-disclosure rather than under-disclosure: a reviewer comparing this
+shell's tab UI to Puter's Dashboard should be able to find out why they look
+related without having to ask.
+
+| EZiL path | LOC | Read from (not copied from) | Upstream commit | Date | What the shape is |
+|---|---|---|---|---|---|
+| `ezil/ui/Settings/index.js` | ~190 | `src/gui/src/UI/Dashboard/UIDashboard.js` (789) | `5a15719` | 2026-08-01 | The sidebar-of-tabs markup shape, the click handler that swaps the sidebar's `.active` item and the matching content pane while calling the tab's `onActivate`, and the "one `UIWindow`, N tab objects (`{id,label,icon,html(),init(),onActivate()}`)" structure. Everything else upstream's 789 lines do — all 6 built-in tabs, hash routing, the entire socket.io block, the user-options/logged-in-users menu, `is_fullpage`/headless chrome — is NOT reproduced; see the file's own header for the line-by-line accounting and `../ATTRIBUTIONS.md`. Read from a read-only reference clone kept outside this repository (see "Reference clone used while porting" below), never copied from it. |
+
+`ezil/ui/Settings/tabs/*.js`, `trpc.js` and `settings.css` are pure "written
+fresh" by the definition below (no upstream reading, no upstream shape) and
+are not individually rowed here for the same reason `apps/registry.js`,
+`apps/desktop-window.js` and `ui/app-drawer.js` are not: `ezil/` is understood
+wholesale as EZiL-authored, and this table exists to resolve ambiguity, not
+to catalogue every file under it.
+
 ### Written fresh
 
 EZiL-authored. No Puter code. Listed here only because some of it sits inside
@@ -180,6 +203,24 @@ upstream.
 | `build-shell.sh` | — | Bundles `src/` + `ezil/` to `app/public/os/`. Its CSS cascade order is explicit, not sorted: upstream's `style.css` deliberately overrides jQuery UI's `.ui-resizable-*` rules, so alphabetical order inverts the cascade. |
 | `load-test.mjs` | — | Headless jsdom load of the **built** bundle: boots the shell, constructs a real window, taskbar and context menu, and asserts every `puter.*` stub rejects. Found three defects a green build and `node --check` both passed. |
 | `package.json` | — | Exists only so `load-test.mjs` has somewhere to declare jsdom. Not a dependency of `app/` or `worker/`. |
+| `ezil/ui/Settings/drawer-action.js` | 155 | Puts a Settings button in the full-bleed window's control drawer. **Reproduces no upstream code** — it builds one `<button>` with the class names `ui/app-drawer.js` already uses (`dashboard-app-drawer-btn`), because `src/css/dashboard.css` is the ported extract that styles exactly those selectors. See the "one exception" note below. |
+| `ezil/ui/Settings/settings-test.mjs` | — | End-to-end jsdom harness for the **built** bundle: opens the desktop window, drives Settings the way a person does, and asserts ORDERING (delete closes the container window before `computer.delete` goes out). Found that guarantee silently not firing; mutation-tested in both directions. Sibling of `load-test.mjs`, kept next to the feature it covers. |
+| `ezil/ui/Settings/computers-drift.test.{tsx,vitest.config.ts}` | — | Renders the `/computers` page — the escape hatch when the shell fails to boot — with `react-dom/server`, so a later "the OS took over, delete this page" cleanup fails a test instead of stranding a user at the 2-computer cap. Runs against `app/`'s module graph from outside it; see the config's header. |
+| `ezil/ui/Settings/{server-only,next-navigation}.stub.ts` | — | Two tiny module stubs the drift test aliases in. Not shipped: nothing under `ezil/ui/Settings/*.stub.ts` is reachable from `ezil/boot.js`, so esbuild never sees them. |
+
+#### 🔴 The one place EZiL code styles a Puter-derived selector from outside `src/`
+
+`ezil/ui/Settings/settings.css` ends with a rule on
+`.dashboard-app-drawer.ezil-has-settings-action`. Every other rule in that file
+is `ezil-settings-*`-prefixed, on purpose. This one is not, and the reason is
+recorded here rather than only in the CSS: `src/css/dashboard.css:52`
+(Puter-derived) derives the drawer's open width from a `calc()` written for
+exactly two buttons, and the tray clips its overflow. EZiL adds a third button,
+so the total has to be redefined. It is redefined **on a marker class**, so a
+drawer without EZiL's button keeps upstream's geometry byte-for-byte, and the
+TOTAL is redefined rather than any of its parts, so upstream's
+`(pointer: coarse)` and `(max-width: 500px)` overrides of `--btn` / `--title-w`
+/ `--t2b` still flow through unchanged. `dashboard.css` itself is untouched.
 
 ---
 
