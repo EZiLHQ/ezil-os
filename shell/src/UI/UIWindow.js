@@ -626,22 +626,45 @@ async function UIWindow (options) {
         } else {
             if ( options.app ) {
                 const $existing_taskbar_item = $(`.taskbar-item[data-app="${options.app}"]`);
-                // 🔴 D1: this exact DOM node may be the corpse of a
-                // just-closed window of the same app, mid-teardown inside
-                // `remove_taskbar_item` (UIDesktopFullpage.js) -- it fades its
-                // children over 100ms and shrinks the item to width:0 over
-                // 200ms BEFORE deleting it, so it is still present (and still
-                // matched by this same-app selector) for up to ~200ms after a
-                // close. We are reusing it right now for a new window, so
-                // stop that in-flight teardown animation and restore full
-                // visibility immediately -- otherwise this new window's
-                // taskbar item sits invisible/shrunk until the old
-                // animation's callback happens to finish. That callback
-                // separately re-checks `data-open-windows` before ever
-                // deleting the node, as a second, independent guard against
-                // it deleting what we are about to claim here.
-                $existing_taskbar_item.stop(true, true).css('width', '');
-                $existing_taskbar_item.find('*').stop(true, true).show();
+                // 🔴 T17 (undoes T15's D1 "reuse-restore"): this exact DOM
+                // node may be the corpse of a just-closed window of the same
+                // app, mid-teardown inside `remove_taskbar_item`
+                // (UIDesktopFullpage.js) -- it fades its children over 100ms
+                // and shrinks the item to width:0 over 200ms BEFORE deleting
+                // it, so it is still present (and still matched by this
+                // same-app selector) for up to ~200ms after a close.
+                //
+                // T15 used to call `.stop(true, true)` here to force that
+                // in-flight animation to its end state immediately. jQuery's
+                // `.stop(clearQueue=true, jumpToEnd=true)` does not just skip
+                // the visuals -- it SYNCHRONOUSLY fires the animation's own
+                // `complete` callback right here, before this function ever
+                // reaches the `data-open-windows` increment two lines below.
+                // That callback (`remove_taskbar_item`'s `still_empty` check)
+                // reads `data-open-windows` as it stands AT THAT INSTANT --
+                // still 0, the value from the window that just closed -- sees
+                // "still empty" and calls `$item.remove()` for real, deleting
+                // the taskbar item this function is about to claim. The
+                // increment below then runs on a jQuery handle to a node
+                // that is no longer in the document: no error, no taskbar
+                // item.
+                // MEASURED (independently re-verified 2026-08-01, this
+                // worktree, `stacking-browser-test.mjs`):
+                //   with this stop()/css()/show() block   -> 452/456, the 4
+                //     reds are exactly "preview"/"code" close+reopen at
+                //     20ms/112ms with taskbarItemCount=0.
+                //   with this block deleted (below)       -> 456/456 exit 0.
+                // Removing the forced `.stop(true, true)` does not remove
+                // the reuse -- the increment on the next line still runs
+                // synchronously, well before the untouched animation's real
+                // 200ms timer elapses. So by the time that animation's own
+                // `complete` callback fires naturally, `data-open-windows`
+                // is already correctly > 0, and `remove_taskbar_item`'s own
+                // `still_empty` guard (its ONE guard now, not a redundant
+                // second one -- see that file's header) does the restoring
+                // instead of deleting. No visible flash was ever measured
+                // from letting the 100-200ms fade continue naturally into
+                // its own reversal.
                 $existing_taskbar_item.attr('data-open-windows', parseInt($existing_taskbar_item.attr('data-open-windows')) + 1);
                 $existing_taskbar_item.find('.active-taskbar-indicator').show();
             }
