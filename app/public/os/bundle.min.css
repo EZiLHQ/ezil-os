@@ -640,7 +640,7 @@ span.header-sort-icon img{margin-bottom:-1px;width:10px}
 .taskbar .taskbar-item .taskbar-icon{border-radius:3px}
 .taskbar .taskbar-item,.taskbar .taskbar-item *{-webkit-user-drag:none;user-select:none;-moz-user-select:none;-webkit-user-select:none;-ms-user-select:none}
 .taskbar-item.ui-sortable-helper{margin-left:25px;z-index:999999999!important}
-.desktop:not(.desktop-selectable-active) .taskbar .taskbar-item:hover .taskbar-icon{background-color:rgb(255 255 255 / 40%);transition:background-color .2s}
+body:not(:has(.desktop.desktop-selectable-active)) .taskbar .taskbar-item:hover .taskbar-icon{background-color:rgb(255 255 255 / 40%);transition:background-color .2s}
 .taskbar .taskbar-item.active .taskbar-icon,.taskbar .taskbar-item:active .taskbar-icon,.taskbar .taskbar-item:focus .taskbar-icon,.taskbar .taskbar-item:focus-visible .taskbar-icon,.taskbar .taskbar-item:focus-within .taskbar-icon,.taskbar-item.has-open-contextmenu .taskbar-icon,.taskbar-item.has-open-popover .taskbar-icon,.taskbar-item.ui-sortable-helper .taskbar-icon{background-color:rgb(255 255 255 / 80%)!important;transition:background-color .2s;filter:none}
 .active-taskbar-indicator{font-size:18px;position:absolute;left:50%;-webkit-transform:translateX(-50%);transform:translateX(-50%);display:none;width:9px;height:3px;background-color:#686868;bottom:8px;border-radius:3px}
 .device-phone .active-taskbar-indicator{display:none!important}
