@@ -809,13 +809,49 @@ export type DesktopFrameProbe =
 export const DESKTOP_FRAME_PROBE_TIMEOUT_MS = 6_000;
 
 /**
- * Ask the desktop origin, over plain HTTP, whether it is serving.
+ * The ONE path whose query string is load-bearing rather than decorative.
  *
- * The query string is DROPPED before the request: the composed browser URL
+ * `worker/src/preview-bridge.ts`'s `handlePreviewBootstrap` answers
+ * `GET /preview-bootstrap` with `401` unless `?token=` carries a valid,
+ * sandbox-bound HMAC. See `PROBE_QUERY_BEARING_PATH`'s use in
+ * `probeDesktopFrame` for why that makes it the exception to the drop rule.
+ */
+const PREVIEW_BOOTSTRAP_PATH = '/preview-bootstrap';
+
+/**
+ * Ask a frame origin, over plain HTTP, whether it is serving.
+ *
+ * ── The query string is DROPPED, with exactly one exception ─────────────────
+ * Normally the query is removed before the request: the composed DESKTOP URL
  * carries the per-sandbox Neko credential in `?pwd=`, and this probe's URL can
  * end up in a server log or an upstream trace. Origin + path is the same
  * document either way — Neko serves its SPA shell at `/` regardless of the
  * auto-connect params, so nothing about the answer changes.
+ *
+ * 🔴 That last sentence is FALSE for the app-preview and code-server bridge
+ * origins Wave A added, and taking it on faith inverts this whole contract
+ * into a false negative. Their URL is the other way round:
+ *
+ *     https://3002-<sandbox>-app.<zone>/preview-bootstrap?token=t=<ts>,v1=<hmac>
+ *                                       └── the document ─┘└─ the credential ─┘
+ *
+ * Strip that query and the Worker answers `401` — every time, for every user,
+ * for a perfectly healthy preview. `confirmFrame` would then report a working
+ * app-preview window as "not answering" forever. A false negative dressed as
+ * caution is not safer than the false positive this contract was built to
+ * stop; it is the same lie with the sign flipped, and harder to notice.
+ *
+ * So `/preview-bootstrap` — and ONLY that path — keeps its query. Everything
+ * else, including `/preview/…` (whose `?ezil_pv=` fallback is also a
+ * credential) and the desktop's `/`, is stripped exactly as before. The
+ * exception is a path allow-list, not a "keep the query when it looks
+ * important" heuristic.
+ *
+ * Keeping the token makes this a genuinely end-to-end probe rather than a
+ * weaker one: the bootstrap 302s to `/preview/?ezil_pv=…`, `redirect: 'follow'`
+ * walks it, and the status judged is the one the container's own dev server
+ * (or code-server) returned. That is precisely what the browser's iframe is
+ * about to experience.
  *
  * "Alive" is `status < 400`, i.e. the origin answered without an error status.
  * That is deliberately the weakest claim the status line can support, and it
@@ -836,7 +872,10 @@ export async function probeDesktopFrame(
         if (u.protocol !== 'https:' && u.protocol !== 'http:') {
             return { alive: false, reason: 'bad_url', detail: 'unsupported_protocol' };
         }
-        target = `${u.origin}${u.pathname}`;
+        target =
+            u.pathname === PREVIEW_BOOTSTRAP_PATH
+                ? `${u.origin}${u.pathname}${u.search}`
+                : `${u.origin}${u.pathname}`;
     } catch {
         return { alive: false, reason: 'bad_url', detail: 'unparseable' };
     }
@@ -856,7 +895,12 @@ export async function probeDesktopFrame(
         }
         return { alive: true, status: res.status };
     } catch (err) {
-        const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+        const raw = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+        // The bootstrap branch above puts a live (if short-lived) credential in
+        // `target`, and some transport errors quote the URL they failed on.
+        // `detail` is not returned to the browser, but it is the kind of string
+        // that ends up in a log line, so redact before it can.
+        const detail = raw.replace(/token=[^&\s]*/gi, 'token=[redacted]');
         return { alive: false, reason: 'unreachable', detail: detail.slice(0, 200) };
     }
 }
