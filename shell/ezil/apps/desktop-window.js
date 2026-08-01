@@ -213,7 +213,33 @@ export async function openDesktopWindow (ctx = {}) {
         // The maximize button would fight `go_fullbleed` for the same geometry
         // and leave `data-is_maximized` set behind a full-bleed window.
         show_maximize_button: false,
-        stay_on_top: true,
+        // 🔴 NOT `stay_on_top: true`. Full-bleed is a LAYOUT mode
+        // (`go_fullbleed` below sets `width/height: 100%` via
+        // `enter_fullpage_mode` — pure geometry, in `UIDesktopFullpage.js`,
+        // which never touches z-index). `stay_on_top` is a STACKING mode:
+        // `UIWindow.js:215` puts the window in a `99999999+` z band at
+        // creation, and `window_zindex_base` (`UIWindow.js:4066`) keeps it
+        // there forever, while `focusWindow` (`UIWindow.js:4089`) explicitly
+        // SKIPS re-raising a `stay_on_top` window on focus. The two properties
+        // were never coupled by anything this window needs — this file set
+        // `stay_on_top: true` on its own initiative, not because
+        // `UIWindow.js:122`'s `window.is_embedded || window.is_fullpage_mode`
+        // auto-promotion applies (neither global is ever set anywhere in this
+        // codebase; grepped clean). The result: a normal window (Settings,
+        // Preview — both explicitly `stay_on_top: false`) is structurally
+        // incapable of ever rising above this one, in ANY of its states,
+        // including windowed-and-booting. OBSERVED in real Chrome: Settings at
+        // z=4 under a full-bleed desktop at z=100000002,
+        // `document.elementFromPoint()` at the Settings titlebar returning the
+        // desktop's iframe — reproduced byte-for-byte by
+        // `../ui/Settings/stacking-browser-test.mjs` before this line changed.
+        // Dropping `stay_on_top` puts the desktop in the same z band as every
+        // other window: it wins when it is the most-recently-focused window
+        // (ordinary `focusWindow` behaviour, unaffected by this change) and
+        // loses to whatever the user opens or clicks next — exactly what
+        // guarantee #1 (Settings -> Computers -> Delete reachable from a
+        // stuck full-bleed desktop) requires.
+        stay_on_top: false,
         single_instance: true,
         show_in_taskbar: true,
         is_droppable: false,
