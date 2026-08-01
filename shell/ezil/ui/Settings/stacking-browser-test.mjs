@@ -1537,17 +1537,45 @@ async function runCloseReopenSweep () {
                 const wins = document.querySelectorAll(`.window[data-app="${a}"]`);
                 const items = document.querySelectorAll(`.taskbar-item[data-app="${a}"]`);
                 const win = wins[0] ?? null;
+                const item = items[0] ?? null;
                 const cs = win ? getComputedStyle(win) : null;
                 const r = win ? win.getBoundingClientRect() : null;
                 return {
                     windowCount: wins.length,
                     taskbarItemCount: items.length,
+                    openWindowsAttr: item ? parseInt(item.getAttribute('data-open-windows'), 10) : null,
                     visible: !! win && cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0,
                 };
             }, id);
 
             push(`${label}: exactly 1 window`, state.windowCount === 1, `windowCount=${state.windowCount}`);
             push(`${label}: exactly 1 taskbar item`, state.taskbarItemCount === 1, `taskbarItemCount=${state.taskbarItemCount}`);
+            // 🔴 ROUND 8 FOLLOW-UP: "'exactly 1 taskbar item' has no
+            // discriminating power for PINNED apps." `desktop` and
+            // `settings` are `pinned: true` (registry.js) — their taskbar
+            // item "sits in the taskbar whether or not it is open"
+            // (registry.js's own doc comment), so `taskbarItemCount === 1`
+            // is true BEFORE this close/reopen cycle, DURING it, and AFTER
+            // it, regardless of whether the reopen actually worked. T16
+            // OBSERVED exactly that: a pinned item stayed at "1 item" while
+            // `windowCount` dropped to 0, and this sub-check still passed.
+            // For `preview`/`code` (`pinned: false`) the item genuinely
+            // disappears when there is no window, so the check has real
+            // power there — the gap is pinned apps specifically.
+            //
+            // The taskbar item itself already carries a SEPARATE, live
+            // signal that isn't just "am I pinned": `data-open-windows`
+            // (`UIWindow.js` increments it on open, decrements it on
+            // close — see that file's own comments next to each). This is
+            // the same attribute `boot-test.mjs` already asserts on for the
+            // exact same reason. Comparing it against the real DOM window
+            // count closes the gap for BOTH pinned and non-pinned apps:
+            // a stale "1 item, but the window and the item's own bookkeeping
+            // disagree" state now fails here even when mere item PRESENCE
+            // cannot tell the difference.
+            push(`${label}: taskbar item's own open-window count matches the real window count`,
+                state.openWindowsAttr === state.windowCount,
+                `data-open-windows=${state.openWindowsAttr} windowCount=${state.windowCount}`);
             push(`${label}: the reopened window is visible`, state.visible, JSON.stringify(state));
 
             // 🔴 `.fullpage-mode .window-minimize-btn { display: none }`
