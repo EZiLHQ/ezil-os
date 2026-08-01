@@ -377,8 +377,6 @@ function bind ($win, ctx) {
     });
 }
 
-let bound = false;
-
 export default {
     id: 'computers',
     label: 'Computers',
@@ -398,11 +396,31 @@ export default {
             </div>`;
     },
 
+    /**
+     * 🔴 Binds EVERY time, and there used to be a `let bound = false` module
+     * flag here guarding it. That was a real defect, not a micro-optimisation
+     * gone wrong: `bind()` attaches DELEGATED handlers to `$win`'s own
+     * `[data-role="slot-list"]` element. Settings is `single_instance` and
+     * `show_in_taskbar`, so closing it and reopening it from the dock is the
+     * ordinary interaction — and on that second open the module flag was
+     * still true, the fresh window's list got no handlers, and Switch / New /
+     * Rename / Delete were all dead buttons. i.e. the 2-computer trap,
+     * reappearing one interaction later.
+     *
+     * Re-binding cannot duplicate handlers, because `index.js` calls `init`
+     * exactly once per window and each window brings a brand-new element.
+     *
+     * Transient per-window state is reset for the same reason: an
+     * `editingId` or a `busyId` left over from a window that no longer exists
+     * would render a rename form, or a permanently disabled row, in the new
+     * one. `computers` is deliberately NOT cleared — showing the last known
+     * list for the ~100ms until `load()` returns beats flashing a spinner.
+     */
     init ($win, ctx) {
-        if ( ! bound ) {
-            bound = true;
-            bind($win, ctx);
-        }
+        editingId = null;
+        busyId = null;
+        loadError = null;
+        bind($win, ctx);
         void load($win);
     },
 

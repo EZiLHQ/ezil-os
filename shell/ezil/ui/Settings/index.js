@@ -37,23 +37,21 @@
 //     desktop chief among them), so it keeps a normal title bar with its own
 //     minimise/close and a modest fixed size, and needs none of that.
 //
-// ── 🔴 Guarantee #1 (reachability from a full-bleed desktop) — READY, NOT
-// WIRED. `desktop-window.js` (not owned by this task) already has the seam:
-// `attach_app_drawer(el_window, { actions: [...] })`, with the comment
-// "Settings drops in here in a later wave — the drawer renders whatever this
-// array contains, in order, before Close." `registry.js`'s
-// `settingsDrawerAction()` (this task) builds exactly the `{id,label,svg,
-// onClick}` shape that array expects. Wiring it in is a one-line change to
-// `desktop-window.js`'s `actions` array — outside this task's owned paths
-// (`shell/ezil/ui/Settings/**`, `shell/ezil/apps/registry.js`,
-// `shell/PUTER-PROVENANCE.md`) — and is NOT done here. Until it lands, a user
-// whose desktop is full-bleed can still reach Settings via its pinned
-// taskbar icon whenever the taskbar is visible (i.e. whenever no window is
-// full-bleed), but NOT while one is — see this task's report for the full
-// account.
+// ── 🔴 Guarantee #1 (reachability from a full-bleed desktop) — DONE, in
+// `./drawer-action.js` + `../../apps/registry.js`'s `launch()`. There are now
+// TWO independent ways to reach this window, which is the point: the pinned
+// taskbar icon (`registry.js`, `pinned: true`) whenever the taskbar is
+// visible, and a Settings button inside the control drawer for when it is
+// not — `enter_fullpage_mode` hides the taskbar, and without the drawer entry
+// a user whose only desktop is stuck full-bleed could not reach Delete at all.
+// Read `./drawer-action.js`'s header for why that button is injected from
+// this side rather than declared in `desktop-window.js`'s `actions` array.
 //
-// ── Guarantee #2 (a drift test for `/computers`) — NOT ADDED, same reason.
-// A Next.js route test belongs under `app/`, which this task does not own.
+// ── Guarantee #2 (a drift test for `/computers`) — `./computers-drift.test.mjs`,
+// which asserts the `/computers` escape hatch still exists and still reaches
+// Delete. Run it with `node shell/ezil/ui/Settings/computers-drift.test.mjs`.
+// See that file's header for why it is a standalone node script rather than a
+// vitest case under `app/src` (a path this task does not own).
 import UIWindow from '../../../src/UI/UIWindow.js';
 import TabComputers from './tabs/computers.js';
 import TabAppearance from './tabs/appearance.js';

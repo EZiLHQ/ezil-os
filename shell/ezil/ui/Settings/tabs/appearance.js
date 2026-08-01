@@ -127,8 +127,6 @@ function bind ($win) {
     });
 }
 
-let bound = false;
-
 export default {
     id: 'appearance',
     label: 'Appearance',
@@ -148,11 +146,11 @@ export default {
             </div>`;
     },
 
+    /** Binds every time — see the long note on `computers.js`'s `init`. The
+     * handlers are delegated onto THIS window's pane, so a module-level
+     * "already bound" flag made the swatches dead on the second open. */
     init ($win) {
-        if ( ! bound ) {
-            bound = true;
-            bind($win);
-        }
+        bind($win);
         render($win);
     },
 
