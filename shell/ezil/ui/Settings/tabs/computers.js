@@ -47,18 +47,60 @@ let loadError = null;
 let editingId = null;
 let busyId = null; // a switch/delete in flight for this computer id
 
+const DESKTOP_SELECTOR = '.window[data-app="desktop"]';
+
 /**
- * The computer id the single 'desktop' app window currently streams, or
- * null if none is open. Seeded from the boot payload — `/os` always opens
- * the payload's own computer first (`boot.js`'s `build()`) — and kept in
- * sync by `switchTo`/`handleDelete` below, which are the only two places
- * that can change what the desktop window shows after boot.
+ * The computer id the single 'desktop' app window currently streams, as far
+ * as module state knows. Only ever a HINT — `desktopStreams()` below is the
+ * authority.
+ *
+ * 🔴 This used to be seeded at MODULE-EVAL time from `session.payload()` and
+ * treated as the truth, and the end-to-end harness
+ * (`../settings-test.mjs`) caught the whole delete guarantee silently not
+ * firing because of it: this module is evaluated as part of `boot.js`'s
+ * import chain, so on any path where `window.__EZIL_BOOT__` is not already
+ * inlined (the `/api/shell/session` rehydrate path, a headless host) it was
+ * seeded `null`, `handleDelete`'s `if (computer.id === activeComputerId)`
+ * was false, and `computer.delete` went out with the desktop window still
+ * mounted and streaming the container that was about to be destroyed.
  *
  * One id is enough because there is at most one desktop window ever: the
  * 'desktop' app is `single_instance` (`registry.js`), enforced three ways
  * (there too, and again inside `UIWindow` itself).
  */
-let activeComputerId = session.payload()?.computer?.id ?? null;
+let activeComputerId;
+
+/**
+ * The computer the open desktop window is streaming.
+ *
+ * @returns {string|null|undefined} the id; `null` if no desktop window is
+ *   open at all; `undefined` if one is open but nothing says whose it is.
+ *
+ * Reads `data-ezil-computer-id`, which `registry.launch()` stamps on every
+ * window it opens with a computer in its ctx. The DOM is preferred over
+ * module state because it is created and destroyed with the window it
+ * describes and cannot go stale behind a rebuild; `activeComputerId` is only
+ * the fallback for a desktop window that somehow reached the document without
+ * going through `launch`.
+ */
+function openDesktopComputerId () {
+    const el = document.querySelector(DESKTOP_SELECTOR);
+    if ( ! el ) return null;
+    return el.getAttribute('data-ezil-computer-id') || activeComputerId || undefined;
+}
+
+/**
+ * Does the open desktop window stream `id`?
+ *
+ * @returns {true|false|'unknown'} `false` ONLY when it is positively known
+ *   NOT to (a different computer, or no window at all).
+ */
+function desktopStreams (id) {
+    const open = openDesktopComputerId();
+    if ( open === null ) return false;
+    if ( open === undefined ) return 'unknown';
+    return open === id;
+}
 
 function timeAgo (input) {
     if ( ! input ) return null;
@@ -142,15 +184,20 @@ function reportError (message) {
  * this fork (see `desktop-window.js`'s `FRAME_CONFIRM_*` constants).
  */
 async function closeDesktopWindows () {
-    const $wins = $('.window[data-app="desktop"]');
-    if ( $wins.length === 0 ) return;
+    const $wins = $(DESKTOP_SELECTOR);
+    if ( $wins.length === 0 ) {
+        activeComputerId = null;
+        return;
+    }
     await Promise.all($wins.toArray().map(el => Promise.resolve($(el).close())));
     const deadline = Date.now() + 3000;
-    while ( $('.window[data-app="desktop"]').length > 0 && Date.now() < deadline ) {
+    while ( $(DESKTOP_SELECTOR).length > 0 && Date.now() < deadline ) {
         await new Promise(r => setTimeout(r, 50));
     }
-    if ( $('.window[data-app="desktop"]').length > 0 ) {
+    if ( $(DESKTOP_SELECTOR).length > 0 ) {
         console.warn(`[${PHASE}] a desktop window did not close within the wait budget`);
+    } else {
+        activeComputerId = null;
     }
 }
 
@@ -168,7 +215,10 @@ function rowHtml (slot, computer) {
             </div>`;
     }
 
-    const isActive = computer.id === activeComputerId;
+    // "Current" means "this is the desktop on screen right now", read from
+    // the DOM rather than from a remembered id — so closing the desktop
+    // window by hand correctly turns the pill back into a Switch button.
+    const isActive = openDesktopComputerId() === computer.id;
     const isBusy = busyId === computer.id;
     const isEditing = editingId === computer.id;
     const when = timeAgo(computer.lastOpenedAt ?? computer.createdAt);
@@ -266,7 +316,7 @@ async function handleCreate ($win) {
 }
 
 async function switchTo (computer, ctx, $win) {
-    if ( computer.id === activeComputerId || busyId ) return;
+    if ( desktopStreams(computer.id) === true || busyId ) return;
     busyId = computer.id;
     render($win);
     try {
@@ -322,9 +372,16 @@ async function handleDelete (computer, $win) {
         // terms; calling delete first would leave the user watching their
         // OS die mid-frame while the iframe reconnect-loops against a
         // container that no longer exists.
-        if ( computer.id === activeComputerId ) {
+        //
+        // 🔴 FAILS SAFE. The window is closed unless the open desktop is
+        // POSITIVELY known to be a different computer. The two errors here
+        // are not symmetric: closing a window we did not have to close costs
+        // one reopen, while not closing one we should have is precisely the
+        // failure this guarantee exists to prevent. Round 1 had this
+        // backwards — it closed only on a positive match against a variable
+        // that was empty on the rehydrate path.
+        if ( desktopStreams(computer.id) !== false ) {
             await closeDesktopWindows();
-            activeComputerId = null;
         }
 
         const res = await trpc.mutate('computer.delete', { id: computer.id });
@@ -420,6 +477,14 @@ export default {
         editingId = null;
         busyId = null;
         loadError = null;
+        // The fallback hint only — `openDesktopComputerId()` prefers the
+        // stamp on the window itself. Read HERE rather than at module-eval
+        // time, so the rehydrate path (payload arrives from
+        // `/api/shell/session` after this module was imported) is not seeded
+        // empty. See the note on `activeComputerId`.
+        if ( activeComputerId === undefined ) {
+            activeComputerId = ctx?.computer?.id ?? session.payload()?.computer?.id ?? undefined;
+        }
         bind($win, ctx);
         void load($win);
     },
