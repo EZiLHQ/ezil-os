@@ -2,16 +2,21 @@
 <!--
   EZiL OS — explicit Openbox root menu for the neko desktop.
 
-  Provides a usable, provable root menu (right-click on the desktop) with
-  entries to focus either mandatory application. Each entry invokes the same
-  deterministic /usr/local/bin/neko-switch-app.sh helper used by the keyboard
-  shortcuts and the validators, so menu, shortcut, and test drive one code path.
+  Provides a usable, provable root menu (right-click on the desktop) with an
+  entry to focus the mandatory native browser. Invokes the same deterministic
+  /usr/local/bin/neko-switch-app.sh helper used by the keyboard shortcuts and
+  the validators, so menu, shortcut, and test drive one code path.
+
+  NOTE (code-server swap): a "Focus VS Code" entry USED to be here. Electron
+  VS Code is replaced by code-server, a plain HTTP server with no X window
+  (see start-neko.sh) — there is no window for a root-menu entry to ever
+  focus, so unlike the now-inert keyboard shortcuts (invisible unless a user
+  happens to press them — see ebuilder-openbox.xml's NOTE), a visible menu
+  item labeled "Focus VS Code" that silently did nothing on click would be an
+  actual UX regression, not a harmless no-op. Removed rather than left inert.
 -->
 <openbox_menu xmlns="http://openbox.org/3.4/menu">
   <menu id="root-menu" label="EZiL OS">
-    <item label="Focus VS Code">
-      <action name="Execute"><command>/usr/local/bin/neko-switch-app.sh vscode</command></action>
-    </item>
     <item label="Focus Browser">
       <action name="Execute"><command>/usr/local/bin/neko-switch-app.sh chromium</command></action>
     </item>
