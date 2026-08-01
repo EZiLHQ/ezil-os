@@ -255,6 +255,53 @@ only the server does, by fetching the origin itself. Anything that claims
 observation. See `probeDesktopFrame` / `confirmFrame` and
 `computeBootUiState`'s `success` branch.
 
+## 17. A `<script src>` inserted by an App Router soft navigation never executes — including a server action's `redirect()`
+
+Observed live 2026-07-31, production build, real Chromium, real Supabase login:
+`/login?returnUrl=%2Fos` after a fresh sign-in landed on `/os` with `bundleFetched: 0`,
+`window.ezil` and `window.__EZIL_BOOT__` both `undefined`, no taskbar, no visible text —
+30 seconds after landing, permanently. Only a manual reload recovered it. Independently
+reproduced from `router.push('/os')`, i.e. from what any future `<Link href="/os">`
+would do, and confirmed absent on a real document load (24/24 clean in the same session).
+
+**What happens.** The HTML living standard only auto-executes a `<script>` element that
+is *parser-inserted* — created by the browser's own HTML parser as it reads the
+document — or one explicitly created and `appendChild`'d by other script in a way that
+sets its execution flag. A `<script>` a React tree renders during a client-side
+transition is neither: React diffs the new tree against the old one and mutates the DOM
+to match, which inserts the node as an ordinary element, not as a parser-driven or
+`document.write`-style insertion. The element sits in the DOM, `src` set, and the browser
+never fetches or runs it. This is `PLATFORM-NOTES.md §14`'s hydration hazard's mirror
+image: §14 is React deleting a foreign script during its OWN document's hydration; this
+is a *future* navigation inserting a script that was never going to run in the first
+place, on a page that has nothing to do with hydration at all.
+
+**Why a server action's `redirect()` counts.** `redirect()` called from inside a
+`'use server'` action is not an HTTP redirect the browser follows. The action's response
+carries the destination back over the existing fetch, and the Next.js App Router
+performs the navigation *client-side* — the same code path as clicking a `<Link>`. A
+route that looks like a plain server-rendered page and simply calls `redirect()` on
+success is, from the browser's perspective, indistinguishable from a soft nav. Nothing
+in the action's own code signals this; it has to be known about the framework, not read
+off the page.
+
+**What to do instead.** Any destination that is not a React route — a separate
+JS application's host document, delivered as `<script src>` tags, is the case here —
+must be reached by an actual document load:
+- A **route handler**'s `NextResponse.redirect(...)` is a real HTTP 3xx the browser
+  follows itself (`GET` handlers, not server actions — see `/auth/callback`).
+- A server action can return the destination as a **value** instead of redirecting to
+  it, and let the client perform `window.location.assign(...)` — a real navigation, not
+  `router.push`, which reproduces the exact defect.
+- Either way, treat "an authenticated destination is a document load" as the rule, not
+  "routes that need one are a list" — a list goes stale the moment a new non-React
+  surface is added and nobody remembers to check it against the list.
+- Add an arrival-side check regardless: something that notices a page with no boot
+  payload and a navigation-timing entry pointing at a *different* URL than the one it's
+  on now, and reloads once (bounded, `sessionStorage`-gated so a storage failure can't
+  turn it into a loop) rather than sitting there silently. Belt and braces: the senders
+  can all be right and a future contributor still adds a `<Link>` to the surface.
+
 ---
 
 ## Method notes
