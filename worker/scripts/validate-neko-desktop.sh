@@ -2,10 +2,16 @@
 # EZiL OS neko desktop — deterministic, machine-checkable desktop validation.
 #
 # Runs INSIDE the final image after start-neko.sh has passed its window-ready
-# gate. Produces positive, inspectable evidence that the mandatory two-app
-# desktop is genuinely up, and negative evidence that the browser is NOT a blank
-# surface. Enumerates window ids / PIDs / classes / titles and normalizes id
-# formats so hex (wmctrl) and decimal (xdotool/_NET_WM_PID) sources agree.
+# gate. Produces positive, inspectable evidence that the mandatory app set
+# (EZIL_DESKTOP_APPS in start-neko.sh: native browser + code-server) is
+# genuinely up, and negative evidence that the browser is NOT a blank surface.
+# Enumerates window ids / PIDs / classes / titles and normalizes id formats so
+# hex (wmctrl) and decimal (xdotool/_NET_WM_PID) sources agree.
+#
+# code-server (which replaced Electron VS Code — see start-neko.sh) is a
+# plain HTTP server with NO X window, so it is validated by a TCP probe
+# (127.0.0.1:8443) plus its supervised PID from the app health file, not by
+# window enumeration.
 #
 # Exit non-zero on any failed assertion; prints a JSON-ish summary either way.
 set -uo pipefail
@@ -54,17 +60,24 @@ enumerate_app() {
   printf '%s\t%s\t%s\t%s\t%s\n' "$label" "$decid" "$class" "$pid" "$title"
 }
 
-echo "== mandatory apps =="
-VSCODE_ROW="$(enumerate_app vscode 'code|Code')"
+echo "== mandatory apps: native browser (X window) =="
 CHROME_ROW="$(enumerate_app chromium 'chrome')"
 
-VSCODE_PID="$(printf '%s' "$VSCODE_ROW" | cut -f4)"
 CHROME_PID="$(printf '%s' "$CHROME_ROW" | cut -f4)"
 CHROME_TITLE="$(printf '%s' "$CHROME_ROW" | cut -f5-)"
 
-# Both apps must be present (enumerate_app already failed loudly if absent).
-[ -n "$VSCODE_ROW" ] || fail "VS Code window not enumerated"
+# Browser must be present (enumerate_app already failed loudly if absent).
 [ -n "$CHROME_ROW" ] || fail "browser window not enumerated"
+
+echo "== mandatory apps: code-server (loopback HTTP port, no X window) =="
+CODESERVER_HOST="${CODESERVER_HOST:-127.0.0.1}"
+CODESERVER_PORT="${CODESERVER_PORT:-8443}"
+if (exec 3<>"/dev/tcp/${CODESERVER_HOST}/${CODESERVER_PORT}") 2>/dev/null; then
+  exec 3>&- 3<&- 2>/dev/null || true
+  ok "code-server is listening on ${CODESERVER_HOST}:${CODESERVER_PORT}"
+else
+  fail "code-server is NOT listening on ${CODESERVER_HOST}:${CODESERVER_PORT}"
+fi
 
 echo "== browser must NOT be blank =="
 # Positive content assertion: the deterministic landing page sets its <title>
@@ -82,8 +95,18 @@ else
   fi
 fi
 
+# codeserver has no X window/PID to enumerate via wmctrl, so its supervised
+# PID comes from start-neko.sh's own sanitized app health file instead (same
+# JSON that terminate_stack/the fatal sentinel already treat as authoritative
+# for this app's process state).
+HF="${NEKO_APP_HEALTH_FILE:-/tmp/neko-app-health.json}"
+CODESERVER_PID=""
+if [ -f "$HF" ]; then
+  CODESERVER_PID="$(grep -o '"codeserver":{[^}]*}' "$HF" | grep -o '"pid":[0-9]*' | cut -d: -f2)"
+fi
+
 echo "== process liveness (PIDs) =="
-for pair in "vscode:$VSCODE_PID" "chromium:$CHROME_PID"; do
+for pair in "codeserver:$CODESERVER_PID" "chromium:$CHROME_PID"; do
   name="${pair%%:*}"; pid="${pair#*:}"
   if [ -n "$pid" ] && [ "$pid" != "0" ] && kill -0 "$pid" 2>/dev/null; then
     ok "$name pid $pid alive"
@@ -96,7 +119,14 @@ echo "== openbox config (explicit shortcuts + root menu) =="
 OB_CFG="${NEKO_OPENBOX_CONFIG:-/etc/neko/ebuilder-openbox.xml}"
 if [ -f "$OB_CFG" ]; then
   ok "openbox config present: $OB_CFG"
-  grep -q "neko-switch-app.sh vscode" "$OB_CFG"   && ok "keybind -> focus vscode present"   || fail "no vscode focus keybind in $OB_CFG"
+  # The "vscode" keybind is now INERT (see ebuilder-openbox.xml's own NOTE and
+  # neko-switch-app.sh's comment on the `vscode` case) — code-server has no X
+  # window to focus. Still asserted present here because Openbox's own root
+  # rc file wiring (the keybind existing at all, regardless of whether its
+  # target currently resolves to a window) is what this section verifies;
+  # the DYNAMIC "does it degrade gracefully" behavior is asserted by
+  # validate-neko-focus.sh instead.
+  grep -q "neko-switch-app.sh vscode" "$OB_CFG"   && ok "keybind -> vscode (inert no-op) present" || fail "no vscode focus keybind in $OB_CFG"
   grep -q "neko-switch-app.sh chromium" "$OB_CFG" && ok "keybind -> focus browser present"  || fail "no browser focus keybind in $OB_CFG"
   grep -q "<menu>" "$OB_CFG"                       && ok "root menu wired in openbox config" || fail "no root menu wired in $OB_CFG"
 else
@@ -105,7 +135,6 @@ fi
 if pgrep -x openbox >/dev/null 2>&1; then ok "openbox WM process running"; else fail "openbox not running"; fi
 
 echo "== app health file =="
-HF="${NEKO_APP_HEALTH_FILE:-/tmp/neko-app-health.json}"
 if [ -f "$HF" ]; then
   echo "health: $(cat "$HF")"
   grep -q '"failed"' "$HF" && fail "an app is in failed state" || ok "no app in failed state"

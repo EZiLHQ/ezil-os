@@ -16,11 +16,23 @@
   validate-neko-desktop.sh asserts this file is the live Openbox rc AND that it
   contains the expected keybind/menu wiring, so "shortcuts + root menu exist"
   becomes positive evidence rather than an assumption.
+
+  NOTE (code-server swap): Electron VS Code was removed from this image and
+  replaced by code-server, a plain HTTP server with no X window at all. The
+  <application class="Code"> rule below and the W-1/W-c keybinds that invoke
+  `neko-switch-app.sh vscode` are therefore now permanently inert — no window
+  will ever match `class="Code"`, and the keybinds resolve to a confirmed,
+  verified no-op (see neko-switch-app.sh's own comment on the `vscode` case).
+  Left in place rather than deleted since an inert rule/keybind is harmless
+  and Openbox does not error on an unmatched `<application>` selector or a
+  keybind whose command exits non-zero.
 -->
 <openbox_config xmlns="http://openbox.org/3.4/rc">
 
 <applications>
-  <!-- Keep the pinned image's intent: VS Code maximized/undecorated/focused. -->
+  <!-- Inert since the code-server swap (see NOTE above) — no window will ever
+       have class="Code" now that VS Code Electron is gone. Kept for a clean
+       rollback path; matches nothing, does nothing. -->
   <application type="normal" class="Code">
     <decor>no</decor>
     <maximized>true</maximized>
@@ -52,7 +64,11 @@
 <keyboard>
   <!-- Explicit, deterministic app-switch shortcuts. Both invoke the same
        helper the validators drive, so the bound key and the tested code path
-       are identical. -->
+       are identical.
+       W-1/W-c ("vscode") are inert since the code-server swap: verified
+       no-op, see the NOTE at the top of this file and neko-switch-app.sh's
+       own comment. Kept rather than removed/rebound for a clean rollback
+       path and because a keybind whose command exits non-zero is harmless. -->
   <keybind key="W-1">
     <action name="Execute"><command>/usr/local/bin/neko-switch-app.sh vscode</command></action>
   </keybind>
