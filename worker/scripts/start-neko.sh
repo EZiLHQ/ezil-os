@@ -2,32 +2,38 @@
 # EBuilder Cloudflare Sandbox — alternate `neko` desktop-mode boot sequence.
 #
 # Phase 1 (see infra/neko-standalone for the validated standalone reference):
-# starts the pinned Neko + VS Code application server inside THIS sandbox
-# container on NEKO_HTTP_PORT (8181 by default — deliberately distinct from
-# Guacamole's 8080 so both modes can coexist in the same image without a
-# port collision; see `NEKO_PORT` in src/index.ts).
+# starts the pinned Neko application server inside THIS sandbox container on
+# NEKO_HTTP_PORT (8181 by default — deliberately distinct from Guacamole's
+# 8080 so both modes can coexist in the same image without a port collision;
+# see `NEKO_PORT` in src/index.ts).
 #
 # Pinned inputs (baked into the image at build time — must match
 # infra/neko-standalone/.env / build.sh exactly):
 #   neko:      d74052bb844c43a0cc3c2386d083f7505dc483a2
 #   neko-apps: 049931d7638f9db8598f29c369d2fb7cd2c6e4b4
 #
-# The Neko runtime (the `neko` Go server, its /var/www client bundle, the
-# /etc/neko config, and the pinned VS Code build) is COPY'd from the pinned
-# ezil-neko-vscode image into this Ubuntu 22.04 Sandbox base by the Dockerfile's
-# multi-stage `neko` build stage. This script does NOT build or fetch Neko at
-# runtime: Cloudflare Sandbox containers have no docker-in-docker, so the pinned
-# neko-apps image build happens at IMAGE BUILD time only, matching the
-# already-validated infra/neko-standalone build path.
+# The Neko runtime (the `neko` Go server, its /var/www client bundle, and the
+# /etc/neko config) is COPY'd from the pinned ezil-neko-vscode image into this
+# Ubuntu 22.04 Sandbox base by the Dockerfile's multi-stage `neko` build
+# stage. This script does NOT build or fetch Neko at runtime: Cloudflare
+# Sandbox containers have no docker-in-docker, so the pinned neko-apps image
+# build happens at IMAGE BUILD time only, matching the already-validated
+# infra/neko-standalone build path. NOTE: that pinned image's own Electron
+# VS Code build is deliberately NOT copied — see the Dockerfile and the
+# "code-server launch" section below; code-server is installed separately.
 #
 # Runtime layout on the Ubuntu base:
 #   Xvfb :99         virtual X display (dummy framebuffer)
 #   openbox          lightweight window manager (config /etc/neko/openbox.xml)
 #   pulseaudio       audio server (best-effort; media is WebRTC-gated)
-#   code             the pinned VS Code build (best-effort; pixels are
-#                    delivered over WebRTC, which requires TURN — see below)
+#   code-server      the IDE, served over plain HTTP on 127.0.0.1:8443 — NOT
+#                    an X client, so it is never part of the Xvfb/WebRTC
+#                    pixel stream (replaces the pinned image's Electron VS
+#                    Code build; see the Dockerfile and this script's
+#                    "code-server launch" section for why)
 #   neko serve       the Neko application server on NEKO_HTTP_PORT (8181):
-#                    HTTP UI + WebSocket signaling. The Worker fronts this via
+#                    HTTP UI + WebSocket signaling for the native browser's
+#                    pixel stream. The Worker fronts this via
 #                    proxyToSandbox().
 #
 # WebRTC media (audio/video/input over datachannels) requires a TURN relay in
@@ -102,12 +108,17 @@ mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
 mkdir -p /var/log/neko 2>/dev/null || true
 
 # ── CPU saturation diagnostics (opt-in, OFF by default, zero cost when off) ───
-# The perf-tuning research established that standard-1 (0.5 vCPU / 4 GiB) is a
-# STRONG CIRCUMSTANTIAL suspect for "EZiL OS is slow" (software rendering only
-# — no GPU in Cloudflare Containers, both Chrome and VS Code Electron run
-# --disable-gpu — sharing half a physical core with Xvfb, two Electron/GUI
-# apps, this script's own vp8enc software encode, and the user's dev-server
-# compile) but it was NEVER MEASURED. Rather than guess, sample real CPU/load
+# The perf-tuning research that originally motivated this diagnostic tool
+# targeted standard-1 (0.5 vCPU / 4 GiB) sharing half a physical core between
+# Xvfb, two Electron/GUI apps (Chrome and Electron VS Code), this script's own
+# vp8enc software encode, and the user's dev-server compile (software
+# rendering only — no GPU in Cloudflare Containers, both ran --disable-gpu) —
+# a STRONG CIRCUMSTANTIAL suspect for "EZiL OS is slow" that was NEVER
+# MEASURED. Both facts have since changed (instance_type is now standard-3 —
+# 2 vCPU — and Electron VS Code is replaced by code-server, a non-renderer;
+# see the encoder-tuning section below for the numbers this changed), but the
+# tool itself stays exactly as useful for verifying that headroom actually
+# materializes as claimed. Rather than guess, sample real CPU/load
 # figures from /proc during an actual session into a sidecar file, following
 # the exact phase-file pattern start-devserver.sh already uses
 # (write_phase()/PHASE_FILE) — one JSON line per sample, gated behind
@@ -179,9 +190,10 @@ if [ ! -x "$NEKO_BIN" ]; then
   exit 1
 fi
 
-# ── Mandatory app preflight (native browser + VS Code, contract requirement) ──
-# The authoritative EZiL OS contract requires BOTH a native browser and VS Code
-# on the neko desktop — neither is optional, and there is no app/desktop
+# ── Mandatory app preflight (native browser + code-server, contract requirement) ──
+# The authoritative EZiL OS contract requires BOTH a native browser and
+# code-server (which replaced Electron VS Code) on the neko desktop — neither
+# is optional, and there is no app/desktop
 # fallback. Both executables MUST be validated to exist BEFORE any background
 # app or `neko serve` is started, so a missing binary fails Neko startup
 # cleanly instead of silently degrading to a "best-effort skip" (the prior,
@@ -209,56 +221,28 @@ if [ -z "$CHROME_BIN" ]; then
   exit 1
 fi
 
-VSCODE_BIN=""
-if command -v code >/dev/null 2>&1; then
-  VSCODE_BIN="$(command -v code)"
-elif [ -x /usr/bin/code ]; then
-  VSCODE_BIN=/usr/bin/code
+# code-server (replaces Electron VS Code — see the Dockerfile and this
+# script's "code-server launch" section below for why the two must never
+# coexist). It is a plain HTTP server, not an X client, so there is no
+# Electron-binary/wrapper resolution to do here — just confirm the binary the
+# Dockerfile installed is actually present before anything is launched.
+CODE_SERVER_BIN=""
+if command -v code-server >/dev/null 2>&1; then
+  CODE_SERVER_BIN="$(command -v code-server)"
 fi
-if [ -z "$VSCODE_BIN" ]; then
-  log "ERROR: mandatory VS Code binary not found (checked: code, /usr/bin/code). The EZiL OS contract requires VS Code on every neko desktop — there is no app/desktop fallback. Failing Neko startup before readiness."
+if [ -z "$CODE_SERVER_BIN" ]; then
+  log "ERROR: mandatory code-server binary not found (checked: code-server). The EZiL OS contract requires code-server on every neko desktop — there is no app/desktop fallback. Failing Neko startup before readiness."
   phase_end container_start error
   exit 1
 fi
 
-# Resolve the REAL Electron binary behind the `code` CLI wrapper.
-#
-# Root cause of the prior Firecracker failure (run
-# cloud_worker_00b1a940…): the `code` CLI (…/bin/code) is a thin shell wrapper
-# that runs Electron-as-node against out/cli.js. On a FRESH instance, cli.js
-# spawns the Electron *main* process and only waits on an IPC marker. Under the
-# Cloudflare Firecracker/Xvfb runtime the main process's GPU child crashed
-# before mapping a top-level X window, the marker was released, and
-# `code --wait … /workspace` returned rc=0 WITHOUT ever mapping a window — so
-# the window-ready gate below timed out, the restart budget was exhausted, and
-# neko never bound 8181. `--wait` is therefore NOT a reliable blocking launcher
-# here.
-#
-# Fix: launch the Electron binary (…/code, sibling of …/bin/code) DIRECTLY.
-# Running the Electron binary itself stays in the foreground for the entire
-# window lifetime (naturally blocking, exactly like the desktop .desktop
-# launcher), and — with the Firecracker-safe GPU flags added at the supervise
-# call below — reliably maps the VS Code top-level window. We resolve it
-# relative to the wrapper so it tracks the pinned image layout; if resolution
-# fails we fall back to the `code` CLI wrapper (still with the safe flags).
-VSCODE_ELECTRON=""
-_code_real="$(readlink -f "$VSCODE_BIN" 2>/dev/null || echo "$VSCODE_BIN")"
-_code_share="$(dirname "$(dirname "$_code_real")")"   # e.g. /usr/share/code
-for _cand in "$_code_share/code" "$_code_share/bin/code"; do
-  # The Electron binary is the one that is NOT the shell-wrapper CLI. Detect the
-  # wrapper by its leading shebang; prefer a sibling that is a real executable.
-  if [ -x "$_cand" ] && ! head -c2 "$_cand" 2>/dev/null | grep -q '#!'; then
-    VSCODE_ELECTRON="$_cand"
-    break
-  fi
-done
-
-log "mandatory app preflight passed: browser=$(basename "$CHROME_BIN") vscode=$(basename "$VSCODE_BIN")${VSCODE_ELECTRON:+ electron=$(basename "$VSCODE_ELECTRON")}"
+log "mandatory app preflight passed: browser=$(basename "$CHROME_BIN") codeserver=$(basename "$CODE_SERVER_BIN")"
 phase_end container_start ok
 
 # ── Workspace hydration (sealed startup delivery → /home/neko/project) ────────
-# The canonical project workspace root. VS Code opens EXACTLY this directory,
-# and — when a sealed startup delivery is present — it is hydrated from the
+# The canonical project workspace root. code-server (formerly Electron VS
+# Code) opens EXACTLY this directory, and — when a sealed startup delivery is
+# present — it is hydrated from the
 # durable branch BEFORE readiness so the desktop never shows an empty/partial
 # tree. Overridable via EZIL_WORKSPACE_ROOT (kept in lockstep with the bootstrap
 # bundle, which defaults to the same path).
@@ -286,7 +270,7 @@ if [ -n "${EZIL_WORKSPACE_STARTUP_DELIVERY:-}" ]; then
     exit 1
   fi
   log "hydrating workspace at $WORKSPACE_ROOT from sealed startup delivery (before readiness)"
-  # Capture the resolved VS Code target root from the bundle's final stdout line;
+  # Capture the resolved code-server target root from the bundle's final stdout line;
   # its stderr (safe stage/outcome logs) is teed into the neko log.
   if _bootstrap_root="$(bun "$WORKSPACE_BOOTSTRAP_BIN" 2> >(tee -a "$LOG" >&2))"; then
     _bootstrap_root="$(printf '%s' "$_bootstrap_root" | tail -n1 | tr -d '[:space:]')"
@@ -299,7 +283,7 @@ if [ -n "${EZIL_WORKSPACE_STARTUP_DELIVERY:-}" ]; then
       # invoked without an explicit argv override).
       export EZIL_WORKSPACE_ROOT="$WORKSPACE_ROOT"
     fi
-    log "workspace hydration succeeded — VS Code target root=$WORKSPACE_ROOT"
+    log "workspace hydration succeeded — code-server target root=$WORKSPACE_ROOT"
     phase_end workspace_hydration ok
   else
     log "ERROR: workspace hydration failed (sealed delivery present) — failing closed"
@@ -307,7 +291,7 @@ if [ -n "${EZIL_WORKSPACE_STARTUP_DELIVERY:-}" ]; then
     exit 1
   fi
 else
-  log "no sealed workspace-startup delivery present — skipping hydration (legacy/pre-ready path), VS Code root=$WORKSPACE_ROOT"
+  log "no sealed workspace-startup delivery present — skipping hydration (legacy/pre-ready path), code-server root=$WORKSPACE_ROOT"
   phase_end workspace_hydration skipped
 fi
 
@@ -325,7 +309,7 @@ fi
 #
 # Placed HERE — after $WORKSPACE_ROOT is fully finalized (hydration above, if
 # any, has already resolved/relocated it) and BEFORE both start-devserver.sh's
-# dependency install below and VS Code opening the workspace further down —
+# dependency install below and code-server opening the workspace further down —
 # so neither ever sees node_modules/.next resolve onto the FUSE mount.
 # Idempotent (containers re-mount their R2 bucket and re-run this script
 # across restarts: re-pointing an already-correct symlink is a no-op) and
@@ -379,7 +363,7 @@ fi
 # — deliberately. start-devserver.sh is itself non-blocking: it backgrounds
 # dependency install and the dev-server process and returns almost
 # immediately (`starting`/`already-running`), so invoking it here adds no
-# measurable delay and can never serialize behind, or gate, VS Code/Chrome
+# measurable delay and can never serialize behind, or gate, code-server/Chrome
 # readiness or `neko serve` binding its own port below. A slow or crashing
 # dev server therefore never prevents the desktop from becoming ready — its
 # real state is written to /tmp/devserver.phase (crashed/timeout/running/…)
@@ -456,7 +440,7 @@ if command -v pulseaudio >/dev/null 2>&1; then
   pulseaudio --log-level=error --disallow-module-loading --disallow-exit --exit-idle-time=-1 >>"$LOG" 2>&1 &
 fi
 
-# ── App supervision (VS Code + isolated Chromium) ─────────────────────────────
+# ── App supervision (code-server + isolated Chromium) ─────────────────────────
 # Both apps run on the same $DISPLAY, each supervised independently: a crash in
 # one app is caught, logged (sanitized — no window titles, URLs, or args), and
 # retried with backoff, and never takes down the other app, `neko serve`, or
@@ -556,40 +540,37 @@ monitor_apps() {
   done
 }
 
-# ── VS Code (mandatory — validated above in preflight; never skipped) ────────
-# Launched into the X session so it is present the moment a media path exists.
-# Presence of the binary was already validated (fail-closed) above; this
-# supervises the process itself. If the process keeps crashing past its
-# restart budget it is reported via health/log output, but Neko readiness is
-# additionally gated on the app's X window actually appearing (see the
-# window-ready gate below) — a stuck/crash-looping app cannot be reported
-# ready.
-#
-# Firecracker-safe Electron flags (mirrors the Chromium flags below):
-#   --no-sandbox           required (no user namespaces in the Sandbox runtime)
-#   --disable-gpu          avoid the GPU child crash that prevented the top-level
-#                          window from ever mapping under Firecracker/Xvfb
-#   --disable-dev-shm-usage  /dev/shm is tiny in the Sandbox runtime; use temp
-#                          files so the renderer does not abort on shm exhaustion
-# We launch the Electron binary DIRECTLY (blocking for the window lifetime)
-# when it could be resolved above; otherwise we fall back to the `code` CLI
-# wrapper with `--wait` plus the same safe flags.
-# NOTE: `vscode_launch` only times the (near-instant) request to fork the
+# ── code-server (mandatory — validated above in preflight; never skipped) ────
+# Replaces Electron VS Code. This is the load-bearing reason for the whole
+# swap: Electron VS Code was a SECOND Chromium-family renderer compositing
+# into this same Xvfb display ($DISPLAY) alongside the native browser below,
+# every repaint of BOTH going through the one software vp8enc encoder
+# (see the encoder-tuning section further down), plus VS Code's own extension
+# host — all sharing whatever CPU this container has. code-server is a plain
+# Node.js HTTP server: it renders nothing into Xvfb, puts nothing through the
+# video encoder, and is NOT part of the neko/WebRTC desktop stream at all. Its
+# `--bind-addr 127.0.0.1:8443` is loopback-only (never 0.0.0.0); the only
+# inbound path is the existing HMAC/cookie-gated containerFetch proxy.
+# Supervised the same way chrome/vscode always were (supervise_app — restart
+# budget, health file, fatal-sentinel teardown on exhaustion) so a crashing
+# code-server is caught exactly like a crashing browser used to be; readiness
+# is confirmed below by the (now data-driven) window/tcp gate rather than
+# assumed from the process merely being alive.
+# NOTE: `codeserver_launch` only times the (near-instant) request to fork the
 # supervised background process — supervise_app itself is non-blocking. How
-# long the window actually takes to APPEAR is measured separately by the
-# `window_ready_gate` phase below, which is the number that actually matters
-# and runs concurrently with Chrome's (see that phase for the concurrency
-# note — nothing here changes that).
-phase_start vscode_launch
-VSCODE_SAFE_FLAGS=(--no-sandbox --disable-gpu --disable-dev-shm-usage --user-data-dir=/tmp/vscode-data)
-if [ -n "$VSCODE_ELECTRON" ]; then
-  log "supervising VS Code Electron ($VSCODE_ELECTRON) into $DISPLAY at $WORKSPACE_ROOT (mandatory, direct blocking launch, isolated user-data-dir)"
-  supervise_app vscode "$NEKO_APP_MAX_RESTARTS" "$VSCODE_ELECTRON" "${VSCODE_SAFE_FLAGS[@]}" "$WORKSPACE_ROOT"
-else
-  log "supervising VS Code ($VSCODE_BIN) into $DISPLAY at $WORKSPACE_ROOT (mandatory, CLI --wait fallback, isolated user-data-dir)"
-  supervise_app vscode "$NEKO_APP_MAX_RESTARTS" "$VSCODE_BIN" --wait "${VSCODE_SAFE_FLAGS[@]}" "$WORKSPACE_ROOT"
-fi
-phase_end vscode_launch ok
+# long the port actually takes to open is measured separately by the
+# `window_ready_gate` phase below (see EZIL_DESKTOP_APPS), which runs
+# concurrently with Chrome's window check.
+phase_start codeserver_launch
+log "supervising code-server ($CODE_SERVER_BIN) on 127.0.0.1:8443 at $WORKSPACE_ROOT (mandatory, isolated user-data-dir)"
+supervise_app codeserver "$NEKO_APP_MAX_RESTARTS" "$CODE_SERVER_BIN" \
+  --bind-addr 127.0.0.1:8443 \
+  --auth none \
+  --disable-telemetry \
+  --user-data-dir=/tmp/code-server-data \
+  --extensions-dir=/tmp/code-server-extensions \
+  "$WORKSPACE_ROOT"
+phase_end codeserver_launch ok
 
 # ── Native browser (mandatory — validated above in preflight; never skipped) ─
 # Reuses whichever Chromium-family binary the image already has installed
@@ -614,16 +595,16 @@ else
   log "WARNING: browser landing asset $CHROME_HOME_FILE missing — falling back to about:blank"
   CHROME_HOME_URL="about:blank"
 fi
-# Additional free-CPU flags (standard-1 has no idle CPU to spare): these only
-# trim CHROME'S OWN background service chatter (component/extension update
-# checks, default-apps bookkeeping, hyperlink-auditing pings, misc background
-# network requests) — the same set widely used for containerized/headless
-# Chrome (e.g. Puppeteer's Docker guidance). None of them touch rendering,
-# JS, canvas, or WebGL, so a previewed app's own behavior is unaffected;
-# deliberately NOT applied to VS Code Electron below, which has its own
-# legitimate background networking (extensions marketplace, settings) that
-# this script has no basis to assume is safe to cut.
-# NOTE: same as `vscode_launch` above — this only times the near-instant
+# Additional free-CPU flags: these only trim CHROME'S OWN background service
+# chatter (component/extension update checks, default-apps bookkeeping,
+# hyperlink-auditing pings, misc background network requests) — the same set
+# widely used for containerized/headless Chrome (e.g. Puppeteer's Docker
+# guidance). None of them touch rendering, JS, canvas, or WebGL, so a
+# previewed app's own behavior is unaffected. code-server (launched above,
+# replacing Electron VS Code) has its own separate extensions-marketplace/
+# settings networking that this script has no basis to assume is safe to cut,
+# and is unaffected by these Chrome-specific flags regardless.
+# NOTE: same as `codeserver_launch` above — this only times the near-instant
 # supervised-process fork request; actual window-appearance time is measured
 # by the concurrent `window_ready_gate` phase below.
 phase_start chrome_launch
@@ -662,6 +643,15 @@ cat >/usr/local/bin/neko-switch-app.sh <<'SWITCH_EOF'
 # display. Resolves the window by its WM_CLASS via `wmctrl -x -l` (class is
 # stable regardless of the page/document title), then activates it by explicit
 # window id (`wmctrl -i -a <id>`) so the match is exact and inspectable.
+#
+# The `vscode` case now has no window to ever find: code-server (which
+# replaced Electron VS Code) is a plain HTTP server, not an X client, so it
+# never appears in `wmctrl -x -l`. This is a confirmed, verified no-op, not an
+# oversight — `win_id` comes back empty, the branch below prints an ERROR to
+# stderr and exits 1, and nothing else observes or propagates that exit code
+# (Openbox's <action name="Execute"> keybind below fires the command and does
+# not care about its result). The `chromium` case is unaffected and still
+# resolves/focuses the native browser window normally.
 set -uo pipefail
 export DISPLAY="${DISPLAY:-:99}"
 case "${1:-}" in
@@ -684,16 +674,28 @@ exec wmctrl -i -a "$win_id"
 SWITCH_EOF
 chmod +x /usr/local/bin/neko-switch-app.sh
 
-# ── Window-ready gate (mandatory, fail-closed) ────────────────────────────────
+# ── Window-ready gate (mandatory, fail-closed, data-driven) ──────────────────
 # Readiness MUST NOT be reported (i.e. `neko serve` must not be started, and
-# this script must not exit successfully) unless BOTH mandatory apps have
-# actually created their X window within a bounded startup timeout. A
-# process being alive (supervise_app's PID bookkeeping) is not sufficient
-# proof — Electron/Chromium can be running yet still be mid-splash with no
-# mapped top-level window. This gate polls `wmctrl -l` for a window whose
-# title/class matches each app's pattern, exactly the same pattern
-# `neko-switch-app.sh` uses, so "ready" and "focusable" are the same
-# definition of ready.
+# this script must not exit successfully) unless EVERY app in the mandatory
+# set has actually become ready within a bounded startup timeout. A process
+# being alive (supervise_app's PID bookkeeping) is not sufficient proof —
+# Electron/Chromium can be running yet still be mid-splash with no mapped
+# top-level window, and a server process can be forked yet not listening.
+#
+# The mandatory set is DATA, not hardcoded control flow — EZIL_DESKTOP_APPS is
+# a space-separated list of `name:kind:target` entries, so a future app swap
+# (like this one) only ever needs to change the DEFAULT VALUE below, never
+# this gate's logic. Two kinds are supported:
+#   window  target = an X `WM_CLASS` regex, polled via `wmctrl -x -l` — same
+#           pattern `neko-switch-app.sh` uses, so "ready" and "focusable" are
+#           the same definition of ready.
+#   tcp     target = `host:port`, polled the same way `wait_tcp` (above) is
+#           used for neko's own HTTP port.
+# Default reflects what this image actually ships today: the native browser
+# (an X window) and code-server (a loopback HTTP port, NOT an X window — see
+# the "code-server launch" section above for why Electron VS Code's X-window
+# check was replaced with a port check rather than just deleted).
+EZIL_DESKTOP_APPS="${EZIL_DESKTOP_APPS:-browser:window:chrome codeserver:tcp:127.0.0.1:8443}"
 NEKO_WINDOW_READY_TIMEOUT="${NEKO_WINDOW_READY_TIMEOUT:-60}"
 
 wait_for_window() {
@@ -707,6 +709,32 @@ wait_for_window() {
   return 1
 }
 
+# wait_for_app_ready <name:kind:target> <timeout_sec> — dispatches to the
+# right probe for `kind`. Splits on the FIRST two colons only, so a `tcp`
+# target's own `host:port` colon is preserved intact in $target.
+wait_for_app_ready() {
+  local spec="$1" timeout_sec="$2"
+  local rest="${spec#*:}"
+  local kind="${rest%%:*}"
+  local target="${rest#*:}"
+  case "$kind" in
+    window)
+      wait_for_window "$target" "$timeout_sec"
+      ;;
+    tcp)
+      local host="${target%:*}" port="${target##*:}"
+      # wait_tcp (defined near the top of this script) sleeps 0.5s per try —
+      # double the try count to normalize to the same per-second timeout unit
+      # wait_for_window uses (1s per try).
+      wait_tcp "$host" "$port" "$((timeout_sec * 2))"
+      ;;
+    *)
+      log "ERROR: EZIL_DESKTOP_APPS entry '$spec' has unknown kind '$kind' (expected window|tcp)"
+      return 1
+      ;;
+  esac
+}
+
 phase_start window_ready_gate
 if ! command -v wmctrl >/dev/null 2>&1; then
   log "ERROR: wmctrl not installed — cannot verify mandatory app windows before reporting readiness. Failing closed."
@@ -714,41 +742,46 @@ if ! command -v wmctrl >/dev/null 2>&1; then
   exit 1
 fi
 
-# Both windows are polled CONCURRENTLY (not sequentially) — each app gets its
-# own full ${NEKO_WINDOW_READY_TIMEOUT}s budget in parallel, so the gate takes
-# as long as the SLOWER of the two apps, not their sum. This still fails
-# closed: if either window never appears within its timeout, the gate fails
-# and `neko serve` is never started. The two `phase_start`/`phase_end` calls
+# Every app in EZIL_DESKTOP_APPS is polled CONCURRENTLY (not sequentially) —
+# each gets its own full ${NEKO_WINDOW_READY_TIMEOUT}s budget in parallel, so
+# the gate takes as long as the SLOWEST app, not their sum. This still fails
+# closed: if any entry never becomes ready within its timeout, the gate fails
+# and `neko serve` is never started. The `phase_start`/`phase_end` calls
 # above/below this block bracket the WHOLE concurrent wait (they do not run
-# per-branch), so they cannot serialize what was deliberately made parallel —
-# do not move them inside the `&`-backgrounded branches below.
-log "waiting up to ${NEKO_WINDOW_READY_TIMEOUT}s (concurrently) for VS Code and native browser X windows to appear"
-
-wait_for_window 'code|Code' "$NEKO_WINDOW_READY_TIMEOUT" &
-vscode_wait_pid=$!
-wait_for_window 'chrome' "$NEKO_WINDOW_READY_TIMEOUT" &
-chrome_wait_pid=$!
-
-vscode_ready=0
-wait "$vscode_wait_pid" && vscode_ready=1
-chrome_ready=0
-wait "$chrome_wait_pid" && chrome_ready=1
-
-if [ "$vscode_ready" -ne 1 ]; then
-  log "ERROR: VS Code did not create its X window within ${NEKO_WINDOW_READY_TIMEOUT}s. Mandatory app failed to become ready — refusing to report Neko readiness or start neko serve."
+# per-app), so they cannot serialize what was deliberately made parallel — do
+# not move them inside the loop below.
+read -r -a DESKTOP_APP_SPECS <<<"$EZIL_DESKTOP_APPS"
+if [ "${#DESKTOP_APP_SPECS[@]}" -eq 0 ]; then
+  log "ERROR: EZIL_DESKTOP_APPS is empty — no mandatory apps configured. Failing closed."
+  phase_end window_ready_gate error
+  exit 1
 fi
-if [ "$chrome_ready" -ne 1 ]; then
-  log "ERROR: native browser did not create its X window within ${NEKO_WINDOW_READY_TIMEOUT}s. Mandatory app failed to become ready — refusing to report Neko readiness or start neko serve."
-fi
-if [ "$vscode_ready" -ne 1 ] || [ "$chrome_ready" -ne 1 ]; then
+log "waiting up to ${NEKO_WINDOW_READY_TIMEOUT}s (concurrently) for mandatory apps to become ready: ${DESKTOP_APP_SPECS[*]%%:*}"
+
+declare -A APP_WAIT_PID=()
+for spec in "${DESKTOP_APP_SPECS[@]}"; do
+  wait_for_app_ready "$spec" "$NEKO_WINDOW_READY_TIMEOUT" &
+  APP_WAIT_PID["$spec"]=$!
+done
+
+gate_ok=1
+for spec in "${DESKTOP_APP_SPECS[@]}"; do
+  app_name="${spec%%:*}"
+  if wait "${APP_WAIT_PID[$spec]}"; then
+    log "${app_name} ready"
+  else
+    log "ERROR: ${app_name} did not become ready within ${NEKO_WINDOW_READY_TIMEOUT}s (spec=${spec}). Mandatory app failed to become ready — refusing to report Neko readiness or start neko serve."
+    gate_ok=0
+  fi
+done
+
+if [ "$gate_ok" -ne 1 ]; then
   log "window-ready gate FAILED — refusing to report Neko readiness or start neko serve."
   phase_end window_ready_gate error
   exit 1
 fi
 
-log "VS Code X window confirmed"
-log "native browser X window confirmed"
-log "window-ready gate passed: both mandatory app windows present"
+log "window-ready gate passed: all mandatory apps present (${DESKTOP_APP_SPECS[*]%%:*})"
 phase_end window_ready_gate ok
 
 # ── Software video-encoder tuning (free CPU lever, no cost) ──────────────────
@@ -765,51 +798,70 @@ phase_end window_ready_gate ok
 # 1920x1080 (from desktop.screen), 25 fps, cpu-used=4, threads=4,
 # deadline=1 (already the cheapest/realtime libvpx deadline), end-usage=cbr,
 # target-bitrate=round(3072*650)≈2.0 Mbps. That default was written assuming
-# a normal multi-core host; three of its numbers are wrong for a
+# a normal multi-core host; the numbers below were previously tuned for a
 # standard-1 container (0.5 vCPU, no GPU, software-only encode shared with
-# Xvfb, two Electron apps, and the user's dev-server compile):
+# Xvfb, TWO Electron/Chromium apps — VS Code plus the native browser — and
+# the user's dev-server compile). Two things have since changed, both
+# independently increasing the free CPU budget available to this encoder:
+#   1. instance_type moved standard-1 -> standard-3 (0.5 -> 2 full vCPU; see
+#      wrangler.toml's own comment on that change) — already true before this
+#      commit, but this comment (and the tuning below) had gone stale.
+#   2. Electron VS Code (a SECOND full Chromium-class renderer + its own
+#      extension host, also compositing into this same Xvfb display and
+#      being captured by this same encoder) is replaced by code-server in
+#      this commit — a plain HTTP server that puts nothing through the
+#      encoder at all. Only ONE Chromium-family renderer (the native browser)
+#      now shares this display/encoder.
 #
-#   fps 25 -> 15:      a coding desktop is dominated by static text, cursor
-#                      blink, and occasional scroll — not motion video. 15fps
-#                      is smooth enough for typing/scrolling feedback and cuts
-#                      ~40% of the frames vp8enc must process, the single
-#                      biggest lever available WITHOUT touching resolution.
-#                      Resolution (1920x1080, from desktop.screen) is left
-#                      untouched on purpose: text legibility/sharpness matters
-#                      far more than motion smoothness on this desktop, and
-#                      the brief is explicit about that trade-off.
-#   cpu-used 4 -> 6:   vp8enc's speed/quality dial (0-16, higher = faster/
-#                      cheaper, lower = slower/sharper). On a shared half-core
-#                      the CPU saved by nudging this up is worth more than the
-#                      marginal quality difference at the coding-desktop
-#                      framerates above; 6 stays well short of the
-#                      visibly-blocky extremes (12+).
-#   threads 4 -> 1:    vp8enc's row-based multithreading only pays off with
-#                      genuine parallel execution lanes. standard-1 grants
-#                      0.5 vCPU — LESS than one full core of average compute,
-#                      not several — so 4 encoder threads cannot get real
-#                      parallelism; they only add inter-thread sync/scheduling
-#                      overhead on top of an already CPU-starved core, for
-#                      zero throughput gain.
-#   target-bitrate:    left EXACTLY as-is (round(3072*650) ≈ 2.0 Mbps). Bitrate
-#                      is not a meaningful CPU driver for vp8enc (cpu-used and
-#                      fps are); holding it constant while fps drops means
-#                      MORE bits are spent per remaining frame, which is a
-#                      free sharpness win in the same direction as keeping
-#                      full 1080p resolution.
+#   fps 25 -> 15:        UNCHANGED by this commit — this trade-off is about
+#                        visual CONTENT (a coding desktop is dominated by
+#                        static text/cursor/scroll, not motion video), not
+#                        CPU scarcity, so freed CPU is not a reason to revert
+#                        it. Resolution (1920x1080) also stays untouched for
+#                        the same reason: text legibility over motion
+#                        smoothness.
+#   cpu-used 6 -> 4:     vp8enc's speed/quality dial (0-16, higher = faster/
+#                        cheaper, lower = slower/sharper) is moved back to
+#                        upstream's own default. 6 was chosen specifically to
+#                        buy back CPU on a shared half-core with two
+#                        Electron-class renderers; with a full 2 vCPU and only
+#                        one such renderer left, that headroom is no longer
+#                        scarce enough to justify the visible quality cost of
+#                        overshooting the default.
+#   threads 1 -> 2:      vp8enc's row-based multithreading only pays off with
+#                        genuine parallel execution lanes, which standard-1's
+#                        0.5 vCPU never had (hence 1). standard-3 grants 2
+#                        full cores, so 2 encoder threads can now get real
+#                        parallelism without starving anything else on this
+#                        display (down from the compiled-in default of 4,
+#                        which would still be more encoder threads than this
+#                        container has cores once Xvfb/openbox/the browser/
+#                        the user's dev server are accounted for).
+#   target-bitrate:      left EXACTLY as-is (round(3072*650) ≈ 2.0 Mbps), same
+#                        reasoning as before — bitrate is not a meaningful CPU
+#                        driver for vp8enc.
+#
+# NOTE: these three numbers are a REASONED re-tune from the architecture
+# change above (documented CPU-cost drivers removed/added), NOT a live
+# measurement — this file's own WebRTC/input section above notes that the
+# actual pixel/media pipeline is TURN-gated and unverified end-to-end in this
+# environment, so encoder CPU% under real load was not (and could not be)
+# sampled here. If EZIL_NEKO_CPU_DIAG_ENABLED sampling from a real deployment
+# later shows headroom to spare or a regression, retune these three values —
+# not fps/resolution, per the trade-off above.
 #
 # This is neko's own documented default pipeline (server/internal/config/
-# capture_pipeline.go's `vp8enc` branch) with exactly those three numbers
-# adjusted for this container's real CPU budget — not an invented streaming
-# preset. Delivered via `NEKO_CAPTURE_VIDEO_PIPELINES` (env — see precedence
-# note above) so it can be overridden per-deployment without editing this
-# script, and `NEKO_CAPTURE_VIDEO_IDS` because setting `capture.video.pipelines`
-# does not implicitly populate `capture.video.ids` — an empty id list would
-# leave no video stream selectable at all.
+# capture_pipeline.go's `vp8enc` branch) with these three numbers adjusted for
+# this container's real CPU budget — not an invented streaming preset.
+# Delivered via `NEKO_CAPTURE_VIDEO_PIPELINES` (env — see precedence note
+# above) so it can be overridden per-deployment without editing this script,
+# and `NEKO_CAPTURE_VIDEO_IDS` because setting `capture.video.pipelines` does
+# not implicitly populate `capture.video.ids` — an empty id list would leave
+# no video stream selectable at all.
 NEKO_CAPTURE_VIDEO_IDS="${NEKO_CAPTURE_VIDEO_IDS:-main}"
-NEKO_CAPTURE_VIDEO_PIPELINES="${NEKO_CAPTURE_VIDEO_PIPELINES:-{\"main\":{\"fps\":\"15\",\"gst_encoder\":\"vp8enc\",\"gst_params\":{\"target-bitrate\":\"round(3072 * 650)\",\"cpu-used\":\"6\",\"end-usage\":\"cbr\",\"threads\":\"1\",\"deadline\":\"1\",\"undershoot\":\"95\",\"buffer-size\":\"(3072 * 4)\",\"buffer-initial-size\":\"(3072 * 2)\",\"buffer-optimal-size\":\"(3072 * 3)\",\"keyframe-max-dist\":\"25\",\"min-quantizer\":\"4\",\"max-quantizer\":\"20\"}}}}"
+NEKO_CAPTURE_VIDEO_PIPELINES="${NEKO_CAPTURE_VIDEO_PIPELINES:-{\"main\":{\"fps\":\"15\",\"gst_encoder\":\"vp8enc\",\"gst_params\":{\"target-bitrate\":\"round(3072 * 650)\",\"cpu-used\":\"4\",\"end-usage\":\"cbr\",\"threads\":\"2\",\"deadline\":\"1\",\"undershoot\":\"95\",\"buffer-size\":\"(3072 * 4)\",\"buffer-initial-size\":\"(3072 * 2)\",\"buffer-optimal-size\":\"(3072 * 3)\",\"keyframe-max-dist\":\"25\",\"min-quantizer\":\"4\",\"max-quantizer\":\"20\"}}}}"
 export NEKO_CAPTURE_VIDEO_IDS NEKO_CAPTURE_VIDEO_PIPELINES
-log "video encoder: vp8 software, 1920x1080, 15fps, cpu-used=6, threads=1, ~2.0Mbps (tuned for standard-1's 0.5 vCPU; see start-neko.sh comment for full precedence/justification)"
+log "video encoder: vp8 software, 1920x1080, 15fps, cpu-used=4, threads=2, ~2.0Mbps (re-tuned for standard-3's 2 vCPU now that code-server replaced the second Electron-class renderer; see start-neko.sh comment for full precedence/justification)"
 
 # ── Neko application server (HTTP UI + WebSocket signaling) ────────────────────
 # Bind to 0.0.0.0 so proxyToSandbox() can reach it. Config auto-discovered from
