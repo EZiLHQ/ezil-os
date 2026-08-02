@@ -717,12 +717,26 @@ launch_devserver() {
   # not from this. `nice` is coreutils and always present; the branch exists
   # so a stripped image degrades to the un-niced call rather than to no dev
   # server at all.
+  #
+  # 🔴 Backgrounded and `wait`ed rather than run in the foreground. Bash defers
+  #    a trapped signal until the current FOREGROUND command finishes, and the
+  #    launcher is the one long thing on this path — this file's own
+  #    dev-server-isolation test simulates it as never returning, and the
+  #    bounded real version is a cold `bun install`, which is minutes. In the
+  #    foreground form, a container SIGTERM arriving in that window was simply
+  #    ignored: the teardown handler never ran and the whole desktop was still
+  #    running when the runtime escalated to SIGKILL. `wait` IS interruptible by
+  #    a trap, so the handler runs immediately. The exit status is preserved.
   local launch_rc=0
   if command -v nice >/dev/null 2>&1; then
-    nice -n 10 "$DEVSERVER_BIN" "$WORKSPACE_ROOT" || launch_rc=$?
+    nice -n 10 "$DEVSERVER_BIN" "$WORKSPACE_ROOT" &
   else
-    "$DEVSERVER_BIN" "$WORKSPACE_ROOT" || launch_rc=$?
+    "$DEVSERVER_BIN" "$WORKSPACE_ROOT" &
   fi
+  local launch_pid=$!
+  # Tracked so teardown stops the launcher too if it is still going.
+  SESSION_PID+=("$launch_pid")
+  wait "$launch_pid" || launch_rc=$?
   if [ "$launch_rc" -eq 0 ]; then
     phase_end devserver_launch ok
   else
