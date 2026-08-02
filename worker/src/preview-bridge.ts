@@ -12,11 +12,14 @@
  * Endpoints exposed under the app-preview hostname
  * (`<APP_PREVIEW_PORT>-<sandboxId>-<APP_PREVIEW_TOKEN>.<zone>`):
  *
- *   GET /preview-bootstrap?token=<t=ts,v1=hmac>[&path=/foo]
+ *   GET /preview-bootstrap?token=<t=ts,v1=hmac>[&path=/foo][&folder=/abs/path]
  *       Validates the short-lived, sandboxId-bound HMAC token (see
  *       `./hmac`'s module doc for why this Worker binds sandboxId into the
  *       payload, unlike Azure's per-session-secret model), sets the
  *       `ezil_preview` HttpOnly cookie, and 302-redirects to `/preview/<path>`.
+ *       `folder` (code bridge only — see `handlePreviewBootstrap`) is
+ *       forwarded onto that redirect so code-server's very first request
+ *       opens with a workspace instead of an empty file tree.
  *
  *   * /preview/<path>
  *       Cookie-gated HTTP reverse-proxy to the container's dev server
@@ -729,15 +732,37 @@ export interface BootstrapResult {
 }
 
 /**
- * Handle `GET /preview-bootstrap?token=...&path=...`. Verifies the
- * sandboxId-bound HMAC token, mints the `ezil_preview` cookie, and
+ * Handle `GET /preview-bootstrap?token=...&path=...[&folder=...]`. Verifies
+ * the sandboxId-bound HMAC token, mints the `ezil_preview` cookie, and
  * 302-redirects to `/preview<path>`.
+ *
+ * `folder` is forwarded onto the redirect's query string ONLY for
+ * `target === 'code'` (default `'app'` for every pre-existing call site,
+ * including this file's own tests, none of which need it). This is the fix
+ * for the "Code opens with an empty file tree" gap: code-server (VS Code
+ * Web) needs `?folder=<abs path>` on the very first request it serves to
+ * pre-select a workspace — without it, its own UI shows "You have no recent
+ * folders" and the explorer stays empty, no matter how correctly
+ * code-server itself was launched. `worker/src/index.ts`'s `buildBridgeUrl`
+ * is the ONLY minter of this param, deriving it from
+ * `resolveWorkspaceMountConfig`'s `mountPath` — the exact same value already
+ * forwarded into the container as `EZIL_WORKSPACE_ROOT` (see `ensureDesktop`'s
+ * `workspaceRootEnv`) — so this never hardcodes a path of its own.
+ *
+ * Why this needs an explicit passthrough rather than "just works": this
+ * handler builds `locationUrl` as a BRAND NEW `URL`, not a copy of the
+ * incoming one — every query param on the `/preview-bootstrap` request other
+ * than `token`/`path` is silently dropped unless named here. `folder` is
+ * named. Nothing else is (deliberately — the app target still has no use for
+ * it, and forwarding an unknown query param into a user's own Next.js/Vite
+ * dev server risks confusing its own routing for no benefit).
  */
 export async function handlePreviewBootstrap(
   url: URL,
   sandboxId: string,
   secrets: string[],
   cookieSecret: string | undefined,
+  target: BridgeTarget = 'app',
 ): Promise<Response> {
   const token = url.searchParams.get('token') ?? undefined;
   const auth = await verifyPreviewBootstrapToken(token, secrets, sandboxId);
@@ -778,6 +803,15 @@ export async function handlePreviewBootstrap(
   // carries it forward onto same-origin client-side requests for the rest of
   // that page load.
   const locationUrl = new URL(`/preview${destPath}`, url);
+  // 🔴 code-server's file tree gap: see this function's doc comment above.
+  // `handlePreviewProxy` forwards every remaining query param on the
+  // eventual `/preview` request straight to the container
+  // (`stripPreviewQueryParam` strips only `PREVIEW_COOKIE_QUERY_PARAM`), so
+  // once `folder` survives THIS redirect it reaches code-server unmodified.
+  if (target === 'code') {
+    const folder = url.searchParams.get('folder');
+    if (folder) locationUrl.searchParams.set('folder', folder);
+  }
   locationUrl.searchParams.set(PREVIEW_COOKIE_QUERY_PARAM, cookie);
   const location = `${locationUrl.pathname}${locationUrl.search}`;
 

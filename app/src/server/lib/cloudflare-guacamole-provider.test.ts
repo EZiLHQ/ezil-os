@@ -661,6 +661,29 @@ describe('composeAppPreviewBootstrapUrl', () => {
         const url = composeAppPreviewBootstrapUrl('https://3002-guac-a-b-app.ezil.org', 't=1,v1=abc', '/dashboard');
         expect(new URL(url).searchParams.get('path')).toBe('/dashboard');
     });
+
+    // `extraParams` exists ONLY to carry `folder=` for `codePreviewUrl`'s
+    // Worker-predates-the-field fallback (see the router's `codePreviewUrl`
+    // procedure) — this pins that `appPreviewUrl`'s call site (no
+    // `extraParams`) stays completely unaffected while the mechanism itself
+    // works.
+    it('sets any extraParams onto the URL, additive to token/path', () => {
+        const url = composeAppPreviewBootstrapUrl(
+            'https://8443-guac-a-b-code.ezil.org',
+            't=1,v1=abc',
+            '/',
+            { folder: '/workspace' },
+        );
+        const parsed = new URL(url);
+        expect(parsed.searchParams.get('token')).toBe('t=1,v1=abc');
+        expect(parsed.searchParams.has('path')).toBe(false);
+        expect(parsed.searchParams.get('folder')).toBe('/workspace');
+    });
+
+    it('omits extraParams entirely when not given — no regression for appPreviewUrl callers', () => {
+        const url = composeAppPreviewBootstrapUrl('https://3002-guac-a-b-app.ezil.org', 't=1,v1=abc');
+        expect(new URL(url).searchParams.has('folder')).toBe(false);
+    });
 });
 
 describe('APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS', () => {
