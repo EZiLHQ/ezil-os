@@ -52,8 +52,43 @@ interface CallLog {
   exec: number;
   /** Every `containerFetch(url, init, port)` the route table actually made. */
   containerFetch: Array<{ url: string; port: number; headers: Record<string, string> }>;
+  /**
+   * Every request that reached the Durable Object's HTTP entrypoint
+   * (`stub.fetch`) — i.e. what the SDK's REAL `wsConnect()` delivered after its
+   * own `switchPort()` ran. `port` is resolved exactly the way
+   * `Sandbox.fetch` + `Container.fetch` resolve it, so a handler that loses the
+   * upgrade headers is recorded as hitting port 3000, not 8443.
+   */
+  wsConnect: Array<{ url: string; port: number; method: string; headers: Record<string, string> }>;
   /** Every `exposePort(port, {hostname, token})` the route table actually made. */
   exposePort: Array<{ port: number; token: string; hostname: string }>;
+}
+
+/** Opaque stand-in for a `WebSocket`; only its identity is ever compared. */
+const FAKE_UPSTREAM_WS = { id: 'upstream-ws' } as unknown as WebSocket;
+
+/**
+ * code-server's `authenticateOrigin` (`src/node/http.ts`), ported faithfully —
+ * duplicated from `preview-bridge.test.ts` on purpose so each test module stays
+ * self-contained. Runs on code-server's WS router only, which is why the editor
+ * renders fine over HTTP and only the sockets 403.
+ *
+ * `getHost()` honours `Forwarded`, then `X-Forwarded-Host`, then `Host`.
+ * Throws on rejection; code-server maps that to HTTP 403.
+ */
+function simulateCodeServerEnsureOrigin(headers: Record<string, string>, origin: string | null): void {
+  if (!origin) return;
+  const originHost = new URL(origin).host.trim().toLowerCase();
+  let host: string | undefined;
+  if (headers['forwarded'] !== undefined) {
+    host = /host="?([^";]+)"?/.exec(headers['forwarded'])?.[1]?.trim().toLowerCase();
+  } else if (headers['x-forwarded-host'] !== undefined && headers['x-forwarded-host'] !== '') {
+    host = headers['x-forwarded-host'].split(',')[0]?.trim().toLowerCase();
+  } else {
+    host = headers['host'];
+  }
+  if (host === undefined) throw new Error('no host headers found');
+  if (host !== originHost) throw new Error(`incorrect origin: ${originHost} does not match host ${host}`);
 }
 
 /**
@@ -85,6 +120,7 @@ function fakeSandboxNamespace(options: {
     getExposedPorts: 0,
     exec: 0,
     containerFetch: [],
+    wsConnect: [],
     exposePort: [],
   };
 
@@ -96,6 +132,20 @@ function fakeSandboxNamespace(options: {
         headers[k] = v;
       });
       calls.containerFetch.push({ url, port, headers });
+      // 🔴 `containerFetch` is a Durable Object JSRPC method. When the
+      // container answers an upgrade it returns 101 + `webSocket`, and that
+      // return value cannot be serialized back across the RPC boundary —
+      // workerd rejects the call with exactly this message (reproduced against
+      // real workerd, and observed in production as a 502 on every code-server
+      // socket). Modelling it here is what makes the WebSocket tests below
+      // able to fail: the previous fake returned a bare
+      // `new Response(null, {status: 101})`, the one shape RPC *can* carry and
+      // the one shape production can never produce.
+      if ((headers.upgrade ?? '').toLowerCase() === 'websocket') {
+        throw new Error(
+          'Could not serialize object of type "WebSocket". This type does not support serialization.',
+        );
+      }
       return (
         options.containerResponse?.() ??
         new Response('<html><head></head><body>upstream</body></html>', {
@@ -103,6 +153,43 @@ function fakeSandboxNamespace(options: {
           headers: { 'content-type': 'text/html; charset=utf-8' },
         })
       );
+    },
+    // The Durable Object's HTTP entrypoint. Note this is NOT a stand-in for
+    // `wsConnect()`: `getSandbox()` supplies the REAL `wsConnect`, which is
+    // `switchPort()` + `stub.fetch()`, so the SDK's own implementation runs and
+    // only this last hop is faked. Unlike a JSRPC method, this boundary CAN
+    // carry a 101 + `webSocket` — it is the same one the working neko desktop
+    // stream crosses, and a raw HTTP/1.1 upgrade through this exact shape was
+    // verified end to end against real workerd.
+    //
+    // Port resolution mirrors `Sandbox.fetch` -> `Container.fetch` exactly,
+    // including the trap: the WebSocket branch requires BOTH `Upgrade:
+    // websocket` and a `Connection` containing `upgrade`, and anything that
+    // misses it silently falls back to `determinePort(url)` — 3000, the SDK's
+    // own control plane. A handler that drops either header is therefore
+    // recorded here as talking to port 3000, not to the bridge port.
+    fetch: async (...args: unknown[]) => {
+      const [request] = args as [Request];
+      const headers: Record<string, string> = {};
+      request.headers.forEach((v, k) => {
+        headers[k] = v;
+      });
+      const takesUpgradeBranch =
+        (headers.upgrade ?? '').toLowerCase() === 'websocket' &&
+        (headers.connection ?? '').toLowerCase().includes('upgrade');
+      const proxyMatch = /^\/proxy\/(\d+)/.exec(new URL(request.url).pathname);
+      const port = takesUpgradeBranch
+        ? Number(headers['cf-container-target-port'])
+        : proxyMatch
+          ? Number(proxyMatch[1])
+          : 3000;
+      calls.wsConnect.push({ url: request.url, port, method: request.method, headers });
+      if (!takesUpgradeBranch) {
+        return new Response('sandbox control plane, not the bridge port', { status: 404 });
+      }
+      const res = new Response(null, { status: 101 });
+      Object.defineProperty(res, 'webSocket', { value: FAKE_UPSTREAM_WS, configurable: true });
+      return res;
     },
     terminateSandbox: async () => {
       calls.terminateSandbox++;
@@ -949,22 +1036,94 @@ describe('code-server bridge host (8443-<id>-code.ezil.org)', () => {
     // path, NOT under `/preview-ws/` (RUNTIME_SHIM, which performs that
     // rewrite for Next/Vite HMR, is deliberately never injected here) — so
     // the upgrade must be detected by header, not by path prefix.
-    const { binding, calls } = fakeSandboxNamespace({
-      containerResponse: () => new Response(null, { status: 101 }),
-    });
+    const { binding, calls } = fakeSandboxNamespace({});
     const { cookie } = await bootstrapCodeHost(worker, binding);
 
     const res = await worker.fetch(
       new Request(`https://${CODE_HOST}/?type=ExtensionHost&reconnectionToken=abc`, {
-        headers: { cookie: `ezil_preview=${cookie}`, upgrade: 'websocket', connection: 'Upgrade' },
+        headers: {
+          cookie: `ezil_preview=${cookie}`,
+          upgrade: 'websocket',
+          connection: 'Upgrade',
+          origin: `https://${CODE_HOST}`,
+        },
       }),
       { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
     );
 
     expect(res.status).toBe(101);
-    expect(calls.containerFetch).toHaveLength(1);
-    expect(calls.containerFetch[0].port).toBe(8443);
-    expect(calls.containerFetch[0].headers.upgrade).toBe('websocket');
+    // 🔴 The socket itself has to survive the hop. A 101 with no `webSocket`
+    // is not an upgrade — it is the shape the old fake invented, and the one
+    // the platform cannot actually return through JSRPC.
+    expect(res.webSocket).toBe(FAKE_UPSTREAM_WS);
+    // 🔴 …and it must NOT have gone through the RPC boundary at all.
+    expect(calls.containerFetch).toHaveLength(0);
+    expect(calls.wsConnect).toHaveLength(1);
+    expect(calls.wsConnect[0].port).toBe(8443);
+    expect(calls.wsConnect[0].url).toBe('http://127.0.0.1:8443/?type=ExtensionHost&reconnectionToken=abc');
+    expect(calls.wsConnect[0].headers.upgrade).toBe('websocket');
+    expect(calls.wsConnect[0].headers.connection.toLowerCase()).toContain('upgrade');
+  });
+
+  it("🔴 forwards the REAL bridge host, so code-server's WS origin check can pass", async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const { cookie } = await bootstrapCodeHost(worker, binding);
+
+    await worker.fetch(
+      new Request(`https://${CODE_HOST}/?type=ExtensionHost`, {
+        headers: {
+          cookie: `ezil_preview=${cookie}`,
+          upgrade: 'websocket',
+          connection: 'Upgrade',
+          origin: `https://${CODE_HOST}`,
+          // A caller-supplied `Forwarded` outranks `X-Forwarded-Host` in
+          // code-server's `getHost()`, so it must not survive the hop.
+          forwarded: 'host=attacker.example;proto=https',
+        },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+
+    const forwarded = calls.wsConnect[0].headers;
+    expect(forwarded['x-forwarded-host']).toBe(CODE_HOST);
+    expect(forwarded['x-forwarded-host']).not.toBe('preview.local');
+    expect(forwarded.forwarded).toBeUndefined();
+    // Behavioural, not string-shaped: run code-server's own algorithm.
+    expect(() => simulateCodeServerEnsureOrigin(forwarded, `https://${CODE_HOST}`)).not.toThrow();
+    expect(() => simulateCodeServerEnsureOrigin(forwarded, 'https://ezil-os.vercel.app')).toThrow(
+      /incorrect origin/,
+    );
+    // The shipped bug, for contrast: `preview.local` rejects every origin,
+    // including the bridge host's own.
+    expect(() =>
+      simulateCodeServerEnsureOrigin({ 'x-forwarded-host': 'preview.local' }, `https://${CODE_HOST}`),
+    ).toThrow(/incorrect origin/);
+  });
+
+  it('🔴 forwards the REAL bridge host on the code host HTTP path too (one identity, not two)', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const { cookie } = await bootstrapCodeHost(worker, binding);
+
+    await worker.fetch(
+      new Request(`https://${CODE_HOST}/`, { headers: { cookie: `ezil_preview=${cookie}` } }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(calls.containerFetch[0].headers['x-forwarded-host']).toBe(CODE_HOST);
+  });
+
+  it('🔴 an unauthenticated WebSocket upgrade never reaches the container', async () => {
+    // code-server runs `--auth none`; this gate is the only thing between the
+    // public internet and a root shell. The WS path must not be an exception.
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://${CODE_HOST}/?type=ExtensionHost`, {
+        headers: { upgrade: 'websocket', connection: 'Upgrade', origin: `https://${CODE_HOST}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+    expect(calls.wsConnect).toHaveLength(0);
+    expect(calls.containerFetch).toHaveLength(0);
   });
 
   it('🔴 the catch-all opens NO hole: every code-host path 401s without auth', async () => {
@@ -1043,6 +1202,38 @@ describe('code-server bridge host (8443-<id>-code.ezil.org)', () => {
     const body = await res.text();
     expect(body).toContain('window.WebSocket');
     expect(body).toContain('/preview-ws');
+  });
+
+  it('the APP host HMR socket also crosses via wsConnect, still under `preview.local`', async () => {
+    // Same platform fix (never JSRPC for a socket), deliberately WITHOUT the
+    // forwarded-host change: the user's dev server is untrusted project code
+    // and must keep seeing one synthetic host, never the sandbox-scoped bridge
+    // hostname. Only code-server needs the real one, and only because it
+    // origin-checks its own sockets against it.
+    const { binding, calls } = fakeSandboxNamespace({});
+    const { mintPreviewBootstrapToken } = await import('./hmac');
+    const token = await mintPreviewBootstrapToken(SECRET, SANDBOX_NAME);
+    const boot = await worker.fetch(
+      new Request(`https://${APP_HOST}/preview-bootstrap?token=${encodeURIComponent(token)}`),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    const cookie = /ezil_preview=([^;]+)/.exec(boot.headers.get('set-cookie') ?? '')?.[1] ?? '';
+
+    const res = await worker.fetch(
+      new Request(`https://${APP_HOST}/preview-ws/_next/webpack-hmr`, {
+        headers: { cookie: `ezil_preview=${cookie}`, upgrade: 'websocket', connection: 'Upgrade' },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+
+    expect(res.status).toBe(101);
+    expect(res.webSocket).toBe(FAKE_UPSTREAM_WS);
+    expect(calls.containerFetch).toHaveLength(0);
+    expect(calls.wsConnect).toHaveLength(1);
+    expect(calls.wsConnect[0].port).toBe(3002);
+    expect(calls.wsConnect[0].url).toBe('http://127.0.0.1:3002/_next/webpack-hmr');
+    expect(calls.wsConnect[0].headers['x-forwarded-host']).toBe('preview.local');
+    expect(calls.wsConnect[0].headers['x-forwarded-host']).not.toContain(SANDBOX_NAME);
   });
 });
 

@@ -990,8 +990,17 @@ describe('bridge-host dispatcher: generalized to app-preview AND code-server', (
     expect(src).toContain('const route = parseBridgeHost(url.hostname);');
     expect(src).toContain("const { sandboxId, target } = route;");
     expect(src).toContain("const port = target === 'app' ? APP_PREVIEW_PORT : CODE_PREVIEW_PORT;");
-    expect(src).toContain('handlePreviewWsProxy(request, sandbox, sandboxId, secrets, appPath, port)');
+    expect(src).toContain('handlePreviewWsProxy(request, sandbox, sandboxId, secrets, appPath, port, target)');
     expect(src).toContain('handlePreviewProxy(request, sandbox, sandboxId, secrets, appPath, port, target)');
+  });
+
+  it('threads `target` into the code-bridge WS call too — it selects the forwarded host', () => {
+    // `'code'` is what makes `resolveForwardedHost` forward the REAL bridge
+    // hostname; with `'app'` (or the old 6-arg call) code-server's WS-router
+    // origin check sees `preview.local` and 403s every single upgrade.
+    expect(src).toContain(
+      "handlePreviewWsProxy(request, sandbox, sandboxId, secrets, codePath, port, 'code')",
+    );
   });
 
   it('gates /preview-status and /preview-inspector.js to target: app only', () => {
