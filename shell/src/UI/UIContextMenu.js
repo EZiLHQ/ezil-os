@@ -441,8 +441,58 @@
  * @requires jQuery-menu-aim
  */
 
+/**
+ * 🔴 THE FACTORY-LEVEL STACK GUARD.
+ *
+ * `UIContextMenu` used to be a purely stateless factory: every call appended
+ * a fresh `.context-menu` node to `<body>` and nothing ever closed a
+ * previous one. MEASURED before this guard existed: 3 right-clicks on a
+ * window's titlebar (`UIWindow.js`'s `el_window_head` handler, which has no
+ * guard of its own) produced 1, then 2, then 3 stacked `.context-menu`
+ * elements — never fewer. The Start menu (`shell/ezil/boot.js`) had the
+ * identical shape and was fixed at ITS OWN call site (commit ff1dff1) by
+ * having `boot.js` track and close its own menu — a correct fix, but a
+ * per-caller one, and this factory has six call sites across three files,
+ * one of which (`UIWindow.js:2416`) never got the same treatment and one of
+ * which (`UITaskbarItem.js`) only guards its OWN anchor, not a DIFFERENT
+ * anchor's menu left open elsewhere (right-click taskbar item A, then B,
+ * with nothing closing A's menu first — same stacking shape, different
+ * anchor). Patching each call site individually is how this project keeps
+ * re-losing this exact bug: a seventh call site added later would silently
+ * reintroduce it. So the invariant is enforced HERE, once, for every current
+ * and future caller: at most one ROOT `.context-menu` may exist at a time.
+ *
+ * Submenus are explicitly exempt (`options.is_submenu === true`): a submenu
+ * opened from an already-open parent (this file's own recursive call at the
+ * bottom of the `activate` handler below, and the only place that ever
+ * passes `is_submenu: true`) must NOT trigger this guard, or opening a
+ * submenu would immediately close the parent it belongs to. Submenus are
+ * DOM siblings of their parent (every menu — root or submenu — is appended
+ * straight to `<body>`, never nested), so leaving them alone here is what
+ * lets a parent + submenu chain coexist; they are cleaned up together by
+ * `fade_remove`'s own `data-parent-id` walk and by the `activate` handler's
+ * "close any submenu that doesn't belong to this item" step, not by this
+ * guard.
+ *
+ * `.remove()` (not a manual DOM removal) matters: this codebase vendors
+ * jQuery UI (`shell/src/lib/jquery-ui-1.13.2`), which patches jQuery's
+ * `cleanData` to fire a `remove` event via `triggerHandler` on any element
+ * that has one bound — confirmed by reading the vendored, minified source
+ * (`e.remove&&V(i).triggerHandler("remove")`). That is what makes
+ * `$(contextMenu).on('remove', ...)` below run on ANY removal path, not just
+ * `fade_remove`'s own. So sweeping every open menu with `.remove()` here
+ * fires each one's own `onClose`, restores its `parent_element`'s scroll,
+ * and tears down its sheet backdrop exactly as if it had been dismissed the
+ * ordinary way — callers that track their own menu state through `onClose`
+ * (`boot.js`'s Start-menu toggle) see a real close, not a silently orphaned
+ * reference.
+ */
 function UIContextMenu (options) {
     $('.window-active .window-app-iframe').css('pointer-events', 'none');
+
+    if ( ! options.is_submenu ) {
+        $('.context-menu').remove();
+    }
 
     const menu_id = window.global_element_id++;
 

@@ -141,7 +141,25 @@ function UITaskbarItem (options) {
 
     $(el_taskbar_item).on('contextmenu taphold', function (e) {
         // seems like the only way to stop sortable is to destroy it
-        if ( options.sortable ) {
+        //
+        // 🔴 FOUND while proving the UIContextMenu factory guard closes a
+        // taskbar item's menu when a DIFFERENT item is right-clicked (see
+        // UIContextMenu.js's stack-guard doc comment): `.sortable('destroy')`
+        // throws ("cannot call methods on sortable prior to initialization")
+        // if sortable is already destroyed, which it is here on a second
+        // right-click landing before the first item's menu has been REMOVED —
+        // removal is what calls `window.make_taskbar_sortable()` again (see
+        // UIContextMenu.js's `remove` handler). An uncaught throw here aborts
+        // the handler before it ever reaches the `has-open-contextmenu` check
+        // or `UIContextMenu(...)` below, so a right-click on item B while
+        // item A's menu is still open (exactly the stacking scenario the
+        // factory guard exists to fix) silently did nothing instead of
+        // closing A and opening B. Not a context-menu bug itself -- sortable
+        // has no notion of "already destroyed" -- but it sat directly in the
+        // path of proving the one this task fixes, so it is guarded the same
+        // way `make_taskbar_sortable` itself is idempotent: only destroy an
+        // instance that is actually there.
+        if ( options.sortable && $('.taskbar-sortable').hasClass('ui-sortable') ) {
             $('.taskbar-sortable').sortable('destroy');
         }
 
