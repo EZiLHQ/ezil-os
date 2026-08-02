@@ -1111,6 +1111,27 @@ describe('code-server bridge host (8443-<id>-code.ezil.org)', () => {
     expect(calls.containerFetch[0].headers['x-forwarded-host']).toBe(CODE_HOST);
   });
 
+  it('🔴 an upgrade whose hop-by-hop `Connection` was stripped still lands on 8443', async () => {
+    // `Connection` is hop-by-hop; nothing guarantees it survives to the
+    // Worker. If the bridge merely forwards what it received, `Sandbox.fetch`
+    // misses its WebSocket branch and quietly falls back to
+    // `determinePort(url)` = 3000 — the SDK's own control plane, not
+    // code-server. The socket would "connect" to the wrong service.
+    const { binding, calls } = fakeSandboxNamespace({});
+    const { cookie } = await bootstrapCodeHost(worker, binding);
+
+    const res = await worker.fetch(
+      new Request(`https://${CODE_HOST}/?type=ExtensionHost`, {
+        headers: { cookie: `ezil_preview=${cookie}`, upgrade: 'websocket', origin: `https://${CODE_HOST}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+
+    expect(res.status).toBe(101);
+    expect(calls.wsConnect[0].port).toBe(8443);
+    expect(calls.wsConnect[0].port).not.toBe(3000);
+  });
+
   it('🔴 an unauthenticated WebSocket upgrade never reaches the container', async () => {
     // code-server runs `--auth none`; this gate is the only thing between the
     // public internet and a root shell. The WS path must not be an exception.

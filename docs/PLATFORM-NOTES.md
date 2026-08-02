@@ -334,6 +334,63 @@ ran: the symptom here was an HTTP 500 `Cannot find module 'react/jsx-runtime'` p
 `_next/static` 404s, which reads like a missing dependency and is actually a bundler
 refusing to cross a symlink.
 
+## 19. `containerFetch()` can never return a WebSocket — it is a JSRPC method
+
+`sandbox.containerFetch()` is a **Durable Object JSRPC method**. A `Response` carrying a
+`webSocket` is not a serializable RPC return value, so *every* upgrade forwarded that way
+dies with:
+
+```
+Could not serialize object of type "WebSocket". This type does not support serialization.
+```
+
+The Worker sees that as a thrown error and turns it into a 502; nothing in the Worker's
+own source contains the failing string, which makes it read like an upstream/container
+problem. It is not — the container answered correctly and the DO built a correct 101; only
+the *return trip* failed.
+
+Reproduced against real workerd (`unstable_dev`, no container needed): a DO RPC method
+returning `new Response(null, { status: 101, webSocket })` throws exactly that string,
+while the same object returned from the DO's `fetch()` entrypoint arrives intact.
+
+The SDK documents this in its own source and nowhere else — `@cloudflare/containers`,
+`lib/container.js` (`containerFetch` doc comment): *"WebSocket requests done outside the DO
+won't work until cloudflare/workerd#2319 is addressed. Until then, please use `switchPort`
++ `fetch()`."*
+
+**Use `sandbox.wsConnect(request, port)`** — that IS `switchPort` + `stub.fetch()`. It is
+the boundary the working neko desktop stream has always crossed (`proxyToSandbox` ends in
+`sandbox.fetch(...)`, never in an RPC call), which is why one WebSocket path in this Worker
+worked while the other never could.
+
+**The trap on the other side.** `Sandbox.fetch()` only takes its WebSocket branch when it
+sees BOTH `Upgrade: websocket` and a `Connection` containing `upgrade`. Miss it and there
+is no error: it falls through to `determinePort(url)`, which is **3000** for any path
+outside `/proxy/<n>` — the SDK's own control plane. The socket connects, to the wrong
+service. `Connection` is hop-by-hop, so never forward it and hope; set both explicitly.
+Verified in workerd that a Worker-set `Connection: Upgrade` does reach the DO.
+
+## 20. code-server's origin check turns a wrong `X-Forwarded-Host` into a deny-all
+
+code-server's `authenticateOrigin` runs on its **WS router only**. It compares the
+browser's `Origin` host against `getHost(req)`, and `getHost` honours `Forwarded`, then
+`X-Forwarded-Host`, then `Host`.
+
+So a reverse proxy that pins `x-forwarded-host` to a synthetic constant (this repo used
+`preview.local`, inherited from the Azure daemon) does not harden that same-origin check —
+it makes it impossible to satisfy. Every upgrade 403s: the app's origin, the bridge host's
+own self-origin, and garbage all fail identically, because no browser can present a
+synthetic host as an `Origin`.
+
+The symptom is maximally misleading: HTTP is untouched, so the editor **renders** — real
+VS Code HTML, Monaco instances, `/healthz` 200 — and then has no file tree, no terminal
+and no extension host, ending in `ENOPRO: No file system provider`.
+
+Forward the real bridge host to code-server and the check does what it is for. Forward
+nothing synthetic to anything that origin-checks. Also drop any inbound `Forwarded`
+header: it outranks `x-forwarded-host`, so leaving it in lets the caller choose the host
+the check compares against.
+
 ---
 
 ## Method notes
