@@ -586,6 +586,13 @@ span.header-sort-icon img{margin-bottom:-1px;width:10px}
 .ui-resizable-ne,.ui-resizable-sw{cursor:nesw-resize}
 .ui-resizable-nw,.ui-resizable-se{cursor:nwse-resize}
 .window>.ui-resizable-ne,.window>.ui-resizable-nw,.window>.ui-resizable-se,.window>.ui-resizable-sw{width:15px;height:15px;z-index:95!important}
+.window>.ui-resizable-n{top:0}
+.window>.ui-resizable-s{bottom:0}
+.window>.ui-resizable-e{right:0}
+.window>.ui-resizable-w{left:0}
+.window>.ui-resizable-nw{top:0;left:0}
+.window>.ui-resizable-ne{top:0;right:0}
+.window>.ui-resizable-sw{bottom:0;left:0}
 .window-alert-message,.window-prompt-message{font-size:15px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;color:#414650;text-shadow:1px 1px #ffffff52;margin-top:10px;word-break:break-word}
 .window-alert-message{text-align:center}
 .window-alert-icon{width:64px;margin:10px auto 20px;display:block}
