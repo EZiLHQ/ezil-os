@@ -309,7 +309,9 @@ async function runViewport (vp) {
         // The GAP 1 mutation self-test (see near the GUARD, below) is
         // EXPECTED to log console noise for its deliberately-broken dummy
         // ids; it must not register as a spurious "uncaught page error".
-        if ( process.env.MUTATION_PROVE_GAP1 && /zz-mutation/.test(msg.text()) ) return;
+        // Unconditional (not opt-in) since round 8: the self-test itself is
+        // no longer opt-in either — see that block's own comment.
+        if ( /zz-mutation/.test(msg.text()) ) return;
         page_errors.push(msg.text());
     });
 
@@ -838,6 +840,67 @@ async function runViewport (vp) {
     }
 
     /**
+     * 🔴 GAP 3 FOLLOW-UP (round 8's verifier: "nw and e resize checks: 100%
+     * SKIP, every viewport, every run"). Root cause, found by instrumenting
+     * jQuery UI's own `resizestart`/`resize`/`resizestop` events on the live
+     * target: dragging ANY resize handle — `se`, `nw`, and plain `e` all
+     * independently confirmed, on a FRESH window each time — drives the
+     * window's `height` to a large NEGATIVE `ui.size.height` (CSS then clamps
+     * the rendered box to 0). It reproduces on the very first direction tried
+     * and has nothing to do with which direction that is; MEASURED via a
+     * `resizestart/resize/resizestop` listener attached before the drag:
+     * `{"type":"resize","size":{"w":764,"h":-149},...}` on a window whose
+     * `top` was still its DEFAULT cascade value,
+     * `calc(15% + Npx)` (`default_window_top`, UIWindow.js ~L86) — never
+     * dragged into a plain-pixel position. `-149` is exactly that window's
+     * own `top` in px, which is the fingerprint of jQuery reading a CSS
+     * `calc()` string back through `.css('top')`/`.position()` where it
+     * expects a number.
+     *
+     * Because the three-direction loop below reuses ONE window instance
+     * sequentially, whichever direction runs FIRST corrupts it (collapses to
+     * height 0) and every direction after that finds a degenerate window and
+     * SKIPs — a skip that reads as "not applicable" when the real story is
+     * "already broken by the test's own prior step". `['se','nw','e']` order
+     * meant `se` always ran on the one clean window and always looked like a
+     * PASS (its own assertion only checked "some dimension changed by
+     * >1px", which a collapse to a negative height satisfies), while `nw`
+     * and `e` never got a fresh window to test at all.
+     *
+     * The fix: capture `resizeTarget`'s OWN `style.cssText` once, before any
+     * direction runs (it is still pristine and never-resized at that point
+     * — the opening loop and the round-robin sweep above only click/focus
+     * it, never drag it), then `resetWindowStyle` re-applies that exact
+     * string before every direction so each of the three starts from
+     * IDENTICAL geometry — same `calc()` `top` (the exact condition that
+     * reproduces the defect — see above), same width/height, same screen
+     * position. A close+reopen BETWEEN directions was tried first and
+     * rejected: `UIWindow.js`'s cascade offset (`default_window_top`)
+     * advances on every `open()`, including relaunches, so relaunching
+     * before each of 3 directions walked the target across the screen and
+     * into occlusion by `preview`/`code` (still sitting at THEIR original,
+     * un-advanced cascade position) — `nw` specifically skipped again, but
+     * now for a genuinely different reason (real occlusion by a neighbor)
+     * than before (self-corruption). A style reset carries no cascade
+     * counter and cannot drift the window anywhere.
+     */
+    /** Re-applies a previously captured `style.cssText` to `app`'s window —
+     * see the doc block above for why this, and not a close+reopen, is what
+     * runs BETWEEN directions. A pure style write, no relaunch: it cannot
+     * advance the cascade counter and cannot change which app is topmost
+     * (z-index travels with the captured string, but `ensureNotTopmost`
+     * re-evaluates and re-buries live z-order right before every direction
+     * regardless, so a stale z-index here is harmless). */
+    async function resetWindowStyle (app, cssText) {
+        if ( ! cssText ) return;
+        await page.evaluate(([a, css]) => {
+            const win = document.querySelector(`.window[data-app="${a}"]`);
+            if ( win ) win.style.cssText = css;
+        }, [app, cssText]);
+        await settle(app);
+    }
+
+    /**
      * 🔴 GAP 3 REGRESSION TEST. `UIWindow.js` binds `focusWindow()` to
      * `mousedown` on `.ui-resizable-handle` (delegated on `el_window`, since
      * jQuery UI's `.resizable()` appends each handle as a DIRECT CHILD of the
@@ -892,6 +955,18 @@ async function runViewport (vp) {
             }
             return null; // the whole handle is currently covered by another window
         }, [app, handleDir]);
+        if ( ( ! handle || ! before ) && process.env.DEBUG_RESIZE_HANDLE ) {
+            // Diagnostic only, same convention as `DEBUG_CONSOLE` above: not
+            // asserted, just enough geometry printed to tell "handle genuinely
+            // absent/zero-size" apart from "handle exists but every sampled
+            // pixel is occluded" without re-instrumenting this by hand again.
+            const dbg = await page.evaluate(([a, dir]) => {
+                const win = document.querySelector(`.window[data-app="${a}"]`);
+                const el = win?.querySelector(`.ui-resizable-${dir}`);
+                return { winRect: win?.getBoundingClientRect(), handleRect: el?.getBoundingClientRect() };
+            }, [app, handleDir]);
+            console.error(`DEBUG_RESIZE_HANDLE ${app} ${handleDir}:`, JSON.stringify(dbg));
+        }
         if ( ! handle || ! before ) {
             skip(`${label}: ${app}'s "${handleDir}" resize-handle raise+resize test (no visible resize handle right now — not resizable, or full-bleed hides it by design)`);
             return;
@@ -917,9 +992,45 @@ async function runViewport (vp) {
             zAfterDown === app, `afterDown=${zAfterDown}`);
         coveredIds.add(app);
 
-        const resized = !! after && (Math.abs(after.width - before.width) > 1 || Math.abs(after.height - before.height) > 1);
-        push(`${label}: dragging ${app}'s "${handleDir}" resize handle actually resizes it`,
-            resized, `before=${JSON.stringify(before)} after=${JSON.stringify(after)}`);
+        // 🔴 GAP 3 FOLLOW-UP, PART 2 — a REAL defect this exact check used to
+        // wave through. The old assertion was `Math.abs(width delta) > 1 ||
+        // Math.abs(height delta) > 1` — ANY dimension moving by more than a
+        // pixel in EITHER direction counted as "actually resizes it". MEASURED
+        // on baseline: dragging `se` by (+30,+30) produced
+        // `after.height === 0` (the window's height collapsed entirely — see
+        // `closeAndReopenFresh`'s doc block for the root cause) while width
+        // grew from 760 to 790, and the old OR-check called that a PASS. A
+        // window that is 790 wide and 0 tall is not "resized", it is broken,
+        // and a check that cannot tell the difference has no discriminating
+        // power over the one failure mode this test exists to catch.
+        //
+        // The fix asserts what a correct resize actually looks like for
+        // WHICHEVER axes this specific handle direction touches:
+        //   1. the window never collapses to a degenerate size on EITHER
+        //      axis, even the axis this handle isn't supposed to touch;
+        //   2. the axis (or axes) this handle direction resizes grew by a
+        //      substantial, direction-correct amount (every `DELTA` above is
+        //      an outward drag, so the resized axis must GROW, not shrink);
+        //   3. the axis this handle does NOT touch stays put (proves the
+        //      resize is precise to the handle grabbed, not a side effect).
+        const AFFECTS = {
+            n: { w: false, h: true }, s: { w: false, h: true },
+            e: { w: true, h: false }, w: { w: true, h: false },
+            ne: { w: true, h: true }, nw: { w: true, h: true },
+            se: { w: true, h: true }, sw: { w: true, h: true },
+        }[handleDir] ?? { w: true, h: true };
+        const MIN_GROWTH = 10; // drag is 30px; generous slack for containment/snapping
+        const STABLE = 3; // an untouched axis should not move at all beyond noise
+        const notDegenerate = !! after && after.width > 0 && after.height > 0;
+        const widthOk = ! after ? false
+            : AFFECTS.w ? (after.width - before.width) > MIN_GROWTH
+                : Math.abs(after.width - before.width) <= STABLE;
+        const heightOk = ! after ? false
+            : AFFECTS.h ? (after.height - before.height) > MIN_GROWTH
+                : Math.abs(after.height - before.height) <= STABLE;
+        const resized = notDegenerate && widthOk && heightOk;
+        push(`${label}: dragging ${app}'s "${handleDir}" resize handle actually resizes it (grows the axis it owns, leaves the other alone, never collapses)`,
+            resized, `before=${JSON.stringify(before)} after=${JSON.stringify(after)} affects=${JSON.stringify(AFFECTS)}`);
         coveredIds.add(app);
     }
 
@@ -1118,8 +1229,111 @@ async function runViewport (vp) {
         // per-app raise check in this file (`otherAppIds` loop, round-robin)
         // already excludes it for the same reason.
         const resizeContenders = [...otherAppIds];
+        // 🔴 `resizeTarget` is STILL its own pristine, never-resized self
+        // here — the "otherAppIds" opening loop and the round-robin sweep
+        // above only ever click/focus it, never drag it — so its CURRENT
+        // `style.cssText` (captured once, before any direction runs) IS the
+        // fresh baseline. `resetWindowStyle` re-applies that captured string
+        // before every direction so each of the three starts from IDENTICAL
+        // geometry instead of inheriting whatever the previous drag left
+        // behind. Without this, only the FIRST direction in the list ever
+        // saw an uncorrupted window and the other two SKIPped — exactly what
+        // made `nw` and `e` read as "100% SKIP, every viewport, every run"
+        // before this fix: they were never actually exercised, not "not
+        // applicable". (A per-direction close+reopen was tried first and
+        // rejected — see `closeAndReopenFresh`'s doc block for why an extra
+        // relaunch, even just once, is already one cascade step too many.)
+        const pristineStyle = await page.evaluate(
+            (a) => document.querySelector(`.window[data-app="${a}"]`)?.style.cssText, resizeTarget);
         for ( const dir of ['se', 'nw', 'e'] ) {
+            await resetWindowStyle(resizeTarget, pristineStyle);
             await testResizeHandleRaisesAndResizes(resizeTarget, dir, resizeContenders, `${VP} resize-handle regression`);
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // 🔴 D3 INDEPENDENT COVERAGE (round 8's verifier: "Reverting both
+    // `?.contentWindow?.` guards changes nothing — 452/456, identical. D3
+    // is only visible through D2's race, so if D2 is ever fixed
+    // differently, D3 silently loses all coverage.").
+    //
+    // `$.fn.focusWindow` (`UIWindow.js`) does
+    // `$app_iframe.get(0)?.contentWindow?.postMessage({msg:'focus'}, '*')`
+    // — guarded per that file's own comment because "a detached iframe (a
+    // window mid-close, or one that was reopened while its old iframe
+    // hadn't finished teardown) has `contentWindow === null`". The ONLY
+    // path the rest of this suite reaches that state through is D2's race
+    // (a close/reopen landing in a narrow timing window) — so today, D3's
+    // entire coverage is a side effect of D2's, and disappears the moment
+    // D2 is fixed by any means that closes the race instead of by keeping
+    // this exact guard.
+    //
+    // This reproduces D3's OWN failure condition directly, with no close,
+    // no reopen, no timing window: detach a real window (with a real
+    // iframe already loaded) from the live document with a plain
+    // `Element.remove()` — the same end state D2's race produces (an
+    // iframe whose `contentWindow` the spec sets to `null` the instant its
+    // node is disconnected from the document) — then call `.focusWindow()`
+    // on it directly, the exact code path the guard lives in. `$(el).find()`
+    // and `.hasClass()` both still work on a detached subtree, so this
+    // reaches the SAME line D2 does; only the reason `contentWindow` is
+    // null differs (direct detachment vs. a race), which is exactly what
+    // makes this coverage independent of D2's fix.
+    // ═════════════════════════════════════════════════════════════════════
+    {
+        const d3TargetId = await page.evaluate((ids) => {
+            for ( const id of ids ) {
+                const win = document.querySelector(`.window[data-app="${id}"]`);
+                if ( win && win.querySelector('.window-app-iframe') ) return id;
+            }
+            return null;
+        }, otherAppIds);
+        if ( d3TargetId ) {
+            // 🔴 The `try`/`catch` is IN the page, not around this
+            // `page.evaluate()` call: `.focusWindow()` throws SYNCHRONOUSLY
+            // inside the evaluated function when the guard is missing, which
+            // Playwright surfaces as a REJECTED `evaluate()` call (not a
+            // `pageerror` event — that only fires for exceptions the page's
+            // own event loop never catches, e.g. inside a real click
+            // handler or a timer, not inside a script this harness is
+            // directly awaiting). Left uncaught here, that rejection would
+            // abort this ENTIRE viewport's run ("harness threw without
+            // completing") — confirmed as an OBSERVED failure mode:
+            // reverting the guard while this `try` was still outside the
+            // evaluate() call up-front crashed the whole `[1440x900]`
+            // (and every later) viewport instead of producing one isolated,
+            // readable FAIL, losing every check after it for that viewport.
+            // Catching inside the page turns "the mechanism is broken" into
+            // exactly one clean, isolated result — same principle as every
+            // other risky operation in this file, which never trusts an
+            // emulation/DOM effect without reading back a real signal for it.
+            const result = await page.evaluate((a) => {
+                const win = document.querySelector(`.window[data-app="${a}"]`);
+                if ( ! win ) return { targetMissing: true };
+                win.remove();
+                try {
+                    $(win).focusWindow();
+                    return { threw: false };
+                } catch ( e ) {
+                    return { threw: true, message: String(e?.message ?? e) };
+                }
+            }, d3TargetId);
+            push(`${VP} D3 regression: focusWindow() on a window detached directly from the document (no D2 race involved) does not throw`,
+                result.threw === false, `target=${d3TargetId} result=${JSON.stringify(result)}`);
+
+            // We bypassed `.close()` entirely (a raw DOM `.remove()`, not
+            // real teardown), so this app's taskbar item / bookkeeping never
+            // ran its close path. Relaunch it fresh so every check AFTER
+            // this one — which assumes every `otherAppIds` entry is a real,
+            // on-screen window — still finds one.
+            await page.evaluate(({ a, ctx }) => window.ezil.registry.launch(a, ctx), {
+                a: d3TargetId,
+                ctx: { payload: PAYLOAD, computer: PAYLOAD.computer, desktopState: PAYLOAD.desktopState },
+            });
+            await until((a) => !! document.querySelector(`.window[data-app="${a}"]`), d3TargetId, 6000, 50);
+            await settle(d3TargetId);
+        } else {
+            skip(`${VP} D3 regression: focusWindow() on a detached iframe (no window with a .window-app-iframe found among ${JSON.stringify(otherAppIds)})`);
         }
     }
 
@@ -1157,40 +1371,56 @@ async function runViewport (vp) {
     }
 
     // ═════════════════════════════════════════════════════════════════════
-    // 🔴 MUTATION SELF-TEST for the GUARD immediately below. Opt-in
-    // (`MUTATION_PROVE_GAP1=1`, first viewport only) so ordinary runs are
-    // unaffected — this is a standing, re-runnable proof that the guard can
-    // still fail, not a permanent extra scenario. Round 7's verifier found
-    // the previous guard could NEVER fail: `coveredIds.add(id)` ran
-    // unconditionally, over the very list (`resolvedApps`) it was later
+    // 🔴 MUTATION SELF-TEST for the GUARD immediately below — STANDING, runs
+    // by default (first viewport only; the guard mechanism itself doesn't
+    // vary by viewport, so proving it once per run is enough). Round 7's
+    // verifier found the previous guard could NEVER fail: `coveredIds.add(id)`
+    // ran unconditionally, over the very list (`resolvedApps`) it was later
     // compared against, so the two were identical by construction.
     //
-    //   (a) "zz-mutation-unexercised" is spliced into `resolvedApps` ONLY —
-    //       it is never opened, never asserted, never added to `coveredIds`
-    //       by anything. This is the purest form of "a registered app this
-    //       run never exercised": if the GUARD still passes with this id
-    //       unaccounted for, `coveredIds` is being derived FROM
-    //       `resolvedApps` (the exact tautology), not from real assertions.
+    // 🔴 ROUND 8 FOLLOW-UP: this used to be opt-in behind
+    // `MUTATION_PROVE_GAP1=1`, so an ORDINARY run never executed it and a
+    // reintroduced tautology would go uncaught — "the guard against
+    // tautologies is itself unenforced". It is a real `push()`ed assertion
+    // now, not a side channel a human has to remember to invoke and read by
+    // hand. The reason it WAS opt-in: the previous version spliced both
+    // dummy ids directly into the SHARED `resolvedApps` array that "THE
+    // GUARD" below also reads, with no cleanup — running it unconditionally
+    // would have made the REAL guard permanently FAIL on every ordinary
+    // run too (both dummies stay uncovered forever), masking any genuine
+    // coverage regression behind this self-inflicted one. Fixed by
+    // computing the self-test's own predicate over a LOCAL copy of
+    // `resolvedApps` and asserting it directly — the shared `resolvedApps`
+    // is never mutated, so the real GUARD's own evaluation right after this
+    // block is completely unaffected by this one running every time.
+    //
+    //   (a) "zz-mutation-unexercised" — a plain string, added only to the
+    //       LOCAL copy below. Never opened, never asserted, never added to
+    //       `coveredIds` by anything. The purest form of "a registered app
+    //       this run never exercised": if the GUARD's predicate still
+    //       treats a resolved list containing it as fully covered,
+    //       `coveredIds` is being derived FROM `resolvedApps` (the exact
+    //       tautology), not from real assertions.
     //   (b) "zz-mutation-noassert" is a REAL `.window[data-app]` element
     //       (so "opened" is genuinely true) with no titlebar, no button, no
     //       taskbar item and no `.window-body`. It is run through the ACTUAL
-    //       shipped assertion helpers (not a stand-in), each of which can
-    //       only `skip()` it. This proves "opened but never actually
-    //       asserted" does not buy coverage either.
+    //       shipped assertion helpers (not a stand-in, and against the REAL,
+    //       shared `coveredIds` — proving those helpers genuinely never add
+    //       an id they couldn't actually assert anything about), each of
+    //       which can only `skip()` it. This proves "opened but never
+    //       actually asserted" does not buy coverage either.
     //
-    // Both must appear in `notCovered` and make the GUARD FAIL. If either
-    // does not, the guard is tautological again.
+    // Both must appear in the LOCAL `notCovered` and make the LOCAL guard
+    // predicate false. If either does not, the real GUARD below is
+    // tautological again.
     // ═════════════════════════════════════════════════════════════════════
-    if ( process.env.MUTATION_PROVE_GAP1 && vp === VIEWPORTS[0] ) {
-        resolvedApps.push('zz-mutation-unexercised');
-
+    if ( vp === VIEWPORTS[0] ) {
         await page.evaluate(() => {
             const el = document.createElement('div');
             el.className = 'window';
             el.setAttribute('data-app', 'zz-mutation-noassert');
             document.body.appendChild(el);
         });
-        resolvedApps.push('zz-mutation-noassert');
         const dummyContenders = [...openIds, 'zz-mutation-noassert'];
         await assertHitTestsIntoSelf('zz-mutation-noassert', `${VP} MUTATION SELF-TEST`);
         await checkContentPainted('zz-mutation-noassert', `${VP} MUTATION SELF-TEST`);
@@ -1200,6 +1430,19 @@ async function runViewport (vp) {
             ! coveredIds.has('zz-mutation-noassert'),
             `coveredIds has it = ${coveredIds.has('zz-mutation-noassert')}`);
         await page.evaluate(() => document.querySelector('.window[data-app="zz-mutation-noassert"]')?.remove());
+
+        // The GUARD's own predicate, re-evaluated over a LOCAL copy carrying
+        // both dummies — see the block comment above for why this must be a
+        // local copy and not the shared `resolvedApps`.
+        const selfTestResolvedApps = [...resolvedApps, 'zz-mutation-unexercised', 'zz-mutation-noassert'];
+        const selfTestNotCovered = selfTestResolvedApps.filter((id) => ! coveredIds.has(id));
+        const selfTestGuardWouldPass = selfTestNotCovered.length === 0
+            && coveredIds.size >= selfTestResolvedApps.length;
+        push(`${VP} MUTATION SELF-TEST: the coverage GUARD correctly fails when a resolved-but-unexercised app and an assertion-less dummy are injected`,
+            selfTestNotCovered.includes('zz-mutation-unexercised')
+                && selfTestNotCovered.includes('zz-mutation-noassert')
+                && ! selfTestGuardWouldPass,
+            `notCovered=${JSON.stringify(selfTestNotCovered)} guardWouldPass=${selfTestGuardWouldPass}`);
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -1411,32 +1654,81 @@ async function runCloseReopenSweep () {
                 const wins = document.querySelectorAll(`.window[data-app="${a}"]`);
                 const items = document.querySelectorAll(`.taskbar-item[data-app="${a}"]`);
                 const win = wins[0] ?? null;
+                const item = items[0] ?? null;
                 const cs = win ? getComputedStyle(win) : null;
                 const r = win ? win.getBoundingClientRect() : null;
                 return {
                     windowCount: wins.length,
                     taskbarItemCount: items.length,
+                    openWindowsAttr: item ? parseInt(item.getAttribute('data-open-windows'), 10) : null,
                     visible: !! win && cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0,
                 };
             }, id);
 
             push(`${label}: exactly 1 window`, state.windowCount === 1, `windowCount=${state.windowCount}`);
             push(`${label}: exactly 1 taskbar item`, state.taskbarItemCount === 1, `taskbarItemCount=${state.taskbarItemCount}`);
+            // 🔴 ROUND 8 FOLLOW-UP: "'exactly 1 taskbar item' has no
+            // discriminating power for PINNED apps." `desktop` and
+            // `settings` are `pinned: true` (registry.js) — their taskbar
+            // item "sits in the taskbar whether or not it is open"
+            // (registry.js's own doc comment), so `taskbarItemCount === 1`
+            // is true BEFORE this close/reopen cycle, DURING it, and AFTER
+            // it, regardless of whether the reopen actually worked. T16
+            // OBSERVED exactly that: a pinned item stayed at "1 item" while
+            // `windowCount` dropped to 0, and this sub-check still passed.
+            // For `preview`/`code` (`pinned: false`) the item genuinely
+            // disappears when there is no window, so the check has real
+            // power there — the gap is pinned apps specifically.
+            //
+            // The taskbar item itself already carries a SEPARATE, live
+            // signal that isn't just "am I pinned": `data-open-windows`
+            // (`UIWindow.js` increments it on open, decrements it on
+            // close — see that file's own comments next to each). This is
+            // the same attribute `boot-test.mjs` already asserts on for the
+            // exact same reason. Comparing it against the real DOM window
+            // count closes the gap for BOTH pinned and non-pinned apps:
+            // a stale "1 item, but the window and the item's own bookkeeping
+            // disagree" state now fails here even when mere item PRESENCE
+            // cannot tell the difference.
+            push(`${label}: taskbar item's own open-window count matches the real window count`,
+                state.openWindowsAttr === state.windowCount,
+                `data-open-windows=${state.openWindowsAttr} windowCount=${state.windowCount}`);
             push(`${label}: the reopened window is visible`, state.visible, JSON.stringify(state));
 
             // 🔴 `.fullpage-mode .window-minimize-btn { display: none }`
             // (`shell/src/css/style.css`) hides EVERY window's minimize
-            // button, site-wide, whenever the boot app is in full-bleed mode
-            // — not just the full-bleed window's own button. That is a real,
-            // pre-existing, already-documented shell characteristic (see
-            // this file's own `buttonPointInside` comment), independent of
-            // close/reopen and out of scope for D1/D2/D3 — it is CSS, not
-            // `UIWindow.js`/`UIDesktopFullpage.js`/`registry.js`. Ordinary
-            // (non-drawer) windows have no other way to minimize, so when
-            // neither affordance is currently reachable this is a SKIP, not
-            // a FAIL — same reasoning `checkTaskbarReachable` above uses for
-            // "the taskbar is legitimately hidden by full-bleed mode".
-            const minimizeAffordance = state.windowCount >= 1 ? await page.evaluate((a) => {
+            // button, site-wide, whenever ANY window is full-bleed — not
+            // just that window's own. That is a real, pre-existing,
+            // already-documented shell characteristic (see this file's own
+            // `buttonPointInside` comment), independent of close/reopen and
+            // out of scope for D1/D2/D3 — it is CSS, not
+            // `UIWindow.js`/`UIDesktopFullpage.js`/`registry.js`.
+            //
+            // 🔴 ROUND 8 FOLLOW-UP: "30 of 40 are SKIPs. Find why they skip
+            // and make them real." Cause: `boot.js` opens the full-bleed app
+            // (`desktop`, `wants_settings_in_drawer`) FIRST, and nothing in
+            // this sweep ever exits full-bleed mode before iterating the
+            // OTHER apps — so `settings`/`preview`/`code` NEVER once see a
+            // reachable minimize button (only `desktop`'s own iteration,
+            // via its drawer, ever did — the 10 non-skipped checks in the
+            // old 40). That is not "no such thing as minimizing Preview" —
+            // a real user CAN reach it, the same way this file's own boot
+            // flow does (see `runViewport`'s "Expose the REAL taskbar"
+            // section): minimize the full-bleed app first. So when `id`
+            // itself isn't the full-bleed one and its minimize affordance is
+            // unreachable ONLY because something else is full-bleed, this
+            // exits full-bleed mode via that SAME real mechanism, tests the
+            // REAL affordance, then restores the full-bleed app afterward —
+            // so every later interval/app in this loop still starts from
+            // the same "desktop full-bleed" baseline as before this detour,
+            // and D1/D2/D3's own window/taskbar/visible counts (already
+            // captured above, BEFORE this block runs) are never touched by
+            // it.
+            const isFullbleed = (a) => page.evaluate(
+                (app) => !! document.querySelector(`.window[data-app="${app}"]`)?.classList.contains('ezil-fullbleed'), a);
+            const currentFullbleedAppId = () => page.evaluate(
+                () => document.querySelector('.window.ezil-fullbleed')?.getAttribute('data-app') ?? null);
+            const readMinimizeAffordance = () => page.evaluate((a) => {
                 const win = document.querySelector(`.window[data-app="${a}"]`);
                 const btn = win?.querySelector('.window-minimize-btn');
                 const btnReachable = !! btn && getComputedStyle(btn).display !== 'none'
@@ -1445,7 +1737,24 @@ async function runCloseReopenSweep () {
                     '.dashboard-app-drawer-btn:not(.dashboard-app-drawer-settings):not(.dashboard-app-drawer-close)',
                 );
                 return btnReachable || !! drawerBtn;
-            }, id) : false;
+            }, id);
+
+            let minimizeAffordance = state.windowCount >= 1 ? await readMinimizeAffordance() : false;
+            let blockerId = null;
+            if ( ! minimizeAffordance && state.windowCount >= 1 && ! await isFullbleed(id) ) {
+                blockerId = await currentFullbleedAppId();
+                if ( blockerId && blockerId !== id ) {
+                    await minimizeApp(blockerId);
+                    await until(
+                        (a) => document.querySelector(`.window[data-app="${a}"]`)?.getAttribute('data-is_minimized') === 'true',
+                        blockerId, 2000, 30,
+                    );
+                    await sleep(80); // exit_fullpage_mode's own geometry transition — same wait `runViewport` uses for the same reason
+                    minimizeAffordance = await readMinimizeAffordance();
+                } else {
+                    blockerId = null; // nothing full-bleed found to blame; leave the SKIP path honest below
+                }
+            }
 
             let minimized = false;
             if ( minimizeAffordance ) {
@@ -1456,7 +1765,7 @@ async function runCloseReopenSweep () {
                 );
                 push(`${label}: minimise works`, minimized);
             } else {
-                skip(`${label}: minimise (no reachable minimize affordance right now — full-bleed mode hides ordinary minimize buttons site-wide; a pre-existing shell characteristic, not part of this close/reopen sweep)`);
+                skip(`${label}: minimise (no reachable minimize affordance right now — full-bleed mode hides ordinary minimize buttons site-wide, and no full-bleed app was found to minimize out of the way; a pre-existing shell characteristic, not part of this close/reopen sweep)`);
             }
 
             if ( minimized ) {
@@ -1486,6 +1795,25 @@ async function runCloseReopenSweep () {
                     restored.exists && restored.minimized !== 'true' && restored.visible, JSON.stringify(restored));
             } else {
                 skip(`${label}: restore (minimise never completed — nothing to restore)`);
+            }
+
+            // Put the full-bleed app we minimized to unblock `id` back the
+            // way it was, via a REAL taskbar click (the taskbar is visible
+            // right now precisely because it's minimized) — so the NEXT
+            // interval/app in this loop starts from the same baseline every
+            // iteration before this one did.
+            if ( blockerId ) {
+                const bp = await taskbarItemPoint(blockerId);
+                if ( bp ) {
+                    await page.mouse.click(bp[0], bp[1]);
+                } else {
+                    await page.evaluate((a) => {
+                        const w = $(`.window[data-app="${a}"]`);
+                        if ( w.length ) w.showWindow();
+                    }, blockerId);
+                }
+                await until((a) => document.querySelector(`.window[data-app="${a}"]`)?.classList.contains('ezil-fullbleed'), blockerId, 3000, 50);
+                await settle(blockerId);
             }
 
             const cycleErrors = page_errors.slice(errorsBefore);
