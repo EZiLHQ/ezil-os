@@ -650,6 +650,71 @@ export interface ContainerFetcher {
   containerFetch(requestOrUrl: Request | string, portOrInit?: number | RequestInit, port?: number): Promise<Response>;
 }
 
+/**
+ * The one method the WebSocket path needs from `Sandbox<unknown>`.
+ *
+ * 🔴 Deliberately NOT `containerFetch`. `containerFetch` is a **JSRPC method**
+ * on the Durable Object stub, and a `Response` carrying a `webSocket` cannot
+ * cross a JSRPC boundary — the call rejects with
+ * `Could not serialize object of type "WebSocket". This type does not support
+ * serialization.` The SDK says so in its own source:
+ *
+ *   `@cloudflare/containers/dist/lib/container.js` (`containerFetch` doc):
+ *     "WebSocket requests done outside the DO won't work until
+ *      https://github.com/cloudflare/workerd/issues/2319 is addressed.
+ *      Until then, please use `switchPort` + `fetch()`."
+ *   `@cloudflare/containers/dist/lib/utils.js` (`switchPort` doc):
+ *     "…`fetch` and not `containerFetch` … it's a JSRPC method and it comes
+ *      with some consequences like not being able to pass WebSockets."
+ *
+ * `wsConnect(request, port)` IS that `switchPort` + `stub.fetch()` pair (see
+ * `connect()` in `@cloudflare/sandbox/dist/sandbox-*.js`): the DO's HTTP
+ * entrypoint, which workerd special-cases so a 101 + `webSocket` comes back
+ * intact. It is the same class of boundary the working neko desktop stream
+ * already uses — `proxyToSandbox()` also ends in `sandbox.fetch(...)`, never
+ * in an RPC call. Auto-start is preserved: inside the DO, `Container.fetch`
+ * dispatches back to `Sandbox.containerFetch`, so a sleeping container is
+ * still started with the production timeouts.
+ */
+export interface ContainerWebSocketConnector {
+  wsConnect(request: Request, port: number): Promise<Response>;
+}
+
+/**
+ * Synthetic upstream identity forwarded as `x-forwarded-host` for the APP
+ * preview target, carried over verbatim from Azure's `preview_bridge.py`.
+ *
+ * What it protects (app target only): the user's dev server is arbitrary,
+ * untrusted project code. Next.js/Vite read `x-forwarded-host` to build
+ * absolute URLs, `next/headers` values, redirect targets and cached RSC
+ * payloads. Pinning it to one constant keeps those deterministic and keeps the
+ * real, sandbox-scoped bridge hostname — which embeds the sandboxId and is the
+ * literal address of the HMAC-gated bridge — out of anything the project code
+ * can render, cache or log. It is NOT an auth control; nothing is gated on it.
+ *
+ * 🔴 Why the code target must NOT get it. code-server's `authenticateOrigin`
+ * (its WS router only — which is exactly why HTTP renders fine and only the
+ * sockets fail) compares the browser's `Origin` host against `getHost(req)`,
+ * and `getHost` honours `X-Forwarded-Host` ahead of `Host`. Feeding it a host
+ * no browser can ever present as an `Origin` does not harden that same-origin
+ * check, it converts it into an unconditional deny: every upgrade — app
+ * origin, the bridge host's own self-origin, garbage — gets 403. Forwarding
+ * the real bridge host is what makes the check work as intended: only a
+ * document actually served from this bridge host can open the socket.
+ */
+export const APP_FORWARDED_HOST = 'preview.local';
+
+/**
+ * The `x-forwarded-host` this bridge presents to the upstream, per target.
+ * See `APP_FORWARDED_HOST` for the full rationale on both branches.
+ *
+ * `url.host` (not `url.hostname`) because an `Origin`'s host includes a
+ * non-default port, and that is the value code-server compares against.
+ */
+export function resolveForwardedHost(url: URL, target: BridgeTarget): string {
+  return target === 'code' ? url.host : APP_FORWARDED_HOST;
+}
+
 // ── /preview-bootstrap ────────────────────────────────────────────────────────
 
 export interface BootstrapResult {
@@ -768,8 +833,14 @@ export async function handlePreviewProxy(
   const strippedCookie = stripPreviewCookie(request.headers.get('cookie'));
   if (strippedCookie) forwardHeaders.set('cookie', strippedCookie);
   else forwardHeaders.delete('cookie');
+  // `Forwarded` is dropped, not merged: code-server's `getHost()` honours a
+  // client-supplied `Forwarded` header AHEAD of `x-forwarded-host`, so leaving
+  // it in place would let the caller pick the host our origin check compares
+  // against. Same reason the app target drops it — a dev server that trusts
+  // `Forwarded` would otherwise see an attacker-chosen host.
+  forwardHeaders.delete('forwarded');
   forwardHeaders.set('x-forwarded-proto', 'https');
-  forwardHeaders.set('x-forwarded-host', 'preview.local');
+  forwardHeaders.set('x-forwarded-host', resolveForwardedHost(url, target));
 
   const init: RequestInit = {
     method: request.method,
@@ -891,26 +962,41 @@ export interface PreviewStatus {
 // ── /preview-ws/<path> ────────────────────────────────────────────────────────
 
 /**
- * Cookie-gate + reverse-proxy a WebSocket upgrade into the container's dev
- * server (Next.js HMR / Vite `@vite/client`). Uses the standard Workers
- * container-WebSocket-passthrough pattern: forward the Upgrade request via
- * `containerFetch`, and if the resulting Response carries a `webSocket`, hand
- * it back to the client as a 101 response.
+ * Cookie-gate + reverse-proxy a WebSocket upgrade into the container — the
+ * user's dev server (Next.js HMR / Vite `@vite/client`, `target: 'app'`) or
+ * code-server's extension host / integrated terminal / editor sync
+ * (`target: 'code'`).
  *
- * UNVERIFIED: there is no live sandbox available in this environment to
- * confirm `containerFetch` actually completes a WebSocket upgrade end to end
- * (as opposed to plain HTTP request/response) — see the report's "could not
- * verify" section. The header handling here mirrors the HTTP proxy path and
- * `preview_bridge.py`'s WS proxy (cookie auth, `x-forwarded-*`, cookie
- * stripped before forwarding).
+ * 🔴 Goes through `sandbox.wsConnect()`, NEVER `sandbox.containerFetch()`.
+ * `containerFetch` is a JSRPC method; a `Response` carrying a `webSocket` is
+ * not serializable across that boundary, so every upgrade died with a 502
+ * `Could not serialize object of type "WebSocket"…` — see
+ * `ContainerWebSocketConnector`'s doc comment for the SDK's own statement of
+ * this, and note that the WORKING neko desktop stream reaches the container
+ * the same way this now does (`proxyToSandbox` → `sandbox.fetch(...)`, an HTTP
+ * hop into the DO, not an RPC call).
+ *
+ * The upgrade handshake headers are re-asserted rather than merely forwarded:
+ * `Sandbox.fetch()` only takes its WebSocket branch when it sees BOTH
+ * `Upgrade: websocket` and a `Connection` containing `upgrade`, and if it
+ * misses that branch it silently falls back to `determinePort(url)` — port
+ * 3000, the SDK's own control plane, not this bridge's port. Setting both
+ * explicitly means that dispatch can never depend on whether an intermediary
+ * preserved a hop-by-hop request header.
+ *
+ * Everything else mirrors the HTTP proxy path and `preview_bridge.py`'s WS
+ * proxy: cookie auth, `ezil_pv` stripped from both cookie and query, `Forwarded`
+ * dropped, `x-forwarded-*` set (see `resolveForwardedHost` for why the code
+ * target must get the REAL bridge host — that is bug A).
  */
 export async function handlePreviewWsProxy(
   request: Request,
-  sandbox: ContainerFetcher,
+  sandbox: ContainerWebSocketConnector,
   sandboxId: string,
   secrets: string[],
   appPath: string,
   port: number = APP_PREVIEW_PORT,
+  target: BridgeTarget = 'app',
 ): Promise<Response> {
   const url = new URL(request.url);
   const authorized = await resolvePreviewAuth(request, url, secrets, sandboxId);
@@ -927,14 +1013,16 @@ export async function handlePreviewWsProxy(
   const strippedCookie = stripPreviewCookie(request.headers.get('cookie'));
   if (strippedCookie) forwardHeaders.set('cookie', strippedCookie);
   else forwardHeaders.delete('cookie');
+  forwardHeaders.delete('forwarded');
   forwardHeaders.set('x-forwarded-proto', 'https');
-  forwardHeaders.set('x-forwarded-host', 'preview.local');
+  forwardHeaders.set('x-forwarded-host', resolveForwardedHost(url, target));
+  forwardHeaders.set('upgrade', 'websocket');
+  forwardHeaders.set('connection', 'Upgrade');
 
   let upstream: Response;
   try {
-    upstream = await sandbox.containerFetch(
-      targetUrl,
-      { method: request.method, headers: forwardHeaders },
+    upstream = await sandbox.wsConnect(
+      new Request(targetUrl, { method: request.method, headers: forwardHeaders }),
       port,
     );
   } catch (err) {
@@ -942,10 +1030,16 @@ export async function handlePreviewWsProxy(
     return new Response(`preview ws upstream unavailable: ${message}`, { status: 502 });
   }
 
-  const upgraded = upstream.webSocket;
-  if (upgraded) {
-    return new Response(null, { status: 101, webSocket: upgraded });
-  }
+  // Returned VERBATIM — the same thing the working neko path does
+  // (`proxyToSandbox` returns `sandbox.fetch(...)` unchanged). Rebuilding it as
+  // `new Response(null, { status: 101, webSocket: upstream.webSocket })` also
+  // completes the handshake (both forms verified against real workerd, raw
+  // HTTP/1.1 upgrade, client socket reaches 101) — but it discards the
+  // upstream's own 101 headers, including any `Sec-WebSocket-Protocol` the
+  // container negotiated. Nothing here needs to rewrite a WebSocket handshake,
+  // so nothing here re-mints one. The non-upgrade case (an upstream that
+  // answered with a plain response instead) falls through the same way, as
+  // before.
   return upstream;
 }
 

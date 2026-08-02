@@ -51,7 +51,10 @@ import {
   DEVSERVER_RESTART_COOLDOWN_BASE_S,
   DEVSERVER_RESTART_MAX_BACKOFF_S,
   DEVSERVER_RESTART_ESCALATE_ATTEMPTS,
+  APP_FORWARDED_HOST,
+  resolveForwardedHost,
   type ContainerFetcher,
+  type ContainerWebSocketConnector,
 } from './preview-bridge';
 import {
   mintPreviewBootstrapToken,
@@ -976,67 +979,320 @@ describe('handlePreviewProxy', () => {
   });
 });
 
+// ── The WebSocket path: the two bugs that made code-server unusable ────────
+//
+// 1. BUG B — `containerFetch` is a Durable Object **JSRPC** method, and a
+//    `Response` carrying a `webSocket` cannot be serialized across an RPC
+//    boundary. Every upgrade died as a 502 with
+//    `Could not serialize object of type "WebSocket"…`. The old tests could
+//    not see it because their fake returned `new Response(null,{status:101})`
+//    with NO `webSocket` property, i.e. the one shape that survives RPC.
+//    `rpcContainerFetch()` below models the real boundary instead.
+//
+// 2. BUG A — the forwarded host was pinned to `preview.local`, a host no
+//    browser can present as an `Origin`, so code-server's WS-router origin
+//    check rejected every upgrade. No test set `Origin` or looked at
+//    `x-forwarded-host` at all. `simulateCodeServerEnsureOrigin()` below runs
+//    code-server's actual algorithm against the headers we forward.
+
+/**
+ * `containerFetch` as the Durable Object RPC boundary really behaves: fine for
+ * ordinary responses, and — for a WebSocket upgrade, where the container
+ * answers 101 + `webSocket` — it rejects with workerd's own serializer error.
+ * Verified against real workerd (a DO RPC method returning
+ * `new Response(null,{status:101,webSocket})` throws exactly this string).
+ *
+ * Any code path that reaches the container's WebSocket through `containerFetch`
+ * therefore fails here, loudly and for the production reason.
+ */
+function rpcContainerFetch(): ContainerFetcher['containerFetch'] {
+  return async (requestOrUrl, portOrInit) => {
+    const headers = new Headers(
+      requestOrUrl instanceof Request
+        ? requestOrUrl.headers
+        : typeof portOrInit === 'object'
+          ? portOrInit.headers
+          : undefined,
+    );
+    if ((headers.get('upgrade') ?? '').toLowerCase() === 'websocket') {
+      throw new Error('Could not serialize object of type "WebSocket". This type does not support serialization.');
+    }
+    return new Response('no upgrade');
+  };
+}
+
+/** Opaque stand-in for a `WebSocket` — identity is all these tests compare. */
+const FAKE_UPSTREAM_WS = { id: 'upstream-ws' } as unknown as WebSocket;
+
+interface WsConnectCall {
+  url: string;
+  port: number;
+  method: string;
+  headers: Record<string, string>;
+}
+
+/**
+ * A sandbox fake exposing BOTH surfaces: the working `wsConnect` (DO
+ * `fetch()` hop — 101 + `webSocket` crosses intact) and the RPC
+ * `containerFetch` that cannot carry one. Reverting the handler to
+ * `containerFetch` therefore turns every assertion below red with the real
+ * production error message, not a generic mismatch.
+ */
+function fakeWsSandbox(options: { upgrade?: boolean } = {}): ContainerWebSocketConnector &
+  ContainerFetcher & { calls: WsConnectCall[] } {
+  const calls: WsConnectCall[] = [];
+  return {
+    calls,
+    containerFetch: rpcContainerFetch(),
+    async wsConnect(request: Request, port: number) {
+      const headers: Record<string, string> = {};
+      request.headers.forEach((v, k) => {
+        headers[k] = v;
+      });
+      calls.push({ url: request.url, port, method: request.method, headers });
+      if (options.upgrade === false) return new Response('not an upgrade', { status: 200 });
+      const res = new Response(null, { status: 101 });
+      Object.defineProperty(res, 'webSocket', { value: FAKE_UPSTREAM_WS, configurable: true });
+      return res;
+    },
+  };
+}
+
+/**
+ * code-server's `authenticateOrigin` (`src/node/http.ts`), ported faithfully.
+ * It runs on the WS router only — which is exactly why the editor renders over
+ * HTTP and only the sockets 403.
+ *
+ *   - a missing `Origin` is allowed through (non-browser client);
+ *   - otherwise `new URL(origin).host` must equal `getHost(req)`;
+ *   - `getHost` honours `Forwarded` first, then `X-Forwarded-Host`, then `Host`.
+ *
+ * Throws on rejection (code-server maps that to HTTP 403).
+ */
+function simulateCodeServerEnsureOrigin(headers: Record<string, string>, origin: string | null): void {
+  if (!origin) return;
+  const originHost = new URL(origin).host.trim().toLowerCase();
+  let host: string | undefined;
+  if (headers['forwarded'] !== undefined) {
+    host = /host="?([^";]+)"?/.exec(headers['forwarded'])?.[1]?.trim().toLowerCase();
+  } else if (headers['x-forwarded-host'] !== undefined && headers['x-forwarded-host'] !== '') {
+    host = headers['x-forwarded-host'].split(',')[0]?.trim().toLowerCase();
+  } else {
+    host = headers['host'];
+  }
+  if (host === undefined) throw new Error('no host headers found');
+  if (host !== originHost) throw new Error(`incorrect origin: ${originHost} does not match host ${host}`);
+}
+
+describe('resolveForwardedHost', () => {
+  it('pins the APP target to the synthetic constant (unchanged Azure behaviour)', () => {
+    const url = new URL(`https://${APP_PREVIEW_PORT}-guac-a-b-${APP_PREVIEW_TOKEN}.ezil.org/preview-ws/`);
+    expect(resolveForwardedHost(url, 'app')).toBe(APP_FORWARDED_HOST);
+    expect(APP_FORWARDED_HOST).toBe('preview.local');
+  });
+
+  it('gives the CODE target the real bridge host — the only value an Origin can match', () => {
+    const url = new URL(`https://${CODE_PREVIEW_PORT}-guac-a-b-${CODE_PREVIEW_TOKEN}.ezil.org/?type=ExtensionHost`);
+    expect(resolveForwardedHost(url, 'code')).toBe(`${CODE_PREVIEW_PORT}-guac-a-b-${CODE_PREVIEW_TOKEN}.ezil.org`);
+  });
+
+  it('keeps a non-default port, because an Origin host carries one', () => {
+    expect(resolveForwardedHost(new URL('http://localhost:8787/'), 'code')).toBe('localhost:8787');
+  });
+});
+
 describe('handlePreviewWsProxy', () => {
   const SECRET = 'test-primary-secret';
   const SID = 'guac-user1-proj1';
+  const CODE_HOST = `${CODE_PREVIEW_PORT}-${SID}-${CODE_PREVIEW_TOKEN}.ezil.org`;
+  const APP_HOST = `${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org`;
 
-  it('returns 401 without a valid cookie', async () => {
-    const sandbox: ContainerFetcher = {
-      async containerFetch() {
-        throw new Error('should not be reached');
+  /** The upgrade a browser actually sends for code-server's extension host. */
+  function codeUpgradeRequest(cookie: string, extra: Record<string, string> = {}): Request {
+    return new Request(`https://${CODE_HOST}/?type=ExtensionHost&reconnectionToken=abc`, {
+      headers: {
+        cookie: `${PREVIEW_COOKIE_NAME}=${cookie}`,
+        upgrade: 'websocket',
+        connection: 'Upgrade',
+        origin: `https://${CODE_HOST}`,
+        ...extra,
       },
-    };
-    const request = new Request(`https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-ws/`);
+    });
+  }
+
+  it('returns 401 without a valid cookie, and never touches the container', async () => {
+    const sandbox = fakeWsSandbox();
+    const request = new Request(`https://${APP_HOST}/preview-ws/`);
     const res = await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/');
     expect(res.status).toBe(401);
+    expect(sandbox.calls).toHaveLength(0);
   });
 
   it('defaults to APP_PREVIEW_PORT when no port is given', async () => {
     const cookie = await mintPreviewCookie(SECRET, SID);
-    let seenPort: number | undefined;
-    const sandbox: ContainerFetcher = {
-      async containerFetch(_req, _init, port) {
-        seenPort = port;
-        return new Response('no upgrade');
-      },
-    };
-    const request = new Request(
-      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-ws/`,
-      { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } },
-    );
+    const sandbox = fakeWsSandbox();
+    const request = new Request(`https://${APP_HOST}/preview-ws/`, {
+      headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` },
+    });
     await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/');
-    expect(seenPort).toBe(APP_PREVIEW_PORT);
+    expect(sandbox.calls[0]?.port).toBe(APP_PREVIEW_PORT);
   });
 
   it('reaches the code-server port when an explicit port is given', async () => {
     const cookie = await mintPreviewCookie(SECRET, SID);
-    let seenPort: number | undefined;
-    const sandbox: ContainerFetcher = {
-      async containerFetch(_req, _init, port) {
-        seenPort = port;
-        return new Response('no upgrade');
-      },
-    };
-    const request = new Request(
-      `https://${CODE_PREVIEW_PORT}-${SID}-${CODE_PREVIEW_TOKEN}.ezil.org/preview-ws/`,
-      { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } },
-    );
-    await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/', CODE_PREVIEW_PORT);
-    expect(seenPort).toBe(CODE_PREVIEW_PORT);
+    const sandbox = fakeWsSandbox();
+    await handlePreviewWsProxy(codeUpgradeRequest(cookie), sandbox, SID, [SECRET], '/', CODE_PREVIEW_PORT, 'code');
+    expect(sandbox.calls[0]?.port).toBe(CODE_PREVIEW_PORT);
+    expect(sandbox.calls[0]?.url).toBe(`http://127.0.0.1:${CODE_PREVIEW_PORT}/?type=ExtensionHost&reconnectionToken=abc`);
   });
 
   it('accepts the `ezil_pv` query-param fallback when the cookie is missing', async () => {
     const cookie = await mintPreviewCookie(SECRET, SID);
-    const sandbox: ContainerFetcher = {
-      async containerFetch() {
-        return new Response('no upgrade');
-      },
-    };
+    const sandbox = fakeWsSandbox();
     const request = new Request(
-      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-ws/?${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`,
+      `https://${APP_HOST}/preview-ws/?${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`,
+      { headers: { upgrade: 'websocket', connection: 'Upgrade' } },
     );
     const res = await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/');
-    expect(res.status).toBe(200); // no `webSocket` on the fake Response -> passthrough, not 401
+    expect(res.status).toBe(101);
+    expect(sandbox.calls).toHaveLength(1);
+    expect(sandbox.calls[0]?.url).not.toContain(PREVIEW_COOKIE_QUERY_PARAM);
+  });
+
+  // ── BUG B ────────────────────────────────────────────────────────────────
+  it('🔴 hands the client a REAL 101 carrying the upstream WebSocket', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const sandbox = fakeWsSandbox();
+    const res = await handlePreviewWsProxy(
+      codeUpgradeRequest(cookie), sandbox, SID, [SECRET], '/', CODE_PREVIEW_PORT, 'code',
+    );
+    expect(res.status).toBe(101);
+    // The whole point of the fix: the socket object survives the hop. A 101
+    // with no `webSocket` is what the old test asserted, and it is exactly the
+    // shape that cannot happen in production.
+    expect(res.webSocket).toBe(FAKE_UPSTREAM_WS);
+  });
+
+  it('🔴 never routes the upgrade through the JSRPC `containerFetch` boundary', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    // Only `wsConnect` exists here; a handler that reaches for `containerFetch`
+    // gets a TypeError, which the handler reports as its 502 diagnostic.
+    const wsOnly = { wsConnect: fakeWsSandbox().wsConnect } as ContainerWebSocketConnector;
+    const res = await handlePreviewWsProxy(
+      codeUpgradeRequest(cookie), wsOnly, SID, [SECRET], '/', CODE_PREVIEW_PORT, 'code',
+    );
+    expect(res.status).toBe(101);
+  });
+
+  it('🔴 surfaces an upstream failure as the 502 diagnostic rather than throwing', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const sandbox: ContainerWebSocketConnector = {
+      async wsConnect() {
+        throw new Error('container is not listening in the TCP address 10.0.0.1:8443');
+      },
+    };
+    const res = await handlePreviewWsProxy(
+      codeUpgradeRequest(cookie), sandbox, SID, [SECRET], '/', CODE_PREVIEW_PORT, 'code',
+    );
+    expect(res.status).toBe(502);
+    expect(await res.text()).toContain('preview ws upstream unavailable');
+  });
+
+  it('🔴 re-asserts Upgrade/Connection so the SDK cannot misroute to its 3000 control plane', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const sandbox = fakeWsSandbox();
+    // Inbound request deliberately WITHOUT the hop-by-hop `Connection` header:
+    // `Sandbox.fetch()` only takes its WebSocket branch when it sees both, and
+    // otherwise silently falls back to port 3000.
+    const request = new Request(`https://${CODE_HOST}/?type=ExtensionHost`, {
+      headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}`, upgrade: 'websocket', origin: `https://${CODE_HOST}` },
+    });
+    await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/', CODE_PREVIEW_PORT, 'code');
+    expect(sandbox.calls[0]?.headers.upgrade).toBe('websocket');
+    expect((sandbox.calls[0]?.headers.connection ?? '').toLowerCase()).toContain('upgrade');
+  });
+
+  // ── BUG A ────────────────────────────────────────────────────────────────
+  it('🔴 forwards the REAL bridge host for target: code, so the Origin check can pass', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const sandbox = fakeWsSandbox();
+    await handlePreviewWsProxy(
+      codeUpgradeRequest(cookie), sandbox, SID, [SECRET], '/', CODE_PREVIEW_PORT, 'code',
+    );
+    expect(sandbox.calls[0]?.headers['x-forwarded-host']).toBe(CODE_HOST);
+    expect(sandbox.calls[0]?.headers['x-forwarded-host']).not.toBe('preview.local');
+  });
+
+  it("🔴 code-server's own ensureOrigin ACCEPTS the headers we forward for the browser's Origin", async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const sandbox = fakeWsSandbox();
+    await handlePreviewWsProxy(
+      codeUpgradeRequest(cookie), sandbox, SID, [SECRET], '/', CODE_PREVIEW_PORT, 'code',
+    );
+    const forwarded = sandbox.calls[0]!.headers;
+    // The document that opens the extension-host socket is served from the
+    // bridge host, so this is the Origin the browser really sends.
+    expect(() => simulateCodeServerEnsureOrigin(forwarded, `https://${CODE_HOST}`)).not.toThrow();
+    // …and it stays a real same-origin check, not a rubber stamp.
+    expect(() => simulateCodeServerEnsureOrigin(forwarded, 'https://evil.example')).toThrow(/incorrect origin/);
+    // A non-browser client sends no Origin at all; code-server allows that,
+    // and the bridge's HMAC cookie gate upstream is what actually stops it.
+    expect(() => simulateCodeServerEnsureOrigin(forwarded, null)).not.toThrow();
+  });
+
+  it('🔴 the OLD `preview.local` value is provably rejected by that same check', async () => {
+    // Reproduces the shipped bug exactly: every origin measured in production
+    // (app origin, the bridge's own self-origin, garbage) 403s.
+    for (const origin of [`https://${CODE_HOST}`, 'https://ezil-os.vercel.app', 'https://garbage.example']) {
+      expect(() => simulateCodeServerEnsureOrigin({ 'x-forwarded-host': 'preview.local' }, origin)).toThrow(
+        /incorrect origin/,
+      );
+    }
+  });
+
+  it('keeps `preview.local` for target: app — the dev server never learns the bridge host', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const sandbox = fakeWsSandbox();
+    const request = new Request(`https://${APP_HOST}/preview-ws/`, {
+      headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` },
+    });
+    await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/');
+    expect(sandbox.calls[0]?.headers['x-forwarded-host']).toBe(APP_FORWARDED_HOST);
+    expect(sandbox.calls[0]?.headers['x-forwarded-host']).not.toContain(SID);
+  });
+
+  it('🔴 drops a client-supplied `Forwarded` header, which outranks x-forwarded-host', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const sandbox = fakeWsSandbox();
+    await handlePreviewWsProxy(
+      codeUpgradeRequest(cookie, { forwarded: 'host=attacker.example;proto=https' }),
+      sandbox, SID, [SECRET], '/', CODE_PREVIEW_PORT, 'code',
+    );
+    const forwarded = sandbox.calls[0]!.headers;
+    expect(forwarded.forwarded).toBeUndefined();
+    // Left in place it would have chosen the host the origin check compares to.
+    expect(() => simulateCodeServerEnsureOrigin(forwarded, `https://${CODE_HOST}`)).not.toThrow();
+  });
+
+  it('strips the `ezil_preview` cookie before the container ever sees it', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const sandbox = fakeWsSandbox();
+    await handlePreviewWsProxy(
+      codeUpgradeRequest(cookie, { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}; keep=yes` }),
+      sandbox, SID, [SECRET], '/', CODE_PREVIEW_PORT, 'code',
+    );
+    expect(sandbox.calls[0]?.headers.cookie).toBe('keep=yes');
+    expect(sandbox.calls[0]?.headers.cookie).not.toContain(PREVIEW_COOKIE_NAME);
+  });
+
+  it('passes a non-upgrade upstream response straight through', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const sandbox = fakeWsSandbox({ upgrade: false });
+    const res = await handlePreviewWsProxy(
+      codeUpgradeRequest(cookie), sandbox, SID, [SECRET], '/', CODE_PREVIEW_PORT, 'code',
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('not an upgrade');
   });
 });
 

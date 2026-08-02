@@ -3151,7 +3151,10 @@ async function handleCodeBridge(
   const sandbox = openSandbox(env, sandboxId);
   const upgrade = (request.headers.get('upgrade') ?? '').toLowerCase();
   if (upgrade === 'websocket') {
-    return handlePreviewWsProxy(request, sandbox, sandboxId, secrets, codePath, port);
+    // `'code'` is load-bearing, not cosmetic: it selects the REAL bridge
+    // hostname as `x-forwarded-host`, which is the only value code-server's
+    // WS-router origin check can ever accept (see `resolveForwardedHost`).
+    return handlePreviewWsProxy(request, sandbox, sandboxId, secrets, codePath, port, 'code');
   }
   return handlePreviewProxy(request, sandbox, sandboxId, secrets, codePath, port, 'code');
 }
@@ -3233,7 +3236,7 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
   if (path === '/preview-ws' || path.startsWith('/preview-ws/')) {
     const sandbox = openSandbox(env, sandboxId);
     const appPath = path === '/preview-ws' ? '/' : path.slice('/preview-ws'.length);
-    return handlePreviewWsProxy(request, sandbox, sandboxId, secrets, appPath, port);
+    return handlePreviewWsProxy(request, sandbox, sandboxId, secrets, appPath, port, target);
   }
 
   if (path === '/preview' || path.startsWith('/preview/')) {
