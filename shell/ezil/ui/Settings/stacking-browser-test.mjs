@@ -290,6 +290,181 @@ const VIEWPORTS = [
 // before the module reaches `runCloseReopenSweep`'s own textual definition.
 const CLOSE_REOPEN_INTERVALS_MS = [20, 50, 112, 250, 500];
 
+// ═══════════════════════════════════════════════════════════════════════════
+// T22 — THE COVERAGE MANIFEST (the check-COUNT gate)
+// ═══════════════════════════════════════════════════════════════════════════
+// Round 9 built a canary that catches exactly one literal
+// (`resolvedApps.forEach(id => coveredIds.add(id))`). Round 10 walked around
+// it twice without ever touching that literal:
+//
+//   H4:  `otherAppIds.filter(id => id !== 'code')` + a targeted, one-line
+//        `coveredIds.add('code')` right after the Set is declared.
+//        -> 462/462 exit 0, 5 SKIP. `code` is never opened, hit-tested,
+//        painted or raised at ANY viewport. THE GUARD below still reports
+//        "every app got a scenario" because `coveredIds` was lied to
+//        directly, not derived from anything real.
+//   H2c: the identical two edits, gated to `vp !== VIEWPORTS[0]` so the
+//        round-9 canary (first-viewport-only) never sees them.
+//        -> 481/481 exit 0, 5 SKIP. `code` gets a real scenario at 1 of 5
+//        viewports; `taskbar item "code" stays hittable` drops from 20
+//        occurrences to 4.
+//
+// Both attacks are invisible to a boolean "was it covered" guard, because
+// they win by making `coveredIds` LIE, not by leaving it honestly empty.
+// Both are trivially visible to a COUNT: 557 checks shrank to 462, or to
+// 481. Nothing in the file before T22 read that number. This block does.
+//
+// `checkCounts` tallies, per (viewport, app-id), how many REAL checks this
+// run actually `push()`ed that are directly attributable to that app —
+// independent of, and never fed by, `coveredIds`. It is incremented at every
+// place a check names a specific app: the four per-app assertion helpers
+// (`assertHitTestsIntoSelf`, `checkContentPainted`, `raiseByTitlebarClick`,
+// `raiseByTaskbarItemClick` — the same four `coveredIds.add()` already
+// trusts, but this is a SEPARATE counter, not a read of that Set, so lying
+// to `coveredIds` cannot also lie to this), `checkTaskbarReachable`'s
+// per-item loop (the exact mechanism H2c's taskbar-hittability collapse
+// exploits), and the `SCENARIO: "id" window opened` push (the very first
+// thing that stops happening at all for an app H4 filters out of
+// `otherAppIds` — a push this file already made unconditionally, now also
+// counted).
+//
+// `viewportResolvedApps` snapshots the TRUE resolved-app list for each
+// viewport at the ONE moment it is least corruptible: immediately after
+// `registry.resolve()` returns, before `otherAppIds` (or anything else) is
+// ever derived from it. Both H4 and H2c edit `otherAppIds`, not
+// `resolvedApps` itself — deriving the manifest's "what must have been
+// tested" list from the SAME variable the loop is driven from would let an
+// attacker starve both at once with one edit; snapshotting a step earlier
+// closes that gap.
+//
+// `checkCoverageManifest()` (defined below, called right after the viewport
+// sweep) compares, for every viewport × every app that viewport's own
+// snapshot says was resolved, the actual tally against a floor, and FAILS —
+// loudly, with the expected/actual numbers for every short cell printed, not
+// just a boolean — if any cell came in under. See that function's own doc
+// block for how the floors are derived and how to bump them.
+// ═══════════════════════════════════════════════════════════════════════════
+const checkCounts = new Map(); // key `${vp.name}::${appId}` -> count
+const viewportResolvedApps = new Map(); // key `vp.name` -> string[] (true resolved list, pre-`otherAppIds`)
+
+/** Increment the tally for `appId` at `vpName`. Called ONLY from real
+ * `push()` sites (never from `skip()` sites) — a check that never ran must
+ * never inflate a cell, or this gate would suffer from exactly the disease
+ * it exists to cure. */
+function tally (vpName, appId, n = 1) {
+    if ( ! appId ) return;
+    const key = `${vpName}::${appId}`;
+    checkCounts.set(key, (checkCounts.get(key) ?? 0) + n);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// T22 — THE COVERAGE MANIFEST'S FLOORS
+// ═══════════════════════════════════════════════════════════════════════════
+// For every (viewport, app) cell the registry actually resolved, this is the
+// MINIMUM number of real checks (`tally()` calls, above) that cell must have
+// accumulated. `NAMED_APP_FLOORS` below is the EXACT count a clean run of
+// this file produces today for each of the four current apps, captured with
+// `DEBUG_CHECK_COUNTS=1` and confirmed IDENTICAL across all 5 viewports and
+// across repeated clean runs — this harness has no real per-app or
+// per-viewport randomness in these numbers, so an exact floor (not a range)
+// is the tightest, most honest gate available: ANY drop, even a partial one
+// (e.g. "code" going from 11 checks to 8 at one viewport — nothing this
+// small has shipped yet, but the whole point of a count gate is not to wait
+// for the next round to find out), is visible immediately.
+//
+// A legitimate future change to the SHAPE of a scenario (adding or removing
+// a round of assertions for a specific app) moves that one number
+// deterministically — bump it, in the same commit, with a reason. That is
+// the "obvious, reviewable manifest bump" the brief asks for: a one-line,
+// one-cell diff, not a mystery.
+//
+// `*_FALLBACK_FLOOR` below exist ONLY for an app the registry resolves that
+// is NOT YET a key in `NAMED_APP_FLOORS` — i.e. a brand-new app dropped into
+// `APPS` with no manifest entry yet. Deliberately generic and conservative
+// (well under any of the four measured minimums), so a genuinely
+// well-tested new app clears it easily while a new app that ships with the
+// SAME "whole app never opened" defect this file exists to catch (its own
+// count sitting at 0, or at the noise floor of one or two incidental
+// mentions) still fails loudly. This is what keeps the manifest from
+// becoming the next hardcoded app-id list the file's own header warns
+// against: an app not YET named here is still gated, just more loosely,
+// until a human reviews its real numbers and gives it an exact entry.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Exact per-app floors, measured via `DEBUG_CHECK_COUNTS=1` on a clean run
+ * of this branch (identical at all 5 viewports: 1280x860, 1366x768,
+ * 1440x900, 1280x800, 1920x1080). `desktop` is the boot app
+ * (`wants_settings_in_drawer`, opened by `boot.js` itself, so it never gets
+ * a SCENARIO-opened push and its `assertHitTestsIntoSelf` checks legitimately
+ * SKIP both — its floor is almost entirely `checkContentPainted` +
+ * `checkTaskbarReachable` mentions once minimized + the restore checks at
+ * the end). `settings`/`preview`/`code` all go through the identical
+ * `otherAppIds` loop + round-robin + `checkTaskbarReachable` machinery;
+ * `settings` additionally eats the resize-handle regression's 6 tallies
+ * (`otherAppIds[0]`, 2 per direction x 3 directions — WHICH app lands in
+ * that slot is registry-order-dependent, which is exactly why this is a
+ * NAMED number and not folded into a generic rule) and the full-bleed
+ * drawer's "open Settings" scenario extras. */
+const NAMED_APP_FLOORS = {
+    desktop: 9,
+    settings: 23,
+    preview: 12,
+    code: 11,
+};
+
+/** Generic fallback for a registered app the registry resolves that has no
+ * entry in `NAMED_APP_FLOORS` yet (a new app just added to `APPS`, before a
+ * human has reviewed its real numbers and given it an exact floor). Set
+ * comfortably below every measured non-boot minimum above (11) so it never
+ * false-fails a normal new app, while still catching the shape of defect
+ * this whole file exists for — an app that is registered but never actually
+ * opened/tested would sit at 0, or at most a couple of incidental
+ * `checkTaskbarReachable` mentions from OTHER apps' scans, both well under 6. */
+const OTHER_APP_FALLBACK_FLOOR = 6;
+
+/** Same idea, for a hypothetical future boot app (`APPS[0]`) not yet named
+ * above. Set below the one measured boot-app minimum (9). */
+const BOOT_APP_FALLBACK_FLOOR = 3;
+
+/**
+ * 🔴 THE GATE. For every viewport, for every app that viewport's OWN
+ * snapshot (`viewportResolvedApps`, captured at registry-resolve time — see
+ * the top-of-file block for why that moment, not `otherAppIds`, is the
+ * source of truth) says the registry resolved, require `checkCounts` to meet
+ * or exceed that app's floor. A cell under floor is a `push()` FAIL naming
+ * the exact viewport, app, expected and actual counts — not a silent number
+ * nobody reads. This is deliberately independent of `coveredIds`/THE GUARD
+ * (inside `runViewport`): H4 and H2c both defeat that guard by writing a
+ * true value into `coveredIds` for an app that never ran; they cannot also
+ * inflate `checkCounts`, because nothing populates `checkCounts` except a
+ * `tally()` call sitting directly next to a real `push()`. Set
+ * `DEBUG_CHECK_COUNTS=1` to print the raw per-cell table this was
+ * calibrated from (same convention as this file's other `DEBUG_*` env
+ * flags).
+ */
+function checkCoverageManifest () {
+    if ( process.env.DEBUG_CHECK_COUNTS ) {
+        console.log('\nDEBUG_CHECK_COUNTS:', JSON.stringify([...checkCounts.entries()], null, 2));
+    }
+    for ( const vp of VIEWPORTS ) {
+        const resolved = viewportResolvedApps.get(vp.name);
+        if ( ! resolved ) {
+            push(`[${vp.name}] coverage manifest: this viewport recorded a resolved-apps snapshot`, false,
+                'no snapshot — runViewport must have aborted before reaching it');
+            continue;
+        }
+        for ( const app of resolved ) {
+            const actual = checkCounts.get(`${vp.name}::${app}`) ?? 0;
+            const expected = NAMED_APP_FLOORS[app]
+                ?? (app === resolved[0] ? BOOT_APP_FALLBACK_FLOOR : OTHER_APP_FALLBACK_FLOOR);
+            push(`[${vp.name}] coverage manifest: "${app}" met its check-count floor`,
+                actual >= expected,
+                `expected>=${expected} actual=${actual}${NAMED_APP_FLOORS[app] === undefined ? ' (no NAMED_APP_FLOORS entry yet — using the generic fallback; add one once this app'
+                    + '\'s real numbers are known)' : ''} (a shortfall here means this app's coverage silently collapsed at this viewport, even if THE GUARD above reported it covered)`);
+        }
+    }
+}
+
 const browser = await chromium.launch();
 const allPageErrors = [];
 let anyHardFailure = false;
@@ -302,6 +477,12 @@ for ( const vp of VIEWPORTS ) {
         push(`[${vp.name}] harness threw without completing`, false, String(err?.stack ?? err));
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE GATE ITSELF — see `checkCoverageManifest`'s own doc block for the
+// floors and the diff format. Runs once, after every viewport has reported.
+// ═══════════════════════════════════════════════════════════════════════════
+checkCoverageManifest();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GAP 2 — close, then reopen, every registered app. See the file's own
@@ -339,6 +520,31 @@ try {
     anyHardFailure = true;
     push('[dashboard-popstate] harness threw without completing', false, String(err?.stack ?? err));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// T22 — GLOBAL TOTAL-CHECK FLOOR, defense in depth alongside the per-(app,
+// viewport) coverage manifest above. That manifest is the precise tool for
+// "one app's coverage silently collapsed" — this is the blunt one for "the
+// suite as a whole silently got smaller", the exact signal the brief points
+// at directly: "Nothing in the repo gates on a minimum check count, so the
+// only signal (557 -> 462) is unread." It also covers the three sweeps below
+// the main viewport loop (GAP 2/4/5), which are NOT `otherAppIds`-shaped and
+// so are outside the per-app manifest's scope, without needing a second
+// full manifest built for them.
+//
+// `MIN_TOTAL_CHECKS` is the exact total (`checks.length`, ALL sweeps
+// combined) a clean run of this file produces today — 577 (557 real checks
+// + 20 from the coverage-manifest gate itself, 4 apps x 5 viewports).
+// Bump it, with a reason, in the same commit as any change that legitimately
+// adds or removes checks anywhere in this file — the same "obvious,
+// reviewable manifest bump" discipline as `NAMED_APP_FLOORS` above, at
+// whole-suite granularity.
+// ═══════════════════════════════════════════════════════════════════════════
+const MIN_TOTAL_CHECKS = 577;
+const totalSoFar = checks.length;
+push(`GATE: total check count across the whole suite has not silently shrunk`,
+    totalSoFar >= MIN_TOTAL_CHECKS,
+    `expected>=${MIN_TOTAL_CHECKS} actual=${totalSoFar} (this is the "557 -> 462" signal itself — see T22's own header block, top of file)`);
 
 await browser.close();
 
@@ -638,6 +844,7 @@ async function runViewport (vp) {
             // own comment block near the bottom of this file for why that
             // distinction is the entire fix.
             coveredIds.add(app);
+            tally(vp.name, app); // T22 — see the coverage-manifest block, top of file.
         } else {
             skip(`${label}: titlebar hit test for ${app} (no titlebar pixel this window owns — either full-bleed hides it by design, or another window fully occludes it)`);
         }
@@ -645,6 +852,7 @@ async function runViewport (vp) {
             push(`${label}: a button inside ${app} hit-tests INTO ${app}`, hitBp.inWindow === app,
                 `button-hit=${JSON.stringify(hitBp)}`);
             coveredIds.add(app);
+            tally(vp.name, app);
         } else {
             skip(`${label}: button-inside hit test for ${app} (no visible interactive control found)`);
         }
@@ -680,6 +888,15 @@ async function runViewport (vp) {
             push(`${label}: ${humanLabel} stays hittable (not occluded by a window)`,
                 hit.inTaskbarItem === it.app,
                 `point=(${it.x.toFixed(0)},${it.y.toFixed(0)}) hit=${JSON.stringify(hit)}`);
+            // T22 — this is the EXACT mechanism the H2c attack (see the
+            // coverage-manifest block, top of file) collapses for a
+            // filtered-out app: if `it.app` never opens, its taskbar item
+            // never exists, this loop never iterates it, and this tally
+            // never increments — precisely the "count dropping IS the tell"
+            // signal the manifest gate reads. Real (Start-button) items
+            // carry `data-app="undefined"` and are excluded — they are not a
+            // registered app and have no manifest cell.
+            if ( it.app && it.app !== 'undefined' ) tally(vp.name, it.app);
         }
     }
 
@@ -788,6 +1005,7 @@ async function runViewport (vp) {
         }
         push(name, res.pass, JSON.stringify(res.detail));
         coveredIds.add(app); // 🔴 GAP 1 FIX — see assertHitTestsIntoSelf's comment.
+        tally(vp.name, app); // T22
     }
 
     /**
@@ -856,6 +1074,7 @@ async function runViewport (vp) {
         push(`${label}: a real click on ${app}'s titlebar raises it to the top`,
             top === app, `clicked-at=${JSON.stringify(tb)} z=${JSON.stringify(z)}`);
         coveredIds.add(app); // 🔴 GAP 1 FIX — see assertHitTestsIntoSelf's comment.
+        tally(vp.name, app); // T22
     }
 
     /** Same signal, via the taskbar item — the OTHER real path a user has to
@@ -884,6 +1103,7 @@ async function runViewport (vp) {
         push(`${label}: a real click on ${app}'s taskbar item raises/restores it to the top`,
             top === app, `clicked-at=${JSON.stringify(p)} z=${JSON.stringify(z)}`);
         coveredIds.add(app); // 🔴 GAP 1 FIX — see assertHitTestsIntoSelf's comment.
+        tally(vp.name, app); // T22
     }
 
     /** Minimize whatever app is passed — tries the ordinary titlebar minimize
@@ -1055,6 +1275,7 @@ async function runViewport (vp) {
         push(`${label}: grabbing ${app}'s "${handleDir}" resize handle raises it (buried -> top on mousedown)`,
             zAfterDown === app, `afterDown=${zAfterDown}`);
         coveredIds.add(app);
+        tally(vp.name, app); // T22
 
         // 🔴 GAP 3 FOLLOW-UP, PART 2 — a REAL defect this exact check used to
         // wave through. The old assertion was `Math.abs(width delta) > 1 ||
@@ -1096,6 +1317,7 @@ async function runViewport (vp) {
         push(`${label}: dragging ${app}'s "${handleDir}" resize handle actually resizes it (grows the axis it owns, leaves the other alone, never collapses)`,
             resized, `before=${JSON.stringify(before)} after=${JSON.stringify(after)} affects=${JSON.stringify(AFFECTS)}`);
         coveredIds.add(app);
+        tally(vp.name, app); // T22
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -1130,6 +1352,15 @@ async function runViewport (vp) {
     const resolvedApps = await page.evaluate(() => window.ezil.registry.resolve(window.__EZIL_BOOT__).map((a) => a.id));
     push(`${VP} registry resolved at least one app for this boot payload`, resolvedApps.length > 0,
         `resolved=${JSON.stringify(resolvedApps)}`);
+    // T22 — snapshot the TRUE resolved list for THIS viewport right now, one
+    // statement after the registry call returns and before anything (not
+    // even `otherAppIds`) is derived from it. See the coverage-manifest
+    // block at the top of this file for why this exact moment matters: both
+    // documented attacks (H4, H2c) edit `otherAppIds`, never `resolvedApps`
+    // itself, specifically so the loop can be starved without the obvious
+    // list looking short — deriving the manifest's expectation from anything
+    // downstream of this line would let the same one edit starve both.
+    viewportResolvedApps.set(vp.name, [...resolvedApps]);
 
     const bootAppId = resolvedApps[0];
     const otherAppIds = resolvedApps.slice(1);
@@ -1236,6 +1467,7 @@ async function runViewport (vp) {
 
         const opened = await page.evaluate((a) => !! document.querySelector(`.window[data-app="${a}"]`), id);
         push(`${VP} SCENARIO: "${id}" window opened`, opened);
+        tally(vp.name, id); // T22 — the first check H4 removes entirely for a filtered-out app.
         // 🔴 GAP 1 FIX: `continue` here now genuinely means "not covered" —
         // nothing below adds `id` to `coveredIds` (or even `openIds`) unless
         // this line is passed. The old code added to `coveredIds`
@@ -1777,7 +2009,38 @@ async function runCloseReopenSweep () {
             await until((a) => !! document.querySelector(`.window[data-app="${a}"]`), id, 8000, 50);
             await settle(id);
 
-            const state = await page.evaluate((a) => {
+            // 🔴 T22 FLAKE FIX — see this file's own header, trap #1
+            // ("never trust a mid-transition read"), applied here for the
+            // first time to THIS state read specifically. `closeApp()`
+            // clicks a real close button; the CLICKED element's own
+            // teardown (`$.fn.close`, awaited internally, per the M5b sweep
+            // above) is not guaranteed to have removed the OLD `.window`
+            // node from the DOM by the exact moment `reopenApp()`'s brand
+            // new window has already appeared — `until()` above only waits
+            // for AT LEAST ONE `.window[data-app]` node to exist, which the
+            // NEW window satisfies instantly regardless of whether the OLD
+            // one has finished being torn down. `settle(id)` only reads
+            // `document.querySelector` (singular — whichever node the
+            // engine returns first) so it cannot see a stray SECOND node
+            // either. OBSERVED (this branch, pre-fix: 3 of 6 consecutive
+            // runs, always "settings" at the tightest 20ms interval, never a
+            // real product defect per the manual cross-check noted in this
+            // sweep's own header — 10/10 clean after this fix, see the T22
+            // report):
+            // a transient `windowCount: 2` — one old node mid-removal, one
+            // freshly opened — that resolves to `1` within well under a
+            // second on every run once actually waited for. This is NOT a
+            // longer CLOSE_REOPEN_INTERVALS_MS timeout in disguise: the
+            // interval between close and reopen (the thing GAP 2 exists to
+            // sweep) is untouched; only the READ of the RESULT, after both
+            // actions have already happened, is now taken once it has
+            // stopped changing — exactly `settle()`'s own principle, applied
+            // to window/taskbar COUNTS instead of geometry. A real,
+            // persistent duplicate-window bug still fails this: the state
+            // would stabilize AT "2", not converge to "1", and the assertion
+            // below judges whatever it actually stabilized at, not a
+            // wished-for value.
+            const readState = (appId) => page.evaluate((a) => {
                 const wins = document.querySelectorAll(`.window[data-app="${a}"]`);
                 const items = document.querySelectorAll(`.taskbar-item[data-app="${a}"]`);
                 const win = wins[0] ?? null;
@@ -1790,7 +2053,19 @@ async function runCloseReopenSweep () {
                     openWindowsAttr: item ? parseInt(item.getAttribute('data-open-windows'), 10) : null,
                     visible: !! win && cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0,
                 };
-            }, id);
+            }, appId);
+            let state = await readState(id);
+            {
+                const deadline = Date.now() + 800;
+                let prev = JSON.stringify(state);
+                while ( Date.now() < deadline ) {
+                    await sleep(40);
+                    state = await readState(id);
+                    const cur = JSON.stringify(state);
+                    if ( cur === prev ) break;
+                    prev = cur;
+                }
+            }
 
             push(`${label}: exactly 1 window`, state.windowCount === 1, `windowCount=${state.windowCount}`);
             push(`${label}: exactly 1 taskbar item`, state.taskbarItemCount === 1, `taskbarItemCount=${state.taskbarItemCount}`);
