@@ -227,7 +227,48 @@ function stub (url, method, bodyText) {
 }
 
 const HOST = 'https://ezil-stacking-test.invalid';
-const DOC_HTML = `<!doctype html><html><head><style>${css}</style></head>
+
+// 🔴 WAVE F INTEGRATION FIX — HARNESS FIDELITY, NOT AN ASSERTION CHANGE.
+// This document copies the REAL `/os` page's element classes from
+// `app/src/app/layout.tsx`:
+//     <html class="… h-full antialiased">  <body class="min-h-full flex flex-col">
+// `h-full` and `min-h-full` are TAILWIND utilities. Tailwind lives in
+// `app/src/app/globals.css`, which this harness never loads — it loads only
+// the shell's own `bundle.min.css`. So the class names are present and mean
+// NOTHING here: MEASURED in this document, `getComputedStyle(html).height`
+// and `getComputedStyle(body).height` are both **"0px"** (the real page's
+// body is at least viewport-tall), even though `documentElement.clientHeight`
+// is a normal 900.
+//
+// That is not cosmetic. `UIWindow.js` wires `.resizable({ containment:
+// 'parent' })`, and a `.window`'s parent here IS `<body>`. jQuery UI clamps a
+// resize against the containment box, so with a 0-height container it clamps
+// every window's height to `containerHeight - top` — a NEGATIVE number, which
+// CSS then renders as 0. MEASURED, via a `resizestart/resize/resizestop`
+// listener on the live target (`/tmp/.../scratchpad/probe-resize.mjs`):
+//   body height 0px  -> first resize event reports `size:{w:764,h:-155}` on a
+//                       window at top=155 (h is exactly `0 - top`), and a
+//                       (+30,+30) drag on `se` ends at 790x0.
+//   html/body given their REAL height -> the identical drag on the identical
+//                       window ends at 790x590, i.e. exactly +30 on both axes.
+// Same bundle, same window, same drag; only the container's height differs.
+//
+// So the 15 resize FAILs this suite reported at integration time were an
+// artifact of THIS document, not a defect in `UIWindow.js`. Two earlier
+// diagnoses were checked and disproved here: it is NOT `top: calc(15% + Npx)`
+// (a window converted to a plain-pixel `top` collapses identically) and it is
+// NOT the `resize` handler's toolbar clamp in `UIWindow.js` (`toolbar_height`
+// is 0 and `position().top` is 155, so `155 < 0` is false and that branch
+// never runs).
+//
+// The fix is to make the fake document's BOX MODEL match the real one, which
+// is what every other geometry assertion in this file has silently assumed all
+// along. No assertion is relaxed by this — in particular the direction-aware
+// resize check added this wave keeps its full discriminating power: it is the
+// very thing that refuses to call a collapse a pass, and it is what goes from
+// FAIL to PASS when, and only when, the geometry becomes real.
+const DOC_HTML = `<!doctype html><html class="h-full"><head><style>${css}</style>
+     <style>html{height:100%}body{min-height:100%}</style></head>
      <body class="min-h-full flex flex-col"><div id="ezil-os-root"><div id="ezil-os-root-inner"></div></div></body></html>`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
