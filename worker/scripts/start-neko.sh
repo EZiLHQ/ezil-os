@@ -97,6 +97,11 @@ phase_end() {
 phase_start container_start
 
 NEKO_HTTP_PORT="${NEKO_HTTP_PORT:-8181}"
+# code-server's port. 8443 is not free to change unilaterally — the Worker's
+# CODE_PREVIEW_PORT and the `8443-<id>-code.<host>` bridge hostname both hard-
+# code it (src/index.ts). Named here so the launch flag, the readiness gate and
+# the stale-listener preflight all read the same value.
+CODE_SERVER_PORT="${CODE_SERVER_PORT:-8443}"
 NEKO_BIN="${NEKO_BIN:-/usr/bin/neko}"
 export DISPLAY="${DISPLAY:-:99}"
 export USER="${USER:-root}"
@@ -163,6 +168,199 @@ if [ "${EZIL_NEKO_CPU_DIAG_ENABLED:-0}" = "1" ]; then
   ) &
   CPU_DIAG_PID=$!
 fi
+
+# ── Process bookkeeping + teardown ───────────────────────────────────────────
+# Declared HERE, near the top, and not next to the app supervisor further down,
+# because `terminate_stack` is wired to EXIT and to every terminating signal
+# just below: it can therefore fire from ANY point in the boot — including the
+# early fail-closed `exit 1`s in preflight and the window-ready gate — and must
+# never touch an unset variable under `set -u`.
+#
+# 🔴 THE BUG THIS SECTION EXISTS TO PREVENT (measured in a real container,
+#    2026-08-02, not theorised). Teardown used to be exactly this:
+#
+#        for p in "${APP_PID[@]}"; do kill "$p" 2>/dev/null || true; done
+#        kill "$NEKO_PID" 2>/dev/null || true
+#
+#    APP_PID holds the pids of supervise_app's SUBSHELLS, not of the
+#    applications. code-server and Chrome are CHILDREN of those subshells, so
+#    killing the supervisor reparented them to init and left them running. What
+#    a container looked like one second after that teardown:
+#
+#        137  1  .../code-server --bind-addr 0.0.0.0:8443   <- PPID 1, alive
+#        164  1  /usr/bin/google-chrome-stable ...          <- PPID 1, alive
+#        8443 NOT BINDABLE: [Errno 98] Address already in use
+#
+#    The next boot in that same container was then unrecoverable, and it failed
+#    in the most misleading way available: the orphaned code-server ANSWERED the
+#    fail-closed readiness probe on 8443 and the orphaned Chrome SUPPLIED the
+#    WM_CLASS the window gate looks for, so the gate passed in 58ms and the boot
+#    logged `phase=ready event=end status=ok`. The real, new code-server then
+#    failed to bind six times ("address already in use"), exhausted its restart
+#    budget, and took the whole desktop down 14 seconds after declaring itself
+#    ready — leaving yet more orphans behind for the boot after that.
+#
+#    Two things are needed to make that impossible and both are load-bearing:
+#      1. each application runs in its OWN process group (`setsid` in
+#         supervise_app), so teardown can signal the application AND its whole
+#         descendant tree — code-server forks a second node process which is
+#         the one actually holding the listening socket, and Chrome forks a
+#         dozen — with one `kill -- -PGID`;
+#      2. the pgid is recorded in a FILE, not a shell variable, because the
+#         supervisor is a subshell and cannot assign back into this shell, and
+#         because the file then survives the process that wrote it and becomes
+#         this container's cross-boot ownership record (see reclaim_stale_app).
+#
+#    Note what is NOT used: the process group of this script. Non-interactive
+#    bash has job control off, so every `&` child stays in the SCRIPT's own
+#    process group (all of pids 81/105/137/164 above shared pgid 15, the
+#    script) — `kill -- -$$` would kill the teardown as it ran. And never a
+#    bare-name `pkill`: a name match in a container the user also runs
+#    processes in is not ownership.
+declare -A APP_PID=()   # app name -> supervise_app subshell (a bash loop) pid
+NEKO_PID=""             # `neko serve`
+MONITOR_PID=""          # monitor_apps health-refresh loop
+SESSION_PID=()          # plain `&` children of this script: Xvfb, openbox, pulseaudio
+
+# Where each supervisor publishes the process-group id of the application it is
+# currently running, one file per app. Deliberately NOT cleared on boot: a file
+# left behind by a previous boot of this same container is exactly the evidence
+# reclaim_stale_app needs to prove it owns a straggler.
+NEKO_APP_PGID_DIR="${NEKO_APP_PGID_DIR:-/tmp/neko-app-pgid}"
+mkdir -p "$NEKO_APP_PGID_DIR" 2>/dev/null || true
+
+# Set by terminate_stack before it signals anything, so a supervisor whose app
+# dies during the teardown breaks out of its restart loop instead of racing the
+# teardown by starting a replacement. Cleared on boot.
+NEKO_SHUTDOWN_FLAG="${NEKO_SHUTDOWN_FLAG:-/tmp/neko-shutdown}"
+rm -f "$NEKO_SHUTDOWN_FLAG" 2>/dev/null || true
+
+# Seconds a graceful SIGTERM is given before teardown escalates to SIGKILL.
+# code-server may be mid-write to the user's workspace, so it gets a real
+# chance to close cleanly; the escalation exists so a wedged process can still
+# never outlive the teardown.
+NEKO_TEARDOWN_GRACE="${NEKO_TEARDOWN_GRACE:-8}"
+
+# _kill_pid <signal> <pid> — signal one process. No-op on an empty/dead pid.
+_kill_pid() {
+  local sig="$1" pid="${2:-}"
+  [ -n "$pid" ] || return 0
+  kill -"$sig" "$pid" 2>/dev/null || true
+}
+
+# _kill_pgid <signal> <pgid> — signal a whole process group (leader included,
+# and still effective once the leader itself is gone). Empty pgid is a no-op.
+_kill_pgid() {
+  local sig="$1" pgid="${2:-}"
+  [ -n "$pgid" ] || return 0
+  kill -"$sig" -- "-$pgid" 2>/dev/null || true
+}
+
+# _pgid_alive <pgid> — true while ANY process remains in that group.
+_pgid_alive() {
+  local pgid="${1:-}"
+  [ -n "$pgid" ] || return 1
+  kill -0 -- "-$pgid" 2>/dev/null
+}
+
+# _app_pgids — echo the pgid of every application this boot currently has
+# running, one per line, read from the supervisors' pgid files. Reading the
+# files (rather than a snapshot taken at launch) is what makes this correct
+# across restarts: after a crash-and-restart the file holds the NEW pgid.
+_app_pgids() {
+  local f pgid
+  for f in "$NEKO_APP_PGID_DIR"/*.pgid; do
+    [ -f "$f" ] || continue
+    pgid="$(tr -dc '0-9' <"$f" 2>/dev/null)"
+    [ -n "$pgid" ] && printf '%s\n' "$pgid"
+  done
+  return 0
+}
+
+TEARDOWN_DONE=0
+# terminate_stack <reason> — stop everything this boot started, for real.
+# Idempotent (a second call returns immediately), safe against processes that
+# are already gone, and silent when there is nothing to tear down so the
+# "neko already serving — nothing to do" early exit stays quiet.
+terminate_stack() {
+  local reason="$1"
+  [ "$TEARDOWN_DONE" -eq 0 ] || return 0
+  local pgids
+  pgids="$(_app_pgids)"
+  if [ -z "$pgids" ] && [ -z "$NEKO_PID" ] && [ "${#APP_PID[@]}" -eq 0 ] \
+     && [ "${#SESSION_PID[@]}" -eq 0 ]; then
+    return 0
+  fi
+  TEARDOWN_DONE=1
+  log "terminating neko stack: $reason"
+
+  # 1. Stop the restart loops FIRST, before anything is signalled, so no
+  #    supervisor can replace an app we are about to kill.
+  : >"$NEKO_SHUTDOWN_FLAG" 2>/dev/null || true
+
+  # 2. Graceful SIGTERM to everything at once: the supervisors and helper loops
+  #    (plain pids in this script's own group), each application's process
+  #    GROUP (the fix — this is what reaches code-server's second node process
+  #    and Chrome's dozen children), neko, and the plain background children.
+  local name pgid sp
+  _kill_pid TERM "$MONITOR_PID"
+  _kill_pid TERM "$CPU_DIAG_PID"
+  for name in "${!APP_PID[@]}"; do _kill_pid TERM "${APP_PID[$name]}"; done
+  for pgid in $pgids; do _kill_pgid TERM "$pgid"; done
+  _kill_pid TERM "$NEKO_PID"
+  for sp in ${SESSION_PID[@]+"${SESSION_PID[@]}"}; do _kill_pid TERM "$sp"; done
+
+  # 3. Bounded grace period. Polls rather than sleeping the full budget, so a
+  #    clean stack tears down in milliseconds and only a wedged one waits.
+  local waited=0 deadline=$((NEKO_TEARDOWN_GRACE * 10)) remaining
+  while [ "$waited" -lt "$deadline" ]; do
+    remaining=0
+    for pgid in $pgids; do
+      if _pgid_alive "$pgid"; then remaining=1; fi
+    done
+    if [ -n "$NEKO_PID" ] && kill -0 "$NEKO_PID" 2>/dev/null; then remaining=1; fi
+    if [ "$remaining" -eq 0 ]; then break; fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  # 4. Escalate to SIGKILL on whatever ignored SIGTERM. Logged by pgid so an
+  #    app that routinely needs killing is visible in `wrangler tail`.
+  for pgid in $pgids; do
+    if _pgid_alive "$pgid"; then
+      log "teardown: process group $pgid ignored SIGTERM for ${NEKO_TEARDOWN_GRACE}s — escalating to SIGKILL"
+      _kill_pgid KILL "$pgid"
+    fi
+  done
+  for name in "${!APP_PID[@]}"; do _kill_pid KILL "${APP_PID[$name]}"; done
+  _kill_pid KILL "$MONITOR_PID"
+  _kill_pid KILL "$CPU_DIAG_PID"
+  _kill_pid KILL "$NEKO_PID"
+  for sp in ${SESSION_PID[@]+"${SESSION_PID[@]}"}; do _kill_pid KILL "$sp"; done
+
+  # 5. Reap neko so its exit status is collected rather than left zombied.
+  if [ -n "$NEKO_PID" ]; then wait "$NEKO_PID" 2>/dev/null || true; fi
+
+  # 6. Drop the ownership records — these processes are provably gone, and a
+  #    stale file would make the next boot chase a recycled pid.
+  rm -f "$NEKO_APP_PGID_DIR"/*.pgid 2>/dev/null || true
+  log "teardown complete: apps, neko and the X session are stopped"
+}
+
+# Teardown must run on EVERY exit, not just the fatal-app path that used to be
+# its only caller. Before this, a SIGTERM from the container runtime (the most
+# likely teardown in production) and every fail-closed `exit 1` in this script
+# left the whole desktop running headless behind them.
+#
+# Bash resets trapped signals to their default disposition inside `( … ) &`
+# subshells (verified in this image), so the supervisors and monitor loops do
+# NOT inherit these handlers and cannot recursively tear the stack down.
+# The EXIT handler does not call `exit`, so it never overwrites the exit status
+# the script was already exiting with.
+trap 'terminate_stack "received SIGTERM"; exit 143' TERM
+trap 'terminate_stack "received SIGINT"; exit 130' INT
+trap 'terminate_stack "received SIGHUP"; exit 129' HUP
+trap 'terminate_stack "script exiting"' EXIT
 
 # wait_tcp <host> <port> <tries> — poll a TCP port, 0.5s between attempts.
 #
@@ -456,6 +654,10 @@ if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
 else
   log "starting Xvfb on $DISPLAY ($NEKO_SCREEN)"
   Xvfb "$DISPLAY" -screen 0 "$NEKO_SCREEN" -ac +extension RANDR -nolisten tcp >>"$LOG" 2>&1 &
+  # Recorded so teardown stops the X server too. It used to be missed entirely,
+  # so a failed boot left $DISPLAY held by an orphaned Xvfb (with an orphaned
+  # openbox and browser still drawing into it) for the life of the container.
+  SESSION_PID+=("$!")
   for _ in $(seq 1 40); do
     xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break
     sleep 0.5
@@ -489,6 +691,7 @@ if [ -x /usr/bin/openbox ] || command -v openbox >/dev/null 2>&1; then
     log "starting openbox (default config)"
     openbox >>"$LOG" 2>&1 &
   fi
+  SESSION_PID+=("$!")
   sleep 1
   phase_end openbox ok
 else
@@ -500,6 +703,7 @@ fi
 if command -v pulseaudio >/dev/null 2>&1; then
   log "starting pulseaudio (best-effort)"
   pulseaudio --log-level=error --disallow-module-loading --disallow-exit --exit-idle-time=-1 >>"$LOG" 2>&1 &
+  SESSION_PID+=("$!")
 fi
 
 # ── App supervision (code-server + isolated Chromium) ─────────────────────────
@@ -522,7 +726,9 @@ rm -f "$NEKO_APP_FATAL_SENTINEL" 2>/dev/null || true
 # and are NOT weakened.
 NEKO_APP_MAX_RESTARTS="${NEKO_APP_MAX_RESTARTS:-5}"
 NEKO_APP_RESTART_DELAY="${NEKO_APP_RESTART_DELAY:-2}"
-declare -A APP_PID=()
+# NOTE: APP_PID itself is declared near the top of this script, alongside
+# terminate_stack — see the "Process bookkeeping + teardown" section for why,
+# and for why the supervisor pid it holds is NOT what teardown signals.
 declare -A APP_STATE=()   # starting|running|crashed|stopped|failed
 declare -A APP_RESTARTS=()
 
@@ -542,22 +748,50 @@ write_health() {
 }
 
 # supervise_app <name> <max_restarts> <cmd...>
-# Runs <cmd> in a restart loop inside its own background subshell/process
-# group. On exit it logs only the app name + exit code (never argv/urls), waits
-# with a short backoff, and retries up to <max_restarts> times before settling
-# into a terminal "crashed" state — which is reported via health/log output but
-# never triggers a Guacamole/other-mode fallback (fail-closed-but-isolated).
+# Runs <cmd> in a restart loop inside a background subshell. On exit it logs
+# only the app name + exit code (never argv/urls), waits with a short backoff,
+# and retries up to <max_restarts> times before settling into a terminal
+# "crashed" state — which is reported via health/log output but never triggers
+# a Guacamole/other-mode fallback (fail-closed-but-isolated).
+#
+# 🔴 The application is started under `setsid`, which is the whole reason
+#    teardown can be trusted. `setsid <cmd> &` puts <cmd> — and therefore every
+#    process it goes on to fork — into a brand-new process group whose id
+#    equals the pid bash reports in `$!` (verified in this image: pid == pgid ==
+#    sid). Without it, <cmd> would sit in THIS SCRIPT's process group along
+#    with the script itself, so the only handle teardown could ever have on it
+#    would be the supervisor pid below — which is a bash loop, not the app, and
+#    killing it merely reparents the real app to init. That is the exact defect
+#    that used to wedge containers; see the teardown section near the top.
+#
+#    The pgid is published through a FILE rather than a variable because this
+#    is a subshell: an assignment here would be invisible to the shell that
+#    runs terminate_stack. See _app_pgids / reclaim_stale_app.
 supervise_app() {
   local name="$1" max_restarts="$2"
   shift 2
   local attempt=0
+  local pgid_file="${NEKO_APP_PGID_DIR}/${name}.pgid"
   APP_STATE[$name]="starting"
   APP_RESTARTS[$name]=0
+  rm -f "$pgid_file" 2>/dev/null || true
   write_health
   (
     while true; do
-      "$@" >>"$LOG" 2>&1
+      setsid "$@" >>"$LOG" 2>&1 &
+      app_pgid=$!
+      # Written atomically so terminate_stack can never read a half-written
+      # number, and rewritten on every restart so the recorded pgid is always
+      # the app that is actually running right now.
+      printf '%s\n' "$app_pgid" >"${pgid_file}.tmp" 2>/dev/null \
+        && mv "${pgid_file}.tmp" "$pgid_file" 2>/dev/null
+      wait "$app_pgid"
       local rc=$?
+      # Teardown in progress: do not start a replacement that would outlive it.
+      if [ -f "$NEKO_SHUTDOWN_FLAG" ]; then
+        log "app=$name exited rc=$rc during teardown — not restarting"
+        break
+      fi
       log "app=$name exited rc=$rc (attempt $((attempt + 1))/$((max_restarts + 1)))"
       attempt=$((attempt + 1))
       if [ "$attempt" -gt "$max_restarts" ]; then
@@ -572,10 +806,65 @@ supervise_app() {
       fi
       sleep "$NEKO_APP_RESTART_DELAY"
     done
+    # Nothing of this app is running any more, so the ownership record must go
+    # with it — otherwise the next boot would find a pgid file for a process
+    # that no longer exists and could chase a recycled pid.
+    rm -f "$pgid_file" 2>/dev/null || true
   ) &
   APP_PID[$name]=$!
   APP_STATE[$name]="running"
   write_health
+}
+
+# reclaim_stale_app <name> <cmdline_substring>
+# Defence for the OTHER way an orphan can appear: not an unclean teardown by
+# this script (the section at the top makes those impossible), but a boot that
+# never got to run a teardown at all — a SIGKILL, an OOM kill, or a host-side
+# container restart that leaves the previous boot's processes alive in the same
+# container. Their listening socket and X windows would otherwise satisfy this
+# boot's readiness gate while the new processes fail to bind behind it.
+#
+# 🔴 Ownership is proved twice before anything is signalled, and it is never
+#    proved by name: (1) the pgid must come from a file THIS SCRIPT wrote in a
+#    previous boot of this same container, and (2) the process still leading
+#    that group must have a /proc cmdline containing the caller-supplied
+#    substring taken from this script's own launch arguments — so a pid number
+#    that has since been recycled by an unrelated process is left alone. No
+#    `pkill`, no pattern match over the process table.
+reclaim_stale_app() {
+  local name="$1" expect="$2"
+  local f="${NEKO_APP_PGID_DIR}/${name}.pgid"
+  [ -f "$f" ] || return 0
+  local pgid
+  pgid="$(tr -dc '0-9' <"$f" 2>/dev/null)"
+  if [ -z "$pgid" ] || ! _pgid_alive "$pgid"; then
+    rm -f "$f" 2>/dev/null || true
+    return 0
+  fi
+  local cmd=""
+  if [ -r "/proc/${pgid}/cmdline" ]; then
+    cmd="$(tr '\0' ' ' <"/proc/${pgid}/cmdline" 2>/dev/null)"
+  fi
+  case "$cmd" in
+    *"$expect"*) : ;;
+    *)
+      log "stale-app check: recorded pgid $pgid for app=$name is not $name any more (pid recycled) — leaving it alone"
+      rm -f "$f" 2>/dev/null || true
+      return 0
+      ;;
+  esac
+  log "stale-app RECLAIM: app=$name from a previous boot is still alive (pgid=$pgid) — stopping it before this boot starts its own"
+  _kill_pgid TERM "$pgid"
+  local waited=0 deadline=$((NEKO_TEARDOWN_GRACE * 10))
+  while [ "$waited" -lt "$deadline" ] && _pgid_alive "$pgid"; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if _pgid_alive "$pgid"; then
+    log "stale-app RECLAIM: app=$name (pgid=$pgid) ignored SIGTERM for ${NEKO_TEARDOWN_GRACE}s — escalating to SIGKILL"
+    _kill_pgid KILL "$pgid"
+  fi
+  rm -f "$f" 2>/dev/null || true
 }
 
 # Background monitor: periodically re-checks liveness (by supervisor subshell
@@ -634,10 +923,60 @@ monitor_apps() {
 # long the port actually takes to open is measured separately by the
 # `window_ready_gate` phase below (see EZIL_DESKTOP_APPS), which runs
 # concurrently with Chrome's window check.
+
+# ── Stale-boot reclaim + port preflight (fail FAST, not 60s later) ───────────
+# Everything below this point assumes this boot can actually own 8443 and the
+# X display. If a previous boot in this same container was SIGKILLed, OOM-ed,
+# or otherwise died without running terminate_stack, its code-server and Chrome
+# are still here — and a live orphan is not merely in the way, it is actively
+# MISLEADING: it answers the readiness probe on 8443 and supplies the WM_CLASS
+# the window gate looks for, so the gate passes in milliseconds while the new
+# code-server behind it fails to bind and, ~15s later, exhausts its restart
+# budget and takes the desktop down after it has already reported ready.
+# (Measured, in a container, before this block existed.)
+#
+# So: reclaim anything this container can PROVE it owns, then verify the port
+# really is free and fail immediately with a message that names the port if it
+# is not — rather than letting the gate time out 60 seconds later with a
+# generic "codeserver did not become ready".
+#
+# The two variables are set here rather than at their old sites purely so this
+# check can run BEFORE anything is launched — in particular before the
+# `rm -rf "$CHROME_PROFILE_DIR"` below, which would otherwise delete the
+# profile directory out from under a still-running orphaned Chrome.
+CHROME_PROFILE_DIR="${CHROME_PROFILE_DIR:-/tmp/chromium-app-data}"
+# The mandatory-app set (consumed by the window-ready gate further down — see
+# EZIL_DESKTOP_APPS there for the full format). Defined here so this preflight
+# and that gate can never disagree about which ports this boot must own.
+EZIL_DESKTOP_APPS="${EZIL_DESKTOP_APPS:-browser:window:chrome codeserver:tcp:127.0.0.1:${CODE_SERVER_PORT}}"
+
+phase_start stale_boot_reclaim
+reclaim_stale_app codeserver "--bind-addr 0.0.0.0:${CODE_SERVER_PORT}"
+reclaim_stale_app chromium "--user-data-dir=${CHROME_PROFILE_DIR}"
+
+# Now check every TCP port the readiness gate will require. Two probe attempts
+# (wait_tcp sleeps 0.5s between them) so a socket in the middle of closing
+# after the reclaim above is not mistaken for a live listener.
+stale_port_seen=0
+for _spec in $EZIL_DESKTOP_APPS; do
+  _rest="${_spec#*:}"
+  [ "${_rest%%:*}" = "tcp" ] || continue
+  _target="${_rest#*:}"
+  if wait_tcp "${_target%:*}" "${_target##*:}" 2; then
+    log "ERROR: ${_target} is ALREADY IN USE before this boot has started anything. A process from an earlier boot of this container still owns it and could not be attributed to this script (no ownership record, or a different process now holds the port). Refusing to start: the readiness gate would be satisfied by that stale listener while the real ${_spec%%:*} failed to bind behind it."
+    stale_port_seen=1
+  fi
+done
+if [ "$stale_port_seen" -ne 0 ]; then
+  phase_end stale_boot_reclaim error
+  exit 1
+fi
+phase_end stale_boot_reclaim ok
+
 phase_start codeserver_launch
-log "supervising code-server ($CODE_SERVER_BIN) on 0.0.0.0:8443 at $WORKSPACE_ROOT (mandatory, isolated user-data-dir)"
+log "supervising code-server ($CODE_SERVER_BIN) on 0.0.0.0:${CODE_SERVER_PORT} at $WORKSPACE_ROOT (mandatory, isolated user-data-dir)"
 supervise_app codeserver "$NEKO_APP_MAX_RESTARTS" "$CODE_SERVER_BIN" \
-  --bind-addr 0.0.0.0:8443 \
+  --bind-addr "0.0.0.0:${CODE_SERVER_PORT}" \
   --auth none \
   --disable-telemetry \
   --user-data-dir=/tmp/code-server-data \
@@ -653,7 +992,10 @@ phase_end codeserver_launch ok
 # points at a fresh, container-local, isolated directory created below, and
 # first-run/default-browser prompts are suppressed so the isolated instance
 # comes up headless-of-prompts on a neutral page.
-CHROME_PROFILE_DIR="${CHROME_PROFILE_DIR:-/tmp/chromium-app-data}"
+# CHROME_PROFILE_DIR is resolved in the stale-boot reclaim above (it has to be,
+# because that block needs it before this `rm -rf` runs — deleting the profile
+# of a still-live orphaned Chrome is how you turn a recoverable stale boot into
+# a corrupted one).
 rm -rf "$CHROME_PROFILE_DIR" 2>/dev/null || true
 mkdir -p "$CHROME_PROFILE_DIR" 2>/dev/null || true
 # Deterministic, non-blank landing page. The mandatory native browser must come
@@ -771,7 +1113,10 @@ chmod +x "$NEKO_SWITCH_APP_BIN"
 # (an X window) and code-server (a loopback HTTP port, NOT an X window — see
 # the "code-server launch" section above for why Electron VS Code's X-window
 # check was replaced with a port check rather than just deleted).
-EZIL_DESKTOP_APPS="${EZIL_DESKTOP_APPS:-browser:window:chrome codeserver:tcp:127.0.0.1:8443}"
+# EZIL_DESKTOP_APPS itself is defaulted EARLIER, in the stale-boot reclaim block
+# just above the code-server launch — the port preflight there has to agree with
+# this gate about which ports the boot must own, and one definition is the only
+# way to guarantee that. Everything about the format above still applies.
 NEKO_WINDOW_READY_TIMEOUT="${NEKO_WINDOW_READY_TIMEOUT:-60}"
 
 wait_for_window() {
@@ -1001,17 +1346,11 @@ launch_devserver
 # we mark the app failed in the health file, tear down neko + the other
 # supervisors/monitor, and exit NON-ZERO so the container is reported unhealthy
 # instead of continuing to serve an apparently-ready desktop with a dead app.
-terminate_stack() {
-  local reason="$1"
-  log "terminating neko stack: $reason"
-  kill "$MONITOR_PID" 2>/dev/null || true
-  [ -n "$CPU_DIAG_PID" ] && kill "$CPU_DIAG_PID" 2>/dev/null || true
-  local p
-  for p in "${APP_PID[@]}"; do kill "$p" 2>/dev/null || true; done
-  kill "$NEKO_PID" 2>/dev/null || true
-  wait "$NEKO_PID" 2>/dev/null || true
-}
-
+#
+# terminate_stack is defined near the TOP of this file now, not here. It used to
+# live at this call site, which is also why it only ever knew about the handful
+# of pids in scope at this point — and why it killed supervisors instead of
+# applications. See the "Process bookkeeping + teardown" section.
 while true; do
   if [ -f "$NEKO_APP_FATAL_SENTINEL" ]; then
     failed_app="$(head -1 "$NEKO_APP_FATAL_SENTINEL" 2>/dev/null)"
