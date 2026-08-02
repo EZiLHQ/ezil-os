@@ -548,22 +548,36 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
 //               show a desktop we have no evidence AGAINST would break every
 //               working desktop at once — but it is NOT called ready.
 //
-// 🔴 `DISPLAY_DEADLINE_MS` is 20s in `desktop-window.js`, and these scenarios
-// wait it out for real rather than shortening it. A gate whose deadline the
-// test controls is a gate the test can be wrong about.
+// 🔴 THE DEADLINES ARE REAL HERE. `desktop-window.js` gives the two verdicts
+// two different budgets — 6s before it will admit it cannot check, 45s before
+// it will call a screen blank — and these scenarios wait both out rather than
+// shortening them. A gate whose deadline the test controls is a gate the test
+// can be wrong about. It costs this file about a minute; that is the price of
+// the numbers meaning something.
 // ───────────────────────────────────────────────────────────────────────────
-const DEADLINE_WAIT_MS = 26_000;
+/** Past `DISPLAY_BLANK_DEADLINE_MS` (45s) with room for jsdom's scheduler. */
+const BLANK_WAIT_MS = 55_000;
+/** Past `DISPLAY_UNVERIFIED_DEADLINE_MS` (6s), and nowhere near the blank one. */
+const UNVERIFIED_WAIT_MS = 12_000;
 
 /**
- * Boot a shell whose `confirm=display` always answers `answer`, drive it to the
- * point where the display gate is the only thing left, and return the window.
+ * Boot a shell whose `confirm=display` answers `answer`, drive it to the point
+ * where the display gate is the only thing left, and return the window.
  * Everything upstream of the gate SUCCEEDS — the preview request, the
  * server-side frame confirmation, the browser-side one — so the only thing
  * these scenarios can be measuring is the gate itself.
+ *
+ * `answer` may be a value or a function of the elapsed gate time, which is how
+ * a peer that connects LATE is expressed. It may also be the string `'hang'`:
+ * a request that never comes back at all, which is what a degraded probe
+ * actually looks like from the browser.
  */
 async function boot_to_display_gate (answer) {
+    let t_nav = 0;
+    const say = () => (typeof answer === 'function' ? answer(Date.now() - (t_nav || Date.now())) : answer);
     const { window, seen } = boot_shell(async (url, init) => {
         if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            t_nav = Date.now();
             return {
                 ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko',
                 frame: { confirmed: true },
@@ -572,7 +586,14 @@ async function boot_to_display_gate (answer) {
         if (url.includes('confirm=frame')) return { ok: true, confirmed: true };
         // `answer === undefined` leaves the field off entirely, which is what a
         // server that could not read Neko's answer actually sends.
-        if (url.includes('confirm=display')) return { ok: true, display: answer };
+        if (url.includes('confirm=display')) {
+            const said = say();
+            // 🔴 Never resolves. jsdom has no `AbortSignal.timeout`, so nothing
+            // rescues this — which is exactly the point: the gate must get out
+            // on its own clock, not on the transport's.
+            if (said === 'hang') await new Promise(() => {});
+            return { ok: true, display: said };
+        }
         if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
         return { ok: true };
     });
@@ -580,7 +601,7 @@ async function boot_to_display_gate (answer) {
     await until(() => iframe?.getAttribute('src') === URL_OK);
     iframe.dispatchEvent(new window.Event('load'));
     await until(() => seen.some(r => r.url.includes('confirm=display')), 4000);
-    return { window, seen };
+    return { window, seen, nav_at: () => t_nav };
 }
 
 // ── Scenario 6 — video never decodes: the honest failure, never "ready" ─────
@@ -598,7 +619,7 @@ async function boot_to_display_gate (answer) {
         + ` asks=${seen.filter(r => r.url.includes('confirm=display')).length}`);
 
     const failed_panel = await until(
-        () => $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'failed', DEADLINE_WAIT_MS);
+        () => $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'failed', BLANK_WAIT_MS);
     push('🔴 video that never decodes ends in a FAILURE, not a ready desktop',
         !!failed_panel, $1(window, '.ezil-boot')?.getAttribute('data-kind'));
 
@@ -636,7 +657,7 @@ async function boot_to_display_gate (answer) {
     const { window } = await boot_to_display_gate(undefined);
     const win = $1(window, '.window[data-app="desktop"]');
 
-    const revealed = await until(() => win.classList.contains('ezil-fullbleed'), DEADLINE_WAIT_MS);
+    const revealed = await until(() => win.classList.contains('ezil-fullbleed'), UNVERIFIED_WAIT_MS);
     push('🔴 an unanswerable probe still REVEALS the desktop (no regression)',
         !!revealed, win.className);
     push('the boot panel is retired, so the desktop is genuinely usable',
@@ -660,6 +681,172 @@ async function boot_to_display_gate (answer) {
     window.$($1(window, '.ezil-display-notice-dismiss')).trigger('click');
     push('dismissing it leaves the desktop alone',
         notice?.hidden === true && win.classList.contains('ezil-fullbleed'));
+    await window.$(win).close();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 8 — A SLOW PEER IS NOT A DEAD ONE
+//
+// 🔴 THE SIGN-FLIPPED VERSION OF THE BUG SCENARIO 6 GUARDS. `blank` is the only
+// verdict that HIDES anything, so a desktop that is merely slow to negotiate
+// must never reach it. The old gate gave WebRTC 20s, a number sized for ICE
+// against STUN — and there is no STUN path here: PLATFORM-NOTES §6 says
+// Cloudflare Containers carry no UDP, so every connection is relayed through
+// TURN and a relayed candidate is only tried after the direct ones time out.
+// A peer connecting at 25s was called blank and its working desktop hidden.
+//
+// This peer connects at 25s. It must get its desktop, and it must be called
+// `ready` — the evidence arrived, late but real.
+// ───────────────────────────────────────────────────────────────────────────
+{
+    const CONNECTS_AT_MS = 25_000;
+    const { window, seen } = await boot_to_display_gate(
+        (age) => (age < CONNECTS_AT_MS ? 'blank' : 'live'));
+    const win = $1(window, '.window[data-app="desktop"]');
+
+    const revealed = await until(() => win.classList.contains('ezil-fullbleed'), BLANK_WAIT_MS);
+    push('🔴 a peer that needs 25s over a TURN relay reaches its DESKTOP, not a blank verdict',
+        !!revealed, `${win.className} panel=${$1(window, '.ezil-boot')?.getAttribute('data-kind')}`);
+    push('🔴 ...and it is READY, not merely tolerated — the evidence arrived, late but real',
+        $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'ready',
+        $1(window, '.ezil-boot')?.getAttribute('data-kind'));
+    push('no "we could not check" strip, because we DID check',
+        $1(window, '.ezil-display-notice')?.hidden === true);
+    push('the boot panel is retired',
+        $1(window, '.ezil-boot')?.hidden === true);
+    push('it kept asking the whole way rather than giving up',
+        seen.filter(r => r.url.includes('confirm=display')).length >= 10,
+        `${seen.filter(r => r.url.includes('confirm=display')).length} asks`);
+    await window.$(win).close();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 9 — A DEGRADED PROBE MUST NOT COST EVERY USER 20 SECONDS
+//
+// Measured before this wave: when the probe could not answer, settle went from
+// 7s to 29.7s. The desktop was revealed in the end — correctly — but the gate
+// polled to its 20s deadline first, and it only TESTED that deadline after an
+// ask came back, so each hung ask burned `session.js`'s 12s budget on the way.
+// Every user of a degraded deployment waited half a minute to be shown a
+// desktop that had been working the whole time.
+//
+// 🔴 The probe here HANGS — the request never resolves, and jsdom has no
+// `AbortSignal.timeout` to rescue it. So this measures the gate's own clock and
+// nothing else: if the reveal is not driven by a timer, it never happens.
+// ───────────────────────────────────────────────────────────────────────────
+{
+    const t0 = Date.now();
+    const { window } = await boot_to_display_gate('hang');
+    const win = $1(window, '.window[data-app="desktop"]');
+
+    const revealed = await until(() => win.classList.contains('ezil-fullbleed'), UNVERIFIED_WAIT_MS);
+    const took = Date.now() - t0;
+    push('🔴 a probe that never answers AT ALL still reveals the desktop', !!revealed, win.className);
+    push('🔴 ...and it does so on the UNVERIFIED deadline (6s), not the blank one (45s)',
+        !!revealed && took < 12_000, `${took}ms from boot`);
+    push('🔴 it is `ready_unverified` — never `ready`, never `failed`',
+        $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'ready_unverified',
+        $1(window, '.ezil-boot')?.getAttribute('data-kind'));
+    push('and the user is told, in EZiL copy, that we could not check',
+        $1(window, '.ezil-display-notice')?.hidden === false
+        && $1(window, '.ezil-display-notice-title')?.textContent === "We couldn't check your display");
+    await window.$(win).close();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 11 — A MEMORY OF A BLANK IS NOT AN OBSERVATION OF ONE
+//
+// The gate used to latch a boolean the first time it understood an answer, and
+// spend it at the deadline however old it had become. So: one `blank` while the
+// peer was still negotiating — which is EXPECTED, and means nothing — and then
+// a probe that goes silent, and forty-four seconds later the desktop is hidden
+// on evidence from the first second of the boot.
+//
+// 🔴 This also pins the timer that gets us out at all. Once a well-formed
+// answer has been seen there is deliberately no unverified escape hatch (the
+// user is then waiting on their desktop, not on our plumbing), so if the blank
+// deadline were only tested when an ask RETURNED, an ask that never returns
+// would hold this boot open forever. It answers once, then hangs.
+// ───────────────────────────────────────────────────────────────────────────
+{
+    let answered = false;
+    const { window } = await boot_to_display_gate(() => {
+        if (answered) return 'hang';
+        answered = true;
+        return 'blank';
+    });
+    const win = $1(window, '.window[data-app="desktop"]');
+
+    const settled = await until(
+        () => win.classList.contains('ezil-fullbleed')
+            || $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'failed',
+        BLANK_WAIT_MS);
+    push('🔴 a boot whose probe answered once and then died still settles',
+        !!settled, `${win.className} panel=${$1(window, '.ezil-boot')?.getAttribute('data-kind')}`);
+    push('🔴 ...and it does NOT hide the desktop on a 45-second-old `blank`',
+        $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'ready_unverified'
+        && win.classList.contains('ezil-fullbleed'),
+        $1(window, '.ezil-boot')?.getAttribute('data-kind'));
+    push('the user is told we could not check, which is the true statement',
+        $1(window, '.ezil-display-notice')?.hidden === false);
+    await window.$(win).close();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 10 — THE GUARD ON THE OVERLAP ITSELF
+//
+// 🔴 The display gate now starts at the NAVIGATION, before the frame check has
+// answered. That is a saving of ~430ms and it is also the one new way this
+// contract could be broken: a gate that spends a `live` it obtained early,
+// without waiting for `computeBootUiState` to produce a `ready` for it to
+// downgrade, would hand the viewport over on ONE gate's evidence — and the
+// gate it skipped is the one that catches an HTTP 500 error page, which is the
+// 2026-07-31 production failure verbatim.
+//
+// So: the frame check REFUTES, and the display probe says `live` anyway. The
+// composition must hold. `applyDisplayEvidence` can only ever DOWNGRADE, so
+// with no `ready` to downgrade there is nothing for `live` to do, and the
+// honest outcome is the frame check's own failure.
+// ───────────────────────────────────────────────────────────────────────────
+{
+    const { window, seen } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            return {
+                ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko',
+                frame: { confirmed: true },
+            };
+        }
+        // The browser's own re-ask says the origin is NOT serving a desktop.
+        if (url.includes('confirm=frame')) return { ok: true, confirmed: false };
+        // ...while Neko cheerfully reports a watcher. Only one of these two can
+        // open the gate, and it is not this one.
+        if (url.includes('confirm=display')) return { ok: true, display: 'live' };
+        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
+        return { ok: true };
+    });
+    const iframe = await until(() => $1(window, '.window[data-app="desktop"] .window-app-iframe'));
+    await until(() => iframe?.getAttribute('src') === URL_OK);
+    iframe.dispatchEvent(new window.Event('load'));
+
+    const win = await until(() => $1(window, '.window[data-app="desktop"]'));
+    const failed_panel = await until(
+        () => $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'failed', 8_000);
+    push('🔴 a `live` display cannot rescue a frame the server says is not a desktop',
+        !!failed_panel, $1(window, '.ezil-boot')?.getAttribute('data-kind'));
+    push('🔴 ...and the viewport is NOT handed over',
+        !win.classList.contains('ezil-fullbleed'), win.className);
+    push('the copy is the frame check\'s own, not the display gate\'s',
+        $1(window, '.ezil-boot-title')?.textContent === "Your desktop isn't answering",
+        $1(window, '.ezil-boot-title')?.textContent);
+    push('no "we could not check" strip either — we checked, and it failed',
+        $1(window, '.ezil-display-notice')?.hidden === true);
+
+    // And the gate lets go rather than polling a dead boot forever.
+    const asks_at_failure = seen.filter(r => r.url.includes('confirm=display')).length;
+    await sleep(3_000);
+    push('the display gate stopped asking once the frame was refuted',
+        seen.filter(r => r.url.includes('confirm=display')).length === asks_at_failure,
+        `${asks_at_failure} -> ${seen.filter(r => r.url.includes('confirm=display')).length}`);
     await window.$(win).close();
 }
 
