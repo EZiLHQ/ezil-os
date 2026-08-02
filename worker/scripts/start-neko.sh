@@ -345,6 +345,39 @@ _pgid_alive() {
   return 1
 }
 
+# _pgid_member_matching <pgid> <cmdline_substring> — echo the pid of a LIVE
+# member of that process group whose /proc cmdline contains the substring, and
+# return 0; return 1 if there is none.
+#
+# Corroborates ownership of a recorded process group when its LEADER is gone.
+# Measured: a partially-killed previous boot left code-server's second node
+# process — the one actually holding :8443 — alive in the group while the
+# wrapper that led the group was dead, so a leader-only cmdline check could not
+# attribute the group and the reclaim declined to touch it. The selector is
+# still the pgid this script recorded; the cmdline is only a guard against that
+# pid number having been recycled.
+_pgid_member_matching() {
+  local pgid="${1:-}" expect="$2" d line rest state pgrp cmd
+  [ -n "$pgid" ] || return 1
+  for d in /proc/[0-9]*; do
+    line=""
+    read -r line <"$d/stat" 2>/dev/null || continue
+    rest="${line##*) }"
+    state="${rest%% *}"
+    [ "$state" = "Z" ] && continue
+    pgrp="${rest#* }"
+    pgrp="${pgrp#* }"
+    pgrp="${pgrp%% *}"
+    [ "$pgrp" = "$pgid" ] || continue
+    cmd=""
+    [ -r "$d/cmdline" ] && cmd="$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null)"
+    case "$cmd" in
+      *"$expect"*) printf '%s' "${d#/proc/}"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
 # _app_pgids — echo the pgid of every application this boot currently has
 # running, one per line, read from the supervisors' pgid files. Reading the
 # files (rather than a snapshot taken at launch) is what makes this correct
@@ -989,18 +1022,12 @@ reclaim_stale_app() {
   if [ -z "$pgid" ] || ! _pgid_alive "$pgid"; then
     return 0
   fi
-  local cmd=""
-  if [ -r "/proc/${pgid}/cmdline" ]; then
-    cmd="$(tr '\0' ' ' <"/proc/${pgid}/cmdline" 2>/dev/null)"
+  local owner=""
+  if ! owner="$(_pgid_member_matching "$pgid" "$expect")"; then
+    log "stale-boot check: process group $pgid recorded for app=$name holds no live $name process (pid recycled, or only unrelated processes remain) — leaving it alone"
+    return 0
   fi
-  case "$cmd" in
-    *"$expect"*) : ;;
-    *)
-      log "stale-boot check: recorded pgid $pgid for app=$name is not $name any more (pid recycled) — leaving it alone"
-      return 0
-      ;;
-  esac
-  log "stale-boot RECLAIM: app=$name from a previous boot is still alive (pgid=$pgid) — stopping it and every process it forked"
+  log "stale-boot RECLAIM: app=$name from a previous boot is still alive (pgid=$pgid, e.g. pid=$owner) — stopping it and every process it forked"
   _kill_pgid TERM "$pgid"
   local waited=0 deadline=$((NEKO_TEARDOWN_GRACE * 10))
   while [ "$waited" -lt "$deadline" ] && _pgid_alive "$pgid"; do
@@ -1097,7 +1124,12 @@ CHROME_PROFILE_DIR="${CHROME_PROFILE_DIR:-/tmp/chromium-app-data}"
 EZIL_DESKTOP_APPS="${EZIL_DESKTOP_APPS:-browser:window:chrome codeserver:tcp:127.0.0.1:${CODE_SERVER_PORT}}"
 
 phase_start stale_boot_reclaim
-reclaim_stale_app codeserver "--bind-addr 0.0.0.0:${CODE_SERVER_PORT}"
+# The second argument is the cmdline fragment that corroborates a recorded
+# process group really is still this app. It must appear in EVERY member of the
+# tree, not just the process this script launched: code-server forks a second
+# node process that carries none of the launch flags but is the one holding the
+# port, and it can outlive the wrapper.
+reclaim_stale_app codeserver "/code-server"
 reclaim_stale_app chromium "--user-data-dir=${CHROME_PROFILE_DIR}"
 
 # Now check every TCP port the readiness gate will require. Two probe attempts
