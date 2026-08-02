@@ -328,6 +328,25 @@ body.device-phone {
     display: none;
 }
 
+/* 🔴 GET OUT FROM UNDER THE DRAWER. Measured in Chromium at 1280x860, in the
+ * `ready_unverified` state this strip is meant for: the notice sat at
+ * `top: 12`..`94.5`, and the control drawer — which IS the window's titlebar
+ * once full-bleed has taken the real one away — sat at `top: 0`..`43` with
+ * `z-index: 600`. The notice's title line runs `25`..`43.8`, so the drawer
+ * painted over it and the one sentence naming the problem was the part the user
+ * could not read.
+ *
+ * The z-order is not the thing to change: the drawer is the only way out of a
+ * full-bleed window, and the rule above already says nothing may paint over it.
+ * So the strip moves down instead — 43px of open drawer plus the same 12px gap
+ * it uses everywhere else. Only in full-bleed: while the window is ordinary the
+ * drawer is `display: none` (see the `:not(.ezil-fullbleed)` rule below) and
+ * the window's own head is a sibling above `.window-body`, so `top: 12px` is
+ * already clear. */
+.ezil-desktop-window.ezil-fullbleed .ezil-display-notice {
+    top: 55px;
+}
+
 .ezil-display-notice-text {
     flex: 1 1 260px;
     min-width: 0;

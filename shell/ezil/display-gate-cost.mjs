@@ -91,10 +91,17 @@ if ( ! chromium ) {
 // 🔴 These are constants, not measurements of this machine. Changing one
 // changes every number this file prints, so a before/after pair is only
 // meaningful when both halves ran the same values.
+//
+// $DISPLAY_MS overrides the probe's own cost, and exists for exactly one
+// comparison: the server-side half of this work (reusing the Neko admin token
+// instead of logging in on every ask — see `cloudflare-guacamole-provider.ts`)
+// takes the probe from two serial round trips to one. Re-running with a halved
+// DISPLAY shows the two savings composed. The DEFAULT is the pre-change
+// measurement, so a plain before/after pair isolates the shell change alone.
 const LATENCY = {
     PREVIEW: 3_400,
     FRAME: 420,
-    DISPLAY: 1_454,
+    DISPLAY: Number(process.env.DISPLAY_MS ?? 1_454),
     STATUS: 90,
 };
 
