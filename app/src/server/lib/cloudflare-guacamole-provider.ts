@@ -927,11 +927,22 @@ export function composeAppPreviewBootstrapUrl(
     appPreviewOrigin: string,
     token: string,
     path: string = '/',
+    extraParams?: Record<string, string>,
 ): string {
     const url = new URL('/preview-bootstrap', appPreviewOrigin);
     url.searchParams.set('token', token);
     if (path && path !== '/') {
         url.searchParams.set('path', path);
+    }
+    // `extraParams` exists ONLY for `codePreviewUrl`'s `folder=` (see
+    // `cloudflareGuacamole.codePreviewUrl`'s compose-fallback branch) — a
+    // generic escape hatch rather than a `folder`-specific parameter so this
+    // function stays byte-for-byte reusable by `appPreviewUrl` above, which
+    // never passes it.
+    if (extraParams) {
+        for (const [key, value] of Object.entries(extraParams)) {
+            url.searchParams.set(key, value);
+        }
     }
     return url.toString();
 }

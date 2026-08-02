@@ -384,7 +384,13 @@ describe('the Worker really does emit appPreviewUrl as string|null, never omitte
         // assigned from it unconditionally, then included in the response.
         expect(src).toMatch(/buildBridgeUrl\s*=\s*async\s*\([^)]*\):\s*Promise<string \| null>/);
         expect(src).toMatch(/const appPreviewUrl = await buildBridgeUrl\(appPreviewExpose\)/);
-        expect(src).toMatch(/const codePreviewUrl = await buildBridgeUrl\(codePreviewExpose\)/);
+        // `codePreviewUrl` additionally passes `codePreviewFolderParams(workspace)`
+        // — the `folder=` fix for code-server's empty file tree (see
+        // `worker/src/index.ts`'s `codePreviewFolderParams` doc comment) — so
+        // this no longer matches a bare single-argument call.
+        expect(src).toMatch(
+            /const codePreviewUrl = await buildBridgeUrl\(codePreviewExpose, codePreviewFolderParams\(workspace\)\)/,
+        );
         expect(src).toMatch(/^\s*appPreviewUrl,\s*$/m);
         expect(src).toMatch(/^\s*codePreviewUrl,\s*$/m);
     });

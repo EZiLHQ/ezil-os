@@ -571,7 +571,21 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             }
 
             const token = mintAppPreviewBootstrapToken(hmacSecret, sandboxId);
-            const codePreviewUrl = composeAppPreviewBootstrapUrl(codePreviewOrigin, token);
+            // `folder=` is what makes code-server open with a file tree instead
+            // of "You have no recent folders" — see `handlePreviewBootstrap`'s
+            // doc comment in `worker/src/preview-bridge.ts` for the full
+            // mechanism. This is the FALLBACK branch only (a Worker predating
+            // `codePreviewUrl` on the wire); the primary path already gets
+            // `folder=` baked in by `worker/src/index.ts`'s `buildBridgeUrl`,
+            // which this mirrors using the SAME `workspace.mountPath` the
+            // Worker computed and returned on this exact response — never a
+            // literal `/workspace` — guarded by the same `mounted` check
+            // `buildBridgeUrl` uses, since an unmounted workspace means the
+            // container's real root is its own `/home/neko/project` fallback.
+            const codeFolder = result.workspace?.mounted && result.workspace.mountPath
+                ? { folder: result.workspace.mountPath }
+                : undefined;
+            const codePreviewUrl = composeAppPreviewBootstrapUrl(codePreviewOrigin, token, '/', codeFolder);
 
             return {
                 ok: true as const,
