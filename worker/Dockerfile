@@ -108,9 +108,11 @@ COPY scripts/start-desktop.sh /usr/local/bin/start-desktop.sh
 COPY scripts/start-neko.sh /usr/local/bin/start-neko.sh
 # The Option D app-preview dev-server launcher (ported from the Azure
 # reference `Sandboxes/infra/sandbox-desktop/start-devserver.sh`). Invoked by
-# start-neko.sh right after workspace hydration resolves; see that script's
-# "Dev server (Option D app preview)" section for why it's placed there and
-# why it never blocks boot.
+# start-neko.sh's `launch_devserver` at the very END of boot — after the
+# window-ready gate and after `neko serve` binds — so nothing the dev server
+# does can stop the desktop coming up. See that script's "Dev server (Option D
+# app preview)" section; it used to be invoked before the gate, and that is
+# what broke the desktop in production on 2026-08-02.
 COPY scripts/start-devserver.sh /usr/local/bin/start-devserver.sh
 # Idempotent code-server launcher (pid-file + port probe), ported from the
 # Sandboxes reference — see that file's own doc comment. Not on start-neko.sh's
@@ -270,9 +272,9 @@ RUN test -f /opt/ezil-sandbox-template/package.json \
 # SandboxSecurityError for it — so the dev server MUST listen elsewhere
 # (ezil-sandbox-template runs `next dev --port 3002` for exactly this reason).
 # start-neko.sh launches scripts/start-devserver.sh (ported from the Azure
-# reference) after workspace hydration, which is what actually listens on
+# reference) once neko is already serving, which is what actually listens on
 # this port — see that script's doc comment for package-manager detection,
-# phase reporting, and why it never blocks boot.
+# phase reporting, and why its call site is last in the boot sequence.
 EXPOSE 8080
 EXPOSE 8181
 EXPOSE 3002

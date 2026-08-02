@@ -823,8 +823,9 @@ async function ensureDesktop(
   // state, identifying the SELECTED service (readyPath), not just open TCP.
   // The desktop is considered ready if EITHER signal succeeds. From the
   // Worker's side this single wait spans everything start-neko.sh does
-  // in-container (Xvfb, openbox, workspace hydration, dev-server launch,
-  // VS Code/Chrome launch, the window-ready gate, neko's own HTTP bind) —
+  // in-container (workspace hydration, Xvfb, openbox, code-server/Chrome
+  // launch, the window-ready gate, neko's own HTTP bind — the dev-server
+  // launch deliberately comes AFTER all of that, see `launch_devserver`) —
   // those finer-grained phases show up separately in the container's own
   // `[ezil-boot]` log lines (see scripts/start-neko.sh), not here.
   bootLog('desktop_ready_wait', 'start');
