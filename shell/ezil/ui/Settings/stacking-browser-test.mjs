@@ -1727,6 +1727,12 @@ async function runCloseReopenSweep () {
     const resolvedApps = await page.evaluate(() => window.ezil.registry.resolve(window.__EZIL_BOOT__).map((a) => a.id));
     push(`${VP} registry resolved at least one app for close/reopen coverage`, resolvedApps.length > 0,
         `resolved=${JSON.stringify(resolvedApps)}`);
+    // 🔴 M2's late-check (below) is meaningless for a PINNED app — its
+    // taskbar item "sits in the taskbar whether or not it is open"
+    // (registry.js), so `taskbarItemCount === 1` is true regardless of
+    // whether `remove_taskbar_item`'s guard did anything at all. Same
+    // reasoning as the ROUND 8 FOLLOW-UP comment a few lines below.
+    const pinnedIds = await page.evaluate(() => window.ezil.registry.APPS.filter((a) => a.pinned).map((a) => a.id));
 
     for ( const id of resolvedApps ) {
         // The boot app (apps[0]) is already open from boot.js itself; every
@@ -1792,6 +1798,44 @@ async function runCloseReopenSweep () {
                 state.openWindowsAttr === state.windowCount,
                 `data-open-windows=${state.openWindowsAttr} windowCount=${state.windowCount}`);
             push(`${label}: the reopened window is visible`, state.visible, JSON.stringify(state));
+
+            // 🔴 M2 — promoted from throwaway probe `probe-d1a.mjs`.
+            // `remove_taskbar_item`'s `still_empty` guard (`UIDesktopFullpage.js`)
+            // re-checks LIVE state at the moment its 200ms
+            // `.animate({width:0}, 200, callback)` completes, not the state that
+            // was true when the removal was scheduled — because a reopen INSIDE
+            // that 200ms window reuses the SAME taskbar-item node (`launch()`
+            // only creates a fresh one when none exists) rather than getting a
+            // new one, bumping `data-open-windows` back up. Without the guard,
+            // that stale callback deletes the reused item out from under a
+            // window that is still open (MEASURED: reopen at ~112ms ->
+            // windows=1, taskbar items=0).
+            //
+            // The checks just above run right after `settle()`, which typically
+            // resolves in well under 200ms — BEFORE the animation's own natural
+            // `complete` callback has fired at all, so they cannot see this
+            // defect either way (confirmed separately: 456/456 pass whether the
+            // guard is present or not). Only true for intervals below the 200ms
+            // boundary (reopen must land INSIDE the animation window for the
+            // item to be reused rather than recreated) — 250/500ms already sit
+            // above it and get a fresh item regardless. Wait a REAL buffer past
+            // the 200ms completion before checking again.
+            // Pinned apps are silently OMITTED here (not `skip()`ed): for a
+            // pinned app, `close_one_window`'s own selector
+            // (`.taskbar-item[data-app][data-keep-in-taskbar="false"]`) never
+            // matches its item in the first place, so `remove_taskbar_item` is
+            // never even called — there is no guard invocation to observe, not
+            // an inapplicable one (the SKIP baseline this file's suite is held
+            // to is for the latter, not the former).
+            if ( interval < 200 && ! pinnedIds.includes(id) ) {
+                await sleep(Math.max(0, 400 - interval)); // ~400ms total since close — a real buffer past the 200ms animation
+                const late = await page.evaluate((a) => ({
+                    windowCount: document.querySelectorAll(`.window[data-app="${a}"]`).length,
+                    taskbarItemCount: document.querySelectorAll(`.taskbar-item[data-app="${a}"]`).length,
+                }), id);
+                push(`${label}: M2 GUARD — the reused taskbar item survives remove_taskbar_item's natural animation-complete callback (~200ms after close) while the reopened window is still open`,
+                    late.windowCount === 1 && late.taskbarItemCount === 1, `late=${JSON.stringify(late)}`);
+            }
 
             // 🔴 `.fullpage-mode .window-minimize-btn { display: none }`
             // (`shell/src/css/style.css`) hides EVERY window's minimize
