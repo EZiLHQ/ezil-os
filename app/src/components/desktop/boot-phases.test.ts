@@ -1,3 +1,7 @@
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -13,6 +17,44 @@ import {
     phaseVisualState,
     type BootProgressState,
 } from './boot-phases';
+
+/**
+ * 🔴 THE SIXTH ATTACK IS THE ONE THIS CATCHES.
+ *
+ * `computeBootUiState` has now survived five separate attempts to make it show
+ * something it had not earned, and every one of them was an EDIT to its body —
+ * a defaulted flag, a truthiness test, a `?? true`, a widened branch. The suite
+ * below re-states each of those as behaviour, which is the right way to defend
+ * them and is not quite enough on its own: a change that keeps every case below
+ * green while quietly widening a branch nobody thought to test would pass.
+ *
+ * So the text itself is pinned. This is not a substitute for the behavioural
+ * cases — it is the thing that makes an edit VISIBLE in review even when the
+ * cases stay green.
+ *
+ * ── If this fails ───────────────────────────────────────────────────────────
+ * Do not update the hash to make it pass. Read the diff first, and be able to
+ * say out loud which of the five attacks it does not reopen. The function has
+ * two copies (the TS one and the shell mirror bound for `shell/ezil/`) and both
+ * are pinned, so an edit to one alone fails here as well as in the drift guard
+ * in `boot-phases.shell.test.ts`.
+ */
+function computeBootUiStateSource(file: string): string {
+    const src = readFileSync(fileURLToPath(new URL(file, import.meta.url)), 'utf8');
+    const start = src.indexOf('export function computeBootUiState');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\n}\n', start) + 3;
+    return src.slice(start, end);
+}
+
+describe('🔴 computeBootUiState is byte-identical to the reviewed text', () => {
+    it.each([
+        ['./boot-phases.ts', 'dc278f14cd5fed30e27ecf5c43aab11b1b7e08f9c84f79a087e0e597cfd75df9'],
+        ['./boot-phases.shell.js', '9792051fdd265b5424d025c9bbfb77d16e907c951394a1a879d719db0bafa8b4'],
+    ])('%s', (file, sha) => {
+        expect(createHash('sha256').update(computeBootUiStateSource(file)).digest('hex')).toBe(sha);
+    });
+});
 
 describe('estimatePhaseForElapsedMs', () => {
     it('starts at "waking" immediately', () => {

@@ -10,6 +10,7 @@ import {
     CODE_PREVIEW_PORT,
     CODE_PREVIEW_TOKEN,
     composeAppPreviewBootstrapUrl,
+    cachedNekoAdminToken,
     composeAppPreviewOrigin,
     composeBrowserDesktopUrl,
     composeCodePreviewOrigin,
@@ -19,6 +20,7 @@ import {
     mintAppPreviewBootstrapToken,
     requestGuacamolePreview,
     requestGuacamoleSandboxTerminate,
+    resetNekoAdminTokenCacheForTests,
     type CloudflareGuacamoleConfig,
     type GuacamolePreviewError,
     type GuacamolePreviewErrorCode,
@@ -469,7 +471,15 @@ describe('enableImplicitHosting — a click on your own computer must just work'
         expect(calls.some((c) => c.method === 'POST' && c.url.includes('/api/room/settings'))).toBe(false);
     });
 
-    it('releases the admin session it opened, so no phantom member is left in the room', async () => {
+    it('🔴 KEEPS the admin session it opened, and hands the token to the display probe', async () => {
+        // This used to log out here. It ran milliseconds before the display
+        // gate asked the SAME origin with the SAME derived password, so its
+        // only measurable effect was to force that ask to buy a second login —
+        // half of the probe's measured 1454ms, on the critical path of every
+        // boot. `cacheNekoAdminToken` owns the token's lifetime now and logs
+        // out whatever it replaces (proved in `desktop-display-honesty.test.ts`),
+        // so the room still never accumulates sessions.
+        resetNekoAdminTokenCacheForTests();
         const { calls } = stubNeko({
             'POST /api/login': () => okJson({ token: 'tok' }),
             'GET /api/room/settings': () => okJson(LIVE_SETTINGS),
@@ -477,7 +487,9 @@ describe('enableImplicitHosting — a click on your own computer must just work'
             'POST /api/logout': () => new Response(null, { status: 200 }),
         });
         await enableImplicitHosting(DESKTOP_URL, 'admin-pwd');
-        expect(calls.some((c) => c.method === 'POST' && c.url.endsWith('/api/logout'))).toBe(true);
+        expect(calls.some((c) => c.method === 'POST' && c.url.endsWith('/api/logout'))).toBe(false);
+        expect(cachedNekoAdminToken(new URL(DESKTOP_URL).origin, 'admin-pwd')).toBe('tok');
+        resetNekoAdminTokenCacheForTests();
     });
 
     it.each([
