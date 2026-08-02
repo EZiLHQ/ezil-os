@@ -647,6 +647,57 @@ span.header-sort-icon img {
     user-select: none !important;
     -moz-user-select: none !important;
     -webkit-user-select: none;
+    /* 🔴 wave-h/t23 — INVESTIGATED, KEPT HERE. `contain: paint` is verbatim
+     * upstream Puter (`_reference/puter/src/gui/src/css/style.css` L979 —
+     * not a porting artifact; upstream ships the identical rule on `.window`)
+     * and is genuinely load-bearing: on a desktop with many overlapping
+     * windows, each window becomes its own paint-containment boundary, so
+     * dragging/animating/repainting one window's subtree (an app iframe, a
+     * DOM-heavy file-explorer grid) never obliges the browser to consider
+     * repainting outside it. It is NOT incidental porting debris — removing
+     * it would be a real, measurable regression on this specific UI shape.
+     *
+     * T21 (wave-g) found this rule clips `.ui-resizable-handle` — jQuery
+     * UI's resize handles are direct children of `.window` (`UIWindow.js`
+     * ~L1395-1399) positioned with negative offsets outside the border box
+     * (`.ui-resizable-n{top:-5px;height:7px}` etc., see
+     * `lib/jquery-ui-1.13.2/jquery-ui.min.css`), and `contain: paint` clips
+     * all descendants to the border box — MEASURED: only 2 of a
+     * straight-edge handle's 7px survived hit-testing; the rest resolved to
+     * whatever sat behind the window.
+     *
+     * First attempt here was to relocate `contain: paint` down to
+     * `.window-body` (the actual heavy-paint content), reasoning the resize
+     * handles — direct children of `.window`, siblings of `.window-body` —
+     * would then sit outside the clip entirely. That MEASURABLY fixed the
+     * click target (7/7px hit-tested, elementFromPoint probe, both
+     * directions) but MEASURABLY regressed `stacking-browser-test.mjs`:
+     * 557/557 (5 SKIP) baseline -> 552/552 (10 SKIP), reproducible across
+     * repeated runs, not flake. Root cause: once unclipped, a resize
+     * handle's negative-offset overhang is real, hit-testable area that can
+     * now sit on TOP of a neighbouring overlapped window's titlebar
+     * (invisible — the handle paints no visible background — but it wins
+     * `elementFromPoint`), silently stealing clicks meant for that window.
+     * That is a real regression `contain: paint` was ALSO incidentally
+     * buying (upstream Puter has this exact same setup and therefore the
+     * exact same protection) — reverted.
+     *
+     * Actual fix, below (`.window > .ui-resizable-*`): give the handles
+     * positions that never leave `.window`'s own border box in the first
+     * place, so there is nothing left for containment to clip and nothing
+     * left to overhang onto a neighbour. `jquery-ui.js`'s own resize math
+     * (`_mouseStart`/`_mouseDrag`) tracks deltas from
+     * `event.pageX/pageY` and identifies the active handle by which
+     * element's class the mousedown landed on — NOT by the handle's exact
+     * CSS position/rect — so repositioning a handle inside its window
+     * changes nothing about resize behaviour. This exact pattern
+     * (`right: 0` instead of the library default `right: -5px`) already
+     * exists in this file for the window-sidebar's own resizable handle,
+     * see `.window-sidebar .ui-resizable-e` below — this just applies it to
+     * `.window`'s own handles too, so `contain: paint` needed no change at
+     * all. Zero risk of the regression above: nothing about
+     * `.window`/`.window-body`'s containment moved.
+     */
     contain: paint;
 }
 .window[data-is_maximized="1"] {
@@ -1113,6 +1164,47 @@ span.header-sort-icon img {
     width: 15px;
     height: 15px;
     z-index: 95 !important;
+}
+/* 🔴 wave-h/t23 — see the long comment on `.window` above for why this
+ * exists: pull every one of `.window`'s own resize handles fully inside its
+ * border box (jQuery UI's library defaults, per
+ * `lib/jquery-ui-1.13.2/jquery-ui.min.css`, put n/s/e/w/nw/ne/sw mostly
+ * OUTSIDE it via negative offsets — `se` is already inside at `right:1px;
+ * bottom:1px` and needs no change). This is the same technique already used
+ * a few lines below for the window-sidebar's own handle
+ * (`.window-sidebar .ui-resizable-e { right: 0; }`); applied here to
+ * `.window`'s handles so `contain: paint` (above) never needs to clip them,
+ * and so none can overhang onto a neighbouring window. The `>` direct-child
+ * combinator scopes this to `.window`'s OWN handles only — the sidebar's
+ * handle is a grandchild of `.window` (a child of `.window-sidebar`), so it
+ * is untouched by this rule and keeps its own `right: 0` override as-is.
+ * Purely a hit-target relocation: jQuery UI's resize math tracks mouse
+ * deltas and identifies the active handle by the mousedown target's class,
+ * never by the handle's own CSS rect, so this changes nothing about drag
+ * behaviour. */
+.window>.ui-resizable-n {
+    top: 0;
+}
+.window>.ui-resizable-s {
+    bottom: 0;
+}
+.window>.ui-resizable-e {
+    right: 0;
+}
+.window>.ui-resizable-w {
+    left: 0;
+}
+.window>.ui-resizable-nw {
+    top: 0;
+    left: 0;
+}
+.window>.ui-resizable-ne {
+    top: 0;
+    right: 0;
+}
+.window>.ui-resizable-sw {
+    bottom: 0;
+    left: 0;
 }
 .window-alert-message, .window-prompt-message {
     font-size: 15px;
