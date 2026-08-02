@@ -11,12 +11,21 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   realR2KeyPrefix,
   SEED_SENTINEL_FILENAME,
   seedWorkspaceIfAbsent,
   sentinelKeyFor,
+  buildEnsureTurbopackConfigCommand,
+  parseTurbopackConfigOutcome,
+  TURBOPACK_CONFIG_WRITTEN_MARKER,
+  TURBOPACK_CONFIG_SKIPPED_EXISTING_MARKER,
+  TURBOPACK_CONFIG_SKIPPED_NOT_NEXT_MARKER,
   type SeedR2BucketLike,
   type SeedR2ObjectLike,
 } from './workspace-seed';
@@ -254,5 +263,183 @@ describe('seedWorkspaceIfAbsent', () => {
     // which is the deliberate, documented trade-off (never re-seed over
     // whatever the user may have since written).
     expect(bucket.store.has('proj1/branches/main/.ezil-seeded')).toBe(true);
+  });
+});
+
+// ── buildEnsureTurbopackConfigCommand / parseTurbopackConfigOutcome ─────────
+//
+// GAP (T30): `seedWorkspaceIfAbsent`'s template copy (above) is the ONLY
+// place the Turbopack `turbopack: { root: '/' }` fix (PLATFORM-NOTES §18)
+// ever lands, and it only ever runs against a workspace R2 finds genuinely
+// empty. A real, pre-existing, already-hydrated computer (content already in
+// R2, no sentinel needed because it was never empty) never goes through that
+// path and never gets the fix. These tests run the ACTUAL generated shell
+// command through a real `bash -c`, against a real temp directory — not a
+// grep of the JS that builds it — to prove the three safety rules in
+// `buildEnsureTurbopackConfigCommand`'s doc comment: never clobber a user's
+// own config, never touch a non-Next project, and behave identically on a
+// second run (no churn).
+
+const TEMPLATE_CONFIG_MARKER = 'TURBOPACK_ROOT_FIX_TEMPLATE_CONTENT';
+
+/** Runs `buildEnsureTurbopackConfigCommand`'s output through a real `bash -c`, against a real temp dir. Returns trimmed stdout. */
+function runEnsureTurbopackConfig(targetPath: string, templateConfigPath: string): string {
+  const command = buildEnsureTurbopackConfigCommand(targetPath, templateConfigPath);
+  const stdout = execFileSync('bash', ['-c', command], { encoding: 'utf8' });
+  return stdout.trim();
+}
+
+describe('buildEnsureTurbopackConfigCommand — real shell, real filesystem', () => {
+  let root: string;
+  let templateConfigPath: string;
+
+  const freshDir = (): string => {
+    const dir = join(root, Math.random().toString(36).slice(2));
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  };
+
+  const setUp = () => {
+    root = mkdtempSync(join(tmpdir(), 'ezil-turbopack-config-test-'));
+    templateConfigPath = join(root, 'template-next.config.js');
+    writeFileSync(templateConfigPath, TEMPLATE_CONFIG_MARKER);
+  };
+  const tearDown = () => {
+    rmSync(root, { recursive: true, force: true });
+  };
+
+  it('writes the template config into a pre-existing Next.js workspace that has none — THE GAP FIX', () => {
+    setUp();
+    try {
+      const dir = freshDir();
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'p', dependencies: { next: '16.2.12' } }));
+      const stdout = runEnsureTurbopackConfig(dir, templateConfigPath);
+      expect(stdout).toBe(TURBOPACK_CONFIG_WRITTEN_MARKER);
+      expect(parseTurbopackConfigOutcome(stdout)).toBe('written');
+      expect(existsSync(join(dir, 'next.config.js'))).toBe(true);
+      expect(readFileSync(join(dir, 'next.config.js'), 'utf8')).toBe(TEMPLATE_CONFIG_MARKER);
+    } finally {
+      tearDown();
+    }
+  });
+
+  it('NEVER overwrites a user’s own next.config.js', () => {
+    setUp();
+    try {
+      const dir = freshDir();
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'p', dependencies: { next: '16.2.12' } }));
+      writeFileSync(join(dir, 'next.config.js'), 'USER_OWNED_CONFIG_CONTENT');
+      const stdout = runEnsureTurbopackConfig(dir, templateConfigPath);
+      expect(stdout).toBe(TURBOPACK_CONFIG_SKIPPED_EXISTING_MARKER);
+      expect(parseTurbopackConfigOutcome(stdout)).toBe('skipped_existing_config');
+      expect(readFileSync(join(dir, 'next.config.js'), 'utf8')).toBe('USER_OWNED_CONFIG_CONTENT');
+    } finally {
+      tearDown();
+    }
+  });
+
+  it('NEVER overwrites a user’s own next.config.ts (a different extension than the template writes)', () => {
+    setUp();
+    try {
+      const dir = freshDir();
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'p', dependencies: { next: '16.2.12' } }));
+      writeFileSync(join(dir, 'next.config.ts'), 'USER_OWNED_TS_CONFIG');
+      const stdout = runEnsureTurbopackConfig(dir, templateConfigPath);
+      expect(stdout).toBe(TURBOPACK_CONFIG_SKIPPED_EXISTING_MARKER);
+      expect(existsSync(join(dir, 'next.config.js'))).toBe(false);
+      expect(readFileSync(join(dir, 'next.config.ts'), 'utf8')).toBe('USER_OWNED_TS_CONFIG');
+    } finally {
+      tearDown();
+    }
+  });
+
+  it('NEVER overwrites a user’s own next.config.mjs', () => {
+    setUp();
+    try {
+      const dir = freshDir();
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'p', dependencies: { next: '16.2.12' } }));
+      writeFileSync(join(dir, 'next.config.mjs'), 'USER_OWNED_MJS_CONFIG');
+      const stdout = runEnsureTurbopackConfig(dir, templateConfigPath);
+      expect(stdout).toBe(TURBOPACK_CONFIG_SKIPPED_EXISTING_MARKER);
+      expect(existsSync(join(dir, 'next.config.js'))).toBe(false);
+    } finally {
+      tearDown();
+    }
+  });
+
+  it('never touches a non-Next project — no next.config.js appears', () => {
+    setUp();
+    try {
+      const dir = freshDir();
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'p', dependencies: { express: '4.0.0' } }));
+      const stdout = runEnsureTurbopackConfig(dir, templateConfigPath);
+      expect(stdout).toBe(TURBOPACK_CONFIG_SKIPPED_NOT_NEXT_MARKER);
+      expect(parseTurbopackConfigOutcome(stdout)).toBe('skipped_not_next');
+      expect(existsSync(join(dir, 'next.config.js'))).toBe(false);
+    } finally {
+      tearDown();
+    }
+  });
+
+  it('never touches a workspace with no package.json at all', () => {
+    setUp();
+    try {
+      const dir = freshDir();
+      const stdout = runEnsureTurbopackConfig(dir, templateConfigPath);
+      expect(stdout).toBe(TURBOPACK_CONFIG_SKIPPED_NOT_NEXT_MARKER);
+      expect(existsSync(join(dir, 'next.config.js'))).toBe(false);
+    } finally {
+      tearDown();
+    }
+  });
+
+  it('is idempotent: running it a second time after a real write is a no-op, not a re-copy', () => {
+    setUp();
+    try {
+      const dir = freshDir();
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'p', dependencies: { next: '16.2.12' } }));
+      const first = runEnsureTurbopackConfig(dir, templateConfigPath);
+      expect(first).toBe(TURBOPACK_CONFIG_WRITTEN_MARKER);
+
+      // Simulate a later hydrate: the user has since edited the file that got
+      // written (this is EXACTLY what must never be clobbered by a second run).
+      writeFileSync(join(dir, 'next.config.js'), 'EDITED_AFTER_FIRST_WRITE');
+
+      const second = runEnsureTurbopackConfig(dir, templateConfigPath);
+      expect(second).toBe(TURBOPACK_CONFIG_SKIPPED_EXISTING_MARKER);
+      expect(readFileSync(join(dir, 'next.config.js'), 'utf8')).toBe('EDITED_AFTER_FIRST_WRITE');
+    } finally {
+      tearDown();
+    }
+  });
+
+  it('does not false-positive on a package.json that merely mentions "next" inside another package name', () => {
+    setUp();
+    try {
+      const dir = freshDir();
+      // "next-auth" contains the substring "next" but is NOT the `next`
+      // dependency itself — the pattern requires the exact `"next":` key.
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'p', dependencies: { 'next-auth': '1.0.0' } }));
+      const stdout = runEnsureTurbopackConfig(dir, templateConfigPath);
+      expect(stdout).toBe(TURBOPACK_CONFIG_SKIPPED_NOT_NEXT_MARKER);
+      expect(existsSync(join(dir, 'next.config.js'))).toBe(false);
+    } finally {
+      tearDown();
+    }
+  });
+});
+
+describe('parseTurbopackConfigOutcome', () => {
+  it('recognizes all three markers', () => {
+    expect(parseTurbopackConfigOutcome(TURBOPACK_CONFIG_WRITTEN_MARKER)).toBe('written');
+    expect(parseTurbopackConfigOutcome(TURBOPACK_CONFIG_SKIPPED_EXISTING_MARKER)).toBe('skipped_existing_config');
+    expect(parseTurbopackConfigOutcome(TURBOPACK_CONFIG_SKIPPED_NOT_NEXT_MARKER)).toBe('skipped_not_next');
+  });
+
+  it('returns null for empty/missing/unrecognized stdout — honest "unknown", never a guess', () => {
+    expect(parseTurbopackConfigOutcome('')).toBeNull();
+    expect(parseTurbopackConfigOutcome(undefined)).toBeNull();
+    expect(parseTurbopackConfigOutcome(null)).toBeNull();
+    expect(parseTurbopackConfigOutcome('some unrelated exec output')).toBeNull();
   });
 });

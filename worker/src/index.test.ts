@@ -669,6 +669,25 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
     expect(src).toContain('await recordHydrationOutcome(sandbox, realPrefix, mountPath, hydrateOk);');
   });
 
+  // ── GAP (T30): the Turbopack root fix must reach an EXISTING workspace too ──
+  //
+  // `seedWorkspaceIfAbsent`'s template copy above only ever runs when R2 finds
+  // the prefix genuinely empty, so it never reaches a real, already-hydrated
+  // computer. `buildEnsureTurbopackConfigCommand`'s own shell logic is
+  // exercised for real (real bash, real filesystem, all safety rules
+  // mutation-proven) in `workspace-seed.test.ts` — these assertions pin only
+  // that `ensureWorkspaceHydratedFromR2` actually WIRES it in, unconditionally,
+  // inside the `if (hydrateOk)` block, so both the seeded-new-workspace path
+  // and the hydrated-existing-workspace path both reach it.
+  it('runs buildEnsureTurbopackConfigCommand unconditionally inside `if (hydrateOk)`, covering BOTH the seed and hydrate-existing paths', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const hydrateOkMatch = src.match(/if \(hydrateOk\) \{[\s\S]*?\n {2}\}\n\n {2}await recordHydrationOutcome/);
+    expect(hydrateOkMatch).not.toBeNull();
+    const body = hydrateOkMatch![0];
+    expect(body).toContain('await sandbox.exec(buildEnsureTurbopackConfigCommand(mountPath));');
+    expect(body).toContain('parseTurbopackConfigOutcome(turbopackResult.stdout)');
+  });
+
   it('EzilSandboxDO is exported as `Sandbox` (same DO binding name — zero wrangler.toml changes) and uses schedule(), not alarm()', async () => {
     const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
     expect(src).toContain('export { EzilSandboxDO as Sandbox };');
