@@ -692,6 +692,7 @@ export async function openDesktopWindow (ctx = {}) {
         /** Have we EVER understood an answer? Only this suppresses `unverified`. */
         let ever_wellformed = false;
         let unverified_timer = null;
+        let blank_timer = null;
 
         // The first gate's verdict, run for real rather than assumed — the two
         // gates compose, and `applyDisplayEvidence` can only ever take this
@@ -708,6 +709,7 @@ export async function openDesktopWindow (ctx = {}) {
         const stop = () => {
             done = true;
             clearTimeout(unverified_timer); unverified_timer = null;
+            clearTimeout(blank_timer); blank_timer = null;
         };
 
         /**
@@ -751,6 +753,14 @@ export async function openDesktopWindow (ctx = {}) {
 
             // `ready` or `ready_unverified`: the desktop is shown either way.
             // The difference the user sees is the strip, and only the strip.
+            //
+            // 🔴 THE CLOCK STOPS HERE, EVEN WHEN THE ASKING DOES NOT. `paint`
+            // renders `requestStatus: 'pending'`, so a tick surviving the
+            // reveal writes `data-kind="progress"` back over the panel — a
+            // hidden panel claiming a boot still in progress under a desktop
+            // that is on screen. Caught by boot-test, intermittently, which is
+            // the worst way to find out.
+            stop_timers();
             progress.render(state);
             progress.el.hidden = true;
             if ( state.kind === 'ready_unverified' ) notice.show();
@@ -759,7 +769,7 @@ export async function openDesktopWindow (ctx = {}) {
                 ? 'the display was observed streaming'
                 : 'the display could not be verified');
             revealed = true;
-            if ( state.kind === 'ready' || terminal ) { stop(); stop_timers(); }
+            if ( state.kind === 'ready' || terminal ) stop();
         };
 
         /**
@@ -778,6 +788,35 @@ export async function openDesktopWindow (ctx = {}) {
                 + ` ${Math.round(age())}ms (${asks} asks) — showing it UNVERIFIED,`
                 + ' and still asking');
             settle('unknown', false);
+        };
+
+        /**
+         * The blank deadline. The last moment at which this gate is allowed to
+         * hold the boot, and the only place `blank` can be reached.
+         *
+         * 🔴 FRESHNESS, NOT STICKINESS. The predecessor latched a boolean the
+         * first time it understood an answer, so one `blank` at t=1s followed
+         * by forty-four seconds of unanswerable probe still hid the desktop —
+         * on evidence a minute old, which is not an observation, it is a
+         * memory. `blank` now needs a well-formed blank from within the last
+         * `DISPLAY_BLANK_FRESHNESS_MS`; anything else is `unknown`, which
+         * reveals.
+         */
+        const conclude = () => {
+            if ( ! alive() || done ) return;
+            const fresh = last_blank_at !== 0
+                && performance.now() - last_blank_at <= DISPLAY_BLANK_FRESHNESS_MS;
+            if ( fresh ) {
+                console.error(`[${PHASE}] nothing is watching this desktop after`
+                    + ` ${Math.round(age())}ms (${asks} asks) — no pixels reached the browser`);
+                settle('blank', true);
+                return;
+            }
+            console.warn(`[${PHASE}] could not determine whether the display is streaming`
+                + ` (${asks} asks, last understood answer`
+                + `${last_blank_at ? ` ${Math.round(performance.now() - last_blank_at)}ms ago` : ' never'})`
+                + ' — leaving it UNVERIFIED');
+            settle('unknown', true);
         };
 
         const ask = async () => {
@@ -805,22 +844,7 @@ export async function openDesktopWindow (ctx = {}) {
             // to has not had time to negotiate WebRTC, so an early `blank` is
             // expected and means nothing yet.
 
-            if ( age() >= DISPLAY_BLANK_DEADLINE_MS ) {
-                const fresh = last_blank_at !== 0
-                    && performance.now() - last_blank_at <= DISPLAY_BLANK_FRESHNESS_MS;
-                if ( fresh ) {
-                    console.error(`[${PHASE}] nothing is watching this desktop after`
-                        + ` ${Math.round(age())}ms (${asks} asks) — no pixels reached the browser`);
-                    settle('blank', true);
-                    return;
-                }
-                console.warn(`[${PHASE}] could not determine whether the display is streaming`
-                    + ` (${asks} asks, last understood answer`
-                    + `${last_blank_at ? ` ${Math.round(performance.now() - last_blank_at)}ms ago` : ' never'})`
-                    + ' — leaving it UNVERIFIED');
-                settle('unknown', true);
-                return;
-            }
+            if ( age() >= DISPLAY_BLANK_DEADLINE_MS ) { conclude(); return; }
 
             // The unverified reveal is timer-driven rather than checked here on
             // purpose: an ask that hangs burns `session.js`'s 12s budget, and a
@@ -837,6 +861,15 @@ export async function openDesktopWindow (ctx = {}) {
             unverified_due = true;
             reveal_unverified();
         }, DISPLAY_UNVERIFIED_DEADLINE_MS);
+
+        // 🔴 BOTH DEADLINES ARE TIMERS, for the same reason. Checking one only
+        // when an ask RETURNS makes it a deadline the transport can walk
+        // through: an ask that hangs holds the boot open past it, and the one
+        // case that reaches here with `ever_wellformed` already true — a blank
+        // observed early, then a probe that goes silent — has no unverified
+        // escape hatch by design (the user is waiting on their desktop, not on
+        // us). Without this timer that boot would wait forever.
+        blank_timer = setTimeout(() => { blank_timer = null; conclude(); }, DISPLAY_BLANK_DEADLINE_MS);
 
         void ask();
 

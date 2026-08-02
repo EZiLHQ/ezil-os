@@ -320,6 +320,58 @@ returning an array whose entries carry a boolean `state.is_watching`. Break that
 and nothing errors — every desktop quietly becomes `ready_unverified`, which is
 survivable but is a downgrade nobody will notice from a dashboard.
 
+## 16c. That gate's deadlines are answers to two different questions — don't share one
+
+The gate in §16b shipped correct and measured expensive: a warm boot went
+**5.1s -> 6.8s (+30%)**, gate share a median **1508ms**, and two failure paths
+were worse than the happy one.
+
+**The probe's own serial round trip was the whole cost (1454ms of the 1508ms).**
+Two fixes, both structural rather than tuning:
+
+- It ran *after* the frame check, which it has nothing to do with — it asks
+  Neko's API, not the iframe. Started at the **navigation** instead, it is
+  usually answered before the frame check lands. The composition is unchanged:
+  it still cannot release the desktop until `computeBootUiState` has produced a
+  `ready` for `applyDisplayEvidence` to downgrade. Only the *waiting* overlaps.
+- It bought a `POST /api/login` on **every ask**, while `enableImplicitHosting`
+  had logged into the same origin with the same derived password seconds
+  earlier and discarded the token. The token is now cached per origin and
+  seeded by that handshake. A stale one can only fail toward `unknown` (401 ->
+  re-mint once -> `unknown` if that fails), never toward `live` or `blank`.
+
+Measured with `shell/ezil/display-gate-cost.mjs` (real Chromium, declared
+latencies): gate **1476 -> 1039ms** from the overlap, **-> 434ms** with the
+token reuse composed.
+
+**One deadline cannot serve both verdicts.** The old gate polled to a single 20s
+deadline:
+
+- *Degraded probe* — nothing understood, ever. Settle went **7s -> 29.7s**,
+  because the deadline was only tested after an ask RETURNED and each hung ask
+  burns the shell's 12s request budget. But "we cannot check" is a fact about
+  **our** plumbing, and there is nothing to wait for. Now **6s**, on a timer, and
+  the desktop is revealed with the `ready_unverified` strip while the probe
+  keeps trying behind it and upgrades if it recovers. Measured 25011 -> 5578ms.
+- *Slow peer* — `blank` is the only verdict that HIDES anything, and 20s was
+  sized for ICE against STUN. **§6 says there is no UDP path**, so every
+  connection is relayed through TURN and a relayed candidate is only tried after
+  the direct ones time out; DTLS's own retransmit ladder is 1+2+4+8+16s for a
+  single lost flight. 20s sat *inside* the envelope of a connection that was
+  about to succeed — the §16b defect, sign-flipped. Now **45s**, one full ladder.
+
+**A sticky "we once saw a blank" is not an observation.** The old flag latched:
+one `blank` at t=1s plus 44s of unanswerable probe still hid the desktop, on
+minute-old evidence. `blank` now requires a well-formed blank seen within the
+last 5s; otherwise the verdict is `unknown`.
+
+**Still open, deliberately:** `live` counts any watcher, so a second tab of the
+same computer that is already streaming can answer for a boot whose own peer has
+not connected. Fixing it means a per-boot `usr=` nonce in the desktop URL, which
+is the credential path every production desktop authenticates through — verify
+against a real container before changing it, and make an unattributable watcher
+`unknown` rather than `blank`. See `probeDesktopDisplay`'s doc comment.
+
 ## 17. A `<script src>` inserted by an App Router soft navigation never executes — including a server action's `redirect()`
 
 Observed live 2026-07-31, production build, real Chromium, real Supabase login:

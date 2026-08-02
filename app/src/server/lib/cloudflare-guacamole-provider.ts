@@ -1376,6 +1376,37 @@ export function resetNekoAdminTokenCacheForTests(): void {
  * The admin session this opens is never a watcher (it holds no peer
  * connection), so it cannot inflate its own answer.
  *
+ * ── 🔴 KNOWN GAP: `live` counts ANY watcher, not necessarily THIS viewer ─────
+ * `watching > 0` means some browser's peer connection is up against this
+ * container. If the same user has the same computer open in a second tab and
+ * that tab is streaming, this probe answers `live` for a boot whose own peer
+ * has not connected yet — a false positive, narrow but real. It is not fixed
+ * here, and the reason is a cost/blast-radius judgement rather than an
+ * oversight:
+ *
+ *   - Nothing in the session list distinguishes the tabs. `composeBrowserDesktopUrl`
+ *     logs every viewer in as `usr=EZiL`, so `profile.name` is identical
+ *     across them and `id` is opaque to us.
+ *   - The fix is therefore a per-boot identity in that URL (`usr=EZiL-<nonce>`,
+ *     matched here against the `usr` in the caller's own `frameUrl`). That
+ *     changes the credential path every production desktop authenticates
+ *     through. Neko does not key on the name — `enableImplicitHosting` and this
+ *     function already log in under two different ones — but "does not key on
+ *     the name" is a belief about the pinned build, and if it is wrong the
+ *     failure is not a false positive, it is every desktop failing to connect.
+ *   - The other discriminator on offer, `state.watching_since` vs. the moment
+ *     the shell navigated, needs the container's clock and ours to agree. They
+ *     have no reason to. A skewed container would make every genuine watcher
+ *     look like somebody else's, which is the same total failure again.
+ *
+ * Both need a live container to verify and neither is worth shipping unverified
+ * against a defect that requires one user, one computer, two tabs and a race.
+ * The nonce is the right fix when someone can run it against a real Neko: add
+ * it in `composeBrowserDesktopUrl`, read it from `desktopUrl` here, and — this
+ * is the load-bearing half — return `unknown` rather than `blank` when there
+ * ARE watchers but none is attributable, so a wrong guess about the shape
+ * degrades to `ready_unverified` instead of hiding working desktops.
+ *
  * NEVER THROWS. Never logs or returns the credential or the session token.
  */
 export async function probeDesktopDisplay(
