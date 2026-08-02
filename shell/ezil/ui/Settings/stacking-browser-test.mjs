@@ -210,6 +210,15 @@ function stub (url, method, bodyText) {
     // field, which `session.confirmFrame()` reads as a hard `false` (not
     // `undefined`) — silently failing frame confirmation for every window.
     if ( url.includes('confirm=frame') ) return { ok: true, confirmed: true };
+    // 🔴 The SECOND gate, and the same ordering rule for the same reason. The
+    // desktop window no longer reaches full-bleed on a confirmed FRAME — a
+    // Neko origin answers 200 whether or not WebRTC ever connects, so
+    // `settle_display` must first observe that pixels arrived. A stub that
+    // omits this leaves `session.confirmDisplay` reading `'unknown'`, and the
+    // window is then revealed only after the 20s deadline, carrying the
+    // "we could not check your display" strip. `'live'` is the only value that
+    // retires the panel outright.
+    if ( url.includes('confirm=display') ) return { ok: true, display: 'live' };
     if ( url.includes('/api/shell/desktop') ) return { ok: true, guacamoleRunning: true };
     if ( url.includes('/api/shell/preview-url') && method === 'POST' ) {
         return { ok: true, appPreviewUrl: 'about:blank?preview-frame=1' };

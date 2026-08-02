@@ -14,8 +14,10 @@ import * as original from './boot-phases';
 import {
     BOOT_FAILURE_COPY,
     BOOT_PHASES,
+    BOOT_UNVERIFIED_COPY,
     LONG_BOOT_MS,
     TYPICAL_BOOT_MS,
+    applyDisplayEvidence,
     classifyPreviewFetchError,
     computeBootUiState,
     estimatePhaseForElapsedMs,
@@ -203,12 +205,98 @@ describe('computeBootUiState — never fabricates progress', () => {
 
     it('invents no new failure copy for them — every reason still resolves to existing strings', () => {
         expect(Object.keys(BOOT_FAILURE_COPY).sort()).toEqual([
+            // 🔴 `display_not_streaming` is reachable ONLY through
+            // `applyDisplayEvidence`. It is deliberately absent from
+            // `classifyFailure`'s switch and from `BootErrorCode`, because the
+            // preview request cannot fail this way — the request succeeds and
+            // then no picture arrives. The sweep above proves the deterministic
+            // error codes still land on `unknown` rather than reaching for it.
             'desktop_unreachable',
+            'display_not_streaming',
             'sandbox_crashed',
             'timeout',
             'unknown',
             'worker_unreachable',
         ]);
+    });
+});
+
+// ─── The SECOND gate ────────────────────────────────────────────────────────
+// `computeBootUiState` above answers "is there a desktop at that URL". This
+// answers "did any of it reach the browser", and it is a separate function on
+// purpose — see its doc comment. The property that matters is not that `live`
+// works; it is that NOTHING ELSE DOES.
+
+describe('applyDisplayEvidence — only literal "live" survives as ready', () => {
+    const READY = { kind: 'ready' } as const;
+
+    it('lets a confirmed streaming display through', () => {
+        expect(applyDisplayEvidence(READY, 'live')).toEqual({ kind: 'ready' });
+    });
+
+    it('🔴 turns an observed-blank display into an honest, retryable failure', () => {
+        expect(applyDisplayEvidence(READY, 'blank')).toEqual({
+            kind: 'failed',
+            reason: 'display_not_streaming',
+        });
+    });
+
+    it('🔴 turns "we could not tell" into ready_unverified — never ready, never failed', () => {
+        expect(applyDisplayEvidence(READY, 'unknown')).toEqual({ kind: 'ready_unverified' });
+    });
+
+    it('🔴 treats a caller that never threaded the evidence as not having checked', () => {
+        // The omission loophole. If this returned `ready`, deleting one
+        // argument at a call site would silently restore the original defect,
+        // and nothing would fail.
+        expect(applyDisplayEvidence(READY, undefined)).toEqual({ kind: 'ready_unverified' });
+    });
+
+    it('🔴 accepts nothing truthy off the wire as a stand-in for the observation', () => {
+        // Same rule as `frameConfirmed === true` in `computeBootUiState`: a
+        // body that says something we did not plan for is exactly what
+        // `unknown` exists to catch, and it must not be able to open the gate.
+        for (const junk of [true, 1, 'LIVE', 'Live', ' live', 'live ', 'watching', {}, [], null, NaN]) {
+            expect(applyDisplayEvidence(READY, junk as never)).toEqual({ kind: 'ready_unverified' });
+        }
+    });
+
+    it('🔴 only ever DOWNGRADES — pixel evidence cannot rescue a failed boot', () => {
+        const failed = { kind: 'failed', reason: 'sandbox_crashed' } as const;
+        const progress = { kind: 'progress', currentPhase: 'starting', confirmed: false, isRunningLong: false } as const;
+        const notConfigured = { kind: 'not_configured' } as const;
+        for (const evidence of ['live', 'blank', 'unknown', undefined] as const) {
+            expect(applyDisplayEvidence(failed, evidence)).toBe(failed);
+            expect(applyDisplayEvidence(progress, evidence)).toBe(progress);
+            expect(applyDisplayEvidence(notConfigured, evidence)).toBe(notConfigured);
+        }
+    });
+
+    it('🔴 the whole desktop chain: a reachable origin with no viewer is not ready', () => {
+        // Composed exactly as `settle_display` composes it, so this pins the
+        // real pipeline rather than a restatement of it.
+        const frameState = computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: true });
+        expect(frameState).toEqual({ kind: 'ready' });
+        expect(applyDisplayEvidence(frameState, 'blank')).toEqual({
+            kind: 'failed',
+            reason: 'display_not_streaming',
+        });
+        expect(applyDisplayEvidence(frameState, 'live')).toEqual({ kind: 'ready' });
+    });
+
+    it('the unverified copy names the uncertainty and never claims readiness', () => {
+        expect(BOOT_UNVERIFIED_COPY.title).toBe("We couldn't check your display");
+        expect(`${BOOT_UNVERIFIED_COPY.title} ${BOOT_UNVERIFIED_COPY.body}`.toLowerCase())
+            .not.toContain('ready');
+        expect(BOOT_UNVERIFIED_COPY.body).toContain('try again');
+    });
+
+    it('the streaming-failure copy blames the route, not the user or the machine', () => {
+        const copy = BOOT_FAILURE_COPY.display_not_streaming;
+        expect(copy.title).toBe("Your desktop isn't coming through");
+        // It must not tell the user their computer failed — it did not.
+        expect(copy.body).toContain('Your computer is running');
+        expect(copy.body).toContain('try again');
     });
 });
 
@@ -310,6 +398,7 @@ describe('the port is a module-format conversion and nothing more', () => {
         expect(ported.BOOT_PROGRESS_LONG_SUBTEXT).toBe(original.BOOT_PROGRESS_LONG_SUBTEXT);
         expect(ported.BOOT_FAILURE_COPY).toEqual(original.BOOT_FAILURE_COPY);
         expect(ported.BOOT_NOT_CONFIGURED_COPY).toEqual(original.BOOT_NOT_CONFIGURED_COPY);
+        expect(ported.BOOT_UNVERIFIED_COPY).toEqual(original.BOOT_UNVERIFIED_COPY);
     });
 
     it('agrees on estimatePhaseForElapsedMs across the whole timeline', () => {
@@ -369,6 +458,42 @@ describe('the port is a module-format conversion and nothing more', () => {
                 }
             }
         }
+    });
+
+    it('agrees on applyDisplayEvidence for every state against every answer', () => {
+        // 🔴 The junk values are the point. The two copies must agree not only
+        // that `'live'` passes, but that every near-miss for it does NOT —
+        // that is the whole safety property, and it is exactly the kind of
+        // thing a "small improvement" to one copy would quietly relax.
+        const BASE_STATES: unknown[] = [
+            { kind: 'ready' },
+            { kind: 'ready_unverified' },
+            { kind: 'not_configured' },
+            { kind: 'failed', reason: 'desktop_unreachable' },
+            { kind: 'failed', reason: 'display_not_streaming' },
+            { kind: 'progress', currentPhase: 'connecting', confirmed: true, isRunningLong: false },
+            { kind: 'progress', currentPhase: 'waking', confirmed: false, isRunningLong: true },
+        ];
+        const ANSWERS: unknown[] = [
+            'live', 'blank', 'unknown', undefined, null, true, false, 1, 0,
+            'LIVE', 'Live', ' live', 'live ', 'watching', '', {}, [],
+        ];
+        let compared = 0;
+        for (const state of BASE_STATES) {
+            for (const answer of ANSWERS) {
+                expect(ported.applyDisplayEvidence(state as never, answer as never)).toEqual(
+                    original.applyDisplayEvidence(state as never, answer as never),
+                );
+                compared++;
+            }
+        }
+        expect(compared).toBe(BASE_STATES.length * ANSWERS.length);
+        // And a vacuity guard of its own: the sweep must actually contain a
+        // pass, a failure and an unverified, or "they agree" means nothing.
+        const kinds = new Set(
+            ANSWERS.map((a) => (ported.applyDisplayEvidence({ kind: 'ready' } as never, a as never)).kind),
+        );
+        expect([...kinds].sort()).toEqual(['failed', 'ready', 'ready_unverified']);
     });
 
     it('agrees on classifyPreviewFetchError', () => {
