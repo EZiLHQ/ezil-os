@@ -282,6 +282,37 @@ _pid_alive() {
   [ -n "$st" ] && [ "$st" != "Z" ]
 }
 
+# _reclaim_pid <pid> <cmdline_substring> <label> — TERM, bounded grace, KILL a
+# single process left over from a previous boot of this container. Returns 1
+# WITHOUT signalling anything if ownership cannot be proved: the pid must be a
+# live (non-zombie) process whose /proc cmdline contains <cmdline_substring>.
+# Callers always source the pid from a record written by this script or by the
+# process itself (an X lock file) — never from a search of the process table.
+_reclaim_pid() {
+  local pid="$1" expect="$2" label="$3" cmd=""
+  [ -n "$pid" ] || return 1
+  _pid_alive "$pid" || return 1
+  if [ -r "/proc/${pid}/cmdline" ]; then
+    cmd="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null)"
+  fi
+  case "$cmd" in
+    *"$expect"*) : ;;
+    *) return 1 ;;
+  esac
+  log "stale-boot RECLAIM: $label from a previous boot is still alive (pid=$pid) — stopping it before this boot starts its own"
+  _kill_pid TERM "$pid"
+  local waited=0 deadline=$((NEKO_TEARDOWN_GRACE * 10))
+  while [ "$waited" -lt "$deadline" ] && _pid_alive "$pid"; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if _pid_alive "$pid"; then
+    log "stale-boot RECLAIM: $label (pid=$pid) ignored SIGTERM for ${NEKO_TEARDOWN_GRACE}s — escalating to SIGKILL"
+    _kill_pid KILL "$pid"
+  fi
+  return 0
+}
+
 # _pgid_alive <pgid> [pgid...] — true while ANY of the named process groups
 # still has a LIVE member. Zombies do not count.
 #
@@ -709,6 +740,30 @@ phase_start xvfb
 if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
   log "X display $DISPLAY already active — reusing"
 else
+  # 🔴 Stale X lock. The display is NOT answering (the probe above just failed),
+  #    but an X server that was SIGKILLed — a crashed or OOM-killed boot, a host
+  #    restart — never gets to remove /tmp/.X<n>-lock, and Xvfb refuses to start
+  #    while that file exists. Every subsequent boot then dies right here, 20s
+  #    in, with "X display did not become available": the container is wedged
+  #    for good by a leftover file. Measured, not theorised.
+  #
+  #    Ownership is taken from the lock file itself — X writes the server pid
+  #    into it — and then checked, exactly like the app reclaim above: only a
+  #    process that is still alive AND whose cmdline is an Xvfb is signalled,
+  #    so a recycled pid is never touched. If the pid is already gone the file
+  #    is simply deleted.
+  _x_display_num="${DISPLAY#:}"
+  _x_display_num="${_x_display_num%%.*}"
+  _x_lock="/tmp/.X${_x_display_num}-lock"
+  if [ -f "$_x_lock" ]; then
+    _x_pid="$(tr -dc '0-9' <"$_x_lock" 2>/dev/null)"
+    if _reclaim_pid "${_x_pid:-}" "Xvfb" "X server on $DISPLAY"; then
+      log "reclaimed a wedged X server holding $DISPLAY"
+    else
+      log "removing stale X lock $_x_lock left by a previous boot (recorded pid ${_x_pid:-unknown} is gone)"
+    fi
+    rm -f "$_x_lock" "/tmp/.X11-unix/X${_x_display_num}" 2>/dev/null || true
+  fi
   log "starting Xvfb on $DISPLAY ($NEKO_SCREEN)"
   Xvfb "$DISPLAY" -screen 0 "$NEKO_SCREEN" -ac +extension RANDR -nolisten tcp >>"$LOG" 2>&1 &
   # Recorded so teardown stops the X server too. It used to be missed entirely,
@@ -902,33 +957,6 @@ supervise_app() {
 #
 #    The SUPERVISOR is reclaimed FIRST and the app second, because the reverse
 #    order does not work: the supervisor exists precisely to restart the app.
-
-# _reclaim_pid <pid> <cmdline_substring> <label> — TERM, bounded grace, KILL.
-# Returns 1 without signalling anything if ownership cannot be proved.
-_reclaim_pid() {
-  local pid="$1" expect="$2" label="$3" cmd=""
-  [ -n "$pid" ] || return 1
-  _pid_alive "$pid" || return 1
-  if [ -r "/proc/${pid}/cmdline" ]; then
-    cmd="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null)"
-  fi
-  case "$cmd" in
-    *"$expect"*) : ;;
-    *) return 1 ;;
-  esac
-  log "stale-boot RECLAIM: $label from a previous boot is still alive (pid=$pid) — stopping it before this boot starts its own"
-  _kill_pid TERM "$pid"
-  local waited=0 deadline=$((NEKO_TEARDOWN_GRACE * 10))
-  while [ "$waited" -lt "$deadline" ] && _pid_alive "$pid"; do
-    sleep 0.1
-    waited=$((waited + 1))
-  done
-  if _pid_alive "$pid"; then
-    log "stale-boot RECLAIM: $label (pid=$pid) ignored SIGTERM for ${NEKO_TEARDOWN_GRACE}s — escalating to SIGKILL"
-    _kill_pid KILL "$pid"
-  fi
-  return 0
-}
 
 reclaim_stale_app() {
   local name="$1" expect="$2"
