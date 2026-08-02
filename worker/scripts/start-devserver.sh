@@ -235,17 +235,28 @@ else
         HOST_VALUE="${6:-0.0.0.0}"
         write_phase() { echo "$1 $(date +%s 2>/dev/null || echo 0)" >"$PHASE_FILE"; }
         # start-neko.sh symlinks ./node_modules to a directory on local
-        # ephemeral disk (EZIL_LOCAL_STATE_DIR — see that script's "Split
-        # mount" section and docs/PLATFORM-NOTES.md §2: node_modules must
+        # ephemeral disk (EZIL_LOCAL_STATE_DIR — see the "Split mount"
+        # section there, and docs/PLATFORM-NOTES.md §2: node_modules must
         # never live on the R2-backed workspace root, where even a cold
         # install is pathologically slow). A blind `rm -rf node_modules`
         # UNLINKS that symlink (rm never follows a symlink to recurse into
         # its target — it just removes the link itself), so the very next
         # install call below would materialize a brand-new REAL directory
         # back on the workspace root, silently breaking the split on every
-        # cold boot. clean_node_modules() clears the SYMLINK'S TARGET
+        # cold boot. clean_node_modules() clears the TARGET OF THE SYMLINK
         # in-place instead, so node_modules is always emptied for a truly
         # clean install without ever losing the local-disk redirection.
+        #
+        # 🔴 NO APOSTROPHES ANYWHERE IN THIS BLOCK — not even inside a comment.
+        # Everything from the enclosing "bash -c" opening quote to its closing
+        # quote is ONE single-quoted string, so a stray apostrophe terminates it
+        # early and the whole file stops parsing. That shipped once: two
+        # apostrophes in these very comments produced "line 293: unexpected EOF
+        # while looking for matching", the dev server never launched, and the
+        # app preview regressed from "500 on a missing module" to "nothing
+        # listening at all". Use double quotes, or reword.
+        # "bash -n" catches it in one second; tsc and 482 unit tests did not.
+        # (The first attempt to write THIS warning reintroduced the bug.)
         clean_node_modules() {
             if [ -L node_modules ]; then
                 local target
