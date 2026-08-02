@@ -340,6 +340,8 @@ import {
   realR2KeyPrefix,
   buildTemplateCopyCommand,
   templateWasMissing,
+  buildEnsureTurbopackConfigCommand,
+  parseTurbopackConfigOutcome,
 } from './workspace-seed';
 import {
   hydrateWorkspaceFromR2,
@@ -461,6 +463,38 @@ const SLEEP_AFTER = '30m';
 const DESKTOP_READY_TIMEOUT_MS = WORKER_DESKTOP_READY_TIMEOUT_MS;
 /** Default in-container mount point for the S3 workspace bucket. */
 const DEFAULT_WORKSPACE_MOUNT_PATH = '/workspace';
+
+/**
+ * The `folder=` query param `handlePreview`'s `buildBridgeUrl` should mint
+ * for `codePreviewUrl`, given the exact workspace-mount outcome
+ * `ensureWorkspaceMount` already computed for this `/sandbox/preview` call.
+ *
+ * Exported and pure (no I/O) so this is a real, invokable unit test rather
+ * than a grep for a string in `handlePreview`'s source — see
+ * `index.test.ts`'s "codePreviewFolderParams" suite, which mutation-proves
+ * both branches.
+ *
+ * Fix for "Code opens with an empty file tree" (code-server shows "You have
+ * no recent folders" without `?folder=<abs path>` on its first request — see
+ * `handlePreviewBootstrap`'s doc comment in `./preview-bridge.ts` for the
+ * full mechanism this feeds). `workspace.mountPath` is the SAME value,
+ * resolved the SAME way (`resolveWorkspaceMountConfig`), already forwarded
+ * into the container as `EZIL_WORKSPACE_ROOT` (see `ensureDesktop`'s
+ * `workspaceRootEnv`) — never a literal `/workspace` here, so a future change
+ * to the mount path can't silently empty the file tree again.
+ *
+ * Guarded by the IDENTICAL `mounted` condition `workspaceRootEnv` already
+ * uses: when the bucket isn't mounted, the container's own `WORKSPACE_ROOT`
+ * falls back to `start-neko.sh`'s `/home/neko/project` default instead, and
+ * `folder` must follow that same fallback (by omitting itself, letting
+ * code-server use its own launch-time default) rather than pointing at a
+ * path nothing actually populated.
+ */
+export function codePreviewFolderParams(
+  workspace: { mounted: boolean; mountPath?: string },
+): Record<string, string> | undefined {
+  return workspace.mounted && workspace.mountPath ? { folder: workspace.mountPath } : undefined;
+}
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -1302,6 +1336,43 @@ async function ensureWorkspaceHydratedFromR2(
       // never unsafe (hydrate only ever writes from R2's own truth).
       console.error(
         `[ensureWorkspaceMount] hydrate marker write failed (path=${markerPath}) — a later call on this container will re-hydrate: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+
+    // GAP (T30): `seedWorkspaceIfAbsent`'s template copy (above, on the
+    // genuinely-empty-workspace branch only) is the ONLY place the Turbopack
+    // `turbopack: { root: '/' }` fix (PLATFORM-NOTES §18) ever landed — a
+    // real, already-hydrated workspace (content already in R2 before this fix
+    // shipped, so never empty, so never seeded) never got it, and the
+    // Turbopack symlink fatal still greets it on every `next dev`. Run
+    // UNCONDITIONALLY here — after EVERY successful hydrate, seeded or not —
+    // rather than only on the non-seeded branch: cheap, and a backstop against
+    // the template itself ever losing the config file. See
+    // `buildEnsureTurbopackConfigCommand`'s doc comment in `./workspace-seed`
+    // for the full safety contract (never touches a user's own config, never
+    // touches a non-Next project, writes at most once ever per project so it
+    // cannot churn the periodic R2 flush).
+    try {
+      const turbopackResult = await sandbox.exec(buildEnsureTurbopackConfigCommand(mountPath));
+      const outcome = parseTurbopackConfigOutcome(turbopackResult.stdout);
+      if (outcome === 'written') {
+        console.log(
+          `[ensureWorkspaceMount] wrote the Turbopack config (turbopack.root fix) into a Next.js workspace at ${mountPath} that had none — likely a pre-existing computer hydrated before this fix shipped.`,
+        );
+      } else if (outcome === 'skipped_existing_config') {
+        console.log(
+          `[ensureWorkspaceMount] workspace at ${mountPath} already has its own next.config.* — leaving it untouched.`,
+        );
+      }
+      // 'skipped_not_next' / null: not a Next.js project (or the exec itself
+      // produced no recognizable marker) — nothing to fix, nothing to log.
+    } catch (err) {
+      // Best-effort, like every other step in this function: never fail boot
+      // over a config-convenience fix.
+      console.error(
+        `[ensureWorkspaceMount] Turbopack config check failed (path=${mountPath}) — continuing without it: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -2161,7 +2232,10 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
     // window opened later must re-request `/sandbox/preview` (idempotent — the
     // already-exposed fast path makes it cheap) rather than reuse a stale URL.
     const bootstrapSecret = resolvePreviewSecrets(env)[0] ?? 'local-dev';
-    const buildBridgeUrl = async (exposed: AppPreviewExposeResult): Promise<string | null> => {
+    const buildBridgeUrl = async (
+      exposed: AppPreviewExposeResult,
+      extraParams?: Record<string, string>,
+    ): Promise<string | null> => {
       if (!exposed.exposed || !exposed.url) return null;
       try {
         const bootstrapToken = await mintPreviewBootstrapToken(bootstrapSecret, sandboxId);
@@ -2169,6 +2243,11 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
         bridgeUrl.pathname = '/preview-bootstrap';
         bridgeUrl.search = '';
         bridgeUrl.searchParams.set('token', bootstrapToken);
+        if (extraParams) {
+          for (const [key, value] of Object.entries(extraParams)) {
+            bridgeUrl.searchParams.set(key, value);
+          }
+        }
         return bridgeUrl.toString();
       } catch (err) {
         console.error(
@@ -2180,7 +2259,9 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
       }
     };
     const appPreviewUrl = await buildBridgeUrl(appPreviewExpose);
-    const codePreviewUrl = await buildBridgeUrl(codePreviewExpose);
+    // See `codePreviewFolderParams`'s doc comment above for the full "empty
+    // file tree" mechanism/contract this closes.
+    const codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace));
 
     // EXPLICIT flush before handing the ready preview URL back to the caller
     // (in addition to the alarm-driven periodic flush — see
@@ -3186,7 +3267,7 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
 
   if (request.method === 'GET' && path === '/preview-bootstrap') {
     const cookieSecret = resolveNekoDerivationSecret(env) ?? undefined;
-    return handlePreviewBootstrap(url, sandboxId, secrets, cookieSecret);
+    return handlePreviewBootstrap(url, sandboxId, secrets, cookieSecret, target);
   }
 
   if (target === 'code') return handleCodeBridge(request, env, url, sandboxId, secrets, port);

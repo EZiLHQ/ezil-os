@@ -669,6 +669,25 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
     expect(src).toContain('await recordHydrationOutcome(sandbox, realPrefix, mountPath, hydrateOk);');
   });
 
+  // ── GAP (T30): the Turbopack root fix must reach an EXISTING workspace too ──
+  //
+  // `seedWorkspaceIfAbsent`'s template copy above only ever runs when R2 finds
+  // the prefix genuinely empty, so it never reaches a real, already-hydrated
+  // computer. `buildEnsureTurbopackConfigCommand`'s own shell logic is
+  // exercised for real (real bash, real filesystem, all safety rules
+  // mutation-proven) in `workspace-seed.test.ts` — these assertions pin only
+  // that `ensureWorkspaceHydratedFromR2` actually WIRES it in, unconditionally,
+  // inside the `if (hydrateOk)` block, so both the seeded-new-workspace path
+  // and the hydrated-existing-workspace path both reach it.
+  it('runs buildEnsureTurbopackConfigCommand unconditionally inside `if (hydrateOk)`, covering BOTH the seed and hydrate-existing paths', async () => {
+    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const hydrateOkMatch = src.match(/if \(hydrateOk\) \{[\s\S]*?\n {2}\}\n\n {2}await recordHydrationOutcome/);
+    expect(hydrateOkMatch).not.toBeNull();
+    const body = hydrateOkMatch![0];
+    expect(body).toContain('await sandbox.exec(buildEnsureTurbopackConfigCommand(mountPath));');
+    expect(body).toContain('parseTurbopackConfigOutcome(turbopackResult.stdout)');
+  });
+
   it('EzilSandboxDO is exported as `Sandbox` (same DO binding name — zero wrangler.toml changes) and uses schedule(), not alarm()', async () => {
     const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
     expect(src).toContain('export { EzilSandboxDO as Sandbox };');
@@ -1025,7 +1044,9 @@ describe('handlePreview response carries ready-to-embed bridge URLs', () => {
 
   it('mints a bootstrap token and builds appPreviewUrl/codePreviewUrl from the exposed bridge URL', () => {
     expect(src).toContain('const appPreviewUrl = await buildBridgeUrl(appPreviewExpose);');
-    expect(src).toContain('const codePreviewUrl = await buildBridgeUrl(codePreviewExpose);');
+    expect(src).toContain(
+      'const codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace));',
+    );
     expect(src).toContain("bridgeUrl.pathname = '/preview-bootstrap';");
     expect(src).toContain("bridgeUrl.searchParams.set('token', bootstrapToken);");
   });
@@ -1039,6 +1060,42 @@ describe('handlePreview response carries ready-to-embed bridge URLs', () => {
     expect(fnMatch).not.toBeNull();
     expect(fnMatch?.[0]).toContain('} catch (err) {');
     expect(fnMatch?.[0]).toContain('return null;');
+  });
+});
+
+// ── codePreviewFolderParams — the "empty file tree" fix ─────────────────────
+//
+// GAP: production never sent `folder=` on the code-server bridge URL, so
+// code-server's own UI showed "You have no recent folders" (explorerRows: 0)
+// no matter how correctly the process itself was launched. Appending
+// `&folder=%2Fworkspace` to the SAME bridge URL measured `explorerRows: 11`
+// immediately. This is the pure derivation `handlePreview` calls to mint that
+// param — real behavioral tests, not a grep, so reverting the guard condition
+// (e.g. dropping the `mounted` check, or hardcoding `/workspace`) fails these.
+describe('codePreviewFolderParams', () => {
+  it('mints `folder` from the REAL workspace.mountPath when the workspace is mounted', async () => {
+    const { codePreviewFolderParams } = await import('./index');
+    expect(codePreviewFolderParams({ mounted: true, mountPath: '/workspace' })).toEqual({
+      folder: '/workspace',
+    });
+  });
+
+  it('never hardcodes /workspace — whatever resolveWorkspaceMountConfig resolved wins', async () => {
+    const { codePreviewFolderParams } = await import('./index');
+    expect(codePreviewFolderParams({ mounted: true, mountPath: '/some/other/root' })).toEqual({
+      folder: '/some/other/root',
+    });
+  });
+
+  it('omits folder when the workspace bucket was never mounted (container falls back to its own default root)', async () => {
+    const { codePreviewFolderParams } = await import('./index');
+    expect(codePreviewFolderParams({ mounted: false, mountPath: '/workspace' })).toBeUndefined();
+    expect(codePreviewFolderParams({ mounted: false })).toBeUndefined();
+  });
+
+  it('omits folder when mounted is true but mountPath is missing (defensive — should not happen)', async () => {
+    const { codePreviewFolderParams } = await import('./index');
+    expect(codePreviewFolderParams({ mounted: true })).toBeUndefined();
   });
 });
 

@@ -778,6 +778,51 @@ describe('handlePreviewBootstrap', () => {
     expect(locUrl.searchParams.get('x')).toBe('1');
     expect(locUrl.searchParams.has(PREVIEW_COOKIE_QUERY_PARAM)).toBe(true);
   });
+
+  // ── `folder=` passthrough — the "Code opens with an empty file tree" fix ───
+  //
+  // GAP: production never sent `folder=` on the code-server bridge URL, so
+  // code-server's own UI showed "You have no recent folders" (explorerRows:
+  // 0). Even once the minting side (`buildBridgeUrl` in `./index.ts`) is
+  // fixed to embed `folder=`, this redirect handler builds a BRAND NEW
+  // `locationUrl` — every query param other than `path`/the cookie fallback
+  // is silently dropped unless explicitly named here. These tests prove
+  // `folder` survives the 302 for the code target, is dropped for the app
+  // target (which has no matching concept and must not risk confusing a
+  // user's own dev server routing), and is absent when the caller never
+  // supplied one.
+  it('forwards `folder=` onto the redirect target for the CODE bridge', async () => {
+    const codeSid = 'guac-user1-proj1';
+    const token = await mintPreviewBootstrapToken(SECRET, codeSid);
+    const url = new URL(
+      `https://${CODE_PREVIEW_PORT}-${codeSid}-${CODE_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}&folder=%2Fworkspace`,
+    );
+    const res = await handlePreviewBootstrap(url, codeSid, [SECRET], SECRET, 'code');
+    expect(res.status).toBe(302);
+    const locUrl = new URL(res.headers.get('location')!, 'https://example.com');
+    expect(locUrl.searchParams.get('folder')).toBe('/workspace');
+  });
+
+  it('does NOT forward `folder=` for the APP bridge, even if present on the request', async () => {
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    const url = new URL(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}&folder=%2Fworkspace`,
+    );
+    const res = await handlePreviewBootstrap(url, SID, [SECRET], SECRET, 'app');
+    const locUrl = new URL(res.headers.get('location')!, 'https://example.com');
+    expect(locUrl.searchParams.has('folder')).toBe(false);
+  });
+
+  it('omits `folder=` on the code bridge when the caller never supplied one', async () => {
+    const codeSid = 'guac-user1-proj1';
+    const token = await mintPreviewBootstrapToken(SECRET, codeSid);
+    const url = new URL(
+      `https://${CODE_PREVIEW_PORT}-${codeSid}-${CODE_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}`,
+    );
+    const res = await handlePreviewBootstrap(url, codeSid, [SECRET], SECRET, 'code');
+    const locUrl = new URL(res.headers.get('location')!, 'https://example.com');
+    expect(locUrl.searchParams.has('folder')).toBe(false);
+  });
 });
 
 // ── Query-param fallback auth (resolvePreviewAuth / stripPreviewQueryParam) ──
@@ -976,6 +1021,76 @@ describe('handlePreviewProxy', () => {
       const body = await res.text();
       expect(body).toContain('preview-inspector.js');
     });
+  });
+});
+
+// ── End-to-end: /preview-bootstrap -> /preview really hands `folder=` to the
+//    container, exactly as observed in production ("You have no recent
+//    folders" -> `explorerRows: 11` once `&folder=%2Fworkspace` reaches
+//    code-server). Chains the REAL `handlePreviewBootstrap` redirect into the
+//    REAL `handlePreviewProxy` forward — not a mock of either — against a
+//    fake `ContainerFetcher`, so this fails if EITHER hop drops the param.
+describe('bootstrap -> proxy carries folder= all the way to the container fetch', () => {
+  const SECRET = 'test-primary-secret';
+  const SID = 'guac-user1-proj1';
+
+  it('a folder= minted on the bootstrap request reaches containerFetch on the code bridge', async () => {
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    const bootstrapUrl = new URL(
+      `https://${CODE_PREVIEW_PORT}-${SID}-${CODE_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}&folder=%2Fworkspace`,
+    );
+    const bootstrapRes = await handlePreviewBootstrap(bootstrapUrl, SID, [SECRET], SECRET, 'code');
+    expect(bootstrapRes.status).toBe(302);
+    const location = bootstrapRes.headers.get('location')!;
+
+    let seenUrl = '';
+    const sandbox = fakeContainerFetcher((url) => {
+      seenUrl = url;
+      return new Response('<html><head></head><body>code-server</body></html>', {
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+      });
+    });
+    // The browser's actual follow-up request: same host, the 302's Location,
+    // carrying whatever Set-Cookie the bootstrap minted.
+    const setCookie = bootstrapRes.headers.get('set-cookie')!;
+    const cookiePair = setCookie.split(';')[0]!;
+    const followUpUrl = new URL(location, bootstrapUrl);
+    const followUpRequest = new Request(followUpUrl.toString(), { headers: { cookie: cookiePair } });
+    const codePath = followUpUrl.pathname === '/preview' ? '/' : followUpUrl.pathname.slice('/preview'.length) || '/';
+    const proxyRes = await handlePreviewProxy(
+      followUpRequest,
+      sandbox,
+      SID,
+      [SECRET],
+      codePath,
+      CODE_PREVIEW_PORT,
+      'code',
+    );
+    expect(proxyRes.status).toBe(200);
+    expect(seenUrl).toContain(`127.0.0.1:${CODE_PREVIEW_PORT}`);
+    expect(seenUrl).toContain('folder=%2Fworkspace');
+  });
+
+  it('the SAME chain on the APP bridge never leaks folder= to the dev server', async () => {
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    const bootstrapUrl = new URL(
+      `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-bootstrap?token=${encodeURIComponent(token)}&folder=%2Fworkspace`,
+    );
+    const bootstrapRes = await handlePreviewBootstrap(bootstrapUrl, SID, [SECRET], SECRET, 'app');
+    const location = bootstrapRes.headers.get('location')!;
+    const followUpUrl = new URL(location, bootstrapUrl);
+    expect(followUpUrl.searchParams.has('folder')).toBe(false);
+
+    let seenUrl = '';
+    const sandbox = fakeContainerFetcher((url) => {
+      seenUrl = url;
+      return new Response('ok');
+    });
+    const setCookie = bootstrapRes.headers.get('set-cookie')!;
+    const cookiePair = setCookie.split(';')[0]!;
+    const followUpRequest = new Request(followUpUrl.toString(), { headers: { cookie: cookiePair } });
+    await handlePreviewProxy(followUpRequest, sandbox, SID, [SECRET], '/');
+    expect(seenUrl).not.toContain('folder');
   });
 });
 
