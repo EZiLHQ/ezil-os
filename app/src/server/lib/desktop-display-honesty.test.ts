@@ -54,11 +54,20 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { applyDisplayEvidence, computeBootUiState } from '@/components/desktop/boot-phases';
 import shellSession from '../../../../shell/ezil/session.js';
-import { probeDesktopDisplay } from './cloudflare-guacamole-provider';
+import {
+    cacheNekoAdminToken,
+    probeDesktopDisplay,
+    resetNekoAdminTokenCacheForTests,
+} from './cloudflare-guacamole-provider';
+
+// 🔴 The admin-token cache is module-level and survives between cases. A test
+// that inherits the previous one's token is a test that passes for the wrong
+// reason — and the reuse path is precisely what several cases below assert.
+beforeEach(() => resetNekoAdminTokenCacheForTests());
 
 const ADMIN_PASSWORD = 'derived-admin-secret-value';
 const TOKEN = 'neko-session-token';
@@ -82,6 +91,11 @@ type NekoOpts = {
     sessions: unknown | number;
     /** Reject the login instead of issuing a token. */
     rejectLogin?: boolean;
+    /**
+     * Hold every answer this long. Makes a saved round trip a wall-clock fact
+     * instead of an inference from a request count — see the cost case.
+     */
+    delayMs?: number;
 };
 
 /** Records every request, so credential hygiene is checkable rather than assumed. */
@@ -102,9 +116,15 @@ function makeNeko(opts: NekoOpts) {
                 body,
             });
 
+            const send = (fn: () => void) => {
+                if (opts.delayMs) setTimeout(fn, opts.delayMs);
+                else fn();
+            };
             const json = (status: number, payload: unknown) => {
-                res.writeHead(status, { 'content-type': 'application/json' });
-                res.end(JSON.stringify(payload));
+                send(() => {
+                    res.writeHead(status, { 'content-type': 'application/json' });
+                    res.end(JSON.stringify(payload));
+                });
             };
 
             if (path === '/api/login' && req.method === 'POST') {
@@ -166,11 +186,14 @@ describe('probeDesktopDisplay — only a connected WebRTC peer counts as pixels'
             expect(hits.map((h) => `${h.method} ${h.path}`)).toEqual([
                 'POST /api/login',
                 'GET /api/sessions',
-                'POST /api/logout',
             ]);
             expect(hits.map((h) => h.path).join('')).not.toContain(ADMIN_PASSWORD);
-            // And the phantom-session hygiene `enableImplicitHosting` established.
-            expect(hits.some((h) => h.path === '/api/logout')).toBe(true);
+            // 🔴 NO LOGOUT, and that is the change. The token is kept for the
+            // next ask (this gate polls every second) instead of being thrown
+            // away and re-minted. `cacheNekoAdminToken` logs out whatever it
+            // replaces, so the room still never accumulates sessions — proved
+            // by "re-minting a token releases the one it replaces" below.
+            expect(hits.some((h) => h.path === '/api/logout')).toBe(false);
         } finally {
             await close(server);
         }
@@ -308,6 +331,155 @@ describe('probeDesktopDisplay — only a connected WebRTC peer counts as pixels'
             await expect(
                 probeDesktopDisplay(bad as unknown as string, ADMIN_PASSWORD, 1_500),
             ).resolves.toHaveProperty('display', 'unknown');
+        }
+    });
+});
+
+/**
+ * 🔴 THE COST HALF OF THE SAME CONTRACT.
+ *
+ * The gate above is correct. It was also measured at a median 1508ms on a warm
+ * boot, of which 1454ms was this probe's own serial round trip — and half of
+ * THAT was a `POST /api/login` repeated on every ask, at a moment when
+ * `enableImplicitHosting` had logged into the same origin with the same derived
+ * password seconds earlier and discarded the token.
+ *
+ * These cases pin the saving AND its safety. A cache that answers `live` from
+ * stale state would be far worse than the round trip it saves, so every one of
+ * them checks what came back, not only how many requests it took.
+ */
+describe('the admin-token cache — one session per container, not one per question', () => {
+    it('🔴 a second ask reuses the token: no second login, same verdict', async () => {
+        const { server, hits } = makeNeko({ sessions: [session('a', true)] });
+        const url = await listen(server);
+        try {
+            const first = await probeDesktopDisplay(`${url}/`, ADMIN_PASSWORD);
+            const second = await probeDesktopDisplay(`${url}/`, ADMIN_PASSWORD);
+            await settle();
+
+            expect(first).toEqual({ display: 'live', sessions: 1, watching: 1 });
+            // 🔴 The verdict is IDENTICAL. A cheaper answer that is a different
+            // answer is not a saving, it is a bug.
+            expect(second).toEqual(first);
+            expect(hits.map((h) => `${h.method} ${h.path}`)).toEqual([
+                'POST /api/login',
+                'GET /api/sessions',
+                'GET /api/sessions',
+            ]);
+        } finally {
+            await close(server);
+        }
+    });
+
+    it('🔴 the token `enableImplicitHosting` mints is the one the first ask spends', async () => {
+        // The seed, stated as the boot path produces it: the control handshake
+        // runs inside `previewUrl` and now hands its token to the cache, so the
+        // display gate's FIRST question — the one on the critical path — costs
+        // one round trip instead of two.
+        const { server, hits } = makeNeko({ sessions: [session('a', true)] });
+        const url = await listen(server);
+        try {
+            cacheNekoAdminToken(new URL(url).origin, ADMIN_PASSWORD, TOKEN);
+            expect(await probeDesktopDisplay(`${url}/`, ADMIN_PASSWORD)).toEqual({
+                display: 'live',
+                sessions: 1,
+                watching: 1,
+            });
+            await settle();
+            expect(hits.map((h) => `${h.method} ${h.path}`)).toEqual(['GET /api/sessions']);
+        } finally {
+            await close(server);
+        }
+    });
+
+    it('🔴 a token the far end no longer honours re-mints ONCE and still answers correctly', async () => {
+        // The container restarted under us. A stale token must cost one wasted
+        // GET and nothing else — never a wrong verdict, and never `blank`.
+        const { server, hits } = makeNeko({ sessions: [session('a', true)] });
+        const url = await listen(server);
+        try {
+            cacheNekoAdminToken(new URL(url).origin, ADMIN_PASSWORD, 'a-token-from-a-dead-container');
+            expect(await probeDesktopDisplay(`${url}/`, ADMIN_PASSWORD)).toEqual({
+                display: 'live',
+                sessions: 1,
+                watching: 1,
+            });
+            await settle();
+            expect(hits.map((h) => `${h.method} ${h.path}`)).toEqual([
+                'GET /api/sessions', // 401 — the stale one
+                'POST /api/login',
+                'GET /api/sessions',
+            ]);
+        } finally {
+            await close(server);
+        }
+    });
+
+    it('🔴 a rotated password is never answered from the old token', async () => {
+        const { server, hits } = makeNeko({ sessions: [session('a', true)] });
+        const url = await listen(server);
+        try {
+            cacheNekoAdminToken(new URL(url).origin, 'the-password-from-before-the-rotation', TOKEN);
+            await probeDesktopDisplay(`${url}/`, ADMIN_PASSWORD);
+            await settle();
+            // It logs in with the CURRENT password rather than spending a token
+            // minted with one that no longer applies — and releases the one it
+            // is discarding on the way past.
+            const login = hits.find((h) => h.path === '/api/login');
+            expect(login?.method).toBe('POST');
+            expect(JSON.parse(login?.body ?? '{}')).toMatchObject({ password: ADMIN_PASSWORD });
+            expect(hits.find((h) => h.path === '/api/logout')?.auth).toBe(`Bearer ${TOKEN}`);
+        } finally {
+            await close(server);
+        }
+    });
+
+    it('re-minting a token releases the one it replaces, so the room stays clean', async () => {
+        const { server, hits } = makeNeko({ sessions: [] });
+        const url = await listen(server);
+        try {
+            const origin = new URL(url).origin;
+            cacheNekoAdminToken(origin, ADMIN_PASSWORD, 'first-token');
+            cacheNekoAdminToken(origin, ADMIN_PASSWORD, 'second-token');
+            await settle();
+            const logouts = hits.filter((h) => h.path === '/api/logout');
+            expect(logouts).toHaveLength(1);
+            expect(logouts[0]?.auth).toBe('Bearer first-token');
+        } finally {
+            await close(server);
+        }
+    });
+
+    it('🔴 MEASURED: reuse removes one full round trip from the probe', async () => {
+        // The server is deliberately slowed so the saving is a wall-clock fact
+        // rather than an inference from a request count. 120ms per hop is well
+        // above scheduling noise and well below the real ~600ms.
+        const HOP_MS = 120;
+        const { server } = makeNeko({ sessions: [session('a', true)], delayMs: HOP_MS });
+        const url = await listen(server);
+        try {
+            const time = async () => {
+                const t0 = performance.now();
+                const got = await probeDesktopDisplay(`${url}/`, ADMIN_PASSWORD, 10_000);
+                expect(got).toHaveProperty('display', 'live');
+                return performance.now() - t0;
+            };
+            const cold = await time();
+            const warm: number[] = [];
+            for (let i = 0; i < 5; i++) warm.push(await time());
+            warm.sort((a, b) => a - b);
+            const warmMedian = warm[2] as number;
+
+            // Two hops cold, one warm. Assert the SHAPE (a hop's worth of time
+            // disappeared), not a machine-specific number.
+            expect(cold).toBeGreaterThan(HOP_MS * 1.8);
+            expect(warmMedian).toBeLessThan(cold - HOP_MS * 0.6);
+            console.info(
+                `[cost] display probe: cold ${Math.round(cold)}ms -> warm median ${Math.round(warmMedian)}ms`
+                    + ` (${HOP_MS}ms per hop)`,
+            );
+        } finally {
+            await close(server);
         }
     });
 });

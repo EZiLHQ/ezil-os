@@ -1263,12 +1263,102 @@ export type DesktopDisplayProbe =
       };
 
 /**
- * Whole budget for one display probe: login + list + (unawaited) logout. Sits
- * on the desktop-open critical path and is polled, so it is kept tight — the
- * container is already awake and these are two small JSON round trips to an
- * edge hostname that has just been observed answering.
+ * Whole budget for one display probe: login + list. Sits on the desktop-open
+ * critical path and is polled, so it is kept tight — the container is already
+ * awake and these are two small JSON round trips to an edge hostname that has
+ * just been observed answering.
  */
 export const DESKTOP_DISPLAY_PROBE_TIMEOUT_MS = 6_000;
+
+// ─── One admin session per container, not one per question ───────────────────
+//
+// 🔴 THE PROBE'S OWN SERIAL ROUND TRIP WAS THE WHOLE COST.
+//
+// Measured in production: the display gate added a median 1508ms to a warm
+// boot, of which 1454ms was `probeDesktopDisplay` itself — and half of that is
+// `POST /api/login`, which the probe repeated on every single ask while
+// `enableImplicitHosting` had logged into the SAME origin with the SAME derived
+// password seconds earlier and thrown the token away.
+//
+// So the token is kept. One process-local entry per origin, spent by both call
+// sites, re-minted on expiry or on a 401.
+//
+// ── Why this cannot make the gate dishonest ─────────────────────────────────
+// A cached token can only ever be WRONG in the direction of `unknown`. If it
+// has been revoked (container restarted, Neko restarted, password rotated) the
+// sessions GET answers 401/403; the probe then drops it, logs in once, and asks
+// again — and if THAT fails it returns `unknown`, exactly as it does today.
+// There is no path on which a stale token produces `live` or `blank`: both come
+// only from a 2xx body that passed the well-formedness gate.
+//
+// ── What it costs ───────────────────────────────────────────────────────────
+// The admin session now outlives the request that opened it, so a container can
+// carry one for up to the TTL. It is not a watcher (it holds no peer
+// connection) and so cannot inflate the probe's own answer; it only appears in
+// the `sessions` COUNT, which is reported and never decided on. Against that:
+// the polling gate used to open and close an admin session every second, and
+// now opens at most one per TTL. The room is quieter, not busier.
+//
+// 🔴 Process-local and best-effort BY DESIGN. On a serverless deployment a
+// later request may land on a cold instance and simply log in again. That is a
+// missed saving, never a wrong answer, and it is why nothing here is allowed to
+// be load-bearing.
+
+/** How long a minted Neko admin token may be reused before it is re-minted. */
+export const NEKO_ADMIN_TOKEN_TTL_MS = 120_000;
+
+interface CachedAdminToken {
+    token: string;
+    /** The credential it was minted with. A rotated password must not reuse it. */
+    password: string;
+    expiresAt: number;
+}
+
+const nekoAdminTokens = new Map<string, CachedAdminToken>();
+
+/** Best-effort `POST /api/logout`. Never awaited, never throws. */
+function releaseNekoAdminToken(origin: string, token: string): void {
+    void fetch(`${origin}/api/logout`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(3_000),
+    }).catch(() => undefined);
+}
+
+/**
+ * Hand a freshly minted admin token to the cache. Any token it replaces is
+ * logged out, so the room never accumulates sessions.
+ */
+export function cacheNekoAdminToken(origin: string, password: string, token: string): void {
+    const previous = nekoAdminTokens.get(origin);
+    if (previous && previous.token !== token) releaseNekoAdminToken(origin, previous.token);
+    nekoAdminTokens.set(origin, { token, password, expiresAt: Date.now() + NEKO_ADMIN_TOKEN_TTL_MS });
+}
+
+/** The cached token for this origin, if one was minted with this password and is not stale. */
+export function cachedNekoAdminToken(origin: string, password: string): string | null {
+    const hit = nekoAdminTokens.get(origin);
+    if (!hit) return null;
+    if (hit.password !== password || hit.expiresAt <= Date.now()) {
+        nekoAdminTokens.delete(origin);
+        releaseNekoAdminToken(origin, hit.token);
+        return null;
+    }
+    return hit.token;
+}
+
+/** Forget a token the far end has stopped honouring. No logout — it is already gone. */
+export function dropNekoAdminToken(origin: string, token: string): void {
+    if (nekoAdminTokens.get(origin)?.token === token) nekoAdminTokens.delete(origin);
+}
+
+/**
+ * Empty the cache without talking to anything. For tests only — a module-level
+ * cache that survives between cases is a test that passes for the wrong reason.
+ */
+export function resetNekoAdminTokenCacheForTests(): void {
+    nekoAdminTokens.clear();
+}
 
 /**
  * Is anything actually being decoded at the other end of that desktop URL?
@@ -1305,31 +1395,68 @@ export async function probeDesktopDisplay(
     }
 
     const deadline = AbortSignal.timeout(timeoutMs);
-    let token: string | null = null;
 
-    try {
+    /** Mint a fresh admin session and remember it. `null` = the login failed. */
+    const login = async (): Promise<{ token: string } | { status?: number }> => {
         const loginRes = await fetch(`${origin}/api/login`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             // A distinct username from `enableImplicitHosting`'s so the two
             // server-side sessions are told apart in Neko's own logs. Both
-            // authenticate by password; Neko does not key on the name.
+            // authenticate by password; Neko does not key on the name. (A probe
+            // that REUSES the control session's token borrows its name too —
+            // that is the price of not paying for a second round trip.)
             body: JSON.stringify({ username: 'ezil-os-display', password: adminPassword }),
             cache: 'no-store',
             signal: deadline,
         });
-        if (!loginRes.ok) return { display: 'unknown', reason: 'login_failed', status: loginRes.status };
-        const login = (await loginRes.json()) as { token?: unknown };
-        if (typeof login.token !== 'string' || login.token.length === 0) {
-            return { display: 'unknown', reason: 'login_failed' };
-        }
-        token = login.token;
+        if (!loginRes.ok) return { status: loginRes.status };
+        const body = (await loginRes.json()) as { token?: unknown };
+        if (typeof body.token !== 'string' || body.token.length === 0) return {};
+        cacheNekoAdminToken(origin, adminPassword, body.token);
+        return { token: body.token };
+    };
 
-        const listRes = await fetch(`${origin}/api/sessions`, {
+    try {
+        // 🔴 The saving, and the only structural change to this function: a
+        // token minted by `enableImplicitHosting` moments ago (or by the
+        // previous ask of this very gate) turns the probe from two serial round
+        // trips into one. Everything below is unchanged, including every path
+        // that can produce a verdict.
+        let token = cachedNekoAdminToken(origin, adminPassword);
+        let reused = token !== null;
+        if (token === null) {
+            const fresh = await login();
+            if (!('token' in fresh)) {
+                return { display: 'unknown', reason: 'login_failed', status: fresh.status };
+            }
+            token = fresh.token;
+        }
+
+        let listRes = await fetch(`${origin}/api/sessions`, {
             headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
             cache: 'no-store',
             signal: deadline,
         });
+
+        // The far end stopped honouring a token we were reusing — the container
+        // restarted, or Neko did. That is not an observation of the display, so
+        // re-mint once and ask again rather than reporting anything about it.
+        if (reused && (listRes.status === 401 || listRes.status === 403)) {
+            dropNekoAdminToken(origin, token);
+            reused = false;
+            const fresh = await login();
+            if (!('token' in fresh)) {
+                return { display: 'unknown', reason: 'login_failed', status: fresh.status };
+            }
+            token = fresh.token;
+            listRes = await fetch(`${origin}/api/sessions`, {
+                headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+                cache: 'no-store',
+                signal: deadline,
+            });
+        }
+
         if (!listRes.ok) return { display: 'unknown', reason: 'http_error', status: listRes.status };
 
         let body: unknown;
@@ -1358,18 +1485,11 @@ export async function probeDesktopDisplay(
         // Timeout, transport failure, non-JSON login body. None of them is an
         // observation of the user's screen, and none may be dressed up as one.
         return { display: 'unknown', reason: 'unreachable' };
-    } finally {
-        if (token) {
-            // Same hygiene as `enableImplicitHosting`: don't leave a phantom
-            // admin session in the room. Unawaited — its outcome changes
-            // nothing anyone can perceive, and this probe is on a hot path.
-            void fetch(`${origin}/api/logout`, {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${token}` },
-                signal: AbortSignal.timeout(3_000),
-            }).catch(() => undefined);
-        }
     }
+    // 🔴 NO `finally { logout }` ANY MORE, and that is the point. The token
+    // belongs to `nekoAdminTokens` now; logging it out here would guarantee the
+    // next ask paid for a fresh login, which is the cost this whole section
+    // exists to remove. The cache logs out whatever it replaces.
 }
 
 /**
@@ -1524,6 +1644,12 @@ export async function enableImplicitHosting(
         const login = (await loginRes.json()) as { token?: unknown };
         if (typeof login.token !== 'string' || login.token.length === 0) return 'manual';
         token = login.token;
+        // 🔴 THE SEED. This runs inside the boot request, seconds before the
+        // display gate's first ask hits the same origin with the same derived
+        // password — and it used to throw the token away, so that ask paid for
+        // a second login. Handing it to the cache is what makes the gate's
+        // first question cost one round trip instead of two.
+        cacheNekoAdminToken(origin, adminPassword, token);
 
         const auth = { Authorization: `Bearer ${token}` };
 
@@ -1544,15 +1670,11 @@ export async function enableImplicitHosting(
         // Timeout, transport failure, non-JSON body — all mean the same thing
         // to the user, and none of them may take the desktop down with them.
         return 'manual';
-    } finally {
-        if (token) {
-            // Don't leave a phantom admin session in the room. Best effort:
-            // its failure changes nothing the user can perceive.
-            void fetch(`${origin}/api/logout`, {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${token}` },
-                signal: AbortSignal.timeout(3_000),
-            }).catch(() => undefined);
-        }
     }
+    // 🔴 The logout that used to live here is gone, deliberately. It ran
+    // milliseconds before the display gate asked the same origin the same
+    // question with the same credential, so its only measurable effect was to
+    // make the next login unavoidable. `cacheNekoAdminToken` above owns the
+    // token's lifetime now and logs out whatever it replaces; a container that
+    // is torn down before the TTL takes its own sessions with it.
 }
