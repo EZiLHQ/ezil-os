@@ -28,7 +28,11 @@
  *       HMR-rewrite shim + inspector script tag into HTML responses.
  *
  *   GET/WS /preview-ws/<path>
- *       Cookie-gated WebSocket reverse-proxy (Next.js HMR / Vite client).
+ *       Cookie-gated WebSocket reverse-proxy (Next.js HMR / Vite client) via
+ *       `sandbox.wsConnect()` — never `containerFetch()`, which cannot carry a
+ *       101 back across its RPC boundary (see `ContainerWebSocketConnector`).
+ *       On the code-server host the upgrade is detected by header instead, at
+ *       any path (see `handleCodeBridge` in `src/index.ts`).
  *
  *   GET /preview-inspector.js
  *       Cookie-gated static inspector script (element selection, click/hover
@@ -47,9 +51,12 @@
  * `cloudflare:workers` transitive import) so the pure logic here — header
  * rewriting, HTML shim injection, hostname parsing, response shaping — can be
  * unit-tested with plain `bun test`, mirroring `./desktop-mode` and `./hmac`.
- * The one piece that genuinely needs container I/O (`containerFetch`) is
- * expressed against a minimal structural interface (`ContainerFetcher`) below,
- * not the concrete `Sandbox` class, so it stays mockable in tests too.
+ * The pieces that genuinely need container I/O are expressed against minimal
+ * structural interfaces below — `ContainerFetcher` (`containerFetch`, HTTP)
+ * and `ContainerWebSocketConnector` (`wsConnect`, upgrades) — not the concrete
+ * `Sandbox` class, so they stay mockable in tests too. Those two are NOT
+ * interchangeable: see `ContainerWebSocketConnector`'s doc comment for why a
+ * WebSocket can never come back through `containerFetch`.
  */
 
 import {

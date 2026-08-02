@@ -70,8 +70,17 @@ fi
 # Stale pid file with nothing listening — clean up and relaunch.
 rm -f "$PID_FILE"
 
-# Keep auth none because the daemon is already HMAC-gated behind the
-# containerFetch proxy; bind to loopback only — never 0.0.0.0.
+# Keep auth none because the bridge is already HMAC/cookie-gated in front of
+# this process. 0.0.0.0 is required, NOT loopback — see the 🔴 block above; an
+# earlier version of this very comment said the opposite while the flag below
+# already said 0.0.0.0, which is exactly how the loopback bind got restored
+# once. Do not "restore" it again.
+#
+# code-server's own `authenticateOrigin` (WS router only) additionally compares
+# the browser's Origin against the forwarded host, so the bridge must send the
+# REAL bridge hostname as `x-forwarded-host` — see `resolveForwardedHost` in
+# worker/src/preview-bridge.ts and PLATFORM-NOTES §20. `--auth none` does not
+# disable that check.
 nohup code-server \
     --bind-addr 0.0.0.0:${PORT} \
     --auth none \
