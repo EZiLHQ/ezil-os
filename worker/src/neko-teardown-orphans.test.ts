@@ -119,8 +119,16 @@ interface Harness {
 let running: Harness | null = null;
 let workdir: string | null = null;
 
-function hardKill (h: Harness | null): void {
+async function hardKill (h: Harness | null): Promise<void> {
     if (h?.proc.pid) {
+        // SIGTERM first so the script's own handler stops the apps: they run in
+        // their own process groups, so killing the SCRIPT's group does not
+        // reach them.
+        try { process.kill(h.proc.pid, 'SIGTERM'); } catch { /* already gone */ }
+        const until = Date.now() + 15_000;
+        while (Date.now() < until && h.proc.exitCode === null && h.proc.signalCode === null) {
+            await new Promise((r) => setTimeout(r, 100));
+        }
         try { process.kill(-h.proc.pid, 'SIGKILL'); } catch { /* already gone */ }
     }
     // Belt and braces: if the thing under test failed to clean up, do not leak
@@ -132,8 +140,8 @@ function hardKill (h: Harness | null): void {
     }
 }
 
-afterEach(() => {
-    hardKill(running);
+afterEach(async () => {
+    await hardKill(running);
     running = null;
     if (workdir) {
         try { rmSync(workdir, { recursive: true, force: true }); } catch { /* best effort */ }
