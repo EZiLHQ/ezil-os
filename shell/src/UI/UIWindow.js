@@ -3977,10 +3977,15 @@ window.scale_window = (el_window) => {
         // Use taskbar position-aware window positioning
         window.update_maximized_window_for_taskbar(el_window);
 
-        // hide toolbar
-        if ( !isMobile.phone && !isMobile.tablet ) {
-            window.hide_toolbar();
-        }
+        // MODIFIED BY EZIL 2026-08-02: removed a `window.hide_toolbar()` call.
+        // Upstream Puter has a desktop toolbar and a global to hide it; this
+        // fork ports neither, so the global was never defined and the call
+        // threw `window.hide_toolbar is not a function` on every Maximize.
+        // Because this was the LAST statement in the maximize branch, the
+        // window did maximize and then the exception propagated into the
+        // caller — so choosing "Maximize" from a window's titlebar context
+        // menu left that menu stranded on screen (its `fade_remove` never
+        // ran). Nothing to hide here: there is no toolbar in EZiL-OS.
     }
     //shrink
     else {
