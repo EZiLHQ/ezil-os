@@ -36,6 +36,7 @@ const actions = read('./actions.ts');
 const form = read('./login-form.tsx');
 const callback = read('../auth/callback/route.ts');
 const osPage = read('../os/page.tsx');
+const loginPage = read('./page.tsx');
 
 /** The body of one exported function, from its signature to the next one. */
 function functionBody(source: string, name: string): string {
@@ -111,8 +112,29 @@ describe('/os checks its own arrival, because senders are a convention', () => {
         // server-action redirect. If one is ever added deliberately, the
         // watchdog turns it into one reload rather than a dead page — but it
         // should be a deliberate act, so this fails first.
-        for (const [name, source] of Object.entries({ form, callback, osPage, actions })) {
+        for (const [name, source] of Object.entries({ form, callback, osPage, actions, loginPage })) {
             expect(code(source), name).not.toMatch(/<Link[^>]*href=["'{]*\/os["'}]/);
         }
+    });
+});
+
+describe('/ redirects into /os, so its one known client-side sender must be a real link', () => {
+    // `/` (the root route, `../page.tsx`) now redirects an authenticated
+    // visitor straight into `Routes.OS` (see `../page-entry.test.ts`). That
+    // is only safe as long as every client-side way of reaching `/` is a
+    // real document load, not an App Router soft navigation — same reasoning
+    // as the sign-in path above. The logo on this page is the one such
+    // sender, so it must stay a plain `<a>`.
+
+    it('🔴 the /login logo is a plain <a href={Routes.HOME}>, not a <Link>', () => {
+        expect(code(loginPage)).toMatch(/<a href=\{Routes\.HOME\}/);
+    });
+
+    it('and Routes.HOME never appears on a <Link> anywhere in this file', () => {
+        // If someone "tidies up" the <a> back into Next's <Link> for
+        // consistency with the Terms/Privacy links below it, this fails:
+        // that conversion turns the eventual /os redirect back into a soft
+        // nav that never executes /os's <script src> tags.
+        expect(code(loginPage)).not.toMatch(/<Link[^>]*href=\{Routes\.HOME\}/);
     });
 });
