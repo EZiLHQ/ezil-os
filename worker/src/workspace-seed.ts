@@ -139,6 +139,116 @@ export function templateWasMissing(stdout: string | undefined | null): boolean {
   return (stdout ?? '').includes(TEMPLATE_MISSING_MARKER);
 }
 
+// ── Turbopack config for a PRE-EXISTING, already-hydrated workspace ─────────
+//
+// GAP (T30): `worker/sandbox-template/next.config.js` (the `turbopack: {
+// root: '/' }` fix for the symlinked-node_modules Turbopack fatal —
+// PLATFORM-NOTES §18) is only ever placed by `seedWorkspaceIfAbsent`, which
+// by design skips any workspace `bucket.list()` finds non-empty. A real
+// computer whose workspace was hydrated before this fix shipped — content
+// already in R2, no sentinel needed because it was never empty — NEVER goes
+// through the seed path, so it never gets the file and the Turbopack fatal
+// still greets it on every `next dev`.
+//
+// Fix: a SEPARATE, idempotent, existing-workspace-safe pass, run
+// unconditionally after every successful hydrate in `ensureWorkspaceHydratedFromR2`
+// (`src/index.ts`) — covers both the brand-new-workspace path (finds the
+// config `seedWorkspaceIfAbsent`'s template copy just wrote, no-ops) and the
+// pre-existing-workspace path this gap is actually about.
+//
+// No env var / CLI flag alternative exists: `turbopack.root` is read ONLY
+// from the resolved `next.config.*` object (`next/dist/server/config.js`,
+// confirmed against the exact Next.js version this template pins) — there is
+// no `TURBOPACK_ROOT`-style environment variable Turbopack itself reads
+// instead (checked: no match anywhere in `next/dist` for that or any
+// `TURBOPACK_*`/`TURBO_*` root override). Writing the file is therefore not
+// a preference, it is the only lever that exists.
+//
+// Safety, in order of priority:
+//   1. NEVER overwrites a user's own config — checked BEFORE anything else,
+//      across all three extensions Next.js itself accepts (`.js`/`.ts`/`.mjs`).
+//      A config in any of the three counts as "has one"; only the exact
+//      literal absence of all three is "has none".
+//   2. NEVER touches a non-Next project — gated on `package.json` naming
+//      `next` as a dependency (the one reliable signal available at hydrate
+//      time, BEFORE `node_modules` exists: dependencies are not installed
+//      until `start-devserver.sh` runs later in boot, so checking for an
+//      installed `next` binary is not yet possible here).
+//   3. Idempotent / no flush-loop churn: writes at most ONCE ever per
+//      project — the very first hydrate after this ships. That write is
+//      itself what `flushWorkspaceToR2` (`./workspace-persist.ts`) picks up
+//      and persists to R2 on its next cycle, so every LATER hydrate
+//      downloads the config as part of the workspace's own existing files
+//      and this command's own existence check (step 1) short-circuits to a
+//      no-op — never a second write, on this container or any other.
+
+/** Every `next.config.*` extension Next.js itself resolves — see this section's doc comment, safety rule 1. */
+export const NEXT_CONFIG_FILENAMES = ['next.config.js', 'next.config.ts', 'next.config.mjs'] as const;
+
+/** In-image path (baked in by the Dockerfile, same as `buildTemplateCopyCommand`'s template dir) of the Turbopack-fixed config to copy in. */
+export const TEMPLATE_NEXT_CONFIG_PATH = '/opt/ezil-sandbox-template/next.config.js';
+
+/** `buildEnsureTurbopackConfigCommand`'s stdout marker: wrote the config into a Next project that had none. */
+export const TURBOPACK_CONFIG_WRITTEN_MARKER = 'EZIL_TURBOPACK_CONFIG_WRITTEN';
+/** `buildEnsureTurbopackConfigCommand`'s stdout marker: left an existing user config (any of the three extensions) untouched. */
+export const TURBOPACK_CONFIG_SKIPPED_EXISTING_MARKER = 'EZIL_TURBOPACK_CONFIG_SKIPPED_EXISTING';
+/** `buildEnsureTurbopackConfigCommand`'s stdout marker: not a Next.js project (no `package.json`, or no `next` dependency) — nothing to fix. */
+export const TURBOPACK_CONFIG_SKIPPED_NOT_NEXT_MARKER = 'EZIL_TURBOPACK_CONFIG_SKIPPED_NOT_NEXT';
+
+/**
+ * Build the shell snippet `ensureWorkspaceHydratedFromR2` execs, unconditionally,
+ * after every successful hydrate. See this section's module doc comment above
+ * for the full safety contract (never clobber a user config, never touch a
+ * non-Next project, idempotent/no flush churn) — this function is the exact
+ * shell encoding of those three rules, checked in order:
+ *   1. any of `next.config.{js,ts,mjs}` already exists -> leave it, report
+ *      `TURBOPACK_CONFIG_SKIPPED_EXISTING_MARKER`;
+ *   2. else, `package.json` exists AND names `next` as a dependency -> copy
+ *      the template's config in, report `TURBOPACK_CONFIG_WRITTEN_MARKER`;
+ *   3. else -> not a Next project, report `TURBOPACK_CONFIG_SKIPPED_NOT_NEXT_MARKER`.
+ * Never fails the exec (no branch exits non-zero on its own), matching the
+ * "must-not-fail-boot" convention `buildTemplateCopyCommand` already follows.
+ *
+ * `templateConfigPath` defaults to the real in-image path
+ * (`TEMPLATE_NEXT_CONFIG_PATH`) for every production call site; it is an
+ * explicit parameter (not a hardcoded literal in the body) SPECIFICALLY so
+ * `workspace-seed.test.ts` can point it at a throwaway fixture file and run
+ * the actual generated string through a real shell against a real temp
+ * directory — proving the shell logic itself, not just the JS that builds
+ * it — without touching the real `/opt/ezil-sandbox-template`.
+ */
+export function buildEnsureTurbopackConfigCommand(
+  targetPath: string,
+  templateConfigPath: string = TEMPLATE_NEXT_CONFIG_PATH,
+): string {
+  const hasConfig = NEXT_CONFIG_FILENAMES.map((name) => `[ -f "${targetPath}/${name}" ]`).join(' || ');
+  return (
+    `if ${hasConfig}; then ` +
+    `echo ${TURBOPACK_CONFIG_SKIPPED_EXISTING_MARKER}; ` +
+    `elif [ -f "${targetPath}/package.json" ] && grep -q "\\"next\\":" "${targetPath}/package.json"; then ` +
+    `cp ${templateConfigPath} "${targetPath}/next.config.js" && echo ${TURBOPACK_CONFIG_WRITTEN_MARKER}; ` +
+    `else echo ${TURBOPACK_CONFIG_SKIPPED_NOT_NEXT_MARKER}; fi`
+  );
+}
+
+/** The three possible outcomes `buildEnsureTurbopackConfigCommand`'s stdout can report — see that function's doc comment. */
+export type TurbopackConfigOutcome = 'written' | 'skipped_existing_config' | 'skipped_not_next' | null;
+
+/**
+ * Parse `buildEnsureTurbopackConfigCommand`'s stdout into one of its three
+ * declared outcomes, or `null` for anything unrecognized (e.g. `sandbox.exec`
+ * itself failed before the command's own `echo` ran) — mirrors
+ * `parseDevserverPhase`'s "unparseable is honestly unknown, never a guess"
+ * convention.
+ */
+export function parseTurbopackConfigOutcome(stdout: string | undefined | null): TurbopackConfigOutcome {
+  const trimmed = (stdout ?? '').trim();
+  if (trimmed.includes(TURBOPACK_CONFIG_WRITTEN_MARKER)) return 'written';
+  if (trimmed.includes(TURBOPACK_CONFIG_SKIPPED_EXISTING_MARKER)) return 'skipped_existing_config';
+  if (trimmed.includes(TURBOPACK_CONFIG_SKIPPED_NOT_NEXT_MARKER)) return 'skipped_not_next';
+  return null;
+}
+
 export type SeedOutcome =
   | { seeded: true }
   | {

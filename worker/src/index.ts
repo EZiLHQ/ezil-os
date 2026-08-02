@@ -340,6 +340,8 @@ import {
   realR2KeyPrefix,
   buildTemplateCopyCommand,
   templateWasMissing,
+  buildEnsureTurbopackConfigCommand,
+  parseTurbopackConfigOutcome,
 } from './workspace-seed';
 import {
   hydrateWorkspaceFromR2,
@@ -1334,6 +1336,43 @@ async function ensureWorkspaceHydratedFromR2(
       // never unsafe (hydrate only ever writes from R2's own truth).
       console.error(
         `[ensureWorkspaceMount] hydrate marker write failed (path=${markerPath}) — a later call on this container will re-hydrate: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+
+    // GAP (T30): `seedWorkspaceIfAbsent`'s template copy (above, on the
+    // genuinely-empty-workspace branch only) is the ONLY place the Turbopack
+    // `turbopack: { root: '/' }` fix (PLATFORM-NOTES §18) ever landed — a
+    // real, already-hydrated workspace (content already in R2 before this fix
+    // shipped, so never empty, so never seeded) never got it, and the
+    // Turbopack symlink fatal still greets it on every `next dev`. Run
+    // UNCONDITIONALLY here — after EVERY successful hydrate, seeded or not —
+    // rather than only on the non-seeded branch: cheap, and a backstop against
+    // the template itself ever losing the config file. See
+    // `buildEnsureTurbopackConfigCommand`'s doc comment in `./workspace-seed`
+    // for the full safety contract (never touches a user's own config, never
+    // touches a non-Next project, writes at most once ever per project so it
+    // cannot churn the periodic R2 flush).
+    try {
+      const turbopackResult = await sandbox.exec(buildEnsureTurbopackConfigCommand(mountPath));
+      const outcome = parseTurbopackConfigOutcome(turbopackResult.stdout);
+      if (outcome === 'written') {
+        console.log(
+          `[ensureWorkspaceMount] wrote the Turbopack config (turbopack.root fix) into a Next.js workspace at ${mountPath} that had none — likely a pre-existing computer hydrated before this fix shipped.`,
+        );
+      } else if (outcome === 'skipped_existing_config') {
+        console.log(
+          `[ensureWorkspaceMount] workspace at ${mountPath} already has its own next.config.* — leaving it untouched.`,
+        );
+      }
+      // 'skipped_not_next' / null: not a Next.js project (or the exec itself
+      // produced no recognizable marker) — nothing to fix, nothing to log.
+    } catch (err) {
+      // Best-effort, like every other step in this function: never fail boot
+      // over a config-convenience fix.
+      console.error(
+        `[ensureWorkspaceMount] Turbopack config check failed (path=${mountPath}) — continuing without it: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
