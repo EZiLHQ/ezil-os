@@ -641,21 +641,33 @@ export async function openDesktopWindow (ctx = {}) {
             frameConfirmed: true,
         });
 
-        const finish = (evidence, why) => {
+        /**
+         * The one place this gate ends, for all three verdicts. Routing every
+         * outcome through `applyDisplayEvidence` rather than branching on the
+         * evidence directly is deliberate: the mapping from what was observed
+         * to what the user is shown lives in one pure, swept-over function, and
+         * this function cannot disagree with it.
+         */
+        const finish = (evidence) => {
             if ( disposed || my_attempt !== attempt ) return;
             stop_timers();
             const state = applyDisplayEvidence(frame_state, evidence);
             progress.render(state);
 
             if ( state.kind === 'failed' ) {
+                // The blank frame is never revealed. The panel stays, over an
+                // ordinary window, on an OS with its taskbar still on it.
                 show_panel();
                 return;
             }
 
             // `ready` or `ready_unverified`: the desktop is shown either way.
+            // The difference the user sees is the strip, and only the strip.
             progress.el.hidden = true;
             if ( state.kind === 'ready_unverified' ) notice.show();
-            go_fullbleed(why);
+            go_fullbleed(state.kind === 'ready'
+                ? 'the display was observed streaming'
+                : 'the display could not be verified');
         };
 
         const ask = async () => {
@@ -668,7 +680,7 @@ export async function openDesktopWindow (ctx = {}) {
                 console.info(`[${PHASE}] the display is streaming`
                     + ` (+${Math.round(performance.now() - t_display)}ms after the frame confirmed,`
                     + ` ${asks} ask(s))`);
-                finish('live', 'the display was observed streaming');
+                finish('live');
                 return;
             }
             // 'blank' is a real answer and 'unknown' is not — but neither ends
@@ -685,12 +697,12 @@ export async function openDesktopWindow (ctx = {}) {
             if ( saw_wellformed ) {
                 console.error(`[${PHASE}] nothing is watching this desktop after`
                     + ` ${Math.round(performance.now() - t_display)}ms (${asks} asks) — no pixels reached the browser`);
-                finish('blank', 'never used — blank does not reveal');
+                finish('blank');
                 return;
             }
             console.warn(`[${PHASE}] could not determine whether the display is streaming`
                 + ` (${asks} asks, none understood) — showing it UNVERIFIED`);
-            finish('unknown', 'display could not be verified');
+            finish('unknown');
         };
 
         void ask();
