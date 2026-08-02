@@ -49,6 +49,7 @@ import {
     isOwnDesktopOrigin,
     mintAppPreviewBootstrapToken,
     newCorrelationId,
+    probeDesktopDisplay,
     probeDesktopFrame,
     readWorkerBridgeUrl,
     requestGuacamoleFocusApp,
@@ -656,6 +657,68 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 return { confirmed: true as const, status: frame.status };
             }
             return { confirmed: false as const, reason: frame.reason, status: frame.status };
+        }),
+
+    /**
+     * Is the desktop actually DELIVERING PIXELS to a browser?
+     *
+     * `confirmFrame` above answers "is there a desktop at that URL". This
+     * answers the question underneath it, and the two are genuinely separable:
+     * measured under WebKit, the origin answered 200 and the shell went ready
+     * in 4.6s while the `<video>` element had `videoWidth: 0` and no
+     * `srcObject` at all. Neko is the only witness — see `probeDesktopDisplay`.
+     *
+     * 🔴 Same SSRF pin as `confirmFrame`, for the same reason and with more at
+     * stake: this one posts the per-sandbox Neko ADMIN credential to whatever
+     * origin it is given. `isOwnDesktopOrigin` must gate it, and a refusal here
+     * is `unknown` rather than `blank` — refusing to probe is not an
+     * observation of anything, and must not be laundered into a failure the
+     * user is shown.
+     */
+    confirmDisplay: protectedProcedure
+        .input(
+            z.object({
+                computerId: z.string().uuid(),
+                frameUrl: z.string().url().max(2048),
+            }),
+        )
+        .query(async ({ ctx, input }) => {
+            await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+
+            const config = resolveCloudflareGuacamoleConfig();
+            if (!config.isConfigured) {
+                return { display: 'unknown' as const, reason: 'provider_not_configured' as const };
+            }
+
+            let workerHost: string;
+            try {
+                workerHost = new URL(config.workerUrl).hostname;
+            } catch {
+                return { display: 'unknown' as const, reason: 'provider_not_configured' as const };
+            }
+
+            const sandboxId = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
+            if (!isOwnDesktopOrigin(workerHost, sandboxId, input.frameUrl)) {
+                console.warn('[cloudflareGuacamole.confirmDisplay] refused a foreign origin', {
+                    computerId: input.computerId,
+                });
+                return { display: 'unknown' as const, reason: 'not_own_origin' as const };
+            }
+
+            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+            // Same fallback as `previewUrl`'s implicit-hosting handshake: a
+            // keyless local dev environment runs Neko's built-in default admin
+            // password. The derived value is never returned or logged.
+            const adminPassword = hmacSecret ? deriveNekoAdminValue(hmacSecret, sandboxId) : 'admin';
+
+            const probe = await probeDesktopDisplay(input.frameUrl, adminPassword);
+            if (probe.display === 'live') {
+                return { display: 'live' as const, watching: probe.watching, sessions: probe.sessions };
+            }
+            if (probe.display === 'blank') {
+                return { display: 'blank' as const, sessions: probe.sessions };
+            }
+            return { display: 'unknown' as const, reason: probe.reason, status: probe.status };
         }),
 
     /** Health-check a computer's sandbox. */

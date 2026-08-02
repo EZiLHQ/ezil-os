@@ -1179,6 +1179,199 @@ export async function probeDesktopFrame(
     }
 }
 
+// ─── Did any pixels actually reach the browser? ───────────────────────────────
+//
+// 🔴 THE SECOND BLIND SPOT, ONE LAYER BELOW THE FIRST.
+//
+// `probeDesktopFrame` above closed the gap between "the Worker registered a
+// port" and "the desktop origin serves". It cannot close the next one, and
+// measured under WebKit it did not: the shell declared **ready in 4.6s** with
+// `videoWidth: 0, paused: true, srcObject: false`. The origin answered 200 —
+// it served Neko's SPA shell perfectly — and then WebRTC never connected, so
+// the user sat looking at a third-party spinner under a checkmark we had
+// already drawn. Every signal the contract had was true; the screen was blank.
+//
+// The browser cannot report this. The desktop iframe is
+// `8181-<sandbox>-nekodesktop.<zone>` inside the app origin, so
+// `video.videoWidth` is unreadable from the parent, and it is not fixable by
+// injecting a reporter either: `parseBridgeHost` (`worker/src/preview-bridge.ts`)
+// accepts only ports 3002/8443 and routes 8181 down the SDK's raw
+// `proxyToSandbox` path, so the shim injector never sees this response at all.
+// Putting the desktop behind the bridge proxy to change that would hand our
+// own proxy Neko's WebSocket — which is its WebRTC SIGNALLING channel — and
+// this repo already carries that scar: wrapping code-server's non-HMR socket
+// "breaks the extension host immediately and silently".
+//
+// The server can answer it, because Neko keeps the books itself. Per session it
+// tracks `state.is_watching`, and that flag has exactly one writer:
+//
+//     // internal/webrtc/manager.go
+//     connection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+//         switch state {
+//         case webrtc.PeerConnectionStateConnected:
+//             session.SetWebRTCConnected(peer, true)   // -> state.IsWatching = true
+//
+// So `is_watching: true` means a real `RTCPeerConnection` belonging to a real
+// browser reached `connected` and Neko is pushing media into it. That is not a
+// reachability probe and not a timer; it is the far end of the same pipe whose
+// near end is the `<video>` element we are not allowed to look at.
+//
+// We already hold the credential and the code path: `enableImplicitHosting`
+// below has logged into this exact API, from this exact server, since the
+// control-mode work. This adds one authenticated GET to it.
+
+/**
+ * What a probe of the desktop's WebRTC bookkeeping actually observed.
+ *
+ * 🔴 Three values, and the third is load-bearing. `probeDesktopFrame`
+ * deliberately has no `unknown` variant — for a reachability question, "no
+ * answer" IS the answer, because the browser is about to fetch that same URL
+ * and get the same nothing. This question is different: it is answered by an
+ * API on the far side of OUR OWN plumbing, so a non-answer is a fact about our
+ * plumbing, not about the user's display. Collapsing it into `blank` would
+ * mean a single deploy-time mistake — a renamed field, a Neko bump, an admin
+ * password that stopped deriving — showing every user in the product a failure
+ * panel over a desktop that is streaming perfectly. That is the same lie as the
+ * one being fixed, with the sign flipped, and it is worse because it is total.
+ *
+ * So:
+ *   'live'    — at least one session's WebRTC peer is connected. The ONLY value
+ *               that may be turned into "ready" anywhere.
+ *   'blank'   — a WELL-FORMED session list in which nobody is watching. A real,
+ *               positive observation that no pixels are being delivered. `[]`
+ *               counts: no sessions means no viewer.
+ *   'unknown' — we could not obtain a well-formed answer. Never a pass, and
+ *               never a failure either.
+ */
+export type DesktopDisplayProbe =
+    | { display: 'live'; sessions: number; watching: number }
+    | { display: 'blank'; sessions: number }
+    | {
+          display: 'unknown';
+          /**
+           * `bad_url`      — not a URL we can probe.
+           * `login_failed` — the Neko API refused our admin credential, or
+           *                  handed back no token.
+           * `http_error`   — `/api/sessions` answered >= 400.
+           * `unrecognised` — it answered 2xx with something that is not a list
+           *                  of sessions carrying a boolean `is_watching`. The
+           *                  shape we rely on changed; we must not guess.
+           * `unreachable`  — no answer at all, or our own timeout elapsed.
+           */
+          reason: 'bad_url' | 'login_failed' | 'http_error' | 'unrecognised' | 'unreachable';
+          status?: number;
+      };
+
+/**
+ * Whole budget for one display probe: login + list + (unawaited) logout. Sits
+ * on the desktop-open critical path and is polled, so it is kept tight — the
+ * container is already awake and these are two small JSON round trips to an
+ * edge hostname that has just been observed answering.
+ */
+export const DESKTOP_DISPLAY_PROBE_TIMEOUT_MS = 6_000;
+
+/**
+ * Is anything actually being decoded at the other end of that desktop URL?
+ *
+ * ── The well-formedness gate is the whole safety property ───────────────────
+ * `blank` is only ever returned for a body that is an ARRAY every one of whose
+ * entries carries a BOOLEAN `state.is_watching`. Anything else — an object, a
+ * string, an array of entries missing the field, an HTML error page that
+ * somehow arrived with a 2xx — is `unrecognised`, i.e. `unknown`. The rule is
+ * not "parse leniently and assume the worst"; it is "either we understood the
+ * answer or we did not have one". A future Neko that renames the field makes
+ * every probe `unknown` and every desktop reveal exactly as it does today,
+ * rather than making every desktop fail.
+ *
+ * The admin session this opens is never a watcher (it holds no peer
+ * connection), so it cannot inflate its own answer.
+ *
+ * NEVER THROWS. Never logs or returns the credential or the session token.
+ */
+export async function probeDesktopDisplay(
+    desktopUrl: string,
+    adminPassword: string,
+    timeoutMs: number = DESKTOP_DISPLAY_PROBE_TIMEOUT_MS,
+): Promise<DesktopDisplayProbe> {
+    let origin: string;
+    try {
+        const u = new URL(desktopUrl);
+        if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+            return { display: 'unknown', reason: 'bad_url' };
+        }
+        origin = u.origin;
+    } catch {
+        return { display: 'unknown', reason: 'bad_url' };
+    }
+
+    const deadline = AbortSignal.timeout(timeoutMs);
+    let token: string | null = null;
+
+    try {
+        const loginRes = await fetch(`${origin}/api/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            // A distinct username from `enableImplicitHosting`'s so the two
+            // server-side sessions are told apart in Neko's own logs. Both
+            // authenticate by password; Neko does not key on the name.
+            body: JSON.stringify({ username: 'ezil-os-display', password: adminPassword }),
+            cache: 'no-store',
+            signal: deadline,
+        });
+        if (!loginRes.ok) return { display: 'unknown', reason: 'login_failed', status: loginRes.status };
+        const login = (await loginRes.json()) as { token?: unknown };
+        if (typeof login.token !== 'string' || login.token.length === 0) {
+            return { display: 'unknown', reason: 'login_failed' };
+        }
+        token = login.token;
+
+        const listRes = await fetch(`${origin}/api/sessions`, {
+            headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+            cache: 'no-store',
+            signal: deadline,
+        });
+        if (!listRes.ok) return { display: 'unknown', reason: 'http_error', status: listRes.status };
+
+        let body: unknown;
+        try {
+            body = await listRes.json();
+        } catch {
+            return { display: 'unknown', reason: 'unrecognised' };
+        }
+        if (!Array.isArray(body)) return { display: 'unknown', reason: 'unrecognised' };
+
+        let watching = 0;
+        for (const entry of body) {
+            const state = (entry as { state?: { is_watching?: unknown } } | null)?.state;
+            if (typeof state?.is_watching !== 'boolean') {
+                // One entry we cannot read makes the whole count untrustworthy:
+                // the unreadable one could be the watcher.
+                return { display: 'unknown', reason: 'unrecognised' };
+            }
+            if (state.is_watching) watching++;
+        }
+
+        return watching > 0
+            ? { display: 'live', sessions: body.length, watching }
+            : { display: 'blank', sessions: body.length };
+    } catch {
+        // Timeout, transport failure, non-JSON login body. None of them is an
+        // observation of the user's screen, and none may be dressed up as one.
+        return { display: 'unknown', reason: 'unreachable' };
+    } finally {
+        if (token) {
+            // Same hygiene as `enableImplicitHosting`: don't leave a phantom
+            // admin session in the room. Unawaited — its outcome changes
+            // nothing anyone can perceive, and this probe is on a hot path.
+            void fetch(`${origin}/api/logout`, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${token}` },
+                signal: AbortSignal.timeout(3_000),
+            }).catch(() => undefined);
+        }
+    }
+}
+
 /**
  * May this server fetch `candidateUrl` on behalf of a caller who owns
  * `sandboxId`?

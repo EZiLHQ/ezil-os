@@ -288,6 +288,102 @@ body.device-phone {
     outline-offset: 2px;
 }
 
+/* ── the "we could not check your display" strip ──────────────────────────
+ * The `ready_unverified` surface (`DisplayNotice` in boot-progress.js). It sits
+ * OVER a desktop that is being shown, so:
+ *   - it is `position: absolute` inside `.window-body`, pinned to the top, and
+ *     deliberately NOT `inset: 0` — it must not cover the desktop it is
+ *     annotating;
+ *   - `z-index: 3` puts it above `.ezil-boot` (2) and the iframe, but the
+ *     control drawer's own band is higher still, because the drawer is the only
+ *     way out of a full-bleed window and nothing may paint over it;
+ *   - `display: flex` beats the UA's `[hidden]` rule, so it gets the same
+ *     explicit `[hidden]` override every other panel in this file needed.
+ *     `code.js`/`preview.js` shipped exactly that bug once already. */
+.ezil-display-notice {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    right: 12px;
+    z-index: 3;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px 16px;
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 12px 14px;
+    border: 1px solid rgba(245, 245, 244, 0.16);
+    border-radius: 10px;
+    background-color: rgba(16, 17, 17, 0.94);
+    color: #f5f5f4;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    font-size: 13px;
+    line-height: 1.45;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+
+.ezil-display-notice[hidden] {
+    display: none;
+}
+
+.ezil-display-notice-text {
+    flex: 1 1 260px;
+    min-width: 0;
+}
+
+.ezil-display-notice-title {
+    display: block;
+    font-weight: 600;
+}
+
+.ezil-display-notice-body {
+    display: block;
+    color: rgba(245, 245, 244, 0.72);
+}
+
+.ezil-display-notice-actions {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 8px;
+}
+
+.ezil-display-notice-retry,
+.ezil-display-notice-dismiss {
+    appearance: none;
+    border-radius: 6px;
+    padding: 7px 13px;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.ezil-display-notice-retry {
+    border: none;
+    color: #101111;
+    background-color: #00adb5;
+}
+
+.ezil-display-notice-dismiss {
+    border: 1px solid rgba(245, 245, 244, 0.22);
+    color: #f5f5f4;
+    background-color: transparent;
+}
+
+.ezil-display-notice-retry:hover,
+.ezil-display-notice-dismiss:hover {
+    opacity: 0.9;
+}
+
+.ezil-display-notice-retry:focus-visible,
+.ezil-display-notice-dismiss:focus-visible {
+    outline: 2px solid #f5f5f4;
+    outline-offset: 2px;
+}
+
 /* ── the control tray ─────────────────────────────────────────────────────
  * 🔴 `enter_fullpage_mode` hides the taskbar AND the window head, and
  * `style.css:246` hides `.window-minimize-btn` in fullpage mode. The drawer is

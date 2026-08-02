@@ -365,6 +365,47 @@ export async function confirmFrame (computerId, frameUrl) {
 }
 
 /**
+ * `GET /api/shell/desktop?confirm=display` — ask the server whether the desktop
+ * is actually PUTTING PIXELS IN THE BROWSER, not merely answering HTTP.
+ *
+ * 🔴 WHY `confirmFrame` IS NOT THIS. `confirmFrame` reads a status line. A Neko
+ * origin serves its SPA shell with a 200 whether or not WebRTC will ever
+ * connect, so a 200 there is entirely compatible with a blank screen — measured
+ * under WebKit, the shell went ready in 4.6s with `videoWidth: 0`, `paused:
+ * true`, `srcObject: false`, and the user got a third-party spinner under our
+ * checkmark.
+ *
+ * 🔴 WHY THE BROWSER CANNOT ANSWER IT. The desktop iframe is cross-origin
+ * (`8181-<sandbox>-nekodesktop.<zone>` inside this app's origin). Reading
+ * `video.videoWidth` out of it is not "hard", it is forbidden — the attempt
+ * throws or returns nothing, which is worse than not asking, because it looks
+ * like a check. The server can ask Neko, which knows: it flips a per-session
+ * `is_watching` flag from its WebRTC peer's `connected` state change.
+ *
+ * @returns {Promise<'live' | 'blank' | 'unknown'>}
+ *   `'live'`    — a WebRTC peer is connected and being fed video.
+ *   `'blank'`   — a real, well-formed observation that nobody is watching.
+ *   `'unknown'` — no usable answer. This is NOT `'blank'`: it is a fact about
+ *                 our plumbing, not about the user's screen, and it must never
+ *                 be rendered as either a ready desktop or a broken one.
+ *                 Anything unexpected off the wire lands here on purpose.
+ */
+export async function confirmDisplay (computerId, frameUrl) {
+    if ( ! computerId || ! frameUrl ) return 'unknown';
+    const url = `${endpoint('desktop')}?computerId=${encodeURIComponent(computerId)}`
+        + `&confirm=display&frameUrl=${encodeURIComponent(frameUrl)}`;
+    const res = await request(url, { timeoutMs: STATUS_TIMEOUT_MS });
+    if ( ! res.ok ) return 'unknown';
+    if ( res.data?.ok !== true ) return 'unknown';
+    // Strict equality against the two claims, never a truthiness test and never
+    // a default: a body that says something we did not plan for is exactly the
+    // case `'unknown'` exists to catch.
+    if ( res.data.display === 'live' ) return 'live';
+    if ( res.data.display === 'blank' ) return 'blank';
+    return 'unknown';
+}
+
+/**
  * `GET /api/shell/desktop?computerId=` — the cheap poll. Does NOT wake a
  * sleeping container, so it is safe to run every 2s WHILE the boot request
  * above is in flight. It is the single genuine mid-boot signal the browser
@@ -386,7 +427,7 @@ export default {
     get, set, del,
     payload,
     readSession, openSession,
-    openDesktop, desktopRunning, confirmFrame,
+    openDesktop, desktopRunning, confirmFrame, confirmDisplay,
     previewUrl, focusApp,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
