@@ -318,6 +318,13 @@ export async function openDesktopWindow (ctx = {}) {
      * out of the window at all — better to stay windowed forever.
      */
     let may_fullbleed = true;
+    /**
+     * Repaints the panel from the CURRENT attempt's clock and observations.
+     * Assigned by `start_boot`, which owns both; held out here so the display
+     * gate can put the panel back on live progress after the frame check has
+     * written something else into it. A no-op before the first attempt.
+     */
+    let paint = () => {};
 
     const stop_timers = () => {
         clearInterval(tick_timer); tick_timer = null;
@@ -394,7 +401,7 @@ export async function openDesktopWindow (ctx = {}) {
         }
 
         const t0 = performance.now();
-        const paint = () => {
+        paint = () => {
             if ( disposed || my_attempt !== attempt ) return;
             progress.render(computeBootUiState({
                 requestStatus: 'pending',
@@ -608,6 +615,18 @@ export async function openDesktopWindow (ctx = {}) {
      * `timed_out` failure reason.
      */
     function settle_display (my_attempt, url) {
+        // 🔴 Whatever the frame check left on the panel, the true statement for
+        // the next few seconds is "Connecting the display" — so put the live
+        // progress painting back. This matters on one real race: the server's
+        // own probe can refute a frame that the browser's re-ask then confirms
+        // a moment later, and without this the user would sit under "Your
+        // desktop isn't answering" for the whole display wait and then be
+        // handed a working desktop.
+        show_panel();
+        stop_timers();
+        tick_timer = setInterval(paint, TICK_MS);
+        paint();
+
         let asks = 0;
         /** Did we ever get an answer we UNDERSTOOD? Only this can yield `blank`. */
         let saw_wellformed = false;
