@@ -274,6 +274,22 @@ push('and the fresh URL is the one the SECOND call returned',
 // ═══════════════════════════════════════════════════════════════════════════
 // 5. FRAME HONESTY, BOTH DIRECTIONS, inside the shell.
 // ═══════════════════════════════════════════════════════════════════════════
+// 🔴 M16 (round 9 mutation pass): the checks below read `.hidden` — the IDL
+// property jsdom actually implements — as the oracle for "is the boot panel
+// down". That is exactly the property the round-6 regression class defeats:
+// an inline `style.display` set alongside `hidden = true` beats the UA's
+// `[hidden] { display: none }` in a REAL cascade, so the panel keeps
+// painting over a working iframe while `.hidden` still reads `true`. jsdom
+// has no cascade at all, so this file structurally CANNOT see that class of
+// bug either way (see this file's own header, "It cannot prove pixels") —
+// PROVEN: reintroducing that exact inline style (`el_unavailable.style.
+// display = 'flex'` in `code.js`) leaves this file's 32/32 unchanged.
+// That mutation IS caught, in a real browser, computed-style, by
+// `overlay-paint-browser-test.mjs` (3 failing checks, this exact scenario)
+// AND `stacking-browser-test.mjs`'s `checkContentPainted` (fails at every
+// viewport) — see the wave-g-t20 report for both runs. This file's jsdom
+// checks below are the fast wiring/ordering smoke test; those two are the
+// pixel oracle for this specific regression class, by design, not by gap.
 // Direction A: the browser fires `load`. That must NOT be what reveals the
 // frame — only the server's answer may.
 const progressA = win2?.querySelector('[data-kind]');
