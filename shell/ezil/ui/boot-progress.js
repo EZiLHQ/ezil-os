@@ -23,6 +23,7 @@ import {
     BOOT_PROGRESS_HEADLINE,
     BOOT_PROGRESS_LONG_SUBTEXT,
     BOOT_PROGRESS_SUBTEXT,
+    BOOT_UNVERIFIED_COPY,
     phaseVisualState,
 } from '../boot-phases.js';
 
@@ -128,12 +129,81 @@ export function BootProgress ({ onRetry } = {}) {
             return;
         }
 
-        // 'ready' — the caller is about to swap the iframe in over this
-        // panel. Leave the last frame in place rather than blanking it, so
-        // there is no white flash between the two.
+        // 'ready' and 'ready_unverified' — the caller is about to swap the
+        // iframe in over this panel. Leave the last frame in place rather than
+        // blanking it, so there is no white flash between the two.
+        //
+        // 🔴 The two are NOT the same to the user, and this file is not where
+        // the difference is drawn: `ready_unverified` means the desktop is
+        // shown but nothing checked it, and `DisplayNotice` below is what says
+        // so, on top of the frame. Rendering that text into a panel that is
+        // about to be hidden would be the same as not saying it.
     }
 
     return { el: root, render };
+}
+
+/**
+ * The `ready_unverified` surface: a small, EZiL-branded strip that sits ON TOP
+ * of a desktop that is being shown without having been checked.
+ *
+ * 🔴 WHY THIS EXISTS AT ALL. `ready_unverified` is what the display gate
+ * produces when it could not obtain an answer — Neko's session API refused our
+ * login, answered a shape we do not recognise, or did not answer. The desktop
+ * is still revealed, because hiding a desktop we have no evidence AGAINST would
+ * break every working desktop at once the moment that API changes. But
+ * revealing it silently would make "we could not check" and "we checked and it
+ * is fine" pixel-identical to the user, which is precisely the confusion this
+ * whole task exists to remove. So the difference is drawn here, in one strip,
+ * in EZiL's own voice.
+ *
+ * 🔴 NOT A TOAST. It does not auto-dismiss. A notice that disappears on a timer
+ * would be a claim retracted by a clock — the same class of lie as a checkmark
+ * drawn by one. It goes away when the user dismisses it, when they retry, or
+ * when the window is closed.
+ *
+ * @param {object} opts
+ * @param {() => void} opts.onRetry Re-runs the whole boot.
+ */
+export function DisplayNotice ({ onRetry } = {}) {
+    const root = document.createElement('div');
+    root.className = 'ezil-display-notice';
+    root.hidden = true;
+    // `alert`, not `status`: unlike the boot phases this is a single message
+    // the user has to be able to act on, and it appears over content they are
+    // otherwise being invited to treat as working.
+    root.setAttribute('role', 'alert');
+
+    root.innerHTML = `
+        <div class="ezil-display-notice-text">
+            <strong class="ezil-display-notice-title"></strong>
+            <span class="ezil-display-notice-body"></span>
+        </div>
+        <div class="ezil-display-notice-actions">
+            <button type="button" class="ezil-display-notice-retry">Try again</button>
+            <button type="button" class="ezil-display-notice-dismiss" aria-label="Dismiss">Dismiss</button>
+        </div>`;
+
+    root.querySelector('.ezil-display-notice-title').textContent = BOOT_UNVERIFIED_COPY.title;
+    root.querySelector('.ezil-display-notice-body').textContent = BOOT_UNVERIFIED_COPY.body;
+
+    const hide = () => { root.hidden = true; };
+
+    // Same `stopPropagation` rule as the Retry button above: these sit inside a
+    // `.window-body` and must not reach UIWindow's focus/drag handlers.
+    root.querySelector('.ezil-display-notice-retry').addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        hide();
+        if ( typeof onRetry === 'function' ) onRetry();
+    });
+    root.querySelector('.ezil-display-notice-dismiss').addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        hide();
+    });
+
+    return { el: root, show: () => { root.hidden = false; }, hide };
 }
 
 export default BootProgress;

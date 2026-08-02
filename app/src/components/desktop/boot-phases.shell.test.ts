@@ -203,7 +203,14 @@ describe('computeBootUiState — never fabricates progress', () => {
 
     it('invents no new failure copy for them — every reason still resolves to existing strings', () => {
         expect(Object.keys(BOOT_FAILURE_COPY).sort()).toEqual([
+            // 🔴 `display_not_streaming` is reachable ONLY through
+            // `applyDisplayEvidence`. It is deliberately absent from
+            // `classifyFailure`'s switch and from `BootErrorCode`, because the
+            // preview request cannot fail this way — the request succeeds and
+            // then no picture arrives. The sweep above proves the deterministic
+            // error codes still land on `unknown` rather than reaching for it.
             'desktop_unreachable',
+            'display_not_streaming',
             'sandbox_crashed',
             'timeout',
             'unknown',

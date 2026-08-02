@@ -31,6 +31,23 @@
  *      page, and `computeBootUiState` now requires it before it will say
  *      `ready`.
  *
+ * ── The fourth signal, added after `ready` was measured over a blank screen ──
+ * All three above are about REACHABILITY. None of them can see whether a
+ * single frame of video was ever decoded, and measured under WebKit the gap
+ * was total: the shell declared ready in 4.6s with `videoWidth: 0`,
+ * `paused: true`, `srcObject: false`, and the user got a third-party spinner
+ * under our checkmark. The browser cannot close it either — the desktop iframe
+ * is cross-origin, so the `<video>` element is unreadable from the parent by
+ * construction, not by difficulty.
+ *
+ *   4. Neko's own WebRTC bookkeeping, read server-side
+ *      (`probeDesktopDisplay`, reached here as `DisplayEvidence`). Neko flips a
+ *      per-session `is_watching` flag from its peer connection's `connected`
+ *      state change, so it is the far end of the same pipe whose near end we
+ *      are not allowed to look at. `applyDisplayEvidence` — deliberately a
+ *      SECOND gate rather than a fourth input to `computeBootUiState` — is
+ *      what turns it into UI.
+ *
  * Everything shown before those signals land is a TIME-BASED ESTIMATE,
  * anchored to the measured reference boot in PLATFORM-NOTES §11
  * (container_start ~0.3s, workspace_mount ~5.9s, desktop_ready_wait ~15.3s,
@@ -135,11 +152,18 @@ export interface BootNotConfiguredState {
  * stop at the handoff: the preview request succeeded, and then the desktop
  * origin itself either answered with an error status or did not answer. See
  * `computeBootUiState`'s `success` branch.
+ *
+ * `display_not_streaming` is the one added after the contract was found to stop
+ * one layer BELOW that: the desktop origin answered 200 and no pixels ever
+ * arrived. It is produced by `applyDisplayEvidence`, never by
+ * `classifyFailure` — there is no `BootErrorCode` for it, because the preview
+ * request cannot fail this way. See `applyDisplayEvidence`.
  */
 export type BootFailureReason =
     | 'worker_unreachable'
     | 'sandbox_crashed'
     | 'desktop_unreachable'
+    | 'display_not_streaming'
     | 'timeout'
     | 'unknown';
 
@@ -148,7 +172,44 @@ export interface BootFailureState {
     reason: BootFailureReason;
 }
 
-export type BootUiState = BootProgressState | BootReadyState | BootNotConfiguredState | BootFailureState;
+/**
+ * The desktop is on screen, and we could NOT determine whether it is showing
+ * anything.
+ *
+ * 🔴 This is not a softer `ready` and it is not a softer `failed`. It is the
+ * state of our knowledge, rendered. It exists because the two honest-looking
+ * alternatives are both dishonest:
+ *
+ *   - calling it `ready` is the exact lie the display gate was built to stop,
+ *     just relocated to the case where the gate itself could not run;
+ *   - calling it `failed` hides a desktop that is probably working perfectly,
+ *     on no evidence at all, and would do so for EVERY user at once the moment
+ *     a Neko bump renames a field. Same lie, sign flipped, and total.
+ *
+ * So the desktop is revealed, and the user is told plainly that we could not
+ * check it, with a way to retry. No checkmark is drawn and nothing anywhere
+ * reports this as live.
+ */
+export interface BootUnverifiedState {
+    kind: 'ready_unverified';
+}
+
+export type BootUiState =
+    | BootProgressState
+    | BootReadyState
+    | BootNotConfiguredState
+    | BootFailureState
+    | BootUnverifiedState;
+
+/**
+ * What was observed about pixels actually reaching the browser.
+ *
+ * Produced server-side by `probeDesktopDisplay`
+ * (`server/lib/cloudflare-guacamole-provider.ts`), which asks Neko whether any
+ * session's WebRTC peer is connected. Carried to the shell by
+ * `session.confirmDisplay`.
+ */
+export type DisplayEvidence = 'live' | 'blank' | 'unknown';
 
 /**
  * The error codes `requestGuacamolePreview` can genuinely produce, plus
@@ -283,6 +344,44 @@ export function computeBootUiState(input: ComputeBootUiStateInput): BootUiState 
     };
 }
 
+/**
+ * The SECOND gate: given what `computeBootUiState` decided, and what was
+ * observed about pixels arriving, decide what the user may be shown.
+ *
+ * ── Why this is a separate function and not another field on the input ──────
+ * `computeBootUiState` has resisted five separate attempts to make it show a
+ * checkmark it had not earned, and its `success` branch is the load-bearing
+ * part. Threading a fourth optional flag through it would put every one of
+ * those attacks back in play, and would also be WRONG for its other callers:
+ * the app-preview and code-server windows are HTML documents, where "the
+ * origin answered without an error status" genuinely is the whole question.
+ * Only the desktop is a video stream, and only the desktop needs this. So the
+ * desktop path composes two gates instead of one function growing a mode.
+ *
+ * ── Why there is no way to get `ready` out of this by omission ──────────────
+ * `'live'` is the ONLY input that returns `{ kind: 'ready' }`. `undefined`,
+ * `null`, `true`, `'LIVE'`, `1`, an object — every one of them is
+ * `ready_unverified`. A caller that forgets to thread the evidence therefore
+ * gets the "we did not check" state, which is exactly what has happened. There
+ * is no default-to-pass anywhere in here, which is the property that makes this
+ * safe to add to a contract already carrying the weight it does.
+ *
+ * ── It only ever DOWNGRADES ─────────────────────────────────────────────────
+ * A state that is not `ready` comes back untouched. Pixel evidence cannot
+ * rescue a boot that failed, cannot end a boot still in progress, and cannot
+ * conjure a desktop where no provider is configured. It can only take `ready`
+ * away.
+ *
+ * @param state the state `computeBootUiState` produced
+ * @param display what `session.confirmDisplay` observed, if anything
+ */
+export function applyDisplayEvidence(state: BootUiState, display: DisplayEvidence | undefined): BootUiState {
+    if (!state || state.kind !== 'ready') return state;
+    if (display === 'live') return { kind: 'ready' };
+    if (display === 'blank') return { kind: 'failed', reason: 'display_not_streaming' };
+    return { kind: 'ready_unverified' };
+}
+
 export type PhaseVisualState = 'upcoming' | 'current' | 'passed' | 'confirmed';
 
 /**
@@ -344,6 +443,15 @@ export const BOOT_FAILURE_COPY: Record<BootFailureReason, BootFailureCopy> = {
         title: "Your desktop isn't answering",
         body: "Your computer started, but we couldn't reach its display. This is usually temporary — try again.",
     },
+    // One layer below `desktop_unreachable`: the display DID answer, and then
+    // no picture came through it. The distinction is worth keeping because the
+    // remedies differ — that one is usually a route that will come back on its
+    // own, this one is usually the network between the user and the video
+    // stream. Neither blames the machine, because in both cases it is fine.
+    display_not_streaming: {
+        title: "Your desktop isn't coming through",
+        body: "Your computer is running, but its screen isn't reaching your browser. This is usually a network problem — try again, and if it keeps happening, let us know.",
+    },
     timeout: {
         title: 'This is taking too long',
         body: "Starting your computer is taking longer than it should. It may still come up in the background — try again.",
@@ -357,4 +465,17 @@ export const BOOT_FAILURE_COPY: Record<BootFailureReason, BootFailureCopy> = {
 export const BOOT_NOT_CONFIGURED_COPY: BootFailureCopy = {
     title: 'EZiL OS desktop',
     body: "This computer's desktop provider is not configured.",
+};
+
+/**
+ * `ready_unverified`. Says what we know and what we don't, in that order, and
+ * hands the judgement to the only party who can actually see the screen.
+ *
+ * 🔴 The word "ready" does not appear, and neither does anything green. This
+ * copy is the entire user-visible difference between "we checked" and "we
+ * couldn't check", so it may never be softened into reassurance.
+ */
+export const BOOT_UNVERIFIED_COPY: BootFailureCopy = {
+    title: "We couldn't check your display",
+    body: "Your desktop is here, but we couldn't confirm it's actually showing. If the screen is blank, try again.",
 };

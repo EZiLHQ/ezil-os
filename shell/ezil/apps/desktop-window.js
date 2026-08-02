@@ -59,6 +59,27 @@
 // the TRIGGER to ask (`session.confirmFrame`), never the answer. See
 // `settle_frame`.
 //
+// ── 🔴 NOR IS A CONFIRMED ORIGIN PROOF THAT PIXELS ARRIVED ──────────────────
+// The paragraph above closed one gap and stopped one layer short of the floor.
+// A Neko origin serves its SPA shell with a 200 whether or not WebRTC will ever
+// connect, so `confirmFrame` saying yes is entirely compatible with a blank
+// screen. Measured under WebKit: this window declared ready in **4.6s** while
+// the video element had `videoWidth: 0`, `paused: true`, `srcObject: false` —
+// and because the panel had already come down, what the user actually saw was
+// a bare third-party n.eko logo and spinner. No EZiL copy, no retry, no way to
+// tell whose product had failed. Half the harm was the vendor-branding leak.
+//
+// Reading `videoWidth` from here is not an option and never was: the iframe is
+// `8181-<sandbox>-nekodesktop.<zone>` inside this app's origin, so the document
+// is cross-origin and the video element is unreachable BY CONSTRUCTION. A
+// "check the video element" fix would throw or silently return nothing while
+// looking exactly like a check, which is worse than the bug.
+//
+// Neko itself knows, and the server can ask it — it flips a per-session
+// `is_watching` flag from its WebRTC peer's `connected` state change. So the
+// panel now comes down on THAT (`session.confirmDisplay` -> `settle_display`),
+// and `confirmFrame` joins `load` as a trigger rather than an answer.
+//
 // ── 🔴 The taskbar is hidden; the drawer is the only way out ────────────────
 // Once full-bleed, `enter_fullpage_mode` has hidden the taskbar AND the window
 // head, and `style.css:246` hides `.window-minimize-btn` in fullpage mode. So
@@ -68,8 +89,8 @@
 // a desktop they cannot leave. See `minimise_to_taskbar` below.
 
 import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
-import { computeBootUiState } from '../boot-phases.js';
-import BootProgress from '../ui/boot-progress.js';
+import { applyDisplayEvidence, computeBootUiState } from '../boot-phases.js';
+import BootProgress, { DisplayNotice } from '../ui/boot-progress.js';
 import attach_app_drawer from '../ui/app-drawer.js';
 import UIWindow from '../../src/UI/UIWindow.js';
 
@@ -98,6 +119,30 @@ const POLL_MS = 2_000;
 const FRAME_CONFIRM_FALLBACK_MS = 4_000;
 const FRAME_CONFIRM_ATTEMPTS = 3;
 const FRAME_CONFIRM_RETRY_MS = 1_500;
+
+/**
+ * The display gate (`settle_display`) — the answer to "did any pixel actually
+ * arrive", which `confirmFrame` above structurally cannot give.
+ *
+ * 🔴 NEITHER OF THESE PRODUCES A VERDICT. The deadline governs how long we keep
+ * ASKING; it never manufactures an answer, in either direction. A boot that
+ * reaches it without ever having obtained a well-formed observation is
+ * `unknown`, not `blank` — see `settle_display`.
+ *
+ * POLL: how often to re-ask. The first ask is immediate, so a desktop whose
+ * WebRTC peer is already connected by the time the frame confirms costs one
+ * round trip and nothing else.
+ *
+ * DEADLINE: how long a genuinely-connecting desktop is given. ICE gathering
+ * against STUN normally settles in well under a second and worst-cases around
+ * ten; 20s is comfortably past that, and it is only ever SPENT by a desktop
+ * that is failing — a healthy one releases the instant `live` lands. Erring
+ * long here is deliberate: the cost of being too generous is a slower failure
+ * panel, and the cost of being too tight is telling a user with a slow network
+ * that their working desktop is broken.
+ */
+const DISPLAY_POLL_MS = 1_000;
+const DISPLAY_DEADLINE_MS = 20_000;
 
 const MINIMISE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"'
     + ' stroke-linecap="round" aria-hidden="true"><line x1="5" y1="17" x2="19" y2="17"/></svg>';
@@ -282,6 +327,14 @@ export async function openDesktopWindow (ctx = {}) {
     const progress = BootProgress({ onRetry: () => { void start_boot(); } });
     el_body.appendChild(progress.el);
 
+    // The `ready_unverified` strip. Attached up front, hidden, for the same
+    // reason the drawer is: whether it CAN be shown must be settled before
+    // anything could need to show it. It is a sibling of the boot panel, not a
+    // child, because it outlives the panel — it is the one thing on screen
+    // once the desktop has been revealed without having been checked.
+    const notice = DisplayNotice({ onRetry: () => { void start_boot(); } });
+    el_body.appendChild(notice.el);
+
     /** Show the panel again (retry after a failure, or a fresh attempt). */
     const show_panel = () => { progress.el.hidden = false; };
 
@@ -326,6 +379,9 @@ export async function openDesktopWindow (ctx = {}) {
         const my_attempt = ++attempt;
         stop_timers();
         show_panel();
+        // A fresh attempt has established nothing yet, so last attempt's "we
+        // could not check" must not linger over it.
+        notice.hide();
         running_signal = undefined;
 
         if ( desktop_state.configured !== true ) {
@@ -382,19 +438,38 @@ export async function openDesktopWindow (ctx = {}) {
             return;
         }
 
-        console.info(`[${PHASE}] desktop ready in ${Math.round(performance.now() - t0)}ms`
+        console.info(`[${PHASE}] desktop URL in ${Math.round(performance.now() - t0)}ms`
             + ` (${Math.round(performance.now() - t_open)}ms since the window opened;`
             + ` frame confirmed server-side: ${res.frameConfirmed === true})`);
-        progress.render(computeBootUiState({
-            requestStatus: 'success',
-            elapsedMs: 0,
-            // 🔴 Not a constant, and not defaulted to true. `openDesktop`
-            // reports this only when the SERVER observed the desktop origin
-            // answering, before it handed the URL over. If it is false,
-            // `computeBootUiState` renders the failure panel instead of
-            // `ready` — see its `success` branch.
-            frameConfirmed: res.frameConfirmed,
-        }));
+
+        if ( res.frameConfirmed === true ) {
+            // 🔴 NOT `ready`, and this is the change the whole task turns on.
+            // The server has confirmed the desktop ORIGIN answers; nothing has
+            // yet seen a pixel, and until `settle_display` below obtains that,
+            // the true statement is the one the panel is already making —
+            // "Connecting the display". Rendering `ready` here would put
+            // `data-kind="ready"` on the panel while the screen may be blank,
+            // which is the claim being deferred.
+            //
+            // So the clock keeps running (the phase list stays live, and a slow
+            // boot still gets its "still working" copy) while the status poll
+            // is left stopped — `guacamoleRunning` has nothing further to say
+            // once the preview request itself has resolved.
+            tick_timer = setInterval(paint, TICK_MS);
+            paint();
+        } else {
+            // The server looked and did NOT see a desktop. Say so now rather
+            // than showing progress over it; `settle_frame` re-asks from the
+            // browser and can still overturn this.
+            progress.render(computeBootUiState({
+                requestStatus: 'success',
+                elapsedMs: 0,
+                // 🔴 Not a constant, and not defaulted to true. `openDesktop`
+                // reports this only when the SERVER observed the desktop origin
+                // answering, before it handed the URL over.
+                frameConfirmed: res.frameConfirmed,
+            }));
+        }
 
         // 🔴 The single navigation. Everything above had to have finished.
         el_iframe.src = res.url;
@@ -459,15 +534,20 @@ export async function openDesktopWindow (ctx = {}) {
             settled = true;
 
             if ( seen === true ) {
-                // 🔴 The one path to the viewport. "The panel is gone" and "the
-                // taskbar is gone" stay one decision, and that decision now
-                // rests on a real HTTP answer from the desktop's own origin.
-                progress.el.hidden = true;
-                go_fullbleed('frame confirmed by the server');
+                // 🔴 NO LONGER THE PATH TO THE VIEWPORT. It used to be, and
+                // that was the remaining hole: a confirmed ORIGIN is not a
+                // confirmed PICTURE. Measured under WebKit, this branch fired
+                // at 4.6s over `videoWidth: 0, paused: true, srcObject: false`
+                // and handed the user a third-party spinner full-screen.
+                //
+                // It is now the trigger for the second gate, which is the one
+                // that can actually end the boot. See `settle_display`.
+                settle_display(my_attempt, url);
                 return;
             }
 
             console.error(`[${PHASE}] the frame is not a desktop (confirmFrame -> ${String(seen)})`);
+            stop_timers();
             show_panel();
             progress.render(computeBootUiState({
                 requestStatus: 'success',
@@ -478,6 +558,123 @@ export async function openDesktopWindow (ctx = {}) {
 
         el_iframe.addEventListener('load', () => { void ask(); }, { once: true });
         setTimeout(() => { void ask(); }, FRAME_CONFIRM_FALLBACK_MS);
+    }
+
+    // ── the display gate ───────────────────────────────────────────────────
+    /**
+     * 🔴 READY NOW REQUIRES EVIDENCE THAT PIXELS ARRIVED.
+     *
+     * Everything the boot contract knew before this function ran was about
+     * REACHABILITY: the Worker registered a port, the container reports the
+     * desktop process up, the desktop origin answers HTTP without an error
+     * status. All three can be true of a completely blank screen, and measured
+     * under WebKit all three WERE true while the video element had
+     * `videoWidth: 0`, `paused: true` and no `srcObject` at all.
+     *
+     * The browser cannot close that gap. The desktop iframe is cross-origin, so
+     * `el_iframe.contentDocument` is null and `video.videoWidth` is not merely
+     * hard to reach but forbidden — an attempt throws or silently returns
+     * nothing, which is worse than not checking, because it LOOKS like a check.
+     *
+     * The server can, because Neko keeps the books. `session.confirmDisplay`
+     * asks it whether any session's WebRTC peer is connected, which is the far
+     * end of the very pipe whose near end we are not allowed to look at.
+     *
+     * Three outcomes, and the third is the one that took the most care:
+     *
+     *   live    — panel down, viewport handed over. The only path to `ready`.
+     *
+     *   blank   — a real, WELL-FORMED observation that nobody is watching,
+     *             still true at the deadline. EZiL's own failure copy and a
+     *             Retry, in a window on a usable OS. Crucially the user is told
+     *             whose product failed and what to do, instead of being left
+     *             staring at a vendor logo and a spinner.
+     *
+     *   unknown — we never got an answer we understood. The desktop is still
+     *             revealed, because refusing to show a desktop we have no
+     *             evidence AGAINST would break every working desktop at once
+     *             the moment Neko renames a field — the same lie, sign
+     *             flipped, and total. But it is NOT called ready: the
+     *             `ready_unverified` strip says plainly that we could not
+     *             check, and offers the retry.
+     *
+     * 🔴 `unknown` NEVER BECOMES `blank`. A failure panel is shown only when we
+     * positively observed a session list with no watcher in it. Not answering
+     * is a fact about our plumbing, never about the user's screen.
+     *
+     * 🔴 THE DEADLINE DOES NOT DECIDE ANYTHING. It bounds how long we keep
+     * asking. The verdict at the deadline is whatever was actually established
+     * along the way — which is why `saw_wellformed` exists rather than a
+     * `timed_out` failure reason.
+     */
+    function settle_display (my_attempt, url) {
+        let asks = 0;
+        /** Did we ever get an answer we UNDERSTOOD? Only this can yield `blank`. */
+        let saw_wellformed = false;
+        const t_display = performance.now();
+
+        // The first gate's verdict, run for real rather than assumed — the two
+        // gates compose, and `applyDisplayEvidence` can only ever take this
+        // `ready` away, never manufacture one.
+        const frame_state = computeBootUiState({
+            requestStatus: 'success',
+            elapsedMs: 0,
+            frameConfirmed: true,
+        });
+
+        const finish = (evidence, why) => {
+            if ( disposed || my_attempt !== attempt ) return;
+            stop_timers();
+            const state = applyDisplayEvidence(frame_state, evidence);
+            progress.render(state);
+
+            if ( state.kind === 'failed' ) {
+                show_panel();
+                return;
+            }
+
+            // `ready` or `ready_unverified`: the desktop is shown either way.
+            progress.el.hidden = true;
+            if ( state.kind === 'ready_unverified' ) notice.show();
+            go_fullbleed(why);
+        };
+
+        const ask = async () => {
+            if ( disposed || my_attempt !== attempt ) return;
+            asks++;
+            const seen = await session.confirmDisplay(computer.id, url);
+            if ( disposed || my_attempt !== attempt ) return;
+
+            if ( seen === 'live' ) {
+                console.info(`[${PHASE}] the display is streaming`
+                    + ` (+${Math.round(performance.now() - t_display)}ms after the frame confirmed,`
+                    + ` ${asks} ask(s))`);
+                finish('live', 'the display was observed streaming');
+                return;
+            }
+            // 'blank' is a real answer and 'unknown' is not — but neither ends
+            // the wait on its own. A desktop that has only just been navigated
+            // to has not had time to negotiate WebRTC, so an early `blank` is
+            // expected and means nothing yet.
+            if ( seen === 'blank' ) saw_wellformed = true;
+
+            if ( performance.now() - t_display < DISPLAY_DEADLINE_MS ) {
+                setTimeout(() => { void ask(); }, DISPLAY_POLL_MS);
+                return;
+            }
+
+            if ( saw_wellformed ) {
+                console.error(`[${PHASE}] nothing is watching this desktop after`
+                    + ` ${Math.round(performance.now() - t_display)}ms (${asks} asks) — no pixels reached the browser`);
+                finish('blank', 'never used — blank does not reveal');
+                return;
+            }
+            console.warn(`[${PHASE}] could not determine whether the display is streaming`
+                + ` (${asks} asks, none understood) — showing it UNVERIFIED`);
+            finish('unknown', 'display could not be verified');
+        };
+
+        void ask();
     }
 
     // ── minimise ───────────────────────────────────────────────────────────

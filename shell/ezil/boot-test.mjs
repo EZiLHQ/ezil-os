@@ -108,6 +108,7 @@ let release_preview;
 const preview_gate = new Promise((r) => { release_preview = r; });
 
 let guac_running = false;   // flipped mid-test to prove the confirmed path
+let display_answer = 'live';  // flipped by the mutation proofs at the end
 {
     const { window, seen } = boot_shell(async (url, init) => {
         if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
@@ -130,6 +131,12 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
         // `confirmFrame` sees no `confirmed` field, reads it as "no answer",
         // and the shell correctly refuses to hand over the viewport.
         if (url.includes('confirm=frame')) return { ok: true, confirmed: true };
+        // 🔴 The SECOND gate, and the same ordering rule for the same reason.
+        // `display_answer` is a module-level let so the mutation proofs further
+        // down can flip it without forking this handler: 'live' is the only
+        // value that may retire the panel, 'blank' must produce EZiL's own
+        // failure copy, and anything else must produce `ready_unverified`.
+        if (url.includes('confirm=display')) return { ok: true, display: display_answer };
         if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: guac_running };
         return { ok: true };
     });
@@ -262,8 +269,15 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
     release_preview();
     const swapped = await until(() => iframe.getAttribute('src') === URL_OK);
     push('🔴 iframe is navigated only after previewUrl RESOLVED', !!swapped, iframe.getAttribute('src'));
-    push('panel reports ready', $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'ready');
-    push('and the taskbar is STILL there — the frame has not loaded yet',
+    // 🔴 NOT `ready`. A resolved preview request plus a server-side frame
+    // confirmation is REACHABILITY, and reachability is exactly what was true
+    // on the 4.6s WebKit boot that reported ready over `videoWidth: 0`. Until
+    // `confirm=display` answers, the honest thing on screen is the phase list,
+    // still saying "Connecting the display" — which it is.
+    push('🔴 a resolved preview + confirmed origin is NOT yet "ready"',
+        $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'progress',
+        $1(window, '.ezil-boot')?.getAttribute('data-kind'));
+    push('and the taskbar is STILL there — no pixel has been seen yet',
         window.$('.taskbar').css('display') !== 'none', window.$('.taskbar').css('display'));
 
     // ── the handoff: the desktop earns the viewport ────────────────────────
@@ -275,9 +289,18 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
     const asked = await until(() => seen.some(r => r.url.includes('confirm=frame')), 2000);
     push('🔴 `load` only triggers the QUESTION — the server is asked first', !!asked,
         JSON.stringify(seen.filter(r => r.url.includes('confirm=')).map(r => `${r.method} ${r.url}`)));
-    const fullbled = await until(() => win.classList.contains('ezil-fullbleed'), 2000);
-    push('🔴 full-bleed happens when the DESKTOP FRAME lands, not before', !!fullbled,
+    const asked_display = await until(() => seen.some(r => r.url.includes('confirm=display')), 2000);
+    push('🔴 a confirmed origin only triggers the SECOND question — did pixels arrive?',
+        !!asked_display,
+        JSON.stringify(seen.filter(r => r.url.includes('confirm=')).map(r => `${r.method} ${r.url}`)));
+    const fullbled = await until(() => win.classList.contains('ezil-fullbleed'), 3000);
+    push('🔴 full-bleed happens when the DISPLAY is observed streaming, not before', !!fullbled,
         win.className);
+    push('and the panel says ready only now', $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'ready',
+        $1(window, '.ezil-boot')?.getAttribute('data-kind'));
+    push('🔴 no "we could not check" strip on a desktop we DID check',
+        $1(window, '.ezil-display-notice')?.hidden === true,
+        String($1(window, '.ezil-display-notice')?.hidden));
     push('...and only then is the taskbar hidden (the reason the drawer exists)',
         window.$('.taskbar').css('display') === 'none', window.$('.taskbar').css('display'));
     push('the panel is retired in the same beat, so chrome is never traded for nothing',
@@ -415,6 +438,7 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
             };
         }
         if (url.includes('confirm=frame')) return { ok: true, confirmed: true };
+        if (url.includes('confirm=display')) return { ok: true, display: 'live' };
         if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
         return { ok: true };
     }, PAYLOAD, OS_BODY);
@@ -500,6 +524,143 @@ let guac_running = false;   // flipped mid-test to prove the confirmed path
     const rewin = await until(() => $1(window, '.window[data-app="desktop"]'));
     push('the desktop window is back too', !!rewin);
     push('and exactly one of them is open', $$(window, '.window[data-app="desktop"]').length === 1);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenarios 6 and 7 — THE MUTATION PROOFS FOR THE DISPLAY GATE
+//
+// Scenario 1 proved the gate opens. On its own that is worth almost nothing:
+// a gate that always opens passes it too, and "always open" is precisely the
+// bug being fixed — the old contract was a gate that always opened, and it
+// passed every test it had. So the same shell, driven the same way, must be
+// shown to REFUSE, and to refuse differently for the two different reasons.
+//
+// The mutation is a single stubbed value, `display_answer`, which is exactly
+// what `probeDesktopDisplay` returns after reading Neko's session list:
+//
+//   'blank'   — Neko answered, and no session's WebRTC peer is connected.
+//               This is the measured production failure: HTTP 200 from the
+//               desktop origin, and `videoWidth: 0, paused: true,
+//               srcObject: false` in the frame. The user MUST get EZiL's own
+//               failure copy and a Retry — not a third-party spinner.
+//   undefined — the shape came back unreadable (a Neko bump, a refused login).
+//               We know nothing. The desktop is shown, because refusing to
+//               show a desktop we have no evidence AGAINST would break every
+//               working desktop at once — but it is NOT called ready.
+//
+// 🔴 `DISPLAY_DEADLINE_MS` is 20s in `desktop-window.js`, and these scenarios
+// wait it out for real rather than shortening it. A gate whose deadline the
+// test controls is a gate the test can be wrong about.
+// ───────────────────────────────────────────────────────────────────────────
+const DEADLINE_WAIT_MS = 26_000;
+
+/**
+ * Boot a shell whose `confirm=display` always answers `answer`, drive it to the
+ * point where the display gate is the only thing left, and return the window.
+ * Everything upstream of the gate SUCCEEDS — the preview request, the
+ * server-side frame confirmation, the browser-side one — so the only thing
+ * these scenarios can be measuring is the gate itself.
+ */
+async function boot_to_display_gate (answer) {
+    const { window, seen } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            return {
+                ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko',
+                frame: { confirmed: true },
+            };
+        }
+        if (url.includes('confirm=frame')) return { ok: true, confirmed: true };
+        // `answer === undefined` leaves the field off entirely, which is what a
+        // server that could not read Neko's answer actually sends.
+        if (url.includes('confirm=display')) return { ok: true, display: answer };
+        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
+        return { ok: true };
+    });
+    const iframe = await until(() => $1(window, '.window[data-app="desktop"] .window-app-iframe'));
+    await until(() => iframe?.getAttribute('src') === URL_OK);
+    iframe.dispatchEvent(new window.Event('load'));
+    await until(() => seen.some(r => r.url.includes('confirm=display')), 4000);
+    return { window, seen };
+}
+
+// ── Scenario 6 — video never decodes: the honest failure, never "ready" ─────
+{
+    const { window, seen } = await boot_to_display_gate('blank');
+    const win = $1(window, '.window[data-app="desktop"]');
+
+    // It does not give up on the first `blank`: a frame that has only just been
+    // navigated to has not had time to negotiate WebRTC yet.
+    await sleep(3_000);
+    push('🔴 an early "blank" is not a verdict — it keeps asking',
+        $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'progress'
+        && seen.filter(r => r.url.includes('confirm=display')).length >= 2,
+        `kind=${$1(window, '.ezil-boot')?.getAttribute('data-kind')}`
+        + ` asks=${seen.filter(r => r.url.includes('confirm=display')).length}`);
+
+    const failed_panel = await until(
+        () => $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'failed', DEADLINE_WAIT_MS);
+    push('🔴 video that never decodes ends in a FAILURE, not a ready desktop',
+        !!failed_panel, $1(window, '.ezil-boot')?.getAttribute('data-kind'));
+
+    const title = $1(window, '.ezil-boot-title')?.textContent ?? '';
+    const body = $1(window, '.ezil-boot-sub')?.textContent ?? '';
+    push('🔴 and it is EZiL copy, in EZiL words — not a vendor spinner',
+        title === "Your desktop isn't coming through"
+        && body.includes("its screen isn't reaching your browser"),
+        `${title} / ${body}`);
+    push('🔴 with a Retry the user can actually act on',
+        $1(window, '.ezil-boot-actions')?.hidden === false
+        && !!$1(window, '.ezil-boot-retry'));
+    push('🔴 the panel is still UP — the blank frame is never revealed',
+        $1(window, '.ezil-boot')?.hidden === false, String($1(window, '.ezil-boot')?.hidden));
+    push('🔴 the viewport was never handed over',
+        !win.classList.contains('ezil-fullbleed'), win.className);
+    push('...so the taskbar is still there and the OS is still usable',
+        window.$('.taskbar').css('display') !== 'none', window.$('.taskbar').css('display'));
+    push('the phase list is hidden, as it is for every other failure',
+        $1(window, '.ezil-boot-phases')?.hidden === true);
+    push('🔴 no checkmark survived into the failure',
+        $$(window, '.ezil-boot-phase[data-state="confirmed"]').length === 0);
+
+    // Retry must re-run the WHOLE boot, not just the gate.
+    const posts_before = seen.filter(r => r.method === 'POST').length;
+    window.$($1(window, '.ezil-boot-retry')).trigger('click');
+    const retried = await until(() => seen.filter(r => r.method === 'POST').length > posts_before, 4000);
+    push('Retry re-runs the whole boot', !!retried,
+        `${posts_before} -> ${seen.filter(r => r.method === 'POST').length} POSTs`);
+    await window.$(win).close();
+}
+
+// ── Scenario 7 — we cannot tell: shown, but never called ready ──────────────
+{
+    const { window } = await boot_to_display_gate(undefined);
+    const win = $1(window, '.window[data-app="desktop"]');
+
+    const revealed = await until(() => win.classList.contains('ezil-fullbleed'), DEADLINE_WAIT_MS);
+    push('🔴 an unanswerable probe still REVEALS the desktop (no regression)',
+        !!revealed, win.className);
+    push('the boot panel is retired, so the desktop is genuinely usable',
+        $1(window, '.ezil-boot')?.hidden === true);
+
+    const notice = $1(window, '.ezil-display-notice');
+    push('🔴 but the user is TOLD we could not check it', notice?.hidden === false,
+        `notice hidden=${String(notice?.hidden)}`);
+    push('🔴 in EZiL copy that never says "ready"',
+        $1(window, '.ezil-display-notice-title')?.textContent === "We couldn't check your display"
+        && ($1(window, '.ezil-display-notice-body')?.textContent ?? '')
+            .includes("couldn't confirm it's actually showing"),
+        `${$1(window, '.ezil-display-notice-title')?.textContent}`);
+    push('🔴 with its own Retry', !!$1(window, '.ezil-display-notice-retry'));
+    push('the panel itself never claimed ready either',
+        $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'ready_unverified',
+        $1(window, '.ezil-boot')?.getAttribute('data-kind'));
+    push('and the notice does not cover the desktop it is annotating',
+        notice?.className === 'ezil-display-notice', notice?.className);
+
+    window.$($1(window, '.ezil-display-notice-dismiss')).trigger('click');
+    push('dismissing it leaves the desktop alone',
+        notice?.hidden === true && win.classList.contains('ezil-fullbleed'));
+    await window.$(win).close();
 }
 
 // ───────────────────────────────────────────────────────────────────────────
