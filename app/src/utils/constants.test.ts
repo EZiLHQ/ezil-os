@@ -40,10 +40,29 @@ describe('safeReturnUrl', () => {
         expect(safeReturnUrl('\t//evil.example')).toBe(Routes.COMPUTERS);
     });
 
-    it('falls back for anything absent or empty, rather than throwing', () => {
-        expect(safeReturnUrl(undefined)).toBe(Routes.COMPUTERS);
-        expect(safeReturnUrl(null)).toBe(Routes.COMPUTERS);
-        expect(safeReturnUrl('')).toBe(Routes.COMPUTERS);
+    /**
+     * 🔴 Two DIFFERENT fallbacks, deliberately. An absent `returnUrl` is an
+     * ordinary sign-in with nothing to reject, and lands on `Routes.OS` — the
+     * product's entry point. A `returnUrl` that WAS supplied but is malformed
+     * (not absent — present and wrong) is treated as anomalous and lands on
+     * the more conservative `Routes.COMPUTERS`, not the shell.
+     *
+     * Both directions: flip the first branch's `Routes.OS` back to
+     * `Routes.COMPUTERS` and this test goes red (login stops landing in the
+     * OS by default). Delete the branch split entirely (route everything
+     * through one fallback) and either this test or the malformed-input test
+     * below goes red, because the two groups no longer disagree.
+     */
+    it('🔴 an absent or empty returnUrl lands on the OS — the default entry point', () => {
+        expect(safeReturnUrl(undefined)).toBe(Routes.OS);
+        expect(safeReturnUrl(null)).toBe(Routes.OS);
+        expect(safeReturnUrl('')).toBe(Routes.OS);
+        // No value survived the repeated-param collapse below either.
+        expect(safeReturnUrl([])).toBe(Routes.OS);
+    });
+
+    it('a returnUrl that was supplied but is malformed lands on /computers, not the OS', () => {
+        // Present, but not a path at all — different from "nothing supplied".
         expect(safeReturnUrl('relative/path')).toBe(Routes.COMPUTERS);
     });
 
@@ -51,7 +70,6 @@ describe('safeReturnUrl', () => {
         // `?returnUrl=/os&returnUrl=https://evil.example` must not widen.
         expect(safeReturnUrl(['/os', 'https://evil.example'])).toBe('/os');
         expect(safeReturnUrl(['https://evil.example', '/os'])).toBe(Routes.COMPUTERS);
-        expect(safeReturnUrl([])).toBe(Routes.COMPUTERS);
     });
 
     it('round-trips with the builder that produces these links', () => {

@@ -29,8 +29,9 @@ async function siteOrigin(): Promise<string> {
 }
 
 /**
- * Email/password sign-in. Hands `returnUrl` (or `/computers`) back to the
- * caller instead of navigating there itself.
+ * Email/password sign-in. Hands `returnUrl` (or `/os`, the default entry
+ * point — see `safeReturnUrl`) back to the caller instead of navigating there
+ * itself.
  *
  * ── 🔴 WHY THIS DOES NOT CALL `redirect()` ──────────────────────────────────
  * It used to. `redirect()` inside a server action is not an HTTP redirect: the
