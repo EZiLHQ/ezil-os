@@ -120,6 +120,35 @@ let mount_attempts = 0;
 let current_apps = [];
 let current_ctx = null;
 let start_click_bound = false;
+/**
+ * 🔴 THE LAUNCHER TOGGLE. The Start button's menu had no state at all: every
+ * `ezil:start-click` unconditionally called `UIContextMenu(...)`, which is a
+ * stateless factory that always appends a fresh `.context-menu` — it has no
+ * notion of "one already exists for this caller" (unlike, say,
+ * `UITaskbarItem`'s own right-click menu, which checks `has-open-contextmenu`
+ * on its anchor first). OBSERVED in a real browser (Playwright, headless
+ * Chromium): three Start clicks in a row against the built bundle produced 1,
+ * then 2, then 3 `.context-menu` elements in the DOM — never 0, and never
+ * fewer than the click count. That is "spawns one more on top of it," in the
+ * owner's own words, not a stale-flag or double-binding bug: `start_click_bound`
+ * above already guards against the LISTENER being attached twice (verified by
+ * reading `mount`'s rebuild path), and there is only one `open_start_menu`
+ * call site. The defect is the total absence of a toggle: nothing ever
+ * remembers that a menu is already open, so nothing ever tells the second
+ * click to close it instead of opening a second one.
+ *
+ * `start_menu` holds the currently-open menu's controller (`UIContextMenu`'s
+ * return value), its DOM node (for outside-click detection) and the anchor
+ * element (`aria-expanded`, and so outside-click detection does not treat a
+ * click on the TOGGLE BUTTON itself as "outside" — that click is the toggle's
+ * own job, handled by the listener below, not a dismiss-and-reopen).
+ * `null` whenever no Start menu is open, by ANY closing path (toggle-click,
+ * outside-click, Escape, or picking an item) — `close_start_menu` and the
+ * `onClose` wired in `open_start_menu` are the only two writers, and both set
+ * it to `null` before doing anything else, so nothing can observe a half-torn-
+ * down menu as "open".
+ */
+let start_menu = null;
 /** Watches for the desktop being removed from the document. */
 let removal_observer = null;
 
@@ -275,10 +304,29 @@ function mount_desktop_root () {
 }
 
 /**
+ * Tears down whatever `start_menu` currently points at, however it needs to
+ * go: the toggle-click path wants it gone SYNCHRONOUSLY (so a click landing a
+ * beat later sees a clean "closed" state, not a menu still mid-fade), so this
+ * always cancels with `fade: false`. `UIContextMenu`'s own `remove` handler
+ * fires `onClose` regardless of which path removed the node, and that is what
+ * actually clears `start_menu` and `aria-expanded` (see `open_start_menu`) —
+ * so calling this when nothing is open, or twice in a row, is harmless.
+ */
+function close_start_menu () {
+    start_menu?.handle?.cancel?.({ fade: false });
+}
+
+/**
  * The Start button's menu. Upstream opened a 500x500 popover backed by
  * `puter.apps` (recents, recommendations, search, drag-to-pin). There is no
  * app store to query, so this lists exactly what `registry.resolve()` returned
  * — today, one thing — using the ported context menu.
+ *
+ * 🔴 THE TOGGLE. Callers must check `start_menu` themselves before calling
+ * this (the `ezil:start-click` listener below does) — this function's job is
+ * only to open one and remember it, never to decide whether one should be
+ * open. See the `start_menu` doc comment (top of file) for the mechanism this
+ * closes: `UIContextMenu` itself has no concept of "already open."
  */
 function open_start_menu (apps, ctx, el_anchor) {
     const items = apps.map(app => ({
@@ -293,13 +341,50 @@ function open_start_menu (apps, ctx, el_anchor) {
     if ( items.length === 0 ) items.push({ html: 'Nothing to open', disabled: true });
 
     const rect = el_anchor?.getBoundingClientRect?.();
-    UIContextMenu({
+    const handle = UIContextMenu({
         items,
         // Above the dock, left-aligned to the button. The context menu clamps
         // itself to the viewport, so a bad rect degrades to a visible menu
         // rather than one off-screen.
         position: rect ? { top: rect.top - 8, left: rect.left } : undefined,
     });
+
+    // `UIContextMenu` appends its element to `<body>` synchronously (before
+    // returning) and never reorders `.context-menu` nodes, so the LAST
+    // top-level one in the DOM at this exact point is the one it just
+    // created — even if a different, unrelated context menu (a taskbar item's
+    // right-click) happens to already be open elsewhere. `:not([data-is-submenu])`
+    // excludes submenus, which this call cannot have produced (no `items`
+    // here nests further items).
+    const menus = document.querySelectorAll('.context-menu:not([data-is-submenu="true"])');
+    const el = menus[menus.length - 1] ?? null;
+
+    const on_outside_mousedown = (e) => {
+        if ( el?.contains(e.target) ) return;
+        if ( el_anchor?.contains?.(e.target) ) return; // the toggle button's own job, not "outside"
+        close_start_menu();
+    };
+    const on_keydown = (e) => {
+        if ( e.key === 'Escape' ) close_start_menu();
+    };
+    // Capture phase: this must see the click BEFORE anything inside the menu
+    // (an item's own click handler) has a chance to stop its propagation.
+    document.addEventListener('mousedown', on_outside_mousedown, true);
+    document.addEventListener('keydown', on_keydown, true);
+
+    el_anchor?.setAttribute?.('aria-expanded', 'true');
+
+    start_menu = { handle, el, anchor: el_anchor };
+    // Fires on ANY removal of `el` — an item click (`fade_remove`), the
+    // toggle-close path above (`cancel({fade:false})` -> `remove()`), or a
+    // future caller of `.cancel()` this file does not yet have. Whichever it
+    // is, the menu is gone and the state above must say so, exactly once.
+    handle.onClose = () => {
+        document.removeEventListener('mousedown', on_outside_mousedown, true);
+        document.removeEventListener('keydown', on_keydown, true);
+        el_anchor?.setAttribute?.('aria-expanded', 'false');
+        start_menu = null;
+    };
 }
 
 /**
@@ -377,9 +462,21 @@ async function build (payload) {
     // Bound ONCE, whatever happens afterwards: a rebuild that re-bound it
     // would open one Start menu per rebuild. It reads the current app list
     // from module state instead of closing over this call's copy.
+    //
+    // 🔴 THE TOGGLE ITSELF. `start_menu` is truthy iff a menu this listener
+    // opened is still in the DOM (see its doc comment, top of file). A second
+    // click while it is open CLOSES it — it must not also open a new one, or
+    // every click after the first would leave two menus fighting for the same
+    // spot. Every other closing path (outside-click, Escape, picking an item)
+    // clears `start_menu` through the exact same `onClose` this file wires in
+    // `open_start_menu`, so this check is never looking at stale state.
     if ( ! start_click_bound ) {
         start_click_bound = true;
         window.addEventListener('ezil:start-click', (e) => {
+            if ( start_menu ) {
+                close_start_menu();
+                return;
+            }
             open_start_menu(current_apps, current_ctx, e.detail?.element);
         });
     }
