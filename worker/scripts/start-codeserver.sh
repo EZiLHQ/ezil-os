@@ -17,10 +17,25 @@
 # captured by the same software video encoder as the native browser, plus its
 # own extension host — the two must never coexist (see start-neko.sh and the
 # Dockerfile). code-server is a plain HTTP server; it renders nothing into
-# Xvfb and is never part of the neko/WebRTC desktop stream. Its only inbound
-# path is loopback, reached by the existing HMAC/cookie-gated containerFetch
-# proxy — this is why --bind-addr is 127.0.0.1 and never 0.0.0.0, and why
-# --auth none is safe here.
+# Xvfb and is never part of the neko/WebRTC desktop stream.
+#
+# 🔴 --bind-addr is 0.0.0.0, NOT 127.0.0.1. An earlier version of this file
+# bound loopback-only on the premise that "the only inbound path is the
+# containerFetch proxy, so loopback is enough". That premise is wrong about
+# how the platform actually reaches a container: Cloudflare's proxy connects
+# to the container's ROUTABLE address (observed: 10.0.0.1:8443), never to its
+# loopback. Bound to 127.0.0.1, code-server listens happily and every proxied
+# request dies with `The container is not listening in the TCP address
+# 10.0.0.1:8443` — the process is up, the port is open, and nothing can reach
+# it. `start-neko.sh` already had this right for neko:
+#     NEKO_SERVER_BIND="0.0.0.0:${NEKO_HTTP_PORT}"   # so proxyToSandbox() can reach it
+#
+# Why --auth none stays safe: the container's network is not publicly
+# routable. The ONLY way in is the Worker's `*-code.ezil.org` bridge host,
+# which is HMAC/cookie-gated before it ever calls containerFetch. Binding
+# 0.0.0.0 widens reachability inside an already-sealed network boundary, not
+# outside it. Do not "harden" this back to loopback — it does not add a
+# boundary, it only breaks the one client that exists.
 #
 # Output contract (unchanged from the reference):
 #   stdout:  one of `already-running`, `started`, `failed`
@@ -58,7 +73,7 @@ rm -f "$PID_FILE"
 # Keep auth none because the daemon is already HMAC-gated behind the
 # containerFetch proxy; bind to loopback only — never 0.0.0.0.
 nohup code-server \
-    --bind-addr 127.0.0.1:${PORT} \
+    --bind-addr 0.0.0.0:${PORT} \
     --auth none \
     --disable-telemetry \
     --user-data-dir=/tmp/code-server-data \
