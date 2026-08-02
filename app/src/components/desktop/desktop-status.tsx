@@ -85,11 +85,24 @@ export function useReportDesktopStatus(status: DesktopSurfaceStatus) {
  *   has computed one at all.
  */
 export function desktopSurfaceStatus(
-    kind: 'progress' | 'ready' | 'not_configured' | 'failed' | undefined,
+    kind: 'progress' | 'ready' | 'not_configured' | 'failed' | 'ready_unverified' | undefined,
 ): DesktopSurfaceStatus {
     switch (kind) {
         case 'ready':
             return 'live';
+        // 🔴 The desktop is on screen and NOBODY CHECKED IT. Deliberately not
+        // `live` — that is the entire point of the state — and deliberately not
+        // `down` either, because nothing observed a failure. "Checking" is the
+        // literal truth: our knowledge of this desktop never got past checking.
+        //
+        // `/computer/[id]` does not thread display evidence today, so this
+        // canvas cannot currently produce this kind; only the `/os` shell can
+        // (`settle_display` in `shell/ezil/apps/desktop-window.js`). It is
+        // mapped anyway rather than left to the `default`, so that wiring the
+        // evidence in here later is a one-line change that cannot silently
+        // land on the wrong pill.
+        case 'ready_unverified':
+            return 'checking';
         case 'progress':
             return 'starting';
         case 'failed':

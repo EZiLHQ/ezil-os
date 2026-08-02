@@ -33,6 +33,17 @@ import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/sh
  *                          iframe's `load` event fires for both. Also cheap —
  *                          one GET to an edge hostname, no Worker call, no
  *                          container wake.
+ *   GET  ?computerId=...&confirm=display&frameUrl=...
+ *                        — the question UNDERNEATH that one: is the desktop
+ *                          delivering pixels to a browser? Asks Neko's own
+ *                          session bookkeeping whether a WebRTC peer is
+ *                          connected. Measured under WebKit, `confirm=frame`
+ *                          said yes while the video element had
+ *                          `videoWidth: 0` and no `srcObject`, and the shell
+ *                          went ready over a blank screen. Answers
+ *                          `live`/`blank`/`unknown` — see `confirmDisplay`.
+ *                          Two small JSON round trips to the same edge
+ *                          hostname; no Worker call, no container wake.
  *   POST { computerId }  — the long one. Starts/attaches the desktop and
  *                          resolves only at the end, success or a specific
  *                          error.
@@ -74,6 +85,15 @@ export async function GET(req: Request) {
                 frameUrl: params.get('frameUrl') ?? '',
             });
             return shellJson({ ok: true, ...confirmation });
+        }
+
+        if (params.get('confirm') === 'display') {
+            // Same pin, same forwarding rule. See `confirmDisplay`.
+            const observation = await caller.cloudflareGuacamole.confirmDisplay({
+                computerId,
+                frameUrl: params.get('frameUrl') ?? '',
+            });
+            return shellJson({ ok: true, ...observation });
         }
 
         const status = await caller.cloudflareGuacamole.status({ computerId });

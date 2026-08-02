@@ -255,6 +255,71 @@ only the server does, by fetching the origin itself. Anything that claims
 observation. See `probeDesktopFrame` / `confirmFrame` and
 `computeBootUiState`'s `success` branch.
 
+## 16b. A 200 from the desktop origin is still not a picture — ask Neko, not the iframe
+
+§16 closed the gap between "the Worker registered a port" and "the origin
+serves". Measured under WebKit, the layer below it was still wide open: the
+shell declared **ready in 4.6s** while the frame's video element reported
+`videoWidth: 0`, `paused: true`, `srcObject: false`. Neko serves its SPA shell
+with a **200 whether or not WebRTC will ever connect**, so `probeDesktopFrame`
+was correct and the screen was blank. Because the boot panel had already come
+down, what the user saw was a bare third-party **n.eko logo and spinner** — no
+EZiL copy, no retry, no way to tell whose product had failed.
+
+**The browser cannot supply the missing signal, and this is not a difficulty —
+it is the same-origin policy.** The desktop iframe is
+`8181-<sandbox>-nekodesktop.<zone>` inside the app origin, so
+`contentDocument` is `null` and `video.videoWidth` is unreachable. A fix that
+"checks the video element" throws or silently returns nothing *while looking
+exactly like a check*, which is worse than not checking.
+
+**Injecting a reporter into the frame is not available either**, and the reason
+is structural rather than stylistic. `parseBridgeHost`
+(`worker/src/preview-bridge.ts`) accepts only ports **3002** and **8443**; port
+8181 falls through to the SDK's raw `proxyToSandbox`, so `injectRuntimeShim` —
+whose single call site is inside `handlePreviewProxy` — never sees a desktop
+response. Moving the desktop behind the bridge proxy to change that would hand
+our own proxy Neko's **WebSocket**, which is its WebRTC *signalling* channel,
+and this repo already has that scar: wrapping code-server's non-HMR socket
+"breaks the extension host immediately and silently (it just never connects)".
+
+**Neko keeps the books itself.** In the pinned build (`neko=d74052bb`,
+2026-06-14) `GET /api/sessions` returns
+`[{ id, profile, state: { is_connected, is_watching, ... } }]`, and
+`state.is_watching` has exactly one writer:
+
+```go
+// internal/webrtc/manager.go
+connection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+    switch state {
+    case webrtc.PeerConnectionStateConnected:
+        session.SetWebRTCConnected(peer, true)   // -> state.IsWatching = true
+```
+
+So `is_watching: true` means a real browser `RTCPeerConnection` reached
+`connected` and Neko is pushing media into it — the far end of the pipe whose
+near end we may not look at. No new container surface was needed:
+`enableImplicitHosting` has been logging into this API from the app server, with
+`deriveNekoAdminValue(...)`, since the control-mode work. `probeDesktopDisplay`
+adds one authenticated GET to that path.
+
+**Three values, and the third is the load-bearing one.** `probeDesktopFrame`
+deliberately has no `unknown` variant, because for a reachability question a
+non-answer *is* the answer — the browser is about to fetch the same URL and get
+the same nothing. This question is different: it is answered by an API on the
+far side of **our own** plumbing, so a non-answer is a fact about us. Collapsing
+it into "blank" would mean one renamed field in a Neko bump showing **every user
+at once** a failure panel over a desktop that is streaming perfectly — the same
+lie as the one being fixed, sign flipped, and total. Hence `live` / `blank` /
+`unknown`, a strict well-formedness gate before anything may be called `blank`,
+and a `ready_unverified` UI state that shows the desktop while saying plainly
+that nobody checked it.
+
+**If you bump Neko, check this first.** The dependency is `GET /api/sessions`
+returning an array whose entries carry a boolean `state.is_watching`. Break that
+and nothing errors — every desktop quietly becomes `ready_unverified`, which is
+survivable but is a downgrade nobody will notice from a dashboard.
+
 ## 17. A `<script src>` inserted by an App Router soft navigation never executes — including a server action's `redirect()`
 
 Observed live 2026-07-31, production build, real Chromium, real Supabase login:
