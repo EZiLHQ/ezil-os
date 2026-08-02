@@ -1484,6 +1484,32 @@ async function runViewport (vp) {
                 && selfTestNotCovered.includes('zz-mutation-noassert')
                 && ! selfTestGuardWouldPass,
             `notCovered=${JSON.stringify(selfTestNotCovered)} guardWouldPass=${selfTestGuardWouldPass}`);
+
+        // 🔴 ROUND 9 FOLLOW-UP — H1/H2b: the two checks above simulate THE
+        // GUARD's predicate over a LOCAL copy, computed and asserted HERE,
+        // BEFORE THE GUARD's own real code runs a few lines down. That
+        // ordering is exactly why they are blind to the round-7 tautology
+        // reintroduced immediately before THE GUARD's real computation
+        // (`resolvedApps.forEach(id => coveredIds.add(id))`): JS runs
+        // top-to-bottom, so nothing pasted in AFTER this block can be
+        // observed BY this block, no matter how faithfully it simulates the
+        // predicate. PROVEN (see wave-g-t20 report): reintroducing that exact
+        // line still leaves every check above green — 533/533 exit 0.
+        //
+        // Fix: inject the canary into the REAL, SHARED `resolvedApps` array
+        // (not a local copy) and defer judgment until THE GUARD's own real
+        // `notCovered` line, a few statements down, actually runs — so
+        // anything pasted in between (the tautology's insertion point,
+        // "before THE GUARD") necessarily processes the canary exactly the
+        // way it would process a real, silently-dropped app id. The canary
+        // can never be legitimately covered — nothing above this line ever
+        // opens, hit-tests, or raises an app named this — so if it turns up
+        // "covered" by the time THE GUARD reads `coveredIds`, something
+        // between here and there added it without a real assertion. Removed
+        // again immediately after judgment, before THE GUARD's real
+        // pass/fail for the ACTUAL resolved apps is computed, so this
+        // self-test can never itself make an ordinary run's real GUARD fail.
+        resolvedApps.push('zz-mutation-tautology-canary');
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -1493,7 +1519,38 @@ async function runViewport (vp) {
     // shell-local app (every shell-local app must resolve regardless of the
     // boot payload's `apps` list — that is the whole point of the flag).
     // ═════════════════════════════════════════════════════════════════════
-    const notCovered = resolvedApps.filter((id) => ! coveredIds.has(id));
+    // 🔴 ROUND 9 FOLLOW-UP — H1/H2b, part 2. `rawNotCovered` below is THE ONE
+    // AND ONLY computation of "which resolved app id has no entry in
+    // `coveredIds`" in this whole file — the canary (if the self-test above
+    // injected it, first viewport only) rides through this EXACT SAME
+    // `.filter()` call, over the EXACT SAME shared `resolvedApps`/
+    // `coveredIds`, that a real dropped app would. There is no separate
+    // "judge the canary" line positioned somewhere for a mutation to land
+    // before: whatever runs between the self-test's injection and THIS line
+    // — including a reintroduced round-7 tautology
+    // (`resolvedApps.forEach(id => coveredIds.add(id))`), wherever it is
+    // pasted — necessarily executes before `rawNotCovered` is computed and
+    // therefore necessarily affects the canary's fate identically to a real
+    // one's. The canary can never be legitimately covered (nothing above
+    // ever opens/asserts an app by this name), so if it is missing from
+    // `rawNotCovered` — i.e. something already decided it was "covered" —
+    // that is the tautology, caught at the guard's own single point of
+    // truth instead of in an early proxy that runs before the mutation does.
+    const CANARY = 'zz-mutation-tautology-canary';
+    const rawNotCovered = resolvedApps.filter((id) => ! coveredIds.has(id));
+    if ( resolvedApps.includes(CANARY) ) {
+        const canaryLeaked = ! rawNotCovered.includes(CANARY);
+        push(`${VP} MUTATION SELF-TEST: an app injected into the REAL resolvedApps array, with zero real assertions run against it, is still reported not-covered by THE GUARD's own single notCovered computation (catches a reintroduced GAP1 tautology no matter where between the self-test block and here it is pasted)`,
+            ! canaryLeaked, `canaryLeaked=${canaryLeaked} rawNotCovered=${JSON.stringify(rawNotCovered)} coveredIds=${JSON.stringify([...coveredIds])}`);
+    }
+    // Strip the canary before judging the REAL resolved apps — an ordinary
+    // run must never be failed by its own canary. `resolvedApps` itself is
+    // also cleaned so nothing downstream (the shell-local check just below,
+    // or a later viewport) ever sees it.
+    const canaryIdx = resolvedApps.indexOf(CANARY);
+    if ( canaryIdx !== -1 ) resolvedApps.splice(canaryIdx, 1);
+    coveredIds.delete(CANARY);
+    const notCovered = rawNotCovered.filter((id) => id !== CANARY);
     push(`${VP} GUARD: every app the registry resolved for this boot got a scenario`,
         notCovered.length === 0 && coveredIds.size >= resolvedApps.length,
         `resolved=${JSON.stringify(resolvedApps)} covered=${JSON.stringify([...coveredIds])} notCovered=${JSON.stringify(notCovered)}`);
