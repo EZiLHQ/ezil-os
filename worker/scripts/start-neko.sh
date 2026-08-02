@@ -233,7 +233,10 @@ mkdir -p "$NEKO_APP_PGID_DIR" 2>/dev/null || true
 # dies during the teardown breaks out of its restart loop instead of racing the
 # teardown by starting a replacement. Cleared on boot.
 NEKO_SHUTDOWN_FLAG="${NEKO_SHUTDOWN_FLAG:-/tmp/neko-shutdown}"
-rm -f "$NEKO_SHUTDOWN_FLAG" 2>/dev/null || true
+# Deliberately NOT cleared here. A flag left behind by a previous boot keeps
+# that boot's supervisors — if any survived — from restarting anything while
+# this boot reclaims them; it is cleared in the stale-boot reclaim block, once
+# the reclaim is done and immediately before this boot starts its own apps.
 
 # Seconds a graceful SIGTERM is given before teardown escalates to SIGKILL.
 # code-server may be mid-write to the user's workspace, so it gets a real
@@ -256,11 +259,59 @@ _kill_pgid() {
   kill -"$sig" -- "-$pgid" 2>/dev/null || true
 }
 
-# _pgid_alive <pgid> — true while ANY process remains in that group.
+# _proc_state <pid> — echo the single-letter state from /proc/<pid>/stat, or
+# nothing at all if the process does not exist. /proc/<pid>/stat is
+# "pid (comm) state ppid pgrp …" and <comm> may itself contain spaces and
+# parentheses, so every parse here splits on the LAST ") ".
+_proc_state() {
+  local line rest
+  read -r line <"/proc/${1}/stat" 2>/dev/null || return 1
+  rest="${line##*) }"
+  printf '%s' "${rest%% *}"
+}
+
+# _pid_alive <pid> — true while that pid is a LIVE process. Zombies do not
+# count, for the same reason they do not count in _pgid_alive below: a
+# reparented supervisor whose init never reaps it stays visible to `kill -0`
+# forever, which made the stale-boot reclaim spend its whole grace period
+# waiting for a process that had already exited (measured: 8s per app).
+_pid_alive() {
+  local st
+  [ -n "${1:-}" ] || return 1
+  st="$(_proc_state "$1")" || return 1
+  [ -n "$st" ] && [ "$st" != "Z" ]
+}
+
+# _pgid_alive <pgid> [pgid...] — true while ANY of the named process groups
+# still has a LIVE member. Zombies do not count.
+#
+# 🔴 Why not `kill -0 -- -PGID`, which is the obvious implementation: that
+#    succeeds for a group whose only remaining members are zombies. Measured
+#    consequence — every teardown burned its entire grace period waiting for
+#    reaped-but-unwaited Chrome processes to "exit", then logged a false
+#    "ignored SIGTERM for 8s" and SIGKILLed processes that had already died.
+#    A zombie holds no port, no X connection and no memory, only a pid slot its
+#    parent has not collected yet, so for teardown purposes it is gone.
+#
+#    `read </proc/...` is a builtin: no fork per process, so this stays cheap
+#    enough to poll at 10 Hz.
 _pgid_alive() {
-  local pgid="${1:-}"
-  [ -n "$pgid" ] || return 1
-  kill -0 -- "-$pgid" 2>/dev/null
+  local want=" $* " d line rest state pgrp
+  [ -n "${1:-}" ] || return 1
+  for d in /proc/[0-9]*; do
+    line=""
+    read -r line <"$d/stat" 2>/dev/null || continue
+    rest="${line##*) }"
+    state="${rest%% *}"
+    [ "$state" = "Z" ] && continue
+    pgrp="${rest#* }"
+    pgrp="${pgrp#* }"
+    pgrp="${pgrp%% *}"
+    case "$want" in
+      *" $pgrp "*) return 0 ;;
+    esac
+  done
+  return 1
 }
 
 # _app_pgids — echo the pgid of every application this boot currently has
@@ -298,14 +349,19 @@ terminate_stack() {
   #    supervisor can replace an app we are about to kill.
   : >"$NEKO_SHUTDOWN_FLAG" 2>/dev/null || true
 
-  # 2. Graceful SIGTERM to everything at once: the supervisors and helper loops
-  #    (plain pids in this script's own group), each application's process
-  #    GROUP (the fix — this is what reaches code-server's second node process
-  #    and Chrome's dozen children), neko, and the plain background children.
+  # 2. Graceful SIGTERM to each application's process GROUP — the actual fix:
+  #    this is what reaches code-server's second node process (the one holding
+  #    the listening socket) and Chrome's dozen children. Also neko, the X
+  #    session children and the health/diagnostic loops.
+  #
+  #    The SUPERVISORS are deliberately left running for now. Each is blocked
+  #    in `wait` on its own app, so keeping it alive is what lets it REAP that
+  #    app rather than leaving a zombie tree parented to init; the shutdown
+  #    flag above is what stops it starting a replacement. They are stopped in
+  #    step 5, by which point they have almost always exited on their own.
   local name pgid sp
   _kill_pid TERM "$MONITOR_PID"
   _kill_pid TERM "$CPU_DIAG_PID"
-  for name in "${!APP_PID[@]}"; do _kill_pid TERM "${APP_PID[$name]}"; done
   for pgid in $pgids; do _kill_pgid TERM "$pgid"; done
   _kill_pid TERM "$NEKO_PID"
   for sp in ${SESSION_PID[@]+"${SESSION_PID[@]}"}; do _kill_pid TERM "$sp"; done
@@ -315,10 +371,8 @@ terminate_stack() {
   local waited=0 deadline=$((NEKO_TEARDOWN_GRACE * 10)) remaining
   while [ "$waited" -lt "$deadline" ]; do
     remaining=0
-    for pgid in $pgids; do
-      if _pgid_alive "$pgid"; then remaining=1; fi
-    done
-    if [ -n "$NEKO_PID" ] && kill -0 "$NEKO_PID" 2>/dev/null; then remaining=1; fi
+    if [ -n "$pgids" ] && _pgid_alive $pgids; then remaining=1; fi
+    if [ -n "$NEKO_PID" ] && _pid_alive "$NEKO_PID"; then remaining=1; fi
     if [ "$remaining" -eq 0 ]; then break; fi
     sleep 0.1
     waited=$((waited + 1))
@@ -332,18 +386,21 @@ terminate_stack() {
       _kill_pgid KILL "$pgid"
     fi
   done
+
+  # 5. Now the supervisors and helper loops themselves.
+  for name in "${!APP_PID[@]}"; do _kill_pid TERM "${APP_PID[$name]}"; done
   for name in "${!APP_PID[@]}"; do _kill_pid KILL "${APP_PID[$name]}"; done
   _kill_pid KILL "$MONITOR_PID"
   _kill_pid KILL "$CPU_DIAG_PID"
   _kill_pid KILL "$NEKO_PID"
   for sp in ${SESSION_PID[@]+"${SESSION_PID[@]}"}; do _kill_pid KILL "$sp"; done
 
-  # 5. Reap neko so its exit status is collected rather than left zombied.
+  # 6. Reap neko so its exit status is collected rather than left zombied.
   if [ -n "$NEKO_PID" ]; then wait "$NEKO_PID" 2>/dev/null || true; fi
 
-  # 6. Drop the ownership records — these processes are provably gone, and a
+  # 7. Drop the ownership records — these processes are provably gone, and a
   #    stale file would make the next boot chase a recycled pid.
-  rm -f "$NEKO_APP_PGID_DIR"/*.pgid 2>/dev/null || true
+  rm -f "$NEKO_APP_PGID_DIR"/*.pgid "$NEKO_APP_PGID_DIR"/*.sup 2>/dev/null || true
   log "teardown complete: apps, neko and the X session are stopped"
 }
 
@@ -772,9 +829,10 @@ supervise_app() {
   shift 2
   local attempt=0
   local pgid_file="${NEKO_APP_PGID_DIR}/${name}.pgid"
+  local sup_file="${NEKO_APP_PGID_DIR}/${name}.sup"
   APP_STATE[$name]="starting"
   APP_RESTARTS[$name]=0
-  rm -f "$pgid_file" 2>/dev/null || true
+  rm -f "$pgid_file" "$sup_file" 2>/dev/null || true
   write_health
   (
     while true; do
@@ -806,12 +864,22 @@ supervise_app() {
       fi
       sleep "$NEKO_APP_RESTART_DELAY"
     done
-    # Nothing of this app is running any more, so the ownership record must go
-    # with it — otherwise the next boot would find a pgid file for a process
-    # that no longer exists and could chase a recycled pid.
-    rm -f "$pgid_file" 2>/dev/null || true
+    # Nothing of this app is running any more, so the ownership records must go
+    # with it — otherwise the next boot would find files for processes that no
+    # longer exist and could chase recycled pids.
+    rm -f "$pgid_file" "$sup_file" 2>/dev/null || true
   ) &
   APP_PID[$name]=$!
+  # Ownership record for the SUPERVISOR, alongside the app pgid the subshell
+  # publishes. Both are needed, and finding that out cost a container:
+  # a boot following a SIGKILLed boot correctly reclaimed the stale Chrome —
+  # and the stale boot's still-running supervisor, orphaned but very much
+  # alive, immediately restarted it, burned through its restart budget and
+  # raised the fatal sentinel that the NEW boot was watching, killing a desktop
+  # that had already reported ready. Killing a stale app without killing the
+  # loop that restarts it is not a reclaim.
+  printf '%s\n' "${APP_PID[$name]}" >"${sup_file}.tmp" 2>/dev/null \
+    && mv "${sup_file}.tmp" "$sup_file" 2>/dev/null
   APP_STATE[$name]="running"
   write_health
 }
@@ -824,21 +892,59 @@ supervise_app() {
 # container. Their listening socket and X windows would otherwise satisfy this
 # boot's readiness gate while the new processes fail to bind behind it.
 #
-# 🔴 Ownership is proved twice before anything is signalled, and it is never
-#    proved by name: (1) the pgid must come from a file THIS SCRIPT wrote in a
-#    previous boot of this same container, and (2) the process still leading
-#    that group must have a /proc cmdline containing the caller-supplied
-#    substring taken from this script's own launch arguments — so a pid number
-#    that has since been recycled by an unrelated process is left alone. No
-#    `pkill`, no pattern match over the process table.
+# 🔴 Ownership is proved before anything is signalled, and it is never proved
+#    by name: (1) the pid/pgid must come from a file THIS SCRIPT wrote during a
+#    previous boot of this same container, and (2) the process it names must
+#    still have a /proc cmdline that matches what this script launches — the
+#    caller-supplied substring for the app, `start-neko.sh` for the supervisor.
+#    A pid number that has since been recycled by an unrelated process is left
+#    strictly alone. No `pkill`, no pattern match over the process table.
+#
+#    The SUPERVISOR is reclaimed FIRST and the app second, because the reverse
+#    order does not work: the supervisor exists precisely to restart the app.
+
+# _reclaim_pid <pid> <cmdline_substring> <label> — TERM, bounded grace, KILL.
+# Returns 1 without signalling anything if ownership cannot be proved.
+_reclaim_pid() {
+  local pid="$1" expect="$2" label="$3" cmd=""
+  [ -n "$pid" ] || return 1
+  _pid_alive "$pid" || return 1
+  if [ -r "/proc/${pid}/cmdline" ]; then
+    cmd="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null)"
+  fi
+  case "$cmd" in
+    *"$expect"*) : ;;
+    *) return 1 ;;
+  esac
+  log "stale-boot RECLAIM: $label from a previous boot is still alive (pid=$pid) — stopping it before this boot starts its own"
+  _kill_pid TERM "$pid"
+  local waited=0 deadline=$((NEKO_TEARDOWN_GRACE * 10))
+  while [ "$waited" -lt "$deadline" ] && _pid_alive "$pid"; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if _pid_alive "$pid"; then
+    log "stale-boot RECLAIM: $label (pid=$pid) ignored SIGTERM for ${NEKO_TEARDOWN_GRACE}s — escalating to SIGKILL"
+    _kill_pid KILL "$pid"
+  fi
+  return 0
+}
+
 reclaim_stale_app() {
   local name="$1" expect="$2"
-  local f="${NEKO_APP_PGID_DIR}/${name}.pgid"
-  [ -f "$f" ] || return 0
-  local pgid
-  pgid="$(tr -dc '0-9' <"$f" 2>/dev/null)"
+  local pgid_file="${NEKO_APP_PGID_DIR}/${name}.pgid"
+  local sup_file="${NEKO_APP_PGID_DIR}/${name}.sup"
+  local sup="" pgid=""
+
+  # 1. The restart loop, before the thing it restarts.
+  [ -f "$sup_file" ] && sup="$(tr -dc '0-9' <"$sup_file" 2>/dev/null)"
+  _reclaim_pid "$sup" "start-neko.sh" "supervisor for app=$name" || true
+  rm -f "$sup_file" 2>/dev/null || true
+
+  # 2. The application and every process it forked, as one group.
+  [ -f "$pgid_file" ] && pgid="$(tr -dc '0-9' <"$pgid_file" 2>/dev/null)"
+  rm -f "$pgid_file" 2>/dev/null || true
   if [ -z "$pgid" ] || ! _pgid_alive "$pgid"; then
-    rm -f "$f" 2>/dev/null || true
     return 0
   fi
   local cmd=""
@@ -848,12 +954,11 @@ reclaim_stale_app() {
   case "$cmd" in
     *"$expect"*) : ;;
     *)
-      log "stale-app check: recorded pgid $pgid for app=$name is not $name any more (pid recycled) — leaving it alone"
-      rm -f "$f" 2>/dev/null || true
+      log "stale-boot check: recorded pgid $pgid for app=$name is not $name any more (pid recycled) — leaving it alone"
       return 0
       ;;
   esac
-  log "stale-app RECLAIM: app=$name from a previous boot is still alive (pgid=$pgid) — stopping it before this boot starts its own"
+  log "stale-boot RECLAIM: app=$name from a previous boot is still alive (pgid=$pgid) — stopping it and every process it forked"
   _kill_pgid TERM "$pgid"
   local waited=0 deadline=$((NEKO_TEARDOWN_GRACE * 10))
   while [ "$waited" -lt "$deadline" ] && _pgid_alive "$pgid"; do
@@ -861,10 +966,9 @@ reclaim_stale_app() {
     waited=$((waited + 1))
   done
   if _pgid_alive "$pgid"; then
-    log "stale-app RECLAIM: app=$name (pgid=$pgid) ignored SIGTERM for ${NEKO_TEARDOWN_GRACE}s — escalating to SIGKILL"
+    log "stale-boot RECLAIM: app=$name (pgid=$pgid) ignored SIGTERM for ${NEKO_TEARDOWN_GRACE}s — escalating to SIGKILL"
     _kill_pgid KILL "$pgid"
   fi
-  rm -f "$f" 2>/dev/null || true
 }
 
 # Background monitor: periodically re-checks liveness (by supervisor subshell
@@ -880,7 +984,7 @@ monitor_apps() {
       # "stopped".
       if [ -f "$NEKO_APP_FATAL_SENTINEL" ] && grep -qx "$name" "$NEKO_APP_FATAL_SENTINEL" 2>/dev/null; then
         APP_STATE[$name]="failed"
-      elif kill -0 "${APP_PID[$name]}" 2>/dev/null; then
+      elif _pid_alive "${APP_PID[$name]}"; then
         APP_STATE[$name]="running"
       else
         APP_STATE[$name]="stopped"
@@ -971,6 +1075,15 @@ if [ "$stale_port_seen" -ne 0 ]; then
   phase_end stale_boot_reclaim error
   exit 1
 fi
+
+# Only NOW is it safe to clear the two cross-boot files. Until this point they
+# still belong to the previous boot: the shutdown flag was suppressing any of
+# its surviving supervisors, and the fatal sentinel may have been appended to
+# by one of them on its way out — a stale "chromium" line in there would
+# otherwise be read by THIS boot's fatal-failure watch and tear down a healthy
+# desktop for a crash that happened in a previous one.
+rm -f "$NEKO_SHUTDOWN_FLAG" 2>/dev/null || true
+rm -f "$NEKO_APP_FATAL_SENTINEL" 2>/dev/null || true
 phase_end stale_boot_reclaim ok
 
 phase_start codeserver_launch
@@ -1360,7 +1473,7 @@ while true; do
     terminate_stack "mandatory app '$failed_app' permanently failed"
     exit 1
   fi
-  if ! kill -0 "$NEKO_PID" 2>/dev/null; then
+  if ! _pid_alive "$NEKO_PID"; then
     log "neko process exited on its own — propagating its status"
     break
   fi
