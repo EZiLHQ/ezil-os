@@ -164,11 +164,32 @@ if [ "${EZIL_NEKO_CPU_DIAG_ENABLED:-0}" = "1" ]; then
   CPU_DIAG_PID=$!
 fi
 
+# wait_tcp <host> <port> <tries> — poll a TCP port, 0.5s between attempts.
+#
+# NOTE the brace group around the fd-closing `exec` below. An `exec` with NO
+# command applies its redirections to the CURRENT SHELL, PERMANENTLY. The
+# previous form here was:
+#
+#     exec 3>&- 3<&- 2>/dev/null || true
+#
+# so the FIRST successful wait_tcp call in the main shell silently redirected
+# this script's own stderr to /dev/null for the rest of the boot. Observed, not
+# theorised: after `neko_serve_bind`, "neko is serving on <port>" appeared in
+# $LOG (written by log()'s `tee`) but never on stderr — and with it went
+# `phase=ready event=end`, the FATAL mandatory-app message, terminate_stack,
+# and `neko exited rc=`. `wrangler tail` is the ONLY window into a live boot
+# (see this file's header), and it went dark at exactly the moment something
+# could start going wrong. The brace group scopes `2>/dev/null` to the group.
+#
+# Note also that this timeout is POLL-COUNT bounded, not wall-clock bounded:
+# <tries> attempts each followed by a fixed sleep. CPU starvation stretches the
+# wall time but never reduces the number of attempts, so a busy box makes this
+# MORE forgiving, not less. The same is true of wait_for_window below.
 wait_tcp() {
   local host="$1" port="$2" tries="$3" ok=1
   for _ in $(seq 1 "$tries"); do
     if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
-      exec 3>&- 3<&- 2>/dev/null || true
+      { exec 3>&- 3<&-; } 2>/dev/null || true
       ok=0; break
     fi
     sleep 0.5
@@ -308,9 +329,10 @@ fi
 # instead, symlinked in from under the (possibly R2-backed) workspace root.
 #
 # Placed HERE — after $WORKSPACE_ROOT is fully finalized (hydration above, if
-# any, has already resolved/relocated it) and BEFORE both start-devserver.sh's
-# dependency install below and code-server opening the workspace further down —
-# so neither ever sees node_modules/.next resolve onto the FUSE mount.
+# any, has already resolved/relocated it) and BEFORE code-server opens the
+# workspace further down and before launch_devserver() runs its dependency
+# install at the very end of boot — so neither ever sees node_modules/.next
+# resolve onto the FUSE mount.
 # Idempotent (containers re-mount their R2 bucket and re-run this script
 # across restarts: re-pointing an already-correct symlink is a no-op) and
 # strictly non-fatal — a missing/not-yet-materialized workspace root, or any
@@ -348,8 +370,8 @@ else
   log "warning: failed to create $EZIL_LOCAL_STATE_DIR — skipping node_modules/.next local-disk symlink setup (non-fatal)"
 fi
 
-# ── Dev server (Option D app preview) ─────────────────────────────────────────
-# Launch the user's dev server on the app-preview port (APP_PREVIEW_PORT /
+# ── Dev server (Option D app preview) — DEFINED here, INVOKED after neko binds ─
+# Launches the user's dev server on the app-preview port (APP_PREVIEW_PORT /
 # desktop-mode.ts, default 3002 — never 3000, which the @cloudflare/sandbox
 # SDK reserves for its own control plane). This closes the gap
 # src/preview-bridge.ts's module doc has flagged since Option D landed: the
@@ -357,32 +379,72 @@ fi
 # proxied/probed the app-preview port, but nothing in this container image
 # ever started a process listening there.
 #
-# Placed HERE — after $WORKSPACE_ROOT is finalized (hydration, if any, is
-# synchronous/fail-closed above, unlike start-desktop.sh's async
-# hydrate-with-timeout pattern) but BEFORE Xvfb/openbox/the window-ready gate
-# — deliberately. start-devserver.sh is itself non-blocking: it backgrounds
-# dependency install and the dev-server process and returns almost
-# immediately (`starting`/`already-running`), so invoking it here adds no
-# measurable delay and can never serialize behind, or gate, code-server/Chrome
-# readiness or `neko serve` binding its own port below. A slow or crashing
-# dev server therefore never prevents the desktop from becoming ready — its
-# real state is written to /tmp/devserver.phase (crashed/timeout/running/…)
+# 🔴 THE CALL SITE IS DELIBERATELY AT THE VERY END OF BOOT, AFTER `neko serve`
+# HAS BOUND ITS PORT. Do not move it back up here.
+#
+# It used to be invoked right here — after workspace hydration, before
+# Xvfb/openbox/code-server/Chrome and before the fail-closed window-ready gate
+# — under the claim that "a slow or crashing dev server therefore never
+# prevents the desktop from becoming ready". That claim was only ever TRUE BY
+# ACCIDENT: at the time it was written, start-devserver.sh had an unparseable
+# `bash -c` block (see 036cb21), so the launch failed instantly and consumed
+# nothing at all. The moment the script was repaired and the dev server
+# genuinely started running — `bun install` on a Next project, on a 2-vCPU
+# container, concurrent with the whole rest of boot — the desktop stopped
+# coming up in production, and the only thing that had changed between the
+# last-good and first-bad container image was this one script becoming
+# runnable.
+#
+# The invariant is not "the launch call returns quickly" (it does) — it is
+# "nothing the dev server does can affect whether the desktop boots". Placement
+# is the only thing that actually guarantees that, and it is free: the launch
+# is asynchronous and NOTHING in the boot path waits on it. Everything upstream
+# of `neko serve` — the X display, the window manager, code-server, Chrome, and
+# the fail-closed window-ready gate that exits 1 when a mandatory app is not
+# ready — now runs on a container where the dev server does not yet exist. A
+# dev server that saturates both vCPUs, exhausts memory, fills the disk, hangs
+# forever, or crashes on boot cannot reach any of them, because it has not been
+# started yet. The app preview is explicitly optional; the desktop is not.
+#
+# Its real state is written to /tmp/devserver.phase (crashed/timeout/running/…)
 # for the Worker's /preview-status probe to report truthfully instead of
-# silently proxying to nothing, which was the whole prior bug.
+# silently proxying to nothing, which was the whole prior bug. The cost of the
+# move is the few seconds of dependency-install head start the preview used to
+# get during boot; the preview reports `installing_deps` for that much longer
+# and nothing else changes.
 DEVSERVER_BIN="${DEVSERVER_BIN:-/usr/local/bin/start-devserver.sh}"
-phase_start devserver_launch
-if [ -x "$DEVSERVER_BIN" ]; then
+launch_devserver() {
+  phase_start devserver_launch
+  if [ ! -x "$DEVSERVER_BIN" ]; then
+    log "warning: $DEVSERVER_BIN not found — dev server will not be started (app preview will report port_not_listening)"
+    phase_end devserver_launch skipped
+    return 0
+  fi
   log "requesting async dev server launch in $WORKSPACE_ROOT on :${EZIL_DEV_SERVER_PORT:-3002}"
-  if "$DEVSERVER_BIN" "$WORKSPACE_ROOT"; then
+  # Run it (and therefore its whole descendant tree — the package-manager
+  # install and the dev server itself) at a lower scheduling priority, so that
+  # the app preview can never out-prioritise the desktop the user is actually
+  # looking at; in particular neko's software vp8 encoder, the one thing on
+  # this box with a hard real-time budget. Raising niceness never requires
+  # privileges. This is a belt-and-braces measure for POST-boot contention
+  # only — the boot-time guarantee comes from WHERE this function is called,
+  # not from this. `nice` is coreutils and always present; the branch exists
+  # so a stripped image degrades to the un-niced call rather than to no dev
+  # server at all.
+  local launch_rc=0
+  if command -v nice >/dev/null 2>&1; then
+    nice -n 10 "$DEVSERVER_BIN" "$WORKSPACE_ROOT" || launch_rc=$?
+  else
+    "$DEVSERVER_BIN" "$WORKSPACE_ROOT" || launch_rc=$?
+  fi
+  if [ "$launch_rc" -eq 0 ]; then
     phase_end devserver_launch ok
   else
-    log "warning: dev server launch request failed (non-fatal, continuing boot — see /tmp/devserver.log)"
+    log "warning: dev server launch request failed rc=$launch_rc (non-fatal — see /tmp/devserver.log)"
     phase_end devserver_launch error
   fi
-else
-  log "warning: $DEVSERVER_BIN not found — dev server will not be started (app preview will report port_not_listening)"
-  phase_end devserver_launch skipped
-fi
+  return 0
+}
 
 # ── X display ────────────────────────────────────────────────────────────────
 # Neko's desktop manager connects to $DISPLAY at startup and panics if it is
@@ -646,8 +708,11 @@ MONITOR_PID=$!
 # Installs a tiny wrapper so an operator/automation can deterministically
 # activate either app window by class via `wmctrl -x -a`, independent of the
 # pinned openbox config's built-in Alt+Tab keybinding. Written at runtime (not
-# baked in) so it always matches this script's app names.
-cat >/usr/local/bin/neko-switch-app.sh <<'SWITCH_EOF'
+# baked in) so it always matches this script's app names. The destination is
+# overridable purely so a test harness can run this script without writing into
+# the host's /usr/local/bin; production never sets it.
+NEKO_SWITCH_APP_BIN="${NEKO_SWITCH_APP_BIN:-/usr/local/bin/neko-switch-app.sh}"
+cat >"$NEKO_SWITCH_APP_BIN" <<'SWITCH_EOF'
 #!/usr/bin/env bash
 # Usage: neko-switch-app.sh <vscode|chromium>
 # Deterministically raises/focuses the named app's window on the shared X
@@ -683,7 +748,7 @@ if [ -z "$win_id" ]; then
 fi
 exec wmctrl -i -a "$win_id"
 SWITCH_EOF
-chmod +x /usr/local/bin/neko-switch-app.sh
+chmod +x "$NEKO_SWITCH_APP_BIN"
 
 # ── Window-ready gate (mandatory, fail-closed, data-driven) ──────────────────
 # Readiness MUST NOT be reported (i.e. `neko serve` must not be started, and
@@ -919,6 +984,15 @@ else
   phase_end neko_serve_bind error
   phase_end ready error
 fi
+
+# ── Dev server (Option D app preview) — the deliberate call site ──────────────
+# See launch_devserver()'s definition above for why this is HERE and nowhere
+# earlier. Everything the desktop needs has already happened: the readiness
+# verdict for this boot is already decided and already logged, and neko has
+# either bound its port or definitively failed to. Launched unconditionally on
+# both branches — the preview is worth having even on a boot where neko never
+# came up, and by this point it cannot influence that outcome either way.
+launch_devserver
 
 # ── Fatal-failure watch (contract: dead mandatory app => unhealthy desktop) ───
 # Keep the startProcess-managed process alive for the lifetime of the desktop,

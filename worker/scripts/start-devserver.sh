@@ -20,16 +20,24 @@
 # not part of the requested adaptation scope; see the worker's report for the
 # explicit callout.
 #
-# Invoked by start-neko.sh immediately after workspace hydration resolves
-# (before the mandatory-app window-ready gate and before `neko serve` binds
-# its port). This script itself is NON-BLOCKING: dependency install and the
-# dev-server process are launched in a detached background subshell, and this
-# script returns (`starting`/`already-running`, exit 0) almost immediately —
-# so it can never serialize behind, or gate, VS Code/Chrome readiness or neko
-# binding its HTTP port. A slow or crashing dev server therefore never
-# prevents the desktop itself from becoming ready; its real state is reported
-# via the phase file below (surfaced by the Worker's `/preview-status` probe
-# in `probeAppPreviewStatus`, `src/index.ts`) instead of by blocking boot.
+# Invoked by start-neko.sh's `launch_devserver` at the VERY END of boot —
+# AFTER the mandatory-app window-ready gate has passed and AFTER `neko serve`
+# has bound its HTTP port. That ordering, not any property of this script, is
+# what guarantees the desktop cannot be held hostage by the app preview.
+#
+# This script is also non-blocking in its own right (dependency install and the
+# dev-server process are launched in a detached background subshell and it
+# returns `starting`/`already-running`, exit 0, in tens of milliseconds) — but
+# do NOT rely on that to justify calling it earlier. It was called before the
+# gate until 2026-08-02, on exactly that reasoning, and the desktop stopped
+# booting in production the moment the dev server it launches actually started
+# doing work: a fast-returning launcher still leaves an unbounded `bun install`
+# and a Turbopack dev server competing with Xvfb, Chrome, code-server and neko
+# for a 2-vCPU container. See start-neko.sh's `launch_devserver` comment.
+#
+# Its real state is reported via the phase file below (surfaced by the Worker's
+# `/preview-status` probe in `probeAppPreviewStatus`, `src/index.ts`) instead of
+# by blocking boot.
 set -uo pipefail
 
 # Workspace root: prefer an explicit argv[1] (start-neko.sh passes the
