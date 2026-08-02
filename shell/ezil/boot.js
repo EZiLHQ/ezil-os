@@ -349,15 +349,15 @@ function open_start_menu (apps, ctx, el_anchor) {
         position: rect ? { top: rect.top - 8, left: rect.left } : undefined,
     });
 
-    // `UIContextMenu` appends its element to `<body>` synchronously (before
-    // returning) and never reorders `.context-menu` nodes, so the LAST
-    // top-level one in the DOM at this exact point is the one it just
-    // created — even if a different, unrelated context menu (a taskbar item's
-    // right-click) happens to already be open elsewhere. `:not([data-is-submenu])`
-    // excludes submenus, which this call cannot have produced (no `items`
-    // here nests further items).
-    const menus = document.querySelectorAll('.context-menu:not([data-is-submenu="true"])');
-    const el = menus[menus.length - 1] ?? null;
+    // SIMPLIFIED (see UIContextMenu.js's stack-guard doc comment): `UIContextMenu`
+    // itself now closes any other open ROOT menu before creating a new one, so
+    // there is no longer a "which one is mine" question — at most one
+    // `:not([data-is-submenu])` node can exist in the DOM at this exact point,
+    // and it is the one this call just created, even if a different, unrelated
+    // context menu (a taskbar item's right-click) was open a moment ago. This
+    // used to pick the LAST of possibly several such nodes for exactly that
+    // ambiguity; the factory now makes the ambiguity impossible, not just rare.
+    const el = document.querySelector('.context-menu:not([data-is-submenu="true"])');
 
     const on_outside_mousedown = (e) => {
         if ( el?.contains(e.target) ) return;
