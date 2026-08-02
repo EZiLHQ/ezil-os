@@ -317,6 +317,29 @@ try {
     push('[close-reopen] harness threw without completing', false, String(err?.stack ?? err));
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// GAP 4 (M3a / M5b) — a close that THROWS, and the awaited-teardown
+// contract. See `runCloseRobustnessSweep`'s own doc block below.
+// ═══════════════════════════════════════════════════════════════════════════
+try {
+    await runCloseRobustnessSweep();
+} catch ( err ) {
+    anyHardFailure = true;
+    push('[close-robustness] harness threw without completing', false, String(err?.stack ?? err));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GAP 5 (M6 / M7 / M8) — the `:not([data-closing="1"])` guards on the
+// dashboard-mode popstate handler and its watchdog fallback. See
+// `runDashboardPopstateGuardSweep`'s own doc block below.
+// ═══════════════════════════════════════════════════════════════════════════
+try {
+    await runDashboardPopstateGuardSweep();
+} catch ( err ) {
+    anyHardFailure = true;
+    push('[dashboard-popstate] harness threw without completing', false, String(err?.stack ?? err));
+}
+
 await browser.close();
 
 const failed = checks.filter(c => ! c.pass);
@@ -1966,4 +1989,391 @@ async function runCloseReopenSweep () {
 
     allPageErrors.push(...page_errors);
     await page.close();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GAP 4 — a close that THROWS (M3a), and the awaited-teardown contract (M5b).
+// ═══════════════════════════════════════════════════════════════════════════
+// M3a: `close_one_window`'s `try/finally` around `data-closing` (`UIWindow.js`
+// — see that function's own header comment for the full writeup). Without
+// it, an `on_before_exit` that THROWS (a real app can do this; nothing
+// sanitizes it) leaves `data-closing="1"` stuck forever on a window that
+// never actually closed, making it permanently invisible to every
+// `:not([data-closing="1"])` lookup this codebase uses to answer "is app X
+// already open" (the single_instance check, `registry.js`'s `launch()`, and
+// GAP 5 below's popstate guards).
+//
+// M5b: `$.fn.close`'s `for` loop does `await close_one_window.call(...)`.
+// `closeSandboxWindows` (registry.js) depends on `.close()`'s own returned
+// promise not resolving until teardown REALLY finished — that IS the delete
+// guarantee (close every window, THEN delete the sandbox). If that `await`
+// were ever weakened to a fire-and-forget, `.close()` would resolve before
+// an async veto (`on_before_exit`) — or the DOM removal it gates — had
+// actually run, and a caller awaiting it would wrongly believe the window
+// was gone.
+//
+// Promoted from throwaway probe `probe-c-throw.mjs` (M3a). M5b is new: it
+// measures WALL-CLOCK TIME, not just end state — "resolved suspiciously
+// fast" is the one signal a fire-and-forget `void` leaves behind that a
+// correct `await` cannot, because the whole point of the mutation is that
+// nothing is holding the outer promise open anymore.
+async function runCloseRobustnessSweep () {
+    const VP = '[close-robustness]';
+    const page = await browser.newPage({ viewport: { width: 1280, height: 860 } });
+    const page_errors = [];
+    page.on('pageerror', (e) => page_errors.push(String(e)));
+    await page.route('**/*', async (route) => {
+        const req = route.request();
+        const url = req.url();
+        if ( url === `${HOST}/os` ) {
+            await route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
+            return;
+        }
+        if ( url.includes('/api/') ) {
+            const body = stub(url, req.method(), req.postData());
+            await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+            return;
+        }
+        if ( url.startsWith(HOST) ) {
+            await route.fulfill({ status: 404, body: '' });
+            return;
+        }
+        await route.continue();
+    });
+
+    await page.goto(`${HOST}/os`, { waitUntil: 'load' });
+    await page.evaluate((p) => { window.__EZIL_BOOT__ = p; }, PAYLOAD);
+    await page.addScriptTag({ content: icons });
+    await page.addScriptTag({ content: bundle });
+
+    async function until (fn, arg, ms = 6000, step = 50) {
+        const deadline = Date.now() + ms;
+        for ( ;; ) {
+            const v = await page.evaluate(fn, arg);
+            if ( v ) return v;
+            if ( Date.now() > deadline ) return null;
+            await sleep(step);
+        }
+    }
+
+    await until(() => Array.isArray(window.ezil?.registry?.APPS) && window.ezil.registry.APPS.length > 0, undefined);
+    const resolvedApps = await page.evaluate(() => window.ezil.registry.resolve(window.__EZIL_BOOT__).map((a) => a.id));
+    push(`${VP} registry resolved at least one app for close-robustness coverage`, resolvedApps.length > 0,
+        `resolved=${JSON.stringify(resolvedApps)}`);
+    if ( resolvedApps.length === 0 ) {
+        await page.close();
+        return;
+    }
+    const id = resolvedApps[0]; // the boot app — already open, no extra launch needed
+    await until((a) => !! document.querySelector(`.window[data-app="${a}"]`), id, 8000, 50);
+
+    // ── M3a: on_before_exit THROWS ──────────────────────────────────────────
+    const throwResult = await page.evaluate(async (a) => {
+        const el = document.querySelector(`.window[data-app="${a}"]`);
+        el.on_before_exit = () => { throw new Error('boom: deliberate throw from on_before_exit'); };
+        let threw = null;
+        try {
+            await $(el).close();
+        } catch ( e ) {
+            threw = String(e?.message ?? e);
+        }
+        return {
+            threw,
+            dataClosingAfter: el.getAttribute('data-closing'),
+            stillInDom: document.body.contains(el),
+        };
+    }, id);
+    push(`${VP} M3a: a close whose on_before_exit THROWS still propagates the throw (does not swallow it)`,
+        !! throwResult.threw && throwResult.threw.includes('boom'), JSON.stringify(throwResult));
+    push(`${VP} M3a GUARD: data-closing is cleared by the try/finally even when the close throws (else the window is permanently invisible to every :not([data-closing="1"]) lookup)`,
+        throwResult.dataClosingAfter === null, JSON.stringify(throwResult));
+    push(`${VP} M3a: the window survives a throw from on_before_exit (not half-deleted)`,
+        throwResult.stillInDom, JSON.stringify(throwResult));
+
+    // ── M5b: the awaited-teardown contract ──────────────────────────────────
+    // A veto that resolves only after a real delay. If `$.fn.close`'s
+    // `await close_one_window.call(...)` were ever weakened to a
+    // fire-and-forget, the outer `await $(el).close()` below would resolve
+    // almost immediately — long before this delay elapses — because nothing
+    // would be holding it open.
+    const DELAY_MS = 300;
+    const timing = await page.evaluate(async ({ a, delay }) => {
+        const el = document.querySelector(`.window[data-app="${a}"]`);
+        el.on_before_exit = () => new Promise((resolve) => setTimeout(() => resolve(true), delay));
+        const t0 = performance.now();
+        await $(el).close();
+        const elapsed = performance.now() - t0;
+        return {
+            elapsed,
+            dataClosingAfter: el.getAttribute('data-closing'),
+            stillInDom: document.body.contains(el),
+        };
+    }, { a: id, delay: DELAY_MS });
+    push(`${VP} M5b GUARD: $.fn.close's returned promise does not resolve until the awaited veto (on_before_exit) actually finishes`,
+        timing.elapsed >= DELAY_MS - 50,
+        `elapsed=${timing.elapsed.toFixed(1)}ms delay=${DELAY_MS}ms ${JSON.stringify(timing)}`);
+    push(`${VP} M5b: by the time the awaited close() resolves, the window is actually gone and data-closing is cleared`,
+        timing.dataClosingAfter === null && ! timing.stillInDom, JSON.stringify(timing));
+
+    push(`${VP} no uncaught page errors during close-robustness sweep`, page_errors.length === 0, JSON.stringify(page_errors));
+    allPageErrors.push(...page_errors);
+    await page.close();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GAP 5 — the three `:not([data-closing="1"])` guards on the dashboard-mode
+// popstate handler and its 400ms watchdog fallback (M6 / M7 / M8,
+// `UIWindow.js`, `pop_dashboard_app_url` / the `popstate` listener next to
+// it).
+// ═══════════════════════════════════════════════════════════════════════════
+// `window.is_dashboard_mode` is Puter's Dashboard — a surface EZiL does not
+// have and will not build (`app-drawer.js`'s own header). Nothing in
+// `shell/ezil` ever sets it, and nothing ever passes `update_window_url:
+// true` either (the one option that lets a NEWLY OPENED window claim a
+// dashboard URL) — this whole subsystem is dead in the shipped app, on
+// purpose, TWICE over. That is exactly why round 9's mutation pass found
+// zero coverage: nothing anywhere ever runs this code, so no suite could
+// have caught a mutation to it.
+//
+// It is still real, committed, reachable source — `UIWindow.js`'s own
+// header treats the whole file as a load-bearing port, not dead weight to
+// delete — so a guard inside it regressing silently is still a real defect
+// waiting for the day this fork's dashboard mode (or a future one) turns the
+// flag back on. This harness exercises the REAL functions through the ONE
+// legitimate side door available without a dashboard UI: `$.fn.showWindow`'s
+// restore branch reads `data-update_window_url`/`data-minimized_in_place`
+// off the LIVE DOM element, not a captured option — setting those two
+// attributes directly and calling the real, unmodified `showWindow()`
+// reaches the real `push_dashboard_app_url`, which does real
+// `history.pushState`. Everything downstream of that (the real `popstate`
+// listener already registered by `UIWindow.js` on page load, real
+// `history.back()/forward()`, the real 400ms watchdog `setTimeout`) is then
+// exercised exactly as a live user's Back button would, no reimplementation
+// of any of the three guards under test.
+async function runDashboardPopstateGuardSweep () {
+    async function newPage () {
+        const page = await browser.newPage({ viewport: { width: 1280, height: 860 } });
+        const page_errors = [];
+        page.on('pageerror', (e) => page_errors.push(String(e)));
+        await page.route('**/*', async (route) => {
+            const req = route.request();
+            const url = req.url();
+            if ( url === `${HOST}/os` ) {
+                await route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
+                return;
+            }
+            if ( url.includes('/api/') ) {
+                const body = stub(url, req.method(), req.postData());
+                await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+                return;
+            }
+            if ( url.startsWith(HOST) ) {
+                await route.fulfill({ status: 404, body: '' });
+                return;
+            }
+            await route.continue();
+        });
+        await page.goto(`${HOST}/os`, { waitUntil: 'load' });
+        await page.evaluate((p) => { window.__EZIL_BOOT__ = p; }, PAYLOAD);
+        await page.addScriptTag({ content: icons });
+        await page.addScriptTag({ content: bundle });
+        return { page, page_errors };
+    }
+
+    async function until (page, fn, arg, ms = 6000, step = 50) {
+        const deadline = Date.now() + ms;
+        for ( ;; ) {
+            const v = await page.evaluate(fn, arg);
+            if ( v ) return v;
+            if ( Date.now() > deadline ) return null;
+            await sleep(step);
+        }
+    }
+
+    /** Reach the real `push_dashboard_app_url` through the real
+     * `showWindow()` restore branch — see this function's own doc block for
+     * why these two attributes are the legitimate side door. */
+    async function forcePushDashboardUrl (page, id) {
+        await page.evaluate((a) => {
+            window.is_dashboard_mode = true;
+            const el = document.querySelector(`.window[data-app="${a}"]`);
+            el.setAttribute('data-minimized_in_place', '1');
+            el.setAttribute('data-update_window_url', 'true');
+            $(el).showWindow();
+        }, id);
+        await until(page, (a) => window.location.pathname === `/app/${a}`, id, 2000, 30);
+    }
+
+    /** Fire-and-forget a close whose `on_before_exit` never resolves — the
+     * window is stamped `data-closing="1"` synchronously and then stuck
+     * there forever, a stable, deterministic stand-in for "mid-teardown"
+     * with no race to win. */
+    async function startHungClose (page, id) {
+        await page.evaluate((a) => {
+            const el = document.querySelector(`.window[data-app="${a}"]`);
+            el.on_before_exit = () => new Promise(() => {}); // never resolves
+            void $(el).close();
+        }, id);
+        await until(page, (a) => document.querySelector(`.window[data-app="${a}"]`)?.getAttribute('data-closing') === '1', id, 2000, 30);
+    }
+
+    async function pickTwoApps (page) {
+        await until(page, () => Array.isArray(window.ezil?.registry?.APPS) && window.ezil.registry.APPS.length > 0, undefined);
+        const resolvedApps = await page.evaluate(() => window.ezil.registry.resolve(window.__EZIL_BOOT__).map((a) => a.id));
+        return resolvedApps;
+    }
+
+    async function launchAndWait (page, id) {
+        const already = await page.evaluate((a) => !! document.querySelector(`.window[data-app="${a}"]`), id);
+        if ( ! already ) {
+            await page.evaluate(({ a, ctx }) => window.ezil.registry.launch(a, ctx), {
+                a: id, ctx: { payload: PAYLOAD, computer: PAYLOAD.computer, desktopState: PAYLOAD.desktopState },
+            });
+        }
+        await until(page, (a) => !! document.querySelector(`.window[data-app="${a}"]`), id, 8000, 50);
+    }
+
+    // ── M7: the popstate handler's `prev_app` guard ─────────────────────────
+    // A traversal that leaves an app's URL entry minimizes that app's
+    // window — UNLESS it is mid-teardown, in which case minimizing it is
+    // exactly the wrong thing to do to a window about to be deleted.
+    {
+        const VP = '[dashboard-popstate M7]';
+        const { page, page_errors } = await newPage();
+        const resolvedApps = await pickTwoApps(page);
+        push(`${VP} registry resolved at least 2 apps to exercise this guard`, resolvedApps.length >= 2,
+            `resolved=${JSON.stringify(resolvedApps)}`);
+        if ( resolvedApps.length >= 2 ) {
+            const [idA, idB] = resolvedApps;
+            await launchAndWait(page, idA);
+            await forcePushDashboardUrl(page, idA);
+            await launchAndWait(page, idB);
+            await forcePushDashboardUrl(page, idB); // dashboard_url_app === idB now, history: [/os, /app/idA, /app/idB]
+            await startHungClose(page, idB); // idB is now stuck mid-teardown, data-closing="1", never resolves
+
+            await page.evaluate(() => { window.history.back(); }); // real traversal -> URL becomes /app/idA
+            await until(page, (a) => window.location.pathname === `/app/${a}`, idA, 3000, 30);
+            await sleep(150); // let the popstate handler's synchronous body finish
+
+            const bMinimized = await page.evaluate((a) => document.querySelector(`.window[data-app="${a}"]`)?.getAttribute('data-is_minimized'), idB);
+            push(`${VP} M7 GUARD: a window mid-teardown is NOT minimized by the popstate handler's prev_app branch, even though the traversal left its URL entry`,
+                bMinimized !== 'true' && bMinimized !== '1', `data-is_minimized=${bMinimized}`);
+        }
+
+        push(`${VP} no uncaught page errors`, page_errors.length === 0, JSON.stringify(page_errors));
+        allPageErrors.push(...page_errors);
+        await page.close();
+    }
+
+    // ── M8: the popstate handler's `new_app` guard ──────────────────────────
+    // Landing on an app's URL entry restores its window, or relaunches it if
+    // none is found — UNLESS a window IS found but is mid-teardown, in which
+    // case restoring/focusing it is wrong (it is about to be deleted out
+    // from under that restore) and the code must treat it as "not found"
+    // instead. Detected via `document.title`: the found-window branch is the
+    // ONLY place in the whole handler that sets `document.title` to the
+    // window's own `data-name` — see this block's own comment for why that
+    // makes an unambiguous signal.
+    {
+        const VP = '[dashboard-popstate M8]';
+        const { page, page_errors } = await newPage();
+        const resolvedApps = await pickTwoApps(page);
+        push(`${VP} registry resolved at least 1 app to exercise this guard`, resolvedApps.length >= 1,
+            `resolved=${JSON.stringify(resolvedApps)}`);
+        if ( resolvedApps.length >= 1 ) {
+            const idA = resolvedApps[0];
+            const MARKER = 'M8-MUTATION-SELF-TEST-MARKER';
+            await launchAndWait(page, idA);
+            await page.evaluate((a) => document.querySelector(`.window[data-app="${a}"]`)?.setAttribute('data-name', a), idA);
+            await forcePushDashboardUrl(page, idA); // dashboard_url_app === idA, history: [/os, /app/idA]
+
+            // Leave idA's entry (real Back), which also minimizes it for
+            // real (it is healthy at this point) and resets the cached
+            // "current app" to null — isolating the scenario so the
+            // `prev_app` branch has nothing to act on for the `forward()`
+            // below (this test is about `new_app`, not `prev_app`).
+            await page.evaluate(() => { window.history.back(); });
+            await until(page, () => window.location.pathname === '/os', undefined, 3000, 30);
+            await sleep(100);
+
+            // NOW make idA mid-teardown.
+            await startHungClose(page, idA);
+            await page.evaluate((marker) => { document.title = marker; }, MARKER);
+
+            await page.evaluate(() => { window.history.forward(); }); // real traversal -> URL becomes /app/idA again
+            await until(page, (a) => window.location.pathname === `/app/${a}`, idA, 3000, 30);
+            await sleep(150);
+
+            const title = await page.evaluate(() => document.title);
+            push(`${VP} M8 GUARD: a window mid-teardown is treated as NOT FOUND by the popstate handler's new_app branch (title is untouched, not stamped from the dying window's data-name)`,
+                title === MARKER, `title=${JSON.stringify(title)} expectedUnchanged=${JSON.stringify(MARKER)}`);
+        }
+
+        push(`${VP} no uncaught page errors`, page_errors.length === 0, JSON.stringify(page_errors));
+        allPageErrors.push(...page_errors);
+        await page.close();
+    }
+
+    // ── M6: pop_dashboard_app_url's 400ms watchdog fallback ─────────────────
+    // If the real popstate a `history.back()` issues never arrives (e.g. the
+    // app's iframe consumed the joint history entry instead — see this
+    // function's own header comment in `UIWindow.js`), the watchdog repairs
+    // the address bar itself after 400ms and, same as the popstate handler,
+    // must not act on a window mid-teardown. Reproduced by making
+    // `history.back()` a deliberate no-op (so no real popstate ever arrives,
+    // forcing the watchdog to fire) and stretching `$.fn.animate`'s duration
+    // so the closing window's DOM node is still attached, `data-closing="1"`,
+    // when the watchdog's 400ms elapses.
+    {
+        const VP = '[dashboard-popstate M6]';
+        const { page, page_errors } = await newPage();
+        const resolvedApps = await pickTwoApps(page);
+        push(`${VP} registry resolved at least 1 app to exercise this guard`, resolvedApps.length >= 1,
+            `resolved=${JSON.stringify(resolvedApps)}`);
+        if ( resolvedApps.length >= 1 ) {
+            const idA = resolvedApps[0];
+            await launchAndWait(page, idA);
+            await forcePushDashboardUrl(page, idA); // dashboard_url_app === idA, history: [/os, /app/idA]
+
+            await page.evaluate(() => {
+                // Stretch every animate() call so the shrink-to-target close
+                // animation below outlives the 400ms watchdog — the window
+                // must still be attached, data-closing="1", when it fires.
+                const origAnimate = $.fn.animate;
+                $.fn.animate = function (props, duration, ...rest) {
+                    const boosted = typeof duration === 'number' ? Math.max(duration, 900) : duration;
+                    return origAnimate.call(this, props, boosted, ...rest);
+                };
+                // Block the real navigation pop_dashboard_app_url issues, so
+                // no real popstate ever arrives to clear the pending latch —
+                // forcing the watchdog to be the one that acts.
+                window.history.back = () => {};
+            });
+
+            await page.evaluate((a) => {
+                const el = document.querySelector(`.window[data-app="${a}"]`);
+                // Fire-and-forget: this close reaches pop_dashboard_app_url
+                // (no on_before_exit to block it) and then hangs mid-shrink
+                // for ~900ms thanks to the patched animate() above —
+                // data-closing="1" stays on an ATTACHED node the whole time.
+                void $(el).close({ shrink_to_target: document.body });
+            }, idA);
+
+            await sleep(450); // past the watchdog's 400ms, well before the ~900ms shrink completes
+            const state = await page.evaluate((a) => {
+                const el = document.querySelector(`.window[data-app="${a}"]`);
+                return el ? { stillInDom: true, dataClosing: el.getAttribute('data-closing'), isMinimized: el.getAttribute('data-is_minimized') } : { stillInDom: false };
+            }, idA);
+            push(`${VP} setup sanity: the window is still attached and mid-teardown when the watchdog fires`,
+                state.stillInDom && state.dataClosing === '1', JSON.stringify(state));
+            push(`${VP} M6 GUARD: the watchdog does NOT minimize a window mid-teardown, even though its own address-bar repair still ran`,
+                state.isMinimized !== 'true' && state.isMinimized !== '1', JSON.stringify(state));
+
+            await sleep(600); // let the stretched close finish before tearing the page down
+        }
+
+        push(`${VP} no uncaught page errors`, page_errors.length === 0, JSON.stringify(page_errors));
+        allPageErrors.push(...page_errors);
+        await page.close();
+    }
 }
