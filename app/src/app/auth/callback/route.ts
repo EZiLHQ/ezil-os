@@ -8,8 +8,7 @@ import { createClient } from '@/utils/supabase/server';
  * browser here with a `code` query param after the user completes sign-in
  * on the provider's side (or clicks a confirmation-email link); we exchange
  * it for a session, then send the browser on to `returnUrl` (defaulting to
- * `/computers` — this app has no chat editor, so there is no alternate
- * landing destination to branch on).
+ * `/os`, the product's entry point — see `safeReturnUrl`).
  *
  * 🔴 This is a ROUTE HANDLER, so its 302 is a real HTTP redirect that the
  * browser follows as a document load. That matters for `/os`, whose shell is
