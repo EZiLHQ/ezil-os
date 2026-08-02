@@ -26,7 +26,7 @@
 #   Xvfb :99         virtual X display (dummy framebuffer)
 #   openbox          lightweight window manager (config /etc/neko/openbox.xml)
 #   pulseaudio       audio server (best-effort; media is WebRTC-gated)
-#   code-server      the IDE, served over plain HTTP on 127.0.0.1:8443 — NOT
+#   code-server      the IDE, served over plain HTTP on 0.0.0.0:8443 — NOT
 #                    an X client, so it is never part of the Xvfb/WebRTC
 #                    pixel stream (replaces the pinned image's Electron VS
 #                    Code build; see the Dockerfile and this script's
@@ -548,9 +548,20 @@ monitor_apps() {
 # (see the encoder-tuning section further down), plus VS Code's own extension
 # host — all sharing whatever CPU this container has. code-server is a plain
 # Node.js HTTP server: it renders nothing into Xvfb, puts nothing through the
-# video encoder, and is NOT part of the neko/WebRTC desktop stream at all. Its
-# `--bind-addr 127.0.0.1:8443` is loopback-only (never 0.0.0.0); the only
-# inbound path is the existing HMAC/cookie-gated containerFetch proxy.
+# video encoder, and is NOT part of the neko/WebRTC desktop stream at all.
+#
+# 🔴 `--bind-addr 0.0.0.0:8443`, NOT loopback. This bound 127.0.0.1 until a
+# live production test found code-server running, listening and completely
+# unreachable: `Error proxying request to container: The container is not
+# listening in the TCP address 10.0.0.1:8443`. Cloudflare's proxy connects to
+# the container's ROUTABLE address, never its loopback — which is exactly why
+# neko is launched with `NEKO_SERVER_BIND="0.0.0.0:..."` further down this
+# same file, with the comment "so proxyToSandbox() can reach it". Neko worked;
+# code-server did not; the only difference was the bind address.
+# `--auth none` remains safe because the container network is not publicly
+# routable and the sole ingress is the Worker's HMAC/cookie-gated
+# `*-code.ezil.org` bridge. Loopback here is not a security boundary — it is
+# just an unreachable service.
 # Supervised the same way chrome/vscode always were (supervise_app — restart
 # budget, health file, fatal-sentinel teardown on exhaustion) so a crashing
 # code-server is caught exactly like a crashing browser used to be; readiness
@@ -562,9 +573,9 @@ monitor_apps() {
 # `window_ready_gate` phase below (see EZIL_DESKTOP_APPS), which runs
 # concurrently with Chrome's window check.
 phase_start codeserver_launch
-log "supervising code-server ($CODE_SERVER_BIN) on 127.0.0.1:8443 at $WORKSPACE_ROOT (mandatory, isolated user-data-dir)"
+log "supervising code-server ($CODE_SERVER_BIN) on 0.0.0.0:8443 at $WORKSPACE_ROOT (mandatory, isolated user-data-dir)"
 supervise_app codeserver "$NEKO_APP_MAX_RESTARTS" "$CODE_SERVER_BIN" \
-  --bind-addr 127.0.0.1:8443 \
+  --bind-addr 0.0.0.0:8443 \
   --auth none \
   --disable-telemetry \
   --user-data-dir=/tmp/code-server-data \

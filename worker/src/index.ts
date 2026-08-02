@@ -3104,7 +3104,7 @@ async function probeAppPreviewStatus(sandbox: Sandbox<unknown>, env: Env) {
  * 🔴 Why this is a CATCH-ALL and the app-preview host is not.
  *
  * code-server is launched by the container's `start-codeserver.sh` with
- * `--bind-addr 127.0.0.1:8443 --auth none` and NO proxy base-path flag, so it
+ * `--bind-addr 0.0.0.0:8443 --auth none` and NO proxy base-path flag, so it
  * believes it is mounted at `/`. It emits root-absolute asset URLs
  * (`/_static/...`, `/stable-<commit>/...`, `/manifest.json`, …) and opens its
  * extension-host / integrated-terminal WebSockets against that same root.

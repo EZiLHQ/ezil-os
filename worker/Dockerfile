@@ -195,10 +195,13 @@ RUN chmod +x /usr/bin/neko \
 # ── code-server (replaces the pinned Electron VS Code build above) ───────────
 # Installed via the official installer, which on Debian/Ubuntu fetches and
 # installs the .deb release from GitHub (detected automatically; see
-# https://code-server.dev/install.sh). Binds to 127.0.0.1:8443 only — never
-# 0.0.0.0 — with `--auth none`; start-neko.sh/start-codeserver.sh launch it,
-# and the only inbound path is the existing HMAC/cookie-gated containerFetch
-# proxy. This RUN step must stay in the SAME commit as the /usr/share/code
+# https://code-server.dev/install.sh). Binds **0.0.0.0**:8443 with `--auth
+# none`; start-neko.sh/start-codeserver.sh launch it. It bound 127.0.0.1 until
+# a live test showed Cloudflare's proxy reaches containers on their routable
+# address (10.0.0.1), never loopback — see the note in start-codeserver.sh.
+# Safe because the container network is not publicly routable and the sole
+# ingress is the HMAC/cookie-gated `*-code.ezil.org` bridge.
+# This RUN step must stay in the SAME commit as the /usr/share/code
 # COPY removal above so the two IDEs are never both present in one image.
 RUN curl -fsSL https://code-server.dev/install.sh | sh \
   && test -x /usr/bin/code-server
