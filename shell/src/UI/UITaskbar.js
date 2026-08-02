@@ -170,7 +170,7 @@ async function UITaskbar (options) {
     // Upstream opened a 500x500 popover here listing recent + recommended apps
     // from `puter.apps`. EZiL has no app registry to list, so the button only
     // announces the click and the desktop root decides what it means.
-    UITaskbarItem({
+    const el_start = UITaskbarItem({
         icon: window.icons['start.svg'],
         name: i18n('start'),
         sortable: false,
@@ -182,6 +182,21 @@ async function UITaskbar (options) {
             }));
         },
     });
+    // 🔴 A stable, purpose-built hook for whoever opens/closes the menu this
+    // button controls (`boot.js`'s `open_start_menu`/`close_start_menu`) to
+    // find it by, and the a11y contract that toggle keeps: `aria-expanded`
+    // starts `false` here and `boot.js` is the only thing that ever flips it,
+    // in the same places it opens/closes the menu — so it can never drift
+    // from the menu's real DOM presence. `data-app` is unusable for this: no
+    // `app` id was ever passed to `UITaskbarItem` above, so it carries
+    // whatever an encoded `undefined` happens to render as (OBSERVED: an
+    // empty string) — an implementation detail of `html_encode`, not a
+    // selector anything should rely on identifying the Start item by.
+    if ( el_start ) {
+        el_start.setAttribute('data-ezil-start', '1');
+        el_start.setAttribute('aria-haspopup', 'menu');
+        el_start.setAttribute('aria-expanded', 'false');
+    }
 
     window.make_taskbar_sortable();
 }
