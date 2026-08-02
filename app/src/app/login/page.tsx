@@ -11,6 +11,15 @@ import { LoginForm } from './login-form';
  * workspace (a new computer boots empty). Design/copy carried; the
  * component tree, auth wiring, and styling primitives are written fresh for
  * this repo's own (much smaller) dependency surface.
+ *
+ * 🔴 The logo below is a plain `<a href={Routes.HOME}>`, NOT a `<Link>`.
+ * `/` now redirects an authenticated visitor into `Routes.OS`, and `/os`
+ * only boots on a real document load (see `page.tsx` at the root and
+ * `login/entry-contract.test.ts`). A Next `<Link>` here would turn that
+ * redirect into an App Router soft navigation, which never executes `/os`'s
+ * `<script src>` tags — the exact dead-page defect this repo already fixed
+ * once for the sign-in path. Keep this an `<a>`; `entry-contract.test.ts`
+ * fails if it becomes a `<Link>` again.
  */
 export default async function LoginPage({
     searchParams,
@@ -30,9 +39,9 @@ export default async function LoginPage({
             </div>
             <div className="flex h-full w-full max-w-xl flex-col justify-between space-y-8 overflow-auto bg-charcoal/40 p-16">
                 <div className="flex items-center space-x-2">
-                    <Link href={Routes.HOME} className="text-lg font-semibold text-offwhite transition-opacity hover:opacity-80">
+                    <a href={Routes.HOME} className="text-lg font-semibold text-offwhite transition-opacity hover:opacity-80">
                         EZiL
-                    </Link>
+                    </a>
                 </div>
                 <div className="space-y-8">
                     <div className="space-y-4">
