@@ -302,6 +302,38 @@ must be reached by an actual document load:
   turn it into a loop) rather than sitting there silently. Belt and braces: the senders
   can all be right and a future contributor still adds a `<Link>` to the surface.
 
+## 18. Turbopack fatals on a `node_modules` symlink that escapes the project root
+
+§2 says `node_modules` must never live on R2-backed storage, so `start-neko.sh` symlinks
+it out to local ephemeral disk. Next 16's **default** dev bundler then refuses to start:
+
+```
+Error [TurbopackInternalError]: Symlink [project]/node_modules is invalid,
+it points out of the filesystem root
+```
+
+Deterministic, not a race. The fix is `turbopack: { root: '/' }` in `next.config.js` —
+`root` is a real, schema-validated option (`next/dist/server/config-schema.js`,
+`zTurbopackConfig.root`), and `/` is the only value that works here because the workspace
+mount and the local-state directory share no ancestor but the filesystem root.
+
+**Two traps around this:**
+
+- **A partial fix is worse than none.** The launcher also ran `rm -rf node_modules` before
+  installing. `rm -rf` on a *symlink* only unlinks it, so the split was destroyed on every
+  cold boot and `bun install` quietly materialised a real tree on the R2-backed root —
+  the §2 pathology, reintroduced automatically. Repairing only that, and leaving Turbopack
+  unconfigured, upgrades an intermittent failure into a **fatal on every boot**. Clear the
+  symlink's *target* in place instead; never unlink the symlink.
+- **A clobbered split becomes durable.** Once a real `node_modules` directory exists at the
+  workspace root, the boot script's own idempotent symlink setup `rm -rf`s it on the next
+  restart — so a broken install persists to R2 instead of self-healing.
+
+Second Turbopack landmine in this repo (see §12). Both were invisible until the real thing
+ran: the symptom here was an HTTP 500 `Cannot find module 'react/jsx-runtime'` plus ~20
+`_next/static` 404s, which reads like a missing dependency and is actually a bundler
+refusing to cross a symlink.
+
 ---
 
 ## Method notes
