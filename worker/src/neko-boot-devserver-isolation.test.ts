@@ -94,6 +94,9 @@ interface Harness {
     stderr: () => string;
     nekoPort: number;
     devserverCalledMarker: string;
+    /** Test-local NEKO_APP_PGID_DIR. Keeps these runs out of the shared
+     *  /tmp default, and gives afterEach the pids it needs to clean up. */
+    pgidDir: string;
 }
 
 let running: Harness | null = null;
@@ -105,6 +108,25 @@ afterEach(() => {
         // leaves background children (supervisors, monitor, the stubs), so kill
         // the whole process group rather than just the leader.
         try { process.kill(-running.proc.pid, 'SIGKILL'); } catch { /* already gone */ }
+    }
+    // …and then the supervised apps, which that group kill does NOT reach:
+    // supervise_app now starts each app under `setsid`, in its own process
+    // group, precisely so teardown can kill an app together with everything it
+    // forked. The pids are read from the records the script itself writes into
+    // this test's own NEKO_APP_PGID_DIR — never from a name search. Without
+    // this, each test left its stubbed code-server holding a port that the next
+    // test in this file reuses, and the later tests failed on a collision they
+    // had created themselves.
+    if (running?.pgidDir) {
+        for (const name of ['codeserver', 'chromium']) {
+            for (const suffix of ['pgid', 'sup']) {
+                const f = join(running.pgidDir, `${name}.${suffix}`);
+                if (!existsSync(f)) continue;
+                const pid = Number.parseInt(readFileSync(f, 'utf8').trim(), 10);
+                if (!Number.isFinite(pid) || pid <= 1) continue;
+                try { process.kill(suffix === 'pgid' ? -pid : pid, 'SIGKILL'); } catch { /* gone */ }
+            }
+        }
     }
     running = null;
     if (workdir) {
@@ -128,6 +150,7 @@ function bootWithDevserver (devserverBody: string): Harness {
     const nekoPort = pickPort(0);
     const codeServerPort = pickPort(1);
     const devserverCalledMarker = join(root, 'devserver-was-called');
+    const pgidDir = join(root, 'pgids');
 
     // X is "already up" so the script skips Xvfb entirely.
     writeStub(bin, 'xdpyinfo', 'exit 0');
@@ -166,6 +189,8 @@ function bootWithDevserver (devserverBody: string): Harness {
             NEKO_APP_HEALTH_FILE: join(root, 'health.json'),
             NEKO_APP_FATAL_SENTINEL: join(root, 'fatal'),
             NEKO_SWITCH_APP_BIN: join(root, 'neko-switch-app.sh'),
+            NEKO_APP_PGID_DIR: pgidDir,
+            NEKO_SHUTDOWN_FLAG: join(root, 'shutdown'),
             XDG_RUNTIME_DIR: join(root, 'xdg'),
             DISPLAY: ':99',
         },
@@ -175,7 +200,7 @@ function bootWithDevserver (devserverBody: string): Harness {
     proc.stderr?.on('data', (chunk) => { stderr += String(chunk); });
     proc.stdout?.on('data', () => { /* drained so the pipe can never fill */ });
 
-    const harness: Harness = { proc, stderr: () => stderr, nekoPort, devserverCalledMarker };
+    const harness: Harness = { proc, stderr: () => stderr, nekoPort, devserverCalledMarker, pgidDir };
     running = harness;
     return harness;
 }

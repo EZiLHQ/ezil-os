@@ -73,9 +73,19 @@ function parseSwitchAppArms(): Map<string, string> {
  * listening port, which by definition has no window to raise).
  */
 function parseDesktopApps(): { name: string; kind: string; target: string }[] {
-    const m = /EZIL_DESKTOP_APPS="\$\{EZIL_DESKTOP_APPS:-([^}]*)\}"/.exec(startNeko);
+    // Anchored to the whole assignment line rather than stopping at the first
+    // `}`, because the default now interpolates `${CODE_SERVER_PORT}` — the
+    // script's single source of truth for code-server's port, shared by the
+    // launch flag, this readiness declaration and the stale-listener preflight.
+    // Resolving that variable from its own default in the same file keeps the
+    // port un-hardcoded HERE too, so this still fails (rather than silently
+    // drifting) if the image ever moves code-server off 8443.
+    const m = /^EZIL_DESKTOP_APPS="\$\{EZIL_DESKTOP_APPS:-(.*)\}"$/m.exec(startNeko);
     expect(m, 'EZIL_DESKTOP_APPS default not found in start-neko.sh').toBeTruthy();
+    const portM = /^CODE_SERVER_PORT="\$\{CODE_SERVER_PORT:-(\d+)\}"$/m.exec(startNeko);
+    expect(portM, 'CODE_SERVER_PORT default not found in start-neko.sh').toBeTruthy();
     return m![1]!
+        .replaceAll('${CODE_SERVER_PORT}', portM![1]!)
         .trim()
         .split(/\s+/)
         .filter(Boolean)
