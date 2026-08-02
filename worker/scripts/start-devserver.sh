@@ -234,10 +234,37 @@ else
         DEV_CMD="$5"
         HOST_VALUE="${6:-0.0.0.0}"
         write_phase() { echo "$1 $(date +%s 2>/dev/null || echo 0)" >"$PHASE_FILE"; }
+        # start-neko.sh symlinks ./node_modules to a directory on local
+        # ephemeral disk (EZIL_LOCAL_STATE_DIR — see that script's "Split
+        # mount" section and docs/PLATFORM-NOTES.md §2: node_modules must
+        # never live on the R2-backed workspace root, where even a cold
+        # install is pathologically slow). A blind `rm -rf node_modules`
+        # UNLINKS that symlink (rm never follows a symlink to recurse into
+        # its target — it just removes the link itself), so the very next
+        # install call below would materialize a brand-new REAL directory
+        # back on the workspace root, silently breaking the split on every
+        # cold boot. clean_node_modules() clears the SYMLINK'S TARGET
+        # in-place instead, so node_modules is always emptied for a truly
+        # clean install without ever losing the local-disk redirection.
+        clean_node_modules() {
+            if [ -L node_modules ]; then
+                local target
+                target="$(readlink -f node_modules 2>/dev/null || true)"
+                if [ -n "$target" ] && [ -d "$target" ]; then
+                    rm -rf "$target"
+                    mkdir -p "$target"
+                    return 0
+                fi
+            fi
+            # Not a symlink (or the symlink target could not be resolved) —
+            # no split to preserve, fall back to the simple/original behavior.
+            rm -rf node_modules
+        }
         if [ ! -x node_modules/.bin/next ] && grep -q "\"next\"" package.json 2>/dev/null && command -v bun >/dev/null 2>&1; then
             echo "[devserver] preparing Next.js dependencies with bun" >&2
             write_phase "installing_deps"
-            rm -rf node_modules package-lock.json
+            clean_node_modules
+            rm -f package-lock.json
             bun install --no-progress
         elif [ ! -d node_modules ]; then
             echo "[devserver] installing dependencies with $PM" >&2
@@ -246,7 +273,7 @@ else
                 bun)  bun install --no-progress ;;
                 pnpm) pnpm install --prefer-frozen-lockfile ;;
                 yarn) yarn install --frozen-lockfile ;;
-                npm)  npm ci --no-audit --no-fund || { rm -rf node_modules package-lock.json && npm install --no-audit --no-fund; } ;;
+                npm)  npm ci --no-audit --no-fund || { clean_node_modules; rm -f package-lock.json; npm install --no-audit --no-fund; } ;;
             esac
         fi
         if [ -f node_modules/next/dist/bin/next ] && [ ! -x node_modules/.bin/next ]; then

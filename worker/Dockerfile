@@ -243,11 +243,17 @@ RUN test -f /usr/local/lib/ezil/workspace-bootstrap.mjs
 # on why object storage must never see `node_modules`). The `dev` script MUST
 # stay `next dev --port 3002` — this is the exact command `desktop-mode.ts`'s
 # `APP_PREVIEW_PORT` doc comment and this file's own EXPOSE 3002 comment below
-# both reference by name.
+# both reference by name. `next.config.js`'s `turbopack.root: '/'` is likewise
+# required, not optional: start-neko.sh symlinks node_modules to local disk
+# OUTSIDE this workspace root, and Next 16's Turbopack dev server fatals on
+# any node_modules symlink escaping its detected project root without it
+# (`Symlink [project]/node_modules is invalid, it points out of the
+# filesystem root`) — see that file's own doc comment for the full trace.
 COPY sandbox-template /opt/ezil-sandbox-template
 RUN test -f /opt/ezil-sandbox-template/package.json \
   && test -f /opt/ezil-sandbox-template/README.md \
-  && test -f /opt/ezil-sandbox-template/pages/index.js
+  && test -f /opt/ezil-sandbox-template/pages/index.js \
+  && test -f /opt/ezil-sandbox-template/next.config.js
 
 # Required so `wrangler dev` can proxy the exposed port locally. 8080 serves the
 # Apache Guacamole HTML5 client (Tomcat); guacd (4822) and x11vnc (5901) stay
