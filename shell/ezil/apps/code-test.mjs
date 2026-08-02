@@ -274,27 +274,43 @@ push('and the fresh URL is the one the SECOND call returned',
 // ═══════════════════════════════════════════════════════════════════════════
 // 5. FRAME HONESTY, BOTH DIRECTIONS, inside the shell.
 // ═══════════════════════════════════════════════════════════════════════════
-// 🔴 M16 (round 9 mutation pass): the checks below read `.hidden` — the IDL
-// property jsdom actually implements — as the oracle for "is the boot panel
-// down". That is exactly the property the round-6 regression class defeats:
-// an inline `style.display` set alongside `hidden = true` beats the UA's
-// `[hidden] { display: none }` in a REAL cascade, so the panel keeps
-// painting over a working iframe while `.hidden` still reads `true`. jsdom
-// has no cascade at all, so this file structurally CANNOT see that class of
-// bug either way (see this file's own header, "It cannot prove pixels") —
-// PROVEN: reintroducing that exact inline style (`el_unavailable.style.
-// display = 'flex'` in `code.js`) leaves this file's 32/32 unchanged.
-// That mutation IS caught, in a real browser, computed-style, by
-// `overlay-paint-browser-test.mjs` (3 failing checks, this exact scenario)
-// AND `stacking-browser-test.mjs`'s `checkContentPainted` (fails at every
-// viewport) — see the wave-g-t20 report for both runs. This file's jsdom
-// checks below are the fast wiring/ordering smoke test; those two are the
-// pixel oracle for this specific regression class, by design, not by gap.
+// 🔴 M16 (round 9), RE-INVESTIGATED wave-h/t23 — the previous version of this
+// comment claimed jsdom "structurally CANNOT see that class of bug either
+// way" and relied solely on `.hidden` — the IDL property, which the round-6
+// regression defeats (an inline `style.display` set alongside `hidden = true`
+// beats the UA's `[hidden] { display: none }` in a real cascade, so `.hidden`
+// keeps reading `true` while the panel still paints). That claim was too
+// broad. MEASURED (see wave-h-t23 report): jsdom's `getComputedStyle` DOES
+// correctly resolve this exact cascade, inline-style-vs-attribute-selector
+// included — a probe against the identical CSS shape (`.foo{display:flex}` +
+// `.foo[hidden]{display:none}` + an inline `style.display='flex'` set
+// alongside `hidden=true`) returns `flex`, matching a real browser. So
+// `getComputedStyle(...).display` (added below, both success paths) is a
+// REAL, mutation-proven assertion in jsdom, not a fast smoke test — proven by
+// reintroducing `el_unavailable.style.display = 'flex'` in `code.js`, which
+// flips these NEW checks red while leaving every pre-existing `.hidden` check
+// green (see the wave-h-t23 report for the exact run).
+//
+// What jsdom genuinely cannot do, and this file does not attempt: `document.
+// elementFromPoint` (real hit-testing against actual layout) is simply
+// unimplemented in jsdom — `doc.elementFromPoint` is `undefined`, calling it
+// throws `TypeError: ... is not a function` (verified). That half of the
+// regression class — "is the failure panel ACTUALLY on top, pixel-wise" —
+// stays exclusively `overlay-paint-browser-test.mjs`'s job (a real Chromium
+// via Playwright), which already asserts exactly that ("a real hit-test at
+// the window body's centre lands INSIDE THE IFRAME, not an overlay", 30/30)
+// AND `stacking-browser-test.mjs`'s `checkContentPainted` — see the
+// wave-g-t20 report for those runs. This file's jsdom checks below are now a
+// real (not fake) computed-style assertion PLUS the wiring/ordering smoke
+// test; the two browser suites remain the pixel/hit-test oracle, by design.
 // Direction A: the browser fires `load`. That must NOT be what reveals the
 // frame — only the server's answer may.
 const progressA = win2?.querySelector('[data-kind]');
 push('the boot panel is still up at the moment `load` fires',
     !! progressA && progressA.hidden === false, `hidden=${progressA?.hidden}`);
+push('...and is actually painted that way, not just flagged (computed display is NOT none)',
+    !! progressA && window.getComputedStyle(progressA).display !== 'none',
+    `display=${progressA && window.getComputedStyle(progressA).display}`);
 push('nothing asked the server before `load`',
     ! calls.some(c => c.url.includes('confirm=frame')));
 
@@ -309,6 +325,9 @@ push('confirmFrame was asked about the URL the iframe is actually showing',
 push('\u{1f534} DIRECTION A - a CONFIRMED frame brings the boot panel down',
     !! progressA && progressA.hidden === true,
     `hidden=${progressA?.hidden}`);
+push('\u{1f534} DIRECTION A - and it is TRULY down: computed display is none, not just the `hidden` flag',
+    !! progressA && window.getComputedStyle(progressA).display === 'none',
+    `display=${progressA && window.getComputedStyle(progressA).display}`);
 
 // Direction B: same window, same code, same `load` event — and a frame the
 // server refuses. Direction A passing is what makes this a discrimination
@@ -325,6 +344,9 @@ const progressB = win3?.querySelector('[data-kind]');
 push('\u{1f534} DIRECTION B - a REFUSED frame leaves the boot panel up',
     !! progressB && progressB.hidden === false,
     `hidden=${progressB?.hidden}`);
+push('\u{1f534} DIRECTION B - and it is TRULY up: computed display is NOT none',
+    !! progressB && window.getComputedStyle(progressB).display !== 'none',
+    `display=${progressB && window.getComputedStyle(progressB).display}`);
 push('...and says the desktop is not answering, never "ready"',
     progressB?.getAttribute('data-kind') === 'failed',
     `data-kind=${progressB?.getAttribute('data-kind')}`);
@@ -342,6 +364,14 @@ push('an unavailable code-server says so, honestly',
 push('🔴 …and NEVER navigates the frame to an invented URL',
     (win4?.querySelector('.window-app-iframe')?.getAttribute('src') ?? '') === 'about:blank',
     win4?.querySelector('.window-app-iframe')?.getAttribute('src') ?? '(none)');
+const elUnavailableC = win4?.querySelector('.ezil-code-unavailable');
+push('\u{1f534} the "unavailable" panel is TRULY visible: computed display is NOT none',
+    !! elUnavailableC && window.getComputedStyle(elUnavailableC).display !== 'none',
+    `display=${elUnavailableC && window.getComputedStyle(elUnavailableC).display}`);
+const progressC = win4?.querySelector('[data-kind]');
+push('...and the boot panel underneath is TRULY hidden — no double-overlay',
+    !! progressC && window.getComputedStyle(progressC).display === 'none',
+    `display=${progressC && window.getComputedStyle(progressC).display}`);
 codePreviewUrlMode = 'ok';
 await window.$(win4).close();
 await settle(4);
