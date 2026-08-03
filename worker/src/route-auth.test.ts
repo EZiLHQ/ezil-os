@@ -123,6 +123,13 @@ function fakeSandboxNamespace(options: {
    * only proves the ROUTE TABLE (auth, kill switch, response mapping).
    */
   restartResult?: Record<string, unknown>;
+  /**
+   * When set, any `exec()` command touching the container's boot-telemetry
+   * NDJSON path (`ezil-telemetry.ndjson` — see `drainContainerBootTelemetry`,
+   * `./index.ts`) returns this as `stdout` instead of the default `''`. Lets a
+   * test prove boot-phase data actually reaches `spoolTelemetry()`.
+   */
+  containerTelemetryNdjson?: string;
 }): { binding: unknown; calls: CallLog } {
   /** The sandbox id the Worker actually opened the DO with. */
   let openedWith = SANDBOX_NAME;
@@ -243,8 +250,16 @@ function fakeSandboxNamespace(options: {
       calls.getExposedPorts++;
       return options.exposedPorts ?? [];
     },
-    exec: async () => {
+    exec: async (...args: unknown[]) => {
       calls.exec++;
+      const [command] = args as [string | undefined];
+      if (
+        options.containerTelemetryNdjson !== undefined &&
+        typeof command === 'string' &&
+        command.includes('ezil-telemetry.ndjson')
+      ) {
+        return { exitCode: 0, stdout: options.containerTelemetryNdjson, stderr: '' };
+      }
       return { exitCode: 0, stdout: '', stderr: '' };
     },
     // Only wired when `options.exposePort` is supplied — otherwise the Proxy's
@@ -1115,6 +1130,100 @@ describe('POST /sandbox/preview returns appPreviewUrl + codePreviewUrl', () => {
     // …and the failure is surfaced, not swallowed.
     expect((body.codePreviewExpose as { attempted: boolean; exposed: boolean }).attempted).toBe(true);
     expect((body.codePreviewExpose as { attempted: boolean; exposed: boolean }).exposed).toBe(false);
+  });
+});
+
+// ── Telemetry: boot phase/outcome data reaches the R2 spool ─────────────────
+//
+// Before this, `proc.getLogs()` was read only on the FAILURE path inside
+// `ensureDesktop`, and nowhere durable at all — a healthy boot's own
+// container-emitted phase timings were invisible everywhere except a live
+// `wrangler tail`. This proves the fix end to end through the REAL route
+// table: a fake R2 bucket stands in for `TELEMETRY_R2_BUCKET`, and the fake
+// container's `exec()` answers the boot-telemetry drain command
+// (`ezil-telemetry.ndjson`) with canned NDJSON — see `fakeSandboxNamespace`'s
+// `containerTelemetryNdjson` option.
+describe('telemetry: boot phase/outcome data reaches the R2 spool on a SUCCESSFUL boot', () => {
+  function fakeTelemetryBucket(): { bucket: unknown; puts: Array<{ key: string; body: string }> } {
+    const puts: Array<{ key: string; body: string }> = [];
+    return {
+      puts,
+      bucket: {
+        put: async (key: string, body: string) => {
+          puts.push({ key, body });
+          return {};
+        },
+      },
+    };
+  }
+
+  const CONTAINER_NDJSON = [
+    '{"eventClass":"boot_phase","source":"container","site":"xvfb","code":"ok","outcome":"ok","durationMs":210}',
+    '{"eventClass":"boot_summary","source":"container","site":"ready","code":"ok","outcome":"ok","durationMs":5900}',
+  ].join('\n');
+
+  async function preview(env: Record<string, unknown>, binding: unknown) {
+    const res = await worker.fetch(
+      new Request('https://api-desktop.ezil.org/sandbox/preview', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          token: await mintToken(),
+          projectId: 'proj-telemetry',
+          userId: 'user-telemetry',
+          desktopMode: 'neko',
+        }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, ...env },
+    );
+    return { res, body: (await res.json()) as Record<string, unknown> };
+  }
+
+  it('spools ONE ndjson object containing the worker boot_summary AND the container-emitted lines', async () => {
+    const { binding } = fakeSandboxNamespace({ exposePort: () => true, containerTelemetryNdjson: CONTAINER_NDJSON });
+    const { bucket, puts } = fakeTelemetryBucket();
+    const { res, body } = await preview({ TELEMETRY_R2_BUCKET: bucket }, binding);
+
+    expect(res.status).toBe(200);
+    expect(body.ok).toBe(true);
+
+    expect(puts).toHaveLength(1);
+    const lines = puts[0].body.split('\n').map((l) => JSON.parse(l) as Record<string, unknown>);
+    // The Worker's own boot_summary (sandbox.preview.desktop_ready, ok).
+    expect(lines.some((l) => l.eventClass === 'boot_summary' && l.source === 'worker' && l.outcome === 'ok')).toBe(
+      true,
+    );
+    // The container's own two lines, drained via the exec() fake.
+    expect(lines.some((l) => l.source === 'container' && l.site === 'xvfb')).toBe(true);
+    expect(lines.some((l) => l.source === 'container' && l.eventClass === 'boot_summary' && l.site === 'ready')).toBe(
+      true,
+    );
+    // Every row is correlated to THIS request, joinable across worker+container.
+    const correlationId = body.correlationId as string;
+    expect(correlationId).toBeTruthy();
+    expect(lines.every((l) => l.correlationId === correlationId)).toBe(true);
+    // Keyed by that same correlation id (design doc §4.1's v1/dt=/hh=/ layout).
+    expect(puts[0].key).toContain(`/${correlationId}.ndjson`);
+    expect(puts[0].key.startsWith('v1/dt=')).toBe(true);
+  });
+
+  it('is a silent no-op when TELEMETRY_R2_BUCKET is not configured — never fails the preview', async () => {
+    const { binding } = fakeSandboxNamespace({ exposePort: () => true, containerTelemetryNdjson: CONTAINER_NDJSON });
+    const { res, body } = await preview({}, binding);
+    expect(res.status).toBe(200);
+    expect(body.ok).toBe(true);
+    // No bucket binding at all — nothing to assert on except that this didn't throw.
+  });
+
+  it('still spools the worker boot_summary even with NO container telemetry present (older image)', async () => {
+    const { binding } = fakeSandboxNamespace({ exposePort: () => true }); // no containerTelemetryNdjson
+    const { bucket, puts } = fakeTelemetryBucket();
+    const { res } = await preview({ TELEMETRY_R2_BUCKET: bucket }, binding);
+    expect(res.status).toBe(200);
+    expect(puts).toHaveLength(1);
+    const lines = puts[0].body.split('\n').map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(lines.every((l) => l.source === 'worker')).toBe(true);
+    expect(lines.some((l) => l.eventClass === 'boot_summary')).toBe(true);
   });
 });
 

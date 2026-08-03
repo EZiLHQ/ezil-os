@@ -152,6 +152,27 @@ const defaultSink: LogSink = (event) => {
 };
 
 /**
+ * A sink that behaves EXACTLY like the default (`console.log(JSON.stringify(event))`,
+ * so `wrangler tail` keeps working unchanged) while ALSO accumulating every
+ * built event into `events`, so a caller can harvest the ones worth spooling
+ * to the telemetry pipeline (`./telemetry.ts`'s `selectTelemetryWorthy` +
+ * `toTelemetryEventInput`) once the request is done.
+ *
+ * Purely additive: none of the 25 existing `tl.event`/`tl.stage` call sites
+ * in `index.ts` change — only the `LifecycleTimeline` CONSTRUCTION site
+ * passes `{ sink: createCollectingSink(events) }` instead of relying on the
+ * default. `events` is mutated in place (pushed to) rather than returned,
+ * so the caller can pass the SAME array to multiple timelines/requests if it
+ * ever needs to (not done today — one array per request).
+ */
+export function createCollectingSink(events: LogEvent[]): LogSink {
+  return (event) => {
+    console.log(JSON.stringify(event));
+    events.push(event);
+  };
+}
+
+/**
  * A correlation timeline binding every stage event of one preview request to a
  * single `correlationId`, with per-stage duration measurement.
  *

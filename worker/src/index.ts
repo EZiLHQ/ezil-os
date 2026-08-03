@@ -110,6 +110,19 @@ interface Env extends SandboxEnv {
   /** R2 bucket binding backing the persistent sandbox workspace (`ezil-sandbox-workspaces`). */
   SANDBOX_WORKSPACE_R2_BUCKET?: R2Bucket;
 
+  /**
+   * OPTIONAL R2 bucket binding backing the fleet crash-telemetry spool
+   * (`ezil-telemetry-spool`) — see `scratchpad/telemetry-design.md` §4.1 and
+   * `./telemetry.ts`. Deliberately a SEPARATE bucket from
+   * `SANDBOX_WORKSPACE_R2_BUCKET`: that one is FUSE-mounted into user
+   * containers, and a mount that ever resolved without a per-computer prefix
+   * would put the whole fleet's error log inside a user's file manager.
+   * Absent binding (e.g. local dev, or before the bucket is provisioned) is
+   * a silent no-op in `spoolTelemetry()` — telemetry must never become a
+   * hard dependency of the preview path.
+   */
+  TELEMETRY_R2_BUCKET?: R2Bucket;
+
   // ── S3-compatible workspace bucket (mounted into the sandbox container) ────
   // Names are deliberately prefixed `SANDBOX_WORKSPACE_S3_*` so they never
   // collide with unrelated AWS/Bedrock credential env vars used elsewhere in
@@ -447,7 +460,14 @@ import {
   mintPreviewBootstrapToken,
   PREVIEW_COOKIE_NAME,
 } from './hmac';
-import { LifecycleTimeline, newCorrelationId } from './observability';
+import { LifecycleTimeline, newCorrelationId, createCollectingSink, type LogEvent } from './observability';
+import {
+  selectTelemetryWorthy,
+  toTelemetryEventInput,
+  parseContainerTelemetryLines,
+  serializeTelemetryBatch,
+  buildTelemetryR2Key,
+} from './telemetry';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -762,6 +782,32 @@ function bootLog(
  * Readiness is verified against the real port state (not the launcher process's
  * lifetime) so an already-running desktop is detected instead of failing.
  */
+/**
+ * Fixed path `emit_telemetry()` (`scripts/start-neko.sh`) appends one JSON
+ * line to per boot phase. Capped at 64 KB (design doc §4.2) — this is a tail
+ * read of the MOST RECENT boot's phases, never the whole file history.
+ */
+const CONTAINER_TELEMETRY_PATH = '/var/log/ezil-telemetry.ndjson';
+const CONTAINER_TELEMETRY_MAX_BYTES = 65_536;
+
+/**
+ * Best-effort drain of the container's own structured boot-phase log. Never
+ * throws — a missing file (older image, or nothing emitted yet) or a read
+ * failure just yields `''`, exactly like every other diagnostic read in this
+ * file (`pollDesktopReady`, `handleCpuDiag`).
+ */
+async function drainContainerBootTelemetry(sandbox: Sandbox<unknown>): Promise<string> {
+  try {
+    const res = await sandbox.exec(
+      `tail -c ${CONTAINER_TELEMETRY_MAX_BYTES} ${CONTAINER_TELEMETRY_PATH} 2>/dev/null || true`,
+      { origin: 'internal' },
+    );
+    return res.exitCode === 0 ? (res.stdout ?? '') : '';
+  } catch {
+    return '';
+  }
+}
+
 async function ensureDesktop(
   sandbox: Sandbox<unknown>,
   hostname: string,
@@ -770,6 +816,17 @@ async function ensureDesktop(
   startupDelivery: string | null = null,
   workspaceRoot: string | null = null,
   cpuDiagFlag: string | undefined = undefined,
+  /**
+   * Best-effort sink for the container's own boot-phase/outcome telemetry
+   * (`scripts/start-neko.sh`'s `emit_telemetry()`), called with the raw
+   * NDJSON tail on BOTH the success path and the failure path right below —
+   * this is the fix for "boot phase/outcome data only reaches anywhere on
+   * failure": previously only `proc.getLogs()`'s stderr tail was read, and
+   * only when `!ready`. Never awaited by the caller's response path; the
+   * caller decides what to do with the raw text (parse + spool to R2, or
+   * ignore it entirely when telemetry is unconfigured).
+   */
+  onBootTelemetry?: (raw: string) => void,
 ): Promise<{ url: string; appPreviewExpose: AppPreviewExposeResult; codePreviewExpose: AppPreviewExposeResult }> {
   const bootT0 = Date.now();
   const { port, readyPath } = portFor(mode);
@@ -897,6 +954,16 @@ async function ensureDesktop(
     } catch {
       /* logs are best-effort diagnostics */
     }
+    // Boot phase/outcome data must reach the ingest path on the FAILURE path
+    // too, not just a human-readable stderr tail folded into this Error's
+    // message — see this function's `onBootTelemetry` param doc comment.
+    if (onBootTelemetry) {
+      try {
+        onBootTelemetry(await drainContainerBootTelemetry(sandbox));
+      } catch {
+        /* telemetry drain is best-effort; must never mask the real boot failure */
+      }
+    }
     bootLog('ready', 'end', { status: 'error', cumulativeMs: Date.now() - bootT0 });
     throw new Error(`desktop_failed_to_start: ${detail}`);
   }
@@ -968,6 +1035,18 @@ async function ensureDesktop(
   }
 
   bootLog('ready', 'end', { status: 'ok', phaseMs: Date.now() - bootT0, cumulativeMs: Date.now() - bootT0 });
+  // Boot phase/outcome data must reach the ingest path on the SUCCESS path
+  // too — previously nothing at all read the container's own boot-phase log
+  // when the boot went fine (`proc.getLogs()` was only ever consulted on the
+  // `!ready` branch above), so a healthy boot's own phase timings/skips were
+  // invisible everywhere except a live `wrangler tail`.
+  if (onBootTelemetry) {
+    try {
+      onBootTelemetry(await drainContainerBootTelemetry(sandbox));
+    } catch {
+      /* telemetry drain is best-effort; must never fail an otherwise-ready desktop */
+    }
+  }
   return { url: desktopUrl, appPreviewExpose, codePreviewExpose };
 }
 
@@ -2306,7 +2385,12 @@ interface PreviewBody {
   startupDelivery?: string;
 }
 
-async function handlePreview(request: Request, env: Env, url: URL): Promise<Response> {
+async function handlePreview(
+  request: Request,
+  env: Env,
+  url: URL,
+  ctx?: ExecutionContext,
+): Promise<Response> {
   // Correlate every stage of this preview request under one id. Prefer an
   // inbound request id header so the browser/web-API and Worker timelines
   // stitch together; otherwise mint a fresh one.
@@ -2314,6 +2398,16 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
     request.headers.get('x-request-id')?.trim() ||
     request.headers.get('x-correlation-id')?.trim() ||
     newCorrelationId();
+
+  // Every `LogEvent` this request's `LifecycleTimeline` builds is ALSO
+  // accumulated here (additive — `createCollectingSink`, `./observability.ts`)
+  // so it can be spooled to the telemetry R2 bucket once the response is
+  // decided, alongside whatever the container itself emitted during THIS
+  // boot (`containerTelemetryRaw`, filled in by `ensureDesktop`'s
+  // `onBootTelemetry` callback below). See `spoolTelemetry()`.
+  const collectedLogs: LogEvent[] = [];
+  let containerTelemetryRaw = '';
+  let bootSandboxId: string | undefined;
 
   let body: PreviewBody = {};
   try {
@@ -2328,6 +2422,7 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
     correlationId,
     projectId: body.projectId,
     userId: body.userId,
+    sink: createCollectingSink(collectedLogs),
   });
   tl.event('web_api', 'sandbox.preview.received', 'ok');
 
@@ -2397,6 +2492,7 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
 
   const sandboxId = deriveSandboxId(body.userId ?? 'anon', scopeId);
   tl.setSandboxId(sandboxId);
+  bootSandboxId = sandboxId;
 
   // The R2 workspace mount prefix is keyed on the FULL scope id + branch
   // (not the truncated/sanitized `sandboxId`) so it matches the write
@@ -2464,6 +2560,9 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
       mode === 'neko' ? (body.startupDelivery ?? null) : null,
       workspace.mounted ? workspace.mountPath ?? null : null,
       env.EZIL_NEKO_CPU_DIAG_ENABLED,
+      (raw) => {
+        containerTelemetryRaw = raw;
+      },
     );
     const guacamoleUrl = mode === 'neko' ? exposedUrl : toGuacamoleUrl(exposedUrl, url.protocol);
     desktopDone('ok');
@@ -2558,7 +2657,7 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
       );
     }
 
-    return json({
+    const response = json({
       ok: true,
       guacamoleUrl,
       expiresAt: Date.now() + SESSION_TTL_MS,
@@ -2574,12 +2673,67 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
       appPreviewUrl,
       codePreviewUrl,
     });
+    // Spool AFTER the response is built, never awaited by it — see
+    // `spoolTelemetry`'s own doc comment for the "no telemetry code path is
+    // ever awaited by a code path that produces user-visible output"
+    // guarantee (design doc §4.6).
+    spoolTelemetry(env, ctx, correlationId, bootSandboxId, collectedLogs, containerTelemetryRaw);
+    return response;
   } catch (err) {
     tl.event('preview_lifecycle', 'sandbox.preview.failed', 'error', { error: err });
+    spoolTelemetry(env, ctx, correlationId, bootSandboxId, collectedLogs, containerTelemetryRaw);
     return json(
       { ok: false, error: err instanceof Error ? err.message : String(err), mode },
       500,
     );
+  }
+}
+
+/**
+ * Spool this request's telemetry-worthy events — the Worker's own
+ * `LifecycleTimeline` events (filtered by `selectTelemetryWorthy`) AND
+ * whatever the container itself emitted during this boot (parsed by
+ * `parseContainerTelemetryLines`) — to the R2 telemetry spool, as ONE NDJSON
+ * object keyed by this request's correlation id (design doc §4.1/§4.2).
+ *
+ * Absent `env.TELEMETRY_R2_BUCKET` (unconfigured deployment) or an empty
+ * batch are both silent no-ops — telemetry must never become a hard
+ * dependency, and never trip an error path of its own. The PUT is scheduled
+ * via `ctx.waitUntil()` when available (real Workers runtime), so it can
+ * keep running after the response is already on the wire; a missing `ctx`
+ * (e.g. a test harness that calls `fetch(request, env)` with only two
+ * arguments) still fires the PUT, just without that extension guarantee —
+ * consistent with every other "best-effort, never blocks the response"
+ * convention in this handler. NEVER awaited by the caller.
+ */
+function spoolTelemetry(
+  env: Env,
+  ctx: ExecutionContext | undefined,
+  correlationId: string,
+  sandboxId: string | undefined,
+  workerLogs: readonly LogEvent[],
+  containerTelemetryRaw: string,
+): void {
+  const bucket = env.TELEMETRY_R2_BUCKET;
+  if (!bucket) return;
+
+  const workerEvents = selectTelemetryWorthy(workerLogs).map((e) => toTelemetryEventInput(e));
+  const containerEvents = parseContainerTelemetryLines(containerTelemetryRaw, { correlationId, sandboxId });
+  const events = [...workerEvents, ...containerEvents];
+  if (events.length === 0) return;
+
+  const key = buildTelemetryR2Key(new Date(), correlationId);
+  const body = serializeTelemetryBatch(events);
+  const put = bucket
+    .put(key, body, { httpMetadata: { contentType: 'application/x-ndjson' } })
+    .catch((err: unknown) => {
+      // A failed telemetry PUT is a no-op, never a 500 (design §4.1/§4.6) —
+      // still logged loudly so a persistently-broken spool is observable.
+      console.error(`[spoolTelemetry] R2 put failed (key=${key}): ${err instanceof Error ? err.message : String(err)}`);
+    });
+
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(put);
   }
 }
 
@@ -3886,7 +4040,7 @@ async function handleTerminate(env: Env, sandboxName: string): Promise<Response>
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     // 0) Option D bridge hostnames — app-preview (`<APP_PREVIEW_PORT>-<id>-app.<zone>`)
     //    AND code-server (`<CODE_PREVIEW_PORT>-<id>-code.<zone>`): handled
     //    ENTIRELY by our own token/cookie-gated dispatcher, BEFORE
@@ -3936,7 +4090,7 @@ export default {
     }
 
     if (method === 'POST' && path === '/sandbox/preview') {
-      return handlePreview(request, env, url);
+      return handlePreview(request, env, url, ctx);
     }
 
     const statusMatch = path.match(/^\/sandbox\/([^/]+)\/status$/);
