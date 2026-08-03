@@ -82,6 +82,69 @@ describe('sanitizeErrorMessage', () => {
     expect(sanitizeErrorMessage('')).toBe('');
     expect(sanitizeErrorMessage(undefined)).toBe('');
   });
+
+  /**
+   * 🔴 The Worker half of the path-redaction fix. `app/src/server/telemetry/sanitize.ts`
+   * is a byte-identical twin of this function and carries the same cases; both
+   * are asserted here so removing the rule from EITHER file goes red on its own
+   * suite, not only via the cross-repo parity test.
+   */
+  describe('absolute paths — the workspace path is a username and a project name', () => {
+    // The exact string measured end-to-end through the shipped chain before
+    // the rule existed; it landed in `ezil_error_events.detail` verbatim.
+    const MEASURED =
+      'restart rejected for <url> after 20001ms for u_b6b2f6a3 at ' +
+      '/home/user1/workspace/proj-1 (cid_abc1, computer <uuid>, port :8444)';
+
+    it('strips the measured leak and keeps the diagnosis', () => {
+      const out = sanitizeErrorMessage(MEASURED);
+      expect(out).not.toContain('user1');
+      expect(out).not.toContain('proj-1');
+      expect(out).toContain('<path>');
+      expect(out).toContain('port :8444');
+      expect(out).toContain('20001ms');
+      expect(out).toContain('cid_abc1');
+    });
+
+    it('strips paths out of the two producers this Worker actually builds', () => {
+      const mount = sanitizeErrorMessage(
+        'mount_failed_after_4_attempts: s3fs: could not mount /workspace/alice/secret-startup',
+      );
+      expect(mount).not.toContain('alice');
+      expect(mount).not.toContain('secret-startup');
+      expect(mount).toContain('mount_failed_after_4_attempts');
+      const seed = sanitizeErrorMessage("seed_check_failed: ENOENT, open '/home/bob/workspace/my app/.env'");
+      expect(seed).not.toContain('bob');
+      expect(seed).not.toContain('my app');
+      expect(seed).toContain('seed_check_failed');
+    });
+
+    it('strips a workspace path smuggled inside a URL', () => {
+      const out = sanitizeErrorMessage('fetch https://8444-guac-x.workers.dev/home/user1/workspace/p1/i.html failed');
+      expect(out).not.toContain('user1');
+      expect(out).not.toContain('p1');
+      expect(out).toBe('fetch <url> failed');
+    });
+
+    it('leaves non-paths completely alone', () => {
+      for (const s of [
+        'http 500 on :8444 read/write conflict, ratio 1/2',
+        'expected 200 / got 500',
+        'openWindow@UIWindow.js:12:34',
+        '08/01/2026 boot failed',
+        'workspace_fuse_unavailable: fuse: device not found',
+        'stop_timed_out: exit 137 after 20001ms',
+      ]) {
+        expect(sanitizeErrorMessage(s)).toBe(s);
+      }
+    });
+
+    it('is idempotent, so sanitizing at the source and again on the way out is safe', () => {
+      for (const s of [MEASURED, '/home/u/w/p failed', 'C:\\a\\b broke']) {
+        expect(sanitizeErrorMessage(sanitizeErrorMessage(s))).toBe(sanitizeErrorMessage(s));
+      }
+    });
+  });
 });
 
 describe('classifyError', () => {

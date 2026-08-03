@@ -101,6 +101,73 @@ push('capture() called 1000x with no browser globals at all: never throws', ! th
     push('the weakest eventId path still produces 500 distinct ids', ids.size === 500, `${ids.size}/500`);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 0c. `redact()` MUST strip absolute filesystem paths.
+//
+//     🔴 A workspace path is `/home/<login>/workspace/<project>` — a username
+//     and a project name. `docs/telemetry.md` promises under "What is never
+//     collected" that these never reach storage. This is the FIRST of the
+//     three places that promise is enforced (the server's
+//     `sanitizeErrorMessage` and its byte-identical Worker twin are the
+//     other two, and they are the actual boundary — this one only has to keep
+//     it off the wire in the first place).
+//
+//     Extracted from the SOURCE the same way `newEventId` is above, because
+//     `redact` is module-private: nothing exports it, and testing it through
+//     `capture()` would only prove the composite, not the rule.
+//
+//     Both directions are asserted. A redactor that ate everything would pass
+//     "no path survived" and be useless: `port :8444`, durations, correlation
+//     ids and `file.js:12:34` positions are the diagnosis, and every one of
+//     them must come out unchanged.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const src = fs.readFileSync(path.join(here, 'telemetry.js'), 'utf8');
+    const start = src.indexOf('function redact');
+    const end = src.indexOf('function normalizeCode');
+    if ( start === -1 || end === -1 || end < start ) {
+        console.error('could not extract redact() from telemetry.js — the test, not the code, is stale');
+        process.exit(1);
+    }
+    const redact = new Function(`${src.slice(start, end)}; return redact;`)();
+
+    // The exact string measured end-to-end through the shipped chain
+    // (telemetry.js -> handleTelemetryPost -> parseTelemetryBatch ->
+    // ingestBatch -> Postgres) before this rule existed. It was stored in
+    // `ezil_error_events.detail` verbatim.
+    const MEASURED = 'restart rejected for https://api-desktop.ezil.org/sandbox/guac-abc/restart '
+        + 'after 20001ms for u_b6b2f6a3 at /home/user1/workspace/proj-1 '
+        + '(cid_abc1, computer 33333333-3333-4333-8333-333333333333, port :8444)';
+    const out = redact(MEASURED);
+    push('🔴 the measured leak: no username in the redacted detail', ! out.includes('user1'), out);
+    push('🔴 the measured leak: no project name in the redacted detail', ! out.includes('proj-1'), out);
+    push('🔴 the measured leak: no absolute path of any shape survives',
+        ! /(?:^|[\s'"(=])~?\/[\w.@%+~-]/.test(out), out);
+    push('and it produced the <path> placeholder rather than deleting the location entirely',
+        out.includes('<path>'), out);
+
+    for ( const [label, input, forbidden] of [
+        ['a bare workspace path', '/home/user1/workspace/proj-1 is not empty', ['user1', 'proj-1']],
+        ['a path with a space in it', "ENOENT, open '/home/bob/workspace/my app/.env'", ['bob', 'my app', '.env']],
+        ['a home-relative path', 'failed at ~/workspace/proj-1/src/index.ts', ['proj-1', 'index.ts']],
+        ['a Windows drive path', 'C:\\Users\\user1\\workspace\\proj-1 not found', ['user1', 'proj-1']],
+        ['a path smuggled inside a URL', 'GET https://x.dev/home/user1/workspace/proj-1/i.html 500', ['user1', 'proj-1']],
+    ] ) {
+        const r = redact(input);
+        push(`redact strips ${label}`, forbidden.every((f) => ! r.includes(f)), r);
+    }
+
+    for ( const [label, input] of [
+        ['a port, a status and a ratio', 'http 500 on :8444 read/write conflict, ratio 1/2'],
+        ['a bare slash between two numbers', 'expected 200 / got 500'],
+        ['a stack position', 'openWindow@UIWindow.js:12:34'],
+        ['a date', '08/01/2026 boot failed'],
+        ['an exit code and a duration', 'stop_timed_out: exit 137 after 20001ms'],
+    ] ) {
+        push(`redact leaves ${label} completely alone`, redact(input) === input, redact(input));
+    }
+}
+
 const dom = new JSDOM(
     `<!doctype html><html><head><style>${fs.readFileSync(`${OS}/bundle.min.css`, 'utf8')}</style></head>
      <body><div class="desktop"></div></body></html>`,
