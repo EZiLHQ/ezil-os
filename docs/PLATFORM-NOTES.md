@@ -510,6 +510,34 @@ the check compares against.
 
 ---
 
+## 21. `next/server`'s `after()` throws outside a real request — design the seam, don't fight it
+
+`after()` (used by `src/app/api/shell/telemetry/route.ts` to defer the Postgres write past the
+flushed response) is not a plain function you can call from anywhere convenient. Called outside
+Next's own request-handling machinery — including from a Route Handler module imported directly
+into a `vitest` test, with no live HTTP request driving it — it throws immediately:
+
+```
+`after` was called outside a request scope.
+Read more: https://nextjs.org/docs/messages/next-dynamic-api-wrong-context
+```
+
+VERIFIED: `node -e "require('next/server').after(() => {})"` throws that exact message, and so
+does calling a route's exported `POST` directly in a test harness. That means a route handler
+that reaches for `after()` cannot be unit-tested by importing the route file and invoking
+`POST(req)` — the only two options are (a) a full Next test server (slow, heavy, not what this
+repo's other route tests do) or (b) not putting `after()` directly in the route file at all.
+
+The fix used here: the route file (`route.ts`) stays a thin two-line wrapper that wires the real
+`after`; all the actual logic — auth check, body-size bound, validation, rate limit, load-shed —
+lives in a sibling module (`@/server/telemetry/http-handler.ts`) that takes a `schedule` callback
+as a parameter instead of importing `after` itself. Production passes the real `after`; tests pass
+a `vi.fn()` spy and invoke the captured callback manually. This is the same shape this codebase
+already uses for `db` (a narrow `Pick<>` injected rather than imported) — treat any Next.js API
+that only works inside a live request the same way: as a dependency to inject, not a global to call.
+
+---
+
 ## Method notes
 
 Two habits found more bugs than any amount of code reading:

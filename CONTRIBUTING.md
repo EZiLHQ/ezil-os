@@ -48,8 +48,36 @@ bun run typecheck          # tsc --noEmit
 bun run test                # bun test
 ```
 
-`app/` (the web client) has its own build instructions once it lands —
-see its README when it does.
+`app/` is a Next.js project (needs a Supabase Postgres instance — see
+`app/src/env.ts` for the required environment variables):
+
+```bash
+cd app
+bun install
+bun run dev                # next dev
+bun run typecheck          # tsc --noEmit
+bun run lint                # eslint
+bun run test                # vitest run
+bun run build               # next build — run this before opening a PR that touches app/
+```
+
+`shell/` (the in-browser desktop UI, a modified fork of Puter — see
+`ATTRIBUTIONS.md`) builds into `app/public/os/bundle.min.js`:
+
+```bash
+shell/build-shell.sh           # build the bundle
+shell/build-shell.sh --check   # verify it's up to date without writing
+```
+
+🔴 **Never commit `app/public/os/bundle.min.js` by hand** if you're working
+alongside an automated build/integration step for this repository — check
+whether one exists before adding it to a commit; a stale bundle silently
+serving old code is worse than a missing one.
+
+Every `.sh` file in this repository must pass `bash -n` (see
+`worker/src/shell-scripts-parse.test.ts`), and no `.sh` file may contain an
+apostrophe inside a single-quoted `bash -c` block — that exact mistake has
+taken the desktop down before.
 
 ## Pull requests
 

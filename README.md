@@ -2,30 +2,54 @@
 
 **A real Linux computer, running in your browser.**
 
-EZiL-OS gives every user a persistent, full Linux desktop and dev
-environment — not a mockup, not a browser-based simulation, but an actual
-sandboxed computer (real filesystem, real processes, a real browser and
-editor inside it) that boots on demand, streams to any device, and picks
-up exactly where you left it. It's built for freelancers and independent
-professionals doing real work: a computer you sign into from any tab,
-rather than a box tied to one desk.
+EZiL-OS gives every user a persistent, full Linux desktop and dev environment —
+not a mockup, not a browser-based simulation, but an actual sandboxed computer
+(real filesystem, real processes, a real code editor and a real browser inside
+it) that boots on demand, streams to any device, and picks up exactly where
+you left it. It's built for freelancers and independent professionals doing
+real work: a computer you sign into from any tab, rather than a box tied to
+one desk.
 
-This repository is the Cloudflare Worker and container image that make
-that possible — the sandbox/desktop backend (Cloudflare Sandbox + Apache
-Guacamole, with an alternate Neko-based streaming mode) — plus the web
-application that will sit in front of it.
+## What's actually here
 
-## Who it's for
+Three things, wired together:
 
-Freelancers, contractors, and small teams who need a real, persistent work
-computer reachable from anywhere — without buying, provisioning, or
-maintaining physical hardware, and without trusting their files to a
-browser-only simulation that disappears on refresh.
+- **A streamed Linux desktop.** A Cloudflare Sandbox container running Apache
+  Guacamole (or an alternate Neko/WebRTC streaming mode), a real browser
+  ([Google Chrome](./ATTRIBUTIONS.md)), and **[code-server](https://github.com/coder/code-server)**
+  (VS Code in the browser) against your own persistent workspace.
+- **An app preview bridge.** The Worker also exposes whatever a dev server
+  inside the container is listening on as its own signed, expiring preview
+  URL — so a web app you're building inside the desktop is reachable directly,
+  not just through the streamed screen.
+- **A boot-honesty contract.** Booting a real container takes real time
+  (measured, not assumed — see `docs/PLATFORM-NOTES.md`). Rather than a spinner
+  that either resolves or hangs forever with no explanation, the shell surfaces
+  named boot phases as they happen and says plainly when it genuinely doesn't
+  know whether the desktop came up — never a false "ready."
 
-## Quick start
+## Repository layout
 
-The Worker is a Bun-managed Cloudflare Worker project.
+```
+worker/   # Cloudflare Worker (Durable Objects + R2) + the container image:
+          #   Guacamole/Neko streaming, code-server, the app preview bridge
+app/      # Next.js web app: auth, the "your computers" list, the /os host
+          #   page, Supabase Postgres (via Drizzle) as the one datastore
+shell/    # The in-browser desktop UI itself — a modified fork of Puter's
+          #   GUI (see ATTRIBUTIONS.md) plus EZiL-authored code alongside it;
+          #   built by shell/build-shell.sh into app/public/os/bundle.min.js
+docs/     # Platform notes, the operational runbook, and telemetry.md
+```
 
+`app/` renders one real page (`/os`) whose entire job is to paint the
+`shell/`-built bundle fast and hand it a boot payload; everything a user sees
+after that first paint is drawn by that bundle talking to the Worker.
+
+## Running it
+
+Three independent pieces, each with its own dependencies:
+
+**The Worker** (Bun-managed Cloudflare Worker + container image):
 ```bash
 cd worker
 bun install
@@ -33,18 +57,46 @@ bun run dev          # wrangler dev, local Worker + container
 bun run typecheck    # tsc --noEmit
 bun run test         # bun test
 ```
+See [`worker/README.md`](./worker/README.md) for the container image's
+architecture (Guacamole/Neko/code-server) and how the Worker drives it.
 
-See [`worker/README.md`](./worker/README.md) for details on the
-Cloudflare Sandbox / Guacamole / Neko container image and how the Worker
-drives it.
-
-## Repository layout
-
+**The app** (Next.js, needs a Supabase Postgres instance):
+```bash
+cd app
+bun install
+bun run dev          # next dev
+bun run typecheck    # tsc --noEmit
+bun run lint         # eslint
+bun run test         # vitest run
+bun run db:generate  # drizzle-kit generate, after a schema change
 ```
-worker/   # Cloudflare Worker + container image (Guacamole/Neko sandbox desktop)
-app/      # Web client (in progress)
-docs/     # Platform notes and design documentation
+Requires `SUPABASE_DATABASE_URL`, `NEXT_PUBLIC_SUPABASE_URL` and
+`NEXT_PUBLIC_SUPABASE_ANON_KEY` at minimum (`app/src/env.ts` validates the
+full set eagerly at boot and fails loudly if one is missing); the Cloudflare
+Guacamole variables are optional for local app-only work.
+
+**The shell** (the desktop UI bundle):
+```bash
+shell/build-shell.sh          # builds app/public/os/bundle.min.js
+shell/build-shell.sh --check  # verify the build is up to date, no write
 ```
+
+## Telemetry
+
+EZiL-OS collects crash/error telemetry from signed-in sessions — never
+identities, file contents, secrets, or full URLs. **[`docs/telemetry.md`](./docs/telemetry.md)**
+is the exact, code-linked account of what is collected, what deliberately is
+not, how long it's kept, and how to stop it from reaching this repo's servers
+at all.
+
+## Further reading
+
+- **[`docs/PLATFORM-NOTES.md`](./docs/PLATFORM-NOTES.md)** — everything learned
+  the hard way about Cloudflare Containers/Workers, Vercel, and this stack's
+  own sharp edges. Read it before assuming a primitive behaves the way its
+  docs imply.
+- **[`docs/RUNBOOK.md`](./docs/RUNBOOK.md)** — the operational runbook: what's
+  live, known constraints, and open items.
 
 ## License
 
@@ -70,20 +122,19 @@ mind.
 
 ## Built on the work of
 
-EZiL-OS did not start from a blank slate. Its sandboxed-desktop streaming
-stack builds on several open-source projects — **Apache Guacamole**,
-**Neko**, **VS Code**, **Google Chrome**, and the **Cloudflare Sandbox
-SDK** — and its architectural lineage traces back through an earlier
-prototype built on **[Onlook](https://github.com/onlook-dev/onlook)**
-(Apache-2.0), with design inspiration studied from
-**[Puter](https://github.com/HeyPuter/puter)** (AGPL-3.0). No code from
-Onlook or Puter is present in this repository; both are credited
-voluntarily because the lineage is real, not because either license
-requires it.
+EZiL-OS did not start from a blank slate. The streamed-desktop backend builds
+on **Apache Guacamole**, **Neko**, **code-server**/**VS Code**, **Google
+Chrome**, and the **Cloudflare Sandbox SDK**; the in-browser desktop UI
+(`shell/`) is a **modified fork of [Puter](https://github.com/HeyPuter/puter)**
+(AGPL-3.0) — genuinely forked code, not just an influence, tracked file-by-file
+in [`shell/PUTER-PROVENANCE.md`](./shell/PUTER-PROVENANCE.md). The project's
+architectural lineage also traces back through an earlier prototype built on
+**[Onlook](https://github.com/onlook-dev/onlook)** (Apache-2.0); no Onlook code
+is present in this repository, and it is credited voluntarily.
 
 **Every upstream project this repository actually uses, its license, and
 exactly what it's used for is documented in
 [`ATTRIBUTIONS.md`](./ATTRIBUTIONS.md).** That file also flags any
-dependency that carries copyleft or otherwise restricted terms — currently
-none in this repository's own dependency tree. If you're evaluating this
-project for redistribution or compliance purposes, start there.
+dependency that carries copyleft or otherwise restricted terms. If you're
+evaluating this project for redistribution or compliance purposes, start
+there.
