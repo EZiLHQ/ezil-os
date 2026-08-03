@@ -19,6 +19,8 @@
 // once the shell demonstrably works. Until then this file is also the
 // inventory of what would have to be cut.
 
+import telemetry from '../ezil/telemetry.js';
+
 const PHASE = 'ezil-os:shell';
 
 /**
@@ -40,6 +42,17 @@ export class PuterBackendRemovedError extends Error {
 /** Loud, attributable, and non-fatal to the caller's synchronous frame. */
 function reject (what) {
     console.error(`[${PHASE}] blocked call to removed backend: ${what}`);
+    // `what` can carry a DYNAMIC argument — `launch_app`'s below embeds the
+    // app name the (removed) upstream launcher was asked to open, and the
+    // recursive `puter.*` proxy embeds an arg COUNT. Neither belongs on the
+    // wire: only the function/method name prefix (before the first `(`) goes
+    // into `site`, which is what the design doc's own table means by "the
+    // stub name goes in `site`" — never the call's own arguments.
+    telemetry.capture({
+        eventClass: 'contract_violation',
+        site: `ezil-os:stub#${String(what).split('(')[0]}`,
+        code: 'removed_backend',
+    });
     return Promise.reject(new PuterBackendRemovedError(what));
 }
 
@@ -107,16 +120,23 @@ export function launch_app (options) {
 /** @see DO NOT TAKE list — `UIItem.js`, 1,911 lines. */
 export function item_icon (fsentry) {
     console.error(`[${PHASE}] blocked call to removed backend: item_icon`);
+    telemetry.capture({ eventClass: 'contract_violation', site: 'ezil-os:stub#item_icon', code: 'removed_backend' });
     throw new PuterBackendRemovedError('item_icon');
 }
 
 export function new_context_menu_item () {
     console.error(`[${PHASE}] blocked call to removed backend: new_context_menu_item`);
+    telemetry.capture({
+        eventClass: 'contract_violation', site: 'ezil-os:stub#new_context_menu_item', code: 'removed_backend',
+    });
     throw new PuterBackendRemovedError('new_context_menu_item');
 }
 
 export function refresh_item_container () {
     console.error(`[${PHASE}] blocked call to removed backend: refresh_item_container`);
+    telemetry.capture({
+        eventClass: 'contract_violation', site: 'ezil-os:stub#refresh_item_container', code: 'removed_backend',
+    });
     throw new PuterBackendRemovedError('refresh_item_container');
 }
 
