@@ -29,6 +29,16 @@ const serverSchema = z.object({
      * guarantee; treat it as a shared secret, not a password.
      */
     CRON_SECRET: z.string().min(32).optional(),
+    /**
+     * Comma-separated allow-list of emails permitted to open
+     * `/admin/telemetry` (see `@/server/telemetry/admin.ts`). No roles table
+     * exists in this schema, and introducing one for a single internal
+     * review page is out of scope here — this is the smallest correct gate,
+     * not a placeholder for a fancier one. Unset by default: with no
+     * allow-list configured, the page is unreachable by anyone (fail
+     * closed), never "reachable by every signed-in user".
+     */
+    TELEMETRY_ADMIN_EMAILS: z.string().optional(),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
 });
 
@@ -49,6 +59,7 @@ const parsedServer = isServer
           CLOUDFLARE_GUACAMOLE_WORKER_URL: process.env.CLOUDFLARE_GUACAMOLE_WORKER_URL,
           CLOUDFLARE_GUACAMOLE_HMAC_SECRET: process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET,
           CRON_SECRET: process.env.CRON_SECRET,
+          TELEMETRY_ADMIN_EMAILS: process.env.TELEMETRY_ADMIN_EMAILS,
           NODE_ENV: process.env.NODE_ENV,
       })
     : null;
@@ -80,6 +91,7 @@ export const env = {
         CLOUDFLARE_GUACAMOLE_WORKER_URL: undefined,
         CLOUDFLARE_GUACAMOLE_HMAC_SECRET: undefined,
         CRON_SECRET: undefined,
+        TELEMETRY_ADMIN_EMAILS: undefined,
         NODE_ENV: process.env.NODE_ENV ?? 'development',
     }),
     ...parsedClient.data,
