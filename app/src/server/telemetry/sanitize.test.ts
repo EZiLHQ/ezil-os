@@ -86,6 +86,95 @@ describe('sanitize.ts functions behave as expected (smoke coverage for the parit
         expect(out.length).toBeLessThanOrEqual(200);
     });
 
+    /**
+     * 🔴 The reason this file's parity check exists at all. `ezil_error_events.detail`
+     * is written from `sanitizeErrorMessage`'s output — NOT from
+     * `normalizeDetail`'s — so a path rule that lives only in `normalizeDetail`
+     * (N9) leaves absolute paths in the stored column while making a fingerprint
+     * look clean. `docs/telemetry.md` promises the opposite. These cases are
+     * written so that deleting either path `.replace(...)` from `sanitize.ts`
+     * turns them red, not just the parity test.
+     */
+    describe('sanitizeErrorMessage strips absolute paths from what actually gets STORED', () => {
+        /**
+         * The exact string measured end-to-end through the shipped chain
+         * (`shell/ezil/telemetry.js` -> `handleTelemetryPost` -> `parseTelemetryBatch`
+         * -> `ingestBatch` -> Postgres) before this rule existed. It landed in
+         * `detail` verbatim, username and project name included.
+         */
+        const MEASURED =
+            'restart rejected for <url> after 20001ms for u_b6b2f6a3 at ' +
+            '/home/user1/workspace/proj-1 (cid_abc1, computer <uuid>, port :8444)';
+
+        it('the exact measured leak: no username, no project name, no slash-path left', () => {
+            const out = sanitizeErrorMessage(MEASURED);
+            expect(out).not.toContain('user1');
+            expect(out).not.toContain('proj-1');
+            expect(out).not.toContain('/home');
+            expect(out).not.toMatch(/(?:^|\s)~?\/[\w.@%+~-]/);
+            expect(out).toContain('<path>');
+        });
+
+        it('the same string keeps everything that makes it actionable', () => {
+            const out = sanitizeErrorMessage(MEASURED);
+            // Over-redaction is its own failure mode: a record with no port, no
+            // duration and no correlation id cannot be acted on.
+            expect(out).toContain('port :8444');
+            expect(out).toContain('20001ms');
+            expect(out).toContain('cid_abc1');
+            expect(out).toContain('u_b6b2f6a3');
+            expect(out).toContain('restart rejected');
+            expect(out).toBe(
+                'restart rejected for <url> after 20001ms for u_b6b2f6a3 at <path> ' +
+                    '(cid_abc1, computer <uuid>, port :8444)',
+            );
+        });
+
+        it.each([
+            ['/home/user1/workspace/proj-1 is not empty', ['user1', 'proj-1']],
+            ['mount_failed_after_4_attempts: s3fs could not mount /workspace/alice/startup', ['alice', 'startup']],
+            ["seed_check_failed: ENOENT, open '/home/bob/workspace/my app/.env'", ['bob', 'my app', '.env']],
+            ['EACCES /home/u/workspace/proj 1/node_modules/.bin/next', ['proj 1', 'node_modules']],
+            ['failed at ~/workspace/proj-1/src/index.ts', ['proj-1', 'index.ts']],
+            ['error in "/home/user1/workspace/p/a.js"', ['user1', 'a.js']],
+            ['C:\\Users\\user1\\workspace\\proj-1 not found', ['user1', 'proj-1']],
+            ['C:\\Program Files\\EZiL\\proj-1\\x.txt missing', ['Program Files', 'proj-1', 'x.txt']],
+            // A URL is a path carrier too — the workspace path rides in its
+            // pathname, where the POSIX rule deliberately will not follow it.
+            ['fetch https://8444-guac-x.workers.dev/home/user1/workspace/proj-1/i.html failed', ['user1', 'proj-1']],
+        ])('%s leaks nothing', (input, forbidden) => {
+            const out = sanitizeErrorMessage(input);
+            for (const f of forbidden) expect(out).not.toContain(f);
+        });
+
+        it.each([
+            ['http 500 on :8444 read/write conflict, ratio 1/2', 'http 500 on :8444 read/write conflict, ratio 1/2'],
+            ['expected 200 / got 500', 'expected 200 / got 500'],
+            ['openWindow@UIWindow.js:12:34', 'openWindow@UIWindow.js:12:34'],
+            ['08/01/2026 boot failed', '08/01/2026 boot failed'],
+            ['and/or both flags set', 'and/or both flags set'],
+            ['stop_timed_out: exit 137 after 20001ms', 'stop_timed_out: exit 137 after 20001ms'],
+            ["Cannot read properties of undefined (reading 'foo')", "Cannot read properties of undefined (reading 'foo')"],
+            ['workspace_fuse_unavailable: fuse: device not found', 'workspace_fuse_unavailable: fuse: device not found'],
+        ])('%s is left completely alone', (input, expected) => {
+            expect(sanitizeErrorMessage(input)).toBe(expected);
+        });
+
+        it('is idempotent — the worker sanitizes at the source and again on the way out', () => {
+            for (const s of [MEASURED, '/home/u/w/p failed', 'C:\\a\\b broke', 'plain message']) {
+                expect(sanitizeErrorMessage(sanitizeErrorMessage(s))).toBe(sanitizeErrorMessage(s));
+            }
+        });
+
+        it('does not blow up on pathological input (no catastrophic backtracking)', () => {
+            for (const bomb of ['/' + 'a/'.repeat(3000), '/a' + ' a'.repeat(2000), 'C:\\' + 'a\\'.repeat(600) + ' x']) {
+                const t0 = Date.now();
+                sanitizeErrorMessage(bomb);
+                expect(Date.now() - t0).toBeLessThan(1000);
+            }
+        });
+    });
+
     it('classifyError derives a stable low-cardinality code', () => {
         expect(classifyError('sandbox_start_failed: boom')).toBe('sandbox_start_failed');
         expect(classifyError('timed out waiting for X')).toBe('timeout');
