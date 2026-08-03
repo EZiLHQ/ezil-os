@@ -16,9 +16,11 @@ dependencies and container-image components, listed below.
 [`shell/PUTER-PROVENANCE.md`](./shell/PUTER-PROVENANCE.md) is the
 file-by-file index of what was taken verbatim, what was taken and modified,
 and what was written fresh. **It is authoritative over any summary in this
-file** — as of this writing the `shell/` tree is scaffolded but not yet
-populated, so the index, not this paragraph, is where to check what is
-actually present.
+file** — the `shell/` tree is now populated (both `shell/src/` — the
+Puter-derived tree — and `shell/ezil/`, EZiL-authored code that sits
+alongside it and talks to Puter's UI layer without deriving from it), so the
+index, not this paragraph, is where to check what is actually present at any
+given commit.
 
 If you believe an attribution is missing or inaccurate, please open an issue
 — under-crediting an upstream project is treated as a bug in this repository.
@@ -88,21 +90,35 @@ If you believe an attribution is missing or inaccurate, please open an issue
   Neko (Apache-2.0), but that is not a substitute for a confirmed grant —
   do not assume Apache-2.0 without checking again before relying on it.
   Pinned at commit `049931d7638f9db8598f29c369d2fb7cd2c6e4b4`.
-- **Used for:** Supplies the `vscode` app recipe used to produce the pinned
-  VS Code build baked into the sandbox image's build stage. Nothing from
-  neko-apps ships as code in this repository; it is a build-time input to
-  the container image only.
+- **Used for:** its `vscode` recipe produces a pinned Electron VS Code build
+  in an intermediate build stage of `worker/Dockerfile`. **That build stage's
+  output is deliberately NOT copied into the final image** — see
+  `code-server` below, which replaced it in the same commit that removed the
+  `COPY --from=neko /usr/share/code` step. neko-apps is therefore a
+  build-time-only input with nothing from it, or from the Electron VS Code
+  build it produces, present in the shipped container image today.
 
-### Visual Studio Code (Microsoft's official build)
-- Installed via the `neko-apps` `vscode` recipe, which downloads Microsoft's
-  official `.deb` (`go.microsoft.com/fwlink/?LinkID=760868`). The underlying
-  source, `microsoft/vscode` ("Code - OSS"), is MIT-licensed, but the
-  **released Microsoft binary is distributed under the proprietary
-  Microsoft Software License Terms** (product name/icon, telemetry,
-  marketplace access — not covered by the MIT grant). No VS Code source is
-  modified or redistributed by this repository; the container image
-  downloads Microsoft's official binary at build time, under Microsoft's
-  own terms.
+### code-server (`coder/code-server`)
+- **URL:** https://github.com/coder/code-server
+- **License:** **MIT** (verified via the GitHub Licenses API against the
+  `LICENSE` file on `coder/code-server`'s `main` branch: "The MIT License,
+  Copyright (c) 2019 Coder Technologies Inc.").
+- **Used for:** the in-browser code editor (VS Code in the browser) served
+  to users, replacing the Electron VS Code build described above.
+  `worker/Dockerfile` installs it via the official installer
+  (`curl -fsSL https://code-server.dev/install.sh | sh`), which fetches a
+  prebuilt `.deb` release directly from `coder/code-server`'s own GitHub
+  releases — no code-server source is vendored or modified in this
+  repository, and no separate Electron/Chromium renderer is composited into
+  the container's display for it (code-server serves the IDE over plain
+  HTTP; the note in `worker/Dockerfile` explains why the two approaches
+  cannot coexist in one container). Because code-server ships the
+  open-source ("Code - OSS", MIT) VS Code build with Microsoft's proprietary
+  product branding, telemetry and marketplace access already stripped out
+  and pointed at Open VSX by default, using it — rather than Microsoft's own
+  official binary (which the superseded Electron build above downloaded
+  under the proprietary Microsoft Software License Terms) — avoids that
+  proprietary-terms question entirely.
 
 ### Google Chrome
 - Installed via the official `google-chrome-stable` `.deb` from
@@ -184,7 +200,11 @@ anyone relies on an assumed license:
 - Licenses for container-image components (Guacamole, Neko, neko-apps, VS
   Code, Chrome) were verified against upstream project pages/release
   artifacts and prior audits of the same pinned commits/versions used by
-  `worker/Dockerfile`.
+  `worker/Dockerfile`. code-server's MIT license was re-verified directly
+  against the GitHub Licenses API for `coder/code-server`'s `main` branch
+  (not assumed from memory) when it replaced the Electron VS Code build in
+  the shipped image; its Open VSX-by-default behaviour was confirmed
+  against Coder's own published FAQ.
 - Licenses for `worker/`'s npm dependencies were read directly from each
   package's installed `package.json` under `worker/node_modules` (i.e.
   from the actual artifact this repository builds with), not assumed from
