@@ -157,6 +157,23 @@ push('capture() called 1000x with no browser globals at all: never throws', ! th
         push(`redact strips ${label}`, forbidden.every((f) => ! r.includes(f)), r);
     }
 
+    push('a QUOTED path is eaten whole, spaces and all',
+        redact("could not open '/home/bob/workspace/my secret project'") === "could not open '<path>'",
+        redact("could not open '/home/bob/workspace/my secret project'"));
+
+    // 🔴 Pins the ONE residual `docs/telemetry.md` states out loud rather than
+    // promising absolutely: an UNQUOTED path whose LAST segment contains a
+    // space is undecidable (`my project failed` — directory, or directory plus
+    // prose?), so the rule stops at the space instead of eating the diagnosis.
+    // Bounded: the username and every interior segment are still gone.
+    {
+        const r = redact('mount failed at /home/user1/workspace/my secret project');
+        push('DOCUMENTED RESIDUAL: an unquoted path with a space in its last segment truncates there',
+            r === 'mount failed at <path> secret project', r);
+        push('  ...and the residual is bounded — no username, no interior segment survives',
+            ! r.includes('user1') && ! r.includes('/home'), r);
+    }
+
     for ( const [label, input] of [
         ['a port, a status and a ratio', 'http 500 on :8444 read/write conflict, ratio 1/2'],
         ['a bare slash between two numbers', 'expected 200 / got 500'],

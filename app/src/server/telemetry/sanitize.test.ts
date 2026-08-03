@@ -160,6 +160,35 @@ describe('sanitize.ts functions behave as expected (smoke coverage for the parit
             expect(sanitizeErrorMessage(input)).toBe(expected);
         });
 
+        it('a QUOTED path is eaten whole, spaces and all — quotes delimit it', () => {
+            expect(sanitizeErrorMessage("could not open '/home/bob/workspace/my secret project'")).toBe(
+                "could not open '<path>'",
+            );
+            expect(sanitizeErrorMessage('EACCES "/home/u/workspace/my app/.env" at boot')).toBe(
+                'EACCES "<path>" at boot',
+            );
+        });
+
+        /**
+         * 🔴 PINS THE ONE RESIDUAL, so it cannot quietly get worse and cannot be
+         * forgotten when someone next reads `docs/telemetry.md`. An UNQUOTED path
+         * whose LAST segment contains a space is undecidable — `/home/u/w/my
+         * project failed` could be a directory called `my project` or a directory
+         * called `my` followed by prose. The rule stops at the space, so the tail
+         * words survive. Absorbing them instead would eat the diagnosis, which is
+         * the failure mode the other half of this suite guards against. The doc
+         * says this plainly rather than promising absolutely; if this test ever
+         * changes, that paragraph has to change with it.
+         */
+        it('DOCUMENTED RESIDUAL: an unquoted path with a space in its last segment truncates there', () => {
+            const out = sanitizeErrorMessage('mount failed at /home/user1/workspace/my secret project');
+            expect(out).toBe('mount failed at <path> secret project');
+            // The username and every interior segment are still gone — the
+            // residual is bounded to the trailing words of the final segment.
+            expect(out).not.toContain('user1');
+            expect(out).not.toContain('/home');
+        });
+
         it('is idempotent — the worker sanitizes at the source and again on the way out', () => {
             for (const s of [MEASURED, '/home/u/w/p failed', 'C:\\a\\b broke', 'plain message']) {
                 expect(sanitizeErrorMessage(sanitizeErrorMessage(s))).toBe(sanitizeErrorMessage(s));

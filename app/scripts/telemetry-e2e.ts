@@ -114,6 +114,29 @@ telemetry.capture({
     computerId: COMPUTER_ID,
     attrs: { status: 500, retryable: false },
 });
+// 🔴 THE PATH LEAK, verbatim. Before the path rules landed in `redact()` /
+// `sanitizeErrorMessage()`, THIS string was measured at the far end of this
+// exact chain and `ezil_error_events.detail` held it with the username and
+// the project name intact:
+//
+//   restart rejected for <url> after 20001ms for u_b6b2f6a3 at
+//   /home/user1/workspace/proj-1 (cid_abc1, computer <uuid>, port :8444)
+//
+// `docs/telemetry.md` promises, under "What is never collected", that
+// workspace paths never reach storage. Step 4b below reads the stored row
+// back out of Postgres and proves it.
+const PATH_LEAK_DETAIL =
+    'restart rejected for https://api-desktop.ezil.org/sandbox/guac-abc/restart after 20001ms ' +
+    'for u_b6b2f6a3 at /home/user1/workspace/proj-1 ' +
+    '(cid_abc1, computer 33333333-3333-4333-8333-333333333333, port :8444)';
+telemetry.capture({
+    eventClass: 'api_failure',
+    site: 'ezil-os:settings/troubleshoot#restart',
+    code: 'restart_rejected',
+    detail: PATH_LEAK_DETAIL,
+    computerId: COMPUTER_ID,
+    attrs: { status: 409, retryable: true },
+});
 telemetry.capture({
     eventClass: 'crash',
     site: 'ezil-os:window#onerror',
@@ -135,7 +158,7 @@ for (const fn of listeners.pagehide ?? []) fn({});
 
 ok(sentBody !== null, 'the shell module actually put a body on the wire');
 const wire = JSON.parse(sentBody ?? '{}') as { schemaVersion: number; events: Record<string, unknown>[] };
-ok(wire.events?.length === 3, 'all three captured events reached the wire', `got ${wire.events?.length}`);
+ok(wire.events?.length === 4, 'all four captured events reached the wire', `got ${wire.events?.length}`);
 
 // Privacy assertions on the ACTUAL bytes the shell sends.
 ok(!/11111111-1111-4111-8111-111111111111/.test(sentBody ?? ''), '🔴 the raw user id is NOT on the wire');
@@ -143,6 +166,10 @@ ok(!/userId|email|cookie|authorization/i.test(sentBody ?? ''), '🔴 no identity
 ok(
     !/api-desktop\.ezil\.org/.test(sentBody ?? ''),
     '🔴 the URL in the detail string was redacted before the wire',
+);
+ok(
+    !/\/home\/|user1|proj-1/.test(sentBody ?? ''),
+    '🔴 the absolute workspace path was redacted before the wire (client, first line of defence)',
 );
 
 // ── 3. Feed those exact bytes to the SHIPPED route core ─────────────────────
@@ -178,11 +205,11 @@ scheduled = [];
 // ── 4. It landed ────────────────────────────────────────────────────────────
 const rows = await client`select event_class, source, site, code, outcome, detail, duration_ms,
                                  computer_id, attrs, user_hash, fingerprint
-                          from ezil_error_events order by event_class`;
-ok(rows.length === 3, '🔴 THREE ROWS LANDED IN POSTGRES', `got ${rows.length}`);
+                          from ezil_error_events order by event_class, code`;
+ok(rows.length === 4, '🔴 FOUR ROWS LANDED IN POSTGRES', `got ${rows.length}`);
 ok(rows.every((r) => r.user_hash === userHash), 'every row carries the server-derived user_hash');
 ok(rows.every((r) => r.source === 'shell'), 'source survived as shell');
-const apiRow = rows.find((r) => r.event_class === 'api_failure');
+const apiRow = rows.find((r) => r.code === 'stop_timed_out');
 ok(apiRow?.site === 'ezil-os:settings/troubleshoot#restart', 'site survived field-for-field', String(apiRow?.site));
 ok(apiRow?.code === 'stop_timed_out', 'code survived field-for-field', String(apiRow?.code));
 ok(apiRow?.computer_id === COMPUTER_ID, 'computerId survived as a real FK-checked uuid');
@@ -217,18 +244,56 @@ ok(
     String(apiRow?.detail),
 );
 
+// ── 4b. 🔴 THE PATH LEAK, read back out of Postgres ─────────────────────────
+// This is the assertion the whole change exists for. `detail` is the column
+// that was holding `/home/user1/workspace/proj-1`; `normalized_detail` (the
+// fingerprint's input) always looked clean, which is exactly why the leak
+// survived review. Both are checked, and so is the other direction: the row
+// has to remain diagnostically useful, or the redactor traded one bug for
+// another.
+const leakRow = rows.find((r) => r.code === 'restart_rejected');
+const storedDetail = String(leakRow?.detail ?? '');
+const [{ normalized_detail: storedNormalized }] =
+    await client`select normalized_detail from ezil_error_fingerprints where fingerprint = ${String(leakRow?.fingerprint)}`;
+ok(leakRow !== undefined, '🔴 the path-bearing event landed as its own row');
+for (const forbidden of ['/home', 'user1', 'proj-1', 'workspace/']) {
+    ok(!storedDetail.includes(forbidden), `🔴 STORED detail contains no "${forbidden}"`, storedDetail);
+    ok(!String(storedNormalized).includes(forbidden), `stored normalized_detail contains no "${forbidden}"`);
+}
+ok(
+    !/(?:^|[\s'"(=])~?\/[\w.@%+~-]/.test(storedDetail),
+    '🔴 STORED detail contains no absolute path of ANY shape',
+    storedDetail,
+);
+ok(storedDetail.includes('<path>'), 'the location was replaced with <path>, not deleted', storedDetail);
+ok(
+    storedDetail.includes('port :8444') &&
+        storedDetail.includes('20001ms') &&
+        storedDetail.includes('cid_abc1') &&
+        storedDetail.includes('restart rejected'),
+    '🔴 and the row is still ACTIONABLE: port, duration and correlation id all survived',
+    storedDetail,
+);
+ok(
+    storedDetail ===
+        'restart rejected for <url> after 20001ms for u_b6b2f6a3 at <path> ' +
+            '(cid_abc1, computer <uuid>, port :8444)',
+    '🔴 the stored detail is exactly the redacted form, character for character',
+    storedDetail,
+);
+
 const fps = await client`select fingerprint, total_count from ezil_error_fingerprints`;
-ok(fps.length === 3, 'three dimension rows upserted', `got ${fps.length}`);
+ok(fps.length === 4, 'four dimension rows upserted', `got ${fps.length}`);
 ok(fps.every((f) => Number(f.total_count) === 1), 'total_count rolled up to 1 each');
 const hours = await client`select fingerprint, user_hash, event_count from ezil_error_user_hours`;
-ok(hours.length === 3, 'three user-hour rollup rows', `got ${hours.length}`);
+ok(hours.length === 4, 'four user-hour rollup rows', `got ${hours.length}`);
 
 // ── 5. Idempotency — the same batch again must not double-count ─────────────
 await post(sentBody ?? '');
 for (const w of scheduled) await w();
 scheduled = [];
 const [{ n: eventCount }] = await client`select count(*)::int as n from ezil_error_events`;
-ok(eventCount === 3, '🔴 a re-sent batch is a no-op (eventId is the idempotency key)', `n=${eventCount}`);
+ok(eventCount === 4, '🔴 a re-sent batch is a no-op (eventId is the idempotency key)', `n=${eventCount}`);
 const fps2 = await client`select total_count from ezil_error_fingerprints`;
 ok(fps2.every((f) => Number(f.total_count) === 1), '🔴 total_count did NOT double on the replay');
 const hours2 = await client`select event_count from ezil_error_user_hours`;
@@ -239,9 +304,9 @@ const fpApi = String(apiRow?.fingerprint);
 const q1 = await distinctUsersForFingerprint(db, fpApi, 24);
 ok(q1.distinctUsers === 1 && q1.events === 1, 'Q1 distinct-users returns the row', JSON.stringify(q1));
 const q2 = await fingerprintLeaderboard(db, { windowHours: 24, limit: 10 });
-// TWO, not three: the leaderboard filters `e.outcome = 'error'` on purpose, and
+// THREE, not four: the leaderboard filters `e.outcome = 'error'` on purpose, and
 // the boot_summary event is outcome 'ok' — it is the DENOMINATOR, not an error.
-ok(q2.length === 2, 'Q2 leaderboard returns the two error fingerprints, excluding the ok boot_summary', `len=${q2.length}`);
+ok(q2.length === 3, 'Q2 leaderboard returns the three error fingerprints, excluding the ok boot_summary', `len=${q2.length}`);
 ok(
     q2.some((r) => r.fingerprint === fpApi && Number(r.distinctUsers) === 1),
     'Q2 counts distinct users, not rows',
@@ -253,8 +318,91 @@ ok(Array.isArray(q4), 'Q4 spike detection runs against real SQL');
 const q5 = await bootPhaseFailureRanking(db, 24);
 ok(Array.isArray(q5), 'boot-phase failure ranking runs against real SQL');
 
+// ── 6b. 🔴 THE HEADLINE FEATURE, re-proved after the redaction change ───────
+// Two DIFFERENT people hitting the SAME bug in their OWN workspaces must fold
+// into ONE fingerprint with `distinctUsers = 2`. That is the single question
+// this whole system exists to answer, and it is exactly the property a
+// redaction change can silently destroy: if the per-user path survived into
+// the fingerprint's input, each user would get their own fingerprint and
+// every count would read 1.
+//
+// This is now a STRONGER property than before the path rules landed. It used
+// to hold only because `normalizeDetail`'s N9 erased the paths on the way to
+// the hash while `detail` kept them; now the two users' STORED details are
+// identical too, so the fold is visible in the raw rows and not just in the
+// hash.
+const USER_ID_2 = '44444444-4444-4444-8444-444444444444';
+const userHash2 = safeUserHash(USER_ID_2);
+ok(userHash2 !== userHash, 'the two users hash to different correlation keys', `${userHash} vs ${userHash2}`);
+
+// Same eventClass/site/code, different workspace path — i.e. the same bug,
+// two people. Produced through the SHIPPED shell module, like everything else.
+// Different depths and different names on purpose: the fold must survive the
+// paths being structurally unalike, not just differing in one segment.
+for (const path_ of ['/home/alice/workspace/blog-rewrite/src/index.ts', '/home/bob/workspace/shop-2/app/page.tsx']) {
+    telemetry.capture({
+        eventClass: 'window_error',
+        site: 'ezil-os:apps/code#open',
+        code: 'open_failed',
+        detail: `could not open editor at ${path_} after 1200ms`,
+        attrs: { app_id: 'code' },
+    });
+}
+for (const fn of listeners.pagehide ?? []) fn({});
+const shared = JSON.parse(sentBody ?? '{}') as { schemaVersion: number; events: Record<string, unknown>[] };
+ok(shared.events?.length === 2, 'both same-bug events reached the wire', `got ${shared.events?.length}`);
+ok(
+    !/alice|bob|blog-rewrite|shop-2/.test(sentBody ?? ''),
+    '🔴 neither user\'s workspace path is on the wire',
+);
+
+// One event per user, through the real route core, as two separate sessions.
+for (const [i, uid] of [USER_ID, USER_ID_2].entries()) {
+    await post(JSON.stringify({ schemaVersion: shared.schemaVersion, events: [shared.events[i]] }), { id: uid });
+    for (const w of scheduled) await w();
+    scheduled = [];
+}
+
+const sharedRows = await client`select user_hash, fingerprint, detail
+                                from ezil_error_events where code = 'open_failed' order by user_hash`;
+ok(sharedRows.length === 2, 'both rows landed', `got ${sharedRows.length}`);
+ok(
+    new Set(sharedRows.map((r) => String(r.user_hash))).size === 2,
+    'the two rows carry two different user_hashes',
+    sharedRows.map((r) => String(r.user_hash)).join(','),
+);
+const sharedFps = new Set(sharedRows.map((r) => String(r.fingerprint)));
+ok(
+    sharedFps.size === 1,
+    '🔴 TWO USERS, ONE FINGERPRINT — the per-user path did not fragment it',
+    [...sharedFps].join(','),
+);
+ok(
+    new Set(sharedRows.map((r) => String(r.detail))).size === 1,
+    'and their STORED details are now identical too, not just their hashes',
+    sharedRows.map((r) => String(r.detail)).join(' | '),
+);
+ok(
+    sharedRows.every((r) => !/alice|bob|blog-rewrite|shop-2|\/home/.test(String(r.detail))),
+    '🔴 neither stored detail names a user or a project',
+    String(sharedRows[0]?.detail),
+);
+const fpShared = [...sharedFps][0]!;
+const q1b = await distinctUsersForFingerprint(db, fpShared, 24);
+ok(
+    q1b.distinctUsers === 2 && q1b.events === 2,
+    '🔴 Q1 REPORTS distinctUsers = 2 FOR THAT ONE FINGERPRINT',
+    `${fpShared} -> ${JSON.stringify(q1b)}`,
+);
+const [{ n: sharedHourRows }] =
+    await client`select count(*)::int as n from ezil_error_user_hours where fingerprint = ${fpShared}`;
+ok(sharedHourRows === 2, 'the user-hour rollup also has one row per user for that fingerprint', `n=${sharedHourRows}`);
+
 // ── 7. Hostile input still 202s and writes nothing extra ────────────────────
-const before = eventCount;
+// Re-read rather than reusing step 5's `eventCount`: step 6b legitimately
+// added two more rows, and a stale baseline here would make this assertion
+// pass for the wrong reason.
+const [{ n: before }] = await client`select count(*)::int as n from ezil_error_events`;
 for (const bad of [
     'not json at all',
     JSON.stringify({ schemaVersion: 1, events: [{ eventId: 'nope', schemaVersion: 1 }] }),

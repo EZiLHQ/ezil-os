@@ -85,6 +85,11 @@ export function sanitizeErrorMessage(input: unknown): string {
         // segments and query strings carry both workspace paths and tokens).
         .replace(/\b(?:data|blob):[^\s'"]+/gi, '<uri>')
         .replace(/\bhttps?:\/\/[^\s'"<>)\]]+/gi, '<url>')
+        // A QUOTED absolute path, whole. Quotes delimit unambiguously, so this
+        // is the one case where a path containing spaces can be eaten entirely
+        // — `'/home/bob/workspace/my project'` and all. It must run before the
+        // unquoted rule below, which would otherwise chew the front of it.
+        .replace(/(['"])(~?\/[^'"\n]{0,240})\1/g, '$1<path>$1')
         // Absolute POSIX paths. `/home/<login>/workspace/<project>` is a
         // username and a project name — user data, and the single thing this
         // rule exists for. Anchored on a `/` NOT preceded by a word char,
@@ -96,6 +101,14 @@ export function sanitizeErrorMessage(input: unknown): string {
         // `file.js:12:34` keeps its line/column and `port :8444` keeps its
         // port. Those, durations, correlation ids and error codes are what
         // make a record actionable, and none of them begin with a slash.
+        //
+        // KNOWN RESIDUAL, stated in `docs/telemetry.md` rather than papered
+        // over: an UNQUOTED path whose LAST segment contains a space
+        // (`/home/u/workspace/my project failed`) is redacted only up to that
+        // space, leaving `<path> project failed`. Nothing can decide where
+        // such a path ends — absorbing the rest would eat the diagnosis
+        // instead, which is its own failure. Interior segments and any quoted
+        // path are handled above; this is the only shape left.
         .replace(/(?<![\w:/@.~$-])~?(?:\/[\w.@%+~-]+(?: [\w.@%+~-]+)*(?=\/))*\/[\w.@%+~-]+\/?/g, '<path>')
         // Windows drive paths, same shape. UNC (`\\host\share`) is NOT matched
         // on purpose — `\\n` in a JSON-escaped message would false-positive.
