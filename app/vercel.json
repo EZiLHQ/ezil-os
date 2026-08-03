@@ -3,7 +3,7 @@
   "crons": [
     {
       "path": "/api/cron/telemetry-maintenance",
-      "schedule": "17 * * * *"
+      "schedule": "17 3 * * *"
     }
   ]
 }
