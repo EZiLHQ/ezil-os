@@ -35,6 +35,23 @@ Each stored row carries, at most:
 That's the entire row. See `app/src/server/db/schema/telemetry.ts` for the literal column
 list and `app/src/server/telemetry/types.ts` for the wire contract the shell sends.
 
+**Not collected yet at all**, as of this writing: nothing is stored. The three tables
+above do not exist in the live database — `app/drizzle/0001_telemetry.sql` ships
+un-applied on purpose (see `docs/RUNBOOK.md`, "PENDING"). Until an operator applies it,
+every batch the browser sends is accepted with a `202` and written nowhere.
+
+### `computer_id` and the Worker
+
+`computer_id` is filled in only by the **browser**, which knows the real UUID.
+
+The **Worker** and the **container** deliberately leave it empty, and it is worth saying
+why rather than leaving a blank column looking like an oversight. All the Worker has is
+its sandbox id, `guac-<16 chars of your user id>-<16 chars of your computer id>` — which
+is a *truncated copy of your account id*, not an anonymous token, and putting it in a
+field named `computer_id` would have quietly made this document's "your raw account id is
+never collected" untrue. Worker- and container-side records join to a request by
+`correlation_id` instead. See the `computerId` doc comment in `worker/src/telemetry.ts`.
+
 ## What is never collected — named so nobody adds it back thinking it was an oversight
 
 - **Your raw account id or email.** Both exist in the browser's own boot payload
@@ -91,6 +108,16 @@ Every telemetry code path is designed so that failure is invisible to the produc
 See `app/src/server/telemetry/http-handler.ts` for the literal code, and its test file for
 the both-directions proof (each failure mode is asserted to still return 202 and schedule
 no work).
+
+The strongest version of that proof is `app/scripts/telemetry-e2e.ts`, which runs the
+whole chain — the shipped browser module, the bytes it actually puts on the wire, the real
+route, the real validator, the real writer, a real Postgres, the real aggregation
+queries — and then **drops the tables** and re-sends the same batch to confirm the answer
+is still an immediate `202` with no throw. It is not part of `vitest run` (it needs a
+database); the commands to run it against a throwaway container are in its own header.
+It is the only test here that can catch a disagreement between the browser and the server
+about what a field means, which is the failure mode this pipeline is most exposed to:
+three separate producers, three separate copies of one contract.
 
 ## Retention
 

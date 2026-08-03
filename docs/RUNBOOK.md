@@ -24,6 +24,61 @@ system, which is out of scope for a docs-only pass.
 
 ---
 
+## 🔴 PENDING: `app/drizzle/0001_telemetry.sql` has NOT been applied
+
+The telemetry ingest path, the aggregation queries, the hourly retention job and
+the `/admin/telemetry` page are all merged and green. **The migration behind them
+is deliberately un-applied.** The three tables it creates
+(`ezil_error_events`, `ezil_error_fingerprints`, `ezil_error_user_hours`) do not
+exist in the live Supabase database, and nothing in this repo will create them —
+no code path calls `drizzle-kit push`/`migrate`.
+
+**Why it is safe to ship un-applied.** The ingest route always answers `202` and
+does its write in `after()`, after the response is flushed. With no table
+present, the insert throws inside that deferred callback, the route has already
+returned, and one line goes to the server log. DEMONSTRATED, not asserted —
+`app/scripts/telemetry-e2e.ts` step 8 drops the three tables and re-POSTs a real
+batch: `202`, no throw, answered in single-digit milliseconds. The desktop, the
+shell and every other route are untouched, because nothing reads these tables
+except the admin page (which will simply error for the one operator who opens it).
+
+**The command an operator runs to apply it**, against whatever
+`SUPABASE_DATABASE_URL` points at, from `app/`:
+
+```
+psql "$SUPABASE_DATABASE_URL" -v ON_ERROR_STOP=1 -f drizzle/0001_telemetry.sql
+```
+
+`-v ON_ERROR_STOP=1` matters: the file is a plain script, and without it psql
+would keep going past a failed statement and leave a half-built schema.
+`drizzle-kit migrate` also works if the journal is in sync; the raw `psql` form is
+listed because it is the one that does exactly what the file says and nothing else.
+
+**Verified against a throwaway Supabase Postgres 17.6 container** (same engine
+family as production, `auth.uid()`/`auth.role()`/`auth.users` present), applied on
+top of `0000`: all three tables created with RLS enabled, three service-role-only
+policies, both foreign keys, seven indexes, three CHECK constraints. The real
+ingest path then wrote and read back through it end-to-end.
+
+**Reversal**, if it needs to come out. There is no down-migration file; this is it,
+and it was executed against the throwaway database as part of the same run:
+
+```
+DROP TABLE IF EXISTS "ezil_error_user_hours";
+DROP TABLE IF EXISTS "ezil_error_events";
+DROP TABLE IF EXISTS "ezil_error_fingerprints";
+```
+
+Order matters (both FKs point inward). Confirmed to leave `ezil_computers` and
+every other `0000` object untouched. Dropping the tables destroys collected
+telemetry and nothing else — no product data lives in them.
+
+⚠️ Applying this is a schema change to a live database holding real users' rows.
+It is a human decision, not an automated step, and it is why the file ships
+un-applied.
+
+---
+
 ## Known live issue: VS Code Workspace Trust eats the first terminal open
 
 Carried forward from a prior session's live diagnosis of code-server in
@@ -55,6 +110,71 @@ hourly error-rate table. Before spending time reproducing a user-reported
 bug by hand, check whether its fingerprint is already there — that is
 literally what "how many distinct users hit this in the last N hours"
 exists to answer. See `docs/telemetry.md` for what is (and is not) recorded.
+
+⚠️ None of it holds any data until `0001_telemetry.sql` is applied — see PENDING above.
+
+---
+
+## Before the next deploy — two prerequisites that are not code
+
+**1. Create the telemetry R2 bucket.** `worker/wrangler.toml` now binds
+`TELEMETRY_R2_BUCKET` to `ezil-telemetry-spool`, and the bucket does not exist. A
+Worker deploy with an unresolvable R2 binding fails, so this must be run first:
+
+```
+cd worker && npx wrangler r2 bucket create ezil-telemetry-spool
+```
+
+Deliberately a SEPARATE bucket from `SANDBOX_WORKSPACE_R2_BUCKET`, which is
+FUSE-mounted into user containers — sharing it would put the fleet's error log
+inside a user's file manager.
+
+Nothing drains this spool yet. The objects are written (`v1/dt=/hh=/…` NDJSON) and
+never read; a drainer is unwritten work, and `worker/src/telemetry.ts`'s header
+states what it must do.
+
+**2. Nothing else.** The desktop-restart control needs no provisioning: the Worker
+route is on by default (`SANDBOX_RESTART` unset = enabled, same convention as
+`SANDBOX_FOCUS`), and it reuses the existing HMAC secret. Set `SANDBOX_RESTART=off`
+to kill it without a code change.
+
+---
+
+## Desktop restart (Settings → Troubleshoot)
+
+For "the desktop is frozen and there is no way to restart it". The chain is three
+independently-deployed links, and each one feature-detects the next:
+
+```
+Settings → Troubleshoot  →  POST /api/shell/restart  →  POST /sandbox/:name/restart
+   (shell/…/troubleshoot.js)     (app Route Handler)          (Worker + DO)
+```
+
+The button is drawn **disabled** unless `desktopState.endpoints.restart` is present in
+the boot payload, so a shell newer than its server degrades to an honest "Not available
+in this deployment yet" rather than POSTing to a URL it invented. That key
+(`SHELL_API_ROUTES.restart`) and the Route Handler must be added and removed together.
+
+What it actually does: SIGTERMs the desktop launcher **inside the already-running
+container**, reusing `start-neko.sh`'s own `terminate_stack` trap, then boots the stack
+again in place. The container is not recreated; the computer row and the R2 workspace are
+untouched. Budget ~45s worst case — up to 20s waiting for the old stack to confirm it is
+gone (`RESTART_STOP_DEADLINE_MS`), then the usual ~22s boot. Hence `maxDuration = 300` on
+the Route Handler and a 120s client timeout in the provider; a 15s budget copied from
+`/focus` would abort restarts that were going to succeed.
+
+Failure outcomes a user can actually see, and what they mean:
+
+| outcome | meaning |
+|---|---|
+| `stop_timed_out` | The old stack would not die, so **nothing was relaunched** — the Worker refuses to boot a second stack on top of a maybe-alive one. Recreate the computer. |
+| `boot_failed` | It stopped, but did not come back. Retry. |
+| `unsupported_mode` | Guacamole-mode container: `start-desktop.sh` has no SIGTERM trap to reuse, so restart is refused outright rather than attempted. |
+| `restart_in_progress` | A concurrent call; the second is a no-op, not a race. |
+
+Not exercised against a live container by any automated test — the DO's own body does not
+run under `bun test`. The decision logic, the route, the auth envelope and the exact URL
+are unit-tested on both sides.
 
 ---
 
@@ -124,10 +244,11 @@ was written** (superseded by the live status at the top of this file):
 
 ### Wave A — make it exist
 
-**A1. Database + environment.** Apply `app/drizzle/0000_*.sql` (and, as of this pass,
-`app/drizzle/0001_telemetry.sql`) to Supabase. Write `.env.local` for `app/`. The one
-constraint that breaks everything silently: `CLOUDFLARE_GUACAMOLE_HMAC_SECRET` must
-**byte-match** the Worker's `SANDBOX_HMAC_SECRET`.
+**A1. Database + environment.** Apply `app/drizzle/0000_*.sql` to Supabase (long since
+done — see `0001_telemetry.sql` below, which is **not** applied). Write `.env.local` for
+`app/`. The one constraint that breaks everything silently:
+`CLOUDFLARE_GUACAMOLE_HMAC_SECRET` must **byte-match** the Worker's
+`SANDBOX_HMAC_SECRET`.
 
 **A2. Put the template in the image.** `/opt/ezil-sandbox-template` — whether this ships
 in image v8 was not re-verified this session.
