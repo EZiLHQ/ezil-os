@@ -23,15 +23,39 @@ interface Statement {
     params: unknown[];
 }
 
-function makeTestDb() {
+/**
+ * @param alreadyStored eventIds Postgres would reject as duplicates, i.e. what
+ *   `ON CONFLICT DO NOTHING` silently drops. The previous version of this
+ *   harness could not express that at all — it returned one opaque row for
+ *   every insert regardless — which is precisely why the aggregate
+ *   double-counting bug survived ten green tests here and was only found by
+ *   POSTing the same batch twice at a real Postgres. Modelling the drop is the
+ *   difference between a mock that can fail and one that cannot.
+ */
+function makeTestDb(alreadyStored: readonly string[] = []) {
     const statements: Statement[] = [];
+    const rejected = new Set(alreadyStored);
     const proxy = drizzle(
         async (sql, params) => {
             statements.push({ sql, params });
-            if (/^\s*insert\b/i.test(sql) && /returning/i.test(sql)) {
-                // Every row "wins" the insert (no pre-existing eventId) unless a
-                // test overrides this by re-running with different mocked rows.
-                return { rows: params.slice(0, 1).map(() => []) };
+            if (/^\s*insert\b/i.test(sql) && /returning\s+"event_id"/i.test(sql)) {
+                // `RETURNING "event_id"` gives back exactly the rows that were
+                // inserted, as single-column tuples. Recover each row's
+                // event_id positionally from the real column list in the SQL
+                // (rather than sniffing for uuid-shaped params, which would
+                // also match `computer_id`), then drop the known duplicates.
+                const cols = (sql.match(/insert into "ezil_error_events" \(([^)]*)\)/i)?.[1] ?? '')
+                    .split(',')
+                    .map((c) => c.trim().replace(/"/g, ''));
+                const idIdx = cols.indexOf('event_id');
+                if (idIdx < 0 || cols.length === 0) throw new Error('could not parse the events insert column list');
+                const ids: string[] = [];
+                for (let i = 0; i + cols.length <= params.length; i += cols.length) {
+                    const id = params[i + idIdx] as string;
+                    // Postgres inserts a repeated eventId once, so dedupe too.
+                    if (!rejected.has(id) && !ids.includes(id)) ids.push(id);
+                }
+                return { rows: ids.map((id) => [id]) };
             }
             return { rows: [] };
         },
@@ -60,14 +84,20 @@ function event(overrides: Partial<ParsedTelemetryEventInput> = {}): ParsedTeleme
 const USER_HASH = 'u_f5537974';
 
 describe('ingestBatch: statement shape and order', () => {
-    it('does three inserts in order: fingerprints, events, user_hours', async () => {
+    /**
+     * 🔴 EVENTS FIRST. The counters in statements 2 and 3 are derived from what
+     * statement 1 actually stored, so this order is correctness, not style.
+     * The FK order that IS forced by the schema (`ezil_error_user_hours` ->
+     * `ezil_error_fingerprints`) is still 2 before 3.
+     */
+    it('does three inserts in order: events, fingerprints, user_hours', async () => {
         const { db, statements } = makeTestDb();
         await ingestBatch(db, [event()], USER_HASH);
 
         const inserts = statements.filter((s) => /^\s*insert\b/i.test(s.sql));
         expect(inserts).toHaveLength(3);
-        expect(inserts[0]!.sql).toMatch(/"ezil_error_fingerprints"/);
-        expect(inserts[1]!.sql).toMatch(/"ezil_error_events"/);
+        expect(inserts[0]!.sql).toMatch(/"ezil_error_events"/);
+        expect(inserts[1]!.sql).toMatch(/"ezil_error_fingerprints"/);
         expect(inserts[2]!.sql).toMatch(/"ezil_error_user_hours"/);
     });
 
@@ -147,6 +177,60 @@ describe('ingestBatch: statement shape and order', () => {
         const result = await ingestBatch(db, [event(), dup, dup], USER_HASH);
         expect(result.fingerprintsTouched).toBe(1);
         expect(result.attempted).toBe(3);
+    });
+
+    /**
+     * 🔴 THE REGRESSION, found by POSTing one batch twice at a real Postgres
+     * (Supabase 17.6, throwaway container) during the integration merge — with
+     * ten green tests in this file and a code comment that promised exactly the
+     * property it did not have.
+     *
+     * `ezil_error_events` was idempotent on `event_id`, so the replay added no
+     * rows. But the dimension upsert ran FIRST and added `+N` unconditionally,
+     * so `total_count` and `event_count` counted events that exist nowhere in
+     * the events table — permanently, and worse than "permanently" because raw
+     * events are pruned at retention while the rollup is kept 90 days, so the
+     * inflated number is the one that survives to be read.
+     */
+    it('🔴 a fully-duplicate batch touches NO counter — not just no event row', async () => {
+        const e = event();
+        const { db, statements } = makeTestDb([e.eventId]);
+        const result = await ingestBatch(db, [e], USER_HASH);
+
+        const inserts = statements.filter((s) => /^\s*insert\b/i.test(s.sql));
+        expect(inserts).toHaveLength(1);
+        expect(inserts[0]!.sql).toMatch(/"ezil_error_events"/);
+        expect(result).toEqual({ fingerprintsTouched: 0, inserted: 0, attempted: 1 });
+    });
+
+    it('🔴 a half-duplicate batch counts only the half that was actually stored', async () => {
+        const fresh = event({ eventId: '550e8400-e29b-41d4-a716-446655440002' });
+        const dupe = event({ eventId: '550e8400-e29b-41d4-a716-446655440003' });
+        const { db, statements } = makeTestDb([dupe.eventId]);
+        const result = await ingestBatch(db, [fresh, dupe], USER_HASH);
+
+        expect(result.inserted).toBe(1);
+        expect(result.attempted).toBe(2);
+        // Both events share a fingerprint, so the increment is what proves it:
+        // 1 (the stored one), never 2.
+        const fpInsert = statements.find((s) => /"ezil_error_fingerprints"/.test(s.sql))!;
+        const hoursInsert = statements.find((s) => /"ezil_error_user_hours"/.test(s.sql))!;
+        expect(fpInsert.params).toContain(1);
+        expect(fpInsert.params).not.toContain(2);
+        expect(hoursInsert.params).toContain(1);
+        expect(hoursInsert.params).not.toContain(2);
+    });
+
+    it('counts a repeated eventId INSIDE one batch once — Postgres only stores it once', async () => {
+        const e = event();
+        const { db, statements } = makeTestDb();
+        const result = await ingestBatch(db, [e, e], USER_HASH);
+
+        expect(result.inserted).toBe(1);
+        expect(result.attempted).toBe(2);
+        const fpInsert = statements.find((s) => /"ezil_error_fingerprints"/.test(s.sql))!;
+        expect(fpInsert.params).toContain(1);
+        expect(fpInsert.params).not.toContain(2);
     });
 
     it('strips a disallowed attrs key before it ever reaches the insert params', async () => {
