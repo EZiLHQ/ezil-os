@@ -114,7 +114,10 @@ In practice, that means:
   difference from a plain GPL or permissive license — it applies even if
   you never distribute a binary, only a hosted service.
 - **Contributions** to this repository are accepted under the same
-  AGPL-3.0 terms (see [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
+  AGPL-3.0 terms (see [`CONTRIBUTING.md`](./CONTRIBUTING.md)). Who has
+  contributed is recorded in [`CONTRIBUTORS.md`](./CONTRIBUTORS.md); the
+  third-party code this builds on is in
+  [`ATTRIBUTIONS.md`](./ATTRIBUTIONS.md).
 
 This is not legal advice; read the [full license text](./LICENSE) or talk
 to a lawyer if you have a specific redistribution or hosting scenario in
