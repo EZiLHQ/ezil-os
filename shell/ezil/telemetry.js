@@ -142,12 +142,21 @@ function redact (input) {
         // is not. `:` is excluded from the segment class on purpose:
         // `file.js:12:34` keeps its position and `port :8444` keeps its port.
         //
+        // A QUOTED absolute path is eaten whole, spaces and all — quotes
+        // delimit it unambiguously. Must run before the unquoted rule.
+        //
+        // KNOWN RESIDUAL (stated in `docs/telemetry.md`, not papered over): an
+        // UNQUOTED path whose LAST segment contains a space is redacted only
+        // up to that space. Nothing can decide where such a path ends, and
+        // absorbing the rest of the sentence would eat the diagnosis.
+        //
         // Written with a leading capture group rather than the server twin's
         // `(?<!...)` lookbehind ON PURPOSE — a lookbehind in a regex LITERAL
         // is a parse-time SyntaxError on Safari < 16.4, which would take this
         // whole module down at load rather than degrade. This is the
         // best-effort client copy; `sanitizeErrorMessage` on the server is
         // the boundary that actually has to be exact.
+        .replace(/(['"])(~?\/[^'"\n]{0,240})\1/g, '$1<path>$1')
         .replace(/(^|[^\w:/@.~$-])(~?(?:\/[\w.@%+~-]+(?: [\w.@%+~-]+)*(?=\/))*\/[\w.@%+~-]+\/?)/g, '$1<path>')
         .replace(/\b[a-z]:\\(?:[\w.@%+~-]+(?: [\w.@%+~-]+)*\\)*[\w.@%+~-]*/gi, '<path>')
         .replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g, '<ip>')

@@ -139,6 +139,22 @@ describe('sanitizeErrorMessage', () => {
       }
     });
 
+    it('a quoted path is eaten whole, spaces and all', () => {
+      expect(sanitizeErrorMessage("seed_check_failed: ENOENT, open '/home/bob/workspace/my project'")).toBe(
+        "seed_check_failed: ENOENT, open '<path>'",
+      );
+    });
+
+    // 🔴 Pins the one residual `docs/telemetry.md` states out loud: an UNQUOTED
+    // path whose LAST segment contains a space is undecidable, so the rule stops
+    // at the space rather than eating the rest of the sentence. Bounded — the
+    // username and every interior segment are still gone.
+    it('DOCUMENTED RESIDUAL: an unquoted path with a space in its last segment truncates there', () => {
+      const out = sanitizeErrorMessage('mount failed at /home/user1/workspace/my secret project');
+      expect(out).toBe('mount failed at <path> secret project');
+      expect(out).not.toContain('user1');
+    });
+
     it('is idempotent, so sanitizing at the source and again on the way out is safe', () => {
       for (const s of [MEASURED, '/home/u/w/p failed', 'C:\\a\\b broke']) {
         expect(sanitizeErrorMessage(sanitizeErrorMessage(s))).toBe(sanitizeErrorMessage(s));
