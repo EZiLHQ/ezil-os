@@ -46,6 +46,7 @@ async function mintToken(secret = SECRET, now = Date.now()): Promise<string> {
 
 interface CallLog {
   terminateSandbox: number;
+  restartDesktopStack: Array<{ hostname: string; sandboxId: string; explicitMode: unknown; fallbackMode: unknown }>;
   destroy: number;
   flushWorkspaceNow: number;
   getExposedPorts: number;
@@ -110,11 +111,31 @@ function fakeSandboxNamespace(options: {
    * the mandatory desktop-port exposure.
    */
   exposePort?: (port: number) => boolean;
+  /**
+   * Canned response for `restartDesktopStack` — this fake stands in for the
+   * WHOLE Durable Object (see this function's own doc comment), so it is the
+   * DO's `restartDesktopStack` RPC method itself that is replaced here, not
+   * the real one's internals. What THOSE internals do (`listProcesses` /
+   * `killProcess` / `getProcess` / `unexposePort` / `ensureDesktop`) is
+   * covered by the pure decision helpers in `sandbox-control.test.ts`
+   * (`buildRestartReport`, `findDesktopLauncherProcess`) — exactly the same
+   * split `terminateSandbox`/`buildTerminateReport` already uses. This block
+   * only proves the ROUTE TABLE (auth, kill switch, response mapping).
+   */
+  restartResult?: Record<string, unknown>;
+  /**
+   * When set, any `exec()` command touching the container's boot-telemetry
+   * NDJSON path (`ezil-telemetry.ndjson` — see `drainContainerBootTelemetry`,
+   * `./index.ts`) returns this as `stdout` instead of the default `''`. Lets a
+   * test prove boot-phase data actually reaches `spoolTelemetry()`.
+   */
+  containerTelemetryNdjson?: string;
 }): { binding: unknown; calls: CallLog } {
   /** The sandbox id the Worker actually opened the DO with. */
   let openedWith = SANDBOX_NAME;
   const calls: CallLog = {
     terminateSandbox: 0,
+    restartDesktopStack: [],
     destroy: 0,
     flushWorkspaceNow: 0,
     getExposedPorts: 0,
@@ -204,6 +225,20 @@ function fakeSandboxNamespace(options: {
         }
       );
     },
+    restartDesktopStack: async (...args: unknown[]) => {
+      const [hostname, sandboxId, explicitMode, fallbackMode] = args as [string, string, unknown, unknown];
+      calls.restartDesktopStack.push({ hostname, sandboxId, explicitMode, fallbackMode });
+      return (
+        options.restartResult ?? {
+          ok: true,
+          mode: 'neko',
+          outcome: 'restarted',
+          wasRunning: true,
+          stopConfirmed: true,
+          bootOk: true,
+        }
+      );
+    },
     destroy: async () => {
       calls.destroy++;
     },
@@ -215,8 +250,16 @@ function fakeSandboxNamespace(options: {
       calls.getExposedPorts++;
       return options.exposedPorts ?? [];
     },
-    exec: async () => {
+    exec: async (...args: unknown[]) => {
       calls.exec++;
+      const [command] = args as [string | undefined];
+      if (
+        options.containerTelemetryNdjson !== undefined &&
+        typeof command === 'string' &&
+        command.includes('ezil-telemetry.ndjson')
+      ) {
+        return { exitCode: 0, stdout: options.containerTelemetryNdjson, stderr: '' };
+      }
       return { exitCode: 0, stdout: '', stderr: '' };
     },
     // Only wired when `options.exposePort` is supplied — otherwise the Proxy's
@@ -803,6 +846,179 @@ describe('POST /sandbox/:name/focus is HMAC-gated with a closed-enum `app`', () 
   });
 });
 
+// ── POST /sandbox/:name/restart ──────────────────────────────────────────────
+// Same shared-HMAC envelope as `DELETE /sandbox/:name` and `/focus`. The DO's
+// OWN restart logic (SIGTERM reusing terminate_stack, stop-confirm polling,
+// unexpose-then-relaunch, the neko-only guard) is covered by the pure
+// decision helpers in `sandbox-control.test.ts` — see `fakeSandboxNamespace`'s
+// doc comment on `restartResult`. This block proves the ROUTE TABLE: auth,
+// the kill switch, mode resolution, and status-code mapping from `outcome`.
+
+describe('POST /sandbox/:name/restart is HMAC-gated the same way as DELETE/focus', () => {
+  it('REJECTS an unsigned request with 401 and never calls the DO', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+    expect(calls.restartDesktopStack.length).toBe(0);
+  });
+
+  it('rejects a token signed with the WRONG secret', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken('a-different-secret')}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+    expect(calls.restartDesktopStack.length).toBe(0);
+  });
+
+  it('ACCEPTS a signed request via `Authorization: Bearer` and calls the DO exactly once', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(body.outcome).toBe('restarted');
+    expect(calls.restartDesktopStack.length).toBe(1);
+    expect(calls.restartDesktopStack[0].sandboxId).toBe(SANDBOX_NAME);
+    // No explicit `?desktopMode=` — auto-detection is the DO's job, so the
+    // route passes `undefined` through rather than guessing.
+    expect(calls.restartDesktopStack[0].explicitMode).toBeUndefined();
+  });
+
+  it('ACCEPTS a signed request via `?token=` (the /preview-bootstrap precedent)', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const token = encodeURIComponent(await mintToken());
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart?token=${token}`, { method: 'POST' }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    expect(calls.restartDesktopStack.length).toBe(1);
+  });
+
+  it('forwards an explicit `?desktopMode=` through to the DO', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart?desktopMode=neko`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    expect(calls.restartDesktopStack[0].explicitMode).toBe('neko');
+  });
+
+  it('rejects an invalid `?desktopMode=` with a 400, before calling the DO', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart?desktopMode=bogus`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(400);
+    expect(calls.restartDesktopStack.length).toBe(0);
+  });
+
+  it('the kill switch (SANDBOX_RESTART=off) hard-disables the route with a 404, before auth runs', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_RESTART: 'off' },
+    );
+    expect(res.status).toBe(404);
+    expect(calls.restartDesktopStack.length).toBe(0);
+  });
+
+  it('still works keyless in local dev (no secret configured), unchanged', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+      { Sandbox: binding },
+    );
+    expect(res.status).toBe(200);
+    expect(calls.restartDesktopStack.length).toBe(1);
+  });
+
+  it('maps a `stop_timed_out` / `boot_failed` outcome to a 500 (fail loud, never a false 200)', async () => {
+    const { binding, calls } = fakeSandboxNamespace({
+      restartResult: {
+        ok: false,
+        mode: 'neko',
+        outcome: 'stop_timed_out',
+        wasRunning: true,
+        stopConfirmed: false,
+        bootOk: false,
+        error: 'desktop_stack_did_not_stop_within_grace_period',
+      },
+    });
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { ok: boolean; outcome: string };
+    expect(body.ok).toBe(false);
+    expect(body.outcome).toBe('stop_timed_out');
+    expect(calls.restartDesktopStack.length).toBe(1);
+  });
+
+  it('maps an `unsupported_mode` outcome (Guacamole has no teardown trap) to a 400, not a 500', async () => {
+    const { binding } = fakeSandboxNamespace({
+      restartResult: {
+        ok: false,
+        mode: 'guacamole',
+        outcome: 'unsupported_mode',
+        wasRunning: false,
+        stopConfirmed: false,
+        bootOk: false,
+        error: 'restart_not_supported_for_mode:guacamole',
+      },
+    });
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { outcome: string };
+    expect(body.outcome).toBe('unsupported_mode');
+  });
+
+  it('never calls terminateSandbox or destroy — restart must never tear down the container', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(calls.terminateSandbox).toBe(0);
+    expect(calls.destroy).toBe(0);
+  });
+});
+
 // ── POST /sandbox/preview hands back ready-to-embed bridge URLs ─────────────
 //
 // Exercised through the REAL route table with a container fake complete enough
@@ -914,6 +1130,100 @@ describe('POST /sandbox/preview returns appPreviewUrl + codePreviewUrl', () => {
     // …and the failure is surfaced, not swallowed.
     expect((body.codePreviewExpose as { attempted: boolean; exposed: boolean }).attempted).toBe(true);
     expect((body.codePreviewExpose as { attempted: boolean; exposed: boolean }).exposed).toBe(false);
+  });
+});
+
+// ── Telemetry: boot phase/outcome data reaches the R2 spool ─────────────────
+//
+// Before this, `proc.getLogs()` was read only on the FAILURE path inside
+// `ensureDesktop`, and nowhere durable at all — a healthy boot's own
+// container-emitted phase timings were invisible everywhere except a live
+// `wrangler tail`. This proves the fix end to end through the REAL route
+// table: a fake R2 bucket stands in for `TELEMETRY_R2_BUCKET`, and the fake
+// container's `exec()` answers the boot-telemetry drain command
+// (`ezil-telemetry.ndjson`) with canned NDJSON — see `fakeSandboxNamespace`'s
+// `containerTelemetryNdjson` option.
+describe('telemetry: boot phase/outcome data reaches the R2 spool on a SUCCESSFUL boot', () => {
+  function fakeTelemetryBucket(): { bucket: unknown; puts: Array<{ key: string; body: string }> } {
+    const puts: Array<{ key: string; body: string }> = [];
+    return {
+      puts,
+      bucket: {
+        put: async (key: string, body: string) => {
+          puts.push({ key, body });
+          return {};
+        },
+      },
+    };
+  }
+
+  const CONTAINER_NDJSON = [
+    '{"eventClass":"boot_phase","source":"container","site":"xvfb","code":"ok","outcome":"ok","durationMs":210}',
+    '{"eventClass":"boot_summary","source":"container","site":"ready","code":"ok","outcome":"ok","durationMs":5900}',
+  ].join('\n');
+
+  async function preview(env: Record<string, unknown>, binding: unknown) {
+    const res = await worker.fetch(
+      new Request('https://api-desktop.ezil.org/sandbox/preview', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          token: await mintToken(),
+          projectId: 'proj-telemetry',
+          userId: 'user-telemetry',
+          desktopMode: 'neko',
+        }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, ...env },
+    );
+    return { res, body: (await res.json()) as Record<string, unknown> };
+  }
+
+  it('spools ONE ndjson object containing the worker boot_summary AND the container-emitted lines', async () => {
+    const { binding } = fakeSandboxNamespace({ exposePort: () => true, containerTelemetryNdjson: CONTAINER_NDJSON });
+    const { bucket, puts } = fakeTelemetryBucket();
+    const { res, body } = await preview({ TELEMETRY_R2_BUCKET: bucket }, binding);
+
+    expect(res.status).toBe(200);
+    expect(body.ok).toBe(true);
+
+    expect(puts).toHaveLength(1);
+    const lines = puts[0].body.split('\n').map((l) => JSON.parse(l) as Record<string, unknown>);
+    // The Worker's own boot_summary (sandbox.preview.desktop_ready, ok).
+    expect(lines.some((l) => l.eventClass === 'boot_summary' && l.source === 'worker' && l.outcome === 'ok')).toBe(
+      true,
+    );
+    // The container's own two lines, drained via the exec() fake.
+    expect(lines.some((l) => l.source === 'container' && l.site === 'xvfb')).toBe(true);
+    expect(lines.some((l) => l.source === 'container' && l.eventClass === 'boot_summary' && l.site === 'ready')).toBe(
+      true,
+    );
+    // Every row is correlated to THIS request, joinable across worker+container.
+    const correlationId = body.correlationId as string;
+    expect(correlationId).toBeTruthy();
+    expect(lines.every((l) => l.correlationId === correlationId)).toBe(true);
+    // Keyed by that same correlation id (design doc §4.1's v1/dt=/hh=/ layout).
+    expect(puts[0].key).toContain(`/${correlationId}.ndjson`);
+    expect(puts[0].key.startsWith('v1/dt=')).toBe(true);
+  });
+
+  it('is a silent no-op when TELEMETRY_R2_BUCKET is not configured — never fails the preview', async () => {
+    const { binding } = fakeSandboxNamespace({ exposePort: () => true, containerTelemetryNdjson: CONTAINER_NDJSON });
+    const { res, body } = await preview({}, binding);
+    expect(res.status).toBe(200);
+    expect(body.ok).toBe(true);
+    // No bucket binding at all — nothing to assert on except that this didn't throw.
+  });
+
+  it('still spools the worker boot_summary even with NO container telemetry present (older image)', async () => {
+    const { binding } = fakeSandboxNamespace({ exposePort: () => true }); // no containerTelemetryNdjson
+    const { bucket, puts } = fakeTelemetryBucket();
+    const { res } = await preview({ TELEMETRY_R2_BUCKET: bucket }, binding);
+    expect(res.status).toBe(200);
+    expect(puts).toHaveLength(1);
+    const lines = puts[0].body.split('\n').map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(lines.every((l) => l.source === 'worker')).toBe(true);
+    expect(lines.some((l) => l.eventClass === 'boot_summary')).toBe(true);
   });
 });
 
@@ -1268,6 +1578,7 @@ describe('no other mutating route is reachable unauthenticated', () => {
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/cpu-diag` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/twen` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus` },
+      { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart` },
       { method: 'POST', url: `https://api-desktop.ezil.org/project-files/put` },
       { method: 'POST', url: `https://api-desktop.ezil.org/project-files/delete` },
       { method: 'POST', url: `https://api-desktop.ezil.org/project-files/list` },
@@ -1283,7 +1594,7 @@ describe('no other mutating route is reachable unauthenticated', () => {
       expect(`${method} ${new URL(url).pathname} -> ${res.status}`).toBe(
         `${method} ${new URL(url).pathname} -> 401`,
       );
-      expect(calls.terminateSandbox + calls.destroy + calls.exec).toBe(0);
+      expect(calls.terminateSandbox + calls.destroy + calls.exec + calls.restartDesktopStack.length).toBe(0);
     }
   });
 

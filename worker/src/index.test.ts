@@ -1129,3 +1129,48 @@ describe('POST /sandbox/:id/focus wiring', () => {
     expect(src).toContain('SANDBOX_FOCUS?: string;');
   });
 });
+
+// ── Container boot telemetry drain — reaches BOTH the success and failure path ─
+//
+// The end-to-end SUCCESS case (a full ndjson batch actually landing in a fake
+// R2 bucket) is covered live in `route-auth.test.ts`. What is NOT practical to
+// drive live through that harness is the FAILURE branch — it requires making
+// the fake container's readiness probe genuinely fail, several layers deep in
+// `pollDesktopReady`. These are static source assertions (same style as the
+// "sealed workspace-startup delivery" block above) pinning that
+// `onBootTelemetry` — the callback `drainContainerBootTelemetry`'s result is
+// handed to — is invoked from BOTH branches, so a regression that quietly
+// drops one of them (e.g. "only call it on success, like `proc.getLogs()`
+// used to be failure-only") fails this test immediately.
+describe('container boot-telemetry drain reaches ensureDesktop callers on success AND failure', () => {
+  const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+
+  it('drains and forwards telemetry on the FAILURE path, before throwing desktop_failed_to_start', () => {
+    const failureBlock = src.match(/if \(!ready\) \{[\s\S]*?throw new Error\(`desktop_failed_to_start[\s\S]*?\n {4}\}/)?.[0] ?? '';
+    expect(failureBlock).toContain('if (onBootTelemetry) {');
+    expect(failureBlock).toContain('onBootTelemetry(await drainContainerBootTelemetry(sandbox));');
+    // The drain must never mask the real boot failure — it is wrapped so a
+    // drain error cannot suppress the throw two lines below it.
+    expect(failureBlock.indexOf('onBootTelemetry(await drainContainerBootTelemetry')).toBeLessThan(
+      failureBlock.indexOf('throw new Error(`desktop_failed_to_start'),
+    );
+  });
+
+  it('drains and forwards telemetry on the SUCCESS path too — not only on failure', () => {
+    const successBlock =
+      src.match(/bootLog\('ready', 'end', \{ status: 'ok'[\s\S]*?return \{ url: desktopUrl[^}]*\};/)?.[0] ?? '';
+    expect(successBlock).toContain('if (onBootTelemetry) {');
+    expect(successBlock).toContain('onBootTelemetry(await drainContainerBootTelemetry(sandbox));');
+  });
+
+  it('the drain itself is best-effort — reads a bounded tail and never throws on a missing/unreadable file', () => {
+    expect(src).toContain('async function drainContainerBootTelemetry(');
+    expect(src).toContain("tail -c ${CONTAINER_TELEMETRY_MAX_BYTES} ${CONTAINER_TELEMETRY_PATH} 2>/dev/null || true");
+  });
+
+  it('spoolTelemetry never awaits the R2 put on the response path (fire-and-forget via ctx.waitUntil)', () => {
+    const fnBlock = src.match(/function spoolTelemetry\([\s\S]*?\n\}/)?.[0] ?? '';
+    expect(fnBlock).not.toContain('await bucket.put');
+    expect(fnBlock).toContain('ctx?.waitUntil');
+  });
+});

@@ -92,6 +92,34 @@ phase_end() {
   t0="${PHASE_T0_MS[$name]:-$now}"
   dur=$((now - t0))
   echo "[ezil-boot] +$(elapsed_ms)ms phase=${name} event=end status=${status} phase_ms=${dur} cumulative_ms=$((now - BOOT_T0_MS))" | tee -a "$LOG" >&2
+  emit_telemetry "$name" "$status" "$dur"
+}
+
+# ── Structured boot telemetry (fixed path, drained by the Worker) ───────────
+# Production has no exec/shell route into a live container (see this file
+# header comment above), and the wrangler tail human-readable [ezil-boot]
+# lines above are not queryable anywhere durable. This gives the Worker a fixed,
+# machine-parseable file to drain (`drainContainerBootTelemetry`, index.ts)
+# after EVERY boot attempt, ok or not, so the fleet-wide "which boot phase
+# fails most" question can be answered without grepping live logs.
+#
+# One JSON line per PHASE_END call (never a raw message, never a path, never
+# an env value) — the closed set of phase names already logged above plus an
+# ok/error/skipped status and an integer duration. Same "never interpolate a
+# free-form string" discipline this whole script already applies everywhere
+# else. `|| true` on the append: a full disk must never fail a boot.
+TELEMETRY_NDJSON="${EZIL_TELEMETRY_NDJSON_PATH:-/var/log/ezil-telemetry.ndjson}"
+# emit_telemetry <phase_name> <status> <duration_ms>
+# The whole-boot "ready" phase becomes eventClass=boot_summary (the
+# denominator every telemetry query divides by — see the design doc, section
+# 6, Q2/Q4); every other phase becomes eventClass=boot_phase. `code` mirrors
+# `status` here: this script has no richer per-phase error taxonomy than
+# ok/error/skipped, and an outcome string is itself a safe, closed-set code.
+emit_telemetry() {
+  local phase_name="$1" status="${2:-ok}" duration_ms="${3:-0}" event_class="boot_phase"
+  [ "$phase_name" = "ready" ] && event_class="boot_summary"
+  printf '{"eventClass":"%s","source":"container","site":"%s","code":"%s","outcome":"%s","durationMs":%s}\n' \
+    "$event_class" "$phase_name" "$status" "$status" "$duration_ms" >>"$TELEMETRY_NDJSON" 2>/dev/null || true
 }
 
 phase_start container_start

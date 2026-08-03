@@ -16,6 +16,7 @@ import {
   MAX_DETAIL_LEN,
   LifecycleTimeline,
   classifyError,
+  createCollectingSink,
   newCorrelationId,
   safeUserHash,
   sanitizeErrorMessage,
@@ -187,5 +188,47 @@ describe('LifecycleTimeline', () => {
     expect(blob).not.toContain('SECRETRELAYCRED');
     expect(blob).not.toContain('203.0.113.9');
     expect(events[0].errorCode).toBe('turn_unavailable');
+  });
+});
+
+describe('createCollectingSink (additive telemetry harvesting, zero new tl.event call sites)', () => {
+  it('still writes exactly what the default sink would have — console.log(JSON.stringify(event))', () => {
+    const originalLog = console.log;
+    const lines: string[] = [];
+    console.log = (...args: unknown[]) => {
+      lines.push(String(args[0]));
+    };
+    try {
+      const collected: LogEvent[] = [];
+      const tl = new LifecycleTimeline({ correlationId: 'cid-1', sink: createCollectingSink(collected) });
+      tl.event('web_api', 'sandbox.preview.received', 'ok');
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0])).toMatchObject({ event: 'sandbox.preview.received', outcome: 'ok' });
+    } finally {
+      console.log = originalLog;
+    }
+  });
+
+  it('ALSO accumulates every built event into the given array, in emission order', () => {
+    const collected: LogEvent[] = [];
+    const tl = new LifecycleTimeline({ correlationId: 'cid-2', sink: createCollectingSink(collected) });
+    tl.event('web_api', 'sandbox.preview.received', 'ok');
+    tl.event('project_authorization', 'sandbox.preview.authorize', 'error', { error: 'bad_token' });
+    expect(collected).toHaveLength(2);
+    expect(collected[0].event).toBe('sandbox.preview.received');
+    expect(collected[1].event).toBe('sandbox.preview.authorize');
+    expect(collected[1].errorCode).toBe('bad_token');
+  });
+
+  it('a fresh array passed to a second timeline stays independent (no shared mutable state)', () => {
+    const a: LogEvent[] = [];
+    const b: LogEvent[] = [];
+    new LifecycleTimeline({ correlationId: 'cid-a', sink: createCollectingSink(a) }).event(
+      'web_api',
+      'sandbox.preview.received',
+      'ok',
+    );
+    expect(a).toHaveLength(1);
+    expect(b).toHaveLength(0);
   });
 });
