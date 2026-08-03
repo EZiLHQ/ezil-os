@@ -460,7 +460,13 @@ import {
   mintPreviewBootstrapToken,
   PREVIEW_COOKIE_NAME,
 } from './hmac';
-import { LifecycleTimeline, newCorrelationId, createCollectingSink, type LogEvent } from './observability';
+import {
+  LifecycleTimeline,
+  newCorrelationId,
+  createCollectingSink,
+  sanitizeErrorMessage,
+  type LogEvent,
+} from './observability';
 import {
   selectTelemetryWorthy,
   toTelemetryEventInput,
@@ -1217,7 +1223,16 @@ async function ensureWorkspaceMount(
     }
   }
   if (!mounted) {
-    return { mounted: false, detail: `mount_failed_after_${MOUNT_ATTEMPTS}_attempts: ${mountErr}` };
+    // Sanitized AT THE SOURCE, not only where it is logged: `detail` is also
+    // returned to the caller in the `/sandbox/preview` response body and
+    // re-wrapped by two other call sites (`diag_mount_failed`,
+    // `twen_mount_failed`), and an s3fs error carries the mount path — i.e. a
+    // username and a project name. `LifecycleTimeline.build` sanitizes again
+    // on the way to telemetry; sanitizing is idempotent.
+    return {
+      mounted: false,
+      detail: `mount_failed_after_${MOUNT_ATTEMPTS}_attempts: ${sanitizeErrorMessage(mountErr)}`,
+    };
   }
 
   // Fallback for the generic S3-compatible mode only (local dev / no native
@@ -1246,7 +1261,9 @@ async function ensureWorkspaceMount(
     return {
       mounted: true,
       mountPath: config.mountPath,
-      detail: `seed_check_failed: ${err instanceof Error ? err.message : String(err)}`,
+      // Same reason as `mount_failed_after_*` above — an ENOENT/EACCES from
+      // the seed check names the mount path verbatim.
+      detail: `seed_check_failed: ${sanitizeErrorMessage(err)}`,
     };
   }
 

@@ -87,8 +87,18 @@ export const MAX_DETAIL_LEN = 200;
  *
  * Redacts common secret-bearing shapes (HMAC tokens/signatures, bearer/auth
  * headers, cookies, key/secret assignments, IPv4/IPv6 addresses, s3/r2 access
- * keys) and hard-truncates the result. Returns a stable placeholder for empty
- * input.
+ * keys) AND locations (data:/blob: URIs, full URLs, absolute filesystem
+ * paths), then hard-truncates the result. Returns a stable placeholder for
+ * empty input.
+ *
+ * 🔴 The location rules are the ones that make `docs/telemetry.md`'s "workspace
+ * file names, paths, or contents are never collected" TRUE OF WHAT IS STORED.
+ * `normalizeDetail`'s own path rule (N9) is not enough and never was: its
+ * output feeds `ezil_error_fingerprints.normalized_detail` and the hash only,
+ * while `ezil_error_events.detail` is written from THIS function's output.
+ * Inspecting a fingerprint therefore makes paths look handled when they are
+ * not. Anything added here must be added to the app's twin in the same
+ * commit — `app/src/server/telemetry/sanitize.test.ts` fails otherwise.
  */
 export function sanitizeErrorMessage(input: unknown): string {
   let s =
@@ -110,7 +120,28 @@ export function sanitizeErrorMessage(input: unknown): string {
     )
     // AWS/R2-style access key ids and long opaque secrets.
     .replace(/\bAKIA[0-9A-Z]{16}\b/g, '[redacted-keyid]')
-    // IPv4 addresses (ICE candidate leakage).
+    // data:/blob: URIs (can carry whole file contents) and full URLs (path
+    // segments and query strings carry both workspace paths and tokens).
+    .replace(/\b(?:data|blob):[^\s'"]+/gi, '<uri>')
+    .replace(/\bhttps?:\/\/[^\s'"<>)\]]+/gi, '<url>')
+    // Absolute POSIX paths. `/home/<login>/workspace/<project>` is a
+    // username and a project name — user data, and the single thing this
+    // rule exists for. Anchored on a `/` NOT preceded by a word char,
+    // `:`, `/`, `@`, `.`, `~` or `$`, so `and/or`, `1/2`, `08/01/2026`
+    // and a URL's own path are all left alone. A segment may contain
+    // single spaces only when another `/` follows, so a project directory
+    // named `my app` is eaten whole while `expected 200 / got 500` is
+    // untouched. `:` is excluded from the segment class ON PURPOSE:
+    // `file.js:12:34` keeps its line/column and `port :8444` keeps its
+    // port. Those, durations, correlation ids and error codes are what
+    // make a record actionable, and none of them begin with a slash.
+    .replace(/(?<![\w:/@.~$-])~?(?:\/[\w.@%+~-]+(?: [\w.@%+~-]+)*(?=\/))*\/[\w.@%+~-]+\/?/g, '<path>')
+    // Windows drive paths, same shape. UNC (`\\host\share`) is NOT matched
+    // on purpose — `\\n` in a JSON-escaped message would false-positive.
+    .replace(/\b[a-z]:\\(?:[\w.@%+~-]+(?: [\w.@%+~-]+)*\\)*[\w.@%+~-]*/gi, '<path>')
+    // IPv4 addresses (ICE candidate leakage). AFTER the path rules, so a
+    // path containing an address collapses to one `<path>` rather than
+    // `<path>[redacted-ip].sock`.
     .replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g, '[redacted-ip]')
     // IPv6 addresses.
     .replace(/\b(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{1,4}\b/gi, '[redacted-ip]')
