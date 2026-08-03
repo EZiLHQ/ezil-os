@@ -5,12 +5,23 @@
  * `ingestBatch`, and this is the only place a `fingerprint` or a
  * `normalizedDetail` is computed for storage.
  *
- * One transaction, three statements, same order the design specifies
- * (§4.5) — fingerprints dimension upserted BEFORE the rollup row, because
+ * One transaction, three statements: EVENTS, then the fingerprints
+ * dimension, then the hour rollup.
+ *
+ * 🔴 Events first is load-bearing, and is a correction to the order the
+ * design sketched (§4.5). The two counter statements derive their increments
+ * from what the events insert ACTUALLY STORED (`RETURNING` on
+ * `ON CONFLICT DO NOTHING`), because otherwise a re-delivered batch bumps
+ * `total_count`/`event_count` for events that were dropped as duplicates and
+ * the aggregates drift permanently above the raw table they summarise. That
+ * defect passed every mocked test in `ingest.test.ts` and was found only by
+ * POSTing the same batch twice at a real Postgres.
+ *
+ * The dimension is still upserted BEFORE the rollup, because
  * `ezil_error_user_hours` carries a real FK to `ezil_error_fingerprints`.
  * There is deliberately no FK from `ezil_error_events.fingerprint` to the
- * dimension table (see `../db/schema/telemetry.ts`), so statement order
- * between 1 and 2 does not matter — only order before 3 does.
+ * dimension table (see `../db/schema/telemetry.ts`), which is exactly what
+ * frees the events insert to go first.
  *
  * `IngestDb` is a narrow `Pick<>` of Drizzle's generic `PgDatabase` (exactly
  * the pattern `computer-store.ts` uses) — this file exercises it entirely
@@ -98,43 +109,52 @@ export async function ingestBatch(
         };
     });
 
-    // Fold to one row per distinct fingerprint in THIS batch — both for the
-    // fingerprints-dimension upsert and the hour-rollup upsert, so a client
-    // sending the same crash 3 times in one flush increments `total_count`
-    // and `event_count` by 3 in one statement rather than racing itself.
-    const byFingerprint = new Map<string, { row: (typeof rows)[number]; count: number }>();
-    for (const row of rows) {
-        const existing = byFingerprint.get(row.fingerprint);
-        if (existing) existing.count++;
-        else byFingerprint.set(row.fingerprint, { row, count: 1 });
+    /**
+     * Fold to one row per distinct fingerprint — so a client sending the same
+     * crash 3 times in one flush increments `total_count` and `event_count`
+     * by 3 in one statement rather than racing itself.
+     *
+     * 🔴 Takes the ACTUALLY-STORED rows, not the submitted batch. See the
+     * statement order in the transaction below for why that distinction is
+     * the whole correctness of this function.
+     */
+    function foldByFingerprint(stored: typeof rows) {
+        const byFingerprint = new Map<string, { row: (typeof rows)[number]; count: number }>();
+        for (const row of stored) {
+            const existing = byFingerprint.get(row.fingerprint);
+            if (existing) existing.count++;
+            else byFingerprint.set(row.fingerprint, { row, count: 1 });
+        }
+        return [...byFingerprint.values()];
     }
-    const grouped = [...byFingerprint.values()];
 
     return db.transaction(async (tx) => {
-        // 1. Fingerprints dimension (upsert). Must run before 3 (the FK).
-        await tx
-            .insert(errorFingerprints)
-            .values(
-                grouped.map(({ row, count }) => ({
-                    fingerprint: row.fingerprint,
-                    eventClass: row.eventClass,
-                    source: row.source,
-                    site: row.site,
-                    code: row.code,
-                    normalizedDetail: row.normalizedDetail || null,
-                    totalCount: count,
-                })),
-            )
-            .onConflictDoUpdate({
-                target: errorFingerprints.fingerprint,
-                set: {
-                    lastSeenAt: now,
-                    totalCount: sql`${errorFingerprints.totalCount} + excluded.total_count`,
-                },
-            });
-
-        // 2. The events themselves. Idempotent: a re-sent beacon (retried
-        // fetch after a flaky network) is a no-op, never a duplicate row.
+        /**
+         * 1. The events themselves, FIRST, and idempotently on `event_id`.
+         *
+         * 🔴 THIS RUNS FIRST FOR A REASON, and the reason was found by sending
+         * the same batch twice at a real Postgres. The counters in statements 2
+         * and 3 must be derived from what this statement ACTUALLY STORED, not
+         * from what the client submitted. When the dimension upsert ran first
+         * it added `+N` unconditionally while this statement silently dropped
+         * all N as duplicates — so a re-delivered beacon left `total_count` and
+         * `event_count` permanently inflated with events that exist nowhere in
+         * `ezil_error_events`, and every rollup-backed number
+         * (`fingerprintLeaderboardFromRollup`, the admin page's totals) drifted
+         * upward with no way to reconcile it. The events table was idempotent;
+         * the aggregates over it were not, which is the worse half to get wrong
+         * because raw rows are pruned at retention and the rollup is what
+         * survives.
+         *
+         * `RETURNING` on an `ON CONFLICT DO NOTHING` insert yields exactly the
+         * rows that were inserted, which is precisely the set we need.
+         *
+         * Nothing here depends on statement 2: `ezil_error_events.fingerprint`
+         * deliberately carries NO foreign key to the dimension table (see
+         * `../db/schema/telemetry.ts`). The one ordering constraint that is
+         * real — `ezil_error_user_hours` -> `ezil_error_fingerprints` — is
+         * still honoured, 2 before 3.
+         */
         const insertResult = await tx
             .insert(errorEvents)
             .values(
@@ -160,9 +180,49 @@ export async function ingestBatch(
             .onConflictDoNothing({ target: errorEvents.eventId })
             .returning({ eventId: errorEvents.eventId });
 
+        // Only what became a row. A batch whose every event was already
+        // stored is now a TRUE no-op — no counters move, nothing to fold —
+        // which is what "a re-sent batch is idempotent" has to mean if it is
+        // going to be worth saying. Deduped by eventId first, so a client that
+        // repeats one eventId inside a single batch cannot count it twice
+        // either (Postgres inserts it once; `rows` still holds it twice).
+        const storedIds = new Set(insertResult.map((r) => r.eventId));
+        const seen = new Set<string>();
+        const stored = rows.filter(
+            (row) => storedIds.has(row.eventId) && !seen.has(row.eventId) && (seen.add(row.eventId), true),
+        );
+        if (stored.length === 0) {
+            return { fingerprintsTouched: 0, inserted: 0, attempted: rows.length };
+        }
+        const grouped = foldByFingerprint(stored);
+
+        // 2. Fingerprints dimension (upsert). Must run before 3 (the FK).
+        //    `last_seen_at` advances only when something was actually stored,
+        //    for the same reason the counters do — a replay is not a sighting.
+        await tx
+            .insert(errorFingerprints)
+            .values(
+                grouped.map(({ row, count }) => ({
+                    fingerprint: row.fingerprint,
+                    eventClass: row.eventClass,
+                    source: row.source,
+                    site: row.site,
+                    code: row.code,
+                    normalizedDetail: row.normalizedDetail || null,
+                    totalCount: count,
+                })),
+            )
+            .onConflictDoUpdate({
+                target: errorFingerprints.fingerprint,
+                set: {
+                    lastSeenAt: now,
+                    totalCount: sql`${errorFingerprints.totalCount} + excluded.total_count`,
+                },
+            });
+
         // 3. Keep the current hour's rollup live so Q1/Q3 work even before
-        // an hourly maintenance job runs. Requires (1) to have committed
-        // its upsert first (FK to errorFingerprints).
+        // an hourly maintenance job runs. Requires (2) to have run first
+        // (FK to errorFingerprints).
         await tx
             .insert(errorUserHours)
             .values(
@@ -182,7 +242,7 @@ export async function ingestBatch(
 
         return {
             fingerprintsTouched: grouped.length,
-            inserted: insertResult.length,
+            inserted: stored.length,
             attempted: rows.length,
         };
     });
