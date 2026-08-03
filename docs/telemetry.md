@@ -1,0 +1,136 @@
+# Telemetry — what EZiL-OS collects, what it does not, and how to turn it off
+
+EZiL-OS is a public, AGPL-licensed project handling real users. This document is the
+trust surface for that: an exact account of the crash/error telemetry the shell, the
+Worker, and the container send to EZiL's own servers, written so a stranger reading the
+source can verify every claim against the code cited.
+
+Design source of truth: the telemetry design this implementation follows is not
+reproduced here in full — read the code it describes instead:
+`app/src/server/telemetry/` (schema, fingerprinting, ingest, retention, queries) and
+`app/src/server/db/schema/telemetry.ts` (the three Postgres tables). This document is
+the plain-language summary of what that code does, kept in sync with it.
+
+## What is collected
+
+One thing only: **structured records of failures** — a crash, a boot phase that failed,
+an API call that returned an error, a desktop window that failed to open. Nine closed
+event classes exist (`boot_phase`, `boot_summary`, `boot_stall`, `crash`, `window_error`,
+`api_failure`, `display_failure`, `worker_exception`, `contract_violation`); nothing
+outside that list is accepted — `POST /api/shell/telemetry` validates every event against
+a strict schema (`app/src/server/telemetry/schema.ts`) and silently drops anything that
+doesn't match, rather than storing an unrecognised shape.
+
+Each stored row carries, at most:
+
+| Field | What it is |
+|---|---|
+| `fingerprint` | A SHA-256 hash of the error's *type*, computed server-side from an already-redacted, already-normalised description — never of anything a person typed |
+| `user_hash` | A one-way hash of your account id (`u_xxxxxxxx`, FNV-1a) — a *correlation key*, not an identifier. It lets us count "how many distinct people hit this" without our own dashboards, exports, or on-call screenshots ever showing an identity |
+| `site` / `code` | A hand-written, low-cardinality label for *where* and *what kind* of failure this was (e.g. `sandbox_start_failed`) — never a file path or a URL |
+| `detail` | A short (≤200 char), redacted description, run through the same sanitiser twice (once by the sender, once again on our server) before it is ever written |
+| `duration_ms`, `outcome`, `occurred_at` | Timing and pass/fail bookkeeping |
+| `computer_id` | The random UUID your own computer row already uses — it identifies no one outside our own database and is already visible to you in the product |
+
+That's the entire row. See `app/src/server/db/schema/telemetry.ts` for the literal column
+list and `app/src/server/telemetry/types.ts` for the wire contract the shell sends.
+
+## What is never collected — named so nobody adds it back thinking it was an oversight
+
+- **Your raw account id or email.** Both exist in the browser's own boot payload
+  (`window.__EZIL_BOOT__`) and are deliberately never put on the wire. The ingest route's
+  schema is `.strict()` — an event carrying an unrecognised field like `userId` is
+  rejected outright, not silently accepted (`app/src/server/telemetry/schema.test.ts`
+  asserts this directly, not just as a comment's promise).
+- **Your IP address.** Not read from the request, not derivable from anything stored.
+- **Full stack traces.** At most one stack frame (`functionName@file.js`, no line, no
+  column, no path), and only for the `crash` event class.
+- **Workspace file names, paths, or contents.** Redaction strips absolute paths before
+  anything is hashed or stored.
+- **Full URLs, query strings, or `document.referrer`.** Query strings can carry tokens.
+- **Secrets, tokens, cookies, HMAC signatures, TURN/relay credentials.** Redacted twice —
+  once by the sender, once again at the server — before storage.
+- **Browser/OS fingerprinting signals** (User-Agent, screen size, locale, timezone).
+  None of these answer the one question this system exists to answer ("how many people
+  hit this specific bug"), so none are collected.
+- **A behavioural trail of what you clicked or typed.** Only failures are recorded, and
+  only the failure itself — never a breadcrumb history leading up to it.
+
+## How to turn it off
+
+Telemetry is **best-effort and silently optional by construction**, not a setting to
+find and flip:
+
+- It only exists for a signed-in session — there is no anonymous collection path.
+- If your browser has JavaScript disabled, or blocks `navigator.sendBeacon`/`fetch`
+  requests to this origin (an ad blocker, a strict extension, a corporate proxy), nothing
+  is sent, and nothing in the product behaves any differently — see the "always 202,
+  nothing to branch on" contract below.
+- Blocking requests to `/api/shell/telemetry` at the browser or network level (a
+  userscript, an extension rule, a hosts-file entry, a proxy filter) fully disables it.
+  Because the ingest route never changes what the product does based on whether a batch
+  arrived, blocking it has no functional side effect on EZiL-OS itself.
+
+There is deliberately no in-product toggle yet, because there is deliberately no
+telemetry to opt out of beyond crash/error records already stripped of anything
+identifying. If that changes — if a future version collects anything beyond failure
+records — this document and a real settings toggle are expected to change together.
+
+## The guarantee: telemetry can never affect what you see
+
+Every telemetry code path is designed so that failure is invisible to the product:
+
+- The ingest route always answers `202 Accepted` with an empty body — whether you are
+  signed in, the batch is malformed, the server is overloaded, or Postgres is down. There
+  is nothing in the response for a client to read or branch on.
+- The actual database write happens **after** that response is already sent (Next.js's
+  `after()`), so a slow or unreachable database costs you nothing.
+- If the shell's telemetry module throws for any reason, it fails silently and stops
+  trying for the rest of that page load — it never surfaces an error of its own.
+
+See `app/src/server/telemetry/http-handler.ts` for the literal code, and its test file for
+the both-directions proof (each failure mode is asserted to still return 202 and schedule
+no work).
+
+## Retention
+
+Raw event rows (`ezil_error_events`) are kept for **14 days**, then deleted — not
+archived, not soft-deleted, permanently removed by an hourly maintenance job
+(`app/src/server/telemetry/retention.ts`, run from
+`GET /api/cron/telemetry-maintenance`). An hourly rollup
+(`ezil_error_user_hours` — a count per error-type, per hour, per hashed user, with no
+other fields) is kept for 90 days so long-horizon "how many distinct people hit this"
+questions can still be answered after the raw rows are gone, without keeping any
+per-event detail around longer than two weeks. A small permanent table
+(`ezil_error_fingerprints`) records only "this kind of error exists, first/last seen,
+how many times total" — no per-event data, and rows unseen for a year with fewer than 10
+total occurrences are pruned from even that.
+
+## Who can read it
+
+All three telemetry tables are Postgres Row-Level-Security tables with **no policy at
+all for ordinary signed-in users** — only EZiL's own service-role connection can query
+them (`app/drizzle/0001_telemetry.sql`). There is no "your own crash reports" view in the
+product today. A small internal review page (`/admin/telemetry`) exists for the project
+owner, gated by an explicit email allow-list (`app/src/server/telemetry/admin.ts`) that
+is unset by default — meaning the page is unreachable by anyone until it is deliberately
+configured, never reachable by every signed-in user by default.
+
+## Abuse surface and flood behaviour
+
+`POST /api/shell/telemetry` is reachable by any signed-in session and accepts
+client-controlled JSON, so it is treated as hostile input:
+
+- Request bodies are capped at 64 KB, measured by actual bytes read off the request
+  stream — never by a trustable `Content-Length` header.
+- At most 50 events are accepted per request; more are silently truncated, not rejected.
+- Each user is rate-limited to 20 requests/minute per server instance
+  (`app/src/server/telemetry/rate-limit.ts` — documented there as best-effort, not a
+  distributed limit).
+- A global circuit breaker (`app/src/server/telemetry/load-shed.ts`) drops **all** new
+  telemetry, from everyone, the moment the underlying table's estimated row count crosses
+  2,000,000 — telemetry is designed to fail before the product it is meant to protect
+  does.
+
+None of these limits are visible to the caller: every outcome, including being dropped
+outright, is the same `202 Accepted`.
