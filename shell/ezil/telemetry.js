@@ -132,6 +132,33 @@ function redact (input) {
         .replace(/\b(?:key|secret|token|password|sig|hmac)=[^\s'"&]+/gi, '[redacted]')
         .replace(/\b(?:data|blob):[^\s'"]+/gi, '<uri>')
         .replace(/\bhttps?:\/\/[^\s'"<>)\]]+/gi, '<url>')
+        // Absolute filesystem paths. A workspace path is
+        // `/home/<login>/workspace/<project>` — a username and a project
+        // name, which `docs/telemetry.md` promises is never stored. Anchored
+        // on a `/` NOT preceded by a word char, `:`, `/`, `@`, `.`, `~` or
+        // `$`, so `and/or`, `1/2`, `08/01/2026` and a URL's own path survive.
+        // A segment may hold single spaces only when another `/` follows, so
+        // a project called `my app` is eaten while `expected 200 / got 500`
+        // is not. `:` is excluded from the segment class on purpose:
+        // `file.js:12:34` keeps its position and `port :8444` keeps its port.
+        //
+        // A QUOTED absolute path is eaten whole, spaces and all — quotes
+        // delimit it unambiguously. Must run before the unquoted rule.
+        //
+        // KNOWN RESIDUAL (stated in `docs/telemetry.md`, not papered over): an
+        // UNQUOTED path whose LAST segment contains a space is redacted only
+        // up to that space. Nothing can decide where such a path ends, and
+        // absorbing the rest of the sentence would eat the diagnosis.
+        //
+        // Written with a leading capture group rather than the server twin's
+        // `(?<!...)` lookbehind ON PURPOSE — a lookbehind in a regex LITERAL
+        // is a parse-time SyntaxError on Safari < 16.4, which would take this
+        // whole module down at load rather than degrade. This is the
+        // best-effort client copy; `sanitizeErrorMessage` on the server is
+        // the boundary that actually has to be exact.
+        .replace(/(['"])(~?\/[^'"\n]{0,240})\1/g, '$1<path>$1')
+        .replace(/(^|[^\w:/@.~$-])(~?(?:\/[\w.@%+~-]+(?: [\w.@%+~-]+)*(?=\/))*\/[\w.@%+~-]+\/?)/g, '$1<path>')
+        .replace(/\b[a-z]:\\(?:[\w.@%+~-]+(?: [\w.@%+~-]+)*\\)*[\w.@%+~-]*/gi, '<path>')
         .replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g, '<ip>')
         .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<uuid>')
         .replace(/\b[A-Za-z0-9_-]{24,}\b/g, '<opaque>')
