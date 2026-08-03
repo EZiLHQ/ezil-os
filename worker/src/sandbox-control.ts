@@ -99,6 +99,140 @@ export function focusDisabled(flag: string | undefined): boolean {
   return ['off', 'false', '0', 'disabled', 'no'].includes(flag.trim().toLowerCase());
 }
 
+// ── Desktop-stack restart (`POST /sandbox/:id/restart`) ─────────────────────
+//
+// "Someone closed the browser — there is no way to restart the system." This
+// gives the shell a route that restarts the desktop stack INSIDE the already-
+// running container, without destroying the container or its workspace.
+//
+// Same non-secret kill-switch vocabulary as every other control route.
+export function restartDisabled(flag: string | undefined): boolean {
+  if (!flag) return false;
+  return ['off', 'false', '0', 'disabled', 'no'].includes(flag.trim().toLowerCase());
+}
+
+/** The exact command `ensureDesktop`'s `sandbox.startProcess()` launches (see `./index.ts`). */
+const DESKTOP_LAUNCHER_MARKER = '/usr/local/bin/start-desktop.sh';
+
+/** The subset of `@cloudflare/sandbox`'s `Process`/`ProcessListResult` entry this module needs. */
+export interface ProcessLike {
+  id: string;
+  command: string;
+  status: string;
+}
+
+/**
+ * Find the currently-running (or starting) desktop-launcher process among
+ * `sandbox.listProcesses()`'s result, if any. Matches on the exact script
+ * path `ensureDesktop` launches (`DESKTOP_MODE=<mode> bash
+ * /usr/local/bin/start-desktop.sh`) — never a bare-name match, mirroring the
+ * "no `pkill` by name" discipline `start-neko.sh`'s own doc comment insists
+ * on (a name match in a container the user also runs processes in is not
+ * ownership; here it is stronger still — this is the SDK's own tracked
+ * process record, not a host-wide process scan).
+ */
+export function findDesktopLauncherProcess(processes: readonly ProcessLike[]): ProcessLike | undefined {
+  return processes.find(
+    (p) => (p.status === 'running' || p.status === 'starting') && p.command.includes(DESKTOP_LAUNCHER_MARKER),
+  );
+}
+
+/**
+ * Honest restart reporting — same discipline as `buildTerminateReport`:
+ * describe what was actually OBSERVED, never what was requested.
+ *
+ *   `restarted`            — a launcher WAS running, was confirmed stopped,
+ *                             and a fresh boot came up ready.
+ *   `started`              — nothing was running (idempotent "start"
+ *                             behavior — e.g. the desktop was never opened,
+ *                             or a previous session already tore it down),
+ *                             and a fresh boot came up ready.
+ *   `stop_timed_out`        — a launcher was running and did NOT confirm
+ *                             stopped within the grace window. The relaunch
+ *                             is DELIBERATELY SKIPPED in this case — booting
+ *                             a second stack on top of a maybe-still-alive
+ *                             one is the exact orphan/port-collision bug
+ *                             `terminate_stack` exists to prevent. Fail loud,
+ *                             never half-restart.
+ *   `boot_failed`           — the stop was confirmed (or nothing needed
+ *                             stopping) but the fresh boot did not become
+ *                             ready.
+ *   `unsupported_mode`      — the running/target mode has no teardown-trap
+ *                             discipline this route can safely drive (see
+ *                             the doc comment on the caller).
+ *   `restart_in_progress`   — a concurrent restart call is already in
+ *                             flight on this same sandbox; this call is a
+ *                             deliberate no-op rather than racing it.
+ */
+export type RestartOutcome =
+  | 'restarted'
+  | 'started'
+  | 'stop_timed_out'
+  | 'boot_failed'
+  | 'unsupported_mode'
+  | 'restart_in_progress';
+
+export interface RestartObservation {
+  mode: DesktopMode;
+  /** A desktop-launcher process was observed running/starting BEFORE any action was taken. */
+  wasRunning: boolean;
+  /**
+   * Only meaningful when `wasRunning` is true. Trivially true when
+   * `wasRunning` is false (nothing needed stopping).
+   */
+  stopConfirmed: boolean;
+  /** True iff the post-stop boot attempt resolved (the desktop came up ready). */
+  bootOk: boolean;
+  bootError?: string;
+}
+
+export interface RestartReport {
+  ok: boolean;
+  mode: DesktopMode;
+  outcome: RestartOutcome;
+  wasRunning: boolean;
+  stopConfirmed: boolean;
+  bootOk: boolean;
+  error?: string;
+}
+
+export function buildRestartReport(observation: RestartObservation): RestartReport {
+  const { mode, wasRunning, stopConfirmed, bootOk, bootError } = observation;
+
+  if (wasRunning && !stopConfirmed) {
+    return {
+      ok: false,
+      mode,
+      outcome: 'stop_timed_out',
+      wasRunning,
+      stopConfirmed: false,
+      bootOk: false,
+      error: 'desktop_stack_did_not_stop_within_grace_period',
+    };
+  }
+
+  if (!bootOk) {
+    return {
+      ok: false,
+      mode,
+      outcome: 'boot_failed',
+      wasRunning,
+      stopConfirmed,
+      bootOk: false,
+      error: bootError?.trim() || 'boot_failed',
+    };
+  }
+
+  return {
+    ok: true,
+    mode,
+    outcome: wasRunning ? 'restarted' : 'started',
+    wasRunning,
+    stopConfirmed,
+    bootOk: true,
+  };
+}
+
 /** Read the shared HMAC token from a control request. Returns `undefined` when absent everywhere. */
 export function extractSignedToken(sources: SignedTokenSources): string | undefined {
   const authorization = sources.authorization?.trim();
