@@ -52,6 +52,7 @@ import {
     probeDesktopDisplay,
     probeDesktopFrame,
     readWorkerBridgeUrl,
+    requestGuacamoleDesktopRestart,
     requestGuacamoleFocusApp,
     requestGuacamolePreview,
     requestGuacamoleSandboxTerminate,
@@ -807,6 +808,62 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 ok: result.ok,
                 app: input.app,
                 error: result.error,
+                correlationId,
+                provider: 'cloudflare-guacamole' as const,
+            };
+        }),
+
+    /**
+     * Restart the desktop stack inside the computer's LIVE container.
+     *
+     * Ownership is checked here, once, by `assertOwnedComputer` — exactly like
+     * `terminate`/`focusApp`. The sandbox id is DERIVED from
+     * `(ctx.user.id, computerId)`, never taken from the client, so a caller
+     * cannot address someone else's container even if they guess its name.
+     *
+     * Returns the Worker's outcome as a VALUE on a 200, like `terminate` and
+     * `focusApp`: a restart the container refused (`stop_timed_out`,
+     * `unsupported_mode`) is a real answer the UI must render honestly, not an
+     * exception. `errorCode` is what `shell/ezil/ui/Settings/tabs/troubleshoot.js`
+     * renders through its `reasonCopy()` switch, so it is a stable, low-cardinality
+     * string, not a raw message.
+     */
+    restartDesktop: protectedProcedure
+        .input(z.object({ computerId: z.string().uuid() }))
+        .mutation(async ({ ctx, input }) => {
+            await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+
+            const config = resolveCloudflareGuacamoleConfig();
+            if (!config.isConfigured) {
+                return {
+                    ok: false as const,
+                    errorCode: 'provider_not_configured',
+                    provider: 'cloudflare-guacamole' as const,
+                };
+            }
+
+            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+            const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
+            const correlationId = newCorrelationId();
+            const result = await requestGuacamoleDesktopRestart(config, hmacSecret, sandboxName, correlationId);
+
+            if (!result.ok) {
+                return {
+                    ok: false as const,
+                    // The Worker's own discriminator when it answered at all;
+                    // `unknown` when it did not (transport failure). 🔴 Never
+                    // `result.error` — that is a free-text message that can carry
+                    // a URL or a stack fragment, and this value is rendered.
+                    errorCode: result.outcome ?? 'unknown',
+                    correlationId,
+                    provider: 'cloudflare-guacamole' as const,
+                };
+            }
+
+            return {
+                ok: true as const,
+                outcome: result.outcome,
+                wasRunning: result.wasRunning,
                 correlationId,
                 provider: 'cloudflare-guacamole' as const,
             };

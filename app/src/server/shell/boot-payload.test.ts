@@ -240,6 +240,7 @@ describe('toShellDesktopState — never implies an observation it does not have'
             codePreviewUrl: '/api/shell/code-preview-url',
             focus: '/api/shell/focus',
             telemetry: '/api/shell/telemetry',
+            restart: '/api/shell/restart',
         });
     });
 
@@ -270,6 +271,22 @@ describe('toShellDesktopState — never implies an observation it does not have'
     it('carries `telemetry`, the key shell/ezil/telemetry.js feature-detects on', () => {
         expect(toShellDesktopState({ isConfigured: true, hasHmacSecret: true }).endpoints.telemetry).toBe(
             '/api/shell/telemetry',
+        );
+    });
+
+    /**
+     * 🔴 Third instance of the same feature flag, and the one that has already
+     * failed once. The Worker built `POST /sandbox/:name/restart` and the shell
+     * built the Settings Troubleshoot tab in the same round, but nobody
+     * published this key or the Route Handler behind it — so
+     * `shell/ezil/session.js`'s `restartEndpoint()` returned `null`, the button
+     * rendered permanently disabled saying "Not available in this deployment
+     * yet", and every test on both sides stayed green. Deleting this key puts
+     * the product straight back into that exact silence.
+     */
+    it('carries `restart`, the key the Settings Troubleshoot button feature-detects on', () => {
+        expect(toShellDesktopState({ isConfigured: true, hasHmacSecret: true }).endpoints.restart).toBe(
+            '/api/shell/restart',
         );
     });
 });

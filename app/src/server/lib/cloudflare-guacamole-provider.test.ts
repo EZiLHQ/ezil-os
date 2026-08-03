@@ -18,6 +18,7 @@ import {
     enableImplicitHosting,
     isRetryablePreviewErrorCode,
     mintAppPreviewBootstrapToken,
+    requestGuacamoleDesktopRestart,
     requestGuacamolePreview,
     requestGuacamoleSandboxTerminate,
     resetNekoAdminTokenCacheForTests,
@@ -335,6 +336,133 @@ describe('requestGuacamoleSandboxTerminate — the regression: an unsigned, unch
         );
         expect(result).toEqual({ ok: true, terminated: false });
         expect(fetchSpy).not.toHaveBeenCalled();
+    });
+});
+
+/**
+ * 🔴 THE SEAM. The Worker route (`POST /sandbox/:name/restart`) and the shell
+ * control (Settings -> Troubleshoot) were built in the same round by two agents
+ * who never spoke, and NOTHING joined them: no provider call, no tRPC
+ * procedure, no Route Handler, no `restart` key in `SHELL_API_ROUTES`. Every
+ * test on both sides passed. The button simply rendered disabled forever.
+ *
+ * These tests pin the join at the only place it can drift silently — the URL
+ * and method this function sends — plus the honesty rule that governs every
+ * other Worker call in this file: `ok` is what the Worker CONFIRMED, never
+ * "the promise resolved".
+ */
+describe('requestGuacamoleDesktopRestart — the seam between the Worker route and the Settings button', () => {
+    it('POSTs to the exact path the Worker serves, signed as Authorization: Bearer', async () => {
+        const fetchSpy = stubWorkerResponse(
+            200,
+            JSON.stringify({ ok: true, outcome: 'restarted', wasRunning: true }),
+        );
+
+        await requestGuacamoleDesktopRestart(CONFIG, 'secret', 'guac-u-c', 'cid-r');
+
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+        const [url, init] = fetchSpy.mock.calls[0] as unknown as [RequestInfo, RequestInit];
+        // `handleRestart` is mounted at `/sandbox/:name/restart` in
+        // worker/src/index.ts. A typo here is invisible to every other test.
+        expect(String(url)).toBe('https://ezil-os-worker.example.workers.dev/sandbox/guac-u-c/restart');
+        expect(init.method).toBe('POST');
+        const headers = init.headers as Record<string, string>;
+        expect(headers.Authorization).toMatch(/^Bearer t=\d+,v1=[0-9a-f]+$/);
+    });
+
+    it('sends NO desktopMode, so the Worker auto-detects what is actually running', async () => {
+        const fetchSpy = stubWorkerResponse(200, JSON.stringify({ ok: true, outcome: 'restarted' }));
+        await requestGuacamoleDesktopRestart(CONFIG, 'secret', 'guac-u-c');
+        const [url, init] = fetchSpy.mock.calls[0] as unknown as [RequestInfo, RequestInit];
+        expect(String(url)).not.toContain('desktopMode');
+        expect(JSON.parse(String(init.body))).toEqual({});
+    });
+
+    it('reports ok:true with the outcome for a confirmed restart', async () => {
+        stubWorkerResponse(200, JSON.stringify({ ok: true, outcome: 'restarted', wasRunning: true }));
+        const result = await requestGuacamoleDesktopRestart(CONFIG, 'secret', 'guac-u-c');
+        expect(result).toEqual({ ok: true, outcome: 'restarted', wasRunning: true });
+    });
+
+    it('🔴 reports ok:false for stop_timed_out — the Worker REFUSED to boot a second stack', async () => {
+        // The most important failure to surface honestly: the old desktop
+        // would not die, so nothing was relaunched. Telling the user "restarted"
+        // here would send them back to the same frozen screen.
+        stubWorkerResponse(
+            500,
+            JSON.stringify({
+                ok: false,
+                outcome: 'stop_timed_out',
+                wasRunning: true,
+                error: 'desktop_stack_did_not_stop_within_grace_period',
+            }),
+        );
+        const result = await requestGuacamoleDesktopRestart(CONFIG, 'secret', 'guac-u-c');
+        expect(result.ok).toBe(false);
+        expect(result.outcome).toBe('stop_timed_out');
+    });
+
+    it('reports ok:false for the 400 unsupported_mode answer', async () => {
+        stubWorkerResponse(
+            400,
+            JSON.stringify({ ok: false, outcome: 'unsupported_mode', error: 'restart_not_supported_for_mode:guacamole' }),
+        );
+        const result = await requestGuacamoleDesktopRestart(CONFIG, 'secret', 'guac-u-c');
+        expect(result.ok).toBe(false);
+        expect(result.outcome).toBe('unsupported_mode');
+    });
+
+    it('reports ok:false for a 401 — a rejected signature is never a restart', async () => {
+        stubWorkerResponse(401, JSON.stringify({ ok: false, error: 'hmac_signature_mismatch' }));
+        const result = await requestGuacamoleDesktopRestart(CONFIG, 'wrong-secret', 'guac-u-c');
+        expect(result.ok).toBe(false);
+        expect(result.error).toBe('hmac_signature_mismatch');
+    });
+
+    it('reports ok:false for a 200 whose body does not confirm — status is not the contract', async () => {
+        stubWorkerResponse(200, JSON.stringify({ ok: false, outcome: 'restart_in_progress' }));
+        const result = await requestGuacamoleDesktopRestart(CONFIG, 'secret', 'guac-u-c');
+        expect(result.ok).toBe(false);
+        expect(result.outcome).toBe('restart_in_progress');
+    });
+
+    it('reports ok:false, never throws, on a transport failure', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () => {
+                throw new TypeError('fetch failed');
+            }),
+        );
+        const result = await requestGuacamoleDesktopRestart(CONFIG, 'secret', 'guac-u-c');
+        expect(result.ok).toBe(false);
+        expect(result.error).toContain('fetch failed');
+        expect(result.outcome).toBeUndefined();
+    });
+
+    it('does not call the Worker at all when the provider is not configured', async () => {
+        const fetchSpy = vi.fn();
+        vi.stubGlobal('fetch', fetchSpy);
+        const result = await requestGuacamoleDesktopRestart(
+            { workerUrl: '', hasHmacSecret: false, isConfigured: false },
+            '',
+            'guac-u-c',
+        );
+        // Unlike `terminate`, an unconfigured provider is NOT a no-op success
+        // here: the user pressed a button and nothing happened, and the UI has
+        // to say so.
+        expect(result).toEqual({ ok: false, error: 'provider_not_configured' });
+        expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('allows more than a cold boot of time — a 15s budget would abort a working restart', async () => {
+        // 20s stop deadline (`RESTART_STOP_DEADLINE_MS`) + ~22s boot is the
+        // FLOOR of a successful restart. Pinning the order of magnitude here
+        // keeps someone from copying `focus`'s 15s onto this call.
+        const fetchSpy = stubWorkerResponse(200, JSON.stringify({ ok: true, outcome: 'restarted' }));
+        await requestGuacamoleDesktopRestart(CONFIG, 'secret', 'guac-u-c');
+        const [, init] = fetchSpy.mock.calls[0] as unknown as [RequestInfo, RequestInit];
+        expect(init.signal).toBeInstanceOf(AbortSignal);
+        expect(init.signal?.aborted).toBe(false);
     });
 });
 
