@@ -61,7 +61,6 @@ describe('toTelemetryEventInput', () => {
     expect(out.outcome).toBe('ok');
     expect(out.code).toBe('ok');
     expect(out.site).toBe('sandbox.preview.desktop_ready');
-    expect(out.computerId).toBe('guac-abc');
     expect(out.schemaVersion).toBe(TELEMETRY_SCHEMA_VERSION);
   });
 
@@ -106,6 +105,27 @@ describe('toTelemetryEventInput', () => {
     const out = toTelemetryEventInput(logEvent());
     expect(out.computerId).toBeUndefined();
   });
+
+  /**
+   * 🔴 NEVER emits a computerId when a sandboxId IS present either — the case
+   * that actually shipped. `sandboxId` is
+   * `guac-<16 alnum of userId>-<16 alnum of computerId>`, which is (a) not a
+   * UUID, so `app/src/server/telemetry/schema.ts`'s `.strict()` parse drops
+   * the WHOLE event (measured: `{ events: [], droppedInvalid: 1 }` with the
+   * field, clean without it), and (b) 64 bits of the raw Supabase user id,
+   * which is a re-identifiable identity, not an opaque token.
+   *
+   * Both halves are asserted: nothing named computerId, and no substring of
+   * the sandboxId anywhere in the serialised event.
+   */
+  it('🔴 never puts the sandboxId in computerId — it is not a UUID and not anonymous', () => {
+    const out = toTelemetryEventInput(
+      logEvent({ event: 'sandbox.preview.desktop_ready', outcome: 'ok', sandboxId: 'guac-abcdef0123456789-fedcba9876543210' }),
+    );
+    expect(out.computerId).toBeUndefined();
+    expect(JSON.stringify(out)).not.toContain('abcdef0123456789');
+    expect(JSON.stringify(out)).not.toContain('guac-');
+  });
 });
 
 describe('parseContainerTelemetryLines (emit_telemetry() NDJSON drain)', () => {
@@ -123,7 +143,6 @@ describe('parseContainerTelemetryLines (emit_telemetry() NDJSON drain)', () => {
       outcome: 'error',
       durationMs: 420,
       correlationId: 'cid-boot',
-      computerId: 'guac-boot-1',
       schemaVersion: TELEMETRY_SCHEMA_VERSION,
     });
     expect(typeof events[0].occurredAt).toBe('string');
@@ -194,6 +213,14 @@ describe('parseContainerTelemetryLines (emit_telemetry() NDJSON drain)', () => {
     const [event] = parseContainerTelemetryLines(raw, { correlationId: 'cid-only' });
     expect(event.computerId).toBeUndefined();
     expect(event.correlationId).toBe('cid-only');
+  });
+
+  /** Same rule as the worker path — see that test's header. */
+  it('🔴 omits computerId even when the context DOES carry a sandboxId', () => {
+    const raw = '{"eventClass":"boot_phase","site":"x","code":"y","outcome":"ok"}';
+    const [event] = parseContainerTelemetryLines(raw, ctx);
+    expect(event.computerId).toBeUndefined();
+    expect(JSON.stringify(event)).not.toContain('guac-');
   });
 
   it('uses the injectable `now` for a deterministic occurredAt', () => {

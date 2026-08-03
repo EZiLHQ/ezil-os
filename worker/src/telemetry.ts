@@ -27,6 +27,21 @@
  * because `emit_telemetry()` only ever writes a closed-set phase name, a
  * closed-set status token, and an integer — never a message, a path, or a
  * secret. See the design doc §8 for the full field-by-field justification.
+ *
+ * The one field that got this wrong is `computerId` — it used to carry
+ * `sandboxId`, which is a truncated RAW USER ID and not a UUID. It is now
+ * never set; the reasoning is written out in full on the field itself, and
+ * `telemetry.test.ts` pins the absence in both directions.
+ *
+ * ── KNOWN GAP, stated so nobody "fixes" it by putting the leak back ─────────
+ * 🔴 Nothing drains `ezil-telemetry-spool` yet. These objects are written and
+ * never read. Whoever writes the drainer must run each line through the app's
+ * `parseTelemetryBatch` (which is `.strict()` and drops an event whole on any
+ * failure) rather than inserting it directly, and must NOT reintroduce a
+ * per-computer field until a real `ezil_computers.id` UUID is plumbed down to
+ * the Worker — the only value that satisfies both the `uuid` column and the
+ * no-raw-identity rule. Until then, worker/container events join on
+ * `correlationId` and the R2 key's `dt=/hh=` layout only.
  */
 
 import type { LogEvent } from './observability';
@@ -69,7 +84,35 @@ export interface TelemetryEventInput {
   durationMs?: number;
   /** Groups every event of one page-load / one Worker request. */
   correlationId?: string;
-  /** Opaque, safe: a random id that joins to nothing outside our own DB. */
+  /**
+   * The app's `ezil_computers.id` — a real UUID, stored in a `uuid` column
+   * with a foreign key.
+   *
+   * 🔴 THE WORKER CANNOT FILL THIS IN, and must not try. All it has is
+   * `sandboxId`, which is `guac-<first 16 alnum of the user's id>-<first 16
+   * alnum of the computer's id>` (`deriveGuacamoleSandboxId` in
+   * `app/src/server/lib/cloudflare-guacamole-provider.ts`). That string is
+   * two things this field must never be:
+   *
+   *   1. NOT A UUID. The app's zod schema is `computerId: z.string().uuid()`
+   *      and its `.strict()` parse drops the WHOLE event on a failure —
+   *      measured: a spooled worker event with `computerId` set to a
+   *      sandboxId parses to `{ events: [], droppedInvalid: 1 }`, and the
+   *      same event with the field removed parses clean. Filling it in did
+   *      not attach a computer to worker telemetry; it silently discarded
+   *      100% of worker telemetry at the first validator downstream.
+   *   2. NOT ANONYMOUS. 16 alphanumeric characters of a Supabase user UUID is
+   *      64 bits of the raw user id — enough to re-identify a user against
+   *      `auth.users`. It is a truncated raw user id, not an opaque token,
+   *      whatever the field it sits in is called. The Worker's own precedent
+   *      for identity in structured output is a HASH (`userHash`, `u_xxxxxxxx`).
+   *
+   * Left unset, deliberately. Worker and container events join by
+   * `correlationId` and by the R2 key's own `dt=/hh=` layout; per-computer
+   * attribution from the worker side needs a real computer UUID to be handed
+   * down from the app, which no route does today. See this module's
+   * `KNOWN GAP` note.
+   */
   computerId?: string;
 }
 
@@ -122,10 +165,9 @@ export function toTelemetryEventInput(logEvent: LogEvent): TelemetryEventInput {
   if (logEvent.correlationId) out.correlationId = logEvent.correlationId;
   if (typeof logEvent.durationMs === 'number') out.durationMs = Math.round(logEvent.durationMs);
   if (logEvent.detail) out.detail = logEvent.detail;
-  // `sandboxId` is an opaque, per-computer random id — safe as `computerId`
-  // (design §8.1: "joins to nothing outside our own DB; the row is already
-  // scoped to its owner").
-  if (logEvent.sandboxId) out.computerId = logEvent.sandboxId;
+  // 🔴 `logEvent.sandboxId` is deliberately NOT copied to `computerId`. It is
+  // not a UUID (the app drops the whole event) and it carries 64 bits of the
+  // raw user id (it is not anonymous). See `computerId`'s own doc comment.
   return out;
 }
 
@@ -202,7 +244,7 @@ export function parseContainerTelemetryLines(
       correlationId: ctx.correlationId,
     };
     if (durationMs !== undefined) event.durationMs = durationMs;
-    if (ctx.sandboxId) event.computerId = ctx.sandboxId;
+    // Same rule as the worker path above — see `computerId`'s doc comment.
     out.push(event);
   }
   return out;
