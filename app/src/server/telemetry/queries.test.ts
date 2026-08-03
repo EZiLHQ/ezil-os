@@ -80,10 +80,30 @@ describe('Q2 — errorRateOverTime: the LEFT JOIN class filter bug the design ca
 
         const generated = statements[0]!.sql;
         expect(generated).toMatch(/left\s+join\s+ezil_error_events/i);
-        // The class filter must appear before the closing of the JOIN ON
-        // clause (i.e. as part of the ON condition), not as a bare WHERE.
-        expect(generated).not.toMatch(/where\s+e\.event_class/i);
         expect(generated).toMatch(/event_class\s*=/i);
+        // The load-bearing assertion: this whole query has NO WHERE clause
+        // at all in the correct implementation — the class filter folds
+        // entirely into the JOIN's ON condition. A regression that instead
+        // hoists it into a `WHERE ... e.event_class = ...` (even a `WHERE
+        // 1=1 AND e.event_class = ...`, which a narrower "not immediately
+        // after WHERE" check would miss) silently turns the LEFT JOIN back
+        // into an INNER JOIN, dropping every zero-error hour — exactly the
+        // ones that prove a fix worked. Asserting "no WHERE clause exists
+        // outside a FILTER (WHERE ...) aggregate" is what actually catches
+        // that, not just a check on adjacency to `event_class`. (`FILTER
+        // (WHERE ...)` is a legitimate, unrelated use of the word "where"
+        // elsewhere in this same query, for the per-row `outcome = 'error'`
+        // aggregate filter — stripped out first so it can't false-positive.)
+        const withoutFilterWhere = generated.replace(/filter\s*\(\s*where\b[^)]*\)/gi, '');
+        expect(withoutFilterWhere).not.toMatch(/\bwhere\b/i);
+        // And the filter must be textually INSIDE the ON-clause span (after
+        // the JOIN's own `ON`, before `GROUP BY`).
+        const onIndex = generated.search(/\bon\s+e\.received_at/i);
+        const groupByIndex = generated.search(/\bgroup\s+by\b/i);
+        const classFilterIndex = generated.search(/event_class\s*=/i);
+        expect(onIndex).toBeGreaterThan(-1);
+        expect(classFilterIndex).toBeGreaterThan(onIndex);
+        expect(classFilterIndex).toBeLessThan(groupByIndex);
     });
 
     it('omits the class filter entirely with no eventClass given', async () => {
