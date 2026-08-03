@@ -85,6 +85,7 @@
 // the exact commands run.
 
 import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
+import telemetry from '../telemetry.js';
 import { computeBootUiState } from '../boot-phases.js';
 import BootProgress from '../ui/boot-progress.js';
 import UIWindow from '../../src/UI/UIWindow.js';
@@ -162,6 +163,9 @@ async function mintCodePreviewUrl (computerId) {
         // Reported success with nothing to show. Loud, not silent — same rule
         // `session.js`'s `previewUrl()` follows for `appPreviewUrl`.
         console.error(`[${PHASE}] codePreviewUrl returned ok with no URL`);
+        telemetry.capture({
+            eventClass: 'contract_violation', site: 'ezil-os:apps/code#mint', code: 'code_preview_url_missing',
+        });
         return { ok: false, errorCode: 'unknown' };
     }
     return { ok: true, url: data.codePreviewUrl, expiresAt: data.expiresAt };
@@ -184,6 +188,9 @@ export async function openCodeWindow (ctx = {}) {
 
     if ( ! computer?.id ) {
         console.error(`[${PHASE}] refusing to open: the boot payload carries no computer`);
+        telemetry.capture({
+            eventClass: 'contract_violation', site: 'ezil-os:apps/code#open', code: 'no_computer_in_payload',
+        });
         return null;
     }
 
@@ -212,6 +219,9 @@ export async function openCodeWindow (ctx = {}) {
 
     if ( ! el_window ) {
         console.error(`[${PHASE}] UIWindow returned nothing`);
+        telemetry.capture({
+            eventClass: 'window_error', site: 'ezil-os:apps/code#open', code: 'uiwindow_returned_nothing',
+        });
         return null;
     }
 
@@ -309,6 +319,10 @@ export async function openCodeWindow (ctx = {}) {
                 return;
             }
             console.error(`[${PHASE}] code-preview mint failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`);
+            telemetry.capture({
+                eventClass: 'api_failure', site: 'ezil-os:apps/code#mint', code: res.errorCode,
+                durationMs: performance.now() - t0,
+            });
             progress.render(computeBootUiState({
                 requestStatus: 'error',
                 elapsedMs: performance.now() - t0,
@@ -372,6 +386,10 @@ export async function openCodeWindow (ctx = {}) {
             }
 
             console.error(`[${PHASE}] the code frame is not answering (confirmFrame -> ${String(seen)})`);
+            telemetry.capture({
+                eventClass: 'display_failure', site: 'ezil-os:apps/code#confirmFrame', code: 'frame_not_answering',
+                attrs: { seen: String(seen) },
+            });
             show_panel();
             progress.render(computeBootUiState({
                 requestStatus: 'success',

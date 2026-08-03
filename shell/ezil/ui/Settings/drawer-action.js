@@ -51,6 +51,7 @@
 // both read it); it no longer carries any geometry.
 
 import { sync_drawer_width } from '../app-drawer.js';
+import telemetry from '../../telemetry.js';
 
 const PHASE = 'ezil-os:settings/drawer';
 
@@ -113,11 +114,19 @@ function inject (drawer, el_window, onOpen) {
             el_window._dashboard_drawer_collapse?.();
         } catch ( err ) {
             console.error(`[${PHASE}] collapse threw`, err);
+            telemetry.capture({
+                eventClass: 'window_error', site: 'ezil-os:settings/drawer-action#collapse', code: 'collapse_threw',
+                detail: err,
+            });
         }
         try {
             onOpen();
         } catch ( err ) {
             console.error(`[${PHASE}] "Settings" handler threw`, err);
+            telemetry.capture({
+                eventClass: 'window_error', site: 'ezil-os:settings/drawer-action#open', code: 'settings_handler_threw',
+                detail: err,
+            });
         }
     });
 

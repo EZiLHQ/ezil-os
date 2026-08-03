@@ -86,6 +86,7 @@
 // window just asks.
 
 import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
+import telemetry from '../telemetry.js';
 import { computeBootUiState } from '../boot-phases.js';
 import BootProgress from '../ui/boot-progress.js';
 import UIWindow from '../../src/UI/UIWindow.js';
@@ -124,6 +125,9 @@ export async function openPreviewWindow (ctx = {}) {
 
     if ( ! computer?.id ) {
         console.error(`[${PHASE}] refusing to open: the boot payload carries no computer`);
+        telemetry.capture({
+            eventClass: 'contract_violation', site: 'ezil-os:apps/preview#open', code: 'no_computer_in_payload',
+        });
         return null;
     }
 
@@ -151,6 +155,9 @@ export async function openPreviewWindow (ctx = {}) {
 
     if ( ! el_window ) {
         console.error(`[${PHASE}] UIWindow returned nothing`);
+        telemetry.capture({
+            eventClass: 'window_error', site: 'ezil-os:apps/preview#open', code: 'uiwindow_returned_nothing',
+        });
         return null;
     }
 
@@ -263,6 +270,10 @@ export async function openPreviewWindow (ctx = {}) {
                 return;
             }
             console.error(`[${PHASE}] preview mint failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`);
+            telemetry.capture({
+                eventClass: 'api_failure', site: 'ezil-os:apps/preview#mint', code: res.errorCode,
+                durationMs: performance.now() - t0,
+            });
             progress.render(computeBootUiState({
                 requestStatus: 'error',
                 elapsedMs: performance.now() - t0,
@@ -331,6 +342,10 @@ export async function openPreviewWindow (ctx = {}) {
             }
 
             console.error(`[${PHASE}] the preview frame is not answering (confirmFrame -> ${String(seen)})`);
+            telemetry.capture({
+                eventClass: 'display_failure', site: 'ezil-os:apps/preview#confirmFrame', code: 'frame_not_answering',
+                attrs: { seen: String(seen) },
+            });
             show_panel();
             progress.render(computeBootUiState({
                 requestStatus: 'success',

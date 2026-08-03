@@ -127,7 +127,7 @@ AGPL §5(a) record.
 
 | EZiL path | LOC | Upstream path | Upstream commit | Date | What changed |
 |---|---|---|---|---|---|
-| `src/UI/UIWindow.js` | 5281 | `src/gui/src/UI/UIWindow.js` (5265) | `5a15719` | 2026-07-31 | **Import block only.** Taken WHOLE — see the note below. Nine imports (login/save-account/email-confirmation dialogs, publish-website, item-properties, `new_context_menu_item`, `refresh_item_container`, `launch_app`, `item_icon`) plus the `puter` SDK now resolve to `src/ezil-stubs.js`. Nothing else touched. |
+| `src/UI/UIWindow.js` | 5281 | `src/gui/src/UI/UIWindow.js` (5265) | `5a15719` | 2026-07-31 (import block); 2026-08-02, 2026-08-03 (see below) | **Import block, plus three small, individually tagged body edits — no longer "nothing else touched", see the note below for why.** Nine imports (login/save-account/email-confirmation dialogs, publish-website, item-properties, `new_context_menu_item`, `refresh_item_container`, `launch_app`, `item_icon`) plus the `puter` SDK resolve to `src/ezil-stubs.js`. 2026-08-02: removed one `window.hide_toolbar()` call (see the `MODIFIED BY EZIL` comment in-file; not previously recorded here). 2026-08-03: added one import (`telemetry.js`) and two `telemetry.capture()` calls, each one line beside a pre-existing `console.error` it does not replace — see `ezil/telemetry.js`'s header and this file's own `MODIFIED BY EZIL` comments at each site. |
 | `src/UI/UITaskbar.js` | 469 | `src/gui/src/UI/UITaskbar.js` (763) | `5a15719` | 2026-07-31 | Removed the `GET /get-launch-apps` XHR and the entire Start-button launcher popover it fed (~180 lines, backed by `puter.apps`, including an "Add to Desktop" that wrote through `puter.fs.upload`); removed the Explorer item, the `window.user.taskbar_items` loop, the Trash item, its `puter.fs.stat` probe and the socket.io `trash.is_empty` emit, and the two separators that bracketed Trash. `puter.kv` → `ezil/session.js`. `window.update_taskbar` reimplemented locally. Start now dispatches an `ezil:start-click` event. Geometry, sorting and resize logic are upstream's, unchanged. |
 | `src/UI/UITaskbarItem.js` | 536 | `src/gui/src/UI/UITaskbarItem.js` (527) | `5a15719` | 2026-07-31 | **Import block only** — verified identical from `let tray_item_id` to EOF (504 lines). `launch_app` → stub. |
 | `src/UI/UIAlert.js` | 179 | `src/gui/src/UI/UIAlert.js` (172) | `5a15719` | 2026-07-31 | **One added import** — verified identical from `function UIAlert` to EOF. It was expected to be verbatim but has a single `puter.ui.closeDialog()` call, which now resolves to the stub. |
@@ -147,7 +147,8 @@ cut lines are **not contiguous**. A too-aggressive cut yields windows that drag
 but do not snap, or minimise but never restore, and nothing upstream would
 catch it.
 
-So it was not pruned. The verification is mechanical and repeatable:
+So it was not pruned. The verification was mechanical and repeatable at the
+2026-07-31 import-block-only snapshot:
 
 ```
 a=$(grep -n '^const el_body' <upstream>/UI/UIWindow.js | cut -d: -f1)   # 35
@@ -155,12 +156,22 @@ b=$(grep -n '^const el_body' shell/src/UI/UIWindow.js  | cut -d: -f1)   # 51
 diff <(tail -n +$a <upstream>/UI/UIWindow.js) <(tail -n +$b shell/src/UI/UIWindow.js)
 ```
 
-That diff is **empty**: 5,231 lines byte-identical. The only difference between
-the two files is the header comment and the import block above `const el_body`.
+That diff was empty at that snapshot: 5,231 lines byte-identical, the only
+difference being the header comment and the import block above `const el_body`.
 
-Pruning happens later, in an isolated commit, once the shell demonstrably
-works. Bundle size is not the constraint today; a subtly broken window manager
-is.
+🔴 It is **no longer** empty, and that is expected, not a regression to chase:
+two small body edits landed after 2026-07-31 (see the table row above), each
+one individually tagged `MODIFIED BY EZIL` in-file and each one line — a
+removed `hide_toolbar()` call, and two one-line `telemetry.capture()` additions
+beside pre-existing `console.error` calls they do not replace. None of the
+25 `is_dir` branches or 73 `i18n()` calls this section exists to protect were
+touched. Re-running the diff above today will show exactly those three hunks
+and nothing else — that is the bar this note now holds itself to, not a
+byte-for-byte match.
+
+Pruning the unreachable branches happens later, in an isolated commit, once
+the shell demonstrably works. Bundle size is not the constraint today; a
+subtly broken window manager is.
 
 ### Structurally adapted (no upstream bytes copied)
 

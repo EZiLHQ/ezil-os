@@ -35,6 +35,10 @@ import UIAlert from './UIAlert.js';
 import UIContextMenu from './UIContextMenu.js';
 import path from '../lib/path.js';
 import UITaskbarItem from './UITaskbarItem.js';
+// MODIFIED BY EZIL 2026-08-03: added, for the two `console.error` capture()
+// sites below — see each site's own comment. Not part of the original
+// import-block swap; see PUTER-PROVENANCE.md's updated row for this file.
+import telemetry from '../../ezil/telemetry.js';
 import {
     puter,
     UIWindowLogin,
@@ -4655,6 +4659,16 @@ window.addEventListener('popstate', () => {
                 window_options: { morph_from_dashboard_tile: true },
             }).catch((err) => {
                 console.error(`Failed to launch ${new_app}:`, err);
+                // MODIFIED BY EZIL 2026-08-03: telemetry capture only, added
+                // beside the pre-existing `console.error` — see
+                // `telemetry.js`'s header. `new_app` is not this repo's own
+                // data (a Dashboard-mode tile id, and `is_dashboard_mode` is
+                // never set anywhere in this fork — see `app-drawer.js`'s
+                // header), so it goes in `detail`, capped/redacted, not `code`.
+                telemetry.capture({
+                    eventClass: 'window_error', site: 'ezil-os:UIWindow#launch_app', code: 'app_launch_failed',
+                    detail: err,
+                });
             });
         }
     } else if ( window.dashboard_base_title !== undefined ) {
@@ -5424,6 +5438,12 @@ async function saveSidebarOrder (order) {
         window.sidebar_items = JSON.stringify(order);
     } catch ( err ) {
         console.error('Error saving sidebar order:', err);
+        // MODIFIED BY EZIL 2026-08-03: telemetry capture only, added beside
+        // the pre-existing `console.error` — see `telemetry.js`'s header.
+        telemetry.capture({
+            eventClass: 'window_error', site: 'ezil-os:UIWindow#saveSidebarOrder', code: 'sidebar_order_save_failed',
+            detail: err,
+        });
     }
 }
 
