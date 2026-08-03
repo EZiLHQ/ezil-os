@@ -110,6 +110,19 @@ interface Env extends SandboxEnv {
   /** R2 bucket binding backing the persistent sandbox workspace (`ezil-sandbox-workspaces`). */
   SANDBOX_WORKSPACE_R2_BUCKET?: R2Bucket;
 
+  /**
+   * OPTIONAL R2 bucket binding backing the fleet crash-telemetry spool
+   * (`ezil-telemetry-spool`) — see `scratchpad/telemetry-design.md` §4.1 and
+   * `./telemetry.ts`. Deliberately a SEPARATE bucket from
+   * `SANDBOX_WORKSPACE_R2_BUCKET`: that one is FUSE-mounted into user
+   * containers, and a mount that ever resolved without a per-computer prefix
+   * would put the whole fleet's error log inside a user's file manager.
+   * Absent binding (e.g. local dev, or before the bucket is provisioned) is
+   * a silent no-op in `spoolTelemetry()` — telemetry must never become a
+   * hard dependency of the preview path.
+   */
+  TELEMETRY_R2_BUCKET?: R2Bucket;
+
   // ── S3-compatible workspace bucket (mounted into the sandbox container) ────
   // Names are deliberately prefixed `SANDBOX_WORKSPACE_S3_*` so they never
   // collide with unrelated AWS/Bedrock credential env vars used elsewhere in
@@ -164,6 +177,16 @@ interface Env extends SandboxEnv {
    * surface (returns 404) without a code change.
    */
   SANDBOX_FOCUS?: string;
+
+  /**
+   * Non-secret kill-switch for the desktop-restart control route
+   * (`POST /sandbox/:name/restart`, see `handleRestart` /
+   * `EzilSandboxDO.restartDesktopStack`). Enabled by default (HMAC-gated,
+   * neko-mode-only, reuses `terminate_stack`'s own SIGTERM teardown rather
+   * than a second one); set to `off`/`false`/`0`/`disabled`/`no` to
+   * hard-disable the surface (returns 404) without a code change.
+   */
+  SANDBOX_RESTART?: string;
 
   /**
    * Non-secret opt-in flag forwarded verbatim into the container process env
@@ -321,10 +344,16 @@ export {
   validateFocusApp,
   buildFocusAppCommand,
   focusDisabled,
+  restartDisabled,
+  findDesktopLauncherProcess,
+  buildRestartReport,
   type TerminateOutcome,
   type TerminateReport,
   type DesktopStatus,
   type FocusApp,
+  type ProcessLike,
+  type RestartOutcome,
+  type RestartReport,
 } from './sandbox-control';
 import {
   extractSignedToken,
@@ -333,7 +362,12 @@ import {
   validateFocusApp,
   buildFocusAppCommand,
   focusDisabled,
+  restartDisabled,
+  findDesktopLauncherProcess,
+  buildRestartReport,
   type TerminateReport,
+  type ProcessLike,
+  type RestartReport,
 } from './sandbox-control';
 import {
   seedWorkspaceIfAbsent,
@@ -426,7 +460,14 @@ import {
   mintPreviewBootstrapToken,
   PREVIEW_COOKIE_NAME,
 } from './hmac';
-import { LifecycleTimeline, newCorrelationId } from './observability';
+import { LifecycleTimeline, newCorrelationId, createCollectingSink, type LogEvent } from './observability';
+import {
+  selectTelemetryWorthy,
+  toTelemetryEventInput,
+  parseContainerTelemetryLines,
+  serializeTelemetryBatch,
+  buildTelemetryR2Key,
+} from './telemetry';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -561,6 +602,19 @@ interface EzilWorkspacePersistRpc {
    * this name") readable. See `EzilSandboxDO.terminateSandbox`.
    */
   terminateSandbox(): Promise<TerminateReport>;
+  /**
+   * The `POST /sandbox/:name/restart` implementation. See
+   * `EzilSandboxDO.restartDesktopStack`'s doc comment for the full contract —
+   * runs entirely inside the DO because that is where the SDK's own
+   * `listProcesses`/`killProcess`/`getProcess` process registry and
+   * `getExposedPorts`/`unexposePort` port bookkeeping live.
+   */
+  restartDesktopStack(
+    hostname: string,
+    sandboxId: string,
+    explicitMode: DesktopMode | undefined,
+    fallbackMode: DesktopMode,
+  ): Promise<RestartReport & { url?: string; appPreviewUrl?: string | null; codePreviewUrl?: string | null }>;
 }
 
 /** Open (or create) the Sandbox DO for an id with consistent options. */
@@ -728,6 +782,32 @@ function bootLog(
  * Readiness is verified against the real port state (not the launcher process's
  * lifetime) so an already-running desktop is detected instead of failing.
  */
+/**
+ * Fixed path `emit_telemetry()` (`scripts/start-neko.sh`) appends one JSON
+ * line to per boot phase. Capped at 64 KB (design doc §4.2) — this is a tail
+ * read of the MOST RECENT boot's phases, never the whole file history.
+ */
+const CONTAINER_TELEMETRY_PATH = '/var/log/ezil-telemetry.ndjson';
+const CONTAINER_TELEMETRY_MAX_BYTES = 65_536;
+
+/**
+ * Best-effort drain of the container's own structured boot-phase log. Never
+ * throws — a missing file (older image, or nothing emitted yet) or a read
+ * failure just yields `''`, exactly like every other diagnostic read in this
+ * file (`pollDesktopReady`, `handleCpuDiag`).
+ */
+async function drainContainerBootTelemetry(sandbox: Sandbox<unknown>): Promise<string> {
+  try {
+    const res = await sandbox.exec(
+      `tail -c ${CONTAINER_TELEMETRY_MAX_BYTES} ${CONTAINER_TELEMETRY_PATH} 2>/dev/null || true`,
+      { origin: 'internal' },
+    );
+    return res.exitCode === 0 ? (res.stdout ?? '') : '';
+  } catch {
+    return '';
+  }
+}
+
 async function ensureDesktop(
   sandbox: Sandbox<unknown>,
   hostname: string,
@@ -736,6 +816,17 @@ async function ensureDesktop(
   startupDelivery: string | null = null,
   workspaceRoot: string | null = null,
   cpuDiagFlag: string | undefined = undefined,
+  /**
+   * Best-effort sink for the container's own boot-phase/outcome telemetry
+   * (`scripts/start-neko.sh`'s `emit_telemetry()`), called with the raw
+   * NDJSON tail on BOTH the success path and the failure path right below —
+   * this is the fix for "boot phase/outcome data only reaches anywhere on
+   * failure": previously only `proc.getLogs()`'s stderr tail was read, and
+   * only when `!ready`. Never awaited by the caller's response path; the
+   * caller decides what to do with the raw text (parse + spool to R2, or
+   * ignore it entirely when telemetry is unconfigured).
+   */
+  onBootTelemetry?: (raw: string) => void,
 ): Promise<{ url: string; appPreviewExpose: AppPreviewExposeResult; codePreviewExpose: AppPreviewExposeResult }> {
   const bootT0 = Date.now();
   const { port, readyPath } = portFor(mode);
@@ -863,6 +954,16 @@ async function ensureDesktop(
     } catch {
       /* logs are best-effort diagnostics */
     }
+    // Boot phase/outcome data must reach the ingest path on the FAILURE path
+    // too, not just a human-readable stderr tail folded into this Error's
+    // message — see this function's `onBootTelemetry` param doc comment.
+    if (onBootTelemetry) {
+      try {
+        onBootTelemetry(await drainContainerBootTelemetry(sandbox));
+      } catch {
+        /* telemetry drain is best-effort; must never mask the real boot failure */
+      }
+    }
     bootLog('ready', 'end', { status: 'error', cumulativeMs: Date.now() - bootT0 });
     throw new Error(`desktop_failed_to_start: ${detail}`);
   }
@@ -934,6 +1035,18 @@ async function ensureDesktop(
   }
 
   bootLog('ready', 'end', { status: 'ok', phaseMs: Date.now() - bootT0, cumulativeMs: Date.now() - bootT0 });
+  // Boot phase/outcome data must reach the ingest path on the SUCCESS path
+  // too — previously nothing at all read the container's own boot-phase log
+  // when the boot went fine (`proc.getLogs()` was only ever consulted on the
+  // `!ready` branch above), so a healthy boot's own phase timings/skips were
+  // invisible everywhere except a live `wrangler tail`.
+  if (onBootTelemetry) {
+    try {
+      onBootTelemetry(await drainContainerBootTelemetry(sandbox));
+    } catch {
+      /* telemetry drain is best-effort; must never fail an otherwise-ready desktop */
+    }
+  }
   return { url: desktopUrl, appPreviewExpose, codePreviewExpose };
 }
 
@@ -1458,6 +1571,19 @@ const TERMINATE_MONITOR_BACKSTOP_MS = 10_000;
 const TERMINATE_CONFIRM_TIMEOUT_MS = 3_000;
 const TERMINATE_CONFIRM_INTERVAL_MS = 250;
 
+/**
+ * Deadline for `restartDesktopStack()`'s SIGTERM'd launcher to confirm
+ * actually stopped, polled via `getProcess()`. Generous on purpose: it must
+ * outlast `terminate_stack`'s OWN internal budget (an 8s SIGTERM grace period,
+ * `NEKO_TEARDOWN_GRACE` in `start-neko.sh`, plus the SIGKILL escalation and
+ * reap that follow it) with real margin, so a clean teardown is never
+ * mistaken for a stuck one. If the launcher is STILL running after this, the
+ * relaunch is skipped and the call fails loudly (`stop_timed_out`) rather than
+ * booting a second stack on top of a maybe-still-alive one.
+ */
+const RESTART_STOP_DEADLINE_MS = 20_000;
+const RESTART_STOP_POLL_INTERVAL_MS = 500;
+
 interface WorkspaceFlushContext {
   /** R2 key prefix, NO leading slash — e.g. `${projectId}/branches/${branch}`. */
   prefix: string;
@@ -1529,6 +1655,17 @@ const WORKSPACE_FLUSH_INTERVAL_SECONDS = 10;
  * identity is unchanged, only new methods are added on top of it.
  */
 class EzilSandboxDO extends CFSandboxClass<Env> {
+  /**
+   * Reentrancy guard for `restartDesktopStack()`. A DO instance is a single
+   * JS object handling one request at a time cooperatively, but `await`
+   * points let a SECOND concurrent restart call interleave with the first —
+   * two overlapping kill+relaunch cycles racing is exactly the orphan/
+   * port-collision failure mode `terminate_stack` was written to prevent.
+   * This makes a second call while one is in flight a fast, honest no-op
+   * (`outcome: 'restart_in_progress'`) instead of a race.
+   */
+  private restartInProgress = false;
+
   /** Read the flush-manifest cache from local disk. Missing/corrupt -> empty (safe: just re-uploads everything once). */
   private async readFlushManifest(mountPath: string): Promise<FlushManifest> {
     const manifestPath = `${mountPath}/${FLUSH_MANIFEST_FILENAME}`;
@@ -1819,6 +1956,223 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     });
     return report;
   }
+
+  /**
+   * The `POST /sandbox/:name/restart` implementation, run inside the DO.
+   *
+   * "Someone closed the browser — there is no way to restart the system from
+   * settings." This restarts the desktop stack INSIDE the already-running
+   * container: it does NOT call `destroy()`/`terminateSandbox()` (the
+   * container, and the workspace on its disk, are never touched), it does NOT
+   * re-mount or re-hydrate the workspace bucket (the files are already on the
+   * container's own filesystem from the original boot — restart only needs to
+   * tell the fresh launcher where they live), and it re-derives every other
+   * input (TURN/ICE credentials, the neko auto-connect password, the
+   * workspace root path) the SAME way a fresh `/sandbox/preview` call does,
+   * from `sandboxId` + env alone, so no caller-held secret needs to survive
+   * between the original preview call and this one.
+   *
+   * NEKO MODE ONLY. `start-neko.sh` is the ONLY launcher with a `terminate_stack`
+   * teardown trap wired to SIGTERM — Guacamole's `start-desktop.sh` has none
+   * (see that script's own doc comment: it just blocks on `wait
+   * "$TOMCAT_PID"`), so a SIGTERM there would kill the launcher shell and
+   * leave Xvfb/guacd/Tomcat/Chrome running as unreachable orphans — the exact
+   * bug `terminate_stack` exists to prevent, for the one mode that has no such
+   * trap. Rather than write a second, weaker teardown for that mode, this
+   * route refuses it outright (`unsupported_mode`, mapped to HTTP 400 by the
+   * caller) until Guacamole gets the same discipline.
+   *
+   * Sequence, each step OBSERVED rather than assumed (mirrors
+   * `terminateSandbox`'s own "describe what actually happened" discipline):
+   *   1. Detect the live launcher (`listProcesses()` + `findDesktopLauncherProcess`,
+   *      matching on the exact command `ensureDesktop` launches) and the
+   *      current/target mode (`describeDesktopStatus`, the SAME helper
+   *      `handleStatus` uses).
+   *   2. If one is running: SIGTERM it via `killProcess()` — this is the
+   *      SAME signal `terminate_stack`'s own trap (`start-neko.sh`) is wired
+   *      to, so the ENTIRE teardown (graceful stop of every app's process
+   *      group, escalation to SIGKILL, reaping) runs exactly as it does for a
+   *      container-runtime-issued SIGTERM. Nothing here reimplements any part
+   *      of that. Then poll for confirmed exit, bounded by
+   *      `RESTART_STOP_DEADLINE_MS`.
+   *   3. If it did not confirm stopped in time: FAIL LOUD (`stop_timed_out`)
+   *      and stop — never relaunch on top of a maybe-still-alive stack.
+   *   4. Unexpose whatever ports were exposed from the OLD run, so
+   *      `ensureDesktop`'s own "already exposed" fast path (which trusts the
+   *      DO's exposed-port record, not a live probe) cannot skip the relaunch.
+   *   5. Relaunch via `ensureDesktop` — the EXACT SAME boot path
+   *      `/sandbox/preview` uses. No second boot sequence.
+   *
+   * Idempotent: calling this on an already-stopped desktop just (re)starts it
+   * (`outcome: 'started'`); calling it twice in a row restarts it twice, each
+   * time through the same safe sequence. Safe to press twice AT ONCE: a
+   * concurrent call while one is in flight is a fast no-op
+   * (`restart_in_progress`), never a race (`restartInProgress` guard above).
+   */
+  async restartDesktopStack(
+    hostname: string,
+    sandboxId: string,
+    explicitMode: DesktopMode | undefined,
+    fallbackMode: DesktopMode,
+  ): Promise<RestartReport & { url?: string; appPreviewUrl?: string | null; codePreviewUrl?: string | null }> {
+    if (this.restartInProgress) {
+      return {
+        ok: false,
+        mode: explicitMode ?? fallbackMode,
+        outcome: 'restart_in_progress',
+        wasRunning: false,
+        stopConfirmed: false,
+        bootOk: false,
+        error: 'restart_already_in_progress',
+      };
+    }
+    this.restartInProgress = true;
+    try {
+      const exposedBefore = await this.getExposedPorts(hostname);
+      const status = describeDesktopStatus(exposedBefore, explicitMode, fallbackMode);
+      const mode = status.mode;
+
+      if (mode !== 'neko') {
+        bootLog('restart', 'end', { status: 'skipped', detail: `unsupported_mode=${mode}` });
+        return {
+          ok: false,
+          mode,
+          outcome: 'unsupported_mode',
+          wasRunning: status.desktopRunning,
+          stopConfirmed: false,
+          bootOk: false,
+          error: `restart_not_supported_for_mode:${mode}`,
+        };
+      }
+
+      bootLog('restart', 'start', { detail: `mode=${mode}` });
+
+      // 1) find + 2) stop the running launcher — reusing terminate_stack's
+      //    OWN SIGTERM->grace->escalate contract, never a second teardown.
+      const processesRaw = await this.listProcesses();
+      const processes: readonly ProcessLike[] = Array.isArray(processesRaw) ? (processesRaw as ProcessLike[]) : [];
+      const launcher = findDesktopLauncherProcess(processes);
+      const wasRunning = Boolean(launcher);
+      let stopConfirmed = !wasRunning;
+
+      if (launcher) {
+        try {
+          await this.killProcess(launcher.id, 'SIGTERM');
+        } catch (err) {
+          console.error(
+            `[restartDesktopStack] killProcess(${launcher.id}) failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        const deadline = Date.now() + RESTART_STOP_DEADLINE_MS;
+        while (Date.now() < deadline) {
+          let current: { status: string } | null = null;
+          try {
+            current = await this.getProcess(launcher.id);
+          } catch {
+            current = null; // treat "cannot find it anymore" as "it is gone"
+          }
+          if (!current || (current.status !== 'running' && current.status !== 'starting')) {
+            stopConfirmed = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, RESTART_STOP_POLL_INTERVAL_MS));
+        }
+      }
+
+      if (!stopConfirmed) {
+        bootLog('restart', 'end', { status: 'error', detail: 'stop_timed_out' });
+        return buildRestartReport({ mode, wasRunning, stopConfirmed: false, bootOk: false });
+      }
+
+      // 3) Unexpose every port left over from the OLD run so `ensureDesktop`'s
+      //    "already exposed" fast path cannot short-circuit the relaunch.
+      const exposedNow = await this.getExposedPorts(hostname);
+      for (const p of exposedNow) {
+        try {
+          await this.unexposePort(p.port);
+        } catch (err) {
+          console.error(
+            `[restartDesktopStack] unexposePort(${p.port}) failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      }
+
+      // 4) Relaunch via the EXACT SAME boot path `/sandbox/preview` uses.
+      // TURN/ICE + the neko auto-connect password are re-derived exactly the
+      // way `handlePreview` derives them — deterministic from `sandboxId` +
+      // env, no caller-held secret needed. The workspace root is likewise
+      // re-derived from env alone (`resolveWorkspaceMountConfig`): the files
+      // are already on the container's own disk from the original boot, so
+      // this never re-mounts or re-hydrates anything.
+      let iceEnv: Record<string, string> | null = null;
+      const ice = checkIceConfig(this.env);
+      if (!ice.ok) {
+        bootLog('restart', 'end', { status: 'error', detail: 'ice_unavailable' });
+        return buildRestartReport({ mode, wasRunning, stopConfirmed: true, bootOk: false, bootError: ice.error });
+      }
+      if (hasTurnConfigured(this.env)) {
+        try {
+          iceEnv = await resolveNekoIceEnv(this.env);
+        } catch (err) {
+          const detail = err instanceof Error ? err.message : String(err);
+          if (ice.policy === 'relay' || ice.policy === 'production') {
+            bootLog('restart', 'end', { status: 'error', detail: 'turn_unavailable' });
+            return buildRestartReport({
+              mode,
+              wasRunning,
+              stopConfirmed: true,
+              bootOk: false,
+              bootError: `turn_unavailable: ${detail}`,
+            });
+          }
+          iceEnv = null; // diagnostic policy: proceed without relay
+        }
+      }
+      const nekoCreds = await deriveNekoCredentials(this.env, sandboxId);
+      iceEnv = {
+        ...(iceEnv ?? {}),
+        NEKO_MEMBER_MULTIUSER_USER_PASSWORD: nekoCreds.user,
+        NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD: nekoCreds.admin,
+        NEKO_PASSWORD: nekoCreds.user,
+        NEKO_PASSWORD_ADMIN: nekoCreds.admin,
+      };
+      const workspaceRoot = resolveWorkspaceMountConfig(this.env)?.mountPath ?? null;
+
+      try {
+        const { url, appPreviewExpose, codePreviewExpose } = await ensureDesktop(
+          this,
+          hostname,
+          mode,
+          iceEnv,
+          // No sealed workspace-startup delivery on restart — the workspace
+          // already lives on the container's disk from the original boot, and
+          // `start-neko.sh`'s hydration phase reports `skipped` (not an
+          // error) when this is absent. See that script's own doc comment.
+          null,
+          workspaceRoot,
+          this.env.EZIL_NEKO_CPU_DIAG_ENABLED,
+        );
+        bootLog('restart', 'end', { status: 'ok' });
+        const report = buildRestartReport({ mode, wasRunning, stopConfirmed: true, bootOk: true });
+        return {
+          ...report,
+          url,
+          appPreviewUrl: appPreviewExpose.exposed ? (appPreviewExpose.url ?? null) : null,
+          codePreviewUrl: codePreviewExpose.exposed ? (codePreviewExpose.url ?? null) : null,
+        };
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        bootLog('restart', 'end', { status: 'error', detail: 'boot_failed' });
+        return buildRestartReport({ mode, wasRunning, stopConfirmed: true, bootOk: false, bootError: detail });
+      }
+    } finally {
+      this.restartInProgress = false;
+    }
+  }
 }
 
 export { EzilSandboxDO as Sandbox };
@@ -2031,7 +2385,12 @@ interface PreviewBody {
   startupDelivery?: string;
 }
 
-async function handlePreview(request: Request, env: Env, url: URL): Promise<Response> {
+async function handlePreview(
+  request: Request,
+  env: Env,
+  url: URL,
+  ctx?: ExecutionContext,
+): Promise<Response> {
   // Correlate every stage of this preview request under one id. Prefer an
   // inbound request id header so the browser/web-API and Worker timelines
   // stitch together; otherwise mint a fresh one.
@@ -2039,6 +2398,16 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
     request.headers.get('x-request-id')?.trim() ||
     request.headers.get('x-correlation-id')?.trim() ||
     newCorrelationId();
+
+  // Every `LogEvent` this request's `LifecycleTimeline` builds is ALSO
+  // accumulated here (additive — `createCollectingSink`, `./observability.ts`)
+  // so it can be spooled to the telemetry R2 bucket once the response is
+  // decided, alongside whatever the container itself emitted during THIS
+  // boot (`containerTelemetryRaw`, filled in by `ensureDesktop`'s
+  // `onBootTelemetry` callback below). See `spoolTelemetry()`.
+  const collectedLogs: LogEvent[] = [];
+  let containerTelemetryRaw = '';
+  let bootSandboxId: string | undefined;
 
   let body: PreviewBody = {};
   try {
@@ -2053,6 +2422,7 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
     correlationId,
     projectId: body.projectId,
     userId: body.userId,
+    sink: createCollectingSink(collectedLogs),
   });
   tl.event('web_api', 'sandbox.preview.received', 'ok');
 
@@ -2122,6 +2492,7 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
 
   const sandboxId = deriveSandboxId(body.userId ?? 'anon', scopeId);
   tl.setSandboxId(sandboxId);
+  bootSandboxId = sandboxId;
 
   // The R2 workspace mount prefix is keyed on the FULL scope id + branch
   // (not the truncated/sanitized `sandboxId`) so it matches the write
@@ -2189,6 +2560,9 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
       mode === 'neko' ? (body.startupDelivery ?? null) : null,
       workspace.mounted ? workspace.mountPath ?? null : null,
       env.EZIL_NEKO_CPU_DIAG_ENABLED,
+      (raw) => {
+        containerTelemetryRaw = raw;
+      },
     );
     const guacamoleUrl = mode === 'neko' ? exposedUrl : toGuacamoleUrl(exposedUrl, url.protocol);
     desktopDone('ok');
@@ -2283,7 +2657,7 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
       );
     }
 
-    return json({
+    const response = json({
       ok: true,
       guacamoleUrl,
       expiresAt: Date.now() + SESSION_TTL_MS,
@@ -2299,12 +2673,67 @@ async function handlePreview(request: Request, env: Env, url: URL): Promise<Resp
       appPreviewUrl,
       codePreviewUrl,
     });
+    // Spool AFTER the response is built, never awaited by it — see
+    // `spoolTelemetry`'s own doc comment for the "no telemetry code path is
+    // ever awaited by a code path that produces user-visible output"
+    // guarantee (design doc §4.6).
+    spoolTelemetry(env, ctx, correlationId, bootSandboxId, collectedLogs, containerTelemetryRaw);
+    return response;
   } catch (err) {
     tl.event('preview_lifecycle', 'sandbox.preview.failed', 'error', { error: err });
+    spoolTelemetry(env, ctx, correlationId, bootSandboxId, collectedLogs, containerTelemetryRaw);
     return json(
       { ok: false, error: err instanceof Error ? err.message : String(err), mode },
       500,
     );
+  }
+}
+
+/**
+ * Spool this request's telemetry-worthy events — the Worker's own
+ * `LifecycleTimeline` events (filtered by `selectTelemetryWorthy`) AND
+ * whatever the container itself emitted during this boot (parsed by
+ * `parseContainerTelemetryLines`) — to the R2 telemetry spool, as ONE NDJSON
+ * object keyed by this request's correlation id (design doc §4.1/§4.2).
+ *
+ * Absent `env.TELEMETRY_R2_BUCKET` (unconfigured deployment) or an empty
+ * batch are both silent no-ops — telemetry must never become a hard
+ * dependency, and never trip an error path of its own. The PUT is scheduled
+ * via `ctx.waitUntil()` when available (real Workers runtime), so it can
+ * keep running after the response is already on the wire; a missing `ctx`
+ * (e.g. a test harness that calls `fetch(request, env)` with only two
+ * arguments) still fires the PUT, just without that extension guarantee —
+ * consistent with every other "best-effort, never blocks the response"
+ * convention in this handler. NEVER awaited by the caller.
+ */
+function spoolTelemetry(
+  env: Env,
+  ctx: ExecutionContext | undefined,
+  correlationId: string,
+  sandboxId: string | undefined,
+  workerLogs: readonly LogEvent[],
+  containerTelemetryRaw: string,
+): void {
+  const bucket = env.TELEMETRY_R2_BUCKET;
+  if (!bucket) return;
+
+  const workerEvents = selectTelemetryWorthy(workerLogs).map((e) => toTelemetryEventInput(e));
+  const containerEvents = parseContainerTelemetryLines(containerTelemetryRaw, { correlationId, sandboxId });
+  const events = [...workerEvents, ...containerEvents];
+  if (events.length === 0) return;
+
+  const key = buildTelemetryR2Key(new Date(), correlationId);
+  const body = serializeTelemetryBatch(events);
+  const put = bucket
+    .put(key, body, { httpMetadata: { contentType: 'application/x-ndjson' } })
+    .catch((err: unknown) => {
+      // A failed telemetry PUT is a no-op, never a 500 (design §4.1/§4.6) —
+      // still logged loudly so a persistently-broken spool is observable.
+      console.error(`[spoolTelemetry] R2 put failed (key=${key}): ${err instanceof Error ? err.message : String(err)}`);
+    });
+
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(put);
   }
 }
 
@@ -2361,6 +2790,41 @@ async function handleStatus(env: Env, url: URL, sandboxName: string, requestedMo
         error: err instanceof Error ? err.message : String(err),
         mode: modeResult.mode,
       },
+      500,
+    );
+  }
+}
+
+/**
+ * `POST /sandbox/:name/restart` — restart the desktop stack inside a LIVE
+ * container, without destroying the computer or its workspace. See
+ * `EzilSandboxDO.restartDesktopStack` for the full contract (SIGTERM reusing
+ * `terminate_stack`, neko-mode-only, idempotent, fail-loud on a stuck stop).
+ *
+ * Mode resolution mirrors `handleStatus` exactly: an explicit
+ * `?desktopMode=` answers the caller's literal request; an omitted one lets
+ * the DO auto-detect whatever is actually running (or falls back to the env
+ * default when nothing is).
+ */
+async function handleRestart(env: Env, url: URL, sandboxName: string, requestedMode?: string): Promise<Response> {
+  const modeResult = resolveDesktopMode(requestedMode, env.SANDBOX_DEFAULT_DESKTOP_MODE);
+  if (!modeResult.ok) {
+    return json({ ok: false, error: modeResult.error }, 400);
+  }
+  const explicitMode = requestedMode?.trim() ? modeResult.mode : undefined;
+  try {
+    const sandbox = openSandbox(env, sandboxName);
+    const report = await sandbox.restartDesktopStack(
+      normalizeSandboxHostname(url.host),
+      sandboxName,
+      explicitMode,
+      modeResult.mode,
+    );
+    const status = report.ok ? 200 : report.outcome === 'unsupported_mode' ? 400 : 500;
+    return json({ sandboxName, ...report }, status);
+  } catch (err) {
+    return json(
+      { ok: false, sandboxName, error: err instanceof Error ? err.message : String(err) },
       500,
     );
   }
@@ -3576,7 +4040,7 @@ async function handleTerminate(env: Env, sandboxName: string): Promise<Response>
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     // 0) Option D bridge hostnames — app-preview (`<APP_PREVIEW_PORT>-<id>-app.<zone>`)
     //    AND code-server (`<CODE_PREVIEW_PORT>-<id>-code.<zone>`): handled
     //    ENTIRELY by our own token/cookie-gated dispatcher, BEFORE
@@ -3626,7 +4090,7 @@ export default {
     }
 
     if (method === 'POST' && path === '/sandbox/preview') {
-      return handlePreview(request, env, url);
+      return handlePreview(request, env, url, ctx);
     }
 
     const statusMatch = path.match(/^\/sandbox\/([^/]+)\/status$/);
@@ -3682,6 +4146,25 @@ export default {
       const unauthorized = await authorizeSignedControlRequest(request, env, url);
       if (unauthorized) return unauthorized;
       return handleFocus(request, env, decodeURIComponent(focusMatch[1]));
+    }
+
+    const restartMatch = path.match(/^\/sandbox\/([^/]+)\/restart$/);
+    if (method === 'POST' && restartMatch) {
+      // Restart the desktop stack inside a LIVE container ("someone closed
+      // the browser — there is no way to restart the system"). HMAC-gated
+      // (SAME envelope as `DELETE /sandbox/:name` and `/focus`). Operators
+      // can hard-disable it WITHOUT a code change via `SANDBOX_RESTART=off`.
+      if (restartDisabled(env.SANDBOX_RESTART)) {
+        return json({ ok: false, error: 'restart_disabled' }, 404);
+      }
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      return handleRestart(
+        env,
+        url,
+        decodeURIComponent(restartMatch[1]),
+        url.searchParams.get('desktopMode') ?? undefined,
+      );
     }
 
     if (method === 'POST' && path.startsWith('/project-files/')) {

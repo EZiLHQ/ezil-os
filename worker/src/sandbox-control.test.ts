@@ -248,3 +248,112 @@ describe('focusDisabled (kill switch for POST /sandbox/:id/focus)', () => {
     expect(focusDisabled('1')).toBe(false);
   });
 });
+
+describe('restartDisabled (kill switch for POST /sandbox/:id/restart)', () => {
+  it('is enabled (not disabled) by default — unset/undefined', async () => {
+    const { restartDisabled } = await import('./sandbox-control');
+    expect(restartDisabled(undefined)).toBe(false);
+    expect(restartDisabled('')).toBe(false);
+  });
+
+  it('recognizes every documented disable spelling, case-insensitively', async () => {
+    const { restartDisabled } = await import('./sandbox-control');
+    for (const spelling of ['off', 'OFF', 'false', '0', 'disabled', 'no', '  off  ']) {
+      expect(restartDisabled(spelling)).toBe(true);
+    }
+  });
+
+  it('treats any other value as enabled (not disabled)', async () => {
+    const { restartDisabled } = await import('./sandbox-control');
+    expect(restartDisabled('on')).toBe(false);
+    expect(restartDisabled('true')).toBe(false);
+  });
+});
+
+describe('findDesktopLauncherProcess (locating the tracked start-desktop.sh launcher)', () => {
+  it('finds a running launcher by its exact command path', async () => {
+    const { findDesktopLauncherProcess } = await import('./sandbox-control');
+    const processes = [
+      { id: 'p1', command: 'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh', status: 'running' },
+    ];
+    expect(findDesktopLauncherProcess(processes)?.id).toBe('p1');
+  });
+
+  it('also matches a "starting" launcher (not yet confirmed running)', async () => {
+    const { findDesktopLauncherProcess } = await import('./sandbox-control');
+    const processes = [
+      { id: 'p1', command: 'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh', status: 'starting' },
+    ];
+    expect(findDesktopLauncherProcess(processes)?.id).toBe('p1');
+  });
+
+  it('ignores a launcher that already exited (completed/killed/failed/error)', async () => {
+    const { findDesktopLauncherProcess } = await import('./sandbox-control');
+    for (const status of ['completed', 'killed', 'failed', 'error']) {
+      const processes = [{ id: 'p1', command: 'bash /usr/local/bin/start-desktop.sh', status }];
+      expect(findDesktopLauncherProcess(processes)).toBeUndefined();
+    }
+  });
+
+  it('ignores unrelated processes (e.g. the dev-server launcher) even when running', async () => {
+    const { findDesktopLauncherProcess } = await import('./sandbox-control');
+    const processes = [{ id: 'p1', command: 'bash /usr/local/bin/start-devserver.sh', status: 'running' }];
+    expect(findDesktopLauncherProcess(processes)).toBeUndefined();
+  });
+
+  it('returns undefined for an empty process list', async () => {
+    const { findDesktopLauncherProcess } = await import('./sandbox-control');
+    expect(findDesktopLauncherProcess([])).toBeUndefined();
+  });
+});
+
+describe('buildRestartReport (honest restart reporting — same discipline as buildTerminateReport)', () => {
+  it('reports "restarted" when a launcher was running, confirmed stopped, and the fresh boot came up', async () => {
+    const { buildRestartReport } = await import('./sandbox-control');
+    const report = buildRestartReport({ mode: 'neko', wasRunning: true, stopConfirmed: true, bootOk: true });
+    expect(report).toEqual({
+      ok: true,
+      mode: 'neko',
+      outcome: 'restarted',
+      wasRunning: true,
+      stopConfirmed: true,
+      bootOk: true,
+    });
+  });
+
+  it('reports "started" (idempotent start) when nothing was running and the fresh boot came up', async () => {
+    const { buildRestartReport } = await import('./sandbox-control');
+    const report = buildRestartReport({ mode: 'neko', wasRunning: false, stopConfirmed: true, bootOk: true });
+    expect(report.ok).toBe(true);
+    expect(report.outcome).toBe('started');
+  });
+
+  it('FAILS LOUD with "stop_timed_out" — and never claims bootOk — when a running launcher did not confirm stopped', async () => {
+    const { buildRestartReport } = await import('./sandbox-control');
+    const report = buildRestartReport({ mode: 'neko', wasRunning: true, stopConfirmed: false, bootOk: true });
+    expect(report.ok).toBe(false);
+    expect(report.outcome).toBe('stop_timed_out');
+    expect(report.bootOk).toBe(false); // never half-restart: bootOk is forced false, the boot must be skipped
+    expect(report.error).toBeTruthy();
+  });
+
+  it('reports "boot_failed" when the stop was confirmed (or nothing needed stopping) but the boot did not become ready', async () => {
+    const { buildRestartReport } = await import('./sandbox-control');
+    const report = buildRestartReport({
+      mode: 'neko',
+      wasRunning: true,
+      stopConfirmed: true,
+      bootOk: false,
+      bootError: 'desktop_failed_to_start: timeout',
+    });
+    expect(report.ok).toBe(false);
+    expect(report.outcome).toBe('boot_failed');
+    expect(report.error).toBe('desktop_failed_to_start: timeout');
+  });
+
+  it('falls back to a generic error string when boot_failed carries no detail', async () => {
+    const { buildRestartReport } = await import('./sandbox-control');
+    const report = buildRestartReport({ mode: 'neko', wasRunning: false, stopConfirmed: true, bootOk: false });
+    expect(report.error).toBe('boot_failed');
+  });
+});

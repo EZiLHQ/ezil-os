@@ -59,6 +59,22 @@ binding = "SANDBOX_WORKSPACE_R2_BUCKET"
 bucket_name = "ezil-sandbox-workspaces"
 experimental_remote = true
 
+# ── R2 bucket binding (fleet crash-telemetry spool) ───────────────────────────
+# Backs the boot-phase/crash telemetry pipeline (see
+# scratchpad/telemetry-design.md, section 4.1, and src/telemetry.ts).
+# Deliberately a SEPARATE bucket from SANDBOX_WORKSPACE_R2_BUCKET above: that
+# one is FUSE-mounted into user containers, and a mount that ever resolved
+# without a per-computer prefix would put the whole fleet's error log inside a
+# user's file manager. This binding is optional at runtime — spoolTelemetry()
+# in index.ts silently no-ops when it is absent (local dev, or before the
+# bucket is provisioned), so telemetry never becomes a hard dependency of the
+# preview path. Requires the bucket to exist before deploy:
+#   wrangler r2 bucket create ezil-telemetry-spool
+[[r2_buckets]]
+binding = "TELEMETRY_R2_BUCKET"
+bucket_name = "ezil-telemetry-spool"
+experimental_remote = true
+
 [dev]
 port = 8787
 local_protocol = "http"
