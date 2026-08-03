@@ -48,6 +48,8 @@ LOG_FILE=/tmp/code-server.log
 PORT=8443
 TIMEOUT_SEC=30
 WORKSPACE_ROOT="${1:-${WORKSPACE_ROOT:-/home/neko/project}}"
+USER_DATA_DIR="${CODE_SERVER_USER_DATA_DIR:-/tmp/code-server-data}"
+EXTENSIONS_DIR="${CODE_SERVER_EXTENSIONS_DIR:-/tmp/code-server-extensions}"
 
 port_up() {
     # `nc` may not be present — use bash's /dev/tcp builtin.
@@ -70,6 +72,25 @@ fi
 # Stale pid file with nothing listening — clean up and relaunch.
 rm -f "$PID_FILE"
 
+# ── Workspace Trust off — see the long block in start-neko.sh for the measured
+# evidence. Short version: with a folder open, an untrusted workspace boots into
+# Restricted Mode and the integrated terminal refuses to start behind a "Do you
+# trust the authors of the files in this folder? / Creating a terminal process
+# requires executing code" modal. The grant lives in --user-data-dir, which is
+# under /tmp and recreated every container start, so the prompt returns every
+# session. A SETTING, not `--disable-workspace-trust`: an unknown setting is
+# ignored, an unknown CLI option makes code-server exit non-zero.
+# Keep this in sync with start-neko.sh, which is the launcher that actually runs
+# on the mandatory boot path; this one is the idempotent on-demand fallback.
+if [ ! -s "$USER_DATA_DIR/User/settings.json" ]; then
+    mkdir -p "$USER_DATA_DIR/User"
+    cat >"$USER_DATA_DIR/User/settings.json" <<'CODESERVER_SETTINGS_JSON'
+{
+  "security.workspace.trust.enabled": false
+}
+CODESERVER_SETTINGS_JSON
+fi
+
 # Keep auth none because the bridge is already HMAC/cookie-gated in front of
 # this process. 0.0.0.0 is required, NOT loopback — see the 🔴 block above; an
 # earlier version of this very comment said the opposite while the flag below
@@ -85,8 +106,8 @@ nohup code-server \
     --bind-addr 0.0.0.0:${PORT} \
     --auth none \
     --disable-telemetry \
-    --user-data-dir=/tmp/code-server-data \
-    --extensions-dir=/tmp/code-server-extensions \
+    --user-data-dir="$USER_DATA_DIR" \
+    --extensions-dir="$EXTENSIONS_DIR" \
     "$WORKSPACE_ROOT" \
     >"$LOG_FILE" 2>&1 &
 echo $! >"$PID_FILE"

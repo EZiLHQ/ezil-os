@@ -1188,14 +1188,77 @@ rm -f "$NEKO_SHUTDOWN_FLAG" 2>/dev/null || true
 rm -f "$NEKO_APP_FATAL_SENTINEL" 2>/dev/null || true
 phase_end stale_boot_reclaim ok
 
+# ── Workspace Trust must be OFF before code-server ever opens the folder ─────
+# 🔴 Measured in production on image v8 (2026-08-03), not reasoned about. With
+# a folder open — which is exactly what the `folder=` bridge param now produces
+# — code-server inherits VS Code's Workspace Trust and boots into RESTRICTED
+# MODE. Observed, in that order:
+#   * status bar reads `Restricted Mode`, plus a banner across the top of the
+#     window: "Restricted Mode is intended for safe code browsing. Trust this
+#     folder to enable all features."
+#   * pressing Ctrl+` yields `.xterm: 0` and an empty panel reading "Drag a
+#     view here to display.", behind a MODAL: "Do you trust the authors of the
+#     files in this folder? / Creating a terminal process requires executing
+#     code" with [Manage] [Cancel] [Trust Folder & Continue].
+#   * clicking "Trust Folder & Continue" clears Restricted Mode but does NOT
+#     open the terminal — VS Code cancels the action that triggered the prompt,
+#     so a SECOND Ctrl+` is required. Only then does `.xterm: 1` /
+#     `TERMINAL bash` / a real `root@…:/workspace` prompt appear.
+# That is the whole of what "the VS Code server is not working" looks like from
+# the outside: the editor renders, the file tree is full, files open — and the
+# terminal is a dead panel guarded by a security dialog about the user's own
+# files.
+#
+# It cannot self-heal. The trust grant is stored under --user-data-dir, which
+# is /tmp/code-server-data — recreated on every container start. So this is not
+# a one-time click, it is every session, forever.
+#
+# Restricted Mode is also not a security boundary *here*. start-devserver.sh
+# already `exec`s the workspace's own dev script at boot (see its tail), so the
+# project's code is running unconditionally in this container before the editor
+# is ever opened. Refusing to spawn a shell because doing so "requires
+# executing code" is incoherent with what the container already does, and the
+# container is single-tenant and disposable.
+#
+# 🔴 Written as a SETTING, deliberately NOT the `--disable-workspace-trust` CLI
+# flag. An unrecognised setting is ignored by VS Code; an unrecognised CLI
+# option makes code-server exit non-zero — and code-server is a MANDATORY
+# supervised app here, so that would burn the restart budget, trip the fatal
+# sentinel and take the whole desktop down. Do not "simplify" this into a flag
+# unless you have proven the installed binary parses it.
+CODE_SERVER_USER_DATA_DIR="${CODE_SERVER_USER_DATA_DIR:-/tmp/code-server-data}"
+CODE_SERVER_EXTENSIONS_DIR="${CODE_SERVER_EXTENSIONS_DIR:-/tmp/code-server-extensions}"
+
+# Never clobbers an existing file: within a single container life the user may
+# have changed settings through the UI, and this runs before every launch.
+seed_codeserver_user_settings() {
+  _cs_user_dir="$1/User"
+  _cs_settings="$_cs_user_dir/settings.json"
+  if [ -s "$_cs_settings" ]; then
+    return 0
+  fi
+  mkdir -p "$_cs_user_dir" 2>/dev/null || return 1
+  cat >"$_cs_settings" <<'CODESERVER_SETTINGS_JSON'
+{
+  "security.workspace.trust.enabled": false
+}
+CODESERVER_SETTINGS_JSON
+}
+
+if seed_codeserver_user_settings "$CODE_SERVER_USER_DATA_DIR"; then
+  log "code-server user settings seeded at ${CODE_SERVER_USER_DATA_DIR}/User/settings.json (workspace trust disabled — no Restricted Mode, terminal works on the first Ctrl+backtick)"
+else
+  log "WARNING: could not seed ${CODE_SERVER_USER_DATA_DIR}/User/settings.json — code-server will open in Restricted Mode and its integrated terminal will prompt for workspace trust before it will start"
+fi
+
 phase_start codeserver_launch
 log "supervising code-server ($CODE_SERVER_BIN) on 0.0.0.0:${CODE_SERVER_PORT} at $WORKSPACE_ROOT (mandatory, isolated user-data-dir)"
 supervise_app codeserver "$NEKO_APP_MAX_RESTARTS" "$CODE_SERVER_BIN" \
   --bind-addr "0.0.0.0:${CODE_SERVER_PORT}" \
   --auth none \
   --disable-telemetry \
-  --user-data-dir=/tmp/code-server-data \
-  --extensions-dir=/tmp/code-server-extensions \
+  --user-data-dir="$CODE_SERVER_USER_DATA_DIR" \
+  --extensions-dir="$CODE_SERVER_EXTENSIONS_DIR" \
   "$WORKSPACE_ROOT"
 phase_end codeserver_launch ok
 
