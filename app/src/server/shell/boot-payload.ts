@@ -72,6 +72,18 @@ export const SHELL_API_ROUTES = {
      * only be present while `src/app/api/shell/focus/route.ts` exists.
      */
     focus: '/api/shell/focus',
+    /**
+     * POST = a batch of crash/error telemetry events (see
+     * `scratchpad/telemetry-design.md`). Same feature-detection contract as
+     * `focus`: `shell/ezil/telemetry.js` reads `desktopState.endpoints.telemetry`
+     * and stays permanently dark — no buffering, no beacon, no timer — if the
+     * key is absent, rather than POSTing to a URL an older/newer bundle
+     * invented. This is what makes the route and the shell module independently
+     * mergeable (`scratchpad/telemetry-design.md` §9's suggested landing order).
+     * Always responds 202 regardless of outcome — see the route's own doc
+     * comment for why the response is never meaningfully read.
+     */
+    telemetry: '/api/shell/telemetry',
 } as const;
 
 export interface ShellBootUser {

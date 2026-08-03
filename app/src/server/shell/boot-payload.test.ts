@@ -239,6 +239,7 @@ describe('toShellDesktopState — never implies an observation it does not have'
             // `previewUrl` — see `cloudflareGuacamole.codePreviewUrl`.
             codePreviewUrl: '/api/shell/code-preview-url',
             focus: '/api/shell/focus',
+            telemetry: '/api/shell/telemetry',
         });
     });
 
@@ -257,6 +258,18 @@ describe('toShellDesktopState — never implies an observation it does not have'
     it('carries `focus`, the key the shell in-stream switcher feature-detects on', () => {
         expect(toShellDesktopState({ isConfigured: true, hasHmacSecret: true }).endpoints.focus).toBe(
             '/api/shell/focus',
+        );
+    });
+
+    /**
+     * Same feature-flag shape as `focus` above, for the telemetry beacon
+     * module (`shell/ezil/telemetry.js`, scratchpad/telemetry-design.md §4.3):
+     * deleting this key silently turns off all crash reporting for every
+     * client that reads it, with no other test noticing.
+     */
+    it('carries `telemetry`, the key shell/ezil/telemetry.js feature-detects on', () => {
+        expect(toShellDesktopState({ isConfigured: true, hasHmacSecret: true }).endpoints.telemetry).toBe(
+            '/api/shell/telemetry',
         );
     });
 });
