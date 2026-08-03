@@ -32,6 +32,26 @@ import {
     type ComputerStoreDb,
 } from './computer-store';
 
+/**
+ * True when `needle` appears in an error's message or anywhere down its
+ * `cause` chain.
+ *
+ * drizzle-orm >= 0.44 wraps every driver error in a `DrizzleQueryError`
+ * ("Failed query: …") and hangs the original postgres error off `.cause`, so
+ * a top-level message match no longer sees the real failure. Bounded depth so
+ * a self-referential cause cannot hang the suite.
+ */
+function causeChainIncludes(error: unknown, needle: string): boolean {
+    let current: unknown = error;
+    for (let depth = 0; depth < 5; depth += 1) {
+        if (typeof current !== 'object' || current === null) return false;
+        const message = (current as { message?: unknown }).message;
+        if (typeof message === 'string' && message.includes(needle)) return true;
+        current = (current as { cause?: unknown }).cause;
+    }
+    return false;
+}
+
 const USER = '11111111-1111-1111-1111-111111111111';
 const OTHER_USER = '22222222-2222-2222-2222-222222222222';
 const COMPUTER = '33333333-3333-3333-3333-333333333333';
@@ -335,9 +355,22 @@ describe('createComputerInLowestFreeSlot', () => {
         const notNull = Object.assign(new Error('null value in column'), { code: '23502' });
         const { db } = makeScriptedDb([[], notNull]);
 
-        await expect(createComputerInLowestFreeSlot(db, { userId: USER })).rejects.toThrow(
-            'null value in column',
-        );
+        // Asserted through the cause chain, not on the top-level message:
+        // drizzle-orm >= 0.44 wraps driver errors in a `DrizzleQueryError`
+        // ("Failed query: …") and hangs the original off `.cause`. The
+        // property under test is unchanged — a non-unique error must escape
+        // rather than be laundered into the cap — so this checks the two
+        // things that actually matter: it rejects at all, and the real error
+        // is still reachable. Swallow it or map it to `computer_limit_reached`
+        // and this still fails.
+        let thrown: unknown;
+        try {
+            await createComputerInLowestFreeSlot(db, { userId: USER });
+        } catch ( err ) {
+            thrown = err;
+        }
+        expect(thrown, 'must reject, not return the cap outcome').toBeDefined();
+        expect(causeChainIncludes(thrown, 'null value in column')).toBe(true);
     });
 
     it('reports an insert that returned no row distinctly from the cap', async () => {
@@ -458,9 +491,15 @@ describe('getOrCreateDefaultComputer', () => {
         const boom = Object.assign(new Error('connection terminated'), { code: '08006' });
         const { db } = makeScriptedDb([[], [], boom]);
 
-        await expect(getOrCreateDefaultComputer(db, { userId: USER })).rejects.toThrow(
-            'connection terminated',
-        );
+        // Cause-chain assertion — see the note on the create-path twin above.
+        let thrown: unknown;
+        try {
+            await getOrCreateDefaultComputer(db, { userId: USER });
+        } catch ( err ) {
+            thrown = err;
+        }
+        expect(thrown, 'must reject, not return the cap outcome').toBeDefined();
+        expect(causeChainIncludes(thrown, 'connection terminated')).toBe(true);
     });
 
     it('issues no DELETE on any path', async () => {

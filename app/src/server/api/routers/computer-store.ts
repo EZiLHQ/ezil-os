@@ -123,12 +123,30 @@ export function liveOwnedComputer(userId: string, id: string): SQL | undefined {
 
 /** True for a Postgres unique-violation error (SQLSTATE 23505). */
 export function isUniqueViolation(error: unknown): boolean {
-    return (
-        typeof error === 'object' &&
-        error !== null &&
-        'code' in error &&
-        (error as { code?: unknown }).code === '23505'
-    );
+    // 🔴 Walk the `cause` chain — do not just read `error.code`.
+    //
+    // drizzle-orm >= 0.44 wraps every driver error in a `DrizzleQueryError`
+    // ("Failed query: insert into …") and hangs the original postgres error,
+    // the one carrying SQLSTATE, off `.cause`. Before that upgrade the driver
+    // error arrived bare, so a top-level `code` check was sufficient.
+    //
+    // This is not cosmetic. Both slot races depend on recognising 23505:
+    // `createComputerInLowestFreeSlot` reports `computer_limit_reached`
+    // instead of a raw 500, and `getOrCreateDefaultComputer` re-reads to
+    // return the WINNER's row rather than failing the loser. A bare check
+    // silently stops matching after the upgrade and both degrade into 500s
+    // under exactly the concurrency they exist to handle — caught only
+    // because those races have tests.
+    //
+    // Bounded depth: a cause chain is short, and an unbounded walk on a
+    // self-referential `cause` would hang.
+    let current: unknown = error;
+    for (let depth = 0; depth < 5; depth += 1) {
+        if (typeof current !== 'object' || current === null) return false;
+        if ((current as { code?: unknown }).code === '23505') return true;
+        current = (current as { cause?: unknown }).cause;
+    }
+    return false;
 }
 
 /**
