@@ -104,9 +104,24 @@ describe('fingerprint(): positive pairs collide, pinned as literals', () => {
         expect(fingerprint(EX3_B)).toBe('fp_26c1ab9711e709b9');
     });
 
+    /**
+     * The pinned literal moved from `fp_0152c25775351c84` to
+     * `fp_b4a68646617f9fe2` when `sanitizeErrorMessage` gained its own path
+     * rule. Before, `/workspace/<uuid>` reached `normalizeDetail` intact and
+     * was rewritten by N3 (uuid) and then N9 (path); now the sanitiser — which
+     * runs first, and which is what actually writes `ezil_error_events.detail`
+     * — has already collapsed the whole thing to `<path>`. Both sides still
+     * normalise to `fuse: device not found, mount <path> failed after <dur>`,
+     * so THE PROPERTY THE PIN EXISTS FOR IS UNCHANGED: two containers with
+     * different workspace paths and different durations remain one fingerprint.
+     *
+     * Re-pinning was safe to do exactly once: `app/drizzle/0001_telemetry.sql`
+     * is still un-applied, so no stored fingerprint anywhere needs rehashing.
+     * It will not be safe the next time.
+     */
     it('EX4 — container boot phase, different workspace paths', () => {
-        expect(fingerprint(EX4_A)).toBe('fp_0152c25775351c84');
-        expect(fingerprint(EX4_B)).toBe('fp_0152c25775351c84');
+        expect(fingerprint(EX4_A)).toBe('fp_b4a68646617f9fe2');
+        expect(fingerprint(EX4_B)).toBe('fp_b4a68646617f9fe2');
     });
 });
 
