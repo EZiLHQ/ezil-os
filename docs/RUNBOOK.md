@@ -213,10 +213,37 @@ are unit-tested on both sides.
 
 ## Open, owner-side
 
-🔴 Key rotation — `/data/openclaw/projects/ezil/KEY-ROTATION-REQUIRED.md`, end of day.
-`CLOUDFLARE_GUACAMOLE_HMAC_SECRET` and the Worker's `SANDBOX_HMAC_SECRET` rotate
-**together**; Worker secrets are versioned, so a rollback silently reverts a rotated one.
-**Not re-verified this session — confirm this file's status before assuming it is stale.**
+### Secret rotation
+
+The deployment holds exactly these secrets. Anything not listed here is public by design.
+
+| Secret | Where | Notes |
+|---|---|---|
+| `CLOUDFLARE_GUACAMOLE_HMAC_SECRET` | app env | must **byte-match** the Worker's `SANDBOX_HMAC_SECRET` |
+| `SANDBOX_HMAC_SECRET` | Worker | the other half of the same pair |
+| `SUPABASE_DATABASE_URL` | app env | carries the database password |
+| `SANDBOX_NEKO_TURN_API_TOKEN` / `SANDBOX_NEKO_TURN_KEY_ID` | Worker | Cloudflare Realtime TURN |
+
+🔴 **The HMAC pair rotates together or not at all.** They are compared byte-for-byte;
+changing one alone makes every signed control-plane call fail with `hmac_required` /
+`hmac_invalid`, and the symptom — a desktop that will not start — does not name the cause.
+
+Because a Worker secret takes effect immediately while an app env var only takes effect on
+the next deploy, there is an unavoidable window between the two where the halves disagree.
+Keep it short and expect it:
+
+1. set the new value on the app side and start a deploy;
+2. the moment that deploy is live, `wrangler secret put SANDBOX_HMAC_SECRET`;
+3. verify with a real signed request, not just a health check — `/health` is unauthenticated
+   and answers 200 with a broken secret.
+
+⚠️ **Worker secrets are versioned.** A `wrangler rollback` silently restores the *previous*
+secret value along with the previous code, which un-rotates the Worker half and re-opens the
+window above. After any rollback, re-check the pair.
+
+**Never commit rotation state, key inventories, or operator paths to this repository.** An
+earlier revision of this file pointed at a local key-inventory file by absolute path; that
+line has been removed. Track rotation wherever you track other operational secrets.
 
 ---
 
