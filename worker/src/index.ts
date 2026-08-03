@@ -166,6 +166,16 @@ interface Env extends SandboxEnv {
   SANDBOX_FOCUS?: string;
 
   /**
+   * Non-secret kill-switch for the desktop-restart control route
+   * (`POST /sandbox/:name/restart`, see `handleRestart` /
+   * `EzilSandboxDO.restartDesktopStack`). Enabled by default (HMAC-gated,
+   * neko-mode-only, reuses `terminate_stack`'s own SIGTERM teardown rather
+   * than a second one); set to `off`/`false`/`0`/`disabled`/`no` to
+   * hard-disable the surface (returns 404) without a code change.
+   */
+  SANDBOX_RESTART?: string;
+
+  /**
    * Non-secret opt-in flag forwarded verbatim into the container process env
    * as `EZIL_NEKO_CPU_DIAG_ENABLED` (see `ensureDesktop` + `cpu-diag.ts`),
    * which gates `scripts/start-neko.sh`'s in-container CPU sampler. DEFAULT
@@ -321,10 +331,16 @@ export {
   validateFocusApp,
   buildFocusAppCommand,
   focusDisabled,
+  restartDisabled,
+  findDesktopLauncherProcess,
+  buildRestartReport,
   type TerminateOutcome,
   type TerminateReport,
   type DesktopStatus,
   type FocusApp,
+  type ProcessLike,
+  type RestartOutcome,
+  type RestartReport,
 } from './sandbox-control';
 import {
   extractSignedToken,
@@ -333,7 +349,12 @@ import {
   validateFocusApp,
   buildFocusAppCommand,
   focusDisabled,
+  restartDisabled,
+  findDesktopLauncherProcess,
+  buildRestartReport,
   type TerminateReport,
+  type ProcessLike,
+  type RestartReport,
 } from './sandbox-control';
 import {
   seedWorkspaceIfAbsent,
@@ -561,6 +582,19 @@ interface EzilWorkspacePersistRpc {
    * this name") readable. See `EzilSandboxDO.terminateSandbox`.
    */
   terminateSandbox(): Promise<TerminateReport>;
+  /**
+   * The `POST /sandbox/:name/restart` implementation. See
+   * `EzilSandboxDO.restartDesktopStack`'s doc comment for the full contract —
+   * runs entirely inside the DO because that is where the SDK's own
+   * `listProcesses`/`killProcess`/`getProcess` process registry and
+   * `getExposedPorts`/`unexposePort` port bookkeeping live.
+   */
+  restartDesktopStack(
+    hostname: string,
+    sandboxId: string,
+    explicitMode: DesktopMode | undefined,
+    fallbackMode: DesktopMode,
+  ): Promise<RestartReport & { url?: string; appPreviewUrl?: string | null; codePreviewUrl?: string | null }>;
 }
 
 /** Open (or create) the Sandbox DO for an id with consistent options. */
@@ -1458,6 +1492,19 @@ const TERMINATE_MONITOR_BACKSTOP_MS = 10_000;
 const TERMINATE_CONFIRM_TIMEOUT_MS = 3_000;
 const TERMINATE_CONFIRM_INTERVAL_MS = 250;
 
+/**
+ * Deadline for `restartDesktopStack()`'s SIGTERM'd launcher to confirm
+ * actually stopped, polled via `getProcess()`. Generous on purpose: it must
+ * outlast `terminate_stack`'s OWN internal budget (an 8s SIGTERM grace period,
+ * `NEKO_TEARDOWN_GRACE` in `start-neko.sh`, plus the SIGKILL escalation and
+ * reap that follow it) with real margin, so a clean teardown is never
+ * mistaken for a stuck one. If the launcher is STILL running after this, the
+ * relaunch is skipped and the call fails loudly (`stop_timed_out`) rather than
+ * booting a second stack on top of a maybe-still-alive one.
+ */
+const RESTART_STOP_DEADLINE_MS = 20_000;
+const RESTART_STOP_POLL_INTERVAL_MS = 500;
+
 interface WorkspaceFlushContext {
   /** R2 key prefix, NO leading slash — e.g. `${projectId}/branches/${branch}`. */
   prefix: string;
@@ -1529,6 +1576,17 @@ const WORKSPACE_FLUSH_INTERVAL_SECONDS = 10;
  * identity is unchanged, only new methods are added on top of it.
  */
 class EzilSandboxDO extends CFSandboxClass<Env> {
+  /**
+   * Reentrancy guard for `restartDesktopStack()`. A DO instance is a single
+   * JS object handling one request at a time cooperatively, but `await`
+   * points let a SECOND concurrent restart call interleave with the first —
+   * two overlapping kill+relaunch cycles racing is exactly the orphan/
+   * port-collision failure mode `terminate_stack` was written to prevent.
+   * This makes a second call while one is in flight a fast, honest no-op
+   * (`outcome: 'restart_in_progress'`) instead of a race.
+   */
+  private restartInProgress = false;
+
   /** Read the flush-manifest cache from local disk. Missing/corrupt -> empty (safe: just re-uploads everything once). */
   private async readFlushManifest(mountPath: string): Promise<FlushManifest> {
     const manifestPath = `${mountPath}/${FLUSH_MANIFEST_FILENAME}`;
@@ -1818,6 +1876,223 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       detail: `outcome=${report.outcome},wasRunning=${wasRunning},runningAfter=${runningAfter}`,
     });
     return report;
+  }
+
+  /**
+   * The `POST /sandbox/:name/restart` implementation, run inside the DO.
+   *
+   * "Someone closed the browser — there is no way to restart the system from
+   * settings." This restarts the desktop stack INSIDE the already-running
+   * container: it does NOT call `destroy()`/`terminateSandbox()` (the
+   * container, and the workspace on its disk, are never touched), it does NOT
+   * re-mount or re-hydrate the workspace bucket (the files are already on the
+   * container's own filesystem from the original boot — restart only needs to
+   * tell the fresh launcher where they live), and it re-derives every other
+   * input (TURN/ICE credentials, the neko auto-connect password, the
+   * workspace root path) the SAME way a fresh `/sandbox/preview` call does,
+   * from `sandboxId` + env alone, so no caller-held secret needs to survive
+   * between the original preview call and this one.
+   *
+   * NEKO MODE ONLY. `start-neko.sh` is the ONLY launcher with a `terminate_stack`
+   * teardown trap wired to SIGTERM — Guacamole's `start-desktop.sh` has none
+   * (see that script's own doc comment: it just blocks on `wait
+   * "$TOMCAT_PID"`), so a SIGTERM there would kill the launcher shell and
+   * leave Xvfb/guacd/Tomcat/Chrome running as unreachable orphans — the exact
+   * bug `terminate_stack` exists to prevent, for the one mode that has no such
+   * trap. Rather than write a second, weaker teardown for that mode, this
+   * route refuses it outright (`unsupported_mode`, mapped to HTTP 400 by the
+   * caller) until Guacamole gets the same discipline.
+   *
+   * Sequence, each step OBSERVED rather than assumed (mirrors
+   * `terminateSandbox`'s own "describe what actually happened" discipline):
+   *   1. Detect the live launcher (`listProcesses()` + `findDesktopLauncherProcess`,
+   *      matching on the exact command `ensureDesktop` launches) and the
+   *      current/target mode (`describeDesktopStatus`, the SAME helper
+   *      `handleStatus` uses).
+   *   2. If one is running: SIGTERM it via `killProcess()` — this is the
+   *      SAME signal `terminate_stack`'s own trap (`start-neko.sh`) is wired
+   *      to, so the ENTIRE teardown (graceful stop of every app's process
+   *      group, escalation to SIGKILL, reaping) runs exactly as it does for a
+   *      container-runtime-issued SIGTERM. Nothing here reimplements any part
+   *      of that. Then poll for confirmed exit, bounded by
+   *      `RESTART_STOP_DEADLINE_MS`.
+   *   3. If it did not confirm stopped in time: FAIL LOUD (`stop_timed_out`)
+   *      and stop — never relaunch on top of a maybe-still-alive stack.
+   *   4. Unexpose whatever ports were exposed from the OLD run, so
+   *      `ensureDesktop`'s own "already exposed" fast path (which trusts the
+   *      DO's exposed-port record, not a live probe) cannot skip the relaunch.
+   *   5. Relaunch via `ensureDesktop` — the EXACT SAME boot path
+   *      `/sandbox/preview` uses. No second boot sequence.
+   *
+   * Idempotent: calling this on an already-stopped desktop just (re)starts it
+   * (`outcome: 'started'`); calling it twice in a row restarts it twice, each
+   * time through the same safe sequence. Safe to press twice AT ONCE: a
+   * concurrent call while one is in flight is a fast no-op
+   * (`restart_in_progress`), never a race (`restartInProgress` guard above).
+   */
+  async restartDesktopStack(
+    hostname: string,
+    sandboxId: string,
+    explicitMode: DesktopMode | undefined,
+    fallbackMode: DesktopMode,
+  ): Promise<RestartReport & { url?: string; appPreviewUrl?: string | null; codePreviewUrl?: string | null }> {
+    if (this.restartInProgress) {
+      return {
+        ok: false,
+        mode: explicitMode ?? fallbackMode,
+        outcome: 'restart_in_progress',
+        wasRunning: false,
+        stopConfirmed: false,
+        bootOk: false,
+        error: 'restart_already_in_progress',
+      };
+    }
+    this.restartInProgress = true;
+    try {
+      const exposedBefore = await this.getExposedPorts(hostname);
+      const status = describeDesktopStatus(exposedBefore, explicitMode, fallbackMode);
+      const mode = status.mode;
+
+      if (mode !== 'neko') {
+        bootLog('restart', 'end', { status: 'skipped', detail: `unsupported_mode=${mode}` });
+        return {
+          ok: false,
+          mode,
+          outcome: 'unsupported_mode',
+          wasRunning: status.desktopRunning,
+          stopConfirmed: false,
+          bootOk: false,
+          error: `restart_not_supported_for_mode:${mode}`,
+        };
+      }
+
+      bootLog('restart', 'start', { detail: `mode=${mode}` });
+
+      // 1) find + 2) stop the running launcher — reusing terminate_stack's
+      //    OWN SIGTERM->grace->escalate contract, never a second teardown.
+      const processesRaw = await this.listProcesses();
+      const processes: readonly ProcessLike[] = Array.isArray(processesRaw) ? (processesRaw as ProcessLike[]) : [];
+      const launcher = findDesktopLauncherProcess(processes);
+      const wasRunning = Boolean(launcher);
+      let stopConfirmed = !wasRunning;
+
+      if (launcher) {
+        try {
+          await this.killProcess(launcher.id, 'SIGTERM');
+        } catch (err) {
+          console.error(
+            `[restartDesktopStack] killProcess(${launcher.id}) failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        const deadline = Date.now() + RESTART_STOP_DEADLINE_MS;
+        while (Date.now() < deadline) {
+          let current: { status: string } | null = null;
+          try {
+            current = await this.getProcess(launcher.id);
+          } catch {
+            current = null; // treat "cannot find it anymore" as "it is gone"
+          }
+          if (!current || (current.status !== 'running' && current.status !== 'starting')) {
+            stopConfirmed = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, RESTART_STOP_POLL_INTERVAL_MS));
+        }
+      }
+
+      if (!stopConfirmed) {
+        bootLog('restart', 'end', { status: 'error', detail: 'stop_timed_out' });
+        return buildRestartReport({ mode, wasRunning, stopConfirmed: false, bootOk: false });
+      }
+
+      // 3) Unexpose every port left over from the OLD run so `ensureDesktop`'s
+      //    "already exposed" fast path cannot short-circuit the relaunch.
+      const exposedNow = await this.getExposedPorts(hostname);
+      for (const p of exposedNow) {
+        try {
+          await this.unexposePort(p.port);
+        } catch (err) {
+          console.error(
+            `[restartDesktopStack] unexposePort(${p.port}) failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      }
+
+      // 4) Relaunch via the EXACT SAME boot path `/sandbox/preview` uses.
+      // TURN/ICE + the neko auto-connect password are re-derived exactly the
+      // way `handlePreview` derives them — deterministic from `sandboxId` +
+      // env, no caller-held secret needed. The workspace root is likewise
+      // re-derived from env alone (`resolveWorkspaceMountConfig`): the files
+      // are already on the container's own disk from the original boot, so
+      // this never re-mounts or re-hydrates anything.
+      let iceEnv: Record<string, string> | null = null;
+      const ice = checkIceConfig(this.env);
+      if (!ice.ok) {
+        bootLog('restart', 'end', { status: 'error', detail: 'ice_unavailable' });
+        return buildRestartReport({ mode, wasRunning, stopConfirmed: true, bootOk: false, bootError: ice.error });
+      }
+      if (hasTurnConfigured(this.env)) {
+        try {
+          iceEnv = await resolveNekoIceEnv(this.env);
+        } catch (err) {
+          const detail = err instanceof Error ? err.message : String(err);
+          if (ice.policy === 'relay' || ice.policy === 'production') {
+            bootLog('restart', 'end', { status: 'error', detail: 'turn_unavailable' });
+            return buildRestartReport({
+              mode,
+              wasRunning,
+              stopConfirmed: true,
+              bootOk: false,
+              bootError: `turn_unavailable: ${detail}`,
+            });
+          }
+          iceEnv = null; // diagnostic policy: proceed without relay
+        }
+      }
+      const nekoCreds = await deriveNekoCredentials(this.env, sandboxId);
+      iceEnv = {
+        ...(iceEnv ?? {}),
+        NEKO_MEMBER_MULTIUSER_USER_PASSWORD: nekoCreds.user,
+        NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD: nekoCreds.admin,
+        NEKO_PASSWORD: nekoCreds.user,
+        NEKO_PASSWORD_ADMIN: nekoCreds.admin,
+      };
+      const workspaceRoot = resolveWorkspaceMountConfig(this.env)?.mountPath ?? null;
+
+      try {
+        const { url, appPreviewExpose, codePreviewExpose } = await ensureDesktop(
+          this,
+          hostname,
+          mode,
+          iceEnv,
+          // No sealed workspace-startup delivery on restart — the workspace
+          // already lives on the container's disk from the original boot, and
+          // `start-neko.sh`'s hydration phase reports `skipped` (not an
+          // error) when this is absent. See that script's own doc comment.
+          null,
+          workspaceRoot,
+          this.env.EZIL_NEKO_CPU_DIAG_ENABLED,
+        );
+        bootLog('restart', 'end', { status: 'ok' });
+        const report = buildRestartReport({ mode, wasRunning, stopConfirmed: true, bootOk: true });
+        return {
+          ...report,
+          url,
+          appPreviewUrl: appPreviewExpose.exposed ? (appPreviewExpose.url ?? null) : null,
+          codePreviewUrl: codePreviewExpose.exposed ? (codePreviewExpose.url ?? null) : null,
+        };
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        bootLog('restart', 'end', { status: 'error', detail: 'boot_failed' });
+        return buildRestartReport({ mode, wasRunning, stopConfirmed: true, bootOk: false, bootError: detail });
+      }
+    } finally {
+      this.restartInProgress = false;
+    }
   }
 }
 
@@ -2361,6 +2636,41 @@ async function handleStatus(env: Env, url: URL, sandboxName: string, requestedMo
         error: err instanceof Error ? err.message : String(err),
         mode: modeResult.mode,
       },
+      500,
+    );
+  }
+}
+
+/**
+ * `POST /sandbox/:name/restart` — restart the desktop stack inside a LIVE
+ * container, without destroying the computer or its workspace. See
+ * `EzilSandboxDO.restartDesktopStack` for the full contract (SIGTERM reusing
+ * `terminate_stack`, neko-mode-only, idempotent, fail-loud on a stuck stop).
+ *
+ * Mode resolution mirrors `handleStatus` exactly: an explicit
+ * `?desktopMode=` answers the caller's literal request; an omitted one lets
+ * the DO auto-detect whatever is actually running (or falls back to the env
+ * default when nothing is).
+ */
+async function handleRestart(env: Env, url: URL, sandboxName: string, requestedMode?: string): Promise<Response> {
+  const modeResult = resolveDesktopMode(requestedMode, env.SANDBOX_DEFAULT_DESKTOP_MODE);
+  if (!modeResult.ok) {
+    return json({ ok: false, error: modeResult.error }, 400);
+  }
+  const explicitMode = requestedMode?.trim() ? modeResult.mode : undefined;
+  try {
+    const sandbox = openSandbox(env, sandboxName);
+    const report = await sandbox.restartDesktopStack(
+      normalizeSandboxHostname(url.host),
+      sandboxName,
+      explicitMode,
+      modeResult.mode,
+    );
+    const status = report.ok ? 200 : report.outcome === 'unsupported_mode' ? 400 : 500;
+    return json({ sandboxName, ...report }, status);
+  } catch (err) {
+    return json(
+      { ok: false, sandboxName, error: err instanceof Error ? err.message : String(err) },
       500,
     );
   }
@@ -3682,6 +3992,25 @@ export default {
       const unauthorized = await authorizeSignedControlRequest(request, env, url);
       if (unauthorized) return unauthorized;
       return handleFocus(request, env, decodeURIComponent(focusMatch[1]));
+    }
+
+    const restartMatch = path.match(/^\/sandbox\/([^/]+)\/restart$/);
+    if (method === 'POST' && restartMatch) {
+      // Restart the desktop stack inside a LIVE container ("someone closed
+      // the browser — there is no way to restart the system"). HMAC-gated
+      // (SAME envelope as `DELETE /sandbox/:name` and `/focus`). Operators
+      // can hard-disable it WITHOUT a code change via `SANDBOX_RESTART=off`.
+      if (restartDisabled(env.SANDBOX_RESTART)) {
+        return json({ ok: false, error: 'restart_disabled' }, 404);
+      }
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      return handleRestart(
+        env,
+        url,
+        decodeURIComponent(restartMatch[1]),
+        url.searchParams.get('desktopMode') ?? undefined,
+      );
     }
 
     if (method === 'POST' && path.startsWith('/project-files/')) {
