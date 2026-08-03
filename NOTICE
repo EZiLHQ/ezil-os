@@ -6,9 +6,9 @@ This product is licensed under the GNU Affero General Public License v3.0
 full license text.
 
 This repository contains original EZiL code, ordinary unmodified third-party
-dependencies and container-image components (Apache Guacamole, Neko, VS Code,
-Google Chrome, the Cloudflare Sandbox SDK, and their transitive npm
-dependencies), and a modified fork of the Puter web desktop
+dependencies and container-image components (Apache Guacamole, Neko,
+code-server, Google Chrome, the Cloudflare Sandbox SDK, and their transitive
+npm dependencies), and a modified fork of the Puter web desktop
 (https://github.com/HeyPuter/puter), which is licensed AGPL-3.0-only.
 
 Puter-derived source is confined to shell/src/ and HAS BEEN MODIFIED by
