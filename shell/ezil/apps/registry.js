@@ -33,7 +33,8 @@
 // hosted (a Cloudflare container per computer) and stays gated exactly as
 // before; `settings` and `preview` are shell-local.
 //
-// Wave 1 had exactly one entry: the streamed Linux desktop.
+// Wave 1 had exactly one entry: the streamed Linux desktop (user-facing name
+// "Browser" as of 2026-08-03 — see that entry's own comment below).
 //
 // MODIFIED BY EZIL 2026-08-01: added two entries. `settings` is the Settings
 // window (`../ui/Settings/index.js`) — computer management, appearance, and
@@ -157,7 +158,17 @@ const CODE_ICON = 'data:image/svg+xml,' + encodeURIComponent(
 export const APPS = [
     {
         id: 'desktop',
-        name: 'Linux Desktop',
+        // MODIFIED BY EZIL 2026-08-03: renamed from 'Linux Desktop', per the
+        // owner directly — "It shows Linux desktop computer code, something
+        // like that. I think we should rename that as a browser and a code."
+        // The container's default (and, today, only) focusable app IS a
+        // browser (`FOCUS_APPS` in `../apps/desktop-window.js` has one entry:
+        // "Show the browser" / chromium), so this is not a euphemism, it is
+        // what a user actually sees on first boot. `id: 'desktop'` is left
+        // alone — it is wire/DOM plumbing (`data-app="desktop"`, every
+        // `.window[data-app="desktop"]` selector across this shell and its
+        // tests), not a user-facing string.
+        name: 'Browser',
         icon: DESKTOP_ICON,
         pinned: true,
         // 🔴 Two windows competing for one cold container is the worst

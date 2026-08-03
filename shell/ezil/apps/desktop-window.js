@@ -250,7 +250,10 @@ export async function openDesktopWindow (ctx = {}) {
     const desktop_state = ctx.desktopState ?? ctx.payload?.desktopState ?? {};
     // The computer's own name, not the app's: the window IS that machine, and
     // a user with two computers must be able to tell which one they are in.
-    const title = computer?.name || 'Linux Desktop';
+    // Falls back to the app's own display name (`registry.js`'s 'Browser',
+    // MODIFIED BY EZIL 2026-08-03) only for a computer with no name at all —
+    // `code.js`/`preview.js` fall back to their own app name the same way.
+    const title = computer?.name || 'Browser';
 
     if ( ! computer?.id ) {
         // Nothing to connect to. `/os` already refuses to render the shell in
