@@ -65,6 +65,42 @@ try {
 } catch { threw = true; }
 push('capture() called 1000x with no browser globals at all: never throws', ! threw);
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 0b. eventId MUST be a real RFC-4122 v4 uuid in EVERY crypto environment.
+//
+//     🔴 The ingest route validates `eventId: z.string().uuid()` inside a
+//     `.strict()` parse that drops the WHOLE event, and it always answers 202
+//     regardless — so a malformed id is a 100% silent loss with nothing
+//     anywhere to indicate it. `crypto.randomUUID` requires a SECURE CONTEXT
+//     and is `undefined` on a plain-http origin, which is precisely the case
+//     that used to fall through to a non-uuid string.
+//
+//     Exercises the shipped `newEventId()` against all three environments:
+//     randomUUID present, getRandomValues only, and neither.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const src = fs.readFileSync(path.join(here, 'telemetry.js'), 'utf8');
+    const start = src.indexOf('function newEventId');
+    const end = src.indexOf('function keyFor');
+    const makeFn = new Function('crypto', `${src.slice(start, end)}; return newEventId;`);
+    const V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    const getRandomValuesOnly = {
+        getRandomValues: (b) => { for ( let i = 0; i < b.length; i++ ) b[i] = (Math.random() * 256) | 0; return b; },
+    };
+    for ( const [label, cryptoImpl] of [
+        ['crypto.randomUUID present (secure context)', globalThis.crypto],
+        ['🔴 getRandomValues only (plain-http origin — randomUUID is undefined)', getRandomValuesOnly],
+        ['no crypto at all', {}],
+    ] ) {
+        const id = makeFn(cryptoImpl)();
+        push(`eventId is a v4 uuid: ${label}`, V4.test(id), id);
+    }
+    // Not a constant: 500 ids from the weakest path must all differ.
+    const weak = makeFn({});
+    const ids = new Set(Array.from({ length: 500 }, () => weak()));
+    push('the weakest eventId path still produces 500 distinct ids', ids.size === 500, `${ids.size}/500`);
+}
+
 const dom = new JSDOM(
     `<!doctype html><html><head><style>${fs.readFileSync(`${OS}/bundle.min.css`, 'utf8')}</style></head>
      <body><div class="desktop"></div></body></html>`,

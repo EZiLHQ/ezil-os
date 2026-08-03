@@ -163,6 +163,42 @@ function firstFrame (err) {
     return file ? `${fn}@${file}`.slice(0, 96) : undefined;
 }
 
+/**
+ * A real RFC-4122 v4 uuid, always.
+ *
+ * 🔴 `crypto.randomUUID` requires a SECURE CONTEXT — it is `undefined` on a
+ * plain-http origin. The previous fallback here was
+ * `String(Date.now()) + Math.random()...`, which is not a uuid, and the ingest
+ * route's zod schema is `eventId: z.string().uuid()` inside a `.strict()`
+ * parse that drops the WHOLE event. So on any non-secure origin this module
+ * would have armed, buffered, flushed, got its 202 (the route always answers
+ * 202) and had 100% of its events silently discarded server-side, with
+ * nothing anywhere to indicate it. `crypto.getRandomValues` has no
+ * secure-context requirement, so it covers the gap; `Math.random` is the last
+ * resort and still produces a well-formed v4.
+ */
+function newEventId () {
+    try {
+        if ( typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ) {
+            return crypto.randomUUID();
+        }
+        const b = new Uint8Array(16);
+        if ( typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function' ) {
+            crypto.getRandomValues(b);
+        } else {
+            for ( let i = 0; i < 16; i++ ) b[i] = Math.floor(Math.random() * 256);
+        }
+        b[6] = (b[6] & 0x0f) | 0x40; // version 4
+        b[8] = (b[8] & 0x3f) | 0x80; // variant 10x
+        const h = [];
+        for ( let i = 0; i < 16; i++ ) h.push(b[i].toString(16).padStart(2, '0'));
+        return `${h.slice(0, 4).join('')}-${h.slice(4, 6).join('')}-${h.slice(6, 8).join('')}`
+            + `-${h.slice(8, 10).join('')}-${h.slice(10, 16).join('')}`;
+    } catch {
+        return '00000000-0000-4000-8000-000000000000';
+    }
+}
+
 function keyFor (eventClass, site, code) {
     return `${eventClass}${site}${code}`;
 }
@@ -280,9 +316,7 @@ export function capture (input) {
         }
 
         const event = {
-            eventId: (typeof crypto !== 'undefined' && crypto.randomUUID)
-                ? crypto.randomUUID()
-                : (typeof uuidv4 === 'function' ? uuidv4() : String(Date.now()) + Math.random().toString(16).slice(2)),
+            eventId: newEventId(),
             schemaVersion: SCHEMA_VERSION,
             eventClass,
             source: 'shell',
