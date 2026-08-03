@@ -32,8 +32,10 @@
 // caller could mistakenly chain on).
 //
 // ── FEATURE DETECTION, NOT A ROUTE THIS FILE INVENTED ───────────────────────
-// `session.payload()?.desktopState?.endpoints?.telemetry` is read fresh on
-// every arm-check, the same way `desktop-window.js` gates its app-switcher on
+// `window.__EZIL_BOOT__.desktopState?.endpoints?.telemetry` (via the local
+// `bootPayload()` below — see its own comment for why this file reads that
+// global directly instead of importing `session.js`) is read fresh on every
+// arm-check, the same way `desktop-window.js` gates its app-switcher on
 // `endpoints.focus` (see that file's header). At the time this file was
 // written `app/src/server/shell/boot-payload.ts` (not owned by this task)
 // had not published a `telemetry` endpoint yet — a deployment on that server
@@ -48,9 +50,21 @@
 // the design doc's §3.1 says the ingest route re-runs its own sanitiser as
 // defence in depth, and this file's job is to not be the ONLY line of
 // defence, not to be a complete one.
-import * as session from './session.js';
-
-const PHASE = 'ezil-os:telemetry';
+// 🔴 NO IMPORT OF `./session.js` HERE, ON PURPOSE. `boot.js` imports this
+// module FIRST, specifically so its top-level `installGlobalHandlers()` call
+// (see the tail of this file) runs before any other module's own top-level
+// code — including `session.js`'s. Importing `session.js` back from here
+// would make the two modules a circular pair and put this file's own arm
+// check at the mercy of import-graph ordering it does not control. Reading
+// `window.__EZIL_BOOT__` directly is the same one-line contract
+// `session.js`'s own `payload()` uses, kept local so this file has zero
+// shell-internal dependencies — a leaf module, deliberately.
+function bootPayload () {
+    const raw = typeof window === 'undefined' ? null : window.__EZIL_BOOT__;
+    if ( ! raw || typeof raw !== 'object' ) return null;
+    if ( ! raw.user || typeof raw.user.id !== 'string' ) return null;
+    return raw;
+}
 
 const SCHEMA_VERSION = 1;
 const MAX_BUFFER = 50;
@@ -81,7 +95,7 @@ const perKeySeen = new Map();
 let reentering = false;    // stops capture() recursing through its own onerror
 
 function endpointUrl () {
-    const url = session.payload?.()?.desktopState?.endpoints?.telemetry;
+    const url = bootPayload()?.desktopState?.endpoints?.telemetry;
     return typeof url === 'string' && url !== '' ? url : null;
 }
 
@@ -353,5 +367,12 @@ if ( typeof document !== 'undefined' && typeof document.addEventListener === 'fu
     // Not `beforeunload` — design doc §4.3: unreliable, and can block the unload.
     window.addEventListener('pagehide', () => { flush(); });
 }
+
+// Self-installing. Importing this module IS "installing the handlers" — see
+// `boot.js`'s "FIRST IMPORT, ON PURPOSE" comment for why that has to happen
+// before any other module's own top-level code runs, not merely before
+// `boot()` is called. `installGlobalHandlers` itself stays idempotent and
+// exported for a test harness that wants to (re-)arm it explicitly.
+installGlobalHandlers();
 
 export default { capture, installGlobalHandlers };

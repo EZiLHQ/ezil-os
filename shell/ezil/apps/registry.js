@@ -64,6 +64,7 @@ import { openPreviewWindow } from './preview.js';
 import { openCodeWindow } from './code.js';
 import { openSettingsWindow } from '../ui/Settings/index.js';
 import { ensureSettingsDrawerButton, SETTINGS_DRAWER_SVG } from '../ui/Settings/drawer-action.js';
+import telemetry from '../telemetry.js';
 
 const PHASE = 'ezil-os:apps';
 
@@ -357,6 +358,10 @@ export async function launch (id, ctx = {}) {
     const app = getApp(id);
     if ( ! app ) {
         console.error(`[${PHASE}] no such app: ${id}`);
+        telemetry.capture({
+            eventClass: 'contract_violation', site: 'ezil-os:apps/registry#launch', code: 'unknown_app',
+            detail: String(id),
+        });
         return null;
     }
 
@@ -444,6 +449,10 @@ export async function launch (id, ctx = {}) {
         // A throwing `open` must not leave the caller (a taskbar click, a
         // Start press) believing something is on its way.
         console.error(`[${PHASE}] "${id}" failed to open`, err);
+        telemetry.capture({
+            eventClass: 'window_error', site: 'ezil-os:apps/registry#launch', code: 'app_open_threw',
+            detail: err, attrs: { app_id: String(id) },
+        });
         return null;
     }
 }

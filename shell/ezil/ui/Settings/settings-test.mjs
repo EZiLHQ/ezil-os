@@ -213,9 +213,9 @@ push('exactly one Settings window (single_instance)',
     qa('.window[data-app="settings"]').length === 1);
 
 const tabIds = qa('.window[data-app="settings"] .ezil-settings-tab').map(t => t.getAttribute('data-tab'));
-push('three tabs, and only three', tabIds.length === 3, JSON.stringify(tabIds));
-push('tabs are Computers / Appearance / About',
-    JSON.stringify(tabIds) === JSON.stringify(['computers', 'appearance', 'about']));
+push('four tabs, and only four', tabIds.length === 4, JSON.stringify(tabIds));
+push('tabs are Computers / Appearance / About / Troubleshoot',
+    JSON.stringify(tabIds) === JSON.stringify(['computers', 'appearance', 'about', 'troubleshoot']));
 push('no upstream Dashboard tab survived',
     ! tabIds.some(id => ['home', 'apps', 'files', 'usage', 'account', 'security'].includes(id)));
 
@@ -291,6 +291,56 @@ push('About links the upstream project',
 push('About carries the required Puter trademark sentence',
     /not endorsed by Puter Technologies Inc/.test(aboutText));
 push('About shows a version', /Shell version\s*\S/.test(aboutText));
+
+// ── Troubleshoot tab (restart) ───────────────────────────────────────────────
+// `window.__EZIL_BOOT__` is never set anywhere above this point in this file
+// (`ezil.boot()` ran with none at line ~135; every window since was opened by
+// calling `registry.launch(id, ctx)` directly with an explicit `ctx`, which is
+// NOT the same thing `session.payload()` reads). So `session.restartEndpoint()`
+// is null here for the same reason `desktop-window.js`'s own `focus_endpoint`
+// would be: no boot payload published a `restart` key, because none exists yet.
+// This is the exact "route not shipped" case the tab must degrade through
+// honestly, not a test artefact.
+click(qa('.window[data-app="settings"] .ezil-settings-tab')[3]);
+await settle(4);
+const troubleshoot = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]');
+push('Troubleshoot pane becomes active', troubleshoot?.classList.contains('active'));
+let restartBtn = troubleshoot?.querySelector('[data-action="restart"]');
+push('🔴 restart is DISABLED when the server has not published the route',
+    !! restartBtn?.disabled, `disabled=${restartBtn?.disabled}`);
+push('🔴 …and says so honestly, rather than staying silent or guessing a URL',
+    /available in this deployment/i.test(troubleshoot?.textContent ?? ''));
+push('the tab explains the workspace is not touched',
+    /files.*(?:not|are not|aren.t) touched|storage.*not touched/i.test(troubleshoot?.textContent ?? ''));
+
+// Now the OTHER direction: a deployment that HAS published the route. Setting
+// `window.__EZIL_BOOT__` is exactly what a real page does before this bundle's
+// first line runs; here it is done mid-run to prove the tab reads it LIVE
+// (every render, not a value snapshotted at window-open) — the same shape of
+// proof `preview-focus-test.mjs` uses for `endpoints.focus`.
+window.__EZIL_BOOT__ = { user: { id: 'u-test' }, desktopState: { endpoints: { restart: '/api/shell/restart' } } };
+click(qa('.window[data-app="settings"] .ezil-settings-tab')[2]); // away…
+await settle(2);
+click(qa('.window[data-app="settings"] .ezil-settings-tab')[3]); // …and back, re-triggering onActivate
+await settle(4);
+restartBtn = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"] [data-action="restart"]');
+push('🔴 …and flips to ENABLED the moment the route is published — no code change, live feature-detection',
+    restartBtn && ! restartBtn.disabled, `disabled=${restartBtn?.disabled}`);
+
+// Click it: confirm, then a stubbed 500 (this harness's `fetch` stub has no
+// `/api/shell/restart` case, so it falls through to the generic 500 at the
+// bottom of the stub) must render as `failed`, never as a claimed success.
+click(restartBtn);
+await settle(2);
+const restartConfirmBtn = Array.from(doc.querySelectorAll('button')).find(b => b.textContent.trim() === 'Restart');
+push('restarting asks for confirmation first', !! restartConfirmBtn);
+click(restartConfirmBtn);
+await settle(6);
+push('🔴 a failed restart is reported as failed, never as a claimed success',
+    /something went wrong|couldn.t reach|expired|too long/i.test(
+        q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]')?.textContent ?? '',
+    ));
+delete window.__EZIL_BOOT__;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4. CLOSE AND REOPEN — the second-open regression (dead buttons).

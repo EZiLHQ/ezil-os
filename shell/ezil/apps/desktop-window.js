@@ -89,6 +89,7 @@
 // a desktop they cannot leave. See `minimise_to_taskbar` below.
 
 import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
+import telemetry from '../telemetry.js';
 import { applyDisplayEvidence, computeBootUiState } from '../boot-phases.js';
 import BootProgress, { DisplayNotice } from '../ui/boot-progress.js';
 import attach_app_drawer from '../ui/app-drawer.js';
@@ -260,6 +261,9 @@ export async function openDesktopWindow (ctx = {}) {
         // this case, so reaching here means a rehydrated payload lost its
         // computer — say so instead of opening an empty window.
         console.error(`[${PHASE}] refusing to open: the boot payload carries no computer`);
+        telemetry.capture({
+            eventClass: 'contract_violation', site: 'ezil-os:apps/desktop#open', code: 'no_computer_in_payload',
+        });
         return null;
     }
 
@@ -327,6 +331,9 @@ export async function openDesktopWindow (ctx = {}) {
 
     if ( ! el_window ) {
         console.error(`[${PHASE}] UIWindow returned nothing`);
+        telemetry.capture({
+            eventClass: 'window_error', site: 'ezil-os:apps/desktop#open', code: 'uiwindow_returned_nothing',
+        });
         return null;
     }
 
@@ -470,6 +477,10 @@ export async function openDesktopWindow (ctx = {}) {
 
         if ( ! res.ok ) {
             console.error(`[${PHASE}] boot failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`);
+            telemetry.capture({
+                eventClass: 'api_failure', site: 'ezil-os:apps/desktop#mint', code: res.errorCode,
+                durationMs: performance.now() - t0,
+            });
             progress.render(computeBootUiState({
                 requestStatus: 'error',
                 elapsedMs: performance.now() - t0,
@@ -596,6 +607,10 @@ export async function openDesktopWindow (ctx = {}) {
             }
 
             console.error(`[${PHASE}] the frame is not a desktop (confirmFrame -> ${String(seen)})`);
+            telemetry.capture({
+                eventClass: 'display_failure', site: 'ezil-os:apps/desktop#confirmFrame', code: 'frame_not_answering',
+                attrs: { seen: String(seen) },
+            });
             gate.stop();
             stop_timers();
             show_panel();
@@ -812,6 +827,10 @@ export async function openDesktopWindow (ctx = {}) {
             if ( fresh ) {
                 console.error(`[${PHASE}] nothing is watching this desktop after`
                     + ` ${Math.round(age())}ms (${asks} asks) — no pixels reached the browser`);
+                telemetry.capture({
+                    eventClass: 'display_failure', site: 'ezil-os:apps/desktop#watch', code: 'no_watcher',
+                    durationMs: age(), attrs: { seen: 'blank' },
+                });
                 settle('blank', true);
                 return;
             }
@@ -1043,6 +1062,9 @@ export async function openDesktopWindow (ctx = {}) {
         // this file opts INTO, refusing is a flag rather than a reversal —
         // there is no window of time in which the taskbar is already gone.
         console.error(`[${PHASE}] control drawer did not attach — this window will stay windowed, over the taskbar`);
+        telemetry.capture({
+            eventClass: 'window_error', site: 'ezil-os:apps/desktop#drawer', code: 'drawer_attach_failed',
+        });
         may_fullbleed = false;
     }
 

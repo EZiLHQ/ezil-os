@@ -42,6 +42,14 @@
 // <body>. A plain blocking <script> in <head> yields a null body reference and
 // windows that never attach. `/os` uses `defer`.
 
+// 🔴 FIRST IMPORT, ON PURPOSE — see "Load order below is LOAD-BEARING" above.
+// `telemetry.js` installs `window.onerror`/`unhandledrejection` AT ITS OWN
+// MODULE TOP LEVEL (see that file's tail), specifically so those listeners
+// exist before ANY of the modules imported below get a chance to run their
+// own top-level code — `UIWindow.js` (imported via `../src/UI/UIWindow.js`)
+// references `document.body` at module scope, per this file's own header.
+// An error that happens during THAT import would otherwise be invisible.
+import telemetry from './telemetry.js';
 import '../src/lib/ezil-vendor.js';
 import install_globals from '../src/ezil-globals.js';
 import '../src/i18n/i18n.js';
@@ -235,6 +243,7 @@ function give_up (reason, detail) {
     if ( shell.stalled ) return;
     shell.stalled = { reason, ...detail };
     console.error(`[${PHASE}] giving up: ${reason}`, shell.stalled);
+    telemetry.capture({ eventClass: 'boot_stall', site: 'ezil-os:boot#give_up', code: reason });
     if ( typeof window !== 'undefined' && typeof CustomEvent === 'function' ) {
         window.dispatchEvent(new CustomEvent('ezil:stalled', { detail: shell.stalled }));
     }
@@ -565,6 +574,10 @@ function begin_mount (why) {
             `[${PHASE}] the desktop could not be kept on screen after ${mount_attempts} attempts (${why}).`
             + ' Not trying again — reload the page, or call ezil.recover().',
         );
+        telemetry.capture({
+            eventClass: 'window_error', site: 'ezil-os:boot#mount', code: 'mount_failed',
+            detail: `exhausted after ${mount_attempts} attempts (${why})`,
+        });
         // 🔴 Bounded AND legible. Exhausting the budget used to be visible
         // only in the console, which meant the user was left looking at the
         // server-rendered wallpaper with no OS on it and no way to know.
@@ -574,7 +587,13 @@ function begin_mount (why) {
     mount_attempts += 1;
     mounting = true;
     void mount(shell.payload)
-        .catch((err) => { console.error(`[${PHASE}] mount failed (${why})`, err); })
+        .catch((err) => {
+            console.error(`[${PHASE}] mount failed (${why})`, err);
+            telemetry.capture({
+                eventClass: 'window_error', site: 'ezil-os:boot#mount', code: 'mount_failed',
+                detail: err,
+            });
+        })
         .finally(() => {
             mounting = false;
             // The desktop can be destroyed WHILE it is being built; re-check

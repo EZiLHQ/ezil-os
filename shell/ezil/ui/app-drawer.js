@@ -37,6 +37,8 @@
 // exactly those selectors. Renaming them here would mean re-porting the
 // stylesheet to gain nothing.
 
+import telemetry from '../telemetry.js';
+
 const PHASE = 'ezil-os:drawer';
 
 /**
@@ -97,6 +99,7 @@ export function sync_drawer_width (drawer) {
 export function attach_app_drawer (el_window, options = {}) {
     if ( ! el_window ) {
         console.error(`[${PHASE}] refusing to attach to a null window`);
+        telemetry.capture({ eventClass: 'contract_violation', site: 'ezil-os:ui/app-drawer#attach', code: 'null_window' });
         return null;
     }
 
@@ -165,6 +168,10 @@ export function attach_app_drawer (el_window, options = {}) {
                 // A throwing handler must not take the tray down with it —
                 // the tray is the only way out of a full-bleed window.
                 console.error(`[${PHASE}] "${spec.label}" handler threw`, err);
+                telemetry.capture({
+                    eventClass: 'window_error', site: 'ezil-os:ui/app-drawer#handler', code: 'drawer_handler_threw',
+                    detail: err,
+                });
             }
         });
         $controls.append($btn);
