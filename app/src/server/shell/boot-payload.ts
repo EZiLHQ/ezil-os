@@ -84,6 +84,20 @@ export const SHELL_API_ROUTES = {
      * comment for why the response is never meaningfully read.
      */
     telemetry: '/api/shell/telemetry',
+    /**
+     * POST = restart the desktop stack inside a computer's LIVE container
+     * (`{ computerId }`), without destroying the container, the computer row
+     * or the workspace. Third instance of the same feature-detection contract
+     * as `focus` and `telemetry`: `shell/ezil/session.js`'s `restartEndpoint()`
+     * reads `desktopState.endpoints.restart` fresh on every call and
+     * `ui/Settings/tabs/troubleshoot.js` renders a DISABLED button saying so
+     * when it is absent, rather than POSTing to a URL it invented. So this
+     * entry is the switch that turns the Troubleshoot restart control on, and
+     * it must only be present while `src/app/api/shell/restart/route.ts`
+     * exists — which in turn only works while the Worker serves
+     * `POST /sandbox/:name/restart`.
+     */
+    restart: '/api/shell/restart',
 } as const;
 
 export interface ShellBootUser {
@@ -124,7 +138,14 @@ export interface ShellBootApp {
 }
 
 export const SHELL_APPS: readonly ShellBootApp[] = [
-    { id: 'desktop', name: 'Linux Desktop', icon: 'desktop', kind: 'desktop' },
+    // MODIFIED BY EZIL 2026-08-03: renamed from 'Linux Desktop' to match
+    // `shell/ezil/apps/registry.js`'s own entry, which is what the Start menu,
+    // taskbar tooltip and app drawer actually render. `registry.resolve()`
+    // reads only `served[].id` from this list, never `.name`, so this string
+    // reaches no user today — it is corrected because it is the SERVER's
+    // declaration of what the app is called, and leaving the two names
+    // disagreeing in a public repo is how the next person picks the wrong one.
+    { id: 'desktop', name: 'Browser', icon: 'desktop', kind: 'desktop' },
 ];
 
 export interface ShellDesktopState {

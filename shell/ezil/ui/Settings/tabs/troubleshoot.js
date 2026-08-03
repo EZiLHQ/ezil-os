@@ -1,7 +1,8 @@
 // tabs/troubleshoot.js — EZiL-authored. Not Puter code.
 //
-// A way out when the desktop is stuck: restart its container without losing
-// the computer or its workspace. Per the owner's brief:
+// A way out when the desktop is stuck: restart the desktop stack inside the
+// container without losing the computer, the container, or its workspace. Per
+// the owner's brief:
 //
 //   - Reachable while the desktop is full-bleed. That is exactly the moment a
 //     user is stuck — `enter_fullpage_mode` hides the taskbar, and Settings'
@@ -15,15 +16,23 @@
 //   - Confirm before acting, and say what it does and does not destroy.
 //   - Feature-detect the restart route and degrade honestly if it is absent.
 //
-// 🔴 FEATURE-DETECTED, not assumed. As of this writing there is no restart
-// route under `app/src/app/api/shell/*` and no `restart` key in
-// `SHELL_API_ROUTES` (`app/src/server/shell/boot-payload.ts`, not owned by
-// this task — see `session.js`'s `restartEndpoint()` for the full account).
-// Until a sibling task publishes it, `render()`'s `! supported` branch draws
+// 🔴 FEATURE-DETECTED, not assumed. The chain behind this button is three
+// independently-deployed pieces: `SHELL_API_ROUTES.restart` ->
+// `app/src/app/api/shell/restart/route.ts` -> the Worker's
+// `POST /sandbox/:name/restart`. This tab checks only the FIRST link, because
+// that is the only one it can see, and `render()`'s `! supported` branch draws
 // a disabled button with the honest reason INSTEAD OF throwing or guessing a
-// URL. Once the route exists, this tab picks it up on its own — no code
-// change needed here, because the check reads the live boot payload every
-// render, not a value cached at import time.
+// URL. The check reads the live boot payload every render, not a value cached
+// at import time, so a deployment that has the key picks the control up with
+// no code change here and one that does not degrades quietly.
+//
+// 🔴 WHAT IT ACTUALLY DOES, stated where the copy is written. The Worker
+// SIGTERMs the desktop launcher inside the ALREADY-RUNNING container (reusing
+// `start-neko.sh`'s own `terminate_stack` trap) and boots the stack again in
+// place. The container is not recreated, so files written to the container's
+// own disk survive too — but nothing in this shell can verify that, so the
+// copy below promises only what the design guarantees: the workspace in
+// storage and the computer row.
 //
 // 🔴 HONESTY CONTRACT. A restart is reported "restarted" ONLY on a 2xx with
 // `data.ok === true` (`session.restartDesktop`'s own contract). Everything
@@ -70,6 +79,23 @@ function openDesktopComputerId () {
 let status = 'idle'; // 'idle' | 'restarting' | 'restarted' | 'failed'
 let failReason = '';
 
+/**
+ * Two families of code arrive here and both must read as an honest sentence.
+ *
+ *   - Transport verdicts `session.restartDesktop()` produces itself:
+ *     `unsupported` / `timeout` / `fetch_failed` / `unauthorized` /
+ *     `bad_request` / `unknown`.
+ *   - The Worker's own `RestartReport.outcome`, passed through verbatim by
+ *     `app/src/server/api/routers/cloudflare-guacamole.ts`'s `restartDesktop`
+ *     as `errorCode` (see `worker/src/sandbox-control.ts`'s
+ *     `buildRestartReport`). These are the interesting ones: `stop_timed_out`
+ *     in particular is the Worker REFUSING to boot a second stack on top of
+ *     one that would not die, which is a materially different situation for
+ *     the user than "something went wrong" and must not be flattened into it.
+ *
+ * Anything unrecognised still lands on the honest default rather than echoing
+ * a server string into the DOM.
+ */
 function reasonCopy (errorCode) {
     switch ( errorCode ) {
         case 'unsupported': return "This deployment hasn't turned on desktop restarts yet.";
@@ -77,6 +103,14 @@ function reasonCopy (errorCode) {
         case 'fetch_failed': return 'Could not reach the server. Check your connection and try again.';
         case 'unauthorized': return 'Your session expired — sign in again.';
         case 'bad_request': return 'Open a desktop first, then come back here.';
+        // ── the Worker's own outcomes ──
+        case 'stop_timed_out': return 'The desktop would not shut down, so it was left alone rather than '
+            + 'started twice. Close the desktop window and open it again; if that does not help, delete '
+            + 'the computer and make a new one.';
+        case 'boot_failed': return 'The desktop stopped, but did not come back up. Try again in a moment.';
+        case 'unsupported_mode': return 'This desktop runs on an older stack that cannot be restarted in place.';
+        case 'restart_in_progress': return 'A restart is already running. Give it a few seconds.';
+        case 'provider_not_configured': return "This deployment hasn't turned on desktop restarts yet.";
         default: return 'Something went wrong. Please try again.';
     }
 }
@@ -90,7 +124,11 @@ function render ($win) {
 
     let statusHtml = '';
     if ( status === 'restarting' ) {
-        statusHtml = '<p class="ezil-settings-muted">Restarting… this can take up to about 22 seconds.</p>';
+        // ~45s, not ~22s: the Worker waits up to 20s for the old stack to
+        // confirm it is gone (`RESTART_STOP_DEADLINE_MS`) BEFORE it starts the
+        // ~22s boot. Quoting only the boot half would make a normal restart
+        // look overdue while it is still going fine.
+        statusHtml = '<p class="ezil-settings-muted">Restarting… this can take up to about 45 seconds.</p>';
     } else if ( status === 'restarted' ) {
         statusHtml = '<p class="ezil-settings-muted">Restart requested. Give it a few seconds, then reopen the '
             + 'desktop from the taskbar or Start menu if it does not reconnect on its own.</p>';
@@ -107,8 +145,8 @@ function render ($win) {
 
     $body.html(`
         <p class="ezil-settings-lead">
-            If the desktop is frozen or not responding, restarting its container can help. This
-            stops the container and starts a fresh one for the SAME computer — your files in
+            If the desktop is frozen or not responding, restarting it can help. This shuts the
+            desktop down and starts it again inside the SAME container — your files in
             storage are not touched, and the computer itself is not deleted.
         </p>
         <button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="restart"
@@ -120,7 +158,7 @@ function render ($win) {
 async function confirmRestart () {
     const value = await UIAlert({
         message: '<strong>Restart this desktop?</strong>'
-            + '<p>Its container will stop and a fresh one will start for the same computer. Anything '
+            + '<p>The desktop will shut down and start again inside the same container. Anything '
             + 'unsaved in an open application inside it will be lost. Your workspace in storage, and the '
             + 'computer itself, are not touched.</p>',
         type: 'warning',

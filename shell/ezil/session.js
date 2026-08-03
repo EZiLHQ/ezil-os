@@ -437,15 +437,14 @@ export async function desktopRunning (computerId) {
  * newer or older payload than the one this module first saw.
  *
  * 🔴 FEATURE-DETECTED, and deliberately NOT added to the `ENDPOINTS` mirror
- * with a guessed path the way `focus` is. As of this writing there is no
- * restart route anywhere under `app/src/app/api/shell/*` and no `restart` key
- * in `SHELL_API_ROUTES` (`app/src/server/shell/boot-payload.ts`, not owned by
- * this task) — `payload().desktopState.endpoints` is the ONLY source of
- * truth for "can the server actually do this today", the same rule
+ * with a hardcoded path. `payload().desktopState.endpoints` is the ONLY source
+ * of truth for "can the server actually do this today", the same rule
  * `desktop-window.js` already applies to `endpoints.focus` (see that file's
  * `focus_endpoint` constant and its header comment). Every caller of
  * `restartDesktop` below must treat a `null` here as "no", never invent
- * `/api/shell/restart` and try it anyway.
+ * `/api/shell/restart` and try it anyway — the bundle and the server deploy
+ * separately, so a shell newer than its server is a real state, not a
+ * hypothetical one.
  *
  * @returns {string|null}
  */

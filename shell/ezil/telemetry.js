@@ -38,7 +38,10 @@
 // arm-check, the same way `desktop-window.js` gates its app-switcher on
 // `endpoints.focus` (see that file's header). At the time this file was
 // written `app/src/server/shell/boot-payload.ts` (not owned by this task)
-// had not published a `telemetry` endpoint yet — a deployment on that server
+// had not published a `telemetry` endpoint yet. It does as of 2026-08-03
+// (`telemetry: '/api/shell/telemetry'`), so on a current server build this
+// module DOES arm. An older server build is still a real state — the bundle
+// and the server deploy separately — a deployment on that server
 // build simply never arms, and every `capture()` call below is then a no-op
 // that costs one property read. Nothing here assumes the route exists, and
 // nothing here POSTs to a URL it invented.

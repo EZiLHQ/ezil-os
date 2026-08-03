@@ -685,6 +685,125 @@ export async function requestGuacamoleFocusApp(
     }
 }
 
+// ─── Desktop restart control (POST /sandbox/:name/restart) ────────────────────
+
+/**
+ * What the Worker's `handleRestart` answers with (`worker/src/index.ts`), which
+ * is `{ sandboxName, ...RestartReport }` from
+ * `worker/src/sandbox-control.ts`'s `buildRestartReport`.
+ *
+ * `ok` is true ONLY for the Worker's `restarted` / `started` outcomes. It is
+ * false for `stop_timed_out` (the old stack would not die — the Worker
+ * deliberately does NOT relaunch on top of a maybe-alive one), `boot_failed`,
+ * `unsupported_mode` (guacamole-mode containers have no SIGTERM trap to reuse),
+ * `restart_in_progress`, a non-2xx, or a transport failure. As everywhere else
+ * in this file, a resolved promise is NOT a confirmed restart — read `ok`.
+ */
+export interface GuacamoleRestartResult {
+    ok: boolean;
+    /** The Worker's own discriminator: `restarted` | `started` | `stop_timed_out`
+     * | `boot_failed` | `unsupported_mode` | `restart_in_progress`. */
+    outcome?: string;
+    /** True when a stack was actually running and got torn down by this call
+     * (as opposed to `started`, where there was nothing to stop). */
+    wasRunning?: boolean;
+    error?: string;
+}
+
+/**
+ * Restart the desktop stack inside a LIVE container, without destroying the
+ * container, the computer row, or the workspace.
+ *
+ * Same HMAC envelope as `DELETE /sandbox/:name` and `POST /sandbox/:name/focus`
+ * (`mintSandboxPreviewToken` presented as `Authorization: Bearer`) — no new
+ * auth scheme. The Worker gates this route behind the same
+ * `authorizeSignedControlRequest` and a `SANDBOX_RESTART=off` kill switch that
+ * 404s before auth is even attempted.
+ *
+ * 🔴 The timeout is 120s, an order of magnitude above `focus`'s 15s, and that
+ * is the route's real cost rather than a padded guess: the Worker's own
+ * `RESTART_STOP_DEADLINE_MS` gives the SIGTERM'd launcher up to 20s to confirm
+ * exit, and only then runs `ensureDesktop()` — the same cold boot measured at
+ * ~22s on `/sandbox/preview`. 20 + 22 is the floor, not the ceiling, so a
+ * 15s budget would abort a restart that was going to succeed and report a
+ * timeout for a desktop that then came back anyway. The calling Route Handler
+ * carries `maxDuration = 300` for the same reason (docs/PLATFORM-NOTES.md §13).
+ *
+ * NEVER THROWS.
+ */
+export async function requestGuacamoleDesktopRestart(
+    config: CloudflareGuacamoleConfig,
+    hmacSecret: string,
+    sandboxName: string,
+    correlationId: string = newCorrelationId(),
+): Promise<GuacamoleRestartResult> {
+    if (!config.isConfigured) {
+        return { ok: false, error: 'provider_not_configured' };
+    }
+
+    const token = mintSandboxPreviewToken(hmacSecret);
+    const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/restart`;
+
+    try {
+        const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                [CORRELATION_HEADER]: correlationId,
+            },
+            // No `desktopMode`: an omitted mode is what makes the Worker
+            // AUTO-DETECT whatever is actually running (`handleRestart`'s
+            // `explicitMode` stays undefined), which is the honest thing to do
+            // from here — this layer does not know, and must not assert, which
+            // stack the container booted.
+            body: JSON.stringify({}),
+            signal: AbortSignal.timeout(120_000),
+        });
+
+        // Like terminate/focus: the Worker answers a failed restart as 400/500
+        // WITH a JSON body carrying `outcome` and `error`, so parse either way
+        // or the most useful field is lost on exactly the responses where it
+        // matters most.
+        const text = await res.text().catch(() => '');
+        let data: { ok?: unknown; outcome?: unknown; wasRunning?: unknown; error?: unknown } = {};
+        try {
+            data = text ? (JSON.parse(text) as typeof data) : {};
+        } catch {
+            // Non-JSON (an edge error page). The raw text still reaches the log.
+        }
+
+        const outcome = typeof data.outcome === 'string' ? data.outcome : undefined;
+
+        if (!res.ok || data.ok !== true) {
+            console.warn('[cloudflare-guacamole] restart request rejected', {
+                sandboxName,
+                status: res.status,
+                outcome,
+                body: text.slice(0, 300),
+            });
+            return {
+                ok: false,
+                outcome,
+                wasRunning: data.wasRunning === true,
+                error:
+                    typeof data.error === 'string'
+                        ? data.error
+                        : `worker_http_${res.status}: ${text.slice(0, 300)}`,
+            };
+        }
+
+        return { ok: true, outcome, wasRunning: data.wasRunning === true };
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn('[cloudflare-guacamole] restart request failed (non-fatal):', {
+            sandboxName,
+            error: message,
+        });
+        return { ok: false, error: message };
+    }
+}
+
 /** Health-check the named sandbox. */
 export async function getGuacamoleSandboxStatus(
     config: CloudflareGuacamoleConfig,
