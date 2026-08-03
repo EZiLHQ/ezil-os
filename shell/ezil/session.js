@@ -24,6 +24,8 @@
 // back as a typed `{ ok: false, errorCode }` the boot UI already knows how to
 // render honestly (see `boot-phases.js`).
 
+import telemetry from './telemetry.js';
+
 const NS = 'ezil-os:';
 
 /**
@@ -235,6 +237,9 @@ export async function openDesktop (computerId) {
     if ( typeof data.guacamoleUrl !== 'string' || data.guacamoleUrl === '' ) {
         // Reported success with nothing to show. Loud, not silent.
         console.error('[ezil-os:session] previewUrl returned ok with no URL');
+        telemetry.capture({
+            eventClass: 'contract_violation', site: 'ezil-os:session#previewUrl', code: 'preview_url_missing',
+        });
         return { ok: false, errorCode: 'unknown' };
     }
     return {
@@ -302,6 +307,9 @@ export async function previewUrl (computerId) {
         // Reported success with nothing to show. Loud, not silent — same rule
         // as `openDesktop` above.
         console.error('[ezil-os:session] appPreviewUrl returned ok with no URL');
+        telemetry.capture({
+            eventClass: 'contract_violation', site: 'ezil-os:session#appPreviewUrl', code: 'app_preview_url_missing',
+        });
         return { ok: false, errorCode: 'unknown' };
     }
     return { ok: true, url: data.appPreviewUrl, expiresAt: data.expiresAt };
@@ -423,12 +431,78 @@ export async function desktopRunning (computerId) {
     return res.data?.ok === true ? res.data.guacamoleRunning : undefined;
 }
 
+/**
+ * Is a Worker-side "restart this desktop" route published by THIS
+ * deployment, right now? Read fresh every call — a rehydrate can bring in a
+ * newer or older payload than the one this module first saw.
+ *
+ * 🔴 FEATURE-DETECTED, and deliberately NOT added to the `ENDPOINTS` mirror
+ * with a guessed path the way `focus` is. As of this writing there is no
+ * restart route anywhere under `app/src/app/api/shell/*` and no `restart` key
+ * in `SHELL_API_ROUTES` (`app/src/server/shell/boot-payload.ts`, not owned by
+ * this task) — `payload().desktopState.endpoints` is the ONLY source of
+ * truth for "can the server actually do this today", the same rule
+ * `desktop-window.js` already applies to `endpoints.focus` (see that file's
+ * `focus_endpoint` constant and its header comment). Every caller of
+ * `restartDesktop` below must treat a `null` here as "no", never invent
+ * `/api/shell/restart` and try it anyway.
+ *
+ * @returns {string|null}
+ */
+export function restartEndpoint () {
+    const url = payload()?.desktopState?.endpoints?.restart;
+    return typeof url === 'string' && url !== '' ? url : null;
+}
+
+/**
+ * `POST <endpoints.restart>` — ask the server to restart this computer's
+ * desktop container without destroying the computer itself or its workspace.
+ * Same response-shape convention as `openDesktop`/`previewUrl`: a 200 with
+ * `{ok:true, ...}`, or `{ok:false, errorCode}` for an operational failure the
+ * server observed. Never guesses at success: a transport failure, a timeout,
+ * or the route not existing at all are all `{ok:false}`, never `{ok:true}`.
+ *
+ * @returns {Promise<{ok:true} | {ok:false, errorCode:string, message?:string}>}
+ */
+export async function restartDesktop (computerId) {
+    if ( ! computerId ) {
+        return { ok: false, errorCode: 'bad_request', message: 'No computer to restart.' };
+    }
+    const url = restartEndpoint();
+    if ( ! url ) {
+        // Not published by this deployment — say so WITHOUT making a request.
+        // See `restartEndpoint()`'s header for why this never invents a URL.
+        return {
+            ok: false,
+            errorCode: 'unsupported',
+            message: "Restarting isn't available in this deployment yet.",
+        };
+    }
+    const res = await request(url, {
+        method: 'POST',
+        body: { computerId },
+        timeoutMs: DESKTOP_BOOT_TIMEOUT_MS,
+    });
+    if ( ! res.ok ) {
+        if ( res.code === 'TIMEOUT' ) return { ok: false, errorCode: 'timeout', message: res.message };
+        if ( res.code === 'NETWORK' ) return { ok: false, errorCode: 'fetch_failed', message: res.message };
+        if ( res.code === 'UNAUTHORIZED' ) return { ok: false, errorCode: 'unauthorized', message: res.message };
+        return { ok: false, errorCode: 'unknown', message: res.message };
+    }
+    const data = res.data ?? {};
+    if ( data.ok !== true ) {
+        return { ok: false, errorCode: data.errorCode ?? 'unknown', message: data.message };
+    }
+    return { ok: true };
+}
+
 export default {
     get, set, del,
     payload,
     readSession, openSession,
     openDesktop, desktopRunning, confirmFrame, confirmDisplay,
     previewUrl, focusApp,
+    restartEndpoint, restartDesktop,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
 };

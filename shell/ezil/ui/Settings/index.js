@@ -53,14 +53,23 @@
 // See that file's header for why it is a standalone node script rather than a
 // vitest case under `app/src` (a path this task does not own).
 import UIWindow from '../../../src/UI/UIWindow.js';
+import telemetry from '../../telemetry.js';
 import TabComputers from './tabs/computers.js';
 import TabAppearance from './tabs/appearance.js';
 import TabAbout from './tabs/about.js';
+import TabTroubleshoot from './tabs/troubleshoot.js';
 
 const PHASE = 'ezil-os:settings';
 
-/** Hard-coded, not discovered — see the header for why. Order is display order. */
-const TABS = [TabComputers, TabAppearance, TabAbout];
+/**
+ * Hard-coded, not discovered — see the header for why. Order is display
+ * order. `troubleshoot` is last — MODIFIED BY EZIL 2026-08-03: a way to
+ * restart a stuck desktop's container without losing the workspace, reachable
+ * from the same two paths Settings itself is (the pinned taskbar icon, and
+ * the control-drawer button `drawer-action.js` injects into a full-bleed
+ * window) — see `tabs/troubleshoot.js`'s header.
+ */
+const TABS = [TabComputers, TabAppearance, TabAbout, TabTroubleshoot];
 
 function sidebarItemHtml (tab, isActive) {
     return `
@@ -118,6 +127,9 @@ export async function openSettingsWindow (ctx = {}) {
 
     if ( ! el_window ) {
         console.error(`[${PHASE}] UIWindow returned nothing`);
+        telemetry.capture({
+            eventClass: 'window_error', site: 'ezil-os:settings#open', code: 'uiwindow_returned_nothing',
+        });
         return null;
     }
 
@@ -141,6 +153,14 @@ export async function openSettingsWindow (ctx = {}) {
             tab?.onActivate?.($win, ctx);
         } catch ( err ) {
             console.error(`[${PHASE}] tab "${id}" failed to activate`, err);
+            // `id` is a Settings TAB id (computers/appearance/about/…), not a
+            // member of the app registry's enum — `attrs.app_id` is reserved
+            // for that (see `registry.js`), so the tab id rides in `detail`
+            // instead, where it needs no schema membership to survive.
+            telemetry.capture({
+                eventClass: 'window_error', site: 'ezil-os:settings#activate', code: 'tab_activate_threw',
+                detail: `${String(id)}: ${err?.message ?? err}`,
+            });
         }
     });
 
@@ -151,6 +171,10 @@ export async function openSettingsWindow (ctx = {}) {
             // One broken tab must not take the whole Settings window down —
             // the other two (one of which is the AGPL notice) still matter.
             console.error(`[${PHASE}] tab "${tab.id}" failed to initialise`, err);
+            telemetry.capture({
+                eventClass: 'window_error', site: 'ezil-os:settings#init', code: 'tab_init_threw',
+                detail: `${String(tab.id)}: ${err?.message ?? err}`,
+            });
         }
     }
 
