@@ -256,6 +256,76 @@ export async function spikeDetection(db: QueryDb): Promise<SpikeRow[]> {
     return rowsOf<SpikeRow>(result);
 }
 
+// ── recentTraces / traceTimeline — "what happened during THIS app-open" ─────
+// The W1 observability plan's whole point: every producer (shell's
+// `registry.js#launch()`, and now the worker/container events the
+// `/telemetry/drain` cron finally lands — see `spool-drain.ts`) shares a
+// `correlationId`, and exactly ONE `boot_summary` row exists per app-open /
+// per preview-boot request. `recentTraces` lists those rows (one per row,
+// most recent first); `traceTimeline` pulls every event sharing one
+// `correlationId`, in chronological order, so a single click on a row in the
+// admin page answers "what happened, in what order, before this one ended".
+
+export interface RecentTraceRow {
+    correlationId: string;
+    source: string;
+    site: string;
+    code: string;
+    outcome: string;
+    durationMs: number | null;
+    occurredAt: string;
+}
+
+/** Recent app-opens / preview boots — one row per `boot_summary`, newest
+ * first. `correlationId IS NOT NULL` excludes the (should-not-happen, but
+ * never trusted) case of a `boot_summary` that somehow lost its trace. */
+export async function recentTraces(db: QueryDb, opts: { limit?: number } = {}): Promise<RecentTraceRow[]> {
+    const limit = Math.min(opts.limit ?? 50, 200);
+    const result = await db.execute(sql`
+        SELECT correlation_id AS "correlationId",
+               source, site, code, outcome,
+               duration_ms       AS "durationMs",
+               occurred_at       AS "occurredAt"
+        FROM   ezil_error_events
+        WHERE  event_class = 'boot_summary'
+          AND  correlation_id IS NOT NULL
+        ORDER  BY received_at DESC
+        LIMIT  ${limit}
+    `);
+    return rowsOf<RecentTraceRow>(result);
+}
+
+export interface TraceTimelineRow {
+    eventClass: string;
+    source: string;
+    site: string;
+    code: string;
+    outcome: string;
+    durationMs: number | null;
+    occurredAt: string;
+    detail: string | null;
+}
+
+/** Every event sharing one `correlationId`, oldest first — the drill-down
+ * behind `recentTraces`' rows. Capped at 200: a trace is one app-open or one
+ * preview-boot request, never a page's whole lifetime, so this is a ceiling
+ * that should never actually bind in practice, kept only as defence in depth
+ * against a future producer bug that reuses one id across many events. */
+export async function traceTimeline(db: QueryDb, correlationId: string): Promise<TraceTimelineRow[]> {
+    const result = await db.execute(sql`
+        SELECT event_class AS "eventClass",
+               source, site, code, outcome,
+               duration_ms       AS "durationMs",
+               occurred_at       AS "occurredAt",
+               detail
+        FROM   ezil_error_events
+        WHERE  correlation_id = ${correlationId}
+        ORDER  BY occurred_at ASC
+        LIMIT  200
+    `);
+    return rowsOf<TraceTimelineRow>(result);
+}
+
 // ── Q4 — which boot phase fails most ─────────────────────────────────────────
 // `site` here is one of the 11 phase names already emitted by
 // `worker/scripts/start-neko.sh`, so this answers "where does boot die" in
