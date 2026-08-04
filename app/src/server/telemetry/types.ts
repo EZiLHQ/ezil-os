@@ -86,6 +86,26 @@ export interface TelemetryBatch {
     events: TelemetryEventInput[];
 }
 
+/**
+ * The `userHash` a drained worker/container event is stored under.
+ * `ezil_error_events.userHash` is `NOT NULL` and a worker/container event has
+ * no user at all — there is no session, no cookie, nothing to hash. This is
+ * the ONE reserved value in that column that is not a real
+ * `safeUserHash()` output (a real hash is 8 hex digits derived from a FNV-1a
+ * fold; this is deliberately all zeros, unattainable by that function for any
+ * input), so it can never collide with an actual user.
+ *
+ * 🔴 MUST be excluded from every "distinct users" count that a worker/container
+ * fingerprint could otherwise inflate to a false "1 distinct user" —
+ * `queries.ts`'s `fingerprintLeaderboard` and `fingerprintLeaderboardFromRollup`
+ * both do this via a `FILTER (WHERE user_hash <> ...)` on the `count(DISTINCT
+ * ...)` aggregate, not a `WHERE` clause, so a worker-only fingerprint still
+ * shows up in the leaderboard (with its real event count) instead of vanishing
+ * from it entirely. See `app/src/server/telemetry/spool-drain.ts`'s doc
+ * comment for where this is actually inserted.
+ */
+export const WORKER_SENTINEL_USER_HASH = 'u_00000000';
+
 /** Server-side limits enforced at every layer that can enforce them
  * (zod schema, route handler, `ingestBatch`). Kept in one place so the
  * numbers cited in comments elsewhere cannot drift from what actually runs. */
