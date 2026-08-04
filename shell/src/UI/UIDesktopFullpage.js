@@ -114,10 +114,27 @@ window.remove_taskbar_item = function (item) {
     });
 };
 
+// MODIFIED BY EZIL 2026-08-04 (W2 item 4): stash the window's geometry from
+// the moment BEFORE it goes full-page, on the element itself (`dataset`
+// survives detach/reattach and needs no separate registry to leak). Guarded
+// so a SECOND `enter_fullpage_mode` on the same element (minimise -> restore
+// -> full-bleed again) does not overwrite the one true "pre-fullpage" value
+// with the fullpage geometry this function is about to apply.
+// `reset_window_size_and_position` below reads it back and falls back to the
+// historical 680x380 box only when nothing was ever stashed (e.g. a window
+// that somehow reaches exit without ever having entered).
 window.enter_fullpage_mode = (el_window) => {
     $('.taskbar').hide();
     $(el_window).find('.window-head').hide();
     $('body').addClass('fullpage-mode');
+    if ( el_window && el_window.dataset.ezilPrevFpWidth === undefined ) {
+        const $el = $(el_window);
+        el_window.dataset.ezilPrevFpWidth = $el.css('width');
+        el_window.dataset.ezilPrevFpHeight = $el.css('height');
+        el_window.dataset.ezilPrevFpTop = $el.css('top');
+        el_window.dataset.ezilPrevFpLeft = $el.css('left');
+        el_window.dataset.ezilPrevFpBorderRadius = $el.css('border-radius');
+    }
     $(el_window).css({
         width: '100%',
         height: '100%',
@@ -127,7 +144,17 @@ window.enter_fullpage_mode = (el_window) => {
     });
 };
 
-window.exit_fullpage_mode = (el_window) => {
+// MODIFIED BY EZIL 2026-08-04 (W2 item 4): split out of `exit_fullpage_mode`
+// below. This half is pure CHROME — taskbar, window head, the body class,
+// the desktop's own height — and never touches the window's own geometry.
+// Minimise (`_ezil_minimise` / `minimise_to_taskbar`, `shell/ezil/apps/`)
+// should call THIS, not `exit_fullpage_mode`, so a window being minimised
+// keeps its full-page size the whole time it is hidden: there is then
+// nothing for `showWindow`'s restore to flash BEFORE `go_fullbleed`
+// reapplies full-bleed, because the geometry never left full-bleed in the
+// first place. `exit_fullpage_mode` (unchanged call sites: window close)
+// still does chrome + geometry together.
+window.exit_fullpage_chrome = (el_window) => {
     $('body').removeClass('fullpage-mode');
     window.taskbar_height = window.default_taskbar_height;
     // In fullpage mode the taskbar is never built, so create it on exit; otherwise just restore it.
@@ -141,7 +168,6 @@ window.exit_fullpage_mode = (el_window) => {
     // desktop's filesystem icons. There is no filesystem. See header.
     $(el_window).removeAttr('data-is_fullpage');
     if ( el_window ) {
-        window.reset_window_size_and_position(el_window);
         $(el_window).find('.window-head').show();
     }
 
@@ -152,19 +178,43 @@ window.exit_fullpage_mode = (el_window) => {
     // wallpaper lived in puter.kv. See header.
 };
 
+window.exit_fullpage_mode = (el_window) => {
+    window.exit_fullpage_chrome(el_window);
+    // MODIFIED BY EZIL 2026-08-04 (W2 item 2): skip the geometry reset for a
+    // window mid-close (`data-closing` is stamped synchronously, before any
+    // `await`, by `$.fn.close` in UIWindow.js) — resetting geometry on a
+    // window already animating out would jump it to a floating box first,
+    // which is exactly the flash this change exists to avoid on the OTHER
+    // path (minimise). A window that isn't closing still gets its geometry
+    // restored here, same as before this change.
+    if ( el_window && $(el_window).attr('data-closing') !== '1' ) {
+        window.reset_window_size_and_position(el_window);
+    }
+};
+
 window.reset_window_size_and_position = (el_window) => {
+    const ds = el_window && el_window.dataset;
+    const has_stash = !! (ds && ds.ezilPrevFpWidth !== undefined);
     $(el_window).css({
-        width: 680,
-        height: 380,
-        'border-radius': window.window_border_radius,
-        top: 'calc(50% - 190px)',
-        left: 'calc(50% - 340px)',
+        width: has_stash ? ds.ezilPrevFpWidth : 680,
+        height: has_stash ? ds.ezilPrevFpHeight : 380,
+        'border-radius': has_stash ? ds.ezilPrevFpBorderRadius : window.window_border_radius,
+        top: has_stash ? ds.ezilPrevFpTop : 'calc(50% - 190px)',
+        left: has_stash ? ds.ezilPrevFpLeft : 'calc(50% - 340px)',
     });
+    if ( has_stash ) {
+        delete ds.ezilPrevFpWidth;
+        delete ds.ezilPrevFpHeight;
+        delete ds.ezilPrevFpTop;
+        delete ds.ezilPrevFpLeft;
+        delete ds.ezilPrevFpBorderRadius;
+    }
 };
 
 export default {
     remove_taskbar_item: window.remove_taskbar_item,
     enter_fullpage_mode: window.enter_fullpage_mode,
+    exit_fullpage_chrome: window.exit_fullpage_chrome,
     exit_fullpage_mode: window.exit_fullpage_mode,
     reset_window_size_and_position: window.reset_window_size_and_position,
 };
