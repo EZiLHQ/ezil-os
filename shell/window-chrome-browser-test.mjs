@@ -181,10 +181,27 @@ await page.waitForSelector('.taskbar-item', { timeout: 5000 });
 await sleep(200);
 
 // ── get the two real windows this file needs ────────────────────────────
-// "desktop" auto-opens at boot (PAYLOAD.apps[0]) and stays windowed because
-// the stub above fails its confirm POST. "settings" is `pinned: true` in
-// the registry regardless of PAYLOAD.apps, same technique
-// `context-menu-stack-browser-test.mjs` uses for its second window.
+// 🔴 MODIFIED BY EZIL 2026-08-04 (integration of W2 with W3): "desktop" USED
+// TO auto-open at boot from `PAYLOAD.apps[0]`, and this setup inherited it
+// for free. W3 ("login opens nothing" — see `boot.js`'s header) removed that
+// auto-launch, so the window must now be earned with the same explicit dock
+// click a real user makes. This is the identical one-click fix W3 applied to
+// `context-menu-stack-browser-test.mjs`, `display-notice-browser-test.mjs`,
+// `overlay-paint-browser-test.mjs` and `stacking-browser-test.mjs`; this file
+// only missed it because it did not exist on the W3 branch. It still stays
+// windowed (not full-bleed) because the stub above fails its confirm POST.
+// "settings" is `pinned: true` in the registry regardless of PAYLOAD.apps,
+// same technique `context-menu-stack-browser-test.mjs` uses for its second
+// window.
+const desktopItemRect = await page.evaluate(() => {
+    const el = document.querySelector('.taskbar-item[data-app="desktop"]');
+    const r = el?.getBoundingClientRect();
+    return r ? { cx: r.left + r.width / 2, cy: r.top + r.height / 2 } : null;
+});
+push('setup: desktop taskbar item exists', !! desktopItemRect);
+await page.mouse.click(desktopItemRect.cx, desktopItemRect.cy);
+await page.waitForSelector('.window[data-app="desktop"]', { timeout: 5000 });
+
 const settingsItemRect = await page.evaluate(() => {
     const el = document.querySelector('.taskbar-item[data-app="settings"]');
     const r = el?.getBoundingClientRect();
