@@ -838,6 +838,16 @@ async function boot_to_display_gate (answer) {
     push('it kept asking the whole way rather than giving up',
         seen.filter(r => r.url.includes('confirm=display')).length >= 10,
         `${seen.filter(r => r.url.includes('confirm=display')).length} asks`);
+    // 🔴 FEATURE-DETECTION, proven for real over real elapsed time. This
+    // window has been open past `CONNECTS_AT_MS` (25s) plus everything
+    // `boot_to_display_gate` and the wait above spent getting here — comfortably
+    // past a genuinely idle tab's normal poll cadence, on the shared `PAYLOAD`
+    // (declared at the top of this file), which carries no `endpoints.activity`.
+    // See Scenario 17/18 for the direct proof of the heartbeat's own wiring;
+    // this is the "and nothing about a real, long-lived boot accidentally
+    // sends one anyway" side of that same guarantee.
+    push('🔴 no /api/shell/activity request ever went out — this deployment does not publish the endpoint',
+        seen.every(r => r.url !== '/api/shell/activity'));
     await window.$(win).close();
 }
 
@@ -970,6 +980,419 @@ async function boot_to_display_gate (answer) {
     push('the display gate stopped asking once the frame was refuted',
         seen.filter(r => r.url.includes('confirm=display')).length === asks_at_failure,
         `${asks_at_failure} -> ${seen.filter(r => r.url.includes('confirm=display')).length}`);
+    await window.$(win).close();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 12 — WARM ON INTENT, NOT ON LOGIN (container-billing fix)
+//
+// `boot.js` used to call `warm(ctx.computer.id)` unconditionally the instant
+// the desktop painted — on EVERY login, whether or not the user ever opened
+// Browser. MEASURED in production: a container idle-resident for 26 hours on
+// a 30-minute sleep timer, because nothing distinguished "someone warmed this
+// because they are about to click" from "someone merely landed on /os".
+// `warm()` now fires only on INTENT — a pointerdown/pointerenter on the
+// Browser dock icon — and this scenario proves both halves of that sentence.
+//
+// 🔴 Both directions matter, same as every other guard in this file: revert
+// `boot.js`'s removal of the login-time `warm()` call and the FIRST assertion
+// below goes red (a POST would already be in `seen` before any interaction).
+// Revert `bind_warm_intent`'s wiring onto the dock icon instead and the LATER
+// assertions go red (hovering/pressing the dock icon would never warm
+// anything, so Browser would pay its full ~22s cold boot on the actual click
+// instead of having a head start).
+// ───────────────────────────────────────────────────────────────────────────
+{
+    const { window, seen } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            return {
+                ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko',
+                frame: { confirmed: true },
+            };
+        }
+        if (url.includes('confirm=frame')) return { ok: true, confirmed: true };
+        if (url.includes('confirm=display')) return { ok: true, display: 'live' };
+        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
+        return { ok: true };
+    });
+
+    const dock = await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    push('dock icon painted', !!dock);
+
+    // Give any (wrongly reinstated) login-time warm a fair chance to fire.
+    await sleep(300);
+    push('🔴 LOGIN FIRES ZERO REQUESTS — no warm just from painting the dock',
+        seen.filter((r) => r.method === 'POST').length === 0,
+        JSON.stringify(seen.map((r) => `${r.method} ${r.url}`)));
+
+    // Intent signal #1: the cursor arriving over the dock icon.
+    dock.dispatchEvent(new window.Event('pointerenter'));
+    const warmed = await until(() => seen.some((r) => r.method === 'POST' && r.url === '/api/shell/desktop'));
+    push('🔴 WARM ON INTENT — a pointerenter on the dock icon fires the warm request', !!warmed,
+        JSON.stringify(seen.map((r) => `${r.method} ${r.url}`)));
+    push('warming does not open a window — nothing is drawn for a mere hover',
+        $$(window, '.window').length === 0);
+
+    // The actual click reuses the SAME warm (single-flight) — no second mint.
+    open_desktop(window);
+    const win = await until(() => $1(window, '.window[data-app="desktop"]'));
+    push('the real open still works after an intent-only warm', !!win);
+    await sleep(200);
+    push('🔴 single-flight held: hover-then-click cost exactly ONE mint, not two',
+        seen.filter((r) => r.method === 'POST' && r.url === '/api/shell/desktop').length === 1,
+        `${seen.filter((r) => r.method === 'POST' && r.url === '/api/shell/desktop').length} POSTs`);
+    await window.$(win).close();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 13 — WARM ON INTENT from the Start menu, and pointerdown ALONE
+// (no hover first — the keyboard/switch-user path) also warms. Also proves
+// the gate: an unconfigured deployment gets NO warm from either surface, no
+// matter how much intent the user shows.
+// ───────────────────────────────────────────────────────────────────────────
+{
+    const { window, seen } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            return { ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko', frame: { confirmed: true } };
+        }
+        return { ok: true, guacamoleRunning: false };
+    });
+
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    await sleep(200);
+    push('no warm from painting alone (Start-menu scenario)',
+        seen.filter((r) => r.method === 'POST').length === 0);
+
+    // Open the Start menu exactly the way a real click does.
+    window.dispatchEvent(new window.CustomEvent('ezil:start-click', { detail: {} }));
+    const items = await until(() => {
+        const list = [...$$(window, '.context-menu-item')];
+        return list.length > 0 ? list : null;
+    });
+    push('Start menu opened with at least one item', !!items && items.length > 0);
+    const browser_item = items?.find((el) => el.textContent.includes('Browser'));
+    push('the Browser entry is in the menu', !!browser_item,
+        items?.map((el) => el.textContent).join(' | '));
+
+    // Intent signal #2: pointerdown ALONE, no pointerenter first — the
+    // keyboard/switch-user path `bind_warm_intent`'s own doc comment calls
+    // out. If only `pointerenter` were bound, this would never fire.
+    browser_item.dispatchEvent(new window.Event('pointerdown'));
+    const warmed = await until(() => seen.some((r) => r.method === 'POST' && r.url === '/api/shell/desktop'));
+    push('🔴 pointerdown alone (no prior hover) on the Start-menu entry also warms', !!warmed,
+        JSON.stringify(seen.map((r) => `${r.method} ${r.url}`)));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 14 — an UNCONFIGURED deployment: intent signals must not warm a
+// container nobody can open, even though the dock icon and Start-menu entry
+// still exist and still fire pointer events. Same gate `maybe_warm_desktop`
+// applies as the old login-time call did (`desktopState.configured === true`).
+// ───────────────────────────────────────────────────────────────────────────
+{
+    let requests = 0;
+    const { window } = boot_shell(async () => { requests++; return { ok: true }; }, {
+        ...PAYLOAD,
+        desktopState: { ...PAYLOAD.desktopState, configured: false },
+    });
+
+    const dock = await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    dock.dispatchEvent(new window.Event('pointerenter'));
+    dock.dispatchEvent(new window.Event('pointerdown'));
+    await sleep(300);
+    push('🔴 an unconfigured deployment never warms, however much intent is shown',
+        requests === 0, `${requests} requests`);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 15 — VISIBILITY-AWARE POLLING (container-billing fix): a
+// backgrounded tab must stop generating the status poll (`POLL_MS`, 2s) and
+// the display gate's periodic re-ask (`DISPLAY_POLL_MS`, 1s), and resume both
+// the instant the tab is foregrounded again. Neither this file's fix nor this
+// test touches `computeBootUiState`/`applyDisplayEvidence` or any of the
+// display gate's DEADLINES — see the header on `visibilityGatedInterval` and
+// `schedule_next_ask` in `apps/desktop-window.js` for why those are untouched
+// by construction; the assertions below only ever check WHETHER a poll fired,
+// never the verdict it would have produced.
+//
+// 🔴 Both directions: comment out either pause (the status poll's
+// `visibilityGatedInterval` or the display gate's `schedule_next_ask`) and the
+// "stops while hidden" assertion for that poll goes red — new requests keep
+// landing in `seen` on schedule regardless of `document.visibilityState`.
+// Comment out either RESUME path instead and the "resumes when visible" half
+// goes red — the boot would sit frozen forever once backgrounded once.
+// ───────────────────────────────────────────────────────────────────────────
+{
+    const { window, seen } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            // Held open so the status poll has a long window to prove itself
+            // in, same pattern as Scenario 1's `preview_gate`.
+            return new Promise(() => {}); // never resolves within this scenario's lifetime
+        }
+        if (url.includes('confirm=display')) return { ok: true, display: 'unknown' };
+        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: false };
+        return { ok: true };
+    });
+
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    open_desktop(window);
+    await until(() => $1(window, '.window[data-app="desktop"]'));
+
+    // Let the status poll (POLL_MS=2s) fire a few times while visible.
+    await sleep(4_500);
+    const polls_visible = seen.filter((r) => r.method === 'GET' && r.url.includes('computerId=computer-1')).length;
+    push('status poll ticks normally while visible', polls_visible >= 1, `${polls_visible} polls`);
+
+    // Background the tab.
+    Object.defineProperty(window.document, 'visibilityState', { value: 'hidden', configurable: true });
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+
+    // A poll that was ALREADY in flight the instant visibility changed is not
+    // a pause violation — nothing can un-send a request already dispatched.
+    // Let any such straggler settle before taking the "at hide" baseline, so
+    // this measures whether a NEW poll gets SCHEDULED while hidden, which is
+    // the thing `visibilityGatedInterval` actually controls.
+    await sleep(150);
+    const polls_at_hide = seen.filter((r) => r.method === 'GET' && r.url.includes('computerId=computer-1')).length;
+    await sleep(4_500); // more than two POLL_MS cycles
+    const polls_while_hidden = seen.filter((r) => r.method === 'GET' && r.url.includes('computerId=computer-1')).length;
+    push('🔴 the status poll STOPS while the tab is hidden — zero new polls',
+        polls_while_hidden === polls_at_hide,
+        `${polls_at_hide} -> ${polls_while_hidden}`);
+
+    // Foreground it again.
+    Object.defineProperty(window.document, 'visibilityState', { value: 'visible', configurable: true });
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+
+    const resumed = await until(
+        () => seen.filter((r) => r.method === 'GET' && r.url.includes('computerId=computer-1')).length > polls_while_hidden,
+        4_000,
+    );
+    push('🔴 the status poll RESUMES the moment the tab is visible again', !!resumed,
+        `${polls_while_hidden} -> ${seen.filter((r) => r.method === 'GET' && r.url.includes('computerId=computer-1')).length}`);
+
+    const win = $1(window, '.window[data-app="desktop"]');
+    await window.$(win).close();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 16 — the same visibility pause/resume, for the DISPLAY GATE's
+// periodic re-ask (`confirm=display`), reached past the frame check exactly
+// as `boot_to_display_gate` reaches it for Scenarios 6-11 above.
+// ───────────────────────────────────────────────────────────────────────────
+{
+    const { window, seen } = await boot_to_display_gate('unknown');
+    const win = $1(window, '.window[data-app="desktop"]');
+
+    const asks_visible_before = seen.filter((r) => r.url.includes('confirm=display')).length;
+    await sleep(3_000); // a few DISPLAY_POLL_MS (1s) cycles while visible
+    const asks_visible_after = seen.filter((r) => r.url.includes('confirm=display')).length;
+    push('display gate keeps asking normally while visible',
+        asks_visible_after > asks_visible_before,
+        `${asks_visible_before} -> ${asks_visible_after}`);
+
+    Object.defineProperty(window.document, 'visibilityState', { value: 'hidden', configurable: true });
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+
+    // Same straggler allowance as the status-poll scenario above: an ask
+    // already in flight the instant visibility changed is not a pause
+    // violation. `DISPLAY_POLL_MS` is 1s, so a short settle is enough.
+    await sleep(150);
+    const asks_at_hide = seen.filter((r) => r.url.includes('confirm=display')).length;
+    await sleep(3_500); // several DISPLAY_POLL_MS cycles' worth, while hidden
+    const asks_while_hidden = seen.filter((r) => r.url.includes('confirm=display')).length;
+    push('🔴 the display gate STOPS re-asking while the tab is hidden',
+        asks_while_hidden === asks_at_hide, `${asks_at_hide} -> ${asks_while_hidden}`);
+
+    Object.defineProperty(window.document, 'visibilityState', { value: 'visible', configurable: true });
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+
+    const resumed = await until(
+        () => seen.filter((r) => r.url.includes('confirm=display')).length > asks_while_hidden, 4_000);
+    push('🔴 the display gate RESUMES asking the moment the tab is visible again', !!resumed,
+        `${asks_while_hidden} -> ${seen.filter((r) => r.url.includes('confirm=display')).length}`);
+
+    // 🔴 THE DEADLINE ITSELF IS UNCHANGED. The gate has now spent real wall
+    // clock time both hidden and visible; `DISPLAY_UNVERIFIED_DEADLINE_MS`
+    // (6s) was never paused by the visibility toggle above, so by now — well
+    // past 6s of real elapsed time since `boot_to_display_gate` navigated —
+    // the gate must already have revealed the desktop UNVERIFIED, exactly as
+    // Scenario 7 proves in isolation. If pausing the PERIODIC re-ask had
+    // accidentally paused this deadline too, the desktop would still be
+    // hidden here.
+    push('🔴 the UNVERIFIED deadline itself kept running the whole time — untouched by the pause',
+        win.classList.contains('ezil-fullbleed')
+        && $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'ready_unverified',
+        `fullbleed=${win.classList.contains('ezil-fullbleed')} kind=${$1(window, '.ezil-boot')?.getAttribute('data-kind')}`);
+
+    await window.$(win).close();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 17 — ACTIVITY HEARTBEAT (container-billing fix)
+//
+// `session.reportActivity` is feature-detected off `desktopState.endpoints.
+// activity`, and the eligibility RULE (visible + real input within 30
+// minutes) is proven exhaustively — and instantly — in
+// `activity-heartbeat-test.mjs`; see that file's own header for why a
+// 30-minute deadline cannot honestly be waited out in a browser test. What
+// THIS scenario proves is the WIRING in `desktop-window.js`: that opening the
+// desktop window really does register `setInterval(heartbeat_tick,
+// HEARTBEAT_INTERVAL_MS)`, that the tick really does call
+// `session.reportActivity` with the real computer id, and that hiding the
+// tab really does refuse a heartbeat rather than merely skip a no-op.
+//
+// `capture_setInterval` grabs the REAL callback the production code
+// registers, filtered by the exact 60000ms period so it can never collide
+// with `TICK_MS`/`POLL_MS`/`DISPLAY_POLL_MS` (250/2000/1000 — three different
+// numbers). Invoking that SAME function reference directly lets the 30-minute
+// idle case be proven against a mocked `performance.now()`, instead of by
+// waiting 30 real minutes for the real interval to notice — precisely the
+// same reasoning `activity-heartbeat-test.mjs` gives for splitting the
+// eligibility rule into its own pure module in the first place.
+//
+// 🔴 Both directions, per guard: comment out `document.addEventListener(
+// 'pointerdown'|'pointermove'|'keydown', note_input, ...)` in
+// `desktop-window.js` and the "fresh input lifts the idle-stop" assertion
+// goes red (the keydown below would no longer reset `last_input_at`).
+// Comment out the `shouldHeartbeat` call in `heartbeat_tick` (replace with
+// `true`) and the hidden/idle assertions both go red — every `tick()` call
+// below would post, regardless of visibility or staleness.
+// ───────────────────────────────────────────────────────────────────────────
+function capture_setInterval (window, ms_filter) {
+    const fns = [];
+    const real = window.setInterval.bind(window);
+    window.setInterval = (fn, ms, ...rest) => {
+        if (ms === ms_filter) fns.push(fn);
+        return real(fn, ms, ...rest);
+    };
+    return fns;
+}
+
+const HEARTBEAT_MS = 60_000; // must match shell/ezil/activity-heartbeat.js's HEARTBEAT_INTERVAL_MS
+
+{
+    const ACTIVITY_PAYLOAD = {
+        ...PAYLOAD,
+        desktopState: {
+            ...PAYLOAD.desktopState,
+            endpoints: { ...PAYLOAD.desktopState.endpoints, activity: '/api/shell/activity' },
+        },
+    };
+    const activity_bodies = [];
+    const { window, seen } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            return { ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko', frame: { confirmed: true } };
+        }
+        if (url.includes('confirm=frame')) return { ok: true, confirmed: true };
+        if (url.includes('confirm=display')) return { ok: true, display: 'live' };
+        if (url === '/api/shell/activity') {
+            activity_bodies.push(JSON.parse(init.body));
+            return { ok: true };
+        }
+        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
+        return { ok: true };
+    }, ACTIVITY_PAYLOAD);
+
+    const heartbeat_fns = capture_setInterval(window, HEARTBEAT_MS);
+
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    open_desktop(window);
+    await until(() => $1(window, '.window[data-app="desktop"]'));
+    // Let the synchronous remainder of `openDesktopWindow` finish registering
+    // the interval before this test reaches for it.
+    await until(() => heartbeat_fns.length > 0);
+
+    push('the heartbeat interval registers at HEARTBEAT_INTERVAL_MS (60s), and only once',
+        heartbeat_fns.length === 1, `${heartbeat_fns.length} interval(s) at ${HEARTBEAT_MS}ms`);
+    const tick = heartbeat_fns[0];
+
+    // ── visible + fresh input (the window just opened) -> fires ────────────
+    tick();
+    await until(() => activity_bodies.length >= 1);
+    push('🔴 visible + fresh input -> the heartbeat calls /api/shell/activity', activity_bodies.length === 1,
+        `${activity_bodies.length} calls`);
+    push('the heartbeat body carries the real computerId and a small lastInputAgoMs',
+        activity_bodies[0]?.computerId === 'computer-1'
+        && typeof activity_bodies[0]?.lastInputAgoMs === 'number'
+        && activity_bodies[0].lastInputAgoMs >= 0 && activity_bodies[0].lastInputAgoMs < 5_000,
+        JSON.stringify(activity_bodies[0]));
+
+    // ── 🔴 HIDDEN -> the tick itself refuses, even called directly ─────────
+    Object.defineProperty(window.document, 'visibilityState', { value: 'hidden', configurable: true });
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    tick();
+    await sleep(150);
+    push('🔴 a hidden tab does not heartbeat, even on an explicit tick', activity_bodies.length === 1,
+        `${activity_bodies.length} calls`);
+
+    // Back to visible, still fresh (no real time has passed).
+    Object.defineProperty(window.document, 'visibilityState', { value: 'visible', configurable: true });
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    tick();
+    await until(() => activity_bodies.length >= 2);
+    push('visible again -> the heartbeat resumes', activity_bodies.length === 2, `${activity_bodies.length} calls`);
+
+    // ── 🔴 THE 30-MINUTE IDLE GUARD, proven on the REAL wiring ──────────────
+    // Mock the clock 31 minutes forward, without waiting 31 real minutes —
+    // `heartbeat_tick` reads `performance.now()` fresh on every call, so this
+    // is a live, load-bearing override of the exact function the code calls,
+    // not a fixture the code path never actually reaches.
+    const real_now = window.performance.now();
+    window.performance.now = () => real_now + 31 * 60_000;
+    tick();
+    await sleep(150);
+    push('🔴 visible, but input is 31 (mocked) minutes stale -> NO heartbeat', activity_bodies.length === 2,
+        `${activity_bodies.length} calls`);
+
+    // Real input arrives — a keydown the parent document actually observes
+    // (see this file's header on why document-level input is the honest
+    // signal a cross-origin iframe leaves reachable).
+    window.document.dispatchEvent(new window.Event('keydown'));
+    tick();
+    await until(() => activity_bodies.length >= 3);
+    push('🔴 fresh input lifts the idle-stop — the very next tick heartbeats again',
+        activity_bodies.length === 3, `${activity_bodies.length} calls`);
+    push('...and the freshly-reported lastInputAgoMs is small again, not 31 minutes',
+        activity_bodies[2]?.lastInputAgoMs < 5_000, JSON.stringify(activity_bodies[2]));
+
+    const win = $1(window, '.window[data-app="desktop"]');
+    await window.$(win).close();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 18 — FEATURE-DETECTION: a server that has never published
+// `endpoints.activity` gets NO heartbeat request at all, not a 404. The
+// shared `PAYLOAD` every other scenario in this file boots with already
+// lacks this key (see its declaration at the top), which is also why NONE of
+// those other scenarios — including ones with a window open for 55+ real
+// seconds (Scenario 6, 8) — ever produce an `/api/shell/activity` request;
+// this scenario ties that "degrades silently" property to a real, direct
+// tick rather than to "nothing happened to show up".
+// ───────────────────────────────────────────────────────────────────────────
+{
+    const { window, seen } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            return { ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko', frame: { confirmed: true } };
+        }
+        return { ok: true, guacamoleRunning: false };
+    }); // default PAYLOAD — no endpoints.activity
+
+    const heartbeat_fns = capture_setInterval(window, HEARTBEAT_MS);
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    open_desktop(window);
+    await until(() => $1(window, '.window[data-app="desktop"]'));
+    await until(() => heartbeat_fns.length > 0);
+
+    push('the heartbeat timer still registers even without the feature flag (the client-side timer runs either way)',
+        heartbeat_fns.length === 1);
+    heartbeat_fns[0]?.();
+    await sleep(200);
+    push('🔴 FEATURE-DETECTED: no endpoints.activity -> zero /api/shell/activity requests, ever',
+        seen.every((r) => r.url !== '/api/shell/activity'),
+        JSON.stringify(seen.map((r) => `${r.method} ${r.url}`)));
+
+    const win = $1(window, '.window[data-app="desktop"]');
     await window.$(win).close();
 }
 
