@@ -1229,6 +1229,79 @@ async function boot_to_display_gate (answer) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Scenario 16b — the display gate's OTHER pause branch: an ask whose FETCH
+// was already in flight when the tab hid must not schedule another one when
+// it lands.
+//
+// 🔴 WHY THIS EXISTS AS A SEPARATE SCENARIO. Scenario 16 above hides the tab
+// while the gate is merely WAITING on its armed `ask_timer`, so the only
+// thing that has to work there is `on_gate_visibility` cancelling that timer.
+// Deleting `schedule_next_ask`'s OWN `hidden` guard leaves Scenario 16
+// entirely green — mutation-proved, that exact deletion passed BOTH ways —
+// because with the stub answering instantly there is never an ask in flight
+// at the moment visibility changes, so nothing ever reaches that guard. That
+// is precisely the "a test that passes both ways is worse than none" hole the
+// rest of this file is written to avoid, so: hold the first ask OPEN across
+// the visibility change, and the guard becomes load-bearing.
+//
+// Nothing here touches the gate's decision logic or its deadlines — these
+// assertions only ever count `confirm=display` requests.
+// ───────────────────────────────────────────────────────────────────────────
+{
+    let release_display = null;
+    let display_asks = 0;
+    const { window } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            return {
+                ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko',
+                frame: { confirmed: true },
+            };
+        }
+        if (url.includes('confirm=frame')) return { ok: true, confirmed: true };
+        if (url.includes('confirm=display')) {
+            display_asks++;
+            // Hold the FIRST ask open, so it is still in flight when the tab
+            // hides below. Every later ask answers instantly.
+            if (display_asks === 1) await new Promise((r) => { release_display = r; });
+            return { ok: true, display: 'unknown' };
+        }
+        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
+        return { ok: true };
+    });
+
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    open_desktop(window);
+    const iframe = await until(() => $1(window, '.window[data-app="desktop"] .window-app-iframe'));
+    await until(() => iframe?.getAttribute('src') === URL_OK);
+    iframe.dispatchEvent(new window.Event('load'));
+    await until(() => display_asks === 1 && release_display !== null);
+    push('the display gate has exactly one ask IN FLIGHT',
+        display_asks === 1 && !!release_display, `${display_asks} asks`);
+
+    // Hide the tab while that ask is still unanswered.
+    Object.defineProperty(window.document, 'visibilityState', { value: 'hidden', configurable: true });
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+
+    // Now let it land. Its completion runs `schedule_next_ask`, which is the
+    // ONLY thing standing between this and an un-paused poll loop: there is
+    // no armed timer here for `on_gate_visibility` to have cancelled.
+    release_display();
+    await sleep(3_000); // several DISPLAY_POLL_MS (1s) cycles' worth
+    push('🔴 an ask that was IN FLIGHT when the tab hid does not schedule another',
+        display_asks === 1, `${display_asks} asks`);
+
+    // And the tab coming back still resumes it, from that same paused state.
+    Object.defineProperty(window.document, 'visibilityState', { value: 'visible', configurable: true });
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    const resumed = await until(() => display_asks > 1, 4_000);
+    push('🔴 ...and going visible again resumes it from that paused-on-completion state',
+        !!resumed, `${display_asks} asks`);
+
+    const win = $1(window, '.window[data-app="desktop"]');
+    await window.$(win).close();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Scenario 17 — ACTIVITY HEARTBEAT (container-billing fix)
 //
 // `session.reportActivity` is feature-detected off `desktopState.endpoints.
