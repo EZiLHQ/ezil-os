@@ -17,7 +17,9 @@ import {
     errorRateOverTime,
     fingerprintLeaderboard,
     fingerprintLeaderboardFromRollup,
+    recentTraces,
     spikeDetection,
+    traceTimeline,
     type QueryDb,
 } from './queries';
 import { WORKER_SENTINEL_USER_HASH } from './types';
@@ -155,6 +157,47 @@ describe('Q3 — spikeDetection: never divides by zero, needs 3+ users to call a
         const { db, statements } = makeTestDb([]);
         await spikeDetection(db);
         expect(statements[0]!.sql).toMatch(/r\.users\s*>=\s*3/i);
+    });
+});
+
+describe('recentTraces — one row per app-open/preview-boot, newest first', () => {
+    it('selects only boot_summary events with a non-null correlation id, ordered by received_at desc', async () => {
+        const { db, statements } = makeTestDb([]);
+        await recentTraces(db, { limit: 10 });
+        const generated = statements[0]!.sql;
+        expect(generated).toMatch(/event_class\s*=\s*'boot_summary'/i);
+        expect(generated).toMatch(/correlation_id\s+is\s+not\s+null/i);
+        expect(generated).toMatch(/order\s+by\s+received_at\s+desc/i);
+    });
+
+    it('clamps an oversized limit to 200', async () => {
+        const { db, statements } = makeTestDb([]);
+        await recentTraces(db, { limit: 100_000 });
+        expect(statements[0]!.params).toContain(200);
+    });
+
+    it('defaults to 50 when no limit is given', async () => {
+        const { db, statements } = makeTestDb([]);
+        await recentTraces(db);
+        expect(statements[0]!.params).toContain(50);
+    });
+});
+
+describe('traceTimeline — every event sharing one correlationId, chronological order', () => {
+    it('filters by correlation_id and orders oldest first', async () => {
+        const { db, statements } = makeTestDb([{ eventClass: 'boot_phase', source: 'container', site: 'xvfb', code: 'ok', outcome: 'ok', durationMs: 210, occurredAt: 'a', detail: null }]);
+        const result = await traceTimeline(db, 'cid-abc-123');
+        expect(statements[0]!.sql).toMatch(/correlation_id\s*=/i);
+        expect(statements[0]!.sql).toMatch(/order\s+by\s+occurred_at\s+asc/i);
+        expect(statements[0]!.params).toContain('cid-abc-123');
+        expect(result).toHaveLength(1);
+        expect(result[0]!.site).toBe('xvfb');
+    });
+
+    it('returns an empty array, never throws, when nothing matches', async () => {
+        const { db } = makeTestDb([]);
+        const result = await traceTimeline(db, 'no-such-trace');
+        expect(result).toEqual([]);
     });
 });
 
