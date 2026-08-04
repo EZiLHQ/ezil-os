@@ -1227,6 +1227,223 @@ describe('telemetry: boot phase/outcome data reaches the R2 spool on a SUCCESSFU
   });
 });
 
+// ── POST /telemetry/drain + /telemetry/ack ──────────────────────────────────
+//
+// `spoolTelemetry()` above has been PUTting to `TELEMETRY_R2_BUCKET` all
+// along; before this, nothing ever read it back — `worker/src/telemetry.ts`'s
+// own "KNOWN GAP" doc comment says so outright. These prove the missing last
+// hop through the REAL route table: same shared-HMAC envelope as
+// `/focus`/`/restart`/`DELETE /sandbox/:name`, same kill-switch vocabulary.
+describe('POST /telemetry/drain + /telemetry/ack are HMAC-gated and read/delete only the v1/ spool prefix', () => {
+  function fakeSpoolBucket(seed: Record<string, string> = {}) {
+    const store = new Map<string, string>(Object.entries(seed));
+    const deletedKeys: string[] = [];
+    const bucket = {
+      list: async ({ prefix, cursor, limit }: { prefix: string; cursor?: string; limit?: number }) => {
+        const keys = [...store.keys()].filter((k) => k.startsWith(prefix)).sort();
+        const startIdx = cursor ? keys.indexOf(cursor) + 1 : 0;
+        const page = keys.slice(startIdx, startIdx + (limit ?? 200));
+        const truncated = startIdx + page.length < keys.length;
+        return {
+          objects: page.map((key) => ({ key })),
+          truncated,
+          cursor: truncated ? page[page.length - 1] : undefined,
+        };
+      },
+      get: async (key: string) => {
+        const body = store.get(key);
+        if (body === undefined) return null;
+        return { text: async () => body };
+      },
+      delete: async (keys: string | string[]) => {
+        for (const k of Array.isArray(keys) ? keys : [keys]) {
+          store.delete(k);
+          deletedKeys.push(k);
+        }
+      },
+    };
+    return { bucket, store, deletedKeys };
+  }
+
+  it('REJECTS an unsigned /telemetry/drain request with 401', async () => {
+    const { bucket } = fakeSpoolBucket();
+    const res = await worker.fetch(
+      new Request('https://api-desktop.ezil.org/telemetry/drain', { method: 'POST', body: '{}' }),
+      { TELEMETRY_R2_BUCKET: bucket, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('a signed drain lists+reads back the spooled objects, one page, cursor+truncated reported honestly', async () => {
+    const { bucket } = fakeSpoolBucket({
+      'v1/dt=2026-08-03/hh=14/a.ndjson': '{"eventClass":"boot_summary","source":"worker","site":"x","code":"ok","outcome":"ok","eventId":"e1","schemaVersion":1,"occurredAt":"2026-08-03T14:00:00.000Z"}',
+      'v1/dt=2026-08-03/hh=14/b.ndjson': '{"eventClass":"boot_phase","source":"container","site":"y","code":"ok","outcome":"ok","eventId":"e2","schemaVersion":1,"occurredAt":"2026-08-03T14:00:00.000Z"}',
+    });
+    const res = await worker.fetch(
+      new Request('https://api-desktop.ezil.org/telemetry/drain', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({}),
+      }),
+      { TELEMETRY_R2_BUCKET: bucket, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; objects: { key: string; body: string }[]; truncated: boolean };
+    expect(body.ok).toBe(true);
+    expect(body.objects).toHaveLength(2);
+    expect(body.objects.map((o) => o.key).sort()).toEqual([
+      'v1/dt=2026-08-03/hh=14/a.ndjson',
+      'v1/dt=2026-08-03/hh=14/b.ndjson',
+    ]);
+    expect(body.truncated).toBe(false);
+  });
+
+  it('respects a caller-requested `limit`, paginating via `cursor`', async () => {
+    const { bucket } = fakeSpoolBucket({
+      'v1/a.ndjson': 'line-a',
+      'v1/b.ndjson': 'line-b',
+      'v1/c.ndjson': 'line-c',
+    });
+    const res1 = await worker.fetch(
+      new Request('https://api-desktop.ezil.org/telemetry/drain', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ limit: 2 }),
+      }),
+      { TELEMETRY_R2_BUCKET: bucket, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    const body1 = (await res1.json()) as { objects: { key: string }[]; truncated: boolean; cursor?: string };
+    expect(body1.objects).toHaveLength(2);
+    expect(body1.truncated).toBe(true);
+    expect(body1.cursor).toBeTruthy();
+
+    const res2 = await worker.fetch(
+      new Request('https://api-desktop.ezil.org/telemetry/drain', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ limit: 2, cursor: body1.cursor }),
+      }),
+      { TELEMETRY_R2_BUCKET: bucket, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    const body2 = (await res2.json()) as { objects: { key: string }[]; truncated: boolean };
+    expect(body2.objects).toHaveLength(1);
+    expect(body2.truncated).toBe(false);
+  });
+
+  it('🔴 a caller-requested limit above 200 is clamped, never honoured as-is', async () => {
+    const seed: Record<string, string> = {};
+    for (let i = 0; i < 5; i++) seed[`v1/k${i}.ndjson`] = 'x';
+    const { bucket } = fakeSpoolBucket(seed);
+    let seenLimit: number | undefined;
+    const originalList = bucket.list;
+    bucket.list = async (opts: { limit?: number }) => {
+      seenLimit = opts.limit;
+      return originalList(opts as { prefix: string; cursor?: string; limit?: number });
+    };
+    await worker.fetch(
+      new Request('https://api-desktop.ezil.org/telemetry/drain', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ limit: 999_999 }),
+      }),
+      { TELEMETRY_R2_BUCKET: bucket, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(seenLimit).toBe(200);
+  });
+
+  it('the kill switch (SANDBOX_TELEMETRY_DRAIN=off) hard-disables /telemetry/drain with a 404, before auth runs', async () => {
+    const { bucket } = fakeSpoolBucket();
+    const res = await worker.fetch(
+      new Request('https://api-desktop.ezil.org/telemetry/drain', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: '{}',
+      }),
+      { TELEMETRY_R2_BUCKET: bucket, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_TELEMETRY_DRAIN: 'off' },
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it('is a clean 500 (never a false ok:true) when TELEMETRY_R2_BUCKET is not configured', async () => {
+    const res = await worker.fetch(
+      new Request('https://api-desktop.ezil.org/telemetry/drain', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: '{}',
+      }),
+      { SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(500);
+    const parsed = (await res.json()) as { ok: boolean };
+    expect(parsed.ok).toBe(false);
+  });
+
+  it('REJECTS an unsigned /telemetry/ack request with 401 and deletes nothing', async () => {
+    const { bucket, store } = fakeSpoolBucket({ 'v1/a.ndjson': 'x' });
+    const res = await worker.fetch(
+      new Request('https://api-desktop.ezil.org/telemetry/ack', {
+        method: 'POST',
+        body: JSON.stringify({ keys: ['v1/a.ndjson'] }),
+      }),
+      { TELEMETRY_R2_BUCKET: bucket, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+    expect(store.has('v1/a.ndjson')).toBe(true);
+  });
+
+  it('a signed ack deletes exactly the given keys', async () => {
+    const { bucket, store, deletedKeys } = fakeSpoolBucket({
+      'v1/a.ndjson': 'x',
+      'v1/b.ndjson': 'y',
+    });
+    const res = await worker.fetch(
+      new Request('https://api-desktop.ezil.org/telemetry/ack', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ keys: ['v1/a.ndjson'] }),
+      }),
+      { TELEMETRY_R2_BUCKET: bucket, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; deleted: number };
+    expect(body.ok).toBe(true);
+    expect(body.deleted).toBe(1);
+    expect(store.has('v1/a.ndjson')).toBe(false);
+    expect(store.has('v1/b.ndjson')).toBe(true);
+    expect(deletedKeys).toEqual(['v1/a.ndjson']);
+  });
+
+  it('🔴 REJECTS a key outside the v1/ spool prefix, even properly signed — never a delete-anything primitive', async () => {
+    const { bucket, deletedKeys } = fakeSpoolBucket({ 'v1/a.ndjson': 'x' });
+    const res = await worker.fetch(
+      new Request('https://api-desktop.ezil.org/telemetry/ack', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ keys: ['some-other-object.json', '../v1/a.ndjson'] }),
+      }),
+      { TELEMETRY_R2_BUCKET: bucket, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; deleted: number };
+    expect(body.deleted).toBe(0);
+    expect(deletedKeys).toEqual([]);
+  });
+
+  it('the kill switch (SANDBOX_TELEMETRY_DRAIN=off) hard-disables /telemetry/ack with a 404 too', async () => {
+    const { bucket, store } = fakeSpoolBucket({ 'v1/a.ndjson': 'x' });
+    const res = await worker.fetch(
+      new Request('https://api-desktop.ezil.org/telemetry/ack', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ keys: ['v1/a.ndjson'] }),
+      }),
+      { TELEMETRY_R2_BUCKET: bucket, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_TELEMETRY_DRAIN: 'off' },
+    );
+    expect(res.status).toBe(404);
+    expect(store.has('v1/a.ndjson')).toBe(true);
+  });
+});
+
 // ── code-server bridge host, whole journey through the REAL route table ─────
 //
 // The failure this block exists to catch: code-server is launched with
