@@ -49,6 +49,8 @@ interface CallLog {
   restartDesktopStack: Array<{ hostname: string; sandboxId: string; explicitMode: unknown; fallbackMode: unknown }>;
   destroy: number;
   flushWorkspaceNow: number;
+  /** Every `recordActivity(lastInputAgoMs)` the route table actually made. */
+  recordActivity: number[];
   getExposedPorts: number;
   exec: number;
   /** Every `containerFetch(url, init, port)` the route table actually made. */
@@ -138,6 +140,7 @@ function fakeSandboxNamespace(options: {
     restartDesktopStack: [],
     destroy: 0,
     flushWorkspaceNow: 0,
+    recordActivity: [],
     getExposedPorts: 0,
     exec: 0,
     containerFetch: [],
@@ -245,6 +248,10 @@ function fakeSandboxNamespace(options: {
     flushWorkspaceNow: async () => {
       calls.flushWorkspaceNow++;
       return {};
+    },
+    recordActivity: async (...args: unknown[]) => {
+      const [lastInputAgoMs] = args as [number];
+      calls.recordActivity.push(lastInputAgoMs);
     },
     getExposedPorts: async () => {
       calls.getExposedPorts++;
@@ -843,6 +850,155 @@ describe('POST /sandbox/:name/focus is HMAC-gated with a closed-enum `app`', () 
     const body = (await res.json()) as { ok: boolean; error: string };
     expect(body.ok).toBe(false);
     expect(body.error).toContain('focus_switch_failed');
+  });
+});
+
+// ── POST /sandbox/:name/activity ─────────────────────────────────────────────
+// The idle-stop heartbeat added alongside the container-billing fix (see
+// BILLING-BRIEF.md / `worker/src/index.ts`'s `LAST_ACTIVITY_AT_KEY`). Same
+// shared-HMAC envelope as every other control route. The load-bearing
+// property this block proves — beyond auth/kill-switch, which mirror
+// `/focus` — is the NEGATIVE one: this route must NEVER touch the container
+// (`calls.exec` / `calls.containerFetch` must stay exactly 0 on every path,
+// success or failure), because an endpoint whose whole purpose is helping
+// decide when to STOP a container would defeat itself if it could wake one.
+
+describe('POST /sandbox/:name/activity is HMAC-gated and never touches the container', () => {
+  it('REJECTS an unsigned request with 401 and never calls the DO', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
+        method: 'POST',
+        body: JSON.stringify({ lastInputAgoMs: 1000 }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+    expect(calls.recordActivity.length).toBe(0);
+    expect(calls.exec).toBe(0);
+    expect(calls.containerFetch.length).toBe(0);
+  });
+
+  it('ACCEPTS a signed request via `Authorization: Bearer` and records activity, touching nothing else', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ lastInputAgoMs: 4321 }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(body.sandboxId).toBe(SANDBOX_NAME);
+    expect(calls.recordActivity).toEqual([4321]);
+    // The whole point: no container RPC of any kind.
+    expect(calls.exec).toBe(0);
+    expect(calls.containerFetch.length).toBe(0);
+    expect(calls.terminateSandbox).toBe(0);
+    expect(calls.flushWorkspaceNow).toBe(0);
+  });
+
+  it('ACCEPTS a signed request via `?token=` (the /preview-bootstrap precedent)', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const token = encodeURIComponent(await mintToken());
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity?token=${token}`, {
+        method: 'POST',
+        body: JSON.stringify({ lastInputAgoMs: 0 }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    expect(calls.recordActivity).toEqual([0]);
+  });
+
+  it('rejects a token signed with the WRONG secret', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken('a-different-secret')}` },
+        body: JSON.stringify({ lastInputAgoMs: 100 }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+    expect(calls.recordActivity.length).toBe(0);
+  });
+
+  it('REJECTS a missing lastInputAgoMs, even when properly signed', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({}),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(400);
+    expect(calls.recordActivity.length).toBe(0);
+  });
+
+  it('REJECTS a negative lastInputAgoMs rather than clamping it, even when properly signed', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ lastInputAgoMs: -1 }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json() as { error: string }).error).toContain('non_negative');
+    expect(calls.recordActivity.length).toBe(0);
+  });
+
+  it('the kill switch (SANDBOX_ACTIVITY=off) hard-disables the route with a 404, before auth runs', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ lastInputAgoMs: 100 }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_ACTIVITY: 'off' },
+    );
+    expect(res.status).toBe(404);
+    expect(calls.recordActivity.length).toBe(0);
+  });
+
+  it('still works keyless in local dev (no secret configured), unchanged', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
+        method: 'POST',
+        body: JSON.stringify({ lastInputAgoMs: 500 }),
+      }),
+      { Sandbox: binding },
+    );
+    expect(res.status).toBe(200);
+    expect(calls.recordActivity).toEqual([500]);
+  });
+
+  it('never calls terminateSandbox, destroy, or flushWorkspaceNow — activity is a pure signal, not a lifecycle action', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ lastInputAgoMs: 42 }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(calls.terminateSandbox).toBe(0);
+    expect(calls.destroy).toBe(0);
+    expect(calls.flushWorkspaceNow).toBe(0);
+    expect(calls.getExposedPorts).toBe(0);
   });
 });
 
@@ -1796,6 +1952,7 @@ describe('no other mutating route is reachable unauthenticated', () => {
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/twen` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart` },
+      { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity` },
       { method: 'POST', url: `https://api-desktop.ezil.org/project-files/put` },
       { method: 'POST', url: `https://api-desktop.ezil.org/project-files/delete` },
       { method: 'POST', url: `https://api-desktop.ezil.org/project-files/list` },
@@ -1811,7 +1968,13 @@ describe('no other mutating route is reachable unauthenticated', () => {
       expect(`${method} ${new URL(url).pathname} -> ${res.status}`).toBe(
         `${method} ${new URL(url).pathname} -> 401`,
       );
-      expect(calls.terminateSandbox + calls.destroy + calls.exec + calls.restartDesktopStack.length).toBe(0);
+      expect(
+        calls.terminateSandbox +
+          calls.destroy +
+          calls.exec +
+          calls.restartDesktopStack.length +
+          calls.recordActivity.length,
+      ).toBe(0);
     }
   });
 
