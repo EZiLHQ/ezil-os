@@ -35,9 +35,17 @@
 // in a real browser, both directions:
 //
 //   SUCCESS   — `getComputedStyle(overlay).display === 'none'` for BOTH
-//               overlays (`.ezil-boot` and `.ezil-{code,preview}-unavailable`),
-//               AND `document.elementFromPoint()` at the window body's centre
+//               overlays (the boot/progress panel and
+//               `.ezil-{code,preview}-unavailable`), AND
+//               `document.elementFromPoint()` at the window body's centre
 //               returns the IFRAME, not an overlay.
+//
+// MODIFIED BY EZIL 2026-08-04 (W3): the boot/progress overlay this file
+// measures was `.ezil-boot` (`BootProgress`) when this file was written.
+// Preview and Code have since dropped `BootProgress` for `AppSpinner`
+// (`.ezil-app-spinner`) — see `preview.js`/`code.js` — so every selector
+// below now targets that class. Same overlay role (the thing that must be
+// truly `display: none` on success and truly on top on failure), new class.
 //   FAILURE   — (refused frame, and "not available") the relevant overlay is
 //               NOT `display: none`, hit-tests as ON TOP at that same point,
 //               and is actually readable (non-empty rendered text, non-zero
@@ -320,7 +328,10 @@ async function testApp (app) {
             if ( ! win ) return { windowFound: false };
             const body = win.querySelector('.window-body');
             const iframe = win.querySelector('.window-app-iframe');
-            const progress = win.querySelector('.ezil-boot');
+            // MODIFIED BY EZIL 2026-08-04 (W3): Preview and Code dropped
+            // `BootProgress` (`.ezil-boot`) for `AppSpinner` (`.ezil-app-spinner`)
+            // — see `preview.js`/`code.js`. Same overlay role, new class.
+            const progress = win.querySelector('.ezil-app-spinner');
             const unavailable = win.querySelector(`.ezil-${appId}-unavailable`);
             const r = body.getBoundingClientRect();
             const cx = r.left + r.width / 2;
@@ -336,7 +347,7 @@ async function testApp (app) {
                 hitTag: hit ? hit.tagName : null,
                 hitClass: hit ? hit.className : null,
                 hitInIframe: !! hit?.closest?.('.window-app-iframe'),
-                hitInProgress: !! hit?.closest?.('.ezil-boot'),
+                hitInProgress: !! hit?.closest?.('.ezil-app-spinner'),
                 hitInUnavailable: !! hit?.closest?.(`.ezil-${appId}-unavailable`),
                 progress: progress ? {
                     hiddenAttr: progress.hidden,
@@ -403,7 +414,7 @@ async function testApp (app) {
     // Real navigation (about:blank) fires a genuine `load` event on its own —
     // unlike jsdom, nothing here needs to be dispatched by hand.
     await until((appId) => {
-        const el = document.querySelector(`.window[data-app="${appId}"] .ezil-boot`);
+        const el = document.querySelector(`.window[data-app="${appId}"] .ezil-app-spinner`);
         return el ? el.hidden === true : false;
     }, app.id, 8000);
 
@@ -431,7 +442,7 @@ async function testApp (app) {
     confirmAnswer = false;
     await openFresh();
     await until((appId) => {
-        const el = document.querySelector(`.window[data-app="${appId}"] .ezil-boot`);
+        const el = document.querySelector(`.window[data-app="${appId}"] .ezil-app-spinner`);
         return el?.getAttribute('data-kind') === 'failed';
     }, app.id, 8000);
 

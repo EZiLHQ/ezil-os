@@ -10,14 +10,25 @@
 // socket.io connection with its dozen realtime subscriptions, the app-launch
 // deep-link router, and the desktop's own filesystem hydration. None of it
 // crosses. What is left — install the globals, decide the device class, build a
-// desktop root, build a taskbar, open something — is this file.
+// desktop root, build a taskbar, warm the container silently, and open NOTHING
+// — is this file.
 //
-// ── The rule that shapes it: never wait on the container ────────────────────
+// ── The rule that shapes it: never wait on the container, never show one either ──
 // A cold desktop boot is ~22s (docs/PLATFORM-NOTES.md §11). Everything below
 // runs against data already in the document (`window.__EZIL_BOOT__`, inlined by
 // `app/src/app/os/page.tsx`), so the wallpaper and the taskbar are on screen
-// before any request exists. The container boots BEHIND the desktop window's
-// own progress panel, and the user can minimise it and use the OS meanwhile.
+// before any request exists.
+//
+// MODIFIED BY EZIL 2026-08-04 (W3, "app-open feel"): this used to also launch
+// `apps[0]` the instant the desktop painted, so every login opened a boot
+// panel nobody asked for. The owner, directly: "The moment I log in, it just
+// shows a computer loading and then a mounting screen... App opening should
+// be like opening an app." Login now opens nothing at all — the wallpaper and
+// dock ARE the boot. `warm.js` fires the one request that used to be implicit
+// in that launch (silently, fire-and-forget, `claim()`ed by the desktop
+// window on its first real open), so the container is already most of the
+// way through its ~22s by the time anyone clicks Browser, without a window
+// ever existing to show a panel for it.
 //
 // ── Load order below is LOAD-BEARING ────────────────────────────────────────
 // ES `import` declarations are hoisted and a module's dependencies evaluate,
@@ -71,6 +82,7 @@ import { PuterBackendRemovedError, puter } from '../src/ezil-stubs.js';
 
 import session from './session.js';
 import registry from './apps/registry.js';
+import { warm } from './warm.js';
 
 const PHASE = 'ezil-os:boot';
 
@@ -492,17 +504,34 @@ async function build (payload) {
 
     console.info(`[${PHASE}] desktop + taskbar painted in ${(performance.now() - t0).toFixed(1)}ms`);
 
-    // 🔴 EXACTLY ONE WINDOW. Two windows racing for one cold container means
-    // two boot spinners, one of which is lying, and a user with no way to tell
-    // which. `shell.mounted` above, `single_instance` in the registry and
-    // `single_instance` in UIWindow are three independent guards on the same
-    // rule, because each of them can be bypassed by a different caller.
-    const first = apps[0];
-    if ( ! first ) {
-        console.warn(`[${PHASE}] no apps to open`);
-        return;
+    // 🔴 LOGIN OPENS NOTHING (W3). The wallpaper and dock above ARE the boot —
+    // nobody asked to watch a machine start. The owner, directly: "The moment
+    // I log in, it just shows a computer loading and then a mounting
+    // screen... App opening should be like opening an app." This used to
+    // `registry.launch(apps[0].id, ctx)` here, unconditionally, the instant
+    // the desktop painted; it no longer opens anything at all. A resolve
+    // sanity log replaces it, so a boot with an empty app list is still
+    // visible in the console rather than silently doing nothing for a reason
+    // nobody can see.
+    console.info(`[${PHASE}] resolved ${apps.length} app(s); opening none automatically`,
+        apps.map(a => a.id));
+
+    // Warm the desktop container SILENTLY, right here, well before the user
+    // has clicked anything — see `warm.js`. Fire-and-forget on purpose: this
+    // function's caller (`mount`) must not be held open by a request that can
+    // take ~22s, and a warm that fails costs nothing worse than the ordinary
+    // cold boot the eventual real launch would have paid anyway.
+    //
+    // Gated the same way `desktop-window.js#start_boot` gates its own first
+    // request, so this never sends a request whose answer is already known
+    // (`configured !== true`), and only for a deployment that actually served
+    // the desktop app — warming a container nobody can open would just be a
+    // second cold boot nobody asked for.
+    if ( ctx.computer?.id
+        && ctx.desktopState?.configured === true
+        && apps.some((a) => a.id === 'desktop') ) {
+        warm(ctx.computer.id);
     }
-    await registry.launch(first.id, ctx);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
