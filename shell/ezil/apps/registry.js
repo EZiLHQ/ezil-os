@@ -71,6 +71,43 @@ import log from '../log.js';
 const PHASE = 'ezil-os:apps';
 
 /**
+ * How long `launch()` will wait for an `owns_boot_trace` app to end its OWN
+ * trace before giving up on it and closing the trace out itself — never
+ * silently, and never as `'ok'`.
+ *
+ * 🔴 A FORGETFUL APP MUST NOT LEAK A NEVER-ENDED TRACE. Without this, a bug in
+ * `desktop-window.js`/`preview.js`/`code.js` that reaches neither a `ready`
+ * nor a `failed`/`unavailable` branch (an uncaught throw inside `start_boot`,
+ * a code path this file's own review missed) would produce NO `boot_summary`
+ * for that open at all — worse than the original defect, which at least
+ * always emitted a (wrong) row.
+ *
+ * 🔴 The fallback closes the trace as `'error'`, not a fourth `'unknown'`
+ * value — `OUTCOMES` (`app/src/server/telemetry/types.ts`, mirrored in
+ * `worker/src/observability.ts`) is a closed 3-value wire enum (`ok`/`error`/
+ * `skipped`), owned by neither this task nor this tree, and a value outside
+ * it is exactly the kind of "the client invents its own vocabulary" defect
+ * this whole telemetry effort exists to avoid. `'error'` is also the
+ * semantically honest choice: whatever happened, it was not a confirmed
+ * success. What DOES distinguish a real, fast `mint_error`/`confirm_error`
+ * from "this app never called back" is `attrs.phases` itself — a fallback
+ * closure carries only the registry's OWN bookkeeping steps
+ * (`launch_start`, `open_resolved`, …) with none of the app's own
+ * `mint_*`/`confirm_*`/`display_*` breadcrumbs after them, because the app
+ * never got that far.
+ *
+ * The value has to clear every EXPLICIT end path this file's owned apps
+ * exercise on a slow-but-real boot, or a healthy slow boot would get its
+ * trace closed out from under it before it ever reaches its own terminal
+ * state. The longest such path is `desktop-window.js`'s own mint budget
+ * (`DESKTOP_BOOT_TIMEOUT_MS`, `session.js` — 215s) — a mint that itself times
+ * out ends the trace immediately as `'error'` on its own, so it never reaches
+ * this fallback; this value only needs enough headroom OVER that figure to be
+ * "generous", not to reconstruct every deadline in every owned file by hand.
+ */
+export const TRACE_FALLBACK_TIMEOUT_MS = 240_000;
+
+/**
  * The Desktop app's icon. EZiL-authored, inline, and NOT a `window.icons`
  * lookup, for two reasons:
  *
@@ -154,6 +191,16 @@ const CODE_ICON = 'data:image/svg+xml,' + encodeURIComponent(
  * @property {boolean} [wants_settings_in_drawer] This app's window carries an
  *   `attach_app_drawer` control tray and goes full-bleed, so the tray must
  *   carry a Settings button. See `../ui/Settings/drawer-action.js`.
+ * @property {boolean} [owns_boot_trace] `open()` returning does NOT mean the
+ *   boot is over — it kicked off async work (a container mint, a display
+ *   confirmation) that reaches ITS OWN terminal state (ready/failed/
+ *   unavailable) well after `open()`'s promise resolves. An app that sets
+ *   this ends its OWN `ctx.trace` at that later moment instead of `launch()`
+ *   ending it the instant `open()` resolves — see `launch()` below for why
+ *   ending it early is exactly the bug this flag exists to prevent, measured
+ *   as `durationMs` off by ~500x and `outcome=ok` reported for boots that
+ *   then crashed. Unset (the default) means `open()` resolving IS the whole
+ *   story — true of `settings`, false of `desktop`/`preview`/`code`.
  * @property {(ctx: object) => Promise<HTMLElement|null>} open
  */
 
@@ -186,6 +233,11 @@ export const APPS = [
         // 🔴 This is the app that hides the taskbar. Its tray must carry the
         // way back to Settings — see ../ui/Settings/drawer-action.js.
         wants_settings_in_drawer: true,
+        // `open()` returns the instant `UIWindow()` exists — the container
+        // mint, the frame confirmation and the display gate all run AFTER,
+        // inside the `void start_boot()` this file's own comment on that line
+        // calls out as fire-and-forget. See `owns_boot_trace`'s own doc.
+        owns_boot_trace: true,
         open: openDesktopWindow,
     },
     {
@@ -245,6 +297,9 @@ export const APPS = [
         // was being written in a sibling worktree and a static import would
         // not have resolved. Both files are in this tree now, so the import
         // is real and the stub is gone.
+        // Same fire-and-forget shape as `desktop` — `void start_boot()` runs
+        // its mint/confirm well after `open()` returns. See `owns_boot_trace`.
+        owns_boot_trace: true,
         open: openPreviewWindow,
     },
     {
@@ -267,6 +322,10 @@ export const APPS = [
         // target inside the streamed desktop. See `../apps/code.js`'s file
         // header for why "focus code in the stream" is not a smaller version
         // of this feature but a different, impossible one.
+        // Same fire-and-forget shape as `desktop`/`preview` — `void
+        // start_boot()` runs its mint/confirm well after `open()` returns.
+        // See `owns_boot_trace`.
+        owns_boot_trace: true,
         open: openCodeWindow,
     },
 ];
@@ -433,20 +492,64 @@ export async function launch (id, ctx = {}) {
     // (`../trace.js#beginTrace`) — every `telemetry.capture()` call made
     // anywhere below, and anywhere `app.open()` itself (or anything it calls
     // transitively, e.g. `desktop-window.js`'s own boot-phase telemetry)
-    // reaches during this `await`, now shares ONE `correlationId` without any
-    // of those ~30 existing call sites being edited. `.step()` marks the
-    // checkpoints this file itself can see; a richer breadcrumb trail (real
-    // boot-phase timings) is `trace.ambientTraceRef()?.step(code)`, callable
-    // from any owned file without importing this one.
+    // reaches WHILE THE TRACE IS STILL OPEN, now shares ONE `correlationId`
+    // without any of those ~30 existing call sites being edited. `.step()`
+    // marks the checkpoints this file itself can see; a richer breadcrumb
+    // trail (real boot-phase timings) is `ctx.trace.step(code)` below,
+    // callable from any owned file without importing this one.
     const trace = beginTrace(id);
     trace.step('launch_start');
+
+    // 🔴 WHO ENDS THIS TRACE, AND WHEN, IS THE WHOLE FIX.
+    //
+    // `app.open()` resolving is NOT the same moment as "this app-open is
+    // over" for an `owns_boot_trace` app: `openDesktopWindow` (and
+    // `preview`/`code`'s identically-shaped windows) return the instant their
+    // `UIWindow` exists and fire off `void start_boot()` — deliberately
+    // fire-and-forget, so the caller is not stuck awaiting a container mint,
+    // a frame confirmation and a display gate before the window even paints.
+    // Ending the trace here, right after `await app.open(...)`, used to mean
+    // ending it BEFORE any of that ran: MEASURED, real desktop opens of
+    // 11150ms and 3631ms each produced `durationMs=22`/`12` and an `ok`
+    // outcome for an open that, in one measured case, went on to fail with a
+    // sandbox crash the trace had already closed its books on.
+    //
+    // So `finishTrace` — the one and only path to `emitBootSummary` — is
+    // handed to the app itself via `ctx.trace.end`, and THIS file only calls
+    // it directly for an app that does NOT declare `owns_boot_trace`, or for
+    // an owning app whose `open()` returned `null` (nothing async was kicked
+    // off — see the early-return contract-violation/UIWindow-failure paths in
+    // `desktop-window.js`/`preview.js`/`code.js`, none of which reach their
+    // own `void start_boot()`).
+    let fallback_timer = null;
+    const finishTrace = (outcome) => {
+        if ( fallback_timer !== null ) { clearTimeout(fallback_timer); fallback_timer = null; }
+        emitBootSummary(trace.end(outcome));
+    };
 
     try {
         // The descriptor's own icon travels with the launch, so the window
         // head, the taskbar item and the control tray cannot show a different
-        // image from the dock tile the user just clicked.
-        const el_window = await app.open({ ...ctx, icon: app.icon, appName: app.name });
+        // image from the dock tile the user just clicked. `trace` rides along
+        // too: an `owns_boot_trace` app reaches back into it (`.step()` for
+        // its own mint/confirm/display checkpoints, `.end()` at its own
+        // terminal state) without this file importing anything of theirs.
+        const el_window = await app.open({ ...ctx, icon: app.icon, appName: app.name, trace: { step: trace.step, end: finishTrace } });
         trace.step('open_resolved');
+
+        // An `owns_boot_trace` app that actually kicked off its async boot
+        // (i.e. returned a real window) is now responsible for its own
+        // trace — start the bounded fallback so a version of that app which
+        // never reaches a terminal state cannot leave this open forever (see
+        // `TRACE_FALLBACK_TIMEOUT_MS`). `finishTrace` is idempotent (via
+        // `trace.end`'s own idempotence), so this racing the app's real
+        // `.end()` call is harmless either way — whichever runs first wins,
+        // and the loser's call is a no-op.
+        if ( app.owns_boot_trace && el_window ) {
+            // `'error'`, not a wire value outside the closed `OUTCOMES` enum —
+            // see `TRACE_FALLBACK_TIMEOUT_MS`'s own doc for why.
+            fallback_timer = setTimeout(() => finishTrace('error'), TRACE_FALLBACK_TIMEOUT_MS);
+        }
 
         // 🔴 Stamp WHICH computer this window is for, on the window itself.
         //
@@ -489,18 +592,32 @@ export async function launch (id, ctx = {}) {
             trace.step('drawer_ready');
         }
 
-        // One `boot_summary` for this app-open, success or "opened nothing"
-        // alike (`el_window` can be null for a window that declined to open
-        // without throwing — e.g. `show_unavailable()` paths). Emitted AFTER
-        // `capture()` calls above have already run, so they were captured
-        // WHILE this trace was still ambient and share its correlation id;
-        // `.end()` clears the ambient pointer itself.
-        emitBootSummary(trace.end(el_window ? 'ok' : 'skipped'));
+        if ( ! ( app.owns_boot_trace && el_window ) ) {
+            // Either this app's `open()` resolving IS its whole story
+            // (`settings`, any future synchronous app), or an `owns_boot_trace`
+            // app declined to open at all (`el_window === null` — a contract
+            // violation or a `UIWindow()` failure caught before that app's own
+            // `void start_boot()` ever ran, so nothing async is left racing
+            // this call). Either way, THIS is the terminal moment: one
+            // `boot_summary` for this app-open, success or "opened nothing"
+            // alike. Emitted AFTER the `capture()` calls above have already
+            // run, so they were captured WHILE this trace was still ambient
+            // and share its correlation id; `.end()` clears the ambient
+            // pointer itself.
+            finishTrace(el_window ? 'ok' : 'skipped');
+        }
+        // Else: `el_window` is real and `app.owns_boot_trace` is set — the
+        // fallback timer above is armed and the app itself now owns ending
+        // this trace, at its own terminal state, via the `ctx.trace.end` it
+        // was handed. Nothing further to do here.
 
         return el_window;
     } catch ( err ) {
         // A throwing `open` must not leave the caller (a taskbar click, a
-        // Start press) believing something is on its way.
+        // Start press) believing something is on its way. A throw means
+        // `open()` never reached its own `void start_boot()` either, so
+        // there is nothing async left racing this — safe to end the trace
+        // unconditionally, `owns_boot_trace` or not.
         log.error(`[${PHASE}] "${id}" failed to open`, err);
         telemetry.capture({
             eventClass: 'window_error', site: 'ezil-os:apps/registry#launch', code: 'app_open_threw',
@@ -509,7 +626,7 @@ export async function launch (id, ctx = {}) {
         // Captured above WHILE the trace was still ambient, so it already
         // carries this same correlation id — `.end()` runs last and closes
         // the trace with the one boot_summary row for this failed open.
-        emitBootSummary(trace.end('error'));
+        finishTrace('error');
         return null;
     }
 }

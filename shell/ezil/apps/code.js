@@ -182,6 +182,13 @@ async function mintCodePreviewUrl (computerId) {
  * @returns {Promise<HTMLElement|null>}
  */
 export async function openCodeWindow (ctx = {}) {
+    // `registry.js#launch` hands this in when it opened the trace for THIS
+    // app-open (`owns_boot_trace: true` on the `code` descriptor) — see that
+    // file's own doc on the flag, and `preview.js`'s identical seam.
+    // Defaulted so this function stays callable without a registry launch.
+    // `.end()` is idempotent, so calling it from more than one terminal
+    // point is safe.
+    const trace = ctx.trace ?? { step () {}, end () {} };
     const computer = ctx.computer ?? ctx.payload?.computer ?? null;
     const desktop_state = ctx.desktopState ?? ctx.payload?.desktopState ?? {};
     const title = computer?.name ? `${computer.name} — Code` : 'Code';
@@ -274,6 +281,11 @@ export async function openCodeWindow (ctx = {}) {
         if ( desktop_state.configured !== true ) {
             console.warn(`[${PHASE}] no desktop provider is configured`);
             progress.render(computeBootUiState({ requestStatus: 'not_configured', elapsedMs: 0 }));
+            // Terminal: no provider means no mint will ever be attempted.
+            // `'skipped'`, not `'error'` — an honest, known deployment
+            // state, not a failure this boot attempted and lost.
+            trace.step('not_configured');
+            trace.end('skipped');
             return;
         }
 
@@ -316,6 +328,11 @@ export async function openCodeWindow (ctx = {}) {
             if ( res.errorCode === 'code_preview_unavailable' ) {
                 console.warn(`[${PHASE}] this computer cannot serve code-server: ${res.errorCode}`);
                 show_unavailable();
+                // Terminal: an honest, known "this deployment does not
+                // support it" state, not a failure this boot attempted and
+                // lost.
+                trace.step('mint_unavailable');
+                trace.end('skipped');
                 return;
             }
             console.error(`[${PHASE}] code-preview mint failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`);
@@ -328,6 +345,9 @@ export async function openCodeWindow (ctx = {}) {
                 elapsedMs: performance.now() - t0,
                 errorCode: res.errorCode,
             }));
+            // Terminal: the mint failed for real.
+            trace.step('mint_error');
+            trace.end('error');
             return;
         }
 
@@ -337,10 +357,16 @@ export async function openCodeWindow (ctx = {}) {
         if ( typeof code_preview_url !== 'string' || code_preview_url === '' ) {
             console.warn(`[${PHASE}] code-preview-url returned ok with no URL; code-server is not available`);
             show_unavailable();
+            // Terminal, and `'error'` rather than `'skipped'`:
+            // `mintCodePreviewUrl` violating its own "never `ok` without a
+            // URL" contract, not an honest "not configured" answer.
+            trace.step('mint_url_missing');
+            trace.end('error');
             return;
         }
 
         console.info(`[${PHASE}] mint resolved in ${Math.round(performance.now() - t0)}ms`);
+        trace.step('mint_ok');
         progress.render(computeBootUiState({
             requestStatus: 'success',
             elapsedMs: 0,
@@ -382,6 +408,10 @@ export async function openCodeWindow (ctx = {}) {
                 progress.el.hidden = true;
                 el_unavailable.hidden = true;
                 console.info(`[${PHASE}] code frame confirmed by the server`);
+                // Terminal: a confirmed frame IS the whole verdict for this
+                // window — there is no separate display gate here.
+                trace.step('confirm_ok');
+                trace.end('ok');
                 return;
             }
 
@@ -396,6 +426,9 @@ export async function openCodeWindow (ctx = {}) {
                 elapsedMs: 0,
                 frameConfirmed: false,
             }));
+            // Terminal: the frame never confirmed.
+            trace.step('confirm_error');
+            trace.end('error');
         };
 
         el_iframe.addEventListener('load', () => { void ask(); }, { once: true });
@@ -406,6 +439,13 @@ export async function openCodeWindow (ctx = {}) {
         disposed = true;
         stop_timers();
         window.removeEventListener('ezil:teardown', dispose);
+        // The window can close mid-boot before any terminal point above ever
+        // fires. Without this the trace would sit open until `registry.js`'s
+        // bounded fallback finally closes it as `'unknown'`. `'skipped'`:
+        // abandoned, not failed and not completed. No-op if a terminal point
+        // already ended it (`trace.step`/`trace.end` are idempotent).
+        trace.step('disposed');
+        trace.end('skipped');
     };
 
     el_window.on_before_exit = async () => {
