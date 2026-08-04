@@ -3817,8 +3817,17 @@ async function close_one_window (options) {
                 $(`.taskbar-item[data-app="${$(this).attr('data-app')}"] .active-taskbar-indicator`).hide();
             }
             // if a fullpage window is closed, show desktop and taskbar
+            //
+            // MODIFIED BY EZIL 2026-08-04 (W2): pass `this` — the old
+            // no-argument call skipped `UIDesktopFullpage.js`'s
+            // `if (el_window)` guard entirely, so a close from full-bleed
+            // never restored the window head or geometry. `data-closing`
+            // is already `'1'` here (stamped synchronously by `$.fn.close`
+            // above, before any `await`), so `exit_fullpage_mode` itself
+            // skips the geometry reset for this call — a window mid-close
+            // animation must not jump to a floating box first.
             if ( $(this).attr('data-is_fullpage') === '1' ) {
-                window.exit_fullpage_mode();
+                window.exit_fullpage_mode(this);
             }
 
             // FileDialog closed
@@ -4565,17 +4574,28 @@ function pop_dashboard_app_url (app_name, options) {
 
 /**
  * Minimize a window AND do the dashboard URL bookkeeping — the shared
- * body of every minimize control (head button, context menu, control
- * drawer). The window hides FIRST: consuming the app's URL entry rides
- * the session history (pop_dashboard_app_url), and when the app's iframe
- * has stacked joint entries the pop only settles at the watchdog — the
- * minimize morph must not wait ~400ms on that. The eager hide is safe
- * against both ways the pop can settle: hideWindow marks
- * data-is_minimized synchronously, and the popstate handler and the
- * watchdog both skip already-minimized windows. (The browser's Back
- * button still minimizes through the popstate handler as before.)
+ * body of every minimize control (head button, context menu). The window
+ * hides FIRST: consuming the app's URL entry rides the session history
+ * (pop_dashboard_app_url), and when the app's iframe has stacked joint
+ * entries the pop only settles at the watchdog — the minimize morph must
+ * not wait ~400ms on that. The eager hide is safe against both ways the
+ * pop can settle: hideWindow marks data-is_minimized synchronously, and
+ * the popstate handler and the watchdog both skip already-minimized
+ * windows. (The browser's Back button still minimizes through the
+ * popstate handler as before.)
+ *
+ * SEAM: before any of that, give the window a chance to handle its own
+ * minimize. `el_window._ezil_minimise` is installed by EZiL's control
+ * drawer (`shell/ezil/apps/desktop-window.js`) on windows that may be
+ * full-bleed (`ezil-fullbleed`) — a concept this Puter-derived file must
+ * stay ignorant of. It takes no arguments and returns truthy once it has
+ * fully handled the minimize (restored chrome, hidden the window), in
+ * which case the generic path below must not also run.
  */
 function minimize_window (el_window) {
+    if ( el_window._ezil_minimise?.() ) {
+        return;
+    }
     const minimized = $(el_window).attr('data-is_minimized');
     if ( minimized !== '1' && minimized !== 'true' ) {
         $(el_window).hideWindow();

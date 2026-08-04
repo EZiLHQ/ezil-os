@@ -243,7 +243,15 @@ html, body {
     padding-bottom: 0;
     height: calc(100vh) !important;
 }
-.fullpage-mode .window-minimize-btn {
+/* MODIFIED BY EZIL 2026-08-04 (W2): was `.fullpage-mode .window-minimize-btn`,
+ * keyed off a BODY class shared by the whole page — the instant ANY window
+ * went full-bleed, this hid the minimize button on EVERY window, including
+ * ones that were never full-bleed themselves (e.g. Settings sitting behind a
+ * full-bleed desktop). Scope to the individual window's own
+ * `data-is_fullpage` attribute instead (written at creation, UIWindow.js:315,
+ * and set to '1' by `go_fullbleed` / `enter_fullpage_mode`) so only a window
+ * that is ITSELF full-bleed loses its minimize button. */
+.window[data-is_fullpage="1"] .window-minimize-btn {
     display: none;
 }
 .device-phone .desktop {
