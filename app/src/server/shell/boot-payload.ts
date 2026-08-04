@@ -109,7 +109,14 @@ export const SHELL_API_ROUTES = {
      * request when it is absent, rather than POSTing to a URL it invented —
      * an older server build degrades to no heartbeat, not a console full of
      * 404s. This entry is the switch that turns the heartbeat's NETWORK CALL
-     * on; the client-side timer and input tracking run either way.
+     * on; the client-side timer and presence tracking run either way.
+     *
+     * `lastInputAgoMs` is milliseconds since the user was last PRESENT
+     * (`visibilityState === 'visible' && document.hasFocus()`), not since a
+     * key was pressed — the desktop is a cross-origin iframe and this
+     * document cannot see input aimed at it. See
+     * `shell/ezil/activity-heartbeat.js`. The field name is unchanged because
+     * the Worker only ever reads it as `now - ago`.
      */
     activity: '/api/shell/activity',
 } as const;

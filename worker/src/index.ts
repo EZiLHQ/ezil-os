@@ -1774,6 +1774,168 @@ export function isIdleStopDue(params: { lastActivityAt: number; now: number }): 
 }
 
 /**
+ * ── SIGNAL B: is the CONTAINER doing real work, whatever the user is doing ──
+ *
+ * The owner requirement is literally "no work, AND no activity from the
+ * user". `isIdleStopDue` above answers only the second half. A user can
+ * legitimately start a long `bun install` / `next build` / test run and then
+ * go look at something else — presence goes stale, ten minutes pass, and
+ * stopping the container at that moment destroys work that was in progress.
+ * So BOTH must be false before an idle stop: nobody present AND nothing
+ * running.
+ *
+ * The probe is `/proc/loadavg`'s 1-minute figure, read over the same
+ * `sandbox.exec()` path everything else in this file uses. It runs ONLY once
+ * presence is already stale, so in the common case (a user at their desk) it
+ * costs nothing at all.
+ *
+ * ── Why the 1-minute average, and not 5/15 ──────────────────────────────────
+ * Consecutive probes are at most `WORKSPACE_FLUSH_BACKOFF_STEPS_SECONDS`'s
+ * cap — 60s — apart, so successive 1-minute windows TILE the timeline with no
+ * gap: no burst of work can slip between two probes unobserved. It is also
+ * the shortest window that still bridges the brief lulls inside a real build
+ * (the seconds between `install` finishing and `compile` starting), because
+ * the kernel's EWMA decays with a 60s time constant: a second of true idle
+ * inside a busy minute moves the figure by under 2%.
+ */
+const LOADAVG_PROBE_COMMAND = 'cat /proc/loadavg';
+
+/**
+ * The 1-minute load average at or above which the container counts as BUSY
+ * and an otherwise-due idle stop is refused.
+ *
+ * ── MEASURED, not guessed ───────────────────────────────────────────────────
+ * Bench: the real production image (`ezil-os-worker-sandbox`, this
+ * directory's Dockerfile) run under `--cpus=2` to match `wrangler.toml`'s
+ * `instance_type = "standard-3"` (2 vCPU), desktop booted through
+ * `start-desktop.sh` in `neko` mode with the full resident set up — Xvfb,
+ * openbox, pulseaudio, dbus, Chrome (11 processes) on the mandatory landing
+ * page, code-server, the dev server, `neko serve`, and the base image's own
+ * control-plane Bun server.
+ *
+ * Container runtimes generally do NOT namespace `/proc/loadavg` (verified on
+ * the bench: inside the container it reported the HOST's figure and `nproc`
+ * the host's core count), so the kernel's own algorithm was reproduced over
+ * the container's PID namespace instead — count tasks in R or D state every
+ * 5s (CALC_LOAD_INTERVAL, threads not processes), EWMA with the 1-minute
+ * constant EXP_1 = 1884/2048 — which is exactly what a namespaced
+ * `/proc/loadavg` reports. Cross-checked against cgroup CPU accounting, and
+ * calibrated: one deliberate busy thread moved the figure by exactly 1.0.
+ *
+ *   A. idle, NO session attached          (8.1 min steady state)
+ *        load1  min 0.0000  p50 0.0000  p95 0.0000  max 0.0000
+ *        cpu    0.0040 cores mean
+ *   B. idle, WebRTC SESSION ATTACHED      (7.1 min steady state)
+ *        load1  min 0.0485  p50 0.1793  p95 0.2784  max 0.3055
+ *        cpu    0.2366 cores mean
+ *   C. one busy thread + session attached (3.1 min steady state)
+ *        load1  min 0.8054  p50 1.1177  p95 1.4049  max 1.4402
+ *        cpu    1.2539 cores mean
+ *
+ * 🔴 (B) is the case that decides this number, and it is the one that would
+ * have been missed by reasoning instead of measuring. A user who leaves the
+ * tab open and walks away is state (B), not state (A): the Neko WebRTC
+ * session stays connected and `neko` keeps software-encoding 1920x1080 vp8
+ * for nobody, costing a QUARTER OF A CORE continuously. That is a container
+ * that MUST still be stoppable — it is precisely the "a tab merely left open
+ * must not bill" case from the billing brief — so the threshold has to sit
+ * ABOVE (B)'s ceiling, not just above (A)'s.
+ *
+ * ── Where the number comes from ─────────────────────────────────────────────
+ * (B) and (C) are the two bands that must be told apart, and they are cleanly
+ * separated: (B) never exceeds 0.3055, (C) never drops below 0.8054. The
+ * threshold is their GEOMETRIC mean, sqrt(0.3055 * 0.8054) = 0.4957 -> 0.50,
+ * which is the point that leaves the same RATIO of margin on both sides:
+ *
+ *     1.64x above (B)'s observed maximum      — an abandoned session still stops
+ *     1.61x below (C)'s observed minimum      — a working container never does
+ *
+ * It is round because the measurement made it round, not because 0.5 looked
+ * like a nice number. A slower, I/O-bound build averaging only 0.3 cores
+ * still lands at ~0.54 with (B)'s baseline underneath it, so it is protected
+ * too; and the kernel's EWMA crosses this line after 40s of a single busy
+ * thread, well inside the 10 minutes of absence required before the probe
+ * runs at all.
+ *
+ * ── Residual risk, stated ───────────────────────────────────────────────────
+ * A container left showing ANIMATED content raises (B) — the encoder has real
+ * frames to compress — and could sit above 0.50 with nobody there. That fails
+ * in the safe direction (money, not work) and the platform's own `SLEEP_AFTER`
+ * still collects it.
+ *
+ * ── Retuning it ─────────────────────────────────────────────────────────────
+ * `EZIL_NEKO_CPU_DIAG_ENABLED=1` makes `scripts/start-neko.sh` sample real
+ * `load1` from inside a live production container into
+ * `/tmp/neko-cpu-diag.jsonl`, retrievable over the existing
+ * `/sandbox/:name/cpu-diag` route (`./cpu-diag.ts`). That is the instrument
+ * to re-measure with if the image's resident set ever changes; it is also how
+ * to check the one thing the bench CANNOT: whether Cloudflare's container
+ * runtime namespaces `/proc/loadavg` at all. If it does not, this probe reads
+ * the neighbours' load, always answers BUSY, and idle-stop silently stops
+ * happening — which is why `containerBusyFromProbe` returns the observed
+ * figure and `flushWorkspaceScheduled` logs it on EVERY probe, stop or no
+ * stop.
+ */
+const CONTAINER_BUSY_LOAD1 = 0.5;
+
+/**
+ * Pure parse of `/proc/loadavg`'s first field. The file is one line —
+ * `0.42 0.31 0.28 1/512 1234` — and only the first number is read.
+ *
+ * Returns `null` for anything that is not a finite, non-negative number, so
+ * the caller can apply the fail-safe rather than this silently inventing a
+ * `0` that would authorize a stop.
+ */
+export function parseLoadAvg1(stdout: string): number | null {
+  const first = String(stdout ?? '').trim().split(/\s+/)[0];
+  if (!first) return null;
+  // `Number('')` is 0 and `Number('0.5abc')` is NaN; require the whole token
+  // to be a plain decimal so a truncated or error-shaped stdout can never be
+  // coerced into a low, stop-authorizing reading.
+  if (!/^\d+(\.\d+)?$/.test(first)) return null;
+  const value = Number(first);
+  if (!Number.isFinite(value) || value < 0) return null;
+  return value;
+}
+
+/**
+ * 🔴 THE FAIL-SAFE. Turn a `/proc/loadavg` probe into a busy verdict.
+ *
+ * Every way of NOT KNOWING resolves to BUSY — the probe threw (`null`), the
+ * command exited non-zero, `/proc/loadavg` was missing or unreadable, stdout
+ * did not parse. Only an actual number, actually below
+ * {@link CONTAINER_BUSY_LOAD1}, is allowed to authorize stopping a container.
+ *
+ * The asymmetry is deliberate and is the contract: a container that lingers
+ * costs money and the platform's own `SLEEP_AFTER` backstop eventually
+ * collects it; a container stopped mid-build costs the user work that cannot
+ * be recovered.
+ *
+ * Returns the observed figure alongside the verdict so the caller can log
+ * what it actually saw — the only way an operator can tell "genuinely idle"
+ * from "this probe has never once returned a usable number".
+ */
+export function containerBusyFromProbe(
+  probe: { exitCode: number; stdout: string } | null,
+): { busy: boolean; load1: number | null; reason: string } {
+  if (probe === null) {
+    return { busy: true, load1: null, reason: 'probe_threw' };
+  }
+  if (probe.exitCode !== 0) {
+    return { busy: true, load1: null, reason: `probe_exit_${probe.exitCode}` };
+  }
+  const load1 = parseLoadAvg1(probe.stdout);
+  if (load1 === null) {
+    return { busy: true, load1: null, reason: 'unparseable' };
+  }
+  return {
+    busy: load1 >= CONTAINER_BUSY_LOAD1,
+    load1,
+    reason: load1 >= CONTAINER_BUSY_LOAD1 ? 'load_above_threshold' : 'load_below_threshold',
+  };
+}
+
+/**
  * Pure idle-backoff step function backing the "otherwise flush as today"
  * branch of `flushWorkspaceScheduled`. Given what the JUST-COMPLETED cycle
  * observed, decides the interval for the NEXT `schedule()` call:
@@ -2060,11 +2222,18 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    *      touching it here would resurrect exactly what stopped it — the same
    *      failure mode `WORKSPACE_TERMINATED_KEY` exists to prevent, just
    *      without an explicit DELETE. Neither flush nor reschedule.
-   *   3. IDLE (`isIdleStopDue` against `LAST_ACTIVITY_AT_KEY`) — does a FINAL
-   *      flush first (`runWorkspaceFlush('alarm')` — trigger stays `'alarm'`
-   *      deliberately: this must NOT bump `LAST_ACTIVITY_AT_KEY`), and ONLY IF
-   *      THAT SUCCEEDS stops the container via `this.stop()` — a graceful
-   *      signal, NOT `destroy()` — and marks the loop stopped WITHOUT setting
+   *   3. IDLE (`isIdleStopDue` against `LAST_ACTIVITY_AT_KEY`) — nobody is
+   *      present. That is only HALF the owner requirement ("no work, no
+   *      activity from the user"), so before anything else this branch asks
+   *      whether the CONTAINER is working: `probeContainerBusy()` reads
+   *      `/proc/loadavg` (see `CONTAINER_BUSY_LOAD1`). If it is busy, or if
+   *      the probe cannot answer, nothing is stopped — the interval resets to
+   *      the base and the same question is asked again next cycle. Only when
+   *      the container is POSITIVELY observed quiet does the stop proceed: a
+   *      FINAL flush first (`runWorkspaceFlush('alarm')` — trigger stays
+   *      `'alarm'` deliberately: this must NOT bump `LAST_ACTIVITY_AT_KEY`),
+   *      and ONLY IF THAT SUCCEEDS `this.stop()` — a graceful signal, NOT
+   *      `destroy()` — marking the loop stopped WITHOUT setting
    *      `WORKSPACE_TERMINATED_KEY` (see that key's "CRITICAL DISTINCTION"
    *      doc comment: the next preview must boot this sandbox normally). If
    *      the final flush FAILS, stays running and retries the SAME idle check
@@ -2100,11 +2269,45 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     const lastActivityAt = (await this.ctx.storage.get<number>(LAST_ACTIVITY_AT_KEY)) ?? Date.now();
     const now = Date.now();
     if (isIdleStopDue({ lastActivityAt, now })) {
+      // 🔴 SIGNAL B — "no work" is the OTHER half of the owner requirement.
+      // Presence being stale only establishes that nobody is watching; it says
+      // nothing about whether the box is mid-`bun install`. Ask the container
+      // (see `CONTAINER_BUSY_LOAD1`), and if it is working, leave it alone and
+      // look again next cycle. Safe to `exec` here: `containerIsRunning()`
+      // above has already established a container is up, so this cannot
+      // resurrect a stopped one. Runs ONLY on this branch, so a present user
+      // never pays for it.
+      const busy = await this.probeContainerBusy();
+      if (busy.busy) {
+        bootLog('workspace_flush', 'end', {
+          status: 'skipped',
+          detail: `idle_but_busy,${busy.detail},idleMs=${now - lastActivityAt}`,
+        });
+        // Back to the base interval — this sandbox is no longer "nothing is
+        // happening", so stop treating it as such, and re-ask promptly rather
+        // than a minute later. Persist it too, or `nextFlushRescheduleSeconds`
+        // would resume climbing from the stale rung on the next quiet cycle.
+        await this.ctx.storage.put(WORKSPACE_FLUSH_BACKOFF_SECONDS_KEY, WORKSPACE_FLUSH_INTERVAL_SECONDS);
+        try {
+          await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK);
+        } catch (err) {
+          console.error(
+            `[ezil-boot] phase=workspace_flush event=reschedule_failed error=${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        return;
+      }
+
       // Trigger stays `'alarm'` — this must NOT bump `LAST_ACTIVITY_AT_KEY`,
       // idle-triggered or not.
       const outcome = await this.runWorkspaceFlush('alarm');
       if (outcome.ok) {
-        bootLog('workspace_flush', 'end', { status: 'ok', detail: `idle_stop,idleMs=${now - lastActivityAt}` });
+        bootLog('workspace_flush', 'end', {
+          status: 'ok',
+          detail: `idle_stop,${busy.detail},idleMs=${now - lastActivityAt}`,
+        });
         // A NEW, separate state from `WORKSPACE_TERMINATED_KEY` — deliberately
         // NOT written here. See that key's doc comment: the next
         // `/sandbox/preview` for this sandbox must boot normally.
@@ -2200,6 +2403,42 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   /** True when a container is actually alive under this DO right now. */
   private containerIsRunning(): boolean {
     return this.ctx.container?.running === true;
+  }
+
+  /**
+   * SIGNAL B's I/O half: read `/proc/loadavg` out of the container and hand
+   * it to the pure {@link containerBusyFromProbe} for the verdict. See
+   * {@link CONTAINER_BUSY_LOAD1} for the measured threshold.
+   *
+   * 🔴 The `try` swallows the error deliberately and converts it to `null`,
+   * which `containerBusyFromProbe` reads as BUSY. A probe that cannot answer
+   * must never be the reason a container gets stopped — the whole point of
+   * this guard is that we only stop on a POSITIVE observation of idleness.
+   *
+   * Only ever called from `flushWorkspaceScheduled`'s idle branch, i.e. after
+   * `containerIsRunning()` has already returned true, so this `exec` can
+   * never be the thing that starts a container.
+   */
+  private async probeContainerBusy(): Promise<{ busy: boolean; detail: string }> {
+    let probe: { exitCode: number; stdout: string } | null = null;
+    try {
+      const res = await this.exec(LOADAVG_PROBE_COMMAND, { origin: 'internal' });
+      probe = { exitCode: res.exitCode, stdout: res.stdout ?? '' };
+    } catch (err) {
+      console.error(
+        `[ezil-boot] phase=workspace_flush event=busy_probe_failed error=${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    const verdict = containerBusyFromProbe(probe);
+    // Always logged, busy or not: this figure is the only way to tell a
+    // genuinely quiet container from a `/proc/loadavg` that is reporting
+    // somebody else's machine — see `CONTAINER_BUSY_LOAD1`'s "Retuning it".
+    return {
+      busy: verdict.busy,
+      detail: `load1=${verdict.load1 === null ? 'unknown' : verdict.load1}` + `,busyReason=${verdict.reason}`,
+    };
   }
 
   /**
