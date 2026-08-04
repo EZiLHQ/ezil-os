@@ -11,6 +11,7 @@ import { drizzle } from 'drizzle-orm/pg-proxy';
 import { describe, expect, it } from 'vitest';
 
 import * as schema from '@/server/db/schema';
+import * as queriesModule from './queries';
 import {
     bootPhaseFailureRanking,
     distinctUsersForFingerprint,
@@ -209,4 +210,101 @@ describe('Q4 — bootPhaseFailureRanking: boot_summary is the denominator', () =
         expect(statements[0]!.sql).toMatch(/boot_phase/);
         expect(statements[0]!.sql).toMatch(/group\s+by\s+p\.site/i);
     });
+});
+
+// ── 🔴 sentinel-exclusion coverage — the actual defect this file exists to fix ──
+// `WORKER_SENTINEL_USER_HASH` was excluded from ONE distinct-user aggregate
+// (`fingerprintLeaderboard`) and silently left in five others. A hand-written
+// list of "the queries that need this" is exactly how that happened in the
+// first place — the list went stale the moment a sixth aggregate was added
+// and nobody remembered to update it.
+//
+// So this suite does not enumerate query NAMES. It enumerates every exported
+// function from `./queries` at runtime (`Object.entries(queriesModule)`) —
+// so a future 7th aggregate is covered automatically, with zero edits here —
+// calls each one, and structurally scans the SQL it generates for every
+// `count(DISTINCT ... user_hash)` occurrence (the only column any query in
+// this file ever counts distinct users by — verified: `grep -n "count(DISTINCT"
+// queries.ts` turns up nothing else). Each occurrence must be immediately
+// followed by a `FILTER (WHERE ... <ref> <> $n)` clause, and the sentinel
+// value must actually appear among that statement's bound params — so a
+// FILTER that excludes some OTHER, unrelated condition doesn't count.
+describe('🔴 sentinel-exclusion coverage: every distinct-user aggregate this file emits excludes WORKER_SENTINEL_USER_HASH', () => {
+    type AnyQueryFn = (db: QueryDb, ...rest: unknown[]) => Promise<unknown>;
+    const queryFunctions = (Object.entries(queriesModule) as [string, unknown][])
+        .filter((entry): entry is [string, AnyQueryFn] => typeof entry[1] === 'function');
+
+    it('enumerated at least one function (guards against an import/build change silently emptying this suite)', () => {
+        expect(queryFunctions.length).toBeGreaterThan(0);
+    });
+
+    it('the known distinct-user-bearing queries are still exported under these names (sanity check on the enumeration itself)', () => {
+        const names = queryFunctions.map(([name]) => name);
+        for (const expected of [
+            'distinctUsersForFingerprint',
+            'fingerprintLeaderboard',
+            'fingerprintLeaderboardFromRollup',
+            'errorRateOverTime',
+            'spikeDetection',
+            'bootPhaseFailureRanking',
+        ]) {
+            expect(names).toContain(expected);
+        }
+    });
+
+    for (const [name, fn] of queryFunctions) {
+        it(`\`${name}\`: every count(DISTINCT ...user_hash) it emits is immediately FILTERed against the sentinel`, async () => {
+            const { db, statements } = makeTestDb([]);
+            // A single generic call works for every current signature: extra
+            // args are ignored by functions that don't declare them, and the
+            // ones that DO declare a required arg (fingerprint,
+            // correlationId) only ever use it as a bound SQL *value*, never
+            // for control flow, so `undefined` still produces real,
+            // inspectable SQL text.
+            await fn(db, undefined, undefined);
+            expect(statements.length).toBeGreaterThan(0);
+            const { sql: generated, params } = statements[0]!;
+
+            const countDistinctUserHash = /count\(\s*distinct\s+((?:[a-zA-Z_]\w*\.)?user_hash)\s*\)/gi;
+            let match: RegExpExecArray | null;
+            let aggregatesSeen = 0;
+            while ((match = countDistinctUserHash.exec(generated))) {
+                aggregatesSeen++;
+                const ref = match[1]!;
+                const afterCount = generated.slice(match.index + match[0].length, match.index + match[0].length + 300);
+                // The FILTER must sit directly on THIS aggregate (allowing an
+                // optional `::type` cast in between, matching this file's own
+                // style) — not merely appear later in the query on some
+                // unrelated predicate.
+                const filterClause = afterCount.match(/^\s*(?:::\w+\s*)?filter\s*\(\s*where\s+([\s\S]*?)\)/i);
+                expect(
+                    filterClause,
+                    `[${name}] count(DISTINCT ${ref}) at offset ${match.index} has no FILTER ` +
+                        `(WHERE ...) immediately attached — every distinct-user aggregate must ` +
+                        `exclude the worker sentinel via a FILTER on the aggregate itself (a bare ` +
+                        `WHERE would make a worker/container-only row vanish from the result ` +
+                        `instead of reporting a truthful, possibly-zero, distinct-user count). ` +
+                        `Generated SQL:\n${generated}`,
+                ).toBeTruthy();
+
+                const filterBody = filterClause![1]!;
+                const refPattern = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                expect(
+                    new RegExp(`${refPattern}\\s*<>`, 'i').test(filterBody),
+                    `[${name}] count(DISTINCT ${ref})'s FILTER ("${filterBody.trim()}") does not ` +
+                        `exclude ${ref} from the sentinel — expected something like ` +
+                        `"FILTER (WHERE ${ref} <> $n)".`,
+                ).toBe(true);
+            }
+
+            if (aggregatesSeen > 0) {
+                expect(
+                    params,
+                    `[${name}] emits ${aggregatesSeen} distinct-user aggregate(s) with a sentinel-shaped ` +
+                        `FILTER, but WORKER_SENTINEL_USER_HASH never appears among its bound params — ` +
+                        `the FILTER references a placeholder that isn't actually bound to the sentinel.`,
+                ).toContain(WORKER_SENTINEL_USER_HASH);
+            }
+        });
+    }
 });

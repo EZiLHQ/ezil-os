@@ -41,13 +41,21 @@ export interface FingerprintWindowStats {
     lastInWindow: string | null;
 }
 
+/**
+ * 🔴 `distinctUsers` excludes `WORKER_SENTINEL_USER_HASH` via a `FILTER`
+ * clause on the aggregate — same reasoning as `fingerprintLeaderboard` below:
+ * a `WHERE` predicate would make a fingerprint that only ever fired from a
+ * worker/container (no real user) vanish from the result instead of
+ * reporting its true (possibly zero) distinct-user count alongside a
+ * truthful `events` total.
+ */
 export async function distinctUsersForFingerprint(
     db: QueryDb,
     fingerprint: string,
     windowHours = 1,
 ): Promise<FingerprintWindowStats> {
     const result = await db.execute(sql`
-        SELECT count(DISTINCT user_hash)::int AS "distinctUsers",
+        SELECT count(DISTINCT user_hash) FILTER (WHERE user_hash <> ${WORKER_SENTINEL_USER_HASH})::int AS "distinctUsers",
                count(*)::int                  AS events,
                min(received_at)               AS "firstInWindow",
                max(received_at)               AS "lastInWindow"
@@ -158,6 +166,16 @@ export interface ErrorRateBucket {
     pctUsersAffected: number | null;
 }
 
+/**
+ * 🔴 `usersWithErrors`, `usersReporting`, and (both sides of) `pctUsersAffected`
+ * all exclude `WORKER_SENTINEL_USER_HASH` via `FILTER` on their respective
+ * aggregates. `pctUsersAffected` answers "what % of real users hit an
+ * error?" — the sentinel is a machine, not a user, so it belongs on neither
+ * side of that ratio. Excluding it from only the numerator or only the
+ * denominator would just move the distortion (a sentinel `boot_summary`
+ * would silently deflate the rate; a sentinel error would silently inflate
+ * it, including back past 100%) rather than remove it.
+ */
 export async function errorRateOverTime(
     db: QueryDb,
     opts: { hours?: number; eventClass?: string } = {},
@@ -178,10 +196,15 @@ export async function errorRateOverTime(
         )
         SELECT b.h AS hour,
                count(*) FILTER (WHERE e.outcome = 'error')::int                    AS errors,
-               count(DISTINCT e.user_hash) FILTER (WHERE e.outcome = 'error')::int AS "usersWithErrors",
-               count(DISTINCT e.user_hash)::int                                    AS "usersReporting",
-               round(100.0 * count(DISTINCT e.user_hash) FILTER (WHERE e.outcome = 'error')
-                     / nullif(count(DISTINCT e.user_hash), 0), 1)                   AS "pctUsersAffected"
+               count(DISTINCT e.user_hash)
+                 FILTER (WHERE e.outcome = 'error' AND e.user_hash <> ${WORKER_SENTINEL_USER_HASH})::int
+                                                                                    AS "usersWithErrors",
+               count(DISTINCT e.user_hash)
+                 FILTER (WHERE e.user_hash <> ${WORKER_SENTINEL_USER_HASH})::int   AS "usersReporting",
+               round(100.0 * count(DISTINCT e.user_hash)
+                       FILTER (WHERE e.outcome = 'error' AND e.user_hash <> ${WORKER_SENTINEL_USER_HASH})
+                     / nullif(count(DISTINCT e.user_hash)
+                       FILTER (WHERE e.user_hash <> ${WORKER_SENTINEL_USER_HASH}), 0), 1) AS "pctUsersAffected"
         FROM   buckets b
         LEFT   JOIN ezil_error_events e
                ON e.received_at >= b.h AND e.received_at < b.h + interval '1 hour'
@@ -212,10 +235,14 @@ export interface SpikeRow {
     isNew: boolean;
 }
 
+/** 🔴 `usersNow` excludes `WORKER_SENTINEL_USER_HASH` via `FILTER` on the
+ * aggregate — otherwise a worker/container-only fingerprint could cross the
+ * "3+ distinct users" new-fingerprint threshold on machine noise alone. */
 export async function spikeDetection(db: QueryDb): Promise<SpikeRow[]> {
     const result = await db.execute(sql`
         WITH recent AS (
-          SELECT fingerprint, count(DISTINCT user_hash)::numeric AS users
+          SELECT fingerprint,
+                 count(DISTINCT user_hash) FILTER (WHERE user_hash <> ${WORKER_SENTINEL_USER_HASH})::numeric AS users
           FROM   ezil_error_events
           WHERE  received_at >= now() - interval '1 hour' AND outcome = 'error'
           GROUP  BY fingerprint
@@ -341,6 +368,10 @@ export interface BootPhaseFailureRow {
     mostCommonCode: string | null;
 }
 
+/** 🔴 `usersAffected` excludes `WORKER_SENTINEL_USER_HASH` via `FILTER` on
+ * the aggregate — `boot_phase` failures are exactly the events most likely
+ * to come from a container's own boot rather than a real user's, so this is
+ * the aggregate the sentinel would distort the most if left unfiltered. */
 export async function bootPhaseFailureRanking(db: QueryDb, hours = 24): Promise<BootPhaseFailureRow[]> {
     const result = await db.execute(sql`
         WITH attempts AS (
@@ -351,7 +382,7 @@ export async function bootPhaseFailureRanking(db: QueryDb, hours = 24): Promise<
         )
         SELECT p.site                                AS phase,
                count(*)::int                          AS failures,
-               count(DISTINCT p.user_hash)::int        AS "usersAffected",
+               count(DISTINCT p.user_hash) FILTER (WHERE p.user_hash <> ${WORKER_SENTINEL_USER_HASH})::int AS "usersAffected",
                (SELECT n FROM attempts)::int           AS "bootAttempts",
                round(100.0 * count(*) / nullif((SELECT n FROM attempts), 0), 2)::float AS "pctOfBoots",
                round(avg(p.duration_ms))::float        AS "avgMsBeforeFailure",
