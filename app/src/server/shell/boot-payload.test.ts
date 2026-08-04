@@ -241,6 +241,9 @@ describe('toShellDesktopState — never implies an observation it does not have'
             focus: '/api/shell/focus',
             telemetry: '/api/shell/telemetry',
             restart: '/api/shell/restart',
+            // Container-billing fix: the activity heartbeat's feature flag —
+            // see the dedicated test below.
+            activity: '/api/shell/activity',
         });
     });
 
@@ -287,6 +290,23 @@ describe('toShellDesktopState — never implies an observation it does not have'
     it('carries `restart`, the key the Settings Troubleshoot button feature-detects on', () => {
         expect(toShellDesktopState({ isConfigured: true, hasHmacSecret: true }).endpoints.restart).toBe(
             '/api/shell/restart',
+        );
+    });
+
+    /**
+     * 🔴 Fourth instance of the same feature flag — the container-billing
+     * fix's whole reason for existing. `shell/ezil/apps/desktop-window.js`'s
+     * heartbeat calls `session.reportActivity()` only when
+     * `session.js#activityEndpoint()` reads a truthy
+     * `desktopState.endpoints.activity` here; deleting this key silently
+     * turns every desktop window's heartbeat into a no-op, and the container
+     * that heartbeat exists to keep cool goes back to being resident (and
+     * billed) for as long as a tab is merely left open — with every other
+     * test on both sides still green.
+     */
+    it('carries `activity`, the key the desktop window heartbeat feature-detects on', () => {
+        expect(toShellDesktopState({ isConfigured: true, hasHmacSecret: true }).endpoints.activity).toBe(
+            '/api/shell/activity',
         );
     });
 });

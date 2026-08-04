@@ -685,6 +685,113 @@ export async function requestGuacamoleFocusApp(
     }
 }
 
+// ─── Activity heartbeat (POST /sandbox/:name/activity) ────────────────────────
+//
+// The client-side half of the container-billing fix: `boot.js` used to warm a
+// container on every login and `worker/src/index.ts`'s 10s workspace-flush
+// alarm called `containerFetch()` on every tick, which auto-starts a stopped
+// container per the SDK — so nothing could ever tell the difference between
+// "someone is watching this desktop" and "a tab is merely still open", and a
+// container could sit resident (billed) for HOURS with nobody at the wheel.
+// This is the request `shell/ezil/apps/desktop-window.js`'s heartbeat sends
+// every `HEARTBEAT_INTERVAL_MS` (`shell/ezil/activity-heartbeat.js`) while a
+// human is actually there, so the Worker's own idle-reaper alarm has a real
+// signal to cool down on instead of none at all.
+
+export interface GuacamoleActivityResult {
+    ok: boolean;
+    /** The Worker's own error string, when it answered at all. */
+    error?: string;
+}
+
+/**
+ * Tell the Worker a human is present at this sandbox's desktop.
+ *
+ * 🔴 `worker/src/index.ts`'s `POST /sandbox/:name/activity` handler MUST NOT
+ * touch the container to serve this — no `exec`, no `containerFetch` — or a
+ * heartbeat that exists so an idle container can sleep would itself be what
+ * keeps waking it up, exactly the `flushWorkspaceScheduled` defect this whole
+ * fix is closing. This function has no way to enforce that from here; it
+ * only has to not make the mistake worse by calling anything OTHER than this
+ * one lightweight route.
+ *
+ * Same HMAC envelope as `/focus` and `/restart` (`mintSandboxPreviewToken`,
+ * presented as `Authorization: Bearer`) — no new auth scheme. The Worker
+ * gates this route behind the same `authorizeSignedControlRequest` and a
+ * `SANDBOX_ACTIVITY=off` kill switch that 404s before auth is attempted.
+ *
+ * NEVER THROWS, and a resolved promise here is NOT proof the Worker recorded
+ * anything — callers must read `ok`. This is a best-effort heartbeat: a
+ * failed beat is swallowed by the client (`session.js#reportActivity`'s own
+ * doc comment), never retried, because the next one is only
+ * `HEARTBEAT_INTERVAL_MS` away and retrying a heartbeat is a contradiction in
+ * terms.
+ */
+export async function requestGuacamoleActivity(
+    config: CloudflareGuacamoleConfig,
+    hmacSecret: string,
+    sandboxName: string,
+    lastInputAgoMs: number,
+    correlationId: string = newCorrelationId(),
+): Promise<GuacamoleActivityResult> {
+    if (!config.isConfigured) {
+        return { ok: false, error: 'provider_not_configured' };
+    }
+
+    const token = mintSandboxPreviewToken(hmacSecret);
+    const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/activity`;
+
+    try {
+        const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                [CORRELATION_HEADER]: correlationId,
+            },
+            body: JSON.stringify({ lastInputAgoMs }),
+            // A Durable Object storage write, not a container call — generous
+            // against any transient edge latency, well under any route budget.
+            signal: AbortSignal.timeout(10_000),
+        });
+
+        // Same parse-either-way rule as `requestGuacamoleFocusApp`: a
+        // rejected/disabled heartbeat can still carry a JSON body worth
+        // logging.
+        const text = await res.text().catch(() => '');
+        let data: { ok?: unknown; error?: unknown } = {};
+        try {
+            data = text ? (JSON.parse(text) as typeof data) : {};
+        } catch {
+            // Non-JSON (an edge error page). The raw text still reaches the log.
+        }
+
+        if (!res.ok || data.ok !== true) {
+            console.warn('[cloudflare-guacamole] activity heartbeat rejected', {
+                sandboxName,
+                status: res.status,
+                body: text.slice(0, 300),
+            });
+            return {
+                ok: false,
+                error:
+                    typeof data.error === 'string'
+                        ? data.error
+                        : `worker_http_${res.status}: ${text.slice(0, 300)}`,
+            };
+        }
+
+        return { ok: true };
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn('[cloudflare-guacamole] activity heartbeat failed (non-fatal):', {
+            sandboxName,
+            error: message,
+        });
+        return { ok: false, error: message };
+    }
+}
+
 // ─── Desktop restart control (POST /sandbox/:name/restart) ────────────────────
 
 /**
