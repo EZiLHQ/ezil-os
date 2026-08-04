@@ -119,6 +119,13 @@ const FRAME_CONFIRM_RETRY_MS = 1_500;
  * @returns {Promise<HTMLElement|null>}
  */
 export async function openPreviewWindow (ctx = {}) {
+    // `registry.js#launch` hands this in when it opened the trace for THIS
+    // app-open (`owns_boot_trace: true` on the `preview` descriptor) — see
+    // that file's own doc on the flag, and `desktop-window.js`'s identical
+    // seam. Defaulted so this function stays callable without a registry
+    // launch. `.end()` is idempotent, so calling it from more than one
+    // terminal point (a `settle_frame` failure racing `dispose()`) is safe.
+    const trace = ctx.trace ?? { step () {}, end () {} };
     const computer = ctx.computer ?? ctx.payload?.computer ?? null;
     const desktop_state = ctx.desktopState ?? ctx.payload?.desktopState ?? {};
     const title = computer?.name ? `${computer.name} — Preview` : 'Preview';
@@ -217,6 +224,11 @@ export async function openPreviewWindow (ctx = {}) {
         if ( desktop_state.configured !== true ) {
             console.warn(`[${PHASE}] no desktop provider is configured`);
             progress.render(computeBootUiState({ requestStatus: 'not_configured', elapsedMs: 0 }));
+            // Terminal: no provider means no mint will ever be attempted.
+            // `'skipped'`, not `'error'` — an honest, known deployment
+            // state, not a failure this boot attempted and lost.
+            trace.step('not_configured');
+            trace.end('skipped');
             return;
         }
 
@@ -267,6 +279,11 @@ export async function openPreviewWindow (ctx = {}) {
             if ( res.errorCode === 'app_preview_unavailable' ) {
                 console.warn(`[${PHASE}] this computer cannot serve an app preview: ${res.errorCode}`);
                 show_unavailable();
+                // Terminal: an honest, known "this deployment does not
+                // support it" state — the same reasoning as `not_configured`
+                // above, not a failure this boot attempted and lost.
+                trace.step('mint_unavailable');
+                trace.end('skipped');
                 return;
             }
             console.error(`[${PHASE}] preview mint failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`);
@@ -279,6 +296,10 @@ export async function openPreviewWindow (ctx = {}) {
                 elapsedMs: performance.now() - t0,
                 errorCode: res.errorCode,
             }));
+            // Terminal: the mint failed for real, so there is no URL to
+            // navigate to.
+            trace.step('mint_error');
+            trace.end('error');
             return;
         }
 
@@ -291,10 +312,18 @@ export async function openPreviewWindow (ctx = {}) {
         if ( typeof preview_url !== 'string' || preview_url === '' ) {
             console.warn(`[${PHASE}] preview-url returned ok with no URL; app preview is not available`);
             show_unavailable();
+            // Terminal, and `'error'` rather than `'skipped'`: this is
+            // `session.previewUrl` violating its own "never `ok` without a
+            // URL" contract, not an honest "not configured for this
+            // deployment" answer — worth standing out from the
+            // `mint_unavailable` case above in telemetry.
+            trace.step('mint_url_missing');
+            trace.end('error');
             return;
         }
 
         console.info(`[${PHASE}] mint resolved in ${Math.round(performance.now() - t0)}ms`);
+        trace.step('mint_ok');
         // Same rule as `desktop-window.js`: only the SERVER's confirmation
         // may reveal the frame; render() below still gates on `frameConfirmed`.
         progress.render(computeBootUiState({
@@ -338,6 +367,11 @@ export async function openPreviewWindow (ctx = {}) {
                 progress.el.hidden = true;
                 el_unavailable.hidden = true;
                 console.info(`[${PHASE}] preview frame confirmed by the server`);
+                // Terminal: unlike `desktop-window.js` there is no separate
+                // display gate here — a confirmed frame IS the whole
+                // verdict for this window.
+                trace.step('confirm_ok');
+                trace.end('ok');
                 return;
             }
 
@@ -352,6 +386,9 @@ export async function openPreviewWindow (ctx = {}) {
                 elapsedMs: 0,
                 frameConfirmed: false,
             }));
+            // Terminal: the frame never confirmed.
+            trace.step('confirm_error');
+            trace.end('error');
         };
 
         el_iframe.addEventListener('load', () => { void ask(); }, { once: true });
@@ -362,6 +399,13 @@ export async function openPreviewWindow (ctx = {}) {
         disposed = true;
         stop_timers();
         window.removeEventListener('ezil:teardown', dispose);
+        // The window can close mid-boot before any terminal point above ever
+        // fires. Without this the trace would sit open until `registry.js`'s
+        // bounded fallback finally closes it as `'unknown'`. `'skipped'`:
+        // abandoned, not failed and not completed. No-op if a terminal point
+        // already ended it (`trace.step`/`trace.end` are idempotent).
+        trace.step('disposed');
+        trace.end('skipped');
     };
 
     el_window.on_before_exit = async () => {
