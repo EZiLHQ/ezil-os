@@ -266,6 +266,14 @@ const FULLBLEED_CLASS = 'ezil-fullbleed';
  * @returns {Promise<HTMLElement|null>}
  */
 export async function openDesktopWindow (ctx = {}) {
+    // `registry.js#launch` hands this in when it opened the trace for THIS
+    // app-open (`owns_boot_trace: true` on the `desktop` descriptor) — see
+    // that file's own doc on the flag. Defaulted to a no-op pair so this
+    // function stays callable directly (a future test, a REPL) without
+    // throwing on a missing `ctx.trace`. `.end()` is idempotent even on the
+    // REAL trace, so calling it more than once from below (e.g. `dispose()`
+    // racing a terminal `settle()`) is always safe.
+    const trace = ctx.trace ?? { step () {}, end () {} };
     const computer = ctx.computer ?? ctx.payload?.computer ?? null;
     const desktop_state = ctx.desktopState ?? ctx.payload?.desktopState ?? {};
     // The computer's own name, not the app's: the window IS that machine, and
@@ -513,6 +521,12 @@ export async function openDesktopWindow (ctx = {}) {
             // both boot surfaces hide the button for this state on purpose.
             console.warn(`[${PHASE}] no desktop provider is configured`);
             render_both(computeBootUiState({ requestStatus: 'not_configured', elapsedMs: 0 }));
+            // Terminal: there is no provider to ever mint from, so nothing
+            // further will happen on this attempt. `'skipped'`, not
+            // `'error'` — this is an honest, known deployment state, not a
+            // failure the boot attempted and lost.
+            trace.step('not_configured');
+            trace.end('skipped');
             return;
         }
 
@@ -569,12 +583,21 @@ export async function openDesktopWindow (ctx = {}) {
                 elapsedMs: performance.now() - t0,
                 errorCode: res.errorCode,
             }));
+            // Terminal: the mint itself failed, so there is no URL to
+            // navigate to and nothing further will run on this attempt.
+            trace.step('mint_error');
+            trace.end('error');
             return;
         }
 
         console.info(`[${PHASE}] desktop URL in ${Math.round(performance.now() - t0)}ms`
             + ` (${Math.round(performance.now() - t_open)}ms since the window opened;`
             + ` frame confirmed server-side: ${res.frameConfirmed === true})`);
+        // Not terminal — the frame check and the display gate below still
+        // have to run before this open has a verdict — but a real breadcrumb
+        // for how long the mint itself took, which is exactly the "real
+        // stage timing" `attrs.phases` was missing entirely before this fix.
+        trace.step('mint_ok');
 
         if ( res.frameConfirmed === true ) {
             // 🔴 NOT `ready`, and this is the change the whole task turns on.
@@ -685,6 +708,10 @@ export async function openDesktopWindow (ctx = {}) {
                 // It is now the RELEASE for the second gate, which is the one
                 // that can actually end the boot and which has been asking
                 // since the navigation. See `start_display_gate`.
+                //
+                // Not terminal on its own — the display gate below is what
+                // actually ends this trace, once IT reaches a verdict.
+                trace.step('confirm_ok');
                 gate.frameConfirmed();
                 return;
             }
@@ -702,6 +729,11 @@ export async function openDesktopWindow (ctx = {}) {
                 elapsedMs: 0,
                 frameConfirmed: false,
             }));
+            // Terminal: the origin never confirmed as a desktop, `gate.stop()`
+            // just retired the display gate too, and nothing further will run
+            // on this attempt.
+            trace.step('confirm_error');
+            trace.end('error');
         };
 
         el_iframe.addEventListener('load', () => { void ask(); }, { once: true });
@@ -850,6 +882,13 @@ export async function openDesktopWindow (ctx = {}) {
                 // The blank frame is never revealed. The panel stays, over an
                 // ordinary window, on an OS with its taskbar still on it.
                 show_panel();
+                // Terminal: this is the FIRST time this open reached a
+                // verdict (the `revealed` branch above already returned for
+                // a late failure arriving after a real reveal), and that
+                // verdict is "no pixels reached the browser" — a real boot
+                // failure, not a partial success.
+                trace.step('display_failed');
+                trace.end('error');
                 return;
             }
 
@@ -878,6 +917,18 @@ export async function openDesktopWindow (ctx = {}) {
                 ? 'the display was observed streaming'
                 : 'the display could not be verified');
             revealed = true;
+            // Terminal, for the TRACE specifically, the first time this
+            // fires — this is the moment the desktop actually became visible
+            // to the user, `ready` or `ready_unverified` alike. A LATER call
+            // that upgrades `ready_unverified` to `ready` (the poll kept
+            // asking after `reveal_unverified` already showed the desktop —
+            // see `ask()`'s `pending_live`/`frame_ok` handling) re-runs this
+            // whole branch, but `trace.step`/`trace.end` are both no-ops
+            // once `.end()` has already fired once, so the boot_summary this
+            // open produces is the one from the FIRST reveal, not a second
+            // row and not a row overwritten out from under it.
+            trace.step(state.kind === 'ready' ? 'display_live' : 'display_unverified');
+            trace.end('ok');
             if ( state.kind === 'ready' || terminal ) stop();
         };
 
@@ -1180,6 +1231,16 @@ export async function openDesktopWindow (ctx = {}) {
         stop_timers();
         observer.disconnect();
         window.removeEventListener('ezil:teardown', dispose);
+        // The window can close (or be torn down) mid-boot, before ANY of the
+        // terminal points above ever fires — a user closing the boot panel,
+        // `../boot.js`'s `ensure_intact` rebuilding the desktop out from
+        // under an orphan. Without this the trace would sit open until
+        // `registry.js`'s bounded fallback finally closes it as `'unknown'`,
+        // minutes later. `'skipped'`: the boot was abandoned, not failed and
+        // not completed. No-op if a terminal point already ended it —
+        // `trace.step`/`trace.end` are both idempotent after `.end()`.
+        trace.step('disposed');
+        trace.end('skipped');
     };
 
     // `$.fn.close` awaits this before it dismantles anything, so it is the one
