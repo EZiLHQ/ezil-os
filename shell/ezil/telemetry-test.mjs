@@ -77,12 +77,17 @@ push('capture() called 1000x with no browser globals at all: never throws', ! th
 //
 //     Exercises the shipped `newEventId()` against all three environments:
 //     randomUUID present, getRandomValues only, and neither.
+//
+//     🔴 EXTRACTED to `./trace.js` (`beginTrace()` needs the same generator
+//     for a trace id — see that file's own header for why it moved and why
+//     `telemetry.js` now imports it back rather than defining a second one).
+//     Read from `trace.js`'s source, not `telemetry.js`'s, on purpose.
 // ═══════════════════════════════════════════════════════════════════════════
 {
-    const src = fs.readFileSync(path.join(here, 'telemetry.js'), 'utf8');
-    const start = src.indexOf('function newEventId');
-    const end = src.indexOf('function keyFor');
-    const makeFn = new Function('crypto', `${src.slice(start, end)}; return newEventId;`);
+    const src = fs.readFileSync(path.join(here, 'trace.js'), 'utf8');
+    const start = src.indexOf('export function newEventId');
+    const end = src.indexOf('let ambientTrace');
+    const makeFn = new Function('crypto', `${src.slice(start, end).replace('export function', 'function')}; return newEventId;`);
     const V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
     const getRandomValuesOnly = {
         getRandomValues: (b) => { for ( let i = 0; i < b.length; i++ ) b[i] = (Math.random() * 256) | 0; return b; },

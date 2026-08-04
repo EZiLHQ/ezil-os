@@ -62,6 +62,15 @@
 // `window.__EZIL_BOOT__` directly is the same one-line contract
 // `session.js`'s own `payload()` uses, kept local so this file has zero
 // shell-internal dependencies — a leaf module, deliberately.
+//
+// `./trace.js` is the ONE exception, and it is safe for a different reason
+// than "leaf module": that file has zero top-level side effects (no
+// self-installing behaviour, unlike this file's own tail), so importing it
+// cannot disturb the "telemetry.js must be the FIRST import" ordering
+// `boot.js` depends on — see `trace.js`'s own header for the full account of
+// why the dependency runs this direction and not the other.
+import { newEventId, ambientCorrelationId } from './trace.js';
+
 function bootPayload () {
     const raw = typeof window === 'undefined' ? null : window.__EZIL_BOOT__;
     if ( ! raw || typeof raw !== 'object' ) return null;
@@ -83,6 +92,17 @@ const EVENT_CLASSES = new Set([
     'api_failure', 'display_failure', 'worker_exception', 'contract_violation',
 ]);
 
+// 🔴 `MAX_PER_KEY` would throttle `boot_summary` to three app-opens per page:
+// each app-open's `site` is `ezil-os:trace#<appId>` and `code` is almost
+// always `ok`, so opening the SAME app a fourth time in one page life shares
+// a key with the first three and gets silently dropped — exactly the traces
+// an admin reviewing "what happened on this page" would want to see. These
+// two classes (breadcrumbs' own summary, and any future direct `boot_phase`
+// emission) are exempted from the per-KEY dedup above and given a shared
+// per-PAGE cap instead — see `capture()`'s branch below.
+const BOOT_EVENT_CLASSES = new Set(['boot_summary', 'boot_phase']);
+const MAX_BOOT_EVENTS_PER_PAGE = 12;
+
 // ── module state ────────────────────────────────────────────────────────────
 // One page load, one buffer. Nothing here is meant to survive a reload — an
 // unflushed tail is an accepted, documented loss (design doc §10.2), not a
@@ -95,6 +115,7 @@ let killed = false;        // two consecutive transport failures -> stop for goo
 let flushTimer = null;
 let dropped = 0;
 const perKeySeen = new Map();
+let bootEventCount = 0;    // shared per-page counter for BOOT_EVENT_CLASSES
 let reentering = false;    // stops capture() recursing through its own onerror
 
 function endpointUrl () {
@@ -190,41 +211,12 @@ function firstFrame (err) {
     return file ? `${fn}@${file}`.slice(0, 96) : undefined;
 }
 
-/**
- * A real RFC-4122 v4 uuid, always.
- *
- * 🔴 `crypto.randomUUID` requires a SECURE CONTEXT — it is `undefined` on a
- * plain-http origin. The previous fallback here was
- * `String(Date.now()) + Math.random()...`, which is not a uuid, and the ingest
- * route's zod schema is `eventId: z.string().uuid()` inside a `.strict()`
- * parse that drops the WHOLE event. So on any non-secure origin this module
- * would have armed, buffered, flushed, got its 202 (the route always answers
- * 202) and had 100% of its events silently discarded server-side, with
- * nothing anywhere to indicate it. `crypto.getRandomValues` has no
- * secure-context requirement, so it covers the gap; `Math.random` is the last
- * resort and still produces a well-formed v4.
- */
-function newEventId () {
-    try {
-        if ( typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ) {
-            return crypto.randomUUID();
-        }
-        const b = new Uint8Array(16);
-        if ( typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function' ) {
-            crypto.getRandomValues(b);
-        } else {
-            for ( let i = 0; i < 16; i++ ) b[i] = Math.floor(Math.random() * 256);
-        }
-        b[6] = (b[6] & 0x0f) | 0x40; // version 4
-        b[8] = (b[8] & 0x3f) | 0x80; // variant 10x
-        const h = [];
-        for ( let i = 0; i < 16; i++ ) h.push(b[i].toString(16).padStart(2, '0'));
-        return `${h.slice(0, 4).join('')}-${h.slice(4, 6).join('')}-${h.slice(6, 8).join('')}`
-            + `-${h.slice(8, 10).join('')}-${h.slice(10, 16).join('')}`;
-    } catch {
-        return '00000000-0000-4000-8000-000000000000';
-    }
-}
+// `newEventId()` used to live here. EXTRACTED to `./trace.js` (imported
+// above) so `beginTrace()` can mint a trace id with the exact same
+// secure-context-safe generator, per the design brief: "do NOT write a
+// second uuid generator". See that file's header for the full account,
+// including why importing it here does not reintroduce the "leaf module"
+// hazard this file's own header warns about for `./session.js`.
 
 function keyFor (eventClass, site, code) {
     return `${eventClass}${site}${code}`;
@@ -315,6 +307,10 @@ function flush () {
  *   call site this ships beside is itself an error path.
  * @param {unknown} [input.detail] Redacted and capped at 200 chars.
  * @param {number} [input.durationMs]
+ * @param {string} [input.correlationId] Groups this event with the rest of
+ *   one app-open. Explicit value wins; otherwise defaults to whatever trace
+ *   is currently ambient (`./trace.js`'s `beginTrace()`/`ambientCorrelationId()`),
+ *   so most callers never need to pass this at all.
  * @param {string} [input.computerId]
  * @param {Record<string, string|number|boolean>} [input.attrs] Bounded extras;
  *   the ingest route strips anything not on its per-class allow-list, so this
@@ -332,10 +328,20 @@ export function capture (input) {
 
         const site = normalizeSite(input.site);
         const code = normalizeCode(input.code);
-        const key = keyFor(eventClass, site, code);
-        const seen = perKeySeen.get(key) ?? 0;
-        if ( seen >= MAX_PER_KEY ) return;
-        perKeySeen.set(key, seen + 1);
+
+        if ( BOOT_EVENT_CLASSES.has(eventClass) ) {
+            // 🔴 Exempt from the per-(class+site+code) dedup below — see
+            // BOOT_EVENT_CLASSES' own comment for why that dedup would
+            // throttle repeat app-opens to three per page. A shared per-page
+            // cap still bounds the worst case (a pathological loop of opens).
+            if ( bootEventCount >= MAX_BOOT_EVENTS_PER_PAGE ) return;
+            bootEventCount += 1;
+        } else {
+            const key = keyFor(eventClass, site, code);
+            const seen = perKeySeen.get(key) ?? 0;
+            if ( seen >= MAX_PER_KEY ) return;
+            perKeySeen.set(key, seen + 1);
+        }
 
         if ( buffer.length >= MAX_BUFFER ) {
             buffer.shift();
@@ -357,6 +363,15 @@ export function capture (input) {
         if ( typeof input.durationMs === 'number' && Number.isFinite(input.durationMs) ) {
             event.durationMs = Math.max(0, Math.round(input.durationMs));
         }
+        // Explicit caller value wins; otherwise default to whatever app-open
+        // trace is currently ambient (`registry.js`'s `launch()` opens one) —
+        // the single change that groups every existing capture() call site
+        // under one app-open's correlation id without editing any of them.
+        const correlationId = (typeof input.correlationId === 'string' && input.correlationId)
+            ? input.correlationId
+            : ambientCorrelationId();
+        // 64 chars, per the wire contract (`TELEMETRY_LIMITS.MAX_CORRELATION_ID_LEN`).
+        if ( correlationId ) event.correlationId = String(correlationId).slice(0, 64);
         if ( typeof input.computerId === 'string' && input.computerId ) event.computerId = input.computerId;
         if ( input.attrs && typeof input.attrs === 'object' ) {
             const attrs = {};

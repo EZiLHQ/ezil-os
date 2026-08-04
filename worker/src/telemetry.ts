@@ -270,3 +270,92 @@ export function buildTelemetryR2Key(now: Date, correlationId: string): string {
   const safeId = (correlationId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128) || 'unknown';
   return `v1/dt=${yyyy}-${mm}-${dd}/hh=${hh}/${safeId}.ndjson`;
 }
+
+// ── The R2 drain (`POST /telemetry/drain` + `/telemetry/ack`) ───────────────
+//
+// `spoolTelemetry()` above has been writing to `TELEMETRY_R2_BUCKET` all
+// along; this is the missing last hop that finally reads it. See this
+// module's own top-of-file "KNOWN GAP" note — this section is what closes it.
+//
+// Pure/testable helpers only, same discipline as the rest of this file: the
+// actual `R2Bucket` calls (`.list()`/`.get()`/`.delete()`) live in
+// `./index.ts`'s route handlers, which this module cannot import (no
+// `@cloudflare/sandbox` here). What lives here is everything that does NOT
+// need the Workers runtime to test: request-body parsing, key validation,
+// and the page-size ceiling.
+
+/** All spooled objects live under this prefix (`buildTelemetryR2Key`). The
+ * drain lists ONLY this prefix — never the whole bucket — and the ack route
+ * refuses to delete a key that does not start with it (`parseTelemetryAckKeys`),
+ * so a caller can never turn `/telemetry/ack` into an arbitrary-object delete. */
+export const TELEMETRY_SPOOL_PREFIX = 'v1/';
+
+/** Hard ceiling on objects returned by one `/telemetry/drain` page, and on
+ * keys accepted by one `/telemetry/ack` call (design: "cursor-paged, ≤200
+ * objects"). Independent of R2's own list-page ceiling (1000) — this is a
+ * deliberately smaller number so one drain page is cheap to re-process
+ * whole on a crash between ingest and ack (idempotent via `eventId`, but
+ * still bounded work). */
+export const TELEMETRY_DRAIN_MAX_OBJECTS = 200;
+
+/**
+ * Non-secret production kill-switch for BOTH `/telemetry/drain` and
+ * `/telemetry/ack`. Same vocabulary as `./sandbox-control.ts`'s
+ * `focusDisabled`/`restartDisabled` and `./workspace-diag.ts`'s
+ * `diagDisabled` — set to `off`/`false`/`0`/`disabled`/`no` to hard-disable
+ * both routes (404) without a code change. Both routes share ONE flag
+ * (`SANDBOX_TELEMETRY_DRAIN`) because acking without draining first (or vice
+ * versa) is never a coherent half-state to leave reachable.
+ */
+export function telemetryDrainDisabled(flag: string | undefined): boolean {
+  if (!flag) return false;
+  return ['off', 'false', '0', 'disabled', 'no'].includes(flag.trim().toLowerCase());
+}
+
+/** Clamp a caller-requested page size into `[1, TELEMETRY_DRAIN_MAX_OBJECTS]`.
+ * A missing/non-numeric/non-finite request falls back to the ceiling itself
+ * (the drain cron always wants as much as it is allowed in one page). */
+export function clampDrainLimit(requested: unknown): number {
+  const n = typeof requested === 'number' && Number.isFinite(requested) ? Math.floor(requested) : TELEMETRY_DRAIN_MAX_OBJECTS;
+  return Math.min(Math.max(n, 1), TELEMETRY_DRAIN_MAX_OBJECTS);
+}
+
+export interface TelemetryDrainRequestBody {
+  cursor?: string;
+  limit?: number;
+}
+
+/** Parse `POST /telemetry/drain`'s JSON body. Never throws: an absent or
+ * malformed body just means "start from the beginning, default page size". */
+export function parseTelemetryDrainBody(body: unknown): TelemetryDrainRequestBody {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return {};
+  const b = body as Record<string, unknown>;
+  const cursor = typeof b.cursor === 'string' && b.cursor.trim() !== '' ? b.cursor : undefined;
+  const limit = typeof b.limit === 'number' ? b.limit : undefined;
+  return { cursor, limit };
+}
+
+/**
+ * Validate `POST /telemetry/ack`'s `{ keys: string[] }` body into a safe
+ * delete list: every entry must be a string, rooted under
+ * `TELEMETRY_SPOOL_PREFIX`, and boundedly short — so a caller (even one that
+ * already holds a valid HMAC token) can never turn this route into a delete
+ * of an arbitrary R2 object elsewhere in the bucket. Anything else is
+ * silently dropped from the list, never thrown on — one bad key must not
+ * sink the ack of every other valid one. Capped at
+ * `TELEMETRY_DRAIN_MAX_OBJECTS`, matching the largest page `/telemetry/drain`
+ * can ever hand back in one call.
+ */
+export function parseTelemetryAckKeys(body: unknown): string[] {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return [];
+  const raw = (body as Record<string, unknown>).keys;
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const k of raw) {
+    if (out.length >= TELEMETRY_DRAIN_MAX_OBJECTS) break;
+    if (typeof k === 'string' && k.length > 0 && k.length < 500 && k.startsWith(TELEMETRY_SPOOL_PREFIX)) {
+      out.push(k);
+    }
+  }
+  return out;
+}

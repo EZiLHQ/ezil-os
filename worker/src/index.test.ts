@@ -1130,6 +1130,36 @@ describe('POST /sandbox/:id/focus wiring', () => {
   });
 });
 
+// ── POST /telemetry/drain + /telemetry/ack wiring ───────────────────────────
+// End-to-end auth/kill-switch/bucket behavior is covered live in
+// `route-auth.test.ts` against the real `fetch()` table; these pin the
+// specific wiring choices — same HMAC gate as `/focus`, one shared kill
+// switch, no bucket call before the gate runs.
+describe('POST /telemetry/drain + /telemetry/ack wiring', () => {
+  const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+
+  it('registers both routes behind SANDBOX_TELEMETRY_DRAIN, gated by authorizeSignedControlRequest', () => {
+    expect(src).toContain("path === '/telemetry/drain'");
+    expect(src).toContain("path === '/telemetry/ack'");
+    expect(src).toContain('telemetryDrainDisabled(env.SANDBOX_TELEMETRY_DRAIN)');
+    expect(src).toContain("json({ ok: false, error: 'telemetry_drain_disabled' }, 404)");
+
+    const drainBlock = src.match(/if \(method === 'POST' && path === '\/telemetry\/drain'\) \{[\s\S]*?\n {4}\}\n/)?.[0] ?? '';
+    expect(drainBlock).toContain('await authorizeSignedControlRequest(request, env, url);');
+    const ackBlock = src.match(/if \(method === 'POST' && path === '\/telemetry\/ack'\) \{[\s\S]*?\n {4}\}\n/)?.[0] ?? '';
+    expect(ackBlock).toContain('await authorizeSignedControlRequest(request, env, url);');
+  });
+
+  it('Env carries SANDBOX_TELEMETRY_DRAIN as a non-secret, optional string', () => {
+    expect(src).toContain('SANDBOX_TELEMETRY_DRAIN?: string;');
+  });
+
+  it('the ack route validates keys through parseTelemetryAckKeys, never trusting the body\'s keys array raw', () => {
+    expect(src).toContain('const keys = parseTelemetryAckKeys(body);');
+    expect(src).not.toMatch(/bucket\.delete\(\s*\(body as[^)]*\)\.keys/);
+  });
+});
+
 // ── Container boot telemetry drain — reaches BOTH the success and failure path ─
 //
 // The end-to-end SUCCESS case (a full ndjson batch actually landing in a fake

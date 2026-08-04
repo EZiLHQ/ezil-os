@@ -189,6 +189,18 @@ interface Env extends SandboxEnv {
   SANDBOX_RESTART?: string;
 
   /**
+   * Non-secret kill-switch for BOTH telemetry-drain control routes
+   * (`POST /telemetry/drain` + `POST /telemetry/ack`, see
+   * `handleTelemetryDrain` / `handleTelemetryAck` and
+   * `./telemetry.ts`'s `telemetryDrainDisabled`). Enabled by default
+   * (HMAC-gated via `authorizeSignedControlRequest`, read/delete confined to
+   * `TELEMETRY_R2_BUCKET`'s own `v1/` spool prefix); set to
+   * `off`/`false`/`0`/`disabled`/`no` to hard-disable both surfaces (404)
+   * without a code change.
+   */
+  SANDBOX_TELEMETRY_DRAIN?: string;
+
+  /**
    * Non-secret opt-in flag forwarded verbatim into the container process env
    * as `EZIL_NEKO_CPU_DIAG_ENABLED` (see `ensureDesktop` + `cpu-diag.ts`),
    * which gates `scripts/start-neko.sh`'s in-container CPU sampler. DEFAULT
@@ -473,6 +485,11 @@ import {
   parseContainerTelemetryLines,
   serializeTelemetryBatch,
   buildTelemetryR2Key,
+  telemetryDrainDisabled,
+  clampDrainLimit,
+  parseTelemetryDrainBody,
+  parseTelemetryAckKeys,
+  TELEMETRY_SPOOL_PREFIX,
 } from './telemetry';
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -3550,6 +3567,94 @@ async function handleFocus(request: Request, env: Env, sandboxName: string): Pro
   }
 }
 
+// ── Telemetry R2-spool drain ─────────────────────────────────────────────────
+//
+// POST /telemetry/drain  { token, cursor?, limit? }
+//   Lists and reads back a page of the R2 spool `spoolTelemetry()` (above)
+//   has been writing to all along — see this module's own `KNOWN GAP` note
+//   in `./telemetry.ts`. Gated with the SAME shared-HMAC envelope as
+//   `/focus`/`/restart`/`DELETE /sandbox/:name` (`authorizeSignedControlRequest`).
+//   Cursor-paged, capped at `TELEMETRY_DRAIN_MAX_OBJECTS` (200) objects per
+//   call. Read-only: nothing is deleted here. The caller (the app's cron —
+//   `app/src/server/telemetry/spool-drain.ts`) is expected to ingest every
+//   object's NDJSON lines into Postgres BEFORE calling `/telemetry/ack` —
+//   idempotent on `eventId`, so a crash between the two, or an ack that never
+//   arrives, costs nothing: the same objects are simply re-drained (and
+//   re-ingested as a no-op) next run.
+//
+// Response: { ok, objects: [{key, body}], cursor?, truncated } on success.
+async function handleTelemetryDrain(request: Request, env: Env): Promise<Response> {
+  const bucket = env.TELEMETRY_R2_BUCKET;
+  if (!bucket) return json({ ok: false, error: 'telemetry_bucket_not_configured' }, 500);
+
+  let body: unknown = {};
+  try {
+    const raw = await request.text();
+    if (raw.trim() !== '') body = JSON.parse(raw);
+  } catch {
+    return json({ ok: false, error: 'invalid_json_body' }, 400);
+  }
+
+  const { cursor, limit } = parseTelemetryDrainBody(body);
+  const pageLimit = clampDrainLimit(limit);
+
+  try {
+    const page = await bucket.list({ prefix: TELEMETRY_SPOOL_PREFIX, cursor, limit: pageLimit });
+    const objects: { key: string; body: string }[] = [];
+    for (const object of page.objects) {
+      const got = await bucket.get(object.key);
+      if (!got) continue; // deleted between list() and get() — skip, not fatal
+      objects.push({ key: object.key, body: await got.text() });
+    }
+    return json({
+      ok: true,
+      objects,
+      cursor: page.truncated ? page.cursor : undefined,
+      truncated: page.truncated,
+    });
+  } catch (err) {
+    return json(
+      { ok: false, error: `telemetry_drain_failed: ${err instanceof Error ? err.message : String(err)}` },
+      500,
+    );
+  }
+}
+
+// POST /telemetry/ack  { token, keys: string[] }
+//   Deletes the given spool objects — called ONLY after the caller has
+//   durably ingested them (see `handleTelemetryDrain`'s doc comment for the
+//   ordering guarantee that makes a lost/duplicated ack harmless). `keys` is
+//   revalidated here via `parseTelemetryAckKeys`, NOT trusted from the drain
+//   response alone — a caller (even one holding a valid HMAC token) can never
+//   delete an R2 object outside the `v1/` spool prefix through this route.
+//
+// Response: { ok, deleted } on success.
+async function handleTelemetryAck(request: Request, env: Env): Promise<Response> {
+  const bucket = env.TELEMETRY_R2_BUCKET;
+  if (!bucket) return json({ ok: false, error: 'telemetry_bucket_not_configured' }, 500);
+
+  let body: unknown = {};
+  try {
+    const raw = await request.text();
+    if (raw.trim() !== '') body = JSON.parse(raw);
+  } catch {
+    return json({ ok: false, error: 'invalid_json_body' }, 400);
+  }
+
+  const keys = parseTelemetryAckKeys(body);
+  if (keys.length === 0) return json({ ok: true, deleted: 0 });
+
+  try {
+    await bucket.delete(keys);
+    return json({ ok: true, deleted: keys.length });
+  } catch (err) {
+    return json(
+      { ok: false, error: `telemetry_ack_failed: ${err instanceof Error ? err.message : String(err)}` },
+      500,
+    );
+  }
+}
+
 // ── Option D: app-preview reverse proxy dispatcher ───────────────────────────
 //
 // Handles every path under the app-preview hostname
@@ -4163,6 +4268,29 @@ export default {
       const unauthorized = await authorizeSignedControlRequest(request, env, url);
       if (unauthorized) return unauthorized;
       return handleFocus(request, env, decodeURIComponent(focusMatch[1]));
+    }
+
+    if (method === 'POST' && path === '/telemetry/drain') {
+      // R2-spool drain. HMAC-gated (SAME envelope as `DELETE
+      // /sandbox/:name`/`/focus`). Operators can hard-disable it WITHOUT a
+      // code change via `SANDBOX_TELEMETRY_DRAIN=off`.
+      if (telemetryDrainDisabled(env.SANDBOX_TELEMETRY_DRAIN)) {
+        return json({ ok: false, error: 'telemetry_drain_disabled' }, 404);
+      }
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      return handleTelemetryDrain(request, env);
+    }
+
+    if (method === 'POST' && path === '/telemetry/ack') {
+      // Same envelope and kill switch as `/telemetry/drain` — see that
+      // route's doc comment for why the two share one flag.
+      if (telemetryDrainDisabled(env.SANDBOX_TELEMETRY_DRAIN)) {
+        return json({ ok: false, error: 'telemetry_drain_disabled' }, 404);
+      }
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      return handleTelemetryAck(request, env);
     }
 
     const restartMatch = path.match(/^\/sandbox\/([^/]+)\/restart$/);
