@@ -1889,9 +1889,14 @@ const CONTAINER_BUSY_LOAD1 = 0.5;
 export function parseLoadAvg1(stdout: string): number | null {
   const first = String(stdout ?? '').trim().split(/\s+/)[0];
   if (!first) return null;
-  // `Number('')` is 0 and `Number('0.5abc')` is NaN; require the whole token
-  // to be a plain decimal so a truncated or error-shaped stdout can never be
-  // coerced into a low, stop-authorizing reading.
+  // 🔴 Require the WHOLE token to be a plain decimal. The `Number.isFinite`
+  // and `< 0` checks below are not sufficient on their own and it is worth
+  // being precise about why: they happen to reject the obvious garbage
+  // (`cat:` -> NaN, `0.5abc` -> NaN, `-1.0` -> negative), but JS will gladly
+  // evaluate `5e-3` to 0.005 and `0x0` to 0 — values BELOW the busy
+  // threshold, i.e. authorizations to STOP a container, conjured out of bytes
+  // `/proc/loadavg` cannot emit. This format check is the guard that actually
+  // carries the fail-safe for that class of input.
   if (!/^\d+(\.\d+)?$/.test(first)) return null;
   const value = Number(first);
   if (!Number.isFinite(value) || value < 0) return null;
