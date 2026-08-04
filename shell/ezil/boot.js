@@ -325,6 +325,56 @@ function mount_desktop_root () {
 }
 
 /**
+ * Warm the desktop container only when there is somewhere for it to open —
+ * the SAME gate `build()` used to apply once, unconditionally, at login (see
+ * "LOGIN NO LONGER WARMS" further down for why that changed). Never sends a
+ * request whose answer is already known (`configured !== true`), and never
+ * warms a deployment that cannot serve the app at all.
+ *
+ * @param {object} ctx `{ computer, desktopState }`, as built by `build()`.
+ * @param {import('./apps/registry.js').AppDescriptor[]} apps
+ */
+function maybe_warm_desktop (ctx, apps) {
+    if ( ctx?.computer?.id
+        && ctx?.desktopState?.configured === true
+        && apps.some((a) => a.id === 'desktop') ) {
+        warm(ctx.computer.id);
+    }
+}
+
+/**
+ * 🔴 WARM ON INTENT, NOT ON LOGIN (container-billing fix). `warm()` used to
+ * fire unconditionally the instant the desktop painted — see "LOGIN NO LONGER
+ * WARMS" in `build()`, below, for the full account of why that booted a
+ * container for every user who merely landed on `/os`. `warm()` ITSELF is
+ * unchanged: still single-flight, still `WARM_MAX_AGE_MS` (see that file's
+ * own header) — what changed is WHO calls it and WHEN. A `pointerenter`
+ * (the cursor arriving over the target) or a `pointerdown` (about to click
+ * it) on the Browser dock icon or its Start-menu entry is the first moment a
+ * real open is actually likely, which is the whole reason `warm()` exists:
+ * to have paid for as much of the ~22s cold boot as possible before the click
+ * that needs it.
+ *
+ * Both events are bound, on purpose: a mouse user typically fires
+ * `pointerenter` before `pointerdown`, but a keyboard/switch user reaching the
+ * dock item with focus-and-Enter never fires `pointerenter` at all, so
+ * `pointerdown` alone still covers them. Firing `warm()` twice for the same
+ * computer (hover THEN click) is a documented no-op — see that file's own
+ * `warm()` — so binding both, and binding this on two separate surfaces
+ * (the dock and the Start menu), cannot double-boot anything.
+ *
+ * @param {Element|null|undefined} el The dock icon or launcher menu item, if it exists.
+ * @param {object} ctx
+ * @param {import('./apps/registry.js').AppDescriptor[]} apps
+ */
+function bind_warm_intent (el, ctx, apps) {
+    if ( ! el ) return;
+    const on_intent = () => { maybe_warm_desktop(ctx, apps); };
+    el.addEventListener('pointerdown', on_intent);
+    el.addEventListener('pointerenter', on_intent);
+}
+
+/**
  * Tears down whatever `start_menu` currently points at, however it needs to
  * go: the toggle-click path wants it gone SYNCHRONOUSLY (so a click landing a
  * beat later sees a clean "closed" state, not a menu still mid-fade), so this
@@ -379,6 +429,16 @@ function open_start_menu (apps, ctx, el_anchor) {
     // used to pick the LAST of possibly several such nodes for exactly that
     // ambiguity; the factory now makes the ambiguity impossible, not just rare.
     const el = document.querySelector('.context-menu:not([data-is-submenu="true"])');
+
+    // 🔴 WARM ON INTENT — the Start-menu half of the same fix as the dock
+    // icon in `build()`. `items` above is built from `apps`, in order, so the
+    // Browser entry's `data-action` index (`UIContextMenu`'s own markup, see
+    // that file) is just `apps`' own index of it. See `bind_warm_intent`'s
+    // doc comment for why both `pointerdown` and `pointerenter` are bound.
+    const desktop_idx = apps.findIndex((a) => a.id === 'desktop');
+    if ( desktop_idx !== -1 ) {
+        bind_warm_intent(el?.querySelector(`li[data-action="${desktop_idx}"]`), ctx, apps);
+    }
 
     const on_outside_mousedown = (e) => {
         if ( el?.contains(e.target) ) return;
@@ -466,7 +526,7 @@ async function build (payload) {
     // the desktop. UIWindow sees the item already exists and just increments
     // its open-window count.
     for ( const app of apps.filter(a => a.pinned) ) {
-        UITaskbarItem({
+        const el_item = UITaskbarItem({
             app: app.id,
             name: app.name,
             icon: app.icon,
@@ -478,6 +538,12 @@ async function build (payload) {
             // window and opens one otherwise.
             onClick: () => { void registry.launch(app.id, ctx); },
         });
+        // 🔴 WARM ON INTENT — see `bind_warm_intent`'s doc comment and "LOGIN
+        // NO LONGER WARMS" below. The dock icon is the far more common path to
+        // opening Browser than the Start menu (`open_start_menu` binds the
+        // same thing on that surface), so THIS is where most real opens will
+        // actually earn their head start on the ~22s cold boot.
+        if ( app.id === 'desktop' ) bind_warm_intent(el_item, ctx, apps);
     }
 
     // Bound ONCE, whatever happens afterwards: a rebuild that re-bound it
@@ -516,22 +582,20 @@ async function build (payload) {
     console.info(`[${PHASE}] resolved ${apps.length} app(s); opening none automatically`,
         apps.map(a => a.id));
 
-    // Warm the desktop container SILENTLY, right here, well before the user
-    // has clicked anything — see `warm.js`. Fire-and-forget on purpose: this
-    // function's caller (`mount`) must not be held open by a request that can
-    // take ~22s, and a warm that fails costs nothing worse than the ordinary
-    // cold boot the eventual real launch would have paid anyway.
-    //
-    // Gated the same way `desktop-window.js#start_boot` gates its own first
-    // request, so this never sends a request whose answer is already known
-    // (`configured !== true`), and only for a deployment that actually served
-    // the desktop app — warming a container nobody can open would just be a
-    // second cold boot nobody asked for.
-    if ( ctx.computer?.id
-        && ctx.desktopState?.configured === true
-        && apps.some((a) => a.id === 'desktop') ) {
-        warm(ctx.computer.id);
-    }
+    // 🔴 LOGIN NO LONGER WARMS (container-billing fix). This used to fire
+    // `warm()` SILENTLY, right here, the instant the desktop painted — well
+    // before the user had clicked anything. Sound reasoning for "make the
+    // first real click fast"; wrong for "boot a Cloudflare container for
+    // every login". MEASURED: a container idle-resident for 26 hours on a
+    // 30-minute sleep timer, because the flush loop `ensureDesktop` starts on
+    // a successful mint resets the container's idle clock every 10 seconds —
+    // so a container this call warmed for a user who never opened Browser
+    // stayed billed indefinitely, not for the ~22s this file's own header
+    // describes. `warm()` now fires from `bind_warm_intent`, wired onto the
+    // dock icon (in this function, above) and the Start-menu entry (in
+    // `open_start_menu`) — the first moment a click is actually likely,
+    // rather than the moment the wallpaper exists. `warm()` itself, and its
+    // single-flight + `WARM_MAX_AGE_MS` semantics, are unchanged.
 }
 
 // ───────────────────────────────────────────────────────────────────────────

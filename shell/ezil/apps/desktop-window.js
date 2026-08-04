@@ -92,6 +92,7 @@ import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
 import { claim as claimWarm } from '../warm.js';
 import telemetry from '../telemetry.js';
 import { applyDisplayEvidence, computeBootUiState } from '../boot-phases.js';
+import { HEARTBEAT_INTERVAL_MS, shouldHeartbeat } from '../activity-heartbeat.js';
 import BootProgress, { DisplayNotice } from '../ui/boot-progress.js';
 import AppSpinner from '../ui/app-spinner.js';
 import attach_app_drawer from '../ui/app-drawer.js';
@@ -254,6 +255,61 @@ function is_minimized (el) {
 const FULLBLEED_CLASS = 'ezil-fullbleed';
 
 /**
+ * Run `tick` on `ms`, but only while the document is visible (container
+ * billing fix — a backgrounded tab must not keep generating network traffic).
+ *
+ * 🔴 TORN DOWN on hidden and REBUILT on visible, not merely skipped inside the
+ * callback: a `setInterval` that keeps ticking every `ms` while hidden and
+ * just no-ops its body is still a running timer, and the point here is zero
+ * polling while backgrounded, not merely zero VISIBLE effect from it. Started
+ * immediately unless the document is ALREADY hidden at construction time (an
+ * edge case no test in this file exercises today — `document.visibilityState`
+ * is always `'visible'` under jsdom — but the guard costs nothing and keeps
+ * this helper correct if that ever changes).
+ *
+ * Used by the status poll (`POLL_MS`) in `start_boot` below. The display
+ * gate's own periodic re-ask (`DISPLAY_POLL_MS`/`DISPLAY_POLL_SLOW_MS`) is
+ * NOT built on this — it self-reschedules via `setTimeout` rather than
+ * `setInterval`, so `start_display_gate` pauses it with its own, smaller
+ * `schedule_next_ask` instead. Either way, only the TICKING pauses: neither
+ * this helper nor `schedule_next_ask` touches a single deadline
+ * (`DISPLAY_UNVERIFIED_DEADLINE_MS`/`DISPLAY_BLANK_DEADLINE_MS`), which stay
+ * wall-clock and keep counting whichever way the tab is showing.
+ *
+ * @param {() => void} tick
+ * @param {number} ms
+ * @returns {{ stop: () => void }} tears the whole thing down, in any visibility state.
+ */
+function visibilityGatedInterval (tick, ms) {
+    let id = null;
+    let stopped = false;
+
+    const pause = () => {
+        if ( id !== null ) { clearInterval(id); id = null; }
+    };
+    const resume = () => {
+        if ( stopped || id !== null ) return;
+        if ( document.visibilityState === 'hidden' ) return;
+        id = setInterval(tick, ms);
+    };
+    const on_visibility = () => {
+        if ( document.visibilityState === 'hidden' ) pause();
+        else resume();
+    };
+
+    document.addEventListener('visibilitychange', on_visibility);
+    resume();
+
+    return {
+        stop () {
+            stopped = true;
+            pause();
+            document.removeEventListener('visibilitychange', on_visibility);
+        },
+    };
+}
+
+/**
  * Open the desktop window.
  *
  * @param {object} ctx
@@ -369,7 +425,8 @@ export async function openDesktopWindow (ctx = {}) {
 
     // ── boot state ─────────────────────────────────────────────────────────
     let tick_timer = null;
-    let poll_timer = null;
+    /** The status-poll's `visibilityGatedInterval` handle, or null between attempts. */
+    let poll_gate = null;
     let attempt = 0;          // guards a stale request finishing after a retry
     let running_signal;       // undefined until a poll lands; never coerced to false
     let disposed = false;
@@ -395,8 +452,68 @@ export async function openDesktopWindow (ctx = {}) {
 
     const stop_timers = () => {
         clearInterval(tick_timer); tick_timer = null;
-        clearInterval(poll_timer); poll_timer = null;
+        poll_gate?.stop(); poll_gate = null;
     };
+
+    // ── activity heartbeat (container-billing fix) ──────────────────────────
+    // Tells the server a human is present, every `HEARTBEAT_INTERVAL_MS`,
+    // for as long as THIS window is open — see `../activity-heartbeat.js` for
+    // the (independently, instantly unit-tested) eligibility rule and why it
+    // is a separate pure module rather than inline here.
+    //
+    // 🔴 SPANS THE WHOLE WINDOW, NOT ONE BOOT ATTEMPT. Unlike `tick_timer`/
+    // `poll_gate` above, this does not stop when a boot attempt settles —
+    // the whole point is a heartbeat for as long as the desktop is open and
+    // watched, whether it is still booting or long since revealed. It starts
+    // once, here, and only `dispose()` below ever ends it.
+    //
+    // Input is tracked at the DOCUMENT level, not on the iframe: the iframe
+    // is a cross-origin Neko session (see this file's own header on why its
+    // pixels are unreachable), so key/pointer events whose target is inside
+    // it never reach this document at all — there is no DOM signal from
+    // "inside the stream" to listen for. What this window CAN see honestly is
+    // whether a human is at the keyboard/mouse at all while it is open: the
+    // click that focuses the iframe, drawer/taskbar interaction, anything
+    // landing on the wallpaper. That is the real, buildable meaning of "real
+    // user input" from a parent page that structurally cannot see inside a
+    // cross-origin child.
+    let last_input_at = performance.now();
+    const note_input = () => { last_input_at = performance.now(); };
+    document.addEventListener('pointerdown', note_input, true);
+    document.addEventListener('pointermove', note_input, true);
+    document.addEventListener('keydown', note_input, true);
+
+    let heartbeat_timer = null;
+    const heartbeat_tick = () => {
+        if ( disposed ) return;
+        const lastInputAgoMs = performance.now() - last_input_at;
+        if ( ! shouldHeartbeat({ visible: document.visibilityState === 'visible', lastInputAgoMs }) ) return;
+        // Best-effort and silently swallowed — see `session.js#reportActivity`'s
+        // own doc comment. A missed beat costs nothing; the next one is only
+        // `HEARTBEAT_INTERVAL_MS` away, and there is nothing useful to retry.
+        void session.reportActivity(computer.id, Math.round(lastInputAgoMs));
+    };
+    const start_heartbeat = () => {
+        if ( disposed || heartbeat_timer !== null ) return;
+        if ( document.visibilityState !== 'visible' ) return;
+        heartbeat_timer = setInterval(heartbeat_tick, HEARTBEAT_INTERVAL_MS);
+    };
+    const stop_heartbeat = () => {
+        clearInterval(heartbeat_timer); heartbeat_timer = null;
+    };
+    // 🔴 A hidden tab STOPS heartbeating, not merely skips a tick — the whole
+    // point is that the container then has nothing telling it a human is
+    // present, so it can cool down server-side. Torn down/rebuilt exactly
+    // like `visibilityGatedInterval` above (a bespoke pair rather than reusing
+    // that helper directly, since a heartbeat tick takes no elapsed-time
+    // argument and needs no per-attempt lifetime — it is simpler to read as
+    // its own four lines than as a generic helper bent to fit).
+    const on_heartbeat_visibility = () => {
+        if ( document.visibilityState === 'visible' ) start_heartbeat();
+        else stop_heartbeat();
+    };
+    document.addEventListener('visibilitychange', on_heartbeat_visibility);
+    start_heartbeat();
 
     const progress = BootProgress({ onRetry: () => { void start_boot(); } });
     el_body.appendChild(progress.el);
@@ -545,13 +662,18 @@ export async function openDesktopWindow (ctx = {}) {
         // The ONE genuine mid-boot signal the browser has. Safe to run while
         // the long request is in flight: the container is already being woken
         // by that request, and this probe never wakes one itself.
-        poll_timer = setInterval(async () => {
+        //
+        // 🔴 VISIBILITY-GATED (container-billing fix). A backgrounded tab must
+        // not keep generating this traffic — `visibilityGatedInterval` tears
+        // the interval down while hidden and rebuilds it on visible, rather
+        // than merely skipping the body, so a hidden tab produces ZERO polls.
+        poll_gate = visibilityGatedInterval(async () => {
             if ( disposed || my_attempt !== attempt ) return;
             const running = await session.desktopRunning(computer.id);
             if ( disposed || my_attempt !== attempt ) return;
             if ( running === true ) {
                 running_signal = true;
-                clearInterval(poll_timer); poll_timer = null;
+                poll_gate?.stop(); poll_gate = null;
                 console.info(`[${PHASE}] desktop process is up (+${Math.round(performance.now() - t0)}ms)`);
                 paint();
             }
@@ -826,6 +948,10 @@ export async function openDesktopWindow (ctx = {}) {
         let ever_wellformed = false;
         let unverified_timer = null;
         let blank_timer = null;
+        /** The armed "ask again" timer, or null while paused/between-schedule. See `schedule_next_ask`. */
+        let ask_timer = null;
+        /** True once hidden has cancelled or refused a scheduling, so the next visible edge knows to resume. */
+        let ask_paused_pending = false;
 
         // The first gate's verdict, run for real rather than assumed — the two
         // gates compose, and `applyDisplayEvidence` can only ever take this
@@ -843,6 +969,8 @@ export async function openDesktopWindow (ctx = {}) {
             done = true;
             clearTimeout(unverified_timer); unverified_timer = null;
             clearTimeout(blank_timer); blank_timer = null;
+            clearTimeout(ask_timer); ask_timer = null;
+            document.removeEventListener('visibilitychange', on_gate_visibility);
         };
 
         /**
@@ -983,6 +1111,64 @@ export async function openDesktopWindow (ctx = {}) {
             settle('unknown', true);
         };
 
+        /**
+         * 🔴 VISIBILITY-GATED (container-billing fix), same rule as the
+         * status poll in `start_boot` above — a backgrounded tab must not
+         * keep asking Neko whether anyone is watching. Deliberately NOT built
+         * on `visibilityGatedInterval`: this is a self-rescheduling
+         * `setTimeout` chain with a variable delay (`DISPLAY_POLL_MS` vs
+         * `DISPLAY_POLL_SLOW_MS`), not a fixed-period `setInterval`.
+         *
+         * 🔴 REFUSING TO ARM A NEW TIMER WHILE HIDDEN IS NOT ENOUGH ON ITS
+         * OWN. A timer armed WHILE VISIBLE, due to fire a moment later, does
+         * not know the tab has since backgrounded — nothing here can reach
+         * into a `setTimeout` already in flight. `on_gate_visibility` below
+         * is what closes that gap: it CANCELS an armed `ask_timer` the
+         * instant `visibilitychange` fires, rather than letting one more ask
+         * through before the pause takes effect. An `ask()` whose FETCH is
+         * already in flight when the tab backgrounds is not touched by
+         * either path — that request already left the browser, and nothing
+         * here can un-send it; its own completion runs `schedule_next_ask`
+         * again, which by then correctly sees `hidden` and pauses.
+         *
+         * 🔴 DOES NOT TOUCH THE DEADLINES. `unverified_timer`/`blank_timer`
+         * below are unconditional `setTimeout`s already running on their own
+         * wall-clock schedule; this (and `on_gate_visibility`) only ever
+         * gate the PERIODIC re-ask — exactly the "only whether it is ticking
+         * while hidden" boundary the whole visibility-pause requirement draws.
+         */
+        const schedule_next_ask = (delay) => {
+            if ( document.visibilityState === 'hidden' ) {
+                ask_paused_pending = true;
+                return;
+            }
+            ask_timer = setTimeout(() => { ask_timer = null; void ask(); }, delay);
+        };
+
+        /**
+         * Registered ONCE for the whole life of the gate (not per scheduled
+         * ask). Two jobs, symmetric with each other:
+         *   - going HIDDEN cancels an already-armed `ask_timer` immediately;
+         *   - going VISIBLE again resumes immediately if anything was left
+         *     pending, rather than waiting out a delay that measured nothing
+         *     real while the tab was backgrounded.
+         */
+        const on_gate_visibility = () => {
+            if ( document.visibilityState === 'hidden' ) {
+                if ( ask_timer !== null ) {
+                    clearTimeout(ask_timer); ask_timer = null;
+                    ask_paused_pending = true;
+                }
+                return;
+            }
+            if ( ask_paused_pending && ask_timer === null ) {
+                ask_paused_pending = false;
+                if ( ! alive() || done ) return;
+                void ask();
+            }
+        };
+        document.addEventListener('visibilitychange', on_gate_visibility);
+
         const ask = async () => {
             if ( ! alive() || done ) return;
             asks++;
@@ -1016,8 +1202,7 @@ export async function openDesktopWindow (ctx = {}) {
             // probe can walk straight through. (It did: settle went to 29.7s.)
             if ( unverified_due ) reveal_unverified();
 
-            setTimeout(() => { void ask(); },
-                age() < DISPLAY_POLL_SLOW_AFTER_MS ? DISPLAY_POLL_MS : DISPLAY_POLL_SLOW_MS);
+            schedule_next_ask(age() < DISPLAY_POLL_SLOW_AFTER_MS ? DISPLAY_POLL_MS : DISPLAY_POLL_SLOW_MS);
         };
 
         unverified_timer = setTimeout(() => {
@@ -1229,6 +1414,13 @@ export async function openDesktopWindow (ctx = {}) {
     const dispose = () => {
         disposed = true;
         stop_timers();
+        // Activity heartbeat (container-billing fix) — this window is the
+        // only thing keeping it alive; nothing else ever stops it.
+        stop_heartbeat();
+        document.removeEventListener('pointerdown', note_input, true);
+        document.removeEventListener('pointermove', note_input, true);
+        document.removeEventListener('keydown', note_input, true);
+        document.removeEventListener('visibilitychange', on_heartbeat_visibility);
         observer.disconnect();
         window.removeEventListener('ezil:teardown', dispose);
         // The window can close (or be torn down) mid-boot, before ANY of the
