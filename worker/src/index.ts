@@ -189,6 +189,20 @@ interface Env extends SandboxEnv {
   SANDBOX_RESTART?: string;
 
   /**
+   * Non-secret kill-switch for the activity-heartbeat control route
+   * (`POST /sandbox/:name/activity`, see `handleActivity` /
+   * `EzilSandboxDO.recordActivity`). Enabled by default (HMAC-gated, writes
+   * ONLY `lastActivityAt` to DO storage, never touches the container); set to
+   * `off`/`false`/`0`/`disabled`/`no` to hard-disable the surface (returns
+   * 404) without a code change. Disabling this does NOT make the idle-stop
+   * path more aggressive — it just removes the one signal that can tell it
+   * "a human is still here" beyond what preview/flush/hydrate already prove,
+   * so a disabled heartbeat degrades toward earlier idle-stops, never later
+   * ones.
+   */
+  SANDBOX_ACTIVITY?: string;
+
+  /**
    * Non-secret kill-switch for BOTH telemetry-drain control routes
    * (`POST /telemetry/drain` + `POST /telemetry/ack`, see
    * `handleTelemetryDrain` / `handleTelemetryAck` and
@@ -498,8 +512,21 @@ import {
 const DESKTOP_PORT = 8080;
 /** Preview validity window reported to the client. */
 const SESSION_TTL_MS = 30 * 60 * 1000;
-/** Sandbox auto-sleep when idle (explicit DELETE → destroy() for teardown). */
-const SLEEP_AFTER = '30m';
+/**
+ * Sandbox auto-sleep when idle. BACKSTOP ONLY, not the real mechanism:
+ * `EzilSandboxDO.flushWorkspaceScheduled`'s explicit idle-stop path
+ * (`IDLE_STOP_MS`, 10 minutes, with a mandatory successful final flush first)
+ * is what actually decides when a sandbox sleeps. This platform timer is
+ * provably defeatable on its own — the periodic flush alarm's own
+ * `containerFetch()` auto-starts a stopped container and/or renews the
+ * SDK's activity timeout on every cycle, so left alone this NEVER fires
+ * (measured: an instance ran 26 hours idle under the old 30m value; see
+ * BILLING-BRIEF.md). Lowered from `'30m'` to `'5m'` so that if the explicit
+ * path is ever skipped (e.g. the flush loop never started for this
+ * generation), the container still doesn't run unbounded — just later and
+ * less predictably than the explicit 10-minute idle-stop.
+ */
+const SLEEP_AFTER = '5m';
 /**
  * Max time to wait for the SELECTED desktop service to bind + serve.
  *
@@ -618,6 +645,16 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
 interface EzilWorkspacePersistRpc {
   recordWorkspaceHydration(params: { prefix: string; mountPath: string; hydrated: boolean }): Promise<void>;
   flushWorkspaceNow(): Promise<FlushOutcome>;
+  /**
+   * The `POST /sandbox/:name/activity` implementation's DO-side write. See
+   * `EzilSandboxDO.recordActivity`'s doc comment: writes ONLY
+   * `LAST_ACTIVITY_AT_KEY` to DO storage, touches the container in no way at
+   * all (no `exec`, no `containerFetch`) — the whole point of this RPC is
+   * feeding the idle-stop decision a genuine presence signal, so it must be
+   * structurally incapable of itself being the thing that keeps a container
+   * alive.
+   */
+  recordActivity(lastInputAgoMs: number): Promise<void>;
   /**
    * Observe → flush → cancel the flush loop → destroy → RE-OBSERVE, returning
    * what actually happened. Runs entirely inside the DO because only there is
@@ -1559,11 +1596,59 @@ const WORKSPACE_FLUSH_LOOP_STARTED_KEY = 'ezil:workspaceFlushLoopStarted';
  * `WORKSPACE_FLUSH_INTERVAL_SECONDS` window — teardown could never stick.
  * `destroy()` in the SDK deletes only its OWN storage keys (`portTokens`,
  * `tunnels*`), so nothing upstream cancels our schedule; we must do it here.
+ *
+ * CRITICAL DISTINCTION from the idle-stop path below: this key means
+ * "explicitly torn down by `DELETE /sandbox/:name` — never come back without
+ * a fresh boot deciding to". Idle-stop (triggered by `IDLE_STOP_MS` inactivity,
+ * see `flushWorkspaceScheduled`) is a DIFFERENT, NEW state — it stops the
+ * container the same way (so it stops billing) but does NOT set this
+ * tombstone, because the next `/sandbox/preview` for an idle-stopped sandbox
+ * must boot normally, exactly like any other cold start. Reusing this key for
+ * idle-stop would make every idle-stopped sandbox indistinguishable from an
+ * explicitly-deleted one — permanently refusing to reboot until something
+ * else happened to clear the tombstone.
  */
 const WORKSPACE_TERMINATED_KEY = 'ezil:workspaceTerminated';
 
 /** The `schedule()` callback name for the periodic workspace flush — also the key `deleteSchedules()` cancels by. */
 const WORKSPACE_FLUSH_CALLBACK = 'flushWorkspaceScheduled';
+
+/**
+ * Last time this sandbox observed GENUINE user-driven activity (`Date.now()`
+ * epoch ms). Bumped ONLY by real signals, never by the periodic flush alarm:
+ *
+ *   - `recordWorkspaceHydration` — a hydrate attempt only ever runs in
+ *     response to an authenticated caller reaching `ensureWorkspaceMount`
+ *     (`/sandbox/preview`, `/sandbox/:id/workspace-diag`, `/sandbox/:id/twen`
+ *     — never the alarm), so it counts as "desktop open/mint" regardless of
+ *     whether hydration itself succeeded.
+ *   - `runWorkspaceFlush('explicit')` — the pre-handoff flush in
+ *     `handlePreview` and the pre-destroy flush in `terminateSandbox`. Both
+ *     only ever run from a real inbound request, never from `schedule()`.
+ *   - `EzilSandboxDO.recordActivity` — the `POST /sandbox/:name/activity`
+ *     heartbeat (see that method's doc comment).
+ *
+ * `flushWorkspaceScheduled` (trigger `'alarm'`) MUST NEVER write this key.
+ * That was the actual root cause of the billing bug this file fixes: the
+ * alarm resetting its own idle clock every `WORKSPACE_FLUSH_INTERVAL_SECONDS`
+ * by touching the container (`containerFetch()` auto-starts / renews
+ * activity). Writing here from the alarm would rebuild that bug byte-for-byte
+ * with a different variable name.
+ */
+const LAST_ACTIVITY_AT_KEY = 'ezil:lastActivityAt';
+
+/**
+ * Internal bookkeeping ONLY for `computeNextFlushBackoffSeconds` — the
+ * `lastActivityAt` value the alarm observed as of the END of the PREVIOUS
+ * flush cycle, so the current cycle can tell "did activity advance since
+ * last time" without needing a second, alarm-writable copy of
+ * `LAST_ACTIVITY_AT_KEY` itself. Writing here is bookkeeping ABOUT that key,
+ * never a write TO it.
+ */
+const WORKSPACE_FLUSH_LAST_SEEN_ACTIVITY_AT_KEY = 'ezil:workspaceFlushLastSeenActivityAt';
+
+/** Current reschedule interval (seconds) for the self-perpetuating flush loop — see `computeNextFlushBackoffSeconds`. */
+const WORKSPACE_FLUSH_BACKOFF_SECONDS_KEY = 'ezil:workspaceFlushBackoffSeconds';
 
 /**
  * Backstop ceiling (ms) for `terminateSandbox()`'s primary confirmation
@@ -1654,6 +1739,121 @@ interface WorkspaceFlushContext {
 const WORKSPACE_FLUSH_INTERVAL_SECONDS = 10;
 
 /**
+ * How long a sandbox may sit with no GENUINE user-driven activity before
+ * `flushWorkspaceScheduled`'s idle-stop path does a final flush and stops the
+ * container. See `LAST_ACTIVITY_AT_KEY`'s doc comment for the exhaustive list
+ * of what counts as activity — the periodic flush alarm itself never does.
+ *
+ * 10 minutes: long enough that a user reading/thinking between actions in an
+ * open desktop tab is never mistaken for "gone", short enough that the
+ * measured failure mode (a container idle for 26 HOURS under the old
+ * `SLEEP_AFTER='30m'` platform timer — see BILLING-BRIEF.md) cannot recur:
+ * this path does not depend on that platform timer at all.
+ */
+const IDLE_STOP_MS = 10 * 60_000;
+
+/**
+ * The reschedule-interval ladder `computeNextFlushBackoffSeconds` steps
+ * through. `[0]` (10s, == `WORKSPACE_FLUSH_INTERVAL_SECONDS`) is also the
+ * value every cycle resets to the moment either a file actually changed or
+ * genuine activity advanced; the ladder only climbs on a cycle that finds
+ * NOTHING to do, and caps at the last entry (60s) rather than growing
+ * unbounded.
+ */
+const WORKSPACE_FLUSH_BACKOFF_STEPS_SECONDS = [WORKSPACE_FLUSH_INTERVAL_SECONDS, 30, 60] as const;
+
+/**
+ * Pure idle-stop predicate — no I/O, so this is a real, invokable unit test
+ * (`isIdleStopDue`'s own suite) rather than a grep for a string, mirroring
+ * `codePreviewFolderParams` above. Isolated from `flushWorkspaceScheduled` so
+ * the ONE thing that decides "has this sandbox been idle long enough" can be
+ * mutation-tested by calling it, not by reading source text.
+ */
+export function isIdleStopDue(params: { lastActivityAt: number; now: number }): boolean {
+  return params.now - params.lastActivityAt >= IDLE_STOP_MS;
+}
+
+/**
+ * Pure idle-backoff step function backing the "otherwise flush as today"
+ * branch of `flushWorkspaceScheduled`. Given what the JUST-COMPLETED cycle
+ * observed, decides the interval for the NEXT `schedule()` call:
+ *
+ *   - a file actually changed (`wroteSomething`), OR genuine activity
+ *     advanced since the previous cycle (`activityAdvanced`) → back to the
+ *     base interval (steps[0]) — minimize the eviction-window data-loss
+ *     exposure while something is actually happening.
+ *   - neither → climb one rung of `WORKSPACE_FLUSH_BACKOFF_STEPS_SECONDS`,
+ *     capped at the last one — nothing to do, so stop paying the DO-CPU cost
+ *     of walking the workspace tree every 10s.
+ *
+ * `previousIntervalSeconds` not matching any rung (should not happen in
+ * practice — this DO is the only writer of that stored value, and always
+ * writes a value from this same ladder) falls back to the first climb step
+ * rather than throwing.
+ */
+export function computeNextFlushBackoffSeconds(params: {
+  previousIntervalSeconds: number;
+  wroteSomething: boolean;
+  activityAdvanced: boolean;
+}): number {
+  const steps = WORKSPACE_FLUSH_BACKOFF_STEPS_SECONDS;
+  if (params.wroteSomething || params.activityAdvanced) {
+    return steps[0];
+  }
+  const currentIndex = (steps as readonly number[]).indexOf(params.previousIntervalSeconds);
+  const nextIndex = currentIndex === -1 ? 1 : Math.min(currentIndex + 1, steps.length - 1);
+  return steps[nextIndex];
+}
+
+/**
+ * Pure derivation of the absolute `lastActivityAt` timestamp `POST
+ * /sandbox/:name/activity` records, from the client-reported "how long ago
+ * was real input" duration. Deliberately NOT `now` — the shell heartbeats
+ * every 60s for as long as real input happened within the last 30 minutes
+ * (see BILLING-BRIEF.md's "Shell" contract), so a heartbeat firing does NOT
+ * itself mean "activity just happened"; a user idle for 25 minutes with the
+ * tab still open keeps heartbeating with a GROWING `lastInputAgoMs`, and
+ * treating that as "now" would reset the idle clock every 60s forever —
+ * rebuilding the exact immortality bug this whole change fixes, just moved
+ * into the new endpoint instead of the alarm.
+ *
+ * `lastInputAgoMs` is clamped to `>= 0` defensively (a negative value would
+ * push the derived timestamp into the FUTURE, which would make
+ * `isIdleStopDue` never fire against real wall-clock time — the same
+ * immortality failure mode again). `validateActivityBody` below additionally
+ * REJECTS a negative value outright at the route layer (400, not a silent
+ * clamp) — this clamp is defense-in-depth for the DO-side RPC itself, which
+ * is reachable by any future caller of `EzilWorkspacePersistRpc`, not only
+ * this one route.
+ */
+export function computeActivityTimestamp(params: { now: number; lastInputAgoMs: number }): number {
+  const agoMs = Number.isFinite(params.lastInputAgoMs) ? Math.max(0, params.lastInputAgoMs) : 0;
+  return params.now - agoMs;
+}
+
+/**
+ * Validate `POST /sandbox/:name/activity`'s `{ lastInputAgoMs: number }`
+ * body. Rejects outright (never coerces/defaults) anything that isn't a
+ * finite, non-negative number — same "closed contract, 400 on anything else"
+ * discipline as `validateFocusApp` (`./sandbox-control.ts`).
+ */
+export function validateActivityBody(
+  raw: unknown,
+): { ok: true; lastInputAgoMs: number } | { ok: false; error: string } {
+  const value =
+    raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>).lastInputAgoMs
+      : undefined;
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return { ok: false, error: 'lastInputAgoMs_missing_or_not_a_finite_number' };
+  }
+  if (value < 0) {
+    return { ok: false, error: 'lastInputAgoMs_must_be_non_negative' };
+  }
+  return { ok: true, lastInputAgoMs: value };
+}
+
+/**
  * The Durable Object class backing each sandbox container.
  *
  * Extends the SDK's own `Sandbox` class — no new transport, no new daemon —
@@ -1672,15 +1872,25 @@ const WORKSPACE_FLUSH_INTERVAL_SECONDS = 10;
  *     README: "Instead of using the default alarm handler, use `schedule()`
  *     instead").
  *   - `flushWorkspaceScheduled()` — the callback name `schedule()` invokes.
- *     Runs one flush pass then reschedules itself UNCONDITIONALLY (a failed
- *     cycle must not kill the loop — failures are logged loudly via
- *     `bootLog`/`console.error`, never swallowed).
+ *     Runs one flush pass and reschedules itself on most cycles (a failed
+ *     flush must not kill the loop — failures are logged loudly via
+ *     `bootLog`/`console.error`, never swallowed), with THREE exceptions that
+ *     do neither, checked in order: the sandbox is tombstoned
+ *     (`WORKSPACE_TERMINATED_KEY`, unchanged from before), the container is
+ *     already not running (`containerIsRunning()` — never resurrect what
+ *     already stopped), or the sandbox has been idle for `IDLE_STOP_MS` (does
+ *     a FINAL flush, and only stops the container — via `this.stop()`, NOT
+ *     `destroy()` — if that flush actually succeeded). A cycle that keeps
+ *     looping backs off its own reschedule interval when it finds nothing to
+ *     do (`computeNextFlushBackoffSeconds`).
  *   - `flushWorkspaceNow()` — the same flush pass, called directly by the
  *     Worker (an ordinary Durable Object RPC — the same call style as the
  *     pre-existing `sandbox.exec()`) for the two EXPLICIT flush points this
  *     change adds: immediately before `/sandbox/preview` hands the ready URL
  *     back to the caller, and immediately before `DELETE /sandbox/:name`
  *     calls `destroy()` (see `handlePreview` / `handleTerminate`).
+ *   - `recordActivity()` — the `POST /sandbox/:name/activity` heartbeat's
+ *     DO-side write. See `LAST_ACTIVITY_AT_KEY`'s doc comment.
  *
  * `class_name = "Sandbox"` in wrangler.toml binds to whatever this module
  * exports under the name `Sandbox` — exporting THIS subclass under that exact
@@ -1735,6 +1945,16 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     const t0 = Date.now();
     bootLog('workspace_flush', 'start', { detail: `trigger=${trigger}` });
 
+    // An EXPLICIT flush is always caller-initiated — the `/sandbox/preview`
+    // pre-handoff flush and `terminateSandbox()`'s pre-destroy flush both only
+    // ever run from a real inbound request, never from `schedule()`. Counts as
+    // genuine activity. The `'alarm'` trigger MUST NEVER reach this branch —
+    // see `LAST_ACTIVITY_AT_KEY`'s doc comment for why that would rebuild the
+    // exact billing bug this file fixes.
+    if (trigger === 'explicit') {
+      await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, Date.now());
+    }
+
     const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
     if (!wctx) {
       bootLog('workspace_flush', 'end', { status: 'skipped', detail: `no_context,trigger=${trigger}`, phaseMs: Date.now() - t0 });
@@ -1786,6 +2006,13 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * `true` from a previous container generation.
    */
   async recordWorkspaceHydration(params: { prefix: string; mountPath: string; hydrated: boolean }): Promise<void> {
+    // A hydrate attempt only ever runs in response to an authenticated caller
+    // reaching `ensureWorkspaceMount` (`/sandbox/preview`,
+    // `/sandbox/:id/workspace-diag`, `/sandbox/:id/twen` — NEVER the flush
+    // alarm), so it counts as genuine "desktop open/mint" activity regardless
+    // of whether hydration itself succeeded. See `LAST_ACTIVITY_AT_KEY`.
+    await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, Date.now());
+
     await this.ctx.storage.put(WORKSPACE_FLUSH_CONTEXT_KEY, { prefix: params.prefix, mountPath: params.mountPath });
     await this.ctx.storage.put(WORKSPACE_HYDRATED_KEY, params.hydrated);
     // A hydrate attempt means this sandbox is booting again, so any previous
@@ -1798,6 +2025,14 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
     const started = (await this.ctx.storage.get<boolean>(WORKSPACE_FLUSH_LOOP_STARTED_KEY)) ?? false;
     if (started) return; // loop already running (or a schedule is already pending) — do not double-schedule
+
+    // Fresh container generation, fresh cadence: DO storage (unlike the
+    // container filesystem) SURVIVES container recreation, so without this a
+    // brand-new boot could inherit a backed-off 60s interval left over from
+    // the PREVIOUS generation's idle tail — needlessly widening this
+    // generation's own data-loss exposure window from its very first cycle.
+    await this.ctx.storage.delete(WORKSPACE_FLUSH_BACKOFF_SECONDS_KEY);
+    await this.ctx.storage.delete(WORKSPACE_FLUSH_LAST_SEEN_ACTIVITY_AT_KEY);
 
     await this.ctx.storage.put(WORKSPACE_FLUSH_LOOP_STARTED_KEY, true);
     try {
@@ -1813,15 +2048,36 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   }
 
   /**
-   * The `schedule()` callback — self-perpetuating: always reschedules, even
-   * after a failed cycle… EXCEPT once this sandbox has been explicitly
-   * terminated, where it must do neither.
+   * The `schedule()` callback. Checked in order, EXACTLY as documented on the
+   * class itself:
    *
-   * See `WORKSPACE_TERMINATED_KEY`: `runWorkspaceFlush` reaches into the
-   * container, and a container RPC AUTO-STARTS a stopped container, so an
-   * un-cancelled loop resurrects whatever `destroy()` just killed. The
-   * tombstone is checked here as well as cancelled in `destroy()` because a
-   * schedule row may already be due/in-flight when destroy runs.
+   *   1. TOMBSTONED (`WORKSPACE_TERMINATED_KEY`) — unchanged from before this
+   *      idle-stop work. Neither flush nor reschedule.
+   *   2. NOT RUNNING (`containerIsRunning()`) — the container is already
+   *      stopped (a prior idle-stop, an eviction, a crash — doesn't matter
+   *      which). `runWorkspaceFlush` reaches into the container over an RPC,
+   *      and per the SDK a container RPC AUTO-STARTS a stopped container, so
+   *      touching it here would resurrect exactly what stopped it — the same
+   *      failure mode `WORKSPACE_TERMINATED_KEY` exists to prevent, just
+   *      without an explicit DELETE. Neither flush nor reschedule.
+   *   3. IDLE (`isIdleStopDue` against `LAST_ACTIVITY_AT_KEY`) — does a FINAL
+   *      flush first (`runWorkspaceFlush('alarm')` — trigger stays `'alarm'`
+   *      deliberately: this must NOT bump `LAST_ACTIVITY_AT_KEY`), and ONLY IF
+   *      THAT SUCCEEDS stops the container via `this.stop()` — a graceful
+   *      signal, NOT `destroy()` — and marks the loop stopped WITHOUT setting
+   *      `WORKSPACE_TERMINATED_KEY` (see that key's "CRITICAL DISTINCTION"
+   *      doc comment: the next preview must boot this sandbox normally). If
+   *      the final flush FAILS, stays running and retries the SAME idle check
+   *      next cycle at the base interval — losing user work is worse than the
+   *      bill, so a flush failure here never gives up.
+   *
+   * Otherwise (2 and 3 both clear): flushes as before and reschedules,
+   * backing off the interval when a cycle finds nothing to do
+   * (`nextFlushRescheduleSeconds`).
+   *
+   * See `WORKSPACE_TERMINATED_KEY`: the tombstone is checked here as well as
+   * cancelled in `destroy()` because a schedule row may already be due/
+   * in-flight when destroy runs.
    */
   async flushWorkspaceScheduled(): Promise<void> {
     const terminated = (await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)) ?? false;
@@ -1831,9 +2087,65 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       await this.ctx.storage.put(WORKSPACE_FLUSH_LOOP_STARTED_KEY, false);
       return;
     }
-    await this.runWorkspaceFlush('alarm');
+
+    if (!this.containerIsRunning()) {
+      bootLog('workspace_flush', 'end', { status: 'skipped', detail: 'not_running,trigger=alarm' });
+      // Same reasoning as the tombstone branch above: leave the loop marked
+      // stopped so the next successful hydrate restarts it — never touch a
+      // container that isn't there.
+      await this.ctx.storage.put(WORKSPACE_FLUSH_LOOP_STARTED_KEY, false);
+      return;
+    }
+
+    const lastActivityAt = (await this.ctx.storage.get<number>(LAST_ACTIVITY_AT_KEY)) ?? Date.now();
+    const now = Date.now();
+    if (isIdleStopDue({ lastActivityAt, now })) {
+      // Trigger stays `'alarm'` — this must NOT bump `LAST_ACTIVITY_AT_KEY`,
+      // idle-triggered or not.
+      const outcome = await this.runWorkspaceFlush('alarm');
+      if (outcome.ok) {
+        bootLog('workspace_flush', 'end', { status: 'ok', detail: `idle_stop,idleMs=${now - lastActivityAt}` });
+        // A NEW, separate state from `WORKSPACE_TERMINATED_KEY` — deliberately
+        // NOT written here. See that key's doc comment: the next
+        // `/sandbox/preview` for this sandbox must boot normally.
+        await this.ctx.storage.put(WORKSPACE_FLUSH_LOOP_STARTED_KEY, false);
+        try {
+          await this.stop();
+        } catch (err) {
+          console.error(
+            `[ezil-boot] phase=workspace_flush event=idle_stop_failed error=${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        return; // No reschedule: the loop is done. A future hydrate restarts it.
+      }
+
+      // 🔴 Never lose user work: the FINAL flush failed, so do not stop. Stay
+      // running and retry the same idle check next cycle, at the base
+      // interval (not backed off — this sandbox is trying to shut down
+      // cleanly and should retry promptly).
+      console.error(
+        `[ezil-boot] phase=workspace_flush event=idle_final_flush_failed detail=${
+          outcome.skippedReason ?? `failed=${outcome.failed.length}`
+        }`,
+      );
+      try {
+        await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK);
+      } catch (err) {
+        console.error(
+          `[ezil-boot] phase=workspace_flush event=reschedule_failed error=${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+      return;
+    }
+
+    const outcome = await this.runWorkspaceFlush('alarm');
+    const nextIntervalSeconds = await this.nextFlushRescheduleSeconds(outcome, lastActivityAt);
     try {
-      await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK);
+      await this.schedule(nextIntervalSeconds, WORKSPACE_FLUSH_CALLBACK);
     } catch (err) {
       console.error(
         `[ezil-boot] phase=workspace_flush event=reschedule_failed error=${err instanceof Error ? err.message : String(err)}`,
@@ -1841,9 +2153,48 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     }
   }
 
+  /**
+   * DO-storage plumbing around the pure `computeNextFlushBackoffSeconds`
+   * decision: reads the two bookkeeping keys, computes the next interval, and
+   * persists both for the following cycle to compare against. See
+   * `WORKSPACE_FLUSH_LAST_SEEN_ACTIVITY_AT_KEY`'s doc comment — this writes
+   * that key, NEVER `LAST_ACTIVITY_AT_KEY` itself.
+   */
+  private async nextFlushRescheduleSeconds(outcome: FlushOutcome, lastActivityAtAtCycleStart: number): Promise<number> {
+    const previousActivitySeen =
+      (await this.ctx.storage.get<number>(WORKSPACE_FLUSH_LAST_SEEN_ACTIVITY_AT_KEY)) ?? lastActivityAtAtCycleStart;
+    const previousIntervalSeconds =
+      (await this.ctx.storage.get<number>(WORKSPACE_FLUSH_BACKOFF_SECONDS_KEY)) ?? WORKSPACE_FLUSH_INTERVAL_SECONDS;
+
+    const nextSeconds = computeNextFlushBackoffSeconds({
+      previousIntervalSeconds,
+      wroteSomething: outcome.uploaded.length > 0,
+      activityAdvanced: lastActivityAtAtCycleStart > previousActivitySeen,
+    });
+
+    await this.ctx.storage.put(WORKSPACE_FLUSH_LAST_SEEN_ACTIVITY_AT_KEY, lastActivityAtAtCycleStart);
+    await this.ctx.storage.put(WORKSPACE_FLUSH_BACKOFF_SECONDS_KEY, nextSeconds);
+    return nextSeconds;
+  }
+
   /** Explicit, on-demand flush — see class doc comment for the two call sites. */
   async flushWorkspaceNow(): Promise<FlushOutcome> {
     return this.runWorkspaceFlush('explicit');
+  }
+
+  /**
+   * The `POST /sandbox/:name/activity` implementation's DO-side write. See
+   * `LAST_ACTIVITY_AT_KEY`'s doc comment for the full contract.
+   *
+   * Deliberately touches NOTHING else — no `exec`, no `containerFetch`, no
+   * container RPC of any kind. This endpoint's entire purpose is helping
+   * `flushWorkspaceScheduled` decide when to STOP a container; if writing the
+   * activity signal could itself wake one, it would defeat its own purpose
+   * (see BILLING-BRIEF.md's contract for this exact wording).
+   */
+  async recordActivity(lastInputAgoMs: number): Promise<void> {
+    const lastActivityAt = computeActivityTimestamp({ now: Date.now(), lastInputAgoMs });
+    await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, lastActivityAt);
   }
 
   /** True when a container is actually alive under this DO right now. */
@@ -3567,6 +3918,63 @@ async function handleFocus(request: Request, env: Env, sandboxName: string): Pro
   }
 }
 
+/**
+ * Non-secret production kill-switch for `POST /sandbox/:id/activity`. Same
+ * vocabulary (and same per-surface duplication) as `focusDisabled`/
+ * `restartDisabled` (`./sandbox-control.ts`), `diagDisabled`
+ * (`./workspace-diag.ts`), `twenDisabled` (`./twen.ts`) —
+ * `off`/`false`/`0`/`disabled`/`no` hard-disables the route (returns 404)
+ * without a code change.
+ */
+function activityDisabled(flag: string | undefined): boolean {
+  if (!flag) return false;
+  return ['off', 'false', '0', 'disabled', 'no'].includes(flag.trim().toLowerCase());
+}
+
+// ── Activity heartbeat ───────────────────────────────────────────────────────
+//
+// POST /sandbox/:name/activity  { lastInputAgoMs: number }
+//   Records a genuine user-presence signal in DO storage
+//   (`EzilSandboxDO.recordActivity` -> `LAST_ACTIVITY_AT_KEY`) so
+//   `flushWorkspaceScheduled`'s idle-stop path can tell "a tab is merely open"
+//   apart from "a human is actually here". Gated with the SAME shared-HMAC
+//   envelope as every other control route — see
+//   `authorizeSignedControlRequest`'s doc comment for the three places the
+//   token may be presented.
+//
+// Deliberately the ONLY thing this route does: it never touches the
+// container (no `exec`, no `containerFetch`) — see
+// `EzilSandboxDO.recordActivity`'s doc comment for why an endpoint whose
+// whole purpose is helping decide when to SLEEP a container must be
+// structurally incapable of itself waking one.
+//
+// Response: { ok, sandboxId } on success; { ok: false, error } otherwise.
+async function handleActivity(request: Request, env: Env, sandboxName: string): Promise<Response> {
+  let body: unknown = {};
+  try {
+    const raw = await request.text();
+    if (raw.trim() !== '') body = JSON.parse(raw);
+  } catch {
+    return json({ ok: false, error: 'invalid_json_body' }, 400);
+  }
+
+  const validated = validateActivityBody(body);
+  if (!validated.ok) {
+    return json({ ok: false, error: validated.error }, 400);
+  }
+
+  try {
+    const sandbox = openSandbox(env, sandboxName);
+    await sandbox.recordActivity(validated.lastInputAgoMs);
+    return json({ ok: true, sandboxId: sandboxName });
+  } catch (err) {
+    return json(
+      { ok: false, sandboxId: sandboxName, error: err instanceof Error ? err.message : String(err) },
+      500,
+    );
+  }
+}
+
 // ── Telemetry R2-spool drain ─────────────────────────────────────────────────
 //
 // POST /telemetry/drain  { token, cursor?, limit? }
@@ -4268,6 +4676,21 @@ export default {
       const unauthorized = await authorizeSignedControlRequest(request, env, url);
       if (unauthorized) return unauthorized;
       return handleFocus(request, env, decodeURIComponent(focusMatch[1]));
+    }
+
+    const activityMatch = path.match(/^\/sandbox\/([^/]+)\/activity$/);
+    if (method === 'POST' && activityMatch) {
+      // Activity heartbeat — the ONE signal `flushWorkspaceScheduled`'s
+      // idle-stop path has that a human is present beyond what preview/
+      // hydrate/explicit-flush already prove. HMAC-gated (SAME envelope as
+      // `/focus`/`/restart`/`DELETE /sandbox/:name`). Operators can
+      // hard-disable it WITHOUT a code change via `SANDBOX_ACTIVITY=off`.
+      if (activityDisabled(env.SANDBOX_ACTIVITY)) {
+        return json({ ok: false, error: 'activity_disabled' }, 404);
+      }
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      return handleActivity(request, env, decodeURIComponent(activityMatch[1]));
     }
 
     if (method === 'POST' && path === '/telemetry/drain') {
