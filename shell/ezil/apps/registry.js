@@ -65,6 +65,8 @@ import { openCodeWindow } from './code.js';
 import { openSettingsWindow } from '../ui/Settings/index.js';
 import { ensureSettingsDrawerButton, SETTINGS_DRAWER_SVG } from '../ui/Settings/drawer-action.js';
 import telemetry from '../telemetry.js';
+import { beginTrace } from '../trace.js';
+import log from '../log.js';
 
 const PHASE = 'ezil-os:apps';
 
@@ -300,6 +302,35 @@ export function getApp (id) {
 }
 
 /**
+ * Turn a `./trace.js` `.end()` summary into the ONE `boot_summary` event for
+ * this app-open, and send it. `trace.end()` is idempotent (returns `null` on
+ * a second call), so this is naturally "exactly one boot_summary per
+ * app-open" — a caller that ends the same trace twice sends nothing the
+ * second time, rather than a duplicate row.
+ *
+ * `attrs.phases`/`attrs.total_ms` are the two keys `ATTRS_ALLOW_LIST.boot_summary`
+ * actually allows (`app/src/server/telemetry/types.ts`) — anything else
+ * would be silently stripped server-side anyway, so this only ever builds
+ * those two.
+ *
+ * @param {{correlationId:string,name:string,outcome:string,totalMs:number,phases:string}|null} summary
+ */
+function emitBootSummary (summary) {
+    if ( ! summary ) return;
+    const attrs = { total_ms: summary.totalMs };
+    if ( summary.phases ) attrs.phases = summary.phases;
+    telemetry.capture({
+        eventClass: 'boot_summary',
+        site: `ezil-os:trace#${summary.name}`,
+        code: summary.outcome === 'ok' ? 'ok' : summary.outcome,
+        outcome: summary.outcome,
+        durationMs: summary.totalMs,
+        correlationId: summary.correlationId,
+        attrs,
+    });
+}
+
+/**
  * The apps this boot may actually show: every shell-local app, plus the
  * intersection of the HOSTED apps this file knows how to draw with the ones
  * the server said it can serve.
@@ -323,7 +354,7 @@ export function getApp (id) {
 export function resolve (payload) {
     const served = payload?.apps;
     if ( ! Array.isArray(served) ) {
-        console.warn(`[${PHASE}] boot payload carried no app list; showing all known apps`);
+        log.warn(`[${PHASE}] boot payload carried no app list; showing all known apps`);
         return [...APPS];
     }
 
@@ -337,11 +368,11 @@ export function resolve (payload) {
     // definition — the server is not expected to know about them.
     for ( const a of APPS ) {
         if ( a.shell_local !== true && ! ids.has(a.id) ) {
-            console.warn(`[${PHASE}] "${a.id}" is not served by this deployment; hiding it`);
+            log.warn(`[${PHASE}] "${a.id}" is not served by this deployment; hiding it`);
         }
     }
     for ( const id of ids ) {
-        if ( ! getApp(id) ) console.warn(`[${PHASE}] server offers "${id}" but this shell cannot open it`);
+        if ( ! getApp(id) ) log.warn(`[${PHASE}] server offers "${id}" but this shell cannot open it`);
     }
     return allowed;
 }
@@ -357,7 +388,7 @@ export function resolve (payload) {
 export async function launch (id, ctx = {}) {
     const app = getApp(id);
     if ( ! app ) {
-        console.error(`[${PHASE}] no such app: ${id}`);
+        log.error(`[${PHASE}] no such app: ${id}`);
         telemetry.capture({
             eventClass: 'contract_violation', site: 'ezil-os:apps/registry#launch', code: 'unknown_app',
             detail: String(id),
@@ -381,7 +412,7 @@ export async function launch (id, ctx = {}) {
             // Already open. It may be minimised, buried, or right there — all
             // three want the same thing, and `showWindow` on a visible window
             // is harmless.
-            console.info(`[${PHASE}] "${id}" is already open; restoring it`);
+            log.info(`[${PHASE}] "${id}" is already open; restoring it`);
             $existing.showWindow();
             const el_existing = $existing.get(0);
             // Belt and braces: the first open already did this, but a window
@@ -398,11 +429,24 @@ export async function launch (id, ctx = {}) {
         }
     }
 
+    // Opens a trace for THIS app-open and makes it ambient
+    // (`../trace.js#beginTrace`) — every `telemetry.capture()` call made
+    // anywhere below, and anywhere `app.open()` itself (or anything it calls
+    // transitively, e.g. `desktop-window.js`'s own boot-phase telemetry)
+    // reaches during this `await`, now shares ONE `correlationId` without any
+    // of those ~30 existing call sites being edited. `.step()` marks the
+    // checkpoints this file itself can see; a richer breadcrumb trail (real
+    // boot-phase timings) is `trace.ambientTraceRef()?.step(code)`, callable
+    // from any owned file without importing this one.
+    const trace = beginTrace(id);
+    trace.step('launch_start');
+
     try {
         // The descriptor's own icon travels with the launch, so the window
         // head, the taskbar item and the control tray cannot show a different
         // image from the dock tile the user just clicked.
         const el_window = await app.open({ ...ctx, icon: app.icon, appName: app.name });
+        trace.step('open_resolved');
 
         // 🔴 Stamp WHICH computer this window is for, on the window itself.
         //
@@ -442,17 +486,30 @@ export async function launch (id, ctx = {}) {
                 () => { void launch('settings', ctx); },
                 { expected: true },
             );
+            trace.step('drawer_ready');
         }
+
+        // One `boot_summary` for this app-open, success or "opened nothing"
+        // alike (`el_window` can be null for a window that declined to open
+        // without throwing — e.g. `show_unavailable()` paths). Emitted AFTER
+        // `capture()` calls above have already run, so they were captured
+        // WHILE this trace was still ambient and share its correlation id;
+        // `.end()` clears the ambient pointer itself.
+        emitBootSummary(trace.end(el_window ? 'ok' : 'skipped'));
 
         return el_window;
     } catch ( err ) {
         // A throwing `open` must not leave the caller (a taskbar click, a
         // Start press) believing something is on its way.
-        console.error(`[${PHASE}] "${id}" failed to open`, err);
+        log.error(`[${PHASE}] "${id}" failed to open`, err);
         telemetry.capture({
             eventClass: 'window_error', site: 'ezil-os:apps/registry#launch', code: 'app_open_threw',
             detail: err, attrs: { app_id: String(id) },
         });
+        // Captured above WHILE the trace was still ambient, so it already
+        // carries this same correlation id — `.end()` runs last and closes
+        // the trace with the one boot_summary row for this failed open.
+        emitBootSummary(trace.end('error'));
         return null;
     }
 }
