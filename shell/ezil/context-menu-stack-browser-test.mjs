@@ -239,6 +239,17 @@ async function rightClickAt (rect) {
     await page.mouse.click(rect.cx, rect.cy, { button: 'right' });
 }
 
+// ── get window A on screen ──────────────────────────────────────────────
+// 🔴 MODIFIED BY EZIL 2026-08-04 (W3): login opens NOTHING now — see
+// `boot.js`'s own header. Every other browser test that wants the desktop
+// window open earns it with the same click a real user makes; this file's
+// setup used to inherit it for free from the `apps[0]` auto-launch that no
+// longer exists.
+const desktopItemRectSetup = await rectOf('.taskbar-item[data-app="desktop"]');
+push('setup: desktop taskbar item exists (source of window A)', !! desktopItemRectSetup);
+await page.mouse.click(desktopItemRectSetup.cx, desktopItemRectSetup.cy);
+await page.waitForSelector('.window[data-app="desktop"]', { timeout: 5000 });
+
 // ── get a SECOND real window on screen ──────────────────────────────────
 // `registry.js`'s 'settings' app is `shell_local: true` AND `pinned: true`,
 // so its taskbar item is present regardless of `PAYLOAD.apps` — the one way

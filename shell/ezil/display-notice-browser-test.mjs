@@ -133,6 +133,14 @@ for ( const vp of VIEWPORTS ) {
     await page.evaluate((p) => { window.__EZIL_BOOT__ = p; }, PAYLOAD);
     await page.addScriptTag({ content: icons });
     await page.addScriptTag({ content: bundle });
+    // 🔴 MODIFIED BY EZIL 2026-08-04 (W3): login opens NOTHING now — see
+    // `boot.js`'s own header. This file needs the desktop window open (to
+    // reach the display-unverified notice at all), so it earns it with the
+    // same explicit launch every other browser test in this wave uses.
+    await page.waitForSelector('.taskbar-item[data-app="desktop"]', { timeout: 10_000 });
+    await page.evaluate((p) => {
+        window.ezil.registry.launch('desktop', { payload: p, computer: p.computer, desktopState: p.desktopState });
+    }, PAYLOAD);
     await page.waitForSelector('.ezil-display-notice:not([hidden])', { timeout: 30_000 });
     // The drawer FLASHES open on full-bleed (`_ezil_drawer_flash`) and collapses
     // a few seconds later. Measure while it is OPEN: that is its largest, and a
