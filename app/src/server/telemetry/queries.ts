@@ -13,6 +13,7 @@ import { sql, type ExtractTablesWithRelations } from 'drizzle-orm';
 import type { PgDatabase, PgQueryResultHKT } from 'drizzle-orm/pg-core';
 
 import * as schema from '@/server/db/schema';
+import { WORKER_SENTINEL_USER_HASH } from './types';
 
 export type QueryDb = Pick<
     PgDatabase<PgQueryResultHKT, typeof schema, ExtractTablesWithRelations<typeof schema>>,
@@ -71,8 +72,18 @@ export interface LeaderboardRow {
     firstSeenAt: string;
 }
 
-/** "What is hurting the most people right now?" — the fleet-wide leaderboard,
- * within the raw-retention window. Muted fingerprints are excluded. */
+/**
+ * "What is hurting the most people right now?" — the fleet-wide leaderboard,
+ * within the raw-retention window. Muted fingerprints are excluded.
+ *
+ * 🔴 `distinctUsers` excludes `WORKER_SENTINEL_USER_HASH` via a `FILTER`
+ * clause on the aggregate, NOT a `WHERE` predicate on the outer query — a
+ * `WHERE user_hash <> sentinel` would make a worker-only fingerprint (every
+ * row under the sentinel) vanish from the leaderboard entirely instead of
+ * showing up with its real event count and a truthful (possibly zero)
+ * distinct-user count. Every worker/container error reported "1 distinct
+ * user" before this, which is a lie: nobody's `userHash` is the sentinel.
+ */
 export async function fingerprintLeaderboard(
     db: QueryDb,
     opts: { windowHours?: number; limit?: number } = {},
@@ -83,7 +94,7 @@ export async function fingerprintLeaderboard(
         SELECT e.fingerprint,
                f.event_class AS "eventClass", f.source, f.site, f.code,
                f.normalized_detail AS "normalizedDetail",
-               count(DISTINCT e.user_hash)::int AS "distinctUsers",
+               count(DISTINCT e.user_hash) FILTER (WHERE e.user_hash <> ${WORKER_SENTINEL_USER_HASH})::int AS "distinctUsers",
                count(*)::int                    AS events,
                max(e.received_at)               AS "lastSeen",
                f.first_seen_at                  AS "firstSeenAt"
@@ -109,6 +120,11 @@ export interface RollupLeaderboardRow {
 /** Same question as `fingerprintLeaderboard`, but from the hour-rollup table
  * — EXACT (not estimated) distinct-user counts beyond the raw-retention
  * horizon, since raw events are pruned but the rollup is kept 90 days. */
+/**
+ * 🔴 Same sentinel exclusion as `fingerprintLeaderboard`, same reason: a
+ * `FILTER` on the aggregate, not a `WHERE`, so a worker-only fingerprint's
+ * `events` total still shows up truthfully instead of the row disappearing.
+ */
 export async function fingerprintLeaderboardFromRollup(
     db: QueryDb,
     opts: { days?: number; limit?: number } = {},
@@ -117,7 +133,7 @@ export async function fingerprintLeaderboardFromRollup(
     const limit = Math.min(opts.limit ?? 50, 200);
     const result = await db.execute(sql`
         SELECT fingerprint,
-               count(DISTINCT user_hash)::int AS "distinctUsers",
+               count(DISTINCT user_hash) FILTER (WHERE user_hash <> ${WORKER_SENTINEL_USER_HASH})::int AS "distinctUsers",
                sum(event_count)::int          AS events
         FROM   ezil_error_user_hours
         WHERE  hour_bucket >= now() - (${days} || ' days')::interval

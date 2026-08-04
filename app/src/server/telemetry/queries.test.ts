@@ -20,6 +20,7 @@ import {
     spikeDetection,
     type QueryDb,
 } from './queries';
+import { WORKER_SENTINEL_USER_HASH } from './types';
 
 function makeTestDb(rows: unknown[] = []) {
     const statements: { sql: string; params: unknown[] }[] = [];
@@ -70,6 +71,36 @@ describe('Q1 — fingerprintLeaderboard (fleet-wide "what is hurting people now"
         await fingerprintLeaderboardFromRollup(db, { days: 90 });
         expect(statements[0]!.sql).toMatch(/ezil_error_user_hours/);
         expect(statements[0]!.sql).not.toMatch(/ezil_error_events/);
+    });
+
+    // 🔴 The worker-sentinel exclusion: `errorEvents.userHash` is NOT NULL and
+    // worker/container events have no real user, so they are stored under
+    // `WORKER_SENTINEL_USER_HASH`. Without this exclusion, every worker error
+    // reports "1 distinct user" and the leaderboard lies.
+    it('🔴 excludes WORKER_SENTINEL_USER_HASH from the distinctUsers aggregate via FILTER, not WHERE', async () => {
+        const { db, statements } = makeTestDb([]);
+        await fingerprintLeaderboard(db, { windowHours: 1, limit: 10 });
+        const generated = statements[0]!.sql;
+        // Must be inside a FILTER clause on the count(DISTINCT ...) aggregate —
+        // a WHERE predicate would make a worker-only fingerprint (every row
+        // under the sentinel) vanish from the result set entirely rather than
+        // showing up with a truthful (possibly zero) distinct-user count.
+        expect(generated).toMatch(/count\(distinct e\.user_hash\)\s*filter\s*\(\s*where\s+e\.user_hash\s*<>/i);
+        expect(statements[0]!.params).toContain(WORKER_SENTINEL_USER_HASH);
+        // And NOT hoisted into the outer WHERE clause (which already carries
+        // the received_at/outcome/muted_at predicates) — a WHERE-level
+        // exclusion would drop a worker-only fingerprint's row entirely
+        // instead of showing it with a truthful distinct-user count.
+        const outerWhere = generated.match(/\bwhere\s+e\.received_at[\s\S]*?group\s+by/i)?.[0] ?? '';
+        expect(outerWhere).not.toMatch(/user_hash\s*<>/i);
+    });
+
+    it('🔴 fingerprintLeaderboardFromRollup excludes the same sentinel from its distinctUsers aggregate', async () => {
+        const { db, statements } = makeTestDb([]);
+        await fingerprintLeaderboardFromRollup(db, { days: 90 });
+        const generated = statements[0]!.sql;
+        expect(generated).toMatch(/count\(distinct user_hash\)\s*filter\s*\(\s*where\s+user_hash\s*<>/i);
+        expect(statements[0]!.params).toContain(WORKER_SENTINEL_USER_HASH);
     });
 });
 
