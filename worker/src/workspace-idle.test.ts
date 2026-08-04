@@ -265,6 +265,21 @@ describe('parseLoadAvg1', () => {
     expect(parseLoadAvg1('0.5abc 1 1')).toBeNull();
   });
 
+  it('🔴 refuses an exotic numeric literal JS would happily evaluate to a stop-authorizing number', async () => {
+    // This is why the strict `^\d+(\.\d+)?$` check exists and a bare
+    // `Number()` is not enough. `Number('5e-3')` is 0.005 and `Number('0x0')`
+    // is 0 — both BELOW the busy threshold, i.e. both an authorization to
+    // stop a container, manufactured out of a byte sequence `/proc/loadavg`
+    // cannot produce. Everything the plain `Number.isFinite`/`< 0` checks
+    // already reject lands on the safe side by luck; these two do not, so the
+    // format check is the guard that actually carries the fail-safe here.
+    const { parseLoadAvg1, containerBusyFromProbe } = await import('./index');
+    expect(parseLoadAvg1('5e-3 1 1')).toBeNull();
+    expect(parseLoadAvg1('0x0 1 1')).toBeNull();
+    expect(containerBusyFromProbe({ exitCode: 0, stdout: '5e-3 1 1' }).busy).toBe(true);
+    expect(containerBusyFromProbe({ exitCode: 0, stdout: '0x0 1 1' }).busy).toBe(true);
+  });
+
   it('returns null for a negative figure (impossible for a load average)', async () => {
     const { parseLoadAvg1 } = await import('./index');
     expect(parseLoadAvg1('-1.0 0 0')).toBeNull();
