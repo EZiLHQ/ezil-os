@@ -584,6 +584,57 @@ Consequences worth keeping:
 
 ---
 
+## 23. A cross-origin desktop iframe makes "user input" unobservable — and an abandoned WebRTC session is not idle
+
+Two corrections to §22's client half, both found by measuring rather than reasoning.
+
+**The presence signal can't be input.** §22's fix asked the client for "time since real
+key/pointer input". The desktop is a **cross-origin** Neko iframe (`src` from
+`session.openDesktop()`, no `postMessage` bridge), so every keystroke and every pointer event
+aimed at the desktop is delivered *inside* that iframe's browsing context and the parent
+document observes **none** of it. `document.addEventListener('keydown', …)` on the host page is
+not a weak signal here, it is an empty one: it froze the instant a user started working, and the
+server's 10-minute idle-stop would have fired **during active use**. A test can't catch this —
+in jsdom you dispatch the event yourself and it works perfectly.
+
+`document.hasFocus()` is the signal that crosses the boundary: **it stays `true` while a
+descendant cross-origin iframe holds focus**, and goes false when the user switches window or
+tab. Pair it with `visibilityState` and you have presence. Note the trap in the transition:
+clicking *into* the iframe fires `blur` on the parent window while `hasFocus()` stays true — so a
+`blur` handler must **re-read** `hasFocus()`, never assume the user left, or you rebuild the same
+bug through a different door.
+
+**An idle container is not an idle container.** Measured on the production image under
+`--cpus=2` (matching `standard-3`), reproducing the kernel's loadavg over the container's own PID
+namespace, because **container runtimes do not namespace `/proc/loadavg`** — read it inside a
+container and you get the *host's* figure and `nproc` gives the *host's* core count:
+
+| state | load1 (p50 / max) | CPU |
+|---|---|---|
+| desktop up, **no** session attached | 0.0000 / 0.0000 | 0.004 cores |
+| desktop up, **session attached, nobody touching it** | 0.179 / **0.306** | **0.237 cores** |
+| one busy thread + session attached | 1.118 / 1.440 | 1.254 cores |
+
+The middle row is the one that matters and the one intuition gets wrong. A user who leaves the
+tab open and walks away leaves the WebRTC session **connected**, and `neko` keeps software-encoding
+1920x1080 vp8 for an audience of nobody — **a quarter of a core, indefinitely**. That is the
+"a tab merely left open must not bill" case, and it burns vCPU as well as memory. Any
+load-based "is it busy" guard whose threshold sits under ~0.3 will classify precisely those
+containers as working and refuse to stop them — vetoing the exact stops that pay for the fix.
+
+Consequences worth keeping:
+
+- **Check what the parent document can actually observe before making it the contract.** The
+  origin boundary is invisible in the source and invisible in jsdom.
+- **`/proc/loadavg` inside a container is not the container's.** Verify namespacing before
+  trusting it; log the figure you read so production can tell you whether it is plausible.
+- **Set a threshold from measured bands, not from a round number.** Two measured bands with a gap
+  between them have a defensible answer — the geometric mean, equal ratio margin either side.
+- **A "fail safe" default that always answers BUSY is a fix that silently does nothing.** Fail
+  safe, and then log enough to notice that you are always failing safe.
+
+---
+
 ## Method notes
 
 Two habits found more bugs than any amount of code reading:
