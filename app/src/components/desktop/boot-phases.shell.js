@@ -101,13 +101,18 @@
 
 /**
  * Phase vocabulary, in boot order. This is product copy, not a log line.
+ *
+ * MODIFIED BY EZIL 2026-08-04 (W3, "app-open feel"): relabeled away from
+ * machine/container vocabulary — see `./boot-phases.ts`'s copy of this same
+ * doc comment, which this file must agree with byte-for-byte (the drift
+ * guard in `boot-phases.shell.test.ts` checks it).
  * @type {readonly BootPhaseDef[]}
  */
 export const BOOT_PHASES = [
-    { id: 'waking', label: 'Waking your machine' },
-    { id: 'mounting', label: 'Mounting your files' },
-    { id: 'starting', label: 'Starting the desktop' },
-    { id: 'connecting', label: 'Connecting the display' },
+    { id: 'waking', label: 'Getting your workspace' },
+    { id: 'mounting', label: 'Loading your files' },
+    { id: 'starting', label: 'Starting your apps' },
+    { id: 'connecting', label: 'Opening the window' },
 ];
 
 // Measured reference timings (ms) — PLATFORM-NOTES §11's live measurement.
@@ -430,7 +435,10 @@ export function classifyPreviewFetchError(err) {
 
 // ─── User-facing copy ───────────────────────────────────────────────────────
 
-export const BOOT_PROGRESS_HEADLINE = 'Starting your computer';
+// MODIFIED BY EZIL 2026-08-04 (W3): was 'Starting your computer' — see
+// `./boot-phases.ts`'s copy of this comment. Kept in lockstep by the drift
+// guard in `boot-phases.shell.test.ts`.
+export const BOOT_PROGRESS_HEADLINE = 'Opening your workspace';
 export const BOOT_PROGRESS_SUBTEXT = 'This usually takes about 20 seconds.';
 export const BOOT_PROGRESS_LONG_SUBTEXT =
     'Still working — first boots and larger workspaces can take a bit longer.';
