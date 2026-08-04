@@ -437,7 +437,7 @@ body,html{overscroll-behavior-x:none}
 .device-desktop .desktop{padding-top:5px}
 .desktop.desktop-taskbar-position-left{margin-left:50px;padding-right:0;padding-bottom:0;height:calc(100vh)!important}
 .desktop.desktop-taskbar-position-right{margin-right:50px;padding-left:0;padding-bottom:0;height:calc(100vh)!important}
-.fullpage-mode .window-minimize-btn{display:none}
+.window[data-is_fullpage="1"] .window-minimize-btn{display:none}
 .device-phone .desktop{height:calc(100dvh - 90px)!important;padding-left:0!important;padding-right:0!important;padding-bottom:0!important}
 .item-container-list{display:grid;overflow-x:scroll!important;overflow-y:hidden!important;grid-template-rows:repeat(auto-fill,18px);grid-auto-flow:column;gap:15px 70px;padding-top:5px}
 .device-phone .item-container-list{grid-template-rows:repeat(auto-fill,55px);overflow-x:hidden!important;overflow-y:scroll!important;grid-auto-flow:unset}
@@ -879,14 +879,22 @@ body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;backgro
 0%,100%{box-shadow:0 0 0 0 rgba(0,173,181,.45)}
 50%{box-shadow:0 0 0 5px rgba(0,173,181,0)}
 }
-@media (prefers-reduced-motion:reduce){
-.ezil-boot-phase[data-state=current] .ezil-boot-dot{animation:none}
-}
 .ezil-boot-actions{margin-top:4px}
 .ezil-boot-actions[hidden]{display:none}
 .ezil-boot-retry{appearance:none;border:none;border-radius:6px;padding:9px 16px;font:inherit;font-size:13px;font-weight:500;color:#101111;background-color:#00adb5;cursor:pointer}
 .ezil-boot-retry:hover{opacity:.9}
 .ezil-boot-retry:focus-visible{outline:#f5f5f4 solid 2px;outline-offset:2px}
+.ezil-app-spinner{position:absolute;inset:0;z-index:2;display:flex;align-items:center;justify-content:center;padding:24px;background-color:#101111;color:#f5f5f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;-webkit-user-select:none;user-select:none;overflow:hidden;text-align:center}
+.ezil-app-spinner[hidden]{display:none}
+.ezil-app-spinner-panel{display:flex;flex-direction:column;align-items:center;max-width:280px}
+.ezil-app-spinner-ring{width:32px;height:32px;margin-bottom:18px;border-radius:50%;border:3px solid #2a2e2e;border-top-color:#00adb5;animation:.9s linear infinite ezil-app-spinner-spin}
+.ezil-app-spinner-sub[hidden]{display:none}
+@keyframes ezil-app-spinner-spin{
+to{transform:rotate(360deg)}
+}
+@media (prefers-reduced-motion:reduce){
+.ezil-app-spinner-ring,.ezil-boot-phase[data-state=current] .ezil-boot-dot{animation:none}
+}
 .ezil-display-notice{position:absolute;top:12px;left:12px;right:12px;z-index:3;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px 16px;max-width:720px;margin:0 auto;padding:12px 14px;border:1px solid rgba(245,245,244,.16);border-radius:10px;background-color:rgba(16,17,17,.94);color:#f5f5f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;line-height:1.45;box-shadow:0 10px 30px rgba(0,0,0,.45)}
 .ezil-display-notice[hidden]{display:none}
 .ezil-desktop-window.ezil-fullbleed .ezil-display-notice{top:55px}
