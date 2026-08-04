@@ -4,6 +4,10 @@
     {
       "path": "/api/cron/telemetry-maintenance",
       "schedule": "17 3 * * *"
+    },
+    {
+      "path": "/api/cron/telemetry-drain",
+      "schedule": "43 3 * * *"
     }
   ]
 }

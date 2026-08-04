@@ -13,6 +13,7 @@ import { sql, type ExtractTablesWithRelations } from 'drizzle-orm';
 import type { PgDatabase, PgQueryResultHKT } from 'drizzle-orm/pg-core';
 
 import * as schema from '@/server/db/schema';
+import { WORKER_SENTINEL_USER_HASH } from './types';
 
 export type QueryDb = Pick<
     PgDatabase<PgQueryResultHKT, typeof schema, ExtractTablesWithRelations<typeof schema>>,
@@ -71,8 +72,18 @@ export interface LeaderboardRow {
     firstSeenAt: string;
 }
 
-/** "What is hurting the most people right now?" — the fleet-wide leaderboard,
- * within the raw-retention window. Muted fingerprints are excluded. */
+/**
+ * "What is hurting the most people right now?" — the fleet-wide leaderboard,
+ * within the raw-retention window. Muted fingerprints are excluded.
+ *
+ * 🔴 `distinctUsers` excludes `WORKER_SENTINEL_USER_HASH` via a `FILTER`
+ * clause on the aggregate, NOT a `WHERE` predicate on the outer query — a
+ * `WHERE user_hash <> sentinel` would make a worker-only fingerprint (every
+ * row under the sentinel) vanish from the leaderboard entirely instead of
+ * showing up with its real event count and a truthful (possibly zero)
+ * distinct-user count. Every worker/container error reported "1 distinct
+ * user" before this, which is a lie: nobody's `userHash` is the sentinel.
+ */
 export async function fingerprintLeaderboard(
     db: QueryDb,
     opts: { windowHours?: number; limit?: number } = {},
@@ -83,7 +94,7 @@ export async function fingerprintLeaderboard(
         SELECT e.fingerprint,
                f.event_class AS "eventClass", f.source, f.site, f.code,
                f.normalized_detail AS "normalizedDetail",
-               count(DISTINCT e.user_hash)::int AS "distinctUsers",
+               count(DISTINCT e.user_hash) FILTER (WHERE e.user_hash <> ${WORKER_SENTINEL_USER_HASH})::int AS "distinctUsers",
                count(*)::int                    AS events,
                max(e.received_at)               AS "lastSeen",
                f.first_seen_at                  AS "firstSeenAt"
@@ -109,6 +120,11 @@ export interface RollupLeaderboardRow {
 /** Same question as `fingerprintLeaderboard`, but from the hour-rollup table
  * — EXACT (not estimated) distinct-user counts beyond the raw-retention
  * horizon, since raw events are pruned but the rollup is kept 90 days. */
+/**
+ * 🔴 Same sentinel exclusion as `fingerprintLeaderboard`, same reason: a
+ * `FILTER` on the aggregate, not a `WHERE`, so a worker-only fingerprint's
+ * `events` total still shows up truthfully instead of the row disappearing.
+ */
 export async function fingerprintLeaderboardFromRollup(
     db: QueryDb,
     opts: { days?: number; limit?: number } = {},
@@ -117,7 +133,7 @@ export async function fingerprintLeaderboardFromRollup(
     const limit = Math.min(opts.limit ?? 50, 200);
     const result = await db.execute(sql`
         SELECT fingerprint,
-               count(DISTINCT user_hash)::int AS "distinctUsers",
+               count(DISTINCT user_hash) FILTER (WHERE user_hash <> ${WORKER_SENTINEL_USER_HASH})::int AS "distinctUsers",
                sum(event_count)::int          AS events
         FROM   ezil_error_user_hours
         WHERE  hour_bucket >= now() - (${days} || ' days')::interval
@@ -238,6 +254,76 @@ export async function spikeDetection(db: QueryDb): Promise<SpikeRow[]> {
         ORDER  BY "isNew" DESC, z DESC
     `);
     return rowsOf<SpikeRow>(result);
+}
+
+// ── recentTraces / traceTimeline — "what happened during THIS app-open" ─────
+// The W1 observability plan's whole point: every producer (shell's
+// `registry.js#launch()`, and now the worker/container events the
+// `/telemetry/drain` cron finally lands — see `spool-drain.ts`) shares a
+// `correlationId`, and exactly ONE `boot_summary` row exists per app-open /
+// per preview-boot request. `recentTraces` lists those rows (one per row,
+// most recent first); `traceTimeline` pulls every event sharing one
+// `correlationId`, in chronological order, so a single click on a row in the
+// admin page answers "what happened, in what order, before this one ended".
+
+export interface RecentTraceRow {
+    correlationId: string;
+    source: string;
+    site: string;
+    code: string;
+    outcome: string;
+    durationMs: number | null;
+    occurredAt: string;
+}
+
+/** Recent app-opens / preview boots — one row per `boot_summary`, newest
+ * first. `correlationId IS NOT NULL` excludes the (should-not-happen, but
+ * never trusted) case of a `boot_summary` that somehow lost its trace. */
+export async function recentTraces(db: QueryDb, opts: { limit?: number } = {}): Promise<RecentTraceRow[]> {
+    const limit = Math.min(opts.limit ?? 50, 200);
+    const result = await db.execute(sql`
+        SELECT correlation_id AS "correlationId",
+               source, site, code, outcome,
+               duration_ms       AS "durationMs",
+               occurred_at       AS "occurredAt"
+        FROM   ezil_error_events
+        WHERE  event_class = 'boot_summary'
+          AND  correlation_id IS NOT NULL
+        ORDER  BY received_at DESC
+        LIMIT  ${limit}
+    `);
+    return rowsOf<RecentTraceRow>(result);
+}
+
+export interface TraceTimelineRow {
+    eventClass: string;
+    source: string;
+    site: string;
+    code: string;
+    outcome: string;
+    durationMs: number | null;
+    occurredAt: string;
+    detail: string | null;
+}
+
+/** Every event sharing one `correlationId`, oldest first — the drill-down
+ * behind `recentTraces`' rows. Capped at 200: a trace is one app-open or one
+ * preview-boot request, never a page's whole lifetime, so this is a ceiling
+ * that should never actually bind in practice, kept only as defence in depth
+ * against a future producer bug that reuses one id across many events. */
+export async function traceTimeline(db: QueryDb, correlationId: string): Promise<TraceTimelineRow[]> {
+    const result = await db.execute(sql`
+        SELECT event_class AS "eventClass",
+               source, site, code, outcome,
+               duration_ms       AS "durationMs",
+               occurred_at       AS "occurredAt",
+               detail
+        FROM   ezil_error_events
+        WHERE  correlation_id = ${correlationId}
+        ORDER  BY occurred_at ASC
+        LIMIT  200
+    `);
+    return rowsOf<TraceTimelineRow>(result);
 }
 
 // ── Q4 — which boot phase fails most ─────────────────────────────────────────
