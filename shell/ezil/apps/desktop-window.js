@@ -89,9 +89,11 @@
 // a desktop they cannot leave. See `minimise_to_taskbar` below.
 
 import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
+import { claim as claimWarm } from '../warm.js';
 import telemetry from '../telemetry.js';
 import { applyDisplayEvidence, computeBootUiState } from '../boot-phases.js';
 import BootProgress, { DisplayNotice } from '../ui/boot-progress.js';
+import AppSpinner from '../ui/app-spinner.js';
 import attach_app_drawer from '../ui/app-drawer.js';
 import UIWindow from '../../src/UI/UIWindow.js';
 
@@ -101,6 +103,23 @@ const PHASE = 'ezil-os:desktop';
 const TICK_MS = 250;
 /** How often the cheap status probe runs. It does NOT wake a container. */
 const POLL_MS = 2_000;
+
+/**
+ * Progressive disclosure (W3). The window opens showing `AppSpinner` — a
+ * ring and "Opening Browser…", nothing else — and only reveals the phase
+ * panel's checklist once a boot has been genuinely pending this long. A warm
+ * open (the common case, thanks to `warm.js`) usually settles well inside
+ * this window and never shows a phase list at all; a genuinely long cold
+ * boot earns the detail because it is genuinely taking longer than "a
+ * circular thing rotates a few seconds" covers.
+ *
+ * 🔴 Comfortably inside `DISPLAY_UNVERIFIED_DEADLINE_MS` (6s, below) — the
+ * phase list must have a chance to appear before the display gate's own
+ * "we could not check" strip could ever fire, or a slow-but-honest boot would
+ * jump straight from a bare spinner to a failure/unverified surface with no
+ * detail in between.
+ */
+const PHASE_LIST_AFTER_MS = 4_000;
 
 /**
  * The post-handoff frame confirmation (`settle_frame`). These three govern
@@ -374,6 +393,35 @@ export async function openDesktopWindow (ctx = {}) {
     const progress = BootProgress({ onRetry: () => { void start_boot(); } });
     el_body.appendChild(progress.el);
 
+    // ── W3: opens showing this, not the phase panel ─────────────────────────
+    // See `PHASE_LIST_AFTER_MS`'s doc comment. Same `BootUiState` in, same
+    // failure/not-configured copy out — the two components disagree only on
+    // how much detail a still-`progress` state gets, and `render_both` below
+    // is what keeps them from ever disagreeing about anything else: both are
+    // always fed the identical state, in the same call, so there is no
+    // sequence in which one shows a claim the other has not also made.
+    const spinner = AppSpinner({
+        label: `Opening ${ctx.appName || title}…`,
+        onRetry: () => { void start_boot(); },
+    });
+    el_body.appendChild(spinner.el);
+
+    /** Has a boot attempt been pending long enough to earn the phase list? */
+    let show_phase_list = false;
+    /** Cleared on every fresh attempt and on disposal; see `start_boot`. */
+    let phase_list_timer = null;
+    /** The most recent state either surface was given, so the reveal timer
+     *  can tell "still pending" from "already concluded" without a second,
+     *  separately-maintained flag that could drift from what was rendered. */
+    let last_kind = null;
+
+    /** The one place either boot surface is told what to render. */
+    function render_both (state) {
+        last_kind = state.kind;
+        progress.render(state);
+        spinner.render(state);
+    }
+
     // The `ready_unverified` strip. Attached up front, hidden, for the same
     // reason the drawer is: whether it CAN be shown must be settled before
     // anything could need to show it. It is a sibling of the boot panel, not a
@@ -382,8 +430,18 @@ export async function openDesktopWindow (ctx = {}) {
     const notice = DisplayNotice({ onRetry: () => { void start_boot(); } });
     el_body.appendChild(notice.el);
 
-    /** Show the panel again (retry after a failure, or a fresh attempt). */
-    const show_panel = () => { progress.el.hidden = false; };
+    /**
+     * Show whichever of the two surfaces is currently earned, and hide the
+     * other. Called on every fresh attempt and every time the phase-list
+     * timer fires on a still-pending boot — never while a terminal state
+     * (failed / not_configured / ready / ready_unverified) is showing,
+     * because at that point which DOM node is visible is no longer this
+     * function's decision (the reveal/failure code paths own it directly).
+     */
+    const show_panel = () => {
+        progress.el.hidden = ! show_phase_list;
+        spinner.el.hidden = show_phase_list;
+    };
 
     /**
      * Hand the viewport to the desktop.
@@ -425,25 +483,43 @@ export async function openDesktopWindow (ctx = {}) {
         if ( disposed ) return;
         const my_attempt = ++attempt;
         stop_timers();
+        clearTimeout(phase_list_timer); phase_list_timer = null;
+        // A fresh attempt has earned nothing yet — start back at the spinner,
+        // whatever the previous attempt had revealed.
+        show_phase_list = false;
         show_panel();
         // A fresh attempt has established nothing yet, so last attempt's "we
         // could not check" must not linger over it.
         notice.hide();
         running_signal = undefined;
 
+        // 🔴 PHASE_LIST_AFTER_MS, measured from THIS attempt's own start, not
+        // from anything upstream. Guarded on `last_kind` rather than a second
+        // "are we still booting" flag: if this attempt has already reached a
+        // terminal state (or a later attempt has started) by the time this
+        // fires, there is nothing to reveal and calling `show_panel()` would
+        // only re-toggle visibility on a surface that already retired itself
+        // for a real reason.
+        phase_list_timer = setTimeout(() => {
+            phase_list_timer = null;
+            if ( disposed || my_attempt !== attempt || last_kind !== 'progress' ) return;
+            show_phase_list = true;
+            show_panel();
+        }, PHASE_LIST_AFTER_MS);
+
         if ( desktop_state.configured !== true ) {
             // No provider at all. Do not send a request whose answer is
             // already known, and do not offer a Retry that cannot succeed —
-            // `BootProgress` hides the button for this state on purpose.
+            // both boot surfaces hide the button for this state on purpose.
             console.warn(`[${PHASE}] no desktop provider is configured`);
-            progress.render(computeBootUiState({ requestStatus: 'not_configured', elapsedMs: 0 }));
+            render_both(computeBootUiState({ requestStatus: 'not_configured', elapsedMs: 0 }));
             return;
         }
 
         const t0 = performance.now();
         paint = () => {
             if ( disposed || my_attempt !== attempt ) return;
-            progress.render(computeBootUiState({
+            render_both(computeBootUiState({
                 requestStatus: 'pending',
                 elapsedMs: performance.now() - t0,
                 confirmedGuacamoleRunning: running_signal,
@@ -470,7 +546,14 @@ export async function openDesktopWindow (ctx = {}) {
         }, POLL_MS);
 
         console.info(`[${PHASE}] booting computer ${computer.id} (budget ${DESKTOP_BOOT_TIMEOUT_MS}ms)`);
-        const res = await session.openDesktop(computer.id);
+        // 🔴 ONLY the window's FIRST attempt claims the silent warm `boot.js`
+        // fired after paint (see `warm.js`) — an explicit Retry always asks
+        // fresh. "Try again" has to mean the network is actually asked again,
+        // never a possibly-stale warm result silently replayed; see
+        // `warm.js`'s own header for why that split lives there and not here.
+        const res = my_attempt === 1
+            ? await claimWarm(computer.id)
+            : await session.openDesktop(computer.id);
 
         if ( disposed || my_attempt !== attempt ) return;
         stop_timers();
@@ -481,7 +564,7 @@ export async function openDesktopWindow (ctx = {}) {
                 eventClass: 'api_failure', site: 'ezil-os:apps/desktop#mint', code: res.errorCode,
                 durationMs: performance.now() - t0,
             });
-            progress.render(computeBootUiState({
+            render_both(computeBootUiState({
                 requestStatus: 'error',
                 elapsedMs: performance.now() - t0,
                 errorCode: res.errorCode,
@@ -512,7 +595,7 @@ export async function openDesktopWindow (ctx = {}) {
             // The server looked and did NOT see a desktop. Say so now rather
             // than showing progress over it; `settle_frame` re-asks from the
             // browser and can still overturn this.
-            progress.render(computeBootUiState({
+            render_both(computeBootUiState({
                 requestStatus: 'success',
                 elapsedMs: 0,
                 // 🔴 Not a constant, and not defaulted to true. `openDesktop`
@@ -614,7 +697,7 @@ export async function openDesktopWindow (ctx = {}) {
             gate.stop();
             stop_timers();
             show_panel();
-            progress.render(computeBootUiState({
+            render_both(computeBootUiState({
                 requestStatus: 'success',
                 elapsedMs: 0,
                 frameConfirmed: false,
@@ -762,7 +845,8 @@ export async function openDesktopWindow (ctx = {}) {
                 }
                 stop();
                 stop_timers();
-                progress.render(state);
+                clearTimeout(phase_list_timer); phase_list_timer = null;
+                render_both(state);
                 // The blank frame is never revealed. The panel stays, over an
                 // ordinary window, on an OS with its taskbar still on it.
                 show_panel();
@@ -779,8 +863,15 @@ export async function openDesktopWindow (ctx = {}) {
             // that is on screen. Caught by boot-test, intermittently, which is
             // the worst way to find out.
             stop_timers();
-            progress.render(state);
+            clearTimeout(phase_list_timer); phase_list_timer = null;
+            render_both(state);
+            // 🔴 BOTH surfaces, not just whichever one `show_phase_list` had
+            // made visible. Whichever of the two was on screen a moment ago,
+            // the iframe is about to take the viewport — leaving the OTHER
+            // one visible (a warm open that never earned the phase list, e.g.)
+            // would paint the spinner over a desktop that is now live.
             progress.el.hidden = true;
+            spinner.el.hidden = true;
             if ( state.kind === 'ready_unverified' ) notice.show();
             else notice.hide();
             go_fullbleed(state.kind === 'ready'
@@ -942,6 +1033,20 @@ export async function openDesktopWindow (ctx = {}) {
         }
         $(el).hideWindow();
     }
+
+    // 🔴 SEAM (W2/W3). `UIWindow.js`'s head-minimise button calls
+    // `el_window._ezil_minimise?.()` first and returns without doing anything
+    // ELSE if it returns truthy — see that file's `minimize_window`. Without
+    // this, the window head's own minimise button skips the taskbar-restore
+    // dance above entirely (`exit_fullpage_mode` never runs), which is the
+    // exact "minimise and close behave differently depending on which button
+    // you press" defect this property exists to close. Property name and
+    // shape are the CONTRACT: no arguments, returns a truthy value the moment
+    // — and only the moment — this file has actually handled the minimise.
+    el_window._ezil_minimise = () => {
+        minimise_to_taskbar(el_window);
+        return true;
+    };
 
     // Coming back from the taskbar must return to full-bleed, or a desktop
     // that WAS full-bleed reopens as a 680x380 box (that is what

@@ -79,12 +79,24 @@ export interface BootPhaseDef {
     label: string;
 }
 
-/** Phase vocabulary, in boot order. This is product copy, not a log line. */
+/**
+ * Phase vocabulary, in boot order. This is product copy, not a log line.
+ *
+ * MODIFIED BY EZIL 2026-08-04 (W3, "app-open feel"): relabeled away from
+ * machine/container vocabulary ("Waking your machine", "Starting the
+ * desktop") per the owner directly — "The user doesn't care about any of
+ * that... App opening should be like opening an app." This list is now only
+ * ever SEEN by `desktop-window.js`'s own phase panel, and only after
+ * `PHASE_LIST_AFTER_MS` (4s) of a genuinely long boot — a warm open never
+ * reaches it, and Preview/Code dropped the phase panel entirely in favor of
+ * `AppSpinner`. `id`s are unchanged; they are read by `estimatePhaseForElapsedMs`
+ * and `phaseVisualState`, never rendered.
+ */
 export const BOOT_PHASES: readonly BootPhaseDef[] = [
-    { id: 'waking', label: 'Waking your machine' },
-    { id: 'mounting', label: 'Mounting your files' },
-    { id: 'starting', label: 'Starting the desktop' },
-    { id: 'connecting', label: 'Connecting the display' },
+    { id: 'waking', label: 'Getting your workspace' },
+    { id: 'mounting', label: 'Loading your files' },
+    { id: 'starting', label: 'Starting your apps' },
+    { id: 'connecting', label: 'Opening the window' },
 ];
 
 // Measured reference timings (ms) — PLATFORM-NOTES §11's live measurement.
@@ -415,7 +427,10 @@ export function classifyPreviewFetchError(err: unknown): 'timeout' | undefined {
 
 // ─── User-facing copy ───────────────────────────────────────────────────────
 
-export const BOOT_PROGRESS_HEADLINE = 'Starting your computer';
+// MODIFIED BY EZIL 2026-08-04 (W3): was 'Starting your computer' — see the
+// `BOOT_PHASES` doc comment above for why. Kept in lockstep with
+// `boot-phases.shell.js` by the drift guard in `boot-phases.shell.test.ts`.
+export const BOOT_PROGRESS_HEADLINE = 'Opening your workspace';
 export const BOOT_PROGRESS_SUBTEXT = 'This usually takes about 20 seconds.';
 export const BOOT_PROGRESS_LONG_SUBTEXT =
     'Still working — first boots and larger workspaces can take a bit longer.';

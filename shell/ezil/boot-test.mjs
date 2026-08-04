@@ -100,6 +100,18 @@ function boot_shell (handler, payload = PAYLOAD, body = '<div id="ezil-os-root">
 const $$ = (w, sel) => w.document.querySelectorAll(sel);
 const $1 = (w, sel) => w.document.querySelector(sel);
 
+/**
+ * MODIFIED BY EZIL 2026-08-04 (W3, "app-open feel"): `boot.js` used to
+ * `registry.launch(apps[0].id, ctx)` the instant the desktop painted, so
+ * every scenario below inherited a desktop window for free. It no longer
+ * opens anything — see `boot.js`'s own header — so every scenario that wants
+ * a window now opens it exactly the way a real user does: clicking the
+ * pinned dock icon. Requires the taskbar to already exist.
+ */
+function open_desktop (window) {
+    window.$('.taskbar-item[data-app="desktop"]').trigger('click');
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Scenario 1 — a happy boot
 // ───────────────────────────────────────────────────────────────────────────
@@ -158,8 +170,16 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
     push('pinned item is kept in the taskbar (survives a close)',
         $1(window, '.taskbar-item[data-app="desktop"]')?.getAttribute('data-keep-in-taskbar') === 'true');
 
+    // 🔴 THE WHOLE POINT OF W3. Login used to auto-launch `apps[0]` the
+    // instant the desktop painted; it no longer opens anything at all. Both
+    // directions matter: revert `boot.js`'s removal of that launch and this
+    // goes red on a REAL window existing before any click happened.
+    push('🔴 login opened ZERO windows — the wallpaper and dock ARE the boot',
+        $$(window, '.window').length === 0, `${$$(window, '.window').length} windows`);
+
+    open_desktop(window);
     const win = await until(() => $1(window, '.window[data-app="desktop"]'));
-    push('desktop window opened', !!win);
+    push('clicking the dock opens the desktop window', !!win);
     push('🔴 EXACTLY ONE window',
         $$(window, '.window').length === 1, `${$$(window, '.window').length} windows`);
     // 🔴 THE STACKING CONTRACT. This window used to be created with
@@ -221,8 +241,26 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
     push('four phase rows rendered', $$(window, '.ezil-boot-phase').length === 4,
         `${$$(window, '.ezil-boot-phase').length} rows`);
     push('boot headline is the honest one',
-        $1(window, '.ezil-boot-title')?.textContent === 'Starting your computer',
+        $1(window, '.ezil-boot-title')?.textContent === 'Opening your workspace',
         $1(window, '.ezil-boot-title')?.textContent);
+
+    // 🔴 PROGRESSIVE DISCLOSURE (W3). The window opens showing `AppSpinner`,
+    // not the phase panel — "a circular thing rotates a few seconds", not a
+    // machine checklist. The phase panel above is built and kept up to date
+    // the whole time, it is just not what is ON SCREEN yet. See Scenario 1b,
+    // below, for the crisp 4s-reveal proof; this only pins the initial state.
+    const spinner = $1(window, '.ezil-app-spinner');
+    push('🔴 the window opens showing the app spinner, not the phase panel',
+        !!spinner && spinner.hidden === false,
+        `spinner hidden=${spinner?.hidden}`);
+    push('🔴 ...and the phase panel is hidden behind it',
+        panel?.hidden === true, `panel hidden=${panel?.hidden}`);
+    push('the spinner says what is opening, not what is booting',
+        $1(window, '.ezil-app-spinner-label')?.textContent === 'Opening Browser…',
+        $1(window, '.ezil-app-spinner-label')?.textContent);
+    push('no machine vocabulary anywhere the user can see it yet',
+        !spinner.textContent.includes('computer') && !spinner.textContent.includes('machine'),
+        spinner.textContent);
 
     // 🔴 HONESTY: no checkmark may be drawn from elapsed time alone. The stub
     // reports guacamoleRunning:false, so nothing is `confirmed` no matter how
@@ -339,6 +377,62 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Scenario 1b — PROGRESSIVE DISCLOSURE, measured against the real deadline
+//
+// Scenario 1 pinned the INITIAL state (spinner up, phase panel hidden) but
+// deliberately did not depend on wall-clock timing to do it — it asserted
+// that state well inside any reasonable margin of `PHASE_LIST_AFTER_MS`. This
+// scenario is the one that actually crosses the 4s line: the preview request
+// is held open the whole time (same `preview_gate` pattern as Scenario 1), so
+// the boot is GENUINELY still pending on both sides of the deadline, and
+// nothing here can pass by accident.
+//
+// 🔴 Both directions: comment out `desktop-window.js`'s reveal-timer and this
+// scenario's second assertion goes red forever (the phase panel never
+// appears); make the reveal fire immediately instead of waiting for the
+// timer and the FIRST assertion goes red (a warm-looking open would show a
+// phase list before it earned one).
+// ───────────────────────────────────────────────────────────────────────────
+{
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const { window } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            await gate;
+            return { ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko', frame: { confirmed: true } };
+        }
+        return { ok: true, guacamoleRunning: false };
+    });
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    open_desktop(window);
+    const win = await until(() => $1(window, '.window[data-app="desktop"]'));
+
+    await sleep(3_000); // well before PHASE_LIST_AFTER_MS (4s)
+    push('🔴 a boot that is only 3s in still shows the spinner, not the phase list',
+        $1(window, '.ezil-app-spinner')?.hidden === false
+        && $1(window, '.ezil-boot')?.hidden === true,
+        `spinner hidden=${$1(window, '.ezil-app-spinner')?.hidden}`
+        + ` panel hidden=${$1(window, '.ezil-boot')?.hidden}`);
+
+    await sleep(2_000); // now ~5s in — past PHASE_LIST_AFTER_MS (4s), still pending
+    push('🔴 a boot still pending past 4s earns the phase list, and the spinner steps aside',
+        $1(window, '.ezil-boot')?.hidden === false
+        && $1(window, '.ezil-app-spinner')?.hidden === true,
+        `spinner hidden=${$1(window, '.ezil-app-spinner')?.hidden}`
+        + ` panel hidden=${$1(window, '.ezil-boot')?.hidden}`);
+    push('the phase list itself is now visible, not just the panel',
+        $1(window, '.ezil-boot-phases')?.hidden === false);
+
+    // Not this scenario's concern whether the boot then succeeds or fails —
+    // only that the panel swap already happened correctly. Let the released
+    // request settle before tearing down, so nothing here leaves a dangling
+    // timer for the next scenario to trip over.
+    release();
+    await sleep(500);
+    await window.$(win).close();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Scenario 2 — the worker is unreachable
 // ───────────────────────────────────────────────────────────────────────────
 {
@@ -351,6 +445,8 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
         return { ok: true, guacamoleRunning: false };
     });
 
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    open_desktop(window);
     const failed = await until(() => $1(window, '.ezil-boot[data-kind="failed"]'));
     push('a failed boot says so', !!failed);
     push('failure copy is the specific one, not a generic spinner',
@@ -386,6 +482,8 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
         desktopState: { ...PAYLOAD.desktopState, configured: false },
     });
 
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    open_desktop(window);
     const nc = await until(() => $1(window, '.ezil-boot[data-kind="not_configured"]'));
     push('unconfigured provider renders its own honest state', !!nc);
     push('no Retry button for a state retrying cannot fix',
@@ -460,8 +558,14 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
         window.document.body.className);
     push('it adopted the server-rendered desktop instead of adding a second',
         $$(window, '.desktop').length === 1, `${$$(window, '.desktop').length} .desktop nodes`);
+
+    // 🔴 W3: login (and by extension every `build()`, rebuild included) opens
+    // nothing automatically — see `boot.js`'s header. So proving a window CAN
+    // open on this React host, same as any other host, takes the same click
+    // every other scenario now uses.
+    open_desktop(window);
     const win = await until(() => $1(window, '.window[data-app="desktop"]'));
-    push('the desktop window opened on the React host', !!win);
+    push('the desktop window opens on the React host, on request', !!win);
 
     // Capture what the shell was actually tracking BEFORE the regeneration, so
     // the "did this really get destroyed" check is about the shell's own
@@ -506,10 +610,20 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
     // chance to run — exactly how this went stale. `mountAttempts` incrementing
     // is the one signal that cannot be satisfied by anything left over from
     // the destroyed mount.
+    //
+    // 🔴 W3: NOT gated on a window reappearing, unlike before this task.
+    // `build()` opens nothing on ANY call, rebuild included — it is the same
+    // function every login runs, with no "this one is a rebuild" flag to key
+    // an auto-launch off. A rebuilt, windowless desktop is the CORRECT,
+    // honest result of a React regeneration, exactly as it is of the
+    // original login. The pinned taskbar item reappearing is the
+    // rebuild-specific signal instead.
     const rebuilt = await until(() => window.ezil.mountAttempts > attempts_before
-        && $1(window, '.window[data-app="desktop"]'));
+        && $1(window, '.taskbar-item[data-app="desktop"]'));
     push('🔴 a destroyed desktop rebuilds itself — `mounted` is not a latch',
         !!rebuilt, `attempts=${window.ezil.mountAttempts}`);
+    push('🔴 ...and the rebuild opens ZERO windows, same as the original login',
+        $$(window, '.window').length === 0, `${$$(window, '.window').length} windows`);
     push('the rebuild adopted a genuinely new desktop node, not the disconnected one',
         !!window.ezil.desktop && window.ezil.desktop !== stale_desktop && window.ezil.desktop.isConnected,
         `same-node=${window.ezil.desktop === stale_desktop} connected=${window.ezil.desktop?.isConnected}`);
@@ -521,8 +635,13 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
         `${$$(window, '.taskbar-item[data-app="desktop"]').length} items`);
     push('the device class is back on <body>',
         window.document.body.classList.contains('device-desktop'), window.document.body.className);
+
+    // The rebuild restored the AFFORDANCE (a clickable dock icon); it did not
+    // restore a window it never opened by itself. Prove the affordance still
+    // works post-rebuild, the same way every other scenario proves it.
+    open_desktop(window);
     const rewin = await until(() => $1(window, '.window[data-app="desktop"]'));
-    push('the desktop window is back too', !!rewin);
+    push('...and clicking it after the rebuild opens the desktop window again', !!rewin);
     push('and exactly one of them is open', $$(window, '.window[data-app="desktop"]').length === 1);
 }
 
@@ -597,6 +716,8 @@ async function boot_to_display_gate (answer) {
         if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
         return { ok: true };
     });
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    open_desktop(window);
     const iframe = await until(() => $1(window, '.window[data-app="desktop"] .window-app-iframe'));
     await until(() => iframe?.getAttribute('src') === URL_OK);
     iframe.dispatchEvent(new window.Event('load'));
@@ -824,6 +945,8 @@ async function boot_to_display_gate (answer) {
         if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
         return { ok: true };
     });
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    open_desktop(window);
     const iframe = await until(() => $1(window, '.window[data-app="desktop"] .window-app-iframe'));
     await until(() => iframe?.getAttribute('src') === URL_OK);
     iframe.dispatchEvent(new window.Event('load'));

@@ -87,7 +87,7 @@
 import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
 import telemetry from '../telemetry.js';
 import { computeBootUiState } from '../boot-phases.js';
-import BootProgress from '../ui/boot-progress.js';
+import AppSpinner from '../ui/app-spinner.js';
 import UIWindow from '../../src/UI/UIWindow.js';
 
 const PHASE = 'ezil-os:code';
@@ -240,7 +240,7 @@ export async function openCodeWindow (ctx = {}) {
         clearInterval(poll_timer); poll_timer = null;
     };
 
-    const progress = BootProgress({ onRetry: () => { void start_boot(); } });
+    const progress = AppSpinner({ label: 'Opening Code…', onRetry: () => { void start_boot(); } });
     el_body.appendChild(progress.el);
 
     // ── the "no field yet" panel — same reasoning as `preview.js`'s: "the

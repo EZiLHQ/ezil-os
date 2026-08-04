@@ -1395,7 +1395,22 @@ async function runViewport (vp) {
     const coveredIds = new Set();
     const openIds = new Set();
 
-    // ── boot app: opened by boot.js itself (`apps[0]`), not by this harness ──
+    // ── boot app ─────────────────────────────────────────────────────────
+    // 🔴 MODIFIED BY EZIL 2026-08-04 (W3): this used to be "opened by boot.js
+    // itself (`apps[0]`), not by this harness" — `boot.js` unconditionally
+    // launched `apps[0]` the instant the desktop painted. Login now opens
+    // NOTHING (see that file's own header: "the wallpaper and dock ARE the
+    // boot"), so this harness earns the boot app's window exactly the way
+    // `otherAppIds` below already do — one explicit `registry.launch` — before
+    // asserting anything about it. Every downstream assertion in this
+    // function (full-bleed, drawer, hit-testing, taskbar reachability) is
+    // unchanged: they all describe what a REAL user sees once the app is
+    // open, which this harness now produces with one extra line instead of
+    // for free.
+    await page.evaluate(({ a, ctx }) => window.ezil.registry.launch(a, ctx), {
+        a: bootAppId,
+        ctx: { payload: PAYLOAD, computer: PAYLOAD.computer, desktopState: PAYLOAD.desktopState },
+    });
     const bootWinOk = await until((id) => !! document.querySelector(`.window[data-app="${id}"]`), bootAppId);
     push(`${VP} boot app "${bootAppId}" window opened`, !! bootWinOk);
 
@@ -2348,7 +2363,14 @@ async function runCloseRobustnessSweep () {
         await page.close();
         return;
     }
-    const id = resolvedApps[0]; // the boot app — already open, no extra launch needed
+    const id = resolvedApps[0]; // the boot app
+    // 🔴 MODIFIED BY EZIL 2026-08-04 (W3): used to be "already open, no extra
+    // launch needed" — `boot.js` no longer opens anything on its own (see its
+    // header). One explicit launch, same as every other sweep in this file.
+    await page.evaluate(({ a, ctx }) => window.ezil.registry.launch(a, ctx), {
+        a: id,
+        ctx: { payload: PAYLOAD, computer: PAYLOAD.computer, desktopState: PAYLOAD.desktopState },
+    });
     await until((a) => !! document.querySelector(`.window[data-app="${a}"]`), id, 8000, 50);
 
     // ── M3a: on_before_exit THROWS ──────────────────────────────────────────
