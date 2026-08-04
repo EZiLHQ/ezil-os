@@ -1302,35 +1302,53 @@ async function boot_to_display_gate (answer) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Scenario 17 — ACTIVITY HEARTBEAT (container-billing fix)
+// Scenario 17 — PRESENCE HEARTBEAT (container-billing fix)
 //
 // `session.reportActivity` is feature-detected off `desktopState.endpoints.
-// activity`, and the eligibility RULE (visible + real input within 30
-// minutes) is proven exhaustively — and instantly — in
-// `activity-heartbeat-test.mjs`; see that file's own header for why a
-// 30-minute deadline cannot honestly be waited out in a browser test. What
-// THIS scenario proves is the WIRING in `desktop-window.js`: that opening the
-// desktop window really does register `setInterval(heartbeat_tick,
-// HEARTBEAT_INTERVAL_MS)`, that the tick really does call
-// `session.reportActivity` with the real computer id, and that hiding the
-// tab really does refuse a heartbeat rather than merely skip a no-op.
+// activity`, and the eligibility RULE (visible + presence within 30 minutes)
+// is proven exhaustively — and instantly — in `activity-heartbeat-test.mjs`;
+// see that file's own header for why a 30-minute deadline cannot honestly be
+// waited out in a browser test. What THIS scenario proves is the WIRING in
+// `desktop-window.js`: that opening the desktop window really does register
+// `setInterval(heartbeat_tick, HEARTBEAT_INTERVAL_MS)`, that the tick really
+// does call `session.reportActivity` with the real computer id, and — the
+// load-bearing one — that PRESENCE is what it tracks.
+//
+// 🔴 THE DEFECT THIS SCENARIO EXISTS TO CATCH. The shipped version tracked
+// "time since key/pointer input THIS DOCUMENT observed". The desktop is a
+// CROSS-ORIGIN Neko iframe, so a user typing into it produces NO document
+// events at all — the signal froze the moment work started and the server
+// would idle-stop the container mid-session at 10 minutes. Assertion "31
+// minutes of work inside the cross-origin iframe still heartbeats" below is
+// exactly that case: no document input event is ever dispatched, and it must
+// STILL heartbeat, because `document.hasFocus()` stays true while a
+// descendant iframe holds focus. Restore the old input-based rule and that
+// assertion goes red.
 //
 // `capture_setInterval` grabs the REAL callback the production code
 // registers, filtered by the exact 60000ms period so it can never collide
 // with `TICK_MS`/`POLL_MS`/`DISPLAY_POLL_MS` (250/2000/1000 — three different
 // numbers). Invoking that SAME function reference directly lets the 30-minute
-// idle case be proven against a mocked `performance.now()`, instead of by
-// waiting 30 real minutes for the real interval to notice — precisely the
-// same reasoning `activity-heartbeat-test.mjs` gives for splitting the
-// eligibility rule into its own pure module in the first place.
+// case be proven against a mocked `performance.now()`, instead of by waiting
+// 30 real minutes for the real interval to notice — precisely the same
+// reasoning `activity-heartbeat-test.mjs` gives for splitting the eligibility
+// rule into its own pure module in the first place.
 //
-// 🔴 Both directions, per guard: comment out `document.addEventListener(
-// 'pointerdown'|'pointermove'|'keydown', note_input, ...)` in
-// `desktop-window.js` and the "fresh input lifts the idle-stop" assertion
-// goes red (the keydown below would no longer reset `last_input_at`).
-// Comment out the `shouldHeartbeat` call in `heartbeat_tick` (replace with
-// `true`) and the hidden/idle assertions both go red — every `tick()` call
-// below would post, regardless of visibility or staleness.
+// jsdom's `document.hasFocus()` is hard-wired to `false` and its
+// `window.focus()`/`blur()` are unimplemented, so presence is driven here by
+// redefining `document.hasFocus` — the same live-override technique this file
+// already uses for `document.visibilityState`, over the exact function the
+// production code calls (it re-reads `typeof document.hasFocus` on every
+// sample, so the override is genuinely load-bearing and not a fixture the
+// code path skips).
+//
+// 🔴 Both directions, per guard: replace the `shouldHeartbeat` call in
+// `heartbeat_tick` with `true` and the hidden/absent assertions all go red —
+// every `tick()` would post regardless. Make `present_now()` ignore
+// `hasFocus` and "switching to another window stops the heartbeat" goes red.
+// Make `sample_presence` stamp unconditionally (drop the `present ||
+// was_present` guard) and "31 minutes away -> NO heartbeat" goes red, because
+// the clock would advance on the mere act of looking.
 // ───────────────────────────────────────────────────────────────────────────
 function capture_setInterval (window, ms_filter) {
     const fns = [];
@@ -1369,6 +1387,12 @@ const HEARTBEAT_MS = 60_000; // must match shell/ezil/activity-heartbeat.js's HE
 
     const heartbeat_fns = capture_setInterval(window, HEARTBEAT_MS);
 
+    // The user is at their desk with this tab focused when the desktop opens.
+    let focused = true;
+    Object.defineProperty(window.document, 'hasFocus', {
+        value: () => focused, configurable: true, writable: true,
+    });
+
     await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
     open_desktop(window);
     await until(() => $1(window, '.window[data-app="desktop"]'));
@@ -1380,10 +1404,10 @@ const HEARTBEAT_MS = 60_000; // must match shell/ezil/activity-heartbeat.js's HE
         heartbeat_fns.length === 1, `${heartbeat_fns.length} interval(s) at ${HEARTBEAT_MS}ms`);
     const tick = heartbeat_fns[0];
 
-    // ── visible + fresh input (the window just opened) -> fires ────────────
+    // ── visible + focused (the user just opened it) -> fires ───────────────
     tick();
     await until(() => activity_bodies.length >= 1);
-    push('🔴 visible + fresh input -> the heartbeat calls /api/shell/activity', activity_bodies.length === 1,
+    push('🔴 visible + focused -> the heartbeat calls /api/shell/activity', activity_bodies.length === 1,
         `${activity_bodies.length} calls`);
     push('the heartbeat body carries the real computerId and a small lastInputAgoMs',
         activity_bodies[0]?.computerId === 'computer-1'
@@ -1399,35 +1423,155 @@ const HEARTBEAT_MS = 60_000; // must match shell/ezil/activity-heartbeat.js's HE
     push('🔴 a hidden tab does not heartbeat, even on an explicit tick', activity_bodies.length === 1,
         `${activity_bodies.length} calls`);
 
-    // Back to visible, still fresh (no real time has passed).
+    // Back to visible, still focused (no real time has passed).
     Object.defineProperty(window.document, 'visibilityState', { value: 'visible', configurable: true });
     window.document.dispatchEvent(new window.Event('visibilitychange'));
     tick();
     await until(() => activity_bodies.length >= 2);
     push('visible again -> the heartbeat resumes', activity_bodies.length === 2, `${activity_bodies.length} calls`);
 
-    // ── 🔴 THE 30-MINUTE IDLE GUARD, proven on the REAL wiring ──────────────
-    // Mock the clock 31 minutes forward, without waiting 31 real minutes —
+    // Mock the clock forward, without waiting 31 real minutes —
     // `heartbeat_tick` reads `performance.now()` fresh on every call, so this
     // is a live, load-bearing override of the exact function the code calls,
     // not a fixture the code path never actually reaches.
     const real_now = window.performance.now();
-    window.performance.now = () => real_now + 31 * 60_000;
-    tick();
-    await sleep(150);
-    push('🔴 visible, but input is 31 (mocked) minutes stale -> NO heartbeat', activity_bodies.length === 2,
-        `${activity_bodies.length} calls`);
+    let clock_offset = 0;
+    window.performance.now = () => real_now + clock_offset;
 
-    // Real input arrives — a keydown the parent document actually observes
-    // (see this file's header on why document-level input is the honest
-    // signal a cross-origin iframe leaves reachable).
-    window.document.dispatchEvent(new window.Event('keydown'));
+    // ── 🔴 THE DEFECT: 31 MINUTES OF WORK INSIDE THE CROSS-ORIGIN IFRAME ────
+    // Clicking into the Neko iframe fires `blur` on THIS window while
+    // `document.hasFocus()` stays true — the user is right there, working,
+    // and the parent document sees not one keystroke of it. Not a single
+    // input event is dispatched below. Under the shipped input-based rule
+    // `lastInputAgoMs` would now read 31 minutes and the server would idle-
+    // stop the container out from under a working user. Presence must see
+    // straight through it.
+    window.dispatchEvent(new window.Event('blur'));
+    clock_offset = 31 * 60_000;
     tick();
     await until(() => activity_bodies.length >= 3);
-    push('🔴 fresh input lifts the idle-stop — the very next tick heartbeats again',
+    push('🔴 31 min of work INSIDE the cross-origin iframe (zero document input) still heartbeats',
         activity_bodies.length === 3, `${activity_bodies.length} calls`);
-    push('...and the freshly-reported lastInputAgoMs is small again, not 31 minutes',
+    push('...and reports a SMALL age — the user is present, not 31 minutes gone',
         activity_bodies[2]?.lastInputAgoMs < 5_000, JSON.stringify(activity_bodies[2]));
+
+    // ── 🔴 THE ABSENCE GUARD — switching to another window ends presence ────
+    // Same `blur` event as the iframe click above; the ONLY difference is
+    // that `document.hasFocus()` now answers false. That difference is the
+    // whole signal.
+    focused = false;
+    window.dispatchEvent(new window.Event('blur'));
+    const left_at = clock_offset;
+    tick();
+    await sleep(150);
+    push('🔴 the tick right after leaving still heartbeats (they only just left)',
+        activity_bodies.length === 4, `${activity_bodies.length} calls`);
+    push('...reporting an age of ~0, so the SERVER owns the 10-minute deadline, not the client',
+        activity_bodies[3]?.lastInputAgoMs < 5_000, JSON.stringify(activity_bodies[3]));
+
+    // 🔴 TIME-SINCE-LAST-HEARTBEAT IS NOT PRESENCE. Five more minutes away,
+    // and the reported age must have GROWN by five minutes. If the act of
+    // SENDING a heartbeat stamped the presence clock, this would read ~0
+    // forever, the server's `lastActivityAt` would advance every 60s, and its
+    // idle deadline could never arrive — the exact immortality bug this whole
+    // change exists to kill, rebuilt on the client side.
+    clock_offset = left_at + 5 * 60_000;
+    tick();
+    await until(() => activity_bodies.length >= 5);
+    push('🔴 five more minutes away -> the reported age GROWS; sending a heartbeat never resets presence',
+        activity_bodies[4]?.lastInputAgoMs >= 5 * 60_000 - 5_000, JSON.stringify(activity_bodies[4]));
+
+    clock_offset = left_at + 31 * 60_000;
+    tick();
+    await sleep(150);
+    push('🔴 visible but unfocused for 31 (mocked) minutes -> NO heartbeat, so the container cools down',
+        activity_bodies.length === 5, `${activity_bodies.length} calls`);
+
+    // ── Coming back lifts it again ─────────────────────────────────────────
+    focused = true;
+    window.dispatchEvent(new window.Event('focus'));
+    tick();
+    await until(() => activity_bodies.length >= 6);
+    push('🔴 coming back lifts it — the very next tick heartbeats again',
+        activity_bodies.length === 6, `${activity_bodies.length} calls`);
+    push('...and the freshly-reported lastInputAgoMs is small again, not 31 minutes',
+        activity_bodies[5]?.lastInputAgoMs < 5_000, JSON.stringify(activity_bodies[5]));
+
+    const win = $1(window, '.window[data-app="desktop"]');
+    await window.$(win).close();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 17b — 🔴 THE TRUTHFULNESS PROPERTY: the reported age is time since
+// REAL OBSERVED PRESENCE, never time since the page loaded.
+//
+// A desktop window that opens into a tab that has never once been focused
+// (restored session, opened in a background tab, a headless/automated hit)
+// has observed NO presence, so it must report none — `desktop-window.js`
+// leaves its clock `null`, hands `shouldHeartbeat` a `NaN`, and sends
+// nothing. Seeding that clock from window-open time instead would be a claim
+// the client never earned, and would buy every such tab a free 30 minutes of
+// container residency for a user who was never there.
+//
+// `document.hasFocus` is pinned to false for the whole scenario (jsdom's own
+// default flips to true once the window manager focuses an element, so it
+// cannot be left to chance) — the tab is visible, the endpoint is published,
+// the interval is registered, and the ONLY thing missing is a human.
+//
+// 🔴 Mutation: seed `last_present_at = performance.now()` at declaration
+// instead of `null` — this scenario goes red (it would post immediately).
+// ───────────────────────────────────────────────────────────────────────────
+{
+    const ACTIVITY_PAYLOAD = {
+        ...PAYLOAD,
+        desktopState: {
+            ...PAYLOAD.desktopState,
+            endpoints: { ...PAYLOAD.desktopState.endpoints, activity: '/api/shell/activity' },
+        },
+    };
+    const activity_bodies = [];
+    const { window } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            return { ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko', frame: { confirmed: true } };
+        }
+        if (url.includes('confirm=frame')) return { ok: true, confirmed: true };
+        if (url.includes('confirm=display')) return { ok: true, display: 'live' };
+        if (url === '/api/shell/activity') { activity_bodies.push(JSON.parse(init.body)); return { ok: true }; }
+        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
+        return { ok: true };
+    }, ACTIVITY_PAYLOAD);
+
+    let focused = false;
+    Object.defineProperty(window.document, 'hasFocus', {
+        value: () => focused, configurable: true, writable: true,
+    });
+
+    const heartbeat_fns = capture_setInterval(window, HEARTBEAT_MS);
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    open_desktop(window);
+    await until(() => $1(window, '.window[data-app="desktop"]'));
+    await until(() => heartbeat_fns.length > 0);
+
+    // Visible, endpoint published, timer registered — everything is in place
+    // EXCEPT an actual observation of a human.
+    push('a never-focused tab is visible and wired up (so the refusal below is about presence, nothing else)',
+        window.document.visibilityState === 'visible' && heartbeat_fns.length === 1
+        && window.document.hasFocus() === false,
+        `visibility=${window.document.visibilityState} hasFocus=${window.document.hasFocus()}`);
+
+    heartbeat_fns[0]();
+    await sleep(150);
+    push('🔴 presence NEVER observed -> NO heartbeat; the clock is not seeded from page-load time',
+        activity_bodies.length === 0, `${activity_bodies.length} calls`);
+
+    // And it is genuinely a presence gate, not a permanently dead window:
+    // the moment focus actually arrives, it reports.
+    focused = true;
+    window.dispatchEvent(new window.Event('focus'));
+    heartbeat_fns[0]();
+    await until(() => activity_bodies.length >= 1);
+    push('...and the first REAL focus starts it reporting, so this is a gate and not a dead window',
+        activity_bodies.length === 1, `${activity_bodies.length} calls`);
 
     const win = $1(window, '.window[data-app="desktop"]');
     await window.$(win).close();

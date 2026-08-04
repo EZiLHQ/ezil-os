@@ -92,7 +92,7 @@ import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
 import { claim as claimWarm } from '../warm.js';
 import telemetry from '../telemetry.js';
 import { applyDisplayEvidence, computeBootUiState } from '../boot-phases.js';
-import { HEARTBEAT_INTERVAL_MS, shouldHeartbeat } from '../activity-heartbeat.js';
+import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
 import BootProgress, { DisplayNotice } from '../ui/boot-progress.js';
 import AppSpinner from '../ui/app-spinner.js';
 import attach_app_drawer from '../ui/app-drawer.js';
@@ -467,31 +467,78 @@ export async function openDesktopWindow (ctx = {}) {
     // watched, whether it is still booting or long since revealed. It starts
     // once, here, and only `dispose()` below ever ends it.
     //
-    // Input is tracked at the DOCUMENT level, not on the iframe: the iframe
-    // is a cross-origin Neko session (see this file's own header on why its
-    // pixels are unreachable), so key/pointer events whose target is inside
-    // it never reach this document at all — there is no DOM signal from
-    // "inside the stream" to listen for. What this window CAN see honestly is
-    // whether a human is at the keyboard/mouse at all while it is open: the
-    // click that focuses the iframe, drawer/taskbar interaction, anything
-    // landing on the wallpaper. That is the real, buildable meaning of "real
-    // user input" from a parent page that structurally cannot see inside a
-    // cross-origin child.
-    let last_input_at = performance.now();
-    const note_input = () => { last_input_at = performance.now(); };
-    document.addEventListener('pointerdown', note_input, true);
-    document.addEventListener('pointermove', note_input, true);
-    document.addEventListener('keydown', note_input, true);
+    // 🔴 PRESENCE, NOT OBSERVED INPUT. This used to listen for `pointerdown`/
+    // `pointermove`/`keydown` on the document and call that "activity". It is
+    // not: the iframe is a cross-origin Neko session (see this file's own
+    // header on why its pixels are unreachable), so key and pointer events
+    // aimed at the desktop land INSIDE it and never reach this document at
+    // all. "Time since observed input" therefore froze the moment somebody
+    // started working, and the server would have idle-stopped the container
+    // out from under them at 10 minutes. See `../activity-heartbeat.js`'s
+    // header for the full account.
+    //
+    // `document.hasFocus()` crosses that boundary: it stays true while a
+    // descendant cross-origin iframe holds focus, and goes false when the
+    // user switches window or tab. `isPresent()` pairs it with
+    // `visibilityState`.
+    const present_now = () => isPresent({
+        visibilityState: document.visibilityState,
+        // Read the capability at CALL time, not once at construction: a
+        // runtime without it degrades to visibility-only inside `isPresent`.
+        hasFocus: typeof document.hasFocus === 'function' ? document.hasFocus() : undefined,
+    });
+    /**
+     * `performance.now()` at the last instant presence was OBSERVED true —
+     * `null` until it has actually been observed once. Deliberately NOT
+     * seeded from window-open time and never touched by the act of sending a
+     * heartbeat: either would make this signal self-sustaining, which is the
+     * immortality bug the whole billing fix exists to kill. While it is
+     * `null` the reported age is `NaN` and `shouldHeartbeat` refuses.
+     */
+    let last_present_at = null;
+    /** Presence as of the previous sample, so an ENDING can be stamped. */
+    let was_present = false;
+    /**
+     * Sample presence and stamp the clock. Stamps when presence is true now,
+     * and ALSO on the tick where it just became false — that tick is the last
+     * instant presence held, so stamping it is what makes the reported age
+     * "how long since they left" rather than "how long since I last looked".
+     */
+    const sample_presence = () => {
+        const present = present_now();
+        if ( present || was_present ) last_present_at = performance.now();
+        was_present = present;
+    };
+    // Focus/blur and visibility are the events presence actually changes on.
+    // 🔴 `blur` must RE-READ `hasFocus()` rather than assume absence: clicking
+    // into the cross-origin iframe blurs this window while `document.
+    // hasFocus()` stays true, and treating that as "the user left" would
+    // rebuild the exact defect this replaces.
+    window.addEventListener('focus', sample_presence);
+    window.addEventListener('blur', sample_presence);
+    document.addEventListener('visibilitychange', sample_presence);
+    sample_presence();
 
     let heartbeat_timer = null;
     const heartbeat_tick = () => {
         if ( disposed ) return;
-        const lastInputAgoMs = performance.now() - last_input_at;
-        if ( ! shouldHeartbeat({ visible: document.visibilityState === 'visible', lastInputAgoMs }) ) return;
+        // Sampled on every tick as well as on the events above, so a presence
+        // change the events happen to miss (focus can move out of an already-
+        // blurred parent without a second `blur`) is still noticed within one
+        // interval — and noticed LATE rather than early, which delays a stop
+        // by at most `HEARTBEAT_INTERVAL_MS` instead of causing a wrong one.
+        sample_presence();
+        const lastPresenceAgoMs = last_present_at === null ? NaN : performance.now() - last_present_at;
+        if ( ! shouldHeartbeat({ visible: document.visibilityState === 'visible', lastPresenceAgoMs }) ) return;
         // Best-effort and silently swallowed — see `session.js#reportActivity`'s
         // own doc comment. A missed beat costs nothing; the next one is only
         // `HEARTBEAT_INTERVAL_MS` away, and there is nothing useful to retry.
-        void session.reportActivity(computer.id, Math.round(lastInputAgoMs));
+        //
+        // The wire field is still `lastInputAgoMs`: the Worker only ever
+        // treats it as "how long ago the user was last there" (`now - ago`),
+        // which is exactly what this now measures, so the endpoint and its
+        // tests are unchanged.
+        void session.reportActivity(computer.id, Math.round(lastPresenceAgoMs));
     };
     const start_heartbeat = () => {
         if ( disposed || heartbeat_timer !== null ) return;
@@ -1417,9 +1464,9 @@ export async function openDesktopWindow (ctx = {}) {
         // Activity heartbeat (container-billing fix) — this window is the
         // only thing keeping it alive; nothing else ever stops it.
         stop_heartbeat();
-        document.removeEventListener('pointerdown', note_input, true);
-        document.removeEventListener('pointermove', note_input, true);
-        document.removeEventListener('keydown', note_input, true);
+        window.removeEventListener('focus', sample_presence);
+        window.removeEventListener('blur', sample_presence);
+        document.removeEventListener('visibilitychange', sample_presence);
         document.removeEventListener('visibilitychange', on_heartbeat_visibility);
         observer.disconnect();
         window.removeEventListener('ezil:teardown', dispose);

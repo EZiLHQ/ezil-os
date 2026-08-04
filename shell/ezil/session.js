@@ -515,7 +515,7 @@ export function activityEndpoint () {
  * container down out from under someone who is actually watching it. See
  * `apps/desktop-window.js`'s heartbeat wiring for when this is called (every
  * `HEARTBEAT_INTERVAL_MS` while the window is open, the tab is visible, and
- * real input is recent — `../activity-heartbeat.js` owns that decision).
+ * PRESENCE is recent — `../activity-heartbeat.js` owns that decision).
  *
  * 🔴 FEATURE-DETECTED, same contract as `restartDesktop` above: a deployment
  * that does not publish `endpoints.activity` gets NO request at all. This is
@@ -530,7 +530,11 @@ export function activityEndpoint () {
  * in terms.
  *
  * @param {string} computerId
- * @param {number} lastInputAgoMs
+ * @param {number} lastInputAgoMs Milliseconds since the user was last PRESENT
+ *   (see `../activity-heartbeat.js`). The wire name predates the correction
+ *   from "observed input" to "presence" and is deliberately kept: the server
+ *   only ever reads it as `now - ago`, which is exactly what it still means,
+ *   so nothing on the Worker side had to change.
  * @returns {Promise<boolean|undefined>} `true`/`false` is a real answer from
  *   the server. `undefined` means either OUR request never landed, or this
  *   deployment does not publish the endpoint at all — neither is an
