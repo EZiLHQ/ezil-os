@@ -11,6 +11,7 @@
  *   cloudflareGuacamole.codePreviewUrl — mint a fresh code-server window URL
  *   cloudflareGuacamole.status         — health-check a computer's sandbox
  *   cloudflareGuacamole.terminate      — request sandbox teardown
+ *   cloudflareGuacamole.reportActivity — record that a human is present (container-billing fix)
  *
  * Security:
  *   - The Worker URL and HMAC secret NEVER reach the browser.
@@ -52,6 +53,7 @@ import {
     probeDesktopDisplay,
     probeDesktopFrame,
     readWorkerBridgeUrl,
+    requestGuacamoleActivity,
     requestGuacamoleDesktopRestart,
     requestGuacamoleFocusApp,
     requestGuacamolePreview,
@@ -807,6 +809,60 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             return {
                 ok: result.ok,
                 app: input.app,
+                error: result.error,
+                correlationId,
+                provider: 'cloudflare-guacamole' as const,
+            };
+        }),
+
+    /**
+     * Record that a human is present at a computer's desktop — the
+     * client-side heartbeat that lets the Worker's idle-container reaper tell
+     * "someone is watching" from "a tab is merely still open". See
+     * `shell/ezil/apps/desktop-window.js`'s heartbeat wiring for the caller
+     * and `requestGuacamoleActivity`'s doc comment for why this NEVER touches
+     * the container itself.
+     *
+     * Ownership is checked here, once, by `assertOwnedComputer` — same as
+     * every other procedure in this router. Same "value not exception"
+     * contract as `focusApp`/`terminate`: a rejected or disabled heartbeat is
+     * a real, non-fatal answer the client silently swallows (see
+     * `session.js#reportActivity`), never something to throw and retry — a
+     * thrown error is what TanStack Query retries, and retrying a heartbeat
+     * whose next beat is 60s away is a contradiction in terms.
+     */
+    reportActivity: protectedProcedure
+        .input(
+            z.object({
+                computerId: z.string().uuid(),
+                lastInputAgoMs: z.number().finite().nonnegative(),
+            }),
+        )
+        .mutation(async ({ ctx, input }) => {
+            await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+
+            const config = resolveCloudflareGuacamoleConfig();
+            if (!config.isConfigured) {
+                return {
+                    ok: false as const,
+                    error: 'provider_not_configured',
+                    provider: 'cloudflare-guacamole' as const,
+                };
+            }
+
+            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+            const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
+            const correlationId = newCorrelationId();
+            const result = await requestGuacamoleActivity(
+                config,
+                hmacSecret,
+                sandboxName,
+                input.lastInputAgoMs,
+                correlationId,
+            );
+
+            return {
+                ok: result.ok,
                 error: result.error,
                 correlationId,
                 provider: 'cloudflare-guacamole' as const,

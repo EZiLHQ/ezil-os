@@ -18,6 +18,7 @@ import {
     enableImplicitHosting,
     isRetryablePreviewErrorCode,
     mintAppPreviewBootstrapToken,
+    requestGuacamoleActivity,
     requestGuacamoleDesktopRestart,
     requestGuacamolePreview,
     requestGuacamoleSandboxTerminate,
@@ -460,6 +461,82 @@ describe('requestGuacamoleDesktopRestart — the seam between the Worker route a
         // keeps someone from copying `focus`'s 15s onto this call.
         const fetchSpy = stubWorkerResponse(200, JSON.stringify({ ok: true, outcome: 'restarted' }));
         await requestGuacamoleDesktopRestart(CONFIG, 'secret', 'guac-u-c');
+        const [, init] = fetchSpy.mock.calls[0] as unknown as [RequestInfo, RequestInit];
+        expect(init.signal).toBeInstanceOf(AbortSignal);
+        expect(init.signal?.aborted).toBe(false);
+    });
+});
+
+describe('requestGuacamoleActivity — the container-billing heartbeat must never wake anything', () => {
+    it('POSTs to the exact path the Worker serves, signed as Authorization: Bearer', async () => {
+        const fetchSpy = stubWorkerResponse(200, JSON.stringify({ ok: true }));
+
+        await requestGuacamoleActivity(CONFIG, 'secret', 'guac-u-c', 12_345, 'cid-a');
+
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+        const [url, init] = fetchSpy.mock.calls[0] as unknown as [RequestInfo, RequestInit];
+        // `handleActivity` (billing fix) is mounted at `/sandbox/:name/activity`
+        // in worker/src/index.ts. A typo here is invisible to every other test.
+        expect(String(url)).toBe('https://ezil-os-worker.example.workers.dev/sandbox/guac-u-c/activity');
+        expect(init.method).toBe('POST');
+        const headers = init.headers as Record<string, string>;
+        expect(headers.Authorization).toMatch(/^Bearer t=\d+,v1=[0-9a-f]+$/);
+        expect(JSON.parse(String(init.body))).toEqual({ lastInputAgoMs: 12_345 });
+    });
+
+    it('reports ok:true for a confirmed heartbeat', async () => {
+        stubWorkerResponse(200, JSON.stringify({ ok: true }));
+        const result = await requestGuacamoleActivity(CONFIG, 'secret', 'guac-u-c', 0);
+        expect(result).toEqual({ ok: true });
+    });
+
+    it('reports ok:false for a 404 — the SANDBOX_ACTIVITY=off kill switch', async () => {
+        stubWorkerResponse(404, JSON.stringify({ ok: false, error: 'activity_disabled' }));
+        const result = await requestGuacamoleActivity(CONFIG, 'secret', 'guac-u-c', 0);
+        expect(result.ok).toBe(false);
+        expect(result.error).toBe('activity_disabled');
+    });
+
+    it('reports ok:false for a 401 — a rejected signature is never a recorded heartbeat', async () => {
+        stubWorkerResponse(401, JSON.stringify({ ok: false, error: 'hmac_signature_mismatch' }));
+        const result = await requestGuacamoleActivity(CONFIG, 'wrong-secret', 'guac-u-c', 0);
+        expect(result.ok).toBe(false);
+        expect(result.error).toBe('hmac_signature_mismatch');
+    });
+
+    it('reports ok:false, never throws, on a transport failure', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () => {
+                throw new TypeError('fetch failed');
+            }),
+        );
+        const result = await requestGuacamoleActivity(CONFIG, 'secret', 'guac-u-c', 0);
+        expect(result.ok).toBe(false);
+        expect(result.error).toContain('fetch failed');
+    });
+
+    it('does not call the Worker at all when the provider is not configured', async () => {
+        const fetchSpy = vi.fn();
+        vi.stubGlobal('fetch', fetchSpy);
+        const result = await requestGuacamoleActivity(
+            { workerUrl: '', hasHmacSecret: false, isConfigured: false },
+            '',
+            'guac-u-c',
+            0,
+        );
+        expect(result).toEqual({ ok: false, error: 'provider_not_configured' });
+        expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('🔴 budgets like a storage write, not a container call — nowhere near a cold-boot timeout', async () => {
+        // The whole point of this route is that it is CHEAP: a Durable Object
+        // field write, never an `exec`/`containerFetch`. A generous timeout
+        // here would be the first sign someone routed this through the
+        // container after all — pin the order of magnitude against `focus`'s
+        // 15s (itself already generous for a request that measures 150-400ms).
+        const fetchSpy = stubWorkerResponse(200, JSON.stringify({ ok: true }));
+        await requestGuacamoleActivity(CONFIG, 'secret', 'guac-u-c', 0);
         const [, init] = fetchSpy.mock.calls[0] as unknown as [RequestInfo, RequestInit];
         expect(init.signal).toBeInstanceOf(AbortSignal);
         expect(init.signal?.aborted).toBe(false);

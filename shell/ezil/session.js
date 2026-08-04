@@ -495,6 +495,60 @@ export async function restartDesktop (computerId) {
     return { ok: true };
 }
 
+/**
+ * Is a Worker-side "record recent input" route published by THIS
+ * deployment, right now? Read fresh every call, mirroring `restartEndpoint()`
+ * — the container-idle reaper this feeds needs no static mirror in
+ * `ENDPOINTS` above: an OLDER server that has never heard of this field must
+ * get NO request at all, never a 404 sprayed at a path this bundle invented.
+ *
+ * @returns {string|null}
+ */
+export function activityEndpoint () {
+    const url = payload()?.desktopState?.endpoints?.activity;
+    return typeof url === 'string' && url !== '' ? url : null;
+}
+
+/**
+ * `POST <endpoints.activity>` — tell the server a human is present at this
+ * computer's desktop, so its container-idle reaper does not cool the
+ * container down out from under someone who is actually watching it. See
+ * `apps/desktop-window.js`'s heartbeat wiring for when this is called (every
+ * `HEARTBEAT_INTERVAL_MS` while the window is open, the tab is visible, and
+ * real input is recent — `../activity-heartbeat.js` owns that decision).
+ *
+ * 🔴 FEATURE-DETECTED, same contract as `restartDesktop` above: a deployment
+ * that does not publish `endpoints.activity` gets NO request at all. This is
+ * the difference between "an older server degrades to no heartbeat" and "an
+ * older server's console fills up with 404s" — the whole reason this checks
+ * `activityEndpoint()` FIRST rather than just POSTing and reading the status.
+ *
+ * NEVER THROWS, and a resolved promise is not proof the server recorded
+ * anything — this is a best-effort signal. A failed or skipped beat is
+ * swallowed by the caller, not retried: the next one is only
+ * `HEARTBEAT_INTERVAL_MS` away, and retrying a heartbeat is a contradiction
+ * in terms.
+ *
+ * @param {string} computerId
+ * @param {number} lastInputAgoMs
+ * @returns {Promise<boolean|undefined>} `true`/`false` is a real answer from
+ *   the server. `undefined` means either OUR request never landed, or this
+ *   deployment does not publish the endpoint at all — neither is an
+ *   observation of anything and callers must not treat it as a failure.
+ */
+export async function reportActivity (computerId, lastInputAgoMs) {
+    if ( ! computerId ) return undefined;
+    const url = activityEndpoint();
+    if ( ! url ) return undefined;
+    const res = await request(url, {
+        method: 'POST',
+        body: { computerId, lastInputAgoMs },
+        timeoutMs: STATUS_TIMEOUT_MS,
+    });
+    if ( ! res.ok ) return undefined;
+    return res.data?.ok === true;
+}
+
 export default {
     get, set, del,
     payload,
@@ -502,6 +556,7 @@ export default {
     openDesktop, desktopRunning, confirmFrame, confirmDisplay,
     previewUrl, focusApp,
     restartEndpoint, restartDesktop,
+    activityEndpoint, reportActivity,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
 };

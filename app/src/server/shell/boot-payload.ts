@@ -98,6 +98,20 @@ export const SHELL_API_ROUTES = {
      * `POST /sandbox/:name/restart`.
      */
     restart: '/api/shell/restart',
+    /**
+     * POST = record that a human is present at a computer's desktop
+     * (`{ computerId, lastInputAgoMs }`), so the Worker's container-idle
+     * reaper does not cool it down while someone is actually watching.
+     * Fourth instance of the `focus`/`telemetry`/`restart` feature-detection
+     * contract: `shell/ezil/session.js`'s `activityEndpoint()` reads
+     * `desktopState.endpoints.activity` fresh on every call and
+     * `shell/ezil/apps/desktop-window.js`'s heartbeat simply never fires a
+     * request when it is absent, rather than POSTing to a URL it invented —
+     * an older server build degrades to no heartbeat, not a console full of
+     * 404s. This entry is the switch that turns the heartbeat's NETWORK CALL
+     * on; the client-side timer and input tracking run either way.
+     */
+    activity: '/api/shell/activity',
 } as const;
 
 export interface ShellBootUser {
