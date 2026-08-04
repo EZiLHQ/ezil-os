@@ -213,6 +213,42 @@ are unit-tested on both sides.
 
 ## Open, owner-side
 
+### Database migrations — read this before running `drizzle-kit migrate`
+
+🔴 **`drizzle-kit migrate` does not work against this database, and failing to
+know that wastes a deploy.** There is no `drizzle.__drizzle_migrations` journal:
+the original schema was created by some route other than `migrate` (`db:push`,
+or by hand). So `migrate` believes nothing has been applied, replays
+`0000_massive_mole_man.sql` from the top, and dies on:
+
+```
+PostgresError: relation "ezil_computers" already exists
+```
+
+That failure is **safe** — it happens inside a transaction and rolls back
+without touching anything — but it blocks every later migration behind it.
+
+Until someone baselines that journal, apply migrations individually. The
+telemetry migration ships with a script that does it safely:
+
+```
+cd app && npm run db:apply-0001     # needs SUPABASE_DATABASE_URL
+```
+
+It is idempotent (exits 0 if `ezil_error_events` already exists), refuses to run
+on a file containing `DROP`/`TRUNCATE`/`DELETE` or an `ALTER` of a table it did
+not itself create, applies everything in one transaction, and verifies the table
+count moved by **exactly** three with RLS on and policies present before
+committing. `public` already holds ~40 tables from an older project sharing this
+database — which is why "additive only" is checked rather than assumed.
+
+**No database credentials are needed locally to run it.** `vercel env pull`
+returns 11-character placeholders for this project's encrypted variables, so the
+practical route is to run the script inside a Vercel build, where the real
+environment exists, by temporarily prefixing the `build` script with it. Revert
+that prefix afterwards: a build step that mutates the schema on every deploy is
+a different policy decision, and not one to make by accident.
+
 ### Secret rotation
 
 The deployment holds exactly these secrets. Anything not listed here is public by design.
