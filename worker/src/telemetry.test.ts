@@ -7,11 +7,17 @@
 import { describe, expect, it } from 'bun:test';
 import type { LogEvent } from './observability';
 import {
+  TELEMETRY_DRAIN_MAX_OBJECTS,
   TELEMETRY_SCHEMA_VERSION,
+  TELEMETRY_SPOOL_PREFIX,
   buildTelemetryR2Key,
+  clampDrainLimit,
   parseContainerTelemetryLines,
+  parseTelemetryAckKeys,
+  parseTelemetryDrainBody,
   selectTelemetryWorthy,
   serializeTelemetryBatch,
+  telemetryDrainDisabled,
   toTelemetryEventInput,
 } from './telemetry';
 
@@ -271,5 +277,94 @@ describe('buildTelemetryR2Key', () => {
   it('zero-pads month/day/hour', () => {
     const key = buildTelemetryR2Key(new Date('2026-01-05T03:00:00.000Z'), 'x');
     expect(key).toBe('v1/dt=2026-01-05/hh=03/x.ndjson');
+  });
+});
+
+// ── The R2 drain: telemetryDrainDisabled / clampDrainLimit / body parsers ────
+// These back `POST /telemetry/drain` + `/telemetry/ack` (`./index.ts`) — the
+// headline defect this module's own top-of-file "KNOWN GAP" note calls out:
+// `spoolTelemetry()` has been writing all along, nothing ever read it back.
+
+describe('telemetryDrainDisabled — same kill-switch vocabulary as focusDisabled/restartDisabled', () => {
+  it('is enabled (not disabled) by default — undefined/empty flag', () => {
+    expect(telemetryDrainDisabled(undefined)).toBe(false);
+    expect(telemetryDrainDisabled('')).toBe(false);
+  });
+
+  it('disables on off/false/0/disabled/no, case- and whitespace-insensitive', () => {
+    for (const v of ['off', 'FALSE', ' 0 ', 'Disabled', 'no']) {
+      expect(telemetryDrainDisabled(v)).toBe(true);
+    }
+  });
+
+  it('anything else (a typo, an unrelated value) leaves the route enabled, never silently disables it', () => {
+    expect(telemetryDrainDisabled('onn')).toBe(false);
+    expect(telemetryDrainDisabled('true')).toBe(false);
+  });
+});
+
+describe('clampDrainLimit', () => {
+  it('defaults to the ceiling when nothing/non-numeric is requested', () => {
+    expect(clampDrainLimit(undefined)).toBe(TELEMETRY_DRAIN_MAX_OBJECTS);
+    expect(clampDrainLimit('200')).toBe(TELEMETRY_DRAIN_MAX_OBJECTS);
+    expect(clampDrainLimit(NaN)).toBe(TELEMETRY_DRAIN_MAX_OBJECTS);
+  });
+
+  it('🔴 clamps an oversized request DOWN to the 200-object ceiling — never lets a caller demand more', () => {
+    expect(clampDrainLimit(999_999)).toBe(TELEMETRY_DRAIN_MAX_OBJECTS);
+  });
+
+  it('clamps a non-positive request UP to at least 1', () => {
+    expect(clampDrainLimit(0)).toBe(1);
+    expect(clampDrainLimit(-5)).toBe(1);
+  });
+
+  it('passes a valid in-range request through unchanged', () => {
+    expect(clampDrainLimit(50)).toBe(50);
+  });
+});
+
+describe('parseTelemetryDrainBody', () => {
+  it('extracts a valid cursor and limit', () => {
+    expect(parseTelemetryDrainBody({ cursor: 'abc', limit: 10 })).toEqual({ cursor: 'abc', limit: 10 });
+  });
+
+  it('never throws on a malformed body — empty object, not an exception', () => {
+    expect(parseTelemetryDrainBody(null)).toEqual({});
+    expect(parseTelemetryDrainBody(undefined)).toEqual({});
+    expect(parseTelemetryDrainBody('not an object')).toEqual({});
+    expect(parseTelemetryDrainBody([1, 2, 3])).toEqual({});
+  });
+
+  it('drops a blank-string cursor and a non-number limit rather than passing them through', () => {
+    expect(parseTelemetryDrainBody({ cursor: '   ', limit: 'ten' })).toEqual({});
+  });
+});
+
+describe('parseTelemetryAckKeys — the delete-list allowlist', () => {
+  it('accepts keys rooted under the spool prefix', () => {
+    const keys = [`${TELEMETRY_SPOOL_PREFIX}dt=2026-08-03/hh=14/a.ndjson`, `${TELEMETRY_SPOOL_PREFIX}dt=2026-08-03/hh=14/b.ndjson`];
+    expect(parseTelemetryAckKeys({ keys })).toEqual(keys);
+  });
+
+  it('🔴 REJECTS a key outside the spool prefix, even if the caller holds a valid HMAC token — never a delete-anything primitive', () => {
+    const keys = ['some-other-bucket-object.txt', '../etc/passwd', 'ezil-telemetry-spool-config.json'];
+    expect(parseTelemetryAckKeys({ keys })).toEqual([]);
+  });
+
+  it('drops non-string entries and keeps the valid ones from the same array', () => {
+    const good = `${TELEMETRY_SPOOL_PREFIX}dt=2026-08-03/hh=14/a.ndjson`;
+    expect(parseTelemetryAckKeys({ keys: [good, 123, null, {}, good] })).toEqual([good, good]);
+  });
+
+  it('never throws on a malformed body', () => {
+    expect(parseTelemetryAckKeys(null)).toEqual([]);
+    expect(parseTelemetryAckKeys({})).toEqual([]);
+    expect(parseTelemetryAckKeys({ keys: 'not-an-array' })).toEqual([]);
+  });
+
+  it('caps the accepted list at TELEMETRY_DRAIN_MAX_OBJECTS', () => {
+    const many = Array.from({ length: TELEMETRY_DRAIN_MAX_OBJECTS + 50 }, (_, i) => `${TELEMETRY_SPOOL_PREFIX}k${i}.ndjson`);
+    expect(parseTelemetryAckKeys({ keys: many })).toHaveLength(TELEMETRY_DRAIN_MAX_OBJECTS);
   });
 });
