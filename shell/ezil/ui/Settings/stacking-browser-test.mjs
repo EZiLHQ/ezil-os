@@ -236,6 +236,7 @@ function stub (url, method, bodyText) {
 }
 
 const HOST = 'https://ezil-stacking-test.invalid';
+const HOST_HOSTNAME = new URL(HOST).hostname;
 
 // 🔴 WAVE F INTEGRATION FIX — HARNESS FIDELITY, NOT AN ASSERTION CHANGE.
 // This document copies the REAL `/os` page's element classes from
@@ -610,7 +611,7 @@ async function runViewport (vp) {
             await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
             return;
         }
-        if ( url.startsWith(HOST) ) {
+        if ( new URL(url).hostname === HOST_HOSTNAME ) {
             await route.fulfill({ status: 404, body: '' });
             return;
         }
@@ -1895,7 +1896,7 @@ async function runCloseReopenSweep () {
             await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
             return;
         }
-        if ( url.startsWith(HOST) ) {
+        if ( new URL(url).hostname === HOST_HOSTNAME ) {
             await route.fulfill({ status: 404, body: '' });
             return;
         }
@@ -2318,7 +2319,7 @@ async function runCloseRobustnessSweep () {
             await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
             return;
         }
-        if ( url.startsWith(HOST) ) {
+        if ( new URL(url).hostname === HOST_HOSTNAME ) {
             await route.fulfill({ status: 404, body: '' });
             return;
         }
@@ -2451,7 +2452,7 @@ async function runDashboardPopstateGuardSweep () {
                 await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
                 return;
             }
-            if ( url.startsWith(HOST) ) {
+            if ( new URL(url).hostname === HOST_HOSTNAME ) {
                 await route.fulfill({ status: 404, body: '' });
                 return;
             }

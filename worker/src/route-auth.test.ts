@@ -1059,10 +1059,8 @@ describe('POST /sandbox/preview returns appPreviewUrl + codePreviewUrl', () => {
 
     const appPreviewUrl = new URL(String(body.appPreviewUrl));
     const codePreviewUrl = new URL(String(body.codePreviewUrl));
-    expect(appPreviewUrl.hostname.startsWith('3002-')).toBe(true);
-    expect(appPreviewUrl.hostname.endsWith('-app.ezil.org')).toBe(true);
-    expect(codePreviewUrl.hostname.startsWith('8443-')).toBe(true);
-    expect(codePreviewUrl.hostname.endsWith('-code.ezil.org')).toBe(true);
+    expect(/^3002-[a-zA-Z0-9-]+-app\.ezil\.org$/.test(appPreviewUrl.hostname)).toBe(true);
+    expect(/^8443-[a-zA-Z0-9-]+-code\.ezil\.org$/.test(codePreviewUrl.hostname)).toBe(true);
     for (const u of [appPreviewUrl, codePreviewUrl]) {
       expect(u.protocol).toBe('https:');
       expect(u.pathname).toBe('/preview-bootstrap');

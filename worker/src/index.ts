@@ -3788,7 +3788,8 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
       const status = await probeAppPreviewStatus(sandbox, env);
       return json(status);
     } catch (err) {
-      return json({ ok: false, error: err instanceof Error ? err.message : String(err) }, 500);
+      console.error('[preview-status] probe error:', err);
+      return json({ ok: false, error: 'preview_status_unavailable' }, 500);
     }
   }
 

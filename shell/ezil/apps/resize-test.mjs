@@ -198,6 +198,7 @@ const css = fs.readFileSync(`${OS}/bundle.min.css`, 'utf8');
 // `html{height:100%} body{min-height:100%}` rule alongside them.
 const BREAK_BOX_MODEL = process.env.RESIZE_TEST_BREAK_BOX_MODEL === '1';
 const HOST = 'https://ezil-resize-test.invalid';
+const HOST_HOSTNAME = new URL(HOST).hostname;
 const DOC_HTML = BREAK_BOX_MODEL
     ? `<!doctype html><html><head><style>${css}</style></head>
        <body class="min-h-full flex flex-col"><div id="ezil-os-root"><div id="ezil-os-root-inner"></div></div></body></html>`
@@ -279,7 +280,7 @@ await page.route('**/*', async (route) => {
     if ( url.includes('/api/') ) {
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(stub(url, req.method())) });
     }
-    if ( url.startsWith(HOST) ) return route.fulfill({ status: 404, body: '' });
+    if ( new URL(url).hostname === HOST_HOSTNAME ) return route.fulfill({ status: 404, body: '' });
     return route.continue();
 });
 
