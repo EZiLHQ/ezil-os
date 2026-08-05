@@ -2674,21 +2674,43 @@ async function handlePreview(
 
     // EXPLICIT flush before handing the ready preview URL back to the caller
     // (in addition to the alarm-driven periodic flush — see
-    // `EzilSandboxDO.flushWorkspaceNow`'s doc comment). This is the last
-    // point control is inside the Worker before the browser/user takes over;
-    // closing the gap here bounds the worst case to "the alarm-driven 10s
-    // cadence", not "however long until the next preview call happens to run
-    // ensureWorkspaceMount again". Best-effort and non-blocking-of-failure:
-    // a flush error here must never fail the preview response — logged
-    // loudly instead (never a bare `catch {}`).
-    try {
-      await sandbox.flushWorkspaceNow();
-    } catch (err) {
+    // `EzilSandboxDO.flushWorkspaceNow`'s doc comment). Closes the gap so the
+    // worst-case staleness is bounded to "the alarm-driven 10s cadence", not
+    // "however long until the next preview call happens to run
+    // ensureWorkspaceMount again". Best-effort and non-blocking-of-failure: a
+    // flush error here must never fail the preview response — logged loudly
+    // instead (never a bare `catch {}`).
+    //
+    // 🔴 PERF (z2-mint-latency): measured live against an ALREADY-RUNNING
+    // container, this RPC alone cost 441-754ms (median ~580ms across 6 warm
+    // production mints, `wrangler tail` on `ezil-os-worker`) — 15-27% of the
+    // Worker's own wall time on the warm path, paid synchronously before the
+    // response, even though the response (a streaming-desktop URL) has no
+    // dependency on R2 durability. The flush writes local container files TO
+    // R2; it reads nothing the caller's response needs. So it is handed to
+    // `ctx.waitUntil()` — the EXACT same "run to completion, don't make the
+    // response wait for it" contract `spoolTelemetry()` below already uses —
+    // instead of being awaited inline. This does NOT weaken the staleness
+    // bound described above: `waitUntil()` guarantees the flush still runs to
+    // completion on the same cadence as before, it just no longer blocks the
+    // bytes the browser is waiting on. Unlike `spoolTelemetry` (which is
+    // allowed to be silently dropped when `ctx` is absent), a dropped
+    // workspace flush is a real durability loss, so the ORIGINAL inline
+    // `await` is kept as the fallback for any caller that has no
+    // `ExecutionContext` (test harnesses calling the handler with 2 args) —
+    // see `route-auth.test.ts`'s "pre-handoff flush deferral" suite for both
+    // branches, mutation-tested.
+    const flushOutcome = sandbox.flushWorkspaceNow().catch((err) => {
       console.error(
         `[handlePreview] pre-handoff flushWorkspaceNow failed (sandboxId=${sandboxId}): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
+    });
+    if (ctx?.waitUntil) {
+      ctx.waitUntil(flushOutcome);
+    } else {
+      await flushOutcome;
     }
 
     const response = json({

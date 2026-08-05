@@ -701,12 +701,20 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
     expect(src).not.toMatch(/class EzilSandboxDO[\s\S]*?\basync alarm\s*\(/);
   });
 
-  it('flush is invoked explicitly before the preview response, and before destroy inside terminateSandbox', async () => {
+  it('flush is invoked explicitly before/around the preview response, and before destroy inside terminateSandbox', async () => {
     const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
-    // handlePreview's pre-handoff flush is still a Worker-side RPC.
-    expect(src).toContain('await sandbox.flushWorkspaceNow();');
-    const callSites = [...src.matchAll(/await sandbox\.flushWorkspaceNow\(\);/g)];
+    // handlePreview's pre-handoff flush is still a Worker-side RPC — started
+    // unconditionally exactly once. z2-mint-latency: no longer awaited
+    // inline unconditionally (measured 441-754ms on a WARM call, paid before
+    // the response with zero benefit to it — see the call site's own doc
+    // comment) — it is handed to `ctx.waitUntil()` when available, with an
+    // inline `await` fallback for callers with no `ExecutionContext`, proven
+    // both ways in `route-auth.test.ts`'s "pre-handoff flush deferral" suite.
+    expect(src).toContain('const flushOutcome = sandbox.flushWorkspaceNow().catch(');
+    const callSites = [...src.matchAll(/sandbox\.flushWorkspaceNow\(\)/g)];
     expect(callSites.length).toBe(1); // handlePreview (pre-handoff) only
+    expect(src).toContain('ctx.waitUntil(flushOutcome);');
+    expect(src).toContain('await flushOutcome;');
 
     // Terminate's pre-destroy flush moved INSIDE the DO (`terminateSandbox`),
     // where `ctx.container.running` is readable, and is now conditional on a
