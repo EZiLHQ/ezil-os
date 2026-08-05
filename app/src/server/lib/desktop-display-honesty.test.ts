@@ -61,6 +61,7 @@ import shellSession from '../../../../shell/ezil/session.js';
 import {
     cacheNekoAdminToken,
     probeDesktopDisplay,
+    probeDesktopDisplayLongPoll,
     resetNekoAdminTokenCacheForTests,
 } from './cloudflare-guacamole-provider';
 
@@ -480,6 +481,250 @@ describe('the admin-token cache — one session per container, not one per quest
             );
         } finally {
             await close(server);
+        }
+    });
+});
+
+/**
+ * z1: THE GATE SPENT MOST OF ITS TIME WAITING TO ASK, NOT TO CONNECT.
+ *
+ * `probeDesktopDisplay` above is one honest round trip. The measured cost was
+ * never that round trip being slow — it was that the SHELL had to make 2-3 of
+ * them, 1000ms apart (`DISPLAY_POLL_MS`, `desktop-window.js`), to notice a
+ * peer that may have connected right after the first ask. `probeDesktopDisplayLongPoll`
+ * moves the waiting server-side: it holds the request, re-checking
+ * `is_watching` internally, and returns the moment it flips or the hold
+ * expires — so the client usually needs exactly one round trip instead of
+ * three.
+ *
+ * Every case here uses a REAL HTTP server, exactly like the suite above.
+ */
+describe('probeDesktopDisplayLongPoll — z1: catch the peer connecting WHILE we ask, honestly', () => {
+    /** A Neko whose one session flips from idle to watching after `flipAtMs`. */
+    function makeFlippingNeko(flipAtMs: number) {
+        let watching = false;
+        const hits: string[] = [];
+        const server = createServer((req, res) => {
+            const chunks: Buffer[] = [];
+            req.on('data', (c: Buffer) => chunks.push(c));
+            req.on('end', () => {
+                const body = Buffer.concat(chunks).toString('utf8');
+                const path = req.url ?? '/';
+                if (path === '/api/login' && req.method === 'POST') {
+                    const parsed = JSON.parse(body || '{}') as { password?: string };
+                    if (parsed.password !== ADMIN_PASSWORD) {
+                        res.writeHead(401, { 'content-type': 'application/json' });
+                        res.end(JSON.stringify({ message: 'invalid password' }));
+                        return;
+                    }
+                    res.writeHead(200, { 'content-type': 'application/json' });
+                    res.end(JSON.stringify({ id: 'srv', token: TOKEN, profile: { is_admin: true } }));
+                    return;
+                }
+                if (path === '/api/sessions' && req.method === 'GET') {
+                    hits.push('GET /api/sessions');
+                    if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+                        res.writeHead(401, { 'content-type': 'application/json' });
+                        res.end(JSON.stringify({ message: 'unauthorized' }));
+                        return;
+                    }
+                    res.writeHead(200, { 'content-type': 'application/json' });
+                    res.end(JSON.stringify([session('a', watching)]));
+                    return;
+                }
+                if (path === '/api/logout' && req.method === 'POST') {
+                    res.writeHead(200, { 'content-type': 'application/json' });
+                    res.end(JSON.stringify({}));
+                    return;
+                }
+                res.writeHead(200, { 'content-type': 'text/html' });
+                res.end('<html></html>');
+            });
+        });
+        const timer = setTimeout(() => { watching = true; }, flipAtMs);
+        return { server, hits, stop: () => clearTimeout(timer) };
+    }
+
+    it('🔴 MUTATION-PROVING: catches a peer that connects MID-HOLD, in one client round trip', async () => {
+        // The measured production shape: nobody is watching at t=0, and a real
+        // peer finishes connecting a fraction of a second later. The OLD
+        // mechanism only found out because the SHELL asked again a second
+        // later; this asks internally instead.
+        const { server, hits, stop } = makeFlippingNeko(700);
+        const url = await listen(server);
+        try {
+            const t0 = performance.now();
+            const probe = await probeDesktopDisplayLongPoll(`${url}/`, ADMIN_PASSWORD, 4_000, 150);
+            const elapsed = performance.now() - t0;
+
+            expect(probe).toEqual({ display: 'live', sessions: 1, watching: 1 });
+            // 🔴 THE MUTATION THIS CATCHES: revert `probeDesktopDisplayLongPoll`
+            // to `return probeDesktopDisplay(...)` (a single ask, no internal
+            // re-check) and this goes RED — the single ask at t=0 sees
+            // `watching: false` and returns `{ display: 'blank', sessions: 1 }`,
+            // which fails the `toEqual` above outright.
+            expect(elapsed).toBeGreaterThan(650); // did not fabricate an early answer
+            expect(elapsed).toBeLessThan(1_600); // caught it promptly, nowhere near the 4s ceiling
+            // More than one internal check landed — the holding, not luck.
+            expect(hits.length).toBeGreaterThan(1);
+        } finally {
+            stop();
+            await close(server);
+        }
+    });
+
+    it('🔴 live on the very first check returns immediately — the best answer is never held for', async () => {
+        const { server, hits } = makeNeko({ sessions: [session('a', true)] });
+        const url = await listen(server);
+        try {
+            const t0 = performance.now();
+            const probe = await probeDesktopDisplayLongPoll(`${url}/`, ADMIN_PASSWORD, 4_000, 150);
+            const elapsed = performance.now() - t0;
+            expect(probe).toEqual({ display: 'live', sessions: 1, watching: 1 });
+            expect(elapsed).toBeLessThan(600);
+            expect(hits.filter((h) => h.path === '/api/sessions')).toHaveLength(1);
+        } finally {
+            await close(server);
+        }
+    });
+
+    it('a stable blank is held for the WHOLE budget, then answered honestly — never fabricated as a timeout', async () => {
+        const { server } = makeNeko({ sessions: [session('a', false)] });
+        const url = await listen(server);
+        try {
+            const t0 = performance.now();
+            const probe = await probeDesktopDisplayLongPoll(`${url}/`, ADMIN_PASSWORD, 1_000, 150);
+            const elapsed = performance.now() - t0;
+            expect(probe).toEqual({ display: 'blank', sessions: 1 });
+            expect(elapsed).toBeGreaterThanOrEqual(900);
+            // Bounded overshoot only — not "however long the last attempt felt
+            // like taking".
+            expect(elapsed).toBeLessThan(1_800);
+        } finally {
+            await close(server);
+        }
+    });
+
+    it('🔴 `unknown` is answered immediately, never held — re-asking a broken shape fixes nothing', async () => {
+        // A shape `probeDesktopDisplay` cannot read: `unrecognised`, i.e.
+        // `unknown`. If holding treated this like `blank` it would burn the
+        // whole budget on a deployment that will never self-heal within it.
+        const { server } = makeNeko({ sessions: [{ id: 'a', state: { isWatching: true } }] });
+        const url = await listen(server);
+        try {
+            const t0 = performance.now();
+            const probe = await probeDesktopDisplayLongPoll(`${url}/`, ADMIN_PASSWORD, 4_000, 150);
+            const elapsed = performance.now() - t0;
+            expect(probe).toEqual({ display: 'unknown', reason: 'unrecognised' });
+            expect(elapsed).toBeLessThan(500);
+        } finally {
+            await close(server);
+        }
+    });
+
+    it('🔴 `holdMs <= 0` is the bounded fallback: exactly one probe, byte-for-byte today\'s behaviour', async () => {
+        const { server, hits } = makeNeko({ sessions: [session('a', false)] });
+        const url = await listen(server);
+        try {
+            const probe = await probeDesktopDisplayLongPoll(`${url}/`, ADMIN_PASSWORD, 0);
+            expect(probe).toEqual({ display: 'blank', sessions: 1 });
+            expect(hits.map((h) => `${h.method} ${h.path}`)).toEqual([
+                'POST /api/login',
+                'GET /api/sessions',
+            ]);
+        } finally {
+            await close(server);
+        }
+    });
+
+    it('🔴 a server that never answers /api/sessions cannot walk the hold past its own budget', async () => {
+        // Never responds to `/api/sessions` — a genuinely hung far end, the
+        // case the shell's OWN independent timers (`DISPLAY_UNVERIFIED_DEADLINE_MS`,
+        // `DISPLAY_BLANK_DEADLINE_MS`, both in `desktop-window.js`) exist to
+        // survive. This pins the half of that property that belongs here: the
+        // hold itself must return near its OWN budget, not near some larger,
+        // unrelated ceiling (e.g. `probeDesktopDisplay`'s un-clamped 6s
+        // default) and never indefinitely.
+        const server = createServer((req, res) => {
+            const chunks: Buffer[] = [];
+            req.on('data', (c: Buffer) => chunks.push(c));
+            req.on('end', () => {
+                const body = Buffer.concat(chunks).toString('utf8');
+                if (req.url === '/api/login' && req.method === 'POST') {
+                    const parsed = JSON.parse(body || '{}') as { password?: string };
+                    if (parsed.password !== ADMIN_PASSWORD) {
+                        res.writeHead(401, { 'content-type': 'application/json' });
+                        res.end(JSON.stringify({ message: 'invalid password' }));
+                        return;
+                    }
+                    res.writeHead(200, { 'content-type': 'application/json' });
+                    res.end(JSON.stringify({ id: 'srv', token: TOKEN, profile: { is_admin: true } }));
+                    return;
+                }
+                // `/api/sessions` (and anything else): never respond. The
+                // connection is left open, exactly like a genuinely stuck peer.
+            });
+        });
+        const url = await listen(server);
+        try {
+            const t0 = performance.now();
+            const probe = await probeDesktopDisplayLongPoll(`${url}/`, ADMIN_PASSWORD, 1_500, 150);
+            const elapsed = performance.now() - t0;
+            expect(probe.display).toBe('unknown');
+            // 🔴 Comfortably under the shell's `DISPLAY_UNVERIFIED_DEADLINE_MS`
+            // (6s) and `STATUS_TIMEOUT_MS` (12s, `session.js`) — a hung far end
+            // cannot make this single ask outlast either of the CLIENT's own
+            // independent timers, which is what lets those timers still fire
+            // on schedule regardless of how this promise is doing.
+            expect(elapsed).toBeLessThan(2_500);
+        } finally {
+            await close(server);
+        }
+    });
+
+    it('🔴 END-TO-END: the shipped `session.confirmDisplay` reports `live` from a peer that connected mid-hold, over the REAL wire shape', async () => {
+        // The whole chain the router now actually runs: a fake `/api/shell/desktop`
+        // route calling `probeDesktopDisplayLongPoll` (not the bare probe), the
+        // shipped shell client, and the real `applyDisplayEvidence`.
+        const { server: neko, stop } = makeFlippingNeko(300);
+        const nekoUrl = await listen(neko);
+        const app = createServer((req, res) => {
+            const url = new URL(req.url ?? '/', 'http://internal');
+            void (async () => {
+                const frameUrl = url.searchParams.get('frameUrl') ?? '';
+                const probe = await probeDesktopDisplayLongPoll(frameUrl, ADMIN_PASSWORD, 1_500, 100);
+                res.writeHead(200, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ ok: true, ...probe }));
+            })();
+        });
+        const appUrl = await listen(app);
+        const savedWindow = (globalThis as unknown as { window: unknown }).window;
+        (globalThis as unknown as { window: unknown }).window = {
+            __EZIL_BOOT__: {
+                user: { id: '00000000-0000-4000-8000-000000000001' },
+                desktopState: { endpoints: { desktop: `${appUrl}/api/shell/desktop` } },
+            },
+        };
+        try {
+            const frameState = () =>
+                computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: true });
+            const t0 = performance.now();
+            const display = await shellSession.confirmDisplay(
+                '00000000-0000-4000-8000-000000000002',
+                `${nekoUrl}/?usr=EZiL&pwd=secret&embed=1`,
+            );
+            const elapsed = performance.now() - t0;
+            expect(display).toBe('live');
+            expect(applyDisplayEvidence(frameState(), display)).toEqual({ kind: 'ready' });
+            // ONE client-visible round trip caught a peer that connected 300ms
+            // in — the shell never needed a second `ask()` to find out.
+            expect(elapsed).toBeGreaterThan(250);
+            expect(elapsed).toBeLessThan(1_200);
+        } finally {
+            stop();
+            (globalThis as unknown as { window: unknown }).window = savedWindow;
+            await close(app);
+            await close(neko);
         }
     });
 });
