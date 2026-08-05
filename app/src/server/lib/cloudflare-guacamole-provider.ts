@@ -1749,6 +1749,103 @@ export async function probeDesktopDisplay(
     // exists to remove. The cache logs out whatever it replaces.
 }
 
+// ─── z1: the gate spent most of its time waiting to ASK, not to connect ──────
+//
+// Measured in production (`y3-open-latency`, 4/4 real warm opens): the display
+// gate took a median 5604ms to observe `live`, needing 2-3 client round trips.
+// Each round trip is a REAL network hop, Vercel function -> container's Neko
+// admin API (~1-2s), and `desktop-window.js` additionally sleeps
+// `DISPLAY_POLL_MS` (measured dead-on 1000ms, every time) between asks. So a
+// peer that finished connecting one second after the first ask still cost the
+// user a second full round trip plus a second of pure client-side waiting to
+// find out.
+//
+// The fix is not a faster probe — `probeDesktopDisplay` above is already one
+// round trip with a cached token. It is asking FEWER TIMES, by having THIS
+// SIDE do the waiting: hold the request open and re-check internally on a
+// short interval, so a peer that connects mid-hold is caught before the
+// answer is ever sent, instead of being caught by a client re-ask a second
+// (or more) later.
+//
+// 🔴 ONLY `blank` IS WORTH RE-ASKING. `live` is already the best answer there
+// is — return it the instant it is seen. `unknown` means our OWN plumbing
+// (login, shape, transport) did not produce a well-formed read; re-hitting
+// the exact same broken thing every 300ms will not fix a wrong password or a
+// renamed field, so holding for it would only spend the budget for nothing
+// and delay an honest `unknown` reaching the client. The pre-existing
+// client-side retry loop (`desktop-window.js`'s `ask()`, unchanged) is what
+// recovers from a TRANSIENT `unknown` a second later; this function exists
+// only to catch a peer that connects WHILE we are already holding a `blank`.
+//
+// 🔴 THE INVARIANTS ABOVE ARE UNTOUCHED, NOT RE-DERIVED. This function never
+// inspects `is_watching` itself and never constructs a verdict — it only
+// calls `probeDesktopDisplay` again and again, so every well-formedness rule
+// and every `unknown`/`blank` boundary above applies unchanged to each
+// attempt. A hold that expires returns whatever `probeDesktopDisplay` most
+// recently, honestly answered — never a synthesized "nobody's watching" for
+// the mere fact that time ran out.
+
+/**
+ * Default hold budget: comfortably under the shell's own
+ * `DISPLAY_UNVERIFIED_DEADLINE_MS` (6000ms, `desktop-window.js`) so a typical
+ * hold that finds nothing still leaves headroom for network transit and the
+ * ownership check before that CLIENT-SIDE timer would fire, and comfortably
+ * under the client's own fetch abort (`STATUS_TIMEOUT_MS` = 12000ms,
+ * `session.js`) so a full hold is never itself mistaken for a hung request.
+ */
+export const DISPLAY_LONGPOLL_HOLD_MS = 4_000;
+
+/** How often to re-check `is_watching` while holding a `blank`. */
+export const DISPLAY_LONGPOLL_INTERVAL_MS = 300;
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * `probeDesktopDisplay`, held open across a short window instead of asked
+ * once and handed straight back.
+ *
+ * 🔴 `holdMs <= 0` IS THE BOUNDED FALLBACK, NOT A SPECIAL CASE BOLTED ON. It
+ * degrades to calling `probeDesktopDisplay` exactly once, with its own
+ * default budget — byte-for-byte the pre-long-poll behaviour. That is what an
+ * older deployment (or this one, with the feature dialled to 0) falls back
+ * to: never a hang, just the single-shot probe this whole gate used to be.
+ *
+ * 🔴 THE HOLD CAN NEVER RUN LONGER THAN `holdMs` PLUS ONE ATTEMPT'S OWN
+ * TRANSIT SLACK. Every attempt's own timeout is clamped to whatever time is
+ * left before the deadline (`attemptBudget`), so a hanging final attempt is
+ * cut short at the deadline rather than being handed a fresh full budget —
+ * the loop cannot be walked past its budget by a slow network the way a
+ * naive `while (not done) probe()` could be.
+ *
+ * @param holdMs total wall-clock budget for this whole call, including any
+ *   login. `<= 0` disables holding (see above).
+ * @param intervalMs how long to sleep between re-checks while `blank`.
+ */
+export async function probeDesktopDisplayLongPoll(
+    desktopUrl: string,
+    adminPassword: string,
+    holdMs: number = DISPLAY_LONGPOLL_HOLD_MS,
+    intervalMs: number = DISPLAY_LONGPOLL_INTERVAL_MS,
+): Promise<DesktopDisplayProbe> {
+    if (holdMs <= 0) return probeDesktopDisplay(desktopUrl, adminPassword);
+
+    const deadline = Date.now() + holdMs;
+    const attemptBudget = () =>
+        Math.max(Math.min(deadline - Date.now(), DESKTOP_DISPLAY_PROBE_TIMEOUT_MS), 1);
+
+    let probe = await probeDesktopDisplay(desktopUrl, adminPassword, attemptBudget());
+
+    while (probe.display === 'blank' && Date.now() < deadline) {
+        await sleep(Math.min(intervalMs, Math.max(deadline - Date.now(), 0)));
+        if (Date.now() >= deadline) break;
+        probe = await probeDesktopDisplay(desktopUrl, adminPassword, attemptBudget());
+    }
+
+    return probe;
+}
+
 /**
  * May this server fetch `candidateUrl` on behalf of a caller who owns
  * `sandboxId`?
