@@ -130,6 +130,14 @@ function fakeSandboxNamespace(options: {
    * test prove boot-phase data actually reaches `spoolTelemetry()`.
    */
   containerTelemetryNdjson?: string;
+  /**
+   * Override the fake `flushWorkspaceNow` RPC's own behavior — e.g. a
+   * deferred promise the test resolves manually, to prove `/sandbox/preview`
+   * does or doesn't wait on it (z2-mint-latency: it must NOT, when `ctx` is
+   * present). Still counted in `calls.flushWorkspaceNow` exactly like the
+   * default. Defaults to an immediately-resolved `{}`.
+   */
+  flushWorkspaceNow?: () => Promise<unknown>;
 }): { binding: unknown; calls: CallLog } {
   /** The sandbox id the Worker actually opened the DO with. */
   let openedWith = SANDBOX_NAME;
@@ -244,7 +252,7 @@ function fakeSandboxNamespace(options: {
     },
     flushWorkspaceNow: async () => {
       calls.flushWorkspaceNow++;
-      return {};
+      return options.flushWorkspaceNow ? await options.flushWorkspaceNow() : {};
     },
     getExposedPorts: async () => {
       calls.getExposedPorts++;
@@ -312,14 +320,14 @@ function fakeSandboxNamespace(options: {
   };
 }
 
-async function loadWorker(): Promise<{ fetch(request: Request, env: unknown): Promise<Response> }> {
+async function loadWorker(): Promise<{ fetch(request: Request, env: unknown, ctx?: ExecutionContext): Promise<Response> }> {
   const mod = (await import('./index')) as unknown as {
-    default: { fetch(request: Request, env: unknown): Promise<Response> };
+    default: { fetch(request: Request, env: unknown, ctx?: ExecutionContext): Promise<Response> };
   };
   return mod.default;
 }
 
-let worker: { fetch(request: Request, env: unknown): Promise<Response> };
+let worker: { fetch(request: Request, env: unknown, ctx?: ExecutionContext): Promise<Response> };
 
 beforeEach(async () => {
   worker = await loadWorker();
@@ -1133,6 +1141,117 @@ describe('POST /sandbox/preview returns appPreviewUrl + codePreviewUrl', () => {
   });
 });
 
+// ── z2-mint-latency: pre-handoff flush must not block a WARM response ───────
+//
+// Measured live against an already-running production container (see
+// scratchpad report), the pre-handoff `flushWorkspaceNow()` RPC alone cost
+// 441-754ms on a warm `/sandbox/preview` call, paid synchronously before the
+// response even though the response has no dependency on it (it hands back a
+// streaming-desktop URL; the flush only pushes local files TO R2 for
+// durability). It is now handed to `ctx.waitUntil()` when available — same
+// contract `spoolTelemetry()` already uses — with an inline `await` fallback
+// preserved for any caller with no `ExecutionContext` (so a dropped flush
+// stays impossible, only its position relative to the response changes).
+//
+// Both directions are proven with a CONTROLLABLE flush (a promise the test
+// resolves by hand) rather than a timer, so there is no flakiness window:
+//   - with ctx: the response promise must settle on its own, `deferred.resolve()`
+//     is called strictly AFTER awaiting it — if the code regressed to an
+//     inline `await`, this test would time out, not merely mis-assert.
+//   - without ctx: the response promise must NOT have settled ahead of a
+//     Promise.resolve() sentinel, proving it is still gated on the flush.
+describe('POST /sandbox/preview: pre-handoff flush deferral (z2-mint-latency)', () => {
+  const host = 'ezil.org';
+  const id = 'guac-flushflushflush-deferdeferdefer';
+
+  function makeDeferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((res) => {
+      resolve = res;
+    });
+    return { promise, resolve };
+  }
+
+  function warmSandboxWithControllableFlush(order: string[], deferred: { promise: Promise<void> }) {
+    return fakeSandboxNamespace({
+      exposedPorts: [{ port: 8181, url: `https://8181-${id}-nekodesktop.${host}`, status: 'open' }],
+      flushWorkspaceNow: async () => {
+        await deferred.promise;
+        order.push('flush');
+        return {};
+      },
+    });
+  }
+
+  async function signedPreviewRequest(): Promise<Request> {
+    return new Request('https://api-desktop.ezil.org/sandbox/preview', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: await mintToken(), projectId: 'proj-1', userId: 'user-1', desktopMode: 'neko' }),
+    });
+  }
+
+  it('WITH ctx.waitUntil: the response resolves without waiting for the flush', async () => {
+    const order: string[] = [];
+    const deferred = makeDeferred();
+    const { binding, calls } = warmSandboxWithControllableFlush(order, deferred);
+    const waited: Array<Promise<unknown>> = [];
+    const ctx = { waitUntil: (p: Promise<unknown>) => waited.push(p) } as unknown as ExecutionContext;
+
+    const res = await worker.fetch(
+      await signedPreviewRequest(),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+      ctx,
+    );
+    order.push('response');
+
+    expect(res.status).toBe(200);
+    // The response landed strictly BEFORE the flush did — order is exactly
+    // ['response'] at this point because `deferred.resolve()` has not been
+    // called yet, so 'flush' cannot possibly be in `order` unless the flush
+    // was awaited inline (the regression this test exists to catch).
+    expect(order).toEqual(['response']);
+    // …but the flush was genuinely started, not dropped —
+    expect(calls.flushWorkspaceNow).toBe(1);
+    // — and handed to ctx.waitUntil() so the runtime keeps it alive.
+    expect(waited).toHaveLength(1);
+
+    // Let it finish and prove it really does run to completion.
+    deferred.resolve();
+    await waited[0];
+    expect(order).toEqual(['response', 'flush']);
+  });
+
+  it('WITHOUT ctx (mutation: force the fast path off): the response still WAITS for the flush', async () => {
+    const order: string[] = [];
+    const deferred = makeDeferred();
+    const { binding, calls } = warmSandboxWithControllableFlush(order, deferred);
+
+    // No third `ctx` argument — the exact call shape every other test in this
+    // file already uses (a caller with no ExecutionContext).
+    const resPromise = worker
+      .fetch(await signedPreviewRequest(), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET })
+      .then((res) => {
+        order.push('response');
+        return res;
+      });
+
+    // Race against an already-resolved sentinel: if the response had already
+    // settled (or settles within this microtask turn), 'response' wins. It
+    // must not — the fallback path is still gated on the flush.
+    const winner = await Promise.race([resPromise.then(() => 'response'), Promise.resolve('not-yet')]);
+    expect(winner).toBe('not-yet');
+    expect(order).toEqual([]);
+
+    deferred.resolve();
+    const res = await resPromise;
+    expect(res.status).toBe(200);
+    // Flush completed BEFORE the response — the original blocking contract.
+    expect(order).toEqual(['flush', 'response']);
+    expect(calls.flushWorkspaceNow).toBe(1);
+  });
+});
+
 // ── Telemetry: boot phase/outcome data reaches the R2 spool ─────────────────
 //
 // Before this, `proc.getLogs()` was read only on the FAILURE path inside
@@ -1458,7 +1577,7 @@ const CODE_HOST = `8443-${SANDBOX_NAME}-code.ezil.org`;
 const APP_HOST = `3002-${SANDBOX_NAME}-app.ezil.org`;
 
 async function bootstrapCodeHost(
-  worker: { fetch(request: Request, env: unknown): Promise<Response> },
+  worker: { fetch(request: Request, env: unknown, ctx?: ExecutionContext): Promise<Response> },
   binding: unknown,
 ): Promise<{ cookie: string; fallbackParam: string; location: string; res: Response }> {
   const { mintPreviewBootstrapToken } = await import('./hmac');
