@@ -80,8 +80,18 @@ If you believe an attribution is missing or inaccurate, please open an issue
 - **Used for:** The alternate `neko` desktop mode — WebRTC-based browser
   desktop streaming. Pinned at commit `d74052bb844c43a0cc3c2386d083f7505dc483a2`,
   consumed as a pre-built binary/asset copied from a project-owned build
-  stage (`ezil-neko-vscode`) into the final image. Not modified in this
-  repository.
+  stage (`ezil-neko-vscode`) into the final image. The `/usr/bin/neko`
+  binary and `/etc/neko` config are unmodified. Its compiled HTML5 client
+  bundle's **static branding assets** (favicons, PWA manifest, mask icon,
+  the `img/logo.800bec71.svg` wordmark — a cat-silhouette mark — and the
+  `chat.mp3` notification sound) and a handful of strings/colors in
+  `index.html` **are** replaced by a second, local-only build stage
+  (`worker/assets/neko-branding/Dockerfile`, tag
+  `ezil-neko-vscode:d74052bb-049931d7-ezil-brand1`) layered on top of the
+  unmodified upstream image before `worker/Dockerfile` consumes it — no
+  upstream JS/CSS, and no copyright/license notice, is altered. Apache-2.0
+  imposes no on-screen-attribution obligation, so this is permitted; full
+  attribution stays here rather than in the product UI.
 
 ### neko-apps (`m1k1o/neko-apps`)
 - **URL:** https://github.com/m1k1o/neko-apps

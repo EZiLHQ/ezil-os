@@ -33,7 +33,23 @@
 # Sandbox base below. Never pushed to any registry; resolved from the local
 # build host's image store (wrangler builds the container image locally before
 # pushing to registry.cloudflare.com).
-ARG NEKO_IMAGE=ezil-neko-vscode:d74052bb-049931d7
+#
+# `-ezil-brand1` is a SECOND local, project-owned, never-pushed tag: it is
+# `ezil-neko-vscode:d74052bb-049931d7` with EZiL's branding overlay applied
+# (worker/assets/neko-branding/Dockerfile) — the upstream n.eko wordmark
+# (img/logo.800bec71.svg — a cat-silhouette mark, confirmed by inspecting its
+# path data), favicons/tile icons, PWA manifest, mask icon, and the
+# `chat.mp3` notification chime (the literal "n.eko sound", played via
+# `new Audio("chat.mp3").play()` on the built-in chat plugin's newMessage
+# event) are replaced. No EZiL logo graphic exists anywhere in this
+# repository as of this commit, so the replacements are neutral/blank
+# placeholders in EZiL's real palette (--color-charcoal #161616 /
+# --color-teal #00adb5), not an invented mark — see that Dockerfile's header
+# comment. Rebuild it with:
+#   docker build -t ezil-neko-vscode:d74052bb-049931d7-ezil-brand1 \
+#     -f worker/assets/neko-branding/Dockerfile worker/assets/neko-branding
+# before building this Dockerfile, exactly like the upstream tag it overlays.
+ARG NEKO_IMAGE=ezil-neko-vscode:d74052bb-049931d7-ezil-brand1
 FROM ${NEKO_IMAGE} AS neko
 
 FROM docker.io/cloudflare/sandbox:0.12.1

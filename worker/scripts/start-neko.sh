@@ -886,12 +886,55 @@ else
   phase_end openbox skipped
 fi
 
-# ── Audio (best-effort; media path is WebRTC/TURN-gated) ──────────────────────
-if command -v pulseaudio >/dev/null 2>&1; then
-  log "starting pulseaudio (best-effort)"
-  pulseaudio --log-level=error --disallow-module-loading --disallow-exit --exit-idle-time=-1 >>"$LOG" 2>&1 &
-  SESSION_PID+=("$!")
-fi
+# ── Audio capture: disabled at the source (no third-party n.eko sound) ──────
+# EZiL OS ships no audible desktop audio: this section used to start
+# pulseaudio "best-effort" so neko's WebRTC audio track had a real desktop
+# source to capture, and that is exactly what let a stray system sound (or
+# the client bundle's own chat notification chime, see below) reach the
+# user. This is intentionally the OPPOSITE of that: pulseaudio is not
+# started, and NEKO_CAPTURE_AUDIO_DEVICE is pointed at a name that cannot
+# resolve to a real source, so the container has no functioning desktop
+# audio capture path at all.
+#
+# 🔴 A plan for this task assumed a `NEKO_CAPTURE_AUDIO_ENABLED=false`
+# environment variable would exist and disable audio capture outright. It
+# does not exist in this pinned build. Verified directly against the actual
+# binary/config baked into this image (never trust a flag name without
+# checking it against the real thing — see docs/PLATFORM-NOTES.md's Method
+# notes):
+#   docker run --rm --entrypoint /bin/sh ezil-neko-vscode:d74052bb-049931d7 \
+#     -c "/usr/bin/neko serve --help 2>&1 | grep -i audio"
+# lists only capture.audio.codec / capture.audio.device / capture.audio.pipeline
+# (env equivalents NEKO_CAPTURE_AUDIO_CODEC / _DEVICE / _PIPELINE) — there is
+# no capture.audio.enabled flag, hidden or otherwise (also checked by
+# grepping the compiled binary's own strings for every NEKO_CAPTURE_AUDIO*
+# and capture.audio.* literal it contains). Unlike video, which is only
+# added to a session when NEKO_CAPTURE_VIDEO_IDS names a stream, audio has no
+# such id list to empty out.
+#
+# Also verified directly against a live session on this exact pinned binary
+# (a real WebSocket + WebRTC negotiation, not just log-reading) that the
+# offer SDP unconditionally contains an `m=audio` section (opus/48000) using
+# the SAME `msid:stream` as `m=video` — i.e. one shared MediaStream, exactly
+# matching the reason `autoplay` must stay on the app iframe (see
+# UIWindow.js). No combination of the three capture.audio.* settings removes
+# that `m=audio` line; only patching/recompiling neko itself could, which is
+# out of scope here. What setting an unresolvable device DOES guarantee: if
+# a peer ever exercises that inert audio track, the per-session GStreamer
+# pipeline (`pulsesrc device=... ! ... ! opusenc ...`, built lazily on first
+# subscription — confirmed by its absence from this image's own startup log,
+# unlike video's two pipelines which ARE syntax-checked at boot) has no
+# PulseAudio server to connect to and no real device name even if one were
+# running, so it can never carry real desktop sound. This also avoids
+# spending any CPU on a live audio encode on this 2-vCPU box, matching the
+# free-CPU-lever framing of the video tuning below.
+#
+# The neko client's own compiled bundle already keeps its <video> element
+# muted by default (`muted:!0` in its Vuex store) regardless of this
+# setting, so this is defense-in-depth, not the only thing standing between
+# a user and real desktop audio.
+export NEKO_CAPTURE_AUDIO_DEVICE="${NEKO_CAPTURE_AUDIO_DEVICE:-ezil-audio-capture-disabled}"
+log "audio capture: pulseaudio not started, NEKO_CAPTURE_AUDIO_DEVICE unresolvable — no real desktop audio can reach the WebRTC stream"
 
 # ── App supervision (code-server + isolated Chromium) ─────────────────────────
 # Both apps run on the same $DISPLAY, each supervised independently: a crash in
