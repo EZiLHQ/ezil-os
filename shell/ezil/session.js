@@ -390,6 +390,19 @@ export async function confirmFrame (computerId, frameUrl) {
  * like a check. The server can ask Neko, which knows: it flips a per-session
  * `is_watching` flag from its WebRTC peer's `connected` state change.
  *
+ * 🔴 z1: THIS ONE CALL CAN TAKE SEVERAL SECONDS ON PURPOSE. The server now
+ * HOLDS the request, re-checking internally, for up to `DISPLAY_LONGPOLL_HOLD_MS`
+ * (`cloudflare-guacamole-provider.ts`, currently 4s) before answering — a peer
+ * that connects mid-hold is caught there instead of by our next poll a second
+ * or more later. That is comfortably under `STATUS_TIMEOUT_MS` below (this
+ * call's own fetch abort) and under `start_display_gate`'s
+ * `DISPLAY_UNVERIFIED_DEADLINE_MS` (`desktop-window.js`), so a normal hold
+ * finishing does not race either. Nothing here changed to make that true:
+ * this function still does exactly one GET and reports exactly what comes
+ * back, in either direction — a server that does not hold (an older
+ * deployment) just answers fast, and this loop's own retry cadence below is
+ * the bounded fallback for that case, unchanged.
+ *
  * @returns {Promise<'live' | 'blank' | 'unknown'>}
  *   `'live'`    — a WebRTC peer is connected and being fed video.
  *   `'blank'`   — a real, well-formed observation that nobody is watching.

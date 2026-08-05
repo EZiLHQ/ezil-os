@@ -50,7 +50,7 @@ import {
     isOwnDesktopOrigin,
     mintAppPreviewBootstrapToken,
     newCorrelationId,
-    probeDesktopDisplay,
+    probeDesktopDisplayLongPoll,
     probeDesktopFrame,
     readWorkerBridgeUrl,
     requestGuacamoleActivity,
@@ -677,6 +677,13 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
      * is `unknown` rather than `blank` — refusing to probe is not an
      * observation of anything, and must not be laundered into a failure the
      * user is shown.
+     *
+     * 🔴 z1: THIS HOLDS, IT DOES NOT JUST ASK ONCE. `probeDesktopDisplayLongPoll`
+     * re-checks `is_watching` internally for up to `DISPLAY_LONGPOLL_HOLD_MS`
+     * before answering, so a peer that connects mid-hold is caught here rather
+     * than by the shell's own next poll a second (or more) later — see that
+     * function's header for why only `blank` is worth holding for, and why the
+     * hold can never itself manufacture a verdict.
      */
     confirmDisplay: protectedProcedure
         .input(
@@ -714,7 +721,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             // password. The derived value is never returned or logged.
             const adminPassword = hmacSecret ? deriveNekoAdminValue(hmacSecret, sandboxId) : 'admin';
 
-            const probe = await probeDesktopDisplay(input.frameUrl, adminPassword);
+            const probe = await probeDesktopDisplayLongPoll(input.frameUrl, adminPassword);
             if (probe.display === 'live') {
                 return { display: 'live' as const, watching: probe.watching, sessions: probe.sessions };
             }

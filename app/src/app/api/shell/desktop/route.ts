@@ -44,6 +44,13 @@ import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/sh
  *                          `live`/`blank`/`unknown` — see `confirmDisplay`.
  *                          Two small JSON round trips to the same edge
  *                          hostname; no Worker call, no container wake.
+ *                          🔴 z1: this handler now HOLDS for up to
+ *                          `DISPLAY_LONGPOLL_HOLD_MS` (4s,
+ *                          `cloudflare-guacamole-provider.ts`) re-checking
+ *                          internally before answering — well inside the
+ *                          `maxDuration` below, which is the one thing that
+ *                          must stay true for a hold to ever return rather
+ *                          than being killed mid-hold (PLATFORM-NOTES §13).
  *   POST { computerId }  — the long one. Starts/attaches the desktop and
  *                          resolves only at the end, success or a specific
  *                          error.
