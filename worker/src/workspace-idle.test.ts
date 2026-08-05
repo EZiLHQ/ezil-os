@@ -32,9 +32,25 @@
  *      temporarily removed/reverted.
  */
 
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, mock } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+
+// `./index.ts` pulls in `@cloudflare/sandbox`, which imports the workerd-only
+// `cloudflare:workers`. Registered HERE rather than relied upon from whichever
+// other test file happens to load first: this module used to import cleanly
+// only because `route-auth.test.ts` had already stubbed the specifier, so
+// running this file on its own — or in any smaller selection, e.g. while
+// mutation-testing a single guard — failed every `await import('./index')`
+// with "Cannot find package 'cloudflare:workers'". A test that can only pass
+// in one particular whole-suite ordering is not a test you can bisect with.
+mock.module('cloudflare:workers', () => ({
+  DurableObject: class {},
+  WorkerEntrypoint: class {},
+  RpcTarget: class {},
+  RpcStub: class {},
+  env: {},
+}));
 
 const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
 
@@ -436,7 +452,11 @@ describe('SLEEP_AFTER backstop', () => {
 // reverting the guard it pins, observing the test fail, restoring it).
 
 describe('flushWorkspaceScheduled: ordering and guards', () => {
-  const method = between('async flushWorkspaceScheduled(): Promise<void> {', '\n  /**\n   * DO-storage plumbing');
+  // `flushWorkspaceScheduled` is now a thin survival wrapper (it re-arms the
+  // loop when the cycle THROWS — see `workspace-flush-loop.test.ts`, which
+  // executes that behaviour rather than reading it); the ordered decision
+  // logic these assertions pin lives in `runScheduledFlushCycle`.
+  const method = between('private async runScheduledFlushCycle(): Promise<void> {', '\n  /**\n   * DO-storage plumbing');
 
   it('checks the terminate tombstone FIRST, before the not-running check', () => {
     const terminatedIdx = method.indexOf('WORKSPACE_TERMINATED_KEY');
@@ -456,11 +476,16 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
       'if (!this.containerIsRunning()) {',
       'const lastActivityAt = (await this.ctx.storage.get<number>(LAST_ACTIVITY_AT_KEY))',
     );
-    expect(notRunningBranch).toContain('WORKSPACE_FLUSH_LOOP_STARTED_KEY, false');
     expect(notRunningBranch).not.toContain('runWorkspaceFlush');
     expect(notRunningBranch).not.toContain('this.schedule(');
     // Mutation-proven: temporarily added a `this.runWorkspaceFlush('alarm')`
     // call inside this branch — the assertion failed. Restored.
+    //
+    // The branch used to also write `WORKSPACE_FLUSH_LOOP_STARTED_KEY, false`
+    // here. That key is gone (see `LEGACY_WORKSPACE_FLUSH_LOOP_STARTED_KEY` in
+    // `index.ts`): "no reschedule" IS the stopped state now, because liveness
+    // is read back out of the scheduler's own rows. `workspace-flush-loop.test.ts`
+    // executes that end-to-end instead of grepping for it.
   });
 
   it('reads LAST_ACTIVITY_AT_KEY and applies isIdleStopDue before deciding to flush-and-stop', () => {
@@ -512,12 +537,12 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
 
   it('a BUSY container is NOT marked as a stopped loop (the alarm must keep running to re-ask)', () => {
     const busyBranch = between('if (busy.busy) {', "// Trigger stays `'alarm'`");
-    expect(busyBranch).not.toContain('WORKSPACE_FLUSH_LOOP_STARTED_KEY, false');
-    // Mutation-proven: added
-    // `await this.ctx.storage.put(WORKSPACE_FLUSH_LOOP_STARTED_KEY, false);`
-    // to the busy branch — this assertion failed. That mutation is how a busy
-    // container would silently stop being re-checked and never idle-stop at
-    // all, which is the pre-fix bug wearing a new hat.
+    // With liveness derived from the scheduler, "the loop is still running" is
+    // now expressed by the reschedule itself, so THAT is what this pins. A
+    // busy container that failed to reschedule would silently stop being
+    // re-checked and never idle-stop at all — the pre-fix bug wearing a new
+    // hat. Executed (not grepped) in `workspace-flush-loop.test.ts`.
+    expect(busyBranch).toContain('await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK)');
   });
 
   it('a BUSY container is not tombstoned either — busy is not termination', () => {

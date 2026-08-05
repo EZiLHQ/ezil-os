@@ -1581,7 +1581,37 @@ async function ensureWorkspaceHydratedFromR2(
 // ── Durable Object storage keys (EzilSandboxDO) ──────────────────────────────
 const WORKSPACE_FLUSH_CONTEXT_KEY = 'ezil:workspaceFlushContext';
 const WORKSPACE_HYDRATED_KEY = 'ezil:workspaceHydrated';
-const WORKSPACE_FLUSH_LOOP_STARTED_KEY = 'ezil:workspaceFlushLoopStarted';
+/**
+ * 🔴 REMOVED, deliberately — read this before reintroducing anything like it.
+ *
+ * This key used to hold a boolean "the periodic flush loop is running", and
+ * `recordWorkspaceHydration` returned early whenever it was `true`. Production
+ * measurement (`wrangler tail` against a full container boot) showed EVERY
+ * `workspace_flush` line reading `trigger=explicit` and not one reading
+ * `trigger=alarm` — the loop was permanently dead for that sandbox, so the
+ * idle-stop never ran AND the workspace only persisted on explicit flushes,
+ * against `docs/PLATFORM-NOTES.md` §8 (containers have no guaranteed lifetime;
+ * persistence must be continuous and eager).
+ *
+ * The mechanism, confirmed in the SDK's own source: `@cloudflare/containers`'
+ * `alarm()` dispatcher runs a due schedule's callback inside a `try`, logs any
+ * throw, and then UNCONDITIONALLY deletes that schedule row
+ * (`DELETE FROM container_schedules WHERE id = ...`) — it never reschedules on
+ * our behalf. So one throw out of `flushWorkspaceScheduled` (a `listFiles` /
+ * `readFile` RPC against a container that went away mid-cycle is enough)
+ * deleted the only pending row while this flag stayed `true`. Every later boot
+ * then read "already started" and returned early. Dead forever, for that
+ * sandbox, with no way back.
+ *
+ * The lesson is not "reset the flag in one more place": it is that a flag
+ * maintained in parallel with the scheduler's own state can disagree with it,
+ * and when it does, it wins for the wrong reason. Liveness is now DERIVED from
+ * the scheduler — `listSchedules(WORKSPACE_FLUSH_CALLBACK)` + the staleness
+ * check in {@link workspaceFlushLoopIsAlive} — which cannot go stale
+ * independently of the thing it describes. The key is deleted on every hydrate
+ * purely so old sandboxes do not carry a misleading orphan around.
+ */
+const LEGACY_WORKSPACE_FLUSH_LOOP_STARTED_KEY = 'ezil:workspaceFlushLoopStarted';
 /**
  * Set by `terminateSandbox()`/`destroy()`; cleared by the next successful boot
  * (`recordWorkspaceHydration`). While set, the periodic flush loop MUST NOT
@@ -1761,6 +1791,52 @@ const IDLE_STOP_MS = 10 * 60_000;
  * unbounded.
  */
 const WORKSPACE_FLUSH_BACKOFF_STEPS_SECONDS = [WORKSPACE_FLUSH_INTERVAL_SECONDS, 30, 60] as const;
+
+/**
+ * How far PAST its own fire time a pending `container_schedules` row may be
+ * before {@link workspaceFlushLoopIsAlive} stops believing it.
+ *
+ * A schedule row is the scheduler's own state, so it cannot drift out of sync
+ * with the scheduler the way the old boolean flag did — but it is still not
+ * quite the same claim as "an alarm will actually arrive". A row can outlive
+ * its alarm (the alarm handler itself throwing past workerd's retry budget,
+ * for instance), and a row nobody will ever run is exactly as dead as no row
+ * at all. So the check has a liveness component: a row due more than this long
+ * ago is treated as debris, not as a running loop.
+ *
+ * 5 minutes is chosen to sit in the gap between the two clocks it must not
+ * confuse:
+ *   - comfortably ABOVE every legitimate delay — our own longest reschedule is
+ *     60s (`WORKSPACE_FLUSH_BACKOFF_STEPS_SECONDS`' cap) and the SDK's alarm
+ *     loop re-arms at worst every 3 minutes, so a healthy loop is never
+ *     mistaken for a dead one;
+ *   - comfortably BELOW `IDLE_STOP_MS` (10 minutes), so this can never race
+ *     the idle-stop decision or resurrect a loop the idle path just retired.
+ */
+const WORKSPACE_FLUSH_SCHEDULE_STALE_AFTER_MS = 5 * 60_000;
+
+/**
+ * Is the periodic flush loop ACTUALLY still pending — asked of the scheduler's
+ * own rows, never of a flag we maintain alongside them. See
+ * {@link LEGACY_WORKSPACE_FLUSH_LOOP_STARTED_KEY} for the production incident
+ * that made this the only acceptable way to answer the question.
+ *
+ * `Schedule.time` is UNIX SECONDS (the SDK writes `Date.now()/1000 + delay`),
+ * hence the `* 1000`. A row whose `time` is not a finite number is debris from
+ * a corrupt/foreign write and is NOT counted as alive: an unreadable schedule
+ * must never be the reason a workspace stops being persisted.
+ *
+ * Pure and exported so the ONE decision that can turn continuous persistence
+ * off is unit-testable by CALLING it, exactly like `isIdleStopDue`.
+ */
+export function workspaceFlushLoopIsAlive(params: {
+  pendingSchedules: ReadonlyArray<{ time: number }>;
+  nowMs: number;
+}): boolean {
+  return params.pendingSchedules.some(
+    (s) => Number.isFinite(s.time) && s.time * 1000 > params.nowMs - WORKSPACE_FLUSH_SCHEDULE_STALE_AFTER_MS,
+  );
+}
 
 /**
  * Pure idle-stop predicate — no I/O, so this is a real, invokable unit test
@@ -2031,17 +2107,23 @@ export function validateActivityBody(
  *     `ensureWorkspaceHydratedFromR2` above (success OR failure). Remembers
  *     `{prefix, mountPath}` + the hydration-success flag in DO STORAGE
  *     (survives container eviction even though the container filesystem does
- *     not), and — ONLY once hydration has actually succeeded, and only once
- *     per DO lifetime — starts the self-rescheduling flush loop via the
- *     `@cloudflare/containers` SDK's own `schedule()` primitive. This
- *     deliberately does NOT override `alarm()` (the SDK reserves that for
- *     container-lifecycle keepalive — see the `@cloudflare/containers`
- *     README: "Instead of using the default alarm handler, use `schedule()`
- *     instead").
+ *     not), and — ONLY once hydration has actually succeeded, and only when no
+ *     flush cycle is genuinely pending — (re)starts the self-rescheduling
+ *     flush loop via the `@cloudflare/containers` SDK's own `schedule()`
+ *     primitive. "Genuinely pending" is read back OUT of the scheduler
+ *     (`workspaceFlushLoopAlive` -> `listSchedules`), never from a boolean we
+ *     keep alongside it; see `LEGACY_WORKSPACE_FLUSH_LOOP_STARTED_KEY` for the
+ *     measured incident where such a boolean outlived the schedule it
+ *     described and left the loop dead forever. That makes every boot a
+ *     recovery point. This deliberately does NOT override `alarm()` (the SDK
+ *     reserves that for container-lifecycle keepalive — see the
+ *     `@cloudflare/containers` README: "Instead of using the default alarm
+ *     handler, use `schedule()` instead").
  *   - `flushWorkspaceScheduled()` — the callback name `schedule()` invokes.
- *     Runs one flush pass and reschedules itself on most cycles (a failed
- *     flush must not kill the loop — failures are logged loudly via
- *     `bootLog`/`console.error`, never swallowed), with THREE exceptions that
+ *     Runs one flush pass and reschedules itself on most cycles (neither a
+ *     failed flush NOR a thrown one may kill the loop — failures are logged
+ *     loudly via `bootLog`/`console.error`, never swallowed), with THREE
+ *     exceptions that
  *     do neither, checked in order: the sandbox is tombstoned
  *     (`WORKSPACE_TERMINATED_KEY`, unchanged from before), the container is
  *     already not running (`containerIsRunning()` — never resurrect what
@@ -2136,15 +2218,52 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     }
 
     const manifest = await this.readFlushManifest(wctx.mountPath);
-    const outcome = await flushWorkspaceToR2({
-      container: this,
-      bucket,
-      mountPath: wctx.mountPath,
-      realPrefix: wctx.prefix,
-      manifest,
-      hydrationComplete: hydrated,
-      log: (message) => console.error(`[workspace_flush] ${message}`),
-    });
+    let outcome: FlushOutcome;
+    try {
+      outcome = await flushWorkspaceToR2({
+        container: this,
+        bucket,
+        mountPath: wctx.mountPath,
+        realPrefix: wctx.prefix,
+        manifest,
+        hydrationComplete: hydrated,
+        log: (message) => console.error(`[workspace_flush] ${message}`),
+      });
+    } catch (err) {
+      // 🔴 A THROW HERE USED TO KILL THE LOOP PERMANENTLY. `flushWorkspaceToR2`
+      // walks the workspace over container RPCs (`listFiles` in
+      // `walkWorkspaceTree`, then `readFile` per file); a container that goes
+      // away mid-cycle makes those REJECT rather than return. That rejection
+      // propagated out of `flushWorkspaceScheduled`, and
+      // `@cloudflare/containers`' alarm dispatcher responds to a throwing
+      // callback by logging it and then deleting the schedule row anyway —
+      // without rescheduling. One transient RPC failure therefore ended
+      // continuous persistence for that sandbox until the next hydrate.
+      //
+      // Reported as an ordinary FAILED outcome instead, which keeps two
+      // separate contracts intact: the caller reaches its reschedule, and the
+      // idle path's "stop only if the FINAL flush succeeded" rule still sees
+      // `ok: false` — a flush that threw is emphatically not one that worked.
+      // `manifest` is returned unchanged, so nothing is recorded as synced.
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[workspace_flush] flush threw (trigger=${trigger}) — treated as a failed cycle: ${message}`);
+      bootLog('workspace_flush', 'end', {
+        status: 'error',
+        phaseMs: Date.now() - t0,
+        detail: `trigger=${trigger},reason=flush_threw,hydrated=${hydrated}`,
+      });
+      return {
+        ok: false,
+        uploaded: [],
+        skippedUnchanged: 0,
+        skippedIgnored: 0,
+        skippedUnsupported: 0,
+        failed: [],
+        manifest,
+        skippedReason: 'flush_threw',
+        heartbeatWritten: false,
+      };
+    }
     // Persist the updated manifest even on a partial failure — the entries
     // for files that DID upload successfully must not be re-uploaded next
     // cycle; only the failed ones are (deliberately) absent from
@@ -2188,10 +2307,22 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     // sandbox that was terminated once and later re-created under the same
     // deterministic name (the normal case — `deriveSandboxId` is stable).
     await this.ctx.storage.delete(WORKSPACE_TERMINATED_KEY);
+    // Hygiene only — nothing reads this any more. See
+    // `LEGACY_WORKSPACE_FLUSH_LOOP_STARTED_KEY`: sandboxes that booted under
+    // the old code still carry a `true` here, and leaving that orphan lying
+    // around invites someone to trust it again.
+    await this.ctx.storage.delete(LEGACY_WORKSPACE_FLUSH_LOOP_STARTED_KEY);
     if (!params.hydrated) return;
 
-    const started = (await this.ctx.storage.get<boolean>(WORKSPACE_FLUSH_LOOP_STARTED_KEY)) ?? false;
-    if (started) return; // loop already running (or a schedule is already pending) — do not double-schedule
+    // 🔴 SELF-HEALING GATE. Ask the SCHEDULER whether a flush cycle is
+    // genuinely pending; do not ask a boolean we wrote down earlier. The whole
+    // measured failure was a `true` that outlived the schedule row it claimed
+    // to describe (see `LEGACY_WORKSPACE_FLUSH_LOOP_STARTED_KEY`), so every
+    // subsequent boot declined to restart a loop that no longer existed.
+    // Asked here, on every hydrate, this makes a boot the recovery point: if
+    // nothing is pending — for ANY reason, including reasons we have not
+    // thought of — the loop starts again.
+    if (await this.workspaceFlushLoopAlive()) return;
 
     // Fresh container generation, fresh cadence: DO storage (unlike the
     // container filesystem) SURVIVES container recreation, so without this a
@@ -2201,17 +2332,58 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     await this.ctx.storage.delete(WORKSPACE_FLUSH_BACKOFF_SECONDS_KEY);
     await this.ctx.storage.delete(WORKSPACE_FLUSH_LAST_SEEN_ACTIVITY_AT_KEY);
 
-    await this.ctx.storage.put(WORKSPACE_FLUSH_LOOP_STARTED_KEY, true);
+    // Drop whatever rows the previous generation left (a stale past-due one,
+    // or none at all) so the restart below leaves EXACTLY ONE pending cycle
+    // rather than stacking a second loop on top of debris. Only reachable once
+    // the check above has already ruled the loop dead, so this can never
+    // cancel a healthy schedule.
+    try {
+      this.deleteSchedules(WORKSPACE_FLUSH_CALLBACK);
+    } catch (err) {
+      console.error(
+        `[ezil-boot] phase=workspace_flush event=stale_schedule_delete_failed error=${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+
     try {
       await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK);
     } catch (err) {
+      // Nothing to un-set: the next hydrate re-derives liveness from the
+      // scheduler and will simply find nothing pending, so a failed start
+      // retries on its own instead of latching.
       console.error(
         `[ezil-boot] phase=workspace_flush event=schedule_failed error=${err instanceof Error ? err.message : String(err)}`,
       );
-      // Allow a later successful hydrate to retry starting the loop instead
-      // of permanently believing (incorrectly) that it is already running.
-      await this.ctx.storage.put(WORKSPACE_FLUSH_LOOP_STARTED_KEY, false);
     }
+  }
+
+  /**
+   * "Is a periodic flush cycle actually pending?", answered from the SDK's own
+   * `container_schedules` rows via {@link workspaceFlushLoopIsAlive}.
+   *
+   * 🔴 The `catch` returns FALSE (i.e. "dead — restart it") on purpose, and
+   * that direction is load-bearing: a probe that cannot answer must never be
+   * the reason a workspace stops being persisted continuously. The cost of
+   * being wrong in this direction is bounded and self-limiting (a duplicate
+   * schedule row means one extra flush per cycle, and the restart path deletes
+   * pre-existing rows first anyway); the cost of being wrong the other way is
+   * the unbounded, silent data loss this whole change exists to end.
+   */
+  private async workspaceFlushLoopAlive(): Promise<boolean> {
+    let pending: ReadonlyArray<{ time: number }>;
+    try {
+      pending = await this.listSchedules(WORKSPACE_FLUSH_CALLBACK);
+    } catch (err) {
+      console.error(
+        `[ezil-boot] phase=workspace_flush event=list_schedules_failed error=${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return false;
+    }
+    return workspaceFlushLoopIsAlive({ pendingSchedules: pending, nowMs: Date.now() });
   }
 
   /**
@@ -2252,22 +2424,58 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * See `WORKSPACE_TERMINATED_KEY`: the tombstone is checked here as well as
    * cancelled in `destroy()` because a schedule row may already be due/
    * in-flight when destroy runs.
+   *
+   * This outer method is ONLY the survival wrapper — see the `catch` below for
+   * why an escaping throw is the one failure this callback cannot afford. The
+   * decision logic lives in `runScheduledFlushCycle` immediately after it.
    */
   async flushWorkspaceScheduled(): Promise<void> {
+    try {
+      await this.runScheduledFlushCycle();
+    } catch (err) {
+      // 🔴 The SDK's alarm dispatcher deletes this callback's schedule row
+      // after it returns — whether it returned or THREW — and never
+      // reschedules on our behalf. An escaping throw therefore does not fail
+      // one cycle, it ends the loop, and with it continuous persistence (see
+      // `LEGACY_WORKSPACE_FLUSH_LOOP_STARTED_KEY` for the production evidence).
+      // So the loop is re-armed here rather than allowed to die.
+      //
+      // Re-arming is SAFE with respect to every guard above: a schedule row
+      // touches nothing at all. The tombstone check and the `containerIsRunning()`
+      // check both re-run at the top of the next cycle, so a terminated or
+      // stopped sandbox is still refused there — this cannot resurrect a
+      // container, only re-ask the question.
+      console.error(
+        `[ezil-boot] phase=workspace_flush event=cycle_threw error=${err instanceof Error ? err.message : String(err)}`,
+      );
+      try {
+        await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK);
+      } catch (scheduleErr) {
+        console.error(
+          `[ezil-boot] phase=workspace_flush event=reschedule_failed error=${
+            scheduleErr instanceof Error ? scheduleErr.message : String(scheduleErr)
+          }`,
+        );
+      }
+    }
+  }
+
+  /** The real body of {@link flushWorkspaceScheduled} — see that method's doc comment for the ordered contract. */
+  private async runScheduledFlushCycle(): Promise<void> {
     const terminated = (await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)) ?? false;
     if (terminated) {
       bootLog('workspace_flush', 'end', { status: 'skipped', detail: 'terminated,trigger=alarm' });
-      // Leave the loop marked stopped so the next successful hydrate restarts it.
-      await this.ctx.storage.put(WORKSPACE_FLUSH_LOOP_STARTED_KEY, false);
+      // Returning without rescheduling IS how the loop stops: the SDK deletes
+      // this row on the way out, so nothing is pending afterwards and the next
+      // successful hydrate is what restarts it.
       return;
     }
 
     if (!this.containerIsRunning()) {
       bootLog('workspace_flush', 'end', { status: 'skipped', detail: 'not_running,trigger=alarm' });
-      // Same reasoning as the tombstone branch above: leave the loop marked
-      // stopped so the next successful hydrate restarts it — never touch a
-      // container that isn't there.
-      await this.ctx.storage.put(WORKSPACE_FLUSH_LOOP_STARTED_KEY, false);
+      // Same reasoning as the tombstone branch above — never touch a container
+      // that isn't there, and let the absence of a reschedule be the loop's
+      // "stopped" state.
       return;
     }
 
@@ -2315,8 +2523,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         });
         // A NEW, separate state from `WORKSPACE_TERMINATED_KEY` — deliberately
         // NOT written here. See that key's doc comment: the next
-        // `/sandbox/preview` for this sandbox must boot normally.
-        await this.ctx.storage.put(WORKSPACE_FLUSH_LOOP_STARTED_KEY, false);
+        // `/sandbox/preview` for this sandbox must boot normally, which it
+        // does because the absence of a reschedule (below) is the only thing
+        // marking this loop retired.
         try {
           await this.stop();
         } catch (err) {
@@ -2452,11 +2661,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    */
   private async cancelWorkspaceFlushLoop(): Promise<void> {
     await this.ctx.storage.put(WORKSPACE_TERMINATED_KEY, true);
-    await this.ctx.storage.put(WORKSPACE_FLUSH_LOOP_STARTED_KEY, false);
     try {
       // Drops any pending `container_schedules` row for this callback so the
-      // next alarm has nothing to run. Best-effort: the tombstone check at the
-      // top of `flushWorkspaceScheduled` is the backstop if this throws.
+      // next alarm has nothing to run — and, since liveness is now DERIVED
+      // from exactly these rows, this is also what records the loop as
+      // stopped. Best-effort: the tombstone check at the top of
+      // `flushWorkspaceScheduled` is the backstop if this throws.
       this.deleteSchedules(WORKSPACE_FLUSH_CALLBACK);
     } catch (err) {
       console.error(
@@ -3269,21 +3479,43 @@ async function handlePreview(
 
     // EXPLICIT flush before handing the ready preview URL back to the caller
     // (in addition to the alarm-driven periodic flush — see
-    // `EzilSandboxDO.flushWorkspaceNow`'s doc comment). This is the last
-    // point control is inside the Worker before the browser/user takes over;
-    // closing the gap here bounds the worst case to "the alarm-driven 10s
-    // cadence", not "however long until the next preview call happens to run
-    // ensureWorkspaceMount again". Best-effort and non-blocking-of-failure:
-    // a flush error here must never fail the preview response — logged
-    // loudly instead (never a bare `catch {}`).
-    try {
-      await sandbox.flushWorkspaceNow();
-    } catch (err) {
+    // `EzilSandboxDO.flushWorkspaceNow`'s doc comment). Closes the gap so the
+    // worst-case staleness is bounded to "the alarm-driven 10s cadence", not
+    // "however long until the next preview call happens to run
+    // ensureWorkspaceMount again". Best-effort and non-blocking-of-failure: a
+    // flush error here must never fail the preview response — logged loudly
+    // instead (never a bare `catch {}`).
+    //
+    // 🔴 PERF (z2-mint-latency): measured live against an ALREADY-RUNNING
+    // container, this RPC alone cost 441-754ms (median ~580ms across 6 warm
+    // production mints, `wrangler tail` on `ezil-os-worker`) — 15-27% of the
+    // Worker's own wall time on the warm path, paid synchronously before the
+    // response, even though the response (a streaming-desktop URL) has no
+    // dependency on R2 durability. The flush writes local container files TO
+    // R2; it reads nothing the caller's response needs. So it is handed to
+    // `ctx.waitUntil()` — the EXACT same "run to completion, don't make the
+    // response wait for it" contract `spoolTelemetry()` below already uses —
+    // instead of being awaited inline. This does NOT weaken the staleness
+    // bound described above: `waitUntil()` guarantees the flush still runs to
+    // completion on the same cadence as before, it just no longer blocks the
+    // bytes the browser is waiting on. Unlike `spoolTelemetry` (which is
+    // allowed to be silently dropped when `ctx` is absent), a dropped
+    // workspace flush is a real durability loss, so the ORIGINAL inline
+    // `await` is kept as the fallback for any caller that has no
+    // `ExecutionContext` (test harnesses calling the handler with 2 args) —
+    // see `route-auth.test.ts`'s "pre-handoff flush deferral" suite for both
+    // branches, mutation-tested.
+    const flushOutcome = sandbox.flushWorkspaceNow().catch((err) => {
       console.error(
         `[handlePreview] pre-handoff flushWorkspaceNow failed (sandboxId=${sandboxId}): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
+    });
+    if (ctx?.waitUntil) {
+      ctx.waitUntil(flushOutcome);
+    } else {
+      await flushOutcome;
     }
 
     const response = json({
