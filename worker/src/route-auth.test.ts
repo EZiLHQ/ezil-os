@@ -49,8 +49,6 @@ interface CallLog {
   restartDesktopStack: Array<{ hostname: string; sandboxId: string; explicitMode: unknown; fallbackMode: unknown }>;
   destroy: number;
   flushWorkspaceNow: number;
-  /** Every `recordActivity(lastInputAgoMs)` the route table actually made. */
-  recordActivity: number[];
   getExposedPorts: number;
   exec: number;
   /** Every `containerFetch(url, init, port)` the route table actually made. */
@@ -132,6 +130,14 @@ function fakeSandboxNamespace(options: {
    * test prove boot-phase data actually reaches `spoolTelemetry()`.
    */
   containerTelemetryNdjson?: string;
+  /**
+   * Override the fake `flushWorkspaceNow` RPC's own behavior — e.g. a
+   * deferred promise the test resolves manually, to prove `/sandbox/preview`
+   * does or doesn't wait on it (z2-mint-latency: it must NOT, when `ctx` is
+   * present). Still counted in `calls.flushWorkspaceNow` exactly like the
+   * default. Defaults to an immediately-resolved `{}`.
+   */
+  flushWorkspaceNow?: () => Promise<unknown>;
 }): { binding: unknown; calls: CallLog } {
   /** The sandbox id the Worker actually opened the DO with. */
   let openedWith = SANDBOX_NAME;
@@ -140,7 +146,6 @@ function fakeSandboxNamespace(options: {
     restartDesktopStack: [],
     destroy: 0,
     flushWorkspaceNow: 0,
-    recordActivity: [],
     getExposedPorts: 0,
     exec: 0,
     containerFetch: [],
@@ -247,11 +252,7 @@ function fakeSandboxNamespace(options: {
     },
     flushWorkspaceNow: async () => {
       calls.flushWorkspaceNow++;
-      return {};
-    },
-    recordActivity: async (...args: unknown[]) => {
-      const [lastInputAgoMs] = args as [number];
-      calls.recordActivity.push(lastInputAgoMs);
+      return options.flushWorkspaceNow ? await options.flushWorkspaceNow() : {};
     },
     getExposedPorts: async () => {
       calls.getExposedPorts++;
@@ -319,14 +320,14 @@ function fakeSandboxNamespace(options: {
   };
 }
 
-async function loadWorker(): Promise<{ fetch(request: Request, env: unknown): Promise<Response> }> {
+async function loadWorker(): Promise<{ fetch(request: Request, env: unknown, ctx?: ExecutionContext): Promise<Response> }> {
   const mod = (await import('./index')) as unknown as {
-    default: { fetch(request: Request, env: unknown): Promise<Response> };
+    default: { fetch(request: Request, env: unknown, ctx?: ExecutionContext): Promise<Response> };
   };
   return mod.default;
 }
 
-let worker: { fetch(request: Request, env: unknown): Promise<Response> };
+let worker: { fetch(request: Request, env: unknown, ctx?: ExecutionContext): Promise<Response> };
 
 beforeEach(async () => {
   worker = await loadWorker();
@@ -853,155 +854,6 @@ describe('POST /sandbox/:name/focus is HMAC-gated with a closed-enum `app`', () 
   });
 });
 
-// ── POST /sandbox/:name/activity ─────────────────────────────────────────────
-// The idle-stop heartbeat added alongside the container-billing fix (see
-// BILLING-BRIEF.md / `worker/src/index.ts`'s `LAST_ACTIVITY_AT_KEY`). Same
-// shared-HMAC envelope as every other control route. The load-bearing
-// property this block proves — beyond auth/kill-switch, which mirror
-// `/focus` — is the NEGATIVE one: this route must NEVER touch the container
-// (`calls.exec` / `calls.containerFetch` must stay exactly 0 on every path,
-// success or failure), because an endpoint whose whole purpose is helping
-// decide when to STOP a container would defeat itself if it could wake one.
-
-describe('POST /sandbox/:name/activity is HMAC-gated and never touches the container', () => {
-  it('REJECTS an unsigned request with 401 and never calls the DO', async () => {
-    const { binding, calls } = fakeSandboxNamespace({});
-    const res = await worker.fetch(
-      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
-        method: 'POST',
-        body: JSON.stringify({ lastInputAgoMs: 1000 }),
-      }),
-      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
-    );
-    expect(res.status).toBe(401);
-    expect(calls.recordActivity.length).toBe(0);
-    expect(calls.exec).toBe(0);
-    expect(calls.containerFetch.length).toBe(0);
-  });
-
-  it('ACCEPTS a signed request via `Authorization: Bearer` and records activity, touching nothing else', async () => {
-    const { binding, calls } = fakeSandboxNamespace({});
-    const res = await worker.fetch(
-      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${await mintToken()}` },
-        body: JSON.stringify({ lastInputAgoMs: 4321 }),
-      }),
-      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
-    );
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as Record<string, unknown>;
-    expect(body.ok).toBe(true);
-    expect(body.sandboxId).toBe(SANDBOX_NAME);
-    expect(calls.recordActivity).toEqual([4321]);
-    // The whole point: no container RPC of any kind.
-    expect(calls.exec).toBe(0);
-    expect(calls.containerFetch.length).toBe(0);
-    expect(calls.terminateSandbox).toBe(0);
-    expect(calls.flushWorkspaceNow).toBe(0);
-  });
-
-  it('ACCEPTS a signed request via `?token=` (the /preview-bootstrap precedent)', async () => {
-    const { binding, calls } = fakeSandboxNamespace({});
-    const token = encodeURIComponent(await mintToken());
-    const res = await worker.fetch(
-      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity?token=${token}`, {
-        method: 'POST',
-        body: JSON.stringify({ lastInputAgoMs: 0 }),
-      }),
-      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
-    );
-    expect(res.status).toBe(200);
-    expect(calls.recordActivity).toEqual([0]);
-  });
-
-  it('rejects a token signed with the WRONG secret', async () => {
-    const { binding, calls } = fakeSandboxNamespace({});
-    const res = await worker.fetch(
-      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${await mintToken('a-different-secret')}` },
-        body: JSON.stringify({ lastInputAgoMs: 100 }),
-      }),
-      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
-    );
-    expect(res.status).toBe(401);
-    expect(calls.recordActivity.length).toBe(0);
-  });
-
-  it('REJECTS a missing lastInputAgoMs, even when properly signed', async () => {
-    const { binding, calls } = fakeSandboxNamespace({});
-    const res = await worker.fetch(
-      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${await mintToken()}` },
-        body: JSON.stringify({}),
-      }),
-      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
-    );
-    expect(res.status).toBe(400);
-    expect(calls.recordActivity.length).toBe(0);
-  });
-
-  it('REJECTS a negative lastInputAgoMs rather than clamping it, even when properly signed', async () => {
-    const { binding, calls } = fakeSandboxNamespace({});
-    const res = await worker.fetch(
-      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${await mintToken()}` },
-        body: JSON.stringify({ lastInputAgoMs: -1 }),
-      }),
-      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
-    );
-    expect(res.status).toBe(400);
-    expect((await res.json() as { error: string }).error).toContain('non_negative');
-    expect(calls.recordActivity.length).toBe(0);
-  });
-
-  it('the kill switch (SANDBOX_ACTIVITY=off) hard-disables the route with a 404, before auth runs', async () => {
-    const { binding, calls } = fakeSandboxNamespace({});
-    const res = await worker.fetch(
-      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${await mintToken()}` },
-        body: JSON.stringify({ lastInputAgoMs: 100 }),
-      }),
-      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_ACTIVITY: 'off' },
-    );
-    expect(res.status).toBe(404);
-    expect(calls.recordActivity.length).toBe(0);
-  });
-
-  it('still works keyless in local dev (no secret configured), unchanged', async () => {
-    const { binding, calls } = fakeSandboxNamespace({});
-    const res = await worker.fetch(
-      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
-        method: 'POST',
-        body: JSON.stringify({ lastInputAgoMs: 500 }),
-      }),
-      { Sandbox: binding },
-    );
-    expect(res.status).toBe(200);
-    expect(calls.recordActivity).toEqual([500]);
-  });
-
-  it('never calls terminateSandbox, destroy, or flushWorkspaceNow — activity is a pure signal, not a lifecycle action', async () => {
-    const { binding, calls } = fakeSandboxNamespace({});
-    await worker.fetch(
-      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity`, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${await mintToken()}` },
-        body: JSON.stringify({ lastInputAgoMs: 42 }),
-      }),
-      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
-    );
-    expect(calls.terminateSandbox).toBe(0);
-    expect(calls.destroy).toBe(0);
-    expect(calls.flushWorkspaceNow).toBe(0);
-    expect(calls.getExposedPorts).toBe(0);
-  });
-});
-
 // ── POST /sandbox/:name/restart ──────────────────────────────────────────────
 // Same shared-HMAC envelope as `DELETE /sandbox/:name` and `/focus`. The DO's
 // OWN restart logic (SIGTERM reusing terminate_stack, stop-confirm polling,
@@ -1286,6 +1138,117 @@ describe('POST /sandbox/preview returns appPreviewUrl + codePreviewUrl', () => {
     // …and the failure is surfaced, not swallowed.
     expect((body.codePreviewExpose as { attempted: boolean; exposed: boolean }).attempted).toBe(true);
     expect((body.codePreviewExpose as { attempted: boolean; exposed: boolean }).exposed).toBe(false);
+  });
+});
+
+// ── z2-mint-latency: pre-handoff flush must not block a WARM response ───────
+//
+// Measured live against an already-running production container (see
+// scratchpad report), the pre-handoff `flushWorkspaceNow()` RPC alone cost
+// 441-754ms on a warm `/sandbox/preview` call, paid synchronously before the
+// response even though the response has no dependency on it (it hands back a
+// streaming-desktop URL; the flush only pushes local files TO R2 for
+// durability). It is now handed to `ctx.waitUntil()` when available — same
+// contract `spoolTelemetry()` already uses — with an inline `await` fallback
+// preserved for any caller with no `ExecutionContext` (so a dropped flush
+// stays impossible, only its position relative to the response changes).
+//
+// Both directions are proven with a CONTROLLABLE flush (a promise the test
+// resolves by hand) rather than a timer, so there is no flakiness window:
+//   - with ctx: the response promise must settle on its own, `deferred.resolve()`
+//     is called strictly AFTER awaiting it — if the code regressed to an
+//     inline `await`, this test would time out, not merely mis-assert.
+//   - without ctx: the response promise must NOT have settled ahead of a
+//     Promise.resolve() sentinel, proving it is still gated on the flush.
+describe('POST /sandbox/preview: pre-handoff flush deferral (z2-mint-latency)', () => {
+  const host = 'ezil.org';
+  const id = 'guac-flushflushflush-deferdeferdefer';
+
+  function makeDeferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((res) => {
+      resolve = res;
+    });
+    return { promise, resolve };
+  }
+
+  function warmSandboxWithControllableFlush(order: string[], deferred: { promise: Promise<void> }) {
+    return fakeSandboxNamespace({
+      exposedPorts: [{ port: 8181, url: `https://8181-${id}-nekodesktop.${host}`, status: 'open' }],
+      flushWorkspaceNow: async () => {
+        await deferred.promise;
+        order.push('flush');
+        return {};
+      },
+    });
+  }
+
+  async function signedPreviewRequest(): Promise<Request> {
+    return new Request('https://api-desktop.ezil.org/sandbox/preview', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: await mintToken(), projectId: 'proj-1', userId: 'user-1', desktopMode: 'neko' }),
+    });
+  }
+
+  it('WITH ctx.waitUntil: the response resolves without waiting for the flush', async () => {
+    const order: string[] = [];
+    const deferred = makeDeferred();
+    const { binding, calls } = warmSandboxWithControllableFlush(order, deferred);
+    const waited: Array<Promise<unknown>> = [];
+    const ctx = { waitUntil: (p: Promise<unknown>) => waited.push(p) } as unknown as ExecutionContext;
+
+    const res = await worker.fetch(
+      await signedPreviewRequest(),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+      ctx,
+    );
+    order.push('response');
+
+    expect(res.status).toBe(200);
+    // The response landed strictly BEFORE the flush did — order is exactly
+    // ['response'] at this point because `deferred.resolve()` has not been
+    // called yet, so 'flush' cannot possibly be in `order` unless the flush
+    // was awaited inline (the regression this test exists to catch).
+    expect(order).toEqual(['response']);
+    // …but the flush was genuinely started, not dropped —
+    expect(calls.flushWorkspaceNow).toBe(1);
+    // — and handed to ctx.waitUntil() so the runtime keeps it alive.
+    expect(waited).toHaveLength(1);
+
+    // Let it finish and prove it really does run to completion.
+    deferred.resolve();
+    await waited[0];
+    expect(order).toEqual(['response', 'flush']);
+  });
+
+  it('WITHOUT ctx (mutation: force the fast path off): the response still WAITS for the flush', async () => {
+    const order: string[] = [];
+    const deferred = makeDeferred();
+    const { binding, calls } = warmSandboxWithControllableFlush(order, deferred);
+
+    // No third `ctx` argument — the exact call shape every other test in this
+    // file already uses (a caller with no ExecutionContext).
+    const resPromise = worker
+      .fetch(await signedPreviewRequest(), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET })
+      .then((res) => {
+        order.push('response');
+        return res;
+      });
+
+    // Race against an already-resolved sentinel: if the response had already
+    // settled (or settles within this microtask turn), 'response' wins. It
+    // must not — the fallback path is still gated on the flush.
+    const winner = await Promise.race([resPromise.then(() => 'response'), Promise.resolve('not-yet')]);
+    expect(winner).toBe('not-yet');
+    expect(order).toEqual([]);
+
+    deferred.resolve();
+    const res = await resPromise;
+    expect(res.status).toBe(200);
+    // Flush completed BEFORE the response — the original blocking contract.
+    expect(order).toEqual(['flush', 'response']);
+    expect(calls.flushWorkspaceNow).toBe(1);
   });
 });
 
@@ -1614,7 +1577,7 @@ const CODE_HOST = `8443-${SANDBOX_NAME}-code.ezil.org`;
 const APP_HOST = `3002-${SANDBOX_NAME}-app.ezil.org`;
 
 async function bootstrapCodeHost(
-  worker: { fetch(request: Request, env: unknown): Promise<Response> },
+  worker: { fetch(request: Request, env: unknown, ctx?: ExecutionContext): Promise<Response> },
   binding: unknown,
 ): Promise<{ cookie: string; fallbackParam: string; location: string; res: Response }> {
   const { mintPreviewBootstrapToken } = await import('./hmac');
@@ -1952,7 +1915,6 @@ describe('no other mutating route is reachable unauthenticated', () => {
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/twen` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart` },
-      { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/activity` },
       { method: 'POST', url: `https://api-desktop.ezil.org/project-files/put` },
       { method: 'POST', url: `https://api-desktop.ezil.org/project-files/delete` },
       { method: 'POST', url: `https://api-desktop.ezil.org/project-files/list` },
@@ -1968,13 +1930,7 @@ describe('no other mutating route is reachable unauthenticated', () => {
       expect(`${method} ${new URL(url).pathname} -> ${res.status}`).toBe(
         `${method} ${new URL(url).pathname} -> 401`,
       );
-      expect(
-        calls.terminateSandbox +
-          calls.destroy +
-          calls.exec +
-          calls.restartDesktopStack.length +
-          calls.recordActivity.length,
-      ).toBe(0);
+      expect(calls.terminateSandbox + calls.destroy + calls.exec + calls.restartDesktopStack.length).toBe(0);
     }
   });
 

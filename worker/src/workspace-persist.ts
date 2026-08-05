@@ -459,7 +459,14 @@ export interface FlushOutcome {
   failed: Array<{ relPath: string; error: string }>;
   /** Updated manifest the caller should persist for the next flush cycle. */
   manifest: FlushManifest;
-  skippedReason?: 'hydration_incomplete' | 'empty_prefix';
+  /**
+   * `'flush_threw'` is never produced by `flushWorkspaceToR2` itself — it is
+   * the caller-side (`EzilSandboxDO.runWorkspaceFlush`) rendering of "this
+   * cycle raised instead of returning", so a thrown container RPC is reported
+   * as an ordinary FAILED outcome rather than escaping. See that method for
+   * why an escaping throw silently killed the periodic flush loop.
+   */
+  skippedReason?: 'hydration_incomplete' | 'empty_prefix' | 'flush_threw';
   /** True iff the `.ezil-heartbeat` liveness object was written this cycle (see `WORKSPACE_HEARTBEAT_FILENAME`). */
   heartbeatWritten: boolean;
 }
