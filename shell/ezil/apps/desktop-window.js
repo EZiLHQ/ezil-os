@@ -186,6 +186,16 @@ const FRAME_CONFIRM_RETRY_MS = 1_500;
  * blank verdict to stand at the deadline. Without this the flag was STICKY: one
  * `blank` at t=1s followed by 44 seconds of unanswerable probe still hid the
  * desktop, on evidence that was a minute stale. Two poll cycles.
+ *
+ * 🔴 z1: `session.confirmDisplay` NOW HOLDS SERVER-SIDE (see its own header in
+ * `session.js`) before answering, so the common case — a peer that connects
+ * within a few seconds of navigation — settles this whole gate on the FIRST
+ * `ask()` below, no `DISPLAY_POLL_MS` wait ever spent. Nothing about this
+ * loop's own shape changed: `ask()` still schedules the next attempt only
+ * after the previous one resolves, `unverified`/`blank` are still independent
+ * TIMERS (see their own comments), and a server that does not hold (older
+ * deployment) degrades to exactly today's cadence — this is a pure
+ * latency win on the common path, not a new mechanism the client depends on.
  */
 const DISPLAY_POLL_MS = 1_000;
 const DISPLAY_POLL_SLOW_MS = 2_000;
