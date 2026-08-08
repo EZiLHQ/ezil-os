@@ -73,16 +73,43 @@ body.device-phone {
  * boot that is a white rectangle behind a dark panel; for the frame between
  * `iframe.src = ...` and the desktop's first paint it is a white flash. */
 .ezil-desktop-window .window-body {
-    background-color: #101111;
-    /* The boot panel is positioned against this. `.window { contain: paint }`
-       already makes the window a containing block, but the panel must anchor
-       to the BODY, not the window, so it never covers the control drawer. */
+    /* MODIFIED BY EZIL 2026-08-08: `var(--color-charcoal)`, was a hardcoded
+       `#101111` — a fifth near-black that was not any of the four colours in
+       the brand palette. This surface is now doing real work: it is the
+       LETTERBOX. `fit_stream` (`../apps/desktop-window.js`) sizes the stream
+       iframe to the largest 16:9 box that fits and centres it, so whatever
+       margin the window's shape leaves over is this colour — the OS's own
+       charcoal, continuous with the rest of the chrome, rather than a black
+       bar drawn by a third-party page inside the iframe. */
+    background-color: var(--color-charcoal);
+    /* The boot panel is positioned against this — AND, since 2026-08-08, so is
+       the stream iframe, which `fit_stream` places with explicit `left`/`top`.
+       `.window { contain: paint }` already makes the window a containing
+       block, but both must anchor to the BODY, not the window, so neither ever
+       covers the control drawer. */
     position: relative;
     overflow: hidden;
 }
 
+/* 🔴 The stream iframe is POSITIONED, not stretched.
+ * `style.css`'s `.window-app-iframe { width: 100%; height: 100% }` hands the
+ * neko client a box of whatever shape the window happens to be; the stream
+ * inside it is pinned to 1920x1080 on the server (see `desktop-window.js`), so
+ * every non-16:9 window made the client letterbox the picture itself, in its
+ * own black, inside our window.
+ *
+ * `fit_stream` writes the width/height/left/top instead. These declarations
+ * are only what makes those writes meaningful (absolute, so left/top place it)
+ * plus the pre-measurement fallback: `width`/`height` stay 100% here so that
+ * the frame between window creation and the observer's first callback shows a
+ * full-size box rather than an iframe's 300x150 intrinsic default. */
 .ezil-desktop-window .window-app-iframe {
-    background-color: #101111;
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background-color: var(--color-charcoal);
 }
 
 /* ── the boot panel ───────────────────────────────────────────────────────
@@ -554,4 +581,203 @@ body.device-phone {
         + 2px * (var(--btn-count, 2) - 1)
         + 10px
     );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * WINDOW CONTROLS — close / minimise / expand
+ * ADDED BY EZIL 2026-08-08.
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Upstream Puter's three titlebar controls are grey `<img>` glyphs whose only
+ * state is opacity, and the opacity is applied TWICE — `.window-action-btn`
+ * at 0.6 and its own `img` at 0.5 — so an unfocused window's controls compute
+ * to 0.30 and are, MEASURED in Chromium on this fork's dark chrome, very
+ * nearly invisible. They also have no hover target of their own (the hover
+ * rule is on the img), no `cursor: pointer` (`style.css`'s
+ * `.window-head * { cursor: default }` suppresses it), no focus ring, no
+ * pressed state, and no way to tell close apart from the other two until you
+ * have already clicked it. This block replaces that presentation with the
+ * one every user of a desktop OS already knows.
+ *
+ * 🔴 PRESENTATION ONLY. Not one line here changes what a control DOES, and
+ * the markup is untouched: `UIWindow.js` still emits the same three
+ * `.window-action-btn` spans, in the same DOM order (minimize, scale, close),
+ * still as direct children of `.window-head`, still each wrapping the same
+ * `window.icons[...]` `<img>`. That matters — this file may not break
+ * `UIWindow.js`'s `#window-N > .window-head > .window-close-btn` bindings,
+ * `scale_window`'s `.window-scale-btn>img` src swap, or
+ * `stacking-browser-test.mjs`'s `.window-action-btn` hit-testing. The visual
+ * left-to-right order is CSS `order`; the `<img>` is hidden, not removed;
+ * and the group-hover reveal is `:has()` rather than a wrapper element, all
+ * three so that no live selector has to change.
+ *
+ * These rules live here, not in `style.css`, because they are EZiL-authored
+ * chrome and `build-shell.sh` concatenates `shell/ezil/**` last — so equal
+ * specificity wins on source order without any `!important`. */
+
+.window-head {
+    align-items: center;
+    padding-left: var(--win-ctl-gap);
+}
+
+/* The disc. */
+.window-action-btn {
+    /* Reset upstream's box: it used asymmetric margins and a padding-bottom to
+       nudge a 15-18px glyph into a 30px strip. */
+    margin: 0 var(--win-ctl-gap) 0 0;
+    padding: 0;
+    width: var(--win-ctl-size);
+    height: var(--win-ctl-size);
+    flex: 0 0 auto;
+    border-radius: 50%;
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    /* Upstream's 0.6-and-then-0.5 opacity is gone. An unfocused window is now
+       said with COLOUR (grey discs, below), which is legible; 30% opacity is
+       not. */
+    opacity: 1;
+    background-color: var(--win-ctl-idle);
+    /* Keeps a light disc from bleeding into a light titlebar, and gives the
+       grey idle disc an edge on the dark one. */
+    box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.35);
+    cursor: pointer;
+    transition: background-color 120ms ease;
+    /* The hover glyph. `ui-sans-serif` first so the arrows and the minus come
+       from the system UI face at these very small sizes. */
+    font: 600 10px/1 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    color: var(--win-ctl-glyph);
+}
+
+/* 🔴 The hit target, which is NOT the disc.
+ * A 12px circle is a 12px circle whatever it looks like, and 12px is well
+ * under any reasonable pointer target. This grows the clickable area to 24x24
+ * without moving the disc or changing the layout — the same trick a real OS
+ * uses, and the reason its traffic lights are easy to hit despite being tiny.
+ * 24px still fits inside the 30px head, so nothing overflows it. */
+.window-action-btn::after {
+    content: '';
+    position: absolute;
+    inset: -6px;
+}
+
+/* Upstream's glyph image. Kept in the DOM (`scale_window` swaps its `src`,
+   and removing it would mean editing Puter-derived markup for nothing) and
+   hidden, because the disc IS the control now. */
+.window-action-btn > img {
+    display: none;
+}
+
+/* 🔴 Left-to-right: close, minimise, expand, then the title.
+ * Ordering only — the DOM order is still upstream's minimize/scale/close, so
+ * every direct-child selector in `UIWindow.js` still matches. `.window-head`
+ * is already `display: flex`, which is what makes `order` available. */
+.window-close-btn    { order: 1; }
+.window-minimize-btn { order: 2; }
+.window-scale-btn    { order: 3; }
+.window-head-draggable {
+    order: 4;
+    /* Centre the title over the WHOLE titlebar, not over the space left after
+       the controls: the left inset is `padding-left + 3 discs + 3 gaps`, so an
+       equal right inset puts the midpoint back at the centre of the head.
+       (`.window-head`'s padding-left is one `--win-ctl-gap`, hence the 4.) */
+    padding-right: calc(3 * var(--win-ctl-size) + 4 * var(--win-ctl-gap));
+    justify-content: center;
+    align-items: center;
+    min-width: 0;
+}
+
+/* The app icon and title now sit in one centred group. */
+.window-head-icon {
+    float: none;
+    margin: 0 6px 0 0;
+    flex: 0 0 auto;
+}
+.window-head-title {
+    float: none;
+    margin-left: 0;
+    font-weight: 590;
+    font-size: 13px;
+    letter-spacing: 0.01em;
+    /* Unfocused titles recede, like every other OS. */
+    opacity: 0.62;
+}
+.window-active .window-head-title {
+    opacity: 1;
+}
+
+/* 🔴 Colour is the focus signal, and it is the ONLY thing that distinguishes
+ * the three. A user who has ever used a Mac already knows which one is close;
+ * that prior knowledge is the whole point of matching the convention. */
+.window-active .window-close-btn    { background-color: var(--win-ctl-close); }
+.window-active .window-minimize-btn { background-color: var(--win-ctl-minimise); }
+.window-active .window-scale-btn    { background-color: var(--win-ctl-expand); }
+
+/* The hover glyphs. Hidden until the pointer is over the control GROUP —
+ * `:has()`, so hovering any one of the three reveals all three, which is the
+ * behaviour being imitated and is also what makes them readable as a set.
+ * `:has()` is already relied on by `style.css`'s taskbar hover rule, so this
+ * adds no new browser requirement. */
+.window-action-btn::before {
+    opacity: 0;
+    transition: opacity 90ms ease;
+    /* Above the ::after hit pad, which is a transparent sibling box. */
+    position: relative;
+    z-index: 1;
+    pointer-events: none;
+}
+.window-head:has(.window-action-btn:hover) .window-action-btn::before,
+.window-action-btn:focus-visible::before {
+    opacity: 1;
+}
+.window-close-btn::before    { content: '\00d7'; font-size: 13px; }
+.window-minimize-btn::before { content: '\2212'; font-size: 11px; }
+.window-scale-btn::before    { content: '\002b'; font-size: 12px; }
+
+/* Pressed. A real control answers the mouse down, not just the mouse up. */
+.window-action-btn:active {
+    filter: brightness(0.82);
+}
+
+/* 🔴 Keyboard. These carry `role="button" tabindex="0"` and a keydown handler
+ * (`UIWindow.js`), so they are genuine tab stops and must show where focus
+ * is — an invisible focus ring is the same bug as no focus at all. */
+.window-action-btn:focus-visible {
+    outline: 2px solid var(--color-teal);
+    outline-offset: 2px;
+}
+
+/* An inactive window still answers the pointer: colour on hover tells the
+ * user the control is live before they commit to clicking it. */
+.window:not(.window-active) .window-head:has(.window-action-btn:hover) .window-close-btn    { background-color: var(--win-ctl-close); }
+.window:not(.window-active) .window-head:has(.window-action-btn:hover) .window-minimize-btn { background-color: var(--win-ctl-minimise); }
+.window:not(.window-active) .window-head:has(.window-action-btn:hover) .window-scale-btn    { background-color: var(--win-ctl-expand); }
+
+/* Phones: `style.css` hides the expand control entirely there, and the head
+ * padding-right maths above must not then leave the title off-centre. */
+.device-phone .window-head-draggable,
+.device-tablet .window-head-draggable {
+    padding-right: calc(2 * var(--win-ctl-size) + 3 * var(--win-ctl-gap));
+}
+
+/* 🔴 `style.css`'s `.window-head { filter: grayscale(80%) }` (undone by
+ * `.window-active .window-head { filter: none !important }`) is upstream's way
+ * of recessing an unfocused titlebar. On Puter's LIGHT chrome it desaturates a
+ * blue-grey bar; on EZiL's dark chrome the bar has essentially no colour to
+ * remove, so the only things it actually greyed out were the app icon and —
+ * once the discs above existed — the hover reveal, which came out muddy
+ * brown/olive instead of red/amber/green. MEASURED in Chromium: an unfocused
+ * window's hovered close control rendered ~#6b4a48 rather than #ff5f57.
+ *
+ * The recede is not lost, it moved to where it is legible: an unfocused
+ * window's discs are grey (`--win-ctl-idle`) and its title drops to 0.62
+ * opacity, both above.
+ *
+ * 🔴 `grayscale(0%)`, deliberately NOT `none`. Any filter other than `none`
+ * makes an element a stacking context and a containing block. Keeping one here
+ * means an unfocused `.window-head` forms exactly the same stacking context it
+ * formed before this change, so nothing in `stacking-browser-test.mjs`'s
+ * z-order model shifts — this rule changes colour and only colour. */
+.window-head {
+    filter: grayscale(0%);
 }

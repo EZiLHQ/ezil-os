@@ -352,20 +352,48 @@ async function UIWindow (options) {
             h += '<img class="window-head-icon" />';
         }
         // title
-        h += `<span class="window-head-title" title="${html_encode(options.title)}"></span>`;
+        // MODIFIED BY EZIL 2026-08-08: the tooltip is `title_tooltip` when the
+        // caller supplies one, so a window can be TITLED after its app (which
+        // is what a titlebar is for) while still naming the machine it belongs
+        // to on hover. `desktop-window.js` / `code.js` / `preview.js` all pass
+        // one; everything else falls through to the old behaviour unchanged.
+        h += `<span class="window-head-title" title="${html_encode(options.title_tooltip ?? options.title)}"></span>`;
         h += '</div>';
+        // ── the three window controls ──────────────────────────────────────
+        // MODIFIED BY EZIL 2026-08-08. The markup is deliberately the SAME
+        // shape as upstream's — one `.window-action-btn` span per control,
+        // each wrapping the same `window.icons[...]` `<img>`, in the same DOM
+        // order (minimize, scale, close), still direct children of
+        // `.window-head`. Three things in this file bind by DIRECT-CHILD
+        // selector (`#window-N > .window-head > .window-close-btn` at the
+        // click handlers below, and `el_window_head_scale_btn` at the element
+        // lookups), `scale_window` swaps the scale `<img>`'s `src`, and
+        // `stacking-browser-test.mjs` hit-tests `.window-action-btn` — so
+        // introducing a wrapper element or dropping the `<img>` would break
+        // live code and tests for a purely visual gain. The Apple-style
+        // traffic-light presentation is done entirely in CSS
+        // (`.window-action-btn` in `style.css`), which hides the `<img>` and
+        // draws the disc + hover glyph; group-hover is `:has()`, not a
+        // wrapper, for exactly the same reason.
+        //
+        // What IS new here is affordance, which upstream never had: these
+        // were bare `<span>`s with no role, no name, and no tab stop, so a
+        // screen reader announced nothing and a keyboard could not reach
+        // close/minimise/maximise at all.
+        const btn_attrs = (cls, label) =>
+            `class="window-action-btn ${cls}" role="button" tabindex="0" aria-label="${html_encode(label)}" title="${html_encode(label)}"`;
         // Minimize button, only if window is resizable and not embedded
         if ( options.is_resizable && options.show_minimize_button && !window.is_embedded )
         {
-            h += `<span class="window-action-btn window-minimize-btn" style="margin-left:0;"><img src="${html_encode(window.icons['minimize.svg'])}" draggable="false"></span>`;
+            h += `<span ${btn_attrs('window-minimize-btn', i18n('minimize'))}><img src="${html_encode(window.icons['minimize.svg'])}" draggable="false"></span>`;
         }
         // Maximize button
         if ( options.is_resizable && options.show_maximize_button )
         {
-            h += `<span class="window-action-btn window-scale-btn"><img src="${html_encode(window.icons['scale.svg'])}" draggable="false"></span>`;
+            h += `<span ${btn_attrs('window-scale-btn', 'Expand')}><img src="${html_encode(window.icons['scale.svg'])}" draggable="false"></span>`;
         }
         // Close button
-        h += `<span class="window-action-btn window-close-btn"><img src="${html_encode(window.icons['close.svg'])}" draggable="false"></span>`;
+        h += `<span ${btn_attrs('window-close-btn', 'Close')}><img src="${html_encode(window.icons['close.svg'])}" draggable="false"></span>`;
         h += '</div>';
     }
 
@@ -1887,6 +1915,24 @@ async function UIWindow (options) {
     // --------------------------------------------------------
     $(`#window-${win_id} > .window-head > .window-minimize-btn`).click(function () {
         minimize_window(el_window);
+    });
+
+    // --------------------------------------------------------
+    // Keyboard activation for the three window controls
+    // --------------------------------------------------------
+    // ADDED BY EZIL 2026-08-08. The controls are `role="button"
+    // tabindex="0"` (see the head markup above), which promises a keyboard
+    // user that Enter and Space do what a click does. `<span>` gives no such
+    // behaviour for free — only a real `<button>` does — so without this the
+    // tab stop is a dead end: focusable, announced as a button, and inert.
+    // Delegated from the head so it covers whichever of the three this
+    // window actually rendered, and `preventDefault` on Space stops the page
+    // scrolling instead.
+    $(`#window-${win_id} > .window-head`).on('keydown', '.window-action-btn', function (e) {
+        if ( e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar' ) return;
+        e.preventDefault();
+        e.stopPropagation();
+        $(this).trigger('click');
     });
 
     // --------------------------------------------------------
@@ -3826,6 +3872,10 @@ async function close_one_window (options) {
             // above, before any `await`), so `exit_fullpage_mode` itself
             // skips the geometry reset for this call — a window mid-close
             // animation must not jump to a floating box first.
+            //
+            // (Branch `aedf40c5` arrived at the identical call independently;
+            // this comment is kept because it also records the `data-closing`
+            // interaction, which that branch's base did not have.)
             if ( $(this).attr('data-is_fullpage') === '1' ) {
                 window.exit_fullpage_mode(this);
             }
@@ -3972,6 +4022,27 @@ async function close_one_window (options) {
 }
 
 window.scale_window = (el_window) => {
+    // MODIFIED BY EZIL 2026-08-08: the sibling of `minimize_window`'s
+    // `_ezil_minimise` hook, and it exists for the same reason.
+    //
+    // EZiL's Browser window has a bigger "expand" than this function can
+    // express: full-bleed, which hides the taskbar and the window head and is
+    // entered through `go_fullbleed` (`shell/ezil/apps/desktop-window.js`) so
+    // the control drawer comes with it. Before this hook that window was
+    // opened `show_maximize_button: false` — the honest choice at the time,
+    // since a maximise here would have fought `go_fullbleed` for the same
+    // geometry and stranded `data-is_maximized` behind a full-bleed window —
+    // but it left the Browser as the ONE window in the OS with no expand
+    // control at all.
+    //
+    // A window that owns its own expand says so by setting `_ezil_maximise`,
+    // takes the whole job (this function then does nothing, so nothing writes
+    // `data-is_maximized` and there is no geometry to fight over), and every
+    // other window keeps upstream's behaviour unchanged.
+    if ( typeof el_window?._ezil_maximise === 'function' ) {
+        el_window._ezil_maximise();
+        return;
+    }
     //maximize
     if ( $(el_window).attr('data-is_maximized') !== '1' ) {
         // save original size and position
@@ -4591,6 +4662,17 @@ function pop_dashboard_app_url (app_name, options) {
  * stay ignorant of. It takes no arguments and returns truthy once it has
  * fully handled the minimize (restored chrome, hidden the window), in
  * which case the generic path below must not also run.
+ *
+ * 🔴 MERGE NOTE: branch `aedf40c5` reimplemented this same seam against a base
+ * that predated it, as a `typeof … === 'function'` test placed INSIDE the
+ * `data-is_minimized` guard below. Both were auto-mergeable, so the merge
+ * silently produced two live call sites and the hook would have fired twice.
+ * This version is kept and that one dropped, for two reasons: it consults the
+ * RETURN VALUE, so a hook may decline and fall through to the generic path
+ * (a `typeof` test assumes the hook always handles it), and it sits ahead of
+ * the `data-is_minimized` re-entrancy guard rather than inside it, so a
+ * full-bleed window that must leave full-bleed first is not skipped just
+ * because something already marked it minimized.
  */
 function minimize_window (el_window) {
     if ( el_window._ezil_minimise?.() ) {
