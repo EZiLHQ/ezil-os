@@ -10,6 +10,7 @@ import {
     isDeterministicQueryError,
     retryTransientOnly,
 } from './retry-policy';
+import { surfacePreviewErrorAsValue } from '@/server/lib/cloudflare-guacamole-provider';
 
 /**
  * The contract under test is a latency contract, not a correctness one, so it
@@ -169,11 +170,31 @@ describe('the policy is actually wired in', () => {
     it('lets the preview router surface a non-retryable Worker failure as a value, never a throw', () => {
         // A returned result cannot be retried by construction; a thrown
         // TRPCError is the only thing TanStack Query retries.
+        //
+        // The rule itself moved into the provider as
+        // `surfacePreviewErrorAsValue` (the router imports the database and
+        // cannot be loaded by a unit test, so the rule was unexaminable where
+        // it was — see `server/lib/preview-error-code-transit.test.ts`, which
+        // now sweeps its BEHAVIOUR). What stays here is the wiring: the router
+        // must consult it, and must do so BEFORE it reaches for the throw.
         const text = src('server/api/routers/cloudflare-guacamole.ts');
-        expect(text).toContain('!result.retryable');
-        const surfaceIdx = text.indexOf('!result.retryable');
+        expect(text).toContain('surfacePreviewErrorAsValue(result.errorCode, result.retryable)');
+        const surfaceIdx = text.indexOf('surfacePreviewErrorAsValue(result.errorCode, result.retryable)');
         const throwIdx = text.indexOf("code: 'BAD_GATEWAY'");
         expect(surfaceIdx).toBeGreaterThan(-1);
         expect(throwIdx).toBeGreaterThan(surfaceIdx);
+        // ...at every one of the three procedures that call the Worker, not
+        // just the first. A procedure that quietly kept the old inline test
+        // would keep throwing away the code.
+        expect(text.split('surfacePreviewErrorAsValue(result.errorCode, result.retryable)').length - 1).toBe(3);
+        // And the rule is not ALSO restated here, where it could drift.
+        expect(text).not.toContain('!result.retryable ||');
+    });
+
+    it('a deterministic failure really does come back as a value', () => {
+        // The behavioural half of the check above, so "the router calls the
+        // function" is not the only thing being asserted about the function.
+        expect(surfacePreviewErrorAsValue('unauthorized', false)).toBe(true);
+        expect(surfacePreviewErrorAsValue('custom_domain_required', false)).toBe(true);
     });
 });

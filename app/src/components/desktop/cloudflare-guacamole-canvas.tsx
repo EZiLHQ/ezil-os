@@ -11,6 +11,8 @@ import {
     BOOT_PROGRESS_HEADLINE,
     BOOT_PROGRESS_LONG_SUBTEXT,
     BOOT_PROGRESS_SUBTEXT,
+    WAKE_DEADLINE_MS,
+    WAKE_REASK_MS,
     computeBootUiState,
     phaseVisualState,
     type BootErrorCode,
@@ -119,6 +121,12 @@ function toBootErrorCode(raw: string | undefined): BootErrorCode {
         case 'fetch_failed':
         case 'sandbox_runtime_blocked':
         case 'sandbox_start_failed':
+        // Both added 2026-08-08, and both were already being PRODUCED by
+        // `previewUrl` and dropped on the floor here — collapsing to `unknown`
+        // ("We couldn't start your computer") a wake that was going fine, and a
+        // display-route failure that has its own accurate copy.
+        case 'sandbox_starting':
+        case 'desktop_unreachable':
         case 'worker_http_error':
         case 'timeout':
             return raw;
@@ -127,32 +135,74 @@ function toBootErrorCode(raw: string | undefined): BootErrorCode {
     }
 }
 
+/** How often the preview query re-asks a server that said `sandbox_starting`. */
+const PREVIEW_TOKEN_REFRESH_MS = 50 * 60 * 1000;
+
 export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareGuacamoleCanvasProps) {
     const [reloadKey, setReloadKey] = useState(0);
     const [controlHintDismissed, setControlHintDismissed] = useState(false);
     const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
-    // Wall-clock start of the CURRENT boot attempt (a ref — mutated only from
-    // inside effects/handlers, never read during render) and ms elapsed since
-    // it (state, updated only from the interval callback below). Neither
-    // `Date.now()` nor a ref read ever happens in the render body itself, to
-    // keep the component pure. Only ever used to pick which phase to
-    // HIGHLIGHT as an estimate — never to assert a phase is actually done
-    // (see boot-phases.ts).
-    const attemptStartedAtRef = useRef<number | null>(null);
-    const [elapsedMs, setElapsedMs] = useState(0);
+    /**
+     * ms since the current boot PHASE began, and which phase that was.
+     *
+     * `Date.now()` never happens in the render body, so the component stays
+     * pure. Only ever used to pick which phase to HIGHLIGHT as an estimate, and
+     * to bound the two waits — never to assert a phase is actually done (see
+     * boot-phases.ts).
+     *
+     * Written ONLY from the interval callback below — never synchronously in
+     * an effect body, and never read from a ref during render, so the
+     * component stays pure and does not cascade renders. `null` before the
+     * first tick of the first phase, and reset to `null` by a manual reload.
+     */
+    const [phaseClock, setPhaseClock] = useState<{ phase: 'boot' | 'handoff'; elapsedMs: number } | null>(
+        null,
+    );
 
     const isConfiguredQuery = api.cloudflareGuacamole.isConfigured.useQuery(undefined, {
         staleTime: 5 * 60 * 1000,
         refetchOnWindowFocus: false,
     });
 
+    /**
+     * Has this attempt spent its whole wake budget?
+     *
+     * 🔴 Read off the BOOT phase's clock specifically, and deliberately NOT
+     * off the phase-relative `elapsedMs` below. That value resets to 0 the
+     * moment the phase changes, and `requestStatus` depends on this flag — so
+     * a reset would flip the status back to `pending`, restart the clock, and
+     * oscillate. The clock is left holding its expired boot value once the
+     * effect stops, which makes this a latch without needing to be one.
+     */
+    const wakeExpired = phaseClock?.phase === 'boot' && phaseClock.elapsedMs >= WAKE_DEADLINE_MS;
+
     const previewQuery = api.cloudflareGuacamole.previewUrl.useQuery(
         { sessionId, computerId },
         {
             enabled: isConfiguredQuery.data?.isConfigured === true,
-            // Refresh 5 min before token expiry (tokens are 55 min).
-            refetchInterval: 50 * 60 * 1000,
+            /**
+             * 🔴 TWO DIFFERENT CADENCES, AND THE FAST ONE IS THE WAKE LOOP.
+             *
+             * A hibernated container answers `sandbox_starting` — a labelled,
+             * retryable "not ready yet" the server produces at 12s rather than
+             * holding the connection for ~187s and then failing
+             * unclassifiably (see `SANDBOX_WAKE_ANSWER_BUDGET_MS`). It arrives
+             * as a VALUE on a 200, so TanStack's `retry` never sees it; the
+             * re-ask has to be this. Bounded by `wakeExpired`, so a container
+             * that never comes up ends at a visible failure rather than
+             * polling forever.
+             *
+             * Everything else keeps the original cadence: one refresh five
+             * minutes before the 55-minute token expires.
+             */
+            refetchInterval: (query) => {
+                const data = query.state.data as { ok?: boolean; errorCode?: string } | undefined;
+                if (data?.ok === false && data.errorCode === 'sandbox_starting') {
+                    return wakeExpired ? false : WAKE_REASK_MS;
+                }
+                return PREVIEW_TOKEN_REFRESH_MS;
+            },
             refetchOnWindowFocus: false,
             staleTime: 0,
             // Retry ONLY what a second identical attempt could fix. A blanket
@@ -191,6 +241,17 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
         }
         if (!previewQuery.data.ok) {
             const errData = previewQuery.data as { ok: false; errorCode?: string };
+            // 🔴 A WAKE IS PROGRESS, NOT AN ERROR. `sandbox_starting` means the
+            // container is coming up and the server declined to hold the
+            // connection while it does. Rendering it as `error` would show
+            // "This is taking too long" twelve seconds into a boot that is
+            // going exactly as expected — so it stays `pending`, the phase
+            // list keeps running, and the `refetchInterval` above asks again.
+            // Past `WAKE_DEADLINE_MS` it becomes a real, visible failure with
+            // its own copy and its own Retry.
+            if (errData.errorCode === 'sandbox_starting' && !wakeExpired) {
+                return { requestStatus: 'pending' };
+            }
             return { requestStatus: 'error', errorCode: toBootErrorCode(errData.errorCode) };
         }
         return { requestStatus: 'success' };
@@ -200,6 +261,7 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
         previewQuery.isLoading,
         previewQuery.error,
         previewQuery.data,
+        wakeExpired,
     ]);
 
     // ── Is the thing the iframe is pointed at actually a desktop? ───────────
@@ -267,21 +329,49 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
     const confirmedGuacamoleRunning =
         sandboxStatusQuery.data?.ok === true ? sandboxStatusQuery.data.guacamoleRunning : undefined;
 
-    // Tick every 500ms while pending so the time-based estimate advances.
-    // `Date.now()` and the ref mutation only ever happen inside this effect
-    // (the mount of the first `setInterval` tick, and the interval's own
-    // callback) — never in the render body — to keep the component pure.
+    /**
+     * 🔴 WHICH PHASE THE CLOCK IS TIMING — and `null` when there is nothing
+     * left to time.
+     *
+     * `computeBootUiState`'s `elapsedMs` is phase-relative (see its field doc):
+     * while `pending` it times the container boot and picks the estimated
+     * phase; once `success` it times the DISPLAY HANDOFF against
+     * `FRAME_CONFIRM_DEADLINE_MS`. Those are two different clocks and they must
+     * not be one — a boot that spent 200s waking a hibernated container would
+     * otherwise arrive at the handoff with its confirmation budget already
+     * gone, and fail a desktop that was about to confirm.
+     */
+    const timingPhase: 'boot' | 'handoff' | null =
+        requestStatus === 'pending'
+            ? 'boot'
+            : requestStatus === 'success' && frameConfirmed !== true
+              ? 'handoff'
+              : null;
+
+    // Tick every 500ms while a phase is being timed. `Date.now()` and every
+    // state write happen inside the interval CALLBACK — never in the render
+    // body and never synchronously in the effect body — so the component stays
+    // pure and a phase change costs no cascading render. A new phase gets a new
+    // anchor, and the interval stops entirely once nothing is being timed.
     useEffect(() => {
-        if (requestStatus !== 'pending') return;
-        if (attemptStartedAtRef.current === null) {
-            attemptStartedAtRef.current = Date.now();
-        }
-        const startedAt = attemptStartedAtRef.current;
+        if (timingPhase === null) return;
+        const startedAt = Date.now();
         const id = setInterval(() => {
-            setElapsedMs(Date.now() - startedAt);
+            setPhaseClock({ phase: timingPhase, elapsedMs: Date.now() - startedAt });
         }, 500);
         return () => clearInterval(id);
-    }, [requestStatus]);
+    }, [timingPhase]);
+
+    /**
+     * The clock `computeBootUiState` is given: this phase's elapsed time, or 0.
+     *
+     * A reading left over from the PREVIOUS phase reads as 0 rather than being
+     * carried over — which is the whole point of the phase being part of the
+     * state. Without it, the first render after a 200-second wake would hand
+     * the handoff branch a 200-second clock and fail a desktop that was about
+     * to confirm.
+     */
+    const elapsedMs = phaseClock !== null && phaseClock.phase === timingPhase ? phaseClock.elapsedMs : 0;
 
     const bootUiState = useMemo(
         () =>
@@ -301,8 +391,10 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
     useReportDesktopStatus(desktopSurfaceStatus(bootUiState.kind));
 
     const handleReload = useCallback(() => {
-        attemptStartedAtRef.current = null;
-        setElapsedMs(0);
+        // A fresh attempt gets a fresh clock. Without this, a boot that used up
+        // its whole wake budget would stay `wakeExpired` and the retry would
+        // report a timeout before it had asked anything.
+        setPhaseClock(null);
         // A reload is a fresh boot, and implicit hosting is re-attempted with
         // it — so a previously-dismissed hint must be allowed to come back if
         // the new attempt still lands in 'manual'.
