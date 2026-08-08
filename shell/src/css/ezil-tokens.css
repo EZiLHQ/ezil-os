@@ -58,4 +58,46 @@
     --select-hue: 182.65;
     --select-saturation: 100%;
     --select-lightness: 35.49%;
+
+    /* ── ADDED BY EZIL 2026-08-08 ───────────────────────────────────────────
+       The brand palette, by name.
+
+       Until now this file only DOCUMENTED the palette in the header comment
+       above and then re-expressed it as hsl() component triples, because that
+       is the shape upstream's chrome consumes. Anything EZiL-authored that
+       wanted a brand colour had to hardcode the hex — `ezil-shell.css` had
+       `#101111` for the desktop window's letterbox, which is a fourth,
+       undocumented near-black that is not any of the four below.
+
+       Source of truth is unchanged: `app/src/app/globals.css` (`@theme
+       inline`). These are that file's values, restated here so the shell can
+       name them. */
+    --color-charcoal: #161616;
+    --color-charcoal-light: #1f1f1f;
+    --color-offwhite: #f5f5f4;
+    --color-teal: #00adb5;
+
+    /* ── window controls ────────────────────────────────────────────────────
+       The close / minimise / expand discs (`ezil-shell.css`). Sizes are here
+       rather than there because the titlebar's own centring maths has to add
+       them up — see `.window-head-draggable`'s `padding-right`.
+
+       🔴 --win-ctl-size must stay well under the 30px titlebar. That 30px is
+       load-bearing well beyond the head: `style.css`'s
+       `.window-body-app { height: calc(100% - 30px) }` and the `.fullpage-mode`
+       variants beside it all encode it, as does `.window-head-title`'s
+       `line-height`. Growing the discs is fine; growing the HEAD is a
+       different, much larger change. */
+    --win-ctl-size: 12px;
+    --win-ctl-gap: 8px;
+    /* An unfocused window's discs are colourless, exactly as on macOS — the
+       colour is what tells you which window has the keyboard. */
+    --win-ctl-idle: #4b4f50;
+    --win-ctl-close: #ff5f57;
+    --win-ctl-minimise: #febc2e;
+    --win-ctl-expand: #28c840;
+    /* The glyph that appears inside a disc on hover. Dark on the light discs,
+       never white — the discs are bright, and a white glyph on #febc2e is
+       unreadable. */
+    --win-ctl-glyph: rgba(0, 0, 0, 0.62);
 }

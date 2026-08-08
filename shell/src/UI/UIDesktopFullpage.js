@@ -166,8 +166,26 @@ window.exit_fullpage_chrome = (el_window) => {
     }
     // EZIL: upstream called refresh_item_container() here to repaint the
     // desktop's filesystem icons. There is no filesystem. See header.
-    $(el_window).removeAttr('data-is_fullpage');
+    // MODIFIED BY EZIL 2026-08-08: `removeAttr` moved INSIDE the guard it was
+    // sitting one line above. It only ever looked harmless because
+    // `$(undefined)` is an empty jQuery set and so the call quietly did
+    // nothing — the guard on the next line existed precisely because
+    // `el_window` is optional, and this statement was outside it by accident.
+    // It matters now: `style.css`'s minimise-button rule is keyed on
+    // `data-is_fullpage`, so this is the write that gives a window its head
+    // controls back, and it belongs with the rest of the per-window restore.
+    //
+    // 🔴 MERGE NOTE: the `removeAttr` moves in here, but the
+    // `reset_window_size_and_position` that accompanied it on the branch does
+    // NOT. W2 item 4 split this function out of `exit_fullpage_mode` precisely
+    // so that CHROME could be restored without touching GEOMETRY — a window
+    // being minimised keeps its full-page size the whole time it is hidden, so
+    // there is nothing for `showWindow` to flash before `go_fullbleed`
+    // reapplies full-bleed. Geometry now lives in `exit_fullpage_mode` below,
+    // behind the `data-closing` guard from W2 item 2. Restoring it here would
+    // undo both.
     if ( el_window ) {
+        $(el_window).removeAttr('data-is_fullpage');
         $(el_window).find('.window-head').show();
     }
 

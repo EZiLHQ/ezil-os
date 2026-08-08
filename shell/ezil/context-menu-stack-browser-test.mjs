@@ -229,14 +229,108 @@ const rectOf = (sel) => page.evaluate((s) => {
 const hasOpenClass = (sel) => page.evaluate((s) => document.querySelector(s)?.classList.contains('has-open-contextmenu'), sel);
 
 /**
- * `page.mouse.click(x, y, { button: 'right' })` at a fixed point, not
+ * `page.mouse.click(x, y, { button: 'right' })` at a point, not
  * `page.click(selector, { button: 'right' })`: same coordinate-based-click
  * reasoning `launcher-toggle-browser-test.mjs` documents for the Start
  * button — a more honest simulation of a real click, and avoids
  * Playwright's actionability wait on a chrome element.
+ *
+ * MODIFIED BY EZIL 2026-08-08: takes an app id and RESOLVES the point at each
+ * call, instead of taking a rect captured once at the top of the file. See
+ * `titlebarPointOf` below for why.
  */
 async function rightClickAt (rect) {
     await page.mouse.click(rect.cx, rect.cy, { button: 'right' });
+}
+
+/**
+ * The same thing for a WINDOW TITLEBAR, which unlike a taskbar item cannot be
+ * reduced to a rect captured once — see `titlebarPointOf`.
+ *
+ * @param {string} app `data-app` of the window to right-click.
+ */
+async function rightClickApp (app) {
+    const pt = await titlebarPointOf(app);
+    push(`  (resolved a right-clickable titlebar pixel for ${app})`, !! pt, JSON.stringify(pt));
+    if ( ! pt ) return false;
+    await page.mouse.click(pt.cx, pt.cy, { button: 'right' });
+    return true;
+}
+
+/**
+ * A pixel on this window's titlebar that a real user could actually
+ * right-click right now: one that is NOT a window control and that hit-tests
+ * to this window rather than to something stacked over it.
+ *
+ * 🔴 ADDED BY EZIL 2026-08-08, replacing two constants computed once:
+ *
+ *     const ptA = { cx: headA.left + 20, ... };
+ *     const ptB = { cx: headB.left + 20, ... };
+ *
+ * with the comment "a point on the head that is not over a button
+ * (close/minimize sit at the right edge)". Both halves of that premise have
+ * since stopped being true, and neither is anything this file is about:
+ *
+ *   - the window controls are now traffic lights on the LEFT of the titlebar,
+ *     so `left + 20` is over the close button rather than clear of it. (That
+ *     alone is harmless — a right-click on a control still bubbles to the
+ *     head's `contextmenu` handler and opens the window menu, VERIFIED in
+ *     Chromium — but the constant no longer means what it says.)
+ *   - the Browser window's default size changed, so the two windows land in
+ *     different places, and in scenario 2 the menu deliberately left open on
+ *     window A now covers the fixed pixel that scenario 2 wanted to click on
+ *     window B. The click landed on A's own menu, so B's menu never opened —
+ *     which is CORRECT behaviour for a click on an overlapping menu, and a
+ *     false failure for this file.
+ *
+ * Resolving per call fixes both, and is what `stacking-browser-test.mjs`'s
+ * `titlebarPointInside` already does for the same reason. It also makes the
+ * scenarios stronger rather than weaker: "right-click window B's titlebar
+ * while A's menu is open" is now genuinely a click on B's titlebar, every
+ * time, instead of accidentally being a click on A's menu.
+ *
+ * The scan mirrors that file's: prefer a spot 40px in (cheap, and where the
+ * old constants pointed), then sweep for the first pixel this window owns.
+ *
+ * @param {string} app `data-app` of the window whose titlebar is wanted.
+ * @returns {Promise<{cx: number, cy: number}|null>}
+ */
+async function titlebarPointOf (app) {
+    return page.evaluate((a) => {
+        const el = document.querySelector(`.window[data-app="${a}"] > .window-head`);
+        if ( ! el ) return null;
+        const r = el.getBoundingClientRect();
+        if ( r.width === 0 || r.height === 0 ) return null;
+        const cy = r.top + r.height / 2;
+        const owns = (x) => {
+            const hit = document.elementFromPoint(x, cy);
+            if ( ! hit ) return false;
+            // A window control is a titlebar pixel, but not a PLAIN one — this
+            // file is about the titlebar's own `contextmenu` handler, and
+            // clicking a control is a different interaction with its own
+            // meaning.
+            if ( hit.closest('.window-action-btn') ) return false;
+            // 🔴 The hit must be in THIS window's HEAD, not merely somewhere
+            // in this window. jQuery UI lays eight `.ui-resizable-handle`
+            // divs over the window's edges, and they overlap the titlebar's
+            // first and last few pixels — `hit.closest('.window')` says yes
+            // to those, but a right-click on a resize handle never reaches
+            // the head's handler and no menu opens. MEASURED: the sweep
+            // below starts at `left + 3`, which is inside `.ui-resizable-w`
+            // every time, so a `.window`-scoped check hands back a pixel
+            // that provably does not work.
+            const head = hit.closest('.window-head');
+            if ( ! head ) return false;
+            const win = head.closest('.window');
+            return !! win && win.getAttribute('data-app') === a;
+        };
+        const preferred = r.left + Math.min(40, r.width / 2);
+        if ( owns(preferred) ) return { cx: preferred, cy };
+        for ( let x = r.left + 3; x <= r.right - 3; x += 6 ) {
+            if ( owns(x) ) return { cx: x, cy };
+        }
+        return null;
+    }, app);
 }
 
 // ── get window A on screen ──────────────────────────────────────────────
@@ -266,31 +360,57 @@ const windows = await page.evaluate(() => [...document.querySelectorAll('.window
 push('setup: two real windows are open (desktop + settings)',
     windows.includes('desktop') && windows.includes('settings'), JSON.stringify(windows));
 
+// 🔴 ADDED BY EZIL 2026-08-08: place the two windows, rather than taking
+// whatever the defaults happen to give.
+//
+// Every scenario in this file needs BOTH titlebars to stay reachable no
+// matter which window is on top — scenario 2 right-clicks B while A's menu is
+// open, scenario 3 does the reverse. Default placement used to satisfy that
+// by luck. It stopped when the Browser window's default size grew from
+// 560x400 to 960x570 (it is now sized to the 16:9 stream it shows): raised,
+// it covered the Settings titlebar completely, and the sweep below correctly
+// reported that there was no pixel of it left to click.
+//
+// Stacked vertically with the wider window LOWER, each titlebar has a strip
+// the other cannot reach: Settings sits above where the Browser window
+// starts, and the Browser's head runs 200px wider than Settings does. This is
+// a fact about the layout, not about z-order, so it holds in both directions
+// — which is exactly what these scenarios need.
+await page.evaluate(() => {
+    $('.window[data-app="settings"]').css({ top: '40px', left: '20px' });
+    $('.window[data-app="desktop"]').css({ top: '300px', left: '20px' });
+});
+await sleep(150);
+
 const headA = await rectOf('.window[data-app="desktop"] > .window-head');
 const headB = await rectOf('.window[data-app="settings"] > .window-head');
 push('setup: both windows have a clickable titlebar', !! headA && !! headB);
+// The placement above is only worth anything if it actually holds. Assert it
+// rather than assuming it: a titlebar pixel must exist for BOTH windows
+// before any scenario starts.
+push('setup: both titlebars expose a right-clickable pixel, whichever is on top',
+    !! await titlebarPointOf('desktop') && !! await titlebarPointOf('settings'),
+    JSON.stringify({ a: await titlebarPointOf('desktop'), b: await titlebarPointOf('settings') }));
 
-// A point on the head that is not over a button (close/minimize sit at the
-// right edge) — fixed for the whole file. Nothing below resizes, maximizes,
-// or minimizes either window, so these stay valid throughout.
-const ptA = { cx: headA.left + 20, cy: headA.top + headA.height / 2 };
-const ptB = { cx: headB.left + 20, cy: headB.top + headB.height / 2 };
+// MODIFIED BY EZIL 2026-08-08: the two fixed points that used to live here
+// are gone; `rightClickApp('desktop'|'settings')` resolves a real one at each
+// call. See `titlebarPointOf` above for the two reasons.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SCENARIO 1 — 3 rapid right-clicks on ONE window's titlebar never stack
 // ═══════════════════════════════════════════════════════════════════════════
 push('0 menus before any click', (await allMenuCount()) === 0, `count=${await allMenuCount()}`);
 
-await rightClickAt(ptA);
+await rightClickApp('desktop');
 await sleep(150);
 push('right-click 1 on window A: exactly 1 root menu', (await rootMenuCount()) === 1, `count=${await rootMenuCount()}`);
 
-await rightClickAt(ptA);
+await rightClickApp('desktop');
 await sleep(150);
 push('🔴 right-click 2 on window A: STILL exactly 1 (THE BUG: this used to be 2)',
     (await rootMenuCount()) === 1, `count=${await rootMenuCount()}`);
 
-await rightClickAt(ptA);
+await rightClickApp('desktop');
 await sleep(150);
 push('🔴 right-click 3 on window A: STILL exactly 1 (THE BUG: this used to be 3)',
     (await rootMenuCount()) === 1, `count=${await rootMenuCount()}`);
@@ -304,7 +424,7 @@ push('...and it is a fresh menu owned by A, not a stray survivor',
 // first. Opening B's is the thing under test.
 push('scenario 2 setup: window A menu still open from scenario 1', (await rootMenuCount()) === 1);
 
-await rightClickAt(ptB);
+await rightClickApp('settings');
 await sleep(150);
 push('🔴 right-click window B WITHOUT closing A first: exactly 1 root menu (THE BUG: this used to be 2)',
     (await rootMenuCount()) === 1, `count=${await rootMenuCount()}`);
@@ -320,7 +440,7 @@ push('🔴 ...and it BELONGS TO B, not the stale one from A',
 // SCENARIO 3 — the reverse order also resolves to exactly 1, belonging to A
 // ═══════════════════════════════════════════════════════════════════════════
 // B's menu (from scenario 2) is still open. Right-click A now.
-await rightClickAt(ptA);
+await rightClickApp('desktop');
 await sleep(150);
 push('B-then-A: exactly 1 root menu', (await rootMenuCount()) === 1, `count=${await rootMenuCount()}`);
 push('...and it belongs to A this time',
@@ -359,7 +479,7 @@ push('🔴 ...and it BELONGS TO the settings item, not the stale one',
 // SCENARIO 5 — documented (not "fixed") pre-existing behaviour: outside-click
 // and Escape do NOT dismiss a window-titlebar menu. See the file header.
 // ═══════════════════════════════════════════════════════════════════════════
-await rightClickAt(ptA);
+await rightClickApp('desktop');
 await sleep(150);
 push('scenario 5 setup: window A menu open (replacing the taskbar item\'s)',
     (await allMenuCount()) === 1, `count=${await allMenuCount()}`);
@@ -384,8 +504,9 @@ push('DOCUMENTED (not required by this fix): Escape does not close it either',
 // mouseY tracking in boot.js) needs real mousemove history to activate a
 // row at all, and Playwright's default single-step `mouse.move` can win the
 // race against that with only one point recorded.
-await page.mouse.move(ptA.cx - 100, ptA.cy, { steps: 5 });
-await page.mouse.move(ptA.cx, ptA.cy, { steps: 5 });
+const ptMove = await titlebarPointOf('desktop');
+await page.mouse.move(ptMove.cx - 100, ptMove.cy, { steps: 5 });
+await page.mouse.move(ptMove.cx, ptMove.cy, { steps: 5 });
 await sleep(50);
 
 const advancedRow = await page.evaluate(() => {
