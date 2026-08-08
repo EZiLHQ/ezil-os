@@ -63,11 +63,24 @@ import { createTRPCRouter, protectedProcedure } from '../trpc';
 // Error codes that represent expected operational failures (not server bugs).
 // For these the router returns a typed result object instead of throwing so
 // the canvas can render a first-class actionable diagnostics panel.
+//
+// 🔴 A THROW DESTROYS THE LABEL. Anything that leaves here as a `TRPCError`
+// becomes a 502 whose body is `{error:{code:'BAD_GATEWAY', message:<generic>}}`
+// (`server/shell/http.ts` deliberately strips 5xx detail), and both shell
+// clients map every non-401 HTTP failure to `unknown` — whose copy is the dead
+// end "We couldn't start your computer." So membership of this set is not a
+// stylistic choice about throwing: it is the difference between a code the
+// browser can act on and no code at all.
+//
+// `sandbox_starting` is here for exactly that reason, and it is the most
+// important member: it is the answer a hibernated container gives, it is
+// PROGRESS rather than a failure, and it is worthless if it arrives unlabelled.
 const OPERATIONAL_ERROR_CODES = new Set([
     'connection_refused',
     'fetch_failed',
     'sandbox_runtime_blocked',
     'sandbox_start_failed',
+    'sandbox_starting',
     'timeout',
 ]);
 

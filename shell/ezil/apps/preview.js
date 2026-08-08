@@ -295,13 +295,26 @@ export async function openPreviewWindow (ctx = {}) {
         }
 
         console.info(`[${PHASE}] mint resolved in ${Math.round(performance.now() - t0)}ms`);
-        // Same rule as `desktop-window.js`: only the SERVER's confirmation
-        // may reveal the frame; render() below still gates on `frameConfirmed`.
-        progress.render(computeBootUiState({
-            requestStatus: 'success',
-            elapsedMs: 0,
-            frameConfirmed: false,
-        }));
+
+        // 🔴 THE HANDOFF IS NOT A VERDICT. Same rule as `desktop-window.js`:
+        // only the SERVER's confirmation may reveal the frame, and `render()`
+        // still gates on `frameConfirmed`. What changed is that this used to
+        // pass `frameConfirmed: false` — an assertion that the origin had been
+        // asked and had refused — in the instant before anybody asked it. The
+        // flag is now OMITTED, which is the input meaning "no observation
+        // exists", and the panel shows `connecting` until `settle_frame` below
+        // produces one. Still bounded: `FRAME_CONFIRM_DEADLINE_MS` runs from
+        // `t_handoff`.
+        const t_handoff = performance.now();
+        const paint_handoff = () => {
+            if ( disposed || my_attempt !== attempt ) return;
+            progress.render(computeBootUiState({
+                requestStatus: 'success',
+                elapsedMs: performance.now() - t_handoff,
+            }));
+        };
+        paint_handoff();
+        tick_timer = setInterval(paint_handoff, TICK_MS);
 
         el_iframe.src = preview_url;
         settle_frame(my_attempt);
@@ -333,6 +346,9 @@ export async function openPreviewWindow (ctx = {}) {
             }
 
             settled = true;
+            // The handoff clock has done its job — stop repainting it before
+            // writing a settled state, or the next tick overwrites the answer.
+            stop_timers();
 
             if ( seen === true ) {
                 progress.el.hidden = true;
@@ -347,6 +363,9 @@ export async function openPreviewWindow (ctx = {}) {
                 attrs: { seen: String(seen) },
             });
             show_panel();
+            // 🔴 `false`, explicitly, and the only place this window says it:
+            // we asked, and the answer was no (or we could not reach our own
+            // server `FRAME_CONFIRM_ATTEMPTS` times running).
             progress.render(computeBootUiState({
                 requestStatus: 'success',
                 elapsedMs: 0,

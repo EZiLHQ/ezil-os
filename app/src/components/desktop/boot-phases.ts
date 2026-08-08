@@ -107,6 +107,55 @@ export const TYPICAL_BOOT_MS = STARTING_ENDS_MS;
 export const LONG_BOOT_MS = 35_000;
 
 /**
+ * How long `computeBootUiState` will show the `connecting` phase over a
+ * SUCCESSFUL preview request whose frame nobody has confirmed yet, before it
+ * gives up and says `desktop_unreachable`.
+ *
+ * 🔴 THIS IS THE THING THAT KEEPS THE NEW `success` BRANCH TERMINAL. That
+ * branch used to fail closed the instant it saw anything other than
+ * `frameConfirmed === true`, which was wrong in the common case (nobody had
+ * asked yet) but right about one thing: a permanent progress bar is not more
+ * honest than a failure, it is just quieter. So the "we have not asked yet"
+ * state is bounded here rather than left open.
+ *
+ * Sized from the WORST CASE of the callers' own bounded confirmation loops,
+ * not from the happy path. `shell/ezil/apps/desktop-window.js` (and its two
+ * siblings) ask up to `FRAME_CONFIRM_ATTEMPTS` (3) times, `FRAME_CONFIRM_RETRY_MS`
+ * (1.5s) apart, and each ask carries `session.js`'s `STATUS_TIMEOUT_MS` (12s)
+ * budget — ~40s if every single one of them times out. Anything below that
+ * would fire the deadline BEFORE the caller had finished asking, turning a
+ * slow confirmation into a fabricated failure. Measured healthy gap: ~6s.
+ */
+export const FRAME_CONFIRM_DEADLINE_MS = 45_000;
+
+/**
+ * How long to wait after a `sandbox_starting` answer before asking again.
+ *
+ * The server already spends `SANDBOX_WAKE_ANSWER_BUDGET_MS` (12s) per ask, so
+ * this is only the beat between them — it paces the loop, it does not set it.
+ * Short on purpose: each re-ask is also what keeps the Worker driving the wake,
+ * and the already-exposed fast path in `ensureDesktop` makes a re-ask cheap the
+ * moment the container is up.
+ */
+export const WAKE_REASK_MS = 1_500;
+
+/**
+ * Total patience for a container that keeps answering "still waking".
+ *
+ * 🔴 DELIBERATELY THE SAME NUMBER THE SHELL ALREADY WAITED. `session.js`'s
+ * `DESKTOP_BOOT_TIMEOUT_MS` is 215s and always was; what changed is what
+ * happens during those 215s. It used to be one silent socket that produced an
+ * unclassifiable failure at the end; it is now a live phase list and a bounded
+ * loop of labelled answers. The user's worst case did not get longer — a
+ * hibernation wake was measured at ~187s, and the whole point is to still be
+ * waiting, honestly, when it lands.
+ *
+ * Pinned to `session.DESKTOP_BOOT_TIMEOUT_MS` by a test, because two numbers
+ * that must agree and live in different files do not stay agreed.
+ */
+export const WAKE_DEADLINE_MS = 215_000;
+
+/**
  * Purely time-based phase estimate. Never use this alone to decide whether to
  * show a checkmark — only to decide which phase is CURRENTLY highlighted
  * while we wait for a real signal or the request to settle.
@@ -227,15 +276,58 @@ export type BootErrorCode =
     | 'fetch_failed'
     | 'sandbox_runtime_blocked'
     | 'sandbox_start_failed'
+    | 'sandbox_starting'
     | 'worker_http_error'
     | 'desktop_unreachable'
     | 'timeout'
     | 'unknown';
 
+/**
+ * The deterministic family, restated for the browser. Byte-for-byte the same
+ * membership as `DETERMINISTIC_PREVIEW_ERROR_CODES` in
+ * `server/lib/cloudflare-guacamole-provider.ts` — and pinned to it by a test
+ * that sweeps every member of both unions, because two copies of a rule is
+ * exactly how this codebase has drifted before.
+ *
+ * Retryable is the DEFAULT here for the same reason it is there: an
+ * unrecognised code (a future addition, or one arriving from a server newer
+ * than this bundle) costs at most one duplicate request, rather than silently
+ * hardening a transient blip into a dead end.
+ */
+const DETERMINISTIC_BOOT_ERROR_CODES: readonly string[] = [
+    'bad_request',
+    'unauthorized',
+    'preconditions_unmet',
+    'custom_domain_required',
+    'sandbox_runtime_blocked',
+];
+
+/**
+ * True when re-sending the identical request could plausibly change the answer.
+ *
+ * The browser-side half of the automatic retry: a first attempt that failed
+ * this way is worth one silent re-ask, and one that did not is worth none.
+ */
+export function isRetryableBootErrorCode(code: string | undefined): boolean {
+    if (!code) return true;
+    return !DETERMINISTIC_BOOT_ERROR_CODES.includes(code);
+}
+
 export interface ComputeBootUiStateInput {
     /** Overall status of the one-shot `POST /sandbox/preview` request. */
     requestStatus: 'not_configured' | 'pending' | 'success' | 'error';
-    /** ms since this boot attempt started. Ignored once the request has settled. */
+    /**
+     * ms since the CURRENT PHASE began — not since the window opened.
+     *
+     *   `pending` — since this boot attempt started. Picks which phase the
+     *               time-based estimate highlights.
+     *   `success` — since the desktop URL was handed to the browser. This is a
+     *               DIFFERENT clock on purpose: the display handoff is what is
+     *               being timed there, and a cold boot that took 200s must not
+     *               spend the confirmation's whole budget before the
+     *               confirmation has been asked for once.
+     *   `error` / `not_configured` — ignored.
+     */
     elapsedMs: number;
     /**
      * Last observed value from polling the cheap `GET /sandbox/:id/status`
@@ -249,8 +341,19 @@ export interface ComputeBootUiStateInput {
     /**
      * Whether the DESKTOP ORIGIN itself has been observed answering — not the
      * Worker, and not the iframe's `load` event. Read only when
-     * `requestStatus === 'success'`. `undefined` means no observation exists
-     * yet and is NOT a pass; see the `success` branch.
+     * `requestStatus === 'success'`.
+     *
+     * 🔴 THREE VALUES, THREE MEANINGS. Same convention as
+     * `confirmedGuacamoleRunning` above, and for the same reason:
+     *
+     *   `true`      — observed answering. The one and only route to `ready`.
+     *   `false`     — ASKED AND REFUTED. The probe read an error status, or the
+     *                 caller exhausted its own bounded retries and is reporting
+     *                 the negative. A real observation, and a failure.
+     *   `undefined` — nobody has asked yet. NOT a pass, and not a failure
+     *                 either: fabricating a negative from the absence of an
+     *                 observation is what painted a dead end over six seconds
+     *                 of a perfectly healthy boot. See the `success` branch.
      */
     frameConfirmed?: boolean;
 }
@@ -266,6 +369,14 @@ function classifyFailure(errorCode: BootErrorCode | undefined): BootFailureReaso
             return 'sandbox_crashed';
         case 'desktop_unreachable':
             return 'desktop_unreachable';
+        // `sandbox_starting` is the server saying "still waking, ask again" —
+        // it is normally consumed as PROGRESS by the caller's wake loop and
+        // never reaches here at all. It only lands in this switch when that
+        // loop ran out of patience, and at that point the honest thing to say
+        // is the `timeout` copy, which is already exactly right: "it may still
+        // come up in the background — try again." Deliberately NOT
+        // `sandbox_crashed`: nothing crashed, and nothing observed says it did.
+        case 'sandbox_starting':
         case 'timeout':
             return 'timeout';
         // The deterministic family — a malformed request, a rejected HMAC
@@ -307,21 +418,54 @@ export function computeBootUiState(input: ComputeBootUiStateInput): BootUiState 
         // surfaces then reported success over it, because this branch was the
         // end of the contract.
         //
-        // So `ready` now requires a SECOND, independent, positive observation
+        // So `ready` STILL requires a SECOND, independent, positive observation
         // of the desktop origin itself (`probeDesktopFrame` in
         // `server/lib/cloudflare-guacamole-provider.ts`, reached from the
         // shell as `frameConfirmed`). Strict `=== true`, for the same reason
-        // `confirmed` below is: nothing truthy off the wire may stand in for
-        // a real observation.
+        // `confirmed` below is: nothing truthy off the wire may stand in for a
+        // real observation. That has not moved, and the `display === 'live'`
+        // gate in `applyDisplayEvidence` still sits underneath it.
         //
-        // Fail CLOSED, and fail TERMINALLY. `undefined` — a caller that never
-        // threaded the flag, or a confirmation that never landed — is not a
-        // pass, and it does not become an endless spinner either: it becomes a
-        // visible, retryable failure, because "we cannot confirm your desktop"
-        // is a true statement and a permanent progress bar is not.
-        return input.frameConfirmed === true
-            ? { kind: 'ready' }
-            : { kind: 'failed', reason: 'desktop_unreachable' };
+        // 🔴 WHAT DID MOVE, AND WHY (2026-08-08). This branch read "anything
+        // that is not `true` is `desktop_unreachable`". So in the instant after
+        // a mint resolved — before anybody had asked the origin anything — every
+        // caller painted a TERMINAL failure over a workspace that was booting
+        // normally. Measured: the mint resolved at 2:41:06, the frame confirmed
+        // at 2:41:12, and for those six seconds the user was told their desktop
+        // was not answering. Nobody had asked it yet. That is not failing
+        // closed; it is answering a question that was never put.
+        //
+        // The three answers are now kept apart, and exactly one of them is new:
+        //
+        //   `true`        — observed answering. `ready`, as before.
+        //   `false`       — ASKED AND REFUTED: the probe read an error status,
+        //                   or the caller exhausted its own bounded retries.
+        //                   `desktop_unreachable`, as before.
+        //   anything else — NOBODY HAS ASKED YET. Not a pass. No longer a
+        //                   failure either: it is the `connecting` phase, which
+        //                   is the true statement while a confirmation is in
+        //                   flight. This converts a false FAILURE into
+        //                   PROGRESS; it opens no new route to `ready`.
+        //
+        // It still ends TERMINALLY. `elapsedMs` here is time since the URL was
+        // handed to the browser (see the field's doc), and at
+        // `FRAME_CONFIRM_DEADLINE_MS` the unanswered case becomes the same
+        // visible, retryable `desktop_unreachable` it always was. A caller that
+        // never threads an observation gets that, not a permanent spinner.
+        if (input.frameConfirmed === true) {
+            return { kind: 'ready' };
+        }
+        if (input.frameConfirmed === false || input.elapsedMs >= FRAME_CONFIRM_DEADLINE_MS) {
+            return { kind: 'failed', reason: 'desktop_unreachable' };
+        }
+        return {
+            kind: 'progress',
+            currentPhase: 'connecting',
+            // Never `true`. `confirmed` is what draws a CHECKMARK, and the
+            // display is precisely the thing not yet confirmed.
+            confirmed: false,
+            isRunningLong: input.elapsedMs >= LONG_BOOT_MS,
+        };
     }
     if (input.requestStatus === 'error') {
         return { kind: 'failed', reason: classifyFailure(input.errorCode) };

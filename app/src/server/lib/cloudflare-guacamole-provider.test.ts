@@ -22,6 +22,7 @@ import {
     requestGuacamolePreview,
     requestGuacamoleSandboxTerminate,
     resetNekoAdminTokenCacheForTests,
+    SANDBOX_WAKE_ANSWER_BUDGET_MS,
     type CloudflareGuacamoleConfig,
     type GuacamolePreviewError,
     type GuacamolePreviewErrorCode,
@@ -252,6 +253,176 @@ describe('requestGuacamolePreview — the failure carries its own retryability',
         const result = (await requestGuacamolePreview(CONFIG, 'secret', INPUT)) as GuacamolePreviewError;
         expect(result.errorCode).toBe('custom_domain_required');
         expect(result.retryable).toBe(false);
+    });
+});
+
+/**
+ * 🔴 THE HIBERNATION REGRESSION, AT ITS SOURCE.
+ *
+ * Measured in production after containers started hibernating when idle:
+ * `POST /api/shell/code-preview-url` at 12:40:57 and the desktop boot at
+ * 12:41:10 BOTH died at 12:44:05 — 187505ms and 175108ms, both reported to the
+ * user as `unknown` ("We couldn't start your computer."). Clicking retry two
+ * seconds later resolved in 5460ms. The wake had worked; the request that
+ * triggered it was the only casualty.
+ *
+ * Two properties are proven here, and the second is the one that makes the
+ * first safe: it answers EARLY, and it answers with a LABEL.
+ */
+describe('🔴 requestGuacamolePreview answers a hibernation wake early, and labels it', () => {
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    /** A Worker call that never comes back — exactly what a 187s wake looks like from here. */
+    function stubHangingWorker() {
+        const spy = vi.fn(() => new Promise<Response>(() => {}));
+        vi.stubGlobal('fetch', spy);
+        return spy;
+    }
+
+    it('does NOT hold the caller for ~180s — it answers at the wake budget', async () => {
+        vi.useFakeTimers();
+        stubHangingWorker();
+
+        const pending = requestGuacamolePreview(CONFIG, 'secret', INPUT, 'cid-wake');
+        let settled = false;
+        void pending.then(() => {
+            settled = true;
+        });
+
+        // One millisecond short of the budget: still waiting, as it should be.
+        await vi.advanceTimersByTimeAsync(SANDBOX_WAKE_ANSWER_BUDGET_MS - 1);
+        expect(settled).toBe(false);
+
+        await vi.advanceTimersByTimeAsync(1);
+        const result = (await pending) as GuacamolePreviewError;
+
+        expect(result.ok).toBe(false);
+        // 🔴 THE LABEL. Not `unknown`, which is what the browser used to get.
+        expect(result.errorCode).toBe('sandbox_starting');
+        // 🔴 AND RETRYABLE — asking again is the entire point of this answer.
+        expect(result.retryable).toBe(true);
+        expect(result.error).toContain('sandbox_starting');
+    });
+
+    it('the budget is well inside the client budget and nowhere near the Worker ceiling it replaces', () => {
+        // 180_000 was the ceiling that produced the 187s dead end. The point of
+        // the number is that it is an order of magnitude below it, and above
+        // the ~6s at which `ensureDesktop` has already issued `startProcess`
+        // (container_start ~0.3s + workspace_mount ~5.9s, PLATFORM-NOTES §11) —
+        // so no wake is ever abandoned before it has actually been started.
+        expect(SANDBOX_WAKE_ANSWER_BUDGET_MS).toBeGreaterThan(6_000);
+        expect(SANDBOX_WAKE_ANSWER_BUDGET_MS).toBeLessThanOrEqual(15_000);
+    });
+
+    it('🔴 does not ABORT the wake it started — the Worker call is left running', async () => {
+        vi.useFakeTimers();
+        let seenSignal: AbortSignal | undefined;
+        vi.stubGlobal(
+            'fetch',
+            vi.fn((_url: string, init?: RequestInit) => {
+                seenSignal = init?.signal ?? undefined;
+                return new Promise<Response>(() => {});
+            }),
+        );
+
+        const pending = requestGuacamolePreview(CONFIG, 'secret', INPUT, 'cid-wake-2');
+        await vi.advanceTimersByTimeAsync(SANDBOX_WAKE_ANSWER_BUDGET_MS);
+        await pending;
+
+        // Aborting here would cancel the Worker invocation that is DRIVING the
+        // container boot — the one thing that must survive this answer. The
+        // only signal on the call is its own long cold-start budget, and it is
+        // still unaborted after we have already replied.
+        expect(seenSignal).toBeDefined();
+        expect(seenSignal?.aborted).toBe(false);
+    });
+
+    it('a Worker that answers inside the budget is completely unaffected', async () => {
+        // The warm path — measured at 2.3s — must not pay for any of this, and
+        // must not be relabelled as a wake.
+        const spy = vi.fn(
+            async () =>
+                new Response(
+                    JSON.stringify({ ok: true, guacamoleUrl: 'https://desktop.example/', expiresAt: 1 }),
+                    { status: 200 },
+                ),
+        );
+        vi.stubGlobal('fetch', spy);
+
+        const result = await requestGuacamolePreview(CONFIG, 'secret', INPUT, 'cid-warm');
+        expect(result.ok).toBe(true);
+        expect(spy).toHaveBeenCalledTimes(1);
+    });
+});
+
+/**
+ * 🔴 THE UNLABELLED SOFT FAILURE IS NOW UNCONSTRUCTIBLE.
+ *
+ * `previewError(error, errorCode?)` had an OPTIONAL code, so a soft failure
+ * carrying none was legal, silent, and reachable — and every consumer
+ * downstream can only render `errorCode ?? 'unknown'`, whose copy is the dead
+ * end the user actually saw. The type now requires it.
+ */
+describe('🔴 previewError refuses to build an unlabelled failure', () => {
+    it('will not compile without an error code', () => {
+        // A COMPILE-TIME assertion, not a runtime one — `bun run typecheck`
+        // includes this file. If `errorCode` is ever made optional again, this
+        // `@ts-expect-error` becomes unused and TypeScript fails the build,
+        // which is the whole mechanism.
+        //
+        // @ts-expect-error `errorCode` is required: a soft failure must name its kind.
+        const unlabelled: GuacamolePreviewError = { ok: false, error: 'boom', retryable: true };
+        expect(unlabelled.ok).toBe(false);
+    });
+
+    it('every failure `requestGuacamolePreview` can produce carries a non-empty code', async () => {
+        // The runtime half: sweep every shape the function can fail with and
+        // assert the invariant on the value, not on the type. A future edit
+        // that reintroduces an unlabelled path fails here even if it type-casts
+        // its way past the compiler.
+        const shapes: { name: string; arrange: () => void }[] = [
+            { name: 'not configured', arrange: () => vi.stubGlobal('fetch', vi.fn()) },
+            { name: 'worker 400', arrange: () => stubWorkerResponse(400, '{"ok":false}') },
+            { name: 'worker 500', arrange: () => stubWorkerResponse(500, 'desktop_failed_to_start: ...') },
+            { name: 'worker 503', arrange: () => stubWorkerResponse(503, '') },
+            { name: '200 ok:false, no code', arrange: () => stubWorkerResponse(200, '{"ok":false}') },
+            {
+                name: '200 ok:false, no code, no error text',
+                arrange: () => stubWorkerResponse(200, '{"ok":false,"error":null}'),
+            },
+            {
+                name: '200 ok:false with an unrecognised code',
+                arrange: () => stubWorkerResponse(200, '{"ok":false,"errorCode":"from_the_future"}'),
+            },
+            {
+                name: 'transport failure',
+                arrange: () =>
+                    vi.stubGlobal(
+                        'fetch',
+                        vi.fn(async () => {
+                            throw new TypeError('fetch failed');
+                        }),
+                    ),
+            },
+            { name: 'malformed JSON body', arrange: () => stubWorkerResponse(200, 'not json at all') },
+        ];
+
+        for (const shape of shapes) {
+            vi.unstubAllGlobals();
+            shape.arrange();
+            const config = shape.name === 'not configured'
+                ? { workerUrl: '', hasHmacSecret: false, isConfigured: false }
+                : CONFIG;
+            const result = (await requestGuacamolePreview(config, 'secret', INPUT)) as GuacamolePreviewError;
+            expect(result.ok, shape.name).toBe(false);
+            expect(typeof result.errorCode, shape.name).toBe('string');
+            expect(result.errorCode, shape.name).not.toBe('');
+            expect(result.errorCode, shape.name).not.toBeUndefined();
+            // `retryable` is derived from the code, so it must be present too.
+            expect(typeof result.retryable, shape.name).toBe('boolean');
+        }
     });
 });
 
