@@ -139,8 +139,16 @@ window.exit_fullpage_mode = (el_window) => {
     }
     // EZIL: upstream called refresh_item_container() here to repaint the
     // desktop's filesystem icons. There is no filesystem. See header.
-    $(el_window).removeAttr('data-is_fullpage');
+    // MODIFIED BY EZIL 2026-08-08: `removeAttr` moved INSIDE the guard it was
+    // sitting one line above. It only ever looked harmless because
+    // `$(undefined)` is an empty jQuery set and so the call quietly did
+    // nothing — the guard on the next line existed precisely because
+    // `el_window` is optional, and this statement was outside it by accident.
+    // It matters now: `style.css`'s minimise-button rule is keyed on
+    // `data-is_fullpage`, so this is the write that gives a window its head
+    // controls back, and it belongs with the rest of the per-window restore.
     if ( el_window ) {
+        $(el_window).removeAttr('data-is_fullpage');
         window.reset_window_size_and_position(el_window);
         $(el_window).find('.window-head').show();
     }

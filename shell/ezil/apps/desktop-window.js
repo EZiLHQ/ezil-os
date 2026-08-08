@@ -315,9 +315,23 @@ export async function openDesktopWindow (ctx = {}) {
         // the window. `ezil-shell.css` hides the resize handles once the window
         // is full-bleed, so a stray drag still cannot shrink the live desktop.
         is_resizable: true,
-        // The maximize button would fight `go_fullbleed` for the same geometry
-        // and leave `data-is_maximized` set behind a full-bleed window.
-        show_maximize_button: false,
+        // MODIFIED BY EZIL 2026-08-08: true, was false.
+        //
+        // It was false because "The maximize button would fight `go_fullbleed`
+        // for the same geometry and leave `data-is_maximized` set behind a
+        // full-bleed window" — a correct diagnosis of `window.scale_window`,
+        // and the price was that the Browser was the ONE window in this OS
+        // with no expand control, in a titlebar that shows the other two. An
+        // OS whose main window is missing a standard control does not read as
+        // an OS.
+        //
+        // The fight is now settled rather than avoided: `UIWindow.js`'s
+        // `scale_window` checks for an `_ezil_maximise` hook FIRST and returns
+        // if it finds one, so on this window it never runs, never writes
+        // `data-is_maximized`, and has no geometry to disagree about. The hook
+        // (installed below, right after `go_fullbleed` is in scope) routes the
+        // button to `go_fullbleed`, which is what "expand" means here.
+        show_maximize_button: true,
         // 🔴 NOT `stay_on_top: true`. Full-bleed is a LAYOUT mode
         // (`go_fullbleed` below sets `width/height: 100%` via
         // `enter_fullpage_mode` — pure geometry, in `UIDesktopFullpage.js`,
@@ -965,6 +979,36 @@ export async function openDesktopWindow (ctx = {}) {
         }
         $(el).hideWindow();
     }
+
+    // ── the two window-control hooks ───────────────────────────────────────
+    // ADDED BY EZIL 2026-08-08. This window's minimise and expand are not
+    // `hideWindow()` and `scale_window()`; they are the two functions in this
+    // file, which know about full-bleed. Before these hooks only the control
+    // DRAWER reached them, so the very same window behaved one way from its
+    // tray and another way from its titlebar and titlebar context menu:
+    //
+    //   minimise — the head button and the context menu both call
+    //     `minimize_window` -> `hideWindow()`, which hides a FULL-BLEED window
+    //     without first restoring the taskbar it is covering. The window
+    //     shrinks toward a dock that is not on screen and the OS looks empty.
+    //     `minimise_to_taskbar` above has the ordering and the reasoning.
+    //
+    //   expand — there was no head button at all (see `show_maximize_button`
+    //     in the `UIWindow` options above), because upstream's `scale_window`
+    //     would have written a competing geometry.
+    //
+    // 🔴 The hook is read by `UIWindow.js` (`minimize_window` and
+    // `scale_window`), which is Puter-derived and must not learn what
+    // `ezil-fullbleed` is. This is the seam that keeps that true: the generic
+    // file asks "does this window minimise/expand itself?", and only this
+    // file, which owns full-bleed, answers yes. Every other window in the OS
+    // is unaffected and keeps upstream's behaviour exactly.
+    //
+    // Both hooks take the whole job, including the hide — `minimize_window`
+    // does not fall through to `hideWindow()` when the hook is present, so
+    // neither hook may call back into it.
+    el_window._ezil_minimise = () => { minimise_to_taskbar(el_window); };
+    el_window._ezil_maximise = () => { go_fullbleed('expand button'); };
 
     // Coming back from the taskbar must return to full-bleed, or a desktop
     // that WAS full-bleed reopens as a 680x380 box (that is what
