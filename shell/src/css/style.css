@@ -243,7 +243,34 @@ html, body {
     padding-bottom: 0;
     height: calc(100vh) !important;
 }
-.fullpage-mode .window-minimize-btn {
+/* MODIFIED BY EZIL 2026-08-08: element-scoped, was `.fullpage-mode
+ * .window-minimize-btn`.
+ *
+ * `.fullpage-mode` is a class on `<body>`, so the old selector hid the
+ * minimise button on EVERY window on screen the moment ANY ONE of them went
+ * full-bleed. In this fork that is not a corner case, it is the normal boot:
+ * `boot.js` opens the Browser window first and `go_fullbleed` puts it
+ * full-bleed as soon as the display gate says `ready`, after which Code,
+ * Preview and Settings each opened as ordinary floating windows that could
+ * not be minimised. OBSERVED, and already written down as a known defect in
+ * `shell/ezil/ui/Settings/stacking-browser-test.mjs` (see its
+ * `buttonPointInside` comment and the ROUND 8 FOLLOW-UP block), which had to
+ * minimise the full-bleed app out of the way before it could test any other
+ * window's minimise affordance at all.
+ *
+ * 🔴 The rule itself is still needed and is NOT being deleted: a full-bleed
+ * window's own head is hidden by `enter_fullpage_mode`, and its minimise lives
+ * in the control drawer instead (`ezil-shell.css`, `app-drawer.js`). Scoping
+ * it to the window that is actually full-bleed keeps that true for that window
+ * and stops it being true for everyone else.
+ *
+ * `data-is_fullpage="1"` is the right key: `UIWindow.js` stamps it at creation
+ * and `go_fullbleed` sets it when it enters full-bleed, and `exit_fullpage_mode`
+ * removes it on the way out — so it tracks the state this rule is about.
+ * (`ezil-fullbleed` is EZiL's own class and deliberately survives a minimise,
+ * which is exactly what this rule must NOT key off: a minimised window that
+ * still wants full-bleed has a visible head again.) */
+.window[data-is_fullpage="1"] .window-minimize-btn {
     display: none;
 }
 .device-phone .desktop {

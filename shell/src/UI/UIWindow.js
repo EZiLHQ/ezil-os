@@ -1918,6 +1918,24 @@ async function UIWindow (options) {
     });
 
     // --------------------------------------------------------
+    // Keyboard activation for the three window controls
+    // --------------------------------------------------------
+    // ADDED BY EZIL 2026-08-08. The controls are `role="button"
+    // tabindex="0"` (see the head markup above), which promises a keyboard
+    // user that Enter and Space do what a click does. `<span>` gives no such
+    // behaviour for free — only a real `<button>` does — so without this the
+    // tab stop is a dead end: focusable, announced as a button, and inert.
+    // Delegated from the head so it covers whichever of the three this
+    // window actually rendered, and `preventDefault` on Space stops the page
+    // scrolling instead.
+    $(`#window-${win_id} > .window-head`).on('keydown', '.window-action-btn', function (e) {
+        if ( e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar' ) return;
+        e.preventDefault();
+        e.stopPropagation();
+        $(this).trigger('click');
+    });
+
+    // --------------------------------------------------------
     // Draggable
     // --------------------------------------------------------
     let width_before_snap = 0;
@@ -3845,8 +3863,18 @@ async function close_one_window (options) {
                 $(`.taskbar-item[data-app="${$(this).attr('data-app')}"] .active-taskbar-indicator`).hide();
             }
             // if a fullpage window is closed, show desktop and taskbar
+            // MODIFIED BY EZIL 2026-08-08: pass the window.
+            // `exit_fullpage_mode` guards its restore work behind
+            // `if ( el_window )` (`UIDesktopFullpage.js`), so calling it bare
+            // ran only the global half — body class off, taskbar back — and
+            // silently skipped everything scoped to the window itself,
+            // including `removeAttr('data-is_fullpage')`. That attribute is
+            // now what `style.css` keys the minimise-button rule off, so
+            // leaving it set is no longer merely untidy. `this` is the window
+            // element `$.fn.close` is already reading `data-is_fullpage` from
+            // one line up.
             if ( $(this).attr('data-is_fullpage') === '1' ) {
-                window.exit_fullpage_mode();
+                window.exit_fullpage_mode(this);
             }
 
             // FileDialog closed
@@ -3991,6 +4019,27 @@ async function close_one_window (options) {
 }
 
 window.scale_window = (el_window) => {
+    // MODIFIED BY EZIL 2026-08-08: the sibling of `minimize_window`'s
+    // `_ezil_minimise` hook, and it exists for the same reason.
+    //
+    // EZiL's Browser window has a bigger "expand" than this function can
+    // express: full-bleed, which hides the taskbar and the window head and is
+    // entered through `go_fullbleed` (`shell/ezil/apps/desktop-window.js`) so
+    // the control drawer comes with it. Before this hook that window was
+    // opened `show_maximize_button: false` — the honest choice at the time,
+    // since a maximise here would have fought `go_fullbleed` for the same
+    // geometry and stranded `data-is_maximized` behind a full-bleed window —
+    // but it left the Browser as the ONE window in the OS with no expand
+    // control at all.
+    //
+    // A window that owns its own expand says so by setting `_ezil_maximise`,
+    // takes the whole job (this function then does nothing, so nothing writes
+    // `data-is_maximized` and there is no geometry to fight over), and every
+    // other window keeps upstream's behaviour unchanged.
+    if ( typeof el_window?._ezil_maximise === 'function' ) {
+        el_window._ezil_maximise();
+        return;
+    }
     //maximize
     if ( $(el_window).attr('data-is_maximized') !== '1' ) {
         // save original size and position
@@ -4606,7 +4655,31 @@ function pop_dashboard_app_url (app_name, options) {
 function minimize_window (el_window) {
     const minimized = $(el_window).attr('data-is_minimized');
     if ( minimized !== '1' && minimized !== 'true' ) {
-        $(el_window).hideWindow();
+        // MODIFIED BY EZIL 2026-08-08: one minimise, whoever asked for it.
+        //
+        // A window can need MORE than `hideWindow()` to minimise correctly.
+        // EZiL's Browser window is the case in point: while it is full-bleed
+        // the taskbar is hidden, so hiding the window first shrinks it toward
+        // a dock that is not on screen and leaves the OS looking empty — it
+        // has to leave full-bleed FIRST (`minimise_to_taskbar` in
+        // `shell/ezil/apps/desktop-window.js`, which has the ordering and the
+        // reasoning). That window already had a correct minimise reachable
+        // from its control drawer; the head button and the titlebar context
+        // menu, which both land here, did not, and produced the empty-OS
+        // result instead.
+        //
+        // 🔴 The hook, rather than teaching this file about `ezil-fullbleed`.
+        // This is Puter-derived code (see PUTER-PROVENANCE.md) and the
+        // full-bleed drawer is entirely EZiL's; a window that knows how to
+        // minimise itself says so by setting `_ezil_minimise`, and everything
+        // else keeps the upstream behaviour byte-for-byte. The hook is
+        // responsible for the whole minimise, including the hide — it must
+        // not call back into this function.
+        if ( typeof el_window?._ezil_minimise === 'function' ) {
+            el_window._ezil_minimise();
+        } else {
+            $(el_window).hideWindow();
+        }
     }
     pop_dashboard_app_url($(el_window).attr('data-app'));
 }
