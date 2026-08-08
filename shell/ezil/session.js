@@ -25,6 +25,7 @@
 // render honestly (see `boot-phases.js`).
 
 import telemetry from './telemetry.js';
+import { WAKE_DEADLINE_MS, WAKE_REASK_MS, isRetryableBootErrorCode } from './boot-phases.js';
 
 const NS = 'ezil-os:';
 
@@ -183,6 +184,117 @@ async function request (url, { method = 'GET', body, timeoutMs } = {}) {
     return { ok: true, data };
 }
 
+// ---------------------------------------------------------------------------
+// The wake loop, and the one automatic retry
+// ---------------------------------------------------------------------------
+
+/**
+ * Hard ceiling on how many times ONE call may hit the server, whatever the
+ * two real bounds below happen to say. See the comment at the top of
+ * `withWakeAndOneRetry`'s loop for why a ceiling and not just the conditions.
+ */
+const MAX_ISSUES = 40;
+
+/**
+ * 🔴 THE HIBERNATION FIX, CLIENT SIDE. One implementation, three callers
+ * (`openDesktop`, `previewUrl`, and `apps/code.js`'s own mint) — three copies
+ * of a retry loop is how the timings drift apart and one surface quietly stops
+ * waiting.
+ *
+ * Two distinct behaviours, and they are NOT the same thing:
+ *
+ *   1. THE WAKE LOOP. `sandbox_starting` is not a failure. It is the server
+ *      saying "the container is coming up and I am not going to hold this
+ *      socket for three minutes" (see `SANDBOX_WAKE_ANSWER_BUDGET_MS` in
+ *      `app/src/server/lib/cloudflare-guacamole-provider.ts`). The honest
+ *      response is to ask again, which is what this does, until
+ *      `WAKE_DEADLINE_MS`. The caller's boot panel is on a `setInterval` of its
+ *      own, so the phase list keeps running the whole time — the user sees
+ *      "Waking your machine" for as long as that is the true statement, instead
+ *      of a dead socket followed by "We couldn't start your computer."
+ *
+ *   2. ONE AUTOMATIC RETRY. Measured on this repo's own regression: the first
+ *      mint after an idle period fails, and the second one — issued seconds
+ *      later, byte-identical — succeeds every single time. So a RETRYABLE
+ *      failure buys exactly one silent re-ask before the user is shown
+ *      anything. ONE. `retried` is a plain boolean, set before the second
+ *      attempt is issued and never cleared inside this call, so there is no
+ *      path through here that can issue a third. A DETERMINISTIC failure
+ *      (`isRetryableBootErrorCode` — an HMAC mismatch, a malformed request)
+ *      buys none, because re-asking a fixed question is just latency.
+ *
+ * The wake loop and the retry compose without interfering: `sandbox_starting`
+ * is consumed by (1) and never reaches (2), so a long wake cannot silently
+ * spend the one retry that a genuine failure is owed.
+ *
+ * @param {() => Promise<{ok: true} | {ok: false, errorCode: string, message?: string}>} issue
+ *   Sends the request once. Must never throw.
+ * @param {string} what For the log line only.
+ */
+async function withWakeAndOneRetry (issue, what) {
+    const t0 = Date.now();
+    let retried = false;
+    let asks = 0;
+
+    for (;;) {
+        // 🔴 THE STRUCTURAL BACKSTOP, AND IT IS NOT DECORATION. Every other
+        // bound in this function is a CONDITION — a clock for the wake, a
+        // boolean for the retry — and a condition can be edited away. Removing
+        // the `retried = true` line was tried during review and it turned this
+        // into an unbounded, zero-delay request loop that HUNG the headless
+        // suite rather than failing it. A browser would have hammered the
+        // server for as long as the tab stayed open.
+        //
+        // `MAX_ISSUES` is far above every legitimate path (a full 215s wake at
+        // ~13.5s per ask is ~16, plus one retry) so it can never fire in normal
+        // use, and it turns any future breakage of the two real bounds into a
+        // stop rather than a spin. With it in place the same mutation now
+        // reports `attempts=40` and fails three named checks.
+        if ( asks >= MAX_ISSUES ) {
+            console.error(`[ezil-os:session] ${what}: refusing to ask a ${asks + 1}th time; stopping`);
+            telemetry.capture({
+                eventClass: 'contract_violation', site: `ezil-os:session#${what}`, code: 'ask_cap_reached',
+                durationMs: Date.now() - t0, detail: `${asks} asks`,
+            });
+            return { ok: false, errorCode: 'unknown', message: 'Gave up asking the server.' };
+        }
+        asks++;
+        const res = await issue();
+        if ( res.ok === true ) return res;
+
+        if ( res.errorCode === 'sandbox_starting' ) {
+            const waited = Date.now() - t0;
+            if ( waited >= WAKE_DEADLINE_MS ) {
+                console.warn(`[ezil-os:session] ${what}: still waking after ${waited}ms; giving up`);
+                telemetry.capture({
+                    eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: 'sandbox_starting',
+                    durationMs: waited, detail: `gave up after ${asks} asks`,
+                });
+                // The honest code for "it never finished waking within our
+                // budget". `classifyFailure` in boot-phases.js turns it into
+                // the `timeout` copy — "it may still come up in the background
+                // — try again" — which is exactly what is true.
+                return res;
+            }
+            await new Promise(r => setTimeout(r, WAKE_REASK_MS));
+            continue;
+        }
+
+        // A genuine failure. One silent re-ask if a second attempt could
+        // plausibly answer differently, then hand it to the user.
+        if ( ! retried && isRetryableBootErrorCode(res.errorCode) ) {
+            retried = true;
+            console.info(`[ezil-os:session] ${what}: ${res.errorCode} on the first attempt; retrying once`);
+            telemetry.capture({
+                eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: `auto_retry_${res.errorCode}`,
+                durationMs: Date.now() - t0,
+            });
+            continue;
+        }
+        return res;
+    }
+}
+
 /** `GET /api/shell/session` — read-only. `computer` may be null. */
 export function readSession () {
     return request(endpoint('session'), { timeoutMs: STATUS_TIMEOUT_MS });
@@ -211,6 +323,11 @@ export async function openDesktop (computerId) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to open.' };
     }
+    return withWakeAndOneRetry(() => openDesktopOnce(computerId), 'openDesktop');
+}
+
+/** One `POST /api/shell/desktop`. The loop that may call it more than once is above. */
+async function openDesktopOnce (computerId) {
     const res = await request(endpoint('desktop'), {
         method: 'POST',
         body: { computerId },
@@ -286,6 +403,11 @@ export async function previewUrl (computerId) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to preview.' };
     }
+    return withWakeAndOneRetry(() => previewUrlOnce(computerId), 'previewUrl');
+}
+
+/** One `POST /api/shell/preview-url`. The loop that may call it more than once is above. */
+async function previewUrlOnce (computerId) {
     const res = await request(endpoint('previewUrl'), {
         method: 'POST',
         body: { computerId },
@@ -566,6 +688,8 @@ export async function reportActivity (computerId, lastInputAgoMs) {
     return res.data?.ok === true;
 }
 
+export { withWakeAndOneRetry };
+
 export default {
     get, set, del,
     payload,
@@ -574,6 +698,7 @@ export default {
     previewUrl, focusApp,
     restartEndpoint, restartDesktop,
     activityEndpoint, reportActivity,
+    withWakeAndOneRetry,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
 };

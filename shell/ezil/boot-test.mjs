@@ -467,9 +467,197 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
         && failed_win?.getAttribute('data-is_fullpage') === '0',
         `class="${failed_win?.className}" fullpage=${failed_win?.getAttribute('data-is_fullpage')}`);
 
+    // 🔴 THE AUTOMATIC RETRY — ONCE, AND ONLY ONCE.
+    //
+    // Measured on the hibernation regression: the first mint after an idle
+    // period fails and the second, issued seconds later and byte-identical,
+    // succeeds every single time. So one retryable failure buys exactly one
+    // silent re-ask. `connection_refused` is retryable, so by the time the
+    // user sees this panel the shell has already asked twice.
+    //
+    // Both halves are asserted deliberately. "At least two" would pass for a
+    // retry LOOP, which is the failure mode a silent retry actually has.
+    push('🔴 a retryable first failure was silently re-asked exactly ONCE',
+        attempts === 2, `attempts=${attempts}`);
+    await sleep(600);
+    push('🔴 ...and it stopped there — a silent retry that loops is worse than none',
+        attempts === 2, `attempts=${attempts}`);
+
+    const before_click = attempts;
     window.$(retry).trigger('click');
-    const retried = await until(() => attempts >= 2);
-    push('Retry re-runs the boot', !!retried, `attempts=${attempts}`);
+    const retried = await until(() => attempts > before_click);
+    push('Retry re-runs the boot', !!retried, `attempts=${before_click} -> ${attempts}`);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 2b — A DETERMINISTIC FAILURE BUYS NO RETRY
+//
+// The sign-flipped guard on the automatic retry above. Re-asking a question
+// whose answer is fixed — a rejected HMAC signature, a malformed request — is
+// pure latency in front of the same panel. `isRetryableBootErrorCode` is what
+// tells the two apart, and this is the proof it is actually consulted rather
+// than being a decoration on an unconditional retry.
+// ───────────────────────────────────────────────────────────────────────────
+{
+    let attempts = 0;
+    const { window } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            attempts++;
+            return { ok: false, errorCode: 'unauthorized' };
+        }
+        return { ok: true, guacamoleRunning: false };
+    });
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    open_desktop(window);
+
+    await until(() => $1(window, '.ezil-boot[data-kind="failed"]'));
+    await sleep(600);
+    push('🔴 a DETERMINISTIC failure is not re-asked at all', attempts === 1, `attempts=${attempts}`);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 2c — THE HIBERNATION WAKE
+//
+// 🔴 THE REGRESSION THIS WHOLE WAVE EXISTS FOR. A hibernated container used to
+// hold the request for ~187s and then hand back something the browser could
+// only call `unknown`, whose copy is the dead end "We couldn't start your
+// computer." The server now answers `sandbox_starting` at 12s — labelled and
+// retryable — and the shell's job is to treat that as PROGRESS and ask again.
+//
+// The two properties, and the second is the one that was actually broken:
+//   1. it keeps asking until the container is up, and then boots normally;
+//   2. it NEVER shows a failure panel while it is doing so.
+// ───────────────────────────────────────────────────────────────────────────
+{
+    const WAKES = 3;
+    let posts = 0;
+    let saw_failure = false;
+    const { window, seen } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            posts++;
+            // The first three asks land on a container that is still waking.
+            if (posts <= WAKES) return { ok: false, errorCode: 'sandbox_starting' };
+            return {
+                ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko',
+                frame: { confirmed: true },
+            };
+        }
+        if (url.includes('confirm=frame')) return { ok: true, confirmed: true };
+        if (url.includes('confirm=display')) return { ok: true, display: 'live' };
+        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: false };
+        return { ok: true };
+    });
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    open_desktop(window);
+
+    // Watch the panel for the whole wake. A single `failed` frame at any point
+    // is the defect, so this samples rather than checking once at the end.
+    const watcher = setInterval(() => {
+        if ($1(window, '.ezil-boot')?.getAttribute('data-kind') === 'failed') saw_failure = true;
+    }, 50);
+
+    const iframe = await until(() => $1(window, '.window[data-app="desktop"] .window-app-iframe'), 10_000);
+    const booted = await until(() => iframe?.getAttribute('src') === URL_OK, 20_000);
+    clearInterval(watcher);
+
+    push('🔴 a container that answers "still waking" is asked again, and boots',
+        !!booted, `${posts} POSTs, src=${iframe?.getAttribute('src')}`);
+    push('🔴 ...and the user was NEVER shown a failure panel during the wake',
+        !saw_failure, `saw_failure=${saw_failure}`);
+    push('🔴 ...it really did re-ask, rather than one lucky first attempt',
+        posts === WAKES + 1, `${posts} POSTs`);
+    push('the phase list was live throughout — this is the UI that was dead',
+        $$(window, '.ezil-boot-phase').length === 4);
+
+    // And the wake must not have burned the one automatic retry: that is owed
+    // to a genuine failure, and `sandbox_starting` is not one.
+    push('the wake did not spend the automatic retry (no extra POST)',
+        seen.filter(r => r.method === 'POST' && r.url === '/api/shell/desktop').length === WAKES + 1,
+        `${seen.filter(r => r.method === 'POST' && r.url === '/api/shell/desktop').length} POSTs`);
+
+    await window.$($1(window, '.window[data-app="desktop"]')).close();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scenario 2d — A SERVER THAT DID NOT CHECK IS NOT A DESKTOP THAT REFUSED
+//
+// 🔴 The desktop window's half of the same defect `code-test.mjs` pins for the
+// Code window. When the preview response carries no `frame.confirmed`,
+// `session.openDesktop` reports `frameConfirmed: false` — and this window used
+// to render that as the terminal "Your desktop isn't answering" panel, in the
+// same breath as navigating the iframe and asking the browser's own question,
+// which then usually said yes. Its own comment admitted the panel was expected
+// to be overturned.
+//
+// Both directions, so this is a discrimination and not a blanket softening:
+// unasked is PROGRESS and still reaches `ready`; asked-and-refused is a
+// FAILURE.
+// ───────────────────────────────────────────────────────────────────────────
+{
+    const { window } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            // 🔴 NO `frame` FIELD AT ALL — a server that did not check.
+            return { ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko' };
+        }
+        if (url.includes('confirm=frame')) return { ok: true, confirmed: true };
+        if (url.includes('confirm=display')) return { ok: true, display: 'live' };
+        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
+        return { ok: true };
+    });
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    open_desktop(window);
+
+    const win = await until(() => $1(window, '.window[data-app="desktop"]'));
+    const iframe = await until(() => $1(window, '.window[data-app="desktop"] .window-app-iframe'));
+    await until(() => iframe?.getAttribute('src') === URL_OK, 8_000);
+
+    push('🔴 an unconfirmed handoff is PROGRESS, not "Your desktop isn\'t answering"',
+        $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'progress',
+        $1(window, '.ezil-boot')?.getAttribute('data-kind'));
+    push('🔴 ...and no Retry is offered for a question nobody has asked yet',
+        $1(window, '.ezil-boot-actions')?.hidden === true,
+        `actions hidden=${$1(window, '.ezil-boot-actions')?.hidden}`);
+
+    iframe.dispatchEvent(new window.Event('load'));
+    const revealed = await until(() => win.classList.contains('ezil-fullbleed'), 10_000);
+    push('🔴 ...and the browser\'s own confirmation still carries it all the way to ready',
+        !!revealed && $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'ready',
+        `${win.className} panel=${$1(window, '.ezil-boot')?.getAttribute('data-kind')}`);
+    await window.$(win).close();
+}
+
+{
+    // The sign flip: same unconfirmed handoff, and this time the browser's
+    // question comes back NO. That is a real observation, and it must be a
+    // failure — immediately, not at the deadline.
+    const { window } = boot_shell(async (url, init) => {
+        if (url.startsWith('/api/shell/desktop') && init.method === 'POST') {
+            return { ok: true, guacamoleUrl: URL_OK, controlMode: 'interactive', mode: 'neko' };
+        }
+        if (url.includes('confirm=frame')) return { ok: true, confirmed: false };
+        if (url.includes('confirm=display')) return { ok: true, display: 'live' };
+        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
+        return { ok: true };
+    });
+    await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
+    open_desktop(window);
+
+    const win = await until(() => $1(window, '.window[data-app="desktop"]'));
+    const iframe = await until(() => $1(window, '.window[data-app="desktop"] .window-app-iframe'));
+    await until(() => iframe?.getAttribute('src') === URL_OK, 8_000);
+    iframe.dispatchEvent(new window.Event('load'));
+
+    const failed = await until(
+        () => $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'failed', 10_000);
+    push('🔴 an unconfirmed handoff that IS then refused becomes a failure', !!failed,
+        $1(window, '.ezil-boot')?.getAttribute('data-kind'));
+    push('...with the frame check\'s own copy and a Retry',
+        $1(window, '.ezil-boot-title')?.textContent === "Your desktop isn't answering"
+        && $1(window, '.ezil-boot-actions')?.hidden === false,
+        $1(window, '.ezil-boot-title')?.textContent);
+    push('...and the viewport was never handed over',
+        !win.classList.contains('ezil-fullbleed'), win.className);
+    await window.$(win).close();
 }
 
 // ───────────────────────────────────────────────────────────────────────────

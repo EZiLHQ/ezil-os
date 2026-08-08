@@ -15,6 +15,7 @@ import {
     BOOT_FAILURE_COPY,
     BOOT_PHASES,
     BOOT_UNVERIFIED_COPY,
+    FRAME_CONFIRM_DEADLINE_MS,
     LONG_BOOT_MS,
     TYPICAL_BOOT_MS,
     applyDisplayEvidence,
@@ -81,10 +82,23 @@ describe('computeBootUiState — never fabricates progress', () => {
         ).toEqual({ kind: 'failed', reason: 'desktop_unreachable' });
     });
 
-    it('CANNOT report ready when nobody looked at the frame at all — fails closed', () => {
-        // A caller that forgot to thread the observation gets a visible,
-        // retryable failure, never an unearned `ready`.
+    it('🔴 success + nobody-has-asked-yet is PROGRESS, not a failure — and never ready', () => {
         expect(computeBootUiState({ requestStatus: 'success', elapsedMs: 0 })).toEqual({
+            kind: 'progress',
+            currentPhase: 'connecting',
+            confirmed: false,
+            isRunningLong: false,
+        });
+        for (const elapsedMs of [0, 1, 5_000, 34_999, 35_000, 44_999, 45_000, 600_000]) {
+            expect(computeBootUiState({ requestStatus: 'success', elapsedMs }).kind).not.toBe('ready');
+        }
+    });
+
+    it('🔴 ...and it DOES escalate to desktop_unreachable once the deadline elapses', () => {
+        expect(
+            computeBootUiState({ requestStatus: 'success', elapsedMs: FRAME_CONFIRM_DEADLINE_MS - 1 }).kind,
+        ).toBe('progress');
+        expect(computeBootUiState({ requestStatus: 'success', elapsedMs: FRAME_CONFIRM_DEADLINE_MS })).toEqual({
             kind: 'failed',
             reason: 'desktop_unreachable',
         });
@@ -96,6 +110,13 @@ describe('computeBootUiState — never fabricates progress', () => {
                 computeBootUiState({
                     requestStatus: 'success',
                     elapsedMs: 0,
+                    frameConfirmed: junk as boolean,
+                }).kind,
+            ).toBe('progress');
+            expect(
+                computeBootUiState({
+                    requestStatus: 'success',
+                    elapsedMs: FRAME_CONFIRM_DEADLINE_MS,
                     frameConfirmed: junk as boolean,
                 }),
             ).toEqual({ kind: 'failed', reason: 'desktop_unreachable' });
@@ -362,7 +383,12 @@ describe('classifyPreviewFetchError — only a real AbortSignal.timeout counts a
 // people at different times and the honesty rules live in the branches.
 
 describe('the port is a module-format conversion and nothing more', () => {
-    const ELAPSED_SWEEP = [0, 1, 299, 300, 3_000, 6_199, 6_200, 21_499, 21_500, 34_999, 35_000, 120_000];
+    // 44_999/45_000 straddle `FRAME_CONFIRM_DEADLINE_MS`: the `success` branch
+    // changes answer there, so a sweep that skipped it would compare the two
+    // copies everywhere except the one boundary that was just added.
+    const ELAPSED_SWEEP = [
+        0, 1, 299, 300, 3_000, 6_199, 6_200, 21_499, 21_500, 34_999, 35_000, 44_999, 45_000, 120_000,
+    ];
     const REQUEST_STATUSES = ['not_configured', 'pending', 'success', 'error'] as const;
     const CONFIRMED = [undefined, false, true] as const;
     const ERROR_CODES = [
@@ -375,6 +401,7 @@ describe('the port is a module-format conversion and nothing more', () => {
         'fetch_failed',
         'sandbox_runtime_blocked',
         'sandbox_start_failed',
+        'sandbox_starting',
         'worker_http_error',
         'desktop_unreachable',
         'timeout',
@@ -393,6 +420,7 @@ describe('the port is a module-format conversion and nothing more', () => {
         expect(ported.BOOT_PHASES).toEqual(original.BOOT_PHASES);
         expect(ported.TYPICAL_BOOT_MS).toBe(original.TYPICAL_BOOT_MS);
         expect(ported.LONG_BOOT_MS).toBe(original.LONG_BOOT_MS);
+        expect(ported.FRAME_CONFIRM_DEADLINE_MS).toBe(original.FRAME_CONFIRM_DEADLINE_MS);
         expect(ported.BOOT_PROGRESS_HEADLINE).toBe(original.BOOT_PROGRESS_HEADLINE);
         expect(ported.BOOT_PROGRESS_SUBTEXT).toBe(original.BOOT_PROGRESS_SUBTEXT);
         expect(ported.BOOT_PROGRESS_LONG_SUBTEXT).toBe(original.BOOT_PROGRESS_LONG_SUBTEXT);
@@ -494,6 +522,29 @@ describe('the port is a module-format conversion and nothing more', () => {
             ANSWERS.map((a) => (ported.applyDisplayEvidence({ kind: 'ready' } as never, a as never)).kind),
         );
         expect([...kinds].sort()).toEqual(['failed', 'ready', 'ready_unverified']);
+    });
+
+    it('agrees on isRetryableBootErrorCode for every code and every near-miss', () => {
+        const CODES: unknown[] = [
+            ...ERROR_CODES,
+            'sandbox_starting',
+            '',
+            'some_future_code',
+            'BAD_REQUEST',
+            ' unauthorized',
+            null,
+            0,
+            false,
+        ];
+        for (const code of CODES) {
+            expect(ported.isRetryableBootErrorCode(code as never)).toBe(
+                original.isRetryableBootErrorCode(code as never),
+            );
+        }
+        // Vacuity guard: the sweep must contain both answers, or "they agree"
+        // is a statement about a constant function.
+        const answers = new Set(CODES.map((c) => ported.isRetryableBootErrorCode(c as never)));
+        expect([...answers].sort()).toEqual([false, true]);
     });
 
     it('agrees on classifyPreviewFetchError', () => {

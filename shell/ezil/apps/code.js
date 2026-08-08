@@ -119,7 +119,17 @@ async function mintCodePreviewUrl (computerId) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to preview.' };
     }
+    // 🔴 THE WAKE LOOP AND THE ONE RETRY ARE SESSION.JS'S, NOT A COPY. This
+    // window's own timeline is the one the regression was measured on
+    // (`POST /api/shell/code-preview-url` at 12:40:57, dead at 12:44:05 after
+    // 187505ms with `errorCode: unknown`; retry two seconds later resolved in
+    // 5460ms). Re-implementing the loop here is how the two surfaces would
+    // stop waiting for the same length of time — see `withWakeAndOneRetry`.
+    return session.withWakeAndOneRetry(() => mintCodePreviewUrlOnce(computerId), 'codePreviewUrl');
+}
 
+/** One `POST /api/shell/code-preview-url`. The loop that may call it more than once is above. */
+async function mintCodePreviewUrlOnce (computerId) {
     const endpoint = session.payload()?.desktopState?.endpoints?.codePreviewUrl
         ?? '/api/shell/code-preview-url';
 
@@ -367,11 +377,26 @@ export async function openCodeWindow (ctx = {}) {
 
         console.info(`[${PHASE}] mint resolved in ${Math.round(performance.now() - t0)}ms`);
         trace.step('mint_ok');
-        progress.render(computeBootUiState({
-            requestStatus: 'success',
-            elapsedMs: 0,
-            frameConfirmed: false,
-        }));
+
+        // 🔴 THE HANDOFF IS NOT A VERDICT. This used to pass
+        // `frameConfirmed: false`, which `computeBootUiState` read as "asked
+        // and refuted" and rendered as the terminal "Your desktop isn't
+        // answering" panel — over a window that was working. Nobody had asked
+        // anything yet: `settle_frame` below is what asks, and measured, it
+        // answers about six seconds later. The flag is now OMITTED, which is
+        // the input that means "no observation exists", and the panel shows
+        // the `connecting` phase until there is one. The boot still ends on
+        // its own: `FRAME_CONFIRM_DEADLINE_MS` is measured from `t_handoff`.
+        const t_handoff = performance.now();
+        const paint_handoff = () => {
+            if ( disposed || my_attempt !== attempt ) return;
+            progress.render(computeBootUiState({
+                requestStatus: 'success',
+                elapsedMs: performance.now() - t_handoff,
+            }));
+        };
+        paint_handoff();
+        tick_timer = setInterval(paint_handoff, TICK_MS);
 
         el_iframe.src = code_preview_url;
         settle_frame(my_attempt);
@@ -403,6 +428,10 @@ export async function openCodeWindow (ctx = {}) {
             }
 
             settled = true;
+            // Either way the handoff clock has done its job — stop repainting
+            // it before writing a settled state, or the next tick overwrites
+            // the answer with the progress panel again.
+            stop_timers();
 
             if ( seen === true ) {
                 progress.el.hidden = true;
@@ -421,6 +450,11 @@ export async function openCodeWindow (ctx = {}) {
                 attrs: { seen: String(seen) },
             });
             show_panel();
+            // 🔴 `false`, explicitly, and this is the ONLY place this window
+            // says it. We asked, and either the origin refused or we exhausted
+            // `FRAME_CONFIRM_ATTEMPTS` trying to reach our own server. That is
+            // a real negative observation, and it is a failure now, not at the
+            // deadline.
             progress.render(computeBootUiState({
                 requestStatus: 'success',
                 elapsedMs: 0,

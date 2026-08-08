@@ -63,6 +63,46 @@ const CLIENT_TIMEOUT_MARGIN_MS = 30_000;
 const SANDBOX_COLD_START_TIMEOUT_MS = WORKER_DESKTOP_READY_TIMEOUT_MS + CLIENT_TIMEOUT_MARGIN_MS;
 
 /**
+ * 🔴 HOW LONG ONE PREVIEW REQUEST MAY HOLD A CALLER BEFORE IT ADMITS THE
+ * CONTAINER IS STILL WAKING.
+ *
+ * ── The regression this exists for ──────────────────────────────────────────
+ * Containers now hibernate when idle. The first request after a hibernation
+ * wakes one, and the Worker's readiness wait (`WORKER_DESKTOP_READY_TIMEOUT_MS`,
+ * 180s) does not survive it: measured in production, `POST /sandbox/preview`
+ * came back 500 `desktop_failed_to_start` at 187s, the tRPC layer threw
+ * BAD_GATEWAY over it, and both shell clients — which map every non-401 HTTP
+ * failure to `unknown` — showed "We couldn't start your computer." Clicking
+ * Retry two seconds later succeeded in 5-22s, every single time, because the
+ * wake HAD worked. The only thing that failed was the request that triggered it.
+ *
+ * ── Why answering early is the fix, and not a papering-over ─────────────────
+ * The container boot is NOT bound to this request. `ensureDesktop` issues
+ * `sandbox.startProcess` inside the first ~6s (measured: container_start ~0.3s,
+ * workspace_mount ~5.9s) and the container proceeds on the Durable Object's own
+ * lifetime from there. So a caller that stops WAITING has not stopped the wake;
+ * it has only stopped pretending that one request must witness it. 12s sits
+ * comfortably past that ~6s, so we never abandon a request before the thing we
+ * are waiting for has even been asked for.
+ *
+ * What comes back instead is `sandbox_starting` — LABELLED, retryable, and
+ * carrying the one true statement available: it is waking, ask again. Callers
+ * turn that into the `waking`/`mounting`/`starting`/`connecting` progress the
+ * boot UI already knows how to draw, instead of a dead end.
+ *
+ * 🔴 This does NOT abort the in-flight Worker call. Aborting would be the one
+ * way to actually damage the wake — it would cancel the Worker invocation that
+ * is driving it. The fetch is left running under its own
+ * `SANDBOX_COLD_START_TIMEOUT_MS` budget with its rejection swallowed; whatever
+ * it eventually answers is discarded, because the caller has already been told
+ * the truth and has already moved on.
+ */
+export const SANDBOX_WAKE_ANSWER_BUDGET_MS = 12_000;
+
+/** The race sentinel. A unique object, so nothing off the wire can impersonate it. */
+const WAKE_STILL_RUNNING = Symbol('sandbox_wake_still_running');
+
+/**
  * Mint a fresh correlation id for one product action -> API -> Worker
  * chain. Non-sensitive and non-reversible.
  */
@@ -252,6 +292,13 @@ export type GuacamolePreviewErrorCode =
     | 'fetch_failed'
     | 'sandbox_runtime_blocked'
     | 'sandbox_start_failed'
+    /**
+     * The container is WAKING and this request is not going to wait for it.
+     * A soft, labelled, retryable "not ready yet" — see
+     * `SANDBOX_WAKE_ANSWER_BUDGET_MS`. It is never a statement that anything
+     * failed, and callers must render it as progress, not as an error.
+     */
+    | 'sandbox_starting'
     | 'worker_http_error'
     | 'timeout'
     | 'unknown';
@@ -280,8 +327,10 @@ export type GuacamolePreviewErrorCode =
  * (the Worker never answered — it may next time), sandbox_start_failed
  * (containers vanish without notice, `docs/PLATFORM-NOTES.md` §8, and a
  * restart genuinely can succeed), timeout (a cold-start race that ran past
- * our budget), and worker_http_error (now only ever a 5xx/408/429 — see
- * `classifyWorkerHttpFailure`).
+ * our budget), worker_http_error (now only ever a 5xx/408/429 — see
+ * `classifyWorkerHttpFailure`), and sandbox_starting, which is not merely
+ * retryable but is a REQUEST to be re-asked: it means the wake is under way
+ * and the next attempt is how we find out it finished.
  */
 const DETERMINISTIC_PREVIEW_ERROR_CODES: ReadonlySet<string> = new Set<GuacamolePreviewErrorCode>([
     'bad_request',
@@ -295,6 +344,53 @@ const DETERMINISTIC_PREVIEW_ERROR_CODES: ReadonlySet<string> = new Set<Guacamole
 export function isRetryablePreviewErrorCode(code: GuacamolePreviewErrorCode | undefined): boolean {
     if (!code) return true; // unclassified — safe direction is one duplicate request
     return !DETERMINISTIC_PREVIEW_ERROR_CODES.has(code);
+}
+
+/**
+ * Expected operational failures — not server bugs. The tRPC router returns
+ * these as typed result objects instead of throwing, so the browser gets a
+ * first-class actionable panel rather than a generic one.
+ */
+const OPERATIONAL_PREVIEW_ERROR_CODES: ReadonlySet<string> = new Set<GuacamolePreviewErrorCode>([
+    'connection_refused',
+    'fetch_failed',
+    'sandbox_runtime_blocked',
+    'sandbox_start_failed',
+    'sandbox_starting',
+    'timeout',
+]);
+
+/**
+ * Does this failure reach the browser WITH ITS CODE, or as a thrown 502 the
+ * browser can only call `unknown`?
+ *
+ * 🔴 A THROW DESTROYS THE LABEL. Anything the router raises as a `TRPCError`
+ * becomes `{error:{code:'BAD_GATEWAY', message:<generic>}}` with a 502
+ * (`server/shell/http.ts` strips 5xx detail on purpose, because an internal
+ * message can carry internals), and both shell clients map every non-401 HTTP
+ * failure to `unknown` — whose copy is the dead end "We couldn't start your
+ * computer." So this is not a stylistic choice about throwing: it is the
+ * difference between a code the browser can act on and no code at all.
+ *
+ * It lives HERE rather than in the router because the router imports the
+ * database and cannot be loaded by a unit test — and an untestable rule is how
+ * this one went unexamined while it silently deleted every label that mattered.
+ *
+ * `sandbox_starting` is the most important member of the operational set: it
+ * is the answer a hibernated container gives, it is PROGRESS rather than a
+ * failure, and it is worthless if it arrives unlabelled.
+ */
+export function surfacePreviewErrorAsValue(
+    errorCode: string | undefined,
+    retryable: boolean,
+): boolean {
+    // Nothing to surface. Unreachable from `previewError` now that the code is
+    // required, and kept as the belt on those braces.
+    if (!errorCode) return false;
+    // A deterministic failure must never be thrown: a thrown error is the only
+    // thing TanStack Query retries, and re-asking a fixed question is pure
+    // latency in front of the same panel.
+    return !retryable || OPERATIONAL_PREVIEW_ERROR_CODES.has(errorCode);
 }
 
 /**
@@ -328,7 +424,23 @@ export function classifyWorkerHttpFailure(status: number, body: string): Guacamo
 export interface GuacamolePreviewError {
     ok: false;
     error: string;
-    errorCode?: GuacamolePreviewErrorCode;
+    /**
+     * 🔴 REQUIRED. Not optional, and this is the whole point.
+     *
+     * It was optional, and `previewError`'s second parameter was optional to
+     * match, so it was possible — and legal, and silent — to construct a soft
+     * failure carrying no code at all. Every caller downstream then has exactly
+     * one thing left to say about it: `errorCode ?? 'unknown'`, whose user-facing
+     * copy is the dead end "We couldn't start your computer." A failure with no
+     * label cannot be classified, cannot be retried on purpose, and cannot be
+     * told apart from a genuine bug.
+     *
+     * Making it required is not a lint: it is the reason `previewError` below
+     * can no longer be called without deciding what kind of failure this is.
+     * `'unknown'` is still available for a failure that genuinely is unknown —
+     * but now somebody has to write the word.
+     */
+    errorCode: GuacamolePreviewErrorCode;
     /**
      * Whether re-sending the identical request could plausibly change the
      * answer. Travels WITH the failure rather than being re-derived by each
@@ -341,8 +453,23 @@ export interface GuacamolePreviewError {
 
 export type GuacamolePreviewResult = GuacamolePreviewSuccess | GuacamolePreviewError;
 
-/** The single construction site for a preview failure, so `retryable` is always consistent with `errorCode`. */
-function previewError(error: string, errorCode?: GuacamolePreviewErrorCode): GuacamolePreviewError {
+/**
+ * The single construction site for a preview failure, so `retryable` is always
+ * consistent with `errorCode`.
+ *
+ * 🔴 `errorCode` IS REQUIRED, AT THE TYPE LEVEL. It used to be optional, which
+ * made an unlabelled soft failure constructible by simply not passing it — and
+ * that is exactly what reached production: a 200 or a 502 whose body carried no
+ * code, which both shell clients collapsed to `unknown` and rendered as "We
+ * couldn't start your computer." over a container that was merely waking.
+ *
+ * There is now no way to build a `GuacamolePreviewError` without naming its
+ * kind. `'unknown'` remains a legitimate answer for a failure that genuinely is
+ * unknown; the difference is that somebody has to type it, and a reviewer can
+ * see them do it. See `previewError refuses to build an unlabelled failure` in
+ * `cloudflare-guacamole-provider.test.ts` for the compile-time proof.
+ */
+function previewError(error: string, errorCode: GuacamolePreviewErrorCode): GuacamolePreviewError {
     return { ok: false, error, errorCode, retryable: isRetryablePreviewErrorCode(errorCode) };
 }
 
@@ -351,6 +478,12 @@ function previewError(error: string, errorCode?: GuacamolePreviewErrorCode): Gua
  * never throws. Errors are captured and returned as `{ ok: false, ... }` so
  * the tRPC router can surface them cleanly to the browser without leaking
  * internal details.
+ *
+ * 🔴 IT NO LONGER WAITS FOR A HIBERNATED CONTAINER. Past
+ * `SANDBOX_WAKE_ANSWER_BUDGET_MS` it answers `sandbox_starting` — labelled,
+ * retryable, and true — and leaves the Worker call running so the wake it
+ * started is not disturbed. See that constant for the measured failure this
+ * replaces.
  */
 export async function requestGuacamolePreview(
     config: CloudflareGuacamoleConfig,
@@ -372,13 +505,47 @@ export async function requestGuacamolePreview(
     const body: GuacamolePreviewRequest = { ...input, token };
 
     try {
-        const res = await fetch(`${config.workerUrl.replace(/\/$/, '')}/sandbox/preview`, {
+        const workerCall = fetch(`${config.workerUrl.replace(/\/$/, '')}/sandbox/preview`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', [CORRELATION_HEADER]: correlationId },
             body: JSON.stringify(body),
             // Generous timeout to allow the container's cold start.
             signal: AbortSignal.timeout(SANDBOX_COLD_START_TIMEOUT_MS),
         });
+        // Whatever happens to this call after the wake budget expires is not
+        // this caller's business any more, but an unhandled rejection IS
+        // everybody's business. Swallow it here, once, at the source.
+        workerCall.catch(() => {});
+
+        let wakeTimer: ReturnType<typeof setTimeout> | undefined;
+        let res: Response;
+        try {
+            const answered = await Promise.race([
+                workerCall,
+                new Promise<typeof WAKE_STILL_RUNNING>((resolve) => {
+                    wakeTimer = setTimeout(() => resolve(WAKE_STILL_RUNNING), SANDBOX_WAKE_ANSWER_BUDGET_MS);
+                }),
+            ]);
+            if (answered === WAKE_STILL_RUNNING) {
+                // 🔴 NOT A FAILURE, AND SAID SO IN THE LABEL. The Worker is
+                // still working and the container is still coming up; we are
+                // simply declining to hold this connection for another ~175s
+                // and then hand back something nobody can classify.
+                console.info('[requestGuacamolePreview] container still waking; answering early', {
+                    correlationId,
+                    afterMs: SANDBOX_WAKE_ANSWER_BUDGET_MS,
+                });
+                return previewError(
+                    `sandbox_starting: the container is still waking after ${SANDBOX_WAKE_ANSWER_BUDGET_MS}ms`,
+                    'sandbox_starting',
+                );
+            }
+            res = answered;
+        } finally {
+            // Both directions: a fetch that won the race must not leave a live
+            // timer behind either.
+            if (wakeTimer !== undefined) clearTimeout(wakeTimer);
+        }
 
         if (!res.ok) {
             const text = await res.text();
@@ -390,8 +557,16 @@ export async function requestGuacamolePreview(
 
         const data = (await res.json()) as GuacamolePreviewResult;
         if (!data.ok) {
-            const errMsg = (data as GuacamolePreviewError).error ?? '';
-            const existing = (data as GuacamolePreviewError).errorCode;
+            // 🔴 READ AS A WIRE SHAPE, NOT AS OUR OWN TYPE. `errorCode` is
+            // required on `GuacamolePreviewError` so that WE cannot build one
+            // without it — but the Worker is a separate deploy target and the
+            // body is untrusted JSON, so a response that omits it is a real
+            // state, not an impossible one. Typing the read as optional is
+            // what keeps the `?? 'unknown'` below honest rather than dead code
+            // that the compiler has been told to disbelieve.
+            const wire = data as { error?: string; errorCode?: GuacamolePreviewErrorCode };
+            const errMsg = wire.error ?? '';
+            const existing = wire.errorCode;
             let errorCode: GuacamolePreviewErrorCode = existing ?? 'unknown';
             if (!existing) {
                 if (/setsockoptint/i.test(errMsg)) {

@@ -308,6 +308,36 @@ push('and the fresh URL is the one the SECOND call returned',
 const progressA = win2?.querySelector('[data-kind]');
 push('the boot panel is still up at the moment `load` fires',
     !! progressA && progressA.hidden === false, `hidden=${progressA?.hidden}`);
+// 🔴 THE SIX SECONDS OF DEAD END. Between the mint resolving and the server
+// answering `confirm=frame`, this window used to render
+// `computeBootUiState({requestStatus:'success', frameConfirmed:false})` — a
+// TERMINAL "Your desktop isn't answering" panel with a Retry button, over a
+// window that was working. Measured in production: mint resolved 2:41:06,
+// frame confirmed 2:41:12. Nobody had asked the origin anything in between.
+// It must be a PROGRESS state, still visibly working.
+push('\u{1f534} the panel between the mint and the answer is PROGRESS, not a failure',
+    progressA?.getAttribute('data-kind') === 'progress',
+    `data-kind=${progressA?.getAttribute('data-kind')}`);
+// 🔴 MERGE NOTE (A × W3). This check used to read the phase list's
+// `data-phase="connecting"`. W3 replaced this window's `BootProgress` with
+// `AppSpinner` — Preview/Code deliberately ship NO phase list any more (see
+// `boot-phases.ts`'s `BOOT_PHASES` doc comment), so that node cannot exist
+// here by design, and asserting on it was testing a surface main removed.
+//
+// The claim is therefore re-expressed against what this window actually
+// draws, and it is the SAME claim with the same mutation-proving force:
+// reverting to `frameConfirmed: false` makes `kind` `failed`, which hides the
+// ring and swaps the label to the failure copy. Both halves are asserted, so
+// this cannot pass on a failure panel. The `connecting`-phase claim itself is
+// unit-pinned in `boot-phases.test.ts`.
+push('\u{1f534} ...and it is still visibly WORKING — ring up, app copy, not the dead end',
+    win2?.querySelector('.ezil-app-spinner-ring')?.hidden === false
+    && win2?.querySelector('.ezil-app-spinner-label')?.textContent === 'Opening Code…',
+    `ring hidden=${win2?.querySelector('.ezil-app-spinner-ring')?.hidden}`
+    + ` label=${win2?.querySelector('.ezil-app-spinner-label')?.textContent}`);
+push('\u{1f534} ...and offers no Retry, because there is nothing to retry yet',
+    win2?.querySelector('.ezil-boot-actions')?.hidden === true,
+    `actions hidden=${win2?.querySelector('.ezil-boot-actions')?.hidden}`);
 push('...and is actually painted that way, not just flagged (computed display is NOT none)',
     !! progressA && window.getComputedStyle(progressA).display !== 'none',
     `display=${progressA && window.getComputedStyle(progressA).display}`);
