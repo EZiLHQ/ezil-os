@@ -244,17 +244,38 @@ const FULLBLEED_CLASS = 'ezil-fullbleed';
  * @param {string} [ctx.icon]       The launching descriptor's icon, so the
  *   window head, the taskbar item and the control tray all show the same
  *   image as the dock the user clicked. `registry.launch` supplies it.
+ * @param {string} [ctx.appName]    The launching descriptor's `name` — this
+ *   window's TITLE, for the same reason and from the same place as `ctx.icon`.
+ *   See the `title` assignment in the body.
  * @returns {Promise<HTMLElement|null>}
  */
 export async function openDesktopWindow (ctx = {}) {
     const computer = ctx.computer ?? ctx.payload?.computer ?? null;
     const desktop_state = ctx.desktopState ?? ctx.payload?.desktopState ?? {};
-    // The computer's own name, not the app's: the window IS that machine, and
-    // a user with two computers must be able to tell which one they are in.
-    // Falls back to the app's own display name (`registry.js`'s 'Browser',
-    // MODIFIED BY EZIL 2026-08-03) only for a computer with no name at all —
-    // `code.js`/`preview.js` fall back to their own app name the same way.
-    const title = computer?.name || 'Browser';
+    // MODIFIED BY EZIL 2026-08-08: the APP's name, not the machine's.
+    //
+    // This was `computer?.name || 'Browser'`. The owner's computer is called
+    // "Computer", so the Browser window's titlebar read "Computer" — OBSERVED,
+    // and it is what a titlebar is least allowed to be: ambiguous about which
+    // program you are looking at. Every desktop OS titles a window after the
+    // application (macOS especially: the titlebar names the app/document, never
+    // the host machine), and `code.js`/`preview.js` had the mirror-image bug
+    // ("Computer — Code"). All three are fixed the same way, together, because
+    // a titling convention that holds for two windows out of three is not a
+    // convention.
+    //
+    // `ctx.appName` is the registry descriptor's own `name`, passed by
+    // `registry.js`'s `launch()` alongside `ctx.icon` and for the same stated
+    // reason: the window head, the taskbar item and the dock tile must not
+    // disagree about what this app is called. The literal is the fallback for
+    // a direct `openDesktopWindow()` call that bypasses the registry.
+    //
+    // 🔴 The machine identity is NOT lost. It was never carried by this string
+    // alone: `registry.js` stamps `data-ezil-computer-id` on the window (which
+    // is what Settings actually reads), and the head's `title=` tooltip below
+    // names the computer in full for a user with two of them.
+    const title = ctx.appName || 'Browser';
+    const title_tooltip = computer?.name ? `${title} — ${computer.name}` : title;
 
     if ( ! computer?.id ) {
         // Nothing to connect to. `/os` already refuses to render the shell in
@@ -271,6 +292,8 @@ export async function openDesktopWindow (ctx = {}) {
 
     const el_window = await UIWindow({
         title,
+        // The machine, on hover. See the `title` assignment above.
+        title_tooltip,
         app: 'desktop',
         icon: ctx.icon,
         // 🔴 Navigated exactly once, after previewUrl resolves. See header.

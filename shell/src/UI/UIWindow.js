@@ -352,20 +352,48 @@ async function UIWindow (options) {
             h += '<img class="window-head-icon" />';
         }
         // title
-        h += `<span class="window-head-title" title="${html_encode(options.title)}"></span>`;
+        // MODIFIED BY EZIL 2026-08-08: the tooltip is `title_tooltip` when the
+        // caller supplies one, so a window can be TITLED after its app (which
+        // is what a titlebar is for) while still naming the machine it belongs
+        // to on hover. `desktop-window.js` / `code.js` / `preview.js` all pass
+        // one; everything else falls through to the old behaviour unchanged.
+        h += `<span class="window-head-title" title="${html_encode(options.title_tooltip ?? options.title)}"></span>`;
         h += '</div>';
+        // ── the three window controls ──────────────────────────────────────
+        // MODIFIED BY EZIL 2026-08-08. The markup is deliberately the SAME
+        // shape as upstream's — one `.window-action-btn` span per control,
+        // each wrapping the same `window.icons[...]` `<img>`, in the same DOM
+        // order (minimize, scale, close), still direct children of
+        // `.window-head`. Three things in this file bind by DIRECT-CHILD
+        // selector (`#window-N > .window-head > .window-close-btn` at the
+        // click handlers below, and `el_window_head_scale_btn` at the element
+        // lookups), `scale_window` swaps the scale `<img>`'s `src`, and
+        // `stacking-browser-test.mjs` hit-tests `.window-action-btn` — so
+        // introducing a wrapper element or dropping the `<img>` would break
+        // live code and tests for a purely visual gain. The Apple-style
+        // traffic-light presentation is done entirely in CSS
+        // (`.window-action-btn` in `style.css`), which hides the `<img>` and
+        // draws the disc + hover glyph; group-hover is `:has()`, not a
+        // wrapper, for exactly the same reason.
+        //
+        // What IS new here is affordance, which upstream never had: these
+        // were bare `<span>`s with no role, no name, and no tab stop, so a
+        // screen reader announced nothing and a keyboard could not reach
+        // close/minimise/maximise at all.
+        const btn_attrs = (cls, label) =>
+            `class="window-action-btn ${cls}" role="button" tabindex="0" aria-label="${html_encode(label)}" title="${html_encode(label)}"`;
         // Minimize button, only if window is resizable and not embedded
         if ( options.is_resizable && options.show_minimize_button && !window.is_embedded )
         {
-            h += `<span class="window-action-btn window-minimize-btn" style="margin-left:0;"><img src="${html_encode(window.icons['minimize.svg'])}" draggable="false"></span>`;
+            h += `<span ${btn_attrs('window-minimize-btn', i18n('minimize'))}><img src="${html_encode(window.icons['minimize.svg'])}" draggable="false"></span>`;
         }
         // Maximize button
         if ( options.is_resizable && options.show_maximize_button )
         {
-            h += `<span class="window-action-btn window-scale-btn"><img src="${html_encode(window.icons['scale.svg'])}" draggable="false"></span>`;
+            h += `<span ${btn_attrs('window-scale-btn', 'Expand')}><img src="${html_encode(window.icons['scale.svg'])}" draggable="false"></span>`;
         }
         // Close button
-        h += `<span class="window-action-btn window-close-btn"><img src="${html_encode(window.icons['close.svg'])}" draggable="false"></span>`;
+        h += `<span ${btn_attrs('window-close-btn', 'Close')}><img src="${html_encode(window.icons['close.svg'])}" draggable="false"></span>`;
         h += '</div>';
     }
 

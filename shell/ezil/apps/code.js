@@ -179,12 +179,21 @@ async function mintCodePreviewUrl (computerId) {
  * @param {object} ctx.computer     `payload.computer`
  * @param {object} ctx.desktopState `payload.desktopState`
  * @param {string} [ctx.icon]       The launching descriptor's icon.
+ * @param {string} [ctx.appName]    The launching descriptor's `name` — this
+ *   window's TITLE. See the `title` assignment in the body.
  * @returns {Promise<HTMLElement|null>}
  */
 export async function openCodeWindow (ctx = {}) {
     const computer = ctx.computer ?? ctx.payload?.computer ?? null;
     const desktop_state = ctx.desktopState ?? ctx.payload?.desktopState ?? {};
-    const title = computer?.name ? `${computer.name} — Code` : 'Code';
+    // MODIFIED BY EZIL 2026-08-08: the APP's name, not the machine's. This was
+    // `computer?.name ? \`${computer.name} — Code\` : 'Code'`, which titled the
+    // window "Computer — Code" for a computer named "Computer". See
+    // `desktop-window.js`'s matching block for the full reasoning — all three
+    // app windows are titled the same way, from `ctx.appName`, and carry the
+    // machine in the head's tooltip instead.
+    const title = ctx.appName || 'Code';
+    const title_tooltip = computer?.name ? `${title} — ${computer.name}` : title;
 
     if ( ! computer?.id ) {
         console.error(`[${PHASE}] refusing to open: the boot payload carries no computer`);
@@ -196,6 +205,8 @@ export async function openCodeWindow (ctx = {}) {
 
     const el_window = await UIWindow({
         title,
+        // The machine, on hover. See the `title` assignment above.
+        title_tooltip,
         app: 'code',
         icon: ctx.icon,
         // 🔴 Same reasoning as `preview.js`: navigated exactly once, after a
