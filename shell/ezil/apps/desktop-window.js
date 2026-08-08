@@ -318,9 +318,21 @@ function fit_stream (el_body, el_iframe) {
     if ( ! el_body || ! el_iframe ) return null;
     const bw = Math.round(el_body.clientWidth);
     const bh = Math.round(el_body.clientHeight);
-    // A hidden or minimised window measures 0. Writing `0px` would collapse
-    // the iframe and it would stay collapsed after a restore, because the
-    // restore does not necessarily change the body's size again.
+    // A hidden or minimised window measures 0, and writing `0px` through
+    // would collapse the iframe and leave it collapsed after a restore,
+    // because the restore does not necessarily change the body's size again.
+    //
+    // 🔴 HONESTY NOTE — this early return is NOT mutation-proven, and it is
+    // the only line in this change that is not. Deleting it leaves
+    // `os-chrome-browser-test.mjs` 62/62 green, including its explicit
+    // minimise/restore round trip. The reason is that ResizeObserver does not
+    // deliver an observation for an element with no box, so today the only
+    // caller (the observer in `openDesktopWindow`) never actually reaches it
+    // with a zero: `hideWindow` ends in `display: none` and the callback
+    // simply does not fire. It is kept as a precondition on a function that
+    // writes geometry from a measurement, not as a fix for an observed bug —
+    // and it is written down here as unproven rather than quietly counted
+    // among the guards that were proven.
     if ( bw <= 0 || bh <= 0 ) return null;
 
     let w = bw;
