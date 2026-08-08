@@ -308,6 +308,22 @@ push('and the fresh URL is the one the SECOND call returned',
 const progressA = win2?.querySelector('[data-kind]');
 push('the boot panel is still up at the moment `load` fires',
     !! progressA && progressA.hidden === false, `hidden=${progressA?.hidden}`);
+// 🔴 THE SIX SECONDS OF DEAD END. Between the mint resolving and the server
+// answering `confirm=frame`, this window used to render
+// `computeBootUiState({requestStatus:'success', frameConfirmed:false})` — a
+// TERMINAL "Your desktop isn't answering" panel with a Retry button, over a
+// window that was working. Measured in production: mint resolved 2:41:06,
+// frame confirmed 2:41:12. Nobody had asked the origin anything in between.
+// It must be the `connecting` PHASE, and the phase list must be on screen.
+push('\u{1f534} the panel between the mint and the answer is PROGRESS, not a failure',
+    progressA?.getAttribute('data-kind') === 'progress',
+    `data-kind=${progressA?.getAttribute('data-kind')}`);
+push('\u{1f534} ...and it says "Connecting the display", which is what is actually happening',
+    win2?.querySelector('.ezil-boot-phase[data-state="current"]')?.getAttribute('data-phase') === 'connecting',
+    win2?.querySelector('.ezil-boot-phase[data-state="current"]')?.getAttribute('data-phase'));
+push('\u{1f534} ...and offers no Retry, because there is nothing to retry yet',
+    win2?.querySelector('.ezil-boot-actions')?.hidden === true,
+    `actions hidden=${win2?.querySelector('.ezil-boot-actions')?.hidden}`);
 push('...and is actually painted that way, not just flagged (computed display is NOT none)',
     !! progressA && window.getComputedStyle(progressA).display !== 'none',
     `display=${progressA && window.getComputedStyle(progressA).display}`);

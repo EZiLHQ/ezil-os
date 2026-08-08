@@ -347,6 +347,53 @@ export function isRetryablePreviewErrorCode(code: GuacamolePreviewErrorCode | un
 }
 
 /**
+ * Expected operational failures — not server bugs. The tRPC router returns
+ * these as typed result objects instead of throwing, so the browser gets a
+ * first-class actionable panel rather than a generic one.
+ */
+const OPERATIONAL_PREVIEW_ERROR_CODES: ReadonlySet<string> = new Set<GuacamolePreviewErrorCode>([
+    'connection_refused',
+    'fetch_failed',
+    'sandbox_runtime_blocked',
+    'sandbox_start_failed',
+    'sandbox_starting',
+    'timeout',
+]);
+
+/**
+ * Does this failure reach the browser WITH ITS CODE, or as a thrown 502 the
+ * browser can only call `unknown`?
+ *
+ * 🔴 A THROW DESTROYS THE LABEL. Anything the router raises as a `TRPCError`
+ * becomes `{error:{code:'BAD_GATEWAY', message:<generic>}}` with a 502
+ * (`server/shell/http.ts` strips 5xx detail on purpose, because an internal
+ * message can carry internals), and both shell clients map every non-401 HTTP
+ * failure to `unknown` — whose copy is the dead end "We couldn't start your
+ * computer." So this is not a stylistic choice about throwing: it is the
+ * difference between a code the browser can act on and no code at all.
+ *
+ * It lives HERE rather than in the router because the router imports the
+ * database and cannot be loaded by a unit test — and an untestable rule is how
+ * this one went unexamined while it silently deleted every label that mattered.
+ *
+ * `sandbox_starting` is the most important member of the operational set: it
+ * is the answer a hibernated container gives, it is PROGRESS rather than a
+ * failure, and it is worthless if it arrives unlabelled.
+ */
+export function surfacePreviewErrorAsValue(
+    errorCode: string | undefined,
+    retryable: boolean,
+): boolean {
+    // Nothing to surface. Unreachable from `previewError` now that the code is
+    // required, and kept as the belt on those braces.
+    if (!errorCode) return false;
+    // A deterministic failure must never be thrown: a thrown error is the only
+    // thing TanStack Query retries, and re-asking a fixed question is pure
+    // latency in front of the same panel.
+    return !retryable || OPERATIONAL_PREVIEW_ERROR_CODES.has(errorCode);
+}
+
+/**
  * Match the message `@cloudflare/sandbox` puts on `CustomDomainRequiredError`
  * (`exposePort` throws it verbatim for any `.workers.dev` hostname). The
  * Worker's own catch-all returns `err.message` with a 500, so the class name

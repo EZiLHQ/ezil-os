@@ -57,32 +57,9 @@ import {
     requestGuacamolePreview,
     requestGuacamoleSandboxTerminate,
     resolveCloudflareGuacamoleConfig,
+    surfacePreviewErrorAsValue,
 } from '@/server/lib/cloudflare-guacamole-provider';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
-
-// Error codes that represent expected operational failures (not server bugs).
-// For these the router returns a typed result object instead of throwing so
-// the canvas can render a first-class actionable diagnostics panel.
-//
-// 🔴 A THROW DESTROYS THE LABEL. Anything that leaves here as a `TRPCError`
-// becomes a 502 whose body is `{error:{code:'BAD_GATEWAY', message:<generic>}}`
-// (`server/shell/http.ts` deliberately strips 5xx detail), and both shell
-// clients map every non-401 HTTP failure to `unknown` — whose copy is the dead
-// end "We couldn't start your computer." So membership of this set is not a
-// stylistic choice about throwing: it is the difference between a code the
-// browser can act on and no code at all.
-//
-// `sandbox_starting` is here for exactly that reason, and it is the most
-// important member: it is the answer a hibernated container gives, it is
-// PROGRESS rather than a failure, and it is worthless if it arrives unlabelled.
-const OPERATIONAL_ERROR_CODES = new Set([
-    'connection_refused',
-    'fetch_failed',
-    'sandbox_runtime_blocked',
-    'sandbox_start_failed',
-    'sandbox_starting',
-    'timeout',
-]);
 
 /** Ownership check shared by every procedure below — never trust a bare computerId. */
 async function assertOwnedComputer(
@@ -173,7 +150,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 // comes back as a VALUE, which cannot be retried by
                 // construction, alongside the operational codes that already
                 // did. See `isRetryablePreviewErrorCode` in the provider.
-                if (result.errorCode && (!result.retryable || OPERATIONAL_ERROR_CODES.has(result.errorCode))) {
+                if (surfacePreviewErrorAsValue(result.errorCode, result.retryable)) {
                     return {
                         ok: false as const,
                         error: logSafe,
@@ -338,7 +315,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 // error is what TanStack Query (and this route's own client
                 // poller) retries, which is wrong for a deterministic
                 // rejection and right for a transient one.
-                if (result.errorCode && (!result.retryable || OPERATIONAL_ERROR_CODES.has(result.errorCode))) {
+                if (surfacePreviewErrorAsValue(result.errorCode, result.retryable)) {
                     return {
                         ok: false as const,
                         error: logSafe,
@@ -508,7 +485,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     retryable: result.retryable,
                 });
 
-                if (result.errorCode && (!result.retryable || OPERATIONAL_ERROR_CODES.has(result.errorCode))) {
+                if (surfacePreviewErrorAsValue(result.errorCode, result.retryable)) {
                     return {
                         ok: false as const,
                         error: logSafe,
