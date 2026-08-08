@@ -505,8 +505,29 @@ export async function openDesktopWindow (ctx = {}) {
     // drag on a resize handle, a restore from the taskbar), and it is the box
     // the fit is actually against. It fires once on observe, which is what
     // sizes the iframe initially.
-    const fit_observer = new ResizeObserver(() => { fit_stream(el_body, el_iframe); });
-    fit_observer.observe(el_body);
+    //
+    // 🔴 Guarded, and the guard is not theoretical. The first version of this
+    // was a bare `new ResizeObserver(...)`, and `boot-test.mjs` went from 110
+    // checks to a hard crash: jsdom has no `ResizeObserver`, the constructor
+    // threw INSIDE `openDesktopWindow`, `registry.launch` caught it — and the
+    // user's entire desktop window failed to open. That is the right lesson
+    // regardless of jsdom. Fitting the stream to its aspect is an improvement
+    // on a window; it is not the window, and it must never be able to take
+    // the window down with it. Every browser this ships to has
+    // `ResizeObserver` (Chrome 64+, Safari 13.1+), so the fallback is not
+    // expected to run — but "not expected to run" is exactly what the bare
+    // constructor assumed.
+    //
+    // The fallback still fits once, so even without an observer the window
+    // opens at the right shape and only stops TRACKING later resizes.
+    let fit_observer = null;
+    if ( typeof ResizeObserver === 'function' ) {
+        fit_observer = new ResizeObserver(() => { fit_stream(el_body, el_iframe); });
+        fit_observer.observe(el_body);
+    } else {
+        console.warn(`[${PHASE}] no ResizeObserver; the stream will be fitted once and not tracked`);
+        fit_stream(el_body, el_iframe);
+    }
 
     // ── boot state ─────────────────────────────────────────────────────────
     let tick_timer = null;
@@ -1273,8 +1294,9 @@ export async function openDesktopWindow (ctx = {}) {
         stop_timers();
         observer.disconnect();
         // The aspect-fit observer holds a reference to the window body; a
-        // window that is going away must not leave one behind.
-        fit_observer.disconnect();
+        // window that is going away must not leave one behind. Null when the
+        // environment has no ResizeObserver — see where it is created.
+        fit_observer?.disconnect();
         window.removeEventListener('ezil:teardown', dispose);
     };
 
