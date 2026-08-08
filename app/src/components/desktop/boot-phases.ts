@@ -5,10 +5,23 @@
  * ── Honesty constraint ──────────────────────────────────────────────────────
  * The browser has exactly two genuine signals during a cold boot:
  *
- *   1. The single `POST /sandbox/preview` request (`requestGuacamolePreview`
- *      in `cloudflare-guacamole-provider.ts`), which resolves ONLY at the
- *      very end — success or a specific error. Nothing about it is
- *      observable mid-flight.
+ *   1. The `POST /sandbox/preview` request (`requestGuacamolePreview` in
+ *      `cloudflare-guacamole-provider.ts`), which resolves ONLY at the very
+ *      end — success or a specific error. Nothing about it is observable
+ *      mid-flight.
+ *
+ *      🔴 It stopped being a SINGLE request on 2026-08-08, and the reason is
+ *      worth knowing here. Containers hibernate when idle, and the wake
+ *      outlives any sane request budget: measured, the first request after a
+ *      hibernation blocked for 187s and then failed with something the browser
+ *      could only call `unknown`, while the wake it had started went on to
+ *      succeed. So the server now answers `sandbox_starting` at
+ *      `SANDBOX_WAKE_ANSWER_BUDGET_MS` (12s) and the caller asks again
+ *      (`withWakeAndOneRetry` in the shell, the `refetchInterval` in the
+ *      canvas) until `WAKE_DEADLINE_MS`. That is not a new signal about the
+ *      desktop — it says nothing this module may render as progress EARNED —
+ *      it only means the estimate below gets to keep running honestly instead
+ *      of being cut short by a dead socket.
  *   2. `GET /sandbox/:id/status` — cheap, does NOT wake a sleeping container,
  *      returns `{ ok, sandboxName, guacamoleRunning, mode }`. Polling it
  *      WHILE the preview request is in flight is safe (the container is

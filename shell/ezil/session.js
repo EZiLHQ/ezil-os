@@ -189,6 +189,13 @@ async function request (url, { method = 'GET', body, timeoutMs } = {}) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Hard ceiling on how many times ONE call may hit the server, whatever the
+ * two real bounds below happen to say. See the comment at the top of
+ * `withWakeAndOneRetry`'s loop for why a ceiling and not just the conditions.
+ */
+const MAX_ISSUES = 40;
+
+/**
  * 🔴 THE HIBERNATION FIX, CLIENT SIDE. One implementation, three callers
  * (`openDesktop`, `previewUrl`, and `apps/code.js`'s own mint) — three copies
  * of a retry loop is how the timings drift apart and one surface quietly stops
@@ -230,6 +237,27 @@ async function withWakeAndOneRetry (issue, what) {
     let asks = 0;
 
     for (;;) {
+        // 🔴 THE STRUCTURAL BACKSTOP, AND IT IS NOT DECORATION. Every other
+        // bound in this function is a CONDITION — a clock for the wake, a
+        // boolean for the retry — and a condition can be edited away. Removing
+        // the `retried = true` line was tried during review and it turned this
+        // into an unbounded, zero-delay request loop that HUNG the headless
+        // suite rather than failing it. A browser would have hammered the
+        // server for as long as the tab stayed open.
+        //
+        // `MAX_ISSUES` is far above every legitimate path (a full 215s wake at
+        // ~13.5s per ask is ~16, plus one retry) so it can never fire in normal
+        // use, and it turns any future breakage of the two real bounds into a
+        // stop rather than a spin. With it in place the same mutation now
+        // reports `attempts=40` and fails three named checks.
+        if ( asks >= MAX_ISSUES ) {
+            console.error(`[ezil-os:session] ${what}: refusing to ask a ${asks + 1}th time; stopping`);
+            telemetry.capture({
+                eventClass: 'contract_violation', site: `ezil-os:session#${what}`, code: 'ask_cap_reached',
+                durationMs: Date.now() - t0, detail: `${asks} asks`,
+            });
+            return { ok: false, errorCode: 'unknown', message: 'Gave up asking the server.' };
+        }
         asks++;
         const res = await issue();
         if ( res.ok === true ) return res;
