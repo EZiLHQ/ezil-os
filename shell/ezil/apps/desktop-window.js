@@ -509,17 +509,33 @@ export async function openDesktopWindow (ctx = {}) {
             tick_timer = setInterval(paint, TICK_MS);
             paint();
         } else {
-            // The server looked and did NOT see a desktop. Say so now rather
-            // than showing progress over it; `settle_frame` re-asks from the
-            // browser and can still overturn this.
-            progress.render(computeBootUiState({
-                requestStatus: 'success',
-                elapsedMs: 0,
-                // 🔴 Not a constant, and not defaulted to true. `openDesktop`
-                // reports this only when the SERVER observed the desktop origin
-                // answering, before it handed the URL over.
-                frameConfirmed: res.frameConfirmed,
-            }));
+            // 🔴 THE SERVER DID NOT REPORT A CONFIRMED ORIGIN — WHICH IS NOT
+            // THE SAME AS THE ORIGIN REFUSING. This branch used to render
+            // `frameConfirmed: false` and paint the terminal "Your desktop
+            // isn't answering" panel here, and then the very next line
+            // navigated the iframe and `settle_frame` asked the question
+            // properly, usually getting a yes about six seconds later. The old
+            // comment even admitted it ("`settle_frame` re-asks and can still
+            // overturn this") — a failure panel you expect to be overturned is
+            // not a failure panel, it is a flicker with alarming copy.
+            //
+            // `openDesktop` flattens "the server checked and said no" and "the
+            // server did not check" into one `false` (`data.frame?.confirmed
+            // === true`), so this branch genuinely does not know which it has.
+            // The honest rendering of not knowing is the `connecting` phase.
+            // `settle_frame` below is the only thing that may conclude
+            // `desktop_unreachable`, and `FRAME_CONFIRM_DEADLINE_MS` — measured
+            // from `t_handoff` — ends the boot if it never does.
+            const t_handoff = performance.now();
+            paint = () => {
+                if ( disposed || my_attempt !== attempt ) return;
+                progress.render(computeBootUiState({
+                    requestStatus: 'success',
+                    elapsedMs: performance.now() - t_handoff,
+                }));
+            };
+            tick_timer = setInterval(paint, TICK_MS);
+            paint();
         }
 
         // 🔴 The single navigation. Everything above had to have finished.

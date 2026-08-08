@@ -8,15 +8,22 @@ import {
     BOOT_FAILURE_COPY,
     BOOT_PHASES,
     BOOT_UNVERIFIED_COPY,
+    FRAME_CONFIRM_DEADLINE_MS,
     LONG_BOOT_MS,
     TYPICAL_BOOT_MS,
+    WAKE_DEADLINE_MS,
+    WAKE_REASK_MS,
     applyDisplayEvidence,
     classifyPreviewFetchError,
     computeBootUiState,
     estimatePhaseForElapsedMs,
+    isRetryableBootErrorCode,
     phaseVisualState,
+    type BootErrorCode,
     type BootProgressState,
 } from './boot-phases';
+import { isRetryablePreviewErrorCode } from '@/server/lib/cloudflare-guacamole-provider';
+import shellSession from '../../../../shell/ezil/session.js';
 
 /**
  * 🔴 THE SIXTH ATTACK IS THE ONE THIS CATCHES.
@@ -47,10 +54,40 @@ function computeBootUiStateSource(file: string): string {
     return src.slice(start, end);
 }
 
+/**
+ * ── HASH CHANGE OF 2026-08-08, AND WHY IT WAS LEGITIMATE ───────────────────
+ * Previous: `boot-phases.ts` dc278f14…5df9, `boot-phases.shell.js` 9792051f…a8b4.
+ *
+ * The `success` branch used to read "anything that is not `frameConfirmed ===
+ * true` is `desktop_unreachable`", which fired in the instant after a mint
+ * resolved and BEFORE anyone had asked the desktop origin anything. Measured
+ * in production: a terminal "Your desktop isn't answering" panel painted over
+ * six seconds of a boot that then completed normally. The branch now separates
+ * "asked and refuted" (`false` — still a failure) from "nobody has asked yet"
+ * (anything else — the `connecting` progress phase, bounded by
+ * `FRAME_CONFIRM_DEADLINE_MS`).
+ *
+ * Which of the five attacks does it reopen? NONE:
+ *   1. a defaulted flag        — there is no default; `frameConfirmed` is read raw.
+ *   2. a truthiness test       — still `=== true` and `=== false`, never `if (x)`.
+ *   3. a `?? true`             — no coalescing anywhere in the branch.
+ *   4. a widened `ready`       — `ready` is returned from exactly one place,
+ *                                under exactly the same `=== true` test as
+ *                                before. The new branch returns `progress`,
+ *                                which `applyDisplayEvidence` cannot promote:
+ *                                that gate only ever DOWNGRADES a `ready`, so
+ *                                `display === 'live'` remains the sole route to
+ *                                a revealed desktop.
+ *   5. an endless spinner      — `FRAME_CONFIRM_DEADLINE_MS` still ends the boot
+ *                                at `desktop_unreachable` for a caller that
+ *                                never threads an observation.
+ * The change converts a false FAILURE into PROGRESS, which is strictly more
+ * honest, and adds no path to `ready` that did not exist before.
+ */
 describe('🔴 computeBootUiState is byte-identical to the reviewed text', () => {
     it.each([
-        ['./boot-phases.ts', 'dc278f14cd5fed30e27ecf5c43aab11b1b7e08f9c84f79a087e0e597cfd75df9'],
-        ['./boot-phases.shell.js', '9792051fdd265b5424d025c9bbfb77d16e907c951394a1a879d719db0bafa8b4'],
+        ['./boot-phases.ts', '0a8865a62753b33922a3c58df7eeb4a65412664fb33e29acb3c15d6f33e3aa80'],
+        ['./boot-phases.shell.js', '57d43a012f1faad401bf536193d93fdfd43beea5ea97d75a29c8dc18dd9c97bf'],
     ])('%s', (file, sha) => {
         expect(createHash('sha256').update(computeBootUiStateSource(file)).digest('hex')).toBe(sha);
     });
@@ -83,6 +120,23 @@ describe('estimatePhaseForElapsedMs', () => {
     });
 });
 
+describe('the wake budget agrees with the transport that spends it', () => {
+    it('🔴 WAKE_DEADLINE_MS is the shell\'s existing boot budget, not a new number', () => {
+        // The wake loop must not out-wait — or under-wait — the fetch budget
+        // each of its asks is issued under. These live in different files
+        // because the shell cannot import the app's modules and vice versa, so
+        // the agreement is asserted rather than assumed.
+        expect(WAKE_DEADLINE_MS).toBe(shellSession.DESKTOP_BOOT_TIMEOUT_MS);
+    });
+
+    it('a single ask fits inside the loop many times over', () => {
+        // Otherwise the "loop" would be one ask and a deadline, which is the
+        // behaviour this whole change replaced.
+        expect(WAKE_REASK_MS).toBeGreaterThan(0);
+        expect(WAKE_REASK_MS).toBeLessThan(WAKE_DEADLINE_MS / 10);
+    });
+});
+
 describe('computeBootUiState — never fabricates progress', () => {
     it('reports not_configured distinctly from a failure', () => {
         const state = computeBootUiState({ requestStatus: 'not_configured', elapsedMs: 0 });
@@ -110,25 +164,87 @@ describe('computeBootUiState — never fabricates progress', () => {
         ).toEqual({ kind: 'failed', reason: 'desktop_unreachable' });
     });
 
-    it('CANNOT report ready when nobody looked at the frame at all — fails closed', () => {
-        // A caller that forgot to thread the observation gets a visible,
-        // retryable failure, never an unearned `ready`.
-        expect(computeBootUiState({ requestStatus: 'success', elapsedMs: 0 })).toEqual({
+    // 🔴 THE REGRESSION GUARD FOR ITEM 3 — the six seconds of dead end.
+    // Before this, the line above ran for `undefined` too, so the instant a
+    // mint resolved the panel said "Your desktop isn't answering" about a
+    // desktop nobody had asked. It is now the `connecting` phase, and the
+    // two properties that matter are BOTH asserted: it is not `ready`, and
+    // it does not stay here forever.
+    it('🔴 success + nobody-has-asked-yet is PROGRESS, not a failure — and never ready', () => {
+        const state = computeBootUiState({ requestStatus: 'success', elapsedMs: 0 });
+        expect(state).toEqual({
+            kind: 'progress',
+            currentPhase: 'connecting',
+            confirmed: false,
+            isRunningLong: false,
+        });
+        // Restated as the property, not the shape: no unconfirmed frame, at
+        // any point on the clock, may reach `ready`.
+        for (const elapsedMs of [0, 1, 5_000, 34_999, 35_000, 44_999, 45_000, 600_000]) {
+            expect(computeBootUiState({ requestStatus: 'success', elapsedMs }).kind).not.toBe('ready');
+        }
+    });
+
+    it('🔴 ...and it DOES escalate to desktop_unreachable once the deadline elapses', () => {
+        expect(
+            computeBootUiState({ requestStatus: 'success', elapsedMs: FRAME_CONFIRM_DEADLINE_MS - 1 }).kind,
+        ).toBe('progress');
+        expect(computeBootUiState({ requestStatus: 'success', elapsedMs: FRAME_CONFIRM_DEADLINE_MS })).toEqual({
+            kind: 'failed',
+            reason: 'desktop_unreachable',
+        });
+        expect(computeBootUiState({ requestStatus: 'success', elapsedMs: 600_000 })).toEqual({
+            kind: 'failed',
+            reason: 'desktop_unreachable',
+        });
+    });
+
+    it('🔴 ...and a confirmation that genuinely FAILED is a failure immediately, not at the deadline', () => {
+        // `false` is an observation — the probe read an error status, or the
+        // caller exhausted its bounded retries. It must not be softened into
+        // progress just because the deadline has not arrived.
+        expect(computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: false })).toEqual({
             kind: 'failed',
             reason: 'desktop_unreachable',
         });
     });
 
     it('accepts nothing but a literal `true` as a frame confirmation', () => {
+        // Junk off the wire is "we have no observation", so it renders the
+        // handoff phase — and, crucially, still never `ready`, and still ends
+        // at the deadline. Truthiness has not been let back in.
         for (const junk of [1, 'true', 'yes', {}, [], 'ok'] as unknown[]) {
             expect(
                 computeBootUiState({
                     requestStatus: 'success',
                     elapsedMs: 0,
                     frameConfirmed: junk as boolean,
+                }).kind,
+            ).toBe('progress');
+            expect(
+                computeBootUiState({
+                    requestStatus: 'success',
+                    elapsedMs: FRAME_CONFIRM_DEADLINE_MS,
+                    frameConfirmed: junk as boolean,
                 }),
             ).toEqual({ kind: 'failed', reason: 'desktop_unreachable' });
         }
+    });
+
+    it('🔴 the handoff phase is never CONFIRMED — no checkmark for a display nobody checked', () => {
+        const state = computeBootUiState({ requestStatus: 'success', elapsedMs: 10_000 }) as BootProgressState;
+        expect(state.confirmed).toBe(false);
+        expect(phaseVisualState('connecting', state)).toBe('current');
+    });
+
+    it('the handoff phase still says "still working" once it runs long', () => {
+        const state = computeBootUiState({ requestStatus: 'success', elapsedMs: LONG_BOOT_MS });
+        expect(state).toEqual({
+            kind: 'progress',
+            currentPhase: 'connecting',
+            confirmed: false,
+            isRunningLong: true,
+        });
     });
 
     it('maps a server-reported desktop_unreachable error code to its own copy, not to "unknown"', () => {
@@ -232,6 +348,19 @@ describe('computeBootUiState — never fabricates progress', () => {
         }
     });
 
+    it('🔴 a wake in progress that ran out of patience takes the timeout copy, never "crashed"', () => {
+        // `sandbox_starting` is normally consumed as PROGRESS by the caller's
+        // wake loop and never reaches the error branch at all. When it does,
+        // the container is still coming up as far as anyone knows — so
+        // `sandbox_crashed` ("Retrying usually fixes this", about a machine
+        // that did not fail) would be a lie, and `unknown` ("we couldn't start
+        // your computer") would be a second one.
+        expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'sandbox_starting' })).toEqual({
+            kind: 'failed',
+            reason: 'timeout',
+        });
+    });
+
     it('invents no new failure copy for them — every reason still resolves to existing strings', () => {
         expect(Object.keys(BOOT_FAILURE_COPY).sort()).toEqual([
             // 🔴 `display_not_streaming` is reachable ONLY through
@@ -301,6 +430,19 @@ describe('applyDisplayEvidence — only literal "live" survives as ready', () =>
         }
     });
 
+    // 🔴 THE GUARD ON THE ONE THING ITEM 3 MUST NOT HAVE DONE.
+    // The `success` branch now produces `progress` where it used to produce
+    // `failed`. If `applyDisplayEvidence` could promote, that would be a brand
+    // new route to a revealed desktop that skips the frame check entirely —
+    // the 2026-07-31 defect, restored through the back door.
+    it('🔴 cannot promote the new success-handoff PROGRESS state to ready, on any evidence', () => {
+        const handoff = computeBootUiState({ requestStatus: 'success', elapsedMs: 1_000 });
+        expect(handoff.kind).toBe('progress');
+        for (const evidence of ['live', 'blank', 'unknown', undefined] as const) {
+            expect(applyDisplayEvidence(handoff, evidence)).toBe(handoff);
+        }
+    });
+
     it('🔴 the whole desktop chain: a reachable origin with no viewer is not ready', () => {
         // Composed exactly as `settle_display` composes it, so this pins the
         // real pipeline rather than a restatement of it.
@@ -364,6 +506,70 @@ describe('phaseVisualState — only "confirmed" is a real observation', () => {
 
     it('covers every phase in BOOT_PHASES', () => {
         expect(BOOT_PHASES.map((p) => p.id)).toEqual(['waking', 'mounting', 'starting', 'connecting']);
+    });
+});
+
+/**
+ * 🔴 THE BROWSER'S COPY OF THE DETERMINISTIC SET, PINNED TO THE SERVER'S.
+ *
+ * `isRetryableBootErrorCode` exists so the shell's automatic retry can tell a
+ * transient failure from a fixed one WITHOUT shipping the server module to the
+ * browser. Two copies of a rule is how this codebase has drifted before, so
+ * they are swept against each other over the whole union rather than being
+ * eyeballed: a code added to one set and not the other fails here.
+ */
+describe('isRetryableBootErrorCode mirrors the server\'s classification exactly', () => {
+    const EVERY_CODE: readonly BootErrorCode[] = [
+        'bad_request',
+        'unauthorized',
+        'preconditions_unmet',
+        'custom_domain_required',
+        'connection_refused',
+        'fetch_failed',
+        'sandbox_runtime_blocked',
+        'sandbox_start_failed',
+        'sandbox_starting',
+        'worker_http_error',
+        'desktop_unreachable',
+        'timeout',
+        'unknown',
+    ];
+
+    it('agrees with isRetryablePreviewErrorCode on every code both unions share', () => {
+        for (const code of EVERY_CODE) {
+            // `desktop_unreachable` is browser-side only (the server's union
+            // has no such preview error), so the server call is given the same
+            // string and must still agree — it defaults unrecognised codes to
+            // retryable, which is what this one is.
+            expect(isRetryableBootErrorCode(code)).toBe(
+                isRetryablePreviewErrorCode(code as never),
+            );
+        }
+    });
+
+    it('is not vacuous — the sweep contains both answers', () => {
+        const answers = new Set(EVERY_CODE.map((c) => isRetryableBootErrorCode(c)));
+        expect([...answers].sort()).toEqual([false, true]);
+    });
+
+    it('names the five deterministic codes and nothing else', () => {
+        expect(EVERY_CODE.filter((c) => !isRetryableBootErrorCode(c))).toEqual([
+            'bad_request',
+            'unauthorized',
+            'preconditions_unmet',
+            'custom_domain_required',
+            'sandbox_runtime_blocked',
+        ]);
+    });
+
+    it('🔴 a wake in progress is RETRYABLE — asking again is the entire point of it', () => {
+        expect(isRetryableBootErrorCode('sandbox_starting')).toBe(true);
+    });
+
+    it('treats an absent or unrecognised code as retryable — one duplicate request, never a dead end', () => {
+        expect(isRetryableBootErrorCode(undefined)).toBe(true);
+        expect(isRetryableBootErrorCode('')).toBe(true);
+        expect(isRetryableBootErrorCode('some_future_code')).toBe(true);
     });
 });
 
