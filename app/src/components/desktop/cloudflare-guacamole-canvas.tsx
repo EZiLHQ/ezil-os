@@ -143,15 +143,22 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
     const [controlHintDismissed, setControlHintDismissed] = useState(false);
     const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
-    // Wall-clock start of the CURRENT boot attempt (a ref — mutated only from
-    // inside effects/handlers, never read during render) and ms elapsed since
-    // it (state, updated only from the interval callback below). Neither
-    // `Date.now()` nor a ref read ever happens in the render body itself, to
-    // keep the component pure. Only ever used to pick which phase to
-    // HIGHLIGHT as an estimate — never to assert a phase is actually done
-    // (see boot-phases.ts).
-    const attemptStartedAtRef = useRef<number | null>(null);
-    const [elapsedMs, setElapsedMs] = useState(0);
+    /**
+     * ms since the current boot PHASE began, and which phase that was.
+     *
+     * `Date.now()` never happens in the render body, so the component stays
+     * pure. Only ever used to pick which phase to HIGHLIGHT as an estimate, and
+     * to bound the two waits — never to assert a phase is actually done (see
+     * boot-phases.ts).
+     *
+     * Written ONLY from the interval callback below — never synchronously in
+     * an effect body, and never read from a ref during render, so the
+     * component stays pure and does not cascade renders. `null` before the
+     * first tick of the first phase, and reset to `null` by a manual reload.
+     */
+    const [phaseClock, setPhaseClock] = useState<{ phase: 'boot' | 'handoff'; elapsedMs: number } | null>(
+        null,
+    );
 
     const isConfiguredQuery = api.cloudflareGuacamole.isConfigured.useQuery(undefined, {
         staleTime: 5 * 60 * 1000,
@@ -159,11 +166,16 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
     });
 
     /**
-     * Has this attempt spent its whole wake budget? Derived from `elapsedMs`
-     * (state, ticked by the effect below) rather than a ref, so nothing reads
-     * mutable state during render — see the note on `attemptStartedAtRef`.
+     * Has this attempt spent its whole wake budget?
+     *
+     * 🔴 Read off the BOOT phase's clock specifically, and deliberately NOT
+     * off the phase-relative `elapsedMs` below. That value resets to 0 the
+     * moment the phase changes, and `requestStatus` depends on this flag — so
+     * a reset would flip the status back to `pending`, restart the clock, and
+     * oscillate. The clock is left holding its expired boot value once the
+     * effect stops, which makes this a latch without needing to be one.
      */
-    const wakeExpired = elapsedMs >= WAKE_DEADLINE_MS;
+    const wakeExpired = phaseClock?.phase === 'boot' && phaseClock.elapsedMs >= WAKE_DEADLINE_MS;
 
     const previewQuery = api.cloudflareGuacamole.previewUrl.useQuery(
         { sessionId, computerId },
@@ -336,21 +348,30 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
               ? 'handoff'
               : null;
 
-    // Tick every 500ms while a phase is being timed. `Date.now()` and the ref
-    // mutation only ever happen inside this effect (its body, and the
-    // interval's own callback) — never in the render body — to keep the
-    // component pure. A new phase gets a NEW anchor, and the interval stops
-    // entirely once nothing is being timed.
+    // Tick every 500ms while a phase is being timed. `Date.now()` and every
+    // state write happen inside the interval CALLBACK — never in the render
+    // body and never synchronously in the effect body — so the component stays
+    // pure and a phase change costs no cascading render. A new phase gets a new
+    // anchor, and the interval stops entirely once nothing is being timed.
     useEffect(() => {
         if (timingPhase === null) return;
         const startedAt = Date.now();
-        attemptStartedAtRef.current = startedAt;
-        setElapsedMs(0);
         const id = setInterval(() => {
-            setElapsedMs(Date.now() - startedAt);
+            setPhaseClock({ phase: timingPhase, elapsedMs: Date.now() - startedAt });
         }, 500);
         return () => clearInterval(id);
     }, [timingPhase]);
+
+    /**
+     * The clock `computeBootUiState` is given: this phase's elapsed time, or 0.
+     *
+     * A reading left over from the PREVIOUS phase reads as 0 rather than being
+     * carried over — which is the whole point of the phase being part of the
+     * state. Without it, the first render after a 200-second wake would hand
+     * the handoff branch a 200-second clock and fail a desktop that was about
+     * to confirm.
+     */
+    const elapsedMs = phaseClock !== null && phaseClock.phase === timingPhase ? phaseClock.elapsedMs : 0;
 
     const bootUiState = useMemo(
         () =>
@@ -370,8 +391,10 @@ export function CloudflareGuacamoleCanvas({ computerId, sessionId }: CloudflareG
     useReportDesktopStatus(desktopSurfaceStatus(bootUiState.kind));
 
     const handleReload = useCallback(() => {
-        attemptStartedAtRef.current = null;
-        setElapsedMs(0);
+        // A fresh attempt gets a fresh clock. Without this, a boot that used up
+        // its whole wake budget would stay `wakeExpired` and the retry would
+        // report a timeout before it had asked anything.
+        setPhaseClock(null);
         // A reload is a fresh boot, and implicit hosting is re-attempted with
         // it — so a previously-dismissed hint must be allowed to come back if
         // the new attempt still lands in 'manual'.
