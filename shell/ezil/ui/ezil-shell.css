@@ -73,16 +73,43 @@ body.device-phone {
  * boot that is a white rectangle behind a dark panel; for the frame between
  * `iframe.src = ...` and the desktop's first paint it is a white flash. */
 .ezil-desktop-window .window-body {
-    background-color: #101111;
-    /* The boot panel is positioned against this. `.window { contain: paint }`
-       already makes the window a containing block, but the panel must anchor
-       to the BODY, not the window, so it never covers the control drawer. */
+    /* MODIFIED BY EZIL 2026-08-08: `var(--color-charcoal)`, was a hardcoded
+       `#101111` — a fifth near-black that was not any of the four colours in
+       the brand palette. This surface is now doing real work: it is the
+       LETTERBOX. `fit_stream` (`../apps/desktop-window.js`) sizes the stream
+       iframe to the largest 16:9 box that fits and centres it, so whatever
+       margin the window's shape leaves over is this colour — the OS's own
+       charcoal, continuous with the rest of the chrome, rather than a black
+       bar drawn by a third-party page inside the iframe. */
+    background-color: var(--color-charcoal);
+    /* The boot panel is positioned against this — AND, since 2026-08-08, so is
+       the stream iframe, which `fit_stream` places with explicit `left`/`top`.
+       `.window { contain: paint }` already makes the window a containing
+       block, but both must anchor to the BODY, not the window, so neither ever
+       covers the control drawer. */
     position: relative;
     overflow: hidden;
 }
 
+/* 🔴 The stream iframe is POSITIONED, not stretched.
+ * `style.css`'s `.window-app-iframe { width: 100%; height: 100% }` hands the
+ * neko client a box of whatever shape the window happens to be; the stream
+ * inside it is pinned to 1920x1080 on the server (see `desktop-window.js`), so
+ * every non-16:9 window made the client letterbox the picture itself, in its
+ * own black, inside our window.
+ *
+ * `fit_stream` writes the width/height/left/top instead. These declarations
+ * are only what makes those writes meaningful (absolute, so left/top place it)
+ * plus the pre-measurement fallback: `width`/`height` stay 100% here so that
+ * the frame between window creation and the observer's first callback shows a
+ * full-size box rather than an iframe's 300x150 intrinsic default. */
 .ezil-desktop-window .window-app-iframe {
-    background-color: #101111;
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background-color: var(--color-charcoal);
 }
 
 /* ── the boot panel ───────────────────────────────────────────────────────
