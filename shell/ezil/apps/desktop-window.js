@@ -234,6 +234,108 @@ function is_minimized (el) {
  */
 const FULLBLEED_CLASS = 'ezil-fullbleed';
 
+// ═══════════════════════════════════════════════════════════════════════════
+// THE STREAM'S SHAPE, AND WHAT THIS FILE CAN AND CANNOT DO ABOUT IT
+// ═══════════════════════════════════════════════════════════════════════════
+// ADDED BY EZIL 2026-08-08.
+//
+// The remote desktop is HARD-PINNED to 1920x1080 on the server and there is no
+// client -> server resize path. Traced to ground, not assumed:
+//
+//   worker/scripts/start-neko.sh:138   NEKO_SCREEN=${NEKO_SCREEN:-1920x1080x24}
+//   worker/scripts/start-neko.sh:843   Xvfb "$DISPLAY" -screen 0 "$NEKO_SCREEN"
+//   worker/scripts/start-neko.sh:1319  chromium --window-size=1920,1080
+//   worker/scripts/start-neko.sh:1490  neko.yaml desktop.screen: "1920x1080@60"
+//   worker/scripts/start-neko.sh:1519  "Resolution (1920x1080) also stays untouched"
+//
+// So the stream is 16:9, always, and this window is a box of whatever shape the
+// user or the viewport makes it. The mismatch has to go SOMEWHERE, and there
+// are only two places it can go: bars, or a stretched picture.
+//
+// 🔴 What this file cannot do, and must not try:
+//
+//   - It cannot touch the video. The desktop is a cross-origin neko SPA in an
+//     iframe (`8181-<sandbox>-nekodesktop.<zone>`), so its `<video>` element is
+//     unreachable BY CONSTRUCTION — `object-fit` on it is not something this
+//     side of the origin boundary can set, and neither is anything else.
+//   - It must not change the stream's RESOLUTION to match the window. Every
+//     capture-pipeline restart is a 5-10s interruption plus a full software-vp8
+//     re-init. That is an explicit user action at most, and never a resize
+//     handler.
+//
+// 🔴 What it CAN do, and now does: choose the shape of the box it hands the
+// iframe. `fit_stream` below sizes the iframe to the largest 16:9 rectangle
+// that fits the window body and centres it, so the neko client's own viewport
+// is always exactly the aspect of the picture inside it and its internal fit
+// produces no bars of its own. The remaining margin is drawn by the WINDOW, in
+// `--color-charcoal`, next to the rest of the OS chrome — instead of by a
+// third-party page in whatever black its stylesheet happens to use.
+//
+// This makes the window's default size matter, so `WINDOW_*` below derive from
+// the stream rather than being round numbers: a freshly opened Browser window
+// has a content box that is exactly 16:9 and therefore no bars at all.
+//
+// 🔴 Sizing the IFRAME is not "resizing on window.resize" in the forbidden
+// sense. Nothing here reaches the server, nothing renegotiates a capture, and
+// the iframe's box ALREADY changed on every window drag (it is `width: 100%;
+// height: 100%` in `style.css`). If anything this reduces the pressure: the
+// client's viewport aspect is now constant across every window shape, where
+// before it was whatever the user dragged.
+const STREAM_W = 1920;
+const STREAM_H = 1080;
+/** 1.777…, i.e. 16:9. Derived, so the two numbers above stay the only source. */
+const STREAM_ASPECT = STREAM_W / STREAM_H;
+/**
+ * The default window. Content box exactly 16:9 (960x540), plus the 30px head
+ * — `style.css`'s `.window-body-app { height: calc(100% - 30px) }`, which is
+ * the one number this has to agree with.
+ *
+ * Bigger than the 560x400 it replaces, and deliberately: that box was sized
+ * for the boot panel alone ("an app starting", not "the OS is this window"),
+ * from before this window had a real desktop to show at a real aspect. 960x540
+ * is a half-scale 1920x1080 — the exact pixel-doubled shape of the thing being
+ * streamed — and still leaves the taskbar and the desktop visible around it on
+ * any laptop screen.
+ */
+const WINDOW_HEAD_H = 30;
+const WINDOW_W = 960;
+const WINDOW_H = Math.round(WINDOW_W / STREAM_ASPECT) + WINDOW_HEAD_H;
+
+/**
+ * Size and centre the stream iframe to the largest `STREAM_ASPECT` rectangle
+ * that fits `el_body`, and report what it did.
+ *
+ * Written in whole pixels: a half-pixel box on a scaled video is a visibly
+ * soft picture, and the centring offsets have to add up to the body's own
+ * integer size or the bars come out uneven.
+ *
+ * @param {HTMLElement} el_body   The window body — the box to fit inside.
+ * @param {HTMLElement} el_iframe The stream iframe.
+ * @returns {{w: number, h: number}|null} null if the body has no layout yet
+ *   (a minimised or not-yet-shown window), in which case nothing is written.
+ */
+function fit_stream (el_body, el_iframe) {
+    if ( ! el_body || ! el_iframe ) return null;
+    const bw = Math.round(el_body.clientWidth);
+    const bh = Math.round(el_body.clientHeight);
+    // A hidden or minimised window measures 0. Writing `0px` would collapse
+    // the iframe and it would stay collapsed after a restore, because the
+    // restore does not necessarily change the body's size again.
+    if ( bw <= 0 || bh <= 0 ) return null;
+
+    let w = bw;
+    let h = Math.round(bw / STREAM_ASPECT);
+    if ( h > bh ) {
+        h = bh;
+        w = Math.round(bh * STREAM_ASPECT);
+    }
+    el_iframe.style.width = `${w}px`;
+    el_iframe.style.height = `${h}px`;
+    el_iframe.style.left = `${Math.round((bw - w) / 2)}px`;
+    el_iframe.style.top = `${Math.round((bh - h) / 2)}px`;
+    return { w, h };
+}
+
 /**
  * Open the desktop window.
  *
@@ -302,10 +404,12 @@ export async function openDesktopWindow (ctx = {}) {
         // first frame; full-bleed is entered by `go_fullbleed` below, once
         // there is a desktop to be full-bleed WITH. See the header.
         is_fullpage: false,
-        // Big enough for the boot panel with room around it, small enough to
-        // read as "an app starting" rather than "the OS is this window".
-        width: 560,
-        height: 400,
+        // MODIFIED BY EZIL 2026-08-08: derived from the stream's own shape,
+        // was a flat 560x400. See `WINDOW_W` / `WINDOW_H` above — the content
+        // box is now exactly 16:9, so a freshly opened Browser window shows
+        // the desktop with no bars at all.
+        width: WINDOW_W,
+        height: WINDOW_H,
         // 🔴 Resizable — and NOT because anyone needs to resize a boot panel.
         // `UIWindow.js:346` renders the head's MINIMISE button only when
         // `is_resizable && show_minimize_button && !is_embedded`. OBSERVED in
@@ -376,6 +480,21 @@ export async function openDesktopWindow (ctx = {}) {
 
     const el_body = el_window.querySelector('.window-body');
     const el_iframe = el_window.querySelector('.window-app-iframe');
+
+    // ── keep the stream's box at the stream's aspect ───────────────────────
+    // ADDED BY EZIL 2026-08-08. See the `fit_stream` block at the top of this
+    // file for what this does and, more importantly, for the two things it
+    // deliberately does NOT do (touch the video — impossible, cross-origin —
+    // and change the capture resolution, which is never a resize handler's
+    // decision).
+    //
+    // A `ResizeObserver` on the BODY, not a `window.resize` listener: the body
+    // changes size for reasons the viewport does not (full-bleed in and out, a
+    // drag on a resize handle, a restore from the taskbar), and it is the box
+    // the fit is actually against. It fires once on observe, which is what
+    // sizes the iframe initially.
+    const fit_observer = new ResizeObserver(() => { fit_stream(el_body, el_iframe); });
+    fit_observer.observe(el_body);
 
     // ── boot state ─────────────────────────────────────────────────────────
     let tick_timer = null;
@@ -1141,6 +1260,9 @@ export async function openDesktopWindow (ctx = {}) {
         disposed = true;
         stop_timers();
         observer.disconnect();
+        // The aspect-fit observer holds a reference to the window body; a
+        // window that is going away must not leave one behind.
+        fit_observer.disconnect();
         window.removeEventListener('ezil:teardown', dispose);
     };
 
