@@ -342,3 +342,267 @@ describe('ezil-mobile.js drives the client bundle rather than reimplementing it'
         expect(r.calls).toContain('blur:overlay');
     });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The black-picture detector (the other half of www/ezil-mobile.js).
+//
+// 🔴 What this proves and what it does not. The thresholds it fires on were
+// calibrated against real measurements — a production desktop that rendered
+// every sampled pixel at exactly 0 on 13 of 13 opens, and a healthy container
+// whose SERVER-SIDE framebuffer (`GET /api/room/screen/shot.jpg`, which bypasses
+// the encoder entirely) reads meanLuma 34.664. Killing the one X client that
+// paints anything drops that same framebuffer to `mean 0.000 / max 0 /
+// nonzeroFrac 0.0000` while `phase=ready event=end status=ok` still stands.
+// That is the fault. It is not reproducible in a unit test, and nothing below
+// is evidence that production is fixed.
+//
+// What IS testable here, and is: given a picture, does this code reach the
+// right verdict, does it stay silent when it should, and does it stop costing
+// anything the moment it sees content.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Drive the detector against a stub DOM whose clock and ticks the test owns. */
+function runPictureScript(opts: {
+    /** `null` = no <video> in the document at all. */
+    video?: { videoWidth: number; videoHeight: number; readyState: number } | null;
+    /** What `getImageData` hands back. `unreadable` = no 2D context (tainted canvas). */
+    pixels?: 'black' | 'lit' | 'unreadable';
+    /** Bytes the inbound-rtp report gains per second, and the frame size it claims. */
+    peer?: { bytesPerSecond: number; width: number; height: number } | null;
+}) {
+    const posted: Record<string, unknown>[] = [];
+    let clock = 1_700_000_000_000;
+
+    const video = opts.video === undefined
+        ? { videoWidth: 1920, videoHeight: 1080, readyState: 4 }
+        : opts.video;
+
+    const pixels = opts.pixels ?? 'lit';
+    const makeCanvas = () => {
+        const el: Record<string, any> = { width: 0, height: 0 };
+        el.getContext = () => {
+            if (pixels === 'unreadable') return null;
+            return {
+                drawImage() {},
+                getImageData(_x: number, _y: number, w: number, h: number) {
+                    const data = new Uint8ClampedArray(w * h * 4);
+                    if (pixels === 'lit') data.fill(128);
+                    return { data };
+                },
+            };
+        };
+        return el;
+    };
+
+    // A SYNCHRONOUS thenable, so `pumpStats()` resolves inside the tick that
+    // started it and the whole test stays deterministic. `getStats()` only has
+    // to be thenable — the detector never awaits it.
+    let bytes = 0;
+    const peer = opts.peer === undefined ? { bytesPerSecond: 30_000, width: 1920, height: 1080 } : opts.peer;
+    const pc: Record<string, any> = {
+        getStats: () => ({
+            then(ok: (r: unknown) => void) {
+                ok({
+                    forEach(fn: (e: unknown) => void) {
+                        fn({ type: 'inbound-rtp', kind: 'audio', bytesReceived: 1 });
+                        fn({
+                            type: 'inbound-rtp',
+                            kind: 'video',
+                            bytesReceived: bytes,
+                            frameWidth: peer?.width,
+                            frameHeight: peer?.height,
+                        });
+                    },
+                });
+                return this;
+            },
+        }),
+    };
+
+    const doc: Record<string, any> = {
+        activeElement: null,
+        documentElement: {},
+        head: { appendChild() {} },
+        body: { appendChild() {} },
+        createElement: (t: string) => (t === 'canvas' ? makeCanvas() : { style: {}, setAttribute() {}, addEventListener() {} }),
+        getElementById: () => null,
+        addEventListener: () => {},
+        querySelector(sel: string) {
+            if (sel === 'video') return video;
+            return null;
+        },
+    };
+
+    let ticker: (() => void) | null = null;
+    let cleared = 0;
+    const win: Record<string, any> = {
+        // Non-touch on purpose: the detector must run anyway. That is the point
+        // of the "regardless of device" requirement, so it is the default here.
+        navigator: { maxTouchPoints: 0 },
+        matchMedia: () => ({ matches: false }),
+        getComputedStyle: () => ({ pointerEvents: 'none' }),
+        MutationObserver: class { observe() {} disconnect() {} },
+        visualViewport: null,
+        // A parent that is not us, so `postMessage` is actually attempted.
+        parent: { postMessage: (m: Record<string, unknown>) => posted.push(m) },
+        RTCPeerConnection: peer ? function RTCPeerConnection() {} : undefined,
+        console: { warn() {} },
+    };
+    if (peer) {
+        (win.RTCPeerConnection as any).prototype.setRemoteDescription = function () { return null; };
+    }
+    win.window = win;
+    win.document = doc;
+
+    const setInterval = (fn: () => void) => { ticker = fn; return 7; };
+    const clearInterval = () => { cleared += 1; ticker = null; };
+    const DateStub = { now: () => clock };
+
+    const run = new Function(
+        'window', 'document', 'navigator', 'console', 'MutationObserver',
+        'setInterval', 'clearInterval', 'getComputedStyle', 'Date',
+        EZIL_MOBILE_JS,
+    );
+    run(win, doc, win.navigator, win.console, win.MutationObserver,
+        setInterval, clearInterval, win.getComputedStyle, DateStub);
+
+    // The bundle constructs its peer after the script runs, so hand the hooked
+    // prototype a call exactly as a real handshake would.
+    if (peer) (win.RTCPeerConnection as any).prototype.setRemoteDescription.call(pc);
+
+    const state = win.__ezilPicture as {
+        state: string; ticks: number; liveTicks: number; blackRun: number;
+        lastNorm: number | null; reported: string | null;
+    };
+    const tick = (n = 1) => {
+        for ( let i = 0; i < n; i++ ) {
+            if ( ! ticker ) return;
+            clock += 1000;
+            bytes += peer ? peer.bytesPerSecond : 0;
+            ticker();
+        }
+    };
+    return { state, posted, tick, cleared: () => cleared, running: () => ticker !== null };
+}
+
+describe('ezil-mobile.js detects a black picture, which is the one failure every other health signal misses', () => {
+    it('runs on a NON-TOUCH device — black is not a phone problem', () => {
+        // The keyboard half is a hard no-op here (`not-a-touch-device`). The
+        // detector must not be behind that gate. Goes RED if anyone moves it.
+        const r = runPictureScript({ pixels: 'black', peer: { bytesPerSecond: 6_000, width: 1920, height: 1080 } });
+        r.tick(20);
+        expect(r.posted.map((m) => m.code)).toContain('picture_black');
+    });
+
+    it('reports a sustained black picture as display_failure at the picture site', () => {
+        const r = runPictureScript({ pixels: 'black', peer: { bytesPerSecond: 6_000, width: 1920, height: 1080 } });
+        r.tick(20);
+        expect(r.posted).toEqual([{
+            source: 'ezil-mobile',
+            type: 'display_failure',
+            site: 'ezil-os:apps/desktop#picture',
+            code: 'picture_black',
+        }]);
+    });
+
+    it('waits out the grace ticks AND the full sustain window before saying so', () => {
+        // 3 grace + 8 consecutive black samples. Anything shorter would fire on
+        // the ramp-up of a perfectly healthy stream.
+        const r = runPictureScript({ pixels: 'black' });
+        r.tick(10);
+        expect(r.posted).toEqual([]);
+        r.tick(1);
+        expect(r.posted.length).toBe(1);
+    });
+
+    it('🔴 is SILENT on a static-but-painted desktop, and stops costing anything', () => {
+        // The calibration reference was equally idle and still read meanLuma
+        // 33.6. "Nothing is moving" and "there is nothing to see" are different
+        // measurements; this one asks the second question.
+        const r = runPictureScript({ pixels: 'lit', peer: { bytesPerSecond: 200, width: 1920, height: 1080 } });
+        r.tick(60);
+        expect(r.posted).toEqual([]);
+        expect(r.state.state).toBe('healthy');
+        // One readback and it is done, permanently — for the rest of the
+        // session there is no timer, no canvas and no getStats call at all.
+        expect(r.running()).toBe(false);
+        expect(r.cleared()).toBe(1);
+        expect(r.state.liveTicks).toBe(4);
+    });
+
+    it('🔴 says NOTHING when there is no stream to judge', () => {
+        // A desktop that never connects is a different failure, already owned by
+        // the shell's frame/display gates. Reporting it here would double-count
+        // it and train people to ignore the row that matters.
+        const r = runPictureScript({ video: null });
+        r.tick(200);
+        expect(r.posted).toEqual([]);
+        expect(r.state.state).toBe('gave-up');
+    });
+
+    it('🔴 says NOTHING before the video has a decoded frame', () => {
+        // An untouched canvas reads back as transparent black. Without the
+        // readyState guard this detector would fire on every healthy boot.
+        const r = runPictureScript({
+            video: { videoWidth: 1920, videoHeight: 1080, readyState: 1 },
+            pixels: 'black',
+        });
+        r.tick(200);
+        expect(r.posted).toEqual([]);
+        expect(r.state.liveTicks).toBe(0);
+    });
+
+    it('falls back to normalised bitrate when the pixels cannot be read, under its own code', () => {
+        // 6 kB/s at 1920x1080 = 0.0231 kbps/kpx, below the 0.072 threshold —
+        // the production black range was 0.0355–0.0371.
+        const r = runPictureScript({
+            pixels: 'unreadable',
+            peer: { bytesPerSecond: 6_000, width: 1920, height: 1080 },
+        });
+        r.tick(20);
+        expect(r.posted.map((m) => m.code)).toEqual(['picture_starved']);
+        expect(r.state.lastNorm).toBeLessThan(0.072);
+    });
+
+    it('🔴 does NOT fire on an unreadable picture whose stream is carrying real content', () => {
+        // 40 kB/s at 1920x1080 = 0.154 kbps/kpx — the measured healthy idle
+        // figure was 0.1419. A blind detector must abstain, not guess.
+        const r = runPictureScript({
+            pixels: 'unreadable',
+            peer: { bytesPerSecond: 40_000, width: 1920, height: 1080 },
+        });
+        r.tick(30);
+        expect(r.posted).toEqual([]);
+        expect(r.state.state).toBe('healthy');
+    });
+
+    it('🔴 abstains entirely when it has neither pixels nor stats', () => {
+        const r = runPictureScript({ pixels: 'unreadable', peer: null });
+        r.tick(30);
+        expect(r.posted).toEqual([]);
+        expect(r.state.reported).toBe(null);
+    });
+
+    it('reports at most once, however long it stays black', () => {
+        const r = runPictureScript({ pixels: 'black' });
+        r.tick(200);
+        expect(r.posted.length).toBe(1);
+    });
+
+    it('does not replace window.RTCPeerConnection — a broken stream beats a missing row', () => {
+        // Swapping the global constructor risks the stream itself. Only one
+        // prototype method is wrapped, and the original is still called.
+        expect(EZIL_MOBILE_JS).not.toMatch(/window\.RTCPeerConnection\s*=/);
+        expect(EZIL_MOBILE_JS).toContain('P.prototype.setRemoteDescription = function');
+        expect(EZIL_MOBILE_JS).toContain('return orig.apply(this, arguments);');
+    });
+
+    it('every threshold in the file is a stated number, not a magic one', () => {
+        for ( const marker of ['BLACK_MAX_LUMA = 2', 'STARVED_KBPS_PER_KPX = 0.072', 'VERDICT_TICKS = 8', 'GRACE_TICKS = 3'] ) {
+            expect(EZIL_MOBILE_JS).toContain(marker);
+        }
+        // …and each one is accompanied by the measurement it came from.
+        expect(EZIL_MOBILE_JS).toContain('0.1419 kbps/kpx');
+        expect(EZIL_MOBILE_JS).toContain('nonzeroFrac 0.0000');
+    });
+});

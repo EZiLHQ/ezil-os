@@ -323,6 +323,108 @@ system.**
 
 ---
 
+## 🔴 The black desktop — the mechanism, and how to see it
+
+**A black picture means no Chrome window is mapped. There is no other
+possibility.** Grep the whole 2,204-line `worker/scripts/start-neko.sh` for
+`xsetroot|hsetroot|feh|nitrogen|wallpaper`: there is no root-window painter of
+any kind. Xvfb is started bare (`start-neko.sh:970`), openbox paints no desktop,
+and code-server is not an X client. Chrome's mapped window is the **only** source
+of pixels on `:99`. Remove it and the stream carries the bare X root, which is
+solid black.
+
+**Reproduced locally, 2026-08-19.** `ezil-integrated:local`, plain boot, healthy:
+`shot.jpg` reads `mean 34.664 / max 255 / nonzeroFrac 1.0000` (three consecutive
+boots, identical to the digit). `pkill -9` the Chrome that owns
+`--user-data-dir=/tmp/chromium-app-data` and the *same* endpoint one second later
+reads **`mean 0.000 / max 0 / nonzeroFrac 0.0000`** — the exact production
+signature — while `phase=ready event=end status=ok` still stands in `/tmp/neko.log`
+and `GET /api/room/screen` still answers `1920x1080@60`.
+
+### Why nothing catches it
+
+| check | what it actually proves |
+| --- | --- |
+| window-ready gate | `wmctrl -x -l` prints **some** line whose class field matches `chrome` (`start-neko.sh:1899-1908`). Not the pid, not the boot generation, not map state, **not one pixel**. |
+| code-server leg | a bare TCP *connect* to `127.0.0.1:8443` (`wait_tcp`, 559-569). Any listener passes. |
+| `/tmp/neko-app-health.json` | measured stale: it read `{"chromium":{"state":"running","pid":210,"restarts":0}}` while pid 210 had been dead for a minute and the screen was black. |
+| `?confirm=frame` / `?confirm=display` | the iframe answered, and neko thinks somebody is watching. Both are true of a black stream. |
+
+### The unbounded gap W4 opened
+
+`_app_exit_is_clean` (`start-neko.sh:1150-1161`) exempts `rc == 0 && uptime >= 5s`
+from the restart budget. `attempt` is incremented **only** on the crash branch
+(1245), and the fatal sentinel — the only thing that makes the desktop fail
+closed — is reachable **only** from that branch (1253). So an app that exits 0
+after ≥5s restarts **forever** and can never fail the desktop closed. The only
+floor is the linear backoff, `2s * clean_streak` capped at 30s (1230-1235).
+
+Driven live in a container:
+
+```
+app=chromium exited rc=0 after 50051ms — CLEAN exit: restarting in 2s,  NOT charged (still 1/5 used, clean_streak=1)
+app=chromium exited rc=0 after  5051ms — CLEAN exit: restarting in 4s,  NOT charged (still 1/5 used, clean_streak=2)
+app=chromium exited rc=0 after  5047ms — CLEAN exit: restarting in 6s,  NOT charged (still 2/5 used, clean_streak=3)
+app=chromium exited rc=0 after  5060ms — CLEAN exit: restarting in 8s,  NOT charged (still 3/5 used, clean_streak=4)
+app=chromium exited rc=0 after 19348ms — CLEAN exit: restarting in 10s, NOT charged (still 3/5 used, clean_streak=5)
+```
+
+and the framebuffer during that 10 s window, sampled every 2 s:
+
+```
+t+02s mean=0.000 max=0 nonzero=0.0000
+t+04s mean=0.000 max=0 nonzero=0.0000
+t+06s mean=0.000 max=0 nonzero=0.0000
+t+08s mean=0.000 max=0 nonzero=0.0000
+t+10s mean=42.952 max=255 nonzero=1.0000   <- Chrome remapped
+```
+
+At the 30 s cap that is a **30-second black desktop, on repeat, forever**, under
+`ready ok`, with `restarts: 0` in the health file. W4's own commit message claims
+"the budget is unchanged and is not infinite"; that is true of the *crash* budget
+only. The in-file comment at 1136-1145 is the honest one.
+
+### Reading the picture yourself, server-side
+
+`GET /api/room/screen/shot.jpg` renders the X framebuffer and **bypasses the
+encoder entirely**, so it settles "is X black, or is only the capture black?" in
+one request. `/shot` alone 404s; it needs a neko **admin** bearer:
+
+```sh
+ADMIN=$(docker exec <container> printenv NEKO_PASSWORD_ADMIN)
+TOK=$(curl -s -X POST http://127.0.0.1:<port>/api/login \
+        -H 'content-type: application/json' \
+        -d "{\"username\":\"probe\",\"password\":\"$ADMIN\"}" | jq -r .token)
+curl -s -o shot.jpg http://127.0.0.1:<port>/api/room/screen/shot.jpg -H "Authorization: Bearer $TOK"
+```
+
+In production the admin password is HMAC-derived (`deriveNekoAdminValue`) and only
+the app server holds the secret — the password in the desktop URL is the **user**
+role and gets `403 session is not admin`.
+
+### The detector that now exists
+
+`worker/assets/neko-branding/www/ezil-mobile.js` (image tag **`brand3`** and up)
+samples the decoded `<video>` from inside the stream's own origin — the only
+place in the product that can — and posts a verdict to the shell, which turns it
+into a real telemetry row:
+
+| field | value |
+| --- | --- |
+| `eventClass` | `display_failure` |
+| `site` | `ezil-os:apps/desktop#picture` |
+| `code` | `picture_black` (pixels read, and they were black) or `picture_starved` (pixels unreadable; normalised bitrate below 0.072 kbps/kpx) |
+| `outcome` | `error` |
+
+It is **one-shot and anchored at the start of the stream**: 3 grace ticks, then 8
+consecutive black samples, then it reports once and stops. The first non-black
+sample disarms it permanently, so a healthy desktop pays for exactly one 64x36
+canvas readback and a legitimately dark screen later in the session is never
+judged. The cost of that choice: a desktop that goes black **mid-session** is not
+caught here — it is caught on the next open.
+
+---
+
 ## `POST /sandbox/:name/logs` — the container boot-log tail
 
 Added 2026-08-19. Returns a bounded tail of the container's own `/tmp/neko.log`

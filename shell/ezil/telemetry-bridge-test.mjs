@@ -20,6 +20,8 @@
 // armed — so this file can assert what the bridge accepted with no network,
 // no boot payload and no ingest route at all.
 
+import { readFile } from 'node:fs/promises';
+
 import { JSDOM } from 'jsdom';
 
 const checks = [];
@@ -30,6 +32,7 @@ const push = (name, pass, detail = '') => {
 
 const DESKTOP_ORIGIN = 'https://8181-guac-abc-def-nekodesktop.ezil.org';
 const KEYBOARD_SITE = 'ezil-os:apps/desktop#keyboard';
+const PICTURE_SITE = 'ezil-os:apps/desktop#picture';
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', {
     url: 'https://os.ezil.work/os',
@@ -91,6 +94,43 @@ const GOOD = { source: 'ezil-mobile', type: 'window_error', site: KEYBOARD_SITE,
     const got = post({ data: { ...GOOD, code: 'XTest-Dead!!' } });
     push('🔴 a hostile/odd `code` is normalised to [a-z0-9_], never stored verbatim',
         got[0]?.code === 'xtest_dead', String(got[0]?.code));
+}
+
+// ── the black-picture detector's row ────────────────────────────────────────
+// The second producer on this bridge. Same origin, same iframe, different site
+// and a different class — `display_failure`, because a desktop that streams a
+// completely black picture is not a window error, it is the display failing
+// while every other health signal says `ok`.
+{
+    const got = post({ data: { source: 'ezil-mobile', type: 'display_failure', site: PICTURE_SITE, code: 'picture_black' } });
+    push('a black-picture report from the desktop iframe becomes exactly one event',
+        got.length === 1, `${got.length} event(s)`);
+    push('…recorded as display_failure at the picture site',
+        got[0]?.eventClass === 'display_failure' && got[0]?.site === PICTURE_SITE,
+        `${got[0]?.eventClass}/${got[0]?.site}`);
+    push('…with an error outcome, so it cannot read as a healthy boot',
+        got[0]?.outcome === 'error', String(got[0]?.outcome));
+    push('…and NO `app_id` attr, which `ATTRS_ALLOW_LIST.display_failure` would strip anyway',
+        got[0]?.attrs === undefined || got[0]?.attrs?.app_id === undefined,
+        JSON.stringify(got[0]?.attrs));
+}
+{
+    const got = post({ data: { source: 'ezil-mobile', type: 'display_failure', site: PICTURE_SITE, code: 'picture_starved' } });
+    push('the stats-only fallback code is carried through distinctly',
+        got.length === 1 && got[0]?.code === 'picture_starved', String(got[0]?.code));
+}
+
+// 🔴 The pairing, not the cross product. Two independent closed SETS would have
+// accepted every combination of {keyboard, picture} x {window_error,
+// display_failure} the moment the second row landed. Each site admits exactly
+// one class.
+{
+    const got = post({ data: { source: 'ezil-mobile', type: 'display_failure', site: KEYBOARD_SITE, code: 'xtest_dead' } });
+    push('🔴 REJECTS the keyboard site under the picture site\'s class', got.length === 0);
+}
+{
+    const got = post({ data: { source: 'ezil-mobile', type: 'window_error', site: PICTURE_SITE, code: 'picture_black' } });
+    push('🔴 REJECTS the picture site under the keyboard site\'s class', got.length === 0);
 }
 
 // ── the refusals ────────────────────────────────────────────────────────────
@@ -164,6 +204,72 @@ const GOOD = { source: 'ezil-mobile', type: 'window_error', site: KEYBOARD_SITE,
     push('🔴 the bridge is bounded per page load — a flood cannot fill the buffer',
         refusedAfter !== null && accepted <= 5,
         `refused after ${refusedAfter} more; ${accepted} accepted in total`);
+}
+
+// ── 🔴 the two sides of the contract, checked against each other ────────────
+// Contract §10.2: prove behaviour, do not assert the string you typed. Both
+// halves of this bridge live in this repo but in different packages and ship in
+// different artifacts (the shell bundle, and a `brandN` container image), so
+// "the producer posts what the consumer accepts" is exactly the kind of thing
+// that drifts silently — and drifts INVISIBLY, because a rejected message
+// produces no error anywhere, just a row that never arrives.
+//
+// So: read the LITERAL `postMessage` payloads out of the producer's source and
+// feed every one of them through the real listener. A fresh module instance
+// (cache-busted import) is used because the listener above is deliberately
+// capped at 5 events per page load and the checks above have spent that budget.
+{
+    const producer = await readFile(
+        new URL('../../worker/assets/neko-branding/www/ezil-mobile.js', import.meta.url),
+        'utf8',
+    );
+    // Every `postMessage({...})` object literal the producer sends.
+    const literals = [...producer.matchAll(/\{ source: 'ezil-mobile'[^}]*\}/g)].map((m) => m[0]);
+    push('the producer source was found and posts more than one payload shape',
+        literals.length >= 2, `${literals.length} literal(s)`);
+
+    const fresh = await import('./telemetry.js?producer-contract');
+    let baseline2 = fresh.recentEvents().length;
+    const postFresh = (data) => {
+        baseline2 = fresh.recentEvents().length;
+        window.dispatchEvent(new window.MessageEvent('message', {
+            data, origin: DESKTOP_ORIGIN, source: desktopFrame.contentWindow,
+        }));
+        return fresh.recentEvents().slice(baseline2);
+    };
+
+    // The producer writes some fields as identifiers (`site: PICTURE_SITE`,
+    // `code: code`). Resolve them from the producer's OWN declarations rather
+    // than retyping the values here — retyping them is precisely the mistake
+    // this check exists to catch.
+    const resolve = (src) => src.replace(/([a-z]+): ([A-Za-z_][A-Za-z0-9_]*)/g, (whole, key, ident) => {
+        if ( key === ident ) return `${key}: 'probe_code'`;   // `code: code`
+        const decl = producer.match(new RegExp(`var ${ident} = '([^']+)'`));
+        return decl ? `${key}: '${decl[1]}'` : whole;
+    });
+
+    const rejected = [];
+    let accepted = 0;
+    for ( const literal of literals ) {
+        const src = resolve(literal);
+        let payload = null;
+        try { payload = (0, eval)(`(${src})`); } catch { /* leave null */ }
+        if ( ! payload ) { rejected.push(`unparseable: ${src}`); continue; }
+        if ( postFresh(payload).length === 1 ) accepted += 1;
+        else rejected.push(JSON.stringify(payload));
+    }
+    push('🔴 EVERY payload the in-stream script actually posts is accepted by this listener',
+        literals.length >= 2 && accepted === literals.length,
+        rejected.length ? `rejected: ${rejected.join(' | ')}` : `${accepted}/${literals.length}`);
+
+    // And the inverse: the sites the producer names are exactly the sites this
+    // listener knows about. A site added on one side only is the silent failure.
+    const producerSites = [...new Set([...producer.matchAll(/'(ezil-os:apps\/desktop#[a-z]+)'/g)].map((m) => m[1]))].sort();
+    const listenerSites = Object.values(fresh.default.SITES)
+        .filter((v) => v === 'ezil-os:apps/desktop#keyboard' || v === 'ezil-os:apps/desktop#picture').sort();
+    push('🔴 the producer names no site the listener has not been told about',
+        producerSites.every((site) => listenerSites.includes(site)),
+        `producer=${producerSites.join(',')} listener=${listenerSites.join(',')}`);
 }
 
 console.log(`\n${checks.filter((c) => c.pass).length}/${checks.length} checks passed`);

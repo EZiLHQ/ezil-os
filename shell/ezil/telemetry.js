@@ -120,6 +120,7 @@ export const SITES = {
     DESKTOP_SCREEN: 'ezil-os:apps/desktop#screen',
     DESKTOP_CLOSE: 'ezil-os:apps/desktop#close',
     DESKTOP_KEYBOARD: 'ezil-os:apps/desktop#keyboard',
+    DESKTOP_PICTURE: 'ezil-os:apps/desktop#picture',
 };
 
 // ── The cross-origin bridge for the in-stream mobile script ──────────────────
@@ -140,8 +141,10 @@ export const SITES = {
 //      first test; a spoofed `data.source` fails nothing on its own and is
 //      therefore never sufficient. Nothing is derived from the message about
 //      where it came from — the DOM is the authority.
-//   2. `type` and `site` must each be in a CLOSED SET defined here. A message
-//      naming any other site or class is dropped, not forwarded.
+//   2. `site` must be a key of a CLOSED MAP defined here, and `type` must
+//      equal the ONE class that map pairs with that site. Any other site, or
+//      the right site under the wrong class, is dropped rather than forwarded
+//      — and the class actually recorded is read off the map, not the message.
 //   3. `code` is the ONLY free-ish field, and it goes through the same
 //      `normalizeCode` every other call site uses (`[a-z0-9_]`, 64 chars).
 //   4. `detail`, `attrs`, `correlationId` and `computerId` are NEVER read off
@@ -151,8 +154,36 @@ export const SITES = {
 //
 // If any of that cannot hold, the correct outcome is a MISSING telemetry row.
 const MOBILE_BRIDGE_SOURCE = 'ezil-mobile';
-const MOBILE_BRIDGE_SITES = new Set([SITES.DESKTOP_KEYBOARD]);
-const MOBILE_BRIDGE_CLASSES = new Set(['window_error']);
+
+/**
+ * The closed set, as a PAIRING of site -> the one class that site may be
+ * reported under, plus the `attrs` this shell writes for it (never the
+ * message's).
+ *
+ * It was two independent sets — one of sites, one of classes — which admitted
+ * their cross product the moment a second row was added. Pairing them keeps
+ * "one more thing the stream may tell us" from also meaning "three more shapes
+ * it may tell us in". This NARROWS the previous contract rather than widening
+ * it: every message the old sets accepted and this one rejects is a
+ * combination no producer has ever emitted.
+ *
+ * `#picture` is the black-screen detector in
+ * `worker/assets/neko-branding/www/ezil-mobile.js`. It is here because the
+ * decoded `<video>` lives in THAT origin and cannot be read from this one, so
+ * the shell has no independent way to learn that the desktop it just revealed
+ * shows nothing at all — which is exactly how 13 of 13 production opens
+ * rendered a completely black picture under `outcome: 'ok'`.
+ *
+ * `attrs` is omitted for `display_failure` on purpose: its server-side
+ * allow-list (`ATTRS_ALLOW_LIST` in `app/src/server/telemetry/types.ts`) is
+ * `['seen']`, so an `app_id` sent under that class would be stripped on
+ * ingest. Sending a key guaranteed to be discarded is how a field comes to be
+ * believed in a dashboard that never receives it.
+ */
+const MOBILE_BRIDGE_CONTRACT = new Map([
+    [SITES.DESKTOP_KEYBOARD, { eventClass: 'window_error', attrs: { app_id: 'desktop' } }],
+    [SITES.DESKTOP_PICTURE, { eventClass: 'display_failure', attrs: undefined }],
+]);
 const MAX_MOBILE_BRIDGE_EVENTS = 5;
 let mobileBridgeCount = 0;
 
@@ -191,18 +222,22 @@ function onMobileBridgeMessage (event) {
         if ( data.source !== MOBILE_BRIDGE_SOURCE ) return;
         if ( mobileBridgeCount >= MAX_MOBILE_BRIDGE_EVENTS ) return;
         // Cheap shape checks first, the DOM walk only for a plausible message.
-        if ( ! MOBILE_BRIDGE_CLASSES.has(data.type) ) return;
-        if ( typeof data.site !== 'string' || ! MOBILE_BRIDGE_SITES.has(data.site) ) return;
+        if ( typeof data.site !== 'string' ) return;
+        const allowed = MOBILE_BRIDGE_CONTRACT.get(data.site);
+        if ( ! allowed ) return;
+        if ( data.type !== allowed.eventClass ) return;
         if ( ! fromDesktopFrame(event) ) return;
         mobileBridgeCount += 1;
         // `code` is normalised by `capture()`; nothing else is taken from the
-        // message. `app_id` is written HERE, not read from the payload.
+        // message. The class and the attrs come from the CONTRACT above, keyed
+        // by site — never from the payload, even though the payload had to name
+        // a matching class to get this far.
         capture({
-            eventClass: data.type,
+            eventClass: allowed.eventClass,
             site: data.site,
             code: data.code,
             outcome: 'error',
-            attrs: { app_id: 'desktop' },
+            attrs: allowed.attrs,
         });
     } catch {
         // A hostile or malformed message must never surface as a page error.

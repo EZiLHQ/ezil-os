@@ -46,7 +46,7 @@
 # placeholders in EZiL's real palette (--color-charcoal #161616 /
 # --color-teal #00adb5), not an invented mark — see that Dockerfile's header
 # comment. Rebuild it with:
-#   docker build -t ezil-neko-vscode:d74052bb-049931d7-ezil-brand2 \
+#   docker build -t ezil-neko-vscode:d74052bb-049931d7-ezil-brand3 \
 #     -f worker/assets/neko-branding/Dockerfile worker/assets/neko-branding
 # before building this Dockerfile, exactly like the upstream tag it overlays.
 #
@@ -61,13 +61,20 @@
 #    brand1 -> brand2 adds the mobile on-screen-keyboard client script
 #    (`/var/www/ezil-mobile.js`, ~18 KB, plus its <script> tag in
 #    `/var/www/index.html`). Verified present in brand2 and absent from brand1.
+#
+#    brand2 -> brand3 adds the BLACK-PICTURE DETECTOR to that same script
+#    (~36 KB now). It is the only code in the product that can read the decoded
+#    picture, because the `<video>` is in the container's origin and the shell's
+#    is not. Verified by grep INSIDE both images: `picture_black` appears 4x in
+#    brand3's `/var/www/ezil-mobile.js` and 0x in brand2's. Ship brand2 and the
+#    product goes back to being unable to see its own worst failure.
 #    The overlay Dockerfile has its own build-time gate (`test -s
 #    /var/www/ezil-mobile.js`), but that gate only runs when the new tag is
 #    ACTUALLY BEING BUILT — it cannot catch this line never being bumped.
 #
 #    So: whenever `worker/assets/neko-branding/**` changes, rebuild the overlay
 #    under a NEW `brandN` tag and bump this line in the same commit.
-ARG NEKO_IMAGE=ezil-neko-vscode:d74052bb-049931d7-ezil-brand2
+ARG NEKO_IMAGE=ezil-neko-vscode:d74052bb-049931d7-ezil-brand3
 FROM ${NEKO_IMAGE} AS neko
 
 FROM docker.io/cloudflare/sandbox:0.12.1
