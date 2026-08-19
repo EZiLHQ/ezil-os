@@ -36,6 +36,31 @@ class_name = "Sandbox"
 image = "./Dockerfile"
 instance_type = "standard-3"
 max_instances = 20
+# ── Rollout: replace EVERY instance in one step ───────────────────────────────
+# 🔴 THE DEFAULT SILENTLY STRANDS DEPLOYS, AND IT DID. Without these keys
+# Cloudflare runs a two-step progressive rollout (10%, then 100%), and step 1
+# only completes once it observes a HEALTHY instance on the new version. These
+# containers are Durable-Object-pinned and start on demand, so an idle fleet
+# sits `inactive`, no new-version instance ever becomes healthy, and the rollout
+# parks at 10% indefinitely.
+#
+# Measured 2026-08-19: a deploy at 12:30 was still reporting
+#   status=progressing, step 1 of 2, target_version_instances=1,
+#   current_version_instances=6, "healthy target instances observed = 0"
+# 45 minutes later, with all live instances still on a two-week-old image. The
+# deploy reported SUCCESS and pushed the image correctly — it simply was not
+# serving anyone. Every "the fix isn't working in production" symptom that
+# afternoon traced back to this and nothing else.
+#
+# `rollout_step_percentage = 100` makes it a single step, so a deploy either
+# takes effect or fails visibly instead of half-landing. `rollout_kind` stays
+# automatic. The grace period is what protects a user mid-session: an ACTIVE
+# instance is given this long to finish before it is replaced, so "replace
+# everything at once" does not mean "yank a running desktop". 300s comfortably
+# exceeds a cold boot (~22s measured) and a normal interaction.
+rollout_step_percentage = 100
+rollout_kind = "full_auto"
+rollout_active_grace_period = 300
 
 # ── Durable Object binding (backs each Sandbox container) ─────────────────────
 [[durable_objects.bindings]]
@@ -196,3 +221,22 @@ zone_name = "ezil.org"
 #   SANDBOX_WORKSPACE_MOUNT_PATH    — in-container mount point (defaults to `/workspace`)
 # When unset, the Worker skips the workspace bucket mount entirely (desktop
 # preview still works; no persistent workspace is attached).
+
+# ── Workers Logs: retained, queryable, and the reason we can look BACKWARDS ───
+# `wrangler tail` is a live stream and nothing more: close the terminal and the
+# evidence is gone. Every diagnosis this project has made from Worker behaviour
+# so far has depended on someone happening to be tailing at the moment a defect
+# fired — which is not a strategy, and twice this month meant a failure could
+# only be described after it had been reproduced on purpose.
+#
+# With this enabled, invocation logs are retained and queryable in the dashboard
+# and over the API, so a user report at 14:00 can be answered at 18:00. The
+# sampling rate is 1.0 deliberately: this is a low-traffic service where the rare
+# event IS the interesting one, and sampling would preferentially discard it.
+[observability]
+enabled = true
+head_sampling_rate = 1.0
+
+[observability.logs]
+enabled = true
+invocation_logs = true
