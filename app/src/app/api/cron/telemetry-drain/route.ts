@@ -47,6 +47,30 @@ function authHeaders(): Record<string, string> {
  * JSON) collapses to `{ ok: false }` uniformly; see `spool-drain.ts`'s
  * `DrainPageResult` doc comment for why the loop does not need to
  * distinguish them. */
+/**
+ * Objects per drain page.
+ *
+ * 🔴 SENDING THIS IS LOAD-BEARING, and omitting it is what this constant exists
+ * to prevent. `clampDrainLimit(undefined)` (`worker/src/telemetry.ts:360`) falls
+ * back to `TELEMETRY_DRAIN_MAX_OBJECTS = 200`, and `handleTelemetryDrain` then
+ * performs up to 200 **sequential awaited** `bucket.get()` calls inside a single
+ * request — against the 20s `AbortSignal.timeout` below.
+ *
+ * That is not hypothetical. Measured 2026-08-19: `ezil-telemetry-spool` holds
+ * **173 objects** that have never been drained, so the very first restored run
+ * is the worst case. If it aborts, the app sees `{ok:false}`, never acks, and
+ * the backlog is unchanged — a self-perpetuating stall indistinguishable from
+ * the outage it is recovering from. Cloudflare's invocation analytics record an
+ * aborting client as `clientDisconnected`, and the only three hour-03 Worker
+ * hits in the whole window (2026-08-06/07/08, one per day, then silence) are
+ * exactly that shape — so this may well be how the drain died in the first
+ * place, rather than merely how it would fail next time.
+ *
+ * 25 keeps a page comfortably inside the budget and costs only more round trips;
+ * `runTelemetrySpoolDrain` already loops on the returned cursor.
+ */
+const DRAIN_PAGE_LIMIT = 25;
+
 async function drainPage(cursor: string | undefined): Promise<DrainPageResult> {
     const base = workerBaseUrl();
     if (!base) return { ok: false };
@@ -54,7 +78,7 @@ async function drainPage(cursor: string | undefined): Promise<DrainPageResult> {
         const res = await fetch(`${base}/telemetry/drain`, {
             method: 'POST',
             headers: authHeaders(),
-            body: JSON.stringify({ cursor }),
+            body: JSON.stringify({ cursor, limit: DRAIN_PAGE_LIMIT }),
             signal: AbortSignal.timeout(20_000),
         });
         if (!res.ok) return { ok: false };
