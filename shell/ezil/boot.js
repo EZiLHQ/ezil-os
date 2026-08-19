@@ -282,18 +282,333 @@ function give_up (reason, detail) {
  * to `<body>` directly: a wrapper inside `#ezil-os-root` would not be an
  * ancestor of the windows, and ~40 `.device-* .window-*` rules would stop
  * matching.
+ *
+ * ── MODIFIED BY EZIL 2026-08-19 (W7, contract §7.3) ─────────────────────────
+ * This used to be pure UA sniffing — `isMobile.phone` / `isMobile.tablet`,
+ * which are `navigator.userAgent`/`platform`/`maxTouchPoints` regexes in
+ * `../src/lib/isMobile.min.js`. Three consequences, all observed:
+ *
+ *   - a narrow desktop window was NEVER `device-phone`, so the phone layout
+ *     could not be reproduced (or tested) by resizing a browser;
+ *   - in-app webviews and "request desktop site" mobile Safari fell through
+ *     to `device-desktop` on a 390px screen;
+ *   - it was called exactly ONCE, so nothing re-evaluated on rotation.
+ *
+ * See `DEVICE_RULE` below for the rule that replaced it, `evaluate_device_class`
+ * for the re-evaluation, and `publish_viewport_metrics` for the keyboard.
  */
-function set_device_class () {
-    let cls = 'device-desktop';
-    if ( isMobile.phone ) {
-        cls = 'device-phone';
-    } else if ( isMobile.tablet ) {
-        // Upstream's "smarter check": a tablet with a real pointer gets the
-        // desktop UI; a touch-only one gets the mobile UI.
-        const has_pointer = window.matchMedia && window.matchMedia('(hover: hover)').matches;
-        cls = has_pointer ? 'device-desktop' : 'device-tablet';
+
+/**
+ * ── 🔴 THE DEVICE RULE ──────────────────────────────────────────────────────
+ * Three signals, combined in a fixed order. First clause that matches wins.
+ *
+ *   touch_first  = (pointer: coarse)          // the PRIMARY pointer is coarse
+ *               || isMobile.phone || isMobile.tablet
+ *
+ *   phone_shaped = isMobile.phone                          // (A) the UA says so
+ *               || w <= PHONE_MAX_W                       // (B) narrow viewport
+ *               || (touch_first                           // (C) a phone in
+ *                   && min(w,h) <= PHONE_MAX_SHORT        //     landscape
+ *                   && max(w,h) <= PHONE_MAX_LONG)
+ *
+ *   phone_shaped -> device-phone
+ *   touch_first  -> device-tablet
+ *   otherwise    -> device-desktop
+ *
+ * WHY EACH PIECE:
+ *
+ * `(pointer: coarse)` and not `(any-pointer: coarse)`: `any-pointer` is true
+ * for a DESKTOP with a touchscreen attached, which is emphatically not a
+ * tablet. `pointer` describes the primary input, which is the one the layout
+ * has to serve. A Surface with its keyboard folded back reports `coarse` and
+ * gets the tablet UI; the same Surface docked to a mouse reports `fine` and
+ * gets the desktop UI, which is exactly the distinction the old
+ * `(hover: hover)` tablet branch was groping for.
+ *
+ * 🔴 Clause (A) — the old UA check — IS STILL FIRST, and that is not
+ * politeness to the previous implementation. The brief for this change is
+ * "widen the signal", and widening must be strictly additive: every device
+ * that used to be classed `device-phone` must still be. MEASURED, and the
+ * reason this clause was re-added after being dropped from a first draft: a
+ * page with NO `<meta name="viewport">` gets the 980px legacy layout viewport
+ * on every mobile browser, so on such a page clause (B) sees 980, not 390, and
+ * a real iPhone came out `device-tablet`. `/os` relies on Next's DEFAULT
+ * viewport metadata (`width=device-width`) — nothing in `app/src/app/**`
+ * declares one — and a rule that silently depends on a default someone else
+ * owns is a rule that breaks the day they change it. `isMobile.phone` is the
+ * signal that does not care.
+ *
+ * Clause (B) is DELIBERATELY unconditional on input. A 390px viewport cannot
+ * usefully show a draggable 680px window whatever is pointing at it, and this
+ * is the clause that finally makes the phone layout reachable from a desktop
+ * browser — see "FAILURE MODES" for what it costs.
+ *
+ * Clause (C) exists because a phone held in landscape is 844x390, and its
+ * WIDTH (844) is nothing like a phone's. `min(w,h)` catches it. The
+ * `max(w,h) <= PHONE_MAX_LONG` cap is what stops a 1400x500 touch display —
+ * a kiosk strip, a car head unit — from being called a phone on the strength
+ * of a short edge alone. (VERIFIED: a synthetic touch context at 1400x500
+ * comes out `device-tablet`, not `device-phone`.)
+ *
+ * WIDTH, NEVER HEIGHT, drives clause (B). That is not an accident: a mobile
+ * URL bar collapsing on scroll changes the height by ~60px several times a
+ * second and would otherwise flip the class under the user's finger. Height
+ * only appears inside clause (C), behind `touch_first`, and only as `min`/`max`
+ * of both axes, which a URL-bar collapse cannot move across a threshold.
+ *
+ * FAILURE MODES, stated rather than discovered:
+ *
+ *   1. A desktop browser narrowed below PHONE_MAX_W gets the phone layout,
+ *      which HIDES the window resize handles and the maximize control
+ *      (`style.css` `.device-phone .window .ui-resizable-handle`). Widening
+ *      the window brings them back — that only became true with this change,
+ *      because nothing re-evaluated before. Judged the right trade: at 600px
+ *      a floating window manager is worse than a full-bleed one.
+ *   2. Mobile Safari in "Request Desktop Website" reports a 980px layout
+ *      viewport, a fine pointer AND a desktop UA. It will be classed
+ *      `device-desktop`. No viewport-based rule can see through a viewport the
+ *      site was TOLD to use, and no UA-based one can see through a UA the user
+ *      asked to have replaced. NOT FIXED.
+ *   3. An iPad with an Apple Pencil is `device-tablet`. iPadOS reports
+ *      `pointer: coarse` regardless of the stylus, so the stylus is invisible
+ *      to us. `device-tablet` keeps the resize handles and loses only the
+ *      maximize button, which is the conservative half of the guess.
+ *   4. A foldable unfolded past PHONE_MAX_LONG in landscape is `device-tablet`,
+ *      not `device-phone`. Deliberate: at that size it IS a small tablet.
+ *   5. A browser with no `matchMedia` (none that matters; jsdom in
+ *      `boot-test.mjs` does have it) degrades to `touch_first = isMobile.*`,
+ *      i.e. exactly the old behaviour plus clause (B).
+ */
+const PHONE_MAX_W = 600;
+const PHONE_MAX_SHORT = 500;
+const PHONE_MAX_LONG = 950;
+/**
+ * Hysteresis, in CSS pixels, applied to all three thresholds *while already
+ * `device-phone`*. A viewport parked exactly on a boundary — a user dragging a
+ * desktop window's edge across 600px, a rotation animation passing through it —
+ * would otherwise flip the class on every frame, and a class that flips
+ * repeatedly during a drag is worse than one that never changes. 40px is wider
+ * than any single resize step a human produces and far narrower than the gap
+ * between any two real device widths.
+ */
+const DEVICE_HYSTERESIS = 40;
+/**
+ * Trailing debounce for re-evaluation. Long enough that a drag of a desktop
+ * window's edge produces ONE class change at the end rather than one per
+ * frame; short enough that a rotation feels instant.
+ */
+const DEVICE_SETTLE_MS = 150;
+
+const DEVICE_CLASSES = ['device-desktop', 'device-tablet', 'device-phone'];
+
+/** The class currently on `<body>`, or null before the first evaluation. */
+let device_class = null;
+/** Listeners are installed once, however many times `build()` runs. */
+let device_listeners_bound = false;
+let device_settle_timer = null;
+let viewport_metrics_frame = 0;
+
+function media_matches (query) {
+    try {
+        return !! (window.matchMedia && window.matchMedia(query).matches);
+    } catch {
+        // A media feature the browser does not know throws in some engines
+        // rather than returning false. Unknown means "no signal", never
+        // "phone".
+        return false;
     }
-    $('body').addClass(cls);
+}
+
+/**
+ * The rule above, as code. Pure: reads the environment, returns a class name,
+ * touches nothing. `current` is the class already applied, and is what makes
+ * the hysteresis one-directional — it widens the phone band only for a session
+ * that is ALREADY a phone.
+ */
+function device_class_for (current) {
+    const w = window.innerWidth || document.documentElement?.clientWidth || 0;
+    const h = window.innerHeight || document.documentElement?.clientHeight || 0;
+    const slack = current === 'device-phone' ? DEVICE_HYSTERESIS : 0;
+
+    const touch_first = media_matches('(pointer: coarse)')
+        || !! isMobile.phone || !! isMobile.tablet;
+
+    const phone_shaped = !! isMobile.phone
+        || w <= PHONE_MAX_W + slack
+        || (
+            touch_first
+            && Math.min(w, h) <= PHONE_MAX_SHORT + slack
+            && Math.max(w, h) <= PHONE_MAX_LONG + slack
+        );
+
+    if ( phone_shaped ) return 'device-phone';
+    if ( touch_first ) return 'device-tablet';
+    return 'device-desktop';
+}
+
+/**
+ * ── 🔴 THE KEYBOARD ─────────────────────────────────────────────────────────
+ * A raised mobile keyboard does NOT change `window.innerHeight` on iOS Safari
+ * or on Android Chrome's default `resizes-visual` mode — it shrinks the VISUAL
+ * viewport and leaves the layout viewport alone. So `100dvh`, `100%` and
+ * `window.innerHeight` all keep reporting the full screen and the bottom of
+ * the desktop, along with whatever field the user is typing into, ends up
+ * behind the keyboard.
+ *
+ * `visualViewport` is the only thing that sees it. This publishes what it sees
+ * as two custom properties on `<body>`:
+ *
+ *   --ezil-vvh   the visual viewport's height in px — what "full height"
+ *                actually means right now.
+ *   --ezil-kb    the number of px of the layout viewport currently obscured at
+ *                the BOTTOM (the keyboard), or 0.
+ *
+ * `<body>` and not `:root` for the same reason the device class is on `<body>`:
+ * `UIWindow.js:51` appends every window to `<body>` directly, so a custom
+ * property set here inherits into every window, the taskbar and the desktop
+ * alike. It is also the element THE HYDRATION CONTRACT already sanctions
+ * writing to from `mount()`.
+ *
+ * Consumers are in `../src/css/style.css`'s `.device-phone` block — a rule that
+ * uses `var(--ezil-vvh, 100dvh)` degrades to today's behaviour on a browser
+ * with no `visualViewport` (and inside jsdom), which is why the fallback is
+ * spelled out at every use site.
+ *
+ * 🔴 The 60px floor on the inset. A mobile URL bar collapsing on scroll moves
+ * `innerHeight` and `visualViewport.height` TOGETHER, so it should net to
+ * zero — but sub-pixel rounding and the animation's intermediate frames do
+ * not, and an unfloored inset makes the taskbar jitter for the whole scroll.
+ * No software keyboard is 60px tall; every URL-bar artefact is under it.
+ */
+const KEYBOARD_MIN_PX = 60;
+
+function publish_viewport_metrics () {
+    const body = document.body;
+    if ( ! body ) return;
+    const vv = window.visualViewport;
+    const layout_h = window.innerHeight || 0;
+    const visual_h = vv ? vv.height : layout_h;
+    let inset = vv ? Math.round(layout_h - vv.height - vv.offsetTop) : 0;
+    if ( ! (inset >= KEYBOARD_MIN_PX) ) inset = 0;
+    body.style.setProperty('--ezil-vvh', `${Math.round(visual_h)}px`);
+    body.style.setProperty('--ezil-kb', `${inset}px`);
+}
+
+/** rAF-coalesced: `visualViewport` fires many times per keyboard animation. */
+function schedule_viewport_metrics () {
+    if ( viewport_metrics_frame ) return;
+    const raf = window.requestAnimationFrame
+        ? (fn) => window.requestAnimationFrame(fn)
+        : (fn) => setTimeout(fn, 16);
+    viewport_metrics_frame = 1;
+    raf(() => {
+        viewport_metrics_frame = 0;
+        publish_viewport_metrics();
+    });
+}
+
+/**
+ * Apply the rule and, if the answer changed, move the class. Returns the class
+ * now on `<body>`.
+ *
+ * `removeClass` names the three classes EXPLICITLY rather than resetting the
+ * attribute — same reason `addClass` replaced upstream's `attr('class', …)`:
+ * `<body>` on `/os` carries Tailwind classes this shell did not put there and
+ * must not remove.
+ *
+ * No-op when the answer is unchanged. That matters on the resize path: the
+ * common case of a resize is "same class", and re-writing it would invalidate
+ * style for the whole document on every settled resize for nothing.
+ */
+function apply_device_class () {
+    const next = device_class_for(device_class);
+    // 🔴 `next === device_class` is not on its own enough to skip the write.
+    // `ensure_intact` exists because the tree CAN be regenerated out from
+    // under the shell (a late React hydration), and a regenerated `<body>`
+    // carries React's className, not ours — the module would still believe
+    // the class is applied. Check the document, not just the variable.
+    const on_body = !! document.body?.classList?.contains(next);
+    if ( next === device_class && on_body ) return next;
+    const previous = device_class;
+    device_class = next;
+    $('body').removeClass(DEVICE_CLASSES.join(' ')).addClass(next);
+    if ( previous === next ) return next;
+    if ( previous !== null ) {
+        console.info(`[${PHASE}] device class ${previous} -> ${next} (${window.innerWidth}x${window.innerHeight})`);
+    }
+    // Lets a test (and any future consumer) wait for the settled answer
+    // instead of polling. Fired only on a real change, never on a no-op and
+    // never on a re-assert of the class the body already had.
+    if ( typeof CustomEvent === 'function' ) {
+        window.dispatchEvent(new CustomEvent('ezil:device-class', {
+            detail: { previous, current: next, width: window.innerWidth, height: window.innerHeight },
+        }));
+    }
+    return next;
+}
+
+/** Trailing debounce — see `DEVICE_SETTLE_MS`. */
+function schedule_device_class () {
+    if ( device_settle_timer ) clearTimeout(device_settle_timer);
+    device_settle_timer = setTimeout(() => {
+        device_settle_timer = null;
+        apply_device_class();
+    }, DEVICE_SETTLE_MS);
+}
+
+/**
+ * 🔴 Bound ONCE, however many times `build()` runs (`ensure_intact` can rebuild
+ * the mount up to `MAX_MOUNT_ATTEMPTS` times) — the same guard, and the same
+ * reason, as `start_click_bound` below.
+ *
+ * Four sources, because no one of them covers the ground:
+ *   - `resize`          desktop window resizing, and Android's keyboard in
+ *                       `resizes-content` mode.
+ *   - `orientationchange` fires BEFORE `resize` on some engines and after on
+ *                       others; both are debounced into the same trailing call
+ *                       so the double-fire costs nothing.
+ *   - `(pointer: coarse)` a mouse being plugged into or unplugged from a
+ *                       tablet, which changes the class without changing a
+ *                       single pixel and is therefore invisible to `resize`.
+ *   - `visualViewport`  the keyboard. `resize` AND `scroll`: iOS reports part
+ *                       of a keyboard opening as an offset change, not a
+ *                       height change.
+ *
+ * Nothing here is ever removed. These are page-lifetime listeners on a shell
+ * that has no teardown path (`ensure_intact` rebuilds the DOM, it does not
+ * unload the module), and adding a removal path we never call would be dead
+ * code that only looks careful.
+ */
+function bind_device_listeners () {
+    if ( device_listeners_bound ) return;
+    device_listeners_bound = true;
+
+    window.addEventListener('resize', () => {
+        schedule_viewport_metrics();
+        schedule_device_class();
+    });
+    window.addEventListener('orientationchange', schedule_device_class);
+
+    try {
+        const mq = window.matchMedia && window.matchMedia('(pointer: coarse)');
+        // `addEventListener` on a MediaQueryList is Safari 14+; `addListener`
+        // is the deprecated spelling that older WebKit still needs. A phone is
+        // exactly where the old spelling is most likely to be the only one.
+        if ( mq?.addEventListener ) mq.addEventListener('change', schedule_device_class);
+        else if ( mq?.addListener ) mq.addListener(schedule_device_class);
+    } catch { /* no matchMedia: the rule already degrades, see DEVICE_RULE */ }
+
+    const vv = window.visualViewport;
+    if ( vv?.addEventListener ) {
+        vv.addEventListener('resize', schedule_viewport_metrics);
+        vv.addEventListener('scroll', schedule_viewport_metrics);
+    }
+}
+
+function set_device_class () {
+    const cls = apply_device_class();
+    publish_viewport_metrics();
+    bind_device_listeners();
     return cls;
 }
 
