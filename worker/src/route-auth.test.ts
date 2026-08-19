@@ -139,6 +139,15 @@ function fakeSandboxNamespace(options: {
    */
   containerTelemetryNdjson?: string;
   /**
+   * Canned `exec()` answers keyed off the command string, so a route that
+   * READS a file out of the container (`/sandbox/:name/logs`,
+   * `/sandbox/:name/cpu-diag`) can be driven end to end through the REAL route
+   * table with realistic container stdout. Return `undefined` to fall through
+   * to the default `{ exitCode: 0, stdout: '', stderr: '' }`, which is what
+   * every pre-existing test in this file still gets.
+   */
+  execResult?: (command: string) => { exitCode: number; stdout: string; stderr: string } | undefined;
+  /**
    * Override the fake `flushWorkspaceNow` RPC's own behavior — e.g. a
    * deferred promise the test resolves manually, to prove `/sandbox/preview`
    * does or doesn't wait on it (z2-mint-latency: it must NOT, when `ctx` is
@@ -276,6 +285,10 @@ function fakeSandboxNamespace(options: {
         command.includes('ezil-telemetry.ndjson')
       ) {
         return { exitCode: 0, stdout: options.containerTelemetryNdjson, stderr: '' };
+      }
+      if (options.execResult) {
+        const canned = options.execResult(typeof command === 'string' ? command : '');
+        if (canned) return canned;
       }
       return { exitCode: 0, stdout: '', stderr: '' };
     },
@@ -1168,6 +1181,223 @@ describe('POST /sandbox/:name/screen is HMAC-gated and validates before touching
 // decision helpers in `sandbox-control.test.ts` — see `fakeSandboxNamespace`'s
 // doc comment on `restartResult`. This block proves the ROUTE TABLE: auth,
 // the kill switch, mode resolution, and status-code mapping from `outcome`.
+
+// ── POST /sandbox/:name/logs (container boot-log tail) ──────────────────────
+//
+// The route table is driven for real; only the container's `exec` is faked,
+// and it is faked with output shaped like what genuinely lands in
+// `/tmp/neko.log` (Chromium/code-server/neko stdout, not just `[ezil-boot]`
+// lines). So "the response never carries a URL/path/token" is measured on the
+// actual HTTP body, not inferred from the handler's source.
+
+/** Answer both commands `handleNekoLogs` issues, with `raw` as the log body. */
+function fakeNekoLogExec(raw: string) {
+  return (command: string) => {
+    if (command.includes("wc -c < '/tmp/neko.log'")) {
+      return {
+        exitCode: 0,
+        stdout: `exists\n${raw.length}\n${raw.split('\n').length}\n`,
+        stderr: '',
+      };
+    }
+    if (command.includes("tail -c") && command.includes("'/tmp/neko.log'")) {
+      return { exitCode: 0, stdout: raw, stderr: '' };
+    }
+    return undefined;
+  };
+}
+
+describe('POST /sandbox/:name/logs is HMAC-gated and never returns a raw container line', () => {
+  const LOGS_URL = `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/logs`;
+
+  it('REJECTS an unsigned request with 401 and never execs', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(new Request(LOGS_URL, { method: 'POST', body: '{}' }), {
+      Sandbox: binding,
+      SANDBOX_HMAC_SECRET: SECRET,
+    });
+    expect(res.status).toBe(401);
+    expect(calls.exec).toBe(0);
+  });
+
+  it('ACCEPTS a signed request and returns the redacted tail', async () => {
+    const { binding, calls } = fakeSandboxNamespace({
+      execResult: fakeNekoLogExec(
+        '[ezil-boot][start-neko] +12ms starting\n' +
+          '[ezil-boot] +21534ms phase=neko_serve_bind event=end status=error phase_ms=120034 cumulative_ms=21534\n',
+      ),
+    });
+    const res = await worker.fetch(
+      new Request(LOGS_URL, {
+        method: 'POST',
+        body: JSON.stringify({ token: await mintToken() }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(body.path).toBe('/tmp/neko.log');
+    expect(body.exists).toBe(true);
+    expect(body.redacted).toBe(true);
+    expect(body.returnedLines).toBe(2);
+    // The phase line — the whole point of the route — survives intact.
+    expect(String(body.content)).toContain('phase=neko_serve_bind event=end status=error');
+    expect(calls.exec).toBe(2); // stat, then bounded tail
+  });
+
+  it('strips URLs, absolute paths, IPs and tokens out of the HTTP RESPONSE BODY', async () => {
+    const { binding } = fakeSandboxNamespace({
+      execResult: fakeNekoLogExec(
+        [
+          '[9:1:0819/061500.1:ERROR:CONSOLE(1)] "boom", source: https://acme.example/app?sid=SECRET123 (1)',
+          '[code-server] error opening /home/user1/workspace/proj-1/notes.md',
+          'ice candidate 203.0.113.42 srflx',
+          'auth failed token=t=1755583200000,v1=deadbeefcafef00d',
+        ].join('\n'),
+      ),
+    });
+    const res = await worker.fetch(
+      new Request(LOGS_URL, {
+        method: 'POST',
+        body: JSON.stringify({ token: await mintToken() }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    const raw = await res.text();
+    expect(res.status).toBe(200);
+    for (const leak of [
+      'acme.example',
+      'SECRET123',
+      'user1',
+      'proj-1',
+      'notes.md',
+      '203.0.113.42',
+      'deadbeefcafef00d',
+    ]) {
+      expect(`${leak} present in body: ${raw.includes(leak)}`).toBe(`${leak} present in body: false`);
+    }
+    // But the diagnosis is still there.
+    expect(raw).toContain('boom');
+    expect(raw).toContain('ERROR:CONSOLE');
+  });
+
+  it('reports exists:false as a clean 200, not a 500', async () => {
+    // The default fake `exec` returns empty stdout, which parses as `missing`.
+    const { binding } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(LOGS_URL, {
+        method: 'POST',
+        body: JSON.stringify({ token: await mintToken() }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(body.exists).toBe(false);
+    expect(body.content).toBe('');
+  });
+
+  it('honours the caller-supplied maxLines cap in the command it runs', async () => {
+    let tailCmd = '';
+    const { binding } = fakeSandboxNamespace({
+      execResult: (command: string) => {
+        if (command.startsWith('tail -c')) tailCmd = command;
+        return fakeNekoLogExec('a\nb\nc\n')(command);
+      },
+    });
+    await worker.fetch(
+      new Request(LOGS_URL, {
+        method: 'POST',
+        body: JSON.stringify({ token: await mintToken(), maxLines: 7 }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(tailCmd).toContain('tail -n 7');
+    expect(tailCmd).toContain("'/tmp/neko.log'");
+  });
+
+  it('clamps an absurd maxLines rather than issuing an unbounded read', async () => {
+    let tailCmd = '';
+    const { binding } = fakeSandboxNamespace({
+      execResult: (command: string) => {
+        if (command.startsWith('tail -c')) tailCmd = command;
+        return fakeNekoLogExec('a\n')(command);
+      },
+    });
+    await worker.fetch(
+      new Request(LOGS_URL, {
+        method: 'POST',
+        body: JSON.stringify({ token: await mintToken(), maxLines: 10_000_000 }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(tailCmd).toContain('tail -n 2000');
+  });
+
+  it('a caller-supplied `path` is ignored — the file read is always /tmp/neko.log', async () => {
+    const seen: string[] = [];
+    const { binding } = fakeSandboxNamespace({
+      execResult: (command: string) => {
+        seen.push(command);
+        return fakeNekoLogExec('x\n')(command);
+      },
+    });
+    const res = await worker.fetch(
+      new Request(LOGS_URL, {
+        method: 'POST',
+        body: JSON.stringify({
+          token: await mintToken(),
+          path: '/etc/shadow',
+          file: '/etc/shadow',
+          maxLines: 5,
+        }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    expect((await res.json() as { path: string }).path).toBe('/tmp/neko.log');
+    expect(seen.join('\n')).not.toContain('/etc/shadow');
+    for (const cmd of seen) expect(cmd).toContain('/tmp/neko.log');
+  });
+
+  it('EZIL_NEKO_LOGS=off 404s before the handler and never execs', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(LOGS_URL, {
+        method: 'POST',
+        body: JSON.stringify({ token: await mintToken() }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, EZIL_NEKO_LOGS: 'off' },
+    );
+    expect(res.status).toBe(404);
+    expect((await res.json() as { error: string }).error).toBe('neko_logs_disabled');
+    expect(calls.exec).toBe(0);
+  });
+
+  it('is ON by default — an absent EZIL_NEKO_LOGS does not disable it (contract §2)', async () => {
+    const { binding } = fakeSandboxNamespace({ execResult: fakeNekoLogExec('hello\n') });
+    const res = await worker.fetch(
+      new Request(LOGS_URL, {
+        method: 'POST',
+        body: JSON.stringify({ token: await mintToken() }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it('GET is not routed — the surface is POST-only', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(new Request(LOGS_URL, { method: 'GET' }), {
+      Sandbox: binding,
+      SANDBOX_HMAC_SECRET: SECRET,
+    });
+    expect(res.status).toBe(404);
+    expect(calls.exec).toBe(0);
+  });
+});
 
 describe('POST /sandbox/:name/restart is HMAC-gated the same way as DELETE/focus', () => {
   it('REJECTS an unsigned request with 401 and never calls the DO', async () => {
@@ -2322,6 +2552,7 @@ describe('no other mutating route is reachable unauthenticated', () => {
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/preview` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/workspace-diag` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/cpu-diag` },
+      { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/logs` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/twen` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen` },

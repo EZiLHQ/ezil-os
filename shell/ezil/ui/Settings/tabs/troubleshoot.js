@@ -39,9 +39,39 @@
 // else — including "the request never landed" — renders as `failed`, with
 // the real reason, mirroring the rule `session.openDesktop`/`boot-phases.js`
 // already hold the rest of this shell to.
+//
+// ── SECOND CONTROL: the diagnostic log ──────────────────────────────────────
+// `shell/ezil/log.js` has kept a 200-entry ring of every `debug`/`info`/
+// `warn`/`error` call since the day it was written, for exactly one stated
+// reason — "so a support conversation does not depend on the user having had
+// devtools open at the time" — and its own header ends "this module's value
+// is the RING BUFFER, which nothing yet reads". Nothing did. This tab is the
+// reader.
+//
+// 🔴 WHAT MAY BE COPIED, and why it is not simply the raw ring. The ring holds
+// RAW CONSOLE ARGUMENTS: whatever a call site happened to pass, which can
+// include a full URL with a query string, an absolute workspace path, or an
+// error object carrying either. That is NOT the sanitized closed-vocabulary
+// wire format `docs/telemetry.md` describes, and a "copy this and send it to
+// support" button turns a local debugging convenience into an export path.
+// So every console line is put through the SAME `redact()` the telemetry
+// sender uses before it reaches the clipboard — links, absolute paths,
+// addresses, uuids and token-shaped strings are replaced. The consequence is
+// stated in the UI copy, not buried here, and it is real: `redact()` also
+// caps each line at 200 characters, so a very long console line arrives
+// shortened.
+//
+// The second half of the report — `telemetry.recentEvents()` — needs no
+// redaction pass of its own: those fields ARE the wire form (hand-written
+// low-cardinality `site`/`code`, and a `detail` already through `redact()`).
+// It is included because the console ring alone would tell half the story:
+// exactly one module writes to `log.js` today, while ~30 call sites across
+// this shell report through `telemetry.capture()`.
 import UIAlert from '../../../../src/UI/UIAlert.js';
+import log from '../../../log.js';
 import session from '../../../session.js';
 import telemetry from '../../../telemetry.js';
+import { ambientCorrelationId } from '../../../trace.js';
 
 const PHASE = 'ezil-os:settings/troubleshoot';
 
@@ -78,6 +108,89 @@ function openDesktopComputerId () {
 // state is safe under that lifetime.
 let status = 'idle'; // 'idle' | 'restarting' | 'restarted' | 'failed'
 let failReason = '';
+// 'idle' | 'copied' | 'manual' — 'manual' means the clipboard was unavailable
+// (no `navigator.clipboard`, a denied permission, a non-secure origin) and the
+// report is shown in a textarea for the user to select and copy by hand.
+let copyState = 'idle';
+let copyText = '';
+
+// ── the diagnostic report ────────────────────────────────────────────────
+
+/** ISO-8601 UTC. Deliberately not a locale/timezone-formatted string: a
+ * timezone is a fingerprinting signal `docs/telemetry.md` lists as never
+ * collected, and there is no reason for this report to be the exception. */
+function stamp (ms) {
+    try { return new Date(ms).toISOString(); } catch { return '(bad timestamp)'; }
+}
+
+/**
+ * Build the copyable report. Pure apart from reading the two ring buffers and
+ * the clock, so what the button copies is exactly what a test can inspect.
+ *
+ * See this file's header for what is and is not allowed in here.
+ */
+function buildDiagnosticReport () {
+    const console_entries = log.ringBuffer();
+    const events = telemetry.recentEvents();
+    const trace = ambientCorrelationId();
+
+    const lines = [
+        'EZiL OS diagnostic log',
+        `generated ${stamp(Date.now())}`,
+        `trace ${trace ?? '(none open)'}`,
+        `console entries ${console_entries.length}, recorded events ${events.length}`,
+        'redacted: links, file paths, addresses, ids and token-like values are replaced;'
+            + ' long lines are shortened',
+        '',
+        `-- console (${console_entries.length}) --`,
+    ];
+    if ( console_entries.length === 0 ) lines.push('(nothing recorded)');
+    for ( const e of console_entries ) {
+        // 🔴 The redaction pass. Raw `e.msg` must never reach `lines`.
+        lines.push(`${stamp(e.t)} ${e.level} ${telemetry.redact(e.msg) ?? ''}`.trim());
+    }
+
+    lines.push('', `-- events (${events.length}) --`);
+    if ( events.length === 0 ) lines.push('(nothing recorded)');
+    for ( const e of events ) {
+        lines.push([stamp(e.t), e.eventClass, e.site, e.code, e.outcome, e.detail ?? '']
+            .join(' ').trim());
+    }
+    return lines.join('\n');
+}
+
+/**
+ * Best-effort clipboard write. Resolves to `true` only when the write is
+ * OBSERVED to succeed — the same honesty rule the restart path above holds
+ * itself to. `navigator.clipboard` is absent on a non-secure origin and its
+ * promise rejects on a denied permission, and the legacy `execCommand` path
+ * does not exist everywhere either, so "we could not copy it for you" is a
+ * real state and gets a real UI (the textarea), not a false "Copied".
+ */
+async function copyToClipboard (text) {
+    try {
+        if ( typeof navigator !== 'undefined' && navigator.clipboard
+            && typeof navigator.clipboard.writeText === 'function' ) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch { /* fall through to the legacy path */ }
+    try {
+        if ( typeof document.execCommand !== 'function' ) return false;
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', 'readonly');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand('copy');
+        ta.remove();
+        return ok === true;
+    } catch {
+        return false;
+    }
+}
 
 /**
  * Two families of code arrive here and both must read as an honest sentence.
@@ -143,6 +256,26 @@ function render ($win) {
     const disabled = status === 'restarting' || ! supported || ! computerId;
     const label = status === 'restarting' ? 'Restarting…' : 'Restart desktop';
 
+    // ── the diagnostic-log section ───────────────────────────────────────
+    // Counts are read at render time, so re-opening the tab shows what has
+    // accumulated since — same "read the live state every render" rule the
+    // restart control above follows for `restartEndpoint()`.
+    const consoleCount = log.ringBuffer().length;
+    const eventCount = telemetry.recentEvents().length;
+    const nothingRecorded = consoleCount + eventCount === 0;
+
+    let copyHtml = '';
+    if ( copyState === 'copied' ) {
+        copyHtml = '<p class="ezil-settings-muted">Copied. Paste it into your message to support.</p>';
+    } else if ( copyState === 'manual' ) {
+        copyHtml = '<p class="ezil-settings-muted">This browser would not let the page write to your '
+            + 'clipboard, so here it is to select and copy yourself.</p>'
+            + `<textarea class="ezil-settings-diagnostic" data-role="diagnostic-text" readonly rows="10"
+                >${html_encode(copyText)}</textarea>`;
+    } else if ( nothingRecorded ) {
+        copyHtml = '<p class="ezil-settings-muted">Nothing has been recorded yet on this page.</p>';
+    }
+
     $body.html(`
         <p class="ezil-settings-lead">
             If the desktop is frozen or not responding, restarting it can help. This shuts the
@@ -152,6 +285,19 @@ function render ($win) {
         <button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="restart"
             ${disabled ? 'disabled' : ''}>${html_encode(label)}</button>
         ${statusHtml}
+        <hr class="ezil-settings-rule">
+        <p class="ezil-settings-lead">
+            EZiL OS keeps a short record of what this page did — ${consoleCount} console
+            ${consoleCount === 1 ? 'entry' : 'entries'} and ${eventCount} recorded
+            ${eventCount === 1 ? 'event' : 'events'} — so you can send it to support without
+            having had developer tools open. It stays in this browser tab until you copy it,
+            and it is cleared when you reload. Links, file paths, addresses and anything that
+            looks like a password or token are replaced before it is copied, and long lines
+            are shortened, so it will not carry your files or your sign-in.
+        </p>
+        <button type="button" class="ezil-settings-btn" data-action="copy-diagnostics"
+            ${nothingRecorded ? 'disabled' : ''}>Copy diagnostic log</button>
+        ${copyHtml}
     `);
 }
 
@@ -204,9 +350,23 @@ async function handleRestart ($win) {
     render($win);
 }
 
+async function handleCopyDiagnostics ($win) {
+    copyText = buildDiagnosticReport();
+    copyState = (await copyToClipboard(copyText)) ? 'copied' : 'manual';
+    render($win);
+    if ( copyState === 'manual' ) {
+        // Put the caret in the box so "select all, copy" is one keystroke.
+        const ta = $win.find('[data-role="diagnostic-text"]')[0];
+        if ( ta && typeof ta.select === 'function' ) {
+            try { ta.focus(); ta.select(); } catch { /* focus is a nicety, never a failure */ }
+        }
+    }
+}
+
 function bind ($win) {
     $win.find('[data-role="troubleshoot-body"]')
-        .on('click', '[data-action="restart"]', () => { void handleRestart($win); });
+        .on('click', '[data-action="restart"]', () => { void handleRestart($win); })
+        .on('click', '[data-action="copy-diagnostics"]', () => { void handleCopyDiagnostics($win); });
 }
 
 export default {
@@ -221,6 +381,8 @@ export default {
     init ($win) {
         status = 'idle';
         failReason = '';
+        copyState = 'idle';
+        copyText = '';
         bind($win);
         render($win);
     },
