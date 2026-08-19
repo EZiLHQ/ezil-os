@@ -164,8 +164,26 @@ describe('the honesty contract is not weakened', () => {
     });
 
     it('reports how hard it tried, so the next failure is a diagnosis not an investigation', async () => {
-        const { url } = await settlingOrigin(Array<number>(50).fill(410));
-        const confirmed = await confirmDesktopFrame(url, 300, 20);
+        // 🔴 DE-FLAKED BY INTEGRATION, 2026-08-19 — and note WHICH knob moved.
+        // This was `settlingOrigin(Array(50).fill(410))` with a 300 ms budget,
+        // and it was LOAD-flaky rather than wrong: measured ~1-in-3 red inside
+        // the full 649-test vitest run, 6/6 green when this file ran alone. With
+        // a 300 ms whole budget, one slow loopback round trip on a busy machine
+        // eats it, the per-attempt timeout clamps to `Math.max(1, remaining)`,
+        // the probe aborts, and the reason comes back `unreachable` — a fact
+        // about the CPU, not about the origin.
+        //
+        // Raising the BUDGET alone is wrong and was tried first: `settlingOrigin`
+        // serves 200 once the array runs out, so a bigger budget walks past all
+        // 50 statuses and the origin CONFIRMS. The 300 ms was load-bearing
+        // against the array length, which is exactly the coupling that made this
+        // brittle. So the ORIGIN becomes permanently 410 instead, and the budget
+        // is then free to be generous. The three assertions below are all about
+        // the origin — it tried more than once, it saw the 410, it kept the
+        // status — and none is about speed; the budget's own tightness is the
+        // separate `cannot outrun its own budget` case above.
+        const { url } = await settlingOrigin(Array<number>(10_000).fill(410));
+        const confirmed = await confirmDesktopFrame(url, 1_000, 20);
         if (confirmed.alive) throw new Error("an origin that only 410s must never confirm");
         expect(confirmed.attempts).toBeGreaterThan(1);
         expect(confirmed.elapsedMs).toBeGreaterThan(0);
