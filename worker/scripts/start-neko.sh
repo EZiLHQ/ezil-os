@@ -1657,16 +1657,37 @@ fi
 # (`…Chrome/151.0.0.0 Safari/537.36`, no HeadlessChrome, no automation token).
 # `--noerrdialogs` was tried first as the narrower flag and does NOT suppress
 # this infobar — verified by screenshot on the running desktop.
-# 🔴 `--window-size` IS DERIVED FROM `NEKO_SCREEN`, NOT HARDCODED (integration,
-# 2026-08-19). It read a literal `1920,1080` until W1's framebuffer split and
-# W2's per-session `NEKO_SCREEN` landed together; after that a portrait session
-# (`NEKO_SCREEN=1080x1920x24`) booted an X screen 1080 wide while telling Chrome
-# to open a 1920-wide window. Openbox's maximize reflows it — W1 measured a
-# correct 1080x1920 client at that size — so this was never fatal, but Chrome
-# paints its FIRST frame at the wrong shape and the user sees it. Both variables
-# are set and exported by the X-server block above and are always integers
-# (a malformed `NEKO_SCREEN` has already been forced to 1920x1080x24 there), so
-# there is no unset/empty case to guard here.
+# `--window-size` is derived from `NEKO_SCREEN` rather than hardcoded
+# `1920,1080` (integration, 2026-08-19). Both variables are set and exported by
+# the X-server block above and are always integers (a malformed `NEKO_SCREEN`
+# has already been forced to 1920x1080x24 there), so there is no unset/empty
+# case to guard here. Keeping the flag consistent with the requested screen is
+# right on its own terms — but the justification originally written here was
+# that it removes a wrongly-shaped FIRST frame the user sees, and that is
+# WRONG. Do not repeat it, and do not "improve" this flag expecting a visible
+# result.
+#
+# 🔴 CORRECTED 2026-08-19 by V2, from an X-protocol event trace and raw
+# XGetImage frames on real portrait containers (`NEKO_SCREEN=1080x1920x24`),
+# running the current script and a variant with the old literal `1920,1080`
+# side by side. `--window-size` NEVER REACHES A PAINTED PIXEL:
+#
+#   new flag (1080,1920): Create 1080x1920 -> Configure 1920x1920 -> Map 1920x1920
+#   old flag (1920,1080): Create 1920x1080 -> Configure 1920x1920 -> Map 1920x1920
+#
+# openbox's `<maximized>true</maximized>` resizes the client to the CURRENT
+# ROOT before MapNotify, so the window is never once visible at the size this
+# flag asks for. And the root at that moment is the FRAMEBUFFER
+# (`EZIL_X_FRAMEBUFFER`, 1920x1920), not the requested screen: neko applies
+# `NEKO_SCREEN` ~1.4s later, from its own startup. So the first painted frame
+# on a portrait boot is a fully-rendered 1920x1920 SQUARE — in both variants
+# alike — for ~1.4s, and this flag changes neither its shape nor its duration.
+#
+# Nor does any consumer see that square. neko logs `setting initial screen
+# size` BEFORE `http listening`, so the capture pipeline and the HTTP surface
+# both come up after the resize: hammering `GET /api/room/screen/shot.jpg` from
+# container start returns 1080x1920 on the very first success (t=5.18s). The
+# transient is real on the X display and invisible everywhere else.
 phase_start chrome_launch
 log "supervising mandatory native browser ($CHROME_BIN) into $DISPLAY (fresh, isolated user-data-dir — no host profile; home=$CHROME_HOME_URL)"
 supervise_app chromium "$NEKO_APP_MAX_RESTARTS" "$CHROME_BIN" \
