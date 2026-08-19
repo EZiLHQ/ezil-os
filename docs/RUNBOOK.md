@@ -345,7 +345,7 @@ and `GET /api/room/screen` still answers `1920x1080@60`.
 
 | check | what it actually proves |
 | --- | --- |
-| window-ready gate | `wmctrl -x -l` prints **some** line whose class field matches `chrome` (`start-neko.sh:1899-1908`). Not the pid, not the boot generation, not map state, **not one pixel**. |
+| window-ready gate | `wmctrl -x -l` prints **some** line whose class field matches `chrome` (`start-neko.sh:1900-1908`). Not the pid, not the boot generation, not map state, **not one pixel**. |
 | code-server leg | a bare TCP *connect* to `127.0.0.1:8443` (`wait_tcp`, 559-569). Any listener passes. |
 | `/tmp/neko-app-health.json` | measured stale: it read `{"chromium":{"state":"running","pid":210,"restarts":0}}` while pid 210 had been dead for a minute and the screen was black. |
 | `?confirm=frame` / `?confirm=display` | the iframe answered, and neko thinks somebody is watching. Both are true of a black stream. |
@@ -356,8 +356,19 @@ and `GET /api/room/screen` still answers `1920x1080@60`.
 from the restart budget. `attempt` is incremented **only** on the crash branch
 (1245), and the fatal sentinel — the only thing that makes the desktop fail
 closed — is reachable **only** from that branch (1253). So an app that exits 0
-after ≥5s restarts **forever** and can never fail the desktop closed. The only
-floor is the linear backoff, `2s * clean_streak` capped at 30s (1230-1235).
+after ≥5s restarts **forever** and can never fail the desktop closed. The file's
+own comment at 1136-1145 says so in as many words: *"A clean exit is free
+forever, so an app that exits 0 after >=5s of uptime restarts indefinitely rather
+than ever tripping the sentinel. That is the intended trade."*
+
+The only floor is the linear backoff, `2s * clean_streak` capped at 30s
+(1230-1235). **Be precise about how that streak grows**, because it bounds how
+bad this gets: a clean exit with uptime ≥60s resets `clean_streak` to **1** — not
+to 0, so there is always at least a 2s gap — and only a clean exit *under* 60s
+increments it (1219-1223). Reaching the 30s cap therefore takes **15 consecutive
+clean exits each living less than 60s**. That is the pathological case the
+comment anticipates: reachable, and unbounded once entered, but not the ordinary
+one. A user who simply closes the browser gets it back in 2s, as designed.
 
 Driven live in a container:
 
@@ -379,10 +390,14 @@ t+08s mean=0.000 max=0 nonzero=0.0000
 t+10s mean=42.952 max=255 nonzero=1.0000   <- Chrome remapped
 ```
 
-At the 30 s cap that is a **30-second black desktop, on repeat, forever**, under
-`ready ok`, with `restarts: 0` in the health file. W4's own commit message claims
-"the budget is unchanged and is not infinite"; that is true of the *crash* budget
-only. The in-file comment at 1136-1145 is the honest one.
+Every one of those exits lived under 60s, so the streak never reset and the delay
+kept climbing. Sustained, that reaches a **30-second black desktop, on repeat,
+with no bound on how long it continues** — under `ready ok`, with `restarts: 0`
+in the health file. Be careful reading that: the gaps **measured** above are
+2-10s. The 30s figure is where the same arithmetic caps out after 15 such exits;
+it was not observed. W4's commit message claims "the budget is unchanged and is
+not infinite" — true of the *crash* budget only, and the sentence the code
+actually supports.
 
 ### Reading the picture yourself, server-side
 
