@@ -17,11 +17,11 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # 🔴 THE ONE RULE THIS FILE EXISTS TO ENFORCE: EXIT 2 IS *SKIPPED*, NOT PASSED
 # ═══════════════════════════════════════════════════════════════════════════
-# Eleven of these suites are REAL-BROWSER tests that need `playwright`, which
+# Twelve of these suites are REAL-BROWSER tests that need `playwright`, which
 # is deliberately NOT a project dependency and appears in no lockfile. Every
 # one of them exits **2** when playwright (or the built bundle) cannot be
 # resolved. A runner that treats "not 1" as "pass" would report a fully green
-# run on a machine where ELEVEN suites never started a browser — which is
+# run on a machine where TWELVE suites never started a browser — which is
 # exactly the false-green this repository has already been bitten by more than
 # once.
 #
@@ -50,7 +50,7 @@
 #   can disappear without warning. If both do, the browser suites skip; they do
 #   not silently pass. If $PLAYWRIGHT_REQUIRE_DIR is unset this runner defaults
 #   to the first when it exists, and says so, so that a bare
-#   `shell/run-tests.sh` does the useful thing rather than skipping eleven
+#   `shell/run-tests.sh` does the useful thing rather than skipping twelve
 #   suites by default.
 #
 #   🔴 Having two versions to hand is worth keeping. Running the same suite
@@ -73,7 +73,7 @@
 # WHAT IS AND IS NOT RUN
 # ═══════════════════════════════════════════════════════════════════════════
 # By default: `build-shell.sh --check` (fail-fast on bundle drift), then the
-# 12 node-only shell suites, then the 11 browser suites. That is the whole of
+# 12 node-only shell suites, then the 12 browser suites. That is the whole of
 # `shell/` except the cost probes, which are behind `--cost` and are NOT tests
 # — see that block for why, and for the known-red state of the one that exists.
 #
@@ -297,7 +297,7 @@ echo
 # bundle is unresolvable, and that 2 is a SKIP above. So is a suite whose file
 # is not in this worktree yet — several are owned by sibling agents.
 # ═══════════════════════════════════════════════════════════════════════════
-echo "${C_B}[2/2] real-browser suites (11)${C_0}"
+echo "${C_B}[2/2] real-browser suites (12)${C_0}"
 run_suite "shell/window-chrome-browser-test.mjs"                   300 node "$HERE/window-chrome-browser-test.mjs"
 run_suite "shell/seam-minimise-browser-test.mjs"                   300 node "$HERE/seam-minimise-browser-test.mjs"
 run_suite "shell/ezil/display-notice-browser-test.mjs"             300 node "$HERE/ezil/display-notice-browser-test.mjs"
@@ -310,45 +310,43 @@ run_suite "shell/ezil/apps/resize-test.mjs"                        420 node "$HE
 # The phone-viewport suite. It is the only suite in this tree that runs with
 # hasTouch/isMobile and a phone UA; see its own header for why that matters.
 run_suite "shell/ezil/apps/mobile-browser-test.mjs"                420 node "$HERE/ezil/apps/mobile-browser-test.mjs"
-# W5's touch-focus suite (26 checks, needs playwright, exits 2 on skip).
+# W5's touch-focus suite (needs playwright, exits 2 on skip).
 # Registered here on W5's request; not this file's to edit.
-# 🔴 KNOWN RED ON THE INTEGRATION BRANCH — AN UNRESOLVED INTENT CONFLICT
-# BETWEEN W5 AND W7, ESCALATED TO THE COORDINATOR, NOT DECIDED HERE.
 #
-# MEASURED, both ways, 2026-08-19:
-#   - on W5's own branch (`worktree-agent-a9d7b0a0cced664dc`):  26/26 PASS
-#   - on the merged integration branch:                          9/24, then an
-#     uncaught `waitForSelector` timeout in GROUP 5
+# ✅ THE W5/W7 INTENT CONFLICT RECORDED HERE IS RESOLVED (V1, Phase 2).
+# The block that used to sit here described a suite that was 26/26 on W5's own
+# branch and 9/24-plus-an-uncaught-timeout after the merge, and escalated the
+# choice rather than making it. The coordinator's decision, now implemented:
 #
-# WHY. This suite runs the only browser context in the repo with
-# `hasTouch: true` at 390x844 — and it uses a DESKTOP user agent. Under W5
-# alone that context was `device-desktop`, because detection was UA-only. W7
-# (contract §7.3) deliberately widened detection to coarse pointer + viewport
-# width, so the SAME context is now `device-phone`, and W7's phone layout
-# applies to it for the first time: every app-bearing window goes full-bleed
-# and loses its resize handles. W5's suite opens two probe windows side by side
-# and taps each one; on a full-bleed layout both cover the whole screen, so a
-# tap aimed at probe-a lands on probe-b, and nothing W5 asserts can be true.
-#   `winClasses: "... ezil-fullbleed"`, `hit: "IFRAME.window-app-iframe"` —
-#   from the GROUP 5 failure line, i.e. the drawer tongue is occluded by
-#   another window's iframe.
+#   • W7's behaviour STANDS. A phone window has no live resize handles and
+#     an app-bearing phone window is full-bleed. Nothing in `.device-*` or in
+#     `set_device_class` was weakened to make W5's suite pass.
+#   • W5's HARNESS adapted. `touch-focus-browser-test.mjs` now pins
+#     `device-desktop` — 1024x844 plus one narrowly-scoped `(pointer: coarse)`
+#     override — while keeping `hasTouch: true`, so every tap is still real
+#     Chromium touch input. See that file's own header for exactly what is and
+#     is not pinned. 28/28 (its original 26 plus two setup checks that assert
+#     the pin, so it cannot silently drift back to the wrong device class).
 #
-# NOT the pre-existing `.device-phone .window { z-index: 9999999 !important }`
-# landmine, which that widened detection also arms for the first time. That was
-# tested directly: neutralising the rule moved the reported z-indexes (9999999
-# -> 3, 11) and changed nothing else. It is worth a look on its own, but it is
-# not what makes this suite red.
-#
-# The conflict is in INTENT, not in text, which is why integration did not pick
-# a side. The two assertions cannot both hold in one context:
-#   W5: "a single TAP on a buried window's resize handle raises it"
-#   W7: "a WINDOWED phone window has no live resize handles — the screen edge
-#        is not a drag target"   (`apps/mobile-browser-test.mjs`, PASSING)
-# The likely resolution is that W5's suite should pin `device-desktop` (it is
-# testing touch FOCUS, not phone layout) while W7 keeps owning what a phone
-# window looks like — but that changes the meaning of W5's acceptance criteria
-# and is the coordinator's call, not integration's.
+# WHO OWNS WHAT NOW, so the split is not rediscovered the hard way:
+#   • `shell/touch-focus-browser-test.mjs`      — the BINDING MECHANICS of
+#     §7.1 at desktop-class layout: one tap reaches a defocused iframe,
+#     pointerdown + mousedown = ONE focus, the titlebar / resize-handle /
+#     app-drawer bindings, and the `UIContextMenu` pointer-events restore path.
+#   • `shell/ezil/apps/mobile-browser-test.mjs`  — the PHONE-LAYOUT
+#     ACCEPTANCE: one tap reaches the stream at a real phone viewport with a
+#     real phone UA, under W7's full-bleed layout. Nothing was lost by moving
+#     the suite above to desktop class; this is where that claim lives.
+#   • `shell/phone-stacking-browser-test.mjs`   — STACKING at the touch
+#     device classes (new; see below).
 run_suite "shell/touch-focus-browser-test.mjs"                     420 node "$HERE/touch-focus-browser-test.mjs"
+# Window stacking at `device-phone` / `device-tablet` — the classes W7's
+# widened detection made reachable from an ordinary desktop session, and the
+# only ones `ezil/ui/Settings/stacking-browser-test.mjs` (five DESKTOP
+# viewports, no touch) has never covered. Added with the fix to the flat
+# `.device-* .window { z-index: 9999999 !important }` band; red on the pre-fix
+# sheet (25/38, exit 1), green on this one (38/38).
+run_suite "shell/phone-stacking-browser-test.mjs"                  420 node "$HERE/phone-stacking-browser-test.mjs"
 echo
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -357,7 +355,7 @@ echo
 # 🔴 `shell/ezil/display-gate-cost.mjs` is a BENCHMARK, not a suite: its own
 # header calls it a cost probe for PLATFORM-NOTES §16c, it takes `SAMPLES`, and
 # it reports medians rather than checks. It is deliberately not one of the 11
-# node suites or the 10 browser suites, and running it by default would be
+# node suites or the 12 browser suites, and running it by default would be
 # wrong twice over — it would add wall time nobody asked for, and its number is
 # a measurement to be read, not a threshold to be passed.
 #

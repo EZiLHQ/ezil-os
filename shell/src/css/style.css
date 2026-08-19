@@ -719,8 +719,78 @@ span.header-sort-icon img {
 .device-phone .window[data-is_maximized="1"] {
     top: 0 !important;
 }
+/* ── 🔴 THE PHONE/TABLET WINDOW BAND — MODIFIED BY EZIL 2026-08-19 (V1) ──
+ * The `9999999 !important` below is PRE-EXISTING (it came in with the port)
+ * and it is kept, unchanged, for the FOCUSED window. What it does is lift a
+ * window clear of `.toolbar` (999999) and `.taskbar` (99999), both of which
+ * live in the root stacking context alongside `.window` and would otherwise
+ * paint over a phone's full-bleed app. That part is correct and is not what
+ * this note is about.
+ *
+ * 🔴 WHAT WAS BROKEN. `!important` in a stylesheet beats a non-important
+ * INLINE declaration, and the inline declaration it beat is the entire window
+ * z-order mechanism: `$.fn.focusWindow` (`../../src/UI/UIWindow.js`) raises a
+ * window with `$(this).css('z-index', base + (++window.last_window_zindex))`.
+ * With one flat `!important` on every `.window`, every window computed to the
+ * SAME 9999999 whatever the counter said, so paint order fell through to DOM
+ * order — and `focusWindow` never reorders the DOM. **A user could not raise
+ * one window above another at all.**
+ *
+ * MEASURED before this change (Chromium, built bundle, two app windows):
+ *     device-phone   390x844, phone UA      z(a)=z(b)=9999999, inline 6 vs 5
+ *     device-phone   390x844, DESKTOP UA    z(a)=z(b)=9999999, inline 6 vs 5
+ *     device-tablet  900x700, desktop UA    z(a)=z(b)=9999999, inline 6 vs 5
+ *   After `$('.window[data-app="probe-a"]').focusWindow()`, probe-a had
+ *   `.window-active` and its iframe had `pointer-events: all` — and
+ *   `document.elementFromPoint` at the centre of probe-a still returned
+ *   probe-B's `.window-body`. The FOCUSED window was behind, its live iframe
+ *   unreachable, and the covering window's body swallowed the next tap and
+ *   focused itself straight back. That is a lock-out, not a cosmetic glitch:
+ *   on a phone W7's layout makes app windows full-bleed, so the two windows
+ *   are exactly co-extensive and there is no pixel of the buried one to tap.
+ *
+ * 🔴 WHY IT WAS INVISIBLE UNTIL NOW. `device-phone` used to require a phone
+ * UA (`isMobile.phone`), so no test in this repo had ever executed this rule
+ * — `stacking-browser-test.mjs`, the 578-check stacking authority, sweeps
+ * five DESKTOP viewports and no touch. W7's widened detection (§7.3) makes
+ * the rule reachable from an ordinary narrow/coarse desktop session for the
+ * first time, which is why it is being fixed now rather than left alone.
+ *
+ * 🔴 THE FIX, AND WHY IT IS THIS ONE. Split the flat band in two along
+ * `.window-active` — the class `focusWindow` puts on exactly one window and
+ * strips from every other (`UIWindow.js:4429-4431`), i.e. the shell's own
+ * record of which window is on top:
+ *
+ *     focused     9999999   (UNCHANGED — the value every other rule in these
+ *                            sheets was already tuned against)
+ *     not focused 9999998
+ *
+ * The focused window keeps its exact previous z, so nothing that sits at or
+ * near this band moves relative to it. In particular `.popover` (9999999)
+ * still ties with the active window and still wins on DOM order, exactly as
+ * before — raising the ACTIVE window instead would have buried every popover
+ * on a phone. Only the windows the user is NOT looking at move, and they move
+ * down by one.
+ *
+ * This deliberately does NOT restore a full N-deep ordering among the
+ * unfocused windows; CSS cannot express a per-element counter, and doing it
+ * properly would mean changing `focusWindow` itself, which is W5's file.
+ * Two tiers is enough for the claim that was actually broken — "the window
+ * you focused is the one in front" — and on a phone, where the windows are
+ * co-extensive, only the front one is visible anyway.
+ *
+ * `stay_on_top` windows are untouched by both rules: `UIWindow.js:227` gives
+ * them an INLINE `!important` z-index in the 99999999+ band, and an inline
+ * `!important` beats a stylesheet `!important`. They stay above.
+ *
+ * Regression cover: `../../phone-stacking-browser-test.mjs`, which fails on
+ * the pre-change sheet and passes on this one, at three device classes. */
 .device-phone .window, .device-tablet .window {
     z-index: 9999999 !important;
+}
+.device-phone .window:not(.window-active),
+.device-tablet .window:not(.window-active) {
+    z-index: 9999998 !important;
 }
 .device-phone .window-alert, .device-tablet .window-alert {
     min-width: 90%;
