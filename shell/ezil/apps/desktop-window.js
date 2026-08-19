@@ -1704,13 +1704,100 @@ export async function openDesktopWindow (ctx = {}) {
         may_fullbleed = false;
     }
 
+    /**
+     * 🔴 THE CLOSE RELEASES THE CONTAINER. Best-effort, fire-and-forget.
+     *
+     * Before this, closing a desktop window released NOTHING: `dispose()`
+     * below stopped the heartbeat and that was the entire server-side
+     * consequence of a close. The container then sat for `IDLE_STOP_MS`
+     * (10 minutes, worker/src/index.ts) plus an alarm tick before anything
+     * noticed the beats had stopped — a user who closed their desktop was
+     * billed for ten more minutes of a machine nobody was looking at. This
+     * says "the user has gone" out loud instead of letting a ten-minute
+     * silence say it, which takes the same close down to at most one flush
+     * alarm (<=60s).
+     *
+     * ── It cannot hang or fail the close ────────────────────────────────────
+     * Three independent reasons, because "must never block the close" is a
+     * contract and not a hope:
+     *
+     *   1. NOT AWAITED. `void` on a call whose promise nobody holds. The
+     *      `on_before_exit` hook below awaits `dispose()` only, so `$.fn.close`
+     *      dismantles the window on its own schedule regardless of what this
+     *      request is doing — a dead network cannot leave a window on screen.
+     *   2. BOUNDED ANYWAY. `session.releaseDesktop` -> `reportActivity` ->
+     *      `request()` carries `STATUS_TIMEOUT_MS` as an `AbortSignal.timeout`,
+     *      so even the promise nobody awaits cannot outlive it.
+     *   3. CANNOT THROW AT ALL. `session.js#request` converts every transport
+     *      failure into a value and never rejects; the `try`/`.catch` here are
+     *      belt-and-braces for a future edit of that file, not for a failure
+     *      mode that exists today. `dispose()` must be reachable even if this
+     *      line blows up.
+     *
+     * ── What it is NOT ──────────────────────────────────────────────────────
+     * NOT a destroy/terminate verb. See `session.js#releaseDesktop`: this is
+     * the ordinary activity transport reporting that presence ended, and the
+     * Worker's own idle-stop path (with its `/proc/loadavg` busy probe and its
+     * mandatory successful final workspace flush) still decides entirely on
+     * its own whether that means stop. The shell has never been able to
+     * destroy a container and still cannot.
+     *
+     * NOT wired to minimise. `minimise_to_taskbar` above does not call this or
+     * `dispose`, and the heartbeat keeps running: a minimised desktop is still
+     * open and the user is coming back to it.
+     *
+     * NOT wired to `ezil:teardown`. That event means the shell is REBUILDING
+     * the desktop around a window it orphaned (`../boot.js#ensure_intact`),
+     * and a rebuilt window is about to want the very same container — see the
+     * `ezil:teardown` listener at the bottom of this function. Only a genuine
+     * close releases.
+     */
+    const release_container = () => {
+        if ( ! computer?.id ) return;
+        // Feature-detected FIRST, exactly like the heartbeat: a deployment
+        // without `endpoints.activity` gets no request and no telemetry — an
+        // older server is not a failure, it is an older server.
+        if ( ! session.activityEndpoint() ) {
+            console.info(`[${PHASE}] close: this deployment publishes no activity endpoint — nothing to release to`);
+            return;
+        }
+        try {
+            void session.releaseDesktop(computer.id).then((released) => {
+                if ( released === true ) {
+                    console.info(`[${PHASE}] close: released the container (presence reported ended)`);
+                    return;
+                }
+                // `false` (the server answered and refused) and `undefined`
+                // (our request never landed) are the same thing from here:
+                // the release was not recorded, the window is closed anyway,
+                // and the 10-minute idle path is still there as the backstop.
+                console.warn(`[${PHASE}] close: release was not recorded — the container will idle-stop on its own instead`);
+                telemetry.capture({
+                    eventClass: 'window_error', site: 'ezil-os:apps/desktop#close', code: 'release-failed',
+                });
+            }).catch(() => {
+                telemetry.capture({
+                    eventClass: 'window_error', site: 'ezil-os:apps/desktop#close', code: 'release-failed',
+                });
+            });
+        } catch {
+            telemetry.capture({
+                eventClass: 'window_error', site: 'ezil-os:apps/desktop#close', code: 'release-failed',
+            });
+        }
+    };
+
     // ── teardown ───────────────────────────────────────────────────────────
     /** Everything that must stop, whichever way this window ends. */
     const dispose = () => {
         disposed = true;
         stop_timers();
         // Activity heartbeat (container-billing fix) — this window is the
-        // only thing keeping it alive; nothing else ever stops it.
+        // only thing keeping it alive. Stopping the beats is what lets the
+        // container cool down on the 10-minute idle path; `release_container`
+        // above is what makes a real CLOSE not have to wait for it. Teardown
+        // paths that are not a close (`ezil:teardown`) reach only this line,
+        // which is the pre-existing, correct behaviour for them.
         stop_heartbeat();
         window.removeEventListener('focus', sample_presence);
         window.removeEventListener('blur', sample_presence);
@@ -1737,6 +1824,11 @@ export async function openDesktopWindow (ctx = {}) {
     // `$.fn.close` awaits this before it dismantles anything, so it is the one
     // place guaranteed to run exactly once per close.
     el_window.on_before_exit = async () => {
+        // Release BEFORE tearing down, so the request is issued while
+        // everything it needs still exists — and NOT awaited, so a slow or
+        // dead network cannot delay the close by one frame. See
+        // `release_container`'s own comment for the full contract.
+        release_container();
         dispose();
         return true;
     };
