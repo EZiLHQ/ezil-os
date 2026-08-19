@@ -158,8 +158,40 @@ describe('runTelemetrySpoolDrain — the core loop', () => {
             eventsDroppedInvalid: 0,
             eventsIngested: 0,
             objectsAcked: 0,
+            // 🔴 The one field that separates this outcome from a healthy
+            // empty spool. Both stop the loop at zero pages; only this says
+            // WHY. Measured 2026-08-19: 173 objects sat undrained in
+            // `ezil-telemetry-spool` for 16 days while every cron run returned
+            // `200 {ok:true}` — see this field's doc comment in
+            // `./spool-drain.ts`.
+            drainFailures: 1,
         });
         expect(ack).not.toHaveBeenCalled();
+    });
+
+    it('🔴 an EMPTY spool and an UNREACHABLE Worker are distinguishable, not both "zero pages"', async () => {
+        const { db } = makeIngestDb();
+        const ack = vi.fn().mockResolvedValue(true);
+
+        const empty = await runTelemetrySpoolDrain({
+            db,
+            ack,
+            drainPage: vi.fn().mockResolvedValue({ ok: true, objects: [], truncated: false } satisfies DrainPageResult),
+        });
+        const unreachable = await runTelemetrySpoolDrain({
+            db,
+            ack,
+            drainPage: vi.fn().mockResolvedValue({ ok: false } satisfies DrainPageResult),
+        });
+
+        // Identical on every pre-existing field — which is exactly why the
+        // outage was invisible for 16 days.
+        expect(empty.objectsSeen).toBe(unreachable.objectsSeen);
+        expect(empty.eventsIngested).toBe(unreachable.eventsIngested);
+        expect(empty.objectsAcked).toBe(unreachable.objectsAcked);
+        // And different on the field that was added to tell them apart.
+        expect(empty.drainFailures).toBe(0);
+        expect(unreachable.drainFailures).toBe(1);
     });
 
     it('drops a torn/malformed NDJSON line without failing its neighbours in the same object', async () => {

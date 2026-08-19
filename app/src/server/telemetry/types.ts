@@ -121,3 +121,77 @@ export const TELEMETRY_LIMITS = {
     /** attrs.stack_head and other free-ish string attrs. */
     MAX_ATTR_STRING_LEN: 160,
 } as const;
+
+/**
+ * The `code` charset every producer must satisfy, restated here next to the
+ * limits so it is discoverable from the contract file rather than only from
+ * `./schema.ts`'s zod chain.
+ *
+ * 🔴 `-` IS NOT IN IT, and a code containing one is not "cleaned up" — it is
+ * DROPPED. `parseTelemetryBatch` discards a failing event WHOLE, so a producer
+ * writing `screen-unsupported` would emit telemetry that validated nowhere and
+ * vanished with no error visible to its author.
+ *
+ * `docs/BROWSER-FIX-CONTRACT.md` §8 originally specified codes as
+ * "hyphenated"; that was caught during this change set and the contract was
+ * corrected to the underscored spellings (`screen_unsupported`,
+ * `screen_upstream`, `decor_still_present`, `xtest_dead`). The contract bent
+ * to this regex, not the other way round — do NOT widen it, because widening
+ * would change the stored spelling of codes already in flight and split every
+ * existing fingerprint.
+ *
+ * Belt and braces, so a hyphen at a call site can never silently cost a row:
+ * every producer normalises `[^a-z0-9_]+ -> _` before emitting.
+ *   - shell:            `normalizeCode` in `shell/ezil/telemetry.js`
+ *   - worker/container: `normalizeTelemetryCode` in `worker/src/telemetry.ts`
+ * One event therefore has one spelling regardless of which producer sent it.
+ */
+export const TELEMETRY_CODE_PATTERN = /^[a-z0-9_]+$/;
+
+/**
+ * The `site` values `docs/BROWSER-FIX-CONTRACT.md` §8 assigns to the
+ * twelve-agent browser fix, with the `eventClass` each must be emitted under.
+ *
+ * `site` is NOT a closed enum on the wire (it is bounded at
+ * `MAX_SITE_LEN` and nothing else), so this constant does not gate anything —
+ * it exists so the agents that emit these events import one spelling instead
+ * of retyping the strings in several files, which is how
+ * `ezil-os:apps/desktop#screen` and `ezil-os:apps/desktop#Screen` become two
+ * different rows in a dashboard.
+ *
+ * Emitters are NOT this module's owner: W2 emits `#screen`, W4 `#close` and
+ * `container:neko#app_exit`, W3 `container:neko#decor`. `#keyboard` is the odd
+ * one — see its own note below.
+ *
+ * `container:neko#xserver` was in §8 and has been REMOVED: it existed to
+ * record which X server started during the Xvfb→Xorg migration, and that
+ * migration was cancelled. There is one X server, so the site is moot. Do not
+ * re-add it.
+ */
+export const BROWSER_FIX_SITES = {
+    /** A screen-size request failed (`api_failure`), or the server applied a
+     * size the client neither asked for nor was offered as a snap
+     * (`contract_violation`). */
+    DESKTOP_SCREEN: 'ezil-os:apps/desktop#screen',
+    /** A release-on-close attempt failed. `window_error`. */
+    DESKTOP_CLOSE: 'ezil-os:apps/desktop#close',
+    /**
+     * The keyboard affordance could not arm. `window_error`.
+     *
+     * 🔴 The code that DETECTS this condition cannot emit it. It runs inside
+     * the neko document (`worker/assets/neko-branding/www/ezil-mobile.js`),
+     * a different origin with no route to the telemetry endpoint and no
+     * access to `shell/ezil/telemetry.js`. It instead `postMessage`s
+     * `{source:'ezil-mobile', type:'window_error', site, code}` to the parent,
+     * and the shell-side listener in `shell/ezil/telemetry.js`
+     * (`installMobileBridge`) is what turns that into a real event — after
+     * verifying the message came from the desktop iframe this shell itself
+     * embedded. See that function for the trust argument.
+     */
+    DESKTOP_KEYBOARD: 'ezil-os:apps/desktop#keyboard',
+    /** The browser window was still decorated after enforcement.
+     * `contract_violation`. */
+    NEKO_DECOR: 'container:neko#decor',
+} as const;
+
+export type BrowserFixSite = (typeof BROWSER_FIX_SITES)[keyof typeof BROWSER_FIX_SITES];

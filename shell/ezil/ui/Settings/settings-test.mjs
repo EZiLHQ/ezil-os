@@ -340,6 +340,63 @@ push('🔴 a failed restart is reported as failed, never as a claimed success',
     /something went wrong|couldn.t reach|expired|too long/i.test(
         q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]')?.textContent ?? '',
     ));
+// ── Troubleshoot tab (diagnostic log) ────────────────────────────────────────
+// `shell/ezil/log.js` has kept a 200-entry ring of every debug/info/warn/error
+// call since it was written, explicitly so a support conversation would not
+// depend on the user having had devtools open — and its own header said
+// "nothing yet reads" it. These checks are the reader, and the thing they
+// actually have to prove is not that a button exists: it is that what the
+// button hands the user has been through the redactor, because the ring holds
+// RAW console arguments and this is an export path.
+//
+// The probe is a real code path, not a stub: `registry.launch()` on an unknown
+// id writes the id verbatim into the log ring (`no such app: <id>`) AND raises
+// a `contract_violation` capture carrying it as `detail`. Handing it a URL
+// with a query token therefore seeds BOTH halves of the report with something
+// that must not survive.
+const LEAKY_ID = 'https://evil.example/steal?tok=SECRET123';
+push('probe: launching an unknown app id returns null (the seeding path is real)',
+    (await ezil.registry.launch(LEAKY_ID)) === null);
+await settle(2);
+
+// Re-render the pane so the counts and the button's enabled state are current.
+click(qa('.window[data-app="settings"] .ezil-settings-tab')[2]);
+await settle(2);
+click(qa('.window[data-app="settings"] .ezil-settings-tab')[3]);
+await settle(4);
+
+const ts = () => q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]');
+const copyBtn = ts()?.querySelector('[data-action="copy-diagnostics"]');
+push('🔴 Troubleshoot offers a way OUT of the log ring buffer at all',
+    !! copyBtn, `button=${!! copyBtn}`);
+push('…and it is enabled once anything has been recorded',
+    copyBtn && ! copyBtn.disabled, `disabled=${copyBtn?.disabled}`);
+push('the pane tells the user what the log does and does not carry',
+    /replaced before it is copied|not carry your files/i.test(ts()?.textContent ?? ''));
+
+// jsdom has neither `navigator.clipboard` nor `document.execCommand`, which is
+// the same state a real browser presents on a non-secure origin or a denied
+// permission. The tab must then say so and show the text, NOT claim "Copied".
+click(copyBtn);
+await settle(6);
+const area = ts()?.querySelector('[data-role="diagnostic-text"]');
+push('🔴 a clipboard write the page could not make is reported honestly, not as success',
+    !! area && ! /^\s*Copied\./m.test(ts()?.textContent ?? ''), `textarea=${!! area}`);
+const report = area?.value ?? '';
+push('the report has both halves — the console ring AND the recorded events',
+    /-- console \(\d+\) --/.test(report) && /-- events \(\d+\) --/.test(report), report.slice(0, 80));
+push('the console ring actually reached it (the probe line is there)',
+    /no such app/.test(report));
+push('the recorded events actually reached it (the probe capture is there)',
+    /contract_violation .*ezil-os:apps\/registry#launch .*unknown_app/.test(report));
+push('the earlier failed restart is in it too — the api_failure this pane itself raised',
+    /api_failure .*ezil-os:settings\/troubleshoot#restart/.test(report));
+push('🔴 THE GUARANTEE: neither the URL nor its query token survived into the copied text',
+    ! report.includes('evil.example') && ! report.includes('SECRET123'),
+    report.includes('evil.example') ? 'LEAKED host' : (report.includes('SECRET123') ? 'LEAKED token' : 'clean'));
+push('…and the redaction placeholder is what took its place, so the line is still readable',
+    /<url>|<opaque>/.test(report));
+
 delete window.__EZIL_BOOT__;
 
 // ═══════════════════════════════════════════════════════════════════════════

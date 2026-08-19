@@ -103,6 +103,121 @@ const EVENT_CLASSES = new Set([
 const BOOT_EVENT_CLASSES = new Set(['boot_summary', 'boot_phase']);
 const MAX_BOOT_EVENTS_PER_PAGE = 12;
 
+/**
+ * The `site` values `docs/BROWSER-FIX-CONTRACT.md` §8 assigns to the
+ * twelve-agent browser fix, so the shell-side emitters (the desktop window's
+ * screen/close paths, the mobile keyboard affordance) import ONE spelling
+ * instead of retyping the string in three files. Mirrors
+ * `BROWSER_FIX_SITES` in `app/src/server/telemetry/types.ts`.
+ *
+ * `site` is not a closed enum on the wire — this constant gates nothing, it
+ * just removes the typo. `code` IS charset-constrained (`[a-z0-9_]`), and
+ * `normalizeCode` below already maps the contract's hyphenated spellings onto
+ * it, so a call site may pass either `screen-unsupported` or
+ * `screen_unsupported` and one row comes out.
+ */
+export const SITES = {
+    DESKTOP_SCREEN: 'ezil-os:apps/desktop#screen',
+    DESKTOP_CLOSE: 'ezil-os:apps/desktop#close',
+    DESKTOP_KEYBOARD: 'ezil-os:apps/desktop#keyboard',
+};
+
+// ── The cross-origin bridge for the in-stream mobile script ──────────────────
+// `worker/assets/neko-branding/www/ezil-mobile.js` runs INSIDE the neko
+// document. That document is a different origin: it cannot import this module,
+// cannot read the boot payload, and has no route to `/api/shell/telemetry`. So
+// the one §8 row it is responsible for (`ezil-os:apps/desktop#keyboard` /
+// `window_error`) cannot be emitted by the code that detects it. It
+// `postMessage`s the parent instead, and this listener is what closes the loop.
+//
+// 🔴 THIS IS UNTRUSTED INPUT FROM ANOTHER ORIGIN and is treated as such. A
+// `postMessage` handler that believes its payload is a real attack surface, so:
+//
+//   1. `event.source` must be the `contentWindow` of an iframe THIS document
+//      embedded inside the desktop window, and `event.origin` must equal that
+//      iframe's own `src` origin. Both, not either. A nested frame inside the
+//      stream page, or any other window that posts to `window.top`, fails the
+//      first test; a spoofed `data.source` fails nothing on its own and is
+//      therefore never sufficient. Nothing is derived from the message about
+//      where it came from — the DOM is the authority.
+//   2. `type` and `site` must each be in a CLOSED SET defined here. A message
+//      naming any other site or class is dropped, not forwarded.
+//   3. `code` is the ONLY free-ish field, and it goes through the same
+//      `normalizeCode` every other call site uses (`[a-z0-9_]`, 64 chars).
+//   4. `detail`, `attrs`, `correlationId` and `computerId` are NEVER read off
+//      the message. A cross-origin page must not be able to write free text
+//      into a `detail` column, however well `redact()` works.
+//   5. Bounded per page load, independently of `capture()`'s own dedup.
+//
+// If any of that cannot hold, the correct outcome is a MISSING telemetry row.
+const MOBILE_BRIDGE_SOURCE = 'ezil-mobile';
+const MOBILE_BRIDGE_SITES = new Set([SITES.DESKTOP_KEYBOARD]);
+const MOBILE_BRIDGE_CLASSES = new Set(['window_error']);
+const MAX_MOBILE_BRIDGE_EVENTS = 5;
+let mobileBridgeCount = 0;
+
+/**
+ * Is this message from an iframe this document itself embedded inside the
+ * desktop window, posting from that iframe's own origin?
+ *
+ * The `.window[data-app="desktop"]` selector is the same DOM contract
+ * `ui/Settings/tabs/troubleshoot.js` already reads. If it ever drifts, this
+ * returns `false` and the bridge goes silent — it fails CLOSED, which is the
+ * only acceptable direction for a trust check.
+ */
+function fromDesktopFrame (event) {
+    if ( typeof document === 'undefined' || ! event || ! event.source ) return false;
+    const frames = document.querySelectorAll('.window[data-app="desktop"] iframe');
+    for ( const frame of frames ) {
+        let contentWindow = null;
+        try { contentWindow = frame.contentWindow; } catch { continue; }
+        if ( contentWindow === null || contentWindow !== event.source ) continue;
+        // Same frame. Now its OWN origin must be the one that posted.
+        let frameOrigin = null;
+        try { frameOrigin = new URL(frame.src, location.href).origin; } catch { return false; }
+        // `about:blank` (the pre-navigation state) and any opaque origin
+        // serialise to 'null', which must never match.
+        if ( ! frameOrigin || frameOrigin === 'null' ) return false;
+        return frameOrigin === event.origin;
+    }
+    return false;
+}
+
+/** The `message` handler itself. Never throws; drops anything it cannot fully vouch for. */
+function onMobileBridgeMessage (event) {
+    try {
+        const data = event?.data;
+        if ( ! data || typeof data !== 'object' ) return;
+        if ( data.source !== MOBILE_BRIDGE_SOURCE ) return;
+        if ( mobileBridgeCount >= MAX_MOBILE_BRIDGE_EVENTS ) return;
+        // Cheap shape checks first, the DOM walk only for a plausible message.
+        if ( ! MOBILE_BRIDGE_CLASSES.has(data.type) ) return;
+        if ( typeof data.site !== 'string' || ! MOBILE_BRIDGE_SITES.has(data.site) ) return;
+        if ( ! fromDesktopFrame(event) ) return;
+        mobileBridgeCount += 1;
+        // `code` is normalised by `capture()`; nothing else is taken from the
+        // message. `app_id` is written HERE, not read from the payload.
+        capture({
+            eventClass: data.type,
+            site: data.site,
+            code: data.code,
+            outcome: 'error',
+            attrs: { app_id: 'desktop' },
+        });
+    } catch {
+        // A hostile or malformed message must never surface as a page error.
+    }
+}
+
+/**
+ * How many recent captures the LOCAL diagnostic mirror keeps (`recentEvents`).
+ * Independent of `MAX_BUFFER` — that one is the OUTGOING queue and is drained
+ * on every flush, which is exactly why it cannot double as "what happened on
+ * this page". Bounded, oldest evicted, same discipline as everything else here.
+ */
+const MAX_RECENT = 50;
+const recent = [];
+
 // ── module state ────────────────────────────────────────────────────────────
 // One page load, one buffer. Nothing here is meant to survive a reload — an
 // unflushed tail is an accepted, documented loss (design doc §10.2), not a
@@ -136,7 +251,7 @@ function isArmed () {
  * (tokens, cookies, IPs, long opaque ids) off the wire, not produce a stable
  * fingerprint.
  */
-function redact (input) {
+export function redact (input) {
     if ( input === undefined || input === null ) return undefined;
     let s;
     if ( input instanceof Error ) {
@@ -198,6 +313,35 @@ function normalizeSite (site) {
     return String(site ?? 'unknown').slice(0, 96);
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The `computerId` every event defaults to: this boot's own computer row id.
+ *
+ * 🔴 WHY THIS EXISTS. `docs/telemetry.md` §"computer_id and the Worker" states
+ * plainly that "`computer_id` is filled in only by the BROWSER, which knows
+ * the real UUID" — and the browser never did. Measured 2026-08-19 against the
+ * live database: `computer_id` was NULL on 100% of stored rows, so no error
+ * could be attributed to a computer and "something failed" could never become
+ * "*this* computer failed". Nothing was wrong with the column, the schema or
+ * the ingest route; the one producer that has the value simply never sent it.
+ * Defaulting it here fixes every existing `capture()` call site at once,
+ * exactly the way `ambientCorrelationId()` did for `correlationId`.
+ *
+ * 🔴 UUID-CHECKED, and this check is not paranoia. The app's ingest schema is
+ * `computerId: z.string().uuid()` inside a `.strict()` parse, and a failure
+ * drops the WHOLE EVENT — this is the identical trap `worker/src/telemetry.ts`
+ * documents for `sandboxId`, where filling the field in did not attach a
+ * computer, it silently discarded 100% of that producer's telemetry. A boot
+ * payload whose `computer.id` is not a UUID (a test fixture, a future
+ * non-UUID id scheme) yields `undefined` here and the field is simply omitted,
+ * which costs one join and loses nothing.
+ */
+function ambientComputerId () {
+    const id = bootPayload()?.computer?.id;
+    return (typeof id === 'string' && UUID_RE.test(id)) ? id : undefined;
+}
+
 /** One frame only: `functionName@file.js`, no line/col, no absolute path. */
 function firstFrame (err) {
     const stack = err && typeof err.stack === 'string' ? err.stack : '';
@@ -220,6 +364,42 @@ function firstFrame (err) {
 
 function keyFor (eventClass, site, code) {
     return `${eventClass}${site}${code}`;
+}
+
+/**
+ * Record one capture in the LOCAL diagnostic mirror. Bounded, oldest evicted,
+ * never sent anywhere by this module.
+ *
+ * Why this exists: `shell/ezil/log.js`'s ring buffer was built so a support
+ * conversation would not depend on the user having had devtools open — but
+ * only ONE module (`apps/registry.js`, six call sites) ever writes to it,
+ * while there are ~30 `capture()` call sites covering the crash handlers and
+ * every `window_error` / `api_failure` / `contract_violation` in this shell.
+ * Reading the console ring back without also reading these would surface the
+ * quiet half of the story and miss the loud half.
+ *
+ * The outgoing `buffer` cannot serve this purpose: it is DRAINED on every
+ * flush, so by the time a user opens Settings it is usually empty.
+ */
+function pushRecent (entry) {
+    try {
+        recent.push(entry);
+        if ( recent.length > MAX_RECENT ) recent.shift();
+    } catch { /* a diagnostic mirror must never be able to break capture() */ }
+}
+
+/**
+ * Snapshot of the recent captures on this page — a copy, so a caller can
+ * never mutate the live mirror.
+ *
+ * Every field here is ALREADY the sanitized closed-vocabulary wire form:
+ * `site` and `code` are hand-written low-cardinality literals and `detail`
+ * has been through `redact()`. There is nothing in here that is not already
+ * permitted to cross the wire, which is what makes it safe for
+ * Settings → Troubleshoot to show and for a user to copy.
+ */
+export function recentEvents () {
+    return recent.slice();
 }
 
 function scheduleFlush () {
@@ -324,10 +504,21 @@ export function capture (input) {
         if ( ! input || typeof input !== 'object' ) return;
         const eventClass = EVENT_CLASSES.has(input.eventClass) ? input.eventClass : undefined;
         if ( ! eventClass ) return; // an unrecognised class is a bug in THIS file's own call sites
-        if ( ! isArmed() ) return;
 
         const site = normalizeSite(input.site);
         const code = normalizeCode(input.code);
+        const detail = redact(input.detail);
+        const outcome = (input.outcome === 'ok' || input.outcome === 'skipped') ? input.outcome : 'error';
+
+        // 🔴 BEFORE the arm check, on purpose. The local diagnostic mirror
+        // (`recentEvents()`, read by Settings → Troubleshoot) has to work on a
+        // deployment whose server has no telemetry route at all — that is
+        // precisely the deployment where a user asking "what went wrong" has
+        // no other source. It never leaves the browser on its own; only the
+        // user's own copy action moves it anywhere.
+        pushRecent({ t: Date.now(), eventClass, site, code, outcome, detail });
+
+        if ( ! isArmed() ) return;
 
         if ( BOOT_EVENT_CLASSES.has(eventClass) ) {
             // 🔴 Exempt from the per-(class+site+code) dedup below — see
@@ -356,9 +547,8 @@ export function capture (input) {
             occurredAt: new Date().toISOString(),
             site,
             code,
-            outcome: (input.outcome === 'ok' || input.outcome === 'skipped') ? input.outcome : 'error',
+            outcome,
         };
-        const detail = redact(input.detail);
         if ( detail ) event.detail = detail;
         if ( typeof input.durationMs === 'number' && Number.isFinite(input.durationMs) ) {
             event.durationMs = Math.max(0, Math.round(input.durationMs));
@@ -372,7 +562,17 @@ export function capture (input) {
             : ambientCorrelationId();
         // 64 chars, per the wire contract (`TELEMETRY_LIMITS.MAX_CORRELATION_ID_LEN`).
         if ( correlationId ) event.correlationId = String(correlationId).slice(0, 64);
-        if ( typeof input.computerId === 'string' && input.computerId ) event.computerId = input.computerId;
+        // Explicit caller value wins; otherwise default to this boot's own
+        // computer — see `ambientComputerId()` for why the field was NULL on
+        // every stored row until now, and why it is UUID-checked.
+        // An EXPLICIT value is UUID-checked too: the server drops the whole
+        // event on a malformed one, so forwarding a caller's typo would lose
+        // the event entirely rather than lose one join.
+        const explicitComputerId = (typeof input.computerId === 'string' && UUID_RE.test(input.computerId))
+            ? input.computerId
+            : undefined;
+        const computerId = explicitComputerId ?? ambientComputerId();
+        if ( computerId ) event.computerId = computerId;
         if ( input.attrs && typeof input.attrs === 'object' ) {
             const attrs = {};
             for ( const [k, v] of Object.entries(input.attrs) ) {
@@ -434,6 +634,11 @@ export function installGlobalHandlers () {
             });
         } catch { /* never let the handler itself throw */ }
     });
+
+    // The in-stream mobile script's only way home. See `onMobileBridgeMessage`
+    // and the block above it for the trust argument — this listener rejects
+    // everything it cannot positively attribute to the desktop iframe.
+    window.addEventListener('message', onMobileBridgeMessage);
 }
 
 /** Best-effort final flush. Still fire-and-forget — see the file header. */
@@ -454,4 +659,4 @@ if ( typeof document !== 'undefined' && typeof document.addEventListener === 'fu
 // exported for a test harness that wants to (re-)arm it explicitly.
 installGlobalHandlers();
 
-export default { capture, installGlobalHandlers };
+export default { capture, installGlobalHandlers, recentEvents, redact, SITES };
