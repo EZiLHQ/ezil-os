@@ -540,6 +540,9 @@ import {
   selectTelemetryWorthy,
   toTelemetryEventInput,
   parseContainerTelemetryLines,
+  containerTelemetryTailCommand,
+  parseContainerTelemetryTail,
+  type ContainerTelemetryTail,
   serializeTelemetryBatch,
   buildTelemetryR2Key,
   telemetryDrainDisabled,
@@ -893,21 +896,32 @@ function bootLog(
 const CONTAINER_TELEMETRY_PATH = '/var/log/ezil-telemetry.ndjson';
 const CONTAINER_TELEMETRY_MAX_BYTES = 65_536;
 
+/** What an unattempted / failed read yields — empty, never an exception. */
+const EMPTY_CONTAINER_TELEMETRY: ContainerTelemetryTail = { raw: '', inode: '0' };
+
 /**
  * Best-effort drain of the container's own structured boot-phase log. Never
  * throws — a missing file (older image, or nothing emitted yet) or a read
- * failure just yields `''`, exactly like every other diagnostic read in this
- * file (`pollDesktopReady`, `handleCpuDiag`).
+ * failure just yields an empty tail, exactly like every other diagnostic read
+ * in this file (`pollDesktopReady`, `handleCpuDiag`).
+ *
+ * 🔴 This read is NON-DESTRUCTIVE and it happens on EVERY boot attempt,
+ * warm ones included — so the same lines are read again and again for as long
+ * as the container lives. That is why it now also reports the file's size and
+ * inode: they are what let `parseContainerTelemetryLines` give each line an
+ * identity that survives a re-read, instead of minting a fresh random
+ * `eventId` and turning one boot phase into N rows. See
+ * `stableTelemetryEventId` in `./telemetry.ts`.
  */
-async function drainContainerBootTelemetry(sandbox: Sandbox<unknown>): Promise<string> {
+async function drainContainerBootTelemetry(sandbox: Sandbox<unknown>): Promise<ContainerTelemetryTail> {
   try {
     const res = await sandbox.exec(
-      `tail -c ${CONTAINER_TELEMETRY_MAX_BYTES} ${CONTAINER_TELEMETRY_PATH} 2>/dev/null || true`,
+      containerTelemetryTailCommand(CONTAINER_TELEMETRY_PATH, CONTAINER_TELEMETRY_MAX_BYTES),
       { origin: 'internal' },
     );
-    return res.exitCode === 0 ? (res.stdout ?? '') : '';
+    return res.exitCode === 0 ? parseContainerTelemetryTail(res.stdout) : EMPTY_CONTAINER_TELEMETRY;
   } catch {
-    return '';
+    return EMPTY_CONTAINER_TELEMETRY;
   }
 }
 
@@ -929,7 +943,7 @@ async function ensureDesktop(
    * caller decides what to do with the raw text (parse + spool to R2, or
    * ignore it entirely when telemetry is unconfigured).
    */
-  onBootTelemetry?: (raw: string) => void,
+  onBootTelemetry?: (tail: ContainerTelemetryTail) => void,
 ): Promise<{ url: string; appPreviewExpose: AppPreviewExposeResult; codePreviewExpose: AppPreviewExposeResult }> {
   const bootT0 = Date.now();
   const { port, readyPath } = portFor(mode);
@@ -3328,10 +3342,10 @@ async function handlePreview(
   // accumulated here (additive — `createCollectingSink`, `./observability.ts`)
   // so it can be spooled to the telemetry R2 bucket once the response is
   // decided, alongside whatever the container itself emitted during THIS
-  // boot (`containerTelemetryRaw`, filled in by `ensureDesktop`'s
+  // boot (`containerTelemetry`, filled in by `ensureDesktop`'s
   // `onBootTelemetry` callback below). See `spoolTelemetry()`.
   const collectedLogs: LogEvent[] = [];
-  let containerTelemetryRaw = '';
+  let containerTelemetry: ContainerTelemetryTail = EMPTY_CONTAINER_TELEMETRY;
   let bootSandboxId: string | undefined;
 
   let body: PreviewBody = {};
@@ -3515,8 +3529,8 @@ async function handlePreview(
       mode === 'neko' ? (body.startupDelivery ?? null) : null,
       workspace.mounted ? workspace.mountPath ?? null : null,
       env.EZIL_NEKO_CPU_DIAG_ENABLED,
-      (raw) => {
-        containerTelemetryRaw = raw;
+      (tail) => {
+        containerTelemetry = tail;
       },
     );
     const guacamoleUrl = mode === 'neko' ? exposedUrl : toGuacamoleUrl(exposedUrl, url.protocol);
@@ -3654,11 +3668,11 @@ async function handlePreview(
     // `spoolTelemetry`'s own doc comment for the "no telemetry code path is
     // ever awaited by a code path that produces user-visible output"
     // guarantee (design doc §4.6).
-    spoolTelemetry(env, ctx, correlationId, bootSandboxId, collectedLogs, containerTelemetryRaw);
+    spoolTelemetry(env, ctx, correlationId, bootSandboxId, collectedLogs, containerTelemetry);
     return response;
   } catch (err) {
     tl.event('preview_lifecycle', 'sandbox.preview.failed', 'error', { error: err });
-    spoolTelemetry(env, ctx, correlationId, bootSandboxId, collectedLogs, containerTelemetryRaw);
+    spoolTelemetry(env, ctx, correlationId, bootSandboxId, collectedLogs, containerTelemetry);
     return json(
       { ok: false, error: err instanceof Error ? err.message : String(err), mode },
       500,
@@ -3689,13 +3703,20 @@ function spoolTelemetry(
   correlationId: string,
   sandboxId: string | undefined,
   workerLogs: readonly LogEvent[],
-  containerTelemetryRaw: string,
+  containerTelemetry: ContainerTelemetryTail,
 ): void {
   const bucket = env.TELEMETRY_R2_BUCKET;
   if (!bucket) return;
 
   const workerEvents = selectTelemetryWorthy(workerLogs).map((e) => toTelemetryEventInput(e));
-  const containerEvents = parseContainerTelemetryLines(containerTelemetryRaw, { correlationId, sandboxId });
+  const containerEvents = parseContainerTelemetryLines(containerTelemetry.raw, {
+    correlationId,
+    sandboxId,
+    // Both fields are what make a re-read of an already-shipped line resolve
+    // to the SAME `eventId` — see `stableTelemetryEventId` (`./telemetry.ts`).
+    tailStartByteOffset: containerTelemetry.startByteOffset,
+    logInode: containerTelemetry.inode,
+  });
   const events = [...workerEvents, ...containerEvents];
   if (events.length === 0) return;
 

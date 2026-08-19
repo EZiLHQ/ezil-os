@@ -1201,9 +1201,20 @@ describe('container boot-telemetry drain reaches ensureDesktop callers on succes
     expect(successBlock).toContain('onBootTelemetry(await drainContainerBootTelemetry(sandbox));');
   });
 
-  it('the drain itself is best-effort — reads a bounded tail and never throws on a missing/unreadable file', () => {
+  it('the drain itself is best-effort — reads a bounded tail and never throws on a missing/unreadable file', async () => {
+    const { containerTelemetryTailCommand } = await import('./telemetry');
     expect(src).toContain('async function drainContainerBootTelemetry(');
-    expect(src).toContain("tail -c ${CONTAINER_TELEMETRY_MAX_BYTES} ${CONTAINER_TELEMETRY_PATH} 2>/dev/null || true");
+    // The shell text moved into `./telemetry.ts` so it could be RUN in a test
+    // rather than string-matched here — `telemetry-container-tail.test.ts`
+    // executes it against a real file. What index.ts must not do is build its
+    // own, and it must degrade to an empty tail rather than throwing.
+    expect(src).toContain('containerTelemetryTailCommand(CONTAINER_TELEMETRY_PATH, CONTAINER_TELEMETRY_MAX_BYTES)');
+    expect(src).toContain('return EMPTY_CONTAINER_TELEMETRY;');
+
+    const cmd = containerTelemetryTailCommand('/var/log/ezil-telemetry.ndjson', 65_536);
+    expect(cmd).toContain('tail -c 65536');
+    expect(cmd).toContain('2>/dev/null');
+    expect(cmd.endsWith('|| true')).toBe(true);
   });
 
   it('spoolTelemetry never awaits the R2 put on the response path (fire-and-forget via ctx.waitUntil)', () => {
