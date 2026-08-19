@@ -196,6 +196,41 @@ async function request (url, { method = 'GET', body, timeoutMs } = {}) {
 const MAX_ISSUES = 40;
 
 /**
+ * 🔴 THE BEAT BEFORE THE ONE AUTOMATIC RETRY — AND IT USED TO BE ZERO.
+ *
+ * ── The measurement this exists for ─────────────────────────────────────────
+ * `ezil_error_events`, 2026-08-08 → 2026-08-10: 10 of 26 desktop launches
+ * failed with `desktop_unreachable`, and the automatic retry failed on all
+ * ten. Reading the two events that bracket it — `session#openDesktop`
+ * `auto_retry_desktop_unreachable` carries elapsed-at-retry, and
+ * `apps/desktop#mint` carries elapsed-at-give-up — gives the gap between the
+ * first failure and the second, identical one:
+ *
+ *     2026-08-09 03:32   22560ms -> 24142ms     retry took 1582ms
+ *     2026-08-09 05:04   33492ms -> 34037ms     retry took  545ms
+ *     2026-08-10 10:54   32933ms -> 34569ms     retry took 1636ms
+ *     2026-08-10 12:30   32355ms -> 32760ms     retry took  405ms
+ *
+ * A 405ms round trip is not a second chance at anything. The retry branch
+ * below `continue`d with no delay at all (see commit 8510ff6, which noticed
+ * exactly this while proving `MAX_ISSUES` was load-bearing: "the retry branch
+ * has no delay"), so the second ask reached the server while the first
+ * answer was still the current state of the world. `desktop_unreachable` in
+ * particular means the app server's own handoff probe of the desktop origin
+ * did not get an answer — a condition that resolves in SECONDS as a container
+ * finishes coming up, and never in the sub-second gap this loop was leaving.
+ *
+ * ── Why 1.5s and not more ───────────────────────────────────────────────────
+ * Same number as `WAKE_REASK_MS`, and for the same reason: it is a beat
+ * between asks, not a budget. The real waiting belongs SERVER-side, where the
+ * probe can be re-issued against a live socket without paying a browser round
+ * trip each time (see this task's report — `probeDesktopFrame` is still a
+ * single 6s shot). Making this large enough to cover a container boot on its
+ * own would put the user in front of a spinner that this file cannot explain.
+ */
+const RETRY_DELAY_MS = 1_500;
+
+/**
  * 🔴 THE HIBERNATION FIX, CLIENT SIDE. One implementation, three callers
  * (`openDesktop`, `previewUrl`, and `apps/code.js`'s own mint) — three copies
  * of a retry loop is how the timings drift apart and one surface quietly stops
@@ -284,11 +319,17 @@ async function withWakeAndOneRetry (issue, what) {
         // plausibly answer differently, then hand it to the user.
         if ( ! retried && isRetryableBootErrorCode(res.errorCode) ) {
             retried = true;
-            console.info(`[ezil-os:session] ${what}: ${res.errorCode} on the first attempt; retrying once`);
+            console.info(`[ezil-os:session] ${what}: ${res.errorCode} on the first attempt; retrying once in ${RETRY_DELAY_MS}ms`);
             telemetry.capture({
                 eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: `auto_retry_${res.errorCode}`,
                 durationMs: Date.now() - t0,
             });
+            // Measured: without this the second ask landed 405-1636ms after
+            // the first and returned the same answer 10 times out of 10. See
+            // `RETRY_DELAY_MS`. The telemetry above is emitted BEFORE the
+            // wait, so its `durationMs` still marks the first failure and the
+            // arithmetic in that comment keeps working.
+            await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
             continue;
         }
         return res;
