@@ -12,6 +12,41 @@
 // resolves, this exits 2 (skip), never 0.
 //
 // ═══════════════════════════════════════════════════════════════════════════
+// 2026-08-19 — THE 16/18 IS SETTLED. IT WAS THIS FILE, NOT `UIWindow.js`.
+// ═══════════════════════════════════════════════════════════════════════════
+// This file shipped failing 2 of its 18 checks — the `se` handle, in both
+// sweeps — and the header below claimed all eight passed. Both candidate
+// explanations on the table (a genuine `se` regression in the committed
+// bundle, or an artifact of the playwright build in use) were tested. The
+// answer is NEITHER of those exactly: it is a defect in THIS FILE's drag
+// emulation, present since it was written and independent of playwright
+// version. `UIWindow.js` is clean; nothing was changed outside this file.
+//
+// The version hypothesis is not merely argued away, it is MEASURED away. Two
+// playwright installs are reachable in this environment — 1.61.1 at
+// `EZiL-Universe/node_modules` and 1.59.1 at `EBuilder/node_modules`. Against
+// the same committed bundle:
+//   pre-fix file, playwright 1.61.1 -> 16/18, `se` red in both sweeps
+//   pre-fix file, playwright 1.59.1 -> 16/18, `se` red in both sweeps,
+//                                     byte-identical geometry (700x380 ->
+//                                     700x460: height grew, width did not)
+//   this file,    playwright 1.61.1 -> 20/20
+//   this file,    playwright 1.59.1 -> 20/20
+// Identical red under both versions and identical green under both: the
+// variable that mattered was never the playwright build.
+//
+// One-line cause: jQuery UI picks the resize axis from the last handle the
+// pointer was seen OVER, not from the one you pressed, and this file's
+// ten-step drag teleported the pointer off the 15x15 `se` handle before
+// jQuery UI had latched the axis. Full derivation, with the library source
+// and the measured coordinates, is at `dragHandle` below. The fix is a
+// three-pixel first movement inside the handle — what a human hand does
+// anyway — and it leaves every distance, threshold and assertion untouched.
+// MEASURED after the fix: 20/20 (18 originals + 2 new stray-start guards),
+// and `RESIZE_TEST_BREAK_BOX_MODEL=1` still turns all sixteen ALL-HANDLES
+// checks red, so the file's discriminating power is intact.
+//
+// ═══════════════════════════════════════════════════════════════════════════
 // THE GAP THIS FILE CLOSES, AND WHY IT IS A NEW FILE
 // ═══════════════════════════════════════════════════════════════════════════
 // T18/T13 reported "dragging any resize handle collapses a window's height",
@@ -382,20 +417,126 @@ if ( ! opened ) {
             const ix2 = Math.min(hr.left + hr.width, wr.left + wr.width);
             const iy2 = Math.min(hr.top + hr.height, wr.top + wr.height);
             if ( ix2 <= ix1 || iy2 <= iy1 ) return null;
-            return [(ix1 + ix2) / 2, (iy1 + iy2) / 2];
+            // The intersection box travels with the centre: `dragHandle` needs
+            // it to keep its first nudge INSIDE the handle (see there). A
+            // straight-edge handle is only 7px thick, so "centre + 3px" is
+            // not automatically still on it.
+            return { c: [(ix1 + ix2) / 2, (iy1 + iy2) / 2], box: [ix1, iy1, ix2, iy2] };
         }, dir);
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // 🔴 THE FIRST MOVEMENT OF A DRAG MUST STAY ON THE HANDLE IT STARTED ON.
+    // ═══════════════════════════════════════════════════════════════════════
+    // This is the fix for the `se` failure this file carried (16/18) from the
+    // day it was committed. It was a HARNESS defect, not a `UIWindow.js` one.
+    // Traced to ground, in the vendored library's own source and reproduced
+    // both ways:
+    //
+    // jQuery UI 1.13.2 does NOT decide which axis you are resizing from the
+    // element you pressed. `_create` ends with (unminified from this repo's
+    // own `src/lib/jquery-ui-1.13.2/jquery-ui.min.js`):
+    //
+    //     this._handles.on("mouseover", function () {
+    //         if (!that.resizing) {
+    //             if (this.className) {
+    //                 n = this.className.match(/ui-resizable-(se|sw|ne|nw|n|e|s|w)/i);
+    //             }
+    //             that.axis = n && n[1] ? n[1] : "se";
+    //         }
+    //     });
+    //
+    // — i.e. `axis` is whatever handle the pointer was last seen OVER, and it
+    // keeps being rewritten until `resizing` becomes true. `resizing` becomes
+    // true in `_mouseStart`, which the jQuery UI mouse widget only calls on
+    // the FIRST mousemove after mousedown that clears `distance` (default 1px).
+    //
+    // So there is a window of exactly one mousemove in which a stray
+    // `mouseover` can silently change which axis is about to be dragged. A
+    // real human drag never hits it, because a human's first mousemove after
+    // pressing is a pixel or two and stays on the handle. `page.mouse.move(x,
+    // y, { steps: 10 })` is not a human: for an 80px diagonal it TELEPORTS the
+    // pointer 8px on its first step.
+    //
+    // MEASURED on the committed bundle, viewport 1440x900, window at
+    // left=400 top=300 700x380:
+    //   `.ui-resizable-se` is 15x15 at (1084,664)-(1099,679).
+    //   `.ui-resizable-e`  is  7x380 at (1093,300)-(1100,680).
+    //   `.ui-resizable-s`  is 700x7  at (400,673)-(1100,680).
+    //   handleCenter('se') = (1091.5, 671.5); the first of ten steps toward
+    //   (+80,+80) lands at (1099.5, 679.5) — STILL INSIDE THE WINDOW but 0.5px
+    //   outside `se`'s own box, i.e. on top of `s`/`e`. Chromium delivers the
+    //   `mouseover` on that handle before `_mouseStart` runs, so `axis` is
+    //   rewritten to `s` and an `s` resize begins. (Deduced, not assumed: the
+    //   mouseover handler quoted above is the ONLY writer of `axis`, and
+    //   `_mouseStart` is observed reading `s`.)
+    //   Instrumenting `_mouseStart` prints `axis=s` for exactly this drag, and
+    //   `axis=se` for the identical drag issued as a single un-stepped move —
+    //   which grows BOTH axes, 700x380 -> 780x460, on the same unmodified
+    //   bundle. `UIWindow.js` is not involved.
+    //
+    // WHY ONLY `se`, AND WHY `stacking-browser-test.mjs` PASSES 578/578 ON THE
+    // SAME HANDLE: `se` is the only one of the eight whose first 8px step
+    // lands on ANOTHER HANDLE. Every other handle's first step leaves the
+    // window's box altogether and lands on the wallpaper, which is not a
+    // handle, so no `mouseover` fires on one and `axis` survives — `ne` steps
+    // to (1100.5, 299.5), `sw` to (399.5, 680.5), `e` to (1104.5, 490), and so
+    // on, all outside a window that spans 400..1100 by 300..680. Only `se`,
+    // sitting in the corner where the `s` and `e` strips overlap its own 15x15
+    // box by a pixel, steps from one handle straight onto another. It is a
+    // one-handle geometric coincidence, not a resize defect — which is also why
+    // `stacking-browser-test.mjs`'s `se` drag, which uses different geometry
+    // and a different step count, never reproduced it.
+    //
+    // THE FIX, and why it makes the test MORE faithful rather than weaker: nudge
+    // the pointer a few px WITHIN the handle first, so `_mouseStart` runs while
+    // `axis` is still correct and `resizing` then locks it, exactly as a real
+    // drag does. The pointer still ends at (h + dx, h + dy), so the total drag
+    // distance, the ten-step travel and every growth threshold below are
+    // unchanged. `startedOn` is returned so the caller can assert the nudge
+    // really did stay on the intended handle — if a future CSS change shrinks a
+    // handle below NUDGE px, this goes red with a legible reason instead of
+    // silently mis-dragging some other axis.
+    const NUDGE = 3;
+
     async function dragHandle (dir, dx, dy) {
-        const h = await handleCenter(dir);
-        if ( ! h ) return false;
+        const found = await handleCenter(dir);
+        if ( ! found ) return null;
+        const h = found.c;
+        const [ix1, iy1, ix2, iy2] = found.box;
+        // Clamp 1px inside the handle's clickable box, so the nudge cannot
+        // itself walk off a 7px edge handle and hand the axis to a neighbour —
+        // which is the very failure this nudge exists to prevent.
+        const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+        const nx = clamp(h[0] + Math.sign(dx) * NUDGE, ix1 + 1, ix2 - 1);
+        const ny = clamp(h[1] + Math.sign(dy) * NUDGE, iy1 + 1, iy2 - 1);
+        // Read the hit target BEFORE pressing: `resizable`'s own `start`
+        // callback sets `pointer-events: none` on every `.window`, so an
+        // `elementFromPoint` taken mid-drag would answer about the wallpaper.
+        const startedOn = await page.evaluate(([x, y]) => {
+            const el = document.elementFromPoint(Math.round(x), Math.round(y));
+            return /ui-resizable-(se|sw|ne|nw|n|e|s|w)\b/.exec(el?.className ?? '')?.[1] ?? null;
+        }, [nx, ny]);
         await page.mouse.move(h[0], h[1]);
         await page.mouse.down();
+        await page.mouse.move(nx, ny);
         await page.mouse.move(h[0] + dx, h[1] + dy, { steps: 10 });
         await page.mouse.up();
         await sleep(200);
-        return true;
+        // 🔴 `nudgePx` matters as much as `startedOn`. If the clamp above
+        // squeezed the nudge to zero (a handle only 2px thick in the drag's
+        // axis), the pointer never moved before the ten-step travel and
+        // jQuery UI's `_mouseStart` fires on a step that may already be over a
+        // different handle — the original defect, back again and invisible.
+        // jQuery UI's mouse `distance` default is 1px, so <1 is "no nudge".
+        return {
+            startedOn,
+            nudgePx: Math.max(Math.abs(nx - h[0]), Math.abs(ny - h[1])),
+        };
     }
+
+    /** Directions whose drag did not start on their own handle, per sweep. */
+    let strayStarts = [];
 
     async function runDirection (dir, topValue, label) {
         await setGeometry(topValue);
@@ -406,6 +547,8 @@ if ( ! opened ) {
             skip(`${label}: "${dir}" resize handle not found/zero-size (not resizable in this state)`);
             return;
         }
+        if ( dragged.startedOn !== dir ) strayStarts.push(`${dir}: first move landed on "${dragged.startedOn}"`);
+        else if ( dragged.nudgePx < 1 ) strayStarts.push(`${dir}: no room to nudge (${dragged.nudgePx}px)`);
         const after = await rectOf();
         const affects = AFFECTS[dir];
 
@@ -420,13 +563,30 @@ if ( ! opened ) {
         push(
             `${label}: dragging "${dir}" grows the axis it owns, leaves the other alone, never collapses`,
             notDegenerate && widthOk && heightOk,
-            `before=${JSON.stringify(before)} after=${JSON.stringify(after)} affects=${JSON.stringify(affects)}`,
+            `before=${JSON.stringify(before)} after=${JSON.stringify(after)} `
+            + `affects=${JSON.stringify(affects)} startedOn=${dragged.startedOn}`,
         );
     }
+
+    // 🔴 The guard for the defect that made this file 16/18. jQuery UI picks
+    // the axis from the last handle the pointer was seen OVER (see dragHandle),
+    // so a drag can silently resize a DIFFERENT axis than the one under test
+    // and report it as "the handle doesn't grow width". This check names that
+    // condition instead of leaving it to be re-diagnosed from a geometry dump.
+    const strayCheck = (label) => {
+        push(`${label}: every drag started on the handle it was aimed at`,
+            strayStarts.length === 0,
+            strayStarts.length
+                ? `stray starts: ${strayStarts.join('; ')} — the pointer was not on the intended `
+                  + 'handle when jQuery UI latched the axis, so these drags resized something else'
+                : `all ${HANDLES.length} handles`);
+        strayStarts = [];
+    };
 
     for ( const dir of HANDLES ) {
         await runDirection(dir, `${PRISTINE.top}px`, 'ALL-HANDLES (plain-px top)');
     }
+    strayCheck('ALL-HANDLES (plain-px top)');
     // Re-run every handle with `top` as a `calc()` string the browser must
     // resolve itself — T18's specific theory, re-tested per-handle (the
     // original probe only ever tried `se`). If `calc()` mattered, this sweep
@@ -434,6 +594,7 @@ if ( ! opened ) {
     for ( const dir of HANDLES ) {
         await runDirection(dir, PRISTINE_CALC_TOP, 'CALC-TOP-EQUIVALENCE');
     }
+    strayCheck('CALC-TOP-EQUIVALENCE');
 
     push('no uncaught page errors during the whole resize sweep', page_errors.length === 0, page_errors.join(' | '));
 }
