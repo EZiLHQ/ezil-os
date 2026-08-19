@@ -228,6 +228,44 @@ const ENDPOINTS = {
     codePreviewUrl: '/api/shell/code-preview-url',
     focus: '/api/shell/focus',
 };
+
+/**
+ * The §3 mode table, verbatim from `docs/BROWSER-FIX-CONTRACT.md`. Duplicated
+ * here ON PURPOSE: this file is a harness standing in for the app layer, and a
+ * harness that imported the shell's own idea of the table would agree with the
+ * shell by construction and prove nothing about the wire between them.
+ */
+const SCREEN_MODES = [
+    [1920, 1080], [1600, 900], [1280, 720], [1440, 900], [1280, 800], [1024, 768],
+    [1280, 1024], [1200, 1600], [1080, 1920], [896, 1600], [720, 1280], [768, 1024],
+];
+
+/** The POST body, or null. Playwright hands it over as a string. */
+function readBody (req) {
+    try { return JSON.parse(req.postData() ?? 'null'); } catch { return null; }
+}
+
+/**
+ * Snap `{width,height}` to the §3 table — by aspect ratio first, then by area,
+ * exactly as §3 specifies. Returns `null` for an absent or unusable ask, which
+ * is what makes the "old bundle against a new server" path testable.
+ */
+function snapScreen (asked) {
+    const w = asked?.width, h = asked?.height;
+    if ( ! Number.isFinite(w) || ! Number.isFinite(h) || w <= 0 || h <= 0 ) return null;
+    const want = w / h;
+    let best = null, bestAspect = Infinity, bestArea = Infinity;
+    for ( const [mw, mh] of SCREEN_MODES ) {
+        const da = Math.abs((mw / mh) - want);
+        const dz = Math.abs((mw * mh) - (w * h));
+        if ( da < bestAspect - 1e-9 || (Math.abs(da - bestAspect) <= 1e-9 && dz < bestArea) ) {
+            best = { width: mw, height: mh }; bestAspect = da; bestArea = dz;
+        }
+    }
+    if ( ! best ) return null;
+    const exact = best.width === w && best.height === h;
+    return { ...best, source: exact ? 'requested' : 'snapped' };
+}
 const PAYLOAD = {
     user: { id: 'u-1', email: 'someone@example.com' },
     computer: COMPUTER,
@@ -346,9 +384,35 @@ async function boot (contextOpts) {
             if ( url.includes('confirm=frame') ) body = { ok: true, confirmed: true, status: 200 };
             else if ( url.includes('confirm=display') ) body = { ok: true, display: 'live' };
             else if ( url.includes(ENDPOINTS.desktop) ) {
-                body = req.method() === 'POST'
-                    ? { ok: true, guacamoleUrl: `${HOST}/frame?desktop=1`, frame: { confirmed: true } }
-                    : { ok: true, guacamoleRunning: true };
+                if ( req.method() === 'POST' ) {
+                    // 🔴 THIS MOCK SPEAKS CONTRACT §4.1 — ADDED BY INTEGRATION,
+                    // 2026-08-19. It used to answer with no `screen` field at
+                    // all, and the two `[awaits W2]` checks below stayed red
+                    // even after W2 landed. That was the HARNESS being wrong,
+                    // not the shell: per §4.1 an ABSENT `screen` means "server
+                    // behaves exactly as today", so the shell correctly kept
+                    // `stream` at 1920x1080 and correctly letterboxed a phone to
+                    // a 16:9 strip. A mock that cannot express the fix can only
+                    // ever measure the defect.
+                    //
+                    // So it now does what the real app layer does: read the
+                    // OPTIONAL `screen` the shell measured, snap it to the §3
+                    // table, and report back what was applied plus a `source`.
+                    // The shell is still free to send nothing — `snapScreen`
+                    // answers null and the response omits the field, which is
+                    // the backward-compatibility path §4.1 requires and which
+                    // the `[desktop-control]` scenarios still exercise.
+                    const asked = readBody(req)?.screen;
+                    const applied = snapScreen(asked);
+                    body = {
+                        ok: true,
+                        guacamoleUrl: `${HOST}/frame?desktop=1`,
+                        frame: { confirmed: true },
+                        ...(applied ? { screen: applied } : {}),
+                    };
+                } else {
+                    body = { ok: true, guacamoleRunning: true };
+                }
             } else if ( url.includes(ENDPOINTS.codePreviewUrl) ) {
                 body = { ok: true, codePreviewUrl: `${HOST}/frame?code=1`, expiresAt: Date.now() + 300_000 };
             } else if ( url.includes(ENDPOINTS.previewUrl) ) {

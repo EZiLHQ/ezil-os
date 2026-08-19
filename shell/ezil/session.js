@@ -251,6 +251,33 @@ const MAX_ISSUES = 40;
 const RETRY_DELAY_MS = 1_500;
 
 /**
+ * 🔴 CODES THAT ARE TERMINAL AT THIS LAYER, WHICH `isRetryableBootErrorCode`
+ * CANNOT KNOW ABOUT.
+ *
+ * `isRetryableBootErrorCode` mirrors the SERVER's
+ * `DETERMINISTIC_PREVIEW_ERROR_CODES` byte-for-byte, pinned by a test, and that
+ * list is about the DESKTOP preview path. `code_preview_unavailable` and
+ * `app_preview_unavailable` travel on different routes entirely
+ * (`codePreviewUrl` / `previewUrl`), are not members of `BootErrorCode`, and so
+ * fall through that function's `!DETERMINISTIC.includes(code)` default and are
+ * classified retryable. They are not. Widening the server's list to cover them
+ * would break the pin and misfile a code-server fact as a desktop-preview fact.
+ *
+ * They mean "this deployment/container cannot serve that app at all".
+ * `apps/code.js` and `apps/preview.js` both already treat them as TERMINAL and
+ * paint an honest "not available" panel — read the comment above
+ * `show_unavailable()` in either file. Re-asking cannot change the answer, so
+ * the retry is one wasted request and, since `RETRY_DELAY_MS` landed, 1.5s of
+ * spinner in front of a panel we were ready to draw immediately.
+ *
+ * 🔴 MEASURED, not theorised. `apps/code-test.mjs`'s Direction C went red on
+ * the merged tree (38/40) and green on `main` (40/40) for exactly this reason:
+ * the delay pushed the panel past the test's settle window. The retry was
+ * ALWAYS wrong here; before the delay it was merely invisible.
+ */
+const TERMINAL_ERROR_CODES = ['code_preview_unavailable', 'app_preview_unavailable'];
+
+/**
  * 🔴 THE HIBERNATION FIX, CLIENT SIDE. One implementation, three callers
  * (`openDesktop`, `previewUrl`, and `apps/code.js`'s own mint) — three copies
  * of a retry loop is how the timings drift apart and one surface quietly stops
@@ -337,7 +364,8 @@ async function withWakeAndOneRetry (issue, what) {
 
         // A genuine failure. One silent re-ask if a second attempt could
         // plausibly answer differently, then hand it to the user.
-        if ( ! retried && isRetryableBootErrorCode(res.errorCode) ) {
+        if ( ! retried && ! TERMINAL_ERROR_CODES.includes(res.errorCode)
+             && isRetryableBootErrorCode(res.errorCode) ) {
             retried = true;
             console.info(`[ezil-os:session] ${what}: ${res.errorCode} on the first attempt; retrying once in ${RETRY_DELAY_MS}ms`);
             telemetry.capture({
