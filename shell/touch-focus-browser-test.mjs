@@ -51,8 +51,15 @@
 // WHAT GOES RED IF THE FIX IS REVERTED — both reverts were actually RUN, and
 // these are the results they produced, not a prediction.
 // ═══════════════════════════════════════════════════════════════════════════
+// 🔴 RE-MEASURED 2026-08-19 (V1), after this file moved to a pinned
+// `device-desktop` context (see the block at `newContext`). Each revert was
+// applied to the source, the bundle rebuilt, the suite re-run, and the source
+// restored. The TOTALS moved by the two setup checks that were added; the SET
+// of checks that goes red is unchanged in both cases, which is the part that
+// matters — the suite is still sensitive to exactly the defects it was
+// written for, at the new device class.
 // REVERT A — drop `pointerdown` from every binding (i.e. the pre-fix file).
-//   MEASURED 23/26, red on exactly three checks, all of them `hits=[]`:
+//   MEASURED 25/28, red on exactly three checks, all of them `hits=[]`:
 //     GROUP 1  one tap on a defocused window reaches the iframe
 //     GROUP 1  that tap delivers a `click` inside the iframe
 //     GROUP 4  one tap after a context menu revives the iframe
@@ -67,7 +74,7 @@
 //
 // REVERT B — keep `pointerdown` but delete the `focus_on_press` latch in
 //   `UIWindow.js` (bind both events to a bare `() => …focusWindow()`).
-//   MEASURED 23/26, red on exactly three checks, all `delta=2`:
+//   MEASURED 25/28, red on exactly three checks, all `delta=2`:
 //     GROUP 2  one tap on a titlebar = one focus
 //     GROUP 2  one mouse click on a titlebar = one focus
 //     GROUP 3  the resize-handle tap focused it exactly once
@@ -178,12 +185,89 @@ const browser = await chromium.launch();
 // `hasTouch` makes Chromium expose `ontouchstart`/`maxTouchPoints` AND makes
 // `page.touchscreen` dispatch real raw touch input, from which the browser
 // derives pointer events and the synthesized compatibility mouse events in
-// the real order and at the real times. A phone viewport, because that is
-// where the defect was reported.
+// the real order and at the real times. That has not changed and must not:
+// every tap below is real Chromium touch input, not a synthesized event.
+//
+// ════════════════════════════════════════════════════════════════════════════
+// ⬛ THE DEVICE CLASS THIS FILE RUNS AT, AND WHY IT IS PINNED — 2026-08-19
+// ════════════════════════════════════════════════════════════════════════════
+// This file was written at 390x844 with a desktop UA, which under the
+// device detection of the day resolved to `device-desktop`. §7.3 (W7) then
+// widened that detection to include coarse pointer + viewport size, and the
+// SAME context became `device-phone` — at which point W7's phone layout
+// applies: app-bearing windows go full-bleed, so the two probe windows this
+// file opens side by side occupy the same rectangle and every tap aimed at
+// `probe-a` lands on `probe-b`. Resize handles also go away, by design.
+//
+// The resolution (coordinator, Phase 2): **W7's behaviour is correct and
+// stands; this harness adapts.** The two-overlapping-probe-windows
+// arrangement and the resize-handle probe are artefacts of how this file was
+// built, not of §7.1's requirement. §7.1 is about *focus activation* — one
+// tap reaching the iframe — and about the binding mechanics around it
+// (idempotence, the latch, pointerdown-before-mousedown ordering, the
+// `UIContextMenu`/`UIPopover` restore path). None of that is device-class
+// specific, and all of it is what the groups below measure.
+//
+// ⬛ WHAT OWNS THE PHONE-LAYOUT ACCEPTANCE INSTEAD. `shell/ezil/apps/mobile-browser-test.mjs`
+// (W8) asserts "one tap reaches the stream" at a REAL phone viewport with a
+// REAL phone UA, i.e. against `device-phone` and W7's full-bleed layout.
+// That suite is the acceptance for the phone; this suite is the acceptance
+// for the binding mechanics. Do not re-add a phone viewport here — you would
+// be duplicating W8 and re-breaking the geometry these groups need.
+//
+// ⬛ HOW `device-desktop` IS PINNED, AND WHAT IS AND IS NOT FAKED.
+// `device_class_for` in `ezil/boot.js` returns `device-desktop` only when
+// BOTH are false:
+//     phone_shaped  ← `isMobile.phone` OR width <= 600 OR (touch-first AND
+//                     short side <= 500 AND long side <= 950)
+//     touch_first   ← `(pointer: coarse)` OR `isMobile.phone/.tablet`
+// so two things have to be true here, and they are pinned separately:
+//
+//   1. A viewport WIDER than `PHONE_MAX_W` (600). 1024x844 — the height is
+//      unchanged from the original so the window geometry the groups were
+//      tuned against still fits, and 1024 is an ordinary laptop width.
+//   2. `(pointer: coarse)` must report false. Chromium's touch emulation
+//      forces the primary pointer to coarse whenever `hasTouch` is on and
+//      offers no switch — VERIFIED: `Emulation.setEmulatedMedia` with
+//      `pointer: fine` over CDP does not move it. So this init script
+//      answers that ONE media query, and only that one, with false.
+//
+// That combination is not an artificial device: it is a **touchscreen
+// laptop**, which is exactly the case W7 documents when it explains why the
+// rule reads `(pointer: coarse)` and not `(any-pointer: coarse)` — a machine
+// with a real digitizer whose PRIMARY pointer is a mouse. `(any-pointer:
+// coarse)` is left genuinely true here, `navigator.maxTouchPoints` is left
+// genuinely non-zero, `ontouchstart` is left genuinely present, and every
+// `page.touchscreen` gesture is still real touch input through Chromium's
+// real pipeline. Nothing about the mechanism under test is stubbed: the one
+// value overridden is the CLASSIFICATION signal the shell reads to choose a
+// layout, and the setup check below proves which layout was chosen.
 const context = await browser.newContext({
-    viewport: { width: 390, height: 844 },
+    viewport: { width: 1024, height: 844 },
     hasTouch: true,
     deviceScaleFactor: 2,
+});
+// Runs before any page script, so `boot.js`'s first `set_device_class()` and
+// every later re-evaluation see the same answer. Deliberately narrow: the
+// exact string `(pointer: coarse)`, delegating everything else — including
+// `(any-pointer: coarse)` and `(prefers-reduced-motion: reduce)`, which
+// `UIWindow.js` reads — to the real implementation. The returned stub carries
+// both the modern and the legacy listener spellings because `boot.js`'s
+// `bind_device_listeners` subscribes to this very query.
+await context.addInitScript(() => {
+    const real = window.matchMedia && window.matchMedia.bind(window);
+    if ( ! real ) return;
+    const COARSE_PRIMARY = /\(\s*pointer\s*:\s*coarse\s*\)/;
+    window.matchMedia = (query) => {
+        const q = String(query);
+        if ( ! COARSE_PRIMARY.test(q) ) return real(q);
+        return {
+            media: q, matches: false, onchange: null,
+            addEventListener () {}, removeEventListener () {},
+            addListener () {}, removeListener () {},
+            dispatchEvent () { return false; },
+        };
+    };
 });
 const page = await context.newPage();
 
@@ -234,6 +318,30 @@ await sleep(200);
 push('setup: the touchscreen is real (the page reports touch support)',
     await page.evaluate(() => ('ontouchstart' in window) && navigator.maxTouchPoints > 0),
     `maxTouchPoints=${await page.evaluate(() => navigator.maxTouchPoints)}`);
+
+// 🔴 The pin, asserted rather than assumed — see the long block at
+// `newContext` above. Two halves, and BOTH have to hold or a green run below
+// would be meaningless: the shell must have chosen the desktop layout, and
+// the touch hardware must still be genuinely present (`any-pointer: coarse`
+// is NOT overridden, so it is the honest witness that this is a touchscreen
+// machine and not a plain desktop with the touch input turned off).
+{
+    const env = await page.evaluate(() => ({
+        deviceClass: ['device-desktop', 'device-tablet', 'device-phone']
+            .filter((c) => document.body.classList.contains(c)).join(',') || 'NONE',
+        primaryCoarse: matchMedia('(pointer: coarse)').matches,
+        anyCoarse: matchMedia('(any-pointer: coarse)').matches,
+        maxTouchPoints: navigator.maxTouchPoints,
+        w: window.innerWidth, h: window.innerHeight,
+    }));
+    push('setup: the shell resolved this context to `device-desktop` — the pin holds, so '
+        + 'W7\'s phone layout is NOT in play and the two probe windows keep separate rectangles',
+        env.deviceClass === 'device-desktop', JSON.stringify(env));
+    push('setup: and it is a touchscreen desktop, not a de-touched one — `any-pointer: coarse` '
+        + 'and `maxTouchPoints` are untouched, so the taps below are real touch input',
+        env.anyCoarse === true && env.maxTouchPoints > 0 && env.primaryCoarse === false,
+        JSON.stringify(env));
+}
 
 // ── two real windows, each with a real iframe ──────────────────────────────
 // Two, because "the window lost focus" has to happen the way it happens to a

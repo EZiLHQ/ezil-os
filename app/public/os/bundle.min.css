@@ -509,6 +509,7 @@ span.header-sort-icon img{margin-bottom:-1px;width:10px}
 .window-cover-page{border-radius:0;height:100vh!important}
 .device-phone .window[data-is_maximized="1"]{top:0!important}
 .device-phone .window,.device-tablet .window{z-index:9999999!important}
+.device-phone .window:not(.window-active),.device-tablet .window:not(.window-active){z-index:9999998!important}
 .device-phone .window-alert,.device-tablet .window-alert{min-width:90%;max-width:300px;position:absolute;left:50%!important;top:50%!important;transform:translate(-50%,-50%)}
 .device-phone .window .ui-resizable-handle,.device-phone .window .window-scale-btn,.device-tablet .window .window-scale-btn{display:none!important}
 .window-backdrop{position:fixed;top:0;bottom:0;left:0;right:0;background-color:#00000080}
