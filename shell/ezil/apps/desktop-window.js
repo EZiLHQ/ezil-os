@@ -654,17 +654,38 @@ export async function openDesktopWindow (ctx = {}) {
             stream.h = height;
             refit();
         },
-        onFailure: ({ code }) => {
+        onFailure: ({ code, message }) => {
             if ( disposed ) return;
             // Never fatal, and never retried here: the desktop keeps working at
             // the size it already has and the window letterboxes it. The code
             // is recorded so "resizing silently does nothing" is answerable
             // from telemetry rather than by guessing.
-            console.warn(`[${PHASE}] screen resize refused: ${code}`);
+            //
+            // 🔴 `detail` IS THE WHOLE POINT, and omitting it made the sentence
+            // above false for the first day this shipped. `code` is the closed
+            // five-member set (`UPSTREAM` and four others), so every distinct
+            // upstream failure — a 500 from neko, a 500 from the sandbox proxy,
+            // a refused login, a container that went away — arrives in the
+            // table as the identical row `screen_upstream`, `detail: NULL`.
+            //
+            // Observed 2026-08-19, the day of the deploy: 19 events, one user,
+            // zero successes, and the status was *unrecoverable from the data*.
+            // It had to be read off `wrangler tail` instead — which is exactly
+            // the guessing this call site claims to have removed. The Worker
+            // already builds `screen_upstream_<status>` and the app carries it
+            // verbatim as `message` (`classifyScreenFailure`'s caller sets
+            // `message: workerError`), so the granularity existed the whole way
+            // down and was discarded one line before it was recorded.
+            //
+            // `detail` is capped at 200 chars and passes through
+            // `sanitizeErrorMessage` server-side, so this cannot widen what is
+            // collected — see `docs/telemetry.md`.
+            console.warn(`[${PHASE}] screen resize refused: ${code}${message ? ` (${message})` : ''}`);
             telemetry.capture({
                 eventClass: 'api_failure',
                 site: 'ezil-os:apps/desktop#screen',
                 code: code === 'UNSUPPORTED' ? 'screen_unsupported' : `screen_${String(code).toLowerCase()}`,
+                detail: message ? String(message) : undefined,
             });
         },
     });

@@ -1631,8 +1631,49 @@ export async function probeDesktopFrame(
 // retry policy. Lengthening it there would make each of those asks slower
 // without making any of them more informative.
 
-/** Whole budget for the pre-handoff frame confirmation, across all attempts. */
-export const DESKTOP_FRAME_CONFIRM_BUDGET_MS = 20_000;
+/**
+ * Whole budget for the pre-handoff frame confirmation, across all attempts.
+ *
+ * 🔴 20s WAS NOT ENOUGH, and this is the number production picked, not a guess.
+ * The re-probe shipped at 20s on 2026-08-19 and immediately did what it was
+ * designed to do — the failure shape changed rather than disappearing:
+ *
+ *     before the re-probe   fail at 32-35s   (one 6s probe, then a retry
+ *                                             0.4-1.6s later that could never
+ *                                             work — 10 of 10 never recovered)
+ *     with a 20s budget     fail at 43-50s   (retry legs 20,970ms / 27,852ms,
+ *                                             i.e. the budget fully consumed)
+ *
+ * A budget that is fully consumed and still fails is a budget that is too
+ * small, not a mechanism that does not work: the origin is genuinely not
+ * answering for longer than 20s. That is the edge, not the container — by this
+ * point `ensureDesktop` has already passed `desktop_ready_wait`, which is an
+ * in-container `wget` on `127.0.0.1:8181`, so neko is serving *inside* while
+ * the public `*-nekodesktop` hostname is still not routable. There is no local
+ * analogue of that gap, which is precisely why every local run passed.
+ *
+ * 🔴 30s, NOT the 45s used elsewhere for the same question, and the difference
+ * is a hard constraint rather than taste. 45s was tried and
+ * `desktop-frame-reprobe.test.ts`'s "stays inside the route and shell budgets
+ * that contain it" caught it: a worst-case ~180s Worker wait is already inside
+ * this request, and 180 + 45 = 225s overruns the shell's own
+ * `DESKTOP_BOOT_TIMEOUT_MS` of 215s — the client would give up while the server
+ * was still patiently probing, converting a slow success into a failure at a
+ * different layer. 180 + 30 = 210s fits. The guard was right and this comment
+ * exists so nobody "fixes" it upward again without moving the 180s first.
+ *
+ * The related 45s figures (`FRAME_CONFIRM_DEADLINE_MS` in
+ * `shell/ezil/apps/desktop-window.js`, and `boot-phases.ts`) are CLIENT-side
+ * deadlines with no 180s sitting inside them. Same reasoning, different
+ * containing budget — do not conflate them.
+ *
+ * ⚠️ This makes a FAILING boot slower (~55s worst case) to make a SLOW boot
+ * succeed, and 30s may still not be enough. If production keeps failing at the
+ * budget, the answer is NOT a bigger number here — it is the boot panel telling
+ * the user "your computer is running, we cannot reach its screen yet" while it
+ * waits, and shrinking the 180s Worker wait that owns most of the envelope.
+ */
+export const DESKTOP_FRAME_CONFIRM_BUDGET_MS = 30_000;
 
 /** Gap between attempts. Long enough not to hammer the edge, short enough to catch a fast settle. */
 export const DESKTOP_FRAME_CONFIRM_GAP_MS = 1_500;
