@@ -1,7 +1,8 @@
 import { db } from '@/server/db';
 import { env } from '@/env';
 import { mintSandboxPreviewToken } from '@/server/lib/cloudflare-guacamole-provider';
-import { handleTelemetrySpoolDrain, type DrainPageResult } from '@/server/telemetry/spool-drain';
+import { handleTelemetrySpoolDrain } from '@/server/telemetry/spool-drain';
+import { createDrainTransportFromEnv } from '@/server/telemetry/spool-drain-transport';
 
 /**
  * `GET /api/cron/telemetry-drain` — drains the Worker's R2 telemetry spool
@@ -14,11 +15,19 @@ import { handleTelemetrySpoolDrain, type DrainPageResult } from '@/server/teleme
  * ever read them back out — 100% of `source:'worker'`/`source:'container'`
  * events, including every container boot phase, never reached Postgres.
  *
- * ⚠️ Vercel's Hobby plan only permits DAILY cron schedules — see
- * `vercel.json`'s comment on this route's entry. The existing
- * `telemetry-maintenance` cron is `17 3 * * *` for the exact same reason.
- * This route is scheduled at a different minute/hour so the two crons never
- * clash on the same tick.
+ * 🔴 NO LONGER ON A CRON OF ITS OWN, and that is the point. `vercel.json`
+ * declared three crons and the plan permits two; this is the one that stopped
+ * being invoked (zero hour-03 Worker requests from it since 2026-08-09, while
+ * the other two kept firing). The drain now runs at the tail of
+ * `/api/cron/telemetry-maintenance` — a cron that is PROVEN to fire — and this
+ * route is kept as the MANUAL entry point:
+ *
+ *     curl -sS -H "Authorization: Bearer $CRON_SECRET" \
+ *       https://ezil-os.vercel.app/api/cron/telemetry-drain
+ *
+ * Running it while the scheduled drain is also running is harmless: ingest
+ * strictly precedes ack per page, ingest is idempotent on `eventId`, and an
+ * object either gets acked (deleted) or comes back on the next run.
  *
  * Guarded by `CRON_SECRET` (`@/env.ts`), the SAME secret
  * `telemetry-maintenance` uses: unset -> 404, wrong/missing bearer -> 404.
@@ -26,101 +35,28 @@ import { handleTelemetrySpoolDrain, type DrainPageResult } from '@/server/teleme
  * comment for the full fail-closed rationale (copied verbatim from
  * `@/server/telemetry/maintenance-handler.ts`).
  *
- * `maxDuration` set well above what one run's bounded work (≤10 pages ×
- * ≤200 objects, per `spool-drain.ts`'s `DEFAULT_MAX_PAGES`) should ever take,
- * for the same "maxDuration is not inherited" reason
- * `telemetry-maintenance/route.ts` documents.
+ * `maxDuration` covers one whole run of the bounded loop — `DEFAULT_MAX_PAGES`
+ * (10) × `DRAIN_PAGE_LIMIT` (25) objects, cut short by
+ * `DEFAULT_DRAIN_BUDGET_MS` (150 s) plus one in-flight page — for the same
+ * "maxDuration is not inherited" reason docs/PLATFORM-NOTES.md §13 gives.
+ *
+ * The two Worker HTTP calls are NOT defined here any more: they live in
+ * `@/server/telemetry/spool-drain-transport.ts` so this route and the
+ * maintenance route cannot drift apart on the page limit, the timeout or the
+ * auth envelope.
  */
-export const maxDuration = 90;
-
-function workerBaseUrl(): string {
-    return (env.CLOUDFLARE_GUACAMOLE_WORKER_URL ?? '').replace(/\/$/, '');
-}
-
-function authHeaders(): Record<string, string> {
-    const token = mintSandboxPreviewToken(env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET ?? '');
-    return { 'content-type': 'application/json', authorization: `Bearer ${token}` };
-}
-
-/** Real transport for `runTelemetrySpoolDrain`'s `drainPage` dependency —
- * every failure mode (unconfigured Worker, network error, non-2xx, malformed
- * JSON) collapses to `{ ok: false }` uniformly; see `spool-drain.ts`'s
- * `DrainPageResult` doc comment for why the loop does not need to
- * distinguish them. */
-/**
- * Objects per drain page.
- *
- * 🔴 SENDING THIS IS LOAD-BEARING, and omitting it is what this constant exists
- * to prevent. `clampDrainLimit(undefined)` (`worker/src/telemetry.ts:360`) falls
- * back to `TELEMETRY_DRAIN_MAX_OBJECTS = 200`, and `handleTelemetryDrain` then
- * performs up to 200 **sequential awaited** `bucket.get()` calls inside a single
- * request — against the 20s `AbortSignal.timeout` below.
- *
- * That is not hypothetical. Measured 2026-08-19: `ezil-telemetry-spool` holds
- * **173 objects** that have never been drained, so the very first restored run
- * is the worst case. If it aborts, the app sees `{ok:false}`, never acks, and
- * the backlog is unchanged — a self-perpetuating stall indistinguishable from
- * the outage it is recovering from. Cloudflare's invocation analytics record an
- * aborting client as `clientDisconnected`, and the only three hour-03 Worker
- * hits in the whole window (2026-08-06/07/08, one per day, then silence) are
- * exactly that shape — so this may well be how the drain died in the first
- * place, rather than merely how it would fail next time.
- *
- * 25 keeps a page comfortably inside the budget and costs only more round trips;
- * `runTelemetrySpoolDrain` already loops on the returned cursor.
- */
-const DRAIN_PAGE_LIMIT = 25;
-
-async function drainPage(cursor: string | undefined): Promise<DrainPageResult> {
-    const base = workerBaseUrl();
-    if (!base) return { ok: false };
-    try {
-        const res = await fetch(`${base}/telemetry/drain`, {
-            method: 'POST',
-            headers: authHeaders(),
-            body: JSON.stringify({ cursor, limit: DRAIN_PAGE_LIMIT }),
-            signal: AbortSignal.timeout(20_000),
-        });
-        if (!res.ok) return { ok: false };
-        const data = (await res.json()) as {
-            ok?: boolean;
-            objects?: { key: string; body: string }[];
-            cursor?: string;
-            truncated?: boolean;
-        };
-        if (!data.ok) return { ok: false };
-        return { ok: true, objects: data.objects ?? [], cursor: data.cursor, truncated: Boolean(data.truncated) };
-    } catch {
-        return { ok: false };
-    }
-}
-
-/** Real transport for `runTelemetrySpoolDrain`'s `ack` dependency. A `false`
- * return is harmless — see `spool-drain.ts`'s file header: the un-acked
- * objects simply come back (and re-ingest as a no-op) on the next run. */
-async function ack(keys: string[]): Promise<boolean> {
-    if (keys.length === 0) return true;
-    const base = workerBaseUrl();
-    if (!base) return false;
-    try {
-        const res = await fetch(`${base}/telemetry/ack`, {
-            method: 'POST',
-            headers: authHeaders(),
-            body: JSON.stringify({ keys }),
-            signal: AbortSignal.timeout(20_000),
-        });
-        if (!res.ok) return false;
-        const data = (await res.json()) as { ok?: boolean };
-        return Boolean(data.ok);
-    } catch {
-        return false;
-    }
-}
+export const maxDuration = 300;
 
 /**
  * GET, not POST — same as `telemetry-maintenance`: Vercel Cron Jobs invoke
  * their configured path with GET (`vercel.json`).
  */
 export async function GET(req: Request): Promise<Response> {
-    return handleTelemetrySpoolDrain(req, { cronSecret: env.CRON_SECRET, db, drainPage, ack });
+    const transport = createDrainTransportFromEnv(env, mintSandboxPreviewToken);
+    return handleTelemetrySpoolDrain(req, {
+        cronSecret: env.CRON_SECRET,
+        db,
+        drainPage: transport.drainPage,
+        ack: transport.ack,
+    });
 }

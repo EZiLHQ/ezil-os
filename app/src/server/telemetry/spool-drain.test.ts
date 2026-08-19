@@ -158,6 +158,9 @@ describe('runTelemetrySpoolDrain — the core loop', () => {
             eventsDroppedInvalid: 0,
             eventsIngested: 0,
             objectsAcked: 0,
+            // The loop stopped because the Worker was unreachable, not because
+            // the clock ran out.
+            hitBudget: false,
             // 🔴 The one field that separates this outcome from a healthy
             // empty spool. Both stop the loop at zero pages; only this says
             // WHY. Measured 2026-08-19: 173 objects sat undrained in
@@ -243,6 +246,43 @@ describe('runTelemetrySpoolDrain — the core loop', () => {
 
         expect(drainPage).toHaveBeenCalledTimes(3);
         expect(result.pagesDrained).toBe(3);
+    });
+
+    it('🔴 stops starting pages once the wall-clock budget is spent, and says so', async () => {
+        // The drain no longer owns its invocation: it runs at the tail of
+        // `/api/cron/telemetry-maintenance`, so a page COUNT is not a bound on
+        // how long it may take. Each page here burns real time, and the budget
+        // — not `maxPages` — is what ends the run.
+        const { db } = makeIngestDb();
+        const drainPage = vi.fn().mockImplementation(async () => {
+            await new Promise((r) => setTimeout(r, 12));
+            return page([{ key: `v1/${drainPage.mock.calls.length}.ndjson`, body: rawEventLine() }], {
+                truncated: true,
+                cursor: 'more',
+            });
+        });
+        const ack = vi.fn().mockResolvedValue(true);
+
+        const result = await runTelemetrySpoolDrain({ db, drainPage, ack, maxPages: 50, budgetMs: 20 });
+
+        expect(result.hitBudget).toBe(true);
+        expect(result.pagesDrained).toBeGreaterThan(0); // it did real work
+        expect(result.pagesDrained).toBeLessThan(50); // and stopped well short of the page ceiling
+        // Everything it did drain was ingested and acked before it stopped —
+        // stopping on the clock must never orphan a half-processed page.
+        expect(result.objectsAcked).toBe(result.objectsSeen);
+    });
+
+    it('always attempts the FIRST page, however little budget is left — a silent no-op is the outage`s own shape', async () => {
+        const { db } = makeIngestDb();
+        const drainPage = vi.fn().mockResolvedValue(page([{ key: 'v1/a.ndjson', body: rawEventLine() }], { truncated: false }));
+        const ack = vi.fn().mockResolvedValue(true);
+
+        const result = await runTelemetrySpoolDrain({ db, drainPage, ack, budgetMs: 0 });
+
+        expect(drainPage).toHaveBeenCalledTimes(1);
+        expect(result.pagesDrained).toBe(1);
+        expect(result.hitBudget).toBe(false);
     });
 
     it('an empty object array with truncated:false ends the loop with a zeroed result', async () => {
