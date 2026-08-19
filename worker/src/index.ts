@@ -4735,12 +4735,12 @@ async function readNekoScreen(
   origin: string,
   port: number,
   token: string,
-  signal: AbortSignal,
 ): Promise<{ width: number; height: number } | null> {
   try {
     const res = await sandbox.containerFetch(
       `${origin}/api/room/screen`,
-      { method: 'GET', headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, signal },
+      // No `signal` — see `withDeadline`. The caller races this whole call.
+      { method: 'GET', headers: { Accept: 'application/json', Authorization: `Bearer ${token}` } },
       port,
     );
     if (!res.ok) return null;
@@ -4752,6 +4752,50 @@ async function readNekoScreen(
     return { width, height };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Race a container RPC against a deadline **without** an `AbortSignal`.
+ *
+ * 🔴 `containerFetch` CANNOT BE GIVEN A SIGNAL. `Sandbox.containerFetch()` is a
+ * Durable Object RPC, so its `RequestInit` is serialized across the isolate
+ * boundary, and an `AbortSignal` is not serializable unless the
+ * `enable_request_signal` compatibility flag is set. Passing one throws
+ * `AbortSignal serialization is not enabled.` — synchronously, before the
+ * request is ever made.
+ *
+ * That is not a theory. Shipped 2026-08-19 with `signal: deadline` on all three
+ * container calls below, and live telemetry recorded **20 of 20 resizes failing**
+ * with `screen_upstream_exception`, every one of them this message. It is 100%
+ * reproducible in production and 0% reproducible locally, because the local
+ * `local-dev-stub` path never reaches `containerFetch` and a direct
+ * `fetch()` at a container in a docker test is an ordinary fetch, where a signal
+ * is perfectly legal. The mechanism only exists on the RPC boundary.
+ *
+ * A raced timer gives the same ceiling. It does not cancel the in-flight
+ * request — the isolate discards the result — which is acceptable here: the
+ * budget exists so a caller is not left hanging, and neko's own handler is
+ * bounded.
+ *
+ * Rejects with an `Error` named `TimeoutError` so the `catch` below classifies
+ * it as `screen_timeout` (504) exactly as an `AbortSignal.timeout` would have.
+ */
+async function withDeadline<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          const err = new Error(`${label} exceeded ${ms}ms`);
+          err.name = 'TimeoutError';
+          reject(err);
+        }, ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -4774,7 +4818,10 @@ async function handleScreen(request: Request, env: Env, sandboxName: string): Pr
   }
   const { width, height } = requested;
 
-  const deadline = AbortSignal.timeout(SCREEN_SET_BUDGET_MS);
+  // NO `AbortSignal` here — see `withDeadline` above for why it cannot cross
+  // the container RPC boundary. The budget is enforced by racing instead.
+  const started = Date.now();
+  const remaining = () => Math.max(1, SCREEN_SET_BUDGET_MS - (Date.now() - started));
   const nekoPort = portFor('neko').port;
   const origin = `http://127.0.0.1:${nekoPort}`;
 
@@ -4788,16 +4835,15 @@ async function handleScreen(request: Request, env: Env, sandboxName: string): Pr
     // 500ms client-side, deduplicated against the last applied size), so one
     // extra loopback round trip per resize is not worth a second cache that
     // could hand a restarted container a dead token.
-    const loginRes = await sandbox.containerFetch(
+    const loginRes = await withDeadline(sandbox.containerFetch(
       `${origin}/api/login`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: 'ezil-os-screen', password: creds.admin }),
-        signal: deadline,
       },
       nekoPort,
-    );
+    ), remaining(), 'screen login');
     if (!loginRes.ok) {
       return json({ ok: false, sandboxId: sandboxName, error: `screen_login_failed_${loginRes.status}` }, 502);
     }
@@ -4811,17 +4857,16 @@ async function handleScreen(request: Request, env: Env, sandboxName: string): Pr
     // screen configuration and nothing else — there are no sibling fields for a
     // POST to silently reset, which is the failure `enableImplicitHosting`'s own
     // doc comment records for the settings endpoint.
-    const setRes = await sandbox.containerFetch(
+    const setRes = await withDeadline(sandbox.containerFetch(
       `${origin}/api/room/screen`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${login.token}` },
         // Built from the two integers validated above, never from the body.
         body: JSON.stringify({ width, height, rate: SCREEN_RATE_HZ }),
-        signal: deadline,
       },
       nekoPort,
-    );
+    ), remaining(), 'screen set');
 
     if (setRes.ok) {
       // 🔴 READ BACK. THE POST'S OWN BODY IS NOT EVIDENCE.
@@ -4838,7 +4883,11 @@ async function handleScreen(request: Request, env: Env, sandboxName: string): Pr
       // are what this route reports. When it does not, the route says so with
       // `verified: false` rather than falling back to the POST's echo and
       // calling it applied; the app then declines to claim `requested`.
-      const applied = await readNekoScreen(sandbox, origin, nekoPort, login.token, deadline);
+      const applied = await withDeadline(
+        readNekoScreen(sandbox, origin, nekoPort, login.token),
+        remaining(),
+        'screen read-back',
+      );
       return json({
         ok: true,
         sandboxId: sandboxName,
