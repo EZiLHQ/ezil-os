@@ -2631,7 +2631,7 @@ export async function requestGuacamoleScreen(
         // answers a refused resize as a non-2xx WITH a JSON body carrying the
         // reason.
         const text = await res.text().catch(() => '');
-        let data: { ok?: unknown; error?: unknown; width?: unknown; height?: unknown; verified?: unknown } = {};
+        let data: { ok?: unknown; error?: unknown; detail?: unknown; width?: unknown; height?: unknown; verified?: unknown } = {};
         try {
             data = text ? (JSON.parse(text) as typeof data) : {};
         } catch {
@@ -2653,6 +2653,14 @@ export async function requestGuacamoleScreen(
         }
 
         const workerError = typeof data.error === 'string' ? data.error : '';
+        // 🔴 The Worker sends `detail` alongside `error` and this used to read
+        // only `error`, so the exception message never left the Worker. Measured
+        // in production 2026-08-19: 20 of 20 live resizes failed with
+        // `screen_upstream_exception` — the catch branch at
+        // `worker/src/index.ts`, i.e. something THREW inside the handler — and
+        // the message naming what threw was discarded here. `error` alone tells
+        // you an exception happened; `detail` is the only field that says which.
+        const workerDetail = typeof data.detail === 'string' ? data.detail : '';
         console.warn('[cloudflare-guacamole] screen request rejected', {
             sandboxName,
             width,
@@ -2663,7 +2671,13 @@ export async function requestGuacamoleScreen(
         return {
             ok: false,
             code: classifyScreenFailure(res.status, workerError),
-            message: workerError || `worker_http_${res.status}`,
+            // Both, joined — the code is the closed set the client branches on,
+            // the detail is the only thing that makes one `UPSTREAM` row
+            // distinguishable from another in telemetry.
+            message: [workerError || `worker_http_${res.status}`, workerDetail]
+                .filter(Boolean)
+                .join(': ')
+                .slice(0, 200),
         };
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
