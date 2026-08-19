@@ -119,6 +119,30 @@ export const SHELL_API_ROUTES = {
      * the Worker only ever reads it as `now - ago`.
      */
     activity: '/api/shell/activity',
+    /**
+     * POST = change the X screen mode of a computer's LIVE desktop
+     * (`{ computerId, width, height }`), so a window that has been dragged,
+     * rotated or full-bleeded streams the shape it is actually shown in rather
+     * than a letterboxed 16:9 strip. Fifth instance of the
+     * `focus`/`telemetry`/`restart`/`activity` feature-detection contract:
+     * `shell/ezil/apps/desktop-screen.js` reads
+     * `desktopState.endpoints.screen` and stays permanently dark — no
+     * observer, no debounce timer, no request — when it is absent, rather than
+     * POSTing to a URL it invented. An older server build degrades to
+     * boot-time sizing plus letterboxing, which is a working desktop.
+     *
+     * 🔴 BOOT-TIME sizing does NOT depend on this key. That travels on the
+     * existing `desktop` call as an optional `screen` field and needs no new
+     * route, so a deployment that carries this entry and one that does not
+     * both size the desktop correctly at open; only LIVE resizing differs.
+     *
+     * This entry must only be present while `src/app/api/shell/screen/route.ts`
+     * exists — which in turn only works while the Worker serves
+     * `POST /sandbox/:name/screen`, and only produces a visible change while
+     * the container's X server can actually change mode (Xorg+dummy; never
+     * Xvfb, whose framebuffer is fixed at process start).
+     */
+    screen: '/api/shell/screen',
 } as const;
 
 export interface ShellBootUser {
