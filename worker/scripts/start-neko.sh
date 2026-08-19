@@ -977,6 +977,62 @@ write_health() {
   printf '%s\n' "$body" >"$NEKO_APP_HEALTH_FILE.tmp" && mv "$NEKO_APP_HEALTH_FILE.tmp" "$NEKO_APP_HEALTH_FILE"
 }
 
+# ── Clean quit vs crash (a user closing the browser must not kill the session) ─
+#
+# `supervise_app` below used to restart an app on ANY exit and charge EVERY
+# exit to the restart budget: `rc` was logged and never looked at. So a user
+# who quit the in-stream browser six times got `NEKO_APP_MAX_RESTARTS` (5)
+# exhausted, the fatal sentinel raised, and `terminate_stack` — SIGTERM/SIGKILL
+# to every app group, neko, the X server, openbox, pulseaudio — followed by
+# `exit 1`. The user asked to close a window and lost the whole desktop
+# session. (W3 is separately removing that close button; this must not be
+# reachable by ordinary use whether or not the button is there.)
+#
+# ── The rule ────────────────────────────────────────────────────────────────
+# An exit is CLEAN — and therefore NOT charged to the restart budget — when
+# BOTH hold:
+#
+#   rc == 0                     the app chose to exit. A crash is a non-zero
+#                               status, and a signal death is 128+n, never 0.
+#   uptime >= 5s                it had actually been running. "Exited 0
+#                               immediately" is not a user quitting: it is
+#                               Chrome handing off to an already-running
+#                               instance, or a profile it refuses to open,
+#                               and letting THAT be free would be an
+#                               unbounded hot restart loop.
+#
+# Everything else — any non-zero status, any signal, and any rc=0 inside the
+# first 5 seconds — is charged exactly as before, so a genuine crash-loop
+# still exhausts the budget and still fails the desktop closed. The budget is
+# NOT infinite and NOT larger than it was.
+#
+# ── What a clean exit costs ─────────────────────────────────────────────────
+# A clean exit is free forever, so an app that exits 0 after >=5s of uptime
+# restarts indefinitely rather than ever tripping the sentinel. That is the
+# intended trade (a browser the user closed must come back, not take the
+# session with it), but "indefinitely" needs a floor under it or a
+# pathological app could relaunch every ~7s for the life of the container. So
+# CONSECUTIVE clean exits back off LINEARLY (2s, 4s, 6s, … capped at 30s),
+# and the streak resets the moment an app manages a genuinely healthy run
+# (>=60s) — which is every real user-initiated quit, so a user who closes the
+# browser gets it back in the same 2s as always.
+#
+# These three are internal constants, deliberately NOT `${VAR:-…}`-overridable:
+# the browser-fix contract §2 fixes the set of environment variables and this
+# needs none of them.
+NEKO_APP_CLEAN_EXIT_MIN_UPTIME_MS=5000
+NEKO_APP_CLEAN_EXIT_HEALTHY_MS=60000
+NEKO_APP_CLEAN_RESTART_MAX_DELAY=30
+
+# _app_exit_is_clean <rc> <uptime_ms> — the rule above, and nothing else.
+# Returns 0 (true) for a clean, user-initiated quit.
+_app_exit_is_clean() {
+  local rc="$1" uptime_ms="$2"
+  [ "$rc" = "0" ] || return 1
+  [ "$uptime_ms" -ge "$NEKO_APP_CLEAN_EXIT_MIN_UPTIME_MS" ] || return 1
+  return 0
+}
+
 # supervise_app <name> <max_restarts> <cmd...>
 # Runs <cmd> in a restart loop inside a background subshell. On exit it logs
 # only the app name + exit code (never argv/urls), waits with a short backoff,
@@ -1007,8 +1063,10 @@ supervise_app() {
   APP_RESTARTS[$name]=0
   rm -f "$pgid_file" "$sup_file" 2>/dev/null || true
   write_health
+  local clean_streak=0
   (
     while true; do
+      app_started_ms="$(date +%s%3N)"
       setsid "$@" >>"$LOG" 2>&1 &
       app_pgid=$!
       # Written atomically so terminate_stack can never read a half-written
@@ -1018,12 +1076,45 @@ supervise_app() {
         && mv "${pgid_file}.tmp" "$pgid_file" 2>/dev/null
       wait "$app_pgid"
       local rc=$?
+      # Captured AFTER rc, never before: anything between `wait` and reading
+      # `$?` destroys the status this whole classification rests on.
+      local uptime_ms=$(( $(date +%s%3N) - app_started_ms ))
       # Teardown in progress: do not start a replacement that would outlive it.
       if [ -f "$NEKO_SHUTDOWN_FLAG" ]; then
         log "app=$name exited rc=$rc during teardown — not restarting"
         break
       fi
-      log "app=$name exited rc=$rc (attempt $((attempt + 1))/$((max_restarts + 1)))"
+      # 🔴 The user-initiated quit. Restarted like any other exit — the desktop
+      # still needs its browser — but NOT charged to the restart budget, so no
+      # number of them can ever raise the fatal sentinel and take the session
+      # down. See `_app_exit_is_clean` above for the rule and its cost.
+      if _app_exit_is_clean "$rc" "$uptime_ms"; then
+        if [ "$uptime_ms" -ge "$NEKO_APP_CLEAN_EXIT_HEALTHY_MS" ]; then
+          clean_streak=1
+        else
+          clean_streak=$((clean_streak + 1))
+        fi
+        # Integer maths only. `NEKO_APP_RESTART_DELAY` is a `sleep` argument
+        # and may legitimately be fractional ("0.5"), which bash arithmetic
+        # cannot multiply — and under `set -u` a failed arithmetic assignment
+        # would leave `clean_delay` unset and kill this supervisor outright.
+        # A non-integer delay simply gets no backoff.
+        local clean_delay="$NEKO_APP_RESTART_DELAY"
+        case "$NEKO_APP_RESTART_DELAY" in
+          ''|*[!0-9]*) : ;;
+          *)
+            clean_delay=$((NEKO_APP_RESTART_DELAY * clean_streak))
+            [ "$clean_delay" -gt "$NEKO_APP_CLEAN_RESTART_MAX_DELAY" ] \
+              && clean_delay="$NEKO_APP_CLEAN_RESTART_MAX_DELAY"
+            ;;
+        esac
+        log "app=$name exited rc=$rc after ${uptime_ms}ms — CLEAN exit (user-initiated quit): restarting in ${clean_delay}s, NOT charged to the restart budget (still $attempt/$max_restarts used, clean_streak=$clean_streak)"
+        emit_telemetry "container:neko#app_exit" "ok" "$uptime_ms"
+        sleep "$clean_delay"
+        continue
+      fi
+      log "app=$name exited rc=$rc after ${uptime_ms}ms — CRASH (non-zero status, or exited 0 inside the first ${NEKO_APP_CLEAN_EXIT_MIN_UPTIME_MS}ms): charged to the restart budget (attempt $((attempt + 1))/$((max_restarts + 1)))"
+      emit_telemetry "container:neko#app_exit" "error" "$uptime_ms"
       attempt=$((attempt + 1))
       if [ "$attempt" -gt "$max_restarts" ]; then
         log "app=$name PERMANENTLY FAILED after $attempt attempts — restart budget exhausted. Marking desktop unhealthy; neko/container will terminate (contract: no apparently-ready desktop with a dead mandatory app)."
