@@ -317,7 +317,7 @@ _kill_pgid() {
 # parentheses, so every parse here splits on the LAST ") ".
 _proc_state() {
   local line rest
-  read -r line <"/proc/${1}/stat" 2>/dev/null || return 1
+  read -r line 2>/dev/null <"/proc/${1}/stat" || return 1
   rest="${line##*) }"
   printf '%s' "${rest%% *}"
 }
@@ -383,7 +383,7 @@ _pgid_alive() {
   [ -n "${1:-}" ] || return 1
   for d in /proc/[0-9]*; do
     line=""
-    read -r line <"$d/stat" 2>/dev/null || continue
+    read -r line 2>/dev/null <"$d/stat" || continue
     rest="${line##*) }"
     state="${rest%% *}"
     [ "$state" = "Z" ] && continue
@@ -413,7 +413,7 @@ _pgid_member_matching() {
   [ -n "$pgid" ] || return 1
   for d in /proc/[0-9]*; do
     line=""
-    read -r line <"$d/stat" 2>/dev/null || continue
+    read -r line 2>/dev/null <"$d/stat" || continue
     rest="${line##*) }"
     state="${rest%% *}"
     [ "$state" = "Z" ] && continue
@@ -1089,16 +1089,35 @@ NEKO_APP_RESTART_DELAY="${NEKO_APP_RESTART_DELAY:-2}"
 declare -A APP_STATE=()   # starting|running|crashed|stopped|failed
 declare -A APP_RESTARTS=()
 
+# _app_pgid_for <name> — the process group id this boot recorded for one app,
+# or empty. Read from the file on every call rather than cached: supervise_app
+# rewrites it on every restart, so a cached value goes stale exactly when it
+# matters.
+_app_pgid_for() {
+  local f="${NEKO_APP_PGID_DIR}/${1}.pgid"
+  [ -f "$f" ] || return 0
+  tr -dc '0-9' <"$f" 2>/dev/null
+}
+
 write_health() {
   # Sanitized: only name/pid/state/restart-count per app — never command lines,
   # window titles, or URLs (which could contain workspace paths or page state).
+  #
+  # 🔴 `pid` is the APPLICATION's process-group leader — the browser, the
+  #    code-server — NOT the supervisor. It used to be the supervisor's, which
+  #    is a bash loop that stays alive precisely BECAUSE its app died, so the
+  #    field reported a live pid for a dead app. Measured in production:
+  #    `{"chromium":{"state":"running","pid":210,…}}` with pid 210 dead and the
+  #    screen black. The supervisor pid is still published, under its own
+  #    honest name, because teardown bookkeeping needs it.
   local body="{"
   local first=1
-  local name
+  local name pgid
   for name in "${!APP_STATE[@]}"; do
     [ "$first" -eq 1 ] || body+=","
     first=0
-    body+="\"${name}\":{\"state\":\"${APP_STATE[$name]}\",\"pid\":${APP_PID[$name]:-0},\"restarts\":${APP_RESTARTS[$name]:-0}}"
+    pgid="$(_app_pgid_for "$name")"
+    body+="\"${name}\":{\"state\":\"${APP_STATE[$name]}\",\"pid\":${pgid:-0},\"supervisor_pid\":${APP_PID[$name]:-0},\"restarts\":${APP_RESTARTS[$name]:-0}}"
   done
   body+="}"
   printf '%s\n' "$body" >"$NEKO_APP_HEALTH_FILE.tmp" && mv "$NEKO_APP_HEALTH_FILE.tmp" "$NEKO_APP_HEALTH_FILE"
@@ -1116,8 +1135,8 @@ write_health() {
 # reachable by ordinary use whether or not the button is there.)
 #
 # ── The rule ────────────────────────────────────────────────────────────────
-# An exit is CLEAN — and therefore NOT charged to the restart budget — when
-# BOTH hold:
+# An exit is CLEAN — and therefore not charged to the restart budget, up to the
+# loop bound described further down — when BOTH hold:
 #
 #   rc == 0                     the app chose to exit. A crash is a non-zero
 #                               status, and a signal death is 128+n, never 0.
@@ -1133,23 +1152,57 @@ write_health() {
 # still exhausts the budget and still fails the desktop closed. The budget is
 # NOT infinite and NOT larger than it was.
 #
-# ── What a clean exit costs ─────────────────────────────────────────────────
-# A clean exit is free forever, so an app that exits 0 after >=5s of uptime
-# restarts indefinitely rather than ever tripping the sentinel. That is the
-# intended trade (a browser the user closed must come back, not take the
-# session with it), but "indefinitely" needs a floor under it or a
-# pathological app could relaunch every ~7s for the life of the container. So
-# CONSECUTIVE clean exits back off LINEARLY (2s, 4s, 6s, … capped at 30s),
-# and the streak resets the moment an app manages a genuinely healthy run
-# (>=60s) — which is every real user-initiated quit, so a user who closes the
-# browser gets it back in the same 2s as always.
+# ── What a clean exit costs, and the loop it used to be unable to stop ─────
+# CONSECUTIVE clean exits back off LINEARLY (2s, 4s, 6s, … capped at 30s), and
+# the streak resets the moment an app manages a genuinely healthy run (>=60s)
+# — which is every real user-initiated quit, so a user who closes the browser
+# gets it back in the same 2s as always.
 #
-# These three are internal constants, deliberately NOT `${VAR:-…}`-overridable:
+# 🔴 That backoff was the ONLY floor, and a floor is not a bound. `attempt` is
+#    incremented on the crash branch alone, and the fatal sentinel — the only
+#    thing that can make the desktop fail closed — is reachable only from that
+#    branch. So an app that exits 0 after >=5s restarted FOREVER and could
+#    never fail closed, no matter how long it had been looping, while every
+#    gap between launches is a completely BLACK desktop: Xvfb is bare, openbox
+#    paints no root window, and code-server is not an X client, so Chrome's
+#    window is the only pixel source in the whole image. `phase=ready
+#    event=end status=ok` stood the entire time.
+#
+# ── The rule that fixes it, without undoing the one above ───────────────────
+# `clean_streak` already counts exactly the right thing: CONSECUTIVE clean
+# exits none of which managed a healthy run. One healthy run (>=60s) puts it
+# back to 1. So the loop signal is already computed — it just had nothing
+# attached to it. Now it does:
+#
+#   A clean exit is exempt from the restart budget for the first
+#   NEKO_APP_CLEAN_RESTART_MAX_STREAK consecutive short restarts. Past that,
+#   the app has failed six times running to stay up for even one minute, and
+#   the exit stops being read as "a user quit" and is CHARGED to the ordinary
+#   restart budget — the same budget, the same sentinel, the same teardown a
+#   crash-loop has always used. No second fatal path was added: the one place
+#   that raises the sentinel is still the crash branch, which is now simply
+#   REACHABLE from sustained clean-restart pressure.
+#
+# Why 6: it is the same generosity the crash path already gives (
+# NEKO_APP_MAX_RESTARTS=5, i.e. six attempts), and it costs a determined user
+# nothing — tripping it needs SEVEN consecutive quits in which the browser
+# never once stayed open a full minute. Six quits spread over a session, or
+# any number of quits with real use in between, are still free forever, which
+# is exactly what W4 was for.
+#
+# What it bounds (calculated from the constants, not measured): six free
+# restarts sleep 2+4+6+8+10+12 = 42s, then six charged restarts sleep 5×2 =
+# 10s before the sentinel — so at most twelve launches and ~52s of accumulated
+# black, with a LONGEST SINGLE gap of 12s instead of the 30s the backoff
+# formula caps at. Before this, both numbers were unbounded.
+#
+# These four are internal constants, deliberately NOT `${VAR:-…}`-overridable:
 # the browser-fix contract §2 fixes the set of environment variables and this
 # needs none of them.
 NEKO_APP_CLEAN_EXIT_MIN_UPTIME_MS=5000
 NEKO_APP_CLEAN_EXIT_HEALTHY_MS=60000
 NEKO_APP_CLEAN_RESTART_MAX_DELAY=30
+NEKO_APP_CLEAN_RESTART_MAX_STREAK=6
 
 # _app_exit_is_clean <rc> <uptime_ms> — the rule above, and nothing else.
 # Returns 0 (true) for a clean, user-initiated quit.
@@ -1212,15 +1265,25 @@ supervise_app() {
         break
       fi
       # 🔴 The user-initiated quit. Restarted like any other exit — the desktop
-      # still needs its browser — but NOT charged to the restart budget, so no
-      # number of them can ever raise the fatal sentinel and take the session
-      # down. See `_app_exit_is_clean` above for the rule and its cost.
+      # still needs its browser — and, for as long as it still looks like a
+      # user rather than a loop, NOT charged to the restart budget. See
+      # `_app_exit_is_clean` and NEKO_APP_CLEAN_RESTART_MAX_STREAK above for
+      # the rule, the loop bound, and what each costs.
+      #
+      # The streak is updated BEFORE the exemption is decided, and deliberately
+      # outside the `continue` below, so it keeps counting once the exemption
+      # has lapsed — otherwise the first charged exit would freeze the streak
+      # and a later healthy run could never reset it.
+      local clean_exit=0
       if _app_exit_is_clean "$rc" "$uptime_ms"; then
+        clean_exit=1
         if [ "$uptime_ms" -ge "$NEKO_APP_CLEAN_EXIT_HEALTHY_MS" ]; then
           clean_streak=1
         else
           clean_streak=$((clean_streak + 1))
         fi
+      fi
+      if [ "$clean_exit" -eq 1 ] && [ "$clean_streak" -le "$NEKO_APP_CLEAN_RESTART_MAX_STREAK" ]; then
         # Integer maths only. `NEKO_APP_RESTART_DELAY` is a `sleep` argument
         # and may legitimately be fractional ("0.5"), which bash arithmetic
         # cannot multiply — and under `set -u` a failed arithmetic assignment
@@ -1240,7 +1303,16 @@ supervise_app() {
         sleep "$clean_delay"
         continue
       fi
-      log "app=$name exited rc=$rc after ${uptime_ms}ms — CRASH (non-zero status, or exited 0 inside the first ${NEKO_APP_CLEAN_EXIT_MIN_UPTIME_MS}ms): charged to the restart budget (attempt $((attempt + 1))/$((max_restarts + 1)))"
+      if [ "$clean_exit" -eq 1 ]; then
+        # Clean status, but the ${clean_streak}th consecutive restart without a
+        # single healthy run. That is a restart LOOP, not a person: charged to
+        # the ordinary restart budget from here on, so the sentinel below is
+        # reachable and the desktop can finally fail closed instead of
+        # flickering black under `ready ok` for the life of the container.
+        log "app=$name exited rc=$rc after ${uptime_ms}ms — CLEAN status but the ${clean_streak}th consecutive restart with no healthy run (>=${NEKO_APP_CLEAN_EXIT_HEALTHY_MS}ms), past the ${NEKO_APP_CLEAN_RESTART_MAX_STREAK}-restart loop bound: treated as a RESTART LOOP, charged to the restart budget (attempt $((attempt + 1))/$((max_restarts + 1)))"
+      else
+        log "app=$name exited rc=$rc after ${uptime_ms}ms — CRASH (non-zero status, or exited 0 inside the first ${NEKO_APP_CLEAN_EXIT_MIN_UPTIME_MS}ms): charged to the restart budget (attempt $((attempt + 1))/$((max_restarts + 1)))"
+      fi
       emit_telemetry "container:neko#app_exit" "error" "$uptime_ms"
       attempt=$((attempt + 1))
       if [ "$attempt" -gt "$max_restarts" ]; then
@@ -1329,21 +1401,41 @@ reclaim_stale_app() {
   fi
 }
 
-# Background monitor: periodically re-checks liveness (by supervisor subshell
-# pid, since the supervisor itself only exits once retries are exhausted) and
-# refreshes the sanitized health file. Runs for the lifetime of this script.
+# Background monitor: periodically re-checks liveness and refreshes the
+# sanitized health file. Runs for the lifetime of this script.
+#
+# 🔴 Liveness is the APPLICATION's, read from the process group this boot
+#    recorded for it — not the supervisor subshell's pid. Checking the
+#    supervisor is checking the wrong process by construction: the supervisor
+#    is a bash restart loop that is alive precisely WHILE its app is dead and
+#    only exits once the budget is exhausted, so "supervisor alive" is
+#    ~"the app is dead or the app is fine" and the health file said `running`
+#    either way. Measured in production during the black-screen incident:
+#    `{"chromium":{"state":"running","pid":210,…}}` with pid 210 long dead.
+#
+#    Three states now, and they are distinguishable, which is the point:
+#      running    — a live member of the app's recorded process group exists.
+#      restarting — no live app, but its supervisor is still there, i.e. the
+#                   app is inside a restart backoff. THIS is what a black
+#                   desktop looks like from the health file, and it used to be
+#                   indistinguishable from "running".
+#      stopped    — neither. Nothing is coming back on its own.
+#      failed     — the restart budget was exhausted (fatal sentinel). Pinned,
+#                   so the health file never regresses a dead mandatory app
+#                   back to a benign "stopped".
 monitor_apps() {
   while true; do
-    local name
+    local name pgid
     for name in "${!APP_PID[@]}"; do
-      # A permanently-failed app (restart budget exhausted) is recorded in the
-      # fatal sentinel by its supervisor; keep it pinned to "failed" so the
-      # health file never regresses a dead mandatory app back to a benign
-      # "stopped".
       if [ -f "$NEKO_APP_FATAL_SENTINEL" ] && grep -qx "$name" "$NEKO_APP_FATAL_SENTINEL" 2>/dev/null; then
         APP_STATE[$name]="failed"
-      elif _pid_alive "${APP_PID[$name]}"; then
+        continue
+      fi
+      pgid="$(_app_pgid_for "$name")"
+      if [ -n "$pgid" ] && _pgid_alive "$pgid"; then
         APP_STATE[$name]="running"
+      elif _pid_alive "${APP_PID[$name]}"; then
+        APP_STATE[$name]="restarting"
       else
         APP_STATE[$name]="stopped"
       fi
@@ -1896,14 +1988,108 @@ verify_browser_frame() {
 # way to guarantee that. Everything about the format above still applies.
 NEKO_WINDOW_READY_TIMEOUT="${NEKO_WINDOW_READY_TIMEOUT:-60}"
 
+# ── What "the window is there" has to mean ──────────────────────────────────
+# 🔴 This gate used to be one line: grep `wmctrl -x -l` for a class substring.
+#    Everything that made it worth trusting was missing from it.
+#
+#    * It proved nothing about the window being ON SCREEN. `wmctrl` lists what
+#      is in `_NET_CLIENT_LIST`, and an ICONIFIED window stays in that list
+#      while it is unmapped and painting nothing. Measured in the image:
+#      `xwininfo -id <id>` on an unmapped browser window reads
+#      `Map State: IsUnMapped`, and the root framebuffer reads
+#      max=0 across every sampled pixel — a completely black desktop — while
+#      the class string was still exactly what the old check wanted.
+#    * It proved nothing about WHOSE window it was. The documented production
+#      failure is an orphan from a PREVIOUS boot of the same container
+#      supplying the WM_CLASS while this boot's real Chrome is still failing
+#      behind it (see the stale-boot reclaim block above, which exists because
+#      that already cost a container). A substring match cannot tell the two
+#      apart. A pid can: Chrome sets `_NET_WM_PID`, and this script records
+#      the process GROUP of every app it launches, so "is this window's owner
+#      a member of a process group THIS boot started?" is answerable exactly,
+#      with no name matching and no pattern over the process table.
+#
+# So a window now counts as ready only when all three hold:
+#   1. its WM_CLASS matches the requested class (as before);
+#   2. `xwininfo -id` reports `Map State: IsViewable` — mapped, and not
+#      obscured behind an unmapped ancestor;
+#   3. its `_NET_WM_PID` is a live member of one of this boot's recorded app
+#      process groups.
+# Anything that fails (2) or (3) is reported by id in the log, so a gate
+# timeout says WHICH of the three it got to rather than just "not ready".
+#
+# `xwininfo` and `xprop` are both in the image (`x11-utils`, installed
+# alongside `xdotool`/`wmctrl` in the Dockerfile) — they are not new
+# dependencies, and their absence fails this gate closed like `wmctrl`'s does.
+
+# _window_ids_for_class <class_re> — every managed top-level window id whose
+# WM_CLASS field matches. Column 1 of `wmctrl -x -l` is the id; column 3 is the
+# class. (The class can itself contain spaces — Chrome's is
+# `google-chrome (/tmp/chromium-app-data).Google-chrome` — so only column 1 is
+# safe to slice, which is exactly what this needs.)
+_window_ids_for_class() {
+  wmctrl -x -l 2>/dev/null | awk -v re="$1" 'tolower($3) ~ tolower(re){print $1}'
+}
+
+# _window_is_viewable <wid> — true only for `Map State: IsViewable`. Matched
+# POSITIVELY: the unmapped spelling X actually prints is `IsUnMapped` (capital
+# M), and a negative match on a guessed spelling is how a gate silently stops
+# gating.
+_window_is_viewable() {
+  xwininfo -id "$1" 2>/dev/null | grep -q 'Map State: IsViewable'
+}
+
+# _window_pid <wid> — the window's `_NET_WM_PID`, or empty when it has none.
+_window_pid() {
+  xprop -id "$1" _NET_WM_PID 2>/dev/null \
+    | sed -n 's/.*_NET_WM_PID(CARDINAL) = \([0-9][0-9]*\).*/\1/p' | head -1
+}
+
+# _pid_in_this_boot <pid> — true when that pid is a LIVE member of one of the
+# process groups this boot recorded in $NEKO_APP_PGID_DIR. The pgid files are
+# written by supervise_app and cleared by reclaim_stale_app/terminate_stack, so
+# by the time this gate runs they name this boot's apps and nothing else.
+_pid_in_this_boot() {
+  local pid="${1:-}" line rest state pgrp p
+  [ -n "$pid" ] || return 1
+  read -r line 2>/dev/null <"/proc/$pid/stat" || return 1
+  rest="${line##*) }"
+  state="${rest%% *}"
+  [ "$state" = "Z" ] && return 1
+  pgrp="${rest#* }"
+  pgrp="${pgrp#* }"
+  pgrp="${pgrp%% *}"
+  for p in $(_app_pgids); do
+    [ "$p" = "$pgrp" ] && return 0
+  done
+  return 1
+}
+
 wait_for_window() {
   local class_re="$1" tries="$2"
+  local wid wpid why last_why=""
   for _ in $(seq 1 "$tries"); do
-    if wmctrl -x -l 2>/dev/null | awk -v re="$class_re" 'tolower($3) ~ tolower(re){found=1} END{exit found?0:1}'; then
+    why="no window of class /${class_re}/ is listed at all"
+    for wid in $(_window_ids_for_class "$class_re"); do
+      if ! _window_is_viewable "$wid"; then
+        why="window ${wid} matches /${class_re}/ but is NOT viewable (iconified or unmapped — it paints no pixels)"
+        continue
+      fi
+      wpid="$(_window_pid "$wid")"
+      if [ -z "$wpid" ]; then
+        why="window ${wid} is viewable but publishes no _NET_WM_PID, so it cannot be attributed to this boot"
+        continue
+      fi
+      if ! _pid_in_this_boot "$wpid"; then
+        why="window ${wid} is viewable but its owner pid ${wpid} is not in any process group THIS boot started — it belongs to an earlier boot of this container"
+        continue
+      fi
       return 0
-    fi
+    done
+    last_why="$why"
     sleep 1
   done
+  log "window gate: /${class_re}/ never became ready — last reason: ${last_why:-$why}"
   return 1
 }
 
@@ -1934,11 +2120,13 @@ wait_for_app_ready() {
 }
 
 phase_start window_ready_gate
-if ! command -v wmctrl >/dev/null 2>&1; then
-  log "ERROR: wmctrl not installed — cannot verify mandatory app windows before reporting readiness. Failing closed."
-  phase_end window_ready_gate error
-  exit 1
-fi
+for _need in wmctrl xwininfo xprop; do
+  if ! command -v "$_need" >/dev/null 2>&1; then
+    log "ERROR: ${_need} not installed — cannot verify that a mandatory app window is mapped, viewable and owned by this boot before reporting readiness. Failing closed."
+    phase_end window_ready_gate error
+    exit 1
+  fi
+done
 
 # Every app in EZIL_DESKTOP_APPS is polled CONCURRENTLY (not sequentially) —
 # each gets its own full ${NEKO_WINDOW_READY_TIMEOUT}s budget in parallel, so
@@ -1979,7 +2167,140 @@ if [ "$gate_ok" -ne 1 ]; then
   exit 1
 fi
 
-log "window-ready gate passed: all mandatory apps present (${DESKTOP_APP_SPECS[*]%%:*})"
+log "window-ready gate passed: all mandatory apps present, mapped and owned by this boot (${DESKTOP_APP_SPECS[*]%%:*})"
+
+# ── The last gate: at least one lit pixel ───────────────────────────────────
+# Every check above this line is about PROCESSES and WINDOWS. The thing the
+# user actually receives is a picture, and the production failure was a
+# completely black one served under `phase=ready event=end status=ok`. Nothing
+# in this image paints the root window — Xvfb is bare, openbox draws no
+# desktop, code-server is not an X client — so the framebuffer is black if and
+# only if no application window is painting into it. That makes "is any pixel
+# non-zero?" the single strongest statement this script can make about the
+# desktop it is about to declare ready, and it is the one statement the old
+# boot never made.
+#
+# Read directly from the X server with XGetImage via ctypes — the same path
+# neko's own `/api/room/screen/shot.jpg` uses, but available HERE, before neko
+# is started and therefore before anything has reported ready. No new package:
+# python3 and libX11 are both already in the image, and neither `xwd` nor
+# ImageMagick is (checked in the running image, which is why this is not a
+# `import -window root` one-liner).
+#
+# COST, measured in the image rather than estimated: 39ms for a full-screen
+# grab plus a 16px-step sample grid (3600 samples at 1280x720). A healthy boot
+# pays that once and passes on the first try.
+#
+# FAILING is deliberately the most conservative statement available: not "the
+# picture is dark", not a mean-luma threshold, but "every one of thousands of
+# sampled pixels across the whole screen is exactly zero in all three
+# channels". Nothing that is rendering anything at all — dark theme, splash,
+# a half-painted page — can produce that. The retry budget exists because a
+# window that has JUST mapped may not have painted yet; the gate passes on the
+# first non-black sample.
+NEKO_SCREEN_PIXEL_TRIES=15
+
+# _screen_has_pixels — 0 = at least one non-black pixel; 1 = provably all
+# black; 2 = could not look (no python3, no libX11, or no reachable display).
+# The three are kept distinct on purpose: "I could not look" must never be
+# logged, or acted on, as "I looked and it was fine".
+_screen_has_pixels() {
+  command -v python3 >/dev/null 2>&1 || return 2
+  python3 - <<'EZIL_PIXEL_PROBE'
+import ctypes, ctypes.util, sys
+
+try:
+    x = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+except OSError:
+    sys.exit(2)
+
+class XImage(ctypes.Structure):
+    _fields_ = [("width", ctypes.c_int), ("height", ctypes.c_int),
+                ("xoffset", ctypes.c_int), ("format", ctypes.c_int),
+                ("data", ctypes.c_void_p), ("byte_order", ctypes.c_int),
+                ("bitmap_unit", ctypes.c_int), ("bitmap_bit_order", ctypes.c_int),
+                ("bitmap_pad", ctypes.c_int), ("depth", ctypes.c_int),
+                ("bytes_per_line", ctypes.c_int), ("bits_per_pixel", ctypes.c_int)]
+
+x.XOpenDisplay.restype = ctypes.c_void_p
+x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+x.XDefaultRootWindow.restype = ctypes.c_ulong
+x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+x.XDefaultScreen.restype = ctypes.c_int
+x.XDefaultScreen.argtypes = [ctypes.c_void_p]
+x.XDisplayWidth.restype = ctypes.c_int
+x.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+x.XDisplayHeight.restype = ctypes.c_int
+x.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+x.XGetImage.restype = ctypes.POINTER(XImage)
+x.XGetImage.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                        ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
+                        ctypes.c_ulong, ctypes.c_int]
+
+# "Could not look" — an unreachable display is NOT evidence about pixels.
+display = x.XOpenDisplay(None)
+if not display:
+    sys.exit(2)
+screen = x.XDefaultScreen(display)
+# The framebuffer Xvfb was started with can be larger than the screen neko
+# applies via RANDR; grab the SCREEN, which is what is streamed.
+w = x.XDisplayWidth(display, screen)
+h = x.XDisplayHeight(display, screen)
+if w <= 0 or h <= 0:
+    sys.exit(2)
+image = x.XGetImage(display, x.XDefaultRootWindow(display), 0, 0, w, h,
+                    0xFFFFFFFF, 2)  # AllPlanes, ZPixmap
+if not image:
+    sys.exit(2)
+im = image.contents
+stride, pixel_bytes = im.bytes_per_line, max(1, im.bits_per_pixel // 8)
+buf = ctypes.string_at(im.data, stride * im.height)
+
+step = 16
+lit = 0
+total = 0
+peak = 0
+for row in range(0, im.height, step):
+    base = row * stride
+    for col in range(0, im.width, step):
+        off = base + col * pixel_bytes
+        if off + 2 >= len(buf):
+            continue
+        value = buf[off] | buf[off + 1] | buf[off + 2]
+        total += 1
+        if value:
+            lit += 1
+            if value > peak:
+                peak = value
+
+sys.stderr.write("pixels=%dx%d samples=%d lit=%d peak=%d\n" % (im.width, im.height, total, lit, peak))
+sys.exit(0 if lit else 1)
+EZIL_PIXEL_PROBE
+}
+
+pixel_try=0
+pixel_rc=2
+while [ "$pixel_try" -lt "$NEKO_SCREEN_PIXEL_TRIES" ]; do
+  _screen_has_pixels 2>>"$LOG"
+  pixel_rc=$?
+  [ "$pixel_rc" -eq 1 ] || break
+  pixel_try=$((pixel_try + 1))
+  sleep 1
+done
+case "$pixel_rc" in
+  0)
+    log "screen-pixel gate passed: the X framebuffer is painting (a non-black pixel was read directly from the root window; ${pixel_try} retries were needed)"
+    ;;
+  1)
+    log "ERROR: every sampled pixel of the X framebuffer is BLACK after ${NEKO_SCREEN_PIXEL_TRIES}s, even though a mandatory app window is mapped and viewable. Nothing in this image paints the root window, so a black framebuffer means no application is painting — refusing to report Neko readiness or start neko serve rather than serving a black desktop under 'ready ok'."
+    phase_end window_ready_gate error
+    exit 1
+    ;;
+  *)
+    log "warning: screen-pixel gate SKIPPED — could not read the framebuffer (no python3, no libX11, or DISPLAY ${DISPLAY} not reachable from this process). This boot has NOT been checked for a black picture; the window checks above are all that ran."
+    ;;
+esac
+
 phase_end window_ready_gate ok
 
 # The browser window is only guaranteed to exist once the gate above has seen
