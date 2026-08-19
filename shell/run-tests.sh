@@ -312,6 +312,42 @@ run_suite "shell/ezil/apps/resize-test.mjs"                        420 node "$HE
 run_suite "shell/ezil/apps/mobile-browser-test.mjs"                420 node "$HERE/ezil/apps/mobile-browser-test.mjs"
 # W5's touch-focus suite (26 checks, needs playwright, exits 2 on skip).
 # Registered here on W5's request; not this file's to edit.
+# 🔴 KNOWN RED ON THE INTEGRATION BRANCH — AN UNRESOLVED INTENT CONFLICT
+# BETWEEN W5 AND W7, ESCALATED TO THE COORDINATOR, NOT DECIDED HERE.
+#
+# MEASURED, both ways, 2026-08-19:
+#   - on W5's own branch (`worktree-agent-a9d7b0a0cced664dc`):  26/26 PASS
+#   - on the merged integration branch:                          9/24, then an
+#     uncaught `waitForSelector` timeout in GROUP 5
+#
+# WHY. This suite runs the only browser context in the repo with
+# `hasTouch: true` at 390x844 — and it uses a DESKTOP user agent. Under W5
+# alone that context was `device-desktop`, because detection was UA-only. W7
+# (contract §7.3) deliberately widened detection to coarse pointer + viewport
+# width, so the SAME context is now `device-phone`, and W7's phone layout
+# applies to it for the first time: every app-bearing window goes full-bleed
+# and loses its resize handles. W5's suite opens two probe windows side by side
+# and taps each one; on a full-bleed layout both cover the whole screen, so a
+# tap aimed at probe-a lands on probe-b, and nothing W5 asserts can be true.
+#   `winClasses: "... ezil-fullbleed"`, `hit: "IFRAME.window-app-iframe"` —
+#   from the GROUP 5 failure line, i.e. the drawer tongue is occluded by
+#   another window's iframe.
+#
+# NOT the pre-existing `.device-phone .window { z-index: 9999999 !important }`
+# landmine, which that widened detection also arms for the first time. That was
+# tested directly: neutralising the rule moved the reported z-indexes (9999999
+# -> 3, 11) and changed nothing else. It is worth a look on its own, but it is
+# not what makes this suite red.
+#
+# The conflict is in INTENT, not in text, which is why integration did not pick
+# a side. The two assertions cannot both hold in one context:
+#   W5: "a single TAP on a buried window's resize handle raises it"
+#   W7: "a WINDOWED phone window has no live resize handles — the screen edge
+#        is not a drag target"   (`apps/mobile-browser-test.mjs`, PASSING)
+# The likely resolution is that W5's suite should pin `device-desktop` (it is
+# testing touch FOCUS, not phone layout) while W7 keeps owning what a phone
+# window looks like — but that changes the meaning of W5's acceptance criteria
+# and is the coordinator's call, not integration's.
 run_suite "shell/touch-focus-browser-test.mjs"                     420 node "$HERE/touch-focus-browser-test.mjs"
 echo
 
