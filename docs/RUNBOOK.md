@@ -341,6 +341,90 @@ reads **`mean 0.000 / max 0 / nonzeroFrac 0.0000`** — the exact production
 signature — while `phase=ready event=end status=ok` still stands in `/tmp/neko.log`
 and `GET /api/room/screen` still answers `1920x1080@60`.
 
+### ✅ What actually removed the Chrome window in production — found and fixed 2026-08-19
+
+**A second `startProcess` into a healthy container tore down the live boot's
+apps.** Reproduced in a container against the deployed image
+`ezil-os-worker-sandbox:50f3518f` (fleet v15), first attempt, 100 % of the time.
+
+`ensureDesktop` (`worker/src/index.ts`) re-issues
+`startProcess("DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh")` whenever
+`getExposedPorts()` does not list 8181. In neko mode `start-desktop.sh` `exec`s
+`start-neko.sh` with **no idempotency check of its own** (the `wait_tcp 8080`
+no-op at the top of that file is the guacamole branch and is never reached), so
+that second invocation runs the real boot script. It hits `start-neko.sh`'s own
+check — `neko already serving on 127.0.0.1:8181 — nothing to do` — and `exit 0`s
+in ~10 ms having started nothing.
+
+Its **EXIT trap still ran `terminate_stack`**. That function's emptiness guard
+tests three *shell* variables (`NEKO_PID`, `APP_PID`, `SESSION_PID` — all
+correctly empty in a process that started nothing) and one **file-backed** list,
+`_app_pgids`, which globbed `$NEKO_APP_PGID_DIR`. That directory is
+*deliberately* cross-boot — its whole purpose is to let `reclaim_stale_app` prove
+it owns a straggler from an **earlier** boot — so it was never empty. The no-op
+boot therefore sailed past the guard and:
+
+1. wrote `/tmp/neko-shutdown`, the **shared** flag every supervisor reads as
+   "stop restarting", so the live boot's supervisors gave up permanently;
+2. SIGTERM'd the live boot's Chrome **and** code-server process groups;
+3. deleted their ownership records.
+
+What it did **not** touch: `Xvfb`, `openbox`, and `neko serve` — those live in
+the *first* boot's shell variables, which the second process does not have. So
+the X display stays up, neko keeps answering on 8181, and every health signal
+the product owns keeps saying the desktop is fine.
+
+Measured, one invocation, same container:
+
+| | before | after |
+| --- | --- | --- |
+| `GET /api/room/screen/shot.jpg` | `mean 34.664 / max 255 / nonzero 1.0000` | **`mean 0.000 / max 0 / nonzero 0.0000`** |
+| `127.0.0.1:8443` | LISTENING | **DEAD** |
+| mapped X windows | `0x00400003 … Google-chrome` | **none** |
+| `GET /api/room/screen` | `1920x1080@60` | `1920x1080@60` (unchanged) |
+| `/tmp/neko-app-health.json` | both `running` | both `stopped`, permanently |
+
+`+37701ms app=codeserver exited rc=0 during teardown — not restarting` /
+`+37729ms app=chromium exited rc=0 during teardown — not restarting` in
+`/tmp/neko.log` is the fingerprint to grep for.
+
+**Why production and not local.** Local opens one desktop, once. Production
+issues that second `startProcess` routinely:
+
+- `SANDBOX_WAKE_ANSWER_BUDGET_MS = 12_000`
+  (`app/src/server/lib/cloudflare-guacamole-provider.ts`) races each Worker call
+  against a 12 s budget and answers `sandbox_starting` **without aborting it**;
+  the shell then re-asks every `WAKE_REASK_MS = 1_500` up to the 215 s deadline —
+  its own comment budgets ~16 asks. A cold boot is p50 ~11 s / p90 19 s / max
+  28 s (`docs/PERFORMANCE-BASELINE.md` §1.4), so re-asks reliably land **after**
+  neko binds and **before** `ensureDesktop` exposes the port.
+- `restartDesktopStack` sets `stopConfirmed = true` when
+  `findDesktopLauncherProcess` finds no launcher, then unexposes every port and
+  relaunches — straight into the same window.
+- `previewUrl`, `appPreviewUrl` and `codePreviewUrl` are three procedures on the
+  same `/sandbox/preview` route and the same sandbox id, with no coalescing at
+  any layer.
+
+**The fix** (`worker/scripts/start-neko.sh`): `_app_pgids` now selects by
+`${!APP_PID[@]}` — the apps *this* process supervises — instead of globbing the
+cross-boot directory; the shutdown flag is written only when this boot has
+supervisors to stop; and teardown removes only its own ownership records. A boot
+that started nothing is now the true no-op `terminate_stack`'s own comment always
+claimed it was. Regression test:
+`worker/src/neko-teardown-orphans.test.ts` → *"a boot that starts nothing must
+not tear down the one that did"* (mutation-proved red against the old
+`_app_pgids`).
+
+🔴 **Still open, and not fixed here: the trigger itself.** Nothing coalesces
+concurrent mints, so two boots can still both get past the 8181 check and fight
+— `reclaim_stale_app` cannot tell a *stale* previous boot from a *live*
+concurrent one, and will kill a healthy sibling's apps. With this fix the loser's
+EXIT trap no longer makes that permanent (the survivor's supervisors restart the
+apps), but the right fix is a real in-container boot mutex, or single-flight on
+`ensureDesktop` inside the DO — the same shape as
+`EzilSandboxDO.restartDesktopStack`'s `restartInProgress`, which the preview path
+has no equivalent of.
+
 ### Why nothing catches it
 
 | check | what it actually proves |
