@@ -34,8 +34,15 @@
  * `telemetry.test.ts` pins the absence in both directions.
  *
  * ── KNOWN GAP, stated so nobody "fixes" it by putting the leak back ─────────
- * 🔴 Nothing drains `ezil-telemetry-spool` yet. These objects are written and
- * never read. Whoever writes the drainer must run each line through the app's
+ * 🔴 CORRECTED 2026-08-19: the drainer now exists
+ * (`app/src/server/telemetry/spool-drain.ts`, invoked from
+ * `/api/cron/telemetry-maintenance`), but as of that date it had never once
+ * run in production — 173 objects had accumulated in `ezil-telemetry-spool`
+ * since the day the bucket was created and ZERO rows with `source` of
+ * `worker`/`container` had ever reached Postgres. The cause was the cron, not
+ * this module. Until a post-deploy run is confirmed, treat this producer as
+ * UNPROVEN end to end. The rules below still bind whoever touches the drainer:
+ * it must run each line through the app's
  * `parseTelemetryBatch` (which is `.strict()` and drops an event whole on any
  * failure) rather than inserting it directly, and must NOT reintroduce a
  * per-computer field until a real `ezil_computers.id` UUID is plumbed down to
@@ -174,6 +181,211 @@ function mintEventId(): string {
 }
 
 /**
+ * ── Deterministic ids for CONTAINER lines, and why they are not random ──────
+ *
+ * 🔴 THE BUG THIS FIXES. `drainContainerBootTelemetry` (`./index.ts`) runs
+ * `tail -c 65536` over `/var/log/ezil-telemetry.ndjson` and NEVER truncates
+ * it, and it runs after EVERY `ensureDesktop` — the warm/`already_exposed`
+ * path included. So the second, third and n-th preview request of a
+ * container's life re-read every line the first one already shipped. With a
+ * fresh `crypto.randomUUID()` per parse each re-read minted a NEW `eventId`,
+ * and the app's only defence against duplicates is `ingestBatch`'s
+ * `ON CONFLICT DO NOTHING` on exactly that column — so one physical boot phase
+ * would land as N rows, N growing with how often the user opened the desktop.
+ * Nobody has seen it yet only because the drain itself has never once run; it
+ * would have appeared with the first successful drain, as inflated
+ * boot-phase counts that no query could tell apart from real ones.
+ *
+ * The identity of a container line is therefore derived from WHERE the line
+ * is, not from when it happened to be read:
+ *
+ *     source | sandboxId | log inode | absolute byte offset | the line itself
+ *
+ * Each component earns its place:
+ *   - `sandboxId` — stable per (user, computer). Without it, two different
+ *     containers whose logs happened to agree byte-for-byte would collapse
+ *     into one another. It is the component that makes a CROSS-USER collision
+ *     impossible, so when it is absent this function is not used at all (see
+ *     `parseContainerTelemetryLines`): a duplicate row is a far cheaper
+ *     failure than one user's event being swallowed by another's.
+ *   - log inode — a restarted container gets a brand-new file (its filesystem
+ *     comes from the image), so a differing inode separates two instances that
+ *     would otherwise write identical bytes at identical offsets. `0` when the
+ *     container's `stat` could not supply it, which degrades to the
+ *     offset-only identity rather than breaking it.
+ *   - absolute byte offset — the discriminator WITHIN one file. Boot phases
+ *     repeat verbatim (`"code":"skipped","outcome":"skipped","durationMs":0`
+ *     is emitted identically on every relaunch), so content alone would
+ *     silently merge two genuinely distinct events. It is measured from the
+ *     START of the file, not from the start of the tail window, precisely so
+ *     it does not move when the file grows.
+ *
+ * 🔴 RESIDUAL FAILURE MODE, stated rather than discovered later: this is a
+ * dedupe key, so its only way to be wrong is to say "same" about two genuinely
+ * different events — and the ingest path then drops the second one for good.
+ * That needs a later container instance, for the same computer, to be handed
+ * the same inode number AND to write a byte-identical log prefix (every
+ * preceding phase's millisecond duration identical, digit for digit) AND to
+ * write the same line at the same offset. Millisecond durations make that
+ * essentially unreachable past the first line or two, and the cost when it
+ * does happen is one lost boot-phase row — not a lost boot, and never a wrong
+ * one. The alternatives fail in kind rather than in degree:
+ * truncate-after-read loses every line written between the read and the
+ * truncate (a live `container:neko#app_exit`, say) and loses the whole tail
+ * whenever the R2 PUT that follows fails, which it does silently because that
+ * PUT is `waitUntil`-ed and never awaited; a persisted read offset needs
+ * durable per-sandbox state the Worker does not have, and loses exactly the
+ * same lines on a crash.
+ *
+ * The digest is a synchronous FNV-1a-64 pair with splitmix64 finalisation
+ * rather than SHA-256 because `parseContainerTelemetryLines` is synchronous
+ * and `crypto.subtle` is not; 128 well-mixed bits is far more than a dedupe
+ * key over a few thousand lines per container needs. The output is shaped as
+ * a UUID because `ezil_error_events.event_id` is a `uuid` column and the app's
+ * zod schema is `z.string().uuid()` — a non-UUID id would not dedupe anything,
+ * it would drop 100% of container events at the validator.
+ */
+const FNV64_PRIME = 0x100000001b3n;
+const U64 = 0xffffffffffffffffn;
+const ID_ENCODER = new TextEncoder();
+
+function fnv1a64(input: string, basis: bigint): bigint {
+  let h = basis;
+  for (const b of ID_ENCODER.encode(input)) {
+    h = ((h ^ BigInt(b)) * FNV64_PRIME) & U64;
+  }
+  return h;
+}
+
+/** splitmix64's finaliser. FNV-1a's avalanche is poor in the high bits; this fixes it. */
+function mix64(x: bigint): bigint {
+  let z = x & U64;
+  z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & U64;
+  z = ((z ^ (z >> 27n)) * 0x94d049bb133111ebn) & U64;
+  return (z ^ (z >> 31n)) & U64;
+}
+
+/**
+ * A UUID-shaped 128-bit digest of `parts`, stable for all time given the same
+ * parts. Parts are joined with a byte that cannot occur inside any of them, so
+ * no part boundary can be forged by content.
+ *
+ * Exported for `telemetry.test.ts`, which pins both directions: same parts ->
+ * same id, any part different -> different id.
+ */
+export function stableTelemetryEventId(parts: readonly string[]): string {
+  const s = parts.join('\u0000');
+  const hi = mix64(fnv1a64(s, 0xcbf29ce484222325n));
+  const lo = mix64(fnv1a64(s, 0x9e3779b97f4a7c15n));
+  const hex = hi.toString(16).padStart(16, '0') + lo.toString(16).padStart(16, '0');
+  // RFC-4122 layout: version nibble 5 (name-based, which is exactly what this
+  // is whatever the digest), variant nibble forced into 8..b. Zod's `.uuid()`
+  // accepts the shape and Postgres stores it in a `uuid` column.
+  const variant = ((parseInt(hex[16] as string, 16) & 0x3) | 0x8).toString(16);
+  return (
+    `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-` +
+    `${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`
+  );
+}
+
+/** Byte length of a string as it sits in the container's NDJSON file. */
+function byteLen(s: string): number {
+  return ID_ENCODER.encode(s).length;
+}
+
+/**
+ * ── Reading the container's NDJSON sidecar ──────────────────────────────────
+ * Pure command-builder + parser pair, in this module rather than in
+ * `./index.ts` for the same reason `./neko-logs.ts` and `./cpu-diag.ts` are:
+ * the shell text and the arithmetic over its output are the parts that go
+ * silently wrong, and they must be testable without the Workers runtime.
+ */
+
+/**
+ * Sentinel opening the ONE metadata line {@link containerTelemetryTailCommand}
+ * prints before the tail. It is `printf`-ed by the command this Worker builds,
+ * never by the log itself, and every NDJSON line the container writes begins
+ * with `{` — so log content cannot forge it.
+ */
+export const CONTAINER_TELEMETRY_META_PREFIX = 'ezil-telemetry-meta';
+
+/** What one read of the container's NDJSON sidecar yielded. */
+export interface ContainerTelemetryTail {
+  /** The raw NDJSON tail. `''` when the file is missing or unreadable. */
+  raw: string;
+  /**
+   * Absolute byte offset in the container's file at which `raw` begins, or
+   * `undefined` when the container did not report a usable size — in which
+   * case the parser falls back to random ids (a duplicate, never a loss).
+   * Feeds `ContainerTelemetryContext.tailStartByteOffset`.
+   */
+  startByteOffset?: number;
+  /** The file's inode as a decimal string; `'0'` when unavailable. */
+  inode: string;
+}
+
+/**
+ * Read the file's size and inode, then a bounded tail of it — in ONE exec, so
+ * the size and the bytes cannot disagree about a file that is being appended
+ * to underneath us by more than the append itself.
+ *
+ * The size and inode are what make every line's identity stable across the
+ * re-reads this command performs on every single boot; see
+ * {@link stableTelemetryEventId} for the duplicate-row bug that makes them
+ * load-bearing rather than decorative. `wc`/`stat` failures degrade to `0`
+ * rather than failing the read, matching `emit_telemetry()`'s own `|| true`
+ * discipline on the write side.
+ */
+export function containerTelemetryTailCommand(path: string, maxBytes: number): string {
+  const bytes = Math.max(1, Math.floor(maxBytes));
+  return (
+    `printf '${CONTAINER_TELEMETRY_META_PREFIX} bytes=%s inode=%s\\n' ` +
+    `"$({ wc -c < '${path}'; } 2>/dev/null || echo 0)" ` +
+    `"$({ stat -c %i '${path}'; } 2>/dev/null || echo 0)"; ` +
+    `{ tail -c ${bytes} '${path}'; } 2>/dev/null || true`
+  );
+}
+
+const CONTAINER_TELEMETRY_META_RE = new RegExp(
+  `^${CONTAINER_TELEMETRY_META_PREFIX} bytes=(\\d+) inode=(\\d+)\\s*$`,
+);
+
+/**
+ * Split {@link containerTelemetryTailCommand}'s stdout into its metadata line
+ * and the NDJSON tail, and derive the tail's absolute start offset from the
+ * reported file size.
+ *
+ * When the metadata line is absent or unparseable — an older container image,
+ * a shell without `stat`, a `wc` that padded its output unexpectedly — the
+ * WHOLE stdout is treated as the tail and no offset is reported. That degrade
+ * is deliberate and is the safe direction: no offset means random event ids
+ * means a re-read costs a duplicate row, whereas a WRONG offset would mean a
+ * wrong identity, and a wrong identity is how a real event gets silently
+ * swallowed by an unrelated one.
+ */
+export function parseContainerTelemetryTail(stdout: string | null | undefined): ContainerTelemetryTail {
+  const text = stdout ?? '';
+  const newline = text.indexOf('\n');
+  const head = newline === -1 ? text : text.slice(0, newline);
+  const meta = CONTAINER_TELEMETRY_META_RE.exec(head.trim());
+  if (!meta) return { raw: text, inode: '0' };
+
+  const raw = newline === -1 ? '' : text.slice(newline + 1);
+  const totalBytes = Number(meta[1]);
+  const inode = meta[2] ?? '0';
+  // `raw` is the LAST `min(totalBytes, maxBytes)` bytes of the file, so it
+  // starts at `totalBytes - byteLength(raw)`. Deriving that from what actually
+  // came back — rather than from `min(...)` — is deliberate: whatever the exec
+  // transport trims (a trailing newline, most commonly) it trims
+  // DETERMINISTICALLY for given file content, so two reads of a growing file
+  // still agree on every already-seen line's offset. Agreement across reads is
+  // the only property the identity needs; agreement with `ls -l` is not.
+  const tailBytes = byteLen(raw);
+  const startByteOffset = Number.isFinite(totalBytes) ? Math.max(0, totalBytes - tailBytes) : undefined;
+  return { raw, startByteOffset, inode };
+}
+
+/**
  * Map one Worker `LogEvent` (`./observability.ts`'s `LifecycleTimeline`) into
  * the wire shape. `sandbox.preview.desktop_ready` becomes `boot_summary`
  * (captured on BOTH `ok` and `error` — the denominator); every other event
@@ -216,6 +428,39 @@ export interface ContainerTelemetryContext {
   sandboxId?: string;
   /** Injectable for deterministic tests; defaults to `new Date()`. */
   now?: Date;
+  /**
+   * Absolute byte offset, WITHIN the container's NDJSON file, at which `raw`
+   * begins — i.e. `fileBytes - byteLength(raw)` for a `tail -c N` read.
+   * Supplied by `drainContainerBootTelemetry` (`./index.ts`).
+   *
+   * Its presence (together with `sandboxId`) is what switches `eventId` from
+   * a fresh random UUID to the stable, re-read-proof identity described on
+   * {@link stableTelemetryEventId}. Absent -> random ids -> a re-read of the
+   * same line ingests a second row. Never the other way round: a missing
+   * offset can only cost a duplicate, never a dropped event.
+   */
+  tailStartByteOffset?: number;
+  /**
+   * Inode of the container's NDJSON file, as a decimal string, or `'0'` when
+   * the container could not report one. Separates two container instances
+   * that wrote identical bytes at identical offsets — see
+   * {@link stableTelemetryEventId}.
+   */
+  logInode?: string;
+}
+
+/**
+ * The `eventId` for one container NDJSON line.
+ *
+ * Stable (and therefore re-read-proof) only when BOTH a `sandboxId` and an
+ * absolute byte offset are known — see {@link stableTelemetryEventId} for why
+ * a missing `sandboxId` must fall back to a random id rather than to a
+ * weaker shared identity. The fallback is exactly the old behaviour: one
+ * extra row per re-read, never a lost or misattributed one.
+ */
+function containerEventId(ctx: ContainerTelemetryContext, byteOffset: number, line: string): string {
+  if (!ctx.sandboxId || ctx.tailStartByteOffset === undefined) return mintEventId();
+  return stableTelemetryEventId(['container', ctx.sandboxId, ctx.logInode ?? '0', String(byteOffset), line]);
 }
 
 /**
@@ -242,7 +487,15 @@ export function parseContainerTelemetryLines(
   const occurredAt = (ctx.now ?? new Date()).toISOString();
   const out: TelemetryEventInput[] = [];
 
+  // Byte cursor into the CONTAINER'S FILE, not into `raw` — see
+  // `ContainerTelemetryContext.tailStartByteOffset`. Advanced for every
+  // segment `split` produced, including the ones dropped below, so a blank or
+  // malformed line still shifts its successors exactly as it does on disk.
+  let byteOffset = ctx.tailStartByteOffset ?? 0;
+
   for (const line of raw.split('\n')) {
+    const lineOffset = byteOffset;
+    byteOffset += byteLen(line) + 1; // +1: the '\n' that `split` consumed.
     const trimmed = line.trim();
     if (!trimmed) continue;
 
@@ -270,7 +523,7 @@ export function parseContainerTelemetryLines(
       typeof p.durationMs === 'number' && Number.isFinite(p.durationMs) ? Math.round(p.durationMs) : undefined;
 
     const event: TelemetryEventInput = {
-      eventId: mintEventId(),
+      eventId: containerEventId(ctx, lineOffset, trimmed),
       schemaVersion: TELEMETRY_SCHEMA_VERSION,
       eventClass: eventClass as TelemetryEventClass,
       source: 'container',
