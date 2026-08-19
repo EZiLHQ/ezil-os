@@ -29,11 +29,17 @@
 # in this Dockerfile or in worker/Dockerfile needs to change.
 #
 # Build (from the repo root):
-#   docker build -t ezil-neko-vscode:d74052bb-049931d7-ezil-brand1 \
+#   docker build -t ezil-neko-vscode:d74052bb-049931d7-ezil-brand2 \
 #     -f worker/assets/neko-branding/Dockerfile worker/assets/neko-branding
 #
 # Then point worker/Dockerfile's `ARG NEKO_IMAGE` default at the resulting
-# tag (already done in this commit).
+# tag. THE OVERLAY SUFFIX MUST BE BUMPED EVERY TIME THE CONTENT OF www/
+# CHANGES, and worker/Dockerfile's `ARG NEKO_IMAGE` must be bumped with it in
+# the same commit. The two are a pair: the base tag is a content pin, so
+# rebuilding new content under an old suffix would make `-ezil-brand1` mean
+# two different images, and bumping only one of the two files silently ships
+# the OLD overlay with no error anywhere. The suffix went 1 -> 2 when
+# www/ezil-mobile.js and the <script> tag that loads it were added.
 ARG BASE_NEKO_IMAGE=ezil-neko-vscode:d74052bb-049931d7
 FROM ${BASE_NEKO_IMAGE}
 
@@ -83,6 +89,17 @@ COPY www/chat-silent.mp3            /var/www/chat.mp3
 # so the compiled Vue bundle's DOM/module expectations are unaffected.
 COPY www/index.html                 /var/www/index.html
 
+# The mobile on-screen-keyboard affordance, referenced by exactly one added
+# <script> tag in the index.html above (every pre-existing <script>/<link> tag
+# and hashed filename in that file is still byte-identical to upstream). It is
+# a separate file, not an inline blob, so it stays readable and diffable and so
+# index.html's own diff against upstream remains one line. It runs in the
+# desktop's origin — the only place with DOM access to the compiled client —
+# and it is a hard no-op unless the device reports real touch capability. See
+# the file's header comment for what the upstream bundle already provides and
+# what this repairs.
+COPY www/ezil-mobile.js             /var/www/ezil-mobile.js
+
 # Build-time verification: fail the image build (not just a later manual
 # check) if any of the strings this overlay is supposed to remove are still
 # present in the file it patches.
@@ -99,4 +116,9 @@ RUN if grep -qi "n\.eko" /var/www/index.html; then \
       exit 1; \
     fi \
   && test -s /var/www/img/logo.800bec71.svg \
-  && test -s /var/www/chat.mp3
+  && test -s /var/www/chat.mp3 \
+  && test -s /var/www/ezil-mobile.js \
+  && if ! grep -q 'src="ezil-mobile.js"' /var/www/index.html; then \
+      echo "ERROR: index.html does not load ezil-mobile.js" >&2; \
+      exit 1; \
+    fi
