@@ -66,6 +66,29 @@ export interface SpoolDrainResult {
      * re-drained, already-ingested object contributes 0 here, not a re-count). */
     eventsIngested: number;
     objectsAcked: number;
+    /**
+     * How many `drainPage()` calls came back `{ ok: false }` — i.e. the Worker
+     * was unreachable, unconfigured, rejected the HMAC, or answered
+     * unparseably.
+     *
+     * 🔴 THIS FIELD EXISTS BECAUSE ITS ABSENCE HID A 16-DAY OUTAGE. Measured
+     * 2026-08-19: `ezil-telemetry-spool` held 173 objects / 467 kB accumulated
+     * since 2026-08-03, and `ezil_error_events` contained ZERO rows with
+     * `source` of `worker` or `container` — the spool has been filling since
+     * the day it was created and has never once been drained. Producing and
+     * spooling both work; the drain does not.
+     *
+     * Without this counter the two outcomes below are indistinguishable in the
+     * result AND in the HTTP response, because `runTelemetrySpoolDrain` breaks
+     * out of the loop identically for both:
+     *   - "the spool is empty, nothing to do"  -> a healthy no-op
+     *   - "I could not reach the Worker at all" -> a total outage
+     * Both returned `{ pagesDrained: 0, ... }` and a `200 {ok:true}`, so a
+     * completely broken drain looked exactly like a quiet day in the cron log.
+     *
+     * A non-zero value here is always a fault, never a normal state.
+     */
+    drainFailures: number;
 }
 
 export interface SpoolDrainEngineDeps {
@@ -98,10 +121,21 @@ export async function runTelemetrySpoolDrain(deps: SpoolDrainEngineDeps): Promis
     let eventsDroppedInvalid = 0;
     let eventsIngested = 0;
     let objectsAcked = 0;
+    let drainFailures = 0;
 
     for (let i = 0; i < maxPages; i++) {
         const page = await deps.drainPage(cursor);
-        if (!page.ok) break; // Worker/transport failure — spool is untouched, retried whole next run.
+        if (!page.ok) {
+            // Worker/transport failure — spool is untouched, retried whole
+            // next run. COUNTED and LOGGED, not silently swallowed: see
+            // `SpoolDrainResult.drainFailures` for the outage this hid.
+            drainFailures++;
+            console.error('[telemetry] spool-drain could not reach the Worker', {
+                page: i,
+                hint: 'check CLOUDFLARE_GUACAMOLE_WORKER_URL, CLOUDFLARE_GUACAMOLE_HMAC_SECRET and SANDBOX_TELEMETRY_DRAIN',
+            });
+            break;
+        }
         pagesDrained++;
         objectsSeen += page.objects.length;
 
@@ -166,7 +200,7 @@ export async function runTelemetrySpoolDrain(deps: SpoolDrainEngineDeps): Promis
         if (!cursor) break;
     }
 
-    return { pagesDrained, objectsSeen, eventsParsed, eventsDroppedInvalid, eventsIngested, objectsAcked };
+    return { pagesDrained, objectsSeen, eventsParsed, eventsDroppedInvalid, eventsIngested, objectsAcked, drainFailures };
 }
 
 export interface SpoolDrainHandlerDeps extends SpoolDrainEngineDeps {
