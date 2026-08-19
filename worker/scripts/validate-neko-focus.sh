@@ -45,6 +45,14 @@ norm_id() {
 
 active_id() { norm_id "$(xdotool getactivewindow 2>/dev/null || echo 0)"; }
 
+# The window holding the X INPUT FOCUS, which is a different thing from the
+# "active" window (_NET_ACTIVE_WINDOW). XTEST key events are delivered to the
+# input-focus window, so a desktop where the active window and the focus window
+# disagree looks focused but silently swallows every keystroke. Ground truth §f
+# proved XTEST delivery works; this is the standing check that the precondition
+# it depends on still holds.
+focus_id() { norm_id "$(xdotool getwindowfocus 2>/dev/null || echo 0)"; }
+
 # Resolve the (decimal-normalized) window id for an app by WM_CLASS match,
 # identical to how neko-switch-app.sh resolves it.
 win_id_for() {
@@ -73,6 +81,13 @@ sleep 1
 after_chrome="$(active_id)"
 echo "active window AFTER focusing browser (decimal): $after_chrome"
 [ "$after_chrome" = "$chrome_id" ] || fail "active window after focusing browser ($after_chrome) does not match enumerated browser window ($chrome_id)"
+
+# ...and the browser must actually hold the X INPUT FOCUS, not merely be the
+# "active" window. These can diverge, and when they do keyboard input is
+# delivered to nothing while every other signal still looks healthy.
+focus_after_chrome="$(focus_id)"
+echo "input-focus window AFTER focusing browser (decimal): $focus_after_chrome"
+[ "$focus_after_chrome" = "$chrome_id" ] || fail "browser is the active window ($after_chrome) but the X input focus is on $focus_after_chrome — synthetic keystrokes would not reach the browser"
 
 echo "== neko-switch-app.sh vscode degrades gracefully (no window, no crash) =="
 # code-server (which replaced Electron VS Code) is a plain HTTP server with no
