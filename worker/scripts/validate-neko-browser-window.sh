@@ -253,15 +253,15 @@ fi
 
 if [ -z "$MOTIF_DECOR" ]; then
   # No _MOTIF_WM_HINTS at all also means Chrome is not suppressing decorations.
-  pass "awaiting:W3" browser.chrome_frame.no_caption_buttons \
+  pass now browser.chrome_frame.no_caption_buttons \
     "_MOTIF_WM_HINTS absent — Chrome is not asking the WM to skip decorations"
 else
   case "$MOTIF_DECOR" in
     0x0|0)
-      bad "awaiting:W3" browser.chrome_frame.no_caption_buttons \
-        "_MOTIF_WM_HINTS decorations field is $MOTIF_DECOR (MWM_DECOR_NONE) — Chrome is drawing its OWN frame, i.e. its own minimize/restore/close inside the tab strip. Pending W3 seeding browser.custom_chrome_frame=false. Full hints: $MOTIF_RAW" ;;
+      bad now browser.chrome_frame.no_caption_buttons \
+        "_MOTIF_WM_HINTS decorations field is $MOTIF_DECOR (MWM_DECOR_NONE) — Chrome is drawing its OWN frame, i.e. its own minimize/restore/close inside the tab strip. W3 seeds browser.custom_chrome_frame=false in start-neko.sh and this was PASSING against ezil-integrated:local on 2026-08-19, so a red here is a REGRESSION, not a pending fix. Full hints: $MOTIF_RAW" ;;
     *)
-      pass "awaiting:W3" browser.chrome_frame.no_caption_buttons \
+      pass now browser.chrome_frame.no_caption_buttons \
         "_MOTIF_WM_HINTS decorations field is $MOTIF_DECOR (non-zero) — Chrome asked the WM to decorate it, so Chrome is NOT drawing its own caption buttons. Full hints: $MOTIF_RAW" ;;
   esac
 fi
@@ -381,8 +381,8 @@ else
         bad now screen.resize.portrait_refused_consistently \
           "framebuffer is ${FB_W}x${FB_H} so portrait ${PORTRAIT_W}x${PORTRAIT_H} must be refused with 422, but got HTTP $RC (body: $BODY)"
       fi
-      bad "awaiting:W1" screen.resize.portrait \
-        "contract §3 requires portrait ${PORTRAIT_W}x${PORTRAIT_H} to be settable, but the running framebuffer is only ${FB_W}x${FB_H}. Pending W1 raising EZIL_NEKO_FRAMEBUFFER to 1920x1920x24."
+      bad now screen.resize.portrait \
+        "contract §3 requires portrait ${PORTRAIT_W}x${PORTRAIT_H} to be settable, but the running framebuffer is only ${FB_W}x${FB_H}. W1 raises EZIL_X_FRAMEBUFFER to 1920x1920x24 in start-neko.sh and this was PASSING against ezil-integrated:local on 2026-08-19, so a red here is a REGRESSION, not a pending fix."
     fi
 
     # (c) The NEGATIVE case matters as much as the positive one: a mode larger
