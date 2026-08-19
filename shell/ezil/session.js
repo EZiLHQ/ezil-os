@@ -26,6 +26,10 @@
 
 import telemetry from './telemetry.js';
 import { WAKE_DEADLINE_MS, WAKE_REASK_MS, isRetryableBootErrorCode } from './boot-phases.js';
+// The shell's own "long enough ago to count as absent" threshold. Read by
+// `RELEASE_PRESENCE_AGO_MS` below so a release and a heartbeat cannot drift
+// apart about what "nobody is here" means.
+import { ACTIVITY_FRESH_MS } from './activity-heartbeat.js';
 
 const NS = 'ezil-os:';
 
@@ -688,6 +692,79 @@ export async function reportActivity (computerId, lastInputAgoMs) {
     return res.data?.ok === true;
 }
 
+/**
+ * How stale a presence report has to be for the server's idle-stop path to
+ * treat it as "nobody is here any more" — the value {@link releaseDesktop}
+ * puts on the wire.
+ *
+ * 🔴 THIS IS NOT A NEW LIFECYCLE VERB, AND IT MUST NOT BECOME ONE. The shell
+ * has never had the power to destroy a container and this does not give it
+ * one. All it can say is the one thing the activity transport has always been
+ * able to say — "the user was last here N ms ago" — with an N that means
+ * "they have gone". The Worker's `EzilSandboxDO.recordActivity` writes
+ * `now - N` to `LAST_ACTIVITY_AT_KEY` and its own idle-stop path
+ * (`isIdleStopDue`, `IDLE_STOP_MS` = 10 minutes, PLUS a `/proc/loadavg` busy
+ * probe, PLUS a successful final workspace flush) decides on its own whether
+ * that means stop. A release is a fact reported, not an order given, and
+ * every safety rule on the server side still applies to it unchanged.
+ *
+ * The number is `ACTIVITY_FRESH_MS` (30 minutes — `../activity-heartbeat.js`'s
+ * own definition of "the tab is open but nobody is there"), not a bespoke
+ * constant, and deliberately not `Infinity`/`Number.MAX_SAFE_INTEGER`: the
+ * server's `computeActivityTimestamp` subtracts it from `Date.now()`, so a
+ * silly value would write a nonsense timestamp for anyone reading DO storage
+ * later. 30 minutes is 3x the server's 10-minute idle window, so the release
+ * is due IMMEDIATELY on the next flush alarm (<=60s) whatever that window is
+ * retuned to, while still being a duration a human could actually have been
+ * away for.
+ *
+ * Imported rather than redeclared so there is exactly one definition of "long
+ * enough ago to count as absent" in the shell.
+ */
+const RELEASE_PRESENCE_AGO_MS = ACTIVITY_FRESH_MS;
+
+/**
+ * `POST <endpoints.activity>` — report that presence at this desktop has
+ * ENDED, because the window showing it was closed.
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────────
+ * `apps/desktop-window.js`'s `dispose()` used to stop the heartbeat and
+ * nothing else, so closing a desktop window released nothing at all: the
+ * container then sat until the Worker's own `IDLE_STOP_MS` (10 minutes) plus
+ * an alarm tick noticed the beats had stopped. This is the shell saying so
+ * out loud instead of letting a ten-minute silence say it.
+ *
+ * ── Why it is `reportActivity` and not a new verb ───────────────────────────
+ * See {@link RELEASE_PRESENCE_AGO_MS}. Same route, same body shape, same
+ * server handler, same DO write — an OLDER server needs no change at all to
+ * honour this, and a NEWER server gains no capability it did not already
+ * have. The only difference from a heartbeat is the number, and the number is
+ * one the server has always had to be able to handle (a user who really has
+ * been away 30 minutes with the tab open sends it too).
+ *
+ * ── Contract with the caller ────────────────────────────────────────────────
+ * NEVER THROWS and NEVER BLOCKS A CLOSE. The caller fires this and does not
+ * await it: a user who closes a window gets a closed window whether or not
+ * this request ever lands. Feature-detected exactly like `reportActivity`
+ * above — a deployment that does not publish `endpoints.activity` gets NO
+ * request, never a 404 sprayed at a path this bundle invented.
+ *
+ * 🔴 NOT called on minimise. A minimised desktop is still open and still
+ * heartbeating; releasing it would stop a container the user is coming back
+ * to. `apps/desktop-window.js`'s `minimise_to_taskbar` deliberately does not
+ * reach this, and must not learn to.
+ *
+ * @param {string} computerId
+ * @returns {Promise<boolean|undefined>} `true`/`false` is a real answer from
+ *   the server. `undefined` means either OUR request never landed, or this
+ *   deployment does not publish the endpoint at all — neither is an
+ *   observation of anything, and in particular `undefined` is NOT "the
+ *   container is still running".
+ */
+export async function releaseDesktop (computerId) {
+    return reportActivity(computerId, RELEASE_PRESENCE_AGO_MS);
+}
+
 export { withWakeAndOneRetry };
 
 export default {
@@ -697,7 +774,7 @@ export default {
     openDesktop, desktopRunning, confirmFrame, confirmDisplay,
     previewUrl, focusApp,
     restartEndpoint, restartDesktop,
-    activityEndpoint, reportActivity,
+    activityEndpoint, reportActivity, releaseDesktop,
     withWakeAndOneRetry,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
