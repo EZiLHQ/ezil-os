@@ -78,6 +78,36 @@ Related: **`computer_id` is NULL on all 84 shell rows**, contradicting
 
 ### 🔴 OPEN OUTAGE: the R2 telemetry spool has never once been drained
 
+> **UPDATED 2026-08-19 — root cause found, fix committed, NOT yet deployed.**
+> The cause was not the secret and not the R2 binding. **The cron was never
+> invoked.** `app/vercel.json` declared **three** crons and the plan permits
+> **two**; Cloudflare's invocation analytics show `sandbox-reap` (`8 4 * * *`)
+> hitting the Worker once a day unbroken and `telemetry-maintenance`
+> (`17 3 * * *`) demonstrably running — the raw table's retention boundary
+> tracks the clock exactly — while `telemetry-drain` (`43 3 * * *`) produced
+> **zero hour-03 Worker requests after 2026-08-09**. Every other hop was
+> verified working: the container writes the NDJSON, the Worker spools it,
+> `POST /telemetry/drain` is deployed and answers correctly (401 unsigned,
+> not 404), and the parse chain from real container bytes through the app's
+> `parseTelemetryBatch` drops nothing.
+>
+> **The fix removes the dependency on a third cron rather than rescheduling
+> it.** The drain now runs at the tail of `/api/cron/telemetry-maintenance`
+> — the cron that is proven to fire — and `vercel.json` is back to two
+> entries. The two jobs are isolated: each is awaited in its own `try`, and
+> the response reports both, so "the drain is down" can never again look
+> like "the cron did nothing". `/api/cron/telemetry-drain` still exists for
+> manual runs. See `app/src/server/telemetry/maintenance-handler.ts`.
+>
+> **What is still unverified (COULD-NOT-DETERMINE):** which plan this Vercel
+> project is on, and therefore whether "three crons" is precisely the reason
+> the third stopped — the billing API returns nothing at the token scope
+> available and the crons endpoint 404s. The inference is from the
+> invocation evidence, not from the plan. And nothing here is proven until
+> the first post-deploy run: **the check is `select count(*) from
+> public.ezil_error_events where source in ('worker','container')` going
+> above zero for the first time in the product's history.**
+
 Measured 2026-08-19. The R2 bucket `ezil-telemetry-spool` held **173 objects /
 467 kB, accumulating since 2026-08-03** — the day it was created — and not one
 of those objects has ever reached Postgres. This is the mechanical reason for the
@@ -89,12 +119,207 @@ in both the result object and the HTTP response — `runTelemetrySpoolDrain` bro
 out of its loop identically for "the spool is empty" and "I could not reach the
 Worker at all", and both returned `{ pagesDrained: 0 }` with `200 {ok:true}`.
 
-`SpoolDrainResult.drainFailures` (`app/src/server/telemetry/spool-drain.ts`) now
+`SpoolDrainResult.drainFailures` (`app/src/server/telemetry/spool-drain.ts`)
 separates the two. **A non-zero `drainFailures` is always a fault, never a normal
-state.** The counter makes the outage visible; **it does not fix it.** Root cause
-of why the drain cannot reach the Worker is NOT yet established — candidates are
-an unset/incorrect drain secret, an unconfigured R2 binding on the Worker side,
-or the scheduled trigger never firing. Diagnose before assuming.
+state.**
+
+**Two things about that first restored run.** It has 173 objects of backlog to
+clear, and both bounds that keep it from stalling are load-bearing:
+
+- the page limit (`DRAIN_PAGE_LIMIT = 25`) — without it the Worker's own default
+  is 200 sequential `bucket.get()`s inside one request against a 20 s abort, and
+  an aborted page never acks, so the backlog stays exactly where it was;
+- the wall-clock budget (`DEFAULT_DRAIN_BUDGET_MS = 150 s`) — it stops the drain
+  from starting new pages once it has spent its share of the invocation it now
+  shares with the retention job. `hitBudget: true` in the response is **not** a
+  fault: it means a large backlog is being spread across runs, as designed.
+
+Expect the backlog to clear in one run (173 objects ≈ 7 pages) and the row count
+to jump once, then settle.
+
+---
+
+## 📖 The log topology — every stream, where it lands, how long it lives, how to read it
+
+This is the answer to "I want to go back in time and see exactly what the
+problem was". There are **five** streams. They have different homes, different
+lifetimes and different read commands, and three of them are invisible from the
+other two — so the first question in any investigation is *which stream would
+have seen it*.
+
+| stream | source of truth | retention | read it with |
+| --- | --- | --- | --- |
+| Shell/browser telemetry | Postgres `ezil_error_events` (`source='shell'`) | **14 days** raw, **90 days** rolled up | SQL, or `/admin/telemetry` |
+| Container + Worker telemetry | R2 `ezil-telemetry-spool` → the same Postgres tables (`source='container'` / `'worker'`) | hours-to-1-day in R2, then **14 days** raw | SQL, same tables — filter `source` |
+| Container boot log (`/tmp/neko.log`) | inside the live container only | **dies with the container** | `scripts/pull-neko-log.mjs` |
+| CPU saturation samples (`/tmp/neko-cpu-diag.jsonl`) | inside the live container only, and only when opted in | **dies with the container** | `scripts/pull-neko-log.mjs --route cpu-diag` |
+| Worker invocation logs | Cloudflare Workers Logs | live tail, plus retained (see below) | `wrangler tail`, or the dashboard's Observability → Logs |
+
+### 1. Shell / browser telemetry — the only stream that has ever worked
+
+The shell (`app/public/os/bundle.min.js`, built from `shell/ezil/telemetry.js`)
+POSTs batches to `POST /api/shell/telemetry`, which validates with
+`parseTelemetryBatch` (`.strict()` — an event that fails is dropped whole, never
+half-written) and writes through the single writer `ingestBatch`.
+
+**Lands in:** `public.ezil_error_events` (raw), `public.ezil_error_fingerprints`
+(one row per distinct site+code, all-time counters),
+`public.ezil_error_user_hours` (per-user-per-hour rollup).
+
+**Kept for:** raw events **14 days** (`RETENTION_DAYS_EVENTS`), the hourly rollup
+**90 days** (`RETENTION_DAYS_USER_HOURS`), fingerprints indefinitely unless stale
+and low-volume. Pruning is the retention half of the `17 3 * * *` cron.
+🔴 **The rollup outlives the raw rows on purpose** — after 14 days you can still
+answer "how often, how many users, when did it start", but not "what exactly
+happened in that one session".
+
+**Read it with** SQL against the project (`btgqfmnzycdecmeyqubx`, "EZiL App"):
+
+```sql
+-- the last two days, newest first
+select occurred_at, source, event_class, site, code, outcome,
+       duration_ms, user_hash, computer_id, detail, attrs->>'phases' as phases
+from public.ezil_error_events
+where occurred_at > now() - interval '2 days'
+order by occurred_at desc;
+```
+
+or the gated admin page `/admin/telemetry` — which needs an email in
+`TELEMETRY_ADMIN_EMAILS`, and that env var is **unset**, so the page is currently
+unreachable by everyone. Fail-closed by design; set it if you want the UI.
+
+### 2. Container + Worker telemetry — NDJSON → R2 → Postgres
+
+Three hops, and each one is a place it can stop:
+
+1. **The container writes it.** `emit_telemetry()` in `worker/scripts/start-neko.sh`
+   appends one JSON line per boot phase to `/var/log/ezil-telemetry.ndjson`
+   — a closed set of phase names, an `ok`/`error`/`skipped` status and an
+   integer duration. Never a message, a path or an env value.
+2. **The Worker spools it.** After *every* `ensureDesktop` (success and failure
+   alike) `drainContainerBootTelemetry` reads a bounded tail of that file, and
+   `spoolTelemetry` PUTs it — together with the Worker's own telemetry-worthy
+   `LifecycleTimeline` events — as one NDJSON object into the R2 bucket
+   `ezil-telemetry-spool`, keyed `v1/dt=YYYY-MM-DD/hh=HH/<correlationId>.ndjson`.
+   The PUT is `waitUntil`-ed and never blocks the response.
+3. **The cron drains it.** `/api/cron/telemetry-maintenance` (03:17 UTC daily)
+   pages the objects out through the Worker's `POST /telemetry/drain`, ingests
+   them through the same validator the shell's events go through, and only then
+   `POST /telemetry/ack`s (deletes) them. Ingest strictly precedes ack, so the
+   drain can duplicate work but cannot lose it.
+
+**Lands in:** the same three Postgres tables, with `source='container'` or
+`source='worker'` and `user_hash = 'u_00000000'` — a sentinel, because these
+events have no user. 🔴 **Exclude that sentinel from every distinct-user count**,
+or one busy container will read as a user.
+
+**Kept for:** hours in R2 (until the next drain), then the same **14 days** as
+everything else.
+
+**Read it with** the same SQL, filtered:
+
+```sql
+select occurred_at, source, site, code, outcome, duration_ms, correlation_id
+from public.ezil_error_events
+where source in ('worker','container')
+order by occurred_at desc limit 200;
+```
+
+`correlation_id` is the join: one browser request, the Worker events it caused
+and the container phases underneath it all carry the same value.
+
+To see what is still sitting in R2 undrained (i.e. how deep the backlog is):
+
+```sh
+cd worker && npx wrangler r2 bucket info ezil-telemetry-spool
+```
+
+That reports the bucket's object count and total size — it is the command that
+measured **173 objects / 467 kB** on 2026-08-19. `wrangler` has no
+object-listing subcommand, so per-key inspection means the dashboard or the S3
+API.
+
+To force a drain between daily runs, without waiting for the cron:
+
+```sh
+curl -sS -H "Authorization: Bearer $CRON_SECRET" \
+  https://ezil-os.vercel.app/api/cron/telemetry-drain | jq
+```
+
+A healthy response is `{"ok":true,"result":{... "drainFailures":0 ...}}`.
+**`drainFailures > 0` is always a fault**; `hitBudget: true` is not — it means a
+backlog is being spread over several runs on purpose.
+
+### 3. The container's own boot log — `/tmp/neko.log`
+
+Everything human-readable a boot produced: `start-neko.sh`'s own `[ezil-boot]`
+lines **plus** the raw stdout+stderr of Xvfb, openbox, `neko serve`, code-server
+and Chromium, all redirected into one file.
+
+**Kept for:** as long as the container lives, and **not one second longer**.
+There is no copy anywhere else. If a boot failed an hour ago and the container
+has since been recycled, this stream is gone — which is exactly why streams 1
+and 2 exist. Pull it *while the sandbox is still up*.
+
+**Read it with** (see the next section for the full flag set):
+
+```sh
+cd worker
+SANDBOX_HMAC_SECRET='<the Worker's HMAC secret>' \
+  node scripts/pull-neko-log.mjs guac-<userid16>-<computerid16> --lines 400
+```
+
+### 4. CPU saturation samples — `/tmp/neko-cpu-diag.jsonl`
+
+Same shape, same lifetime, same auth as stream 3, but **opt-in**: nothing is
+written unless `EZIL_NEKO_CPU_DIAG_ENABLED` is on for that boot. Fixed-shape
+JSONL, one sample per interval.
+
+```sh
+cd worker
+SANDBOX_HMAC_SECRET='<secret>' node scripts/pull-neko-log.mjs <sandbox> --route cpu-diag
+```
+
+### 5. Worker invocation logs
+
+Every `console.log`/`console.error` in the Worker, plus the structured
+`LifecycleTimeline` JSON lines (`{"ts":…,"correlationId":…,"event":…}`) that are
+the *only* record of what the Worker thought was happening — the ~3-minute
+upstream hang in `docs/PRODUCTION-ERROR-ANALYSIS.md` §3#6 is invisible in
+Postgres precisely because only this stream could have explained it.
+
+**Live tail**, which is the same command it has always been:
+
+```sh
+cd worker && npx wrangler tail ezil-os-worker --format pretty
+# machine-readable, and grep-able by correlation id or sandbox id:
+npx wrangler tail ezil-os-worker --format json | grep '<correlationId>'
+```
+
+**Retained**, once `[observability]` with `head_sampling_rate = 1.0` is enabled
+in `worker/wrangler.toml` and deployed: invocation logs stop being live-tail-only
+and become queryable after the fact in the Cloudflare dashboard under
+**Workers & Pages → `ezil-os-worker` → Observability → Logs**, where they can be
+filtered by field (`correlationId`, `sandboxId`, `event`, `outcome`) and by time
+range. `head_sampling_rate = 1.0` means no sampling: every invocation is kept.
+
+> **COULD-NOT-DETERMINE, two things.** (a) **The retention window.** Cloudflare
+> keeps Workers Logs for a few days and the window depends on the account plan;
+> the exact number for *this* account was not verified from here. Treat it as
+> "days, not weeks", and copy anything you need to keep. (b) **A CLI query
+> command.** `wrangler` 4.108 has no subcommand that queries retained logs —
+> `wrangler tail` is live-only. The dashboard is the supported reader; there is
+> also an account-scoped Workers Observability query API, which was **not**
+> exercised from here.
+
+### What none of these streams see
+
+Carried from `docs/PRODUCTION-ERROR-ANALYSIS.md` §4, because it is the part
+people forget: a page that never loads emits nothing (the emitter is in the
+shell bundle); a session that connects and dies at minute three writes nothing
+(the boot trace has already ended, and there is no heartbeat); a user who gave
+up and never retried leaves no row at all. **A quiet table is not a healthy
+system.**
 
 ---
 
@@ -123,6 +348,51 @@ prints URLs it navigates to; neko prints session and room state. The redaction
 and the caps on this route are what the guarantee rests on, not the script's
 editorial discipline. That header comment used to over-promise and was corrected
 in the same pass.
+
+### How to actually pull one — `worker/scripts/pull-neko-log.mjs`
+
+🔴 **This route was deployed on 2026-08-19 and then called by nothing for the
+rest of the day**, because a caller needs an HMAC token and there was no way to
+mint one outside the app's own server code. There is now:
+
+```sh
+cd worker
+SANDBOX_HMAC_SECRET='<the Worker's CLOUDFLARE_GUACAMOLE_HMAC_SECRET>' \
+  node scripts/pull-neko-log.mjs guac-<userid16>-<computerid16> --lines 400
+```
+
+- **The sandbox name** is `guac-<first 16 alphanumerics of the user's id>-<first
+  16 of the computer's id>` (`deriveGuacamoleSandboxId`,
+  `app/src/server/lib/cloudflare-guacamole-provider.ts`). It is also the
+  `sandboxId` field in every Worker log line for that computer, so the easiest
+  way to get one is to copy it out of `wrangler tail`.
+- **The secret** goes in the environment, never in a flag — a flag lands in
+  shell history and in `ps`. `CLOUDFLARE_GUACAMOLE_HMAC_SECRET` is accepted as
+  an alias, since that is what the same value is called on the Vercel side.
+- **`EZIL_WORKER_URL`** defaults to `https://api-desktop.ezil.org`; set it to
+  `http://localhost:8787` to run against `wrangler dev`.
+- **Flags:** `--lines N` (default 400, ceiling 2000), `--route cpu-diag` to pull
+  `/tmp/neko-cpu-diag.jsonl` through the twin route instead, `--json` for the
+  whole response envelope rather than just the text.
+- **Output split:** the log text goes to **stdout** (so `| grep`, `| less` and
+  `> file` all work) and the one-line summary to **stderr**.
+- **Exit codes:** `0` got a log · `1` the route said no, or this container has
+  never written one · `2` bad usage or no secret configured.
+
+The token is a 5-minute HMAC over the same canonical payload every other signed
+Worker route uses. `scripts/pull-neko-log.test.ts` verifies the script's tokens
+with the **Worker's own** `verifyPreviewToken`, so the two copies of that string
+cannot drift into a 401 unnoticed.
+
+**Typical answers and what they mean:**
+
+| what you see | meaning |
+| --- | --- |
+| `… absent — neko_log_absent: …` (exit 1) | that sandbox has never run `start-neko.sh` — a fresh container, or a guacamole-mode one |
+| `404 neko_logs_disabled` (exit 1) | the `EZIL_NEKO_LOGS` kill switch is off |
+| `401 hmac_signature_mismatch` (exit 1) | wrong secret |
+| `401 hmac_token_expired` (exit 1) | the machine's clock is more than 5 minutes out |
+| `(TRUNCATED)` in the summary | the file is bigger than the caps; raise `--lines`, but 256 KiB is the hard byte ceiling |
 
 ---
 
@@ -187,7 +457,11 @@ exists to answer. See `docs/telemetry.md` for what is (and is not) recorded.
 ⚠️ It holds **84 live rows**, all `source='shell'` — see "APPLIED" above. No
 worker- or container-sourced row has ever landed, because the R2 spool drain has
 never run; see "OPEN OUTAGE" above before reading an empty container slice as
-"nothing failed".
+"nothing failed". The cause is now known (the drain's cron was never invoked) and
+the fix is committed but **not deployed** — so until the first post-deploy
+03:17 UTC run, an empty `source in ('worker','container')` slice still means
+"nothing has ever arrived", not "nothing failed". "📖 The log topology" above
+lists all five streams and which one would have seen what you are looking for.
 
 ---
 
@@ -206,9 +480,11 @@ FUSE-mounted into user containers — sharing it would put the fleet's error log
 inside a user's file manager.
 
 A drainer **has since been written** (`app/src/server/telemetry/spool-drain.ts`)
-and it is **not working in production**: 173 objects / 467 kB have accumulated and
-none has ever been ingested. See "OPEN OUTAGE" above. Writing the spool is proven;
-reading it is not.
+and it has **never yet run in production**: 173 objects / 467 kB have accumulated
+and none has ever been ingested. Root cause is the cron, not the drainer — see
+"OPEN OUTAGE" above, where the fix (fold the drain into the one cron that is
+proven to fire) and the single query that confirms it are written out. Writing
+the spool is proven; reading it is proven everywhere except against production.
 
 **2. Nothing else.** The desktop-restart control needs no provisioning: the Worker
 route is on by default (`SANDBOX_RESTART` unset = enabled, same convention as
