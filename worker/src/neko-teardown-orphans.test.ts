@@ -330,6 +330,90 @@ describe('start-neko.sh: teardown leaves no orphaned applications', () => {
     }, 180_000);
 });
 
+describe('start-neko.sh: a boot that starts nothing must not tear down the one that did', () => {
+    /**
+     * ── The production outage this reproduces ───────────────────────────────
+     * `ensureDesktop` (src/index.ts) re-issues
+     * `startProcess("DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh")`
+     * every time `getExposedPorts()` does not list the desktop port. That is
+     * not rare: the app server races each Worker call against a 12s wake
+     * budget WITHOUT aborting it (`SANDBOX_WAKE_ANSWER_BUDGET_MS`,
+     * app/src/server/lib/cloudflare-guacamole-provider.ts) and the shell then
+     * re-asks every 1.5s, so a cold boot — measured p50 ~11s, p90 19s, max 28s
+     * — reliably produces further `/sandbox/preview` calls that arrive AFTER
+     * neko has bound but BEFORE the port is exposed. `restartDesktopStack`
+     * reaches the same place whenever `findDesktopLauncherProcess` finds no
+     * launcher to stop.
+     *
+     * Such an invocation hits this script's own idempotency check
+     * ("neko already serving — nothing to do") and `exit 0`s within ~10ms
+     * having started NOTHING. Its EXIT trap still ran `terminate_stack`, whose
+     * emptiness guard checks three SHELL variables (all correctly empty) and
+     * one FILE-backed list, `_app_pgids`, which globbed the deliberately
+     * CROSS-BOOT `$NEKO_APP_PGID_DIR`. So the no-op boot sailed past the guard
+     * and killed the LIVE boot's applications, wrote the shared shutdown flag
+     * that stops their supervisors restarting them, and deleted their
+     * ownership records.
+     *
+     * Verified in a real container against `ezil-os-worker-sandbox:50f3518f`
+     * on 2026-08-19: one such invocation took the X framebuffer from
+     * `mean 34.664 / max 255` to `mean 0.000 / max 0`, killed :8443, and left
+     * `{"chromium":{"state":"stopped"},"codeserver":{"state":"stopped"}}`
+     * permanently — while `neko serve` kept answering on 8181, so
+     * `/api/room/screen`, `?confirm=frame` and `?confirm=display` all still
+     * reported a healthy desktop. That is the black desktop, exactly.
+     */
+    it('the "neko already serving" early exit leaves the live boot untouched', async () => {
+        const first = await bootToReady();
+        const appPid = readPid(first.appPidFile);
+        const grandchildPid = readPid(first.grandchildPidFile);
+        expect(isLive(appPid)).toBe(true);
+        expect(isLive(grandchildPid)).toBe(true);
+
+        // A SECOND `startProcess`, byte-for-byte the same environment the
+        // Worker hands the first one — same pgid dir, same shutdown flag, same
+        // neko port. Run to completion so its EXIT trap has certainly fired.
+        const second = spawn('bash', [START_NEKO], {
+            detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: first.env,
+        });
+        let secondErr = '';
+        second.stderr?.on('data', (c) => { secondErr += String(c); });
+        second.stdout?.on('data', () => { /* drained */ });
+        const secondCode = await Promise.race([
+            new Promise<number | null>((r) => second.once('exit', (code) => r(code))),
+            new Promise<null>((r) => setTimeout(() => r(null), TEARDOWN_DEADLINE_MS)),
+        ]);
+        expect(`exit=${secondCode}`).toBe('exit=0');
+        expect(secondErr).toContain('nothing to do');
+        // The single line that names the bug: a boot that started nothing must
+        // never announce a teardown.
+        expect(secondErr).not.toContain('terminating neko stack');
+
+        // Give a teardown that DID start every chance to land before asserting.
+        await new Promise((r) => setTimeout(r, 3_000));
+
+        const damage = [
+            isLive(appPid) ? null : `app pid ${appPid} was KILLED by the no-op boot`,
+            isLive(grandchildPid) ? null : `grandchild pid ${grandchildPid} was KILLED by the no-op boot`,
+            (await tcpOpen(first.codeServerPort)) ? null : `port ${first.codeServerPort} was FREED by the no-op boot`,
+            (await tcpOpen(first.nekoPort)) ? null : `neko port ${first.nekoPort} was FREED by the no-op boot`,
+            existsSync(first.env.NEKO_SHUTDOWN_FLAG!)
+                ? 'the shared shutdown flag was raised, so the live boot\'s supervisors will never restart its apps'
+                : null,
+            existsSync(join(first.env.NEKO_APP_PGID_DIR!, 'codeserver.pgid'))
+                ? null : 'the live boot\'s codeserver ownership record was deleted',
+            existsSync(join(first.env.NEKO_APP_PGID_DIR!, 'chromium.pgid'))
+                ? null : 'the live boot\'s chromium ownership record was deleted',
+        ].filter(Boolean);
+        expect(`${damage.join(' | ')}\n${secondErr.slice(-2000)}`).toBe(`\n${secondErr.slice(-2000)}`);
+
+        // And the first boot is still the one running: it has not silently
+        // restarted its apps to cover for a teardown.
+        expect(readPid(first.appPidFile)).toBe(appPid);
+        expect(first.stderr()).not.toContain('PERMANENTLY FAILED');
+    }, 180_000);
+});
+
 describe('start-neko.sh: a genuinely unstartable app still fails closed', () => {
     it('exits non-zero when a mandatory app can never start, and cleans up anyway', async () => {
         // Guards the other direction: the teardown work above must not have

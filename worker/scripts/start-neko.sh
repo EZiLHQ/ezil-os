@@ -430,13 +430,50 @@ _pgid_member_matching() {
   return 1
 }
 
-# _app_pgids — echo the pgid of every application this boot currently has
-# running, one per line, read from the supervisors' pgid files. Reading the
-# files (rather than a snapshot taken at launch) is what makes this correct
-# across restarts: after a crash-and-restart the file holds the NEW pgid.
+# _app_pgids — echo the pgid of every application THIS boot is supervising,
+# one per line, read from that app's own pgid file. Reading the file (rather
+# than a snapshot taken at launch) is what makes this correct across restarts:
+# after a crash-and-restart the file holds the NEW pgid.
+#
+# 🔴 THE SELECTOR IS `APP_PID`, NOT A GLOB OF $NEKO_APP_PGID_DIR — and that
+#    distinction is the whole of a production outage (reproduced in a
+#    container, 2026-08-19). The directory is deliberately CROSS-BOOT: its
+#    files are "deliberately NOT cleared on boot" precisely so
+#    `reclaim_stale_app` can prove it owns a straggler from an EARLIER boot of
+#    this same container. Globbing it therefore answers "every app any boot of
+#    this container ever started", which is the right question for reclaim and
+#    the WRONG one for `terminate_stack` and `_pid_in_this_boot`, whose own doc
+#    comments both say "this boot".
+#
+#    What that cost: the Worker re-issues
+#    `startProcess("DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh")`
+#    whenever `getExposedPorts()` does not list 8181 (`ensureDesktop`,
+#    src/index.ts) — a second concurrent `/sandbox/preview`, or a
+#    `restartDesktopStack` that found no launcher process to stop and so
+#    skipped straight to the relaunch. That second invocation hits the
+#    idempotency check below (`neko already serving — nothing to do`) and
+#    `exit 0`s within ~10ms, having started NOTHING. Its EXIT trap then ran
+#    `terminate_stack`, whose emptiness guard checks three SHELL variables
+#    (`NEKO_PID`, `APP_PID`, `SESSION_PID`) — all correctly empty — and this
+#    one FILE-backed list, which was not. So the no-op boot sailed past the
+#    guard and SIGTERM'd the LIVE boot's Chrome and code-server, wrote the
+#    global shutdown flag that stops their supervisors from ever restarting
+#    them, and deleted their ownership records. Left behind: Xvfb still up,
+#    `neko serve` still answering on 8181 (so `/api/room/screen`,
+#    `?confirm=frame` and `?confirm=display` all still say the desktop is
+#    fine), no mapped Chrome window — an exactly-black stream — and nothing
+#    listening on 8443. Measured: framebuffer `mean 0.000 / max 0`, 8443 dead,
+#    health file `{"chromium":{"state":"stopped"},"codeserver":{"state":"stopped"}}`,
+#    permanently.
+#
+#    `APP_PID` is populated by `supervise_app` (`APP_PID[$name]=$!`) and is
+#    per-process, so it names this boot's apps and nothing else. A boot that
+#    started no app now yields nothing here, the guard fires, and the EXIT trap
+#    is the true no-op its own comment already claims it is.
 _app_pgids() {
-  local f pgid
-  for f in "$NEKO_APP_PGID_DIR"/*.pgid; do
+  local name f pgid
+  for name in "${!APP_PID[@]}"; do
+    f="${NEKO_APP_PGID_DIR}/${name}.pgid"
     [ -f "$f" ] || continue
     pgid="$(tr -dc '0-9' <"$f" 2>/dev/null)"
     [ -n "$pgid" ] && printf '%s\n' "$pgid"
@@ -463,7 +500,17 @@ terminate_stack() {
 
   # 1. Stop the restart loops FIRST, before anything is signalled, so no
   #    supervisor can replace an app we are about to kill.
-  : >"$NEKO_SHUTDOWN_FLAG" 2>/dev/null || true
+  #
+  #    🔴 ONLY when this boot HAS supervisors. The flag file is shared by every
+  #    boot of this container, and a supervisor reads it as "stop restarting".
+  #    A boot with no apps of its own has no restart loop to stop, so writing
+  #    the flag here could only ever reach ANOTHER boot's supervisors — and
+  #    nothing clears it again until the next full boot's stale-boot reclaim,
+  #    so that other boot's Chrome and code-server stay dead for the life of
+  #    the container. Same "this boot, not this container" rule as _app_pgids.
+  if [ "${#APP_PID[@]}" -gt 0 ]; then
+    : >"$NEKO_SHUTDOWN_FLAG" 2>/dev/null || true
+  fi
 
   # 2. Graceful SIGTERM to each application's process GROUP — the actual fix:
   #    this is what reaches code-server's second node process (the one holding
@@ -515,8 +562,13 @@ terminate_stack() {
   if [ -n "$NEKO_PID" ]; then wait "$NEKO_PID" 2>/dev/null || true; fi
 
   # 7. Drop the ownership records — these processes are provably gone, and a
-  #    stale file would make the next boot chase a recycled pid.
-  rm -f "$NEKO_APP_PGID_DIR"/*.pgid "$NEKO_APP_PGID_DIR"/*.sup 2>/dev/null || true
+  #    stale file would make the next boot chase a recycled pid. Only the
+  #    records for the apps THIS boot supervised: a glob would also delete a
+  #    concurrently-booting sibling's records, and those files are the only
+  #    evidence a later `reclaim_stale_app` has that it owns a straggler.
+  for name in "${!APP_PID[@]}"; do
+    rm -f "$NEKO_APP_PGID_DIR/${name}.pgid" "$NEKO_APP_PGID_DIR/${name}.sup" 2>/dev/null || true
+  done
   log "teardown complete: apps, neko and the X session are stopped"
 }
 
