@@ -548,6 +548,43 @@ body.device-phone {
     display: none;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * THE KEYBOARD AND THE SAFE AREA, ON A PHONE — W7, 2026-08-19, contract §7.3.
+ * 🔴 NO RULE HERE. This note exists so the next person looks in the right file.
+ * ═══════════════════════════════════════════════════════════════════════════
+ * `boot.js` publishes two custom properties on `<body>` from `visualViewport`
+ * (see `publish_viewport_metrics` there for why `<body>` and not `:root`):
+ *
+ *   --ezil-vvh   the VISUAL viewport's height in px — the screen minus a
+ *                raised software keyboard. Undefined on a browser with no
+ *                `visualViewport`, so every use site spells out the old value
+ *                as the `var()` fallback and behaviour there is unchanged.
+ *   --ezil-kb    px of the layout viewport obscured at the bottom, or 0.
+ *
+ * WHY IT MATTERS. `go_fullbleed` sizes the desktop window with an INLINE
+ * `height: 100%`, resolved against `<body>` — the LAYOUT viewport. Neither the
+ * layout viewport nor `100dvh` shrinks when a software keyboard opens on iOS
+ * Safari or on Android Chrome's default `resizes-visual` mode; only the visual
+ * viewport does. Separately, W6 MEASURED that `env(safe-area-inset-bottom)`
+ * resolves to 0 inside the cross-origin neko iframe, so the picture cannot
+ * dodge an iPhone's home indicator by itself — only the window containing it
+ * can inset it.
+ *
+ * BOTH ARE APPLIED IN `../../src/css/style.css`, on the
+ * `.device-phone .window…:has(> .window-body.window-body-app)` rule beside its
+ * `.window-filedialog` sibling — deliberately NOT here. That selector computes
+ * to (0,6,0); anything plainer in THIS file loses on specificity no matter that
+ * this file is concatenated last, and would be a rule that reads as if it
+ * works and does not. One home for phone window geometry, and it is that one.
+ *
+ * 🔴 The stream inside the window is not touched by any of it. `fit_stream`
+ * (`../apps/desktop-window.js`, W2's file, contract §4.3) already observes the
+ * window BODY with a `ResizeObserver`, so shrinking the window is exactly the
+ * input it is built to react to: the stream refits itself, through W2's code.
+ * MEASURED: with the window at 844px the stream box sat at y=313; with a 336px
+ * keyboard raised the window became 508px and the stream box moved to y=145,
+ * with nothing in this workstream reaching into `fit_stream`. */
+
 /* ── the control tray's open width, derived from its button count ──────────
  *
  * 🔴 REPLACES A LANDMINE THAT RE-ARMED ITSELF. `src/css/dashboard.css:52`
