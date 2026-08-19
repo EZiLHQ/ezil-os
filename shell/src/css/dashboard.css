@@ -238,14 +238,53 @@
     outline: 2px solid rgba(255, 255, 255, 0.9);
     outline-offset: 1px;
 }
+/* MODIFIED BY EZIL 2026-08-19 (W7). `--btn` was 36px here, which is a
+   36x36 hit target — above WCAG 2.5.8 AA (24px) but below the 44px of Apple's
+   HIG and WCAG 2.5.5 AAA, and MEASURED by W8's phone harness at 390x844 as
+   exactly 36x36 effective.
+
+   Raised to 44 because of WHERE these buttons are. `enter_fullpage_mode`
+   (`../UI/UIDesktopFullpage.js`) hides the taskbar, so on a full-bleed
+   streamed desktop this tray is not one control surface among several — it is
+   the ONLY chrome on the screen and the user's entire way back out. A missed
+   tap on the only exit is a different class of problem from a missed tap on a
+   control that has a second route.
+
+   🔴 The 44px could NOT be bought with a transparent `::after` hit pad, which
+   is the trick `../../ezil/ui/ezil-shell.css` uses for `.window-action-btn`
+   and which would have cost no layout at all. These buttons sit 2px apart
+   (`.dashboard-app-drawer-minimize`), so 44px pads on 36px discs would
+   OVERLAP by 6px and the seam would deliver the tap to whichever pad paints
+   last — on a strip whose last button is close, that is worse than a small
+   target. The discs themselves therefore have to grow.
+
+   🔴 THE THREE HEIGHTS MOVE TOGETHER, and the invariant is the one already
+   documented on `--strip-h` at the top of this file: the dismiss strip stacks
+   OVER the controls layer, so it must never rise past the buttons' bottom
+   edge at `(controls-h + btn)/2` or it steals their taps.
+       before: (48 + 36)/2 = 42, strip top = open-h - strip-h = 50 - 8 = 42 ✓
+       after:  (56 + 44)/2 = 50, strip top =                   58 - 8 = 50 ✓
+   Changing `--btn` alone would have put the strip 4px INSIDE the buttons.
+
+   Deliberately NOT applied to a narrow window on a fine pointer. This is a
+   `(pointer: coarse)` block and it stays one: a 390px-wide DESKTOP window is
+   `device-phone` for LAYOUT (see THE DEVICE RULE in `../../ezil/boot.js`) but
+   is still driven by a mouse, and a mouse does not need a 44px target. Size
+   the target to the pointer; size the layout to the viewport. */
 @media (pointer: coarse) {
 .dashboard-app-drawer {
-        --btn: 36px;
-        --controls-h: 48px;
+        --btn: 44px;
+        --controls-h: 56px;
         --strip-h: 8px;
-        --open-h: 50px;
+        --open-h: 58px;
         --shut-w: 68px;
         --shut-h: 20px;
+    }
+    /* The glyph is a fixed 14px everywhere else; in a 44px disc that reads as
+       a dot. 18px keeps the same optical weight inside the larger disc. */
+.dashboard-app-drawer-btn svg {
+        width: 18px;
+        height: 18px;
     }
 .dashboard-app-drawer-grabber {
         width: 28px;
