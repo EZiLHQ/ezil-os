@@ -244,6 +244,11 @@ describe('toShellDesktopState — never implies an observation it does not have'
             // Container-billing fix: the activity heartbeat's feature flag —
             // see the dedicated test below.
             activity: '/api/shell/activity',
+            // The live-resize feature flag. Boot-time sizing does NOT depend
+            // on this key (it travels on `desktop`), so a deployment without
+            // it still opens the desktop at the right shape — it just cannot
+            // change it afterwards.
+            screen: '/api/shell/screen',
         });
     });
 

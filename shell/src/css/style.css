@@ -719,8 +719,78 @@ span.header-sort-icon img {
 .device-phone .window[data-is_maximized="1"] {
     top: 0 !important;
 }
+/* ── 🔴 THE PHONE/TABLET WINDOW BAND — MODIFIED BY EZIL 2026-08-19 (V1) ──
+ * The `9999999 !important` below is PRE-EXISTING (it came in with the port)
+ * and it is kept, unchanged, for the FOCUSED window. What it does is lift a
+ * window clear of `.toolbar` (999999) and `.taskbar` (99999), both of which
+ * live in the root stacking context alongside `.window` and would otherwise
+ * paint over a phone's full-bleed app. That part is correct and is not what
+ * this note is about.
+ *
+ * 🔴 WHAT WAS BROKEN. `!important` in a stylesheet beats a non-important
+ * INLINE declaration, and the inline declaration it beat is the entire window
+ * z-order mechanism: `$.fn.focusWindow` (`../../src/UI/UIWindow.js`) raises a
+ * window with `$(this).css('z-index', base + (++window.last_window_zindex))`.
+ * With one flat `!important` on every `.window`, every window computed to the
+ * SAME 9999999 whatever the counter said, so paint order fell through to DOM
+ * order — and `focusWindow` never reorders the DOM. **A user could not raise
+ * one window above another at all.**
+ *
+ * MEASURED before this change (Chromium, built bundle, two app windows):
+ *     device-phone   390x844, phone UA      z(a)=z(b)=9999999, inline 6 vs 5
+ *     device-phone   390x844, DESKTOP UA    z(a)=z(b)=9999999, inline 6 vs 5
+ *     device-tablet  900x700, desktop UA    z(a)=z(b)=9999999, inline 6 vs 5
+ *   After `$('.window[data-app="probe-a"]').focusWindow()`, probe-a had
+ *   `.window-active` and its iframe had `pointer-events: all` — and
+ *   `document.elementFromPoint` at the centre of probe-a still returned
+ *   probe-B's `.window-body`. The FOCUSED window was behind, its live iframe
+ *   unreachable, and the covering window's body swallowed the next tap and
+ *   focused itself straight back. That is a lock-out, not a cosmetic glitch:
+ *   on a phone W7's layout makes app windows full-bleed, so the two windows
+ *   are exactly co-extensive and there is no pixel of the buried one to tap.
+ *
+ * 🔴 WHY IT WAS INVISIBLE UNTIL NOW. `device-phone` used to require a phone
+ * UA (`isMobile.phone`), so no test in this repo had ever executed this rule
+ * — `stacking-browser-test.mjs`, the 578-check stacking authority, sweeps
+ * five DESKTOP viewports and no touch. W7's widened detection (§7.3) makes
+ * the rule reachable from an ordinary narrow/coarse desktop session for the
+ * first time, which is why it is being fixed now rather than left alone.
+ *
+ * 🔴 THE FIX, AND WHY IT IS THIS ONE. Split the flat band in two along
+ * `.window-active` — the class `focusWindow` puts on exactly one window and
+ * strips from every other (`UIWindow.js:4429-4431`), i.e. the shell's own
+ * record of which window is on top:
+ *
+ *     focused     9999999   (UNCHANGED — the value every other rule in these
+ *                            sheets was already tuned against)
+ *     not focused 9999998
+ *
+ * The focused window keeps its exact previous z, so nothing that sits at or
+ * near this band moves relative to it. In particular `.popover` (9999999)
+ * still ties with the active window and still wins on DOM order, exactly as
+ * before — raising the ACTIVE window instead would have buried every popover
+ * on a phone. Only the windows the user is NOT looking at move, and they move
+ * down by one.
+ *
+ * This deliberately does NOT restore a full N-deep ordering among the
+ * unfocused windows; CSS cannot express a per-element counter, and doing it
+ * properly would mean changing `focusWindow` itself, which is W5's file.
+ * Two tiers is enough for the claim that was actually broken — "the window
+ * you focused is the one in front" — and on a phone, where the windows are
+ * co-extensive, only the front one is visible anyway.
+ *
+ * `stay_on_top` windows are untouched by both rules: `UIWindow.js:227` gives
+ * them an INLINE `!important` z-index in the 99999999+ band, and an inline
+ * `!important` beats a stylesheet `!important`. They stay above.
+ *
+ * Regression cover: `../../phone-stacking-browser-test.mjs`, which fails on
+ * the pre-change sheet and passes on this one, at three device classes. */
 .device-phone .window, .device-tablet .window {
     z-index: 9999999 !important;
+}
+.device-phone .window:not(.window-active),
+.device-tablet .window:not(.window-active) {
+    z-index: 9999998 !important;
 }
 .device-phone .window-alert, .device-tablet .window-alert {
     min-width: 90%;
@@ -768,9 +838,23 @@ span.header-sort-icon img {
     padding-left: 5px;
     margin-bottom: -1px;
 }
+/* MODIFIED BY EZIL 2026-08-19 (W7): was `rgba(231, 238, 245)` — upstream
+   Puter's LIGHT chrome, hardcoded. Upstream's reason for hardcoding a colour
+   here is sound and is kept: `backdrop-filter` is expensive and unreliable on
+   mobile GPUs, so a phone gets a flat opaque titlebar instead of the
+   translucent one. What is not kept is the COLOUR. EZiL's chrome is dark and
+   `.window-head-title` is `--primary-color` (#f5f5f4, `ezil-tokens.css`), so
+   that value put off-white text on a near-white bar. MEASURED in Chromium at
+   390x844 against the built bundle: head background rgb(231,238,245), title
+   colour rgb(245,245,244) — a contrast ratio of 1.09:1, i.e. the window title
+   was invisible on every phone. Now the same hsl() the non-phone rule above
+   derives, at alpha 1 rather than translucent, which lands at ~#1d2020 and
+   ~15.4:1 against the same text. */
 .device-phone .window-head {
     /* not transparent on mobile */
-    background-color: rgba(231, 238, 245);
+    background-color: hsl(var(--window-head-hue),
+            var(--window-head-saturation),
+            var(--window-head-lightness));
 }
 .window-head, .window-head * {
     user-select: none !important;
@@ -1916,9 +2000,15 @@ body:not(:has(.desktop.desktop-selectable-active)) .taskbar .taskbar-item:hover 
                 var(--window-head-alpha));
         backdrop-filter: blur(10px);
     }
+/* MODIFIED BY EZIL 2026-08-19 (W7): same light-chrome hardcode as the
+   non-@supports copy above, and the same fix. `backdrop-filter` is kept
+   because this branch only runs where it is supported, but a blur behind an
+   OPAQUE colour is a no-op that costs a compositing layer, so it goes: the
+   whole point of the phone rule is that the bar is not translucent. */
 .device-phone .window-head {
-        background-color: rgba(231, 238, 245);
-        backdrop-filter: blur(10px);
+        background-color: hsl(var(--window-head-hue),
+                var(--window-head-saturation),
+                var(--window-head-lightness));
     }
 .window-sidebar {
         background-color: hsla(var(--window-sidebar-hue),
@@ -1997,28 +2087,147 @@ body:not(:has(.desktop.desktop-selectable-active)) .taskbar .taskbar-item:hover 
     transform: none;
     width: 100%;
 }
+/* ADDED BY EZIL 2026-08-19 (W7). The rule directly above has been in the sheet
+   since the port and has never done anything: `width: 100%` with no
+   `!important` loses to the inline `style="width: 960px; left: -285px"` that
+   `UIWindow.js:332` writes on every window. It LOOKED correct on a real phone
+   only because `UIWindow.js:202`'s own `isMobile.phone` branch had already
+   written `width: 100%` inline before the cascade was consulted.
+   With the widened detection in `../../ezil/boot.js`, `device-phone` no longer
+   implies `isMobile.phone`, so that branch no longer fires and the inline
+   desktop geometry is what a phone-classed session actually gets. MEASURED,
+   Chromium 390x844, desktop UA, `device-phone` on `<body>`: the Browser window
+   was 960x570 at x=-285 — 285px off the left edge and 285px off the right.
+
+   Phone only, deliberately. `.device-tablet` is left exactly as it was: a
+   tablet is wide enough for a windowed UI, no test covers it, and this change
+   is scoped to the phone defect it was raised for.
+
+   `left`, but NOT `height`/`top`: a window hanging off both edges of the
+   viewport is unambiguously broken, whereas a window shorter than the screen
+   is merely unusual — and a window shorter than the screen is exactly what
+   `$.fn.close`'s and `minimize_window`'s shrink animations produce, which an
+   `!important` height would freeze. Full-bleed height is applied only to the
+   app and file-dialog windows below, which are the ones that ask for it. */
+.device-phone .window:not(.window-alert) {
+    /* `env(…, 0px)` everywhere it does not apply, so this is `100%` / `0` on
+       every device and every test browser without insets. It is non-zero on a
+       notched phone in LANDSCAPE, which `device-phone` now reaches — see
+       clause (C) of THE DEVICE RULE in `../../ezil/boot.js`. */
+    width: calc(100% - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)) !important;
+    left: env(safe-area-inset-left, 0px) !important;
+}
 .device-phone .window.window-filedialog {
     transform: none;
-    width: 100% !important;
-    left: 0 !important;
-    min-height: 100dvh;
-    height: 100dvh;
-    top: 0 !important;
+    /* MODIFIED BY EZIL 2026-08-19 (W7): was a flat `100% / 100dvh / top: 0`.
+       Same two corrections as the app-window rule immediately below, and the
+       long explanation lives there — `--ezil-vvh` so a raised keyboard shrinks
+       the dialog instead of hiding its buttons, and `env(safe-area-inset-*)`
+       so its bottom row is not under a home indicator. Both fall back to the
+       original values. */
+    top: env(safe-area-inset-top, 0px) !important;
+    left: env(safe-area-inset-left, 0px) !important;
+    width: calc(100% - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)) !important;
+    height: calc(
+        var(--ezil-vvh, 100dvh)
+        - env(safe-area-inset-top, 0px)
+        - env(safe-area-inset-bottom, 0px)
+    );
+    min-height: 0;
     border-radius: 0 !important;
 }
-.device-phone .window.window-app {
+/* ── 🔴 REWRITTEN BY EZIL 2026-08-19 (W7) ──────────────────────────────────
+ * THE SELECTOR WAS DEAD. `.window-app` is emitted NOWHERE in this fork —
+ * `grep -rn 'window-app\b' shell/ --include=*.js` returns exactly two hits,
+ * `UIWindow.js:5524`'s `$('.window-app').scrollTop(0)` (which therefore also
+ * matches nothing) and this rule. The class an iframe-bearing window actually
+ * gets is `window-body-app`, and it is on the window's BODY, not on the
+ * window (`UIWindow.js:483`). So for the whole life of this fork, the rule
+ * that was supposed to make an app window full-bleed on a phone has applied
+ * to zero elements.
+ *
+ * That was invisible while `device-phone` could only come from a phone UA,
+ * because `UIWindow.js:202` has its own `isMobile.phone` branch that writes
+ * `width: 100%` INLINE and got there first. It stops being invisible the
+ * moment `device-phone` can be reached without a phone UA (the widened
+ * detection in `../../ezil/boot.js`), because then `isMobile.phone` is false
+ * and the inline geometry is the desktop one.
+ *
+ * MEASURED against the built bundle, Chromium at 390x844, `device-phone` on
+ * `<body>` and a desktop UA: the Browser window rendered 960x570 at x=-285 —
+ * 285px off the left edge and 285px off the right of a 390px viewport.
+ *
+ * `!important` on width/height/left is therefore REQUIRED, not decorative:
+ * every one of them is fighting an inline `style="width: 960px; left: -285px"`
+ * written by `UIWindow.js:332`. The sibling `.window-filedialog` rule above
+ * already had `!important` on exactly those two properties, for exactly this
+ * reason.
+ *
+ * `--ezil-vvh` is published on `<body>` by `boot.js`'s `publish_viewport_metrics`
+ * and is the VISUAL viewport's height — i.e. the screen minus a raised
+ * keyboard. `100dvh` is the fallback and is what this rule used to say
+ * unconditionally; on iOS and on Android's default `resizes-visual` mode
+ * `100dvh` does NOT shrink for the keyboard, which is the whole defect.
+ *
+ * 🔴 THE SAFE AREA IS THE SHELL'S JOB AND ONLY THE SHELL'S. W6 measured this
+ * from inside the container: `env(safe-area-inset-bottom)` resolves to `0`
+ * inside the CROSS-ORIGIN neko iframe, so nothing drawn inside the stream can
+ * dodge an iPhone's home indicator. The only element in a position to inset
+ * the picture is the window that contains the iframe — this one. Without the
+ * `calc()` below, the bottom ~34px of the streamed desktop lives permanently
+ * under the home indicator and cannot be tapped.
+ *
+ * Every `env()` here carries a `0px` fallback, so on any device or test
+ * browser without insets this arithmetic reduces to exactly the old
+ * `top: 0; left: 0; width: 100%; height: <full>` and nothing measured today
+ * moves. `safe-area-inset-left`/`right` are the ones that matter in landscape
+ * on a notched phone, which `device-phone` now reaches (see clause (C) of
+ * THE DEVICE RULE).
+ *
+ * The bottom inset and the keyboard do not double-count: iOS reports
+ * `safe-area-inset-bottom` as 0 while a software keyboard is up, because the
+ * home indicator is not drawn over a keyboard.
+ *
+ * `.window-alert` is excluded because the rule above it deliberately centres
+ * alerts at 90%/300px, and a full-bleed alert would be a dialog the size of
+ * the screen.
+ *
+ * 🔴 THIS RULE IS THE LAST WORD ON PHONE APP-WINDOW GEOMETRY. Do not add a
+ * competing `.device-phone .window…` geometry rule in `ezil-shell.css`: the
+ * `:has()` arm here computes to (0,6,0), so a plainer selector in a
+ * later-concatenated sheet loses on specificity and silently does nothing. */
+.device-phone .window.window-app,
+.device-phone .window:not(.window-alert):not(.window-filedialog):has(> .window-body.window-body-app) {
     transform: none;
-    width: 100%;
-    left: 0;
-    height: 100dvh;
-    min-height: 100dvh;
-    top: 0 !important;
+    top: env(safe-area-inset-top, 0px) !important;
+    left: env(safe-area-inset-left, 0px) !important;
+    width: calc(100% - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)) !important;
+    height: calc(
+        var(--ezil-vvh, 100dvh)
+        - env(safe-area-inset-top, 0px)
+        - env(safe-area-inset-bottom, 0px)
+    ) !important;
+    min-height: 0;
     border-radius: 0;
 }
 .device-phone .taskbar {
     /* Force taskbar to bottom on mobile devices, overriding any position classes */
     position: fixed !important;
-    bottom: 5px !important;
+    /* MODIFIED BY EZIL 2026-08-19 (W7): was a flat `5px`. Two things sit under
+       a phone's "bottom" that this did not account for.
+
+       `--ezil-kb` is the number of pixels of the layout viewport currently
+       obscured by a raised software keyboard, published on `<body>` by
+       `boot.js`'s `publish_viewport_metrics`. `position: fixed` is relative to
+       the LAYOUT viewport, which does not shrink for the keyboard on iOS or on
+       Android's default `resizes-visual` mode — so without this term the dock
+       sits behind the keyboard for as long as it is up. It is floored at 60px
+       in `boot.js` so a collapsing URL bar cannot jitter it.
+
+       `env(safe-area-inset-bottom)` is the home indicator on a notched phone.
+       It resolves to 0 everywhere it does not apply, including in every test
+       browser, so it changes nothing that is currently measured. */
+    bottom: calc(5px + var(--ezil-kb, 0px) + env(safe-area-inset-bottom, 0px)) !important;
     left: 50% !important;
     right: auto !important;
     top: auto !important;

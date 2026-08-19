@@ -183,6 +183,17 @@ export interface GuacamolePreviewRequest {
      *  unless its SANDBOX_DEFAULT_DESKTOP_MODE env var says otherwise. */
     desktopMode: 'neko';
     token: string;
+    /**
+     * The X screen the container should BOOT at, already snapped to the closed
+     * mode table (`SCREEN_MODES` below) by `resolveScreenRequest`.
+     *
+     * 🔴 OMITTED ENTIRELY, never sent as a default, when the caller asked for
+     * nothing or asked for something rejected. The Worker only injects
+     * `NEKO_SCREEN` when this field is present, so "absent" and "1920x1080"
+     * produce byte-for-byte the same container — which is what makes an OLD
+     * shell bundle against a NEW server behave exactly as it does today.
+     */
+    screen?: { width: number; height: number };
 }
 
 export interface GuacamolePreviewSuccess {
@@ -1580,6 +1591,92 @@ export async function probeDesktopFrame(
     }
 }
 
+// ─── The probe that was a coin flip, and the re-probe that is not ────────────
+//
+// 🔴 A SINGLE 6-SECOND GET WAS DECIDING 38% OF DESKTOP LAUNCHES.
+//
+// `desktop_unreachable` has exactly one producer: the pre-handoff guard in
+// `routers/cloudflare-guacamole.ts`. In all ten observed production failures
+// THE WORKER SUCCEEDED — it returned `ok` with a `guacamoleUrl`,
+// `ensureDesktop` had already passed `desktop_ready_wait`, and the port was
+// exposed. What failed was `probeDesktopFrame` above: one GET, no retry.
+//
+// The discriminator is decisive rather than suggestive: `codePreviewUrl` has NO
+// frame probe at all, and in every one of those failures the code app minted
+// successfully on the same sandbox in the same seconds. The launch with a probe
+// failed; the launch without one succeeded.
+//
+// The mechanism is that the edge answers FAST and WRONG during a normal boot
+// transition. `proxyToSandbox` returns `404 INVALID_TOKEN`,
+// `410 STALE_PREVIEW_URL` and `500 Container suddenly disconnected` in well
+// under a second while a container is still settling. All are `>= 400`, so the
+// probe reports `alive:false` immediately — a 27.9s success and a 33s failure
+// are the same boot, and the probe merely missed at the finish line.
+//
+// 🔴 THE CORRECT POLICY ALREADY EXISTED AND NEVER RAN. `FRAME_CONFIRM_DEADLINE_MS`
+// (45s, `components/desktop/boot-phases.ts`) carries a comment saying anything
+// shorter "would fire the deadline BEFORE the caller had finished asking,
+// turning a slow confirmation into a fabricated failure". This 6s server-side
+// probe fires first, so that 45s policy was dead code in practice.
+//
+// ── What this costs ─────────────────────────────────────────────────────────
+// ZERO on a healthy boot: the first probe answers `alive` and the loop breaks
+// before any sleep. At most +20s on a boot that was going to fail anyway —
+// inside the route's `maxDuration = 300` and well inside the shell's own 215s
+// `DESKTOP_BOOT_TIMEOUT_MS`.
+//
+// 🔴 `probeDesktopFrame`'s own default is deliberately UNCHANGED. `confirmFrame`
+// (the shell's post-handoff `?confirm=frame` check) shares that function and is
+// a genuinely one-shot question asked repeatedly by a client that owns its own
+// retry policy. Lengthening it there would make each of those asks slower
+// without making any of them more informative.
+
+/** Whole budget for the pre-handoff frame confirmation, across all attempts. */
+export const DESKTOP_FRAME_CONFIRM_BUDGET_MS = 20_000;
+
+/** Gap between attempts. Long enough not to hammer the edge, short enough to catch a fast settle. */
+export const DESKTOP_FRAME_CONFIRM_GAP_MS = 1_500;
+
+/**
+ * Ask the desktop origin whether it is serving, and keep asking until it is or
+ * the budget runs out.
+ *
+ * Reports `attempts` and `elapsedMs` alongside the verdict so a failure can be
+ * read as "we asked N times over M ms and it never answered" rather than as an
+ * unqualified "unreachable" — which is what nobody could tell apart before.
+ *
+ * NEVER THROWS: every attempt is a `probeDesktopFrame`, which never throws.
+ */
+export async function confirmDesktopFrame(
+    rawUrl: string,
+    budgetMs: number = DESKTOP_FRAME_CONFIRM_BUDGET_MS,
+    gapMs: number = DESKTOP_FRAME_CONFIRM_GAP_MS,
+): Promise<DesktopFrameProbe & { attempts: number; elapsedMs: number }> {
+    const started = Date.now();
+    let attempts = 0;
+    let last: DesktopFrameProbe = { alive: false, reason: 'unreachable', detail: 'no probe attempted' };
+
+    for (;;) {
+        attempts++;
+        // Each attempt gets the SHORTER of the per-probe timeout and whatever
+        // is left of the whole budget, so the loop cannot overrun its own
+        // ceiling by up to a full probe timeout on the last try.
+        const remaining = started + budgetMs - Date.now();
+        last = await probeDesktopFrame(rawUrl, Math.max(1, Math.min(DESKTOP_FRAME_PROBE_TIMEOUT_MS, remaining)));
+        if (last.alive) break;
+        // 🔴 `bad_url` is DETERMINISTIC — an unparseable or non-HTTP URL is the
+        // same answer however many times it is asked, and retrying it would
+        // spend the whole budget learning nothing. Every other reason
+        // (`http_error`, `unreachable`) is exactly the transient the retry
+        // exists for.
+        if (last.reason === 'bad_url') break;
+        if (Date.now() + gapMs >= started + budgetMs) break;
+        await sleep(gapMs);
+    }
+
+    return { ...last, attempts, elapsedMs: Date.now() - started };
+}
+
 // ─── Did any pixels actually reach the browser? ───────────────────────────────
 //
 // 🔴 THE SECOND BLIND SPOT, ONE LAYER BELOW THE FIRST.
@@ -2206,4 +2303,474 @@ export async function enableImplicitHosting(
     // make the next login unavoidable. `cacheNekoAdminToken` above owns the
     // token's lifetime now and logs out whatever it replaces; a container that
     // is torn down before the TTL takes its own sessions with it.
+}
+
+// ─── The requestable screen modes, and the snap that chooses one ──────────────
+//
+// The streamed desktop used to be hard-pinned to 1920x1080 (`start-neko.sh`'s
+// `NEKO_SCREEN=${NEKO_SCREEN:-1920x1080x24}`), and the shell letterboxed it to
+// 16:9 whatever shape the window was. On a 390x844 phone that produced a
+// 390x219 strip — about a quarter of the screen, at a 4.9x downscale.
+//
+// This section is the app-side half of the fix: it turns a MEASUREMENT the
+// shell made of its own window into one of a closed list of screen modes, and
+// reports back which one, and why. The Worker (`worker/src/screen-modes.ts`)
+// re-validates independently and is the only place a mode becomes an
+// `NEKO_SCREEN` string.
+//
+// 🔴 THE TABLE IS DUPLICATED IN THE WORKER, ON PURPOSE. The two are separate
+// deploy targets and cannot import each other — the same situation as
+// `worker/src/preview-timeouts.ts` and its canonical twin. The Worker's
+// `screen-modes.test.ts` reads THIS FILE and fails if the two lists differ, so
+// the copies cannot drift silently. This copy is the canonical one: snapping
+// (and therefore the `source` the shell is told) happens here.
+
+/** One entry of the closed mode table. */
+export interface ScreenMode {
+    width: number;
+    height: number;
+}
+
+/** Where a served screen size came from, as reported to the shell. */
+export type ScreenModeSource =
+    /** The shell's ask was already a table entry and was honoured verbatim. */
+    | 'requested'
+    /** A different table entry was chosen — nearest by aspect, then by area. */
+    | 'snapped'
+    /** Nothing was asked, or the ask was rejected. 1920x1080. */
+    | 'default';
+
+/** The resolved answer: what will be applied, and why. */
+export interface ResolvedScreen extends ScreenMode {
+    source: ScreenModeSource;
+}
+
+/** The default, the fallback, and the largest mode there is. */
+export const DEFAULT_SCREEN_MODE: ScreenMode = { width: 1920, height: 1080 };
+
+/** No mode may exceed this many pixels — see `docs/PLATFORM-NOTES.md` §23. */
+export const SCREEN_PIXEL_CEILING = 1920 * 1080;
+
+/**
+ * Sanity bounds on a REQUEST (not on a mode). Anything outside is rejected
+ * rather than snapped: it is not a plausible measurement of a window, and
+ * snapping it would invent a screen nobody asked for.
+ */
+export const MIN_REQUESTED_AXIS = 64;
+export const MAX_REQUESTED_AXIS = 16384;
+
+/**
+ * How close two aspect ratios have to be (in log space, so ~1%) to count as
+ * THE SAME aspect class, inside which area decides.
+ *
+ * 🔴 NOT a rounding fudge — it is what the platform's own quantisation forces.
+ * The three 16:9 entries are bit-identical in ratio, but the portrait
+ * "9:16 cheaper" mode is `896x1600` (0.5600) rather than `900x1600` (0.5625)
+ * because Xvfb floors screen widths to a multiple of 8. Without a tolerance
+ * that 0.4% difference would make `896x1600` its own aspect class and win
+ * every phone request on aspect alone — so a phone would get 1,433,600 pixels
+ * where the area rule says it should get either 921,600 or 2,073,600. The
+ * nearest DISTINCT pair of classes in this table is 4:3 vs 5:4, 0.065 apart in
+ * log space, so 0.01 cannot merge two classes that were meant to be different.
+ */
+const ASPECT_CLASS_TOLERANCE = 0.01;
+
+/**
+ * Xvfb rounds the screen WIDTH down to a multiple of this and reports success.
+ *
+ * 🔴 MEASURED against a real container, not assumed: `900x1600` produces a
+ * display that is actually `896x1600`, and `902x902` produces `896x902`.
+ * Height is NOT quantised (`1080x1918` applies exactly). This is why the
+ * table's phone-portrait-cheaper entry reads `896x1600` rather than the
+ * contract's original `900x1600` — that was the one entry the platform could
+ * not deliver, and it would have shipped as a size we told the client we had
+ * applied and had not.
+ */
+export const SCREEN_WIDTH_ALIGNMENT = 8;
+
+/**
+ * Fixed text — exactly the modes the container's X server can actually be set
+ * to. Order matters only as the final, deterministic tie-break in
+ * `snapScreenMode`.
+ *
+ * Every width and height is EVEN (vp8 encoding of an odd dimension is a known
+ * source of chroma artefacts) and every WIDTH is a multiple of
+ * `SCREEN_WIDTH_ALIGNMENT` (see above).
+ */
+export const SCREEN_MODES: readonly ScreenMode[] = [
+    { width: 1920, height: 1080 }, // 16:9  landscape — default; desktop
+    { width: 1600, height: 900 }, //  16:9  landscape — smaller desktop window
+    { width: 1280, height: 720 }, //  16:9  landscape — low-bandwidth / small window
+    { width: 1440, height: 900 }, //  16:10 landscape — laptop
+    { width: 1280, height: 800 }, //  16:10 landscape — laptop
+    { width: 1024, height: 768 }, //  4:3   landscape — tablet landscape
+    { width: 1280, height: 1024 }, // 5:4   landscape — legacy monitor
+    { width: 1200, height: 1600 }, // 3:4   portrait  — tablet portrait
+    { width: 1080, height: 1920 }, // 9:16  portrait  — phone portrait
+    { width: 896, height: 1600 }, //  9:16  portrait  — phone portrait, cheaper (896, not 900 — see SCREEN_WIDTH_ALIGNMENT)
+    { width: 720, height: 1280 }, //  9:16  portrait  — phone portrait, cheapest
+    { width: 768, height: 1024 }, // 3:4   portrait  — tablet portrait, cheaper
+];
+
+/** Is this pair one of the modes above, exactly? */
+export function isScreenMode(width: unknown, height: unknown): boolean {
+    return SCREEN_MODES.some((m) => m.width === width && m.height === height);
+}
+
+function isPlainAxis(value: unknown): value is number {
+    return (
+        typeof value === 'number' &&
+        Number.isInteger(value) &&
+        value >= MIN_REQUESTED_AXIS &&
+        value <= MAX_REQUESTED_AXIS
+    );
+}
+
+/**
+ * Read a `screen` value off an untrusted request body.
+ *
+ * Returns `null` — never a coerced guess — for anything that is not an object
+ * carrying two PLAIN INTEGERS in range. `"1080"`, `1080.5`, `NaN`, `Infinity`,
+ * `-1080` and `1e9` are all `null`, and `null` means "behave exactly as before
+ * this field existed".
+ */
+export function parseRequestedScreen(raw: unknown): ScreenMode | null {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const { width, height } = raw as { width?: unknown; height?: unknown };
+    if (!isPlainAxis(width) || !isPlainAxis(height)) return null;
+    return { width, height };
+}
+
+/**
+ * Choose the table entry nearest to a request: **by aspect ratio first, then by
+ * area**, exactly as the contract states.
+ *
+ * 🔴 Aspect distance is measured on the LOG of the ratio, not on the ratio
+ * itself. `|a - b|` is not scale-symmetric: 16:9 (1.778) and 5:4 (1.25) are
+ * 0.53 apart while their portrait mirrors 9:16 (0.5625) and 4:5 (0.8) are only
+ * 0.24 apart, so a plain difference silently gives portrait asks less
+ * discrimination than their landscape mirrors. `|ln a − ln b|` gives both the
+ * same.
+ *
+ * "Then by area" means NEAREST area to the request, not largest: a phone asking
+ * for 1170x2532 wants a 9:16 screen it can actually afford, and the table
+ * offers three. Preferring the largest would put every phone at the
+ * 2,073,600-pixel ceiling.
+ *
+ * Ties inside an aspect class are broken by table order, so the answer is a
+ * pure function of its inputs and does not depend on sort stability.
+ */
+export function snapScreenMode(
+    width: number,
+    height: number,
+): ScreenMode & { source: 'requested' | 'snapped' } {
+    if (isScreenMode(width, height)) return { width, height, source: 'requested' };
+
+    const askAspect = Math.log(width / height);
+    const askArea = width * height;
+
+    let best: ScreenMode = SCREEN_MODES[0] ?? DEFAULT_SCREEN_MODE;
+    let bestAspect = Number.POSITIVE_INFINITY;
+    let bestArea = Number.POSITIVE_INFINITY;
+
+    for (const mode of SCREEN_MODES) {
+        const aspect = Math.abs(Math.log(mode.width / mode.height) - askAspect);
+        const area = Math.abs(mode.width * mode.height - askArea);
+        // `ASPECT_CLASS_TOLERANCE` groups the three 16:9 entries (and the three
+        // 9:16, and the two 3:4) as EQUAL — see its own comment for why an
+        // exact comparison is not enough once the platform's 8-pixel width
+        // quantisation is in the table. Inside a class, area decides.
+        if (aspect < bestAspect - ASPECT_CLASS_TOLERANCE) {
+            best = mode;
+            bestAspect = aspect;
+            bestArea = area;
+        } else if (aspect <= bestAspect + ASPECT_CLASS_TOLERANCE && area < bestArea) {
+            best = mode;
+            bestAspect = Math.min(bestAspect, aspect);
+            bestArea = area;
+        }
+    }
+
+    return { width: best.width, height: best.height, source: 'snapped' };
+}
+
+/**
+ * The whole server-side rule, in one place: untrusted value in, applied screen
+ * out. A rejected or absent ask is `default` at 1920x1080 — which is also what
+ * the container boots at when no `NEKO_SCREEN` is injected, so `default` and
+ * "this field did not exist" are byte-for-byte the same container.
+ */
+export function resolveScreenRequest(raw: unknown): ResolvedScreen {
+    const parsed = parseRequestedScreen(raw);
+    if (!parsed) return { ...DEFAULT_SCREEN_MODE, source: 'default' };
+    return snapScreenMode(parsed.width, parsed.height);
+}
+
+// ─── Live resize (POST /sandbox/:name/screen) ─────────────────────────────────
+
+/** Closed error set for a live-resize attempt. Fixed text; the shell renders these. */
+export type ScreenErrorCode = 'BAD_REQUEST' | 'NOT_FOUND' | 'UNSUPPORTED' | 'UPSTREAM' | 'TIMEOUT';
+
+export type GuacamoleScreenResult =
+    | {
+          ok: true;
+          /**
+           * What the X display ACTUALLY is, read back after the set — not what
+           * was asked for. See `requestGuacamoleScreen`'s doc comment.
+           */
+          width: number;
+          height: number;
+          /** False when the read-back did not answer, so `width`/`height` are the ASK. */
+          verified: boolean;
+      }
+    | { ok: false; code: ScreenErrorCode; message: string };
+
+/**
+ * Ask a LIVE container to change its X screen mode.
+ *
+ * Signed with the same HMAC envelope as `requestGuacamoleFocusApp` above, and
+ * for the same reason: this is a control-plane call to a container the caller
+ * has already been proven to own.
+ *
+ * 🔴 NEVER THROWS, and never reports a success it did not observe. Every
+ * failure comes back as one of the five closed codes so the shell can decide
+ * between "stop asking and letterbox forever" (`UNSUPPORTED`) and "this one
+ * attempt failed" (everything else) without parsing prose.
+ *
+ * 🔴 THE SIZE THAT COMES BACK IS A READ-BACK, NOT AN ECHO. Measured against a
+ * real container: neko's own `POST /api/room/screen` answers 200 and echoes
+ * the REQUEST — asking for `900x1600` returns `{"width":900,"height":1600}`
+ * while the display is actually `896x1600`. The Worker therefore re-reads
+ * `GET /api/room/screen` after every set and reports THAT; `verified: false`
+ * means the read-back did not answer and the numbers are only the ask. The
+ * caller must not claim `source: 'requested'` on an unverified answer.
+ *
+ * `UNSUPPORTED` is not a condition to retry: it is what a container answers for
+ * a size outside the framebuffer it started with (measured: HTTP 422, display
+ * unchanged), and no number of retries grows a framebuffer.
+ */
+export async function requestGuacamoleScreen(
+    config: CloudflareGuacamoleConfig,
+    hmacSecret: string,
+    sandboxName: string,
+    width: number,
+    height: number,
+    correlationId: string = newCorrelationId(),
+): Promise<GuacamoleScreenResult> {
+    if (!config.isConfigured) {
+        return { ok: false, code: 'NOT_FOUND', message: 'provider_not_configured' };
+    }
+    // Belt and braces with the procedure's own zod check: this helper is
+    // exported and directly callable, and the value it is about to put on the
+    // wire ends up next to an X server.
+    if (!isScreenMode(width, height)) {
+        return { ok: false, code: 'BAD_REQUEST', message: 'not_a_screen_mode' };
+    }
+
+    const token = mintSandboxPreviewToken(hmacSecret);
+    const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/screen`;
+
+    try {
+        const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                [CORRELATION_HEADER]: correlationId,
+            },
+            body: JSON.stringify({ width, height }),
+            // A mode set is a capture-pipeline restart inside the container.
+            // Its real cost is UNMEASURED (no container run was available);
+            // 20s is above the 15s the sibling control routes use and still
+            // far below any route budget.
+            signal: AbortSignal.timeout(20_000),
+        });
+
+        // Same parse-either-way rule as `requestGuacamoleFocusApp`: the Worker
+        // answers a refused resize as a non-2xx WITH a JSON body carrying the
+        // reason.
+        const text = await res.text().catch(() => '');
+        let data: { ok?: unknown; error?: unknown; width?: unknown; height?: unknown; verified?: unknown } = {};
+        try {
+            data = text ? (JSON.parse(text) as typeof data) : {};
+        } catch {
+            // Non-JSON (an edge error page). The raw text still reaches the log.
+        }
+
+        if (res.ok && data.ok === true) {
+            // Strict: a success that names no size is a success we cannot act
+            // on, and inventing the ask back would be exactly the echo this
+            // whole read-back exists to avoid.
+            const observed =
+                Number.isInteger(data.width) && Number.isInteger(data.height)
+                    ? { width: data.width as number, height: data.height as number }
+                    : null;
+            if (!observed) {
+                return { ok: false, code: 'UPSTREAM', message: 'worker confirmed a size it did not name' };
+            }
+            return { ok: true, ...observed, verified: data.verified === true };
+        }
+
+        const workerError = typeof data.error === 'string' ? data.error : '';
+        console.warn('[cloudflare-guacamole] screen request rejected', {
+            sandboxName,
+            width,
+            height,
+            status: res.status,
+            body: text.slice(0, 300),
+        });
+        return {
+            ok: false,
+            code: classifyScreenFailure(res.status, workerError),
+            message: workerError || `worker_http_${res.status}`,
+        };
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const timedOut = err instanceof Error && err.name === 'TimeoutError';
+        console.warn('[cloudflare-guacamole] screen request failed (non-fatal):', {
+            sandboxName,
+            width,
+            height,
+            error: message,
+        });
+        return { ok: false, code: timedOut ? 'TIMEOUT' : 'UPSTREAM', message };
+    }
+}
+
+// ─── Reading the desktop's real size back (GET /api/room/screen) ─────────────
+
+/** Budget for the boot-time screen read-back. It is on the desktop-open critical path. */
+export const SCREEN_READBACK_TIMEOUT_MS = 3_000;
+
+/**
+ * What the container's X display ACTUALLY is, asked of neko itself.
+ *
+ * ── Why this exists rather than trusting `NEKO_SCREEN` ──────────────────────
+ * The boot env is a REQUEST. What the X server did with it is a separate fact,
+ * and they are measurably not always the same: Xvfb floors the screen width to
+ * a multiple of 8 and reports success, so `900x1600` becomes `896x1600` with
+ * nothing in the response saying so. Every mode in `SCREEN_MODES` is
+ * 8-aligned precisely so that cannot happen — but "cannot happen because of an
+ * argument" is exactly the kind of claim this repo has been burned by, and one
+ * cheap GET turns it into an observation.
+ *
+ * ── Why it uses the CACHED admin token ──────────────────────────────────────
+ * `enableImplicitHosting` logs into this same origin, with this same derived
+ * password, milliseconds earlier in the same request, and hands the token to
+ * `nekoAdminTokens`. So on the boot path this is ONE small GET, not a login
+ * plus a GET. Minting is still available for a cold instance, and a 401 on a
+ * reused token drops it and re-mints once — the same shape
+ * `probeDesktopDisplay` already uses.
+ *
+ * NEVER THROWS. Returns null for anything that is not a well-formed answer: a
+ * non-2xx, a non-JSON body, or one whose `width`/`height` are not plain
+ * integers. Null means "we do not know", never a guess — the caller reports
+ * `source: 'default'`/`'snapped'` rather than claiming a size it never saw.
+ */
+export async function readDesktopScreen(
+    desktopUrl: string,
+    adminPassword: string,
+    timeoutMs: number = SCREEN_READBACK_TIMEOUT_MS,
+): Promise<{ width: number; height: number } | null> {
+    let origin: string;
+    try {
+        const u = new URL(desktopUrl);
+        if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+        origin = u.origin;
+    } catch {
+        return null;
+    }
+
+    const deadline = AbortSignal.timeout(timeoutMs);
+
+    const login = async (): Promise<string | null> => {
+        const res = await fetch(`${origin}/api/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 'ezil-os-screen', password: adminPassword }),
+            cache: 'no-store',
+            signal: deadline,
+        });
+        if (!res.ok) return null;
+        const body = (await res.json()) as { token?: unknown };
+        if (typeof body.token !== 'string' || body.token.length === 0) return null;
+        cacheNekoAdminToken(origin, adminPassword, body.token);
+        return body.token;
+    };
+
+    const ask = async (token: string) =>
+        fetch(`${origin}/api/room/screen`, {
+            headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+            cache: 'no-store',
+            signal: deadline,
+        });
+
+    try {
+        let token = cachedNekoAdminToken(origin, adminPassword);
+        const reused = token !== null;
+        if (token === null) {
+            token = await login();
+            if (token === null) return null;
+        }
+
+        let res = await ask(token);
+        if (reused && (res.status === 401 || res.status === 403)) {
+            dropNekoAdminToken(origin, token);
+            const fresh = await login();
+            if (fresh === null) return null;
+            token = fresh;
+            res = await ask(token);
+        }
+        if (!res.ok) return null;
+
+        const body = (await res.json()) as { width?: unknown; height?: unknown };
+        if (!Number.isInteger(body.width) || !Number.isInteger(body.height)) return null;
+        const width = body.width as number;
+        const height = body.height as number;
+        if (width <= 0 || height <= 0) return null;
+        return { width, height };
+    } catch {
+        // Timeout, transport failure, non-JSON body. None is an observation of
+        // the screen, and none may be dressed up as one.
+        return null;
+    }
+}
+
+/**
+ * Turn an OBSERVED screen into the `source` the shell is told, given what the
+ * shell originally asked for.
+ *
+ * 🔴 `requested` is a claim about the CLIENT's ask matching REALITY, not about
+ * the server having accepted it. So it is only ever produced from an
+ * observation: an unverified size is `snapped` at best, because "we set it and
+ * were not able to check" is not the same statement as "you got what you asked
+ * for".
+ */
+export function describeAppliedScreen(
+    requested: ScreenMode | null,
+    observed: ScreenMode,
+): ResolvedScreen {
+    const matches =
+        requested !== null && requested.width === observed.width && requested.height === observed.height;
+    return { width: observed.width, height: observed.height, source: matches ? 'requested' : 'snapped' };
+}
+
+/**
+ * Map the Worker's answer onto the closed code set.
+ *
+ * The Worker's own `error` string is read BEFORE the HTTP status, because only
+ * the Worker can tell "the X server has no such mode" (`UNSUPPORTED`) from
+ * "neko refused for some other reason" (`UPSTREAM`) — both of which arrive
+ * here as the same 502.
+ */
+export function classifyScreenFailure(status: number, workerError: string): ScreenErrorCode {
+    const e = workerError.toLowerCase();
+    if (e.startsWith('screen_unsupported')) return 'UNSUPPORTED';
+    if (e.startsWith('screen_timeout')) return 'TIMEOUT';
+    if (e.startsWith('screen_bad_request') || e === 'invalid_json_body') return 'BAD_REQUEST';
+    if (e === 'screen_disabled' || e.startsWith('sandbox_not_found')) return 'NOT_FOUND';
+    if (status === 400) return 'BAD_REQUEST';
+    if (status === 401 || status === 403 || status === 404) return 'NOT_FOUND';
+    if (status === 408 || status === 504) return 'TIMEOUT';
+    return 'UPSTREAM';
 }

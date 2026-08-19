@@ -163,6 +163,22 @@ async function mintCodePreviewUrlOnce (computerId) {
     if ( ! res.ok ) {
         const code = data?.error?.code;
         if ( code === 'UNAUTHORIZED' ) return { ok: false, errorCode: 'unauthorized', message: data?.error?.message };
+        // 🔴 A 502/504 IS A CLASSIFIED FAILURE, NOT AN UNKNOWN ONE. Identical
+        // defect, identical treatment, to the one fixed in
+        // `session.js#openDesktopOnce` — see the long note there. This route
+        // handler is the same `shellErrorResponse` shape, so tRPC's own
+        // `BAD_GATEWAY` / `GATEWAY_TIMEOUT` arrives here verbatim in
+        // `data.error.code` and used to be flattened to `unknown`, which
+        // `classifyFailure` renders with the generic "if it keeps happening,
+        // let us know" copy. `fetch_failed` is the `BootErrorCode` that maps to
+        // `worker_unreachable` — what actually happened, and something the user
+        // can act on. The HTTP status is checked as well as the body code
+        // because a gateway can answer 502 with no JSON body at all, in which
+        // case `data` is `null` and the body code is the thing that is missing.
+        if ( code === 'BAD_GATEWAY' || code === 'GATEWAY_TIMEOUT'
+             || res.status === 502 || res.status === 504 ) {
+            return { ok: false, errorCode: 'fetch_failed', message: data?.error?.message };
+        }
         return { ok: false, errorCode: 'unknown', message: data?.error?.message ?? 'Something went wrong.' };
     }
 

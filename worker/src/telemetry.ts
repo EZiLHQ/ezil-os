@@ -131,6 +131,39 @@ export function selectTelemetryWorthy(events: readonly LogEvent[]): LogEvent[] {
   return events.filter((e) => e.outcome === 'error' || e.event === BOOT_SUMMARY_EVENT_NAME);
 }
 
+/**
+ * Force a `code` into the wire contract's `^[a-z0-9_]{1,64}$`.
+ *
+ * 🔴 THIS IS NOT COSMETIC, AND IT IS NOT DEFENSIVE PADDING. The app's ingest
+ * schema (`app/src/server/telemetry/schema.ts`) is `.strict()` and validates
+ * `code` against `/^[a-z0-9_]+$/`; `parseTelemetryBatch` drops a FAILING EVENT
+ * WHOLE. Until this function existed, this module only `.slice(0, 64)`d the
+ * code, so any producer whose code contained a hyphen, a dot, a slash or a
+ * capital had its event accepted here, written to R2, drained — and then
+ * silently discarded at the last validator, with nothing anywhere saying why.
+ *
+ * That is not hypothetical: `docs/BROWSER-FIX-CONTRACT.md` §8 specifies the
+ * codes for this change set as "short, lowercase, HYPHENATED", naming
+ * `screen-unsupported`, `screen-upstream`, `decor-still-present` and
+ * `xtest-dead`. Every one of those is invalid under the schema as written.
+ * The shell producer already normalises (`normalizeCode` in
+ * `shell/ezil/telemetry.js`, same rule, written first); this is the worker and
+ * container half of the same rule, so all three producers spell one event the
+ * same way and a `decor-still-present` from the container fingerprints
+ * identically to a `decor_still_present` from the shell.
+ *
+ * Never rejects — normalises. An empty/unusable input becomes `unknown`, which
+ * is a valid code, because dropping an event for a bad code is exactly the
+ * failure mode this function exists to remove.
+ */
+export function normalizeTelemetryCode(code: unknown): string {
+  const s = String(code ?? 'unknown')
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return (s || 'unknown').slice(0, 64);
+}
+
 /** Fresh id for a Worker-minted `TelemetryEventInput` (not a `correlationId` — every row gets its own). */
 function mintEventId(): string {
   try {
@@ -150,7 +183,11 @@ function mintEventId(): string {
 export function toTelemetryEventInput(logEvent: LogEvent): TelemetryEventInput {
   const eventClass: TelemetryEventClass =
     logEvent.event === BOOT_SUMMARY_EVENT_NAME ? 'boot_summary' : 'worker_exception';
-  const code = logEvent.errorCode ?? (logEvent.outcome === 'ok' ? 'ok' : 'unexpected_error');
+  // Normalised for the SAME reason the container path below is — see
+  // `normalizeTelemetryCode`. `errorCode` comes from `classifyError()`, which
+  // is already snake_case today, so this is a no-op in practice and a
+  // guarantee in principle.
+  const code = normalizeTelemetryCode(logEvent.errorCode ?? (logEvent.outcome === 'ok' ? 'ok' : 'unexpected_error'));
 
   const out: TelemetryEventInput = {
     eventId: mintEventId(),
@@ -239,7 +276,12 @@ export function parseContainerTelemetryLines(
       source: 'container',
       occurredAt,
       site: site.slice(0, 96),
-      code: code.slice(0, 64),
+      // 🔴 NOT `code.slice(0, 64)`. The container writes this field itself
+      // (`emit_telemetry()` in `scripts/start-neko.sh`, and any future direct
+      // NDJSON append), so it is the one `code` in this file that a human
+      // types by hand — and the app's ingest schema drops a whole event whose
+      // code does not match `^[a-z0-9_]+$`. See `normalizeTelemetryCode`.
+      code: normalizeTelemetryCode(code),
       outcome,
       correlationId: ctx.correlationId,
     };

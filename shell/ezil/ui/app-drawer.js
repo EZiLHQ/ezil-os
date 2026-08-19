@@ -215,7 +215,26 @@ export function attach_app_drawer (el_window, options = {}) {
     // desktop window that is not `window-active` renders perfectly and
     // ignores every click — the same symptom as a failed implicit-hosting
     // handshake, from a completely different cause.
-    $drawer.on('mousedown', () => {
+    //
+    // 🔴 `pointerdown` as well as `mousedown`, for the touch case: a mobile
+    // browser synthesizes `mousedown` only after `touchend`, so on a tap the
+    // iframe's pointer-events came back one whole gesture too late and the
+    // user's first tap was always swallowed. `pointerdown` fires for mouse,
+    // touch and pen alike, at the start of the press. `mousedown` stays bound
+    // as the fallback for anything without Pointer Events; the latch below
+    // makes the pair fire `focusWindow()` exactly once, because that function
+    // is not idempotent (every call bumps `window.last_window_zindex` and
+    // re-runs the whole focus side effect). Same shape as `UIWindow.js`'s
+    // `focus_on_press` — see the long comment there for why a latch and not a
+    // time window, and why the guard lives in the binding.
+    let pointer_press_pending = false;
+    $drawer.on('pointerdown mousedown', (e) => {
+        if ( e?.type === 'pointerdown' ) {
+            pointer_press_pending = true;
+        } else if ( pointer_press_pending ) {
+            pointer_press_pending = false;
+            return;
+        }
         setTimeout(() => $(el_window).focusWindow(), 0);
     });
 
