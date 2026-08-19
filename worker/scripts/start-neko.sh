@@ -811,6 +811,105 @@ launch_devserver() {
 # Neko's desktop manager connects to $DISPLAY at startup and panics if it is
 # unavailable, so the X server MUST be up before `neko serve` launches. Keyed
 # off the X display itself so a re-run reuses an already-running Xvfb.
+#
+# ── Framebuffer vs. screen: two different things that used to be one variable ─
+# `NEKO_SCREEN` was passed straight to `Xvfb -screen 0 <WxHxD>`, which sets the
+# framebuffer allocation AND the initial root-window size in one go. That
+# conflation is what pinned the desktop to one shape for the life of the
+# container, and it is the actual defect behind "the streamed desktop is
+# letterboxed into a strip on a phone".
+#
+# Measured behaviour of Xvfb's RANDR (docs/NEKO-GROUND-TRUTH.md §e, taken from a
+# real container, NOT theorised):
+#   * `POST /api/room/screen {"width":1280,"height":720,"rate":60}` returns 200
+#     and REALLY resizes the X root — `xdpyinfo` follows, and the maximized
+#     Chrome window re-lays-out with it. Xvfb's RANDR is not a stub.
+#   * A size LARGER than the boot-time `-screen` allocation is refused with
+#     HTTP 422 `cannot set screen size`.
+#   * `GET /api/room/screen/configurations` advertises exactly ONE entry — the
+#     boot-time size, with `"rate":0`. It is NOT the set of sizes that can be
+#     applied; do not treat it as one. The requestable set is fixed by §3 of
+#     docs/BROWSER-FIX-CONTRACT.md and enforced app-side.
+#
+# So the framebuffer is a CEILING, not a fixed size: every mode that fits inside
+# it is reachable at runtime. Splitting the two concepts is therefore the whole
+# fix, and it costs one Xvfb argument:
+#
+#   EZIL_X_FRAMEBUFFER — the ceiling. Must be the bounding box of every mode we
+#                        ever want to be selectable. Contract §3's twelve modes
+#                        are at most 1920 wide (1920x1080) and at most 1920 tall
+#                        (1080x1920), so the bounding box is 1920x1920x24. Note
+#                        this is a bounding box, not a mode: nothing ever
+#                        displays at 1920x1920.
+#   NEKO_SCREEN        — the INITIAL screen size, i.e. what the user first sees.
+#                        Unchanged in meaning and still per-session injectable
+#                        (contract §4.1: W2 writes it into the container boot
+#                        env from the shell's measured window). It is applied by
+#                        neko via `--desktop.screen` further down, because Xvfb
+#                        cannot be told a screen size distinct from its
+#                        framebuffer and this image has no `xrandr`.
+#
+# The framebuffer is clamped UP to contain NEKO_SCREEN in both axes. Without
+# that clamp an operator (or a future W2 bug) setting NEKO_SCREEN larger than
+# the framebuffer produces a boot where neko's initial `XRRSetScreenConfig`
+# silently fails and the desktop is left at the framebuffer size — a failure
+# mode nothing in this script currently detects.
+#
+# Both values are `WxHxD`. Depth is taken from NEKO_SCREEN, because depth is a
+# property of the visual the user actually gets and RANDR cannot change it;
+# contract §3 fixes it at 24 regardless.
+_screen_spec="$NEKO_SCREEN"
+NEKO_SCREEN_W=""; NEKO_SCREEN_H=""; NEKO_SCREEN_D=""
+if [[ "$_screen_spec" =~ ^([0-9]+)x([0-9]+)x([0-9]+)$ ]]; then
+  NEKO_SCREEN_W="${BASH_REMATCH[1]}"
+  NEKO_SCREEN_H="${BASH_REMATCH[2]}"
+  NEKO_SCREEN_D="${BASH_REMATCH[3]}"
+fi
+if [ -z "$NEKO_SCREEN_W" ] || [ "$NEKO_SCREEN_W" -eq 0 ] || [ "$NEKO_SCREEN_H" -eq 0 ]; then
+  # Contract §3: "1920x1080 stays the default and the fallback. If a mode
+  # request fails for any reason, the desktop must end up at 1920x1080, never
+  # at nothing." A malformed NEKO_SCREEN is exactly such a failure.
+  log "warning: NEKO_SCREEN='${_screen_spec}' is not a WxHxD spec — falling back to 1920x1080x24"
+  NEKO_SCREEN_W=1920; NEKO_SCREEN_H=1080; NEKO_SCREEN_D=24
+  NEKO_SCREEN="1920x1080x24"
+fi
+
+EZIL_X_FRAMEBUFFER="${EZIL_X_FRAMEBUFFER:-1920x1920x24}"
+_fb_w=""; _fb_h=""
+if [[ "$EZIL_X_FRAMEBUFFER" =~ ^([0-9]+)x([0-9]+)(x[0-9]+)?$ ]]; then
+  _fb_w="${BASH_REMATCH[1]}"
+  _fb_h="${BASH_REMATCH[2]}"
+fi
+if [ -z "$_fb_w" ] || [ "$_fb_w" -eq 0 ] || [ "$_fb_h" -eq 0 ]; then
+  log "warning: EZIL_X_FRAMEBUFFER='${EZIL_X_FRAMEBUFFER}' is not a WxH[xD] spec — falling back to 1920x1920"
+  _fb_w=1920; _fb_h=1920
+fi
+# Clamp up so the framebuffer always contains the initial screen in both axes.
+if [ "$NEKO_SCREEN_W" -gt "$_fb_w" ] || [ "$NEKO_SCREEN_H" -gt "$_fb_h" ]; then
+  log "warning: NEKO_SCREEN ${NEKO_SCREEN_W}x${NEKO_SCREEN_H} does not fit framebuffer ${_fb_w}x${_fb_h} — growing the framebuffer to contain it"
+  [ "$NEKO_SCREEN_W" -gt "$_fb_w" ] && _fb_w="$NEKO_SCREEN_W"
+  [ "$NEKO_SCREEN_H" -gt "$_fb_h" ] && _fb_h="$NEKO_SCREEN_H"
+fi
+EZIL_X_FRAMEBUFFER="${_fb_w}x${_fb_h}x${NEKO_SCREEN_D}"
+# 🔴 Xvfb's RANDR floors the screen WIDTH to a multiple of 8. Height is not
+#    quantised. Measured in a real container by asking for sizes either side of
+#    the boundary and reading back what was actually applied:
+#      request 900x1600 -> applied 896x1600      request 1080x1918 -> applied 1080x1918
+#      request 898x1600 -> applied 896x1600      request  902x902  -> applied  896x902
+#      request 904x1600 -> applied 904x1600      request 1082x1920 -> applied 1080x1920
+#    Worse, `POST /api/room/screen` echoes back the size that was REQUESTED,
+#    not the one that was applied — only `GET /api/room/screen` tells the truth.
+#    So a non-multiple-of-8 width fails SILENTLY at every layer above this one.
+#    Eleven of contract §3's twelve modes are already 8-aligned; `900x1600` is
+#    not, and is unreachable. This warns rather than snapping, because snapping
+#    here would hide a contract problem that belongs in §3.
+if [ $(( NEKO_SCREEN_W % 8 )) -ne 0 ]; then
+  log "warning: NEKO_SCREEN width ${NEKO_SCREEN_W} is not a multiple of 8 — Xvfb's RANDR will floor it to $(( NEKO_SCREEN_W / 8 * 8 )); the desktop will NOT be ${NEKO_SCREEN_W} wide"
+fi
+# Exported so validators and the neko-serve section below read exactly the
+# values Xvfb was actually started with, rather than re-deriving them.
+export NEKO_SCREEN EZIL_X_FRAMEBUFFER NEKO_SCREEN_W NEKO_SCREEN_H NEKO_SCREEN_D
+
 phase_start xvfb
 if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
   log "X display $DISPLAY already active — reusing"
@@ -839,8 +938,12 @@ else
     fi
     rm -f "$_x_lock" "/tmp/.X11-unix/X${_x_display_num}" 2>/dev/null || true
   fi
-  log "starting Xvfb on $DISPLAY ($NEKO_SCREEN)"
-  Xvfb "$DISPLAY" -screen 0 "$NEKO_SCREEN" -ac +extension RANDR -nolisten tcp >>"$LOG" 2>&1 &
+  # -screen takes the FRAMEBUFFER, not the screen the user sees. Xvfb comes up
+  # at the framebuffer size; `neko serve` immediately applies NEKO_SCREEN via
+  # `--desktop.screen` (see the neko-serve section below), and every later
+  # `POST /api/room/screen` can reach any size inside this box.
+  log "starting Xvfb on $DISPLAY (framebuffer $EZIL_X_FRAMEBUFFER; initial screen $NEKO_SCREEN, applied by neko)"
+  Xvfb "$DISPLAY" -screen 0 "$EZIL_X_FRAMEBUFFER" -ac +extension RANDR -nolisten tcp >>"$LOG" 2>&1 &
   # Recorded so teardown stops the X server too. It used to be missed entirely,
   # so a failed boot left $DISPLAY held by an orphaned Xvfb (with an orphaned
   # openbox and browser still drawing into it) for the life of the container.
@@ -1615,16 +1718,35 @@ log "video encoder: vp8 software, 1920x1080, 15fps, cpu-used=4, threads=2, ~2.0M
 # desktop with Xvfb, whose Xorg input ABI differs, so the custom driver cannot
 # be loaded. Disabling it makes neko fall back to standard X (XTEST) input,
 # which works on Xvfb — without it neko panics on `xf86-input-neko.sock` before
-# ever binding its HTTP listener. With the custom driver disabled neko falls
-# back to standard X input; whether pointer/keyboard events are actually
-# delivered over XTEST on this Xvfb base is UNVERIFIED (input travels over the
-# same WebRTC datachannel that is TURN-gated, so it cannot be exercised in
-# Phase 1). Do not assume working pointer/keyboard until TURN is wired and it is
-# tested end-to-end. The Phase-1 gate proven here is only that neko binds its
-# HTTP UI + WebSocket signaling on NEKO_HTTP_PORT; the visible pixel stream and
-# input remain WebRTC/TURN-gated (out of Phase-1 scope).
+# ever binding its HTTP listener.
+#
+# XTEST delivery on this Xvfb base is VERIFIED WORKING — pointer AND keyboard —
+# by a real container run: see docs/NEKO-GROUND-TRUTH.md §f, where true XTEST
+# (no XSendEvent fallback) synthetically clicked Chrome's new-tab button and
+# typed a URL into the omnibox. This comment previously said that was
+# UNVERIFIED; it is not any more. What remains WebRTC/TURN-gated is the
+# transport that carries a REMOTE user's input to neko, not neko's ability to
+# inject it into X once it arrives.
+#
+# `--desktop.screen "<W>x<H>@60"`: neko applies this with XRRSetScreenConfig at
+# startup ("INF setting initial screen size"). It is the mechanism that makes
+# NEKO_SCREEN the size the user first sees, now that Xvfb's `-screen` carries
+# the FRAMEBUFFER instead (see the X-display section above). Without it neko
+# falls through to the baked /etc/neko/neko.yaml `desktop.screen:
+# "1920x1080@60"` and every session would start 1920x1080 no matter what
+# NEKO_SCREEN said. Config precedence is neko's own Viper order documented in
+# the encoder section above — explicit CLI flag beats NEKO_* env beats
+# neko.yaml beats the compiled-in default — so the flag form is used here for
+# the same reason `--desktop.display` is: it cannot be shadowed.
+#
+# `@60` is a nominal refresh, not a measured one: the real frame rate is set by
+# the capture pipeline (15 fps, see the encoder section above). 60 matches the
+# rate the app layer sends in `POST /api/room/screen {"rate":60}` per contract
+# §4.2, so the initial screen and every later resize describe themselves the
+# same way.
 phase_start neko_serve_bind
-log "starting neko on 0.0.0.0:$NEKO_HTTP_PORT (pinned build, static=$NEKO_STATIC)"
+NEKO_DESKTOP_SCREEN_SPEC="${NEKO_SCREEN_W}x${NEKO_SCREEN_H}@60"
+log "starting neko on 0.0.0.0:$NEKO_HTTP_PORT (pinned build, static=$NEKO_STATIC, initial screen $NEKO_DESKTOP_SCREEN_SPEC inside framebuffer $EZIL_X_FRAMEBUFFER)"
 # Report ONLY whether a TURN relay is wired — never the credential values.
 if [ -n "${NEKO_WEBRTC_ICESERVERS_FRONTEND:-}" ]; then
   log "ICE: TURN relay configured via NEKO_WEBRTC_ICESERVERS_* (credentials redacted)"
@@ -1638,6 +1760,7 @@ NEKO_DESKTOP_INPUT_ENABLED="false" \
     --server.static "$NEKO_STATIC" \
     --desktop.input.enabled=false \
     --desktop.display "$DISPLAY" \
+    --desktop.screen "$NEKO_DESKTOP_SCREEN_SPEC" \
     --capture.video.display "$DISPLAY" >>"$LOG" 2>&1 &
 NEKO_PID=$!
 
