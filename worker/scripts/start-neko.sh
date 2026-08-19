@@ -2292,9 +2292,34 @@ case "$pixel_rc" in
     log "screen-pixel gate passed: the X framebuffer is painting (a non-black pixel was read directly from the root window; ${pixel_try} retries were needed)"
     ;;
   1)
-    log "ERROR: every sampled pixel of the X framebuffer is BLACK after ${NEKO_SCREEN_PIXEL_TRIES}s, even though a mandatory app window is mapped and viewable. Nothing in this image paints the root window, so a black framebuffer means no application is painting — refusing to report Neko readiness or start neko serve rather than serving a black desktop under 'ready ok'."
-    phase_end window_ready_gate error
-    exit 1
+    # 🔴 REPORTS, DOES NOT REFUSE — and that is a deliberate reversal, made
+    # against production evidence, not a softening of nerve.
+    #
+    # This gate shipped fatal (`phase_end window_ready_gate error; exit 1`) on
+    # the reasoning that serving a black desktop under `ready ok` is worse than
+    # serving nothing. Measured immediately afterwards: FOUR consecutive
+    # production opens went from "black picture" to no desktop at all
+    # (`desktop_unreachable` at 47.6s), while the container fleet reported
+    # healthy=3 active=2 failed=0. Failing closed on a fault that is currently
+    # hitting every container does not degrade the product, it removes it, and
+    # a retry cannot help when there is no healthy container to land on.
+    #
+    # The gate is NOT wrong — it is accurate, and that is the problem. Verified
+    # against a real Chrome in this exact image locally: window gate passed
+    # "mapped and owned by this boot", pixel probe read `lit=14400 peak=255` in
+    # 0 retries. So the check does not false-negative on a healthy desktop; the
+    # production containers really are black, and refusing them is refusing
+    # everything until the CAUSE is fixed.
+    #
+    # So: emit the observation loudly, on the record, and let the desktop
+    # serve. A user gets what they got yesterday plus a telemetry row naming
+    # it, instead of nothing. Restore `exit 1` the moment a black boot is the
+    # exception rather than the rule — the whole value of the probe is that
+    # it can now tell the difference, and the NDJSON row below is what will
+    # say when that day arrives.
+    log "ERROR: every sampled pixel of the X framebuffer is BLACK after ${NEKO_SCREEN_PIXEL_TRIES}s, even though a mandatory app window is mapped and viewable. Nothing in this image paints the root window, so a black framebuffer means no application is painting. Serving anyway (see this branch's comment); this desktop will show a black screen."
+    printf '{"eventClass":"display_failure","source":"container","site":"container:neko#picture","code":"screen_black_at_boot","outcome":"error","durationMs":%s}\n' \
+      "$((NEKO_SCREEN_PIXEL_TRIES * 1000))" >>"$TELEMETRY_NDJSON" 2>/dev/null || true
     ;;
   *)
     log "warning: screen-pixel gate SKIPPED — could not read the framebuffer (no python3, no libX11, or DISPLAY ${DISPLAY} not reachable from this process). This boot has NOT been checked for a black picture; the window checks above are all that ran."
