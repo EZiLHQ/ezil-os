@@ -119,8 +119,8 @@ shell/run-tests.sh — run every EZiL-OS shell suite and print one honest verdic
   --worker        also run `worker/` bun test
   --app           also run `app/` vitest
   --no-check      skip the `build-shell.sh --check` bundle-drift gate
-  --cost          also run the cost probes (display-gate-cost.mjs). KNOWN RED —
-                  a stale harness, not a regression; see the comment on that block.
+  --cost          also run the cost probes (display-gate-cost.mjs). A benchmark,
+                  not a suite: read its medians, it has no threshold.
   --strict        exit non-zero if ANY suite SKIPPED (use this in CI)
   --only <sub>    run only suites whose path contains <sub>
   -h, --help      this text
@@ -325,26 +325,26 @@ echo
 # wrong twice over — it would add wall time nobody asked for, and its number is
 # a measurement to be read, not a threshold to be passed.
 #
-# It is ALSO red right now, and that is the second reason it must not run by
-# default. MEASURED on the unmodified bundle in a clean worktree, under
-# playwright 1.61.1: it dies with an uncaught
+# It WAS red — and it is not any more. MEASURED red on the unmodified bundle
+# under playwright 1.61.1: an uncaught
 #   `page.waitForSelector: Timeout 15000ms exceeded` waiting for
-#   `.window[data-app="desktop"] .window-app-iframe`   (line 218)
-# — an uncaught exception, so it exits 1 and prints a stack rather than a
-# result. DIAGNOSED, not guessed: the file injects the bundle and then waits
-# for the desktop window WITHOUT ever calling `window.ezil.boot()` or
-# activating the dock item. It was written against a base where `boot.js`
-# auto-launched `apps[0]`; login now opens NOTHING (see `boot.js`'s header, and
-# the same merge note in `os-chrome-browser-test.mjs`'s `boot()` helper), so
-# nothing ever opens the Browser and the wait can only time out. It is a stale
-# harness, not a shell regression, and it fails identically before and after
-# every Phase 1 change. `display-gate-cost.mjs` is unowned in the Browser-fix
-# contract's §9 table, so this is reported rather than fixed here.
+#   `.window[data-app="desktop"] .window-app-iframe`
+# so it exited 1 with a stack instead of a result. W8 diagnosed it as a stale
+# harness rather than a shell regression: the file injected the bundle and then
+# waited for the desktop window WITHOUT ever calling `window.ezil.boot()` or
+# activating the dock item, having been written against a base where `boot.js`
+# auto-launched `apps[0]`. Login now opens NOTHING.
+#
+# FIXED by integration, 2026-08-19, in `display-gate-cost.mjs` itself — the same
+# `boot()` + dock-click pair `apps/os-chrome-browser-test.mjs` already uses, and
+# `t_boot` moved to after the click so `settle_ms` still measures the gate and
+# not script evaluation. It stays behind `--cost` because it is still a
+# benchmark and not a suite; it is no longer advertised as KNOWN RED, so a red
+# here now means something.
 if [ "$RUN_COST" = "1" ]; then
     echo "${C_B}[opt] cost probes${C_0}"
-    echo "${C_SKIP}  note: display-gate-cost.mjs is KNOWN RED — a stale harness, see the"
-    echo "        comment above this block. Its failure is not a regression.${C_0}"
-    run_suite "shell/ezil/display-gate-cost.mjs (cost probe, KNOWN RED)" 600 node "$HERE/ezil/display-gate-cost.mjs"
+    echo "${C_SKIP}  note: this is a BENCHMARK. Read its medians; it has no threshold.${C_0}"
+    run_suite "shell/ezil/display-gate-cost.mjs (cost probe)" 600 node "$HERE/ezil/display-gate-cost.mjs"
     echo
 fi
 

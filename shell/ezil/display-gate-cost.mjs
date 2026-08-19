@@ -208,9 +208,33 @@ async function run_once (browser, answer) {
 
     await page.goto(`${HOST}/os`, { waitUntil: 'load' });
     await page.evaluate((p) => { window.__EZIL_BOOT__ = p; }, PAYLOAD);
-    const t_boot = Date.now();
     await page.addScriptTag({ content: icons });
     await page.addScriptTag({ content: bundle });
+
+    // 🔴 STALE-HARNESS FIX (integration, 2026-08-19). This file used to inject
+    // the bundle and go straight to the `waitForSelector` below, because it was
+    // written against a base where `boot.js` auto-launched `apps[0]` and the
+    // desktop window therefore appeared for free. Login now opens NOTHING (see
+    // `boot.js`'s header), so nothing ever created the window and the probe died
+    // on an uncaught `Timeout 15000ms exceeded`, exit 1, every run, before and
+    // after every Phase 1 change. Same two lines, same reason, as
+    // `apps/os-chrome-browser-test.mjs`'s `boot()` helper — kept in step with it
+    // deliberately: there should be one idea of what "a booted shell" means.
+    //
+    // Block body, no implicit return: `boot()` resolves to live references that
+    // do not survive Playwright's structured clone.
+    await page.evaluate(async () => { await window.ezil.boot(); });
+    await page.evaluate(() => { $('.taskbar-item[data-app="desktop"]').trigger('click'); });
+
+    // 🔴 `t_boot` IS TAKEN AFTER THE DOCK CLICK, NOT BEFORE IT. `settle_ms` is
+    // "how long from the desktop window being asked for to the gate letting go";
+    // starting the clock before the bundle even parsed would fold script
+    // evaluation and a synthetic dock click into a number that is reported as a
+    // display-gate cost. The numbers this probe printed historically started at
+    // bundle injection, but they were also produced by a run that auto-opened
+    // the window as part of boot — so this is the same instant, reached the way
+    // the shell reaches it now.
+    const t_boot = Date.now();
 
     // The iframe will never load a real document (the desktop host 404s), so
     // fire `load` the way a real frame would once the src is set. This is the

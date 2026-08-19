@@ -215,20 +215,20 @@ describe('the app and the Worker agree on the mode table', () => {
   });
 });
 
-// ── W1's modelines ───────────────────────────────────────────────────────────
+// ── DELETED 2026-08-19 by integration: the Xorg modeline guard ──────────────
 //
-// `worker/assets/ebuilder-xorg.conf` is W1's file and does not exist yet. When
-// it lands, every mode this Worker will accept must be a mode the X server
-// actually advertises, or a live resize to it can only ever fail. Written now,
-// skipped until the file exists, so it starts guarding the moment W1 merges
-// rather than being remembered later.
-const XORG_CONF = fileURLToPath(new URL('../assets/ebuilder-xorg.conf', import.meta.url));
-const xorgConfExists = existsSync(XORG_CONF);
-
-describe('every requestable mode is advertised by the X server config', () => {
-  it.skipIf(!xorgConfExists)('has a modeline for each SCREEN_MODES entry', () => {
-    const conf = readFileSync(XORG_CONF, 'utf8');
-    const missing = SCREEN_MODES.filter((m) => !conf.includes(`${m.width}x${m.height}`));
-    expect(missing).toEqual([]);
-  });
-});
+// A `describe`/`it.skipIf` pair lived here asserting that every SCREEN_MODES
+// entry had a matching modeline in `worker/assets/ebuilder-xorg.conf`. That
+// file does not exist and NEVER WILL: the Xorg `dummy`-driver migration was
+// cancelled after Phase 0a — see the CORRECTED note in
+// `docs/BROWSER-FIX-CONTRACT.md` §3 and `docs/NEKO-GROUND-TRUTH.md` §e. Xvfb's
+// RandR is not a stub; `XRRSetScreenConfig` works against it and the startup
+// framebuffer is a CEILING, not a fixed size, so there is no mode list to
+// advertise and nothing for a modeline guard to check. W1 shipped one larger
+// framebuffer (`EZIL_X_FRAMEBUFFER`) instead of an Xorg config.
+//
+// It was written before that was known, and armed on a file's existence, so it
+// could only ever have done one of two things: skip forever, or wake up against
+// a file that would have to mean something entirely different. A permanently
+// skipped test is not a guard — it is a skip count nobody can explain. Removing
+// it takes the worker suite's skips back from 2 to 1.

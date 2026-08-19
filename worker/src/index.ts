@@ -3022,6 +3022,33 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         NEKO_PASSWORD: nekoCreds.user,
         NEKO_PASSWORD_ADMIN: nekoCreds.admin,
       };
+
+      // 🔴 KNOWN LIMITATION — A TROUBLESHOOT RESTART DROPS THE SCREEN SIZE.
+      // `handlePreview` sets `iceEnv.NEKO_SCREEN` from the caller's requested
+      // mode (see the "Boot-time screen sizing" block there). This path sets no
+      // `NEKO_SCREEN` at all, so the relaunched container falls back to
+      // `start-neko.sh:138`'s own `${NEKO_SCREEN:-1920x1080x24}` and a portrait
+      // desktop comes back landscape.
+      //
+      // NOT FIXED HERE, DELIBERATELY, and not because it is hard. The restart
+      // is initiated inside the DO with no caller-supplied body, so the only
+      // place the requested size could come from is DO storage — which means
+      // `handlePreview` (a Worker-side function, outside the DO) would have to
+      // gain an RPC that writes it, and `handleScreen` would have to update it
+      // on every live resize or the restart would restore a stale shape. That
+      // is a new persisted field on the sandbox lifecycle and it cannot be
+      // exercised anywhere but a real deployed Worker, so it is written down
+      // rather than guessed at. See `docs/RUNBOOK.md`.
+      //
+      // 🔴 AND THE SHELL DOES NOT SILENTLY REPAIR IT — CHECKED, NOT ASSUMED.
+      // The obvious hope is that Tier-2 (`/api/shell/screen`) re-asks. It does
+      // not. `desktop-window.js`'s `screen_ctl.request()` is driven ONLY by the
+      // ResizeObserver settle path, and a restart does not change the browser
+      // window's size, so no tick fires. Even if one did, the controller's
+      // `settled()` dedupe still holds the pre-restart `last_applied` /
+      // `last_sent` and would drop the request as already-answered. The desktop
+      // therefore stays 1920x1080, letterboxed, until the user closes and
+      // reopens the window (which re-runs the Tier-1 boot-time ask).
       const workspaceRoot = resolveWorkspaceMountConfig(this.env)?.mountPath ?? null;
 
       try {
