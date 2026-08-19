@@ -47,7 +47,29 @@ import { afterAll, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 
-const IMAGE = process.env.EZIL_VALIDATE_IMAGE ?? 'ezil-ground-truth:local';
+/**
+ * 🔴 DEFAULT CHANGED BY INTEGRATION, 2026-08-19: `ezil-ground-truth:local` ->
+ * `ezil-integrated:local`.
+ *
+ * `ezil-ground-truth:local` is a PHASE 0 SNAPSHOT — the image the ground-truth
+ * pass built and deliberately left on the host, from a tree that predates every
+ * fix in this effort. Validating the current `start-neko.sh` against it asks a
+ * two-week-old binary whether today's source works, and the honest answer is
+ * always no. That was harmless while both W1's and W3's assertions were
+ * `awaiting:*` (soft); the moment they were tightened to `now` it turned a
+ * correct build into two red tests.
+ *
+ * The default is therefore the image built FROM THIS TREE:
+ *
+ *     cd worker && docker build -t ezil-integrated:local .
+ *
+ * If it is absent the suite SKIPS with that exact command in the message —
+ * which is the honest outcome, and much better than passing against whatever
+ * old image happens to be lying around. `EZIL_VALIDATE_IMAGE` still overrides,
+ * which is how you point it at a registry tag or at the Phase 0 snapshot to
+ * reproduce a before/after.
+ */
+const IMAGE = process.env.EZIL_VALIDATE_IMAGE ?? 'ezil-integrated:local';
 const VALIDATOR = join(import.meta.dir, '..', 'scripts', 'validate-neko-browser-window.sh');
 const CONTAINER = `ezil-w9-validate-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -173,10 +195,29 @@ afterAll(() => {
 const itIfContainer = SKIP_REASON ? it.skip : it;
 
 /** Assertion ids that a named agent has not landed yet. */
-const AWAITING_OWNERS: Record<string, string> = {
-    'browser.chrome_frame.no_caption_buttons': 'W3 (seed browser.custom_chrome_frame=false)',
-    'screen.resize.portrait': 'W1 (raise the framebuffer to 1920x1920x24)',
-};
+/**
+ * 🔴 EMPTIED BY INTEGRATION, 2026-08-19 — both entries LANDED and were proven
+ * against a real container, so they are hard `now` assertions from here on.
+ *
+ * It held two ids while their fixes were in flight:
+ *   `browser.chrome_frame.no_caption_buttons` — W3
+ *   `screen.resize.portrait`                  — W1
+ *
+ * MEASURED, not assumed. `cd worker && docker build -t ezil-integrated:local .`
+ * (exit 0 — the FIRST time that build could succeed, because W1's Dockerfile
+ * COPYs W9's validator and that file only exists after the merge), then
+ * `EZIL_VALIDATE_IMAGE=ezil-integrated:local bun test
+ * src/neko-browser-window.container.test.ts` -> 8 pass / 0 fail, and this file
+ * printed `LANDED` for both ids. That also discharges the evidence contract §5.3
+ * still owed from W3: the pref demonstrably takes effect FROM `start-neko.sh`,
+ * not merely from a hand-run Chrome.
+ *
+ * The map stays here, and empty, on purpose. Anything added back is a red
+ * assertion somebody has claimed and dated; anything red that is NOT in here
+ * fails the suite as an unowned regression, which is the state we want to be
+ * the default. Do not re-populate it to make a red go away.
+ */
+const AWAITING_OWNERS: Record<string, string> = {};
 
 function byId (id: string): Assertion | undefined {
     return result?.assertions.find((a) => a.id === id);
