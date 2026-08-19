@@ -1319,6 +1319,81 @@ phase_end codeserver_launch ok
 # a corrupted one).
 rm -rf "$CHROME_PROFILE_DIR" 2>/dev/null || true
 mkdir -p "$CHROME_PROFILE_DIR" 2>/dev/null || true
+
+# ── The browser must NOT draw its own window frame ───────────────────────────
+# 🔴 MEASURED in a real container (docs/NEKO-GROUND-TRUTH.md §a–§d, §g), not
+# reasoned about. The bar the user sees inside the stream — with minimize /
+# restore / close buttons at the top right — is NOT an openbox titlebar.
+# Openbox is already doing exactly what ebuilder-openbox.xml tells it:
+#   _NET_FRAME_EXTENTS = 0, 0, 0, 0
+#   _NET_WM_STATE contains _OB_WM_STATE_UNDECORATED
+#   the openbox frame window is pixel-identical to its client (1920x1080+0+0)
+#   and all 55 of its decoration widgets are collapsed to 1x1
+# The class it matches on is literally `Google-chrome` and the match is
+# confirmed by openbox's own `_OB_APP_CLASS`. There is no WM decoration left
+# to remove, so DO NOT "fix" this by widening the openbox selector.
+#
+# ⚠️ AND THE OPPOSITE WARNING, WHICH THIS CHANGE CREATES. Before this change
+# the openbox <decor>no</decor> rule was REDUNDANT: Chrome's own
+# MWM_DECOR_NONE hint was already suppressing WM decoration, so pointing
+# openbox at a bogus class changed nothing (measured). After this change the
+# rule is LOAD-BEARING — Chrome now asks to be decorated, and openbox refusing
+# is the only reason there is no titlebar. Measured with the pref set and the
+# openbox rule deliberately mis-targeted: the window came back fully decorated,
+# `_NET_FRAME_EXTENTS = 1, 1, 20, 5`. So weakening, mistyping or re-scoping
+# that rule is now WORSE than doing nothing at all. `verify_browser_frame`
+# below checks `_NET_FRAME_EXTENTS` precisely to catch that regression.
+#
+# What draws the bar is Chrome's own tabstrip-integrated frame. On Linux,
+# Chrome's default is to draw that frame itself and to ask the WM not to
+# decorate it (`_MOTIF_WM_HINTS = 0x2, 0x0, 0x0, 0x0, 0x0` — flags =
+# MWM_HINTS_DECORATIONS, decorations = none). `browser.custom_chrome_frame` is
+# where Chrome persists the "Use system title bar and borders" toggle, and it
+# is ABSENT from a fresh profile, so nothing has ever told Chrome otherwise.
+#
+# Seeding it false makes Chrome ask for a SYSTEM frame instead — and openbox's
+# existing <decor>no</decor> then declines to draw one. Net result: tab strip
+# and omnibox at pixel row 0, no title bar, no caption buttons. Tabs and the
+# address bar are kept deliberately (approved product decision), which is why
+# this is NOT done with --kiosk or --app=.
+#
+# 🔴 The pref is seeded on EVERY boot because the profile directory is
+# `rm -rf`'d immediately above. There is nowhere persistent for it to live.
+#
+# VERIFIED that Chrome honours a hand-seeded file rather than discarding it —
+# Chrome 151.0.7922.71, same image, same flags, openbox with the same config:
+#   without the seed: _MOTIF_WM_HINTS = 0x2, 0x0, 0x0, 0x0, 0x0  (own frame)
+#   with the seed:    _MOTIF_WM_HINTS = 0x2, 0x0, 0x1, 0x0, 0x0  (system frame)
+# and the key was still `"custom_chrome_frame":false` in Preferences after
+# Chrome exited and rewrote the file — this key is not one of the MAC-protected
+# prefs, so it is neither rejected at startup nor scrubbed at shutdown.
+# `verify_browser_frame` below re-checks that third field on every boot rather
+# than trusting that this write took.
+#
+# EZIL_BROWSER_DECOR is the kill switch (contract §2): `off` (default) = no
+# decorations, i.e. seed the pref; `on` = leave Chrome on its default and get
+# its own frame back, exactly as before this change.
+EZIL_BROWSER_DECOR="${EZIL_BROWSER_DECOR:-off}"
+
+# Written with plain shell redirection — no jq, no python — because this runs
+# before anything has proven those exist, and a failure here must degrade to a
+# cosmetic regression, never to a failed boot.
+seed_chrome_frame_pref() {
+  _cf_default_dir="$1/Default"
+  mkdir -p "$_cf_default_dir" 2>/dev/null || return 1
+  cat >"$_cf_default_dir/Preferences" <<'CHROME_PREFS_JSON'
+{"browser":{"custom_chrome_frame":false}}
+CHROME_PREFS_JSON
+}
+
+if [ "$EZIL_BROWSER_DECOR" = "on" ]; then
+  log "EZIL_BROWSER_DECOR=on — leaving Chrome on its Linux default (it will draw its own frame, with its own minimize/maximize/close buttons, inside the stream)"
+elif seed_chrome_frame_pref "$CHROME_PROFILE_DIR"; then
+  log "browser frame: seeded browser.custom_chrome_frame=false into ${CHROME_PROFILE_DIR}/Default/Preferences (Chrome asks for a system frame; openbox <decor>no</decor> then draws none — no title bar, no caption buttons, tabs and omnibox kept)"
+else
+  log "WARNING: could not seed ${CHROME_PROFILE_DIR}/Default/Preferences — Chrome will fall back to its own custom frame and the stream will show a second set of window controls"
+fi
+
 # Deterministic, non-blank landing page. The mandatory native browser must come
 # up on real EZiL OS content with a known <title> ("EZiL OS Browser"), not
 # about:blank — so validators can positively assert the browser window is
@@ -1343,10 +1418,32 @@ fi
 # NOTE: same as `codeserver_launch` above — this only times the near-instant
 # supervised-process fork request; actual window-appearance time is measured
 # by the concurrent `window_ready_gate` phase below.
+#
+# 🔴 `--test-type` is here for ONE visible reason: it suppresses Chrome's
+# "You are using an unsupported command-line flag: --no-sandbox. Stability and
+# security will suffer." infobar, which otherwise eats a ~40px strip across the
+# top of the window in EVERY session (it is in the ground-truth screenshot).
+# `--no-sandbox` itself stays: it is required for Chrome to run in this
+# container and is not in scope to remove, so the banner is permanent unless
+# something suppresses it. (Why the sandbox cannot be used here was NOT
+# re-measured by this change — the flag was left exactly as it was found.)
+#
+# What it costs, stated plainly rather than waved away. `--test-type` does not
+# suppress that one string; it turns off the whole bad-flags warning path, so
+# if a future edit adds another security-weakening flag to this launch line, no
+# one will be warned on screen. It also suppresses assorted startup error
+# dialogs (e.g. the "profile in use" dialog). It does NOT weaken the sandbox
+# further than --no-sandbox already has, and — MEASURED on this image, not
+# assumed — it does not mark the browser as automated to web pages:
+# `navigator.webdriver` is still `false` and the User-Agent is unchanged
+# (`…Chrome/151.0.0.0 Safari/537.36`, no HeadlessChrome, no automation token).
+# `--noerrdialogs` was tried first as the narrower flag and does NOT suppress
+# this infobar — verified by screenshot on the running desktop.
 phase_start chrome_launch
 log "supervising mandatory native browser ($CHROME_BIN) into $DISPLAY (fresh, isolated user-data-dir — no host profile; home=$CHROME_HOME_URL)"
 supervise_app chromium "$NEKO_APP_MAX_RESTARTS" "$CHROME_BIN" \
   --no-sandbox \
+  --test-type \
   --disable-gpu \
   --disable-dev-shm-usage \
   --no-first-run \
@@ -1412,6 +1509,116 @@ fi
 exec wmctrl -i -a "$win_id"
 SWITCH_EOF
 chmod +x "$NEKO_SWITCH_APP_BIN"
+
+# ── Browser-frame read-back (contract §5.3) ─────────────────────────────────
+# Defined here, CALLED after the window-ready gate below — the window it reads
+# does not exist until that gate has seen it.
+#
+# This repo has already shipped one decoration rule whose only guard was a test
+# that grepped an XML file for a substring. A grep of a config file proves the
+# config file; it does not prove the window. So this reads the LIVE window's
+# properties out of the running X server after the browser is up, logs the
+# LITERAL WM_CLASS on every boot so the match target stops being a guess, and
+# emits contract §8 telemetry (`container:neko#decor` / `decor-still-present`)
+# when the browser is still wearing a frame.
+#
+# The two ways a frame can come back, both checked:
+#   1. Chrome draws its own — `_MOTIF_WM_HINTS` flags carry MWM_HINTS_DECORATIONS
+#      (0x2) with a decorations field of 0, i.e. "WM, don't decorate me, I've
+#      got this". That is the state ground truth measured, and the state the
+#      seeded pref is meant to flip to 0x1.
+#   2. Openbox draws one — a non-zero TOP value in `_NET_FRAME_EXTENTS`
+#      (left, right, top, bottom). Ground truth measured 0,0,0,0. This is the
+#      newly-possible failure: seeding the pref makes the openbox rule
+#      load-bearing (see the long note at the seed site), and a broken rule
+#      now yields a real WM titlebar — measured as 1, 1, 20, 5.
+#
+# Check 1 is deliberately the SAME property `validate-neko-browser-window.sh`
+# asserts as `browser.chrome_frame.no_caption_buttons` — the decorations field
+# of `_MOTIF_WM_HINTS`. Two checks agreeing on one property is the point; do
+# not re-derive "is it decorated" some third way here.
+#
+# This never fails the boot and never blocks it: a browser with an extra bar is
+# a cosmetic defect, and refusing to serve a desktop over one would be worse
+# than the defect. Every probe degrades to a log line.
+emit_decor_violation() {
+  printf '{"eventClass":"contract_violation","source":"container","site":"container:neko#decor","code":"decor-still-present","outcome":"error","durationMs":0}\n' \
+    >>"$TELEMETRY_NDJSON" 2>/dev/null || true
+}
+
+verify_browser_frame() {
+  local wm_line="" wid="" class_field="" motif="" vals="" flags="" decorations=""
+  local extents="" top_extent="" pref="" own_frame=0 wm_frame=0
+
+  if ! command -v wmctrl >/dev/null 2>&1; then
+    log "browser frame check COULD-NOT-DETERMINE: wmctrl not available"
+    return 0
+  fi
+  wm_line="$(wmctrl -x -l 2>/dev/null | awk 'tolower($3) ~ /chrome/ {print; exit}')"
+  if [ -z "$wm_line" ]; then
+    log "browser frame check COULD-NOT-DETERMINE: no window with a chrome WM_CLASS is listed by wmctrl"
+    return 0
+  fi
+  wid="$(printf '%s' "$wm_line" | awk '{print $1}')"
+  # The whole matched line, verbatim. NOT just awk's $3: the WM_CLASS instance
+  # Chrome publishes contains a space ("google-chrome (/tmp/chromium-app-data)"),
+  # so field 3 alone silently truncates the very string this line exists to
+  # record. The authoritative WM_CLASS is read off the window with xprop below.
+  log "browser window id=${wid} wmctrl line: ${wm_line}"
+
+  pref="$(grep -o '"custom_chrome_frame":[a-z]*' "${CHROME_PROFILE_DIR}/Default/Preferences" 2>/dev/null | head -n 1)"
+  log "browser frame pref now in profile: ${pref:-ABSENT} (EZIL_BROWSER_DECOR=${EZIL_BROWSER_DECOR})"
+
+  if ! command -v xprop >/dev/null 2>&1; then
+    log "browser frame check COULD-NOT-DETERMINE: xprop not available — cannot read _MOTIF_WM_HINTS/_NET_FRAME_EXTENTS off window ${wid}"
+    return 0
+  fi
+  if ! motif="$(xprop -id "$wid" _MOTIF_WM_HINTS 2>/dev/null)"; then
+    log "browser frame check COULD-NOT-DETERMINE: xprop could not read window ${wid} (no X connection, or the window went away). Not reporting a violation for a property that was never read."
+    return 0
+  fi
+  extents="$(xprop -id "$wid" _NET_FRAME_EXTENTS 2>/dev/null || true)"
+  # The literal WM_CLASS, every boot, straight off the window — this is the
+  # exact string `ebuilder-openbox.xml`'s class="Google-chrome" rule is matched
+  # against, and the one thing nobody should ever again have to guess at.
+  class_field="$(xprop -id "$wid" WM_CLASS 2>/dev/null | tr '\n' ' ' || true)"
+  log "browser ${class_field:-WM_CLASS unreadable}"
+  log "browser frame props: $(printf '%s %s' "$motif" "$extents" | tr '\n' ' ')"
+
+  # _MOTIF_WM_HINTS = flags, functions, decorations, input_mode, status
+  case "$motif" in
+    *=*)
+      vals="${motif#*= }"
+      flags="$(printf '%s' "$vals" | cut -d, -f1 | tr -d ' ')"
+      decorations="$(printf '%s' "$vals" | cut -d, -f3 | tr -d ' ')"
+      ;;
+  esac
+  if [[ "$flags" =~ ^(0[xX])?[0-9a-fA-F]+$ ]] && [[ "$decorations" =~ ^(0[xX])?[0-9a-fA-F]+$ ]]; then
+    if [ "$(( flags & 2 ))" -ne 0 ] && [ "$(( decorations ))" -eq 0 ]; then
+      own_frame=1
+    fi
+  else
+    log "browser frame: _MOTIF_WM_HINTS is not set on ${wid} — Chrome is not claiming its own frame; the window manager decides, and ebuilder-openbox.xml says <decor>no</decor>"
+  fi
+
+  # _NET_FRAME_EXTENTS = left, right, top, bottom — a titlebar is a non-zero top.
+  case "$extents" in
+    *=*)
+      top_extent="$(printf '%s' "${extents#*= }" | cut -d, -f3 | tr -d ' ')"
+      ;;
+  esac
+  if [[ "$top_extent" =~ ^[0-9]+$ ]] && [ "$top_extent" -gt 0 ]; then
+    wm_frame=1
+  fi
+
+  if [ "$own_frame" -eq 1 ] || [ "$wm_frame" -eq 1 ]; then
+    log "ERROR: the in-stream browser window ${wid} is STILL framed after enforcement (chrome_own_frame=${own_frame} wm_titlebar_top_px=${top_extent:-0}). The user will see a second set of window controls inside the stream."
+    emit_decor_violation
+  else
+    log "browser frame verified undecorated: chrome is using the system frame (_MOTIF_WM_HINTS decorations=${decorations:-unset}) and openbox draws none (_NET_FRAME_EXTENTS top=${top_extent:-0}) — tab strip and omnibox at row 0, no title bar, no caption buttons"
+  fi
+  return 0
+}
 
 # ── Window-ready gate (mandatory, fail-closed, data-driven) ──────────────────
 # Readiness MUST NOT be reported (i.e. `neko serve` must not be started, and
@@ -1525,6 +1732,11 @@ fi
 
 log "window-ready gate passed: all mandatory apps present (${DESKTOP_APP_SPECS[*]%%:*})"
 phase_end window_ready_gate ok
+
+# The browser window is only guaranteed to exist once the gate above has seen
+# it. Read back what frame it actually ended up with — see verify_browser_frame
+# (defined above the gate) for why this is a live X read and not a config grep.
+verify_browser_frame || true
 
 # ── Software video-encoder tuning (free CPU lever, no cost) ──────────────────
 # Config precedence here is neko's own (Viper): explicit CLI flag > NEKO_*
