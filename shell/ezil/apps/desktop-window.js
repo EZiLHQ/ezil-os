@@ -616,11 +616,13 @@ export async function openDesktopWindow (ctx = {}) {
     //                  Works whether or not anything else here does.
     //   `screen_ctl` — the live-resize path. FEATURE-DETECTED off
     //                  `endpoints.screen`, and it disarms itself permanently on
-    //                  `UNSUPPORTED` (a container whose X server has a fixed
-    //                  framebuffer — every container under Xvfb). When it is
-    //                  dark or disarmed, `refit()` alone is the whole
-    //                  behaviour: the desktop stays the size it booted at and
-    //                  the window letterboxes it, exactly as before.
+    //                  `UNSUPPORTED` — a container whose X framebuffer cannot
+    //                  contain the requested mode, which is a fixed property of
+    //                  that container and not something a retry can change.
+    //                  When it is dark or disarmed, `refit()` alone is the
+    //                  whole behaviour: the desktop stays the size it booted at
+    //                  and the window letterboxes it, exactly as before. That
+    //                  is the degradation path, and it is a working desktop.
     const stream = { w: STREAM_W, h: STREAM_H };
     const refit = () => fit_stream(el_body, el_iframe, stream);
     /** What this window most recently ASKED for, so a bogus `requested` can be spotted. */
