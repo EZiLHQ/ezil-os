@@ -44,21 +44,27 @@ import {
     composeCodePreviewOrigin,
     deriveGuacamoleSandboxId,
     deriveNekoAdminValue,
+    describeAppliedScreen,
     enableImplicitHosting,
     FOCUSABLE_APPS,
     getGuacamoleSandboxStatus,
     isOwnDesktopOrigin,
     mintAppPreviewBootstrapToken,
     newCorrelationId,
+    parseRequestedScreen,
     probeDesktopDisplayLongPoll,
     probeDesktopFrame,
+    readDesktopScreen,
     readWorkerBridgeUrl,
     requestGuacamoleActivity,
     requestGuacamoleDesktopRestart,
     requestGuacamoleFocusApp,
     requestGuacamolePreview,
     requestGuacamoleSandboxTerminate,
+    requestGuacamoleScreen,
     resolveCloudflareGuacamoleConfig,
+    resolveScreenRequest,
+    snapScreenMode,
     surfacePreviewErrorAsValue,
 } from '@/server/lib/cloudflare-guacamole-provider';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
@@ -103,10 +109,32 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             z.object({
                 sessionId: z.string().uuid(),
                 computerId: z.string().uuid(),
+                /**
+                 * The shape the shell wants its desktop to boot at, measured
+                 * from the box the stream will actually occupy.
+                 *
+                 * 🔴 `z.unknown()`, NOT a `{width,height}` schema, and that is
+                 * the whole backward-compatibility guarantee rather than
+                 * laziness. A zod object here would 400 the ENTIRE desktop boot
+                 * for a client whose measurement came out as `NaN` or a string
+                 * — turning a cosmetic sizing miss into "your computer will not
+                 * start". `resolveScreenRequest` is the single validator, it
+                 * accepts only plain integers, and everything it rejects
+                 * becomes `source: 'default'`, i.e. exactly today's 1920x1080
+                 * behaviour. Absent behaves identically, which is what lets an
+                 * OLD cached bundle keep working against this server.
+                 */
+                screen: z.unknown().optional(),
             }),
         )
         .query(async ({ ctx, input }) => {
             await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+
+            // Decided BEFORE the Worker call, because it is an input to the
+            // container's boot env, and reported afterwards so the shell can
+            // letterbox to what it actually got rather than to what it asked
+            // for. `source` is the difference between those two.
+            const screen = resolveScreenRequest(input.screen);
 
             const config = resolveCloudflareGuacamoleConfig();
             if (!config.isConfigured) {
@@ -128,6 +156,14 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     userId: ctx.user.id,
                     projectId: input.computerId,
                     desktopMode: 'neko',
+                    // 🔴 OMITTED, not defaulted, when nothing usable was asked
+                    // for. The Worker only injects `NEKO_SCREEN` when this
+                    // field is present, so a `default` resolution produces a
+                    // byte-for-byte identical container to the one this
+                    // codebase booted before the field existed.
+                    ...(screen.source === 'default'
+                        ? {}
+                        : { screen: { width: screen.width, height: screen.height } }),
                 },
                 correlationId,
             );
@@ -232,6 +268,50 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 });
             }
 
+            // 🔴 WHAT THE SCREEN ACTUALLY IS, not what we asked for.
+            //
+            // `NEKO_SCREEN` is a REQUEST. What the X server did with it is a
+            // separate fact, and measurably not always the same one: Xvfb
+            // floors the screen width to a multiple of 8 and reports success.
+            // Every mode in `SCREEN_MODES` is 8-aligned so that cannot bite —
+            // but the shell letterboxes to whatever this field says, and a
+            // wrong value here IS the bug this change exists to remove, so it
+            // is observed rather than argued.
+            //
+            // 🔴 SKIPPED ENTIRELY when nothing was asked for. That keeps the
+            // legacy path (old bundle, unmeasurable environment) at exactly
+            // its previous cost — this adds a round trip only to the requests
+            // that are actually doing the new thing. The token was cached by
+            // `enableImplicitHosting` moments ago, so it is one small GET to an
+            // origin already proven to answer, bounded at
+            // `SCREEN_READBACK_TIMEOUT_MS`. Its real cost has NOT been measured.
+            let appliedScreen = screen;
+            if (screen.source !== 'default' && result.mode !== 'local-dev-stub') {
+                const observed = await readDesktopScreen(
+                    result.guacamoleUrl,
+                    hmacSecret ? deriveNekoAdminValue(hmacSecret, sandboxId) : 'admin',
+                );
+                if (observed) {
+                    // Compared against the SHELL's original ask, not against
+                    // the snap: `requested` means "you got the shape you asked
+                    // for", which is the only thing the shell can act on.
+                    appliedScreen = describeAppliedScreen(parseRequestedScreen(input.screen), observed);
+                    if (observed.width !== screen.width || observed.height !== screen.height) {
+                        console.warn('[cloudflareGuacamole.previewUrl] screen differs from the mode requested', {
+                            correlationId,
+                            computerId: input.computerId,
+                            asked: `${screen.width}x${screen.height}`,
+                            observed: `${observed.width}x${observed.height}`,
+                        });
+                    }
+                } else {
+                    // Unverified. Downgrade any `requested` claim to `snapped`
+                    // rather than telling the shell its ask was honoured on the
+                    // strength of having sent an environment variable.
+                    appliedScreen = { ...screen, source: screen.source === 'requested' ? 'snapped' : screen.source };
+                }
+            }
+
             return {
                 ok: true as const,
                 correlationId,
@@ -247,6 +327,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 // as `false` — the guard above returns early — but typed as
                 // the observation it is, not as a constant.
                 frame: { confirmed: frame.alive, status: frame.status, observedAt: Date.now() },
+                // What the desktop was ACTUALLY booted at, and why. The shell
+                // cannot read this from the DOM — the stream is a cross-origin
+                // iframe and its `<video>` is unreachable by construction — so
+                // this field is the only way `fit_stream` can letterbox to the
+                // real aspect instead of assuming 16:9.
+                //
+                // 🔴 Reported even when it is the default, so a client can tell
+                // "the server considered my ask and declined" from "the server
+                // is too old to have considered it" (the field is absent).
+                screen: appliedScreen,
             };
         }),
 
@@ -809,6 +899,114 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 error: result.error,
                 correlationId,
                 provider: 'cloudflare-guacamole' as const,
+            };
+        }),
+
+    /**
+     * Change the X screen mode of a LIVE desktop, so a window that has been
+     * dragged, rotated or full-bleeded ends up streaming the shape it is
+     * actually being shown in instead of a letterboxed 16:9 strip.
+     *
+     * Ownership is checked here, once, by `assertOwnedComputer`, and the
+     * sandbox id is DERIVED from `(ctx.user.id, computerId)` — same rule as
+     * every other procedure in this router.
+     *
+     * 🔴 SNAPPED HERE, and the caller is TOLD it was snapped. `snapScreenMode`
+     * is the same function `previewUrl` uses, so boot-time and live sizing can
+     * never disagree about which mode a given box maps to. The client compares
+     * the returned `{width,height}` against what it asked for; a `source` of
+     * `snapped` is a normal, expected answer, not an error.
+     *
+     * 🔴 A VALUE, never a throw, for every operational outcome — same contract
+     * as `focusApp`/`terminate`. A thrown error is the one thing TanStack Query
+     * retries, and `UNSUPPORTED` (the X server has a fixed framebuffer) is the
+     * least retryable answer there is: it will be false forever on that
+     * container, and a client that retried it would restart the capture
+     * pipeline in a loop for nothing.
+     */
+    setScreen: protectedProcedure
+        .input(
+            z.object({
+                computerId: z.string().uuid(),
+                // 🔴 UNLIKE `previewUrl.screen`, these ARE strictly typed and a
+                // malformed value IS a 400. The difference is what failure
+                // costs: a bad measurement at boot must not stop a desktop
+                // starting, but a bad measurement here has nothing to degrade
+                // to — the desktop is already up and simply stays the size it
+                // is. `.int()` is load-bearing: this value reaches an X server.
+                width: z.number().int().min(64).max(16384),
+                height: z.number().int().min(64).max(16384),
+            }),
+        )
+        .mutation(async ({ ctx, input }) => {
+            await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+
+            const correlationId = newCorrelationId();
+            const config = resolveCloudflareGuacamoleConfig();
+            if (!config.isConfigured) {
+                return {
+                    ok: false as const,
+                    error: { code: 'NOT_FOUND' as const, message: 'provider_not_configured' },
+                    correlationId,
+                };
+            }
+
+            const target = snapScreenMode(input.width, input.height);
+
+            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+            const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
+            const result = await requestGuacamoleScreen(
+                config,
+                hmacSecret,
+                sandboxName,
+                target.width,
+                target.height,
+                correlationId,
+            );
+
+            if (!result.ok) {
+                return {
+                    ok: false as const,
+                    error: { code: result.code, message: result.message },
+                    correlationId,
+                };
+            }
+
+            // 🔴 THE ANSWER IS THE READ-BACK, NOT THE ASK. `result.width/height`
+            // come from `GET /api/room/screen` after the set, because neko's own
+            // POST response echoes the REQUEST: measured, asking for `900x1600`
+            // returns `{"width":900,"height":1600}` on a display that is
+            // actually `896x1600`. Reporting the ask would tell the shell to
+            // letterbox to an aspect the stream does not have.
+            //
+            // `verified: false` means the read-back did not answer, so
+            // `requested` is downgraded to `snapped` — "we set it and could not
+            // check" is not "you got what you asked for".
+            const applied = describeAppliedScreen(
+                { width: input.width, height: input.height },
+                { width: result.width, height: result.height },
+            );
+            const source = result.verified ? applied.source : 'snapped';
+
+            if (result.verified && (result.width !== target.width || result.height !== target.height)) {
+                // The platform changed the size underneath us. Every mode in
+                // the table is 8-aligned specifically so this cannot happen, so
+                // if it does, the table and the platform have diverged.
+                console.warn('[cloudflareGuacamole.setScreen] applied size differs from the mode set', {
+                    correlationId,
+                    computerId: input.computerId,
+                    set: `${target.width}x${target.height}`,
+                    applied: `${result.width}x${result.height}`,
+                });
+            }
+
+            return {
+                ok: true as const,
+                width: result.width,
+                height: result.height,
+                // Exactly the two values the live-resize contract allows.
+                source,
+                correlationId,
             };
         }),
 

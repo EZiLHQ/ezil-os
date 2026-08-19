@@ -69,6 +69,7 @@
 // is silently replayed. See that file's own comment at the call site.
 
 import session from './session.js';
+import { measureDesktopBox } from './apps/desktop-screen.js';
 
 /**
  * Far tighter than either server-side TTL on this path — see the module doc
@@ -88,10 +89,40 @@ function isFresh (entry) {
         && (performance.now() - entry.resolvedAt) < WARM_MAX_AGE_MS;
 }
 
+/**
+ * The shape to ask the container to boot at, measured HERE rather than taken
+ * from a caller.
+ *
+ * 🔴 THIS IS WHY THE WARM PATH HAD TO KNOW ABOUT SIZING AT ALL. The warm
+ * request is what actually boots the container on the common path — the
+ * desktop window's first attempt `claim()`s this promise rather than making
+ * its own. A warm that asked for nothing would boot every container at the
+ * default 1920x1080 and leave the window to correct it with a live resize,
+ * which is a capture-pipeline restart on every single first open and is
+ * impossible entirely on a container whose X server cannot change mode. So the
+ * one request that boots the container is the one that has to carry the size.
+ *
+ * There is no window yet, so the measurement is of the VIEWPORT — which is
+ * exactly right: the desktop window goes full-bleed the moment its desktop is
+ * confirmed, and the viewport is the box it ends up in. `measureDesktopBox`
+ * returns null when nothing is measurable (no `window` at all, e.g. a node
+ * test), and `session.openDesktop` then omits the field entirely.
+ */
+function bootScreen () {
+    try {
+        return measureDesktopBox({ view: typeof window !== 'undefined' ? window : null });
+    } catch {
+        // Sizing is an improvement on a boot; it is not the boot, and it must
+        // never be able to stop one. Same rule as `desktop-window.js`'s guard
+        // around `ResizeObserver`.
+        return null;
+    }
+}
+
 /** Mint a fresh single-flight entry for `computerId` and make it the current one. */
 function mint (computerId) {
     const entry = { computerId, promise: null, resolvedAt: null };
-    entry.promise = session.openDesktop(computerId).then((res) => {
+    entry.promise = session.openDesktop(computerId, bootScreen()).then((res) => {
         // `session.openDesktop` is failure-first and never throws (see that
         // file's own header), so this is the only branch that needs
         // handling. Only a genuine success counts as "warm" — a failure must
