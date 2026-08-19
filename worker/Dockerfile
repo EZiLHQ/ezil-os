@@ -232,9 +232,12 @@ RUN curl -fsSL https://code-server.dev/install.sh | sh \
 COPY assets/ebuilder-openbox.xml /etc/neko/ebuilder-openbox.xml
 COPY assets/ebuilder-menu.xml    /etc/neko/ebuilder-menu.xml
 COPY assets/browser-home.html    /usr/local/share/ezil/browser-home.html
-COPY scripts/validate-neko-focus.sh   /usr/local/bin/validate-neko-focus.sh
-COPY scripts/validate-neko-desktop.sh /usr/local/bin/validate-neko-desktop.sh
-RUN chmod +x /usr/local/bin/validate-neko-focus.sh /usr/local/bin/validate-neko-desktop.sh \
+COPY scripts/validate-neko-focus.sh          /usr/local/bin/validate-neko-focus.sh
+COPY scripts/validate-neko-desktop.sh        /usr/local/bin/validate-neko-desktop.sh
+COPY scripts/validate-neko-browser-window.sh /usr/local/bin/validate-neko-browser-window.sh
+RUN chmod +x /usr/local/bin/validate-neko-focus.sh \
+             /usr/local/bin/validate-neko-desktop.sh \
+             /usr/local/bin/validate-neko-browser-window.sh \
   && test -f /etc/neko/ebuilder-openbox.xml \
   && test -f /etc/neko/ebuilder-menu.xml \
   && test -f /usr/local/share/ezil/browser-home.html
