@@ -620,8 +620,86 @@ wait_tcp() {
   return "$ok"
 }
 
+# ── Boot mutex ───────────────────────────────────────────────────────────────
+# 🔴 THE PORT CHECK BELOW IS NOT A MUTEX, AND TREATING IT AS ONE COST A DAY.
+# `neko serve` binds 8181 LAST, so for the whole ~7s between Xvfb starting and
+# neko binding, a second invocation probes the port, finds nothing, and boots a
+# full second stack into the same container. The two then share `:99`, the pgid
+# directory, the fatal sentinel and the Chrome profile dir, and
+# `reclaim_stale_app` — which cannot tell a STALE previous boot from a LIVE
+# concurrent one — kills its healthy sibling's apps. Left behind: Xvfb and neko
+# up, no mapped Chrome window, an exactly-black stream, and every health signal
+# green. Reproduced: two boots 1.5s apart produced two `ready ok` and an 11ms
+# `xvfb` phase that started no X server.
+#
+# The Worker makes this easy to hit rather than rare: `ensureDesktop` re-issues
+# the start command whenever `getExposedPorts()` omits 8181, the wake path
+# answers `sandbox_starting` on a 12s budget WITHOUT aborting the call in
+# flight, and the shell re-asks every 1.5s for up to 215s. Cold boot is ~11s
+# p50, so re-asks reliably land inside the window. Three separate procedures
+# (`previewUrl`, `appPreviewUrl`, `codePreviewUrl`) reach it with no coalescing
+# at any layer.
+#
+# `flock` closes it where the race actually is — in the container, across
+# processes, with a kernel-held lock that cannot be left stale by a killed
+# boot (the fd dies with the process). Non-blocking: a second boot does not
+# queue behind the first for 200s, it reports and leaves. Leaving is safe now
+# that `terminate_stack` only tears down what THIS process supervises — before
+# that fix, this early exit is precisely what killed the live boot's apps.
+# Derived from NEKO_APP_PGID_DIR rather than hardcoded, so it inherits exactly
+# the same isolation that directory already has: production gets one lock per
+# container, and a test harness that redirects the pgid dir into its own tmpdir
+# automatically gets its own lock instead of colliding with every other boot on
+# the host. Adds no new environment variable (contract §2 fixes that set).
+NEKO_BOOT_LOCK="${NEKO_BOOT_LOCK:-${NEKO_APP_PGID_DIR%/}.boot.lock}"
+# Seconds to wait for a departing boot to release the lock before concluding
+# that another boot genuinely owns this container. See the flock call below.
+NEKO_BOOT_LOCK_WAIT="${NEKO_BOOT_LOCK_WAIT:-10}"
+# 🔴 "COULD NOT LOCK" AND "SOMEONE ELSE HOLDS THE LOCK" ARE DIFFERENT ANSWERS,
+# and collapsing them is a mistake this block made on its first attempt: a
+# failed `exec 9>` leaves fd 9 closed, `flock -n 9` then fails for THAT reason
+# rather than contention, and every boot declined itself 3ms in. Nine guard
+# tests went red immediately, which is the only reason it was caught before a
+# deploy. Contention DECLINES; anything else PROCEEDS with a warning, because
+# an unserialised boot is a risk while a universally declined boot is an outage.
+_boot_lock_held=0
+# 🔴 `: >file` FIRST, THEN `exec`. A failed redirection on `exec` terminates a
+# non-interactive shell outright — `|| true`, `2>/dev/null` and an `if`
+# condition all fail to contain it. That is not a hypothetical: the first
+# version of this block used `exec 9>` directly and every boot died silently at
+# +3ms, after `phase=container_start event=start` and before any other line.
+# `: >` probes creatability harmlessly, so `exec` only ever runs on a path that
+# is already known to open.
+if command -v flock >/dev/null 2>&1 \
+  && mkdir -p "$(dirname "$NEKO_BOOT_LOCK")" 2>/dev/null \
+  && : >"$NEKO_BOOT_LOCK" 2>/dev/null \
+  && exec 9>"$NEKO_BOOT_LOCK"; then
+  # 🔴 WAIT BRIEFLY, do not decline instantly. `-n` was wrong: a boot that
+  # arrives while a previous one is still EXITING (its teardown running, fd 9
+  # not yet released) would decline and start nothing, so a restart could not
+  # succeed until the old process finished — caught by
+  # `neko-teardown-orphans.test.ts`'s "lets a SECOND boot succeed on the same
+  # ports afterwards". A departing boot releases the lock in well under a
+  # second; a boot genuinely in progress holds it for the whole ~11s startup,
+  # so 10s separates "wait your turn" from "someone is already doing this"
+  # without making a real concurrent caller queue behind a full boot.
+  if flock -w "$NEKO_BOOT_LOCK_WAIT" 9 2>/dev/null; then
+    _boot_lock_held=1
+  else
+    log "another boot of this container already holds ${NEKO_BOOT_LOCK} — nothing to do (this invocation started nothing and will tear down nothing)"
+    printf '{"eventClass":"boot_phase","source":"container","site":"container:neko#boot_lock","code":"concurrent_boot_declined","outcome":"skipped","durationMs":0}\n' \
+      >>"$TELEMETRY_NDJSON" 2>/dev/null || true
+    phase_end container_start skipped
+    exit 0
+  fi
+else
+  log "warning: could not take the boot lock at ${NEKO_BOOT_LOCK} (flock missing, or the file could not be opened) — this boot is NOT serialised against a concurrent one and may race it. Proceeding: an unserialised boot is a risk, a universally declined boot is an outage."
+fi
+
 # Idempotency, same rationale as start-desktop.sh: probe the loopback port
 # rather than pgrep, since sandbox containers share the host PID namespace.
+# Kept as well as the lock above: the lock stops two boots OVERLAPPING, this
+# stops a boot starting after a previous one has finished and is still serving.
 if wait_tcp 127.0.0.1 "$NEKO_HTTP_PORT" 2; then
   log "neko already serving on 127.0.0.1:$NEKO_HTTP_PORT — nothing to do"
   phase_end container_start skipped
