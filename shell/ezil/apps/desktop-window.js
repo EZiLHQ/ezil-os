@@ -96,6 +96,14 @@ import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-h
 import BootProgress, { DisplayNotice } from '../ui/boot-progress.js';
 import AppSpinner from '../ui/app-spinner.js';
 import attach_app_drawer from '../ui/app-drawer.js';
+import {
+    computeFitBox,
+    createScreenController,
+    isScreenContractViolation,
+    keyboardInsetPx,
+    measureDesktopBox,
+    readAppliedScreen,
+} from './desktop-screen.js';
 import UIWindow from '../../src/UI/UIWindow.js';
 
 const PHASE = 'ezil-os:desktop';
@@ -267,53 +275,59 @@ const FULLBLEED_CLASS = 'ezil-fullbleed';
 // ═══════════════════════════════════════════════════════════════════════════
 // THE STREAM'S SHAPE, AND WHAT THIS FILE CAN AND CANNOT DO ABOUT IT
 // ═══════════════════════════════════════════════════════════════════════════
-// ADDED BY EZIL 2026-08-08.
+// ADDED BY EZIL 2026-08-08. REWRITTEN 2026-08-19 — the pin is gone.
 //
-// The remote desktop is HARD-PINNED to 1920x1080 on the server and there is no
-// client -> server resize path. Traced to ground, not assumed:
+// ── What used to be true, and no longer is ─────────────────────────────────
+// The remote desktop WAS hard-pinned to 1920x1080 with no client -> server
+// sizing path at all (`start-neko.sh:138`'s `NEKO_SCREEN=${NEKO_SCREEN:-…}`
+// was never set by anything). So the stream was 16:9 always, this window was a
+// box of whatever shape the user or the viewport made it, and the mismatch had
+// nowhere to go but bars. On a 390x844 phone that meant a 390x219 strip — a
+// quarter of the screen at a 4.9x downscale.
 //
-//   worker/scripts/start-neko.sh:138   NEKO_SCREEN=${NEKO_SCREEN:-1920x1080x24}
-//   worker/scripts/start-neko.sh:843   Xvfb "$DISPLAY" -screen 0 "$NEKO_SCREEN"
-//   worker/scripts/start-neko.sh:1319  chromium --window-size=1920,1080
-//   worker/scripts/start-neko.sh:1490  neko.yaml desktop.screen: "1920x1080@60"
-//   worker/scripts/start-neko.sh:1519  "Resolution (1920x1080) also stays untouched"
+// The desktop now BOOTS at a shape this shell chooses. `desktop-screen.js`
+// measures the box the stream will occupy, `session.openDesktop` carries it,
+// the server snaps it to a closed table of modes the container's X server
+// actually advertises, and the answer says which mode was applied and why.
 //
-// So the stream is 16:9, always, and this window is a box of whatever shape the
-// user or the viewport makes it. The mismatch has to go SOMEWHERE, and there
-// are only two places it can go: bars, or a stretched picture.
+// ── What is STILL true, and must not be forgotten ──────────────────────────
+//   - This file cannot touch the video. The desktop is a cross-origin neko SPA
+//     in an iframe (`8181-<sandbox>-nekodesktop.<zone>`), so its `<video>`
+//     element is unreachable BY CONSTRUCTION — `object-fit` on it is not
+//     something this side of the origin boundary can set, and neither is
+//     anything else. It follows that this file cannot MEASURE the stream
+//     either: it knows the desktop's real size only because it asked for one
+//     and the server said what it applied. `stream` below is that answer, and
+//     1920x1080 until there is one.
+//   - A resolution change is still expensive — a capture-pipeline restart plus
+//     a full software-vp8 re-init — and still must never fire from a raw
+//     resize tick. `createScreenController` is what makes the live path safe:
+//     500ms trailing debounce, never a duplicate of the last applied size, so
+//     a window drag costs zero requests while it happens and at most one when
+//     it stops.
 //
-// 🔴 What this file cannot do, and must not try:
+// 🔴 `fit_stream` below is now a function of the ACTUAL stream size, not of a
+// hardcoded 16:9. That is the half of the fix that survives when live resizing
+// does not: when the desktop really is portrait, the box is portrait too. If
+// the box stayed 16:9 while the desktop went 9:16, the result would be a
+// portrait picture letterboxed inside a landscape box — worse than before.
 //
-//   - It cannot touch the video. The desktop is a cross-origin neko SPA in an
-//     iframe (`8181-<sandbox>-nekodesktop.<zone>`), so its `<video>` element is
-//     unreachable BY CONSTRUCTION — `object-fit` on it is not something this
-//     side of the origin boundary can set, and neither is anything else.
-//   - It must not change the stream's RESOLUTION to match the window. Every
-//     capture-pipeline restart is a 5-10s interruption plus a full software-vp8
-//     re-init. That is an explicit user action at most, and never a resize
-//     handler.
+// The remaining margin is still drawn by the WINDOW, in `--color-charcoal`,
+// next to the rest of the OS chrome — instead of by a third-party page in
+// whatever black its stylesheet happens to use.
 //
-// 🔴 What it CAN do, and now does: choose the shape of the box it hands the
-// iframe. `fit_stream` below sizes the iframe to the largest 16:9 rectangle
-// that fits the window body and centres it, so the neko client's own viewport
-// is always exactly the aspect of the picture inside it and its internal fit
-// produces no bars of its own. The remaining margin is drawn by the WINDOW, in
-// `--color-charcoal`, next to the rest of the OS chrome — instead of by a
-// third-party page in whatever black its stylesheet happens to use.
-//
-// This makes the window's default size matter, so `WINDOW_*` below derive from
-// the stream rather than being round numbers: a freshly opened Browser window
-// has a content box that is exactly 16:9 and therefore no bars at all.
-//
-// 🔴 Sizing the IFRAME is not "resizing on window.resize" in the forbidden
-// sense. Nothing here reaches the server, nothing renegotiates a capture, and
-// the iframe's box ALREADY changed on every window drag (it is `width: 100%;
-// height: 100%` in `style.css`). If anything this reduces the pressure: the
-// client's viewport aspect is now constant across every window shape, where
-// before it was whatever the user dragged.
+// 🔴 Sizing the IFRAME is still not "resizing on window.resize" in the
+// forbidden sense. It reaches nothing, renegotiates nothing, and the iframe's
+// box ALREADY changed on every window drag (`width: 100%; height: 100%` in
+// `style.css`).
 const STREAM_W = 1920;
 const STREAM_H = 1080;
-/** 1.777…, i.e. 16:9. Derived, so the two numbers above stay the only source. */
+/**
+ * 1.777…, i.e. 16:9 — the DEFAULT stream aspect, used for the window's own
+ * opening geometry (which is chosen before any desktop exists and therefore
+ * before its real shape is knowable). `fit_stream` does NOT use this: it reads
+ * the per-window `stream` object, which the server's answer updates.
+ */
 const STREAM_ASPECT = STREAM_W / STREAM_H;
 /**
  * The default window. Content box exactly 16:9 (960x540), plus the 30px head
@@ -332,50 +346,55 @@ const WINDOW_W = 960;
 const WINDOW_H = Math.round(WINDOW_W / STREAM_ASPECT) + WINDOW_HEAD_H;
 
 /**
- * Size and centre the stream iframe to the largest `STREAM_ASPECT` rectangle
- * that fits `el_body`, and report what it did.
+ * Size and centre the stream iframe to the largest rectangle of the STREAM'S
+ * OWN aspect that fits `el_body`, and report what it did.
+ *
+ * 🔴 `stream` is a parameter, not a constant, and that is the whole of §4.3 of
+ * the fix contract. It is the size the SERVER said it applied — this side
+ * cannot measure it (the iframe is cross-origin and its `<video>` is
+ * unreachable), so the only honest source is the answer to the request that
+ * asked for it. Defaults to 1920x1080, which is what the container boots at
+ * when nothing asked, so a server too old to answer produces byte-for-byte the
+ * previous behaviour.
  *
  * Written in whole pixels: a half-pixel box on a scaled video is a visibly
  * soft picture, and the centring offsets have to add up to the body's own
- * integer size or the bars come out uneven.
+ * integer size or the bars come out uneven. The arithmetic itself lives in
+ * `computeFitBox` (`./desktop-screen.js`) so it can be tested without a
+ * browser; this function is only the measurement and the write.
  *
  * @param {HTMLElement} el_body   The window body — the box to fit inside.
  * @param {HTMLElement} el_iframe The stream iframe.
+ * @param {{w:number,h:number}} [stream] The desktop's ACTUAL size.
  * @returns {{w: number, h: number}|null} null if the body has no layout yet
  *   (a minimised or not-yet-shown window), in which case nothing is written.
  */
-function fit_stream (el_body, el_iframe) {
+function fit_stream (el_body, el_iframe, stream) {
     if ( ! el_body || ! el_iframe ) return null;
-    const bw = Math.round(el_body.clientWidth);
-    const bh = Math.round(el_body.clientHeight);
+    const sw = stream && stream.w > 0 ? stream.w : STREAM_W;
+    const sh = stream && stream.h > 0 ? stream.h : STREAM_H;
     // A hidden or minimised window measures 0, and writing `0px` through
     // would collapse the iframe and leave it collapsed after a restore,
     // because the restore does not necessarily change the body's size again.
     //
-    // 🔴 HONESTY NOTE — this early return is NOT mutation-proven, and it is
-    // the only line in this change that is not. Deleting it leaves
-    // `os-chrome-browser-test.mjs` 62/62 green, including its explicit
-    // minimise/restore round trip. The reason is that ResizeObserver does not
-    // deliver an observation for an element with no box, so today the only
-    // caller (the observer in `openDesktopWindow`) never actually reaches it
-    // with a zero: `hideWindow` ends in `display: none` and the callback
-    // simply does not fire. It is kept as a precondition on a function that
-    // writes geometry from a measurement, not as a fix for an observed bug —
-    // and it is written down here as unproven rather than quietly counted
-    // among the guards that were proven.
-    if ( bw <= 0 || bh <= 0 ) return null;
+    // 🔴 HONESTY NOTE — this precondition (now inside `computeFitBox`) is NOT
+    // mutation-proven. Deleting it leaves `os-chrome-browser-test.mjs` 62/62
+    // green, including its explicit minimise/restore round trip. The reason is
+    // that ResizeObserver does not deliver an observation for an element with
+    // no box, so today the only caller (the observer in `openDesktopWindow`)
+    // never actually reaches it with a zero: `hideWindow` ends in `display:
+    // none` and the callback simply does not fire. It is kept as a
+    // precondition on a function that writes geometry from a measurement, not
+    // as a fix for an observed bug — and it is written down here as unproven
+    // rather than quietly counted among the guards that were proven.
+    const box = computeFitBox(el_body.clientWidth, el_body.clientHeight, sw, sh);
+    if ( ! box ) return null;
 
-    let w = bw;
-    let h = Math.round(bw / STREAM_ASPECT);
-    if ( h > bh ) {
-        h = bh;
-        w = Math.round(bh * STREAM_ASPECT);
-    }
-    el_iframe.style.width = `${w}px`;
-    el_iframe.style.height = `${h}px`;
-    el_iframe.style.left = `${Math.round((bw - w) / 2)}px`;
-    el_iframe.style.top = `${Math.round((bh - h) / 2)}px`;
-    return { w, h };
+    el_iframe.style.width = `${box.w}px`;
+    el_iframe.style.height = `${box.h}px`;
+    el_iframe.style.left = `${box.left}px`;
+    el_iframe.style.top = `${box.top}px`;
+    return { w: box.w, h: box.h };
 }
 
 /**
@@ -586,18 +605,92 @@ export async function openDesktopWindow (ctx = {}) {
     const el_body = el_window.querySelector('.window-body');
     const el_iframe = el_window.querySelector('.window-app-iframe');
 
+    // ── the desktop's ACTUAL size, and the live-resize path ────────────────
+    // ADDED BY EZIL 2026-08-19. See `./desktop-screen.js` and the header block
+    // above. Three things live here and they are deliberately separable:
+    //
+    //   `stream`     — what the server said the desktop IS. 1920x1080 until it
+    //                  says otherwise, which is what the container boots at
+    //                  when nothing asked, so an older server changes nothing.
+    //   `refit()`    — the letterbox, now against `stream` rather than 16:9.
+    //                  Works whether or not anything else here does.
+    //   `screen_ctl` — the live-resize path. FEATURE-DETECTED off
+    //                  `endpoints.screen`, and it disarms itself permanently on
+    //                  `UNSUPPORTED` (a container whose X server has a fixed
+    //                  framebuffer — every container under Xvfb). When it is
+    //                  dark or disarmed, `refit()` alone is the whole
+    //                  behaviour: the desktop stays the size it booted at and
+    //                  the window letterboxes it, exactly as before.
+    const stream = { w: STREAM_W, h: STREAM_H };
+    const refit = () => fit_stream(el_body, el_iframe, stream);
+    /** What this window most recently ASKED for, so a bogus `requested` can be spotted. */
+    let screen_requested = null;
+
+    const screen_ctl = createScreenController({
+        endpoint: session.screenEndpoint(),
+        send: async (width, height) => {
+            // A window that is going away must not talk to the server. There
+            // is no hook into `dispose()` from here (it belongs to the close
+            // path, not to sizing), so the guard lives on the one edge that
+            // matters: a debounce timer armed just before the close fires at
+            // most once, finds `disposed`, and shuts the controller down.
+            if ( disposed ) { screen_ctl.dispose(); return { ok: false, code: 'NOT_FOUND' }; }
+            screen_requested = { width, height };
+            return session.setScreen(computer.id, width, height);
+        },
+        onApplied: ({ width, height, source }) => {
+            if ( disposed ) return;
+            if ( isScreenContractViolation(screen_requested, { width, height, source }) ) {
+                console.error(`[${PHASE}] server applied ${width}x${height} but called it 'requested'`);
+                telemetry.capture({
+                    eventClass: 'contract_violation',
+                    site: 'ezil-os:apps/desktop#screen',
+                    code: 'screen-unrequested-size',
+                });
+            }
+            stream.w = width;
+            stream.h = height;
+            refit();
+        },
+        onFailure: ({ code }) => {
+            if ( disposed ) return;
+            // Never fatal, and never retried here: the desktop keeps working at
+            // the size it already has and the window letterboxes it. The code
+            // is recorded so "resizing silently does nothing" is answerable
+            // from telemetry rather than by guessing.
+            console.warn(`[${PHASE}] screen resize refused: ${code}`);
+            telemetry.capture({
+                eventClass: 'api_failure',
+                site: 'ezil-os:apps/desktop#screen',
+                code: code === 'UNSUPPORTED' ? 'screen-unsupported' : `screen-${String(code).toLowerCase()}`,
+            });
+        },
+    });
+
+    /** The box the stream will occupy, in device pixels — or null if nothing is measurable. */
+    const measure_screen = () => measureDesktopBox({
+        body: el_body,
+        view: typeof window !== 'undefined' ? window : null,
+    });
+
     // ── keep the stream's box at the stream's aspect ───────────────────────
     // ADDED BY EZIL 2026-08-08. See the `fit_stream` block at the top of this
-    // file for what this does and, more importantly, for the two things it
-    // deliberately does NOT do (touch the video — impossible, cross-origin —
-    // and change the capture resolution, which is never a resize handler's
-    // decision).
+    // file for what this does and, more importantly, for the one thing it
+    // deliberately does NOT do (touch the video — impossible, cross-origin).
     //
     // A `ResizeObserver` on the BODY, not a `window.resize` listener: the body
     // changes size for reasons the viewport does not (full-bleed in and out, a
     // drag on a resize handle, a restore from the taskbar), and it is the box
     // the fit is actually against. It fires once on observe, which is what
     // sizes the iframe initially.
+    //
+    // 🔴 The tick REFITS SYNCHRONOUSLY and only ASKS asynchronously. The fit is
+    // free and must track every frame of a drag; the resize is a
+    // capture-pipeline restart and must fire only once the drag has stopped
+    // (500ms trailing, in `createScreenController`). Conflating the two is how
+    // a resize handler ends up restarting the encoder dozens of times per
+    // gesture, which is exactly what this file's header used to forbid
+    // outright — the debounce is what makes it safe rather than the ban.
     //
     // 🔴 Guarded, and the guard is not theoretical. The first version of this
     // was a bare `new ResizeObserver(...)`, and `boot-test.mjs` went from 110
@@ -615,11 +708,35 @@ export async function openDesktopWindow (ctx = {}) {
     // opens at the right shape and only stops TRACKING later resizes.
     let fit_observer = null;
     if ( typeof ResizeObserver === 'function' ) {
-        fit_observer = new ResizeObserver(() => { fit_stream(el_body, el_iframe); });
+        fit_observer = new ResizeObserver(() => {
+            // ALWAYS refit. The box really did change, whatever caused it.
+            refit();
+            // 🔴 BUT NOT ALWAYS RESIZE. A raised on-screen keyboard shrinks
+            // this window by hundreds of pixels for a few hundred milliseconds
+            // and then gives them back (measured: 844 -> 508 -> 844 at 390x844
+            // with a 336px keyboard). The window's GEOMETRY changed; the
+            // desktop's RESOLUTION did not, and turning every tap on a text
+            // field into a capture-pipeline restart would be the worst thing
+            // this feature could do to a phone user.
+            //
+            // The 500ms debounce would probably swallow the open/close pair on
+            // its own. "Probably" is exactly why this is explicit: the rule is
+            // that a keyboard-driven height change is FIT-ONLY, by decision,
+            // not by a timing coincidence that a future debounce tweak could
+            // quietly undo. `cancel()` also drops anything already armed, so a
+            // keyboard opening mid-drag cannot fire the drag's request at the
+            // keyboard-shrunk size.
+            if ( keyboardInsetPx(typeof document !== 'undefined' ? document : null) > 0 ) {
+                screen_ctl.cancel();
+                return;
+            }
+            const want = measure_screen();
+            if ( want ) screen_ctl.request(want.width, want.height);
+        });
         fit_observer.observe(el_body);
     } else {
         console.warn(`[${PHASE}] no ResizeObserver; the stream will be fitted once and not tracked`);
-        fit_stream(el_body, el_iframe);
+        refit();
     }
 
     // ── boot state ─────────────────────────────────────────────────────────
@@ -933,12 +1050,51 @@ export async function openDesktopWindow (ctx = {}) {
         // fresh. "Try again" has to mean the network is actually asked again,
         // never a possibly-stale warm result silently replayed; see
         // `warm.js`'s own header for why that split lives there and not here.
+        //
+        // 🔴 THE SCREEN SIZE TRAVELS ON THIS REQUEST, on both branches. On the
+        // warm branch `warm.js` measures it (there is no window yet, so it
+        // measures the viewport — the box a full-bleed desktop ends up in); on
+        // the retry branch this window measures its own body against the
+        // viewport. Both are optional: an unmeasurable environment sends
+        // nothing and the container boots at the default it always did.
+        //
+        // 🔴 On the WARM branch the measurement was taken by `warm.js`, before
+        // this window existed, so this side does not know it. `measure_screen()`
+        // is the closest thing available and is what the observer will report
+        // next; seeding it is what stops the first tick from re-asking. If the
+        // two genuinely differ (the viewport changed between the warm and the
+        // open), the first settle corrects it — which is exactly what the live
+        // path is for.
+        const boot_screen_ask = measure_screen();
         const res = my_attempt === 1
             ? await claimWarm(computer.id)
-            : await session.openDesktop(computer.id);
+            : await session.openDesktop(computer.id, boot_screen_ask);
 
         if ( disposed || my_attempt !== attempt ) return;
         stop_timers();
+
+        // 🔴 What the server says the desktop ACTUALLY is. Read BEFORE the
+        // `res.ok` branch below returns, and read STRICTLY: an older server
+        // omits the field, `readAppliedScreen` answers null, and `stream`
+        // keeps its 1920x1080 default — i.e. exactly the behaviour that
+        // shipped before any of this existed.
+        //
+        // This is the ONLY way this side can know the stream's shape. The
+        // iframe is cross-origin; its `<video>` cannot be read. Believing the
+        // answer is the design, not a shortcut.
+        const applied = readAppliedScreen(res.screen);
+        if ( applied ) {
+            stream.w = applied.width;
+            stream.h = applied.height;
+            // Seeded with BOTH what the desktop is and what was asked to get
+            // it. The second half matters: the server SNAPS, so the box the
+            // observer is about to report is not the mode that came back, and
+            // without the ask recorded the very first tick after the window
+            // opens would re-send the boot measurement and restart the capture
+            // pipeline for nothing.
+            screen_ctl.seed(applied.width, applied.height, boot_screen_ask);
+            refit();
+        }
 
         if ( ! res.ok ) {
             console.error(`[${PHASE}] boot failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`);

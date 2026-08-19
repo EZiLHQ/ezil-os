@@ -130,9 +130,20 @@ export async function POST(req: Request) {
             return shellJson({ error: { code: 'BAD_REQUEST', message: 'Expected a JSON body.' } }, 400);
         }
 
-        const { computerId = '', sessionId } = (body ?? {}) as {
+        const { computerId = '', sessionId, screen } = (body ?? {}) as {
             computerId?: string;
             sessionId?: string;
+            /**
+             * The shape the shell measured for the box the stream will occupy.
+             * Forwarded VERBATIM and unvalidated, exactly like every other
+             * input on this route — `cloudflareGuacamole.previewUrl` types it
+             * `z.unknown()` and `resolveScreenRequest` is its one validator.
+             *
+             * 🔴 An absent or malformed value must NOT fail this request. The
+             * desktop is the point; its resolution is not. See the procedure's
+             * own comment on why the schema is `unknown` rather than an object.
+             */
+            screen?: unknown;
         };
 
         const preview = await caller.cloudflareGuacamole.previewUrl({
@@ -141,6 +152,7 @@ export async function POST(req: Request) {
             // shell path and the fallback path correlate identically in logs.
             sessionId: sessionId ?? computerId,
             computerId,
+            screen,
         });
 
         return shellJson(preview);

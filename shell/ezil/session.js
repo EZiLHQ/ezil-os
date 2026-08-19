@@ -48,6 +48,18 @@ export const DESKTOP_BOOT_TIMEOUT_MS = 215_000;
 /** The cheap status probe never wakes a container, so it gets a short leash. */
 const STATUS_TIMEOUT_MS = 12_000;
 
+/**
+ * Leash for a LIVE screen resize (`setScreen`).
+ *
+ * Longer than `STATUS_TIMEOUT_MS` because the container really does work — the
+ * Worker logs into neko and neko restarts the capture pipeline — and shorter
+ * than anything on the boot path because the container is already awake and
+ * the whole round trip is two loopback calls inside it. The Worker's own
+ * budget is 12s and the app's is 20s; 25s sits outside both, so a timeout seen
+ * HERE means the network, not the resize.
+ */
+const SCREEN_TIMEOUT_MS = 25_000;
+
 // ---------------------------------------------------------------------------
 // Preferences — the `puter.kv` replacement
 // ---------------------------------------------------------------------------
@@ -124,6 +136,10 @@ export const ENDPOINTS = {
     desktop: '/api/shell/desktop',
     previewUrl: '/api/shell/preview-url',
     focus: '/api/shell/focus',
+    // 🔴 Written down here for the same reason `focus` is — one canonical list
+    // of paths — but NEVER used as a fallback: `screenEndpoint()` reads the
+    // payload and only the payload. See its doc comment.
+    screen: '/api/shell/screen',
 };
 
 /** The payload carries its own endpoint map; prefer it, fall back to the mirror. */
@@ -316,21 +332,36 @@ export function openSession () {
  * shell that composed its own URL would produce a desktop that renders
  * perfectly and silently ignores every click.
  *
- * @returns {Promise<{ok: true, url: string, frameConfirmed: boolean, controlMode?: string, mode?: string, workspace?: any}
+ * @param {string} computerId
+ * @param {{width:number, height:number}} [screen] The shape to boot the
+ *   desktop at, in device pixels — see `apps/desktop-screen.js`'s
+ *   `measureDesktopBox`. OPTIONAL in both directions: an older server ignores
+ *   an unknown body field, and this client omits the field entirely when it
+ *   has nothing to measure, so neither side has to know about the other.
+ * @returns {Promise<{ok: true, url: string, frameConfirmed: boolean, controlMode?: string, mode?: string, workspace?: any, screen?: {width:number,height:number,source:string}}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
-export async function openDesktop (computerId) {
+export async function openDesktop (computerId, screen) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to open.' };
     }
-    return withWakeAndOneRetry(() => openDesktopOnce(computerId), 'openDesktop');
+    return withWakeAndOneRetry(() => openDesktopOnce(computerId, screen), 'openDesktop');
 }
 
 /** One `POST /api/shell/desktop`. The loop that may call it more than once is above. */
-async function openDesktopOnce (computerId) {
+async function openDesktopOnce (computerId, screen) {
+    // 🔴 The field is OMITTED, not sent as null, when there is nothing to ask
+    // for. The server treats absent and malformed identically, but a body that
+    // is byte-identical to the pre-change one is the strongest form of "an old
+    // server sees exactly what it always saw".
+    const usable = screen
+        && Number.isInteger(screen.width) && Number.isInteger(screen.height)
+        && screen.width > 0 && screen.height > 0;
     const res = await request(endpoint('desktop'), {
         method: 'POST',
-        body: { computerId },
+        body: usable
+            ? { computerId, screen: { width: screen.width, height: screen.height } }
+            : { computerId },
         timeoutMs: DESKTOP_BOOT_TIMEOUT_MS,
     });
 
@@ -371,6 +402,13 @@ async function openDesktopOnce (computerId) {
         controlMode: data.controlMode,
         mode: data.mode,
         workspace: data.workspace,
+        // 🔴 What the server says it ACTUALLY booted the desktop at, passed
+        // through raw and NEVER defaulted here. An older server omits it, and
+        // the window must read that as "I still know nothing about the stream's
+        // shape" (i.e. keep assuming 1920x1080, exactly as before) rather than
+        // as any particular size. `apps/desktop-screen.js`'s
+        // `readAppliedScreen` is the one validator.
+        screen: data.screen,
     };
 }
 
@@ -688,6 +726,88 @@ export async function reportActivity (computerId, lastInputAgoMs) {
     return res.data?.ok === true;
 }
 
+/**
+ * Is a LIVE screen-resize route published by THIS deployment, right now?
+ *
+ * 🔴 FEATURE-DETECTED, and read from the PAYLOAD only — never from the
+ * `ENDPOINTS` mirror, even though `screen` appears there. Same rule as
+ * `restartEndpoint()` and `activityEndpoint()` above, and the same rule
+ * `apps/desktop-window.js` applies to `endpoints.focus`:
+ * `payload().desktopState.endpoints` is the only source of truth for "can the
+ * server actually do this today". The mirror exists so the path is written
+ * down in one canonical place next to its siblings, not so a newer bundle can
+ * invent a route against an older server.
+ *
+ * 🔴 BOOT-TIME SIZING DOES NOT DEPEND ON THIS. That travels on the existing
+ * `openDesktop` call and needs no new route, so a deployment without this key
+ * still opens the desktop at the right shape — it just cannot change it
+ * afterwards, and the window letterboxes as it always did.
+ *
+ * @returns {string|null}
+ */
+export function screenEndpoint () {
+    const url = payload()?.desktopState?.endpoints?.screen;
+    return typeof url === 'string' && url !== '' ? url : null;
+}
+
+/**
+ * `POST <endpoints.screen>` — ask the server to change this computer's LIVE
+ * desktop to a different screen mode.
+ *
+ * The server snaps whatever it is given to the closed mode table and reports
+ * BACK what it applied, so `width`/`height` in the answer are authoritative
+ * and may differ from what was asked. A caller that letterboxes to its own
+ * request rather than to the answer reproduces the exact defect this whole
+ * change exists to fix.
+ *
+ * NEVER THROWS. Every failure — including "this deployment has no such route"
+ * — comes back as `{ok:false, code}` from the closed set
+ * `BAD_REQUEST|NOT_FOUND|UNSUPPORTED|UPSTREAM|TIMEOUT`, so a caller can tell
+ * "stop asking forever" (`UNSUPPORTED`: the container's X server has a fixed
+ * framebuffer) from "that one attempt failed".
+ *
+ * @returns {Promise<{ok:true, width:number, height:number, source:string}
+ *                 | {ok:false, code:string, message?:string}>}
+ */
+export async function setScreen (computerId, width, height, timeoutMs = SCREEN_TIMEOUT_MS) {
+    if ( ! computerId || ! Number.isInteger(width) || ! Number.isInteger(height) ) {
+        return { ok: false, code: 'BAD_REQUEST', message: 'No computer, or nothing measurable.' };
+    }
+    const url = screenEndpoint();
+    if ( ! url ) {
+        // Not published by this deployment — say so WITHOUT making a request,
+        // and say it as UNSUPPORTED so the caller disarms permanently rather
+        // than re-asking a server that will never grow the route mid-session.
+        return { ok: false, code: 'UNSUPPORTED', message: "Resizing isn't available in this deployment." };
+    }
+
+    const res = await request(url, { method: 'POST', body: { computerId, width, height }, timeoutMs });
+    if ( ! res.ok ) {
+        if ( res.code === 'TIMEOUT' ) return { ok: false, code: 'TIMEOUT', message: res.message };
+        if ( res.code === 'UNAUTHORIZED' ) return { ok: false, code: 'NOT_FOUND', message: res.message };
+        // 404 from a route that is published but not deployed yet is the same
+        // permanent state as "no key at all".
+        if ( res.status === 404 ) return { ok: false, code: 'UNSUPPORTED', message: res.message };
+        return { ok: false, code: 'UPSTREAM', message: res.message };
+    }
+
+    const data = res.data ?? {};
+    if ( data.ok !== true ) {
+        const code = typeof data.error?.code === 'string' ? data.error.code : 'UPSTREAM';
+        return { ok: false, code, message: data.error?.message };
+    }
+    if ( ! Number.isInteger(data.width) || ! Number.isInteger(data.height) ) {
+        // Reported success with nothing to fit to. Loud, not silent — the same
+        // rule `openDesktopOnce` applies to a URL-less success.
+        console.error('[ezil-os:session] setScreen returned ok with no size');
+        telemetry.capture({
+            eventClass: 'contract_violation', site: 'ezil-os:apps/desktop#screen', code: 'screen_size_missing',
+        });
+        return { ok: false, code: 'UPSTREAM', message: 'The server confirmed a size it did not name.' };
+    }
+    return { ok: true, width: data.width, height: data.height, source: data.source ?? 'requested' };
+}
+
 export { withWakeAndOneRetry };
 
 export default {
@@ -698,6 +818,7 @@ export default {
     previewUrl, focusApp,
     restartEndpoint, restartDesktop,
     activityEndpoint, reportActivity,
+    screenEndpoint, setScreen,
     withWakeAndOneRetry,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
