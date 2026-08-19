@@ -647,7 +647,7 @@ export async function openDesktopWindow (ctx = {}) {
                 telemetry.capture({
                     eventClass: 'contract_violation',
                     site: 'ezil-os:apps/desktop#screen',
-                    code: 'screen-unrequested-size',
+                    code: 'screen_unrequested_size',
                 });
             }
             stream.w = width;
@@ -664,7 +664,7 @@ export async function openDesktopWindow (ctx = {}) {
             telemetry.capture({
                 eventClass: 'api_failure',
                 site: 'ezil-os:apps/desktop#screen',
-                code: code === 'UNSUPPORTED' ? 'screen-unsupported' : `screen-${String(code).toLowerCase()}`,
+                code: code === 'UNSUPPORTED' ? 'screen_unsupported' : `screen_${String(code).toLowerCase()}`,
             });
         },
     });
@@ -1940,16 +1940,16 @@ export async function openDesktopWindow (ctx = {}) {
                 // and the 10-minute idle path is still there as the backstop.
                 console.warn(`[${PHASE}] close: release was not recorded — the container will idle-stop on its own instead`);
                 telemetry.capture({
-                    eventClass: 'window_error', site: 'ezil-os:apps/desktop#close', code: 'release-failed',
+                    eventClass: 'window_error', site: 'ezil-os:apps/desktop#close', code: 'release_failed',
                 });
             }).catch(() => {
                 telemetry.capture({
-                    eventClass: 'window_error', site: 'ezil-os:apps/desktop#close', code: 'release-failed',
+                    eventClass: 'window_error', site: 'ezil-os:apps/desktop#close', code: 'release_failed',
                 });
             });
         } catch {
             telemetry.capture({
-                eventClass: 'window_error', site: 'ezil-os:apps/desktop#close', code: 'release-failed',
+                eventClass: 'window_error', site: 'ezil-os:apps/desktop#close', code: 'release_failed',
             });
         }
     };

@@ -24,26 +24,28 @@ system, which is out of scope for a docs-only pass.
 
 ---
 
-## 🔴 PENDING: `app/drizzle/0001_telemetry.sql` has NOT been applied
+## ✅ APPLIED: `app/drizzle/0001_telemetry.sql` is live, and holds real rows
 
-The telemetry ingest path, the aggregation queries, the hourly retention job and
-the `/admin/telemetry` page are all merged and green. **The migration behind them
-is deliberately un-applied.** The three tables it creates
-(`ezil_error_events`, `ezil_error_fingerprints`, `ezil_error_user_hours`) do not
-exist in the live Supabase database, and nothing in this repo will create them —
-no code path calls `drizzle-kit push`/`migrate`.
+> **CORRECTED 2026-08-19 by integration.** This section said "🔴 PENDING … the
+> three tables do not exist in the live Supabase database". **That was false, and
+> had been for roughly two weeks.** It was written from the repo (no code path
+> calls `drizzle-kit push`/`migrate`, which is still true) rather than from the
+> database. Nobody had looked. `docs/telemetry.md`'s matching "nothing is
+> stored" claim was corrected in the same pass. Evidence below is from
+> `docs/SUPABASE-STATE.md`, which queried the live project.
 
-**Why it is safe to ship un-applied.** The ingest route always answers `202` and
-does its write in `after()`, after the response is flushed. With no table
-present, the insert throws inside that deferred callback, the route has already
-returned, and one line goes to the server log. DEMONSTRATED, not asserted —
-`app/scripts/telemetry-e2e.ts` step 8 drops the three tables and re-POSTs a real
-batch: `202`, no throw, answered in single-digit milliseconds. The desktop, the
-shell and every other route are untouched, because nothing reads these tables
-except the admin page (which will simply error for the one operator who opens it).
+**State, measured 2026-08-19 against project `btgqfmnzycdecmeyqubx`:**
 
-**The command an operator runs to apply it**, against whatever
-`SUPABASE_DATABASE_URL` points at, from `app/`:
+| Fact | Value |
+| --- | --- |
+| Migration applied | **Yes**, on or before **2026-08-04** |
+| Tables present | `ezil_error_events`, `ezil_error_fingerprints`, `ezil_error_user_hours` |
+| Structural match to the file | exact — RLS on, 3 service-role-only policies, 7 indexes, 3 CHECKs, 2 FKs |
+| `ezil_error_events` | 199 inserts / 109 deletes / **84 live rows**, autovacuumed the same day |
+| Retention cron | running — oldest surviving row is exactly 14 days back |
+
+So **telemetry you add is readable.** The operator command below is retained for
+a rebuild or a fresh environment; it is not an outstanding action.
 
 ```
 psql "$SUPABASE_DATABASE_URL" -v ON_ERROR_STOP=1 -f drizzle/0001_telemetry.sql
@@ -51,17 +53,9 @@ psql "$SUPABASE_DATABASE_URL" -v ON_ERROR_STOP=1 -f drizzle/0001_telemetry.sql
 
 `-v ON_ERROR_STOP=1` matters: the file is a plain script, and without it psql
 would keep going past a failed statement and leave a half-built schema.
-`drizzle-kit migrate` also works if the journal is in sync; the raw `psql` form is
-listed because it is the one that does exactly what the file says and nothing else.
 
-**Verified against a throwaway Supabase Postgres 17.6 container** (same engine
-family as production, `auth.uid()`/`auth.role()`/`auth.users` present), applied on
-top of `0000`: all three tables created with RLS enabled, three service-role-only
-policies, both foreign keys, seven indexes, three CHECK constraints. The real
-ingest path then wrote and read back through it end-to-end.
-
-**Reversal**, if it needs to come out. There is no down-migration file; this is it,
-and it was executed against the throwaway database as part of the same run:
+**Reversal**, if it needs to come out — there is no down-migration file, this is
+it. ⚠️ It now destroys 84 rows of real collected telemetry:
 
 ```
 DROP TABLE IF EXISTS "ezil_error_user_hours";
@@ -69,13 +63,92 @@ DROP TABLE IF EXISTS "ezil_error_events";
 DROP TABLE IF EXISTS "ezil_error_fingerprints";
 ```
 
-Order matters (both FKs point inward). Confirmed to leave `ezil_computers` and
-every other `0000` object untouched. Dropping the tables destroys collected
-telemetry and nothing else — no product data lives in them.
+Order matters (both FKs point inward). Leaves `ezil_computers` and every other
+`0000` object untouched.
 
-⚠️ Applying this is a schema change to a live database holding real users' rows.
-It is a human decision, not an automated step, and it is why the file ships
-un-applied.
+### 🔴 …but only the SHELL producer has ever worked
+
+All 193 recorded occurrences carry `source='shell'`. **Zero** rows have ever
+arrived with `source='worker'` or `source='container'`. Before anything is built
+on a `container:neko#*` site — `decor_still_present`, `app_exit`, or any other —
+treat that producer as **unproven in production**, not merely unused.
+
+Related: **`computer_id` is NULL on all 84 shell rows**, contradicting
+`docs/telemetry.md`. Error events cannot currently be joined to a computer.
+
+### 🔴 OPEN OUTAGE: the R2 telemetry spool has never once been drained
+
+Measured 2026-08-19. The R2 bucket `ezil-telemetry-spool` held **173 objects /
+467 kB, accumulating since 2026-08-03** — the day it was created — and not one
+of those objects has ever reached Postgres. This is the mechanical reason for the
+"zero worker/container rows" finding above: **producing and spooling both work;
+the drain does not.**
+
+It hid for ~16 days because a broken drain and a quiet day were indistinguishable
+in both the result object and the HTTP response — `runTelemetrySpoolDrain` broke
+out of its loop identically for "the spool is empty" and "I could not reach the
+Worker at all", and both returned `{ pagesDrained: 0 }` with `200 {ok:true}`.
+
+`SpoolDrainResult.drainFailures` (`app/src/server/telemetry/spool-drain.ts`) now
+separates the two. **A non-zero `drainFailures` is always a fault, never a normal
+state.** The counter makes the outage visible; **it does not fix it.** Root cause
+of why the drain cannot reach the Worker is NOT yet established — candidates are
+an unset/incorrect drain secret, an unconfigured R2 binding on the Worker side,
+or the scheduled trigger never firing. Diagnose before assuming.
+
+---
+
+## `POST /sandbox/:name/logs` — the container boot-log tail
+
+Added 2026-08-19. Returns a bounded tail of the container's own `/tmp/neko.log`
+so "more logs" in Settings → Troubleshoot means something.
+
+| Property | Value |
+| --- | --- |
+| Route | `POST /sandbox/:name/logs` |
+| Auth | the same HMAC envelope as `POST /sandbox/:name/focus` |
+| Path read | hardcoded `/tmp/neko.log` — **never caller-supplied** |
+| Bounds | byte cap, line cap, per-line cap |
+| Redaction | every returned line runs through `sanitizeErrorMessage` |
+| Kill switch | `EZIL_NEKO_LOGS` — `on` (default) \| `off`; `off` answers `404 {ok:false,error:"neko_logs_disabled"}` |
+
+Modelled line-for-line on the existing `handleCpuDiag`, and it follows the same
+`SANDBOX_CPU_DIAG` / `SANDBOX_WORKSPACE_DIAG` operator-switch pattern.
+
+⚠️ **`/tmp/neko.log` is a shared sink, not a curated stream.** `start-neko.sh`'s
+own `log()` / `phase_*` emit only phase names, outcomes and integers — but six
+other producers redirect raw stdout+stderr into the same file (Xvfb, openbox,
+both supervised apps, `neko serve`, and the workspace bootstrap's stderr). Chrome
+prints URLs it navigates to; neko prints session and room state. The redaction
+and the caps on this route are what the guarantee rests on, not the script's
+editorial discipline. That header comment used to over-promise and was corrected
+in the same pass.
+
+---
+
+## 🔴 Known limitation: a Troubleshoot restart drops the desktop back to 1920x1080
+
+`EzilSandboxDO.restartDesktopStack` rebuilds its boot env (`iceEnv`) from
+`this.env` + `sandboxId` alone and sets **no `NEKO_SCREEN`**, so the relaunched
+container falls back to `start-neko.sh:138`'s `${NEKO_SCREEN:-1920x1080x24}`. A
+portrait desktop comes back landscape after a restart.
+
+**The shell does not silently repair it** — checked, not assumed.
+`desktop-window.js`'s `screen_ctl.request()` fires only from the ResizeObserver
+settle path, and a restart does not change the browser window's size, so no tick
+occurs; even if one did, the controller's `settled()` dedupe still holds the
+pre-restart `last_applied`/`last_sent` and would drop it as already-answered.
+
+**Workaround for a user:** close and reopen the desktop window. That re-runs the
+Tier-1 boot-time ask (`POST /api/shell/desktop` with `screen`), which does set
+`NEKO_SCREEN`.
+
+**Why it is written down rather than fixed.** The restart is initiated inside the
+DO with no caller-supplied body, so the requested size could only come from DO
+storage. That means `handlePreview` (Worker-side, outside the DO) gains an RPC
+that writes it, and `handleScreen` updates it on every live resize or the restart
+restores a stale shape. That is a new persisted field on the sandbox lifecycle
+and it is not exercisable outside a real deployed Worker.
 
 ---
 
@@ -111,27 +184,31 @@ bug by hand, check whether its fingerprint is already there — that is
 literally what "how many distinct users hit this in the last N hours"
 exists to answer. See `docs/telemetry.md` for what is (and is not) recorded.
 
-⚠️ None of it holds any data until `0001_telemetry.sql` is applied — see PENDING above.
+⚠️ It holds **84 live rows**, all `source='shell'` — see "APPLIED" above. No
+worker- or container-sourced row has ever landed, because the R2 spool drain has
+never run; see "OPEN OUTAGE" above before reading an empty container slice as
+"nothing failed".
 
 ---
 
 ## Before the next deploy — two prerequisites that are not code
 
-**1. Create the telemetry R2 bucket.** `worker/wrangler.toml` now binds
-`TELEMETRY_R2_BUCKET` to `ezil-telemetry-spool`, and the bucket does not exist. A
-Worker deploy with an unresolvable R2 binding fails, so this must be run first:
+**1. ~~Create the telemetry R2 bucket.~~ DONE — and now the problem is the other
+end.** `worker/wrangler.toml` binds `TELEMETRY_R2_BUCKET` to
+`ezil-telemetry-spool`. The bucket **exists and has existed since 2026-08-03**:
 
 ```
-cd worker && npx wrangler r2 bucket create ezil-telemetry-spool
+cd worker && npx wrangler r2 bucket create ezil-telemetry-spool   # already run
 ```
 
 Deliberately a SEPARATE bucket from `SANDBOX_WORKSPACE_R2_BUCKET`, which is
 FUSE-mounted into user containers — sharing it would put the fleet's error log
 inside a user's file manager.
 
-Nothing drains this spool yet. The objects are written (`v1/dt=/hh=/…` NDJSON) and
-never read; a drainer is unwritten work, and `worker/src/telemetry.ts`'s header
-states what it must do.
+A drainer **has since been written** (`app/src/server/telemetry/spool-drain.ts`)
+and it is **not working in production**: 173 objects / 467 kB have accumulated and
+none has ever been ingested. See "OPEN OUTAGE" above. Writing the spool is proven;
+reading it is not.
 
 **2. Nothing else.** The desktop-restart control needs no provisioning: the Worker
 route is on by default (`SANDBOX_RESTART` unset = enabled, same convention as

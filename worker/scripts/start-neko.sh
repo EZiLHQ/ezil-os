@@ -61,9 +61,33 @@ LOG=/tmp/neko.log
 # single `wrangler tail` interleaves both sides of one boot into one
 # greppable stream. `phase_start`/`phase_end` additionally bracket the named
 # phases a human actually cares about ("where does boot time go / where did
-# it die") with both a per-phase and a cumulative-since-boot duration. Never
-# logs payloads, secrets, file contents, or env values — only phase names,
-# ok/error/skipped outcomes, and integers.
+# it die") with both a per-phase and a cumulative-since-boot duration.
+#
+# 🔴 WHAT THIS PROMISE COVERS, AND WHAT IT DOES NOT — CORRECTED 2026-08-19.
+# This header used to say flatly that the log "never logs payloads, secrets,
+# file contents, or env values". That is true of `log()` and `phase_start` /
+# `phase_end` — THEY emit only phase names, ok/error/skipped outcomes, and
+# integers, and that guarantee is unchanged and is what the boot-telemetry
+# drain reads. It is NOT true of the FILE, because `$LOG` is a shared sink and
+# six other producers redirect their raw stdout+stderr straight into it:
+#
+#   - `Xvfb`                              (the X server)
+#   - `openbox`                           (both the configured and bare launch)
+#   - every `supervise_app` child         (chromium and code-server), whose
+#                                         command line and any URL, profile
+#                                         path or diagnostic they choose to
+#                                         print lands here verbatim
+#   - `neko serve`
+#   - the workspace bootstrap's stderr    (via a process substitution, so its
+#                                         diagnostics land here too)
+#
+# None of those are under this script's editorial control. Chrome in particular
+# prints URLs it is navigating to, and neko prints session and room state. So
+# treat `/tmp/neko.log` as "third-party process output that MAY contain URLs,
+# paths and other operational detail", not as a curated stream — which is
+# exactly why `POST /sandbox/:name/logs` runs every line it returns through
+# `sanitizeErrorMessage` and caps what it will hand back, rather than trusting
+# a promise made in this comment block.
 BOOT_T0_MS="$(date +%s%3N)"
 elapsed_ms() { echo $(( $(date +%s%3N) - BOOT_T0_MS )); }
 log() { echo "[ezil-boot][start-neko] +$(elapsed_ms)ms $*" | tee -a "$LOG" >&2; }
@@ -1633,6 +1657,16 @@ fi
 # (`…Chrome/151.0.0.0 Safari/537.36`, no HeadlessChrome, no automation token).
 # `--noerrdialogs` was tried first as the narrower flag and does NOT suppress
 # this infobar — verified by screenshot on the running desktop.
+# 🔴 `--window-size` IS DERIVED FROM `NEKO_SCREEN`, NOT HARDCODED (integration,
+# 2026-08-19). It read a literal `1920,1080` until W1's framebuffer split and
+# W2's per-session `NEKO_SCREEN` landed together; after that a portrait session
+# (`NEKO_SCREEN=1080x1920x24`) booted an X screen 1080 wide while telling Chrome
+# to open a 1920-wide window. Openbox's maximize reflows it — W1 measured a
+# correct 1080x1920 client at that size — so this was never fatal, but Chrome
+# paints its FIRST frame at the wrong shape and the user sees it. Both variables
+# are set and exported by the X-server block above and are always integers
+# (a malformed `NEKO_SCREEN` has already been forced to 1920x1080x24 there), so
+# there is no unset/empty case to guard here.
 phase_start chrome_launch
 log "supervising mandatory native browser ($CHROME_BIN) into $DISPLAY (fresh, isolated user-data-dir — no host profile; home=$CHROME_HOME_URL)"
 supervise_app chromium "$NEKO_APP_MAX_RESTARTS" "$CHROME_BIN" \
@@ -1650,7 +1684,7 @@ supervise_app chromium "$NEKO_APP_MAX_RESTARTS" "$CHROME_BIN" \
   --disable-default-apps \
   --no-pings \
   --user-data-dir="$CHROME_PROFILE_DIR" \
-  --window-size=1920,1080 \
+  --window-size="${NEKO_SCREEN_W},${NEKO_SCREEN_H}" \
   --window-position=0,0 \
   "$CHROME_HOME_URL"
 phase_end chrome_launch ok
@@ -1713,7 +1747,7 @@ chmod +x "$NEKO_SWITCH_APP_BIN"
 # config file; it does not prove the window. So this reads the LIVE window's
 # properties out of the running X server after the browser is up, logs the
 # LITERAL WM_CLASS on every boot so the match target stops being a guess, and
-# emits contract §8 telemetry (`container:neko#decor` / `decor-still-present`)
+# emits contract §8 telemetry (`container:neko#decor` / `decor_still_present`)
 # when the browser is still wearing a frame.
 #
 # The two ways a frame can come back, both checked:
@@ -1736,7 +1770,7 @@ chmod +x "$NEKO_SWITCH_APP_BIN"
 # a cosmetic defect, and refusing to serve a desktop over one would be worse
 # than the defect. Every probe degrades to a log line.
 emit_decor_violation() {
-  printf '{"eventClass":"contract_violation","source":"container","site":"container:neko#decor","code":"decor-still-present","outcome":"error","durationMs":0}\n' \
+  printf '{"eventClass":"contract_violation","source":"container","site":"container:neko#decor","code":"decor_still_present","outcome":"error","durationMs":0}\n' \
     >>"$TELEMETRY_NDJSON" 2>/dev/null || true
 }
 
