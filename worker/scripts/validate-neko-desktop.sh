@@ -114,10 +114,12 @@ else
   fi
 fi
 
-# codeserver has no X window/PID to enumerate via wmctrl, so its supervised
-# PID comes from start-neko.sh's own sanitized app health file instead (same
-# JSON that terminate_stack/the fatal sentinel already treat as authoritative
-# for this app's process state).
+# codeserver has no X window/PID to enumerate via wmctrl, so its PID comes from
+# start-neko.sh's own sanitized app health file instead (same JSON that
+# terminate_stack/the fatal sentinel already treat as authoritative for this
+# app's process state). `"pid"` there is the APPLICATION's process-group
+# leader, not the supervisor loop — the supervisor is alive precisely while
+# its app is dead, so the old field could not have failed this check.
 HF="${NEKO_APP_HEALTH_FILE:-/tmp/neko-app-health.json}"
 CODESERVER_PID=""
 if [ -f "$HF" ]; then

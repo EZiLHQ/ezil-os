@@ -37,6 +37,18 @@
  *                                    relaunch it forever. Only an
  *                                    implementation that looks at BOTH the
  *                                    status and the uptime passes all three.
+ *   D. exits 0 after a real run,  -> the exemption RUNS OUT and the desktop
+ *      over and over, forever        fails closed. Added after the first fix
+ *                                    for A shipped an exemption with no bound
+ *                                    at all: `attempt` was incremented only on
+ *                                    the crash branch and the fatal sentinel
+ *                                    was reachable only from there, so a clean
+ *                                    exit loop restarted indefinitely and
+ *                                    could never fail closed — a black desktop
+ *                                    on repeat under `ready ok`, since Chrome's
+ *                                    window is the only thing painting pixels
+ *                                    in this image. A passes under that bug;
+ *                                    D does not.
  *
  * ── Host requirements ───────────────────────────────────────────────────────
  * Linux, bash, python3. No Docker, no X server, no neko binary. The
@@ -139,6 +151,24 @@ function boot(opts: { uptimeSeconds: string; rc: number; maxRestarts: string; re
     writeStub(bin, 'xdpyinfo', 'exit 0');
     // The window gate resolves the browser by WM_CLASS in column 3.
     writeStub(bin, 'wmctrl', 'echo "0x01 0 chrome.Google-chrome stub EZiL OS Browser"');
+    // The gate no longer trusts `wmctrl` alone: it also demands
+    // `Map State: IsViewable` from `xwininfo -id`, and an `_NET_WM_PID` from
+    // `xprop -id` that resolves to a live member of one of THIS boot's app
+    // process groups. Both tools ship in the image (`x11-utils`), so they are
+    // stubbed here exactly like `xdpyinfo`/`wmctrl` already were — there is no
+    // X server on this host to answer for real.
+    //
+    // 🔴 The `xprop` stub does NOT hand the gate a pass. It reports the pid
+    //    this boot actually recorded for the browser, so the ownership
+    //    resolution — /proc pgrp lookup against $NEKO_APP_PGID_DIR — really
+    //    runs against a real live process. A stale or dead pid there fails the
+    //    gate here just as it would in the image.
+    writeStub(bin, 'xwininfo', 'echo "  Map State: IsViewable"');
+    writeStub(bin, 'xprop', [
+        'p="$(cat "${NEKO_APP_PGID_DIR}/chromium.pgid" 2>/dev/null)"',
+        '[ -n "$p" ] || exit 1',
+        'echo "_NET_WM_PID(CARDINAL) = $p"',
+    ].join('\n'));
     writeStub(bin, 'ezil-stub-neko', 'exec python3 -m http.server "$NEKO_HTTP_PORT" --bind 0.0.0.0');
     // code-server just has to hold its port so the readiness gate passes; this
     // suite is about the BROWSER's exits.
@@ -246,6 +276,41 @@ describe('start-neko.sh: a clean app exit is not a crash', () => {
         expect(h.stderr()).toContain('charged to the restart budget');
         expect(launches(h)).toBe(2);
     }, 150_000);
+
+    it('D. still fails closed when clean exits become a restart LOOP', async () => {
+        // 🔴 The regression this case exists to prevent. `attempt` was
+        // incremented only on the crash branch, and the fatal sentinel was
+        // reachable only from that branch, so an app exiting 0 after >=5s
+        // restarted FOREVER and could never fail the desktop closed — while
+        // every gap between launches is a black desktop (Chrome's window is
+        // the only pixel source in the image) under `phase=ready status=ok`.
+        // Case A alone cannot catch that: an infinite exemption passes A.
+        //
+        // Same shape as A — rc=0 after 6s, past the 5s minimum uptime — just
+        // sustained. Six consecutive short clean restarts stay free (the
+        // NEKO_APP_CLEAN_RESTART_MAX_STREAK bound, which is what keeps A
+        // green); the seventh is no longer readable as a person and is
+        // charged, so the ordinary budget takes over and the desktop dies.
+        // Budget of 1 => two charged exits, i.e. eight launches in total.
+        const h = boot({ uptimeSeconds: '6', rc: 0, maxRestarts: '1', restartDelay: '1' });
+        expect(await waitFor(() => tcpOpen(h.nekoPort), BIND_DEADLINE_MS)).toBe(true);
+
+        const code = await Promise.race([
+            h.exited,
+            new Promise<null>((r) => setTimeout(() => r(null), 130_000)),
+        ]);
+        expect(`exit=${code}\n${h.stderr().slice(-4000)}`).toBe(`exit=1\n${h.stderr().slice(-4000)}`);
+
+        // The first six really were free — this is A's guarantee, restated
+        // here so a fix that simply deleted the exemption cannot pass D.
+        expect(h.stderr()).toContain('NOT charged to the restart budget');
+        expect(h.stderr()).toContain('clean_streak=6');
+        // …and the seventh was recognised as a loop and charged.
+        expect(h.stderr()).toContain('7th consecutive restart with no healthy run');
+        expect(h.stderr()).toContain('RESTART LOOP');
+        expect(h.stderr()).toContain('PERMANENTLY FAILED');
+        expect(launches(h)).toBe(8);
+    }, 180_000);
 
     it('C. still fails closed when the app exits 0 IMMEDIATELY, over and over', async () => {
         // The hot-loop guard. rc=0, but it never ran: an implementation that

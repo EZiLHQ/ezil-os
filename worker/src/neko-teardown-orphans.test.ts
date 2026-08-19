@@ -171,6 +171,20 @@ function boot (reuse?: Harness): Harness {
         writeStub(bin, 'wmctrl', 'echo "0x01 0 chrome.Google-chrome stub EZiL OS Browser"');
         writeStub(bin, 'ezil-stub-browser', 'exec sleep 600');
         writeStub(bin, 'ezil-stub-neko', 'exec python3 -m http.server "$NEKO_HTTP_PORT" --bind 0.0.0.0');
+        // The gate now also demands `Map State: IsViewable` from `xwininfo`
+        // and an `_NET_WM_PID` from `xprop` that resolves to a live member of
+        // one of THIS boot's app process groups. Both tools ship in the image
+        // (`x11-utils`); there is no X server on this host to answer for real,
+        // so they are stubbed exactly like `xdpyinfo`/`wmctrl` already were.
+        // The `xprop` stub reports the pid this boot really recorded, so the
+        // ownership lookup runs for real against a live process rather than
+        // being handed a pass.
+        writeStub(bin, 'xwininfo', 'echo "  Map State: IsViewable"');
+        writeStub(bin, 'xprop', [
+            'p="$(cat "${NEKO_APP_PGID_DIR}/chromium.pgid" 2>/dev/null)"',
+            '[ -n "$p" ] || exit 1',
+            'echo "_NET_WM_PID(CARDINAL) = $p"',
+        ].join('\n'));
 
         // The mandatory code-server stand-in. It records its OWN pid, then
         // forks a GRANDCHILD which is what actually binds the port — the same
@@ -333,6 +347,20 @@ describe('start-neko.sh: a genuinely unstartable app still fails closed', () => 
         writeStub(bin, 'wmctrl', 'echo "0x01 0 chrome.Google-chrome stub EZiL OS Browser"');
         writeStub(bin, 'ezil-stub-browser', 'exec sleep 600');
         writeStub(bin, 'ezil-stub-neko', 'exec python3 -m http.server "$NEKO_HTTP_PORT" --bind 0.0.0.0');
+        // The gate now also demands `Map State: IsViewable` from `xwininfo`
+        // and an `_NET_WM_PID` from `xprop` that resolves to a live member of
+        // one of THIS boot's app process groups. Both tools ship in the image
+        // (`x11-utils`); there is no X server on this host to answer for real,
+        // so they are stubbed exactly like `xdpyinfo`/`wmctrl` already were.
+        // The `xprop` stub reports the pid this boot really recorded, so the
+        // ownership lookup runs for real against a live process rather than
+        // being handed a pass.
+        writeStub(bin, 'xwininfo', 'echo "  Map State: IsViewable"');
+        writeStub(bin, 'xprop', [
+            'p="$(cat "${NEKO_APP_PGID_DIR}/chromium.pgid" 2>/dev/null)"',
+            '[ -n "$p" ] || exit 1',
+            'echo "_NET_WM_PID(CARDINAL) = $p"',
+        ].join('\n'));
         // Never listens on anything. The gate must never pass.
         writeStub(bin, 'code-server', 'exit 7');
 

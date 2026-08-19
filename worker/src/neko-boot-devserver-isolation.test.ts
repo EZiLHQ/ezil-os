@@ -157,6 +157,24 @@ function bootWithDevserver (devserverBody: string): Harness {
     // The window-ready gate resolves Chrome by WM_CLASS in column 3 of
     // `wmctrl -x -l`. Report a matching window immediately.
     writeStub(bin, 'wmctrl', 'echo "0x01 0 chrome.Google-chrome stub EZiL OS Browser"');
+    // The gate no longer trusts `wmctrl` alone: it also demands
+    // `Map State: IsViewable` from `xwininfo -id`, and an `_NET_WM_PID` from
+    // `xprop -id` that resolves to a live member of one of THIS boot's app
+    // process groups. Both tools ship in the image (`x11-utils`), so they are
+    // stubbed here exactly like `xdpyinfo`/`wmctrl` already were — there is no
+    // X server on this host to answer for real.
+    //
+    // 🔴 The `xprop` stub does NOT hand the gate a pass. It reports the pid
+    //    this boot actually recorded for the browser, so the ownership
+    //    resolution — /proc pgrp lookup against $NEKO_APP_PGID_DIR — really
+    //    runs against a real live process. A stale or dead pid there fails the
+    //    gate here just as it would in the image.
+    writeStub(bin, 'xwininfo', 'echo "  Map State: IsViewable"');
+    writeStub(bin, 'xprop', [
+        'p="$(cat "${NEKO_APP_PGID_DIR}/chromium.pgid" 2>/dev/null)"',
+        '[ -n "$p" ] || exit 1',
+        'echo "_NET_WM_PID(CARDINAL) = $p"',
+    ].join('\n'));
     // Mandatory browser: named via NEKO_BROWSER_CANDIDATES below so the
     // preflight resolves this stub instead of a real Chrome on the host.
     writeStub(bin, 'ezil-stub-browser', 'exec sleep 600');

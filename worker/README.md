@@ -328,8 +328,12 @@ path; failures fail closed, never silently degrade to Guacamole).
   attaches any host/human profile, cookies, or saved logins.
 - **Health observability**: a sanitized JSON health file
   (`/tmp/neko-app-health.json`, default) is refreshed every 5s with only
-  `{state, pid, restarts}` per app — never command lines, window titles, or
-  URLs. `/tmp/neko.log` logs only app name + exit code on crash.
+  `{state, pid, supervisor_pid, restarts}` per app — never command lines,
+  window titles, or URLs. `pid` is the **application's** process-group leader
+  and `state` is that process group's liveness (`running` / `restarting` /
+  `stopped` / `failed`); `supervisor_pid` is the restart loop, which stays
+  alive precisely while its app is down and so must never be read as app
+  liveness. `/tmp/neko.log` logs only app name + exit code on crash.
 - **Focus/app switching**: deterministic switching is available two ways —
   the pinned `openbox.xml`'s built-in `Alt+Tab` keybinding, and
   `/usr/local/bin/neko-switch-app.sh <vscode|chromium>` (installed at

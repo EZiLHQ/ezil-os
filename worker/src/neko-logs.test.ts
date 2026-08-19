@@ -362,7 +362,20 @@ describe('neko-logs: the writers this route actually exposes are enumerated', ()
     const writers = [...startNekoSource.matchAll(/^\s*(\S+).*?(?:>>"\$LOG"|tee -a "\$LOG")/gm)].map(
       (m) => m[1],
     );
-    const known = new Set(['log()', 'echo', 'if', 'Xvfb', 'openbox', 'setsid', '--capture.video.display']);
+    // `_screen_has_pixels` is EZiL's own function, not a third party: it runs a
+    // libX11 `XGetImage` probe via python3 and answers black / not-black /
+    // could-not-look. Only its STDERR is redirected here, so what reaches $LOG
+    // is a Python traceback — file paths and exception text, never page
+    // content, never an env value, and never anything it read off the screen
+    // (the probe prints only its verdict, on stdout, which is NOT redirected).
+    // `redactNekoLogContent` already rewrites absolute paths, so the exposure
+    // is bounded by the same per-line pass as every other writer. Enumerated
+    // deliberately rather than by widening the regex — the point of this guard
+    // is that a new writer forces someone to state what it prints.
+    const known = new Set([
+      'log()', 'echo', 'if', 'Xvfb', 'openbox', 'setsid', '--capture.video.display',
+      '_screen_has_pixels',
+    ]);
     for (const w of writers) expect(known.has(w)).toBe(true);
   });
 });
