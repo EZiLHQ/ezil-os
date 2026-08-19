@@ -1097,10 +1097,19 @@ export async function openDesktopWindow (ctx = {}) {
         }
 
         if ( ! res.ok ) {
-            console.error(`[${PHASE}] boot failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`);
+            console.error(`[${PHASE}] boot failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`
+                + `${res.message ? ` (${res.message})` : ''}`);
             telemetry.capture({
                 eventClass: 'api_failure', site: 'ezil-os:apps/desktop#mint', code: res.errorCode,
                 durationMs: performance.now() - t0,
+                // 🔴 The SERVER's own words, not just our classification of
+                // them. `desktop_unreachable` is one code covering
+                // `desktop_frame_http_error_404`, `_410`, `_500` and
+                // `desktop_frame_unreachable`, and without this every one of
+                // them was recorded identically — which is exactly why ten
+                // production failures could not be told apart. `detail` is
+                // redacted and capped at 200 chars by `telemetry.js`.
+                detail: res.message,
             });
             render_both(computeBootUiState({
                 requestStatus: 'error',

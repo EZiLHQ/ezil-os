@@ -42,6 +42,7 @@ import {
     composeAppPreviewOrigin,
     composeBrowserDesktopUrl,
     composeCodePreviewOrigin,
+    confirmDesktopFrame,
     deriveGuacamoleSandboxId,
     deriveNekoAdminValue,
     describeAppliedScreen,
@@ -224,7 +225,19 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             // that handshake talks to the same origin and would otherwise burn
             // up to its own 8s budget failing against a host we already know is
             // not answering.
-            const frame = await probeDesktopFrame(result.guacamoleUrl);
+            //
+            // 🔴 `confirmDesktopFrame`, NOT `probeDesktopFrame`. The single
+            // 6-second GET this used to be was deciding 38% of desktop
+            // launches: in all ten observed production failures the Worker had
+            // SUCCEEDED and the port was exposed, and what failed was this one
+            // probe catching a `404 INVALID_TOKEN` / `410 STALE_PREVIEW_URL` /
+            // `500 Container suddenly disconnected` that the edge returns for
+            // well under a second during a normal boot transition. The
+            // discriminator: `codePreviewUrl` has no probe at all and minted
+            // fine on the same sandbox in the same seconds. See
+            // `confirmDesktopFrame`'s own header for the full mechanism and
+            // for why it costs nothing on a healthy boot.
+            const frame = await confirmDesktopFrame(result.guacamoleUrl);
             if (!frame.alive) {
                 console.error('[cloudflareGuacamole.previewUrl] desktop origin did not confirm', {
                     correlationId,
@@ -232,6 +245,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     reason: frame.reason,
                     status: frame.status,
                     detail: frame.detail,
+                    attempts: frame.attempts,
+                    elapsedMs: frame.elapsedMs,
                 });
                 // A VALUE, not a throw: the canvas retries thrown errors, and
                 // hammering a broken edge route three times before the user
@@ -241,6 +256,16 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     ok: false as const,
                     error: `desktop_frame_${frame.reason}${frame.status ? `_${frame.status}` : ''}`,
                     errorCode: 'desktop_unreachable' as const,
+                    // 🔴 THE OBSERVATION, ON THE WIRE. Before this, ten
+                    // production failures were indistinguishable: every one
+                    // arrived as a bare `desktop_unreachable` and nobody could
+                    // say which of 404/410/500 the probe had actually seen, or
+                    // whether it had asked once or twenty times. These three
+                    // fields are what turns the next occurrence into a
+                    // diagnosis instead of another investigation.
+                    frameReason: frame.reason,
+                    frameStatus: frame.status,
+                    frameAttempts: frame.attempts,
                     provider: 'cloudflare-guacamole' as const,
                 };
             }
