@@ -509,13 +509,14 @@ span.header-sort-icon img{margin-bottom:-1px;width:10px}
 .window-cover-page{border-radius:0;height:100vh!important}
 .device-phone .window[data-is_maximized="1"]{top:0!important}
 .device-phone .window,.device-tablet .window{z-index:9999999!important}
+.device-phone .window:not(.window-active),.device-tablet .window:not(.window-active){z-index:9999998!important}
 .device-phone .window-alert,.device-tablet .window-alert{min-width:90%;max-width:300px;position:absolute;left:50%!important;top:50%!important;transform:translate(-50%,-50%)}
 .device-phone .window .ui-resizable-handle,.device-phone .window .window-scale-btn,.device-tablet .window .window-scale-btn{display:none!important}
 .window-backdrop{position:fixed;top:0;bottom:0;left:0;right:0;background-color:#00000080}
 .window-dragging,.window.ui-resizable-resizing{transition:none}
 .window-head-draggable{overflow:hidden;flex-grow:1;display:flex}
 .window-head{overflow:hidden!important;padding:0 0 0 5px;background-color:hsla(var(--window-head-hue),var(--window-head-saturation),var(--window-head-lightness),calc(.5 + .5 * var(--window-head-alpha)));filter:grayscale(80%);box-shadow:inset 0 -4px 5px -7px rgb(0 0 0 / 64%);display:flex;flex-flow:row;margin-bottom:-1px}
-.device-phone .window-head{background-color:rgba(231,238,245)}
+.device-phone .window-head{background-color:hsl(var(--window-head-hue),var(--window-head-saturation),var(--window-head-lightness))}
 .window-head,.window-head *{user-select:none!important;-moz-user-select:none!important;-webkit-user-select:none!important;-ms-user-select:none!important;cursor:default}
 .window-active .window-head{filter:none!important}
 .window-head-title{line-height:30px;text-overflow:ellipsis;white-space:nowrap;overflow:hidden;color:var(--window-head-color)}
@@ -700,7 +701,7 @@ body:not(:has(.desktop.desktop-selectable-active)) .taskbar .taskbar-item:hover 
 .allow-user-select,.allow-user-select *{user-select:text}
 @supports ((backdrop-filter:blur())){
 .window-head{background-color:hsla(var(--window-head-hue),var(--window-head-saturation),var(--window-head-lightness),var(--window-head-alpha));backdrop-filter:blur(10px)}
-.device-phone .window-head{background-color:rgba(231,238,245);backdrop-filter:blur(10px)}
+.device-phone .window-head{background-color:hsl(var(--window-head-hue),var(--window-head-saturation),var(--window-head-lightness))}
 .window-sidebar{background-color:hsla(var(--window-sidebar-hue),var(--window-sidebar-saturation),var(--window-sidebar-lightness),var(--window-sidebar-alpha));backdrop-filter:blur(10px)}
 .window-snap-placeholder{backdrop-filter:blur(5px)}
 .context-menu{background-color:rgb(255 255 255 / 92%);backdrop-filter:blur(3px)}
@@ -717,9 +718,10 @@ body:not(:has(.desktop.desktop-selectable-active)) .taskbar .taskbar-item:hover 
 .window-copy-auth-token .window-body{box-sizing:border-box!important}
 }
 .device-phone .window:not(.window-alert),.device-tablet .window:not(.window-alert){transform:none;width:100%}
-.device-phone .window.window-filedialog{transform:none;width:100%!important;left:0!important;min-height:100dvh;height:100dvh;top:0!important;border-radius:0!important}
-.device-phone .window.window-app{transform:none;width:100%;left:0;height:100dvh;min-height:100dvh;top:0!important;border-radius:0}
-.device-phone .taskbar{position:fixed!important;bottom:5px!important;left:50%!important;right:auto!important;top:auto!important;width:auto!important;height:50px!important;transform:translateX(-50%)!important;flex-direction:row!important;justify-content:left!important;writing-mode:initial!important;padding:0 7px!important;border-radius:10px!important;-webkit-overflow-scrolling:touch;touch-action:pan-x;overflow-x:auto;scrollbar-width:none;-ms-overflow-style:none;display:flex}
+.device-phone .window:not(.window-alert){width:calc(100% - env(safe-area-inset-left,0px) - env(safe-area-inset-right,0px))!important;left:env(safe-area-inset-left,0)!important}
+.device-phone .window.window-filedialog{transform:none;top:env(safe-area-inset-top,0)!important;left:env(safe-area-inset-left,0)!important;width:calc(100% - env(safe-area-inset-left,0px) - env(safe-area-inset-right,0px))!important;height:calc(var(--ezil-vvh,100dvh) - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px));min-height:0;border-radius:0!important}
+.device-phone .window.window-app,.device-phone .window:not(.window-alert):not(.window-filedialog):has(> .window-body.window-body-app){transform:none;top:env(safe-area-inset-top,0)!important;left:env(safe-area-inset-left,0)!important;width:calc(100% - env(safe-area-inset-left,0px) - env(safe-area-inset-right,0px))!important;height:calc(var(--ezil-vvh,100dvh) - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px))!important;min-height:0;border-radius:0}
+.device-phone .taskbar{position:fixed!important;bottom:calc(5px + var(--ezil-kb,0px) + env(safe-area-inset-bottom,0px))!important;left:50%!important;right:auto!important;top:auto!important;width:auto!important;height:50px!important;transform:translateX(-50%)!important;flex-direction:row!important;justify-content:left!important;writing-mode:initial!important;padding:0 7px!important;border-radius:10px!important;-webkit-overflow-scrolling:touch;touch-action:pan-x;overflow-x:auto;scrollbar-width:none;-ms-overflow-style:none;display:flex}
 .device-phone .taskbar::-webkit-scrollbar{display:none}
 .device-phone .taskbar .taskbar-item{touch-action:pan-x pinch-zoom;user-select:none;-webkit-user-select:none;cursor:grab;display:flex;align-items:center;justify-content:center}
 .device-phone .desktop{position:relative;-webkit-overflow-scrolling:touch;touch-action:pan-x;scrollbar-width:none;-ms-overflow-style:none;overflow-y:visible!important;overflow-x:scroll}
@@ -792,7 +794,8 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .dashboard-app-drawer-btn:active{background-color:rgba(255,255,255,.26)}
 .dashboard-app-drawer-btn:focus-visible,.dashboard-app-drawer-toggle:focus-visible{outline:rgba(255,255,255,.9) solid 2px;outline-offset:1px}
 @media (pointer:coarse){
-.dashboard-app-drawer{--btn:36px;--controls-h:48px;--strip-h:8px;--open-h:50px;--shut-w:68px;--shut-h:20px}
+.dashboard-app-drawer{--btn:44px;--controls-h:56px;--strip-h:8px;--open-h:58px;--shut-w:68px;--shut-h:20px}
+.dashboard-app-drawer-btn svg{width:18px;height:18px}
 .dashboard-app-drawer-grabber{width:28px;height:4px}
 .dashboard-app-drawer.collapsed .dashboard-app-drawer-grabber{width:24px}
 .dashboard-app-drawer-toggle::after{inset:0 -16px -18px}
@@ -852,6 +855,8 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-settings-swatch-label{position:absolute;left:0;right:0;bottom:0;padding:2px 6px;font-size:10px;color:#fff;background:rgba(0,0,0,.45);text-align:left}
 .ezil-settings-about-version{color:#8a8a88;margin:0 0 18px}
 .dashboard-app-drawer-settings{margin-right:2px}
+.ezil-settings-rule{border:0;border-top:1px solid rgba(245,245,244,.1);margin:22px 0 18px}
+.ezil-settings-diagnostic{display:block;width:100%;margin-top:10px;padding:8px 10px;box-sizing:border-box;resize:vertical;border-radius:6px;border:1px solid rgba(245,245,244,.15);background:#1f1f1f;color:#cfcfce;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.45;white-space:pre;overflow:auto}
 #ezil-os-root{position:fixed;inset:0}
 .desktop.ezil-desktop{position:fixed;inset:0;box-sizing:border-box;width:auto;height:auto!important;background-color:#161616;background-image:radial-gradient(120% 80% at 78% 8%,rgba(0,173,181,.2) 0,rgba(0,173,181,0) 62%),radial-gradient(90% 70% at 10% 96%,rgba(0,173,181,.1) 0,rgba(0,173,181,0) 60%),linear-gradient(168deg,#1b1e1e 0,#161616 46%,#101111 100%)}
 body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;background-color:#161616}

@@ -61,9 +61,33 @@ LOG=/tmp/neko.log
 # single `wrangler tail` interleaves both sides of one boot into one
 # greppable stream. `phase_start`/`phase_end` additionally bracket the named
 # phases a human actually cares about ("where does boot time go / where did
-# it die") with both a per-phase and a cumulative-since-boot duration. Never
-# logs payloads, secrets, file contents, or env values — only phase names,
-# ok/error/skipped outcomes, and integers.
+# it die") with both a per-phase and a cumulative-since-boot duration.
+#
+# 🔴 WHAT THIS PROMISE COVERS, AND WHAT IT DOES NOT — CORRECTED 2026-08-19.
+# This header used to say flatly that the log "never logs payloads, secrets,
+# file contents, or env values". That is true of `log()` and `phase_start` /
+# `phase_end` — THEY emit only phase names, ok/error/skipped outcomes, and
+# integers, and that guarantee is unchanged and is what the boot-telemetry
+# drain reads. It is NOT true of the FILE, because `$LOG` is a shared sink and
+# six other producers redirect their raw stdout+stderr straight into it:
+#
+#   - `Xvfb`                              (the X server)
+#   - `openbox`                           (both the configured and bare launch)
+#   - every `supervise_app` child         (chromium and code-server), whose
+#                                         command line and any URL, profile
+#                                         path or diagnostic they choose to
+#                                         print lands here verbatim
+#   - `neko serve`
+#   - the workspace bootstrap's stderr    (via a process substitution, so its
+#                                         diagnostics land here too)
+#
+# None of those are under this script's editorial control. Chrome in particular
+# prints URLs it is navigating to, and neko prints session and room state. So
+# treat `/tmp/neko.log` as "third-party process output that MAY contain URLs,
+# paths and other operational detail", not as a curated stream — which is
+# exactly why `POST /sandbox/:name/logs` runs every line it returns through
+# `sanitizeErrorMessage` and caps what it will hand back, rather than trusting
+# a promise made in this comment block.
 BOOT_T0_MS="$(date +%s%3N)"
 elapsed_ms() { echo $(( $(date +%s%3N) - BOOT_T0_MS )); }
 log() { echo "[ezil-boot][start-neko] +$(elapsed_ms)ms $*" | tee -a "$LOG" >&2; }
@@ -811,6 +835,105 @@ launch_devserver() {
 # Neko's desktop manager connects to $DISPLAY at startup and panics if it is
 # unavailable, so the X server MUST be up before `neko serve` launches. Keyed
 # off the X display itself so a re-run reuses an already-running Xvfb.
+#
+# ── Framebuffer vs. screen: two different things that used to be one variable ─
+# `NEKO_SCREEN` was passed straight to `Xvfb -screen 0 <WxHxD>`, which sets the
+# framebuffer allocation AND the initial root-window size in one go. That
+# conflation is what pinned the desktop to one shape for the life of the
+# container, and it is the actual defect behind "the streamed desktop is
+# letterboxed into a strip on a phone".
+#
+# Measured behaviour of Xvfb's RANDR (docs/NEKO-GROUND-TRUTH.md §e, taken from a
+# real container, NOT theorised):
+#   * `POST /api/room/screen {"width":1280,"height":720,"rate":60}` returns 200
+#     and REALLY resizes the X root — `xdpyinfo` follows, and the maximized
+#     Chrome window re-lays-out with it. Xvfb's RANDR is not a stub.
+#   * A size LARGER than the boot-time `-screen` allocation is refused with
+#     HTTP 422 `cannot set screen size`.
+#   * `GET /api/room/screen/configurations` advertises exactly ONE entry — the
+#     boot-time size, with `"rate":0`. It is NOT the set of sizes that can be
+#     applied; do not treat it as one. The requestable set is fixed by §3 of
+#     docs/BROWSER-FIX-CONTRACT.md and enforced app-side.
+#
+# So the framebuffer is a CEILING, not a fixed size: every mode that fits inside
+# it is reachable at runtime. Splitting the two concepts is therefore the whole
+# fix, and it costs one Xvfb argument:
+#
+#   EZIL_X_FRAMEBUFFER — the ceiling. Must be the bounding box of every mode we
+#                        ever want to be selectable. Contract §3's twelve modes
+#                        are at most 1920 wide (1920x1080) and at most 1920 tall
+#                        (1080x1920), so the bounding box is 1920x1920x24. Note
+#                        this is a bounding box, not a mode: nothing ever
+#                        displays at 1920x1920.
+#   NEKO_SCREEN        — the INITIAL screen size, i.e. what the user first sees.
+#                        Unchanged in meaning and still per-session injectable
+#                        (contract §4.1: W2 writes it into the container boot
+#                        env from the shell's measured window). It is applied by
+#                        neko via `--desktop.screen` further down, because Xvfb
+#                        cannot be told a screen size distinct from its
+#                        framebuffer and this image has no `xrandr`.
+#
+# The framebuffer is clamped UP to contain NEKO_SCREEN in both axes. Without
+# that clamp an operator (or a future W2 bug) setting NEKO_SCREEN larger than
+# the framebuffer produces a boot where neko's initial `XRRSetScreenConfig`
+# silently fails and the desktop is left at the framebuffer size — a failure
+# mode nothing in this script currently detects.
+#
+# Both values are `WxHxD`. Depth is taken from NEKO_SCREEN, because depth is a
+# property of the visual the user actually gets and RANDR cannot change it;
+# contract §3 fixes it at 24 regardless.
+_screen_spec="$NEKO_SCREEN"
+NEKO_SCREEN_W=""; NEKO_SCREEN_H=""; NEKO_SCREEN_D=""
+if [[ "$_screen_spec" =~ ^([0-9]+)x([0-9]+)x([0-9]+)$ ]]; then
+  NEKO_SCREEN_W="${BASH_REMATCH[1]}"
+  NEKO_SCREEN_H="${BASH_REMATCH[2]}"
+  NEKO_SCREEN_D="${BASH_REMATCH[3]}"
+fi
+if [ -z "$NEKO_SCREEN_W" ] || [ "$NEKO_SCREEN_W" -eq 0 ] || [ "$NEKO_SCREEN_H" -eq 0 ]; then
+  # Contract §3: "1920x1080 stays the default and the fallback. If a mode
+  # request fails for any reason, the desktop must end up at 1920x1080, never
+  # at nothing." A malformed NEKO_SCREEN is exactly such a failure.
+  log "warning: NEKO_SCREEN='${_screen_spec}' is not a WxHxD spec — falling back to 1920x1080x24"
+  NEKO_SCREEN_W=1920; NEKO_SCREEN_H=1080; NEKO_SCREEN_D=24
+  NEKO_SCREEN="1920x1080x24"
+fi
+
+EZIL_X_FRAMEBUFFER="${EZIL_X_FRAMEBUFFER:-1920x1920x24}"
+_fb_w=""; _fb_h=""
+if [[ "$EZIL_X_FRAMEBUFFER" =~ ^([0-9]+)x([0-9]+)(x[0-9]+)?$ ]]; then
+  _fb_w="${BASH_REMATCH[1]}"
+  _fb_h="${BASH_REMATCH[2]}"
+fi
+if [ -z "$_fb_w" ] || [ "$_fb_w" -eq 0 ] || [ "$_fb_h" -eq 0 ]; then
+  log "warning: EZIL_X_FRAMEBUFFER='${EZIL_X_FRAMEBUFFER}' is not a WxH[xD] spec — falling back to 1920x1920"
+  _fb_w=1920; _fb_h=1920
+fi
+# Clamp up so the framebuffer always contains the initial screen in both axes.
+if [ "$NEKO_SCREEN_W" -gt "$_fb_w" ] || [ "$NEKO_SCREEN_H" -gt "$_fb_h" ]; then
+  log "warning: NEKO_SCREEN ${NEKO_SCREEN_W}x${NEKO_SCREEN_H} does not fit framebuffer ${_fb_w}x${_fb_h} — growing the framebuffer to contain it"
+  [ "$NEKO_SCREEN_W" -gt "$_fb_w" ] && _fb_w="$NEKO_SCREEN_W"
+  [ "$NEKO_SCREEN_H" -gt "$_fb_h" ] && _fb_h="$NEKO_SCREEN_H"
+fi
+EZIL_X_FRAMEBUFFER="${_fb_w}x${_fb_h}x${NEKO_SCREEN_D}"
+# 🔴 Xvfb's RANDR floors the screen WIDTH to a multiple of 8. Height is not
+#    quantised. Measured in a real container by asking for sizes either side of
+#    the boundary and reading back what was actually applied:
+#      request 900x1600 -> applied 896x1600      request 1080x1918 -> applied 1080x1918
+#      request 898x1600 -> applied 896x1600      request  902x902  -> applied  896x902
+#      request 904x1600 -> applied 904x1600      request 1082x1920 -> applied 1080x1920
+#    Worse, `POST /api/room/screen` echoes back the size that was REQUESTED,
+#    not the one that was applied — only `GET /api/room/screen` tells the truth.
+#    So a non-multiple-of-8 width fails SILENTLY at every layer above this one.
+#    Eleven of contract §3's twelve modes are already 8-aligned; `900x1600` is
+#    not, and is unreachable. This warns rather than snapping, because snapping
+#    here would hide a contract problem that belongs in §3.
+if [ $(( NEKO_SCREEN_W % 8 )) -ne 0 ]; then
+  log "warning: NEKO_SCREEN width ${NEKO_SCREEN_W} is not a multiple of 8 — Xvfb's RANDR will floor it to $(( NEKO_SCREEN_W / 8 * 8 )); the desktop will NOT be ${NEKO_SCREEN_W} wide"
+fi
+# Exported so validators and the neko-serve section below read exactly the
+# values Xvfb was actually started with, rather than re-deriving them.
+export NEKO_SCREEN EZIL_X_FRAMEBUFFER NEKO_SCREEN_W NEKO_SCREEN_H NEKO_SCREEN_D
+
 phase_start xvfb
 if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
   log "X display $DISPLAY already active — reusing"
@@ -839,8 +962,12 @@ else
     fi
     rm -f "$_x_lock" "/tmp/.X11-unix/X${_x_display_num}" 2>/dev/null || true
   fi
-  log "starting Xvfb on $DISPLAY ($NEKO_SCREEN)"
-  Xvfb "$DISPLAY" -screen 0 "$NEKO_SCREEN" -ac +extension RANDR -nolisten tcp >>"$LOG" 2>&1 &
+  # -screen takes the FRAMEBUFFER, not the screen the user sees. Xvfb comes up
+  # at the framebuffer size; `neko serve` immediately applies NEKO_SCREEN via
+  # `--desktop.screen` (see the neko-serve section below), and every later
+  # `POST /api/room/screen` can reach any size inside this box.
+  log "starting Xvfb on $DISPLAY (framebuffer $EZIL_X_FRAMEBUFFER; initial screen $NEKO_SCREEN, applied by neko)"
+  Xvfb "$DISPLAY" -screen 0 "$EZIL_X_FRAMEBUFFER" -ac +extension RANDR -nolisten tcp >>"$LOG" 2>&1 &
   # Recorded so teardown stops the X server too. It used to be missed entirely,
   # so a failed boot left $DISPLAY held by an orphaned Xvfb (with an orphaned
   # openbox and browser still drawing into it) for the life of the container.
@@ -977,6 +1104,62 @@ write_health() {
   printf '%s\n' "$body" >"$NEKO_APP_HEALTH_FILE.tmp" && mv "$NEKO_APP_HEALTH_FILE.tmp" "$NEKO_APP_HEALTH_FILE"
 }
 
+# ── Clean quit vs crash (a user closing the browser must not kill the session) ─
+#
+# `supervise_app` below used to restart an app on ANY exit and charge EVERY
+# exit to the restart budget: `rc` was logged and never looked at. So a user
+# who quit the in-stream browser six times got `NEKO_APP_MAX_RESTARTS` (5)
+# exhausted, the fatal sentinel raised, and `terminate_stack` — SIGTERM/SIGKILL
+# to every app group, neko, the X server, openbox, pulseaudio — followed by
+# `exit 1`. The user asked to close a window and lost the whole desktop
+# session. (W3 is separately removing that close button; this must not be
+# reachable by ordinary use whether or not the button is there.)
+#
+# ── The rule ────────────────────────────────────────────────────────────────
+# An exit is CLEAN — and therefore NOT charged to the restart budget — when
+# BOTH hold:
+#
+#   rc == 0                     the app chose to exit. A crash is a non-zero
+#                               status, and a signal death is 128+n, never 0.
+#   uptime >= 5s                it had actually been running. "Exited 0
+#                               immediately" is not a user quitting: it is
+#                               Chrome handing off to an already-running
+#                               instance, or a profile it refuses to open,
+#                               and letting THAT be free would be an
+#                               unbounded hot restart loop.
+#
+# Everything else — any non-zero status, any signal, and any rc=0 inside the
+# first 5 seconds — is charged exactly as before, so a genuine crash-loop
+# still exhausts the budget and still fails the desktop closed. The budget is
+# NOT infinite and NOT larger than it was.
+#
+# ── What a clean exit costs ─────────────────────────────────────────────────
+# A clean exit is free forever, so an app that exits 0 after >=5s of uptime
+# restarts indefinitely rather than ever tripping the sentinel. That is the
+# intended trade (a browser the user closed must come back, not take the
+# session with it), but "indefinitely" needs a floor under it or a
+# pathological app could relaunch every ~7s for the life of the container. So
+# CONSECUTIVE clean exits back off LINEARLY (2s, 4s, 6s, … capped at 30s),
+# and the streak resets the moment an app manages a genuinely healthy run
+# (>=60s) — which is every real user-initiated quit, so a user who closes the
+# browser gets it back in the same 2s as always.
+#
+# These three are internal constants, deliberately NOT `${VAR:-…}`-overridable:
+# the browser-fix contract §2 fixes the set of environment variables and this
+# needs none of them.
+NEKO_APP_CLEAN_EXIT_MIN_UPTIME_MS=5000
+NEKO_APP_CLEAN_EXIT_HEALTHY_MS=60000
+NEKO_APP_CLEAN_RESTART_MAX_DELAY=30
+
+# _app_exit_is_clean <rc> <uptime_ms> — the rule above, and nothing else.
+# Returns 0 (true) for a clean, user-initiated quit.
+_app_exit_is_clean() {
+  local rc="$1" uptime_ms="$2"
+  [ "$rc" = "0" ] || return 1
+  [ "$uptime_ms" -ge "$NEKO_APP_CLEAN_EXIT_MIN_UPTIME_MS" ] || return 1
+  return 0
+}
+
 # supervise_app <name> <max_restarts> <cmd...>
 # Runs <cmd> in a restart loop inside a background subshell. On exit it logs
 # only the app name + exit code (never argv/urls), waits with a short backoff,
@@ -1007,8 +1190,10 @@ supervise_app() {
   APP_RESTARTS[$name]=0
   rm -f "$pgid_file" "$sup_file" 2>/dev/null || true
   write_health
+  local clean_streak=0
   (
     while true; do
+      app_started_ms="$(date +%s%3N)"
       setsid "$@" >>"$LOG" 2>&1 &
       app_pgid=$!
       # Written atomically so terminate_stack can never read a half-written
@@ -1018,12 +1203,45 @@ supervise_app() {
         && mv "${pgid_file}.tmp" "$pgid_file" 2>/dev/null
       wait "$app_pgid"
       local rc=$?
+      # Captured AFTER rc, never before: anything between `wait` and reading
+      # `$?` destroys the status this whole classification rests on.
+      local uptime_ms=$(( $(date +%s%3N) - app_started_ms ))
       # Teardown in progress: do not start a replacement that would outlive it.
       if [ -f "$NEKO_SHUTDOWN_FLAG" ]; then
         log "app=$name exited rc=$rc during teardown — not restarting"
         break
       fi
-      log "app=$name exited rc=$rc (attempt $((attempt + 1))/$((max_restarts + 1)))"
+      # 🔴 The user-initiated quit. Restarted like any other exit — the desktop
+      # still needs its browser — but NOT charged to the restart budget, so no
+      # number of them can ever raise the fatal sentinel and take the session
+      # down. See `_app_exit_is_clean` above for the rule and its cost.
+      if _app_exit_is_clean "$rc" "$uptime_ms"; then
+        if [ "$uptime_ms" -ge "$NEKO_APP_CLEAN_EXIT_HEALTHY_MS" ]; then
+          clean_streak=1
+        else
+          clean_streak=$((clean_streak + 1))
+        fi
+        # Integer maths only. `NEKO_APP_RESTART_DELAY` is a `sleep` argument
+        # and may legitimately be fractional ("0.5"), which bash arithmetic
+        # cannot multiply — and under `set -u` a failed arithmetic assignment
+        # would leave `clean_delay` unset and kill this supervisor outright.
+        # A non-integer delay simply gets no backoff.
+        local clean_delay="$NEKO_APP_RESTART_DELAY"
+        case "$NEKO_APP_RESTART_DELAY" in
+          ''|*[!0-9]*) : ;;
+          *)
+            clean_delay=$((NEKO_APP_RESTART_DELAY * clean_streak))
+            [ "$clean_delay" -gt "$NEKO_APP_CLEAN_RESTART_MAX_DELAY" ] \
+              && clean_delay="$NEKO_APP_CLEAN_RESTART_MAX_DELAY"
+            ;;
+        esac
+        log "app=$name exited rc=$rc after ${uptime_ms}ms — CLEAN exit (user-initiated quit): restarting in ${clean_delay}s, NOT charged to the restart budget (still $attempt/$max_restarts used, clean_streak=$clean_streak)"
+        emit_telemetry "container:neko#app_exit" "ok" "$uptime_ms"
+        sleep "$clean_delay"
+        continue
+      fi
+      log "app=$name exited rc=$rc after ${uptime_ms}ms — CRASH (non-zero status, or exited 0 inside the first ${NEKO_APP_CLEAN_EXIT_MIN_UPTIME_MS}ms): charged to the restart budget (attempt $((attempt + 1))/$((max_restarts + 1)))"
+      emit_telemetry "container:neko#app_exit" "error" "$uptime_ms"
       attempt=$((attempt + 1))
       if [ "$attempt" -gt "$max_restarts" ]; then
         log "app=$name PERMANENTLY FAILED after $attempt attempts — restart budget exhausted. Marking desktop unhealthy; neko/container will terminate (contract: no apparently-ready desktop with a dead mandatory app)."
@@ -1319,6 +1537,81 @@ phase_end codeserver_launch ok
 # a corrupted one).
 rm -rf "$CHROME_PROFILE_DIR" 2>/dev/null || true
 mkdir -p "$CHROME_PROFILE_DIR" 2>/dev/null || true
+
+# ── The browser must NOT draw its own window frame ───────────────────────────
+# 🔴 MEASURED in a real container (docs/NEKO-GROUND-TRUTH.md §a–§d, §g), not
+# reasoned about. The bar the user sees inside the stream — with minimize /
+# restore / close buttons at the top right — is NOT an openbox titlebar.
+# Openbox is already doing exactly what ebuilder-openbox.xml tells it:
+#   _NET_FRAME_EXTENTS = 0, 0, 0, 0
+#   _NET_WM_STATE contains _OB_WM_STATE_UNDECORATED
+#   the openbox frame window is pixel-identical to its client (1920x1080+0+0)
+#   and all 55 of its decoration widgets are collapsed to 1x1
+# The class it matches on is literally `Google-chrome` and the match is
+# confirmed by openbox's own `_OB_APP_CLASS`. There is no WM decoration left
+# to remove, so DO NOT "fix" this by widening the openbox selector.
+#
+# ⚠️ AND THE OPPOSITE WARNING, WHICH THIS CHANGE CREATES. Before this change
+# the openbox <decor>no</decor> rule was REDUNDANT: Chrome's own
+# MWM_DECOR_NONE hint was already suppressing WM decoration, so pointing
+# openbox at a bogus class changed nothing (measured). After this change the
+# rule is LOAD-BEARING — Chrome now asks to be decorated, and openbox refusing
+# is the only reason there is no titlebar. Measured with the pref set and the
+# openbox rule deliberately mis-targeted: the window came back fully decorated,
+# `_NET_FRAME_EXTENTS = 1, 1, 20, 5`. So weakening, mistyping or re-scoping
+# that rule is now WORSE than doing nothing at all. `verify_browser_frame`
+# below checks `_NET_FRAME_EXTENTS` precisely to catch that regression.
+#
+# What draws the bar is Chrome's own tabstrip-integrated frame. On Linux,
+# Chrome's default is to draw that frame itself and to ask the WM not to
+# decorate it (`_MOTIF_WM_HINTS = 0x2, 0x0, 0x0, 0x0, 0x0` — flags =
+# MWM_HINTS_DECORATIONS, decorations = none). `browser.custom_chrome_frame` is
+# where Chrome persists the "Use system title bar and borders" toggle, and it
+# is ABSENT from a fresh profile, so nothing has ever told Chrome otherwise.
+#
+# Seeding it false makes Chrome ask for a SYSTEM frame instead — and openbox's
+# existing <decor>no</decor> then declines to draw one. Net result: tab strip
+# and omnibox at pixel row 0, no title bar, no caption buttons. Tabs and the
+# address bar are kept deliberately (approved product decision), which is why
+# this is NOT done with --kiosk or --app=.
+#
+# 🔴 The pref is seeded on EVERY boot because the profile directory is
+# `rm -rf`'d immediately above. There is nowhere persistent for it to live.
+#
+# VERIFIED that Chrome honours a hand-seeded file rather than discarding it —
+# Chrome 151.0.7922.71, same image, same flags, openbox with the same config:
+#   without the seed: _MOTIF_WM_HINTS = 0x2, 0x0, 0x0, 0x0, 0x0  (own frame)
+#   with the seed:    _MOTIF_WM_HINTS = 0x2, 0x0, 0x1, 0x0, 0x0  (system frame)
+# and the key was still `"custom_chrome_frame":false` in Preferences after
+# Chrome exited and rewrote the file — this key is not one of the MAC-protected
+# prefs, so it is neither rejected at startup nor scrubbed at shutdown.
+# `verify_browser_frame` below re-checks that third field on every boot rather
+# than trusting that this write took.
+#
+# EZIL_BROWSER_DECOR is the kill switch (contract §2): `off` (default) = no
+# decorations, i.e. seed the pref; `on` = leave Chrome on its default and get
+# its own frame back, exactly as before this change.
+EZIL_BROWSER_DECOR="${EZIL_BROWSER_DECOR:-off}"
+
+# Written with plain shell redirection — no jq, no python — because this runs
+# before anything has proven those exist, and a failure here must degrade to a
+# cosmetic regression, never to a failed boot.
+seed_chrome_frame_pref() {
+  _cf_default_dir="$1/Default"
+  mkdir -p "$_cf_default_dir" 2>/dev/null || return 1
+  cat >"$_cf_default_dir/Preferences" <<'CHROME_PREFS_JSON'
+{"browser":{"custom_chrome_frame":false}}
+CHROME_PREFS_JSON
+}
+
+if [ "$EZIL_BROWSER_DECOR" = "on" ]; then
+  log "EZIL_BROWSER_DECOR=on — leaving Chrome on its Linux default (it will draw its own frame, with its own minimize/maximize/close buttons, inside the stream)"
+elif seed_chrome_frame_pref "$CHROME_PROFILE_DIR"; then
+  log "browser frame: seeded browser.custom_chrome_frame=false into ${CHROME_PROFILE_DIR}/Default/Preferences (Chrome asks for a system frame; openbox <decor>no</decor> then draws none — no title bar, no caption buttons, tabs and omnibox kept)"
+else
+  log "WARNING: could not seed ${CHROME_PROFILE_DIR}/Default/Preferences — Chrome will fall back to its own custom frame and the stream will show a second set of window controls"
+fi
+
 # Deterministic, non-blank landing page. The mandatory native browser must come
 # up on real EZiL OS content with a known <title> ("EZiL OS Browser"), not
 # about:blank — so validators can positively assert the browser window is
@@ -1343,10 +1636,63 @@ fi
 # NOTE: same as `codeserver_launch` above — this only times the near-instant
 # supervised-process fork request; actual window-appearance time is measured
 # by the concurrent `window_ready_gate` phase below.
+#
+# 🔴 `--test-type` is here for ONE visible reason: it suppresses Chrome's
+# "You are using an unsupported command-line flag: --no-sandbox. Stability and
+# security will suffer." infobar, which otherwise eats a ~40px strip across the
+# top of the window in EVERY session (it is in the ground-truth screenshot).
+# `--no-sandbox` itself stays: it is required for Chrome to run in this
+# container and is not in scope to remove, so the banner is permanent unless
+# something suppresses it. (Why the sandbox cannot be used here was NOT
+# re-measured by this change — the flag was left exactly as it was found.)
+#
+# What it costs, stated plainly rather than waved away. `--test-type` does not
+# suppress that one string; it turns off the whole bad-flags warning path, so
+# if a future edit adds another security-weakening flag to this launch line, no
+# one will be warned on screen. It also suppresses assorted startup error
+# dialogs (e.g. the "profile in use" dialog). It does NOT weaken the sandbox
+# further than --no-sandbox already has, and — MEASURED on this image, not
+# assumed — it does not mark the browser as automated to web pages:
+# `navigator.webdriver` is still `false` and the User-Agent is unchanged
+# (`…Chrome/151.0.0.0 Safari/537.36`, no HeadlessChrome, no automation token).
+# `--noerrdialogs` was tried first as the narrower flag and does NOT suppress
+# this infobar — verified by screenshot on the running desktop.
+# `--window-size` is derived from `NEKO_SCREEN` rather than hardcoded
+# `1920,1080` (integration, 2026-08-19). Both variables are set and exported by
+# the X-server block above and are always integers (a malformed `NEKO_SCREEN`
+# has already been forced to 1920x1080x24 there), so there is no unset/empty
+# case to guard here. Keeping the flag consistent with the requested screen is
+# right on its own terms — but the justification originally written here was
+# that it removes a wrongly-shaped FIRST frame the user sees, and that is
+# WRONG. Do not repeat it, and do not "improve" this flag expecting a visible
+# result.
+#
+# 🔴 CORRECTED 2026-08-19 by V2, from an X-protocol event trace and raw
+# XGetImage frames on real portrait containers (`NEKO_SCREEN=1080x1920x24`),
+# running the current script and a variant with the old literal `1920,1080`
+# side by side. `--window-size` NEVER REACHES A PAINTED PIXEL:
+#
+#   new flag (1080,1920): Create 1080x1920 -> Configure 1920x1920 -> Map 1920x1920
+#   old flag (1920,1080): Create 1920x1080 -> Configure 1920x1920 -> Map 1920x1920
+#
+# openbox's `<maximized>true</maximized>` resizes the client to the CURRENT
+# ROOT before MapNotify, so the window is never once visible at the size this
+# flag asks for. And the root at that moment is the FRAMEBUFFER
+# (`EZIL_X_FRAMEBUFFER`, 1920x1920), not the requested screen: neko applies
+# `NEKO_SCREEN` ~1.4s later, from its own startup. So the first painted frame
+# on a portrait boot is a fully-rendered 1920x1920 SQUARE — in both variants
+# alike — for ~1.4s, and this flag changes neither its shape nor its duration.
+#
+# Nor does any consumer see that square. neko logs `setting initial screen
+# size` BEFORE `http listening`, so the capture pipeline and the HTTP surface
+# both come up after the resize: hammering `GET /api/room/screen/shot.jpg` from
+# container start returns 1080x1920 on the very first success (t=5.18s). The
+# transient is real on the X display and invisible everywhere else.
 phase_start chrome_launch
 log "supervising mandatory native browser ($CHROME_BIN) into $DISPLAY (fresh, isolated user-data-dir — no host profile; home=$CHROME_HOME_URL)"
 supervise_app chromium "$NEKO_APP_MAX_RESTARTS" "$CHROME_BIN" \
   --no-sandbox \
+  --test-type \
   --disable-gpu \
   --disable-dev-shm-usage \
   --no-first-run \
@@ -1359,7 +1705,7 @@ supervise_app chromium "$NEKO_APP_MAX_RESTARTS" "$CHROME_BIN" \
   --disable-default-apps \
   --no-pings \
   --user-data-dir="$CHROME_PROFILE_DIR" \
-  --window-size=1920,1080 \
+  --window-size="${NEKO_SCREEN_W},${NEKO_SCREEN_H}" \
   --window-position=0,0 \
   "$CHROME_HOME_URL"
 phase_end chrome_launch ok
@@ -1412,6 +1758,116 @@ fi
 exec wmctrl -i -a "$win_id"
 SWITCH_EOF
 chmod +x "$NEKO_SWITCH_APP_BIN"
+
+# ── Browser-frame read-back (contract §5.3) ─────────────────────────────────
+# Defined here, CALLED after the window-ready gate below — the window it reads
+# does not exist until that gate has seen it.
+#
+# This repo has already shipped one decoration rule whose only guard was a test
+# that grepped an XML file for a substring. A grep of a config file proves the
+# config file; it does not prove the window. So this reads the LIVE window's
+# properties out of the running X server after the browser is up, logs the
+# LITERAL WM_CLASS on every boot so the match target stops being a guess, and
+# emits contract §8 telemetry (`container:neko#decor` / `decor_still_present`)
+# when the browser is still wearing a frame.
+#
+# The two ways a frame can come back, both checked:
+#   1. Chrome draws its own — `_MOTIF_WM_HINTS` flags carry MWM_HINTS_DECORATIONS
+#      (0x2) with a decorations field of 0, i.e. "WM, don't decorate me, I've
+#      got this". That is the state ground truth measured, and the state the
+#      seeded pref is meant to flip to 0x1.
+#   2. Openbox draws one — a non-zero TOP value in `_NET_FRAME_EXTENTS`
+#      (left, right, top, bottom). Ground truth measured 0,0,0,0. This is the
+#      newly-possible failure: seeding the pref makes the openbox rule
+#      load-bearing (see the long note at the seed site), and a broken rule
+#      now yields a real WM titlebar — measured as 1, 1, 20, 5.
+#
+# Check 1 is deliberately the SAME property `validate-neko-browser-window.sh`
+# asserts as `browser.chrome_frame.no_caption_buttons` — the decorations field
+# of `_MOTIF_WM_HINTS`. Two checks agreeing on one property is the point; do
+# not re-derive "is it decorated" some third way here.
+#
+# This never fails the boot and never blocks it: a browser with an extra bar is
+# a cosmetic defect, and refusing to serve a desktop over one would be worse
+# than the defect. Every probe degrades to a log line.
+emit_decor_violation() {
+  printf '{"eventClass":"contract_violation","source":"container","site":"container:neko#decor","code":"decor_still_present","outcome":"error","durationMs":0}\n' \
+    >>"$TELEMETRY_NDJSON" 2>/dev/null || true
+}
+
+verify_browser_frame() {
+  local wm_line="" wid="" class_field="" motif="" vals="" flags="" decorations=""
+  local extents="" top_extent="" pref="" own_frame=0 wm_frame=0
+
+  if ! command -v wmctrl >/dev/null 2>&1; then
+    log "browser frame check COULD-NOT-DETERMINE: wmctrl not available"
+    return 0
+  fi
+  wm_line="$(wmctrl -x -l 2>/dev/null | awk 'tolower($3) ~ /chrome/ {print; exit}')"
+  if [ -z "$wm_line" ]; then
+    log "browser frame check COULD-NOT-DETERMINE: no window with a chrome WM_CLASS is listed by wmctrl"
+    return 0
+  fi
+  wid="$(printf '%s' "$wm_line" | awk '{print $1}')"
+  # The whole matched line, verbatim. NOT just awk's $3: the WM_CLASS instance
+  # Chrome publishes contains a space ("google-chrome (/tmp/chromium-app-data)"),
+  # so field 3 alone silently truncates the very string this line exists to
+  # record. The authoritative WM_CLASS is read off the window with xprop below.
+  log "browser window id=${wid} wmctrl line: ${wm_line}"
+
+  pref="$(grep -o '"custom_chrome_frame":[a-z]*' "${CHROME_PROFILE_DIR}/Default/Preferences" 2>/dev/null | head -n 1)"
+  log "browser frame pref now in profile: ${pref:-ABSENT} (EZIL_BROWSER_DECOR=${EZIL_BROWSER_DECOR})"
+
+  if ! command -v xprop >/dev/null 2>&1; then
+    log "browser frame check COULD-NOT-DETERMINE: xprop not available — cannot read _MOTIF_WM_HINTS/_NET_FRAME_EXTENTS off window ${wid}"
+    return 0
+  fi
+  if ! motif="$(xprop -id "$wid" _MOTIF_WM_HINTS 2>/dev/null)"; then
+    log "browser frame check COULD-NOT-DETERMINE: xprop could not read window ${wid} (no X connection, or the window went away). Not reporting a violation for a property that was never read."
+    return 0
+  fi
+  extents="$(xprop -id "$wid" _NET_FRAME_EXTENTS 2>/dev/null || true)"
+  # The literal WM_CLASS, every boot, straight off the window — this is the
+  # exact string `ebuilder-openbox.xml`'s class="Google-chrome" rule is matched
+  # against, and the one thing nobody should ever again have to guess at.
+  class_field="$(xprop -id "$wid" WM_CLASS 2>/dev/null | tr '\n' ' ' || true)"
+  log "browser ${class_field:-WM_CLASS unreadable}"
+  log "browser frame props: $(printf '%s %s' "$motif" "$extents" | tr '\n' ' ')"
+
+  # _MOTIF_WM_HINTS = flags, functions, decorations, input_mode, status
+  case "$motif" in
+    *=*)
+      vals="${motif#*= }"
+      flags="$(printf '%s' "$vals" | cut -d, -f1 | tr -d ' ')"
+      decorations="$(printf '%s' "$vals" | cut -d, -f3 | tr -d ' ')"
+      ;;
+  esac
+  if [[ "$flags" =~ ^(0[xX])?[0-9a-fA-F]+$ ]] && [[ "$decorations" =~ ^(0[xX])?[0-9a-fA-F]+$ ]]; then
+    if [ "$(( flags & 2 ))" -ne 0 ] && [ "$(( decorations ))" -eq 0 ]; then
+      own_frame=1
+    fi
+  else
+    log "browser frame: _MOTIF_WM_HINTS is not set on ${wid} — Chrome is not claiming its own frame; the window manager decides, and ebuilder-openbox.xml says <decor>no</decor>"
+  fi
+
+  # _NET_FRAME_EXTENTS = left, right, top, bottom — a titlebar is a non-zero top.
+  case "$extents" in
+    *=*)
+      top_extent="$(printf '%s' "${extents#*= }" | cut -d, -f3 | tr -d ' ')"
+      ;;
+  esac
+  if [[ "$top_extent" =~ ^[0-9]+$ ]] && [ "$top_extent" -gt 0 ]; then
+    wm_frame=1
+  fi
+
+  if [ "$own_frame" -eq 1 ] || [ "$wm_frame" -eq 1 ]; then
+    log "ERROR: the in-stream browser window ${wid} is STILL framed after enforcement (chrome_own_frame=${own_frame} wm_titlebar_top_px=${top_extent:-0}). The user will see a second set of window controls inside the stream."
+    emit_decor_violation
+  else
+    log "browser frame verified undecorated: chrome is using the system frame (_MOTIF_WM_HINTS decorations=${decorations:-unset}) and openbox draws none (_NET_FRAME_EXTENTS top=${top_extent:-0}) — tab strip and omnibox at row 0, no title bar, no caption buttons"
+  fi
+  return 0
+}
 
 # ── Window-ready gate (mandatory, fail-closed, data-driven) ──────────────────
 # Readiness MUST NOT be reported (i.e. `neko serve` must not be started, and
@@ -1526,6 +1982,11 @@ fi
 log "window-ready gate passed: all mandatory apps present (${DESKTOP_APP_SPECS[*]%%:*})"
 phase_end window_ready_gate ok
 
+# The browser window is only guaranteed to exist once the gate above has seen
+# it. Read back what frame it actually ended up with — see verify_browser_frame
+# (defined above the gate) for why this is a live X read and not a config grep.
+verify_browser_frame || true
+
 # ── Software video-encoder tuning (free CPU lever, no cost) ──────────────────
 # Config precedence here is neko's own (Viper): explicit CLI flag > NEKO_*
 # environment variable > /etc/neko/neko.yaml > compiled-in flag default.
@@ -1615,16 +2076,63 @@ log "video encoder: vp8 software, 1920x1080, 15fps, cpu-used=4, threads=2, ~2.0M
 # desktop with Xvfb, whose Xorg input ABI differs, so the custom driver cannot
 # be loaded. Disabling it makes neko fall back to standard X (XTEST) input,
 # which works on Xvfb — without it neko panics on `xf86-input-neko.sock` before
-# ever binding its HTTP listener. With the custom driver disabled neko falls
-# back to standard X input; whether pointer/keyboard events are actually
-# delivered over XTEST on this Xvfb base is UNVERIFIED (input travels over the
-# same WebRTC datachannel that is TURN-gated, so it cannot be exercised in
-# Phase 1). Do not assume working pointer/keyboard until TURN is wired and it is
-# tested end-to-end. The Phase-1 gate proven here is only that neko binds its
-# HTTP UI + WebSocket signaling on NEKO_HTTP_PORT; the visible pixel stream and
-# input remain WebRTC/TURN-gated (out of Phase-1 scope).
+# ever binding its HTTP listener.
+#
+# XTEST delivery on this Xvfb base is VERIFIED WORKING — pointer AND keyboard —
+# by a real container run: see docs/NEKO-GROUND-TRUTH.md §f, where true XTEST
+# (no XSendEvent fallback) synthetically clicked Chrome's new-tab button and
+# typed a URL into the omnibox. This comment previously said that was
+# UNVERIFIED; it is not any more. What remains WebRTC/TURN-gated is the
+# transport that carries a REMOTE user's input to neko, not neko's ability to
+# inject it into X once it arrives.
+#
+# `--desktop.screen "<W>x<H>@60"`: neko applies this with XRRSetScreenConfig at
+# startup ("INF setting initial screen size"). It is the mechanism that makes
+# NEKO_SCREEN the size the user first sees, now that Xvfb's `-screen` carries
+# the FRAMEBUFFER instead (see the X-display section above). Without it neko
+# falls through to the baked /etc/neko/neko.yaml `desktop.screen:
+# "1920x1080@60"` and every session would start 1920x1080 no matter what
+# NEKO_SCREEN said. Config precedence is neko's own Viper order documented in
+# the encoder section above — explicit CLI flag beats NEKO_* env beats
+# neko.yaml beats the compiled-in default — so the flag form is used here for
+# the same reason `--desktop.display` is: it cannot be shadowed.
+#
+# `@60` is a nominal refresh, not a measured one: the real frame rate is set by
+# the capture pipeline (15 fps, see the encoder section above). 60 matches the
+# rate the app layer sends in `POST /api/room/screen {"rate":60}` per contract
+# §4.2, so the initial screen and every later resize describe themselves the
+# same way.
+#
+# `--session.implicit_hosting=true`: a connecting session takes control of the
+# desktop without having to ask for it. neko's own compiled-in default is
+# already `true`; the baked /etc/neko/neko.yaml turns it OFF (line 14,
+# `implicit_hosting: false`), and THAT is the root cause of "no keyboard on
+# mobile" — not a client-side gap:
+#   * neko's on-screen-keyboard button renders only when `hosting &&
+#     is_touch_device`, so with hosting off it is not in the DOM at all;
+#   * the input overlay carries `pointer-events: none`;
+#   * the client drops every keystroke on its own `hosting && !locked` guard.
+# A phone user therefore cannot type and cannot see why.
+#
+# The app layer has been rescuing this per session with `enableImplicitHosting`
+# (app/src/server/lib/cloudflare-guacamole-provider.ts), which logs in as admin
+# and rewrites room settings on every boot — but it is explicitly best-effort
+# and degrades to control mode 'manual' on any failure. That function's own
+# docstring names THIS flag "the durable fix" and notes it becomes a cheap
+# no-op once set, because its read-before-write already reports `true` and it
+# returns without writing. So this is not a second mechanism competing with
+# that one; it is the mechanism that one was standing in for.
+#
+# 🔴 This is BEHAVIOURAL, not plumbing: it changes who holds control on
+#    connect. Checked against the one thing that counts sessions — the display
+#    gate in cloudflare-guacamole-provider.ts, which asks `GET /api/sessions`
+#    and counts `state.is_watching`. `is_watching` is about receiving video,
+#    not about holding control; implicit hosting moves the host/control field,
+#    which that gate never reads. No conflict. Nothing else in this repo reads
+#    `/api/sessions`.
 phase_start neko_serve_bind
-log "starting neko on 0.0.0.0:$NEKO_HTTP_PORT (pinned build, static=$NEKO_STATIC)"
+NEKO_DESKTOP_SCREEN_SPEC="${NEKO_SCREEN_W}x${NEKO_SCREEN_H}@60"
+log "starting neko on 0.0.0.0:$NEKO_HTTP_PORT (pinned build, static=$NEKO_STATIC, initial screen $NEKO_DESKTOP_SCREEN_SPEC inside framebuffer $EZIL_X_FRAMEBUFFER)"
 # Report ONLY whether a TURN relay is wired — never the credential values.
 if [ -n "${NEKO_WEBRTC_ICESERVERS_FRONTEND:-}" ]; then
   log "ICE: TURN relay configured via NEKO_WEBRTC_ICESERVERS_* (credentials redacted)"
@@ -1638,6 +2146,8 @@ NEKO_DESKTOP_INPUT_ENABLED="false" \
     --server.static "$NEKO_STATIC" \
     --desktop.input.enabled=false \
     --desktop.display "$DISPLAY" \
+    --desktop.screen "$NEKO_DESKTOP_SCREEN_SPEC" \
+    --session.implicit_hosting=true \
     --capture.video.display "$DISPLAY" >>"$LOG" 2>&1 &
 NEKO_PID=$!
 

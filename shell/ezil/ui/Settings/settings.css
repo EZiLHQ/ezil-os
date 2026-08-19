@@ -373,3 +373,35 @@
 .dashboard-app-drawer-settings {
     margin-right: 2px;
 }
+
+/* ── Troubleshoot: the diagnostic-log section ───────────────────────────── */
+/* Separates the two independent controls in that pane (restart the desktop /
+ * copy the diagnostic log) so the second does not read as more copy belonging
+ * to the first. */
+.ezil-settings-rule {
+    border: 0;
+    border-top: 1px solid rgba(245, 245, 244, 0.1);
+    margin: 22px 0 18px;
+}
+
+/* The manual-copy fallback, shown only when the browser refused the page a
+ * clipboard write (`tabs/troubleshoot.js`'s `copyState === 'manual'`). Fixed
+ * height + its own scroll: the report is bounded but not short, and it must
+ * never push the pane's own controls off screen. */
+.ezil-settings-diagnostic {
+    display: block;
+    width: 100%;
+    margin-top: 10px;
+    padding: 8px 10px;
+    box-sizing: border-box;
+    resize: vertical;
+    border-radius: 6px;
+    border: 1px solid rgba(245, 245, 244, 0.15);
+    background: #1f1f1f;
+    color: #cfcfce;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    white-space: pre;
+    overflow: auto;
+}

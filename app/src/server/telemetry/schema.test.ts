@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
 import { parseTelemetryBatch, sanitizeAttrs, telemetryEventInputSchema } from './schema';
-import { TELEMETRY_LIMITS } from './types';
+import {
+    ATTRS_ALLOW_LIST,
+    BROWSER_FIX_SITES,
+    TELEMETRY_CODE_PATTERN,
+    TELEMETRY_LIMITS,
+    type BrowserFixSite,
+} from './types';
 
 function validEvent(overrides: Record<string, unknown> = {}) {
     return {
@@ -103,5 +109,82 @@ describe('parseTelemetryBatch: bounds and flood behaviour', () => {
         const result = parseTelemetryBatch({ schemaVersion: 1, events: [] });
         expect(result.events).toEqual([]);
         expect(result.droppedInvalid).toBe(0);
+    });
+});
+
+// ── docs/BROWSER-FIX-CONTRACT.md §8 ─────────────────────────────────────────
+//
+// Six agents are told to emit these six site/class pairs. This block proves
+// the ingest end of that pipe accepts them BEFORE any of them ships, and pins
+// the one place the contract's prose and the schema disagree.
+
+describe('the browser-fix contract §8 rows survive ingest validation', () => {
+    const ROWS: Array<{ site: BrowserFixSite | string; eventClass: string; code: string }> = [
+        { site: BROWSER_FIX_SITES.DESKTOP_SCREEN, eventClass: 'api_failure', code: 'screen_upstream' },
+        { site: BROWSER_FIX_SITES.DESKTOP_SCREEN, eventClass: 'contract_violation', code: 'screen_unrequested_size' },
+        { site: BROWSER_FIX_SITES.DESKTOP_CLOSE, eventClass: 'window_error', code: 'release_failed' },
+        { site: BROWSER_FIX_SITES.DESKTOP_KEYBOARD, eventClass: 'window_error', code: 'xtest_dead' },
+        { site: BROWSER_FIX_SITES.NEKO_DECOR, eventClass: 'contract_violation', code: 'decor_still_present' },
+        // W4's clean/crash exit reporting, added to §8 after the first draft.
+        { site: 'container:neko#app_exit', eventClass: 'boot_phase', code: 'app_exit_clean' },
+    ];
+
+    it('every contract site/class/code triple validates', () => {
+        for (const row of ROWS) {
+            const result = telemetryEventInputSchema.safeParse(
+                validEvent({ site: row.site, eventClass: row.eventClass, code: row.code }),
+            );
+            expect(`${row.site}/${row.eventClass}/${row.code} -> ${result.success}`).toBe(
+                `${row.site}/${row.eventClass}/${row.code} -> true`,
+            );
+        }
+    });
+
+    it('every contract site fits MAX_SITE_LEN with room to spare', () => {
+        for (const site of Object.values(BROWSER_FIX_SITES)) {
+            expect(site.length).toBeLessThanOrEqual(TELEMETRY_LIMITS.MAX_SITE_LEN);
+        }
+    });
+
+    it('🔴 a HYPHENATED code is REJECTED, which is why §8 was corrected to underscores', () => {
+        // Not a nitpick: `parseTelemetryBatch` drops a failing event WHOLE, so
+        // a producer emitting `screen-unsupported` would ship telemetry that
+        // silently never lands. §8 originally said "hyphenated" and was
+        // corrected; the belt-and-braces guard is normalisation at each
+        // producer (`normalizeCode` in shell/ezil/telemetry.js,
+        // `normalizeTelemetryCode` in worker/src/telemetry.ts). This test
+        // exists so widening the regex instead is a deliberate, visible act.
+        for (const literal of ['screen-unsupported', 'screen-upstream', 'decor-still-present', 'xtest-dead']) {
+            expect(TELEMETRY_CODE_PATTERN.test(literal)).toBe(false);
+            expect(telemetryEventInputSchema.safeParse(validEvent({ code: literal })).success).toBe(false);
+            // ...and the normalised form is accepted.
+            expect(
+                telemetryEventInputSchema.safeParse(validEvent({ code: literal.replace(/-/g, '_') })).success,
+            ).toBe(true);
+        }
+    });
+
+    it('TELEMETRY_CODE_PATTERN is the SAME rule the schema enforces, not a second copy', () => {
+        for (const probe of ['ok', 'screen_upstream', 'a1_b2', 'Screen', 'a-b', 'a.b', 'a b', '']) {
+            const viaSchema = telemetryEventInputSchema.safeParse(validEvent({ code: probe })).success;
+            expect(`${probe || '<empty>'}: ${TELEMETRY_CODE_PATTERN.test(probe)}`).toBe(
+                `${probe || '<empty>'}: ${viaSchema}`,
+            );
+        }
+    });
+
+    it('no contract row needs an attrs key that is not already allow-listed', () => {
+        // §8's rows carry no attrs at all today. `boot_phase` in particular has
+        // an EMPTY allow-list, so a container row that wants to say WHICH of
+        // something happened must encode it in `code` (`app_exit_clean` vs
+        // `app_exit_crash`), never in attrs.
+        expect(ATTRS_ALLOW_LIST.boot_phase).toEqual([]);
+        expect(ATTRS_ALLOW_LIST.contract_violation).toEqual([]);
+        expect(ATTRS_ALLOW_LIST.window_error).toContain('app_id');
+        expect(ATTRS_ALLOW_LIST.api_failure).toContain('status');
+        // An `xserver` attrs key would be silently stripped, so anyone who
+        // tries it gets a row with no answer in it. Proven, not asserted.
+        const stripped = sanitizeAttrs('boot_phase', { xserver: 'xorg' });
+        expect(stripped).toBeUndefined();
     });
 });

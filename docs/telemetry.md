@@ -35,10 +35,28 @@ Each stored row carries, at most:
 That's the entire row. See `app/src/server/db/schema/telemetry.ts` for the literal column
 list and `app/src/server/telemetry/types.ts` for the wire contract the shell sends.
 
-**Not collected yet at all**, as of this writing: nothing is stored. The three tables
-above do not exist in the live database — `app/drizzle/0001_telemetry.sql` ships
-un-applied on purpose (see `docs/RUNBOOK.md`, "PENDING"). Until an operator applies it,
-every batch the browser sends is accepted with a `202` and written nowhere.
+> **CORRECTED 2026-08-19 by integration.** This paragraph used to read *"Not
+> collected yet at all … nothing is stored. The three tables above do not exist in
+> the live database."* **That was false**, and had been for roughly two weeks. It
+> was written from the repo rather than from the database, and nobody had looked.
+
+**It is collected, and it is readable.** `app/drizzle/0001_telemetry.sql` was
+applied to the live project on or before **2026-08-04**. All three tables exist
+with RLS on, 3 policies, 7 indexes, 3 CHECKs and 2 FKs — an exact structural match
+for the file. `ezil_error_events` holds **84 live rows** (199 inserts / 109
+deletes), and the 14-day retention cron is running.
+
+Three caveats that matter more than the correction:
+
+- 🔴 **Only the shell producer has ever worked.** All 193 recorded occurrences are
+  `source='shell'`. **Zero** rows have ever arrived with `source='worker'` or
+  `source='container'`. Do not read an empty container slice as "nothing failed".
+- 🔴 **The R2 spool has never been drained.** `ezil-telemetry-spool` has been
+  accumulating worker/container events since 2026-08-03 — 173 objects / 467 kB as
+  of 2026-08-19 — and not one has reached Postgres. That is the mechanical reason
+  for the point above. See `docs/RUNBOOK.md`, "OPEN OUTAGE".
+- 🔴 **`computer_id` is NULL on all 84 rows**, contradicting the table above. Error
+  events cannot currently be joined to a computer.
 
 ### What `user_hash` is honestly worth
 

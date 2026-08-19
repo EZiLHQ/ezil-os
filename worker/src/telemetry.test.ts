@@ -368,3 +368,87 @@ describe('parseTelemetryAckKeys — the delete-list allowlist', () => {
     expect(parseTelemetryAckKeys({ keys: many })).toHaveLength(TELEMETRY_DRAIN_MAX_OBJECTS);
   });
 });
+
+// ── The `code` wire contract (`docs/BROWSER-FIX-CONTRACT.md` §8) ────────────
+
+describe('telemetry: `code` is normalised to what the app ingest schema accepts', () => {
+  /** The app's own rule, `app/src/server/telemetry/schema.ts`. Copied here
+   * because the worker package has no import path into `app/`; if that regex
+   * ever changes, this is the assertion that goes stale loudly rather than a
+   * pipeline that starts silently discarding events. */
+  const APP_CODE_REGEX = /^[a-z0-9_]{1,64}$/;
+
+  it('accepts the contract §8 codes verbatim and returns something the app will store', async () => {
+    const { normalizeTelemetryCode } = await import('./telemetry');
+    // These four are the literal examples in the contract. All four are
+    // INVALID under the app's regex as written — the hyphen.
+    for (const contractCode of ['screen-unsupported', 'screen-upstream', 'decor-still-present', 'xtest-dead']) {
+      expect(APP_CODE_REGEX.test(contractCode)).toBe(false);
+      const normalized = normalizeTelemetryCode(contractCode);
+      expect(APP_CODE_REGEX.test(normalized)).toBe(true);
+      expect(normalized).toBe(contractCode.replace(/-/g, '_'));
+    }
+  });
+
+  it('agrees with the shell producer, so one event has one spelling everywhere', async () => {
+    const { normalizeTelemetryCode } = await import('./telemetry');
+    // `shell/ezil/telemetry.js`'s `normalizeCode`, transcribed. The two must
+    // produce the same string for the same input or a shell-reported
+    // `screen-unsupported` and a container-reported one become two rows.
+    const shellNormalizeCode = (code: unknown) => {
+      const s = String(code ?? 'unknown').toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '');
+      return (s || 'unknown').slice(0, 64);
+    };
+    for (const probe of [
+      'screen-unsupported', 'DECOR-Still-Present', 'xtest.dead', 'a/b', '', '   ',
+      'ja-acentuado', '__leading', 'trailing__', 'x'.repeat(200),
+    ]) {
+      expect(normalizeTelemetryCode(probe)).toBe(shellNormalizeCode(probe));
+    }
+  });
+
+  it('never yields an empty or over-long code', async () => {
+    const { normalizeTelemetryCode } = await import('./telemetry');
+    for (const probe of [undefined, null, '', '---', '!!!', {}, 0]) {
+      expect(APP_CODE_REGEX.test(normalizeTelemetryCode(probe))).toBe(true);
+    }
+    expect(normalizeTelemetryCode('x'.repeat(500))).toHaveLength(64);
+  });
+
+  it('normalises the code on a CONTAINER NDJSON line, not merely truncates it', async () => {
+    const { parseContainerTelemetryLines } = await import('./telemetry');
+    const line = JSON.stringify({
+      eventClass: 'contract_violation',
+      source: 'container',
+      site: 'container:neko#decor',
+      code: 'decor-still-present',
+      outcome: 'error',
+    });
+    const [event] = parseContainerTelemetryLines(line, { correlationId: 'corr-1' });
+    expect(event.site).toBe('container:neko#decor');
+    expect(event.code).toBe('decor_still_present');
+    expect(APP_CODE_REGEX.test(event.code)).toBe(true);
+  });
+
+  it('carries the contract §8 container sites through unchanged (site has no charset rule)', async () => {
+    const { parseContainerTelemetryLines } = await import('./telemetry');
+    const raw = [
+      JSON.stringify({ eventClass: 'boot_phase', site: 'container:neko#app_exit', code: 'app_exit_clean', outcome: 'ok', durationMs: 12 }),
+      JSON.stringify({ eventClass: 'contract_violation', site: 'container:neko#decor', code: 'decor-still-present', outcome: 'error' }),
+    ].join('\n');
+    const events = parseContainerTelemetryLines(raw, { correlationId: 'corr-2' });
+    expect(events.map((e) => e.site)).toEqual(['container:neko#app_exit', 'container:neko#decor']);
+    expect(events.map((e) => e.eventClass)).toEqual(['boot_phase', 'contract_violation']);
+    // Both are inside the 96-char site ceiling, so nothing is truncated.
+    for (const e of events) expect(e.site.length).toBeLessThanOrEqual(96);
+  });
+
+  it('does not disturb the codes the container already emits (`ok`/`error`/`skipped`)', async () => {
+    const { parseContainerTelemetryLines } = await import('./telemetry');
+    const raw = ['ok', 'error', 'skipped']
+      .map((s) => JSON.stringify({ eventClass: 'boot_phase', site: 'neko_serve_bind', code: s, outcome: s }))
+      .join('\n');
+    const events = parseContainerTelemetryLines(raw, { correlationId: 'c' });
+    expect(events.map((e) => e.code)).toEqual(['ok', 'error', 'skipped']);
+  });
+});

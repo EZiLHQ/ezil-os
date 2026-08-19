@@ -26,6 +26,10 @@
 
 import telemetry from './telemetry.js';
 import { WAKE_DEADLINE_MS, WAKE_REASK_MS, isRetryableBootErrorCode } from './boot-phases.js';
+// The shell's own "long enough ago to count as absent" threshold. Read by
+// `RELEASE_PRESENCE_AGO_MS` below so a release and a heartbeat cannot drift
+// apart about what "nobody is here" means.
+import { ACTIVITY_FRESH_MS } from './activity-heartbeat.js';
 
 const NS = 'ezil-os:';
 
@@ -47,6 +51,18 @@ export const DESKTOP_BOOT_TIMEOUT_MS = 215_000;
 
 /** The cheap status probe never wakes a container, so it gets a short leash. */
 const STATUS_TIMEOUT_MS = 12_000;
+
+/**
+ * Leash for a LIVE screen resize (`setScreen`).
+ *
+ * Longer than `STATUS_TIMEOUT_MS` because the container really does work — the
+ * Worker logs into neko and neko restarts the capture pipeline — and shorter
+ * than anything on the boot path because the container is already awake and
+ * the whole round trip is two loopback calls inside it. The Worker's own
+ * budget is 12s and the app's is 20s; 25s sits outside both, so a timeout seen
+ * HERE means the network, not the resize.
+ */
+const SCREEN_TIMEOUT_MS = 25_000;
 
 // ---------------------------------------------------------------------------
 // Preferences — the `puter.kv` replacement
@@ -124,6 +140,10 @@ export const ENDPOINTS = {
     desktop: '/api/shell/desktop',
     previewUrl: '/api/shell/preview-url',
     focus: '/api/shell/focus',
+    // 🔴 Written down here for the same reason `focus` is — one canonical list
+    // of paths — but NEVER used as a fallback: `screenEndpoint()` reads the
+    // payload and only the payload. See its doc comment.
+    screen: '/api/shell/screen',
 };
 
 /** The payload carries its own endpoint map; prefer it, fall back to the mirror. */
@@ -194,6 +214,68 @@ async function request (url, { method = 'GET', body, timeoutMs } = {}) {
  * `withWakeAndOneRetry`'s loop for why a ceiling and not just the conditions.
  */
 const MAX_ISSUES = 40;
+
+/**
+ * 🔴 THE BEAT BEFORE THE ONE AUTOMATIC RETRY — AND IT USED TO BE ZERO.
+ *
+ * ── The measurement this exists for ─────────────────────────────────────────
+ * `ezil_error_events`, 2026-08-08 → 2026-08-10: 10 of 26 desktop launches
+ * failed with `desktop_unreachable`, and the automatic retry failed on all
+ * ten. Reading the two events that bracket it — `session#openDesktop`
+ * `auto_retry_desktop_unreachable` carries elapsed-at-retry, and
+ * `apps/desktop#mint` carries elapsed-at-give-up — gives the gap between the
+ * first failure and the second, identical one:
+ *
+ *     2026-08-09 03:32   22560ms -> 24142ms     retry took 1582ms
+ *     2026-08-09 05:04   33492ms -> 34037ms     retry took  545ms
+ *     2026-08-10 10:54   32933ms -> 34569ms     retry took 1636ms
+ *     2026-08-10 12:30   32355ms -> 32760ms     retry took  405ms
+ *
+ * A 405ms round trip is not a second chance at anything. The retry branch
+ * below `continue`d with no delay at all (see commit 8510ff6, which noticed
+ * exactly this while proving `MAX_ISSUES` was load-bearing: "the retry branch
+ * has no delay"), so the second ask reached the server while the first
+ * answer was still the current state of the world. `desktop_unreachable` in
+ * particular means the app server's own handoff probe of the desktop origin
+ * did not get an answer — a condition that resolves in SECONDS as a container
+ * finishes coming up, and never in the sub-second gap this loop was leaving.
+ *
+ * ── Why 1.5s and not more ───────────────────────────────────────────────────
+ * Same number as `WAKE_REASK_MS`, and for the same reason: it is a beat
+ * between asks, not a budget. The real waiting belongs SERVER-side, where the
+ * probe can be re-issued against a live socket without paying a browser round
+ * trip each time (see this task's report — `probeDesktopFrame` is still a
+ * single 6s shot). Making this large enough to cover a container boot on its
+ * own would put the user in front of a spinner that this file cannot explain.
+ */
+const RETRY_DELAY_MS = 1_500;
+
+/**
+ * 🔴 CODES THAT ARE TERMINAL AT THIS LAYER, WHICH `isRetryableBootErrorCode`
+ * CANNOT KNOW ABOUT.
+ *
+ * `isRetryableBootErrorCode` mirrors the SERVER's
+ * `DETERMINISTIC_PREVIEW_ERROR_CODES` byte-for-byte, pinned by a test, and that
+ * list is about the DESKTOP preview path. `code_preview_unavailable` and
+ * `app_preview_unavailable` travel on different routes entirely
+ * (`codePreviewUrl` / `previewUrl`), are not members of `BootErrorCode`, and so
+ * fall through that function's `!DETERMINISTIC.includes(code)` default and are
+ * classified retryable. They are not. Widening the server's list to cover them
+ * would break the pin and misfile a code-server fact as a desktop-preview fact.
+ *
+ * They mean "this deployment/container cannot serve that app at all".
+ * `apps/code.js` and `apps/preview.js` both already treat them as TERMINAL and
+ * paint an honest "not available" panel — read the comment above
+ * `show_unavailable()` in either file. Re-asking cannot change the answer, so
+ * the retry is one wasted request and, since `RETRY_DELAY_MS` landed, 1.5s of
+ * spinner in front of a panel we were ready to draw immediately.
+ *
+ * 🔴 MEASURED, not theorised. `apps/code-test.mjs`'s Direction C went red on
+ * the merged tree (38/40) and green on `main` (40/40) for exactly this reason:
+ * the delay pushed the panel past the test's settle window. The retry was
+ * ALWAYS wrong here; before the delay it was merely invisible.
+ */
+const TERMINAL_ERROR_CODES = ['code_preview_unavailable', 'app_preview_unavailable'];
 
 /**
  * 🔴 THE HIBERNATION FIX, CLIENT SIDE. One implementation, three callers
@@ -282,13 +364,20 @@ async function withWakeAndOneRetry (issue, what) {
 
         // A genuine failure. One silent re-ask if a second attempt could
         // plausibly answer differently, then hand it to the user.
-        if ( ! retried && isRetryableBootErrorCode(res.errorCode) ) {
+        if ( ! retried && ! TERMINAL_ERROR_CODES.includes(res.errorCode)
+             && isRetryableBootErrorCode(res.errorCode) ) {
             retried = true;
-            console.info(`[ezil-os:session] ${what}: ${res.errorCode} on the first attempt; retrying once`);
+            console.info(`[ezil-os:session] ${what}: ${res.errorCode} on the first attempt; retrying once in ${RETRY_DELAY_MS}ms`);
             telemetry.capture({
                 eventClass: 'api_failure', site: `ezil-os:session#${what}`, code: `auto_retry_${res.errorCode}`,
                 durationMs: Date.now() - t0,
             });
+            // Measured: without this the second ask landed 405-1636ms after
+            // the first and returned the same answer 10 times out of 10. See
+            // `RETRY_DELAY_MS`. The telemetry above is emitted BEFORE the
+            // wait, so its `durationMs` still marks the first failure and the
+            // arithmetic in that comment keeps working.
+            await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
             continue;
         }
         return res;
@@ -316,21 +405,36 @@ export function openSession () {
  * shell that composed its own URL would produce a desktop that renders
  * perfectly and silently ignores every click.
  *
- * @returns {Promise<{ok: true, url: string, frameConfirmed: boolean, controlMode?: string, mode?: string, workspace?: any}
+ * @param {string} computerId
+ * @param {{width:number, height:number}} [screen] The shape to boot the
+ *   desktop at, in device pixels — see `apps/desktop-screen.js`'s
+ *   `measureDesktopBox`. OPTIONAL in both directions: an older server ignores
+ *   an unknown body field, and this client omits the field entirely when it
+ *   has nothing to measure, so neither side has to know about the other.
+ * @returns {Promise<{ok: true, url: string, frameConfirmed: boolean, controlMode?: string, mode?: string, workspace?: any, screen?: {width:number,height:number,source:string}}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
-export async function openDesktop (computerId) {
+export async function openDesktop (computerId, screen) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to open.' };
     }
-    return withWakeAndOneRetry(() => openDesktopOnce(computerId), 'openDesktop');
+    return withWakeAndOneRetry(() => openDesktopOnce(computerId, screen), 'openDesktop');
 }
 
 /** One `POST /api/shell/desktop`. The loop that may call it more than once is above. */
-async function openDesktopOnce (computerId) {
+async function openDesktopOnce (computerId, screen) {
+    // 🔴 The field is OMITTED, not sent as null, when there is nothing to ask
+    // for. The server treats absent and malformed identically, but a body that
+    // is byte-identical to the pre-change one is the strongest form of "an old
+    // server sees exactly what it always saw".
+    const usable = screen
+        && Number.isInteger(screen.width) && Number.isInteger(screen.height)
+        && screen.width > 0 && screen.height > 0;
     const res = await request(endpoint('desktop'), {
         method: 'POST',
-        body: { computerId },
+        body: usable
+            ? { computerId, screen: { width: screen.width, height: screen.height } }
+            : { computerId },
         timeoutMs: DESKTOP_BOOT_TIMEOUT_MS,
     });
 
@@ -340,6 +444,16 @@ async function openDesktopOnce (computerId) {
         if ( res.code === 'TIMEOUT' ) return { ok: false, errorCode: 'timeout', message: res.message };
         if ( res.code === 'NETWORK' ) return { ok: false, errorCode: 'fetch_failed', message: res.message };
         if ( res.code === 'UNAUTHORIZED' ) return { ok: false, errorCode: 'unauthorized', message: res.message };
+        // 🔴 A 502/504 IS A CLASSIFIED FAILURE, NOT AN UNKNOWN ONE. The route
+        // handler re-emits tRPC's own code verbatim (`shellErrorResponse`), so
+        // `previewUrl`'s `BAD_GATEWAY` throw — "the desktop Worker returned an
+        // error" — arrived here as `unknown` and was rendered with the generic
+        // "if it keeps happening, let us know" copy. `fetch_failed` is the
+        // `BootErrorCode` that `classifyFailure` maps to `worker_unreachable`,
+        // which is what actually happened and what the user can act on.
+        if ( res.code === 'BAD_GATEWAY' || res.code === 'GATEWAY_TIMEOUT' ) {
+            return { ok: false, errorCode: 'fetch_failed', message: res.message };
+        }
         return { ok: false, errorCode: 'unknown', message: res.message };
     }
 
@@ -349,7 +463,18 @@ async function openDesktopOnce (computerId) {
     // boot-phases.js owns the mapping to user-facing copy.
     const data = res.data ?? {};
     if ( data.ok !== true ) {
-        return { ok: false, errorCode: data.errorCode ?? 'unknown' };
+        // 🔴 `data.error` IS CARRIED, and it used to be dropped on the floor.
+        // That is why ten production `desktop_unreachable` failures were
+        // indistinguishable from each other: the server had said
+        // `desktop_frame_http_error_404` vs `_410` vs `_500`, and this line
+        // kept only the errorCode, so nothing downstream could say WHICH. The
+        // code still drives the UI copy — nothing about the rendering changes
+        // — but the observation now survives the trip.
+        return {
+            ok: false,
+            errorCode: data.errorCode ?? 'unknown',
+            message: typeof data.error === 'string' ? data.error : undefined,
+        };
     }
     if ( typeof data.guacamoleUrl !== 'string' || data.guacamoleUrl === '' ) {
         // Reported success with nothing to show. Loud, not silent.
@@ -371,6 +496,13 @@ async function openDesktopOnce (computerId) {
         controlMode: data.controlMode,
         mode: data.mode,
         workspace: data.workspace,
+        // 🔴 What the server says it ACTUALLY booted the desktop at, passed
+        // through raw and NEVER defaulted here. An older server omits it, and
+        // the window must read that as "I still know nothing about the stream's
+        // shape" (i.e. keep assuming 1920x1080, exactly as before) rather than
+        // as any particular size. `apps/desktop-screen.js`'s
+        // `readAppliedScreen` is the one validator.
+        screen: data.screen,
     };
 }
 
@@ -688,6 +820,161 @@ export async function reportActivity (computerId, lastInputAgoMs) {
     return res.data?.ok === true;
 }
 
+/**
+ * How stale a presence report has to be for the server's idle-stop path to
+ * treat it as "nobody is here any more" — the value {@link releaseDesktop}
+ * puts on the wire.
+ *
+ * 🔴 THIS IS NOT A NEW LIFECYCLE VERB, AND IT MUST NOT BECOME ONE. The shell
+ * has never had the power to destroy a container and this does not give it
+ * one. All it can say is the one thing the activity transport has always been
+ * able to say — "the user was last here N ms ago" — with an N that means
+ * "they have gone". The Worker's `EzilSandboxDO.recordActivity` writes
+ * `now - N` to `LAST_ACTIVITY_AT_KEY` and its own idle-stop path
+ * (`isIdleStopDue`, `IDLE_STOP_MS` = 10 minutes, PLUS a `/proc/loadavg` busy
+ * probe, PLUS a successful final workspace flush) decides on its own whether
+ * that means stop. A release is a fact reported, not an order given, and
+ * every safety rule on the server side still applies to it unchanged.
+ *
+ * The number is `ACTIVITY_FRESH_MS` (30 minutes — `../activity-heartbeat.js`'s
+ * own definition of "the tab is open but nobody is there"), not a bespoke
+ * constant, and deliberately not `Infinity`/`Number.MAX_SAFE_INTEGER`: the
+ * server's `computeActivityTimestamp` subtracts it from `Date.now()`, so a
+ * silly value would write a nonsense timestamp for anyone reading DO storage
+ * later. 30 minutes is 3x the server's 10-minute idle window, so the release
+ * is due IMMEDIATELY on the next flush alarm (<=60s) whatever that window is
+ * retuned to, while still being a duration a human could actually have been
+ * away for.
+ *
+ * Imported rather than redeclared so there is exactly one definition of "long
+ * enough ago to count as absent" in the shell.
+ */
+const RELEASE_PRESENCE_AGO_MS = ACTIVITY_FRESH_MS;
+
+/**
+ * `POST <endpoints.activity>` — report that presence at this desktop has
+ * ENDED, because the window showing it was closed.
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────────
+ * `apps/desktop-window.js`'s `dispose()` used to stop the heartbeat and
+ * nothing else, so closing a desktop window released nothing at all: the
+ * container then sat until the Worker's own `IDLE_STOP_MS` (10 minutes) plus
+ * an alarm tick noticed the beats had stopped. This is the shell saying so
+ * out loud instead of letting a ten-minute silence say it.
+ *
+ * ── Why it is `reportActivity` and not a new verb ───────────────────────────
+ * See {@link RELEASE_PRESENCE_AGO_MS}. Same route, same body shape, same
+ * server handler, same DO write — an OLDER server needs no change at all to
+ * honour this, and a NEWER server gains no capability it did not already
+ * have. The only difference from a heartbeat is the number, and the number is
+ * one the server has always had to be able to handle (a user who really has
+ * been away 30 minutes with the tab open sends it too).
+ *
+ * ── Contract with the caller ────────────────────────────────────────────────
+ * NEVER THROWS and NEVER BLOCKS A CLOSE. The caller fires this and does not
+ * await it: a user who closes a window gets a closed window whether or not
+ * this request ever lands. Feature-detected exactly like `reportActivity`
+ * above — a deployment that does not publish `endpoints.activity` gets NO
+ * request, never a 404 sprayed at a path this bundle invented.
+ *
+ * 🔴 NOT called on minimise. A minimised desktop is still open and still
+ * heartbeating; releasing it would stop a container the user is coming back
+ * to. `apps/desktop-window.js`'s `minimise_to_taskbar` deliberately does not
+ * reach this, and must not learn to.
+ *
+ * @param {string} computerId
+ * @returns {Promise<boolean|undefined>} `true`/`false` is a real answer from
+ *   the server. `undefined` means either OUR request never landed, or this
+ *   deployment does not publish the endpoint at all — neither is an
+ *   observation of anything, and in particular `undefined` is NOT "the
+ *   container is still running".
+ */
+export async function releaseDesktop (computerId) {
+    return reportActivity(computerId, RELEASE_PRESENCE_AGO_MS);
+}
+
+/**
+ * Is a LIVE screen-resize route published by THIS deployment, right now?
+ *
+ * 🔴 FEATURE-DETECTED, and read from the PAYLOAD only — never from the
+ * `ENDPOINTS` mirror, even though `screen` appears there. Same rule as
+ * `restartEndpoint()` and `activityEndpoint()` above, and the same rule
+ * `apps/desktop-window.js` applies to `endpoints.focus`:
+ * `payload().desktopState.endpoints` is the only source of truth for "can the
+ * server actually do this today". The mirror exists so the path is written
+ * down in one canonical place next to its siblings, not so a newer bundle can
+ * invent a route against an older server.
+ *
+ * 🔴 BOOT-TIME SIZING DOES NOT DEPEND ON THIS. That travels on the existing
+ * `openDesktop` call and needs no new route, so a deployment without this key
+ * still opens the desktop at the right shape — it just cannot change it
+ * afterwards, and the window letterboxes as it always did.
+ *
+ * @returns {string|null}
+ */
+export function screenEndpoint () {
+    const url = payload()?.desktopState?.endpoints?.screen;
+    return typeof url === 'string' && url !== '' ? url : null;
+}
+
+/**
+ * `POST <endpoints.screen>` — ask the server to change this computer's LIVE
+ * desktop to a different screen mode.
+ *
+ * The server snaps whatever it is given to the closed mode table and reports
+ * BACK what it applied, so `width`/`height` in the answer are authoritative
+ * and may differ from what was asked. A caller that letterboxes to its own
+ * request rather than to the answer reproduces the exact defect this whole
+ * change exists to fix.
+ *
+ * NEVER THROWS. Every failure — including "this deployment has no such route"
+ * — comes back as `{ok:false, code}` from the closed set
+ * `BAD_REQUEST|NOT_FOUND|UNSUPPORTED|UPSTREAM|TIMEOUT`, so a caller can tell
+ * "stop asking forever" (`UNSUPPORTED`: the container's X server has a fixed
+ * framebuffer) from "that one attempt failed".
+ *
+ * @returns {Promise<{ok:true, width:number, height:number, source:string}
+ *                 | {ok:false, code:string, message?:string}>}
+ */
+export async function setScreen (computerId, width, height, timeoutMs = SCREEN_TIMEOUT_MS) {
+    if ( ! computerId || ! Number.isInteger(width) || ! Number.isInteger(height) ) {
+        return { ok: false, code: 'BAD_REQUEST', message: 'No computer, or nothing measurable.' };
+    }
+    const url = screenEndpoint();
+    if ( ! url ) {
+        // Not published by this deployment — say so WITHOUT making a request,
+        // and say it as UNSUPPORTED so the caller disarms permanently rather
+        // than re-asking a server that will never grow the route mid-session.
+        return { ok: false, code: 'UNSUPPORTED', message: "Resizing isn't available in this deployment." };
+    }
+
+    const res = await request(url, { method: 'POST', body: { computerId, width, height }, timeoutMs });
+    if ( ! res.ok ) {
+        if ( res.code === 'TIMEOUT' ) return { ok: false, code: 'TIMEOUT', message: res.message };
+        if ( res.code === 'UNAUTHORIZED' ) return { ok: false, code: 'NOT_FOUND', message: res.message };
+        // 404 from a route that is published but not deployed yet is the same
+        // permanent state as "no key at all".
+        if ( res.status === 404 ) return { ok: false, code: 'UNSUPPORTED', message: res.message };
+        return { ok: false, code: 'UPSTREAM', message: res.message };
+    }
+
+    const data = res.data ?? {};
+    if ( data.ok !== true ) {
+        const code = typeof data.error?.code === 'string' ? data.error.code : 'UPSTREAM';
+        return { ok: false, code, message: data.error?.message };
+    }
+    if ( ! Number.isInteger(data.width) || ! Number.isInteger(data.height) ) {
+        // Reported success with nothing to fit to. Loud, not silent — the same
+        // rule `openDesktopOnce` applies to a URL-less success.
+        console.error('[ezil-os:session] setScreen returned ok with no size');
+        telemetry.capture({
+            eventClass: 'contract_violation', site: 'ezil-os:apps/desktop#screen', code: 'screen_size_missing',
+        });
+        return { ok: false, code: 'UPSTREAM', message: 'The server confirmed a size it did not name.' };
+    }
+    return { ok: true, width: data.width, height: data.height, source: data.source ?? 'requested' };
+}
+
 export { withWakeAndOneRetry };
 
 export default {
@@ -697,7 +984,8 @@ export default {
     openDesktop, desktopRunning, confirmFrame, confirmDisplay,
     previewUrl, focusApp,
     restartEndpoint, restartDesktop,
-    activityEndpoint, reportActivity,
+    activityEndpoint, reportActivity, releaseDesktop,
+    screenEndpoint, setScreen,
     withWakeAndOneRetry,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,

@@ -69,6 +69,25 @@ CHROME_TITLE="$(printf '%s' "$CHROME_ROW" | cut -f5-)"
 # Browser must be present (enumerate_app already failed loudly if absent).
 [ -n "$CHROME_ROW" ] || fail "browser window not enumerated"
 
+# Record the LITERAL WM_CLASS off the live window. `wmctrl -x` prints
+# "instance.class" as one field, which silently hides which half is which; the
+# openbox rule matches on the CLASS half only. Two suites in this repo stub
+# wmctrl and SUPPLY this string, so until now nothing had ever read it off a
+# real X server. Printed verbatim so it is never again an open question.
+CHROME_DECID="$(printf '%s' "$CHROME_ROW" | cut -f2)"
+if [ -n "$CHROME_DECID" ] && command -v xprop >/dev/null 2>&1; then
+  WM_CLASS_RAW="$(xprop -id "$CHROME_DECID" WM_CLASS 2>/dev/null)"
+  WM_INSTANCE="$(printf '%s' "$WM_CLASS_RAW" | sed -n 's/.*= "\([^"]*\)", "\([^"]*\)".*/\1/p')"
+  WM_CLASS="$(printf '%s' "$WM_CLASS_RAW" | sed -n 's/.*= "\([^"]*\)", "\([^"]*\)".*/\2/p')"
+  if [ -n "$WM_CLASS" ]; then
+    ok "browser literal WM_CLASS: instance=\"$WM_INSTANCE\" class=\"$WM_CLASS\""
+  else
+    fail "could not read WM_CLASS off the live browser window (xprop said: $WM_CLASS_RAW)"
+  fi
+else
+  fail "no window id or no xprop — the literal WM_CLASS could not be read from the running system"
+fi
+
 echo "== mandatory apps: code-server (loopback HTTP port, no X window) =="
 CODESERVER_HOST="${CODESERVER_HOST:-127.0.0.1}"
 CODESERVER_PORT="${CODESERVER_PORT:-8443}"
@@ -116,7 +135,19 @@ for pair in "codeserver:$CODESERVER_PID" "chromium:$CHROME_PID"; do
 done
 
 echo "== openbox config (explicit shortcuts + root menu) =="
-OB_CFG="${NEKO_OPENBOX_CONFIG:-/etc/neko/ebuilder-openbox.xml}"
+# The config path is resolved from the argv of the openbox process that is
+# ACTUALLY RUNNING, not from a hardcoded default. Grepping a file that nothing
+# loaded proves nothing — that is precisely how `<decor>no</decor>` went the
+# whole life of this repo without anyone being able to say whether openbox had
+# ever matched the rule. The env override is kept as a fallback for running this
+# script before/without openbox.
+OB_CFG_RUNNING="$(ps -eo args 2>/dev/null | grep -m1 '^openbox' | sed -n 's/.*--config-file[ =]\([^ ]*\).*/\1/p')"
+OB_CFG="${OB_CFG_RUNNING:-${NEKO_OPENBOX_CONFIG:-/etc/neko/ebuilder-openbox.xml}}"
+if [ -n "$OB_CFG_RUNNING" ]; then
+  ok "openbox is running with config actually loaded from $OB_CFG_RUNNING (resolved from its argv, not assumed)"
+else
+  fail "could not resolve --config-file from the running openbox process — the assertions below would be grepping a file nothing has loaded"
+fi
 if [ -f "$OB_CFG" ]; then
   ok "openbox config present: $OB_CFG"
   # The "vscode" keybind is now INERT (see ebuilder-openbox.xml's own NOTE and
@@ -142,13 +173,40 @@ else
   fail "health file $HF missing"
 fi
 
+echo "== browser window: decoration / WM_CLASS / screen modes / XTEST =="
+# The heavy runtime assertions live in their own validator. Everything above in
+# THIS file that mentions openbox inspects a config file; the checks below
+# inspect the window on screen, the X server, and real synthetic input. Exit
+# code 2 there means "only assertions awaiting another agent's change are red",
+# which is not a failure of this desktop.
+BW_VALIDATOR=""
+if [ -x /usr/local/bin/validate-neko-browser-window.sh ]; then
+  BW_VALIDATOR=/usr/local/bin/validate-neko-browser-window.sh
+elif [ -x "$(dirname "$0")/validate-neko-browser-window.sh" ]; then
+  BW_VALIDATOR="$(dirname "$0")/validate-neko-browser-window.sh"
+fi
+if [ -n "$BW_VALIDATOR" ]; then
+  "$BW_VALIDATOR"
+  BW_RC=$?
+  case "$BW_RC" in
+    0) ok "browser-window validation passed in full" ;;
+    2) ok "browser-window validation: only awaiting:* assertions are red (see rows above) — no regression" ;;
+    3) fail "browser-window validation could NOT run some assertions (exit 3) — unproven, not passing" ;;
+    *) fail "browser-window validation FAILED (exit $BW_RC) — a behaviour that is known-good on main has regressed" ;;
+  esac
+else
+  fail "validate-neko-browser-window.sh not found — window decoration, WM_CLASS, screen modes and XTEST input are UNVERIFIED by this run"
+fi
+
 echo "== focus switching =="
 if [ -x /usr/local/bin/validate-neko-focus.sh ]; then
   /usr/local/bin/validate-neko-focus.sh || fail "focus-switch validation failed"
 elif [ -x "$(dirname "$0")/validate-neko-focus.sh" ]; then
   "$(dirname "$0")/validate-neko-focus.sh" || fail "focus-switch validation failed"
 else
-  echo "note: validate-neko-focus.sh not found on PATH — skipping (run separately)"
+  # Not a pass. A validator that cannot find its sub-validator has verified
+  # nothing about focus, and must say so rather than staying quiet.
+  fail "validate-neko-focus.sh not found on PATH or beside this script — focus switching is UNVERIFIED by this run"
 fi
 
 echo "=================================================="
