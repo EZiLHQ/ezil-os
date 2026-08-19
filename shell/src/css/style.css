@@ -254,9 +254,17 @@ html, body {
 .window[data-is_fullpage="1"] .window-minimize-btn {
     display: none;
 }
+/* MODIFIED BY EZIL 2026-08-19 — sized from the VISUAL viewport, not the layout
+ * viewport. `100dvh` does not shrink when the on-screen keyboard opens, so the
+ * backdrop stayed taller than what the user could actually see and the excess
+ * became scrollable. `--ezil-vvh` is published on `<body>` by `boot.js`'s
+ * `publish_viewport_metrics` and tracks the real visible height, so this
+ * adapts dynamically instead of assuming. The `100dvh` line stays as the
+ * fallback for a browser with no `visualViewport`. */
 .device-phone .desktop {
     height: calc(100vh - 90px) !important;
     height: calc(100dvh - 90px) !important;
+    height: calc(var(--ezil-vvh, 100dvh) - 90px) !important;
     /* Ensure no left/right padding on mobile, regardless of taskbar position classes */
     padding-left: 0 !important;
     padding-right: 0 !important;
@@ -2269,27 +2277,63 @@ body:not(:has(.desktop.desktop-selectable-active)) .taskbar .taskbar-item:hover 
     align-items: center;
     justify-content: center;
 }
+/* MODIFIED BY EZIL 2026-08-19 — the phone desktop must not scroll at all.
+ *
+ * 🔴 THIS RULE PRODUCED A SCROLL INDICATOR ON EVERY PHONE, three ways at once:
+ *
+ *   1. `overflow-x: scroll` (not `auto`) makes a scroll container
+ *      unconditionally, whether or not anything overflows. Upstream Puter needs
+ *      it because its phone desktop pages a grid of FILE ICONS sideways. EZiL
+ *      has no filesystem and no desktop icons — `boot.js` builds `.desktop` as
+ *      an empty container — so the axis scrolled nothing and only ever drew the
+ *      indicator.
+ *   2. `overflow-y: visible` alongside it is not what it appears to be. Per
+ *      CSS overflow, when one axis is `scroll`/`auto` and the other is
+ *      `visible`, the `visible` computes to `auto`. So this silently created a
+ *      VERTICAL scroll container as well — the `!important` made it look
+ *      deliberate and load-bearing while doing the opposite of what it says.
+ *   3. `padding-bottom: 60px` on a box already sized `calc(100dvh - 90px)`
+ *      pushes content 60px past the box, which guarantees the vertical overflow
+ *      that (2) had just made scrollable.
+ *
+ * `scrollbar-width: none` and the `::-webkit-scrollbar` rule below were an
+ * attempt to hide the symptom. They suppress the persistent scrollbar CHROME,
+ * but not iOS's transient overlay indicator during a touch, and not the
+ * scrolling itself — a user could still drag the whole desktop off-centre under
+ * a full-bleed window.
+ *
+ * The desktop is a fixed backdrop the size of the visible viewport. It has
+ * nothing to scroll to. `overflow: hidden` on both axes says that once, instead
+ * of three rules disagreeing about it.
+ *
+ * Bottom inset comes from the safe area rather than a magic 60px: the dock is
+ * `position: fixed` (see the `.device-phone .taskbar` rule) so it never needed
+ * space reserving inside this box, and 60px of padding in a box that must not
+ * overflow is exactly the bug above. */
 .device-phone .desktop {
     position: relative;
 
-    /* Enable smooth scrolling on iOS */
-    -webkit-overflow-scrolling: touch;
+    /* Nothing to scroll: sized to the viewport, holding no icon grid. Both
+       axes, explicitly — leaving one `visible` re-creates defect (2). */
+    overflow: hidden;
 
-    /* Allow vertical touch scrolling while preventing horizontal */
-    touch-action: pan-x;
+    /* Gestures belong to whatever is on top of this backdrop — the streamed
+       desktop window, which `UIWindow.js` appends to `<body>` rather than here,
+       so `.desktop *` below never reaches it. */
+    touch-action: none;
 
-    /* Hide scrollbars while keeping functionality */
+    /* Belt and braces: if a future child ever does overflow, fail invisibly
+       rather than re-introducing an indicator. */
     scrollbar-width: none;
     -ms-overflow-style: none;
 
-    /* Scrolling behavior */
-    overflow-y: visible !important;
-    overflow-x: scroll;
-
-    padding-bottom: 60px;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
 }
+/* MODIFIED BY EZIL 2026-08-19 — was `touch-action: pan-x`, which re-armed
+ * horizontal panning on every descendant and undid the parent's `none`. The
+ * backdrop has nothing to pan. */
 .device-phone .desktop * {
-    touch-action: pan-x;
+    touch-action: none;
 }
 .device-phone .desktop::-webkit-scrollbar {
     display: none;

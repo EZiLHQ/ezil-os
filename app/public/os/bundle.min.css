@@ -438,7 +438,7 @@ body,html{overscroll-behavior-x:none}
 .desktop.desktop-taskbar-position-left{margin-left:50px;padding-right:0;padding-bottom:0;height:calc(100vh)!important}
 .desktop.desktop-taskbar-position-right{margin-right:50px;padding-left:0;padding-bottom:0;height:calc(100vh)!important}
 .window[data-is_fullpage="1"] .window-minimize-btn{display:none}
-.device-phone .desktop{height:calc(100dvh - 90px)!important;padding-left:0!important;padding-right:0!important;padding-bottom:0!important}
+.device-phone .desktop{height:calc(100dvh - 90px)!important;height:calc(var(--ezil-vvh,100dvh) - 90px)!important;padding-left:0!important;padding-right:0!important;padding-bottom:0!important}
 .item-container-list{display:grid;overflow-x:scroll!important;overflow-y:hidden!important;grid-template-rows:repeat(auto-fill,18px);grid-auto-flow:column;gap:15px 70px;padding-top:5px}
 .device-phone .item-container-list{grid-template-rows:repeat(auto-fill,55px);overflow-x:hidden!important;overflow-y:scroll!important;grid-auto-flow:unset}
 .item-container-details{overflow-x:scroll!important;overflow-y:scroll!important;padding-top:5px}
@@ -724,8 +724,8 @@ body:not(:has(.desktop.desktop-selectable-active)) .taskbar .taskbar-item:hover 
 .device-phone .taskbar{position:fixed!important;bottom:calc(5px + var(--ezil-kb,0px) + env(safe-area-inset-bottom,0px))!important;left:50%!important;right:auto!important;top:auto!important;width:auto!important;height:50px!important;transform:translateX(-50%)!important;flex-direction:row!important;justify-content:left!important;writing-mode:initial!important;padding:0 7px!important;border-radius:10px!important;-webkit-overflow-scrolling:touch;touch-action:pan-x;overflow-x:auto;scrollbar-width:none;-ms-overflow-style:none;display:flex}
 .device-phone .taskbar::-webkit-scrollbar{display:none}
 .device-phone .taskbar .taskbar-item{touch-action:pan-x pinch-zoom;user-select:none;-webkit-user-select:none;cursor:grab;display:flex;align-items:center;justify-content:center}
-.device-phone .desktop{position:relative;-webkit-overflow-scrolling:touch;touch-action:pan-x;scrollbar-width:none;-ms-overflow-style:none;overflow-y:visible!important;overflow-x:scroll}
-.device-phone .desktop *{touch-action:pan-x}
+.device-phone .desktop{position:relative;overflow:hidden;touch-action:none;scrollbar-width:none;-ms-overflow-style:none;padding-bottom:env(safe-area-inset-bottom,0)}
+.device-phone .desktop *{touch-action:none}
 .device-phone .desktop::-webkit-scrollbar{display:none}
 .device-phone .window:not(.window-filedialog) .window-body.item-container{height:100%}
 .device-phone .window-body.item-container{-webkit-overflow-scrolling:touch;touch-action:pan-y;width:100%;overflow-y:scroll;overflow-x:hidden;scrollbar-width:none;-ms-overflow-style:none}
