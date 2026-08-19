@@ -371,6 +371,16 @@ async function openDesktopOnce (computerId, screen) {
         if ( res.code === 'TIMEOUT' ) return { ok: false, errorCode: 'timeout', message: res.message };
         if ( res.code === 'NETWORK' ) return { ok: false, errorCode: 'fetch_failed', message: res.message };
         if ( res.code === 'UNAUTHORIZED' ) return { ok: false, errorCode: 'unauthorized', message: res.message };
+        // 🔴 A 502/504 IS A CLASSIFIED FAILURE, NOT AN UNKNOWN ONE. The route
+        // handler re-emits tRPC's own code verbatim (`shellErrorResponse`), so
+        // `previewUrl`'s `BAD_GATEWAY` throw — "the desktop Worker returned an
+        // error" — arrived here as `unknown` and was rendered with the generic
+        // "if it keeps happening, let us know" copy. `fetch_failed` is the
+        // `BootErrorCode` that `classifyFailure` maps to `worker_unreachable`,
+        // which is what actually happened and what the user can act on.
+        if ( res.code === 'BAD_GATEWAY' || res.code === 'GATEWAY_TIMEOUT' ) {
+            return { ok: false, errorCode: 'fetch_failed', message: res.message };
+        }
         return { ok: false, errorCode: 'unknown', message: res.message };
     }
 
@@ -380,7 +390,18 @@ async function openDesktopOnce (computerId, screen) {
     // boot-phases.js owns the mapping to user-facing copy.
     const data = res.data ?? {};
     if ( data.ok !== true ) {
-        return { ok: false, errorCode: data.errorCode ?? 'unknown' };
+        // 🔴 `data.error` IS CARRIED, and it used to be dropped on the floor.
+        // That is why ten production `desktop_unreachable` failures were
+        // indistinguishable from each other: the server had said
+        // `desktop_frame_http_error_404` vs `_410` vs `_500`, and this line
+        // kept only the errorCode, so nothing downstream could say WHICH. The
+        // code still drives the UI copy — nothing about the rendering changes
+        // — but the observation now survives the trip.
+        return {
+            ok: false,
+            errorCode: data.errorCode ?? 'unknown',
+            message: typeof data.error === 'string' ? data.error : undefined,
+        };
     }
     if ( typeof data.guacamoleUrl !== 'string' || data.guacamoleUrl === '' ) {
         // Reported success with nothing to show. Loud, not silent.

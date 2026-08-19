@@ -1591,6 +1591,92 @@ export async function probeDesktopFrame(
     }
 }
 
+// ─── The probe that was a coin flip, and the re-probe that is not ────────────
+//
+// 🔴 A SINGLE 6-SECOND GET WAS DECIDING 38% OF DESKTOP LAUNCHES.
+//
+// `desktop_unreachable` has exactly one producer: the pre-handoff guard in
+// `routers/cloudflare-guacamole.ts`. In all ten observed production failures
+// THE WORKER SUCCEEDED — it returned `ok` with a `guacamoleUrl`,
+// `ensureDesktop` had already passed `desktop_ready_wait`, and the port was
+// exposed. What failed was `probeDesktopFrame` above: one GET, no retry.
+//
+// The discriminator is decisive rather than suggestive: `codePreviewUrl` has NO
+// frame probe at all, and in every one of those failures the code app minted
+// successfully on the same sandbox in the same seconds. The launch with a probe
+// failed; the launch without one succeeded.
+//
+// The mechanism is that the edge answers FAST and WRONG during a normal boot
+// transition. `proxyToSandbox` returns `404 INVALID_TOKEN`,
+// `410 STALE_PREVIEW_URL` and `500 Container suddenly disconnected` in well
+// under a second while a container is still settling. All are `>= 400`, so the
+// probe reports `alive:false` immediately — a 27.9s success and a 33s failure
+// are the same boot, and the probe merely missed at the finish line.
+//
+// 🔴 THE CORRECT POLICY ALREADY EXISTED AND NEVER RAN. `FRAME_CONFIRM_DEADLINE_MS`
+// (45s, `components/desktop/boot-phases.ts`) carries a comment saying anything
+// shorter "would fire the deadline BEFORE the caller had finished asking,
+// turning a slow confirmation into a fabricated failure". This 6s server-side
+// probe fires first, so that 45s policy was dead code in practice.
+//
+// ── What this costs ─────────────────────────────────────────────────────────
+// ZERO on a healthy boot: the first probe answers `alive` and the loop breaks
+// before any sleep. At most +20s on a boot that was going to fail anyway —
+// inside the route's `maxDuration = 300` and well inside the shell's own 215s
+// `DESKTOP_BOOT_TIMEOUT_MS`.
+//
+// 🔴 `probeDesktopFrame`'s own default is deliberately UNCHANGED. `confirmFrame`
+// (the shell's post-handoff `?confirm=frame` check) shares that function and is
+// a genuinely one-shot question asked repeatedly by a client that owns its own
+// retry policy. Lengthening it there would make each of those asks slower
+// without making any of them more informative.
+
+/** Whole budget for the pre-handoff frame confirmation, across all attempts. */
+export const DESKTOP_FRAME_CONFIRM_BUDGET_MS = 20_000;
+
+/** Gap between attempts. Long enough not to hammer the edge, short enough to catch a fast settle. */
+export const DESKTOP_FRAME_CONFIRM_GAP_MS = 1_500;
+
+/**
+ * Ask the desktop origin whether it is serving, and keep asking until it is or
+ * the budget runs out.
+ *
+ * Reports `attempts` and `elapsedMs` alongside the verdict so a failure can be
+ * read as "we asked N times over M ms and it never answered" rather than as an
+ * unqualified "unreachable" — which is what nobody could tell apart before.
+ *
+ * NEVER THROWS: every attempt is a `probeDesktopFrame`, which never throws.
+ */
+export async function confirmDesktopFrame(
+    rawUrl: string,
+    budgetMs: number = DESKTOP_FRAME_CONFIRM_BUDGET_MS,
+    gapMs: number = DESKTOP_FRAME_CONFIRM_GAP_MS,
+): Promise<DesktopFrameProbe & { attempts: number; elapsedMs: number }> {
+    const started = Date.now();
+    let attempts = 0;
+    let last: DesktopFrameProbe = { alive: false, reason: 'unreachable', detail: 'no probe attempted' };
+
+    for (;;) {
+        attempts++;
+        // Each attempt gets the SHORTER of the per-probe timeout and whatever
+        // is left of the whole budget, so the loop cannot overrun its own
+        // ceiling by up to a full probe timeout on the last try.
+        const remaining = started + budgetMs - Date.now();
+        last = await probeDesktopFrame(rawUrl, Math.max(1, Math.min(DESKTOP_FRAME_PROBE_TIMEOUT_MS, remaining)));
+        if (last.alive) break;
+        // 🔴 `bad_url` is DETERMINISTIC — an unparseable or non-HTTP URL is the
+        // same answer however many times it is asked, and retrying it would
+        // spend the whole budget learning nothing. Every other reason
+        // (`http_error`, `unreachable`) is exactly the transient the retry
+        // exists for.
+        if (last.reason === 'bad_url') break;
+        if (Date.now() + gapMs >= started + budgetMs) break;
+        await sleep(gapMs);
+    }
+
+    return { ...last, attempts, elapsedMs: Date.now() - started };
+}
+
 // ─── Did any pixels actually reach the browser? ───────────────────────────────
 //
 // 🔴 THE SECOND BLIND SPOT, ONE LAYER BELOW THE FIRST.
