@@ -1744,6 +1744,34 @@ log "video encoder: vp8 software, 1920x1080, 15fps, cpu-used=4, threads=2, ~2.0M
 # rate the app layer sends in `POST /api/room/screen {"rate":60}` per contract
 # §4.2, so the initial screen and every later resize describe themselves the
 # same way.
+#
+# `--session.implicit_hosting=true`: a connecting session takes control of the
+# desktop without having to ask for it. neko's own compiled-in default is
+# already `true`; the baked /etc/neko/neko.yaml turns it OFF (line 14,
+# `implicit_hosting: false`), and THAT is the root cause of "no keyboard on
+# mobile" — not a client-side gap:
+#   * neko's on-screen-keyboard button renders only when `hosting &&
+#     is_touch_device`, so with hosting off it is not in the DOM at all;
+#   * the input overlay carries `pointer-events: none`;
+#   * the client drops every keystroke on its own `hosting && !locked` guard.
+# A phone user therefore cannot type and cannot see why.
+#
+# The app layer has been rescuing this per session with `enableImplicitHosting`
+# (app/src/server/lib/cloudflare-guacamole-provider.ts), which logs in as admin
+# and rewrites room settings on every boot — but it is explicitly best-effort
+# and degrades to control mode 'manual' on any failure. That function's own
+# docstring names THIS flag "the durable fix" and notes it becomes a cheap
+# no-op once set, because its read-before-write already reports `true` and it
+# returns without writing. So this is not a second mechanism competing with
+# that one; it is the mechanism that one was standing in for.
+#
+# 🔴 This is BEHAVIOURAL, not plumbing: it changes who holds control on
+#    connect. Checked against the one thing that counts sessions — the display
+#    gate in cloudflare-guacamole-provider.ts, which asks `GET /api/sessions`
+#    and counts `state.is_watching`. `is_watching` is about receiving video,
+#    not about holding control; implicit hosting moves the host/control field,
+#    which that gate never reads. No conflict. Nothing else in this repo reads
+#    `/api/sessions`.
 phase_start neko_serve_bind
 NEKO_DESKTOP_SCREEN_SPEC="${NEKO_SCREEN_W}x${NEKO_SCREEN_H}@60"
 log "starting neko on 0.0.0.0:$NEKO_HTTP_PORT (pinned build, static=$NEKO_STATIC, initial screen $NEKO_DESKTOP_SCREEN_SPEC inside framebuffer $EZIL_X_FRAMEBUFFER)"
@@ -1761,6 +1789,7 @@ NEKO_DESKTOP_INPUT_ENABLED="false" \
     --desktop.input.enabled=false \
     --desktop.display "$DISPLAY" \
     --desktop.screen "$NEKO_DESKTOP_SCREEN_SPEC" \
+    --session.implicit_hosting=true \
     --capture.video.display "$DISPLAY" >>"$LOG" 2>&1 &
 NEKO_PID=$!
 
