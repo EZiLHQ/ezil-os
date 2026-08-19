@@ -22,6 +22,12 @@
  *          `/tmp/neko-cpu-diag.jsonl` — see `EZIL_NEKO_CPU_DIAG_ENABLED` /
  *          `handleCpuDiag`; bounded/tail-capped; degrades cleanly with
  *          `exists: false` when the sampler was never enabled)
+ *   POST   /sandbox/:name/logs → { ok, sandboxId, path, exists, bytes, totalLines, returnedLines, maxLines, maxLineLen, redacted, truncated, truncatedLines, content }
+ *          (HMAC-gated retrieval of the container's own boot log,
+ *          `/tmp/neko.log` — hardcoded, never caller-supplied. Bounded by
+ *          bytes, by lines, and per-line; EVERY line is run through
+ *          `sanitizeErrorMessage` before it leaves. Kill switch
+ *          `EZIL_NEKO_LOGS=off`. See `handleNekoLogs` / `./neko-logs.ts`)
  *   DELETE /sandbox/:name          → { ok, sandboxName, terminated, stopped, outcome,
  *                                     wasRunning, runningAfter, mode }
  *          (HMAC-gated with the SAME token envelope as `/sandbox/preview` —
@@ -235,6 +241,16 @@ interface Env extends SandboxEnv {
    * when the sampler itself is off; it then simply reports `exists: false`.
    */
   SANDBOX_CPU_DIAG?: string;
+
+  /**
+   * Non-secret kill-switch for the CONTAINER BOOT LOG retrieval route
+   * (`POST /sandbox/:name/logs` — see `handleNekoLogs` + `./neko-logs.ts`).
+   * DEFAULT `on` per `docs/BROWSER-FIX-CONTRACT.md` §2; set to
+   * `off`/`false`/`0`/`disabled`/`no` to hard-disable the route (404) without
+   * a code change. Same vocabulary and same shape as `SANDBOX_CPU_DIAG` /
+   * `SANDBOX_WORKSPACE_DIAG` above.
+   */
+  EZIL_NEKO_LOGS?: string;
 
   /**
    * Non-secret kill-switch for the `/project-files/*` storage-proxy routes
@@ -476,6 +492,32 @@ import {
   parseCpuDiagStatLines,
   cpuDiagContentCommand,
 } from './cpu-diag';
+// Same workerd constraint as the `./cpu-diag` block above: `NEKO_LOG_FILE`,
+// `NEKO_LOG_MAX_BYTES`, `NEKO_LOG_DEFAULT_MAX_LINES`,
+// `NEKO_LOG_MAX_LINES_CEILING` and `NEKO_LOG_MAX_LINE_LEN` are plain `const`s
+// and must NOT be re-exported from this entrypoint module. Import them from
+// `./neko-logs` directly.
+export {
+  nekoLogsRouteDisabled,
+  resolveNekoLogMaxLines,
+  nekoLogStatCommand,
+  parseNekoLogStatLines,
+  nekoLogContentCommand,
+  redactNekoLogContent,
+  type NekoLogStat,
+  type RedactedNekoLog,
+} from './neko-logs';
+import {
+  NEKO_LOG_FILE,
+  NEKO_LOG_MAX_BYTES,
+  NEKO_LOG_MAX_LINE_LEN,
+  nekoLogsRouteDisabled,
+  resolveNekoLogMaxLines,
+  nekoLogStatCommand,
+  parseNekoLogStatLines,
+  nekoLogContentCommand,
+  redactNekoLogContent,
+} from './neko-logs';
 import {
   resolvePreviewSecrets,
   verifyPreviewToken,
@@ -4090,6 +4132,165 @@ async function handleCpuDiag(
 }
 
 /**
+ * CONTAINER BOOT LOG retrieval endpoint (HMAC-gated).
+ *
+ * Modelled line-for-line on {@link handleCpuDiag} above — hardcoded path,
+ * stat-then-bounded-tail, identical HMAC envelope, identical kill-switch shape
+ * — because that route is the reviewed precedent for returning bounded file
+ * content out of a live container. See `./neko-logs.ts` for the constants and
+ * for the redaction argument in full.
+ *
+ * WHY IT EXISTS: `scripts/start-neko.sh` writes every human-readable boot line
+ * to `/tmp/neko.log` and nothing ever read it. The only escapes were a
+ * 600-byte stderr tail folded into an Error on the FAILURE path
+ * (`ensureDesktop`), and the NDJSON telemetry sidecar, which by design carries
+ * phase + outcome + duration and never a message. Every ERROR STRING a boot
+ * produced therefore reached a live `wrangler tail` and nowhere else.
+ *
+ * 🔴 EVERY RETURNED LINE IS REDACTED with `sanitizeErrorMessage` — the same
+ * function that produces the only value ever written to the telemetry `detail`
+ * column. This is NOT optional politeness: unlike the cpu-diag sampler's
+ * fixed-shape JSONL, `/tmp/neko.log` also receives the raw stdout+stderr of
+ * Xvfb, openbox, neko, code-server and Chromium, and Chromium logs page
+ * console errors WITH the page's URL. See `./neko-logs.ts`'s header.
+ *
+ * POST /sandbox/:name/logs  { token, maxLines? }
+ *   maxLines: optional cap on trailing lines returned, clamped to
+ *     [1, NEKO_LOG_MAX_LINES_CEILING] (default NEKO_LOG_DEFAULT_MAX_LINES).
+ *
+ * Response:
+ *   { ok, sandboxId, correlationId, path, exists, bytes, totalLines,
+ *     returnedLines, maxLines, maxBytes, maxLineLen, redacted, truncated,
+ *     truncatedLines, content, checkedAt }
+ * `exists: false` (the container never booted the desktop script, or the log
+ * was rotated away) is a CLEAN, informative 200 — never a 500. `content` is
+ * '' when `exists` is false.
+ */
+async function handleNekoLogs(
+  request: Request,
+  env: Env,
+  sandboxName: string,
+): Promise<Response> {
+  const correlationId =
+    request.headers.get('x-request-id')?.trim() ||
+    request.headers.get('x-correlation-id')?.trim() ||
+    newCorrelationId();
+  const tl = new LifecycleTimeline({ correlationId, sandboxId: sandboxName });
+
+  let body: { token?: string; maxLines?: number } = {};
+  try {
+    body = (await request.json()) as { token?: string; maxLines?: number };
+  } catch {
+    // Allow an empty body — the route defaults maxLines.
+  }
+
+  const auth = await verifyPreviewToken(body.token, resolvePreviewSecrets(env));
+  if (!auth.ok) {
+    tl.event('project_authorization', 'sandbox.neko_logs.authorize', 'error', { error: auth.error });
+    return json({ ok: false, error: auth.error }, 401);
+  }
+  tl.event('project_authorization', 'sandbox.neko_logs.authorize', 'ok');
+
+  const maxLines = resolveNekoLogMaxLines(body.maxLines);
+  const checkedAt = () => new Date().toISOString();
+
+  try {
+    const sandbox = openSandbox(env, sandboxName);
+
+    const statRes = await sandbox.exec(nekoLogStatCommand(NEKO_LOG_FILE));
+    if (statRes.exitCode !== 0) {
+      tl.event('workspace_mount', 'sandbox.neko_logs.stat_failed', 'error', { error: statRes.stderr });
+      return json(
+        {
+          ok: false,
+          sandboxId: sandboxName,
+          path: NEKO_LOG_FILE,
+          error: `neko_logs_stat_failed: exit=${statRes.exitCode} stderr=${sanitizeErrorMessage(statRes.stderr ?? '')}`,
+        },
+        500,
+      );
+    }
+    const stat = parseNekoLogStatLines((statRes.stdout ?? '').split('\n').map((l) => l.trim()));
+
+    if (!stat.exists) {
+      // Clean, informative degrade — NOT a 500. The likeliest causes are a
+      // sandbox that has never run `start-neko.sh` (guacamole mode, or a
+      // freshly-created container) and a container that was recycled.
+      tl.event('workspace_mount', 'sandbox.neko_logs.result', 'ok', { detail: 'exists=false' });
+      return json({
+        ok: true,
+        sandboxId: sandboxName,
+        correlationId,
+        path: NEKO_LOG_FILE,
+        exists: false,
+        bytes: 0,
+        totalLines: 0,
+        returnedLines: 0,
+        maxLines,
+        maxBytes: NEKO_LOG_MAX_BYTES,
+        maxLineLen: NEKO_LOG_MAX_LINE_LEN,
+        redacted: true,
+        truncated: false,
+        truncatedLines: 0,
+        content: '',
+        note: 'neko_log_absent: this sandbox has not run the desktop boot script, or its log has been removed',
+        checkedAt: checkedAt(),
+      });
+    }
+
+    const contentRes = await sandbox.exec(nekoLogContentCommand(NEKO_LOG_FILE, NEKO_LOG_MAX_BYTES, maxLines));
+    if (contentRes.exitCode !== 0) {
+      tl.event('workspace_mount', 'sandbox.neko_logs.read_failed', 'error', { error: contentRes.stderr });
+      return json(
+        {
+          ok: false,
+          sandboxId: sandboxName,
+          path: NEKO_LOG_FILE,
+          error: `neko_logs_read_failed: exit=${contentRes.exitCode} stderr=${sanitizeErrorMessage(contentRes.stderr ?? '')}`,
+        },
+        500,
+      );
+    }
+
+    // 🔴 The redaction pass. The raw exec output has exactly ONE consumer —
+    // the redactor — and must never reach the response body by any other
+    // route. `neko-logs.test.ts` counts the references to hold that.
+    const redactedLog = redactNekoLogContent(contentRes.stdout);
+    const content = redactedLog.lines.join('\n');
+    const returnedLines = redactedLog.lines.length;
+    const truncated = stat.totalLines > returnedLines || stat.bytes > NEKO_LOG_MAX_BYTES;
+
+    tl.event('workspace_mount', 'sandbox.neko_logs.result', 'ok', {
+      detail: `exists=true bytes=${stat.bytes} totalLines=${stat.totalLines} returnedLines=${returnedLines} truncated=${truncated} truncatedLines=${redactedLog.truncatedLines}`,
+    });
+    return json({
+      ok: true,
+      sandboxId: sandboxName,
+      correlationId,
+      path: NEKO_LOG_FILE,
+      exists: true,
+      bytes: stat.bytes,
+      totalLines: stat.totalLines,
+      returnedLines,
+      maxLines,
+      maxBytes: NEKO_LOG_MAX_BYTES,
+      maxLineLen: NEKO_LOG_MAX_LINE_LEN,
+      redacted: true,
+      truncated,
+      truncatedLines: redactedLog.truncatedLines,
+      content,
+      checkedAt: checkedAt(),
+    });
+  } catch (err) {
+    tl.event('workspace_mount', 'sandbox.neko_logs.failed', 'error', { error: err });
+    return json(
+      { ok: false, sandboxId: sandboxName, error: sanitizeErrorMessage(err) },
+      500,
+    );
+  }
+}
+
+/**
  * Twen workspace orchestration endpoint (HMAC-gated).
  *
  * "Twen" is a first-class, named orchestration action operating on an
@@ -5127,6 +5328,19 @@ export default {
         return json({ ok: false, error: 'cpu_diag_disabled' }, 404);
       }
       return handleCpuDiag(request, env, decodeURIComponent(cpuDiagMatch[1]));
+    }
+
+    const nekoLogsMatch = path.match(/^\/sandbox\/([^/]+)\/logs$/);
+    if (method === 'POST' && nekoLogsMatch) {
+      // Container boot-log tail. HMAC-gated, read-only, bounded three ways
+      // (bytes, lines, per-line), and every returned line is run through
+      // `sanitizeErrorMessage` (see `handleNekoLogs`). Operators can
+      // hard-disable it WITHOUT a code change via `EZIL_NEKO_LOGS=off`
+      // (default `on` — `docs/BROWSER-FIX-CONTRACT.md` §2).
+      if (nekoLogsRouteDisabled(env.EZIL_NEKO_LOGS)) {
+        return json({ ok: false, error: 'neko_logs_disabled' }, 404);
+      }
+      return handleNekoLogs(request, env, decodeURIComponent(nekoLogsMatch[1]));
     }
 
     const twenMatch = path.match(/^\/sandbox\/([^/]+)\/twen$/);

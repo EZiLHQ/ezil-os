@@ -207,8 +207,12 @@ if ( ! window.crypto?.getRandomValues ) {
 // not timing out on its own. Every call is counted so this script can prove
 // telemetry actually tried to send (armed), not that it silently no-op'd.
 let fetchCalls = 0;
+// Every body the module tried to send, kept so this file can assert WHAT
+// crosses the wire, not merely THAT something did.
+const sentBodies = [];
 window.fetch = (...args) => {
     fetchCalls += 1;
+    try { sentBodies.push(String(args[1]?.body ?? '')); } catch { /* never fail the stub */ }
     return new Promise(() => {}); // deliberately never resolves or rejects
 };
 // jsdom does not implement sendBeacon; confirm that assumption rather than
@@ -232,7 +236,10 @@ evalOrDie('icons.js', fs.readFileSync(`${OS}/icons.js`, 'utf8'));
 // is ALSO harmless.
 window.__EZIL_BOOT__ = {
     user: { id: 'u-telemetry-test' },
-    computer: { id: 'c-1', name: 'My computer', slot: 1, createdAt: new Date().toISOString(), lastOpenedAt: null, isNew: false },
+    // A REAL uuid, because `computerId` is only emitted when it is one — see
+    // `ambientComputerId()` in `telemetry.js`. A non-uuid here would make the
+    // computer-attribution checks below silently vacuous.
+    computer: { id: '4f7b1d2e-9c31-4a5f-8e60-1b2c3d4e5f60', name: 'My computer', slot: 1, createdAt: new Date().toISOString(), lastOpenedAt: null, isNew: false },
     apps: [{ id: 'desktop', name: 'Browser', icon: 'desktop', kind: 'desktop' }],
     desktopState: { endpoints: { telemetry: 'https://black-hole.invalid/api/shell/telemetry' } },
 };
@@ -289,6 +296,23 @@ push('the process is still alive and responsive after the black hole was fed 26 
 // This is the actual proof the black hole was REACHED, not skipped: if this
 // were 0, the whole exercise above would have measured nothing.
 push('telemetry actually attempted to send (armed, not silently dark)', fetchCalls > 0, `${fetchCalls} fetch() call(s)`);
+
+// ── WHAT crossed the wire ────────────────────────────────────────────────────
+// 🔴 `computer_id` was NULL on 100% of stored rows (measured against the live
+// database, 2026-08-19) even though `docs/telemetry.md` says the browser fills
+// it in. It never did: `capture()` accepted the field and no call site ever
+// passed it. It is now defaulted from the boot payload, so these checks are
+// what stop that regressing to NULL again.
+const sent = sentBodies.join('\n');
+let parsedBatch = null;
+try { parsedBatch = JSON.parse(sentBodies[0] ?? 'null'); } catch { /* asserted below */ }
+push('the flushed body is a well-formed batch', !! parsedBatch?.events?.length,
+    `${parsedBatch?.events?.length ?? 0} event(s)`);
+push('🔴 every event carries the computer id, so an error can be attributed to a computer',
+    parsedBatch?.events?.length > 0 && parsedBatch.events.every(e => e.computerId === '4f7b1d2e-9c31-4a5f-8e60-1b2c3d4e5f60'),
+    JSON.stringify(parsedBatch?.events?.[0]?.computerId));
+push('🔴 …and still no user id and no email anywhere in what is sent',
+    ! sent.includes('u-telemetry-test') && ! sent.includes('userId') && ! sent.includes('email'));
 
 console.log(`\n${checks.filter(c => c.pass).length}/${checks.length} checks passed`);
 if ( checks.some(c => ! c.pass) ) process.exit(1);
