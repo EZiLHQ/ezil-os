@@ -6,10 +6,6 @@
       "schedule": "17 3 * * *"
     },
     {
-      "path": "/api/cron/telemetry-drain",
-      "schedule": "43 3 * * *"
-    },
-    {
       "path": "/api/cron/sandbox-reap",
       "schedule": "8 4 * * *"
     }

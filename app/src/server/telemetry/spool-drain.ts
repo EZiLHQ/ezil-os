@@ -57,6 +57,25 @@ export type DrainPageResult =
  * scheduled runs rather than one long-running request. */
 const DEFAULT_MAX_PAGES = 10;
 
+/**
+ * Wall-clock ceiling on one drain, in the same spirit as `./retention.ts`'s
+ * `DEFAULT_BUDGET_MS`: stop STARTING pages once this much of the invocation has
+ * been spent, and leave the rest for the next scheduled run.
+ *
+ * 🔴 This exists because the drain no longer owns its invocation. It now also
+ * runs at the tail of `/api/cron/telemetry-maintenance` (one Vercel cron, two
+ * jobs — see that route), and `maxPages` alone bounds only the number of round
+ * trips, not their duration: 10 pages against a 20 s per-request abort is 200 s
+ * of worst case, which would blow any `maxDuration` the retention job also has
+ * to fit inside. A page count cannot express "and be finished by then"; a clock
+ * can.
+ *
+ * The first page is ALWAYS attempted, however little budget is left — a run
+ * that drains nothing and reports nothing is indistinguishable from the outage
+ * this whole path exists to end.
+ */
+export const DEFAULT_DRAIN_BUDGET_MS = 150_000;
+
 export interface SpoolDrainResult {
     pagesDrained: number;
     objectsSeen: number;
@@ -66,6 +85,10 @@ export interface SpoolDrainResult {
      * re-drained, already-ingested object contributes 0 here, not a re-count). */
     eventsIngested: number;
     objectsAcked: number;
+    /** `true` if the wall-clock budget stopped the loop before the spool was
+     * exhausted — the remainder is still in R2 and the next run continues from
+     * it. Not a fault: a large backlog is SUPPOSED to spread across runs. */
+    hitBudget: boolean;
     /**
      * How many `drainPage()` calls came back `{ ok: false }` — i.e. the Worker
      * was unreachable, unconfigured, rejected the HMAC, or answered
@@ -100,6 +123,8 @@ export interface SpoolDrainEngineDeps {
      * the objects simply come back on the next drain. */
     ack: (keys: string[]) => Promise<boolean>;
     maxPages?: number;
+    /** Wall-clock ceiling; defaults to {@link DEFAULT_DRAIN_BUDGET_MS}. */
+    budgetMs?: number;
 }
 
 /**
@@ -114,6 +139,9 @@ export interface SpoolDrainEngineDeps {
  */
 export async function runTelemetrySpoolDrain(deps: SpoolDrainEngineDeps): Promise<SpoolDrainResult> {
     const maxPages = deps.maxPages ?? DEFAULT_MAX_PAGES;
+    const budgetMs = deps.budgetMs ?? DEFAULT_DRAIN_BUDGET_MS;
+    const startedAt = Date.now();
+    let hitBudget = false;
     let cursor: string | undefined;
     let pagesDrained = 0;
     let objectsSeen = 0;
@@ -124,6 +152,12 @@ export async function runTelemetrySpoolDrain(deps: SpoolDrainEngineDeps): Promis
     let drainFailures = 0;
 
     for (let i = 0; i < maxPages; i++) {
+        // Checked BEFORE the second and later pages only — see
+        // `DEFAULT_DRAIN_BUDGET_MS` on why the first is unconditional.
+        if (i > 0 && Date.now() - startedAt > budgetMs) {
+            hitBudget = true;
+            break;
+        }
         const page = await deps.drainPage(cursor);
         if (!page.ok) {
             // Worker/transport failure — spool is untouched, retried whole
@@ -200,7 +234,16 @@ export async function runTelemetrySpoolDrain(deps: SpoolDrainEngineDeps): Promis
         if (!cursor) break;
     }
 
-    return { pagesDrained, objectsSeen, eventsParsed, eventsDroppedInvalid, eventsIngested, objectsAcked, drainFailures };
+    return {
+        pagesDrained,
+        objectsSeen,
+        eventsParsed,
+        eventsDroppedInvalid,
+        eventsIngested,
+        objectsAcked,
+        hitBudget,
+        drainFailures,
+    };
 }
 
 export interface SpoolDrainHandlerDeps extends SpoolDrainEngineDeps {
