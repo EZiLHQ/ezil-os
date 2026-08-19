@@ -1417,12 +1417,61 @@ async function UIWindow (options) {
     // as it did before this handler existed) or with native text selection
     // inside the body (selection is a browser default action this handler
     // never touches).
-    $(el_window_head).on('mousedown', function () {
-        $(el_window).focusWindow();
-    });
-    $(el_window_body).on('mousedown', function () {
-        $(el_window).focusWindow();
-    });
+    //
+    // 🔴 DEFECT C — on a touch device the FIRST tap is always swallowed.
+    // `mousedown` alone is a mouse-only signal: a mobile browser synthesizes
+    // it only AFTER `touchend`, so the tap that re-activates a window arrives
+    // at `.window-body` (the iframe is `pointer-events: none` until
+    // `.window-active`, so the body is the hit target), restores the iframe's
+    // pointer-events — and is already over. The user taps, nothing happens,
+    // and concludes the app is dead. `pointerdown` is the one signal that
+    // fires for mouse, touch AND pen, and for touch it fires at the START of
+    // the gesture, before the browser has picked a hit target for the
+    // synthesized mouse events. `touchstart` is deliberately NOT added: it
+    // would be a third handler for the same press covering strictly fewer
+    // input devices than `pointerdown` already covers.
+    //
+    // `mousedown` STAYS BOUND — it is the fallback for anything that does not
+    // implement Pointer Events, and removing it would change desktop
+    // behaviour that several suites assert. `focus_on_press` below is what
+    // keeps "both bound" from meaning "fires twice".
+    const focus_on_press = (() => {
+        // One press delivers `pointerdown` and THEN a synthesized `mousedown`
+        // — back-to-back for a mouse, separated by the whole gesture for a
+        // touch (so a time window would not tell them apart; a latch does).
+        // Only the first of the pair may reach `focusWindow()`, which is NOT
+        // idempotent — every call does `++window.last_window_zindex`, re-runs
+        // the whole z-index reshuffle over parents and children, and re-fires
+        // the iframe's `focus()` and `{msg:'focus'}` postMessage. The
+        // z-index counter is what `touch-focus-browser-test.mjs` measures,
+        // because it is the one side effect a test can count. The latch is
+        // made HERE, in the
+        // binding, rather than inside `focusWindow` — that function has a
+        // dozen other callers (open, taskbar, dblclick, close-refocus, the
+        // drag-over dragster) whose contract must not change.
+        //
+        // Safe in both directions. With Pointer Events, every real `mousedown`
+        // is preceded by its own `pointerdown`, which re-arms the latch before
+        // the `mousedown` consumes it — a latch left set by a gesture whose
+        // compat mouse events were suppressed can never swallow a later real
+        // press. Without Pointer Events the latch is never set at all and
+        // `mousedown` behaves exactly as it did before this block existed.
+        let pointer_press_pending = false;
+        return function (e) {
+            if ( e?.type === 'pointerdown' ) {
+                pointer_press_pending = true;
+            } else if ( pointer_press_pending ) {
+                pointer_press_pending = false;
+                return;
+            }
+            // No event argument, exactly as before: passing one would enable
+            // `focusWindow`'s menubar branch and its `{msg:'click'}` postMessage
+            // to the iframe, neither of which these bindings have ever done.
+            $(el_window).focusWindow();
+        };
+    })();
+    $(el_window_head).on('pointerdown mousedown', focus_on_press);
+    $(el_window_body).on('pointerdown mousedown', focus_on_press);
     // 🔴 DEFECT B — the same click-to-focus gap, on the resize handles.
     // jQuery UI's `.resizable()` (wired further below) appends each
     // `.ui-resizable-handle` as a direct child of `el_window` ITSELF, not of
@@ -1439,9 +1488,11 @@ async function UIWindow (options) {
     // jQuery UI's own mousedown handling on the handle (which starts the
     // resize) runs exactly as before; this only reorders z-index and toggles
     // `window-active`/iframe pointer-events.
-    $(el_window).on('mousedown', '.ui-resizable-handle', function () {
-        $(el_window).focusWindow();
-    });
+    // `pointerdown` here too, same reasoning and the same shared latch as the
+    // head/body bindings above — a press only ever fires ONE of these three
+    // handlers (the delegated selector matches handles and nothing else), so
+    // one latch per window covers all three without them interfering.
+    $(el_window).on('pointerdown mousedown', '.ui-resizable-handle', focus_on_press);
 
     // on_close event
     $(el_window).on('remove', function (e) {
