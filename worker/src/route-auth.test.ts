@@ -35,6 +35,7 @@ mock.module('cloudflare:workers', () => ({
 }));
 
 import { hmacSha256Hex, PREVIEW_TOKEN_PAYLOAD, TOKEN_MAX_AGE_MS } from './hmac';
+import { SCREEN_MODES } from './screen-modes';
 
 const SECRET = 'route-auth-test-secret';
 const SANDBOX_NAME = 'guac-abcdef0123456789-fedcba9876543210';
@@ -52,7 +53,7 @@ interface CallLog {
   getExposedPorts: number;
   exec: number;
   /** Every `containerFetch(url, init, port)` the route table actually made. */
-  containerFetch: Array<{ url: string; port: number; headers: Record<string, string> }>;
+  containerFetch: Array<{ url: string; port: number; method: string; headers: Record<string, string> }>;
   /**
    * Every request that reached the Durable Object's HTTP entrypoint
    * (`stub.fetch`) — i.e. what the SDK's REAL `wsConnect()` delivered after its
@@ -63,6 +64,13 @@ interface CallLog {
   wsConnect: Array<{ url: string; port: number; method: string; headers: Record<string, string> }>;
   /** Every `exposePort(port, {hostname, token})` the route table actually made. */
   exposePort: Array<{ port: number; token: string; hostname: string }>;
+  /**
+   * Every `startProcess(command, {env})` — i.e. the ACTUAL container boot
+   * environment. This is the only place `NEKO_SCREEN` can be observed: it is
+   * an env var on the launcher process, never an argv and never a response
+   * field, so a test that reads anything else is testing a paraphrase.
+   */
+  startProcess: Array<{ command: string; env: Record<string, string> }>;
 }
 
 /** Opaque stand-in for a `WebSocket`; only its identity is ever compared. */
@@ -151,6 +159,7 @@ function fakeSandboxNamespace(options: {
     containerFetch: [],
     wsConnect: [],
     exposePort: [],
+    startProcess: [],
   };
 
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
@@ -160,7 +169,7 @@ function fakeSandboxNamespace(options: {
       new Headers(init?.headers).forEach((v, k) => {
         headers[k] = v;
       });
-      calls.containerFetch.push({ url, port, headers });
+      calls.containerFetch.push({ url, port, method: (init?.method ?? 'GET').toUpperCase(), headers });
       // 🔴 `containerFetch` is a Durable Object JSRPC method. When the
       // container answers an upgrade it returns 101 + `webSocket`, and that
       // return value cannot be serialized back across the RPC boundary —
@@ -275,10 +284,14 @@ function fakeSandboxNamespace(options: {
     // behaviour byte-identical.
     ...(options.exposePort
       ? {
-          startProcess: async () => ({
-            waitForPort: async () => undefined,
-            getLogs: async () => ({ stdout: '', stderr: '' }),
-          }),
+          startProcess: async (...args: unknown[]) => {
+            const [command, opts] = args as [string, { env?: Record<string, string> } | undefined];
+            calls.startProcess.push({ command, env: { ...(opts?.env ?? {}) } });
+            return {
+              waitForPort: async () => undefined,
+              getLogs: async () => ({ stdout: '', stderr: '' }),
+            };
+          },
           exposePort: async (...args: unknown[]) => {
             const [port, opts] = args as [number, { hostname: string; token: string }];
             if (!options.exposePort!(port)) {
@@ -854,6 +867,300 @@ describe('POST /sandbox/:name/focus is HMAC-gated with a closed-enum `app`', () 
   });
 });
 
+// ── POST /sandbox/:name/screen ───────────────────────────────────────────────
+// Live X screen resize. Same shared-HMAC envelope as `/focus`. The mode table
+// and the `NEKO_SCREEN` formatting are proven exhaustively in
+// `./screen-modes.test.ts`; this block proves the ROUTE TABLE — auth, that a
+// bad body never reaches the container at all, that a valid one reaches neko's
+// admin API on the right port with the right JSON, and that a refusal comes
+// back as a refusal rather than a false success.
+
+/**
+ * A `fakeSandboxNamespace` whose container answers neko's `/api/login` with a
+ * token and `/api/room/screen` with whatever `screenResponse` says.
+ *
+ * The discrimination is on the URL the Worker actually asked for, read out of
+ * the call log — which `fakeSandboxNamespace` writes BEFORE it consults
+ * `containerResponse`. So a handler that hit the wrong endpoint gets the wrong
+ * answer here, rather than being quietly handed the right one.
+ */
+function fakeNekoScreenSandbox(
+  screenResponse: () => Response,
+  loginStatus = 200,
+  /**
+   * What `GET /api/room/screen` reports — the READ-BACK, deliberately settable
+   * to something OTHER than what was posted. Neko's POST echoes the request
+   * even when the X server did something else (measured: `900x1600` posted,
+   * `896x1600` applied), so a fake that always agreed with the POST could not
+   * fail for the one reason this route reads back at all.
+   */
+  readBack: (() => Response) | null = () =>
+    new Response(JSON.stringify({ width: 1080, height: 1920 }), { status: 200 }),
+): { binding: unknown; calls: CallLog } {
+  const fake: { binding: unknown; calls: CallLog } = fakeSandboxNamespace({
+    containerResponse: () => {
+      const last = fake.calls.containerFetch[fake.calls.containerFetch.length - 1] ?? { url: '' };
+      const url = last.url;
+      if (url.includes('/api/login')) {
+        return loginStatus === 200
+          ? new Response(JSON.stringify({ token: 'neko-admin-token' }), {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            })
+          : new Response('nope', { status: loginStatus });
+      }
+      // The GET read-back and the POST set share a path; only the method tells
+      // them apart, and the call log records the method for exactly this.
+      if (url.includes('/api/room/screen') && (last as { method?: string }).method === 'GET') {
+        return readBack ? readBack() : new Response('no', { status: 500 });
+      }
+      return screenResponse();
+    },
+  }) as { binding: unknown; calls: CallLog };
+  return fake;
+}
+
+describe('POST /sandbox/:name/screen is HMAC-gated and validates before touching the container', () => {
+  it('REJECTS an unsigned request with 401 and never reaches the container', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+        method: 'POST',
+        body: JSON.stringify({ width: 1080, height: 1920 }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+    expect(calls.containerFetch.length).toBe(0);
+  });
+
+  it('rejects a token signed with the WRONG secret', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken('some-other-secret')}` },
+        body: JSON.stringify({ width: 1080, height: 1920 }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+    expect(calls.containerFetch.length).toBe(0);
+  });
+
+  it('🔴 a signed request for a size OUTSIDE the mode table 400s and never reaches the container', async () => {
+    // 1170x2532 is a real phone's device-pixel box and a perfectly plausible
+    // ask — but it is not a modeline the X server advertises, so it can only
+    // ever fail. The app snaps before it gets here; this proves the Worker
+    // does not depend on that having happened.
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ width: 1170, height: 2532 }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json() as { error: string }).error).toBe('screen_bad_request');
+    expect(calls.containerFetch.length).toBe(0);
+  });
+
+  it('🔴 a stringly-typed size 400s and never reaches the container', async () => {
+    for (const body of [
+      { width: '1080', height: '1920' },
+      { width: 1080.5, height: 1920 },
+      { width: '1080x1920x24; rm -rf /', height: 1920 },
+      {},
+      [1080, 1920],
+    ]) {
+      const { binding, calls } = fakeSandboxNamespace({});
+      const res = await worker.fetch(
+        new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${await mintToken()}` },
+          body: JSON.stringify(body),
+        }),
+        { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+      );
+      expect(`${JSON.stringify(body)} -> ${res.status}`).toBe(`${JSON.stringify(body)} -> 400`);
+      expect(calls.containerFetch.length).toBe(0);
+    }
+  });
+
+  it('a malformed JSON body 400s (parse failure is not an allow)', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: '{not json',
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(400);
+    expect(calls.containerFetch.length).toBe(0);
+  });
+
+  it('ACCEPTS a signed, in-table request and posts {width,height,rate} to neko on port 8181', async () => {
+    const one = fakeNekoScreenSandbox(() => new Response('{}', { status: 200 }));
+
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ width: 1080, height: 1920 }),
+      }),
+      { Sandbox: one.binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      sandboxId: SANDBOX_NAME,
+      width: 1080,
+      height: 1920,
+      verified: true,
+      requested: { width: 1080, height: 1920 },
+    });
+
+    expect(one.calls.containerFetch.length).toBe(3);
+    expect(one.calls.containerFetch[0]!.url).toBe('http://127.0.0.1:8181/api/login');
+    expect(one.calls.containerFetch[0]!.port).toBe(8181);
+    expect(one.calls.containerFetch[1]!.url).toBe('http://127.0.0.1:8181/api/room/screen');
+    expect(one.calls.containerFetch[1]!.method).toBe('POST');
+    expect(one.calls.containerFetch[1]!.port).toBe(8181);
+    expect(one.calls.containerFetch[1]!.headers.authorization).toBe('Bearer neko-admin-token');
+    // The read-back. Its absence is the whole defect this guards.
+    expect(one.calls.containerFetch[2]!.url).toBe('http://127.0.0.1:8181/api/room/screen');
+    expect(one.calls.containerFetch[2]!.method).toBe('GET');
+  });
+
+  it("🔴 reports the READ-BACK, not the POST's echo — neko echoes the request even when X did something else", async () => {
+    // Measured against a real container: posting `900x1600` answers 200 with
+    // `{"width":900,"height":1600}` while the display is actually `896x1600`
+    // (Xvfb floors the width to a multiple of 8). A route that trusted the POST
+    // body would put a size on the wire that never existed, and the client
+    // would letterbox to an aspect the stream does not have.
+    const one = fakeNekoScreenSandbox(
+      () => new Response(JSON.stringify({ width: 720, height: 1280 }), { status: 200 }),
+      200,
+      () => new Response(JSON.stringify({ width: 712, height: 1280 }), { status: 200 }),
+    );
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ width: 720, height: 1280 }),
+      }),
+      { Sandbox: one.binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    const body = (await res.json()) as { width: number; height: number; verified: boolean; requested: unknown };
+    expect(`${body.width}x${body.height}`).toBe('712x1280');
+    expect(body.verified).toBe(true);
+    expect(body.requested).toEqual({ width: 720, height: 1280 });
+  });
+
+  it('🔴 says `verified: false` when the read-back cannot be read, instead of claiming the ask', async () => {
+    for (const readBack of [
+      () => new Response('nope', { status: 500 }),
+      () => new Response('<html>not json</html>', { status: 200 }),
+      () => new Response(JSON.stringify({ width: '720', height: 1280 }), { status: 200 }),
+      () => new Response(JSON.stringify({ height: 1280 }), { status: 200 }),
+      () => new Response(JSON.stringify({ width: 0, height: 0 }), { status: 200 }),
+    ]) {
+      const one = fakeNekoScreenSandbox(() => new Response('{}', { status: 200 }), 200, readBack);
+      const res = await worker.fetch(
+        new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${await mintToken()}` },
+          body: JSON.stringify({ width: 720, height: 1280 }),
+        }),
+        { Sandbox: one.binding, SANDBOX_HMAC_SECRET: SECRET },
+      );
+      const body = (await res.json()) as { ok: boolean; width: number; verified: boolean };
+      // Still a success — the set itself was accepted — but honestly labelled,
+      // so the app declines to tell the shell its ask was honoured.
+      expect(`ok=${body.ok} verified=${body.verified} width=${body.width}`).toBe('ok=true verified=false width=720');
+    }
+  });
+
+  it('🔴 an X server that cannot change mode comes back as screen_unsupported, not a false success', async () => {
+    // This is the Xvfb case, which is EVERY container until the Xorg+dummy
+    // migration lands: the framebuffer is fixed at process start and RandR
+    // advertises one mode, so neko rejects the set. The client must letterbox
+    // and stop asking — which it can only do if this is reported honestly.
+    const one = fakeNekoScreenSandbox(() => new Response('unknown screen configuration', { status: 422 }));
+
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ width: 1080, height: 1920 }),
+      }),
+      { Sandbox: one.binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { ok: boolean; error: string };
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe('screen_unsupported_422');
+  });
+
+  it('a 500 from neko is screen_upstream, NOT screen_unsupported (a retry is worth it, a mode that does not exist is not)', async () => {
+    const one = fakeNekoScreenSandbox(() => new Response('boom', { status: 500 }));
+
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ width: 1280, height: 720 }),
+      }),
+      { Sandbox: one.binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect((await res.json() as { error: string }).error).toBe('screen_upstream_500');
+  });
+
+  it('a failed neko login is reported, never treated as a resize that worked', async () => {
+    const one = fakeNekoScreenSandbox(() => new Response('{}', { status: 200 }), 401);
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ width: 1280, height: 720 }),
+      }),
+      { Sandbox: one.binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(502);
+    const body = (await res.json()) as { ok: boolean; error: string };
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe('screen_login_failed_401');
+    // The set was never attempted.
+    expect(one.calls.containerFetch.length).toBe(1);
+  });
+
+  it('🔴 leaks neither the derived neko admin credential nor the session token into the response', async () => {
+    for (const [label, one] of [
+      ['login refused', fakeNekoScreenSandbox(() => new Response('{}', { status: 200 }), 401)],
+      ['set refused', fakeNekoScreenSandbox(() => new Response('unknown screen configuration', { status: 422 }))],
+      ['set succeeded', fakeNekoScreenSandbox(() => new Response('{}', { status: 200 }))],
+    ] as Array<[string, { binding: unknown; calls: CallLog }]>) {
+      const res = await worker.fetch(
+        new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${await mintToken()}` },
+          body: JSON.stringify({ width: 1280, height: 720 }),
+        }),
+        { Sandbox: one.binding, SANDBOX_HMAC_SECRET: SECRET },
+      );
+      const text = await res.text();
+      expect(`${label}: ${/password/i.test(text)}`).toBe(`${label}: false`);
+      expect(`${label}: ${text.includes('neko-admin-token')}`).toBe(`${label}: false`);
+    }
+  });
+});
+
 // ── POST /sandbox/:name/restart ──────────────────────────────────────────────
 // Same shared-HMAC envelope as `DELETE /sandbox/:name` and `/focus`. The DO's
 // OWN restart logic (SIGTERM reusing terminate_stack, stop-confirm polling,
@@ -1024,6 +1331,109 @@ describe('POST /sandbox/:name/restart is HMAC-gated the same way as DELETE/focus
     );
     expect(calls.terminateSandbox).toBe(0);
     expect(calls.destroy).toBe(0);
+  });
+});
+
+// ── POST /sandbox/preview: boot-time screen sizing (NEKO_SCREEN) ────────────
+//
+// The whole Tier-1 fix is one environment variable on the container's launcher
+// process. So these tests read `calls.startProcess[0].env` — the actual boot
+// env — and nothing else. There is deliberately no test asserting that
+// `index.ts` contains the string `NEKO_SCREEN`: this repo has already shipped a
+// guard that asserted the text someone typed rather than what it did.
+
+describe('POST /sandbox/preview: NEKO_SCREEN boot env', () => {
+  async function preview(body: Record<string, unknown>, binding: unknown) {
+    return worker.fetch(
+      new Request('https://api-desktop.ezil.org/sandbox/preview', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          token: await mintToken(),
+          projectId: 'proj-1',
+          userId: 'user-1',
+          desktopMode: 'neko',
+          ...body,
+        }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+  }
+
+  it('🔴 does NOT set NEKO_SCREEN when the caller asks for nothing (an old bundle must be unaffected)', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
+    await preview({}, binding);
+    expect(calls.startProcess.length).toBe(1);
+    expect('NEKO_SCREEN' in calls.startProcess[0]!.env).toBe(false);
+  });
+
+  it('sets NEKO_SCREEN=<W>x<H>x24 for an in-table portrait request', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
+    await preview({ screen: { width: 1080, height: 1920 } }, binding);
+    expect(calls.startProcess[0]!.env.NEKO_SCREEN).toBe('1080x1920x24');
+  });
+
+  it('sets NEKO_SCREEN for every entry in the table, and for no other value', async () => {
+    for (const mode of SCREEN_MODES) {
+      const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
+      await preview({ screen: { width: mode.width, height: mode.height } }, binding);
+      expect(`${mode.width}x${mode.height} -> ${calls.startProcess[0]!.env.NEKO_SCREEN}`).toBe(
+        `${mode.width}x${mode.height} -> ${mode.width}x${mode.height}x24`,
+      );
+    }
+  });
+
+  it('🔴 leaves NEKO_SCREEN unset for a hostile or malformed screen, rather than 400ing the whole boot', async () => {
+    // The rule is "behaves exactly as today", not "fails loudly": a caller
+    // whose measurement went wrong must still get a working desktop.
+    for (const screen of [
+      { width: '1080x1920x24; rm -rf /', height: 1920 },
+      { width: '1080', height: '1920' },
+      { width: 1080.5, height: 1920 },
+      { width: 1170, height: 2532 }, // plausible, but not an advertised mode
+      { width: 999999, height: 999999 },
+      'portrait',
+      null,
+      [1080, 1920],
+    ]) {
+      const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
+      const res = await preview({ screen }, binding);
+      expect(`${JSON.stringify(screen)} -> ${res.status}`).toBe(`${JSON.stringify(screen)} -> 200`);
+      expect(`${JSON.stringify(screen)} -> ${calls.startProcess[0]!.env.NEKO_SCREEN}`).toBe(
+        `${JSON.stringify(screen)} -> undefined`,
+      );
+    }
+  });
+
+  it('🔴 every NEKO_SCREEN this route can produce matches /^\\d+x\\d+x24$/', async () => {
+    // The property that matters on a path ending at `Xvfb -screen 0 "$NEKO_SCREEN"`.
+    for (const mode of SCREEN_MODES) {
+      const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
+      await preview({ screen: { width: mode.width, height: mode.height } }, binding);
+      expect(calls.startProcess[0]!.env.NEKO_SCREEN).toMatch(/^\d+x\d+x24$/);
+    }
+  });
+
+  it('does not disturb the neko credential env it sits alongside', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
+    await preview({ screen: { width: 720, height: 1280 } }, binding);
+    const env = calls.startProcess[0]!.env;
+    expect(env.NEKO_SCREEN).toBe('720x1280x24');
+    for (const key of [
+      'NEKO_MEMBER_MULTIUSER_USER_PASSWORD',
+      'NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD',
+      'NEKO_PASSWORD',
+      'NEKO_PASSWORD_ADMIN',
+      'DESKTOP_MODE',
+    ]) {
+      expect(`${key} present: ${typeof env[key] === 'string' && env[key] !== ''}`).toBe(`${key} present: true`);
+    }
+  });
+
+  it('never sets NEKO_SCREEN in guacamole mode (there is no neko desktop to size)', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
+    await preview({ desktopMode: 'guacamole', screen: { width: 1080, height: 1920 } }, binding);
+    expect('NEKO_SCREEN' in calls.startProcess[0]!.env).toBe(false);
   });
 });
 
@@ -1914,6 +2324,7 @@ describe('no other mutating route is reachable unauthenticated', () => {
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/cpu-diag` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/twen` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus` },
+      { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen` },
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart` },
       { method: 'POST', url: `https://api-desktop.ezil.org/project-files/put` },
       { method: 'POST', url: `https://api-desktop.ezil.org/project-files/delete` },

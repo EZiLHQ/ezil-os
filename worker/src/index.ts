@@ -493,6 +493,7 @@ import {
   sanitizeErrorMessage,
   type LogEvent,
 } from './observability';
+import { parseRequestedScreen, formatNekoScreen } from './screen-modes';
 import {
   selectTelemetryWorthy,
   toTelemetryEventInput,
@@ -3222,6 +3223,22 @@ interface PreviewBody {
    * echoed into any response body, or added to a lifecycle timeline.
    */
   startupDelivery?: string;
+  /**
+   * The X screen the container should BOOT at, as `{width, height}` integers
+   * the app has already snapped to the closed mode table.
+   *
+   * 🔴 TYPED `unknown` ON PURPOSE. This is untrusted JSON off the wire, and it
+   * ends up next to `Xvfb -screen 0 "$NEKO_SCREEN"`. Nothing reads these two
+   * fields directly — `parseRequestedScreen` (`./screen-modes.ts`) is the only
+   * reader, it accepts only plain integers, and `formatNekoScreen` REBUILDS
+   * the env value from integers it re-checked against the table itself. There
+   * is no path from a string here to a command line.
+   *
+   * Absent (an older app deploy, or a caller that asked for nothing) means the
+   * container boots at `start-neko.sh`'s own `${NEKO_SCREEN:-1920x1080x24}`
+   * default — i.e. exactly today's behaviour.
+   */
+  screen?: { width?: unknown; height?: unknown };
 }
 
 async function handlePreview(
@@ -3366,6 +3383,36 @@ async function handlePreview(
       NEKO_PASSWORD: nekoCreds.user,
       NEKO_PASSWORD_ADMIN: nekoCreds.admin,
     };
+
+    // ── Boot-time screen sizing ─────────────────────────────────────────────
+    // The desktop was hard-pinned to 1920x1080 and the shell letterboxed it to
+    // 16:9 whatever shape the window was — a 390x844 phone got a 390x219 strip.
+    // `start-neko.sh:138` has ALWAYS been `${NEKO_SCREEN:-1920x1080x24}`;
+    // nothing ever set it. This is the one line that does.
+    //
+    // 🔴 Injected ONLY when the caller asked for a valid mode. An absent,
+    // malformed, or out-of-table `screen` leaves `iceEnv` byte-for-byte as it
+    // was, so the container boots at the script's own default and an older app
+    // deploy is unaffected. That is the backward-compatibility guarantee, and
+    // it is structural: there is no `?? DEFAULT` anywhere on this path.
+    //
+    // 🔴 The value is REBUILT by `formatNekoScreen` from two integers it
+    // re-checked against the closed table — never interpolated from anything
+    // the caller sent. See `./screen-modes.ts`'s header for why that matters
+    // on a path that ends at an X server command line.
+    const requestedScreen = parseRequestedScreen(body.screen);
+    const nekoScreen = requestedScreen
+      ? formatNekoScreen(requestedScreen.width, requestedScreen.height)
+      : null;
+    if (nekoScreen) {
+      iceEnv.NEKO_SCREEN = nekoScreen;
+      tl.event('sandbox_identity', 'sandbox.preview.screen', 'ok', { detail: `screen=${nekoScreen}` });
+    } else if (body.screen !== undefined) {
+      // Asked for, refused. Loud in the timeline rather than silently 1920x1080:
+      // a client that thinks it got a portrait desktop and did not is exactly
+      // the state `fit_stream` cannot detect on its own.
+      tl.event('sandbox_identity', 'sandbox.preview.screen', 'error', { error: 'screen_not_a_mode' });
+    }
   }
 
   tl.event('sandbox_identity', 'sandbox.preview.identity', 'ok', {
@@ -4394,6 +4441,223 @@ async function handleFocus(request: Request, env: Env, sandboxName: string): Pro
   }
 }
 
+// ── Live screen resize ───────────────────────────────────────────────────────
+//
+// POST /sandbox/:name/screen  { token, width, height }
+//   Changes the X screen mode of a LIVE container, so a desktop opened on a
+//   phone can become portrait without a reboot. Gated with the SAME
+//   shared-HMAC envelope as `/focus` and `DELETE /sandbox/:name`.
+//
+// 🔴 WHY THIS RUNS IN THE WORKER AND NOT IN THE APP. Neko's admin API is
+// reachable two ways: over the public preview hostname (which the app already
+// uses for `/api/login` + `/api/room/settings`), or over the container's own
+// loopback via `containerFetch`. This route takes the second, because the app
+// does not hold the desktop ORIGIN outside the boot request that minted it —
+// and the contract's request body (`{computerId, width, height}`) deliberately
+// carries no frame URL for it to be handed. The credential is NOT a new one:
+// `deriveNekoCredentials(env, sandboxId).admin` is the exact value the app's
+// `deriveNekoAdminValue` mirrors, and this Worker is where that derivation
+// already lives.
+//
+// 🔴 WHY IT CAN LEGITIMATELY FAIL, AND MUST SAY SO. The X screen can only grow
+// INSIDE the framebuffer the server started with. MEASURED against a real
+// container: one pixel over the bound (`1920x1921` against a 1920x1920
+// framebuffer) answers `HTTP 422 {"code":422,"message":"cannot set screen
+// size"}` and leaves the display untouched. That is `screen_unsupported` — and
+// against a container whose framebuffer is smaller than the mode table (an
+// older image, or one where the ceiling was never raised) it is a PERMANENT
+// property, not a transient error, so the client letterboxes and stops asking
+// rather than retrying something that cannot start working.
+//
+// Every one of the twelve contract modes has been driven through this endpoint
+// against a real container and confirmed four ways (`GET /api/room/screen`,
+// `xdpyinfo`, `wmctrl`, and a screenshot at exactly that size), so the happy
+// path is measured rather than hoped for.
+//
+// Response: { ok: true, sandboxId, width, height, verified, requested }
+//         | { ok: false, error }.
+// `error` is the closed vocabulary the app maps to its own five codes
+// (`classifyScreenFailure`, app-side): `screen_bad_request`,
+// `screen_unsupported`, `screen_upstream_<status>`, `screen_timeout`,
+// `screen_login_failed`.
+
+/** Whole budget for one live resize: login + set. */
+const SCREEN_SET_BUDGET_MS = 12_000;
+
+/** Neko's own refresh rate field. The modelines are all 60Hz. */
+const SCREEN_RATE_HZ = 60;
+
+/**
+ * `GET /api/room/screen` — what the X display ACTUALLY is, right now.
+ *
+ * Returns null for anything that is not a well-formed answer: a non-2xx, a
+ * body that is not JSON, or one whose `width`/`height` are not plain integers.
+ * The rule is "either we understood the answer or we did not have one", the
+ * same rule `probeDesktopDisplay` (app side) applies to `/api/sessions` — a
+ * lenient parse here would let a renamed field turn into a confidently wrong
+ * size on the wire.
+ *
+ * 🔴 NOT `/api/room/screen/configurations`. That endpoint returns exactly ONE
+ * entry — the framebuffer BOUND, with `rate: 0` — and is a ceiling, not an
+ * enumeration of selectable modes. Any size fitting inside it on both axes is
+ * settable, so a mode's absence from that list means nothing at all.
+ */
+async function readNekoScreen(
+  sandbox: Sandbox<unknown>,
+  origin: string,
+  port: number,
+  token: string,
+  signal: AbortSignal,
+): Promise<{ width: number; height: number } | null> {
+  try {
+    const res = await sandbox.containerFetch(
+      `${origin}/api/room/screen`,
+      { method: 'GET', headers: { Accept: 'application/json', Authorization: `Bearer ${token}` }, signal },
+      port,
+    );
+    if (!res.ok) return null;
+    const body = (await res.json()) as { width?: unknown; height?: unknown };
+    if (!Number.isInteger(body.width) || !Number.isInteger(body.height)) return null;
+    const width = body.width as number;
+    const height = body.height as number;
+    if (width <= 0 || height <= 0) return null;
+    return { width, height };
+  } catch {
+    return null;
+  }
+}
+
+async function handleScreen(request: Request, env: Env, sandboxName: string): Promise<Response> {
+  let body: unknown = {};
+  try {
+    const raw = await request.text();
+    if (raw.trim() !== '') body = JSON.parse(raw);
+  } catch {
+    return json({ ok: false, error: 'invalid_json_body' }, 400);
+  }
+
+  // The ONLY reader of the caller's numbers. Plain integers or nothing — see
+  // `./screen-modes.ts`. `formatNekoScreen` is then the membership check: a
+  // pair that is not one of the advertised modelines can never be set, so
+  // rejecting it here saves a round trip and keeps the wire honest.
+  const requested = parseRequestedScreen(body);
+  if (!requested || formatNekoScreen(requested.width, requested.height) === null) {
+    return json({ ok: false, error: 'screen_bad_request' }, 400);
+  }
+  const { width, height } = requested;
+
+  const deadline = AbortSignal.timeout(SCREEN_SET_BUDGET_MS);
+  const nekoPort = portFor('neko').port;
+  const origin = `http://127.0.0.1:${nekoPort}`;
+
+  try {
+    const sandbox = openSandbox(env, sandboxName);
+    const creds = await deriveNekoCredentials(env, sandboxName);
+
+    // 🔴 No token cache here, deliberately. The app's `nekoAdminTokens` cache
+    // exists because the display gate asks the same question every second on a
+    // boot's critical path; a resize is a rare, human-paced action (debounced
+    // 500ms client-side, deduplicated against the last applied size), so one
+    // extra loopback round trip per resize is not worth a second cache that
+    // could hand a restarted container a dead token.
+    const loginRes = await sandbox.containerFetch(
+      `${origin}/api/login`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'ezil-os-screen', password: creds.admin }),
+        signal: deadline,
+      },
+      nekoPort,
+    );
+    if (!loginRes.ok) {
+      return json({ ok: false, sandboxId: sandboxName, error: `screen_login_failed_${loginRes.status}` }, 502);
+    }
+    const login = (await loginRes.json()) as { token?: unknown };
+    if (typeof login.token !== 'string' || login.token === '') {
+      return json({ ok: false, sandboxId: sandboxName, error: 'screen_login_failed_no_token' }, 502);
+    }
+
+    // 🔴 NOT a read-modify-write, and that is a difference from
+    // `/api/room/settings` rather than an oversight. `/api/room/screen` takes a
+    // screen configuration and nothing else — there are no sibling fields for a
+    // POST to silently reset, which is the failure `enableImplicitHosting`'s own
+    // doc comment records for the settings endpoint.
+    const setRes = await sandbox.containerFetch(
+      `${origin}/api/room/screen`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${login.token}` },
+        // Built from the two integers validated above, never from the body.
+        body: JSON.stringify({ width, height, rate: SCREEN_RATE_HZ }),
+        signal: deadline,
+      },
+      nekoPort,
+    );
+
+    if (setRes.ok) {
+      // 🔴 READ BACK. THE POST'S OWN BODY IS NOT EVIDENCE.
+      //
+      // Measured against a real container: `POST /api/room/screen` with
+      // `900x1600` answers HTTP 200 and echoes `{"width":900,"height":1600}`
+      // while the X display is actually 896x1600 (Xvfb floors the width to a
+      // multiple of 8). The POST echoes the REQUEST, not the RESULT. Reporting
+      // it as applied would put a size on the wire that never existed, and the
+      // client would letterbox to an aspect the stream does not have — the
+      // exact class of bug this whole change exists to remove.
+      //
+      // `GET /api/room/screen` is the observation. When it answers, its numbers
+      // are what this route reports. When it does not, the route says so with
+      // `verified: false` rather than falling back to the POST's echo and
+      // calling it applied; the app then declines to claim `requested`.
+      const applied = await readNekoScreen(sandbox, origin, nekoPort, login.token, deadline);
+      return json({
+        ok: true,
+        sandboxId: sandboxName,
+        // The observed screen when there is one, the requested one otherwise —
+        // and `verified` is the flag that tells them apart. Never merged into
+        // one indistinguishable number.
+        width: applied ? applied.width : width,
+        height: applied ? applied.height : height,
+        verified: applied !== null,
+        /** What was actually sent to neko, so a divergence is visible in logs. */
+        requested: { width, height },
+      });
+    }
+
+    const detail = (await setRes.text().catch(() => '')).slice(0, 300);
+    // 422 is neko's MEASURED answer for a size the X server cannot reach —
+    // `{"code":422,"message":"cannot set screen size"}`, observed for one pixel
+    // over the framebuffer bound, with the display left unchanged. 400 is
+    // included because a malformed body reaches the same dead end from this
+    // caller's point of view, and both mean "asking again will not help".
+    // Reported as UNSUPPORTED so the client stops asking rather than retrying
+    // a thing that cannot start working.
+    const unsupported = setRes.status === 400 || setRes.status === 422;
+    return json(
+      {
+        ok: false,
+        sandboxId: sandboxName,
+        error: unsupported ? `screen_unsupported_${setRes.status}` : `screen_upstream_${setRes.status}`,
+        detail,
+      },
+      502,
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const timedOut = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
+    return json(
+      {
+        ok: false,
+        sandboxId: sandboxName,
+        error: timedOut ? 'screen_timeout' : `screen_upstream_exception`,
+        detail: message.slice(0, 300),
+      },
+      timedOut ? 504 : 502,
+    );
+  }
+}
+
 /**
  * Non-secret production kill-switch for `POST /sandbox/:id/activity`. Same
  * vocabulary (and same per-surface duplication) as `focusDisabled`/
@@ -5152,6 +5416,24 @@ export default {
       const unauthorized = await authorizeSignedControlRequest(request, env, url);
       if (unauthorized) return unauthorized;
       return handleFocus(request, env, decodeURIComponent(focusMatch[1]));
+    }
+
+    const screenMatch = path.match(/^\/sandbox\/([^/]+)\/screen$/);
+    if (method === 'POST' && screenMatch) {
+      // Live X screen resize. HMAC-gated (SAME envelope as `/focus`), and its
+      // body is two integers checked against the closed mode table before
+      // anything is sent to the container — never a free string.
+      //
+      // 🔴 NO KILL SWITCH ENV VAR, unlike its siblings, and that is deliberate
+      // rather than an omission: the fix contract fixes the environment-variable
+      // set and this route is not in it. The route degrades on its own — under
+      // an X server that cannot change mode it answers `screen_unsupported`
+      // and the client falls back to letterboxing permanently, which is the
+      // same end state a kill switch would produce. If an operator switch is
+      // wanted later, `SANDBOX_SCREEN` alongside `SANDBOX_FOCUS` is the shape.
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      return handleScreen(request, env, decodeURIComponent(screenMatch[1]));
     }
 
     const activityMatch = path.match(/^\/sandbox\/([^/]+)\/activity$/);
