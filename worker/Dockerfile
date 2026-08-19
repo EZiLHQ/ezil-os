@@ -34,7 +34,7 @@
 # build host's image store (wrangler builds the container image locally before
 # pushing to registry.cloudflare.com).
 #
-# `-ezil-brand1` is a SECOND local, project-owned, never-pushed tag: it is
+# `-ezil-brand2` is a SECOND local, project-owned, never-pushed tag: it is
 # `ezil-neko-vscode:d74052bb-049931d7` with EZiL's branding overlay applied
 # (worker/assets/neko-branding/Dockerfile) — the upstream n.eko wordmark
 # (img/logo.800bec71.svg — a cat-silhouette mark, confirmed by inspecting its
@@ -46,10 +46,28 @@
 # placeholders in EZiL's real palette (--color-charcoal #161616 /
 # --color-teal #00adb5), not an invented mark — see that Dockerfile's header
 # comment. Rebuild it with:
-#   docker build -t ezil-neko-vscode:d74052bb-049931d7-ezil-brand1 \
+#   docker build -t ezil-neko-vscode:d74052bb-049931d7-ezil-brand2 \
 #     -f worker/assets/neko-branding/Dockerfile worker/assets/neko-branding
 # before building this Dockerfile, exactly like the upstream tag it overlays.
-ARG NEKO_IMAGE=ezil-neko-vscode:d74052bb-049931d7-ezil-brand1
+#
+# 🔴 THE `brandN` SUFFIX IS LOAD-BEARING AND ITS TEST CANNOT SEE IT.
+#    `scripts/neko-branding.test.ts` asserts only that this tag CONTAINS
+#    `ezil-brand` and `d74052bb-049931d7`. Every `brandN` satisfies both, so a
+#    stale suffix here is invisible to the suite: the worker image would build
+#    from the OLD overlay, ship none of the newer overlay's files, and nothing
+#    would go red. That is exactly how a feature ends up green-tested and
+#    absent from the artifact.
+#
+#    brand1 -> brand2 adds the mobile on-screen-keyboard client script
+#    (`/var/www/ezil-mobile.js`, ~18 KB, plus its <script> tag in
+#    `/var/www/index.html`). Verified present in brand2 and absent from brand1.
+#    The overlay Dockerfile has its own build-time gate (`test -s
+#    /var/www/ezil-mobile.js`), but that gate only runs when the new tag is
+#    ACTUALLY BEING BUILT — it cannot catch this line never being bumped.
+#
+#    So: whenever `worker/assets/neko-branding/**` changes, rebuild the overlay
+#    under a NEW `brandN` tag and bump this line in the same commit.
+ARG NEKO_IMAGE=ezil-neko-vscode:d74052bb-049931d7-ezil-brand2
 FROM ${NEKO_IMAGE} AS neko
 
 FROM docker.io/cloudflare/sandbox:0.12.1
