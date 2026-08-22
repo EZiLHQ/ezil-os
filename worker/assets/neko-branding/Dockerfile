@@ -87,7 +87,57 @@ COPY www/chat-silent.mp3            /var/www/chat.mp3
 # ATTRIBUTIONS.md §2 — the project-level file already carries full upstream
 # attribution). Every <script>/<link> tag and hashed filename is unchanged,
 # so the compiled Vue bundle's DOM/module expectations are unaffected.
-COPY www/index.html                 /var/www/index.html
+# 🔴 index.html IS EDITED IN PLACE, NEVER REPLACED — and that is the whole
+# lesson of 2026-08-22. This line used to be:
+#
+#     COPY www/index.html  /var/www/index.html
+#
+# A whole-file replacement, which necessarily pins the CONTENT-HASHED asset
+# names of whichever base build it was captured from:
+#     css/app.8dceb2fa.css · js/app.4919abb0.js · js/app-legacy.4a0d07b4.js
+#
+# The Vue build is NOT reproducible. Rebuilding the pinned base from the same
+# pinned SHAs produced css/app.497e53ca.css and js/app.48a1d8f5.js — different
+# hashes, same source. So the moment the base was rebuilt, every asset in the
+# pinned index.html 404'd, the neko client never loaded, no RTCPeerConnection
+# was ever constructed, and production served a desktop window with no video
+# at all. Measured: `pcCount: 0`, and the browser refusing the stylesheet
+# because a 404 body arrives as `text/plain`.
+#
+# It "worked" for months only because nobody had rebuilt the base. The pin was
+# a landmine armed by the first rebuild, which is exactly when someone is least
+# able to tell a new bug from an old one.
+#
+# So: take the base image's OWN index.html — whose hashes are correct by
+# construction — and apply only the seven textual edits this overlay actually
+# wants. The `www/index.html` file is kept in the repo as the readable record
+# of what those edits produce, and is asserted against below, but it is no
+# longer what ships.
+RUN set -eux; \
+    f=/var/www/index.html; \
+    sed -i 's|<title>n\.eko</title>|<title>EZiL OS</title>|' "$f"; \
+    sed -i 's|href="safari-pinned-tab.svg" color="#19bd9c"|href="safari-pinned-tab.svg" color="#00adb5"|' "$f"; \
+    sed -i 's|name="msapplication-TileColor" content="#19bd9c"|name="msapplication-TileColor" content="#00adb5"|' "$f"; \
+    sed -i 's|name="theme-color" content="#19bd9c"|name="theme-color" content="#161616"|' "$f"; \
+    sed -i 's|<strong>We.re sorry but n\.eko[^<]*</strong>|<strong>This app requires JavaScript to be enabled.</strong>|' "$f"; \
+    sed -i 's|<p>A self hosted virtual browser[^<]*<a[^>]*>[^<]*</a>[^<]*</p>||' "$f"; \
+    sed -i 's|</head>|<script defer="defer" src="ezil-mobile.js"></script></head>|' "$f"; \
+    # Every edit asserted, so a silent no-op from an upstream wording change is
+    # a failed build rather than an unbranded image nobody notices.
+    grep -q '<title>EZiL OS</title>' "$f"; \
+    grep -q 'content="#161616"' "$f"; \
+    grep -q 'color="#00adb5"' "$f"; \
+    grep -q 'src="ezil-mobile.js"' "$f"; \
+    ! grep -q 'n\.eko' "$f"; \
+    ! grep -q 'm1k1o/neko' "$f"; \
+    # 🔴 THE GUARD THAT WOULD HAVE CAUGHT THE PIN. Every hashed asset the page
+    # references must exist in this image. With the old COPY this assertion
+    # fails instantly; with the in-place edit it can only fail if upstream
+    # changes its markup shape.
+    for a in $(grep -oE '(js|css)/[A-Za-z0-9._-]+\.(js|css)' "$f" | sort -u); do \
+      test -s "/var/www/$a" || { echo "ERROR: index.html references /var/www/$a which does not exist in this image" >&2; exit 1; }; \
+    done; \
+    echo "index.html branded in place; all referenced assets present"
 
 # The mobile on-screen-keyboard affordance, referenced by exactly one added
 # <script> tag in the index.html above (every pre-existing <script>/<link> tag
