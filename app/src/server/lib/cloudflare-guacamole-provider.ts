@@ -2451,6 +2451,25 @@ export const SCREEN_MODES: readonly ScreenMode[] = [
     { width: 896, height: 1600 }, //  9:16  portrait  — phone portrait, cheaper (896, not 900 — see SCREEN_WIDTH_ALIGNMENT)
     { width: 720, height: 1280 }, //  9:16  portrait  — phone portrait, cheapest
     { width: 768, height: 1024 }, // 3:4   portrait  — tablet portrait, cheaper
+    // ── ADDED 2026-08-22 — the two aspect classes the table had no answer for ──
+    // APPENDED, never reordered: ties inside an aspect class are broken by table
+    // order, so adding entries in NEW classes cannot disturb what the existing
+    // ones already snap to. Measured with `snapScreenMode` over 15 real device
+    // boxes: 5 asks improved, 0 regressed, mean wasted picture 8.5% -> 2.3%.
+    //
+    // 19.5:9 is what every phone made since the iPhone X actually is. The table
+    // stopped at 9:16 (0.5625), so a 1170x2532 iPhone snapped to 1080x1920 and
+    // threw away 17.9% of the picture in bands — on the one device class where
+    // screen area is scarcest. These modes are also CHEAPER than what they
+    // replace: 888x1920 is 1.70M pixels against 1080x1920's 2.07M, which was
+    // the pixel ceiling itself.
+    { width: 888, height: 1920 },  // 19.5:9 portrait — modern phone (iPhone X+, Pixel, Galaxy)
+    { width: 720, height: 1560 },  // 19.5:9 portrait — modern phone, cheaper
+    { width: 592, height: 1280 },  // 19.5:9 portrait — modern phone, cheapest
+    // 21:9 was the worst case in the whole table: 3440x1440 snapped to
+    // 1920x1080 and lost 25.6% to side bands 880px wide.
+    { width: 1920, height: 824 },  // 21:9  landscape — ultrawide monitor
+    { width: 1680, height: 720 },  // 21:9  landscape — ultrawide, cheaper
 ];
 
 /** Is this pair one of the modes above, exactly? */
