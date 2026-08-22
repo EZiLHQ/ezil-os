@@ -1,0 +1,15 @@
+{
+  "name": "@ezil-os/browser-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "description": "Narrow HTTP automation surface over the EZiL OS desktop browser's loopback CDP port. Fixed verb set, no passthrough.",
+  "type": "module",
+  "main": "server.mjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "playwright-core": "1.62.1"
+  }
+}

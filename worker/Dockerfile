@@ -304,6 +304,49 @@ RUN test -f /opt/ezil-sandbox-template/package.json \
   && test -f /opt/ezil-sandbox-template/pages/index.js \
   && test -f /opt/ezil-sandbox-template/next.config.js
 
+# ── Browser sidecar: the desktop browser's narrow automation surface ─────────
+# `worker/sidecar/` — a small Node service that connects to Chrome's CDP port
+# on container loopback (`--remote-debugging-port=9222`, added to the Chrome
+# launch in start-neko.sh) with `playwright-core`'s `connectOverCDP`, and
+# serves a FIXED verb set on 0.0.0.0:9223. Launched by start-neko.sh's
+# `launch_browser_sidecar`, after the boot readiness verdict, so it can never
+# affect whether the desktop comes up.
+#
+# 🔴 THE TWO PORTS ARE NOT THE SAME KIND OF THING.
+#    9222 is CDP: unauthenticated and TOTAL — whatever reaches it reads every
+#    page, exfiltrates the profile's cookies and runs arbitrary JS in any
+#    origin. It stays on 127.0.0.1 (Chromium M113+ forces that anyway) and is
+#    deliberately NOT `EXPOSE`d below, not `exposePort()`d by the Worker, and
+#    not proxied by anything.
+#    9223 is the sidecar: navigate / snapshot / click / type / get_text /
+#    screenshot / console / network / wait_for, with NO CDP passthrough verb —
+#    see `sidecar/README.md` and the pinned wire contract it names. It is
+#    reached by `sandbox.containerFetch` from an HMAC-gated Worker route, NOT
+#    through `src/preview-bridge.ts` (which accepts 3002 and 8443 by design).
+#
+# `playwright-core` — not `playwright` — on purpose: we connect to a browser
+# that is already running, so none of the browser DOWNLOADS the full package
+# pulls in are wanted. `--omit=dev` keeps it to that one dependency. The
+# version is pinned in `sidecar/package.json`; `npm ci` is not used because
+# there is no lockfile to keep in step with a single pinned dependency.
+#
+# The final `node -e` runs verbs.mjs's LOAD-TIME route/contract conformance
+# check inside the image (it throws when the served routes and
+# `sidecar/contract.mjs` have drifted) and asserts the verb COUNT, so a server
+# whose wire has drifted from its own declaration fails the BUILD rather than
+# failing to be noticed. It imports the module without binding any port.
+COPY sidecar /opt/ezil-sidecar
+RUN cd /opt/ezil-sidecar \
+  && npm install --omit=dev --no-audit --no-fund \
+  && test -f /opt/ezil-sidecar/server.mjs \
+  && test -d /opt/ezil-sidecar/node_modules/playwright-core \
+  && node --check /opt/ezil-sidecar/server.mjs \
+  && node --check /opt/ezil-sidecar/verbs.mjs \
+  && node --check /opt/ezil-sidecar/browser.mjs \
+  && node --check /opt/ezil-sidecar/redact.mjs \
+  && node --check /opt/ezil-sidecar/page-scripts.mjs \
+  && node -e "import('/opt/ezil-sidecar/verbs.mjs').then(m=>{const n=Object.keys(m.VERBS).length;if(n!==10)throw new Error('expected 10 verbs, got '+n);console.log('sidecar verbs ok:',n)})"
+
 # Required so `wrangler dev` can proxy the exposed port locally. 8080 serves the
 # Apache Guacamole HTML5 client (Tomcat); guacd (4822) and x11vnc (5901) stay
 # internal to the container. 8181 serves the alternate `neko` mode's HTTP UI +
@@ -322,3 +365,16 @@ RUN test -f /opt/ezil-sandbox-template/package.json \
 EXPOSE 8080
 EXPOSE 8181
 EXPOSE 3002
+
+# The browser sidecar's narrow automation surface (`sidecar/`, see the COPY
+# above). Reached by `sandbox.containerFetch` from the Worker's HMAC-gated
+# `POST /sandbox/:name/browser/:verb` route — NOT by `exposePort()` (which
+# would mint an unauthenticated public preview hostname for a surface that can
+# drive the user's logged-in browser) and NOT through `src/preview-bridge.ts`,
+# which accepts 3002 and 8443 by design.
+#
+# 🔴 9222 — Chrome's CDP port — is DELIBERATELY ABSENT from this file, and must
+#    stay absent. CDP is unauthenticated and total. It lives on 127.0.0.1 only
+#    (Chromium M113+ pins it there regardless of flags) and the sidecar is the
+#    only thing that talks to it.
+EXPOSE 9223
