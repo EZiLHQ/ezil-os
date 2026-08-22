@@ -107,19 +107,63 @@ describe('snapScreenMode — real device boxes, not round numbers', () => {
         }
     });
 
+    // 🔴 UPDATED 2026-08-22 with the 19.5:9 and 21:9 classes. The four
+    // expectations that changed here all changed BECAUSE the table gained an
+    // aspect it did not have; each one now wastes less picture, and the
+    // percentages below are measured, not asserted:
+    //
+    //   1170x2532  1080x1920 (17.9% wasted) -> 888x1920  (0.1%)
+    //    390x844    720x1280 (17.9%)        -> 592x1280  (0.1%)
+    //   2532x1170  1920x1080 (17.9%)        -> 1920x824  (7.1%)
+    //
+    // The phone cases matter most: every phone made since the iPhone X is
+    // ~19.5:9, and the table stopped at 9:16, so the one device class with the
+    // least screen area to spare was the one throwing ~18% of it away in
+    // bands. The new modes are also cheaper to encode than the ones they
+    // replace — 888x1920 is 1.70M pixels against 1080x1920's 2.07M.
     it.each([
         // label, requested (device pixels), expected mode
-        ['iPhone 14 Pro portrait (390x844 @3x)', 1170, 2532, '1080x1920'],
+        ['iPhone 14 Pro portrait (390x844 @3x)', 1170, 2532, '888x1920'],
         ['iPhone SE portrait (375x667 @2x)', 750, 1334, '720x1280'],
-        ['a phone at dpr 1 (390x844)', 390, 844, '720x1280'],
+        ['a phone at dpr 1 (390x844)', 390, 844, '592x1280'],
         ['iPad portrait (820x1180 @2x)', 1640, 2360, '1200x1600'],
         ['iPad landscape (1180x820 @2x)', 2360, 1640, '1024x768'],
         ['a 1080p desktop, full-bleed', 1920, 1080, '1920x1080'],
         ['a MacBook Air (1440x900 @2x)', 2880, 1800, '1440x900'],
         ['a half-screen desktop window (960x540 @1x)', 960, 540, '1280x720'],
-        ['a phone in landscape (844x390 @3x)', 2532, 1170, '1920x1080'],
+        ['a phone in landscape (844x390 @3x)', 2532, 1170, '1920x824'],
+        // An iPhone SE is 16:9, not 19.5:9 — it must NOT be dragged into the
+        // new class. This is the guard that the classes stay distinct.
+        ['iPhone SE landscape (667x375 @2x)', 1334, 750, '1280x720'],
+        // True ultrawide is its own class and keeps it: 21:9 (2.333) beats
+        // 19.5:9-transposed for a 2.389 ask.
+        ['an ultrawide monitor (3440x1440)', 3440, 1440, '1920x824'],
     ])('%s -> %s', (_label, w, h, expected) => {
         expect(key(snapScreenMode(w as number, h as number))).toBe(expected);
+    });
+
+    // 🔴 The reason the table was widened at all, as an assertion rather than
+    // a comment: no realistic device box may lose more than a tenth of its
+    // picture to letterboxing. Before this change three of these six lost
+    // 17.9-25.6%.
+    it('🔴 wastes at most 10% of the picture on any realistic device box', () => {
+        const boxes: Array<[string, number, number]> = [
+            ['iPhone 12-14 @3x', 1170, 2532],
+            ['iPhone 15 @3x', 1179, 2556],
+            ['Pixel/Galaxy @3x', 1080, 2400],
+            ['ultrawide 21:9', 3440, 1440],
+            ['MacBook Air 13', 1512, 830],
+            ['1080p desktop', 1920, 1080],
+        ];
+        const bad: string[] = [];
+        for (const [label, w, h] of boxes) {
+            const m = snapScreenMode(w, h);
+            const scale = Math.min(w / m.width, h / m.height);
+            const shown = Math.round(m.width * scale) * Math.round(m.height * scale);
+            const wasted = 100 * (1 - shown / (w * h));
+            if (wasted > 10) bad.push(`${label} ${w}x${h} -> ${key(m)} wastes ${wasted.toFixed(1)}%`);
+        }
+        expect(bad).toEqual([]);
     });
 
     it('🔴 never answers a portrait request with a landscape mode, or vice versa', () => {
@@ -227,8 +271,10 @@ describe('resolveScreenRequest — the server-side rule end to end', () => {
     });
 
     it('reports `snapped` when it chose something else', () => {
+        // 888x1920 since the 19.5:9 class was added — see the snapScreenMode
+        // block above. What this test is actually about is the `source`.
         expect(resolveScreenRequest({ width: 1170, height: 2532 })).toEqual({
-            width: 1080,
+            width: 888,
             height: 1920,
             source: 'snapped',
         });
