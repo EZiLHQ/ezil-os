@@ -109,6 +109,7 @@ function boot (): void {
     const run = sh('docker', [
         'run', '-d', '--name', CONTAINER, '--cpus=2',
         '-e', 'DESKTOP_MODE=neko',
+        '-e', 'EZIL_BROWSER_SIDECAR=on',
         '-e', 'NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=s1admin',
         '-e', 'NEKO_PASSWORD_ADMIN=s1admin',
         '-e', 'NEKO_MEMBER_MULTIUSER_USER_PASSWORD=s1user',

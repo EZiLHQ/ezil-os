@@ -988,30 +988,26 @@ EZIL_SIDECAR_LOG="${EZIL_SIDECAR_LOG:-/tmp/ezil-sidecar.log}"
 launch_browser_sidecar() {
   phase_start sidecar_launch
   # Kill switch, same vocabulary as every other flag on this stack.
-  # 🔴 DEFAULT `off` PENDING A PRODUCTION ANSWER, 2026-08-22. The sidecar
-  # shipped default-on and production stopped delivering video: v18 painted
-  # 3/3 an hour earlier, v19 returned NO VIDEO on 3 of 3 opens while the boot
-  # trace still reported `trace#desktop ok` and the display gate reported
-  # `no_watcher`. So the desktop frame loads and WebRTC never delivers a
-  # picture.
+  # 🔴 DEFAULT `on`, AND THE `off` EXPERIMENT THAT PRECEDED IT WAS INVALID.
+  # This defaulted to `off` for one deploy while production served a desktop
+  # with no video, on the theory that the sidecar was responsible. Turning it
+  # off changed nothing, and the reason it changed nothing is that the
+  # experiment never isolated the variable: `--remote-debugging-port` is passed
+  # to Chrome UNCONDITIONALLY, a few hundred lines below, and this switch only
+  # ever governed the sidecar PROCESS.
   #
-  # That correlation is strong but it is NOT yet proof: the same symptom has a
-  # prior, intermittent history in this system (13 of 19 opens black before the
-  # boot-mutex fix), and the post-fix sample that looked healthy was only three
-  # opens. Flipping the default off is therefore both the safe restore AND the
-  # experiment — if video returns, the sidecar is the cause; if it does not,
-  # the cause is the older fault and the sidecar is exonerated.
+  # The real cause was elsewhere entirely, and neither half of that guess was
+  # right. The branding overlay used to `COPY` a whole `index.html` carrying
+  # content-hashed asset names from one particular base build. Rebuilding the
+  # base — same pinned SHAs — produced different hashes, so every asset 404'd,
+  # the neko client never loaded, and `pcCount` was 0: no RTCPeerConnection was
+  # ever constructed. The overlay now edits the base's own index.html in place
+  # and asserts every referenced asset exists.
   #
-  # 🔴 WHY LOCAL TESTS COULD NOT HAVE CAUGHT THIS. The container suite passes
-  # 15/15 and proves CDP, the verbs, and that a navigation changes what the X
-  # display shows. It cannot prove media: WebRTC here is TURN-relayed and TURN
-  # is not wired locally, so "the desktop paints for a remote viewer" is only
-  # answerable in production. That gap is exactly where this landed.
-  #
-  # Turn it back on with `EZIL_BROWSER_SIDECAR=on` once the interaction between
-  # Playwright's CDP attach and neko's capture pipeline is understood. The
-  # route, the image and the tests all stay shipped either way.
-  case "$(printf '%s' "${EZIL_BROWSER_SIDECAR:-off}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')" in
+  # Left as a standing caution: a kill switch that covers part of a change is
+  # worse than none, because a null result reads as exoneration. If this switch
+  # is ever used to test the sidecar again, gate the Chrome flag with it too.
+case "$(printf '%s' "${EZIL_BROWSER_SIDECAR:-on}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')" in
     off|false|0|disabled|no)
       log "browser sidecar disabled by EZIL_BROWSER_SIDECAR — no automation surface on ${EZIL_SIDECAR_PORT} this session"
       phase_end sidecar_launch skipped
