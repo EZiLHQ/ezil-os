@@ -276,3 +276,45 @@ export const CODE_PREVIEW_TOKEN = 'code';
 export function codePortFor(mode: DesktopMode): { port: number; token: string } | null {
   return mode === 'neko' ? { port: CODE_PREVIEW_PORT, token: CODE_PREVIEW_TOKEN } : null;
 }
+
+// ── Browser sidecar port (the desktop browser's automation surface) ──────────
+//
+// `worker/sidecar/` is a small Node service baked into the neko image. It
+// connects to Chrome's CDP endpoint on container loopback and serves a FIXED
+// verb set — navigate / snapshot / click / type / get_text / screenshot /
+// console / network / wait_for — with no CDP passthrough of any kind. See
+// `worker/sidecar/README.md` and `./browser-sidecar.ts`.
+//
+// 🔴 THIS PORT HAS NO `…PortFor(mode)` FUNCTION AND NO PREVIEW TOKEN, AND
+//    THAT ABSENCE IS THE POINT. Every other port in this file gets a token
+//    because it gets an `exposePort()` — a public preview hostname that
+//    `proxyToSandbox()` raw-forwards into the container unauthenticated. That
+//    is correct for a desktop stream or a dev-server preview a user opens in
+//    an iframe. It would be catastrophic for a surface that can drive the
+//    user's logged-in browser: anyone able to construct
+//    `9223-<id>-<token>.<zone>` would own the session, and the sidecar's own
+//    narrowness would be intact and irrelevant.
+//
+//    So the sidecar is reached ONLY by `sandbox.containerFetch` from an
+//    HMAC-gated Worker route (`POST /sandbox/:name/browser/:verb`), and it is
+//    deliberately NOT carried by `preview-bridge.ts` either — that file
+//    accepts 3002 and 8443 and nothing else by design, and its narrowness is
+//    load-bearing.
+//
+// Port choice: distinct from 3000 (SDK control plane), 3002 (`APP_PREVIEW_PORT`),
+// 8080 (guacamole), 8181 (neko), 8443 (`CODE_PREVIEW_PORT`), and from 9222 —
+// which is Chrome's own CDP port and stays on container loopback forever.
+export const BROWSER_SIDECAR_PORT = 9223;
+
+/**
+ * Chrome's DevTools Protocol port inside the container.
+ *
+ * 🔴 LOOPBACK ONLY, FOREVER. Chromium M113+ forces
+ * `--remote-debugging-address` back to `127.0.0.1` regardless of what is
+ * passed — deliberate upstream hardening — and nothing here fights it. CDP is
+ * unauthenticated and total: whatever reaches it reads every page,
+ * exfiltrates the profile's cookies and runs arbitrary JS in any origin. It is
+ * never `EXPOSE`d, never `exposePort()`d, never proxied, and is named here
+ * only so the collision check above can be stated against a real number.
+ */
+export const CHROME_CDP_PORT = 9222;

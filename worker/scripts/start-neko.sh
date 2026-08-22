@@ -961,6 +961,73 @@ launch_devserver() {
   return 0
 }
 
+# ── Browser sidecar (the narrow automation surface over CDP) ─────────────────
+# A small Node service (`worker/sidecar/`, installed at /opt/ezil-sidecar) that
+# connects to Chrome's loopback-only CDP port with Playwright's
+# `chromium.connectOverCDP` and serves a FIXED verb set on 0.0.0.0:9223. It is
+# the container-external face of browser automation; CDP itself never leaves
+# loopback. There is no passthrough verb and none may be added — see
+# `worker/sidecar/README.md` and the pinned wire contract it names.
+#
+# Called from the SAME place and for the SAME reason as launch_devserver: after
+# `neko serve` has bound and the readiness verdict for this boot is already
+# decided, so nothing this does can influence whether the desktop comes up.
+# It is strictly additive — a sidecar that fails to start costs the session an
+# automation surface and nothing else, so every failure path here is a `log` +
+# `phase_end ... skipped/error` and a `return 0`.
+#
+# The entry path and port are overridable purely so a test harness can point
+# them somewhere harmless; production never sets either. The `[ -f ]` guard is
+# what keeps this inert in the stubbed-binary suites
+# (`neko-boot-devserver-isolation.test.ts` et al.), which run this real script
+# on a host where /opt/ezil-sidecar does not exist — they take the `skipped`
+# branch and start no listener.
+EZIL_SIDECAR_ENTRY="${EZIL_SIDECAR_ENTRY:-/opt/ezil-sidecar/server.mjs}"
+EZIL_SIDECAR_PORT="${EZIL_SIDECAR_PORT:-9223}"
+EZIL_SIDECAR_LOG="${EZIL_SIDECAR_LOG:-/tmp/ezil-sidecar.log}"
+launch_browser_sidecar() {
+  phase_start sidecar_launch
+  # Kill switch, same vocabulary as every other flag on this stack.
+  case "$(printf '%s' "${EZIL_BROWSER_SIDECAR:-on}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')" in
+    off|false|0|disabled|no)
+      log "browser sidecar disabled by EZIL_BROWSER_SIDECAR — no automation surface on ${EZIL_SIDECAR_PORT} this session"
+      phase_end sidecar_launch skipped
+      return 0
+      ;;
+  esac
+  if [ ! -f "$EZIL_SIDECAR_ENTRY" ]; then
+    log "browser sidecar entry $EZIL_SIDECAR_ENTRY not present — skipping (no automation surface this session)"
+    phase_end sidecar_launch skipped
+    return 0
+  fi
+  if ! command -v node >/dev/null 2>&1; then
+    log "warning: node not on PATH — browser sidecar cannot start (no automation surface this session)"
+    phase_end sidecar_launch skipped
+    return 0
+  fi
+  # Its own log file, NOT $LOG. `neko-logs.test.ts` enumerates every writer
+  # into /tmp/neko.log and requires a per-writer safety argument; the sidecar
+  # handles page content and typed input, which is exactly the class of output
+  # that should not be pooled into a route that tails a shared file. What DOES
+  # reach $LOG about the sidecar is this script's own `log` lines: start,
+  # skip, and failure — names and integers, never page data.
+  log "starting browser sidecar (node $EZIL_SIDECAR_ENTRY) on 0.0.0.0:${EZIL_SIDECAR_PORT}, CDP 127.0.0.1:${EZIL_CDP_PORT:-9222} — log $EZIL_SIDECAR_LOG"
+  EZIL_SIDECAR_PORT="$EZIL_SIDECAR_PORT" \
+  EZIL_CDP_PORT="${EZIL_CDP_PORT:-9222}" \
+    node "$EZIL_SIDECAR_ENTRY" >>"$EZIL_SIDECAR_LOG" 2>&1 &
+  local sidecar_pid=$!
+  # Tracked so teardown stops it with everything else this boot started.
+  SESSION_PID+=("$sidecar_pid")
+  if wait_tcp 127.0.0.1 "$EZIL_SIDECAR_PORT" 40; then
+    log "browser sidecar is serving on ${EZIL_SIDECAR_PORT}"
+    phase_end sidecar_launch ok
+  else
+    log "warning: browser sidecar did not open ${EZIL_SIDECAR_PORT} within timeout (non-fatal — see $EZIL_SIDECAR_LOG)"
+    phase_end sidecar_launch error
+  fi
+  return 0
+}
+
 # ── X display ────────────────────────────────────────────────────────────────
 # Neko's desktop manager connects to $DISPLAY at startup and panics if it is
 # unavailable, so the X server MUST be up before `neko serve` launches. Keyed
@@ -1910,11 +1977,39 @@ fi
 # both come up after the resize: hammering `GET /api/room/screen/shot.jpg` from
 # container start returns 1080x1920 on the very first success (t=5.18s). The
 # transient is real on the X display and invisible everywhere else.
+#
+# ── `--remote-debugging-port` (CDP) ─────────────────────────────────────────
+# 🔴 This is the ONLY controllable automation surface this browser has. Until
+# it was added, the only way to drive Chrome here was XTEST/`xdotool` — blind
+# coordinate clicking against a pixel stream (docs/NEKO-GROUND-TRUTH.md §f
+# proves XTEST *works*, not that it is usable: it has no idea what is under
+# the cursor). CDP gives the browser an addressable DOM/accessibility surface.
+#
+# 🔴 IT IS LOOPBACK-ONLY, AND THAT IS THE POINT — NOT A LIMITATION TO WORK
+#    AROUND. Chromium M113+ forces `--remote-debugging-address` back to
+#    127.0.0.1 no matter what is passed (deliberate upstream hardening after
+#    the long history of drive-by CDP takeovers). We do not pass that flag,
+#    we do not fight it, and nothing in this repo may bind CDP to 0.0.0.0.
+#    CDP is unauthenticated and TOTAL: whoever reaches port 9222 reads every
+#    page, exfiltrates this profile's cookies and runs arbitrary JS in any
+#    origin. The container-external surface is `worker/sidecar/` on 9223,
+#    which offers a fixed verb set and NO passthrough — see that directory's
+#    README. Port 9222 is never EXPOSEd, never exposePort()'d, and never
+#    proxied.
+#
+# Overridable only so a test harness can move it off a busy port; production
+# never sets it. `0` would ask Chrome to pick a random port and write it to
+# `$CHROME_PROFILE_DIR/DevToolsActivePort`, which the sidecar does not read —
+# so a non-integer/zero value here just leaves the sidecar unable to connect,
+# which it reports as `chromeConnected:false` rather than failing the boot.
+EZIL_CDP_PORT="${EZIL_CDP_PORT:-9222}"
+export EZIL_CDP_PORT
 phase_start chrome_launch
-log "supervising mandatory native browser ($CHROME_BIN) into $DISPLAY (fresh, isolated user-data-dir — no host profile; home=$CHROME_HOME_URL)"
+log "supervising mandatory native browser ($CHROME_BIN) into $DISPLAY (fresh, isolated user-data-dir — no host profile; home=$CHROME_HOME_URL; CDP on 127.0.0.1:${EZIL_CDP_PORT}, loopback-only)"
 supervise_app chromium "$NEKO_APP_MAX_RESTARTS" "$CHROME_BIN" \
   --no-sandbox \
   --test-type \
+  --remote-debugging-port="$EZIL_CDP_PORT" \
   --disable-gpu \
   --disable-dev-shm-usage \
   --no-first-run \
@@ -2671,6 +2766,14 @@ fi
 # both branches — the preview is worth having even on a boot where neko never
 # came up, and by this point it cannot influence that outcome either way.
 launch_devserver
+
+# ── Browser sidecar — same call-site reasoning as launch_devserver above ─────
+# After the readiness verdict, after the neko bind. See launch_browser_sidecar's
+# definition for why every failure path in it is non-fatal. Deliberately AFTER
+# launch_devserver rather than before: the dev server is the thing a user is
+# waiting for, the automation surface is not, and launch_devserver's own
+# `wait` is what makes a container SIGTERM in this window interruptible.
+launch_browser_sidecar
 
 # ── Fatal-failure watch (contract: dead mandatory app => unhealthy desktop) ───
 # Keep the startProcess-managed process alive for the lifetime of the desktop,
