@@ -288,6 +288,118 @@ push('GROUP 3: restoring from the taskbar returns the window to full-bleed (roun
     !! s3b && s3b.fullbleed, JSON.stringify(s3b));
 
 // ═══════════════════════════════════════════════════════════════════════════
+// GROUP 5 — THE RESTORE FLICKER: minimise must not poison the restore size
+// ═══════════════════════════════════════════════════════════════════════════
+// The defect this group exists to catch shipped, was reported by the owner as
+// "flickering when I try to minimize it or maximize it", and was invisible to
+// every check above — GROUP 3 asserts the `ezil-fullbleed` CLASS comes back
+// and never once looks at the window's SIZE.
+//
+// Mechanism. `$.fn.hideWindow` snapshots `data-orig-width/height` from the
+// window's CURRENT on-screen size at the instant it is called, and
+// `$.fn.showWindow` animates back to exactly those pixels over 0.2s. So
+// anything that resizes the window BEFORE `hideWindow` runs decides what the
+// restore animates to. `minimise_to_taskbar` used to call
+// `exit_fullpage_mode`, whose second half (`reset_window_size_and_position`)
+// does precisely that — it reset the window to its stashed pre-full-bleed box
+// first, so the snapshot recorded 960x570 instead of the real 1280x860.
+//
+// What the user then saw, measured on this bundle at this viewport:
+//
+//     t=202ms   960x570   fullbleed=false                  <- settled, WRONG size
+//     t=243ms   960x570   inline 100%/100%, fullbleed=true <- go_fullbleed's 220ms timer
+//     t=263ms  1280x860   transition=none                  <- SNAP, one frame
+//
+// A smooth 200ms animation to the wrong box, a ~40ms pause, then a jump. The
+// jump is instant rather than animated because `showWindow` tears its own
+// transition down at 250ms, 7ms after `go_fullbleed` writes `100%`.
+//
+// The assertion is therefore NOT "it ends up full-bleed" (it always did, one
+// frame later). It is: **by the time showWindow's own 0.2s transition has
+// finished, the window is ALREADY at its final size** — nothing is left to
+// jump to afterwards.
+const FLICKER_SETTLE_MS = 210;   // showWindow's transition is 0.2s
+const GO_FULLBLEED_MS = 220;     // desktop-window.js's restore timer
+
+/**
+ * One real minimise (head button, real hook) + one real restore (taskbar
+ * item), sampling the window's box across the restore. Returns the snapshot
+ * `hideWindow` recorded and the timeline.
+ */
+const minimiseRestoreTimeline = async () => {
+    await clickHeadMinimise();
+    await sleep(600);
+    return page.evaluate(async ({ settle_ms }) => {
+        const el = document.querySelector('.window[data-app="desktop"]');
+        const orig = {
+            w: Number(el.getAttribute('data-orig-width')),
+            h: Number(el.getAttribute('data-orig-height')),
+        };
+        const samples = [];
+        const t0 = performance.now();
+        document.querySelector('.taskbar-item[data-app="desktop"]')
+            .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        for ( let i = 0; i < 30; i++ ) {
+            const r = el.getBoundingClientRect();
+            samples.push({ t: performance.now() - t0, w: Math.round(r.width), h: Math.round(r.height) });
+            await new Promise((r2) => setTimeout(r2, 20));
+        }
+        const final = samples[samples.length - 1];
+        // The last sample at or before the transition should have finished.
+        const settled = samples.filter((s) => s.t <= settle_ms).pop() ?? samples[0];
+        // The largest single-frame growth AFTER the transition is over — the
+        // snap. Zero when the restore animated to the right size all along.
+        let snap = 0;
+        for ( let i = 1; i < samples.length; i++ ) {
+            if ( samples[i].t <= settle_ms ) continue;
+            snap = Math.max(snap, samples[i].w - samples[i - 1].w);
+        }
+        return { orig, final, settled, snap, viewport: { w: innerWidth, h: innerHeight } };
+    }, { settle_ms: FLICKER_SETTLE_MS });
+};
+
+const flick = await minimiseRestoreTimeline();
+push('🔴 GROUP 5 ACCEPTANCE (root cause): hideWindow snapshotted the window\'s REAL full-bleed '
+    + 'size, not the stashed pre-full-bleed box (THE BUG: exit_fullpage_mode reset geometry '
+    + 'BEFORE the snapshot, so the restore animated to 960x570)',
+    flick.orig.w === flick.viewport.w && flick.orig.h > 0,
+    JSON.stringify({ snapshot: flick.orig, viewport: flick.viewport }));
+push(`🔴 GROUP 5 ACCEPTANCE (the flicker): the window is at its FINAL size by ${FLICKER_SETTLE_MS}ms — `
+    + `already settled before go_fullbleed's ${GO_FULLBLEED_MS}ms timer, so there is nothing left to snap to`,
+    flick.settled.w === flick.final.w,
+    JSON.stringify({ settled: flick.settled, final: flick.final }));
+push('GROUP 5: no single-frame jump after the restore transition is over (the snap itself)',
+    flick.snap === 0, `largest post-transition frame growth = ${flick.snap}px`);
+push('GROUP 5: the restore still ends full-bleed (the fix did not trade the flicker for a wrong size)',
+    flick.final.w === flick.viewport.w, JSON.stringify(flick.final));
+
+// ── BOTH DIRECTIONS ────────────────────────────────────────────────────────
+// Put the defect back from the outside — make the chrome-only exit do what
+// `exit_fullpage_mode` did by appending the geometry reset — and run the SAME
+// cycle. If this stays green, the four checks above were proving nothing.
+await page.evaluate(() => {
+    const real_chrome = window.exit_fullpage_chrome;
+    window.__ezil_real_chrome = real_chrome;
+    window.exit_fullpage_chrome = (el) => {
+        real_chrome(el);
+        window.reset_window_size_and_position(el);   // the half that poisons the snapshot
+    };
+});
+const flick_mutated = await minimiseRestoreTimeline();
+push('🔴 GROUP 5 MUTATION PROOF: restoring the geometry reset on the minimise path brings the '
+    + 'flicker straight back — the window settles at the WRONG size and then snaps',
+    flick_mutated.settled.w !== flick_mutated.final.w && flick_mutated.snap > 0,
+    JSON.stringify({ settled: flick_mutated.settled, final: flick_mutated.final, snap: flick_mutated.snap }));
+await page.evaluate(() => { window.exit_fullpage_chrome = window.__ezil_real_chrome; });
+
+// Leave the window full-bleed and restored for GROUP 4, which assumes it.
+await page.waitForFunction(
+    () => document.querySelector('.window[data-app="desktop"]')?.classList.contains('ezil-fullbleed'),
+    null, { timeout: 10_000 },
+).catch(() => {});
+await sleep(300);
+
+// ═══════════════════════════════════════════════════════════════════════════
 // GROUP 4 — BOTH DIRECTIONS: delete the hook and the SAME click strands
 // ═══════════════════════════════════════════════════════════════════════════
 // This is the mutation that a name mismatch across the seam would produce:
