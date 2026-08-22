@@ -195,6 +195,21 @@ interface Env extends SandboxEnv {
   SANDBOX_RESTART?: string;
 
   /**
+   * Non-secret kill-switch for the browser-sidecar control route
+   * (`POST /sandbox/:name/browser/:verb`, see `handleBrowserSidecar` /
+   * `./browser-sidecar.ts`). Enabled by default (HMAC-gated, closed verb
+   * allowlist, reached over `containerFetch` and never exposed as a public
+   * preview hostname); set to `off`/`false`/`0`/`disabled`/`no` to
+   * hard-disable the surface (returns 404) without a code change.
+   *
+   * Independent of the in-container `EZIL_BROWSER_SIDECAR` switch
+   * (`scripts/start-neko.sh`), which decides whether the sidecar process
+   * starts at all. This one closes the door from the Worker side, which is
+   * the one an operator can turn without redeploying an image.
+   */
+  SANDBOX_BROWSER?: string;
+
+  /**
    * Non-secret kill-switch for the activity-heartbeat control route
    * (`POST /sandbox/:name/activity`, see `handleActivity` /
    * `EzilSandboxDO.recordActivity`). Enabled by default (HMAC-gated, writes
@@ -318,6 +333,22 @@ import {
   type IceServerEntry,
   type TurnCredentialsResponse,
 } from './desktop-mode';
+// The browser sidecar's Worker-side plumbing. See `./browser-sidecar.ts` for
+// why 9223 is reached by `containerFetch` from an HMAC-gated route rather than
+// by `exposePort()` (which would publish an unauthenticated hostname that can
+// drive the user's logged-in browser) or by `preview-bridge.ts` (whose
+// two-port narrowness is load-bearing).
+import {
+  BROWSER_SIDECAR_MAX_RESPONSE_BYTES,
+  BROWSER_SIDECAR_PORT,
+  BROWSER_SIDECAR_TIMEOUT_MS,
+  resolveSidecarVerb,
+  sidecarRequestBody,
+} from './browser-sidecar';
+// NOT re-exported from this module — see the `DESKTOP_MODES` note above:
+// workerd rejects a plain `const` among the entrypoint's top-level exports
+// (`Incorrect type for map entry … is not of type 'function or
+// ExportedHandler'`). Import from `./browser-sidecar` directly.
 export {
   parseBridgeHost,
   handlePreviewBootstrap,
@@ -5605,6 +5636,127 @@ async function handleTerminate(env: Env, sandboxName: string): Promise<Response>
   }
 }
 
+/**
+ * Browser-sidecar bridge — `POST /sandbox/:name/browser/:verb`.
+ *
+ * This is how port 9223 is reachable at all, and the shape is the whole point.
+ *
+ * ── Why not `exposePort(9223)` like 8181 / 3002 / 8443 ──────────────────────
+ * 🔴 Because `exposePort` mints a PUBLIC preview hostname
+ * (`<port>-<id>-<token>.<zone>`) that `proxyToSandbox()` raw-forwards into the
+ * container with **no authentication whatsoever**. That is exactly right for a
+ * desktop stream or a dev-server preview a user opens in an iframe, and
+ * exactly catastrophic for a surface that can navigate the user's logged-in
+ * browser, read every page it can see, and type into it. Anyone who could
+ * construct `9223-<id>-<token>.ezil.org` would own the session — and the
+ * sidecar's own narrowness (fixed verb set, no CDP passthrough) would remain
+ * perfectly intact and perfectly beside the point. It would also need a new
+ * `*-<token>.ezil.org` route on the production zone, i.e. a DNS-visible,
+ * deploy-affecting widening of the public surface, for a port whose only
+ * caller is a server.
+ *
+ * `preview-bridge.ts` is the other candidate and is also wrong: it accepts
+ * 3002 and 8443 and nothing else BY DESIGN, its narrowness is load-bearing,
+ * and it is a cookie-gated *browser* bridge whose caller is a page. The
+ * sidecar's caller is the MCP route in EZiL-Works.
+ *
+ * So: HMAC-gated (the SAME envelope as `/focus`, `/screen`, `/restart` and
+ * `DELETE /sandbox/:name`), one allowlisted verb per request, forwarded over
+ * `containerFetch`, which is precisely what the pinned wire contract says
+ * (`"reached_by": "sandbox.containerFetch from the EZiL-OS Worker"`).
+ *
+ * ── Two locks on the same door ──────────────────────────────────────────────
+ * `resolveSidecarVerb` refuses anything outside the allowlist BEFORE a request
+ * reaches the container, and the sidecar refuses it again on arrival. The verb
+ * is matched exactly against a fixed array and then used to BUILD the URL — it
+ * is never a path the caller composed, so `../`, `json/new` (CDP's own
+ * tab-opening endpoint) and a query string all fail to be verbs rather than
+ * arriving at 9223 as one.
+ *
+ * The response is passed through as-is. The sidecar owns its own error shape
+ * (`{ok:false,error,detail}` at HTTP 200) and its own redaction pass; there is
+ * nothing useful for this layer to add and a great deal it could accidentally
+ * remove.
+ */
+async function handleBrowserSidecar(
+  request: Request,
+  env: Env,
+  sandboxName: string,
+  rawVerb: string,
+): Promise<Response> {
+  const resolved = resolveSidecarVerb(rawVerb, 'POST');
+  if (!resolved.ok) return json({ ok: false, error: resolved.error }, 400);
+
+  let body: Record<string, unknown> = {};
+  try {
+    const raw = await request.clone().text();
+    if (raw.trim() !== '') {
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        body = parsed as Record<string, unknown>;
+      }
+    }
+  } catch {
+    return json({ ok: false, error: 'bad_request', detail: 'body is not a JSON object' }, 400);
+  }
+
+  const sandbox = openSandbox(env, sandboxName);
+  try {
+    // `health` is the sidecar's only GET; the Worker route is POST for every
+    // verb so that one HMAC envelope (which may travel in the body) covers
+    // them all uniformly.
+    //
+    // 🔴 The deadline is `withDeadline`, NOT an `AbortSignal` in the
+    // `RequestInit`. `containerFetch` is a Durable Object RPC and its init is
+    // serialised across the isolate boundary, where an `AbortSignal` throws
+    // `AbortSignal serialization is not enabled` — synchronously, before any
+    // request is made. That shipped once on `handleScreen` and took out 20 of
+    // 20 live resizes; `container-fetch-no-signal.test.ts` is the guard.
+    const upstream = await withDeadline(
+      sandbox.containerFetch(
+        resolved.url,
+        resolved.verb === 'health'
+          ? { method: 'GET' }
+          : {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: sidecarRequestBody(body),
+            },
+        BROWSER_SIDECAR_PORT,
+      ),
+      BROWSER_SIDECAR_TIMEOUT_MS,
+      `browser.${resolved.verb}`,
+    );
+
+    const text = await upstream.text();
+    if (text.length > BROWSER_SIDECAR_MAX_RESPONSE_BYTES) {
+      return json(
+        { ok: false, error: 'browser_response_too_large', detail: `${text.length} bytes` },
+        502,
+      );
+    }
+    return new Response(text, {
+      status: upstream.status,
+      headers: { 'content-type': 'application/json; charset=utf-8', ...corsHeaders },
+    });
+  } catch (err) {
+    // The overwhelmingly common cause is that nothing is listening on 9223 —
+    // `launch_browser_sidecar` skipped (no /opt/ezil-sidecar in an older
+    // image, or `EZIL_BROWSER_SIDECAR=off`), or the desktop is not up. Say
+    // that, rather than returning a bare 500 that reads as a Worker fault.
+    const message = err instanceof Error ? err.message : String(err);
+    return json(
+      {
+        ok: false,
+        error: 'browser_sidecar_unreachable',
+        detail: sanitizeErrorMessage(message),
+        port: BROWSER_SIDECAR_PORT,
+      },
+      502,
+    );
+  }
+}
+
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
 export default {
@@ -5713,6 +5865,38 @@ export default {
         return json({ ok: false, error: 'twen_disabled' }, 404);
       }
       return handleTwen(request, env, decodeURIComponent(twenMatch[1]));
+    }
+
+    const browserMatch = path.match(/^\/sandbox\/([^/]+)\/browser\/([a-z_]+)$/);
+    if (method === 'POST' && browserMatch) {
+      // The desktop browser's automation surface (`worker/sidecar/`, port
+      // 9223, reached by `containerFetch`). HMAC-gated with the SAME envelope
+      // as `/focus`/`/screen`/`/restart`/`DELETE /sandbox/:name`, and the verb
+      // is matched against a CLOSED allowlist (`BROWSER_SIDECAR_VERBS`) before
+      // anything is sent to the container — the path regex admits only
+      // `[a-z_]+`, so a verb can never be a path the caller composed.
+      //
+      // 🔴 There is deliberately no `exposePort()` for 9223 and
+      // `preview-bridge.ts` is deliberately not widened to carry it. See
+      // `handleBrowserSidecar`'s doc comment: a public preview hostname for
+      // this port would be an unauthenticated remote control of the user's
+      // logged-in browser.
+      //
+      // Operators can hard-disable the ROUTE without a code change via
+      // `SANDBOX_BROWSER=off` — independent of the in-container
+      // `EZIL_BROWSER_SIDECAR` switch, which decides whether the sidecar
+      // process starts at all.
+      if (diagDisabled(env.SANDBOX_BROWSER)) {
+        return json({ ok: false, error: 'browser_sidecar_disabled' }, 404);
+      }
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      return handleBrowserSidecar(
+        request,
+        env,
+        decodeURIComponent(browserMatch[1]),
+        browserMatch[2],
+      );
     }
 
     const focusMatch = path.match(/^\/sandbox\/([^/]+)\/focus$/);

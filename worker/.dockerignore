@@ -1,0 +1,10 @@
+# The sidecar's dependencies are installed INSIDE the image (`npm install
+# --omit=dev` in the Dockerfile), from the version pinned in
+# `sidecar/package.json`. A host `node_modules/` copied in would shadow that
+# with whatever a developer happened to have — including, for a native
+# dependency, a build for the wrong architecture. The image must install its
+# own.
+sidecar/node_modules
+# Never needed in the image, and `node_modules` here is ~hundreds of MB of
+# Worker-side dependencies that the container has no use for.
+node_modules
