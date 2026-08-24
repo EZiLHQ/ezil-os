@@ -713,6 +713,38 @@ export async function openDesktopWindow (ctx = {}) {
         view: typeof window !== 'undefined' ? window : null,
     });
 
+    /**
+     * Ask the server what the desktop's screen ACTUALLY is, and fold the answer
+     * back into both the fit and the controller's dedup.
+     *
+     * Never throws, never awaits on a caller's behalf, and never reports a
+     * failure to the user: every caller is on a path (a restore) where the
+     * right behaviour on "could not check" is to carry on with the belief
+     * already held. See `screen_ctl.reconcile` for why holding a belief that
+     * cannot be contradicted is the defect this closes.
+     */
+    let reconcile_in_flight = false;
+    function reconcile_screen (why) {
+        if ( disposed || reconcile_in_flight ) return;
+        if ( typeof session.getScreen !== 'function' ) return;   // older server bundle
+        reconcile_in_flight = true;
+        Promise.resolve(session.getScreen(computer.id))
+            .then((res) => {
+                if ( disposed || ! res || res.ok !== true ) return;
+                const { changed } = screen_ctl.reconcile(res.width, res.height);
+                if ( ! changed ) return;
+                // The desktop is a different shape than this side believed, so
+                // the letterbox it is currently drawing is wrong. Fix the fit
+                // immediately — this costs nothing and is the visible half.
+                console.info(`[${PHASE}] screen reconciled to ${res.width}x${res.height} (${why})`);
+                stream.w = res.width;
+                stream.h = res.height;
+                refit();
+            })
+            .catch(() => {})
+            .finally(() => { reconcile_in_flight = false; });
+    }
+
     // ── keep the stream's box at the stream's aspect ───────────────────────
     // ADDED BY EZIL 2026-08-08. See the `fit_stream` block at the top of this
     // file for what this does and, more importantly, for the one thing it
@@ -1853,6 +1885,28 @@ export async function openDesktopWindow (ctx = {}) {
             // restores `data-is_fullpage` (which exit_fullpage_mode removed)
             // so a later close() still knows to bring the taskbar back.
             setTimeout(() => go_fullbleed('restored from the taskbar'), 220);
+            // 🔴 And RECONCILE. A restore is the one moment this side knows it
+            // may have been away while something else changed the desktop
+            // underneath it — a troubleshoot restart resets the container to
+            // 1920x1080 and sets no `NEKO_SCREEN`, and a warm container can be
+            // handed to a window that never sized it. Before this the shell had
+            // no way to find out: `stream` is written only by the boot
+            // read-back and by a successful resize, and the controller's dedup
+            // is seeded with the boot ASK, so every later measurement was
+            // dropped as settled against a belief that had stopped being true
+            // and the picture stayed letterboxed to an aspect the stream did
+            // not have.
+            //
+            // Deliberately a READ (`getScreen`), not a re-ask. A set restarts
+            // the capture pipeline; an observation costs two loopback calls
+            // inside a container that is already running, which is what makes
+            // it affordable on a path a user can trigger repeatedly.
+            //
+            // Fire-and-forget and completely silent on failure: a restore must
+            // never wait on the network, and a reconcile that did not answer
+            // leaves the previous belief in place — stale, but strictly better
+            // than a guess.
+            reconcile_screen('restored from the taskbar');
         }
         was_minimized = now_minimized;
     });

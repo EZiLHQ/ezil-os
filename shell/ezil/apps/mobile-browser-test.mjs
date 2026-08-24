@@ -573,12 +573,51 @@ async function defocusDesktopByTapping (page) {
     const settings = await at('.window[data-app="desktop"] .dashboard-app-drawer-settings');
     if ( ! settings ) return 'no Settings button in the drawer';
     await page.touchscreen.tap(settings[0], settings[1]);
-    await sleep(1200);
+    // 🔴 WAIT FOR THE WINDOW, do not sleep at it. This used to be
+    // `sleep(1200)` / `sleep(900)`, and the pair made this whole scenario
+    // FLAKY: measured over three runs each, the fixed sleeps produced 2/3 on
+    // `main` and 1/3 on a branch that had not touched focus at all. When the
+    // close animation had not settled inside 900ms the desktop was still
+    // `window-active`, the very next check — "the iframe is
+    // pointer-events:none while unfocused" — failed, and the failure looked
+    // exactly like a real focus regression. A precondition that fails at
+    // random is worse than no precondition: it spends the reader's trust on
+    // noise and hides the run where something genuinely broke.
+    if ( ! await waitFor(page, () => !! document.querySelector('.window[data-app="settings"]'), 4000) ) {
+        return 'Settings never opened';
+    }
     const close = await at('.window[data-app="settings"] .window-head > .window-close-btn');
     if ( ! close ) return 'Settings did not open, or has no close control';
     await page.touchscreen.tap(close[0], close[1]);
-    await sleep(900);
+    if ( ! await waitFor(page, () => ! document.querySelector('.window[data-app="settings"]'), 4000) ) {
+        return 'Settings never closed';
+    }
+    // The condition the caller actually depends on, waited for explicitly and
+    // reported as a NAMED failure if it never arrives — so "the tap round trip
+    // did not defocus" can never again be read as "focus is broken".
+    if ( ! await waitFor(page, () => {
+        const el = document.querySelector('.window[data-app="desktop"]');
+        return !! el && ! el.classList.contains('window-active');
+    }, 4000) ) {
+        return 'the Browser was still focused after closing Settings';
+    }
     return null;
+}
+
+/**
+ * Poll a predicate IN THE PAGE until it holds or the budget runs out.
+ *
+ * `page.waitForFunction` would do this, but it is not available on every
+ * Playwright surface this file runs against and it throws on timeout, where
+ * every caller here wants a boolean it can turn into a named failure string.
+ */
+async function waitFor (page, fn, timeoutMs = 4000, stepMs = 50) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        if ( await page.evaluate(fn) ) return true;
+        if ( Date.now() >= deadline ) return false;
+        await sleep(stepMs);
+    }
 }
 
 /** Tap the centre of the stream and report what arrived INSIDE the frame. */

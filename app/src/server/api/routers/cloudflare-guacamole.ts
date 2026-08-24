@@ -62,6 +62,7 @@ import {
     requestGuacamoleFocusApp,
     requestGuacamolePreview,
     requestGuacamoleSandboxTerminate,
+    readGuacamoleScreen,
     requestGuacamoleScreen,
     resolveCloudflareGuacamoleConfig,
     resolveScreenRequest,
@@ -949,6 +950,60 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
      * container, and a client that retried it would restart the capture
      * pipeline in a loop for nothing.
      */
+    /**
+     * Read the LIVE X screen without changing it.
+     *
+     * A `query`, not a `mutation`, because it changes nothing — and that is the
+     * whole value. Until this existed the shell could only learn the desktop's
+     * size by SETTING it, and a set restarts the capture pipeline, so the shell
+     * simply never reconciled: after a troubleshoot restart (which resets the
+     * container to 1920x1080) or on a warm container, its dedup dropped every
+     * measurement against a belief that was already false, and the picture
+     * stayed letterboxed to an aspect the stream did not have.
+     *
+     * Same ownership gate as `setScreen` — `assertOwnedComputer` — because a
+     * screen size is still a fact about someone else's machine.
+     */
+    getScreen: protectedProcedure
+        .input(z.object({ computerId: z.string().uuid() }))
+        .query(async ({ ctx, input }) => {
+            await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+
+            const correlationId = newCorrelationId();
+            const config = resolveCloudflareGuacamoleConfig();
+            if (!config.isConfigured) {
+                return {
+                    ok: false as const,
+                    error: { code: 'NOT_FOUND' as const, message: 'provider_not_configured' },
+                    correlationId,
+                };
+            }
+
+            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+            const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
+            const result = await readGuacamoleScreen(config, hmacSecret, sandboxName, correlationId);
+
+            if (!result.ok) {
+                return {
+                    ok: false as const,
+                    error: { code: result.code, message: result.message },
+                    correlationId,
+                };
+            }
+
+            // `source: 'observed'` — deliberately NOT one of the setter's
+            // `requested`/`snapped`. Nothing was requested, so neither word is
+            // true here, and reusing one would let a caller believe an ask had
+            // been honoured when no ask was made.
+            return {
+                ok: true as const,
+                width: result.width,
+                height: result.height,
+                source: 'observed' as const,
+                correlationId,
+            };
+        }),
+
     setScreen: protectedProcedure
         .input(
             z.object({

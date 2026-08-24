@@ -48,6 +48,37 @@ async function shellCaller(req: Request) {
     return { ctx, caller: appRouter.createCaller(ctx) };
 }
 
+/**
+ * `GET /api/shell/screen?computerId=…` — OBSERVE the live screen, change
+ * nothing.
+ *
+ * The shell calls this to reconcile a belief it may no longer be entitled to.
+ * It is on the same path as the POST and behind the same ownership gate; the
+ * only difference is that it costs a read instead of a capture-pipeline
+ * restart, which is exactly why the shell can afford to call it on a restore.
+ *
+ *   GET ?computerId=…
+ *     -> 200 { ok: true,  width, height, source: 'observed', correlationId }
+ *     -> 200 { ok: false, error: { code, message }, correlationId }
+ *
+ * `computerId` travels in the query string rather than a body because a GET
+ * with a body is a request many intermediaries are free to drop.
+ */
+export async function GET(req: Request) {
+    try {
+        const { ctx, caller } = await shellCaller(req);
+        if (!ctx.user) return shellUnauthenticated();
+
+        const computerId = new URL(req.url).searchParams.get('computerId') ?? '';
+        // Cast, not re-validation — the procedure's `z.string().uuid()` is the
+        // single gate, same rule the POST follows one function below.
+        const result = await caller.cloudflareGuacamole.getScreen({ computerId });
+        return shellJson(result);
+    } catch (err) {
+        return shellErrorResponse(err, 'GET /api/shell/screen');
+    }
+}
+
 export async function POST(req: Request) {
     try {
         // Authenticate BEFORE parsing the body — an unauthenticated caller

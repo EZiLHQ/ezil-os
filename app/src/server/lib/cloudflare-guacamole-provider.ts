@@ -2609,6 +2609,97 @@ export type GuacamoleScreenResult =
  * a size outside the framebuffer it started with (measured: HTTP 422, display
  * unchanged), and no number of retries grows a framebuffer.
  */
+/**
+ * `GET /sandbox/:name/screen` — READ the live X screen without changing it.
+ *
+ * The read half of `requestGuacamoleScreen`, and the reason it exists is worth
+ * stating plainly: until this, the only way for the shell to learn the
+ * desktop's real size was to SET it, and setting restarts the capture
+ * pipeline. So the shell never reconciled. `shell/ezil/apps/desktop-window.js`
+ * writes its `stream` size exactly twice — once from the boot read-back, once
+ * from a successful live resize — and `createScreenController` seeds its
+ * dedup with the boot ASK. Both are correct in isolation. Together they mean a
+ * screen that changed WITHOUT the shell asking can never be discovered:
+ *
+ *   - the Worker's troubleshoot restart resets the container to 1920x1080 and
+ *     deliberately sets no `NEKO_SCREEN`,
+ *   - a warm container gets handed to a window that never asked for its size,
+ *
+ * and every subsequent measurement is then dropped as already-settled against
+ * a belief that is false. The picture stays letterboxed to an aspect the
+ * stream does not have until the window is closed and reopened. That is the
+ * stream-misalignment symptom, and a cheap read is what ends it.
+ *
+ * Shorter timeout than the setter (8s vs 20s) because there is no pipeline
+ * restart to wait for — this is two loopback calls inside a running container.
+ * A reconcile that has not answered in 8s has failed, and the caller's correct
+ * response is to keep the belief it already had, not to hang.
+ */
+export async function readGuacamoleScreen(
+    config: CloudflareGuacamoleConfig,
+    hmacSecret: string,
+    sandboxName: string,
+    correlationId: string = newCorrelationId(),
+): Promise<GuacamoleScreenResult> {
+    if (!config.isConfigured) {
+        return { ok: false, code: 'NOT_FOUND', message: 'provider_not_configured' };
+    }
+
+    const token = mintSandboxPreviewToken(hmacSecret);
+    const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/screen`;
+
+    try {
+        const res = await fetch(endpoint, {
+            method: 'GET',
+            headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: 'application/json',
+                [CORRELATION_HEADER]: correlationId,
+            },
+            signal: AbortSignal.timeout(8_000),
+        });
+
+        const text = await res.text().catch(() => '');
+        let data: { ok?: unknown; error?: unknown; detail?: unknown; width?: unknown; height?: unknown } = {};
+        try {
+            data = text ? (JSON.parse(text) as typeof data) : {};
+        } catch {
+            // Non-JSON (an edge error page). The raw text still reaches the log.
+        }
+
+        if (res.ok && data.ok === true) {
+            // 🔴 A read that cannot name a size is a FAILURE, not a default.
+            // The entire point is to replace a stale belief with the truth;
+            // answering with 1920x1080 because nothing came back would replace
+            // it with a different untruth the caller cannot distinguish.
+            if (!Number.isInteger(data.width) || !Number.isInteger(data.height)) {
+                return { ok: false, code: 'UPSTREAM', message: 'worker reported a screen it did not name' };
+            }
+            // `verified: true` unconditionally: unlike the setter there is no
+            // ask to compare against and no downgrade to express — an
+            // observation either happened or it did not.
+            return { ok: true, width: data.width as number, height: data.height as number, verified: true };
+        }
+
+        const workerError = typeof data.error === 'string' ? data.error : '';
+        const workerDetail = typeof data.detail === 'string' ? data.detail : '';
+        return {
+            ok: false,
+            code: classifyScreenFailure(res.status, workerError),
+            message: [workerError || `worker_http_${res.status}`, workerDetail]
+                .filter(Boolean)
+                .join(': ')
+                .slice(0, 200),
+        };
+    } catch (err) {
+        const name = (err as { name?: string })?.name ?? '';
+        if (name === 'TimeoutError' || name === 'AbortError') {
+            return { ok: false, code: 'TIMEOUT', message: 'screen read timed out' };
+        }
+        return { ok: false, code: 'UPSTREAM', message: (err as { message?: string })?.message ?? 'fetch failed' };
+    }
+}
+
 export async function requestGuacamoleScreen(
     config: CloudflareGuacamoleConfig,
     hmacSecret: string,
