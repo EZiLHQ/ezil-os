@@ -2677,9 +2677,97 @@ verify_browser_frame || true
 # and `NEKO_CAPTURE_VIDEO_IDS` because setting `capture.video.pipelines` does
 # not implicitly populate `capture.video.ids` — an empty id list would leave
 # no video stream selectable at all.
-NEKO_CAPTURE_VIDEO_IDS="${NEKO_CAPTURE_VIDEO_IDS:-main}"
-NEKO_CAPTURE_VIDEO_PIPELINES="${NEKO_CAPTURE_VIDEO_PIPELINES:-{\"main\":{\"fps\":\"15\",\"gst_encoder\":\"vp8enc\",\"gst_params\":{\"target-bitrate\":\"round(3072 * 650)\",\"cpu-used\":\"4\",\"end-usage\":\"cbr\",\"threads\":\"2\",\"deadline\":\"1\",\"undershoot\":\"95\",\"buffer-size\":\"(3072 * 4)\",\"buffer-initial-size\":\"(3072 * 2)\",\"buffer-optimal-size\":\"(3072 * 3)\",\"keyframe-max-dist\":\"25\",\"min-quantizer\":\"4\",\"max-quantizer\":\"20\"}}}}"
+# ── ADAPTIVE QUALITY: a tier ladder, and an estimator that starts PASSIVE ────
+#
+# 🔴 THREE PIPELINES, NOT ONE — and this costs nothing while nobody is on the
+# lower ones. The pinned binary's `StreamSinkManagerCtx` starts a pipeline on
+# its FIRST listener and stops it on its last ("first listener, starting" /
+# "last listener, stopping" are both strings in the binary), so a declared
+# tier with no viewer is not encoding. Declaring the ladder is what makes
+# adaptation POSSIBLE; it is not itself a cost.
+#
+# The ladder, all vp8/cpu-used=4/threads=2 as before — only the bitrate base
+# and (at the bottom) the frame rate move, per the trade-off reasoned above:
+#
+#   main  base 3072  15fps  ~2.0 Mbit/s   unchanged; the default, first in the
+#                                         id list, and what every session that
+#                                         never degrades keeps using
+#   sd    base 1536  15fps  ~1.0 Mbit/s   half the bitrate at the SAME frame
+#                                         rate — motion stays smooth and the
+#                                         picture softens, which is the right
+#                                         trade for a desktop full of text
+#   lo    base  768  12fps  ~0.5 Mbit/s   the floor: only here does fps drop,
+#                                         because below ~0.5 Mbit/s at 15fps
+#                                         vp8 spends its whole budget on
+#                                         keyframes and the picture pulses
+#
+# 🔴 WHY THE SERVER DECIDES AND NOT THE CLIENT. The binary is neko v3 and has
+# the full pion GCC send-side estimator and `WebRTCPeerCtx.SetVideo` /
+# `Track.SetStream` / `MoveListenerTo` compiled in, so a tier switch swaps the
+# sample source behind the EXISTING RTP track — no renegotiation, no client
+# message. That matters because the client bundle shipped in this image is the
+# v2 LEGACY client: `getStats` appears zero times in all four of its JS
+# bundles, it has no `signal/video`, and the v2<->v3 legacy bridge the server
+# runs has no v2 message that could carry a quality request. A client-side
+# quality picker is therefore not available without replacing /var/www, and it
+# is also not NEEDED — the server can do the whole job without the client ever
+# learning it happened.
+#
+# 🔴 THE ESTIMATOR SHIPS IN PASSIVE MODE. `NEKO_WEBRTC_ESTIMATOR_PASSIVE=true`
+# means it estimates and logs and switches NOTHING. That is not timidity, it
+# is the only honest first step on THIS platform: GCC infers congestion from
+# DELAY GRADIENT, and Cloudflare Containers have no UDP, so every session is
+# relayed over TCP TURN (docs/PLATFORM-NOTES.md §6; SANDBOX_NEKO_ICE_POLICY is
+# "relay"). TCP head-of-line blocking manufactures delay that is not
+# congestion. An estimator that misreads that would drop a user's picture to
+# fix a problem that does not exist, and a steady picture beats a wrongly
+# degraded one. Passive + debug is how we find out which it is, from real
+# sessions, before anything is allowed to act.
+#
+# To go active after reading those logs, set NEKO_WEBRTC_ESTIMATOR_PASSIVE=false
+# per-deployment — no image rebuild. The defaults left alone here are the
+# binary's own: 2s read interval, 12s stable before an upgrade, 6s unstable and
+# 24s stalled before a downgrade, 0.15 diff threshold.
+NEKO_CAPTURE_VIDEO_IDS="${NEKO_CAPTURE_VIDEO_IDS:-main,sd,lo}"
+# 🔴 NOT `${VAR:-<json>}`. That is how this was first written and it SILENTLY
+# TRUNCATED: bash matches braces inside a `${...}` expansion, so a default
+# value that is itself brace-heavy JSON ends early. With three tiers the
+# expansion produced only `{"main":...}` — valid JSON, one tier — while
+# NEKO_CAPTURE_VIDEO_IDS happily became `main,sd,lo`. The container then
+# booted "successfully" with two of its three advertised streams not existing
+# at all, and the only symptom would have been a switch to a stream that was
+# never declared. Single-quoted heredoc-free assignment behind an explicit
+# emptiness test has neither problem, and drops the backslash-escaping too.
+if [ -z "${NEKO_CAPTURE_VIDEO_PIPELINES:-}" ]; then
+  NEKO_CAPTURE_VIDEO_PIPELINES='{"main":{"fps":"15","gst_encoder":"vp8enc","gst_params":{"target-bitrate":"round(3072 * 650)","cpu-used":"4","end-usage":"cbr","threads":"2","deadline":"1","undershoot":"95","buffer-size":"(3072 * 4)","buffer-initial-size":"(3072 * 2)","buffer-optimal-size":"(3072 * 3)","keyframe-max-dist":"25","min-quantizer":"4","max-quantizer":"20"}},"sd":{"fps":"15","gst_encoder":"vp8enc","gst_params":{"target-bitrate":"round(1536 * 650)","cpu-used":"4","end-usage":"cbr","threads":"2","deadline":"1","undershoot":"95","buffer-size":"(1536 * 4)","buffer-initial-size":"(1536 * 2)","buffer-optimal-size":"(1536 * 3)","keyframe-max-dist":"25","min-quantizer":"4","max-quantizer":"20"}},"lo":{"fps":"12","gst_encoder":"vp8enc","gst_params":{"target-bitrate":"round(768 * 650)","cpu-used":"4","end-usage":"cbr","threads":"2","deadline":"1","undershoot":"95","buffer-size":"(768 * 4)","buffer-initial-size":"(768 * 2)","buffer-optimal-size":"(768 * 3)","keyframe-max-dist":"25","min-quantizer":"4","max-quantizer":"20"}}}'
+fi
+
+# 🔴 AND THEN CHECK IT, because "the variable is set" is not "the value is
+# right" — this exact bug set both variables and was wrong. Every id must name
+# a pipeline that actually exists; an id without one is a stream neko can be
+# asked to switch to and cannot produce.
+_ids_ok=1
+_IFS_save=$IFS; IFS=','
+for _vid in $NEKO_CAPTURE_VIDEO_IDS; do
+  case "$NEKO_CAPTURE_VIDEO_PIPELINES" in
+    *"\"$_vid\":"*) ;;
+    *) echo "[ezil-boot] FATAL: video id '$_vid' has no pipeline in NEKO_CAPTURE_VIDEO_PIPELINES" >&2; _ids_ok=0 ;;
+  esac
+done
+IFS=$_IFS_save
+if [ "$_ids_ok" != "1" ]; then
+  echo "[ezil-boot] ids=$NEKO_CAPTURE_VIDEO_IDS" >&2
+  echo "[ezil-boot] refusing to start neko with a video id that names no pipeline." >&2
+  exit 1
+fi
+unset _ids_ok _vid _IFS_save
+# The bandwidth estimator. Compiled in, and OFF at the binary's own default —
+# these three lines are what turn it on, observing only.
+NEKO_WEBRTC_ESTIMATOR_ENABLED="${NEKO_WEBRTC_ESTIMATOR_ENABLED:-true}"
+NEKO_WEBRTC_ESTIMATOR_PASSIVE="${NEKO_WEBRTC_ESTIMATOR_PASSIVE:-true}"
+NEKO_WEBRTC_ESTIMATOR_DEBUG="${NEKO_WEBRTC_ESTIMATOR_DEBUG:-true}"
 export NEKO_CAPTURE_VIDEO_IDS NEKO_CAPTURE_VIDEO_PIPELINES
+export NEKO_WEBRTC_ESTIMATOR_ENABLED NEKO_WEBRTC_ESTIMATOR_PASSIVE NEKO_WEBRTC_ESTIMATOR_DEBUG
 log "video encoder: vp8 software, 1920x1080, 15fps, cpu-used=4, threads=2, ~2.0Mbps (re-tuned for standard-3's 2 vCPU now that code-server replaced the second Electron-class renderer; see start-neko.sh comment for full precedence/justification)"
 
 # ── Neko application server (HTTP UI + WebSocket signaling) ────────────────────

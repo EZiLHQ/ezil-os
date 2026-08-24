@@ -1306,6 +1306,117 @@ function fakeNekoLogExec(raw: string) {
   };
 }
 
+// ── /sandbox/:name/browser/:verb ─────────────────────────────────────────────
+// The desktop browser's automation surface — the thing an MCP client drives.
+// It had NO route-level tests at all, which is how the defect below survived:
+// nine of the ten verbs worked, so everything an agent DOES was fine, and the
+// only broken one was the liveness probe a client calls FIRST.
+describe('/sandbox/:name/browser/:verb — the agent-facing surface', () => {
+  const browserUrl = (verb: string) =>
+    `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/browser/${verb}`;
+
+  /** A container that answers anything on 9223 with a recognisable body. */
+  function fakeSidecar() {
+    return fakeSandboxNamespace({
+      containerResponse: () =>
+        new Response(JSON.stringify({ ok: true, chromeConnected: true, cdpUrl: 'http://127.0.0.1:9222' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+    }) as { binding: unknown; calls: CallLog };
+  }
+
+  it('REJECTS an unsigned request and never reaches the container', async () => {
+    const { binding, calls } = fakeSidecar();
+    const res = await worker.fetch(
+      new Request(browserUrl('snapshot'), { method: 'POST', body: '{}' }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+    expect(calls.containerFetch.length).toBe(0);
+  });
+
+  it('🔴 GET /browser/health reaches the sidecar — it is the ONLY GET verb and it was unreachable', async () => {
+    // The defect: `BROWSER_SIDECAR_GET_VERBS = ['health']` and
+    // `resolveSidecarVerb` enforces the method, but only a POST route was
+    // registered. So the contract's single GET verb answered
+    // `browser_verb_method_mismatch: 'health' is GET, not POST` and there was
+    // no other door to reach it through.
+    const { binding, calls } = fakeSidecar();
+    const res = await worker.fetch(
+      new Request(browserUrl('health'), {
+        headers: { authorization: `Bearer ${await mintToken(SECRET)}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    expect(calls.containerFetch.length).toBeGreaterThan(0);
+    expect(calls.containerFetch[calls.containerFetch.length - 1]!.url).toContain('/health');
+  });
+
+  it('POST /browser/health is still refused — admitting GET must not make the verb take both', async () => {
+    const { binding } = fakeSidecar();
+    const res = await worker.fetch(
+      new Request(browserUrl('health'), {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken(SECRET)}` },
+        body: '{}',
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(await res.json())).toContain('browser_verb_method_mismatch');
+  });
+
+  it('🔴 GET on an ACTION verb is refused — admitting GET to the route did not widen the surface', async () => {
+    // The direction that matters. If this ever passes, a GET — cached,
+    // prefetched, followed by a crawler — could click inside the user's
+    // logged-in browser.
+    for (const verb of ['click', 'type', 'navigate']) {
+      const { binding, calls } = fakeSidecar();
+      const res = await worker.fetch(
+        new Request(browserUrl(verb), {
+          headers: { authorization: `Bearer ${await mintToken(SECRET)}` },
+        }),
+        { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+      );
+      expect(res.status).toBe(400);
+      expect(calls.containerFetch.length).toBe(0);
+    }
+  });
+
+  it('a verb outside the allowlist never reaches the container, by either method', async () => {
+    for (const [verb, method] of [['evaluate', 'POST'], ['cdp', 'GET'], ['raw', 'POST']] as const) {
+      const { binding, calls } = fakeSidecar();
+      const res = await worker.fetch(
+        new Request(browserUrl(verb), {
+          method,
+          headers: { authorization: `Bearer ${await mintToken(SECRET)}` },
+          ...(method === 'POST' ? { body: '{}' } : {}),
+        }),
+        { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+      );
+      expect(res.status).toBe(400);
+      expect(calls.containerFetch.length).toBe(0);
+    }
+  });
+
+  it('SANDBOX_BROWSER=off hard-disables the whole surface, GET included', async () => {
+    for (const init of [{ method: 'POST', body: '{}' }, {}] as const) {
+      const { binding, calls } = fakeSidecar();
+      const res = await worker.fetch(
+        new Request(browserUrl('health'), {
+          ...init,
+          headers: { authorization: `Bearer ${await mintToken(SECRET)}` },
+        }),
+        { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_BROWSER: 'off' },
+      );
+      expect(res.status).toBe(404);
+      expect(calls.containerFetch.length).toBe(0);
+    }
+  });
+});
+
 describe('POST /sandbox/:name/logs is HMAC-gated and never returns a raw container line', () => {
   const LOGS_URL = `https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/logs`;
 
