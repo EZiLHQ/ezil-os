@@ -936,6 +936,63 @@ export function screenEndpoint () {
  * @returns {Promise<{ok:true, width:number, height:number, source:string}
  *                 | {ok:false, code:string, message?:string}>}
  */
+/**
+ * `GET <endpoints.screen>?computerId=…` — what the desktop's screen ACTUALLY
+ * is right now, without changing it.
+ *
+ * 🔴 WHY A READ IS NEEDED AT ALL. `setScreen` is the only other way to learn
+ * this, and it costs a capture-pipeline restart. That made the shell unable to
+ * correct itself: `desktop-window.js` writes its `stream` size twice (boot
+ * read-back, successful resize) and the controller seeds its dedup with the
+ * boot ask, so when the container's screen moves WITHOUT the shell asking —
+ * a troubleshoot restart resets it to 1920x1080; a warm container is handed to
+ * a window that never sized it — every later measurement is dropped as settled
+ * against a belief that is false, and the picture stays letterboxed to an
+ * aspect the stream does not have.
+ *
+ * NEVER THROWS, same closed code set as `setScreen`. A failed reconcile must
+ * leave the caller exactly as it was: the belief it holds may be stale, but a
+ * stale belief is strictly better than a guess, and better than a throw on a
+ * restore path.
+ *
+ * @returns {Promise<{ok:true, width:number, height:number, source:string}
+ *                 | {ok:false, code:string, message?:string}>}
+ */
+export async function getScreen (computerId, timeoutMs = SCREEN_TIMEOUT_MS) {
+    if ( ! computerId ) {
+        return { ok: false, code: 'BAD_REQUEST', message: 'No computer.' };
+    }
+    const url = screenEndpoint();
+    if ( ! url ) {
+        return { ok: false, code: 'UNSUPPORTED', message: "Resizing isn't available in this deployment." };
+    }
+
+    const sep = url.includes('?') ? '&' : '?';
+    const res = await request(`${url}${sep}computerId=${encodeURIComponent(computerId)}`, { method: 'GET', timeoutMs });
+    if ( ! res.ok ) {
+        if ( res.code === 'TIMEOUT' ) return { ok: false, code: 'TIMEOUT', message: res.message };
+        if ( res.code === 'UNAUTHORIZED' ) return { ok: false, code: 'NOT_FOUND', message: res.message };
+        // A deployment whose POST exists but whose GET does not is a real
+        // state — the two shipped in different releases. UNSUPPORTED so the
+        // caller stops asking rather than retrying a route that will not
+        // appear mid-session.
+        if ( res.status === 404 || res.status === 405 ) {
+            return { ok: false, code: 'UNSUPPORTED', message: res.message };
+        }
+        return { ok: false, code: 'UPSTREAM', message: res.message };
+    }
+
+    const data = res.data ?? {};
+    if ( data.ok !== true ) {
+        const code = typeof data.error?.code === 'string' ? data.error.code : 'UPSTREAM';
+        return { ok: false, code, message: data.error?.message };
+    }
+    if ( ! Number.isInteger(data.width) || ! Number.isInteger(data.height) ) {
+        return { ok: false, code: 'UPSTREAM', message: 'The server reported a screen it did not name.' };
+    }
+    return { ok: true, width: data.width, height: data.height, source: data.source ?? 'observed' };
+}
+
 export async function setScreen (computerId, width, height, timeoutMs = SCREEN_TIMEOUT_MS) {
     if ( ! computerId || ! Number.isInteger(width) || ! Number.isInteger(height) ) {
         return { ok: false, code: 'BAD_REQUEST', message: 'No computer, or nothing measurable.' };
@@ -985,7 +1042,7 @@ export default {
     previewUrl, focusApp,
     restartEndpoint, restartDesktop,
     activityEndpoint, reportActivity, releaseDesktop,
-    screenEndpoint, setScreen,
+    screenEndpoint, setScreen, getScreen,
     withWakeAndOneRetry,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,

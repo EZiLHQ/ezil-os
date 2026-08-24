@@ -1174,6 +1174,105 @@ describe('POST /sandbox/:name/screen is HMAC-gated and validates before touching
   });
 });
 
+// ── GET /sandbox/:name/screen ────────────────────────────────────────────────
+// The READ half of the same path. It exists because without it the shell can
+// only learn the desktop's size by CHANGING it, and a change restarts the
+// capture pipeline — so the shell never reconciled, and a desktop whose size
+// moved out of band (a troubleshoot restart resets the container to 1920x1080
+// and sets no NEKO_SCREEN; a warm container is handed to a window that never
+// asked for its size) stayed letterboxed to an aspect the stream did not have
+// until the window was closed and reopened.
+//
+// These assert the three properties that make it safe to call on a hot path:
+// it is gated exactly like the POST, it NEVER writes, and an unreadable screen
+// is an error rather than a plausible-looking default.
+describe('GET /sandbox/:name/screen observes without changing anything', () => {
+  it('REJECTS an unsigned request with 401 and never reaches the container', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+    expect(calls.containerFetch.length).toBe(0);
+  });
+
+  it('rejects a token signed with the WRONG secret', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+        headers: { authorization: `Bearer ${await mintToken('some-other-secret')}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(401);
+    expect(calls.containerFetch.length).toBe(0);
+  });
+
+  it('🔴 signed, it reports the READ-BACK and issues NO POST to /api/room/screen', async () => {
+    // The read-back deliberately differs from the mode table's default, so a
+    // handler that answered from a constant instead of from the container
+    // could not pass.
+    const { binding, calls } = fakeNekoScreenSandbox(
+      () => new Response('should never be called', { status: 500 }),
+      200,
+      () => new Response(JSON.stringify({ width: 888, height: 1920 }), { status: 200 }),
+    );
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+        headers: { authorization: `Bearer ${await mintToken(SECRET)}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      sandboxId: SANDBOX_NAME,
+      width: 888,
+      height: 1920,
+    });
+
+    // 🔴 THE ASSERTION THAT MATTERS. A read that resized would be worse than
+    // no read at all: it would restart the capture pipeline every time the
+    // shell reconciled, which is the exact cost the route exists to avoid.
+    const screenPosts = calls.containerFetch.filter(
+      (c) => c.url.includes('/api/room/screen') && (c as { method?: string }).method === 'POST',
+    );
+    expect(screenPosts).toEqual([]);
+  });
+
+  it('🔴 answers `screen_unreadable`, never a plausible default, when the container will not say', async () => {
+    // Replacing a stale belief with a DIFFERENT untruth is the one outcome
+    // this route must never produce — the caller cannot tell the two apart.
+    const { binding } = fakeNekoScreenSandbox(
+      () => new Response('unused', { status: 500 }),
+      200,
+      null,
+    );
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+        headers: { authorization: `Bearer ${await mintToken(SECRET)}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'screen_unreadable' });
+  });
+
+  it('surfaces a failed neko login rather than inventing a size', async () => {
+    const { binding } = fakeNekoScreenSandbox(() => new Response('unused', { status: 500 }), 403);
+    const res = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+        headers: { authorization: `Bearer ${await mintToken(SECRET)}` },
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'screen_login_failed_403' });
+  });
+});
+
+
 // ── POST /sandbox/:name/restart ──────────────────────────────────────────────
 // Same shared-HMAC envelope as `DELETE /sandbox/:name` and `/focus`. The DO's
 // OWN restart logic (SIGTERM reusing terminate_stack, stop-confirm polling,

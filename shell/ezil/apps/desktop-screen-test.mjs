@@ -365,6 +365,69 @@ function harness ({ endpoint = '/api/shell/screen', reply } = {}) {
     push('…and still is not after the clock runs', sent.length === 0);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// reconcile() — the controller learning it was WRONG
+// ═══════════════════════════════════════════════════════════════════════════
+// The defect these close: `seed` records a truth and the ask that produced it
+// together, which is right at boot. But a screen can change with NO ask from
+// this side — the Worker's troubleshoot restart resets the container to
+// 1920x1080 and deliberately sets no NEKO_SCREEN, and a warm container gets
+// handed to a window that never sized it. `last_sent` then still holds the boot
+// measurement, every observer tick matches it, `settled()` returns true, and
+// the controller sits forever believing a size the desktop stopped being. The
+// picture stays letterboxed to an aspect the stream does not have until the
+// window is closed and reopened. There was no way to tell it otherwise.
+
+{
+    // 🔴 THE BUG, reproduced first so the fix below is not proving a tautology.
+    const { ctl, clock, sent } = harness();
+    ctl.seed(1080, 1920, { width: 1170, height: 2532 });   // boot: asked 1170x2532, got 1080x1920
+    // …the container restarts out of band and is now 1920x1080. The observer
+    // keeps reporting the same viewport it always did.
+    ctl.request(1170, 2532);
+    await clock.run();
+    push('🔴 WITHOUT reconcile, a stale belief silently swallows every later tick',
+        sent.length === 0, `sent=${JSON.stringify(sent)}`);
+}
+
+{
+    const { ctl, clock, sent } = harness();
+    ctl.seed(1080, 1920, { width: 1170, height: 2532 });
+    const r = ctl.reconcile(1920, 1080);                    // the observation
+    push('reconcile reports that it CONTRADICTED the previous belief', r.changed === true);
+    push('…and the controller now reports the observed size, not the seeded one',
+        JSON.stringify(ctl.applied()) === JSON.stringify({ width: 1920, height: 1080 }),
+        JSON.stringify(ctl.applied()));
+    ctl.request(1170, 2532);
+    await clock.run();
+    eq('🔴 the very next tick is allowed through — the loop is closed', sent, [[1170, 2532]]);
+}
+
+{
+    // The other half, and the one that keeps a reconcile FREE: agreeing must
+    // not clear the dedup, or every restore would cost a capture restart.
+    const { ctl, clock, sent } = harness();
+    ctl.seed(1080, 1920, { width: 1170, height: 2532 });
+    const r = ctl.reconcile(1080, 1920);
+    push('an AGREEING reconcile reports no change', r.changed === false);
+    ctl.request(1170, 2532);
+    await clock.run();
+    push('🔴 …and sends nothing — a restore that changed nothing costs nothing',
+        sent.length === 0, `sent=${JSON.stringify(sent)}`);
+}
+
+{
+    const { ctl } = harness();
+    ctl.seed(1080, 1920, { width: 1170, height: 2532 });
+    for ( const bad of [[NaN, 1080], [0, 0], [-1, 720], [1920.5, 1080], ['1920', 1080]] ) {
+        const r = ctl.reconcile(bad[0], bad[1]);
+        if ( r.changed !== false ) { push(`reconcile rejects ${JSON.stringify(bad)}`, false); break; }
+    }
+    push('reconcile rejects every non-measurement rather than adopting it',
+        JSON.stringify(ctl.applied()) === JSON.stringify({ width: 1080, height: 1920 }),
+        JSON.stringify(ctl.applied()));
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 const failed_checks = checks.filter((c) => ! c.pass);
 for ( const c of checks ) {
