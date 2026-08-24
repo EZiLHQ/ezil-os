@@ -5763,7 +5763,21 @@ async function handleBrowserSidecar(
   sandboxName: string,
   rawVerb: string,
 ): Promise<Response> {
-  const resolved = resolveSidecarVerb(rawVerb, 'POST');
+  // 🔴 THE CALLER'S REAL METHOD, not a hardcoded 'POST'. This used to pass the
+  // literal string, which had two consequences and only the harmless-looking
+  // one was noticed:
+  //
+  //   * `health` is the contract's only GET verb, so it ALWAYS mismatched and
+  //     was unreachable — the one verb an MCP client calls first.
+  //   * and once the route admitted GET at all, a hardcoded 'POST' here would
+  //     have resolved `GET /browser/click` as a POST and forwarded it. A GET
+  //     is cacheable, prefetchable and crawlable; that would have made it
+  //     possible to click inside a user's logged-in browser by following a
+  //     link. `route-auth.test.ts` asserts both directions.
+  //
+  // `resolveSidecarVerb` is the sole authority on which verb takes which
+  // method, and it can only be that if it is told the truth.
+  const resolved = resolveSidecarVerb(rawVerb, request.method);
   if (!resolved.ok) return json({ ok: false, error: resolved.error }, 400);
 
   let body: Record<string, unknown> = {};
@@ -5781,9 +5795,9 @@ async function handleBrowserSidecar(
 
   const sandbox = openSandbox(env, sandboxName);
   try {
-    // `health` is the sidecar's only GET; the Worker route is POST for every
-    // verb so that one HMAC envelope (which may travel in the body) covers
-    // them all uniformly.
+    // `health` is the sidecar's only GET. The forwarded method is taken from
+    // `resolved`, so the container is asked exactly what the contract says the
+    // verb is — never what the caller happened to use.
     //
     // 🔴 The deadline is `withDeadline`, NOT an `AbortSignal` in the
     // `RequestInit`. `containerFetch` is a Durable Object RPC and its init is
@@ -5794,7 +5808,7 @@ async function handleBrowserSidecar(
     const upstream = await withDeadline(
       sandbox.containerFetch(
         resolved.url,
-        resolved.verb === 'health'
+        resolved.method === 'GET'
           ? { method: 'GET' }
           : {
               method: 'POST',
@@ -5947,7 +5961,26 @@ export default {
     }
 
     const browserMatch = path.match(/^\/sandbox\/([^/]+)\/browser\/([a-z_]+)$/);
-    if (method === 'POST' && browserMatch) {
+    if ((method === 'POST' || method === 'GET') && browserMatch) {
+      // 🔴 GET IS HERE BECAUSE `health` IS A GET AND WAS UNREACHABLE.
+      //
+      // `BROWSER_SIDECAR_GET_VERBS = ['health']` and `resolveSidecarVerb`
+      // rejects a method that does not match the verb — but only a POST route
+      // was ever registered, so the single GET verb in the contract answered
+      // `browser_verb_method_mismatch: 'health' is GET, not POST` and there
+      // was no other door. Nine of the ten verbs worked, which is exactly why
+      // it went unnoticed: everything an agent DOES was fine, and only the
+      // liveness probe an MCP client calls FIRST was broken.
+      //
+      // Both methods land in the same handler, which passes the CALLER'S
+      // method to `resolveSidecarVerb` — the sole authority on which verb
+      // takes which. That hand-off is what keeps admitting GET here from
+      // widening anything: `GET /browser/click` is refused by the same check
+      // that used to refuse `GET /browser/health`. It is asserted in both
+      // directions in `route-auth.test.ts`, because for a moment it was NOT
+      // true: the handler passed a hardcoded 'POST', and a GET to an action
+      // verb went straight through.
+
       // The desktop browser's automation surface (`worker/sidecar/`, port
       // 9223, reached by `containerFetch`). HMAC-gated with the SAME envelope
       // as `/focus`/`/screen`/`/restart`/`DELETE /sandbox/:name`, and the verb
