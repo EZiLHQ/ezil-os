@@ -566,7 +566,7 @@ import {
   sanitizeErrorMessage,
   type LogEvent,
 } from './observability';
-import { parseRequestedScreen, formatNekoScreen } from './screen-modes';
+import { parseRequestedScreen, formatNekoScreen, fitScreenRequest } from './screen-modes';
 import {
   selectTelemetryWorthy,
   toTelemetryEventInput,
@@ -4944,10 +4944,19 @@ async function handleScreen(request: Request, env: Env, sandboxName: string): Pr
   // pair that is not one of the advertised modelines can never be set, so
   // rejecting it here saves a round trip and keeps the wire honest.
   const requested = parseRequestedScreen(body);
-  if (!requested || formatNekoScreen(requested.width, requested.height) === null) {
+  // 🔴 FITTED, NOT SNAPPED TO THE TABLE. This used to require membership of the
+  // closed twelve-mode set, which is exactly what made the streamed desktop
+  // letterbox: a window whose shape was not one of seven aspect ratios could
+  // only be approximated. The table was never a platform limit — RandR applies
+  // arbitrary sizes inside the framebuffer (measured: 1176x1448, 1512x830 and
+  // 1368x912 all exact; 1928x1080 correctly refused with 422). `fitScreenRequest`
+  // clamps, scales under the pixel ceiling, and aligns; the result is a screen
+  // the platform will really apply, in the caller's own aspect.
+  const fitted = requested ? fitScreenRequest(requested.width, requested.height) : null;
+  if (!fitted) {
     return json({ ok: false, error: 'screen_bad_request' }, 400);
   }
-  const { width, height } = requested;
+  const { width, height } = fitted;
 
   // NO `AbortSignal` here — see `withDeadline` above for why it cannot cross
   // the container RPC boundary. The budget is enforced by racing instead.

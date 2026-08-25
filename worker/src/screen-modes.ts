@@ -107,6 +107,93 @@ export const SCREEN_MODES: readonly ScreenMode[] = [
   { width: 1680, height: 720 },  // 21:9  landscape — ultrawide, cheaper
 ];
 
+/**
+ * The Xvfb framebuffer both axes must fit inside.
+ *
+ * `start-neko.sh` creates the display at `${EZIL_X_FRAMEBUFFER:-1920x1920x24}`,
+ * and RandR can set any size inside that box — but not one pixel outside it.
+ * Measured against a real container: `1920x1920` applies exactly, `1928x1080`
+ * answers HTTP 422. Deliberately SQUARE so portrait and landscape have the same
+ * reach.
+ */
+export const SCREEN_FRAMEBUFFER_AXIS = 1920;
+
+/**
+ * Fit an arbitrary measured box to a screen the platform will actually apply.
+ *
+ * 🔴 WHY THIS EXISTS AT ALL, AND WHY IT IS NOT `snapScreenMode`.
+ *
+ * The closed mode table is the reason the streamed desktop letterboxes. Twelve
+ * entries cover seven aspect ratios, so any window whose shape is not one of
+ * the seven gets black bands — measured on a phone before the table was
+ * widened, 17.9% of the picture. Widening the table helps and cannot finish
+ * the job, because a table is a set of guesses about which shapes people have.
+ *
+ * The table was never a platform constraint. Measured against a real
+ * container, RandR applies ARBITRARY sizes:
+ *
+ *     1176x1448 -> 1176x1448   1512x830 -> 1512x830   1368x912 -> 1368x912
+ *      994x1456 ->  992x1456   (width floored to a multiple of 8, as documented)
+ *     1920x1920 -> 1920x1920   1928x1080 -> HTTP 422  (outside the framebuffer)
+ *
+ * So the desktop can simply BE the window's shape, and then there is nothing to
+ * letterbox. Chrome inside re-lays-out at the new width, which is what makes a
+ * narrow desktop show a narrow-layout page — the behaviour of a real browser
+ * being resized, rather than a fixed picture being scaled.
+ *
+ * And it is affordable, which was the other thing the old design assumed
+ * without measuring. `desktop-screen.js` has always claimed a mode change costs
+ * "a visible interruption plus a full software-vp8 re-init". Measured twice on
+ * production, including the worst case of landscape -> portrait: the video
+ * never blacked out, never dropped below normal luma, and no frame was lost.
+ * The cost is container CPU and about a second of latency before the new size
+ * arrives — not pixels the user sees.
+ *
+ * The rules, in the order they must be applied:
+ *   1. clamp each axis into the framebuffer (a bigger ask is a 422, not a screen)
+ *   2. scale BOTH axes together if the area exceeds the pixel ceiling, so the
+ *      caller's aspect survives — the ceiling is a CPU budget, and shrinking one
+ *      axis to meet it would hand back the letterbox this exists to remove
+ *   3. floor the width to a multiple of 8, because Xvfb does it anyway and
+ *      reports success for the size it was ASKED for (measured: 900 -> 896)
+ *   4. make the height even, because odd dimensions produce vp8 chroma artefacts
+ *   5. never return an axis below the minimum
+ *
+ * Returns null for anything that cannot be made into a usable screen, rather
+ * than inventing one.
+ */
+export function fitScreenRequest(
+  width: number,
+  height: number,
+): ScreenMode | null {
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+  if (width <= 0 || height <= 0) return null;
+
+  // 🔴 ONE UNIFORM FACTOR for every constraint at once, and getting this wrong
+  // is easy: clamping each axis FIRST and scaling for area afterwards ruins the
+  // aspect (3440x1440 would become 1920x1440 — 44% off, exactly the letterbox
+  // this exists to remove). Take the smallest factor that satisfies the
+  // framebuffer on both axes AND the pixel ceiling, and apply it to both.
+  const k = Math.min(
+    1,
+    SCREEN_FRAMEBUFFER_AXIS / width,
+    SCREEN_FRAMEBUFFER_AXIS / height,
+    Math.sqrt(SCREEN_PIXEL_CEILING / (width * height)),
+  );
+  let w = width * k;
+  let h = height * k;
+
+  w = Math.floor(w / SCREEN_WIDTH_ALIGNMENT) * SCREEN_WIDTH_ALIGNMENT;
+  h = Math.floor(h / 2) * 2;
+
+  if (w < MIN_REQUESTED_AXIS || h < MIN_REQUESTED_AXIS) return null;
+  // The flooring above can only reduce, so this cannot re-cross the ceiling —
+  // asserted rather than assumed, because a screen over budget is a CPU bill
+  // somebody else pays.
+  if (w * h > SCREEN_PIXEL_CEILING) return null;
+  return { width: w, height: h };
+}
+
 /** Is this pair one of the modes above, exactly? */
 export function isScreenMode(width: unknown, height: unknown): boolean {
   return SCREEN_MODES.some((m) => m.width === width && m.height === height);

@@ -53,7 +53,7 @@ interface CallLog {
   getExposedPorts: number;
   exec: number;
   /** Every `containerFetch(url, init, port)` the route table actually made. */
-  containerFetch: Array<{ url: string; port: number; method: string; headers: Record<string, string> }>;
+  containerFetch: Array<{ url: string; port: number; method: string; headers: Record<string, string>; body: string }>;
   /**
    * Every request that reached the Durable Object's HTTP entrypoint
    * (`stub.fetch`) — i.e. what the SDK's REAL `wsConnect()` delivered after its
@@ -178,7 +178,13 @@ function fakeSandboxNamespace(options: {
       new Headers(init?.headers).forEach((v, k) => {
         headers[k] = v;
       });
-      calls.containerFetch.push({ url, port, method: (init?.method ?? 'GET').toUpperCase(), headers });
+      // The BODY is recorded too: several routes transform the caller's
+      // numbers before sending them on (the screen route fits an arbitrary
+      // measurement to something the platform can apply), and 'it reached the
+      // container' is a much weaker claim than 'it reached the container
+      // carrying the right value'.
+      const bodyText = typeof init?.body === 'string' ? init.body : '';
+      calls.containerFetch.push({ url, port, method: (init?.method ?? 'GET').toUpperCase(), headers, body: bodyText });
       // 🔴 `containerFetch` is a Durable Object JSRPC method. When the
       // container answers an upgrade it returns 101 + `webSocket`, and that
       // return value cannot be serialized back across the RPC boundary —
@@ -961,12 +967,27 @@ describe('POST /sandbox/:name/screen is HMAC-gated and validates before touching
     expect(calls.containerFetch.length).toBe(0);
   });
 
-  it('🔴 a signed request for a size OUTSIDE the mode table 400s and never reaches the container', async () => {
-    // 1170x2532 is a real phone's device-pixel box and a perfectly plausible
-    // ask — but it is not a modeline the X server advertises, so it can only
-    // ever fail. The app snaps before it gets here; this proves the Worker
-    // does not depend on that having happened.
-    const { binding, calls } = fakeSandboxNamespace({});
+  it('🔴 a signed request for a size outside the TABLE is fitted, not refused', async () => {
+    // ── THIS TEST USED TO ASSERT THE OPPOSITE ──────────────────────────────
+    // It required a 400 for any size that was not one of the twelve table
+    // entries, on the stated reasoning that such a size "is not a modeline the
+    // X server advertises, so it can only ever fail". That reasoning was never
+    // measured, and it is wrong: driven through `POST /api/room/screen` against
+    // a real container, RandR applies arbitrary sizes inside the framebuffer —
+    // 1176x1448, 1512x830 and 1368x912 all exactly, 994x1456 as 992x1456 with
+    // the width floored to a multiple of 8, and only 1928x1080 (outside the
+    // 1920x1920 framebuffer) refused with 422.
+    //
+    // That belief is what made the streamed desktop letterbox: a phone asking
+    // for 1170x2532 was answered with the nearest of seven aspect ratios and
+    // lost 17.9% of its picture to black bands. The Worker now FITS the ask —
+    // clamped, scaled under the pixel ceiling, 8-aligned — so the desktop is
+    // the caller's own shape.
+    const { binding, calls } = fakeNekoScreenSandbox(
+      () => new Response(JSON.stringify({ width: 880, height: 1918 }), { status: 200 }),
+      200,
+      () => new Response(JSON.stringify({ width: 880, height: 1918 }), { status: 200 }),
+    );
     const res = await worker.fetch(
       new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
         method: 'POST',
@@ -975,9 +996,34 @@ describe('POST /sandbox/:name/screen is HMAC-gated and validates before touching
       }),
       { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
     );
-    expect(res.status).toBe(400);
-    expect((await res.json() as { error: string }).error).toBe('screen_bad_request');
-    expect(calls.containerFetch.length).toBe(0);
+    expect(res.status).toBe(200);
+    // It reached the container, and with the FITTED size — not the raw ask and
+    // not a table entry.
+    const posts = calls.containerFetch.filter(
+      (c) => c.url.includes('/api/room/screen') && (c as { method?: string }).method === 'POST',
+    );
+    expect(posts.length).toBe(1);
+    expect(posts[0]!.body).toContain('880');
+    expect(posts[0]!.body).toContain('1918');
+  });
+
+  it('🔴 a size it cannot make a screen out of is still refused before the container', async () => {
+    // Fitting is not the same as accepting anything. Below the minimum axis
+    // there is no screen to be had, and inventing one would put a size on the
+    // wire that no display ever had.
+    for (const body of [{ width: 10, height: 10 }, { width: 1, height: 900 }]) {
+      const { binding, calls } = fakeSandboxNamespace({});
+      const res = await worker.fetch(
+        new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/screen`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${await mintToken()}` },
+          body: JSON.stringify(body),
+        }),
+        { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+      );
+      expect(res.status).toBe(400);
+      expect(calls.containerFetch.length).toBe(0);
+    }
   });
 
   it('🔴 a stringly-typed size 400s and never reaches the container', async () => {

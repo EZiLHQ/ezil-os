@@ -66,6 +66,7 @@ import {
     requestGuacamoleScreen,
     resolveCloudflareGuacamoleConfig,
     resolveScreenRequest,
+    fitScreenRequest,
     snapScreenMode,
     surfacePreviewErrorAsValue,
 } from '@/server/lib/cloudflare-guacamole-provider';
@@ -1031,7 +1032,20 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 };
             }
 
-            const target = snapScreenMode(input.width, input.height);
+            // 🔴 FIT, NOT SNAP. Snapping answered the window with the
+            // nearest of twelve fixed shapes, which is where the letterbox
+            // bands came from. The platform applies arbitrary sizes inside the
+            // framebuffer (measured in a container), so the desktop can be the
+            // window's own shape and there is nothing left to letterbox.
+            // `snapScreenMode` remains the right answer for the BOOT ask.
+            const target = fitScreenRequest(input.width, input.height);
+            if (!target) {
+                return {
+                    ok: false as const,
+                    error: { code: 'BAD_REQUEST' as const, message: 'unusable_screen_measurement' },
+                    correlationId,
+                };
+            }
 
             const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
             const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);

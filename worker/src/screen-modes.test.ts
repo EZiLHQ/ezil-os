@@ -30,6 +30,8 @@ import {
   MIN_REQUESTED_AXIS,
   SCREEN_COLOUR_DEPTH,
   SCREEN_MODES,
+  fitScreenRequest,
+  SCREEN_FRAMEBUFFER_AXIS,
   SCREEN_PIXEL_CEILING,
   SCREEN_WIDTH_ALIGNMENT,
   formatNekoScreen,
@@ -79,6 +81,85 @@ describe('the mode table itself', () => {
     // one default without the other, "no screen requested" and "1920x1080
     // requested" stop being the same container.
     expect(script).toContain(`NEKO_SCREEN="\${NEKO_SCREEN:-${DEFAULT_NEKO_SCREEN}}"`);
+  });
+});
+
+describe('fitScreenRequest — the desktop becomes the window, not the nearest of twelve', () => {
+  // 🔴 CONTAINER MEASUREMENTS, not expectations. Each was driven through
+  // `POST /api/room/screen` against a real neko and read back from `xdpyinfo`.
+  // They are why this function exists: the closed table was never a platform
+  // constraint.
+  it('applies arbitrary in-budget boxes exactly', () => {
+    expect(fitScreenRequest(1176, 1448)).toEqual({ width: 1176, height: 1448 });
+    expect(fitScreenRequest(1512, 830)).toEqual({ width: 1512, height: 830 });
+    expect(fitScreenRequest(1368, 912)).toEqual({ width: 1368, height: 912 });
+  });
+
+  it('🔴 floors the width to a multiple of 8, because Xvfb does it anyway', () => {
+    // Measured: asking for 900 wide yields a 896-wide display while the POST
+    // echoes 900. Reporting a width the display does not have is the exact
+    // class of bug the read-back exists to catch; this stops it being created.
+    expect(fitScreenRequest(994, 1456)).toEqual({ width: 992, height: 1456 });
+    expect(fitScreenRequest(900, 1600)).toEqual({ width: 896, height: 1600 });
+    expect(fitScreenRequest(1234, 700)!.width % 8).toBe(0);
+  });
+
+  it('never returns an odd height (odd dimensions produce vp8 chroma artefacts)', () => {
+    for (const [w, h] of [[1000, 701], [800, 999], [640, 361]]) {
+      expect(fitScreenRequest(w, h)!.height % 2).toBe(0);
+    }
+  });
+
+  it('🔴 clamps into the framebuffer — a bigger ask is a 422, not a screen', () => {
+    // Measured: 1928x1080 answers HTTP 422 against the 1920x1920 framebuffer.
+    const got = fitScreenRequest(3440, 1440)!;
+    expect(got.width).toBeLessThanOrEqual(SCREEN_FRAMEBUFFER_AXIS);
+    expect(got.height).toBeLessThanOrEqual(SCREEN_FRAMEBUFFER_AXIS);
+  });
+
+  it('🔴 scales BOTH axes to meet the pixel ceiling, so the aspect survives', () => {
+    // Shrinking one axis would meet the CPU budget and hand back the letterbox
+    // this function exists to remove. An ultrawide must stay ultrawide.
+    const got = fitScreenRequest(3440, 1440)!;
+    expect(got.width * got.height).toBeLessThanOrEqual(SCREEN_PIXEL_CEILING);
+    const askAspect = 3440 / 1440;
+    const gotAspect = got.width / got.height;
+    expect(Math.abs(askAspect - gotAspect) / askAspect).toBeLessThan(0.02);
+  });
+
+  it('🔴 keeps every realistic device box in its OWN aspect — nothing left to letterbox', () => {
+    const boxes: Array<[string, number, number]> = [
+      ['iPhone 12-14 @3x', 1170, 2532],
+      ['iPhone 15 @3x', 1179, 2556],
+      ['Pixel/Galaxy @3x', 1080, 2400],
+      ['ultrawide 21:9', 3440, 1440],
+      ['MacBook Air 13', 1512, 830],
+      ['1080p desktop', 1920, 1080],
+      ['a dragged window', 1003, 641],
+    ];
+    const bad: string[] = [];
+    for (const [label, w, h] of boxes) {
+      const got = fitScreenRequest(w, h);
+      if (!got) { bad.push(`${label}: no screen at all`); continue; }
+      const drift = Math.abs((w / h) - (got.width / got.height)) / (w / h);
+      if (drift > 0.02) {
+        bad.push(`${label} ${w}x${h} -> ${got.width}x${got.height} drifts ${(drift * 100).toFixed(1)}%`);
+      }
+    }
+    expect(bad).toEqual([]);
+  });
+
+  it('stays inside the CPU budget for every one of those boxes', () => {
+    for (const [w, h] of [[1170, 2532], [3440, 1440], [1920, 1080], [1512, 830]]) {
+      expect(fitScreenRequest(w, h)!.width * fitScreenRequest(w, h)!.height)
+        .toBeLessThanOrEqual(SCREEN_PIXEL_CEILING);
+    }
+  });
+
+  it('refuses what it cannot make a screen out of, rather than inventing one', () => {
+    for (const [w, h] of [[0, 0], [-1, 100], [10, 10], [Number.NaN, 100], [Infinity, 100]]) {
+      expect(fitScreenRequest(w, h)).toBeNull();
+    }
   });
 });
 

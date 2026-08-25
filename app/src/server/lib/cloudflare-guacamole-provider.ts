@@ -2551,6 +2551,57 @@ export function parseRequestedScreen(raw: unknown): ScreenMode | null {
  * Ties inside an aspect class are broken by table order, so the answer is a
  * pure function of its inputs and does not depend on sort stability.
  */
+/**
+ * The Xvfb framebuffer both axes must fit inside — mirrors
+ * `worker/src/screen-modes.ts`. See `fitScreenRequest` there for the full
+ * rationale and the container measurements behind it.
+ */
+export const SCREEN_FRAMEBUFFER_AXIS = 1920;
+
+/**
+ * Fit an arbitrary measured box to a screen the platform will actually apply.
+ *
+ * 🔴 THIS REPLACES `snapScreenMode` ON THE LIVE-RESIZE PATH, and the reason is
+ * the letterboxing. Snapping answers a window with the nearest of twelve fixed
+ * shapes, so any window that is not one of seven aspect ratios gets black bands
+ * — 17.9% of the picture on a phone, measured, before the table was widened.
+ * Widening a table of guesses cannot finish that job.
+ *
+ * The table was never a platform constraint. Measured against a real container,
+ * RandR applies arbitrary sizes inside the framebuffer (1176x1448, 1512x830 and
+ * 1368x912 exact; 994x1456 -> 992x1456 with the width floored to a multiple of
+ * 8; 1928x1080 refused with 422). So the desktop can just BE the window's
+ * shape, and Chrome inside re-lays-out at the new width — a real browser being
+ * resized rather than a fixed picture being scaled.
+ *
+ * `snapScreenMode` is KEPT, and is still the right answer for the BOOT ask,
+ * where a stable, small set of well-known sizes is worth more than an exact fit
+ * to a window that is about to change.
+ */
+export function fitScreenRequest(width: number, height: number): ScreenMode | null {
+    if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+    if (width <= 0 || height <= 0) return null;
+
+    // 🔴 ONE UNIFORM FACTOR for every constraint at once. Clamping each axis
+    // first and scaling for area afterwards ruins the aspect (3440x1440 would
+    // become 1920x1440 — 44% off, exactly the letterbox this removes).
+    const k = Math.min(
+        1,
+        SCREEN_FRAMEBUFFER_AXIS / width,
+        SCREEN_FRAMEBUFFER_AXIS / height,
+        Math.sqrt(SCREEN_PIXEL_CEILING / (width * height)),
+    );
+    let w = width * k;
+    let h = height * k;
+
+    w = Math.floor(w / SCREEN_WIDTH_ALIGNMENT) * SCREEN_WIDTH_ALIGNMENT;
+    h = Math.floor(h / 2) * 2;
+
+    if (w < MIN_REQUESTED_AXIS || h < MIN_REQUESTED_AXIS) return null;
+    if (w * h > SCREEN_PIXEL_CEILING) return null;
+    return { width: w, height: h };
+}
+
 export function snapScreenMode(
     width: number,
     height: number,
@@ -2745,8 +2796,14 @@ export async function requestGuacamoleScreen(
     // Belt and braces with the procedure's own zod check: this helper is
     // exported and directly callable, and the value it is about to put on the
     // wire ends up next to an X server.
-    if (!isScreenMode(width, height)) {
-        return { ok: false, code: 'BAD_REQUEST', message: 'not_a_screen_mode' };
+    // Belt and braces with the procedure's own zod check. 🔴 No longer a TABLE
+    // membership test: the live-resize path now asks for the window's real
+    // shape (see `fitScreenRequest`), so the check is that the value is one the
+    // platform can actually apply — which is what `fitScreenRequest` returning
+    // the pair unchanged means.
+    const fitted = fitScreenRequest(width, height);
+    if (!fitted || fitted.width !== width || fitted.height !== height) {
+        return { ok: false, code: 'BAD_REQUEST', message: 'not_an_applicable_screen' };
     }
 
     const token = mintSandboxPreviewToken(hmacSecret);
