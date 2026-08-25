@@ -1294,6 +1294,19 @@ NEKO_APP_HEALTH_FILE="${NEKO_APP_HEALTH_FILE:-/tmp/neko-app-health.json}"
 # serving a half-dead desktop.
 NEKO_APP_FATAL_SENTINEL="${NEKO_APP_FATAL_SENTINEL:-/tmp/neko-app-fatal}"
 rm -f "$NEKO_APP_FATAL_SENTINEL" 2>/dev/null || true
+# The same record for an app that gave up PERMANENTLY but is not
+# desktop-critical (see `_app_is_desktop_critical`). It must exist separately
+# from the fatal sentinel precisely because the main loop treats that one as
+# "terminate the container", and this one must not.
+#
+# 🔴 It is what keeps the health file HONEST. `monitor_apps` recomputes every
+# app's state from whether its process group is alive, and a permanently-dead
+# app looks identical to one that merely has not started: both are "stopped".
+# Without this the editor's own crash-loop would be reported as though it were
+# still coming up, forever — and the Code window would sit on a spinner
+# instead of telling the user what happened.
+NEKO_APP_GAVEUP_SENTINEL="${NEKO_APP_GAVEUP_SENTINEL:-/tmp/neko-app-gaveup}"
+rm -f "$NEKO_APP_GAVEUP_SENTINEL" 2>/dev/null || true
 # Restart budget/backoff. Test harnesses may lower these (e.g. to exhaust
 # retries quickly), but the PRODUCTION DEFAULTS below are deliberately generous
 # and are NOT weakened.
@@ -1420,6 +1433,49 @@ NEKO_APP_CLEAN_EXIT_HEALTHY_MS=60000
 NEKO_APP_CLEAN_RESTART_MAX_DELAY=30
 NEKO_APP_CLEAN_RESTART_MAX_STREAK=6
 
+# ── which apps may take the whole desktop down with them ─────────────────────
+#
+# 🔴 THE BLAST RADIUS FIX. `codeserver` used to be on this list by default,
+# because there was no list — EVERY supervised app that exhausted its restart
+# budget raised the fatal sentinel, and the main loop's response to the
+# sentinel is `terminate_stack` + `exit 1`, i.e. the container dies.
+#
+# That was measured, not theorised. Killing code-server six times in a real
+# container produced:
+#
+#     app=codeserver PERMANENTLY FAILED after 6 attempts — restart budget exhausted
+#     FATAL: mandatory app 'codeserver' permanently failed ... exiting non-zero
+#     container running: false   exit=1
+#
+# So a user installing a VS Code extension that wedges the editor loses their
+# whole desktop session — the browser they were working in, the streamed
+# desktop, everything — and, because container disk is ephemeral, also every
+# extension and editor setting they had installed. That is a reported incident,
+# not a hypothetical.
+#
+# The original contract — "no apparently-ready desktop with a dead app" — is
+# right about the DESKTOP. It is wrong about the editor. Neko without X or
+# without a browser is a desktop that cannot do anything, and pretending
+# otherwise is the dishonesty that rule exists to prevent. Neko without
+# code-server is a working desktop with one app unavailable, which is a true
+# thing the Code window can say for itself.
+#
+# What does NOT change: the boot-time preflight. A missing code-server BINARY
+# still fails startup before readiness (see the preflight above) — an image
+# built without it is a broken image, and that check was always the valuable
+# one. This only governs a RUNTIME crash-loop of an app that did start.
+NEKO_DESKTOP_CRITICAL_APPS="${NEKO_DESKTOP_CRITICAL_APPS:-chromium}"
+
+# _app_is_desktop_critical <name> — may this app's permanent failure terminate
+# the whole desktop? Returns 0 (true) only for names in the list above.
+_app_is_desktop_critical() {
+  local needle="$1" item
+  for item in $NEKO_DESKTOP_CRITICAL_APPS; do
+    [ "$item" = "$needle" ] && return 0
+  done
+  return 1
+}
+
 # _app_exit_is_clean <rc> <uptime_ms> — the rule above, and nothing else.
 # Returns 0 (true) for a clean, user-initiated quit.
 _app_exit_is_clean() {
@@ -1532,13 +1588,19 @@ supervise_app() {
       emit_telemetry "container:neko#app_exit" "error" "$uptime_ms"
       attempt=$((attempt + 1))
       if [ "$attempt" -gt "$max_restarts" ]; then
-        log "app=$name PERMANENTLY FAILED after $attempt attempts — restart budget exhausted. Marking desktop unhealthy; neko/container will terminate (contract: no apparently-ready desktop with a dead mandatory app)."
-        # Record the permanent failure for machine-checkable evidence, then
-        # raise the fatal sentinel the main loop watches.
+        # Record the permanent failure for machine-checkable evidence either
+        # way — what differs is whether it also takes the desktop down.
         APP_STATE[$name]="failed"
         APP_RESTARTS[$name]=$((attempt - 1))
         write_health
-        echo "$name" >>"$NEKO_APP_FATAL_SENTINEL"
+        if _app_is_desktop_critical "$name"; then
+          log "app=$name PERMANENTLY FAILED after $attempt attempts — restart budget exhausted. Marking desktop unhealthy; neko/container will terminate (contract: no apparently-ready desktop with a dead desktop-critical app)."
+          echo "$name" >>"$NEKO_APP_FATAL_SENTINEL"
+        else
+          log "app=$name PERMANENTLY FAILED after $attempt attempts — restart budget exhausted. This app is NOT desktop-critical: the desktop, the browser and the user's session KEEP RUNNING, and '$name' is reported failed in the health file so the surface that fronts it can say so honestly."
+          echo "$name" >>"$NEKO_APP_GAVEUP_SENTINEL"
+          emit_telemetry "container:neko#app_gave_up" "error" "$uptime_ms"
+        fi
         break
       fi
       sleep "$NEKO_APP_RESTART_DELAY"
@@ -1644,6 +1706,14 @@ monitor_apps() {
     local name pgid
     for name in "${!APP_PID[@]}"; do
       if [ -f "$NEKO_APP_FATAL_SENTINEL" ] && grep -qx "$name" "$NEKO_APP_FATAL_SENTINEL" 2>/dev/null; then
+        APP_STATE[$name]="failed"
+        continue
+      fi
+      # Same treatment for an app that gave up without being desktop-critical.
+      # Without this the loop below would recompute it from a dead process
+      # group and report "stopped" — indistinguishable from "not started yet",
+      # which is exactly the ambiguity the Code window cannot act on.
+      if [ -f "$NEKO_APP_GAVEUP_SENTINEL" ] && grep -qx "$name" "$NEKO_APP_GAVEUP_SENTINEL" 2>/dev/null; then
         APP_STATE[$name]="failed"
         continue
       fi
@@ -1809,9 +1879,117 @@ seed_codeserver_user_settings() {
   mkdir -p "$_cs_user_dir" 2>/dev/null || return 1
   cat >"$_cs_settings" <<'CODESERVER_SETTINGS_JSON'
 {
-  "security.workspace.trust.enabled": false
+  "security.workspace.trust.enabled": false,
+  "files.exclude": {
+    "**/.ezil": true
+  }
 }
 CODESERVER_SETTINGS_JSON
+}
+
+# ── editor state that OUTLIVES the container ────────────────────────────────
+#
+# 🔴 THE INCIDENT THIS EXISTS FOR. A user installed a VS Code extension and a
+# CLI, used them, and the editor died. On the next load their project was
+# there but "the changes weren't there" — every extension and every editor
+# setting was gone. That was not a sync bug. code-server runs with
+# `--user-data-dir` and `--extensions-dir` under /tmp, and PLATFORM-NOTES §8 is
+# explicit that all container disk is ephemeral and host restarts happen with
+# no notice. Those directories were never going to survive, by construction.
+#
+# 🔴 WHY A MANIFEST AND NOT A SYNC. The obvious fix — point those dirs at the
+# R2-backed workspace — is the wrong one, and `workspace-persist.ts` says why
+# in its own words: whole files pass through the Durable Object ONE RPC CALL AT
+# A TIME, which is why `node_modules` is on the never-walked list. An
+# extensions directory is node_modules-shaped (thousands of files, tens of MB
+# for a single extension), so blob-syncing it would dominate every flush cycle
+# for the whole fleet. Extension BINARIES are reproducible from a name; only
+# the LIST is irreplaceable. So the list is what gets persisted — a few hundred
+# bytes — and the binaries are refetched. This is the devcontainer model, and
+# it self-heals: a corrupted extension does not get preserved forever.
+#
+# Settings are the opposite shape — small, hand-written, and NOT reproducible
+# from anything — so `settings.json` and `keybindings.json` are copied
+# verbatim. They are the two files a user would actually be upset to lose.
+#
+# Lives under the workspace root because that is the one directory already
+# persisted; `.ezil/` is hidden from the editor's own explorer by the seeded
+# `files.exclude` below, so it does not clutter the file tree.
+EZIL_EDITOR_STATE_DIR="${EZIL_EDITOR_STATE_DIR:-${WORKSPACE_ROOT}/.ezil}"
+EZIL_EDITOR_EXT_MANIFEST="${EZIL_EDITOR_STATE_DIR}/extensions.txt"
+EZIL_EDITOR_SETTINGS_BACKUP="${EZIL_EDITOR_STATE_DIR}/settings.json"
+EZIL_EDITOR_KEYBINDINGS_BACKUP="${EZIL_EDITOR_STATE_DIR}/keybindings.json"
+# How often to re-capture. Cheap: a directory listing and two small file
+# copies, only written when something actually changed.
+EZIL_EDITOR_STATE_INTERVAL="${EZIL_EDITOR_STATE_INTERVAL:-30}"
+
+# The installed set, as extension ids, one per line. Read from the extensions
+# DIRECTORY rather than `code-server --list-extensions`, which spawns a whole
+# Node process and takes seconds; the directory basenames carry the id and the
+# version (`publisher.name-1.2.3`), and the version is deliberately stripped so
+# a restore installs the current release rather than pinning a stale one.
+_ezil_installed_extension_ids() {
+  [ -d "$CODE_SERVER_EXTENSIONS_DIR" ] || return 0
+  find "$CODE_SERVER_EXTENSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
+    | sed -E 's/-[0-9]+\.[0-9]+\.[0-9]+(-.*)?$//' \
+    | grep -E '^[A-Za-z0-9][A-Za-z0-9_-]*\.[A-Za-z0-9][A-Za-z0-9_.-]*$' \
+    | sort -u
+}
+
+# Write the manifest and back up the two settings files — only on a real
+# change, so an idle session does not rewrite workspace files every 30s and
+# make the flush think there is work to do.
+_ezil_capture_editor_state() {
+  mkdir -p "$EZIL_EDITOR_STATE_DIR" 2>/dev/null || return 1
+  _ids="$(_ezil_installed_extension_ids)"
+  if [ -n "$_ids" ] && [ "$_ids" != "$(cat "$EZIL_EDITOR_EXT_MANIFEST" 2>/dev/null)" ]; then
+    printf '%s\n' "$_ids" >"${EZIL_EDITOR_EXT_MANIFEST}.tmp" 2>/dev/null \
+      && mv "${EZIL_EDITOR_EXT_MANIFEST}.tmp" "$EZIL_EDITOR_EXT_MANIFEST" 2>/dev/null \
+      && log "editor state: captured $(printf '%s\n' "$_ids" | wc -l) extension id(s) for restore"
+  fi
+  for _pair in "User/settings.json:$EZIL_EDITOR_SETTINGS_BACKUP" "User/keybindings.json:$EZIL_EDITOR_KEYBINDINGS_BACKUP"; do
+    _src="${CODE_SERVER_USER_DATA_DIR}/${_pair%%:*}"
+    _dst="${_pair#*:}"
+    if [ -s "$_src" ] && ! cmp -s "$_src" "$_dst" 2>/dev/null; then
+      cp -f "$_src" "$_dst" 2>/dev/null && log "editor state: backed up $(basename "$_src")"
+    fi
+  done
+}
+
+# Put back what the manifest names. Runs in the BACKGROUND and never gates
+# readiness: a restore that needs the network must not be able to delay — or
+# fail — a desktop the user is waiting for. Everything here is best-effort by
+# design; a failed reinstall costs one extension, not the session.
+_ezil_restore_editor_state() {
+  for _pair in "$EZIL_EDITOR_SETTINGS_BACKUP:User/settings.json" "$EZIL_EDITOR_KEYBINDINGS_BACKUP:User/keybindings.json"; do
+    _src="${_pair%%:*}"
+    _dst="${CODE_SERVER_USER_DATA_DIR}/${_pair#*:}"
+    if [ -s "$_src" ] && [ ! -s "$_dst" ]; then
+      mkdir -p "$(dirname "$_dst")" 2>/dev/null
+      cp -f "$_src" "$_dst" 2>/dev/null && log "editor state: restored $(basename "$_dst")"
+    fi
+  done
+
+  [ -s "$EZIL_EDITOR_EXT_MANIFEST" ] || return 0
+  _already="$(_ezil_installed_extension_ids)"
+  _want="$(grep -E '^[A-Za-z0-9][A-Za-z0-9_-]*\.[A-Za-z0-9][A-Za-z0-9_.-]*$' "$EZIL_EDITOR_EXT_MANIFEST" 2>/dev/null | sort -u)"
+  [ -n "$_want" ] || return 0
+  _missing=""
+  for _id in $_want; do
+    printf '%s\n' "$_already" | grep -qx "$_id" || _missing="$_missing $_id"
+  done
+  [ -n "$_missing" ] || return 0
+  log "editor state: reinstalling$(printf '%s' "$_missing") (from the manifest this workspace carries)"
+  for _id in $_missing; do
+    if timeout 180 "$CODE_SERVER_BIN" \
+        --user-data-dir="$CODE_SERVER_USER_DATA_DIR" \
+        --extensions-dir="$CODE_SERVER_EXTENSIONS_DIR" \
+        --install-extension "$_id" >>"$LOG" 2>&1; then
+      log "editor state: reinstalled $_id"
+    else
+      log "editor state: could NOT reinstall $_id — continuing (one extension, not the session)"
+    fi
+  done
 }
 
 if seed_codeserver_user_settings "$CODE_SERVER_USER_DATA_DIR"; then
@@ -1830,6 +2008,18 @@ supervise_app codeserver "$NEKO_APP_MAX_RESTARTS" "$CODE_SERVER_BIN" \
   --extensions-dir="$CODE_SERVER_EXTENSIONS_DIR" \
   "$WORKSPACE_ROOT"
 phase_end codeserver_launch ok
+
+# Restore first, then keep capturing. Both in one detached subshell so neither
+# can delay readiness — see `_ezil_restore_editor_state` for why that matters.
+(
+  _ezil_restore_editor_state
+  while true; do
+    sleep "$EZIL_EDITOR_STATE_INTERVAL"
+    [ -f "$NEKO_SHUTDOWN_FLAG" ] && break
+    _ezil_capture_editor_state
+  done
+) >/dev/null 2>&1 &
+log "editor state: restore+capture loop started (manifest ${EZIL_EDITOR_EXT_MANIFEST}, every ${EZIL_EDITOR_STATE_INTERVAL}s)"
 
 # ── Native browser (mandatory — validated above in preflight; never skipped) ─
 # Reuses whichever Chromium-family binary the image already has installed
