@@ -123,7 +123,13 @@ const cycle = (p) => p.evaluate(async () => {
   return { orig, final, settled, snap };
 });
 
-const MAX_WASTE_PCT = 12;
+// 🔴 3%, not 12%. The old ceiling was set when the shell snapped to the
+// nearest of twelve fixed modes and letterboxing was unavoidable. The desktop
+// now takes the window's OWN shape (`fitScreenRequest`), so anything above a
+// couple of percent means the fit has regressed to approximating again.
+// Measured on production after the change: 0.0% / 0.4% / 0.0% / 0.8% across
+// desktop, tall, ultrawide and an iPhone at dpr 3.
+const MAX_WASTE_PCT = 3;
 
 const browser = await chromium.launch({ args: ['--use-gl=swiftshader', '--enable-unsafe-swiftshader'] });
 try {
