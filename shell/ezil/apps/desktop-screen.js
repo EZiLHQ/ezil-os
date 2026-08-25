@@ -75,7 +75,30 @@
  * that justify it: a mode change costs no visible interruption, and 200ms is
  * the smallest debounce that still costs one encoder restart per real gesture.
  */
-export const RESIZE_DEBOUNCE_MS = 200;
+export const RESIZE_DEBOUNCE_MS = 500;
+// 🔴 REVERTED FROM 200ms AFTER A PRODUCTION REGRESSION, and the measurements
+// that justified 200ms still stand — this is not a retraction of them.
+//
+// A mode change genuinely costs no visible interruption (sampled at 40ms in
+// the neko client across a live change, twice, including landscape ->
+// portrait: no blackout, no dropped frame), and 200ms genuinely costs one
+// encoder restart per real gesture (90 recorded ResizeObserver ticks, p50 gap
+// 17ms, longest hesitation 148ms). Both remain true.
+//
+// What 200ms also did, measured on production and reproduced on a second run,
+// was leave the desktop window carrying the `ezil-fullbleed` CLASS while its
+// body stayed at the windowed 960x540 — so a 1440x900 desktop letterboxed to
+// 864x540 and wasted 10% of the window. The phone was unaffected (0.8%). The
+// interaction is with BOOT, not with dragging: a shorter debounce lets a
+// screen request land while the window is still windowed and before
+// `go_fullbleed` has applied its geometry, and something in that overlap
+// leaves the geometry behind.
+//
+// That mechanism is NOT yet understood, and shipping a faster debounce while
+// it is not understood trades a real, visible 10% regression for a 300ms
+// improvement nobody asked for twice. It goes back to 500ms until the
+// boot-time overlap is explained. `e2e/prod-responsiveness.mjs` is what caught
+// it and is what should be green before this is tried again.
 
 /**
  * Ceiling on `devicePixelRatio` when converting a CSS-pixel box into the

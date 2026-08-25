@@ -58,8 +58,8 @@ const view = (w, h, dpr = 1) => ({ innerWidth: w, innerHeight: h, devicePixelRat
 // charging an extra encoder restart every time a user hesitates mid-drag, on a
 // 2-vCPU container, and the symptom would be CPU rather than anything visible
 // — which is exactly the kind of regression that gets shipped unnoticed.
-push('RESIZE_DEBOUNCE_MS is 200ms — fast enough to feel immediate, slow enough to cost one restart per gesture',
-    RESIZE_DEBOUNCE_MS === 200, String(RESIZE_DEBOUNCE_MS));
+push('RESIZE_DEBOUNCE_MS is 500ms — reverted from 200ms after a production regression, see desktop-screen.js',
+    RESIZE_DEBOUNCE_MS === 500, String(RESIZE_DEBOUNCE_MS));
 push('🔴 …and never drops below the 150ms knee, where a mid-drag hesitation starts costing extra encoder restarts',
     RESIZE_DEBOUNCE_MS >= 150, String(RESIZE_DEBOUNCE_MS));
 
