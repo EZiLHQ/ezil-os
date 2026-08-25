@@ -1181,11 +1181,25 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             if (!result.ok) {
                 return {
                     ok: false as const,
-                    // The Worker's own discriminator when it answered at all;
-                    // `unknown` when it did not (transport failure). 🔴 Never
-                    // `result.error` — that is a free-text message that can carry
+                    // The Worker's own discriminator when it answered at all.
+                    // 🔴 Never `result.error` — that is free text that can carry
                     // a URL or a stack fragment, and this value is rendered.
-                    errorCode: result.outcome ?? 'unknown',
+                    //
+                    // But `unknown` for everything else was too coarse, and it
+                    // cost real debugging time in production: a Worker that
+                    // answered HTTP 500 and a Worker that never answered at all
+                    // produced the SAME code, so the one field the user and the
+                    // logs share said nothing about which had happened. Both
+                    // occurred within minutes of each other during one session
+                    // — a 120s transport timeout, and a Cloudflare platform
+                    // error ("Internal error while starting up Durable Object
+                    // storage caused object to be reset") — and neither was
+                    // distinguishable without going to the Vercel logs.
+                    //
+                    // `worker_error_500` still leaks no free text: it is a
+                    // status code and a fixed prefix.
+                    errorCode: result.outcome
+                        ?? (result.status ? `worker_error_${result.status}` : 'no_response'),
                     correlationId,
                     provider: 'cloudflare-guacamole' as const,
                 };

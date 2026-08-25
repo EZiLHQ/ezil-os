@@ -111,6 +111,35 @@ local_protocol = "http"
 # Cloudflare Realtime TURN relay minted per-session from
 # SANDBOX_NEKO_TURN_KEY_ID + SANDBOX_NEKO_TURN_API_TOKEN (secrets, by name).
 [vars]
+# ── The default desktop mode ─────────────────────────────────────────────────
+#
+# 🔴 SET BECAUSE IT WAS NOT, and the omission broke the troubleshoot restart in
+# production. `resolveDesktopMode(requested, envDefault)` falls back to
+# `'guacamole'` when both are absent, and this key was never set — so the
+# Worker's idea of "what this deployment runs" was guacamole while every
+# desktop it actually serves is neko.
+#
+# Mostly invisible, because the app always asks for a mode explicitly. The one
+# caller that does NOT is the restart: it deliberately omits `desktopMode` so
+# the Worker AUTO-DETECTS what is running, and detection only works while a
+# desktop port is exposed. When nothing is exposed — a stopped container, an
+# idle one, or one already mid-restart — detection finds nothing, falls back to
+# this default, sees `guacamole`, and refuses with `unsupported_mode`.
+#
+# So restart failed exactly when the desktop was NOT running, which is the only
+# time anyone reaches for it. Measured in production against the live Worker:
+#
+#     POST /api/shell/restart -> 200 {"ok":false,"errorCode":"unsupported_mode"}
+#
+# and, on a cold container, the app's 120s budget expiring first:
+#
+#     [cloudflare-guacamole] restart request failed (non-fatal):
+#       error: 'The operation was aborted due to timeout'
+#
+# Naming the real default is the fix; the fallback stays `guacamole` in code so
+# a deployment that genuinely runs guacamole is unaffected.
+SANDBOX_DEFAULT_DESKTOP_MODE = "neko"
+
 SANDBOX_NEKO_ICE_POLICY = "relay"
 
 # ── Custom domain + preview routes: LIVE on ezil.org (narrow suffix routes) ──
