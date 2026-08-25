@@ -389,8 +389,22 @@ await settle(6);
 await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
 await settle(20);
 const win4 = q('.window[data-app="code"]');
-push('an unavailable code-server says so, honestly',
-    /isn.t available yet/i.test(win4?.textContent ?? ''), (win4?.textContent ?? '').slice(0, 80));
+push('an unreachable code-server says so, honestly',
+    /isn.t reachable right now/i.test(win4?.textContent ?? ''), (win4?.textContent ?? '').slice(0, 90));
+// 🔴 THE ASSERTION THAT EXISTS BECAUSE OF A REAL INCIDENT. The panel used to
+// read "hasn't been turned on for this deployment" — a claim about
+// CONFIGURATION — for an error code whose three producers are all RUNTIME
+// conditions (port not exposed, worker says not exposed, origin
+// underivable). A user installed an extension, the editor crashed, and the OS
+// told them it had never been enabled for their account. They went looking for
+// a settings problem that did not exist.
+push('🔴 …and never claims this is a DEPLOYMENT or CONFIGURATION problem',
+    ! /turned on for this deployment|not configured|isn.t available yet/i.test(win4?.textContent ?? ''),
+    (win4?.textContent ?? '').slice(0, 120));
+const elRetryC = win4?.querySelector('.ezil-code-unavailable-retry');
+push('🔴 …and offers a Retry, because the most common cause is transient',
+    !! elRetryC && window.getComputedStyle(elRetryC).display !== 'none',
+    elRetryC ? `label="${elRetryC.textContent}"` : 'no retry control');
 push('🔴 …and NEVER navigates the frame to an invented URL',
     (win4?.querySelector('.window-app-iframe')?.getAttribute('src') ?? '') === 'about:blank',
     win4?.querySelector('.window-app-iframe')?.getAttribute('src') ?? '(none)');

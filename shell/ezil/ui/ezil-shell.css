@@ -168,6 +168,32 @@ body.device-phone {
     display: none;
 }
 
+/* The Retry on the code panel. Deliberately styled here rather than inline:
+   the `[hidden]` rule above works by `display`, and an inline `display` on a
+   descendant is fine, but keeping every declaration for this panel in one
+   place is what stopped the panel itself painting over a live iframe once. */
+.ezil-code-unavailable-retry {
+    margin-top: 4px;
+    padding: 7px 18px;
+    font: inherit;
+    font-size: 13px;
+    color: #fff;
+    background: #00adb5;
+    border: 0;
+    border-radius: 6px;
+    cursor: pointer;
+    min-height: 34px;
+}
+
+.ezil-code-unavailable-retry:hover {
+    background: #009aa1;
+}
+
+.ezil-code-unavailable-retry:focus-visible {
+    outline: 2px solid #00adb5;
+    outline-offset: 2px;
+}
+
 .ezil-boot-panel {
     width: 100%;
     max-width: 340px;
