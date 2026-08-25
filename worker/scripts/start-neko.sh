@@ -217,7 +217,8 @@ if [ "${EZIL_NEKO_CPU_DIAG_ENABLED:-0}" = "1" ]; then
       fi
       sleep "$NEKO_CPU_DIAG_INTERVAL"
     done
-  ) &
+    # 9>&- — see the boot-mutex note on `supervise_app` below.
+  ) 9>&- &
   CPU_DIAG_PID=$!
 fi
 
@@ -670,6 +671,19 @@ _boot_lock_held=0
 # +3ms, after `phase=container_start event=start` and before any other line.
 # `: >` probes creatability harmlessly, so `exec` only ever runs on a path that
 # is already known to open.
+# 🔴 EVERY background job in this file closes fd 9 (`9>&- &`), and that is not
+# tidiness — it is what makes the lock releasable. A flock is held until the
+# LAST descriptor referring to it closes, and `&` jobs inherit the parent's
+# descriptors. Xvfb, openbox, neko itself and every supervised app are all
+# backgrounded here, and the supervised ones are `setsid`-detached so a SIGTERM
+# aimed at this script never reaches them. Any single survivor pins the lock.
+#
+# That is what broke the troubleshoot restart in production: after a restart
+# tore down a RUNNING desktop, a survivor still held the lock, the replacement
+# boot's `flock -w` timed out, and it took the "another boot is in progress"
+# path and exited 0 without starting anything — `desktop_ready_wait` then hung
+# until the caller gave up with `boot_failed`. `neko-boot-lock-fd.test.ts`
+# enforces the rule.
 if command -v flock >/dev/null 2>&1 \
   && mkdir -p "$(dirname "$NEKO_BOOT_LOCK")" 2>/dev/null \
   && : >"$NEKO_BOOT_LOCK" 2>/dev/null \
@@ -944,9 +958,9 @@ launch_devserver() {
   #    a trap, so the handler runs immediately. The exit status is preserved.
   local launch_rc=0
   if command -v nice >/dev/null 2>&1; then
-    nice -n 10 "$DEVSERVER_BIN" "$WORKSPACE_ROOT" &
+    nice -n 10 "$DEVSERVER_BIN" "$WORKSPACE_ROOT" 9>&- &
   else
-    "$DEVSERVER_BIN" "$WORKSPACE_ROOT" &
+    "$DEVSERVER_BIN" "$WORKSPACE_ROOT" 9>&- &
   fi
   local launch_pid=$!
   # Tracked so teardown stops the launcher too if it is still going.
@@ -1033,7 +1047,7 @@ case "$(printf '%s' "${EZIL_BROWSER_SIDECAR:-on}" | tr '[:upper:]' '[:lower:]' |
   log "starting browser sidecar (node $EZIL_SIDECAR_ENTRY) on 0.0.0.0:${EZIL_SIDECAR_PORT}, CDP 127.0.0.1:${EZIL_CDP_PORT:-9222} — log $EZIL_SIDECAR_LOG"
   EZIL_SIDECAR_PORT="$EZIL_SIDECAR_PORT" \
   EZIL_CDP_PORT="${EZIL_CDP_PORT:-9222}" \
-    node "$EZIL_SIDECAR_ENTRY" >>"$EZIL_SIDECAR_LOG" 2>&1 &
+    node "$EZIL_SIDECAR_ENTRY" >>"$EZIL_SIDECAR_LOG" 2>&1 9>&- &
   local sidecar_pid=$!
   # Tracked so teardown stops it with everything else this boot started.
   SESSION_PID+=("$sidecar_pid")
@@ -1183,7 +1197,7 @@ else
   # `--desktop.screen` (see the neko-serve section below), and every later
   # `POST /api/room/screen` can reach any size inside this box.
   log "starting Xvfb on $DISPLAY (framebuffer $EZIL_X_FRAMEBUFFER; initial screen $NEKO_SCREEN, applied by neko)"
-  Xvfb "$DISPLAY" -screen 0 "$EZIL_X_FRAMEBUFFER" -ac +extension RANDR -nolisten tcp >>"$LOG" 2>&1 &
+  Xvfb "$DISPLAY" -screen 0 "$EZIL_X_FRAMEBUFFER" -ac +extension RANDR -nolisten tcp >>"$LOG" 2>&1 9>&- &
   # Recorded so teardown stops the X server too. It used to be missed entirely,
   # so a failed boot left $DISPLAY held by an orphaned Xvfb (with an orphaned
   # openbox and browser still drawing into it) for the life of the container.
@@ -1216,10 +1230,10 @@ export NEKO_OPENBOX_CONFIG="$OPENBOX_CONFIG"
 if [ -x /usr/bin/openbox ] || command -v openbox >/dev/null 2>&1; then
   if [ -n "$OPENBOX_CONFIG" ]; then
     log "starting openbox (config $OPENBOX_CONFIG)"
-    openbox --config-file "$OPENBOX_CONFIG" >>"$LOG" 2>&1 &
+    openbox --config-file "$OPENBOX_CONFIG" >>"$LOG" 2>&1 9>&- &
   else
     log "starting openbox (default config)"
-    openbox >>"$LOG" 2>&1 &
+    openbox >>"$LOG" 2>&1 9>&- &
   fi
   SESSION_PID+=("$!")
   sleep 1
@@ -1519,7 +1533,7 @@ supervise_app() {
   (
     while true; do
       app_started_ms="$(date +%s%3N)"
-      setsid "$@" >>"$LOG" 2>&1 &
+      setsid "$@" >>"$LOG" 2>&1 9>&- &
       app_pgid=$!
       # Written atomically so terminate_stack can never read a half-written
       # number, and rewritten on every restart so the recorded pgid is always
@@ -1609,7 +1623,32 @@ supervise_app() {
     # with it — otherwise the next boot would find files for processes that no
     # longer exist and could chase recycled pids.
     rm -f "$pgid_file" "$sup_file" 2>/dev/null || true
-  ) &
+  # 🔴 `9>&-` — THE BOOT MUTEX, AND THIS BROKE RESTART IN PRODUCTION.
+  #
+  # The mutex near the top of this file holds its lock with `exec 9>$LOCK` for
+  # the life of the script, and a `flock` is released only when EVERY
+  # descriptor referring to it is closed. A backgrounded subshell inherits its
+  # parent's open fds, so each supervisor kept fd 9 open — and supervisors are
+  # `setsid`-detached and outlive a SIGTERM to the launcher.
+  #
+  # So after a restart tore down a RUNNING stack, the old supervisors were
+  # still holding the boot lock when the replacement boot started. That boot's
+  # `flock -w` timed out, concluded another boot was already in progress, and
+  # exited 0 — the documented "skipped" path. Nothing ever started.
+  #
+  # The symptom was 200 miles from the cause. Measured against production:
+  #
+  #     phase=restart event=start detail=mode=neko
+  #     phase=container_start event=end status=ok phase_ms=60   <- process spawned
+  #     phase=desktop_ready_wait event=start                    <- and then nothing
+  #     ... 183s later: outcome=boot_failed
+  #
+  # and it was selective in the most misleading way possible: a restart with
+  # NOTHING running succeeded (`outcome: started`, 13s) because there were no
+  # survivors holding the lock, while a restart of a working desktop always
+  # failed. The troubleshoot button worked right up until you had something to
+  # troubleshoot.
+  ) 9>&- &
   APP_PID[$name]=$!
   # Ownership record for the SUPERVISOR, alongside the app pgid the subshell
   # publishes. Both are needed, and finding that out cost a container:
@@ -2247,7 +2286,7 @@ supervise_app chromium "$NEKO_APP_MAX_RESTARTS" "$CHROME_BIN" \
   "$CHROME_HOME_URL"
 phase_end chrome_launch ok
 
-monitor_apps &
+monitor_apps 9>&- &   # 9>&- — see the boot-mutex note on `supervise_app`.
 MONITOR_PID=$!
 
 # ── Focus/app switching helper (deterministic, machine-checkable) ────────────
@@ -2617,7 +2656,7 @@ log "waiting up to ${NEKO_WINDOW_READY_TIMEOUT}s (concurrently) for mandatory ap
 
 declare -A APP_WAIT_PID=()
 for spec in "${DESKTOP_APP_SPECS[@]}"; do
-  wait_for_app_ready "$spec" "$NEKO_WINDOW_READY_TIMEOUT" &
+  wait_for_app_ready "$spec" "$NEKO_WINDOW_READY_TIMEOUT" 9>&- &
   APP_WAIT_PID["$spec"]=$!
 done
 
@@ -2929,7 +2968,32 @@ verify_browser_frame || true
 # per-deployment — no image rebuild. The defaults left alone here are the
 # binary's own: 2s read interval, 12s stable before an upgrade, 6s unstable and
 # 24s stalled before a downgrade, 0.15 diff threshold.
-NEKO_CAPTURE_VIDEO_IDS="${NEKO_CAPTURE_VIDEO_IDS:-main,sd,lo}"
+# 🔴 ONE ID, NOT THREE — REVERTED IN PRODUCTION AFTER A BLACK STREAM.
+#
+# The ladder below stays DEFINED (declaring a pipeline nobody listens to costs
+# nothing: the binary starts a sink on its first listener and stops it on its
+# last), but only `main` is ADVERTISED, because advertising all three took
+# production's video away.
+#
+# What happened, and why it was not caught sooner: the first deploy of the
+# ladder was tested against a container that had not actually rolled. Cloudflare
+# containers are Durable-Object pinned, so a warm instance keeps serving the
+# OLD image until it stops — `prod.mjs` passed 17/17 with the desktop painting
+# at mean=40.8 against the previous script. Only when a later fix forced fresh
+# containers did the new capture config actually run, and then the neko client
+# came up with NO VIDEO TRACK AT ALL (`videoWidth === 0`, not a black picture)
+# on both desktop and phone.
+#
+# The likely mechanism, stated as the hypothesis it is: the client bundle in
+# this image is the v2 LEGACY client, and the v2<->v3 bridge has no message
+# through which a client can select among several video ids. With one id there
+# is nothing to select. That is INFERRED — the black stream is measured, the
+# cause is not yet proven — which is exactly why production goes back to the
+# configuration that is known to work while it is investigated.
+#
+# Re-enabling is a one-line change once a container test drives a real WebRTC
+# client against a multi-id build and shows a video track arriving.
+NEKO_CAPTURE_VIDEO_IDS="${NEKO_CAPTURE_VIDEO_IDS:-main}"
 # 🔴 NOT `${VAR:-<json>}`. That is how this was first written and it SILENTLY
 # TRUNCATED: bash matches braces inside a `${...}` expansion, so a default
 # value that is itself brace-heavy JSON ends early. With three tiers the
@@ -2964,7 +3028,10 @@ fi
 unset _ids_ok _vid _IFS_save
 # The bandwidth estimator. Compiled in, and OFF at the binary's own default —
 # these three lines are what turn it on, observing only.
-NEKO_WEBRTC_ESTIMATOR_ENABLED="${NEKO_WEBRTC_ESTIMATOR_ENABLED:-true}"
+# Nothing to switch between while only one id is advertised, so this stays
+# OFF (the binary's own default) rather than leaving an unverified subsystem
+# running in production. It goes back on with the ladder.
+NEKO_WEBRTC_ESTIMATOR_ENABLED="${NEKO_WEBRTC_ESTIMATOR_ENABLED:-false}"
 NEKO_WEBRTC_ESTIMATOR_PASSIVE="${NEKO_WEBRTC_ESTIMATOR_PASSIVE:-true}"
 NEKO_WEBRTC_ESTIMATOR_DEBUG="${NEKO_WEBRTC_ESTIMATOR_DEBUG:-true}"
 export NEKO_CAPTURE_VIDEO_IDS NEKO_CAPTURE_VIDEO_PIPELINES
@@ -3053,7 +3120,7 @@ NEKO_DESKTOP_INPUT_ENABLED="false" \
     --desktop.display "$DISPLAY" \
     --desktop.screen "$NEKO_DESKTOP_SCREEN_SPEC" \
     --session.implicit_hosting=true \
-    --capture.video.display "$DISPLAY" >>"$LOG" 2>&1 &
+    --capture.video.display "$DISPLAY" >>"$LOG" 2>&1 9>&- &
 NEKO_PID=$!
 
 if wait_tcp 127.0.0.1 "$NEKO_HTTP_PORT" 120; then

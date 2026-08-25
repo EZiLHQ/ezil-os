@@ -1001,6 +1001,16 @@ export interface GuacamoleRestartResult {
      * (as opposed to `started`, where there was nothing to stop). */
     wasRunning?: boolean;
     error?: string;
+    /**
+     * The Worker's HTTP status when it ANSWERED, absent when it did not.
+     *
+     * Added because "the Worker replied 500" and "the Worker never replied"
+     * were indistinguishable to every caller — both became `errorCode:
+     * 'unknown'`. Both happened in production minutes apart (a 120s transport
+     * timeout; a Cloudflare "Durable Object storage caused object to be reset"
+     * 500) and the difference is the first thing anyone debugging needs.
+     */
+    status?: number;
 }
 
 /**
@@ -1051,7 +1061,27 @@ export async function requestGuacamoleDesktopRestart(
             // from here — this layer does not know, and must not assert, which
             // stack the container booted.
             body: JSON.stringify({}),
-            signal: AbortSignal.timeout(120_000),
+            // 🔴 240s, NOT 120s, and the old value was too small for what this
+            // call actually does. `restartDesktopStack` tears the stack down
+            // and then runs `ensureDesktop` — a FULL COLD BOOT of the neko
+            // stack, not a reattach. The e2e's "desktop window opens in 12s" is
+            // an already-running container; a restart has to pay for the whole
+            // thing.
+            //
+            // Measured against production: the restart returned in 123s, just
+            // past the old budget, so the app aborted a restart that was
+            // WORKING and reported `errorCode: 'unknown'` — a real restart
+            // rendered as an unexplained failure, twice, before the Vercel logs
+            // gave up the actual cause:
+            //
+            //     [cloudflare-guacamole] restart request failed (non-fatal):
+            //       error: 'The operation was aborted due to timeout'
+            //
+            // 240s fits inside this route's `maxDuration = 300` with headroom
+            // for the response itself. It is deliberately NOT unbounded: a
+            // restart that has not answered in four minutes has failed, and the
+            // user should be told rather than left watching a spinner.
+            signal: AbortSignal.timeout(240_000),
         });
 
         // Like terminate/focus: the Worker answers a failed restart as 400/500
@@ -1078,6 +1108,7 @@ export async function requestGuacamoleDesktopRestart(
             return {
                 ok: false,
                 outcome,
+                status: res.status,
                 wasRunning: data.wasRunning === true,
                 error:
                     typeof data.error === 'string'
