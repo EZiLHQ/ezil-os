@@ -573,12 +573,118 @@ async function defocusDesktopByTapping (page) {
     const settings = await at('.window[data-app="desktop"] .dashboard-app-drawer-settings');
     if ( ! settings ) return 'no Settings button in the drawer';
     await page.touchscreen.tap(settings[0], settings[1]);
-    await sleep(1200);
-    const close = await at('.window[data-app="settings"] .window-head > .window-close-btn');
+    // 🔴 WAIT FOR THE WINDOW, do not sleep at it. This used to be
+    // `sleep(1200)` / `sleep(900)`, and the pair made this whole scenario
+    // FLAKY: measured over three runs each, the fixed sleeps produced 2/3 on
+    // `main` and 1/3 on a branch that had not touched focus at all. When the
+    // close animation had not settled inside 900ms the desktop was still
+    // `window-active`, the very next check — "the iframe is
+    // pointer-events:none while unfocused" — failed, and the failure looked
+    // exactly like a real focus regression. A precondition that fails at
+    // random is worse than no precondition: it spends the reader's trust on
+    // noise and hides the run where something genuinely broke.
+    if ( ! await waitFor(page, () => !! document.querySelector('.window[data-app="settings"]'), 4000) ) {
+        return 'Settings never opened';
+    }
+    // 🔴 WAIT FOR IT TO STOP MOVING before measuring where to tap. Settings
+    // opens with a launch morph, so its close button is still travelling for
+    // a few hundred ms; a rect sampled during that lands the tap on empty
+    // space and the window never closes. That was the residue of this flake
+    // after the fixed sleeps were removed — the failure had simply moved from
+    // "still focused" to "Settings never closed".
+    const closeSel = '.window[data-app="settings"] .window-head > .window-close-btn';
+    if ( ! await waitForTappable(page, closeSel) ) return 'the Settings close control never became tappable';
+    const close = await at(closeSel);
     if ( ! close ) return 'Settings did not open, or has no close control';
     await page.touchscreen.tap(close[0], close[1]);
-    await sleep(900);
+    if ( ! await waitFor(page, () => ! document.querySelector('.window[data-app="settings"]'), 4000) ) {
+        const diag = await page.evaluate((sel) => {
+            const el = document.querySelector(sel);
+            if ( ! el ) return { gone: true };
+            const r = el.getBoundingClientRect();
+            const x = Math.round(r.left + r.width / 2), y = Math.round(r.top + r.height / 2);
+            const hit = document.elementFromPoint(x, y);
+            return { rect: [r.left, r.top, r.width, r.height].map(Math.round),
+                     topmost: hit ? (hit.className || hit.tagName) : null,
+                     pe: getComputedStyle(el).pointerEvents,
+                     vis: getComputedStyle(el).visibility,
+                     op: getComputedStyle(el).opacity };
+        }, closeSel);
+        console.log('  DIAG after failed tap: ' + JSON.stringify(diag));
+        const viaClick = await page.evaluate((sel) => {
+            const el = document.querySelector(sel);
+            if ( ! el ) return 'gone';
+            el.click();
+            return 'clicked';
+        }, closeSel);
+        const closedNow = await waitFor(page, () => ! document.querySelector('.window[data-app="settings"]'), 3000);
+        console.log(`  DIAG fallback el.click() -> ${viaClick}, closed=${closedNow}`);
+        return 'Settings never closed';
+    }
+    // The condition the caller actually depends on, waited for explicitly and
+    // reported as a NAMED failure if it never arrives — so "the tap round trip
+    // did not defocus" can never again be read as "focus is broken".
+    if ( ! await waitFor(page, () => {
+        const el = document.querySelector('.window[data-app="desktop"]');
+        return !! el && ! el.classList.contains('window-active');
+    }, 4000) ) {
+        return 'the Browser was still focused after closing Settings';
+    }
     return null;
+}
+
+/**
+ * Wait until an element is genuinely TAPPABLE at its own centre.
+ *
+ * 🔴 Not "does it exist", and not "has its box stopped moving" — both were
+ * tried and both still flaked. Tapping is a COORDINATE operation:
+ * `touchscreen.tap` goes to a point, and whatever is topmost at that point
+ * receives it. Measured on failing runs of this very file, `elementFromPoint`
+ * at the Settings close button's centre returned
+ * `window-body window-body-app ui-droppable` — the window BODY was over the
+ * head — while passing runs returned `window-action-btn window-close-btn`.
+ * The rect was correct every time; the point was occluded.
+ *
+ * So the condition is hit-testing, which is the only thing that actually
+ * predicts whether the tap will land. Roughly 2 runs in 5 of this scenario
+ * failed before this existed, and the failure surfaced two checks later as
+ * "the Browser is still focused" — indistinguishable from a real focus
+ * regression, which is exactly what makes an unstable harness expensive.
+ */
+async function waitForTappable (page, selector, timeoutMs = 5000, stepMs = 60) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        const ok = await page.evaluate((sel) => {
+            const el = document.querySelector(sel);
+            if ( ! el ) return false;
+            const r = el.getBoundingClientRect();
+            if ( r.width <= 0 || r.height <= 0 ) return false;
+            const x = Math.round(r.left + r.width / 2);
+            const y = Math.round(r.top + r.height / 2);
+            if ( x < 0 || y < 0 || x > innerWidth || y > innerHeight ) return false;
+            const hit = document.elementFromPoint(x, y);
+            return !! hit && (hit === el || el.contains(hit) || hit.contains(el));
+        }, selector);
+        if ( ok ) return true;
+        if ( Date.now() >= deadline ) return false;
+        await sleep(stepMs);
+    }
+}
+
+/**
+ * Poll a predicate IN THE PAGE until it holds or the budget runs out.
+ *
+ * `page.waitForFunction` would do this, but it is not available on every
+ * Playwright surface this file runs against and it throws on timeout, where
+ * every caller here wants a boolean it can turn into a named failure string.
+ */
+async function waitFor (page, fn, timeoutMs = 4000, stepMs = 50) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        if ( await page.evaluate(fn) ) return true;
+        if ( Date.now() >= deadline ) return false;
+        await sleep(stepMs);
+    }
 }
 
 /** Tap the centre of the stream and report what arrived INSIDE the frame. */

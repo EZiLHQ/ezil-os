@@ -1001,6 +1001,16 @@ export interface GuacamoleRestartResult {
      * (as opposed to `started`, where there was nothing to stop). */
     wasRunning?: boolean;
     error?: string;
+    /**
+     * The Worker's HTTP status when it ANSWERED, absent when it did not.
+     *
+     * Added because "the Worker replied 500" and "the Worker never replied"
+     * were indistinguishable to every caller — both became `errorCode:
+     * 'unknown'`. Both happened in production minutes apart (a 120s transport
+     * timeout; a Cloudflare "Durable Object storage caused object to be reset"
+     * 500) and the difference is the first thing anyone debugging needs.
+     */
+    status?: number;
 }
 
 /**
@@ -1051,7 +1061,27 @@ export async function requestGuacamoleDesktopRestart(
             // from here — this layer does not know, and must not assert, which
             // stack the container booted.
             body: JSON.stringify({}),
-            signal: AbortSignal.timeout(120_000),
+            // 🔴 240s, NOT 120s, and the old value was too small for what this
+            // call actually does. `restartDesktopStack` tears the stack down
+            // and then runs `ensureDesktop` — a FULL COLD BOOT of the neko
+            // stack, not a reattach. The e2e's "desktop window opens in 12s" is
+            // an already-running container; a restart has to pay for the whole
+            // thing.
+            //
+            // Measured against production: the restart returned in 123s, just
+            // past the old budget, so the app aborted a restart that was
+            // WORKING and reported `errorCode: 'unknown'` — a real restart
+            // rendered as an unexplained failure, twice, before the Vercel logs
+            // gave up the actual cause:
+            //
+            //     [cloudflare-guacamole] restart request failed (non-fatal):
+            //       error: 'The operation was aborted due to timeout'
+            //
+            // 240s fits inside this route's `maxDuration = 300` with headroom
+            // for the response itself. It is deliberately NOT unbounded: a
+            // restart that has not answered in four minutes has failed, and the
+            // user should be told rather than left watching a spinner.
+            signal: AbortSignal.timeout(240_000),
         });
 
         // Like terminate/focus: the Worker answers a failed restart as 400/500
@@ -1078,6 +1108,7 @@ export async function requestGuacamoleDesktopRestart(
             return {
                 ok: false,
                 outcome,
+                status: res.status,
                 wasRunning: data.wasRunning === true,
                 error:
                     typeof data.error === 'string'
@@ -2451,6 +2482,25 @@ export const SCREEN_MODES: readonly ScreenMode[] = [
     { width: 896, height: 1600 }, //  9:16  portrait  — phone portrait, cheaper (896, not 900 — see SCREEN_WIDTH_ALIGNMENT)
     { width: 720, height: 1280 }, //  9:16  portrait  — phone portrait, cheapest
     { width: 768, height: 1024 }, // 3:4   portrait  — tablet portrait, cheaper
+    // ── ADDED 2026-08-22 — the two aspect classes the table had no answer for ──
+    // APPENDED, never reordered: ties inside an aspect class are broken by table
+    // order, so adding entries in NEW classes cannot disturb what the existing
+    // ones already snap to. Measured with `snapScreenMode` over 15 real device
+    // boxes: 5 asks improved, 0 regressed, mean wasted picture 8.5% -> 2.3%.
+    //
+    // 19.5:9 is what every phone made since the iPhone X actually is. The table
+    // stopped at 9:16 (0.5625), so a 1170x2532 iPhone snapped to 1080x1920 and
+    // threw away 17.9% of the picture in bands — on the one device class where
+    // screen area is scarcest. These modes are also CHEAPER than what they
+    // replace: 888x1920 is 1.70M pixels against 1080x1920's 2.07M, which was
+    // the pixel ceiling itself.
+    { width: 888, height: 1920 },  // 19.5:9 portrait — modern phone (iPhone X+, Pixel, Galaxy)
+    { width: 720, height: 1560 },  // 19.5:9 portrait — modern phone, cheaper
+    { width: 592, height: 1280 },  // 19.5:9 portrait — modern phone, cheapest
+    // 21:9 was the worst case in the whole table: 3440x1440 snapped to
+    // 1920x1080 and lost 25.6% to side bands 880px wide.
+    { width: 1920, height: 824 },  // 21:9  landscape — ultrawide monitor
+    { width: 1680, height: 720 },  // 21:9  landscape — ultrawide, cheaper
 ];
 
 /** Is this pair one of the modes above, exactly? */
@@ -2590,6 +2640,97 @@ export type GuacamoleScreenResult =
  * a size outside the framebuffer it started with (measured: HTTP 422, display
  * unchanged), and no number of retries grows a framebuffer.
  */
+/**
+ * `GET /sandbox/:name/screen` — READ the live X screen without changing it.
+ *
+ * The read half of `requestGuacamoleScreen`, and the reason it exists is worth
+ * stating plainly: until this, the only way for the shell to learn the
+ * desktop's real size was to SET it, and setting restarts the capture
+ * pipeline. So the shell never reconciled. `shell/ezil/apps/desktop-window.js`
+ * writes its `stream` size exactly twice — once from the boot read-back, once
+ * from a successful live resize — and `createScreenController` seeds its
+ * dedup with the boot ASK. Both are correct in isolation. Together they mean a
+ * screen that changed WITHOUT the shell asking can never be discovered:
+ *
+ *   - the Worker's troubleshoot restart resets the container to 1920x1080 and
+ *     deliberately sets no `NEKO_SCREEN`,
+ *   - a warm container gets handed to a window that never asked for its size,
+ *
+ * and every subsequent measurement is then dropped as already-settled against
+ * a belief that is false. The picture stays letterboxed to an aspect the
+ * stream does not have until the window is closed and reopened. That is the
+ * stream-misalignment symptom, and a cheap read is what ends it.
+ *
+ * Shorter timeout than the setter (8s vs 20s) because there is no pipeline
+ * restart to wait for — this is two loopback calls inside a running container.
+ * A reconcile that has not answered in 8s has failed, and the caller's correct
+ * response is to keep the belief it already had, not to hang.
+ */
+export async function readGuacamoleScreen(
+    config: CloudflareGuacamoleConfig,
+    hmacSecret: string,
+    sandboxName: string,
+    correlationId: string = newCorrelationId(),
+): Promise<GuacamoleScreenResult> {
+    if (!config.isConfigured) {
+        return { ok: false, code: 'NOT_FOUND', message: 'provider_not_configured' };
+    }
+
+    const token = mintSandboxPreviewToken(hmacSecret);
+    const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/screen`;
+
+    try {
+        const res = await fetch(endpoint, {
+            method: 'GET',
+            headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: 'application/json',
+                [CORRELATION_HEADER]: correlationId,
+            },
+            signal: AbortSignal.timeout(8_000),
+        });
+
+        const text = await res.text().catch(() => '');
+        let data: { ok?: unknown; error?: unknown; detail?: unknown; width?: unknown; height?: unknown } = {};
+        try {
+            data = text ? (JSON.parse(text) as typeof data) : {};
+        } catch {
+            // Non-JSON (an edge error page). The raw text still reaches the log.
+        }
+
+        if (res.ok && data.ok === true) {
+            // 🔴 A read that cannot name a size is a FAILURE, not a default.
+            // The entire point is to replace a stale belief with the truth;
+            // answering with 1920x1080 because nothing came back would replace
+            // it with a different untruth the caller cannot distinguish.
+            if (!Number.isInteger(data.width) || !Number.isInteger(data.height)) {
+                return { ok: false, code: 'UPSTREAM', message: 'worker reported a screen it did not name' };
+            }
+            // `verified: true` unconditionally: unlike the setter there is no
+            // ask to compare against and no downgrade to express — an
+            // observation either happened or it did not.
+            return { ok: true, width: data.width as number, height: data.height as number, verified: true };
+        }
+
+        const workerError = typeof data.error === 'string' ? data.error : '';
+        const workerDetail = typeof data.detail === 'string' ? data.detail : '';
+        return {
+            ok: false,
+            code: classifyScreenFailure(res.status, workerError),
+            message: [workerError || `worker_http_${res.status}`, workerDetail]
+                .filter(Boolean)
+                .join(': ')
+                .slice(0, 200),
+        };
+    } catch (err) {
+        const name = (err as { name?: string })?.name ?? '';
+        if (name === 'TimeoutError' || name === 'AbortError') {
+            return { ok: false, code: 'TIMEOUT', message: 'screen read timed out' };
+        }
+        return { ok: false, code: 'UPSTREAM', message: (err as { message?: string })?.message ?? 'fetch failed' };
+    }
+}
+
 export async function requestGuacamoleScreen(
     config: CloudflareGuacamoleConfig,
     hmacSecret: string,

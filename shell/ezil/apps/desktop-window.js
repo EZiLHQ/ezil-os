@@ -377,23 +377,40 @@ function fit_stream (el_body, el_iframe, stream) {
     // would collapse the iframe and leave it collapsed after a restore,
     // because the restore does not necessarily change the body's size again.
     //
-    // 🔴 HONESTY NOTE — this precondition (now inside `computeFitBox`) is NOT
-    // mutation-proven. Deleting it leaves `os-chrome-browser-test.mjs` 62/62
-    // green, including its explicit minimise/restore round trip. The reason is
-    // that ResizeObserver does not deliver an observation for an element with
-    // no box, so today the only caller (the observer in `openDesktopWindow`)
-    // never actually reaches it with a zero: `hideWindow` ends in `display:
-    // none` and the callback simply does not fire. It is kept as a
-    // precondition on a function that writes geometry from a measurement, not
-    // as a fix for an observed bug — and it is written down here as unproven
-    // rather than quietly counted among the guards that were proven.
+    // 🔴 CORRECTION 2026-08-22 — the previous note here said this precondition
+    // could never be reached because "`hideWindow` ends in `display: none` and
+    // the callback simply does not fire". That is NOT what the shipping shell
+    // does. On the taskbar path `$.fn.hideWindow` (UIWindow.js) animates the
+    // window to `width: 0; height: 0` and never sets `display` at all, so the
+    // element keeps a box, ResizeObserver keeps delivering, and this function
+    // keeps being called all the way down. Measured on the built bundle: one
+    // minimise+restore cycle produced 11 style writes on the stream iframe,
+    // four of them DURING the minimise, at boxes of 53x30 and 91x51 — live
+    // geometry being written onto a cross-origin WebRTC iframe at sizes no
+    // one can see. The precondition is therefore load-bearing, not decorative;
+    // it is what stops the very last frame of that animation writing a zero.
     const box = computeFitBox(el_body.clientWidth, el_body.clientHeight, sw, sh);
     if ( ! box ) return null;
 
-    el_iframe.style.width = `${box.w}px`;
-    el_iframe.style.height = `${box.h}px`;
-    el_iframe.style.left = `${box.left}px`;
-    el_iframe.style.top = `${box.top}px`;
+    const w = `${box.w}px`;
+    const h = `${box.h}px`;
+    const left = `${box.left}px`;
+    const top = `${box.top}px`;
+    // Nothing to write. Reading back the INLINE style is a cheap string
+    // compare — it does not flush layout the way a computed-style read would —
+    // and skipping the assignment keeps a redundant tick from invalidating
+    // layout on a live WebRTC iframe. Of the 11 writes measured above only
+    // THREE distinct boxes were ever involved; the rest were the same values
+    // written again.
+    if ( el_iframe.style.width === w && el_iframe.style.height === h
+        && el_iframe.style.left === left && el_iframe.style.top === top ) {
+        return { w: box.w, h: box.h };
+    }
+
+    el_iframe.style.width = w;
+    el_iframe.style.height = h;
+    el_iframe.style.left = left;
+    el_iframe.style.top = top;
     return { w: box.w, h: box.h };
 }
 
@@ -696,6 +713,58 @@ export async function openDesktopWindow (ctx = {}) {
         view: typeof window !== 'undefined' ? window : null,
     });
 
+    /**
+     * Ask the server what the desktop's screen ACTUALLY is, and fold the answer
+     * back into both the fit and the controller's dedup.
+     *
+     * Never throws, never awaits on a caller's behalf, and never reports a
+     * failure to the user: every caller is on a path (a restore) where the
+     * right behaviour on "could not check" is to carry on with the belief
+     * already held. See `screen_ctl.reconcile` for why holding a belief that
+     * cannot be contradicted is the defect this closes.
+     */
+    let reconcile_in_flight = false;
+    function reconcile_screen (why) {
+        if ( disposed || reconcile_in_flight ) return;
+        if ( typeof session.getScreen !== 'function' ) return;   // older server bundle
+        reconcile_in_flight = true;
+        Promise.resolve(session.getScreen(computer.id))
+            .then((res) => {
+                if ( disposed || ! res || res.ok !== true ) return;
+                const { changed } = screen_ctl.reconcile(res.width, res.height);
+                if ( ! changed ) return;
+                // The desktop is a different shape than this side believed, so
+                // the letterbox it is currently drawing is wrong. Fix the fit
+                // immediately — this costs nothing and is the visible half.
+                console.info(`[${PHASE}] screen reconciled to ${res.width}x${res.height} (${why})`);
+                stream.w = res.width;
+                stream.h = res.height;
+                refit();
+                // 🔴 AND ASK AGAIN, HERE. Clearing the dedup is not enough on
+                // its own, and believing it was cost a production run.
+                //
+                // `reconcile` only makes the next measurement ELIGIBLE to be
+                // sent; something still has to send one, and the only thing
+                // that does is a `ResizeObserver` tick. A restore that comes
+                // back to the SAME box produces no tick — the window is
+                // full-bleed at the size it already was — so nothing was ever
+                // re-asked and the desktop stayed at whatever the restart left
+                // it. Measured against production after a real container
+                // restart: the read happened (one GET), the belief was
+                // corrected, and the phone still showed a 1920x1080 stream
+                // letterboxed to 390x219 with 74% of the window wasted.
+                //
+                // So the reconcile finishes the job itself. `request` is the
+                // same debounced, deduplicated path every other caller uses,
+                // and `reconcile` has just cleared the entry that would have
+                // suppressed it.
+                const want = measure_screen();
+                if ( want ) screen_ctl.request(want.width, want.height);
+            })
+            .catch(() => {})
+            .finally(() => { reconcile_in_flight = false; });
+    }
+
     // ── keep the stream's box at the stream's aspect ───────────────────────
     // ADDED BY EZIL 2026-08-08. See the `fit_stream` block at the top of this
     // file for what this does and, more importantly, for the one thing it
@@ -732,7 +801,18 @@ export async function openDesktopWindow (ctx = {}) {
     let fit_observer = null;
     if ( typeof ResizeObserver === 'function' ) {
         fit_observer = new ResizeObserver(() => {
-            // ALWAYS refit. The box really did change, whatever caused it.
+            // 🔴 …unless the window is minimised. `hideWindow` sets
+            // `data-is_minimized` BEFORE it starts animating the window down
+            // to 0x0, so this is the one flag that is already true for every
+            // frame of that animation. Without it the observer spends the
+            // whole minimise fitting the stream to boxes of 53x30 and 91x51
+            // (measured) — writes onto a live cross-origin WebRTC iframe, at
+            // sizes that are on their way off screen and will never be seen.
+            // The restore writes the correct box on its own way back up, so
+            // nothing is lost by not tracking the way down.
+            if ( is_minimized(el_window) ) return;
+            // Otherwise ALWAYS refit. The box really did change, whatever
+            // caused it, and the fit must track every frame of a drag.
             refit();
             // 🔴 BUT NOT ALWAYS RESIZE. A raised on-screen keyboard shrinks
             // this window by hundreds of pixels for a few hundred milliseconds
@@ -1708,20 +1788,59 @@ export async function openDesktopWindow (ctx = {}) {
 
     // ── minimise ───────────────────────────────────────────────────────────
     /**
-     * 🔴 Order matters. `exit_fullpage_mode` un-hides the taskbar (creating it
-     * if it is somehow gone), restores the window head and resets the window
-     * to a floating box; only THEN does `hideWindow` have a taskbar item to
-     * animate into and the user a way back. Reversed, the window shrinks
-     * toward a hidden dock and the OS looks empty.
+     * 🔴 Order matters. The fullpage exit un-hides the taskbar (creating it if
+     * it is somehow gone) and restores the window head; only THEN does
+     * `hideWindow` have a taskbar item to animate into and the user a way
+     * back. Reversed, the window shrinks toward a hidden dock and the OS looks
+     * empty.
+     *
+     * 🔴 CHROME ONLY — `exit_fullpage_chrome`, never `exit_fullpage_mode`.
+     * This is the one line that caused the restore flicker the owner reported,
+     * and `UIDesktopFullpage.js` has prescribed the chrome-only call in prose
+     * since the two halves were split (W2 item 4) — the prescription was never
+     * followed, and `exit_fullpage_chrome` had ZERO production callers.
+     *
+     * The mechanism, measured on the built bundle in a real Chromium at a
+     * 1280x860 viewport (`shell/seam-minimise-browser-test.mjs` GROUP 5 now
+     * holds these numbers):
+     *
+     *   `exit_fullpage_mode` also runs `reset_window_size_and_position`, so the
+     *   window was reset to its stashed pre-full-bleed box BEFORE `hideWindow`
+     *   ran. `hideWindow` snapshots `data-orig-width/height` from the window's
+     *   CURRENT on-screen size at the instant it is called, so it recorded
+     *   960x570 instead of the real 1280x860. On restore `showWindow` animated
+     *   0x0 -> 960x570 over its own 0.2s transition — a full, smooth animation
+     *   to the WRONG size — the window sat there ~40ms, and then SNAPPED to
+     *   1280x860 in a single frame:
+     *
+     *       t=202ms   960x570   inline=960px/570px   fullbleed=false
+     *       t=243ms   960x570   inline=100%/100%     fullbleed=true   <- go_fullbleed
+     *       t=263ms  1280x860   inline=100%/100%     transition=none  <- SNAP
+     *
+     *   The snap is instant rather than animated because `showWindow` tears the
+     *   transition down at 250ms (UIWindow.js) — 7ms after `go_fullbleed`'s
+     *   220ms timer writes `100%`. Grow-to-small-box, pause, jump-to-full is
+     *   exactly the reported flicker.
+     *
+     * Calling the chrome half instead means geometry never leaves full-bleed
+     * while the window is hidden, so `data-orig-*` records the real full-bleed
+     * size and the restore animates straight to it. `go_fullbleed`'s write at
+     * 220ms then resolves to the same box it is already animating toward, so
+     * there is nothing left to snap. It also leaves the `ezilPrevFp*` stash
+     * intact (`reset_window_size_and_position` consumes it), so a later close
+     * still restores the pre-full-bleed geometry correctly.
      */
     function minimise_to_taskbar (el) {
         // Guarded, because this handler is now reachable from a window that
         // never went full-bleed (the drawer exists from the moment the window
-        // does). `exit_fullpage_mode` on a windowed window would reset its
-        // geometry and re-show a head that was never hidden.
+        // does). The fullpage exit on a windowed window would re-show a head
+        // that was never hidden.
         if ( el.classList.contains(FULLBLEED_CLASS) ) {
+            // The class comes off so the restore observer's `go_fullbleed` is
+            // not turned away by its own already-full-bleed early return; that
+            // call is what puts the chrome back.
             el.classList.remove(FULLBLEED_CLASS);
-            window.exit_fullpage_mode(el);
+            window.exit_fullpage_chrome(el);
         }
         $(el).hideWindow();
     }
@@ -1786,6 +1905,28 @@ export async function openDesktopWindow (ctx = {}) {
             // restores `data-is_fullpage` (which exit_fullpage_mode removed)
             // so a later close() still knows to bring the taskbar back.
             setTimeout(() => go_fullbleed('restored from the taskbar'), 220);
+            // 🔴 And RECONCILE. A restore is the one moment this side knows it
+            // may have been away while something else changed the desktop
+            // underneath it — a troubleshoot restart resets the container to
+            // 1920x1080 and sets no `NEKO_SCREEN`, and a warm container can be
+            // handed to a window that never sized it. Before this the shell had
+            // no way to find out: `stream` is written only by the boot
+            // read-back and by a successful resize, and the controller's dedup
+            // is seeded with the boot ASK, so every later measurement was
+            // dropped as settled against a belief that had stopped being true
+            // and the picture stayed letterboxed to an aspect the stream did
+            // not have.
+            //
+            // Deliberately a READ (`getScreen`), not a re-ask. A set restarts
+            // the capture pipeline; an observation costs two loopback calls
+            // inside a container that is already running, which is what makes
+            // it affordable on a path a user can trigger repeatedly.
+            //
+            // Fire-and-forget and completely silent on failure: a restore must
+            // never wait on the network, and a reconcile that did not answer
+            // leaves the previous belief in place — stale, but strictly better
+            // than a guess.
+            reconcile_screen('restored from the taskbar');
         }
         was_minimized = now_minimized;
     });

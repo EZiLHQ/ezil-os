@@ -38,3 +38,4 @@ app/tsconfig.tsbuildinfo
 # OS / editor cruft
 .DS_Store
 *.log
+.claude/

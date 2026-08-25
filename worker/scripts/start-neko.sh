@@ -217,7 +217,8 @@ if [ "${EZIL_NEKO_CPU_DIAG_ENABLED:-0}" = "1" ]; then
       fi
       sleep "$NEKO_CPU_DIAG_INTERVAL"
     done
-  ) &
+    # 9>&- — see the boot-mutex note on `supervise_app` below.
+  ) 9>&- &
   CPU_DIAG_PID=$!
 fi
 
@@ -670,6 +671,19 @@ _boot_lock_held=0
 # +3ms, after `phase=container_start event=start` and before any other line.
 # `: >` probes creatability harmlessly, so `exec` only ever runs on a path that
 # is already known to open.
+# 🔴 EVERY background job in this file closes fd 9 (`9>&- &`), and that is not
+# tidiness — it is what makes the lock releasable. A flock is held until the
+# LAST descriptor referring to it closes, and `&` jobs inherit the parent's
+# descriptors. Xvfb, openbox, neko itself and every supervised app are all
+# backgrounded here, and the supervised ones are `setsid`-detached so a SIGTERM
+# aimed at this script never reaches them. Any single survivor pins the lock.
+#
+# That is what broke the troubleshoot restart in production: after a restart
+# tore down a RUNNING desktop, a survivor still held the lock, the replacement
+# boot's `flock -w` timed out, and it took the "another boot is in progress"
+# path and exited 0 without starting anything — `desktop_ready_wait` then hung
+# until the caller gave up with `boot_failed`. `neko-boot-lock-fd.test.ts`
+# enforces the rule.
 if command -v flock >/dev/null 2>&1 \
   && mkdir -p "$(dirname "$NEKO_BOOT_LOCK")" 2>/dev/null \
   && : >"$NEKO_BOOT_LOCK" 2>/dev/null \
@@ -944,9 +958,9 @@ launch_devserver() {
   #    a trap, so the handler runs immediately. The exit status is preserved.
   local launch_rc=0
   if command -v nice >/dev/null 2>&1; then
-    nice -n 10 "$DEVSERVER_BIN" "$WORKSPACE_ROOT" &
+    nice -n 10 "$DEVSERVER_BIN" "$WORKSPACE_ROOT" 9>&- &
   else
-    "$DEVSERVER_BIN" "$WORKSPACE_ROOT" &
+    "$DEVSERVER_BIN" "$WORKSPACE_ROOT" 9>&- &
   fi
   local launch_pid=$!
   # Tracked so teardown stops the launcher too if it is still going.
@@ -1033,7 +1047,7 @@ case "$(printf '%s' "${EZIL_BROWSER_SIDECAR:-on}" | tr '[:upper:]' '[:lower:]' |
   log "starting browser sidecar (node $EZIL_SIDECAR_ENTRY) on 0.0.0.0:${EZIL_SIDECAR_PORT}, CDP 127.0.0.1:${EZIL_CDP_PORT:-9222} — log $EZIL_SIDECAR_LOG"
   EZIL_SIDECAR_PORT="$EZIL_SIDECAR_PORT" \
   EZIL_CDP_PORT="${EZIL_CDP_PORT:-9222}" \
-    node "$EZIL_SIDECAR_ENTRY" >>"$EZIL_SIDECAR_LOG" 2>&1 &
+    node "$EZIL_SIDECAR_ENTRY" >>"$EZIL_SIDECAR_LOG" 2>&1 9>&- &
   local sidecar_pid=$!
   # Tracked so teardown stops it with everything else this boot started.
   SESSION_PID+=("$sidecar_pid")
@@ -1183,7 +1197,7 @@ else
   # `--desktop.screen` (see the neko-serve section below), and every later
   # `POST /api/room/screen` can reach any size inside this box.
   log "starting Xvfb on $DISPLAY (framebuffer $EZIL_X_FRAMEBUFFER; initial screen $NEKO_SCREEN, applied by neko)"
-  Xvfb "$DISPLAY" -screen 0 "$EZIL_X_FRAMEBUFFER" -ac +extension RANDR -nolisten tcp >>"$LOG" 2>&1 &
+  Xvfb "$DISPLAY" -screen 0 "$EZIL_X_FRAMEBUFFER" -ac +extension RANDR -nolisten tcp >>"$LOG" 2>&1 9>&- &
   # Recorded so teardown stops the X server too. It used to be missed entirely,
   # so a failed boot left $DISPLAY held by an orphaned Xvfb (with an orphaned
   # openbox and browser still drawing into it) for the life of the container.
@@ -1216,10 +1230,10 @@ export NEKO_OPENBOX_CONFIG="$OPENBOX_CONFIG"
 if [ -x /usr/bin/openbox ] || command -v openbox >/dev/null 2>&1; then
   if [ -n "$OPENBOX_CONFIG" ]; then
     log "starting openbox (config $OPENBOX_CONFIG)"
-    openbox --config-file "$OPENBOX_CONFIG" >>"$LOG" 2>&1 &
+    openbox --config-file "$OPENBOX_CONFIG" >>"$LOG" 2>&1 9>&- &
   else
     log "starting openbox (default config)"
-    openbox >>"$LOG" 2>&1 &
+    openbox >>"$LOG" 2>&1 9>&- &
   fi
   SESSION_PID+=("$!")
   sleep 1
@@ -1294,6 +1308,19 @@ NEKO_APP_HEALTH_FILE="${NEKO_APP_HEALTH_FILE:-/tmp/neko-app-health.json}"
 # serving a half-dead desktop.
 NEKO_APP_FATAL_SENTINEL="${NEKO_APP_FATAL_SENTINEL:-/tmp/neko-app-fatal}"
 rm -f "$NEKO_APP_FATAL_SENTINEL" 2>/dev/null || true
+# The same record for an app that gave up PERMANENTLY but is not
+# desktop-critical (see `_app_is_desktop_critical`). It must exist separately
+# from the fatal sentinel precisely because the main loop treats that one as
+# "terminate the container", and this one must not.
+#
+# 🔴 It is what keeps the health file HONEST. `monitor_apps` recomputes every
+# app's state from whether its process group is alive, and a permanently-dead
+# app looks identical to one that merely has not started: both are "stopped".
+# Without this the editor's own crash-loop would be reported as though it were
+# still coming up, forever — and the Code window would sit on a spinner
+# instead of telling the user what happened.
+NEKO_APP_GAVEUP_SENTINEL="${NEKO_APP_GAVEUP_SENTINEL:-/tmp/neko-app-gaveup}"
+rm -f "$NEKO_APP_GAVEUP_SENTINEL" 2>/dev/null || true
 # Restart budget/backoff. Test harnesses may lower these (e.g. to exhaust
 # retries quickly), but the PRODUCTION DEFAULTS below are deliberately generous
 # and are NOT weakened.
@@ -1420,6 +1447,49 @@ NEKO_APP_CLEAN_EXIT_HEALTHY_MS=60000
 NEKO_APP_CLEAN_RESTART_MAX_DELAY=30
 NEKO_APP_CLEAN_RESTART_MAX_STREAK=6
 
+# ── which apps may take the whole desktop down with them ─────────────────────
+#
+# 🔴 THE BLAST RADIUS FIX. `codeserver` used to be on this list by default,
+# because there was no list — EVERY supervised app that exhausted its restart
+# budget raised the fatal sentinel, and the main loop's response to the
+# sentinel is `terminate_stack` + `exit 1`, i.e. the container dies.
+#
+# That was measured, not theorised. Killing code-server six times in a real
+# container produced:
+#
+#     app=codeserver PERMANENTLY FAILED after 6 attempts — restart budget exhausted
+#     FATAL: mandatory app 'codeserver' permanently failed ... exiting non-zero
+#     container running: false   exit=1
+#
+# So a user installing a VS Code extension that wedges the editor loses their
+# whole desktop session — the browser they were working in, the streamed
+# desktop, everything — and, because container disk is ephemeral, also every
+# extension and editor setting they had installed. That is a reported incident,
+# not a hypothetical.
+#
+# The original contract — "no apparently-ready desktop with a dead app" — is
+# right about the DESKTOP. It is wrong about the editor. Neko without X or
+# without a browser is a desktop that cannot do anything, and pretending
+# otherwise is the dishonesty that rule exists to prevent. Neko without
+# code-server is a working desktop with one app unavailable, which is a true
+# thing the Code window can say for itself.
+#
+# What does NOT change: the boot-time preflight. A missing code-server BINARY
+# still fails startup before readiness (see the preflight above) — an image
+# built without it is a broken image, and that check was always the valuable
+# one. This only governs a RUNTIME crash-loop of an app that did start.
+NEKO_DESKTOP_CRITICAL_APPS="${NEKO_DESKTOP_CRITICAL_APPS:-chromium}"
+
+# _app_is_desktop_critical <name> — may this app's permanent failure terminate
+# the whole desktop? Returns 0 (true) only for names in the list above.
+_app_is_desktop_critical() {
+  local needle="$1" item
+  for item in $NEKO_DESKTOP_CRITICAL_APPS; do
+    [ "$item" = "$needle" ] && return 0
+  done
+  return 1
+}
+
 # _app_exit_is_clean <rc> <uptime_ms> — the rule above, and nothing else.
 # Returns 0 (true) for a clean, user-initiated quit.
 _app_exit_is_clean() {
@@ -1463,7 +1533,7 @@ supervise_app() {
   (
     while true; do
       app_started_ms="$(date +%s%3N)"
-      setsid "$@" >>"$LOG" 2>&1 &
+      setsid "$@" >>"$LOG" 2>&1 9>&- &
       app_pgid=$!
       # Written atomically so terminate_stack can never read a half-written
       # number, and rewritten on every restart so the recorded pgid is always
@@ -1532,13 +1602,19 @@ supervise_app() {
       emit_telemetry "container:neko#app_exit" "error" "$uptime_ms"
       attempt=$((attempt + 1))
       if [ "$attempt" -gt "$max_restarts" ]; then
-        log "app=$name PERMANENTLY FAILED after $attempt attempts — restart budget exhausted. Marking desktop unhealthy; neko/container will terminate (contract: no apparently-ready desktop with a dead mandatory app)."
-        # Record the permanent failure for machine-checkable evidence, then
-        # raise the fatal sentinel the main loop watches.
+        # Record the permanent failure for machine-checkable evidence either
+        # way — what differs is whether it also takes the desktop down.
         APP_STATE[$name]="failed"
         APP_RESTARTS[$name]=$((attempt - 1))
         write_health
-        echo "$name" >>"$NEKO_APP_FATAL_SENTINEL"
+        if _app_is_desktop_critical "$name"; then
+          log "app=$name PERMANENTLY FAILED after $attempt attempts — restart budget exhausted. Marking desktop unhealthy; neko/container will terminate (contract: no apparently-ready desktop with a dead desktop-critical app)."
+          echo "$name" >>"$NEKO_APP_FATAL_SENTINEL"
+        else
+          log "app=$name PERMANENTLY FAILED after $attempt attempts — restart budget exhausted. This app is NOT desktop-critical: the desktop, the browser and the user's session KEEP RUNNING, and '$name' is reported failed in the health file so the surface that fronts it can say so honestly."
+          echo "$name" >>"$NEKO_APP_GAVEUP_SENTINEL"
+          emit_telemetry "container:neko#app_gave_up" "error" "$uptime_ms"
+        fi
         break
       fi
       sleep "$NEKO_APP_RESTART_DELAY"
@@ -1547,7 +1623,32 @@ supervise_app() {
     # with it — otherwise the next boot would find files for processes that no
     # longer exist and could chase recycled pids.
     rm -f "$pgid_file" "$sup_file" 2>/dev/null || true
-  ) &
+  # 🔴 `9>&-` — THE BOOT MUTEX, AND THIS BROKE RESTART IN PRODUCTION.
+  #
+  # The mutex near the top of this file holds its lock with `exec 9>$LOCK` for
+  # the life of the script, and a `flock` is released only when EVERY
+  # descriptor referring to it is closed. A backgrounded subshell inherits its
+  # parent's open fds, so each supervisor kept fd 9 open — and supervisors are
+  # `setsid`-detached and outlive a SIGTERM to the launcher.
+  #
+  # So after a restart tore down a RUNNING stack, the old supervisors were
+  # still holding the boot lock when the replacement boot started. That boot's
+  # `flock -w` timed out, concluded another boot was already in progress, and
+  # exited 0 — the documented "skipped" path. Nothing ever started.
+  #
+  # The symptom was 200 miles from the cause. Measured against production:
+  #
+  #     phase=restart event=start detail=mode=neko
+  #     phase=container_start event=end status=ok phase_ms=60   <- process spawned
+  #     phase=desktop_ready_wait event=start                    <- and then nothing
+  #     ... 183s later: outcome=boot_failed
+  #
+  # and it was selective in the most misleading way possible: a restart with
+  # NOTHING running succeeded (`outcome: started`, 13s) because there were no
+  # survivors holding the lock, while a restart of a working desktop always
+  # failed. The troubleshoot button worked right up until you had something to
+  # troubleshoot.
+  ) 9>&- &
   APP_PID[$name]=$!
   # Ownership record for the SUPERVISOR, alongside the app pgid the subshell
   # publishes. Both are needed, and finding that out cost a container:
@@ -1644,6 +1745,14 @@ monitor_apps() {
     local name pgid
     for name in "${!APP_PID[@]}"; do
       if [ -f "$NEKO_APP_FATAL_SENTINEL" ] && grep -qx "$name" "$NEKO_APP_FATAL_SENTINEL" 2>/dev/null; then
+        APP_STATE[$name]="failed"
+        continue
+      fi
+      # Same treatment for an app that gave up without being desktop-critical.
+      # Without this the loop below would recompute it from a dead process
+      # group and report "stopped" — indistinguishable from "not started yet",
+      # which is exactly the ambiguity the Code window cannot act on.
+      if [ -f "$NEKO_APP_GAVEUP_SENTINEL" ] && grep -qx "$name" "$NEKO_APP_GAVEUP_SENTINEL" 2>/dev/null; then
         APP_STATE[$name]="failed"
         continue
       fi
@@ -1809,9 +1918,117 @@ seed_codeserver_user_settings() {
   mkdir -p "$_cs_user_dir" 2>/dev/null || return 1
   cat >"$_cs_settings" <<'CODESERVER_SETTINGS_JSON'
 {
-  "security.workspace.trust.enabled": false
+  "security.workspace.trust.enabled": false,
+  "files.exclude": {
+    "**/.ezil": true
+  }
 }
 CODESERVER_SETTINGS_JSON
+}
+
+# ── editor state that OUTLIVES the container ────────────────────────────────
+#
+# 🔴 THE INCIDENT THIS EXISTS FOR. A user installed a VS Code extension and a
+# CLI, used them, and the editor died. On the next load their project was
+# there but "the changes weren't there" — every extension and every editor
+# setting was gone. That was not a sync bug. code-server runs with
+# `--user-data-dir` and `--extensions-dir` under /tmp, and PLATFORM-NOTES §8 is
+# explicit that all container disk is ephemeral and host restarts happen with
+# no notice. Those directories were never going to survive, by construction.
+#
+# 🔴 WHY A MANIFEST AND NOT A SYNC. The obvious fix — point those dirs at the
+# R2-backed workspace — is the wrong one, and `workspace-persist.ts` says why
+# in its own words: whole files pass through the Durable Object ONE RPC CALL AT
+# A TIME, which is why `node_modules` is on the never-walked list. An
+# extensions directory is node_modules-shaped (thousands of files, tens of MB
+# for a single extension), so blob-syncing it would dominate every flush cycle
+# for the whole fleet. Extension BINARIES are reproducible from a name; only
+# the LIST is irreplaceable. So the list is what gets persisted — a few hundred
+# bytes — and the binaries are refetched. This is the devcontainer model, and
+# it self-heals: a corrupted extension does not get preserved forever.
+#
+# Settings are the opposite shape — small, hand-written, and NOT reproducible
+# from anything — so `settings.json` and `keybindings.json` are copied
+# verbatim. They are the two files a user would actually be upset to lose.
+#
+# Lives under the workspace root because that is the one directory already
+# persisted; `.ezil/` is hidden from the editor's own explorer by the seeded
+# `files.exclude` below, so it does not clutter the file tree.
+EZIL_EDITOR_STATE_DIR="${EZIL_EDITOR_STATE_DIR:-${WORKSPACE_ROOT}/.ezil}"
+EZIL_EDITOR_EXT_MANIFEST="${EZIL_EDITOR_STATE_DIR}/extensions.txt"
+EZIL_EDITOR_SETTINGS_BACKUP="${EZIL_EDITOR_STATE_DIR}/settings.json"
+EZIL_EDITOR_KEYBINDINGS_BACKUP="${EZIL_EDITOR_STATE_DIR}/keybindings.json"
+# How often to re-capture. Cheap: a directory listing and two small file
+# copies, only written when something actually changed.
+EZIL_EDITOR_STATE_INTERVAL="${EZIL_EDITOR_STATE_INTERVAL:-30}"
+
+# The installed set, as extension ids, one per line. Read from the extensions
+# DIRECTORY rather than `code-server --list-extensions`, which spawns a whole
+# Node process and takes seconds; the directory basenames carry the id and the
+# version (`publisher.name-1.2.3`), and the version is deliberately stripped so
+# a restore installs the current release rather than pinning a stale one.
+_ezil_installed_extension_ids() {
+  [ -d "$CODE_SERVER_EXTENSIONS_DIR" ] || return 0
+  find "$CODE_SERVER_EXTENSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
+    | sed -E 's/-[0-9]+\.[0-9]+\.[0-9]+(-.*)?$//' \
+    | grep -E '^[A-Za-z0-9][A-Za-z0-9_-]*\.[A-Za-z0-9][A-Za-z0-9_.-]*$' \
+    | sort -u
+}
+
+# Write the manifest and back up the two settings files — only on a real
+# change, so an idle session does not rewrite workspace files every 30s and
+# make the flush think there is work to do.
+_ezil_capture_editor_state() {
+  mkdir -p "$EZIL_EDITOR_STATE_DIR" 2>/dev/null || return 1
+  _ids="$(_ezil_installed_extension_ids)"
+  if [ -n "$_ids" ] && [ "$_ids" != "$(cat "$EZIL_EDITOR_EXT_MANIFEST" 2>/dev/null)" ]; then
+    printf '%s\n' "$_ids" >"${EZIL_EDITOR_EXT_MANIFEST}.tmp" 2>/dev/null \
+      && mv "${EZIL_EDITOR_EXT_MANIFEST}.tmp" "$EZIL_EDITOR_EXT_MANIFEST" 2>/dev/null \
+      && log "editor state: captured $(printf '%s\n' "$_ids" | wc -l) extension id(s) for restore"
+  fi
+  for _pair in "User/settings.json:$EZIL_EDITOR_SETTINGS_BACKUP" "User/keybindings.json:$EZIL_EDITOR_KEYBINDINGS_BACKUP"; do
+    _src="${CODE_SERVER_USER_DATA_DIR}/${_pair%%:*}"
+    _dst="${_pair#*:}"
+    if [ -s "$_src" ] && ! cmp -s "$_src" "$_dst" 2>/dev/null; then
+      cp -f "$_src" "$_dst" 2>/dev/null && log "editor state: backed up $(basename "$_src")"
+    fi
+  done
+}
+
+# Put back what the manifest names. Runs in the BACKGROUND and never gates
+# readiness: a restore that needs the network must not be able to delay — or
+# fail — a desktop the user is waiting for. Everything here is best-effort by
+# design; a failed reinstall costs one extension, not the session.
+_ezil_restore_editor_state() {
+  for _pair in "$EZIL_EDITOR_SETTINGS_BACKUP:User/settings.json" "$EZIL_EDITOR_KEYBINDINGS_BACKUP:User/keybindings.json"; do
+    _src="${_pair%%:*}"
+    _dst="${CODE_SERVER_USER_DATA_DIR}/${_pair#*:}"
+    if [ -s "$_src" ] && [ ! -s "$_dst" ]; then
+      mkdir -p "$(dirname "$_dst")" 2>/dev/null
+      cp -f "$_src" "$_dst" 2>/dev/null && log "editor state: restored $(basename "$_dst")"
+    fi
+  done
+
+  [ -s "$EZIL_EDITOR_EXT_MANIFEST" ] || return 0
+  _already="$(_ezil_installed_extension_ids)"
+  _want="$(grep -E '^[A-Za-z0-9][A-Za-z0-9_-]*\.[A-Za-z0-9][A-Za-z0-9_.-]*$' "$EZIL_EDITOR_EXT_MANIFEST" 2>/dev/null | sort -u)"
+  [ -n "$_want" ] || return 0
+  _missing=""
+  for _id in $_want; do
+    printf '%s\n' "$_already" | grep -qx "$_id" || _missing="$_missing $_id"
+  done
+  [ -n "$_missing" ] || return 0
+  log "editor state: reinstalling$(printf '%s' "$_missing") (from the manifest this workspace carries)"
+  for _id in $_missing; do
+    if timeout 180 "$CODE_SERVER_BIN" \
+        --user-data-dir="$CODE_SERVER_USER_DATA_DIR" \
+        --extensions-dir="$CODE_SERVER_EXTENSIONS_DIR" \
+        --install-extension "$_id" >>"$LOG" 2>&1; then
+      log "editor state: reinstalled $_id"
+    else
+      log "editor state: could NOT reinstall $_id — continuing (one extension, not the session)"
+    fi
+  done
 }
 
 if seed_codeserver_user_settings "$CODE_SERVER_USER_DATA_DIR"; then
@@ -1830,6 +2047,29 @@ supervise_app codeserver "$NEKO_APP_MAX_RESTARTS" "$CODE_SERVER_BIN" \
   --extensions-dir="$CODE_SERVER_EXTENSIONS_DIR" \
   "$WORKSPACE_ROOT"
 phase_end codeserver_launch ok
+
+# Restore first, then keep capturing. Both in one detached subshell so neither
+# can delay readiness — see `_ezil_restore_editor_state` for why that matters.
+#
+# 🔴 `9>&-` IS LOAD-BEARING, and leaving it out cost a boot. The boot mutex
+# near the top of this file holds its lock on file descriptor 9 for the life
+# of the script. A `flock` is released only when EVERY descriptor referring to
+# it is closed, and a backgrounded subshell inherits the parent's open fds — so
+# this loop, which outlives nothing but is never reaped promptly, kept fd 9
+# open and the boot lock was never released. The symptom was not here at all:
+# the NEXT boot's `flock -w` timed out, concluded another boot was in progress,
+# skipped, and exited 0 — leaving a container that reported success with neko
+# never bound. `neko-teardown-orphans.test.ts`'s "lets a SECOND boot succeed on
+# the same ports afterwards" is what caught it.
+(
+  _ezil_restore_editor_state
+  while true; do
+    sleep "$EZIL_EDITOR_STATE_INTERVAL"
+    [ -f "$NEKO_SHUTDOWN_FLAG" ] && break
+    _ezil_capture_editor_state
+  done
+) 9>&- >/dev/null 2>&1 &
+log "editor state: restore+capture loop started (manifest ${EZIL_EDITOR_EXT_MANIFEST}, every ${EZIL_EDITOR_STATE_INTERVAL}s)"
 
 # ── Native browser (mandatory — validated above in preflight; never skipped) ─
 # Reuses whichever Chromium-family binary the image already has installed
@@ -2046,7 +2286,7 @@ supervise_app chromium "$NEKO_APP_MAX_RESTARTS" "$CHROME_BIN" \
   "$CHROME_HOME_URL"
 phase_end chrome_launch ok
 
-monitor_apps &
+monitor_apps 9>&- &   # 9>&- — see the boot-mutex note on `supervise_app`.
 MONITOR_PID=$!
 
 # ── Focus/app switching helper (deterministic, machine-checkable) ────────────
@@ -2416,7 +2656,7 @@ log "waiting up to ${NEKO_WINDOW_READY_TIMEOUT}s (concurrently) for mandatory ap
 
 declare -A APP_WAIT_PID=()
 for spec in "${DESKTOP_APP_SPECS[@]}"; do
-  wait_for_app_ready "$spec" "$NEKO_WINDOW_READY_TIMEOUT" &
+  wait_for_app_ready "$spec" "$NEKO_WINDOW_READY_TIMEOUT" 9>&- &
   APP_WAIT_PID["$spec"]=$!
 done
 
@@ -2677,9 +2917,125 @@ verify_browser_frame || true
 # and `NEKO_CAPTURE_VIDEO_IDS` because setting `capture.video.pipelines` does
 # not implicitly populate `capture.video.ids` — an empty id list would leave
 # no video stream selectable at all.
+# ── ADAPTIVE QUALITY: a tier ladder, and an estimator that starts PASSIVE ────
+#
+# 🔴 THREE PIPELINES, NOT ONE — and this costs nothing while nobody is on the
+# lower ones. The pinned binary's `StreamSinkManagerCtx` starts a pipeline on
+# its FIRST listener and stops it on its last ("first listener, starting" /
+# "last listener, stopping" are both strings in the binary), so a declared
+# tier with no viewer is not encoding. Declaring the ladder is what makes
+# adaptation POSSIBLE; it is not itself a cost.
+#
+# The ladder, all vp8/cpu-used=4/threads=2 as before — only the bitrate base
+# and (at the bottom) the frame rate move, per the trade-off reasoned above:
+#
+#   main  base 3072  15fps  ~2.0 Mbit/s   unchanged; the default, first in the
+#                                         id list, and what every session that
+#                                         never degrades keeps using
+#   sd    base 1536  15fps  ~1.0 Mbit/s   half the bitrate at the SAME frame
+#                                         rate — motion stays smooth and the
+#                                         picture softens, which is the right
+#                                         trade for a desktop full of text
+#   lo    base  768  12fps  ~0.5 Mbit/s   the floor: only here does fps drop,
+#                                         because below ~0.5 Mbit/s at 15fps
+#                                         vp8 spends its whole budget on
+#                                         keyframes and the picture pulses
+#
+# 🔴 WHY THE SERVER DECIDES AND NOT THE CLIENT. The binary is neko v3 and has
+# the full pion GCC send-side estimator and `WebRTCPeerCtx.SetVideo` /
+# `Track.SetStream` / `MoveListenerTo` compiled in, so a tier switch swaps the
+# sample source behind the EXISTING RTP track — no renegotiation, no client
+# message. That matters because the client bundle shipped in this image is the
+# v2 LEGACY client: `getStats` appears zero times in all four of its JS
+# bundles, it has no `signal/video`, and the v2<->v3 legacy bridge the server
+# runs has no v2 message that could carry a quality request. A client-side
+# quality picker is therefore not available without replacing /var/www, and it
+# is also not NEEDED — the server can do the whole job without the client ever
+# learning it happened.
+#
+# 🔴 THE ESTIMATOR SHIPS IN PASSIVE MODE. `NEKO_WEBRTC_ESTIMATOR_PASSIVE=true`
+# means it estimates and logs and switches NOTHING. That is not timidity, it
+# is the only honest first step on THIS platform: GCC infers congestion from
+# DELAY GRADIENT, and Cloudflare Containers have no UDP, so every session is
+# relayed over TCP TURN (docs/PLATFORM-NOTES.md §6; SANDBOX_NEKO_ICE_POLICY is
+# "relay"). TCP head-of-line blocking manufactures delay that is not
+# congestion. An estimator that misreads that would drop a user's picture to
+# fix a problem that does not exist, and a steady picture beats a wrongly
+# degraded one. Passive + debug is how we find out which it is, from real
+# sessions, before anything is allowed to act.
+#
+# To go active after reading those logs, set NEKO_WEBRTC_ESTIMATOR_PASSIVE=false
+# per-deployment — no image rebuild. The defaults left alone here are the
+# binary's own: 2s read interval, 12s stable before an upgrade, 6s unstable and
+# 24s stalled before a downgrade, 0.15 diff threshold.
+# 🔴 ONE ID, NOT THREE — REVERTED IN PRODUCTION AFTER A BLACK STREAM.
+#
+# The ladder below stays DEFINED (declaring a pipeline nobody listens to costs
+# nothing: the binary starts a sink on its first listener and stops it on its
+# last), but only `main` is ADVERTISED, because advertising all three took
+# production's video away.
+#
+# What happened, and why it was not caught sooner: the first deploy of the
+# ladder was tested against a container that had not actually rolled. Cloudflare
+# containers are Durable-Object pinned, so a warm instance keeps serving the
+# OLD image until it stops — `prod.mjs` passed 17/17 with the desktop painting
+# at mean=40.8 against the previous script. Only when a later fix forced fresh
+# containers did the new capture config actually run, and then the neko client
+# came up with NO VIDEO TRACK AT ALL (`videoWidth === 0`, not a black picture)
+# on both desktop and phone.
+#
+# The likely mechanism, stated as the hypothesis it is: the client bundle in
+# this image is the v2 LEGACY client, and the v2<->v3 bridge has no message
+# through which a client can select among several video ids. With one id there
+# is nothing to select. That is INFERRED — the black stream is measured, the
+# cause is not yet proven — which is exactly why production goes back to the
+# configuration that is known to work while it is investigated.
+#
+# Re-enabling is a one-line change once a container test drives a real WebRTC
+# client against a multi-id build and shows a video track arriving.
 NEKO_CAPTURE_VIDEO_IDS="${NEKO_CAPTURE_VIDEO_IDS:-main}"
-NEKO_CAPTURE_VIDEO_PIPELINES="${NEKO_CAPTURE_VIDEO_PIPELINES:-{\"main\":{\"fps\":\"15\",\"gst_encoder\":\"vp8enc\",\"gst_params\":{\"target-bitrate\":\"round(3072 * 650)\",\"cpu-used\":\"4\",\"end-usage\":\"cbr\",\"threads\":\"2\",\"deadline\":\"1\",\"undershoot\":\"95\",\"buffer-size\":\"(3072 * 4)\",\"buffer-initial-size\":\"(3072 * 2)\",\"buffer-optimal-size\":\"(3072 * 3)\",\"keyframe-max-dist\":\"25\",\"min-quantizer\":\"4\",\"max-quantizer\":\"20\"}}}}"
+# 🔴 NOT `${VAR:-<json>}`. That is how this was first written and it SILENTLY
+# TRUNCATED: bash matches braces inside a `${...}` expansion, so a default
+# value that is itself brace-heavy JSON ends early. With three tiers the
+# expansion produced only `{"main":...}` — valid JSON, one tier — while
+# NEKO_CAPTURE_VIDEO_IDS happily became `main,sd,lo`. The container then
+# booted "successfully" with two of its three advertised streams not existing
+# at all, and the only symptom would have been a switch to a stream that was
+# never declared. Single-quoted heredoc-free assignment behind an explicit
+# emptiness test has neither problem, and drops the backslash-escaping too.
+if [ -z "${NEKO_CAPTURE_VIDEO_PIPELINES:-}" ]; then
+  NEKO_CAPTURE_VIDEO_PIPELINES='{"main":{"fps":"15","gst_encoder":"vp8enc","gst_params":{"target-bitrate":"round(3072 * 650)","cpu-used":"4","end-usage":"cbr","threads":"2","deadline":"1","undershoot":"95","buffer-size":"(3072 * 4)","buffer-initial-size":"(3072 * 2)","buffer-optimal-size":"(3072 * 3)","keyframe-max-dist":"25","min-quantizer":"4","max-quantizer":"20"}},"sd":{"fps":"15","gst_encoder":"vp8enc","gst_params":{"target-bitrate":"round(1536 * 650)","cpu-used":"4","end-usage":"cbr","threads":"2","deadline":"1","undershoot":"95","buffer-size":"(1536 * 4)","buffer-initial-size":"(1536 * 2)","buffer-optimal-size":"(1536 * 3)","keyframe-max-dist":"25","min-quantizer":"4","max-quantizer":"20"}},"lo":{"fps":"12","gst_encoder":"vp8enc","gst_params":{"target-bitrate":"round(768 * 650)","cpu-used":"4","end-usage":"cbr","threads":"2","deadline":"1","undershoot":"95","buffer-size":"(768 * 4)","buffer-initial-size":"(768 * 2)","buffer-optimal-size":"(768 * 3)","keyframe-max-dist":"25","min-quantizer":"4","max-quantizer":"20"}}}'
+fi
+
+# 🔴 AND THEN CHECK IT, because "the variable is set" is not "the value is
+# right" — this exact bug set both variables and was wrong. Every id must name
+# a pipeline that actually exists; an id without one is a stream neko can be
+# asked to switch to and cannot produce.
+_ids_ok=1
+_IFS_save=$IFS; IFS=','
+for _vid in $NEKO_CAPTURE_VIDEO_IDS; do
+  case "$NEKO_CAPTURE_VIDEO_PIPELINES" in
+    *"\"$_vid\":"*) ;;
+    *) echo "[ezil-boot] FATAL: video id '$_vid' has no pipeline in NEKO_CAPTURE_VIDEO_PIPELINES" >&2; _ids_ok=0 ;;
+  esac
+done
+IFS=$_IFS_save
+if [ "$_ids_ok" != "1" ]; then
+  echo "[ezil-boot] ids=$NEKO_CAPTURE_VIDEO_IDS" >&2
+  echo "[ezil-boot] refusing to start neko with a video id that names no pipeline." >&2
+  exit 1
+fi
+unset _ids_ok _vid _IFS_save
+# The bandwidth estimator. Compiled in, and OFF at the binary's own default —
+# these three lines are what turn it on, observing only.
+# Nothing to switch between while only one id is advertised, so this stays
+# OFF (the binary's own default) rather than leaving an unverified subsystem
+# running in production. It goes back on with the ladder.
+NEKO_WEBRTC_ESTIMATOR_ENABLED="${NEKO_WEBRTC_ESTIMATOR_ENABLED:-false}"
+NEKO_WEBRTC_ESTIMATOR_PASSIVE="${NEKO_WEBRTC_ESTIMATOR_PASSIVE:-true}"
+NEKO_WEBRTC_ESTIMATOR_DEBUG="${NEKO_WEBRTC_ESTIMATOR_DEBUG:-true}"
 export NEKO_CAPTURE_VIDEO_IDS NEKO_CAPTURE_VIDEO_PIPELINES
+export NEKO_WEBRTC_ESTIMATOR_ENABLED NEKO_WEBRTC_ESTIMATOR_PASSIVE NEKO_WEBRTC_ESTIMATOR_DEBUG
 log "video encoder: vp8 software, 1920x1080, 15fps, cpu-used=4, threads=2, ~2.0Mbps (re-tuned for standard-3's 2 vCPU now that code-server replaced the second Electron-class renderer; see start-neko.sh comment for full precedence/justification)"
 
 # ── Neko application server (HTTP UI + WebSocket signaling) ────────────────────
@@ -2764,7 +3120,7 @@ NEKO_DESKTOP_INPUT_ENABLED="false" \
     --desktop.display "$DISPLAY" \
     --desktop.screen "$NEKO_DESKTOP_SCREEN_SPEC" \
     --session.implicit_hosting=true \
-    --capture.video.display "$DISPLAY" >>"$LOG" 2>&1 &
+    --capture.video.display "$DISPLAY" >>"$LOG" 2>&1 9>&- &
 NEKO_PID=$!
 
 if wait_tcp 127.0.0.1 "$NEKO_HTTP_PORT" 120; then

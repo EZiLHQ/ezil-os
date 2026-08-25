@@ -287,10 +287,30 @@ export async function openCodeWindow (ctx = {}) {
     const progress = AppSpinner({ label: 'Opening Code…', onRetry: () => { void start_boot(); } });
     el_body.appendChild(progress.el);
 
-    // ── the "no field yet" panel — same reasoning as `preview.js`'s: "the
-    // deployment does not support this" is a different, honest claim from any
-    // BootProgress state, and blurring them would say something untrue. No
-    // Retry: the next attempt fails identically until the deployment changes.
+    // ── the "editor is not reachable" panel ──────────────────────────────
+    //
+    // 🔴 REWRITTEN 2026-08-22, and the old copy was WRONG IN THE FIELD. It
+    // read "This computer's code editor hasn't been turned on for this
+    // deployment", with no Retry, on the reasoning that "the next attempt
+    // fails identically until the deployment changes".
+    //
+    // That reasoning does not hold, because `code_preview_unavailable` is not
+    // a statement about configuration. All three of its producers
+    // (`cloudflare-guacamole.ts`) are RUNTIME conditions: the code-preview
+    // port could not be exposed, the Worker reports it is not exposed, or the
+    // origin could not be derived. Every one of them is true of a container
+    // whose code-server has just crashed or is still coming up, and every one
+    // of them can stop being true a second later.
+    //
+    // A user hit exactly this: they installed an extension, the editor died,
+    // and on refresh the OS told them the editor had never been turned on for
+    // their deployment. That is a false statement about their account
+    // presented as a settled fact, and it sent them looking for a
+    // configuration problem that did not exist.
+    //
+    // So the copy now says only what is actually known — the editor is not
+    // reachable right now — and there IS a Retry, because the most common
+    // cause is transient.
     const el_unavailable = document.createElement('div');
     // Styles live in `ezil-shell.css`, NOT inline: an inline `display` beats
     // the UA's `[hidden] { display: none }`, so `hidden = true` below would
@@ -298,11 +318,21 @@ export async function openCodeWindow (ctx = {}) {
     el_unavailable.className = 'ezil-code-unavailable';
     el_unavailable.hidden = true;
     el_unavailable.innerHTML = `
-        <div style="font-size:15px;font-weight:600;">Code isn't available yet</div>
-        <div style="font-size:13px;max-width:32em;opacity:0.75;">
-            This computer's code editor hasn't been turned on for this deployment.
-            The full desktop still works from its own window.
+        <div style="font-size:15px;font-weight:600;">Code isn't reachable right now</div>
+        <div style="font-size:13px;max-width:34em;opacity:0.75;">
+            The code editor on this computer isn't answering. It may still be
+            starting up, or it may have stopped — installing an extension can
+            restart it. The full desktop keeps running in its own window.
         </div>`;
+    // A real Retry. `start_boot` re-mints from scratch and is already
+    // re-entrant (`my_attempt !== attempt` guards every await in it), which is
+    // the same contract `AppSpinner`'s own onRetry relies on.
+    const el_retry = document.createElement('button');
+    el_retry.type = 'button';
+    el_retry.className = 'ezil-code-unavailable-retry';
+    el_retry.textContent = 'Try again';
+    el_retry.addEventListener('click', () => { void start_boot(); });
+    el_unavailable.appendChild(el_retry);
     el_body.appendChild(el_unavailable);
 
     const show_panel = () => { progress.el.hidden = false; el_unavailable.hidden = true; };

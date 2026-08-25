@@ -454,8 +454,50 @@ export function createScreenController (opts = {}) {
         cancel();
     }
 
+    /**
+     * Replace the belief with an OBSERVATION.
+     *
+     * 🔴 THE ONE THING `seed` CANNOT DO, and the reason this controller could
+     * not previously correct itself. `seed` records a truth AND an ask
+     * together, which is right at boot: the ask is what produced the truth. But
+     * when the screen changes without this side asking — the troubleshoot
+     * restart resets the container to 1920x1080 and sets no `NEKO_SCREEN`; a
+     * warm container is handed to a window that never sized it — there IS no
+     * corresponding ask, and `last_sent` still holds the boot measurement. Every
+     * observer tick then matches `last_sent`, `settled()` returns true, and the
+     * controller sits there forever believing a size the desktop stopped being.
+     * The picture stays letterboxed to an aspect the stream does not have until
+     * the window is closed and reopened.
+     *
+     * So this writes `last_applied` from the observation and, when the
+     * observation DISAGREES with what was last put on the wire, clears
+     * `last_sent`. Clearing it is the whole point: it un-suppresses the next
+     * tick, so the observer's very next measurement is allowed to reach the
+     * server again.
+     *
+     * When the observation AGREES, `last_sent` is deliberately left alone —
+     * nothing has gone stale, and dropping it would turn a free reconcile into
+     * a capture-pipeline restart on every restore.
+     *
+     * @param {number} width  What the server says the desktop IS.
+     * @param {number} height
+     * @returns {{changed: boolean}} `changed` is whether this actually
+     *   contradicted the previous belief — the caller may want to refit.
+     */
+    function reconcile (width, height) {
+        if ( ! Number.isInteger(width) || ! Number.isInteger(height) || width <= 0 || height <= 0 ) {
+            return { changed: false };
+        }
+        const was = last_applied;
+        const changed = ! was || was.width !== width || was.height !== height;
+        last_applied = { width, height };
+        if ( changed ) last_sent = null;
+        return { changed };
+    }
+
     return {
         seed,
+        reconcile,
         request,
         cancel,
         dispose,

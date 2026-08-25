@@ -4851,6 +4851,85 @@ async function withDeadline<T>(work: Promise<T>, ms: number, label: string): Pro
   }
 }
 
+/**
+ * `GET /sandbox/:name/screen` — an OBSERVATION, never a change.
+ *
+ * 🔴 WHY A READ ROUTE HAS TO EXIST AT ALL
+ *
+ * Before this, the only way for the shell to learn the desktop's real size was
+ * to SET it, and that made the shell structurally incapable of correcting
+ * itself. `stream` (in `desktop-window.js`) is written exactly twice — once
+ * from the boot read-back and once from a successful live resize — and
+ * `createScreenController` seeds `last_sent` with the boot ASK so the first
+ * observer tick does not immediately re-send it. Both are right on their own.
+ * Together they mean that when the container's screen changes WITHOUT the
+ * shell asking, the shell has no way to find out and no way to be told:
+ *
+ *   - the troubleshoot restart path resets the container to 1920x1080 and
+ *     deliberately sets no `NEKO_SCREEN` (see the block above `handleRestart`),
+ *   - a warm container can be handed to a window that never asked for its size,
+ *
+ * and in both cases every subsequent measurement is dropped as `settled`
+ * against a belief that is now false. The picture stays letterboxed to an
+ * aspect the stream does not have until the user closes the window and opens
+ * it again. That is the misalignment this route exists to end.
+ *
+ * A GET is the right shape because the alternative — re-asking — is not free:
+ * a screen change restarts the capture pipeline. Reconciling must cost a read.
+ *
+ * Shares `handleScreen`'s login and `readNekoScreen`, so there is exactly one
+ * definition of "what the screen is" and it cannot drift from the setter's.
+ * Same HMAC gate as every other sandbox control route.
+ */
+async function handleScreenRead(env: Env, sandboxName: string): Promise<Response> {
+  const started = Date.now();
+  const remaining = () => Math.max(1, SCREEN_SET_BUDGET_MS - (Date.now() - started));
+  const nekoPort = portFor('neko').port;
+  const origin = `http://127.0.0.1:${nekoPort}`;
+
+  try {
+    const sandbox = openSandbox(env, sandboxName);
+    const creds = await deriveNekoCredentials(env, sandboxName);
+
+    const loginRes = await withDeadline(sandbox.containerFetch(
+      `${origin}/api/login`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'ezil-os-screen', password: creds.admin }),
+      },
+      nekoPort,
+    ), remaining(), 'screen read login');
+    if (!loginRes.ok) {
+      return json({ ok: false, sandboxId: sandboxName, error: `screen_login_failed_${loginRes.status}` }, 502);
+    }
+    const login = (await loginRes.json()) as { token?: unknown };
+    if (typeof login.token !== 'string' || login.token === '') {
+      return json({ ok: false, sandboxId: sandboxName, error: 'screen_login_failed_no_token' }, 502);
+    }
+
+    const observed = await withDeadline(
+      readNekoScreen(sandbox, origin, nekoPort, login.token),
+      remaining(),
+      'screen read',
+    );
+    // 🔴 An unreadable screen is `ok: false`, not a guess. The whole point of
+    // this route is to replace a stale belief with the truth; answering with a
+    // default would replace it with a different untruth, and the caller cannot
+    // tell the two apart.
+    if (!observed) {
+      return json({ ok: false, sandboxId: sandboxName, error: 'screen_unreadable' }, 502);
+    }
+    return json({ ok: true, sandboxId: sandboxName, width: observed.width, height: observed.height });
+  } catch (err) {
+    const e = err as { name?: string; message?: string };
+    if (e?.name === 'TimeoutError') {
+      return json({ ok: false, sandboxId: sandboxName, error: 'screen_timeout' }, 504);
+    }
+    return json({ ok: false, sandboxId: sandboxName, error: 'screen_upstream_exception' }, 502);
+  }
+}
+
 async function handleScreen(request: Request, env: Env, sandboxName: string): Promise<Response> {
   let body: unknown = {};
   try {
@@ -5684,7 +5763,21 @@ async function handleBrowserSidecar(
   sandboxName: string,
   rawVerb: string,
 ): Promise<Response> {
-  const resolved = resolveSidecarVerb(rawVerb, 'POST');
+  // 🔴 THE CALLER'S REAL METHOD, not a hardcoded 'POST'. This used to pass the
+  // literal string, which had two consequences and only the harmless-looking
+  // one was noticed:
+  //
+  //   * `health` is the contract's only GET verb, so it ALWAYS mismatched and
+  //     was unreachable — the one verb an MCP client calls first.
+  //   * and once the route admitted GET at all, a hardcoded 'POST' here would
+  //     have resolved `GET /browser/click` as a POST and forwarded it. A GET
+  //     is cacheable, prefetchable and crawlable; that would have made it
+  //     possible to click inside a user's logged-in browser by following a
+  //     link. `route-auth.test.ts` asserts both directions.
+  //
+  // `resolveSidecarVerb` is the sole authority on which verb takes which
+  // method, and it can only be that if it is told the truth.
+  const resolved = resolveSidecarVerb(rawVerb, request.method);
   if (!resolved.ok) return json({ ok: false, error: resolved.error }, 400);
 
   let body: Record<string, unknown> = {};
@@ -5702,9 +5795,9 @@ async function handleBrowserSidecar(
 
   const sandbox = openSandbox(env, sandboxName);
   try {
-    // `health` is the sidecar's only GET; the Worker route is POST for every
-    // verb so that one HMAC envelope (which may travel in the body) covers
-    // them all uniformly.
+    // `health` is the sidecar's only GET. The forwarded method is taken from
+    // `resolved`, so the container is asked exactly what the contract says the
+    // verb is — never what the caller happened to use.
     //
     // 🔴 The deadline is `withDeadline`, NOT an `AbortSignal` in the
     // `RequestInit`. `containerFetch` is a Durable Object RPC and its init is
@@ -5715,7 +5808,7 @@ async function handleBrowserSidecar(
     const upstream = await withDeadline(
       sandbox.containerFetch(
         resolved.url,
-        resolved.verb === 'health'
+        resolved.method === 'GET'
           ? { method: 'GET' }
           : {
               method: 'POST',
@@ -5868,7 +5961,26 @@ export default {
     }
 
     const browserMatch = path.match(/^\/sandbox\/([^/]+)\/browser\/([a-z_]+)$/);
-    if (method === 'POST' && browserMatch) {
+    if ((method === 'POST' || method === 'GET') && browserMatch) {
+      // 🔴 GET IS HERE BECAUSE `health` IS A GET AND WAS UNREACHABLE.
+      //
+      // `BROWSER_SIDECAR_GET_VERBS = ['health']` and `resolveSidecarVerb`
+      // rejects a method that does not match the verb — but only a POST route
+      // was ever registered, so the single GET verb in the contract answered
+      // `browser_verb_method_mismatch: 'health' is GET, not POST` and there
+      // was no other door. Nine of the ten verbs worked, which is exactly why
+      // it went unnoticed: everything an agent DOES was fine, and only the
+      // liveness probe an MCP client calls FIRST was broken.
+      //
+      // Both methods land in the same handler, which passes the CALLER'S
+      // method to `resolveSidecarVerb` — the sole authority on which verb
+      // takes which. That hand-off is what keeps admitting GET here from
+      // widening anything: `GET /browser/click` is refused by the same check
+      // that used to refuse `GET /browser/health`. It is asserted in both
+      // directions in `route-auth.test.ts`, because for a moment it was NOT
+      // true: the handler passed a hardcoded 'POST', and a GET to an action
+      // verb went straight through.
+
       // The desktop browser's automation surface (`worker/sidecar/`, port
       // 9223, reached by `containerFetch`). HMAC-gated with the SAME envelope
       // as `/focus`/`/screen`/`/restart`/`DELETE /sandbox/:name`, and the verb
@@ -5914,6 +6026,18 @@ export default {
     }
 
     const screenMatch = path.match(/^\/sandbox\/([^/]+)\/screen$/);
+    if (method === 'GET' && screenMatch) {
+      // An OBSERVATION of the live X screen — the read half of the same route.
+      // Same HMAC envelope as the POST; no separate kill switch for the same
+      // reason the POST has none. See `handleScreenRead` for why a read had to
+      // exist: without it the shell can only learn the screen by CHANGING it,
+      // which costs a capture-pipeline restart, so it never reconciles and a
+      // desktop whose size moved out of band stays letterboxed to an aspect
+      // the stream does not have.
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      return handleScreenRead(env, decodeURIComponent(screenMatch[1]));
+    }
     if (method === 'POST' && screenMatch) {
       // Live X screen resize. HMAC-gated (SAME envelope as `/focus`), and its
       // body is two integers checked against the closed mode table before

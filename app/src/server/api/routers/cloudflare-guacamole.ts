@@ -62,6 +62,7 @@ import {
     requestGuacamoleFocusApp,
     requestGuacamolePreview,
     requestGuacamoleSandboxTerminate,
+    readGuacamoleScreen,
     requestGuacamoleScreen,
     resolveCloudflareGuacamoleConfig,
     resolveScreenRequest,
@@ -949,6 +950,60 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
      * container, and a client that retried it would restart the capture
      * pipeline in a loop for nothing.
      */
+    /**
+     * Read the LIVE X screen without changing it.
+     *
+     * A `query`, not a `mutation`, because it changes nothing — and that is the
+     * whole value. Until this existed the shell could only learn the desktop's
+     * size by SETTING it, and a set restarts the capture pipeline, so the shell
+     * simply never reconciled: after a troubleshoot restart (which resets the
+     * container to 1920x1080) or on a warm container, its dedup dropped every
+     * measurement against a belief that was already false, and the picture
+     * stayed letterboxed to an aspect the stream did not have.
+     *
+     * Same ownership gate as `setScreen` — `assertOwnedComputer` — because a
+     * screen size is still a fact about someone else's machine.
+     */
+    getScreen: protectedProcedure
+        .input(z.object({ computerId: z.string().uuid() }))
+        .query(async ({ ctx, input }) => {
+            await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+
+            const correlationId = newCorrelationId();
+            const config = resolveCloudflareGuacamoleConfig();
+            if (!config.isConfigured) {
+                return {
+                    ok: false as const,
+                    error: { code: 'NOT_FOUND' as const, message: 'provider_not_configured' },
+                    correlationId,
+                };
+            }
+
+            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+            const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
+            const result = await readGuacamoleScreen(config, hmacSecret, sandboxName, correlationId);
+
+            if (!result.ok) {
+                return {
+                    ok: false as const,
+                    error: { code: result.code, message: result.message },
+                    correlationId,
+                };
+            }
+
+            // `source: 'observed'` — deliberately NOT one of the setter's
+            // `requested`/`snapped`. Nothing was requested, so neither word is
+            // true here, and reusing one would let a caller believe an ask had
+            // been honoured when no ask was made.
+            return {
+                ok: true as const,
+                width: result.width,
+                height: result.height,
+                source: 'observed' as const,
+                correlationId,
+            };
+        }),
+
     setScreen: protectedProcedure
         .input(
             z.object({
@@ -1126,11 +1181,25 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             if (!result.ok) {
                 return {
                     ok: false as const,
-                    // The Worker's own discriminator when it answered at all;
-                    // `unknown` when it did not (transport failure). 🔴 Never
-                    // `result.error` — that is a free-text message that can carry
+                    // The Worker's own discriminator when it answered at all.
+                    // 🔴 Never `result.error` — that is free text that can carry
                     // a URL or a stack fragment, and this value is rendered.
-                    errorCode: result.outcome ?? 'unknown',
+                    //
+                    // But `unknown` for everything else was too coarse, and it
+                    // cost real debugging time in production: a Worker that
+                    // answered HTTP 500 and a Worker that never answered at all
+                    // produced the SAME code, so the one field the user and the
+                    // logs share said nothing about which had happened. Both
+                    // occurred within minutes of each other during one session
+                    // — a 120s transport timeout, and a Cloudflare platform
+                    // error ("Internal error while starting up Durable Object
+                    // storage caused object to be reset") — and neither was
+                    // distinguishable without going to the Vercel logs.
+                    //
+                    // `worker_error_500` still leaks no free text: it is a
+                    // status code and a fixed prefix.
+                    errorCode: result.outcome
+                        ?? (result.status ? `worker_error_${result.status}` : 'no_response'),
                     correlationId,
                     provider: 'cloudflare-guacamole' as const,
                 };

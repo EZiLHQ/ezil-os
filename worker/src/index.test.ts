@@ -688,6 +688,36 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
     expect(body).toContain('parseTurbopackConfigOutcome(turbopackResult.stdout)');
   });
 
+  it('🔴 wrangler.toml names the default desktop mode, and it is `neko`', async () => {
+    // The omission this catches broke the troubleshoot restart IN PRODUCTION,
+    // and did so in the least visible way available.
+    //
+    // `resolveDesktopMode(requested, envDefault)` falls back to `'guacamole'`
+    // when BOTH are absent. `SANDBOX_DEFAULT_DESKTOP_MODE` was never set, so
+    // the Worker believed this deployment served guacamole while every desktop
+    // it actually serves is neko. That is invisible almost everywhere, because
+    // the app always asks for a mode explicitly — with one exception. The
+    // restart deliberately omits `desktopMode` so the Worker AUTO-DETECTS what
+    // is running, and detection reads the exposed-port list. When nothing is
+    // exposed — a stopped container, an idle one, one already mid-restart —
+    // detection finds nothing, falls back to this default, sees `guacamole`,
+    // and `restartDesktopStack` refuses with `unsupported_mode`.
+    //
+    // So the one feature a user reaches for when their desktop is not working
+    // failed specifically because their desktop was not working. Measured
+    // against the live Worker:
+    //
+    //     POST /api/shell/restart -> 200 {"ok":false,"errorCode":"unsupported_mode"}
+    //
+    // Asserted here rather than in code because the code fallback is CORRECT:
+    // a deployment that genuinely runs guacamole should keep it. What was wrong
+    // was this deployment declining to say what it runs.
+    const toml = await Bun.file(new URL('../wrangler.toml', import.meta.url)).text();
+    const line = toml.split('\n').find((l) => /^\s*SANDBOX_DEFAULT_DESKTOP_MODE\s*=/.test(l));
+    expect(line).toBeDefined();
+    expect(line).toContain('"neko"');
+  });
+
   it('EzilSandboxDO is exported as `Sandbox` (same DO binding name — zero wrangler.toml changes) and uses schedule(), not alarm()', async () => {
     const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
     expect(src).toContain('export { EzilSandboxDO as Sandbox };');
