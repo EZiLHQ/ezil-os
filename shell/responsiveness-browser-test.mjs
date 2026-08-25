@@ -115,6 +115,20 @@ const readConst = (name, fallback) => {
     // eslint-disable-next-line no-eval
     return Number(m[1].split('*').reduce((a, b) => a * Number(b.trim()), 1));
 };
+// 🔴 The debounce is READ FROM SOURCE, not hardcoded, and every wait below is
+// derived from it. This test previously slept a literal 200ms to mean "still
+// mid-drag"; when the debounce was shortened from 500ms to 200ms that literal
+// became exactly the firing boundary and the check went red for a timing
+// coincidence rather than a defect. A test whose timings are relative to the
+// thing under test cannot rot that way.
+const DEBOUNCE_MS = Number(
+    (fs.readFileSync(path.resolve(here, 'ezil/apps/desktop-screen.js'), 'utf8')
+        .match(/export const RESIZE_DEBOUNCE_MS\s*=\s*(\d+)/) ?? [])[1] ?? 0,
+);
+if ( ! DEBOUNCE_MS ) {
+    console.error('could not read RESIZE_DEBOUNCE_MS from desktop-screen.js — skipping, not passing.');
+    process.exit(2);
+}
 const FRAMEBUFFER_AXIS = readConst('SCREEN_FRAMEBUFFER_AXIS', 1920);
 const PIXEL_CEILING = readConst('SCREEN_PIXEL_CEILING', 1920 * 1080);
 const WIDTH_ALIGNMENT = readConst('SCREEN_WIDTH_ALIGNMENT', 8);
@@ -248,7 +262,7 @@ async function boot ({ width, height, dpr = 1, screen = true, serverScreen = nul
         () => document.querySelector('.window[data-app="desktop"]')?.classList.contains('ezil-fullbleed'),
         null, { timeout: 15_000 },
     ).catch(() => {});
-    await sleep(700);   // past go_fullbleed + the 500ms resize debounce
+    await sleep(500 + DEBOUNCE_MS);   // past go_fullbleed and the trailing resize debounce
     return { page, context, state };
 }
 
@@ -430,15 +444,20 @@ for ( const shape of [SHAPES[0], SHAPES[1], SHAPES[4]] ) {
     const { page, context, state } = await boot({ width: 1440, height: 900, dpr: 1 });
     const before = state.asks.length;
 
+    // A real drag ticks at ~17ms (measured through a ResizeObserver in a real
+    // browser: 90 ticks over 1762ms, p50 gap 17ms). `setViewportSize` costs
+    // 1-2ms here, so a short sleep models one faithfully.
+    const stepMs = Math.max(20, Math.round(DEBOUNCE_MS / 5));
     for ( const [w, h] of [[1400, 880], [1360, 860], [1320, 840], [1280, 820], [1200, 800], [1100, 780]] ) {
         await page.setViewportSize({ width: w, height: h });
-        await sleep(60);      // faster than the 500ms debounce, like a real drag
+        await sleep(stepMs);
     }
-    await sleep(200);
+    // Comfortably INSIDE the debounce window, so this is still "mid-drag".
+    await sleep(Math.round(DEBOUNCE_MS / 2));
     push(`${L} 🔴 nothing is sent while the "drag" is still moving`,
         state.asks.length === before, `${state.asks.length - before} request(s) mid-drag`);
 
-    await sleep(900);         // past the 500ms trailing debounce
+    await sleep(DEBOUNCE_MS * 3 + 400);   // comfortably past the trailing debounce
     const after = state.asks.length - before;
     push(`${L} 🔴 exactly one request once it settles, not one per tick`,
         after <= 1, `${after} request(s) after settling`);

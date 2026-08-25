@@ -302,7 +302,7 @@ const FULLBLEED_CLASS = 'ezil-fullbleed';
 //   - A resolution change is still expensive — a capture-pipeline restart plus
 //     a full software-vp8 re-init — and still must never fire from a raw
 //     resize tick. `createScreenController` is what makes the live path safe:
-//     500ms trailing debounce, never a duplicate of the last applied size, so
+//     200ms trailing debounce, never a duplicate of the last applied size, so
 //     a window drag costs zero requests while it happens and at most one when
 //     it stops.
 //
@@ -779,7 +779,7 @@ export async function openDesktopWindow (ctx = {}) {
     // 🔴 The tick REFITS SYNCHRONOUSLY and only ASKS asynchronously. The fit is
     // free and must track every frame of a drag; the resize is a
     // capture-pipeline restart and must fire only once the drag has stopped
-    // (500ms trailing, in `createScreenController`). Conflating the two is how
+    // (200ms trailing, in `createScreenController`). Conflating the two is how
     // a resize handler ends up restarting the encoder dozens of times per
     // gesture, which is exactly what this file's header used to forbid
     // outright — the debounce is what makes it safe rather than the ban.
@@ -822,11 +822,16 @@ export async function openDesktopWindow (ctx = {}) {
             // field into a capture-pipeline restart would be the worst thing
             // this feature could do to a phone user.
             //
-            // The 500ms debounce would probably swallow the open/close pair on
-            // its own. "Probably" is exactly why this is explicit: the rule is
-            // that a keyboard-driven height change is FIT-ONLY, by decision,
-            // not by a timing coincidence that a future debounce tweak could
-            // quietly undo. `cancel()` also drops anything already armed, so a
+            // 🔴 AND THE DEBOUNCE TWEAK THIS ANTICIPATED HAS NOW HAPPENED.
+            // This used to read "the 500ms debounce would probably swallow the
+            // open/close pair on its own", and said "probably" is exactly why
+            // the rule is explicit — a keyboard-driven height change is
+            // FIT-ONLY by decision, not by a timing coincidence a future
+            // debounce tweak could quietly undo. The debounce is now 200ms
+            // (`RESIZE_DEBOUNCE_MS`, shortened on measurement), which would no
+            // longer reliably swallow a keyboard that stays up for a few
+            // hundred milliseconds. The explicit rule below is what keeps this
+            // correct, exactly as it was written to. `cancel()` also drops anything already armed, so a
             // keyboard opening mid-drag cannot fire the drag's request at the
             // keyboard-shrunk size.
             if ( keyboardInsetPx(typeof document !== 'undefined' ? document : null) > 0 ) {

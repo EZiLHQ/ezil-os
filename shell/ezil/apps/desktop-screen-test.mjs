@@ -39,7 +39,29 @@ const view = (w, h, dpr = 1) => ({ innerWidth: w, innerHeight: h, devicePixelRat
 
 // ── measureDesktopBox ───────────────────────────────────────────────────────
 
-push('RESIZE_DEBOUNCE_MS is 500ms, per the contract', RESIZE_DEBOUNCE_MS === 500, String(RESIZE_DEBOUNCE_MS));
+// 🔴 200ms, down from 500ms, and BOUNDED ON BOTH SIDES on purpose.
+//
+// The old 500ms was the price of a belief — that a mode change costs "a
+// visible interruption plus a full software-vp8 re-init" — which was never
+// measured and turned out to be false: sampled at 40ms inside the neko client
+// on production across a live change, including landscape -> portrait, the
+// picture never blacked out and never dropped a frame.
+//
+// What it really costs is container CPU, so the debounce still has a job: one
+// encoder restart per gesture rather than one per tick. 200ms is the measured
+// answer. A real drag recorded through a `ResizeObserver` produced 90 ticks
+// over 1762ms at a p50 gap of 17ms with a longest natural hesitation of 148ms;
+// replayed, 500/200/150ms all cost ONE restart for that gesture, 100ms cost
+// two and 60ms cost three.
+//
+// The lower bound is the point of this check. Anything under ~150ms starts
+// charging an extra encoder restart every time a user hesitates mid-drag, on a
+// 2-vCPU container, and the symptom would be CPU rather than anything visible
+// — which is exactly the kind of regression that gets shipped unnoticed.
+push('RESIZE_DEBOUNCE_MS is 200ms — fast enough to feel immediate, slow enough to cost one restart per gesture',
+    RESIZE_DEBOUNCE_MS === 200, String(RESIZE_DEBOUNCE_MS));
+push('🔴 …and never drops below the 150ms knee, where a mid-drag hesitation starts costing extra encoder restarts',
+    RESIZE_DEBOUNCE_MS >= 150, String(RESIZE_DEBOUNCE_MS));
 
 eq('a phone viewport at 3x asks in DEVICE pixels, not CSS pixels',
     measureDesktopBox({ view: view(390, 844, 3) }), { width: 1170, height: 2532 });

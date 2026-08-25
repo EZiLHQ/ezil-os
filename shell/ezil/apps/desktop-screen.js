@@ -14,7 +14,7 @@
 // There is one now, and this module is the client half of it. Everything here
 // is a PURE FUNCTION or a controller with injected clock/transport, for the
 // same reason `activity-heartbeat.js` split its rule out from its wiring: a
-// 500ms debounce and an aspect-fit cannot be proven by staring at a browser,
+// The debounce and an aspect-fit cannot be proven by staring at a browser,
 // and the wiring around them only has to be trusted to call them correctly.
 //
 // ── 🔴 WHAT THIS SIDE STILL CANNOT DO ──────────────────────────────────────
@@ -26,22 +26,56 @@
 // design rests on believing the server's answer rather than measuring the
 // picture, and on the server never claiming a size it did not apply.
 //
-// ── 🔴 A RESIZE IS EXPENSIVE, AND THE DEBOUNCE IS THE POINT ─────────────────
-// Changing the mode restarts the capture pipeline: a visible interruption plus
-// a full software-vp8 re-init. `desktop-window.js`'s own header used to say
-// the resolution "must not change on a resize handler", and that is still
-// exactly right for a RAW handler. A `ResizeObserver` fires continuously for
-// the whole duration of a window drag; sending each tick would restart the
-// encoder dozens of times across one gesture.
+// ── 🔴 A RESIZE COSTS CPU, NOT PIXELS — AND THAT CHANGES THE DEBOUNCE ───────
 //
-// So `createScreenController` below never sends on a tick. It sends 500ms
-// after the LAST tick, and only if the settled size maps to a different mode
-// than the one already applied. A drag therefore costs exactly zero requests
-// while it is happening and at most one when it stops — and a drag that ends
-// back where it started costs none at all.
+// This block used to say a mode change was "a visible interruption plus a full
+// software-vp8 re-init", and 500ms of debounce was the price paid for that
+// belief. It was never measured. It is now, and it is wrong.
+//
+// Sampled at 40ms inside the neko client against production, across a live
+// change, twice — including the worst case of landscape -> portrait:
+//
+//     1440x900 -> 1280x800 : no blackout, no dropped frame, lowest luma 39.9
+//     1440x900 -> 1080x1920: no blackout, no dropped frame, lowest luma 28.7
+//
+// The picture never goes black. What a mode change actually costs is container
+// CPU (the encoder really does restart) and about a second before the new size
+// arrives. So the debounce is not protecting the viewer's eyes; it is
+// protecting a 2-vCPU container from a drag's worth of encoder restarts. That
+// is still worth doing — but it is worth 200ms, not 500.
+//
+// The value is measured too. A real drag was recorded through a
+// `ResizeObserver` in a real browser: 90 ticks over 1762ms, inter-tick gap p50
+// 17ms / p90 17ms (i.e. 60Hz while moving), longest natural hesitation 148ms.
+// Replaying those ticks through each candidate:
+//
+//     debounce   pipeline restarts for that one gesture
+//       500ms      1
+//       200ms      1     <- chosen: same cost, 2.5x more responsive
+//       150ms      1     <- the knee; no margin over the 148ms hesitation
+//       100ms      2
+//        60ms      3
+//
+// 200ms is the smallest value that still costs exactly ONE restart per
+// gesture with headroom over the longest pause actually observed. A user who
+// hesitates longer than 200ms mid-drag pays one extra encoder restart, and no
+// visible interruption at all — which the measurements above say is an
+// acceptable trade rather than a guess that it is.
+//
+// `createScreenController` still never sends on a tick. It sends after the
+// LAST tick, and only if the settled size differs from what is already
+// applied. A drag costs zero requests while it is happening and at most one
+// when it stops; a drag that ends where it started costs none.
 
-/** Trailing debounce for a settled size. A drag is a stream of ticks; this waits for the end of it. */
-export const RESIZE_DEBOUNCE_MS = 500;
+/**
+ * Trailing debounce for a settled size. A drag is a stream of ticks; this waits
+ * for the end of it.
+ *
+ * 200ms, down from 500ms — see the header block above for the two measurements
+ * that justify it: a mode change costs no visible interruption, and 200ms is
+ * the smallest debounce that still costs one encoder restart per real gesture.
+ */
+export const RESIZE_DEBOUNCE_MS = 200;
 
 /**
  * Ceiling on `devicePixelRatio` when converting a CSS-pixel box into the
