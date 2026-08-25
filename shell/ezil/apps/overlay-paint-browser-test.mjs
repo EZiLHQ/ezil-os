@@ -187,7 +187,11 @@ const APPS = [
         unavailableErrorCode: 'code_preview_unavailable',
         unavailableClass: 'ezil-code-unavailable',
         mintedUrl: 'about:blank?code-frame=1',
-        unavailableText: /isn.t available yet/i,
+        // Changed with the copy: `code_preview_unavailable` never meant "not
+        // configured" — all three of its producers are runtime conditions — so
+        // the panel no longer claims the editor "hasn't been turned on for this
+        // deployment". See `code.js`'s panel comment for the incident.
+        unavailableText: /isn.t reachable right now/i,
     },
     {
         id: 'preview',

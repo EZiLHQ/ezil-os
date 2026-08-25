@@ -372,9 +372,16 @@ describe('neko-logs: the writers this route actually exposes are enumerated', ()
     // is bounded by the same per-line pass as every other writer. Enumerated
     // deliberately rather than by widening the regex — the point of this guard
     // is that a new writer forces someone to state what it prints.
+    // `--install-extension` is the tail of code-server's own extension
+    // reinstall, run by `_ezil_restore_editor_state` when a container comes
+    // back and puts the user's extensions back from the manifest. What it
+    // prints is code-server's installer output: extension ids, versions, and
+    // marketplace errors. No env value, no page content, no workspace file
+    // content — and `redactNekoLogContent` still rewrites absolute paths on
+    // every line, same as for every other writer here.
     const known = new Set([
       'log()', 'echo', 'if', 'Xvfb', 'openbox', 'setsid', '--capture.video.display',
-      '_screen_has_pixels',
+      '_screen_has_pixels', '--install-extension',
     ]);
     for (const w of writers) expect(known.has(w)).toBe(true);
   });

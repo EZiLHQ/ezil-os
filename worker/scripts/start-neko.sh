@@ -2011,6 +2011,17 @@ phase_end codeserver_launch ok
 
 # Restore first, then keep capturing. Both in one detached subshell so neither
 # can delay readiness — see `_ezil_restore_editor_state` for why that matters.
+#
+# 🔴 `9>&-` IS LOAD-BEARING, and leaving it out cost a boot. The boot mutex
+# near the top of this file holds its lock on file descriptor 9 for the life
+# of the script. A `flock` is released only when EVERY descriptor referring to
+# it is closed, and a backgrounded subshell inherits the parent's open fds — so
+# this loop, which outlives nothing but is never reaped promptly, kept fd 9
+# open and the boot lock was never released. The symptom was not here at all:
+# the NEXT boot's `flock -w` timed out, concluded another boot was in progress,
+# skipped, and exited 0 — leaving a container that reported success with neko
+# never bound. `neko-teardown-orphans.test.ts`'s "lets a SECOND boot succeed on
+# the same ports afterwards" is what caught it.
 (
   _ezil_restore_editor_state
   while true; do
@@ -2018,7 +2029,7 @@ phase_end codeserver_launch ok
     [ -f "$NEKO_SHUTDOWN_FLAG" ] && break
     _ezil_capture_editor_state
   done
-) >/dev/null 2>&1 &
+) 9>&- >/dev/null 2>&1 &
 log "editor state: restore+capture loop started (manifest ${EZIL_EDITOR_EXT_MANIFEST}, every ${EZIL_EDITOR_STATE_INTERVAL}s)"
 
 # ── Native browser (mandatory — validated above in preflight; never skipped) ─
