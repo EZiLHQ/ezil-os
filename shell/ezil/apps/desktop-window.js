@@ -740,6 +740,26 @@ export async function openDesktopWindow (ctx = {}) {
                 stream.w = res.width;
                 stream.h = res.height;
                 refit();
+                // 🔴 AND ASK AGAIN, HERE. Clearing the dedup is not enough on
+                // its own, and believing it was cost a production run.
+                //
+                // `reconcile` only makes the next measurement ELIGIBLE to be
+                // sent; something still has to send one, and the only thing
+                // that does is a `ResizeObserver` tick. A restore that comes
+                // back to the SAME box produces no tick — the window is
+                // full-bleed at the size it already was — so nothing was ever
+                // re-asked and the desktop stayed at whatever the restart left
+                // it. Measured against production after a real container
+                // restart: the read happened (one GET), the belief was
+                // corrected, and the phone still showed a 1920x1080 stream
+                // letterboxed to 390x219 with 74% of the window wasted.
+                //
+                // So the reconcile finishes the job itself. `request` is the
+                // same debounced, deduplicated path every other caller uses,
+                // and `reconcile` has just cleared the entry that would have
+                // suppressed it.
+                const want = measure_screen();
+                if ( want ) screen_ctl.request(want.width, want.height);
             })
             .catch(() => {})
             .finally(() => { reconcile_in_flight = false; });

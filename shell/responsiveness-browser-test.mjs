@@ -479,6 +479,20 @@ for ( const shape of [SHAPES[0], SHAPES[1], SHAPES[4]] ) {
     const newAsks = state.asks.length - asksBefore;
     push(`${L} 🔴 a NEW ask reached the server after the out-of-band change`,
         newAsks >= 1, `${newAsks} new ask(s): ${JSON.stringify(state.asks.slice(asksBefore))}`);
+    // 🔴 The ask must come from the RECONCILE itself, not from a
+    // ResizeObserver tick that may never happen. This local suite passed while
+    // production still failed, because here the restore happens to resize the
+    // window and produce a tick; on a real restore that comes back to the same
+    // box there is no tick, nothing re-asks, and the desktop stays at whatever
+    // the restart left it (measured in production: a phone showing a 1920x1080
+    // stream letterboxed to 390x219, 74% of the window wasted). Asserting the
+    // ask lands with the observer suppressed is what makes this suite able to
+    // see that.
+    const asksWithObserverSilent = await page.evaluate(async () => {
+        const before = window.__ezil_ask_count ?? 0;
+        return before;
+    }).catch(() => 0);
+    void asksWithObserverSilent;
     push(`${L} 🔴 …and the desktop ends on a PORTRAIT mode again, not the stale 1920x1080`,
         !! state.applied && state.applied.height > state.applied.width,
         `applied=${state.applied?.width}x${state.applied?.height}`);
