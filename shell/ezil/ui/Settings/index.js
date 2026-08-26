@@ -56,6 +56,7 @@ import UIWindow from '../../../src/UI/UIWindow.js';
 import telemetry from '../../telemetry.js';
 import TabComputers from './tabs/computers.js';
 import TabAppearance from './tabs/appearance.js';
+import TabSystem from './tabs/system.js';
 import TabAbout from './tabs/about.js';
 import TabTroubleshoot from './tabs/troubleshoot.js';
 
@@ -69,7 +70,17 @@ const PHASE = 'ezil-os:settings';
  * the control-drawer button `drawer-action.js` injects into a full-bleed
  * window) — see `tabs/troubleshoot.js`'s header.
  */
-const TABS = [TabComputers, TabAppearance, TabAbout, TabTroubleshoot];
+const TABS = [TabComputers, TabSystem, TabAppearance, TabAbout, TabTroubleshoot];
+
+/**
+ * Which tab is showing, so the one being LEFT can be told.
+ *
+ * Module-scoped for the same reason the tabs' own state is: `single_instance`
+ * means there is only ever one Settings window, and closing it tears
+ * everything down, so this lives exactly as long as a tab could still be
+ * visible.
+ */
+let previousTabId = TABS[0]?.id ?? null;
 
 function sidebarItemHtml (tab, isActive) {
     return `
@@ -119,6 +130,20 @@ export async function openSettingsWindow (ctx = {}) {
         is_droppable: false,
         selectable_body: true,
         window_class: 'ezil-settings-window',
+        // 🔴 Closing the window must release whatever the visible tab
+        // acquired. The System tab has the streamed client publishing stream
+        // vitals every 2s while it is on screen; without this the publishing
+        // would outlive the window that asked for it and keep costing a
+        // 2-vCPU container for a monitor nobody can see any more.
+        on_close: () => {
+            const leaving = TABS.find(t => t.id === previousTabId);
+            try {
+                leaving?.onDeactivate?.();
+            } catch ( err ) {
+                console.error(`[${PHASE}] tab "${previousTabId}" failed to deactivate on close`, err);
+            }
+            previousTabId = TABS[0]?.id ?? null;
+        },
         body_css: {
             padding: '0',
             overflow: 'hidden',
@@ -149,6 +174,21 @@ export async function openSettingsWindow (ctx = {}) {
         $win.find(`.ezil-settings-pane[data-pane="${id}"]`).addClass('active');
 
         const tab = TABS.find(t => t.id === id);
+        // 🔴 Tell the tab being LEFT that it is no longer visible. Without
+        // this, a tab that acquires something while active — the System tab
+        // asks the streamed client to publish stream vitals every 2s — would
+        // keep paying for it forever, on a 2-vCPU container, with nobody
+        // looking at the result. `onActivate` without a matching hook is how a
+        // monitor turns into a background cost.
+        if ( previousTabId && previousTabId !== id ) {
+            const leaving = TABS.find(t => t.id === previousTabId);
+            try {
+                leaving?.onDeactivate?.($win, ctx);
+            } catch ( err ) {
+                console.error(`[${PHASE}] tab "${previousTabId}" failed to deactivate`, err);
+            }
+        }
+        previousTabId = id;
         try {
             tab?.onActivate?.($win, ctx);
         } catch ( err ) {

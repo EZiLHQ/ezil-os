@@ -721,6 +721,7 @@ body:not(:has(.desktop.desktop-selectable-active)) .taskbar .taskbar-item:hover 
 .device-phone .window:not(.window-alert){width:calc(100% - env(safe-area-inset-left,0px) - env(safe-area-inset-right,0px))!important;left:env(safe-area-inset-left,0)!important}
 .device-phone .window.window-filedialog{transform:none;top:env(safe-area-inset-top,0)!important;left:env(safe-area-inset-left,0)!important;width:calc(100% - env(safe-area-inset-left,0px) - env(safe-area-inset-right,0px))!important;height:calc(var(--ezil-vvh,100dvh) - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px));min-height:0;border-radius:0!important}
 .device-phone .window.window-app,.device-phone .window:not(.window-alert):not(.window-filedialog):has(> .window-body.window-body-app){transform:none;top:env(safe-area-inset-top,0)!important;left:env(safe-area-inset-left,0)!important;width:calc(100% - env(safe-area-inset-left,0px) - env(safe-area-inset-right,0px))!important;height:calc(var(--ezil-vvh,100dvh) - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px))!important;min-height:0;border-radius:0}
+.device-phone .window.window-app[data-app=desktop],.device-phone .window[data-app=desktop]:not(.window-alert):not(.window-filedialog):has(> .window-body.window-body-app){height:calc(100dvh - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px))!important}
 .device-phone .taskbar{position:fixed!important;bottom:calc(5px + var(--ezil-kb,0px) + env(safe-area-inset-bottom,0px))!important;left:50%!important;right:auto!important;top:auto!important;width:auto!important;height:50px!important;transform:translateX(-50%)!important;flex-direction:row!important;justify-content:left!important;writing-mode:initial!important;padding:0 7px!important;border-radius:10px!important;-webkit-overflow-scrolling:touch;touch-action:pan-x;overflow-x:auto;scrollbar-width:none;-ms-overflow-style:none;display:flex}
 .device-phone .taskbar::-webkit-scrollbar{display:none}
 .device-phone .taskbar .taskbar-item{touch-action:pan-x pinch-zoom;user-select:none;-webkit-user-select:none;cursor:grab;display:flex;align-items:center;justify-content:center}
@@ -857,6 +858,15 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .dashboard-app-drawer-settings{margin-right:2px}
 .ezil-settings-rule{border:0;border-top:1px solid rgba(245,245,244,.1);margin:22px 0 18px}
 .ezil-settings-diagnostic{display:block;width:100%;margin-top:10px;padding:8px 10px;box-sizing:border-box;resize:vertical;border-radius:6px;border:1px solid rgba(245,245,244,.15);background:#1f1f1f;color:#cfcfce;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.45;white-space:pre;overflow:auto}
+.ezil-settings-system h4{margin:18px 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;opacity:.6}
+.ezil-settings-system h4:first-of-type{margin-top:10px}
+.ezil-sys-lead{margin:4px 0 0;font-size:13px;opacity:.75}
+.ezil-sys-note{margin:6px 0;font-size:13px;opacity:.7}
+.ezil-sys-row{display:grid;grid-template-columns:150px 1fr;gap:2px 12px;padding:7px 0;border-bottom:1px solid rgba(127,127,127,.16);font-size:13px}
+.ezil-sys-k{opacity:.7}
+.ezil-sys-v{font-variant-numeric:tabular-nums}
+.ezil-sys-h{grid-column:2;font-size:12px;opacity:.55;line-height:1.35}
+.ezil-settings-system code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 #ezil-os-root{position:fixed;inset:0}
 .desktop.ezil-desktop{position:fixed;inset:0;box-sizing:border-box;width:auto;height:auto!important;background-color:#161616;background-image:radial-gradient(120% 80% at 78% 8%,rgba(0,173,181,.2) 0,rgba(0,173,181,0) 62%),radial-gradient(90% 70% at 10% 96%,rgba(0,173,181,.1) 0,rgba(0,173,181,0) 60%),linear-gradient(168deg,#1b1e1e 0,#161616 46%,#101111 100%)}
 body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;background-color:#161616}

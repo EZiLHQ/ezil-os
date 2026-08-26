@@ -400,6 +400,120 @@
         });
     }
 
+    // ── (E) STREAM VITALS, BROADCAST TO THE SHELL ──────────────────────────
+    //
+    // Asked for directly: "I need to know the performance of the system, maybe
+    // within the settings or a monitor app itself." The shell cannot obtain any
+    // of this on its own — the desktop is a cross-origin iframe, so its
+    // `RTCPeerConnection`, its `<video>` and `getStats()` are all unreachable
+    // from the parent BY CONSTRUCTION. This side is the only place the numbers
+    // exist, so this side publishes them.
+    //
+    // Deliberately the SAME `inbound-rtp` report the black-picture detector
+    // above already reads, on its own interval, so nothing new is sampled and
+    // there is one definition of "the stream" rather than two that can
+    // disagree.
+    //
+    // Every field is either measured or absent. Nothing is estimated, and a
+    // report that does not carry a field is published without it rather than
+    // with a zero — a zero here would read as "0 fps" rather than "not known",
+    // and the shell renders the difference.
+    var vitalsPrev = null;
+    var vitalsTimer = null;
+
+    function pumpVitals() {
+        var pc = peers.length ? peers[peers.length - 1] : null;
+        if (!pc || typeof pc.getStats !== 'function') return;
+        var promise;
+        try { promise = pc.getStats(); } catch (e) { return; }
+        if (!promise || typeof promise.then !== 'function') return;
+        promise.then(function (report) {
+            try {
+                var vid = null, pair = null;
+                report.forEach(function (e) {
+                    if (!e) return;
+                    if (e.type === 'inbound-rtp' && e.kind === 'video') vid = e;
+                    // `selected` is the legacy flag; `nominated` + state is the
+                    // current one. Either identifies the pair actually in use.
+                    if (e.type === 'candidate-pair'
+                        && (e.selected === true || (e.nominated === true && e.state === 'succeeded'))) pair = e;
+                });
+                if (!vid) return;
+                var at = Date.now();
+                var out = { at: at };
+                var v = liveVideo();
+                var w = vid.frameWidth || (v ? v.videoWidth : 0) || 0;
+                var h = vid.frameHeight || (v ? v.videoHeight : 0) || 0;
+                if (w > 0 && h > 0) { out.width = w; out.height = h; }
+                if (typeof vid.framesPerSecond === 'number') out.fps = Math.round(vid.framesPerSecond);
+                if (typeof vid.packetsLost === 'number') out.packetsLost = vid.packetsLost;
+                if (typeof vid.jitter === 'number') out.jitterMs = Math.round(vid.jitter * 1000);
+                if (pair && typeof pair.currentRoundTripTime === 'number') {
+                    out.rttMs = Math.round(pair.currentRoundTripTime * 1000);
+                }
+                // Bitrate is a RATE and therefore needs two samples. On the
+                // first tick it is genuinely unknown, so it is omitted.
+                if (vitalsPrev && typeof vid.bytesReceived === 'number') {
+                    var dt = (at - vitalsPrev.at) / 1000;
+                    var db = vid.bytesReceived - vitalsPrev.bytes;
+                    if (dt >= 0.5 && dt <= 10 && db >= 0) out.kbps = Math.round((db * 8) / 1000 / dt);
+                }
+                if (typeof vid.bytesReceived === 'number') {
+                    vitalsPrev = { at: at, bytes: vid.bytesReceived };
+                }
+                window.parent.postMessage({ source: NS, type: 'stream_vitals', vitals: out }, '*');
+            } catch (e) {
+                /* a stats shape we do not recognise is not evidence of anything */
+            }
+        }, function () { /* getStats rejects on a closing connection */ });
+    }
+
+    /**
+     * Start or stop publishing vitals, on the shell's request.
+     *
+     * ON DEMAND, because a monitor nobody is looking at is pure cost: one
+     * `getStats()` every 2s for the life of every session, on a 2-vCPU
+     * container budget that the encoder already dominates. The shell asks when
+     * its System view opens and withdraws when it closes.
+     */
+    function stopVitals() {
+        if (!vitalsTimer) return;
+        try { clearInterval(vitalsTimer); } catch (e) { /* nothing to do */ }
+        vitalsTimer = null;
+        vitalsPrev = null;
+    }
+
+    function startVitals() {
+        if (vitalsTimer) return;
+        try {
+            // 2s: slow enough to be free (one getStats call), fast enough that
+            // a monitor does not feel stale. The black-picture detector runs on
+            // its own, shorter, BOUNDED loop and stops; this one runs for as
+            // long as the session does, which is what a monitor needs.
+            // Bare `setInterval`, matching the picture loop below — the
+            // harness that exercises this file supplies the globals, not a
+            // fully-populated `window`.
+            vitalsTimer = setInterval(pumpVitals, 2000);
+            pumpVitals();
+        } catch (e) {
+            warn('vitals-failed', String((e && e.message) || e));
+        }
+    }
+
+    // The shell's side of the request. Deliberately narrow: it answers exactly
+    // two message types from the parent and ignores everything else, including
+    // anything that does not carry our own namespace.
+    try {
+        window.addEventListener('message', function (ev) {
+            var d = ev && ev.data;
+            if (!d || d.source !== 'ezil-shell') return;
+            if (d.type === 'vitals_start') startVitals();
+            else if (d.type === 'vitals_stop') stopVitals();
+        }, false);
+    } catch (e) {
+        warn('vitals-listen-failed', String((e && e.message) || e));
+    }
+
     // ── The loop ────────────────────────────────────────────────────────────
     var pictureTimer = null;
 
@@ -475,6 +589,12 @@
     } catch (e) {
         PICTURE.state = 'error';
     }
+    // 🔴 NOT started here. Vitals are ON DEMAND — see `startVitals` — so a
+    // session with nobody watching the monitor pays nothing, and so that this
+    // file registers exactly ONE timer at boot, as it always has. (Registering
+    // a second one unconditionally broke the picture watch's own harness,
+    // which drives a single interval; that was a warning worth heeding rather
+    // than working around.)
 
     // ═══════════════════════════════════════════════════════════════════════
     // CONCERN 2 of 2 — THE ON-SCREEN-KEYBOARD AFFORDANCE. Touch devices only.

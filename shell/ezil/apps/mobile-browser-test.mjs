@@ -847,8 +847,28 @@ async function scenarioPhonePortrait () {
         await new Promise((r) => setTimeout(r, 400));
         return { before, shrunk, after: Math.round(w.getBoundingClientRect().height) };
     });
-    push(`${L} 🔴 [awaits W7] a shrinking visual viewport resizes the desktop instead of covering it`,
-        kb.after <= kb.shrunk + 2,
+    // 🔴 REVERSED DELIBERATELY, 2026-08-25. This asserted the OPPOSITE — that a
+    // raised keyboard SHRINKS the desktop window — and shipping that is what
+    // the user then reported as a bug: "the page itself used to go up instead
+    // of floating like a shell, like a floater… it just floats. It doesn't
+    // shrink."
+    //
+    // Shrinking is right for a window that owns its own controls. A file
+    // dialog whose buttons went under the keyboard would be unusable, and
+    // `.device-phone .window…` still shrinks those to `--ezil-vvh`. It is
+    // wrong for THIS window, which owns a cross-origin video of someone else's
+    // screen: shrinking it reveals nothing, it just makes the whole remote
+    // picture smaller, and the remote application is the thing that scrolls
+    // its own focused field into view.
+    //
+    // So the desktop keeps its full height and the keyboard floats over it —
+    // paired with `interactive-widget: overlays-content` (see
+    // `app/src/app/layout.tsx`) so the page does not move either. Its own way
+    // out stays reachable: the keyboard-dismiss button lives inside the
+    // streamed client, is `position: fixed`, and tracks `visualViewport`
+    // precisely so a raised keyboard cannot cover it.
+    push(`${L} 🔴 a raised keyboard FLOATS over the desktop instead of squashing it`,
+        kb.after >= kb.before - 2,
         `window height ${kb.before} -> ${kb.after}, visual viewport ${kb.shrunk}`);
 
     // ── the phone-only CSS really executed ─────────────────────────────────

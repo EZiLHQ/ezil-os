@@ -441,6 +441,7 @@ function runPictureScript(opts: {
     peer?: { bytesPerSecond: number; width: number; height: number } | null;
 }) {
     const posted: Record<string, unknown>[] = [];
+    const pictureListeners: Record<string, Array<(e: unknown) => void>> = {};
     let clock = 1_700_000_000_000;
 
     const video = opts.video === undefined
@@ -517,6 +518,14 @@ function runPictureScript(opts: {
         parent: { postMessage: (m: Record<string, unknown>) => posted.push(m) },
         RTCPeerConnection: peer ? function RTCPeerConnection() {} : undefined,
         console: { warn() {} },
+        // A real window has this. The vitals publisher listens here for the
+        // shell's on-demand start/stop, and without it the script would (quite
+        // correctly) warn — which would then show up as a `posted` message and
+        // fail the "says NOTHING when there is no stream" assertion for a
+        // reason that has nothing to do with the picture detector.
+        addEventListener: (type: string, fn: (e: unknown) => void) => {
+            (pictureListeners[type] ??= []).push(fn);
+        },
     };
     if (peer) {
         (win.RTCPeerConnection as any).prototype.setRemoteDescription = function () { return null; };

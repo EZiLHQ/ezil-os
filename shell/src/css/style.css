@@ -2218,6 +2218,47 @@ body:not(:has(.desktop.desktop-selectable-active)) .taskbar .taskbar-item:hover 
     min-height: 0;
     border-radius: 0;
 }
+/* ── 🔴 THE STREAMED DESKTOP FLOATS; IT DOES NOT SHRINK ────────────────────
+ * Reported from a phone: raising the keyboard squeezed the streamed desktop
+ * instead of the keyboard floating over it. The user's words — "it just
+ * floats. It doesn't shrink."
+ *
+ * The rule above is right for LOCAL windows and wrong for this one, and the
+ * difference is what is inside them. A file dialog or an alert owns its own
+ * buttons: if the keyboard covered them the window would be unusable, so it
+ * shrinks to `--ezil-vvh` and keeps them reachable. The desktop window owns a
+ * cross-origin video of someone else's screen. Shrinking that does not reveal
+ * anything — it just makes the whole remote picture smaller, and the remote
+ * application is the thing that scrolls its own focused field into view.
+ *
+ * So this one window keeps the FULL viewport height and lets the keyboard
+ * overlay it. Combined with `interactive-widget: overlays-content` (see
+ * `app/src/app/layout.tsx`) the page no longer moves at all: the desktop holds
+ * still and the keyboard slides over the bottom of it.
+ *
+ * Its own way out stays reachable — the keyboard-dismiss button lives INSIDE
+ * the streamed client (`ezil-mobile.js`), is `position: fixed`, and tracks
+ * `visualViewport` specifically so a raised keyboard can never cover it.
+ *
+ * Selector is deliberately narrow: `data-app="desktop"` only. Every other
+ * phone window keeps the shrink-to-visual-viewport behaviour above.
+ */
+/* 🔴 The selector MIRRORS the rule above and adds `[data-app="desktop"]`, and
+ * that is not stylistic. The rule above uses `:not()` and `:has()`, whose
+ * arguments count toward specificity, so a shorter selector like
+ * `.device-phone .window[data-app="desktop"]` LOSES to it no matter where it
+ * appears in the file — which is exactly what happened on the first attempt:
+ * the desktop still shrank from 844 to 508. Repeating the same structure and
+ * adding one attribute is what makes this strictly more specific. */
+.device-phone .window.window-app[data-app="desktop"],
+.device-phone .window[data-app="desktop"]:not(.window-alert):not(.window-filedialog):has(> .window-body.window-body-app) {
+    height: calc(
+        100dvh
+        - env(safe-area-inset-top, 0px)
+        - env(safe-area-inset-bottom, 0px)
+    ) !important;
+}
+
 .device-phone .taskbar {
     /* Force taskbar to bottom on mobile devices, overriding any position classes */
     position: fixed !important;

@@ -586,6 +586,125 @@ for ( const shape of [SHAPES[0], SHAPES[1], SHAPES[4]] ) {
     await context.close();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// GROUP 5 — a raised keyboard floats over the desktop, it does not squash it
+// ═══════════════════════════════════════════════════════════════════════════
+// Reported from a phone: raising the keyboard pushed the page up and squeezed
+// the streamed desktop. Two things were wrong — the served viewport meta had
+// no `interactive-widget`, so the browser was free to move the document; and
+// the phone window rule shrank EVERY window to `--ezil-vvh`, including the one
+// containing a video of someone else's screen.
+//
+// Shrinking is right for a local window that owns its own buttons (a file
+// dialog would otherwise have them under the keyboard) and wrong for the
+// stream, where it just makes the remote picture smaller. The remote
+// application is the thing that scrolls its own focused field into view.
+//
+// Simulated by publishing the same custom properties `boot.js` publishes for a
+// real keyboard, which is the only input the CSS actually reads.
+{
+    const L = '[keyboard float]';
+    const { page, context, state } = await boot({ width: 390, height: 844, dpr: 3 });
+
+    const heightOf = (sel) => page.evaluate((s) => {
+        const el = document.querySelector(s);
+        return el ? Math.round(el.getBoundingClientRect().height) : null;
+    }, sel);
+
+    const before = await heightOf('.window[data-app="desktop"]');
+    push(`${L} setup: the desktop fills the phone before any keyboard`,
+        before !== null && before >= 800, `height=${before}`);
+
+    // A 336px keyboard on a 390x844 phone — the figure measured in
+    // `desktop-window.js`'s own keyboard note.
+    await page.evaluate(() => {
+        document.body.style.setProperty('--ezil-vvh', '508px');
+        document.body.style.setProperty('--ezil-kb', '336px');
+    });
+    await sleep(120);
+
+    const after = await heightOf('.window[data-app="desktop"]');
+    push(`${L} 🔴 the streamed desktop keeps its full height — the keyboard floats OVER it`,
+        after !== null && Math.abs(after - before) <= 2, `before=${before} after=${after}`);
+
+    // The other half of the rule: a window that owns its own controls must
+    // still shrink, or its buttons end up under the keyboard.
+    // Computed height, not the rect: a bare probe element has no content and
+    // would measure 0 whatever the rule said, which is a check that passes for
+    // the wrong reason.
+    const dialog = await page.evaluate(() => {
+        const el = document.createElement('div');
+        el.className = 'window window-filedialog';
+        document.body.appendChild(el);
+        const h = getComputedStyle(el).height;
+        el.remove();
+        return h;
+    });
+    push(`${L} 🔴 …while a file dialog still shrinks to the visual viewport, so its buttons stay reachable`,
+        /^\d+(\.\d+)?px$/.test(dialog) && Math.round(parseFloat(dialog)) < before - 100,
+        `dialogComputedHeight=${dialog} desktop=${after}`);
+
+    push(`${L} no uncaught page errors`, state.errors.length === 0, JSON.stringify(state.errors.slice(0, 2)));
+    await context.close();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GROUP 6 — the dock hides itself in a full-screen window
+// ═══════════════════════════════════════════════════════════════════════════
+// Reported as "the dock is not automatically hiding when it is actually in a
+// full-screen window". Measured, it already does — and the reason it can look
+// otherwise is worth pinning down, because it is a timing window and not a
+// bug: the control tray plays a 2.6s INTRO FLASH when the desktop opens, so
+// the controls introduce themselves and retract into the tongue. Sample it
+// inside that window and the drawer is legitimately open.
+//
+//     0.7s  (inside the intro flash)   OPEN 290px, taskbar hidden
+//     3.9s  (after it)                 collapsed 58px
+//     tap the grabber                  OPEN 293px
+//     4.2s later                       collapsed 58px
+//
+// This asserts the behaviour so it stays true, and asserts it PAST the flash
+// so the test cannot fail for the same reason a person would misread it.
+{
+    const L = '[dock auto-hide]';
+    const { page, context, state } = await boot({ width: 1440, height: 900, dpr: 1 });
+
+    const dock = () => page.evaluate(() => {
+        const d = document.querySelector('.window[data-app="desktop"] .dashboard-app-drawer');
+        const tb = document.querySelector('.taskbar');
+        return {
+            collapsed: d ? d.classList.contains('collapsed') : null,
+            width: d ? Math.round(d.getBoundingClientRect().width) : null,
+            taskbar: tb ? getComputedStyle(tb).display : 'missing',
+        };
+    });
+
+    push(`${L} 🔴 the OS taskbar is hidden while the desktop is full-screen`,
+        (await dock()).taskbar === 'none', JSON.stringify(await dock()));
+
+    // Past the 2.6s intro flash.
+    await sleep(3200);
+    const resting = await dock();
+    push(`${L} 🔴 the control tray retracts on its own after the intro flash`,
+        resting.collapsed === true, JSON.stringify(resting));
+
+    await page.evaluate(() => {
+        document.querySelector('.window[data-app="desktop"] .dashboard-app-drawer-toggle')?.click();
+    });
+    await sleep(300);
+    const opened = await dock();
+    push(`${L} tapping the grabber opens it`, opened.collapsed === false, JSON.stringify(opened));
+
+    // Past the 3.5s the toggle schedules.
+    await sleep(4200);
+    const reclosed = await dock();
+    push(`${L} 🔴 …and it auto-hides again without being told to`,
+        reclosed.collapsed === true, JSON.stringify(reclosed));
+
+    push(`${L} no uncaught page errors`, state.errors.length === 0, JSON.stringify(state.errors.slice(0, 2)));
+    await context.close();
+}
+
 await browser.close();
 
 const failed = checks.filter((c) => ! c.pass);

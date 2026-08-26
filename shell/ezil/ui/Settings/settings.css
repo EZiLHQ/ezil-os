@@ -405,3 +405,45 @@
     white-space: pre;
     overflow: auto;
 }
+
+/* ── System tab ──────────────────────────────────────────────────────────
+ * A read-only report: what this window is linked to and how that link is
+ * doing. Laid out as label / value / hint rows rather than a table so a long
+ * hint can wrap under its value without the columns fighting.
+ *
+ * The hint line carries the honesty this tab depends on — e.g. that the
+ * resolution is READ from the running desktop rather than remembered from the
+ * last request, and that the round-trip figure has a floor no quality setting
+ * can move because every session is TURN-relayed. A number without that
+ * context invites the wrong conclusion.
+ */
+.ezil-settings-system h4 {
+    margin: 18px 0 6px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    opacity: .6;
+}
+.ezil-settings-system h4:first-of-type { margin-top: 10px; }
+.ezil-sys-lead { margin: 4px 0 0; font-size: 13px; opacity: .75; }
+.ezil-sys-note { margin: 6px 0; font-size: 13px; opacity: .7; }
+.ezil-sys-row {
+    display: grid;
+    grid-template-columns: 150px 1fr;
+    gap: 2px 12px;
+    padding: 7px 0;
+    border-bottom: 1px solid rgba(127, 127, 127, .16);
+    font-size: 13px;
+}
+.ezil-sys-k { opacity: .7; }
+.ezil-sys-v { font-variant-numeric: tabular-nums; }
+.ezil-sys-h {
+    grid-column: 2;
+    font-size: 12px;
+    opacity: .55;
+    line-height: 1.35;
+}
+.ezil-settings-system code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+}

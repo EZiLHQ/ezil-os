@@ -213,9 +213,16 @@ push('exactly one Settings window (single_instance)',
     qa('.window[data-app="settings"]').length === 1);
 
 const tabIds = qa('.window[data-app="settings"] .ezil-settings-tab').map(t => t.getAttribute('data-tab'));
-push('four tabs, and only four', tabIds.length === 4, JSON.stringify(tabIds));
-push('tabs are Computers / Appearance / About / Troubleshoot',
-    JSON.stringify(tabIds) === JSON.stringify(['computers', 'appearance', 'about', 'troubleshoot']));
+// 🔴 The COUNT and the ORDER are both pinned, and both are load-bearing. The
+// count is what caught the Dashboard's six tabs coming back; the order is what
+// the sidebar renders and what the first-tab default resolves to. `system`
+// joined between `computers` and `appearance` — it answers "what is this
+// window linked to, and how is that link doing", which belongs next to the
+// machine list rather than next to the theme picker.
+push('five tabs, and only five', tabIds.length === 5, JSON.stringify(tabIds));
+push('tabs are Computers / System / Appearance / About / Troubleshoot',
+    JSON.stringify(tabIds) === JSON.stringify(['computers', 'system', 'appearance', 'about', 'troubleshoot']),
+    JSON.stringify(tabIds));
 push('no upstream Dashboard tab survived',
     ! tabIds.some(id => ['home', 'apps', 'files', 'usage', 'account', 'security'].includes(id)));
 
@@ -251,8 +258,57 @@ push('New computer fills the second slot',
     qa('.window[data-app="settings"] .ezil-settings-row-empty').length === 0
     && listRows.length === 2, `${listRows.length} rows server-side`);
 
+// 🔴 BY NAME, NOT BY INDEX. These were `…ezil-settings-tab')[1]` and friends,
+// which silently pointed at the wrong tab the moment one was added — every
+// pane assertion below then failed for a reason that had nothing to do with
+// panes. The sidebar already stamps `data-tab` with the tab's own id, so
+// selecting by it says what it means and cannot shift.
+const clickTab = (id) => {
+    const el = q(`.window[data-app="settings"] .ezil-settings-tab[data-tab="${id}"]`);
+    if ( ! el ) throw new Error(`no settings tab named "${id}"`);
+    click(el);
+};
+
+// ── System tab ─────────────────────────────────────────────────────────────
+// Answers the two things Settings could not: what this window is linked to,
+// and how that link is doing. The rule the whole tab rests on is that every
+// field is MEASURED or ABSENT — a monitor that invents a number is worse than
+// no monitor, because it is believed.
+clickTab('system');
+await settle(4);
+{
+    const pane = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="system"]');
+    push('System pane becomes active', !! pane && pane.classList.contains('active'));
+
+    const host = q('.window[data-app="settings"] .ezil-settings-system');
+    const text = host?.textContent ?? '';
+    if ( process.env.EZIL_DEBUG_SYSTEM ) {
+        console.log('DEBUG host exists:', !!host, 'innerHTML length:', host?.innerHTML?.length ?? -1);
+        console.log('DEBUG html head:', (host?.innerHTML ?? '').slice(0, 300));
+    }
+    push('System tab names the computer this session is linked to',
+        text.includes('My computer'), text.slice(0, 140));
+    push('…and reports the desktop screen and the stream as separate things',
+        /Desktop screen/i.test(text) && /Stream/i.test(text));
+
+    // 🔴 With no desktop window open there is nothing to measure, and the tab
+    // must SAY so rather than render zeros. "0 fps" and "not measured" are
+    // different claims.
+    // 🔴 The property, not one particular sentence. With nothing measured yet
+    // the tab must EXPLAIN that — "no stream to measure" when the desktop is
+    // closed, "waiting for the first measurement" when it is open but has not
+    // reported — and must not render a zero. "0 fps" and "not measured" are
+    // different claims, and only one of them is true here.
+    push('🔴 before any measurement it explains itself instead of showing zeros',
+        /(no stream to measure|waiting for the first measurement|stopped reporting)/i.test(text)
+        && ! /\b0 fps\b/.test(text) && ! /\b0 kbit\/s\b/.test(text),
+        text.replace(/\s+/g, ' ').slice(-170));
+    push('🔴 an unknown value renders as an em dash, never as 0',
+        text.includes('—'));
+}
+
 // ── Appearance tab ─────────────────────────────────────────────────────────
-click(qa('.window[data-app="settings"] .ezil-settings-tab')[1]);
+clickTab('appearance');
 await settle(4);
 push('Appearance pane becomes active',
     q('.window[data-app="settings"] .ezil-settings-pane[data-pane="appearance"]')?.classList.contains('active'));
@@ -275,7 +331,7 @@ push('picking an accent writes the theme tokens',
     doc.documentElement.style.getPropertyValue('--select-hue'));
 
 // ── About tab (AGPL §13) ───────────────────────────────────────────────────
-click(qa('.window[data-app="settings"] .ezil-settings-tab')[2]);
+clickTab('about');
 await settle(4);
 const about = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="about"]');
 push('About pane becomes active', about?.classList.contains('active'));
@@ -301,7 +357,7 @@ push('About shows a version', /Shell version\s*\S/.test(aboutText));
 // would be: no boot payload published a `restart` key, because none exists yet.
 // This is the exact "route not shipped" case the tab must degrade through
 // honestly, not a test artefact.
-click(qa('.window[data-app="settings"] .ezil-settings-tab')[3]);
+clickTab('troubleshoot');
 await settle(4);
 const troubleshoot = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]');
 push('Troubleshoot pane becomes active', troubleshoot?.classList.contains('active'));
@@ -319,9 +375,9 @@ push('the tab explains the workspace is not touched',
 // (every render, not a value snapshotted at window-open) — the same shape of
 // proof `preview-focus-test.mjs` uses for `endpoints.focus`.
 window.__EZIL_BOOT__ = { user: { id: 'u-test' }, desktopState: { endpoints: { restart: '/api/shell/restart' } } };
-click(qa('.window[data-app="settings"] .ezil-settings-tab')[2]); // away…
+clickTab('about'); // away…
 await settle(2);
-click(qa('.window[data-app="settings"] .ezil-settings-tab')[3]); // …and back, re-triggering onActivate
+clickTab('troubleshoot'); // …and back, re-triggering onActivate
 await settle(4);
 restartBtn = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"] [data-action="restart"]');
 push('🔴 …and flips to ENABLED the moment the route is published — no code change, live feature-detection',
@@ -360,9 +416,9 @@ push('probe: launching an unknown app id returns null (the seeding path is real)
 await settle(2);
 
 // Re-render the pane so the counts and the button's enabled state are current.
-click(qa('.window[data-app="settings"] .ezil-settings-tab')[2]);
+clickTab('about');
 await settle(2);
-click(qa('.window[data-app="settings"] .ezil-settings-tab')[3]);
+clickTab('troubleshoot');
 await settle(4);
 
 const ts = () => q('.window[data-app="settings"] .ezil-settings-pane[data-pane="troubleshoot"]');
