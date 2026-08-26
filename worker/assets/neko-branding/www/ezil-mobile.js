@@ -725,20 +725,25 @@
         // Both rules are deliberate. `:has()` hides the whole list item so no
         // empty tap target is left behind; the second is the fallback for a
         // browser without `:has()`, which at least removes the duplicate glyph.
-        '.video-menu li:has(> .fa-keyboard){display:none !important;}',
-        '.video-menu .fa-keyboard{display:none !important;}',
-        '#ezil-kbd-btn{',
-        'position:fixed;left:12px;bottom:12px;z-index:2147483000;',
-        'width:48px;height:48px;padding:0;margin:0;border:0;border-radius:12px;',
-        'display:flex;align-items:center;justify-content:center;',
-        'background:rgba(22,22,22,.82);color:#00adb5;',
-        'box-shadow:0 2px 10px rgba(0,0,0,.45);',
-        'cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent;',
-        'transition:background .12s ease,color .12s ease;',
-        '}',
-        '#ezil-kbd-btn:active{background:rgba(0,173,181,.28);}',
-        '#ezil-kbd-btn[data-open="true"]{background:#00adb5;color:#161616;}',
-        '#ezil-kbd-btn svg{width:24px;height:24px;display:block;pointer-events:none;}',
+        // 🔴 REVERSED ON THE OWNER'S OWN TESTING. This hid the CLIENT's keyboard
+        // button and kept ours. On a real phone that was the wrong way round:
+        // ours sits over the streamed picture and hides the browser's tab bar,
+        // and the owner reported the client's own button — bottom right, in its
+        // menu, clear of the picture — as the one that actually works.
+        //
+        // So there is still exactly ONE affordance, and it is the client's. It
+        // is enlarged rather than replaced: 30x30 is under both the 44px iOS
+        // and 48px Android touch minimums, and a padded hit area fixes that
+        // without adding a second control or moving anything the bundle owns.
+        // 🔴 On the ICON, with `content-box`, and both parts are needed. The
+        // list item has a fixed 30x30 from the client's own stylesheet, so
+        // padding it does not grow it (border-box absorbs the padding) —
+        // measured: still 30x30. Padding the glyph with `box-sizing:
+        // content-box` grows the hit area to 48x48 while leaving the glyph
+        // where it is, and a tap anywhere in it still bubbles to the handler
+        // the client bound on the list item. Negative margins keep the menu's
+        // layout unchanged.
+        '.video-menu .fa-keyboard{box-sizing:content-box;padding:9px;margin:-9px;}',
     ].join('');
 
     // Inline mark, so the button does not depend on the bundle's icon font
@@ -796,6 +801,9 @@
     //
     // Touch devices only, like everything else in this file. A desktop
     // browser keeps the upstream behaviour exactly.
+    /** Marks an event this file dispatched, so the guard lets it through. */
+    var SYNTHETIC = '__ezilSynthetic';
+
     function guardInput(overlay) {
         if (STATE.inputGuarded) return;
 
@@ -812,6 +820,9 @@
 
         function onKey(ev) {
             if (ev.target !== overlay) return;
+            // Our own synthetic Backspaces must reach the keysym path — they
+            // are the delete half of a replacement and carry no text.
+            if (ev[SYNTHETIC]) return;
             // Ctrl/Alt/Meta chords are commands, not text, and never arrive as
             // an `input` event — they must keep the keysym path.
             if (ev.ctrlKey || ev.altKey || ev.metaKey) return;
@@ -820,15 +831,120 @@
             }
         }
 
+        // ── (C2) AUTOCORRECT REPLACES; THE CLIENT COULD ONLY APPEND ────────
+        //
+        // Reported with a screenshot: the phone's suggestion strip reading
+        // "Fast.comfast" — a replacement and the text it was meant to replace,
+        // both delivered.
+        //
+        // The client's text path is `type(e.data)`. It can insert and it has no
+        // way to remove, so when a predictive keyboard REPLACES a word — the
+        // autocorrect that fires on space, on punctuation, or on tapping a
+        // suggestion — the remote receives the correction appended to the
+        // original instead of instead of it.
+        //
+        // `beforeinput` is the only event that says what is about to be
+        // removed: `getTargetRanges()` returns the range the replacement will
+        // overwrite. Sending that many Backspaces first turns an append into a
+        // real replacement.
+        //
+        // 🔴 ONLY `insertReplacementText`. A plain Backspace already arrives as
+        // a real `keydown` that this guard deliberately lets through to the
+        // keysym path, so treating `deleteContentBackward` here as well would
+        // delete twice — which is the same class of bug as the double-typing
+        // this file exists to fix, just pointed the other way.
+        function backspaceOnce() {
+            var init = { key: 'Backspace', code: 'Backspace', keyCode: 8, which: 8, bubbles: true };
+            init[SYNTHETIC] = true;
+            var down = new KeyboardEvent('keydown', init);
+            var up = new KeyboardEvent('keyup', init);
+            down[SYNTHETIC] = true;
+            up[SYNTHETIC] = true;
+            overlay.dispatchEvent(down);
+            overlay.dispatchEvent(up);
+        }
+
+        function onBeforeInput(ev) {
+            if (ev.target !== overlay) return;
+            if (ev.inputType !== 'insertReplacementText') return;
+            var removed = 0;
+            try {
+                var ranges = typeof ev.getTargetRanges === 'function' ? ev.getTargetRanges() : [];
+                for (var i = 0; i < ranges.length; i++) {
+                    var r = ranges[i];
+                    if (r && typeof r.startOffset === 'number' && typeof r.endOffset === 'number') {
+                        removed += Math.max(0, r.endOffset - r.startOffset);
+                    }
+                }
+            } catch (e) {
+                return;   // no range information: better to append than to delete blindly
+            }
+            // A pathological range is not a licence to hold Backspace down on
+            // someone's remote desktop.
+            if (removed <= 0 || removed > 64) return;
+            for (var k = 0; k < removed; k++) backspaceOnce();
+        }
+
+        try {
+            window.addEventListener('beforeinput', onBeforeInput, true);
+        } catch (e) {
+            warn('beforeinput-guard-failed', String((e && e.message) || e));
+        }
+
+        // Tell the keyboard what kind of field this is. The client sets only
+        // `spellcheck="false"`; on a phone the rest of these are what stop a
+        // predictive keyboard capitalising, correcting and completing text that
+        // is not a document but a stream of keystrokes for someone else's
+        // machine. They reduce how often the replacement path above is needed;
+        // they do not replace it, because no attribute reliably disables
+        // prediction on Android.
+        try {
+            overlay.setAttribute('autocapitalize', 'none');
+            overlay.setAttribute('autocorrect', 'off');
+            overlay.setAttribute('autocomplete', 'off');
+        } catch (e) {
+            /* attribute support is not worth failing a keyboard over */
+        }
+
         try {
             window.addEventListener('keydown', onKey, true);
             window.addEventListener('keypress', onKey, true);
             // keyup is deliberately NOT suppressed. The bundle tracks modifier
             // state from it, and a swallowed keyup is how a remote desktop
             // ends up with a key stuck down.
-            window.addEventListener('compositionstart', function (ev) {
-                if (ev.target === overlay) ev.stopPropagation();
-            }, true);
+            // 🔴 DEFECT B IS FIXED BY REFUSING ONE REMOVAL, NOT BY WITHHOLDING
+            // THE EVENT. The first version of this suppressed `compositionstart`
+            // outright, and that SHIPPED AND MADE TYPING WORSE.
+            //
+            // The Vue component that owns the player has its own bookkeeping on
+            // the very same event:
+            //
+            //     onCompositionStartHandler() { this.lastTextAreaValue = overlay.value }
+            //     onCompositionEndHandler()   { overlay.value = this.lastTextAreaValue }
+            //
+            // — it snapshots the textarea before a composition and restores it
+            // after, which is what stops the overlay growing without bound.
+            // Withholding `compositionstart` meant the snapshot was never
+            // taken while the restore still ran, so the textarea was reset to a
+            // STALE string. The phone keyboard's own state then diverged from
+            // the field it was editing: reported as "Fast.comfast" in the
+            // suggestion strip while the remote received "ast".
+            //
+            // The actual problem was never the event. It was one line inside
+            // the Guacamole keyboard's own handler:
+            //
+            //     compositionstart: removeEventListener("input", n)
+            //
+            // …which nothing ever undoes, so after the first composed word a
+            // character typed WITHOUT composition has no delivery path. So
+            // refuse exactly that removal and leave every event flowing to
+            // every listener, Vue's included. `input` is removed in precisely
+            // one place in the bundle, so this is as narrow as it looks.
+            var nativeRemove = overlay.removeEventListener.bind(overlay);
+            overlay.removeEventListener = function (type) {
+                if (type === 'input') return undefined;
+                return nativeRemove.apply(null, arguments);
+            };
             STATE.inputGuarded = true;
         } catch (e) {
             warn('input-guard-failed', String((e && e.message) || e));
@@ -836,142 +952,38 @@
     }
 
     function arm(overlay) {
-        // Install the duplicate-input guard even if the button is already
-        // there: they are independent repairs and the guard is idempotent.
-        guardInput(overlay);
-        if (document.getElementById('ezil-kbd-btn')) return;
-
-        var style = document.createElement('style');
-        style.id = 'ezil-kbd-style';
-        style.textContent = CSS;
-        document.head.appendChild(style);
-
-        var btn = document.createElement('button');
-        btn.id = 'ezil-kbd-btn';
-        btn.type = 'button';
-        btn.setAttribute('aria-label', 'Show keyboard');
-        btn.setAttribute('title', 'Show keyboard');
-        btn.setAttribute('data-open', 'false');
-        btn.innerHTML = ICON;
-        document.body.appendChild(btn);
-
-        // Where the button can safely sit.
+        // 🔴 THIS FILE NO LONGER ADDS A KEYBOARD BUTTON.
         //
-        // Bottom-left is the reachable place for a thumb, and it is correct
-        // wherever `visualViewport` reports the keyboard inset (Android Chrome,
-        // and any top-level document). It is NOT correct on iOS inside a
-        // cross-origin iframe: there the keyboard does not shrink the frame's
-        // visual viewport, the inset reads 0, and a bottom-anchored button ends
-        // up buried under the keys with no way to dismiss them. So when the
-        // keyboard is up and we could not measure an inset, we do not guess —
-        // we move to the top, which no keyboard can cover.
-        function place() {
-            var buried = STATE.open && !STATE.keyboardInset;
-            if (buried) {
-                btn.style.top = '12px';
-                btn.style.bottom = 'auto';
-            } else {
-                btn.style.top = 'auto';
-                btn.style.bottom = (STATE.keyboardInset || 0) + 12 + 'px';
-            }
+        // It used to add its own 48x48 one, because the client's is 30x30 and
+        // sits low in the letterbox. On a real phone that reasoning was wrong
+        // in the way that matters: ours is `position: fixed` OVER the streamed
+        // picture, so it covered the remote browser's tab bar, and the owner
+        // reported it as not working while the client's own button did. Two
+        // affordances for one action, and the worse one on top of the content.
+        //
+        // What remains is the part only this file can do — repairing the input
+        // path so a phone keyboard types each character once and corrections
+        // replace rather than append, taking control when the session is not
+        // hosting (without which every keystroke is dropped), and publishing
+        // stream vitals on request. Plus one stylesheet rule that grows the
+        // client's own button to a real touch target.
+        guardInput(overlay);
+
+        if (!document.getElementById('ezil-kbd-style')) {
+            var style = document.createElement('style');
+            style.id = 'ezil-kbd-style';
+            style.textContent = CSS;
+            document.head.appendChild(style);
         }
 
-        function setOpen(open) {
-            STATE.open = open;
-            btn.setAttribute('data-open', open ? 'true' : 'false');
-            var label = open ? 'Hide keyboard' : 'Show keyboard';
-            btn.setAttribute('aria-label', label);
-            btn.setAttribute('title', label);
-            place();
-        }
-
-        // Keep the button from taking focus when it is TAPPED, while leaving it
-        // reachable by Tab. Without this, a tap moves focus off the overlay
-        // before the click handler runs, so the handler sees "overlay is not
-        // focused", re-focuses it, and the button can never dismiss the
-        // keyboard — observed exactly that way before this line existed.
-        // `mousedown` is the event that performs pointer focus (it fires on
-        // touch too, synthesized after touchend), and cancelling it suppresses
-        // the focus change without suppressing the click that follows.
-        btn.addEventListener('mousedown', function (ev) {
-            ev.preventDefault();
-        });
-
-        // `click` — not `pointerdown`/`touchend` — because iOS honours a
-        // programmatic focus() only from inside a user-gesture handler, `click`
-        // is such a handler, and binding one event rather than two removes any
-        // chance of the touch's synthesized click firing this twice.
-        btn.addEventListener('click', function (ev) {
-            ev.preventDefault();
-            ev.stopPropagation();
-
-            var el = overlayEl() || overlay;
-            if (!el) {
-                warn('keyboard-arm-failed', 'overlay vanished');
-                return;
-            }
-
-            if (document.activeElement === el) {
-                // Second tap dismisses. Blur is what lowers the OS keyboard.
-                try {
-                    el.blur();
-                } catch (e) {
-                    /* ignore */
-                }
-                setOpen(false);
-                return;
-            }
-
-            // Recover from control mode 'manual': without this, focus lands but
-            // every keystroke is dropped by the client's `hosting` guard. Fired
-            // before focus() and never awaited — the round trip completes long
-            // before a human types, and blocking here would cost the gesture.
-            if (!isHosting(el)) takeControlIfFree();
-
-            try {
-                // preventScroll: the overlay is full-bleed; scrolling it into
-                // view would jerk the letterboxed picture around for no gain.
-                el.focus({ preventScroll: true });
-            } catch (e) {
-                try {
-                    el.focus();
-                } catch (e2) {
-                    warn('keyboard-focus-failed', String(e2));
-                    return;
-                }
-            }
-            setOpen(document.activeElement === el);
-        });
-
-        // The OS keyboard can also be dismissed by the platform's own "done"
-        // key, which fires blur without any tap on our button. Track the real
-        // state rather than assuming ours is authoritative.
-        overlay.addEventListener('focus', function () {
-            setOpen(true);
-        });
-        overlay.addEventListener('blur', function () {
-            setOpen(false);
-        });
-
-        // `visualViewport` is the only API that reports the keyboard inset at
-        // all. Where it works, use it and stay just above the keys; where it
-        // reports nothing, `place()` falls back to the top edge.
-        var vv = window.visualViewport;
-        if (vv) {
-            var reposition = function () {
-                STATE.keyboardInset = Math.max(0, window.innerHeight - (vv.height + vv.offsetTop));
-                place();
-            };
-            vv.addEventListener('resize', reposition);
-            vv.addEventListener('scroll', reposition);
-            reposition();
-        } else {
-            STATE.keyboardInset = 0;
-            place();
-        }
+        // Control first: in 'manual' mode the overlay carries
+        // `pointer-events: none` and every keystroke is dropped behind the
+        // `hosting && !locked` guard, so the repaired input path would have
+        // nothing to deliver to.
+        if (!isHosting(overlay)) takeControlIfFree();
 
         STATE.armed = true;
-        STATE.reason = 'armed';
+        STATE.reason = 'client-keyboard';
     }
 
     if (document.body) {

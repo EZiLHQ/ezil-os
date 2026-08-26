@@ -225,9 +225,16 @@ describe('the soft keyboard types each character exactly once', () => {
     const res = sh('node', ['-e', script], 180_000);
     const line = (res.stdout || '').trim().split('\n').filter(Boolean).pop() ?? '[]';
     const found = JSON.parse(line) as Array<{ id: string | null; w: number; h: number }>;
-    // Before the fix: upstream's 30x30 `fa-keyboard` in the letterbox AND ours.
+    // 🔴 ONE affordance, and it is the CLIENT'S — not one this file adds.
+    //
+    // This originally asserted the opposite: that our own `#ezil-kbd-btn`
+    // survived and the client's was hidden. Tested on a real phone that was the
+    // wrong way round. Ours is `position: fixed` OVER the streamed picture, so
+    // it covered the remote browser's tab bar, and the owner reported it as not
+    // working while the client's own button did. So this file no longer adds a
+    // button at all; it grows the client's to a real touch target instead.
     expect(found.length).toBe(1);
-    expect(found[0]!.id).toBe('ezil-kbd-btn');
+    expect(found[0]!.id).toBe(null);
     expect(found[0]!.w).toBeGreaterThanOrEqual(48);
     expect(found[0]!.h).toBeGreaterThanOrEqual(48);
   }, 300_000);

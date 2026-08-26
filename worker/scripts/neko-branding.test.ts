@@ -191,6 +191,14 @@ function runMobileScript(opts: {
             addEventListener(type: string, fn: (e: unknown) => void) {
                 (el.listeners[type] ||= []).push(fn);
             },
+            // A real element has this, and the input-path repair REPLACES it on
+            // the overlay so the bundle cannot remove its own `input` listener.
+            // Recorded so a test can assert which removals get through — that
+            // refusal is the whole mechanism.
+            removeEventListener(type: string) {
+                calls.push(`el.off:${type}`);
+                delete el.listeners[type];
+            },
             appendChild() {},
             click() {
                 calls.push(`click:${el.className}`);
@@ -301,20 +309,29 @@ describe('ezil-mobile.js gates on touch capability, not on viewport size', () =>
         expect(EZIL_MOBILE_JS).not.toMatch(/max-width\s*:/);
     });
 
-    it('arms on a real touch device and injects a button', () => {
+    it('🔴 arms on a real touch device and adds NO button of its own', () => {
+        // This asserted the opposite — that a `#ezil-kbd-btn` was injected —
+        // until a real phone showed why that was wrong. Ours is
+        // `position: fixed` OVER the streamed picture and covered the remote
+        // browser's tab bar, and the owner reported it as not working while the
+        // client's own keyboard button did. Two affordances for one action,
+        // with the worse one on top of the content.
+        //
+        // The file now repairs the input path and leaves the affordance to the
+        // client, so "armed" means the repairs are installed.
         const r = runMobileScript({ touch: true, coarsePointer: true });
         expect(r.state.armed).toBe(true);
-        expect(r.button).toBeDefined();
-        expect(r.button!.attrs['aria-label']).toBe('Show keyboard');
+        expect(r.state.reason).toBe('client-keyboard');
+        expect(r.button).toBeUndefined();
     });
 });
 
 describe('ezil-mobile.js drives the client bundle rather than reimplementing it', () => {
-    it('focuses the client’s own overlay textarea, which is what the OS keyboard attaches to', () => {
+    it('does not touch control when the session is ALREADY hosting', () => {
         const r = runMobileScript({ touch: true, coarsePointer: true, overlayPointerEvents: 'auto' });
-        r.clickBtn();
-        expect(r.calls).toContain('focus:overlay');
-        // Already hosting, so it must NOT poke the take-control affordance.
+        // Nothing to take: the overlay already accepts pointer events, so
+        // poking the take-control affordance would be taking it from nobody
+        // and costing a click for it.
         expect(r.calls.some((c) => c.startsWith('click:'))).toBe(false);
     });
 
@@ -328,26 +345,39 @@ describe('ezil-mobile.js drives the client bundle rather than reimplementing it'
             overlayPointerEvents: 'none',
             controlIconClass: 'faded fas fa-computer-mouse',
         });
-        r.clickBtn();
+        // Taken at ARM time now, not on a button press — there is no button.
+        // Without it the overlay carries `pointer-events: none` and every
+        // keystroke is dropped behind the client's `hosting && !locked` guard,
+        // so the repaired input path would have nothing to deliver to.
+        //
         // The guard's own `window.addEventListener` calls are SETUP, not the
-        // behaviour under test here — filtered out so this assertion keeps
-        // saying exactly what it was written to say.
+        // behaviour under test — filtered out so this assertion keeps saying
+        // exactly what it was written to say.
         expect(r.calls.filter((c) => !c.startsWith('win.on:')))
-            .toEqual(['click:faded fas fa-computer-mouse', 'focus:overlay']);
+            .toEqual(['click:faded fas fa-computer-mouse']);
     });
 
     // ── the duplicate-input guard ──────────────────────────────────────────
     // The mechanism of the mobile double-typing fix, asserted without a
     // container. See `mobile-keyboard.container.test.ts` for the end-to-end
     // frame counts against a real client.
-    it('🔴 withholds printable keys from the bundle, and compositionstart, in the CAPTURE phase', () => {
+    it('🔴 withholds printable keys from the bundle in the CAPTURE phase', () => {
         const r = runMobileScript({ touch: true, coarsePointer: true });
         // Capture, because these listeners must run BEFORE the overlay's own —
         // the bundle binds keydown with capture:true on the overlay itself, so
         // a bubble-phase listener could never withhold anything from it.
         expect(r.calls).toContain('win.on:keydown:capture');
         expect(r.calls).toContain('win.on:keypress:capture');
-        expect(r.calls).toContain('win.on:compositionstart:capture');
+        // 🔴 compositionstart is NOT withheld any more, and that reversal
+        // matters. Suppressing it fixed one defect and created a worse one: the
+        // player's Vue component snapshots the textarea on `compositionstart`
+        // and RESTORES it on `compositionend`, so withholding the start meant
+        // the restore wrote a stale value and the phone keyboard's own state
+        // diverged from the field it was editing. That shipped, and was
+        // reported as mangled typing. The removal it was working around is now
+        // refused directly instead — see `guardInput`.
+        expect(r.calls).not.toContain('win.on:compositionstart:capture');
+        expect(r.calls).toContain('win.on:beforeinput:capture');
         // 🔴 keyup is deliberately NOT suppressed: the bundle tracks modifier
         // state from it, and a swallowed keyup is how a remote desktop ends up
         // with a key stuck down.
@@ -384,6 +414,36 @@ describe('ezil-mobile.js drives the client bundle rather than reimplementing it'
         expect(fire({ key: 'c', keyCode: 67, ctrlKey: true })).toBe(false);
     });
 
+    it('🔴 refuses the ONE removal that breaks typing, and passes every other through', () => {
+        // The defect: the Guacamole keyboard's `compositionstart` handler runs
+        //     removeEventListener("input", n)
+        // and nothing ever adds it back, so after the first composed word a
+        // character typed WITHOUT composition has no delivery path at all.
+        //
+        // The first attempt at this withheld `compositionstart` from the bundle
+        // entirely. That fixed the removal and broke something worse: the
+        // player's Vue component snapshots the textarea on `compositionstart`
+        // and RESTORES it on `compositionend`, so withholding the start left
+        // the restore writing a stale value and the phone keyboard's state
+        // diverged from the field it was editing. It shipped, and came back as
+        // mangled typing.
+        //
+        // So the removal is refused directly and every event still reaches
+        // every listener, Vue's included.
+        const r = runMobileScript({ touch: true, coarsePointer: true });
+        const overlay = r.doc.querySelector('textarea.overlay') as unknown as {
+            removeEventListener: (t: string) => void;
+        };
+
+        overlay.removeEventListener('input');
+        expect(r.calls).not.toContain('el.off:input');
+
+        // Anything else must still work — this is a refusal of one removal, not
+        // a lobotomy of the element.
+        overlay.removeEventListener('keydown');
+        expect(r.calls).toContain('el.off:keydown');
+    });
+
     it('leaves events for anything that is not the overlay alone', () => {
         const r = runMobileScript({ touch: true, coarsePointer: true });
         const onKey = r.winListeners.keydown?.[0];
@@ -400,16 +460,27 @@ describe('ezil-mobile.js drives the client bundle rather than reimplementing it'
             overlayPointerEvents: 'none',
             controlIconClass: 'disabled fas fa-computer-mouse',
         });
-        r.clickBtn();
+        // `disabled` marks control held by SOMEONE ELSE. Upstream distinguishes
+        // that from `faded` (nobody holds it), and taking it from a person who
+        // has it would be a worse bug than a keyboard that does not open.
+        // Nothing is clicked, and — since this file no longer owns a button —
+        // nothing is focused either; the client's own control is what opens the
+        // keyboard, and it correctly does nothing while another member hosts.
         expect(r.calls.some((c) => c.startsWith('click:'))).toBe(false);
-        expect(r.calls).toContain('focus:overlay');
+        expect(r.calls).not.toContain('focus:overlay');
     });
 
-    it('a second tap lowers the keyboard again', () => {
+    it('🔴 adds no button, so there is no second tap of ours to test', () => {
+        // This asserted that tapping OUR button twice lowered the keyboard.
+        // There is no button of ours any more — the client's own control both
+        // raises and lowers it, which is the behaviour the owner confirmed
+        // working on a real phone. Kept as a guard rather than deleted: if a
+        // button ever comes back, this goes red and someone has to decide
+        // whether it should, instead of inheriting a second affordance
+        // silently.
         const r = runMobileScript({ touch: true, coarsePointer: true });
-        r.clickBtn();
-        r.clickBtn();
-        expect(r.calls).toContain('blur:overlay');
+        expect(r.button).toBeUndefined();
+        expect(r.calls.filter((c) => !c.startsWith('win.on:'))).toEqual([]);
     });
 });
 

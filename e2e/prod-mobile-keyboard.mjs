@@ -92,10 +92,16 @@ try {
     }
     return out;
   }).catch(() => []);
+  // 🔴 ONE affordance, and it is the CLIENT'S. This asserted the reverse until
+  // a real phone showed our own fixed-position button covering the remote
+  // browser's tab bar while the client's worked — so the button was removed and
+  // the client's grown to a real touch target instead.
   check('🔴 exactly ONE keyboard affordance is on screen (there were two)',
     buttons.length === 1, JSON.stringify(buttons));
   check('…and it clears the 48px Android touch minimum',
     buttons[0] && buttons[0].w >= 48 && buttons[0].h >= 48, JSON.stringify(buttons[0] ?? null));
+  check('…and it is the client\'s own control, not one we overlay on the picture',
+    buttons[0] && buttons[0].id !== 'ezil-kbd-btn', JSON.stringify(buttons[0] ?? null));
 
   // 🔴 Each character exactly once, replaying what a predictive keyboard emits.
   const sent = await frame.evaluate(async () => {
