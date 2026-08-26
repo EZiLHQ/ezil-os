@@ -1,0 +1,163 @@
+# Deploy — and then PROVE it, against the thing that was deployed.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔴 THE TWO THINGS THIS PIPELINE EXISTS TO GET RIGHT
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. A DEPLOY THAT REPORTS SUCCESS IS NOT A DEPLOY THAT TOOK EFFECT. This
+#    project has shipped a green `wrangler deploy` whose container rollout
+#    stalled, and has passed a full production suite against a container still
+#    running the PREVIOUS image. So the production suites run AFTER the deploy,
+#    against the live URL, and their failure fails the run.
+#
+# 2. A RESTART DOES NOT PICK UP A NEW IMAGE. `restartDesktopStack` re-runs the
+#    boot script inside the SAME container, which keeps the image it was created
+#    with until it actually stops. Anything that verifies a CONTAINER change has
+#    to wait for a genuinely fresh one — which is why `verify-container` is a
+#    separate, manually-triggered job rather than a step that would quietly
+#    measure the old image and call it green.
+#
+# Secrets required (repository settings → Secrets and variables → Actions):
+#   CLOUDFLARE_API_TOKEN     Workers + Containers deploy
+#   CLOUDFLARE_ACCOUNT_ID
+#   VERCEL_TOKEN             Vercel CLI
+#   VERCEL_ORG_ID
+#   VERCEL_PROJECT_ID
+#   EZIL_E2E_EMAIL           an account the production suites can sign in as
+#   EZIL_E2E_PASSWORD
+#
+# The worker image is built from `worker/Dockerfile`, which FROMs a pinned neko
+# branding image. That base is NOT built here — it is large, rarely changes, and
+# is pushed by hand. If you change `worker/assets/neko-branding/`, rebuild and
+# push that image first, or this deploys a worker around a stale client.
+name: Deploy
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      verify_container:
+        description: 'Also verify container-image changes (needs a fresh container; slow)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    name: deploy worker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+      - name: Install
+        working-directory: worker
+        run: bun install --frozen-lockfile
+      # Never deploy something that does not typecheck. The unit suite runs in
+      # CI on the way in; this is the last gate on the way out.
+      - name: Typecheck
+        working-directory: worker
+        run: bun run typecheck
+      - name: Deploy
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler deploy
+
+  app:
+    name: deploy app
+    runs-on: ubuntu-latest
+    needs: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+      # 🔴 The committed bundle must match its sources before it is served.
+      - name: Committed bundle matches source
+        run: bash shell/build-shell.sh --check
+      - name: Install
+        working-directory: app
+        run: bun install --frozen-lockfile
+      - name: Deploy
+        working-directory: app
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: npx vercel --prod --yes --token "${{ secrets.VERCEL_TOKEN }}"
+
+  verify:
+    name: verify against production
+    runs-on: ubuntu-latest
+    needs: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Install Playwright
+        run: |
+          mkdir -p /opt/ezil-testkit
+          cd /opt/ezil-testkit
+          npm init -y >/dev/null
+          npm i playwright@1.62.1 >/dev/null
+          npx playwright install --with-deps chromium
+      # Give the edge a moment to serve the new build before asserting on it.
+      - name: Settle
+        run: sleep 30
+      - name: Production suites
+        env:
+          PLAYWRIGHT_REQUIRE_DIR: /opt/ezil-testkit/node_modules
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+        run: |
+          set -e
+          # These assert the SHELL and the WORKER ROUTES, which a Vercel deploy
+          # serves immediately. Container-image behaviour is verified separately
+          # — see the job below and the note at the top of this file.
+          for s in prod prod-responsiveness prod-window-stacking prod-reconcile; do
+            echo "── e2e/$s.mjs"
+            node "e2e/$s.mjs"
+          done
+
+  verify-container:
+    name: verify container image (fresh container required)
+    runs-on: ubuntu-latest
+    needs: verify
+    if: ${{ inputs.verify_container }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Install Playwright
+        run: |
+          mkdir -p /opt/ezil-testkit
+          cd /opt/ezil-testkit
+          npm init -y >/dev/null
+          npm i playwright@1.62.1 >/dev/null
+          npx playwright install --with-deps chromium
+      # 🔴 A running container keeps its image until it STOPS. Releasing the
+      # desktop marks the session idle so the reaper stops it; the poll then
+      # waits for a genuinely fresh one. Without this the suites below would
+      # measure the OLD image and report success — which has happened.
+      - name: Release the desktop and wait for a fresh container
+        env:
+          PLAYWRIGHT_REQUIRE_DIR: /opt/ezil-testkit/node_modules
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+        run: node e2e/release-and-wait.mjs
+      - name: Container-facing production suites
+        env:
+          PLAYWRIGHT_REQUIRE_DIR: /opt/ezil-testkit/node_modules
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+        run: |
+          set -e
+          for s in prod-mobile-keyboard prod-system-tab; do
+            echo "── e2e/$s.mjs"
+            node "e2e/$s.mjs"
+          done

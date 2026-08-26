@@ -1,0 +1,136 @@
+# CI — the checks that must pass before anything ships.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHAT THIS RUNS, AND WHAT IT DELIBERATELY DOES NOT
+# ─────────────────────────────────────────────────────────────────────────────
+# It runs everything a hosted runner can honestly run: type checks, unit tests,
+# the real-browser shell suites (Playwright, headless Chromium), and a check
+# that the committed shell bundle still matches its sources.
+#
+# It does NOT run:
+#
+#   * the CONTAINER tests (`*.container.test.ts`). They boot the real neko image
+#     with Docker, which a runner does not have and cannot cheaply build. Each
+#     one already gates on `docker image inspect` and SKIPS rather than fails,
+#     so they are green-by-absence here — which is exactly why they are named in
+#     the job summary. A skipped test that looks like a pass is how a suite
+#     stops meaning anything.
+#
+#   * the PRODUCTION suites (`e2e/prod-*.mjs`). They sign in to the live
+#     deployment with real credentials and drive a real container. They belong
+#     to a deploy, not to a pull request, and they live in `deploy.yml`.
+#
+# 🔴 The bundle check is not decoration. `app/public/os/bundle.min.js` is
+# COMMITTED, and a source change without a rebuild ships the old behaviour while
+# every local test passes against the new source. That has happened here.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  worker:
+    name: worker (typecheck + unit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install
+        working-directory: worker
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        working-directory: worker
+        run: bun run typecheck
+      - name: Unit tests
+        working-directory: worker
+        # Container tests skip themselves when Docker has no image; everything
+        # else must pass.
+        run: bun test
+
+  app:
+    name: app (typecheck + unit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # bun, not npm: `app/bun.lock` is the committed lockfile and there is no
+      # `package-lock.json`, so `npm ci` would fail outright. Node is still set
+      # up because the shell suites and `vitest` run under it.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install
+        working-directory: app
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        working-directory: app
+        run: npx tsc --noEmit -p tsconfig.json
+      - name: Unit tests
+        working-directory: app
+        run: npx vitest run
+
+  shell:
+    name: shell (bundle check + browser suites)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      # 🔴 The committed bundle must match its sources. Without this a source
+      # change without a rebuild ships the OLD behaviour while every other check
+      # passes against the NEW source.
+      - name: Committed bundle matches source
+        run: bash shell/build-shell.sh --check
+      - name: Install Playwright
+        run: |
+          mkdir -p /opt/ezil-testkit
+          cd /opt/ezil-testkit
+          npm init -y >/dev/null
+          npm i playwright@1.62.1 >/dev/null
+          npx playwright install --with-deps chromium
+      - name: Shell unit suites
+        run: |
+          set -e
+          for t in shell/ezil/apps/desktop-screen-test.mjs \
+                   shell/ezil/apps/desktop-close-test.mjs \
+                   shell/ezil/apps/code-test.mjs \
+                   shell/ezil/apps/preview-focus-test.mjs \
+                   shell/ezil/apps/registry-trace-test.mjs \
+                   shell/ezil/ui/Settings/settings-test.mjs; do
+            echo "── $t"
+            node "$t"
+          done
+      - name: Shell real-browser suites
+        env:
+          PLAYWRIGHT_REQUIRE_DIR: /opt/ezil-testkit
+        run: |
+          set -e
+          for t in shell/responsiveness-browser-test.mjs \
+                   shell/seam-minimise-browser-test.mjs \
+                   shell/window-chrome-browser-test.mjs \
+                   shell/phone-stacking-browser-test.mjs \
+                   shell/touch-focus-browser-test.mjs \
+                   shell/ezil/apps/os-chrome-browser-test.mjs \
+                   shell/ezil/apps/mobile-browser-test.mjs \
+                   shell/ezil/apps/overlay-paint-browser-test.mjs \
+                   shell/ezil/apps/resize-test.mjs \
+                   shell/ezil/ui/Settings/stacking-browser-test.mjs \
+                   shell/ezil/ui/Settings/late-focus-browser-test.mjs; do
+            echo "── $t"
+            node "$t"
+          done
