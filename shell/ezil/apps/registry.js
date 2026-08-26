@@ -522,6 +522,59 @@ export function resolve (payload) {
  *   boot payload (`payload`, `computer`, `desktopState`).
  * @returns {Promise<HTMLElement|null>} the window element, or null if nothing opened.
  */
+/**
+ * Make sure the window a user just opened is actually the one on top.
+ *
+ * 🔴 WHY THIS IS NOT REDUNDANT WITH `focusWindow()`.
+ *
+ * Z-ORDER IN THIS SHELL IS DECIDED BY FOCUS, NOT BY THE COUNTER. `style.css`
+ * gives every `.window` a `z-index: 9999999 !important`, so the inline value
+ * `UIWindow` assigns is overridden and cannot order anything; the rule that
+ * actually orders windows is focused = 9999999, unfocused = 9999998 (see the
+ * long block above that rule — it was written when the counter was found to
+ * be decorative).
+ *
+ * So whichever window is focused LAST wins, and focus is not always applied
+ * synchronously: `$.fn.showWindow` focuses on a `setTimeout(..., 80)`. A
+ * desktop window being restored therefore lands its focus up to 80ms in the
+ * future, and if a user opens Settings from that desktop's drawer inside that
+ * window, the desktop's late focus arrives AFTER Settings opened and Settings
+ * drops to 9999998 — underneath a full-screen desktop, invisible and
+ * untappable. Measured on a phone: `document.elementFromPoint()` at Settings'
+ * own close button returned the DESKTOP's body, and
+ * `mobile-browser-test.mjs` failed 4 runs in 5 on exactly that.
+ *
+ * This re-asserts focus once, after any such delayed focus can have landed,
+ * and ONLY if the window has actually been overtaken. It is deliberately not
+ * an unconditional re-focus: stealing focus back from a window the user
+ * legitimately moved to afterwards would be a worse bug than the one being
+ * fixed.
+ */
+function ensureOnTop (el_window) {
+    if ( ! el_window || typeof el_window.getBoundingClientRect !== 'function' ) return;
+    const zOf = (el) => Number.parseInt(getComputedStyle(el).zIndex, 10) || 0;
+    const assertTop = () => {
+        try {
+            if ( ! el_window.isConnected ) return;
+            // Only if something is genuinely ABOVE it.
+            let above = false;
+            for ( const el_other of document.querySelectorAll('.window') ) {
+                if ( el_other === el_window ) continue;
+                if ( zOf(el_other) > zOf(el_window) ) { above = true; break; }
+            }
+            if ( ! above ) return;
+            log.info(`[${PHASE}] a just-opened window was overtaken; re-focusing it`);
+            $(el_window).focusWindow();
+        } catch ( err ) {
+            // Never let a stacking nicety take down an app open.
+            console.warn(`[${PHASE}] ensureOnTop threw`, err);
+        }
+    };
+    // 120ms > the 80ms `showWindow` delay, so a focus already in flight has
+    // landed and can be corrected rather than raced.
+    setTimeout(assertTop, 120);
+}
+
 export async function launch (id, ctx = {}) {
     const app = getApp(id);
     if ( ! app ) {
@@ -562,6 +615,7 @@ export async function launch (id, ctx = {}) {
                     { expected: true },
                 );
             }
+            ensureOnTop(el_existing);
             return el_existing;
         }
     }
@@ -689,6 +743,9 @@ export async function launch (id, ctx = {}) {
         // this trace, at its own terminal state, via the `ctx.trace.end` it
         // was handed. Nothing further to do here.
 
+        // A freshly created window is subject to the same late-focus race as a
+        // restored one — see `ensureOnTop`.
+        ensureOnTop(el_window);
         return el_window;
     } catch ( err ) {
         // A throwing `open` must not leave the caller (a taskbar click, a
