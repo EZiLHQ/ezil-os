@@ -29,6 +29,7 @@
  */
 
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -53,27 +54,26 @@ const PASS  = process.env.EZIL_E2E_PASSWORD ?? '<redacted-password>';
 const DEADLINE_MS = Number(process.env.EZIL_FRESH_DEADLINE_MS ?? 30 * 60 * 1000);
 
 /**
- * A distinctive string from the CURRENT client script — the evidence that the
- * container is running this build. Picked from the source rather than
- * hardcoded so it cannot go stale; if the source stops containing any of them,
- * that is an error, not a pass.
+ * A fingerprint of the CURRENT client script.
+ *
+ * 🔴 NOT a hand-picked marker string, and that distinction cost a false green.
+ * This first polled for a distinctive substring taken from the source — but a
+ * substring added two builds ago is present in BOTH builds, so the poll
+ * reported "fresh container serving the current build" against the previous
+ * image, which is exactly the failure this file exists to prevent.
+ *
+ * A length-and-digest of the served file against the local one cannot make
+ * that mistake: it is equal only when the container is serving THIS build.
  */
-function markerFromSource() {
+function localFingerprint() {
   const src = fs.readFileSync(
     path.resolve(here, '../worker/assets/neko-branding/www/ezil-mobile.js'), 'utf8',
   );
-  for (const candidate of ['insertReplacementText', 'client-keyboard', 'stream_vitals', 'guardInput']) {
-    if (src.includes(candidate)) return candidate;
-  }
-  return null;
+  return { bytes: Buffer.byteLength(src, 'utf8'), digest: crypto.createHash('sha256').update(src).digest('hex') };
 }
 
-const MARKER = markerFromSource();
-if (!MARKER) {
-  console.error('could not find a marker in ezil-mobile.js — refusing to poll for nothing. SKIPPING (exit 2).');
-  process.exit(2);
-}
-console.log(`waiting for a container whose client script contains ${JSON.stringify(MARKER)}`);
+const WANT = localFingerprint();
+console.log(`waiting for a container serving ezil-mobile.js ${WANT.bytes} bytes, sha256 ${WANT.digest.slice(0, 12)}…`);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -128,10 +128,14 @@ for (;;) {
       if (!frame) continue;
       const ready = await frame.evaluate(() => !!document.querySelector('textarea.overlay')).catch(() => false);
       if (!ready) continue;
-      return frame.evaluate(async (m) => {
+      return frame.evaluate(async (want) => {
         const r = await fetch('ezil-mobile.js');
-        return (await r.text()).includes(m);
-      }, MARKER).catch(() => false);
+        const t = await r.text();
+        if (new Blob([t]).size !== want.bytes) return false;
+        const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t));
+        const hex = Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+        return hex === want.digest;
+      }, WANT).catch(() => false);
     }
     return false;
   }).catch(() => false);

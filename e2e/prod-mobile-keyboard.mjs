@@ -28,6 +28,9 @@
 
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import fs from 'node:fs';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 const REQ_DIR = process.env.PLAYWRIGHT_REQUIRE_DIR;
 let chromium = null;
@@ -92,6 +95,28 @@ try {
     }
     return out;
   }).catch(() => []);
+  // 🔴 IS THE DEPLOYED CONTAINER EVEN RUNNING THIS BUILD?
+  //
+  // Everything below asserts BEHAVIOUR, and behaviour is only evidence about
+  // the current build if the current build is what is serving. A container
+  // keeps the image it was created with until it stops, so a suite can pass
+  // perfectly against the PREVIOUS one — which has happened here more than
+  // once. Comparing the served client script byte-for-byte against the working
+  // tree is the one check that cannot be fooled by that.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const localSrc = fs.readFileSync(
+    path.resolve(here, '../worker/assets/neko-branding/www/ezil-mobile.js'), 'utf8');
+  const localDigest = crypto.createHash('sha256').update(localSrc).digest('hex');
+  const servedDigest = await frame.evaluate(async () => {
+    const r = await fetch('ezil-mobile.js');
+    const t = await r.text();
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t));
+    return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  }).catch(() => null);
+  check('🔴 the deployed container is serving THIS build of the client script',
+    servedDigest === localDigest,
+    `served ${String(servedDigest).slice(0, 12)}… local ${localDigest.slice(0, 12)}…`);
+
   // 🔴 ONE affordance, and it is the CLIENT'S. This asserted the reverse until
   // a real phone showed our own fixed-position button covering the remote
   // browser's tab bar while the client's worked — so the button was removed and
