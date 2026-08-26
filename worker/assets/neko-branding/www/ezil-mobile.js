@@ -99,7 +99,7 @@
     'use strict';
 
     var NS = 'ezil-mobile';
-    var STATE = { armed: false, reason: null, open: false, tookControl: false, errors: [] };
+    var STATE = { armed: false, reason: null, open: false, tookControl: false, inputGuarded: false, errors: [] };
     // Readable from a verifier's `page.evaluate()`; not part of any wire contract.
     try {
         Object.defineProperty(window, '__ezilMobileKeyboard', { value: STATE, writable: false });
@@ -580,6 +580,33 @@
 
     // ── The button ──────────────────────────────────────────────────────────
     var CSS = [
+        // ── (D) TWO KEYBOARD BUTTONS ───────────────────────────────────────
+        // Reported from a phone, with a screenshot: two keyboard affordances
+        // on screen at once. Measured in a real client — upstream's
+        // `<i class="fas fa-keyboard">` at 30x30 sitting at y=799 in the black
+        // letterbox, and ours at 48x48 at y=784.
+        //
+        // (B) above explains why ours exists: upstream's is 30x30, unlabelled,
+        // positioned against `.player` rather than the picture, and on a
+        // 390x844 phone it lands roughly 260px BELOW the image — under both
+        // the 44px iOS and 48px Android minimum touch targets. What (B) never
+        // did was hide the one it replaces, so when `hosting` is true both are
+        // rendered and the user is offered the same action twice, one of which
+        // barely works.
+        //
+        // 🔴 A STYLESHEET RULE, NOT AN INLINE STYLE, and that is the whole
+        // reason this is safe. This file's contract is that it never re-parents
+        // or restyles an element the compiled bundle owns, so a Vue re-render
+        // can never fight it. A rule in OUR stylesheet keeps that property: Vue
+        // re-rendering that `<li>` does not remove our rule, whereas an inline
+        // `style.display` would be wiped on the next patch. Nothing is removed
+        // from the DOM, so the bundle's own handlers stay bound and intact.
+        //
+        // Both rules are deliberate. `:has()` hides the whole list item so no
+        // empty tap target is left behind; the second is the fallback for a
+        // browser without `:has()`, which at least removes the duplicate glyph.
+        '.video-menu li:has(> .fa-keyboard){display:none !important;}',
+        '.video-menu .fa-keyboard{display:none !important;}',
         '#ezil-kbd-btn{',
         'position:fixed;left:12px;bottom:12px;z-index:2147483000;',
         'width:48px;height:48px;padding:0;margin:0;border:0;border-radius:12px;',
@@ -603,7 +630,95 @@
         '<path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 13h.01M10 13h.01M14 13h.01M18 13h.01M8 16.5h8"/>' +
         '</svg>';
 
+    // ── (C) THE SOFT KEYBOARD TYPES EVERYTHING TWICE ───────────────────────
+    //
+    // Reported from a phone: typing "fast" put "fastfast" in the remote
+    // browser, and it got worse the longer you typed. Reproduced against a
+    // real container by replaying what a predictive Android keyboard actually
+    // emits — 4 characters produced 8 keydown frames on the wire.
+    //
+    // The cause is in the compiled client's Guacamole-derived keyboard, which
+    // listens on the overlay like this (deminified from app.48a1d8f5.js):
+    //
+    //     keydown:          if (!e.isComposing && e.keyCode !== 229) -> send keysym
+    //     input:            if (e.data && !e.isComposing)            -> type(e.data)
+    //     compositionstart: removeEventListener("input", n)
+    //     compositionend:   if (e.data)                              -> type(e.data)
+    //
+    // Two separate defects fall out of that on a phone:
+    //
+    //   A. SwiftKey (and Gboard) send REAL key codes per character AND run a
+    //      composition. `keyCode !== 229` is therefore true, so every
+    //      character goes out once as a keysym from `keydown` and again as
+    //      text from `compositionend`. Hence "fast" -> "fastfast".
+    //
+    //   B. `compositionstart` REMOVES the input listener and nothing ever adds
+    //      it back. After the first composed word, a character typed without
+    //      composition has no delivery path left at all.
+    //
+    // Neither is reachable from a desktop browser, which is why it shipped.
+    //
+    // The repair is two `stopPropagation()` calls in the CAPTURE phase on
+    // `window`, which runs before the overlay's own listeners and so can
+    // withhold an event from the bundle without touching it:
+    //
+    //   * printable `keydown`/`keypress` never reach the keysym path, so text
+    //     is delivered once, by the `input`/`compositionend` path that was
+    //     built for it. Non-printable keys — Backspace, Enter, Tab, arrows,
+    //     modifiers — are let through untouched, because they carry no text
+    //     and the keysym path is the only thing that can send them.
+    //
+    //   * `compositionstart` never reaches the bundle, so its input listener
+    //     is never removed and (B) cannot happen. Nothing else is bound to
+    //     that event, and the bundle's own composition handling still works:
+    //     `input` continues to ignore itself while `isComposing` is true, and
+    //     `compositionend` still delivers the finished word.
+    //
+    // Touch devices only, like everything else in this file. A desktop
+    // browser keeps the upstream behaviour exactly.
+    function guardInput(overlay) {
+        if (STATE.inputGuarded) return;
+
+        // A single printable character. `key` is 'a', '.', '€'; anything
+        // longer is a named key ('Backspace', 'Enter', 'ArrowLeft', 'Shift').
+        function isPrintable(ev) {
+            var k = ev.key;
+            if (typeof k !== 'string') return false;
+            // Array.from, not .length: an emoji is one character in two code
+            // units, and treating it as a named key would let it through the
+            // keysym path where it cannot be represented.
+            return Array.from(k).length === 1;
+        }
+
+        function onKey(ev) {
+            if (ev.target !== overlay) return;
+            // Ctrl/Alt/Meta chords are commands, not text, and never arrive as
+            // an `input` event — they must keep the keysym path.
+            if (ev.ctrlKey || ev.altKey || ev.metaKey) return;
+            if (ev.isComposing || ev.keyCode === 229 || isPrintable(ev)) {
+                ev.stopPropagation();
+            }
+        }
+
+        try {
+            window.addEventListener('keydown', onKey, true);
+            window.addEventListener('keypress', onKey, true);
+            // keyup is deliberately NOT suppressed. The bundle tracks modifier
+            // state from it, and a swallowed keyup is how a remote desktop
+            // ends up with a key stuck down.
+            window.addEventListener('compositionstart', function (ev) {
+                if (ev.target === overlay) ev.stopPropagation();
+            }, true);
+            STATE.inputGuarded = true;
+        } catch (e) {
+            warn('input-guard-failed', String((e && e.message) || e));
+        }
+    }
+
     function arm(overlay) {
+        // Install the duplicate-input guard even if the button is already
+        // there: they are independent repairs and the guard is idempotent.
+        guardInput(overlay);
         if (document.getElementById('ezil-kbd-btn')) return;
 
         var style = document.createElement('style');

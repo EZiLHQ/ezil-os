@@ -228,6 +228,7 @@ function runMobileScript(opts: {
         },
     };
 
+    const winListeners: Record<string, Array<(e: unknown) => void>> = {};
     const win: StubEl = {
         navigator: { maxTouchPoints: opts.touch ? 5 : 0 },
         matchMedia: (q: string) => ({ matches: q.includes('pointer: coarse') ? opts.coarsePointer : false }),
@@ -240,6 +241,14 @@ function runMobileScript(opts: {
         clearInterval: () => {},
         console: { warn: (m: string) => calls.push(`warn:${m}`) },
         visualViewport: null,
+        // A real browser window has this, and the duplicate-input guard binds
+        // its capture-phase listeners here. Recorded rather than ignored so a
+        // test can assert WHICH events the guard withholds from the bundle —
+        // that is the whole mechanism of the mobile double-typing fix.
+        addEventListener: (type: string, fn: (e: unknown) => void, capture?: boolean) => {
+            calls.push(`win.on:${type}${capture ? ':capture' : ''}`);
+            (winListeners[type] ??= []).push(fn);
+        },
     };
     if (opts.touch) win.ontouchstart = null;
     win.window = win;
@@ -266,7 +275,7 @@ function runMobileScript(opts: {
     const clickBtn = () => {
         for (const fn of button?.listeners.click ?? []) fn({ preventDefault() {}, stopPropagation() {} });
     };
-    return { state, calls, button, clickBtn, doc };
+    return { state, calls, button, clickBtn, doc, winListeners };
 }
 
 describe('ezil-mobile.js gates on touch capability, not on viewport size', () => {
@@ -320,7 +329,68 @@ describe('ezil-mobile.js drives the client bundle rather than reimplementing it'
             controlIconClass: 'faded fas fa-computer-mouse',
         });
         r.clickBtn();
-        expect(r.calls).toEqual(['click:faded fas fa-computer-mouse', 'focus:overlay']);
+        // The guard's own `window.addEventListener` calls are SETUP, not the
+        // behaviour under test here — filtered out so this assertion keeps
+        // saying exactly what it was written to say.
+        expect(r.calls.filter((c) => !c.startsWith('win.on:')))
+            .toEqual(['click:faded fas fa-computer-mouse', 'focus:overlay']);
+    });
+
+    // ── the duplicate-input guard ──────────────────────────────────────────
+    // The mechanism of the mobile double-typing fix, asserted without a
+    // container. See `mobile-keyboard.container.test.ts` for the end-to-end
+    // frame counts against a real client.
+    it('🔴 withholds printable keys from the bundle, and compositionstart, in the CAPTURE phase', () => {
+        const r = runMobileScript({ touch: true, coarsePointer: true });
+        // Capture, because these listeners must run BEFORE the overlay's own —
+        // the bundle binds keydown with capture:true on the overlay itself, so
+        // a bubble-phase listener could never withhold anything from it.
+        expect(r.calls).toContain('win.on:keydown:capture');
+        expect(r.calls).toContain('win.on:keypress:capture');
+        expect(r.calls).toContain('win.on:compositionstart:capture');
+        // 🔴 keyup is deliberately NOT suppressed: the bundle tracks modifier
+        // state from it, and a swallowed keyup is how a remote desktop ends up
+        // with a key stuck down.
+        expect(r.calls).not.toContain('win.on:keyup:capture');
+    });
+
+    it('🔴 stops a printable key but lets Backspace, Enter and chords through', () => {
+        const r = runMobileScript({ touch: true, coarsePointer: true });
+        const onKey = r.winListeners.keydown?.[0];
+        expect(onKey).toBeDefined();
+        const overlay = r.doc.querySelector('textarea.overlay');
+
+        const fire = (init: Record<string, unknown>) => {
+            let stopped = false;
+            onKey!({ target: overlay, stopPropagation: () => { stopped = true; }, ...init });
+            return stopped;
+        };
+
+        // Text: withheld, because the bundle's input/compositionend path will
+        // deliver it and the keysym path would deliver it a SECOND time.
+        expect(fire({ key: 'f', keyCode: 70 })).toBe(true);
+        expect(fire({ key: '.', keyCode: 190 })).toBe(true);
+        // An IME keydown, both ways it identifies itself.
+        expect(fire({ key: 'a', keyCode: 229 })).toBe(true);
+        expect(fire({ key: 'a', keyCode: 70, isComposing: true })).toBe(true);
+
+        // No text: the keysym path is the ONLY thing that can send these.
+        expect(fire({ key: 'Backspace', keyCode: 8 })).toBe(false);
+        expect(fire({ key: 'Enter', keyCode: 13 })).toBe(false);
+        expect(fire({ key: 'ArrowLeft', keyCode: 37 })).toBe(false);
+        expect(fire({ key: 'Shift', keyCode: 16 })).toBe(false);
+        // A chord is a command, not text, and never arrives as an `input`
+        // event — withholding it would make Ctrl+C unsendable.
+        expect(fire({ key: 'c', keyCode: 67, ctrlKey: true })).toBe(false);
+    });
+
+    it('leaves events for anything that is not the overlay alone', () => {
+        const r = runMobileScript({ touch: true, coarsePointer: true });
+        const onKey = r.winListeners.keydown?.[0];
+        let stopped = false;
+        onKey!({ target: { nodeName: 'INPUT' }, key: 'f', keyCode: 70,
+                 stopPropagation: () => { stopped = true; } });
+        expect(stopped).toBe(false);
     });
 
     it('does not steal control from another member who already holds it', () => {
