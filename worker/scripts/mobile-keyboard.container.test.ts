@@ -56,6 +56,8 @@ import { spawnSync } from 'node:child_process';
 const IMAGE = process.env.EZIL_NEKO_IMAGE ?? 'ezil-integrated:local';
 const CONTAINER = `ezil-kbd-test-${process.pid}`;
 const PORT = 18291;
+const SIDECAR_PORT = 18292;
+const PAGE_PORT = 3112;   // served INSIDE the container
 const BOOT_TIMEOUT_MS = 240_000;
 
 function sh(cmd: string, args: string[], timeout = 60_000) {
@@ -72,9 +74,12 @@ beforeAll(() => {
   }
   sh('docker', ['rm', '-f', CONTAINER]);
   const run = sh('docker', [
-    'run', '-d', '--name', CONTAINER, '--cpus=2', '-p', `${PORT}:8181`,
+    'run', '-d', '--name', CONTAINER, '--cpus=2',
+    '-p', `${PORT}:8181`, '-p', `${SIDECAR_PORT}:9223`,
     '-e', 'DESKTOP_MODE=neko',
-    '-e', 'EZIL_BROWSER_SIDECAR=off',
+    // ON: the end-to-end checks read the remote page back through it, which is
+    // the only way to assert the TEXT rather than a frame count.
+    '-e', 'EZIL_BROWSER_SIDECAR=on',
     '-e', 'NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=s1admin',
     '-e', 'NEKO_PASSWORD_ADMIN=s1admin',
     '-e', 'NEKO_MEMBER_MULTIUSER_USER_PASSWORD=s1user',
@@ -87,7 +92,22 @@ beforeAll(() => {
   const deadline = Date.now() + BOOT_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const probe = sh('docker', ['exec', CONTAINER, 'grep', '-c', 'phase=ready', '/tmp/neko.log'], 20_000);
-    if (probe.status === 0 && Number((probe.stdout || '0').trim()) > 0) return;
+    if (probe.status === 0 && Number((probe.stdout || '0').trim()) > 0) {
+      // A one-input page served from inside the container, and the sidecar up
+      // to read it back. Both are prerequisites for asserting TEXT rather than
+      // frame counts.
+      sh('docker', ['exec', CONTAINER, 'bash', '-lc',
+        'mkdir -p /tmp/tt && printf "%s" '
+        + '"<!doctype html><meta charset=utf-8><input id=t autofocus style=font-size:34px;width:92%>" '
+        + `> /tmp/tt/index.html; (cd /tmp/tt && nohup python3 -m http.server ${PAGE_PORT === 18293 ? 3112 : 3112} >/dev/null 2>&1 &); sleep 1`], 60_000);
+      const sidecarDeadline = Date.now() + 120_000;
+      while (Date.now() < sidecarDeadline) {
+        const h = sh('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}', `http://127.0.0.1:${SIDECAR_PORT}/health`], 15_000);
+        if ((h.stdout || '').trim() === '200') break;
+        Bun.sleepSync(2000);
+      }
+      return;
+    }
     Bun.sleepSync(1000);
   }
   available = false;
@@ -145,6 +165,56 @@ async function framesFor(scenario: string): Promise<{ keydown: number; keyup: nu
   return JSON.parse(line) as { keydown: number; keyup: number };
 }
 
+/**
+ * Type a sequence into the client and read what the REMOTE page received.
+ *
+ * 🔴 Counting frames is not enough for these. A replacement delivers the RIGHT
+ * NUMBER of keysyms while delivering the WRONG TEXT — "fast" then '.' arrived
+ * as "fastfast." with a perfectly plausible frame count. The only honest
+ * assertion is the string in the remote input, read back through the sidecar.
+ */
+async function remoteTextAfter(sequence: string): Promise<string> {
+  const script = `
+    const { chromium } = require('playwright');
+    const sc = async (v, b) => (await fetch('http://127.0.0.1:${SIDECAR_PORT}/' + v, {
+      method: v === 'health' ? 'GET' : 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: v === 'health' ? undefined : JSON.stringify(b || {}) })).json();
+    (async () => {
+      await sc('navigate', { url: 'http://127.0.0.1:3112/' });
+      await new Promise(r => setTimeout(r, 1800));
+      const b = await chromium.launch();
+      const ctx = await b.newContext({ viewport:{width:390,height:844}, hasTouch:true, isMobile:true,
+        deviceScaleFactor:3,
+        userAgent:'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36' });
+      const p = await ctx.newPage();
+      await p.goto('http://127.0.0.1:${PORT}/?usr=EZiL&pwd=s1user&embed=1',{waitUntil:'domcontentloaded'});
+      await p.waitForSelector('textarea.overlay',{timeout:60000}).catch(()=>{});
+      await p.waitForTimeout(8000);
+      await p.evaluate(async () => {
+        const ta = document.querySelector('textarea.overlay'); ta.focus();
+        const K=(t,i)=>ta.dispatchEvent(new KeyboardEvent(t,Object.assign({bubbles:true},i)));
+        const C=(t,i)=>ta.dispatchEvent(new CompositionEvent(t,Object.assign({bubbles:true},i)));
+        const I=(i)=>ta.dispatchEvent(new InputEvent('input',Object.assign({bubbles:true},i)));
+        const BI=(o)=>{ const e=new InputEvent('beforeinput',{bubbles:true,cancelable:true,data:o.data,inputType:o.inputType});
+          e.getTargetRanges=()=>(o.ranges||[]).map(([a,z])=>({startOffset:a,endOffset:z}));
+          ta.dispatchEvent(e); };
+        const s=(ms)=>new Promise(r=>setTimeout(r,ms));
+        ${sequence}
+        await s(800);
+      });
+      await b.close();
+      const snap = await sc('snapshot', {});
+      const m = JSON.stringify(snap).match(/textbox[^\\n"]{0,60}/i);
+      console.log(JSON.stringify((m ? m[0] : '')
+        .replace(/textbox\\s*/,'').replace(/\\[ref=e\\d+\\]\\s*/,'').replace(/\\[focused\\]:?\\s*/,'').trim()));
+    })();
+  `;
+  const res = sh('node', ['-e', script], 240_000);
+  const line = (res.stdout || '').trim().split('\n').filter(Boolean).pop() ?? '""';
+  try { return JSON.parse(line) as string; } catch { return ''; }
+}
+
 describe('the soft keyboard types each character exactly once', () => {
   it('🔴 a predictive keyboard typing a 4-character word sends FOUR keydowns, not eight', async () => {
     if (!available) { console.warn('container unavailable — SKIPPING, not passing'); return; }
@@ -197,6 +267,65 @@ describe('the soft keyboard types each character exactly once', () => {
     `);
     expect(got.keydown).toBe(2);
   }, 300_000);
+
+  // ── what the REMOTE actually received ──────────────────────────────────
+  // 🔴 These assert TEXT, not frame counts, and that distinction is the reason
+  // they exist. A replacement delivers a perfectly plausible number of keysyms
+  // while delivering the wrong string: typing "fast" then '.' arrived in the
+  // remote page as "fastfast." because the client's keyboard types on BOTH the
+  // `insertReplacementText` input and the `compositionend` that follows it.
+  // A frame counter is blind to that; the input's value is not.
+  it.each([
+    // '.' commits the word and autocorrects — the reported failure.
+    ['a word committed by "." ', `
+      C('compositionstart',{data:''});
+      for (const ch of 'fast') { const kc=ch.toUpperCase().charCodeAt(0);
+        K('keydown',{key:ch,keyCode:kc,which:kc}); I({data:ch,inputType:'insertCompositionText',isComposing:true});
+        K('keyup',{key:ch,keyCode:kc,which:kc}); await s(30); }
+      K('keydown',{key:'.',keyCode:190,which:190});
+      BI({inputType:'insertReplacementText',data:'fast',ranges:[[0,4]]});
+      I({data:'fast',inputType:'insertReplacementText'});
+      C('compositionend',{data:'fast'});
+      I({data:'.',inputType:'insertText'});
+      K('keyup',{key:'.',keyCode:190,which:190}); await s(120);
+      for (const ch of 'com') { const kc=ch.toUpperCase().charCodeAt(0);
+        K('keydown',{key:ch,keyCode:kc,which:kc}); I({data:ch,inputType:'insertText'});
+        K('keyup',{key:ch,keyCode:kc,which:kc}); await s(30); }`, 'fast.com'],
+    // the same word committed without a correction
+    ['a word committed plainly', `
+      C('compositionstart',{data:''});
+      for (const ch of 'fast') { const kc=ch.toUpperCase().charCodeAt(0);
+        K('keydown',{key:ch,keyCode:kc,which:kc}); I({data:ch,inputType:'insertCompositionText',isComposing:true});
+        K('keyup',{key:ch,keyCode:kc,which:kc}); await s(30); }
+      C('compositionend',{data:'fast'}); await s(80);
+      K('keydown',{key:'.',keyCode:190,which:190}); I({data:'.',inputType:'insertText'});
+      K('keyup',{key:'.',keyCode:190,which:190}); await s(80);
+      for (const ch of 'com') { const kc=ch.toUpperCase().charCodeAt(0);
+        K('keydown',{key:ch,keyCode:kc,which:kc}); I({data:ch,inputType:'insertText'});
+        K('keyup',{key:ch,keyCode:kc,which:kc}); await s(30); }`, 'fast.com'],
+    // 🔴 a suggestion tapped for an ALREADY-COMMITTED word: no compositionend
+    // is coming, so the replacement must really replace — Backspaces first.
+    ['a tapped suggestion replaces, not appends', `
+      for (const ch of 'teh') { const kc=ch.toUpperCase().charCodeAt(0);
+        K('keydown',{key:ch,keyCode:kc,which:kc}); I({data:ch,inputType:'insertText'});
+        K('keyup',{key:ch,keyCode:kc,which:kc}); await s(30); }
+      await s(80);
+      BI({inputType:'insertReplacementText',data:'the',ranges:[[0,3]]});
+      I({data:'the',inputType:'insertReplacementText'}); await s(150);`, 'the'],
+    // Backspace deletes ONE character, not two.
+    ['Backspace after a composed word', `
+      C('compositionstart',{data:''});
+      for (const ch of 'abcd') { const kc=ch.toUpperCase().charCodeAt(0);
+        K('keydown',{key:ch,keyCode:kc,which:kc}); I({data:ch,inputType:'insertCompositionText',isComposing:true});
+        K('keyup',{key:ch,keyCode:kc,which:kc}); await s(25); }
+      C('compositionend',{data:'abcd'}); await s(120);
+      K('keydown',{key:'Backspace',keyCode:8,which:8});
+      I({data:null,inputType:'deleteContentBackward'});
+      K('keyup',{key:'Backspace',keyCode:8,which:8}); await s(150);`, 'abc'],
+  ])('🔴 %s -> the remote receives exactly "%s"', async (_label, sequence, expected) => {
+    if (!available) { console.warn('container unavailable — SKIPPING, not passing'); return; }
+    expect(await remoteTextAfter(sequence as string)).toBe(expected as string);
+  }, 400_000);
 
   it('🔴 exactly ONE keyboard affordance is on screen, and it clears the 48px touch minimum', async () => {
     if (!available) { console.warn('container unavailable — SKIPPING, not passing'); return; }

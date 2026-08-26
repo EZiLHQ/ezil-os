@@ -74,7 +74,7 @@
 #
 #    So: whenever `worker/assets/neko-branding/**` changes, rebuild the overlay
 #    under a NEW `brandN` tag and bump this line in the same commit.
-ARG NEKO_IMAGE=ezil-neko-vscode:d74052bb-049931d7-ezil-brand7
+ARG NEKO_IMAGE=ezil-neko-vscode:d74052bb-049931d7-ezil-brand8
 FROM ${NEKO_IMAGE} AS neko
 
 FROM docker.io/cloudflare/sandbox:0.12.1

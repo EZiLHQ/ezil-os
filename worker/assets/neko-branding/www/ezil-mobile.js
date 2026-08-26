@@ -864,9 +864,57 @@
             overlay.dispatchEvent(up);
         }
 
+        // Is a composition in flight? Tracked with PASSIVE listeners — nothing
+        // is withheld here, because the player's Vue component needs both
+        // events for its own textarea bookkeeping.
+        var composing = false;
+        try {
+            overlay.addEventListener('compositionstart', function () { composing = true; }, false);
+            overlay.addEventListener('compositionend', function () { composing = false; }, false);
+        } catch (e) {
+            /* without this the replacement rules below simply do not engage */
+        }
+
+        function onInput(ev) {
+            if (ev.target !== overlay) return;
+            // 🔴 A REPLACEMENT THAT ENDS A COMPOSITION IS DELIVERED TWICE.
+            //
+            // When a predictive keyboard commits a word — typing '.' or space
+            // after it — it fires BOTH an `input` carrying
+            // `insertReplacementText` and, immediately after, a
+            // `compositionend` carrying the same final text. The client's
+            // keyboard types on both:
+            //
+            //     input:          if (e.data && !e.isComposing) type(e.data)
+            //     compositionend: if (e.data)                   type(e.data)
+            //
+            // …so "fast" followed by '.' arrived as "fastfast.". Reproduced
+            // end to end against a real client: typing "fast.com" put
+            // "fastfast.com" in the remote page.
+            //
+            // Withhold the `input` half. It is safe to pick that one because
+            // Vue binds only `compositionstart`/`compositionend` — nothing else
+            // reads this event — and `compositionend` is guaranteed to follow
+            // with the same text, so the character still arrives exactly once.
+            //
+            // Only WHILE COMPOSING. A replacement outside a composition (a
+            // suggestion tapped for an already-committed word) has no
+            // `compositionend` coming, so it must be let through — and its
+            // `beforeinput` deletion below is what makes it a replacement
+            // rather than an append.
+            if (composing && ev.inputType === 'insertReplacementText') {
+                ev.stopPropagation();
+            }
+        }
+
         function onBeforeInput(ev) {
             if (ev.target !== overlay) return;
             if (ev.inputType !== 'insertReplacementText') return;
+            // 🔴 NEVER while composing. During a composition the client ignores
+            // `input` (`!e.isComposing`), so the text being "replaced" was
+            // never sent to the remote at all — issuing Backspaces for it would
+            // delete whatever the user had legitimately typed BEFORE the word.
+            if (composing) return;
             var removed = 0;
             try {
                 var ranges = typeof ev.getTargetRanges === 'function' ? ev.getTargetRanges() : [];
@@ -887,6 +935,7 @@
 
         try {
             window.addEventListener('beforeinput', onBeforeInput, true);
+            window.addEventListener('input', onInput, true);
         } catch (e) {
             warn('beforeinput-guard-failed', String((e && e.message) || e));
         }
