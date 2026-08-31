@@ -108,6 +108,12 @@ bun run test
 bun run build        # run this before a PR that touches app/
 ```
 
+Signed in, this is what you get: a desktop with its own windows, dock and
+settings, drawn entirely by the `shell/` bundle. Every computer is a real
+container, and a user may hold two.
+
+<img width="700" alt="The EZiL-OS desktop shell, with Settings open on the computers list" src="docs/assets/desktop-shell.jpg">
+
 **The shell** — the in-browser desktop UI, built into a committed bundle:
 
 ```bash
