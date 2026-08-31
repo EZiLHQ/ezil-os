@@ -1,13 +1,17 @@
 # The Browser-fix contract
 
-**Status: PINNED. Single-authored. Do not edit if you are a Phase 1 agent** — if you
-believe something here is wrong, say so in your final report and stop; do not work
-around it. A contract described in two briefs is two contracts.
+**Status: PINNED, single-authored.** If you believe something here is wrong, say so
+rather than working around it. A contract described in two briefs is two contracts.
 
-This document exists because twelve agents are changing one browser at the same time,
-and six of them touch the same wire. Every name below — env var, route path, JSON
-field, telemetry site, CSS class, file path — is fixed text. Use it exactly. Do not
-invent a name that this document assigns to another task.
+This document exists because twelve parallel workstreams were changing one browser at
+the same time, and six of them touched the same wire. `W1`–`W12` below are workstream
+IDs, and each name — env var, route path, JSON field, telemetry site, CSS class, file
+path — is fixed text with exactly one owner. Use it exactly; do not invent a name this
+document assigns to another workstream.
+
+It is kept in the repository as the record of how that interface was frozen, and of
+who owned which knob. Anything it says was *measured* was measured against a live
+container, not inferred.
 
 Companion document: `docs/NEKO-GROUND-TRUTH.md` (Phase 0a) records what a real
 container actually does. Where this contract says "per ground truth", read that file

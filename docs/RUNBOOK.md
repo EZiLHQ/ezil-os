@@ -31,8 +31,8 @@ system, which is out of scope for a docs-only pass.
 > had been for roughly two weeks.** It was written from the repo (no code path
 > calls `drizzle-kit push`/`migrate`, which is still true) rather than from the
 > database. Nobody had looked. `docs/telemetry.md`'s matching "nothing is
-> stored" claim was corrected in the same pass. Evidence below is from
-> `docs/SUPABASE-STATE.md`, which queried the live project.
+> stored" claim was corrected in the same pass. The evidence below came from
+> querying the live project directly.
 
 **State, measured 2026-08-19 against project `<project-ref>`:**
 
@@ -285,7 +285,7 @@ SANDBOX_HMAC_SECRET='<secret>' node scripts/pull-neko-log.mjs <sandbox> --route 
 Every `console.log`/`console.error` in the Worker, plus the structured
 `LifecycleTimeline` JSON lines (`{"ts":…,"correlationId":…,"event":…}`) that are
 the *only* record of what the Worker thought was happening — the ~3-minute
-upstream hang in `docs/PRODUCTION-ERROR-ANALYSIS.md` §3#6 is invisible in
+upstream hang seen in production telemetry is invisible in
 Postgres precisely because only this stream could have explained it.
 
 **Live tail**, which is the same command it has always been:
@@ -314,8 +314,7 @@ range. `head_sampling_rate = 1.0` means no sampling: every invocation is kept.
 
 ### What none of these streams see
 
-Carried from `docs/PRODUCTION-ERROR-ANALYSIS.md` §4, because it is the part
-people forget: a page that never loads emits nothing (the emitter is in the
+The part people forget: a page that never loads emits nothing (the emitter is in the
 shell bundle); a session that connects and dies at minute three writes nothing
 (the boot trace has already ended, and there is no heartbeat); a user who gave
 up and never retried leaves no row at all. **A quiet table is not a healthy
@@ -831,9 +830,8 @@ Keep it short and expect it:
 secret value along with the previous code, which un-rotates the Worker half and re-opens the
 window above. After any rollback, re-check the pair.
 
-**Never commit rotation state, key inventories, or operator paths to this repository.** An
-earlier revision of this file pointed at a local key-inventory file by absolute path; that
-line has been removed. Track rotation wherever you track other operational secrets.
+**Never commit rotation state, key inventories, or operator paths to this repository.**
+Track rotation wherever you track other operational secrets.
 
 ---
 

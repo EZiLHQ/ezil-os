@@ -1,10 +1,8 @@
 # Performance baseline — where EZiL-OS's time actually goes
 
-Measured against **live production** by L2 on **2026-08-19, 14:05–15:00 UTC**.
-App `https://ezil-os.vercel.app` (Vercel), Worker `ezil-os-worker` on
-`api-desktop.ezil.org` (Cloudflare), container `standard-3` (2 vCPU / 8 GiB),
-account `<redacted-email>`, one computer (`3d348cd2-…`), sandbox
-`guac-894b7d033b8248a9-3d348cd2057b4bae`.
+Measured against **live production** on **2026-08-19, 14:05–15:00 UTC**: the
+Next.js app on Vercel, the `ezil-os-worker` Worker on Cloudflare, a `standard-3`
+container (2 vCPU / 8 GiB), one test account, one computer, one sandbox.
 
 Read-only throughout: desktops were opened and used; **nothing was deleted, no
 setting was changed, nothing was deployed, no source file was modified, no
