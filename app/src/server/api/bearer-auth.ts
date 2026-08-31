@@ -47,7 +47,11 @@ export const userFromBearer = async (
     const header = headers.get('authorization');
     if (header === null) return undefined;
 
-    const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+    // `\s+(.+)` is the shape CodeQL flags as polynomial-backtracking ReDoS on
+    // an attacker-controlled header (the same finding the CodeQL sweep fixed in
+    // `worker/src/sandbox-control.ts`). Anchored, no overlapping quantifiers,
+    // and newlines excluded so a folded header cannot smuggle a second value.
+    const match = /^Bearer[ \t]+(\S[^\r\n]*)$/i.exec(header.trim());
     if (!match) return null;
 
     const token = match[1]!.trim();

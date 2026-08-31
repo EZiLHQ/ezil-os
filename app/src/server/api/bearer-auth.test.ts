@@ -75,3 +75,33 @@ describe('userFromBearer', () => {
         await expect(userFromBearer(v, headers('Bearer nope'))).resolves.toBeNull();
     });
 });
+
+describe('userFromBearer — header parsing hardening', () => {
+    const v = (): BearerVerifier => ({
+        auth: {
+            async getUser(jwt?: string) {
+                return jwt === 'good'
+                    ? { data: { user: ALICE }, error: null }
+                    : { data: { user: null }, error: { message: 'invalid' } };
+            },
+        },
+    });
+
+    // Applied to an attacker-controlled header, so it must not be the
+    // `\s+(.+)` shape CodeQL flags for polynomial backtracking.
+    it('matches a very long token without catastrophic backtracking', async () => {
+        const started = Date.now();
+        await userFromBearer(v(), new Headers({ authorization: `Bearer ${'a'.repeat(50_000)}` }));
+        expect(Date.now() - started).toBeLessThan(1000);
+    });
+
+    it('accepts a tab as the separator, per RFC 7230 whitespace', async () => {
+        const h = new Headers({ authorization: 'Bearer\tgood' });
+        await expect(userFromBearer(v(), h)).resolves.toEqual(ALICE);
+    });
+
+    it('does not treat a multi-word value as the first word', async () => {
+        // "bad good" must not match as token "bad" — the whole value is the token.
+        await expect(userFromBearer(v(), new Headers({ authorization: 'Bearer bad good' }))).resolves.toBeNull();
+    });
+});
