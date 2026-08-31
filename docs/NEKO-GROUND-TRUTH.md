@@ -1,7 +1,10 @@
 # NEKO-GROUND-TRUTH
 
-Phase 0a — ground truth established by running the real worker image in a real
-container. **Observation only. Nothing was fixed, and no source file was changed.**
+Ground truth established by running the real worker image in a real container,
+before any fix was attempted. **Observation only: nothing was fixed and no source
+file was changed.** The screenshots it cites are committed alongside it in
+`docs/assets/`, so every claim here can be checked against the pixels it was drawn
+from.
 
 ## Provenance
 
@@ -43,7 +46,7 @@ INF neko ready  service=neko
 
 - **(a) WM_CLASS** — VERIFIED. Instance = `google-chrome (/tmp/chromium-app-data)`, class = **`Google-chrome`**. The openbox rule `class="Google-chrome"` **DOES match**, exactly and literally.
 - **(b) Decorated?** — VERIFIED **NO**. Openbox reparents Chrome into a frame, but that frame is **undecorated**: `_NET_FRAME_EXTENTS = 0, 0, 0, 0` and `_NET_WM_STATE` contains `_OB_WM_STATE_UNDECORATED`. Openbox draws **no titlebar**.
-- **(c) Screenshot** — VERIFIED, captured. `/tmp/claude-0/-data-openclaw-projects-ezil/df09a697-e799-4103-a1a7-867577d9d014/scratchpad/neko-screenshot.jpg` (JPEG 1920x1080). It shows **no openbox titlebar**; the bar the user reports is **Chrome's own tabstrip-integrated frame**, carrying Chrome's own minimize / restore / close caption buttons at the top right.
+- **(c) Screenshot** — VERIFIED, captured. `docs/assets/neko-screenshot.jpg` (JPEG 1920x1080). It shows **no openbox titlebar**; the bar the user reports is **Chrome's own tabstrip-integrated frame**, carrying Chrome's own minimize / restore / close caption buttons at the top right.
 - **(d) Openbox config parse** — VERIFIED **clean**. No parse error, warning, or any openbox diagnostic anywhere in `/tmp/neko.log`; phase ended `status=ok`. The rule provably took effect (see `_OB_WM_STATE_UNDECORATED` in (b)).
 - **(e) Screen API under Xvfb** — VERIFIED, and **the expected result is WRONG**. `configurations` lists exactly one entry (`1920x1080@0`), but `POST /api/room/screen` with `1280x720` **SUCCEEDED** (HTTP 200) and **really resized the X display**. Sizes **larger** than the Xvfb framebuffer are refused (`2560x1440` → HTTP 422 `cannot set screen size`). Resize down works; resize beyond 1920x1080 does not.
 - **(f) XTEST input** — VERIFIED **YES**, definitively, for both pointer and keyboard, using true XTEST (no `--window`/XSendEvent fallback). A synthetic click opened a new tab; synthetic typing navigated the browser to example.com. `start-neko.sh:1618`'s UNVERIFIED note is now resolved in the affirmative.
@@ -252,10 +255,10 @@ The neko binary's screenshot route is **`GET /api/room/screen/shot.jpg`**, not
 
 | File | What it shows |
 | --- | --- |
-| `/tmp/claude-0/-data-openclaw-projects-ezil/df09a697-e799-4103-a1a7-867577d9d014/scratchpad/neko-screenshot.jpg` | **The primary artifact.** The desktop as booted, untouched. |
-| `/tmp/claude-0/-data-openclaw-projects-ezil/df09a697-e799-4103-a1a7-867577d9d014/scratchpad/xtest-after-typing.jpg` | Omnibox mid-type (XSendEvent path) — evidence for (f). |
-| `/tmp/claude-0/-data-openclaw-projects-ezil/df09a697-e799-4103-a1a7-867577d9d014/scratchpad/xtest-true-xtest.jpg` | Second tab opened by a true-XTEST mouse click — evidence for (f). |
-| `/tmp/claude-0/-data-openclaw-projects-ezil/df09a697-e799-4103-a1a7-867577d9d014/scratchpad/xtest-keyboard-nav.jpg` | After true-XTEST keyboard navigation — evidence for (f). |
+| `docs/assets/neko-screenshot.jpg` | **The primary artifact.** The desktop as booted, untouched. |
+| `docs/assets/xtest-after-typing.jpg` | Omnibox mid-type (XSendEvent path) — evidence for (f). |
+| `docs/assets/xtest-true-xtest.jpg` | Second tab opened by a true-XTEST mouse click — evidence for (f). |
+| `docs/assets/xtest-keyboard-nav.jpg` | After true-XTEST keyboard navigation — evidence for (f). |
 
 All are `JPEG image data, baseline, precision 8, 1920x1080, components 3`.
 
