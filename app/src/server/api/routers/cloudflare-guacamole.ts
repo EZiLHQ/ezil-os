@@ -67,7 +67,6 @@ import {
     resolveCloudflareGuacamoleConfig,
     resolveScreenRequest,
     fitScreenRequest,
-    snapScreenMode,
     surfacePreviewErrorAsValue,
 } from '@/server/lib/cloudflare-guacamole-provider';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
