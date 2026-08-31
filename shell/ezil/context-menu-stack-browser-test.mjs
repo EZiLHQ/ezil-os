@@ -170,6 +170,7 @@ function stub (url, method) {
 }
 
 const HOST = 'https://ezil-context-menu-stack-test.invalid';
+const HOST_HOSTNAME = new URL(HOST).hostname;
 const DOC_HTML = `<!doctype html><html><head><style>${css}</style></head>`
     + '<body class="min-h-full flex flex-col"><div id="ezil-os-root"></div></body></html>';
 
@@ -200,7 +201,7 @@ await page.route('**/*', async (route) => {
         await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
         return;
     }
-    if ( url.startsWith(HOST) ) {
+    if ( new URL(url).hostname === HOST_HOSTNAME ) {
         await route.fulfill({ status: 404, body: '' });
         return;
     }

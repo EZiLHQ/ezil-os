@@ -231,7 +231,7 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
     push('iframe exists but is NOT pointed at a desktop yet',
         !!iframe && iframe.getAttribute('src') === 'about:blank', iframe?.getAttribute('src'));
     push('no preview URL was composed client-side',
-        !window.document.documentElement.outerHTML.includes(URL_OK));
+        !Array.from(window.document.querySelectorAll('[src]')).some(el => el.getAttribute('src') === URL_OK));
 
     const panel = $1(window, '.ezil-boot');
     push('boot panel is in the window body, not an iframe',

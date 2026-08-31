@@ -75,6 +75,7 @@ const bundle = fs.readFileSync(`${OS}/bundle.min.js`, 'utf8');
 const css = fs.readFileSync(`${OS}/bundle.min.css`, 'utf8');
 
 const HOST = 'https://ezil-display-notice-test.invalid';
+const HOST_HOSTNAME = new URL(HOST).hostname;
 const DESKTOP_URL = 'https://8181-guac-x-y-nekodesktop.ezil-display-notice-test.invalid/?usr=EZiL&pwd=x&embed=1';
 const DOC_HTML = `<!doctype html><html><head><style>${css}</style></head>`
     + '<body class="min-h-full flex flex-col"><div id="ezil-os-root"></div></body></html>';
@@ -125,7 +126,7 @@ for ( const vp of VIEWPORTS ) {
         if ( url.includes('confirm=display') ) return json({ ok: true, display: 'something-we-do-not-recognise' });
         if ( url.includes('/api/shell/desktop') ) return json({ ok: true, guacamoleRunning: true });
         if ( url.includes('/api/') ) return json({ ok: true });
-        if ( url.startsWith(HOST) ) return route.fulfill({ status: 404, body: '' });
+        if ( new URL(url).hostname === HOST_HOSTNAME ) return route.fulfill({ status: 404, body: '' });
         return route.continue();
     });
 

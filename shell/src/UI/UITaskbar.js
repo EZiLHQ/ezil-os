@@ -96,6 +96,11 @@ async function UITaskbar (options) {
             taskbar_position = 'bottom'; // default position
             session.set('taskbar_position', taskbar_position);
         }
+        // Validate against allowed values to prevent injecting arbitrary strings into HTML
+        const ALLOWED_TASKBAR_POSITIONS = ['bottom', 'top', 'left', 'right'];
+        if ( ! ALLOWED_TASKBAR_POSITIONS.includes(taskbar_position) ) {
+            taskbar_position = 'bottom';
+        }
     }
 
     // Force bottom position on mobile devices

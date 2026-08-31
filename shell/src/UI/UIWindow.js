@@ -4016,8 +4016,8 @@ async function close_one_window (options) {
             // always has.
             if ( options?.shrink_to_target ) {
                 // get target location
-                const target_pos = $(options.shrink_to_target).position();
-                const target_size = $(options.shrink_to_target).get(0).getBoundingClientRect();
+                const target_pos = $(document).find(options.shrink_to_target).position();
+                const target_size = $(document).find(options.shrink_to_target).get(0).getBoundingClientRect();
 
                 // animate window to target location
                 await new Promise((resolve) => {

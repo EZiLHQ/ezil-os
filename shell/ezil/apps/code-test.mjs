@@ -426,7 +426,7 @@ await settle(4);
 // Every request must be same-origin EXCEPT the code-preview frame itself,
 // which is a cross-origin iframe by design (the bridge host) and is never
 // fetched by this code — it is only ever assigned to `iframe.src`.
-const offOrigin = calls.filter(c => /^https?:\/\//.test(c.url) && ! c.url.startsWith('https://ezil.local'));
+const offOrigin = calls.filter(c => /^https?:\/\//.test(c.url) && ! (new URL(c.url).hostname === 'ezil.local'));
 push('🔴 every request this shell MADE was same-origin', offOrigin.length === 0,
     JSON.stringify(offOrigin.map(c => c.url)));
 push('no puter.* or socket.io traffic', ! calls.some(c => /puter\.com|socket\.io/.test(c.url)));

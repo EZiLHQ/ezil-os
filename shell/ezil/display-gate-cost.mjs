@@ -116,6 +116,7 @@ const bundle = fs.readFileSync(`${OS}/bundle.min.js`, 'utf8');
 const css = fs.readFileSync(`${OS}/bundle.min.css`, 'utf8');
 
 const HOST = 'https://ezil-gate-cost.invalid';
+const HOST_HOSTNAME = new URL(HOST).hostname;
 const DESKTOP_URL = 'https://8181-guac-x-y-nekodesktop.ezil-gate-cost.invalid/?usr=EZiL&pwd=x&embed=1';
 const DOC_HTML = `<!doctype html><html><head><style>${css}</style></head>`
     + '<body class="min-h-full flex flex-col"><div id="ezil-os-root"></div></body></html>';
@@ -202,7 +203,7 @@ async function run_once (browser, answer) {
             return;
         }
         if ( url.includes('/api/') ) { await json({ ok: true }); return; }
-        if ( url.startsWith(HOST) ) { await route.fulfill({ status: 404, body: '' }); return; }
+        if ( new URL(url).hostname === HOST_HOSTNAME ) { await route.fulfill({ status: 404, body: '' }); return; }
         await route.continue();
     });
 

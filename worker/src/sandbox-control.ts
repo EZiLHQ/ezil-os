@@ -238,7 +238,7 @@ export function extractSignedToken(sources: SignedTokenSources): string | undefi
   const authorization = sources.authorization?.trim();
   if (authorization) {
     // Scheme match is case-insensitive per RFC 7235; the token itself is not.
-    const bearer = /^bearer\s+(.+)$/i.exec(authorization);
+    const bearer = /^bearer[ \t]+(\S[^\r\n]*)$/i.exec(authorization);
     if (bearer) {
       const value = bearer[1].trim();
       if (value) return value;

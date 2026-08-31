@@ -147,6 +147,7 @@ const bundle = fs.readFileSync(`${OS}/bundle.min.js`, 'utf8');
 const css = fs.readFileSync(`${OS}/bundle.min.css`, 'utf8');
 
 const HOST = 'https://ezil-overlay-paint-test.invalid';
+const HOST_HOSTNAME = new URL(HOST).hostname;
 const DOC_HTML = `<!doctype html><html><head><style>${css}</style></head>
      <body class="min-h-full flex flex-col"><div id="ezil-os-root"><div id="ezil-os-root-inner"></div></div></body></html>`;
 
@@ -285,7 +286,7 @@ async function testApp (app) {
             await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
             return;
         }
-        if ( url.startsWith(HOST) ) {
+        if ( new URL(url).hostname === HOST_HOSTNAME ) {
             await route.fulfill({ status: 404, body: '' });
             return;
         }
