@@ -150,9 +150,16 @@ jobs:
           npm init -y >/dev/null
           npm i playwright@1.62.1 >/dev/null
           npx playwright install --with-deps chromium
-      # Give the edge a moment to serve the new build before asserting on it.
-      - name: Settle
-        run: sleep 30
+      # 🔴 A FIXED SLEEP CANNOT TELL YOU THE ALIAS SWITCHED. Between
+      # `vercel deploy --prod` returning and the production alias pointing at
+      # the new deployment there is a window in which that URL still serves the
+      # PREVIOUS build — and a suite that runs inside it tests the old code and
+      # reports success. That is this pipeline's whole failure mode, one layer
+      # further down. So wait on the CONDITION: the served bundle must be
+      # byte-for-byte the one this run built. Same discriminator
+      # `release-and-wait.mjs` already uses for the container's client script.
+      - name: Wait for the alias to serve THIS build
+        run: node e2e/await-deployed-bundle.mjs
       - name: Production suites
         env:
           PLAYWRIGHT_REQUIRE_DIR: /opt/ezil-testkit/node_modules
