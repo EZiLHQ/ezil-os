@@ -45,7 +45,7 @@ jobs:
     name: worker (typecheck + unit)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -65,8 +65,8 @@ jobs:
     name: app (typecheck + unit)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       # bun, not npm: `app/bun.lock` is the committed lockfile and there is no
@@ -95,7 +95,7 @@ jobs:
     name: sdk + mcp (typecheck + unit)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -131,8 +131,8 @@ jobs:
     name: shell (bundle check + browser suites)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - uses: oven-sh/setup-bun@v2
@@ -143,6 +143,15 @@ jobs:
       # passes against the NEW source.
       - name: Committed bundle matches source
         run: bash shell/build-shell.sh --check
+      # 🔴 `shell/` HAS dependencies, and this job never installed them. Five of
+      # the six unit suites below `import 'jsdom'`, declared in
+      # `shell/package.json` with `shell/bun.lock` beside it. Without this step
+      # the second suite dies on ERR_MODULE_NOT_FOUND and the job has been red
+      # ever since the suites were added — invisible locally, where
+      # `shell/node_modules` already exists.
+      - name: Install (shell)
+        working-directory: shell
+        run: bun install --frozen-lockfile
       - name: Install Playwright
         run: |
           mkdir -p /opt/ezil-testkit
