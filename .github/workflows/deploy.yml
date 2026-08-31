@@ -79,7 +79,7 @@ jobs:
     needs: worker
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: 22 }
       - uses: oven-sh/setup-bun@v2
         with: { bun-version: latest }
@@ -102,7 +102,7 @@ jobs:
     needs: app
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: 22 }
       - name: Install Playwright
         run: |
@@ -136,7 +136,7 @@ jobs:
     if: ${{ inputs.verify_container }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: 22 }
       - name: Install Playwright
         run: |
