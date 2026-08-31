@@ -1,0 +1,66 @@
+name: Bug report
+description: Something behaves differently from what it says it does.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file this.
+
+        **If this is a security vulnerability, stop** and follow
+        [SECURITY.md](https://github.com/EZiLHQ/ezil-os/blob/main/SECURITY.md)
+        instead — please don't describe it in a public issue.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part
+      options:
+        - worker/ (Cloudflare Worker + container image)
+        - app/ (Next.js app, API routes, tRPC)
+        - shell/ (the in-browser desktop UI)
+        - sdk/ or mcp/
+        - Don't know
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that reliably shows it. If it's intermittent, say how often.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: >
+        Console output, a Worker log line, a network response, a screenshot.
+        Please redact tokens and cookies — preview URLs contain a signed token.
+      render: shell
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Browser and version, OS, device. Whether you're on the hosted deployment or your own.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this isn't already reported.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

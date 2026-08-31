@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest something EZiL-OS should do that it doesn't.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that you can't do today? Describe the situation, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd like instead
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you've already tried or considered
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: I've read the README and this isn't already possible.
+          required: true

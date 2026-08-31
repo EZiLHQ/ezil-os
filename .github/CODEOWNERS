@@ -1,0 +1,15 @@
+# Review routing. A CODEOWNER's approval is required before merge on any path
+# they own. See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+*                       @MidhunAkash
+
+# Licensing and provenance — under-crediting an upstream project is treated as
+# a bug here, so these get looked at every time.
+/LICENSE                @MidhunAkash
+/NOTICE                 @MidhunAkash
+/ATTRIBUTIONS.md        @MidhunAkash
+/SECURITY.md            @MidhunAkash
+/shell/PUTER-PROVENANCE.md @MidhunAkash
+
+# Deploy and CI
+/.github/workflows/     @MidhunAkash

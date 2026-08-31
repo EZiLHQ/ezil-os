@@ -41,6 +41,11 @@ on:
         type: boolean
         default: false
 
+# Deploys authenticate to Cloudflare and Vercel with their own secrets; the
+# GitHub token needs no more than read access to check out the tree.
+permissions:
+  contents: read
+
 concurrency:
   group: deploy-production
   cancel-in-progress: false

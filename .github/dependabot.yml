@@ -1,0 +1,38 @@
+# Dependency updates. This repository has three independent JS projects plus a
+# sidecar, each with its own lockfile, and no root workspace — so each one is
+# listed separately. Grouped and rate-limited on purpose: a small team cannot
+# review a flood of individual bumps, and an unreviewed bump is not an upgrade.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    labels: ["dependencies", "ci"]
+
+  - package-ecosystem: npm
+    directory: /app
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+    groups:
+      patch-and-minor:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: npm
+    directory: /worker
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+    groups:
+      patch-and-minor:
+        update-types: ["minor", "patch"]
+    ignore:
+      # Pinned for compatibility with the container image and tracked in
+      # ATTRIBUTIONS.md — a bump here is a deliberate, tested change.
+      - dependency-name: "@cloudflare/sandbox"
+
+  - package-ecosystem: npm
+    directory: /worker/sidecar
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 3
+    labels: ["dependencies"]

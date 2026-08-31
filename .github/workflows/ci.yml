@@ -31,6 +31,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# CI reads the repository and nothing else. Public repo: `pull_request` runs
+# for forks, so the token this grants is the token a stranger's PR gets.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -76,9 +81,51 @@ jobs:
       - name: Typecheck
         working-directory: app
         run: npx tsc --noEmit -p tsconfig.json
+      # `app/eslint.config.mjs` has existed and been configured all along; it
+      # was simply never run by anything. A configured linter nobody runs is a
+      # linter that is already failing.
+      - name: Lint
+        working-directory: app
+        run: bun run lint
       - name: Unit tests
         working-directory: app
         run: npx vitest run
+
+  connectors:
+    name: sdk + mcp (typecheck + unit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      # `sdk/` is checked FIRST and separately from `mcp/`, because `mcp/`
+      # depends on it by `file:../sdk` — a break in the SDK should be reported
+      # as an SDK failure, not as a confusing downstream one.
+      - name: Install (sdk)
+        working-directory: sdk
+        run: bun install --frozen-lockfile
+      - name: Typecheck (sdk)
+        working-directory: sdk
+        run: bun run typecheck
+      # Includes `src/surface.test.ts`, the drift guard: it reads the real
+      # routers under app/ and fails if this client calls a procedure the
+      # server does not have, or if the server grew one nobody decided about.
+      - name: Unit tests (sdk)
+        working-directory: sdk
+        run: bun test
+      - name: Install (mcp)
+        working-directory: mcp
+        run: bun install --frozen-lockfile
+      - name: Typecheck (mcp)
+        working-directory: mcp
+        run: bun run typecheck
+      # Includes `src/server.protocol.test.ts`, which drives the real server
+      # with a real MCP client over a real transport. Handlers that work and
+      # handlers that are correctly registered are different claims.
+      - name: Unit tests (mcp)
+        working-directory: mcp
+        run: bun test
 
   shell:
     name: shell (bundle check + browser suites)
