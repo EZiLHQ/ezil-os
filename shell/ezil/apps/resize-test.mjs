@@ -23,9 +23,8 @@
 // version. `UIWindow.js` is clean; nothing was changed outside this file.
 //
 // The version hypothesis is not merely argued away, it is MEASURED away. Two
-// playwright installs are reachable in this environment — 1.61.1 at
-// `EZiL-Universe/node_modules` and 1.59.1 at `EBuilder/node_modules`. Against
-// the same committed bundle:
+// playwright installs were reachable in the development environment when this
+// was investigated — 1.61.1 and 1.59.1. Against the same committed bundle:
 //   pre-fix file, playwright 1.61.1 -> 16/18, `se` red in both sweeps
 //   pre-fix file, playwright 1.59.1 -> 16/18, `se` red in both sweeps,
 //                                     byte-identical geometry (700x380 ->

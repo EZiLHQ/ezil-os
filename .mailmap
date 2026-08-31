@@ -1,8 +1,11 @@
-# Canonicalises committer identities so one person appears once in
-# `git shortlog -sne`, `git log --author`, and GitHub's contributor graph.
+# Canonical identities, so one person appears once in `git shortlog -sne`,
+# GitHub's contributor graph, and CONTRIBUTORS.md.
 #
-# Format:  Canonical Name <canonical@email>  Other Name <other@email>
-#
-# MidhunAkash has committed under two display names with the same address.
+# Verify with:  git shortlog -sne HEAD
+MidhunAkash <midhunakash.m@ezil.work> <midhunakash.m@ezil.work>
 MidhunAkash <midhunakash.m@ezil.work> Midhun Akash M <midhunakash.m@ezil.work>
+MidhunAkash <midhunakash.m@ezil.work> Midhunakash M <midhunakash.m@ezil.work>
 MidhunAkash <midhunakash.m@ezil.work> MidhunAkash <midhunakash.m@ezil.work>
+MidhunAkash <midhunakash.m@ezil.work> EZiL Agent <midhunakash.m@ezil.work>
+EZiL <contact@ezil.work> <contact@ezil.work>
+EZiL <contact@ezil.work> V2 <contact@ezil.work>

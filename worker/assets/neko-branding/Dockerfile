@@ -1,7 +1,7 @@
 # EZiL branding overlay for the pinned, project-owned `ezil-neko-vscode`
-# image (built by <path-redacted>/EBuilder/infra/neko-standalone
-# from upstream m1k1o/neko @ d74052bb / m1k1o/neko-apps @ 049931d7, both
-# Apache-2.0 — see ATTRIBUTIONS.md §2).
+# image, built from upstream m1k1o/neko @ d74052bb / m1k1o/neko-apps @ 049931d7,
+# both Apache-2.0 — see ATTRIBUTIONS.md §2. That base image is built and pushed
+# out of band; it is not produced by this repository.
 #
 # Why this exists: the neko Go server bakes its whole HTML5 client bundle
 # into /var/www at upstream build time (Vue app, hashed JS/CSS chunk names).

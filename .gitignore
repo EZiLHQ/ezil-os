@@ -39,3 +39,6 @@ app/tsconfig.tsbuildinfo
 .DS_Store
 *.log
 .claude/
+
+# Local agent/tunnel state — machine-specific, never publishable
+.openclaw-forwards.json

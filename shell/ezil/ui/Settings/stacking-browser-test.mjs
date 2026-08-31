@@ -254,7 +254,7 @@ const HOST = 'https://ezil-stacking-test.invalid';
 // resize against the containment box, so with a 0-height container it clamps
 // every window's height to `containerHeight - top` — a NEGATIVE number, which
 // CSS then renders as 0. MEASURED, via a `resizestart/resize/resizestop`
-// listener on the live target (`/tmp/.../scratchpad/probe-resize.mjs`):
+// listener on the live target, with a throwaway probe script:
 //   body height 0px  -> first resize event reports `size:{w:764,h:-155}` on a
 //                       window at top=155 (h is exactly `0 - top`), and a
 //                       (+30,+30) drag on `se` ends at 790x0.

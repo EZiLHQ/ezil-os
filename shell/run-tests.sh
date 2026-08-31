@@ -40,18 +40,15 @@
 # a directory named by $PLAYWRIGHT_REQUIRE_DIR. This runner just passes that
 # variable through; it does not install anything.
 #
-#   In THIS environment (2026-08-19) there are TWO neighbouring repositories
-#   that resolve a playwright with a working Chromium, at DIFFERENT versions:
+#   Playwright is NOT a dependency of this repository. Point
+#   $PLAYWRIGHT_REQUIRE_DIR at any directory whose `node_modules` carries a
+#   playwright with a working Chromium; CI installs one into
+#   /opt/ezil-testkit for exactly this purpose (see
+#   .github/workflows/ci.yml). $EZIL_PLAYWRIGHT_DIR, if set, is used as the
+#   fallback when $PLAYWRIGHT_REQUIRE_DIR is unset — useful when a
+#   neighbouring checkout on your machine already has one.
 #
-#       <path-redacted>/EZiL-Universe/node_modules   playwright 1.61.1
-#       <path-redacted>/EBuilder/node_modules        playwright 1.59.1
-#
-#   Both are NEIGHBOURING REPOSITORIES, not dependencies of this one, and either
-#   can disappear without warning. If both do, the browser suites skip; they do
-#   not silently pass. If $PLAYWRIGHT_REQUIRE_DIR is unset this runner defaults
-#   to the first when it exists, and says so, so that a bare
-#   `shell/run-tests.sh` does the useful thing rather than skipping twelve
-#   suites by default.
+#   If neither resolves, the browser suites SKIP. They do not silently pass.
 #
 #   🔴 Having two versions to hand is worth keeping. Running the same suite
 #   against both is the cheapest available discriminator between "this test is
@@ -130,9 +127,9 @@ least one skip). Individual suites: 0 PASS, 1 FAIL, 2 SKIP.
 
 Environment:
   PLAYWRIGHT_REQUIRE_DIR   directory from which the browser suites resolve
-                           `playwright`. Defaults (when it exists) to
-                           <path-redacted>/EZiL-Universe/node_modules
-                           which currently carries playwright 1.61.1.
+                           `playwright`. Falls back to $EZIL_PLAYWRIGHT_DIR.
+                           If neither resolves, the browser suites SKIP.
+  EZIL_PLAYWRIGHT_DIR      optional fallback for the above.
   EZIL_OS_DIR              override the built-bundle directory under test.
 EOF
 }
@@ -153,15 +150,15 @@ while [ $# -gt 0 ]; do
 done
 
 # ── playwright resolution ──────────────────────────────────────────────────
-DEFAULT_PW_DIR="<path-redacted>/EZiL-Universe/node_modules"
-if [ -z "${PLAYWRIGHT_REQUIRE_DIR:-}" ] && [ -d "$DEFAULT_PW_DIR/playwright" ]; then
+DEFAULT_PW_DIR="${EZIL_PLAYWRIGHT_DIR:-}"
+if [ -z "${PLAYWRIGHT_REQUIRE_DIR:-}" ] && [ -n "$DEFAULT_PW_DIR" ] && [ -d "$DEFAULT_PW_DIR/playwright" ]; then
     export PLAYWRIGHT_REQUIRE_DIR="$DEFAULT_PW_DIR"
     PW_NOTE="defaulted to $DEFAULT_PW_DIR"
 elif [ -n "${PLAYWRIGHT_REQUIRE_DIR:-}" ]; then
     export PLAYWRIGHT_REQUIRE_DIR
     PW_NOTE="from the environment: $PLAYWRIGHT_REQUIRE_DIR"
 else
-    PW_NOTE="UNSET and the default path does not exist — every browser suite will SKIP"
+    PW_NOTE="UNSET (and no $EZIL_PLAYWRIGHT_DIR fallback) — every browser suite will SKIP"
 fi
 
 # ── colours, only on a tty ─────────────────────────────────────────────────
