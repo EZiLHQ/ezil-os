@@ -45,8 +45,16 @@ try { ({ chromium } = await import('playwright')); } catch {
 if (!chromium) { console.error('playwright is required. SKIPPING (exit 2).'); process.exit(2); }
 
 const APP   = process.env.EZIL_E2E_APP   ?? 'https://ezil-os.vercel.app';
-const EMAIL = process.env.EZIL_E2E_EMAIL ?? '<redacted-email>';
-const PASS  = process.env.EZIL_E2E_PASSWORD ?? '<redacted-password>';
+// 🔴 NO CREDENTIAL DEFAULTS. This suite signs in to the LIVE deployment, so a
+// hardcoded fallback here is a working production account published in a
+// public repository. Absent config is "could not run" (exit 2), never a pass
+// and never a silent sign-in as somebody.
+const EMAIL = process.env.EZIL_E2E_EMAIL;
+const PASS = process.env.EZIL_E2E_PASSWORD;
+if (!EMAIL || !PASS) {
+  console.error('SKIP: set EZIL_E2E_EMAIL and EZIL_E2E_PASSWORD to run this suite against the live deployment.');
+  process.exit(2);
+}
 
 const results = [];
 const check = (n, p, d = '') => { results.push({ n, p: !!p, d }); console.log(`${p ? 'PASS' : 'FAIL'}  ${n}${d ? `  — ${d}` : ''}`); };
