@@ -55,7 +55,7 @@ jobs:
     name: deploy worker
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with: { bun-version: latest }
       - name: Install
@@ -78,7 +78,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: worker
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - uses: oven-sh/setup-bun@v2
@@ -101,7 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - name: Install Playwright
@@ -135,7 +135,7 @@ jobs:
     needs: verify
     if: ${{ inputs.verify_container }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - name: Install Playwright
