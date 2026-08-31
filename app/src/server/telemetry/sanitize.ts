@@ -9,7 +9,7 @@
  * separate deployables with no shared package/workspace link (no root
  * `package.json`, no path from `app/` into `worker/`), so there is no import
  * that would work in both a Vercel build and a `wrangler deploy`. The
- * telemetry design (`scratchpad/telemetry-design.md` §9) explicitly allows
+ * telemetry design (`docs/telemetry-design.md` §9) explicitly allows
  * "duplicate it with a test asserting the two are byte-identical" as the
  * alternative to a shared module, IF that identity is actually tested rather
  * than asserted in a comment. `sanitize.test.ts` does that: it reads

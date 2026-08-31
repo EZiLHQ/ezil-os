@@ -118,7 +118,7 @@ interface Env extends SandboxEnv {
 
   /**
    * OPTIONAL R2 bucket binding backing the fleet crash-telemetry spool
-   * (`ezil-telemetry-spool`) — see `scratchpad/telemetry-design.md` §4.1 and
+   * (`ezil-telemetry-spool`) — see `docs/telemetry-design.md` §4.1 and
    * `./telemetry.ts`. Deliberately a SEPARATE bucket from
    * `SANDBOX_WORKSPACE_R2_BUCKET`: that one is FUSE-mounted into user
    * containers, and a mount that ever resolved without a per-computer prefix
@@ -3200,8 +3200,8 @@ function toGuacamoleUrl(exposedUrl: string, requestProtocol: string): string {
  * `'unset.invalid'` while zero zones were verified safe — `ezil.org` looked
  * off-limits because `*.ezil.org/*` is bound to the live production Worker
  * `cf-guacamole-sandbox` (serves `sandbox.ezil.org` / `neko.ezil.org`), and
- * `zlsocial.ai` turned out to have its own live bare wildcard tunnel
- * catch-all.
+ * the other candidate zone turned out to have its own live bare wildcard
+ * tunnel catch-all.
  *
  * 2026-07-31, later same day — restored to `'ezil.org'`. The owner approved
  * adding narrow, token-scoped suffix routes on `ezil.org` alongside the

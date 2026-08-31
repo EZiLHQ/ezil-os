@@ -6,7 +6,7 @@ import { handleTelemetryPost } from '@/server/telemetry/http-handler';
 /**
  * `POST /api/shell/telemetry` — a batch of crash/error telemetry events.
  *
- * Per `scratchpad/telemetry-design.md` §4.4-4.6. This route is reachable by
+ * Per `docs/telemetry-design.md` §4.4-4.6. This route is reachable by
  * anyone with a session and accepts arbitrary client-controlled JSON, so it
  * is treated as a hostile-input surface: every bound (body size, event
  * count, per-user rate, global row-count) is enforced in

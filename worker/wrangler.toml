@@ -86,7 +86,7 @@ experimental_remote = true
 
 # ── R2 bucket binding (fleet crash-telemetry spool) ───────────────────────────
 # Backs the boot-phase/crash telemetry pipeline (see
-# scratchpad/telemetry-design.md, section 4.1, and src/telemetry.ts).
+# docs/telemetry-design.md, section 4.1, and src/telemetry.ts).
 # Deliberately a SEPARATE bucket from SANDBOX_WORKSPACE_R2_BUCKET above: that
 # one is FUSE-mounted into user containers, and a mount that ever resolved
 # without a per-computer prefix would put the whole fleet's error log inside a
@@ -175,9 +175,8 @@ SANDBOX_NEKO_ICE_POLICY = "relay"
 #
 # Rolled out ONE route at a time with a live-request diff before/after each
 # addition (see the worker README / rollout notes for the verification
-# transcript). `zlsocial.ai` was independently found to be unsafe (a bare
-# `*.zlsocial.ai` wildcard tunnel catch-all already lives there) and remains
-# unused for this feature.
+# transcript). Only zones this project controls are used for this feature; a
+# zone that already has a broad wildcard catch-all is not a safe host for it.
 #
 # `worker/src/index.test.ts`'s drift-guard tests assert `PREVIEW_ZONE_ROOT` in
 # `index.ts` and every token (`desktop`/`nekodesktop`/`app`/`code`) from

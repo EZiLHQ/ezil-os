@@ -272,7 +272,7 @@ describe('toShellDesktopState — never implies an observation it does not have'
 
     /**
      * Same feature-flag shape as `focus` above, for the telemetry beacon
-     * module (`shell/ezil/telemetry.js`, scratchpad/telemetry-design.md §4.3):
+     * module (`shell/ezil/telemetry.js`, docs/telemetry-design.md §4.3):
      * deleting this key silently turns off all crash reporting for every
      * client that reads it, with no other test noticing.
      */

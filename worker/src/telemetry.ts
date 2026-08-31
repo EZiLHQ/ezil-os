@@ -1,6 +1,6 @@
 /**
  * Worker-side contribution to the fleet crash-telemetry pipeline (see the
- * design doc, `scratchpad/telemetry-design.md`). Pure/testable helpers only —
+ * design doc, `docs/telemetry-design.md`). Pure/testable helpers only —
  * no `@cloudflare/sandbox` import here, mirroring `./observability`,
  * `./hmac`, `./desktop-mode` (see those modules' own doc comments for why).
  *

@@ -1,6 +1,6 @@
 // telemetry.js — EZiL-authored. Not Puter code.
 //
-// The shell's half of `scratchpad/telemetry-design.md` (§4.3, §5, §9's
+// The shell's half of `docs/telemetry-design.md` (§4.3, §5, §9's
 // "shell-side" column) — read that document in full before touching this
 // file. This module turns the ~35 `console.error` sites this shell already
 // has (`PUTER-PROVENANCE.md`-adjacent inventory in the design doc's §1.1)
@@ -86,7 +86,7 @@ const MAX_PER_KEY = 3; // per (eventClass+site+code) per page life
 const FLUSH_MS = 10_000;
 const SEND_TIMEOUT_MS = 3_000;
 
-/** Closed set — mirrors `scratchpad/telemetry-design.md` §1.2 exactly. */
+/** Closed set — mirrors `docs/telemetry-design.md` §1.2 exactly. */
 const EVENT_CLASSES = new Set([
     'boot_phase', 'boot_summary', 'boot_stall', 'crash', 'window_error',
     'api_failure', 'display_failure', 'worker_exception', 'contract_violation',

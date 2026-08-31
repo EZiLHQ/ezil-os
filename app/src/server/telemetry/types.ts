@@ -1,7 +1,7 @@
 /**
  * The single shared telemetry contract — shell, worker (via R2 spool) and
  * app-server producers all target this shape. See
- * `scratchpad/telemetry-design.md` §1.2 for the full design; this file is
+ * `docs/telemetry-design.md` §1.2 for the full design; this file is
  * the "wire type" it specifies, landed first per §9's suggested order.
  *
  * Nothing here is trusted as-is: every field is re-validated by the zod

@@ -1,6 +1,6 @@
 /**
  * The fingerprint: the single most important structural decision in the
- * telemetry design (`scratchpad/telemetry-design.md` §2). Computed
+ * telemetry design (`docs/telemetry-design.md` §2). Computed
  * SERVER-SIDE ONLY, here, so a shell `sandbox_start_failed` and a Worker
  * `sandbox_start_failed` at the same `site` are guaranteed byte-identical
  * fingerprints — clients never send one and are never trusted with one.

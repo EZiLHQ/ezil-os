@@ -1,7 +1,7 @@
 /**
  * The single writer. Every telemetry producer (shell over HTTP today; a
  * Worker R2-spool drain and a container-log drain are worker-side/future
- * work per `scratchpad/telemetry-design.md` §4.1-4.2) funnels through
+ * work per `docs/telemetry-design.md` §4.1-4.2) funnels through
  * `ingestBatch`, and this is the only place a `fingerprint` or a
  * `normalizedDetail` is computed for storage.
  *

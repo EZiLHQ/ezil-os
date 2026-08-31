@@ -1,7 +1,7 @@
 // trace.js — EZiL-authored. Not Puter code.
 //
 // Correlation ids + boot breadcrumbs for "what happened during this
-// app-open" (`scratchpad/telemetry-design.md` / the observability plan's W1).
+// app-open" (`docs/telemetry-design.md` / the observability plan's W1).
 //
 // ── The problem this fixes ───────────────────────────────────────────────────
 // `telemetry.js` has ~30 `capture()` call sites scattered across this shell,

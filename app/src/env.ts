@@ -18,7 +18,7 @@ const serverSchema = z.object({
     /**
      * Guards `POST /api/cron/telemetry-maintenance` (the hourly telemetry
      * retention job — see `docs/telemetry.md` and
-     * `scratchpad/telemetry-design.md` §7.2). Vercel Cron sends
+     * `docs/telemetry-design.md` §7.2). Vercel Cron sends
      * `Authorization: Bearer $CRON_SECRET` automatically when this env var
      * is set on the project.
      *

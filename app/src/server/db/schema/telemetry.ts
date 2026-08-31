@@ -25,7 +25,7 @@ import { computers } from './computers';
  * absolute user paths, email addresses, raw user ids, IP addresses, or full
  * URLs. Producers run `sanitizeErrorMessage()` before the wire; the ingest
  * route runs it again (defence in depth) before the insert. See
- * `scratchpad/telemetry-design.md` §8.
+ * `docs/telemetry-design.md` §8.
  *
  * `fingerprint` is computed SERVER-SIDE ONLY (`server/telemetry/fingerprint.ts`)
  * so all producers (shell, worker-via-R2, container-via-worker) bucket

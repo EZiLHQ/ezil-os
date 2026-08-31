@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { fingerprint, normalizeDetail } from './fingerprint';
 
 /**
- * Pins the design's worked examples (`scratchpad/telemetry-design.md` §2.3):
+ * Pins the design's worked examples (`docs/telemetry-design.md` §2.3):
  * 4 positive pairs that MUST collide, 2 negative controls that MUST NOT, and
  * a leak scan over every normalised string. Fingerprints are asserted as
  * LITERALS (not just equality between pairs) so a regex edit that silently

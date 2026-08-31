@@ -1,5 +1,5 @@
 /**
- * The four aggregation queries from `scratchpad/telemetry-design.md` §6, as
+ * The four aggregation queries from `docs/telemetry-design.md` §6, as
  * real parameterised Drizzle `sql` templates rather than only prose SQL a
  * human pastes into the Supabase editor during an incident. Each function
  * still reads as plain SQL (deliberately) so that pasting one into the SQL
