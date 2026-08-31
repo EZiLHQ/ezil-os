@@ -1,0 +1,77 @@
+/**
+ * `userFromBearer` — the header half of `createTRPCContext`.
+ *
+ * This is the seam where a second way to AUTHENTICATE was added (so `sdk/` and
+ * the `mcp/` connector, which have no cookie jar, can call the same API the
+ * browser does) without adding a second way to AUTHORIZE. The property that
+ * matters is the one asserted hardest below: a bearer that is present but does
+ * not check out must resolve to `null`, never fall through to the cookie.
+ */
+import { describe, expect, it } from 'vitest';
+
+import type { User } from '@supabase/supabase-js';
+
+import { type BearerVerifier, userFromBearer } from './bearer-auth';
+
+const ALICE = { id: 'alice-uuid' } as User;
+
+/** Accepts exactly one token; anything else is rejected the way GoTrue would. */
+const verifier = (goodToken: string, cookieUser: User | null = null): BearerVerifier & { calls: (string | undefined)[] } => {
+    const calls: (string | undefined)[] = [];
+    return {
+        calls,
+        auth: {
+            async getUser(jwt?: string) {
+                calls.push(jwt);
+                if (jwt === undefined) return { data: { user: cookieUser }, error: null };
+                return jwt === goodToken
+                    ? { data: { user: ALICE }, error: null }
+                    : { data: { user: null }, error: { message: 'invalid JWT' } };
+            },
+        },
+    };
+};
+
+const headers = (value?: string) => new Headers(value ? { authorization: value } : {});
+
+describe('userFromBearer', () => {
+    it('returns undefined when no Authorization header is offered — meaning "use the cookie"', async () => {
+        const v = verifier('good');
+        await expect(userFromBearer(v, headers())).resolves.toBeUndefined();
+        expect(v.calls).toEqual([]);
+    });
+
+    it('resolves a valid bearer to its user', async () => {
+        const v = verifier('good');
+        await expect(userFromBearer(v, headers('Bearer good'))).resolves.toEqual(ALICE);
+        expect(v.calls).toEqual(['good']);
+    });
+
+    it('is case-insensitive in the scheme and tolerates extra whitespace', async () => {
+        const v = verifier('good');
+        await expect(userFromBearer(v, headers('bearer   good'))).resolves.toEqual(ALICE);
+        await expect(userFromBearer(v, headers('  BEARER good  '))).resolves.toEqual(ALICE);
+    });
+
+    // 🔴 The whole point. Each of these is a request that OFFERED a credential
+    // and failed to prove it. If any returned `undefined`, the caller would go
+    // on to read the session cookie and serve the browser's own user — handing
+    // a stranger's dead token the signed-in user's computers.
+    it.each([
+        ['an expired/forged token', 'Bearer wrong'],
+        ['an empty token', 'Bearer    '],
+        ['a token with no scheme', 'good'],
+        ['the wrong scheme', 'Basic Z29vZA=='],
+        ['a scheme-only header', 'Bearer'],
+    ])('never falls back to the cookie for %s', async (_label, header) => {
+        const v = verifier('good', ALICE); // cookie WOULD authenticate as Alice
+        const result = await userFromBearer(v, headers(header));
+        expect(result).toBeNull();
+        expect(result).not.toBeUndefined();
+    });
+
+    it('resolves to null — not a throw — when the verifier reports an error', async () => {
+        const v = verifier('good');
+        await expect(userFromBearer(v, headers('Bearer nope'))).resolves.toBeNull();
+    });
+});

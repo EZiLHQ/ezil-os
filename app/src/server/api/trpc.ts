@@ -15,12 +15,33 @@ import type { User } from '@supabase/supabase-js';
 import { db } from '@/server/db';
 import { createClient } from '@/utils/supabase/server';
 
+import { userFromBearer } from './bearer-auth';
+
+/**
+ * The one place a request becomes a caller.
+ *
+ * Two credentials are accepted, and they are mutually exclusive:
+ *
+ *  - the Supabase session **cookie**, which is how the browser and the desktop
+ *    shell authenticate; and
+ *  - an `Authorization: Bearer <supabase-jwt>` header, which is how `sdk/` and
+ *    the `mcp/` connector authenticate, since neither has a cookie jar.
+ *
+ * Everything downstream — every tRPC procedure, and every `/api/shell/*` route,
+ * which are transports that resolve through `appRouter.createCaller` — reads
+ * `ctx.user` and nothing else. That is deliberate: authorization has exactly
+ * one implementation, so adding a second way to *authenticate* does not add a
+ * second way to *authorize*.
+ */
 export const createTRPCContext = async (opts: { headers: Headers }) => {
     const supabase = await createClient();
 
-    const {
-        data: { user },
-    } = await supabase.auth.getUser();
+    const bearerUser = await userFromBearer(supabase, opts.headers);
+
+    const user =
+        bearerUser === undefined
+            ? (await supabase.auth.getUser()).data.user
+            : bearerUser;
 
     return {
         db,
