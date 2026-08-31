@@ -28,6 +28,17 @@
  */
 // Does Settings open ON TOP on a real phone against production?
 import { createRequire } from 'node:module'; import path from 'node:path';
+// 🔴 NO CREDENTIAL DEFAULTS. This suite signs in to the LIVE deployment, so a
+// hardcoded fallback here is a working production account published in a
+// public repository. Absent config is "could not run" (exit 2), never a pass
+// and never a silent sign-in as somebody.
+const EMAIL = process.env.EZIL_E2E_EMAIL;
+const PASS = process.env.EZIL_E2E_PASSWORD;
+if (!EMAIL || !PASS) {
+  console.error('SKIP: set EZIL_E2E_EMAIL and EZIL_E2E_PASSWORD to run this suite against the live deployment.');
+  process.exit(2);
+}
+
 const req = createRequire(path.join('/opt/ezil-testkit/node_modules','noop.js'));
 const { chromium } = req('playwright');
 const b = await chromium.launch({args:['--use-gl=swiftshader','--enable-unsafe-swiftshader']});
@@ -37,7 +48,7 @@ for (let n = 1; n <= runs; n++) {
     userAgent:'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1' });
   const p = await ctx.newPage();
   await p.goto('https://ezil-os.vercel.app/login',{waitUntil:'domcontentloaded'});
-  await p.fill('#email','<redacted-email>'); await p.fill('#password','<redacted-password>');
+  await p.fill('#email', EMAIL); await p.fill('#password', PASS);
   await Promise.all([p.waitForURL(u=>!/\/login/.test(u.toString()),{timeout:60000}).catch(()=>{}),
     p.locator('form').filter({has:p.locator('#email')}).locator('button[type=submit]').click()]);
   await p.goto('https://ezil-os.vercel.app/os',{waitUntil:'domcontentloaded'});
