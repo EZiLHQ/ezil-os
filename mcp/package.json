@@ -1,0 +1,25 @@
+{
+    "name": "@ezil-os/mcp",
+    "version": "0.1.0",
+    "description": "Model Context Protocol connector for EZiL-OS. Optional: nothing in EZiL-OS depends on it.",
+    "license": "AGPL-3.0-only",
+    "private": true,
+    "type": "module",
+    "bin": {
+        "ezil-os-mcp": "./src/server.ts"
+    },
+    "scripts": {
+        "start": "bun run src/server.ts",
+        "typecheck": "tsc --noEmit",
+        "test": "bun test"
+    },
+    "dependencies": {
+        "@ezil-os/sdk": "file:../sdk",
+        "@modelcontextprotocol/sdk": "^1.12.0",
+        "zod": "^4"
+    },
+    "devDependencies": {
+        "@types/bun": "^1.3.0",
+        "typescript": "^5"
+    }
+}
