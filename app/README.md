@@ -1,36 +1,48 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# `app/` — the EZiL-OS web app
 
-## Getting Started
+The Next.js half of EZiL-OS: authentication, the "your computers" list, and the
+`/os` host page that paints the desktop shell. See the
+[root README](../README.md) for what the project as a whole is, and
+[`CONTRIBUTING.md`](../CONTRIBUTING.md) for the contribution rules.
 
-First, run the development server:
+## What lives here
+
+- **`src/app/`** — routes. `/login`, `/computers`, `/computer/[id]`, `/os`,
+  `/admin/telemetry`, plus the JSON transports under `/api/shell/*`, the
+  scheduled jobs under `/api/cron/*`, and `/api/trpc/[trpc]`.
+- **`src/server/api/`** — the tRPC routers (`computer`, `cloudflareGuacamole`).
+  This is where authorization actually lives. Every `/api/shell/*` route is a
+  transport only: it resolves through `appRouter.createCaller`, so there is
+  exactly one implementation of who may do what (see
+  `src/server/shell/http.ts`).
+- **`src/server/db/`** — Drizzle schema against Supabase Postgres. Migrations
+  are in `drizzle/`.
+- **`src/server/telemetry/`** — ingest, sanitize, rate-limit, retention. What is
+  and is not collected is documented in [`docs/telemetry.md`](../docs/telemetry.md).
+- **`public/os/`** — the desktop bundle built from `shell/`. **Committed on
+  purpose** so the app needs no shell build step; never edit it by hand.
+
+`/os` renders one page whose entire job is to paint that bundle fast and hand it
+a boot payload. Everything the user sees after the first paint is drawn by the
+bundle talking to the Worker.
+
+## Running it
+
+Needs a Supabase Postgres instance. Copy `.env.example` to `.env.local` and fill
+it in — `src/env.ts` validates the full set eagerly at boot and fails loudly if
+one is missing.
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+bun install
+bun run dev          # next dev
+bun run typecheck    # tsc --noEmit
+bun run lint         # eslint
+bun run test         # vitest run
+bun run build        # next build — run this before opening a PR that touches app/
+bun run db:generate  # drizzle-kit generate, after a schema change
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+`next dev`/`next build` deliberately pass `--webpack`: Next.js 16 with Turbopack
+breaks Vercel packaging for this project. That, and every other platform sharp
+edge found the hard way, is written down in
+[`docs/PLATFORM-NOTES.md`](../docs/PLATFORM-NOTES.md).

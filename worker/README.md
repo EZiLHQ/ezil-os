@@ -1,13 +1,13 @@
-# EBuilder — Cloudflare Sandbox Browser Desktop (Apache Guacamole)
+# EZiL-OS Worker — Cloudflare Sandbox browser desktop (Apache Guacamole)
 
 A real [`@cloudflare/sandbox`](https://developers.cloudflare.com/cloudflare-for-platforms/cloudflare-sandbox/)
 Worker that provisions a **live browser desktop** (Xvfb + fluxbox + x11vnc +
 guacd + Chrome) inside a Cloudflare Sandbox container and exposes it to the
-EBuilder canvas through the **genuine Apache Guacamole HTML5 client** — not
+EZiL-OS desktop shell through the **genuine Apache Guacamole HTML5 client** — not
 noVNC.
 
 > The HTTP API surface consumed by
-> `apps/web/client/src/server/lib/cloudflare-guacamole-provider.ts` is unchanged
+> `app/src/server/lib/cloudflare-guacamole-provider.ts` is unchanged
 > (`{ ok, guacamoleUrl, expiresAt, provider, mode, sandboxId }`), so no
 > web-client change is required. Only what `guacamoleUrl` points at changed:
 > Apache Guacamole on port **8080** instead of noVNC on 6080.
@@ -15,7 +15,7 @@ noVNC.
 ## Architecture
 
 ```
-EBuilder canvas (iframe)
+EZiL-OS shell (iframe)
         │  https://<port>-<id>-desktop.<host>/          Guacamole auto-connect landing (ROOT/index.html)
         │    → /guacamole/#/client/<id>?token=…         genuine Apache Guacamole HTML5 client
         │    → /guacamole/websocket-tunnel              Guacamole protocol over WebSocket
@@ -144,7 +144,7 @@ bun run typecheck      # tsc --noEmit
 bun run dev            # wrangler dev --port 8787 (builds the container image on first run)
 ```
 
-Then in `apps/web/client/.env`:
+Then in `app/.env.local`:
 ```
 CLOUDFLARE_GUACAMOLE_WORKER_URL=http://localhost:8787
 ```
@@ -213,7 +213,8 @@ production website, routed there by mistake; that routing was fully removed
 disabled for a while because the obvious replacement, `ezil.org`, looked
 off-limits (`*.ezil.org/*` is bound to the live production Worker
 `cf-guacamole-sandbox`, serving `sandbox.ezil.org` / `neko.ezil.org`) and
-`zlsocial.ai` turned out to have its own live bare wildcard tunnel catch-all.
+the other candidate zone turned out to have its own live bare wildcard
+tunnel catch-all.
 
 The owner then approved adding three **narrow, token-scoped suffix routes**
 on `ezil.org` alongside the existing bare `*.ezil.org/*` production route:
