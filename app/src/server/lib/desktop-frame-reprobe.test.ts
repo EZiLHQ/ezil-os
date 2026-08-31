@@ -182,6 +182,16 @@ describe('the honesty contract is not weakened', () => {
         // the origin — it tried more than once, it saw the 410, it kept the
         // status — and none is about speed; the budget's own tightness is the
         // separate `cannot outrun its own budget` case above.
+        //
+        // 🔴 STILL FLAKY AFTER THAT, ~1 IN 5 — and the test was right both
+        // times. The remaining cause was in the PRODUCTION loop, not here: the
+        // final iteration probed with whatever milliseconds were left, which on
+        // a busy machine is a handful, so it aborted and returned `unreachable`
+        // — overwriting the real `http_error` the previous attempt had already
+        // established. `confirmDesktopFrame` now refuses to start a probe below
+        // `DESKTOP_FRAME_MIN_PROBE_MS` once it has an answer, which is why this
+        // is stable and why `never lets a starved final attempt overwrite a
+        // real answer` below exists.
         const { url } = await settlingOrigin(Array<number>(10_000).fill(410));
         const confirmed = await confirmDesktopFrame(url, 1_000, 20);
         if (confirmed.alive) throw new Error("an origin that only 410s must never confirm");
@@ -189,6 +199,31 @@ describe('the honesty contract is not weakened', () => {
         expect(confirmed.elapsedMs).toBeGreaterThan(0);
         expect(confirmed.reason).toBe('http_error');
         expect(confirmed.status).toBe(410);
+    });
+
+    it('🔴 never lets a starved final attempt overwrite a real answer', async () => {
+        // The exact shape that made the case above flaky: an origin that only
+        // ever 410s, and a budget short enough that the last slice is too small
+        // to complete a round trip in. The honest answer is the one the origin
+        // actually gave — `http_error` with its status — never an `unreachable`
+        // that describes the clock. Repeated, because the bug was intermittent
+        // by nature and a single green run proved nothing before.
+        for ( let i = 0; i < 25; i++ ) {
+            const { url } = await settlingOrigin(Array<number>(10_000).fill(410));
+            const confirmed = await confirmDesktopFrame(url, 220, 10);
+            if (confirmed.alive) throw new Error('an origin that only 410s must never confirm');
+            expect(`run ${i}: ${confirmed.reason}`).toBe(`run ${i}: http_error`);
+            expect(confirmed.status).toBe(410);
+        }
+    });
+
+    it('still probes once even when the budget is smaller than the floor', async () => {
+        // The floor must never turn into "did nothing". One attempt always
+        // happens, however tight the budget, or the caller gets the initial
+        // placeholder and learns nothing at all.
+        const { url } = await settlingOrigin(Array<number>(10).fill(410));
+        const confirmed = await confirmDesktopFrame(url, 1, 1);
+        expect(confirmed.attempts).toBeGreaterThanOrEqual(1);
     });
 
     it('the shipped budget stays inside the route and shell budgets that contain it', () => {

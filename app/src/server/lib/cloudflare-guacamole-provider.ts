@@ -1710,6 +1710,19 @@ export const DESKTOP_FRAME_CONFIRM_BUDGET_MS = 30_000;
 export const DESKTOP_FRAME_CONFIRM_GAP_MS = 1_500;
 
 /**
+ * The smallest window worth starting a probe in.
+ *
+ * 🔴 A probe clamped to a few milliseconds cannot complete a round trip. It
+ * aborts and reports `unreachable` — a fact about the clock, not about the
+ * origin — and because the loop keeps only the LAST result, that artifact
+ * overwrites a real `http_error` already in hand. The whole point of
+ * `confirmDesktopFrame` is that the next failure is a diagnosis rather than an
+ * investigation; reporting "unreachable" for an origin that just answered 410
+ * is the opposite of that.
+ */
+export const DESKTOP_FRAME_MIN_PROBE_MS = 50;
+
+/**
  * Ask the desktop origin whether it is serving, and keep asking until it is or
  * the budget runs out.
  *
@@ -1729,11 +1742,16 @@ export async function confirmDesktopFrame(
     let last: DesktopFrameProbe = { alive: false, reason: 'unreachable', detail: 'no probe attempted' };
 
     for (;;) {
-        attempts++;
         // Each attempt gets the SHORTER of the per-probe timeout and whatever
         // is left of the whole budget, so the loop cannot overrun its own
         // ceiling by up to a full probe timeout on the last try.
         const remaining = started + budgetMs - Date.now();
+        // ...but a window too small to finish in is worse than no attempt at
+        // all: it can only time out, and its `unreachable` would replace the
+        // real answer we already have. Always probe at least once, however
+        // tight the budget; after that, stop rather than manufacture noise.
+        if (attempts > 0 && remaining < DESKTOP_FRAME_MIN_PROBE_MS) break;
+        attempts++;
         last = await probeDesktopFrame(rawUrl, Math.max(1, Math.min(DESKTOP_FRAME_PROBE_TIMEOUT_MS, remaining)));
         if (last.alive) break;
         // 🔴 `bad_url` is DETERMINISTIC — an unparseable or non-HTTP URL is the
