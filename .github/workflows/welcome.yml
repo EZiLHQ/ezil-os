@@ -1,6 +1,6 @@
 # Welcome - greets a contributor's first pull request or issue in this repo
-# with the links they need (how to send a PR, how to sign off, and - for a
-# fork PR - why two CI checks may show red without blocking merge).
+# with the links they need (how to send a PR, how to sign off, PR size, and -
+# for a fork PR - why two CI checks may show red without blocking merge).
 #
 # -----------------------------------------------------------------------------
 # THIS IS NOT A REQUIRED CONTEXT
@@ -39,6 +39,20 @@
 # read` is the default floor and is not actually read from here, but every
 # other workflow in this repo states it explicitly rather than relying on the
 # repo-wide default, so this one does too.
+#
+# -----------------------------------------------------------------------------
+# THE FORK PARAGRAPH IS tools/triage.ts's "not-required-red" SENTENCE, RE-TENSED
+# -----------------------------------------------------------------------------
+# `tools/triage.ts`'s TEMPLATES["not-required-red"] already says, verbatim,
+# why `container`/`local`/`Vercel` do not block a merge, ending "Neither is
+# one of the fifteen required contexts, so this does not block your merge." -
+# the same sentence this row's brief asks for. Rather than invent a fourth
+# wording of the same fact (`ci.yml`'s own comment and `CONTRIBUTING.md`'s
+# blockquote of it are the other two), this step reuses that sentence,
+# re-tensed for "your PR is from a fork" instead of "a check just failed."
+# `triage.ts`'s version deep-links `ci.yml#L62-L72`; that line range has
+# since drifted (the paragraph is at 65-78 as of this measurement), so this
+# step links the bare file instead of a stale line anchor.
 name: Welcome
 
 on:
@@ -65,23 +79,20 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            // Bot gate - FIRST, before anything else. Mirrors dco.yml's
-            // list: these accounts open plenty of PRs (Dependabot) and
-            // occasionally issues, and a "welcome" aimed at a bot is just
-            // noise the bot cannot act on.
-            const BOT_LOGINS = new Set([
-              "dependabot[bot]",
-              "github-actions[bot]",
-              "copilot-swe-agent[bot]",
-            ]);
-
             const REPO_BLOB = `https://github.com/${context.repo.owner}/${context.repo.repo}/blob/main`;
             const isPr = context.eventName === "pull_request_target";
             const subject = isPr ? context.payload.pull_request : context.payload.issue;
             const number = subject.number;
             const login = subject.user.login;
 
-            if (BOT_LOGINS.has(login)) {
+            // Bot gate - FIRST, before anything else. `endsWith("[bot]")`
+            // mirrors tools/triage.ts's isBotAuthor (`is_bot === true ||
+            // login.endsWith("[bot]")`), the broader convention already in
+            // this repo - narrower than dco.yml's exact three-name list on
+            // purpose: a missed welcome for some other bot account is low
+            // stakes, unlike dco.yml's DCO check where over-matching a real
+            // human as "bot" would wrongly wave through an unsigned commit.
+            if (login.endsWith("[bot]")) {
               console.log(`skip: ${login} is a bot account, not welcoming`);
               return;
             }
@@ -118,7 +129,7 @@ jobs:
               MARKER,
               "Thanks for opening your first one here!",
               "",
-              `See [CONTRIBUTING.md, How to send a PR](${REPO_BLOB}/CONTRIBUTING.md#how-to-send-a-pr) for the fork -> branch -> sign off -> tools/test.sh -> template flow.`,
+              `See [CONTRIBUTING.md, How to send a PR](${REPO_BLOB}/CONTRIBUTING.md#how-to-send-a-pr) for the fork -> branch -> sign off -> tools/test.sh -> template flow, and [CONTRIBUTING.md, PR size](${REPO_BLOB}/CONTRIBUTING.md#pr-size) for how big to keep it.`,
               "",
               "Every commit needs a Signed-off-by trailer that matches its author " +
                 `(see [CONTRIBUTING.md, Sign-off (DCO)](${REPO_BLOB}/CONTRIBUTING.md#sign-off-dco)). If a check comes back red for that, the fix is one of:`,
@@ -132,11 +143,12 @@ jobs:
               if (isFork) {
                 lines.push(
                   "",
-                  "One more thing, since this is a pull request from a fork: two CI jobs, " +
-                    "container (real image) and local (typecheck + unit + smoke), pull a " +
-                    "private container image that a fork's token cannot read, so they will " +
-                    "likely show red or skipped no matter what you wrote " +
-                    `(see [.github/workflows/ci.yml](${REPO_BLOB}/.github/workflows/ci.yml)). ` +
+                  "Since this is a pull request from a fork: two checks, " +
+                    "container (real image) and local (typecheck + unit + smoke), commonly " +
+                    "come up red or skipped here - they pull the desktop image from a private " +
+                    "GitHub Container Registry package that a fork's token cannot read, " +
+                    `regardless of anything you wrote (see [.github/workflows/ci.yml](${REPO_BLOB}/.github/workflows/ci.yml)). ` +
+                    "The Vercel preview deploy is a third-party check on the same footing. " +
                     "Neither is one of the fifteen required contexts, so this does not block your merge - " +
                     `see [CONTRIBUTING.md, Reading CI](${REPO_BLOB}/CONTRIBUTING.md#reading-ci).`,
                 );
@@ -144,8 +156,10 @@ jobs:
             } else {
               lines.push(
                 "",
-                "If this is a bug report or a proposal, the issue templates (task and " +
-                  "app_proposal, offered when you click New Issue) collect the fields a " +
+                "If this is a bug report or a proposal, the " +
+                  `[task](${REPO_BLOB}/.github/ISSUE_TEMPLATE/task.yml) and ` +
+                  `[app_proposal](${REPO_BLOB}/.github/ISSUE_TEMPLATE/app_proposal.yml) ` +
+                  "issue templates (offered when you click New Issue) collect the fields a " +
                   "maintainer needs to act on it. " +
                   `See [docs/community/README.md](${REPO_BLOB}/docs/community/README.md) for how this project is run day to day.`,
               );
