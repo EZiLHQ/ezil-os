@@ -3,6 +3,7 @@ import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 
 import { appRouter } from '@/server/api/root';
+import { OS_ACCESS_NOT_INVITED } from '@/server/api/os-access';
 import { createTRPCContext } from '@/server/api/trpc';
 import { bootPayloadScript, buildShellBootPayload } from '@/server/shell/boot-payload';
 import { Routes, getReturnUrlQueryParam } from '@/utils/constants';
@@ -109,6 +110,31 @@ export default async function Page() {
         // so it is used directly rather than read back from `x-pathname`.
         redirect(`${Routes.LOGIN}?${getReturnUrlQueryParam(Routes.OS)}`);
     }
+
+    /*
+     * 🔴 THE ACCESS GATE, AND ITS POSITION IS THE POINT.
+     *
+     * `getOrCreateDefault` below is a MUTATION: for a user with no computer it
+     * inserts one. So this check cannot live after it, cannot live inside the
+     * `Promise.all`, and cannot be folded into the `catch` that turns a failed
+     * lookup into `<CouldNotOpen />` — every one of those orders creates a
+     * computer row for a principal who may not use the product, and then tells
+     * them no. MEASURED with the check removed (`trpc-access.test.ts`'s
+     * mutation): a refused stranger's request reaches
+     * `select ... from "ezil_computers" ... order by slot` — the first step of
+     * `getOrCreateDefaultComputer`, whose next step on an empty result is the
+     * insert.
+     *
+     * `ctx.access()` is the same single implementation `protectedProcedure`
+     * uses, memoised on this context — so the two `caller.*` calls below reuse
+     * this decision rather than re-querying (`server/api/trpc.ts`). A refused
+     * user would be refused by them anyway; this gate is what stops the
+     * refusal happening AFTER the write.
+     */
+    if (!(await ctx.access()).allowed) {
+        redirect(`${Routes.LOGIN}?error=${OS_ACCESS_NOT_INVITED}`);
+    }
+
     const user = ctx.user;
     const caller = appRouter.createCaller(ctx);
 
