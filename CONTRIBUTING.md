@@ -60,19 +60,23 @@ on the issue rather than waiting indefinitely.
 `feat/…`, `fix/…`, `docs/…`, `test/…`, `chore/…` — the prefix says what kind
 of change the branch carries.
 
-## How big a pull request should be
+## PR size
 
-Prefer **under ~400 changed lines**. A pull request that grows past that will
-be asked to split before review starts. When you split one, cut along a real
-seam rather than an arbitrary line count — one package per pull request, or a
-schema change landed separately from the code that reads it. That second rule
-isn't invented for this list: it's this repository's own rule, stated in
+**Prefer under ~400 changed lines** — past that, a PR gets harder to review
+well even when every line is warranted. That's a preference, not a hard
+line: the automated size labeling only actually asks for a split at
+`size/XL`, over **1000** lines added + deleted (`tools/triage.ts`). If
+you're between the two, err on splitting anyway rather than waiting to be
+asked. When you split one, cut along a real seam rather than an arbitrary
+line count — one package per pull request, or a schema change landed
+separately from the code that reads it. That second rule isn't invented for
+this list: it's this repository's own rule, stated in
 [`docs/RELEASE.md`](docs/RELEASE.md)'s release checklist as "schema before
 code" — a migration has to be applied before the code that depends on the
 table it creates can ship, so the two changes are reviewed, and land,
 separately.
 
-## How to send a pull request
+## How to send a PR
 
 1. Fork the repository and branch off `main` (see "Branch naming" above).
 2. Make your change. Sign off **every** commit: `git commit -s`.
@@ -131,27 +135,33 @@ can't be required yet (`.github/workflows/ci.yml:64-72`):
 block your merge.** If you see one, it is almost certainly this, not
 something you did.
 
-You may also see a `Vercel` check appear — Vercel's GitHub integration deploys
-a preview of `app/` for every branch (`.github/workflows/deploy.yml`'s own
-header explains why that's safe: only `main`'s deploy is disabled at the
-integration level). It is not a required context either; it exists so a
-reviewer can click through to a live preview, not to gate the merge.
+A few other checks can appear that also aren't among the fifteen: `label`
+(the existing labeler workflow), a plain `CodeQL` alongside the required
+`CodeQL (javascript-typescript)`, and `Vercel Preview Comments` — Vercel's
+GitHub integration deploys a preview of `app/` for every branch
+(`.github/workflows/deploy.yml`'s own header explains why that's safe: only
+`main`'s deploy is disabled at the integration level). None of these gate
+the merge; only the fifteen named above do.
 
 ## "A skip is not a pass"
 
 [`tools/test.sh`](tools/test.sh) is the only sanctioned way to run this
-repository's suites, and it is written to fail closed:
+repository's suites, and its own header names three rules it fails closed on:
 
 1. **An absent summary is a failure.** If the run dies mid-way there is no
    final "N pass / N fail" line, and "nothing was reported" is not the same
    as "nothing failed".
 2. **An unreadable failure count is a failure.** A summary that doesn't parse
    to a number counts as a failure, never as zero.
-3. **Every skipped container or browser suite is printed by name.** `worker`'s
-   container suites (`*.container.test.ts`) skip when no desktop image is
-   present on the machine; `shell`'s real-browser suites skip when Playwright
-   is unresolvable. Both are listed, one by one, in the output — never folded
-   into a bare count.
+3. **Any exit code other than 0 is passed through untouched.** The wrapper
+   knows about no "benign" non-zero exit and refuses to invent one — it adds
+   no interpretation on top of whatever the test runner itself reported.
+
+On top of those three, every skipped container or browser suite is printed by
+name, individually: `worker`'s container suites (`*.container.test.ts`) skip
+when no desktop image is present on the machine; `shell`'s real-browser
+suites skip when Playwright is unresolvable. Both are listed one by one in
+the output — never folded into a bare count.
 
 Two environment variables exist to let a run continue past a skip you have
 deliberately accepted — never to make one look like a pass, and both print a
@@ -307,4 +317,4 @@ For an open-ended question or a proposal — as opposed to a concrete bug or a
 scoped task — use [Discussions](https://github.com/EZiLHQ/ezil-os/discussions)
 instead of an issue: **Announcements**, **Q&A**, **Ideas**, **Show and tell**,
 and **Apps** (for talking through a desktop-app idea before or alongside an
-[app proposal issue](.github/ISSUE_TEMPLATE/app_proposal.yml)).
+[app proposal issue](https://github.com/EZiLHQ/ezil-os/issues/new?labels=needs-triage&template=app_proposal.yml)).
