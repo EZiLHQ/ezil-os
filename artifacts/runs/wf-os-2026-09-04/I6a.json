@@ -1,0 +1,10 @@
+{
+  "taskId": "I6a",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "INDEPENDENT_TEST_PASS",
+  "evidence": "Orientation done: read triage.ts/triage.test.ts (house style), test.sh, waves.ts/ledger.ts (voice), the 22 docs/community/issues/*.md front-matter shapes, docs/community/README.md. Measured live: gh 2.95.0 authed; EZiLHQ/ezil-os has 0 issues; all 14 labels the files name exist (app, worker, shell, mcp, local, ci, docs, help wanted, good first issue, blocked, size/S, size/M, size/L, size/XL); the '\"<phrase>\" in:body --state all' search mechanism matches (confirmed against PR #39 body; negative control empty). Building tools/issues.ts + tools/issues.test.ts + fixtures next.",
+  "startedAt": "2026-09-04T22:24:11Z",
+  "updatedAt": "2026-09-04T22:24:11Z",
+  "notes": "Worktree on branch task/I6a, base aab2011. Interpretation to flag: the brief says the parser accepts 'exactly these keys' (id,title,labels,prereq,state) yet also mandates a 'github: <n>' write-back into the front-matter after a create; a literal 5-key-only parser would reject every file the moment its number is written back, bricking idempotent re-runs. Resolving by accepting an optional 'github' key and failing on anything else. Will surface in final report per _MANDATORY section 3."
+}
