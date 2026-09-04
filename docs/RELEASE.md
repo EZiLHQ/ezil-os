@@ -156,6 +156,22 @@ If `verify` fails, the `release` job never runs — the draft `release.yml`
 created stays a **draft**, visibly unreleased, and nothing more claims it
 was verified than the truth supports.
 
+🔴 **The one link in this chain that had to be checked empirically, not
+assumed: can a later `gh release edit <tag> --draft=false` actually find a
+draft that `gh release create <tag> --verify-tag --draft` made?** A draft
+release's own web URL is an internal `releases/tag/untagged-<random>` slug,
+not the tag name — so it is genuinely unobvious that addressing it *by tag*
+later would work. Verified against a real, disposable GitHub repo (created
+and deleted for this check, not `EZiLHQ/ezil-os`): `gh release create
+v0.0.1-test --verify-tag --draft --notes "…"` creates the draft (`isDraft:
+true`, `tagName: "v0.0.1-test"`, URL `.../untagged-…`); `gh release edit
+v0.0.1-test --draft=false` resolves it by tag and publishes it (exit 0, URL
+becomes `.../v0.0.1-test`, `isDraft: false`) — `gh`'s own tag-name fallback
+handles the mismatch. The same sequence with `--prerelease` added (the
+`-rc.N` path) behaves identically. `gh version 2.95.0`, checked 2026-09-04;
+if a future `gh` release changes this fallback, re-run the same check before
+trusting the `release` job's first edit call again.
+
 ## Confirming the rollout
 
 `deploy.yml`'s own header names two different things a "successful deploy"
