@@ -14,36 +14,87 @@
 #
 # It also runs three ubuntu-only jobs: `tools` (typecheck + unit — the one
 # package with neither a `strategy.matrix` need nor a Windows-portability
-# question), and two that exist to HARD-FAIL rather than silently skip:
+# question), and two that pull the REAL published desktop image and run
+# against it instead of silently skipping:
 #
-#   `container` — a placeholder. `worker/Dockerfile:77` pins a project-owned
-#   neko base image that has never been pushed anywhere and exists only on a
-#   developer's machine, so nothing can build or pull the real desktop image
-#   here yet. Publishing it is row T3's job. Until then this job fails on
-#   purpose, loudly naming T3, so the required-status list can include
-#   "container" now without that context ever being a silent, meaningless
-#   green.
+#   `container` — logs in to GHCR with this workflow's own token, pulls
+#   `ghcr.io/ezilhq/ezil-os-desktop:latest` (rows T3/T7 publish it; see
+#   "WHICH TAG, AND WHY" below), tags it locally as `ezil-integrated:local`
+#   and exports `EZIL_VALIDATE_IMAGE`/`EZIL_NEKO_IMAGE` so it resolves for
+#   `worker/src/browser-sidecar.container.test.ts`,
+#   `worker/src/neko-browser-window.container.test.ts` and
+#   `worker/scripts/mobile-keyboard.container.test.ts` (both env spellings —
+#   that file's own header explains why it reads two names), then runs
+#   exactly those three suites and hard-fails on ANY skip, not just a
+#   failure: a skip here means the image gate above did not see the pulled
+#   image, which is a finding about this job, never a pass.
 #
-#   `local` — installs and typechecks `local/` for real (no image needed for
-#   that), then runs `bun test local/` and inspects the result: `bun test`
-#   itself exits 0 when tests are SKIPPED, not just when they pass, so a job
-#   that only checked the exit code would go green while
-#   `local/src/host/docker-host.container.test.ts` — the one suite that boots
-#   a real desktop — never ran (same image gap as `container`, above). This
-#   job parses bun's own pass/skip/fail counts and fails outright if anything
-#   was skipped, naming T3 by name.
+#   `local` — installs and typechecks `local/` for real, ALSO pulls the same
+#   image but tags it under a DIFFERENT local name
+#   (`ezil-os-worker-sandbox:ff199202`, not `ezil-integrated:local` — see the
+#   job's own comment on why: its suites read no env var at all), runs
+#   `bun run doctor` (`working-directory: local`) as an independent health
+#   check, then
+#   `bun test local/` and inspects the result: `bun test` itself exits 0 when
+#   tests are SKIPPED, not just when they pass, so a job that only checked the
+#   exit code would go green while `local/src/host/docker-host.container.test.ts`
+#   and `local/tests/local-smoke.container.test.ts` — the suites that boot a
+#   real desktop in a real browser — never ran. This job parses bun's own
+#   pass/skip/fail counts and fails outright if anything was skipped, then
+#   proves teardown by failing if any `ezil-os-*` container is still running.
+#
+# ── WHICH TAG, AND WHY: `latest`, NOT `<sha8>` ──────────────────────────────
+# `.github/workflows/image.yml` and this workflow trigger off the SAME push
+# and run CONCURRENTLY — there is no `needs:`/`workflow_run` between them (see
+# each file's own `on:` block) — so the commit's own `<sha8>` tag may not
+# exist in GHCR yet by the time this job's pull runs; pinning to `<sha8>`
+# would make this job red on a timing coincidence, not a real defect.
+# `latest` (moved to the last successful push to `main` by image.yml's
+# `desktop` job — see `deploy/images.env`'s own tag-scheme comment) is always
+# resolvable once image.yml has run at least once, on every trigger this
+# workflow has (`push` to `main` AND `pull_request`, since image.yml never
+# runs on a PR — see its own `on:` block). The pulled digest is printed so the
+# log names exactly which build was tested; a PR is therefore tested against
+# the last GOOD build of `main`, not against its own untested changes to
+# `worker/Dockerfile` or `docker/neko/**` — a real gap, called out again in
+# the `container` job's own comment.
+#
+# ── HAND-OFFS FOR THE SUPERVISOR, NOT FIXED IN THIS FILE ───────────────────
+#
+#   FORK PRs CANNOT PULL THE PRIVATE PACKAGE. `pull_request` runs this
+#   workflow with a read-only, fork-scoped `GITHUB_TOKEN` for a fork's PR —
+#   that token cannot pull a private `ezilhq/ezil-os-desktop`, so both
+#   `container` and `local` fail at the "Pull the desktop image" step on
+#   every external contribution, regardless of anything the contributor
+#   wrote. Row G4's required-status list must NOT add "container (real
+#   image)" or "local (typecheck + unit + smoke)" until the package is made
+#   Public (already tracked as a founder step, docs/ORCHESTRATION-LOG.md
+#   2026-09-04 14:50Z) — otherwise no fork PR could ever merge.
+#
+#   MERGE ORDER WITH ROW M1. `worker/scripts/mobile-keyboard.container.test.ts`
+#   is being rewritten on `task/M1` (not yet merged) and, per that file's own
+#   `main`-branch version today, is diagnosed-broken independent of the
+#   image (row M1's hypothesis (b): a bare `require('playwright')` that
+#   cannot resolve it even with `PLAYWRIGHT_REQUIRE_DIR` set — measured on
+#   this box: still 0 pass / 8 fail with the variable exported). So this
+#   row's own PR will show `container (real image)` RED until M1 lands —
+#   expected, and it does not block THIS PR's merge, because neither new
+#   display name is in ruleset 22265548 yet. The supervisor should add both
+#   exact strings to the ruleset only after the first GREEN `container` run
+#   that comes AFTER row M1 merges, not after this row's own PR.
 #
 # What NONE of the above runs:
 #
 #   * the CONTAINER tests (`*.container.test.ts`) inside `worker`'s own matrix
 #     job. They boot the real neko image with Docker, which only the ubuntu
 #     leg even has a daemon for (GitHub's macOS runners have no Docker daemon
-#     and Windows runners cannot run a Linux container), and every one already
-#     gates on `docker image inspect` and SKIPS rather than fails there too —
-#     which is exactly why `local`'s job above exists to make that same skip
-#     loud where this row can actually control the outcome (`local/`'s own
-#     suite). A skipped test that looks like a pass is how a suite stops
-#     meaning anything.
+#     and Windows runners cannot run a Linux container), and every one still
+#     gates on `docker image inspect` and SKIPS rather than fails there —
+#     that job never pulls an image (this row's jobs do, below) — which is
+#     exactly why the `container` job exists to make those same three suites
+#     run for real, and why `local`'s job makes its own skip loud too. A
+#     skipped test that looks like a pass is how a suite stops meaning
+#     anything.
 #
 #   * the PRODUCTION suites (`e2e/prod-*.mjs`). They sign in to the live
 #     deployment with real credentials and drive a real container. They belong
@@ -363,63 +414,201 @@ jobs:
         shell: bash
         run: bun test tools/
 
-  # ── container — a deliberate, loud placeholder. NOT a real test job yet. ───
-  # `worker/Dockerfile:77` pins
-  #   ARG NEKO_IMAGE=ezil-neko-vscode:d74052bb-049931d7-ezil-brand8
-  # a project-owned neko+VS Code base image that, per that Dockerfile's own
-  # header, has "Never [been] pushed to any registry" and exists only in a
-  # developer machine's local Docker image store. `docker build
-  # worker/Dockerfile` therefore cannot succeed on a hosted runner today, and
-  # `deploy/images.env`'s `EZIL_DESKTOP_TAG` is a deliberate, self-documented
-  # placeholder ("<to be pinned by CI>") because nothing has ever been pushed
-  # to GHCR (no tags exist in this repository — `deploy.yml` has never run).
-  # Building or pulling that image in CI is row T3's business, not this row's
-  # (the image itself is 4.6 GB; building it here today is not just blocked,
-  # it would be the wrong layer for this row to own even if it were not).
+  # ── container — pulls the REAL desktop image and runs the container suites
+  # for real. ──────────────────────────────────────────────────────────────
+  # `worker/Dockerfile:77` builds FROM the EZiL-branded neko+VS Code overlay
+  # (see `deploy/images.env`'s pairing rule), and
+  # `.github/workflows/image.yml` builds and pushes the desktop image this
+  # produces to `ghcr.io/ezilhq/ezil-os-desktop` on every push to `main` that
+  # touches `worker/**`, `docker/neko/**`, `deploy/images.env`, or itself
+  # (rows T3/T7; first successful push 2026-09-04, run 33858675382). This job
+  # pulls that image for real, in place of the placeholder that used to fail
+  # on purpose here.
   #
-  # `worker/src/*.container.test.ts` and
-  # `local/src/host/docker-host.container.test.ts` already gate on `docker
-  # image inspect` and SKIP — never fail — when the image they need is
-  # missing, which is exactly correct behaviour on a developer's machine and
-  # exactly wrong for a REQUIRED status context: a check that is green
-  # because it never actually ran a container is how this product's central
-  # claim ("it runs on your machine, for real") ships broken and unnoticed.
-  # `local/`'s job below turns that particular skip into a hard failure by
-  # reading `bun test local/`'s own output; the block of checks in `worker`
-  # has no equivalent here because `worker`'s job already runs elsewhere in
-  # this file and adding a second, ubuntu-only, non-matrix copy of it would
-  # duplicate rather than extend that guard.
+  # 🔴 THE PACKAGE IS PRIVATE — GHCR's default, unchanged by rows T3/T7
+  # (docs/ORCHESTRATION-LOG.md, 2026-09-04 14:50Z: an anonymous
+  # `docker manifest inspect` against it returns `unauthorized`; making it
+  # Public is a manual founder step, tracked separately). A repository's own
+  # `GITHUB_TOKEN`, granted `packages: read` at THIS JOB's level (not the
+  # workflow's — `permissions:` at the top of this file stays `contents:
+  # read` only, since `pull_request` runs this workflow for a fork's PR too),
+  # can pull a private package this same repository's own workflow
+  # published, PROVIDED the package's own "Actions access" setting still
+  # lists this repository — the pull step below fails loudly and names that
+  # setting if the pull is refused, rather than a bare docker exit code.
   #
-  # So this job does the only honest thing left: it fails, on purpose, with a
-  # message that names exactly what has to change (row T3 publishing an
-  # image) and why — so the required-status-context list (row G4) can name
-  # "container" NOW, and a real green here will mean something the day T3
-  # lands, rather than the list growing a context nobody wired.
+  # See the file header's "WHICH TAG, AND WHY" for why this pulls `latest`,
+  # not this commit's own `<sha8>`.
+  #
+  # `worker/src/browser-sidecar.container.test.ts` and
+  # `worker/src/neko-browser-window.container.test.ts` read
+  # `EZIL_VALIDATE_IMAGE`, falling back to the literal `ezil-integrated:local`
+  # if unset; `worker/scripts/mobile-keyboard.container.test.ts` (row M1)
+  # reads `EZIL_VALIDATE_IMAGE` first, then `EZIL_NEKO_IMAGE`, then the same
+  # literal fallback — this job sets both env vars AND tags the pulled image
+  # under that literal name, so all three suites find it however they were
+  # written to look for it.
+  #
+  # 🔴 SETUP PLAYWRIGHT IS HERE TOO, NOT ONLY IN `shell`/`local` — MEASURED,
+  # NOT ASSUMED. `worker/scripts/mobile-keyboard.container.test.ts` spawns
+  # `node -e '<script>'` subprocesses whose scripts open with a bare
+  # `require('playwright')` — that package is deliberately not a dependency
+  # of any `package.json` in this repository (see this action's own header).
+  # On `main` today that resolution fails even WITH `PLAYWRIGHT_REQUIRE_DIR`
+  # set (measured on this box: `bun test worker/scripts/mobile-keyboard.
+  # container.test.ts` with `PLAYWRIGHT_REQUIRE_DIR=/opt/ezil-testkit/
+  # node_modules` exported still gives 0 pass / 8 fail — a bare `require`
+  # cannot see that variable at all) — this is exactly row M1's diagnosed
+  # hypothesis (b): the harness was broken, independent of the product.
+  # Row M1's in-flight fix (`task/M1`, not yet merged) rewrites the same
+  # helpers to `createRequire(process.env.PLAYWRIGHT_REQUIRE_DIR)('playwright')`,
+  # falling back to an honest `SKIP_REASON` naming
+  # `$PLAYWRIGHT_REQUIRE_DIR is unset` when neither resolves it. Without this
+  # step that fallback fires on every run of this job after M1 merges, the
+  # suite SKIPS instead of running, and this job's own hard-fail-on-skip step
+  # below would then be permanently red for a reason that has nothing to do
+  # with the image this job exists to validate. So: install it here too,
+  # even though it changes nothing about today's (pre-M1) red result.
   container:
-    name: container (image-gated placeholder)
+    name: container (real image)
     runs-on: ubuntu-latest
+    # Job-level, not workflow-level: only this job and `local` (below) need
+    # `packages: read`, and the workflow-level `permissions:` block above
+    # stays `contents: read` for every other job, including on a fork's PR.
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v7
-      # Installed for parity with the real job T3 will turn this into — not
-      # used by the placeholder step below, which needs nothing but a shell.
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - name: Placeholder — needs the image row T3 publishes
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # 🔴 PULLS THE IMAGE FOR REAL, OR FAILS NAMING WHY — SEE THE JOB HEADER.
+      - name: Pull the desktop image
         shell: bash
         run: |
-          echo "::error::container tests need the GHCR image published by row T3 (worker/Dockerfile:77 pins a private, never-pushed neko base image — see this job's header comment in .github/workflows/ci.yml). This job fails on purpose until that image exists."
-          exit 1
+          set -e
+          image="ghcr.io/ezilhq/ezil-os-desktop:latest"
+          echo "[image] pulling ${image} ..."
+          if ! pull_out="$(docker pull "${image}" 2>&1)"; then
+            printf '%s\n' "${pull_out}"
+            echo "::error::docker pull ${image} was refused. The ezilhq/ezil-os-desktop package publishes PRIVATE by default and this job already has packages: read (see this job's permissions: block), but that alone is not always enough - check the package's own Actions-access setting at https://github.com/orgs/EZiLHQ/packages/container/ezil-os-desktop/settings (Manage Actions access -> this repository at Read), or make the package Public."
+            exit 1
+          fi
+          printf '%s\n' "${pull_out}"
+          digest="$(printf '%s\n' "${pull_out}" | grep -oE 'Digest: sha256:[0-9a-f]+' | head -1)"
+          echo "[image] tested build: ${image}  ${digest:-<no Digest line printed by docker pull>}"
+          # EZIL_VALIDATE_IMAGE is the name every *.container.test.ts in
+          # worker/ reads (falling back to the literal ezil-integrated:local
+          # if unset); mobile-keyboard.container.test.ts (row M1) also
+          # accepts the older EZIL_NEKO_IMAGE spelling as a second fallback -
+          # export both so this job's tag is found however a suite was
+          # written to look for it.
+          docker tag "${image}" ezil-integrated:local
+          echo "EZIL_VALIDATE_IMAGE=ezil-integrated:local" >> "$GITHUB_ENV"
+          echo "EZIL_NEKO_IMAGE=ezil-integrated:local" >> "$GITHUB_ENV"
+      - name: Install (worker)
+        shell: bash
+        working-directory: worker
+        run: bun install --frozen-lockfile
+      # See .github/actions/setup-playwright/action.yml, and this job's own
+      # header comment above ("SETUP PLAYWRIGHT IS HERE TOO") for why the
+      # container job needs this and not only `local`/`shell`.
+      - name: Setup Playwright
+        uses: ./.github/actions/setup-playwright
+        with:
+          version: '1.62.1'
+      # 🔴 HARD-FAIL ON A SKIP, NOT JUST ON A FAILURE — same reasoning as the
+      # `local` job below, applied to the three suites this job exists to run
+      # for real. A skip here means EZIL_VALIDATE_IMAGE / EZIL_NEKO_IMAGE did
+      # not resolve to an image these suites recognise (the step above
+      # failed, or a suite's own gate found the image missing something it
+      # needs — e.g. row M1's branding-overlay check), or that Playwright
+      # itself did not resolve (the "SETUP PLAYWRIGHT" step above) — never a
+      # pass.
+      - name: Container suites (real image)
+        shell: bash
+        run: |
+          if ! bun test --reporter=junit --reporter-outfile=/tmp/container-junit.xml \
+              worker/src/browser-sidecar.container.test.ts \
+              worker/src/neko-browser-window.container.test.ts \
+              worker/scripts/mobile-keyboard.container.test.ts \
+              2>&1 | tee /tmp/container-test.log; then
+            echo "::error::the container suites failed outright against the real pulled image - see the log above. This is a real product/test defect, not an image-gate problem."
+            exit 1
+          fi
+          if ! grep -qE '^ +[0-9]+ pass$' /tmp/container-test.log; then
+            echo "::error::bun's summary line (' N pass') was not found in the output above - the skip check below cannot be trusted (reporter format may have changed; this job runs bun-version: latest). Failing rather than silently reporting green."
+            exit 1
+          fi
+          skip_count="$(grep -oE '^ [0-9]+ skip$' /tmp/container-test.log | grep -oE '[0-9]+' || true)"
+          if [ -n "$skip_count" ] && [ "$skip_count" -gt 0 ]; then
+            echo "::error::${skip_count} skipped test(s) with the real image present and EZIL_VALIDATE_IMAGE/EZIL_NEKO_IMAGE exported - the image gate above did not see it, or a suite's own image-content check failed. Skip reasons printed by the suites themselves:"
+            grep -iE 'SKIPPING|skip reason|not present locally' /tmp/container-test.log || true
+            exit 1
+          fi
 
-  # ── local (typecheck + unit; container suite loud-skips until T3) ──────────
+  # ── local (typecheck + unit + smoke) — pulls the real image too ────────────
   local:
-    name: local (typecheck + unit)
+    name: local (typecheck + unit + smoke)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # 🔴 SAME PULL AS THE `container` JOB ABOVE, TAGGED UNDER A DIFFERENT
+      # NAME — MEASURED, NOT THE BRIEF'S ORIGINAL ASSUMPTION.
+      # `local/src/host/docker-host.container.test.ts` and
+      # `local/tests/local-smoke.container.test.ts` do NOT read an env var at
+      # all: both call `readAndResolveDesktopImage(deploy/images.env)`
+      # (local/src/container/run-spec.ts:440, calling :415's
+      # `resolveDesktopImage`), which greps `deploy/images.env` for
+      # `EZIL_DESKTOP_IMAGE`/`EZIL_DESKTOP_TAG` and falls back to the literal
+      # `LOCAL_DESKTOP_IMAGE_FALLBACK` constant (run-spec.ts:353) —
+      # `ezil-os-worker-sandbox:ff199202` — whenever the file's tag fails
+      # Docker's tag grammar. `deploy/images.env:90` still ships
+      # `EZIL_DESKTOP_TAG=<to be pinned by CI>` (image.yml's own `desktop`
+      # job runs with `contents: read` and cannot write that pin back — see
+      # that file's own hand-off comment), which does fail the grammar check
+      # (`isDockerTag`, run-spec.ts:389), so on every run today these two
+      # suites resolve to the FALLBACK name, not to any GHCR reference —
+      # tagging the pulled image as `ezil-integrated:local` here (as the
+      # `container` job does) would leave these suites unable to find it. So:
+      # tag the SAME pulled image under the fallback name instead. Once a
+      # human advances `deploy/images.env`'s pin past the placeholder this
+      # step's tag becomes redundant but harmless; nothing here reads the
+      # placeholder itself.
+      - name: Pull the desktop image
+        shell: bash
+        run: |
+          set -e
+          image="ghcr.io/ezilhq/ezil-os-desktop:latest"
+          echo "[image] pulling ${image} ..."
+          if ! pull_out="$(docker pull "${image}" 2>&1)"; then
+            printf '%s\n' "${pull_out}"
+            echo "::error::docker pull ${image} was refused. The ezilhq/ezil-os-desktop package publishes PRIVATE by default and this job already has packages: read (see this job's permissions: block), but that alone is not always enough - check the package's own Actions-access setting at https://github.com/orgs/EZiLHQ/packages/container/ezil-os-desktop/settings (Manage Actions access -> this repository at Read), or make the package Public."
+            exit 1
+          fi
+          printf '%s\n' "${pull_out}"
+          digest="$(printf '%s\n' "${pull_out}" | grep -oE 'Digest: sha256:[0-9a-f]+' | head -1)"
+          echo "[image] tested build: ${image}  ${digest:-<no Digest line printed by docker pull>}"
+          docker tag "${image}" ezil-os-worker-sandbox:ff199202
       # `local/tsconfig.json`'s own header comment: its typecheck reaches
       # `app/src/server/shell/boot-payload.ts`, which imports `drizzle-orm`
       # through `app/node_modules` — so `bun run --cwd local typecheck` needs
@@ -439,18 +628,45 @@ jobs:
         shell: bash
         working-directory: local
         run: bun run typecheck
+      # See .github/actions/setup-playwright/action.yml for why this is a
+      # composite action rather than an inline install: `/opt` does not exist
+      # on the Windows or macOS runner images (this job is ubuntu-only, but
+      # the action itself is shared with the `shell` job and pinned once).
+      # Exports PLAYWRIGHT_REQUIRE_DIR to $GITHUB_ENV — read by
+      # `local/tests/local-smoke.container.test.ts` the same way
+      # `shell/*-browser-test.mjs` reads it.
+      - name: Setup Playwright
+        uses: ./.github/actions/setup-playwright
+        with:
+          version: '1.62.1'
+      # 🔴 EZIL_LOCAL_PORT_OFFSET DELIBERATELY LEFT UNSET.
+      # Row T5 needed offset 10000 on the machine it measured on because
+      # `supabase-kong` already held 0.0.0.0:8443 there. A GitHub-hosted
+      # runner has no such thing running — offset 0 (the doctor's default) is
+      # expected to be free. If it is NOT (a future runner image ships
+      # something on one of these ports), `bun run doctor` prints exactly
+      # which port is busy and exits nonzero on its own; this step does not
+      # swallow that, so the job fails naming the real conflict instead of
+      # silently picking a different offset no other step agrees on. The
+      # container suites below also self-pick a free offset (their own
+      # `pickOffset()`) and never read this env var either.
+      - name: Doctor
+        shell: bash
+        working-directory: local
+        run: bun run doctor
       # 🔴 HARD-FAIL ON A SKIP, NOT JUST ON A FAILURE.
-      # `local/src/host/docker-host.container.test.ts` gates on `docker image
-      # inspect` for the image named by `deploy/images.env` (which falls back
-      # to `ezil-os-worker-sandbox:ff199202` — see the `container` job above
-      # for why nothing built or pulled it onto this runner) and SKIPS — does
-      # not fail — when that image is absent, which it always is here today.
-      # `bun test`'s OWN exit code is 0 on a run with skips and zero failures
-      # (measured: a `describe.skipIf(true)` suite exits 0), so without the
-      # check below this job would read as fully green while the one suite
-      # that boots a real desktop never ran once. So: capture bun's output,
-      # fail on a genuine test failure first, then fail again — loudly, naming
-      # row T3 — if bun reports any skip at all.
+      # `local/src/host/docker-host.container.test.ts` and
+      # `local/tests/local-smoke.container.test.ts` gate on `docker image
+      # inspect` for the image `readAndResolveDesktopImage` resolves (see the
+      # "Pull the desktop image" step above for why that is the FALLBACK
+      # name, not a GHCR reference) and SKIP — do not fail — when it is
+      # absent. `bun test`'s OWN exit code is 0 on a run with skips and zero
+      # failures (measured: a `describe.skipIf(true)` suite exits 0), so
+      # without the check below this job would read as fully green while the
+      # suites that boot a real desktop in a real browser never ran once. So:
+      # capture bun's output, fail on a genuine test failure first, then fail
+      # again — loudly — if bun reports any skip at all, now that the image
+      # the step above pulled should make every skip avoidable.
       #
       # 🔴 `if ! pipeline; then …` ON PURPOSE, NOT `pipeline; if [ $? … ]`.
       # A `shell: bash` step is invoked by GitHub as
@@ -483,6 +699,23 @@ jobs:
           fi
           skip_count="$(grep -oE '^ [0-9]+ skip$' /tmp/local-test.log | grep -oE '[0-9]+' || true)"
           if [ -n "$skip_count" ] && [ "$skip_count" -gt 0 ]; then
-            echo "::error::local/ reported ${skip_count} skipped test(s) — docker-host.container.test.ts loud-skips because the image row T3 publishes is not present on this runner. A skip is not a pass; this job hard-fails until that image exists here."
+            echo "::error::local/ reported ${skip_count} skipped test(s) with the real image pulled and tagged above — the image gate on docker-host.container.test.ts / local-smoke.container.test.ts did not see it. A skip is not a pass."
+            exit 1
+          fi
+      # 🔴 TEARDOWN PROOF. Every container these suites start is named
+      # `ezil-os-<id>` (local/src/container/run-spec.ts:728's
+      # CONTAINER_NAME_PREFIX) and each suite's own cleanup is supposed to
+      # `docker rm -f` it before it exits — this step is the independent
+      # check that it actually happened, not a repeat of the suites' own
+      # claim. `if: always()` so it still reports, and still catches a
+      # leftover container, even when the Unit tests step above already
+      # failed.
+      - name: Teardown proof — no ezil-os- container survived
+        if: always()
+        shell: bash
+        run: |
+          docker ps -a
+          if docker ps -a --format '{{.Names}}' | grep -q '^ezil-os-'; then
+            echo "::error::a container named ezil-os-* is still present after the suite run above - teardown did not happen. See the docker ps -a output above."
             exit 1
           fi
