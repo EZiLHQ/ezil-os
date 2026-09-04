@@ -1,7 +1,39 @@
-# Dependency updates. This repository has three independent JS projects plus a
-# sidecar, each with its own lockfile, and no root workspace — so each one is
-# listed separately. Grouped and rate-limited on purpose: a small team cannot
-# review a flood of individual bumps, and an unreviewed bump is not an upgrade.
+# Dependency updates. This repository has five independent JS/TS projects
+# (app, worker, worker/sidecar, sdk, mcp), each with its own lockfile and no
+# root workspace — so each one is listed separately. Grouped and
+# rate-limited on purpose: a small team cannot review a flood of individual
+# bumps, and an unreviewed bump is not an upgrade.
+#
+# Every npm/bun entry below ignores semver-major *version* updates (this
+# does not affect security updates — Dependabot's `ignore` option only
+# applies to routine version updates, so a security advisory whose only fix
+# is a major still gets its own PR and the Security tab still alerts).
+# The maintainer is solo, the deploy pipeline is tag-triggered off `main`,
+# and `main` is moving to a ruleset that requires a PR + green CI + DCO
+# sign-off but sets `required_approving_review_count: 0` — so nothing here
+# should be able to land unattended. Dependabot has no "open the PR but
+# never auto-merge, and hold it for a human to actually read" mode for
+# majors that's safer than just not opening them, so majors are ignored
+# here and opened by hand instead, each tracked as an issue with a
+# migration note (see CONTRIBUTING.md, "Dependency updates"). Six majors
+# are deferred as of 2026-09-04 — the tracked issue is the durable record,
+# not any one Dependabot PR (this `ignore` rule may itself cause Dependabot
+# to auto-close the six PRs below on its next scheduled run):
+#   - eslint 9 -> 10 (app, was PR #9)
+#   - motion 11 -> 13 (app, was PR #8)
+#   - zod 3 -> 4 (app, was PR #7) — mcp is already on zod ^4; app stays on
+#     ^3 until drizzle-zod compatibility is checked
+#   - sonner 1 -> 2 (app, was PR #6)
+#   - typescript 5.9 -> 7.0 (worker, was PR #4) — TypeScript 7 is the
+#     Go-based compiler rewrite; worker/tsconfig.json has never been
+#     checked against it
+#   - @cloudflare/workers-types 4 -> 5 (worker, was PR #3) — check against
+#     the pinned @cloudflare/sandbox 0.12.1 before taking this
+# `/app` also has open-pull-requests-limit: 5, and before this ignore was
+# added four of those five slots were majors it could never safely land —
+# starving out the one PR actually worth auto-merging (the grouped
+# patch-and-minor bump). Ignoring majors here fixes that starvation as a
+# side effect, not just the review-safety problem.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -17,6 +49,9 @@ updates:
     groups:
       patch-and-minor:
         update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: npm
     directory: /worker
@@ -27,6 +62,8 @@ updates:
       patch-and-minor:
         update-types: ["minor", "patch"]
     ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
       # Pinned for compatibility with the container image and tracked in
       # ATTRIBUTIONS.md — a bump here is a deliberate, tested change.
       - dependency-name: "@cloudflare/sandbox"
@@ -36,3 +73,32 @@ updates:
     schedule: { interval: weekly }
     open-pull-requests-limit: 3
     labels: ["dependencies"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # sdk/ and mcp/ are managed with Bun (bun.lock), not npm/yarn/pnpm — Bun is
+  # its own Dependabot ecosystem, not a variant of "npm".
+  - package-ecosystem: bun
+    directory: /sdk
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 3
+    labels: ["dependencies"]
+    groups:
+      patch-and-minor:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: bun
+    directory: /mcp
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 3
+    labels: ["dependencies"]
+    groups:
+      patch-and-minor:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
