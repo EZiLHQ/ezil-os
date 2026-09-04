@@ -45,3 +45,12 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   state-independent invariant next to it stays. Supervisor fix from O2's hand-off: `.gitignore` `node_modules/` →
   `node_modules` so worktree symlinks are ignored. Hand-off to O3: `tools/package.json`'s `typecheck` needs
   `sdk/node_modules/.bin` on PATH until `tools/test.sh` wires it. Running: T0, G2, G3. Ready when a slot frees: O3, O4.
+- 2026-09-04 09:20Z — **T0 merged** (3b05d3e): 49 pass / 0 fail re-run by the supervisor; eight mutations RED→GREEN in
+  the worker's report, including both sides of the port import (a change in `worker/src/desktop-mode.ts` reddens
+  `local/`). Measured on the pinned image, not assumed: the four neko ICE env names exist; `--webrtc.ip_retrieval_url`
+  defaults to `checkip.amazonaws.com` only when `nat1to1` is absent; **`/etc/neko/neko.yaml` inside the image ships
+  default passwords (`admin`/`neko`)** — `buildContainerEnv` fails closed on an empty password, and T2 must mint
+  per-boot passwords. Hand-offs carried into briefs: T3 must publish the `-ezil-brand<N>` OVERLAY to GHCR (the bare
+  neko tag lacks the mobile keyboard and the black-picture detector) and `EXPOSE` lacks 8443; T0's `verify_cmd` needs
+  `bun install --cwd local` and an installed `app/` (typecheck reaches `drizzle-orm` through the app import).
+  `local/node_modules` installed on main (its own lockfile; nothing shared). Running: G2, G3, O3.
