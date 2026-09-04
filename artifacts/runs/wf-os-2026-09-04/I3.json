@@ -1,9 +1,9 @@
 {
   "taskId": "I3",
   "runId": "wf-os-2026-09-04",
-  "status": "running",
+  "status": "done",
   "doneRung": "COMMITTED",
-  "evidence": "starting: welcome.yml, size-label.yml, triage-label.yml not yet written",
-  "startedAt": "2026-09-04T00:00:00Z",
-  "updatedAt": "2026-09-04T00:00:00Z"
+  "evidence": "3 workflow files created and committed (welcome.yml, size-label.yml, triage-label.yml); all 3 parse via python3 yaml.safe_load (0 fail / 3 pass); actionlint not installed, not run; 3 github-script bodies extracted and node --check clean (0 fail / 3 pass); actions/github-script@v7 tag resolves to f28e40c7f34bde8b3046d885e986cb6290c5673b; size thresholds in size-label.yml match tools/triage.ts sizeBucket verbatim (XS<=20,S<=100,M<=400,L<=1000,XL>1000); 4 CONTRIBUTING anchors (#sign-off-dco, #pr-size, #how-to-send-a-pr, #reading-ci) confirmed present on origin/fix/I1-anchor-contract (PR #38 still open at time of this run, not yet merged into main); mutation-proved 2 guards (YAML parse on welcome.yml, node --check on size-label.yml script) each RED-then-restored-GREEN; real proof (first PR/issue after merge produces the comment + label) is a supervisor step, not run here.",
+  "startedAt": "2026-09-04T22:11:30Z",
+  "updatedAt": "2026-09-04T22:36:48Z"
 }
