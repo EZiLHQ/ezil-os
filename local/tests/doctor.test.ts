@@ -263,7 +263,11 @@ describe('the two silent-when-absent container variables', () => {
         const check = find(report.checks, 'no egress for the ICE candidate');
         expect(check.status).toBe('PASS');
         expect(check.detail).toContain('NEKO_WEBRTC_NAT1TO1=127.0.0.1');
-        expect(check.detail).toContain('checkip.amazonaws.com');
+        // 🔴 NOT the third-party domain: `../src/server/no-hostname.test.ts`
+        // refuses a literal hostname anywhere in `local/src` code, warnings
+        // included, and this assertion has to hold to the same rule as the
+        // string it is asserting on.
+        expect(check.detail).toContain('no outbound IP lookup');
     });
 
     it('reports NEKO_SESSION_IMPLICIT_HOSTING, the one that decides whether clicks work', async () => {

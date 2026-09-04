@@ -246,9 +246,18 @@ export async function runDoctor(deps: DoctorDeps): Promise<DoctorReport> {
         add(
             'no egress for the ICE candidate',
             nat === undefined || nat === '' ? 'FAIL' : 'PASS',
+            // 🔴 THE THIRD-PARTY DOMAIN IS NAMED IN THE COMMENT ABOVE AND
+            // NOWHERE IN A STRING. `../server/no-hostname.test.ts` refuses a
+            // literal hostname anywhere in `local/src` code — including in a
+            // message that merely WARNS about one — because a grep for "does
+            // this product phone home" must come back empty, and a scanner
+            // cannot tell a warning's literal from a caller's. The variable
+            // name is the actionable half anyway.
             nat === undefined || nat === ''
-                ? 'NEKO_WEBRTC_NAT1TO1 is NOT in the container environment — neko would fetch checkip.amazonaws.com on every boot'
-                : `NEKO_WEBRTC_NAT1TO1=${nat} — no checkip.amazonaws.com lookup`,
+                ? 'NEKO_WEBRTC_NAT1TO1 is NOT in the container environment — neko would then fetch its own'
+                    + ' default `--webrtc.ip_retrieval_url` (a third-party service) on every boot and advertise'
+                    + ' the public IP it returns as the ICE candidate for a peer that is on loopback'
+                : `NEKO_WEBRTC_NAT1TO1=${nat} — no outbound IP lookup on boot`,
         );
 
         // 🔴 NEKO_SESSION_IMPLICIT_HOSTING: without it the desktop renders and
