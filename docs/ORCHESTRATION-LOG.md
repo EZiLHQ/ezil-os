@@ -38,3 +38,10 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   (v5/v9) because the newer majors change only the Node runtime. Hand-offs recorded: the ten labels in
   `.github/labeler.yml` do not exist in the repo yet (labeler runs with least privilege and cannot create them) —
   create them in G4; `codeowners/errors` to be checked on the default branch after push. Slot reused for D1.
+- 2026-09-04 08:40Z — **D1 merged** (8099059) and **O2 merged** (7d288c4). O2: 76 pass / 0 fail; `bun tools/waves.ts
+  docs/TASKS.csv` on main reports no ownership overlaps, no cycles, every dependency resolves; eight advisory `wave`
+  column disagreements (computed waves run 0–6) — the column stays as written, the graph is the truth. O2 dropped one
+  ported test ("records that the net is live") because it pins a global fact that differs per worktree; the
+  state-independent invariant next to it stays. Supervisor fix from O2's hand-off: `.gitignore` `node_modules/` →
+  `node_modules` so worktree symlinks are ignored. Hand-off to O3: `tools/package.json`'s `typecheck` needs
+  `sdk/node_modules/.bin` on PATH until `tools/test.sh` wires it. Running: T0, G2, G3. Ready when a slot frees: O3, O4.
