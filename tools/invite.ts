@@ -245,13 +245,17 @@ const connect = async (): Promise<Sql> => {
 	return postgres(url, { max: 1, onnotice: () => {} });
 };
 
+/** ISO-8601 for every timestamp, everywhere. A `Date`'s default `toString()`
+ * ("Fri Sep 04 2026 ... (Coordinated Universal Time)") is unsortable, locale-
+ * shaped, and not what the database holds. */
+const stamp = (raw: unknown): string => {
+	if (raw === null || raw === undefined) return '-';
+	if (raw instanceof Date) return raw.toISOString();
+	return String(raw);
+};
+
 const formatRow = (row: Row): string => {
-	const value = (key: string): string => {
-		const raw = row[key];
-		if (raw === null || raw === undefined) return '-';
-		if (raw instanceof Date) return raw.toISOString();
-		return String(raw);
-	};
+	const value = (key: string): string => stamp(row[key]);
 	const status = row.revoked_at === null || row.revoked_at === undefined ? 'ACTIVE ' : 'REVOKED';
 	return `${status}  ${value('email').padEnd(34)}  by=${value('invited_by').padEnd(16)}  created=${value('created_at')}  revoked=${value('revoked_at')}`;
 };
@@ -368,13 +372,13 @@ const cmdRevoke = async (rawEmail: string): Promise<void> => {
 
 		const row = rows[0];
 		if (row) {
-			out(`[invite] revoked ${email} at ${String(row.revoked_at)} — the row is kept, revoked_at is set.`);
+			out(`[invite] revoked ${email} at ${stamp(row.revoked_at)} — the row is kept, revoked_at is set.`);
 			return;
 		}
 
 		// Nothing updated. Say WHICH of the two reasons, rather than "done".
 		const existing = await sql`SELECT revoked_at FROM ezil_os_access WHERE email = ${email}`;
-		if (existing[0]) out(`[invite] ${email} was already revoked at ${String(existing[0].revoked_at)} — no change.`);
+		if (existing[0]) out(`[invite] ${email} was already revoked at ${stamp(existing[0].revoked_at)} — no change.`);
 		else fail(`[invite] ${email} is not on the allow-list — nothing to revoke.`);
 	} finally {
 		await sql.end();
