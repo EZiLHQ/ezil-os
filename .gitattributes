@@ -25,6 +25,28 @@
 *.bash  text eol=lf
 *.mjs   text eol=lf
 
+# ── Source and prose: LF, everywhere, always ────────────────────────────────
+# `* text=auto` already stores these with LF in the INDEX — measured: `git
+# ls-files --eol` reports 0 `i/crlf` and 0 `i/mixed` across the whole tree, and
+# all 321 tracked `.ts`/`.tsx`/`.json`/`.md` files are `i/lf w/lf`. What it does
+# NOT do is pin the WORKING TREE: under Git for Windows' default
+# `core.autocrlf=true`, `text=auto` checks every one of them out as CRLF. That
+# is not hypothetical — row M4 fixed two real Windows-only test failures caused
+# by exactly it (`worker/src/index.test.ts`, 8 assertions, and
+# `workspace-idle.test.ts`, 2), where a multi-line regex over a source file read
+# with `readFileSync` anchors on `\n` and finds nothing. Every such read is a
+# `.ts` file reading a `.ts`/`.json`/`.md` file, so pinning these four
+# extensions removes the whole class rather than patching each reader.
+#
+# Adding these rules renormalizes nothing: `git add --renormalize` over the four
+# globs stages an empty diff on the commit that introduces them, because the
+# index is already LF. They change what a Windows checkout WRITES, not what git
+# stores.
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+
 # ── PowerShell: CRLF ────────────────────────────────────────────────────────
 # The reverse case, and it is not symmetry for its own sake: Windows PowerShell
 # 5.1 mis-parses some LF-only scripts. There are no `.ps1` files tracked today;
