@@ -1,0 +1,9 @@
+{
+  "taskId": "I1",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "COMMITTED",
+  "evidence": "started: reading CONTRIBUTING.md, README.md, GOVERNANCE.md, PR template, issue templates, ci.yml, dco.yml, tools/test.sh, docs/LOCAL-MODE.md, docs/RELEASE.md; confirmed the 15 required status-check context names live via gh api repos/EZiLHQ/ezil-os/rulesets/22265548 against ci.yml's own job/matrix names (exact match); confirmed all ten area labels plus good first issue/help wanted/size-XS..XL/needs-triage/blocked/prereq-missing/review:claude/dependencies already exist via gh label list (not a pending supervisor step). Not yet written.",
+  "startedAt": "2026-09-04T20:28:02Z",
+  "updatedAt": "2026-09-04T20:28:02Z"
+}
