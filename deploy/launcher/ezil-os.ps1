@@ -21,7 +21,7 @@ function Info($msg) { Write-Host "[ezil-os] $msg" }
 function ErrMsg($msg) { Write-Host "[ezil-os] ERROR: $msg" -ForegroundColor Red }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RepoRoot = Resolve-Path (Join-Path $ScriptDir "..\..")
+$RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
 $LocalDir = Join-Path $RepoRoot "local"
 $ImagesEnv = Join-Path $RepoRoot "deploy\images.env"
 
@@ -154,6 +154,7 @@ try {
         if ($proc.HasExited) {
             ErrMsg "The local host exited before it answered. Log:"
             Get-Content $LogFile -ErrorAction SilentlyContinue
+            Get-Content "$LogFile.err" -ErrorAction SilentlyContinue
             exit 1
         }
         try {
@@ -166,6 +167,7 @@ try {
     if (-not $ready) {
         ErrMsg "$OsUrl did not answer 200 within 30s. Log:"
         Get-Content $LogFile -ErrorAction SilentlyContinue
+        Get-Content "$LogFile.err" -ErrorAction SilentlyContinue
         exit 1
     }
 
