@@ -242,3 +242,9 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   concurrent rows do not each re-run fifteen minutes of checks after every merge; merge method squash (linear
   history forbids merge commits). **From here every change to `main`, including this log, lands by squash-merged
   PR** — the supervisor's `git merge --no-ff` loop is retired for this repository.
+- 2026-09-05 00:05Z — **image.yml second run green** (33865834089, triggered by T7's merge): the gate reported
+  `base_exists=true overlay_exists=true` and skipped the base rebuild exactly as designed (the diff changed no pinned
+  SHA), the desktop image was rebuilt and pushed, and `published-images.env` (481 bytes) was uploaded as the
+  hand-off artifact for the tag write-back. T7 at DEPLOYED. Repository now has auto-merge and delete-branch-on-merge
+  enabled; PR #15 landed as the first squash-merged change under the ruleset. Process note: two docs branches that
+  both append to this file conflict on rebase — rebuild the later one on the merged `main` instead of rebasing.
