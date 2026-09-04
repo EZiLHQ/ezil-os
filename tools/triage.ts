@@ -231,7 +231,7 @@ A check failed here that is currently green on \`main\` for the same name, and i
 
 	"not-required-red": `### A non-required check is red
 
-\`container (real image)\` and \`local (typecheck + unit + smoke)\` pull the desktop image from a private GitHub Container Registry package. A pull request from a fork — and a developer on an unprivileged machine — cannot read that package, so those checks come up red or skipped on outside contributions no matter what you changed (see [\`.github/workflows/ci.yml\` lines 62–72](${REPO_BLOB}/.github/workflows/ci.yml#L62-L72)). The \`Vercel\` preview deploy is a third-party check on the same footing. Neither is one of the fifteen required contexts, so this does not block your merge.`,
+A check failed here that is not among the fifteen required contexts. Two checks commonly do this on outside contributions: \`container (real image)\` and \`local (typecheck + unit + smoke)\` pull the desktop image from a private GitHub Container Registry package that a pull request from a fork — or a developer on an unprivileged machine — cannot read, so they come up red or skipped (see [\`.github/workflows/ci.yml\` lines 62–72](${REPO_BLOB}/.github/workflows/ci.yml#L62-L72)). The \`Vercel\` preview deploy is a third-party check on the same footing. Neither is one of the fifteen required contexts, so this does not block your merge.`,
 
 	"size-xl": `### This pull request is large (size/XL)
 
