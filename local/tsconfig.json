@@ -1,0 +1,48 @@
+{
+  // EZiL OS local mode.
+  //
+  // ── Why there is no `rootDir` ───────────────────────────────────────────────
+  // `src/container/run-spec.ts` and `src/contract/shell-api.test.ts` import
+  // `../../../worker/src/desktop-mode.ts` and
+  // `../../../app/src/server/shell/boot-payload.ts` BY RELATIVE PATH, on
+  // purpose: the port numbers and the shell route table must have exactly one
+  // definition in this repository, and a copy here would be a second one that
+  // drifts. Those files live outside `local/`, so any `rootDir` that contained
+  // `src/` would reject them.
+  //
+  // `rootDir` only constrains OUTPUT layout, and this project sets `noEmit`, so
+  // omitting it costs nothing and is the only setting under which the
+  // cross-package imports typecheck at all.
+  //
+  // ── Why `paths` maps `@/*` ─────────────────────────────────────────────────
+  // `app/src/server/shell/boot-payload.ts` carries one import —
+  // `import type { Computer } from '@/server/db/schema'` — resolved through the
+  // APP's own tsconfig `paths` when the app typechecks itself. tsc resolves a
+  // dependency's specifiers against the tsconfig of the PROJECT DOING THE
+  // COMPILE, not the file's own package, so without this entry that import is
+  // unresolvable from here. See `src/contract/shell-api.ts` for what is
+  // actually imported and why the app subgraph stays small.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "types": ["bun"],
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "paths": {
+      "@/*": ["../app/src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}

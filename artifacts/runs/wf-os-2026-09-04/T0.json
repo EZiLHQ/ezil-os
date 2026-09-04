@@ -1,0 +1,9 @@
+{
+  "taskId": "T0",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "INDEPENDENT_TEST_PASS",
+  "evidence": "started 2026-09-04; orientation complete: neko `--webrtc.{udpmux,tcpmux,nat1to1,icelite,ip_retrieval_url}` flags CONFIRMED present in ezil-neko-vscode:d74052bb-049931d7 (`neko serve --help`, 145 flag lines, ip_retrieval_url default=https://checkip.amazonaws.com); `git ls-files --eol` = 0 tracked .sh/.mjs/.ps1 with CRLF, 36 tracked files non-lf (all i/-text binaries); worker/Dockerfile EXPOSEs 8080/8181/3002/9223 and NOT 8443. No files written yet.",
+  "startedAt": "2026-09-04T07:40:00Z",
+  "updatedAt": "2026-09-04T07:40:00Z"
+}
