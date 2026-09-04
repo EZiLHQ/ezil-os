@@ -93,6 +93,13 @@ jobs:
         working-directory: worker
         run: bun run typecheck
       - name: Unit tests
+        # Linux only: these suites EXECUTE the container's Ubuntu boot scripts
+        # (start-neko.sh, emit_telemetry, the NDJSON tail) for real — PR #14, eighth
+        # run: 227 of them fail on macOS for exactly that reason. They are Linux tests
+        # of a Linux container; the typecheck above runs on every OS. Row M3 makes
+        # them self-skip with a printed reason so a Mac contributor's `bun test` is
+        # honest too. Step-level, so the check run the ruleset requires still exists.
+        if: runner.os == 'Linux'
         shell: bash
         working-directory: worker
         # Container tests skip themselves when Docker has no image (or, on
@@ -114,6 +121,13 @@ jobs:
       # Prints exactly the evidence this row's verify_cmd asks for, without
       # dumping the full (much larger) JUnit report into the log.
       - name: Show the bash -n file list (verify_cmd evidence)
+        # Linux only: these suites EXECUTE the container's Ubuntu boot scripts
+        # (start-neko.sh, emit_telemetry, the NDJSON tail) for real — PR #14, eighth
+        # run: 227 of them fail on macOS for exactly that reason. They are Linux tests
+        # of a Linux container; the typecheck above runs on every OS. Row M3 makes
+        # them self-skip with a printed reason so a Mac contributor's `bun test` is
+        # honest too. Step-level, so the check run the ruleset requires still exists.
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           echo "bash -n was run, this leg (${{ runner.os }}), against:"
