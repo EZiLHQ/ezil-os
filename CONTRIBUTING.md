@@ -62,11 +62,15 @@ of change the branch carries.
 
 ## PR size
 
-Prefer **under ~400 changed lines**. A pull request that grows past that will
-be asked to split before review starts. When you split one, cut along a real
-seam rather than an arbitrary line count — one package per pull request, or a
-schema change landed separately from the code that reads it. That second rule
-isn't invented for this list: it's this repository's own rule, stated in
+**Prefer under ~400 changed lines** — past that, a PR gets harder to review
+well even when every line is warranted. That's a preference, not a hard
+line: the automated size labeling only actually asks for a split at
+`size/XL`, over **1000** lines added + deleted (`tools/triage.ts`). If
+you're between the two, err on splitting anyway rather than waiting to be
+asked. When you split one, cut along a real seam rather than an arbitrary
+line count — one package per pull request, or a schema change landed
+separately from the code that reads it. That second rule isn't invented for
+this list: it's this repository's own rule, stated in
 [`docs/RELEASE.md`](docs/RELEASE.md)'s release checklist as "schema before
 code" — a migration has to be applied before the code that depends on the
 table it creates can ship, so the two changes are reviewed, and land,
