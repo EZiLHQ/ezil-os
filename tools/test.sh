@@ -63,6 +63,12 @@
 #   * `worker`: every skipped test is NAMED BY SUITE. If any of them is in a
 #     `*.container.test.ts`, this exits non-zero unless
 #     `EZIL_ALLOW_SKIPPED_CONTAINER_TESTS=1` -- which prints a line saying so.
+#     That gate covers TWO of this repository's three container suites, because
+#     it can only see a skip bun recorded. The third,
+#     `worker/scripts/mobile-keyboard.container.test.ts`, returns early from
+#     inside its test bodies and is counted as PASSING with no image at all
+#     (measured: `8 pass, 0 skip`). `gate_vacuous_container_passes` below is the
+#     positive assertion that catches that shape; see its comment.
 #   * `shell`: `shell/run-tests.sh` is invoked with `--strict`, which is how
 #     that runner turns a suite that did not run into a failure. Drop the
 #     strictness with `EZIL_ALLOW_SKIPPED_BROWSER_SUITES=1` -- which prints a
@@ -168,18 +174,21 @@ skip_table () {
         }
         /<testcase / {
             if (match($0, /file="[^"]*"/)) f = substr($0, RSTART + 6, RLENGTH - 7)
+            t[f]++
         }
         /<skipped/ { c[f]++; seen++ }
         END {
             printf "TOTAL\t%s\n", (total == "" ? "?" : total)
             printf "SEEN\t%d\n", seen + 0
             for (k in c) printf "FILE\t%d\t%s\n", c[k], k
+            for (k in t) printf "TESTS\t%d\t%s\n", t[k], k
         }
     ' "$1"
 }
 
 CONTAINER_SKIPS=0
 OTHER_SKIPS=0
+SKIP_TABLE=""
 
 # 0 = report read and printed. 1 = the report could not be read or does not add
 # up, which is a failure, never zero skips.
@@ -196,6 +205,7 @@ report_skips () {
 
     local table total seen count file kind
     table="$(skip_table "$xml")"
+    SKIP_TABLE="$table"
     total="$(printf '%s\n' "$table" | awk -F'\t' '$1 == "TOTAL" { print $2 }')"
     seen="$(printf '%s\n' "$table"  | awk -F'\t' '$1 == "SEEN"  { print $2 }')"
 
@@ -291,6 +301,53 @@ gate_container_skips () {
     return 1
 }
 
+# ── The vacuous-container-pass gate ─────────────────────────────────────────
+# The skip gate above can only see a test that bun RECORDED as skipped, and one
+# of this repository three container suites does not produce one.
+#
+# MEASURED: with the image absent, `worker/scripts/mobile-keyboard.container.test.ts`
+# reports `8 pass, 0 skip`. Five of its eight `it` bodies do
+# `console.warn(...SKIPPING, not passing...); return;` -- an early return from
+# inside a test body, which bun counts as a PASS. The warning says the right
+# thing and the runner records the opposite, so `EZIL_ALLOW_SKIPPED_CONTAINER_TESTS`
+# never sees it and the run reads green with a container nobody started. Handed
+# off in the O3 report; until it is fixed, this is the positive assertion that
+# catches it.
+#
+# The rule: when EVERY image the container suites could use is absent, a
+# `*.container.test.ts` that reports a non-skipped test has reported a result it
+# cannot have obtained. Requiring ALL of them absent (not any) is what keeps
+# this from firing on a machine where one env override points somewhere real.
+gate_vacuous_container_passes () {
+    [ -n "$SKIP_TABLE" ] || return 0
+
+    local images=("${EZIL_VALIDATE_IMAGE:-ezil-integrated:local}" "${EZIL_NEKO_IMAGE:-ezil-integrated:local}")
+    local img
+    for img in "${images[@]}"; do
+        # A reachable image means the suites could really have run. Not our case.
+        docker image inspect "$img" >/dev/null 2>&1 && return 0
+    done
+
+    local rc=0 count file skipped ran
+    while IFS=$'\t' read -r _ count file; do
+        case "$file" in
+            *.container.test.ts) ;;
+            *) continue ;;
+        esac
+        skipped="$(printf '%s\n' "$SKIP_TABLE" | awk -F'\t' -v f="$file" '$1 == "FILE" && $3 == f { print $2 }')"
+        [ -n "$skipped" ] || skipped=0
+        ran=$(( count - skipped ))
+        [ "$ran" -gt 0 ] || continue
+        say "$file reported ${ran} test(s) as run while every image those suites use is absent"
+        say "  (${images[*]}). A container test that never reached a container did not pass, it did"
+        say "  not run. bun records an early return inside an it body as a PASS, which is exactly"
+        say "  how a suite like this reads green. This is not covered by"
+        say "  EZIL_ALLOW_SKIPPED_CONTAINER_TESTS, because nothing was recorded as skipped."
+        rc=1
+    done < <(printf '%s\n' "$SKIP_TABLE" | awk -F'\t' '$1 == "TESTS"')
+    return "$rc"
+}
+
 note_other_skips () {
     [ "$OTHER_SKIPS" -gt 0 ] || return 0
     say "${OTHER_SKIPS} further test(s) skipped for reasons outside this gate (named above)."
@@ -315,6 +372,7 @@ run_worker () {
     typecheck "$TREE/worker" bun run typecheck || return 1
     run_bun "$TREE/worker" "$@" || rc=1
     gate_container_skips || rc=1
+    gate_vacuous_container_passes || rc=1
     note_other_skips
     return "$rc"
 }
