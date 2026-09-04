@@ -16,7 +16,8 @@
  */
 
 import { describe, expect, it, mock } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // ── The workerd-only `cloudflare:workers` stub, registered HERE ─────────────
@@ -1304,5 +1305,116 @@ describe('container boot-telemetry drain reaches ensureDesktop callers on succes
     const fnBlock = src.match(/function spoolTelemetry\([\s\S]*?\n\}/)?.[0] ?? '';
     expect(fnBlock).not.toContain('await bucket.put');
     expect(fnBlock).toContain('ctx?.waitUntil');
+  });
+});
+
+// ── Source pin: the workerd stub is a per-file obligation, not a lucky order ─
+// The bug this pins cost 205 red tests on one CI leg and nothing at all on the
+// other two (PR #14 eighth run, job 100991453440). `./index.ts` imports
+// `@cloudflare/sandbox`, whose content-hashed chunk imports the workerd-only
+// `cloudflare:workers`; bun resolves that specifier on NO platform, so any test
+// that loads `./index` must supply it with `mock.module()` (or a bun
+// `plugin()`'s `build.module()`) BEFORE the first load. Four files did. This
+// one did not, and passed anyway — because on ext4 and on Windows's
+// alphabetical order bun happened to load a file that HAD the stub first, and
+// the registration is process-global. On APFS bun reached this file first, the
+// import threw, and bun then served that same rejection to every later
+// importer: the four files that did register a stub failed too.
+//
+// So "it passes here" was never evidence that a file could stand alone. This
+// block makes the obligation checkable without a Mac: it fails on any test file
+// that reaches `./index` without having registered the specifier first.
+describe('source pin: every test that loads ./index registers the cloudflare:workers stub', () => {
+  const testDir = fileURLToPath(new URL('.', import.meta.url));
+  /** `from './index'` or `import('./index')`, with or without a `.ts` suffix. */
+  const LOADS_INDEX = /(?:\bfrom\s*|\bimport\s*\(\s*)['"]\.\/index(?:\.ts)?['"]/;
+  /** `mock.module('cloudflare:workers'` or a bun plugin's `build.module(...)`. */
+  const REGISTERS_STUB = /(?:mock\.module|build\.module)\(\s*['"]cloudflare:workers['"]/;
+
+  /**
+   * Blank out block and whole-line comments so the scan is about CODE.
+   * Without this the check is worse than useless: the doc comment at the top of
+   * THIS file quotes `await import('./index')` while explaining the bug, and
+   * `workspace-idle.test.ts:44` quotes it too — both were reported as loads
+   * occurring before their (real, correctly placed) stub registration.
+   */
+  function stripComments(src: string): string {
+    return src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[ \t]*\/\/.*$/gm, '');
+  }
+
+  const testFiles = readdirSync(testDir)
+    .filter((name) => name.endsWith('.test.ts'))
+    .sort();
+  const sources = new Map(
+    testFiles.map((name) => [
+      name,
+      stripComments(readFileSync(join(testDir, name), 'utf8').replace(/\r\n/g, '\n')),
+    ]),
+  );
+  const indexLoaders = testFiles.filter((name) => LOADS_INDEX.test(sources.get(name)!));
+
+  it('found the test files and the ./index loaders among them — an empty scan is a false green', () => {
+    // A scan that matched nothing would pass every assertion below vacuously.
+    expect(testFiles.length).toBeGreaterThan(20);
+    expect(testFiles).toContain('index.test.ts');
+    expect(indexLoaders.length).toBeGreaterThanOrEqual(5);
+    // The five known at the time of writing; a sixth is welcome, a missing one
+    // means the matcher stopped seeing a real import.
+    for (const known of [
+      'desktop-release.test.ts',
+      'index.test.ts',
+      'route-auth.test.ts',
+      'workspace-flush-loop.test.ts',
+      'workspace-idle.test.ts',
+    ]) {
+      expect(indexLoaders).toContain(known);
+    }
+  });
+
+  it('discriminates — a test file that never loads ./index is not counted as one that does', () => {
+    // Negative control for the matcher itself: `twen.test.ts` imports only
+    // `./twen`, so a matcher that simply matched every file would fail here.
+    expect(sources.has('twen.test.ts')).toBe(true);
+    expect(indexLoaders).not.toContain('twen.test.ts');
+    // Negative control for `stripComments`, which the ordering check below
+    // depends on: a `./index` load QUOTED IN PROSE is not a load, and a stub
+    // registration quoted in prose is not a registration. Both spellings
+    // really do occur in these files.
+    const prose = [
+      "// running this file alone failed every `await import('./index')`",
+      "/* we used to rely on mock.module('cloudflare:workers') elsewhere */",
+    ].join('\n');
+    expect(LOADS_INDEX.test(prose)).toBe(true);
+    expect(REGISTERS_STUB.test(prose)).toBe(true);
+    expect(LOADS_INDEX.test(stripComments(prose))).toBe(false);
+    expect(REGISTERS_STUB.test(stripComments(prose))).toBe(false);
+  });
+
+  it('🔴 every ./index loader registers the stub ITSELF, textually before its first load', () => {
+    const offenders = indexLoaders
+      .map((name) => {
+        const src = sources.get(name)!;
+        const stubAt = src.search(REGISTERS_STUB);
+        const loadAt = src.search(LOADS_INDEX);
+        if (stubAt === -1) return `${name}: loads ./index but never registers cloudflare:workers`;
+        if (stubAt > loadAt) return `${name}: registers the stub AFTER its first ./index load`;
+        return null;
+      })
+      .filter((problem): problem is string => problem !== null);
+    expect(offenders).toEqual([]);
+  });
+
+  it('🔴 so does the file that loads the SDK chunk directly instead of through ./index', () => {
+    // `app-preview-port-validation.test.ts` imports the hashed
+    // `@cloudflare/sandbox` chunk by path to reach the SDK's own
+    // `validatePort()`. It never touches `./index`, so the check above cannot
+    // see it, but it hits the identical `cloudflare:workers` import — it
+    // supplies the specifier through a bun `plugin()` rather than
+    // `mock.module()`, and both are accepted above.
+    const src = sources.get('app-preview-port-validation.test.ts');
+    expect(src).toBeDefined();
+    expect(REGISTERS_STUB.test(src!)).toBe(true);
   });
 });
