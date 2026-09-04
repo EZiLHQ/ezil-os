@@ -147,7 +147,11 @@ describe('GET /os', () => {
         // before its icons".
         expect(html).toContain(`<script src="${OS_ASSET_PATHS.icons}" defer></script>`);
         expect(html).toContain(`<script src="${OS_ASSET_PATHS.bundle}" defer></script>`);
-        expect(html).not.toContain('async');
+        // Matched as an ATTRIBUTE on a script tag, not as a substring: `async`
+        // is four characters that will one day appear in a description, a class
+        // or a comment, and an assertion that goes red for an unrelated edit
+        // teaches people to delete it.
+        expect(html).not.toMatch(/<script[^>]*\basync\b/);
     });
 
     it('renders the mount point the shell adopts', async () => {
