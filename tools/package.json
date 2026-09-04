@@ -1,0 +1,9 @@
+{
+	"name": "@ezil-os/tools",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"test": "bun test",
+		"typecheck": "tsc --noEmit -p tsconfig.json"
+	}
+}
