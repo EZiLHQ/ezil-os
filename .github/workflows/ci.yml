@@ -283,7 +283,30 @@ jobs:
           done
       # PLAYWRIGHT_REQUIRE_DIR is exported to $GITHUB_ENV by the Setup
       # Playwright step above — no env: block needed here.
-      - name: Shell real-browser suites
+      # Two families. The PORTABLE suites assert behaviour (focus, stacking,
+      # paint order, a mobile keyboard) and run on every OS. The GEOMETRY suites
+      # assert pixel deltas and settle times of a real Chromium and were designed
+      # and measured on Linux; on macOS Chromium the same shell settles at 1919px
+      # instead of 1920 and a minimise/restore cycle differs by 5-6px (PR #14,
+      # fourth run) — rendering-platform noise, not a product defect, and a
+      # threshold tuned per OS would measure nothing. They run on the Linux leg
+      # only, by a STEP-level condition (a job-level `if:` would drop the check
+      # run the ruleset requires). A geometry claim that must hold on macOS or
+      # Windows belongs in a suite written and measured there.
+      - name: Shell real-browser suites (portable)
+        shell: bash
+        run: |
+          set -e
+          for t in shell/touch-focus-browser-test.mjs \
+                   shell/ezil/apps/os-chrome-browser-test.mjs \
+                   shell/ezil/apps/mobile-browser-test.mjs \
+                   shell/ezil/ui/Settings/stacking-browser-test.mjs \
+                   shell/ezil/ui/Settings/late-focus-browser-test.mjs; do
+            echo "── $t"
+            node "$t"
+          done
+      - name: Shell real-browser suites (geometry — Linux only)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -e
@@ -291,13 +314,8 @@ jobs:
                    shell/seam-minimise-browser-test.mjs \
                    shell/window-chrome-browser-test.mjs \
                    shell/phone-stacking-browser-test.mjs \
-                   shell/touch-focus-browser-test.mjs \
-                   shell/ezil/apps/os-chrome-browser-test.mjs \
-                   shell/ezil/apps/mobile-browser-test.mjs \
                    shell/ezil/apps/overlay-paint-browser-test.mjs \
-                   shell/ezil/apps/resize-test.mjs \
-                   shell/ezil/ui/Settings/stacking-browser-test.mjs \
-                   shell/ezil/ui/Settings/late-focus-browser-test.mjs; do
+                   shell/ezil/apps/resize-test.mjs; do
             echo "── $t"
             node "$t"
           done
