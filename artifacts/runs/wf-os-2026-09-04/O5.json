@@ -1,0 +1,10 @@
+{
+  "taskId": "O5",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "COMMITTED",
+  "evidence": "Interim verification pass started; worktree O5 at 4b05869 (origin/main). Re-running every kit, package, local-mode, CI and governance check from scratch; no number copied from a log. Counts land in docs/CONFIDENCE-MAP.md as they are measured.",
+  "startedAt": "2026-09-04T12:32:18Z",
+  "updatedAt": "2026-09-04T12:32:18Z",
+  "notes": "INTERIM pass — to be re-run after row R2's founder-present release."
+}
