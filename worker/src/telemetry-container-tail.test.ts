@@ -22,20 +22,43 @@
  * `emit_telemetry()` lifted verbatim out of `scripts/start-neko.sh`, so a
  * change to that `printf` format is caught here rather than in production.
  *
- * ── One test, not the file, is Linux-only ───────────────────────────────────
- * `containerTelemetryTailCommand` (`./telemetry.ts`) shells out to `wc -c`
- * and `tail -c`, which are POSIX and portable, but reads the inode with
- * `stat -c %i` — GNU coreutils only; BSD/macOS `stat` uses `-f %i`, has no
- * `-c`, and the command's own `2>/dev/null || echo 0` fallback turns that
- * into a silent, wrong-but-not-crashing `inode=0`. MEASURED (not assumed): a
- * stub `stat` on PATH that rejects `-c` the way BSD stat does reproduces
- * EXACTLY the "reports the file size and inode" failure below and no other —
- * 12 pass / 1 fail, matching PR #14's macOS run for that one test. The other
- * two macOS failures in this file's eighth run are NOT reproduced by the
- * inode difference alone and are left ungated below: gating them as
- * "Linux-only" without a measured cause would be the same dishonesty this
- * gate exists to prevent, just inverted (see the M3 report for the open
- * question).
+ * ── Three tests, not the file, are GNU-coreutils-only ───────────────────────
+ * `containerTelemetryTailCommand` (`./telemetry.ts`) is a command for the
+ * CONTAINER — Ubuntu, GNU coreutils — and these three tests are the ones that
+ * run it for real and then depend on its metadata line parsing. Two GNU-isms
+ * bite when the same string is handed to a Mac's own shell:
+ *
+ *   * `wc -c < file` — GNU prints the count bare; BSD/macOS RIGHT-ALIGNS it in
+ *     a space-padded field, so the emitted line is `... bytes=       42
+ *     inode=0`. `CONTAINER_TELEMETRY_META_RE` anchors `bytes=(\d+)` and the
+ *     padding sits INSIDE the line, where the parser's `head.trim()` cannot
+ *     reach it, so the meta line does not parse at all. The parser then
+ *     degrades exactly as designed (whole stdout treated as the tail, no
+ *     offset) — which is correct behaviour and makes all three assertions
+ *     false: `tail.raw.startsWith('{')`, `startByteOffset > 0`, and stable
+ *     event ids across re-reads.
+ *   * `stat -c %i` — GNU only; BSD `stat` has no `-c` and the command's own
+ *     `2>/dev/null || echo 0` turns that into a silent `inode=0`.
+ *
+ * MEASURED, not assumed, on this Linux box with stubs on PATH:
+ *   * `stat` alone (rejects -c, usage to stderr, exit 1) -> 12 pass / 1 fail —
+ *     only "reports the file size and inode". This is what M3 measured, and it
+ *     is why M3 could gate one test and had to leave two running.
+ *   * `wc` alone (delegates the count, reprints it as `printf '%8d'`) ->
+ *     10 pass / 3 fail — ALL THREE, by the same names as the real macOS leg.
+ *   * both together -> 10 pass / 3 fail, identical.
+ * PR #14's eighth run, macOS (job 100991453440), failed exactly these three.
+ * So the open question M3 recorded is answered: it is `wc`, not `stat`, and
+ * the two "unexplained" failures were never a second mechanism.
+ *
+ * The command is not wrong — it never runs anywhere but inside the image. What
+ * is not portable is executing a container command against a BSD userland, so
+ * these three are gated on the userland, and the other ten (parser contract,
+ * degradation, id derivation from literal fixtures) keep running everywhere.
+ *
+ * A portable `containerTelemetryTailCommand` would let all thirteen run on a
+ * Mac — `wc -c ... | tr -d ' '` is the whole change — but `./telemetry.ts` is
+ * not this row's to edit; see the M4 report's hand-off.
  */
 import { describe, expect, it, beforeEach, afterEach } from 'bun:test';
 import { spawnSync } from 'node:child_process';
@@ -43,17 +66,20 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-/** Why the inode assertion below may not run here. `null` means it CAN. Same
+/** Why three assertions below may not run here. `null` means they CAN. Same
  *  idiom as `./browser-sidecar.container.test.ts`'s `SKIP_REASON`. */
 const LINUX_ONLY_REASON = process.platform === 'linux'
     ? null
-    : `containerTelemetryTailCommand reads the inode with GNU \`stat -c %i\`, which falls back to `
-    + `a wrong-but-silent 0 on ${process.platform} (BSD stat has no -c); not meaningful there`;
+    : `containerTelemetryTailCommand is a GNU-coreutils command for the container image: BSD `
+    + `\`wc -c\` space-pads its count (so the bytes=/inode= meta line does not parse) and BSD `
+    + `\`stat\` has no -c (so inode degrades to 0). Both MEASURED with stubs on Linux; running `
+    + `the container's command against ${process.platform}'s userland is not meaningful`;
 
 if (LINUX_ONLY_REASON) {
     console.warn(
         `\n${'='.repeat(78)}\n`
-        + `SKIPPING one test in the container-tail suite: ${LINUX_ONLY_REASON}.\n`
+        + `SKIPPING three tests in the container-tail suite: ${LINUX_ONLY_REASON}.\n`
+        + `The other ten (parser contract, degradation, id derivation) still run.\n`
         + `${'='.repeat(78)}\n`,
     );
 }
@@ -134,7 +160,7 @@ describe('container NDJSON tail — the real command against a real file', () =>
     expect(events).toEqual([]);
   });
 
-  it('🔴 gives a re-read line the SAME eventId, and only the new lines new ids', () => {
+  itIf('🔴 gives a re-read line the SAME eventId, and only the new lines new ids', () => {
     emit('container_start', 'ok', 312);
     emit('workspace_mount', 'skipped', 0);
     emit('ready', 'ok', 21900);
@@ -167,7 +193,7 @@ describe('container NDJSON tail — the real command against a real file', () =>
     expect(events[0]!.eventId).not.toBe(events[1]!.eventId);
   });
 
-  it('🔴 keeps ids stable once the file outgrows the 64 KiB window and the tail slides', () => {
+  itIf('🔴 keeps ids stable once the file outgrows the 64 KiB window and the tail slides', () => {
     // Fill past the window with real producer lines, then read, append, re-read.
     const filler = Buffer.alloc(MAX_BYTES, 'x').toString();
     writeFileSync(logPath, `# ${filler}\n`); // non-JSON prologue: dropped by the parser, still shifts offsets
