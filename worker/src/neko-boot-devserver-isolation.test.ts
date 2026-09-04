@@ -37,6 +37,15 @@
  * `bash` and `python3` (the latter is already a hard runtime dependency of
  * `start-devserver.sh`'s placeholder mode and is installed by the Dockerfile).
  * No Docker, no X server, no neko binary.
+ *
+ * That is necessary but not sufficient: `supervise_app`
+ * (`scripts/start-neko.sh:1536`) launches every app — the dev server
+ * included — under `setsid`, which is util-linux and absent on macOS/BSD. PR
+ * #14 eighth run: the 3 tests in the BEHAVIOURAL describe below (the ones
+ * that actually spawn the script) failed on macOS for that reason; the
+ * source-text describe at the bottom of this file needs neither `setsid` nor
+ * a spawned script and is left running everywhere (ORCHESTRATION-LOG.md, row
+ * M3).
  */
 
 import { afterEach, describe, expect, it } from 'bun:test';
@@ -45,6 +54,30 @@ import { connect } from 'node:net';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+/** Why the BEHAVIOURAL describe below may not run here. `null` means it CAN.
+ *  Same idiom as `./browser-sidecar.container.test.ts`'s `SKIP_REASON`. The
+ *  source-text describe at the bottom of this file does not use this — it
+ *  needs neither `setsid` nor a spawned script. */
+const LINUX_ONLY_REASON = process.platform === 'linux'
+    ? null
+    : `executes scripts/start-neko.sh's boot sequence for real, which launches the dev server (and `
+    + `every other app) under \`setsid\` (util-linux) — not present on ${process.platform}; not `
+    + `meaningful there`;
+
+if (LINUX_ONLY_REASON) {
+    console.warn(
+        `\n${'='.repeat(78)}\n`
+        + `SKIPPING the dev-server-isolation BEHAVIOURAL suite: ${LINUX_ONLY_REASON}.\n`
+        + `Nothing about whether a hung dev server can block the desktop from becoming\n`
+        + `ready has been verified by this run — see this file's own header. The\n`
+        + `source-text describe below still runs: it asserts on scripts/start-neko.sh's\n`
+        + `own bytes and needs no script execution.\n`
+        + `${'='.repeat(78)}\n`,
+    );
+}
+
+const describeIf = LINUX_ONLY_REASON ? describe.skip : describe;
 
 const START_NEKO = join(import.meta.dir, '..', 'scripts', 'start-neko.sh');
 
@@ -223,7 +256,7 @@ function bootWithDevserver (devserverBody: string): Harness {
     return harness;
 }
 
-describe('start-neko.sh: the dev server cannot block the desktop', () => {
+describeIf('start-neko.sh: the dev server cannot block the desktop', () => {
     it('binds neko even when the dev-server launcher never returns', async () => {
         // The worst case the old ordering could not survive: a launcher that
         // hangs forever. A real `bun install` on a cold Next project is the

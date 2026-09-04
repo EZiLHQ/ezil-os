@@ -13,6 +13,17 @@
  *
  * Host requirements: bash only. No Docker, no X server, no neko binary —
  * same class of test as `neko-teardown-orphans.test.ts`'s own doc comment.
+ *
+ * MEASURED, and that comment is wrong: the block opens with
+ * `BOOT_T0_MS="$(date +%s%3N)"`, and `%3N` (milliseconds) is a GNU `date`
+ * extension — BSD/macOS `date` has no `%N` at all, so `BOOT_T0_MS` is not a
+ * clean integer there and every downstream `phase_end` duration computed
+ * from it is unreliable. PR #14 eighth run: 7 of this file's 8 tests failed
+ * on macOS for that reason. The 8th, `BOTH-DIRECTIONS: removing the
+ * emit_telemetry call…`, only asserts that the NDJSON file was NOT created —
+ * true whether the mutated script exits cleanly or aborts on bad arithmetic
+ * — so it is genuinely OS-agnostic and stays running (ORCHESTRATION-LOG.md,
+ * row M3).
  */
 
 import { describe, expect, it } from 'bun:test';
@@ -20,6 +31,25 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+/** Why the real-NDJSON-content tests below may not run here. `null` means
+ *  they CAN. Same idiom as `./browser-sidecar.container.test.ts`'s
+ *  `SKIP_REASON`. The BOTH-DIRECTIONS test at the end does not use this. */
+const LINUX_ONLY_REASON = process.platform === 'linux'
+    ? null
+    : `the boot-phase-logging block opens with `
+    + `\`date +%s%3N\` — %N (milliseconds) is a GNU date extension, absent on ${process.platform}; `
+    + `not meaningful there`;
+
+if (LINUX_ONLY_REASON) {
+    console.warn(
+        `\n${'='.repeat(78)}\n`
+        + `SKIPPING 7 of 8 tests in the telemetry-emit suite: ${LINUX_ONLY_REASON}.\n`
+        + `${'='.repeat(78)}\n`,
+    );
+}
+
+const itIf = LINUX_ONLY_REASON ? it.skip : it;
 
 const START_NEKO_PATH = join(import.meta.dir, '..', 'scripts', 'start-neko.sh');
 const START_MARKER = 'BOOT_T0_MS="$(date +%s%3N)"';
@@ -71,7 +101,7 @@ function runAndReadTelemetry(driver: string): string[] {
 }
 
 describe('emit_telemetry() / phase_end() in scripts/start-neko.sh — real bash execution', () => {
-  it('writes one boot_phase NDJSON line per successful (non-"ready") phase', () => {
+  itIf('writes one boot_phase NDJSON line per successful (non-"ready") phase', () => {
     const lines = runAndReadTelemetry('phase_start xvfb\nphase_end xvfb ok\n');
     expect(lines).toHaveLength(1);
     const row = JSON.parse(lines[0]) as Record<string, unknown>;
@@ -85,7 +115,7 @@ describe('emit_telemetry() / phase_end() in scripts/start-neko.sh — real bash 
     expect(typeof row.durationMs).toBe('number');
   });
 
-  it('writes outcome=error (never silently "ok") for a failed phase', () => {
+  itIf('writes outcome=error (never silently "ok") for a failed phase', () => {
     const lines = runAndReadTelemetry('phase_start codeserver_launch\nphase_end codeserver_launch error\n');
     const row = JSON.parse(lines[0]) as Record<string, unknown>;
     expect(row.outcome).toBe('error');
@@ -93,13 +123,13 @@ describe('emit_telemetry() / phase_end() in scripts/start-neko.sh — real bash 
     expect(row.eventClass).toBe('boot_phase');
   });
 
-  it('writes outcome=skipped for a skipped phase (e.g. workspace_hydration with no delivery)', () => {
+  itIf('writes outcome=skipped for a skipped phase (e.g. workspace_hydration with no delivery)', () => {
     const lines = runAndReadTelemetry('phase_start workspace_hydration\nphase_end workspace_hydration skipped\n');
     const row = JSON.parse(lines[0]) as Record<string, unknown>;
     expect(row.outcome).toBe('skipped');
   });
 
-  it('classifies the "ready" phase as boot_summary — the denominator every other query divides by', () => {
+  itIf('classifies the "ready" phase as boot_summary — the denominator every other query divides by', () => {
     const lines = runAndReadTelemetry('phase_end ready ok\n');
     const row = JSON.parse(lines[0]) as Record<string, unknown>;
     expect(row.eventClass).toBe('boot_summary');
@@ -107,14 +137,14 @@ describe('emit_telemetry() / phase_end() in scripts/start-neko.sh — real bash 
     expect(row.outcome).toBe('ok');
   });
 
-  it('emits the boot_summary on a FAILED ready too — success and failure both reach the file', () => {
+  itIf('emits the boot_summary on a FAILED ready too — success and failure both reach the file', () => {
     const lines = runAndReadTelemetry('phase_end ready error\n');
     const row = JSON.parse(lines[0]) as Record<string, unknown>;
     expect(row.eventClass).toBe('boot_summary');
     expect(row.outcome).toBe('error');
   });
 
-  it('appends one line per phase_end call, preserving order across a real multi-phase boot', () => {
+  itIf('appends one line per phase_end call, preserving order across a real multi-phase boot', () => {
     const lines = runAndReadTelemetry(
       ['phase_start xvfb', 'phase_end xvfb ok', 'phase_start openbox', 'phase_end openbox ok', 'phase_end ready ok'].join(
         '\n',
@@ -125,7 +155,7 @@ describe('emit_telemetry() / phase_end() in scripts/start-neko.sh — real bash 
     expect(sites).toEqual(['xvfb', 'openbox', 'ready']);
   });
 
-  it('never fails the boot when the NDJSON path is unwritable (|| true)', () => {
+  itIf('never fails the boot when the NDJSON path is unwritable (|| true)', () => {
     // Point at a directory that does not exist and is never created — the
     // append must fail silently, and the driver script itself must still
     // exit 0 (a broken telemetry sink must never fail a boot).
