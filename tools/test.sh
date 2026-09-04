@@ -488,11 +488,13 @@ all)
     # named in the verdict rather than counted as a pass or a failure.
     FAILED_PKGS=()
     ABSENT_PKGS=()
+    RAN_PKGS=()
     for pkg in "${ALL_PACKAGES[@]}"; do
         if [ ! -d "$TREE/$pkg" ]; then
             ABSENT_PKGS+=("$pkg")
             continue
         fi
+        RAN_PKGS+=("$pkg")
         run_one "$pkg" || FAILED_PKGS+=("$pkg")
     done
     line ""
@@ -503,7 +505,10 @@ all)
         say "FAILED: ${FAILED_PKGS[*]}"
         exit 1
     fi
-    say "all packages passed: ${ALL_PACKAGES[*]}"
+    # Only the packages that RAN. Naming the absent ones here as if they had
+    # passed is the same lie this whole file exists to refuse, and the first
+    # draft of this line made it.
+    say "passed: ${RAN_PKGS[*]:-<nothing ran>}"
     exit 0
     ;;
 *)
