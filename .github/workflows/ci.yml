@@ -144,13 +144,26 @@ jobs:
         working-directory: worker
         run: bun run typecheck
       - name: Unit tests
-        # Linux only: these suites EXECUTE the container's Ubuntu boot scripts
-        # (start-neko.sh, emit_telemetry, the NDJSON tail) for real — PR #14, eighth
-        # run: 227 of them fail on macOS for exactly that reason. They are Linux tests
-        # of a Linux container; the typecheck above runs on every OS. Row M3 makes
-        # them self-skip with a printed reason so a Mac contributor's `bun test` is
-        # honest too. Step-level, so the check run the ruleset requires still exists.
-        if: runner.os == 'Linux'
+        # Runs on all three OSes as of row M4. PR #14's eighth run had 227 macOS
+        # failures and this step was gated to Linux while they were understood.
+        # They were two things, both now fixed or gated with a MEASURED cause:
+        #   * 205 were one missing line. `index.test.ts` loaded `./index` without
+        #     registering the workerd-only `cloudflare:workers` specifier, which
+        #     bun resolves on NO platform; it passed only when the filesystem's
+        #     directory order happened to put a file that DID register it first.
+        #     On APFS it went first instead, and bun then served that same
+        #     rejection to the four files that were correct. A source pin in
+        #     `index.test.ts` now refuses any `./index` loader without a stub.
+        #   * 22 were suites executing the container's Ubuntu boot scripts, or
+        #     GNU-coreutils commands, against a BSD userland. Row M3 gated most;
+        #     row M4 gated the last three (BSD `wc -c` space-pads its count, so
+        #     the tail's `bytes=` meta line does not parse — measured with a stub
+        #     on Linux, 10 pass / 3 fail, the same three names as the macOS leg).
+        # Windows additionally needed CRLF: `.gitattributes` says `* text=auto`, so
+        # a Windows checkout writes `.ts` with CRLF and the multi-line source-text
+        # regexes in `index.test.ts` (8 failures, PR #14 run 44) and
+        # `workspace-idle.test.ts` (2, found by converting the package and running
+        # it) stopped matching. Both files now normalise line endings on read.
         shell: bash
         working-directory: worker
         # Container tests skip themselves when Docker has no image (or, on
@@ -168,21 +181,20 @@ jobs:
         # XML lists every test regardless of outcome; exit code is unchanged
         # by adding a second reporter (measured: still 0 on pass, nonzero on
         # any failure).
-        run: bun test --reporter=junit --reporter-outfile=/tmp/worker-junit.xml
+        run: bun test --reporter=junit --reporter-outfile=worker-junit.xml
       # Prints exactly the evidence this row's verify_cmd asks for, without
       # dumping the full (much larger) JUnit report into the log.
       - name: Show the bash -n file list (verify_cmd evidence)
-        # Linux only: these suites EXECUTE the container's Ubuntu boot scripts
-        # (start-neko.sh, emit_telemetry, the NDJSON tail) for real — PR #14, eighth
-        # run: 227 of them fail on macOS for exactly that reason. They are Linux tests
-        # of a Linux container; the typecheck above runs on every OS. Row M3 makes
-        # them self-skip with a printed reason so a Mac contributor's `bun test` is
-        # honest too. Step-level, so the check run the ruleset requires still exists.
-        if: runner.os == 'Linux'
+        # Runs on all three OSes as of row M4, same as the step above.
         shell: bash
+        # Same working directory as the step that wrote it: the report path is
+        # relative, because `/tmp` is not a location bun (a native Windows binary,
+        # resolving it against the current drive) and Git Bash (MSYS, mapping it
+        # into the user's temp) agree on.
+        working-directory: worker
         run: |
           echo "bash -n was run, this leg (${{ runner.os }}), against:"
-          grep -oE '<testcase name="[^"]*parses under `bash -n`"' /tmp/worker-junit.xml \
+          grep -oE '<testcase name="[^"]*parses under `bash -n`"' worker-junit.xml \
             | sed -E 's/^<testcase name="//; s/"$//'
 
   app:
