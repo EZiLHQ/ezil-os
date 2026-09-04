@@ -92,3 +92,48 @@ taken the desktop down before.
   container images that pull in third-party binaries), update
   `ATTRIBUTIONS.md` in the same PR — under-crediting an upstream project
   is treated as a bug here, not a nitpick.
+
+## Dependency updates
+
+Dependabot (`.github/dependabot.yml`) opens two different kinds of PR, and
+they're handled differently:
+
+- **Minor/patch groups** (the `patch-and-minor` group PR in each project)
+  merge once CI is green and one maintainer has actually read the diff —
+  no auto-merge, this repo is solo-maintained and `main` requires a human
+  in the loop.
+- **Major version bumps are never opened by Dependabot** — every npm/bun
+  entry in `dependabot.yml` ignores `version-update:semver-major`. A major
+  is opened by hand instead, as its own PR linked to a tracked issue that
+  carries a migration note: what changed upstream, what in this repo
+  depends on the old behavior, and what was checked before merging. This
+  isn't extra ceremony for its own sake — the maintainer is solo, the
+  deploy pipeline is tag-triggered straight off `main`, and a bad major
+  landed unattended has no safety net.
+
+As of this writing there are six deferred majors, each already open as a
+hand-reviewed Dependabot PR. Anyone picking one up should check:
+
+- **eslint 9 → 10** (`/app`) — flat-config changes; confirm
+  `app/eslint.config.*` still loads and `bun run lint` is clean, not just
+  non-erroring.
+- **motion 11 → 13** (`/app`) — API changes in the `motion` package
+  (formerly Framer Motion); grep call sites and check the changelog for
+  renamed/removed exports before bumping.
+- **zod 3 → 4** (`/app`) — `app/package.json` pins `zod ^3`, `mcp/package.json`
+  is already on `zod ^4`; taking this bump in `app` is what actually aligns
+  them, but `drizzle-zod` (`^0.6.0` in `app`) must support the zod 4 you land
+  on first. `sdk/src/surface.test.ts` parses `app/src/server/api/routers/*.ts`
+  directly as a drift guard — re-run it after the bump, it's the cheapest
+  check that the routers still parse the way the SDK expects.
+- **sonner 1 → 2** (`/app`) — check the toast API surface used in `app/`
+  against sonner's v2 migration notes before bumping.
+- **typescript 5.9 → 7.0** (`/worker`) — TypeScript 7 is the Go-based
+  compiler rewrite (tsgo), not an incremental release; `worker/tsconfig.json`
+  has never been checked against it. Run `bun run typecheck` in `worker/`
+  and expect to find compiler-option or diagnostic differences, not just a
+  clean pass/fail.
+- **@cloudflare/workers-types 4 → 5** (`/worker`) — check compatibility
+  against the pinned `@cloudflare/sandbox` version (`0.12.1`, see
+  `dependabot.yml` and `ATTRIBUTIONS.md`) before bumping; a types major can
+  break a dependency that itself isn't moving.
