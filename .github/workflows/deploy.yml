@@ -350,6 +350,14 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
+          # NOT lockfile-pinned, unlike the `worker` job's own `npx wrangler
+          # deploy` (that job's comment: "it is a devDependency of worker/,
+          # so the lockfile already pins it"). This job never checks out or
+          # installs worker/, so there is no lockfile to pin against here —
+          # `@4` is a manual major-version pin instead, matching the `app`
+          # job's `vercel@59` convention. Acceptable because this step is
+          # non-gating: a bad wrangler release here degrades a release-notes
+          # line, not the deploy `verify` already proved.
           if [[ -n "${CLOUDFLARE_API_TOKEN}" && -n "${CLOUDFLARE_ACCOUNT_ID}" ]]; then
             out="$(npx --yes wrangler@4 deployments list --name ezil-os-worker 2>&1 | head -20)" || out="(wrangler deployments list failed — see the run log)"
           else
