@@ -101,14 +101,23 @@ export class LocalComputerState {
         return computer;
     }
 
-    /** The id, without consuming the `isNew` latch. Every route's gate reads this. */
-    id(): string {
+    /**
+     * The computer as a READ reports it: `isNew` is always false and the latch
+     * is untouched. Split from `snapshot()` because a status poll or a
+     * rehydrate must not spend the one "this boot created it" answer.
+     */
+    read(): ShellBootComputer {
         return buildLocalComputer({
             workspacePath: this.workspacePath,
             createdAt: this.createdAt,
             lastOpenedAt: this.lastOpenedAt,
             isNew: false,
-        }).id;
+        });
+    }
+
+    /** The id, without consuming the `isNew` latch. Every route's gate reads this. */
+    id(): string {
+        return this.read().id;
     }
 
     markOpened(now = Date.now()): void {
@@ -201,6 +210,7 @@ export async function startLocalServer(options: LocalServerOptions): Promise<Loc
         // `LocalComputerState` stays the one owner of that latch.
         computerId: () => computerState.id(),
         bootComputer: () => computerState.snapshot(),
+        readComputer: () => computerState.read(),
         markOpened: () => computerState.markOpened(),
         recordActivity: (ago) => computerState.recordActivity(ago),
         appendTelemetry,

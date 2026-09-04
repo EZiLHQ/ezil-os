@@ -121,8 +121,24 @@ export interface ShellRouterDeps {
      * told the workspace is brand new.
      */
     readonly computerId: () => string;
-    /** The full computer, for the two routes that actually emit a payload. Consumes the `isNew` latch. */
+    /**
+     * The full computer for a GET-OR-CREATE answer. Consumes the `isNew` latch,
+     * because this is the call that would have created the row.
+     */
     readonly bootComputer: () => ShellBootComputer;
+    /**
+     * The full computer for a READ-ONLY answer.
+     *
+     * 🔴 MUST NOT CONSUME THE `isNew` LATCH. `GET /api/shell/session` never
+     * creates anything (the hosted route passes `isNew: false` outright —
+     * `app/src/app/api/shell/session/route.ts:61`), so a read arriving before
+     * the first POST must not burn the one moment the shell is allowed to be
+     * told the workspace is brand new. Getting this wrong is silent: the boot
+     * that really did create the workspace then reports `isNew: false`, and the
+     * shell can no longer tell an expected-empty workspace from a lost one
+     * (`boot-payload.ts`, and docs/RUNBOOK.md A2).
+     */
+    readonly readComputer: () => ShellBootComputer;
     /** Record that the desktop was opened. Moves `lastOpenedAt`. */
     readonly markOpened: () => void;
     /** Record presence. In memory only — local mode has no idle reaper to feed (`sandbox-host.ts` NON_GOALS: `schedule`). */
@@ -190,11 +206,14 @@ export function shellRoutes(): Readonly<Record<string, ShellRoute>> {
  */
 async function handleSession(req: Request, deps: ShellRouterDeps): Promise<Response> {
     if (req.method === 'GET') {
-        const computer = deps.bootComputer();
-        // `isNew` is FALSE on the read path, exactly as the hosted GET does
-        // (`toShellBootComputer(lowest, false)`): reading a session never
-        // created anything, so it can never be the boot that did.
-        return shellJson(buildLocalSessionPayload({ ...computer, isNew: false }));
+        // 🔴 `readComputer`, NOT `bootComputer`. `isNew` is false on the read
+        // path, exactly as the hosted GET does
+        // (`toShellBootComputer(lowest, false)`) — reading a session never
+        // created anything, so it can never be the boot that did — AND the read
+        // must not SPEND the latch either. Sharing the consuming accessor here
+        // meant a status poll or a rehydrate arriving before the first
+        // get-or-create silently turned the real `isNew: true` into `false`.
+        return shellJson(buildLocalSessionPayload(deps.readComputer()));
     }
     deps.markOpened();
     return shellJson(buildLocalBootPayload(deps.bootComputer()));
