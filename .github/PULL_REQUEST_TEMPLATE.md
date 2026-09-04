@@ -8,6 +8,16 @@
      evidence — say which suites, and against what. If you could not verify
      something, say that instead; an honest gap is more useful than a claim. -->
 
+## Linked issue
+
+<!-- `Closes #123` if this finishes the issue, or `Part of #123` if it's one
+     piece of a larger change. Leave blank if there isn't one. -->
+
+## Size
+
+<!-- XS / S / M / L / XL — see CONTRIBUTING.md, "How big a pull request
+     should be". A size over ~400 changed lines will be asked to split. -->
+
 ## Checklist
 
 - [ ] Commits are signed off (`git commit -s`) — see [CONTRIBUTING.md](../CONTRIBUTING.md#sign-off-dco).
