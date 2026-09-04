@@ -1,0 +1,10 @@
+{
+  "taskId": "O1",
+  "runId": "wf-os-2026-09-04",
+  "status": "done",
+  "doneRung": "COMMITTED",
+  "evidence": "six agent definitions under .claude/agents with full model ids + effort; .gitignore rewritten to .claude/* + !.claude/agents/ + .claude/worktrees/; git check-ignore -v .claude/agents/verifier.md prints nothing; .claude/worktrees/x still ignored (line 47); docs/TASKS.csv seeded with 24 rows",
+  "startedAt": "2026-09-04T07:15:00Z",
+  "updatedAt": "2026-09-04T07:22:00Z",
+  "by": "supervisor"
+}

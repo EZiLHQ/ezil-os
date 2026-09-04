@@ -38,7 +38,13 @@ app/tsconfig.tsbuildinfo
 # OS / editor cruft
 .DS_Store
 *.log
-.claude/
+# Agent definitions are COMMITTED (transparency: the models, effort levels and
+# mandatory rules every worker runs under are part of the public record).
+# Worktrees and any other per-machine agent state stay ignored. A trailing-slash
+# `.claude/` rule would stop git descending and no negation could rescue it.
+.claude/*
+!.claude/agents/
+.claude/worktrees/
 
 # Local agent/tunnel state — machine-specific, never publishable
 .openclaw-forwards.json
