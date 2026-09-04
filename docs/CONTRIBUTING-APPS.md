@@ -61,7 +61,7 @@ the `AppDescriptor`.
 
 These are functional glyphs, not a brand mark — the file says so directly:
 "These are FUNCTIONAL app glyphs — a globe, a cog, `</>`, an eye. None of them
-is, and none of them may become, an EZiL brand mark" (`registry.js:151-153`).
+is, and none of them may become, an EZiL brand mark" (`registry.js:155-157`).
 
 ## Shell-local vs. hosted — the two-sided handshake
 
@@ -77,7 +77,7 @@ of `registry.js`:
 Concretely, `resolve(payload)` (`registry.js:491-515`) reads
 `payload.apps` — the boot payload's app list — and keeps an entry only if its
 `id` is in that list, **unless** the entry declares `shell_local: true`, in
-which case it is kept unconditionally (`registry.js:502-503`). The server side
+which case it is kept unconditionally (`registry.js:499`). The server side
 of that list is `SHELL_APPS` in
 [`app/src/server/shell/boot-payload.ts`](../app/src/server/shell/boot-payload.ts):
 
@@ -157,7 +157,7 @@ just inverted. Always pass one of the three literal strings.
   `open()` resolves would time a boot that had not actually finished — this
   was a real, measured bug: "real desktop opens of 11150ms and 3631ms each
   produced `durationMs=22`/`12` and an `ok` outcome for an open that... went
-  on to fail" (`registry.js:222-227`). So for these apps, `launch()` hands the
+  on to fail" (`registry.js:644-647`). So for these apps, `launch()` hands the
   app `ctx.trace = { step, end }` and the app itself calls `ctx.trace.end(...)`
   once it reaches its **own** terminal state — see `preview.js`'s
   `trace.end('ok')` the moment its frame is confirmed, or `trace.end('error')`
@@ -202,7 +202,7 @@ Z-order in this shell is decided by **focus**, not by any per-window counter.
 of a two-tier band — see below), which overrides `UIWindow`'s own inline
 value; the rule that actually orders windows is "focused = highest,
 unfocused = one below" (`registry.js`'s `ensureOnTop()` doc block,
-`registry.js:527-529`). Whichever window is focused *last* wins.
+`registry.js:530-533`). Whichever window is focused *last* wins.
 
 **Why `ensureOnTop()` exists** (`registry.js:553-576`): a window's own
 focus is not always applied synchronously — `$.fn.showWindow` focuses on an
@@ -220,7 +220,7 @@ yourself; it is part of `launch()`, not part of your `open()`.
 **The phone/tablet band.** On a phone or tablet, every `.window` still gets
 the flat `9999999 !important`, but it is split into two tiers along
 `.window-active` — the class `focusWindow` puts on exactly one window
-(`shell/src/css/style.css:727-795`, the "PHONE/TABLET WINDOW BAND" comment
+(`shell/src/css/style.css:730-795`, the "PHONE/TABLET WINDOW BAND" comment
 block, and the rule immediately below it):
 
 ```css
@@ -293,7 +293,7 @@ hydrated.** The host page marks its mount point
 `data-awaits-hydration="react"` and dispatches an `ezil:hydrated` event from a
 client effect (`boot.js:103-108`); `boot.js` waits for that event before doing
 anything to the DOM. The wait is capped
-(`HYDRATION_CAP_MS = 3_000`, `boot.js:124`) so a page whose React never loads
+(`HYDRATION_CAP_MS = 3_000`, `boot.js:129`) so a page whose React never loads
 still gets an OS — accepting a possible wipe past that point, which a
 separate rebuild guard (`ensure_intact`, referenced at `boot.js:110-113`)
 then repairs. If your app's `open()` runs during this window (it normally
@@ -368,7 +368,7 @@ nothing ever executes.
 (concatenation in a fixed order, then `clean-css`), and `icons.js` (generated
 data-URI map) — via `shell/build-shell.sh`. These artifacts are **committed**,
 not built by the app at deploy time, "so the app needs no shell build step,
-and so `--check` has something to diff" (`shell/build-shell.sh:18-19`).
+and so `--check` has something to diff" (`shell/build-shell.sh:15-16`).
 
 After any change under `shell/`, run:
 
@@ -391,7 +391,7 @@ fails the build on any drift.
 chrome and leaves resize handles mispositioned" (`shell/build-shell.sh:48-59`).
 If your app ships its own stylesheet under `shell/ezil/`, it is picked up by
 the trailing, sorted `find "$here/ezil" -name '*.css'` clause
-(`shell/build-shell.sh:78`) and loads after every Puter-derived sheet and
+(`shell/build-shell.sh:77`) and loads after every Puter-derived sheet and
 every EZiL override — you do not need to touch `css_inputs()` unless your
 sheet is not under `shell/ezil/` or `shell/src/`.
 

@@ -30,7 +30,7 @@ import UIWindow from '../../src/UI/UIWindow.js';
 // `export`. A real entry does not duplicate this function: it adds one more
 // call beside DESKTOP_ICON/SETTINGS_ICON/PREVIEW_ICON/CODE_ICON
 // (registry.js:203-259), inside registry.js itself.
-const GLYPH = '#f5f5f4'; // registry.js's own brand off-white, registry.js:157-158
+const GLYPH = '#f5f5f4'; // registry.js's own brand off-white, registry.js:159-161
 function appIcon (id, from, to, glyph) {
     return 'data:image/svg+xml,' + encodeURIComponent(
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">'
