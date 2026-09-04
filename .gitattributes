@@ -1,0 +1,69 @@
+# EZiL OS — line endings and binary markers.
+#
+# 🔴 WHY THIS FILE EXISTS: `bash -n` under Git Bash on Windows fails on a CRLF
+#    script before anything else in CI gets a chance to. Row T4 adds a Windows
+#    leg to the CI matrix, and without the rules below every `.sh` in this
+#    repository would be checked out with CRLF on that runner (Git for Windows
+#    ships `core.autocrlf=true` by default) and every shell check would fail
+#    with a syntax error that has nothing to do with the script.
+#
+#    Measured on `main` before this file existed: `git ls-files --eol` reports
+#    0 tracked `.sh`, `.mjs` or `.ps1` files with CRLF, and 0 tracked files with
+#    `i/crlf` or `i/mixed` of any kind — every non-`i/lf` entry is a detected
+#    binary. So this file pins the state the repository is already in; adding it
+#    renormalizes nothing and no content changes.
+
+# Let git detect text vs binary, and store text with LF in the index. The
+# explicit rules below override it where detection is not good enough or where
+# the platform-native ending is wrong.
+* text=auto
+
+# ── Scripts: LF, everywhere, always ─────────────────────────────────────────
+# These are executed by bash/node, which do not tolerate a CR before the
+# newline in a shebang line or a heredoc terminator, on any platform.
+*.sh    text eol=lf
+*.bash  text eol=lf
+*.mjs   text eol=lf
+
+# ── PowerShell: CRLF ────────────────────────────────────────────────────────
+# The reverse case, and it is not symmetry for its own sake: Windows PowerShell
+# 5.1 mis-parses some LF-only scripts. There are no `.ps1` files tracked today;
+# the rule is here so the first one added by the Windows CI leg is right on the
+# commit that adds it, rather than after someone debugs it.
+*.ps1   text eol=crlf
+
+# ── Committed build output: never touched ───────────────────────────────────
+# 🔴 THESE THREE ARE BYTE-COMPARED AGAINST A FRESH BUILD.
+#    `shell/build-shell.sh --check` runs `diff -r` between the committed
+#    `app/public/os/` and the output of a fresh esbuild into a temp directory,
+#    because the product rule is that the committed bundle must match its
+#    `shell/` sources. esbuild writes LF. Under `text=auto` with Git for
+#    Windows' default `core.autocrlf=true`, the committed copy would check out
+#    with CRLF and the fresh copy would not, so the check would fail 100% of the
+#    time on the Windows leg — for a reason that has nothing to do with the
+#    shell sources it exists to guard.
+#
+#    `-text` rather than `binary`: `binary` is shorthand for `-diff -merge
+#    -text`, and suppressing the diff on the one file whose whole rule is "must
+#    match its sources" is the opposite of what a reviewer needs. `-text` turns
+#    off end-of-line conversion and nothing else.
+app/public/os/bundle.min.js     -text
+app/public/os/bundle.min.css    -text
+app/public/os/icons.js          -text
+
+# ── Images and media: binary ────────────────────────────────────────────────
+# Covers `docs/assets/*.jpg` (6 files), `worker/assets/neko-branding/www/`
+# (10 PNGs + 1 MP3) and `app/src/app/favicon.ico`. Git already detects all of
+# these; stating it means detection is not the thing standing between a
+# screenshot and a corrupted checkout.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.mp3   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.pdf   binary
