@@ -107,3 +107,13 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   Playwright variable is set (an unescaped `$EZIL_PLAYWRIGHT_DIR` inside a message). Row O3's own `verify_cmd` was a
   coincidence (exit 1 came from the 8 failures, not the guard) — CSV row corrected to the inducing command.
   T3 dispatched (GHCR image chain). Running: T1, T4, T3. Queued: O4.
+- 2026-09-04 13:15Z — **T3 merged**: `docker/neko/{pins.env,build.sh}` (ported from EBuilder; `--dry-run`), `worker/Dockerfile`
+  `ARG NEKO_IMAGE` → `ghcr.io/ezilhq/ezil-neko-vscode:d74052bb-049931d7-ezil-brand8` (the OVERLAY, per T0) and
+  `EXPOSE 8443`; `.github/workflows/image.yml` (neko base + overlay only when the immutable tag is absent from the
+  registry or `rebuild_base` is explicit; desktop image on every main push/tag; cosign keyless; provenance
+  attestations; `cancel-in-progress: false` so a cancel cannot land between push and sign). Local build against the
+  overlay: exit 0 (cache-warm, 4 s), `ExposedPorts` gains `8443/tcp`. Worker found `deploy/images.env` is not
+  shell-sourceable by design (`<to be pinned by CI>`) — the workflow greps it like `parseImagesEnv` does. Row T7 added
+  for the three hand-offs (overlay tag key in images.env; `ghcr.io/m1k1o/neko/base:latest` is a floating base —
+  pin by digest; nothing writes the desktop tag back). The push of this merge triggers image.yml for the first time:
+  its GHCR pushes and signatures are the proof, watched below. O4 dispatched. Running: T1, T4, O4.
