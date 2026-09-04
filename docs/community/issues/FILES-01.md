@@ -27,7 +27,7 @@ holds exactly five files today (`code.js`, `desktop-screen.js`, `desktop-window.
   a plain-text/hex fallback otherwise.
 - Follows the boot-trace contract other apps must honor: it calls `ctx.trace.end` and is
   bounded by the 240s fallback described in `docs/CONTRIBUTING-APPS.md` (once merged — see
-  `../CONTRIBUTING-APPS.md`) so a broken boot reports "don't know", never a false "ready".
+  `../../CONTRIBUTING-APPS.md`) so a broken boot reports "don't know", never a false "ready".
 - A `*-test.mjs` jsdom test against the committed bundle (`shell/build-shell.sh`'s output),
   plus a `*-browser-test.mjs` if the app has real geometry (window sizing, list virtualization).
 - `shell/build-shell.sh --check` passes with the new app's bundle committed.
@@ -59,5 +59,5 @@ passes with zero skips.
 ---
 
 Want to work on this? Comment on the issue to claim it, then read
-[How to send a pull request](../../CONTRIBUTING.md#how-to-send-a-pull-request) and
-[Building an app for the desktop](../CONTRIBUTING-APPS.md).
+[How to send a pull request](../../../CONTRIBUTING.md#how-to-send-a-pull-request) and
+[Building an app for the desktop](../../CONTRIBUTING-APPS.md).

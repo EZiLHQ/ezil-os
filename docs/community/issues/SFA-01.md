@@ -63,5 +63,5 @@ None. This is the prerequisite for `FILES-01`, `PDF-01`, `SHEET-01`, `DOC-01` an
 ---
 
 Want to work on this? Comment on the issue to claim it (72-hour lazy consensus — see
-[Picking something up](../../CONTRIBUTING.md#how-to-send-a-pull-request) in CONTRIBUTING),
-then read [How to send a pull request](../../CONTRIBUTING.md#how-to-send-a-pull-request).
+[Picking something up](../../../CONTRIBUTING.md#how-to-send-a-pull-request) in CONTRIBUTING),
+then read [How to send a pull request](../../../CONTRIBUTING.md#how-to-send-a-pull-request).

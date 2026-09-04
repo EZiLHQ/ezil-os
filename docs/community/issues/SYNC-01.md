@@ -57,4 +57,4 @@ None.
 ---
 
 Want to work on this? Comment on the issue to claim it, then read
-[How to send a pull request](../../CONTRIBUTING.md#how-to-send-a-pull-request).
+[How to send a pull request](../../../CONTRIBUTING.md#how-to-send-a-pull-request).

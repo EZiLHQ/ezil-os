@@ -46,5 +46,5 @@ fetched blob, not a raw file-API URL leaking through) passes with zero skips.
 ---
 
 Want to work on this? Comment on the issue to claim it, then read
-[How to send a pull request](../../CONTRIBUTING.md#how-to-send-a-pull-request) and
-[Building an app for the desktop](../CONTRIBUTING-APPS.md).
+[How to send a pull request](../../../CONTRIBUTING.md#how-to-send-a-pull-request) and
+[Building an app for the desktop](../../CONTRIBUTING-APPS.md).
