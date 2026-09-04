@@ -135,3 +135,11 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   new packages are private (GHCR default) and this session's token has no packages scope — visibility to Public is a
   founder step (added to the founder-run script). T3 recorded at DEPLOYED; TARGET_ENVIRONMENT_CONFIRMED needs the
   anonymous pull and `gh attestation verify` to pass.
+- 2026-09-04 15:40Z — **T4 returned; its proof is PR #14** (`task/T4` → main): 4 jobs × 3 OS + `tools`, `container`,
+  `local`. Measured by the worker: under Git for Windows' default `autocrlf`, `shell/src/**/*.css`, `*.svg` and the
+  non-`.mjs` shell JS check out CRLF because T0's `.gitattributes` does not pin them, so the bundle-diff step (only
+  that step) is gated off Windows with the measurement in its comment — hand-off for `.gitattributes`. The `local`
+  job's skip detector originally failed OPEN on reporter drift (advisor-caught; now a positive control). Row T8 added:
+  wire `container`/`local` to pull the GHCR image with the workflow's own token and retire the placeholder. The
+  15 matrix display names for G4 are in T4's report and PR #14's check list. A1 dispatched (allowlist schema +
+  invite CLI). Running: O4, T5, A1.
