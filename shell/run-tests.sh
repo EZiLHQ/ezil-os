@@ -17,13 +17,14 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # 🔴 THE ONE RULE THIS FILE EXISTS TO ENFORCE: EXIT 2 IS *SKIPPED*, NOT PASSED
 # ═══════════════════════════════════════════════════════════════════════════
-# Twelve of these suites are REAL-BROWSER tests that need `playwright`, which
-# is deliberately NOT a project dependency and appears in no lockfile. Every
-# one of them exits **2** when playwright (or the built bundle) cannot be
-# resolved. A runner that treats "not 1" as "pass" would report a fully green
-# run on a machine where TWELVE suites never started a browser — which is
-# exactly the false-green this repository has already been bitten by more than
-# once.
+# Every suite that needs a real browser (currently every `*-browser-test.mjs`,
+# plus `resize-test.mjs` — see "SUITE DISCOVERY" below for how that is decided)
+# needs `playwright`, which is deliberately NOT a project dependency and
+# appears in no lockfile. Every one of them exits **2** when playwright (or the
+# built bundle) cannot be resolved. A runner that treats "not 1" as "pass"
+# would report a fully green run on a machine where every real-browser suite
+# never started a browser — which is exactly the false-green this repository
+# has already been bitten by more than once.
 #
 # So: exit 0 = PASS, exit 1 = FAIL, exit 2 = SKIP, anything else = FAIL.
 # A suite file that is not in this worktree yet is ALSO a skip, for the same
@@ -69,10 +70,28 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # WHAT IS AND IS NOT RUN
 # ═══════════════════════════════════════════════════════════════════════════
-# By default: `build-shell.sh --check` (fail-fast on bundle drift), then the
-# 12 node-only shell suites, then the 12 browser suites. That is the whole of
+# By default: `build-shell.sh --check` (fail-fast on bundle drift), then every
+# node-only shell suite, then every real-browser suite. That is the whole of
 # `shell/` except the cost probes, which are behind `--cost` and are NOT tests
 # — see that block for why, and for the known-red state of the one that exists.
+#
+# 🔴 THE SUITE LIST IS DISCOVERED, NOT HAND-MAINTAINED. Earlier versions of
+# this file called `run_suite` once per suite from a hand-typed list below, and
+# that list silently fell behind the tree: `shell/responsiveness-browser-test.mjs`
+# existed and CI ran it (in `ci.yml`'s "geometry" step, 20/20 on `main`), while
+# this script never had a line for it — so `./tools/test.sh shell` ran a
+# strictly smaller set than CI did, and nobody could tell just by reading this
+# file. Now: every `shell/**/*-test.mjs` (excluding `node_modules`) is found on
+# disk and classified as node-only or real-browser — see "SUITE DISCOVERY"
+# below — so a new suite file is picked up the moment it lands, with no edit to
+# this script required. `--list` prints exactly what was discovered, one per
+# line, and exits 0, for exactly this reason: "is my new suite actually going
+# to run" is answerable without reading this file at all.
+#
+# `--family portable|geometry|all` (default `all`) mirrors the OS split
+# `.github/workflows/ci.yml`'s `shell` job uses for its real-browser suites —
+# see "CI FAMILY SPLIT" below. `all` runs every discovered suite regardless of
+# family, same as this script has always defaulted to.
 #
 # The `worker/` (bun test) and `app/` (vitest) suites are NOT run by default,
 # behind `--all`. That is a deliberate decision, not an oversight:
@@ -86,7 +105,7 @@
 # or `app/node_modules` is missing (it is, in a fresh git worktree) the run is
 # reported as a SKIP naming the `bun install` to run, never as a failure.
 #
-# The 11 node-only shell suites need `shell/node_modules` for `jsdom`:
+# The node-only shell suites need `shell/node_modules` for `jsdom`:
 # `cd shell && bun install`. This script does not do that either, for the same
 # reason; without it those suites fail on the import rather than skipping,
 # because jsdom is a declared dependency and its absence is a broken checkout,
@@ -94,6 +113,54 @@
 #
 # `shell/ezil/ui/Settings/computers-drift.test.tsx` is a vitest file, not a
 # `.mjs` suite, and is part of the `app` vitest project; it runs under `--app`.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# SUITE-SPECIFIC HISTORY (kept for context — these notes used to sit right
+# above each suite's own `run_suite` line; now that the list is generated,
+# they live here instead)
+# ═══════════════════════════════════════════════════════════════════════════
+# `shell/ezil/boot-test.mjs` needs MORE THAN 120s. At 120s it is killed
+#   mid-run and looks like a hang; MEASURED green well inside 300s (177s here).
+#   Its 420s budget below must not be lowered.
+# `shell/ezil/apps/desktop-close-test.mjs` is the close/release suite (28
+#   checks, node-only, drives the built bundle). It landed from a sibling
+#   worktree; this file used to skip it cleanly while it existed only there.
+# `shell/ezil/apps/mobile-browser-test.mjs` is the only suite in this tree
+#   that runs with hasTouch/isMobile and a phone UA; see its own header for
+#   why that matters.
+#
+# ✅ THE W5/W7 INTENT CONFLICT RECORDED HERE IS RESOLVED (V1, Phase 2).
+# The block that used to sit here described a suite that was 26/26 on W5's own
+# branch and 9/24-plus-an-uncaught-timeout after the merge, and escalated the
+# choice rather than making it. The coordinator's decision, now implemented:
+#
+#   • W7's behaviour STANDS. A phone window has no live resize handles and
+#     an app-bearing phone window is full-bleed. Nothing in `.device-*` or in
+#     `set_device_class` was weakened to make W5's suite pass.
+#   • W5's HARNESS adapted. `touch-focus-browser-test.mjs` now pins
+#     `device-desktop` — 1024x844 plus one narrowly-scoped `(pointer: coarse)`
+#     override — while keeping `hasTouch: true`, so every tap is still real
+#     Chromium touch input. See that file's own header for exactly what is and
+#     is not pinned. 28/28 (its original 26 plus two setup checks that assert
+#     the pin, so it cannot silently drift back to the wrong device class).
+#
+# WHO OWNS WHAT NOW, so the split is not rediscovered the hard way:
+#   • `shell/touch-focus-browser-test.mjs`      — the BINDING MECHANICS of
+#     §7.1 at desktop-class layout: one tap reaches a defocused iframe,
+#     pointerdown + mousedown = ONE focus, the titlebar / resize-handle /
+#     app-drawer bindings, and the `UIContextMenu` pointer-events restore path.
+#   • `shell/ezil/apps/mobile-browser-test.mjs`  — the PHONE-LAYOUT
+#     ACCEPTANCE: one tap reaches the stream at a real phone viewport with a
+#     real phone UA, under W7's full-bleed layout. Nothing was lost by moving
+#     the suite above to desktop class; this is where that claim lives.
+#   • `shell/phone-stacking-browser-test.mjs`   — STACKING at the touch
+#     device classes.
+# Window stacking at `device-phone` / `device-tablet` — the classes W7's
+# widened detection made reachable from an ordinary desktop session, and the
+# only ones `ezil/ui/Settings/stacking-browser-test.mjs` (five DESKTOP
+# viewports, no touch) has never covered. Added with the fix to the flat
+# `.device-* .window { z-index: 9999999 !important }` band; red on the pre-fix
+# sheet (25/38, exit 1), green on this one (38/38).
 
 set -uo pipefail
 
@@ -107,6 +174,8 @@ RUN_CHECK=1
 RUN_COST=0
 STRICT=0
 ONLY=""
+FAMILY="all"
+LIST_ONLY=0
 
 usage () {
     cat <<'EOF'
@@ -120,6 +189,15 @@ shell/run-tests.sh — run every EZiL-OS shell suite and print one honest verdic
                   not a suite: read its medians, it has no threshold.
   --strict        exit non-zero if ANY suite SKIPPED (use this in CI)
   --only <sub>    run only suites whose path contains <sub>
+  --family <f>    all (default) | portable | geometry — restrict the
+                  real-browser suites to the OS family `.github/workflows/
+                  ci.yml`'s `shell` job runs them under. Node-only suites are
+                  unaffected. A suite `ci.yml` classifies into neither family
+                  is an ERROR under `--family portable`/`--family geometry`
+                  (not a silent skip) — see "CI FAMILY SPLIT" in this file.
+  --list          print the suites this invocation would run, one per line
+                  (honouring --only and --family), and exit 0. Does not run
+                  anything, including the bundle-drift gate.
   -h, --help      this text
 
 Exit codes: 0 = no failures. 1 = at least one failure (or, with --strict, at
@@ -143,11 +221,170 @@ while [ $# -gt 0 ]; do
         --cost)     RUN_COST=1 ;;
         --strict)   STRICT=1 ;;
         --only)     shift; ONLY="${1:-}" ;;
+        --family)   shift; FAMILY="${1:-all}" ;;
+        --list)     LIST_ONLY=1 ;;
         -h|--help)  usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 64 ;;
     esac
     shift
 done
+
+case "$FAMILY" in
+    all|portable|geometry) ;;
+    *)
+        echo "unknown --family: $FAMILY (expected: all, portable, geometry)" >&2
+        exit 64
+        ;;
+esac
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUITE DISCOVERY
+# ═══════════════════════════════════════════════════════════════════════════
+# Every `*-test.mjs` under `shell/` (excluding anything under a `node_modules`
+# directory) is a suite. Classified as real-browser or node-only by WHAT IT
+# REQUIRES, not by its name: `*-browser-test.mjs` is the naming convention
+# every suite so far has followed, but `resize-test.mjs` needs playwright too
+# without following it, so the real test is whether the file itself resolves
+# `$PLAYWRIGHT_REQUIRE_DIR` (every real-browser suite in this tree does,
+# MEASURED by grep across all of them — see the mutation proof in this row's
+# report for the check). A suite matching neither test is node-only.
+#
+# bash 3.2 (this script also runs on macOS in CI) has no `mapfile`; a plain
+# `while read` loop over `find` is the portable substitute.
+is_browser_suite () {
+    local rel="$1"
+    case "$rel" in
+        *-browser-test.mjs) return 0 ;;
+    esac
+    grep -q 'PLAYWRIGHT_REQUIRE_DIR' "$ROOT/$rel" 2>/dev/null
+}
+
+NODE_SUITES=()
+BROWSER_SUITES=()
+while IFS= read -r abs; do
+    [ -n "$abs" ] || continue
+    rel="${abs#"$ROOT"/}"
+    if is_browser_suite "$rel"; then
+        BROWSER_SUITES+=("$rel")
+    else
+        NODE_SUITES+=("$rel")
+    fi
+done < <(find "$HERE" \( -name node_modules -type d \) -prune -o -type f -name '*-test.mjs' -print | sort)
+
+# ── per-suite time budgets ──────────────────────────────────────────────────
+# bash 3.2 has no `declare -A` (this script runs on macOS too), so a `case` on
+# the suite's basename is the associative-map substitute. Anything not listed
+# gets the family default: 120s for a node/jsdom suite, 300s for a
+# real-browser one. Every override below is MEASURED, not a guess — see
+# "SUITE-SPECIFIC HISTORY" above and each suite's own header comment.
+default_budget () {
+    if is_browser_suite "$1"; then echo 300; else echo 120; fi
+}
+
+suite_budget () {
+    local base
+    base="$(basename "$1")"
+    case "$base" in
+        boot-test.mjs)                    echo 420 ;;
+        desktop-close-test.mjs)           echo 300 ;;
+        settings-test.mjs)                echo 180 ;;
+        code-test.mjs)                     echo 180 ;;
+        preview-focus-test.mjs)            echo 180 ;;
+        registry-trace-test.mjs)           echo 180 ;;
+        os-chrome-browser-test.mjs)        echo 420 ;;
+        stacking-browser-test.mjs)         echo 600 ;;
+        resize-test.mjs)                   echo 420 ;;
+        mobile-browser-test.mjs)           echo 420 ;;
+        touch-focus-browser-test.mjs)      echo 420 ;;
+        phone-stacking-browser-test.mjs)   echo 420 ;;
+        *) default_budget "$1" ;;
+    esac
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CI FAMILY SPLIT
+# ═══════════════════════════════════════════════════════════════════════════
+# `.github/workflows/ci.yml`'s `shell` job splits real-browser suites into two
+# per-OS legs: PORTABLE (behaviour — focus, stacking, paint order, a mobile
+# keyboard — every OS) and GEOMETRY (pixel deltas and settle times of a real
+# Chromium, designed and measured on Linux; on macOS Chromium the same shell
+# settles at 1919px instead of 1920 and a minimise/restore cycle differs by
+# 5-6px — rendering-platform noise, not a product defect — so GEOMETRY runs on
+# the Linux leg only). The two arrays below are a literal copy of ci.yml's two
+# `for t in ...` lists ("Shell real-browser suites (portable)" and "... —
+# Linux only)", currently ci.yml:387-391 and :400-404 — match by step name if
+# the line numbers have drifted since.
+#
+# 🔴 THESE MUST AGREE WITH `ci.yml` BY HAND. There is no automated check that
+# diffs this copy against the workflow file — a test doing that belongs beside
+# whoever owns `.github/workflows/ci.yml`, and is out of this file's
+# `owns_files`; HAND-OFF. If ci.yml's two lists change, update these two
+# arrays in the same PR.
+#
+# 🔴 A `*-browser-test.mjs` IN NEITHER LIST IS AN ERROR, NOT A SILENT SKIP.
+# MEASURED: `shell/ezil/display-notice-browser-test.mjs`,
+# `shell/ezil/launcher-toggle-browser-test.mjs` and
+# `shell/ezil/context-menu-stack-browser-test.mjs` are real suites in this tree
+# that `ci.yml` does not name in EITHER list — so neither OS family in CI runs
+# them today. `--family all` (the default) still runs them, unfiltered, same
+# as always. `--family portable` / `--family geometry` refuse to guess which
+# family such a suite belongs to: each one is reported as a FAILURE naming the
+# gap, never silently dropped and never silently included. HAND-OFF: `ci.yml`
+# needs to add these three suites to one of its two `for` loops.
+GEOMETRY_SUITES=(
+    "shell/responsiveness-browser-test.mjs"
+    "shell/seam-minimise-browser-test.mjs"
+    "shell/window-chrome-browser-test.mjs"
+    "shell/phone-stacking-browser-test.mjs"
+    "shell/ezil/apps/overlay-paint-browser-test.mjs"
+    "shell/ezil/apps/resize-test.mjs"
+)
+PORTABLE_SUITES=(
+    "shell/touch-focus-browser-test.mjs"
+    "shell/ezil/apps/os-chrome-browser-test.mjs"
+    "shell/ezil/apps/mobile-browser-test.mjs"
+    "shell/ezil/ui/Settings/stacking-browser-test.mjs"
+    "shell/ezil/ui/Settings/late-focus-browser-test.mjs"
+)
+
+# suite_family <relpath> -> "portable", "geometry", or "" (unclassified)
+suite_family () {
+    local rel="$1" x
+    for x in "${GEOMETRY_SUITES[@]}"; do
+        [ "$x" = "$rel" ] && { echo geometry; return; }
+    done
+    for x in "${PORTABLE_SUITES[@]}"; do
+        [ "$x" = "$rel" ] && { echo portable; return; }
+    done
+    echo ""
+}
+
+# suite matches --only, or --only was not given
+matches_only () {
+    [ -z "$ONLY" ] && return 0
+    case "$1" in
+        *"$ONLY"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ── --list: print and exit before touching playwright or the bundle ────────
+if [ "$LIST_ONLY" = 1 ]; then
+    if [ "$FAMILY" = "all" ]; then
+        for f in ${NODE_SUITES[@]+"${NODE_SUITES[@]}"}; do
+            matches_only "$f" && echo "$f"
+        done
+    fi
+    for f in ${BROWSER_SUITES[@]+"${BROWSER_SUITES[@]}"}; do
+        matches_only "$f" || continue
+        if [ "$FAMILY" = "all" ]; then
+            echo "$f"
+        else
+            [ "$(suite_family "$f")" = "$FAMILY" ] && echo "$f"
+        fi
+    done
+    exit 0
+fi
 
 # ── playwright resolution ──────────────────────────────────────────────────
 DEFAULT_PW_DIR="${EZIL_PLAYWRIGHT_DIR:-}"
@@ -244,14 +481,15 @@ run_suite () {
 echo "${C_B}EZiL-OS shell test run${C_0}   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "  root:       $ROOT"
 echo "  playwright: $PW_NOTE"
+echo "  family:     $FAMILY"
 echo "  logs:       $LOGDIR"
 echo
 
 # ── gate 0: bundle drift ───────────────────────────────────────────────────
-# Every `*-test.mjs` under shell/ tests the COMMITTED bundle in
-# `app/public/os`, not the sources. If the bundle has drifted from source,
-# every result below is about code that is not the code in the tree, so this
-# is fail-fast rather than just another suite.
+# Every `*-test.mjs` this script discovers under shell/ tests the COMMITTED
+# bundle in `app/public/os`, not the sources. If the bundle has drifted from
+# source, every result below is about code that is not the code in the tree,
+# so this is fail-fast rather than just another suite.
 if [ "$RUN_CHECK" = "1" ]; then
     echo "${C_B}[gate] shell/build-shell.sh --check${C_0}"
     if "$HERE/build-shell.sh" --check >"$LOGDIR/build-check.log" 2>&1; then
@@ -266,27 +504,31 @@ if [ "$RUN_CHECK" = "1" ]; then
     echo
 fi
 
+# ── the ci.yml drift warning, printed once, for a real run only ────────────
+ORPHAN_SUITES=()
+for f in ${BROWSER_SUITES[@]+"${BROWSER_SUITES[@]}"}; do
+    [ -z "$(suite_family "$f")" ] && ORPHAN_SUITES+=("$f")
+done
+if [ "${#ORPHAN_SUITES[@]}" -gt 0 ]; then
+    echo "${C_FAIL}${C_B}  DRIFT: ${#ORPHAN_SUITES[@]} real-browser suite(s) are in NEITHER of ci.yml's${C_0}"
+    echo "${C_FAIL}${C_B}  'portable'/'geometry' lists (see CI FAMILY SPLIT above):${C_0}"
+    for o in "${ORPHAN_SUITES[@]}"; do echo "${C_FAIL}    - $o${C_0}"; done
+    echo "${C_FAIL}  --family all still runs them, unfiltered. --family portable/geometry cannot${C_0}"
+    echo "${C_FAIL}  select a suite this script cannot place, and will FAIL rather than guess.${C_0}"
+    echo
+fi
+
 # ═══════════════════════════════════════════════════════════════════════════
 # The node-only suites (jsdom / pure function). No browser, no playwright.
 # ═══════════════════════════════════════════════════════════════════════════
-echo "${C_B}[1/2] node-only suites (12)${C_0}"
-run_suite "shell/load-test.mjs"                          120 node "$HERE/load-test.mjs"
-run_suite "shell/ezil/trace-test.mjs"                    120 node "$HERE/ezil/trace-test.mjs"
-run_suite "shell/ezil/log-test.mjs"                      120 node "$HERE/ezil/log-test.mjs"
-run_suite "shell/ezil/telemetry-test.mjs"                120 node "$HERE/ezil/telemetry-test.mjs"
-run_suite "shell/ezil/activity-heartbeat-test.mjs"       120 node "$HERE/ezil/activity-heartbeat-test.mjs"
-run_suite "shell/ezil/ui/app-spinner-test.mjs"           120 node "$HERE/ezil/ui/app-spinner-test.mjs"
-run_suite "shell/ezil/ui/Settings/settings-test.mjs"     180 node "$HERE/ezil/ui/Settings/settings-test.mjs"
-run_suite "shell/ezil/apps/code-test.mjs"                180 node "$HERE/ezil/apps/code-test.mjs"
-run_suite "shell/ezil/apps/preview-focus-test.mjs"       180 node "$HERE/ezil/apps/preview-focus-test.mjs"
-run_suite "shell/ezil/apps/registry-trace-test.mjs"      180 node "$HERE/ezil/apps/registry-trace-test.mjs"
-# 🔴 boot-test needs MORE THAN 120s. At 120s it is killed mid-run and looks
-# like a hang; MEASURED green well inside 300s (177s here). Do not lower this.
-run_suite "shell/ezil/boot-test.mjs"                     420 node "$HERE/ezil/boot-test.mjs"
-# W4's close/release suite (28 checks, node-only, drives the built bundle).
-# Registered here on W4's request; not this file's to edit. Skips cleanly while
-# it is still only in W4's worktree.
-run_suite "shell/ezil/apps/desktop-close-test.mjs"       300 node "$HERE/ezil/apps/desktop-close-test.mjs"
+echo "${C_B}[1/2] node-only suites (${#NODE_SUITES[@]})${C_0}"
+if [ "$FAMILY" = "all" ]; then
+    for f in ${NODE_SUITES[@]+"${NODE_SUITES[@]}"}; do
+        run_suite "$f" "$(suite_budget "$f")" node "$ROOT/$f"
+    done
+else
+    echo "  (skipped: --family $FAMILY restricts this run to real-browser suites)"
+fi
 echo
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -294,56 +536,23 @@ echo
 # bundle is unresolvable, and that 2 is a SKIP above. So is a suite whose file
 # is not in this worktree yet — several are owned by sibling agents.
 # ═══════════════════════════════════════════════════════════════════════════
-echo "${C_B}[2/2] real-browser suites (12)${C_0}"
-run_suite "shell/window-chrome-browser-test.mjs"                   300 node "$HERE/window-chrome-browser-test.mjs"
-run_suite "shell/seam-minimise-browser-test.mjs"                   300 node "$HERE/seam-minimise-browser-test.mjs"
-run_suite "shell/ezil/display-notice-browser-test.mjs"             300 node "$HERE/ezil/display-notice-browser-test.mjs"
-run_suite "shell/ezil/launcher-toggle-browser-test.mjs"            300 node "$HERE/ezil/launcher-toggle-browser-test.mjs"
-run_suite "shell/ezil/context-menu-stack-browser-test.mjs"         300 node "$HERE/ezil/context-menu-stack-browser-test.mjs"
-run_suite "shell/ezil/apps/overlay-paint-browser-test.mjs"         300 node "$HERE/ezil/apps/overlay-paint-browser-test.mjs"
-run_suite "shell/ezil/apps/os-chrome-browser-test.mjs"             420 node "$HERE/ezil/apps/os-chrome-browser-test.mjs"
-run_suite "shell/ezil/ui/Settings/stacking-browser-test.mjs"       600 node "$HERE/ezil/ui/Settings/stacking-browser-test.mjs"
-run_suite "shell/ezil/apps/resize-test.mjs"                        420 node "$HERE/ezil/apps/resize-test.mjs"
-# The phone-viewport suite. It is the only suite in this tree that runs with
-# hasTouch/isMobile and a phone UA; see its own header for why that matters.
-run_suite "shell/ezil/apps/mobile-browser-test.mjs"                420 node "$HERE/ezil/apps/mobile-browser-test.mjs"
-# W5's touch-focus suite (needs playwright, exits 2 on skip).
-# Registered here on W5's request; not this file's to edit.
-#
-# ✅ THE W5/W7 INTENT CONFLICT RECORDED HERE IS RESOLVED (V1, Phase 2).
-# The block that used to sit here described a suite that was 26/26 on W5's own
-# branch and 9/24-plus-an-uncaught-timeout after the merge, and escalated the
-# choice rather than making it. The coordinator's decision, now implemented:
-#
-#   • W7's behaviour STANDS. A phone window has no live resize handles and
-#     an app-bearing phone window is full-bleed. Nothing in `.device-*` or in
-#     `set_device_class` was weakened to make W5's suite pass.
-#   • W5's HARNESS adapted. `touch-focus-browser-test.mjs` now pins
-#     `device-desktop` — 1024x844 plus one narrowly-scoped `(pointer: coarse)`
-#     override — while keeping `hasTouch: true`, so every tap is still real
-#     Chromium touch input. See that file's own header for exactly what is and
-#     is not pinned. 28/28 (its original 26 plus two setup checks that assert
-#     the pin, so it cannot silently drift back to the wrong device class).
-#
-# WHO OWNS WHAT NOW, so the split is not rediscovered the hard way:
-#   • `shell/touch-focus-browser-test.mjs`      — the BINDING MECHANICS of
-#     §7.1 at desktop-class layout: one tap reaches a defocused iframe,
-#     pointerdown + mousedown = ONE focus, the titlebar / resize-handle /
-#     app-drawer bindings, and the `UIContextMenu` pointer-events restore path.
-#   • `shell/ezil/apps/mobile-browser-test.mjs`  — the PHONE-LAYOUT
-#     ACCEPTANCE: one tap reaches the stream at a real phone viewport with a
-#     real phone UA, under W7's full-bleed layout. Nothing was lost by moving
-#     the suite above to desktop class; this is where that claim lives.
-#   • `shell/phone-stacking-browser-test.mjs`   — STACKING at the touch
-#     device classes (new; see below).
-run_suite "shell/touch-focus-browser-test.mjs"                     420 node "$HERE/touch-focus-browser-test.mjs"
-# Window stacking at `device-phone` / `device-tablet` — the classes W7's
-# widened detection made reachable from an ordinary desktop session, and the
-# only ones `ezil/ui/Settings/stacking-browser-test.mjs` (five DESKTOP
-# viewports, no touch) has never covered. Added with the fix to the flat
-# `.device-* .window { z-index: 9999999 !important }` band; red on the pre-fix
-# sheet (25/38, exit 1), green on this one (38/38).
-run_suite "shell/phone-stacking-browser-test.mjs"                  420 node "$HERE/phone-stacking-browser-test.mjs"
+echo "${C_B}[2/2] real-browser suites (${#BROWSER_SUITES[@]})${C_0}"
+for f in ${BROWSER_SUITES[@]+"${BROWSER_SUITES[@]}"}; do
+    if [ "$FAMILY" != "all" ]; then
+        if [ -n "$ONLY" ] && [[ "$f" != *"$ONLY"* ]]; then
+            continue
+        fi
+        fam="$(suite_family "$f")"
+        if [ -z "$fam" ]; then
+            FAILED+=("$f")
+            SUMMARY+=("${C_FAIL}FAIL${C_0}    $f -> unclassified: not in ci.yml's portable or geometry list; --family $FAMILY cannot select it (see DRIFT above)")
+            printf '%s\n' "${C_FAIL}FAIL${C_0}     $f  ${C_DIM}(unclassified — an error, not a skip; see DRIFT above)${C_0}"
+            continue
+        fi
+        [ "$fam" = "$FAMILY" ] || continue
+    fi
+    run_suite "$f" "$(suite_budget "$f")" node "$ROOT/$f"
+done
 echo
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -351,8 +560,8 @@ echo
 # ═══════════════════════════════════════════════════════════════════════════
 # 🔴 `shell/ezil/display-gate-cost.mjs` is a BENCHMARK, not a suite: its own
 # header calls it a cost probe for PLATFORM-NOTES §16c, it takes `SAMPLES`, and
-# it reports medians rather than checks. It is deliberately not one of the 11
-# node suites or the 12 browser suites, and running it by default would be
+# it reports medians rather than checks. It is deliberately not one of the
+# discovered `*-test.mjs` suites above, and running it by default would be
 # wrong twice over — it would add wall time nobody asked for, and its number is
 # a measurement to be read, not a threshold to be passed.
 #
