@@ -164,9 +164,12 @@ typecheck () {
 
 # ── The junit skip table ────────────────────────────────────────────────────
 # Emits, on stdout, tab-separated rows:
-#   TOTAL <n>     the count the report declares on its root element
-#   SEEN  <n>     the count actually attributed to a file below
-#   FILE  <n> <path>
+#   TOTAL <n>          the count the report declares on its root element
+#   SEEN  <n>          the count actually attributed to a file below
+#   FILE  <n> <path>   skipped tests in that file (only when there are some)
+#   TESTS <n> <path>   ALL tests in that file, skipped or not. This is what
+#                      `gate_vacuous_container_passes` needs: a container suite
+#                      with tests and NO skips is the shape it looks for.
 skip_table () {
     awk '
         /<testsuites / {
