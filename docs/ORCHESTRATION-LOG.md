@@ -156,3 +156,8 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   could never run the drift check. Supervisor patch on `task/T4` (054ebf0): both uses become a `read` loop; the
   committed bundle still matches on Linux. `worker/scripts/start-neko.sh` also uses bash-4 builtins but runs only
   inside the Ubuntu container. PR re-running a third time.
+- 2026-09-04 17:15Z — **PR #14 third run:** macOS got past bash 3.2 and died in the icon step — every `icons[]` entry
+  encoded to an empty string because BSD `base64` ignores a positional file (input only via `-i`) and read an empty
+  stdin; the Linux pipeline never showed it. Supervisor patch on `task/T4` (a24b29a): `base64 < "$f"`. Linux output is
+  byte-identical (drift check still matches). Two real cross-OS defects in `shell/build-shell.sh` found by the
+  matrix so far, neither visible on the Linux-only CI that existed before this round. Fourth run in progress.
