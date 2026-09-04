@@ -307,8 +307,9 @@ the roadmap names by product name has gone offline mid-round. A direct
 engine returned as canonical) returned **HTTP 404**, fetched in this session.
 `gh search repos openowl --limit 10`, run in this session, and a follow-up
 `curl -s "https://api.github.com/search/repositories?q=openowl+in:name"`
-(HTTP `200`, `"total_count": 26`) both surface `BlizzHacker/openowl`, whose
-own description states why it exists: *"Fork of OpenOwl by Mihir Kanzariya — MCP server giving any AI
+(HTTP `200`, `"total_count": 26`) both surface
+<https://github.com/BlizzHacker/openowl>, whose own description states why
+it exists: *"Fork of OpenOwl by Mihir Kanzariya — MCP server giving any AI
 assistant eyes and hands on your desktop. Apache-2.0, no account, no
 telemetry. Preserved here after the original repo went offline."* Its README,
 fetched directly, confirms: *"Apache License 2.0 — see `LICENSE` and
@@ -368,9 +369,10 @@ no macOS path at all.
 
 ### macOS — no CUDA, Metal unreachable from a Linux container
 
-Fetched directly (a secondary source, not vendor docs — no first-party Apple
-or Docker page states this as plainly): *"Apple hasn't provided an open GPU
-API for their mandatory Virtualization engine"* — Docker Desktop on macOS
+Fetched directly from `chariotsolutions.com/blog/post/apple-silicon-gpus-docker-and-ollama-pick-two/`
+(a secondary source, not vendor docs — no first-party Apple or Docker page
+states this as plainly): *"Apple hasn't provided an open GPU API for their
+mandatory Virtualization engine"* — Docker Desktop on macOS
 (Apple Silicon or Intel) runs its Linux containers inside Apple's
 `Virtualization.framework`, which does not expose a GPU device to the guest,
 so there is no CUDA (NVIDIA-only, irrelevant on Apple Silicon regardless) and
