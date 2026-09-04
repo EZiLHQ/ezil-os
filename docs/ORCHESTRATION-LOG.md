@@ -54,3 +54,10 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   neko tag lacks the mobile keyboard and the black-picture detector) and `EXPOSE` lacks 8443; T0's `verify_cmd` needs
   `bun install --cwd local` and an installed `app/` (typecheck reaches `drizzle-orm` through the app import).
   `local/node_modules` installed on main (its own lockfile; nothing shared). Running: G2, G3, O3.
+- 2026-09-04 09:50Z — **G3 merged**. The brief said Dependabot commits carry no sign-off; measured on all seven open
+  PRs: they DO (`Signed-off-by: dependabot[bot] <support@github.com>`) with an email that does not match the author,
+  so the bot gate runs before any trailer is read — a harness built from the brief alone stayed green on the wrong
+  design (worker's mutation M2). Third bot found in history (`copilot-swe-agent[bot]`) and allowlisted; merge commits
+  are skipped and printed, because `git rebase --signoff` drops them and `main`'s own merges are unsigned. The check
+  has never run on GitHub: the throwaway-PR proof (red, not pending) is a supervisor step after the first push.
+  T2 dispatched (Docker adapter; must boot the real image on this box). Running: G2, O3, T2.
