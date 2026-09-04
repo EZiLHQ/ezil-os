@@ -107,7 +107,11 @@ emit() {
     --outfile="$dir/bundle.min.js"
 
   local sheets tmpcss
-  mapfile -t sheets < <(css_inputs)
+  # `mapfile` needs bash 4; macOS ships bash 3.2 and this script must run there
+  # (measured on PR #14: `mapfile: command not found`, exit 127). A read loop is
+  # equivalent for paths without newlines, which is every path in this tree.
+  sheets=()
+  while IFS= read -r line; do sheets+=("$line"); done < <(css_inputs)
   tmpcss="$(mktemp)"
   printf '%s\n' "$banner" >"$tmpcss"
   if ((${#sheets[@]})); then
@@ -128,7 +132,8 @@ emit() {
   # Emitted as a *classic* script setting a global, not an ES module, because
   # bundle.min.js is an IIFE and cannot `import` — load icons.js first.
   local icons=() n
-  mapfile -t icons < <(find "$here/src/icons" -type f -not -name '.gitkeep' 2>/dev/null | sort)
+  icons=()
+  while IFS= read -r line; do icons+=("$line"); done < <(find "$here/src/icons" -type f -not -name '.gitkeep' 2>/dev/null | sort)
   echo "[build-shell] icon: ${#icons[@]} file(s) -> $dir/icons.js"
   {
     printf '%s\n' "$banner"
