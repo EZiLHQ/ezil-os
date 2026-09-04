@@ -29,11 +29,15 @@ And the option explicitly **not** to take, also quoted verbatim, as the boundary
 must respect:
 
 > **3. Adopt one of §2's drivers wholesale, pointed at the container's raw X11/VNC/CDP surface
-> instead of the sidecar.** Explicitly the option **not** to take first. ... Using either
-> driver as-is against this OS's desktop would mean opening exactly the passthrough §1
-> documents as deliberately absent. **What would prove it (if ever pursued anyway):** a written
-> exception to `SECURITY.md:74–76`, not a measurement — which is itself the reason it is not
-> the recommendation.
+> instead of the sidecar.** Explicitly the option **not** to take first. This is the ROADMAP
+> text's own warning made concrete by the survey: Agent-S's `exec()` of LLM-generated
+> `pyautogui` code (`cli_app.py:215`) and cua's native XTest/`Input.dispatchMouseEvent` paths
+> both assume unmediated access to the display or the browser's CDP port — the same port
+> `worker/sidecar/README.md` and `SECURITY.md:74–76` name as a finding if reachable outside the
+> fixed verb set. Using either driver as-is against this OS's desktop would mean opening
+> exactly the passthrough §1 documents as deliberately absent. **What would prove it (if ever
+> pursued anyway):** a written exception to `SECURITY.md:74–76`, not a measurement — which is
+> itself the reason it is not the recommendation.
 
 ## Acceptance criteria
 

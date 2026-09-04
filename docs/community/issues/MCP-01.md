@@ -10,8 +10,8 @@ state: open
 
 `worker/sidecar/contract.mjs` pins a closed, ten-route verb set for browser automation
 (`GET /health` plus nine `POST` verbs: `navigate`, `snapshot`, `click`, `type`, `get_text`,
-`screenshot`, `console`, `network`, `wait_for` — `contract.mjs:53-91`), deliberately excluding
-`evaluate`/`raw`/`send`/`cdp`/`exec`/`eval` (`FORBIDDEN_VERBS`, `contract.mjs:33`). The existing
+`screenshot`, `console`, `network`, `wait_for` — `contract.mjs:54-95`), deliberately excluding
+`evaluate`/`raw`/`send`/`cdp`/`exec`/`eval` (`FORBIDDEN_VERBS`, `contract.mjs:36`). The existing
 `mcp/` package (`mcp/src/tools.ts`) wraps the SDK's computer tools but nothing exposes the
 sidecar's browser-automation verbs as their own local MCP tool group, so an agent that wants to
 drive the desktop's browser has no first-class way in.
@@ -44,7 +44,7 @@ half.
 
 ## Where to look
 
-- `worker/sidecar/contract.mjs:24-91` — the pinned `TRANSPORT`, `FORBIDDEN_VERBS`, and
+- `worker/sidecar/contract.mjs:24-30,36,54-95` — the pinned `TRANSPORT`, `FORBIDDEN_VERBS`, and
   `SIDECAR_WIRE` route table this tool group must mirror exactly.
 - `worker/sidecar/README.md` and `SECURITY.md`'s "closed verb allowlist" line — the boundary
   this issue must not cross (no passthrough verb, ever).
