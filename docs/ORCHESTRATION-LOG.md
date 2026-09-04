@@ -79,3 +79,6 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   pins — closed); `CONTRIBUTORS.md` linked a non-existent login; `CODEOWNERS` header claimed approval is required.
   Noted for A2: `app/signup.mjs` is gitignored, never tracked — "delete" is a no-op; the argument stands. Wave 0
   complete. T1 dispatched (local host server). Running: O3, T2, T1.
+- 2026-09-04 11:05Z — **CI green on `main` @ 89c9037** (worker, app, sdk+mcp, shell — all four jobs), CodeQL green.
+  The run on the previous push (2bcf12f) shows `cancelled`: the workflow's per-ref concurrency group cancelled it
+  when the next push arrived, which is the configured behaviour, not a failure.
