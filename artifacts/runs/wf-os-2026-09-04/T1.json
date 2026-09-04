@@ -1,0 +1,9 @@
+{
+  "taskId": "T1",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "INDEPENDENT_TEST_PASS",
+  "evidence": "baseline in worktree task/T1 @ fc6fbcd: bun test local/ = 49 pass / 0 fail, 208 expect() calls, 2 files; bun run --cwd local typecheck clean. Nothing written yet.",
+  "startedAt": "2026-09-04T09:40:00Z",
+  "updatedAt": "2026-09-04T09:40:00Z"
+}
