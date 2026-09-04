@@ -43,11 +43,13 @@ import {
     containerBootCommand,
     formatLocalNekoScreen,
     isDockerTag,
+    isEnvName,
     localUrlFor,
     parseImagesEnv,
     publishedPort,
     resolveDesktopImage,
     type DockerRunSpec,
+    NEKO_IMPLICIT_HOSTING_ENV,
 } from './run-spec.ts';
 import { portFor } from '../../../worker/src/desktop-mode.ts';
 
@@ -142,6 +144,18 @@ describe('docker run argv', () => {
             '--env', 'NEKO_SCREEN=1920x1080x24',
             '--env', 'NEKO_MEMBER_MULTIUSER_USER_PASSWORD=u-pw',
             '--env', 'NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=a-pw',
+            // 🔴 ADDED BY ROW T5. The image's `/etc/neko/neko.yaml` ships
+            // `session.implicit_hosting: false`, and a desktop in that state
+            // renders perfectly while ignoring every click — a state no HTTP
+            // probe in this package can distinguish from a working one. It is
+            // a FALLBACK, not the mechanism: measured, the PINNED image's own
+            // launcher passes `--session.implicit_hosting=true` and an explicit
+            // flag outranks the environment, so this is inert there and
+            // load-bearing only on an image whose launcher does not. See
+            // `NEKO_IMPLICIT_HOSTING_ENV` in `./run-spec.ts` for all three
+            // measurements, and `DockerHost.readControlMode` for the read-back
+            // that is the actual evidence.
+            '--env', 'NEKO_SESSION_IMPLICIT_HOSTING=true',
             '--env', 'NEKO_WEBRTC_UDPMUX=52100',
             '--env', 'NEKO_WEBRTC_TCPMUX=52100',
             '--env', 'NEKO_WEBRTC_NAT1TO1=127.0.0.1',
@@ -388,5 +402,67 @@ describe('deploy/images.env', () => {
 
     it('the parser drops comments and blanks and keeps values containing "="', () => {
         expect(parseImagesEnv('# c\n\nA=1\nB=x=y\n  C = 3  \n=bad\n')).toEqual({ A: '1', B: 'x=y', C: '3' });
+    });
+});
+
+// ── Implicit hosting (row T5) ────────────────────────────────────────────────
+//
+// 🔴 WHY THIS BLOCK IS NOT ONE ASSERTION. The pinned image's
+// `/etc/neko/neko.yaml` ships `session.implicit_hosting: false`, so a desktop
+// booted without this variable RENDERS PERFECTLY AND IGNORES EVERY CLICK.
+// Nothing that speaks HTTP can tell the two apart: `/health` is `true`,
+// `POST /api/login` is a 200 with an admin profile, the SPA is a 200, the
+// `<video>` paints. The only signals are neko's own `/api/room/settings` (the
+// read-back `DockerHost.readControlMode` does) and a human clicking. So the
+// variable is asserted here for EVERY spec shape rather than once for the
+// golden argv, because "present in the one spec the golden uses" is the kind
+// of coverage that lets an `if` creep in later.
+describe('NEKO_SESSION_IMPLICIT_HOSTING', () => {
+    it('is present, and is the string "true", for every spec shape', () => {
+        // Asserted for EVERY shape rather than once for the golden argv:
+        // "present in the one spec the golden uses" is the kind of coverage
+        // that lets an `if` creep in later.
+        for (const spec of [
+            SPEC,
+            { ...SPEC, hostPortOffset: 10_000 },
+            { ...SPEC, hostPortOffset: -1_000 },
+            { ...SPEC, screen: { width: 1280, height: 800 } },
+            { ...SPEC, workspaceHostPath: '/home/someone/project' },
+            { ...SPEC, extraEnv: { EZIL_SOMETHING: 'x' } },
+        ]) {
+            expect(buildContainerEnv(spec)[NEKO_IMPLICIT_HOSTING_ENV]).toBe('true');
+        }
+    });
+
+    it('reaches the argv as a real --env pair, not merely the env map', () => {
+        // The env map is what a test reads; the argv is what the daemon reads.
+        // Asserting only the first would pass on a `buildDockerRunArgv` that
+        // filtered the key out.
+        const argv = buildDockerRunArgv({ ...SPEC, hostPortOffset: 10_000 });
+        const values = argv.filter((_, i) => argv[i - 1] === '--env');
+        expect(values).toContain(`${NEKO_IMPLICIT_HOSTING_ENV}=true`);
+    });
+
+    it('refuses an extraEnv that would turn it off, naming the constraint', () => {
+        // `extraEnv` is merged LAST so it CAN override — this is the one key it
+        // may not, and the check has to run after the merge because the merge
+        // is the only way the value could change.
+        for (const attempt of ['false', '0', '', 'TRUE']) {
+            expect(() => buildContainerEnv({ ...SPEC, extraEnv: { [NEKO_IMPLICIT_HOSTING_ENV]: attempt } }))
+                .toThrow(/implicit_hosting_disabled/);
+        }
+        // Positive control on the same path: an override that AGREES is fine,
+        // so the guard is about the value and not about the key being present
+        // in `extraEnv` at all.
+        expect(buildContainerEnv({ ...SPEC, extraEnv: { [NEKO_IMPLICIT_HOSTING_ENV]: 'true' } })[NEKO_IMPLICIT_HOSTING_ENV])
+            .toBe('true');
+    });
+
+    it('is spelled the way Viper binds this flag', () => {
+        // `--session.implicit_hosting` -> `NEKO_SESSION_IMPLICIT_HOSTING`, the
+        // same transform the four NEKO_WEBRTC_* names follow. A typo here is
+        // silent: neko ignores an unknown variable and keeps the yaml's false.
+        expect(NEKO_IMPLICIT_HOSTING_ENV).toBe('NEKO_SESSION_IMPLICIT_HOSTING');
+        expect(isEnvName(NEKO_IMPLICIT_HOSTING_ENV)).toBe(true);
     });
 });

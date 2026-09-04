@@ -159,7 +159,7 @@ export interface LocalServerOptions {
     /** The desktop runtime. Row T2's Docker adapter in production; `./fake-host.ts` in tests. */
     readonly host: SandboxHost;
     /** Overridable for tests. Defaults to a real GET at the desktop origin. */
-    readonly probeFrame?: (url: string) => Promise<FrameProbe>;
+    readonly probeFrame?: (url: string, offset?: number) => Promise<FrameProbe>;
     /** Overridable for tests so nothing writes to a user's home directory. */
     readonly telemetrySink?: (record: unknown) => Promise<void>;
 }
@@ -214,6 +214,15 @@ export async function startLocalServer(options: LocalServerOptions): Promise<Loc
         markOpened: () => computerState.markOpened(),
         recordActivity: (ago) => computerState.recordActivity(ago),
         appendTelemetry,
+        // 🔴 THE PUBLISHED-PORT OFFSET REACHES THE ROUTER, AND IT USED NOT TO.
+        // `routes.ts#isOwnDesktopOrigin` pins the desktop origin so a hostile
+        // page cannot aim this loopback server at the user's LAN; it pinned it
+        // at offset 0, so on a machine that needed an offset to boot at all the
+        // pin rejected the host's OWN url and every cold boot answered
+        // `desktop_frame_foreign_origin`. Measured in a real browser on this
+        // machine (`supabase-kong` holds 8443, so offset 10000 is mandatory
+        // here), and invisible to every unit test because they all run at 0.
+        hostPortOffset: config.hostPortOffset,
         ...(options.probeFrame === undefined ? {} : { probeFrame: options.probeFrame }),
     };
 

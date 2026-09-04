@@ -48,6 +48,20 @@ export const ENV_KEYS = {
     appUrl: 'EZIL_APP_URL',
     /** OPTIONAL. Where `bundle.min.js` / `bundle.min.css` / `icons.js` live, when they are not where `resolveShellAssetsDir` looks. */
     shellAssets: 'EZIL_LOCAL_SHELL_DIR',
+    /**
+     * OPTIONAL. Shift every PUBLISHED CONTAINER port by this much, for a
+     * machine where one of the six defaults is already taken. `0` (the
+     * default) reproduces the pinned argv byte for byte.
+     *
+     * 🔴 THIS IS NOT `EZIL_LOCAL_PORT`. That one moves this host's own HTTP
+     * listener; this one moves the container's six published ports, and it
+     * moves the WebRTC mux on BOTH sides of the container boundary — see
+     * `offsetPortMap`. On the development machine `supabase-kong` holds
+     * `0.0.0.0:8443` permanently, so without this `docker run` dies before the
+     * image is ever started. `local/src/doctor.ts` reports which ports are
+     * busy and at which offset they are all free.
+     */
+    portOffset: 'EZIL_LOCAL_PORT_OFFSET',
 } as const;
 
 /** A source of environment variables. Injected so tests never touch `process.env`. */
@@ -74,6 +88,19 @@ export interface LocalConfig {
     readonly shellAssetsSearched: readonly string[];
     /** The desktop image reference, resolved through T0's `deploy/images.env` parser. */
     readonly desktopImage: ResolvedImage;
+    /**
+     * How far every published container port is shifted. `0` by default.
+     *
+     * 🔴 CARRIED ON THE CONFIG RATHER THAN ONLY ON THE ADAPTER BECAUSE THE
+     * SERVER NEEDS IT TOO, and that was measured rather than reasoned:
+     * `../server/routes.ts`'s `isOwnDesktopOrigin` pinned the desktop origin at
+     * offset 0, so with any offset the very first cold boot answered
+     * `desktop_frame_foreign_origin` and the shell reported
+     * `desktop_unreachable` — on a machine where the offset is exactly what
+     * makes the container start at all. Every unit test stayed green because
+     * they all run at offset 0 against a fake host.
+     */
+    readonly hostPortOffset: number;
     /** OPTIONAL and unset by default. Configuration only: nothing in this package dials it. */
     readonly mcpEndpoint: string | null;
     /** OPTIONAL and unset by default. Configuration only: nothing in this package dials it. */
@@ -98,6 +125,31 @@ export function parsePort(raw: string | undefined, fallback: number): number {
     const value = Number(text);
     if (value > 65535) {
         throw new Error(`invalid_local_port: ${value} is above 65535 (${ENV_KEYS.port})`);
+    }
+    return value;
+}
+
+/**
+ * Parse the published-port offset.
+ *
+ * Same rule as `parsePort`: a value that looks like configuration and is not
+ * fails at READ time. Negative offsets are accepted (a user may want to move
+ * DOWN off a busy range) but `offsetPortMap` still refuses anything that would
+ * land a port outside 1..65535 — so the range check lives in exactly one place
+ * and this function only decides whether the text is a number at all.
+ */
+export function parsePortOffset(raw: string | undefined): number {
+    if (raw === undefined || raw.trim() === '') return 0;
+    const text = raw.trim();
+    if (!/^-?\d+$/.test(text)) {
+        throw new Error(`invalid_local_port_offset: '${text}' is not a decimal integer (${ENV_KEYS.portOffset})`);
+    }
+    const value = Number(text);
+    // Fail here rather than at `docker run`: `offsetPortMap` throws with the
+    // port that would be out of range, which is the more useful message, so
+    // this only guards the values that would make that message nonsense.
+    if (!Number.isSafeInteger(value)) {
+        throw new Error(`invalid_local_port_offset: ${text} is not a safe integer (${ENV_KEYS.portOffset})`);
     }
     return value;
 }
@@ -244,6 +296,7 @@ export async function loadConfig(
         shellAssetsDir: pickShellAssetsDir(candidates, (p) => existsSyncSafe(p)),
         shellAssetsSearched: candidates,
         desktopImage: await readAndResolveDesktopImage(join(parent, IMAGES_ENV_RELATIVE_PATH)),
+        hostPortOffset: parsePortOffset(env[ENV_KEYS.portOffset]),
         mcpEndpoint: parseOptionalEndpoint(env[ENV_KEYS.mcpEndpoint], ENV_KEYS.mcpEndpoint),
         appUrl: parseOptionalEndpoint(env[ENV_KEYS.appUrl], ENV_KEYS.appUrl),
     };
