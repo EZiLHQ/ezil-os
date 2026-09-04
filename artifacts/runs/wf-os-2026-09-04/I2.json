@@ -1,0 +1,9 @@
+{
+  "taskId": "I2",
+  "runId": "wf-os-2026-09-04",
+  "status": "done",
+  "doneRung": "COMMITTED",
+  "evidence": "docs/CONTRIBUTING-APPS.md (443 lines) and docs/examples/hello-app.js.md (218 lines) written and committed; bash shell/build-shell.sh --check passed before and after (bundle unchanged, docs-only PR); 40+ file:line citations verified with sed -n, 9 were off by a few lines on first pass and fixed in a follow-up commit; all markdown links resolve except ../CONTRIBUTING.md#how-to-send-a-pr which the doc itself flags as not-yet-existing pending row I1's merge; grep -c SFA-01 = 2 (>=1 required)",
+  "startedAt": "2026-09-04T21:51:47Z",
+  "updatedAt": "2026-09-04T22:25:15Z"
+}
