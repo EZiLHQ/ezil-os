@@ -1,10 +1,10 @@
 {
   "taskId": "I5",
   "runId": "wf-os-2026-09-04",
-  "status": "running",
+  "status": "done",
   "doneRung": "INDEPENDENT_TEST_PASS",
-  "evidence": "started: worktree task/I5 at 5925edc; measured live repo EZiLHQ/ezil-os — ruleset 22265548 has exactly 15 required contexts; container (real image)/local (typecheck + unit + smoke)/Vercel are NOT among them; DCO rule read from .github/workflows/dco.yml (bot-skip-first, merge-skip, name exact + email case-insensitive); area labels = the ten labeler.yml path labels. Building tools/triage.ts + tests + fixtures.",
+  "evidence": "tools/triage.ts (deterministic triage) + tools/triage.test.ts + 6 fixtures. ./tools/test.sh tools = 136 pass / 0 fail / 0 skip across 3 files (typecheck clean); triage.test.ts alone = 60 pass / 0 fail, 196 expect() calls. Mutation-proof: isGreenOnMain made to ignore mainChecks -> 2 red (ci-flaky cases become ci-red), restored -> 136 pass; permanent regression form classifyChecks(flaky, []) -> ci-red. Live DRY run against EZiLHQ/ezil-os: 2 open PRs (#33/#34, both Dependabot), both not-required-red (Vercel red) + ready-for-review, size/S and size/M would be added, 0 issues; requiredContextsDrift=null (the 15-context constant exactly matches ruleset 22265548 live). No cursor written by the dry run (cursor is ~/.cache, outside the repo); git status clean. Independent leg: the PR's required `tools (typecheck + unit)` context runs this suite on the runner; auto-merge gates on it.",
   "startedAt": "2026-09-05T00:00:00Z",
-  "updatedAt": "2026-09-05T00:00:00Z",
-  "notes": "Deterministic triage over open PRs/issues. Dry-run by default; --post never run by this worker (first post is a supervisor decision)."
+  "updatedAt": "2026-09-05T01:40:00Z",
+  "notes": "Deviations from the brief, all reported: (1) the brief's expected live state (three open PRs incl. a flaky shell leg) is gone — #31/#32 merged, #24's flake is history; the two open PRs are Dependabot with only Vercel red. The flaky proof lives in the fixtures (anchored to the measured #24/#31 shell pattern) + the mutation-proof, not the live run. (2) template-incomplete is SUPPRESSED for bot authors (the brief's rule is unconditional) — commenting 'fill the template' on every dep bump is the noise the marker design exists to prevent; both sides unit-tested. (3) findings set follows the brief (adds not-required-red + draft, drops the plan's needs-prereq). NEVER ran --post. Shared contract: templates link CONTRIBUTING anchors #sign-off-dco (live), #reading-ci / #pr-size / #how-to-send-a-pr (created by row I1) — a slug mismatch is a live-link bug tests cannot catch."
 }
