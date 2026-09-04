@@ -103,16 +103,22 @@ they're handled differently:
   no auto-merge, this repo is solo-maintained and `main` requires a human
   in the loop.
 - **Major version bumps are never opened by Dependabot** — every npm/bun
-  entry in `dependabot.yml` ignores `version-update:semver-major`. A major
-  is opened by hand instead, as its own PR linked to a tracked issue that
-  carries a migration note: what changed upstream, what in this repo
-  depends on the old behavior, and what was checked before merging. This
-  isn't extra ceremony for its own sake — the maintainer is solo, the
-  deploy pipeline is tag-triggered straight off `main`, and a bad major
-  landed unattended has no safety net.
+  entry in `dependabot.yml` ignores `version-update:semver-major`. This
+  only suppresses routine version-update PRs; it does not affect security
+  updates, so a major that's also a security fix still gets its own PR and
+  still raises a Security tab alert. A routine major is opened by hand
+  instead, as its own PR linked to a tracked issue that carries a
+  migration note: what changed upstream, what in this repo depends on the
+  old behavior, and what was checked before merging. This isn't extra
+  ceremony for its own sake — the maintainer is solo, the deploy pipeline
+  is tag-triggered straight off `main`, and a bad major landed unattended
+  has no safety net.
 
-As of this writing there are six deferred majors, each already open as a
-hand-reviewed Dependabot PR. Anyone picking one up should check:
+As of this writing there are six deferred majors. Each was open as an
+(unreviewed) Dependabot PR before the `ignore` rule above was added; adding
+that rule may itself cause Dependabot to auto-close those PRs on its next
+run, so the tracked issue — not PR number — is the durable record. Anyone
+picking one up should check:
 
 - **eslint 9 → 10** (`/app`) — flat-config changes; confirm
   `app/eslint.config.*` still loads and `bun run lint` is clean, not just
