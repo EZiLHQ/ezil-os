@@ -66,6 +66,16 @@ const DETAILED = frame(160, 100, (i) => {
     const v = (i * 2654435761) % 256;
     return [v, (v * 3) % 256, (v * 7) % 256];
 });
+/**
+ * THE FIXTURE THAT PINS THE BUCKET ARITHMETIC. Every grey level 0..255
+ * appears (16,000 pixels cycling i % 256), so this hits every possible
+ * floor(l / 8) bucket exactly once: 0..31, i.e. 32 distinct values.
+ * Math.round(l / 8) instead would additionally hit round(255 / 8) = 32,
+ * an arithmetically impossible 33rd bucket over a /32 label -- the defect
+ * docs/CONFIDENCE-MAP.md section 3.5(a) reported. This fixture fails
+ * loudly if that regresses.
+ */
+const FULL_RANGE_RAMP = frame(160, 100, (i) => { const v = i % 256; return [v, v, v]; });
 
 describe('luminanceStats — the numbers', () => {
     it('reads every pixel of a well-formed buffer', () => {
@@ -106,6 +116,19 @@ describe('luminanceStats — the numbers', () => {
         // marshals `[...data]`. If this function only accepted typed arrays the
         // smoke test would have had to reimplement it.
         expect(luminanceStats([...SOLID_GREY])).toEqual(luminanceStats(SOLID_GREY));
+    });
+
+    it('a full-range ramp hits exactly 32 buckets -- never 33', () => {
+        // The regression this fixture pins: floor(l / 8) over luminance
+        // 0..255 lands in 0..31 (32 distinct buckets), matching the doc
+        // comment on `LuminanceStats.buckets` and the `/32` suffix in
+        // `describeStats`. The prior `Math.round(l / 8)` produced a 33rd,
+        // impossible bucket (`round(255 / 8) === 32`) -- printing
+        // `buckets=33/32`, reported in `docs/CONFIDENCE-MAP.md` section 3.5(a).
+        const s = luminanceStats(FULL_RANGE_RAMP);
+        expect(s.buckets).toBe(32);
+        expect(s.buckets).not.toBe(33);
+        expect(describeStats(s)).toMatch(/buckets=32\/32/);
     });
 });
 

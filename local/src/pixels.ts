@@ -80,7 +80,14 @@ export function luminanceStats(rgba: ArrayLike<number>): LuminanceStats {
         sum += l;
         sumSquares += l * l;
         samples++;
-        buckets.add(Math.round(l / 8));
+        // 🔴 `Math.floor`, not `Math.round`. Luminance ranges over `0…255`
+        // inclusive; `floor(l / 8)` maps that onto `0…31` -- exactly 32
+        // distinct buckets, matching the doc comment above and the `/32`
+        // suffix in `describeStats`. `Math.round` was measured to produce
+        // 33 (`0…32`, because `round(255 / 8) = 32`) -- an arithmetically
+        // impossible "33/32" in the printed diagnostic. See
+        // `docs/CONFIDENCE-MAP.md` section 3.5(a) and `local/tests/pixels.test.ts`.
+        buckets.add(Math.floor(l / 8));
     }
     const mean = sum / samples;
     // `max(0, …)` because the one-pass form can go a hair negative on a
