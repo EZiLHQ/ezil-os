@@ -1,0 +1,296 @@
+# DCO — every commit a pull request adds must carry a `Signed-off-by` trailer
+# that matches the commit's own author.
+#
+# CONTRIBUTING.md §Sign-off is the contract; this file is the enforcement. The
+# remedy is always `git commit --amend -s` (one commit) or
+# `git rebase --signoff <base>` (several).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# TRAP 1 — WHY THERE IS EXACTLY ONE JOB AND NO JOB-LEVEL if:
+# ─────────────────────────────────────────────────────────────────────────────
+# A branch-protection ruleset requires the check named below ("DCO") on every
+# pull request. A required status context is satisfied only if a check run with
+# that exact name is actually POSTED for the commit. A job skipped by
+# `paths-ignore` or a job-level `if:` never runs, so it never posts a check run
+# — GitHub then shows the required check stuck on "Expected" and the PR can
+# never merge, no matter what the next push does. That is a HANG, not a
+# failure, and nobody can tell the difference from the merge button.
+#
+# So: one job, no job-level `if:`, no `paths-ignore`. Every exemption below
+# happens INSIDE the step, where the job still runs, still posts its check run,
+# and still prints what it decided about every commit.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# TRAP 2 — BOT COMMITS, AND WHAT THEY ACTUALLY LOOK LIKE
+# ─────────────────────────────────────────────────────────────────────────────
+# Bots cannot sign the DCO. If their commits fail this check, every dependency
+# PR becomes unmergeable — so bot commits are skipped by COMMIT-AUTHOR ident.
+#
+# Measured against this repository on 2026-09-04, not assumed:
+#
+#   dependabot[bot]        <49699333+dependabot[bot]@users.noreply.github.com>
+#     — DOES emit a trailer, `Signed-off-by: dependabot[bot] <support@github.com>`
+#       (all 7 open Dependabot PRs). The NAME matches the author; the EMAIL does
+#       not. So a name+email check fails Dependabot even though a trailer is
+#       plainly there. This is why the bot gate below is the FIRST branch and
+#       runs BEFORE any trailer is read: an "is a trailer missing?" gate would
+#       let the real commit fall through into the mismatch branch and fail it.
+#
+#   copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>
+#     — 2 commits in this repo's history, ZERO `Signed-off-by` trailers. Note
+#       the skew: the display NAME is `copilot-swe-agent[bot]` while the email's
+#       login segment is `Copilot`. Matching on either alone would miss it.
+#
+#   github-actions[bot]    <41898282+github-actions[bot]@users.noreply.github.com>
+#     — id from `gh api users/github-actions[bot]`. No commits here yet; listed
+#       because any workflow that ever pushes will author as this and will not
+#       sign off.
+#
+# The gate is "name in the list AND email ends in @users.noreply.github.com",
+# deliberately looser than those exact strings: over-tightening reproduces the
+# unmergeable-PR failure this file exists to prevent, and DCO is a provenance
+# record, not a security boundary (a forged trailer is exactly as easy as a
+# forged author ident). The exact emails are recorded above so a future reader
+# can tighten this on purpose rather than by accident.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# TRAP 3 — MERGE COMMITS ARE SKIPPED
+# ─────────────────────────────────────────────────────────────────────────────
+# `git rebase --signoff` — the remedy this check prints — DROPS merge commits.
+# A failure whose own printed remedy cannot fix it is trap 1 wearing a different
+# hat: the contributor is stuck, just noisily instead of silently.
+#
+# And the commits are not theirs to sign. `base.sha` is captured when the event
+# fires; a contributor who merges `main` into their branch pulls whatever main
+# has accumulated into `base..head`. This repo's main carries unsigned merge
+# commits today (aaf158a, 8099059, and older). A merge introduces no new
+# authored content, so it is skipped — and PRINTED as `skip (merge)`, because a
+# commit nobody accounted for is the same blind spot in a friendlier colour.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY .mailmap IS NOT APPLIED
+# ─────────────────────────────────────────────────────────────────────────────
+# `git commit -s` builds the trailer from the same `user.name` / `user.email`
+# that becomes the author ident, so the raw `%an` / `%ae` are exactly what the
+# trailer should equal. `--use-mailmap` (`%aN` / `%aE`) would rewrite the author
+# to its canonical form while leaving the trailer as written, manufacturing
+# mismatches out of correctly signed commits. `.mailmap` is for shortlog and the
+# contributor graph; it is not an identity policy.
+name: DCO
+
+on:
+  pull_request:
+    # `ready_for_review` is here so a draft that gets promoted is re-checked.
+    # Note that draft PRs still fire `opened` and `synchronize` and are still
+    # checked — filtering them out is trap 1.
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# This check reads commit metadata and nothing else. Public repo:
+# `pull_request` runs for forks, so this is the token a stranger's PR gets.
+permissions:
+  contents: read
+
+concurrency:
+  group: dco-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dco:
+    # 🔴 This exact string is the required status context in the branch
+    # ruleset. Renaming the job renames the check run, and every open PR
+    # immediately hangs on a context that will never be posted again.
+    name: DCO
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 — the walk below needs `base.sha` and every commit
+      # between it and the head. The default shallow clone has neither.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check sign-off on every commit
+        shell: bash
+        # The SHAs arrive through the environment, never interpolated into the
+        # script body. Standard expression-injection hardening — and it keeps
+        # this script byte-identical to the one that can be extracted and run
+        # locally, so what is tested is what ships.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # Trap 2: bot authors, matched on the commit author ident (not the PR
+          # author — a human can push a bot-authored commit onto their branch
+          # and it is still not theirs to sign).
+          BOT_NAMES=(
+            'dependabot[bot]'
+            'github-actions[bot]'
+            'copilot-swe-agent[bot]'
+          )
+          BOT_EMAIL_SUFFIX='@users.noreply.github.com'
+
+          # `Name <email>`, split. Held in a VARIABLE and referenced unquoted:
+          # bash lexes the right-hand side of `=~` before it ever reaches the
+          # regex engine, and a literal `<` there is read as a redirection —
+          # even inside an ERE bracket expression. Written inline this is a
+          # SYNTAX ERROR, not a subtle mismatch (measured: `bash -n` rejects it).
+          # Bracket expressions rather than \< \> because glibc ERE reads the
+          # escaped forms as word boundaries, which never match an angle bracket.
+          SOB_RE='^(.*[^[:space:]])[[:space:]]*[<](.*)[>][[:space:]]*$'
+
+          # A base we cannot see is a hard failure, never an empty range that
+          # would pass silently. One fetch attempt, then stop.
+          for ref_name in BASE_SHA HEAD_SHA; do
+            sha="${!ref_name}"
+            if [ -z "$sha" ]; then
+              echo "DCO: FAILED — ${ref_name} is empty. This workflow only runs on pull_request events."
+              exit 1
+            fi
+            if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+              echo "note: ${ref_name} ${sha} is not in the local clone; fetching it"
+              git fetch --no-tags --quiet origin "$sha" || true
+            fi
+            if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+              echo "DCO: FAILED — ${ref_name} ${sha} is not reachable in this checkout."
+              echo "Nothing was verified. This is a checkout problem, not a contributor problem:"
+              echo "confirm actions/checkout ran with fetch-depth: 0."
+              exit 1
+            fi
+          done
+
+          RANGE="${BASE_SHA}..${HEAD_SHA}"
+          expected="$(git rev-list --count "$RANGE")"
+          echo "PR #${PR_NUMBER}: ${expected} commit(s) in ${RANGE}"
+          echo
+
+          if [ "$expected" -eq 0 ]; then
+            echo "This pull request adds no commits on top of its base — head and base are"
+            echo "the same commit, or the branch was force-pushed back onto the base. There"
+            echo "is nothing to sign off, so this passes."
+            echo "DCO: 0 commits checked, 0 bot commits skipped, 0 failures"
+            exit 0
+          fi
+
+          checked=0
+          skipped_bot=0
+          skipped_merge=0
+          failures=()
+
+          while IFS= read -r sha; do
+            author_name="$(git log -1 --format='%an' "$sha")"
+            author_email="$(git log -1 --format='%ae' "$sha")"
+            printf '%s %s <%s>\n' "$sha" "$author_name" "$author_email"
+
+            # Trap 3 — merge commits.
+            parent_count="$(git log -1 --format='%P' "$sha" | wc -w)"
+            if [ "$parent_count" -gt 1 ]; then
+              skipped_merge=$((skipped_merge + 1))
+              echo "  skip (merge)"
+              continue
+            fi
+
+            # Trap 2 — bots. FIRST, before a trailer is even read: the real
+            # Dependabot commit HAS a trailer and would otherwise fail on the
+            # email mismatch.
+            is_bot=0
+            case "$author_email" in
+              *"$BOT_EMAIL_SUFFIX")
+                for bot in "${BOT_NAMES[@]}"; do
+                  if [ "$author_name" = "$bot" ]; then
+                    is_bot=1
+                    break
+                  fi
+                done
+                ;;
+            esac
+            if [ "$is_bot" -eq 1 ]; then
+              skipped_bot=$((skipped_bot + 1))
+              echo "  skip (bot)"
+              continue
+            fi
+
+            checked=$((checked + 1))
+
+            # One trailer per line, folded continuations unfolded. `key=` is
+            # matched case-insensitively by git, so `signed-off-by:` counts.
+            # A commit may carry several trailers; ANY one matching the author
+            # is a pass.
+            matched=0
+            saw_trailer=0
+            detail=''
+            while IFS= read -r trailer; do
+              [ -n "$trailer" ] || continue
+              saw_trailer=1
+              if [[ "$trailer" =~ $SOB_RE ]]; then
+                trailer_name="${BASH_REMATCH[1]}"
+                trailer_email="${BASH_REMATCH[2]}"
+              else
+                detail="${detail:+${detail}; }unparseable trailer 'Signed-off-by: ${trailer}'"
+                continue
+              fi
+              if [ "$trailer_name" = "$author_name" ] && \
+                 [ "${trailer_email,,}" = "${author_email,,}" ]; then
+                matched=1
+                break
+              fi
+              detail="${detail:+${detail}; }author '${author_name} <${author_email}>' vs trailer '${trailer_name} <${trailer_email}>'"
+            done < <(git log -1 --format='%(trailers:key=Signed-off-by,valueonly,unfold)' "$sha")
+
+            if [ "$matched" -eq 1 ]; then
+              echo "  ok (signed off)"
+            elif [ "$saw_trailer" -eq 0 ]; then
+              echo "  FAIL: no Signed-off-by trailer"
+              failures+=("${sha} — no Signed-off-by trailer. Expected: Signed-off-by: ${author_name} <${author_email}>")
+            else
+              # Distinct from "missing": a contributor who changed user.name,
+              # or hand-copied the line out of CONTRIBUTING.md, has a trailer
+              # they can SEE. Telling them it is missing is unactionable.
+              echo "  FAIL: Signed-off-by present but does not match the author — ${detail}"
+              failures+=("${sha} — Signed-off-by does not match the author: ${detail}")
+            fi
+          done < <(git log --reverse --format='%H' "$RANGE")
+
+          # "An unread count is a failure" — enforced, not asserted. Every
+          # commit in the range is checked, skipped as a bot, or skipped as a
+          # merge. Any other total means the walk lost one.
+          accounted=$((checked + skipped_bot + skipped_merge))
+          if [ "$accounted" -ne "$expected" ]; then
+            echo
+            echo "DCO: FAILED — ${expected} commit(s) in range but only ${accounted} accounted for"
+            echo "(${checked} checked + ${skipped_bot} bot + ${skipped_merge} merge). The walk"
+            echo "dropped a commit; do not trust this run."
+            exit 1
+          fi
+
+          echo
+          if [ "${#failures[@]}" -gt 0 ]; then
+            echo "──────────────────────────────────────────────────────────────────────"
+            echo "${#failures[@]} commit(s) are not signed off:"
+            for f in "${failures[@]}"; do
+              echo "  ${f}"
+            done
+            echo
+            echo "Every commit must certify https://developercertificate.org/ with a"
+            echo "Signed-off-by trailer whose name and email match the commit's author."
+            echo "See CONTRIBUTING.md#sign-off-dco. To fix:"
+            echo
+            echo "  one commit:  git commit --amend -s && git push --force-with-lease"
+            echo "  several:     git rebase --signoff ${BASE_SHA} && git push --force-with-lease"
+            echo
+            echo "If the trailer is present but mismatched, the name/email in your"
+            echo "trailer differ from your git author ident — set user.name and"
+            echo "user.email to the values you sign with, then amend or rebase as above."
+            echo
+            if [ "$skipped_merge" -gt 0 ]; then
+              echo "DCO: ${skipped_merge} merge commit(s) skipped (trap 3 in this file's header)"
+            fi
+            echo "DCO: ${checked} commits checked, ${skipped_bot} bot commits skipped, ${#failures[@]} failures"
+            exit 1
+          fi
+
+          if [ "$skipped_merge" -gt 0 ]; then
+            echo "DCO: ${skipped_merge} merge commit(s) skipped (trap 3 in this file's header)"
+          fi
+          echo "DCO: ${checked} commits checked, ${skipped_bot} bot commits skipped, 0 failures"
