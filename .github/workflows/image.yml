@@ -373,6 +373,8 @@ jobs:
       # placeholder verbatim.
       - name: Write published-images.env
         id: published
+        env:
+          DESKTOP_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           sha8="${GITHUB_SHA:0:8}"
           mkdir -p "${RUNNER_TEMP}/published-images"
@@ -383,6 +385,7 @@ jobs:
             echo "# on purpose - see deploy/images.env's own hand-off comment on"
             echo "# EZIL_DESKTOP_TAG). Paste the line below over that file's"
             echo "# EZIL_DESKTOP_TAG and commit to advance the pin."
+            echo "# digest: ${DESKTOP_DIGEST}"
             echo "EZIL_DESKTOP_TAG=${sha8}"
           } > "${out}"
           echo "path=${out}" >> "$GITHUB_OUTPUT"
@@ -393,7 +396,6 @@ jobs:
         with:
           name: published-images.env
           path: ${{ steps.published.outputs.path }}
-          retention-days: 90
 
       - name: Job summary
         env:
