@@ -144,6 +144,23 @@ export function localUrlFor(name: PublishedPort['name']): string {
  * Viper ranks an explicit flag above the environment — so nothing overrides
  * these.
  *
+ * 🔴 AND THERE IS A CONFIG FILE, WHICH IS NOT OBVIOUS AND WAS ALMOST MISSED.
+ * The image ships `/etc/neko/neko.yaml`, and `start-neko.sh` does `cd /etc/neko`
+ * before launching precisely so it is picked up ("preflight complete with config
+ * file config=/etc/neko/neko.yaml" on every boot). Viper ranks env ABOVE a
+ * config file, but that is a claim about a library, so it was measured against
+ * this binary rather than cited — `NEKO_DESKTOP_DISPLAY` vs
+ * `desktop.display` in the yaml, read off neko's own startup panic:
+ *
+ *     env :77, no yaml key      -> display=:77   (env binds at all)
+ *     yaml :88 AND env :77      -> display=:77   (env beats the file)
+ *     yaml :88, no env          -> display=:88   (control: the file IS read)
+ *
+ * The shipped yaml has no `webrtc:` section either way, so these four variables
+ * are uncontested. It DOES carry
+ * `member.multiuser.{admin_password: "admin", user_password: "neko"}` — see
+ * `buildContainerEnv`'s fail-closed check, which exists because of exactly that.
+ *
  * 🔴 `NEKO_WEBRTC_NAT1TO1` IS NOT OPTIONAL AND IS NOT COSMETIC.
  * `--webrtc.ip_retrieval_url` defaults to `https://checkip.amazonaws.com` and
  * neko fetches it **whenever `nat1to1` is unset** (the flag's own help text:
@@ -372,10 +389,15 @@ export function buildContainerEnv(spec: DockerRunSpec): Record<string, string> {
         throw new Error(`unsupported_local_mode: '${spec.mode}' — local mode runs the neko desktop only`);
     }
     if (spec.userPassword === '' || spec.adminPassword === '') {
-        // Failing closed matters more here than anywhere else in this file:
-        // neko's built-in defaults are `neko` and `admin`, so an empty value
-        // does not produce a locked desktop, it produces a publicly-known one.
-        throw new Error('missing_neko_password: both userPassword and adminPassword are required (neko defaults to the literals "neko"/"admin")');
+        // 🔴 Failing closed matters more here than anywhere else in this file.
+        // An empty value does not produce a locked desktop — it produces a
+        // publicly-known one. And the defaults are not merely neko's built-ins:
+        // MEASURED, the pinned image ships `/etc/neko/neko.yaml` containing
+        // `member.multiuser.admin_password: "admin"` and `user_password:
+        // "neko"` outright, and `start-neko.sh` cds into that directory so the
+        // file is loaded on every boot. Passing nothing here publishes a
+        // desktop on 127.0.0.1:8181 whose password is in a public repository.
+        throw new Error('missing_neko_password: both userPassword and adminPassword are required (the image\'s /etc/neko/neko.yaml sets the literals "neko"/"admin")');
     }
     const screen = spec.screen ?? DEFAULT_SCREEN_MODE;
     const env: Record<string, string> = {
