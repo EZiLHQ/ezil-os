@@ -227,3 +227,11 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   `main`. Supervisor fix on merge: `run-spec.test.ts` pinned "the four keys" — now five. Worker's blind spot recorded:
   the digest pin does not rebuild the base by itself (the tags already exist), only a SHA bump or `rebuild_base`.
   M1 dispatched (mobile-keyboard container test: 8 failures + 5 vacuous passes). Running: A2, T6, M1.
+- 2026-09-04 23:10Z — **PR #14 merged — the three-OS proof.** Final state: `worker`, `app`, `sdk + mcp`, `shell` GREEN on
+  ubuntu-latest, windows-latest and macos-latest; `tools`, `DCO`, `CodeQL (javascript-typescript)`, `label` green;
+  `container` and `local` red by design until T8. Nine runs; what the matrix found that Linux-only CI never could:
+  the composite action's `runner` context; `mapfile` and BSD `base64` in `shell/build-shell.sh` (a Mac contributor could
+  never run the drift check); `npx` not resolving bun shims on Windows; `URL.pathname` and CRLF in three app tests;
+  one wall-clock long-poll block (win32 skip, announced); geometry browser suites and script-executing worker suites
+  are Linux tests and now say so. One stuck ubuntu app job (20 min in typecheck) was cancelled and re-run: pass.
+  T4 done at INDEPENDENT_TEST_PASS. Next: G4 (ruleset with the 15 matrix contexts), T8.
