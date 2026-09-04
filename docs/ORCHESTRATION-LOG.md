@@ -248,3 +248,31 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   hand-off artifact for the tag write-back. T7 at DEPLOYED. Repository now has auto-merge and delete-branch-on-merge
   enabled; PR #15 landed as the first squash-merged change under the ruleset. Process note: two docs branches that
   both append to this file conflict on rebase — rebuild the later one on the merged `main` instead of rebasing.
+- 2026-09-05 00:50Z — **A2 returned; landing as PR #17** (squash, auto-merge armed). One authorization implementation:
+  `createTRPCContext` computes access lazily once per request; `protectedProcedure` refuses `FORBIDDEN not_invited`
+  for cookie and bearer callers alike. Page gates on `/os`, `/computers`, `/computer/*` refuse to
+  `/login?error=not_invited` (never `returnUrl`, which would loop); the login page renders the refusal with a sign-out.
+  Sign-up deleted and source-pinned (a new `auth.signUp(` anywhere under `app/src` fails a test). Invited landing both
+  ways: `/auth/confirm` (`token_hash` + `verifyOtp`) and `/auth/invited` (implicit fragment → `setSession` → set
+  password → document load) — primary source: `@supabase/ssr` hard-codes PKCE and auth-js throws on an invite
+  fragment, so the explicit `setSession` is the only path that works. 44 files / 817 pass; six mutants RED, the
+  headline one showing a refused stranger reaching the `ezil_computers` select that precedes the insert once the
+  procedure check is gone. Not proven here: cookies on `/auth/confirm`'s redirect and the invited landing end to end —
+  R2's steps 1–7 are in the worker's report. Founder steps (F1 redirect URL, F2 optional template, e2e account row)
+  appended to the founder script. T8 dispatched (CI pulls the GHCR image; retires the placeholder). Running: T6, M1, T8.
+- 2026-09-05 01:30Z — **M1 returned; landing as PR #18.** The eight "pre-existing failures" were the test, not the
+  product: spawned `node -e` subprocesses did a bare `require('playwright')` (never a repo dependency), the crash was
+  read as an empty result, and the assertions reported `Received: undefined`. Fixed with the repo's
+  `PLAYWRIGHT_REQUIRE_DIR` convention and crash surfacing; the five early-return vacuous passes are honest skips.
+  Against a clean build carrying `main`'s `ezil-mobile.js`: 9 pass / 0 fail — README's "in progress" undersells it.
+  Finding for anyone trusting this host: `ezil-integrated:local` here was built from `wip/mobile-keyboard`. Env-name
+  collision noted: `EZIL_NEKO_IMAGE` means a bare registry path in `images.env`/image.yml and `image:tag` in the
+  worker tests and `tools/test.sh`. M2 folded into M3; M3 dispatched. Running: T6, T8, M3.
+- 2026-09-05 02:10Z — **T6 returned; landing as PR #19.** `release.yml` (tag → tarball + SHA256SUMS + provenance →
+  Release with notes from the exact CHANGELOG section, failing loudly when the section is missing), `ezil-os.sh`
+  (bash 3.2) and `ezil-os.ps1`. Real runs: the launcher booted the local desktop on this box end to end and its
+  Ctrl-C removed only the containers it created (canary proved); the tarball ran `doctor` and `start` from an
+  isolated directory with no install — which forced `worker/src/{desktop-mode,screen-modes}.ts` into the manifest.
+  Two real bugs fixed before landing (a pipefail abort on an absent optional key; SHA256SUMS paths a downloader
+  cannot have). R1 dispatched with T6's release.yml in its ownership: the Release must be a DRAFT until deploy.yml's
+  production verify passes — "a green deploy that was never verified is not a release". Running: T8, M3, R1.
