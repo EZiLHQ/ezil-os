@@ -1,10 +1,10 @@
 {
   "taskId": "D1",
   "runId": "wf-os-2026-09-04",
-  "status": "running",
-  "doneRung": "pending",
-  "evidence": ".github/dependabot.yml committed (ab6130d): 6 entries parse via yaml.safe_load, each npm/bun entry has exactly one ignore key, /worker still ignores @cloudflare/sandbox. Added bun-ecosystem entries for /sdk and /mcp (verified bun.lock needs package-ecosystem: bun, not npm, via GitHub docs). Now writing CONTRIBUTING.md.",
+  "status": "done",
+  "doneRung": "COMMITTED",
+  "evidence": ".github/dependabot.yml (commit ab6130d) and CONTRIBUTING.md (commit c8d9092) landed. yaml.safe_load parses: 6 update entries total (1 github-actions + 5 npm/bun). Every npm/bun entry has exactly one ignore key (verified via python dict inspection: app=1 item, worker=2 items, worker/sidecar=1, sdk=1, mcp=1); /worker's ignore list still contains '@cloudflare/sandbox' alongside the new '*' semver-major wildcard. Added /sdk and /mcp as package-ecosystem: bun (not npm) after verifying via GitHub docs (WebFetch) that Bun is Dependabot's own ecosystem, distinct from npm, for bun.lock projects -- deviates from the brief's 'npm entries' wording for these two, documented in the report. /local not added (does not exist). git diff --stat 2a3c5bf (my actual branch point) touches exactly 3 files: .github/dependabot.yml, CONTRIBUTING.md, artifacts/runs/wf-os-2026-09-04/D1.json -- matches owns_files + run artifact. 'git diff --stat main' additionally shows G1's files (CODEOWNERS, CodeQL, labeler, stale workflows, ORCHESTRATION-LOG.md) because main advanced past my 2a3c5bf branch point when task/G1 merged; none of those are my edits.",
   "startedAt": "2026-09-04T07:42:37Z",
-  "updatedAt": "2026-09-04T07:46:12Z",
+  "updatedAt": "2026-09-04T07:49:00Z",
   "by": "worker-sonnet-D1"
 }
