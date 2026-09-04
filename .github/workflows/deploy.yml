@@ -25,6 +25,11 @@
 #   EZIL_E2E_EMAIL           an account the production suites can sign in as
 #   EZIL_E2E_PASSWORD
 #
+# The `image` and `release` jobs need no new repository secrets: `image` reads
+# the private GHCR package with the run's own GITHUB_TOKEN (job-level
+# `packages: read`), and `release` publishes with the run's own GITHUB_TOKEN
+# (job-level `contents: write`) plus the Cloudflare pair already listed above.
+#
 # 3. THE GIT INTEGRATION MUST NOT ALSO DEPLOY. `app/vercel.json` sets
 #    `git.deploymentEnabled.main = false`. Vercel for GitHub deploys every push
 #    by default, so with the repository public and the project connected, a push
@@ -37,6 +42,22 @@
 # branding image. That base is NOT built here — it is large, rarely changes, and
 # is pushed by hand. If you change `worker/assets/neko-branding/`, rebuild and
 # push that image first, or this deploys a worker around a stale client.
+#
+# 4. THE SAME DIGEST, BY WAITING, NOT BY BUILDING. `.github/workflows/image.yml`
+#    (a separate workflow, triggered by the same tag push) builds and pushes
+#    `ghcr.io/ezilhq/ezil-os-desktop`. `needs:` cannot cross workflow files, so
+#    the only way this pipeline and image.yml agree they shipped the SAME
+#    container build is for the `image` job below to wait for the digest
+#    image.yml actually pushed and read it back — never to assume a race
+#    between two workflows started by the same push resolves in our favour.
+#    `worker` then `needs: image`, so nothing deploys ahead of it.
+#
+# 5. THE RELEASE PUBLISHES ONLY WHAT `verify` PASSED. `release.yml` (also a
+#    separate workflow, also triggered by the tag push) creates the GitHub
+#    Release as a **draft** immediately — before this pipeline's deploy has
+#    even started. The `release` job below is what makes it public:
+#    `needs: verify`, so a `verify` failure leaves the draft exactly as
+#    ambiguous as it should be — visibly unreleased, not silently claimed.
 name: Deploy
 
 on:
@@ -59,9 +80,101 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  image:
+    name: wait for the desktop image
+    runs-on: ubuntu-latest
+    # Least privilege beyond the workflow-level `contents: read`: this job
+    # needs nothing else to check out, only to authenticate to GHCR
+    # (`packages: read` — the desktop image is a private package) and to look
+    # up whether image.yml ran at all (`actions: read`, for the fail-fast
+    # check below).
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    outputs:
+      digest: ${{ steps.wait.outputs.digest }}
+      ref: ${{ steps.wait.outputs.ref }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 🔴 image.yml's own header names an UNRESOLVED question: whether
+      # GitHub ANDs its `paths:` filter with its `tags: [v*]` trigger. If it
+      # does, a tag cut at a commit that touches none of worker/**,
+      # docker/neko/**, deploy/images.env or .github/workflows/image.yml never
+      # fires that workflow — fail in seconds naming that, instead of
+      # spending the full 30-minute poll below to find out the same way.
+      - name: Fail fast if image.yml never ran for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          runs="$(gh run list -R "${GITHUB_REPOSITORY}" -w image.yml --commit "${GITHUB_SHA}" --json databaseId --jq 'length' 2>/dev/null || echo 0)"
+          if [[ "${runs}" == "0" ]]; then
+            echo "::error::no .github/workflows/image.yml run exists for commit ${GITHUB_SHA} (tag ${GITHUB_REF_NAME}). image.yml's own header names an unresolved question: its 'paths:' filter may AND with its 'tags: [v*]' trigger, so a tag cut at a commit touching none of worker/**, docker/neko/**, deploy/images.env or .github/workflows/image.yml may never fire it. Dispatch image.yml by hand for this ref (workflow_dispatch), or cut the next tag at a commit that touches one of those paths." >&2
+            exit 1
+          fi
+          echo "[image] ${runs} image.yml run(s) found for commit ${GITHUB_SHA} — polling GHCR for what it pushes"
+
+      - name: Wait for ghcr.io/ezilhq/ezil-os-desktop:<sha8> to exist
+        id: wait
+        run: |
+          set -euo pipefail
+          sha8="${GITHUB_SHA:0:8}"
+          ref="ghcr.io/ezilhq/ezil-os-desktop:${sha8}"
+          deadline=$(( $(date +%s) + 1800 ))
+          interval=60
+          while true; do
+            if out="$(docker manifest inspect "${ref}" 2>&1)"; then
+              break
+            fi
+            # 🔴 DEFAULT-DENY, NOT DEFAULT-RETRY. Only the "not published yet"
+            # class of error is worth waiting out; every other class — a bad
+            # credential, a renamed/private package, a typo in the ref — must
+            # not loop silently for the full 30 minutes. `docker manifest
+            # inspect` prints "no such manifest: …" for a genuinely absent tag
+            # (verified locally against a public registry); GHCR's own auth
+            # failures come back as "unauthorized" or "denied" (verified
+            # locally, anonymous, against this exact private image).
+            if grep -qiE 'no such manifest|manifest unknown|not found' <<<"${out}"; then
+              now=$(date +%s)
+              if (( now >= deadline )); then
+                echo "::error::${ref} never appeared in GHCR within 30 minutes. image.yml pushes this tag from the same push — check its run for commit ${GITHUB_SHA} at https://github.com/${GITHUB_REPOSITORY}/actions/workflows/image.yml, or see the 'paths: may AND with tags' note above if no run exists for this commit at all." >&2
+                exit 1
+              fi
+              echo "[image] ${ref} not published yet ($(( deadline - now ))s left) — waiting ${interval}s"
+              sleep "${interval}"
+              continue
+            fi
+            echo "::error::docker manifest inspect ${ref} failed with an error that is NOT 'not yet published' — refusing to loop on it, since looping would hide an auth/config problem for 30 minutes instead of reporting it: ${out}" >&2
+            exit 1
+          done
+          # `docker manifest inspect` above only proves the ref RESOLVES. Its
+          # own JSON reports a per-platform child digest — not the tag's own
+          # digest — whenever the pushed object is a multi-entry index, so the
+          # digest is read from `buildx imagetools` instead, which always
+          # resolves to the digest the TAG itself points at regardless of
+          # index-vs-plain-manifest shape (verified locally against a real
+          # multi-arch tag).
+          digest="$(docker buildx imagetools inspect "${ref}" --format '{{json .Manifest}}' | jq -r '.digest')"
+          if [[ -z "${digest}" || "${digest}" == "null" ]]; then
+            echo "::error::${ref} resolved but no digest could be read back from it" >&2
+            exit 1
+          fi
+          {
+            echo "ref=${ref}"
+            echo "digest=${digest}"
+          } >> "$GITHUB_OUTPUT"
+          echo "[image] ${ref}@${digest}"
+
   worker:
     name: deploy worker
     runs-on: ubuntu-latest
+    needs: image
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
@@ -212,3 +325,79 @@ jobs:
             echo "── e2e/$s.mjs"
             node "e2e/$s.mjs"
           done
+
+  release:
+    name: publish the release
+    runs-on: ubuntu-latest
+    needs: [verify, image]
+    # Only a real tag push publishes anything. R2's own verify_cmd drives
+    # `verify-container` through `workflow_dispatch` on a branch
+    # (`verify_container=true`) — `github.ref` there is a branch ref, and
+    # `gh release edit` must never run against a branch name.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      # Best-effort and informational only — never a gate. `verify` above is
+      # what actually proved production; this step just names WHICH Worker
+      # deployment that was, for the release body. If it cannot (no secret,
+      # or the CLI call fails), the release still publishes — with a note
+      # saying to use the run URL instead, per the brief.
+      - name: Worker deployment (best-effort, not a gate)
+        id: worker_id
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${CLOUDFLARE_API_TOKEN}" && -n "${CLOUDFLARE_ACCOUNT_ID}" ]]; then
+            out="$(npx --yes wrangler@4 deployments list --name ezil-os-worker 2>&1 | head -20)" || out="(wrangler deployments list failed — see the run log)"
+          else
+            out="(no CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID in this job — see the run URL below instead)"
+          fi
+          {
+            echo "text<<EZIL_WORKER_ID_EOF"
+            echo "${out}"
+            echo "EZIL_WORKER_ID_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # 🔴 If `verify` failed, this job never runs at all (`needs: verify`) —
+      # the draft release.yml created stays a draft, visibly unreleased. Only
+      # a passing production-suite run reaches this step.
+      - name: Publish the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          IMAGE_REF: ${{ needs.image.outputs.ref }}
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+          WORKER_DEPLOYMENTS: ${{ steps.worker_id.outputs.text }}
+        run: |
+          set -euo pipefail
+          note_file="$(mktemp)"
+          {
+            echo
+            echo "---"
+            echo
+            echo "**Verified by [this run](${RUN_URL})**: worker + app deployed, then the production suites in this workflow's \`verify\` job passed against the live URL."
+            echo
+            echo "Desktop image: \`${IMAGE_REF}@${IMAGE_DIGEST}\`"
+            echo
+            echo "<details><summary>Worker deployments (<code>wrangler deployments list --name ezil-os-worker</code>)</summary>"
+            echo
+            echo '```'
+            echo "${WORKER_DEPLOYMENTS}"
+            echo '```'
+            echo
+            echo "</details>"
+          } > "${note_file}"
+
+          # Two edits, not one: `--draft=false` alone would publish with only
+          # the notes release.yml wrote at tag time (the CHANGELOG section).
+          # The verified-deployment note above is appended in a second edit so
+          # a `verify` failure — this job never running at all — can never
+          # leave those claims attached to a release that is still a draft.
+          gh release edit "$GITHUB_REF_NAME" --draft=false
+          current="$(gh release view "$GITHUB_REF_NAME" --json body --jq .body)"
+          { printf '%s\n' "${current}"; cat "${note_file}"; } > "${note_file}.full"
+          gh release edit "$GITHUB_REF_NAME" --notes-file "${note_file}.full"
+          echo "[release] $GITHUB_REF_NAME published — ${IMAGE_REF}@${IMAGE_DIGEST}"
