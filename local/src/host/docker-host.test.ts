@@ -458,6 +458,46 @@ describe('fetchIn is request/response only', () => {
         expect(await res.text()).toBe('{"ok":true}');
         expect(seen).toEqual(['http://127.0.0.1:9223/health']);
     });
+
+    it('resolves the host port through the published map, not by adding the offset', async () => {
+        // `offsetPortMap` moves the mux's container port too, so `port+offset`
+        // is right for the HTTP ports and wrong for the mux. Reading the table
+        // keeps that asymmetry in one place.
+        const seen: string[] = [];
+        const host = new DockerHost({
+            spawn: fakeDocker(() => ({})).spawn,
+            hostPortOffset: 10_000,
+            fetch: async (input) => { seen.push(input); return new Response('ok'); },
+        });
+        await host.fetchIn('c1', 8181, new Request('http://ignored/health'));
+        await host.fetchIn('c1', 8443, new Request('http://ignored/'));
+        // A port nobody published still resolves, by the fallback.
+        await host.fetchIn('c1', 4711, new Request('http://ignored/x'));
+        expect(seen).toEqual([
+            'http://127.0.0.1:18181/health',
+            'http://127.0.0.1:18443/',
+            'http://127.0.0.1:14711/x',
+        ]);
+    });
+
+    it('the mux entry is what distinguishes the map from arithmetic', async () => {
+        // 🔴 THE ONLY CASE THAT CAN TELL THE TWO IMPLEMENTATIONS APART, and it
+        // is here for exactly that reason. Every HTTP port has host = container
+        // + offset, so `port + offset` agrees with the table for all four of
+        // them — a test using only those would pass against either. The mux is
+        // published `62100:62100` at offset 10000 (both sides move together),
+        // so the table answers 62100 where the arithmetic answers 72100.
+        // Nothing HTTPs the mux in practice; the assertion exists to keep the
+        // ONE definition of the asymmetry in `offsetPortMap`.
+        const seen: string[] = [];
+        const host = new DockerHost({
+            spawn: fakeDocker(() => ({})).spawn,
+            hostPortOffset: 10_000,
+            fetch: async (input) => { seen.push(input); return new Response('ok'); },
+        });
+        await host.fetchIn('c1', WEBRTC_MUX_PORT + 10_000, new Request('http://ignored/'));
+        expect(seen).toEqual([`http://127.0.0.1:${WEBRTC_MUX_PORT + 10_000}/`]);
+    });
 });
 
 // ── screen ───────────────────────────────────────────────────────────────────

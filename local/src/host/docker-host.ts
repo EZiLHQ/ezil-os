@@ -69,6 +69,7 @@ import {
     composeDesktopUrl,
     containerNameFor,
     localUrlFor,
+    offsetPortMap,
 } from '../container/run-spec.ts';
 
 // ── The exec seam ────────────────────────────────────────────────────────────
@@ -562,7 +563,16 @@ export class DockerHost implements SandboxHost {
             throw new Error(`invalid_port: ${port}`);
         }
         const inbound = new URL(request.url);
-        const target = `http://127.0.0.1:${port + this.offset}${inbound.pathname}${inbound.search}`;
+        // 🔴 RESOLVE THROUGH THE PUBLISHED MAP, NEVER `port + offset`.
+        // `offsetPortMap` moves the mux's CONTAINER port as well as its host
+        // port and the HTTP ports' host port only, so plain arithmetic is the
+        // right answer for four of the six entries and the wrong one for two.
+        // Reading the same table `buildDockerRunArgv` published from means the
+        // asymmetry has exactly one definition. The fallback keeps a port a
+        // caller published by hand working.
+        const mapped = offsetPortMap(this.offset).find((p) => p.container === port && p.protocol === 'tcp');
+        const hostPort = mapped?.host ?? port + this.offset;
+        const target = `http://127.0.0.1:${hostPort}${inbound.pathname}${inbound.search}`;
         const init: RequestInit = { method: request.method, headers: request.headers };
         if (request.method !== 'GET' && request.method !== 'HEAD') {
             init.body = await request.arrayBuffer();
