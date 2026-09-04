@@ -1,0 +1,67 @@
+{
+  // EZiL OS local mode.
+  //
+  // ── Why there is no `rootDir` ───────────────────────────────────────────────
+  // `src/container/run-spec.ts` and `src/contract/shell-api.test.ts` import
+  // `../../../worker/src/desktop-mode.ts` and
+  // `../../../app/src/server/shell/boot-payload.ts` BY RELATIVE PATH, on
+  // purpose: the port numbers and the shell route table must have exactly one
+  // definition in this repository, and a copy here would be a second one that
+  // drifts. Those files live outside `local/`, so any `rootDir` that contained
+  // `src/` would reject them.
+  //
+  // `rootDir` only constrains OUTPUT layout, and this project sets `noEmit`, so
+  // omitting it costs nothing and is the only setting under which the
+  // cross-package imports typecheck at all.
+  //
+  // ── Why `paths` maps `@/*` ─────────────────────────────────────────────────
+  // `app/src/server/shell/boot-payload.ts` carries one import —
+  // `import type { Computer } from '@/server/db/schema'` — resolved through the
+  // APP's own tsconfig `paths` when the app typechecks itself. tsc resolves a
+  // dependency's specifiers against the tsconfig of the PROJECT DOING THE
+  // COMPILE, not the file's own package, so without this entry that import is
+  // unresolvable from here. See `src/contract/shell-api.ts` for what is
+  // actually imported and why the app subgraph stays small.
+  //
+  // 🔴 WHAT THIS TYPECHECK NEEDS INSTALLED, AND IT IS NOT ONLY `local/`.
+  // Measured with `tsc --traceResolution`: the four app files this compile
+  // pulls in import `drizzle-orm/pg-core`, which resolves through
+  // `app/node_modules/drizzle-orm`. So `bun run --cwd local typecheck` needs
+  // BOTH `bun install --cwd local` AND an installed `app/`; without the latter
+  // it fails with TS2307 for reasons that have nothing to do with this package.
+  // `bun test local/` has no such dependency — the app import is type-only and
+  // Bun erases it, and nothing else in this package imports anything external.
+  // The three-OS CI matrix must install both packages before running the
+  // `local` leg.
+  //
+  // The other side of that coupling: `noUncheckedIndexedAccess` below applies
+  // to the app files too, and `app/tsconfig.json` does not set it. An edit to
+  // `app/src/server/db/schema/*.ts` that trips it turns THIS typecheck red, and
+  // the app author gets no signal from their own. That is the price of one
+  // definition instead of a copy; it is cheap today (four small files, clean)
+  // and it is the first thing to look at if this compile fails for no local
+  // reason.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "types": ["bun"],
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "paths": {
+      "@/*": ["../app/src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}

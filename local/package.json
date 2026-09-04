@@ -1,0 +1,17 @@
+{
+  "name": "@ezil-os/local",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "description": "EZiL OS local mode: a native Bun host that drives the desktop container through the `docker` CLI and publishes its ports on 127.0.0.1. Contains NO Cloudflare code and no Cloudflare dependency.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "//doctor": "RESERVED — row T5 adds the real `doctor` script here (preflight: docker daemon reachable, image present, ports free). Left as a comment key, not a script, so `bun run doctor` fails loudly as 'not found' until T5 lands rather than silently succeeding as a no-op."
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.0"
+  }
+}

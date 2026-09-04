@@ -31,6 +31,8 @@ const ROOTS = [
     join(import.meta.dir, '..', 'scripts'),
     join(import.meta.dir, '..', 'bootstrap'),
     join(import.meta.dir, '..', '..', 'shell'),
+    // The orchestration tools are bash too; a parse error there breaks every worker's harness.
+    join(import.meta.dir, '..', '..', 'tools'),
 ];
 
 function shellScriptsIn (dir: string): string[] {

@@ -40,6 +40,13 @@ updates:
     directory: /
     schedule: { interval: weekly }
     labels: ["dependencies", "ci"]
+    # Same rule as the package entries: a major action bump is a deliberate,
+    # hand-opened change. The first weekly run after this file landed opened
+    # three action majors within the hour (codeql-action 4, labeler 7,
+    # stale 11) against pins chosen on purpose.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: npm
     directory: /app

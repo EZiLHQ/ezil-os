@@ -158,7 +158,7 @@ elif [ -n "${PLAYWRIGHT_REQUIRE_DIR:-}" ]; then
     export PLAYWRIGHT_REQUIRE_DIR
     PW_NOTE="from the environment: $PLAYWRIGHT_REQUIRE_DIR"
 else
-    PW_NOTE="UNSET (and no $EZIL_PLAYWRIGHT_DIR fallback) — every browser suite will SKIP"
+    PW_NOTE="UNSET (and no \$EZIL_PLAYWRIGHT_DIR fallback) — every browser suite will SKIP"
 fi
 
 # ── colours, only on a tty ─────────────────────────────────────────────────
