@@ -1,0 +1,99 @@
+# Needs-triage label - adds `needs-triage` to a newly opened issue that
+# carries none of the ten area labels, so nothing opened falls through
+# without a maintainer having looked at it.
+#
+# -----------------------------------------------------------------------------
+# MIRRORS tools/triage.ts's issueLabelChange - WITH ONE NOTED DIVERGENCE
+# -----------------------------------------------------------------------------
+# `tools/triage.ts` computes the same decision for a maintainer's manual
+# `--post` run: `needs-triage` iff the issue has none of AREA_LABELS = [app,
+# worker, sdk, shell, mcp, e2e, docs, ci, local, tools] and does not already
+# carry `needs-triage`. This workflow reimplements that rule rather than
+# importing it (a script step has no checkout - see below - so it cannot
+# `import` repo TypeScript). If you change the area-label rule in one place,
+# change it in the other in the same PR, the same way `size-label.yml` says
+# for `sizeBucket`.
+#
+# One divergence, on purpose, noted here rather than silently: this workflow
+# also skips an issue opened by a known bot account (dependabot[bot],
+# github-actions[bot], copilot-swe-agent[bot]), which `tools/triage.ts`'s
+# `issueLabelChange` does not do today - that function has no bot exemption
+# at all, so a maintainer's manual `--post` run would label a bot-opened
+# issue `needs-triage` exactly like a human one. Bots essentially never open
+# issues in this repo today, so the two disagreeing on that one case is a low
+# stakes gap - but it is real, and worth `tools/triage.ts` picking up the
+# same exemption in a future change to that file (which this row does not
+# own).
+#
+# -----------------------------------------------------------------------------
+# THIS IS NOT A REQUIRED CONTEXT
+# -----------------------------------------------------------------------------
+# Must never be added to the branch ruleset on `main` (ruleset 22265548, `gh
+# api repos/EZiLHQ/ezil-os/rulesets/22265548`) - triage labeling gates
+# nothing, and making it required would risk hanging on a label-API hiccup
+# the way `dco.yml`'s header describes (TRAP 1). One job, no job-level `if:`,
+# so it always runs and always posts.
+#
+# -----------------------------------------------------------------------------
+# LEAST PRIVILEGE
+# -----------------------------------------------------------------------------
+# `issues: write` is the only scope this needs - no checkout, no PR access,
+# nothing else read or written.
+name: Needs-triage label
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: triage-label-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  triage-label:
+    name: triage-label
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add needs-triage if no area label is present
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Mirrors tools/triage.ts's AREA_LABELS constant exactly - see
+            // this file's own header for the noted bot-exemption divergence.
+            const AREA_LABELS = ["app", "worker", "sdk", "shell", "mcp", "e2e", "docs", "ci", "local", "tools"];
+            const BOT_LOGINS = new Set([
+              "dependabot[bot]",
+              "github-actions[bot]",
+              "copilot-swe-agent[bot]",
+            ]);
+
+            const issue = context.payload.issue;
+            const login = issue.user.login;
+
+            if (BOT_LOGINS.has(login)) {
+              console.log(`skip: issue #${issue.number} opened by ${login}, a bot account`);
+              return;
+            }
+
+            const current = new Set(issue.labels.map((l) => l.name));
+            const hasArea = AREA_LABELS.some((area) => current.has(area));
+
+            if (hasArea) {
+              console.log(`skip: issue #${issue.number} already carries an area label`);
+              return;
+            }
+            if (current.has("needs-triage")) {
+              console.log(`skip: issue #${issue.number} already carries needs-triage`);
+              return;
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              labels: ["needs-triage"],
+            });
+            console.log(`added needs-triage to issue #${issue.number}`);
