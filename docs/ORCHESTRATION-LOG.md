@@ -117,3 +117,13 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   for the three hand-offs (overlay tag key in images.env; `ghcr.io/m1k1o/neko/base:latest` is a floating base —
   pin by digest; nothing writes the desktop tag back). The push of this merge triggers image.yml for the first time:
   its GHCR pushes and signatures are the proof, watched below. O4 dispatched. Running: T1, T4, O4.
+- 2026-09-04 14:20Z — **T1 merged** (d0bc646): the local host serves `/os` as a plain document with the inlined boot
+  payload, the three bundle files by path with mtime ETags, and all nine `/api/shell/*` routes over an injected
+  `SandboxHost`; 127.0.0.1 only (a wide bind was mutation-proved reachable on 10.60.1.4 and is refused); a fake host
+  claiming `desktopReady: true` was overridden live by a real reachability check (`desktop_unreachable`). Two defects
+  the worker's own positive controls caught: a status poll burned the `isNew` latch; the no-hostname scanner treated
+  `https://` as a comment. Union of T1+T2 verified on main by the supervisor: typecheck clean, **210 pass / 0 fail**
+  including the real boot. Integration seam handed to T5 (measured by T1 on the image): `/etc/neko/neko.yaml` ships
+  `session.implicit_hosting: false`, so a browser session renders the desktop but every click is ignored unless the
+  adapter sets `NEKO_SESSION_IMPLICIT_HOSTING=true` (env binds on this binary — proven with `NEKO_SESSION_FILE`).
+  T5 now owns all of `local/` (T0–T2 are done and nobody else is in it). Running: T4, O4, T5.
