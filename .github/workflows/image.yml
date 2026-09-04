@@ -58,19 +58,6 @@ concurrency:
   group: image-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  # 🔴 HAND-OFF (T3 -> T0): deploy/images.env's EZIL_NEKO_TAG pins the BARE
-  # base only. worker/Dockerfile needs the `-ezil-brandN` OVERLAY of that tag
-  # (T0's finding: the bare base lacks the mobile keyboard and the
-  # black-picture detector). Until deploy/images.env gains a key for that
-  # suffix — proposed: EZIL_NEKO_OVERLAY_TAG=d74052bb-049931d7-ezil-brand8 —
-  # this workflow pins the suffix here rather than inventing a second,
-  # undocumented source of truth. It MUST stay equal to worker/Dockerfile's
-  # own `ARG NEKO_IMAGE` suffix (that file's own 🔴 comment is the authority
-  # on when it changes); the "Load image pins" step below fails the build if
-  # the two ever disagree.
-  NEKO_OVERLAY_SUFFIX: ezil-brand8
-
 jobs:
   neko-base:
     name: neko-base (amd64)
@@ -102,16 +89,31 @@ jobs:
           set +a
           EZIL_NEKO_IMAGE="$(read_env_key EZIL_NEKO_IMAGE deploy/images.env)"
           EZIL_NEKO_TAG="$(read_env_key EZIL_NEKO_TAG deploy/images.env)"
+          EZIL_NEKO_OVERLAY_TAG="$(read_env_key EZIL_NEKO_OVERLAY_TAG deploy/images.env)"
           base_sha8="${NEKO_SHA:0:8}-${NEKO_APPS_SHA:0:8}"
           if [[ "${base_sha8}" != "${EZIL_NEKO_TAG}" ]]; then
             echo "::error::docker/neko/pins.env (${base_sha8}) and deploy/images.env's EZIL_NEKO_TAG (${EZIL_NEKO_TAG}) disagree - bump both together" >&2
             exit 1
           fi
+          if [[ -z "${EZIL_NEKO_OVERLAY_TAG}" ]]; then
+            echo "::error::deploy/images.env has no EZIL_NEKO_OVERLAY_TAG (must be '<EZIL_NEKO_TAG>-<ezil-brandN>')" >&2
+            exit 1
+          fi
+          # The overlay derives from the base: without this check, bumping
+          # EZIL_NEKO_TAG to a new SHA pair while leaving EZIL_NEKO_OVERLAY_TAG
+          # on the old one would still pass the Dockerfile-consistency check
+          # below (both sides would just be checking two independent strings
+          # against each other, not against the base tag they are supposed to
+          # extend) - see deploy/images.env's own PAIRING RULE comment.
+          if [[ "${EZIL_NEKO_OVERLAY_TAG}" != "${EZIL_NEKO_TAG}-"* ]]; then
+            echo "::error::deploy/images.env's EZIL_NEKO_OVERLAY_TAG (${EZIL_NEKO_OVERLAY_TAG}) is not '${EZIL_NEKO_TAG}-<suffix>' - the overlay derives from the base tag; bump both together" >&2
+            exit 1
+          fi
           base_ref="${EZIL_NEKO_IMAGE}:${EZIL_NEKO_TAG}"
-          overlay_ref="${EZIL_NEKO_IMAGE}:${EZIL_NEKO_TAG}-${NEKO_OVERLAY_SUFFIX}"
+          overlay_ref="${EZIL_NEKO_IMAGE}:${EZIL_NEKO_OVERLAY_TAG}"
           dockerfile_arg="$(grep -oP '^ARG NEKO_IMAGE=\K.*' worker/Dockerfile)"
           if [[ "${dockerfile_arg}" != "${overlay_ref}" ]]; then
-            echo "::error::worker/Dockerfile's ARG NEKO_IMAGE (${dockerfile_arg}) does not match the overlay ref this workflow computed (${overlay_ref}) - bump worker/Dockerfile and NEKO_OVERLAY_SUFFIX together" >&2
+            echo "::error::worker/Dockerfile's ARG NEKO_IMAGE (${dockerfile_arg}) does not match the overlay ref this workflow computed (${overlay_ref}) - bump worker/Dockerfile and deploy/images.env's EZIL_NEKO_OVERLAY_TAG together" >&2
             exit 1
           fi
           {
