@@ -161,13 +161,20 @@ committed, and anyone can read what model did what:
   quoted, not paraphrased — and [`artifacts/runs/`](artifacts/runs/), one JSON
   artifact per task with the real evidence behind it.
 
-Commits produced this way carry a `Co-Authored-By:` trailer naming the model, and
-the DCO `Signed-off-by:` line of the maintainer who dispatched the work. The
-sign-off is a human certification under the
-[Developer Certificate of Origin](https://developercertificate.org/) and it does
+A commit produced this way carries the DCO `Signed-off-by:` line of the
+maintainer who dispatched the work, and the rule for this project is that it also
+carries a `Co-Authored-By:` trailer naming the model. The sign-off is a human
+certification under the
+[Developer Certificate of Origin](https://developercertificate.org/), and it does
 not become less human because a machine typed the diff: responsibility for what
 ships rests with the maintainer who signed it off.
 [`CONTRIBUTORS.md`](CONTRIBUTORS.md) says the same thing about authorship.
+
+The trailer half of that rule is **not yet applied consistently** —
+`git log --format='%h %(trailers:key=Co-Authored-By,valueonly)'` shows it on the
+orchestrating session's own commits and missing from the workers'. Until that is
+fixed, the complete record of which model did what is `artifacts/runs/` and the
+log, not the trailer.
 
 ## Changing this document
 
