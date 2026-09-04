@@ -217,6 +217,8 @@ let computerId = '';
 let bootMs = -1;
 let timeToPixelsMs = -1;
 let pixelStats: LuminanceStats | null = null;
+/** Every console line the shell printed. The shell's boot verdict is narrated here and nowhere else. */
+const consoleLines: string[] = [];
 /** The page that holds the live desktop peer. Shared across the ordered tests: a second page would be a SECOND peer, and `is_watching` counts peers. */
 let page: any = null;
 
@@ -432,6 +434,10 @@ describe.skipIf(SKIP_REASON !== null)('local mode, in a real browser', () => {
         page = await context.newPage();
         const failedRequests: string[] = [];
         page.on('response', (r: any) => { if (r.status() >= 400) failedRequests.push(`${r.status()} ${r.url()}`); });
+        // Kept for the reveal assertion below — the shell narrates its own boot
+        // verdict on the console and there is no DOM class that distinguishes
+        // `ready` from `ready_unverified`.
+        page.on('console', (m: any) => consoleLines.push(m.text()));
 
         await page.goto(`${server!.url}/os`, { waitUntil: 'domcontentloaded' });
         // The shell's own mount signal: the taskbar item the boot log calls
@@ -509,6 +515,36 @@ describe.skipIf(SKIP_REASON !== null)('local mode, in a real browser', () => {
         // does not.
         const critical = failedRequests.filter((u) => /bundle\.min\.(js|css)|icons\.js|\/api\/shell\//.test(u));
         expect(critical).toEqual([]);
+
+        // 🔴 PIXELS IN THE FRAME ARE NOT "THE DESKTOP WAS REVEALED", AND THIS
+        // ROW IS WHAT MADE THAT DISTINCTION MATTER. Before it,
+        // `confirm=display` was hardcoded `unknown`, the shell's
+        // `applyDisplayEvidence` mapped that to `ready_unverified`, and the
+        // desktop was ALWAYS shown (with a strip saying nobody checked). This
+        // row made `blank` reachable — and `blank` is TERMINAL in
+        // `desktop-window.js#start_display_gate`: it calls `show_panel()` and
+        // `go_fullbleed` never runs. So a desktop that is painting perfectly
+        // behind a failure panel would satisfy every other assertion in this
+        // test. §16b, one layer up, introduced by the fix for §16b.
+        //
+        // The shell narrates the verdict and only the verdict:
+        // `go_fullbleed(why)` logs `full-bleed (the display was observed
+        // streaming)` for a `ready` and `full-bleed (the display could not be
+        // verified)` for a `ready_unverified`. Asserting the FIRST string
+        // proves three things at once: the panel came down, it came down on a
+        // `live` verdict from this row's new probe, and the user is not
+        // looking at the unverified strip.
+        const revealDeadline = Date.now() + 30_000;
+        while (Date.now() < revealDeadline && !consoleLines.some((l) => l.includes('full-bleed ('))) {
+            await page.waitForTimeout(500);
+        }
+        const reveal = consoleLines.filter((l) => l.includes('full-bleed (')).join(' | ');
+        expect(reveal).toContain('full-bleed (the display was observed streaming)');
+        expect(reveal).not.toContain('could not be verified');
+        // And the gate said so in its own words, with how long it took.
+        const streaming = consoleLines.find((l) => l.includes('the display is streaming'));
+        expect(streaming ?? '(the display gate never reported streaming)').toContain('the display is streaming');
+        console.log(`\n[T5 measured] the shell REVEALED the desktop: ${reveal}\n[T5 measured] ${streaming}\n`);
         const cosmetic = failedRequests.filter((u) => !critical.includes(u));
         if (cosmetic.length > 0) console.log(`      note: ${cosmetic.length} non-critical 4xx — ${cosmetic.slice(0, 3).join(' | ')}`);
 
