@@ -449,11 +449,12 @@ describe("the real backlog is publishable (integration over docs/community/issue
 	const real = loadIssues(defaultIssuesDir());
 
 	it("every file parses and the set topo-sorts without a cycle", () => {
-		expect(real.length).toBeGreaterThanOrEqual(22);
+		expect(real.length).toBe(22);
 		expect(() => topoOrder(real)).not.toThrow();
 	});
 
 	it("every label the 22 issues name exists in the 2026-09-04 repo label snapshot", () => {
+		expect(REPO_LABELS_SNAPSHOT.length).toBe(29);
 		expect(() => validateLabels(real, new Set(REPO_LABELS_SNAPSHOT))).not.toThrow();
 	});
 });
