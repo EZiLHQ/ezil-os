@@ -1,0 +1,33 @@
+{
+	"$schema": "https://json.schemastore.org/tsconfig",
+	"compilerOptions": {
+		/*
+		 * EZiL-OS has no root package.json / tsconfig.json and no
+		 * `packages/contracts` to extend, unlike the EZiL-Works sibling this was
+		 * ported from -- so the strict options that repo's tsconfig.base.json
+		 * would have supplied are inlined here instead of extended.
+		 *
+		 * `allowImportingTsExtensions` because these are Bun scripts run
+		 * directly from source -- they import `./waves.ts`, not `./waves.js`,
+		 * and there is no build step that would make the second true.
+		 */
+		"target": "ESNext",
+		"lib": ["ESNext"],
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"types": ["bun"],
+		/*
+		 * No `bun install` runs in a worktree (node_modules is the main tree's,
+		 * by symlink -- see `sdk/node_modules`). `@types/bun` lives there, so
+		 * typecheck points here instead of the default `node_modules/@types`,
+		 * which does not exist relative to this file.
+		 */
+		"typeRoots": ["../sdk/node_modules/@types"],
+		"strict": true,
+		"noUncheckedIndexedAccess": true,
+		"allowImportingTsExtensions": true,
+		"resolveJsonModule": true,
+		"noEmit": true
+	},
+	"include": ["*.ts"]
+}
