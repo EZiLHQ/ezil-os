@@ -1,0 +1,9 @@
+{
+	"taskId": "A1",
+	"runId": "wf-os-2026-09-04",
+	"status": "running",
+	"doneRung": "INDEPENDENT_TEST_PASS",
+	"evidence": "started; baseline in worktree A1 before first edit: ./tools/test.sh app -> 39 files / 696 tests passed / 0 fail, exit 0.",
+	"startedAt": "2026-09-04T15:05:00Z",
+	"updatedAt": "2026-09-04T15:05:00Z"
+}
