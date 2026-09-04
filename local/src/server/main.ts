@@ -7,22 +7,24 @@
  * learn why from this block rather than from a blank page.
  *
  * ── `--fake-host` ───────────────────────────────────────────────────────────
- * Row T2 owns `../host/docker-host.ts` and this package must never import it
- * (see `./fake-host.ts` for why). Until it lands there is no real adapter to
- * construct, so `--fake-host` is the only way to run this process end to end —
- * and it is what the row's own verification uses. It is LOUD: the startup block
- * says outright that no container will be started, so nobody can mistake a fake
- * boot for a real one.
+ * The real adapter is `../host/docker-host.ts` and `resolveHost()` below now
+ * constructs it (row T5). `--fake-host` remains, as the way to run this process
+ * end to end with no Docker at all — CI's three-OS matrix and the contract
+ * suite use it. It is LOUD: the startup block says outright that no container
+ * will be started, so nobody can mistake a fake boot for a real one.
  *
- * 🔴 THE HAND-OFF, STATED IN CODE. `resolveHost()` below is the ONE place the
- * real adapter gets wired in. It currently refuses rather than falling back to
- * the fake, because a host that quietly served a fake desktop when Docker was
- * missing would be exactly the "asserting health it has not confirmed" failure
- * this project keeps closing.
+ * 🔴 THERE IS STILL NO FALLBACK, AND THAT IS THE RULE. Without `--fake-host`
+ * this process constructs a real `DockerHost` and a boot that cannot reach the
+ * daemon FAILS. It never degrades to the fake, because a host that quietly
+ * served a fake desktop when Docker was missing would be exactly the
+ * "asserting health it has not confirmed" failure this project keeps closing.
+ * `bun run --cwd local doctor` is the thing that tells a user WHY before they
+ * ever start the server.
  */
 
-import { loadConfig, type LocalConfig } from '../config.ts';
-import { LOCAL_PORT_MAP, localUrlFor } from '../container/run-spec.ts';
+import { ENV_KEYS, loadConfig, type LocalConfig } from '../config.ts';
+import { localUrlFor, offsetPortMap } from '../container/run-spec.ts';
+import { DockerHost } from '../host/docker-host.ts';
 import type { SandboxHost } from '../host/sandbox-host.ts';
 import { FakeSandboxHost } from './fake-host.ts';
 import { startLocalServer, type LocalServer } from './server.ts';
@@ -40,18 +42,26 @@ export function wantsFakeHost(argv: readonly string[]): boolean {
 /**
  * The `SandboxHost` this process will drive.
  *
- * 🔴 ROW T2 WIRES THE REAL ONE IN HERE, and this function is the entire change:
- * `return new DockerSandboxHost({ image: config.desktopImage.ref, workspaceHostPath: config.workspacePath })`.
- * Until then, running without `--fake-host` REFUSES rather than degrading — a
- * fallback to the fake would produce a `/os` that boots, a desktop button that
- * reports success, and no container anywhere.
+ * 🔴 THE ONE PLACE THE REAL ADAPTER IS CONSTRUCTED, AND THEREFORE THE ONE
+ * PLACE THE THREE FACTS ABOUT THIS MACHINE MEET IT: which image reference
+ * `deploy/images.env` resolved to, which host directory is the workspace, and
+ * how far the published ports are shifted. The offset in particular has to be
+ * the SAME number the router pins the desktop origin with — one config field,
+ * read once, handed to both — because when they disagreed every cold boot
+ * answered `desktop_frame_foreign_origin` over a healthy container.
+ *
+ * Exported and pure so `local/tests/local-smoke.container.test.ts` drives the
+ * PRODUCTION wiring rather than composing its own `DockerHost`: a smoke test
+ * that builds its own host proves the adapter works and leaves this function
+ * — the only thing a user actually runs — untested.
  */
-export function resolveHost(argv: readonly string[], _config: LocalConfig): SandboxHost {
+export function resolveHost(argv: readonly string[], config: LocalConfig): SandboxHost {
     if (wantsFakeHost(argv)) return new FakeSandboxHost();
-    throw new Error(
-        'no_sandbox_host: the Docker adapter (local/src/host/docker-host.ts, row T2) is not wired in yet.'
-        + ' Re-run with --fake-host to serve /os and the shell API against a host that starts no container.',
-    );
+    return new DockerHost({
+        image: config.desktopImage.ref,
+        workspaceHostPath: config.workspacePath,
+        hostPortOffset: config.hostPortOffset,
+    });
 }
 
 /** The startup block. Every line is something observed, and the ones that are not are labelled. */
@@ -67,8 +77,13 @@ export function startupReport(config: LocalConfig, server: LocalServer, fake: bo
         config.shellAssetsDir === null
             ? `  shell bundle   NOT FOUND — /os will load nothing. Looked in: ${config.shellAssetsSearched.join(', ')}`
             : `  shell bundle   ${config.shellAssetsDir}`,
-        `  desktop port   ${localUrlFor('desktop')}`,
-        `  ports          ${LOCAL_PORT_MAP.map((p) => `${p.name}:${p.host}/${p.protocol}`).join(' ')}`,
+        // 🔴 THE OFFSET MAP, NOT THE CONSTANTS. Printing `LOCAL_PORT_MAP` on a
+        // host running with an offset would tell the user to open a port
+        // nothing is listening on — the startup block's whole job is to be the
+        // place a user learns where their desktop is.
+        `  desktop port   ${localUrlFor('desktop', config.hostPortOffset)}`,
+        `  port offset    ${config.hostPortOffset}${config.hostPortOffset === 0 ? ' (the pinned map)' : ` (${ENV_KEYS.portOffset})`}`,
+        `  ports          ${offsetPortMap(config.hostPortOffset).map((p) => `${p.name}:${p.host}/${p.protocol}`).join(' ')}`,
         // OPTIONAL and unset by default. Reported as configuration, not as a
         // capability: nothing in this package dials either of them today.
         `  mcp endpoint   ${config.mcpEndpoint ?? '(unset)'}`,

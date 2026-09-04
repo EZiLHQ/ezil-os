@@ -52,6 +52,13 @@ import type {
     TerminateResult,
 } from './sandbox-host.ts';
 import {
+    countWatchers,
+    readImplicitHosting,
+    type DesktopIntrospection,
+    type LocalControlMode,
+    type LocalDisplayProbe,
+} from './display-probe.ts';
+import {
     LOCAL_DESKTOP_IMAGE_FALLBACK,
     NEKO_ADMIN_PASSWORD_ENV,
     NEKO_PATHS,
@@ -195,7 +202,21 @@ const READY_POLL_INTERVAL_MS = 500;
 /** The passwords the pinned image ships in `/etc/neko/neko.yaml`. Named so the guard against them is readable, and so a test can assert on the same constant the guard uses. */
 export const IMAGE_DEFAULT_PASSWORDS: readonly string[] = ['admin', 'neko'];
 
-export class DockerHost implements SandboxHost {
+/**
+ * `GET|POST /api/room/settings` — neko's room settings, where
+ * `implicit_hosting` lives. NOT in `NEKO_PATHS`: that object is the closed set
+ * of paths row T2 measured against the image for the readiness oracle, and
+ * this row adds one more. Kept beside its single reader rather than widening a
+ * frozen constant in another file.
+ *
+ * MEASURED against the pinned image (2026-09-04): with an admin bearer,
+ * `GET` -> 200 `{"private_mode":false,"locked_logins":false,"locked_controls":false,
+ * "control_protection":false,"implicit_hosting":true,"inactive_cursors":false,
+ * "merciful_reconnect":true,"heartbeat_interval":10,"plugins":null}`.
+ */
+export const NEKO_ROOM_SETTINGS_PATH = '/api/room/settings';
+
+export class DockerHost implements SandboxHost, DesktopIntrospection {
     private readonly image: string;
     private readonly offset: number;
     private readonly workspaceHostPath: string | undefined;
@@ -620,6 +641,105 @@ export class DockerHost implements SandboxHost {
         this.phases.set(id, 'absent');
         if (after.present) return { ok: false, terminated: false, detail: 'container still present after docker rm --force' };
         return { ok: true, terminated: true };
+    }
+
+    // ── introspection (outside the interface — see ./display-probe.ts) ───────
+
+    /**
+     * Did a real browser peer connect?
+     *
+     * 🔴 THIS IS THE ONE THING A 200 CANNOT TELL YOU, AND THE ONLY WITNESS IS
+     * NEKO. `docs/PLATFORM-NOTES.md` §16b: neko serves its SPA with a 200
+     * whether or not WebRTC will ever connect, the desktop iframe is
+     * cross-origin so `video.videoWidth` is unreachable from the shell, and
+     * `state.is_watching` in `GET /api/sessions` has exactly one writer —
+     * `PeerConnectionStateConnected`. This host holds the container's admin
+     * credential (`credentialsFor`), so unlike row T1's server it CAN ask.
+     *
+     * 🔴 LOGIN, ASK, LOG OUT — DELIBERATELY NOT THE HOSTED TOKEN CACHE.
+     * `probeDesktopDisplay` keeps a token cache because its round trip is a
+     * real network hop from a Vercel function to a container, and the gate asks
+     * two or three times per boot. Here every hop is loopback (measured
+     * milliseconds), and `status()`'s own doc records the failure mode that
+     * matters more locally: the shell polls this gate about once a second, and
+     * a login per poll with no logout MINTS A SESSION PER POLL. That is not
+     * merely untidy — every leaked session is another entry in the very array
+     * this function counts, so a probe that leaked would eventually be
+     * measuring itself. Measured while writing this row: five probe logins in
+     * one run left five sessions in `GET /api/sessions`, all
+     * `is_watching: false`.
+     *
+     * NEVER THROWS. Never returns or logs the credential or the token.
+     */
+    async probeDisplay(id: ComputerId): Promise<LocalDisplayProbe> {
+        let token: string | null;
+        try {
+            token = await this.loginAdmin(id);
+        } catch (err) {
+            // `credentialsFor` throws for a container running on the image's
+            // own defaults. That is a fact about our plumbing, so it is
+            // `unknown` — never `blank`.
+            return { display: 'unknown', reason: `login_failed: ${message(err).slice(0, 120)}` };
+        }
+        if (token === null) return { display: 'unknown', reason: 'login_failed' };
+        try {
+            const res = await this.httpFetch(`${this.desktopOrigin()}${NEKO_PATHS.sessions}`, {
+                method: 'GET',
+                headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+            });
+            if (!res.ok) return { display: 'unknown', reason: `http_error_${res.status}` };
+            const body: unknown = await res.json().catch(() => null);
+            const counted = countWatchers(body);
+            if (counted === null) return { display: 'unknown', reason: 'unrecognised' };
+            return counted.watching > 0
+                ? { display: 'live', sessions: counted.sessions, watching: counted.watching }
+                : { display: 'blank', sessions: counted.sessions, watching: 0 };
+        } catch (err) {
+            return { display: 'unknown', reason: `unreachable: ${message(err).slice(0, 120)}` };
+        } finally {
+            await this.logout(token);
+        }
+    }
+
+    /**
+     * Does a plain click control this desktop?
+     *
+     * 🔴 A READ-BACK, NOT AN ECHO OF THE ENVIRONMENT WE SET. `buildContainerEnv`
+     * always sets `NEKO_SESSION_IMPLICIT_HOSTING=true` and fails closed if
+     * anything overrides it — but "we set the variable" and "neko is in that
+     * mode" are different facts, exactly as `setScreen`'s POST body and the X
+     * display are different facts. This asks `GET /api/room/settings` and
+     * reports `implicit` only on a literal `implicit_hosting: true`, which is
+     * the same read the hosted `enableImplicitHosting` does before deciding it
+     * has nothing to write.
+     *
+     * A container booted WITHOUT the variable answers `implicit_hosting: false`
+     * here and this returns `'manual'` — measured, and that is the
+     * container-level mutation proof for the environment variable.
+     *
+     * NEVER THROWS: `'manual'` is the honest answer to every failure, and the
+     * shell renders a visible fallback affordance for it.
+     */
+    async readControlMode(id: ComputerId): Promise<LocalControlMode> {
+        let token: string | null;
+        try {
+            token = await this.loginAdmin(id);
+        } catch {
+            return 'manual';
+        }
+        if (token === null) return 'manual';
+        try {
+            const res = await this.httpFetch(`${this.desktopOrigin()}${NEKO_ROOM_SETTINGS_PATH}`, {
+                method: 'GET',
+                headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+            });
+            if (!res.ok) return 'manual';
+            return readImplicitHosting(await res.json().catch(() => null));
+        } catch {
+            return 'manual';
+        } finally {
+            await this.logout(token);
+        }
     }
 
     // ── diagnostics (outside the interface) ──────────────────────────────────

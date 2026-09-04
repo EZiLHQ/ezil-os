@@ -38,6 +38,7 @@ import { SHELL_API_ROUTES } from '../contract/shell-api.ts';
 import type { ShellBootComputer } from '../contract/shell-api.ts';
 import { buildLocalBootPayload, buildLocalSessionPayload } from '../boot/payload.ts';
 import { asRecord, newCorrelationId, readJsonBody, shellError, shellJson } from './http.ts';
+import { canIntrospect, type LocalControlMode } from '../host/display-probe.ts';
 
 /**
  * The provider tag every hosted answer carries.
@@ -72,8 +73,22 @@ export const FRAME_PROBE_TIMEOUT_MS = 3_000;
  * simple cross-origin POST/GET (no preflight). The hosted route pins the same
  * value inside the procedure (`isOwnDesktopOrigin`); this is that pin, with the
  * one origin local mode has.
+ *
+ * 🔴 `offset` IS NOT OPTIONAL POLISH — IT IS THE ROW T5 DEFECT, MEASURED.
+ * This function pinned `localUrlFor('desktop')` at offset 0. On this machine
+ * `supabase-kong` holds `0.0.0.0:8443`, so the container has to run at
+ * `hostPortOffset: 10000` and its desktop origin is `127.0.0.1:18181`. The pin
+ * then rejected the host's OWN url, the cold boot answered
+ * `desktop_frame_foreign_origin`, and the shell rendered `desktop_unreachable`
+ * over a container that was booted, healthy and answering
+ * (`[ezil-os:desktop] boot failed after 1639ms: desktop_unreachable
+ * (desktop_frame_foreign_origin)`, real browser, 2026-09-04). Every unit test
+ * stayed green because they all run at offset 0 against a fake host, and
+ * nothing had ever driven a real offset and a real browser together. The
+ * parameter defaults to 0 so an unoffset call is byte-identical; `../config.ts`
+ * carries the real value and `./server.ts` threads it in.
  */
-export function isOwnDesktopOrigin(raw: string): boolean {
+export function isOwnDesktopOrigin(raw: string, offset = 0): boolean {
     let url: URL;
     try {
         url = new URL(raw);
@@ -82,7 +97,7 @@ export function isOwnDesktopOrigin(raw: string): boolean {
     }
     let own: URL;
     try {
-        own = new URL(localUrlFor('desktop'));
+        own = new URL(localUrlFor('desktop', offset));
     } catch {
         return false;
     }
@@ -90,8 +105,8 @@ export function isOwnDesktopOrigin(raw: string): boolean {
 }
 
 /** The real probe: one GET at the desktop origin, read the status line. Injectable, so the contract test never needs a container. */
-export async function probeDesktopOrigin(rawUrl: string): Promise<FrameProbe> {
-    if (!isOwnDesktopOrigin(rawUrl)) return { alive: false, reason: 'foreign_origin' };
+export async function probeDesktopOrigin(rawUrl: string, offset = 0): Promise<FrameProbe> {
+    if (!isOwnDesktopOrigin(rawUrl, offset)) return { alive: false, reason: 'foreign_origin' };
     try {
         const res = await fetch(rawUrl, {
             method: 'GET',
@@ -146,7 +161,16 @@ export interface ShellRouterDeps {
     /** Append one telemetry batch to the NDJSON sink. Never throws out. */
     readonly appendTelemetry: (record: unknown) => Promise<void>;
     /** Overridable for tests. Defaults to `probeDesktopOrigin`. */
-    readonly probeFrame?: (url: string) => Promise<FrameProbe>;
+    readonly probeFrame?: (url: string, offset?: number) => Promise<FrameProbe>;
+    /**
+     * How far this host's published container ports are shifted. `0` when
+     * absent, which is every existing test.
+     *
+     * 🔴 THE SERVER NEEDS THIS AND USED NOT TO HAVE IT. See
+     * `isOwnDesktopOrigin`: without it the frame pin rejects the host's own
+     * desktop URL on any machine that needed an offset to boot at all.
+     */
+    readonly hostPortOffset?: number;
     readonly now?: () => number;
 }
 
@@ -267,7 +291,7 @@ async function handleDesktopGet(req: Request, deps: ShellRouterDeps): Promise<Re
     const confirm = params.get('confirm');
 
     if (confirm === 'frame') {
-        const probe = await (deps.probeFrame ?? probeDesktopOrigin)(params.get('frameUrl') ?? '');
+        const probe = await (deps.probeFrame ?? probeDesktopOrigin)(params.get('frameUrl') ?? '', deps.hostPortOffset ?? 0);
         // `session.js#confirmFrame` reads `data.ok === true` then
         // `data.confirmed === true`; anything else is `undefined`, which is not
         // an observation and must not be read as either verdict.
@@ -281,22 +305,40 @@ async function handleDesktopGet(req: Request, deps: ShellRouterDeps): Promise<Re
     }
 
     if (confirm === 'display') {
-        // 🔴 `unknown`, ALWAYS, AND IT IS THE HONEST ANSWER — not a stub.
-        // `docs/PLATFORM-NOTES.md` §16b: the only thing that knows whether a
-        // WebRTC peer is connected is neko's own `GET /api/sessions`, and
-        // reading it needs an authenticated login with the container's admin
-        // password. `SandboxHost` exposes no credential (`DesktopUrls` is three
-        // strings) and this host never mints one, so there is nothing here that
-        // could observe the far end of the pipe.
+        // 🔴 THE ONE QUESTION AN HTTP 200 CANNOT ANSWER, ASKED FOR REAL NOW.
+        // `docs/PLATFORM-NOTES.md` §16b: the only witness to a connected WebRTC
+        // peer is neko's own `GET /api/sessions`, behind an authenticated
+        // login with the container's ADMIN password. `SandboxHost` exposes no
+        // credential (`DesktopUrls` is three strings) — which is why row T1
+        // could only ever answer `unknown` here — but the adapter that MINTED
+        // that password can ask, so the question is delegated to the host
+        // through the optional capability in `../host/display-probe.ts`.
         //
-        // §16b is explicit about what must happen then: `unknown` is a fact
-        // about OUR plumbing, not about the user's screen, and collapsing it
-        // into `blank` would show a failure panel over a desktop that is
-        // streaming perfectly. The shell's `applyDisplayEvidence` renders this
-        // as `ready_unverified` — the desktop is shown, with a strip saying
-        // plainly that nobody checked it. See the report's hand-off for the
-        // credential this would need.
-        return shellJson({ ok: true, display: 'unknown', reason: 'no_local_display_probe', correlationId });
+        // 🔴 AND THE FALLBACK IS UNCHANGED AND STILL CORRECT. A host without
+        // the capability (`./fake-host.ts`, or any future adapter) answers
+        // `unknown` exactly as before: §16b is explicit that a non-answer is a
+        // fact about OUR plumbing, not about the user's screen, and collapsing
+        // it into `blank` would show a failure panel over a desktop that is
+        // streaming perfectly. The shell's `applyDisplayEvidence` renders
+        // `unknown` as `ready_unverified` — the desktop is shown, with a strip
+        // saying plainly that nobody checked it.
+        if (!canIntrospect(deps.host)) {
+            return shellJson({ ok: true, display: 'unknown', reason: 'no_local_display_probe', correlationId });
+        }
+        const probe = await deps.host.probeDisplay(computerId);
+        return shellJson({
+            ok: true,
+            display: probe.display,
+            // The reason is only ever present for `unknown` — a `live` or
+            // `blank` that carried one would read as a caveat on an answer we
+            // actually have.
+            ...(probe.reason === undefined ? {} : { reason: probe.reason }),
+            // Relayed so a troubleshooting view can say WHICH count produced
+            // the verdict. Absent whenever the list was not understood.
+            ...(probe.sessions === undefined ? {} : { sessions: probe.sessions }),
+            ...(probe.watching === undefined ? {} : { watching: probe.watching }),
+            correlationId,
+        });
     }
 
     const status = await deps.host.status(computerId);
@@ -397,7 +439,7 @@ async function handleDesktopPost(req: Request, deps: ShellRouterDeps): Promise<R
     }
 
     const urls = await deps.host.desktopUrls(computerId);
-    const frame = await (deps.probeFrame ?? probeDesktopOrigin)(urls.desktop);
+    const frame = await (deps.probeFrame ?? probeDesktopOrigin)(urls.desktop, deps.hostPortOffset ?? 0);
     if (!frame.alive) {
         return shellJson({
             ok: false,
@@ -430,6 +472,13 @@ async function handleDesktopPost(req: Request, deps: ShellRouterDeps): Promise<R
         }
     }
 
+    // 🔴 AFTER the frame check, not before: this is one more authenticated
+    // round trip to the same origin, and there is no point paying for it on a
+    // boot that is about to report `desktop_unreachable`.
+    const controlMode: LocalControlMode = canIntrospect(deps.host)
+        ? await deps.host.readControlMode(computerId)
+        : 'manual';
+
     deps.markOpened();
 
     return shellJson({
@@ -441,16 +490,21 @@ async function handleDesktopPost(req: Request, deps: ShellRouterDeps): Promise<R
         provider: LOCAL_DESKTOP_PROVIDER_TAG,
         mode: 'neko',
         workspace: { mountPath: CONTAINER_WORKSPACE_PATH },
-        // 🔴 `'manual'`, and it is the true value rather than a placeholder.
-        // The hosted path returns `'implicit'` only after `enableImplicitHosting`
-        // has POSTed `/api/login` with the container's admin password; this host
-        // has no credential (see `confirm=display` above) and performs no
-        // handshake, which is exactly the condition the hosted code reports as
-        // `'manual'`. MEASURED, and it is the reason this matters: the pinned
-        // image's `/etc/neko/neko.yaml` ships `session.implicit_hosting: false`,
-        // so without either the handshake or the container env override the
-        // desktop renders and ignores clicks. See the report's hand-off to T2.
-        controlMode: 'manual',
+        // 🔴 READ BACK OUT OF NEKO, NEVER INFERRED FROM HAVING SET THE FLAG.
+        // The pinned image's `/etc/neko/neko.yaml` ships
+        // `session.implicit_hosting: false`, so a desktop booted without an
+        // override renders perfectly and ignores every click — and no HTTP
+        // check in this package can tell the two apart.
+        // `buildContainerEnv` now always sets
+        // `NEKO_SESSION_IMPLICIT_HOSTING=true` (and fails closed if anything
+        // overrides it), which is the ASK; `readControlMode` GETs
+        // `/api/room/settings` and reports `implicit` only on a literal
+        // `implicit_hosting: true`, which is the ANSWER. Same rule as
+        // `setScreen`: the request body is not evidence, the read-back is.
+        // A host with no credential (`./fake-host.ts`) keeps the honest
+        // `'manual'` this route shipped before — the shell renders a visible
+        // fallback affordance for it.
+        controlMode,
         // What the SERVER observed before handing the URL over.
         // `session.js` reads `data.frame?.confirmed === true`, strictly, and
         // never defaults it to true.
