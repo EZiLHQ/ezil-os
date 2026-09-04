@@ -325,6 +325,20 @@ run_shell () {
     # decoration: `app/public/os/bundle.min.js` is COMMITTED, and a source
     # change without a rebuild ships the old behaviour while everything else
     # passes against the new source.
+    #
+    # 🔴 MEASURED BLOCKER, in a file this row does not own: with neither
+    # PLAYWRIGHT_REQUIRE_DIR nor EZIL_PLAYWRIGHT_DIR set -- the default state of
+    # this machine and of a CI runner before the install step --
+    # `shell/run-tests.sh` line 161 aborts with
+    #
+    #     shell/run-tests.sh: line 161: EZIL_PLAYWRIGHT_DIR: unbound variable
+    #
+    # because that line expands `$EZIL_PLAYWRIGHT_DIR` inside a message meant to
+    # print the variable NAME, under its own `set -u`. It fails closed (exit 1),
+    # so nothing is reported green that was not run, but the shell suites cannot
+    # run at all until it reads `\$EZIL_PLAYWRIGHT_DIR`. Handed off in the O3
+    # report. This wrapper deliberately does not work around it: setting the
+    # variable here would hide a broken runner.
     local args=(--strict)
     if [ "${EZIL_ALLOW_SKIPPED_BROWSER_SUITES:-0}" = "1" ]; then
         say "EZIL_ALLOW_SKIPPED_BROWSER_SUITES=1: a browser suite that DID NOT RUN will not fail"
