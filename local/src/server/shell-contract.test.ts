@@ -28,7 +28,13 @@ import { loadConfig, SHELL_ASSET_FILES, type LocalConfig } from '../config.ts';
 import { localUrlFor } from '../container/run-spec.ts';
 import { SHELL_API_ROUTES } from '../contract/shell-api.ts';
 import { FakeSandboxHost, healthyFakeState, type FakeHostState } from './fake-host.ts';
-import { LOCAL_FOCUSABLE_APPS, shellRoutes, type FrameProbe } from './routes.ts';
+import {
+    LOCAL_FOCUSABLE_APPS,
+    isOwnDesktopOrigin,
+    probeDesktopOrigin,
+    shellRoutes,
+    type FrameProbe,
+} from './routes.ts';
 import { startLocalServer, type LocalServer } from './server.ts';
 
 // ── Harness ──────────────────────────────────────────────────────────────────
@@ -934,5 +940,50 @@ describe('boundary behaviour', () => {
             body: JSON.stringify({ computerId: computerId(), app: 'chromium', pad: 'x'.repeat(70_000) }),
         });
         expect(res.status).toBe(413);
+    });
+});
+
+// ── The frame probe's origin pin ─────────────────────────────────────────────
+
+describe('the frame probe only ever fetches our own desktop origin', () => {
+    it('accepts the desktop origin and nothing else', () => {
+        // 🔴 `frameUrl` ARRIVES FROM THE BROWSER. Without this pin the local
+        // host is an SSRF gadget: any page the user has open can aim a
+        // no-preflight cross-origin GET at `/api/shell/desktop?confirm=frame`
+        // and have this process fetch an arbitrary address on the user's LAN,
+        // then read the verdict back. The hosted route pins the same value
+        // inside the procedure (`isOwnDesktopOrigin`).
+        expect(isOwnDesktopOrigin(localUrlFor('desktop'))).toBe(true);
+        expect(isOwnDesktopOrigin(`${localUrlFor('desktop')}/?usr=EZiL&embed=1`)).toBe(true);
+        for (const foreign of [
+            localUrlFor('code'),          // a different port on the same host
+            'http://192.168.1.9:8181/',   // the LAN
+            'http://169.254.169.254/',    // a cloud metadata service
+            'file:///etc/passwd',
+            'not a url',
+            '',
+        ]) {
+            expect(`${foreign} -> ${String(isOwnDesktopOrigin(foreign))}`).toBe(`${foreign} -> false`);
+        }
+    });
+
+    it('refuses a foreign origin WITHOUT making the request', async () => {
+        // A port nothing is listening on: if the probe fetched it we would get
+        // `unreachable` after a connect attempt. `foreign_origin` is only
+        // reachable from the pin, before any socket is opened.
+        const verdict = await probeDesktopOrigin('http://127.0.0.1:1/');
+        expect(verdict.reason).toBe('foreign_origin');
+        expect(verdict.alive).toBe(false);
+    });
+
+    it('POSITIVE CONTROL: the probe really does make a request for its own origin', async () => {
+        // Without this, `foreign_origin` above could just as well be a probe
+        // that never does anything at all.
+        const verdict = await probeDesktopOrigin(localUrlFor('desktop'));
+        // Nothing is serving the desktop port in this suite, so the honest
+        // answer is a failed connection — NOT `foreign_origin`, and never
+        // `alive`.
+        expect(verdict.reason).not.toBe('foreign_origin');
+        expect(verdict.alive).toBe(false);
     });
 });
