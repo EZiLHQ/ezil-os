@@ -202,7 +202,7 @@ The real-browser smoke (`local/tests/local-smoke.container.test.ts`, 6 tests,
 a real container plus real Chromium) measured, at `EZIL_LOCAL_PORT_OFFSET=10000`:
 
 - **Cold boot** through `POST /api/shell/desktop`: **5.7–9.1 s**.
-- **Time to non-uniform pixels** after the window opened: **2.2–5.4 s**.
+- **Time to non-uniform pixels** after the window opened: **2.2–4.4 s**.
 - A pixel statistic over a 160×100 downsample of the decoded `<video>` inside
   the desktop iframe was well past the threshold that separates "a real
   picture" from "a flat colour" (`stdDev 58.8` against a `>= 8` threshold,
