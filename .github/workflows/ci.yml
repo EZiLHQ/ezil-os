@@ -100,7 +100,25 @@ jobs:
         # includes `shell-scripts-parse.test.ts`, which runs `bash -n` on
         # every shipped `.sh` — on the Windows leg that resolves `bash` from
         # Git for Windows, which every GitHub-hosted Windows runner ships.
-        run: bun test
+        #
+        # `--reporter=junit`: bun's default console reporter, MEASURED,
+        # prints per-test names for FAILURES only — a fully passing run
+        # prints just the ` N pass / N fail` summary, never the individual
+        # test names. That is true on every OS, but it means this row's own
+        # verify_cmd ("Windows leg log shows bash -n file list") would be
+        # unsatisfiable from `bun test` alone even on a green run. The JUnit
+        # XML lists every test regardless of outcome; exit code is unchanged
+        # by adding a second reporter (measured: still 0 on pass, nonzero on
+        # any failure).
+        run: bun test --reporter=junit --reporter-outfile=/tmp/worker-junit.xml
+      # Prints exactly the evidence this row's verify_cmd asks for, without
+      # dumping the full (much larger) JUnit report into the log.
+      - name: Show the bash -n file list (verify_cmd evidence)
+        shell: bash
+        run: |
+          echo "bash -n was run, this leg (${{ runner.os }}), against:"
+          grep -oE '<testcase name="[^"]*parses under `bash -n`"' /tmp/worker-junit.xml \
+            | sed -E 's/^<testcase name="//; s/"$//'
 
   app:
     name: app (typecheck + unit)
@@ -412,6 +430,19 @@ jobs:
         run: |
           if ! bun test local/ 2>&1 | tee /tmp/local-test.log; then
             echo "::error::bun test local/ failed outright — see the log above."
+            exit 1
+          fi
+          # 🔴 POSITIVE CONTROL, NOT JUST A NEGATIVE ASSERTION. `bun-version:
+          # latest` above means bun's summary format is not pinned, and the
+          # skip check below trusts a specific format (` N skip`, measured
+          # against bun 1.3.14). A silent reporter-format change would make
+          # the grep below match nothing, `skip_count` would come back empty,
+          # and this job would go green having proven nothing — the exact
+          # failure mode this job exists to prevent, reproduced inside its own
+          # guard. So: first assert the parser can see ANYTHING in bun's
+          # summary at all; only trust "0 skips" once that holds.
+          if ! grep -qE '^ +[0-9]+ pass$' /tmp/local-test.log; then
+            echo "::error::bun's summary line (' N pass') was not found in the output above — the skip check below cannot be trusted (reporter format may have changed; this job runs bun-version: latest). Failing rather than silently reporting green."
             exit 1
           fi
           skip_count="$(grep -oE '^ [0-9]+ skip$' /tmp/local-test.log | grep -oE '[0-9]+' || true)"
