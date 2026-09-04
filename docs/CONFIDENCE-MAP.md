@@ -453,3 +453,137 @@ refuse**. The images exist and are signed (`image.yml` ran three times) and *no
 member of the public can pull them*. Making the packages public is a founder
 step, and until it happens `gh attestation verify` cannot be run by an outsider
 either.
+
+### 3.9 Local mode for real: the package suite, the launcher, the residency oracle
+
+```
+$ PLAYWRIGHT_REQUIRE_DIR=/opt/ezil-testkit/node_modules EZIL_LOCAL_PORT_OFFSET=10000 ./tools/test.sh local
+```
+Exit **0** — `307 pass / 0 fail, 307 tests across 14 files [35.46s]`, and the
+container suites really booted (no skip was recorded, and `tools/test.sh` would
+have refused the run if one had been):
+
+```
+tests/local-smoke.container.test.ts
+[T5 measured] cold boot through POST /api/shell/desktop: 6.3s (offset 10000, image ezil-os-worker-sandbox:ff199202)
+[T5 measured] time to non-uniform pixels after the window opened: 2546ms
+[T5 measured] samples=16000 min=11.3 max=254.3 mean=36.4 stdDev=58.8 buckets=29/32 — non-uniform
+[T5 measured] the shell REVEALED the desktop: [ezil-os:desktop] full-bleed (the display was observed streaming)
+[T5 measured] input oracle (a) /api/room/control: has_host false -> true, host_id EZiL-eXYs3
+[T5 measured] input oracle (b) xdotool: pointer 960,960 -> 383,268 (expected 384,270 …)
+[T5 measured] input oracle (c) /tmp/neko.log: "session host changed"
+src/host/docker-host.container.test.ts
+[T2 measured] cold boot (docker run -> authenticated neko login): 5.6s
+```
+Those `[T5 measured]` / `[T2 measured]` lines are this session's own numbers —
+the suites print with that prefix; they are not quotations from `T5`'s report.
+`stdDev 58.8` against `MIN_STD_DEV = 8` is the seven-fold margin the oracle's
+comment claims, re-observed.
+
+**The launcher, run for real.**
+```
+$ EZIL_LAUNCHER_IMAGE=ezil-os-worker-sandbox:ff199202 EZIL_LOCAL_PORT_OFFSET=10000 \
+  ./deploy/launcher/ezil-os.sh --no-browser        # backgrounded
+[ezil-os] EZiL OS is up: http://127.0.0.1:7080/os
+$ curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:7080/os      → 200
+$ kill -INT <launcher>
+[ezil-os] Stopping the local host...               # process exited; ss: 127.0.0.1:7080 released
+$ docker ps -a --format '{{.Names}}' | grep '^ezil-os-'   → (none)
+$ ss -lun | grep 62100                                    → (none)
+```
+Note the port arithmetic, because the brief's two port numbers come from
+different maps: `EZIL_LOCAL_PORT_OFFSET` moves the container's **published**
+ports (`WEBRTC_MUX_PORT = 52100` → `62100`) and does **not** move the host's own
+HTTP port (`EZIL_LOCAL_PORT`, default `7080`), so `127.0.0.1:7080/os` is right
+and `62100` is right. The launcher's own cleanup is careful in a way worth
+recording: it diffs `docker ps -aq --filter name=^ezil-os-` from before its own
+start, so it destroys only containers **it** created — on this machine, where
+three sibling worktrees are live, that is the difference between a clean exit and
+eating another agent's work.
+
+**The residency oracle, measured three ways.**
+
+| what | container after | verdict |
+|---|---|---|
+| launcher SIGINT'd after `/os` answered | none named `ezil-os-*`; `7080` released; no UDP 62100 | clean |
+| `bun test src/neko-browser-window.container.test.ts` run to completion (8 pass / 0 fail) | its `ezil-w9-validate-1052319-…` gone | clean — `afterAll` `docker rm -f` fires |
+| the **same** run SIGTERM'd mid-flight | `ezil-w9-validate-1062672-ednauc  Up` — still running | 🔴 **orphan** |
+
+🔴 **Finding, measured not inferred.** This pass's own first attempt at the
+container suites was killed by a two-minute command timeout, and left
+`ezil-w9-validate-952616-srjpt3` **resident for eight minutes holding 456.2 MiB**
+(`docker stats --no-stream`) after its owning process was gone. The hypothesis
+was then confirmed deliberately: start the suite, wait for the container, send
+`SIGTERM`, and the container survives. `worker/src/neko-browser-window.container.test.ts:191`
+cleans up in `afterAll` and has **no signal trap**, so any cancellation —
+Ctrl-C, a CI job cancellation, a harness timeout — orphans a container built from
+a 4.57 GB image. On a GitHub runner the VM is discarded so it costs nothing; on a
+contributor's machine it is invisible and permanent. Two of `main`'s CI runs today
+(`33874099090`, `33874063339`) were in fact `cancelled` mid-flight. Both orphans
+this pass created were removed before it finished
+(`docker ps -a | grep ezil-os` → nothing).
+
+**Cloud residency: unchanged, and deliberately not re-measured.** No deploy
+happened this round — `deploy.yml` has never run, there is no tag, `os.ezil.work`
+does not exist — so the cost/residency picture for the hosted product is exactly
+what `docs/RUNBOOK.md` already records, and this pass adds nothing to it. Saying
+anything else here would be invention.
+
+### 3.10 The remaining row-level checks
+
+```
+$ git check-ignore -v .claude/agents/verifier.md     → exit 1 (prints nothing: NOT ignored) ✔
+$ git check-ignore -v .claude/worktrees/x            → .gitignore:52 (ignored) ✔
+$ git ls-files .claude/agents/                       → 6 files (_MANDATORY + 5 roles) ✔
+```
+
+```
+$ bun test worker/src/browser-sidecar-contract.test.ts   (inside this worktree)
+10 pass / 0 fail / 61 expect() calls, 0 skip
+```
+Row `M2`'s claim, verified where it actually failed: **inside a worktree**. Before
+`M2` this file skipped all ten because it resolved the contract path to the
+worktree root.
+
+**Row `M3`, mutation-proved by faking the platform** — the only way to exercise an
+off-Linux branch from Linux. A `--preload` that does
+`Object.defineProperty(process, 'platform', { value: 'darwin' })`:
+
+```
+control (real linux)  bun test worker/src/neko-teardown-orphans.test.ts   → 5 pass / 0 fail / 41 expect() [46.11s]
+mutant  (platform=darwin)                                                 → 0 pass / 5 skip / 0 fail [40.00ms]
+    "SKIPPING the teardown-orphans suite: executes scripts/start-neko.sh's teardown for real,
+     reading /proc/<pid>/stat … neither exists on darwin; not meaningful there.
+     Nothing about whether teardown kills the applications … has been verified by this run"
+```
+Five **recorded skips**, not five early returns counted as passes — which is the
+exact difference `tools/test.sh`'s vacuous-pass gate exists to police, and the
+difference `M1` had to fix in the other file.
+
+```
+$ bun -e '<relative-link resolver over the four docs>'
+GOVERNANCE.md: 22 relative links, 0 dead
+ROADMAP.md: 23 relative links, 0 dead
+docs/ORCHESTRATION.md: 16 relative links, 0 dead
+docs/CONFIDENCE-MAP.md: 1 relative links, 0 dead
+```
+
+```
+$ gh pr list --state all --author app/dependabot -L 20
+12 dependabot PRs: 11 CLOSED, 1 OPEN (#5, the grouped patch-and-minor)
+```
+Row `D1`'s policy has a measurable outcome, not just a committed file: every
+major-version bump (`actions/checkout` 4→7, `setup-node` 4→7, `typescript`
+5.9→7.0, `zod` 3→4, `eslint` 9→10, `motion` 11→13, `sonner` 1→2,
+`codeql-action` 3→4, `labeler` 5→7, `stale` 9→11, `@cloudflare/workers-types`)
+is closed; the grouped patch/minor PR is the only one still open.
+
+🔴 **One weakening that is still in force**, found while checking whether any
+harness had been softened for green: `.gitattributes` pins `*.mjs` to `eol=lf`
+but leaves `*.css`, `*.svg` and the non-`.mjs` shell JS under bare
+`* text=auto`, so a Windows checkout gets CRLF for them — and `ci.yml:320`
+therefore runs the **bundle-diff step** under `if: runner.os != 'Windows'`. The
+gate that stops a stale committed `app/public/os/bundle.min.js` from shipping is
+consequently never exercised on Windows. `T4` recorded this as a hand-off for
+`.gitattributes`; nothing has taken it. Hand-off: `.gitattributes:19-26` and
+`.github/workflows/ci.yml:320`.
