@@ -25,12 +25,17 @@
  */
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
 import { OS_ACCESS_NOT_INVITED } from '@/server/api/os-access';
 
-const here = path.dirname(new URL(import.meta.url).pathname);
+// 🔴 `fileURLToPath`, not `new URL(...).pathname`: on win32 the latter yields
+// `/C:/…`, which `path.resolve` then mangles, and this matrix has a Windows
+// runner. `\r\n` is normalised for the same reason — a checkout with CRLF
+// endings must not fail a source pin that is about code, not line endings.
+const here = path.dirname(fileURLToPath(import.meta.url));
 const read = (p: string) => readFileSync(path.resolve(here, p), 'utf8').replace(/\r\n/g, '\n');
 
 /** Strip comments, so documenting a trap does not read as falling into it. */

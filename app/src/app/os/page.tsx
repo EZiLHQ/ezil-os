@@ -50,6 +50,16 @@ import { HydrationSignal } from './hydration-signal';
  * app deployed in the database's region, where that 240ms is single digits.
  * Do not claim the target is met until one of those has been measured.
  *
+ * 🔴 THAT 414ms IS STALE, AND KNOWINGLY SO. It was measured before the access
+ * gate below existed. The gate adds ONE MORE SERIAL database round trip — a
+ * primary-key read of `ezil_os_access` that cannot be folded into the
+ * `Promise.all`, because its whole purpose is to happen before the call that
+ * writes. On the same host that made `select 1` cost 120ms, expect roughly
+ * that much on top; in `open` mode it costs nothing at all (the mode
+ * short-circuits before any query — see `server/api/os-access.ts`). Nobody has
+ * re-measured the number, so treat 414ms as a floor, not as the current
+ * figure, and re-measure before quoting it.
+ *
  * ── Three known costs, all deliberate ───────────────────────────────────────
  * 1. This page inherits the root layout (`src/app/layout.tsx`), so React and
  *    `TRPCReactProvider` are still shipped and hydrated even though this page

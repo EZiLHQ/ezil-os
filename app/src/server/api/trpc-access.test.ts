@@ -37,6 +37,7 @@ const testEnv = vi.hoisted(() => {
 
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { TRPCError } from '@trpc/server';
 import { drizzle } from 'drizzle-orm/pg-proxy';
@@ -253,7 +254,11 @@ describe('the refused principal never reaches the computer-creating call', () =>
 
 // ── Source pins: the properties no runtime assertion can see ────────────────
 
-const here = path.dirname(new URL(import.meta.url).pathname);
+// 🔴 `fileURLToPath`, not `new URL(...).pathname`: on win32 the latter yields
+// `/C:/…`, which `path.resolve` then mangles, and this matrix has a Windows
+// runner. `\r\n` is normalised so a CRLF checkout does not fail a pin that is
+// about code rather than line endings.
+const here = path.dirname(fileURLToPath(import.meta.url));
 const trpcSource = readFileSync(path.resolve(here, './trpc.ts'), 'utf8').replace(/\r\n/g, '\n');
 /** Strip comments, so documenting a trap does not read as falling into it. */
 const code = (source: string) =>
