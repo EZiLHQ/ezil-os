@@ -1,0 +1,9 @@
+{
+  "taskId": "R1",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "STATIC_CHECKS_PASS",
+  "evidence": "starting: deploy.yml gains an image-wait job + a release-publish job; release.yml gains --draft plus an rc-fallback CHANGELOG extractor; CHANGELOG.md cut to 0.2.0 (+0.2.0-rc.1); docs/RELEASE.md written. Orientation complete (T3/T6/R1/R2 rows, ORCHESTRATION-LOG, deploy.yml/image.yml/release.yml, CHANGELOG, RUNBOOK Before-the-next-deploy/Secret-rotation, images.env, GOVERNANCE Releases), advisor consulted.",
+  "startedAt": "2026-09-04T11:59:00Z",
+  "updatedAt": "2026-09-04T11:59:00Z"
+}
