@@ -248,3 +248,15 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   hand-off artifact for the tag write-back. T7 at DEPLOYED. Repository now has auto-merge and delete-branch-on-merge
   enabled; PR #15 landed as the first squash-merged change under the ruleset. Process note: two docs branches that
   both append to this file conflict on rebase — rebuild the later one on the merged `main` instead of rebasing.
+- 2026-09-05 00:50Z — **A2 returned; landing as PR #17** (squash, auto-merge armed). One authorization implementation:
+  `createTRPCContext` computes access lazily once per request; `protectedProcedure` refuses `FORBIDDEN not_invited`
+  for cookie and bearer callers alike. Page gates on `/os`, `/computers`, `/computer/*` refuse to
+  `/login?error=not_invited` (never `returnUrl`, which would loop); the login page renders the refusal with a sign-out.
+  Sign-up deleted and source-pinned (a new `auth.signUp(` anywhere under `app/src` fails a test). Invited landing both
+  ways: `/auth/confirm` (`token_hash` + `verifyOtp`) and `/auth/invited` (implicit fragment → `setSession` → set
+  password → document load) — primary source: `@supabase/ssr` hard-codes PKCE and auth-js throws on an invite
+  fragment, so the explicit `setSession` is the only path that works. 44 files / 817 pass; six mutants RED, the
+  headline one showing a refused stranger reaching the `ezil_computers` select that precedes the insert once the
+  procedure check is gone. Not proven here: cookies on `/auth/confirm`'s redirect and the invited landing end to end —
+  R2's steps 1–7 are in the worker's report. Founder steps (F1 redirect URL, F2 optional template, e2e account row)
+  appended to the founder script. T8 dispatched (CI pulls the GHCR image; retires the placeholder). Running: T6, M1, T8.
