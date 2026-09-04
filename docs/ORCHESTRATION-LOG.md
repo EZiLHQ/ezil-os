@@ -180,3 +180,8 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   an empty extraction because a Windows checkout is CRLF under `* text=auto`. Supervisor patch (1237c88 on `task/T4`):
   `fileURLToPath` and CRLF normalisation before line-anchored extraction; the three suites stay green on Linux
   (62/62). Note for A2: `entry-contract.test.ts` changed on this branch. Seventh run in progress.
+- 2026-09-04 19:10Z — **PR #14 seventh run:** windows `app` 695/696 — the one failure is a wall-clock long-poll test
+  (1 s budget, 150 ms attempts, real loopback server) that answered `unknown` instead of holding `blank` on the slower
+  Windows runner. Supervisor patch (c18719e on `task/T4`): that describe block is `skipIf(win32)` with the reason in
+  the file — an announced platform skip of a timing claim measured on Linux/macOS, nowhere else. Eighth run in
+  progress; if it is green on every leg, T4 merges through the PR.
