@@ -161,3 +161,10 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   stdin; the Linux pipeline never showed it. Supervisor patch on `task/T4` (a24b29a): `base64 < "$f"`. Linux output is
   byte-identical (drift check still matches). Two real cross-OS defects in `shell/build-shell.sh` found by the
   matrix so far, neither visible on the Linux-only CI that existed before this round. Fourth run in progress.
+- 2026-09-04 17:45Z — **PR #14 fourth run:** macOS reached the real-browser suites; `worker` green on ubuntu; `app` green
+  on ubuntu+macos; `sdk + mcp` green ×3. The only macOS failures were pixel-geometry assertions in
+  `responsiveness-browser-test.mjs` (settles at 1919px not 1920; a minimise/restore cycle off by 5–6px) — the class
+  T4's report predicted for non-Linux Chromium. Decision (e7bf51a on `task/T4`): the geometry family
+  (responsiveness, seam-minimise, window-chrome, phone-stacking, overlay-paint, resize) runs on the Linux leg only by
+  a step-level condition; the behaviour family (touch-focus, os-chrome, mobile, stacking, late-focus) runs on every
+  OS. A geometry claim that must hold on macOS/Windows needs a suite measured there. Fifth run in progress.
