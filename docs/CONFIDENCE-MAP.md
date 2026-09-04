@@ -146,7 +146,129 @@ the named worker is whose claim was re-run. Rungs are the nine in
 
 ## 2. What remains unmeasured
 
-*(filled in below as the measurements land)*
+Not "what failed" — what nothing in this session, or in any run it could read,
+has ever observed. Each entry names the test that would close it.
+
+### 2.1 The invited user, end to end — the biggest hole
+
+`A1` raised it, `A2` answered it in code, and **nobody has walked it**. Supabase
+invites are not PKCE (`@supabase/auth-js`, `GoTrueAdminApi.js:95`, quoted in
+`app/src/app/auth/invited/fragment.ts`), so `/auth/v1/verify` completes as an
+implicit grant and hands the session back in the URL **fragment** — which no
+server route can read, and which `@supabase/ssr`'s browser client refuses
+because it hard-codes `flowType: "pkce"`. `A2` therefore parses the fragment
+itself and calls `setSession` explicitly. That reasoning is sound and cited at
+file:line; it is also **entirely unexecuted**. What would close it: an allow-list
+row seeded in a real project, `tools/invite.ts add` sending a real invite,
+clicking the link in a real browser, and landing signed-in on `/os`. Nothing
+short of that is evidence, because every failure mode here is in the parts a unit
+test replaces.
+
+### 2.2 The deployed host predates the entire round
+
+`N1` never ran. The Worker that answers today was uploaded **by hand on
+2026-08-26**, before the first commit of this round. So the invite gate, the page
+gates, the removal of sign-up, the access mode defaulting to `invite` — none of it
+is running anywhere a person can reach. Any sentence of the form "EZiL OS is now
+invite-only" is, today, a statement about the repository and not about the
+product.
+
+### 2.3 Nobody outside can pull the image, so the supply chain is unverified from outside
+
+`docker manifest inspect ghcr.io/ezilhq/ezil-os-desktop:latest` from an empty
+Docker config → `unauthorized`, while the same command against
+`ghcr.io/m1k1o/neko/base:latest` succeeds — so the refusal is package privacy,
+not a broken anonymous path. The consequence is not only "no pulls": cosign
+signatures and provenance attestations exist (`image.yml` recorded Rekor entries)
+and **no outsider can verify them**, because verification needs the manifest.
+What would close it: packages set Public, then an anonymous
+`docker manifest inspect` and `gh attestation verify` that both succeed.
+
+### 2.4 The release pipeline is unexercised YAML
+
+`release.yml` (`T6`) and `deploy.yml` (`R1`) have **zero runs each**; `stale.yml`
+has zero runs; there are no tags in the repository. The tarball, the
+`SHA256SUMS`, the provenance attestation, the draft-then-publish ordering, the
+"deploy waits for the tag's image" gate — every one of those is a claim about a
+workflow that has never started. What would close it: `R2`.
+
+### 2.5 One browser, one viewport, no audio, no arm64
+
+The real-browser evidence (`T5`, and the `shell` suites) is **Chromium, one
+viewport, on amd64 Linux with Docker 29.1.3**. Nothing measures Firefox or
+WebKit; nothing measures a phone-sized viewport against a real container (the
+phone suites drive a simulated shell); **audio is untouched end to end** — no
+test asserts a sound reaches the browser; and no run has ever happened on
+**arm64**, where the desktop image would need a different build entirely. The
+geometry family runs on the Linux leg only, so every pixel figure in this
+document is a Linux figure.
+
+### 2.6 `deploy/launcher/ezil-os.ps1` has never been executed
+
+The bash launcher was run end to end here. Its PowerShell twin was read and not
+run — there is no Windows host in this pass and `release.yml`, which would
+exercise it, has never fired. A launcher is the first thing a new user touches;
+half of that surface is untested code.
+
+### 2.7 Two `win32` blocks and the geometry family are green by not running
+
+Honest, announced skips — but skips. `app/src/server/lib/desktop-display-honesty.test.ts:508`
+and `desktop-frame-reprobe.test.ts:135` are `describe.skipIf(process.platform === 'win32')`,
+the second of them titled *"the honesty contract is not weakened"*. Both are
+wall-clock timing blocks that were flaky on the slower Windows runner. So the
+Windows `app` leg is green **partly because those blocks do not run there**, and
+no timing claim in that file is measured on Windows. Likewise the geometry
+browser suites (`ci.yml:377`) and the container-script worker suites (`M3`) do not
+run off Linux.
+
+### 2.8 `.gitattributes` still leaves the bundle-drift gate off Windows
+
+`*.mjs` is pinned to `eol=lf`; `*.css`, `*.svg` and the non-`.mjs` shell JS are
+not, so a Windows checkout gets CRLF for them and `ci.yml:320` gates the
+bundle-diff step with `if: runner.os != 'Windows'`. The one check that stops a
+stale committed `app/public/os/bundle.min.js` from shipping is therefore never
+exercised on Windows. `T4` handed this off; nothing has taken it.
+Hand-off: `.gitattributes:19-26`, `.github/workflows/ci.yml:320`.
+
+### 2.9 A cancelled container run orphans a container
+
+Measured, twice, deliberately (§3.9): `worker/src/neko-browser-window.container.test.ts:191`
+cleans up in `afterAll` and installs **no signal trap**, so `SIGTERM` mid-run
+leaves a container from a 4.57 GB image resident — this pass produced one that
+held **456.2 MiB for eight minutes** after its owning process was gone. On a
+GitHub runner the VM is discarded and it costs nothing; on a contributor's
+machine it is invisible and permanent. Two of `main`'s CI runs today were
+`cancelled` mid-flight. Nothing measures how many such containers a week of local
+development leaves behind.
+
+### 2.10 The cloud cost/residency oracle is unchanged, and deliberately not re-derived
+
+No deploy happened this round: `deploy.yml` has never run, there is no tag,
+`os.ezil.work` does not resolve. The hosted product's residency and cost picture
+is therefore exactly what `docs/RUNBOOK.md` already records, and this pass adds
+nothing to it. Writing a number here would be invention.
+
+### 2.11 Three rows have no run artifact at all
+
+`G4` (a supervisor row), `M2` (folded into `M3`'s PR) and `T8` have no
+`artifacts/runs/wf-os-2026-09-04/<id>.json` in `main` — `T8`'s existed as an
+untracked file in the main checkout earlier in this pass and is not there now.
+Their work is real and verified above; the record `_MANDATORY` §2 requires is
+missing, which is the exact condition the ledger cannot distinguish from "the
+agent died". `bun tools/ledger.ts` currently names `N2` stalled for that reason.
+
+### 2.12 What this document itself is blind to
+
+Every figure here comes from one machine (amd64 Linux, 8 cores, Docker 29.1.3,
+bun 1.3.14) plus GitHub-hosted runners, on one day, with three sibling worktrees
+running concurrently — so every timing number carries contention this pass did not
+control for. `main` moved eight PRs during the pass; the counts are pinned to two
+named commits and nothing guarantees the tip is still either of them by the time
+you read this. And the deepest blind spot is structural: a verifier can prove that
+a test fails when the code is broken, which is what mutation-proving buys, but it
+cannot prove that the test asks the right question. Rows `T5` and `M1` are the
+sharpest examples — pixels arrived and keystrokes reached the remote, and **no
+assertion anywhere establishes that an application on the desktop reacted**.
 
 ---
 
