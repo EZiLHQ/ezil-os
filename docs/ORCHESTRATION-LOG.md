@@ -260,3 +260,11 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   procedure check is gone. Not proven here: cookies on `/auth/confirm`'s redirect and the invited landing end to end —
   R2's steps 1–7 are in the worker's report. Founder steps (F1 redirect URL, F2 optional template, e2e account row)
   appended to the founder script. T8 dispatched (CI pulls the GHCR image; retires the placeholder). Running: T6, M1, T8.
+- 2026-09-05 01:30Z — **M1 returned; landing as PR #18.** The eight "pre-existing failures" were the test, not the
+  product: spawned `node -e` subprocesses did a bare `require('playwright')` (never a repo dependency), the crash was
+  read as an empty result, and the assertions reported `Received: undefined`. Fixed with the repo's
+  `PLAYWRIGHT_REQUIRE_DIR` convention and crash surfacing; the five early-return vacuous passes are honest skips.
+  Against a clean build carrying `main`'s `ezil-mobile.js`: 9 pass / 0 fail — README's "in progress" undersells it.
+  Finding for anyone trusting this host: `ezil-integrated:local` here was built from `wip/mobile-keyboard`. Env-name
+  collision noted: `EZIL_NEKO_IMAGE` means a bare registry path in `images.env`/image.yml and `image:tag` in the
+  worker tests and `tools/test.sh`. M2 folded into M3; M3 dispatched. Running: T6, T8, M3.
