@@ -268,3 +268,11 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   Finding for anyone trusting this host: `ezil-integrated:local` here was built from `wip/mobile-keyboard`. Env-name
   collision noted: `EZIL_NEKO_IMAGE` means a bare registry path in `images.env`/image.yml and `image:tag` in the
   worker tests and `tools/test.sh`. M2 folded into M3; M3 dispatched. Running: T6, T8, M3.
+- 2026-09-05 02:10Z — **T6 returned; landing as PR #19.** `release.yml` (tag → tarball + SHA256SUMS + provenance →
+  Release with notes from the exact CHANGELOG section, failing loudly when the section is missing), `ezil-os.sh`
+  (bash 3.2) and `ezil-os.ps1`. Real runs: the launcher booted the local desktop on this box end to end and its
+  Ctrl-C removed only the containers it created (canary proved); the tarball ran `doctor` and `start` from an
+  isolated directory with no install — which forced `worker/src/{desktop-mode,screen-modes}.ts` into the manifest.
+  Two real bugs fixed before landing (a pipefail abort on an absent optional key; SHA256SUMS paths a downloader
+  cannot have). R1 dispatched with T6's release.yml in its ownership: the Release must be a DRAFT until deploy.yml's
+  production verify passes — "a green deploy that was never verified is not a release". Running: T8, M3, R1.
