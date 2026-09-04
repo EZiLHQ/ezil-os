@@ -1,5 +1,6 @@
-# Review routing. A CODEOWNER's approval is required before merge on any path
-# they own. See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+# Review routing: a CODEOWNER is requested for review on any path they own.
+# Approval is NOT required — the branch ruleset needs zero approvals because a
+# solo maintainer cannot approve their own pull request (see GOVERNANCE.md). See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
 *                       @MidhunAkashM
 

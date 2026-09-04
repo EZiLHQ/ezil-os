@@ -6,7 +6,7 @@ see [`ATTRIBUTIONS.md`](ATTRIBUTIONS.md), which is authoritative about provenanc
 
 ## Authors
 
-- **MidhunAkash** ([@MidhunAkash](https://github.com/MidhunAkash)) — author and maintainer.
+- **MidhunAkash** ([@MidhunAkash](https://github.com/MidhunAkashM)) — author and maintainer.
   Created EZiL-OS and its architecture: the Cloudflare Workers/Containers desktop stack,
   the browser-delivered shell, and the product direction.
 

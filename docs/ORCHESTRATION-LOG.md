@@ -71,3 +71,11 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   as check runs on the PR, so every name the ruleset will require has now produced at least one run. PR closed
   without merging, branch deleted. **Dependabot auto-closed #3, #4, #6, #7, #8, #9** on its first run under the new
   policy — as D1 predicted; only the grouped patch PR #5 remains (merge after CI on it is green and read).
+- 2026-09-04 10:45Z — **G2 merged** (GOVERNANCE.md, ROADMAP.md; 26 links checked, 0 dead; every roadmap status keyed
+  to a TASKS.csv row). Worker refused three claims the brief made without evidence and it was right each time (worker
+  commits carry only the DCO trailer; the workflows had already produced check runs; the release-waits-on-verify
+  arrangement is row R1, not present). Supervisor fixes from its hand-offs: `github-actions` Dependabot entry now
+  ignores majors too (#11 codeql-action 4, #12 labeler 7, #13 stale 11 opened within the hour against deliberate
+  pins — closed); `CONTRIBUTORS.md` linked a non-existent login; `CODEOWNERS` header claimed approval is required.
+  Noted for A2: `app/signup.mjs` is gitignored, never tracked — "delete" is a no-op; the argument stands. Wave 0
+  complete. T1 dispatched (local host server). Running: O3, T2, T1.
