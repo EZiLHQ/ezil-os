@@ -1,9 +1,36 @@
 # Dependency updates. This repository has five independent JS/TS projects
-# (app, worker, worker/sidecar, sdk, mcp), each with its own lockfile and no
-# root workspace — so each one is listed separately. Grouped and
-# rate-limited on purpose: a small team cannot review a flood of individual
-# bumps, and an unreviewed bump is not an upgrade.
+# (app, worker, worker/sidecar, sdk, mcp) and no root workspace, so each one
+# is listed separately. Grouped and rate-limited on purpose: a small team
+# cannot review a flood of individual bumps, and an unreviewed bump is not an
+# upgrade.
 #
+# ── WHICH ECOSYSTEM, AND WHY IT IS NOT COSMETIC ─────────────────────────────
+# 🔴 FOUR OF THE FIVE ARE `bun`, NOT `npm`. `app/`, `worker/`, `sdk/` and
+# `mcp/` each carry a `bun.lock` and CI installs them with
+# `bun install --frozen-lockfile` (`.github/workflows/ci.yml`). Dependabot's
+# `npm` ecosystem edits `package.json` and updates an npm/yarn/pnpm lockfile
+# — it does not know `bun.lock` exists — so an `npm` entry against a bun
+# project opens a PR whose `package.json` and `bun.lock` disagree, and
+# `--frozen-lockfile` refuses it. That is exactly why PR #5 (the grouped
+# patch-and-minor bump for `/app`) was red on `app` and `shell` and was
+# closed: +7 −7 in one file, no lockfile, unmergeable by construction. Every
+# future `/app` and `/worker` dependency PR would have been the same until
+# this changed. `/sdk` and `/mcp` were already on `bun` (row D1) and their
+# PRs were fine, which is the positive control for this diagnosis.
+#
+# `/worker/sidecar` is the ONE that stays `npm`, and for a measured reason:
+# it has NO lockfile at all (`worker/sidecar/` is `package.json`,
+# `browser.mjs`, `contract.mjs`, `README.md` — nothing else), so there is no
+# bun lockfile for a `bun` entry to maintain. It is also the only entry
+# without a `groups:` block, because a single-package project has nothing to
+# group.
+#
+# 🔴 THE SUPERVISOR ACTION THIS FILE DEPENDS ON: the `dependencies` label
+# every entry below requests must EXIST (`gh label create dependencies`).
+# Dependabot silently skips a label it cannot apply — it does not create one
+# — so until that label exists these `labels:` lines do nothing at all.
+#
+# ── MAJORS ──────────────────────────────────────────────────────────────────
 # Every npm/bun entry below ignores semver-major *version* updates (this
 # does not affect security updates — Dependabot's `ignore` option only
 # applies to routine version updates, so a security advisory whose only fix
@@ -48,7 +75,8 @@ updates:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
 
-  - package-ecosystem: npm
+  # bun, not npm: app/bun.lock (see the header).
+  - package-ecosystem: bun
     directory: /app
     schedule: { interval: weekly }
     open-pull-requests-limit: 5
@@ -60,7 +88,8 @@ updates:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
 
-  - package-ecosystem: npm
+  # bun, not npm: worker/bun.lock (see the header).
+  - package-ecosystem: bun
     directory: /worker
     schedule: { interval: weekly }
     open-pull-requests-limit: 5
@@ -75,6 +104,8 @@ updates:
       # ATTRIBUTIONS.md — a bump here is a deliberate, tested change.
       - dependency-name: "@cloudflare/sandbox"
 
+  # 🔴 npm ON PURPOSE, AND THE ONLY ONE. worker/sidecar has no lockfile of any
+  # kind, so there is nothing for a `bun` entry to keep in step.
   - package-ecosystem: npm
     directory: /worker/sidecar
     schedule: { interval: weekly }
@@ -84,8 +115,8 @@ updates:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
 
-  # sdk/ and mcp/ are managed with Bun (bun.lock), not npm/yarn/pnpm — Bun is
-  # its own Dependabot ecosystem, not a variant of "npm".
+  # sdk/ and mcp/ have been on Bun since row D1 — the working precedent the
+  # /app and /worker entries above were moved to match.
   - package-ecosystem: bun
     directory: /sdk
     schedule: { interval: weekly }
