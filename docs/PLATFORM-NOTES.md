@@ -92,6 +92,23 @@ Consequence for a streamed desktop: the iframe-over-reverse-proxy path (plain HT
 lower latency than the WebRTC desktop for anything that can be rendered as a web page.
 Make the desktop the fallback, not the default.
 
+### Annex — local mode (2026-09)
+
+**This section dissolves entirely on your own machine.** Local mode
+(`docs/LOCAL-MODE.md`) has no Cloudflare Container in the loop at all — the
+browser and the container are both on `127.0.0.1`, so there is no NAT to
+traverse and TURN is not merely avoidable, it is the wrong tool. The published
+`52100/udp+tcp` mux gives direct media with `nat1to1=127.0.0.1` and `icelite`
+(`local/src/ice.ts`), and `worker/src/desktop-mode.ts`'s `checkIceConfig` —
+the function that fails closed with no TURN provider configured, correctly,
+for *this* section's hosted case — is deliberately never imported by the local
+path; `local/src/ice.ts`'s own header names that as a refusal, not an
+oversight. One caveat survives the platform change: neko still advertises its
+own compiled-in `stun:stun.l.google.com:19302` to the browser regardless, and
+setting `NEKO_WEBRTC_ICESERVERS_FRONTEND=[]`/`_BACKEND=[]` was measured to
+change nothing against the pinned image — see `docs/LOCAL-MODE.md` § "Caveats
+measured this round".
+
 ## 7. No GPU, no hardware encode
 
 Everything is software-rendered and software-encoded. On a small instance, a desktop
@@ -100,6 +117,23 @@ streamer competes with the compiler for the same cores.
 Tuning that matters for a *coding* desktop: lower the framerate (static text, not motion
 video), hold the bitrate (sharper text for free), and set encoder `threads=1` on a
 fractional-vCPU instance — multiple encoder threads on half a core is pure contention.
+
+### Annex — local mode (2026-09)
+
+**This section dissolves only in principle.** A user's own machine can have a
+real GPU, but the image was never changed to use one:
+`worker/scripts/start-neko.sh` still launches the native browser (Chrome) with
+`--disable-gpu`, and `worker/scripts/start-desktop.sh` passes the same flag to
+`google-chrome-stable`. code-server is not a separate
+GPU consumer either way — it replaced the Electron-class VS Code this section's
+software-encoder tuning was originally written against, and runs as a plain
+Node server with no renderer of its own (see this file's encoder-tuning
+section, further down, for the history). **neko's own `--hwenc` flag exists
+and its accepted backends are NOT MEASURED** — grepped out of the pinned
+binary's own `--help` output, never exercised end to end. Read
+[`docs/research/local-agents.md`](research/local-agents.md) §3 before assuming
+hardware encode is either available or usable; do not restate its open
+question as an answer here.
 
 ## 8. Containers have no guaranteed lifetime
 
@@ -632,6 +666,50 @@ Consequences worth keeping:
   between them have a defensible answer — the geometric mean, equal ratio margin either side.
 - **A "fail safe" default that always answers BUSY is a fix that silently does nothing.** Fail
   safe, and then log enough to notice that you are always failing safe.
+
+---
+
+## 24. BSD `base64` and bash 3.2
+
+Two macOS-only defects in [`shell/build-shell.sh`](../shell/build-shell.sh),
+neither visible on the Linux-only CI that existed before the three-OS matrix
+(PR #14) — this file exists for exactly this class of fact.
+
+**`mapfile` needs bash 4; macOS ships bash 3.2.** The script used `mapfile -t`
+to collect CSS inputs and icon files. On `macos-latest`: `mapfile: command not
+found`, exit 127 — the drift check could never run on a Mac contributor's own
+machine, only in CI, and only once CI grew a macOS leg. Fixed to a portable
+`read` loop: `while IFS= read -r line; do sheets+=("$line"); done < <(…)`
+(`shell/build-shell.sh:114` and `:136`).
+
+**BSD `base64` does not take a file positionally.** GNU `base64 file` and BSD
+`base64 file` do different things — BSD's only reads a file via `-i`, so a
+bare `base64 "$f"` silently reads an **empty stdin** instead of erroring.
+Every entry in the generated `icons[]` table encoded to an empty string on
+macOS; the Linux pipeline never showed it because GNU `base64` accepts the
+positional form. Fixed to `base64 < "$f"` (`shell/build-shell.sh:150`), which
+is the one form both implementations agree on. **The general lesson: prefer
+the POSIX-common invocation over either tool's convenience form** — a
+positional filename argument is exactly the kind of "works everywhere I
+tested it" surface GNU coreutils extends and BSD does not.
+
+## 25. `npx` does not see bun's `.bin` shims on Windows
+
+`.github/workflows/ci.yml`'s `app` job ran `npx tsc` for its typecheck step.
+On `windows-latest`, `npx` did not resolve bun's own installed
+`node_modules/.bin/tsc` shim — it instead silently installed and ran the
+unrelated npm package `tsc@2.0.4` (a defunct placeholder package, not the
+TypeScript compiler), which is why the step still exited without an error
+while typechecking nothing. Fixed by running `bun run typecheck` /
+`bun run test` instead in the `app` job specifically
+(`.github/workflows/ci.yml:217,228`; the other jobs already ran `bun run
+typecheck` from the start and were never affected) —
+bun's own script runner resolves its own shims correctly on every OS,
+which `npx` does not. **The general lesson: once a project's package manager
+is not npm, prefer that manager's own script runner over `npx` for anything
+installed as a devDependency** — `npx` falling through to a registry install
+of a same-named package is a silent wrong-tool substitution, not a failure
+that stops the build.
 
 ---
 
