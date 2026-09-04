@@ -1,0 +1,10 @@
+{
+  "taskId": "G1",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "STATIC_CHECKS_PASS",
+  "evidence": "started; fixing CODEOWNERS login and adding codeql/labeler/stale workflows",
+  "startedAt": "2026-09-04T07:31:12Z",
+  "updatedAt": "2026-09-04T07:31:12Z",
+  "by": "worker-sonnet"
+}
