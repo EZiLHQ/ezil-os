@@ -27,10 +27,14 @@
 </div>
 
 > **Status: deployed and live, and you should treat it as alpha.** Everything
-> here is the real thing that runs in production — but the whole stack needs
-> your own Cloudflare, Vercel and Supabase accounts to stand up, so cloning it
-> gets you a codebase to read and build against, not a one-command demo. See
-> [Prerequisites](#prerequisites) before you start.
+> here is the real thing that runs in production — but the hosted product is
+> **invite-only** while it is in this state, and the whole stack needs your
+> own Cloudflare, Vercel and Supabase accounts to stand up, so cloning it for
+> the hosted path gets you a codebase to read and build against, not a
+> one-command demo. If you just want a real desktop today with none of that,
+> **[local mode](docs/LOCAL-MODE.md)** needs only Docker and Bun — no
+> Cloudflare, no Vercel, no Supabase, no account. See
+> [Prerequisites](#prerequisites) before you start with the hosted path.
 
 # An open-source Linux desktop, streamed from a real container
 
@@ -66,8 +70,29 @@ into from any tab, rather than a box tied to one desk.
   - [x] A typed client — [`sdk/`](sdk/README.md)
   - [x] An optional MCP connector — [`mcp/`](mcp/README.md)
   - [ ] Both published to npm
+- [x] Run it anywhere
+  - [x] Runs on your own machine — Docker and Bun, no Cloudflare account, no
+        sign-in ([`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md))
+  - [x] Signed images on GHCR — keyless cosign signature plus build provenance
+  - [x] CI on Linux, Windows and macOS
 
 ## Getting Started
+
+### Run it locally
+
+The fastest way to see a real desktop with no accounts at all:
+
+```bash
+bun install --cwd local
+bun run --cwd local doctor
+bun run --cwd local start
+```
+
+Then open `http://127.0.0.1:7080/os`. See
+[`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md) for the environment variables, the
+port map, what the doctor checks, and what is (and is not) proven about it.
+The rest of this section is about the hosted path, which needs real cloud
+accounts.
 
 ### Prerequisites
 
@@ -146,6 +171,19 @@ cd mcp && bun install && bun run typecheck && bun test
    building is reachable directly and not only through the streamed screen.
 7. The workspace is **hydrated from R2 at boot and flushed back as it changes**.
 
+**Access to the hosted product is invite-only.** Signing in to `https://os.ezil.work`
+requires an invitation, and the gate is an authorization check rather than a
+signup switch — the Supabase project is shared with `app.ezil.work`, where
+builders must keep signing up, and anyone holding the public anon key can
+create a user directly regardless of any signup form. So the check lives
+where authorization already lives: one context
+(`app/src/server/api/trpc.ts`'s `protectedProcedure`) plus the three page
+gates, all reading the same `ezil_os_access` allow-list. Every `/api/shell/*`
+route and the bearer path resolve through that same context, so the SDK and
+the MCP connector are gated with no extra code. `tools/invite.ts` is the only
+sanctioned way onto the allow-list. Local mode has no login, no Supabase and
+no gate of any kind.
+
 🔴 **The workspace is not an R2 mount, and that is the most expensive thing this
 project learned.** `/workspace` is plain container disk. Mounting R2 through
 `sandbox.mountBucket()`/s3fs silently drops **every second write** — 0 bytes,
@@ -201,6 +239,10 @@ with no error a shell redirection would ever see. The measurement is in
 ├── shell/   # The in-browser desktop UI, built into app/public/os/bundle.min.js
 ├── sdk/     # @ezil-os/sdk — a typed client for the computer API
 ├── mcp/     # @ezil-os/mcp — an optional MCP connector over that SDK
+├── local/   # The local-mode host: no Cloudflare, drives Docker directly
+├── docker/  # The neko/code-server base image build inputs (pinned upstream SHAs)
+├── deploy/  # The pinned image reference (images.env) and the release launcher
+├── tools/   # Repo-wide scripts: the invite CLI, the plan/ledger tooling, test.sh
 ├── docs/    # Platform notes, the runbook, telemetry, design records
 └── e2e/     # Production suites: real sign-in, real container, live deployment
 ```
@@ -210,6 +252,9 @@ with no error a shell redirection would ever see. The measurement is in
 
 ## Documentation
 
+- **[`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md)** — running a real desktop on
+  your own machine: prerequisites, the environment variables, the port map,
+  the doctor, what is proven about it and how, and troubleshooting.
 - **[`docs/PLATFORM-NOTES.md`](docs/PLATFORM-NOTES.md)** — everything learned the
   hard way about Cloudflare Containers/Workers, Vercel and this stack's sharp
   edges. Read it before assuming a primitive behaves the way its docs imply.
@@ -223,6 +268,17 @@ with no error a shell redirection would ever see. The measurement is in
   screenshots are committed, so every claim can be checked against the pixels.
 - **[`docs/PERFORMANCE-BASELINE.md`](docs/PERFORMANCE-BASELINE.md)** — where the
   time goes, measured against live production, with its own limits stated up front.
+- **[`docs/research/local-agents.md`](docs/research/local-agents.md)** — a
+  measured survey of computer-use drivers against a local desktop, and what
+  GPU passthrough would need. Research only; nothing here is built yet.
+- **[`GOVERNANCE.md`](GOVERNANCE.md)** — how decisions get made, who can merge,
+  and how somebody outside the project becomes somebody inside it.
+- **[`ROADMAP.md`](ROADMAP.md)** — what the project is trying to become, item
+  by item, with the measurement that would settle whether each one is real.
+- **[`docs/ORCHESTRATION.md`](docs/ORCHESTRATION.md)** and
+  **[`docs/ORCHESTRATION-LOG.md`](docs/ORCHESTRATION-LOG.md)** — how the
+  automated workers referenced in [Contributing](#contributing) below are
+  planned and what they actually did, down to the run artifact.
 
 ## Telemetry
 
@@ -246,7 +302,15 @@ Suggestions and pull requests are welcome. Fork the repository and open a PR, or
 Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first — it covers the DCO sign-off
 every commit needs, the build and test commands per package, and two rules this
 project enforces in CI because breaking them has taken the desktop down before.
-Conduct expectations are in [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+Conduct expectations are in [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md), and how
+decisions get made — including how you become a collaborator — is
+[`GOVERNANCE.md`](GOVERNANCE.md).
+
+**`main` is protected**: every change lands by pull request, with a DCO
+sign-off on every commit and CI green on Linux, Windows and macOS before it
+can merge — including from a maintainer, who cannot approve their own PR
+either (see `GOVERNANCE.md`'s "Merging into `main`" for why the required
+approval count is zero rather than bypassed).
 
 #### Contributors
 
