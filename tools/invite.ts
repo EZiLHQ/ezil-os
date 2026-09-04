@@ -115,19 +115,35 @@ const out = (text: string): void => {
 	console.log(redact(text));
 };
 
-const fail = (text: string): never => {
+/**
+ * EXIT CODES, because `add` has three outcomes and two of them are not
+ * "nothing happened":
+ *
+ *   0  did what was asked.
+ *   1  refused; NOTHING was written.
+ *   2  the allow-list row IS written, but the invite EMAIL was not sent.
+ *
+ * 🔴 2 exists because 1 would lie to a script. `add` writes the row first (see
+ * the header), so every failure after that point leaves real state behind —
+ * and a caller that reads a non-zero exit as "retry from scratch" or "abort,
+ * nothing landed" would be wrong about both.
+ */
+const fail = (text: string, code: 1 | 2 = 1): never => {
 	console.error(redact(text));
-	process.exit(1);
+	process.exit(code);
 };
 
 /**
  * Reads a variable by NAME and refuses by NAME. The value never reaches the
  * message — that is the whole point of taking the name as a string.
  */
-const requireEnv = (name: string, why: string): string => {
+const requireEnv = (name: string, why: string, code: 1 | 2 = 1): string => {
 	const value = process.env[name];
 	if (!value) {
-		fail(`[invite] ${name} is not set — refusing to run.\n         ${why}`);
+		// The headline differs by exit code on purpose: "refusing to run" is a
+		// lie once the allow-list row has already been written (code 2).
+		const headline = code === 2 ? `[invite] ${name} is not set.` : `[invite] ${name} is not set — refusing to run.`;
+		fail(`${headline}\n         ${why}`, code);
 	}
 	rememberSecret(value);
 	return value as string;
@@ -185,6 +201,11 @@ Environment (read by name; never printed)
                               https://os.ezil.work
                               (the link lands on <origin>/auth/callback).
 
+Exit codes
+  0  did what was asked.
+  1  refused; nothing was written.
+  2  the allow-list row IS written, but the invite email was not sent.
+
 Notes
   Access is only enforced while EZIL_OS_ACCESS_MODE is "invite" — its default.
   In "open" mode this table is not consulted at all.
@@ -196,12 +217,17 @@ interface ParsedArgs {
 	email?: string;
 	by?: string;
 	noInvite: boolean;
+	/** True if `--help`/`-h`/`help` appeared ANYWHERE. Tracked as its own flag
+	 * rather than pushed into the positional list, so that asking for help
+	 * never reorders or swallows the other arguments. */
+	help: boolean;
 }
 
 export const parseArgs = (argv: readonly string[]): ParsedArgs => {
 	const positional: string[] = [];
 	let by: string | undefined;
 	let noInvite = false;
+	let help = false;
 
 	for (let i = 0; i < argv.length; i += 1) {
 		const arg = argv[i]!;
@@ -215,7 +241,7 @@ export const parseArgs = (argv: readonly string[]): ParsedArgs => {
 		} else if (arg === '--no-invite') {
 			noInvite = true;
 		} else if (arg === '--help' || arg === '-h' || arg === 'help') {
-			positional.unshift('--help');
+			help = true;
 		} else if (arg.startsWith('-')) {
 			fail(`[invite] unknown option: ${arg}\n\n${USAGE}`);
 		} else {
@@ -223,7 +249,7 @@ export const parseArgs = (argv: readonly string[]): ParsedArgs => {
 		}
 	}
 
-	return { command: positional[0] ?? '', email: positional[1], by, noInvite };
+	return { command: positional[0] ?? '', email: positional[1], by, noInvite, help };
 };
 
 const invitedBy = (explicit: string | undefined): string =>
@@ -277,14 +303,17 @@ const formatRow = (row: Row): string => {
 const sendInvite = async (email: string): Promise<void> => {
 	const key = requireEnv(
 		'SUPABASE_SERVICE_ROLE_KEY',
-		'The admin invite endpoint requires it. Pass --no-invite to write the allow-list row without sending an email.',
+'The allow-list row IS written; the invite EMAIL was not sent. The admin invite\n         endpoint needs this key — re-run with it set, or use --no-invite.',
+		2,
 	);
 	const apiOrigin = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL;
 	if (!apiOrigin) {
 		fail(
-			'[invite] SUPABASE_URL is not set (NEXT_PUBLIC_SUPABASE_URL is accepted too) — refusing to run.\n' +
+			'[invite] SUPABASE_URL is not set (NEXT_PUBLIC_SUPABASE_URL is accepted too).\n' +
 				'         It is the project API origin, e.g. https://<ref>.supabase.co.\n' +
-				'         The allow-list row was already written; re-run with the variable set, or use --no-invite.',
+				'         The allow-list row IS written; the invite EMAIL was not sent. Re-run with the\n' +
+				'         variable set, or use --no-invite.',
+			2,
 		);
 	}
 
@@ -312,6 +341,7 @@ const sendInvite = async (email: string): Promise<void> => {
 			`[invite] the allow-list row IS written, but Supabase refused to send the email ` +
 				`(HTTP ${response.status}).\n         ${body}\n` +
 				`         If the account already exists, that is expected — re-run with --no-invite.`,
+			2,
 		);
 	}
 
@@ -415,11 +445,12 @@ const cmdList = async (): Promise<void> => {
  * machine whose owner most needs to read the usage.
  */
 const main = async (argv: readonly string[]): Promise<void> => {
-	const { command, email, by, noInvite } = parseArgs(argv);
+	const { command, email, by, noInvite, help } = parseArgs(argv);
 
-	if (command === '--help' || command === '') {
+	if (help || command === '') {
 		out(USAGE);
-		process.exit(command === '' ? 1 : 0);
+		// No arguments at all is a mistake, not a request for help.
+		process.exit(help ? 0 : 1);
 	}
 
 	switch (command) {
