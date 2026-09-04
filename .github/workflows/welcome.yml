@@ -1,0 +1,162 @@
+# Welcome - greets a contributor's first pull request or issue in this repo
+# with the links they need (how to send a PR, how to sign off, and - for a
+# fork PR - why two CI checks may show red without blocking merge).
+#
+# -----------------------------------------------------------------------------
+# THIS IS NOT A REQUIRED CONTEXT
+# -----------------------------------------------------------------------------
+# Nothing here gates a merge. It must never be added to the branch ruleset on
+# `main` (ruleset 22265548, `gh api repos/EZiLHQ/ezil-os/rulesets/22265548`) -
+# doing so would turn a courtesy comment into a required status that a skipped
+# or errored run could hang forever (the same failure mode `dco.yml`'s header
+# calls TRAP 1: a job-level `if:` or a job that never runs never posts a check
+# run, so a REQUIRED context would sit on "Expected" forever). This workflow
+# has no job-level `if:` for the same reason it would matter if it ever became
+# required - every exemption (bot author, not-first-contribution, marker
+# already posted) lives inside the one step, so the job always runs and always
+# finishes, it just may decide there is nothing to say.
+#
+# -----------------------------------------------------------------------------
+# WHY pull_request_target, AND WHY THIS JOB NEVER CHECKS OUT THE HEAD REF
+# -----------------------------------------------------------------------------
+# Public repo: on plain `pull_request`, a fork PR gets a read-only token that
+# cannot post a comment at all. `pull_request_target` runs with the BASE
+# repo's token instead - which can - but that token is also handed to
+# whatever this job runs, so checking out and executing the PR's own head ref
+# under `pull_request_target` is a classic fork-PR privilege-escalation
+# pattern (untrusted code, trusted token, same shape `labeler.yml`'s header
+# warns about). This workflow never checks anything out: the only actions are
+# reading the event payload (author login, PR/issue number, whether the PR is
+# from a fork) and one `actions/github-script` step that calls the GitHub API.
+# There is nothing here for a malicious fork PR to run.
+#
+# -----------------------------------------------------------------------------
+# LEAST PRIVILEGE
+# -----------------------------------------------------------------------------
+# `pull-requests: write` and `issues: write` are both needed because a PR
+# comment and an issue comment are the same underlying "issue comment" API
+# object, but GitHub scopes the two permissions independently; `contents:
+# read` is the default floor and is not actually read from here, but every
+# other workflow in this repo states it explicitly rather than relying on the
+# repo-wide default, so this one does too.
+name: Welcome
+
+on:
+  pull_request_target:
+    types: [opened]
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: welcome-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  welcome:
+    name: welcome
+    runs-on: ubuntu-latest
+    steps:
+      - name: Greet a first-time contributor
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Bot gate - FIRST, before anything else. Mirrors dco.yml's
+            // list: these accounts open plenty of PRs (Dependabot) and
+            // occasionally issues, and a "welcome" aimed at a bot is just
+            // noise the bot cannot act on.
+            const BOT_LOGINS = new Set([
+              "dependabot[bot]",
+              "github-actions[bot]",
+              "copilot-swe-agent[bot]",
+            ]);
+
+            const REPO_BLOB = `https://github.com/${context.repo.owner}/${context.repo.repo}/blob/main`;
+            const isPr = context.eventName === "pull_request_target";
+            const subject = isPr ? context.payload.pull_request : context.payload.issue;
+            const number = subject.number;
+            const login = subject.user.login;
+
+            if (BOT_LOGINS.has(login)) {
+              console.log(`skip: ${login} is a bot account, not welcoming`);
+              return;
+            }
+
+            // First-contribution check: is:pr/is:issue author:<login> scoped
+            // to this repo. The item that triggered this run is itself in
+            // the count, so "first" is count <= 1.
+            const kind = isPr ? "is:pr" : "is:issue";
+            const query = `repo:${context.repo.owner}/${context.repo.repo} ${kind} author:${login}`;
+            const search = await github.rest.search.issuesAndPullRequests({ q: query, per_page: 2 });
+            const priorCount = search.data.total_count;
+            console.log(`${login} has ${priorCount} ${isPr ? "PR(s)" : "issue(s)"} in this repo (including this one)`);
+            if (priorCount > 1) {
+              console.log("skip: not this author's first PR/issue");
+              return;
+            }
+
+            const MARKER = "<!-- ezil-triage: welcome -->";
+
+            // Idempotence - never post twice, even if this run is retried or
+            // the event somehow fires again for the same number.
+            const existing = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: number,
+              per_page: 100,
+            });
+            if (existing.data.some((c) => (c.body || "").includes(MARKER))) {
+              console.log("skip: welcome comment already posted");
+              return;
+            }
+
+            const lines = [
+              MARKER,
+              "Thanks for opening your first one here!",
+              "",
+              `See [CONTRIBUTING.md, How to send a PR](${REPO_BLOB}/CONTRIBUTING.md#how-to-send-a-pr) for the fork -> branch -> sign off -> tools/test.sh -> template flow.`,
+              "",
+              "Every commit needs a Signed-off-by trailer that matches its author " +
+                `(see [CONTRIBUTING.md, Sign-off (DCO)](${REPO_BLOB}/CONTRIBUTING.md#sign-off-dco)). If a check comes back red for that, the fix is one of:`,
+              "",
+              "- one commit: git commit --amend -s && git push --force-with-lease",
+              "- several commits: git rebase --signoff <base> && git push --force-with-lease",
+            ];
+
+            if (isPr) {
+              const isFork = context.payload.pull_request.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`;
+              if (isFork) {
+                lines.push(
+                  "",
+                  "One more thing, since this is a pull request from a fork: two CI jobs, " +
+                    "container (real image) and local (typecheck + unit + smoke), pull a " +
+                    "private container image that a fork's token cannot read, so they will " +
+                    "likely show red or skipped no matter what you wrote " +
+                    `(see [.github/workflows/ci.yml](${REPO_BLOB}/.github/workflows/ci.yml)). ` +
+                    "Neither is one of the fifteen required contexts, so this does not block your merge - " +
+                    `see [CONTRIBUTING.md, Reading CI](${REPO_BLOB}/CONTRIBUTING.md#reading-ci).`,
+                );
+              }
+            } else {
+              lines.push(
+                "",
+                "If this is a bug report or a proposal, the issue templates (task and " +
+                  "app_proposal, offered when you click New Issue) collect the fields a " +
+                  "maintainer needs to act on it. " +
+                  `See [docs/community/README.md](${REPO_BLOB}/docs/community/README.md) for how this project is run day to day.`,
+              );
+            }
+
+            const body = lines.join("\n");
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: number,
+              body,
+            });
+            console.log(`posted welcome comment on #${number}`);
