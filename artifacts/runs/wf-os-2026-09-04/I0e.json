@@ -1,0 +1,9 @@
+{
+  "taskId": "I0e",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "unknown",
+  "evidence": "starting: deriving shell/run-tests.sh suite list from the filesystem instead of the hand-maintained run_suite list; adding --family portable|geometry|all and --list",
+  "startedAt": "2026-09-04T00:00:00Z",
+  "updatedAt": "2026-09-04T00:00:00Z"
+}
