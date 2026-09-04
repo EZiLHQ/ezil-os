@@ -168,3 +168,9 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   (responsiveness, seam-minimise, window-chrome, phone-stacking, overlay-paint, resize) runs on the Linux leg only by
   a step-level condition; the behaviour family (touch-focus, os-chrome, mobile, stacking, late-focus) runs on every
   OS. A geometry claim that must hold on macOS/Windows needs a suite measured there. Fifth run in progress.
+- 2026-09-04 18:10Z — **PR #14 fifth run:** `shell` GREEN on windows (jsdom suites + the portable browser suites under
+  Git Bash and Chromium); `worker` green on ubuntu; `app` green on ubuntu+macos; `sdk + mcp` green ×3. New finding on
+  the windows `app` leg — the blind spot T4's report named: `npx tsc` does not resolve bun's `node_modules/.bin`
+  shim on Windows and installed the unrelated npm package `tsc@2.0.4` instead. Supervisor patch (5b2bf3d on
+  `task/T4`): the app job runs `bun run typecheck` / `bun run test`, which resolve bun's own shims on every OS.
+  Sixth run in progress. Three cross-OS defects and one CI-wiring defect found by the matrix so far.
