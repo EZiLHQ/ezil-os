@@ -289,7 +289,13 @@ function runEnsureTurbopackConfig(targetPath: string, templateConfigPath: string
   return stdout.trim();
 }
 
-describe('buildEnsureTurbopackConfigCommand — real shell, real filesystem', () => {
+// The command under test is a one-liner the Worker runs INSIDE the Ubuntu container
+// (`sandbox.exec`); this block executes it through a real `bash -c` on the host. On the
+// Windows runner a temp path like `C:\Users\RUNNER~1\...` loses its backslashes inside
+// the double-quoted command (`cp: cannot stat 'C:UsersRUNNER~1...'`, PR #27) — a fact
+// about Windows paths in bash, not about the command. Announced-skipped on win32;
+// Linux and macOS run it.
+describe.skipIf(process.platform === 'win32')('buildEnsureTurbopackConfigCommand — real shell, real filesystem', () => {
   let root: string;
   let templateConfigPath: string;
 
