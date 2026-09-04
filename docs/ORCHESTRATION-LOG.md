@@ -23,3 +23,13 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   + `.claude/worktrees/`; six agent definitions committed with full model ids and effort levels. `git check-ignore`
   on an agent file prints nothing; a worktree path is still ignored. `docs/TASKS.csv` seeded with the 24 rows. Wave 0
   dispatch order: O2 (sonnet), T0 (opus), G1 (sonnet); then D1, G2 as slots free.
+- 2026-09-04 07:30Z — **Harness limit recorded.** Agent definitions under `.claude/agents/` are loaded at session start,
+  not mid-session: dispatching `subagent_type: worker-sonnet` returned "Agent type not found". This round's workers
+  therefore run as `general-purpose` agents with the `sonnet` / `opus` aliases and read their role file
+  (`.claude/agents/worker-*.md`) as the first instruction of the brief. Per-agent `effort` and the exact Opus 4.8 pin
+  take effect from the next session; noted so the confidence map does not overstate which model produced what.
+- 2026-09-04 07:45Z — **N1 blocked at the permission boundary.** The three cutover writes (Vercel `domains add`,
+  Cloudflare DNS POST, Supabase `uri_allow_list` PATCH) were refused by the session's auto-mode classifier. Not
+  retried and not worked around: they are outward-facing changes to shared infrastructure and belong to the founder.
+  The exact commands are in the supervisor's scratchpad as `n1-cutover.sh` and are repeated in the round report.
+  Rows that depend on N1 (N2, R2) wait; everything else proceeds. Worktrees D1 and G2 prepared @ 2a3c5bf.
