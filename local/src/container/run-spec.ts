@@ -112,15 +112,15 @@ export const LOCAL_PORT_MAP: readonly PublishedPort[] = [
 ];
 
 /** Look a published port up by name. Throws rather than returning `undefined`: every name in the union exists in the table, and a miss is a programming error, not a runtime condition. */
-export function publishedPort(name: PublishedPort['name']): PublishedPort {
-    const hit = LOCAL_PORT_MAP.find((p) => p.name === name);
+export function publishedPort(name: PublishedPort['name'], offset = 0): PublishedPort {
+    const hit = offsetPortMap(offset).find((p) => p.name === name);
     if (!hit) throw new Error(`local_port_map_missing: '${name}' is not in LOCAL_PORT_MAP`);
     return hit;
 }
 
 /** `http://127.0.0.1:<host port>` for a published TCP port. The local equivalent of a minted preview hostname. */
-export function localUrlFor(name: PublishedPort['name']): string {
-    const p = publishedPort(name);
+export function localUrlFor(name: PublishedPort['name'], offset = 0): string {
+    const p = publishedPort(name, offset);
     if (p.protocol !== 'tcp') throw new Error(`local_url_not_http: '${name}' is a ${p.protocol} port`);
     return `http://${LOCAL_BIND_ADDRESS}:${p.host}`;
 }
@@ -182,12 +182,61 @@ export function localUrlFor(name: PublishedPort['name']): string {
  * no TURN means no media) and the wrong answer here, where TURN is exactly what
  * local mode does not need and must never mint.
  */
-export const NEKO_LOCAL_ICE_ENV: Readonly<Record<string, string>> = Object.freeze({
-    NEKO_WEBRTC_UDPMUX: String(WEBRTC_MUX_PORT),
-    NEKO_WEBRTC_TCPMUX: String(WEBRTC_MUX_PORT),
-    NEKO_WEBRTC_NAT1TO1: LOCAL_BIND_ADDRESS,
-    NEKO_WEBRTC_ICELITE: 'true',
-});
+export function localIceEnvFor(muxPort: number): Readonly<Record<string, string>> {
+    if (!Number.isInteger(muxPort) || muxPort < 1 || muxPort > 65535) {
+        throw new Error(`invalid_mux_port: ${muxPort} is not a TCP/UDP port number`);
+    }
+    return Object.freeze({
+        NEKO_WEBRTC_UDPMUX: String(muxPort),
+        NEKO_WEBRTC_TCPMUX: String(muxPort),
+        NEKO_WEBRTC_NAT1TO1: LOCAL_BIND_ADDRESS,
+        NEKO_WEBRTC_ICELITE: 'true',
+    });
+}
+
+/** The default local ICE environment — `localIceEnvFor(WEBRTC_MUX_PORT)`. Kept as a frozen constant because it is what every unoffset deployment gets. */
+export const NEKO_LOCAL_ICE_ENV: Readonly<Record<string, string>> = localIceEnvFor(WEBRTC_MUX_PORT);
+
+/**
+ * Shift the published port map by `offset`, for a machine where a default port
+ * is already taken.
+ *
+ * 🔴 THE MUX MOVES ON **BOTH** SIDES AND THE HTTP PORTS MOVE ON ONE, AND THAT
+ * ASYMMETRY IS THE WHOLE FUNCTION. Measured against the pinned image:
+ * neko logs `webrtc starting … nat1to1=127.0.0.1 tcpmux=52200 udpmux=52200`,
+ * i.e. it advertises `127.0.0.1:<its own mux port>` as the ICE host candidate.
+ * Publishing `127.0.0.1:62200:52200` therefore tells the browser to dial
+ * `127.0.0.1:52200` while the host is listening on 62200 — a candidate that
+ * points at nothing, on a path no HTTP probe can see, so every readiness check
+ * still passes and the picture never arrives. The mux port is consequently
+ * moved INSIDE the container too (via `localIceEnvFor`), keeping host and
+ * container equal; the HTTP ports have no such constraint because the browser
+ * is handed their host-side URLs explicitly.
+ *
+ * `offset` 0 returns `LOCAL_PORT_MAP` itself, so the default deployment is
+ * byte-identical to the pinned argv.
+ */
+export function offsetPortMap(offset: number): readonly PublishedPort[] {
+    if (!Number.isInteger(offset)) throw new Error(`invalid_port_offset: ${offset} is not an integer`);
+    if (offset === 0) return LOCAL_PORT_MAP;
+    return LOCAL_PORT_MAP.map((p) => {
+        const host = p.host + offset;
+        // The two WebRTC entries are the mux, and neko must bind the same
+        // number the host publishes — see the doc comment above.
+        const container = p.name === 'webrtcUdp' || p.name === 'webrtcTcp' ? p.container + offset : p.container;
+        for (const n of [host, container]) {
+            if (n < 1 || n > 65535) throw new Error(`port_offset_out_of_range: ${p.name} would land on ${n}`);
+        }
+        return { ...p, host, container };
+    });
+}
+
+/** The mux port a given offset puts on both sides of the boundary. */
+export function muxPortFor(offset: number): number {
+    const p = offsetPortMap(offset).find((e) => e.name === 'webrtcUdp');
+    if (!p) throw new Error('local_port_map_missing: webrtcUdp');
+    return p.container;
+}
 
 /** The environment variable that carries the neko admin password. Read natively by neko (`--member.multiuser.admin_password`), not by `start-neko.sh`. */
 export const NEKO_ADMIN_PASSWORD_ENV = 'NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD';
@@ -370,6 +419,18 @@ export interface DockerRunSpec {
     readonly memory?: string;
     /** Anything else the host wants to pass. Merged LAST, so it can override; keys are validated. */
     readonly extraEnv?: Readonly<Record<string, string>>;
+    /**
+     * Shift every published port by this much, for a machine where a default is
+     * already taken. Defaults to 0, which reproduces the pinned argv exactly.
+     *
+     * MEASURED, and the reason this exists rather than being a nicety: on the
+     * development machine `supabase-kong` holds `0.0.0.0:8443` permanently, so
+     * `docker run` with the default map dies with
+     * `Bind for 0.0.0.0:8443 failed: port is already allocated` before the
+     * image is ever started. A laptop with anything on 8443 is an ordinary
+     * user. See `offsetPortMap` for why the mux moves on both sides.
+     */
+    readonly hostPortOffset?: number;
 }
 
 /** An environment variable name Docker will accept unambiguously. Rejects `=` and anything that could smuggle a second assignment. */
@@ -405,7 +466,10 @@ export function buildContainerEnv(spec: DockerRunSpec): Record<string, string> {
         NEKO_SCREEN: formatLocalNekoScreen(screen),
         [NEKO_USER_PASSWORD_ENV]: spec.userPassword,
         [NEKO_ADMIN_PASSWORD_ENV]: spec.adminPassword,
-        ...NEKO_LOCAL_ICE_ENV,
+        // `localIceEnvFor(muxPortFor(0))` IS `NEKO_LOCAL_ICE_ENV`, so an
+        // unoffset spec produces the identical four variables; an offset one
+        // moves the mux inside the container to match what is published.
+        ...localIceEnvFor(muxPortFor(spec.hostPortOffset ?? 0)),
     };
     if (spec.workspaceHostPath !== undefined) {
         env['EZIL_WORKSPACE_ROOT'] = CONTAINER_WORKSPACE_PATH;
@@ -452,7 +516,7 @@ export function buildDockerRunArgv(spec: DockerRunSpec): string[] {
     argv.push(`--cpus=${spec.cpus ?? 2}`);
     argv.push(`--memory=${spec.memory ?? '8g'}`);
 
-    for (const p of LOCAL_PORT_MAP) {
+    for (const p of offsetPortMap(spec.hostPortOffset ?? 0)) {
         argv.push('--publish', `${LOCAL_BIND_ADDRESS}:${p.host}:${p.container}/${p.protocol}`);
     }
 
@@ -557,3 +621,135 @@ export function buildDockerVersionArgv(): string[] {
 export function buildDockerImageInspectArgv(imageRef: string): string[] {
     return ['image', 'inspect', '--format', '{{.Id}}', imageRef];
 }
+
+// ── The rest of the closed verb set (row T2) ─────────────────────────────────
+//
+// Same rule as everything above: the ADAPTER spawns, this module only builds
+// arrays. Added by row T2 because `SandboxHost` needs them and because a second
+// worker (T5's doctor) will want the same shapes.
+
+/**
+ * The character set a `computerId` may use before it is allowed anywhere near
+ * an argv or a container name.
+ *
+ * 🔴 THIS IS A GUARD, NOT A STYLE RULE. The id is concatenated into
+ * `--name ezil-os-<id>` and then into `docker exec <name> …`. Docker's own
+ * name grammar is `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, so a `/` or a `..` does not
+ * merely produce a bad name — `docker rm -f ../../x` is a different request
+ * from the one the caller made. Nothing here is passed through a shell, so
+ * word-splitting is not the risk; being a DIFFERENT VALID ARGUMENT is.
+ *
+ * 63 characters because that is the longest label a Docker container name is
+ * comfortable with once the `ezil-os-` prefix is added, and because an
+ * unbounded id is an unbounded argv.
+ */
+export const COMPUTER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/;
+
+/** The container-name prefix. One definition, so `terminate` and `status` cannot disagree about whose container this is. */
+export const CONTAINER_NAME_PREFIX = 'ezil-os-';
+
+export function isComputerId(id: string): boolean {
+    return COMPUTER_ID_PATTERN.test(id);
+}
+
+/** `ezil-os-<computerId>`. Throws on anything the pattern rejects — a bad id must never reach an argv, not even to produce a "no such container". */
+export function containerNameFor(id: string): string {
+    if (!isComputerId(id)) {
+        throw new Error(`invalid_computer_id: '${id}' does not match ${COMPUTER_ID_PATTERN.source}`);
+    }
+    return `${CONTAINER_NAME_PREFIX}${id}`;
+}
+
+/**
+ * `docker inspect` with ONE compound template: running state, exit code, the
+ * container's environment, and the image it is actually running.
+ *
+ * One call rather than four because every extra `docker inspect` is another
+ * process spawn on the shell's cheap status timer, and because four calls can
+ * observe four different instants of a container that is exiting.
+ *
+ * `{{json .Config.Env}}` is how `DESKTOP_MODE` and the neko passwords are READ
+ * BACK rather than assumed — see `DesktopStatus.mode` ("never a default: 'we
+ * do not know' is not 'guacamole'") and `DockerHost`'s credential resolution.
+ */
+export function buildDockerInspectArgv(containerName: string): string[] {
+    return [
+        'inspect',
+        '--format',
+        '{{.State.Running}}\t{{.State.ExitCode}}\t{{.Config.Image}}\t{{json .Config.Env}}',
+        containerName,
+    ];
+}
+
+/** `docker start <name>` — bring a stopped container back with the command it was created with. */
+export function buildDockerStartArgv(containerName: string): string[] {
+    return ['start', containerName];
+}
+
+/**
+ * `docker stop --timeout <s> <name>` — SIGTERM, then SIGKILL after the grace
+ * period. The grace period is what lets `start-neko.sh`'s own `terminate_stack`
+ * trap run; measured, a clean stop of the pinned image takes ~2.4s and the
+ * container reports exit code 143 (128+SIGTERM), i.e. the trap fired.
+ */
+export function buildDockerStopArgv(containerName: string, timeoutSeconds = 20): string[] {
+    if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 0) {
+        throw new Error(`invalid_stop_timeout: ${timeoutSeconds}`);
+    }
+    return ['stop', '--timeout', String(timeoutSeconds), containerName];
+}
+
+/**
+ * The neko user the browser auto-connects as. Mirrors
+ * `composeBrowserDesktopUrl` in
+ * `app/src/server/lib/cloudflare-guacamole-provider.ts`, which sets
+ * `usr=EZiL` for every viewer. Known limitation carried over deliberately:
+ * that provider's own doc records that a shared `usr` makes two viewers
+ * indistinguishable in `GET /api/sessions`, and proposes a per-boot nonce.
+ * Local mode has exactly one viewer, so the ambiguity has no instance here.
+ */
+export const DESKTOP_URL_USER = 'EZiL';
+
+/**
+ * Compose the browser-facing desktop URL, credential included.
+ *
+ * 🔴 THIS IS HOW THE PASSWORD REACHES THE BROWSER, AND IT IS NOT AN INVENTION
+ * OF LOCAL MODE. Hosted, `composeBrowserDesktopUrl(rawUrl, hmacSecret,
+ * sandboxId)` sets exactly `usr`, `pwd` and `embed` on the neko origin, with
+ * `pwd` carrying the derived per-sandbox REGULAR-USER value (never the admin
+ * one). `SandboxHost.DesktopUrls` has no password field precisely because
+ * upstream has none either: the desktop URL *is* the credential envelope.
+ *
+ * `embed=1` is load-bearing — see the upstream doc comment: it drives neko's
+ * `videoOnly`, which suppresses the third-party header/logo/chat, and it is
+ * also what keeps neko's own in-video control button visible above 768px.
+ */
+export function composeDesktopUrl(origin: string, userPassword: string): string {
+    if (userPassword === '') throw new Error('missing_neko_password: refusing to compose a desktop URL with an empty pwd');
+    const url = new URL(origin);
+    url.searchParams.set('usr', DESKTOP_URL_USER);
+    url.searchParams.set('pwd', userPassword);
+    url.searchParams.set('embed', '1');
+    return url.toString();
+}
+
+/**
+ * neko's own paths, measured against the pinned image rather than assumed.
+ *
+ *   GET  /health        -> 200, body exactly `true`.   (`/api/health` is a 404.)
+ *   POST /api/login     -> 200 `{ id, token, profile:{ is_admin }, state }`.
+ *   POST /api/logout    -> 200; the token is 401 afterwards.
+ *   GET  /api/sessions  -> 401 without a token; the array §16b describes with one.
+ *   GET  /api/room/screen  -> `{ width, height, rate }` — the OBSERVATION.
+ *   POST /api/room/screen  -> 200 echoing the REQUEST. Never evidence.
+ */
+export const NEKO_PATHS = Object.freeze({
+    health: '/health',
+    login: '/api/login',
+    logout: '/api/logout',
+    sessions: '/api/sessions',
+    screen: '/api/room/screen',
+});
+
+/** neko's screen refresh rate field. Every modeline in the image is 60Hz (mirrors `SCREEN_RATE_HZ` in `worker/src/index.ts`). */
+export const NEKO_SCREEN_RATE_HZ = 60;
