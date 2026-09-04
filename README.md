@@ -171,9 +171,12 @@ cd mcp && bun install && bun run typecheck && bun test
    building is reachable directly and not only through the streamed screen.
 7. The workspace is **hydrated from R2 at boot and flushed back as it changes**.
 
-**Access to the hosted product is invite-only.** Signing in to `https://os.ezil.work`
-requires an invitation, and the gate is an authorization check rather than a
-signup switch — the Supabase project is shared with `app.ezil.work`, where
+**Access to the hosted product is invite-only.** Signing in requires an
+invitation — today at `https://ezil-os.vercel.app`; `os.ezil.work` is the
+canonical host but its DNS cutover is still pending, see
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md). The gate itself is an authorization
+check rather than a signup switch — the Supabase project is shared with
+`app.ezil.work`, where
 builders must keep signing up, and anyone holding the public anon key can
 create a user directly regardless of any signup form. So the check lives
 where authorization already lives: one context

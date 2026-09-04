@@ -24,6 +24,77 @@ system, which is out of scope for a docs-only pass.
 
 ---
 
+## What is live (as of 2026-09-05)
+
+- **App**: Vercel, `https://ezil-os.vercel.app`. `os.ezil.work` is the
+  **canonical host once the cutover lands** — Vercel project domain,
+  unproxied DNS `A` record, and the Supabase redirect allowlist (row `N1`) —
+  and it is **PENDING**, not live: `dig +short os.ezil.work` returns nothing
+  today. Do not treat it as reachable until `N1` is recorded done.
+- **Worker**: Cloudflare, `https://api-desktop.ezil.org`.
+- **Container images**: built and pushed to GHCR by
+  [`.github/workflows/image.yml`](../.github/workflows/image.yml) — a keyless
+  cosign signature and build provenance on every push — but the packages
+  (`ghcr.io/ezilhq/ezil-os-desktop`, `ghcr.io/ezilhq/ezil-neko-vscode`) are
+  **still private**: `docker manifest inspect ghcr.io/ezilhq/ezil-os-desktop:latest`
+  answers `unauthorized`. Flipping both to Public is a founder step (GitHub →
+  Packages → package settings) that has not happened yet. Separately,
+  [`deploy/images.env`](../deploy/images.env)'s `EZIL_DESKTOP_TAG` still
+  carries its `<to be pinned by CI>` placeholder — the write-back from a
+  workflow run's `published-images.env` artifact to that file is a manual
+  step (row `T7`'s hand-off) nobody has done yet either, so even a
+  credentialed pull would need `EZIL_DESKTOP_TAG` set by hand first. Local
+  mode's fallback to a self-built image (`docs/LOCAL-MODE.md`) exists
+  because of exactly this gap.
+- **Branch protection**: ruleset `main: PR + CI on three OSes + DCO + CodeQL`
+  (id `22265548`) is **active** on `main` — deletion and force-push refused,
+  linear history, pull request required with zero required approvals (a solo
+  maintainer cannot approve their own PR — see
+  [`GOVERNANCE.md`](../GOVERNANCE.md)), squash-only merges, and 15 required
+  status checks (the twelve three-OS matrix legs for `worker`/`app`/`sdk +
+  mcp`/`shell`, plus `tools`, `DCO`, `CodeQL (javascript-typescript)`) —
+  measured live via `gh api repos/EZiLHQ/ezil-os/rulesets/22265548`.
+  `container` and `local` (row `T8`, Docker-backed, Linux-only) run in CI but
+  are **not yet in that required-checks list** — widening the ruleset to
+  require them is unfinished, separate from getting them running at all.
+- **Access is invite-only**, gated by `EZIL_OS_ACCESS_MODE` (`app/src/env.ts`,
+  default `invite`) and enforced in exactly one place —
+  `app/src/server/api/trpc.ts`'s `protectedProcedure`, reading an
+  `ezil_os_access` allow-list row per request — plus the three page gates
+  that give the same answer earlier. `tools/invite.ts` (`add` / `revoke` /
+  `list`) is the only sanctioned way to write that table; it writes the
+  allow-list row **before** sending the Supabase invite email (exit code `2`
+  means the row was written but the email was not — never the other order,
+  which would leave an invited person with a working account the product
+  refuses and no record of why).
+  - 🔴 **Schema before code.** Migration
+    [`app/drizzle/0002_os_access.sql`](../app/drizzle/0002_os_access.sql) must
+    be applied to the **hosted** database before the access-gate code that
+    reads `ezil_os_access` is deployed — the same rule
+    `0001_telemetry.sql` above was applied under. It has been generated and
+    proven against a throwaway Postgres 17, never against the hosted
+    database; applying it there is a founder step, not something this round
+    did.
+  - 🔴 **The invite email's redirect target changed.** It is
+    `EZIL_OS_ORIGIN` + `/auth/invited` (a client page that reads the session
+    out of the URL **fragment**, because Supabase invites are not PKCE and a
+    server route reading `?code=` — `/auth/callback` — can never see a
+    fragment). An earlier hand-off named `/auth/callback`; that is
+    superseded. `<origin>/auth/invited` must be in the Supabase project's
+    **Redirect URLs** allow-list or the invite link silently falls back to
+    the Site URL with no error. If the invite email template is ever changed
+    to the `{{ .TokenHash }}` form instead, the server-side counterpart is
+    `/auth/confirm`, and that path needs allow-listing too.
+  - 🔴 **This blocks the e2e default-host flip until an account exists.**
+    Every `e2e/prod*.mjs` suite and `e2e/release-and-wait.mjs` sign in as
+    `$EZIL_E2E_EMAIL` and then load `/os`; with `EZIL_OS_ACCESS_MODE` at its
+    `invite` default, that account needs a row in `ezil_os_access` or every
+    one of those suites fails at the `/os` step. Seeding it is part of what
+    `N1` must do before row `N2`'s e2e half (the default-host flip, not the
+    docs half this file's edits are part of) can run.
+
+---
+
 ## ✅ APPLIED: `app/drizzle/0001_telemetry.sql` is live, and holds real rows
 
 > **CORRECTED 2026-08-19 by integration.** This section said "🔴 PENDING … the
