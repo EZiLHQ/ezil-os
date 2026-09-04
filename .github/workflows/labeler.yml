@@ -1,0 +1,51 @@
+# PR labeler — routes review by which package a PR touches, per
+# .github/labeler.yml.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY pull_request_target, AND WHY THIS JOB NEVER CHECKS OUT THE PR
+# ─────────────────────────────────────────────────────────────────────────────
+# Public repo: on plain `pull_request`, a fork PR gets a read-only token that
+# cannot apply labels at all. `pull_request_target` runs with the BASE repo's
+# token instead, which can — but it also runs with the base repo's secrets
+# available, which is exactly why checking out the PR's own head ref under
+# `pull_request_target` is a classic fork-PR privilege-escalation pattern
+# (untrusted code, trusted token). This job never checks anything out: the
+# action reads `.github/labeler.yml` from the base ref over the API and diffs
+# the PR's changed files, so there is nothing here for a malicious fork PR to
+# run.
+#
+# `sync-labels: true` REMOVES a config-managed label from a PR whose files no
+# longer match its glob — including a label a human applied to it by hand
+# that happens to share a name with one of the ten below (app, worker, shell,
+# sdk, mcp, e2e, docs, ci, local, tools). That's a real behavior someone will
+# eventually file a bug about, not a corner case; it is the intended trade
+# for labels that track the current diff instead of the first one.
+name: PR Labeler
+
+on:
+  pull_request_target:
+
+# `pull-requests: write` is enough to APPLY existing labels. It is NOT enough
+# to CREATE a label that doesn't exist in the repo yet — that additionally
+# needs `issues: write` (see actions/labeler README, "Creating New Labels").
+# This workflow deliberately does not grant that: none of the ten labels
+# above exist in EZiLHQ/ezil-os yet (verified via
+# `gh api repos/EZiLHQ/ezil-os/labels`), so until they are created by hand
+# this job will fail to apply them rather than silently widen its own
+# permissions to create them itself.
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: labeler-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  labeler:
+    name: label
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v5
+        with:
+          sync-labels: true

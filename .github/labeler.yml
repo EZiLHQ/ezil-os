@@ -1,0 +1,51 @@
+# Path-based PR labels for .github/workflows/labeler.yml (actions/labeler@v5).
+#
+# `local/**`, `deploy/**` and `tools/**` do not exist yet at this commit —
+# they land in wave 0/1 of the local-mode and tooling tracks. A non-matching
+# glob is inert, not an error, so these rules are correctly forward-looking:
+# once those directories exist, PRs touching them get labelled without this
+# file needing another edit.
+#
+# `docs` matches root-level `*.md` (README.md, CONTRIBUTING.md, ...) as well
+# as anything under docs/ — that is the brief, not an oversight; per-package
+# READMEs (app/README.md, worker/README.md, ...) are NOT root-level and so
+# fall under their own package label instead, which is the more useful routing.
+app:
+  - changed-files:
+      - any-glob-to-any-file: ['app/**']
+
+worker:
+  - changed-files:
+      - any-glob-to-any-file: ['worker/**']
+
+shell:
+  - changed-files:
+      - any-glob-to-any-file: ['shell/**', 'app/public/os/**']
+
+sdk:
+  - changed-files:
+      - any-glob-to-any-file: ['sdk/**']
+
+mcp:
+  - changed-files:
+      - any-glob-to-any-file: ['mcp/**']
+
+e2e:
+  - changed-files:
+      - any-glob-to-any-file: ['e2e/**']
+
+docs:
+  - changed-files:
+      - any-glob-to-any-file: ['docs/**', '*.md']
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file: ['.github/**']
+
+local:
+  - changed-files:
+      - any-glob-to-any-file: ['local/**', 'deploy/**']
+
+tools:
+  - changed-files:
+      - any-glob-to-any-file: ['tools/**']
