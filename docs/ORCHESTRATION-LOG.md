@@ -61,3 +61,8 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   are skipped and printed, because `git rebase --signoff` drops them and `main`'s own merges are unsigned. The check
   has never run on GitHub: the throwaway-PR proof (red, not pending) is a supervisor step after the first push.
   T2 dispatched (Docker adapter; must boot the real image on this box). Running: G2, O3, T2.
+- 2026-09-04 10:10Z — **First push of the round** (`6495628..2bcf12f`), after a secret-shaped-string scan of the delta
+  (only a lockfile sha512 matched). `codeowners/errors` on the default branch → 0 (was silently unresolvable).
+  Ten path labels created for the labeler. Probe PR #10 opened from `probe/dco` with one UNSIGNED commit: all seven
+  contexts appeared (the six the ruleset will require, plus `label`), the labeler applied `docs`. Waiting for the
+  DCO check to report failure (a pending context would mean the display name is wrong).
