@@ -45,6 +45,16 @@ const SOLID_GREY = frame(160, 100, () => [128, 128, 128]);
 const SOLID_WHITE = frame(160, 100, () => [255, 255, 255]);
 /** Half black, half white: standard deviation 127.5 — the highest of any frame here — from exactly two tones. */
 const TWO_TONE = frame(160, 100, (i) => (i < 8000 ? [0, 0, 0] : [255, 255, 255]));
+/**
+ * 🔴 THE FIXTURE THAT PROVES `MIN_STD_DEV` IS LOAD-BEARING. Luminance cycles
+ * over 96..120 — FOUR distinct buckets, so it clears `MIN_BUCKETS` outright,
+ * while a uniform spread of width 24 has a standard deviation of 24/sqrt(12) ≈
+ * 6.9, under the threshold. This is what a nearly-flat frame looks like:
+ * encoder noise over a blank screen, or a desktop whose only content is a
+ * gradient. Without it, DELETING the `stdDev` condition from `isNonUniform`
+ * leaves the whole suite GREEN — measured, and the reason this fixture exists.
+ */
+const NEARLY_FLAT = frame(160, 100, (i) => { const v = 96 + (i % 25); return [v, v, v]; });
 /** One white pixel on black. A respectable-looking `max`, and not a picture. */
 const ONE_HOT = frame(160, 100, (i) => (i === 0 ? [255, 255, 255] : [0, 0, 0]));
 /**
@@ -135,6 +145,17 @@ describe('isNonUniform — the verdict', () => {
         expect(s.buckets).toBe(2);
         expect(isNonUniform(s)).toBe(false);
         expect(describeStats(s)).toMatch(/TOO FEW DISTINCT TONES/);
+    });
+
+    it('REJECTS a nearly-flat frame that clears the bucket count', () => {
+        // The case only `MIN_STD_DEV` catches. Proven by mutation: with the
+        // stdDev condition removed from `isNonUniform`, every other test in
+        // this file still passes and this one turns red.
+        const s = luminanceStats(NEARLY_FLAT);
+        expect(s.buckets).toBeGreaterThanOrEqual(MIN_BUCKETS);
+        expect(s.stdDev).toBeLessThan(MIN_STD_DEV);
+        expect(isNonUniform(s)).toBe(false);
+        expect(describeStats(s)).toMatch(/UNIFORM/);
     });
 
     it('REJECTS one white pixel on black — bright, varied, still not a picture', () => {
