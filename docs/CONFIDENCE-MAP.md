@@ -60,6 +60,11 @@ The worktree was cut at `4b05869` at 12:31Z. By 13:20Z `origin/main` was
 | `3c76d43` (#27) | `M4` — the "macOS import" failure was a missing `cloudflare:workers` stub plus directory order; worker unit steps un-gated on all three OSes |
 | `995a61b` (#20), `e1bd1c0` (#25) | supervisor log/ledger folds |
 
+(And it kept moving: by the time this branch was pushed, `origin/main` was
+`63eec2e` — a **new round**, `INTAKE`, with rows `I0a`–`I6b` dispatched. Nothing
+below was measured at that commit. Read every figure against the sha attached to
+it.)
+
 **The first draft of this document said `main`'s CI was red. That is no longer
 true and the correction is the most important line in this file.** At `3c76d43`,
 CI run `33876458190` is **green on all fifteen jobs**, `container (real image)`
