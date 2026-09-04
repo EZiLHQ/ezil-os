@@ -23,7 +23,8 @@ build next, and the measurement that would settle each item, is
 That table is the whole list, and stating it plainly is the point. One other
 person, [@Thanush-41](https://github.com/Thanush-41), is a member of the `EZiLHQ`
 organisation with **read** access; they are not a maintainer and hold no merge
-rights. Nobody else has any.
+rights. Nobody else has any: `gh api repos/EZiLHQ/ezil-os/collaborators` lists
+exactly those two.
 
 So the bus factor is one. The mitigations are that everything the project knows
 is written down in this repository rather than held in one head
@@ -131,14 +132,19 @@ green build, not a deploy, not a merge to `main`.
 Tagging triggers
 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml), which deploys and
 then runs the production suites against what it deployed.
-[`CHANGELOG.md`](CHANGELOG.md) states the rule this project holds itself to — *a
-green deploy that was never verified is not a release here* — and the pipeline
-is arranged so that the verification, not the deploy, is what a release waits
-on.
+[`CHANGELOG.md`](CHANGELOG.md) states the rule this project holds itself to: *a
+green deploy that was never verified is not a release here.*
 
-As of 2026-09-04 **no `v*` tag has ever been cut** (`git tag` is empty), so that
-pipeline has never run. The first release is therefore also the first exercise
-of this rule, and it should be treated accordingly.
+Today that pipeline stops at the verification. Its jobs are `worker`, `app`,
+`verify` and `verify-container`, and none of them publishes a GitHub Release —
+making the release wait on the verification job rather than on the deploy is row
+`R1` in [`docs/TASKS.csv`](docs/TASKS.csv), and it has not landed. Until it does,
+the last step is a maintainer's, taken after reading the verification output.
+
+As of 2026-09-04 **no `v*` tag has ever been cut** — `gh api
+repos/EZiLHQ/ezil-os/tags` returns an empty list and the repository has no
+releases — so that pipeline has never run at all. The first release is therefore
+also the first exercise of this rule, and it should be treated accordingly.
 
 ## Funding
 
