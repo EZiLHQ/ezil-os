@@ -48,10 +48,16 @@
 # why rules 1 and 2 only ever run on an exit of 0: they exist for the case
 # where bun exits 0 and the summary is missing or unreadable anyway.
 #
-# `--timeout` is likewise NOT set by default. Bun's 5000 ms default was
-# measured against the real suite on this machine (1061 worker tests, 39 files,
-# 240 s wall, container suites included and passing), so there is nothing to
-# fix. `EZIL_TEST_TIMEOUT_MS` sets one when a slow machine needs it.
+# `--timeout` is likewise NOT set by default, and that is a measurement rather
+# than an omission. The real worker suite on this machine is 1061 tests over 39
+# files in 245 s under Bun's 5000 ms default; two of the three container suites
+# boot a real container and PASS under it (they boot at module scope, not in a
+# lifecycle hook). The third, `scripts/mobile-keyboard.container.test.ts`, fails
+# 8 of 8 -- and that is NOT a timeout artifact: re-run with
+# `EZIL_TEST_TIMEOUT_MS=600000`, the same 8 fail in 9.6 s, so raising the budget
+# changes nothing and the timeout is not the variable. A default copied from the
+# sibling project would have looked like a fix for a problem it does not touch.
+# `EZIL_TEST_TIMEOUT_MS` is still there for a slow machine.
 #
 # ═══════════════════════════════════════════════════════════════════════════
 # 🔴 THE SKIP HAZARD, WHICH IS THE REASON THIS FILE IS AN OPUS ROW
