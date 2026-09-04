@@ -185,3 +185,13 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   Windows runner. Supervisor patch (c18719e on `task/T4`): that describe block is `skipIf(win32)` with the reason in
   the file — an announced platform skip of a timing claim measured on Linux/macOS, nowhere else. Eighth run in
   progress; if it is green on every leg, T4 merges through the PR.
+- 2026-09-04 19:45Z — **A1 merged**: `ezil_os_access` (text email PK lower-cased by CHECK — `citext` is available but
+  not installed on the Supabase image; `user_id` FK to `auth.users` ON DELETE SET NULL; RLS with a service-role-only
+  policy, as the four existing tables do), migration `0002_os_access.sql` generated offline and applied to a
+  throwaway Postgres 17 (the hosted database was not touched), `EZIL_OS_ACCESS_MODE` defaulting to `invite` at three
+  edit sites in `env.ts`, `osAccessFor`/`assertOsAccess` (29 tests; five mutants RED 4/16/3/1/1), `tools/invite.ts`
+  (`add` writes the row BEFORE sending the invite; exit 2 = row written, email not sent; `--no-invite` for existing
+  accounts). App suite 725/0. 🔴 Hand-off that shapes A2: Supabase invites are NOT PKCE — the verify redirect carries
+  the session in the URL fragment, which `/auth/callback/route.ts` (a server handler reading `?code=`) can never see;
+  the invited-user landing is unproven end to end. Founder steps added: apply 0002 to hosted by hand (schema before
+  code), seed the allow-list, add the callback URL to Redirect URLs. A2 dispatched next. Running: T5, X1.
