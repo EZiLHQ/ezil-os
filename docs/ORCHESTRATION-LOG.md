@@ -220,3 +220,10 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   passes `--session.implicit_hosting=true` and a flag outranks env, so the variable is a fallback, not the fix. 307
   pass / 0 fail on `local/`. Blind spots stated by the worker: nothing proves an application reacted to the keystrokes;
   one viewport, one browser; audio untouched. T6 dispatched (release.yml + launchers). Running: A2, T7, T6.
+- 2026-09-04 22:30Z — **T7 merged**: `EZIL_NEKO_OVERLAY_TAG` in `deploy/images.env` (image.yml greps it; a derivation
+  guard refuses an overlay tag not prefixed by the base tag — three negative controls fire distinct messages);
+  `ghcr.io/m1k1o/neko/base` pinned by the digest CI actually pulled (`sha256:20806497…`, from run 33858675382's log,
+  re-inspected today); the desktop job publishes `published-images.env` as an artifact rather than committing to
+  `main`. Supervisor fix on merge: `run-spec.test.ts` pinned "the four keys" — now five. Worker's blind spot recorded:
+  the digest pin does not rebuild the base by itself (the tags already exist), only a SHA bump or `rebuild_base`.
+  M1 dispatched (mobile-keyboard container test: 8 failures + 5 vacuous passes). Running: A2, T6, M1.

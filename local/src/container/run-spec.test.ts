@@ -345,9 +345,9 @@ describe('deploy/images.env', () => {
     const TEXT = readFileSync(IMAGES_ENV_PATH, 'utf8');
     const ENTRIES = parseImagesEnv(TEXT);
 
-    it('parses to the four pinned keys, comments and blanks dropped', () => {
+    it('parses to the five pinned keys, comments and blanks dropped', () => {
         expect(Object.keys(ENTRIES).sort()).toEqual([
-            'EZIL_DESKTOP_IMAGE', 'EZIL_DESKTOP_TAG', 'EZIL_NEKO_IMAGE', 'EZIL_NEKO_TAG',
+            'EZIL_DESKTOP_IMAGE', 'EZIL_DESKTOP_TAG', 'EZIL_NEKO_IMAGE', 'EZIL_NEKO_OVERLAY_TAG', 'EZIL_NEKO_TAG',
         ]);
         expect(ENTRIES['EZIL_DESKTOP_IMAGE']).toBe('ghcr.io/ezilhq/ezil-os-desktop');
         expect(ENTRIES['EZIL_NEKO_IMAGE']).toBe('ghcr.io/ezilhq/ezil-neko-vscode');
