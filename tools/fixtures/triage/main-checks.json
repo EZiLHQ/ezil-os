@@ -1,0 +1,22 @@
+{
+  "total_count": 17,
+  "check_runs": [
+    { "name": "worker (typecheck + unit) (ubuntu-latest)", "status": "completed", "conclusion": "success" },
+    { "name": "worker (typecheck + unit) (windows-latest)", "status": "completed", "conclusion": "success" },
+    { "name": "worker (typecheck + unit) (macos-latest)", "status": "completed", "conclusion": "success" },
+    { "name": "app (typecheck + unit) (ubuntu-latest)", "status": "completed", "conclusion": "success" },
+    { "name": "app (typecheck + unit) (windows-latest)", "status": "completed", "conclusion": "success" },
+    { "name": "app (typecheck + unit) (macos-latest)", "status": "completed", "conclusion": "success" },
+    { "name": "sdk + mcp (typecheck + unit) (ubuntu-latest)", "status": "completed", "conclusion": "success" },
+    { "name": "sdk + mcp (typecheck + unit) (windows-latest)", "status": "completed", "conclusion": "success" },
+    { "name": "sdk + mcp (typecheck + unit) (macos-latest)", "status": "completed", "conclusion": "success" },
+    { "name": "shell (bundle check + browser suites) (ubuntu-latest)", "status": "completed", "conclusion": "success" },
+    { "name": "shell (bundle check + browser suites) (windows-latest)", "status": "completed", "conclusion": "success" },
+    { "name": "shell (bundle check + browser suites) (macos-latest)", "status": "completed", "conclusion": "success" },
+    { "name": "tools (typecheck + unit)", "status": "completed", "conclusion": "success" },
+    { "name": "DCO", "status": "completed", "conclusion": "success" },
+    { "name": "CodeQL (javascript-typescript)", "status": "completed", "conclusion": "success" },
+    { "name": "container (real image)", "status": "completed", "conclusion": "success" },
+    { "name": "local (typecheck + unit + smoke)", "status": "completed", "conclusion": "success" }
+  ]
+}

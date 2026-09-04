@@ -1,0 +1,16 @@
+[
+  { "name": "app (typecheck + unit) (ubuntu-latest)", "bucket": "fail", "state": "FAILURE" },
+  { "name": "app (typecheck + unit) (windows-latest)", "bucket": "pass", "state": "SUCCESS" },
+  { "name": "app (typecheck + unit) (macos-latest)", "bucket": "pass", "state": "SUCCESS" },
+  { "name": "worker (typecheck + unit) (ubuntu-latest)", "bucket": "pass", "state": "SUCCESS" },
+  { "name": "sdk + mcp (typecheck + unit) (ubuntu-latest)", "bucket": "pass", "state": "SUCCESS" },
+  { "name": "shell (bundle check + browser suites) (ubuntu-latest)", "bucket": "pass", "state": "SUCCESS" },
+  { "name": "tools (typecheck + unit)", "bucket": "pass", "state": "SUCCESS" },
+  { "name": "DCO", "bucket": "pass", "state": "SUCCESS" },
+  { "name": "CodeQL (javascript-typescript)", "bucket": "pass", "state": "SUCCESS" },
+  { "name": "container (real image)", "bucket": "fail", "state": "FAILURE" },
+  { "name": "local (typecheck + unit + smoke)", "bucket": "fail", "state": "FAILURE" },
+  { "name": "Vercel", "bucket": "fail", "state": "FAILURE" },
+  { "name": "Vercel Preview Comments", "bucket": "pass", "state": "SUCCESS" },
+  { "name": "label", "bucket": "pass", "state": "SUCCESS" }
+]

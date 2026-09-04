@@ -1,0 +1,62 @@
+[
+  {
+    "number": 33,
+    "title": "chore(deps-dev): bump wrangler from 4.108.0 to 4.128.0 in /worker in the patch-and-minor group",
+    "author": { "login": "app/dependabot", "is_bot": true },
+    "isDraft": false,
+    "labels": [{ "name": "worker" }, { "name": "dependencies" }],
+    "additions": 40,
+    "deletions": 36,
+    "headRefName": "dependabot/bun/worker/patch-and-minor-90741ce0a8",
+    "body": "Bumps the patch-and-minor group in /worker with 1 update: wrangler. Updates `wrangler` from 4.108.0 to 4.128.0.",
+    "updatedAt": "2026-09-04T20:26:43Z"
+  },
+  {
+    "number": 34,
+    "title": "chore(deps): bump the patch-and-minor group in /app with 11 updates",
+    "author": { "login": "app/dependabot", "is_bot": true },
+    "isDraft": false,
+    "labels": [{ "name": "app" }, { "name": "dependencies" }],
+    "additions": 181,
+    "deletions": 115,
+    "headRefName": "dependabot/bun/app/patch-and-minor-3f2a1c",
+    "body": "Bumps the patch-and-minor group in /app with 11 updates.",
+    "updatedAt": "2026-09-04T20:28:23Z"
+  },
+  {
+    "number": 101,
+    "title": "feat: big refactor of the boot pipeline",
+    "author": { "login": "alice", "is_bot": false },
+    "isDraft": true,
+    "labels": [{ "name": "shell" }],
+    "additions": 1200,
+    "deletions": 300,
+    "headRefName": "feat/boot-refactor",
+    "body": "This reworks a lot of the boot pipeline. TODO: write this up properly.",
+    "updatedAt": "2026-09-05T09:00:00Z"
+  },
+  {
+    "number": 102,
+    "title": "fix: focus order in the window manager",
+    "author": { "login": "bob", "is_bot": false },
+    "isDraft": false,
+    "labels": [{ "name": "shell" }, { "name": "size/L" }],
+    "additions": 120,
+    "deletions": 80,
+    "headRefName": "fix/focus-order",
+    "body": "## What changed\n\nFixes the focus/z-order bug when two windows open together.\n\n- [x] I have read CONTRIBUTING.md\n- [x] I ran `./tools/test.sh shell`\n- [ ] Every commit is signed off",
+    "updatedAt": "2026-09-05T10:00:00Z"
+  },
+  {
+    "number": 103,
+    "title": "docs: fix a typo in the README",
+    "author": { "login": "carol", "is_bot": false },
+    "isDraft": false,
+    "labels": [{ "name": "docs" }],
+    "additions": 3,
+    "deletions": 1,
+    "headRefName": "docs/readme-typo",
+    "body": "A tiny fix.\n\n- [x] I have read CONTRIBUTING.md",
+    "updatedAt": "2026-09-05T11:00:00Z"
+  }
+]

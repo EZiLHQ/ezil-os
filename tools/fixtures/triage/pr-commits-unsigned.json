@@ -1,0 +1,68 @@
+[
+  {
+    "sha": "b0d4721dbotdependabot0000000000000000000",
+    "commit": {
+      "message": "chore(deps-dev): bump wrangler in /worker in the patch-and-minor group\n\nSigned-off-by: dependabot[bot] <support@github.com>",
+      "author": { "name": "dependabot[bot]", "email": "49699333+dependabot[bot]@users.noreply.github.com", "date": "2026-09-04T20:00:00Z" }
+    },
+    "author": { "login": "dependabot[bot]" },
+    "parents": [{ "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }]
+  },
+  {
+    "sha": "1111111111111111111111111111111111111111",
+    "commit": {
+      "message": "feat: add a thing\n\nSigned-off-by: Jane Doe <jane@example.com>",
+      "author": { "name": "Jane Doe", "email": "jane@example.com", "date": "2026-09-04T21:00:00Z" }
+    },
+    "author": { "login": "janedoe" },
+    "parents": [{ "sha": "1111111111111111111111111111111111111110" }]
+  },
+  {
+    "sha": "2222222222222222222222222222222222222222",
+    "commit": {
+      "message": "fix: forgot to sign this one",
+      "author": { "name": "Alex Kim", "email": "alex@example.com", "date": "2026-09-04T22:00:00Z" }
+    },
+    "author": { "login": "alexkim" },
+    "parents": [{ "sha": "2222222222222222222222222222222222222221" }]
+  },
+  {
+    "sha": "3333333333333333333333333333333333333333",
+    "commit": {
+      "message": "refactor: rename a symbol\n\nSigned-off-by: Sam Lee <sam@old.example.com>",
+      "author": { "name": "Sam Lee", "email": "sam@new.example.com", "date": "2026-09-04T23:00:00Z" }
+    },
+    "author": { "login": "samlee" },
+    "parents": [{ "sha": "3333333333333333333333333333333333333331" }]
+  },
+  {
+    "sha": "4444444444444444444444444444444444444444",
+    "commit": {
+      "message": "Merge branch 'main' into feature",
+      "author": { "name": "Alex Kim", "email": "alex@example.com", "date": "2026-09-05T00:00:00Z" }
+    },
+    "author": { "login": "alexkim" },
+    "parents": [
+      { "sha": "4444444444444444444444444444444444444441" },
+      { "sha": "4444444444444444444444444444444444444442" }
+    ]
+  },
+  {
+    "sha": "5555555555555555555555555555555555555555",
+    "commit": {
+      "message": "docs: tweak wording\n\nSigned-off-by: Case User <case@example.com>",
+      "author": { "name": "Case User", "email": "Case@Example.COM", "date": "2026-09-05T01:00:00Z" }
+    },
+    "author": { "login": "caseuser" },
+    "parents": [{ "sha": "5555555555555555555555555555555555555551" }]
+  },
+  {
+    "sha": "6666666666666666666666666666666666666666",
+    "commit": {
+      "message": "chore: small change\n\nSigned-off-by: Bob <bob@x.com>",
+      "author": { "name": "bob", "email": "bob@x.com", "date": "2026-09-05T02:00:00Z" }
+    },
+    "author": { "login": "bob" },
+    "parents": [{ "sha": "6666666666666666666666666666666666666661" }]
+  }
+]

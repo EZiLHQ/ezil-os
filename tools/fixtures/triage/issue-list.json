@@ -1,0 +1,30 @@
+[
+  {
+    "number": 201,
+    "title": "Files app hangs on a large workspace",
+    "labels": [],
+    "body": "Opening a workspace with many files freezes the desktop.",
+    "updatedAt": "2026-09-05T08:00:00Z"
+  },
+  {
+    "number": 202,
+    "title": "Add GPU passthrough on Linux",
+    "labels": [{ "name": "local" }, { "name": "help wanted" }],
+    "body": "Pass --gpus through to the container.",
+    "updatedAt": "2026-09-05T08:30:00Z"
+  },
+  {
+    "number": 203,
+    "title": "Broken link in the README",
+    "labels": [{ "name": "needs-triage" }],
+    "body": "The docs link 404s.",
+    "updatedAt": "2026-09-05T09:00:00Z"
+  },
+  {
+    "number": 204,
+    "title": "Question about the licence of a vendored library",
+    "labels": [{ "name": "question" }],
+    "body": "Is MIT compatible with AGPL here?",
+    "updatedAt": "2026-09-05T09:30:00Z"
+  }
+]
