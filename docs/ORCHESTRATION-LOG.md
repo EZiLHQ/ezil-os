@@ -94,3 +94,16 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   candidate pointing at nothing while every HTTP check stays green); neko advertises its compiled-in
   `stun:stun.l.google.com:19302` and the env spelling to clear it does nothing (T5's doctor prints it as a caveat;
   fixing it is an image change). T4 dispatched (CI matrix). Running: O3, T1, T4. Queued: T3, O4.
+- 2026-09-04 12:30Z — **O3 merged** (e6c21b6): `tools/worktree.sh` (12 MB per worktree vs 1.1 GB of stores; `@ezil-os/sdk`
+  relinked into the worktree — mutation-proved: a type error in the worktree's sdk reddens the worktree's mcp, and the
+  old whole-directory symlink stayed GREEN on the same injection) and `tools/test.sh` (three fail-closed rules; every
+  container skip named; a third gate for *vacuous passes* — `mobile-keyboard.container.test.ts` returns early from
+  five bodies and bun counts them as PASS). Supervisor verified add/readlink/remove of a smoke worktree and the
+  tools/sdk suites. **Finding: with the image present, `main`'s worker suite has 8 pre-existing failures** in
+  `worker/scripts/mobile-keyboard.container.test.ts` (remote receives nothing) — CI is green only by absence of the
+  image; rows M1 and M2 added (M2: `browser-sidecar-contract.test.ts` skips all 10 tests inside any worktree because
+  it resolves the contract path to the worktree root). Supervisor fixes from O3's hand-offs: `.gitignore` now ignores
+  `.dev.vars*`; the parse test scans `tools/`; `shell/run-tests.sh:161` no longer aborts under `set -u` when no
+  Playwright variable is set (an unescaped `$EZIL_PLAYWRIGHT_DIR` inside a message). Row O3's own `verify_cmd` was a
+  coincidence (exit 1 came from the 8 failures, not the guard) — CSV row corrected to the inducing command.
+  T3 dispatched (GHCR image chain). Running: T1, T4, T3. Queued: O4.

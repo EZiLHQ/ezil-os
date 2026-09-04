@@ -29,6 +29,9 @@ app/tsconfig.tsbuildinfo
 .env.development.local
 .env.test.local
 .env.production.local
+# wrangler's local secrets file (the Worker's .env.local)
+.dev.vars
+.dev.vars.*
 # ...except the checked-in, names-only template
 !.env.example
 
