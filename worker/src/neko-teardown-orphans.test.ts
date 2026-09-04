@@ -32,6 +32,13 @@
  * Linux (`/proc` is used to distinguish a live process from a zombie), bash,
  * python3. No Docker, no X server, no neko binary. The container-level proof
  * that this mirrors was run separately against the real image.
+ *
+ * PR #14 eighth run: all 5 tests in this file failed on macOS — both for the
+ * `/proc/<pid>/stat` read above and because `supervise_app`
+ * (`scripts/start-neko.sh:1536`) launches every app under `setsid` (util-
+ * linux, absent on macOS/BSD). Self-skips off Linux with a printed reason
+ * rather than reporting a false pass or a false fail (ORCHESTRATION-LOG.md,
+ * row M3).
  */
 
 import { afterEach, describe, expect, it } from 'bun:test';
@@ -40,6 +47,26 @@ import { connect } from 'node:net';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+/** Why this suite may not run here. `null` means it CAN. Same idiom as
+ *  `./browser-sidecar.container.test.ts`'s `SKIP_REASON`. */
+const LINUX_ONLY_REASON = process.platform === 'linux'
+    ? null
+    : `executes scripts/start-neko.sh's teardown for real, reading /proc/<pid>/stat to tell a live `
+    + `process from a zombie and relying on \`setsid\` (util-linux) — neither exists on `
+    + `${process.platform}; not meaningful there`;
+
+if (LINUX_ONLY_REASON) {
+    console.warn(
+        `\n${'='.repeat(78)}\n`
+        + `SKIPPING the teardown-orphans suite: ${LINUX_ONLY_REASON}.\n`
+        + `Nothing about whether teardown kills the applications (not just their\n`
+        + `supervisors) has been verified by this run — see this file's own header.\n`
+        + `${'='.repeat(78)}\n`,
+    );
+}
+
+const describeIf = LINUX_ONLY_REASON ? describe.skip : describe;
 
 const START_NEKO = join(import.meta.dir, '..', 'scripts', 'start-neko.sh');
 
@@ -252,7 +279,7 @@ async function bootToReady (reuse?: Harness): Promise<Harness> {
     return h;
 }
 
-describe('start-neko.sh: teardown leaves no orphaned applications', () => {
+describeIf('start-neko.sh: teardown leaves no orphaned applications', () => {
     it('kills the app AND its grandchild, and frees the port, on the fatal-app path', async () => {
         const h = await bootToReady();
         const appPid = readPid(h.appPidFile);
@@ -330,7 +357,7 @@ describe('start-neko.sh: teardown leaves no orphaned applications', () => {
     }, 180_000);
 });
 
-describe('start-neko.sh: a boot that starts nothing must not tear down the one that did', () => {
+describeIf('start-neko.sh: a boot that starts nothing must not tear down the one that did', () => {
     /**
      * ── The production outage this reproduces ───────────────────────────────
      * `ensureDesktop` (src/index.ts) re-issues
@@ -414,7 +441,7 @@ describe('start-neko.sh: a boot that starts nothing must not tear down the one t
     }, 180_000);
 });
 
-describe('start-neko.sh: a genuinely unstartable app still fails closed', () => {
+describeIf('start-neko.sh: a genuinely unstartable app still fails closed', () => {
     it('exits non-zero when a mandatory app can never start, and cleans up anyway', async () => {
         // Guards the other direction: the teardown work above must not have
         // turned the fail-closed readiness gate into a fail-open one.

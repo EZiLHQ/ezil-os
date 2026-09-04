@@ -55,6 +55,14 @@
  * container-level proof this mirrors has to be run separately against the real
  * image (a stub browser is not Chrome, and only Chrome can tell us what status
  * Chrome actually exits with when a user closes its last window).
+ *
+ * `supervise_app` (`scripts/start-neko.sh:1536`) launches every app under
+ * `setsid "$@" …`, and `setsid` is util-linux — not present on macOS/BSD, and
+ * not something a stub PATH entry can safely paper over here (the process-
+ * group semantics it provides are the thing under test). PR #14 eighth run:
+ * all 4 tests in this file failed on macOS for exactly this reason (see
+ * ORCHESTRATION-LOG.md, row M3). Self-skips off Linux with a printed reason
+ * rather than reporting a false pass or a false fail.
  */
 
 import { afterEach, describe, expect, it } from 'bun:test';
@@ -63,6 +71,26 @@ import { connect } from 'node:net';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+/** Why this suite may not run here. `null` means it CAN. Same idiom as
+ *  `./browser-sidecar.container.test.ts`'s `SKIP_REASON`. */
+const LINUX_ONLY_REASON = process.platform === 'linux'
+    ? null
+    : `executes scripts/start-neko.sh's supervise_app loop for real, which launches every app `
+    + `under \`setsid\` (util-linux) — not present on ${process.platform}; not meaningful there`;
+
+if (LINUX_ONLY_REASON) {
+    console.warn(
+        `\n${'='.repeat(78)}\n`
+        + `SKIPPING the clean-app-exit suite: ${LINUX_ONLY_REASON}.\n`
+        + `Nothing about the restart-budget classification (clean quit vs. crash-loop)\n`
+        + `has been verified by this run — see this file's own header for why only a\n`
+        + `real script run can prove it.\n`
+        + `${'='.repeat(78)}\n`,
+    );
+}
+
+const describeIf = LINUX_ONLY_REASON ? describe.skip : describe;
 
 const START_NEKO = join(import.meta.dir, '..', 'scripts', 'start-neko.sh');
 
@@ -229,7 +257,7 @@ function launches(h: Harness): number {
     return readFileSync(h.launchLog, 'utf8').split('\n').filter((l) => l.trim() !== '').length;
 }
 
-describe('start-neko.sh: a clean app exit is not a crash', () => {
+describeIf('start-neko.sh: a clean app exit is not a crash', () => {
     it('A. keeps the session alive through more clean quits than the restart budget allows', async () => {
         // Budget of 1 means the OLD behaviour raised the fatal sentinel on the
         // 2nd exit. The browser here exits 0 after 6s — past the 5s minimum
