@@ -420,6 +420,13 @@ export type NonGoal = (typeof NON_GOALS)[number];
 // it — and on its own tsc would happily accept an eleventh member appearing, or a
 // non-goal quietly becoming one. These four lines make both of those a compile
 // error. They emit nothing.
+//
+// 🔴 DO NOT DELETE THESE AS "UNUSED". They are module-scope type aliases that
+// nothing references, so enabling `noUnusedLocals` (or any linter's unused
+// rule) will report them as dead code. They are not: a type alias whose
+// argument violates its own constraint is a compile ERROR at the declaration,
+// which is the entire mechanism. Proven by mutation — adding an eleventh member
+// named `exposePort` produced TS2344 twice, once from each check.
 
 type Expect<T extends true> = T;
 type Exactly<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;

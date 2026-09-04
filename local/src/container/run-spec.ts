@@ -433,6 +433,17 @@ export function buildContainerEnv(spec: DockerRunSpec): Record<string, string> {
  * the path that would need raising. No `--rm`: `terminate` removes the
  * container explicitly, and a container that died on its own must survive long
  * enough for `docker logs` to say why.
+ *
+ * 🔴 THE FLAG SET WAS HANDED TO A REAL DOCKER, NOT ONLY TO A UNIT TEST.
+ * `docker create` parses every flag and builds the container without starting
+ * it. Against Docker 29.1.3 with `ezil-os-worker-sandbox:ff199202`, this exact
+ * argv was accepted and `docker inspect` reported back what it should:
+ * `Entrypoint=[/bin/bash]`,
+ * `Cmd=[-c DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh]`,
+ * 6 port bindings, `NanoCpus=2000000000`, `Memory=8589934592`. The container
+ * was removed immediately. That is not a boot — it does not prove the desktop
+ * comes up — but it does prove no flag here is rejected, which is the failure
+ * this file would otherwise hand to row T2 to discover.
  */
 export function buildDockerRunArgv(spec: DockerRunSpec): string[] {
     const env = buildContainerEnv(spec);
