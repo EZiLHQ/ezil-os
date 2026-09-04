@@ -12,20 +12,20 @@
 # anywhere in this file.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔴 `paths:` ALSO GATES THE `tags: ['v*']` TRIGGER — VERIFIED, NOT ASSUMED
+# ⚠️ `paths:` MAY ALSO GATE THE `tags: ['v*']` TRIGGER — DOCUMENTED, NOT MEASURED
 # ─────────────────────────────────────────────────────────────────────────────
-# GitHub ANDs every filter on a `push` trigger together, and that AND is not
-# documented as applying only to branch pushes: a `paths` filter alongside
-# `tags` restricts tag pushes too, not just pushes to `main`. So a `v*` tag
-# pushed at a commit that touches none of the paths below will NOT trigger
-# this workflow, and no semver-tagged image is published for it — the image
-# for that release is whatever the most recent path-matching push to `main`
-# already built and pushed under its `<git-sha8>` tag. There is no native
-# `on.push` syntax for "these paths OR any version tag" (confirmed against
-# GitHub's own docs: branches/tags are OR'd against each other for the ref
-# match, but paths ANDs on top of that combined match) and a second workflow
-# file is outside this row's `owns_files`, so this is accepted as-is: see the
-# T3 worker report for the full reasoning.
+# GitHub documents `branches`+`paths` on a `push` trigger as ANDed, but does
+# not document whether that AND also applies when the ref match came from
+# `tags` rather than `branches` — no stated exception either way. Until an
+# actual `v*` push is observed on this repository, treat it as ANDed (the
+# conservative reading): a `v*` tag pushed at a commit that touches none of
+# the paths below may NOT trigger this workflow, and no semver-tagged image
+# would be published for it — the image for that release would be whatever
+# the most recent path-matching push to `main` already built and pushed under
+# its `<git-sha8>` tag. There is no native `on.push` syntax for "these paths
+# OR any version tag", and a second workflow file is outside this row's
+# `owns_files`. SUPERVISOR STEP: confirm on the first real `v*` tag push
+# whether this job actually ran; if it silently didn't, that's the AND.
 name: Image
 
 on:
@@ -50,9 +50,13 @@ permissions:
   id-token: write
   attestations: write
 
+# NOT cancel-in-progress: this workflow pushes an image and only THEN signs
+# and attests it. A cancel between push and sign would leave a pushed,
+# unsigned image sitting in the registry — deploy.yml's `deploy-production`
+# group made the identical choice for the identical reason (see its header).
 concurrency:
   group: image-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   # 🔴 HAND-OFF (T3 -> T0): deploy/images.env's EZIL_NEKO_TAG pins the BARE
@@ -75,7 +79,7 @@ jobs:
       base_ref: ${{ steps.pins.outputs.base_ref }}
       overlay_ref: ${{ steps.pins.outputs.overlay_ref }}
       built: ${{ steps.gate.outputs.build }}
-      overlay_digest: ${{ steps.push.outputs.overlay_digest }}
+      overlay_digest: ${{ steps.push_overlay.outputs.overlay_digest }}
     steps:
       # fetch-depth 0: the change-detection step below diffs against the
       # push's own "before" SHA, which needs history beyond the last commit.
@@ -119,49 +123,105 @@ jobs:
           echo "[pins] base_ref=${base_ref}"
           echo "[pins] overlay_ref=${overlay_ref}"
 
-      # Step-level, not job-level: `desktop` below `needs: neko-base`, and a
-      # SKIPPED job's dependents are skipped too by default — so this job
-      # always runs to completion, and only the expensive steps below are
-      # individually gated on this output. See the file header.
-      - name: Decide whether to rebuild the base + overlay
-        id: gate
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.rebuild_base }}" == "true" ]]; then
-            echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "[gate] rebuild_base=true -> building"
-            exit 0
-          fi
-          before="${{ github.event.before }}"
-          if [[ -z "${before}" || "${before}" == "0000000000000000000000000000000000000000" ]] \
-            || ! git cat-file -e "${before}" 2>/dev/null; then
-            # New branch, new tag, or a "before" this checkout cannot see
-            # (e.g. a force-push, or a tag push whose "before" is the zero
-            # SHA): rebuild rather than risk silently skipping a real change.
-            echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "[gate] no usable 'before' SHA (${before:-<empty>}) -> building"
-            exit 0
-          fi
-          if git diff --name-only "${before}" "${{ github.sha }}" -- docker/neko/ | grep -q .; then
-            echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "[gate] docker/neko/** changed -> building"
-          else
-            echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "[gate] docker/neko/** unchanged, rebuild_base not requested -> skipping build/push/sign/attest steps below"
-          fi
-
+      # Needed BEFORE the gate below: the registry-existence probe in "Decide
+      # whether to rebuild" has to authenticate to read ghcr.io/ezilhq's
+      # package manifests (an anonymous `docker manifest inspect` against
+      # this org returns "denied", not a clean 404 — verified locally).
       - name: Log in to GHCR
-        if: steps.gate.outputs.build == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Step-level, not job-level: `desktop` below `needs: neko-base`, and a
+      # SKIPPED job's dependents are skipped too by default — so this job
+      # always runs to completion, and only the expensive steps below are
+      # individually gated on this output. See the file header.
+      #
+      # 🔴 THIS ALSO GUARDS AN IMMUTABLE TAG AGAINST A NON-REPRODUCIBLE BUILD.
+      # worker/assets/neko-branding/Dockerfile's own header records the
+      # measured fact that rebuilding the pinned base from the SAME pinned
+      # SHAs produces a DIFFERENT Vue build (different CSS/JS chunk hashes)
+      # — the overlay's asset guard still passes, because it edits index.html
+      # in place rather than pinning hashes. So a path-diff or dispatch
+      # "please rebuild" is not enough reason to actually push: if the tag
+      # already exists in the registry, pushing again would silently replace
+      # its bytes under the SAME immutable tag `deploy/images.env` and
+      # `worker/Dockerfile` both pin by content. Build only when the tag is
+      # genuinely new, or when rebuild_base explicitly says to overwrite it.
+      - name: Decide whether to rebuild the base + overlay
+        id: gate
+        run: |
+          request=false
+          reason=""
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.rebuild_base }}" == "true" ]]; then
+            request=true
+            reason="rebuild_base=true"
+          else
+            before="${{ github.event.before }}"
+            if [[ -z "${before}" || "${before}" == "0000000000000000000000000000000000000000" ]] \
+              || ! git cat-file -e "${before}" 2>/dev/null; then
+              # New branch, new tag, or a "before" this checkout cannot see
+              # (e.g. a force-push, or a tag push whose "before" is the zero
+              # SHA): treat as a request rather than risk silently skipping a
+              # real change — the existence probe below still protects the
+              # immutable tag if nothing actually changed.
+              request=true
+              reason="no usable 'before' SHA (${before:-<empty>})"
+            elif git diff --name-only "${before}" "${{ github.sha }}" -- docker/neko/ | grep -q .; then
+              request=true
+              reason="docker/neko/** changed"
+            fi
+          fi
+
+          if [[ "${request}" != "true" ]]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "[gate] docker/neko/** unchanged, rebuild_base not requested -> skipping"
+            exit 0
+          fi
+          echo "[gate] rebuild requested (${reason}) - checking whether the tags already exist in GHCR..."
+
+          base_ref="${{ steps.pins.outputs.base_ref }}"
+          overlay_ref="${{ steps.pins.outputs.overlay_ref }}"
+          base_exists=false; overlay_exists=false
+          docker manifest inspect "${base_ref}" >/dev/null 2>&1 && base_exists=true
+          docker manifest inspect "${overlay_ref}" >/dev/null 2>&1 && overlay_exists=true
+          echo "[gate] base_exists=${base_exists} overlay_exists=${overlay_exists}"
+
+          if [[ "${base_exists}" == "true" && "${overlay_exists}" == "true" ]]; then
+            if [[ "${{ inputs.rebuild_base }}" == "true" ]]; then
+              echo "::warning::rebuild_base=true is REBUILDING an already-published, immutable tag pair (${base_ref}, ${overlay_ref}). The upstream Vue build is documented as NOT reproducible from the same pinned SHAs (worker/assets/neko-branding/Dockerfile's header) - this push may carry different bytes under the SAME tag. Proceeding because it was explicitly requested."
+              echo "build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "[gate] both tags already published and rebuild_base not requested (the diff that triggered this run didn't actually change the pinned SHAs) - skipping to avoid silently overwriting an immutable tag. Set rebuild_base=true to force."
+              echo "build=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "[gate] not yet published -> building"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build pinned Neko + VS Code base
         if: steps.gate.outputs.build == 'true'
         env:
           NEKO_IMAGE_TAG: ${{ steps.pins.outputs.base_ref }}
         run: docker/neko/build.sh
+
+      # Pushed immediately, BEFORE the overlay build: the overlay's Dockerfile
+      # FROMs this exact ghcr.io/... reference by --build-arg below, and a
+      # registry-qualified name that only exists in this runner's local store
+      # is a different (and less certain) resolution path than one already
+      # published — push first so FROM always has a real registry object to
+      # resolve, not just a same-runner-local coincidence.
+      - name: Push base
+        if: steps.gate.outputs.build == 'true'
+        id: push_base
+        run: |
+          base_ref="${{ steps.pins.outputs.base_ref }}"
+          base_digest="$(docker push "${base_ref}" | grep -oP 'digest: \Ksha256:[0-9a-f]+')"
+          echo "base_digest=${base_digest}" >> "$GITHUB_OUTPUT"
+          echo "[push] ${base_ref}@${base_digest}"
 
       - name: Build EZiL branding overlay
         if: steps.gate.outputs.build == 'true'
@@ -172,19 +232,13 @@ jobs:
             -f worker/assets/neko-branding/Dockerfile \
             worker/assets/neko-branding
 
-      - name: Push base + overlay
+      - name: Push overlay
         if: steps.gate.outputs.build == 'true'
-        id: push
+        id: push_overlay
         run: |
-          base_ref="${{ steps.pins.outputs.base_ref }}"
           overlay_ref="${{ steps.pins.outputs.overlay_ref }}"
-          base_digest="$(docker push "${base_ref}" | grep -oP 'digest: \Ksha256:[0-9a-f]+')"
           overlay_digest="$(docker push "${overlay_ref}" | grep -oP 'digest: \Ksha256:[0-9a-f]+')"
-          {
-            echo "base_digest=${base_digest}"
-            echo "overlay_digest=${overlay_digest}"
-          } >> "$GITHUB_OUTPUT"
-          echo "[push] ${base_ref}@${base_digest}"
+          echo "overlay_digest=${overlay_digest}" >> "$GITHUB_OUTPUT"
           echo "[push] ${overlay_ref}@${overlay_digest}"
 
       - name: Install cosign
@@ -194,8 +248,8 @@ jobs:
       - name: Sign base + overlay (keyless, OIDC)
         if: steps.gate.outputs.build == 'true'
         run: |
-          cosign sign --yes "${{ steps.pins.outputs.base_ref }}@${{ steps.push.outputs.base_digest }}"
-          cosign sign --yes "${{ steps.pins.outputs.overlay_ref }}@${{ steps.push.outputs.overlay_digest }}"
+          cosign sign --yes "${{ steps.pins.outputs.base_ref }}@${{ steps.push_base.outputs.base_digest }}"
+          cosign sign --yes "${{ steps.pins.outputs.overlay_ref }}@${{ steps.push_overlay.outputs.overlay_digest }}"
 
       # subject-name is the BARE image name, no tag — the digest is what
       # identifies this exact artifact; base and overlay share one repo name
@@ -206,7 +260,7 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ steps.pins.outputs.image }}
-          subject-digest: ${{ steps.push.outputs.base_digest }}
+          subject-digest: ${{ steps.push_base.outputs.base_digest }}
           push-to-registry: true
 
       - name: Attest provenance - overlay
@@ -214,7 +268,7 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ steps.pins.outputs.image }}
-          subject-digest: ${{ steps.push.outputs.overlay_digest }}
+          subject-digest: ${{ steps.push_overlay.outputs.overlay_digest }}
           push-to-registry: true
 
   desktop:
@@ -245,6 +299,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 🔴 HAND-OFF: this job PUBLISHES ghcr.io/ezilhq/ezil-os-desktop:<sha8>
+      # but never writes that tag back into deploy/images.env's
+      # EZIL_DESKTOP_TAG (still the file's own placeholder,
+      # `<to be pinned by CI>`, permissions here are `contents: read` on
+      # purpose). run-spec.ts's isDockerTag guard means that placeholder
+      # keeps failing closed to LOCAL_DESKTOP_IMAGE_FALLBACK forever until
+      # something updates it — no row in docs/TASKS.csv currently owns that
+      # write-back (a commit to main from a workflow, or a separate release
+      # step). Flagged, not fixed: deploy/images.env is not in this row's
+      # owns_files and this workflow has no write access to contents.
       - name: Compute tags
         id: tags
         run: |
