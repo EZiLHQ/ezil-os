@@ -1,0 +1,9 @@
+{
+  "taskId": "T2",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "WORKER_RUNTIME_EVIDENCE",
+  "evidence": "orientation measured against a live container (ezil-os-worker-sandbox:ff199202, Docker 29.1.3): boot reached `phase=ready ... cumulative_ms=6920` in the neko log; neko logged `webrtc starting epr=0-0 icelite=true nat1to1=127.0.0.1 tcpmux=52100 udpmux=52100`; zero matches for checkip/ip_retrieval/amazonaws in /tmp/neko.log; host UDP mux port bound (ss -lun); container RSS 674.7MiB/8GiB. neko API measured: GET /health -> 200 `true`, GET /api/health -> 404, GET /api/sessions unauth -> 401, POST /api/login with the minted admin password -> 200 + 64-char token + profile.is_admin true, image defaults `admin`/`neko` -> 401 on the V3 REST path AND `Unauthorized` on the V2 legacy /ws path. No code written yet.",
+  "startedAt": "2026-09-04T08:12:00Z",
+  "updatedAt": "2026-09-04T08:25:00Z"
+}
