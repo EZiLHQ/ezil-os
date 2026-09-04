@@ -389,6 +389,17 @@ async function framesFor(scenario: string): Promise<{ keydown: number; keyup: nu
     })();
   `;
   const res = sh('node', ['-e', script], 180_000);
+  // A non-zero exit means the subprocess crashed before printing its result
+  // line (playwright unresolvable despite SKIP_REASON's own check passing,
+  // a launch failure, an uncaught throw inside the script, ...). Falling
+  // through to `?? '{}'` here is exactly how the 8 pre-existing failures this
+  // row diagnosed presented as `Received: undefined` instead of naming the
+  // real crash — throw with the child's own stderr instead of silently
+  // treating a crash as "sent nothing".
+  if (res.status !== 0) {
+    throw new Error(`framesFor: the node subprocess exited ${res.status} instead of reporting a frame count — `
+      + `stderr: ${(res.stderr || '').trim().slice(0, 2000) || '(empty)'}`);
+  }
   const line = (res.stdout || '').trim().split('\n').filter(Boolean).pop() ?? '{}';
   return JSON.parse(line) as { keydown: number; keyup: number };
 }
@@ -438,6 +449,14 @@ async function remoteTextAfter(sequence: string): Promise<string> {
     })();
   `;
   const res = sh('node', ['-e', script], 240_000);
+  // Same reasoning as `framesFor`: a non-zero exit is a crash, not "the
+  // remote received nothing" — throw with the child's stderr rather than
+  // letting the `?? '""'` fallback turn a crash into a plausible-looking
+  // empty string.
+  if (res.status !== 0) {
+    throw new Error(`remoteTextAfter: the node subprocess exited ${res.status} instead of reporting the remote text — `
+      + `stderr: ${(res.stderr || '').trim().slice(0, 2000) || '(empty)'}`);
+  }
   const line = (res.stdout || '').trim().split('\n').filter(Boolean).pop() ?? '""';
   try { return JSON.parse(line) as string; } catch { return ''; }
 }
@@ -577,6 +596,12 @@ describe('the soft keyboard types each character exactly once', () => {
       })();
     `;
     const res = sh('node', ['-e', script], 180_000);
+    // Same reasoning as `framesFor`/`remoteTextAfter`: a non-zero exit is a
+    // crash, not "zero affordances found" — throw with the child's stderr.
+    if (res.status !== 0) {
+      throw new Error(`the node subprocess exited ${res.status} instead of reporting the affordance list — `
+        + `stderr: ${(res.stderr || '').trim().slice(0, 2000) || '(empty)'}`);
+    }
     const line = (res.stdout || '').trim().split('\n').filter(Boolean).pop() ?? '[]';
     const found = JSON.parse(line) as Array<{ id: string | null; w: number; h: number }>;
     // 🔴 ONE affordance, and it is the CLIENT'S — not one this file adds.
