@@ -1,0 +1,9 @@
+{
+  "taskId": "T5",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "WORKER_RUNTIME_EVIDENCE",
+  "evidence": "STARTED. Baseline taken in this worktree before any edit: `bun test local/` -> 210 pass / 0 fail, 748 expect() calls across 9 files (includes the T2 container suite, which really booted the image at offset 10000). Pre-checks: Docker 29.1.3 reachable; host arch x86_64; image ezil-os-worker-sandbox:ff199202 present (sha256:14ae1a93...); host TCP 8443 held by docker-proxy for supabase-kong and 8080 by an unrelated node process, so an offset is required on this box; playwright 1.61.1 resolvable from /opt/ezil-testkit/node_modules with chromium builds in ~/.cache/ms-playwright; app/public/os/{bundle.min.js,bundle.min.css,icons.js} present in the worktree; local/tsconfig.json already includes tests/**/*.ts.",
+  "startedAt": "2026-09-04T15:05:00Z",
+  "updatedAt": "2026-09-04T15:05:00Z"
+}
