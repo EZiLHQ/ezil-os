@@ -1,0 +1,9 @@
+{
+	"taskId": "O3",
+	"runId": "wf-os-2026-09-04",
+	"status": "running",
+	"doneRung": "INDEPENDENT_TEST_PASS",
+	"evidence": "started 2026-09-04; sources read (EZiL-Works tools/worktree.sh 126 lines, tools/test.sh 139 lines); measured before writing: every existing worktree hydrates node_modules as a WHOLE-DIRECTORY symlink, so readlink -f .claude/worktrees/O3/mcp/node_modules/@ezil-os/sdk resolves to the MAIN tree (the defect this row fixes); ezil-integrated:local IS present (sha256:1f699f3a) and has /opt/ezil-sidecar, so the container suites RUN here rather than skipping; bun 1.3.14 prints ' 23 skip' and emits per-testcase <skipped/> with file= under --reporter=junit.",
+	"startedAt": "2026-09-04T09:40:00Z",
+	"updatedAt": "2026-09-04T09:40:00Z"
+}
