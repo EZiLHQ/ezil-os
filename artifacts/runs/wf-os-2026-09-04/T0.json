@@ -1,9 +1,9 @@
 {
   "taskId": "T0",
   "runId": "wf-os-2026-09-04",
-  "status": "running",
+  "status": "done",
   "doneRung": "INDEPENDENT_TEST_PASS",
-  "evidence": "started 2026-09-04; orientation complete: neko `--webrtc.{udpmux,tcpmux,nat1to1,icelite,ip_retrieval_url}` flags CONFIRMED present in ezil-neko-vscode:d74052bb-049931d7 (`neko serve --help`, 145 flag lines, ip_retrieval_url default=https://checkip.amazonaws.com); `git ls-files --eol` = 0 tracked .sh/.mjs/.ps1 with CRLF, 36 tracked files non-lf (all i/-text binaries); worker/Dockerfile EXPOSEs 8080/8181/3002/9223 and NOT 8443. No files written yet.",
+  "evidence": "bun run --cwd local typecheck -> tsc --noEmit exit 0. bun test local/ -> 49 pass / 0 fail, 208 expect() calls, 2 files, 0 skipped. 8 mutations each taken RED then restored GREEN: (M1a) run-spec NEKO_HTTP_PORT 8181->8182 = 3 fail; (M1b) worker/src/desktop-mode.ts portFor('neko') 8181->8188 = 3 fail (both sides of the import proven); (M2) drop the `<` escape from the local serializer = 6 fail; (M2b) subtler /</ without /g = 4 fail; (M3) remove NEKO_WEBRTC_NAT1TO1 from NEKO_LOCAL_ICE_ENV = 3 fail; (M4) add an 11th SandboxHost member named exposePort = tsc exit 2, TS2344 x2 (member-count AND non-goal checks both fired); (M5) drop the `screen` route key = 4 fail; (M6) add a `ghost` route key the app lacks = 3 fail; (M7) FOCUS_APPS narrowed to ['chromium'] = 1 fail; (M8) isDockerTag replaced by length>0 = 2 fail. Working tree clean after every restore. Live measurements: neko `serve --help` in ezil-neko-vscode:d74052bb-049931d7 confirms --webrtc.{udpmux,tcpmux,nat1to1,icelite} and --webrtc.ip_retrieval_url default https://checkip.amazonaws.com; viper env-vs-config-file precedence measured on the binary (env :77 beats yaml :88, control yaml-only = :88); the image's /etc/neko/neko.yaml ships admin_password 'admin' / user_password 'neko'. git ls-files --eol: 0 tracked .sh/.mjs/.ps1 with CRLF, 0 i/crlf or i/mixed anywhere, and .gitattributes renormalizes nothing (git diff vs HEAD empty after adding it). 6 commits: b92c689, a2f7ef0, d6ac5af, 54983f7, 94400ee, c0ac7f5.",
   "startedAt": "2026-09-04T07:40:00Z",
-  "updatedAt": "2026-09-04T07:40:00Z"
+  "updatedAt": "2026-09-04T08:05:00Z"
 }
