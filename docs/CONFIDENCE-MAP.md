@@ -20,7 +20,67 @@ The vocabulary is the nine-rung ladder inlined as `DONE_LADDER` in
 
 ## 0. Read this first, or the table will mislead you
 
-*(filled in below as the measurements land)*
+### 0.1 This is an INTERIM pass, and it says so on purpose
+
+Row `O5` is scheduled to run again after row `R2` — the founder-present release
+(secrets, `EZIL_OS_ACCESS_MODE` on Vercel, the `v0.2.0` tag, the watched deploy).
+**None of that has happened.** So every rung below that mentions a deployment is
+a rung about an *image registry* or a *GitHub Actions run*, never about
+`os.ezil.work`. Read §2 before quoting any row of §1 outside this document.
+
+### 0.2 The deployed host predates this round entirely
+
+`N1` — the row that would create `os.ezil.work` (Vercel project domain, the
+unproxied DNS record, the Supabase redirect allowlist, a real sign-in) — is
+`pending`, blocked at this session's permission boundary and gated on the
+founder. `bun tools/waves.ts docs/TASKS.csv` prints it `[ ]` in wave 0 today.
+The round's start state recorded a Worker uploaded by hand on **2026-08-26**,
+before any commit in this round.
+
+Therefore: **the invite gate that rows `A1` and `A2` built is not running
+anywhere a user can reach.** It is proven in code and by test (§3.4) and by
+nothing else. The same applies to the invited-user landing: `A2` shipped a
+client-side fragment reader, so the design objection `A1` raised is answered *in
+code*, but no real Supabase invite has been followed through a real browser to a
+real session by anyone, in this session or any other.
+
+### 0.3 `main` moved under this pass, and one row changed meaning while it ran
+
+This pass measured `4b05869`, which was `origin/main` when the worktree was cut
+at 12:31Z. By 12:54Z `origin/main` was `e1bd1c0`, four commits ahead:
+
+| landed after this pass's base | what |
+|---|---|
+| `2a5007d` (#23) | `R1` — `deploy.yml`, `release.yml` changes, `CHANGELOG` 0.2.0, `docs/RELEASE.md` |
+| `f15787a` (#24) | `M1` — the mobile-keyboard container suite |
+| `995a61b` (#20), `e1bd1c0` (#25) | supervisor log/ledger folds |
+
+Every count in §1 and §3 is a measurement of `4b05869` unless the row says
+otherwise. §3.7 re-measures the one thing that changed materially — `M1`'s eight
+failures — against `e1bd1c0` in a second, throwaway worktree, because a row whose
+entire claim is "these eight tests now pass" cannot be verified at a base that
+predates it.
+
+### 0.4 What "proven" means here, and where the round's real gaps are
+
+Three gaps, in descending order of how badly they would mislead someone reading
+`docs/ORCHESTRATION-LOG.md` alone:
+
+1. **`main`'s CI is red, and has been for every completed run of this round's
+   last four pushes.** The `container (real image)` job — the one row `T8` wired
+   to pull the GHCR desktop image and run the container suites for real — failed
+   on `4b05869` with `23 pass / 8 fail`, and the two runs after it were
+   `cancelled` by the next push before finishing. See §3.6.
+2. **`container` and `local` are still not required contexts.** `G4`'s ruleset
+   `22265548` requires fifteen; the log says those two "join after T8", `T8` has
+   merged, and they have not joined. A red `container` job therefore does not
+   block a merge.
+3. **The desktop image tag is still the placeholder.** `deploy/images.env` reads
+   `EZIL_DESKTOP_TAG=<to be pinned by CI>`; `T7`'s write-back publishes it as a
+   CI *artifact* and nothing commits it. Local mode only starts because the
+   doctor falls back — it says so out loud (§3.5). A value that looks like
+   configuration and is not one is the failure mode this project has already
+   paid for.
 
 ---
 
