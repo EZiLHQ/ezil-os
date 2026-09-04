@@ -1,8 +1,11 @@
 # The confidence map — what round ANYWHERE proved, who proved it, and to which rung
 
-**Measured 2026-09-04 (12:30–xx:xxZ) by the `O5` verifier, from worktree
-`.claude/worktrees/O5` on branch `task/O5`, base `4b05869` (`origin/main` at the
-time of the fetch). The verifier wrote none of the code below.**
+**INTERIM. Measured 2026-09-04, 12:30–13:40Z, by the `O5` verifier, from worktree
+`.claude/worktrees/O5` on branch `task/O5`. The worktree was cut at
+`4b05869` and rebased onto `3c76d43` mid-pass, because `main` moved eight PRs
+while the pass ran; the rows that changed were re-measured at `3c76d43` and every
+count below says which base it belongs to. The verifier wrote none of the code
+below. This pass runs again after row `R2`.**
 
 Every number in the table came out of a command run in **this** session and
 recorded verbatim in [§3, Commands run](#3-commands-run). Nothing is copied from
@@ -44,43 +47,58 @@ client-side fragment reader, so the design objection `A1` raised is answered *in
 code*, but no real Supabase invite has been followed through a real browser to a
 real session by anyone, in this session or any other.
 
-### 0.3 `main` moved under this pass, and one row changed meaning while it ran
+### 0.3 `main` moved eight PRs under this pass — and the headline changed with it
 
-This pass measured `4b05869`, which was `origin/main` when the worktree was cut
-at 12:31Z. By 12:54Z `origin/main` was `e1bd1c0`, four commits ahead:
+The worktree was cut at `4b05869` at 12:31Z. By 13:20Z `origin/main` was
+`3c76d43`, six commits ahead:
 
-| landed after this pass's base | what |
+| landed after this pass's first base | what |
 |---|---|
-| `2a5007d` (#23) | `R1` — `deploy.yml`, `release.yml` changes, `CHANGELOG` 0.2.0, `docs/RELEASE.md` |
-| `f15787a` (#24) | `M1` — the mobile-keyboard container suite |
+| `2a5007d` (#23) | `R1` — `deploy.yml` waits for the tag's image, `release.yml`, `CHANGELOG` 0.2.0, `docs/RELEASE.md` |
+| `f15787a` (#24) | `M1` — the mobile-keyboard container suite: honest skips, no vacuous passes |
+| `d9d70f4` (#26) | a second `win32` announced skip in `app` |
+| `3c76d43` (#27) | `M4` — the "macOS import" failure was a missing `cloudflare:workers` stub plus directory order; worker unit steps un-gated on all three OSes |
 | `995a61b` (#20), `e1bd1c0` (#25) | supervisor log/ledger folds |
 
-Every count in §1 and §3 is a measurement of `4b05869` unless the row says
-otherwise. §3.7 re-measures the one thing that changed materially — `M1`'s eight
-failures — against `e1bd1c0` in a second, throwaway worktree, because a row whose
-entire claim is "these eight tests now pass" cannot be verified at a base that
-predates it.
+**The first draft of this document said `main`'s CI was red. That is no longer
+true and the correction is the most important line in this file.** At `3c76d43`,
+CI run `33876458190` is **green on all fifteen jobs**, `container (real image)`
+and `local (typecheck + unit + smoke)` included — the first fully green CI run on
+`main` in this round (§3.7).
 
 ### 0.4 What "proven" means here, and where the round's real gaps are
 
-Three gaps, in descending order of how badly they would mislead someone reading
-`docs/ORCHESTRATION-LOG.md` alone:
-
-1. **`main`'s CI is red, and has been for every completed run of this round's
-   last four pushes.** The `container (real image)` job — the one row `T8` wired
-   to pull the GHCR desktop image and run the container suites for real — failed
-   on `4b05869` with `23 pass / 8 fail`, and the two runs after it were
-   `cancelled` by the next push before finishing. See §3.6.
-2. **`container` and `local` are still not required contexts.** `G4`'s ruleset
-   `22265548` requires fifteen; the log says those two "join after T8", `T8` has
-   merged, and they have not joined. A red `container` job therefore does not
-   block a merge.
-3. **The desktop image tag is still the placeholder.** `deploy/images.env` reads
-   `EZIL_DESKTOP_TAG=<to be pinned by CI>`; `T7`'s write-back publishes it as a
-   CI *artifact* and nothing commits it. Local mode only starts because the
-   doctor falls back — it says so out loud (§3.5). A value that looks like
-   configuration and is not one is the failure mode this project has already
-   paid for.
+1. **Nothing is deployed, and the thing that is built is not reachable.** No tag
+   exists, `deploy.yml` and `release.yml` have **zero runs**, and
+   `docker manifest inspect ghcr.io/ezilhq/ezil-os-desktop:latest` from an empty
+   Docker config answers `unauthorized` (§3.8, with a public-image positive
+   control). The images are built, pushed and cosign-signed; no member of the
+   public can pull one. Making the packages public is a founder step.
+2. **`container` and `local` are not required contexts, and that is correct
+   today, not a gap.** Both jobs authenticate to GHCR with
+   `secrets.GITHUB_TOKEN` (`ci.yml:498`, `:581`) to pull a **private** package. A
+   pull request from a fork cannot do that, so requiring those contexts would
+   block every outside contribution for a reason that has nothing to do with the
+   contribution. They become requirable the day the packages go public — which
+   is the same founder step as (1). Until then `G4`'s fifteen are the right
+   fifteen.
+3. **The desktop image tag is still a placeholder.** `deploy/images.env` reads
+   `EZIL_DESKTOP_TAG=<to be pinned by CI>`; `T7`'s write-back publishes the real
+   tag as a CI **artifact** and nothing commits it. Local mode starts here only
+   because the doctor falls back to a locally-built image — and says so out loud
+   (§3.6). A value that looks like configuration and is not one is a failure mode
+   this project has already paid for.
+4. **CI does not use `tools/test.sh`.** Not one job in `ci.yml` invokes it; every
+   leg calls `bun test` / `bun run test` / `npx vitest` directly, and the
+   `container` and `local` jobs re-implement their own skip detection inline
+   (`ci.yml:550`, `:695`). So `O3`'s three fail-closed rules and its
+   vacuous-pass gate — the guards `_MANDATORY` §7 obliges every agent to run
+   behind — protect a developer's machine and not the merge gate. The two
+   implementations can drift, and only one of them is exercised on every push.
+   Evidence that the difference is real: the worker unit legs on the green run
+   report `1025 / 1003 / 995 pass` with `43 / 65 / 73 skip` on
+   ubuntu / macos / windows, all green, no skip named in the job's own summary
+   (§3.7).
 
 ---
 
@@ -142,6 +160,31 @@ the smoke worktree, not the main tree; `du -sh` = **13M**; `remove` printed
 three live sibling worktrees, none of them `smoke`).
 
 ### 3.2 The worker package, image present and image absent
+
+**At the rebased tip `3c76d43`, with the image present — this is the current
+number:**
+```
+$ PLAYWRIGHT_REQUIRE_DIR=/opt/ezil-testkit/node_modules \
+  EZIL_VALIDATE_IMAGE=ezil-os-worker-sandbox:ff199202 ./tools/test.sh worker
+```
+Exit **0**.
+```
+ 1067 pass
+ 1 skip
+ 0 fail
+Ran 1068 tests across 39 files. [320.89s]
+==> 1 test(s) were SKIPPED. A skip is not a pass. By suite:
+         1  src/preview-timeouts.test.ts
+```
+One named skip, nothing else — the eight failures below are gone, and the
+container suites really ran (`docker ps -a` after: nothing named `ezil-os-*` or
+`ezil-w9-*`). Compare CI's own ubuntu worker leg on the same commit:
+`1025 pass / 43 skip / 0 fail` — same 1068 tests, 42 more skipped, because that
+leg has no image and calls `bun test` directly rather than through
+`tools/test.sh` (§0.4 item 4).
+
+**The rest of this section is the measurement at the first base, `4b05869`, and
+is kept because it is what the gates were proved against.**
 
 ```
 $ EZIL_VALIDATE_IMAGE=ezil-os-worker-sandbox:ff199202 ./tools/test.sh worker
@@ -333,29 +376,64 @@ On a machine that has never built the image, this is the pin that would decide
 what gets pulled — and it is a placeholder. `T7` publishes the real tag as a CI
 **artifact** (`published-images.env`) and nothing writes it back to the file.
 
-### 3.7 `main`'s CI, live, and row `M1` re-measured at the tip
+### 3.7 `main`'s CI, live — red at the first base, green at the tip
 
 ```
-$ gh run list --workflow ci.yml --branch main -L 5
-33874673503  e1bd1c0  in_progress
-33874099090  995a61b  completed  cancelled
-33874063339  f15787a  completed  cancelled
-33873449626  2a5007d  completed  failure
-33872022280  4b05869  completed  failure     ← this pass's base
+$ gh run list --workflow ci.yml --branch main -L 3
+33876458190  3c76d43  completed  success      ← the tip
+33875344505  d9d70f4  completed  success
+33874673503  e1bd1c0  completed  failure
 ```
 
 ```
-$ gh run view 33872022280 --json jobs      # 15 jobs
-failure  container (real image)
-success  worker/app/sdk+mcp/shell × ubuntu, windows, macos   (12)
-success  tools (typecheck + unit)
+$ gh run view 33876458190 --json jobs        # 15 jobs, sha 3c76d43
+success  container (real image)
 success  local (typecheck + unit + smoke)
+success  tools (typecheck + unit)
+success  worker / app / sdk + mcp / shell  ×  ubuntu-latest, windows-latest, macos-latest   (12)
 ```
-The failing step is `Container suites (real image)`; its log
-(`gh api repos/EZiLHQ/ezil-os/actions/jobs/101020152133/logs`) ends
-`23 pass / 8 fail — Ran 31 tests across 3 files. [52.47s]` — the same eight
-mobile-keyboard failures §3.2 reproduced locally. **There is no green CI run on
-`main` for this round's last four pushes.**
+**Fifteen for fifteen** — the first fully green run on `main` in this round, and
+the two jobs `T8` wired are in it. Their real counts, read out of the job logs
+rather than the badge:
+
+```
+$ gh api repos/EZiLHQ/ezil-os/actions/jobs/101034493104/logs   # container (real image)
+ 32 pass / 0 fail — Ran 32 tests across 3 files. [135.41s]
+
+$ gh api repos/EZiLHQ/ezil-os/actions/jobs/101034493205/logs   # local (… + smoke)
+ 12 pass, 2 warn, 0 fail                      ← the doctor
+ 307 pass / 0 fail — Ran 307 tests across 14 files. [35.44s]
+```
+Those are **the same numbers this session measured on this box** (§3.2, §3.9):
+32/0 for the container suites, 307/0 and 12-pass-2-warn for local. Two
+independent environments, the same result — which is what makes it evidence and
+not a local accident.
+
+The worker unit legs on that run, per OS, also read out of the logs:
+
+| leg | pass | skip | fail |
+|---|---|---|---|
+| `worker … (ubuntu-latest)` | 1025 | 43 | 0 |
+| `worker … (macos-latest)` | 1003 | 65 | 0 |
+| `worker … (windows-latest)` | 995 | 73 | 0 |
+
+Same 1068 tests everywhere — which is `M4`'s achievement (before it, 205 of them
+could not even load on macOS) — and the skip count is the platform difference,
+declared per suite. Nothing in the job's own output names those skips, because
+that leg does not go through `tools/test.sh`.
+
+**At the first base `4b05869` the same workflow was red**, and the previous
+edition of this file led with that:
+```
+$ gh run view 33872022280 --json jobs      # sha 4b05869
+failure  container (real image)             ← 23 pass / 8 fail, Ran 31 tests across 3 files [52.47s]
+success  the other 14
+```
+The eight failures were `M1`'s, they are fixed, and `main` went green two pushes
+later. Recorded because a confidence map that only ever shows the good state is
+not a measurement of anything.
+
+**Row `M1` re-measured directly, before it reached `main`'s CI green.**
 
 `M1` merged as `f15787a` at 12:41Z, after this worktree's base. Re-measured in a
 second, throwaway worktree at `e1bd1c0` (created and removed with
@@ -391,17 +469,28 @@ Target `~DEFAULT_BRANCH`. Rules: `deletion`, `non_fast_forward`,
 matrix legs (`worker` / `app` / `sdk + mcp` / `shell` × ubuntu-, windows-,
 macos-latest), `tools (typecheck + unit)`, `DCO`,
 `CodeQL (javascript-typescript)`. Bypass: `RepositoryRole` id 5 in
-`pull_request` mode only. 🔴 **`container (real image)` and
-`local (typecheck + unit + smoke)` are NOT among them** — the two jobs `T8`
-wired are not required, so their red does not block a merge.
+`pull_request` mode only. Re-read at the tip: **still exactly these fifteen.**
+
+`container (real image)` and `local (typecheck + unit + smoke)` are **not**
+among them, and on today's evidence that is the right call rather than an
+oversight: both jobs log in to GHCR with `secrets.GITHUB_TOKEN`
+(`.github/workflows/ci.yml:498` and `:581`) to pull a package that
+`docker manifest inspect` proves is **private**. A pull request from a fork
+cannot authenticate to it, so making those contexts required would refuse every
+outside contribution for a reason unrelated to the contribution — in a repository
+whose whole `GOVERNANCE.md` premise is outside contributors. The day the packages
+go public, both should be added; that is the same founder step as the anonymous
+pull below.
 
 ```
-$ gh pr list --state open
-#20  auto-merge: SQUASH  BLOCKED  sup/log-3     docs: A2, M1, T6 landings; …
+$ gh pr list --state open        # 12:44Z
+#20  auto-merge: SQUASH  BLOCKED  sup/log-3    docs: A2, M1, T6 landings; …
 #18  auto-merge: SQUASH  BLOCKED  task/M1      test(worker): mobile-keyboard container suite …
 #5   auto-merge: no      UNKNOWN  dependabot/…/patch-and-minor-…
 ```
-(measured at 12:44Z; `#18` and `#20` have since landed as `f15787a` / `995a61b`.)
+`#18` and `#20` have since landed as `f15787a` / `995a61b`. The `BLOCKED` state
+on both is itself the evidence that the ruleset bites: neither could merge until
+its fifteen contexts reported.
 
 ```
 $ gh api repos/EZiLHQ/ezil-os/codeowners/errors        → {"errors":[]}
