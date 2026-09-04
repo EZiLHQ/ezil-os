@@ -82,28 +82,36 @@ and `local (typecheck + unit + smoke)` included — the first fully green CI run
 2. **`container` and `local` are not required contexts, and that is correct
    today, not a gap.** Both jobs authenticate to GHCR with
    `secrets.GITHUB_TOKEN` (`ci.yml:498`, `:581`) to pull a **private** package. A
-   pull request from a fork cannot do that, so requiring those contexts would
-   block every outside contribution for a reason that has nothing to do with the
-   contribution. They become requirable the day the packages go public — which
-   is the same founder step as (1). Until then `G4`'s fifteen are the right
-   fifteen.
+   pull request from a fork is not expected to be able to do that, so requiring
+   those contexts would block every outside contribution for a reason that has
+   nothing to do with the contribution. They become requirable the day the
+   packages go public — which is the same founder step as (1). Until then `G4`'s
+   fifteen are the right fifteen. *(The package's privacy is measured. The fork
+   half is **inferred** from GitHub's fork-PR token restrictions and from those
+   two `ci.yml` lines — no fork pull request exists against this repository, so
+   `_MANDATORY` §13 says to label it an untested hypothesis rather than assert
+   it.)*
 3. **The desktop image tag is still a placeholder.** `deploy/images.env` reads
    `EZIL_DESKTOP_TAG=<to be pinned by CI>`; `T7`'s write-back publishes the real
    tag as a CI **artifact** and nothing commits it. Local mode starts here only
    because the doctor falls back to a locally-built image — and says so out loud
    (§3.6). A value that looks like configuration and is not one is a failure mode
    this project has already paid for.
-4. **CI does not use `tools/test.sh`.** Not one job in `ci.yml` invokes it; every
-   leg calls `bun test` / `bun run test` / `npx vitest` directly, and the
-   `container` and `local` jobs re-implement their own skip detection inline
-   (`ci.yml:550`, `:695`). So `O3`'s three fail-closed rules and its
-   vacuous-pass gate — the guards `_MANDATORY` §7 obliges every agent to run
-   behind — protect a developer's machine and not the merge gate. The two
-   implementations can drift, and only one of them is exercised on every push.
-   Evidence that the difference is real: the worker unit legs on the green run
-   report `1025 / 1003 / 995 pass` with `43 / 65 / 73 skip` on
-   ubuntu / macos / windows, all green, no skip named in the job's own summary
-   (§3.7).
+4. **CI does not use `tools/test.sh`, and the two harnesses run different test
+   sets.** Not one job in `ci.yml` invokes it; every leg calls `bun test` /
+   `bun run test` / `npx vitest` directly, and the `container` and `local` jobs
+   re-implement their own skip detection inline (`ci.yml:550`, `:695`). So
+   `O3`'s three fail-closed rules and its vacuous-pass gate — the guards
+   `_MANDATORY` §7 obliges every agent to run behind — protect a developer's
+   machine and not the merge gate. Two measurements show the drift is not
+   theoretical:
+   - the worker unit legs on the green run report `1025 / 1003 / 995 pass` with
+     `43 / 65 / 73 skip` on ubuntu / macos / windows, all green, **no skip named
+     anywhere in the job output** (§3.7);
+   - `shell/responsiveness-browser-test.mjs` **exists and CI runs it**
+     (`ci.yml:382`, 20/20 on `main`), while `shell/run-tests.sh`'s hand-maintained
+     `run_suite` list omits it — so `./tools/test.sh shell` runs 24 suites where
+     CI's ubuntu leg runs 25 (§3.6).
 
 ---
 
@@ -215,7 +223,28 @@ run — there is no Windows host in this pass and `release.yml`, which would
 exercise it, has never fired. A launcher is the first thing a new user touches;
 half of that surface is untested code.
 
-### 2.7 Two `win32` blocks and the geometry family are green by not running
+### 2.7 The wall-clock long-poll tests are flaky on Linux too, not only on Windows
+
+Measured on **this document's own pull request**, #29, whose entire diff is one
+Markdown file and one JSON artifact. `app (typecheck + unit) (ubuntu-latest)`
+went **red**:
+
+```
+FAIL src/server/lib/desktop-display-honesty.test.ts
+  > probeDesktopDisplayLongPoll — z1: catch the peer connecting WHILE we ask, honestly
+  > a stable blank is held for the WHOLE budget, then answered honestly — never fabricated as a timeout
+AssertionError: expected { display: 'unknown', …(1) } to deeply equal { display: 'blank', sessions: 1 }
+Test Files  1 failed | 43 passed (44)      Tests  1 failed | 816 passed (817)
+```
+The same file passed here (`29 tests, 5069 ms`) and passed on `main`'s green run
+minutes earlier. This is the **exact test class** the round already skipped on
+Windows at 19:10Z for being wall-clock sensitive — and the class the second
+`win32` skip (`d9d70f4`, merged today) was added for. It is now demonstrably
+flaky on a Linux runner as well, which means the merge gate can refuse a
+documentation-only change. Nothing measures its flake rate. What would close it:
+either a fake clock, or a recorded pass rate over N runs rather than one.
+
+### 2.8 Two `win32` blocks and the geometry family are green by not running
 
 Honest, announced skips — but skips. `app/src/server/lib/desktop-display-honesty.test.ts:508`
 and `desktop-frame-reprobe.test.ts:135` are `describe.skipIf(process.platform === 'win32')`,
@@ -226,7 +255,7 @@ no timing claim in that file is measured on Windows. Likewise the geometry
 browser suites (`ci.yml:377`) and the container-script worker suites (`M3`) do not
 run off Linux.
 
-### 2.8 `.gitattributes` still leaves the bundle-drift gate off Windows
+### 2.9 `.gitattributes` still leaves the bundle-drift gate off Windows
 
 `*.mjs` is pinned to `eol=lf`; `*.css`, `*.svg` and the non-`.mjs` shell JS are
 not, so a Windows checkout gets CRLF for them and `ci.yml:320` gates the
@@ -235,7 +264,7 @@ stale committed `app/public/os/bundle.min.js` from shipping is therefore never
 exercised on Windows. `T4` handed this off; nothing has taken it.
 Hand-off: `.gitattributes:19-26`, `.github/workflows/ci.yml:320`.
 
-### 2.9 A cancelled container run orphans a container
+### 2.10 A cancelled container run orphans a container
 
 Measured, twice, deliberately (§3.9): `worker/src/neko-browser-window.container.test.ts:191`
 cleans up in `afterAll` and installs **no signal trap**, so `SIGTERM` mid-run
@@ -246,14 +275,14 @@ machine it is invisible and permanent. Two of `main`'s CI runs today were
 `cancelled` mid-flight. Nothing measures how many such containers a week of local
 development leaves behind.
 
-### 2.10 The cloud cost/residency oracle is unchanged, and deliberately not re-derived
+### 2.11 The cloud cost/residency oracle is unchanged, and deliberately not re-derived
 
 No deploy happened this round: `deploy.yml` has never run, there is no tag,
 `os.ezil.work` does not resolve. The hosted product's residency and cost picture
 is therefore exactly what `docs/RUNBOOK.md` already records, and this pass adds
 nothing to it. Writing a number here would be invention.
 
-### 2.11 Three rows have no run artifact at all
+### 2.12 Three rows have no run artifact at all
 
 `G4` (a supervisor row), `M2` (folded into `M3`'s PR) and `T8` have no
 `artifacts/runs/wf-os-2026-09-04/<id>.json` in `main` — `T8`'s existed as an
@@ -262,7 +291,7 @@ Their work is real and verified above; the record `_MANDATORY` §2 requires is
 missing, which is the exact condition the ledger cannot distinguish from "the
 agent died". `bun tools/ledger.ts` currently names `N2` stalled for that reason.
 
-### 2.12 What this document itself is blind to
+### 2.13 What this document itself is blind to
 
 Every figure here comes from one machine (amd64 Linux, 8 cores, Docker 29.1.3,
 bun 1.3.14) plus GitHub-hosted runners, on one day, with three sibling worktrees
@@ -281,6 +310,11 @@ assertion anywhere establishes that an application on the desktop reacted**.
 
 Every command below was run in this session, in this worktree, in this order.
 The result line is the real tail of what it printed.
+
+One command is missing from the list on purpose: `gh pr checks 29`, run against
+this document's **own** pull request, because a verifier who certifies a merge
+gate and does not then watch it judge their own change has certified a badge.
+What it found is §2.7.
 
 ### 3.1 The kit (`tools/`)
 
@@ -513,9 +547,22 @@ cycle lands 5–6px off. Everything in that list that this run executed
 (`window-chrome` 21, `seam-minimise` 30, `overlay-paint` 30, `resize` 20,
 `phone-stacking` 38) is therefore **a Linux measurement and evidence about Linux
 only** — a geometry claim about macOS or Windows needs a suite measured there,
-and none exists. `responsiveness-browser-test.mjs` did not appear in this run's
-24 at all; it is named in `ci.yml`'s Linux-only step but `shell/run-tests.sh`
-did not select it here, so **nothing in this session measured it**. The
+and none exists.
+
+🔴 **`responsiveness-browser-test.mjs` did not appear in this run's 24 — and the
+reason is a defect, not a skip.** The file exists (`shell/responsiveness-browser-test.mjs`,
+39,948 bytes) and `ci.yml:382` runs it by name in the Linux-only geometry step —
+where it passed on `main`'s green run, `20/20 checks`, job `101034493057`. But
+`shell/run-tests.sh` selects suites from a **hand-maintained list of `run_suite`
+lines** (`:273` onwards) and that file is not on it, while the comment above the
+list at `:251` claims *"Every `*-test.mjs` under `shell/` tests the COMMITTED
+bundle"*. So `./tools/test.sh shell` — the runner `_MANDATORY` §7 obliges every
+agent to use — runs a **strictly smaller set** than CI does, and a new
+`*-test.mjs` dropped into `shell/` is silently not run locally at all. This is
+§0.4 item 4 in its sharpest form: not two runners, two different **test sets**.
+Hand-off: `shell/run-tests.sh:251-273`.
+
+The
 behaviour family (`touch-focus` 28, `os-chrome` 62, `mobile` 39, `stacking` 578,
 late-focus) runs on every OS in CI and did run here.
 
@@ -638,9 +685,10 @@ macos-latest), `tools (typecheck + unit)`, `DCO`,
 among them, and on today's evidence that is the right call rather than an
 oversight: both jobs log in to GHCR with `secrets.GITHUB_TOKEN`
 (`.github/workflows/ci.yml:498` and `:581`) to pull a package that
-`docker manifest inspect` proves is **private**. A pull request from a fork
-cannot authenticate to it, so making those contexts required would refuse every
-outside contribution for a reason unrelated to the contribution — in a repository
+`docker manifest inspect` proves is **private**. A pull request from a fork is
+not expected to be able to authenticate to it (inferred, not measured — see §0.4
+item 2), so making those contexts required would refuse every outside
+contribution for a reason unrelated to the contribution — in a repository
 whose whole `GOVERNANCE.md` premise is outside contributors. The day the packages
 go public, both should be added; that is the same founder step as the anonymous
 pull below.
