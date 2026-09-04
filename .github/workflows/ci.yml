@@ -33,7 +33,8 @@
 #   image but tags it under a DIFFERENT local name
 #   (`ezil-os-worker-sandbox:ff199202`, not `ezil-integrated:local` — see the
 #   job's own comment on why: its suites read no env var at all), runs
-#   `bun run --cwd local doctor` as an independent health check, then
+#   `bun run doctor` (`working-directory: local`) as an independent health
+#   check, then
 #   `bun test local/` and inspects the result: `bun test` itself exits 0 when
 #   tests are SKIPPED, not just when they pass, so a job that only checked the
 #   exit code would go green while `local/src/host/docker-host.container.test.ts`
@@ -57,6 +58,30 @@
 # the last GOOD build of `main`, not against its own untested changes to
 # `worker/Dockerfile` or `docker/neko/**` — a real gap, called out again in
 # the `container` job's own comment.
+#
+# ── HAND-OFFS FOR THE SUPERVISOR, NOT FIXED IN THIS FILE ───────────────────
+#
+#   FORK PRs CANNOT PULL THE PRIVATE PACKAGE. `pull_request` runs this
+#   workflow with a read-only, fork-scoped `GITHUB_TOKEN` for a fork's PR —
+#   that token cannot pull a private `ezilhq/ezil-os-desktop`, so both
+#   `container` and `local` fail at the "Pull the desktop image" step on
+#   every external contribution, regardless of anything the contributor
+#   wrote. Row G4's required-status list must NOT add "container (real
+#   image)" or "local (typecheck + unit + smoke)" until the package is made
+#   Public (already tracked as a founder step, docs/ORCHESTRATION-LOG.md
+#   2026-09-04 14:50Z) — otherwise no fork PR could ever merge.
+#
+#   MERGE ORDER WITH ROW M1. `worker/scripts/mobile-keyboard.container.test.ts`
+#   is being rewritten on `task/M1` (not yet merged) and, per that file's own
+#   `main`-branch version today, is diagnosed-broken independent of the
+#   image (row M1's hypothesis (b): a bare `require('playwright')` that
+#   cannot resolve it even with `PLAYWRIGHT_REQUIRE_DIR` set — measured on
+#   this box: still 0 pass / 8 fail with the variable exported). So this
+#   row's own PR will show `container (real image)` RED until M1 lands —
+#   expected, and it does not block THIS PR's merge, because neither new
+#   display name is in ruleset 22265548 yet. The supervisor should add both
+#   exact strings to the ruleset only after the first GREEN `container` run
+#   that comes AFTER row M1 merges, not after this row's own PR.
 #
 # What NONE of the above runs:
 #
@@ -423,6 +448,27 @@ jobs:
   # literal fallback — this job sets both env vars AND tags the pulled image
   # under that literal name, so all three suites find it however they were
   # written to look for it.
+  #
+  # 🔴 SETUP PLAYWRIGHT IS HERE TOO, NOT ONLY IN `shell`/`local` — MEASURED,
+  # NOT ASSUMED. `worker/scripts/mobile-keyboard.container.test.ts` spawns
+  # `node -e '<script>'` subprocesses whose scripts open with a bare
+  # `require('playwright')` — that package is deliberately not a dependency
+  # of any `package.json` in this repository (see this action's own header).
+  # On `main` today that resolution fails even WITH `PLAYWRIGHT_REQUIRE_DIR`
+  # set (measured on this box: `bun test worker/scripts/mobile-keyboard.
+  # container.test.ts` with `PLAYWRIGHT_REQUIRE_DIR=/opt/ezil-testkit/
+  # node_modules` exported still gives 0 pass / 8 fail — a bare `require`
+  # cannot see that variable at all) — this is exactly row M1's diagnosed
+  # hypothesis (b): the harness was broken, independent of the product.
+  # Row M1's in-flight fix (`task/M1`, not yet merged) rewrites the same
+  # helpers to `createRequire(process.env.PLAYWRIGHT_REQUIRE_DIR)('playwright')`,
+  # falling back to an honest `SKIP_REASON` naming
+  # `$PLAYWRIGHT_REQUIRE_DIR is unset` when neither resolves it. Without this
+  # step that fallback fires on every run of this job after M1 merges, the
+  # suite SKIPS instead of running, and this job's own hard-fail-on-skip step
+  # below would then be permanently red for a reason that has nothing to do
+  # with the image this job exists to validate. So: install it here too,
+  # even though it changes nothing about today's (pre-M1) red result.
   container:
     name: container (real image)
     runs-on: ubuntu-latest
@@ -471,12 +517,21 @@ jobs:
         shell: bash
         working-directory: worker
         run: bun install --frozen-lockfile
+      # See .github/actions/setup-playwright/action.yml, and this job's own
+      # header comment above ("SETUP PLAYWRIGHT IS HERE TOO") for why the
+      # container job needs this and not only `local`/`shell`.
+      - name: Setup Playwright
+        uses: ./.github/actions/setup-playwright
+        with:
+          version: '1.62.1'
       # 🔴 HARD-FAIL ON A SKIP, NOT JUST ON A FAILURE — same reasoning as the
       # `local` job below, applied to the three suites this job exists to run
       # for real. A skip here means EZIL_VALIDATE_IMAGE / EZIL_NEKO_IMAGE did
       # not resolve to an image these suites recognise (the step above
       # failed, or a suite's own gate found the image missing something it
-      # needs — e.g. row M1's branding-overlay check) — never a pass.
+      # needs — e.g. row M1's branding-overlay check), or that Playwright
+      # itself did not resolve (the "SETUP PLAYWRIGHT" step above) — never a
+      # pass.
       - name: Container suites (real image)
         shell: bash
         run: |
