@@ -353,3 +353,29 @@ directory is the parent folder `/data/openclaw/projects/ezil`, not the repositor
 
 - 2026-09-05 (wave 1) — dispatched I0a (O5 resumed; #24 re-run), I0b (LF/junit/`wc` padding), I0c (pin the image tag,
   honest resolution with one override, the `local` CI job pulls the pin, Dependabot `bun`).
+- 2026-09-05 (wave 1) — **PR #24 merged after one re-run** (`shell (ubuntu)` green on the second try; the failing test
+  was `[phone-portrait] tap-Settings/tap-close` — a Playwright tap missing a 12×12 target, tracked as FLAKE-01 in the
+  community backlog). I0a's PR half done; the O5 half is re-measuring at the tip.
+- 2026-09-05 (wave 1) — **O5 interim map re-measured at the tip; PR #29** (auto-merge). Lead correction: `main`'s CI is
+  GREEN on all fifteen jobs at 3c76d43 (`container` 32/0, `local` 307/0, doctor 12/2/0). Rungs: G4 at
+  TARGET_ENVIRONMENT_CONFIRMED; T3/T7 DEPLOYED (not anonymously pullable); sixteen rows INDEPENDENT_TEST_PASS; six
+  COMMITTED; N1/N2/R2 NOT DONE — no row reaches USER_OUTCOME_CONFIRMED because the cutover never ran. Four guards
+  mutation-proved again. Findings → work: (1) a cancelled container test orphans a container (`neko-browser-window
+  .container.test.ts:191` cleans up only in `afterAll`, no signal trap; reproduced with SIGTERM; 456 MiB held for eight
+  minutes) → row I0d; (2) no CI job calls `tools/test.sh`, and `shell/run-tests.sh`'s hand-kept list omits
+  `responsiveness-browser-test.mjs` while its comment claims completeness → row I0e; (3) `.gitattributes` leaves
+  css/svg/js unpinned, which is why the bundle-drift step is gated off Windows → folded into I0b; (4) `pixels.ts`
+  prints `buckets=33/32` (arithmetic) → I0d; (5) G4, M2, T8 lack run artifacts; G3's doneRung is off the ladder →
+  supervisor bookkeeping. Process note: a wall-clock flake refused a docs-only PR once (`desktop-display-honesty`,
+  ubuntu) and passed on re-run.
+- 2026-09-04 20:10Z — 🔴 **The account hit its monthly spend limit and killed four agents mid-flight** (O5, I0b, I0c, I2;
+  HTTP 429 on both Opus and Sonnet). Nothing was lost that had been committed, because every worker commits each
+  increment: O5's map had already merged (#29), I0b had five commits and an open PR, I0c had six commits unpushed,
+  I2 had none. The supervisor finished and verified both survivors by hand rather than re-dispatching: I0b's last
+  hunk (the shell sources' LF pins) was committed after proving renormalisation is a no-op, that
+  `shell/src/ezil-globals.js` — which git detects as binary for a deliberate NUL sentinel — is byte-identical under
+  the new rule, and that `build-shell.sh --check` still passes; I0c was verified with its own `verify_cmd` (doctor
+  without the override 11 pass/2 warn/1 fail naming three fixes, with it 12/2/0 saying the pin is not in use;
+  `bun test local/` 310 pass / 7 skip / 0 fail; no container left running). PRs #30 and #31 are armed.
+  **Rows I2, I5, I1, I3, I4, I6a, I6b remain undispatched until the limit is raised** — dispatching an agent that
+  dies mid-write is worse than not dispatching it. Rows I0d and I0e added from O5's findings.
