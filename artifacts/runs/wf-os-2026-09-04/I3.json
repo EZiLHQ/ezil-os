@@ -1,0 +1,9 @@
+{
+  "taskId": "I3",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "COMMITTED",
+  "evidence": "starting: welcome.yml, size-label.yml, triage-label.yml not yet written",
+  "startedAt": "2026-09-04T00:00:00Z",
+  "updatedAt": "2026-09-04T00:00:00Z"
+}
