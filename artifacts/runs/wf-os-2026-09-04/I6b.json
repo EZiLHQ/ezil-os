@@ -1,0 +1,10 @@
+{
+	"taskId": "I6b",
+	"runId": "wf-os-2026-09-04",
+	"status": "running",
+	"doneRung": "COMMITTED",
+	"evidence": "Started. Reading _MANDATORY.md, plan §B3 row I6b, ROADMAP.md, CONFIDENCE-MAP.md, docs/research/local-agents.md §5, ORCHESTRATION-LOG.md, CONTRIBUTING.md, and verifying file:line pointers for all 22 issues before writing bodies.",
+	"startedAt": "2026-09-05T00:00:00Z",
+	"updatedAt": "2026-09-05T00:00:00Z",
+	"notes": "docs/community/README.md and docs/community/issues/*.md do not exist yet in this worktree — creating from scratch. We implement none of these 22 issues; this row only writes the backlog."
+}
