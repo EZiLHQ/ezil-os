@@ -74,7 +74,15 @@
 #
 #    So: whenever `worker/assets/neko-branding/**` changes, rebuild the overlay
 #    under a NEW `brandN` tag and bump this line in the same commit.
-ARG NEKO_IMAGE=ezil-neko-vscode:d74052bb-049931d7-ezil-brand8
+#
+# GHCR, not a local-only tag: `docker/neko/build.sh` + `.github/workflows/
+# image.yml` (row T3) publish the bare base and this overlay to
+# ghcr.io/ezilhq/ezil-neko-vscode so a clean machine can build this
+# Dockerfile without first building the base by hand. The `-ezil-brand8`
+# suffix is not yet a key in `deploy/images.env` (that file only carries the
+# BARE base tag) — see the workflow's own hand-off comment before bumping
+# either place on its own.
+ARG NEKO_IMAGE=ghcr.io/ezilhq/ezil-neko-vscode:d74052bb-049931d7-ezil-brand8
 FROM ${NEKO_IMAGE} AS neko
 
 FROM docker.io/cloudflare/sandbox:0.12.1
@@ -365,6 +373,8 @@ RUN cd /opt/ezil-sidecar \
 EXPOSE 8080
 EXPOSE 8181
 EXPOSE 3002
+# code-server (see the install step above); 0.0.0.0:8443, reached via src/preview-bridge.ts.
+EXPOSE 8443
 
 # The browser sidecar's narrow automation surface (`sidecar/`, see the COPY
 # above). Reached by `sandbox.containerFetch` from the Worker's HMAC-gated
