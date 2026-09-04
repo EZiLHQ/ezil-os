@@ -1,12 +1,19 @@
-# Release — build the downloadable local-mode tarball and publish a GitHub
-# Release for it, with checksums and a build-provenance attestation.
+# Release — build the downloadable local-mode tarball and open a GitHub
+# Release for it as a DRAFT, with checksums and a build-provenance attestation.
 #
 # This is deliberately separate from `image.yml` (which publishes the
 # container images) and `deploy.yml` (which deploys the hosted product): the
-# artifact here is something a person downloads and runs on their own laptop,
-# and its only dependency on the other two workflows is that `deploy/images.env`
-# already carries a real, published tag by the time this runs — row R1 wires
-# `deploy.yml` to gate on that, not this file.
+# artifact here is something a person downloads and runs on their own laptop.
+#
+# 🔴 THIS WORKFLOW NEVER PUBLISHES WHAT IT CREATES. `gh release create` below
+# passes `--draft`, on purpose: a release visible to the public is a claim
+# that EZiL OS at this tag actually works, and this workflow has no way to
+# know that — it builds a tarball and writes it down. `deploy.yml`'s `release`
+# job (row R1) is what publishes it, `gh release edit <tag> --draft=false`,
+# and only AFTER that pipeline's own `verify` job proves the hosted product
+# against a live production suite. The two workflows run concurrently off the
+# same tag push and do not wait on each other — a slow `verify.yml` run just
+# means the draft sits a while longer before `deploy.yml` reaches it.
 #
 # 🔴 EVERY `${{ }}` VALUE USED INSIDE A `run:` SHELL BLOCK GOES THROUGH `env:`,
 # NEVER SPLICED DIRECTLY INTO THE SCRIPT TEXT — including this workflow's own
@@ -215,22 +222,50 @@ jobs:
         run: |
           set -euo pipefail
           notes_file="notes-${RELEASE_TAG}.md"
+
           # Stops at the NEXT '## [' heading, or at the reference-link-
           # definition block ('[x]: https://...') Keep a Changelog puts at
           # the bottom of the file — otherwise the last version's section
           # would swallow every link reference below it, since there is no
           # following heading to stop at.
-          awk -v want="[${RELEASE_VERSION}]" '
-            /^## \[/ {
-              if (capturing) exit
-              if (index($0, "## " want) == 1) { capturing = 1 }
-              next
-            }
-            capturing && /^\[[^]]+\]:/ { exit }
-            capturing { print }
-          ' CHANGELOG.md > "${notes_file}"
+          extract_section() {
+            awk -v want="[${1}]" '
+              /^## \[/ {
+                if (capturing) exit
+                if (index($0, "## " want) == 1) { capturing = 1 }
+                next
+              }
+              capturing && /^\[[^]]+\]:/ { exit }
+              capturing { print }
+            ' CHANGELOG.md
+          }
+
+          extract_section "${RELEASE_VERSION}" > "${notes_file}"
+
+          # 🔴 RC FALLBACK — preferred over requiring a duplicated section per
+          # release-candidate tag (the alternative this row's brief named: a
+          # '## [0.2.0-rc.1]' heading whose body just points at '## [0.2.0]').
+          # A version ending exactly in '-rc.<digits>' with no exact heading
+          # of its own falls back to its BASE version's section instead. Any
+          # OTHER pre-release identifier ('-beta', '-alpha.2', …) still
+          # requires its own exact heading — this fallback does not become a
+          # general "closest section" search.
+          if [[ ! -s "${notes_file}" && "${RELEASE_VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-rc\.[0-9]+$ ]]; then
+            base_version="${BASH_REMATCH[1]}"
+            echo "[notes] no '## [${RELEASE_VERSION}]' section — falling back to the base version's '## [${base_version}]' section (rc tag)"
+            extract_section "${base_version}" > "${notes_file}"
+            if [[ -s "${notes_file}" ]]; then
+              {
+                echo "_Release-candidate build of ${base_version}; see [${base_version}] below for the notes._"
+                echo
+                cat "${notes_file}"
+              } > "${notes_file}.rc"
+              mv "${notes_file}.rc" "${notes_file}"
+            fi
+          fi
+
           if [[ ! -s "${notes_file}" ]]; then
-            echo "::error file=CHANGELOG.md::no '## [${RELEASE_VERSION}]' section — add one to CHANGELOG.md before tagging a release; a release with empty notes is never published from this workflow" >&2
+            echo "::error file=CHANGELOG.md::no '## [${RELEASE_VERSION}]' section (rc fallback, if applicable, also found nothing) — add one to CHANGELOG.md before tagging a release; a release with empty notes is never published from this workflow" >&2
             exit 1
           fi
           echo "notes_file=${notes_file}" >> "$GITHUB_OUTPUT"
@@ -254,7 +289,10 @@ jobs:
           NOTES_FILE: ${{ steps.notes.outputs.notes_file }}
         run: |
           set -euo pipefail
-          args=(--verify-tag --notes-file "${NOTES_FILE}")
+          # --draft: this workflow never publishes what it creates — see the
+          # file header. deploy.yml's `release` job (row R1) is the only
+          # place `--draft=false` happens, and only after `verify` passes.
+          args=(--verify-tag --draft --notes-file "${NOTES_FILE}")
           if [[ "${PRERELEASE}" == "true" ]]; then
             args+=(--prerelease)
           fi
