@@ -321,7 +321,7 @@ sign-off on every commit and CI green on Linux, Windows and macOS before it
 can merge — including from a maintainer, who cannot approve their own PR
 either (see `GOVERNANCE.md`'s "Merging into `main`" for why the required
 approval count is zero rather than bypassed). See CONTRIBUTING.md's
-[How to send a pull request](CONTRIBUTING.md#how-to-send-a-pull-request) for
+[How to send a PR](CONTRIBUTING.md#how-to-send-a-pr) for
 the exact steps, including which checks are required and which aren't.
 
 #### Contributors

@@ -15,8 +15,8 @@
 
 ## Size
 
-<!-- XS / S / M / L / XL — see CONTRIBUTING.md, "How big a pull request
-     should be". A size over ~400 changed lines will be asked to split. -->
+<!-- XS / S / M / L / XL — see CONTRIBUTING.md#pr-size. A size over
+     ~400 changed lines will be asked to split. -->
 
 ## Checklist
 

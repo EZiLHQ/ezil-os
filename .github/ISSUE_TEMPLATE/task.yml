@@ -56,7 +56,7 @@ body:
     id: size
     attributes:
       label: Estimated size
-      description: A rough changed-line-count guess — see CONTRIBUTING.md, "How big a pull request should be". Leave it if you're not sure; a maintainer can set it.
+      description: A rough changed-line-count guess — see CONTRIBUTING.md#pr-size. Leave it if you're not sure; a maintainer can set it.
       options:
         - "XS (under 20 lines)"
         - "S (under 100 lines)"
