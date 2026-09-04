@@ -1,0 +1,10 @@
+{
+  "taskId": "G2",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "COMMITTED",
+  "evidence": "orientation only so far: read _MANDATORY, worker-opus role, docs/TASKS.csv (24 rows), docs/ORCHESTRATION-LOG.md, README/CONTRIBUTING/SECURITY/CODE_OF_CONDUCT/CONTRIBUTORS/CHANGELOG, docs/RUNBOOK.md sections 'Known constraints' + 'Open, owner-side', docs/PLATFORM-NOTES.md 6-8, plan of record sections 1/2/4/8. Ground truth for G1 checked against main (not the 2a3c5bf worktree base): 'Merge task/G1' = aaf158a, main:.github/CODEOWNERS reads @MidhunAkashM, codeql/labeler/stale workflows present on main, artifacts/runs/wf-os-2026-09-04/G1.json status=done rung=STATIC_CHECKS_PASS. GOVERNANCE.md and ROADMAP.md not yet written.",
+  "startedAt": "2026-09-04T09:05:00Z",
+  "updatedAt": "2026-09-04T09:05:00Z",
+  "by": "worker-opus-G2"
+}
