@@ -141,6 +141,13 @@ jobs:
           # copy of this exact layout before this row was reported done.
           mkdir -p "${stage}/local"
           cp -R local/src "${stage}/local/src"
+          # A handful of *.test.ts are colocated with their sources rather
+          # than under local/tests/ (the container/browser suites T5 added).
+          # Two of them import app/src/... AS VALUES for their own assertion
+          # (not `import type`), which is not in this tarball — nothing runs
+          # a .test.ts here, so this is not a functional break, but shipping
+          # a file that cannot resolve its own import is not "sources" either.
+          find "${stage}/local/src" -name '*.test.ts' -delete
           cp local/package.json local/bun.lock "${stage}/local/"
 
           # worker/src/{desktop-mode,screen-modes}.ts — NOT in the row brief's
@@ -189,7 +196,16 @@ jobs:
       - name: SHA256SUMS
         env:
           TARBALL: ${{ steps.tarball.outputs.tarball }}
-        run: sha256sum "${TARBALL}" deploy/launcher/ezil-os.sh deploy/launcher/ezil-os.ps1 > SHA256SUMS
+        run: |
+          set -euo pipefail
+          # `gh release create` uploads assets by BASENAME (below: the
+          # tarball plus deploy/launcher/ezil-os.{sh,ps1}, flattened into one
+          # download directory) — so SHA256SUMS must name them the same way,
+          # or the README's own `sha256sum -c SHA256SUMS` fails on both
+          # launchers with "No such file or directory" for a downloader who
+          # never has a `deploy/launcher/` directory at all.
+          sha256sum "${TARBALL}" > SHA256SUMS
+          ( cd deploy/launcher && sha256sum ezil-os.sh ezil-os.ps1 ) >> SHA256SUMS
 
       - name: Extract the CHANGELOG section
         id: notes
