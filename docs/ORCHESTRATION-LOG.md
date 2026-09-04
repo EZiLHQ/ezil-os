@@ -379,3 +379,45 @@ directory is the parent folder `/data/openclaw/projects/ezil`, not the repositor
   `bun test local/` 310 pass / 7 skip / 0 fail; no container left running). PRs #30 and #31 are armed.
   **Rows I2, I5, I1, I3, I4, I6a, I6b remain undispatched until the limit is raised** — dispatching an agent that
   dies mid-write is worse than not dispatching it. Rows I0d and I0e added from O5's findings.
+- 2026-09-05 (wave 1) — **PR #24 merged after one re-run** (`shell (ubuntu)` green on the second try; the failing test
+  was `[phone-portrait] tap-Settings/tap-close` — a Playwright tap missing a 12×12 target, tracked as FLAKE-01 in the
+  community backlog). I0a's PR half done; the O5 half is re-measuring at the tip.
+- 2026-09-05 (wave 1) — **O5 interim map re-measured at the tip; PR #29** (auto-merge). Lead correction: `main`'s CI is
+  GREEN on all fifteen jobs at 3c76d43 (`container` 32/0, `local` 307/0, doctor 12/2/0). Rungs: G4 at
+  TARGET_ENVIRONMENT_CONFIRMED; T3/T7 DEPLOYED (not anonymously pullable); sixteen rows INDEPENDENT_TEST_PASS; six
+  COMMITTED; N1/N2/R2 NOT DONE — no row reaches USER_OUTCOME_CONFIRMED because the cutover never ran. Four guards
+  mutation-proved again. Findings → work: (1) a cancelled container test orphans a container (`neko-browser-window
+  .container.test.ts:191` cleans up only in `afterAll`, no signal trap; reproduced with SIGTERM; 456 MiB held for eight
+  minutes) → row I0d; (2) no CI job calls `tools/test.sh`, and `shell/run-tests.sh`'s hand-kept list omits
+  `responsiveness-browser-test.mjs` while its comment claims completeness → row I0e; (3) `.gitattributes` leaves
+  css/svg/js unpinned, which is why the bundle-drift step is gated off Windows → folded into I0b; (4) `pixels.ts`
+  prints `buckets=33/32` (arithmetic) → I0d; (5) G4, M2, T8 lack run artifacts; G3's doneRung is off the ladder →
+  supervisor bookkeeping. Process note: a wall-clock flake refused a docs-only PR once (`desktop-display-honesty`,
+  ubuntu) and passed on re-run.
+- 2026-09-05 — **Wave 1 of round INTAKE complete.** PR #30 (I0b) merged; PRs #31 (I0c) and #32 (bookkeeping) merged after
+  one rerun each of the phone-portrait flake (FLAKE-01, now its fourth occurrence this week). `main` @ 5925edc carries
+  `EZIL_DESKTOP_TAG=3c76d43b` and CI on that commit is green on all jobs including `container (real image)` and
+  `local (typecheck + unit + smoke)` — the `local` job now pulls the PINNED reference, so the pin is proven by the job
+  that consumes it, not asserted. A `Vercel` check has started appearing on PRs and failing (preview builds without the
+  app's env); it is not a required context and does not block merges — worth a founder look at the Vercel Git
+  integration. Labels created: `needs-triage`, `size/XS…XL`, `review:claude`, `blocked`, `prereq-missing`. Wave 2
+  dispatched with the committed agent definitions (loaded this session): I1 (worker-sonnet), I5 (worker-opus),
+  I6b (worker-sonnet).
+- 2026-09-05 — **The failing `Vercel` check explained.** The founder connected the Vercel project's Git integration to
+  the repository on 2026-09-04 ~20:04Z (project `link` now set, `productionBranch: main`). Preview builds fail at
+  "No Next.js version detected … check your Root Directory": the project's Root Directory is the repository root and
+  the app is in `app/`. `deploy.yml` avoids this by running the CLI inside `app/`, which is why the two paths cannot
+  both be right (the contradiction G2's planner flagged). Founder step: Root Directory = `app` (and the Preview
+  environment's env vars); row I0f then runs deploy.yml's `vercel` steps from the repository root. Not a required
+  context; merges are unaffected.
+- 2026-09-05 — **The failing `Vercel` check now blocks auto-merge on every NEW pull request**: GitHub refuses
+  `enablePullRequestAutoMerge` while any check is failing ("Pull request is in unstable status"), required or not.
+  PRs #30–#32 landed only because they were armed before the Git integration was connected. A direct squash merge
+  with the fifteen required contexts green still works and was used for #33 (wrangler 4.108 → 4.128, lockfile moved
+  with the manifest — the patch-and-minor policy). Until the founder sets the Vercel Root Directory to `app`, every
+  contributor PR will show a red Vercel check and need a maintainer's direct merge — the fix is one dashboard field.
+- 2026-09-05 — **Wave 2 landing.** I5 merged (#35). I6b merged (#37): the 22 community issues as files. I1's
+  CONTRIBUTING rewrite merged (#36) with a follow-up (#38) pinning the four anchors I5's templates link — the
+  supervisor had given I1 and I6b a different slug than I5; caught when I5 reported, fixed by message before either
+  landed. Dependabot under the `bun` ecosystem re-opened two groups: #33 (wrangler) merged directly; #34
+  (`@supabase/ssr` 0.5→0.12, a cookie-layer rewrite under the invite gate) HELD → row D2. I6a dispatched (publisher).
