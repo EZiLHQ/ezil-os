@@ -134,13 +134,15 @@ which is what lets a verdict say "reached `STATIC_CHECKS_PASS`, required
   "taskId":    "O4",
   "runId":     "wf-os-2026-09-04",
   "status":    "running",
-  "doneRung":  "CODE_PRESENT",
-  "evidence":  "started: reading tools/waves.ts, tools/ledger.ts, ...",
+  "doneRung":  "COMMITTED",
+  "evidence":  "docs/ORCHESTRATION.md written and committed, 411 lines; link check 12/12 resolve, rung check 9/9 present, both mutation-proved.",
   "startedAt": "2026-09-04T09:35:04Z",
-  "updatedAt": "2026-09-04T09:35:04Z",
+  "updatedAt": "2026-09-04T09:44:30Z",
   "notes":     "optional"
 }
 ```
+
+(This is this row's own real artifact, `artifacts/runs/wf-os-2026-09-04/O4.json`, shown at the shape it reached — not a placeholder.)
 
 Every field but `notes` is required and must be a non-empty string
 (`parseArtifact` in `../tools/ledger.ts` throws `MalformedArtifact` on a blank
@@ -305,8 +307,9 @@ pinned id: the alias is what a dispatch call actually takes.
 project, not on EZiL-OS itself: `EZiL-Works/docs/ORCHESTRATION-LOG.md:22`,
 *"Dispatch | by readiness, ≤3 concurrent Claude subagents (measured ceiling),
 each in `tools/worktree.sh` worktree on `task/<id>`."* This round has run at
-or under that width throughout (the log's running-tasks lines never name more
-than three).
+or under that width throughout: every "Running:" line in `ORCHESTRATION-LOG.md`
+names at most three task ids (`grep -o 'Running: [^.]*' docs/ORCHESTRATION-LOG.md`
+— seven lines, none longer than three ids, checked while writing this file).
 
 **One worktree per mutating agent.** Every row with `isolation: worktree`
 gets its own `.claude/worktrees/<id>` checkout via `tools/worktree.sh add`,
@@ -314,17 +317,22 @@ so two agents editing at once never share a working tree — `isolation: none`
 is reserved for supervisor rows that touch nothing but the CSV, the log, or
 real outward infrastructure directly.
 
-**A finished row lands with `git merge --no-ff` into `main`, done by the
-supervisor only when `main` is clean and no suite is running against it.**
-Every merge this round carries the same message shape and a two-parent commit
-— confirmed directly (`git log --format='%P' <sha>` on `7d288c4`, the `O2`
-merge, prints two parent hashes) — for example:
+**A finished row lands with `git merge --no-ff` into `main`.** Every merge
+this round carries the same message shape and is a real two-parent commit —
+confirmed directly (`git log --format='%P' <sha>` on `7d288c4`, the `O2`
+merge, prints two parent hashes), for example:
 
 ```
 Merge task/O2: tools/waves.ts and tools/ledger.ts ported from EZiL-Works (round wf-os-2026-09-04)
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 ```
+
+The stated practice behind that merge, not something the commit shape alone
+proves: the supervisor does it only when `main` is clean and no suite is
+running against it — a merge race into a tree another process is mid-suite
+against is exactly the shared-checkout hazard `_MANDATORY.md` §11 already
+names for `git stash`, applied to `git merge`.
 
 ## Recovery
 
