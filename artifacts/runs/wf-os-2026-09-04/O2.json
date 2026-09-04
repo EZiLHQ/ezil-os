@@ -3,7 +3,7 @@
   "runId": "wf-os-2026-09-04",
   "status": "done",
   "doneRung": "INDEPENDENT_TEST_PASS",
-  "evidence": "73 pass / 0 fail, 2 files (tools/waves.test.ts, tools/ledger.test.ts), 130 expect() calls; tsc --noEmit -p tools/tsconfig.json exits 0; bun tools/waves.ts docs/TASKS.csv exits 0, no overlapping-ownership, no cycle, every dependency resolves (8 advisory wave-column-stale notes); mutation-proof on a scratch copy of TASKS.csv (D1 given G1's .github/CODEOWNERS): exit 1, 'overlapping-ownership: wave 0 dispatches G1 and D1 together, and both own .github/CODEOWNERS' -> unmutated docs/TASKS.csv still exits 0",
+  "evidence": "76 pass / 0 fail, 2 files (tools/waves.test.ts, tools/ledger.test.ts), 134 expect() calls; tsc --noEmit -p tools/tsconfig.json exits 0; bun tools/waves.ts docs/TASKS.csv exits 0, no overlapping-ownership, no cycle, every dependency resolves (8 advisory wave-column-stale notes); mutation-proof on a scratch copy of TASKS.csv (D1 given G1's .github/CODEOWNERS): exit 1, 'overlapping-ownership: wave 0 dispatches G1 and D1 together, and both own .github/CODEOWNERS' -> unmutated docs/TASKS.csv still exits 0",
   "startedAt": "2026-09-04T00:00:00Z",
-  "updatedAt": "2026-09-04T00:20:00Z"
+  "updatedAt": "2026-09-04T00:35:00Z"
 }
