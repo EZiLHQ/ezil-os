@@ -74,7 +74,12 @@ if ! command -v bun >/dev/null 2>&1; then
 fi
 
 # ── 3. Resolve the image reference ───────────────────────────────────────
-read_env_key() { grep -E "^[[:space:]]*${1}[[:space:]]*=" "$2" 2>/dev/null | head -1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+# `|| true` at the end, not inside: under `set -o pipefail` a key that is
+# simply ABSENT (grep matches nothing, exit 1) would otherwise abort this
+# whole script via `set -e` on the `X="$(read_env_key ...)"` assignment —
+# reproduced locally before this fix landed. EZIL_DESKTOP_DIGEST is absent
+# from deploy/images.env today and must resolve to "", not kill the launcher.
+read_env_key() { grep -E "^[[:space:]]*${1}[[:space:]]*=" "$2" 2>/dev/null | head -1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true; }
 
 EXPECT_DIGEST=""
 if [ -n "${EZIL_LAUNCHER_IMAGE:-}" ]; then
