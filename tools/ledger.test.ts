@@ -418,33 +418,30 @@ describe("the stall check cannot go quietly dead", () => {
 			expect(report).toContain(`${realTasks.length} row(s) inspected`);
 		});
 
-		it("records that the net is NOT currently active in this worktree's own view", () => {
-			// EZiL-Works' version of this test pinned the OPPOSITE fact
-			// (`inFlight.length > 0`) once that repo's wave dispatched WITH
-			// `running` rows in docs/TASKS.csv -- see the historical note that
-			// test's own comment carried, which is itself evidence this
-			// assertion is expected to track live reality rather than stay
-			// fixed forever. EZiL-OS's reality differs on two counts, not just
-			// one path: (1) round ANYWHERE's wave-0 dispatch left every row
-			// `pending` in docs/TASKS.csv (this port's own O2 row included --
-			// not this task's file to change), and (2) `loadArtifacts` here
-			// reads only THIS worktree's own `artifacts/runs`, never a sibling
-			// worktree's `running` artifact (that cross-worktree read is
-			// `loadAllArtifacts`, exercised by the synthetic fixtures above,
-			// not this real-corpus block). By the state this file is committed
-			// in -- this task's own run artifact folded to `done` -- nothing in
-			// this worktree's local view is running, so the honest pin is NOT
-			// ACTIVE. A red here is the same kind of good news the original
-			// comment described: it means a dispatch protocol now writes a
-			// `running` marker this worktree can see.
-			const coverage = stallCoverage(realTasks, realLatest);
-
-			expect(coverageReport(coverage).join("\n")).toContain("STALL CHECK NOT ACTIVE");
-		});
-
 		it("would fire on the real plan the moment one row is marked running", () => {
-			// The positive control on the pin above. It proves the rule still
-			// works against the real rows and not just an empty plan.
+			// EZiL-Works' version of this describe block carried a companion
+			// test here pinning whether the real corpus currently has anything
+			// `running` (`inFlight.length > 0`, later `=== 0` in an earlier
+			// revision -- its own comment documents flipping the assertion as
+			// live reality changed). That pin does not port: in EZiL-Works it
+			// runs from the supervisor's main tree, where "is anything running"
+			// is one global fact. Here it runs from EACH WORKER'S OWN worktree,
+			// and `loadArtifacts` (used by `realLatest` above) only ever sees
+			// that worktree's own `artifacts/runs` -- never a sibling's. Per
+			// _MANDATORY §2 every worker writes ITS OWN `running` artifact at
+			// the start of its own work, so whether this suite reads
+			// `NOT ACTIVE` or not depends entirely on which worker runs it and
+			// when, not on anything the code under test got right or wrong.
+			// Neither direction of the pin is stable here, so it is dropped
+			// rather than re-aimed at whichever state happened to be on disk
+			// when this port was written; "always states what the stall check
+			// could see" above already holds the state-independent invariant
+			// (silence is impossible) that the EZiL-Works pin layered a
+			// snapshot on top of.
+			//
+			// This test is the positive control on THAT invariant test and on
+			// the detector itself. It proves the rule still fires against the
+			// real rows and not just an empty plan.
 			//
 			// Isolated against every OTHER row this wave might currently have
 			// `running` -- by ROW or by its own ARTIFACT -- before the one under

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { REQUIRED_COLUMNS, checkWaveColumn, computeWaves, parseCsv, parseTasks, validate } from "./waves.ts";
+import { DONE_LADDER, REQUIRED_COLUMNS, checkWaveColumn, computeWaves, parseCsv, parseTasks, rungHeight, rungSatisfies, validate } from "./waves.ts";
 
 /**
  * Every refusal here is paired with the case it must accept.
@@ -208,5 +208,34 @@ describe("a finished task owns nothing", () => {
 				].join("\n"),
 			),
 		).not.toEqual([]);
+	});
+});
+
+describe("the done-ladder inlined from EZiL-Works' packages/contracts/src/ladder.ts", () => {
+	it("carries the nine rungs, in order", () => {
+		expect(DONE_LADDER).toEqual([
+			"DESIGNED",
+			"CODE_PRESENT",
+			"COMMITTED",
+			"STATIC_CHECKS_PASS",
+			"WORKER_RUNTIME_EVIDENCE",
+			"INDEPENDENT_TEST_PASS",
+			"DEPLOYED",
+			"TARGET_ENVIRONMENT_CONFIRMED",
+			"USER_OUTCOME_CONFIRMED",
+		]);
+	});
+
+	it("says a higher rung satisfies a lower requirement", () => {
+		expect(rungSatisfies("DEPLOYED", "COMMITTED")).toBe(true);
+	});
+
+	it("does NOT say a lower rung satisfies a higher requirement -- the control on the assertion above", () => {
+		expect(rungSatisfies("COMMITTED", "DEPLOYED")).toBe(false);
+	});
+
+	it("orders rungHeight the same way the array is written", () => {
+		expect(rungHeight("DESIGNED")).toBe(0);
+		expect(rungHeight("USER_OUTCOME_CONFIRMED")).toBe(DONE_LADDER.length - 1);
 	});
 });
