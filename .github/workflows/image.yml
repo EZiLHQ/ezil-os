@@ -1,0 +1,319 @@
+# Image — publish EZiL OS's two container images to GHCR: the pinned Neko +
+# VS Code base/overlay (rarely, only when its build inputs change or forced)
+# and the desktop image built from worker/Dockerfile (whenever anything that
+# feeds it changes).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# AMD64 ONLY
+# ─────────────────────────────────────────────────────────────────────────────
+# Google Chrome ships no arm64 Linux build — worker/Dockerfile installs the
+# amd64 .deb directly (see its `google-chrome-stable_current_amd64.deb`
+# fetch, worker/Dockerfile:116) — so a multi-arch manifest is not attempted
+# anywhere in this file.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔴 `paths:` ALSO GATES THE `tags: ['v*']` TRIGGER — VERIFIED, NOT ASSUMED
+# ─────────────────────────────────────────────────────────────────────────────
+# GitHub ANDs every filter on a `push` trigger together, and that AND is not
+# documented as applying only to branch pushes: a `paths` filter alongside
+# `tags` restricts tag pushes too, not just pushes to `main`. So a `v*` tag
+# pushed at a commit that touches none of the paths below will NOT trigger
+# this workflow, and no semver-tagged image is published for it — the image
+# for that release is whatever the most recent path-matching push to `main`
+# already built and pushed under its `<git-sha8>` tag. There is no native
+# `on.push` syntax for "these paths OR any version tag" (confirmed against
+# GitHub's own docs: branches/tags are OR'd against each other for the ref
+# match, but paths ANDs on top of that combined match) and a second workflow
+# file is outside this row's `owns_files`, so this is accepted as-is: see the
+# T3 worker report for the full reasoning.
+name: Image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - worker/**
+      - docker/neko/**
+      - deploy/images.env
+      - .github/workflows/image.yml
+  workflow_dispatch:
+    inputs:
+      rebuild_base:
+        description: 'Force-rebuild the pinned Neko base + branding overlay even if docker/neko/** did not change'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 🔴 HAND-OFF (T3 -> T0): deploy/images.env's EZIL_NEKO_TAG pins the BARE
+  # base only. worker/Dockerfile needs the `-ezil-brandN` OVERLAY of that tag
+  # (T0's finding: the bare base lacks the mobile keyboard and the
+  # black-picture detector). Until deploy/images.env gains a key for that
+  # suffix — proposed: EZIL_NEKO_OVERLAY_TAG=d74052bb-049931d7-ezil-brand8 —
+  # this workflow pins the suffix here rather than inventing a second,
+  # undocumented source of truth. It MUST stay equal to worker/Dockerfile's
+  # own `ARG NEKO_IMAGE` suffix (that file's own 🔴 comment is the authority
+  # on when it changes); the "Load image pins" step below fails the build if
+  # the two ever disagree.
+  NEKO_OVERLAY_SUFFIX: ezil-brand8
+
+jobs:
+  neko-base:
+    name: neko-base (amd64)
+    runs-on: ubuntu-latest
+    outputs:
+      base_ref: ${{ steps.pins.outputs.base_ref }}
+      overlay_ref: ${{ steps.pins.outputs.overlay_ref }}
+      built: ${{ steps.gate.outputs.build }}
+      overlay_digest: ${{ steps.push.outputs.overlay_digest }}
+    steps:
+      # fetch-depth 0: the change-detection step below diffs against the
+      # push's own "before" SHA, which needs history beyond the last commit.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Load image pins
+        id: pins
+        run: |
+          # deploy/images.env is deliberately NOT shell-sourceable: it ships
+          # `EZIL_DESKTOP_TAG=<to be pinned by CI>` on purpose (see
+          # local/src/container/run-spec.ts's parseImagesEnv doc comment —
+          # `<...>` is redirection syntax to a shell). Read it with grep, the
+          # same line-parsing contract that function documents, never
+          # `source` it. docker/neko/pins.env is ours and safe to source.
+          read_env_key() { grep -E "^[[:space:]]*${1}[[:space:]]*=" "$2" | head -1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+          set -a
+          source docker/neko/pins.env
+          set +a
+          EZIL_NEKO_IMAGE="$(read_env_key EZIL_NEKO_IMAGE deploy/images.env)"
+          EZIL_NEKO_TAG="$(read_env_key EZIL_NEKO_TAG deploy/images.env)"
+          base_sha8="${NEKO_SHA:0:8}-${NEKO_APPS_SHA:0:8}"
+          if [[ "${base_sha8}" != "${EZIL_NEKO_TAG}" ]]; then
+            echo "::error::docker/neko/pins.env (${base_sha8}) and deploy/images.env's EZIL_NEKO_TAG (${EZIL_NEKO_TAG}) disagree - bump both together" >&2
+            exit 1
+          fi
+          base_ref="${EZIL_NEKO_IMAGE}:${EZIL_NEKO_TAG}"
+          overlay_ref="${EZIL_NEKO_IMAGE}:${EZIL_NEKO_TAG}-${NEKO_OVERLAY_SUFFIX}"
+          dockerfile_arg="$(grep -oP '^ARG NEKO_IMAGE=\K.*' worker/Dockerfile)"
+          if [[ "${dockerfile_arg}" != "${overlay_ref}" ]]; then
+            echo "::error::worker/Dockerfile's ARG NEKO_IMAGE (${dockerfile_arg}) does not match the overlay ref this workflow computed (${overlay_ref}) - bump worker/Dockerfile and NEKO_OVERLAY_SUFFIX together" >&2
+            exit 1
+          fi
+          {
+            echo "image=${EZIL_NEKO_IMAGE}"
+            echo "base_ref=${base_ref}"
+            echo "overlay_ref=${overlay_ref}"
+          } >> "$GITHUB_OUTPUT"
+          echo "[pins] image=${EZIL_NEKO_IMAGE}"
+          echo "[pins] base_ref=${base_ref}"
+          echo "[pins] overlay_ref=${overlay_ref}"
+
+      # Step-level, not job-level: `desktop` below `needs: neko-base`, and a
+      # SKIPPED job's dependents are skipped too by default — so this job
+      # always runs to completion, and only the expensive steps below are
+      # individually gated on this output. See the file header.
+      - name: Decide whether to rebuild the base + overlay
+        id: gate
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.rebuild_base }}" == "true" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "[gate] rebuild_base=true -> building"
+            exit 0
+          fi
+          before="${{ github.event.before }}"
+          if [[ -z "${before}" || "${before}" == "0000000000000000000000000000000000000000" ]] \
+            || ! git cat-file -e "${before}" 2>/dev/null; then
+            # New branch, new tag, or a "before" this checkout cannot see
+            # (e.g. a force-push, or a tag push whose "before" is the zero
+            # SHA): rebuild rather than risk silently skipping a real change.
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "[gate] no usable 'before' SHA (${before:-<empty>}) -> building"
+            exit 0
+          fi
+          if git diff --name-only "${before}" "${{ github.sha }}" -- docker/neko/ | grep -q .; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "[gate] docker/neko/** changed -> building"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "[gate] docker/neko/** unchanged, rebuild_base not requested -> skipping build/push/sign/attest steps below"
+          fi
+
+      - name: Log in to GHCR
+        if: steps.gate.outputs.build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build pinned Neko + VS Code base
+        if: steps.gate.outputs.build == 'true'
+        env:
+          NEKO_IMAGE_TAG: ${{ steps.pins.outputs.base_ref }}
+        run: docker/neko/build.sh
+
+      - name: Build EZiL branding overlay
+        if: steps.gate.outputs.build == 'true'
+        run: |
+          docker build \
+            --build-arg "BASE_NEKO_IMAGE=${{ steps.pins.outputs.base_ref }}" \
+            -t "${{ steps.pins.outputs.overlay_ref }}" \
+            -f worker/assets/neko-branding/Dockerfile \
+            worker/assets/neko-branding
+
+      - name: Push base + overlay
+        if: steps.gate.outputs.build == 'true'
+        id: push
+        run: |
+          base_ref="${{ steps.pins.outputs.base_ref }}"
+          overlay_ref="${{ steps.pins.outputs.overlay_ref }}"
+          base_digest="$(docker push "${base_ref}" | grep -oP 'digest: \Ksha256:[0-9a-f]+')"
+          overlay_digest="$(docker push "${overlay_ref}" | grep -oP 'digest: \Ksha256:[0-9a-f]+')"
+          {
+            echo "base_digest=${base_digest}"
+            echo "overlay_digest=${overlay_digest}"
+          } >> "$GITHUB_OUTPUT"
+          echo "[push] ${base_ref}@${base_digest}"
+          echo "[push] ${overlay_ref}@${overlay_digest}"
+
+      - name: Install cosign
+        if: steps.gate.outputs.build == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign base + overlay (keyless, OIDC)
+        if: steps.gate.outputs.build == 'true'
+        run: |
+          cosign sign --yes "${{ steps.pins.outputs.base_ref }}@${{ steps.push.outputs.base_digest }}"
+          cosign sign --yes "${{ steps.pins.outputs.overlay_ref }}@${{ steps.push.outputs.overlay_digest }}"
+
+      # subject-name is the BARE image name, no tag — the digest is what
+      # identifies this exact artifact; base and overlay share one repo name
+      # and differ only by tag, so the digest is the only thing distinguishing
+      # the two attestations.
+      - name: Attest provenance - base
+        if: steps.gate.outputs.build == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.pins.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.base_digest }}
+          push-to-registry: true
+
+      - name: Attest provenance - overlay
+        if: steps.gate.outputs.build == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.pins.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.overlay_digest }}
+          push-to-registry: true
+
+  desktop:
+    name: desktop (amd64)
+    runs-on: ubuntu-latest
+    # neko-base always completes (see the file header) - this job runs on
+    # every push that reaches this workflow, whether or not the base rebuilt.
+    needs: neko-base
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load image pins
+        id: pins
+        run: |
+          # See the neko-base job's "Load image pins" step: deploy/images.env
+          # is grepped, never sourced (it ships a deliberately non-shell-safe
+          # placeholder value for EZIL_DESKTOP_TAG).
+          read_env_key() { grep -E "^[[:space:]]*${1}[[:space:]]*=" "$2" | head -1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+          desktop_image="$(read_env_key EZIL_DESKTOP_IMAGE deploy/images.env)"
+          echo "desktop_image=${desktop_image}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          image="${{ steps.pins.outputs.desktop_image }}"
+          sha8="${GITHUB_SHA:0:8}"
+          declare -a tag_list=("${image}:${sha8}")
+          if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            tag_list+=("${image}:latest")
+          fi
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            semver="${GITHUB_REF#refs/tags/v}"
+            tag_list+=("${image}:${semver}")
+          fi
+          {
+            echo "tags<<TAGSEOF"
+            printf '%s\n' "${tag_list[@]}"
+            echo "TAGSEOF"
+          } >> "$GITHUB_OUTPUT"
+          printf '[tags] %s\n' "${tag_list[@]}"
+
+      # provenance: false - attested separately below via
+      # actions/attest-build-provenance, keyed off the pushed digest.
+      - name: Build and push desktop image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: worker
+          file: worker/Dockerfile
+          build-args: |
+            NEKO_IMAGE=${{ needs.neko-base.outputs.overlay_ref }}
+          tags: ${{ steps.tags.outputs.tags }}
+          push: true
+          provenance: false
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign desktop image (keyless, OIDC)
+        run: |
+          image="${{ steps.pins.outputs.desktop_image }}"
+          digest="${{ steps.build.outputs.digest }}"
+          cosign sign --yes "${image}@${digest}"
+
+      - name: Attest provenance - desktop
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.pins.outputs.desktop_image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Job summary
+        env:
+          DESKTOP_TAGS: ${{ steps.tags.outputs.tags }}
+          BASE_BUILT: ${{ needs.neko-base.outputs.built }}
+          OVERLAY_REF: ${{ needs.neko-base.outputs.overlay_ref }}
+          OVERLAY_DIGEST: ${{ needs.neko-base.outputs.overlay_digest }}
+          DESKTOP_IMAGE: ${{ steps.pins.outputs.desktop_image }}
+          DESKTOP_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          tags_csv="$(printf '%s' "${DESKTOP_TAGS}" | paste -sd, -)"
+          {
+            echo "### Image digests"
+            echo
+            echo "| image | tag(s) | digest |"
+            echo "|---|---|---|"
+            if [[ "${BASE_BUILT}" == "true" ]]; then
+              echo "| \`${OVERLAY_REF}\` | (rebuilt this run) | \`${OVERLAY_DIGEST}\` |"
+            else
+              echo "| \`${OVERLAY_REF}\` | (unchanged - not rebuilt this run) | n/a |"
+            fi
+            echo "| \`${DESKTOP_IMAGE}\` | ${tags_csv} | \`${DESKTOP_DIGEST}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
