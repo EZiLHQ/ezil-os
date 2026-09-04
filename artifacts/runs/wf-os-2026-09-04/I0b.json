@@ -1,0 +1,9 @@
+{
+	"taskId": "I0b",
+	"runId": "wf-os-2026-09-04",
+	"status": "running",
+	"doneRung": "DESIGNED",
+	"evidence": "Pre-edit measurements on the I0b worktree at base 3c76d43, tree clean. EOL BEFORE: `git ls-files --eol | grep -c i/crlf` = 0 and `i/mixed` = 0; 36 of the tracked files are not `i/lf`, and every one of them is a detected binary or a `-text` marked asset (6 jpg, 11 png, 1 mp3, 1 ico, app/src/app/favicon.ico, shell/src/ezil-globals.js and 14 svg/js entries with no content bytes git calls text). RENORMALISE PROBE: `git add --renormalize -- '*.ts' '*.tsx' '*.json' '*.md'` stages an EMPTY diff (`git diff --cached --stat` prints nothing) over 321 tracked files (222 ts, 21 tsx, 43 json, 35 md), and `git ls-files --eol` for those four globs shows 0 entries that are not `i/lf w/lf` -- so the four new `eol=lf` rules renormalise nothing. `git ls-files app/public/os/` is exactly the three byte-compared build outputs (bundle.min.js, bundle.min.css, icons.js), none of which match the new globs, so T0's three `-text` lines cannot be reached by them. COMMAND PIN CAPTURED FROM BASE, not from the edited file: `git show 3c76d43:worker/src/telemetry.ts` -> JSON.stringify(containerTelemetryTailCommand('/var/log/ezil-telemetry.ndjson', 65536)) = \"printf 'ezil-telemetry-meta bytes=%s inode=%s\\\\n' \\\"$({ wc -c < '/var/log/ezil-telemetry.ndjson'; } 2>/dev/null || echo 0)\\\" \\\"$({ stat -c %i '/var/log/ezil-telemetry.ndjson'; } 2>/dev/null || echo 0)\\\"; { tail -c 65536 '/var/log/ezil-telemetry.ndjson'; } 2>/dev/null || true\". Baseline ./tools/test.sh worker running; image ezil-integrated:local IS present on this box (4.57 GB).",
+	"startedAt": "2026-09-04T13:45:00Z",
+	"updatedAt": "2026-09-04T13:55:00Z"
+}
