@@ -20,6 +20,18 @@ app/.next/
 app/next-env.d.ts
 app/tsconfig.tsbuildinfo
 
+# Test reports written INTO the checkout rather than into a temp directory.
+# `.github/workflows/ci.yml`'s worker job runs
+# `bun test --reporter=junit --reporter-outfile=worker-junit.xml` with
+# `working-directory: worker`, so the report lands at `worker/worker-junit.xml`
+# on all three runners. The path is relative on purpose (row M4): bun is a
+# native Windows binary and resolves `/tmp/x` against the current drive, while
+# the evidence step that greps the report runs under Git Bash's MSYS, which
+# maps `/tmp` into the user's temp directory — the two do not agree on `/tmp`,
+# and they do agree on a relative path. Relative means it is inside the working
+# tree, so it needs ignoring; `*.log` above does not cover an `.xml`.
+worker/worker-junit.xml
+
 # Env / secrets — never commit these
 .env
 .env.production

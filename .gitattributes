@@ -25,6 +25,73 @@
 *.bash  text eol=lf
 *.mjs   text eol=lf
 
+# ── Source and prose: LF, everywhere, always ────────────────────────────────
+# `* text=auto` already stores these with LF in the INDEX — measured: `git
+# ls-files --eol` reports 0 `i/crlf` and 0 `i/mixed` across the whole tree, and
+# all 321 tracked `.ts`/`.tsx`/`.json`/`.md` files are `i/lf w/lf`. What it does
+# NOT do is pin the WORKING TREE: under Git for Windows' default
+# `core.autocrlf=true`, `text=auto` checks every one of them out as CRLF. That
+# is not hypothetical — row M4 fixed two real Windows-only test failures caused
+# by exactly it (`worker/src/index.test.ts`, 8 assertions, and
+# `workspace-idle.test.ts`, 2), where a multi-line regex over a source file read
+# with `readFileSync` anchors on `\n` and finds nothing. Every such read is a
+# `.ts` file reading a `.ts`/`.json`/`.md` file, so pinning these four
+# extensions removes the whole class rather than patching each reader.
+#
+# Adding these rules renormalizes nothing: `git add --renormalize` over the four
+# globs stages an empty diff on the commit that introduces them, because the
+# index is already LF. They change what a Windows checkout WRITES, not what git
+# stores.
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+
+# ── The browser shell's own sources: LF, because a rebuild is byte-compared ──
+# 🔴 THIS BLOCK IS WHAT LETS `ci.yml`'s DRIFT GUARD RUN ON WINDOWS.
+#    `shell/build-shell.sh --check` rebuilds the bundle from these sources and
+#    `diff -r`s the result against the committed `app/public/os/`. The three
+#    committed outputs are `-text` below, so they are byte-identical on every
+#    checkout — but their SOURCES were not pinned, and `ci.yml` measured (at
+#    b4c0c98, `core.autocrlf=true`) that a Windows checkout of
+#    `shell/src/**/*.css`, `shell/src/icons/*.svg` and the non-`.mjs`
+#    `shell/ezil/**/*.js` comes out CRLF and rebuilds a `bundle.min.css` and
+#    `icons.js` that byte-differ from the LF-built committed copies. That is a
+#    FALSE failure of the guard, and it is why the "Committed bundle matches
+#    source" step carries `if: runner.os != 'Windows'` — with the hand-off to
+#    this file written into its own comment. Pinning the sources is that fix.
+#
+# Pinned by extension rather than by path, because the guard's inputs move: the
+# stylesheet list and the icon directory are read at build time, and a rule
+# that named today's directories would go quietly stale the first time one is
+# added. `*.html`, `*.yml` and `*.yaml` are here for the same reason `*.md` is
+# above — no build depends on them today, and the point of a pin is that the
+# next file added is right on the commit that adds it.
+#
+# Renormalizes nothing, measured before and after: no tracked file of any of
+# these types is `i/crlf` or `i/mixed`, and `git add --renormalize` over the
+# six globs stages an empty diff. Two classes are worth naming because they are
+# not `i/lf` today and stay unchanged anyway:
+#   * 15 `.svg` and 2 `.js` are `i/none` — single-line files with no line
+#     terminator at all. There is nothing to convert.
+#   * `shell/src/ezil-globals.js` is `i/-text`: git detects it as BINARY
+#     because it carries a DELIBERATE NUL byte at offset 1406 (line 26,
+#     `const NEVER = (name) => `\0ezil-no-fs:${name}``, an impossible path
+#     sentinel; esbuild escapes it, so the committed bundle has no NUL).
+#     `text eol=lf` overrides that detection. It is safe here and was checked
+#     rather than assumed: the file contains 0 CR bytes, so check-in converts
+#     nothing, `--renormalize` stages nothing, and `build-shell.sh --check`
+#     passes byte-for-byte after the change. What it DOES change is that git
+#     will now line-ending-convert a file it used to leave alone — which is
+#     the correct direction for a source file, and is stated here so the next
+#     person meets the NUL in a comment rather than in a diff.
+*.css   text eol=lf
+*.svg   text eol=lf
+*.js    text eol=lf
+*.html  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
 # ── PowerShell: CRLF ────────────────────────────────────────────────────────
 # The reverse case, and it is not symmetry for its own sake: Windows PowerShell
 # 5.1 mis-parses some LF-only scripts. There are no `.ps1` files tracked today;

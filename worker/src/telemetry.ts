@@ -346,8 +346,37 @@ export function containerTelemetryTailCommand(path: string, maxBytes: number): s
   );
 }
 
+/**
+ * The one metadata line, parsed leniently in EXACTLY one respect: either
+ * numeric field may be preceded by whitespace.
+ *
+ * 🔴 Why the leniency is on the READ side and not in the command.
+ * {@link containerTelemetryTailCommand} interpolates `wc -c` and `stat -c %i`
+ * output through `printf`'s `%s`. GNU `wc -c < file` prints the count bare;
+ * BSD/macOS `wc` RIGHT-ALIGNS it in a space-padded field, so the identical
+ * command that emits `... bytes=42 inode=77` inside the Ubuntu image emits
+ * `... bytes=       42 inode=77` against a BSD userland — and that padding sits
+ * INSIDE the line, where {@link parseContainerTelemetryTail}'s `head.trim()`
+ * cannot reach it. MEASURED (row M4) on Linux with a `wc` stub that delegates
+ * the count and reprints it via `printf '%8d'`: three of the thirteen tests in
+ * `./telemetry-container-tail.test.ts` went red, by the same names as the real
+ * macOS CI leg, because the meta line stopped matching this pattern entirely.
+ *
+ * Making the COMMAND portable (`wc -c ... | tr -d ' '`) would fix the same
+ * three, and is deliberately NOT done: that command is the hosted read path,
+ * it only ever runs inside the image, and its exact text is pinned by
+ * `./telemetry.test.ts` so a well-meant edit is caught rather than shipped.
+ * Tolerating the padding here costs one `\s*`, is not platform-specific, and
+ * cannot change what the container is asked to do.
+ *
+ * Everything else stays strict — the sentinel prefix, the field order, the
+ * `bytes=`/`inode=` names, and digits-only values. A field with no digits (an
+ * empty `wc` result, a word) does NOT match, and a non-match still degrades to
+ * "the whole stdout is the tail, no offset"; see
+ * {@link parseContainerTelemetryTail} for why that direction is the safe one.
+ */
 const CONTAINER_TELEMETRY_META_RE = new RegExp(
-  `^${CONTAINER_TELEMETRY_META_PREFIX} bytes=(\\d+) inode=(\\d+)\\s*$`,
+  `^${CONTAINER_TELEMETRY_META_PREFIX} bytes=\\s*(\\d+) inode=\\s*(\\d+)\\s*$`,
 );
 
 /**
@@ -355,12 +384,17 @@ const CONTAINER_TELEMETRY_META_RE = new RegExp(
  * and the NDJSON tail, and derive the tail's absolute start offset from the
  * reported file size.
  *
- * When the metadata line is absent or unparseable — an older container image,
- * a shell without `stat`, a `wc` that padded its output unexpectedly — the
- * WHOLE stdout is treated as the tail and no offset is reported. That degrade
- * is deliberate and is the safe direction: no offset means random event ids
- * means a re-read costs a duplicate row, whereas a WRONG offset would mean a
- * wrong identity, and a wrong identity is how a real event gets silently
+ * When the metadata line is absent or unparseable — an older container image
+ * that never printed one, or a `wc` that wrote something which is not a run of
+ * digits — the WHOLE stdout is treated as the tail and no offset is reported.
+ * (A space-padded count is NOT in that set any more: BSD `wc`'s right-aligned
+ * field parses, see {@link CONTAINER_TELEMETRY_META_RE}. A shell without `stat`
+ * is not in it either — the command's own `|| echo 0` keeps the line parseable
+ * and degrades only the inode to `0`.)
+ *
+ * That degrade is deliberate and is the safe direction: no offset means random
+ * event ids means a re-read costs a duplicate row, whereas a WRONG offset would
+ * mean a wrong identity, and a wrong identity is how a real event gets silently
  * swallowed by an unrelated one.
  */
 export function parseContainerTelemetryTail(stdout: string | null | undefined): ContainerTelemetryTail {

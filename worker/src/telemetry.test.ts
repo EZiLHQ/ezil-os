@@ -10,9 +10,12 @@ import {
   TELEMETRY_DRAIN_MAX_OBJECTS,
   TELEMETRY_SCHEMA_VERSION,
   TELEMETRY_SPOOL_PREFIX,
+  CONTAINER_TELEMETRY_META_PREFIX,
   buildTelemetryR2Key,
   clampDrainLimit,
+  containerTelemetryTailCommand,
   parseContainerTelemetryLines,
+  parseContainerTelemetryTail,
   parseTelemetryAckKeys,
   parseTelemetryDrainBody,
   selectTelemetryWorthy,
@@ -450,5 +453,125 @@ describe('telemetry: `code` is normalised to what the app ingest schema accepts'
       .join('\n');
     const events = parseContainerTelemetryLines(raw, { correlationId: 'c' });
     expect(events.map((e) => e.code)).toEqual(['ok', 'error', 'skipped']);
+  });
+});
+
+/**
+ * ── The container-tail read path: the command is FROZEN, the parser is not ──
+ *
+ * These two describes are a pair and only make sense together.
+ *
+ * `containerTelemetryTailCommand` is the hosted read path. It is built here and
+ * executed inside the Ubuntu image, by that image's GNU coreutils, on every
+ * `ensureDesktop`. Its text is therefore pinned byte for byte below, from a
+ * literal captured out of `git show <base>:worker/src/telemetry.ts` rather than
+ * re-derived from the function it guards — a pin written from the current
+ * output would only prove the command equals itself.
+ *
+ * The parser is where portability is allowed to live, because it runs in the
+ * Worker and costs the container nothing. BSD/macOS `wc -c` RIGHT-ALIGNS its
+ * count in a space-padded field where GNU prints it bare, so the SAME command
+ * emits `bytes=       42` against a BSD userland; row M4 measured that turning
+ * three of `./telemetry-container-tail.test.ts`'s thirteen tests red. The fix
+ * is `bytes=\s*(\d+)` in `CONTAINER_TELEMETRY_META_RE`, NOT `| tr -d ' '` in
+ * the command.
+ */
+describe('containerTelemetryTailCommand — the hosted read path, pinned byte for byte', () => {
+  /**
+   * 🔴 Captured from the BASE revision, not from the function under test:
+   *   git show 3c76d43:worker/src/telemetry.ts > /tmp/base.ts
+   *   bun -e "…; console.log(JSON.stringify(containerTelemetryTailCommand('/var/log/ezil-telemetry.ndjson', 65536)))"
+   * `String.raw` so the `\n` below is the two characters `printf` needs to see,
+   * exactly as they sit in the source's `'…inode=%s\\n'`. If this assertion
+   * fails, the command changed — that is the finding; do not "fix" it by
+   * re-capturing.
+   */
+  const PINNED = String.raw`printf 'ezil-telemetry-meta bytes=%s inode=%s\n' "$({ wc -c < '/var/log/ezil-telemetry.ndjson'; } 2>/dev/null || echo 0)" "$({ stat -c %i '/var/log/ezil-telemetry.ndjson'; } 2>/dev/null || echo 0)"; { tail -c 65536 '/var/log/ezil-telemetry.ndjson'; } 2>/dev/null || true`;
+
+  it('is byte-identical to the string the hosted path has always sent', () => {
+    expect(containerTelemetryTailCommand('/var/log/ezil-telemetry.ndjson', 65_536)).toBe(PINNED);
+  });
+
+  it('still asks the container for a BARE count — no `tr`, no `awk`, no pipe added to make it portable', () => {
+    // Stated as a constraint rather than as string equality, because THIS is
+    // the reason the pin above exists: making the command portable is the
+    // tempting wrong fix, and it changes what runs in production.
+    const cmd = containerTelemetryTailCommand('/var/log/ezil-telemetry.ndjson', 65_536);
+    expect(cmd).toContain(`wc -c < '/var/log/ezil-telemetry.ndjson'`);
+    expect(cmd).toContain(`stat -c %i '/var/log/ezil-telemetry.ndjson'`);
+    expect(cmd).not.toContain('tr -d');
+    expect(cmd).not.toContain('awk');
+    expect(cmd).not.toContain('sed');
+    // Positive control for the three negatives: the pipe-free command really is
+    // the one under test, and a portable variant WOULD trip them.
+    expect(`${cmd} | tr -d ' '`).toContain('tr -d');
+  });
+
+  it('interpolates the path and the byte budget, and floors the budget at 1', () => {
+    expect(containerTelemetryTailCommand('/x/y.ndjson', 4096)).toContain(`tail -c 4096 '/x/y.ndjson'`);
+    expect(containerTelemetryTailCommand('/x/y.ndjson', 0)).toContain('tail -c 1 ');
+    expect(containerTelemetryTailCommand('/x/y.ndjson', 1.9)).toContain('tail -c 1 ');
+  });
+});
+
+describe('parseContainerTelemetryTail — a BSD `wc`s space-padded count still parses', () => {
+  const meta = (bytes: string, inode: string) => `${CONTAINER_TELEMETRY_META_PREFIX} bytes=${bytes} inode=${inode}\n`;
+
+  it('parses `bytes=   1234` as 1234 — the whole file is behind us when the tail is empty', () => {
+    const out = parseContainerTelemetryTail(meta('   1234', '77'));
+    expect(out.raw).toBe('');
+    expect(out.startByteOffset).toBe(1234);
+    expect(out.inode).toBe('77');
+  });
+
+  it('parses the exact line BSD `wc` produces (`printf %8d`, seven spaces before 42)', () => {
+    // The literal M4 measured, character for character.
+    const out = parseContainerTelemetryTail(`${CONTAINER_TELEMETRY_META_PREFIX} bytes=       42 inode=0\n`);
+    expect(out.startByteOffset).toBe(42);
+    expect(out.inode).toBe('0');
+  });
+
+  it('subtracts the tail it actually got, padded count or not — 1234 - 8 = 1226', () => {
+    const padded = parseContainerTelemetryTail(`${meta('   1234', '77')}{"a":1}\n`);
+    expect(padded.raw).toBe('{"a":1}\n'); // 8 bytes
+    expect(padded.startByteOffset).toBe(1226);
+    // ...and the GNU form is unchanged by the leniency: same numbers, no padding.
+    const bare = parseContainerTelemetryTail(`${meta('1234', '77')}{"a":1}\n`);
+    expect(bare).toEqual(padded);
+  });
+
+  it('tolerates a padded inode too, and keeps it as the bare digits', () => {
+    const out = parseContainerTelemetryTail(meta('42', '     77'));
+    expect(out.startByteOffset).toBe(42);
+    expect(out.inode).toBe('77');
+  });
+
+  it('🔴 does NOT accept a field with no digits — an empty `wc` result still degrades', () => {
+    // The negative control for the leniency: `\s*` must not let `bytes=` swallow
+    // the space and then match nothing, and must not let it reach into `inode=`.
+    for (const line of [meta('', '0'), meta('   ', '0'), meta('abc', '0'), meta('4 2', '0'), meta('42', '')]) {
+      const out = parseContainerTelemetryTail(`${line}{"a":1}\n`);
+      expect(out.startByteOffset).toBeUndefined();
+      expect(out.inode).toBe('0');
+      // ...and the unparsed meta line stays in `raw`, which is what makes the
+      // degrade visible rather than silent.
+      expect(out.raw).toContain(CONTAINER_TELEMETRY_META_PREFIX);
+    }
+    // Positive control: the same shape WITH digits parses, so the loop above is
+    // not passing because every input degrades.
+    const ok = parseContainerTelemetryTail(`${meta('42', '0')}{"a":1}\n`);
+    expect(ok.startByteOffset).toBe(34);
+    expect(ok.raw).not.toContain(CONTAINER_TELEMETRY_META_PREFIX);
+  });
+
+  it('🔴 stays strict about the sentinel and the field names', () => {
+    for (const head of [
+      `ezil-telemetry-met bytes=   42 inode=0`,          // truncated sentinel
+      `x ${CONTAINER_TELEMETRY_META_PREFIX} bytes=42 inode=0`, // sentinel not at the start
+      `${CONTAINER_TELEMETRY_META_PREFIX} inode=0 bytes=42`,   // fields swapped
+      `${CONTAINER_TELEMETRY_META_PREFIX} size=42 inode=0`,    // renamed field
+    ]) {
+      expect(parseContainerTelemetryTail(`${head}\n{"a":1}\n`).startByteOffset).toBeUndefined();
+    }
   });
 });
