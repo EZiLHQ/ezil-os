@@ -143,3 +143,10 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   wire `container`/`local` to pull the GHCR image with the workflow's own token and retire the placeholder. The
   15 matrix display names for G4 are in T4's report and PR #14's check list. A1 dispatched (allowlist schema +
   invite CLI). Running: O4, T5, A1.
+- 2026-09-04 16:20Z — **O4 merged** (`docs/ORCHESTRATION.md`, 12/12 links, rungs byte-identical to `tools/waves.ts`).
+  **PR #14 first run:** `sdk + mcp` GREEN on ubuntu, windows AND macos; `app` green on ubuntu and macos; `tools`
+  green; DCO and CodeQL green; `container` and `local` red by design (row T8). `shell` red on all three OSes with the
+  same cause — the composite action used `${{ runner.temp }}` in a `with:` position, which a composite action may not
+  ("Unrecognized named-value: 'runner'"), so the action failed to load. Supervisor patch on `task/T4` (48bdec1):
+  paths and cache key computed once in bash from `$RUNNER_TEMP`/`$RUNNER_OS` and passed as step outputs. PR re-running.
+  X1 dispatched (local-agents research). Running: T5, A1, X1.
