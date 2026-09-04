@@ -58,19 +58,6 @@ concurrency:
   group: image-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  # 🔴 HAND-OFF (T3 -> T0): deploy/images.env's EZIL_NEKO_TAG pins the BARE
-  # base only. worker/Dockerfile needs the `-ezil-brandN` OVERLAY of that tag
-  # (T0's finding: the bare base lacks the mobile keyboard and the
-  # black-picture detector). Until deploy/images.env gains a key for that
-  # suffix — proposed: EZIL_NEKO_OVERLAY_TAG=d74052bb-049931d7-ezil-brand8 —
-  # this workflow pins the suffix here rather than inventing a second,
-  # undocumented source of truth. It MUST stay equal to worker/Dockerfile's
-  # own `ARG NEKO_IMAGE` suffix (that file's own 🔴 comment is the authority
-  # on when it changes); the "Load image pins" step below fails the build if
-  # the two ever disagree.
-  NEKO_OVERLAY_SUFFIX: ezil-brand8
-
 jobs:
   neko-base:
     name: neko-base (amd64)
@@ -102,16 +89,31 @@ jobs:
           set +a
           EZIL_NEKO_IMAGE="$(read_env_key EZIL_NEKO_IMAGE deploy/images.env)"
           EZIL_NEKO_TAG="$(read_env_key EZIL_NEKO_TAG deploy/images.env)"
+          EZIL_NEKO_OVERLAY_TAG="$(read_env_key EZIL_NEKO_OVERLAY_TAG deploy/images.env)"
           base_sha8="${NEKO_SHA:0:8}-${NEKO_APPS_SHA:0:8}"
           if [[ "${base_sha8}" != "${EZIL_NEKO_TAG}" ]]; then
             echo "::error::docker/neko/pins.env (${base_sha8}) and deploy/images.env's EZIL_NEKO_TAG (${EZIL_NEKO_TAG}) disagree - bump both together" >&2
             exit 1
           fi
+          if [[ -z "${EZIL_NEKO_OVERLAY_TAG}" ]]; then
+            echo "::error::deploy/images.env has no EZIL_NEKO_OVERLAY_TAG (must be '<EZIL_NEKO_TAG>-<ezil-brandN>')" >&2
+            exit 1
+          fi
+          # The overlay derives from the base: without this check, bumping
+          # EZIL_NEKO_TAG to a new SHA pair while leaving EZIL_NEKO_OVERLAY_TAG
+          # on the old one would still pass the Dockerfile-consistency check
+          # below (both sides would just be checking two independent strings
+          # against each other, not against the base tag they are supposed to
+          # extend) - see deploy/images.env's own PAIRING RULE comment.
+          if [[ "${EZIL_NEKO_OVERLAY_TAG}" != "${EZIL_NEKO_TAG}-"* ]]; then
+            echo "::error::deploy/images.env's EZIL_NEKO_OVERLAY_TAG (${EZIL_NEKO_OVERLAY_TAG}) is not '${EZIL_NEKO_TAG}-<suffix>' - the overlay derives from the base tag; bump both together" >&2
+            exit 1
+          fi
           base_ref="${EZIL_NEKO_IMAGE}:${EZIL_NEKO_TAG}"
-          overlay_ref="${EZIL_NEKO_IMAGE}:${EZIL_NEKO_TAG}-${NEKO_OVERLAY_SUFFIX}"
+          overlay_ref="${EZIL_NEKO_IMAGE}:${EZIL_NEKO_OVERLAY_TAG}"
           dockerfile_arg="$(grep -oP '^ARG NEKO_IMAGE=\K.*' worker/Dockerfile)"
           if [[ "${dockerfile_arg}" != "${overlay_ref}" ]]; then
-            echo "::error::worker/Dockerfile's ARG NEKO_IMAGE (${dockerfile_arg}) does not match the overlay ref this workflow computed (${overlay_ref}) - bump worker/Dockerfile and NEKO_OVERLAY_SUFFIX together" >&2
+            echo "::error::worker/Dockerfile's ARG NEKO_IMAGE (${dockerfile_arg}) does not match the overlay ref this workflow computed (${overlay_ref}) - bump worker/Dockerfile and deploy/images.env's EZIL_NEKO_OVERLAY_TAG together" >&2
             exit 1
           fi
           {
@@ -299,16 +301,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 🔴 HAND-OFF: this job PUBLISHES ghcr.io/ezilhq/ezil-os-desktop:<sha8>
-      # but never writes that tag back into deploy/images.env's
-      # EZIL_DESKTOP_TAG (still the file's own placeholder,
-      # `<to be pinned by CI>`, permissions here are `contents: read` on
-      # purpose). run-spec.ts's isDockerTag guard means that placeholder
-      # keeps failing closed to LOCAL_DESKTOP_IMAGE_FALLBACK forever until
-      # something updates it — no row in docs/TASKS.csv currently owns that
-      # write-back (a commit to main from a workflow, or a separate release
-      # step). Flagged, not fixed: deploy/images.env is not in this row's
-      # owns_files and this workflow has no write access to contents.
+      # This job PUBLISHES ghcr.io/ezilhq/ezil-os-desktop:<sha8> but never
+      # writes that tag back into deploy/images.env's EZIL_DESKTOP_TAG (still
+      # the file's own placeholder, `<to be pinned by CI>` — deliberately: a
+      # workflow commit to `main` needs `contents: write` and races the
+      # branch ruleset, so `permissions:` above stays `contents: read`).
+      # run-spec.ts's isDockerTag guard means that placeholder keeps failing
+      # closed to LOCAL_DESKTOP_IMAGE_FALLBACK until something updates it.
+      # What this job DOES do instead, below: the job summary and the
+      # `published-images.env` artifact ("Write published-images.env" /
+      # "Upload published-images.env" steps) both carry the exact
+      # `EZIL_DESKTOP_TAG=<sha8>` line a human (or row R2's release step)
+      # pastes into deploy/images.env to advance the pin — see that file's
+      # own hand-off comment for the exact command.
       - name: Compute tags
         id: tags
         run: |
@@ -359,6 +364,39 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
+      # 🔴 THE WRITE-BACK PATH FOR deploy/images.env's EZIL_DESKTOP_TAG.
+      # This job cannot commit (`contents: read`, see "Compute tags" above),
+      # so it hands the pin to whoever advances it as a ready-to-paste line
+      # instead: this file is downloadable from the run
+      # (`gh run download <run-id> -n published-images.env`) and its one
+      # `EZIL_DESKTOP_TAG=<sha8>` line replaces deploy/images.env's
+      # placeholder verbatim.
+      - name: Write published-images.env
+        id: published
+        env:
+          DESKTOP_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          sha8="${GITHUB_SHA:0:8}"
+          mkdir -p "${RUNNER_TEMP}/published-images"
+          out="${RUNNER_TEMP}/published-images/published-images.env"
+          {
+            echo "# Published by .github/workflows/image.yml, run ${GITHUB_RUN_ID}, commit ${GITHUB_SHA}."
+            echo "# Not written back automatically (this job runs with contents: read"
+            echo "# on purpose - see deploy/images.env's own hand-off comment on"
+            echo "# EZIL_DESKTOP_TAG). Paste the line below over that file's"
+            echo "# EZIL_DESKTOP_TAG and commit to advance the pin."
+            echo "# digest: ${DESKTOP_DIGEST}"
+            echo "EZIL_DESKTOP_TAG=${sha8}"
+          } > "${out}"
+          echo "path=${out}" >> "$GITHUB_OUTPUT"
+          cat "${out}"
+
+      - name: Upload published-images.env
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-images.env
+          path: ${{ steps.published.outputs.path }}
+
       - name: Job summary
         env:
           DESKTOP_TAGS: ${{ steps.tags.outputs.tags }}
@@ -369,6 +407,7 @@ jobs:
           DESKTOP_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           tags_csv="$(printf '%s' "${DESKTOP_TAGS}" | paste -sd, -)"
+          sha8="${GITHUB_SHA:0:8}"
           {
             echo "### Image digests"
             echo
@@ -380,4 +419,13 @@ jobs:
               echo "| \`${OVERLAY_REF}\` | (unchanged - not rebuilt this run) | n/a |"
             fi
             echo "| \`${DESKTOP_IMAGE}\` | ${tags_csv} | \`${DESKTOP_DIGEST}\` |"
+            echo
+            echo "### Advancing deploy/images.env's EZIL_DESKTOP_TAG pin"
+            echo
+            echo "Not written back automatically (this job has \`contents: read\`)."
+            echo "Download the \`published-images.env\` artifact from this run and"
+            echo "paste its \`EZIL_DESKTOP_TAG=${sha8}\` line over the placeholder:"
+            echo '```'
+            echo "gh run download ${GITHUB_RUN_ID} -R ${GITHUB_REPOSITORY} -n published-images.env"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
