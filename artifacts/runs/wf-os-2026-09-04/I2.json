@@ -1,0 +1,9 @@
+{
+  "taskId": "I2",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "COMMITTED",
+  "evidence": "orientation complete; bash shell/build-shell.sh --check confirmed OK before edits; writing docs/CONTRIBUTING-APPS.md and docs/examples/hello-app.js.md",
+  "startedAt": "2026-09-04T21:51:47Z",
+  "updatedAt": "2026-09-04T21:51:47Z"
+}
