@@ -82,3 +82,15 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
 - 2026-09-04 11:05Z — **CI green on `main` @ 89c9037** (worker, app, sdk+mcp, shell — all four jobs), CodeQL green.
   The run on the previous push (2bcf12f) shows `cancelled`: the workflow's per-ref concurrency group cancelled it
   when the next push arrived, which is the configured behaviour, not a failure.
+- 2026-09-04 11:40Z — **T2 merged — the desktop runs locally.** Supervisor re-ran the full `local/` suite including the
+  real boot: 124 pass / 0 fail. Measured on this box: cold boot 5.7 s to an authenticated neko login, warm reuse 75 ms,
+  restart 7.6 s, 591 MiB resident; UDP mux bound on 127.0.0.1; `/tmp/neko.log` shows `nat1to1=127.0.0.1` and zero
+  `checkip`/`amazonaws` lines. Seven mutations RED→GREEN, plus a container-level control: the same image with no
+  password env accepts `admin`/`neko` — so the 401s are this host's minting, not neko's. Brief clauses refuted with
+  measurement: neko has `/health` (body `true`), not `/api/health`; screen read/set are HTTP (`/api/room/screen`),
+  not exec; the credential rides in the desktop URL (`?usr=…&pwd=…`) exactly as the app composes it, never in a
+  response field; restart is stop+start because PID 1 is the launcher. Findings for later rows: host port 8443 is held
+  by `supabase-kong` on this machine → `hostPortOffset` (both sides of the mux move together, or the browser gets a
+  candidate pointing at nothing while every HTTP check stays green); neko advertises its compiled-in
+  `stun:stun.l.google.com:19302` and the env spelling to clear it does nothing (T5's doctor prints it as a caveat;
+  fixing it is an image change). T4 dispatched (CI matrix). Running: O3, T1, T4. Queued: T3, O4.
