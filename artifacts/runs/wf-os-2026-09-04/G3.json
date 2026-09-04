@@ -1,0 +1,10 @@
+{
+  "taskId": "G3",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "INDEPENDENT_TEST_PASS",
+  "evidence": "started; worktree task/G3 created at 8099059. Measurement phase complete: three bot idents observed in EZiLHQ/ezil-os -- dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com> (7 open PRs, DOES carry 'Signed-off-by: dependabot[bot] <support@github.com>' whose email mismatches the author), github-actions[bot] id 41898282 (gh api users/github-actions[bot]), copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com> (2 commits in history, ZERO Signed-off-by trailers). Workflow not yet written.",
+  "startedAt": "2026-09-04T08:04:11Z",
+  "updatedAt": "2026-09-04T08:04:11Z",
+  "by": "worker-opus"
+}
