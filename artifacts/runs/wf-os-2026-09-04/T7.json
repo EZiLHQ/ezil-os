@@ -1,0 +1,9 @@
+{
+  "taskId": "T7",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "STATIC_CHECKS_PASS",
+  "evidence": "starting; baseline `tools/test.sh local src/container/` (EZIL_SKIP_TYPECHECK=1) = 34 pass / 0 fail before any edit. Researching the three T3 hand-offs: overlay tag key in images.env, digest-pin the m1k1o base, write-back path for EZIL_DESKTOP_TAG.",
+  "startedAt": "2026-09-04T10:37:37Z",
+  "updatedAt": "2026-09-04T10:37:37Z"
+}
