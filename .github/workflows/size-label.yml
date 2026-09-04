@@ -1,0 +1,115 @@
+# Size label - applies exactly one size/XS..XL label to a pull request, sized
+# by additions + deletions, and removes the other four.
+#
+# -----------------------------------------------------------------------------
+# THE THRESHOLDS ARE tools/triage.ts's sizeBucket, BY NAME - A DRIFT IS A DEFECT
+# -----------------------------------------------------------------------------
+# `tools/triage.ts` computes the same size label for its own dry-run / --post
+# report (a maintainer's manual run). Both this workflow and that function
+# must bucket the same PR into the same label, or a PR shows one size in the
+# CLI report and a different size/* label on GitHub - a visible, confusing
+# disagreement, not a cosmetic one. The thresholds, copied here on purpose
+# rather than shared by import (a GitHub Actions script step cannot import
+# repo TypeScript without a checkout, which this workflow deliberately does
+# not do - see below):
+#
+#   XS <= 20, S <= 100, M <= 400, L <= 1000, XL > 1000, over additions + deletions.
+#
+# If you change one side, change the other in the same PR. `tools/triage.ts`'s
+# own `sizeBucket` function carries this exact comment for the same reason.
+#
+# -----------------------------------------------------------------------------
+# THIS IS NOT A REQUIRED CONTEXT
+# -----------------------------------------------------------------------------
+# It must never be added to the branch ruleset on `main` (ruleset 22265548,
+# `gh api repos/EZiLHQ/ezil-os/rulesets/22265548`) - a label is advisory, and
+# making this required would let a label API hiccup hang every PR's merge
+# button the way `dco.yml`'s header describes (TRAP 1). One job, no job-level
+# `if:`, so it always runs and always posts.
+#
+# -----------------------------------------------------------------------------
+# WHY pull_request_target, AND WHY THIS JOB NEVER CHECKS OUT THE HEAD REF
+# -----------------------------------------------------------------------------
+# On plain `pull_request`, a fork PR's token is read-only and cannot apply a
+# label. `pull_request_target` runs with the base repo's write-capable token
+# instead, which is exactly why this job never checks out the PR's own code
+# (see `labeler.yml`'s header for the same reasoning) - it only reads
+# `additions`/`deletions`/`labels` off the event payload itself and calls the
+# labels API. Nothing here executes anything from the fork.
+#
+# -----------------------------------------------------------------------------
+# LEAST PRIVILEGE
+# -----------------------------------------------------------------------------
+# `pull-requests: write` is the only scope this needs - it never reads
+# `contents` at all (no checkout), so that permission is omitted rather than
+# granted-and-unused.
+name: Size label
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+
+concurrency:
+  group: size-label-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  size-label:
+    name: size-label
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply the size/* label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Mirrors tools/triage.ts's sizeBucket exactly - see this file's
+            // own header for why a drift between the two is a defect.
+            function sizeBucket(changedLines) {
+              if (changedLines <= 20) return "XS";
+              if (changedLines <= 100) return "S";
+              if (changedLines <= 400) return "M";
+              if (changedLines <= 1000) return "L";
+              return "XL";
+            }
+
+            const SIZE_LABELS = ["size/XS", "size/S", "size/M", "size/L", "size/XL"];
+
+            const pr = context.payload.pull_request;
+            const changedLines = pr.additions + pr.deletions;
+            const want = `size/${sizeBucket(changedLines)}`;
+            const current = new Set(pr.labels.map((l) => l.name));
+
+            console.log(`PR #${pr.number}: +${pr.additions} -${pr.deletions} = ${changedLines} changed lines -> ${want}`);
+
+            if (!current.has(want)) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: [want],
+              });
+              console.log(`added ${want}`);
+            } else {
+              console.log(`${want} already present`);
+            }
+
+            for (const size of SIZE_LABELS) {
+              if (size === want) continue;
+              if (!current.has(size)) continue;
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  name: size,
+                });
+                console.log(`removed ${size}`);
+              } catch (err) {
+                // 404 means another run already removed it - not a failure.
+                if (err.status !== 404) throw err;
+                console.log(`${size} already gone`);
+              }
+            }
