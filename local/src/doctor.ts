@@ -176,11 +176,16 @@ export async function runDoctor(deps: DoctorDeps): Promise<DoctorReport> {
         // ask about. This fires before the daemon check matters, and it names
         // both fixes — the override for a developer, the write-back rule for
         // whoever broke the pin.
+        const why = image.reason ?? 'no reason recorded';
         add(
             'desktop image',
             'FAIL',
-            `no desktop image could be resolved (${image.reason ?? 'no reason recorded'}).`
-            + ` Nothing will start until this is fixed: ${overrideFix}`,
+            `no desktop image could be resolved — nothing will start until this is fixed. ${why}`
+            // The resolver's own reasons already end by naming the override;
+            // appending it again would say the same sentence twice. A reason
+            // that does NOT name it still gets the fix, so this branch can
+            // never leave a user without one.
+            + (why.includes(DESKTOP_IMAGE_OVERRIDE_ENV) ? '' : `. ${overrideFix}`),
         );
     } else if (!daemonUp) {
         add('desktop image', 'FAIL', `cannot look for ${imageWhy} — the daemon is not answering (see above)`);

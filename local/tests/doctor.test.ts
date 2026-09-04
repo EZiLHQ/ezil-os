@@ -197,6 +197,15 @@ describe('the desktop image', () => {
         const detail = find(report.checks, 'desktop image').detail;
         expect(detail).toContain('images_env_bad_tag');
         expect(detail).toContain('EZIL_LAUNCHER_IMAGE=<image:tag>');
+        // The fix is named ONCE, not twice: this reason already carries it, so
+        // the doctor must not append its own copy.
+        expect(detail.split('EZIL_LAUNCHER_IMAGE=<image:tag>').length - 1).toBe(1);
+        // Positive control for that de-duplication — a reason that does NOT
+        // name the override still gets the fix appended.
+        const bare = await runDoctor(healthyDeps({
+            config: fakeConfig({ desktopImage: { ref: '', source: 'unresolved', reason: 'images_env_incomplete' } }),
+        }));
+        expect(find(bare.checks, 'desktop image').detail).toContain('EZIL_LAUNCHER_IMAGE=<image:tag>');
         // Nothing was inspected: `docker image inspect ''` is never issued.
         expect(inspected.some((argv) => argv.includes('inspect'))).toBe(false);
         // Positive control: the healthy fixture DOES inspect.
