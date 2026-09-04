@@ -209,3 +209,14 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   `emit_telemetry`/`phase_end`, the NDJSON tail) for real; they are Linux tests of a Linux container and have never
   passed on a Mac. Supervisor patch on `task/T4`: the worker job's unit-test steps run on the Linux leg only
   (typecheck on every OS); row M3 added so those suites self-skip elsewhere with a printed reason. Ninth run.
+- 2026-09-04 21:50Z — **T5 merged — local mode seen working in a real browser.** Supervisor re-ran the smoke: 6/6;
+  frame statistic `stdDev 58.8, 29/32 buckets` (threshold 8/3); the shell revealed the desktop full-bleed after the
+  display gate; neko `/api/room/control` `has_host false → true`; `xdotool` shows the X pointer moving to within 2 px
+  of the click; cold boot 5.7–9.1 s, first pixels 2.2–5.4 s after the window opened. Doctor: 12 pass / 2 warn / 0
+  fail at offset 10000 (8443 is busy here; at offset 0 it fails and names the fix). Two integration defects only the
+  browser run could find, both fixed with tests: the SSRF origin pin was offset-blind (`desktop_frame_foreign_origin`
+  over a healthy container — 210 green tests at offset 0 against a fake host never saw it), and `resolveHost` threw on
+  the only path `bun run start` uses. Brief clause refuted with measurement: the image's `start-neko.sh:3122` already
+  passes `--session.implicit_hosting=true` and a flag outranks env, so the variable is a fallback, not the fix. 307
+  pass / 0 fail on `local/`. Blind spots stated by the worker: nothing proves an application reacted to the keystrokes;
+  one viewport, one browser; audio untouched. T6 dispatched (release.yml + launchers). Running: A2, T7, T6.
