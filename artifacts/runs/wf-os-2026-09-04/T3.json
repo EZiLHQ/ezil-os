@@ -1,0 +1,9 @@
+{
+  "taskId": "T3",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "STATIC_CHECKS_PASS",
+  "evidence": "in progress: docker/neko/pins.env + build.sh ported and bash -n clean, --dry-run/--help verified, --bogus arg rejected; worker/Dockerfile ARG NEKO_IMAGE switched to GHCR overlay ref + EXPOSE 8443 added (2 lines changed, +11/-1 total diff); image.yml not yet written",
+  "startedAt": "2026-09-04T08:50:00Z",
+  "updatedAt": "2026-09-04T09:03:14Z"
+}
