@@ -1,6 +1,6 @@
 # The confidence map — what round ANYWHERE proved, who proved it, and to which rung
 
-**INTERIM. Measured 2026-09-04, 12:30–13:40Z, by the `O5` verifier, from worktree
+**INTERIM. Measured 2026-09-04, 12:30–14:20Z, by the `O5` verifier, from worktree
 `.claude/worktrees/O5` on branch `task/O5`. The worktree was cut at
 `4b05869` and rebased onto `3c76d43` mid-pass, because `main` moved eight PRs
 while the pass ran; the rows that changed were re-measured at `3c76d43` and every
@@ -237,7 +237,11 @@ AssertionError: expected { display: 'unknown', …(1) } to deeply equal { displa
 Test Files  1 failed | 43 passed (44)      Tests  1 failed | 816 passed (817)
 ```
 The same file passed here (`29 tests, 5069 ms`) and passed on `main`'s green run
-minutes earlier. This is the **exact test class** the round already skipped on
+minutes earlier — and **passed again on the very next run of this same pull
+request**, whose only intervening change was three edits to this Markdown file.
+The application code was byte-identical across the red run and the green one, so
+the red was a flake and not a regression; that is the point. This is the **exact
+test class** the round already skipped on
 Windows at 19:10Z for being wall-clock sensitive — and the class the second
 `win32` skip (`d9d70f4`, merged today) was added for. It is now demonstrably
 flaky on a Linux runner as well, which means the merge gate can refuse a
