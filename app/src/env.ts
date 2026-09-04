@@ -39,6 +39,29 @@ const serverSchema = z.object({
      * closed), never "reachable by every signed-in user".
      */
     TELEMETRY_ADMIN_EMAILS: z.string().optional(),
+    /**
+     * Who may use EZiL OS at all (`@/server/api/os-access.ts`).
+     *
+     *   - `invite` — an account reaches the product only if
+     *     `ezil_os_access` holds a row for its email with `revoked_at is
+     *     null`. Invites are issued with `bun tools/invite.ts add <email>`.
+     *   - `open`   — anyone who can sign in is in. This is a deliberate,
+     *     explicit act: someone has to type the word.
+     *
+     * 🔴 `.default('invite')` — NOT `.optional()`, and the default is the
+     * CLOSED value, so an environment that never heard of this variable is
+     * invite-only rather than open. Same shape of decision as `CRON_SECRET`
+     * and `TELEMETRY_ADMIN_EMAILS` above: the state a forgotten deploy lands
+     * in must be the safe one. There is no "if unconfigured, allow" branch
+     * anywhere downstream, and the fallback in the `env` export below repeats
+     * `'invite'` for the same reason — a `undefined` there would quietly
+     * reopen the gate on the client half of the object.
+     *
+     * A value other than these two is a boot failure, not a silent fallback:
+     * `EZIL_OS_ACCESS_MODE=opne` must not read as "not open, so invite" by
+     * accident — it must be noticed.
+     */
+    EZIL_OS_ACCESS_MODE: z.enum(['invite', 'open']).default('invite'),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
 });
 
@@ -60,6 +83,7 @@ const parsedServer = isServer
           CLOUDFLARE_GUACAMOLE_HMAC_SECRET: process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET,
           CRON_SECRET: process.env.CRON_SECRET,
           TELEMETRY_ADMIN_EMAILS: process.env.TELEMETRY_ADMIN_EMAILS,
+          EZIL_OS_ACCESS_MODE: process.env.EZIL_OS_ACCESS_MODE,
           NODE_ENV: process.env.NODE_ENV,
       })
     : null;
@@ -92,6 +116,12 @@ export const env = {
         CLOUDFLARE_GUACAMOLE_HMAC_SECRET: undefined,
         CRON_SECRET: undefined,
         TELEMETRY_ADMIN_EMAILS: undefined,
+        // 🔴 `'invite'`, never `undefined`. This branch is the CLIENT half of
+        // the object (`isServer` is false), and a downstream `?? 'open'` or a
+        // truthiness test on an undefined mode is exactly how a fail-closed
+        // default turns into an open door. The server-only schema's
+        // `.default('invite')` and this literal must always agree.
+        EZIL_OS_ACCESS_MODE: 'invite' as const,
         NODE_ENV: process.env.NODE_ENV ?? 'development',
     }),
     ...parsedClient.data,
