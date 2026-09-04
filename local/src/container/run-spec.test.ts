@@ -23,6 +23,7 @@ import {
     CONTAINER_WORKSPACE_PATH,
     FOCUS_APPS,
     GUACAMOLE_HTTP_PORT,
+    DESKTOP_IMAGE_OVERRIDE_ENV,
     IMAGES_ENV_RELATIVE_PATH,
     LOCAL_BIND_ADDRESS,
     LOCAL_DESKTOP_IMAGE_FALLBACK,
@@ -44,9 +45,11 @@ import {
     formatLocalNekoScreen,
     isDockerTag,
     isEnvName,
+    isResolved,
     localUrlFor,
     parseImagesEnv,
     publishedPort,
+    readAndResolveDesktopImage,
     resolveDesktopImage,
     type DockerRunSpec,
     NEKO_IMPLICIT_HOSTING_ENV,
@@ -359,26 +362,38 @@ describe('deploy/images.env', () => {
         expect(ENTRIES['EZIL_NEKO_TAG']).not.toBe('latest');
     });
 
-    // Stated as an INVARIANT, so it stays true after row T3 pins a real tag:
-    // a usable tag resolves from the file, an unusable one resolves to the
-    // fallback and says why. Today the file carries the placeholder, so this
-    // exercises the fallback branch against real shipped content.
-    it('resolves to a runnable reference either way, and never composes a placeholder', () => {
-        const resolved = resolveDesktopImage(ENTRIES);
+    // 🔴 EVERY CALL BELOW PASSES AN EXPLICIT `env`, NEVER THE DEFAULT.
+    // `resolveDesktopImage(entries, env = process.env)` honours
+    // `EZIL_LAUNCHER_IMAGE` FIRST, and this suite is routinely run on a box
+    // where that variable is exported (it is how a developer who cannot pull
+    // the private GHCR package runs the container suites at all). A test that
+    // let the default through would assert about the developer's shell instead
+    // of about the shipped file, and would flip colour with no code change.
+    const NO_ENV: Record<string, string | undefined> = {};
+
+    // 🔴 THE ASSERTION THE PLACEHOLDER ERA COULD NOT MAKE. Until row I0c this
+    // file shipped `EZIL_DESKTOP_TAG=<to be pinned by CI>` and the resolver
+    // quietly substituted `LOCAL_DESKTOP_IMAGE_FALLBACK`, so "local mode
+    // starts" proved nothing about the pin. The pin is now real and this is
+    // unconditional: the shipped file resolves, from the file, to the pinned
+    // reference — no fallback branch exists to hide behind.
+    it('the shipped pin resolves to the pinned reference, from the file, with no reason', () => {
         const tag = ENTRIES['EZIL_DESKTOP_TAG'] ?? '';
-        if (isDockerTag(tag)) {
-            expect(resolved.source).toBe('images.env');
-            expect(resolved.ref).toBe(`${ENTRIES['EZIL_DESKTOP_IMAGE']}:${tag}`);
-        } else {
-            expect(resolved.source).toBe('fallback');
-            expect(resolved.reason).toMatch(/images_env_bad_tag/);
-            expect(resolved.ref).toBe(LOCAL_DESKTOP_IMAGE_FALLBACK);
-        }
-        // Whichever branch ran, the result is a syntactically valid reference —
-        // this is the assertion that would have caught `<to be pinned by CI>`.
+        expect(isDockerTag(tag)).toBe(true);
+        const resolved = resolveDesktopImage(ENTRIES, NO_ENV);
+        expect(resolved.source).toBe('images.env');
+        expect(resolved.reason).toBeUndefined();
+        expect(resolved.ref).toBe(`${ENTRIES['EZIL_DESKTOP_IMAGE']}:${tag}`);
+        expect(isResolved(resolved)).toBe(true);
+        // A syntactically valid reference, whatever the values are — this is
+        // the assertion that would have caught `<to be pinned by CI>`.
         expect(resolved.ref).toMatch(/^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9_][A-Za-z0-9._-]*$/);
         expect(resolved.ref).not.toContain(' ');
         expect(resolved.ref).not.toContain('<');
+    });
+
+    it('the tag is a git sha8 or a semver, never a floating name', () => {
+        expect(ENTRIES['EZIL_DESKTOP_TAG']).toMatch(/^([0-9a-f]{8}|\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?)$/);
     });
 
     it('the shipped placeholder is rejected by the tag grammar (positive control: a real tag is not)', () => {
@@ -390,14 +405,111 @@ describe('deploy/images.env', () => {
         expect(isDockerTag('0.3.1')).toBe(true);
     });
 
-    it('falls back with a named reason for every unusable shape', () => {
-        expect(resolveDesktopImage({}).reason).toMatch(/images_env_incomplete/);
-        expect(resolveDesktopImage({ EZIL_DESKTOP_IMAGE: 'ghcr.io/x/y' }).reason).toMatch(/images_env_incomplete/);
-        expect(resolveDesktopImage({ EZIL_DESKTOP_IMAGE: 'BAD NAME', EZIL_DESKTOP_TAG: 'v1' }).reason)
+    // 🔴 THE MUTATION THIS SUITE EXISTS FOR. Restore the placeholder into the
+    // real file and `the shipped pin resolves…` above goes red; this case is
+    // the same fact stated on synthetic entries, so the reason is checkable
+    // without editing anything.
+    it('an unusable pin is UNRESOLVED with a named reason — it never becomes a literal', () => {
+        const placeholder = resolveDesktopImage(
+            { EZIL_DESKTOP_IMAGE: 'ghcr.io/ezilhq/ezil-os-desktop', EZIL_DESKTOP_TAG: '<to be pinned by CI>' },
+            NO_ENV,
+        );
+        expect(placeholder.source).toBe('unresolved');
+        expect(placeholder.reason).toMatch(/images_env_bad_tag/);
+        expect(placeholder.ref).toBe('');
+        expect(isResolved(placeholder)).toBe(false);
+        // The literal is NOT what an unusable pin resolves to any more. This is
+        // the regression guard for the defect row I0c removed.
+        expect(placeholder.ref).not.toBe(LOCAL_DESKTOP_IMAGE_FALLBACK);
+        // And the reason names the way out, or a user reading it is stuck.
+        expect(placeholder.reason).toContain(DESKTOP_IMAGE_OVERRIDE_ENV);
+    });
+
+    it('every unusable shape is unresolved, with its own named reason', () => {
+        expect(resolveDesktopImage({}, NO_ENV).reason).toMatch(/images_env_incomplete/);
+        expect(resolveDesktopImage({ EZIL_DESKTOP_IMAGE: 'ghcr.io/x/y' }, NO_ENV).reason).toMatch(/images_env_incomplete/);
+        expect(resolveDesktopImage({ EZIL_DESKTOP_IMAGE: 'BAD NAME', EZIL_DESKTOP_TAG: 'v1' }, NO_ENV).reason)
             .toMatch(/images_env_bad_image_name/);
+        const unusable: Record<string, string>[] = [
+            {},
+            { EZIL_DESKTOP_IMAGE: 'ghcr.io/x/y' },
+            { EZIL_DESKTOP_IMAGE: 'BAD NAME', EZIL_DESKTOP_TAG: 'v1' },
+        ];
+        for (const entries of unusable) {
+            expect(resolveDesktopImage(entries, NO_ENV).source).toBe('unresolved');
+            expect(resolveDesktopImage(entries, NO_ENV).ref).toBe('');
+        }
         // Positive control: a good pair resolves from the file with no reason.
-        const ok = resolveDesktopImage({ EZIL_DESKTOP_IMAGE: 'ghcr.io/ezilhq/ezil-os-desktop', EZIL_DESKTOP_TAG: 'abc12345' });
+        const ok = resolveDesktopImage(
+            { EZIL_DESKTOP_IMAGE: 'ghcr.io/ezilhq/ezil-os-desktop', EZIL_DESKTOP_TAG: 'abc12345' },
+            NO_ENV,
+        );
         expect(ok).toEqual({ ref: 'ghcr.io/ezilhq/ezil-os-desktop:abc12345', source: 'images.env' });
+    });
+
+    // ── The override ─────────────────────────────────────────────────────────
+    //
+    // 🔴 ONE VARIABLE, ONE MEANING. `DESKTOP_IMAGE_OVERRIDE_ENV` is
+    // `EZIL_LAUNCHER_IMAGE` — the name `deploy/launcher/ezil-os.sh:85` already
+    // reads to choose which image it PULLS. Before row I0c the launcher pulled
+    // the override and then started a host that resolved `deploy/images.env`
+    // instead, so the two halves ran different images. Pinning the NAME here is
+    // what keeps that true; a rename in run-spec.ts alone turns this red.
+    it('the override variable is the launcher\'s own, spelled exactly once', () => {
+        expect(DESKTOP_IMAGE_OVERRIDE_ENV).toBe('EZIL_LAUNCHER_IMAGE');
+        const launcher = readFileSync(join(REPO_ROOT, 'deploy', 'launcher', 'ezil-os.sh'), 'utf8');
+        expect(launcher).toContain(DESKTOP_IMAGE_OVERRIDE_ENV);
+        // Negative control on the name that would have collided:
+        // `EZIL_DESKTOP_IMAGE` is a KEY in deploy/images.env meaning a BARE
+        // registry path. Using it as the override too would mean one name with
+        // two shapes — exactly the EZIL_NEKO_IMAGE collision row M1 logged.
+        expect(DESKTOP_IMAGE_OVERRIDE_ENV).not.toBe('EZIL_DESKTOP_IMAGE');
+    });
+
+    it('the override WINS over a perfectly good pin', () => {
+        const resolved = resolveDesktopImage(ENTRIES, { [DESKTOP_IMAGE_OVERRIDE_ENV]: 'ezil-os-worker-sandbox:ff199202' });
+        expect(resolved.source).toBe('override');
+        expect(resolved.ref).toBe('ezil-os-worker-sandbox:ff199202');
+        expect(resolved.reason).toBeUndefined();
+        // Positive control: the SAME entries with no override resolve from the
+        // file — so this test is about the override, not about the entries.
+        expect(resolveDesktopImage(ENTRIES, NO_ENV).source).toBe('images.env');
+    });
+
+    it('the override rescues an unusable pin, and an empty override does not fire', () => {
+        const broken = { EZIL_DESKTOP_IMAGE: 'ghcr.io/ezilhq/ezil-os-desktop', EZIL_DESKTOP_TAG: '<to be pinned by CI>' };
+        expect(resolveDesktopImage(broken, { [DESKTOP_IMAGE_OVERRIDE_ENV]: 'my-desktop:local' }))
+            .toEqual({ ref: 'my-desktop:local', source: 'override' });
+        // Unset, empty and whitespace-only are all "no override" — an exported
+        // but empty variable must not resolve to `''` and then be run.
+        for (const value of [undefined, '', '   ']) {
+            expect(resolveDesktopImage(broken, { [DESKTOP_IMAGE_OVERRIDE_ENV]: value }).source).toBe('unresolved');
+        }
+    });
+
+    it('an override that is not <name>:<tag> is refused by name, not waved through', () => {
+        for (const bad of ['ghcr.io/ezilhq/ezil-os-desktop', 'no-tag', 'name:<to be pinned by CI>', 'BAD NAME:v1', 'name:']) {
+            const resolved = resolveDesktopImage(ENTRIES, { [DESKTOP_IMAGE_OVERRIDE_ENV]: bad });
+            expect(resolved.source).toBe('unresolved');
+            expect(resolved.reason).toMatch(/override_invalid/);
+            expect(resolved.ref).toBe('');
+        }
+        // Positive controls: the shapes a developer actually types.
+        for (const good of ['ezil-os-worker-sandbox:ff199202', 'ghcr.io/ezilhq/ezil-os-desktop:3c76d43b', 'localhost:5000/x:v1.2.3']) {
+            expect(resolveDesktopImage(ENTRIES, { [DESKTOP_IMAGE_OVERRIDE_ENV]: good }).source).toBe('override');
+        }
+    });
+
+    it('an unreadable images.env is unresolved, unless the override supplies one', async () => {
+        const missing = join(REPO_ROOT, 'deploy', 'no-such-images.env');
+        const without = await readAndResolveDesktopImage(missing, NO_ENV);
+        expect(without.source).toBe('unresolved');
+        expect(without.reason).toMatch(/images_env_unreadable/);
+        expect(without.reason).toContain(DESKTOP_IMAGE_OVERRIDE_ENV);
+        const withOverride = await readAndResolveDesktopImage(missing, { [DESKTOP_IMAGE_OVERRIDE_ENV]: 'my-desktop:local' });
+        expect(withOverride).toEqual({ ref: 'my-desktop:local', source: 'override' });
+        // Positive control: the REAL file at the same path prefix does resolve.
+        expect((await readAndResolveDesktopImage(IMAGES_ENV_PATH, NO_ENV)).source).toBe('images.env');
     });
 
     it('the parser drops comments and blanks and keeps values containing "="', () => {

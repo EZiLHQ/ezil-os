@@ -1,0 +1,9 @@
+{
+  "taskId": "I0c",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "STARTED",
+  "evidence": "worktree created at base 3c76d43; newest successful image.yml run on main = 33876458193 (headSha 3c76d43bf..., conclusion success); its published-images.env artifact downloaded (458 B) and reads EZIL_DESKTOP_TAG=3c76d43b, digest sha256:0b90b66d13bb2f1e84a7d254878bd390e1e45f181bb19000a4451f06692e683f; the run log confirms `pushing manifest for ghcr.io/ezilhq/ezil-os-desktop:3c76d43b@sha256:0b90b66d...` so the tag really exists in GHCR. Override image ezil-os-worker-sandbox:ff199202 confirmed present locally (sha256:14ae1a93998f...). No edits yet.",
+  "startedAt": "2026-09-04T00:00:00Z",
+  "updatedAt": "2026-09-04T00:00:00Z"
+}

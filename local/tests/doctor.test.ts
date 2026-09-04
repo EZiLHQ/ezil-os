@@ -48,7 +48,11 @@ function fakeConfig(overrides: Partial<LocalConfig> = {}): LocalConfig {
         telemetryPath: '/x/state/telemetry.ndjson',
         shellAssetsDir: '/x/app/public/os',
         shellAssetsSearched: ['/x/app/public/os'],
-        desktopImage: { ref: 'ezil-os-worker-sandbox:ff199202', source: 'fallback', reason: 'images_env_bad_tag' },
+        // The default fixture is a HEALTHY resolution. Before row I0c it was
+        // `source: 'fallback'` — a state the resolver can no longer produce:
+        // an unusable pin is now `'unresolved'` with an empty `ref`, and the
+        // two cases below drive that branch on purpose.
+        desktopImage: { ref: 'ezil-os-worker-sandbox:ff199202', source: 'override' },
         mcpEndpoint: null,
         appUrl: null,
         hostPortOffset: 0,
@@ -157,14 +161,75 @@ describe('the docker daemon', () => {
 });
 
 describe('the desktop image', () => {
-    it('FAILS with the build command when the image is absent', async () => {
+    it('FAILS with the build command AND the override when the image is absent', async () => {
         const report = await runDoctor(healthyDeps({
             spawn: async (argv) => (argv[0] === 'version'
                 ? OK
                 : { exitCode: 1, stdout: '', stderr: 'Error: No such image', timedOut: false }),
         }));
         expect(statusOf(report.checks, 'desktop image')).toBe('desktop image: FAIL');
-        expect(find(report.checks, 'desktop image').detail).toContain('docker build -t ezil-os-worker-sandbox:ff199202');
+        const detail = find(report.checks, 'desktop image').detail;
+        expect(detail).toContain('docker build -t ezil-os-worker-sandbox:ff199202');
+        // 🔴 THE FIX A DEVELOPER ON THIS BOX CAN ACTUALLY ACT ON. The pinned
+        // reference lives in a PRIVATE GHCR package, so "pull it" is not advice
+        // that works for everyone; the override is.
+        expect(detail).toContain('EZIL_LAUNCHER_IMAGE=<image:tag>');
+    });
+
+    // 🔴 THE PIN'S OWN FAILURE, WHICH IS DIFFERENT FROM THE IMAGE BEING ABSENT.
+    // Row I0c's headline: an unusable pin used to be replaced by a literal and
+    // this line read PASS. It now FAILS before the daemon is asked anything —
+    // there is no reference to ask about — and names both ways out.
+    it('FAILS on an UNRESOLVED image without inspecting anything, naming the override', async () => {
+        const inspected: string[][] = [];
+        const report = await runDoctor(healthyDeps({
+            config: fakeConfig({
+                desktopImage: {
+                    ref: '',
+                    source: 'unresolved',
+                    reason: "images_env_bad_tag: '<to be pinned by CI>' is not [A-Za-z0-9_][A-Za-z0-9._-]{0,127}"
+                        + ' — set EZIL_LAUNCHER_IMAGE=<image:tag> to run an image you already have',
+                },
+            }),
+            spawn: async (argv) => { inspected.push([...argv]); return argv[0] === 'version' ? OK : IMAGE_OK; },
+        }));
+        expect(statusOf(report.checks, 'desktop image')).toBe('desktop image: FAIL');
+        const detail = find(report.checks, 'desktop image').detail;
+        expect(detail).toContain('images_env_bad_tag');
+        expect(detail).toContain('EZIL_LAUNCHER_IMAGE=<image:tag>');
+        // The fix is named ONCE, not twice: this reason already carries it, so
+        // the doctor must not append its own copy.
+        expect(detail.split('EZIL_LAUNCHER_IMAGE=<image:tag>').length - 1).toBe(1);
+        // Positive control for that de-duplication — a reason that does NOT
+        // name the override still gets the fix appended.
+        const bare = await runDoctor(healthyDeps({
+            config: fakeConfig({ desktopImage: { ref: '', source: 'unresolved', reason: 'images_env_incomplete' } }),
+        }));
+        expect(find(bare.checks, 'desktop image').detail).toContain('EZIL_LAUNCHER_IMAGE=<image:tag>');
+        // Nothing was inspected: `docker image inspect ''` is never issued.
+        expect(inspected.some((argv) => argv.includes('inspect'))).toBe(false);
+        // Positive control: the healthy fixture DOES inspect.
+        const ok: string[][] = [];
+        await runDoctor(healthyDeps({
+            spawn: async (argv) => { ok.push([...argv]); return argv[0] === 'version' ? OK : IMAGE_OK; },
+        }));
+        expect(ok.some((argv) => argv.includes('inspect'))).toBe(true);
+    });
+
+    it('names WHERE the reference came from — images.env or the override', async () => {
+        const pinned = await runDoctor(healthyDeps({
+            config: fakeConfig({ desktopImage: { ref: 'ghcr.io/ezilhq/ezil-os-desktop:3c76d43b', source: 'images.env' } }),
+        }));
+        const pinnedDetail = find(pinned.checks, 'desktop image').detail;
+        expect(pinnedDetail).toContain('source: deploy/images.env');
+        expect(pinnedDetail).not.toContain('EZIL_LAUNCHER_IMAGE (environment override');
+
+        const overridden = await runDoctor(healthyDeps({
+            config: fakeConfig({ desktopImage: { ref: 'ezil-os-worker-sandbox:ff199202', source: 'override' } }),
+        }));
+        const overriddenDetail = find(overridden.checks, 'desktop image').detail;
+        expect(overriddenDetail).toContain('source: EZIL_LAUNCHER_IMAGE (environment override');
+        expect(overriddenDetail).toContain("deploy/images.env's pin is NOT in use");
     });
 
     it('asks about the reference the CONFIG resolved, not a constant', async () => {

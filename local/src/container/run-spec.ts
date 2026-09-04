@@ -340,17 +340,53 @@ export function assertUsableScreen(screen: ScreenMode): void {
 // ── The image reference ──────────────────────────────────────────────────────
 
 /**
- * The image local mode falls back to when `deploy/images.env` carries no
- * usable pin.
+ * The image `DockerHost` runs when its constructor is handed no `image` at
+ * all — its own default, and NOT a fallback for an unusable pin.
  *
- * This is what `docker build -t … worker/` produces on a developer machine
- * today, and it is a REAL, RUNNABLE reference — unlike
- * `ghcr.io/ezilhq/ezil-os-desktop:<to be pinned by CI>`, which is what
- * `deploy/images.env` currently holds because nothing has been pushed to GHCR
- * yet. Row T3 pins the published tag; until then a fallback that exists beats
- * a reference that composes cleanly and then 404s at `docker run`.
+ * 🔴 IT USED TO BE BOTH, AND THAT WAS THE DEFECT ROW I0c REMOVED.
+ * `resolveDesktopImage` used to substitute this literal whenever
+ * `deploy/images.env` carried a tag it could not use — which it did, because
+ * the file shipped `EZIL_DESKTOP_TAG=<to be pinned by CI>`. Local mode
+ * therefore started, every doctor line was green, and nothing anyone ran had
+ * any relationship to the pinned configuration: "a value that looks like
+ * configuration and is not one" (docs/CONFIDENCE-MAP.md §0.4). A resolver
+ * that cannot honour the pin now says so and stops; the only way to run some
+ * OTHER image is to ask for it BY NAME through `DESKTOP_IMAGE_OVERRIDE_ENV`.
+ *
+ * The value is what `docker build -t … worker/` produces on a developer
+ * machine, so `new DockerHost()` with no options is still runnable in a test.
+ *
+ * 🔴 HAND-OFF (not this row's file): `local/src/host/docker-host.ts:234` does
+ * `options.image ?? LOCAL_DESKTOP_IMAGE_FALLBACK` — the same silent-fallback
+ * shape one layer down. `DockerHostOptions.image` should become required so
+ * the production wiring cannot construct a host against a literal nobody
+ * configured.
  */
 export const LOCAL_DESKTOP_IMAGE_FALLBACK = 'ezil-os-worker-sandbox:ff199202';
+
+/**
+ * The ONE environment variable that overrides the pinned desktop image.
+ *
+ * 🔴 IT IS THE LAUNCHER'S OWN VARIABLE, ON PURPOSE — ONE NAME, ONE MEANING.
+ * `deploy/launcher/ezil-os.sh:85` already reads `EZIL_LAUNCHER_IMAGE` to pick
+ * which image it pulls, and then runs `bun run --cwd local doctor` and
+ * `start` as child processes that inherit it. Before this row those two
+ * halves disagreed: the launcher pulled the override and the host it started
+ * resolved `deploy/images.env` instead, so `EZIL_LAUNCHER_IMAGE=x` pulled `x`
+ * and ran something else. Honouring the same name here is what makes the
+ * launcher's own documented override true end to end.
+ *
+ * Deliberately NOT `EZIL_DESKTOP_IMAGE`: that name is already a KEY in
+ * `deploy/images.env` meaning a bare registry path with no tag. One name
+ * meaning "bare path" in a file and "full name:tag" in the environment is
+ * exactly the `EZIL_NEKO_IMAGE` collision row M1 logged
+ * (docs/ORCHESTRATION-LOG.md, 2026-09-05 01:30Z).
+ *
+ * Who needs it: anyone who cannot pull `ghcr.io/ezilhq/ezil-os-desktop` —
+ * the package is PRIVATE until the founder flips its visibility — and anyone
+ * running an image they built themselves from `worker/Dockerfile`.
+ */
+export const DESKTOP_IMAGE_OVERRIDE_ENV = 'EZIL_LAUNCHER_IMAGE';
 
 /** Path of the pinned-image file, relative to the repository root. */
 export const IMAGES_ENV_RELATIVE_PATH = 'deploy/images.env';
@@ -380,11 +416,12 @@ export function parseImagesEnv(text: string): Record<string, string> {
  * Docker's own tag grammar: `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`.
  *
  * 🔴 THIS IS THE GUARD THAT KEEPS A PLACEHOLDER OUT OF AN ARGV.
- * `deploy/images.env` ships `EZIL_DESKTOP_TAG=<to be pinned by CI>` on purpose.
- * Without this check that string composes into
+ * `deploy/images.env` shipped `EZIL_DESKTOP_TAG=<to be pinned by CI>` for the
+ * whole of round ANYWHERE. Without this check that string composes into
  * `ghcr.io/ezilhq/ezil-os-desktop:<to be pinned by CI>` — a value that looks
  * exactly like configuration, passes every "is it set?" test, and fails only at
- * the moment a user tries to start their computer.
+ * the moment a user tries to start their computer. The file now carries a real
+ * pin, and this guard is what keeps the next one honest.
  */
 export function isDockerTag(tag: string): boolean {
     return /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/.test(tag);
@@ -396,55 +433,141 @@ export function isDockerImageName(name: string): boolean {
 }
 
 export interface ResolvedImage {
-    /** The reference to hand `docker run`. Always a syntactically valid `name:tag`. */
+    /**
+     * The reference to hand `docker run` — a syntactically valid `name:tag`
+     * when `source` is `'images.env'` or `'override'`, and the EMPTY STRING
+     * when `source` is `'unresolved'`.
+     *
+     * 🔴 CHECK `source`, NOT TRUTHINESS OF `ref` ALONE — or use `isResolved`.
+     * `ref` is typed `string` rather than `string | null` only because two
+     * call sites this row does not own (`local/src/config.ts:298`,
+     * `local/src/server/main.ts:61`) would not compile against a nullable
+     * one; the empty string is a value no `docker` subcommand accepts, so a
+     * caller that ignores `source` fails loudly at the daemon instead of
+     * running the wrong image quietly.
+     */
     readonly ref: string;
-    /** Where it came from. `'fallback'` always carries a `reason`. */
-    readonly source: 'images.env' | 'fallback';
-    /** Why the file's value was not usable. Present iff `source === 'fallback'`. */
+    /**
+     * Where it came from:
+     *   `'override'`    — `DESKTOP_IMAGE_OVERRIDE_ENV` was set and usable; it
+     *                     wins over the file, always, and the file is not even
+     *                     read for the name/tag.
+     *   `'images.env'`  — the pinned `EZIL_DESKTOP_IMAGE`/`_TAG` pair.
+     *   `'unresolved'`  — neither produced a usable reference. Always carries
+     *                     a `reason`, and local mode must refuse to start.
+     */
+    readonly source: 'images.env' | 'override' | 'unresolved';
+    /** Why nothing usable was produced. Present iff `source === 'unresolved'`. */
     readonly reason?: string;
 }
 
+/** `true` when this resolution names an image something can actually be asked to run. */
+export function isResolved(image: ResolvedImage): boolean {
+    return image.source !== 'unresolved' && image.ref !== '';
+}
+
 /**
- * Resolve the desktop image from parsed `deploy/images.env` entries, or say why
- * it could not and fall back to something that actually exists.
- *
- * Never throws and never returns a malformed reference: a caller that ignores
- * `source`/`reason` still gets a runnable image, and a caller that reads them
- * can tell the user their pin was not usable.
+ * The one sentence every "unresolved" reason ends with. Naming the override is
+ * the difference between a user who is stuck and a user who is running.
  */
-export function resolveDesktopImage(entries: Record<string, string>): ResolvedImage {
+function overrideHint(): string {
+    return `set ${DESKTOP_IMAGE_OVERRIDE_ENV}=<image:tag> to run an image you already have`
+        + ' (the same variable `deploy/launcher/ezil-os.sh` reads), or advance the pin in'
+        + ' `deploy/images.env` per that file\'s write-back rule';
+}
+
+/**
+ * Resolve the desktop image from the environment override first, then from
+ * parsed `deploy/images.env` entries — or say, in a named reason, why neither
+ * produced a reference and refuse to name one.
+ *
+ * 🔴 NEVER FALLS BACK TO A LITERAL. Until row I0c it did, and a placeholder pin
+ * therefore started local mode against `LOCAL_DESKTOP_IMAGE_FALLBACK` while
+ * every check reported green. Configuration that cannot be honoured is a
+ * failure, not a default.
+ *
+ * Still never throws: every caller gets a value it can report on, and the
+ * `'unresolved'` branch is a decision the caller makes loudly (see
+ * `local/src/doctor.ts`'s `desktop image` check), not an exception it may drop.
+ *
+ * `env` is a PARAMETER, not a `process.env` read inside the function, so this
+ * stays pure and testable: `bun test` runs a file's cases in one process, and a
+ * suite that mutated `process.env` to test the override would be order-
+ * dependent.
+ */
+export function resolveDesktopImage(
+    entries: Record<string, string>,
+    env: Record<string, string | undefined> = process.env,
+): ResolvedImage {
+    // ── 1. The override, which wins over the file. ───────────────────────────
+    // Validated with the SAME grammar as the file's pin, not waved through: an
+    // override is configuration too, and `EZIL_LAUNCHER_IMAGE=ghcr.io/x/y`
+    // (no tag) would silently mean `:latest` — the one tag `deploy/images.env`
+    // calls a bug.
+    const raw = (env[DESKTOP_IMAGE_OVERRIDE_ENV] ?? '').trim();
+    if (raw !== '') {
+        const cut = raw.lastIndexOf(':');
+        const name = cut === -1 ? raw : raw.slice(0, cut);
+        const tag = cut === -1 ? '' : raw.slice(cut + 1);
+        if (cut === -1 || !isDockerImageName(name) || !isDockerTag(tag)) {
+            return {
+                ref: '',
+                source: 'unresolved',
+                reason: `override_invalid: ${DESKTOP_IMAGE_OVERRIDE_ENV}='${raw}' is not <name>:<tag>`
+                    + ' (an untagged reference would mean `:latest`, which this product never pins)',
+            };
+        }
+        return { ref: `${name}:${tag}`, source: 'override' };
+    }
+
+    // ── 2. The pin. ──────────────────────────────────────────────────────────
     const name = entries['EZIL_DESKTOP_IMAGE'] ?? '';
     const tag = entries['EZIL_DESKTOP_TAG'] ?? '';
     if (name === '' || tag === '') {
         return {
-            ref: LOCAL_DESKTOP_IMAGE_FALLBACK,
-            source: 'fallback',
-            reason: `images_env_incomplete: EZIL_DESKTOP_IMAGE=${name === '' ? '(unset)' : name}, EZIL_DESKTOP_TAG=${tag === '' ? '(unset)' : tag}`,
+            ref: '',
+            source: 'unresolved',
+            reason: `images_env_incomplete: EZIL_DESKTOP_IMAGE=${name === '' ? '(unset)' : name},`
+                + ` EZIL_DESKTOP_TAG=${tag === '' ? '(unset)' : tag} — ${overrideHint()}`,
         };
     }
     if (!isDockerImageName(name)) {
-        return { ref: LOCAL_DESKTOP_IMAGE_FALLBACK, source: 'fallback', reason: `images_env_bad_image_name: '${name}'` };
+        return { ref: '', source: 'unresolved', reason: `images_env_bad_image_name: '${name}' — ${overrideHint()}` };
     }
     if (!isDockerTag(tag)) {
-        return { ref: LOCAL_DESKTOP_IMAGE_FALLBACK, source: 'fallback', reason: `images_env_bad_tag: '${tag}' is not [A-Za-z0-9_][A-Za-z0-9._-]{0,127}` };
+        return {
+            ref: '',
+            source: 'unresolved',
+            reason: `images_env_bad_tag: '${tag}' is not [A-Za-z0-9_][A-Za-z0-9._-]{0,127} — ${overrideHint()}`,
+        };
     }
     return { ref: `${name}:${tag}`, source: 'images.env' };
 }
 
 /**
  * Read and resolve in one step. The only impure function in this module, and it
- * touches exactly one file: a missing `deploy/images.env` is the fallback path,
- * not a crash, so a user who downloaded a binary without the repository still
- * gets a working default.
+ * touches exactly one file.
+ *
+ * A missing `deploy/images.env` is `'unresolved'`, not a crash and not a
+ * default: a user who unpacked a release tarball without that file has no pin,
+ * and telling them so (naming the override) is the only honest answer. The
+ * override is still consulted first, so it works with no file at all.
  */
-export async function readAndResolveDesktopImage(imagesEnvPath: string): Promise<ResolvedImage> {
+export async function readAndResolveDesktopImage(
+    imagesEnvPath: string,
+    env: Record<string, string | undefined> = process.env,
+): Promise<ResolvedImage> {
     let text: string;
     try {
         text = await Bun.file(imagesEnvPath).text();
     } catch {
-        return { ref: LOCAL_DESKTOP_IMAGE_FALLBACK, source: 'fallback', reason: `images_env_unreadable: ${imagesEnvPath}` };
+        // The override alone can still resolve this, so ask the resolver with
+        // no entries rather than returning early.
+        const fromEnv = resolveDesktopImage({}, env);
+        if (fromEnv.source === 'override') return fromEnv;
+        return { ref: '', source: 'unresolved', reason: `images_env_unreadable: ${imagesEnvPath} — ${overrideHint()}` };
     }
-    return resolveDesktopImage(parseImagesEnv(text));
+    return resolveDesktopImage(parseImagesEnv(text), env);
 }
 
 // ── argv builders ────────────────────────────────────────────────────────────

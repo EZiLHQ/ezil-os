@@ -43,10 +43,13 @@ import { join } from 'node:path';
 
 import { ENV_KEYS, loadConfig, type Env, type LocalConfig } from './config.ts';
 import {
+    DESKTOP_IMAGE_OVERRIDE_ENV,
+    IMAGES_ENV_RELATIVE_PATH,
     NEKO_IMPLICIT_HOSTING_ENV,
     buildContainerEnv,
     buildDockerImageInspectArgv,
     buildDockerVersionArgv,
+    isResolved,
     offsetPortMap,
     type PublishedPort,
 } from './container/run-spec.ts';
@@ -144,25 +147,64 @@ export async function runDoctor(deps: DoctorDeps): Promise<DoctorReport> {
     }
 
     // ── 3. The image ─────────────────────────────────────────────────────────
-    // Through `config.desktopImage`, which is `deploy/images.env` resolved by
-    // T0's own parser — including the documented fallback to the locally-built
-    // reference when the file still carries its placeholder tag. Asking about
-    // any other string would be asking about an image that will not be run.
+    // Through `config.desktopImage`, which is `deploy/images.env`'s pin
+    // resolved by T0's own parser, or the `EZIL_LAUNCHER_IMAGE` override that
+    // beats it. Asking about any other string would be asking about an image
+    // that will not be run.
+    //
+    // 🔴 THE SOURCE IS PART OF THE ANSWER, NOT DECORATION. Until row I0c an
+    // unusable pin was silently replaced by a locally-built literal, so this
+    // line read PASS while the pinned configuration was doing nothing at all.
+    // Every outcome below therefore names WHERE the reference came from —
+    // `deploy/images.env` or the override — and an unresolvable one is a FAIL
+    // before anything is inspected, never a quiet substitution.
     const image = deps.config.desktopImage;
-    const imageWhy = `${image.ref} (${image.source}${image.reason ? `: ${image.reason}` : ''})`;
-    if (!daemonUp) {
+    const sourceLine = image.source === 'override'
+        ? `${DESKTOP_IMAGE_OVERRIDE_ENV} (environment override; ${IMAGES_ENV_RELATIVE_PATH}'s pin is NOT in use)`
+        : image.source === 'images.env'
+            ? `${IMAGES_ENV_RELATIVE_PATH} (the pinned EZIL_DESKTOP_IMAGE:EZIL_DESKTOP_TAG)`
+            : 'nothing usable';
+    const imageWhy = `${image.ref} — source: ${sourceLine}`;
+    // The one sentence that turns "this box cannot pull it" into a fix. The
+    // GHCR package is PRIVATE until the founder changes its visibility, so
+    // "just pull it" is not advice a developer here can act on.
+    const overrideFix = `set ${DESKTOP_IMAGE_OVERRIDE_ENV}=<image:tag> to run an image you already have`
+        + ` (\`docker images\` lists them; the same variable \`deploy/launcher/ezil-os.sh\` reads,`
+        + ' so the launcher pulls and the host runs the same thing)';
+    if (!isResolved(image)) {
+        // Reported without asking the daemon anything: there is no reference to
+        // ask about. This fires before the daemon check matters, and it names
+        // both fixes — the override for a developer, the write-back rule for
+        // whoever broke the pin.
+        const why = image.reason ?? 'no reason recorded';
+        add(
+            'desktop image',
+            'FAIL',
+            `no desktop image could be resolved — nothing will start until this is fixed. ${why}`
+            // The resolver's own reasons already end by naming the override;
+            // appending it again would say the same sentence twice. A reason
+            // that does NOT name it still gets the fix, so this branch can
+            // never leave a user without one.
+            + (why.includes(DESKTOP_IMAGE_OVERRIDE_ENV) ? '' : `. ${overrideFix}`),
+        );
+    } else if (!daemonUp) {
         add('desktop image', 'FAIL', `cannot look for ${imageWhy} — the daemon is not answering (see above)`);
     } else {
         try {
             const res = await deps.spawn(buildDockerImageInspectArgv(image.ref), { timeoutMs: DOCTOR_DOCKER_TIMEOUT_MS });
             if (res.exitCode === 0 && res.stdout.trim() !== '') {
-                add('desktop image', 'PASS', `${imageWhy} present as ${res.stdout.trim().slice(0, 19)}…`);
+                add('desktop image', 'PASS', `${imageWhy} — present as ${res.stdout.trim().slice(0, 19)}…`);
             } else {
                 add(
                     'desktop image',
                     'FAIL',
-                    `${imageWhy} is not present locally — build it with \`cd worker && docker build -t ${image.ref} .\``
-                    + `, or \`docker pull ${image.ref}\` once it is published`,
+                    `${imageWhy} — NOT present locally.`
+                    + ` Fix it one of three ways: \`docker pull ${image.ref}\``
+                    + (image.ref.startsWith('ghcr.io/ezilhq/')
+                        ? ' (the GHCR package is PRIVATE until it is made public, so this needs `docker login ghcr.io`'
+                          + ' with a token carrying `read:packages`)'
+                        : '')
+                    + `; \`cd worker && docker build -t ${image.ref} .\`; or ${overrideFix}`,
                 );
             }
         } catch (err) {
