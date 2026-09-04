@@ -308,3 +308,48 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   this log: T5's first-pixels figure is **2.2–4.4 s** (the artifact), not 2.2–5.4 s as written at 21:50Z; the Supabase
   Redirect URL the invite flow needs is `/auth/invited` (A2), superseding A1's `/auth/callback` note. A2 merged as
   PR #17 (583fc6d) — recorded here since the earlier entry only said "landing". The e2e default flip waits for N1.
+- 2026-09-05 07:00Z — **`container (real image)` GREEN on `main`** (run 33874099090, after M1 merged): the container
+  suites pass against the pulled GHCR image on a GitHub runner; with `local (typecheck + unit + smoke)` already green,
+  both image-gated jobs are real. They join the ruleset once the packages are public (fork PRs). That run's windows
+  `app` leg failed one wall-clock test (`desktop-frame-reprobe.test.ts`, a starved-final-attempt simulation) —
+  announced-skipped on win32 in PR #26, the same treatment as the long-poll block. The run itself shows `cancelled`
+  because the next merge's push cancelled it (per-ref concurrency), not a failure.
+- 2026-09-05 08:00Z — **M4 returned; landing as PR #27 — the brief's premise refuted.** The macOS worker log has exactly
+  one module-resolution error: `Cannot find package 'cloudflare:workers'` — `index.test.ts` never registered the stub
+  its four siblings register; on ext4 directory order ran a registering file first, on APFS `index.test.ts` ran first
+  and bun served the cached rejection to every later importer (205 tests). Reproduced on Linux by ordering; fixed with
+  the repo's documented pattern plus a source pin naming any SDK-touching test file without the stub (mutation: RED
+  with the offender's name). `worker/src/index.ts` untouched. Second class: multi-line source regexes break on CRLF
+  checkouts (8 seen on Windows, 2 more found by a full-CRLF copy) — normalised on read. Third: the three macOS
+  `telemetry-container-tail` failures are BSD `wc`'s space-padded count (M3's `stat` stub explained only one).
+  Rebased: 1058 pass / 10 skip / 0 fail. Worker unit steps un-gated in ci.yml; the PR's windows and macos worker legs
+  are the proof. Hand-offs: `.gitattributes` `*.ts text eol=lf`; ignore `worker/worker-junit.xml`; `telemetry.ts:343`
+  `wc -c | tr -d ' '` (container-only command, not a production defect); M3's telemetry-emit skip reason is
+  incomplete (`declare -A` too).
+- 2026-09-05 08:40Z — **PR #27 (M4) first run: worker unit suite GREEN on macOS with the gate removed** — the diagnosis
+  holds on a real Mac. Windows: 1001 pass / 65 skip / 2 fail, both in `workspace-seed.test.ts`'s real-shell block,
+  where a Windows temp path loses its backslashes inside the double-quoted `bash -c` command (`cp: cannot stat
+  'C:UsersRUNNER~1…'`); the command only ever runs inside the Ubuntu container, so that block is announced-skipped on
+  win32 (supervisor commit f1bc4ca on `task/M4`). Second run in progress.
+- 2026-09-05 09:05Z — **PR #27 second run: worker unit suite GREEN on macOS AND Windows with no OS gate** (Linux-only
+  suites self-skip by name). The worker package now joins app, sdk+mcp and shell as proven on all three operating
+  systems; the matrix found and closed one CI-wiring defect, five cross-OS defects and a test-ordering defect that had
+  hidden behind ext4 directory order since the suite was written.
+
+## Round INTAKE — `wf-os-2026-09-04` continued (Part B, approved 2026-09-05)
+
+**Goal.** The repository as a standing system for outside contributors: any PR, any newcomer, any comment processed the
+same way — templates, labels, a welcome, a deterministic triage tool with model tiers, a "build an app" guide, and a
+community backlog of 22 issues we do not implement ourselves. Plan of record: Part B of the plan file (§B0–§B6).
+
+**Start state (measured 2026-09-05).** `origin/main` = 3c76d43 (#27). PR #24 (N2 docs half) RED on one phone-portrait
+tap test that is green on `main` for the same job — a flake; re-run. PR #5 (Dependabot grouped patch) RED because the
+`npm` ecosystem edits `app/package.json` but not `bun.lock` — closed with the reason; `/app` and `/worker` move to the
+`bun` ecosystem in I0c; the `@supabase/ssr` jump gets its own hand-reviewed PR. `dependencies` label never existed —
+created. The O5 verifier's worktree holds seven commits of the interim confidence map at base 4b05869 — resumed to
+re-measure at the tip. **Harness finding:** the committed agent definitions never load because this session's working
+directory is the parent folder `/data/openclaw/projects/ezil`, not the repository — Claude Code reads
+`<cwd>/.claude/agents/`; a symlink from the parent's `.claude/agents` to the repo's is the local fix (not a repo change).
+
+- 2026-09-05 (wave 1) — dispatched I0a (O5 resumed; #24 re-run), I0b (LF/junit/`wc` padding), I0c (pin the image tag,
+  honest resolution with one override, the `local` CI job pulls the pin, Dependabot `bun`).
