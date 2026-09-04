@@ -1,0 +1,28 @@
+[
+  {
+    "number": 1,
+    "title": "A sample backlog issue — used only by the issues.ts tests",
+    "state": "OPEN",
+    "labels": [
+      {
+        "id": "LA_kwDOsample0001",
+        "name": "tools",
+        "description": "Tooling and scripts",
+        "color": "c5def5"
+      },
+      {
+        "id": "LA_kwDOsample0002",
+        "name": "help wanted",
+        "description": "Extra attention is needed",
+        "color": "008672"
+      },
+      {
+        "id": "LA_kwDOsample0003",
+        "name": "size/S",
+        "description": "",
+        "color": "bfd4f2"
+      }
+    ],
+    "body": "## The problem\n\nA controlled fixture body. This exact sentence is asserted verbatim by the\nrender test, so the publisher must copy the body through unchanged.\n\n## Acceptance criteria\n\n- The rendered body contains this list, unaltered.\n- The footer line and the hidden marker are appended after it.\n- Nothing else is added or removed.\n\n## Where to look\n\n- `tools/issues.ts` — the renderer under test.\n\n## How to prove it\n\n```\n./tools/test.sh tools\n```\n\n## Prerequisite\n\nNone. This file is a test fixture and is never published to GitHub.\n\nBacklog id: SAMPLE-01 · prerequisite: none · source: docs/community/issues/SAMPLE-01.md\n\n<!-- ezil-backlog-id: SAMPLE-01 -->"
+  }
+]
