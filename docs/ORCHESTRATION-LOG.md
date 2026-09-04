@@ -174,3 +174,9 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   shim on Windows and installed the unrelated npm package `tsc@2.0.4` instead. Supervisor patch (5b2bf3d on
   `task/T4`): the app job runs `bun run typecheck` / `bun run test`, which resolve bun's own shims on every OS.
   Sixth run in progress. Three cross-OS defects and one CI-wiring defect found by the matrix so far.
+- 2026-09-04 18:40Z — **PR #14 sixth run:** windows `app` typecheck and lint GREEN via `bun run`; its unit tests
+  681 pass / 4 fail — all Windows path handling in tests that read source files: `new URL(import.meta.url).pathname`
+  yields `D:\D:\a\…` (ENOENT) in `page-entry.test.ts` and `entry-contract.test.ts`, and `boot-phases.test.ts` hashed
+  an empty extraction because a Windows checkout is CRLF under `* text=auto`. Supervisor patch (1237c88 on `task/T4`):
+  `fileURLToPath` and CRLF normalisation before line-anchored extraction; the three suites stay green on Linux
+  (62/62). Note for A2: `entry-contract.test.ts` changed on this branch. Seventh run in progress.
