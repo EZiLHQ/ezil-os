@@ -153,15 +153,16 @@ over the local source finds no literal hostname of any kind.
 
 ## Public-repo governance
 
-**Status:** in progress · **Rows:** G1 (landed), D1 (landed), G2, G3, G4
+**Status:** in progress · **Rows:** G1, D1, G3 (landed), G2 (this file), G4
 
 The plumbing an open project needs before outside contributors arrive, rather
-than after. `G1` landed on `main` in merge `aaf158a`: the CODEOWNERS login was
-corrected to an account that exists, and CodeQL, a path labeler and a stale sweep
-were added. `D1` landed alongside it: Dependabot no longer opens major-version
-pull requests, and [`CONTRIBUTING.md`](CONTRIBUTING.md) names the deferred
-majors. `G2` is [`GOVERNANCE.md`](GOVERNANCE.md) and this file. What remains is
-`G3`, the DCO check, and `G4`, Discussions plus the branch ruleset.
+than after. Three rows have landed on `main`: `G1` (merge `aaf158a`) corrected the
+CODEOWNERS login to an account that exists and added CodeQL, a path labeler and a
+stale sweep; `D1` stopped Dependabot opening major-version pull requests and named
+the deferred majors in [`CONTRIBUTING.md`](CONTRIBUTING.md); `G3` (merge
+`6df8495`) added the DCO sign-off check. `G2` is
+[`GOVERNANCE.md`](GOVERNANCE.md) and this file. What remains is `G4` — enabling
+Discussions and putting the branch ruleset on `main`.
 
 **What would prove it:** `gh api repos/EZiLHQ/ezil-os/codeowners/errors` returns
 `{"errors":[]}`; a pull request whose commits carry no sign-off makes the DCO
@@ -170,7 +171,10 @@ context that hangs forever — and amending with `-s` turns it green; reading th
 ruleset back through the API shows the required contexts, linear history and no
 force-push; and Discussions is enabled, which
 [`.github/ISSUE_TEMPLATE/config.yml`](.github/ISSUE_TEMPLATE/config.yml) already
-links to.
+links to. These workflows only started producing check runs on open pull requests
+on 2026-09-04, and until `G4` makes them required contexts a red one does not
+stop a merge — so "the check exists" and "the check gates" are two different
+measurements, and only the first has been taken.
 
 ## Workspace sync to R2 from a local install
 
