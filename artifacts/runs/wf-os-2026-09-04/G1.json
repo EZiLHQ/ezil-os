@@ -1,0 +1,10 @@
+{
+  "taskId": "G1",
+  "runId": "wf-os-2026-09-04",
+  "status": "done",
+  "doneRung": "STATIC_CHECKS_PASS",
+  "evidence": "5 commits (a2e6d0b run-artifact, d9d18e3 CODEOWNERS fix, 1bdeae1 codeql.yml, 06bcc03 labeler config+workflow, 2abda57 stale.yml). CODEOWNERS: grep -c '@MidhunAkashM$' = 7 (all lines), grep -c '@MidhunAkash$' = 0 -- 0 unresolved logins survive. yaml.safe_load parses all 4 workflow/config YAML files clean (CODEOWNERS is not YAML by design, excluded per brief's 'the four YAML files'). actionlint confirmed NOT installed (which actionlint -> exit 1), not installed per rules; substituted actionlint's tag-typo check with gh api repos/<org>/<repo>/git/ref/tags/<tag> for all 4 pinned actions (actions/checkout@v7, actions/labeler@v5, actions/stale@v9, github/codeql-action@v3) -- all 4 resolve. codeowners/errors API check deferred: only checkable on default branch after merge (named as supervisor hand-off). Repo-label gap found and named as hand-off: none of the 10 labeler.yml target labels (app worker shell sdk mcp e2e docs ci local tools) exist yet in EZiLHQ/ezil-os (gh api repos/EZiLHQ/ezil-os/labels lists only GitHub's 9 defaults) -- labeler.yml's workflow deliberately omits issues:write so it cannot silently create them; someone with repo-settings access must create the 10 labels before the labeler job will actually apply anything.",
+  "startedAt": "2026-09-04T07:31:12Z",
+  "updatedAt": "2026-09-04T07:39:56Z",
+  "by": "worker-sonnet"
+}

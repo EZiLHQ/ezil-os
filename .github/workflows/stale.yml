@@ -1,0 +1,54 @@
+# Stale issue/PR sweep.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY PRs ARE MARKED STALE BUT NEVER AUTO-CLOSED
+# ─────────────────────────────────────────────────────────────────────────────
+# `days-before-pr-close: -1` disables PR auto-close outright (a negative
+# value turns the close step off; see actions/stale README). An issue with
+# no assignee going quiet is noise; a PR with no assignee going quiet is a
+# human's unmerged work, and closing it out from under them is a worse
+# failure mode than leaving a stale label on it forever. Issues keep the
+# ordinary stale-then-close lifecycle.
+#
+# `days-before-issue-close` and `days-before-pr-close` are set explicitly for
+# both issues and PRs, instead of one shared `days-before-close` plus a PR
+# override — so "a human's PR never auto-closes" holds by construction, not
+# by trusting override precedence between a general and a specific key.
+name: Stale
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: stale-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  stale:
+    name: sweep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          days-before-stale: 60
+          days-before-issue-close: 14
+          days-before-pr-close: -1
+          exempt-issue-labels: pinned,security,roadmap
+          exempt-pr-labels: dependencies
+          stale-issue-message: >-
+            This issue has had no activity for 60 days and is marked stale.
+            Comment, or add one of the exempt labels, to keep it open — it
+            will close automatically in 14 more days of inactivity otherwise.
+          stale-pr-message: >-
+            This pull request has had no activity for 60 days and is marked
+            stale. Push a commit or comment to keep it open — it will not be
+            closed automatically, but a stale PR is easy to lose track of.
+          close-issue-message: >-
+            Closing after 14 days with no further activity since this was
+            marked stale. Reopen, or comment, if this is still relevant.
