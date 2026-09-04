@@ -263,6 +263,10 @@ with no error a shell redirection would ever see. The measurement is in
   edges. Read it before assuming a primitive behaves the way its docs imply.
 - **[`docs/RUNBOOK.md`](docs/RUNBOOK.md)** — what is live, how to operate it,
   known constraints and open items.
+- **[`docs/RELEASE.md`](docs/RELEASE.md)** — how a `v*` tag turns into a
+  deployed, verified product and a downloadable tarball: the secrets it
+  needs, the order things happen in, and how to confirm a rollout took
+  effect.
 - **[`docs/telemetry.md`](docs/telemetry.md)** — the exact, code-linked account
   of what is collected. Designed in
   [`docs/telemetry-design.md`](docs/telemetry-design.md).
@@ -274,6 +278,9 @@ with no error a shell redirection would ever see. The measurement is in
 - **[`docs/research/local-agents.md`](docs/research/local-agents.md)** — a
   measured survey of computer-use drivers against a local desktop, and what
   GPU passthrough would need. Research only; nothing here is built yet.
+- **[`docs/CONTRIBUTING-APPS.md`](docs/CONTRIBUTING-APPS.md)** — how to build a
+  desktop app for the shell: the `AppDescriptor` shape, the boot-trace
+  contract, and what can be vendored.
 - **[`GOVERNANCE.md`](GOVERNANCE.md)** — how decisions get made, who can merge,
   and how somebody outside the project becomes somebody inside it.
 - **[`ROADMAP.md`](ROADMAP.md)** — what the project is trying to become, item
@@ -313,7 +320,9 @@ decisions get made — including how you become a collaborator — is
 sign-off on every commit and CI green on Linux, Windows and macOS before it
 can merge — including from a maintainer, who cannot approve their own PR
 either (see `GOVERNANCE.md`'s "Merging into `main`" for why the required
-approval count is zero rather than bypassed).
+approval count is zero rather than bypassed). See CONTRIBUTING.md's
+[How to send a pull request](CONTRIBUTING.md#how-to-send-a-pull-request) for
+the exact steps, including which checks are required and which aren't.
 
 #### Contributors
 
