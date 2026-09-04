@@ -195,3 +195,56 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   the session in the URL fragment, which `/auth/callback/route.ts` (a server handler reading `?code=`) can never see;
   the invited-user landing is unproven end to end. Founder steps added: apply 0002 to hosted by hand (schema before
   code), seed the allow-list, add the callback URL to Redirect URLs. A2 dispatched next. Running: T5, X1.
+- 2026-09-04 20:20Z — **X1 merged** (`docs/research/local-agents.md`, 550 lines): the sidecar's ten-verb allowlist,
+  ref-generation-scoped refs and single-choke-point redaction confirmed at file:line as the agent seam; cua (MIT) and
+  Agent-S (Apache-2.0) read at driver level — Agent-S `exec()`s LLM-generated pyautogui strings, the concrete argument
+  against handing an agent the host; Linux+NVIDIA is the only citable `--gpus` path (Windows via WSL2; macOS none);
+  neko's `--hwenc` exists but its accepted backends are NOT MEASURED; nine named gaps. Recommendation: a local MCP
+  wrapping the existing verbs plus an OpenAI-compatible driver loop, provable with `contract.mjs` unchanged.
+  **PR #14 eighth run:** `shell` GREEN on ubuntu, windows AND macos; `app` green ×3; `sdk + mcp` green ×3; `tools`
+  green; worker windows/macos still running. T7 dispatched (overlay tag key in images.env; pin the m1k1o base by
+  digest; desktop tag write-back). Running: T5, A2, T7.
+- 2026-09-04 21:00Z — **PR #14 eighth run, macos `worker` leg:** 802 pass / 34 skip / 227 fail — every failure is a
+  suite that EXECUTES the container's Ubuntu boot scripts (`start-neko.sh` restart budgets and teardown,
+  `emit_telemetry`/`phase_end`, the NDJSON tail) for real; they are Linux tests of a Linux container and have never
+  passed on a Mac. Supervisor patch on `task/T4`: the worker job's unit-test steps run on the Linux leg only
+  (typecheck on every OS); row M3 added so those suites self-skip elsewhere with a printed reason. Ninth run.
+- 2026-09-04 21:50Z — **T5 merged — local mode seen working in a real browser.** Supervisor re-ran the smoke: 6/6;
+  frame statistic `stdDev 58.8, 29/32 buckets` (threshold 8/3); the shell revealed the desktop full-bleed after the
+  display gate; neko `/api/room/control` `has_host false → true`; `xdotool` shows the X pointer moving to within 2 px
+  of the click; cold boot 5.7–9.1 s, first pixels 2.2–5.4 s after the window opened. Doctor: 12 pass / 2 warn / 0
+  fail at offset 10000 (8443 is busy here; at offset 0 it fails and names the fix). Two integration defects only the
+  browser run could find, both fixed with tests: the SSRF origin pin was offset-blind (`desktop_frame_foreign_origin`
+  over a healthy container — 210 green tests at offset 0 against a fake host never saw it), and `resolveHost` threw on
+  the only path `bun run start` uses. Brief clause refuted with measurement: the image's `start-neko.sh:3122` already
+  passes `--session.implicit_hosting=true` and a flag outranks env, so the variable is a fallback, not the fix. 307
+  pass / 0 fail on `local/`. Blind spots stated by the worker: nothing proves an application reacted to the keystrokes;
+  one viewport, one browser; audio untouched. T6 dispatched (release.yml + launchers). Running: A2, T7, T6.
+- 2026-09-04 22:30Z — **T7 merged**: `EZIL_NEKO_OVERLAY_TAG` in `deploy/images.env` (image.yml greps it; a derivation
+  guard refuses an overlay tag not prefixed by the base tag — three negative controls fire distinct messages);
+  `ghcr.io/m1k1o/neko/base` pinned by the digest CI actually pulled (`sha256:20806497…`, from run 33858675382's log,
+  re-inspected today); the desktop job publishes `published-images.env` as an artifact rather than committing to
+  `main`. Supervisor fix on merge: `run-spec.test.ts` pinned "the four keys" — now five. Worker's blind spot recorded:
+  the digest pin does not rebuild the base by itself (the tags already exist), only a SHA bump or `rebuild_base`.
+  M1 dispatched (mobile-keyboard container test: 8 failures + 5 vacuous passes). Running: A2, T6, M1.
+- 2026-09-04 23:10Z — **PR #14 merged — the three-OS proof.** Final state: `worker`, `app`, `sdk + mcp`, `shell` GREEN on
+  ubuntu-latest, windows-latest and macos-latest; `tools`, `DCO`, `CodeQL (javascript-typescript)`, `label` green;
+  `container` and `local` red by design until T8. Nine runs; what the matrix found that Linux-only CI never could:
+  the composite action's `runner` context; `mapfile` and BSD `base64` in `shell/build-shell.sh` (a Mac contributor could
+  never run the drift check); `npx` not resolving bun shims on Windows; `URL.pathname` and CRLF in three app tests;
+  one wall-clock long-poll block (win32 skip, announced); geometry browser suites and script-executing worker suites
+  are Linux tests and now say so. One stuck ubuntu app job (20 min in typecheck) was cancelled and re-run: pass.
+  T4 done at INDEPENDENT_TEST_PASS. Next: G4 (ruleset with the 15 matrix contexts), T8.
+- 2026-09-04 23:30Z — **G4 done**: Discussions enabled; ruleset `22265548` active on the default branch — deletion and
+  force-push refused, linear history, PR required with zero approvals (a solo maintainer cannot self-approve),
+  fifteen required contexts (the twelve matrix legs, `tools`, `DCO`, `CodeQL (javascript-typescript)`; `container`
+  and `local` join after T8), admin bypass in pull-request mode only. `strict` up-to-date relaxed to false so three
+  concurrent rows do not each re-run fifteen minutes of checks after every merge; merge method squash (linear
+  history forbids merge commits). **From here every change to `main`, including this log, lands by squash-merged
+  PR** — the supervisor's `git merge --no-ff` loop is retired for this repository.
+- 2026-09-05 00:05Z — **image.yml second run green** (33865834089, triggered by T7's merge): the gate reported
+  `base_exists=true overlay_exists=true` and skipped the base rebuild exactly as designed (the diff changed no pinned
+  SHA), the desktop image was rebuilt and pushed, and `published-images.env` (481 bytes) was uploaded as the
+  hand-off artifact for the tag write-back. T7 at DEPLOYED. Repository now has auto-merge and delete-branch-on-merge
+  enabled; PR #15 landed as the first squash-merged change under the ruleset. Process note: two docs branches that
+  both append to this file conflict on rebase — rebuild the later one on the merged `main` instead of rebasing.
