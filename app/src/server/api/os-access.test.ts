@@ -13,7 +13,7 @@
  * Postgres anywhere (same technique as `@/server/telemetry/queries.test.ts`).
  */
 import { drizzle } from 'drizzle-orm/pg-proxy';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import * as schema from '@/server/db/schema';
 import {
@@ -302,5 +302,56 @@ describe('osAccessLookup — the ezil_os_access query', () => {
             'invite',
         );
         expect(admitted).toEqual({ allowed: true, reason: 'invited' });
+    });
+});
+
+// ── The mode itself ────────────────────────────────────────────────────────
+// `osAccessFor` takes the mode as a parameter, which is what keeps it free of
+// `@/env` — but that also means nothing above this line proves the DEFAULT is
+// the closed one. This block does, by importing `@/env` for real. It is the
+// only place in the file that touches `@/env`, and it restores `process.env`
+// afterwards.
+
+describe('EZIL_OS_ACCESS_MODE — the default is the closed one', () => {
+    /** Loads a fresh `@/env` under a given value for the mode. */
+    const modeUnder = async (value: string | undefined): Promise<string> => {
+        vi.resetModules();
+        const saved = { ...process.env };
+        try {
+            // The client schema is validated on every path, so these must be
+            // present or the import throws for an unrelated reason.
+            process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://project.supabase.co';
+            process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = 'anon-key-placeholder';
+            process.env.SUPABASE_DATABASE_URL = 'postgresql://placeholder/db';
+            if (value === undefined) delete process.env.EZIL_OS_ACCESS_MODE;
+            else process.env.EZIL_OS_ACCESS_MODE = value;
+
+            const mod = await import('@/env');
+            return mod.env.EZIL_OS_ACCESS_MODE;
+        } finally {
+            process.env = saved;
+        }
+    };
+
+    it('🔴 is "invite" when the variable is not set at all', async () => {
+        // A deploy that never heard of this variable is invite-only. If this
+        // ever reads "open", every environment that has not been updated is
+        // wide open and nothing else in this file would notice.
+        await expect(modeUnder(undefined)).resolves.toBe('invite');
+    });
+
+    it('is "open" only when someone explicitly typed it', async () => {
+        await expect(modeUnder('open')).resolves.toBe('open');
+    });
+
+    it('is "invite" when explicitly typed', async () => {
+        await expect(modeUnder('invite')).resolves.toBe('invite');
+    });
+
+    it('refuses a typo at boot rather than silently picking a side', async () => {
+        // `opne` must not read as "not open, therefore invite" by accident —
+        // the same misconfiguration in the other direction is what a silent
+        // fallback would hide.
+        await expect(modeUnder('opne')).rejects.toThrow(/Invalid server environment variables/);
     });
 });
