@@ -150,3 +150,9 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   ("Unrecognized named-value: 'runner'"), so the action failed to load. Supervisor patch on `task/T4` (48bdec1):
   paths and cache key computed once in bash from `$RUNNER_TEMP`/`$RUNNER_OS` and passed as step outputs. PR re-running.
   X1 dispatched (local-agents research). Running: T5, A1, X1.
+- 2026-09-04 16:50Z — **PR #14 second run:** the composite action now loads on all three OSes; `sdk + mcp` green ×3,
+  `tools`, CodeQL, DCO green. `shell (macos-latest)` still red — a real portability defect, not CI: `shell/build-shell.sh`
+  used `mapfile` (bash 4) and macOS ships bash 3.2 (`mapfile: command not found`, exit 127), so a contributor on a Mac
+  could never run the drift check. Supervisor patch on `task/T4` (054ebf0): both uses become a `read` loop; the
+  committed bundle still matches on Linux. `worker/scripts/start-neko.sh` also uses bash-4 builtins but runs only
+  inside the Ubuntu container. PR re-running a third time.
