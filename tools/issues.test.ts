@@ -1,0 +1,616 @@
+/**
+ * Tests for the idempotent community-backlog publisher.
+ *
+ * ## Fixture provenance
+ *
+ *   - `fixtures/issues/sample-issue.md` — a controlled issue file authored here,
+ *     NOT one of the real `docs/community/issues/*.md`. The parser and renderer
+ *     tests run against it so they do not break when row I6b rewords a real
+ *     issue. It exercises the shapes the parser must handle: an unquoted label,
+ *     a quoted label with a space, a quoted label with a slash, an empty prereq,
+ *     and a body whose text is asserted to survive verbatim.
+ *   - `fixtures/issues/gh-issue-list.json` — one issue in the exact shape
+ *     `gh issue list -R <repo> --state all --json number,title,state,labels,body`
+ *     returns. The LIVE capture on 2026-09-04 (`gh issue list -R EZiLHQ/ezil-os
+ *     --state all --json number,title,state,labels,body`) was `[]` — the repo
+ *     has zero issues — so the single entry is hand-written (generated from the
+ *     renderer, so it stays consistent) as the PUBLISHED form of
+ *     `sample-issue.md`. Its shape was checked against a repo that does have
+ *     issues (`gh issue list -R cli/cli ... --limit 1`, 2026-09-04): `state` is
+ *     gh's uppercase `"OPEN"`, and `labels` are full `{id,name,description,color}`
+ *     objects, not `{name}` — both reproduced here so a normaliser bug cannot
+ *     pass against a too-friendly fixture.
+ *
+ * The idempotence proof (marker vs title) is the `mutation target` test in
+ * "the marker lookup ... (idempotence)"; the manual mutation and its RED counts
+ * are recorded in the row I6a report.
+ */
+
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { describe, expect, it } from "bun:test";
+
+import {
+	appliedLabels,
+	classify,
+	createArgs,
+	defaultIssuesDir,
+	findExisting,
+	footerLine,
+	loadIssues,
+	markerFor,
+	normalizeGhIssues,
+	parseArgs,
+	parseCreatedNumber,
+	parseFrontMatter,
+	parseLabels,
+	renderBody,
+	renderTitle,
+	run,
+	searchArgs,
+	searchPhrase,
+	topoOrder,
+	validateLabels,
+	type Applier,
+	type BacklogIssue,
+	type CreateSpec,
+	type Fetchers,
+	type GhIssue,
+} from "./issues.ts";
+
+// ── fixtures ────────────────────────────────────────────────────────────────
+const fixturesDir = join(import.meta.dir, "fixtures", "issues");
+const sampleText = readFileSync(join(fixturesDir, "sample-issue.md"), "utf8");
+const sample = parseFrontMatter(sampleText, "sample-issue.md");
+const ghListRaw = JSON.parse(readFileSync(join(fixturesDir, "gh-issue-list.json"), "utf8"));
+const ghList = normalizeGhIssues(ghListRaw);
+const publishedSample = ghList[0]!;
+
+/**
+ * The 29 labels measured on EZiLHQ/ezil-os by `gh label list --limit 200`
+ * on 2026-09-04. Frozen so the "real backlog is publishable" test can prove
+ * every label the 22 issues name exists WITHOUT a live gh call; a `gh label
+ * list` change may mean updating this snapshot.
+ */
+const REPO_LABELS_SNAPSHOT = [
+	"app", "blocked", "bug", "ci", "dependencies", "docs", "documentation", "duplicate", "e2e",
+	"enhancement", "good first issue", "help wanted", "invalid", "local", "mcp", "needs-triage",
+	"prereq-missing", "question", "review:claude", "sdk", "shell", "size/L", "size/M", "size/S",
+	"size/XL", "size/XS", "tools", "wontfix", "worker",
+];
+
+/** Build a BacklogIssue from a synthetic front-matter block. */
+function issueFrom(id: string, prereq: string, state = "open"): BacklogIssue {
+	const text = `---\nid: ${id}\ntitle: ${id} title\nlabels: [tools]\nprereq: ${prereq}\nstate: ${state}\n---\n\nbody of ${id}\n`;
+	const { frontMatter, body } = parseFrontMatter(text, `${id}.md`);
+	return { frontMatter, body, source: `${id}.md` };
+}
+
+/** A Fetchers stub: a label set, and a candidate list returned for every id (findExisting filters by marker). */
+function stubFetchers(available: readonly string[], candidates: readonly GhIssue[]): Fetchers {
+	return {
+		availableLabels: async () => new Set(available),
+		existingFor: async () => [...candidates],
+	};
+}
+
+/** An Applier stub that records every create and hands back rising numbers. */
+function recordingApplier(): { applier: Applier; calls: { repo: string; spec: CreateSpec }[] } {
+	const calls: { repo: string; spec: CreateSpec }[] = [];
+	let next = 1000;
+	const applier: Applier = {
+		create: async (repo, spec) => {
+			calls.push({ repo, spec });
+			next += 1;
+			return next;
+		},
+	};
+	return { applier, calls };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("front-matter parser — valid shapes", () => {
+	it("parses the five keys from the sample, prereq empty, github absent", () => {
+		expect(sample.frontMatter.id).toBe("SAMPLE-01");
+		expect(sample.frontMatter.title).toBe("A sample backlog issue — used only by the issues.ts tests");
+		expect(sample.frontMatter.labels).toEqual(["tools", "help wanted", "size/S"]);
+		expect(sample.frontMatter.prereq).toBe("");
+		expect(sample.frontMatter.state).toBe("open");
+		expect(sample.frontMatter.github).toBeUndefined();
+	});
+
+	it("parseLabels handles unquoted, quoted-with-space, quoted-with-slash, single, and empty", () => {
+		expect(parseLabels('[app, worker, "help wanted", "size/L"]', "x")).toEqual(["app", "worker", "help wanted", "size/L"]);
+		expect(parseLabels("[tools]", "x")).toEqual(["tools"]);
+		expect(parseLabels("[]", "x")).toEqual([]);
+		expect(parseLabels("[ ]", "x")).toEqual([]);
+	});
+
+	it("a colon in a title or label is kept (split is on the FIRST colon only)", () => {
+		const { frontMatter } = parseFrontMatter(
+			`---\nid: DB-01\ntitle: A db:apply-0002 script matching db:apply-0001\nlabels: [app, "review:claude"]\nprereq:\nstate: open\n---\nbody\n`,
+			"DB-01.md",
+		);
+		expect(frontMatter.title).toBe("A db:apply-0002 script matching db:apply-0001");
+		expect(frontMatter.labels).toEqual(["app", "review:claude"]);
+	});
+
+	it("tolerates the write-back key `github` as a positive integer", () => {
+		const { frontMatter } = parseFrontMatter(
+			`---\nid: X-01\ntitle: t\nlabels: [tools]\nprereq:\nstate: open\ngithub: 42\n---\nbody\n`,
+			"X-01.md",
+		);
+		expect(frontMatter.github).toBe(42);
+	});
+
+	it("strips one layer of matching quotes from scalar values", () => {
+		const { frontMatter } = parseFrontMatter(
+			`---\nid: "X-01"\ntitle: "quoted title"\nlabels: [tools]\nprereq: "SFA-01"\nstate: "open"\n---\nb\n`,
+			"X-01.md",
+		);
+		expect(frontMatter.id).toBe("X-01");
+		expect(frontMatter.title).toBe("quoted title");
+		expect(frontMatter.prereq).toBe("SFA-01");
+		expect(frontMatter.state).toBe("open");
+	});
+
+	it("keeps a non-empty prereq", () => {
+		expect(issueFrom("FILES-01", "SFA-01").frontMatter.prereq).toBe("SFA-01");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("front-matter parser — each invalid shape fails with a named reason", () => {
+	const ok = `---\nid: X-01\ntitle: t\nlabels: [tools]\nprereq:\nstate: open\n---\nbody\n`;
+
+	it("positive control: the well-formed block parses", () => {
+		expect(parseFrontMatter(ok, "X-01.md").frontMatter.id).toBe("X-01");
+	});
+
+	it("no opening fence", () => {
+		expect(() => parseFrontMatter("id: X\n", "f")).toThrow(/front-matter fence/);
+	});
+
+	it("unclosed fence", () => {
+		expect(() => parseFrontMatter("---\nid: X\n", "f")).toThrow(/not closed/);
+	});
+
+	it("an unknown key, named", () => {
+		expect(() => parseFrontMatter(`---\nid: X\ntitle: t\nlabels: [tools]\nprereq:\nstate: open\nfoo: bar\n---\n`, "f")).toThrow(
+			/unknown front-matter key "foo"/,
+		);
+	});
+
+	it("a missing required key, named", () => {
+		expect(() => parseFrontMatter(`---\nid: X\ntitle: t\nlabels: [tools]\nprereq:\n---\n`, "f")).toThrow(
+			/missing required front-matter key "state"/,
+		);
+	});
+
+	it("a state outside open|blocked", () => {
+		expect(() => parseFrontMatter(`---\nid: X\ntitle: t\nlabels: [tools]\nprereq:\nstate: closed\n---\n`, "f")).toThrow(
+			/"state" must be one of open\|blocked/,
+		);
+	});
+
+	it("a duplicate key", () => {
+		expect(() => parseFrontMatter(`---\nid: X\nid: Y\ntitle: t\nlabels: [tools]\nprereq:\nstate: open\n---\n`, "f")).toThrow(
+			/duplicate front-matter key "id"/,
+		);
+	});
+
+	it("labels that are not a flow list", () => {
+		expect(() => parseFrontMatter(`---\nid: X\ntitle: t\nlabels: app, worker\nprereq:\nstate: open\n---\n`, "f")).toThrow(
+			/"labels" must be a flow list/,
+		);
+	});
+
+	it("an empty id", () => {
+		expect(() => parseFrontMatter(`---\nid:\ntitle: t\nlabels: [tools]\nprereq:\nstate: open\n---\n`, "f")).toThrow(
+			/"id" must be a non-empty string/,
+		);
+	});
+
+	it("an empty title", () => {
+		expect(() => parseFrontMatter(`---\nid: X\ntitle:\nlabels: [tools]\nprereq:\nstate: open\n---\n`, "f")).toThrow(
+			/"title" must be a non-empty string/,
+		);
+	});
+
+	it("an empty label item (a stray comma)", () => {
+		expect(() => parseLabels("[a,,b]", "f")).toThrow(/empty item/);
+		expect(() => parseLabels("[a,]", "f")).toThrow(/empty item/);
+	});
+
+	it("an unterminated quote in labels", () => {
+		expect(() => parseLabels('[a, "b]', "f")).toThrow(/unterminated quote/);
+	});
+
+	it("a non-integer github value", () => {
+		expect(() =>
+			parseFrontMatter(`---\nid: X\ntitle: t\nlabels: [tools]\nprereq:\nstate: open\ngithub: banana\n---\n`, "f"),
+		).toThrow(/"github" must be a positive integer/);
+	});
+
+	it("a line without a colon", () => {
+		expect(() => parseFrontMatter(`---\nid: X\nnonsense\ntitle: t\nlabels: [tools]\nprereq:\nstate: open\n---\n`, "f")).toThrow(
+			/not "key: value"/,
+		);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("loadIssues — the front-matter id must match the filename", () => {
+	it("throws, naming the mismatch, when id != basename; loads when they agree (positive control)", () => {
+		const dir = mkdtempSync(join(tmpdir(), "issues-load-"));
+		try {
+			writeFileSync(join(dir, "GOOD-01.md"), `---\nid: GOOD-01\ntitle: t\nlabels: [tools]\nprereq:\nstate: open\n---\nb\n`);
+			writeFileSync(join(dir, "BAD-01.md"), `---\nid: OTHER-99\ntitle: t\nlabels: [tools]\nprereq:\nstate: open\n---\nb\n`);
+			expect(() => loadIssues(dir)).toThrow(/does not match the filename/);
+			rmSync(join(dir, "BAD-01.md"));
+			const loaded = loadIssues(dir);
+			expect(loaded.map((b) => b.frontMatter.id)).toEqual(["GOOD-01"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("an empty directory is a loud failure, not an empty publish", () => {
+		const dir = mkdtempSync(join(tmpdir(), "issues-empty-"));
+		try {
+			expect(() => loadIssues(dir)).toThrow(/no \*\.md issue files/);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("body rendering: the file body verbatim, then the footer, then the marker", () => {
+	it("keeps the body text unchanged", () => {
+		const body = renderBody(sample.frontMatter, sample.body);
+		expect(body).toContain("A controlled fixture body. This exact sentence is asserted verbatim by the");
+		expect(body).toContain("- The footer line and the hidden marker are appended after it.");
+	});
+
+	it("appends the footer line with id, prerequisite and source", () => {
+		expect(renderBody(sample.frontMatter, sample.body)).toContain(
+			"Backlog id: SAMPLE-01 · prerequisite: none · source: docs/community/issues/SAMPLE-01.md",
+		);
+	});
+
+	it("ends with the hidden marker", () => {
+		expect(renderBody(sample.frontMatter, sample.body).endsWith(markerFor("SAMPLE-01"))).toBe(true);
+		expect(markerFor("SFA-01")).toBe("<!-- ezil-backlog-id: SFA-01 -->");
+	});
+
+	it("footerLine shows the prereq id when there is one, and 'none' when there is not", () => {
+		expect(footerLine(issueFrom("FILES-01", "SFA-01").frontMatter)).toContain("prerequisite: SFA-01");
+		expect(footerLine(issueFrom("SFA-01", "").frontMatter)).toContain("prerequisite: none");
+	});
+
+	it("renderTitle is the front-matter title unchanged", () => {
+		expect(renderTitle(sample.frontMatter)).toBe(sample.frontMatter.title);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("appliedLabels: a blocked issue gets the `blocked` label exactly once", () => {
+	it("an open issue's labels are unchanged", () => {
+		expect(appliedLabels(issueFrom("A-01", "", "open").frontMatter)).toEqual(["tools"]);
+	});
+
+	it("a blocked issue WITHOUT `blocked` in its list gets it appended", () => {
+		const bi = issueFrom("B-01", "", "blocked");
+		expect(appliedLabels(bi.frontMatter)).toEqual(["tools", "blocked"]);
+	});
+
+	it("a blocked issue that already lists `blocked` (the ARM-01/TAURI-01 shape) keeps it exactly once", () => {
+		const { frontMatter } = parseFrontMatter(
+			`---\nid: ARM-01\ntitle: arm64 image\nlabels: [worker, blocked, "size/XL"]\nprereq:\nstate: blocked\n---\nb\n`,
+			"ARM-01.md",
+		);
+		const labels = appliedLabels(frontMatter);
+		expect(labels).toEqual(["worker", "blocked", "size/XL"]);
+		expect(labels.filter((l) => l === "blocked").length).toBe(1);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("existence detection from the fixture gh listing", () => {
+	it("normalizeGhIssues reads the real shape: numeric number, uppercase state, label names, body", () => {
+		expect(publishedSample.number).toBe(1);
+		expect(publishedSample.state).toBe("OPEN");
+		expect(publishedSample.labels).toEqual(["tools", "help wanted", "size/S"]);
+		expect(publishedSample.body).toContain(markerFor("SAMPLE-01"));
+	});
+
+	it("GUARD: the fixture's title is the rendered title of sample-issue.md (update gh-issue-list.json if this fails)", () => {
+		expect(publishedSample.title).toBe(renderTitle(sample.frontMatter));
+	});
+
+	it("an issue carrying the marker is `exists` (title matches)", () => {
+		const c = classify(sample.frontMatter, ghList);
+		expect(c.kind).toBe("exists");
+		expect(c.existing?.number).toBe(1);
+	});
+
+	it("an empty listing means `create` — the wouldCreate path", () => {
+		expect(classify(sample.frontMatter, []).kind).toBe("create");
+	});
+
+	it("a different id is `create` even against a non-empty listing (no marker for it)", () => {
+		expect(classify(issueFrom("OTHER-01", "").frontMatter, ghList).kind).toBe("create");
+	});
+
+	it("a CLOSED issue that carries the marker is `exists`, never re-created (that is what --state all is for)", () => {
+		const closed: GhIssue = { ...publishedSample, state: "CLOSED" };
+		const c = classify(sample.frontMatter, [closed]);
+		expect(c.kind).toBe("exists");
+		expect(c.kind).not.toBe("create");
+		expect(c.existing?.state).toBe("CLOSED");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("drift detection (title only, per the brief)", () => {
+	it("marker present but the title diverged → drift, carrying both titles", () => {
+		const drifted: GhIssue = { ...publishedSample, title: "A stale published title" };
+		const c = classify(sample.frontMatter, [drifted]);
+		expect(c.kind).toBe("drift");
+		expect(c.existing?.title).toBe("A stale published title");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("the marker lookup is by body marker, not title (idempotence)", () => {
+	it("findExisting matches on the body marker even when the title differs; null when the marker is absent", () => {
+		const renamed: GhIssue = { ...publishedSample, title: "totally unrelated human title" };
+		expect(findExisting([renamed], "SAMPLE-01")?.number).toBe(1);
+		const noMarker: GhIssue = { ...publishedSample, body: "a body with no marker at all" };
+		expect(findExisting([noMarker], "SAMPLE-01")).toBeNull();
+	});
+
+	it("MUTATION TARGET: a human-renamed issue is still found by its marker, so it is NOT re-created", () => {
+		// Shipped (marker match): the renamed issue is found → drift, not create.
+		// Swap `issue.body.includes(marker)` for a title test in findExisting and
+		// this issue looks absent → classify returns `create` → a DUPLICATE. RED.
+		const renamed: GhIssue = { ...publishedSample, title: "a maintainer edited this title" };
+		const c = classify(sample.frontMatter, [renamed]);
+		expect(c.kind).toBe("drift");
+		expect(c.kind).not.toBe("create");
+		expect(c.existing?.number).toBe(1);
+	});
+
+	it("findExisting is deterministic when a marker somehow appears twice: lowest number wins", () => {
+		const a: GhIssue = { ...publishedSample, number: 7 };
+		const b: GhIssue = { ...publishedSample, number: 3 };
+		expect(findExisting([a, b], "SAMPLE-01")?.number).toBe(3);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("topological order over prereq", () => {
+	it("emits a prerequisite before its dependants, deterministically", () => {
+		const order = topoOrder([issueFrom("C-01", "A-01"), issueFrom("B-01", "A-01"), issueFrom("A-01", "")]).map(
+			(b) => b.frontMatter.id,
+		);
+		expect(order.indexOf("A-01")).toBeLessThan(order.indexOf("B-01"));
+		expect(order.indexOf("A-01")).toBeLessThan(order.indexOf("C-01"));
+		expect(order).toEqual(["A-01", "B-01", "C-01"]); // alpha among the freed nodes
+	});
+
+	it("the REAL backlog orders SFA-01 before its five viewers and MCP-01 before AGENT-01", () => {
+		const order = topoOrder(loadIssues(defaultIssuesDir())).map((b) => b.frontMatter.id);
+		for (const dep of ["DOC-01", "FILES-01", "IMG-01", "PDF-01", "SHEET-01"]) {
+			expect(order.indexOf("SFA-01")).toBeLessThan(order.indexOf(dep));
+		}
+		expect(order.indexOf("MCP-01")).toBeLessThan(order.indexOf("AGENT-01"));
+	});
+
+	it("a two-node cycle fails, naming both members", () => {
+		expect(() => topoOrder([issueFrom("A-01", "B-01"), issueFrom("B-01", "A-01")])).toThrow(/cycle among: A-01, B-01/);
+	});
+
+	it("a self-prerequisite is a one-node cycle, named", () => {
+		expect(() => topoOrder([issueFrom("X-01", "X-01")])).toThrow(/cycle among: X-01/);
+	});
+
+	it("a dangling prereq fails, naming the missing id", () => {
+		expect(() => topoOrder([issueFrom("A-01", "NOPE-99")])).toThrow(/prereq "NOPE-99" names no issue/);
+	});
+
+	it("a duplicate id is refused", () => {
+		expect(() => topoOrder([issueFrom("A-01", ""), issueFrom("A-01", "")])).toThrow(/duplicate backlog id "A-01"/);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("validateLabels", () => {
+	it("passes when every applied label exists", () => {
+		expect(() => validateLabels([issueFrom("A-01", "")], new Set(["tools"]))).not.toThrow();
+	});
+
+	it("fails, naming the missing label and the issue using it", () => {
+		expect(() => validateLabels([issueFrom("A-01", "")], new Set(["worker"]))).toThrow(/"tools" \(used by A-01\)/);
+	});
+
+	it("requires the auto-added `blocked` label to exist too", () => {
+		const blocked = issueFrom("B-01", "", "blocked");
+		expect(() => validateLabels([blocked], new Set(["tools"]))).toThrow(/"blocked" \(used by B-01\)/);
+		expect(() => validateLabels([blocked], new Set(["tools", "blocked"]))).not.toThrow();
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("the real backlog is publishable (integration over docs/community/issues)", () => {
+	const real = loadIssues(defaultIssuesDir());
+
+	it("every file parses and the set topo-sorts without a cycle", () => {
+		expect(real.length).toBe(22);
+		expect(() => topoOrder(real)).not.toThrow();
+	});
+
+	it("every label the 22 issues name exists in the 2026-09-04 repo label snapshot", () => {
+		expect(REPO_LABELS_SNAPSHOT.length).toBe(29);
+		expect(() => validateLabels(real, new Set(REPO_LABELS_SNAPSHOT))).not.toThrow();
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("createArgs cannot express anything but a create", () => {
+	const spec: CreateSpec = { id: "A-01", title: "a title", body: "a body", labels: ["tools", "help wanted"] };
+
+	it("is `gh issue create` with --title, --body-file and one --label per label", () => {
+		const args = createArgs(spec, "EZiLHQ/ezil-os", "/tmp/x.md");
+		expect(args[0]).toBe("issue");
+		expect(args[1]).toBe("create");
+		expect(args).toContain("--title");
+		expect(args).toContain("--body-file");
+		expect(args[args.indexOf("--body-file") + 1]).toBe("/tmp/x.md");
+		expect(args.filter((a) => a === "--label")).toHaveLength(2);
+		expect(args).toContain("tools");
+		expect(args).toContain("help wanted");
+	});
+
+	it("contains no destructive or mutating verb", () => {
+		const args = createArgs(spec, "r", "/tmp/x.md");
+		const forbidden = ["close", "edit", "delete", "--delete", "reopen", "transfer", "merge", "lock", "pin", "comment", "--add-label", "--remove-label"];
+		for (const token of args) expect(forbidden).not.toContain(token);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("parseCreatedNumber", () => {
+	it("reads the number out of the created issue URL", () => {
+		expect(parseCreatedNumber("https://github.com/EZiLHQ/ezil-os/issues/42\n")).toBe(42);
+	});
+
+	it("throws rather than guess when gh prints something else", () => {
+		expect(() => parseCreatedNumber("something went wrong")).toThrow(/could not read the created issue number/);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("searchArgs / searchPhrase", () => {
+	it("is a --state all, in:body marker search over the id, returning the fields the classifier needs", () => {
+		const args = searchArgs("EZiLHQ/ezil-os", "SFA-01");
+		expect(args.slice(0, 4)).toEqual(["issue", "list", "-R", "EZiLHQ/ezil-os"]);
+		expect(args).toContain("--state");
+		expect(args[args.indexOf("--state") + 1]).toBe("all");
+		expect(args).toContain('"ezil-backlog-id: SFA-01" in:body');
+		expect(args[args.indexOf("--json") + 1]).toBe("number,title,state,labels,body");
+	});
+
+	it("searchPhrase is the marker's readable inner text", () => {
+		expect(searchPhrase("SFA-01")).toBe("ezil-backlog-id: SFA-01");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("the write gate: --apply is the only write", () => {
+	const backlog: BacklogIssue[] = [
+		{ frontMatter: sample.frontMatter, body: sample.body, source: "SAMPLE-01.md" },
+		issueFrom("OTHER-01", ""),
+	];
+	const available = ["tools", "help wanted", "size/S"];
+
+	it("a dry run performs zero gh issue create calls, and marks every missing issue wouldCreate", async () => {
+		const { applier, calls } = recordingApplier();
+		const { summary } = await run(backlog, { repo: "r", apply: false }, stubFetchers(available, []), applier);
+		expect(calls.length).toBe(0);
+		expect(summary.wouldCreate.map((w) => w.id).sort()).toEqual(["OTHER-01", "SAMPLE-01"]);
+		expect(summary.created).toEqual([]);
+	});
+
+	it("--apply creates exactly the missing issues, in topo order, with the right spec, and reports the numbers", async () => {
+		const { applier, calls } = recordingApplier();
+		// SAMPLE-01 already exists (its marker is in the listing); only OTHER-01 is created.
+		const { summary, lines } = await run(backlog, { repo: "r", apply: true }, stubFetchers(available, ghList), applier);
+		expect(calls.map((c) => c.spec.id)).toEqual(["OTHER-01"]);
+		expect(calls[0]!.spec.body).toContain(markerFor("OTHER-01"));
+		expect(calls[0]!.spec.labels).toEqual(["tools"]);
+		expect(summary.exists.map((e) => e.id)).toEqual(["SAMPLE-01"]);
+		expect(summary.created).toEqual([{ id: "OTHER-01", number: 1001 }]);
+		expect(lines.some((l) => l.includes("github: 1001"))).toBe(true);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("run() summary shape and counts", () => {
+	const backlog: BacklogIssue[] = [
+		{ frontMatter: sample.frontMatter, body: sample.body, source: "SAMPLE-01.md" },
+		issueFrom("NEW-01", ""),
+	];
+	const available = ["tools", "help wanted", "size/S"];
+
+	it("files === wouldCreate + exists + drift, and the repo is echoed", async () => {
+		const { applier } = recordingApplier();
+		const { summary } = await run(backlog, { repo: "EZiLHQ/ezil-os", apply: false }, stubFetchers(available, ghList), applier);
+		expect(summary.repo).toBe("EZiLHQ/ezil-os");
+		expect(summary.files).toBe(summary.wouldCreate.length + summary.exists.length + summary.drift.length);
+		expect(summary.exists.map((e) => e.id)).toEqual(["SAMPLE-01"]);
+		expect(summary.wouldCreate.map((w) => w.id)).toEqual(["NEW-01"]);
+		expect(summary.files).toBe(2);
+	});
+
+	it("surfaces drift in the summary and the lines", async () => {
+		const { applier } = recordingApplier();
+		const drifted: GhIssue = { ...publishedSample, title: "stale title" };
+		const { summary, lines } = await run(
+			[{ frontMatter: sample.frontMatter, body: sample.body, source: "SAMPLE-01.md" }],
+			{ repo: "r", apply: false },
+			stubFetchers(available, [drifted]),
+			applier,
+		);
+		expect(summary.drift).toHaveLength(1);
+		expect(summary.drift[0]!.fileTitle).toBe(renderTitle(sample.frontMatter));
+		expect(summary.drift[0]!.issueTitle).toBe("stale title");
+		expect(lines.some((l) => /DRIFT #1 SAMPLE-01: title differs/.test(l))).toBe(true);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("parseArgs", () => {
+	it("defaults to the repo, dry run, no dir override", () => {
+		expect(parseArgs([])).toEqual({ repo: "EZiLHQ/ezil-os", apply: false, issuesDir: null, help: false });
+	});
+
+	it("reads --repo, --apply, --issues-dir", () => {
+		expect(parseArgs(["--repo", "a/b", "--apply", "--issues-dir", "/x"])).toEqual({
+			repo: "a/b",
+			apply: true,
+			issuesDir: "/x",
+			help: false,
+		});
+	});
+
+	it("refuses an unknown flag and a value-less option", () => {
+		expect(() => parseArgs(["--wat"])).toThrow(/unknown argument/);
+		expect(() => parseArgs(["--repo"])).toThrow(/--repo needs/);
+		expect(() => parseArgs(["--issues-dir"])).toThrow(/--issues-dir needs/);
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("normalizeGhIssues rejects a broken shape rather than mis-reading it", () => {
+	it("the fixture parses (positive control)", () => {
+		expect(normalizeGhIssues(ghListRaw)).toHaveLength(1);
+	});
+
+	it("a non-array is refused", () => {
+		expect(() => normalizeGhIssues({ nope: true })).toThrow(/expected a JSON array/);
+	});
+
+	it("an issue with no numeric number is refused", () => {
+		expect(() => normalizeGhIssues([{ title: "t", body: "b", labels: [] }])).toThrow(/no numeric number/);
+	});
+
+	it("a label with no name is refused", () => {
+		expect(() => normalizeGhIssues([{ number: 1, title: "t", body: "b", labels: [{ color: "x" }] }])).toThrow(
+			/label with no name/,
+		);
+	});
+});
