@@ -15,9 +15,65 @@
  * helpers. Run with `bun test` (package-local, no root-level gate).
  */
 
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, mock } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+
+// ── The workerd-only `cloudflare:workers` stub, registered HERE ─────────────
+// Several assertions below `await import('./index')`. `./index.ts` imports
+// `@cloudflare/sandbox`, whose internal content-hashed chunk imports the
+// workerd-only `cloudflare:workers`. bun cannot resolve that specifier on ANY
+// platform — reproduced on Linux, byte for byte:
+//
+//   error: Cannot find package 'cloudflare:workers' from
+//   '<...>/worker/node_modules/@cloudflare/sandbox/dist/sandbox-DKG3H156.js'
+//
+// `route-auth.test.ts`, `workspace-idle.test.ts`, `workspace-flush-loop.test.ts`
+// and `desktop-release.test.ts` each register this stub for themselves (see
+// `workspace-idle.test.ts`'s note on why). THIS file did not, so it imported
+// cleanly only when bun happened to load one of those files first — a property
+// of the filesystem's directory order, not of the code.
+//
+// MEASURED, PR #14 eighth run, job 100991453440: on macOS bun reached
+// `index.test.ts` first (APFS order), the import threw, and bun then served the
+// SAME rejection to every later importer — so all five sibling files failed too,
+// their own stubs notwithstanding: 205 pure-TS tests red on macOS, 0 on Linux
+// (ext4 order) and 0 on Windows (alphabetical: `desktop-release.test.ts` runs
+// first and primes the specifier). Reproduced here: `bun test src/index.test.ts`
+// alone -> 4 fail; `bun test src/index.test.ts src/route-auth.test.ts` -> 126
+// fail; the same two files in the opposite order -> 0 fail. See the source-pin
+// at the bottom of this file, which refuses a `./index` importer with no stub.
+mock.module('cloudflare:workers', () => ({
+  DurableObject: class {},
+  WorkerEntrypoint: class {},
+  RpcTarget: class {},
+  RpcStub: class {},
+  env: {},
+}));
+
+/**
+ * Read one of this package's own source files as text, line endings normalised
+ * to LF.
+ *
+ * `.gitattributes` declares `* text=auto`, so a Windows checkout
+ * (`core.autocrlf=true`, the GitHub-hosted runner default) writes `.ts` and
+ * `.toml` into the working tree with CRLF, while `.sh`/`.bash`/`.mjs` are
+ * pinned to `eol=lf`. Every multi-line regex in this file anchors on `\n`,
+ * `\n\n` or `\n {2}\}`, none of which match across a `\r\n`. MEASURED, PR #14
+ * run 44, the `worker (typecheck + unit) (windows-latest)` leg: eight
+ * assertions here failed with `expect(received).not.toBeNull()` receiving null
+ * — index.test.ts:633, 685, 834, 853, 996, 1093, 1154, 1186 — while the
+ * identical assertions passed on the Linux and macOS legs of the same run.
+ *
+ * A checkout's line-ending policy is not a fact about the Worker, so it is
+ * normalised away here rather than asserted on. This is inert on LF.
+ */
+function readWorkerSource(relativePath: string): string {
+  return readFileSync(fileURLToPath(new URL(relativePath, import.meta.url)), 'utf8').replace(
+    /\r\n/g,
+    '\n',
+  );
+}
 
 describe('resolveDesktopMode', () => {
   it('defaults to guacamole when nothing is requested and no env default is set', async () => {
@@ -480,7 +536,7 @@ describe('HMAC mission-alias: verifyPreviewToken', () => {
 // move the value onto the command line or drop the neko-only gate.
 describe('sealed workspace-startup delivery — env-not-argv contract', () => {
   it('forwards the delivery only through the startProcess env, never the command string', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
 
     // The env key exists and is set from the delivery inside an env object.
     expect(src).toContain('EZIL_WORKSPACE_STARTUP_DELIVERY: startupDelivery');
@@ -496,7 +552,7 @@ describe('sealed workspace-startup delivery — env-not-argv contract', () => {
   });
 
   it('gates the delivery to neko mode both at the call site and inside ensureDesktop', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     // Call site only forwards the delivery for neko; guacamole always gets null.
     expect(src).toContain("mode === 'neko' ? (body.startupDelivery ?? null) : null");
     // ensureDesktop double-checks the neko gate before populating the env.
@@ -504,7 +560,7 @@ describe('sealed workspace-startup delivery — env-not-argv contract', () => {
   });
 
   it('forwards the mounted workspace root only through the startProcess env, never the command string', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
 
     // The env key exists and is set from the resolved workspace root inside an env object.
     expect(src).toContain('EZIL_WORKSPACE_ROOT: workspaceRoot');
@@ -519,7 +575,7 @@ describe('sealed workspace-startup delivery — env-not-argv contract', () => {
   });
 
   it('gates the workspace root to neko mode and forwards the call-site mount decision unchanged', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     // Call site forwards the mounted path (or null) regardless of mode; ensureDesktop gates it.
     expect(src).toContain('workspace.mounted ? workspace.mountPath ?? null : null');
     // ensureDesktop only populates EZIL_WORKSPACE_ROOT for neko when a root is present.
@@ -550,25 +606,25 @@ describe('sealed workspace-startup delivery — env-not-argv contract', () => {
 // (see `boot.test.ts`).
 describe('workspace mount prefix — derived from {projectId, branch}, not sandboxId', () => {
   it('ensureWorkspaceMount takes a {projectId, branch} object, not a bare sandboxId string', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).toContain(
       "{ projectId, branch }: { projectId: string; branch: string },",
     );
   });
 
   it("computes the default prefix as `/${projectId}/branches/${branch}` (leading slash required by mountBucket's own validation, stripped internally before hitting R2)", async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).toContain('config.prefix ?? `/${projectId}/branches/${branch}`');
   });
 
   it('never falls back to the old sandboxId-derived prefix', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     // The pre-fix default that never matched the write path.
     expect(src).not.toContain('config.prefix ?? `/${sandboxId}`');
   });
 
   it('all three call sites pass an explicit {projectId, branch} object into ensureWorkspaceMount', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     const callSites = [...src.matchAll(/ensureWorkspaceMount\(sandbox, env, ([\s\S]{0,120}?)\)/g)];
     expect(callSites.length).toBe(3);
     for (const call of callSites) {
@@ -581,7 +637,7 @@ describe('workspace mount prefix — derived from {projectId, branch}, not sandb
   });
 
   it('the /sandbox/preview call site sources projectId/branch from the request body, defaulting branch to \'main\' explicitly', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).toContain('const workspaceProjectId = scopeId;');
     expect(src).toContain("const workspaceBranch = body.branch?.trim() || 'main';");
   });
@@ -592,13 +648,13 @@ describe('workspace mount prefix — derived from {projectId, branch}, not sandb
   // who both omitted it landed on the exact same workspace. The fallback is
   // now deleted; the request is rejected instead.
   it('no longer falls back to a shared "default" R2 prefix when the scope id is omitted', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).not.toContain("body.projectId ?? 'default'");
     expect(src).not.toContain("const workspaceProjectId = body.projectId ?? 'default';");
   });
 
   it('rejects a /sandbox/preview request whose scope id (projectId) is missing/blank with a 400, before deriving any sandbox identity', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).toContain('const scopeId = body.projectId?.trim();');
     expect(src).toContain("if (!scopeId) {");
     expect(src).toContain("return json({ ok: false, error: 'missing_project_id' }, 400);");
@@ -626,7 +682,7 @@ describe('workspace mount prefix — derived from {projectId, branch}, not sandb
 // and `./workspace-seed.test.ts`.
 describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/flush', () => {
   it('the r2-binding branch of ensureWorkspaceMount no longer calls sandbox.mountBucket()', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     const r2BranchMatch = src.match(
       /if \(config\.mode === 'r2-binding'\) \{[\s\S]*?\n {2}\}\n\n {2}\/\/ ── Generic S3-compatible fallback/,
     );
@@ -636,14 +692,14 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
   });
 
   it('the generic (non-R2) S3-compatible fallback branch is left mounting via s3fs, deliberately unchanged', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     // Exactly one remaining `sandbox.mountBucket` CALL site (not doc-comment
     // mentions) — the s3 fallback.
     expect((src.match(/await sandbox\.mountBucket\(/g) ?? []).length).toBe(1);
   });
 
   it('empty prefix still template-seeds via the unchanged atomic sentinel (seedWorkspaceIfAbsent), not a fresh mechanism', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).toContain('if (initiallyEmpty) {');
     expect(src).toContain('const seedOutcome = await seedWorkspaceIfAbsent({');
     // The template copy itself stays a pure local-disk `cp -a` — it was
@@ -656,13 +712,13 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
   });
 
   it('falls through to a real hydrateWorkspaceFromR2 pass whenever the atomic seed did not seed (lost race / not empty / list failed / etc.)', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).toContain('if (!hydrateOk) {');
     expect(src).toContain('const outcome = await hydrateWorkspaceFromR2({');
   });
 
   it('every hydrate attempt (success or failure) is recorded via recordHydrationOutcome — the flush gate', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     // Called unconditionally at the end of ensureWorkspaceHydratedFromR2 —
     // not only inside the `if (hydrateOk)` branch — so a failed re-hydrate
     // correctly flips the DO-storage hydrated flag back off.
@@ -680,7 +736,7 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
   // inside the `if (hydrateOk)` block, so both the seeded-new-workspace path
   // and the hydrated-existing-workspace path both reach it.
   it('runs buildEnsureTurbopackConfigCommand unconditionally inside `if (hydrateOk)`, covering BOTH the seed and hydrate-existing paths', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     const hydrateOkMatch = src.match(/if \(hydrateOk\) \{[\s\S]*?\n {2}\}\n\n {2}await recordHydrationOutcome/);
     expect(hydrateOkMatch).not.toBeNull();
     const body = hydrateOkMatch![0];
@@ -712,14 +768,14 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
     // Asserted here rather than in code because the code fallback is CORRECT:
     // a deployment that genuinely runs guacamole should keep it. What was wrong
     // was this deployment declining to say what it runs.
-    const toml = await Bun.file(new URL('../wrangler.toml', import.meta.url)).text();
+    const toml = readWorkerSource('../wrangler.toml');
     const line = toml.split('\n').find((l) => /^\s*SANDBOX_DEFAULT_DESKTOP_MODE\s*=/.test(l));
     expect(line).toBeDefined();
     expect(line).toContain('"neko"');
   });
 
   it('EzilSandboxDO is exported as `Sandbox` (same DO binding name — zero wrangler.toml changes) and uses schedule(), not alarm()', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).toContain('export { EzilSandboxDO as Sandbox };');
     // The callback name is a single constant so `schedule()` and
     // `deleteSchedules()` can never drift apart (a mismatch would leave the
@@ -732,7 +788,7 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
   });
 
   it('flush is invoked explicitly before/around the preview response, and before destroy inside terminateSandbox', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     // handlePreview's pre-handoff flush is still a Worker-side RPC — started
     // unconditionally exactly once. z2-mint-latency: no longer awaited
     // inline unconditionally (measured 441-754ms on a WARM call, paid before
@@ -762,7 +818,7 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
   });
 
   it('the flush interval is 10 seconds', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).toContain('const WORKSPACE_FLUSH_INTERVAL_SECONDS = 10;');
   });
 });
@@ -770,7 +826,7 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
 // ── /sandbox/preview request contract — `branch` ────────────────────────────
 describe('PreviewBody request contract carries `branch`', () => {
   it('declares an optional `branch` field alongside `projectId`', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     const bodyMatch = src.match(/interface PreviewBody \{[\s\S]*?\n\}/);
     expect(bodyMatch).not.toBeNull();
     const bodySrc = bodyMatch?.[0] ?? '';
@@ -794,12 +850,12 @@ describe('PreviewBody request contract carries `branch`', () => {
 // documents for the Twen route.
 describe('cpu-diag: flag forwarded only when set', () => {
   it('Env carries EZIL_NEKO_CPU_DIAG_ENABLED as a non-secret, optional string (default OFF)', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).toContain('EZIL_NEKO_CPU_DIAG_ENABLED?: string;');
   });
 
   it('ensureDesktop accepts the flag and normalizes it via cpuDiagFlagEnabled before forwarding', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).toContain('cpuDiagFlag: string | undefined = undefined,');
     expect(src).toContain(
       "mode === 'neko' && cpuDiagFlagEnabled(cpuDiagFlag) ? { EZIL_NEKO_CPU_DIAG_ENABLED: '1' } : {}",
@@ -807,7 +863,7 @@ describe('cpu-diag: flag forwarded only when set', () => {
   });
 
   it('is merged into startProcess env alongside the other opt-in envs, never the command string', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).toContain('...workspaceRootEnv, ...cpuDiagEnv');
     // Same command-template guard as the sealed-delivery tests: no interpolation leak.
     expect(src).toContain('`DESKTOP_MODE=${mode} bash /usr/local/bin/start-desktop.sh`');
@@ -815,21 +871,21 @@ describe('cpu-diag: flag forwarded only when set', () => {
   });
 
   it('the /sandbox/preview call site forwards env.EZIL_NEKO_CPU_DIAG_ENABLED (only set when the Worker var/secret is set)', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).toContain('env.EZIL_NEKO_CPU_DIAG_ENABLED,');
   });
 });
 
 describe('cpu-diag: retrieval route (HMAC-authed, bounded, degrades cleanly)', () => {
   it('registers POST /sandbox/:name/cpu-diag behind the SANDBOX_CPU_DIAG kill-switch', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).toContain(String.raw`/^\/sandbox\/([^/]+)\/cpu-diag$/`);
     expect(src).toContain('cpuDiagRouteDisabled(env.SANDBOX_CPU_DIAG)');
     expect(src).toContain("json({ ok: false, error: 'cpu_diag_disabled' }, 404)");
   });
 
   it('handleCpuDiag reuses the exact preview-token HMAC envelope (same as workspace-diag/twen)', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     const fnMatch = src.match(/async function handleCpuDiag\([\s\S]*?\n}\n/);
     expect(fnMatch).not.toBeNull();
     const fnSrc = fnMatch?.[0] ?? '';
@@ -838,7 +894,7 @@ describe('cpu-diag: retrieval route (HMAC-authed, bounded, degrades cleanly)', (
   });
 
   it('returns bounded content read via cpuDiagContentCommand with the resolved maxLines cap', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     expect(src).toContain('const maxLines = resolveCpuDiagMaxLines(body.maxLines);');
     expect(src).toContain('cpuDiagContentCommand(CPU_DIAG_FILE, CPU_DIAG_MAX_BYTES, maxLines)');
     // truncated is derived from BOTH the line cap and the byte ceiling, so a
@@ -847,7 +903,7 @@ describe('cpu-diag: retrieval route (HMAC-authed, bounded, degrades cleanly)', (
   });
 
   it('degrades cleanly (200, ok:true, exists:false) instead of a 500 when the file is absent', async () => {
-    const src = await Bun.file(new URL('./index.ts', import.meta.url)).text();
+    const src = readWorkerSource('./index.ts');
     const fnMatch = src.match(/async function handleCpuDiag\([\s\S]*?\n}\n/);
     const fnSrc = fnMatch?.[0] ?? '';
     expect(fnSrc).toContain('if (!stat.exists) {');
@@ -873,11 +929,8 @@ describe('cpu-diag: retrieval route (HMAC-authed, bounded, degrades cleanly)', (
 // below is what makes that failure loud — it enumerates every token the Worker
 // can actually pass to `exposePort` and requires a matching route pattern.
 describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => {
-  const wranglerSrc = readFileSync(
-    fileURLToPath(new URL('../wrangler.toml', import.meta.url)),
-    'utf8',
-  );
-  const indexSrc = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+  const wranglerSrc = readWorkerSource('../wrangler.toml');
+  const indexSrc = readWorkerSource('./index.ts');
 
   const zoneRoot = indexSrc.match(/^const PREVIEW_ZONE_ROOT = '([^']+)';$/m)?.[1];
   // Only uncommented `pattern = "..."` lines count — a commented-out route
@@ -1010,7 +1063,7 @@ describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => 
 // this Worker sets, never removed without a replacement, that a live curl can
 // grep for.
 describe('/health distinguishing marker (route-precedence observability)', () => {
-  const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+  const src = readWorkerSource('./index.ts');
   const fnMatch = src.match(/if \(method === 'GET' && path === '\/health'\) \{[\s\S]*?\n {4}\}/);
   const fnSrc = fnMatch?.[0] ?? '';
 
@@ -1036,7 +1089,7 @@ describe('/health distinguishing marker (route-precedence observability)', () =>
 // code and call-site wiring (see the cpu-diag/sealed-delivery describe
 // blocks above).
 describe('bridge-host dispatcher: generalized to app-preview AND code-server', () => {
-  const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+  const src = readWorkerSource('./index.ts');
 
   it('renamed handleAppPreview -> handleBridgeHost (no dangling old name)', () => {
     expect(src).toContain('async function handleBridgeHost(');
@@ -1078,7 +1131,7 @@ describe('bridge-host dispatcher: generalized to app-preview AND code-server', (
 
 // ── handlePreview returns appPreviewUrl / codePreviewUrl ────────────────────
 describe('handlePreview response carries ready-to-embed bridge URLs', () => {
-  const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+  const src = readWorkerSource('./index.ts');
 
   it('mints a bootstrap token and builds appPreviewUrl/codePreviewUrl from the exposed bridge URL', () => {
     expect(src).toContain('const appPreviewUrl = await buildBridgeUrl(appPreviewExpose);');
@@ -1143,7 +1196,7 @@ describe('codePreviewFolderParams', () => {
 // pin the specific wiring choices the brief called out (closed enum, the
 // existing `authorizeSignedControlRequest` gate, a kill switch).
 describe('POST /sandbox/:id/focus wiring', () => {
-  const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+  const src = readWorkerSource('./index.ts');
 
   it('registers the route behind the SANDBOX_FOCUS kill-switch, gated by authorizeSignedControlRequest', () => {
     expect(src).toContain(String.raw`/^\/sandbox\/([^/]+)\/focus$/`);
@@ -1174,7 +1227,7 @@ describe('POST /sandbox/:id/focus wiring', () => {
 // specific wiring choices — same HMAC gate as `/focus`, one shared kill
 // switch, no bucket call before the gate runs.
 describe('POST /telemetry/drain + /telemetry/ack wiring', () => {
-  const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+  const src = readWorkerSource('./index.ts');
 
   it('registers both routes behind SANDBOX_TELEMETRY_DRAIN, gated by authorizeSignedControlRequest', () => {
     expect(src).toContain("path === '/telemetry/drain'");
@@ -1211,7 +1264,7 @@ describe('POST /telemetry/drain + /telemetry/ack wiring', () => {
 // drops one of them (e.g. "only call it on success, like `proc.getLogs()`
 // used to be failure-only") fails this test immediately.
 describe('container boot-telemetry drain reaches ensureDesktop callers on success AND failure', () => {
-  const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+  const src = readWorkerSource('./index.ts');
 
   it('drains and forwards telemetry on the FAILURE path, before throwing desktop_failed_to_start', () => {
     const failureBlock = src.match(/if \(!ready\) \{[\s\S]*?throw new Error\(`desktop_failed_to_start[\s\S]*?\n {4}\}/)?.[0] ?? '';
