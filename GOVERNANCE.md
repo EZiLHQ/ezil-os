@@ -126,6 +126,11 @@ raise, and raising it is itself a change to this document.
 
 ## Releases
 
+See [`docs/RELEASE.md`](docs/RELEASE.md) for the operator side of a release —
+the secrets it needs, the order things happen in, and how to confirm a
+rollout actually took effect. This section states the policy; that document
+is the procedure.
+
 A release is a **`v*` tag cut by a maintainer**. Nothing else creates one: not a
 green build, not a deploy, not a merge to `main`.
 

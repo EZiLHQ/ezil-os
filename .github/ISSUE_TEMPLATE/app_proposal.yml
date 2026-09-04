@@ -1,0 +1,82 @@
+name: App proposal
+description: Propose a desktop app for the EZiL-OS shell.
+labels: ["needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read [`docs/CONTRIBUTING-APPS.md`](https://github.com/EZiLHQ/ezil-os/blob/main/docs/CONTRIBUTING-APPS.md)
+        first — it covers the `AppDescriptor` shape, the `shell_local` /
+        `SHELL_APPS` handshake, the boot-trace contract, and what can be
+        vendored. This form is for proposing the idea before you build it, not
+        a substitute for that guide.
+  - type: input
+    id: name
+    attributes:
+      label: App name
+    validations:
+      required: true
+  - type: dropdown
+    id: hosting
+    attributes:
+      label: Shell-local or hosted?
+      description: >
+        Shell-local ships entirely inside the committed bundle -- nothing on
+        the server has to agree. A hosted app also needs the server's
+        `SHELL_APPS` list (`app/src/server/shell/boot-payload.ts`) to agree
+        with the shell's `APPS` array, or the shell will offer an app the
+        server never advertised.
+      options:
+        - Shell-local
+        - Hosted
+    validations:
+      required: true
+  - type: textarea
+    id: opens
+    attributes:
+      label: What it opens
+      description: What the app actually does once launched -- the window(s) it shows, and what's in them.
+    validations:
+      required: true
+  - type: dropdown
+    id: file-api
+    attributes:
+      label: Does it need the shell file API?
+      options:
+        - "No"
+        - "Yes"
+    validations:
+      required: true
+  - type: input
+    id: file-api-prereq
+    attributes:
+      label: If yes -- prerequisite issue
+      description: No shell-callable file API exists yet. An app that needs one depends on issue SFA-01 -- link the tracked issue here.
+    validations:
+      required: false
+  - type: textarea
+    id: boot-trace
+    attributes:
+      label: Boot-trace outcome it will report
+      description: >
+        What `ctx.trace.end` reports on a successful boot, and what it
+        reports when the app can't boot -- a named phase and an explicit
+        "we don't know" rather than a false "ready".
+    validations:
+      required: true
+  - type: textarea
+    id: licence
+    attributes:
+      label: Licence of any library you would vendor
+      description: >
+        Only AGPL-3.0-compatible licences can be vendored into this
+        repository. Say "none" if you're not vendoring anything.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I've read docs/CONTRIBUTING-APPS.md.
+          required: true

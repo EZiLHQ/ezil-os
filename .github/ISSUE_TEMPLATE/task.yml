@@ -1,0 +1,74 @@
+name: Task
+description: A scoped work item — something concrete to build or fix, with a way to check it's done.
+labels: ["needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        See [CONTRIBUTING.md, "Picking something up"](https://github.com/EZiLHQ/ezil-os/blob/main/CONTRIBUTING.md#picking-something-up)
+        for how labels and claiming work up front — this form is for opening
+        new work, not for claiming an existing issue.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the repository this touches.
+      options:
+        - app
+        - worker
+        - shell
+        - sdk
+        - mcp
+        - e2e
+        - docs
+        - ci
+        - local
+        - tools
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What's wrong, missing, or needed — and why it matters. Describe the situation, not just the fix.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: 3–5, each one checkable — something a reviewer can look at and answer yes or no to, not "make it better".
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+  - type: textarea
+    id: how-to-test
+    attributes:
+      label: How to test
+      description: The exact command a reviewer runs to check this, e.g. `./tools/test.sh worker`.
+      placeholder: ./tools/test.sh <package>
+    validations:
+      required: true
+  - type: dropdown
+    id: size
+    attributes:
+      label: Estimated size
+      description: A rough changed-line-count guess — see CONTRIBUTING.md, "How big a pull request should be". Leave it if you're not sure; a maintainer can set it.
+      options:
+        - "XS (under 20 lines)"
+        - "S (under 100 lines)"
+        - "M (under 400 lines)"
+        - "L (under 1000 lines)"
+        - "XL (over 1000 lines)"
+    validations:
+      required: false
+  - type: input
+    id: prereq
+    attributes:
+      label: Prerequisite issue
+      description: If this can't be started until another issue lands, its number (e.g. `#42`). Leave blank if there isn't one.
+    validations:
+      required: false

@@ -35,6 +35,156 @@ Add it automatically with:
 git commit -s -m "your commit message"
 ```
 
+## Picking something up
+
+Issues are labeled so you can find something that matches what you want to
+work on:
+
+- `good first issue`, `help wanted` — starting points for someone new to the
+  codebase.
+- `size/XS` … `size/XL` — a rough estimate of how many lines the fix touches.
+- One label per area of the repository: `app`, `worker`, `shell`, `sdk`,
+  `mcp`, `e2e`, `docs`, `ci`, `local`, `tools`.
+- `blocked` / `prereq-missing` — this can't be started yet; the issue itself
+  names what has to land first. Don't start one of these — read what it's
+  waiting on instead.
+- `needs-triage` — opened, not yet sorted by a maintainer.
+
+To claim an issue, comment on it; a maintainer assigns it to you. If nobody
+responds within 72 hours — the same lazy-consensus window
+[`GOVERNANCE.md`](GOVERNANCE.md) uses for everything else — take it and say so
+on the issue rather than waiting indefinitely.
+
+## Branch naming
+
+`feat/…`, `fix/…`, `docs/…`, `test/…`, `chore/…` — the prefix says what kind
+of change the branch carries.
+
+## How big a pull request should be
+
+Prefer **under ~400 changed lines**. A pull request that grows past that will
+be asked to split before review starts. When you split one, cut along a real
+seam rather than an arbitrary line count — one package per pull request, or a
+schema change landed separately from the code that reads it. That second rule
+isn't invented for this list: it's this repository's own rule, stated in
+[`docs/RELEASE.md`](docs/RELEASE.md)'s release checklist as "schema before
+code" — a migration has to be applied before the code that depends on the
+table it creates can ship, so the two changes are reviewed, and land,
+separately.
+
+## How to send a pull request
+
+1. Fork the repository and branch off `main` (see "Branch naming" above).
+2. Make your change. Sign off **every** commit: `git commit -s`.
+3. Run [`./tools/test.sh <package>`](tools/test.sh) for each package you
+   touched — `app`, `worker`, `shell`, `sdk`, `mcp`, `tools`, or `local` (or
+   `all` to run everything present in your tree).
+4. If you touched `shell/`, rebuild the committed bundle —
+   `shell/build-shell.sh` — and confirm `shell/build-shell.sh --check` is
+   clean before you commit it.
+5. Fill in the pull request template; open the PR against `main`.
+
+**`main` is protected.** A pull request is the only way onto it, and it needs
+every required status check green (see "Reading CI" below) before it can
+merge — including a maintainer's own PR, which nobody can approve either (see
+[`GOVERNANCE.md`](GOVERNANCE.md)'s "Merging into `main`" for why the required
+approval count is zero rather than bypassed).
+
+## Reading CI
+
+Every pull request runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+Fifteen of its checks are **required contexts** — the branch ruleset on `main`
+will not offer the merge button until every one of these exact names is green:
+
+- `worker (typecheck + unit) (ubuntu-latest)`
+- `worker (typecheck + unit) (windows-latest)`
+- `worker (typecheck + unit) (macos-latest)`
+- `app (typecheck + unit) (ubuntu-latest)`
+- `app (typecheck + unit) (windows-latest)`
+- `app (typecheck + unit) (macos-latest)`
+- `sdk + mcp (typecheck + unit) (ubuntu-latest)`
+- `sdk + mcp (typecheck + unit) (windows-latest)`
+- `sdk + mcp (typecheck + unit) (macos-latest)`
+- `shell (bundle check + browser suites) (ubuntu-latest)`
+- `shell (bundle check + browser suites) (windows-latest)`
+- `shell (bundle check + browser suites) (macos-latest)`
+- `tools (typecheck + unit)`
+- `DCO`
+- `CodeQL (javascript-typescript)`
+
+The same workflow also runs two more jobs, **`container (real image)`** and
+**`local (typecheck + unit + smoke)`**, and neither is a required context.
+Both pull the desktop image from GHCR, and `ci.yml` explains exactly why that
+can't be required yet (`.github/workflows/ci.yml:64-72`):
+
+> FORK PRs CANNOT PULL THE PRIVATE PACKAGE. `pull_request` runs this
+> workflow with a read-only, fork-scoped `GITHUB_TOKEN` for a fork's PR —
+> that token cannot pull a private `ezilhq/ezil-os-desktop`, so both
+> `container` and `local` fail at the "Pull the desktop image" step on
+> every external contribution, regardless of anything the contributor
+> wrote. Row G4's required-status list must NOT add "container (real
+> image)" or "local (typecheck + unit + smoke)" until the package is made
+> Public (already tracked as a founder step, docs/ORCHESTRATION-LOG.md
+> 2026-09-04 14:50Z) — otherwise no fork PR could ever merge.
+
+**A red or missing `container` or `local` check on your pull request does not
+block your merge.** If you see one, it is almost certainly this, not
+something you did.
+
+You may also see a `Vercel` check appear — Vercel's GitHub integration deploys
+a preview of `app/` for every branch (`.github/workflows/deploy.yml`'s own
+header explains why that's safe: only `main`'s deploy is disabled at the
+integration level). It is not a required context either; it exists so a
+reviewer can click through to a live preview, not to gate the merge.
+
+## "A skip is not a pass"
+
+[`tools/test.sh`](tools/test.sh) is the only sanctioned way to run this
+repository's suites, and it is written to fail closed:
+
+1. **An absent summary is a failure.** If the run dies mid-way there is no
+   final "N pass / N fail" line, and "nothing was reported" is not the same
+   as "nothing failed".
+2. **An unreadable failure count is a failure.** A summary that doesn't parse
+   to a number counts as a failure, never as zero.
+3. **Every skipped container or browser suite is printed by name.** `worker`'s
+   container suites (`*.container.test.ts`) skip when no desktop image is
+   present on the machine; `shell`'s real-browser suites skip when Playwright
+   is unresolvable. Both are listed, one by one, in the output — never folded
+   into a bare count.
+
+Two environment variables exist to let a run continue past a skip you have
+deliberately accepted — never to make one look like a pass, and both print a
+line every time they're used, saying exactly that:
+
+- `EZIL_ALLOW_SKIPPED_CONTAINER_TESTS=1`
+- `EZIL_ALLOW_SKIPPED_BROWSER_SUITES=1`
+
+**A `0 fail` that ran nothing is not a green suite.** If your change touches
+`worker/`'s container behaviour or `shell/`'s browser-facing code, run it
+against a real image or a real Playwright install before claiming it's
+covered — don't reach for either variable to make the run finish faster.
+
+## Running it locally
+
+To see your change running in a real desktop, not just passing its tests, see
+[`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md). Start with:
+
+```bash
+bun run --cwd local doctor
+```
+
+before you try to boot anything — it checks the Docker daemon, the resolved
+desktop image, every port at the configured offset and the workspace
+directory, and names the fix for whatever it finds wrong rather than just
+failing. One thing worth knowing before you run it: the pinned desktop image
+is a **private** GHCR package today, so a plain `docker pull` of it fails for
+anyone outside the project. The doctor's own output names the fix; if you're
+using the release launcher rather than a clone, its `EZIL_LAUNCHER_IMAGE`
+environment variable is how you point local mode at an image you already have
+instead of the one it can't pull (see
+[`deploy/launcher/README.md`](deploy/launcher/README.md)).
+
 ## Building and testing
 
 The Worker lives in `worker/` and is a Bun-managed Cloudflare Worker
@@ -95,6 +245,13 @@ taken the desktop down before.
 
 ## Dependency updates
 
+`/app`, `/worker`, `/sdk` and `/mcp` are on Dependabot's `bun` ecosystem, not
+`npm` — each carries a `bun.lock`, and CI installs every one of them with
+`bun install --frozen-lockfile`, so a bumped `package.json` has to bring its
+`bun.lock` along in the same PR or the install (and the PR) fails closed.
+`/worker/sidecar` is the one exception and stays on `npm`: it has no lockfile
+of any kind, so there's nothing for a `bun` entry to keep in step with.
+
 Dependabot (`.github/dependabot.yml`) opens two different kinds of PR, and
 they're handled differently:
 
@@ -143,3 +300,11 @@ picking one up should check:
   against the pinned `@cloudflare/sandbox` version (`0.12.1`, see
   `dependabot.yml` and `ATTRIBUTIONS.md`) before bumping; a types major can
   break a dependency that itself isn't moving.
+
+## Discussions
+
+For an open-ended question or a proposal — as opposed to a concrete bug or a
+scoped task — use [Discussions](https://github.com/EZiLHQ/ezil-os/discussions)
+instead of an issue: **Announcements**, **Q&A**, **Ideas**, **Show and tell**,
+and **Apps** (for talking through a desktop-app idea before or alongside an
+[app proposal issue](.github/ISSUE_TEMPLATE/app_proposal.yml)).
