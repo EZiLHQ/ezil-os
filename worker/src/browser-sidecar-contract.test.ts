@@ -24,16 +24,48 @@
  * suites) is that a suite which could not run must never look like a pass.
  * It therefore skips with a banner naming the exact path it wanted, and
  * `EZIL_BROWSER_SIDECAR_CONTRACT` overrides the location.
+ *
+ * ── M2: the sibling checkout is next to the MAIN tree, not this worktree ───
+ * `import.meta.dir/../../..` finds the sibling correctly from the main
+ * checkout (`worker/src` -> `worker` -> the repo root -> its parent), but a
+ * task worktree lives at `<repo>/.claude/worktrees/<id>`, one level DEEPER —
+ * so the same three `..`s land inside `.claude/worktrees/`, never beside the
+ * repo, and this suite skipped all 10 tests in every worktree (found by O3;
+ * row M2). `tools/worktree.sh` solves the identical problem the identical
+ * way: `--git-common-dir` is the one path identical from every worktree (it
+ * always names the MAIN checkout's `.git`, worktree or not), so its parent's
+ * parent is the sibling-checkout directory regardless of where this file is
+ * running from. Falls back to the old relative derivation if git is
+ * unavailable for any reason (e.g. this file copied outside a git checkout).
  */
 
 import { describe, expect, it } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
-const DEFAULT_CONTRACT = join(
-    import.meta.dir, '..', '..', '..',
-    'EZiL-Works', 'apps', 'api', 'src', 'routes', 'mcp', 'browser-sidecar.contract.json',
-);
+/** The MAIN checkout's root, found the same way `tools/worktree.sh` finds
+ *  `REPO` — from wherever this file happens to be running, worktree or not.
+ *  `null` when git cannot answer (not a git checkout at all). */
+function mainRepoRoot (): string | null {
+    const res = spawnSync(
+        'git', ['rev-parse', '--path-format=absolute', '--git-common-dir'],
+        { cwd: import.meta.dir, encoding: 'utf8' },
+    );
+    if (res.status !== 0 || !res.stdout) return null;
+    // `--git-common-dir` names `<repo>/.git` — even when invoked from inside
+    // a worktree, it names the MAIN repo's `.git`, never the worktree's own
+    // `.git` file. Its dirname is therefore the main checkout root.
+    return dirname(res.stdout.trim());
+}
+
+const GIT_ROOT = mainRepoRoot();
+const DEFAULT_CONTRACT = GIT_ROOT
+    ? join(dirname(GIT_ROOT), 'EZiL-Works', 'apps', 'api', 'src', 'routes', 'mcp', 'browser-sidecar.contract.json')
+    : join(
+        import.meta.dir, '..', '..', '..',
+        'EZiL-Works', 'apps', 'api', 'src', 'routes', 'mcp', 'browser-sidecar.contract.json',
+    );
 const CONTRACT_PATH = process.env.EZIL_BROWSER_SIDECAR_CONTRACT ?? DEFAULT_CONTRACT;
 const HAVE_CONTRACT = existsSync(CONTRACT_PATH);
 
