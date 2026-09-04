@@ -142,3 +142,84 @@ vacuous-pass gate alone.
 $ ./tools/test.sh sdk    # exit 0 — 20 pass / 0 fail, 20 tests across 2 files [76.00ms]
 $ ./tools/test.sh mcp    # exit 0 — 33 pass / 0 fail, 33 tests across 3 files [492.00ms]
 ```
+
+### 3.4 app, and the invite gate specifically
+
+```
+$ ./tools/test.sh app
+```
+Exit **0**. `npx tsc --noEmit` clean, `bun run lint` clean, then
+`Test Files 44 passed (44) / Tests 817 passed (817)`, duration 6.95 s.
+
+```
+$ cd app && npx vitest run src/server/api/trpc-access.test.ts
+```
+Exit **0** — `1 passed (1) / 20 passed (20)`. This is the file that carries the
+row `A2` claim. Its cases include *"🔴 an authenticated bearer that is not on the
+allow-list gets FORBIDDEN"*, its positive control *"and an invited bearer is let
+through"*, and *"a caller with no user is still UNAUTHORIZED, not FORBIDDEN — the
+positive control"*, so the two refusal codes are distinguished rather than
+conflated.
+
+**Mutation (gate, not in the brief's list — done because the row's whole claim
+rests on this one file).** `app/src/server/api/trpc.ts:172`
+`if (!access.allowed)` → `if (false && !access.allowed)`:
+
+```
+before  1 passed (1) / 20 passed (20)
+mutant  1 failed (1) / 6 failed | 14 passed (20)
+after   1 passed (1) / 20 passed (20)      (git checkout -- app/src/server/api/trpc.ts; git status clean)
+```
+
+### 3.5 The two guards the brief named, mutation-proved
+
+**(a) The pixel oracle, `local/src/pixels.ts`.** A scratch probe
+(`pixel-oracle-probe.ts`, outside the repository) imports the **shipped**
+`luminanceStats` / `isNonUniform` / `describeStats` and hands them four 64×64
+RGBA frames:
+
+```
+UNIFORM   samples=4096 min=128 max=128 mean=128 stdDev=0    buckets=1/32  — UNIFORM (stdDev below 8)   isNonUniform = false
+BLACK     samples=4096 min=0   max=0   mean=0   stdDev=0    buckets=1/32  — ALL BLACK                  isNonUniform = false
+TWO-TONE  samples=4096 min=0   max=255 mean=0.06 stdDev=3.98 buckets=2/32 — UNIFORM (stdDev below 8)   isNonUniform = false
+SPREAD    samples=4096 min=0   max=255 mean=127.5 stdDev=73.9 buckets=33/32 — non-uniform              isNonUniform = true
+```
+
+A uniform frame is RED (refused) and the spread is GREEN — and the refusal
+message names *which* threshold rejected it. `local/tests/pixels.test.ts`:
+`12 pass / 0 fail / 29 expect() calls`.
+
+Then the thresholds themselves, mutated in place to prove they are load-bearing
+rather than decorative — `MIN_STD_DEV = 8 → 0`, `MIN_BUCKETS = 3 → 0`:
+
+```
+mutant   pixels.test.ts  7 pass / 5 fail        probe: UNIFORM and TWO-TONE now isNonUniform = true
+restore  pixels.test.ts 12 pass / 0 fail        probe: refuses all three degenerate frames again
+```
+(`git checkout -- local/src/pixels.ts`; `git status --short` empty.)
+
+🔴 **Defect found by this probe, reported not fixed**: `describeStats` prints
+`buckets=33/32` on a full-range frame. `luminanceStats` buckets by
+`Math.round(l / 8)` over luminance `0…255`, which yields **33** distinct values
+(`0…32`), not the 32 the field's own doc comment and the `/32` suffix claim.
+Nothing depends on the count being ≤32 (`MIN_BUCKETS` is a floor), so this is
+cosmetic — but the printed diagnostic is arithmetically impossible as written.
+Hand-off: `local/src/pixels.ts:83` (`buckets.add(Math.round(l / 8))`) and
+`:141` (the `/32` in `describeStats`).
+
+**(b) The no-hostname scan, `local/src/server/no-hostname.test.ts`.** The
+scanner walks `resolve(import.meta.dir, '..')` — the whole of `local/src` — so a
+new file inside that tree is in scope. Scratch copy
+`local/src/server/o5-scratch-copy.ts` (a copy of `local/src/config.ts`) with one
+line appended in **code**, `export const O5_SCRATCH_ENDPOINT = 'https://os.ezil.work';`:
+
+```
+before  8 pass / 0 fail / 18 expect() calls
+mutant  6 pass / 2 fail — "🔴 NO literal hostname appears in code. No exceptions, anywhere."
+          + [ "server/o5-scratch-copy.ts:318 export const O5_SCRATCH_ENDPOINT = 'https://os.ezil.work';" ]
+        and "no URL to a forbidden host appears in code, comment or not"
+after   8 pass / 0 fail        (scratch file deleted; git status --short empty)
+```
+
+The failure names the file, the line and the offending text, so the assertion is
+about the hit and not merely "something threw".
