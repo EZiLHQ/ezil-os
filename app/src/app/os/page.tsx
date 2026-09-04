@@ -3,6 +3,7 @@ import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 
 import { appRouter } from '@/server/api/root';
+import { OS_ACCESS_NOT_INVITED } from '@/server/api/os-access';
 import { createTRPCContext } from '@/server/api/trpc';
 import { bootPayloadScript, buildShellBootPayload } from '@/server/shell/boot-payload';
 import { Routes, getReturnUrlQueryParam } from '@/utils/constants';
@@ -48,6 +49,16 @@ import { HydrationSignal } from './hydration-signal';
  * revocation semantics, not to this page); a cached/co-located database; or an
  * app deployed in the database's region, where that 240ms is single digits.
  * Do not claim the target is met until one of those has been measured.
+ *
+ * 🔴 THAT 414ms IS STALE, AND KNOWINGLY SO. It was measured before the access
+ * gate below existed. The gate adds ONE MORE SERIAL database round trip — a
+ * primary-key read of `ezil_os_access` that cannot be folded into the
+ * `Promise.all`, because its whole purpose is to happen before the call that
+ * writes. On the same host that made `select 1` cost 120ms, expect roughly
+ * that much on top; in `open` mode it costs nothing at all (the mode
+ * short-circuits before any query — see `server/api/os-access.ts`). Nobody has
+ * re-measured the number, so treat 414ms as a floor, not as the current
+ * figure, and re-measure before quoting it.
  *
  * ── Three known costs, all deliberate ───────────────────────────────────────
  * 1. This page inherits the root layout (`src/app/layout.tsx`), so React and
@@ -109,6 +120,31 @@ export default async function Page() {
         // so it is used directly rather than read back from `x-pathname`.
         redirect(`${Routes.LOGIN}?${getReturnUrlQueryParam(Routes.OS)}`);
     }
+
+    /*
+     * 🔴 THE ACCESS GATE, AND ITS POSITION IS THE POINT.
+     *
+     * `getOrCreateDefault` below is a MUTATION: for a user with no computer it
+     * inserts one. So this check cannot live after it, cannot live inside the
+     * `Promise.all`, and cannot be folded into the `catch` that turns a failed
+     * lookup into `<CouldNotOpen />` — every one of those orders creates a
+     * computer row for a principal who may not use the product, and then tells
+     * them no. MEASURED with the check removed (`trpc-access.test.ts`'s
+     * mutation): a refused stranger's request reaches
+     * `select ... from "ezil_computers" ... order by slot` — the first step of
+     * `getOrCreateDefaultComputer`, whose next step on an empty result is the
+     * insert.
+     *
+     * `ctx.access()` is the same single implementation `protectedProcedure`
+     * uses, memoised on this context — so the two `caller.*` calls below reuse
+     * this decision rather than re-querying (`server/api/trpc.ts`). A refused
+     * user would be refused by them anyway; this gate is what stops the
+     * refusal happening AFTER the write.
+     */
+    if (!(await ctx.access()).allowed) {
+        redirect(`${Routes.LOGIN}?error=${OS_ACCESS_NOT_INVITED}`);
+    }
+
     const user = ctx.user;
     const caller = appRouter.createCaller(ctx);
 

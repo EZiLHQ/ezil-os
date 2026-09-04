@@ -87,32 +87,23 @@ export async function signInWithPassword(formData: FormData): Promise<AuthAction
     return { redirectTo: returnUrl };
 }
 
-/** Email/password sign-up. */
-export async function signUpWithPassword(formData: FormData): Promise<AuthActionResult> {
-    const email = String(formData.get('email') ?? '').trim();
-    const password = String(formData.get('password') ?? '');
-    const returnUrl = safeReturnUrl(String(formData.get('returnUrl') ?? ''));
-
-    if (!email || !password) {
-        return { error: 'Email and password are required.' };
-    }
-    if (password.length < 8) {
-        return { error: 'Password must be at least 8 characters.' };
-    }
-
-    const supabase = await createClient();
-    const origin = await siteOrigin();
-    const { error } = await supabase.auth.signUp({
-        email,
-        password,
-        options: { emailRedirectTo: `${origin}/auth/callback?returnUrl=${encodeURIComponent(returnUrl)}` },
-    });
-    if (error) {
-        return { error: error.message };
-    }
-
-    return { error: undefined };
-}
+/*
+ * 🔴 THERE IS NO SIGN-UP ACTION, AND THAT IS THE PRODUCT RULE.
+ *
+ * `signUpWithPassword` used to live here and called `supabase.auth.signUp`.
+ * EZiL OS is invite-only (`EZIL_OS_ACCESS_MODE`, default `invite`): an account
+ * is created by `bun tools/invite.ts add <email>`, which writes the
+ * `ezil_os_access` row and then asks Supabase to send an invite email. A
+ * self-service sign-up form does not just duplicate that — it lets anyone
+ * create an account on the shared Supabase project, which is a real cost
+ * (rows in `auth.users`, email quota) even though the access gate would refuse
+ * every one of them at `/os`.
+ *
+ * `login/entry-contract.test.ts` fails if `auth.signUp(` reappears anywhere
+ * under `app/src`. If self-service ever becomes the intent, that test is the
+ * place to record the decision — deleting the assertion should feel like a
+ * choice, because it is one.
+ */
 
 /**
  * Starts the Google OAuth flow. Supabase returns a provider authorization

@@ -2,30 +2,28 @@
 
 import { useActionState, useState } from 'react';
 
-import {
-    signInWithGoogle,
-    signInWithPassword,
-    signUpWithPassword,
-    type AuthActionResult,
-} from './actions';
+import { signInWithGoogle, signInWithPassword, type AuthActionResult } from './actions';
 
 const initialState: AuthActionResult = {};
 
+/**
+ * Sign IN only. There is no sign-up mode, no "Create account" toggle and no
+ * `new-password` branch: EZiL OS is invite-only, accounts are created by
+ * `bun tools/invite.ts add <email>`, and an invited user sets their password
+ * on `/auth/invited`. See `actions.ts` and `entry-contract.test.ts`.
+ *
+ * Google sign-in stays: an allow-listed address may well be a Google account,
+ * and the allow-list is keyed on the email either way.
+ */
 export function LoginForm({ returnUrl }: { returnUrl: string }) {
-    const [mode, setMode] = useState<'sign-in' | 'sign-up'>('sign-in');
-    const [signUpDone, setSignUpDone] = useState(false);
     /** Set once we have started leaving; keeps the button from re-arming. */
     const [leaving, setLeaving] = useState(false);
 
-    const action = mode === 'sign-in' ? signInWithPassword : signUpWithPassword;
     const [state, formAction, isPending] = useActionState(async (
         _prev: AuthActionResult,
         formData: FormData,
     ) => {
-        const result = await action(formData);
-        if (mode === 'sign-up' && !result.error) {
-            setSignUpDone(true);
-        }
+        const result = await signInWithPassword(formData);
         if (result.redirectTo) {
             setLeaving(true);
             /*
@@ -75,67 +73,47 @@ export function LoginForm({ returnUrl }: { returnUrl: string }) {
                 <div className="h-px flex-1 bg-white/10" />
             </div>
 
-            {signUpDone ? (
-                <p className="rounded-md border border-teal/30 bg-teal/10 p-3 text-sm text-teal">
-                    Check your email to confirm your account, then sign in below.
-                </p>
-            ) : (
-                <form action={formAction} className="space-y-3">
-                    <input type="hidden" name="returnUrl" value={returnUrl} />
-                    <div className="space-y-1.5">
-                        <label htmlFor="email" className="text-small text-gray-400">
-                            Email
-                        </label>
-                        <input
-                            id="email"
-                            name="email"
-                            type="email"
-                            required
-                            autoComplete="email"
-                            className="w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-sm text-offwhite outline-none focus:border-teal"
-                        />
-                    </div>
-                    <div className="space-y-1.5">
-                        <label htmlFor="password" className="text-small text-gray-400">
-                            Password
-                        </label>
-                        <input
-                            id="password"
-                            name="password"
-                            type="password"
-                            required
-                            minLength={mode === 'sign-up' ? 8 : undefined}
-                            autoComplete={mode === 'sign-in' ? 'current-password' : 'new-password'}
-                            className="w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-sm text-offwhite outline-none focus:border-teal"
-                        />
-                    </div>
-                    {state.error && <p className="text-small text-red-400">{state.error}</p>}
-                    <button
-                        type="submit"
-                        disabled={busy}
-                        className="w-full rounded-md bg-teal px-4 py-2.5 text-sm font-medium text-black transition-opacity hover:opacity-90 disabled:opacity-50"
-                    >
-                        {busy
-                            ? 'Please wait…'
-                            : mode === 'sign-in'
-                              ? 'Sign in'
-                              : 'Create account'}
-                    </button>
-                </form>
-            )}
+            <form action={formAction} className="space-y-3">
+                <input type="hidden" name="returnUrl" value={returnUrl} />
+                <div className="space-y-1.5">
+                    <label htmlFor="email" className="text-small text-gray-400">
+                        Email
+                    </label>
+                    <input
+                        id="email"
+                        name="email"
+                        type="email"
+                        required
+                        autoComplete="email"
+                        className="w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-sm text-offwhite outline-none focus:border-teal"
+                    />
+                </div>
+                <div className="space-y-1.5">
+                    <label htmlFor="password" className="text-small text-gray-400">
+                        Password
+                    </label>
+                    <input
+                        id="password"
+                        name="password"
+                        type="password"
+                        required
+                        autoComplete="current-password"
+                        className="w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-sm text-offwhite outline-none focus:border-teal"
+                    />
+                </div>
+                {state.error && <p className="text-small text-red-400">{state.error}</p>}
+                <button
+                    type="submit"
+                    disabled={busy}
+                    className="w-full rounded-md bg-teal px-4 py-2.5 text-sm font-medium text-black transition-opacity hover:opacity-90 disabled:opacity-50"
+                >
+                    {busy ? 'Please wait…' : 'Sign in'}
+                </button>
+            </form>
 
             <p className="text-small text-gray-400">
-                {mode === 'sign-in' ? "Don't have an account? " : 'Already have an account? '}
-                <button
-                    type="button"
-                    onClick={() => {
-                        setMode(mode === 'sign-in' ? 'sign-up' : 'sign-in');
-                        setSignUpDone(false);
-                    }}
-                    className="text-offwhite underline hover:text-teal"
-                >
-                    {mode === 'sign-in' ? 'Create one' : 'Sign in'}
-                </button>
+                EZiL OS is invite-only. If you do not have an account yet, ask a maintainer for an
+                invitation.
             </p>
         </div>
     );
