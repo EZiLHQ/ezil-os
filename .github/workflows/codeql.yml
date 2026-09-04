@@ -1,0 +1,66 @@
+# CodeQL — static analysis for the JS/TypeScript code across worker/, app/,
+# shell/, sdk/, mcp/ and e2e/.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THIS JOB HAS NO paths-ignore AND NO JOB-LEVEL if:
+# ─────────────────────────────────────────────────────────────────────────────
+# A branch-protection ruleset requires the check named below
+# ("CodeQL (javascript-typescript)") on every pull request. A required status
+# context only satisfies a ruleset if a check run with that exact name is
+# actually POSTED for the commit. A job skipped by `paths-ignore` or a
+# job-level `if:` never runs, so it never posts a check run — GitHub then
+# shows the required check stuck on "Expected", and the PR can never merge,
+# no matter what the next push changes. So `codeql` below always runs, on
+# every push to main and every pull request, even for a change that plainly
+# touches nothing CodeQL could analyze (docs, YAML, etc).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THERE IS NO SEPARATE `autobuild` STEP
+# ─────────────────────────────────────────────────────────────────────────────
+# `autobuild` is "only used for analyzing languages that require a build" —
+# it exists to run the language's own build system (javac, msbuild, ...) so
+# CodeQL can trace a compiled binary back to source. javascript-typescript is
+# interpreted: build-mode defaults to `none`, and GitHub's own advanced-setup
+# guide gives the sequence for it as checkout -> init -> analyze, with no
+# build step at all.
+# https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/customizing-your-advanced-setup-for-code-scanning
+# https://github.com/github/codeql-action/blob/main/autobuild/action.yml
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, independent of any push — catches newly-published CodeQL query
+    # packs against code that has not changed since the last run.
+    - cron: '17 5 * * 1'
+
+# Advanced-setup code scanning needs security-events: write to upload SARIF
+# results, contents: read to check out the tree, and actions: read for the
+# Action to look up its own workflow run. Public repo: `pull_request` runs
+# for forks too, so this is the token a stranger's PR gets — read-only plus
+# the one write scope the analysis upload itself requires.
+permissions:
+  security-events: write
+  contents: read
+  actions: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codeql:
+    name: CodeQL (javascript-typescript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
