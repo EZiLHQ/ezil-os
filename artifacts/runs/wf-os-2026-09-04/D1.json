@@ -1,0 +1,10 @@
+{
+  "taskId": "D1",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "pending",
+  "evidence": ".github/dependabot.yml committed (ab6130d): 6 entries parse via yaml.safe_load, each npm/bun entry has exactly one ignore key, /worker still ignores @cloudflare/sandbox. Added bun-ecosystem entries for /sdk and /mcp (verified bun.lock needs package-ecosystem: bun, not npm, via GitHub docs). Now writing CONTRIBUTING.md.",
+  "startedAt": "2026-09-04T07:42:37Z",
+  "updatedAt": "2026-09-04T07:46:12Z",
+  "by": "worker-sonnet-D1"
+}
