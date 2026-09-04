@@ -301,16 +301,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 🔴 HAND-OFF: this job PUBLISHES ghcr.io/ezilhq/ezil-os-desktop:<sha8>
-      # but never writes that tag back into deploy/images.env's
-      # EZIL_DESKTOP_TAG (still the file's own placeholder,
-      # `<to be pinned by CI>`, permissions here are `contents: read` on
-      # purpose). run-spec.ts's isDockerTag guard means that placeholder
-      # keeps failing closed to LOCAL_DESKTOP_IMAGE_FALLBACK forever until
-      # something updates it — no row in docs/TASKS.csv currently owns that
-      # write-back (a commit to main from a workflow, or a separate release
-      # step). Flagged, not fixed: deploy/images.env is not in this row's
-      # owns_files and this workflow has no write access to contents.
+      # This job PUBLISHES ghcr.io/ezilhq/ezil-os-desktop:<sha8> but never
+      # writes that tag back into deploy/images.env's EZIL_DESKTOP_TAG (still
+      # the file's own placeholder, `<to be pinned by CI>` — deliberately: a
+      # workflow commit to `main` needs `contents: write` and races the
+      # branch ruleset, so `permissions:` above stays `contents: read`).
+      # run-spec.ts's isDockerTag guard means that placeholder keeps failing
+      # closed to LOCAL_DESKTOP_IMAGE_FALLBACK until something updates it.
+      # What this job DOES do instead, below: the job summary and the
+      # `published-images.env` artifact ("Write published-images.env" /
+      # "Upload published-images.env" steps) both carry the exact
+      # `EZIL_DESKTOP_TAG=<sha8>` line a human (or row R2's release step)
+      # pastes into deploy/images.env to advance the pin — see that file's
+      # own hand-off comment for the exact command.
       - name: Compute tags
         id: tags
         run: |
@@ -361,6 +364,37 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
+      # 🔴 THE WRITE-BACK PATH FOR deploy/images.env's EZIL_DESKTOP_TAG.
+      # This job cannot commit (`contents: read`, see "Compute tags" above),
+      # so it hands the pin to whoever advances it as a ready-to-paste line
+      # instead: this file is downloadable from the run
+      # (`gh run download <run-id> -n published-images.env`) and its one
+      # `EZIL_DESKTOP_TAG=<sha8>` line replaces deploy/images.env's
+      # placeholder verbatim.
+      - name: Write published-images.env
+        id: published
+        run: |
+          sha8="${GITHUB_SHA:0:8}"
+          mkdir -p "${RUNNER_TEMP}/published-images"
+          out="${RUNNER_TEMP}/published-images/published-images.env"
+          {
+            echo "# Published by .github/workflows/image.yml, run ${GITHUB_RUN_ID}, commit ${GITHUB_SHA}."
+            echo "# Not written back automatically (this job runs with contents: read"
+            echo "# on purpose - see deploy/images.env's own hand-off comment on"
+            echo "# EZIL_DESKTOP_TAG). Paste the line below over that file's"
+            echo "# EZIL_DESKTOP_TAG and commit to advance the pin."
+            echo "EZIL_DESKTOP_TAG=${sha8}"
+          } > "${out}"
+          echo "path=${out}" >> "$GITHUB_OUTPUT"
+          cat "${out}"
+
+      - name: Upload published-images.env
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-images.env
+          path: ${{ steps.published.outputs.path }}
+          retention-days: 90
+
       - name: Job summary
         env:
           DESKTOP_TAGS: ${{ steps.tags.outputs.tags }}
@@ -371,6 +405,7 @@ jobs:
           DESKTOP_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           tags_csv="$(printf '%s' "${DESKTOP_TAGS}" | paste -sd, -)"
+          sha8="${GITHUB_SHA:0:8}"
           {
             echo "### Image digests"
             echo
@@ -382,4 +417,13 @@ jobs:
               echo "| \`${OVERLAY_REF}\` | (unchanged - not rebuilt this run) | n/a |"
             fi
             echo "| \`${DESKTOP_IMAGE}\` | ${tags_csv} | \`${DESKTOP_DIGEST}\` |"
+            echo
+            echo "### Advancing deploy/images.env's EZIL_DESKTOP_TAG pin"
+            echo
+            echo "Not written back automatically (this job has \`contents: read\`)."
+            echo "Download the \`published-images.env\` artifact from this run and"
+            echo "paste its \`EZIL_DESKTOP_TAG=${sha8}\` line over the placeholder:"
+            echo '```'
+            echo "gh run download ${GITHUB_RUN_ID} -R ${GITHUB_REPOSITORY} -n published-images.env"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
