@@ -1,0 +1,9 @@
+{
+  "taskId": "N2",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "TARGET_ENVIRONMENT_CONFIRMED",
+  "evidence": "docs half; e2e default flip and host verification pending N1",
+  "startedAt": "2026-09-04T12:19:14Z",
+  "updatedAt": "2026-09-04T12:19:14Z"
+}
