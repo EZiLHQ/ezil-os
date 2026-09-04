@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
@@ -136,5 +136,77 @@ describe('/ redirects into /os, so its one known client-side sender must be a re
         // that conversion turns the eventual /os redirect back into a soft
         // nav that never executes /os's <script src> tags.
         expect(code(loginPage)).not.toMatch(/<Link[^>]*href=\{Routes\.HOME\}/);
+    });
+});
+
+/**
+ * 🔴 EZiL OS IS INVITE-ONLY, AND THAT IS AN ENTRY CONTRACT TOO.
+ *
+ * Accounts are created by `bun tools/invite.ts add <email>`, which writes the
+ * `ezil_os_access` row and then asks Supabase to send an invite; an invited
+ * person sets their password on `/auth/invited`. `signUpWithPassword` and the
+ * form's `'sign-up'` mode were deleted for this (row A2).
+ *
+ * The sweep below reads every source file under `app/src` rather than the
+ * three files this row touched, because the failure it guards is somebody
+ * adding a NEW surface with a sign-up call on it — which no assertion against
+ * a fixed list of files can see. It is a decision, not a lint rule: if
+ * self-service sign-up ever becomes the intent, delete this block deliberately.
+ */
+const APP_SRC = path.resolve(here, '../..');
+
+function* sourceFilesUnder(dir: string): Generator<string> {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+            yield* sourceFilesUnder(full);
+        } else if (/\.(ts|tsx)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)) {
+            // Test files are excluded: they are not app surfaces, and THIS
+            // file has to be able to write the pattern down in order to
+            // search for it.
+            yield full;
+        }
+    }
+}
+
+describe('there is no way to create an account from the app', () => {
+    it('🔴 nothing under app/src calls auth.signUp(', () => {
+        const offenders: string[] = [];
+        let scanned = 0;
+        for (const file of sourceFilesUnder(APP_SRC)) {
+            scanned += 1;
+            // Comments are stripped, so a file that DOCUMENTS the removal (as
+            // `actions.ts` does) does not read as reintroducing it.
+            if (/\bauth\s*\.\s*signUp\s*\(/.test(code(readFileSync(file, 'utf8')))) {
+                offenders.push(path.relative(APP_SRC, file));
+            }
+        }
+        // The positive control: the sweep really did read the tree. Without
+        // this, an empty walk would pass silently and prove nothing.
+        expect(scanned).toBeGreaterThan(40);
+        expect(offenders).toEqual([]);
+    });
+
+    it('the sign-up action is gone from actions.ts', () => {
+        // `code()` first: `actions.ts` DOCUMENTS the deletion in a comment,
+        // and documenting it must not read as doing it.
+        expect(code(actions)).not.toMatch(/signUpWithPassword/);
+        expect(code(actions)).not.toMatch(/signUp\b/);
+        // Positive control: sign-IN is still there, so this is not passing
+        // because the file failed to load.
+        expect(actions).toMatch(/export async function signInWithPassword\(/);
+        expect(actions).toMatch(/export async function signInWithGoogle\(/);
+        expect(actions).toMatch(/export async function signOut\(/);
+    });
+
+    it('the form has no sign-up mode, toggle or new-password branch', () => {
+        const body = code(form);
+        expect(body).not.toMatch(/'sign-up'/);
+        expect(body).not.toMatch(/setMode|Create account|Create one/);
+        expect(body).not.toMatch(/new-password/);
+        expect(body).not.toMatch(/minLength/);
+        // Positive control: the sign-in form itself survived the deletion.
+        expect(body).toMatch(/signInWithPassword/);
+        expect(body).toMatch(/Continue with Google/);
     });
 });
