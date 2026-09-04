@@ -1,0 +1,111 @@
+# Setup Playwright — a pinned browser, portable across the 3-OS CI matrix.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THIS IS NOT A PROJECT DEPENDENCY
+# ─────────────────────────────────────────────────────────────────────────────
+# `shell/run-tests.sh`'s own header explains it: Playwright is deliberately NOT
+# in any `package.json` or lockfile in this repository. `shell/*-browser-test.mjs`
+# resolves it first from its own location, then from a directory named by
+# `$PLAYWRIGHT_REQUIRE_DIR` — see e.g. `shell/window-chrome-browser-test.mjs`.
+# This action installs it into that directory and exports the variable, so it
+# is the ONE place a CI leg's Playwright version is pinned.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THE INSTALL DIRECTORY IS `${{ runner.temp }}`, NOT A HARDCODED PATH
+# ─────────────────────────────────────────────────────────────────────────────
+# The path this used to be installed at (`/opt/ezil-testkit`) is Linux-only —
+# there is no `/opt` on the Windows or macOS runner images. `runner.temp` is a
+# real directory on every GitHub-hosted runner OS
+# (`D:\a\_temp` on Windows, `/private/var/.../_temp`-style on macOS,
+# `/home/runner/work/_temp` on Linux), so `${{ runner.temp }}/ezil-testkit`
+# is portable by construction.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY `PLAYWRIGHT_BROWSERS_PATH=0`, AND WHY THE CACHE KEYS ON IT
+# ─────────────────────────────────────────────────────────────────────────────
+# Playwright's default browser cache directory differs per OS
+# (`~/.cache/ms-playwright` on Linux, `~/Library/Caches/ms-playwright` on
+# macOS, `%LOCALAPPDATA%\ms-playwright` on Windows — see
+# https://playwright.dev/docs/browsers#managing-browser-binaries), so a naive
+# `actions/cache` step would need a 3-way branch just to name the right path,
+# and `~`/`%LOCALAPPDATA%` do not both expand correctly from a `shell: bash`
+# step on every runner. Setting `PLAYWRIGHT_BROWSERS_PATH=0` switches Playwright
+# to its documented "hermetic install" mode instead: the browser binary is
+# downloaded to `node_modules/playwright-core/.local-browsers`, a path relative
+# to the testkit directory this action already controls and identical in shape
+# on all three OSes. One cache `path`, one cache `key` (`runner.os` +
+# `inputs.version`), no per-OS branch.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY `--with-deps` IS LINUX-ONLY
+# ─────────────────────────────────────────────────────────────────────────────
+# `playwright install --with-deps` shells out to the OS package manager (apt)
+# to install the system libraries headless Chromium needs. That flag/behaviour
+# is Linux-specific; Windows and macOS runner images already carry what a
+# GUI-capable Chromium needs, and `--with-deps` is not a supported combination
+# there. `runner.os` (not `matrix.os`, which this action does not have access
+# to) is read at the point this action actually runs, so it is correct
+# regardless of how the caller's matrix is spelled.
+
+name: Setup Playwright
+description: >-
+  Installs a pinned Playwright + Chromium into $RUNNER_TEMP/ezil-testkit
+  (never a project dependency) and exports PLAYWRIGHT_REQUIRE_DIR so
+  shell/*-browser-test.mjs can resolve it, on any of the three CI runner OSes.
+
+inputs:
+  version:
+    description: The `playwright` npm package version to install.
+    required: false
+    default: '1.62.1'
+
+runs:
+  using: composite
+  steps:
+    # 🔴 No `runner` context anywhere below. Inside a composite action GitHub
+    # rejects `${{ runner.temp }}` in a `with:`/`working-directory:` position
+    # ("Unrecognized named-value: 'runner'") — measured on PR #14, where this
+    # action failed to LOAD on all three OSes. The environment variables
+    # $RUNNER_TEMP and $RUNNER_OS are always present in a step's shell, so the
+    # paths and the cache key are computed once in bash and handed on through
+    # step outputs, which composite steps may reference.
+    - name: Resolve the testkit directory and cache key
+      id: prep
+      shell: bash
+      run: |
+        set -e
+        dir="${RUNNER_TEMP}/ezil-testkit"
+        echo "dir=${dir}" >> "$GITHUB_OUTPUT"
+        echo "browsers=${dir}/node_modules/playwright-core/.local-browsers" >> "$GITHUB_OUTPUT"
+        echo "key=playwright-chromium-${RUNNER_OS}-${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+        echo "PLAYWRIGHT_BROWSERS_PATH=0" >> "$GITHUB_ENV"
+        mkdir -p "${dir}"
+
+    - name: Cache the Chromium download
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.prep.outputs.browsers }}
+        key: ${{ steps.prep.outputs.key }}
+
+    - name: Install the playwright package
+      shell: bash
+      working-directory: ${{ steps.prep.outputs.dir }}
+      run: |
+        set -e
+        npm init -y >/dev/null
+        npm i "playwright@${{ inputs.version }}" >/dev/null
+
+    - name: Install chromium (--with-deps only on Linux)
+      shell: bash
+      working-directory: ${{ steps.prep.outputs.dir }}
+      run: |
+        set -e
+        if [ "${RUNNER_OS}" = "Linux" ]; then
+          npx playwright install --with-deps chromium
+        else
+          npx playwright install chromium
+        fi
+
+    - name: Export PLAYWRIGHT_REQUIRE_DIR
+      shell: bash
+      run: echo "PLAYWRIGHT_REQUIRE_DIR=${{ steps.prep.outputs.dir }}/node_modules" >> "$GITHUB_ENV"

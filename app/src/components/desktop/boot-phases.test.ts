@@ -47,7 +47,11 @@ import shellSession from '../../../../shell/ezil/session.js';
  * in `boot-phases.shell.test.ts`.
  */
 function computeBootUiStateSource(file: string): string {
-    const src = readFileSync(fileURLToPath(new URL(file, import.meta.url)), 'utf8');
+    // Normalise CRLF: a Windows checkout (`* text=auto`) gives every .ts file
+    // CRLF endings, the line-anchored extraction below then matches nothing,
+    // and the hash of an empty string (e3b0c442…) is compared to the reviewed
+    // text — measured on PR #14, sixth run.
+    const src = readFileSync(fileURLToPath(new URL(file, import.meta.url)), 'utf8').replace(/\r\n/g, '\n');
     const start = src.indexOf('export function computeBootUiState');
     expect(start).toBeGreaterThan(-1);
     const end = src.indexOf('\n}\n', start) + 3;

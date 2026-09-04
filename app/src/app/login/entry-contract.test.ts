@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
@@ -29,8 +30,8 @@ import { describe, expect, it } from 'vitest';
  * breaks the login path.
  */
 
-const here = path.dirname(new URL(import.meta.url).pathname);
-const read = (p: string) => readFileSync(path.resolve(here, p), 'utf8');
+const here = path.dirname(fileURLToPath(import.meta.url));
+const read = (p: string) => readFileSync(path.resolve(here, p), 'utf8').replace(/\r\n/g, '\n');
 
 const actions = read('./actions.ts');
 const form = read('./login-form.tsx');

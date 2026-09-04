@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
@@ -24,8 +25,8 @@ import { describe, expect, it } from 'vitest';
  * could fake either way.
  */
 
-const here = path.dirname(new URL(import.meta.url).pathname);
-const read = (p: string) => readFileSync(path.resolve(here, p), 'utf8');
+const here = path.dirname(fileURLToPath(import.meta.url));
+const read = (p: string) => readFileSync(path.resolve(here, p), 'utf8').replace(/\r\n/g, '\n');
 
 describe('/ (root) redirects an authenticated visitor into the OS', () => {
     it('🔴 redirects to Routes.OS, not Routes.COMPUTERS', () => {

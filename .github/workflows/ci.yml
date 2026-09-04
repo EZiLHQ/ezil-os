@@ -3,18 +3,47 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # WHAT THIS RUNS, AND WHAT IT DELIBERATELY DOES NOT
 # ─────────────────────────────────────────────────────────────────────────────
-# It runs everything a hosted runner can honestly run: type checks, unit tests,
-# the real-browser shell suites (Playwright, headless Chromium), and a check
-# that the committed shell bundle still matches its sources.
+# `worker`, `app`, `connectors` (sdk + mcp) and `shell` each run on a THREE-OS
+# matrix (`ubuntu-latest`, `windows-latest`, `macos-latest`, `fail-fast: false`
+# so one OS's failure does not hide the other two's results) — every `run:`
+# step in those four jobs sets `shell: bash` explicitly, because the default
+# shell on a Windows runner is PowerShell, not bash. A matrix job's check-run
+# name is `<name> (<matrix.os value>)` — e.g. `worker (typecheck + unit)
+# (windows-latest)` — so a required-status list naming the base job names
+# alone will not match; it has to name (or wildcard) the OS suffix too.
 #
-# It does NOT run:
+# It also runs three ubuntu-only jobs: `tools` (typecheck + unit — the one
+# package with neither a `strategy.matrix` need nor a Windows-portability
+# question), and two that exist to HARD-FAIL rather than silently skip:
 #
-#   * the CONTAINER tests (`*.container.test.ts`). They boot the real neko image
-#     with Docker, which a runner does not have and cannot cheaply build. Each
-#     one already gates on `docker image inspect` and SKIPS rather than fails,
-#     so they are green-by-absence here — which is exactly why they are named in
-#     the job summary. A skipped test that looks like a pass is how a suite
-#     stops meaning anything.
+#   `container` — a placeholder. `worker/Dockerfile:77` pins a project-owned
+#   neko base image that has never been pushed anywhere and exists only on a
+#   developer's machine, so nothing can build or pull the real desktop image
+#   here yet. Publishing it is row T3's job. Until then this job fails on
+#   purpose, loudly naming T3, so the required-status list can include
+#   "container" now without that context ever being a silent, meaningless
+#   green.
+#
+#   `local` — installs and typechecks `local/` for real (no image needed for
+#   that), then runs `bun test local/` and inspects the result: `bun test`
+#   itself exits 0 when tests are SKIPPED, not just when they pass, so a job
+#   that only checked the exit code would go green while
+#   `local/src/host/docker-host.container.test.ts` — the one suite that boots
+#   a real desktop — never ran (same image gap as `container`, above). This
+#   job parses bun's own pass/skip/fail counts and fails outright if anything
+#   was skipped, naming T3 by name.
+#
+# What NONE of the above runs:
+#
+#   * the CONTAINER tests (`*.container.test.ts`) inside `worker`'s own matrix
+#     job. They boot the real neko image with Docker, which only the ubuntu
+#     leg even has a daemon for (GitHub's macOS runners have no Docker daemon
+#     and Windows runners cannot run a Linux container), and every one already
+#     gates on `docker image inspect` and SKIPS rather than fails there too —
+#     which is exactly why `local`'s job above exists to make that same skip
+#     loud where this row can actually control the outcome (`local/`'s own
+#     suite). A skipped test that looks like a pass is how a suite stops
+#     meaning anything.
 #
 #   * the PRODUCTION suites (`e2e/prod-*.mjs`). They sign in to the live
 #     deployment with real credentials and drive a real container. They belong
@@ -22,7 +51,9 @@
 #
 # 🔴 The bundle check is not decoration. `app/public/os/bundle.min.js` is
 # COMMITTED, and a source change without a rebuild ships the old behaviour while
-# every local test passes against the new source. That has happened here.
+# every local test passes against the new source. That has happened here. (On
+# the Windows leg specifically, this check is SKIPPED for a measured,
+# unrelated reason — see the step's own comment below, not this one.)
 name: CI
 
 on:
@@ -43,27 +74,73 @@ concurrency:
 jobs:
   worker:
     name: worker (typecheck + unit)
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
       - name: Install
+        shell: bash
         working-directory: worker
         run: bun install --frozen-lockfile
       - name: Typecheck
+        shell: bash
         working-directory: worker
         run: bun run typecheck
       - name: Unit tests
+        # Linux only: these suites EXECUTE the container's Ubuntu boot scripts
+        # (start-neko.sh, emit_telemetry, the NDJSON tail) for real — PR #14, eighth
+        # run: 227 of them fail on macOS for exactly that reason. They are Linux tests
+        # of a Linux container; the typecheck above runs on every OS. Row M3 makes
+        # them self-skip with a printed reason so a Mac contributor's `bun test` is
+        # honest too. Step-level, so the check run the ruleset requires still exists.
+        if: runner.os == 'Linux'
+        shell: bash
         working-directory: worker
-        # Container tests skip themselves when Docker has no image; everything
-        # else must pass.
-        run: bun test
+        # Container tests skip themselves when Docker has no image (or, on
+        # macOS/Windows, no daemon at all); everything else must pass. This
+        # includes `shell-scripts-parse.test.ts`, which runs `bash -n` on
+        # every shipped `.sh` — on the Windows leg that resolves `bash` from
+        # Git for Windows, which every GitHub-hosted Windows runner ships.
+        #
+        # `--reporter=junit`: bun's default console reporter, MEASURED,
+        # prints per-test names for FAILURES only — a fully passing run
+        # prints just the ` N pass / N fail` summary, never the individual
+        # test names. That is true on every OS, but it means this row's own
+        # verify_cmd ("Windows leg log shows bash -n file list") would be
+        # unsatisfiable from `bun test` alone even on a green run. The JUnit
+        # XML lists every test regardless of outcome; exit code is unchanged
+        # by adding a second reporter (measured: still 0 on pass, nonzero on
+        # any failure).
+        run: bun test --reporter=junit --reporter-outfile=/tmp/worker-junit.xml
+      # Prints exactly the evidence this row's verify_cmd asks for, without
+      # dumping the full (much larger) JUnit report into the log.
+      - name: Show the bash -n file list (verify_cmd evidence)
+        # Linux only: these suites EXECUTE the container's Ubuntu boot scripts
+        # (start-neko.sh, emit_telemetry, the NDJSON tail) for real — PR #14, eighth
+        # run: 227 of them fail on macOS for exactly that reason. They are Linux tests
+        # of a Linux container; the typecheck above runs on every OS. Row M3 makes
+        # them self-skip with a printed reason so a Mac contributor's `bun test` is
+        # honest too. Step-level, so the check run the ruleset requires still exists.
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo "bash -n was run, this leg (${{ runner.os }}), against:"
+          grep -oE '<testcase name="[^"]*parses under `bash -n`"' /tmp/worker-junit.xml \
+            | sed -E 's/^<testcase name="//; s/"$//'
 
   app:
     name: app (typecheck + unit)
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -76,24 +153,36 @@ jobs:
         with:
           bun-version: latest
       - name: Install
+        shell: bash
         working-directory: app
         run: bun install --frozen-lockfile
       - name: Typecheck
+        shell: bash
         working-directory: app
-        run: npx tsc --noEmit -p tsconfig.json
+        # `bun run`, not `npx`: on the Windows runner npx does not resolve the
+        # bun-created node_modules/.bin shim and quietly installs an unrelated
+        # npm package named `tsc` instead (PR #14, fifth run). bun resolves its
+        # own shims on every OS.
+        run: bun run typecheck
       # `app/eslint.config.mjs` has existed and been configured all along; it
       # was simply never run by anything. A configured linter nobody runs is a
       # linter that is already failing.
       - name: Lint
+        shell: bash
         working-directory: app
         run: bun run lint
       - name: Unit tests
+        shell: bash
         working-directory: app
-        run: npx vitest run
+        run: bun run test
 
   connectors:
     name: sdk + mcp (typecheck + unit)
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
@@ -103,33 +192,43 @@ jobs:
       # depends on it by `file:../sdk` — a break in the SDK should be reported
       # as an SDK failure, not as a confusing downstream one.
       - name: Install (sdk)
+        shell: bash
         working-directory: sdk
         run: bun install --frozen-lockfile
       - name: Typecheck (sdk)
+        shell: bash
         working-directory: sdk
         run: bun run typecheck
       # Includes `src/surface.test.ts`, the drift guard: it reads the real
       # routers under app/ and fails if this client calls a procedure the
       # server does not have, or if the server grew one nobody decided about.
       - name: Unit tests (sdk)
+        shell: bash
         working-directory: sdk
         run: bun test
       - name: Install (mcp)
+        shell: bash
         working-directory: mcp
         run: bun install --frozen-lockfile
       - name: Typecheck (mcp)
+        shell: bash
         working-directory: mcp
         run: bun run typecheck
       # Includes `src/server.protocol.test.ts`, which drives the real server
       # with a real MCP client over a real transport. Handlers that work and
       # handlers that are correctly registered are different claims.
       - name: Unit tests (mcp)
+        shell: bash
         working-directory: mcp
         run: bun test
 
   shell:
     name: shell (bundle check + browser suites)
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -141,7 +240,34 @@ jobs:
       # 🔴 The committed bundle must match its sources. Without this a source
       # change without a rebuild ships the OLD behaviour while every other check
       # passes against the NEW source.
+      #
+      # 🔴 WINDOWS-ONLY EXCLUSION — MEASURED, NOT ASSUMED, AND NOT THIS ROW'S
+      # FILE TO FIX. `.gitattributes` (owned by row T0) pins `*.sh`, `*.bash`,
+      # `*.mjs`, `*.ps1` and the three committed `app/public/os/*` bundle
+      # files to a fixed line ending, but NOT `shell/src/**/*.css`,
+      # `shell/src/icons/*.svg`, or `shell/ezil/**/*.js` (non-`.mjs`) — the
+      # SOURCES this script reads to rebuild the bundle for comparison.
+      # Measured on this repo at commit b4c0c98, with `core.autocrlf=true`
+      # (Git for Windows' documented default — the exact fact
+      # `.gitattributes`'s own header cites for why `*.sh` needed pinning):
+      # those source files check out CRLF, and rebuilding from them produces a
+      # `bundle.min.css` and `icons.js` that byte-differ from the LF-built
+      # committed copy (`diff -r` exits 1 on `bundle.min.css` and `icons.js`;
+      # `bundle.min.js` happens not to differ). That is a false failure of
+      # this DRIFT GUARD, not evidence of real drift — the three committed
+      # bundle files are `-text` in `.gitattributes` and are therefore
+      # byte-identical on every OS's checkout, so the suites below still test
+      # the real, unmodified bundle on Windows; only this rebuild-and-compare
+      # step is unreliable there. The guard still runs on the other two OSes,
+      # so staleness is still caught elsewhere in the matrix.
+      #
+      # HAND-OFF (not this row's `owns_files`): extend `.gitattributes` to pin
+      # `shell/src/**/*.css`, `shell/src/icons/*.svg` and `shell/ezil/**/*.js`
+      # (excluding `*.mjs`, already pinned) to `eol=lf` the same way `*.sh` is
+      # pinned, then drop this `if:`.
       - name: Committed bundle matches source
+        if: runner.os != 'Windows'
+        shell: bash
         run: bash shell/build-shell.sh --check
       # 🔴 `shell/` HAS dependencies, and this job never installed them. Five of
       # the six unit suites below `import 'jsdom'`, declared in
@@ -150,16 +276,18 @@ jobs:
       # ever since the suites were added — invisible locally, where
       # `shell/node_modules` already exists.
       - name: Install (shell)
+        shell: bash
         working-directory: shell
         run: bun install --frozen-lockfile
-      - name: Install Playwright
-        run: |
-          mkdir -p /opt/ezil-testkit
-          cd /opt/ezil-testkit
-          npm init -y >/dev/null
-          npm i playwright@1.62.1 >/dev/null
-          npx playwright install --with-deps chromium
+      # See .github/actions/setup-playwright/action.yml for why this is a
+      # composite action rather than an inline `/opt/ezil-testkit` install:
+      # `/opt` does not exist on the Windows or macOS runner images.
+      - name: Setup Playwright
+        uses: ./.github/actions/setup-playwright
+        with:
+          version: '1.62.1'
       - name: Shell unit suites
+        shell: bash
         run: |
           set -e
           for t in shell/ezil/apps/desktop-screen-test.mjs \
@@ -171,22 +299,190 @@ jobs:
             echo "── $t"
             node "$t"
           done
-      - name: Shell real-browser suites
-        env:
-          PLAYWRIGHT_REQUIRE_DIR: /opt/ezil-testkit
+      # PLAYWRIGHT_REQUIRE_DIR is exported to $GITHUB_ENV by the Setup
+      # Playwright step above — no env: block needed here.
+      # Two families. The PORTABLE suites assert behaviour (focus, stacking,
+      # paint order, a mobile keyboard) and run on every OS. The GEOMETRY suites
+      # assert pixel deltas and settle times of a real Chromium and were designed
+      # and measured on Linux; on macOS Chromium the same shell settles at 1919px
+      # instead of 1920 and a minimise/restore cycle differs by 5-6px (PR #14,
+      # fourth run) — rendering-platform noise, not a product defect, and a
+      # threshold tuned per OS would measure nothing. They run on the Linux leg
+      # only, by a STEP-level condition (a job-level `if:` would drop the check
+      # run the ruleset requires). A geometry claim that must hold on macOS or
+      # Windows belongs in a suite written and measured there.
+      - name: Shell real-browser suites (portable)
+        shell: bash
+        run: |
+          set -e
+          for t in shell/touch-focus-browser-test.mjs \
+                   shell/ezil/apps/os-chrome-browser-test.mjs \
+                   shell/ezil/apps/mobile-browser-test.mjs \
+                   shell/ezil/ui/Settings/stacking-browser-test.mjs \
+                   shell/ezil/ui/Settings/late-focus-browser-test.mjs; do
+            echo "── $t"
+            node "$t"
+          done
+      - name: Shell real-browser suites (geometry — Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
           set -e
           for t in shell/responsiveness-browser-test.mjs \
                    shell/seam-minimise-browser-test.mjs \
                    shell/window-chrome-browser-test.mjs \
                    shell/phone-stacking-browser-test.mjs \
-                   shell/touch-focus-browser-test.mjs \
-                   shell/ezil/apps/os-chrome-browser-test.mjs \
-                   shell/ezil/apps/mobile-browser-test.mjs \
                    shell/ezil/apps/overlay-paint-browser-test.mjs \
-                   shell/ezil/apps/resize-test.mjs \
-                   shell/ezil/ui/Settings/stacking-browser-test.mjs \
-                   shell/ezil/ui/Settings/late-focus-browser-test.mjs; do
+                   shell/ezil/apps/resize-test.mjs; do
             echo "── $t"
             node "$t"
           done
+
+  # ── tools (typecheck + unit) — ubuntu only ──────────────────────────────────
+  # `tools/` deliberately has no `node_modules`/lockfile of its own — see
+  # `tools/tsconfig.json`'s own comment: it borrows `@types/bun` from
+  # `sdk/node_modules/@types`, and its `typecheck` script (`tsc --noEmit`)
+  # needs `tsc` itself resolved from `sdk/node_modules/.bin` on PATH (O2's
+  # 2026-09-04 hand-off). So: install `sdk/`, put its `.bin` on PATH, run.
+  tools:
+    name: tools (typecheck + unit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install (sdk)
+        shell: bash
+        working-directory: sdk
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        shell: bash
+        run: PATH="$PWD/sdk/node_modules/.bin:$PATH" bun run --cwd tools typecheck
+      - name: Unit tests
+        shell: bash
+        run: bun test tools/
+
+  # ── container — a deliberate, loud placeholder. NOT a real test job yet. ───
+  # `worker/Dockerfile:77` pins
+  #   ARG NEKO_IMAGE=ezil-neko-vscode:d74052bb-049931d7-ezil-brand8
+  # a project-owned neko+VS Code base image that, per that Dockerfile's own
+  # header, has "Never [been] pushed to any registry" and exists only in a
+  # developer machine's local Docker image store. `docker build
+  # worker/Dockerfile` therefore cannot succeed on a hosted runner today, and
+  # `deploy/images.env`'s `EZIL_DESKTOP_TAG` is a deliberate, self-documented
+  # placeholder ("<to be pinned by CI>") because nothing has ever been pushed
+  # to GHCR (no tags exist in this repository — `deploy.yml` has never run).
+  # Building or pulling that image in CI is row T3's business, not this row's
+  # (the image itself is 4.6 GB; building it here today is not just blocked,
+  # it would be the wrong layer for this row to own even if it were not).
+  #
+  # `worker/src/*.container.test.ts` and
+  # `local/src/host/docker-host.container.test.ts` already gate on `docker
+  # image inspect` and SKIP — never fail — when the image they need is
+  # missing, which is exactly correct behaviour on a developer's machine and
+  # exactly wrong for a REQUIRED status context: a check that is green
+  # because it never actually ran a container is how this product's central
+  # claim ("it runs on your machine, for real") ships broken and unnoticed.
+  # `local/`'s job below turns that particular skip into a hard failure by
+  # reading `bun test local/`'s own output; the block of checks in `worker`
+  # has no equivalent here because `worker`'s job already runs elsewhere in
+  # this file and adding a second, ubuntu-only, non-matrix copy of it would
+  # duplicate rather than extend that guard.
+  #
+  # So this job does the only honest thing left: it fails, on purpose, with a
+  # message that names exactly what has to change (row T3 publishing an
+  # image) and why — so the required-status-context list (row G4) can name
+  # "container" NOW, and a real green here will mean something the day T3
+  # lands, rather than the list growing a context nobody wired.
+  container:
+    name: container (image-gated placeholder)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Installed for parity with the real job T3 will turn this into — not
+      # used by the placeholder step below, which needs nothing but a shell.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Placeholder — needs the image row T3 publishes
+        shell: bash
+        run: |
+          echo "::error::container tests need the GHCR image published by row T3 (worker/Dockerfile:77 pins a private, never-pushed neko base image — see this job's header comment in .github/workflows/ci.yml). This job fails on purpose until that image exists."
+          exit 1
+
+  # ── local (typecheck + unit; container suite loud-skips until T3) ──────────
+  local:
+    name: local (typecheck + unit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      # `local/tsconfig.json`'s own header comment: its typecheck reaches
+      # `app/src/server/shell/boot-payload.ts`, which imports `drizzle-orm`
+      # through `app/node_modules` — so `bun run --cwd local typecheck` needs
+      # BOTH `local/` and `app/` installed, or it fails on an unresolvable
+      # import that has nothing to do with `local/` itself. `bun test local/`
+      # has no such dependency (the app import is type-only, erased by bun),
+      # but the install is cheap and shared with the typecheck step after it.
+      - name: Install (app)
+        shell: bash
+        working-directory: app
+        run: bun install --frozen-lockfile
+      - name: Install (local)
+        shell: bash
+        working-directory: local
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        shell: bash
+        working-directory: local
+        run: bun run typecheck
+      # 🔴 HARD-FAIL ON A SKIP, NOT JUST ON A FAILURE.
+      # `local/src/host/docker-host.container.test.ts` gates on `docker image
+      # inspect` for the image named by `deploy/images.env` (which falls back
+      # to `ezil-os-worker-sandbox:ff199202` — see the `container` job above
+      # for why nothing built or pulled it onto this runner) and SKIPS — does
+      # not fail — when that image is absent, which it always is here today.
+      # `bun test`'s OWN exit code is 0 on a run with skips and zero failures
+      # (measured: a `describe.skipIf(true)` suite exits 0), so without the
+      # check below this job would read as fully green while the one suite
+      # that boots a real desktop never ran once. So: capture bun's output,
+      # fail on a genuine test failure first, then fail again — loudly, naming
+      # row T3 — if bun reports any skip at all.
+      #
+      # 🔴 `if ! pipeline; then …` ON PURPOSE, NOT `pipeline; if [ $? … ]`.
+      # A `shell: bash` step is invoked by GitHub as
+      # `bash --noprofile --norc -eo pipefail {0}` — `-e` and `pipefail` are
+      # ALREADY on. A bare `bun test … | tee …` that then exits nonzero would
+      # abort the script AT THAT LINE under `-e`, before any code below it
+      # (including the custom `::error::` message) ever ran; testing the
+      # pipeline's exit status as an `if` condition is exempt from `-e`, so
+      # this is the one construct that lets the script keep going long enough
+      # to print why.
+      - name: Unit tests
+        shell: bash
+        run: |
+          if ! bun test local/ 2>&1 | tee /tmp/local-test.log; then
+            echo "::error::bun test local/ failed outright — see the log above."
+            exit 1
+          fi
+          # 🔴 POSITIVE CONTROL, NOT JUST A NEGATIVE ASSERTION. `bun-version:
+          # latest` above means bun's summary format is not pinned, and the
+          # skip check below trusts a specific format (` N skip`, measured
+          # against bun 1.3.14). A silent reporter-format change would make
+          # the grep below match nothing, `skip_count` would come back empty,
+          # and this job would go green having proven nothing — the exact
+          # failure mode this job exists to prevent, reproduced inside its own
+          # guard. So: first assert the parser can see ANYTHING in bun's
+          # summary at all; only trust "0 skips" once that holds.
+          if ! grep -qE '^ +[0-9]+ pass$' /tmp/local-test.log; then
+            echo "::error::bun's summary line (' N pass') was not found in the output above — the skip check below cannot be trusted (reporter format may have changed; this job runs bun-version: latest). Failing rather than silently reporting green."
+            exit 1
+          fi
+          skip_count="$(grep -oE '^ [0-9]+ skip$' /tmp/local-test.log | grep -oE '[0-9]+' || true)"
+          if [ -n "$skip_count" ] && [ "$skip_count" -gt 0 ]; then
+            echo "::error::local/ reported ${skip_count} skipped test(s) — docker-host.container.test.ts loud-skips because the image row T3 publishes is not present on this runner. A skip is not a pass; this job hard-fails until that image exists here."
+            exit 1
+          fi
