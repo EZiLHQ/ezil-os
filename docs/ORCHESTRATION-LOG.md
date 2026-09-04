@@ -235,3 +235,10 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   one wall-clock long-poll block (win32 skip, announced); geometry browser suites and script-executing worker suites
   are Linux tests and now say so. One stuck ubuntu app job (20 min in typecheck) was cancelled and re-run: pass.
   T4 done at INDEPENDENT_TEST_PASS. Next: G4 (ruleset with the 15 matrix contexts), T8.
+- 2026-09-04 23:30Z — **G4 done**: Discussions enabled; ruleset `22265548` active on the default branch — deletion and
+  force-push refused, linear history, PR required with zero approvals (a solo maintainer cannot self-approve),
+  fifteen required contexts (the twelve matrix legs, `tools`, `DCO`, `CodeQL (javascript-typescript)`; `container`
+  and `local` join after T8), admin bypass in pull-request mode only. `strict` up-to-date relaxed to false so three
+  concurrent rows do not each re-run fifteen minutes of checks after every merge; merge method squash (linear
+  history forbids merge commits). **From here every change to `main`, including this log, lands by squash-merged
+  PR** — the supervisor's `git merge --no-ff` loop is retired for this repository.
