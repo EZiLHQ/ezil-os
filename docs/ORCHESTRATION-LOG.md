@@ -61,3 +61,5 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   are skipped and printed, because `git rebase --signoff` drops them and `main`'s own merges are unsigned. The check
   has never run on GitHub: the throwaway-PR proof (red, not pending) is a supervisor step after the first push.
   T2 dispatched (Docker adapter; must boot the real image on this box). Running: G2, O3, T2.
+
+<!-- DCO probe: this PR is closed without merging; it exists to prove the DCO check goes red on an unsigned commit. -->
