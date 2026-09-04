@@ -73,6 +73,32 @@ const IMAGE = process.env.EZIL_VALIDATE_IMAGE ?? 'ezil-integrated:local';
 const VALIDATOR = join(import.meta.dir, '..', 'scripts', 'validate-neko-browser-window.sh');
 const CONTAINER = `ezil-w9-validate-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 
+/**
+ * SIGTERM/SIGINT SURVIVAL -- docs/CONFIDENCE-MAP.md section 2.10 / section 3.9.
+ * `afterAll` alone only fires on a normal bun-test exit; a cancellation
+ * (Ctrl-C, a CI job cancellation, a harness timeout that sends SIGTERM) skips
+ * straight past it and orphans a container built from a 4.57 GB image --
+ * measured: one held 456.2 MiB for eight minutes after its owning process was
+ * gone. So this container's name is registered in a module-level set that a
+ * process-level signal handler removes on the way out. `spawnSync`, not an
+ * async shape, because Node/Bun runs `exit` handlers SYNCHRONOUSLY -- an
+ * outstanding async `docker rm -f` would never be awaited and would not
+ * survive `exit` at all.
+ */
+const CONTAINERS_TO_CLEAN = new Set<string>();
+let cleanupOnExitInstalled = false;
+function installCleanupOnExit () {
+    if (cleanupOnExitInstalled) return;
+    cleanupOnExitInstalled = true;
+    const removeAll = () => {
+        for (const name of CONTAINERS_TO_CLEAN) sh('docker', ['rm', '-f', name], 60_000);
+    };
+    process.on('exit', removeAll);
+    process.on('SIGTERM', () => { removeAll(); process.exit(143); });
+    process.on('SIGINT', () => { removeAll(); process.exit(130); });
+}
+installCleanupOnExit();
+
 /** Boot budget. The pinned build reaches `phase=ready status=ok` in ~11s. */
 const BOOT_TIMEOUT_MS = 180_000;
 
@@ -130,6 +156,7 @@ function bootAndValidate (): Run {
         throw new Error(`docker run failed: ${(run.stderr || '').trim()}`);
     }
     started = true;
+    CONTAINERS_TO_CLEAN.add(CONTAINER);
 
     // Wait for start-neko.sh's own readiness line, not a fixed sleep.
     const deadline = Date.now() + BOOT_TIMEOUT_MS;
