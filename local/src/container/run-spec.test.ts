@@ -144,14 +144,17 @@ describe('docker run argv', () => {
             '--env', 'NEKO_SCREEN=1920x1080x24',
             '--env', 'NEKO_MEMBER_MULTIUSER_USER_PASSWORD=u-pw',
             '--env', 'NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=a-pw',
-            // 🔴 ADDED BY ROW T5, AND THE GOLDEN CHANGED FOR A MEASURED REASON.
-            // The pinned image's `/etc/neko/neko.yaml` ships
-            // `session.implicit_hosting: false`, so before this line the
-            // desktop rendered perfectly and ignored every click — a state no
-            // HTTP probe in this package can distinguish from a working one.
-            // See `NEKO_IMPLICIT_HOSTING_ENV` in `./run-spec.ts` for the
-            // mechanism and `DockerHost.readControlMode` for the read-back that
-            // proves it took.
+            // 🔴 ADDED BY ROW T5. The image's `/etc/neko/neko.yaml` ships
+            // `session.implicit_hosting: false`, and a desktop in that state
+            // renders perfectly while ignoring every click — a state no HTTP
+            // probe in this package can distinguish from a working one. It is
+            // a FALLBACK, not the mechanism: measured, the PINNED image's own
+            // launcher passes `--session.implicit_hosting=true` and an explicit
+            // flag outranks the environment, so this is inert there and
+            // load-bearing only on an image whose launcher does not. See
+            // `NEKO_IMPLICIT_HOSTING_ENV` in `./run-spec.ts` for all three
+            // measurements, and `DockerHost.readControlMode` for the read-back
+            // that is the actual evidence.
             '--env', 'NEKO_SESSION_IMPLICIT_HOSTING=true',
             '--env', 'NEKO_WEBRTC_UDPMUX=52100',
             '--env', 'NEKO_WEBRTC_TCPMUX=52100',
@@ -416,6 +419,9 @@ describe('deploy/images.env', () => {
 // of coverage that lets an `if` creep in later.
 describe('NEKO_SESSION_IMPLICIT_HOSTING', () => {
     it('is present, and is the string "true", for every spec shape', () => {
+        // Asserted for EVERY shape rather than once for the golden argv:
+        // "present in the one spec the golden uses" is the kind of coverage
+        // that lets an `if` creep in later.
         for (const spec of [
             SPEC,
             { ...SPEC, hostPortOffset: 10_000 },

@@ -270,11 +270,19 @@ describe('the two silent-when-absent container variables', () => {
         expect(check.detail).toContain('no outbound IP lookup');
     });
 
-    it('reports NEKO_SESSION_IMPLICIT_HOSTING, the one that decides whether clicks work', async () => {
+    it('reports the NEKO_SESSION_IMPLICIT_HOSTING fallback WITHOUT claiming clicks work', async () => {
         const report = await runDoctor(healthyDeps());
-        const check = find(report.checks, 'clicks reach the desktop');
+        const check = find(report.checks, 'implicit-hosting fallback');
         expect(check.status).toBe('PASS');
         expect(check.detail).toContain(`${NEKO_IMPLICIT_HOSTING_ENV}=true`);
+        // 🔴 THE ROW NAME AND THE WORDING ARE BOTH ASSERTIONS. Measured, the
+        // pinned image's launcher already passes --session.implicit_hosting
+        // and outranks this variable, so a doctor row called "clicks reach the
+        // desktop" would be claiming a fact about a RUNNING container that the
+        // doctor never starts. It says what it knows and names what it does
+        // not.
+        expect(check.detail).toContain('only knowable from a running container');
+        expect(report.checks.map((c) => c.name)).not.toContain('clicks reach the desktop');
     });
 
     it('reads the env the run spec BUILDS, so removing the variable turns this red', async () => {

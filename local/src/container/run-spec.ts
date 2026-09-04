@@ -244,40 +244,58 @@ export const NEKO_ADMIN_PASSWORD_ENV = 'NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD';
 export const NEKO_USER_PASSWORD_ENV = 'NEKO_MEMBER_MULTIUSER_USER_PASSWORD';
 
 /**
- * 🔴 THE VARIABLE THAT DECIDES WHETHER A CLICK DOES ANYTHING.
+ * 🔴 A FALLBACK FOR AN IMAGE WHOSE LAUNCHER DOES NOT SET IT — AND THE PINNED
+ * IMAGE'S LAUNCHER DOES. READ THIS WHOLE BLOCK BEFORE TRUSTING EITHER CLAIM.
  *
+ * ── The thing this is about ─────────────────────────────────────────────────
  * neko is built for SHARED browsing, so control of the cursor is a
  * request/grant handshake between members. This product is a single-user
- * computer: there is exactly one member and asking them to request control of
- * their own machine is pure friction. neko's own default for
- * `session.implicit_hosting` is ON — and the pinned image's baked
- * `/etc/neko/neko.yaml` turns it OFF again (`# default setting for legacy
- * API`), which row T1 measured on the image and handed to this row.
+ * computer. With `session.implicit_hosting` OFF, the shipped client reduces a
+ * click to `$emit('control-attempt')`, whose only effect is a shake animation
+ * on `<neko-controls>` — a component `embed=1` does not even render. The
+ * desktop then RENDERS PERFECTLY and silently ignores every click, and no HTTP
+ * check anywhere in this repository can tell the two states apart.
  *
- * With it OFF the shipped client's `implicitHostingRequest()` reduces a click
- * to `$emit('control-attempt')`, whose only effect is a shake animation on
- * `<neko-controls>` — a component `embed=1` does not even render. So the
- * desktop RENDERS PERFECTLY and silently ignores every click, forever, and
- * every HTTP check in this repository stays green while it does.
+ * ── 🔴 THE ROW BRIEF AND ROW T1'S HAND-OFF WERE BOTH REFUTED HERE ───────────
+ * Both said: the image ships `/etc/neko/neko.yaml` with
+ * `session.implicit_hosting: false`, so every click is ignored unless this
+ * variable is set. The first half is TRUE (the yaml really does say `false`).
+ * The second half is FALSE for the pinned image, and the difference is one
+ * line nobody had read: the in-image launcher passes the flag EXPLICITLY.
  *
- * The hosted product fixes this at request time:
- * `enableImplicitHosting` (`app/src/server/lib/cloudflare-guacamole-provider.ts:2338`)
- * logs into neko's admin API on the desktop-open critical path, reads
- * `/api/room/settings`, flips this one field and writes the merged object back
- * — and its own doc comment names the durable fix: "one flag on the
- * container's own `neko serve` invocation". That is what this is. Local mode
- * owns the container, so it sets the flag at BOOT rather than paying for a
- * handshake on every open.
+ *     /usr/local/bin/start-neko.sh:3122   --session.implicit_hosting=true
  *
- * Viper naming, the same rule the four `NEKO_WEBRTC_*` names follow: the flag
- * `--session.implicit_hosting` is the variable `NEKO_SESSION_IMPLICIT_HOSTING`,
- * and env outranks the yaml (measured against this binary — see
- * `localIceEnvFor`'s header for the three-way `NEKO_DESKTOP_DISPLAY` control).
+ * with its own 30-line comment naming itself "the durable fix" that
+ * `enableImplicitHosting` was standing in for. Viper ranks an explicit flag
+ * above the environment and the environment above a config file, so on this
+ * image the flag decides and this variable decides nothing.
  *
- * 🔴 SETTING IT IS NOT THE SAME AS IT HAVING TAKEN. `DockerHost.readControlMode`
- * READS `/api/room/settings` back and reports `'implicit'` only on a `true`
- * read-back, exactly as `enableImplicitHosting` does. This constant is the ask;
- * that read is the answer.
+ * MEASURED THREE WAYS against `ezil-os-worker-sandbox:ff199202` (2026-09-04),
+ * reading `GET /api/room/settings` with an admin token after each boot:
+ *
+ *     A. no NEKO_SESSION_IMPLICIT_HOSTING at all  -> implicit_hosting: true
+ *     B. NEKO_SESSION_IMPLICIT_HOSTING=false      -> implicit_hosting: true
+ *     C. NEKO_SESSION_IMPLICIT_HOSTING=true       -> implicit_hosting: true
+ *
+ * B is the load-bearing one: the variable cannot even turn it OFF, so it is
+ * inert in both directions against this image, and A is why the desktop
+ * already accepted clicks before this row touched anything.
+ *
+ * ── So why is it set at all ────────────────────────────────────────────────
+ * Because `deploy/images.env` exists precisely so the desktop image reference
+ * can be repointed, and an image whose launcher does NOT pass the flag falls
+ * back to the yaml's `false`. Env outranks a config file — measured on this
+ * binary by row T0 with `NEKO_DESKTOP_DISPLAY` — so this variable is a real
+ * belt for that image and a no-op for this one. It is cheap, it cannot make
+ * anything worse (B), and the alternative is a product that silently stops
+ * accepting clicks the day someone repoints the image.
+ *
+ * 🔴 WHAT IT IS NOT IS EVIDENCE. Setting this proves nothing about the
+ * container that ran; `DockerHost.readControlMode` READS
+ * `GET /api/room/settings` back and reports `'implicit'` only on a literal
+ * `true`, and `local/tests/local-smoke.container.test.ts` additionally turns
+ * the setting OFF on a live container and watches that read-back report
+ * `'manual'`. That pair is the evidence. This constant is the ask.
  */
 export const NEKO_IMPLICIT_HOSTING_ENV = 'NEKO_SESSION_IMPLICIT_HOSTING';
 
@@ -504,11 +522,13 @@ export function buildContainerEnv(spec: DockerRunSpec): Record<string, string> {
         NEKO_SCREEN: formatLocalNekoScreen(screen),
         [NEKO_USER_PASSWORD_ENV]: spec.userPassword,
         [NEKO_ADMIN_PASSWORD_ENV]: spec.adminPassword,
-        // 🔴 ALWAYS, AND NOT CONFIGURABLE. See `NEKO_IMPLICIT_HOSTING_ENV`:
-        // without it the desktop renders and every click is ignored, and
-        // nothing that speaks HTTP can tell the difference. There is no spec
-        // field to turn it off because "a computer that ignores its owner" is
-        // not a mode this product has.
+        // 🔴 ALWAYS, AND NOT CONFIGURABLE. Inert against the PINNED image
+        // (whose launcher passes `--session.implicit_hosting=true` itself, and
+        // an explicit flag outranks the environment — measured), and the
+        // fallback that keeps clicks working on an image whose launcher does
+        // not. There is no spec field to turn it off because "a computer that
+        // ignores its owner" is not a mode this product has. See
+        // `NEKO_IMPLICIT_HOSTING_ENV` for all three measurements.
         [NEKO_IMPLICIT_HOSTING_ENV]: 'true',
         // `localIceEnvFor(muxPortFor(0))` IS `NEKO_LOCAL_ICE_ENV`, so an
         // unoffset spec produces the identical four variables; an offset one
@@ -532,8 +552,9 @@ export function buildContainerEnv(spec: DockerRunSpec): Record<string, string> {
     // for.
     if (env[NEKO_IMPLICIT_HOSTING_ENV] !== 'true') {
         throw new Error(
-            `implicit_hosting_disabled: ${NEKO_IMPLICIT_HOSTING_ENV} must be 'true' — the pinned image's /etc/neko/neko.yaml`
-            + ' ships session.implicit_hosting: false, so a desktop booted without it renders and ignores every click',
+            `implicit_hosting_disabled: ${NEKO_IMPLICIT_HOSTING_ENV} must be 'true' — the image's /etc/neko/neko.yaml`
+            + ' ships session.implicit_hosting: false, and on an image whose launcher does not pass'
+            + ' --session.implicit_hosting itself, a desktop booted without this renders and ignores every click',
         );
     }
     return env;

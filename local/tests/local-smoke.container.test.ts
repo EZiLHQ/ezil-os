@@ -12,9 +12,12 @@
  *     the shell rendered `desktop_unreachable` over a healthy container, because
  *     `routes.ts#isOwnDesktopOrigin` pinned the desktop origin at port offset 0
  *     and this machine needs an offset to boot at all; and
- *   - the desktop, once reached, would have ignored every click, because the
- *     pinned image's `/etc/neko/neko.yaml` ships
- *     `session.implicit_hosting: false`.
+ *   - nothing anywhere observed whether a click DID anything. The row brief and
+ *     row T1's hand-off both said the desktop ignores every click unless
+ *     `NEKO_SESSION_IMPLICIT_HOSTING=true`; measured here, that is FALSE for
+ *     the pinned image (its launcher passes `--session.implicit_hosting=true`
+ *     itself, and a flag outranks the environment). The claim was refuted by
+ *     running it — which is exactly the kind of thing only this suite can do.
  *
  * Neither is visible to anything that speaks HTTP. `/health` is `true`,
  * `POST /api/login` is a 200 with an admin profile, the SPA is a 200, the
@@ -226,25 +229,40 @@ async function nekoGet(path: string): Promise<unknown> {
     // one. Rather than reimplement that, this asks the host's own public
     // capability where it can, and only reads the raw path where the assertion
     // is about a field the capability deliberately does not surface.
-    const creds = await (host as any).credentialsFor(computerId);
-    const login = await fetch(`${origin}${NEKO_PATHS.login}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: 'ezil-os-smoke', password: creds.admin }),
-    });
-    if (!login.ok) throw new Error(`neko login for the smoke probe answered ${login.status}`);
-    const token = ((await login.json()) as { token: string }).token;
+    const token = await nekoAdminToken();
     try {
         const res = await fetch(`${origin}${path}`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } });
         if (!res.ok) throw new Error(`GET ${path} answered ${res.status}`);
         return await res.json();
     } finally {
-        // 🔴 ALWAYS. Every leaked session is another entry in `GET /api/sessions`,
-        // which is the array `probeDisplay` counts — a probe that leaked would
-        // eventually be measuring itself. Measured while writing this row: five
-        // un-logged-out probe logins left five sessions in that array.
-        await fetch(`${origin}${NEKO_PATHS.logout}`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } }).catch(() => { /* best effort */ });
+        await nekoLogout(token);
     }
+}
+
+/** An admin token, through the HOST's own credential resolution — never a literal, and never printed. */
+async function nekoAdminToken(): Promise<string> {
+    const creds = await (host as any).credentialsFor(computerId);
+    const login = await fetch(`${localUrlFor('desktop', OFFSET)}${NEKO_PATHS.login}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'ezil-os-smoke', password: creds.admin }),
+    });
+    if (!login.ok) throw new Error(`neko login for the smoke probe answered ${login.status}`);
+    return ((await login.json()) as { token: string }).token;
+}
+
+/**
+ * 🔴 ALWAYS, AFTER EVERY PROBE. Every leaked session is another entry in
+ * `GET /api/sessions`, which is the array `probeDisplay` counts and this suite
+ * asserts `watching === 1` against — a probe that leaked would eventually be
+ * measuring itself. Measured while writing this row: five un-logged-out probe
+ * logins left five sessions in that array.
+ */
+async function nekoLogout(token: string): Promise<void> {
+    await fetch(`${localUrlFor('desktop', OFFSET)}${NEKO_PATHS.logout}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => { /* best effort — a probe that could not clean up is not a failure */ });
 }
 
 /** `xdotool getmouselocation` inside the container, parsed. X's own answer about where the pointer is. */
@@ -332,14 +350,78 @@ describe.skipIf(SKIP_REASON !== null)('local mode, in a real browser', () => {
         console.log(`\n[T5 measured] cold boot through POST ${SHELL_API_ROUTES.desktop}: ${(bootMs / 1000).toFixed(1)}s (offset ${OFFSET}, image ${IMAGE})\n`);
     }, BOOT_DEADLINE_MS);
 
-    it('neko itself reports implicit hosting on — the container-level control', async () => {
+    it('readControlMode is a READ: turn implicit hosting off on the live container and it says manual', async () => {
         // The read-back's own source, read independently of the route that
-        // reports it. If this said `false` while `controlMode` said `implicit`,
-        // the route would be echoing rather than observing.
-        const settings = (await nekoGet(NEKO_ROOM_SETTINGS_PATH)) as { implicit_hosting?: unknown };
-        expect(settings.implicit_hosting).toBe(true);
+        // reports it.
+        const settings = (await nekoGet(NEKO_ROOM_SETTINGS_PATH)) as Record<string, unknown>;
+        expect(settings['implicit_hosting']).toBe(true);
         expect(await host!.readControlMode(computerId)).toBe('implicit');
-    }, 60_000);
+
+        // 🔴 THE CONTAINER-LEVEL CONTROL, AND IT EXISTS BECAUSE THE ROW BRIEF
+        // WAS REFUTED. The brief (and row T1's hand-off) said the desktop
+        // ignores every click unless `NEKO_SESSION_IMPLICIT_HOSTING=true`.
+        // MEASURED against `ezil-os-worker-sandbox:ff199202`: booting with NO
+        // such variable, and booting with it set to `false`, BOTH report
+        // `implicit_hosting: true` — because the image's own
+        // `/usr/local/bin/start-neko.sh:3122` passes
+        // `--session.implicit_hosting=true` as an explicit flag, which Viper
+        // ranks above the environment. So dropping the variable is NOT a
+        // mutation that can redden anything on this image, and a suite whose
+        // only control was "the variable is present" would be asserting a
+        // constant about itself.
+        //
+        // The real control is this: change the thing being READ, on a live
+        // container, and watch the read-back follow it. `POST /api/room/settings`
+        // is a WHOLE-OBJECT REPLACE (the hosted `enableImplicitHosting` records
+        // this: posting without `heartbeat_interval` reset the room's 10 to 0),
+        // so the current object is sent back with exactly one field changed.
+        const set = async (value: boolean): Promise<void> => {
+            const token = await nekoAdminToken();
+            try {
+                const res = await fetch(`${localUrlFor('desktop', OFFSET)}${NEKO_ROOM_SETTINGS_PATH}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                    body: JSON.stringify({ ...settings, implicit_hosting: value }),
+                });
+                // MEASURED: neko answers **204 No Content**, not 200. The
+                // hosted `enableImplicitHosting` reads `setRes.ok`, which
+                // covers both — asserting 200 here went RED on the first run
+                // and is recorded rather than quietly loosened.
+                expect(`${res.status} ok=${res.ok}`).toBe(`${res.status} ok=true`);
+                expect(res.status).toBe(204);
+            } finally {
+                await nekoLogout(token);
+            }
+        };
+
+        // 🔴 THE RESTORE IS IN A `finally`. This test deliberately breaks the
+        // desktop it shares with the tests after it, and an assertion that
+        // failed mid-way would leave implicit hosting OFF — which showed up on
+        // the first run as the INPUT test failing with `has_host=false`, a
+        // second red that had nothing to do with input. One failure must
+        // produce one failure.
+        let observedOff = '(not reached)';
+        let routeOff = '(not reached)';
+        try {
+            await set(false);
+            observedOff = await host!.readControlMode(computerId);
+            // And the route the shell reads follows it, so `controlMode` is not
+            // computed once at boot and cached.
+            const off = await fetch(`${server!.url}${SHELL_API_ROUTES.desktop}`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ computerId }),
+            });
+            routeOff = ((await off.json()) as { controlMode?: string }).controlMode ?? '(absent)';
+        } finally {
+            await set(true).catch(() => { /* asserted below */ });
+        }
+        expect(observedOff).toBe('manual');
+        expect(routeOff).toBe('manual');
+        // Prove the restore took, rather than assuming it.
+        expect(await host!.readControlMode(computerId)).toBe('implicit');
+        console.log('\n[T5 measured] readControlMode discriminates: implicit -> (settings flipped) manual -> (restored) implicit\n');
+    }, 120_000);
 
     it('the shell mounts, the desktop window opens, and REAL PIXELS ARRIVE', async () => {
         // `--use-gl=swiftshader` is not decoration: headless Chromium needs a

@@ -260,16 +260,26 @@ export async function runDoctor(deps: DoctorDeps): Promise<DoctorReport> {
                 : `NEKO_WEBRTC_NAT1TO1=${nat} — no outbound IP lookup on boot`,
         );
 
-        // 🔴 NEKO_SESSION_IMPLICIT_HOSTING: without it the desktop renders and
-        // ignores every click, and nothing that speaks HTTP can tell.
+        // 🔴 NEKO_SESSION_IMPLICIT_HOSTING, AND THE ROW NAME IS CAREFUL.
+        // This says the FALLBACK is set, not that clicks work. Measured, the
+        // pinned image's own launcher passes `--session.implicit_hosting=true`
+        // and an explicit flag outranks the environment, so on that image this
+        // variable changes nothing in either direction; it is the belt for an
+        // image whose launcher does not. Whether clicks ACTUALLY work is a
+        // read of `GET /api/room/settings` on a RUNNING container
+        // (`DockerHost.readControlMode`) and the doctor starts nothing — see
+        // `NEKO_IMPLICIT_HOSTING_ENV` for all three measurements.
         const implicit = containerEnv[NEKO_IMPLICIT_HOSTING_ENV];
         add(
-            'clicks reach the desktop',
+            'implicit-hosting fallback',
             implicit === 'true' ? 'PASS' : 'FAIL',
             implicit === 'true'
-                ? `${NEKO_IMPLICIT_HOSTING_ENV}=true — a plain click controls the desktop`
+                ? `${NEKO_IMPLICIT_HOSTING_ENV}=true — set for an image whose launcher does not pass`
+                    + ' --session.implicit_hosting itself (the pinned image does, so this is inert there).'
+                    + ' Whether a click really controls the desktop is only knowable from a running container.'
                 : `${NEKO_IMPLICIT_HOSTING_ENV} is ${implicit === undefined ? 'absent' : `'${implicit}'`};`
-                    + " the image's /etc/neko/neko.yaml sets session.implicit_hosting: false, so the desktop would render and ignore every click",
+                    + " on an image whose launcher does not pass the flag, the baked /etc/neko/neko.yaml"
+                    + ' (session.implicit_hosting: false) wins and the desktop renders while ignoring every click',
         );
     }
 

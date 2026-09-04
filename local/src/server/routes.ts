@@ -490,17 +490,19 @@ async function handleDesktopPost(req: Request, deps: ShellRouterDeps): Promise<R
         provider: LOCAL_DESKTOP_PROVIDER_TAG,
         mode: 'neko',
         workspace: { mountPath: CONTAINER_WORKSPACE_PATH },
-        // 🔴 READ BACK OUT OF NEKO, NEVER INFERRED FROM HAVING SET THE FLAG.
-        // The pinned image's `/etc/neko/neko.yaml` ships
-        // `session.implicit_hosting: false`, so a desktop booted without an
-        // override renders perfectly and ignores every click — and no HTTP
-        // check in this package can tell the two apart.
-        // `buildContainerEnv` now always sets
-        // `NEKO_SESSION_IMPLICIT_HOSTING=true` (and fails closed if anything
-        // overrides it), which is the ASK; `readControlMode` GETs
-        // `/api/room/settings` and reports `implicit` only on a literal
-        // `implicit_hosting: true`, which is the ANSWER. Same rule as
-        // `setScreen`: the request body is not evidence, the read-back is.
+        // 🔴 READ BACK OUT OF NEKO, NEVER INFERRED FROM HAVING SET THE FLAG,
+        // AND THAT DISTINCTION IS THE WHOLE POINT OF THIS FIELD.
+        // A desktop with `session.implicit_hosting` off renders perfectly and
+        // ignores every click, and no HTTP check in this package can tell the
+        // two apart. `buildContainerEnv` sets
+        // `NEKO_SESSION_IMPLICIT_HOSTING=true` as a FALLBACK — measured, the
+        // pinned image's own launcher already passes
+        // `--session.implicit_hosting=true` and outranks the environment, so
+        // on that image the variable is inert (see `NEKO_IMPLICIT_HOSTING_ENV`
+        // for the three-way measurement). Precisely because "we set it" proves
+        // nothing, `readControlMode` GETs `/api/room/settings` and reports
+        // `implicit` only on a literal `implicit_hosting: true`. Same rule as
+        // `setScreen`: the request is not evidence, the read-back is.
         // A host with no credential (`./fake-host.ts`) keeps the honest
         // `'manual'` this route shipped before — the shell renders a visible
         // fallback affordance for it.
