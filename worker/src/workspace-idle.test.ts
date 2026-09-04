@@ -52,7 +52,19 @@ mock.module('cloudflare:workers', () => ({
   env: {},
 }));
 
-const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8');
+// Line endings normalised to LF. `.gitattributes` declares `* text=auto`, so a
+// Windows checkout (`core.autocrlf=true`, the GitHub-hosted runner default)
+// writes `index.ts` into the working tree with CRLF, and every multi-line
+// marker handed to `between()` below is written with `\n`. MEASURED against a
+// CRLF copy of this whole package: two assertions here threw
+// "end marker not found (after start)" — `recordWorkspaceHydration bumps
+// activity` and `terminateSandbox still does an explicit pre-destroy flush` —
+// while the other 38 in this file passed. A checkout's line-ending policy is
+// not a fact about the Worker. Inert on LF.
+const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8').replace(
+  /\r\n/g,
+  '\n',
+);
 
 /**
  * Slice `src` between two anchor strings (both must appear, `start` before
