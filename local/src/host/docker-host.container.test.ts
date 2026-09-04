@@ -222,7 +222,7 @@ describe.skipIf(SKIP_REASON !== null)('a real desktop, booted by DockerHost', ()
         for (const literal of IMAGE_DEFAULT_PASSWORDS) {
             expect(await firstWsEvent(`${origin}/ws?password=${literal}`)).toContain('Unauthorized');
         }
-    });
+    }, 60_000);
 
     it('code-server answers on its own port with --auth none', async () => {
         const res = await fetch(localUrlFor('code', OFFSET), { redirect: 'manual' });
@@ -250,11 +250,17 @@ describe.skipIf(SKIP_REASON !== null)('a real desktop, booted by DockerHost', ()
         const res = await host!.exec(COMPUTER_ID, ['sleep', '30'], { timeoutMs: 2_000 });
         expect(res.timedOut).toBe(true);
         expect(res.exitCode).toBeNull();
-    });
+    }, 30_000);
 
     it('NO OUTBOUND IP-RETRIEVAL CALL — and the positive control is in the same log', async () => {
-        const log = await host!.exec(COMPUTER_ID, ['cat', '/tmp/neko.log'], { timeoutMs: 30_000 });
-        expect(log.exitCode).toBe(0);
+        const raw = await host!.exec(COMPUTER_ID, ['cat', '/tmp/neko.log'], { timeoutMs: 30_000 });
+        expect(raw.exitCode).toBe(0);
+        // 🔴 STRIP ANSI FIRST. neko colourises its own structured log, so the
+        // bytes are `udpmux=\x1b[0m62100`, not `udpmux=62100`. The first version
+        // of this test asserted on the raw text and went red against a log that
+        // said exactly the right thing — a substring assertion over colourised
+        // output is a test of the terminal, not of the program.
+        const log = { ...raw, stdout: stripAnsi(raw.stdout) };
         // 🔴 The positive control FIRST, so "no checkip" is a fact about the
         // absence of checkip and not about an empty file or a wrong path.
         // Measured line: `webrtc starting epr=0-0 icelite=true ...
@@ -272,7 +278,7 @@ describe.skipIf(SKIP_REASON !== null)('a real desktop, booted by DockerHost', ()
         for (const needle of ['checkip', 'ip_retrieval', 'amazonaws']) {
             expect(log.stdout.toLowerCase()).not.toContain(needle);
         }
-        console.log(`\n[T2 measured] neko WebRTC line: ${(log.stdout.split('\n').find((l) => l.includes('webrtc starting')) ?? '').replace(/\x1b\[[0-9;]*m/g, '').trim()}\n`);
+        console.log(`\n[T2 measured] neko WebRTC line: ${(log.stdout.split('\n').find((l) => l.includes('webrtc starting')) ?? '').trim()}\n`);
     });
 
     it('the mux port is bound on the HOST, on both transports', async () => {
@@ -312,7 +318,7 @@ describe.skipIf(SKIP_REASON !== null)('a real desktop, booted by DockerHost', ()
         expect(after.width).toBe(1280);
         // Put it back so a later assertion is not surprised by it.
         await host!.setScreen(COMPUTER_ID, { width: 1920, height: 1080 });
-    });
+    }, 60_000);
 
     it('ensureDesktop is idempotent: a second call starts nothing and returns the same URLs', async () => {
         const first = await host!.desktopUrls(COMPUTER_ID);
@@ -324,7 +330,7 @@ describe.skipIf(SKIP_REASON !== null)('a real desktop, booted by DockerHost', ()
         // must be well under it.
         expect(elapsed).toBeLessThan(15_000);
         console.log(`\n[T2 measured] warm ensureDesktop (reuse): ${elapsed}ms\n`);
-    });
+    }, 60_000);
 
     it('restartDesktop keeps the container and comes back ready', async () => {
         const before = sh('docker', ['inspect', '--format', '{{.Id}}', CONTAINER], 20_000).stdout.trim();
@@ -338,7 +344,11 @@ describe.skipIf(SKIP_REASON !== null)('a real desktop, booted by DockerHost', ()
         expect(after).toBe(before);
         expect((await host!.status(COMPUTER_ID)).desktopReady).toBe(true);
         console.log(`\n[T2 measured] restartDesktop (stop + start + ready): ${(elapsed / 1000).toFixed(1)}s\n`);
-    });
+        // 120s rather than Bun's 5s default: a real restart is a real stop, a
+        // real start and a real boot. Measured 9.0s on this machine; the first
+        // run of this suite failed here purely because the default per-test
+        // deadline is shorter than the thing being measured.
+    }, 120_000);
 
     it('terminate removes it, and a second status reports absent', async () => {
         const res = await host!.terminate(COMPUTER_ID);
@@ -348,8 +358,14 @@ describe.skipIf(SKIP_REASON !== null)('a real desktop, booted by DockerHost', ()
         // Terminating an already-absent computer is not a failure.
         expect(await host!.terminate(COMPUTER_ID)).toMatchObject({ ok: true, terminated: false });
         started = false;
-    });
+    }, 60_000);
 });
+
+/** neko colourises its own log; a substring assertion has to see the bytes it means. */
+function stripAnsi(text: string): string {
+    // eslint-disable-next-line no-control-regex
+    return text.replace(/\u001b\[[0-9;]*m/g, '');
+}
 
 /** The first frame neko sends after the legacy websocket handshake. The handshake itself is always a 101 — auth is answered in-band, which is why a curl status code proves nothing here. */
 function firstWsEvent(url: string): Promise<string> {
