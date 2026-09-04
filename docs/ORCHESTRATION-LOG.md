@@ -195,3 +195,12 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   the session in the URL fragment, which `/auth/callback/route.ts` (a server handler reading `?code=`) can never see;
   the invited-user landing is unproven end to end. Founder steps added: apply 0002 to hosted by hand (schema before
   code), seed the allow-list, add the callback URL to Redirect URLs. A2 dispatched next. Running: T5, X1.
+- 2026-09-04 20:20Z — **X1 merged** (`docs/research/local-agents.md`, 550 lines): the sidecar's ten-verb allowlist,
+  ref-generation-scoped refs and single-choke-point redaction confirmed at file:line as the agent seam; cua (MIT) and
+  Agent-S (Apache-2.0) read at driver level — Agent-S `exec()`s LLM-generated pyautogui strings, the concrete argument
+  against handing an agent the host; Linux+NVIDIA is the only citable `--gpus` path (Windows via WSL2; macOS none);
+  neko's `--hwenc` exists but its accepted backends are NOT MEASURED; nine named gaps. Recommendation: a local MCP
+  wrapping the existing verbs plus an OpenAI-compatible driver loop, provable with `contract.mjs` unchanged.
+  **PR #14 eighth run:** `shell` GREEN on ubuntu, windows AND macos; `app` green ×3; `sdk + mcp` green ×3; `tools`
+  green; worker windows/macos still running. T7 dispatched (overlay tag key in images.env; pin the m1k1o base by
+  digest; desktop tag write-back). Running: T5, A2, T7.
