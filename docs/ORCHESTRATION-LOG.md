@@ -204,3 +204,8 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   **PR #14 eighth run:** `shell` GREEN on ubuntu, windows AND macos; `app` green ×3; `sdk + mcp` green ×3; `tools`
   green; worker windows/macos still running. T7 dispatched (overlay tag key in images.env; pin the m1k1o base by
   digest; desktop tag write-back). Running: T5, A2, T7.
+- 2026-09-04 21:00Z — **PR #14 eighth run, macos `worker` leg:** 802 pass / 34 skip / 227 fail — every failure is a
+  suite that EXECUTES the container's Ubuntu boot scripts (`start-neko.sh` restart budgets and teardown,
+  `emit_telemetry`/`phase_end`, the NDJSON tail) for real; they are Linux tests of a Linux container and have never
+  passed on a Mac. Supervisor patch on `task/T4`: the worker job's unit-test steps run on the Linux leg only
+  (typecheck on every OS); row M3 added so those suites self-skip elsewhere with a printed reason. Ninth run.
