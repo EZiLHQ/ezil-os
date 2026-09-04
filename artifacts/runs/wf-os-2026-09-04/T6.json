@@ -1,0 +1,9 @@
+{
+  "taskId": "T6",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "STATIC_CHECKS_PASS",
+  "evidence": "starting: release.yml + launcher pair; orientation complete, advisor consulted",
+  "startedAt": "2026-09-04T00:00:00Z",
+  "updatedAt": "2026-09-04T00:00:00Z"
+}
