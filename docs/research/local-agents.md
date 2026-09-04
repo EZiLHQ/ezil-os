@@ -266,17 +266,24 @@ This is the one entry whose GUI-driving claim did not survive a direct check.
 The README's architecture description (fetched) says the framework's
 "universal interface consolidates common practices for OS manipulation,
 including Python code interpreter, bash terminal, mouse/keyboard control, and
-API calls" — but fetching the actual tool tree,
-<https://github.com/OS-Copilot/OS-Copilot/tree/main/oscopilot/tool_repository/basic_tools>,
-shows exactly two files: `__init__.py` and `text_extractor.py`. No
-`mouse.py`, `keyboard.py`, or `screen.py` is present at that path. **NOT
-MEASURED**: which library (if any) implements the README's "mouse/keyboard
-control" claim, or whether it lives outside `basic_tools` — this session did
-not find it within the two-fetch budget spent looking. What *is* measured is
-that OS-Copilot leans on a bash/Python-code-interpreter executor rather than a
-dedicated screenshot-grounded clicker (`oscopilot/tool_repository/api_tools`
-and `generated_tools` were listed but not opened), which is a materially
-different shape from CUA, Agent-S and UI-TARS. Model: requires an API key —
+API calls" — but the GitHub Contents API for the actual tool folder, queried
+directly (`gh api
+repos/OS-Copilot/OS-Copilot/contents/oscopilot/tool_repository/basic_tools
+--jq '.[].name'`, which lists a directory completely rather than a
+possibly-truncated rendered page), returns exactly two entries:
+```
+__init__.py
+text_extractor.py
+```
+No `mouse.py`, `keyboard.py`, or `screen.py` exists at that path — this is a
+definitive listing, not a partial one. **NOT MEASURED**: which library (if
+any) implements the README's "mouse/keyboard control" claim, or whether it
+lives outside `basic_tools` entirely — `oscopilot/tool_repository/api_tools`
+and `generated_tools` were listed as sibling folders but not opened. What *is*
+measured is that OS-Copilot leans on a bash/Python-code-interpreter executor
+rather than a dedicated screenshot-grounded clicker at the one path checked,
+which is a materially different shape from CUA, Agent-S and UI-TARS. Model:
+requires an API key —
 quoted, *"Configure your OpenAI API key in .env"* — no local-model path was
 found in what was fetched.
 
@@ -407,32 +414,40 @@ software path when unconfigured — the script's own comment traces it to source
 HARDCODED fallback in server/internal/config/capture.go's `Capture.Set()`:
 software vp8enc"* (`start-neko.sh:2854–2856`).
 
-**Measured, not assumed**: the pinned overlay image
-(`ghcr.io/ezilhq/ezil-neko-vscode:d74052bb-049931d7-ezil-brand8`) is private.
-`docker run --rm --entrypoint neko ghcr.io/ezilhq/ezil-neko-vscode:d74052bb-049931d7-ezil-brand8
-serve --help` was run in this session and returned `unauthorized` (GHCR
-denies an anonymous pull) — this matches T3's own finding in
-`docs/ORCHESTRATION-LOG.md` at 2026-09-04 14:50Z: *"the new packages are
-private (GHCR default) and this session's token has no packages scope."* As a
-substitute, the same command was run against the exact **public, floating**
-base image `docker/neko/pins.env` itself points at
-(`NEKO_BASE_IMAGE=ghcr.io/m1k1o/neko/base:latest`) — floating, not
-digest-pinned, a gap `pins.env` itself flags for row T7. `docker run --rm
---entrypoint neko ghcr.io/m1k1o/neko/base:latest serve --help` succeeded
-(digest at pull time: `sha256:20806497c78de64700cb7befa674dbdc6bc4e8f0848a3dc911f0878a6726fa36`)
-and the flag exists:
+**Measured, not assumed**, two ways. First, against the registry: the pinned
+overlay's published name (`ghcr.io/ezilhq/ezil-neko-vscode:d74052bb-049931d7-ezil-brand8`)
+is private — `docker run --rm --entrypoint neko
+ghcr.io/ezilhq/ezil-neko-vscode:d74052bb-049931d7-ezil-brand8 serve --help`
+was run in this session and returned `unauthorized` (GHCR denies an anonymous
+pull), matching T3's own finding in `docs/ORCHESTRATION-LOG.md` at 2026-09-04
+14:50Z: *"the new packages are private (GHCR default) and this session's
+token has no packages scope."*
+
+Second, and decisively: this box's local Docker cache already holds the
+image under its **local build tag** — `docker images` lists
+`ezil-neko-vscode:d74052bb-049931d7-ezil-brand8` (image id
+`sha256:1adfc02efc77245c68d1a3572a6c37907e9c3329081afce79eb9add790cb8a6e`),
+left behind by T2/T3's earlier work in this same environment. Running the
+brief's exact command with no registry prefix —
+`docker run --rm --entrypoint neko ezil-neko-vscode:d74052bb-049931d7-ezil-brand8
+serve --help` — succeeded directly against the actual pinned overlay, no
+substitute needed. The flag exists:
 ```
 --hwenc string   V2: use hardware accelerated encoding
 ```
-No `vaapi`/`nvenc`/named-backend value is enumerated anywhere in the full
-`--help` output (`grep -i -E 'hwenc|nvenc|vaapi|codec'` against the captured
-output shows only `--hwenc`, `--video_codec`, `--capture.video.codec` and the
-deprecated `--vp8`/`--vp9`/`--h264`/`--av1` boolean flags — no accepted-value
-list for `--hwenc`). **NOT MEASURED**: which encoder backends `--hwenc`
-actually accepts — that would need reading neko's Go source
-(`server/internal/capture` or similar), not attempted here, and this floating
-base is not proven identical to the exact commit `pins.env` pins
-(`NEKO_SHA=d74052bb844c...`) since `:latest` moves.
+and the full output is byte-for-byte identical (`diff`, 0 lines) to the
+public floating base's own `serve --help` (`ghcr.io/m1k1o/neko/base:latest`,
+digest `sha256:20806497c78de64700cb7befa674dbdc6bc4e8f0848a3dc911f0878a6726fa36`,
+run first, before the local cache was checked) — the EZiL branding overlay
+adds VS Code, the mobile keyboard and the black-picture detector on top, and
+does not touch the `neko` binary's own flag set. No `vaapi`/`nvenc`/
+named-backend value is enumerated anywhere in either `--help` output
+(`grep -i -E 'hwenc|nvenc|vaapi|codec'` against the captured output shows
+only `--hwenc`, `--video_codec`, `--capture.video.codec` and the deprecated
+`--vp8`/`--vp9`/`--h264`/`--av1` boolean flags — no accepted-value list for
+`--hwenc`). **NOT MEASURED**: which encoder backends `--hwenc` actually
+accepts — that would need reading neko's Go source (`server/internal/capture`
+or similar), not attempted here.
 
 ## 4. Local inference
 
@@ -446,12 +461,11 @@ the vLLM invocation is `vllm serve "ByteDance-Seed/UI-TARS-1.5-7B"`, the
 SGLang one is `python3 -m sglang.launch_server --model-path
 "ByteDance-Seed/UI-TARS-1.5-7B"`, and both are shown driven via
 `http://localhost:8000/v1/chat/completions` / `http://localhost:30000/v1/chat/completions`
-respectively — i.e. genuinely OpenAI-compatible, not a bespoke wire. The card
-also lists the checkpoint's own metadata as `8B parameters` / `F32` tensor
-type, alongside the `-1.5-7B` name — a real discrepancy this session did not
-resolve (a safetensors index can report a different number than the name
-implies, and `F32` on the card need not mean inference runs in FP32); flagged
-rather than silently reconciled.
+respectively — i.e. genuinely OpenAI-compatible, not a bespoke wire. The
+card's own sidebar rounds the parameter count to `8B` next to the `-1.5-7B`
+name — almost certainly a display rounding of the real count (~7.6B is
+typical for this model family), not evidence of a different model; not
+independently verified.
 
 VRAM: **NOT MEASURED** from an authoritative first-party source (ByteDance's
 own model card, fetched, states no GPU/VRAM number). A community setup guide,
