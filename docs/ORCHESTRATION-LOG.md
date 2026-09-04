@@ -212,7 +212,7 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
 - 2026-09-04 21:50Z — **T5 merged — local mode seen working in a real browser.** Supervisor re-ran the smoke: 6/6;
   frame statistic `stdDev 58.8, 29/32 buckets` (threshold 8/3); the shell revealed the desktop full-bleed after the
   display gate; neko `/api/room/control` `has_host false → true`; `xdotool` shows the X pointer moving to within 2 px
-  of the click; cold boot 5.7–9.1 s, first pixels 2.2–5.4 s after the window opened. Doctor: 12 pass / 2 warn / 0
+  of the click; cold boot 5.7–9.1 s, first pixels 2.2–4.4 s after the window opened (corrected 2026-09-05 from the artifact; the narrative had 5.4). Doctor: 12 pass / 2 warn / 0
   fail at offset 10000 (8443 is busy here; at offset 0 it fails and names the fix). Two integration defects only the
   browser run could find, both fixed with tests: the SSRF origin pin was offset-blind (`desktop_frame_foreign_origin`
   over a healthy container — 210 green tests at offset 0 against a fake host never saw it), and `resolveHost` threw on
@@ -276,3 +276,35 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   Two real bugs fixed before landing (a pipefail abort on an absent optional key; SHA256SUMS paths a downloader
   cannot have). R1 dispatched with T6's release.yml in its ownership: the Release must be a DRAFT until deploy.yml's
   production verify passes — "a green deploy that was never verified is not a release". Running: T8, M3, R1.
+- 2026-09-05 03:20Z — **T8 returned; landing as PR #21.** `container (real image)` and `local (typecheck + unit + smoke)`
+  log in to GHCR with the workflow token, pull `ezil-os-desktop:latest`, tag it under the names the worker suites and
+  `local/`'s fallback resolve (the `local/` suites read no env — they resolve `deploy/images.env` and fall back to the
+  literal), run the container suites, the doctor and the real-browser smoke, and fail on any skip or surviving
+  container. Not required by the ruleset until the packages are public (fork PRs cannot pull a private package).
+- 2026-09-05 03:40Z — **M3 (+M2) returned; landing as PR #22.** 22 tests in five worker suites gated off Linux with
+  measured reasons (`setsid`, `/proc`, GNU `stat -c %i`, GNU `date %N`); the sidecar contract path now resolves from
+  the git common dir, so its 10 tests run inside worktrees. Refused (§3): 205 of the 227 macOS failures are pure-TS
+  suites (`route-auth` 122, `workspace-idle` 40, `workspace-flush-loop` 35, …) broken only because
+  `worker/src/index.ts:55,60` imports `@cloudflare/sandbox` at module scope and that chain fails under bun on macOS —
+  gating them would be false. Row M4 added for it; the worker job's Linux-only gate in ci.yml stays until M4 lands.
+- 2026-09-05 03:45Z — **PR #19 (T6) merged.** R1 proceeds on the merged main. N2's documentation half dispatched.
+- 2026-09-05 04:10Z — **Local mode proven on a GitHub-hosted runner** (PR #21, job `local (typecheck + unit + smoke)`):
+  the workflow token pulled the private `ghcr.io/ezilhq/ezil-os-desktop:latest` (digest `eb8504c6…`), the doctor
+  passed at offset 0 (12 pass / 2 warn), cold boot 10.7 s, first non-uniform pixels 2.3 s after the window opened
+  (`stdDev 58.83`, 29/32 buckets), the shell revealed the desktop full-bleed. `container (real image)` pulled the same
+  digest and failed only in `mobile-keyboard.container.test.ts` with exactly M1's diagnosed shape (`Expected
+  "fast.com"`, keydown counts) — PR #18 (M1) fixes the test mechanism; expected green after it merges.
+- 2026-09-05 04:40Z — **R1 returned; landing as PR #23.** deploy.yml: an `image` job waits (bounded, 30 min) for the
+  tagged commit's GHCR image — `unauthorized`/`denied` fail immediately, only "not yet" retries — and `worker` needs it;
+  a `release` job publishes the DRAFT only after `verify` passes. release.yml drafts the Release and falls back to the
+  base section for `-rc.N` tags (a `-beta.1` control does not). CHANGELOG cut at 0.2.0. `docs/RELEASE.md` written.
+  Verified for real that `gh release edit <tag> --draft=false` resolves a draft created with `--verify-tag --draft` —
+  against a disposable private repo the worker could not delete (token lacks `delete_repo`): **founder, please
+  delete `MidhunAkashM/ezil-draft-release-probe-1788524401`.** Hand-offs: no safe-apply script for 0002 (unlike
+  `db:apply-0001`); GOVERNANCE § Releases and the README docs list need a line for RELEASE.md.
+- 2026-09-05 06:10Z — **N2 (docs half) returned; landing as PR #24**: `docs/LOCAL-MODE.md`, README (local mode, the
+  Access paragraph, layout, docs list, protected main), RUNBOOK "What is live (as of 2026-09-05)", PLATFORM-NOTES
+  annexes under §6/§7 plus §24 (BSD `base64`, bash 3.2) and §25 (npx vs bun shims on Windows). Corrections it found in
+  this log: T5's first-pixels figure is **2.2–4.4 s** (the artifact), not 2.2–5.4 s as written at 21:50Z; the Supabase
+  Redirect URL the invite flow needs is `/auth/invited` (A2), superseding A1's `/auth/callback` note. A2 merged as
+  PR #17 (583fc6d) — recorded here since the earlier entry only said "landing". The e2e default flip waits for N1.
