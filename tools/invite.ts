@@ -50,21 +50,35 @@
  * (the package is not on this project's module resolution path, so `tsc`
  * cannot see them from here).
  *
- * ── One integration seam this script CANNOT close (hand-off to row A2) ────
- * `redirectTo` is `EZIL_OS_ORIGIN` + `/auth/callback`. Two caveats a reader
- * needs, neither of which this file can fix:
+ * ── Where the invite link lands, and why it is not `/auth/callback` ──────
+ * `redirectTo` is `EZIL_OS_ORIGIN` + `/auth/invited` (row A2 changed this;
+ * it used to be `/auth/callback`, which could never work).
  *
- *   1. Supabase ignores a `redirect_to` that is not in the project's
+ *   1. Invites do not use PKCE. Verbatim from the installed `@supabase/
+ *      auth-js`, `GoTrueAdminApi.inviteUserByEmail`: "Note that PKCE is not
+ *      supported when using `inviteUserByEmail`. This is because the browser
+ *      initiating the invite is often different from the browser accepting
+ *      the invite". A non-PKCE verify hands the session back in the URL
+ *      FRAGMENT, and `app/src/app/auth/callback/route.ts` is a server route
+ *      handler that reads `?code=` only — a fragment is never sent to a
+ *      server, so the old target dropped every invited user on a page that
+ *      could not see their session.
+ *      `app/src/app/auth/invited/page.tsx` is a CLIENT page: it reads the
+ *      fragment, calls `setSession`, and asks for the password the invited
+ *      account does not have yet.
+ *   2. Supabase ignores a `redirect_to` that is not in the project's
  *      "Redirect URLs" allow-list — silently, with no error, falling back to
- *      the Site URL. That list is dashboard configuration, not code.
- *   2. Invites do not use PKCE (auth-js says so in
- *      `GoTrueAdminApi.inviteUserByEmail`: the browser that sends an invite is
- *      usually not the browser that accepts it). A non-PKCE verify hands the
- *      session back in the URL FRAGMENT, and
- *      `app/src/app/auth/callback/route.ts` is a server route handler that
- *      reads `?code=` only — a fragment is never sent to the server. Whether
- *      an invited user actually lands signed-in is therefore row A2's
- *      question, not this script's.
+ *      the Site URL. That list is dashboard configuration, not code, so
+ *      `<origin>/auth/invited` MUST be added there. If it is not, the invitee
+ *      lands on `/` with a fragment nothing reads, gets bounced to `/os` and
+ *      then to `/login?error=not_invited` — which looks exactly like an
+ *      allow-list bug and is not one.
+ *   3. There is a second, better route that does not depend on a fragment at
+ *      all: change the invite email template to link at
+ *      `{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=invite`
+ *      and `app/src/app/auth/confirm/route.ts` verifies server-side. That is
+ *      also dashboard configuration. Both paths are shipped; this default
+ *      works with the stock template.
  */
 
 // ── Types for the dynamically-loaded `postgres` driver ─────────────────────
@@ -199,7 +213,8 @@ Environment (read by name; never printed)
                               accepted as a fallback.
   EZIL_OS_ORIGIN              invite redirect target; default
                               https://os.ezil.work
-                              (the link lands on <origin>/auth/callback).
+                              (the link lands on <origin>/auth/invited, which
+                              must be in the project's Redirect URLs list).
 
 Exit codes
   0  did what was asked.
@@ -318,7 +333,12 @@ const sendInvite = async (email: string): Promise<void> => {
 	}
 
 	const origin = (process.env.EZIL_OS_ORIGIN ?? 'https://os.ezil.work').replace(/\/+$/, '');
-	const redirectTo = `${origin}/auth/callback`;
+	// 🔴 `/auth/invited`, NOT `/auth/callback`. See this file's header: an
+	// invite is not a PKCE flow, so the verify redirect carries the session in
+	// the URL fragment and `/auth/callback` (a server handler reading `?code=`)
+	// can never see it. `/auth/invited` is a client page that reads the
+	// fragment and sets the password the invited account does not have.
+	const redirectTo = `${origin}/auth/invited`;
 	const url = `${apiOrigin!.replace(/\/+$/, '')}/auth/v1/invite?redirect_to=${encodeURIComponent(redirectTo)}`;
 
 	const response = await fetch(url, {
