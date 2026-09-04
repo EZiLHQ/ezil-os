@@ -145,7 +145,11 @@ jobs:
       - name: Typecheck
         shell: bash
         working-directory: app
-        run: npx tsc --noEmit -p tsconfig.json
+        # `bun run`, not `npx`: on the Windows runner npx does not resolve the
+        # bun-created node_modules/.bin shim and quietly installs an unrelated
+        # npm package named `tsc` instead (PR #14, fifth run). bun resolves its
+        # own shims on every OS.
+        run: bun run typecheck
       # `app/eslint.config.mjs` has existed and been configured all along; it
       # was simply never run by anything. A configured linter nobody runs is a
       # linter that is already failing.
@@ -156,7 +160,7 @@ jobs:
       - name: Unit tests
         shell: bash
         working-directory: app
-        run: npx vitest run
+        run: bun run test
 
   connectors:
     name: sdk + mcp (typecheck + unit)
