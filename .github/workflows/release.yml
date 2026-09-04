@@ -1,0 +1,268 @@
+# Release — build the downloadable local-mode tarball and publish a GitHub
+# Release for it, with checksums and a build-provenance attestation.
+#
+# This is deliberately separate from `image.yml` (which publishes the
+# container images) and `deploy.yml` (which deploys the hosted product): the
+# artifact here is something a person downloads and runs on their own laptop,
+# and its only dependency on the other two workflows is that `deploy/images.env`
+# already carries a real, published tag by the time this runs — row R1 wires
+# `deploy.yml` to gate on that, not this file.
+#
+# 🔴 EVERY `${{ }}` VALUE USED INSIDE A `run:` SHELL BLOCK GOES THROUGH `env:`,
+# NEVER SPLICED DIRECTLY INTO THE SCRIPT TEXT — including this workflow's own
+# computed step outputs, not only the `workflow_dispatch` tag input they are
+# partly derived from. A `${{ }}` splice is substituted into the YAML before
+# the shell ever runs, so it can break out of quoting; an `env:` value is
+# handed to the shell as data. `steps.tag.outputs.tag` IS validated against a
+# closed character class below, but this file does not rely on that alone.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (required — workflow_dispatch has no triggering tag of its own)'
+        required: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+# NOT cancel-in-progress, matching image.yml's and deploy.yml's reasoning: a
+# cancel between `gh release create` and the attestation step would leave a
+# public release asset with no provenance behind it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-tags: the workflow_dispatch path needs to check out a tag that
+      # is not the ref this run started on; fetch-depth 0 alone does not
+      # guarantee tags are present (actions/checkout only fetches tags for
+      # the ref actually being checked out unless asked).
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve the release tag
+        id: tag
+        env:
+          EVENT_TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          else
+            tag="${EVENT_TAG_INPUT}"
+          fi
+          # Closed character class on purpose: this becomes a `git checkout`
+          # ref, a tarball filename component and a `gh release create` arg
+          # below. Anything outside [A-Za-z0-9.+-] after the leading 'v<digit>'
+          # is refused rather than passed through.
+          if [[ ! "${tag}" =~ ^v[0-9]+(\.[0-9]+){0,2}(-[A-Za-z0-9.]+)?(\+[A-Za-z0-9.]+)?$ ]]; then
+            echo "::error::'${tag:-<empty>}' is not a usable version tag (expected v<semver>, e.g. v0.2.0 or v0.2.0-rc.1)" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          # Keep a Changelog / SemVer: anything after a '-' is a pre-release
+          # identifier (0.2.0-rc.1) and ships as a GitHub pre-release.
+          if [[ "${tag#v}" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "[tag] ${tag}"
+
+      # Only needed off the tag-push path: a push already checks out the tag
+      # itself, so re-checking out here would be a no-op there.
+      - name: Check out the release tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: git checkout "${RELEASE_TAG}"
+
+      - name: Static checks — both launchers
+        run: |
+          set -euo pipefail
+          bash -n deploy/launcher/ezil-os.sh
+
+          # bash 3.2 compatibility (macOS's shipped bash) — no bash-4-only
+          # builtin. Comments are stripped first so a comment that merely
+          # NAMES one of these, to explain why it is absent, is not mistaken
+          # for a use of it.
+          pattern='\<mapfile\>|\<readarray\>|declare[[:space:]]+-A|\$\{[A-Za-z_][A-Za-z0-9_]*,,|\$\{[A-Za-z_][A-Za-z0-9_]*\^\^'
+          if sed 's/#.*$//' deploy/launcher/ezil-os.sh | grep -Eq "$pattern"; then
+            echo "::error file=deploy/launcher/ezil-os.sh::uses a bash-4-only builtin (mapfile/readarray/declare -A/\${var,,}/\${var^^}) — PR #14 found these break silently under macOS's bash 3.2" >&2
+            sed 's/#.*$//' deploy/launcher/ezil-os.sh | grep -En "$pattern" >&2
+            exit 1
+          fi
+
+          # Outbound-host allowlist: the registry, the two install pages
+          # (printed, never fetched) and loopback. Anything else here is an
+          # outbound call this launcher has no business making — see both
+          # scripts' own header comment for the same list.
+          allow_re='^(ghcr\.io|docs\.docker\.com|bun\.sh|127\.0\.0\.1)$'
+          bad=0
+          for f in deploy/launcher/ezil-os.sh deploy/launcher/ezil-os.ps1; do
+            hosts="$(grep -EIo 'https?://[A-Za-z0-9.-]+' "$f" | sed -E 's#^https?://##' | sort -u || true)"
+            for h in $hosts; do
+              if ! [[ "$h" =~ $allow_re ]]; then
+                echo "::error file=$f::disallowed outbound host '$h' — allowed: ghcr.io, docs.docker.com, bun.sh, 127.0.0.1" >&2
+                bad=1
+              fi
+            done
+          done
+          [[ "$bad" == "0" ]] || exit 1
+          echo "launcher static checks passed"
+
+      - name: Build the release tarball
+        id: tarball
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          root="ezil-os-${RELEASE_TAG}"
+          stage="$(mktemp -d)/${root}"
+          mkdir -p "${stage}"
+
+          # local/ — sources + package.json + bun.lock. NO node_modules: it
+          # has zero runtime dependencies (only @types/bun and typescript as
+          # devDependencies, both type-only), so `bun run --cwd local start`
+          # needs no `bun install` at all — verified against an extracted
+          # copy of this exact layout before this row was reported done.
+          mkdir -p "${stage}/local"
+          cp -R local/src "${stage}/local/src"
+          cp local/package.json local/bun.lock "${stage}/local/"
+
+          # worker/src/{desktop-mode,screen-modes}.ts — NOT in the row brief's
+          # tarball list, added because local/'s own runtime imports them by
+          # relative path (local/src/container/run-spec.ts and
+          # local/src/server/routes.ts both `from '../../../worker/src/...'`,
+          # real values — portFor, fitScreenRequest — not types). Without
+          # these two files `bun run --cwd local doctor` fails to resolve a
+          # module on the very first line. Both are leaf files with no
+          # imports of their own (confirmed: `bun build --target=bun` on
+          # both local/ entry points resolves cleanly with exactly these two
+          # files pulled in from outside local/ and app/public/os/).
+          mkdir -p "${stage}/worker/src"
+          cp worker/src/desktop-mode.ts worker/src/screen-modes.ts "${stage}/worker/src/"
+
+          mkdir -p "${stage}/app/public/os"
+          cp app/public/os/bundle.min.js app/public/os/bundle.min.css app/public/os/icons.js "${stage}/app/public/os/"
+
+          mkdir -p "${stage}/deploy/launcher"
+          cp deploy/images.env "${stage}/deploy/"
+          cp deploy/launcher/ezil-os.sh deploy/launcher/ezil-os.ps1 deploy/launcher/README.md "${stage}/deploy/launcher/"
+
+          cp LICENSE NOTICE ATTRIBUTIONS.md "${stage}/"
+
+          # `|| true` at the end, not inside the pipe: under pipefail, a key
+          # that is simply ABSENT (grep matches nothing, exit 1) would
+          # otherwise abort this whole step via `set -e` on the
+          # `x="$(read_env_key ...)"` assignment below — reproduced locally
+          # for EZIL_DESKTOP_DIGEST, which is absent from images.env today.
+          read_env_key() { grep -E "^[[:space:]]*${1}[[:space:]]*=" "$2" | head -1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true; }
+          desktop_image="$(read_env_key EZIL_DESKTOP_IMAGE deploy/images.env)"
+          desktop_tag="$(read_env_key EZIL_DESKTOP_TAG deploy/images.env)"
+          desktop_digest="$(read_env_key EZIL_DESKTOP_DIGEST deploy/images.env)"
+          {
+            echo "EZiL OS release ${RELEASE_TAG}"
+            echo "git sha:       ${GITHUB_SHA}"
+            echo "image:         ${desktop_image}:${desktop_tag}"
+            echo "image digest:  ${desktop_digest:-(none recorded in deploy/images.env)}"
+          } > "${stage}/RELEASE-MANIFEST.txt"
+
+          tarball="ezil-os-${RELEASE_TAG}.tar.gz"
+          tar -C "$(dirname "${stage}")" -czf "${tarball}" "${root}"
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          echo "[tarball] ${tarball} ($(du -h "${tarball}" | cut -f1))"
+
+      - name: SHA256SUMS
+        env:
+          TARBALL: ${{ steps.tarball.outputs.tarball }}
+        run: sha256sum "${TARBALL}" deploy/launcher/ezil-os.sh deploy/launcher/ezil-os.ps1 > SHA256SUMS
+
+      - name: Extract the CHANGELOG section
+        id: notes
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          notes_file="notes-${RELEASE_TAG}.md"
+          # Stops at the NEXT '## [' heading, or at the reference-link-
+          # definition block ('[x]: https://...') Keep a Changelog puts at
+          # the bottom of the file — otherwise the last version's section
+          # would swallow every link reference below it, since there is no
+          # following heading to stop at.
+          awk -v want="[${RELEASE_VERSION}]" '
+            /^## \[/ {
+              if (capturing) exit
+              if (index($0, "## " want) == 1) { capturing = 1 }
+              next
+            }
+            capturing && /^\[[^]]+\]:/ { exit }
+            capturing { print }
+          ' CHANGELOG.md > "${notes_file}"
+          if [[ ! -s "${notes_file}" ]]; then
+            echo "::error file=CHANGELOG.md::no '## [${RELEASE_VERSION}]' section — add one to CHANGELOG.md before tagging a release; a release with empty notes is never published from this workflow" >&2
+            exit 1
+          fi
+          echo "notes_file=${notes_file}" >> "$GITHUB_OUTPUT"
+          echo "[notes] $(wc -l < "${notes_file}") lines extracted for [${RELEASE_VERSION}]"
+
+      # `with:` is a structured action input, not a shell command line, so
+      # this one `${{ }}` splice (unlike every `run:` block above) carries no
+      # injection risk — nothing here concatenates it into a script.
+      - name: Attest provenance — release tarball
+        id: attest
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.tarball.outputs.tarball }}
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          PRERELEASE: ${{ steps.tag.outputs.prerelease }}
+          TARBALL: ${{ steps.tarball.outputs.tarball }}
+          NOTES_FILE: ${{ steps.notes.outputs.notes_file }}
+        run: |
+          set -euo pipefail
+          args=(--verify-tag --notes-file "${NOTES_FILE}")
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${RELEASE_TAG}" "${args[@]}" \
+            "${TARBALL}" \
+            deploy/launcher/ezil-os.sh \
+            deploy/launcher/ezil-os.ps1 \
+            SHA256SUMS
+
+      - name: Job summary
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          TARBALL: ${{ steps.tarball.outputs.tarball }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          {
+            echo "### Release ${RELEASE_TAG}"
+            echo
+            echo "| asset |"
+            echo "|---|"
+            echo "| \`${TARBALL}\` |"
+            echo "| \`deploy/launcher/ezil-os.sh\` |"
+            echo "| \`deploy/launcher/ezil-os.ps1\` |"
+            echo "| \`SHA256SUMS\` |"
+            echo
+            echo "Provenance attestation: ${ATTESTATION_URL}"
+          } >> "$GITHUB_STEP_SUMMARY"
