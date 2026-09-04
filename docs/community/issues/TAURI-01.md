@@ -62,4 +62,4 @@ named here rather than scheduled, the same as `ARM-01`.
 Want to work on this? Comment on the issue to claim it (the wrapper and build pipeline can be
 built and tested against a **self-signed** cert while the real credentials are pending — say so
 explicitly in your PR if that's the state it lands in), then read
-[How to send a pull request](../../../CONTRIBUTING.md#how-to-send-a-pull-request).
+[How to send a pull request](../../../CONTRIBUTING.md#how-to-send-a-pr).

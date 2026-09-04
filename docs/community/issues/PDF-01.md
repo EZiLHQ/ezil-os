@@ -55,5 +55,5 @@ and the new app), and the new app's own jsdom/browser test passes with zero skip
 ---
 
 Want to work on this? Comment on the issue to claim it, then read
-[How to send a pull request](../../../CONTRIBUTING.md#how-to-send-a-pull-request) and
+[How to send a pull request](../../../CONTRIBUTING.md#how-to-send-a-pr) and
 [Building an app for the desktop](../../CONTRIBUTING-APPS.md).

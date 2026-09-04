@@ -59,4 +59,4 @@ named here rather than scheduled, the same as `TAURI-01`.
 
 Want to work on this? Comment on the issue to claim it (starting from the missing-arm64-browser
 question, not from a build-matrix PR that would fail at the first `apt-get install`), then read
-[How to send a pull request](../../../CONTRIBUTING.md#how-to-send-a-pull-request).
+[How to send a pull request](../../../CONTRIBUTING.md#how-to-send-a-pr).

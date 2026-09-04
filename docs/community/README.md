@@ -27,7 +27,7 @@ is run), the files in `issues/` are the backlog; a maintainer runs it by hand to
 
 Comment on the issue (once it is published on GitHub) saying you are picking it up. This
 project uses 72-hour lazy consensus for claims — see
-[Picking something up](../../CONTRIBUTING.md#how-to-send-a-pull-request) in `CONTRIBUTING.md`.
+[Picking something up](../../CONTRIBUTING.md#picking-something-up) in `CONTRIBUTING.md`.
 If you are working from the file in this directory before it has been published as a GitHub
 issue, open a draft PR against the corresponding change and reference the file by its `id`
 (e.g. `SFA-01`) in the PR description instead.
