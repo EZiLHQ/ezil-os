@@ -143,8 +143,11 @@ emit() {
     for f in ${icons[@]+"${icons[@]}"}; do
       n="$(basename "$f")"
       mime_for "$n" >/dev/null || { echo "[build-shell] skip icon (unknown type): $n" >&2; continue; }
+      # `base64 < file`, never `base64 file`: BSD base64 (macOS) takes its input
+      # file only via -i and silently reads an empty stdin when given a positional
+      # argument — measured on PR #14, where every icon encoded to nothing.
       printf '  icons[%s] = "data:%s;base64,%s";\n' \
-        "\"$n\"" "$(mime_for "$n")" "$(base64 "$f" | tr -d '\n')"
+        "\"$n\"" "$(mime_for "$n")" "$(base64 < "$f" | tr -d '\n')"
     done
     printf '  return icons;\n})();\n'
   } >"$dir/icons.js"
