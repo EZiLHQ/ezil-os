@@ -260,9 +260,13 @@ run_bun () {
     # the first is how the second one survives.
     report_skips "$xml" || rc=1
 
-    # Rule 3: anything unexpected is reported as itself.
+    # Rule 3: a non-zero exit is reported as itself, with no interpretation
+    # laid over it. Deliberately NOT worded as "unrecognised": bun exits 1 for
+    # an ordinary failing test, and a wrapper that calls its most common exit
+    # code a mystery is a wrapper people stop reading.
     if [ "$bun_exit" -ne 0 ]; then
-        say "bun test exited ${bun_exit}, which this wrapper does not recognise. Reporting it."
+        say "bun test exited ${bun_exit}. This wrapper adds no interpretation to a non-zero exit"
+        say "  and knows no benign ones; reporting it as-is. The summary above is what happened."
         return "$bun_exit"
     fi
 
