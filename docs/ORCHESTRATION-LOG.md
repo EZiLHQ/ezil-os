@@ -127,3 +127,11 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   `session.implicit_hosting: false`, so a browser session renders the desktop but every click is ignored unless the
   adapter sets `NEKO_SESSION_IMPLICIT_HOSTING=true` (env binds on this binary — proven with `NEKO_SESSION_FILE`).
   T5 now owns all of `local/` (T0–T2 are done and nobody else is in it). Running: T4, O4, T5.
+- 2026-09-04 14:50Z — **image.yml's first run succeeded end to end** (run 33858675382; neko-base 09:30→09:33, desktop
+  09:33→09:39). The gate reported `base_exists=false overlay_exists=false → building`; the base really was built in
+  CI from the pinned recipes on upstream `neko/base` (67 s, 2.2 GB, image id `e4b90aeb…`), the overlay and the desktop
+  image were pushed, and cosign recorded Rekor entries 2709596886 and 2709598082 for the base and overlay. **Not yet
+  usable by the public:** `docker manifest inspect ghcr.io/ezilhq/ezil-os-desktop:latest` → `unauthorized`, i.e. the
+  new packages are private (GHCR default) and this session's token has no packages scope — visibility to Public is a
+  founder step (added to the founder-run script). T3 recorded at DEPLOYED; TARGET_ENVIRONMENT_CONFIRMED needs the
+  anonymous pull and `gh attestation verify` to pass.
