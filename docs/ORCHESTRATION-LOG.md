@@ -33,3 +33,8 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   retried and not worked around: they are outward-facing changes to shared infrastructure and belong to the founder.
   The exact commands are in the supervisor's scratchpad as `n1-cutover.sh` and are repeated in the round report.
   Rows that depend on N1 (N2, R2) wait; everything else proceeds. Worktrees D1 and G2 prepared @ 2a3c5bf.
+- 2026-09-04 08:05Z — **G1 merged** (aaf158a). Worker refuted two brief clauses with citations and was right both times:
+  no `autobuild` step for javascript-typescript (build-mode `none`), and the action pins kept at the specified majors
+  (v5/v9) because the newer majors change only the Node runtime. Hand-offs recorded: the ten labels in
+  `.github/labeler.yml` do not exist in the repo yet (labeler runs with least privilege and cannot create them) —
+  create them in G4; `codeowners/errors` to be checked on the default branch after push. Slot reused for D1.
