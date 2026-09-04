@@ -29,10 +29,11 @@
 #   failure: a skip here means the image gate above did not see the pulled
 #   image, which is a finding about this job, never a pass.
 #
-#   `local` — installs and typechecks `local/` for real, ALSO pulls the same
-#   image but tags it under a DIFFERENT local name
-#   (`ezil-os-worker-sandbox:ff199202`, not `ezil-integrated:local` — see the
-#   job's own comment on why: its suites read no env var at all), runs
+#   `local` — installs and typechecks `local/` for real, and pulls the
+#   PINNED reference it reads out of `deploy/images.env`
+#   (`ghcr.io/ezilhq/ezil-os-desktop:$EZIL_DESKTOP_TAG`), not `latest` and not
+#   a re-tag of one — see that job's own comment for why the pin is the only
+#   thing that proves anything here. It runs
 #   `bun run doctor` (`working-directory: local`) as an independent health
 #   check, then
 #   `bun test local/` and inspects the result: `bun test` itself exits 0 when
@@ -64,9 +65,14 @@
 #   FORK PRs CANNOT PULL THE PRIVATE PACKAGE. `pull_request` runs this
 #   workflow with a read-only, fork-scoped `GITHUB_TOKEN` for a fork's PR —
 #   that token cannot pull a private `ezilhq/ezil-os-desktop`, so both
-#   `container` and `local` fail at the "Pull the desktop image" step on
-#   every external contribution, regardless of anything the contributor
-#   wrote. Row G4's required-status list must NOT add "container (real
+#   `container` ("Pull the desktop image") and `local` ("Pull the pinned
+#   desktop image") fail at their pull step on every external contribution,
+#   regardless of anything the contributor wrote. A contributor who wants to
+#   run `local/` on their own machine sets `EZIL_LAUNCHER_IMAGE=<image:tag>`
+#   (`local/src/container/run-spec.ts`'s `DESKTOP_IMAGE_OVERRIDE_ENV`, the
+#   same variable `deploy/launcher/ezil-os.sh` reads) against an image they
+#   built themselves; CI deliberately does not, because this job's job is to
+#   prove the PIN resolves. Row G4's required-status list must NOT add "container (real
 #   image)" or "local (typecheck + unit + smoke)" until the package is made
 #   Public (already tracked as a founder step, docs/ORCHESTRATION-LOG.md
 #   2026-09-04 14:50Z) — otherwise no fork PR could ever merge.
@@ -584,43 +590,74 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # 🔴 SAME PULL AS THE `container` JOB ABOVE, TAGGED UNDER A DIFFERENT
-      # NAME — MEASURED, NOT THE BRIEF'S ORIGINAL ASSUMPTION.
-      # `local/src/host/docker-host.container.test.ts` and
-      # `local/tests/local-smoke.container.test.ts` do NOT read an env var at
-      # all: both call `readAndResolveDesktopImage(deploy/images.env)`
-      # (local/src/container/run-spec.ts:440, calling :415's
-      # `resolveDesktopImage`), which greps `deploy/images.env` for
-      # `EZIL_DESKTOP_IMAGE`/`EZIL_DESKTOP_TAG` and falls back to the literal
-      # `LOCAL_DESKTOP_IMAGE_FALLBACK` constant (run-spec.ts:353) —
-      # `ezil-os-worker-sandbox:ff199202` — whenever the file's tag fails
-      # Docker's tag grammar. `deploy/images.env:90` still ships
-      # `EZIL_DESKTOP_TAG=<to be pinned by CI>` (image.yml's own `desktop`
-      # job runs with `contents: read` and cannot write that pin back — see
-      # that file's own hand-off comment), which does fail the grammar check
-      # (`isDockerTag`, run-spec.ts:389), so on every run today these two
-      # suites resolve to the FALLBACK name, not to any GHCR reference —
-      # tagging the pulled image as `ezil-integrated:local` here (as the
-      # `container` job does) would leave these suites unable to find it. So:
-      # tag the SAME pulled image under the fallback name instead. Once a
-      # human advances `deploy/images.env`'s pin past the placeholder this
-      # step's tag becomes redundant but harmless; nothing here reads the
-      # placeholder itself.
-      - name: Pull the desktop image
+      # 🔴 THIS JOB PULLS THE PIN, NOT `latest` — AND THAT IS THE WHOLE POINT.
+      # `local/src/host/docker-host.container.test.ts`,
+      # `local/tests/local-smoke.container.test.ts` and `bun run doctor` all
+      # resolve their image through `readAndResolveDesktopImage`
+      # (`local/src/container/run-spec.ts`), which reads
+      # `EZIL_DESKTOP_IMAGE`/`EZIL_DESKTOP_TAG` out of `deploy/images.env`.
+      #
+      # Until row I0c that file carried `EZIL_DESKTOP_TAG=<to be pinned by CI>`
+      # and the resolver quietly substituted the literal
+      # `ezil-os-worker-sandbox:ff199202`, so this step pulled `latest` and
+      # re-tagged it under that literal to make the suites find something. The
+      # comment that stood here claimed the re-tag would become "redundant but
+      # harmless" once a human advanced the pin. That was WRONG, and it is the
+      # reason this step is rewritten in the same commit as the pin: with a
+      # real pin the resolver composes `ghcr.io/ezilhq/ezil-os-desktop:<sha8>`,
+      # the doctor inspects THAT reference, and a locally-tagged
+      # `ezil-os-worker-sandbox:ff199202` is not it — the doctor would have
+      # failed and the container suites would have skipped, on a green pull.
+      #
+      # So: read the pin the same way `image.yml`'s "Load image pins" step
+      # does (grep, never `source` — this file is deliberately not
+      # shell-sourceable), check it against Docker's tag grammar before using
+      # it, and pull exactly the reference `local/` will resolve. No re-tag.
+      # Nothing here sets `EZIL_LAUNCHER_IMAGE`: this job exists to prove the
+      # PIN resolves, and an override would prove something else.
+      #
+      # 🔴 THE PIN, NOT THIS COMMIT'S OWN sha8 — the distinction the file
+      # header's "WHICH TAG, AND WHY" is about. `image.yml` runs concurrently
+      # with this workflow and never on a `pull_request`, so this commit's own
+      # sha8 may not exist in GHCR yet; the pinned sha8 is a tag a PREVIOUS
+      # successful `image.yml` run already pushed, is immutable, and is
+      # therefore always resolvable. A pin advanced to a tag that was never
+      # published makes this step fail loudly — the honest failure, and the
+      # reason `deploy/images.env`'s write-back rule says to advance the pin
+      # only from a published run's `published-images.env` artifact.
+      - name: Pull the pinned desktop image
         shell: bash
         run: |
           set -e
-          image="ghcr.io/ezilhq/ezil-os-desktop:latest"
-          echo "[image] pulling ${image} ..."
+          # Same helper as .github/workflows/image.yml's "Load image pins".
+          read_env_key() { grep -E "^[[:space:]]*${1}[[:space:]]*=" "$2" | head -1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+          desktop_image="$(read_env_key EZIL_DESKTOP_IMAGE deploy/images.env)"
+          desktop_tag="$(read_env_key EZIL_DESKTOP_TAG deploy/images.env)"
+          if [ -z "${desktop_image}" ] || [ -z "${desktop_tag}" ]; then
+            echo "::error::deploy/images.env is missing EZIL_DESKTOP_IMAGE or EZIL_DESKTOP_TAG - local/ resolves its image from those two keys and cannot run without them."
+            exit 1
+          fi
+          # The SAME grammar as run-spec.ts's isDockerTag. Without this a
+          # re-introduced placeholder would reach `docker pull` and fail with
+          # an error about a reference format, not about the pin.
+          if ! printf '%s' "${desktop_tag}" | grep -qE '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'; then
+            echo "::error::deploy/images.env's EZIL_DESKTOP_TAG ('${desktop_tag}') is not a valid Docker tag, so local/ resolves no image at all. Advance the pin from a successful image.yml run's published-images.env artifact (gh run download <run-id> -n published-images.env) - see deploy/images.env's own write-back rule."
+            exit 1
+          fi
+          if [ "${desktop_tag}" = "latest" ]; then
+            echo "::error::deploy/images.env pins EZIL_DESKTOP_TAG=latest. A floating tag means two users on 'the same version' run different bytes - see that file's tag-scheme comment. Pin a sha8 or a semver."
+            exit 1
+          fi
+          image="${desktop_image}:${desktop_tag}"
+          echo "[image] pulling the PINNED reference ${image} (from deploy/images.env) ..."
           if ! pull_out="$(docker pull "${image}" 2>&1)"; then
             printf '%s\n' "${pull_out}"
-            echo "::error::docker pull ${image} was refused. The ezilhq/ezil-os-desktop package publishes PRIVATE by default and this job already has packages: read (see this job's permissions: block), but that alone is not always enough - check the package's own Actions-access setting at https://github.com/orgs/EZiLHQ/packages/container/ezil-os-desktop/settings (Manage Actions access -> this repository at Read), or make the package Public."
+            echo "::error::docker pull ${image} was refused. Two causes, in order of likelihood: (1) the ezilhq/ezil-os-desktop package publishes PRIVATE by default and this job already has packages: read (see this job's permissions: block), but that alone is not always enough - check the package's own Actions-access setting at https://github.com/orgs/EZiLHQ/packages/container/ezil-os-desktop/settings (Manage Actions access -> this repository at Read), or make the package Public; (2) the pin in deploy/images.env names a tag image.yml never published - advance it from a successful run's published-images.env artifact."
             exit 1
           fi
           printf '%s\n' "${pull_out}"
           digest="$(printf '%s\n' "${pull_out}" | grep -oE 'Digest: sha256:[0-9a-f]+' | head -1)"
           echo "[image] tested build: ${image}  ${digest:-<no Digest line printed by docker pull>}"
-          docker tag "${image}" ezil-os-worker-sandbox:ff199202
       # `local/tsconfig.json`'s own header comment: its typecheck reaches
       # `app/src/server/shell/boot-payload.ts`, which imports `drizzle-orm`
       # through `app/node_modules` — so `bun run --cwd local typecheck` needs
@@ -669,10 +706,10 @@ jobs:
       # 🔴 HARD-FAIL ON A SKIP, NOT JUST ON A FAILURE.
       # `local/src/host/docker-host.container.test.ts` and
       # `local/tests/local-smoke.container.test.ts` gate on `docker image
-      # inspect` for the image `readAndResolveDesktopImage` resolves (see the
-      # "Pull the desktop image" step above for why that is the FALLBACK
-      # name, not a GHCR reference) and SKIP — do not fail — when it is
-      # absent. `bun test`'s OWN exit code is 0 on a run with skips and zero
+      # inspect` for the image `readAndResolveDesktopImage` resolves — since
+      # row I0c that is `deploy/images.env`'s PINNED GHCR reference, exactly
+      # what the "Pull the pinned desktop image" step above pulled — and SKIP
+      # — do not fail — when it is absent. `bun test`'s OWN exit code is 0 on a run with skips and zero
       # failures (measured: a `describe.skipIf(true)` suite exits 0), so
       # without the check below this job would read as fully green while the
       # suites that boot a real desktop in a real browser never ran once. So:
