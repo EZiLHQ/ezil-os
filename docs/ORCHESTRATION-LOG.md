@@ -66,3 +66,8 @@ hand 2026-08-26); CODEOWNERS names a GitHub user that does not exist.
   Ten path labels created for the labeler. Probe PR #10 opened from `probe/dco` with one UNSIGNED commit: all seven
   contexts appeared (the six the ruleset will require, plus `label`), the labeler applied `docs`. Waiting for the
   DCO check to report failure (a pending context would mean the display name is wrong).
+- 2026-09-04 10:25Z — **DCO check proven on GitHub, both directions.** PR #10: unsigned commit `6ebf612` → `DCO: fail`;
+  amended with `-s` (`e246de5`) → `DCO: pass`. Labeler applied `docs`; CodeQL and the four CI contexts all appeared
+  as check runs on the PR, so every name the ruleset will require has now produced at least one run. PR closed
+  without merging, branch deleted. **Dependabot auto-closed #3, #4, #6, #7, #8, #9** on its first run under the new
+  policy — as D1 predicted; only the grouped patch PR #5 remains (merge after CI on it is green and read).
