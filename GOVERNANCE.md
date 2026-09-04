@@ -10,7 +10,9 @@ rule here has not been enforced by anything yet, it says so.
 Three neighbouring documents own their own subjects and this one does not
 duplicate them: conduct is [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md), building
 and submitting a change is [`CONTRIBUTING.md`](CONTRIBUTING.md), and reporting a
-vulnerability is [`SECURITY.md`](SECURITY.md).
+vulnerability is [`SECURITY.md`](SECURITY.md). What the project is trying to
+build next, and the measurement that would settle each item, is
+[`ROADMAP.md`](ROADMAP.md).
 
 ## Maintainers
 
@@ -95,8 +97,8 @@ unused for a long stretch may be handed back by agreement; nobody is removed for
 being busy.
 
 **Write access is not a way to push to `main`.** `main` will be
-[protected by a ruleset](#merging-into-main) that requires one, so every change —
-a maintainer's included — arrives through a pull request. Write access means you
+[protected by a ruleset](#merging-into-main) that requires a pull request for
+every change — a maintainer's included. Write access means you
 can merge one, not that you can bypass the checks.
 
 ## Merging into `main`
@@ -109,7 +111,9 @@ check, and CodeQL. That ruleset is row `G4` in
 `main` has no branch protection at all.
 
 One consequence is worth stating plainly rather than discovering later: **a solo
-maintainer cannot approve their own pull request.** GitHub does not allow it. So
+maintainer cannot approve their own pull request.** GitHub does not offer the
+Approve action to a pull request's own author, so there is nobody to give the
+approval a rule would demand. So
 the ruleset requires **zero approvals**, and the required checks — CI, DCO,
 CodeQL — are the gate. That is not a lowered bar dressed up as a policy; it is
 the honest one. A required approval count of one, on a project with one
@@ -144,9 +148,10 @@ nobody watches is worse than no button at all.
 
 ## Automation, and reading what it did
 
-Much of this repository is built by automated workers, and the project's position
-is that this is only acceptable if it is auditable. So all four pieces are
-committed, and anyone can read what model did what:
+Parts of this repository are built by automated workers, and the project's
+position is that this is only acceptable if it is auditable. So the definitions,
+the plan and the record are all committed, and anyone can read what model did
+what:
 
 - **The workers themselves** are committed definitions in
   [`.claude/agents/`](.claude/agents/) — one file per role, each naming the exact
