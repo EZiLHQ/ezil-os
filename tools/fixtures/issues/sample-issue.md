@@ -27,6 +27,14 @@ render test, so the publisher must copy the body through unchanged.
 ./tools/test.sh tools
 ```
 
+## Links (exercises absolutizeLinks — row I6c)
+
+Read [How to send a pull request](../../../CONTRIBUTING.md#how-to-send-a-pr)
+(a relative file, with an anchor) and
+[Building an app for the desktop](../../CONTRIBUTING-APPS.md) (relative to a
+sibling directory of this file's own `docs/community/issues/`). An
+already-absolute link like [Bun](https://bun.sh) is left untouched.
+
 ## Prerequisite
 
 None. This file is a test fixture and is never published to GitHub.
