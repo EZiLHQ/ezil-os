@@ -1,0 +1,9 @@
+{
+  "taskId": "I5b",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "INDEPENDENT_TEST_PASS",
+  "evidence": "Baseline ./tools/test.sh tools = 204 pass / 0 fail / 474 expect() across 4 files, before any edit. Work starting: bot exemption parity in issueLabelChange, ci.yml deep-link re-measurement, fixture refresh.",
+  "startedAt": "2026-09-05T00:00:00Z",
+  "updatedAt": "2026-09-05T00:00:00Z"
+}
