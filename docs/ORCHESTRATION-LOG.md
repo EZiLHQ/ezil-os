@@ -454,3 +454,30 @@ directory is the parent folder `/data/openclaw/projects/ezil`, not the repositor
   workflow. The `github:` numbers are written back into the 22 source files in this PR — the human-committed half of
   the publisher's design. Remaining in round INTAKE: I4 (label-gated Claude review; inert until the founder's secret),
   and the founder-gated rows I0f, D2, N1, R2.
+- 2026-09-05 — **I5b's report (merged as #45):** the triage tool's `isBotAuthor` now ORs three signals because the same
+  bot account is rendered differently by two APIs — `gh --json author` (GraphQL) gives `app/dependabot` with
+  `is_bot: true`, the Actions webhook payload gives `dependabot[bot]` with no `is_bot` — so tool and workflow agree
+  per account, not by identical logic. The `ci.yml` deep link is pinned by a boundary test, not a substring (a
+  substring pin stayed green under the wrong range). Hand-off: `triage-label.yml:17-27` still says the tool has no
+  bot exemption — stale, to true up in the next hygiene pass.
+- 2026-09-05 01:14Z — **PR #70 landed** as `f486ed6` (github numbers written back into the 22 issue sources; log and
+  plan folds). Its macOS `shell` leg failed once (the phone-portrait tap, FLAKE-01 #53) and passed on the one rerun the
+  watcher allows; 15 required green, merged directly because the non-required Vercel check keeps auto-merge refused.
+- 2026-09-05 01:12Z — **first dry run of the routine (§B5) on `main`:** `bun tools/triage.ts` → 2 PRs, 22 issues,
+  `requiredContextsDrift: null`; findings: #70 `template-incomplete` + `not-required-red`, #34 `not-required-red` +
+  `size/M` label missing; 22 issues clean. The supervisor's own docs PRs skip the template checklist — the tool caught
+  its author. Nothing posted (`--post` withheld: both PRs are ours).
+- 2026-09-05 — **I4 (claude-review.yml) — PR #71, landed as `8deed51`.** `pull_request_target: [labeled]`, step-level
+  gate on `review:claude` + secret presence (inert with a `::notice` when `ANTHROPIC_API_KEY` is absent), base-branch
+  checkout (the action's security.md: never the head), `anthropics/claude-code-action@d75b94d5` (= `v1.0.216` = `v1`,
+  dereferenced through the tag object), read-only `--allowedTools`, one comment, never approves. Two supervisor
+  corrections from the action's docs: the model id it copied (`claude-4-0-sonnet-20250805`) is the docs' example
+  placeholder → `claude-sonnet-5`; the second — swap to `github_token: GITHUB_TOKEN` because no Claude GitHub App
+  would be installed — the worker **refuted by measurement** (`gh api orgs/EZiLHQ/installations`: app 1236702
+  `claude`, `repository_selection: all`), so the App/OIDC path stands and comments will post as `claude[bot]`.
+  Supervisor fixed one self-contradictory citation left by the global replace (a79f6e5). Worker's own
+  mutation proofs: YAML indentation break → ScannerError → restore; gate shell `bash -n` break → exit 2 → restore.
+  Not proven: a real one-comment review — needs the secret (founder list item 6) and the merge (the workflow loads
+  from `main`). Its macOS `shell` leg failed on the window-controls suite (`G2/G3/G4 desktop`, positions all 0 —
+  a layout-timing shape, not FLAKE-01's tap) on the first head and passed on the next push with no rerun; if it
+  recurs on an unrelated PR it is FLAKE-02.

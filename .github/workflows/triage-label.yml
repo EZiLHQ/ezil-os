@@ -3,7 +3,7 @@
 # without a maintainer having looked at it.
 #
 # -----------------------------------------------------------------------------
-# MIRRORS tools/triage.ts's issueLabelChange - WITH ONE NOTED DIVERGENCE
+# MIRRORS tools/triage.ts's issueLabelChange (bot exemption on both sides)
 # -----------------------------------------------------------------------------
 # `tools/triage.ts` computes the same decision for a maintainer's manual
 # `--post` run: `needs-triage` iff the issue has none of AREA_LABELS = [app,
@@ -14,17 +14,14 @@
 # change it in the other in the same PR, the same way `size-label.yml` says
 # for `sizeBucket`.
 #
-# One divergence, on purpose, noted here rather than silently: this workflow
-# also skips an issue opened by a bot account (`login.endsWith("[bot]")`,
-# the same test as `tools/triage.ts`'s PR-side `isBotAuthor`), which
-# `issueLabelChange` does not do today - that function has no bot exemption
-# at all, so a maintainer's manual `--post` run would label a bot-opened
-# issue `needs-triage` exactly like a human one. Measured 2026-09-04: `gh
-# issue list -R EZiLHQ/ezil-os --state all` returns zero issues total, so
-# there is no bot-authored issue in this repo yet to compare against - the
-# divergence is real but currently untested by any actual case. Worth
-# `tools/triage.ts`'s `issueLabelChange` picking up the same exemption in a
-# future change to that file, which this row does not own.
+# Bot exemption, both sides: this workflow skips an issue opened by a bot
+# account (`login.endsWith("[bot]")`), and since row I5b (PR #45)
+# `issueLabelChange` skips one too, through `isBotAuthor`. The two tests
+# differ on purpose because the two APIs render the same account
+# differently: the webhook payload here gives `dependabot[bot]` and no
+# `is_bot` field; `gh ... --json author` (GraphQL) gives `app/dependabot`
+# with `is_bot: true`, so the tool ORs `BOT_NAMES`, the `[bot]` suffix and
+# `is_bot`. Same decision per account, reached through different fields.
 #
 # -----------------------------------------------------------------------------
 # THIS IS NOT A REQUIRED CONTEXT
