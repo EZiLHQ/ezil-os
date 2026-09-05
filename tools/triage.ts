@@ -156,6 +156,7 @@ export interface PullRequest {
 export interface Issue {
 	readonly number: number;
 	readonly title: string;
+	readonly author: Author;
 	readonly labels: readonly Label[];
 	readonly body: string;
 	readonly updatedAt: string;
@@ -231,7 +232,7 @@ A check failed here that is currently green on \`main\` for the same name, and i
 
 	"not-required-red": `### A non-required check is red
 
-A check failed here that is not among the fifteen required contexts. Two checks commonly do this on outside contributions: \`container (real image)\` and \`local (typecheck + unit + smoke)\` pull the desktop image from a private GitHub Container Registry package that a pull request from a fork — or a developer on an unprivileged machine — cannot read, so they come up red or skipped (see [\`.github/workflows/ci.yml\` lines 62–72](${REPO_BLOB}/.github/workflows/ci.yml#L62-L72)). The \`Vercel\` preview deploy is a third-party check on the same footing. Neither is one of the fifteen required contexts, so this does not block your merge.`,
+A check failed here that is not among the fifteen required contexts. Two checks commonly do this on outside contributions: \`container (real image)\` and \`local (typecheck + unit + smoke)\` pull the desktop image from a private GitHub Container Registry package that a pull request from a fork — or a developer on an unprivileged machine — cannot read, so they come up red or skipped (see [\`.github/workflows/ci.yml\` lines 65–78](${REPO_BLOB}/.github/workflows/ci.yml#L65-L78)). The \`Vercel\` preview deploy is a third-party check on the same footing. Neither is one of the fifteen required contexts, so this does not block your merge.`,
 
 	"size-xl": `### This pull request is large (size/XL)
 
@@ -277,9 +278,27 @@ export function hasChecklist(body: string): boolean {
 	return /^[ \t]*[-*][ \t]*\[[ xX]\]/m.test(body);
 }
 
-/** A bot author cannot fill the human template, so `template-incomplete` is suppressed for them. */
-export function isBotAuthor(pr: Pick<PullRequest, "author">): boolean {
-	return pr.author.is_bot === true || pr.author.login.endsWith("[bot]");
+/**
+ * A bot author cannot fill the human template, so `template-incomplete` is suppressed for
+ * them, and cannot use the repository's own area labels, so `issueLabelChange` skips them
+ * too -- the SAME predicate on both the PR side and the issue side, so a maintainer's manual
+ * `--post` run agrees with `.github/workflows/triage-label.yml`'s `login.endsWith("[bot]")`
+ * check on every account that check can see. Three signals, ORed: `BOT_NAMES` (the explicit
+ * list `dco.yml` also matches on), the `[bot]` suffix convention the workflow's webhook
+ * payload exposes, and the API's own `is_bot` flag. The third is not redundant with the other
+ * two: `gh ... --json author` renders a GitHub App account as `app/dependabot` with
+ * `is_bot: true` and NO `[bot]` suffix (measured 2026-09-05 against a real bot comment on
+ * `cli/cli`, and matching this repo's own `pr-list.json` fixture for PRs #33/#34) -- exactly
+ * the shape `login.endsWith("[bot]")` alone would miss. The workflow's raw webhook payload
+ * renders the classic REST-era bots (`dependabot[bot]`, `github-actions[bot]`) with the
+ * suffix instead and carries no `is_bot` field at all, so the two checks reach the same
+ * real-world verdict through different fields of the same underlying account, not through an
+ * identical expression -- see `.github/workflows/triage-label.yml`'s own header for the
+ * divergence this predicate exists to close everywhere `gh`'s author shape is available.
+ */
+export function isBotAuthor(entity: { readonly author: Pick<Author, "login" | "is_bot"> }): boolean {
+	const { author } = entity;
+	return BOT_NAMES.includes(author.login) || author.login.endsWith("[bot]") || author.is_bot === true;
 }
 
 function isBotCommit(commit: Commit): boolean {
@@ -406,8 +425,15 @@ export function prLabelChange(pr: Pick<PullRequest, "additions" | "deletions" | 
 	};
 }
 
-/** `needs-triage` iff the issue carries no area label and does not already have it. Never removes labels. */
-export function issueLabelChange(issue: Pick<Issue, "labels">): LabelChange {
+/**
+ * `needs-triage` iff the issue carries no area label, does not already have it, and was not
+ * opened by a bot -- the same `isBotAuthor` predicate `classifyPr` uses to suppress
+ * `template-incomplete`, so this function's decision matches
+ * `.github/workflows/triage-label.yml`'s `login.endsWith("[bot]")` check on every account the
+ * workflow can see. Never removes labels.
+ */
+export function issueLabelChange(issue: Pick<Issue, "labels" | "author">): LabelChange {
+	if (isBotAuthor(issue)) return { add: [], remove: [] };
 	const current = new Set(issue.labels.map((label) => label.name));
 	const hasArea = AREA_LABELS.some((area) => current.has(area));
 	const needsTriage = !hasArea && !current.has("needs-triage");
@@ -760,7 +786,7 @@ const liveFetchers: Fetchers = {
 			"--limit",
 			"100",
 			"--json",
-			"number,title,labels,body,updatedAt",
+			"number,title,author,labels,body,updatedAt",
 		]),
 	requiredContexts: async (repo) => {
 		try {

@@ -22,6 +22,24 @@
  *     `@users.noreply.github.com` email) carrying a `Signed-off-by` whose email is
  *     `support@github.com` — the exact mismatch `dco.yml` documents, which MUST be
  *     bot-skipped rather than failed.
+ *   - `issue-list.json`   — `gh issue list -R EZiLHQ/ezil-os --state all --json
+ *     number,title,author,labels,body,updatedAt` returns `[]` (measured 2026-09-05:
+ *     the repository has never had an issue opened, open or closed, not just none
+ *     open today). There is nothing real to capture, so all five entries are
+ *     synthesized to the `--json` shape `liveFetchers.openIssues` actually requests
+ *     (`--state open`); #201/#202/#203/#204 exercise the human-authored area-label
+ *     rule (no labels, an area label, an existing `needs-triage`, a non-area label)
+ *     and are marked human (`is_bot: false`). #205 is the bot-authored entry: its
+ *     `author` shape (`{ login: "app/dependabot", is_bot: true }`) is the SAME real
+ *     shape already captured for PRs #33/#34 in `pr-list.json` from this
+ *     repository's actual open Dependabot PRs — GitHub renders an App-based bot
+ *     account this way over `gh ... --json author` (confirmed against a live bot
+ *     account 2026-09-05: `gh issue list -R cli/cli --json author` returns
+ *     `{"is_bot":true,"login":"app/cli-triage"}`, no `[bot]` suffix), which is
+ *     exactly the case `isBotAuthor`'s `is_bot` check exists for and the case
+ *     `.github/workflows/triage-label.yml`'s webhook-only `login.endsWith("[bot]")`
+ *     check cannot see. Dependabot itself does not open issues today, so #205 is a
+ *     stand-in for "some bot account, someday" rather than a specific known case.
  *
  * The classifiers are pure, so these fixtures are the whole story: the mutation
  * proof for the flaky discriminator is `classifyChecks(flaky, [])` below, and the
@@ -323,6 +341,18 @@ describe("issue triage: needs-triage iff no area label and not already present",
 	it("the area set is exactly the ten path labels", () => {
 		expect([...AREA_LABELS].sort()).toEqual(["app", "ci", "docs", "e2e", "local", "mcp", "sdk", "shell", "tools", "worker"]);
 	});
+
+	it("a human issue with no area label DOES get needs-triage (positive control for the bot exemption below)", () => {
+		expect(isBotAuthor(issueList[0]!)).toBe(false);
+		expect(issueLabelChange(issueList[0]!).add).toEqual(["needs-triage"]);
+	});
+
+	it("is SUPPRESSED for a bot-authored issue even with no area label — the same isBotAuthor predicate the PR side uses, agreeing with triage-label.yml's login.endsWith(\"[bot]\") check", () => {
+		expect(isBotAuthor(issueList[4]!)).toBe(true);
+		expect(issueList[4]!.labels).toEqual([]); // no area label, so the unconditional rule would fire
+		expect(issueLabelChange(issueList[4]!).add).toEqual([]);
+		expect(issueLabelChange(issueList[4]!).remove).toEqual([]);
+	});
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -348,13 +378,43 @@ describe("comment templates are data, asserted verbatim", () => {
 		expect(body).toContain("CONTRIBUTING.md#sign-off-dco");
 	});
 
-	it("not-required-red explains fork/GHCR, cites ci.yml:62-72, and ends with the mandated sentence", () => {
+	it("not-required-red explains fork/GHCR, cites ci.yml:65-78, and ends with the mandated sentence", () => {
 		const body = TEMPLATES["not-required-red"];
 		expect(body).toContain("container (real image)");
 		expect(body).toContain("local (typecheck + unit + smoke)");
 		expect(body).toContain("private GitHub Container Registry");
-		expect(body).toContain(".github/workflows/ci.yml#L62-L72");
+		expect(body).toContain(".github/workflows/ci.yml#L65-L78");
 		expect(body.endsWith("Neither is one of the fifteen required contexts, so this does not block your merge.")).toBe(true);
+	});
+
+	it("the ci.yml#L65-L78 citation is not a stale line number: those lines in the real file are the fork/GHCR paragraph", () => {
+		// A deep link pins a LINE RANGE, not the text at it -- the two can drift
+		// independently the moment either file is edited. This test re-derives the
+		// range from `TEMPLATES["not-required-red"]` itself and reads the CURRENT
+		// `.github/workflows/ci.yml` from disk, so a future edit to either file that
+		// silently moves the paragraph fails HERE, which is exactly the bug this row
+		// was created to fix (the link had drifted from 62-72 to 65-78).
+		const body = TEMPLATES["not-required-red"];
+		const m = /ci\.yml#L(\d+)-L(\d+)/.exec(body);
+		expect(m).not.toBeNull();
+		const [, startStr, endStr] = m!;
+		const start = Number(startStr);
+		const end = Number(endStr);
+
+		const ciYmlPath = join(import.meta.dir, "..", ".github", "workflows", "ci.yml");
+		const lines = readFileSync(ciYmlPath, "utf8").split(/\r?\n/);
+		const cited = lines.slice(start - 1, end).join("\n"); // 1-indexed, inclusive
+
+		expect(cited).toContain("FORK PRs CANNOT PULL THE PRIVATE PACKAGE");
+		expect(cited).toContain("private `ezilhq/ezil-os-desktop`");
+		// A substring check alone is too weak: the OLD (wrong) range 62-72 still
+		// overlaps the tail of this paragraph (which starts at 65), so it would
+		// still contain both phrases above and this test would not have caught the
+		// bug it exists for. The paragraph is comment-boxed by a bare `#` line
+		// immediately before its first line and immediately after its last --
+		// asserting THOSE two lines pins the exact boundary, not just an overlap.
+		expect((lines[start - 2] ?? "").trim()).toBe("#"); // the line just before `start`
+		expect((lines[end] ?? "").trim()).toBe("#"); // the line just after `end`
 	});
 
 	it("ci-flaky says known flake, not your change, maintainer re-run", () => {
@@ -582,8 +642,9 @@ describe("run() end to end over the fixtures, with injected fetchers", () => {
 
 		expect(summary.requiredContextsDrift).toBeNull();
 		expect(summary.issues.find((i) => i.number === 201)!.labelsToAdd).toEqual(["needs-triage"]);
+		expect(summary.issues.find((i) => i.number === 205)!.labelsToAdd).toEqual([]); // bot-authored, exempt end to end
 		expect(summary.counts.openPrs).toBe(5);
-		expect(summary.counts.openIssues).toBe(4);
+		expect(summary.counts.openIssues).toBe(5);
 	});
 
 	it("since filters by updatedAt", async () => {
