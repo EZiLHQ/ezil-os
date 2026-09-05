@@ -421,3 +421,24 @@ directory is the parent folder `/data/openclaw/projects/ezil`, not the repositor
   supervisor had given I1 and I6b a different slug than I5; caught when I5 reported, fixed by message before either
   landed. Dependabot under the `bun` ecosystem re-opened two groups: #33 (wrangler) merged directly; #34
   (`@supabase/ssr` 0.5→0.12, a cookie-layer rewrite under the invite gate) HELD → row D2. I6a dispatched (publisher).
+- 2026-09-05 — **Wave 3 landing.** I2 merged (#40: `docs/CONTRIBUTING-APPS.md` + `docs/examples/hello-app.js.md`; the
+  worker corrected two brief errors — the trace outcome vocabulary is `ok|error|skipped`, never `ready`, and the
+  phone-band CSS lives in `shell/src/css/style.css`, not the file I named). I3 merged (#41: `welcome.yml`,
+  `size-label.yml`, `triage-label.yml` — `pull_request_target`, never checks out the head, one job each, marker-guarded;
+  they load their definition from `main`, so PR #41 could not exercise them: the first real PR/issue after the merge is
+  the proof). Hand-offs → row I5b: `tools/triage.ts`'s `issueLabelChange` lacks the bot exemption the workflow has;
+  its `ci.yml#L62-L72` deep link drifted to 65-78.
+- 2026-09-05 — **I6a landing (PR #42):** `tools/issues.ts` — strict front-matter, marker-based identity (never the
+  title; mutation-proved: a renamed issue is still found), topological order over `prereq`, dry-run default, `--apply`
+  creates missing only; 204 tools tests. Live dry run: 22 `would create`, every label resolved. Two findings before
+  anything is published: (1) the issue bodies' repository-relative links are correct in the tree and DEAD as GitHub
+  issue bodies (the `ezil-universe-dead-link-layer` class) — the publisher must render absolute `blob/main` links;
+  (2) fresh issues may not be search-indexed immediately, so per-id `--search` could double-create on a quick re-run
+  — one bulk list + local marker match instead. Both → row I6c, dispatched. **`--apply` stays unrun until I6c lands.**
+- 2026-09-05 — **I0d landing (PR #43).** The worker's five commits were complete but its verification loop stalled
+  waiting on a background run that never notified it; the supervisor ran the verification instead: SIGTERM on the
+  neko-browser-window suite — container up in 2 s, bun exited 143, no container left; pixels 13/0 (32 buckets, the
+  33rd was arithmetic); smoke 6/0 at `buckets=28/32`; worker suite 1075 / 1 known skip / 1 fail, and the fail was
+  attributed by running the keyboard suite against two images: 9/0 on a clean build, 8/1 on this host's
+  `ezil-integrated:local` (WIP-branch build, per M1). Lesson kept: an agent waiting on its own background task can
+  loop forever — read its tree and artifact, then land it.
