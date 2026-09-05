@@ -173,6 +173,32 @@ import path from 'node:path';
  */
 const IMAGE = process.env.EZIL_VALIDATE_IMAGE ?? process.env.EZIL_NEKO_IMAGE ?? 'ezil-integrated:local';
 const CONTAINER = `ezil-kbd-test-${process.pid}`;
+
+/**
+ * SIGTERM/SIGINT SURVIVAL -- docs/CONFIDENCE-MAP.md section 2.10 / section 3.9,
+ * reproduced against `neko-browser-window.container.test.ts` (same shape:
+ * boot at module scope, cleanup only in `afterAll`). `afterAll` alone only
+ * fires on a normal bun-test exit; a cancellation (Ctrl-C, a CI job
+ * cancellation, a harness timeout that sends SIGTERM) skips straight past it
+ * and orphans a container built from a 4.57 GB image. So this container's
+ * name is registered in a module-level set that a process-level signal
+ * handler removes on the way out. `spawnSync`, not an async shape, because
+ * Node/Bun runs `exit` handlers SYNCHRONOUSLY -- an outstanding async
+ * `docker rm -f` would never be awaited and would not survive `exit` at all.
+ */
+const CONTAINERS_TO_CLEAN = new Set<string>();
+let cleanupOnExitInstalled = false;
+function installCleanupOnExit() {
+  if (cleanupOnExitInstalled) return;
+  cleanupOnExitInstalled = true;
+  const removeAll = () => {
+    for (const name of CONTAINERS_TO_CLEAN) sh('docker', ['rm', '-f', name], 60_000);
+  };
+  process.on('exit', removeAll);
+  process.on('SIGTERM', () => { removeAll(); process.exit(143); });
+  process.on('SIGINT', () => { removeAll(); process.exit(130); });
+}
+installCleanupOnExit();
 const PORT = 18291;
 const SIDECAR_PORT = 18292;
 const PAGE_PORT = 3112;   // served INSIDE the container
@@ -306,6 +332,7 @@ function boot(): void {
   ], 120_000);
   if (run.status !== 0) throw new Error(`docker run failed: ${(run.stderr || '').trim()}`);
   started = true;
+  CONTAINERS_TO_CLEAN.add(CONTAINER);
 
   const deadline = Date.now() + BOOT_TIMEOUT_MS;
   while (Date.now() < deadline) {
