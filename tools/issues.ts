@@ -17,6 +17,23 @@
  * mutation-proves it (swap the marker test for a title test and a renamed issue
  * is re-created — RED).
  *
+ * ## Existence is read once, in bulk, immune to search-index lag (row I6c)
+ *
+ * `fetchers.listAll` is ONE `gh issue list -R <repo> --state all --limit 500
+ * --json number,title,state,labels,body` call, taken before the classify loop
+ * and reused for every file (`findExisting` filters the same in-memory list
+ * locally per id). This replaced a per-id `gh issue list --search` call (row
+ * I6a): `--search` reads GitHub's search index, which is eventually consistent,
+ * so a second `--apply` run shortly after the first could see a just-created
+ * issue as absent and duplicate it. `gh issue list` (no `--search`) reads the
+ * Issues API list endpoint directly — the same table a create just wrote to —
+ * so there is no index to lag. `liveFetchers.listAll` also refuses to trust a
+ * listing that hit the `--limit` cap: an array at exactly the limit cannot be
+ * proven complete, and treating it as complete would classify every unlisted
+ * issue as `create`, which is the exact duplicate this row exists to prevent.
+ * That is "an explicit don't-know instead of a false ready" applied to
+ * existence, not just to boot phases.
+ *
  * The blast radius is bounded like `triage.ts`'s: **dry-run by default**, and
  * `--apply` is the only write. `--apply` CREATES MISSING ISSUES ONLY. It never
  * edits, never closes, never reopens, never labels an existing issue — the live
@@ -50,15 +67,28 @@
  * available id; it FAILS on a cycle (naming the members) and on a dangling
  * prereq (a `prereq` that names no file).
  *
- * ## Bodies are rendered verbatim
+ * ## Bodies are rendered verbatim, except links, which are made absolute (row I6c)
  *
- * The GitHub issue body is the file body, unchanged, plus the footer line and
- * the marker. It is not the tool's place to rewrite the contributor's prose —
- * which means a link in the source renders exactly as written. The 22 bodies
- * today end with repository-relative links (`../../../CONTRIBUTING.md#...`) that
- * resolve for a file viewed in the tree but NOT from an `/issues/N` URL; that is
- * a fix for the source files (row I6b), handed off in the report, and NOT
- * measured here because measuring it would mean creating a live issue.
+ * A GitHub issue body has no base path, so a link written relative to the file
+ * (`../../../CONTRIBUTING.md#how-to-send-a-pr`) resolves for a file viewed in
+ * the repo tree but points nowhere from an `/issues/N` URL. The SOURCE FILES
+ * keep their repository-relative links unchanged — they stay correct for a
+ * contributor reading the tree, and the publisher owns the one-time
+ * translation, not the file. `absolutizeLinks` rewrites every such link,
+ * resolved from the file's own canonical location (`backlogSourcePath`, i.e.
+ * `docs/community/issues/<id>.md`, regardless of where `--issues-dir` actually
+ * pointed this run), to `https://github.com/<repo>/blob/main/<path>` with its
+ * anchor preserved. An `http(s)://` link is left untouched. A link that
+ * resolves outside the repository, to a file that does not exist, or is
+ * anchor-only (`#foo` — an anchor points nowhere once the body leaves the
+ * repo tree, there is no page under it to scroll) FAILS LOUDLY, naming the
+ * source file and the raw target: a dead link is a defect this tool refuses
+ * to publish, not a warning it prints and ships anyway. Every file's links are
+ * checked up front (`validateLinks`, alongside `validateLabels`) before any
+ * `gh` call, so a dead link fails a dry run too, not only `--apply`. Apart
+ * from its links, the body is the file's body unchanged plus the footer line
+ * and the marker — it is not this tool's place to rewrite the contributor's
+ * prose otherwise.
  *
  * ## No dependencies beyond Bun
  *
@@ -67,9 +97,9 @@
  * core, injected fetchers so no test ever reaches a real `gh`.
  */
 
-import { readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 
 // ---------------------------------------------------------------------------
 // The front-matter contract, as data.
@@ -284,20 +314,89 @@ export function markerFor(id: string): string {
 	return `<!-- ezil-backlog-id: ${id} -->`;
 }
 
-/** The search PHRASE (the marker's readable inner text) handed to `gh --search`. */
-export function searchPhrase(id: string): string {
-	return `ezil-backlog-id: ${id}`;
+/**
+ * The repo-relative path a backlog file is canonically read from, used both by
+ * the footer's `source:` line and as the base directory link resolution
+ * happens from. Fixed regardless of the actual `--issues-dir` this run used
+ * (which may be a test fixture directory), because the footer and a published
+ * issue's absolute links must always describe the file's real home.
+ */
+export function backlogSourcePath(id: string): string {
+	return `docs/community/issues/${id}.md`;
 }
 
 /** The footer line appended to every rendered body. */
 export function footerLine(fm: FrontMatter): string {
 	const prereq = fm.prereq === "" ? "none" : fm.prereq;
-	return `Backlog id: ${fm.id} · prerequisite: ${prereq} · source: docs/community/issues/${fm.id}.md`;
+	return `Backlog id: ${fm.id} · prerequisite: ${prereq} · source: ${backlogSourcePath(fm.id)}`;
 }
 
-/** The GitHub issue body: the file's body verbatim, then the footer, then the marker. */
-export function renderBody(fm: FrontMatter, body: string): string {
-	return `${body.trim()}\n\n${footerLine(fm)}\n\n${markerFor(fm.id)}`;
+// ---------------------------------------------------------------------------
+// Links: absolute at render time. See the file-level doc comment.
+// ---------------------------------------------------------------------------
+
+const MARKDOWN_LINK = /\[([^\]]*)\]\(([^)]+)\)/g;
+
+function repoRootDir(): string {
+	return join(import.meta.dir, "..");
+}
+
+/**
+ * Whether `repoRelativePath` names a real file in this checkout. A direct
+ * filesystem check, never injected — `loadIssues` above already reads the
+ * repo's own files directly, and a link either really resolves in this tree
+ * or it does not; faking that would defeat the point of checking it.
+ */
+export function repoFileExists(repoRelativePath: string): boolean {
+	return existsSync(join(repoRootDir(), repoRelativePath));
+}
+
+/**
+ * Rewrite every repository-relative markdown link in `body` to an absolute
+ * `https://github.com/<repo>/blob/main/<path>` URL, resolved from `source`'s
+ * own directory (its anchor, if any, is preserved). An `http(s)://` target is
+ * left untouched. FAILS LOUDLY, naming `source` and the raw target, on a
+ * target that resolves outside the repository, to a file that does not
+ * exist, or that is anchor-only (`#foo` alone points nowhere once this body
+ * is a GitHub issue body, not a file in the tree) — a dead link is a defect,
+ * not something this tool prints a warning about and ships anyway.
+ */
+export function absolutizeLinks(body: string, source: string, repo: string): string {
+	return body.replace(MARKDOWN_LINK, (whole: string, text: string, target: string) => {
+		if (/^https?:\/\//i.test(target)) return whole;
+		if (target.startsWith("#")) {
+			throw new BacklogError(
+				`${source}: link target ${JSON.stringify(target)} is anchor-only — it points nowhere once this body is a GitHub issue`,
+			);
+		}
+		const hashIndex = target.indexOf("#");
+		const rawPath = hashIndex === -1 ? target : target.slice(0, hashIndex);
+		const anchor = hashIndex === -1 ? "" : target.slice(hashIndex);
+		const resolved = posix.normalize(posix.join(posix.dirname(source), rawPath));
+		if (resolved === ".." || resolved.startsWith("../")) {
+			throw new BacklogError(`${source}: link target ${JSON.stringify(target)} resolves outside the repository (to ${resolved})`);
+		}
+		if (!repoFileExists(resolved)) {
+			throw new BacklogError(`${source}: link target ${JSON.stringify(target)} does not exist in the repository (resolved to ${resolved})`);
+		}
+		return `[${text}](https://github.com/${repo}/blob/main/${resolved}${anchor})`;
+	});
+}
+
+/**
+ * Validate every file's links render cleanly, BEFORE any `gh` call — a dead
+ * link is a defect regardless of whether the issue it would become already
+ * exists, so this runs on every file in the backlog, not only the ones about
+ * to be created.
+ */
+export function validateLinks(issues: readonly BacklogIssue[], repo: string): void {
+	for (const bi of issues) absolutizeLinks(bi.body, backlogSourcePath(bi.frontMatter.id), repo);
+}
+
+/** The GitHub issue body: the file's body verbatim but for its links (made absolute), then the footer, then the marker. */
+export function renderBody(fm: FrontMatter, body: string, repo: string): string {
+	const absolutized = absolutizeLinks(body.trim(), backlogSourcePath(fm.id), repo);
+	return `${absolutized}\n\n${footerLine(fm)}\n\n${markerFor(fm.id)}`;
 }
 
 /** The GitHub issue title: the front-matter title, unchanged. */
@@ -338,7 +437,7 @@ export interface Classification {
 }
 
 /**
- * Classify one file against the issues a search returned: `create` when no
+ * Classify one file against the bulk issue listing: `create` when no
  * marker matches, `exists` when the matched issue's title equals the rendered
  * title, `drift` when the marker matches but the title has diverged (scoped to
  * the title, per the brief; body drift is not reported).
@@ -500,11 +599,19 @@ export function normalizeGhIssues(raw: unknown): GhIssue[] {
 	});
 }
 
+/** The cap on {@link bulkListArgs}'s `--limit`. See `liveFetchers.listAll` for why a listing this long is refused rather than trusted. */
+export const BULK_LIST_LIMIT = 500;
+
 export interface Fetchers {
 	/** The set of label names that exist in the repo. */
 	availableLabels(repo: string): Promise<Set<string>>;
-	/** Candidate issues for one backlog id (a `--search` over the marker phrase; refined by `findExisting`). */
-	existingFor(repo: string, id: string): Promise<GhIssue[]>;
+	/**
+	 * EVERY issue in the repo, open and closed, read ONCE per run and reused
+	 * for every file's classification (`findExisting` filters this same list
+	 * locally, per id). A direct `gh issue list`, not `--search` — see the
+	 * file-level doc comment on why that makes this immune to search-index lag.
+	 */
+	listAll(repo: string): Promise<GhIssue[]>;
 }
 
 export interface Applier {
@@ -512,8 +619,8 @@ export interface Applier {
 	create(repo: string, spec: CreateSpec): Promise<number>;
 }
 
-/** The `gh issue list --search` vector for one id, exactly as the brief specifies. */
-export function searchArgs(repo: string, id: string): string[] {
+/** The ONE `gh issue list` vector used for every file's existence check this run. */
+export function bulkListArgs(repo: string): string[] {
 	return [
 		"issue",
 		"list",
@@ -521,12 +628,10 @@ export function searchArgs(repo: string, id: string): string[] {
 		repo,
 		"--state",
 		"all",
-		"--search",
-		`"${searchPhrase(id)}" in:body`,
+		"--limit",
+		String(BULK_LIST_LIMIT),
 		"--json",
 		"number,title,state,labels,body",
-		"--limit",
-		"100",
 	];
 }
 
@@ -539,7 +644,22 @@ const liveFetchers: Fetchers = {
 		for (const label of labels) if (typeof label.name === "string") set.add(label.name);
 		return set;
 	},
-	existingFor: async (repo, id) => normalizeGhIssues(await ghJson<unknown>(searchArgs(repo, id))),
+	listAll: async (repo) => {
+		const issues = normalizeGhIssues(await ghJson<unknown>(bulkListArgs(repo)));
+		// A listing at exactly the cap cannot be proven complete. Trusting it
+		// would classify every issue past the cap as `create`, and --apply
+		// would duplicate it — the exact failure this bulk read exists to
+		// prevent, now with a cap instead of index lag as the cause. An honest
+		// "don't know" (fail loudly, name the cap) beats a false "ready".
+		if (issues.length >= BULK_LIST_LIMIT) {
+			throw new GhError(
+				`gh issue list -R ${repo} returned ${issues.length} issues, at or past the --limit ${BULK_LIST_LIMIT} cap — ` +
+					"this tool cannot prove the listing is complete, so it will not guess which issues are missing from it. " +
+					"Raise BULK_LIST_LIMIT (tools/issues.ts) or close/delete enough issues to get back under the cap.",
+			);
+		}
+		return issues;
+	},
 };
 
 const liveApplier: Applier = {
@@ -623,6 +743,12 @@ export async function run(
 	const ordered = topoOrder(issues);
 	const available = await fetchers.availableLabels(repo);
 	validateLabels(ordered, available);
+	// Every file's links, checked before any gh call at all: a dead link is a
+	// defect whether or not the issue it would become already exists.
+	validateLinks(ordered, repo);
+	// ONE bulk read, reused for every file below — never re-read between
+	// creates, and never re-read per id. See the file-level doc comment.
+	const allIssues = await fetchers.listAll(repo);
 
 	const wouldCreate: WouldCreate[] = [];
 	const exists: ExistsEntry[] = [];
@@ -631,8 +757,7 @@ export async function run(
 
 	for (const bi of ordered) {
 		const fm = bi.frontMatter;
-		const candidates = await fetchers.existingFor(repo, fm.id);
-		const classification = classify(fm, candidates);
+		const classification = classify(fm, allIssues);
 		const labels = appliedLabels(fm);
 		if (classification.kind === "create") {
 			wouldCreate.push({ id: fm.id, title: renderTitle(fm), labels });
@@ -653,11 +778,11 @@ export async function run(
 	if (apply) {
 		for (const bi of toCreate) {
 			const fm = bi.frontMatter;
-			const spec: CreateSpec = { id: fm.id, title: renderTitle(fm), body: renderBody(fm, bi.body), labels: appliedLabels(fm) };
+			const spec: CreateSpec = { id: fm.id, title: renderTitle(fm), body: renderBody(fm, bi.body, repo), labels: appliedLabels(fm) };
 			const number = await applier.create(repo, spec);
 			created.push({ id: fm.id, number });
 			lines.push(
-				`created #${number} ${fm.id} — add this line to docs/community/issues/${fm.id}.md front-matter, then commit:  github: ${number}`,
+				`created #${number} ${fm.id} — add this line to ${backlogSourcePath(fm.id)} front-matter, then commit:  github: ${number}`,
 			);
 		}
 	}
@@ -681,6 +806,8 @@ export interface CliArgs {
 	readonly apply: boolean;
 	readonly issuesDir: string | null;
 	readonly help: boolean;
+	/** `--print <ID>`: render one file's body (absolute links and all) and exit, without touching `gh` at all. */
+	readonly print: string | null;
 }
 
 export function parseArgs(argv: readonly string[]): CliArgs {
@@ -688,6 +815,7 @@ export function parseArgs(argv: readonly string[]): CliArgs {
 	let apply = false;
 	let issuesDir: string | null = null;
 	let help = false;
+	let print: string | null = null;
 	for (let i = 0; i < argv.length; i += 1) {
 		const arg = argv[i];
 		if (arg === "--repo") {
@@ -700,15 +828,20 @@ export function parseArgs(argv: readonly string[]): CliArgs {
 			if (value === undefined) throw new Error("--issues-dir needs a path.");
 			issuesDir = value;
 			i += 1;
+		} else if (arg === "--print") {
+			const value = argv[i + 1];
+			if (value === undefined) throw new Error("--print needs a backlog id, e.g. --print SFA-01.");
+			print = value;
+			i += 1;
 		} else if (arg === "--apply") {
 			apply = true;
 		} else if (arg === "--help" || arg === "-h") {
 			help = true;
 		} else {
-			throw new Error(`unknown argument ${JSON.stringify(arg)}. Flags: --repo <owner/name>, --issues-dir <path>, --apply.`);
+			throw new Error(`unknown argument ${JSON.stringify(arg)}. Flags: --repo <owner/name>, --issues-dir <path>, --print <ID>, --apply.`);
 		}
 	}
-	return { repo, apply, issuesDir, help };
+	return { repo, apply, issuesDir, help, print };
 }
 
 export function defaultIssuesDir(): string {
@@ -722,6 +855,8 @@ if (import.meta.main) {
 			"issues.ts — idempotent publisher of the community backlog (docs/community/issues/*.md).\n" +
 				"  --repo <owner/name>   default EZiLHQ/ezil-os\n" +
 				"  --issues-dir <path>   default <repo>/docs/community/issues\n" +
+				"  --print <ID>          render one file's body (absolute links included) to stdout\n" +
+				"                        and exit. Makes no `gh` call at all; not a dry run or --apply.\n" +
 				"  --apply               the ONLY flag that writes: creates MISSING issues only,\n" +
 				"                        never edits or closes an existing one. Default is a dry run.\n",
 		);
@@ -730,6 +865,17 @@ if (import.meta.main) {
 
 	const dir = args.issuesDir ?? defaultIssuesDir();
 	const issues = loadIssues(dir);
+
+	if (args.print !== null) {
+		const bi = issues.find((b) => b.frontMatter.id === args.print);
+		if (bi === undefined) {
+			process.stderr.write(`--print: no backlog file with id ${JSON.stringify(args.print)} in ${dir}\n`);
+			process.exit(1);
+		}
+		process.stdout.write(`${renderBody(bi.frontMatter, bi.body, args.repo)}\n`);
+		process.exit(0);
+	}
+
 	const { summary, lines } = await run(issues, { repo: args.repo, apply: args.apply }, liveFetchers, liveApplier);
 
 	for (const line of lines) process.stderr.write(`${line}\n`);
