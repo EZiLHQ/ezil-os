@@ -4,6 +4,7 @@ title: GPU passthrough on Linux
 labels: [local, "help wanted", "size/M"]
 prereq:
 state: open
+github: 54
 ---
 
 ## The problem

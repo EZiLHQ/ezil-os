@@ -4,6 +4,7 @@ title: Audio in the stream, exercised locally
 labels: [worker, local, "help wanted", "size/M"]
 prereq:
 state: open
+github: 49
 ---
 
 ## The problem

@@ -4,6 +4,7 @@ title: A Files app to browse the workspace
 labels: [shell, "help wanted", "size/L"]
 prereq: SFA-01
 state: open
+github: 62
 ---
 
 ## The problem

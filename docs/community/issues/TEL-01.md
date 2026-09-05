@@ -4,6 +4,7 @@ title: The telemetry drain outage has no drill
 labels: [worker, docs, "size/M"]
 prereq:
 state: open
+github: 69
 ---
 
 ## The problem

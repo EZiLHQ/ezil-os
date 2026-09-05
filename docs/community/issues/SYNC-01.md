@@ -4,6 +4,7 @@ title: Opt-in workspace sync from a local install to R2
 labels: [local, worker, "size/L"]
 prereq:
 state: open
+github: 67
 ---
 
 ## The problem

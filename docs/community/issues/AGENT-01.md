@@ -4,6 +4,7 @@ title: Agent driver loop — one task, ten verbs, an OpenAI-compatible endpoint
 labels: [mcp, worker, "help wanted", "size/L"]
 prereq: MCP-01
 state: open
+github: 57
 ---
 
 ## The problem

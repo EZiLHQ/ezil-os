@@ -4,6 +4,7 @@ title: Image viewer
 labels: [shell, "good first issue", "size/S"]
 prereq: SFA-01
 state: open
+github: 63
 ---
 
 ## The problem

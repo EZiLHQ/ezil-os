@@ -4,6 +4,7 @@ title: Coverage reporting — revive the branch
 labels: [ci, "good first issue", "size/M"]
 prereq:
 state: open
+github: 51
 ---
 
 ## The problem

@@ -4,6 +4,7 @@ title: Reconcile wip/mobile-keyboard
 labels: [shell, worker, "size/M"]
 prereq:
 state: open
+github: 55
 ---
 
 ## The problem

@@ -4,6 +4,7 @@ title: Forgot-password UI and re-auth before updateUser on /auth/invited
 labels: [app, "help wanted", "size/M"]
 prereq:
 state: open
+github: 50
 ---
 
 ## The problem

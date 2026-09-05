@@ -442,3 +442,15 @@ directory is the parent folder `/data/openclaw/projects/ezil`, not the repositor
   attributed by running the keyboard suite against two images: 9/0 on a clean build, 8/1 on this host's
   `ezil-integrated:local` (WIP-branch build, per M1). Lesson kept: an agent waiting on its own background task can
   loop forever — read its tree and artifact, then land it.
+- 2026-09-05 — **I0e landing (PR #46).** `shell/run-tests.sh` derives its suites from the tree: 28, not the 24 the hand
+  list had (four suites were silently never run by the local runner, `responsiveness` among them); `--family` mirrors
+  CI's portable/geometry split (5/6). The agent's verification loop stalled the same way I0d's did; the supervisor ran
+  it: 27 passed / 1 failed, the failure a 7 px flicker under box load that is 107/107 alone and on main.
+- 2026-09-05 — **The community backlog is public: issues #48–#69** (`bun tools/issues.ts --apply` on main after I6c
+  merged as #47). Every issue carries its area label, `help wanted` / `good first issue` / `blocked` as planned, and a
+  `size/*`; `SFA-01` (#60) is the prerequisite for the five viewers, `MCP-01` (#56) for `AGENT-01` (#57). A second dry
+  run reports 22 exist / 0 to create / 0 drift (the bulk marker lookup, not the search index); #60's body renders
+  absolute `blob/main` links and the marker. I5b merged (#45): the triage tool's bot exemption now agrees with the
+  workflow. The `github:` numbers are written back into the 22 source files in this PR — the human-committed half of
+  the publisher's design. Remaining in round INTAKE: I4 (label-gated Claude review; inert until the founder's secret),
+  and the founder-gated rows I0f, D2, N1, R2.

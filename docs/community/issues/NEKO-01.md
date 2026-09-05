@@ -4,6 +4,7 @@ title: EZIL_NEKO_IMAGE means two different shapes
 labels: [worker, local, "good first issue", "size/S"]
 prereq:
 state: open
+github: 58
 ---
 
 ## The problem
