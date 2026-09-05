@@ -142,7 +142,7 @@
 # -----------------------------------------------------------------------------
 # `model` is a deprecated input (docs/usage.md, "Deprecated Inputs": "Use
 # `claude_args` with `--model` instead"). That same file's migration example
-# writes `claude_args: "--model claude-sonnet-5"` at usage.md:33,
+# writes `claude_args: "--model claude-4-0-sonnet-20250805"` at usage.md:33,
 # :67, :104, and :171 - but this is the docs' placeholder for "a model id
 # goes here", not a real, current model: examples/claude.yml:47 uses the
 # same invented shape one tier up, `claude-opus-4-1-20250805`, both carrying
