@@ -1,9 +1,9 @@
 {
   "taskId": "I0c",
   "runId": "wf-os-2026-09-04",
-  "status": "running",
-  "doneRung": "STARTED",
-  "evidence": "worktree created at base 3c76d43; newest successful image.yml run on main = 33876458193 (headSha 3c76d43bf..., conclusion success); its published-images.env artifact downloaded (458 B) and reads EZIL_DESKTOP_TAG=3c76d43b, digest sha256:0b90b66d13bb2f1e84a7d254878bd390e1e45f181bb19000a4451f06692e683f; the run log confirms `pushing manifest for ghcr.io/ezilhq/ezil-os-desktop:3c76d43b@sha256:0b90b66d...` so the tag really exists in GHCR. Override image ezil-os-worker-sandbox:ff199202 confirmed present locally (sha256:14ae1a93998f...). No edits yet.",
+  "status": "done",
+  "doneRung": "INDEPENDENT_TEST_PASS",
+  "evidence": "PR #31: EZIL_DESKTOP_TAG=3c76d43b; EZIL_LAUNCHER_IMAGE is the one override; the silent fallback is gone (doctor without it: 11/2/1 FAIL naming three fixes; with it: 12/2/0 saying the pin is not in use); local CI pulls the pin; /app,/worker -> bun. Agent killed by the spend limit mid-verification; supervisor ran the full verify (310 pass / 7 skip / 0 fail, no container left) and landed it [artifact completed by the supervisor on 2026-09-05: the worker was killed by the account spend limit before its final write; the row was landed by hand as PR #31 and this file had said running since.]",
   "startedAt": "2026-09-04T00:00:00Z",
-  "updatedAt": "2026-09-04T00:00:00Z"
+  "updatedAt": "2026-09-05T02:28:02Z"
 }
