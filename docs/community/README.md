@@ -19,9 +19,21 @@ by title, so re-running it never creates a duplicate. It is dry-run by default; 
 creates missing issues only, and never edits or closes one that already exists — drift between
 a file here and its published issue is reported, not silently corrected.
 
-**If `tools/issues.ts` has not merged yet, it does not exist** — check
-[`docs/TASKS.csv`](../TASKS.csv) row `I6a` before assuming it is available. Until it lands (or
-is run), the files in `issues/` are the backlog; a maintainer runs it by hand to publish them.
+Run it from the repo root:
+
+```
+bun tools/issues.ts               # dry run: lists what would be created/exists/drifted
+bun tools/issues.ts --print SFA-01  # render one file's body (see below) without touching gh
+bun tools/issues.ts --apply       # a maintainer step — the only flag that writes anything
+```
+
+A GitHub issue body has no base path, so a link written relative to the file (as every link in
+`issues/*.md` is, e.g. `../../../CONTRIBUTING.md#how-to-send-a-pr`) would resolve nowhere from
+an `/issues/N` URL. `tools/issues.ts` makes every such link absolute
+(`https://github.com/EZiLHQ/ezil-os/blob/main/...`) at publish time, so **the files in this
+directory should keep their repository-relative links** — do not hand-rewrite them to absolute
+URLs, the publisher already does that. This README's own links are never published as an issue
+body, so they stay relative too and are not touched by anything in `tools/issues.ts`.
 
 ## How to claim one
 
