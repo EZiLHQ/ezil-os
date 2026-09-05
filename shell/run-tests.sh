@@ -189,12 +189,15 @@ shell/run-tests.sh — run every EZiL-OS shell suite and print one honest verdic
                   not a suite: read its medians, it has no threshold.
   --strict        exit non-zero if ANY suite SKIPPED (use this in CI)
   --only <sub>    run only suites whose path contains <sub>
-  --family <f>    all (default) | portable | geometry — restrict the
-                  real-browser suites to the OS family `.github/workflows/
-                  ci.yml`'s `shell` job runs them under. Node-only suites are
-                  unaffected. A suite `ci.yml` classifies into neither family
-                  is an ERROR under `--family portable`/`--family geometry`
-                  (not a silent skip) — see "CI FAMILY SPLIT" in this file.
+  --family <f>    all (default) | portable | geometry — restrict this run to
+                  the real-browser suites in the named OS family
+                  `.github/workflows/ci.yml`'s `shell` job runs them under.
+                  `portable`/`geometry` run ONLY that family's real-browser
+                  suites (node-only suites are skipped entirely, not run);
+                  `all` runs everything, same as always. A suite `ci.yml`
+                  classifies into neither family is an ERROR under
+                  `--family portable`/`--family geometry` (not a silent skip)
+                  — see "CI FAMILY SPLIT" in this file.
   --list          print the suites this invocation would run, one per line
                   (honouring --only and --family), and exit 0. Does not run
                   anything, including the bundle-drift gate.
@@ -263,7 +266,7 @@ NODE_SUITES=()
 BROWSER_SUITES=()
 while IFS= read -r abs; do
     [ -n "$abs" ] || continue
-    rel="${abs#"$ROOT"/}"
+    rel="${abs#$ROOT/}"
     if is_browser_suite "$rel"; then
         BROWSER_SUITES+=("$rel")
     else
