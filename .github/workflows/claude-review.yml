@@ -125,16 +125,39 @@
 # creates a branch or a commit (see the prompt below - "never pushes"), so
 # the checkout step needs read access only.
 #
+# This auth path was checked against this org, not assumed: `gh api
+# orgs/EZiLHQ/installations` (measured 2026-09-05) lists app_id 1236702,
+# app_slug "claude", `repository_selection: "all"` - the official Claude
+# GitHub App is installed org-wide, so it covers EZiLHQ/ezil-os and the
+# OIDC-token-exchange path `id-token: write` enables actually has an
+# installation to exchange into. (A prior review pass on this same PR
+# proposed swapping to a custom `github_token: ${{ secrets.GITHUB_TOKEN }}`
+# on the premise that no such app was installed here - MANDATORY #13:
+# checked rather than trusted, and the premise did not hold; comments will
+# post as `claude[bot]`, not `github-actions[bot]`.)
+#
 # -----------------------------------------------------------------------------
-# MODEL AND TOOL RESTRICTION - BOTH CITED FROM THE ACTION'S OWN DOCS, NOT
-# GUESSED
+# MODEL - CITED FROM ANTHROPIC'S OWN MODEL CATALOG, NOT THE ACTION'S EXAMPLE
+# STRING (WHICH IS A PLACEHOLDER, MEASURED, NOT GUESSED)
 # -----------------------------------------------------------------------------
 # `model` is a deprecated input (docs/usage.md, "Deprecated Inputs": "Use
-# `claude_args` with `--model` instead"); the migration example in that same
-# file gives the exact current Sonnet id this workflow uses:
+# `claude_args` with `--model` instead"). That same file's migration example
+# writes `claude_args: "--model claude-sonnet-5"` at usage.md:33,
+# :67, :104, and :171 - but this is the docs' placeholder for "a model id
+# goes here", not a real, current model: examples/claude.yml:47 uses the
+# same invented shape one tier up, `claude-opus-4-1-20250805`, both carrying
+# the identical, otherwise-unexplained date `20250805`. Anthropic's own
+# current model catalog has no `claude-4-0-sonnet-...` or
+# `claude-opus-4-1-...` id at all - current-generation ids carry no date
+# suffix (`claude-sonnet-5`, `claude-opus-5`, ...; a dated suffix marks an
+# older, pinned snapshot). Copying the docs' example literally would fail at
+# the API's model lookup on every run, after the founder has already paid
+# for the runner. This workflow uses `claude-sonnet-5` - the current Sonnet
+# id - instead.
 #
-#   `claude_args: "--model claude-4-0-sonnet-20250805"`
-#
+# -----------------------------------------------------------------------------
+# TOOL RESTRICTION - CITED FROM THE ACTION'S OWN DOCS
+# -----------------------------------------------------------------------------
 # `allowed_tools` is likewise deprecated in favor of `claude_args` with
 # `--allowedTools` (docs/usage.md, same table: "Use `claude_args:
 # \"--allowedTools Edit,Read,Write\"`"). This workflow's list is read-only by
@@ -282,5 +305,5 @@ jobs:
             End your comment with exactly this sentence on its own line:
             "This is an automated pass requested by a maintainer; the maintainer decides."
           claude_args: |
-            --model claude-4-0-sonnet-20250805
+            --model claude-sonnet-5
             --allowedTools "Read,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*)"
