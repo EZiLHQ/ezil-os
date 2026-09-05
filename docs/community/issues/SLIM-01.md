@@ -4,6 +4,7 @@ title: Slim the local desktop image
 labels: [worker, "help wanted", "size/L"]
 prereq:
 state: open
+github: 66
 ---
 
 ## The problem

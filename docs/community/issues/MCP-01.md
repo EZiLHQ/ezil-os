@@ -4,6 +4,7 @@ title: A local MCP tool group over the ten sidecar verbs
 labels: [mcp, "help wanted", "size/M"]
 prereq:
 state: open
+github: 56
 ---
 
 ## The problem

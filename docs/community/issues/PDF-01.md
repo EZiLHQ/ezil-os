@@ -4,6 +4,7 @@ title: PDF viewer (pdf.js, vendored UMD)
 labels: [shell, "help wanted", "size/L"]
 prereq: SFA-01
 state: open
+github: 64
 ---
 
 ## The problem

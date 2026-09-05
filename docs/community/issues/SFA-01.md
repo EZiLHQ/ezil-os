@@ -4,6 +4,7 @@ title: A shell-callable file API — expose worker/src/project-files.ts to the d
 labels: [app, worker, "help wanted", "size/L"]
 prereq:
 state: open
+github: 60
 ---
 
 ## The problem

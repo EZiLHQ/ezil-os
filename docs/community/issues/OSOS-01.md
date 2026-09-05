@@ -4,6 +4,7 @@ title: Build the OS inside the OS — the Universe↔OS contract, OS side
 labels: [app, "size/XL"]
 prereq:
 state: open
+github: 59
 ---
 
 ## The problem

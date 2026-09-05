@@ -4,6 +4,7 @@ title: Native installers via a Tauri wrapper
 labels: [local, blocked, "size/XL"]
 prereq:
 state: blocked
+github: 68
 ---
 
 ## The problem

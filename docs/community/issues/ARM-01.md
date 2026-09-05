@@ -4,6 +4,7 @@ title: arm64 image
 labels: [worker, blocked, "size/XL"]
 prereq:
 state: blocked
+github: 48
 ---
 
 ## The problem

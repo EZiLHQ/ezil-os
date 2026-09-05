@@ -4,6 +4,7 @@ title: Spreadsheet viewer — CSV first, then XLSX via SheetJS
 labels: [shell, "help wanted", "size/L"]
 prereq: SFA-01
 state: open
+github: 65
 ---
 
 ## The problem
