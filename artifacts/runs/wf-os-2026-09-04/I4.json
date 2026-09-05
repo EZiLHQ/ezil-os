@@ -1,0 +1,9 @@
+{
+  "taskId": "I4",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "COMMITTED",
+  "evidence": "starting: writing .github/workflows/claude-review.yml",
+  "startedAt": "2026-09-05T01:03:15Z",
+  "updatedAt": "2026-09-05T01:03:15Z"
+}
