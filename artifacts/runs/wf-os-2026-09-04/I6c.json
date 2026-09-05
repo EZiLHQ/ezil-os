@@ -1,0 +1,10 @@
+{
+  "taskId": "I6c",
+  "runId": "wf-os-2026-09-04",
+  "status": "running",
+  "doneRung": "INDEPENDENT_TEST_PASS",
+  "evidence": "starting: absolute-link rendering + bulk marker lookup for tools/issues.ts (row I6c). Baseline before this row: ./tools/test.sh tools = 204 pass / 0 fail across 4 files (issues.test.ts alone: 68 pass / 0 fail / 144 expect()).",
+  "startedAt": "2026-09-05T00:00:00Z",
+  "updatedAt": "2026-09-05T00:00:00Z",
+  "notes": "work in progress"
+}
