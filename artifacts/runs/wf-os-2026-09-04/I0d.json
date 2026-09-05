@@ -1,9 +1,10 @@
 {
   "taskId": "I0d",
   "runId": "wf-os-2026-09-04",
-  "status": "running",
+  "status": "done",
   "doneRung": "INDEPENDENT_TEST_PASS",
-  "evidence": "started: pixels.ts bucket fix (Math.floor over 0..31, 32 buckets) landed and mutation-proved (13 pass / 0 fail restored; mutant Math.round -> 12 pass / 1 fail, Expected 32 Received 33). Signal-trap work on the three worker container suites not yet started.",
+  "evidence": "pixels.ts: floor(l/8) over 0..31 = 32 buckets, mutation-proved (13 pass; mutant Math.round -> Expected 32 Received 33); signal traps in all three container suites; SIGTERM proof on neko-browser-window (supervisor-run): container up in 2 s, kill -TERM -> bun exited 143, docker ps -a shows no container; smoke 6/0 with buckets=28/32 (oracle thresholds unchanged); tools/test.sh worker 1075 pass / 1 known skip / 1 fail; the fail is mobile-keyboard '48px affordance' = this host's ezil-integrated:local built from wip/mobile-keyboard (M1): 8/1 there, 9/0 against ezil-m1-mainverify:local in this tree",
   "startedAt": "2026-09-04T23:38:19Z",
-  "updatedAt": "2026-09-04T23:38:19Z"
+  "updatedAt": "2026-09-05T00:16:15Z",
+  "landedBy": "supervisor (agent stood down after its verification loop stalled)"
 }
