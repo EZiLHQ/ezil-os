@@ -1,9 +1,9 @@
 {
   "taskId": "I0e",
   "runId": "wf-os-2026-09-04",
-  "status": "running",
-  "doneRung": "unknown",
-  "evidence": "starting: deriving shell/run-tests.sh suite list from the filesystem instead of the hand-maintained run_suite list; adding --family portable|geometry|all and --list",
+  "status": "done",
+  "doneRung": "GREEN_LOCAL",
+  "evidence": "shell/run-tests.sh rewritten to derive its suite list from the filesystem (28 shell/**/*-test.mjs discovered, classified node vs real-browser by PLAYWRIGHT_REQUIRE_DIR content, not name) instead of a hand-typed 24-call list; before-fix --list did not exist (counted 24 run_suite calls), after-fix --list prints 28 including responsiveness-browser-test.mjs, desktop-screen-test.mjs, telemetry-bridge-test.mjs, late-focus-browser-test.mjs; mutation-proved by adding+removing shell/zz-probe-test.mjs (appeared/disappeared in --list with zero script edits); added --family all|portable|geometry (default all) with PORTABLE_SUITES(5)/GEOMETRY_SUITES(6) copied verbatim from ci.yml:387-391/:400-405 -- bash shell/run-tests.sh --family portable --list and --family geometry --list diff-empty-matched ci.yml's two lists exactly; found 3 real orphans (display-notice-browser-test.mjs, launcher-toggle-browser-test.mjs, context-menu-stack-browser-test.mjs) that ci.yml classifies into neither family -- under --family portable/geometry these are reported as FAILED (an error), never silently skipped or silently run; --family all is unaffected. bash -n shell/run-tests.sh: OK. bun test worker/src/shell-scripts-parse.test.ts: 14 pass / 0 fail. PLAYWRIGHT_REQUIRE_DIR=/opt/ezil-testkit/node_modules ./tools/test.sh shell: run twice, both real Playwright runs, 28 passed / 0 failed / 0 skipped both times, exit 0, VERDICT: PASSED -- includes responsiveness-browser-test.mjs at 107/107 (56-58s) which the old runner never invoked. --strict, --only, exit-2-skip semantics and VERDICT lines unchanged (byte-identical code), so tools/test.sh shell needed no change. Hand-off (not owns_files): .github/workflows/ci.yml's 'portable'/'geometry' for-loops do not name display-notice/launcher-toggle/context-menu-stack-browser-test.mjs; a drift test between this file's two arrays and ci.yml is also out of scope, named as a hand-off in the script's own comment.",
   "startedAt": "2026-09-04T00:00:00Z",
-  "updatedAt": "2026-09-04T00:00:00Z"
+  "updatedAt": "2026-09-05T00:20:00Z"
 }
