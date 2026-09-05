@@ -360,6 +360,10 @@ export function repoFileExists(repoRelativePath: string): boolean {
  * exist, or that is anchor-only (`#foo` alone points nowhere once this body
  * is a GitHub issue body, not a file in the tree) — a dead link is a defect,
  * not something this tool prints a warning about and ships anyway.
+ *
+ * Scope: only the TARGET FILE's existence is checked (`repoFileExists`),
+ * never whether its anchor names a real heading inside that file — an anchor
+ * that names no heading in an otherwise-real file is not caught here.
  */
 export function absolutizeLinks(body: string, source: string, repo: string): string {
 	return body.replace(MARKDOWN_LINK, (whole: string, text: string, target: string) => {
@@ -635,6 +639,25 @@ export function bulkListArgs(repo: string): string[] {
 	];
 }
 
+/**
+ * FAILS when `issues` is long enough that {@link bulkListArgs}'s `--limit`
+ * could have truncated it — a listing at exactly the cap cannot be proven
+ * complete. Trusting it anyway would classify every issue past the cap as
+ * `create`, and `--apply` would duplicate it: the exact failure the bulk
+ * read exists to prevent, now with a cap instead of search-index lag as the
+ * cause. An honest "don't know" (fail loudly, name the cap) beats a false
+ * "ready". Exported so the cap can be tested without a real `gh` call.
+ */
+export function assertListingComplete(issues: readonly GhIssue[], repo: string): void {
+	if (issues.length >= BULK_LIST_LIMIT) {
+		throw new GhError(
+			`gh issue list -R ${repo} returned ${issues.length} issues, at or past the --limit ${BULK_LIST_LIMIT} cap — ` +
+				"this tool cannot prove the listing is complete, so it will not guess which issues are missing from it. " +
+				"Raise BULK_LIST_LIMIT (tools/issues.ts) or close/delete enough issues to get back under the cap.",
+		);
+	}
+}
+
 const liveFetchers: Fetchers = {
 	availableLabels: async (repo) => {
 		// --limit 200: the default is 30 and a repo can have more, so a missing
@@ -646,18 +669,7 @@ const liveFetchers: Fetchers = {
 	},
 	listAll: async (repo) => {
 		const issues = normalizeGhIssues(await ghJson<unknown>(bulkListArgs(repo)));
-		// A listing at exactly the cap cannot be proven complete. Trusting it
-		// would classify every issue past the cap as `create`, and --apply
-		// would duplicate it — the exact failure this bulk read exists to
-		// prevent, now with a cap instead of index lag as the cause. An honest
-		// "don't know" (fail loudly, name the cap) beats a false "ready".
-		if (issues.length >= BULK_LIST_LIMIT) {
-			throw new GhError(
-				`gh issue list -R ${repo} returned ${issues.length} issues, at or past the --limit ${BULK_LIST_LIMIT} cap — ` +
-					"this tool cannot prove the listing is complete, so it will not guess which issues are missing from it. " +
-					"Raise BULK_LIST_LIMIT (tools/issues.ts) or close/delete enough issues to get back under the cap.",
-			);
-		}
+		assertListingComplete(issues, repo);
 		return issues;
 	},
 };

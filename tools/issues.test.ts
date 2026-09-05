@@ -45,7 +45,9 @@ import { describe, expect, it } from "bun:test";
 import {
 	absolutizeLinks,
 	appliedLabels,
+	assertListingComplete,
 	backlogSourcePath,
+	BULK_LIST_LIMIT,
 	bulkListArgs,
 	classify,
 	createArgs,
@@ -613,6 +615,36 @@ describe("bulkListArgs — the ONE gh read used for every file's existence check
 		expect(args[args.indexOf("--limit") + 1]).toBe("500");
 		expect(args[args.indexOf("--json") + 1]).toBe("number,title,state,labels,body");
 		expect(args).not.toContain("--search");
+	});
+
+	it("BULK_LIST_LIMIT matches the --limit bulkListArgs actually sends", () => {
+		expect(bulkListArgs("r")[bulkListArgs("r").indexOf("--limit") + 1]).toBe(String(BULK_LIST_LIMIT));
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("assertListingComplete: a listing at the --limit cap is a don't-know, not a false-complete read", () => {
+	function issuesOfLength(n: number): GhIssue[] {
+		return Array.from({ length: n }, (_, i) => ({ ...publishedSample, number: i + 1 }));
+	}
+
+	it("positive control: a listing well under the cap is trusted", () => {
+		expect(() => assertListingComplete(issuesOfLength(BULK_LIST_LIMIT - 1), "r")).not.toThrow();
+		expect(() => assertListingComplete([], "r")).not.toThrow();
+	});
+
+	it("MUTATION TARGET: a listing AT the cap is refused, naming the cap and the repo, not trusted as complete", () => {
+		// Shipped: `issues.length >= BULK_LIST_LIMIT` throws. Weaken it to `>`
+		// (or drop the check) and a truncated 500-issue page would be trusted as
+		// complete -- every issue past #500 would then classify as `create` and
+		// --apply would duplicate it. This test is that mutation's target.
+		expect(() => assertListingComplete(issuesOfLength(BULK_LIST_LIMIT), "EZiLHQ/ezil-os")).toThrow(
+			/EZiLHQ\/ezil-os returned 500 issues, at or past the --limit 500 cap/,
+		);
+	});
+
+	it("a listing past the cap is refused too (defence in depth, should gh's --limit ever be inexact)", () => {
+		expect(() => assertListingComplete(issuesOfLength(BULK_LIST_LIMIT + 1), "r")).toThrow(/--limit 500 cap/);
 	});
 });
 
