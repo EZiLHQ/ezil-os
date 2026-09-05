@@ -312,7 +312,7 @@ suite_budget () {
 # 5-6px — rendering-platform noise, not a product defect — so GEOMETRY runs on
 # the Linux leg only). The two arrays below are a literal copy of ci.yml's two
 # `for t in ...` lists ("Shell real-browser suites (portable)" and "... —
-# Linux only)", currently ci.yml:387-391 and :400-404 — match by step name if
+# Linux only)", currently ci.yml:387-391 and :400-405 — match by step name if
 # the line numbers have drifted since.
 #
 # 🔴 THESE MUST AGREE WITH `ci.yml` BY HAND. There is no automated check that
