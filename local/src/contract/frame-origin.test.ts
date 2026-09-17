@@ -19,7 +19,7 @@ test('redirects cannot confirm a foreign frame and response streams are cancelle
         let cancelled = false;
         const fetcher = (async () => new Response(new ReadableStream({ cancel() { cancelled = true; } }), {
             status: 302, headers: { location },
-        })) as typeof fetch;
+        })) as unknown as typeof fetch;
         const probe = await probeFrameOrigin(own, 'code', 0, fetcher);
         expect(probe.alive).toBe(location === '/login');
         expect(cancelled).toBe(true);
@@ -27,10 +27,10 @@ test('redirects cannot confirm a foreign frame and response streams are cancelle
 });
 test('foreign origins never fetch; correct code/preview origins probe without redirects', async () => {
     const calls: { url: string; redirect: unknown }[] = [];
-    const fetcher = (async (url, init) => {
+    const fetcher = (async (url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
         calls.push({ url: String(url), redirect: init?.redirect });
         return new Response('ready', { status: 200 });
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
     expect((await probeFrameOrigin(localUrlFor('desktop'), 'code', 0, fetcher)).reason).toBe('foreign_origin');
     expect(calls).toHaveLength(0);
     for (const surface of ['code', 'preview'] as const) {
