@@ -89,4 +89,26 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: store.workspaceDirectory(second.id).path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: outside.path))
     }
+
+    func testProvisionDiskCopiesAndSparseExpandsWithoutShrinking() throws {
+        let record = try store.createWorkspace()
+        let base = temporaryRoot.appendingPathComponent("base.img")
+        try Data("seed".utf8).write(to: base)
+        let expandedSize: UInt64 = 32 * 1_024 * 1_024
+
+        let disk = try store.provisionDisk(for: record, from: base, expandedSize: expandedSize)
+        let attributes = try FileManager.default.attributesOfItem(atPath: disk.path)
+        XCTAssertEqual((attributes[.size] as? NSNumber)?.uint64Value, expandedSize)
+        let permissions = attributes[.posixPermissions] as? NSNumber
+        XCTAssertEqual((permissions?.intValue ?? -1) & 0o777, 0o600)
+        let handle = try FileHandle(forReadingFrom: disk)
+        defer { try? handle.close() }
+        XCTAssertEqual(try handle.read(upToCount: 4), Data("seed".utf8))
+
+        _ = try store.provisionDisk(for: record, from: base, expandedSize: 1_024)
+        XCTAssertEqual(
+            (try FileManager.default.attributesOfItem(atPath: disk.path)[.size] as? NSNumber)?.uint64Value,
+            expandedSize
+        )
+    }
 }

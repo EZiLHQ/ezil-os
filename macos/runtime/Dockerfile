@@ -5,7 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash build-essential ca-certificates curl dhcpcd-base file git \
-        initramfs-tools iproute2 jq linux-image-virtual nodejs npm openssh-client procps \
+        e2fsprogs initramfs-tools iproute2 jq linux-image-virtual nodejs npm openssh-client procps \
         python3 python3-pip sudo tini util-linux \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*

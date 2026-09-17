@@ -70,6 +70,8 @@ public struct ImportLimits: Equatable, Sendable {
 }
 
 public final class WorkspaceStore: @unchecked Sendable {
+    public static let defaultExpandedDiskSize: UInt64 = 16 * 1_024 * 1_024 * 1_024
+
     public let root: URL
     public let workspacesRoot: URL
     private let fileManager: FileManager
@@ -206,6 +208,35 @@ public final class WorkspaceStore: @unchecked Sendable {
 
     public func diskURL(_ id: UUID) -> URL {
         workspaceDirectory(id).appendingPathComponent("runtime.img")
+    }
+
+    public func provisionDisk(
+        for record: WorkspaceRecord,
+        from baseDisk: URL,
+        expandedSize: UInt64 = WorkspaceStore.defaultExpandedDiskSize
+    ) throws -> URL {
+        let destination = diskURL(record.id)
+        guard isOwned(destination), fileManager.fileExists(atPath: workspaceDirectory(record.id).path) else {
+            throw WorkspaceStoreError.workspaceNotFound
+        }
+        var created = false
+        do {
+            if !fileManager.fileExists(atPath: destination.path) {
+                try fileManager.copyItem(at: baseDisk, to: destination)
+                created = true
+            }
+            let currentSize = try destination.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            if UInt64(currentSize) < expandedSize {
+                let handle = try FileHandle(forWritingTo: destination)
+                defer { try? handle.close() }
+                try handle.truncate(atOffset: expandedSize)
+            }
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+            return destination
+        } catch {
+            if created { try? fileManager.removeItem(at: destination) }
+            throw error
+        }
     }
 
     private func recordURL(_ id: UUID) -> URL {

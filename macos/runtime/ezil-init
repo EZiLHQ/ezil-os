@@ -12,6 +12,11 @@ mountpoint -q /dev/pts || mount -t devpts devpts /dev/pts
 mountpoint -q /workspace || mount -t virtiofs ezil-workspace /workspace
 chmod 1777 /tmp
 
+if ! resize2fs /dev/vda >/var/log/ezil-resize.log 2>&1; then
+    echo "EZIL_ERROR disk-resize-failed" >/dev/hvc0
+    exec sleep infinity
+fi
+
 editor_password="$(tr ' ' '\n' </proc/cmdline | sed -n 's/^ezil\.editor_password=//p' | head -1)"
 if ! [[ "$editor_password" =~ ^[A-Fa-f0-9]{64}$ ]]; then
     echo "EZIL_ERROR editor-password-missing" >/dev/hvc0

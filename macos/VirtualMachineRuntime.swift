@@ -165,11 +165,7 @@ final class VirtualMachineRuntime: ObservableObject {
                     throw VirtualMachineRuntimeError.runtimeCorrupt(url.lastPathComponent)
                 }
             }
-            let disk = store.diskURL(workspace.id)
-            if !FileManager.default.fileExists(atPath: disk.path) {
-                try FileManager.default.copyItem(at: assets.baseDisk, to: disk)
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: disk.path)
-            }
+            let disk = try store.provisionDisk(for: workspace, from: assets.baseDisk)
             return Prepared(
                 assets: assets,
                 disk: disk,

@@ -51,8 +51,8 @@ cp "$initrd" "$OUTPUT_DIR/initrd.img"
 
 # A sparse writable disk gives package managers room without making the DMG
 # carry zero-filled gigabytes. hdiutil compresses the unused ext4 blocks.
-truncate -s 8G "$OUTPUT_DIR/rootfs.img"
-mkfs.ext4 -q -F -L ezil-root -d "$WORK_DIR/rootfs" "$OUTPUT_DIR/rootfs.img"
+truncate -s 4G "$OUTPUT_DIR/rootfs.img"
+mkfs.ext4 -q -F -m 0 -L ezil-root -d "$WORK_DIR/rootfs" "$OUTPUT_DIR/rootfs.img"
 
 docker run --rm --platform linux/arm64 "$IMAGE" \
     dpkg-query -W -f='${Package}\t${Version}\n' > "$OUTPUT_DIR/packages.txt"
