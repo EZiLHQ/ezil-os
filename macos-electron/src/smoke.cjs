@@ -1,0 +1,70 @@
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const http = require('node:http');
+const { execFileSync } = require('node:child_process');
+const assert = require('node:assert/strict');
+const { Workspaces } = require('./workspaces.cjs');
+const { atomic, privateDir } = require('./files.cjs');
+const { discover, cleanEnvironment } = require('./vscode.cjs');
+const { once } = require('node:events');
+async function run(host) {
+  const { app, dataRoot, store, editors, openWorkspace, openBrowser, getDesktop, closeDesktop } = host;
+  const evidenceRoot = privateDir(path.join(dataRoot, 'evidence'));
+  const report = { artifactSHA256: process.env.EZIL_ARTIFACT_SHA256, arch: process.arch, versions: process.versions, checks: [], success: false };
+  let server, browser;
+  const check = name => report.checks.push({ name, passed: true, at: new Date().toISOString() });
+  try {
+    assert.match(report.artifactSHA256 || '', /^[a-f0-9]{64}$/); assert.equal(process.arch, 'arm64'); assert.equal(process.platform, 'darwin');
+    report.os = execFileSync('/usr/bin/sw_vers', [], { encoding: 'utf8' }).trim();
+    report.xcode = execFileSync('/usr/bin/xcodebuild', ['-version'], { encoding: 'utf8' }).trim();
+    assert.notEqual(execFileSync('/usr/bin/stat', ['-f', '%Su', '/dev/console'], { encoding: 'utf8' }).trim(), 'root');
+    check('logged-in Apple Silicon GUI');
+    const guest = store.guest(); assert.equal(new Workspaces(dataRoot).guest().id, guest.id); check('guest persistence');
+    const w = store.create('Physical Mac smoke');
+    const canary = path.join(dataRoot, 'outside-workspace-canary'); fs.writeFileSync(canary, 'preserve');
+    fs.writeFileSync(path.join(w.files, 'build.ts'), 'await Bun.write("built.txt", "native-arm64-build");\n');
+    const bun = path.join(process.resourcesPath, 'bun', 'bun');
+    report.bun = execFileSync(bun, ['--version'], { encoding: 'utf8', env: cleanEnvironment() }).trim();
+    execFileSync(bun, ['run', path.join(w.files, 'build.ts')], { cwd: w.files, env: cleanEnvironment(), stdio: 'pipe' });
+    assert.equal(fs.readFileSync(path.join(w.files, 'built.txt'), 'utf8'), 'native-arm64-build'); check('project build using bundled Darwin Bun');
+    await openWorkspace(w.id);
+    const desktop = getDesktop();
+    assert.equal(await desktop.webContents.executeJavaScript('window.ezilNative.contractVersion'), 1);
+    assert.ok(await desktop.webContents.executeJavaScript('document.body.textContent.trim().length > 10'));
+    fs.writeFileSync(path.join(evidenceRoot, 'desktop.png'), (await desktop.webContents.capturePage()).toPNG()); check('exact bundled shared shell rendered');
+    server = http.createServer((_req, res) => { res.setHeader('Content-Type', 'text/html'); res.end('<!doctype html><title>EZiL smoke browser</title><h1>Native browser</h1><script>localStorage.setItem("ezil-smoke","persisted")</script>'); });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${server.address().port}/`;
+    browser = openBrowser(w.id, url);
+    let wc = browser.tabs[browser.active].view.webContents;
+    if (wc.isLoading()) await once(wc, 'did-finish-load');
+    assert.equal(await wc.executeJavaScript('typeof window.ezilNative'), 'undefined');
+    assert.equal(await wc.executeJavaScript('typeof require'), 'undefined');
+    assert.equal(await wc.executeJavaScript('localStorage.getItem("ezil-smoke")'), 'persisted');
+    fs.writeFileSync(path.join(evidenceRoot, 'browser.png'), (await browser.window.webContents.capturePage()).toPNG());
+    fs.writeFileSync(path.join(evidenceRoot, 'browser-content.png'), (await wc.capturePage()).toPNG()); check('sandboxed WebContentsView GUI');
+    await browser.close(); browser = openBrowser(w.id);
+    wc = browser.tabs.find(t => t.url === url)?.view.webContents; assert.ok(wc);
+    if (wc.isLoading()) await once(wc, 'did-finish-load');
+    assert.equal(await wc.executeJavaScript('localStorage.getItem("ezil-smoke")'), 'persisted'); check('browser tab and Chromium storage persistence');
+    const verified = discover(); assert.ok(verified, 'Verified Microsoft VS Code is required on the physical runner');
+    report.vscode = execFileSync('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleShortVersionString', path.join(verified.app, 'Contents/Info.plist')], { encoding: 'utf8' }).trim();
+    assert.equal((await editors.start(w)).status, 'running');
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    assert.equal(editors.state(w), 'running');
+    assert.ok(fs.existsSync(path.join(w.editorData, 'User')), 'VS Code must initialize app-owned user data');
+    assert.throws(() => store.remove(w.id, editors.state(w), false)); check('verified Microsoft editor instance and running-removal block');
+    assert.equal(await editors.stop(w), 'stopped'); check('graceful tracked editor stop');
+    closeDesktop(); await browser.retire(); browser = null;
+    assert.equal(fs.readFileSync(path.join(new Workspaces(dataRoot).get(w.id).files, 'built.txt'), 'utf8'), 'native-arm64-build'); check('workspace persistence');
+    store.remove(w.id, editors.state(w), true);
+    assert.equal(fs.existsSync(w.dir), false); assert.equal(fs.readFileSync(canary, 'utf8'), 'preserve'); check('inventoried removal and outside canary');
+    report.success = true;
+  } catch { report.failure = 'Physical smoke gate failed; see last completed check. No provider/project output is collected.'; }
+  finally {
+    await browser?.close(); server?.close(); atomic(path.join(evidenceRoot, 'result.json'), JSON.stringify(report, null, 2));
+    app.exit(report.success ? 0 : 1);
+  }
+}
+module.exports = { run };

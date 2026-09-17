@@ -2,6 +2,12 @@
 # Build the Apple Silicon EZiL OS app and drag-to-Applications DMG.
 set -euo pipefail
 
+# Legacy migration/VM maintenance only. Active native packaging lives in macos-electron.
+if [ "${EZIL_LEGACY_VM_MAINTENANCE:-0}" != 1 ]; then
+    echo "Legacy VM tooling is inactive. See docs/NATIVE-MAC.md for the Electron host." >&2
+    exit 1
+fi
+
 usage() {
     cat <<'EOF'
 Usage: macos/build-dmg.sh --version <semver> --runtime <runtime-directory> [options]
