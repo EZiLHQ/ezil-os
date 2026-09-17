@@ -376,7 +376,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          expected="EZiL-OS-${version}-macOS.dmg"
+          expected="EZiL-OS-${version}-AppleSilicon.dmg"
           attempt=0
           while [ "$attempt" -lt 180 ]; do
             assets="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' 2>/dev/null || true)"

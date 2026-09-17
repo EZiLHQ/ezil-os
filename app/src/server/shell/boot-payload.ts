@@ -194,7 +194,8 @@ export const SHELL_APPS: readonly ShellBootApp[] = [
 ];
 
 export interface ShellDesktopState {
-    provider: 'cloudflare-guacamole';
+    /** Runtime identity. Hosted payloads remain unchanged; local clients can report their real boundary. */
+    provider: 'cloudflare-guacamole' | 'local-vm';
     /** Whether the desktop Worker is configured at all. From `cloudflareGuacamole.isConfigured`. */
     configured: boolean;
     /** Whether a signing secret is present. A configured Worker without one will reject every call. */

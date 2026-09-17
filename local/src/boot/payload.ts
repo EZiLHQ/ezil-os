@@ -40,22 +40,8 @@ export const LOCAL_SHELL_APPS: readonly ShellBootApp[] = [
     { id: 'desktop', name: 'Browser', icon: 'desktop', kind: 'desktop' },
 ];
 
-/**
- * 🔴 THE ONE FACTUALLY WRONG VALUE IN THIS FILE, AND IT IS FORCED.
- *
- * `ShellDesktopState.provider` is the LITERAL type `'cloudflare-guacamole'`.
- * Local mode's desktop provider is Docker on the user's own machine and is
- * emphatically not that. The value is emitted anyway because:
- *   - the field is not optional and the type admits no other value, and this
- *     package does not own `app/src/server/shell/boot-payload.ts`;
- *   - NOTHING in `shell/` reads `desktopState.provider` — grepped across every
- *     `shell/**\/*.js`, zero readers — so no behaviour depends on it.
- * It is a contract smell for a later row (widen the literal to a union, or drop
- * the field), recorded here rather than papered over. It is also the ONE
- * non-comment hit the vendor-name grep in `../server/no-hostname.test.ts`
- * allows, and that allowance is pinned to this line.
- */
-export const LOCAL_DESKTOP_PROVIDER_TAG: ShellDesktopState['provider'] = 'cloudflare-guacamole';
+/** The provider tag is descriptive; local mode no longer impersonates the hosted runtime. */
+export const LOCAL_DESKTOP_PROVIDER_TAG: ShellDesktopState['provider'] = 'local-vm';
 
 /**
  * `desktopState`, as local mode reports it.

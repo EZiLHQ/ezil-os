@@ -3,56 +3,69 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-TMP_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TMP_ROOT"' EXIT INT TERM
+TEMP_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TEMP_ROOT"' EXIT INT TERM
 
-bash -n "$REPO_ROOT/deploy/stage-local-runtime.sh"
-bash -n "$SCRIPT_DIR/build-dmg.sh"
-
-RUNTIME="$TMP_ROOT/runtime"
-"$REPO_ROOT/deploy/stage-local-runtime.sh" "$RUNTIME"
-if "$REPO_ROOT/deploy/stage-local-runtime.sh" "$RUNTIME" >/dev/null 2>&1; then
-    echo "runtime staging accepted a non-empty destination" >&2
-    exit 1
-fi
-
-for path in \
-    local/src/server/main.ts \
-    local/package.json \
-    local/bun.lock \
-    worker/src/desktop-mode.ts \
-    worker/src/screen-modes.ts \
-    app/public/os/bundle.min.js \
-    app/public/os/bundle.min.css \
-    app/public/os/icons.js \
-    deploy/images.env \
-    deploy/launcher/ezil-os.sh \
-    LICENSE NOTICE ATTRIBUTIONS.md; do
-    test -f "$RUNTIME/$path" || { echo "missing staged runtime file: $path" >&2; exit 1; }
+for script in \
+    "$SCRIPT_DIR/build-dmg.sh" \
+    "$SCRIPT_DIR/runtime/build-runtime.sh" \
+    "$SCRIPT_DIR/runtime/make-fixture.sh" \
+    "$SCRIPT_DIR/runtime/ezil-init"; do
+    bash -n "$script"
 done
 
-if find "$RUNTIME" -name '*.test.ts' -print -quit | grep -q .; then
-    echo "staged runtime contains test sources" >&2
+fixture="$TEMP_ROOT/runtime-fixture"
+"$SCRIPT_DIR/runtime/make-fixture.sh" "$fixture"
+for file in vmlinuz initrd.img rootfs.img manifest.json CI_FIXTURE_DO_NOT_DISTRIBUTE; do
+    test -f "$fixture/$file" || { echo "macos test: fixture missing $file" >&2; exit 1; }
+done
+
+# The default package path must reject a fixture, and the opt-in is limited to
+# the compile/package smoke job. This prevents a tiny non-bootable DMG from
+# being uploaded by the internal or release workflows.
+grep -q 'CI_FIXTURE_DO_NOT_DISTRIBUTE' "$SCRIPT_DIR/build-dmg.sh"
+grep -q 'EZIL_ALLOW_FIXTURE_RUNTIME' "$SCRIPT_DIR/build-dmg.sh"
+
+grep -q 'arm64-apple-macos14.0' "$SCRIPT_DIR/build-dmg.sh"
+grep -q 'Virtualization' "$SCRIPT_DIR/build-dmg.sh"
+grep -q 'com.apple.security.virtualization' "$SCRIPT_DIR/EZiLOS.entitlements"
+grep -q 'Continue as Guest' "$SCRIPT_DIR/EZiLOSApp.swift"
+grep -q 'WKWebsiteDataStore(forIdentifier:' "$SCRIPT_DIR/EZiLOSApp.swift"
+grep -q 'VZNATNetworkDeviceAttachment' "$SCRIPT_DIR/VirtualMachineRuntime.swift"
+grep -q 'VZSingleDirectoryShare' "$SCRIPT_DIR/VirtualMachineRuntime.swift"
+grep -q 'EZIL_READY' "$SCRIPT_DIR/runtime/ezil-init"
+grep -q -- '--auth password' "$SCRIPT_DIR/runtime/ezil-init"
+if grep -q -- '--auth none' "$SCRIPT_DIR/runtime/ezil-init"; then
+    echo "macos test: code-server must not expose an unauthenticated endpoint" >&2
     exit 1
 fi
 
-# Resolve every runtime import from the exact staged tree the app bundles.
-bun build --target=bun "$RUNTIME/local/src/server/main.ts" --outfile "$TMP_ROOT/local-host.mjs" >/dev/null
-
-# The wrapper must keep the desktop private to this Mac and must use the
-# existing launcher rather than grow a second Docker implementation.
-grep -Eq 'http://127\.0\.0\.1:7080/os' "$SCRIPT_DIR/EZiLOSApp.swift"
-grep -Eq 'deploy/launcher/ezil-os\.sh' "$SCRIPT_DIR/EZiLOSApp.swift"
-grep -Eq 'EZIL_LOCAL_WORKSPACE' "$SCRIPT_DIR/EZiLOSApp.swift"
-grep -Eq '/home/neko/project' "$SCRIPT_DIR/EZiLOSApp.swift"
-grep -Eq 'com\.microsoft\.VSCode' "$SCRIPT_DIR/EZiLOSApp.swift"
-grep -Eq 'Everything runs on this Mac' "$SCRIPT_DIR/EZiLOSApp.swift"
-if grep -Eq '0\.0\.0\.0|--publish' "$SCRIPT_DIR/EZiLOSApp.swift"; then
-    echo "macOS wrapper must not implement or widen Docker networking" >&2
+if rg -n 'ghcr\.io|Docker Desktop|EZIL_LOCAL_WORKSPACE|/home/neko|com\.microsoft\.VSCode' \
+    "$SCRIPT_DIR/EZiLOSApp.swift" "$SCRIPT_DIR/VirtualMachineRuntime.swift"; then
+    echo "macos test: native local app still references the legacy Docker launcher" >&2
     exit 1
 fi
-grep -Eq -- '--require-signing' "$REPO_ROOT/.github/workflows/release.yml"
-grep -Eq 'Wait for the signed macOS installer' "$REPO_ROOT/.github/workflows/deploy.yml"
-grep -Eq 'Upload internal-test DMG' "$REPO_ROOT/.github/workflows/ci.yml"
 
-echo "macos wrapper tests passed"
+if [ "$(uname -s)" = "Darwin" ]; then
+    (cd "$SCRIPT_DIR" && swift test --parallel)
+    SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
+    swiftc \
+        -parse-as-library \
+        -typecheck \
+        -target arm64-apple-macos14.0 \
+        -sdk "$SDK_PATH" \
+        -framework AppKit \
+        -framework CryptoKit \
+        -framework SwiftUI \
+        -framework Virtualization \
+        -framework WebKit \
+        "$SCRIPT_DIR"/Sources/EZiLOSCore/*.swift \
+        "$SCRIPT_DIR/VirtualMachineRuntime.swift" \
+        "$SCRIPT_DIR/EZiLOSApp.swift"
+fi
+
+grep -q 'macos/runtime/build-runtime.sh' "$REPO_ROOT/.github/workflows/macos-internal.yml"
+grep -q 'self-hosted' "$REPO_ROOT/.github/workflows/macos-e2e.yml"
+grep -q -- '--runtime' "$REPO_ROOT/.github/workflows/release.yml"
+
+echo "macOS local-first contract tests passed"

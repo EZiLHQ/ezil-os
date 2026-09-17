@@ -3,10 +3,6 @@ name: macOS Internal DMG
 on:
   workflow_dispatch:
 
-# This workflow intentionally produces an ad-hoc-signed test build. It needs
-# no Apple ID, certificate, notarization credential, or repository secret.
-# Public/tagged releases continue to use release.yml and fail closed unless a
-# real Developer ID Application certificate and notarization credentials exist.
 permissions:
   contents: read
 
@@ -15,15 +11,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  dmg:
-    name: build ad-hoc DMG
-    runs-on: macos-latest
+  runtime:
+    name: build pinned ARM Linux runtime
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
+      - name: Build the bootable runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs
+          ./macos/runtime/build-runtime.sh "$RUNNER_TEMP/ezil-vm-runtime"
+          tar --sparse -C "$RUNNER_TEMP/ezil-vm-runtime" -czf "$RUNNER_TEMP/ezil-vm-runtime.tar.gz" .
+      - name: Upload bootable runtime
+        uses: actions/upload-artifact@v4
         with:
-          bun-version: latest
-      - name: Verify the wrapper and staged runtime
+          name: ezil-vm-runtime-${{ github.sha }}
+          path: ${{ runner.temp }}/ezil-vm-runtime.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  dmg:
+    name: build ad-hoc Apple Silicon DMG
+    needs: runtime
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download bootable runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: ezil-vm-runtime-${{ github.sha }}
+          path: ${{ runner.temp }}/runtime-archive
+      - name: Unpack and verify runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ezil-vm-runtime"
+          tar -xzf "$RUNNER_TEMP/runtime-archive/ezil-vm-runtime.tar.gz" -C "$RUNNER_TEMP/ezil-vm-runtime"
+          test ! -e "$RUNNER_TEMP/ezil-vm-runtime/CI_FIXTURE_DO_NOT_DISTRIBUTE"
+          (cd "$RUNNER_TEMP/ezil-vm-runtime" && shasum -a 256 -c SHA256SUMS)
+      - name: Run native unit and compile tests
         shell: bash
         run: ./macos/test.sh
       - name: Build and verify the ad-hoc DMG
@@ -33,21 +62,18 @@ jobs:
         run: |
           set -euo pipefail
           ./macos/build-dmg.sh \
-            --version "${INTERNAL_VERSION}" \
+            --version "$INTERNAL_VERSION" \
+            --runtime "$RUNNER_TEMP/ezil-vm-runtime" \
             --build "$RUNNER_TEMP/ezil-macos-build" \
             --output "$RUNNER_TEMP/ezil-macos-dist" \
             --no-notarize
-          dmg="$RUNNER_TEMP/ezil-macos-dist/EZiL-OS-${INTERNAL_VERSION}-macOS.dmg"
-          test -f "$dmg"
+          dmg="$RUNNER_TEMP/ezil-macos-dist/EZiL-OS-${INTERNAL_VERSION}-AppleSilicon.dmg"
           hdiutil verify "$dmg"
-          (
-            cd "$(dirname "$dmg")"
-            shasum -a 256 "$(basename "$dmg")" > "$(basename "$dmg").sha256"
-          )
+          (cd "$(dirname "$dmg")" && shasum -a 256 "$(basename "$dmg")" > "$(basename "$dmg").sha256")
       - name: Upload internal-test DMG
         uses: actions/upload-artifact@v4
         with:
-          name: EZiL-OS-macOS-internal-${{ github.run_number }}
+          name: EZiL-OS-AppleSilicon-internal-${{ github.run_number }}
           path: |
             ${{ runner.temp }}/ezil-macos-dist/*.dmg
             ${{ runner.temp }}/ezil-macos-dist/*.sha256

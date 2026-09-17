@@ -128,13 +128,14 @@ concerns (a schema change ships a new migration, not a rewrite of 0002).
 ## Internal macOS test DMG (no Apple subscription)
 
 The manual [`macOS Internal DMG`](../.github/workflows/macos-internal.yml)
-workflow compiles a universal app on `macos-latest`, ad-hoc signs it, verifies
-the disk image, writes a SHA-256 file, and uploads both as a 14-day Actions
-artifact. It does not read any Apple or repository secret.
+workflow builds the pinned ARM Linux runtime on `ubuntu-24.04-arm`, compiles an
+Apple Silicon app on `macos-14`, ad-hoc signs it, verifies the disk image,
+writes a SHA-256 file, and uploads both as a 14-day Actions artifact. It does
+not read any Apple or repository secret.
 
 From GitHub, open **Actions → macOS Internal DMG → Run workflow**, select
 the branch containing the macOS files, and download the
-`EZiL-OS-macOS-internal-*` artifact after the job turns green. This artifact is
+`EZiL-OS-AppleSilicon-internal-*` artifact after the job turns green. This artifact is
 for trusted internal testers only. Because it is not Developer ID signed or
 notarized, macOS will require the tester to Control-click the app and choose
 **Open**, or approve it in **System Settings → Privacy & Security**. The
@@ -158,7 +159,7 @@ git tag v0.2.0-rc.1 && git push origin v0.2.0-rc.1
         ├─▶ release.yml starts ─── builds the local-mode tarball, opens a
         │                          GitHub Release for v0.2.0-rc.1 as a DRAFT,
         │                          then on macOS builds/signs/notarizes the
-        │                          native DMG and attaches it; both artifacts
+        │                          Apple Silicon DMG and attaches it; both artifacts
         │                          receive provenance attestations and enter
         │                          SHA256SUMS.
         │

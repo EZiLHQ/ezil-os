@@ -2,447 +2,447 @@ import AppKit
 import SwiftUI
 import WebKit
 
-private let desktopURL = URL(string: "http://127.0.0.1:7080/os")!
-private let vsCodeBundleIdentifier = "com.microsoft.VSCode"
+enum SidebarDestination: String, CaseIterable, Identifiable {
+    case home = "Home"
+    case code = "Code"
+    case browser = "Browser"
+    case files = "Files"
+    case settings = "Settings"
 
-enum LaunchStatus: Equatable {
-    case stopped
-    case starting
-    case running
-    case stopping
-    case failed(Int32)
-
-    var label: String {
+    var id: String { rawValue }
+    var symbol: String {
         switch self {
-        case .stopped: return "Stopped"
-        case .starting: return "Starting…"
-        case .running: return "Running"
-        case .stopping: return "Stopping…"
-        case .failed(let code): return "Stopped with error (exit \(code))"
-        }
-    }
-
-    var color: Color {
-        switch self {
-        case .running: return .green
-        case .starting, .stopping: return .orange
-        case .failed: return .red
-        case .stopped: return .secondary
+        case .home: return "square.grid.2x2"
+        case .code: return "chevron.left.forwardslash.chevron.right"
+        case .browser: return "globe"
+        case .files: return "folder"
+        case .settings: return "gearshape"
         }
     }
 }
 
-final class DesktopController: ObservableObject {
-    static let shared = DesktopController()
+@MainActor
+final class AppController: ObservableObject {
+    static let shared = AppController()
 
-    @Published var status: LaunchStatus = .stopped
-    @Published var log = "EZiL OS is ready to start.\n"
-    @Published var workspacePath: String {
-        didSet { UserDefaults.standard.set(workspacePath, forKey: "workspacePath") }
-    }
-    @Published var portOffset: String {
-        didSet { UserDefaults.standard.set(portOffset, forKey: "portOffset") }
-    }
-    @Published var imageOverride: String {
-        didSet { UserDefaults.standard.set(imageOverride, forKey: "imageOverride") }
-    }
+    @Published var profile: GuestProfile?
+    @Published var workspace: WorkspaceRecord?
+    @Published var destination: SidebarDestination = .home
+    @Published var message: String?
+    @Published var showingRemoveConfirmation = false
 
-    private var process: Process?
-    private var outputPipe: Pipe?
-    private var stopCompletion: (() -> Void)?
-
-    var isActive: Bool {
-        guard let process else { return false }
-        return process.isRunning
-    }
+    let runtime = VirtualMachineRuntime()
+    let store: WorkspaceStore
 
     private init() {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        workspacePath = UserDefaults.standard.string(forKey: "workspacePath")
-            ?? "\(home)/EZiL-OS Workspace"
-        portOffset = UserDefaults.standard.string(forKey: "portOffset") ?? "10000"
-        imageOverride = UserDefaults.standard.string(forKey: "imageOverride") ?? ""
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("EZiL OS", isDirectory: true)
+        store = WorkspaceStore(root: support)
+        do {
+            profile = try store.loadOrCreateGuestProfile()
+            workspace = try store.listWorkspaces().first
+        } catch {
+            message = error.localizedDescription
+        }
     }
 
-    func chooseWorkspace() {
+    func continueAsGuest() {
+        do {
+            profile = try store.loadOrCreateGuestProfile()
+            if workspace == nil { workspace = try store.createWorkspace() }
+            startWorkspace()
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func startWorkspace() {
+        guard let current = workspace else { return }
+        do {
+            workspace = try store.touch(current)
+            if let workspace { runtime.start(workspace: workspace, store: store) }
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func importFiles() {
+        guard let workspace else { return }
         let panel = NSOpenPanel()
-        panel.title = "Choose the folder shared with EZiL OS"
-        panel.prompt = "Use This Folder"
+        panel.title = "Copy files into \(workspace.name)"
+        panel.prompt = "Import"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = true
+        panel.resolvesAliases = false
+        guard panel.runModal() == .OK else { return }
+        do {
+            try store.importItems(panel.urls, into: workspace)
+            message = "Imported \(panel.urls.count) item\(panel.urls.count == 1 ? "" : "s")."
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func exportWorkspace() {
+        guard let workspace else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose an export destination"
+        panel.prompt = "Export Here"
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.directoryURL = URL(fileURLWithPath: workspacePath, isDirectory: true)
-        if panel.runModal() == .OK, let url = panel.url {
-            workspacePath = url.path
-        }
-    }
-
-    func revealWorkspace() {
-        let url = URL(fileURLWithPath: workspacePath, isDirectory: true)
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(url)
-    }
-
-    func openWorkspaceInVSCode() {
-        let folder = URL(fileURLWithPath: workspacePath, isDirectory: true)
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
         do {
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        } catch {
-            appendLog("ERROR: could not create the Mac workspace: \(error.localizedDescription)\n")
-            return
-        }
-
-        guard let application = NSWorkspace.shared.urlForApplication(
-            withBundleIdentifier: vsCodeBundleIdentifier
-        ) else {
-            appendLog("ERROR: native Visual Studio Code is not installed on this Mac. The Linux VS Code inside the local Docker desktop is still available after Start Desktop.\n")
-            return
-        }
-
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        NSWorkspace.shared.open(
-            [folder],
-            withApplicationAt: application,
-            configuration: configuration
-        ) { [weak self] _, error in
-            guard let error else { return }
-            DispatchQueue.main.async {
-                self?.appendLog("ERROR: could not open the workspace in native Visual Studio Code: \(error.localizedDescription)\n")
+            let children = try FileManager.default.contentsOfDirectory(
+                at: store.filesDirectory(workspace.id),
+                includingPropertiesForKeys: nil
+            )
+            for child in children {
+                _ = try store.exportItem(relativePath: child.lastPathComponent, from: workspace, to: destination)
             }
+            message = "Exported \(children.count) item\(children.count == 1 ? "" : "s")."
+        } catch {
+            message = error.localizedDescription
         }
     }
 
-    func openInBrowser() {
-        NSWorkspace.shared.open(desktopURL)
+    func revealManagedFiles() {
+        guard let workspace else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([store.filesDirectory(workspace.id)])
     }
 
-    func start() {
-        guard !isActive else { return }
-        guard let resourceRoot = Bundle.main.resourceURL else {
-            status = .failed(2)
-            appendLog("ERROR: application resources are unavailable.\n")
-            return
-        }
-
-        let runtimeRoot = resourceRoot.appendingPathComponent("runtime", isDirectory: true)
-        let launcher = runtimeRoot.appendingPathComponent("deploy/launcher/ezil-os.sh")
-        guard FileManager.default.isExecutableFile(atPath: launcher.path) else {
-            status = .failed(2)
-            appendLog("ERROR: bundled launcher is missing at \(launcher.path)\n")
-            return
-        }
-
-        guard Int(portOffset.trimmingCharacters(in: .whitespaces)) != nil else {
-            status = .failed(2)
-            appendLog("ERROR: port offset must be an integer.\n")
-            return
-        }
-
-        let workspace = URL(fileURLWithPath: workspacePath, isDirectory: true)
-        let state = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/EZiL OS", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
-            try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
-        } catch {
-            status = .failed(2)
-            appendLog("ERROR: could not create a local folder: \(error.localizedDescription)\n")
-            return
-        }
-
-        log = "Starting EZiL OS…\nShared Mac folder: \(workspace.path)\nContainer folder: /home/neko/project\n\n"
-        status = .starting
-
-        let task = Process()
-        let pipe = Pipe()
-        task.executableURL = URL(fileURLWithPath: "/bin/bash")
-        task.arguments = [launcher.path, "--no-browser"]
-        task.currentDirectoryURL = runtimeRoot
-        task.standardOutput = pipe
-        task.standardError = pipe
-
-        var environment = ProcessInfo.processInfo.environment
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let guiPaths = [
-            "\(home)/.bun/bin",
-            "\(home)/.docker/bin",
-            "/Applications/Docker.app/Contents/Resources/bin",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-            "/usr/sbin",
-            "/sbin",
-        ]
-        environment["PATH"] = (guiPaths + [environment["PATH"] ?? ""])
-            .filter { !$0.isEmpty }
-            .joined(separator: ":")
-        environment["EZIL_LOCAL_WORKSPACE"] = workspace.path
-        environment["EZIL_LOCAL_STATE_DIR"] = state.path
-        environment["EZIL_LOCAL_PORT"] = "7080"
-        environment["EZIL_LOCAL_PORT_OFFSET"] = portOffset.trimmingCharacters(in: .whitespaces)
-        let override = imageOverride.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !override.isEmpty {
-            environment["EZIL_LAUNCHER_IMAGE"] = override
-        }
-        task.environment = environment
-
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else {
-                handle.readabilityHandler = nil
-                return
-            }
-            let text = String(decoding: data, as: UTF8.self)
-            DispatchQueue.main.async {
-                self?.appendLog(text)
-                if text.contains("EZiL OS is up:") {
-                    self?.status = .running
+    func removeCurrentWorkspace() {
+        guard let workspace else { return }
+        let record = workspace
+        runtime.stop { [weak self] in
+            guard let self else { return }
+            WKWebsiteDataStore.remove(forIdentifier: record.browserProfileID) { error in
+                Task { @MainActor in
+                    if let error { self.message = "Browser data could not be removed: \(error.localizedDescription)" }
+                    do {
+                        try self.store.removeWorkspace(record)
+                        self.workspace = nil
+                        self.destination = .home
+                    } catch {
+                        self.message = error.localizedDescription
+                    }
                 }
             }
-        }
-
-        task.terminationHandler = { [weak self, weak task] finished in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.outputPipe?.fileHandleForReading.readabilityHandler = nil
-                self.outputPipe = nil
-                if self.process === task {
-                    self.process = nil
-                }
-                if case .stopping = self.status {
-                    self.status = .stopped
-                } else if finished.terminationStatus == 0 {
-                    self.status = .stopped
-                } else {
-                    self.status = .failed(finished.terminationStatus)
-                }
-                let completion = self.stopCompletion
-                self.stopCompletion = nil
-                completion?()
-            }
-        }
-
-        do {
-            try task.run()
-            process = task
-            outputPipe = pipe
-        } catch {
-            pipe.fileHandleForReading.readabilityHandler = nil
-            status = .failed(2)
-            appendLog("ERROR: could not launch EZiL OS: \(error.localizedDescription)\n")
-        }
-    }
-
-    func stop(completion: (() -> Void)? = nil) {
-        guard let task = process, task.isRunning else {
-            status = .stopped
-            completion?()
-            return
-        }
-        status = .stopping
-        stopCompletion = completion
-        appendLog("\nStopping EZiL OS and removing its desktop container…\n")
-        task.terminate()
-
-        // The launcher normally handles SIGTERM immediately and removes only
-        // the container it created. Never keep the app's quit request hanging
-        // forever if Docker itself has stopped responding.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self, weak task] in
-            guard let self, let task, task.isRunning else { return }
-            task.interrupt()
-            let completion = self.stopCompletion
-            self.stopCompletion = nil
-            completion?()
-        }
-    }
-
-    private func appendLog(_ text: String) {
-        log.append(text)
-        // Bound the UI buffer while leaving the launcher's full diagnostics
-        // visible for ordinary failures.
-        if log.count > 100_000 {
-            log.removeFirst(log.count - 100_000)
         }
     }
 }
 
-struct DesktopWebView: NSViewRepresentable {
-    let url: URL
-    let enabled: Bool
+struct ProfiledWebView: NSViewRepresentable {
+    let url: URL?
+    let profileID: UUID?
+    var editorPassword: String? = nil
 
-    final class Coordinator {
-        var loaded = false
-    }
-
+    final class Coordinator { var lastURL: URL? }
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        let webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.allowsMagnification = true
-        return webView
+        if let profileID {
+            configuration.websiteDataStore = WKWebsiteDataStore(forIdentifier: profileID)
+        } else {
+            configuration.websiteDataStore = .nonPersistent()
+        }
+        if let editorPassword {
+            let escaped = editorPassword.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            let script = """
+            (() => {
+              const input = document.querySelector('input[name="password"]');
+              if (!input || !input.form) return;
+              input.value = "\(escaped)";
+              input.form.requestSubmit();
+            })();
+            """
+            configuration.userContentController.addUserScript(
+                WKUserScript(source: script, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+            )
+        }
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        view.allowsMagnification = true
+        return view
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
-        guard enabled else {
-            if context.coordinator.loaded {
-                context.coordinator.loaded = false
-                webView.stopLoading()
-                webView.loadHTMLString("", baseURL: nil)
-            }
+        guard context.coordinator.lastURL != url else { return }
+        context.coordinator.lastURL = url
+        guard let url else {
+            webView.loadHTMLString("", baseURL: nil)
             return
         }
-        guard !context.coordinator.loaded else { return }
-        context.coordinator.loaded = true
-        webView.load(URLRequest(url: url))
+        webView.load(URLRequest(url: url, cachePolicy: .reloadRevalidatingCacheData, timeoutInterval: 30))
     }
 }
 
-struct SetupView: View {
-    @ObservedObject var controller: DesktopController
+struct WelcomeView: View {
+    @ObservedObject var controller: AppController
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Local Docker desktop")
-                        .font(.title2.bold())
-                    Text("Everything runs on this Mac. Docker hosts Linux VS Code and Chrome; no cloud desktop is used.")
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Circle()
-                    .fill(controller.status.color)
-                    .frame(width: 10, height: 10)
-                Text(controller.status.label)
-                    .font(.headline)
-            }
-
-            GroupBox("Local workspace") {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        TextField("Mac folder", text: $controller.workspacePath)
-                            .textFieldStyle(.roundedBorder)
-                            .disabled(controller.isActive)
-                        Button("Choose…") { controller.chooseWorkspace() }
-                            .disabled(controller.isActive)
-                        Button("Show in Finder") { controller.revealWorkspace() }
-                        Button("Open in Mac VS Code") { controller.openWorkspaceInVSCode() }
-                    }
-                    Text("This is one set of files, not a copy queue: Docker bind-mounts this Mac folder at /home/neko/project. Linux VS Code, native Mac VS Code, Finder, and your terminal all edit the same files.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.top, 4)
-            }
-
-            GroupBox("What runs where") {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label("Native Mac: this SwiftUI app, its embedded WebKit view, and optional native VS Code.", systemImage: "macbook")
-                    Label("Local Docker: the EZiL Linux desktop, Linux VS Code, and Linux Chrome.", systemImage: "shippingbox")
-                    Label("Network: the desktop and all published ports stay on 127.0.0.1.", systemImage: "lock.shield")
-                }
-                .font(.callout)
-                .padding(.top, 4)
-            }
-
-            DisclosureGroup("Advanced") {
-                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
-                    GridRow {
-                        Text("Container port offset")
-                        TextField("10000", text: $controller.portOffset)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 120)
-                            .disabled(controller.isActive)
-                    }
-                    GridRow {
-                        Text("Desktop image override")
-                        TextField("Optional image:tag", text: $controller.imageOverride)
-                            .textFieldStyle(.roundedBorder)
-                            .disabled(controller.isActive)
-                    }
-                }
-                .padding(.top, 8)
-            }
-
-            HStack {
-                Button(controller.isActive ? "Stop Desktop" : "Start Desktop") {
-                    controller.isActive ? controller.stop() : controller.start()
-                }
-                .keyboardShortcut(.defaultAction)
-
-                Button("Open Local Desktop in Mac Browser") { controller.openInBrowser() }
-                    .disabled(controller.status != .running)
-
-                Spacer()
-                Text("Bedrock and Azure credentials are never bundled. Configure a separate developer identity after install.")
-                    .font(.caption)
+        VStack(spacing: 22) {
+            Image(systemName: "circle.grid.2x2.fill")
+                .font(.system(size: 56, weight: .light))
+                .foregroundStyle(.tint)
+            VStack(spacing: 8) {
+                Text("EZiL OS").font(.largeTitle.bold())
+                Text("A private development workspace on this Mac.")
+                    .font(.title3)
                     .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.trailing)
-                    .frame(maxWidth: 430)
             }
+            Button("Continue as Guest") { controller.continueAsGuest() }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .keyboardShortcut(.defaultAction)
+            Text("No account. No workspace upload. You can remove the workspace at any time.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 430)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(40)
+    }
+}
 
-            GroupBox("Launcher log") {
-                ScrollView {
-                    Text(controller.log)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(6)
-                }
-                .frame(minHeight: 220)
+struct PreparingView: View {
+    @ObservedObject var runtime: VirtualMachineRuntime
+
+    var body: some View {
+        VStack(spacing: 18) {
+            ProgressView().controlSize(.large)
+            Text("Preparing your workspace…").font(.title2.weight(.semibold))
+            Text("Your editor, terminal, tools, and files are starting locally.")
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+struct HomeView: View {
+    @ObservedObject var controller: AppController
+    private let columns = [GridItem(.adaptive(minimum: 150), spacing: 18)]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 28) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Welcome to EZiL OS").font(.largeTitle.bold())
+                Text("Everything you create here stays in this workspace until you export it.")
+                    .foregroundStyle(.secondary)
+            }
+            LazyVGrid(columns: columns, spacing: 18) {
+                appButton("Code", symbol: "chevron.left.forwardslash.chevron.right", destination: .code)
+                appButton("Browser", symbol: "globe", destination: .browser)
+                appButton("Files", symbol: "folder", destination: .files)
+                appButton("Settings", symbol: "gearshape", destination: .settings)
+            }
+            Spacer()
+        }
+        .padding(38)
+    }
+
+    private func appButton(_ title: String, symbol: String, destination: SidebarDestination) -> some View {
+        Button { controller.destination = destination } label: {
+            VStack(spacing: 14) {
+                Image(systemName: symbol).font(.system(size: 34, weight: .medium))
+                Text(title).font(.headline)
+            }
+            .frame(maxWidth: .infinity, minHeight: 120)
+        }
+        .buttonStyle(.plain)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18))
+    }
+}
+
+struct BrowserWorkspaceView: View {
+    let profileID: UUID
+    @State private var address = "https://example.com"
+    @State private var url = URL(string: "https://example.com")
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "lock.shield")
+                    .foregroundStyle(.secondary)
+                    .help("Separate EZiL browser profile")
+                TextField("Search or enter a website", text: $address)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { navigate() }
+                Button("Go") { navigate() }.keyboardShortcut(.defaultAction)
+            }
+            .padding(10)
+            Divider()
+            ProfiledWebView(url: url, profileID: profileID)
+        }
+    }
+
+    private func navigate() {
+        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidate = trimmed.contains("://") ? trimmed : "https://\(trimmed)"
+        if let parsed = URL(string: candidate), ["http", "https"].contains(parsed.scheme?.lowercased() ?? "") {
+            url = parsed
+        }
+    }
+}
+
+struct FilesView: View {
+    @ObservedObject var controller: AppController
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Image(systemName: "folder.badge.gearshape").font(.system(size: 48)).foregroundStyle(.tint)
+            Text("Workspace Files").font(.title2.bold())
+            Text("Import makes a private copy. Export is the only action that writes a project back outside EZiL OS.")
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 520)
+            HStack {
+                Button("Import Files…") { controller.importFiles() }.buttonStyle(.borderedProminent)
+                Button("Export Workspace…") { controller.exportWorkspace() }
+                Button("Show Managed Files") { controller.revealManagedFiles() }
             }
         }
-        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(32)
+    }
+}
+
+struct SettingsView: View {
+    @ObservedObject var controller: AppController
+    @ObservedObject var runtime: VirtualMachineRuntime
+    @State private var showDiagnostics = false
+
+    var body: some View {
+        Form {
+            Section("Workspace") {
+                LabeledContent("Profile", value: "Local guest")
+                LabeledContent("Runtime", value: runtimeLabel)
+                LabeledContent("Architecture", value: "Apple Silicon · ARM Linux")
+            }
+            Section("Data") {
+                Text("EZiL stores this workspace under your Application Support folder. Exported files are never removed by workspace cleanup.")
+                    .foregroundStyle(.secondary)
+                Button("Remove Workspace…", role: .destructive) { controller.showingRemoveConfirmation = true }
+            }
+            Section("Diagnostics") {
+                DisclosureGroup("Runtime log", isExpanded: $showDiagnostics) {
+                    ScrollView {
+                        Text(runtime.diagnosticLog.isEmpty ? "No diagnostics yet." : runtime.diagnosticLog)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(minHeight: 180)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .confirmationDialog("Remove this workspace?", isPresented: $controller.showingRemoveConfirmation, titleVisibility: .visible) {
+            Button("Remove Workspace", role: .destructive) { controller.removeCurrentWorkspace() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes the runtime disk, editor settings, browser profile, and managed files. Files you exported remain where you saved them.")
+        }
+    }
+
+    private var runtimeLabel: String {
+        switch runtime.phase {
+        case .idle: return "Stopped"
+        case .preparing: return "Preparing"
+        case .starting: return "Starting"
+        case .running: return "Running locally"
+        case .stopping: return "Stopping"
+        case .failed: return "Needs attention"
+        }
+    }
+}
+
+struct WorkspaceShell: View {
+    @ObservedObject var controller: AppController
+    @ObservedObject var runtime: VirtualMachineRuntime
+
+    var body: some View {
+        NavigationSplitView {
+            List(SidebarDestination.allCases, selection: $controller.destination) { item in
+                Label(item.rawValue, systemImage: item.symbol).tag(item)
+            }
+            .navigationSplitViewColumnWidth(min: 170, ideal: 190)
+            .safeAreaInset(edge: .bottom) {
+                if let workspace = controller.workspace {
+                    Text(workspace.name).font(.caption).foregroundStyle(.secondary).lineLimit(1).padding()
+                }
+            }
+        } detail: { content }
+        .alert("EZiL OS", isPresented: Binding(
+            get: { controller.message != nil },
+            set: { if !$0 { controller.message = nil } }
+        )) {
+            Button("OK") { controller.message = nil }
+        } message: {
+            Text(controller.message ?? "")
+        }
+    }
+
+    @ViewBuilder private var content: some View {
+        switch controller.destination {
+        case .home:
+            HomeView(controller: controller)
+        case .code:
+            if let editorURL = runtime.editorURL {
+                ProfiledWebView(
+                    url: editorURL,
+                    profileID: nil,
+                    editorPassword: controller.workspace?.editorPassword
+                )
+            } else if case .failed(let message) = runtime.phase {
+                ContentUnavailableView {
+                    Label("Workspace couldn’t start", systemImage: "exclamationmark.triangle")
+                } description: { Text(message) } actions: { Button("Try Again") { controller.startWorkspace() } }
+            } else {
+                PreparingView(runtime: runtime)
+            }
+        case .browser:
+            if let id = controller.workspace?.browserProfileID { BrowserWorkspaceView(profileID: id) }
+        case .files:
+            FilesView(controller: controller)
+        case .settings:
+            SettingsView(controller: controller, runtime: runtime)
+        }
     }
 }
 
 struct RootView: View {
-    @ObservedObject var controller: DesktopController
-    @State private var selectedTab = 1
+    @ObservedObject var controller: AppController
+    @ObservedObject var runtime: VirtualMachineRuntime
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            ZStack {
-                DesktopWebView(url: desktopURL, enabled: controller.status == .running)
-                if controller.status != .running {
-                    VStack(spacing: 12) {
-                        Image(systemName: "display")
-                            .font(.system(size: 48))
-                            .foregroundStyle(.secondary)
-                        Text("Start the desktop from Setup & Logs")
-                            .font(.title3)
-                        Text(controller.status.label)
-                            .foregroundStyle(controller.status.color)
-                    }
-                }
+        Group {
+            if controller.workspace == nil {
+                WelcomeView(controller: controller)
+            } else if runtime.phase == .preparing || runtime.phase == .starting {
+                PreparingView(runtime: runtime)
+            } else {
+                WorkspaceShell(controller: controller, runtime: runtime)
             }
-            .tabItem { Label("Desktop", systemImage: "display") }
-            .tag(0)
-
-            SetupView(controller: controller)
-                .tabItem { Label("Setup & Logs", systemImage: "gearshape") }
-                .tag(1)
         }
-        .onChange(of: controller.status) { newStatus in
-            if newStatus == .running {
-                selectedTab = 0
-            }
+        .onAppear {
+            if controller.workspace != nil, runtime.phase == .idle { controller.startWorkspace() }
+        }
+        .onChange(of: runtime.phase) { phase in
+            if case .running = phase { controller.destination = .home }
         }
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let controller = DesktopController.shared
-        guard controller.isActive else { return .terminateNow }
-        controller.stop {
-            sender.reply(toApplicationShouldTerminate: true)
-        }
+        let runtime = AppController.shared.runtime
+        guard runtime.isActive else { return .terminateNow }
+        runtime.stop { sender.reply(toApplicationShouldTerminate: true) }
         return .terminateLater
     }
 }
@@ -450,12 +450,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct EZiLOSApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var controller = DesktopController.shared
+    @StateObject private var controller = AppController.shared
 
     var body: some Scene {
         WindowGroup("EZiL OS") {
-            RootView(controller: controller)
-                .frame(minWidth: 880, minHeight: 620)
+            RootView(controller: controller, runtime: controller.runtime)
+                .frame(minWidth: 980, minHeight: 680)
         }
         .defaultSize(width: 1280, height: 820)
     }

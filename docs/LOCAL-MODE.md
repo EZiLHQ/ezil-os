@@ -1,18 +1,42 @@
 # Local mode — running EZiL OS on your own machine
 
-Local mode is the same desktop container the hosted product runs, driven by a
-native Bun host over the `docker` CLI instead of a Cloudflare Worker. There is
-no Cloudflare account, no Vercel project, no Supabase project and no sign-in:
-the native host serves `/os` itself, starts and stops the container itself,
-and publishes every port straight onto `127.0.0.1`. Nothing in this mode talks
-to `*.ezil.work`, `*.workers.dev` or `*.vercel.app` — enforced, not just
-intended: `local/src/server/no-hostname.test.ts` fails the build on a literal
-hostname anywhere under `local/src`.
+EZiL has two local runtimes. The Apple Silicon app is the default product: it
+uses Apple's Virtualization framework, contains its ARM Linux runtime, opens a
+native WebKit browser, and requires no cloud account, Docker Desktop, or Bun.
+The older cross-platform developer host remains under `local/`; it uses Docker
+and Bun to run the streamed desktop and is documented below as **legacy local
+mode**.
+
+Neither local path requires Cloudflare, Vercel, Supabase, or EZiL sign-in. The
+Mac app has normal internet access only for websites, Git, and packages the
+user chooses to access; it performs no EZiL authentication, workspace upload,
+or telemetry request.
 
 If you want the hosted product instead — invite-only, `os.ezil.work`, your own
 account — see the main [README](../README.md#getting-started).
 
-## Prerequisites
+## Apple Silicon Mac app
+
+Requirements: an Apple Silicon Mac running macOS 14 or newer and enough free
+space for the bundled runtime plus workspace disk. Download
+`EZiL-OS-<version>-AppleSilicon.dmg`, install it, and choose **Continue as
+Guest**.
+
+The desktop chrome and browser run natively on macOS. Code OSS, its terminal,
+extensions, Linux processes, and development servers execute in a persistent
+ARM Linux virtual machine. This supports Linux and web development; it does
+not turn the guest into macOS and does not provide Xcode, iOS signing, or Metal
+GPU compute inside Linux.
+
+The app copies selected imports into
+`~/Library/Application Support/EZiL OS/workspaces/<id>/files`. It never mounts
+the user's home directory, SSH agent, Docker socket, or original project.
+Export explicitly copies selected results out. Removing a workspace stops its
+VM and removes its managed disk, files, editor state, and browser profile;
+exported files stay where the user saved them. Dragging the app to Trash alone
+does not remove Application Support data.
+
+## Legacy Docker/Bun mode prerequisites
 
 - [Docker](https://www.docker.com/), running.
 - [Bun](https://bun.sh/).
@@ -42,29 +66,18 @@ doctor` reports the exact image it resolved and why.
 
 ### From the macOS app
 
-Every tagged release is wired to produce `EZiL-OS-<version>-macOS.dmg`. Open
-the DMG, drag **EZiL OS** to Applications, start Docker Desktop, and launch the
-app. The app:
-
-- lets the user choose a Mac folder and passes it to the existing launcher as
-  `EZIL_LOCAL_WORKSPACE`;
-- embeds `http://127.0.0.1:7080/os` as the desktop view while retaining an
-  "Open Local Desktop in Mac Browser" fallback;
-- can open the selected folder in native Mac Visual Studio Code; the Linux VS
-  Code and Chrome visible in the EZiL desktop remain inside local Docker, not
-  in Cloudflare or another remote machine;
-- invokes `deploy/launcher/ezil-os.sh` for every doctor, image-pull, start,
-  wait, and cleanup operation rather than maintaining a second Docker path;
-- stops the local host and removes the container that launch created when the
-  user presses Stop or quits the app.
+Every tagged release is wired to produce
+`EZiL-OS-<version>-AppleSilicon.dmg`. Open the DMG, drag **EZiL OS** to
+Applications, and launch it. The native app creates a random local guest
+profile, starts its managed ARM VM, and provides Home, Code, Browser, Files,
+and Settings without contacting GHCR or asking for a cloud login.
 
 The release workflow refuses to attach a public DMG unless it is signed with a
 real Developer ID and notarized by Apple. Building an ad-hoc-signed local-test
-DMG is possible on a Mac with
-`./macos/build-dmg.sh --version 0.0.0 --no-notarize`. CI also uploads that
-internal-test DMG and its SHA-256 file from the `macOS installer` job for 14
-days; it is for trusted testing and still requires Gatekeeper approval when
-opened.
+DMG is produced by the manual `macOS Internal DMG` workflow. Pull-request CI
+builds only a marked, non-bootable packaging fixture and never uploads it as an
+installable artifact. The physical-Mac workflow is the gate that actually
+boots the VM, executes code, restarts it, verifies persistence, and cleans up.
 
 ### From a release download
 
@@ -95,7 +108,7 @@ out: a host that quietly served a fake desktop when Docker was missing would
 be exactly the "asserting health it has not confirmed" failure this project
 keeps closing).
 
-## What “file sync” means
+## What “file sync” means in legacy mode
 
 The selected host directory is mounted read/write at `/home/neko/project` in
 the desktop container. There is no copy queue: a save inside EZiL OS changes

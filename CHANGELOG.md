@@ -19,11 +19,14 @@ did not. See [`docs/RELEASE.md`](docs/RELEASE.md) for the full mechanics.
 
 ### Added
 
-- **Native macOS installer.** A universal Swift wrapper starts and stops the
-  existing local launcher, embeds the loopback remote desktop, and lets the
-  user select a Mac folder that is bind-mounted read/write at
-  `/home/neko/project`. The release workflow signs, notarizes, staples,
-  attests, and checksums the DMG, and refuses to publish an unsigned fallback.
+- **Local-first Apple Silicon app.** The macOS 14+ Swift app creates an
+  anonymous, application-owned workspace, provides a native WebKit browser,
+  and boots a pinned ARM Linux developer runtime with code-server through
+  Apple's Virtualization framework. Files cross the boundary only through
+  explicit copy-based import and export; removing a workspace also removes
+  its VM disk, editor state, managed files, and isolated browser profile.
+  Internal CI produces an ad-hoc-signed DMG, while releases still require
+  Developer ID signing, notarization, stapling, checksums, and provenance.
 
 ## [0.2.0] - 2026-09-04
 

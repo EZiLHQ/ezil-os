@@ -9,6 +9,7 @@ dist/
 dist-ssr/
 dist-electron/
 macos/build/
+macos/.build/
 # ...the workspace bootstrap the Docker image COPYs at build time
 !worker/bootstrap/dist
 !worker/bootstrap/dist/workspace-bootstrap.mjs

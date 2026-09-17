@@ -200,6 +200,8 @@ jobs:
         working-directory: worker
         run: |
           echo "bash -n was run, this leg (${{ runner.os }}), against:"
+          # '$' is an intentional sed end anchor.
+          # shellcheck disable=SC2016
           grep -oE '<testcase name="[^"]*parses under `bash -n`"' worker-junit.xml \
             | sed -E 's/^<testcase name="//; s/"$//'
 
@@ -770,39 +772,29 @@ jobs:
           fi
 
   macos-installer:
-    name: macOS installer (compile + unsigned DMG smoke)
-    runs-on: macos-latest
+    name: macOS app (unit + compile + fixture packaging)
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-      - name: Runtime staging and wrapper contract
+      - name: Native core, runtime contract, and compile tests
         shell: bash
         run: ./macos/test.sh
-      - name: Compile the native app and verify the DMG
+      - name: Package a non-distributable fixture DMG
         shell: bash
+        env:
+          EZIL_ALLOW_FIXTURE_RUNTIME: '1'
         run: |
           set -euo pipefail
+          ./macos/runtime/make-fixture.sh "$RUNNER_TEMP/ezil-runtime-fixture"
           ./macos/build-dmg.sh \
             --version 0.0.0 \
+            --runtime "$RUNNER_TEMP/ezil-runtime-fixture" \
             --build "$RUNNER_TEMP/ezil-macos-build" \
             --output "$RUNNER_TEMP/ezil-macos-dist" \
             --no-notarize
-          dmg="$RUNNER_TEMP/ezil-macos-dist/EZiL-OS-0.0.0-macOS.dmg"
+          dmg="$RUNNER_TEMP/ezil-macos-dist/EZiL-OS-0.0.0-AppleSilicon.dmg"
           test -f "$dmg"
           hdiutil verify "$dmg"
-          (
-            cd "$(dirname "$dmg")"
-            shasum -a 256 "$(basename "$dmg")" > "$(basename "$dmg").sha256"
-          )
-      - name: Upload internal-test DMG
-        uses: actions/upload-artifact@v4
-        with:
-          name: EZiL-OS-macOS-internal-${{ github.run_number }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/ezil-macos-dist/*.dmg
-            ${{ runner.temp }}/ezil-macos-dist/*.sha256
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 14
+          # This artifact deliberately is not uploaded: it contains marker
+          # files instead of a bootable VM. macos-internal.yml is the only
+          # unsigned workflow that publishes something a tester can install.

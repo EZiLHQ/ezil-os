@@ -1,0 +1,62 @@
+name: macOS Physical Runtime E2E
+
+on:
+  workflow_dispatch:
+
+# Never run public pull-request code on the trusted physical Mac. The runner
+# must be a disposable Apple Silicon host carrying the ezil-vz label and no
+# production/cloud credentials.
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-physical-e2e
+  cancel-in-progress: false
+
+jobs:
+  runtime:
+    name: build pinned ARM Linux runtime
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs
+          ./macos/runtime/build-runtime.sh "$RUNNER_TEMP/ezil-vm-runtime"
+          tar --sparse -C "$RUNNER_TEMP/ezil-vm-runtime" -czf "$RUNNER_TEMP/ezil-vm-runtime.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ezil-vm-runtime-e2e-${{ github.sha }}
+          path: ${{ runner.temp }}/ezil-vm-runtime.tar.gz
+          compression-level: 0
+          retention-days: 1
+
+  physical-mac:
+    name: boot, execute, persist, and clean up
+    needs: runtime
+    runs-on: [self-hosted, macOS, ARM64, ezil-vz]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          clean: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: ezil-vm-runtime-e2e-${{ github.sha }}
+          path: ${{ runner.temp }}/runtime-archive
+      - name: Unpack runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ezil-vm-runtime"
+          tar -xzf "$RUNNER_TEMP/runtime-archive/ezil-vm-runtime.tar.gz" -C "$RUNNER_TEMP/ezil-vm-runtime"
+          (cd "$RUNNER_TEMP/ezil-vm-runtime" && shasum -a 256 -c SHA256SUMS)
+      - name: Native tests
+        shell: bash
+        run: ./macos/test.sh
+      - name: Physical virtualization test
+        shell: bash
+        run: ./macos/e2e.sh "$RUNNER_TEMP/ezil-vm-runtime"

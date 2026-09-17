@@ -32,8 +32,9 @@
 > own Cloudflare, Vercel and Supabase accounts to stand up, so cloning it for
 > the hosted path gets you a codebase to read and build against, not a
 > one-command demo. If you just want a real desktop today with none of that,
-> **[local mode](docs/LOCAL-MODE.md)** needs only Docker and Bun — no
-> Cloudflare, no Vercel, no Supabase, no account. See
+> **[local mode](docs/LOCAL-MODE.md)** on Apple Silicon is a self-contained Mac
+> app — no Docker, Cloudflare, Vercel, Supabase, or account. The legacy
+> cross-platform launcher still supports Docker and Bun. See
 > [Prerequisites](#prerequisites) before you start with the hosted path.
 
 # An open-source Linux desktop, streamed from a real container
@@ -71,14 +72,23 @@ into from any tab, rather than a box tied to one desk.
   - [x] An optional MCP connector — [`mcp/`](mcp/README.md)
   - [ ] Both published to npm
 - [x] Run it anywhere
-  - [x] Runs on your own machine — Docker and Bun, no Cloudflare account, no
-        sign-in ([`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md))
+  - [x] Apple Silicon app with a managed ARM Linux workspace, native browser,
+        guest profile, and no cloud sign-in ([`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md))
+  - [x] Legacy Docker/Bun local host for Linux, Windows, and development
   - [x] Signed images on GHCR — keyless cosign signature plus build provenance
   - [x] CI on Linux, Windows and macOS
 
 ## Getting Started
 
-### Run it locally
+### Run it locally on Apple Silicon
+
+Download `EZiL-OS-<version>-AppleSilicon.dmg`, drag the app to Applications,
+and choose **Continue as Guest**. The installer contains the Linux runtime and
+Code OSS backend; Docker Desktop, Bun, and an EZiL account are not required.
+Projects are copied into an app-managed workspace and leave it only through an
+explicit export.
+
+### Run the legacy Docker host
 
 The fastest way to see a real desktop with no accounts at all:
 
@@ -91,11 +101,8 @@ bun run --cwd local start
 Then open `http://127.0.0.1:7080/os`. See
 [`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md) for the environment variables, the
 port map, what the doctor checks, and what is (and is not) proven about it.
-On macOS, the same runtime can be packaged as a native folder-picking,
-start/stop wrapper with `macos/build-dmg.sh`; tagged releases are wired to
-attach the signed and notarized DMG. Maintainers without an Apple Developer
-subscription can use the manual **macOS Internal DMG** Actions workflow to
-download an ad-hoc-signed test build instead.
+Maintainers without an Apple Developer subscription can use the manual
+**macOS Internal DMG** workflow for an ad-hoc-signed Apple Silicon test build.
 The rest of this section is about the hosted path, which needs real cloud
 accounts.
 
