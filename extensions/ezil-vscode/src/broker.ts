@@ -52,10 +52,15 @@ export function readBroker(path: string | undefined, folders: readonly string[],
             || !/^[A-Za-z0-9_-]{43}$/.test(value.token)
             || !Number.isFinite(value.expiresAt) || value.expiresAt <= now
             || !isAbsolute(value.dataRoot) || !isAbsolute(value.workspacePath)) throw new Error('broker_unavailable');
+        const dataRoot = resolve(value.dataRoot);
         const expected = resolve(value.workspacePath);
-        // Attached workspaces may live outside helper storage. Only the private
-        // descriptor may name that root, and it must match the sole open folder.
-        if (inside(value.dataRoot, path) || resolve(folders[0]!) !== expected) throw new Error('broker_unavailable');
+        const managed = [resolve(dataRoot, 'workspaces', value.workspaceId, 'files'),
+            resolve(dataRoot, 'native-v1', 'workspaces', value.workspaceId, 'files')];
+        // The descriptor is app-owned and outside the project. Electron-owned
+        // workspaces and standalone helper workspaces use different managed roots.
+        if (!managed.includes(expected) || !inside(dataRoot, path) || inside(expected, path)
+            || resolve(folders[0]!) !== expected) throw new Error('broker_unavailable');
+        noSymlinks(dataRoot);
         noSymlinks(expected);
         return value;
     } catch { throw new Error('broker_unavailable'); }

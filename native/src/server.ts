@@ -94,6 +94,14 @@ export function createNativeRuntime(options: NativeOptions) {
                     if (input.role !== 'shell' && input.role !== 'connector') throw new NativeError('invalid_role');
                     return json({ ok: true, ...authority.mint(input.role, id) });
                 }
+                if (url.pathname === '/api/native/previews' && req.method === 'GET') {
+                    admin(cap);
+                    const id = store.selectedId;
+                    if (!id) throw new NativeError('workspace_required', 409);
+                    const workspace = refreshEditor(id);
+                    return json({ ok: true, workspaceId: id, editorState: workspace.editorState,
+                        ports: [...(previews.get(id) ?? [])].sort((a, b) => a - b) });
+                }
                 if (url.pathname === '/api/native/handoffs') {
                     admin(cap);
                     if (req.method === 'GET') return json({ ok: true, handoffs: handoffs.take() });

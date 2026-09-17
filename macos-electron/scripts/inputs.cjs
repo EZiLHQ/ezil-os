@@ -23,6 +23,18 @@ function helperCopy(source, dest) {
     else throw Error('Helper special file refused');
   }
 }
+function hashedCopy(source, dest, inventory) {
+  noLinks(source); privateDir(dest);
+  const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  for (const [relative, expected] of Object.entries(inventory)) {
+    const from = path.join(source, relative), to = path.join(dest, relative);
+    noLinks(from); privateDir(path.dirname(to));
+    const stat = fs.lstatSync(from);
+    if (!stat.isFile() || stat.nlink !== 1 || hash(from) !== expected) throw Error('Runtime input changed');
+    fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
+    if (hash(to) !== expected) throw Error('Packaged input mismatch');
+  }
+}
 function validateInputs({ helper, shell, extension }) {
   for (const file of [path.join(helper, 'src/main.ts'), ...['bundle.min.js', 'bundle.min.css', 'icons.js'].map(name => path.join(shell, name))]) {
     if (!fs.lstatSync(file, { throwIfNoEntry: false })?.isFile()) throw Error('Missing exact shell assets/native helper');
@@ -36,6 +48,11 @@ function stageInputs(inputs, resources) {
   for (const [key, relative] of Object.entries(destinations)) {
     const source = inputs[key], dest = path.join(resources, relative);
     if (key === 'helper') helperCopy(source, dest);
+    else if (key === 'extension') {
+      const before = hashes(source);
+      hashedCopy(source, dest, before);
+      if (JSON.stringify(before) !== JSON.stringify(hashes(dest))) throw Error('Packaged input mismatch');
+    }
     else {
       const before = hashes(source);
       copyTree(source, dest);

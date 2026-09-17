@@ -1,24 +1,27 @@
 import * as vscode from 'vscode';
 import { parsePort, readBroker, readModels, sendOperation } from './broker';
+import { EZiLModelProvider } from './model-provider';
 
 let heartbeat: ReturnType<typeof setInterval> | undefined;
 let report: ((operation: Record<string, unknown>) => Promise<void>) | undefined;
 const ports = new Set<number>();
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-    if (!process.env.EZIL_BROKER_FILE || !vscode.workspace.isTrusted) return;
+    if (!vscode.workspace.isTrusted) return;
     const folders = () => (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri.scheme === 'file' ? folder.uri.fsPath : '');
-    context.subscriptions.push(vscode.commands.registerCommand('ezil.listModels', async () => {
-        try {
-            const descriptor = readBroker(process.env.EZIL_BROKER_FILE, folders());
-            if (!('url' in descriptor)) throw new Error('model_broker_unavailable');
-            const models = await readModels(descriptor);
-            void vscode.window.showInformationMessage(models.length ? `EZiL broker models: ${models.join(', ')}` : 'No EZiL broker models are configured.');
-        } catch { void vscode.window.showInformationMessage('EZiL model broker is unavailable.'); }
-    }));
+    if (process.env.EZIL_AI_BROKER_FILE) {
+        context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider('ezil', new EZiLModelProvider(() => process.env.EZIL_AI_BROKER_FILE, folders)));
+        context.subscriptions.push(vscode.commands.registerCommand('ezil.listModels', async () => {
+            try {
+                const descriptor = readBroker(process.env.EZIL_AI_BROKER_FILE, folders());
+                if (!('url' in descriptor)) throw new Error('model_broker_unavailable');
+                const models = await readModels(descriptor);
+                void vscode.window.showInformationMessage(models.length ? `EZiL broker models: ${models.join(', ')}` : 'No EZiL broker models are configured.');
+            } catch { void vscode.window.showInformationMessage('EZiL model broker is unavailable.'); }
+        }));
+    }
+    if (!process.env.EZIL_BROKER_FILE) return;
     try {
-        // The model-only Electron descriptor cannot acknowledge readiness or
-        // previews. Never send invented operations to its models/chat routes.
-        if ('url' in readBroker(process.env.EZIL_BROKER_FILE, folders())) return;
+        if ('url' in readBroker(process.env.EZIL_BROKER_FILE, folders())) throw new Error('connector_unavailable');
     } catch {
         void vscode.window.showInformationMessage('EZiL connector is unavailable. You can keep using VS Code.');
         return;

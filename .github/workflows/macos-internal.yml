@@ -29,6 +29,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24.15.0'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.14'
       - name: Install pinned build tools
         working-directory: macos-electron
         run: |
@@ -37,6 +40,14 @@ jobs:
           npm ci --no-audit --no-fund
       - name: Unit, migration compatibility and Electron GUI checks
         run: |
+          bun install --cwd native --frozen-lockfile --ignore-scripts
+          bun run --cwd native typecheck
+          bun test native/tests
+          bun install --cwd extensions/ezil-vscode --frozen-lockfile --ignore-scripts
+          bun run --cwd extensions/ezil-vscode typecheck
+          bun test extensions/ezil-vscode/tests
+          bun run --cwd extensions/ezil-vscode build
+          git diff --exit-code -- extensions/ezil-vscode/dist/extension.js
           npm --prefix macos-electron run check
           npm --prefix macos-electron test
           bash macos/test.sh

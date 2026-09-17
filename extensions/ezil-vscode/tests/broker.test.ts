@@ -11,8 +11,9 @@ function fixture() {
     const dataRoot = join(root, 'data'); const workspaceId = randomUUID();
     const workspacePath = join(dataRoot, 'native-v1', 'workspaces', workspaceId, 'files');
     mkdirSync(workspacePath, { recursive: true });
+    const privateRoot = join(dataRoot, 'private'); mkdirSync(privateRoot);
     const descriptor = { contractVersion: 1, origin: 'http://127.0.0.1:49152', workspaceId, workspacePath, dataRoot, token: randomBytes(32).toString('base64url'), expiresAt: Date.now() + 60_000 };
-    const path = join(root, 'broker.json');
+    const path = join(privateRoot, 'broker.json');
     writeFileSync(path, JSON.stringify(descriptor), { mode: 0o600 });
     return { path, descriptor, folders: [workspacePath] };
 }
@@ -40,9 +41,9 @@ test('ports accept only explicit loopback port numbers', () => {
     for (const text of ['1024', '3000', '65535']) expect(parsePort(text)).toBe(Number(text));
     for (const text of ['80', '65536', '3000.1', ' 3000', '3000;echo', 'http://127.0.0.1:3000', '-3000']) expect(parsePort(text)).toBeUndefined();
 });
-test('private connector descriptors can bind an Electron-owned root outside helper data', () => {
-    const f = fixture(); const workspacePath = join(f.descriptor.dataRoot, '..', 'project');
-    mkdirSync(workspacePath);
+test('private connector descriptors can bind an Electron-owned managed root', () => {
+    const f = fixture(); const workspacePath = join(f.descriptor.dataRoot, 'workspaces', f.descriptor.workspaceId, 'files');
+    mkdirSync(workspacePath, { recursive: true });
     const descriptor = { ...f.descriptor, workspacePath };
     writeFileSync(f.path, JSON.stringify(descriptor));
     expect(readBroker(f.path, [workspacePath])).toEqual(descriptor);

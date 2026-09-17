@@ -14,23 +14,20 @@ provider nor VS Code; internet sites themselves still require connectivity.
 
 ## Status and validation gates
 
-This checkout lacks Worker A's `native/` helper and `extensions/ezil-vscode`.
-Packaging fails when these inputs or the exact shell assets are absent. Startup
-uses the reviewed Worker A environment names and `/os` route, pending an integrated
-run. Connector readiness/preview and VS Code model-provider integration are
-explicitly unavailable; no connector descriptor is minted or passed to VS Code.
-No successful Mac build, Keychain test, VS Code GUI test, physical run, signed
-release, or notarization is claimed by this change.
+The shared `native/` helper and `extensions/ezil-vscode` connector are integrated.
+Electron mints and renews a short-lived workspace capability, stores its 0600
+descriptor outside the project, and supplies only descriptor paths to the
+dedicated editor profile. Readiness and explicit loopback preview registration
+are enabled. A stable VS Code model-provider API is not implemented or advertised.
+No successful Mac DMG build, Keychain test, VS Code GUI test, physical run,
+publicly signed release, or notarization is claimed until those workflows pass.
 
-Electron 40.0.0, Bun 1.3.14, Node 24.15.0 and npm 11.12.1 are the selected exact
-tool versions. This environment cannot resolve npm or bind loopback sockets;
-unit tests use the real broker handler with an in-process HTTP transport.
-Electron/Chromium tests need the installed Electron binary and a GUI/Xvfb.
-These pins need normal security updates before production distribution.
-There is no committed npm transitive lock yet because registry access was
-unavailable (`EAI_AGAIN registry.npmjs.org` on the review retry). Workflows use
-`npm ci`; they and packaging remain blocked until a real registry-generated
-`macos-electron/package-lock.json` is committed. No integrity values were invented.
+Electron 44.4.1, Bun 1.3.14, Node 24.15.0 and npm 11.12.1 are the selected exact
+tool versions. Unit tests use the real broker handler with an in-process HTTP
+transport, and the Linux Electron/Chromium sandbox smoke runs under Xvfb. These
+pins need normal security updates before production distribution. Registry-
+generated npm and Bun lockfiles are committed; workflows use frozen installs
+and do not invent or rewrite integrity values.
 
 ## Development and internal packaging
 
@@ -42,7 +39,7 @@ npm --prefix macos-electron test
 bash macos/test.sh
 ```
 
-On an Apple Silicon Mac, after the helper has landed:
+On an Apple Silicon Mac:
 
 ```sh
 cd macos-electron
@@ -79,7 +76,7 @@ Use a canonical data path without symlink ancestors. Missing helper/assets
 produce a native startup error and a fixed diagnostic code rather than a
 different runtime fallback.
 
-## Worker A integration contract — assumptions to confirm
+## Native helper integration contract
 
 Electron spawns **only** the configured bundled Bun executable with literal
 arguments `run <absolute-native-root>/src/main.ts`, using the native package as
@@ -102,9 +99,10 @@ EZIL_NATIVE_READY {"contractVersion":1,"port":12345,"capabilities":{"executionTa
 ```
 
 Other startup stdout is bounded at 64 KiB and discarded; stderr is drained
-without logging. The helper must bind exclusively to loopback, authenticate
-shell/assets and every API request with `Authorization: Bearer <admin capability>`,
-and serve the shared desktop at `EZIL_SHELL_PATH` (default `/os`). Electron adds
+without logging. The helper must bind exclusively to loopback, authenticate the
+shell document and every API request with `Authorization: Bearer <admin capability>`,
+and serve the shared desktop at `EZIL_SHELL_PATH` (default `/os`). Static committed
+assets carry no authority and reject conflicting Origin values. Electron adds
 that header and the exact helper `Origin` to requests to the helper origin,
 including API requests where Chromium omits Origin. Worker A's navigation-only
 `/os` exception may allow omitted Origin; this host supplies it.
@@ -131,21 +129,23 @@ Browser opens/focuses its saved tabs without a caller-supplied destination.
 
 The existing `request()` API remains for onboarding and Settings. Its `status`
 returns capabilities, activeID, workspace summaries, VS Code/provider status,
-explicit connector unavailability and redacted diagnostics. Only native Settings
+connector readiness and redacted diagnostics. Only native Settings
 performs creation/import/removal and provider setup. The helper must use the
 passed managed workspace rather than creating a competing inventory.
 
-The separate `private/ai-broker.json` descriptor is 0600 JSON:
+The separate private AI-broker descriptor is 0600 JSON:
 `{contractVersion:1,url,capability,operations:["models","chat"],formats:[...]}`.
-It has no integrated consumer here and is not passed to the helper or VS Code.
-A future verified consumer may receive its filename only under `EZIL_AI_BROKER_FILE`.
+It is never passed to the helper. The verified editor receives only its filename
+under `EZIL_AI_BROKER_FILE`; the connector currently supports the constrained
+model-list command, not streaming chat or a VS Code model-provider registration.
 The proposed protocol uses bearer authentication for `GET /v1/models`
 and `POST /v1/chat` with exactly
 `{model,messages:[{role,content}],maxTokens}` and `Content-Type: application/json`.
 Models returns `{models:[configuredModel]}`. Azure streams raw SSE; Bedrock
-streams raw AWS eventstream (`application/vnd.amazon.eventstream`). Worker A
-must decode those formats and forward cancellation, never send the descriptor
-or bearer capability into the desktop/project/editor, and redact provider data.
+streams raw AWS eventstream (`application/vnd.amazon.eventstream`). Any future
+model-provider implementation must decode those formats and forward cancellation,
+never put the descriptor or bearer capability in desktop/project/editor state,
+and redact provider data.
 No destination override, proxy, general HTTP operation, tool execution, or
 SigV4 signing endpoint exists. API/schema names above are explicit assumptions,
 not evidence that Worker A already implements them.
@@ -172,15 +172,16 @@ editor paths are never consulted. Before launch the bundled connector is copied
 and SHA-256 verified in only that workspace's extensions directory; other
 extensions/profiles are preserved. Missing or malformed bundled extension blocks
 editor startup. `surface.focus` forwards fixed reuse-window arguments to the same
-dedicated profile. No provider secrets, admin capability, `EZIL_BROKER_FILE` or
-`EZIL_AI_BROKER_FILE` are passed to the editor.
+dedicated profile. No provider secrets or admin capability are passed to the
+editor. `EZIL_BROKER_FILE` and `EZIL_AI_BROKER_FILE` contain only absolute paths
+to app-owned 0600 descriptors outside the project.
 
-Connector enablement requires confirming the helper's admin mint/revoke API and
-extension descriptor contract together. Electron must mint after helper readiness,
-write a workspace-scoped, short-lived descriptor atomically as 0600 outside the
-project, refresh before expiry, revoke/remove on helper/workspace shutdown and
-fail closed on refresh errors. This lifecycle is unimplemented, so no incompatible
-AI descriptor is substituted and readiness/preview stay explicitly unavailable.
+After helper readiness, Electron mints a workspace-scoped connector capability,
+writes its descriptor atomically, renews it two minutes before expiry, and removes
+it when the helper closes. The extension re-reads that file on every heartbeat,
+so helper restarts and capability rotation do not put bearer values in editor
+arguments, settings, logs, or project files. Refresh failures retry while the old
+capability remains valid and then fail closed.
 No stable VS Code model-provider API integration is implemented or claimed.
 
 Stop sends SIGTERM only to the live launched
@@ -193,7 +194,8 @@ Provider credentials are entered in native macOS dialogs, carried over private
 pipes to main, encrypted by Electron `safeStorage` (macOS Keychain), and stored
 in an app-owned 0600 file. No provider secret goes to a renderer, argument,
 environment, URL, log or VS Code settings. Azure accepts only HTTPS Azure OpenAI
-resource endpoints and a configured deployment. Bedrock uses a configured region,
+resource roots or the exact `/openai/v1` endpoint on Azure OpenAI and Foundry hosts,
+plus a configured deployment. Bedrock uses a configured region,
 model ID and API-key bearer token. Temporary IAM is explicitly unavailable.
 The loopback broker rejects Origin-bearing requests, enforces its Host and
 capability, follows no redirects and never retries ambiguous failures. Limits:
@@ -201,6 +203,11 @@ capability, follows no redirects and never retries ambiguous failures. Limits:
 100 messages, 8192 requested output tokens. Cancellation aborts upstream work.
 Settings reports request/completion/failure counts and bytes, not inferred
 token prices or costs. Live provider billing/format compatibility remains untested.
+
+The bundled connector requires verified Microsoft VS Code 1.109 or newer, the
+first supported line used here with the stable `LanguageModelChatProvider` API.
+Configured Azure or Bedrock models appear as **EZiL BYOK**. This release supports
+text streaming and cancellation and advertises neither images nor tool calls.
 
 ## Data lifecycle and legacy migration
 
@@ -238,6 +245,14 @@ branches and maintainer approval. The runner labels are
 logged-in GUI Mac with Xcode and standard signed Microsoft VS Code installed.
 No PR event or PR artifact is accepted. If this runner is absent, the job queues;
 hosted packaging is not a substitute for physical evidence.
+
+Before physical acceptance, provision an owner-only regular file at
+`~/.config/ezil-ci/providers.json` (or set `EZIL_PHYSICAL_PROVIDER_FIXTURES` to
+another owner-only absolute path) containing exactly `azure` and `bedrock`
+credential objects accepted by Settings. The smoke stores each through Keychain,
+makes one small live streaming request to each configured provider, removes the
+vault entry, and records only a pass/fail check. It never uploads provider output,
+configuration, or credentials. These calls can incur provider charges.
 
 The physical script downloads the exact build artifact, verifies SHA-256,
 mounts read-only, copies that app to a temporary installation, verifies its

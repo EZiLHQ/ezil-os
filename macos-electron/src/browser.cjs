@@ -3,7 +3,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { pathToFileURL } = require('node:url');
 const { BrowserWindow, WebContentsView, session, dialog } = require('electron');
-const { browserURL, partition, lockSession, lockRemote } = require('./policy.cjs');
+const { browserURL, browserRequestURL, partition, lockSession, lockRemote } = require('./policy.cjs');
 const { atomic, readJSON, privateDir } = require('./files.cjs');
 const TOP = 108;
 class Browser {
@@ -16,7 +16,7 @@ class Browser {
     this.session = session.fromPath(privateDir(path.join(workspace.browser, 'profile')));
     lockSession(this.session);
     this.session.webRequest.onBeforeRequest((details, callback) => {
-      try { browserURL(details.url); callback({}); } catch { callback({ cancel: true }); }
+      try { browserRequestURL(details.url); callback({}); } catch { callback({ cancel: true }); }
     });
     this.window = new BrowserWindow({ title: 'EZiL Browser', width: 1200, height: 850, webPreferences: { preload: path.join(__dirname, 'preload.cjs'), sandbox: true, contextIsolation: true, nodeIntegration: false } });
     const toolbarURL = pathToFileURL(path.join(__dirname, '../ui/browser.html')).href;

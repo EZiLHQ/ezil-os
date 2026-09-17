@@ -2,14 +2,37 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
+const os = require('node:os');
+const { createHash } = require('node:crypto');
 const { execFileSync } = require('node:child_process');
 const assert = require('node:assert/strict');
 const { Workspaces } = require('./workspaces.cjs');
 const { atomic, privateDir } = require('./files.cjs');
 const { discover, cleanEnvironment } = require('./vscode.cjs');
+const { workspaceStatus } = require('./helper.cjs');
 const { once } = require('node:events');
+function providerFixtures(input = process.env.EZIL_PHYSICAL_PROVIDER_FIXTURES || path.join(os.homedir(), '.config', 'ezil-ci', 'providers.json')) {
+  const file = path.resolve(input);
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 32768 || (stat.mode & 0o077) !== 0 || (process.getuid && stat.uid !== process.getuid())) throw Error('Invalid provider fixture file');
+  const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (!value || Object.keys(value).sort().join(',') !== 'azure,bedrock') throw Error('Both provider fixtures are required');
+  return [value.azure, value.bedrock];
+}
+async function proveProvider(vault, broker, config, fetchImpl = fetch) {
+  vault.set(config);
+  const descriptor = JSON.parse(fs.readFileSync(broker.descriptor, 'utf8'));
+  const headers = { authorization: `Bearer ${descriptor.capability}` };
+  const models = await fetchImpl(`${descriptor.url}/v1/models`, { headers, redirect: 'error', signal: AbortSignal.timeout(10_000) });
+  assert.equal(models.ok, true); const listed = await models.json();
+  const model = config.deployment || config.model; assert.deepEqual(listed.models, [model]);
+  const chat = await fetchImpl(`${descriptor.url}/v1/chat`, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(70_000),
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Reply with OK.' }], maxTokens: 8 }) });
+  assert.equal(chat.ok, true); assert.ok((await chat.arrayBuffer()).byteLength > 0);
+}
 async function run(host) {
-  const { app, dataRoot, store, editors, openWorkspace, openBrowser, getDesktop, closeDesktop } = host;
+  const { app, dataRoot, store, editors, vault, broker, openWorkspace, openBrowser, editorDescriptors, getHelper, getDesktop, closeDesktop } = host;
   const evidenceRoot = privateDir(path.join(dataRoot, 'evidence'));
   const report = { artifactSHA256: process.env.EZIL_ARTIFACT_SHA256, arch: process.arch, versions: process.versions, checks: [], success: false };
   let server, browser;
@@ -20,6 +43,10 @@ async function run(host) {
     report.xcode = execFileSync('/usr/bin/xcodebuild', ['-version'], { encoding: 'utf8' }).trim();
     assert.notEqual(execFileSync('/usr/bin/stat', ['-f', '%Su', '/dev/console'], { encoding: 'utf8' }).trim(), 'root');
     check('logged-in Apple Silicon GUI');
+    try {
+      for (const fixture of providerFixtures()) await proveProvider(vault, broker, fixture);
+      check('Keychain-backed Azure and Bedrock provider requests');
+    } finally { vault.remove(); }
     const guest = store.guest(); assert.equal(new Workspaces(dataRoot).guest().id, guest.id); check('guest persistence');
     const w = store.create('Physical Mac smoke');
     const canary = path.join(dataRoot, 'outside-workspace-canary'); fs.writeFileSync(canary, 'preserve');
@@ -28,12 +55,26 @@ async function run(host) {
     report.bun = execFileSync(bun, ['--version'], { encoding: 'utf8', env: cleanEnvironment() }).trim();
     execFileSync(bun, ['run', path.join(w.files, 'build.ts')], { cwd: w.files, env: cleanEnvironment(), stdio: 'pipe' });
     assert.equal(fs.readFileSync(path.join(w.files, 'built.txt'), 'utf8'), 'native-arm64-build'); check('project build using bundled Darwin Bun');
+    const metalSource = path.join(w.files, 'metal-check.swift'), metalBinary = path.join(w.files, 'metal-check');
+    fs.writeFileSync(metalSource, 'import Darwin\nimport Metal\nif let device = MTLCreateSystemDefaultDevice() { print(device.name) } else { exit(2) }\n');
+    execFileSync('/usr/bin/xcrun', ['--sdk', 'macosx', 'swiftc', metalSource, '-framework', 'Metal', '-o', metalBinary], { cwd: w.files, env: cleanEnvironment(), stdio: 'pipe' });
+    report.metalDevice = execFileSync(metalBinary, [], { cwd: w.files, env: cleanEnvironment(), encoding: 'utf8' }).trim();
+    assert.ok(report.metalDevice); check('Xcode toolchain and Metal device');
     await openWorkspace(w.id);
     const desktop = getDesktop();
     assert.equal(await desktop.webContents.executeJavaScript('window.ezilNative.contractVersion'), 1);
     assert.ok(await desktop.webContents.executeJavaScript('document.body.textContent.trim().length > 10'));
     fs.writeFileSync(path.join(evidenceRoot, 'desktop.png'), (await desktop.webContents.capturePage()).toPNG()); check('exact bundled shared shell rendered');
-    server = http.createServer((_req, res) => { res.setHeader('Content-Type', 'text/html'); res.end('<!doctype html><title>EZiL smoke browser</title><h1>Native browser</h1><script>localStorage.setItem("ezil-smoke","persisted")</script>'); });
+    server = http.createServer((_req, res) => {
+      const port = server.address().port;
+      res.setHeader('Content-Type', 'text/html');
+      res.end(`<!doctype html><title>EZiL smoke browser</title><h1>Native browser</h1><script>localStorage.setItem('ezil-smoke','persisted'); window.hmr = new Promise((resolve, reject) => { const socket = new WebSocket('ws://127.0.0.1:${port}/hmr'); socket.onmessage = event => resolve(event.data); socket.onerror = reject; });</script>`);
+    });
+    server.on('upgrade', (req, socket) => {
+      const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+      socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+      const message = Buffer.from('hmr-ready'); socket.write(Buffer.concat([Buffer.from([0x81, message.length]), message]));
+    });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const url = `http://127.0.0.1:${server.address().port}/`;
     browser = openBrowser(w.id, url);
@@ -42,6 +83,7 @@ async function run(host) {
     assert.equal(await wc.executeJavaScript('typeof window.ezilNative'), 'undefined');
     assert.equal(await wc.executeJavaScript('typeof require'), 'undefined');
     assert.equal(await wc.executeJavaScript('localStorage.getItem("ezil-smoke")'), 'persisted');
+    assert.equal(await wc.executeJavaScript('window.hmr'), 'hmr-ready'); check('loopback WebSocket/HMR transport');
     fs.writeFileSync(path.join(evidenceRoot, 'browser.png'), (await browser.window.webContents.capturePage()).toPNG());
     fs.writeFileSync(path.join(evidenceRoot, 'browser-content.png'), (await wc.capturePage()).toPNG()); check('sandboxed WebContentsView GUI');
     await browser.close(); browser = openBrowser(w.id);
@@ -50,9 +92,17 @@ async function run(host) {
     assert.equal(await wc.executeJavaScript('localStorage.getItem("ezil-smoke")'), 'persisted'); check('browser tab and Chromium storage persistence');
     const verified = discover(); assert.ok(verified, 'Verified Microsoft VS Code is required on the physical runner');
     report.vscode = execFileSync('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleShortVersionString', path.join(verified.app, 'Contents/Info.plist')], { encoding: 'utf8' }).trim();
-    assert.equal((await editors.start(w)).status, 'running');
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    assert.equal((await editors.start(w, editorDescriptors())).status, 'running');
+    let connector;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      connector = await workspaceStatus(getHelper(), w.id);
+      if (connector?.editorState === 'active') break;
+    }
     assert.equal(editors.state(w), 'running');
+    assert.equal(connector?.editorState, 'active');
+    assert.ok(fs.existsSync(path.join(w.extensions, 'ezil-vscode', 'dist', 'extension.js')));
+    check('VS Code connector activation and readiness heartbeat');
     assert.ok(fs.existsSync(path.join(w.editorData, 'User')), 'VS Code must initialize app-owned user data');
     assert.throws(() => store.remove(w.id, editors.state(w), false)); check('verified Microsoft editor instance and running-removal block');
     assert.equal(await editors.stop(w), 'stopped'); check('graceful tracked editor stop');
@@ -67,4 +117,4 @@ async function run(host) {
     app.exit(report.success ? 0 : 1);
   }
 }
-module.exports = { run };
+module.exports = { run, providerFixtures, proveProvider };

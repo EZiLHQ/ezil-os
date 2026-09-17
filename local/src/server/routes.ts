@@ -35,6 +35,7 @@ import {
     parseRequestedScreen,
 } from '../../../worker/src/screen-modes.ts';
 import { SHELL_API_ROUTES } from '../contract/shell-api.ts';
+import { isOwnFrameOrigin, probeFrameOrigin } from '../contract/frame-origin.ts';
 import type { ShellBootComputer } from '../contract/shell-api.ts';
 import { buildLocalBootPayload, buildLocalSessionPayload } from '../boot/payload.ts';
 import { asRecord, newCorrelationId, readJsonBody, shellError, shellJson } from './http.ts';
@@ -291,7 +292,15 @@ async function handleDesktopGet(req: Request, deps: ShellRouterDeps): Promise<Re
     const confirm = params.get('confirm');
 
     if (confirm === 'frame') {
-        const probe = await (deps.probeFrame ?? probeDesktopOrigin)(params.get('frameUrl') ?? '', deps.hostPortOffset ?? 0);
+        const surface = params.get('surface') ?? 'desktop';
+        const raw = params.get('frameUrl') ?? '';
+        const offset = deps.hostPortOffset ?? 0;
+        const known = surface === 'desktop' || surface === 'code' || surface === 'preview';
+        const probe: FrameProbe = !known || !isOwnFrameOrigin(raw, surface, offset)
+            ? { alive: false, reason: 'foreign_origin' }
+            : deps.probeFrame
+                ? await deps.probeFrame(raw, offset)
+                : await probeFrameOrigin(raw, surface, offset);
         // `session.js#confirmFrame` reads `data.ok === true` then
         // `data.confirmed === true`; anything else is `undefined`, which is not
         // an observation and must not be read as either verdict.

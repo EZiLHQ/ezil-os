@@ -88,8 +88,8 @@ navigation/IPC policy for those preview pages in Electron. Never attach the
 shell/admin bridge or headers to arbitrary preview content.
 
 Before launching Code, mint a `connector` capability and atomically write this
-0600 descriptor **outside the data root**, e.g. an Electron app-owned broker
-directory:
+0600 descriptor in the Electron app's private broker directory, outside every
+project:
 
 ```json
 {
@@ -98,7 +98,7 @@ directory:
   "workspaceId": "<random-workspace-uuid>",
   "token": "<workspace-scoped-connector-capability>",
   "expiresAt": 0,
-  "dataRoot": "<EZIL_NATIVE_DATA_ROOT>",
+  "dataRoot": "<Electron app-owned data root>",
   "workspacePath": "<canonical-absolute-workspace-root>"
 }
 ```
@@ -111,7 +111,8 @@ connector from `extensions/ezil-vscode`; this helper does not install it itself.
 Renew the descriptor atomically before expiry; the connector re-reads it on
 every heartbeat/command. Keep provider secrets out of the descriptor.
 
-The extension also accepts Electron's separate model-only descriptor:
+The extension also accepts Electron's separate model-only descriptor through
+`EZIL_AI_BROKER_FILE`:
 `{contractVersion:1,url,capability,operations:['models','chat'],formats:[...]}`.
 It offers **List Broker Models**, using only authenticated `GET /v1/models`
 without Origin, as that broker requires. It does not send readiness/preview
@@ -126,6 +127,10 @@ restart. Code launch attempts mark unknown **before** handing off. Electron
 must report closed only after it proves the associated editor process/window
 exited, or after a launch was definitively unavailable and no instance exists.
 Extension readiness and handoff-open acknowledgement are separate facts.
+Authenticated admin `GET /api/native/previews` exposes only the attached/current
+workspace UUID, editor state and validated registered port integers. Electron
+uses the lowest port to open a direct loopback preview; no arbitrary URL proxy
+or provider destination is derived from this endpoint.
 
 ## Storage and removal
 
@@ -151,17 +156,14 @@ requesting workspace removal as well.
 - External-browser pairing is a **tested primitive only** (`Authority`), with a
   random one-use 60-second code, hash-only server storage, and a five-minute
   workspace capability on redemption. No unauthenticated pairing route/UI ships.
-- No language model provider ships. Only model listing is supported in the
-  extension; see its README's compatibility gate. The connector has no provider
-  secrets and no cloud requirement.
+- The VS Code 1.109+ extension registers the stable EZiL BYOK model provider.
+  It supports text streaming and cancellation over the authenticated local broker,
+  while provider secrets remain in Electron's Keychain-backed vault. Images and
+  tool calls are not advertised in this first compatible provider release.
 - Local Code/Preview cold start is fixed in the shared shell. The surface origin
   validator is implemented/tested in `local/src/contract/frame-origin.ts`, and
-  the shell sends surface-specific confirmation requests only in local VM mode.
-  **The local server adapter still requires `local-frame-route.patch`.**
-  `local/src/server/routes.ts` was outside Worker A's owned paths; a requested
-  scope extension was not answered. An authorized integrator should apply
-  the patch in `native/local-frame-route.patch` and rerun local route tests. Until
-  then, local Code/Preview confirmation still rejects their frame origins.
+  the shell and local server now send and enforce surface-specific confirmation
+  requests only in local VM mode.
 - TCP loopback and Chromium launch were blocked by this worker sandbox. Run
   `EZIL_NATIVE_SOCKET_TESTS=1 bun test native/tests` and browser tests on an
   unrestricted development host, then exercise the Electron/official VS Code

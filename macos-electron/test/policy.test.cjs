@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { randomUUID } = require('node:crypto');
-const { schema, browserURL, partition, senderAllowed, lockSession, lockRemote } = require('../src/policy.cjs');
+const { schema, browserURL, browserRequestURL, partition, senderAllowed, lockSession, lockRemote } = require('../src/policy.cjs');
 const { readyLine } = require('../src/helper.cjs');
 const { capabilities } = require('../src/policy.cjs');
 test('strict native schemas reject injection, extra fields and malformed identifiers', () => {
@@ -12,6 +12,10 @@ test('strict native schemas reject injection, extra fields and malformed identif
 test('HTTPS and exact loopback only; no URL credentials', () => {
   for (const url of ['https://example.com/a', 'http://127.0.0.1:3000/', 'http://localhost:3000/', 'http://[::1]:3000/']) assert.ok(browserURL(url));
   for (const url of ['file:///etc/passwd', 'javascript:alert(1)', 'data:text/html,x', 'http://example.com', 'http://localhost.evil/', 'https://u:p@example.com', 'ftp://example.com']) assert.throws(() => browserURL(url));
+});
+test('browser subresources allow secure WebSockets and loopback HMR only', () => {
+  for (const url of ['wss://example.com/socket', 'ws://127.0.0.1:3000/hmr', 'ws://localhost:5173/hmr']) assert.ok(browserRequestURL(url));
+  for (const url of ['ws://example.com/socket', 'wss://u:p@example.com/socket', 'file:///tmp/socket']) assert.throws(() => browserRequestURL(url));
 });
 test('partitions stable per random workspace and different across workspaces', () => {
   const a = randomUUID(), b = randomUUID(); assert.equal(partition(a), partition(a)); assert.notEqual(partition(a), partition(b)); assert.ok(partition(a).startsWith('persist:')); assert.throws(() => partition('../profile'));

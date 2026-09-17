@@ -11,6 +11,13 @@ function browserURL(value) {
   if (url.protocol === 'http:' && !['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname)) throw Error('HTTP requires loopback');
   return url.href;
 }
+function browserRequestURL(value) {
+  const url = new URL(value);
+  if (url.protocol === 'http:' || url.protocol === 'https:') return browserURL(value);
+  if (url.username || url.password || !['ws:', 'wss:'].includes(url.protocol)) throw Error('Invalid browser request URL');
+  if (url.protocol === 'ws:' && !['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname)) throw Error('WS requires loopback');
+  return url.href;
+}
 function partition(id) { return `persist:ezil-${uuid(id)}`; }
 function senderAllowed(event, webContents, allowedURL) {
   return !!event.senderFrame && event.sender === webContents && event.senderFrame === webContents.mainFrame && event.senderFrame.url === allowedURL;
@@ -54,4 +61,4 @@ function lockRemote(wc) {
     try { browserURL(typeof url === 'string' ? url : event.url); } catch { event.preventDefault(); }
   });
 }
-module.exports = { capabilities, uuid, name, exact, browserURL, partition, senderAllowed, surfaceSchema, schema, lockSession, lockRemote };
+module.exports = { capabilities, uuid, name, exact, browserURL, browserRequestURL, partition, senderAllowed, surfaceSchema, schema, lockSession, lockRemote };

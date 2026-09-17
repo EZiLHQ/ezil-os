@@ -199,6 +199,8 @@ describe('loopback HTTP', () => {
         expect((await op({ op: 'editor.readiness', state: 'active' })).status).toBe(200);
         for (const port of [80, 65536, f.server.port, '3000']) expect((await op({ op: 'preview.register', port })).status).toBe(400);
         expect((await op({ op: 'preview.register', port: 3000 })).status).toBe(200);
+        expect(await (await f.request('/api/native/previews')).json()).toEqual({ ok: true, workspaceId: f.record.id, editorState: 'active', ports: [3000] });
+        expect((await f.request('/api/native/previews', {}, connector)).status).toBe(403);
         expect((await op({ op: 'preview.unregister', port: 3000 })).status).toBe(200);
         expect((await op({ op: 'editor.readiness', state: 'closed' })).status).toBe(403);
         f.advance(45_000);

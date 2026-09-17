@@ -19,7 +19,11 @@ async function refresh() {
     for (const [label, op] of [['Open desktop', 'open'], ['Browser', 'browser'], ['VS Code', 'editor'], ['Stop editor', 'stopEditor'], ['Remove', 'remove']]) row.append(button(label, op, workspace.id));
     $('list').append(row);
   }
-  $('editor').textContent = (state.editor === 'available' ? 'Verified Microsoft VS Code is available.' : 'Microsoft VS Code is not installed or could not be verified. Your desktop and browser are available.') + ' Connector readiness, preview and VS Code model-provider integration are unavailable in this build.';
+  const connector = state.connector?.readiness === 'available' && state.connector?.preview === 'available'
+    ? ' The EZiL connector is ready for editor status and loopback previews.'
+    : ' The EZiL connector is unavailable; the desktop and browser still work.';
+  const modelProvider = state.connector?.modelProvider === 'available' ? ' EZiL BYOK is available in the VS Code model picker.' : '';
+  $('editor').textContent = (state.editor === 'available' ? 'Verified Microsoft VS Code 1.109 or newer is available.' : 'Microsoft VS Code 1.109 or newer is not installed or could not be verified. Your desktop and browser are available.') + connector + modelProvider;
   $('provider').textContent = state.provider.configured ? 'A provider is connected.' : 'No provider connected.';
   $('usage').textContent = `Provider requests: ${state.usage.requests} · Completed: ${state.usage.completed} · Failed: ${state.usage.failed}\nReceived bytes: ${state.usage.responseBytes}. Token and cost totals are not estimated.`;
   $('diagnostics').textContent = state.diagnostics.map(d => `${d.at} ${d.code}`).join('\n') || 'No issues recorded.';

@@ -17,7 +17,7 @@ function prompt(label, hidden = false) {
 }
 async function configureProvider(type, vault) {
   if (type === 'remove') { vault.remove(); return; }
-  if (type === 'azure') vault.set({ provider: 'azure', endpoint: await prompt('Azure OpenAI endpoint'), deployment: await prompt('Azure deployment'), key: await prompt('Azure API key', true) });
+  if (type === 'azure') vault.set({ provider: 'azure', endpoint: await prompt('Azure OpenAI or Foundry endpoint'), deployment: await prompt('Azure deployment'), key: await prompt('Azure API key', true) });
   else if (type === 'bedrock') vault.set({ provider: 'bedrock', region: await prompt('Bedrock region'), model: await prompt('Bedrock model ID'), token: await prompt('Bedrock API key', true) });
   else throw Error('Temporary IAM is unavailable');
 }

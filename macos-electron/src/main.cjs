@@ -6,9 +6,9 @@ const { pathToFileURL } = require('node:url');
 const { Workspaces } = require('./workspaces.cjs');
 const { Editors, discover, INSTALLER } = require('./vscode.cjs');
 const { Vault, startBroker } = require('./broker.cjs');
-const { config, startHelper, authenticatedHeaders } = require('./helper.cjs');
+const { config, startHelper, authenticatedHeaders, registeredPreview } = require('./helper.cjs');
 const { operation } = require('./surfaces.cjs');
-const { connectorStatus } = require('./connector.cjs');
+const { unavailableStatus } = require('./connector.cjs');
 const { Browser } = require('./browser.cjs');
 const { schema, senderAllowed, capabilities, lockSession } = require('./policy.cjs');
 const { privateDir, atomic } = require('./files.cjs');
@@ -78,14 +78,25 @@ if (!app.requestSingleInstanceLock()) { app.quit(); } else {
   }
   function openBrowser(id, url) {
     const workspace = store.get(id);
-    if (!browsers.has(id)) browsers.set(id, new Browser(workspace, register, () => browsers.delete(id)));
-    const browser = browsers.get(id); browser.focus(url); return browser;
+    const created = !browsers.has(id);
+    if (created) browsers.set(id, new Browser(workspace, register, () => browsers.delete(id)));
+    const browser = browsers.get(id); browser.focus(url);
+    if (created && !url && helper && activeID === id) {
+      const currentHelper = helper;
+      void registeredPreview(currentHelper, id).then(preview => {
+        if (preview && helper === currentHelper && browsers.get(id) === browser) browser.focus(preview);
+      }).catch(() => {});
+    }
+    return browser;
+  }
+  function editorDescriptors() {
+    return { connector: helper?.connector?.descriptor, model: broker?.descriptor };
   }
   async function status() {
     return { capabilities, guest: fs.existsSync(path.join(dataRoot, 'guest.json')), workspaces: store.list(), activeID, editor: discover() ? 'available' : 'missing', installer: INSTALLER, provider: { configured: fs.existsSync(vault.file), keychainAvailable: process.platform === 'darwin' && safeStorage.isEncryptionAvailable(), temporaryIAM: 'unavailable' }, usage: { ...broker.usage, accounting: 'Requests and bytes only; provider token/cost accounting is not inferred' }, diagnostics: [...diagnostics] };
   }
   async function dispatch(input, caller) {
-    if (input.op === 'status') return { ...await status(), connector: connectorStatus };
+    if (input.op === 'status') return { ...await status(), connector: helper?.connector?.status() ?? unavailableStatus };
     if (input.op === 'browserAction') return caller.browser.action(input);
     if (input.op === 'settings') { showOnboarding(); return; }
     if (input.op === 'installer') { await shell.openExternal(INSTALLER); return; }
@@ -96,7 +107,7 @@ if (!app.requestSingleInstanceLock()) { app.quit(); } else {
       return;
     }
     if (input.op === 'browser') { openBrowser(input.id, input.url); return; }
-    if (input.op === 'editor') return editors.open(store.get(input.id));
+    if (input.op === 'editor') return editors.open(store.get(input.id), editorDescriptors());
     if (input.op === 'stopEditor') return editors.stop(store.get(input.id));
     if (busy) throw Error('Another workspace operation is in progress'); busy = true;
     try {
@@ -127,7 +138,7 @@ if (!app.requestSingleInstanceLock()) { app.quit(); } else {
   }
   ipcMain.handle('ezil:surface:v1', (event, raw) => operation(event, raw, callers.get(event.sender.id), activeID, async input => {
     if (input.surface === 'browser') { openBrowser(input.workspaceId); return true; }
-    return (await editors.open(store.get(input.workspaceId))).status === 'running';
+    return (await editors.open(store.get(input.workspaceId), editorDescriptors())).status === 'running';
   }));
   ipcMain.handle('ezil:native:v1', async (event, raw) => {
     try {
@@ -162,13 +173,14 @@ if (!app.requestSingleInstanceLock()) { app.quit(); } else {
     Menu.setApplicationMenu(Menu.buildFromTemplate([
       { label: 'EZiL OS', submenu: [{ label: 'Settings and workspaces', click: showOnboarding }, { type: 'separator' }, { role: 'quit' }] },
       { role: 'editMenu' }, { role: 'windowMenu' },
-      { label: 'Workspace', submenu: [{ label: 'Open Browser', click: () => { if (activeID) openBrowser(activeID); } }, { label: 'Open Microsoft VS Code', click: () => { if (activeID) editors.open(store.get(activeID)).catch(() => note('EDITOR_UNAVAILABLE')); } }] }
+      { label: 'Workspace', submenu: [{ label: 'Open Browser', click: () => { if (activeID) openBrowser(activeID); } }, { label: 'Open Microsoft VS Code', click: () => { if (activeID) editors.open(store.get(activeID), editorDescriptors()).catch(() => note('EDITOR_UNAVAILABLE')); } }] }
     ]));
     showOnboarding(); note('HOST_READY');
     if (process.argv.includes('--native-smoke')) {
       const manifest = path.join(process.resourcesPath, 'INVENTORY.json');
       if (!app.isPackaged || !fs.existsSync(manifest) || JSON.parse(fs.readFileSync(manifest)).distribution !== 'internal-ad-hoc') throw Error('Smoke requires an internal packaged artifact');
-      await require('./smoke.cjs').run({ app, dataRoot, store, editors, broker, openWorkspace, openBrowser, getDesktop: () => desktop, closeDesktop: () => desktop?.destroy() });
+      await require('./smoke.cjs').run({ app, dataRoot, store, editors, vault, broker, openWorkspace, openBrowser, editorDescriptors,
+        getHelper: () => helper, getDesktop: () => desktop, closeDesktop: () => desktop?.destroy() });
     }
   }).catch(() => {
     note('HOST_START_FAILED');

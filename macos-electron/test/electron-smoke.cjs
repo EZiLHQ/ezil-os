@@ -5,6 +5,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 const http = require('node:http');
+const { createHash } = require('node:crypto');
 const { Browser } = require('../src/browser.cjs');
 const { Workspaces } = require('../src/workspaces.cjs');
 const { senderAllowed, schema } = require('../src/policy.cjs');
@@ -15,13 +16,23 @@ app.whenReady().then(async () => {
   const store = new Workspaces(path.join(temp, 'data')), a = store.create('A'), b = store.create('B');
   const callers = new Map(); const register = (wc, url, _role, browser) => callers.set(wc.id, { wc, url, browser });
   ipcMain.handle('ezil:native:v1', (event, input) => { const c = callers.get(event.sender.id); assert.ok(senderAllowed(event, c.wc, c.url)); return { ok: true, value: c.browser.action(schema(input)) }; });
-  const server = http.createServer((_req, res) => { res.setHeader('Content-Type', 'text/html'); res.end('<title>Test</title><p>Remote page</p>'); });
+  const server = http.createServer((_req, res) => {
+    const port = server.address().port;
+    res.setHeader('Content-Type', 'text/html');
+    res.end(`<title>Test</title><p>Remote page</p><script>window.hmr = new Promise((resolve, reject) => { const socket = new WebSocket('ws://127.0.0.1:${port}/hmr'); socket.onmessage = event => resolve(event.data); socket.onerror = reject; });</script>`);
+  });
+  server.on('upgrade', (req, socket) => {
+    const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    const message = Buffer.from('hmr-ready'); socket.write(Buffer.concat([Buffer.from([0x81, message.length]), message]));
+  });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const url = `http://127.0.0.1:${server.address().port}/`;
   const first = new Browser(a, register, () => {}), second = new Browser(b, register, () => {});
   await first.tabs[0].view.webContents.loadURL(url); await second.tabs[0].view.webContents.loadURL(url);
   const remote = first.tabs[0].view.webContents;
   assert.equal(await remote.executeJavaScript('typeof require'), 'undefined'); assert.equal(await remote.executeJavaScript('typeof ezilNative'), 'undefined');
+  assert.equal(await remote.executeJavaScript('window.hmr'), 'hmr-ready');
   await remote.executeJavaScript('localStorage.setItem("workspace", "A")'); assert.equal(await second.tabs[0].view.webContents.executeJavaScript('localStorage.getItem("workspace")'), null);
   const count = BrowserWindow.getAllWindows().length; await remote.executeJavaScript('window.open("https://example.com")'); assert.equal(BrowserWindow.getAllWindows().length, count);
   assert.equal(first.session.getStoragePath() === second.session.getStoragePath(), false);

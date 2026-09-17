@@ -6,12 +6,15 @@
   "publisher": "ezil",
   "license": "AGPL-3.0-only",
   "private": true,
-  "engines": { "vscode": "^1.96.0" },
+  "engines": { "vscode": "^1.109.0" },
   "main": "./dist/extension.js",
   "extensionKind": ["ui"],
   "activationEvents": ["onStartupFinished"],
   "capabilities": { "untrustedWorkspaces": { "supported": false }, "virtualWorkspaces": false },
   "contributes": {
+    "languageModelChatProviders": [
+      { "vendor": "ezil", "displayName": "EZiL BYOK" }
+    ],
     "commands": [
       { "command": "ezil.registerPreview", "title": "EZiL: Register Loopback Preview Port" },
       { "command": "ezil.unregisterPreview", "title": "EZiL: Unregister Loopback Preview Port" },
@@ -23,5 +26,5 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
-  "devDependencies": { "@types/vscode": "1.96.0", "@types/node": "22.10.2", "typescript": "5.9.3" }
+  "devDependencies": { "@types/vscode": "1.109.0", "@types/node": "22.10.2", "typescript": "5.9.3" }
 }

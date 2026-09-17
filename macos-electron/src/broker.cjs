@@ -11,7 +11,11 @@ function credential(value) {
   if (value.provider === 'azure') {
     exact(value, ['provider', 'endpoint', 'deployment', 'key']);
     const url = new URL(value.endpoint);
-    if (url.protocol !== 'https:' || !/^[a-z0-9-]+\.openai\.azure\.com$/.test(url.hostname) || url.port || url.username || url.password || url.search || url.hash || url.pathname !== '/') throw Error('Use an Azure OpenAI resource endpoint');
+    const openAIHost = /^[a-z0-9-]+\.openai\.azure\.com$/.test(url.hostname);
+    const foundryHost = /^[a-z0-9-]+\.services\.ai\.azure\.com$/.test(url.hostname);
+    const legacyPath = openAIHost && url.pathname === '/';
+    const v1Path = (openAIHost || foundryHost) && (url.pathname === '/openai/v1' || url.pathname === '/openai/v1/');
+    if (url.protocol !== 'https:' || (!legacyPath && !v1Path) || url.port || url.username || url.password || url.search || url.hash) throw Error('Use an Azure OpenAI resource endpoint or exact Foundry /openai/v1 endpoint');
     if (!/^[a-zA-Z0-9._-]{1,128}$/.test(value.deployment)) throw Error('Invalid deployment');
     if (typeof value.key !== 'string' || !/^[\x21-\x7e]{8,4096}$/.test(value.key)) throw Error('Invalid key');
   } else if (value.provider === 'bedrock') {
@@ -32,12 +36,18 @@ function chatRequest(body, model) {
 }
 function upstream(config, body) {
   credential(config);
-  if (config.provider === 'azure') return {
-    url: `${new URL(config.endpoint).origin}/openai/deployments/${config.deployment}/chat/completions?api-version=2024-10-21`,
-    headers: { 'api-key': config.key },
-    body: { messages: body.messages, max_tokens: body.maxTokens, stream: true, stream_options: { include_usage: true } },
-    contentType: 'text/event-stream'
-  };
+  if (config.provider === 'azure') {
+    const endpoint = new URL(config.endpoint);
+    const v1 = endpoint.pathname === '/openai/v1' || endpoint.pathname === '/openai/v1/';
+    return {
+      url: v1
+        ? `${endpoint.origin}/openai/v1/chat/completions`
+        : `${endpoint.origin}/openai/deployments/${config.deployment}/chat/completions?api-version=2024-10-21`,
+      headers: { 'api-key': config.key },
+      body: { ...(v1 ? { model: config.deployment } : {}), messages: body.messages, max_tokens: body.maxTokens, stream: true, stream_options: { include_usage: true } },
+      contentType: 'text/event-stream'
+    };
+  }
   return {
     url: `https://bedrock-runtime.${config.region}.amazonaws.com/model/${encodeURIComponent(config.model)}/converse-stream`,
     headers: { Authorization: `Bearer ${config.token}` },

@@ -10,10 +10,16 @@ const azure = { provider: 'azure', endpoint: 'https://test.openai.azure.com/', d
 const chat = { model: 'deployment', messages: [{ role: 'user', content: 'Hello' }], maxTokens: 10 };
 test('fixed provider destinations, no IAM signing oracle or redirects', () => {
   assert.equal(credential(azure), azure);
-  for (const endpoint of ['http://test.openai.azure.com/', 'https://test.openai.azure.com.evil/', 'https://test.openai.azure.com/path', 'https://u:p@test.openai.azure.com/', 'https://127.0.0.1/']) assert.throws(() => credential({ ...azure, endpoint }));
+  for (const endpoint of ['http://test.openai.azure.com/', 'https://test.openai.azure.com.evil/', 'https://test.openai.azure.com/path', 'https://test.services.ai.azure.com/', 'https://test.services.ai.azure.com/models', 'https://u:p@test.openai.azure.com/', 'https://127.0.0.1/']) assert.throws(() => credential({ ...azure, endpoint }));
   assert.throws(() => credential({ provider: 'iam', accessKey: 'x' }));
   assert.throws(() => credential({ ...azure, destination: 'https://evil.test' }));
   const target = upstream(azure, chat); assert.ok(target.url.startsWith('https://test.openai.azure.com/openai/deployments/deployment/')); assert.equal(target.url.includes(azure.key), false);
+  for (const endpoint of ['https://test.openai.azure.com/openai/v1/', 'https://test.services.ai.azure.com/openai/v1']) {
+    const v1 = upstream({ ...azure, endpoint }, chat);
+    assert.equal(v1.url, `${new URL(endpoint).origin}/openai/v1/chat/completions`);
+    assert.equal(v1.body.model, 'deployment');
+    assert.equal(v1.headers['api-key'], azure.key);
+  }
   const bedrock = upstream({ provider: 'bedrock', region: 'us-east-1', model: 'anthropic.claude-v2', token: 'SECRET-TOKEN' }, chat);
   assert.equal(bedrock.url, 'https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-v2/converse-stream'); assert.equal(bedrock.contentType, 'application/vnd.amazon.eventstream');
 });

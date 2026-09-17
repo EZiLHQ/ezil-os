@@ -6,6 +6,7 @@ const { randomBytes } = require('node:crypto');
 const { capabilities } = require('./policy.cjs');
 const { cleanEnvironment } = require('./vscode.cjs');
 const { privateDir } = require('./files.cjs');
+const { ConnectorSession } = require('./connector.cjs');
 function config(resources, env = process.env) {
   return {
     bun: env.EZIL_BUN_PATH || path.join(resources, 'bun', 'bun'),
@@ -32,6 +33,22 @@ function authenticatedHeaders(details, helper) {
   // Supplying the exact origin also covers API calls where Chromium omits it.
   headers.Origin = helper.origin;
   return headers;
+}
+async function workspaceStatus(helper, workspaceId, fetchImpl = fetch) {
+  const response = await fetchImpl(`${helper.origin}/api/native/previews`, {
+    method: 'GET', redirect: 'error', signal: AbortSignal.timeout(5_000),
+    headers: { origin: helper.origin, authorization: `Bearer ${helper.capability}` },
+  });
+  if (!response.ok) return undefined;
+  const value = await response.json();
+  if (!value || value.ok !== true || value.workspaceId !== workspaceId || !Array.isArray(value.ports) || value.ports.length > 16 ||
+      !['active', 'closed', 'unknown'].includes(value.editorState) ||
+      value.ports.some(port => !Number.isInteger(port) || port < 1024 || port > 65535)) return undefined;
+  return { editorState: value.editorState, ports: [...value.ports].sort((a, b) => a - b) };
+}
+async function registeredPreview(helper, workspaceId, fetchImpl = fetch) {
+  const value = await workspaceStatus(helper, workspaceId, fetchImpl);
+  return value?.ports.length ? `http://127.0.0.1:${value.ports[0]}/` : undefined;
 }
 async function startHelper(settings, root, workspace, onExit = () => {}) {
   for (const file of [settings.bun, settings.helper, ...['bundle.min.js', 'bundle.min.css', 'icons.js'].map(f => path.join(settings.assets, f))]) {
@@ -64,6 +81,10 @@ async function startHelper(settings, root, workspace, onExit = () => {}) {
   });
   child.once('exit', onExit);
   const origin = `http://127.0.0.1:${ready.port}`;
-  return { child, origin, url: origin + settings.shellPath, capability, close: () => child.kill('SIGTERM') };
+  const helper = { origin, capability };
+  let connector = null;
+  try { connector = await new ConnectorSession(root, workspace, helper).start(); } catch { /* Desktop/browser stay available without the editor connector. */ }
+  return { child, origin, url: origin + settings.shellPath, capability, connector,
+    close: () => { try { connector?.close(); } finally { child.kill('SIGTERM'); } } };
 }
-module.exports = { config, readyLine, startHelper, helperEnvironment, authenticatedHeaders };
+module.exports = { config, readyLine, startHelper, helperEnvironment, authenticatedHeaders, workspaceStatus, registeredPreview };
