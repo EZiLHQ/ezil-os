@@ -149,7 +149,19 @@ else
 fi
 
 ln -s /Applications "$DMG_ROOT/Applications"
-hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_ROOT" -ov -format UDZO "$DMG" >/dev/null
+# hdiutil sizes a -srcfolder image from allocated blocks. That undercounts the
+# sparse ext4 disk, so reserve its logical size plus 1 GiB for the app/HFS+
+# metadata before compressing the final DMG.
+runtime_bytes="$(stat -f '%z' "$APP/Contents/Resources/runtime/vm/rootfs.img")"
+dmg_size_mib="$(( (runtime_bytes + 1048575) / 1048576 + 1024 ))"
+hdiutil create \
+    -size "${dmg_size_mib}m" \
+    -fs HFS+ \
+    -volname "$APP_NAME" \
+    -srcfolder "$DMG_ROOT" \
+    -ov \
+    -format UDZO \
+    "$DMG" >/dev/null
 
 if [ "$SIGNED" -eq 1 ]; then
     codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG"

@@ -28,6 +28,7 @@ grep -q 'EZIL_ALLOW_FIXTURE_RUNTIME' "$SCRIPT_DIR/build-dmg.sh"
 
 grep -q 'arm64-apple-macos14.0' "$SCRIPT_DIR/build-dmg.sh"
 grep -q 'Virtualization' "$SCRIPT_DIR/build-dmg.sh"
+grep -Fq -- "-size \"\${dmg_size_mib}m\"" "$SCRIPT_DIR/build-dmg.sh"
 grep -q 'com.apple.security.virtualization' "$SCRIPT_DIR/EZiLOS.entitlements"
 grep -q 'Continue as Guest' "$SCRIPT_DIR/EZiLOSApp.swift"
 grep -q 'WKWebsiteDataStore(forIdentifier:' "$SCRIPT_DIR/EZiLOSApp.swift"
