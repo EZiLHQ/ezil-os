@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createNativeRuntime } from '../../../native/src/server.ts';
@@ -22,7 +22,7 @@ function bedrockFrame(type: string, payload: object): Buffer {
 }
 
 test('activation acknowledges readiness and commands register/unregister a preview with the real handler', async () => {
-    const root = mkdtempSync('/tmp/ezil-extension-'); const dataRoot = join(root, 'data');
+    const root = realpathSync(mkdtempSync('/tmp/ezil-extension-')); const dataRoot = join(root, 'data');
     const admin = randomBytes(32).toString('base64url'); const origin = 'http://127.0.0.1:49152';
     const workspaceId = randomUUID();
     const workspacePath = join(dataRoot, 'workspaces', workspaceId, 'files'); mkdirSync(workspacePath, { recursive: true });

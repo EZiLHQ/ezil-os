@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, chmodSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, symlinkSync, chmodSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { parsePort, readBroker, readModels, sendOperation, type ModelBrokerDescriptor } from '../src/broker';
@@ -7,7 +7,7 @@ import { parsePort, readBroker, readModels, sendOperation, type ModelBrokerDescr
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function fixture() {
-    const root = mkdtempSync('/tmp/ezil-connector-'); roots.push(root);
+    const root = realpathSync(mkdtempSync('/tmp/ezil-connector-')); roots.push(root);
     const dataRoot = join(root, 'data'); const workspaceId = randomUUID();
     const workspacePath = join(dataRoot, 'native-v1', 'workspaces', workspaceId, 'files');
     mkdirSync(workspacePath, { recursive: true });

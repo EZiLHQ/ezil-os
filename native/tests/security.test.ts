@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, symlinkSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Authority } from '../src/auth.ts';
@@ -12,7 +12,7 @@ import { toShellDesktopState } from '../../app/src/server/shell/boot-payload.ts'
 
 const roots: string[] = [];
 const servers: { stop(): void | Promise<void> }[] = [];
-const temp = () => { const path = mkdtempSync('/tmp/ezil-native-'); roots.push(path); return path; };
+const temp = () => { const path = realpathSync(mkdtempSync('/tmp/ezil-native-')); roots.push(path); return path; };
 const token = () => randomBytes(32).toString('base64url');
 afterEach(async () => { for (const server of servers.splice(0)) await server.stop(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
