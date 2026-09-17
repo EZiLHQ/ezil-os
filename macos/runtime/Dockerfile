@@ -27,7 +27,7 @@ RUN test "${TARGETARCH}" = "arm64" \
 COPY ezil-init /sbin/ezil-init
 RUN chmod 0755 /sbin/ezil-init \
     && mkdir -p /workspace /home/ezil/.local/share/code-server /home/ezil/.config/code-server \
-    && useradd --create-home --uid 1000 --shell /bin/bash ezil \
+    && useradd --create-home --uid 10001 --shell /bin/bash ezil \
     && chown -R ezil:ezil /home/ezil
 
 LABEL org.opencontainers.image.title="EZiL OS local ARM runtime" \

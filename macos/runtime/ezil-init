@@ -39,7 +39,7 @@ if [ -z "${address:-}" ]; then
     exec sleep infinity
 fi
 
-setpriv --reuid=1000 --regid=1000 --init-groups env \
+setpriv --reuid=10001 --regid=10001 --init-groups env \
     HOME=/home/ezil PASSWORD="$editor_password" code-server \
     --auth password \
     --bind-addr 0.0.0.0:8443 \

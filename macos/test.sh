@@ -35,6 +35,8 @@ grep -q 'VZNATNetworkDeviceAttachment' "$SCRIPT_DIR/VirtualMachineRuntime.swift"
 grep -q 'VZSingleDirectoryShare' "$SCRIPT_DIR/VirtualMachineRuntime.swift"
 grep -q 'EZIL_READY' "$SCRIPT_DIR/runtime/ezil-init"
 grep -q -- '--auth password' "$SCRIPT_DIR/runtime/ezil-init"
+grep -q -- '--uid 10001' "$SCRIPT_DIR/runtime/Dockerfile"
+grep -q -- 'setpriv --reuid=10001 --regid=10001' "$SCRIPT_DIR/runtime/ezil-init"
 if grep -q -- '--auth none' "$SCRIPT_DIR/runtime/ezil-init"; then
     echo "macos test: code-server must not expose an unauthenticated endpoint" >&2
     exit 1
