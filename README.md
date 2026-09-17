@@ -37,6 +37,8 @@
 > cross-platform launcher still supports Docker and Bun. See
 > [Prerequisites](#prerequisites) before you start with the hosted path.
 
+The internal Electron Apple Silicon host, connector limitations and pending validation gates are documented in [Native Mac](docs/NATIVE-MAC.md).
+
 # An open-source Linux desktop, streamed from a real container
 
 Every user gets their own sandboxed Ubuntu container running

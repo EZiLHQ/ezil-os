@@ -1,88 +1,57 @@
-name: macOS Internal DMG
+name: macOS Native Internal DMG
 
 on:
   workflow_dispatch:
   pull_request:
     paths:
-      - "macos/**"
-      - ".github/workflows/macos-internal.yml"
+      - 'macos-electron/**'
+      - 'native/**'
+      - 'extensions/ezil-vscode/**'
+      - 'app/public/os/**'
+      - '.github/workflows/macos-internal.yml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: macos-internal-${{ github.ref }}
+  group: macos-native-internal-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  runtime:
-    name: build pinned ARM Linux runtime
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build the bootable runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y e2fsprogs
-          ./macos/runtime/build-runtime.sh "$RUNNER_TEMP/ezil-vm-runtime"
-          tar --sparse -C "$RUNNER_TEMP/ezil-vm-runtime" -czf "$RUNNER_TEMP/ezil-vm-runtime.tar.gz" .
-      - name: Upload bootable runtime
-        uses: actions/upload-artifact@v4
-        with:
-          name: ezil-vm-runtime-${{ github.sha }}
-          path: ${{ runner.temp }}/ezil-vm-runtime.tar.gz
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 3
-
   dmg:
-    name: build ad-hoc Apple Silicon DMG
-    needs: runtime
+    name: exact shared shell + Electron Apple Silicon DMG
+    # Standard macos-14 is Apple Silicon for public repositories.
+    # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
     runs-on: macos-14
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - name: Download bootable runtime
-        uses: actions/download-artifact@v4
+      - uses: actions/setup-node@v4
         with:
-          name: ezil-vm-runtime-${{ github.sha }}
-          path: ${{ runner.temp }}/runtime-archive
-      - name: Unpack and verify runtime
-        shell: bash
+          node-version: '24.15.0'
+      - name: Install pinned build tools
+        working-directory: macos-electron
         run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ezil-vm-runtime"
-          tar -xzf "$RUNNER_TEMP/runtime-archive/ezil-vm-runtime.tar.gz" -C "$RUNNER_TEMP/ezil-vm-runtime"
-          test ! -e "$RUNNER_TEMP/ezil-vm-runtime/CI_FIXTURE_DO_NOT_DISTRIBUTE"
-          (cd "$RUNNER_TEMP/ezil-vm-runtime" && shasum -a 256 -c SHA256SUMS)
-          rm -f "$RUNNER_TEMP/runtime-archive/ezil-vm-runtime.tar.gz"
-          df -h "$RUNNER_TEMP"
-      - name: Run native unit and compile tests
-        shell: bash
-        run: ./macos/test.sh
-      - name: Build and verify the ad-hoc DMG
-        shell: bash
+          test "$(uname -m)" = arm64
+          npm install --global npm@11.12.1 --no-audit --no-fund
+          npm ci --no-audit --no-fund
+      - name: Unit, migration compatibility and Electron GUI checks
+        run: |
+          npm --prefix macos-electron run check
+          npm --prefix macos-electron test
+          bash macos/test.sh
+          npm --prefix macos-electron run test:electron
+      - name: Package and verify internal ad-hoc DMG
         env:
-          INTERNAL_VERSION: 0.0.${{ github.run_number }}
-        run: |
-          set -euo pipefail
-          ./macos/build-dmg.sh \
-            --version "$INTERNAL_VERSION" \
-            --runtime "$RUNNER_TEMP/ezil-vm-runtime" \
-            --build "$RUNNER_TEMP/ezil-macos-build" \
-            --output "$RUNNER_TEMP/ezil-macos-dist" \
-            --no-notarize
-          dmg="$RUNNER_TEMP/ezil-macos-dist/EZiL-OS-${INTERNAL_VERSION}-AppleSilicon.dmg"
-          hdiutil verify "$dmg"
-          (cd "$(dirname "$dmg")" && shasum -a 256 "$(basename "$dmg")" > "$(basename "$dmg").sha256")
-      - name: Upload internal-test DMG
-        uses: actions/upload-artifact@v4
+          EZIL_BUILD_VERSION: 0.0.${{ github.run_number }}
+        run: npm --prefix macos-electron run package:internal
+      - uses: actions/upload-artifact@v4
         with:
-          name: EZiL-OS-AppleSilicon-internal-${{ github.run_number }}
+          name: ezil-native-${{ github.sha }}-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/ezil-macos-dist/*.dmg
-            ${{ runner.temp }}/ezil-macos-dist/*.sha256
+            macos-electron/dist/*.dmg
+            macos-electron/dist/*.sha256
+            macos-electron/dist/INVENTORY.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 14

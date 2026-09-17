@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Legacy migration/VM maintenance only. Active native packaging lives in macos-electron.
+if [ "${EZIL_LEGACY_VM_MAINTENANCE:-0}" != 1 ]; then
+    echo "Legacy VM tooling is inactive. See docs/NATIVE-MAC.md for the Electron host." >&2
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUNTIME_DIR="${1:-}"
 if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
