@@ -2,6 +2,10 @@ name: macOS Internal DMG
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "macos/**"
+      - ".github/workflows/macos-internal.yml"
 
 permissions:
   contents: read
