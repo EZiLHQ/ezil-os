@@ -431,8 +431,8 @@ struct RootView: View {
         .onAppear {
             if controller.workspace != nil, runtime.phase == .idle { controller.startWorkspace() }
         }
-        .onChange(of: runtime.phase) { phase in
-            if case .running = phase { controller.destination = .home }
+        .onChange(of: runtime.phase) {
+            if case .running = runtime.phase { controller.destination = .home }
         }
     }
 }

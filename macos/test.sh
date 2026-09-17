@@ -43,7 +43,7 @@ if grep -q -- '--auth none' "$SCRIPT_DIR/runtime/ezil-init"; then
     exit 1
 fi
 
-if rg -n 'ghcr\.io|Docker Desktop|EZIL_LOCAL_WORKSPACE|/home/neko|com\.microsoft\.VSCode' \
+if grep -En 'ghcr\.io|Docker Desktop|EZIL_LOCAL_WORKSPACE|/home/neko|com\.microsoft\.VSCode' \
     "$SCRIPT_DIR/EZiLOSApp.swift" "$SCRIPT_DIR/VirtualMachineRuntime.swift"; then
     echo "macos test: native local app still references the legacy Docker launcher" >&2
     exit 1

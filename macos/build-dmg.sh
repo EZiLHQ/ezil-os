@@ -58,8 +58,8 @@ RUNTIME_DIR="$(cd "$RUNTIME_DIR" && pwd)"
 OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/dist}"
 BUILD_DIR="${BUILD_DIR:-$SCRIPT_DIR/build}"
 APP_NAME="EZiL OS"
-APP="$BUILD_DIR/$APP_NAME.app"
 DMG_ROOT="$BUILD_DIR/dmg"
+APP="$DMG_ROOT/$APP_NAME.app"
 DMG="$OUTPUT_DIR/EZiL-OS-${VERSION}-AppleSilicon.dmg"
 PLIST_VERSION="${VERSION%%[-+]*}"
 case "$PLIST_VERSION" in
@@ -84,14 +84,19 @@ case "$BUILD_DIR" in
     *) echo "build-dmg: --build must be under macos/build, /tmp, or RUNNER_TEMP" >&2; exit 2 ;;
 esac
 mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
-rm -rf "$APP" "$DMG_ROOT"
+rm -rf "$DMG_ROOT"
 rm -f "$DMG"
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/runtime/vm" "$DMG_ROOT"
 cp "$SCRIPT_DIR/Info.plist" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $PLIST_VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${GITHUB_RUN_NUMBER:-1}" "$APP/Contents/Info.plist"
-cp "$RUNTIME_DIR/vmlinuz" "$RUNTIME_DIR/initrd.img" "$RUNTIME_DIR/rootfs.img" "$RUNTIME_DIR/manifest.json" "$APP/Contents/Resources/runtime/vm/"
+cp "$RUNTIME_DIR/vmlinuz" "$RUNTIME_DIR/initrd.img" "$RUNTIME_DIR/manifest.json" "$APP/Contents/Resources/runtime/vm/"
+# APFS clone-copy keeps the sparse VM disk from consuming another 8 GB while
+# hdiutil prepares the image. Fall back for non-APFS build directories.
+if ! cp -c "$RUNTIME_DIR/rootfs.img" "$APP/Contents/Resources/runtime/vm/rootfs.img" 2>/dev/null; then
+    cp "$RUNTIME_DIR/rootfs.img" "$APP/Contents/Resources/runtime/vm/rootfs.img"
+fi
 for optional in SHA256SUMS packages.txt Dockerfile ezil-init; do
     [ ! -f "$RUNTIME_DIR/$optional" ] || cp "$RUNTIME_DIR/$optional" "$APP/Contents/Resources/runtime/vm/"
 done
@@ -143,7 +148,6 @@ else
     codesign --verify --deep --strict --verbose=2 "$APP"
 fi
 
-cp -R "$APP" "$DMG_ROOT/"
 ln -s /Applications "$DMG_ROOT/Applications"
 hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_ROOT" -ov -format UDZO "$DMG" >/dev/null
 
