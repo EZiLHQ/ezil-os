@@ -56,6 +56,8 @@ jobs:
           tar -xzf "$RUNNER_TEMP/runtime-archive/ezil-vm-runtime.tar.gz" -C "$RUNNER_TEMP/ezil-vm-runtime"
           test ! -e "$RUNNER_TEMP/ezil-vm-runtime/CI_FIXTURE_DO_NOT_DISTRIBUTE"
           (cd "$RUNNER_TEMP/ezil-vm-runtime" && shasum -a 256 -c SHA256SUMS)
+          rm -f "$RUNNER_TEMP/runtime-archive/ezil-vm-runtime.tar.gz"
+          df -h "$RUNNER_TEMP"
       - name: Run native unit and compile tests
         shell: bash
         run: ./macos/test.sh

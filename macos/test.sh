@@ -37,6 +37,7 @@ grep -q 'EZIL_READY' "$SCRIPT_DIR/runtime/ezil-init"
 grep -q -- '--auth password' "$SCRIPT_DIR/runtime/ezil-init"
 grep -q -- '--uid 10001' "$SCRIPT_DIR/runtime/Dockerfile"
 grep -q 'initramfs-tools' "$SCRIPT_DIR/runtime/Dockerfile"
+grep -q 'truncate -s 2G' "$SCRIPT_DIR/runtime/build-runtime.sh"
 grep -q 'resize2fs /dev/vda' "$SCRIPT_DIR/runtime/ezil-init"
 grep -q -- 'setpriv --reuid=10001 --regid=10001' "$SCRIPT_DIR/runtime/ezil-init"
 if grep -q -- '--auth none' "$SCRIPT_DIR/runtime/ezil-init"; then
