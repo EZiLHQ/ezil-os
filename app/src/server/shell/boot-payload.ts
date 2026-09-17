@@ -40,7 +40,16 @@
  * per window-open, instead.
  */
 
-import type { Computer } from '@/server/db/schema';
+import type { NativeRuntime } from '../../../../native/src/contract';
+
+/** Structural input keeps this shared transport independent of database packages. */
+interface ShellComputerRecord {
+    id: string;
+    name: string;
+    slot: number;
+    createdAt: Date;
+    lastOpenedAt: Date | null;
+}
 
 /** The HTTP surface the shell talks to. Declared once; the Route Handlers live at these paths. */
 export const SHELL_API_ROUTES = {
@@ -195,7 +204,7 @@ export const SHELL_APPS: readonly ShellBootApp[] = [
 
 export interface ShellDesktopState {
     /** Runtime identity. Hosted payloads remain unchanged; local clients can report their real boundary. */
-    provider: 'cloudflare-guacamole' | 'local-vm';
+    provider: 'cloudflare-guacamole' | 'local-vm' | 'native-macos';
     /** Whether the desktop Worker is configured at all. From `cloudflareGuacamole.isConfigured`. */
     configured: boolean;
     /** Whether a signing secret is present. A configured Worker without one will reject every call. */
@@ -207,7 +216,9 @@ export interface ShellDesktopState {
      * this along only from real answers to `SHELL_API_ROUTES.desktop`.
      */
     status: 'idle';
-    endpoints: typeof SHELL_API_ROUTES;
+    endpoints: Partial<typeof SHELL_API_ROUTES>;
+    /** Present only for the trusted native Mac runtime. No credentials. */
+    runtime?: NativeRuntime;
 }
 
 export interface ShellBootPayload {
@@ -227,7 +238,7 @@ export interface DesktopProviderInfo {
     hasHmacSecret: boolean;
 }
 
-export function toShellBootComputer(computer: Computer, isNew: boolean): ShellBootComputer {
+export function toShellBootComputer(computer: ShellComputerRecord, isNew: boolean): ShellBootComputer {
     return {
         id: computer.id,
         name: computer.name,
@@ -253,7 +264,7 @@ export function toShellDesktopState(provider: DesktopProviderInfo | null): Shell
 
 export function buildShellBootPayload(input: {
     user: { id: string; email?: string | null };
-    computer: Computer;
+    computer: ShellComputerRecord;
     isNew: boolean;
     provider: DesktopProviderInfo | null;
 }): ShellBootPayload {

@@ -1,0 +1,27 @@
+{
+  "name": "ezil-native-connector",
+  "displayName": "EZiL OS Native Connector",
+  "description": "Workspace readiness and explicit loopback previews for EZiL OS on Mac.",
+  "version": "0.1.0",
+  "publisher": "ezil",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "engines": { "vscode": "^1.96.0" },
+  "main": "./dist/extension.js",
+  "extensionKind": ["ui"],
+  "activationEvents": ["onStartupFinished"],
+  "capabilities": { "untrustedWorkspaces": { "supported": false }, "virtualWorkspaces": false },
+  "contributes": {
+    "commands": [
+      { "command": "ezil.registerPreview", "title": "EZiL: Register Loopback Preview Port" },
+      { "command": "ezil.unregisterPreview", "title": "EZiL: Unregister Loopback Preview Port" },
+      { "command": "ezil.listModels", "title": "EZiL: List Broker Models" }
+    ]
+  },
+  "scripts": {
+    "build": "bun build src/extension.ts --target=node --format=cjs --external=vscode --outfile=dist/extension.js",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": { "@types/vscode": "1.96.0", "@types/node": "22.10.2", "typescript": "5.9.3" }
+}

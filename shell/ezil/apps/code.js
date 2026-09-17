@@ -130,6 +130,8 @@ async function mintCodePreviewUrl (computerId) {
 
 /** One `POST /api/shell/code-preview-url`. The loop that may call it more than once is above. */
 async function mintCodePreviewUrlOnce (computerId) {
+    const started = await session.ensureLocalDesktop(computerId);
+    if ( ! started.ok ) return started;
     const endpoint = session.payload()?.desktopState?.endpoints?.codePreviewUrl
         ?? '/api/shell/code-preview-url';
 
@@ -473,7 +475,7 @@ export async function openCodeWindow (ctx = {}) {
         const ask = async () => {
             if ( settled || disposed || my_attempt !== attempt ) return;
             asks++;
-            const seen = await session.confirmFrame(computer.id, el_iframe.src);
+            const seen = await session.confirmFrame(computer.id, el_iframe.src, 'code');
             if ( settled || disposed || my_attempt !== attempt ) return;
 
             if ( seen === undefined ) {

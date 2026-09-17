@@ -421,6 +421,18 @@ export async function openDesktop (computerId, screen) {
     return withWakeAndOneRetry(() => openDesktopOnce(computerId, screen), 'openDesktop');
 }
 
+// Local preview routes currently only mint URLs for a running container. Code
+// and Preview must pay the same cold start as Browser, even when opened first.
+const localStarts = new Map();
+export async function ensureLocalDesktop (computerId) {
+    if ( payload()?.desktopState?.provider !== 'local-vm' ) return { ok: true };
+    if ( ! localStarts.has(computerId) ) {
+        const start = openDesktop(computerId).finally(() => localStarts.delete(computerId));
+        localStarts.set(computerId, start);
+    }
+    return localStarts.get(computerId);
+}
+
 /** One `POST /api/shell/desktop`. The loop that may call it more than once is above. */
 async function openDesktopOnce (computerId, screen) {
     // 🔴 The field is OMITTED, not sent as null, when there is nothing to ask
@@ -540,6 +552,8 @@ export async function previewUrl (computerId) {
 
 /** One `POST /api/shell/preview-url`. The loop that may call it more than once is above. */
 async function previewUrlOnce (computerId) {
+    const started = await ensureLocalDesktop(computerId);
+    if ( ! started.ok ) return started;
     const res = await request(endpoint('previewUrl'), {
         method: 'POST',
         body: { computerId },
@@ -616,10 +630,11 @@ export async function focusApp (computerId, app, timeoutMs = STATUS_TIMEOUT_MS) 
  *   `undefined` = OUR request never landed, which is not an observation of the
  *   desktop and must not be read as either verdict.
  */
-export async function confirmFrame (computerId, frameUrl) {
+export async function confirmFrame (computerId, frameUrl, surface = 'desktop') {
     if ( ! computerId || ! frameUrl ) return undefined;
     const url = `${endpoint('desktop')}?computerId=${encodeURIComponent(computerId)}`
-        + `&confirm=frame&frameUrl=${encodeURIComponent(frameUrl)}`;
+        + `&confirm=frame&frameUrl=${encodeURIComponent(frameUrl)}`
+        + (payload()?.desktopState?.provider === 'local-vm' ? `&surface=${encodeURIComponent(surface)}` : '');
     const res = await request(url, { timeoutMs: STATUS_TIMEOUT_MS });
     if ( ! res.ok ) return undefined;
     if ( res.data?.ok !== true ) return undefined;
@@ -1038,7 +1053,7 @@ export default {
     get, set, del,
     payload,
     readSession, openSession,
-    openDesktop, desktopRunning, confirmFrame, confirmDisplay,
+    openDesktop, ensureLocalDesktop, desktopRunning, confirmFrame, confirmDisplay,
     previewUrl, focusApp,
     restartEndpoint, restartDesktop,
     activityEndpoint, reportActivity, releaseDesktop,

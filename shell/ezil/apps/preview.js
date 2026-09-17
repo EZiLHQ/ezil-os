@@ -371,7 +371,7 @@ export async function openPreviewWindow (ctx = {}) {
         const ask = async () => {
             if ( settled || disposed || my_attempt !== attempt ) return;
             asks++;
-            const seen = await session.confirmFrame(computer.id, el_iframe.src);
+            const seen = await session.confirmFrame(computer.id, el_iframe.src, 'preview');
             if ( settled || disposed || my_attempt !== attempt ) return;
 
             if ( seen === undefined ) {
