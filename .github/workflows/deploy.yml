@@ -175,10 +175,22 @@ jobs:
     name: deploy worker
     runs-on: ubuntu-latest
     needs: image
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with: { bun-version: latest }
+      # worker/Dockerfile FROMs the private neko base image. Wrangler asks the
+      # local Docker daemon to build it even for a container deploy, so this
+      # runner must authenticate independently of the preceding `image` job.
+      - name: Log in to GHCR for the container base image
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
       - name: Install
         working-directory: worker
         run: bun install --frozen-lockfile
@@ -216,37 +228,21 @@ jobs:
       # — it is a devDependency of `worker/`, so the lockfile already pins it.
       - name: Install Vercel CLI
         run: npm install --global vercel@59
-      # `pull` -> `build` -> `deploy --prebuilt` is Vercel's documented shape for
-      # deploying from CI, and it is the right one here for a specific reason:
-      # the artifact that goes live is the one THIS runner built, from the same
-      # tree the checks above just passed against. A bare `vercel --prod`
-      # uploads source and rebuilds it on Vercel, which is a second, unverified
-      # build of the same commit.
-      # ⚠️ FIRST RUN ONLY: these commands run from `app/`, so the Vercel
-      # project's Root Directory must be the repository root, not `app`. If it
-      # is set to `app`, `vercel build` looks for `app/app` and fails. Check
-      # `rootDirectory` in `app/.vercel/project.json` after the pull below.
-      - name: Pull Vercel environment
-        working-directory: app
+      # Upload this checked-out source and build it inside Vercel. Several of
+      # the app's production variables are Vercel Sensitive values: `vercel
+      # pull` intentionally replaces those with `[SENSITIVE]`, so a GitHub-side
+      # `vercel build` cannot parse the URL values and is not a valid deployment
+      # path. Vercel's remote builder receives the real protected values.
+      #
+      # This is a monorepo: the Vercel project's Root Directory is `app`, while
+      # the CLI runs from the repository root. The remote setting is shared by
+      # Git previews and this production command.
+      - name: Build and deploy on Vercel
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
-      - name: Build
-        working-directory: app
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: vercel build --prod --token="$VERCEL_TOKEN"
-      - name: Deploy
-        working-directory: app
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN"
+        run: vercel deploy --yes --prod --token="$VERCEL_TOKEN"
 
   verify:
     name: verify against production
@@ -368,6 +364,31 @@ jobs:
             echo "${out}"
             echo "EZIL_WORKER_ID_EOF"
           } >> "$GITHUB_OUTPUT"
+
+      # release.yml builds the DMG on a macOS runner in a separate workflow.
+      # Do not win that race and publish a release while its installer is
+      # still missing. The DMG job itself requires real signing + notarization
+      # credentials, so this also keeps an unsigned fallback from becoming a
+      # public release by accident.
+      - name: Wait for the signed macOS installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          expected="EZiL-OS-${version}-macOS.dmg"
+          attempt=0
+          while [ "$attempt" -lt 180 ]; do
+            assets="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+            if printf '%s\n' "$assets" | grep -Fxq "$expected"; then
+              echo "[release] signed macOS asset is present: $expected"
+              exit 0
+            fi
+            attempt=$((attempt + 1))
+            sleep 10
+          done
+          echo "::error::release.yml did not attach $expected within 30 minutes; refusing to publish an incomplete release" >&2
+          exit 1
 
       # 🔴 If `verify` failed, this job never runs at all (`needs: verify`) —
       # the draft release.yml created stays a draft, visibly unreleased. Only

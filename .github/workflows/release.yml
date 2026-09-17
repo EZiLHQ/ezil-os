@@ -1,9 +1,10 @@
-# Release — build the downloadable local-mode tarball and open a GitHub
-# Release for it as a DRAFT, with checksums and a build-provenance attestation.
+# Release — build the downloadable local-mode tarball plus signed/notarized
+# macOS DMG and open a GitHub Release as a DRAFT, with checksums and build
+# provenance attestations.
 #
 # This is deliberately separate from `image.yml` (which publishes the
 # container images) and `deploy.yml` (which deploys the hosted product): the
-# artifact here is something a person downloads and runs on their own laptop.
+# artifacts here are what a person downloads and runs on their own laptop.
 #
 # 🔴 THIS WORKFLOW NEVER PUBLISHES WHAT IT CREATES. `gh release create` below
 # passes `--draft`, on purpose: a release visible to the public is a claim
@@ -49,6 +50,9 @@ jobs:
   release:
     name: release
     runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.tag.outputs.tag }}
+      release_version: ${{ steps.tag.outputs.version }}
     steps:
       # fetch-tags: the workflow_dispatch path needs to check out a tag that
       # is not the ref this run started on; fetch-depth 0 alone does not
@@ -139,45 +143,9 @@ jobs:
           set -euo pipefail
           root="ezil-os-${RELEASE_TAG}"
           stage="$(mktemp -d)/${root}"
-          mkdir -p "${stage}"
-
-          # local/ — sources + package.json + bun.lock. NO node_modules: it
-          # has zero runtime dependencies (only @types/bun and typescript as
-          # devDependencies, both type-only), so `bun run --cwd local start`
-          # needs no `bun install` at all — verified against an extracted
-          # copy of this exact layout before this row was reported done.
-          mkdir -p "${stage}/local"
-          cp -R local/src "${stage}/local/src"
-          # A handful of *.test.ts are colocated with their sources rather
-          # than under local/tests/ (the container/browser suites T5 added).
-          # Two of them import app/src/... AS VALUES for their own assertion
-          # (not `import type`), which is not in this tarball — nothing runs
-          # a .test.ts here, so this is not a functional break, but shipping
-          # a file that cannot resolve its own import is not "sources" either.
-          find "${stage}/local/src" -name '*.test.ts' -delete
-          cp local/package.json local/bun.lock "${stage}/local/"
-
-          # worker/src/{desktop-mode,screen-modes}.ts — NOT in the row brief's
-          # tarball list, added because local/'s own runtime imports them by
-          # relative path (local/src/container/run-spec.ts and
-          # local/src/server/routes.ts both `from '../../../worker/src/...'`,
-          # real values — portFor, fitScreenRequest — not types). Without
-          # these two files `bun run --cwd local doctor` fails to resolve a
-          # module on the very first line. Both are leaf files with no
-          # imports of their own (confirmed: `bun build --target=bun` on
-          # both local/ entry points resolves cleanly with exactly these two
-          # files pulled in from outside local/ and app/public/os/).
-          mkdir -p "${stage}/worker/src"
-          cp worker/src/desktop-mode.ts worker/src/screen-modes.ts "${stage}/worker/src/"
-
-          mkdir -p "${stage}/app/public/os"
-          cp app/public/os/bundle.min.js app/public/os/bundle.min.css app/public/os/icons.js "${stage}/app/public/os/"
-
-          mkdir -p "${stage}/deploy/launcher"
-          cp deploy/images.env "${stage}/deploy/"
-          cp deploy/launcher/ezil-os.sh deploy/launcher/ezil-os.ps1 deploy/launcher/README.md "${stage}/deploy/launcher/"
-
-          cp LICENSE NOTICE ATTRIBUTIONS.md "${stage}/"
+          # The native macOS app calls this same staging script. One file list
+          # prevents the tarball and DMG from shipping different runtimes.
+          ./deploy/stage-local-runtime.sh "${stage}"
 
           # `|| true` at the end, not inside the pipe: under pipefail, a key
           # that is simply ABSENT (grep matches nothing, exit 1) would
@@ -319,4 +287,89 @@ jobs:
             echo "| \`SHA256SUMS\` |"
             echo
             echo "Provenance attestation: ${ATTESTATION_URL}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  macos-dmg:
+    name: signed + notarized macOS DMG
+    runs-on: macos-latest
+    needs: release
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.release_tag }}
+
+      - name: Require every Apple distribution secret
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for key in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [[ -z "$(printenv "$key" || true)" ]]; then
+              echo "::error::$key is required; release builds never publish an unsigned or unnotarized DMG" >&2
+              exit 1
+            fi
+          done
+
+      - name: Import the Developer ID certificate
+        uses: apple-actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Build, sign, and notarize the DMG
+        id: dmg
+        env:
+          RELEASE_VERSION: ${{ needs.release.outputs.release_version }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          ./macos/build-dmg.sh \
+            --version "$RELEASE_VERSION" \
+            --build "$RUNNER_TEMP/ezil-macos-build" \
+            --output "$RUNNER_TEMP/ezil-macos-dist" \
+            --require-signing
+          dmg="$RUNNER_TEMP/ezil-macos-dist/EZiL-OS-${RELEASE_VERSION}-macOS.dmg"
+          test -f "$dmg"
+          echo "path=$dmg" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$dmg")" >> "$GITHUB_OUTPUT"
+
+      - name: Attest provenance — macOS DMG
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.dmg.outputs.path }}
+
+      - name: Add the DMG and its checksum to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
+          DMG_PATH: ${{ steps.dmg.outputs.path }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/checksums"
+          gh release download "$RELEASE_TAG" --pattern SHA256SUMS --dir "$RUNNER_TEMP/checksums"
+          (
+            cd "$(dirname "$DMG_PATH")"
+            shasum -a 256 "$(basename "$DMG_PATH")"
+          ) >> "$RUNNER_TEMP/checksums/SHA256SUMS"
+          # Upload the DMG LAST. deploy.yml uses its presence as the readiness
+          # signal, so seeing it also proves the checksum replacement finished.
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/checksums/SHA256SUMS" --clobber
+          gh release upload "$RELEASE_TAG" "$DMG_PATH"
+
+      - name: Job summary
+        env:
+          DMG_NAME: ${{ steps.dmg.outputs.name }}
+        run: |
+          {
+            echo "### macOS installer"
+            echo
+            echo "Signed, notarized, stapled, and uploaded: \`${DMG_NAME}\`"
           } >> "$GITHUB_STEP_SUMMARY"

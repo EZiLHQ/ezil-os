@@ -82,7 +82,9 @@ tag = "v1"
 [[r2_buckets]]
 binding = "SANDBOX_WORKSPACE_R2_BUCKET"
 bucket_name = "ezil-sandbox-workspaces"
-experimental_remote = true
+# Keep local development and CI deterministic and credential-free. This flag
+# affects only `wrangler dev`; deployed Workers still receive the real bucket.
+remote = false
 
 # ── R2 bucket binding (fleet crash-telemetry spool) ───────────────────────────
 # Backs the boot-phase/crash telemetry pipeline (see
@@ -98,7 +100,8 @@ experimental_remote = true
 [[r2_buckets]]
 binding = "TELEMETRY_R2_BUCKET"
 bucket_name = "ezil-telemetry-spool"
-experimental_remote = true
+# See the workspace binding above. Production deployment is unaffected.
+remote = false
 
 [dev]
 port = 8787

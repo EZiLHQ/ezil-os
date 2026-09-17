@@ -8,6 +8,7 @@ node_modules
 dist/
 dist-ssr/
 dist-electron/
+macos/build/
 # ...the workspace bootstrap the Docker image COPYs at build time
 !worker/bootstrap/dist
 !worker/bootstrap/dist/workspace-bootstrap.mjs
@@ -19,6 +20,7 @@ dist-electron/
 app/.next/
 app/next-env.d.ts
 app/tsconfig.tsbuildinfo
+.vercel/
 
 # Test reports written INTO the checkout rather than into a temp directory.
 # `.github/workflows/ci.yml`'s worker job runs

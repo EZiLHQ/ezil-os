@@ -768,3 +768,41 @@ jobs:
             echo "::error::a container named ezil-os-* is still present after the suite run above - teardown did not happen. See the docker ps -a output above."
             exit 1
           fi
+
+  macos-installer:
+    name: macOS installer (compile + unsigned DMG smoke)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Runtime staging and wrapper contract
+        shell: bash
+        run: ./macos/test.sh
+      - name: Compile the native app and verify the DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./macos/build-dmg.sh \
+            --version 0.0.0 \
+            --build "$RUNNER_TEMP/ezil-macos-build" \
+            --output "$RUNNER_TEMP/ezil-macos-dist" \
+            --no-notarize
+          dmg="$RUNNER_TEMP/ezil-macos-dist/EZiL-OS-0.0.0-macOS.dmg"
+          test -f "$dmg"
+          hdiutil verify "$dmg"
+          (
+            cd "$(dirname "$dmg")"
+            shasum -a 256 "$(basename "$dmg")" > "$(basename "$dmg").sha256"
+          )
+      - name: Upload internal-test DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: EZiL-OS-macOS-internal-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ezil-macos-dist/*.dmg
+            ${{ runner.temp }}/ezil-macos-dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

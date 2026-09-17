@@ -9,13 +9,21 @@ Releases are cut by tagging `v*`, which triggers
 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) (deploys, then
 runs the production suites against what it deployed) and
 [`.github/workflows/release.yml`](.github/workflows/release.yml) (builds the
-downloadable local-mode tarball and opens a GitHub Release for it as a
-**draft**) side by side. `deploy.yml` publishes that draft — only once its own
+downloadable local-mode tarball plus signed/notarized macOS DMG and opens a
+GitHub Release for them as a **draft**) side by side. `deploy.yml` publishes that draft — only once its own
 production suites pass — so a green deploy that was never verified is not a
 release here, and neither is a release whose tarball built but whose deploy
 did not. See [`docs/RELEASE.md`](docs/RELEASE.md) for the full mechanics.
 
 ## [Unreleased]
+
+### Added
+
+- **Native macOS installer.** A universal Swift wrapper starts and stops the
+  existing local launcher, embeds the loopback remote desktop, and lets the
+  user select a Mac folder that is bind-mounted read/write at
+  `/home/neko/project`. The release workflow signs, notarizes, staples,
+  attests, and checksums the DMG, and refuses to publish an unsigned fallback.
 
 ## [0.2.0] - 2026-09-04
 

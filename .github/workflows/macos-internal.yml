@@ -1,0 +1,56 @@
+name: macOS Internal DMG
+
+on:
+  workflow_dispatch:
+
+# This workflow intentionally produces an ad-hoc-signed test build. It needs
+# no Apple ID, certificate, notarization credential, or repository secret.
+# Public/tagged releases continue to use release.yml and fail closed unless a
+# real Developer ID Application certificate and notarization credentials exist.
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-internal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dmg:
+    name: build ad-hoc DMG
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Verify the wrapper and staged runtime
+        shell: bash
+        run: ./macos/test.sh
+      - name: Build and verify the ad-hoc DMG
+        shell: bash
+        env:
+          INTERNAL_VERSION: 0.0.${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          ./macos/build-dmg.sh \
+            --version "${INTERNAL_VERSION}" \
+            --build "$RUNNER_TEMP/ezil-macos-build" \
+            --output "$RUNNER_TEMP/ezil-macos-dist" \
+            --no-notarize
+          dmg="$RUNNER_TEMP/ezil-macos-dist/EZiL-OS-${INTERNAL_VERSION}-macOS.dmg"
+          test -f "$dmg"
+          hdiutil verify "$dmg"
+          (
+            cd "$(dirname "$dmg")"
+            shasum -a 256 "$(basename "$dmg")" > "$(basename "$dmg").sha256"
+          )
+      - name: Upload internal-test DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: EZiL-OS-macOS-internal-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/ezil-macos-dist/*.dmg
+            ${{ runner.temp }}/ezil-macos-dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

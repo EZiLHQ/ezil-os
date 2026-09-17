@@ -91,6 +91,11 @@ bun run --cwd local start
 Then open `http://127.0.0.1:7080/os`. See
 [`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md) for the environment variables, the
 port map, what the doctor checks, and what is (and is not) proven about it.
+On macOS, the same runtime can be packaged as a native folder-picking,
+start/stop wrapper with `macos/build-dmg.sh`; tagged releases are wired to
+attach the signed and notarized DMG. Maintainers without an Apple Developer
+subscription can use the manual **macOS Internal DMG** Actions workflow to
+download an ad-hoc-signed test build instead.
 The rest of this section is about the hosted path, which needs real cloud
 accounts.
 
