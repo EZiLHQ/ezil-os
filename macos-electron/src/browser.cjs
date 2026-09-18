@@ -1,105 +1,116 @@
 'use strict';
 const path = require('node:path');
-const fs = require('node:fs');
-const { pathToFileURL } = require('node:url');
-const { BrowserWindow, WebContentsView, session, dialog } = require('electron');
-const { browserURL, browserRequestURL, partition, lockSession, lockRemote } = require('./policy.cjs');
-const { atomic, readJSON, privateDir } = require('./files.cjs');
-const TOP = 108;
+const { browserURL, browserRequestURL, lockSession, lockRemote, exact, uuid } = require('./policy.cjs');
+const { privateDir } = require('./files.cjs');
+function bounds(value, size) {
+  exact(value, ['x', 'y', 'width', 'height']);
+  if (['x', 'y', 'width', 'height'].some(k => !Number.isFinite(value[k]))) throw Error('Invalid bounds');
+  const [width, height] = size, x = Math.min(width, Math.max(0, Math.round(value.x))), y = Math.min(height, Math.max(0, Math.round(value.y)));
+  return { x, y, width: Math.max(0, Math.min(width - x, Math.round(value.width))), height: Math.max(0, Math.min(height - y, Math.round(value.height))) };
+}
+function scaleBounds(value, factor) {
+  if (!Number.isFinite(factor) || factor < 0.25 || factor > 5) throw Error('Invalid zoom factor');
+  return Object.fromEntries(['x', 'y', 'width', 'height'].map(key => [key, value[key] * factor]));
+}
+function browserSchema(input) {
+  const fields = { create: ['bounds'], navigate: ['url'], back: [], forward: [], reload: [], focus: [], layout: ['bounds'], visibility: ['visible'], destroy: [], hide: [], snapshot: [], restore: [] };
+  if (!input || !Object.hasOwn(fields, input.op)) throw Error('Invalid browser operation');
+  exact(input, ['op', 'workspaceId', 'generation', 'sequence', 'viewId', ...fields[input.op], ...(input.op === 'create' && input.url !== undefined ? ['url'] : [])]);
+  uuid(input.workspaceId);
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(input.viewId) || typeof input.generation !== 'string' || !Number.isSafeInteger(input.sequence) || input.sequence < 1) throw Error('Invalid browser identity');
+  if (input.op === 'navigate' || (input.op === 'create' && input.url !== undefined)) browserURL(input.url);
+  if (['create', 'layout'].includes(input.op)) bounds(input.bounds, [10000, 10000]);
+  if (input.op === 'visibility' && typeof input.visible !== 'boolean') throw Error('Invalid visibility');
+  return input;
+}
 class Browser {
-  constructor(workspace, register, onClose) {
-    this.workspace = workspace; this.tabs = []; this.active = 0;
-    this.stateFile = path.join(workspace.browser, 'tabs.json');
-    // fromPath creates an isolated persistent Chromium session, located inside
-    // the inventoried workspace. It never uses Chrome/Safari/WebKit profiles.
-    this.partition = partition(workspace.id);
+  constructor(workspace, window, generation, { WebContentsView, session } = require('electron'), { offline = false } = {}) {
+    this.workspace = workspace; this.window = window; this.generation = generation; this.sequence = 0; this.views = new Map(); this.closed = false;
     this.session = session.fromPath(privateDir(path.join(workspace.browser, 'profile')));
     lockSession(this.session);
-    this.session.webRequest.onBeforeRequest((details, callback) => {
-      try { browserRequestURL(details.url); callback({}); } catch { callback({ cancel: true }); }
-    });
-    this.window = new BrowserWindow({ title: 'EZiL Browser', width: 1200, height: 850, webPreferences: { preload: path.join(__dirname, 'preload.cjs'), sandbox: true, contextIsolation: true, nodeIntegration: false } });
-    const toolbarURL = pathToFileURL(path.join(__dirname, '../ui/browser.html')).href;
-    register(this.window.webContents, toolbarURL, 'browser', this);
-    lockRemote(this.window.webContents);
-    this.window.webContents.on('will-navigate', event => event.preventDefault());
-    this.window.loadURL(toolbarURL).catch(() => {});
-    this.window.on('resize', () => this.layout());
-    this.window.on('closed', () => {
-      this.persist(); for (const tab of this.tabs) tab.view.webContents.close();
-      this.session.removeListener('will-download', this.downloadHandler);
-      onClose();
-    });
-    this.downloadHandler = async (event, item, wc) => {
-      // Cancel automatic downloads. User approves a URL first; the explicit
-      // replacement download receives a save dialog and is never auto-opened.
-      const downloadURL = item.getURL();
-      if (this.approvedDownload === downloadURL) {
-        this.approvedDownload = null;
-        item.setSaveDialogOptions({ title: 'Save browser download', defaultPath: path.basename(item.getFilename()).replace(/[\x00-\x1f]/g, '_') });
-        return;
-      }
-      event.preventDefault();
-      if (!this.tabs.some(tab => tab.view.webContents === wc)) return;
-      let url; try { url = browserURL(downloadURL); } catch { return; }
-      const answer = await dialog.showMessageBox(this.window, { type: 'question', message: 'Download this file?', detail: new URL(url).origin, buttons: ['Cancel', 'Choose save location'], defaultId: 0, cancelId: 0 });
-      if (answer.response === 1 && !this.window.isDestroyed()) { this.approvedDownload = url; wc.downloadURL(url); }
+    this.session.webRequest.onBeforeRequest((details, callback) => { try { browserRequestURL(details.url); if (offline && !['127.0.0.1', '[::1]', 'localhost'].includes(new URL(details.url).hostname)) throw Error('Offline smoke'); callback({}); } catch { callback({ cancel: true }); } });
+    this.downloadHandler = (_event, item) => {
+      const filename = path.basename(item.getFilename() || 'download');
+      const directory = privateDir(path.join(workspace.files, 'Downloads'));
+      item.setSaveDialogOptions({ defaultPath: path.join(directory, filename) });
     };
     this.session.on('will-download', this.downloadHandler);
-    let saved; try { saved = readJSON(this.stateFile); } catch { saved = null; }
-    for (const url of (Array.isArray(saved?.urls) ? saved.urls.slice(0, 20) : [])) { try { this.add(browserURL(url)); } catch { /* Drop invalid persisted URL. */ } }
-    if (!this.tabs.length) this.add();
-    this.select(Math.min(Number.isInteger(saved?.active) ? Math.max(saved.active, 0) : 0, this.tabs.length - 1));
+    this.WebContentsView = WebContentsView;
+    this.resize = () => { for (const item of this.views.values()) item.view.setBounds(bounds(item.bounds, this.window.getContentSize())); };
+    this.dispose = () => { void this.close().catch(() => {}); };
+    window.on('resize', this.resize); window.once('closed', this.dispose);
+    window.webContents.once('destroyed', this.dispose);
+    // Reload destroys all native children; a new shell must explicitly recreate them.
+    this.navigation = (_event, _url, _inPlace, mainFrame) => { if (mainFrame) this.clear(); };
+    window.webContents.on('did-start-navigation', this.navigation);
   }
-  add(url) {
-    if (this.tabs.length >= 20) throw Error('Tab limit reached');
-    const view = new WebContentsView({ webPreferences: { session: this.session, sandbox: true, contextIsolation: true, nodeIntegration: false, webSecurity: true, allowRunningInsecureContent: false } });
-    lockRemote(view.webContents);
-    const tab = { view, url: '', title: 'New tab' }; this.tabs.push(tab);
-    view.webContents.on('did-navigate', (_event, target) => { try { tab.url = browserURL(target); this.persist(); } catch {} });
-    view.webContents.on('page-title-updated', (_event, title) => { tab.title = title.slice(0, 120); });
-    view.webContents.on('did-fail-load', () => { tab.title = 'Page unavailable'; });
-    if (url) { tab.url = browserURL(url); view.webContents.loadURL(tab.url).catch(() => {}); }
-    this.select(this.tabs.length - 1); this.persist();
+  attach(item) {
+    const attached = this.window.contentView.children.includes(item.view);
+    const visible = item.visible && !item.occluded;
+    if (visible && !attached) this.window.contentView.addChildView(item.view);
+    if (!visible && attached) this.window.contentView.removeChildView(item.view);
+    item.view.setVisible(visible);
   }
-  select(index) {
-    if (!this.tabs[index]) throw Error('Tab not found');
-    for (const tab of this.tabs) if (this.window.contentView.children.includes(tab.view)) this.window.contentView.removeChildView(tab.view);
-    this.active = index; this.window.contentView.addChildView(this.tabs[index].view); this.layout(); this.persist();
-  }
-  layout() { if (this.window.isDestroyed()) return; const [width, height] = this.window.getContentSize(); this.tabs[this.active]?.view.setBounds({ x: 0, y: TOP, width, height: Math.max(0, height - TOP) }); }
-  persist() { if (fs.existsSync(this.workspace.browser)) atomic(this.stateFile, JSON.stringify({ urls: this.tabs.map(t => t.url).filter(Boolean), active: this.active })); }
-  state() { const wc = this.tabs[this.active]?.view.webContents; return { partition: this.partition, active: this.active, tabs: this.tabs.map(t => ({ url: t.url, title: t.title })), back: wc?.navigationHistory.canGoBack() || false, forward: wc?.navigationHistory.canGoForward() || false }; }
-  action(input) {
-    const wc = this.tabs[this.active]?.view.webContents;
-    switch (input.action) {
-      case 'new': this.add(input.url); break;
-      case 'select': this.select(input.tab); break;
-      case 'close': {
-        const tab = this.tabs[input.tab]; if (!tab) throw Error('Tab not found');
-        if (this.window.contentView.children.includes(tab.view)) this.window.contentView.removeChildView(tab.view);
-        tab.view.webContents.close(); this.tabs.splice(input.tab, 1); this.active = 0;
-        if (!this.tabs.length) this.add(); else this.select(0); break;
+  async operation(raw) {
+    const input = browserSchema(raw);
+    if (this.closed || this.window.isDestroyed() || input.workspaceId !== this.workspace.id || input.generation !== this.generation || input.sequence <= this.sequence) throw Error('Stale browser operation');
+    this.sequence = input.sequence;
+    let item = this.views.get(input.viewId);
+    if (input.op === 'create') {
+      if (item || this.views.size >= 20) throw Error('View limit or duplicate');
+      const view = new this.WebContentsView({ webPreferences: { session: this.session, sandbox: true, contextIsolation: true, nodeIntegration: false, webSecurity: true, allowRunningInsecureContent: false } });
+      lockRemote(view.webContents);
+      item = { view, bounds: input.bounds, visible: true, occluded: false, snapshot: null, revision: input.sequence };
+      this.views.set(input.viewId, item);
+      view.webContents.once('destroyed', () => { if (this.views.get(input.viewId) === item) this.destroy(input.viewId); });
+      view.setBounds(bounds(item.bounds, this.window.getContentSize())); this.attach(item);
+      try {
+        if (input.url !== undefined) await view.webContents.loadURL(browserURL(input.url));
+        if (this.closed || this.views.get(input.viewId) !== item || item.revision !== input.sequence) throw Error('Stale create');
+        return { state: 'created' };
+      } catch {
+        if (this.views.get(input.viewId) === item) this.destroy(input.viewId);
+        throw Error('Browser creation failed');
       }
-      case 'navigate': wc.loadURL(browserURL(input.url)).catch(() => {}); break;
-      case 'back': if (wc.navigationHistory.canGoBack()) wc.navigationHistory.goBack(); break;
-      case 'forward': if (wc.navigationHistory.canGoForward()) wc.navigationHistory.goForward(); break;
-      case 'reload': wc.reload(); break;
-      case 'devtools': wc.openDevTools({ mode: 'detach' }); break;
     }
-    this.persist(); return this.state();
+    if (!item) throw Error('Unknown view');
+    item.revision = input.sequence;
+    switch (input.op) {
+      case 'navigate': item.snapshot = null; await item.view.webContents.loadURL(browserURL(input.url)); break;
+      case 'back': if (item.view.webContents.navigationHistory?.canGoBack()) item.view.webContents.navigationHistory.goBack(); break;
+      case 'forward': if (item.view.webContents.navigationHistory?.canGoForward()) item.view.webContents.navigationHistory.goForward(); break;
+      case 'reload': item.view.webContents.reload(); break;
+      case 'focus': if (item.visible && !item.occluded) item.view.webContents.focus(); break;
+      case 'layout': item.bounds = input.bounds; this.resize(); break;
+      case 'visibility': item.visible = input.visible; this.attach(item); break;
+      case 'destroy': this.destroy(input.viewId); break;
+      case 'hide': item.occluded = true; item.snapshot = null; this.attach(item); break;
+      case 'snapshot': {
+        const image = await item.view.webContents.capturePage();
+        if (this.closed || this.views.get(input.viewId) !== item || item.revision !== input.sequence) throw Error('Stale snapshot');
+        const snapshot = image.resize({ width: Math.min(1600, Math.max(1, item.view.getBounds().width)) }).toDataURL();
+        item.snapshot = snapshot.length <= 2_000_000 ? snapshot : null;
+        item.occluded = true; this.attach(item);
+        return { state: 'hidden', ...(item.snapshot ? { snapshot: item.snapshot } : {}) };
+      }
+      case 'restore': item.snapshot = null; item.occluded = false; this.attach(item); break;
+    }
+    return { state: input.op === 'hide' ? 'hidden' : 'updated' };
   }
-  focus(url) { if (url) this.add(browserURL(url)); this.window.show(); this.window.focus(); }
-  close() {
-    if (this.window.isDestroyed()) return Promise.resolve();
-    return new Promise(resolve => { this.window.once('closed', resolve); this.window.close(); });
+  destroy(id) {
+    const item = this.views.get(id); if (!item) return;
+    this.views.delete(id); item.snapshot = null;
+    if (!this.window.isDestroyed() && this.window.contentView.children.includes(item.view)) this.window.contentView.removeChildView(item.view);
+    if (!item.view.webContents.isDestroyed()) item.view.webContents.close();
   }
-  async retire() {
-    await this.close();
+  clear() { for (const id of [...this.views.keys()]) this.destroy(id); }
+  async close() {
+    if (this.closed) return; this.closed = true; this.clear();
+    this.window.removeListener('resize', this.resize); this.window.removeListener('closed', this.dispose);
+    this.window.webContents.removeListener('destroyed', this.dispose); this.window.webContents.removeListener('did-start-navigation', this.navigation);
+    this.session.removeListener('will-download', this.downloadHandler);
     await this.session.closeAllConnections();
-    await this.session.clearStorageData();
-    await this.session.clearCache();
-    this.session.flushStorageData();
   }
+  async retire() { await this.close(); await this.session.clearStorageData(); await this.session.clearCache(); }
 }
-module.exports = { Browser, TOP };
+module.exports = { Browser, bounds, scaleBounds, browserSchema };

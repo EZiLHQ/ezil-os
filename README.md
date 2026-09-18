@@ -74,8 +74,8 @@ into from any tab, rather than a box tied to one desk.
   - [x] An optional MCP connector — [`mcp/`](mcp/README.md)
   - [ ] Both published to npm
 - [x] Run it anywhere
-  - [x] Apple Silicon app with a managed ARM Linux workspace, native browser,
-        guest profile, and no cloud sign-in ([`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md))
+  - [x] Apple Silicon app with the shared EZiL shell, embedded editor, Chromium
+        browser, guest profile, and no cloud sign-in ([`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md))
   - [x] Legacy Docker/Bun local host for Linux, Windows, and development
   - [x] Signed images on GHCR — keyless cosign signature plus build provenance
   - [x] CI on Linux, Windows and macOS
@@ -84,11 +84,13 @@ into from any tab, rather than a box tied to one desk.
 
 ### Run it locally on Apple Silicon
 
-Download `EZiL-OS-<version>-AppleSilicon.dmg`, drag the app to Applications,
-and choose **Continue as Guest**. The installer contains the Linux runtime and
-Code OSS backend; Docker Desktop, Bun, and an EZiL account are not required.
-Projects are copied into an app-managed workspace and leave it only through an
-explicit export.
+Download the internal `EZiL-OS-<version>-AppleSilicon-internal.dmg`, drag the
+app to Applications, and approve the local guest workspace. The installer
+contains the shared desktop shell, Bun helper, embedded code-server workbench,
+and Chromium host; Docker Desktop, a separate Bun install, and an EZiL account
+are not required. Commands and extensions run directly with the Mac user's
+permissions, so this mode is trusted native development rather than a VM
+sandbox.
 
 ### Run the legacy Docker host
 

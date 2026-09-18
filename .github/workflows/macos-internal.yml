@@ -8,6 +8,8 @@ on:
       - 'native/**'
       - 'extensions/ezil-vscode/**'
       - 'app/public/os/**'
+      - 'local/src/boot/**'
+      - 'shell/**'
       - '.github/workflows/macos-internal.yml'
 
 permissions:
@@ -20,12 +22,14 @@ concurrency:
 jobs:
   dmg:
     name: exact shared shell + Electron Apple Silicon DMG
-    # Standard macos-14 is Apple Silicon for public repositories.
+    # Standard hosted macos-15 is Apple Silicon for public repositories.
     # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
-    runs-on: macos-14
-    timeout-minutes: 30
+    runs-on: macos-15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: '24.15.0'
@@ -50,12 +54,19 @@ jobs:
           git diff --exit-code -- extensions/ezil-vscode/dist/extension.js
           npm --prefix macos-electron run check
           npm --prefix macos-electron test
-          bash macos/test.sh
           npm --prefix macos-electron run test:electron
       - name: Package and verify internal ad-hoc DMG
         env:
           EZIL_BUILD_VERSION: 0.0.${{ github.run_number }}
         run: npm --prefix macos-electron run package:internal
+      - name: Mandatory packaged offline guest smoke
+        run: bash macos-electron/scripts/physical-smoke.sh macos-electron/dist "$RUNNER_TEMP/native-offline-evidence"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-offline-evidence-${{ github.sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/native-offline-evidence
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: ezil-native-${{ github.sha }}-${{ github.run_id }}
@@ -63,6 +74,7 @@ jobs:
             macos-electron/dist/*.dmg
             macos-electron/dist/*.sha256
             macos-electron/dist/INVENTORY.json
+            macos-electron/dist/SBOM.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 14

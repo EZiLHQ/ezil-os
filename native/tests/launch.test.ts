@@ -16,7 +16,7 @@ test('Electron launch consumes the admin capability and accepts an attached work
     const line = readyLine(49152);
     expect(line.split('\n')).toHaveLength(1);
     expect(line.startsWith('EZIL_NATIVE_READY ')).toBe(true);
-    expect(JSON.parse(line.slice('EZIL_NATIVE_READY '.length))).toEqual({ contractVersion: 1, port: 49152, capabilities: NATIVE_RUNTIME });
+    expect(JSON.parse(line.slice('EZIL_NATIVE_READY '.length))).toEqual({ contractVersion: 2, port: 49152, capabilities: NATIVE_RUNTIME });
     expect(line).not.toContain(token);
     expect(line).not.toContain('/tmp');
 });

@@ -1,188 +1,141 @@
-# Native runtime v1
+# Native runtime contract v2
 
-This helper runs trusted code on the Mac account. It is **not containment**.
-`src/contract.ts` defines the shared contract and rejects unknown operation
-fields. Runtime values are `contractVersion=1`, `executionTarget=macos-host`,
-`isolation=trusted-native`, `editor=external-vscode`, `browser=native-chromium`,
-and `cloudSync=false`. Hosted payloads retain their existing values and shapes.
+The shared `/os` shell retains its app registry, UIWindow chrome and Settings
+tabs. Code embeds code-server; Preview embeds a registered local port; Browser
+places a host Chromium view inside the existing Browser window. Programs run
+with the Mac account's permissions. This runtime is not a containment boundary.
 
-## Electron startup and authentication
-
-1. Generate a fresh 32-byte random base64url or hex `EZIL_NATIVE_ADMIN_CAPABILITY`. Supply it
-   and an absolute `EZIL_NATIVE_DATA_ROOT` only in the helper's inherited
-   environment. Spawn `bun run native/src/main.ts` from the repository/package
-   root. Do not pass secrets in arguments. The helper emits exactly one ready
-   line: `EZIL_NATIVE_READY {"contractVersion":1,"port":<number>,"capabilities":{...}}`.
-   The capabilities are exactly `NATIVE_RUNTIME` from `src/contract.ts`. The
-   admin environment entry is consumed at startup and never printed. Optional
-   `EZIL_NATIVE_BROKER_FILE` is reserved for Electron's model broker: the helper
-   does not read the descriptor or include it in any renderer response.
-2. Construct `origin = http://127.0.0.1:<port>`. Every API/document fetch needs
-   exact `Host: 127.0.0.1:<port>`, `Origin: <origin>`, and `Authorization: Bearer
-   <capability>`. The helper never enables CORS, cookies, URL tokens, or WebSocket
-   transport. An authenticated top-level `GET /os` may omit Origin only with
-   `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`; it still requires
-   the exact Host. A conflicting Origin is always rejected. Unsupported
-   upgrades are rejected. Static
-   `/os/{bundle.min.js,bundle.min.css,icons.js}` assets are public, carry no
-   identity, require exact Host, and accept absent Origin (normal subresource
-   requests) or the exact helper Origin. Assets are served directly from the
-   committed `app/public/os` tree; package that tree alongside native/local code.
-3. Electron supplies `EZIL_NATIVE_WORKSPACE_ID` (v4 UUID) and
-   `EZIL_NATIVE_WORKSPACE_ROOT` (canonical absolute existing directory). Both
-   must be present together. This **attached mode** boots that exact workspace
-   at `/os` without another helper selection or a duplicate workspace record.
-   Existing helper selections cannot override it. Only the inherited ID can
-   be accessed. Profiles are created under
-   `<dataRoot>/native-v1/attached/<uuid>/profile/{code,browser}`; the project
-   stays Electron-owned, and helper creation/removal is refused in this mode.
-   Without either inherited workspace value, standalone mode remains available:
-   with the admin capability, POST `/api/native/operations` with
-   `{"op":"workspace.list"}`. Let Electron's existing guest onboarding create
-   and select a workspace using `workspace.create` (`name`) and
-   `workspace.select` (`workspaceId`). No second onboarding flow is built here.
-4. POST `/api/native/capabilities` with `{"workspaceId":"<uuid>","role":"shell"}`.
-   Response: `{ok:true,token,expiresAt}`. A shell capability lasts five minutes;
-   a `connector` capability lasts fifteen. Renew from Electron before expiry.
-   Renderer code must never receive the admin token or capability token.
-5. Load `/os` with authenticated headers, injected only for this exact helper
-   document URL by Electron's main process. Its boot payload contains identity,
-   native capabilities, and no paths or secrets. Expose only
-   `window.ezilNative.operation(op): Promise<{ok:boolean,state?:'opened'|'unavailable',error?:string}>`
-   from a context-isolated preload. Revalidate the calling frame and operation
-   schema in main. The shell sends only
-   `{op:'surface.open'|'surface.focus',workspaceId,surface:'code'|'browser'}`.
-   Electron may perform this typed operation directly, or forward through
-   `/api/native/operations` with the **shell** capability and service the
-   handoff queue described below. Do not forward to that queue unless polling
-   and acknowledgements are implemented. Do not expose generic fetch, IPC,
-   headers, commands, or URLs.
-   Reload `/os` with a new scoped capability when switching workspaces.
-
-The shell uses that bridge for Browser, Code, and Preview (Preview opens the
-native browser with registered ports). Repeated opens focus the native surface.
-Unavailable VS Code leaves the shell usable. Native Settings is local and never
-calls hosted computer tRPC. No telemetry endpoint is published.
-
-## Surface handoff broker
-
-When using the helper's optional handoff adapter, Electron's main process polls
-authenticated `GET /api/native/handoffs`, about
-every 100–250 ms while the app is active. It receives
-`{ok:true,handoffs:[{id,workspaceId,surface,action,files,profile,previewPorts}]}`.
-`surface` is `code|browser`; `action` is `open|focus`. Each request is delivered
-once and expires after eight seconds. Keep polling independent of renderer
-operation promises, or the handoff will deadlock. There are at most 16 pending
-requests. Electron replies to `POST /api/native/handoffs` with
-`{id,state:'opened'|'unavailable'}` using its admin capability. Acknowledgement
-replay or an expired request is rejected. If Electron disconnects, the original
-operation resolves `unavailable`; it cannot block the shell indefinitely.
-
-Use only verified, fixed official VS Code launch logic and Electron's native
-Chromium window implementation. The helper intentionally never accepts an
-executable path, command, flags, or URL from browser clients. Derive fixed
-`profile/code` and `profile/browser` subdirectories for the two apps. Registered
-preview URLs can only be derived in trusted main as `http://127.0.0.1:<port>/`;
-ports are explicit declarations, not proof that a web service is alive. Enforce
-navigation/IPC policy for those preview pages in Electron. Never attach the
-shell/admin bridge or headers to arbitrary preview content.
-
-Before launching Code, mint a `connector` capability and atomically write this
-0600 descriptor in the Electron app's private broker directory, outside every
-project:
+`src/contract.ts` advertises these capabilities:
 
 ```json
 {
-  "contractVersion": 1,
-  "origin": "http://127.0.0.1:49152",
-  "workspaceId": "<random-workspace-uuid>",
-  "token": "<workspace-scoped-connector-capability>",
-  "expiresAt": 0,
-  "dataRoot": "<Electron app-owned data root>",
-  "workspacePath": "<canonical-absolute-workspace-root>"
+  "contractVersion": 2,
+  "executionTarget": "macos-host",
+  "isolation": "trusted-native",
+  "editor": "embedded-code-server",
+  "externalEditor": "optional-microsoft-vscode",
+  "browser": "native-chromium",
+  "cloudSync": "disabled"
 }
 ```
 
-Use the actual future expiry returned by the capability endpoint. Give official
-VS Code that descriptor path as `EZIL_BROKER_FILE` in its inherited environment.
-Use a distinct app-owned VS Code profile/user data directory so an unrelated
-existing VS Code instance cannot swallow the new environment. Install/load the
-connector from `extensions/ezil-vscode`; this helper does not install it itself.
-Renew the descriptor atomically before expiry; the connector re-reads it on
-every heartbeat/command. Keep provider secrets out of the descriptor.
+The storage schema and connector descriptor remain v1. The runtime protocol
+version changes independently; old native shell capabilities fail locally and
+never fall through to hosted APIs.
 
-The extension also accepts Electron's separate model-only descriptor through
-`EZIL_AI_BROKER_FILE`:
-`{contractVersion:1,url,capability,operations:['models','chat'],formats:[...]}`.
-It offers **List Broker Models**, using only authenticated `GET /v1/models`
-without Origin, as that broker requires. It does not send readiness/preview
-operations to a model broker, and does not register a chat provider. To enable
-readiness and previews, Electron must mint/renew the workspace connector
-descriptor above. Neither descriptor contains an upstream provider secret.
+## Electron host integration
 
-Connector `editor.readiness` accepts `active|unknown`; only admin can report
-`closed`. Forty-five seconds without an observed heartbeat yields `unknown`
-and clears previews when next read. Active records become unknown on helper
-restart. Code launch attempts mark unknown **before** handing off. Electron
-must report closed only after it proves the associated editor process/window
-exited, or after a launch was definitively unavailable and no instance exists.
-Extension readiness and handoff-open acknowledgement are separate facts.
-Authenticated admin `GET /api/native/previews` exposes only the attached/current
-workspace UUID, editor state and validated registered port integers. Electron
-uses the lowest port to open a direct loopback preview; no arbitrary URL proxy
-or provider destination is derived from this endpoint.
+Expose `window.ezilNative.operation(op)` through a context-isolated preload.
+Validate the calling top-level shell frame, workspace and exact operation schema
+in main. Never expose the bridge or authenticated headers to Code, Preview or
+arbitrary browser content. Authentication and secrets stay in main/preload.
 
-## Storage and removal
+`src/surfaces.ts` defines `SurfaceOperation`, `SurfaceResult`,
+`NativeHostAdapter`, validators and `SurfaceLifecycle`. The helper accepts an
+in-process `NativeOptions.hostAdapter`. A separately spawned helper cannot
+receive JavaScript callbacks: Electron may implement these typed operations
+directly in its validated main-process bridge, reusing the validators and
+lifecycle rules. The CLI currently has no v2 surface broker. Without an adapter,
+the helper returns `unavailable`; the shell shows a retryable failure.
 
-Only `<dataRoot>/native-v1` is managed. In attached mode, helper removal always
-fails, even after an admin reports the editor closed. Electron alone owns the
-project's lifecycle. In standalone mode, schema-v1 ownership records have random
-guest/workspace UUIDs. No path-derived identity or device fingerprint is used.
-Removal requires admin, owned records, no active/unknown editor, no pending
-handoff, and a tree without symlinks, hardlinked files, or special files. It
-removes only that workspace's app-owned tree. Legacy VM files and sibling data
-are always preserved; there is no implicit migration or destructive cleanup.
+Every surface operation carries `workspaceId` and `surfaceId` (v4 UUIDs),
+`generation` (positive integer, incremented on retry), and `sequence` (positive,
+strictly increasing within a generation). Results echo all four fields and
+`ok:true`, plus a `state` of `starting`, `ready`, `failed`, `unavailable`, or
+`closed`. Reject stale messages, including completions from an older generation,
+and retain close tombstones until the shell session ends. Serialize process and
+view creation/destruction so a late open cannot resurrect a closed surface.
 
-One helper acquires `native-v1/helper.lock`. Normal shutdown releases it. After
-an unclean exit, verify the old helper has exited before manually removing a
-stale lock. Roots with symlink components are refused: on Mac, supply the
-canonical absolute data-root path. Local filesystem checks are not a defense
-against concurrent hostile code running as the same Mac user; that code already
-has trusted host access. Electron must close its browser/profile writers before
-requesting workspace removal as well.
+| Operation | Additional input | Result/use |
+| --- | --- | --- |
+| `code.open`, `code.status` | None | Ready includes `url`; starting is polled for up to 30 seconds |
+| `code.close` | None | Dispose the embedded editor surface; report process state separately |
+| `preview.list` | Workspace only, no surface identity | `{ok:true,ports:number[]}` from the workspace's registered ports |
+| `preview.open` | Registered `port` | Ready includes `url` using that exact port |
+| `preview.status`, `preview.close` | None | Recheck readiness/grant, or dispose |
+| `browser.attach` | None | Attach a Chromium view, initially hidden; return ready only when usable |
+| `browser.layout` | `bounds:{x,y,width,height}`, `visible`, `occluded` | Position/clip the view in shell viewport CSS pixels; convert for zoom/DPI |
+| `browser.focus` | None | Focus only when the current layout permits visibility |
+| `browser.navigate` | Valid HTTPS or loopback HTTP `url` | Navigate the existing native view |
+| `browser.back`, `browser.forward`, `browser.reload` | None | Use Chromium navigation history or reload |
+| `browser.detach` | None | Destroy/detach and ignore subsequent stale messages |
+| `browser.snapshot` | None | Ready includes `snapshot`, a PNG data URL, at most 2 MB |
+| `diagnostics.read` | Workspace only | `{ok:true,events:[...]}` from the allowlisted native event ring |
 
-## Remaining integration gates
+Code/Preview URLs must use `http://127.0.0.1:<port>/...`, port 1024–65535,
+without credentials, query strings or fragments. Derive them from trusted
+workspace/process records. Supply any frame authentication privately in main;
+never put it in a renderer URL. The helper's document CSP allows loopback frames.
+Do not implement an arbitrary URL or path proxy. Preserve the code-server
+WebSocket path in the host integration. Optional Microsoft VS Code is a separate
+host action; the legacy `surface.open/focus` handoff remains for compatibility
+and is no longer used by the shell's app launches.
 
-- External-browser pairing is a **tested primitive only** (`Authority`), with a
-  random one-use 60-second code, hash-only server storage, and a five-minute
-  workspace capability on redemption. No unauthenticated pairing route/UI ships.
-- The VS Code 1.109+ extension registers the stable EZiL BYOK model provider.
-  It supports text streaming and cancellation over the authenticated local broker,
-  while provider secrets remain in Electron's Keychain-backed vault. Images and
-  tool calls are not advertised in this first compatible provider release.
-- Local Code/Preview cold start is fixed in the shared shell. The surface origin
-  validator is implemented/tested in `local/src/contract/frame-origin.ts`, and
-  the shell and local server now send and enforce surface-specific confirmation
-  requests only in local VM mode.
-- TCP loopback and Chromium launch were blocked by this worker sandbox. Run
-  `EZIL_NATIVE_SOCKET_TESTS=1 bun test native/tests` and browser tests on an
-  unrestricted development host, then exercise the Electron/official VS Code
-  process lifecycle on Mac. No native process launch is claimed verified here.
+Browser layout is deduplicated and sampled during moves, resizes, maximize,
+minimize, restore and overlay changes. When hidden/occluded, hide the entire
+native view so DOM windows and menus remain interactive. The shell can request a
+raster snapshot for a DOM cover; no HTML from native content is inserted.
+Additional shell overlays can mark themselves `data-native-occluder`, or dispatch
+`ezil:native-cover` with `{covered:true|false}` on the Browser UIWindow. A hidden
+view must support snapshot capture or return unavailable. Detach on close,
+shell teardown, renderer loss and workspace switch.
 
-## Validation commands
+Settings maps only `computer.list/create/rename/delete/select` onto
+`workspace.list/create/rename/remove/select`. For Electron-owned workspaces,
+the main process services these through its verified workspace manager. For standalone
+helper-owned workspaces, use authenticated admin operations from main; the
+renderer must never receive that capability. Shell capabilities intentionally
+cannot enumerate, create or remove other workspaces. Renew the scoped capability
+and reload `/os` on workspace switch. Do not forward attached-workspace mutations
+to the helper: its ownership guard rejects them. The shell's existing delete
+confirmation and window-disposal ordering remain in use.
+
+Native diagnostics accept only `event` (one of `NATIVE_EVENTS`), finite `t`, and
+optional bounded `durationMs`, capped at 100 events. No free-form messages,
+paths, URLs, tokens or identifiers cross this diagnostic interface. The Settings
+copy action merges these with the existing redacted shell log. Hosted telemetry
+and report behavior remain unchanged.
+
+## Startup, authentication and storage
+
+- Inherit `EZIL_NATIVE_ADMIN_CAPABILITY` (32 random bytes, base64url/hex) and a
+  canonical absolute `EZIL_NATIVE_DATA_ROOT`; launch `bun run native/src/main.ts`.
+  The admin environment entry is consumed, never printed. The ready line is
+  `EZIL_NATIVE_READY {"contractVersion":2,"port":...,"capabilities":{...}}`.
+- Optionally inherit both `EZIL_NATIVE_WORKSPACE_ID` (v4 UUID) and
+  `EZIL_NATIVE_WORKSPACE_ROOT` (canonical existing directory). Attached mode
+  boots exactly that Electron-owned workspace. The helper does not read broker
+  or credential files.
+- API/document requests require exact loopback Host and Origin and bearer auth.
+  Authenticated top-level `/os` navigation alone may omit Origin with navigation
+  fetch headers. Static `/os/*` assets need no capability and come from committed
+  `app/public/os`. Cookies, URL tokens, CORS and helper WebSockets are disabled.
+- Admin `POST /api/native/capabilities` with `{workspaceId,role:'shell'|'connector'}`
+  mints scoped capabilities. Shell expiry is five minutes; connector expiry is
+  fifteen. Renew privately before expiry. The connector may report
+  `editor.readiness` and register/unregister ports; only admin may report closed.
+  Readiness expires after 45 seconds without a heartbeat, revoking preview ports.
+- Only `<dataRoot>/native-v1` is helper-managed. Attached profiles live under
+  `attached/<uuid>/profile/{code,browser}`. Standalone removal requires admin,
+  owned records, a closed editor, no open surface/pending handoff, and a safe
+  owned tree. Attached projects can never be removed by the helper. Preserve
+  legacy VM data. A helper lock prevents concurrent mutation of one data root.
+
+## Validation
 
 ```sh
-bun test native/tests extensions/ezil-vscode/tests local/src/contract local/src/boot app/src/server/shell/boot-payload.test.ts
+bun test native/tests
 bun run --cwd native typecheck
-bun run --cwd extensions/ezil-vscode typecheck
-bun run --cwd extensions/ezil-vscode build
-node shell/ezil/native-test.mjs
-node shell/ezil/local-surfaces-test.mjs
-node shell/ezil/apps/code-test.mjs
-node shell/ezil/apps/preview-focus-test.mjs
-./shell/build-shell.sh --check
+EZIL_SHELL_OUT_DIR=/tmp/ezil-shell-check shell/build-shell.sh
+node shell/ezil/native-runtime-test.mjs
+EZIL_SHELL_OUT_DIR=/tmp/ezil-shell-check node shell/ezil/native-test.mjs
 ```
 
-The shell build uses exact esbuild 0.28.1 and clean-css-cli 5.6.3. This sandbox
-used those cached versions through a temporary `bunx` wrapper because package
-installation could not write its usual cache; no source build settings changed.
+Existing Code, Preview, Settings, desktop-close, registry-trace, telemetry and
+local-surface regression suites also accept `EZIL_SHELL_OUT_DIR`. This lets an
+isolated shell worker test the current source without editing `app/**` assets.
+The integrator must rebuild/package committed shell assets before shipping.
+The Electron suite adds native Chromium, code-server gateway, occlusion,
+downloads, process lifecycle and packaged-helper checks. The GitHub-hosted Mac
+gate and the dedicated physical runner remain authoritative for Darwin runtime,
+DMG installation, DPI/window composition and Apple toolchain acceptance.

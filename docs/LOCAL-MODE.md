@@ -1,40 +1,42 @@
 # Local mode — running EZiL OS on your own machine
 
-EZiL has two local runtimes. The Apple Silicon app is the default product: it
-uses Apple's Virtualization framework, contains its ARM Linux runtime, opens a
-native WebKit browser, and requires no cloud account, Docker Desktop, or Bun.
-The older cross-platform developer host remains under `local/`; it uses Docker
-and Bun to run the streamed desktop and is documented below as **legacy local
-mode**.
+EZiL has two local runtimes. The Apple Silicon app is the default product: an
+Electron host packages the same responsive `/os` shell as the hosted product,
+an embedded code-server workbench, a Chromium browser surface, and a Bun helper.
+End users do not install Docker or Bun for this mode. The older cross-platform
+developer host remains under `local/`; it uses Docker and Bun to run the
+streamed Linux desktop and is documented below as **legacy local mode**.
 
 Neither local path requires Cloudflare, Vercel, Supabase, or EZiL sign-in. The
-Mac app has normal internet access only for websites, Git, and packages the
-user chooses to access; it performs no EZiL authentication, workspace upload,
-or telemetry request.
+Mac app has normal internet access for websites, Git, packages, and any Azure
+or Bedrock provider the user explicitly configures. Guest startup performs no
+EZiL authentication or workspace upload. Cloud synchronization is disabled.
 
 If you want the hosted product instead — invite-only, `os.ezil.work`, your own
 account — see the main [README](../README.md#getting-started).
 
 ## Apple Silicon Mac app
 
-Requirements: an Apple Silicon Mac running macOS 14 or newer and enough free
-space for the bundled runtime plus workspace disk. Download
-`EZiL-OS-<version>-AppleSilicon.dmg`, install it, and choose **Continue as
-Guest**.
+Requirements: an Apple Silicon Mac and enough free space for the application,
+editor runtime, browser profile, and workspace files. Download the internal
+`EZiL-OS-<version>-AppleSilicon-internal.dmg`, install it, and approve the local
+guest workspace on first launch.
 
-The desktop chrome and browser run natively on macOS. Code OSS, its terminal,
-extensions, Linux processes, and development servers execute in a persistent
-ARM Linux virtual machine. This supports Linux and web development; it does
-not turn the guest into macOS and does not provide Xcode, iOS signing, or Metal
-GPU compute inside Linux.
+The shared desktop shell and Chromium renderer run in Electron. The embedded
+editor, terminal commands, extensions, development servers, and optional
+Microsoft VS Code instance execute directly as the signed-in Mac user. Native
+Mac tools such as Xcode and Metal are therefore available when installed.
 
-The app copies selected imports into
-`~/Library/Application Support/EZiL OS/workspaces/<id>/files`. It never mounts
-the user's home directory, SSH agent, Docker socket, or original project.
-Export explicitly copies selected results out. Removing a workspace stops its
-VM and removes its managed disk, files, editor state, and browser profile;
-exported files stay where the user saved them. Dragging the app to Trash alone
-does not remove Application Support data.
+This is trusted native development, not a VM security boundary. Browser
+renderer content is sandboxed, but project commands and editor extensions have
+the Mac user's permissions and can change files outside the managed workspace.
+
+Managed projects live under
+`~/Library/Application Support/EZiL OS Native/workspaces/<id>/files`, with
+separate editor and browser profiles beside them. Removing a workspace stops
+tracked processes and deletes only those verified app-owned paths. It cannot
+undo changes that trusted commands made elsewhere. Dragging the app to Trash
+alone does not remove Application Support data.
 
 ## Legacy Docker/Bun mode prerequisites
 
@@ -66,18 +68,17 @@ doctor` reports the exact image it resolved and why.
 
 ### From the macOS app
 
-Every tagged release is wired to produce
-`EZiL-OS-<version>-AppleSilicon.dmg`. Open the DMG, drag **EZiL OS** to
-Applications, and launch it. The native app creates a random local guest
-profile, starts its managed ARM VM, and provides Home, Code, Browser, Files,
-and Settings without contacting GHCR or asking for a cloud login.
+Internal acceptance produces
+`EZiL-OS-<version>-AppleSilicon-internal.dmg`. Open the DMG, drag **EZiL OS**
+to Applications, and launch it. The app creates a random local guest profile
+and opens the shared EZiL desktop, embedded Code window, Chromium Browser
+window, and Settings without contacting GHCR or asking for a cloud login.
 
-The release workflow refuses to attach a public DMG unless it is signed with a
-real Developer ID and notarized by Apple. Building an ad-hoc-signed local-test
-DMG is produced by the manual `macOS Internal DMG` workflow. Pull-request CI
-builds only a marked, non-bootable packaging fixture and never uploads it as an
-installable artifact. The physical-Mac workflow is the gate that actually
-boots the VM, executes code, restarts it, verifies persistence, and cleans up.
+The manual `macOS Native Internal DMG` workflow builds an ad-hoc-signed artifact
+on an Apple Silicon GitHub runner, installs the exact packaged bytes, and runs
+the offline guest/editor/browser smoke. A second protected manual workflow
+installs those same bytes on the dedicated logged-in Mac. Public distribution
+is a separate Developer ID signing and Apple notarization gate.
 
 ### From a release download
 

@@ -1,3 +1,4 @@
+import { SurfaceLifecycle, nativeEvents, nativeFrameUrl, type NativeHostAdapter } from './surfaces.ts';
 import { fileURLToPath } from 'node:url';
 import { Authority, type Capability } from './auth.ts';
 import { exact, NativeError, object, parseOperation, workspaceId } from './contract.ts';
@@ -32,7 +33,7 @@ async function body(req: Request): Promise<unknown> {
 }
 function admin(cap: Capability): void { if (cap.role !== 'admin') throw new NativeError('forbidden', 403); }
 
-export interface NativeOptions { dataRoot: string; adminToken: string; attachedWorkspace?: AttachedWorkspace; handoffTimeoutMs?: number; now?: () => number }
+export interface NativeOptions { hostAdapter?: NativeHostAdapter; dataRoot: string; adminToken: string; attachedWorkspace?: AttachedWorkspace; handoffTimeoutMs?: number; now?: () => number }
 /** The actual HTTP handler, separated from TCP binding so its security gates can be tested without a socket. */
 export function createNativeRuntime(options: NativeOptions) {
     const authority = new Authority(options.adminToken, options.now);
@@ -41,6 +42,7 @@ export function createNativeRuntime(options: NativeOptions) {
     try { store = new WorkspaceStore(options.dataRoot, options.attachedWorkspace); }
     catch (err) { release(); throw err; }
     const handoffs = new Handoffs(options.handoffTimeoutMs);
+    const surfaces = new SurfaceLifecycle();
     const previews = new Map<string, Set<number>>();
     const editorSeen = new Map<string, number>();
     const now = options.now ?? Date.now;
@@ -83,7 +85,7 @@ export function createNativeRuntime(options: NativeOptions) {
                     return new Response(renderOsDocument(payload), { headers: {
                         'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
                         'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff',
-                        'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+                        'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-src http://127.0.0.1:*; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
                     } });
                 }
                 if (url.pathname === '/api/native/capabilities' && req.method === 'POST') {
@@ -117,13 +119,38 @@ export function createNativeRuntime(options: NativeOptions) {
                 const op = parseOperation(await body(req));
                 authority.authorize(cap, op);
                 if ('workspaceId' in op) refreshEditor(op.workspaceId);
+                if ('surfaceId' in op) {
+                    // Preview grants are checked on open AND status, so revoked ports cannot be reused.
+                    if (op.op === 'preview.open' || op.op === 'preview.status') {
+                        const port = op.op === 'preview.open' ? op.port : surfaces.port(op);
+                        if (!port || !previews.get(op.workspaceId)?.has(port)) throw new NativeError('preview_not_registered', 409);
+                    }
+                    surfaces.accept(op);
+                    const result = options.hostAdapter ? await options.hostAdapter.surface(op) : { ok: true, ...op, state: 'unavailable' };
+                    if (!surfaces.current(op)) throw new NativeError('stale_surface', 409);
+                    if (!result.ok || result.workspaceId !== op.workspaceId || result.surfaceId !== op.surfaceId || result.generation !== op.generation || result.sequence !== op.sequence || !['starting', 'ready', 'failed', 'closed', 'unavailable'].includes(result.state)) throw new NativeError('invalid_surface_result');
+                    const clean: Record<string, unknown> = { ok: true, workspaceId: op.workspaceId, surfaceId: op.surfaceId,
+                        generation: op.generation, sequence: op.sequence, state: result.state };
+                    if ('url' in result) {
+                        clean.url = nativeFrameUrl(result.url);
+                        if (op.op.startsWith('preview.') && Number(new URL(String(clean.url)).port) !== surfaces.port(op)) throw new NativeError('invalid_surface_url');
+                    }
+                    if ('snapshot' in result) {
+                        if (op.op !== 'browser.snapshot' || typeof result.snapshot !== 'string' || result.snapshot.length > 2_000_000 || !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(result.snapshot)) throw new NativeError('invalid_snapshot');
+                        clean.snapshot = result.snapshot;
+                    }
+                    return json(clean);
+                }
                 switch (op.op) {
+                    case 'diagnostics.read': return json({ ok: true, events: nativeEvents(await options.hostAdapter?.diagnostics?.(op.workspaceId)) });
+                    case 'preview.list': return json({ ok: true, ports: [...(previews.get(op.workspaceId) ?? [])].sort((a, b) => a - b) });
+                    case 'workspace.rename': return json({ ok: true, workspace: store.rename(op.workspaceId, op.name) });
                     case 'workspace.list': return json({ ok: true, workspaces: store.list().map(r => refreshEditor(r.id)) });
                     case 'workspace.create': return json({ ok: true, workspace: store.create(op.name) });
                     case 'workspace.get': return json({ ok: true, workspace: refreshEditor(op.workspaceId) });
                     case 'workspace.select': return json({ ok: true, workspace: store.select(op.workspaceId) });
                     case 'workspace.remove':
-                        if (handoffs.hasWorkspace(op.workspaceId)) throw new NativeError('handoff_pending', 409);
+                        if (handoffs.hasWorkspace(op.workspaceId) || surfaces.hasWorkspace(op.workspaceId)) throw new NativeError('handoff_pending', 409);
                         store.remove(op.workspaceId); authority.revokeWorkspace(op.workspaceId); previews.delete(op.workspaceId); editorSeen.delete(op.workspaceId);
                         return json({ ok: true });
                     case 'editor.readiness':

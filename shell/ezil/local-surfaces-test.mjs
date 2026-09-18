@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 import { readFileSync } from 'node:fs';
 
-const os = new URL('../../app/public/os/', import.meta.url);
+const os = process.env.EZIL_SHELL_OUT_DIR ? new URL(`file://${process.env.EZIL_SHELL_OUT_DIR}/`) : new URL('../../app/public/os/', import.meta.url);
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 for (const surface of ['code', 'preview']) {
     const dom = new JSDOM('<!doctype html><body><div id="ezil-os-root"></div></body>', {

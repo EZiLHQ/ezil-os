@@ -67,8 +67,6 @@ import { ensureSettingsDrawerButton, SETTINGS_DRAWER_SVG } from '../ui/Settings/
 import telemetry from '../telemetry.js';
 import { beginTrace } from '../trace.js';
 import log from '../log.js';
-import { isNative } from '../native-runtime.js';
-import { openNativeSurface } from './native.js';
 
 const PHASE = 'ezil-os:apps';
 
@@ -579,9 +577,6 @@ function ensureOnTop (el_window) {
 
 export async function launch (id, ctx = {}) {
     const app = getApp(id);
-    if ( app && isNative(ctx) && ['desktop', 'code', 'preview'].includes(id) ) {
-        return openNativeSurface(id, { ...ctx, icon: app.icon, appName: app.name });
-    }
     if ( ! app ) {
         log.error(`[${PHASE}] no such app: ${id}`);
         telemetry.capture({

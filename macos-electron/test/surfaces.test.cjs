@@ -32,17 +32,18 @@ test('surface results never reflect capabilities, launch diagnostics or exceptio
   for (const open of [async () => false, async () => ({ capability: 'secret' }), async () => { throw Error('secret'); }]) assert.deepEqual(await operation(event, input, caller, id, open), unavailable);
 });
 test('sandbox preload exposes operation alongside request and strips IPC payloads', async () => {
-  let bridge, calls = 0, result = { ok: true, state: 'opened', capability: 'secret' };
+  const runtimeInput = { op: 'code.open', workspaceId: id, surfaceId: randomUUID(), generation: 1, sequence: 1 };
+  let bridge, calls = 0, result = { ...runtimeInput, ok: true, state: 'ready', url: 'http://127.0.0.1:8443/', capability: 'secret' };
   const context = vm.createContext({ require: name => {
     assert.equal(name, 'electron');
-    return { contextBridge: { exposeInMainWorld: (_name, value) => { bridge = value; } }, ipcRenderer: { invoke: async channel => { assert.equal(channel, 'ezil:surface:v1'); calls++; return result; } } };
+    return { contextBridge: { exposeInMainWorld: (_name, value) => { bridge = value; } }, ipcRenderer: { invoke: async channel => { assert.equal(channel, 'ezil:runtime:v2'); calls++; return result; } } };
   } });
   vm.runInContext(fs.readFileSync(require.resolve('../src/preload.cjs'), 'utf8'), context);
   const invoke = value => bridge.operation(vm.runInContext(`(${JSON.stringify(value)})`, context));
   assert.equal(typeof bridge.request, 'function');
-  assert.equal(JSON.stringify(await invoke(input)), JSON.stringify({ ok: true, state: 'opened' }));
-  assert.equal(JSON.stringify(await invoke({ ...input, url: 'https://evil.test' })), JSON.stringify(unavailable));
+  const opened = await invoke(runtimeInput);
+  assert.equal(opened.state, 'ready'); assert.equal(opened.url, 'http://127.0.0.1:8443/'); assert.equal(opened.capability, undefined);
   assert.equal(calls, 1);
   result = { ok: false, error: 'secret' };
-  assert.equal(JSON.stringify(await invoke(input)), JSON.stringify(unavailable));
+  assert.equal(JSON.stringify(await invoke(runtimeInput)), JSON.stringify(unavailable));
 });

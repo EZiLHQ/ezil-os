@@ -10,7 +10,7 @@ const { ConnectorSession } = require('./connector.cjs');
 function config(resources, env = process.env) {
   return {
     bun: env.EZIL_BUN_PATH || path.join(resources, 'bun', 'bun'),
-    helper: env.EZIL_HELPER_PATH || path.join(resources, 'native', 'src', 'main.ts'),
+    helper: env.EZIL_HELPER_PATH || path.join(resources, 'native', 'src', 'helper.js'),
     assets: env.EZIL_SHELL_ASSETS || path.join(resources, 'app', 'public', 'os'),
     shellPath: env.EZIL_SHELL_PATH || '/os'
   };
@@ -18,7 +18,7 @@ function config(resources, env = process.env) {
 function readyLine(line) {
   if (!line.startsWith('EZIL_NATIVE_READY ')) return null;
   const value = JSON.parse(line.slice('EZIL_NATIVE_READY '.length));
-  if (value.contractVersion !== 1 || !Number.isInteger(value.port) || value.port < 1 || value.port > 65535) throw Error('Invalid native helper ready line');
+  if (value.contractVersion !== 2 || !Number.isInteger(value.port) || value.port < 1 || value.port > 65535) throw Error('Invalid native helper ready line');
   for (const [key, expected] of Object.entries(capabilities)) if (key !== 'contractVersion' && value.capabilities?.[key] !== expected) throw Error('Native helper capabilities mismatch');
   return value;
 }
@@ -27,12 +27,26 @@ function helperEnvironment(settings, root, workspace, capability) {
 }
 function authenticatedHeaders(details, helper) {
   const headers = { ...details.requestHeaders };
-  if (new URL(details.url).origin !== helper.origin) return headers;
-  for (const key of Object.keys(headers)) if (['authorization', 'origin'].includes(key.toLowerCase())) delete headers[key];
-  headers.Authorization = `Bearer ${helper.capability}`;
-  // Supplying the exact origin also covers API calls where Chromium omits it.
+  for (const key of Object.keys(headers)) if (['authorization', 'cookie', 'origin'].includes(key.toLowerCase())) delete headers[key];
+  if (new URL(details.url).origin !== helper.origin || details.webContentsId !== helper.webContentsId || !helper.shellCapability) return headers;
+  let source; try { source = new URL(details.initiator || details.origin || details.frame?.url || details.referrer).origin; } catch {}
+  // The initial main-frame navigation has no initiator. All subsequent requests
+  // must originate in the exact shared-shell origin and registered webContents.
+  if (source !== helper.origin && !(details.resourceType === 'mainFrame' && details.url === helper.url)) return headers;
+  headers.Authorization = `Bearer ${helper.shellCapability}`;
   headers.Origin = helper.origin;
   return headers;
+}
+async function shellCapability(helper, workspaceId) {
+  const response = await fetch(`${helper.origin}/api/native/capabilities`, {
+    method: 'POST', redirect: 'error', signal: AbortSignal.timeout(5000),
+    headers: { origin: helper.origin, authorization: `Bearer ${helper.capability}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ workspaceId, role: 'shell' })
+  });
+  const value = await response.json();
+  if (!response.ok || value.ok !== true || !/^[A-Za-z0-9_-]{43}$/.test(value.token) || !Number.isFinite(value.expiresAt) || value.expiresAt < Date.now() + 30000 || value.expiresAt > Date.now() + 6 * 60000) throw Error('Shell capability unavailable');
+  helper.shellCapability = value.token;
+  return value.expiresAt;
 }
 async function workspaceStatus(helper, workspaceId, fetchImpl = fetch) {
   const response = await fetchImpl(`${helper.origin}/api/native/previews`, {
@@ -56,7 +70,7 @@ async function startHelper(settings, root, workspace, onExit = () => {}) {
   }
   if (!/^\/(?!\/)[^?#]*$/.test(settings.shellPath)) throw Error('Invalid shell path');
   const capability = randomBytes(32).toString('hex');
-  const child = spawn(settings.bun, ['run', settings.helper], {
+  const child = spawn(settings.bun, ['--no-env-file', settings.helper], {
     cwd: path.dirname(path.dirname(settings.helper)), stdio: ['ignore', 'pipe', 'pipe'], shell: false,
     env: helperEnvironment(settings, root, workspace, capability)
   });
@@ -65,7 +79,7 @@ async function startHelper(settings, root, workspace, onExit = () => {}) {
   const ready = await new Promise((resolve, reject) => {
     let buffer = '', total = 0;
     const timer = setTimeout(() => fail(), 20000);
-    const fail = () => { clearTimeout(timer); child.kill('SIGTERM'); reject(Error('Native helper failed to become ready (contract v1, 20 second timeout)')); };
+    const fail = () => { clearTimeout(timer); child.kill('SIGTERM'); reject(Error('Native helper failed to become ready (contract v2, 20 second timeout)')); };
     child.once('error', fail); child.once('exit', fail);
     child.stdout.on('data', chunk => {
       total += chunk.length; if (total > 65536) return fail();
@@ -84,7 +98,25 @@ async function startHelper(settings, root, workspace, onExit = () => {}) {
   const helper = { origin, capability };
   let connector = null;
   try { connector = await new ConnectorSession(root, workspace, helper).start(); } catch { /* Desktop/browser stay available without the editor connector. */ }
-  return { child, origin, url: origin + settings.shellPath, capability, connector,
-    close: () => { try { connector?.close(); } finally { child.kill('SIGTERM'); } } };
+  Object.assign(helper, { child, url: origin + settings.shellPath, connector });
+  let timer, closed = false;
+  const renew = async () => {
+    const expiresAt = await shellCapability(helper, workspace.id);
+    if (closed) { helper.shellCapability = null; return; }
+    timer = setTimeout(() => { renew().catch(() => { helper.shellCapability = null; child.kill('SIGTERM'); }); }, Math.max(1000, expiresAt - Date.now() - 60000));
+    timer.unref?.();
+  };
+  helper.close = () => {
+    if (helper.closing) return helper.closing;
+    closed = true; clearTimeout(timer); helper.shellCapability = null; connector?.close();
+    helper.closing = new Promise(resolve => {
+      if (child.exitCode !== null || child.signalCode !== null) { resolve(); return; }
+      const kill = setTimeout(() => child.kill('SIGKILL'), 3000);
+      child.once('exit', () => { clearTimeout(kill); resolve(); }); child.kill('SIGTERM');
+    });
+    return helper.closing;
+  };
+  try { await renew(); } catch { helper.close(); throw Error('Shell capability unavailable'); }
+  return helper;
 }
-module.exports = { config, readyLine, startHelper, helperEnvironment, authenticatedHeaders, workspaceStatus, registeredPreview };
+module.exports = { config, readyLine, startHelper, helperEnvironment, authenticatedHeaders, workspaceStatus, registeredPreview, shellCapability };

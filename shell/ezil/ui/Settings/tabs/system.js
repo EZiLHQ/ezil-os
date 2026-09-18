@@ -1,3 +1,4 @@
+import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../native-runtime.js';
 // tabs/system.js — EZiL-authored. Not Puter code.
 //
 // ═══════════════════════════════════════════════════════════════════════════
@@ -60,6 +61,7 @@ let vitalsAt = 0;           // when it arrived, so staleness can be shown
 let screenObserved = null;  // { width, height } from the live read
 let screenError = null;
 let refreshTimer = null;
+let nativeProvider = { configured: false, pending: false, error: '' };
 let listening = false;
 
 /** The desktop window's iframe, or null when the desktop is not open. */
@@ -130,6 +132,7 @@ function linkedComputer () {
  */
 async function refreshScreen () {
     const computer = linkedComputer();
+    if (isNative(tabCtx)) { screenObserved = null; screenError = null; paint(); return; }
     if ( ! computer || typeof session.getScreen !== 'function' ) {
         screenObserved = null;
         screenError = 'not available in this deployment';
@@ -177,6 +180,24 @@ function paint () {
 
     const num = (x, unit) => (typeof x === 'number' && Number.isFinite(x) ? `${x}${unit ?? ''}` : UNKNOWN);
 
+    if (isNative(tabCtx)) {
+        host.innerHTML = `<h3>System</h3><h4>On this Mac</h4>
+            ${row('Name', esc(computer?.name ?? UNKNOWN))}
+            ${row('Execution', NATIVE_CAPABILITIES.executionTarget, 'Programs run with your Mac account’s permissions.')}
+            ${row('Isolation', NATIVE_CAPABILITIES.isolation)}
+            ${row('Editor', NATIVE_CAPABILITIES.editor)}
+            ${row('External editor', NATIVE_CAPABILITIES.externalEditor)}
+            ${row('Browser', NATIVE_CAPABILITIES.browser)}
+            ${row('Cloud sync', 'Disabled', 'Your workspace is stored on this Mac.')}
+            <h4 style="margin-top:20px">AI provider</h4>
+            <p class="ezil-settings-lead">${nativeProvider.error ? esc(nativeProvider.error) : (nativeProvider.configured ? 'A provider is stored in macOS Keychain.' : 'No provider is connected. The desktop and editor work without one.')}</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="ezil-settings-btn" data-native-provider="azure" ${nativeProvider.pending ? 'disabled' : ''}>Connect Azure</button>
+              <button class="ezil-settings-btn" data-native-provider="bedrock" ${nativeProvider.pending ? 'disabled' : ''}>Connect Bedrock</button>
+              <button class="ezil-settings-btn" data-native-provider="remove" ${nativeProvider.pending || !nativeProvider.configured ? 'disabled' : ''}>Remove provider</button>
+            </div>`;
+        return;
+    }
     host.innerHTML = `
         <h3>System</h3>
         <p class="ezil-sys-lead">What this window is connected to, and how that connection is doing.
@@ -224,6 +245,21 @@ export default {
 
     init ($win, ctx) {
         tabCtx = ctx ?? tabCtx;
+        $win.off('click.ezil-native-provider').on('click.ezil-native-provider', '[data-native-provider]', async function () {
+            if (!isNative(tabCtx) || nativeProvider.pending) return;
+            nativeProvider = { ...nativeProvider, pending: true, error: '' }; paint();
+            const action = this.getAttribute('data-native-provider');
+            try {
+                const runtime = selectRuntimeAdapter(tabCtx);
+                const result = await runtime.operation(action === 'remove' ? { op: 'provider.remove' } : { op: 'provider.configure', action });
+                if (result?.ok !== true) throw Error('Provider setup did not complete.');
+                nativeProvider = { configured: action !== 'remove', pending: false, error: '' };
+            } catch { nativeProvider = { ...nativeProvider, pending: false, error: 'Provider setup did not complete.' }; }
+            paint();
+        });
+        if (isNative(tabCtx)) void selectRuntimeAdapter(tabCtx).operation({ op: 'provider.status' }).then(result => {
+            nativeProvider = { configured: result?.ok === true && result.configured === true, pending: false, error: '' }; paint();
+        });
         paint();
     },
 

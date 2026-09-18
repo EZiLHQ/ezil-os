@@ -1,16 +1,20 @@
+import { parseSurfaceOperation, type SurfaceOperation } from './surfaces.ts';
 /** Native execution is trusted host execution, not a containment boundary. */
 export const NATIVE_RUNTIME = Object.freeze({
-    contractVersion: 1,
+    contractVersion: 2,
     executionTarget: 'macos-host',
     isolation: 'trusted-native',
-    editor: 'external-vscode',
+    editor: 'embedded-code-server',
+    externalEditor: 'optional-microsoft-vscode',
     browser: 'native-chromium',
-    cloudSync: false,
+    cloudSync: 'disabled',
 } as const);
 export type NativeRuntime = typeof NATIVE_RUNTIME;
 export type Surface = 'code' | 'browser';
 export type EditorState = 'active' | 'closed' | 'unknown';
-export type NativeOperation =
+export type NativeOperation = SurfaceOperation
+    | { op: 'diagnostics.read' | 'preview.list'; workspaceId: string }
+    | { op: 'workspace.rename'; workspaceId: string; name: string }
     | { op: 'workspace.list' }
     | { op: 'workspace.create'; name: string }
     | { op: 'workspace.get' | 'workspace.select' | 'workspace.remove'; workspaceId: string }
@@ -40,6 +44,7 @@ export function previewPort(value: unknown): number {
 export function parseOperation(value: unknown): NativeOperation {
     const body = object(value);
     const op = body.op;
+    if (typeof op === 'string' && /^(code|browser)\.|^preview\.(open|status|close)$/.test(op)) return parseSurfaceOperation(value);
     if (op === 'workspace.list') exact(body, ['op']);
     else if (op === 'workspace.create') {
         exact(body, ['op', 'name']);
@@ -47,7 +52,11 @@ export function parseOperation(value: unknown): NativeOperation {
     } else {
         workspaceId(body.workspaceId);
         switch (op) {
-            case 'workspace.get': case 'workspace.select': case 'workspace.remove': exact(body, ['op', 'workspaceId']); break;
+            case 'workspace.rename':
+                exact(body, ['op', 'workspaceId', 'name']);
+                if (typeof body.name !== 'string' || !body.name.trim() || body.name.length > 80 || /[\x00-\x1f\x7f]/.test(body.name)) throw new NativeError('invalid_name');
+                break;
+            case 'diagnostics.read': case 'preview.list': case 'workspace.get': case 'workspace.select': case 'workspace.remove': exact(body, ['op', 'workspaceId']); break;
             case 'surface.open': case 'surface.focus':
                 exact(body, ['op', 'workspaceId', 'surface']);
                 if (body.surface !== 'code' && body.surface !== 'browser') throw new NativeError('invalid_surface');

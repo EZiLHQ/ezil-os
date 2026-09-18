@@ -20,7 +20,7 @@ function fixture(t) {
   fs.writeFileSync(path.join(extension, 'extension.js'), 'exports.activate = () => {};');
   return { root, extension, store: new Workspaces(path.join(root, 'data')) };
 }
-test('helper uses /os and Worker A env names without broker or provider env', t => {
+test('helper uses /os and the native env contract without broker or provider env', t => {
   const { root, store } = fixture(t), w = store.create('A'), settings = config(root, {});
   assert.equal(settings.shellPath, '/os');
   const env = helperEnvironment(settings, root, w, 'test-admin');
@@ -29,9 +29,9 @@ test('helper uses /os and Worker A env names without broker or provider env', t 
   for (const key of ['EZIL_BROKER_FILE', 'EZIL_AI_BROKER_FILE', 'EZIL_NATIVE_BROKER_DESCRIPTOR', 'AZURE_API_KEY']) assert.equal(env[key], undefined);
 });
 test('helper auth overwrites headers case-insensitively only on exact origin', () => {
-  const helper = { origin: 'http://127.0.0.1:1234', capability: 'test-admin' };
+  const helper = { origin: 'http://127.0.0.1:1234', capability: 'test-admin', shellCapability: 'test-shell', webContentsId: 7 };
   for (const suffix of ['/os', '/api/workspaces']) {
-    assert.deepEqual(authenticatedHeaders({ url: helper.origin + suffix, requestHeaders: { authorization: 'bad', ORIGIN: 'https://evil.test', Accept: '*/*' } }, helper), { Accept: '*/*', Authorization: 'Bearer test-admin', Origin: helper.origin });
+    assert.deepEqual(authenticatedHeaders({ url: helper.origin + suffix, webContentsId: 7, initiator: helper.origin, requestHeaders: { authorization: 'bad', ORIGIN: 'https://evil.test', Accept: '*/*' } }, helper), { Accept: '*/*', Authorization: 'Bearer test-shell', Origin: helper.origin });
   }
   assert.deepEqual(authenticatedHeaders({ url: 'http://127.0.0.1:12345/api', requestHeaders: {} }, helper), {});
 });

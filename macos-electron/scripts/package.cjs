@@ -4,6 +4,8 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const { copyTree, privateDir, atomic } = require('../src/files.cjs');
+const { bundleHelper } = require('./bundle-helper.cjs');
+const { stageCodeServer, binaryKind } = require('./code-server.cjs');
 const { validateInputs, stageInputs } = require('./inputs.cjs');
 const root = path.resolve(__dirname, '..'), repo = path.dirname(root);
 const pkg = require('../package.json');
@@ -42,13 +44,8 @@ const bunPackage = path.join(bunStage, 'node_modules/@oven/bun-darwin-aarch64');
 const bun = path.join(privateDir(path.join(resources, 'bun')), 'bun');
 fs.copyFileSync(path.join(bunPackage, 'bin/bun'), bun); fs.chmodSync(bun, 0o755);
 if (run(bun, ['--version'], { encoding: 'utf8', stdio: 'pipe' }).trim() !== pkg.ezilTools.bun) throw Error('Bundled Bun version mismatch');
-if (fs.existsSync(path.join(resources, 'native/package.json'))) {
-  const nativePkg = JSON.parse(fs.readFileSync(path.join(resources, 'native/package.json')));
-  if (Object.keys(nativePkg.dependencies || {}).length) {
-    if (!fs.existsSync(path.join(resources, 'native/bun.lock'))) throw Error('Native dependencies require a committed bun.lock');
-    run(bun, ['install', '--frozen-lockfile', '--production', '--ignore-scripts'], { cwd: path.join(resources, 'native') });
-  }
-}
+inputInventory.helper = bundleHelper(bun, nativeSource, resources);
+const codeServerInventory = stageCodeServer(build, resources, run);
 const licenses = privateDir(path.join(resources, 'licenses'));
 for (const file of ['LICENSE', 'NOTICE', 'ATTRIBUTIONS.md']) fs.copyFileSync(path.join(repo, file), path.join(licenses, file));
 fs.copyFileSync(path.join(repo, 'shell/PUTER-PROVENANCE.md'), path.join(licenses, 'PUTER-PROVENANCE.md'));
@@ -70,18 +67,36 @@ for (const [key, value] of Object.entries({ CFBundleIdentifier: 'com.ezil.os.nat
 const inventory = { distribution: 'internal-ad-hoc', version, gitSHA: process.env.GITHUB_SHA || run('git', ['rev-parse', 'HEAD'], { cwd: repo, stdio: 'pipe', encoding: 'utf8' }).trim(), electron: pkg.devDependencies.electron, bun: pkg.ezilTools.bun, node: process.version, files: {} };
 inventory.inputs = inputInventory;
 inventory.architecture = 'arm64';
+inventory.codeServer = codeServerInventory;
+const runtimeComponents = new Map();
+function componentPackages(directory) {
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const file = path.join(directory, entry.name);
+    if (entry.isDirectory()) componentPackages(file);
+    else if (entry.isFile() && entry.name === 'package.json') {
+      let metadata; try { metadata = JSON.parse(fs.readFileSync(file)); } catch { throw Error('Invalid runtime package manifest'); }
+      if (typeof metadata.name === 'string' && typeof metadata.version === 'string') runtimeComponents.set(`${metadata.name}@${metadata.version}`, { type: 'library', name: metadata.name, version: metadata.version, ...(typeof metadata.license === 'string' ? { licenses: [{ license: { name: metadata.license } }] } : {}) });
+    }
+  }
+}
+componentPackages(path.join(resources, 'code-server'));
+atomic(path.join(resources, 'SBOM.json'), JSON.stringify({ bomFormat: 'CycloneDX', specVersion: '1.5', version: 1, components: [...runtimeComponents.values(), { type: 'application', name: 'electron', version: pkg.devDependencies.electron }, { type: 'application', name: 'bun', version: pkg.ezilTools.bun }, { type: 'application', name: 'code-server', version: codeServerInventory.version, hashes: [{ alg: 'SHA-256', content: codeServerInventory.archiveSHA256 }] }], properties: [{ name: 'ezil:dependency-evidence', value: 'INVENTORY.json; BUN-PACKAGE-LOCK.json; HOST-BUILD-LOCK.json; native/closure.json; code-server/package.json; code-server/lib/vscode/package.json' }] }, null, 2));
 function inventoryFiles(dir) { for (const item of fs.readdirSync(dir, { withFileTypes: true })) { const file = path.join(dir, item.name); if (item.isDirectory()) inventoryFiles(file); else if (item.isFile()) inventory.files[path.relative(resources, file)] = createHash('sha256').update(fs.readFileSync(file)).digest('hex'); } }
 // Sign executable components bottom-up. No virtualization entitlements/runtime.
 function signTree(dir) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const file = path.join(dir, entry.name);
-    if (entry.isDirectory()) { signTree(file); if (/\.(app|framework)$/.test(file)) run('/usr/bin/codesign', ['--force', '--sign', '-', file]); }
-    else if (entry.isFile() && /Mach-O/.test(run('/usr/bin/file', ['-b', file], { stdio: 'pipe', encoding: 'utf8' }))) run('/usr/bin/codesign', ['--force', '--sign', '-', file]);
+    if (entry.isDirectory()) { signTree(file); if (/\.(app|framework)$/.test(file)) run('/usr/bin/codesign', ['--force', '--sign', '-', '--preserve-metadata=entitlements', file]); }
+    else if (entry.isFile() && binaryKind(file) === 'Mach-O') {
+      if (run('/usr/bin/lipo', ['-archs', file], { stdio: 'pipe', encoding: 'utf8' }).trim() !== 'arm64') throw Error('Nested binary architecture mismatch');
+      run('/usr/bin/codesign', ['--force', '--sign', '-', '--preserve-metadata=entitlements', file]);
+      run('/usr/bin/codesign', ['--verify', '--strict', file]);
+    }
   }
 }
 signTree(bundle);
 inventoryFiles(resources); atomic(path.join(resources, 'INVENTORY.json'), JSON.stringify(inventory, null, 2));
-run('/usr/bin/codesign', ['--force', '--sign', '-', bundle]);
+run('/usr/bin/codesign', ['--force', '--sign', '-', '--preserve-metadata=entitlements', bundle]);
 run('/usr/bin/codesign', ['--verify', '--deep', '--strict', bundle]);
 const dmgStage = privateDir(path.join(build, 'image'));
 run('/usr/bin/ditto', [bundle, path.join(dmgStage, 'EZiL OS.app')]); fs.symlinkSync('/Applications', path.join(dmgStage, 'Applications'));
@@ -91,4 +106,5 @@ run('/usr/bin/hdiutil', ['verify', dmg]);
 const hash = createHash('sha256').update(fs.readFileSync(dmg)).digest('hex');
 atomic(dmg + '.sha256', `${hash}  ${path.basename(dmg)}\n`);
 fs.copyFileSync(path.join(resources, 'INVENTORY.json'), path.join(out, 'INVENTORY.json'));
+fs.copyFileSync(path.join(resources, 'SBOM.json'), path.join(out, 'SBOM.json'));
 console.log(`Internal ad-hoc artifact: ${dmg}\nSHA256: ${hash}`);

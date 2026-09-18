@@ -16,5 +16,5 @@ export function launchOptions(env: Record<string, string | undefined>): NativeOp
 }
 
 export function readyLine(port: number): string {
-    return `EZIL_NATIVE_READY ${JSON.stringify({ contractVersion: 1, port, capabilities: NATIVE_RUNTIME })}`;
+    return `EZIL_NATIVE_READY ${JSON.stringify({ contractVersion: NATIVE_RUNTIME.contractVersion, port, capabilities: NATIVE_RUNTIME })}`;
 }

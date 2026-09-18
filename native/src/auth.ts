@@ -36,7 +36,10 @@ export class Authority {
         if (cap.role === 'admin') return;
         if (!('workspaceId' in operation) || operation.workspaceId !== cap.workspaceId) throw new NativeError('forbidden', 403);
         const allowed = cap.role === 'shell'
-            ? ['workspace.get', 'workspace.select', 'surface.open', 'surface.focus']
+            ? ['workspace.get', 'workspace.select', 'surface.open', 'surface.focus', 'diagnostics.read', 'preview.list',
+                'code.open', 'code.status', 'code.close', 'preview.open', 'preview.status', 'preview.close',
+                'browser.attach', 'browser.layout', 'browser.focus', 'browser.detach', 'browser.snapshot',
+                'browser.navigate', 'browser.back', 'browser.forward', 'browser.reload']
             : ['editor.readiness', 'preview.register', 'preview.unregister'];
         if (!allowed.includes(operation.op) || (operation.op === 'editor.readiness' && operation.state === 'closed')) throw new NativeError('forbidden', 403);
     }

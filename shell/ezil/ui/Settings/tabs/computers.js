@@ -1,3 +1,4 @@
+import { isNative } from '../../../native-runtime.js';
 // tabs/computers.js — EZiL-authored. Not Puter code.
 //
 // The Computers tab: this is where computer management lives now that login
@@ -297,6 +298,7 @@ function rowHtml (slot, computer) {
                 </div>
                 <div class="ezil-settings-row-actions">
                     <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="create">New computer</button>
+                    ${isNative() ? '<button type="button" class="ezil-settings-btn" data-action="import">Import project copy</button>' : ''}
                 </div>
             </div>`;
     }
@@ -401,6 +403,17 @@ async function handleCreate ($win) {
     await load($win);
 }
 
+async function handleImport ($win) {
+    const res = await trpc.mutate('computer.import', {});
+    if ( ! res.ok ) {
+        reportError(res.code === 'FORBIDDEN'
+            ? "You've reached your computer limit."
+            : 'Failed to import the project. Please try again.');
+        return;
+    }
+    await load($win);
+}
+
 async function switchTo (computer, ctx, $win) {
     if ( desktopStreams(computer.id) === true || busyId ) return;
     busyId = computer.id;
@@ -416,6 +429,13 @@ async function switchTo (computer, ctx, $win) {
         // otherwise just re-focus. No `id` argument: we are leaving whatever
         // is open behind regardless of which computer it belonged to.
         await closeSandboxWindows();
+        if (isNative(ctx)) {
+            const selected = await trpc.mutate('computer.select', { id: computer.id });
+            if (!selected.ok) { reportError('Could not switch local workspaces.'); return; }
+            // Preload may reload /os to renew its workspace-scoped capability.
+            window.__EZIL_BOOT__.computer = computer;
+            if (ctx.payload) ctx.payload.computer = computer;
+        }
         activeComputerId = computer.id;
         const desktopState = ctx?.payload?.desktopState ?? {};
         await registry.launch('desktop', { ...ctx, computer, desktopState });
@@ -497,6 +517,7 @@ function bind ($win, ctx) {
     const $list = $win.find('[data-role="slot-list"]');
 
     $list.on('click', '[data-action="create"]', () => { void handleCreate($win); });
+    $list.on('click', '[data-action="import"]', () => { void handleImport($win); });
     $list.on('click', '[data-action="retry"]', () => { void load($win); });
 
     $list.on('click', '[data-action="switch"]', function () {

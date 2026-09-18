@@ -12,6 +12,7 @@ test('persistent random guest/workspace; removal preserves imports and outside c
   const temp = setup(t), source = path.join(temp, 'source'); fs.mkdirSync(source); fs.writeFileSync(path.join(source, 'project.txt'), 'original');
   const root = path.join(temp, 'native'), store = new Workspaces(root), guest = store.guest(), w = store.create('Test', source);
   assert.equal(new Workspaces(root).guest().id, guest.id); assert.equal(new Workspaces(root).get(w.id).name, 'Test');
+  fs.mkdirSync(path.join(w.dir, 'shell-profile')); fs.writeFileSync(path.join(w.dir, 'shell-profile', 'preferences'), 'persisted');
   for (const state of ['running', 'unknown']) assert.throws(() => store.remove(w.id, state, true));
   assert.throws(() => store.remove(w.id, 'stopped', false));
   store.remove(w.id, 'stopped', true); assert.equal(fs.existsSync(w.dir), false); assert.equal(fs.readFileSync(path.join(source, 'project.txt'), 'utf8'), 'original');

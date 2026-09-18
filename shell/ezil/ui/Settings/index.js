@@ -59,8 +59,6 @@ import TabAppearance from './tabs/appearance.js';
 import TabSystem from './tabs/system.js';
 import TabAbout from './tabs/about.js';
 import TabTroubleshoot from './tabs/troubleshoot.js';
-import { isNative } from '../../native-runtime.js';
-import { openNativeSettings } from '../../apps/native.js';
 
 const PHASE = 'ezil-os:settings';
 
@@ -117,7 +115,6 @@ function buildHtml () {
  * @returns {Promise<HTMLElement|null>}
  */
 export async function openSettingsWindow (ctx = {}) {
-    if ( isNative(ctx) ) return openNativeSettings(ctx);
     const el_window = await UIWindow({
         title: 'Settings',
         app: 'settings',

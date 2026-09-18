@@ -30,6 +30,12 @@ class Workspaces {
     for (const child of ['files', 'editor-data', 'extensions', 'browser']) if (identity(noLinks(path.join(dir, child))) !== record.children[child]) throw Error('Workspace child identity changed');
     return { ...record, dir, files: path.join(dir, 'files'), editorData: path.join(dir, 'editor-data'), extensions: path.join(dir, 'extensions'), browser: path.join(dir, 'browser') };
   }
+  rename(id, label) {
+    this.checkRoots(); label = name(label);
+    const record = this.get(id), index = this.index.workspaces.findIndex(workspace => workspace.id === id);
+    this.index.workspaces[index] = { ...this.index.workspaces[index], name: label };
+    this.save(); return { ...record, name: label };
+  }
   create(label, source, legacyID) {
     this.checkRoots(); label = name(label);
     const id = randomUUID(), dir = privateDir(path.join(this.managed, id));

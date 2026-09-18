@@ -7,6 +7,10 @@ on:
         description: 'Successful macos-internal workflow_dispatch run for this exact protected commit'
         required: true
         type: string
+      external_vscode:
+        description: 'Also test an installed external Microsoft VS Code'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -67,6 +71,7 @@ jobs:
       - name: Install verified bytes and run logged-in GUI canaries
         env:
           ARTIFACT_DIR: ${{ runner.temp }}/native-artifact-${{ github.run_id }}
+          EZIL_SMOKE_EXTERNAL_VSCODE: ${{ inputs.external_vscode && '1' || '0' }}
           EVIDENCE_DIR: ${{ runner.temp }}/native-evidence-${{ github.run_id }}
         run: bash macos-electron/scripts/physical-smoke.sh "$ARTIFACT_DIR" "$EVIDENCE_DIR"
       - uses: actions/upload-artifact@v4

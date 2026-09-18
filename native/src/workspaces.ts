@@ -148,6 +148,12 @@ export class WorkspaceStore {
         write(join(this.root, 'index.json'), this.index);
         return record;
     }
+    rename(id: string, name: string): WorkspaceRecord {
+        if (this.attached) throw new NativeError('electron_owned_workspace', 409);
+        const record = { ...this.get(id), name: name.trim() };
+        write(join(this.root, 'workspaces', id, 'workspace.json'), record);
+        return record;
+    }
     setEditor(id: string, state: EditorState): WorkspaceRecord {
         const record = { ...this.get(id), editorState: state };
         if (this.attached) { this.attached.record = record; return record; }
