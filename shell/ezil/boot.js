@@ -650,6 +650,7 @@ function mount_desktop_root () {
  * @param {import('./apps/registry.js').AppDescriptor[]} apps
  */
 function maybe_warm_desktop (ctx, apps) {
+    if ( ctx?.desktopState?.provider === 'native-macos' ) return;
     if ( ctx?.computer?.id
         && ctx?.desktopState?.configured === true
         && apps.some((a) => a.id === 'desktop') ) {

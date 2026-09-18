@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "target": "ES2022", "module": "Preserve", "moduleResolution": "bundler",
+    "types": ["bun"], "allowImportingTsExtensions": true, "noEmit": true,
+    "strict": true, "noUncheckedIndexedAccess": true, "skipLibCheck": true,
+    "paths": { "@/*": ["../app/src/*"] }
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}

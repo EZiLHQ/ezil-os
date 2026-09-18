@@ -1,0 +1,8 @@
+{
+  "name": "@ezil-os/native",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "bun test", "typecheck": "tsc --noEmit", "start": "bun run src/main.ts" },
+  "devDependencies": { "@types/bun": "1.3.0", "typescript": "5.9.3" }
+}

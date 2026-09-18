@@ -1,0 +1,12 @@
+# The Vercel CLI is invoked from the monorepo root. Nested .gitignore files are
+# not a sufficient secret boundary for that upload: without these root-level
+# rules, app/.env was included in a preview source bundle even though Git
+# ignored it. Vercel provides hosted environment variables separately.
+**/.env
+**/.env.*
+
+# Local CLI state and build/dependency output are never deployment source.
+**/.vercel
+**/node_modules
+**/.next
+macos/build

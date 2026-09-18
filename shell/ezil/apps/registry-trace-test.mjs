@@ -35,7 +35,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const OS = path.resolve(here, '../../../app/public/os');
+const OS = process.env.EZIL_SHELL_OUT_DIR || path.resolve(here, '../../../app/public/os');
 
 for ( const f of ['icons.js', 'bundle.min.js', 'bundle.min.css'] ) {
     if ( ! fs.existsSync(path.join(OS, f)) ) {

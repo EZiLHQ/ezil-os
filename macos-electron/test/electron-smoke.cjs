@@ -1,0 +1,48 @@
+'use strict';
+const { app, BrowserWindow, session } = require('electron');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
+const http = require('node:http');
+const { randomUUID, createHash } = require('node:crypto');
+const { Browser } = require('../src/browser.cjs');
+const { Workspaces } = require('../src/workspaces.cjs');
+const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-electron-')));
+app.setPath('userData', path.join(temp, 'electron'));
+setTimeout(() => { console.error('Electron smoke timed out'); app.exit(1); }, 45000).unref();
+app.whenReady().then(async () => {
+  const store = new Workspaces(path.join(temp, 'data')), a = store.create('A'), b = store.create('B');
+  const sockets = new Set();
+  const server = http.createServer((_req, res) => {
+    res.setHeader('Content-Type', 'text/html');
+    res.end(`<title>Test</title><p>Remote page</p><script>window.hmr = new Promise(resolve => { const socket = new WebSocket('ws://127.0.0.1:${server.address().port}/hmr'); socket.onmessage = event => resolve(event.data); });</script>`);
+  });
+  server.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
+  server.on('upgrade', (req, socket) => {
+    const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    const message = Buffer.from('hmr-ready'); socket.write(Buffer.concat([Buffer.from([0x81, message.length]), message]));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const url = `http://127.0.0.1:${server.address().port}/`, generation = randomUUID();
+  const window = new BrowserWindow({ show: true, width: 900, height: 700, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
+  await window.loadURL('about:blank');
+  const first = new Browser(a, window, generation), second = new Browser(b, window, generation);
+  const create = workspaceId => ({ op: 'create', workspaceId, generation, sequence: 1, viewId: 'tab', url, bounds: { x: 20, y: 40, width: 500, height: 400 } });
+  await first.operation(create(a.id)); await second.operation(create(b.id));
+  const remote = first.views.get('tab').view.webContents, other = second.views.get('tab').view.webContents;
+  assert.equal(await remote.executeJavaScript('typeof require'), 'undefined'); assert.equal(await remote.executeJavaScript('typeof ezilNative'), 'undefined');
+  assert.equal(await remote.executeJavaScript('window.hmr'), 'hmr-ready');
+  await remote.executeJavaScript('localStorage.setItem("workspace", "A")'); assert.equal(await other.executeJavaScript('localStorage.getItem("workspace")'), null);
+  await remote.executeJavaScript('window.open("https://example.com")'); assert.equal(BrowserWindow.getAllWindows().length, 1);
+  assert.notEqual(first.session.getStoragePath(), second.session.getStoragePath());
+  assert.equal(remote.getLastWebPreferences().sandbox, true);
+  const snapshot = await first.operation({ op: 'snapshot', workspaceId: a.id, generation, sequence: 2, viewId: 'tab' }); assert.match(snapshot.snapshot, /^data:image\//);
+  assert.equal(window.contentView.children.includes(first.views.get('tab').view), false);
+  await first.operation({ op: 'restore', workspaceId: a.id, generation, sequence: 3, viewId: 'tab' });
+  assert.equal(window.contentView.children.includes(first.views.get('tab').view), true);
+  await first.close(); await second.close(); assert.equal(window.contentView.children.length, 0);
+  window.destroy(); for (const socket of sockets) socket.destroy(); server.close(); await session.defaultSession.clearStorageData();
+  fs.rmSync(temp, { recursive: true, force: true }); console.log('Electron composition/sandbox/partition/occlusion smoke passed'); app.exit(0);
+}).catch(() => { console.error('Electron smoke failed'); app.exit(1); });

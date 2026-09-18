@@ -18,8 +18,10 @@ Tauri wrapper around the launcher, or similar) needs real code-signing to avoid 
 quarantine, and the same document states plainly: "**Native installers are blocked on
 org-level signing prerequisites**: an Apple Developer ID with notarytool credentials, and an
 Authenticode signing route. Both are account-level things a person has to obtain; no amount of
-code produces them." No such Tauri wrapper, Apple Developer ID, or Authenticode certificate
-exists in this repository or its CI today.
+code produces them." The repository now contains an equivalent native Swift macOS wrapper and
+a fail-closed signing/notarization job. The macOS half is implemented but cannot produce a
+distributable asset until the Apple credentials are installed; a Windows wrapper and
+Authenticode route do not exist yet.
 
 ## Acceptance criteria
 
@@ -42,8 +44,10 @@ exists in this repository or its CI today.
   wrapper must invoke rather than reimplement.
 - `docs/RELEASE.md` and `.github/workflows/release.yml` — the existing signed-tarball release
   pipeline a native-installer build would need to plug into (or run alongside).
-- No `tauri.conf.json`, `src-tauri/`, or signing-certificate reference exists anywhere in this
-  repository today (verified by grep) — this is a from-scratch addition.
+- `macos/EZiLOSApp.swift`, `macos/build-dmg.sh` — the equivalent native wrapper and DMG builder.
+- `deploy/stage-local-runtime.sh` — the one runtime file list used by both the tarball and DMG.
+- `.github/workflows/release.yml` — fail-closed Developer ID signing and notarization; it never
+  uploads an unsigned fallback.
 
 ## How to prove it
 
@@ -53,10 +57,10 @@ installs and the launcher's own doctor check passes afterward.
 
 ## Prerequisite
 
-None — but this issue is **blocked**: it needs an Apple Developer ID with notarytool
-credentials and an Authenticode signing certificate, both account-level credentials the
-founder must obtain. No amount of code in a pull request produces them, which is why this is
-named here rather than scheduled, the same as `ARM-01`.
+The macOS implementation is blocked on an Apple Developer ID with notarytool credentials and
+the full issue remains blocked on a Windows wrapper plus an Authenticode signing certificate.
+Both credentials are account-level resources the founder must obtain. No amount of code in a
+pull request produces them, which is why this remains blocked, the same as `ARM-01`.
 
 ---
 

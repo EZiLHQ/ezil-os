@@ -114,6 +114,7 @@ describe('the boot payload', () => {
         // `boot-payload.ts`: "ALWAYS 'idle' at boot... the server has no
         // observation of whether the desktop is up, and refuses to imply one."
         expect(state.status).toBe('idle');
+        expect(state.provider).toBe('local-vm');
     });
 
     it('lists exactly the apps the app server lists', () => {

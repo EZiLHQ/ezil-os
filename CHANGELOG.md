@@ -9,13 +9,24 @@ Releases are cut by tagging `v*`, which triggers
 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) (deploys, then
 runs the production suites against what it deployed) and
 [`.github/workflows/release.yml`](.github/workflows/release.yml) (builds the
-downloadable local-mode tarball and opens a GitHub Release for it as a
-**draft**) side by side. `deploy.yml` publishes that draft — only once its own
+downloadable local-mode tarball plus signed/notarized macOS DMG and opens a
+GitHub Release for them as a **draft**) side by side. `deploy.yml` publishes that draft — only once its own
 production suites pass — so a green deploy that was never verified is not a
 release here, and neither is a release whose tarball built but whose deploy
 did not. See [`docs/RELEASE.md`](docs/RELEASE.md) for the full mechanics.
 
 ## [Unreleased]
+
+### Added
+
+- **Local-first Apple Silicon app.** The macOS 14+ Swift app creates an
+  anonymous, application-owned workspace, provides a native WebKit browser,
+  and boots a pinned ARM Linux developer runtime with code-server through
+  Apple's Virtualization framework. Files cross the boundary only through
+  explicit copy-based import and export; removing a workspace also removes
+  its VM disk, editor state, managed files, and isolated browser profile.
+  Internal CI produces an ad-hoc-signed DMG, while releases still require
+  Developer ID signing, notarization, stapling, checksums, and provenance.
 
 ## [0.2.0] - 2026-09-04
 

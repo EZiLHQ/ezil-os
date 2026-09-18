@@ -29,7 +29,8 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
 entry="$here/ezil/boot.js"
-out="$repo/app/public/os"
+# Override for isolated validation without modifying committed app assets.
+out="${EZIL_SHELL_OUT_DIR:-$repo/app/public/os}"
 
 ESBUILD_VERSION="0.28.1"
 CLEANCSS_VERSION="5.6.3"

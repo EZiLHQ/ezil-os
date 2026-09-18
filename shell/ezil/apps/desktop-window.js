@@ -1,3 +1,5 @@
+import { isNative } from '../native-runtime.js';
+import { bindNativeBrowser } from './native.js';
 // desktop-window.js — EZiL-authored. Not Puter code.
 //
 // The one window Wave 1 opens: the user's real Linux container, full-bleed,
@@ -618,6 +620,8 @@ export async function openDesktopWindow (ctx = {}) {
         });
         return null;
     }
+
+    if (isNative(ctx)) return bindNativeBrowser(el_window, ctx);
 
     const el_body = el_window.querySelector('.window-body');
     const el_iframe = el_window.querySelector('.window-app-iframe');

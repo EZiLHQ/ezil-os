@@ -456,6 +456,20 @@ describe('GET /api/shell/desktop — the cheap poll', () => {
         reset();
     });
 
+    it('confirm=frame pins Code and Preview to their own declared surface ports', async () => {
+        reset();
+        const probe = async (surface: string | undefined, frameUrl: string) => {
+            const query = new URLSearchParams({ computerId: computerId(), confirm: 'frame', frameUrl });
+            if (surface !== undefined) query.set('surface', surface);
+            return (await (await get(`${SHELL_API_ROUTES.desktop}?${query}`)).json()) as { confirmed: boolean; reason: string };
+        };
+        expect((await probe('code', localUrlFor('code'))).confirmed).toBe(true);
+        expect((await probe('preview', localUrlFor('appPreview'))).confirmed).toBe(true);
+        expect(await probe(undefined, localUrlFor('code'))).toMatchObject({ confirmed: false, reason: 'foreign_origin' });
+        expect(await probe('code', localUrlFor('desktop'))).toMatchObject({ confirmed: false, reason: 'foreign_origin' });
+        expect(await probe('unknown', localUrlFor('desktop'))).toMatchObject({ confirmed: false, reason: 'foreign_origin' });
+    });
+
     it('confirm=display answers unknown, well-formed', async () => {
         reset();
         const url = `${SHELL_API_ROUTES.desktop}?computerId=${computerId()}&confirm=display&frameUrl=x`;
