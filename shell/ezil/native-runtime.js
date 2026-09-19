@@ -24,11 +24,20 @@ export function nativeCompatible (ctx) {
     const state = ctx?.desktopState ?? ctx?.payload?.desktopState ?? globalThis.window?.__EZIL_BOOT__?.desktopState;
     return isNative(ctx) && Object.entries(NATIVE_CAPABILITIES).every(([key, value]) => state?.runtime?.[key] === value);
 }
+// These host operations may await a picker or confirmation for an arbitrary
+// amount of time. The bridge has no dialog-phase signal: await the host result
+// rather than report failure while it can still complete the user's action.
+// Keep this explicit so noninteractive operations retain bounded deadlines.
+const HOST_DIALOG_OPERATIONS = new Set([
+    'workspace.import', 'workspace.attach', 'workspace.relink',
+    'workspace.select', 'workspace.remove', 'workspace.openXcode',
+]);
 /** @param {import('../../native/src/contract.ts').NativeOperation} operation */
 export async function nativeOperation (operation) {
     if ( typeof window.ezilNative?.operation !== 'function' ) return { ok: false, error: 'native_unavailable' };
     let timer;
     try {
+        if (HOST_DIALOG_OPERATIONS.has(operation?.op)) return await window.ezilNative.operation(operation);
         const timeoutMs = operation?.op === 'provider.configure' ? 300_000 : operation?.op === 'code.open' ? 35_000 : 10_000;
         return await Promise.race([
             window.ezilNative.operation(operation),

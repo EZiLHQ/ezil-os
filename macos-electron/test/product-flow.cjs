@@ -72,19 +72,37 @@ function nativeButton(label, seconds = 45) {
     { timeout: (seconds + 5) * 1000 }, (error, stdout, stderr) => resolve({ clicked: !error && stdout.trim() === 'clicked',
       ...(error ? { error: error.killed ? 'automation_timeout' : 'accessibility_or_dialog_failed', code: String(error.code ?? '').slice(0, 40), detail: String(stderr || '').slice(0, 600) } : {}) })));
 }
-function nativeShortcut(action) {
+function nativeShortcut(action, point) {
   const pid = electronApp.process().pid;
   assert.ok(Number.isSafeInteger(pid) && pid > 1);
   const command = { address: 'keystroke "l" using command down', interrupt: 'keystroke "c" using control down' }[action];
   assert.ok(command);
+  if (point) assert.ok(Number.isSafeInteger(point.x) && Number.isSafeInteger(point.y));
   // CDP key events do not exercise Electron's before-input-event bridge.
   // Send the real macOS shortcut only to this test application's process.
   execFileSync('/usr/bin/osascript', ['-e', `tell application "System Events"
 tell first application process whose unix id is ${pid}
 set frontmost to true
+delay 0.15
+${point ? `click at {${point.x}, ${point.y}}\ndelay 0.15` : ''}
 ${command}
 end tell
 end tell`], { timeout: 5000 });
+}
+async function interruptTerminal() {
+  const win = await dock('code');
+  if (await win.getAttribute('data-is_maximized') !== '1') await win.locator('.window-scale-btn').click();
+  terminal = codeFrame.locator('textarea.xterm-helper-textarea').first();
+  const screen = codeFrame.locator('.xterm-screen:visible').first();
+  await screen.waitFor({ state: 'visible' });
+  const box = await screen.boundingBox(); assert.ok(box && box.height > 0);
+  const hostWindow = await electronApp.browserWindow(shellPage);
+  const geometry = await hostWindow.evaluate(win => ({ bounds: win.getContentBounds(), zoom: win.webContents.getZoomFactor() }));
+  // Physical input establishes the native WebContents focus as a user click
+  // would. DOM focus/CDP key delivery alone does not prove that OS focus moved
+  // away from the previous Chromium child view.
+  nativeShortcut('interrupt', { x: Math.round(geometry.bounds.x + (box.x + Math.min(20, box.width / 2)) * geometry.zoom),
+    y: Math.round(geometry.bounds.y + (box.y + Math.min(20, box.height / 2)) * geometry.zoom) });
 }
 async function unusedPort() {
   const server = net.createServer(); await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
@@ -279,9 +297,7 @@ async function run() {
     assert.equal(fs.readFileSync(path.join(project.files, 'src/message.ts'), 'utf8'), sourceText('EZIL_HMR'));
   });
   await step('stop_development_server', async () => {
-    await dock('code'); await palette('Terminal: Focus Terminal');
-    terminal = codeFrame.locator('textarea.xterm-helper-textarea').first();
-    await terminal.focus(); nativeShortcut('interrupt');
+    await interruptTerminal();
     await until(async () => { try { await fetch(origin, { signal: AbortSignal.timeout(500) }); return false; } catch { return true; } });
   });
   await step('preview_stop_restart_recovery', async () => {
@@ -305,7 +321,7 @@ async function run() {
     assert.notEqual(await preview.locator('body').getAttribute('data-document-id'), documentId);
     await screenshot('preview-restarted');
     await minimize('preview'); await dock('code'); await palette('Terminal: Focus Terminal');
-    terminal = codeFrame.locator('textarea.xterm-helper-textarea').first(); await terminal.focus(); nativeShortcut('interrupt');
+    await interruptTerminal();
     await until(async () => { try { await fetch(origin, { signal: AbortSignal.timeout(500) }); return false; } catch { return true; } });
   });
   report.success = true;
