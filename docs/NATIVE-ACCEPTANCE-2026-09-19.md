@@ -2,9 +2,65 @@
 
 ## Current continuation: page zoom and real Bun development
 
-Status: **unfinished; packaging and installed acceptance are pending**. The
-user removed the old 0.0.14 application and reconnected the SSD. The historical
-sections below describe earlier checks, not the current installed state.
+Status: **unfinished; 0.1.0 is installed, final patched packaging and acceptance
+remain pending**. The user removed the old 0.0.14 application and reconnected
+the SSD. The historical sections below describe earlier checks, not the
+current installed state.
+
+### Latest installed-machine continuation (19:13 local)
+
+The installed `/Applications/EZiL OS.app` contains runtime commit `53b0b4c`.
+Its matching internal DMG is in the September 19 SSD build root's `dist/`:
+`EZiL-OS-0.1.0-AppleSilicon-internal.dmg`, SHA-256
+`27c30162febfb2bc00b338738a11b2d685e15f04054e0396c6120019e98714b7`.
+Deep/strict signature verification passed. Staged and installed bundle
+fingerprints matched 7,280 entries, including symlink targets, file hashes
+and executable modes. The DMG was ejected before normal installed launch.
+Installed packaged mode was verified and desktop readiness measured 5,881 ms.
+This is one timing, not the required five-launch acceptance.
+
+Fresh installed-product observations:
+
+- Removed the accidentally created `VirtualBackgrounds` attached association
+  through Settings > Detach. A before/after tree hash confirmed the original
+  folder was unchanged. No original project files were deleted.
+- Attached `/Users/midhun/Projects/EZiL Local Playground` through the actual
+  native picker, verifying its destination before Open, then switched to it.
+  The host metadata confirms this exact original path.
+- Found a real renderer timeout defect: a folder selection taking more than
+  ten seconds attached successfully but reported failure and left Settings
+  stale. Reopening Settings exposed the successfully attached folder. Commit
+  `3a9996b` fixes host-owned dialog deadlines and includes deterministic delayed
+  success/cancel/rejection and ordinary-timeout regressions. This fix is **not
+  yet in the installed app or DMG**; those must be rebuilt and retested.
+- Opened embedded Code from the dock, trusted only the fixture, created
+  `bun-demo/server.ts` through Explorer, and verified the saved bytes. Started
+  `bun --hot bun-demo/server.ts` through its integrated terminal. The actual
+  Chromium Browser rendered its page at `http://localhost:49814/`; the + button
+  changed page zoom from 100% to 110%. The server remains running for now.
+- EZiL Settings > Xcode opened `apple-app/EZiLFixture.xcodeproj` in native
+  Xcode. Native Cmd+B completed with **Build Succeeded**. Native Cmd+U reached
+  the macOS **Developer Tools Access** authentication prompt before running
+  tests. The user must approve with Touch ID/password on the Mac. This is not
+  a LuLu or Accessibility prompt. XCTest/UI run acceptance is still pending.
+- LuLu remains enabled. Identified installed-editor Open VSX requests were
+  allowed temporarily; an optional Microsoft telemetry request was blocked
+  once. Further prompts were not broadly authorized or suppressed.
+
+Evidence: `evidence/installed-picker-verified.png`,
+`installed-bun-browser-zoom.png`, `installed-xcode-open.png`,
+`xcode-build-state.png`, and `xcode-test-state.png`. Some captures contain LuLu
+or authorization overlays and are **not clean final visual acceptance**.
+The Xcode build success was also read from its native accessibility status.
+
+The full development harness has passed individual Code/build, native
+download, HMR and lifecycle stages across runs, but has **no complete passing
+run yet**. Native terminal-focus automation was corrected and still needs a
+fresh full run. Five launches, the 30-minute development session, fresh
+installed external-editor sharing, and final process-cleanup audit remain
+open. Do not treat the existence of the installed application as release
+completion. Current free space is approximately 8.5 GiB internally and
+151 GiB on the SSD; no additional user files were moved in this continuation.
 
 Builds, runtime staging and evidence now use
 `/Volumes/9502040569/EZiL-Local-Build/2026-09-19/`. Both original application
