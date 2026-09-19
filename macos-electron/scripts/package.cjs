@@ -30,6 +30,10 @@ const build = fs.mkdtempSync(path.join(privateDir(path.resolve(process.env.EZIL_
 const out = privateDir(path.resolve(process.env.EZIL_DIST || path.join(root, 'dist')));
 const bundle = path.join(build, 'EZiL OS.app');
 run('/usr/bin/ditto', [template, bundle]);
+// Electron identifies its default executable as development mode, even inside
+// a renamed .app bundle. Production resource selection requires a branded
+// executable as well as the matching signed Info.plist entry.
+fs.renameSync(path.join(bundle, 'Contents/MacOS/Electron'), path.join(bundle, 'Contents/MacOS/EZiL OS'));
 const resources = path.join(bundle, 'Contents/Resources');
 fs.rmSync(path.join(resources, 'default_app.asar'), { force: true });
 const host = privateDir(path.join(resources, 'app'));
@@ -64,7 +68,7 @@ run('/usr/bin/curl', ['--fail', '--location', '--proto', '=https', '--tlsv1.2', 
 fs.copyFileSync(path.join(bunStage, 'package-lock.json'), path.join(resources, 'BUN-PACKAGE-LOCK.json'));
 fs.copyFileSync(path.join(root, 'package-lock.json'), path.join(resources, 'HOST-BUILD-LOCK.json'));
 const plist = path.join(bundle, 'Contents/Info.plist');
-for (const [key, value] of Object.entries({ CFBundleIdentifier: 'com.ezil.os.native', CFBundleName: 'EZiL OS', CFBundleDisplayName: 'EZiL OS', CFBundleShortVersionString: version, CFBundleVersion: version.split('-')[0] })) run('/usr/libexec/PlistBuddy', ['-c', `Set :${key} ${value}`, plist]);
+for (const [key, value] of Object.entries({ CFBundleIdentifier: 'com.ezil.os.native', CFBundleExecutable: 'EZiL OS', CFBundleName: 'EZiL OS', CFBundleDisplayName: 'EZiL OS', CFBundleShortVersionString: version, CFBundleVersion: version.split('-')[0] })) run('/usr/libexec/PlistBuddy', ['-c', `Set :${key} ${value}`, plist]);
 const inventory = { distribution: 'internal-ad-hoc', version, gitSHA: process.env.GITHUB_SHA || run('git', ['rev-parse', 'HEAD'], { cwd: repo, stdio: 'pipe', encoding: 'utf8' }).trim(), electron: pkg.devDependencies.electron, bun: pkg.ezilTools.bun, node: process.version, files: {} };
 inventory.inputs = inputInventory;
 inventory.architecture = 'arm64';

@@ -54,7 +54,7 @@ cp "$scratch/EZiL OS.app/Contents/Resources/SBOM.json" "$evidence_dir/SBOM.json"
 # No Gatekeeper bypass or quarantine removal. This is an internal ad-hoc test,
 # not evidence of public Developer ID/notarization/Gatekeeper acceptance.
 EZIL_NATIVE_APP_DATA="$scratch/data" EZIL_ARTIFACT_SHA256="$actual" EZIL_SMOKE_OFFLINE=1 \
-  "$scratch/EZiL OS.app/Contents/MacOS/Electron" --native-smoke \
+  "$scratch/EZiL OS.app/Contents/MacOS/EZiL OS" --native-smoke \
   > /dev/null 2> /dev/null
 test -f "$scratch/data/evidence/result.json"
 /usr/bin/plutil -extract success raw -o - "$scratch/data/evidence/result.json" | /usr/bin/grep -qx true

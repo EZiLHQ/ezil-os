@@ -11,7 +11,7 @@ const { developmentEnvironment } = require('../src/development-environment.cjs')
 const root = path.resolve(__dirname, '../..');
 const appRoot = process.env.EZIL_TABS_APP || path.join(root, 'macos-electron');
 const packaged = appRoot.endsWith('.app');
-const executablePath = process.env.EZIL_TABS_EXECUTABLE || (packaged ? path.join(appRoot, 'Contents/MacOS/Electron') : path.join(root, 'macos-electron/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron'));
+const executablePath = process.env.EZIL_TABS_EXECUTABLE || (packaged ? path.join(appRoot, 'Contents/MacOS/EZiL OS') : path.join(root, 'macos-electron/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron'));
 const resources = packaged ? path.join(appRoot, 'Contents/Resources') : root;
 const evidenceRoot = process.env.EZIL_TABS_EVIDENCE;
 assert.ok(evidenceRoot && path.isAbsolute(evidenceRoot), 'Set an absolute EZIL_TABS_EVIDENCE directory');
@@ -83,6 +83,7 @@ async function launch() {
     env: { ...developmentEnvironment(resources), EZIL_NATIVE_APP_DATA: dataRoot, EZIL_NATIVE_SKIP_LEGACY: '1',
       EZIL_NATIVE_RESOURCES: root, EZIL_SHELL_ASSETS: path.join(root, 'app/public/os'),
       EZIL_BUN_PATH: process.env.EZIL_BUN_PATH || path.join(root, '.native-tools/bin/bun') } });
+  assert.equal(await app.evaluate(({ app }) => app.isPackaged), packaged, 'application runtime mode must match its distribution');
   page = await app.firstWindow(); page.setDefaultTimeout(8000);
   await page.locator('.taskbar-item[data-app="desktop"]').waitFor();
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().find(w => w.webContents.getURL().startsWith('http:')).setSize(1280, 800));

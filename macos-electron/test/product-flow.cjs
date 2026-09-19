@@ -72,6 +72,18 @@ function nativeButton(label, seconds = 45) {
     { timeout: (seconds + 5) * 1000 }, (error, stdout, stderr) => resolve({ clicked: !error && stdout.trim() === 'clicked',
       ...(error ? { error: error.killed ? 'automation_timeout' : 'accessibility_or_dialog_failed', code: String(error.code ?? '').slice(0, 40), detail: String(stderr || '').slice(0, 600) } : {}) })));
 }
+function nativeAddressShortcut() {
+  const pid = electronApp.process().pid;
+  assert.ok(Number.isSafeInteger(pid) && pid > 1);
+  // CDP key events do not exercise Electron's before-input-event bridge.
+  // Send the real macOS shortcut only to this test application's process.
+  execFileSync('/usr/bin/osascript', ['-e', `tell application "System Events"
+tell first application process whose unix id is ${pid}
+set frontmost to true
+keystroke "l" using command down
+end tell
+end tell`], { timeout: 5000 });
+}
 async function unusedPort() {
   const server = net.createServer(); await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   const port = server.address().port; await new Promise(resolve => server.close(resolve)); return port;
@@ -114,6 +126,7 @@ async function run() {
     for (const key of ['EZIL_BUN_PATH', 'EZIL_HELPER_PATH', 'EZIL_NATIVE_RESOURCES', 'EZIL_SHELL_ASSETS']) if (process.env[key]) env[key] = required(key);
     env.EZIL_NATIVE_SKIP_LEGACY = '1';
     electronApp = await _electron.launch({ executablePath, args: packaged ? [] : [appRoot], env, timeout: READY });
+    assert.equal(await electronApp.evaluate(({ app }) => app.isPackaged), packaged, 'application runtime mode must match its distribution');
     shellPage = await electronApp.firstWindow();
     report.rendererErrors = [];
     shellPage.on('pageerror', error => { if (report.rendererErrors.length < 6) report.rendererErrors.push(error.message.slice(0, 240)); });
@@ -196,7 +209,7 @@ async function run() {
     await address.fill(`${origin}/__ezil_input`); await address.press('Enter');
     const browser = await until(() => electronApp.context().pages().find(page => page.url() === `${origin}/__ezil_input`));
     const typing = browser.locator('#typing'); await typing.click(); await browser.keyboard.type('before-address');
-    await browser.keyboard.press('Meta+l');
+    nativeAddressShortcut();
     await until(() => address.evaluate(el => document.activeElement === el));
     await shellPage.keyboard.type('localhost:12345');
     assert.equal(await address.inputValue(), 'localhost:12345', 'address_shortcut_did_not_select');
@@ -296,7 +309,7 @@ async function cleanup() {
   if (!electronApp) return;
   // Native confirmation is OS UI, outside Chromium. Only click the fixed quit
   // button in our launched PID; Accessibility permission is needed on macOS.
-  const pid = electronApp.process().pid;
+  const child = electronApp.process(), pid = child.pid;
   const dialog = nativeButton('Stop workspace', 45);
   let timer;
   try {
@@ -306,7 +319,7 @@ async function cleanup() {
     report.cleanup = 'closed';
   } catch {
     report.cleanup = 'quit_failed'; report.success = false;
-    if (electronApp.process().exitCode !== null || electronApp.process().signalCode !== null) return;
+    if (child.exitCode !== null || child.signalCode !== null) return;
     // No broad PID/name matching, and no claim of clean lifecycle acceptance.
     // Failed-run cleanup only, never lifecycle acceptance. Enumerate only
     // descendants of this test's live Electron PID before terminating it.
@@ -314,7 +327,7 @@ async function cleanup() {
     const owned = new Set([pid]);
     for (let i = 0; i < rows.length; i++) for (const [child, parent] of rows) if (owned.has(parent)) owned.add(child);
     for (const child of [...owned].reverse()) if (child !== pid) { try { process.kill(child, 'SIGTERM'); } catch {} }
-    electronApp.process().kill('SIGKILL');
+    child.kill('SIGKILL');
   } finally { clearTimeout(timer); report.quitDialog = await dialog; }
 }
 if (require.main === module) {

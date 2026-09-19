@@ -62,6 +62,14 @@ inline codesign requirement syntax and resolved the verified executable name
 actual signature-verified discovery now pass. No signature protection was
 removed or relaxed.
 
+The next isolated packaged launch correctly failed acceptance before
+installation: Electron reported `app.isPackaged === false` because the
+application executable retained the default `Electron` name. The packager now
+renames both the executable and `CFBundleExecutable` to `EZiL OS`, and the
+Browser/development harnesses assert the expected runtime mode. This is a
+packaging fix, not a production-path exception. Superseded DMGs remain on the
+SSD for diagnosis and must not be installed.
+
 ## Historical checks before the SSD was reconnected
 
 Branch: `codex/macos-native-completion`, based on `e30539e`.
