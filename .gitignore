@@ -2,6 +2,8 @@
 # `node_modules` without a trailing slash: worktrees carry node_modules as SYMLINKS to the main tree, and a
 # directory-only pattern (trailing slash) would leave every symlink showing as untracked in every worktree.
 node_modules
+.native-tools
+.native-evidence/
 
 # Build output (except intentionally-committed, pre-built bundles that
 # something downstream consumes without a toolchain)

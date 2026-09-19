@@ -4,6 +4,7 @@ import { isAbsolute, relative, resolve, dirname } from 'node:path';
 export interface BrokerDescriptor {
     contractVersion: 1; origin: string; workspaceId: string; token: string;
     expiresAt: number; dataRoot: string; workspacePath: string;
+    workspaceKind?: 'managed' | 'attached'; workspaceIdentity?: string;
 }
 /** Electron's provider broker exposes no workspace-management operations. */
 export interface ModelBrokerDescriptor {
@@ -22,8 +23,15 @@ function noSymlinks(path: string): void {
     }
 }
 function loopbackOrigin(value: unknown): value is string {
-    return typeof value === 'string' && /^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(value)
-        && new URL(value).origin === value;
+    try { return typeof value === 'string' && /^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(value)
+        && new URL(value).origin === value; } catch { return false; }
+}
+/** Only local files or the bundled editor's loopback remote filesystem. The
+ * private descriptor still authorizes the exact canonical directory and inode. */
+export function localFolder(uri: { scheme: string; authority: string; fsPath: string }): string {
+    if (uri.scheme === 'file' && !uri.authority) return uri.fsPath;
+    if (uri.scheme === 'vscode-remote' && loopbackOrigin(`http://${uri.authority}`)) return uri.fsPath;
+    return '';
 }
 export function readBroker(path: string | undefined, folders: readonly string[], now = Date.now()): Descriptor {
     if (!path || !isAbsolute(path)) throw new Error('broker_unavailable');
@@ -58,10 +66,26 @@ export function readBroker(path: string | undefined, folders: readonly string[],
             resolve(dataRoot, 'native-v1', 'workspaces', value.workspaceId, 'files')];
         // The descriptor is app-owned and outside the project. Electron-owned
         // workspaces and standalone helper workspaces use different managed roots.
-        if (!managed.includes(expected) || !inside(dataRoot, path) || inside(expected, path)
+        if (!inside(dataRoot, path) || inside(expected, path)
             || resolve(folders[0]!) !== expected) throw new Error('broker_unavailable');
         noSymlinks(dataRoot);
         noSymlinks(expected);
+        const kind = value.workspaceKind;
+        if (kind === 'attached') {
+            // Attached roots are authorized only by the fixed host-owned
+            // connector descriptor, never by metadata inside a project.
+            if (resolve(path) !== resolve(dataRoot, 'private', 'connectors', `${value.workspaceId}.json`)
+                || inside(dataRoot, expected) || inside(expected, dataRoot)) throw new Error('broker_unavailable');
+            for (const directory of [dataRoot, dirname(dirname(path)), dirname(path)]) {
+                const stat = lstatSync(directory);
+                if (!stat.isDirectory() || (stat.mode & 0o077) !== 0
+                    || (process.getuid && stat.uid !== process.getuid())) throw new Error('broker_unavailable');
+            }
+        } else if ((kind !== undefined && kind !== 'managed') || !managed.includes(expected)) throw new Error('broker_unavailable');
+        if (kind !== undefined || value.workspaceIdentity !== undefined) {
+            const stat = lstatSync(expected);
+            if (!kind || value.workspaceIdentity !== `${stat.dev}:${stat.ino}`) throw new Error('broker_unavailable');
+        }
         return value;
     } catch { throw new Error('broker_unavailable'); }
     finally { closeSync(fd); }

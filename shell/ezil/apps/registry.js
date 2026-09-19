@@ -511,6 +511,12 @@ export function resolve (payload) {
     for ( const id of ids ) {
         if ( ! getApp(id) ) log.warn(`[${PHASE}] server offers "${id}" but this shell cannot open it`);
     }
+    // Native development has no container provisioning gate. Keep its core
+    // tools reachable directly from the dock, including after window close.
+    if (payload?.desktopState?.provider === 'native-macos') {
+        const order = ['desktop', 'code', 'preview', 'settings'];
+        return allowed.map(a => ({ ...a, pinned: true })).sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+    }
     return allowed;
 }
 

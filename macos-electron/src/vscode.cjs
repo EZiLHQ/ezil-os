@@ -3,7 +3,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { execFileSync, spawn } = require('node:child_process');
-const { noLinks, identity, atomic, readJSON } = require('./files.cjs');
+const { noLinks, identity, atomic, readJSON, privateDir } = require('./files.cjs');
+const { developmentEnvironment, configureTerminalEnvironment } = require('./development-environment.cjs');
 const { installConnector } = require('./connector.cjs');
 const TEAM = 'UBF8T346G9', BUNDLE = 'com.microsoft.VSCode';
 const MINIMUM_VERSION = Object.freeze({ major: 1, minor: 109 });
@@ -35,7 +36,7 @@ function discover({ platform = process.platform, home = os.homedir(), run = exec
 }
 function argv(workspace) {
   for (const key of ['files', 'editorData', 'extensions']) if (!path.isAbsolute(workspace[key]) || workspace[key].includes('\0')) throw Error('Invalid editor directory');
-  return ['--new-window', '--user-data-dir', workspace.editorData, '--extensions-dir', workspace.extensions, workspace.files];
+  return ['--new-window', '--user-data-dir', path.join(workspace.editorData, 'external-vscode'), '--extensions-dir', path.join(workspace.extensions, 'external-vscode'), workspace.files];
 }
 function cleanEnvironment() {
   // Project tools retain normal user permissions, but never inherit EZiL
@@ -50,8 +51,8 @@ function descriptorPath(file) {
   if (!stat.isFile() || stat.nlink !== 1 || stat.size > 4096 || (stat.mode & 0o077) !== 0) throw Error('Invalid broker descriptor');
   return file;
 }
-function editorEnvironment(descriptors = {}) {
-  const env = cleanEnvironment();
+function editorEnvironment(descriptors = {}, resources) {
+  const env = developmentEnvironment(resources);
   const connector = descriptorPath(descriptors.connector);
   const model = descriptorPath(descriptors.model);
   if (connector) env.EZIL_BROKER_FILE = connector;
@@ -59,9 +60,9 @@ function editorEnvironment(descriptors = {}) {
   return env;
 }
 class Editors {
-  constructor({ extensionSource, findCode = discover, launch = spawn } = {}) {
+  constructor({ extensionSource, resources, findCode = discover, launch = spawn } = {}) {
     this.instances = new Map(); this.starting = new Set();
-    this.extensionSource = extensionSource; this.findCode = findCode; this.launch = launch;
+    this.extensionSource = extensionSource; this.resources = resources; this.findCode = findCode; this.launch = launch;
   }
   marker(w) { return path.join(w.dir, 'editor-instance.json'); }
   state(w) {
@@ -72,13 +73,16 @@ class Editors {
   async start(w, descriptors) {
     if (this.starting.has(w.id)) return { status: 'unavailable' };
     if (this.state(w) !== 'stopped') return { status: this.state(w) };
-    const code = this.findCode(); if (!code) return { status: 'missing', installer: INSTALLER };
-    installConnector(this.extensionSource, w);
+    const code = await this.findCode(); if (!code) return { status: 'missing', installer: INSTALLER };
+    if (this.starting.has(w.id)) return { status: 'unavailable' };
+    configureTerminalEnvironment(w, { external: true });
+    const external = { ...w, editorData: privateDir(path.join(w.editorData, 'external-vscode')), extensions: privateDir(path.join(w.extensions, 'external-vscode')) };
+    if (this.extensionSource) installConnector(this.extensionSource, external);
     if (identity(code.executable) !== code.identity) throw Error('VS Code changed during verification');
     this.starting.add(w.id);
     try {
       atomic(this.marker(w), JSON.stringify({ state: 'unknown' }));
-      const child = this.launch(code.executable, argv(w), { env: editorEnvironment(descriptors), stdio: 'ignore', shell: false });
+      const child = this.launch(code.executable, argv(w), { cwd: w.files, env: editorEnvironment(descriptors, this.resources), stdio: 'ignore', shell: false });
       const instance = { child, stopping: false }; this.instances.set(w.id, instance);
       child.once('error', () => { this.instances.delete(w.id); });
       child.once('exit', () => {
@@ -92,10 +96,11 @@ class Editors {
   }
   async open(w, descriptors) {
     if (this.state(w) !== 'running') return this.start(w, descriptors);
-    const code = this.findCode();
+    const code = await this.findCode();
     if (!code || identity(code.executable) !== code.identity) return { status: 'unavailable' };
+    configureTerminalEnvironment(w, { external: true });
     // Forward a fixed reuse-window invocation to this dedicated VS Code profile.
-    const child = this.launch(code.executable, ['--reuse-window', ...argv(w).slice(1)], { env: editorEnvironment(descriptors), stdio: 'ignore', shell: false });
+    const child = this.launch(code.executable, ['--reuse-window', ...argv(w).slice(1)], { cwd: w.files, env: editorEnvironment(descriptors, this.resources), stdio: 'ignore', shell: false });
     const status = await new Promise(resolve => {
       const timer = setTimeout(() => resolve('unavailable'), 5000);
       const done = value => { clearTimeout(timer); resolve(value); };

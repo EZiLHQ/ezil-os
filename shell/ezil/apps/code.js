@@ -1,4 +1,4 @@
-import { selectRuntimeAdapter } from '../native-runtime.js';
+import { selectRuntimeAdapter, watchNativeSurface } from '../native-runtime.js';
 // code.js — EZiL-authored. Not Puter code.
 //
 // The Code window: code-server (VS Code Web), over plain HTTP, in an iframe.
@@ -282,13 +282,16 @@ export async function openCodeWindow (ctx = {}) {
     let attempt = 0;
     let running_signal;
     let disposed = false;
+    let stop_monitor = () => {};
 
     const stop_timers = () => {
+        stop_monitor(); stop_monitor = () => {};
         clearInterval(tick_timer); tick_timer = null;
         clearInterval(poll_timer); poll_timer = null;
     };
 
-    const progress = AppSpinner({ label: 'Opening Code…', onRetry: () => { void start_boot(); } });
+    const progress = AppSpinner({ label: 'Opening Code…', onRetry: () => { void start_boot(); },
+        failureCopy: nativeSurface ? { title: 'Code is unavailable', body: 'The local editor could not start or its connection was lost. Try again. If this continues, reinstall EZiL OS.' } : undefined });
     el_body.appendChild(progress.el);
 
     // ── the "editor is not reachable" panel ──────────────────────────────
@@ -497,6 +500,11 @@ export async function openCodeWindow (ctx = {}) {
             if ( seen === true ) {
                 progress.el.hidden = true;
                 el_unavailable.hidden = true;
+                stop_monitor = watchNativeSurface(nativeSurface, () => {
+                    if (disposed || my_attempt !== attempt) return;
+                    show_panel();
+                    progress.render(computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: false }));
+                });
                 console.info(`[${PHASE}] code frame confirmed by the server`);
                 // Terminal: a confirmed frame IS the whole verdict for this
                 // window — there is no separate display gate here.

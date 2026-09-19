@@ -85,7 +85,18 @@ function noSymlinks(path) {
   }
 }
 function loopbackOrigin(value) {
-  return typeof value === "string" && /^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(value) && new URL(value).origin === value;
+  try {
+    return typeof value === "string" && /^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(value) && new URL(value).origin === value;
+  } catch {
+    return false;
+  }
+}
+function localFolder(uri) {
+  if (uri.scheme === "file" && !uri.authority)
+    return uri.fsPath;
+  if (uri.scheme === "vscode-remote" && loopbackOrigin(`http://${uri.authority}`))
+    return uri.fsPath;
+  return "";
 }
 function readBroker(path, folders, now = Date.now()) {
   if (!path || !import_node_path.isAbsolute(path))
@@ -117,10 +128,26 @@ function readBroker(path, folders, now = Date.now()) {
       import_node_path.resolve(dataRoot, "workspaces", value.workspaceId, "files"),
       import_node_path.resolve(dataRoot, "native-v1", "workspaces", value.workspaceId, "files")
     ];
-    if (!managed.includes(expected) || !inside(dataRoot, path) || inside(expected, path) || import_node_path.resolve(folders[0]) !== expected)
+    if (!inside(dataRoot, path) || inside(expected, path) || import_node_path.resolve(folders[0]) !== expected)
       throw new Error("broker_unavailable");
     noSymlinks(dataRoot);
     noSymlinks(expected);
+    const kind = value.workspaceKind;
+    if (kind === "attached") {
+      if (import_node_path.resolve(path) !== import_node_path.resolve(dataRoot, "private", "connectors", `${value.workspaceId}.json`) || inside(dataRoot, expected) || inside(expected, dataRoot))
+        throw new Error("broker_unavailable");
+      for (const directory of [dataRoot, import_node_path.dirname(import_node_path.dirname(path)), import_node_path.dirname(path)]) {
+        const stat = import_node_fs.lstatSync(directory);
+        if (!stat.isDirectory() || (stat.mode & 63) !== 0 || process.getuid && stat.uid !== process.getuid())
+          throw new Error("broker_unavailable");
+      }
+    } else if (kind !== undefined && kind !== "managed" || !managed.includes(expected))
+      throw new Error("broker_unavailable");
+    if (kind !== undefined || value.workspaceIdentity !== undefined) {
+      const stat = import_node_fs.lstatSync(expected);
+      if (!kind || value.workspaceIdentity !== `${stat.dev}:${stat.ino}`)
+        throw new Error("broker_unavailable");
+    }
     return value;
   } catch {
     throw new Error("broker_unavailable");
@@ -373,9 +400,17 @@ var heartbeat;
 var report;
 var ports = new Set;
 async function activate(context) {
-  if (!vscode2.workspace.isTrusted)
+  if (!vscode2.workspace.isTrusted) {
+    const waiting = vscode2.workspace.onDidGrantWorkspaceTrust(() => {
+      waiting.dispose();
+      activate(context).catch(() => {
+        console.info("EZIL_CONNECTOR_INITIALIZATION_FAILED");
+      });
+    });
+    context.subscriptions.push(waiting);
     return;
-  const folders = () => (vscode2.workspace.workspaceFolders ?? []).map((folder) => folder.uri.scheme === "file" ? folder.uri.fsPath : "");
+  }
+  const folders = () => (vscode2.workspace.workspaceFolders ?? []).map((folder) => localFolder(folder.uri));
   if (process.env.EZIL_AI_BROKER_FILE) {
     context.subscriptions.push(vscode2.lm.registerLanguageModelChatProvider("ezil", new EZiLModelProvider(() => process.env.EZIL_AI_BROKER_FILE, folders)));
     context.subscriptions.push(vscode2.commands.registerCommand("ezil.listModels", async () => {
@@ -390,12 +425,15 @@ async function activate(context) {
       }
     }));
   }
-  if (!process.env.EZIL_BROKER_FILE)
+  if (!process.env.EZIL_BROKER_FILE) {
+    console.info("EZIL_CONNECTOR_NO_DESCRIPTOR");
     return;
+  }
   try {
     if ("url" in readBroker(process.env.EZIL_BROKER_FILE, folders()))
       throw new Error("connector_unavailable");
   } catch {
+    console.info("EZIL_CONNECTOR_INVALID_DESCRIPTOR");
     vscode2.window.showInformationMessage("EZiL connector is unavailable. You can keep using VS Code.");
     return;
   }
@@ -412,6 +450,7 @@ async function activate(context) {
   };
   try {
     await refresh();
+    console.info("EZIL_CONNECTOR_READY");
   } catch {
     vscode2.window.showInformationMessage("EZiL connector is unavailable. You can keep using VS Code.");
   }

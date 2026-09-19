@@ -13,6 +13,10 @@ const { authenticatedHeaders } = require('../src/helper.cjs');
 const { EditorSupervisor } = require('../src/editor.cjs');
 const { checkClosure } = require('../scripts/bundle-helper.cjs');
 const id = randomUUID(), generation = randomUUID();
+function editorWorkspace(root) {
+  const editorData = path.join(root, 'editor-data'); fs.mkdirSync(editorData);
+  return { id, dir: root, files: root, editorData, extensions: path.join(root, 'extensions') };
+}
 function fakeBrowser() {
   const window = new EventEmitter(), contents = new EventEmitter();
   Object.assign(window, { webContents: contents, isDestroyed: () => false, getContentSize: () => [800, 600], contentView: { children: [], addChildView(v) { this.children.push(v); }, removeChildView(v) { this.children = this.children.filter(x => x !== v); } } });
@@ -90,7 +94,7 @@ test('late capture cannot restore a destroyed or newly visible view', async t =>
 });
 test('supervisor deduplicates starts, keeps secrets out of child env/args, stops and retries failures', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-supervisor-'))); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const workspace = { id, files: root, editorData: path.join(root, 'data'), extensions: path.join(root, 'extensions') };
+  const workspace = editorWorkspace(root);
   let launches = 0, socketFailure; const states = [];
   // Real private socket stat, injected login. Socket transport is covered separately.
   const net = require('node:net'); let server;
@@ -121,7 +125,7 @@ test('closure verifier rejects unbundled packages and relative runtime imports',
 });
 test('supervisor ready, failed, stopped, cancellation and restart transitions without socket binding', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-state-'))); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const workspace = { id, files: root, editorData: path.join(root, 'data'), extensions: path.join(root, 'extensions') };
+  const workspace = editorWorkspace(root);
   let mode = 'ready', launches = 0, child; const states = [];
   const supervisor = new EditorSupervisor({ resources: root, timeout: 10,
     socketStat: () => ({ isSocket: () => true, mode: 0o600 }),
@@ -143,7 +147,7 @@ test('supervisor ready, failed, stopped, cancellation and restart transitions wi
 });
 test('supervisor does not signal a process group again after graceful exit', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-graceful-'))); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const workspace = { id, files: root, editorData: path.join(root, 'data'), extensions: path.join(root, 'extensions') };
+  const workspace = editorWorkspace(root);
   const signals = [];
   const supervisor = new EditorSupervisor({ resources: root,
     socketStat: () => ({ isSocket: () => true, mode: 0o600 }), authenticate: async () => 'cookie=opaque',
@@ -154,15 +158,22 @@ test('supervisor does not signal a process group again after graceful exit', asy
   await supervisor.start(workspace); await supervisor.stop(id);
   assert.deepEqual(signals, ['SIGTERM']);
 });
-test('failed browser creation removes its native child', async t => {
+test('navigation fails asynchronously while real creation failure leaves no native child', async t => {
   const { directory, browser, View, window } = fakeBrowser(); t.after(async () => { await browser.close(); fs.rmSync(directory, { recursive: true, force: true }); });
   browser.WebContentsView = class extends View { constructor(options) { super(options); this.webContents.loadURL = async () => { throw Error('Navigation failed'); }; } };
-  await assert.rejects(browser.operation({ op: 'create', workspaceId: id, generation, sequence: 1, viewId: 'failed', url: 'https://example.com', bounds: { x: 0, y: 0, width: 10, height: 10 } }));
+  const create = { op: 'create', workspaceId: id, generation, sequence: 1, viewId: 'failed', url: 'https://example.com', bounds: { x: 0, y: 0, width: 10, height: 10 } };
+  assert.deepEqual(await browser.operation(create), { state: 'created' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(browser.state('failed').error, 'navigation_failed');
+  assert.equal(browser.views.size, 1); assert.equal(window.contentView.children.length, 1);
+  browser.destroy('failed');
+  browser.WebContentsView = class { constructor() { throw Error('View allocation failed'); } };
+  await assert.rejects(browser.operation({ ...create, sequence: 2 }), /View allocation failed/);
   assert.equal(browser.views.size, 0); assert.equal(window.contentView.children.length, 0);
 });
 test('editor cancellation while authenticating cannot publish ready or leave runtime files', async t => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-cancel-'))); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const workspace = { id, files: root, editorData: path.join(root, 'data'), extensions: path.join(root, 'extensions') };
+  const workspace = editorWorkspace(root);
   let release;
   const supervisor = new EditorSupervisor({ resources: root, socketStat: () => ({ isSocket: () => true, mode: 0o600 }), authenticate: () => new Promise(resolve => { release = resolve; }), launch: () => {
     const child = new EventEmitter(); child.kill = () => queueMicrotask(() => child.emit('exit')); return child;

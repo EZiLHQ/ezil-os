@@ -7,6 +7,7 @@ const { copyTree, privateDir, atomic } = require('../src/files.cjs');
 const { bundleHelper } = require('./bundle-helper.cjs');
 const { stageCodeServer, binaryKind } = require('./code-server.cjs');
 const { validateInputs, stageInputs } = require('./inputs.cjs');
+const { verifyRuntimeBundle } = require('./verify-bundle.cjs');
 const root = path.resolve(__dirname, '..'), repo = path.dirname(root);
 const pkg = require('../package.json');
 function run(bin, args, options = {}) { return execFileSync(bin, args, { stdio: 'inherit', ...options }); }
@@ -25,7 +26,7 @@ if (electronPackage.version !== pkg.devDependencies.electron) throw Error('Elect
 const electronRoot = path.dirname(require.resolve('electron/package.json'));
 const template = path.join(electronRoot, 'dist/Electron.app');
 if (!fs.existsSync(template)) throw Error('Install the pinned Darwin arm64 Electron binary first');
-const build = fs.mkdtempSync(path.join(privateDir(path.join(root, '.stage')), 'build-'));
+const build = fs.mkdtempSync(path.join(privateDir(path.resolve(process.env.EZIL_STAGE_ROOT || path.join(root, '.stage'))), 'build-'));
 const out = privateDir(path.resolve(process.env.EZIL_DIST || path.join(root, 'dist')));
 const bundle = path.join(build, 'EZiL OS.app');
 run('/usr/bin/ditto', [template, bundle]);
@@ -68,6 +69,9 @@ const inventory = { distribution: 'internal-ad-hoc', version, gitSHA: process.en
 inventory.inputs = inputInventory;
 inventory.architecture = 'arm64';
 inventory.codeServer = codeServerInventory;
+// Never produce another shell-only installer. Verify the application owns all
+// runtime dependencies before signing, without relying on the build SSD.
+inventory.portabilityBeforeSigning = verifyRuntimeBundle(resources, inventory);
 const runtimeComponents = new Map();
 function componentPackages(directory) {
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {

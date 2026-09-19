@@ -8,9 +8,9 @@
   "private": true,
   "engines": { "vscode": "^1.109.0" },
   "main": "./dist/extension.js",
-  "extensionKind": ["ui"],
+  "extensionKind": ["workspace"],
   "activationEvents": ["onStartupFinished"],
-  "capabilities": { "untrustedWorkspaces": { "supported": false }, "virtualWorkspaces": false },
+  "capabilities": { "untrustedWorkspaces": { "supported": "limited", "description": "The connector waits for workspace trust before reading broker descriptors or enabling previews and models." }, "virtualWorkspaces": false },
   "contributes": {
     "languageModelChatProviders": [
       { "vendor": "ezil", "displayName": "EZiL BYOK" }

@@ -1,13 +1,20 @@
 import * as vscode from 'vscode';
-import { parsePort, readBroker, readModels, sendOperation } from './broker';
+import { localFolder, parsePort, readBroker, readModels, sendOperation } from './broker';
 import { EZiLModelProvider } from './model-provider';
 
 let heartbeat: ReturnType<typeof setInterval> | undefined;
 let report: ((operation: Record<string, unknown>) => Promise<void>) | undefined;
 const ports = new Set<number>();
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-    if (!vscode.workspace.isTrusted) return;
-    const folders = () => (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri.scheme === 'file' ? folder.uri.fsPath : '');
+    if (!vscode.workspace.isTrusted) {
+        const waiting = vscode.workspace.onDidGrantWorkspaceTrust(() => {
+            waiting.dispose();
+            void activate(context).catch(() => { console.info('EZIL_CONNECTOR_INITIALIZATION_FAILED'); });
+        });
+        context.subscriptions.push(waiting);
+        return;
+    }
+    const folders = () => (vscode.workspace.workspaceFolders ?? []).map(folder => localFolder(folder.uri));
     if (process.env.EZIL_AI_BROKER_FILE) {
         context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider('ezil', new EZiLModelProvider(() => process.env.EZIL_AI_BROKER_FILE, folders)));
         context.subscriptions.push(vscode.commands.registerCommand('ezil.listModels', async () => {
@@ -19,10 +26,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             } catch { void vscode.window.showInformationMessage('EZiL model broker is unavailable.'); }
         }));
     }
-    if (!process.env.EZIL_BROKER_FILE) return;
+    if (!process.env.EZIL_BROKER_FILE) { console.info('EZIL_CONNECTOR_NO_DESCRIPTOR'); return; }
     try {
         if ('url' in readBroker(process.env.EZIL_BROKER_FILE, folders())) throw new Error('connector_unavailable');
     } catch {
+        console.info('EZIL_CONNECTOR_INVALID_DESCRIPTOR');
         void vscode.window.showInformationMessage('EZiL connector is unavailable. You can keep using VS Code.');
         return;
     }
@@ -37,7 +45,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await report?.({ op: 'editor.readiness', state: 'active' });
         for (const port of ports) await report?.({ op: 'preview.register', port });
     };
-    try { await refresh(); }
+    try { await refresh(); console.info('EZIL_CONNECTOR_READY'); }
     catch { void vscode.window.showInformationMessage('EZiL connector is unavailable. You can keep using VS Code.'); }
     let refreshing = false;
     heartbeat = setInterval(() => {

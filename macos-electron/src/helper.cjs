@@ -64,6 +64,58 @@ async function registeredPreview(helper, workspaceId, fetchImpl = fetch) {
   const value = await workspaceStatus(helper, workspaceId, fetchImpl);
   return value?.ports.length ? `http://127.0.0.1:${value.ports[0]}/` : undefined;
 }
+async function performOperation(helper, operation, fetchImpl = fetch) {
+  const response = await fetchImpl(`${helper.origin}/api/native/operations`, {
+    method: 'POST', redirect: 'error', signal: AbortSignal.timeout(5000),
+    headers: { origin: helper.origin, authorization: `Bearer ${helper.capability}`, 'content-type': 'application/json' },
+    body: JSON.stringify(operation)
+  });
+  const value = await response.json();
+  if (!response.ok || value?.ok !== true) throw Error('Local operation unavailable');
+  return value;
+}
+async function previewReady(port, fetchImpl = fetch) {
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) return false;
+  try {
+    const response = await fetchImpl(`http://127.0.0.1:${port}/`, { redirect: 'manual', signal: AbortSignal.timeout(2000) });
+    await response.body?.cancel();
+    return response.status >= 200 && response.status < 400;
+  } catch { return false; }
+}
+function waitForReady(child, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    let buffer = '', total = 0, settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.removeListener('error', launchFailed); child.removeListener('exit', exited);
+      child.stdout.removeListener('data', data); child.stdout.resume();
+    };
+    // Report fixed, actionable reasons only. Child output can contain private
+    // paths or credentials and must never become an error message or log.
+    const fail = message => {
+      if (settled) return;
+      settled = true; cleanup();
+      try { child.kill('SIGTERM'); } catch { /* The child may already be gone. */ }
+      reject(Error(message));
+    };
+    const launchFailed = () => fail('Native helper could not start. Rebuild or reinstall EZiL OS.');
+    const exited = () => fail('Native helper exited before becoming ready. Rebuild or reinstall EZiL OS.');
+    const data = chunk => {
+      total += chunk.length;
+      if (total > 65536) return fail('Native helper exceeded its startup response limit. Rebuild or reinstall EZiL OS.');
+      buffer += chunk.toString('utf8');
+      while (buffer.includes('\n')) {
+        const index = buffer.indexOf('\n'), line = buffer.slice(0, index).trim(); buffer = buffer.slice(index + 1);
+        let parsed;
+        try { parsed = readyLine(line); }
+        catch { fail('Native helper returned an incompatible startup response (contract v2). Rebuild or reinstall EZiL OS.'); return; }
+        if (parsed) { settled = true; cleanup(); resolve(parsed); return; }
+      }
+    };
+    const timer = setTimeout(() => fail('Native helper did not become ready within 20 seconds (contract v2). Try again or reinstall EZiL OS.'), timeoutMs);
+    child.once('error', launchFailed); child.once('exit', exited); child.stdout.on('data', data);
+  });
+}
 async function startHelper(settings, root, workspace, onExit = () => {}) {
   for (const file of [settings.bun, settings.helper, ...['bundle.min.js', 'bundle.min.css', 'icons.js'].map(f => path.join(settings.assets, f))]) {
     if (!fs.statSync(file, { throwIfNoEntry: false })?.isFile()) throw Error('Native runtime assets/helper absent. Set EZIL_BUN_PATH, EZIL_HELPER_PATH and EZIL_SHELL_ASSETS or rebuild the app.');
@@ -76,23 +128,7 @@ async function startHelper(settings, root, workspace, onExit = () => {}) {
   });
   // Helper output is a protocol, not a log sink. Never persist arbitrary output.
   child.stderr.resume();
-  const ready = await new Promise((resolve, reject) => {
-    let buffer = '', total = 0;
-    const timer = setTimeout(() => fail(), 20000);
-    const fail = () => { clearTimeout(timer); child.kill('SIGTERM'); reject(Error('Native helper failed to become ready (contract v2, 20 second timeout)')); };
-    child.once('error', fail); child.once('exit', fail);
-    child.stdout.on('data', chunk => {
-      total += chunk.length; if (total > 65536) return fail();
-      buffer += chunk.toString('utf8');
-      while (buffer.includes('\n')) {
-        const index = buffer.indexOf('\n'), line = buffer.slice(0, index).trim(); buffer = buffer.slice(index + 1);
-        try {
-          const parsed = readyLine(line);
-          if (parsed) { clearTimeout(timer); child.removeListener('exit', fail); child.removeListener('error', fail); child.stdout.removeAllListeners('data'); child.stdout.resume(); resolve(parsed); return; }
-        } catch { fail(); }
-      }
-    });
-  });
+  const ready = await waitForReady(child);
   child.once('exit', onExit);
   const origin = `http://127.0.0.1:${ready.port}`;
   const helper = { origin, capability };
@@ -119,4 +155,4 @@ async function startHelper(settings, root, workspace, onExit = () => {}) {
   try { await renew(); } catch { helper.close(); throw Error('Shell capability unavailable'); }
   return helper;
 }
-module.exports = { config, readyLine, startHelper, helperEnvironment, authenticatedHeaders, workspaceStatus, registeredPreview, shellCapability };
+module.exports = { config, readyLine, waitForReady, startHelper, helperEnvironment, authenticatedHeaders, workspaceStatus, registeredPreview, shellCapability, performOperation, previewReady };

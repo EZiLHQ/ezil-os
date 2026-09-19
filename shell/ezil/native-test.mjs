@@ -19,13 +19,13 @@ window.__EZIL_BOOT__ = {
     desktopState: { provider: 'native-macos', configured: true, hasHmacSecret: false, status: 'idle', endpoints: {},
         runtime: { contractVersion: 2, executionTarget: 'macos-host', isolation: 'trusted-native', editor: 'embedded-code-server', externalEditor: 'optional-microsoft-vscode', browser: 'native-chromium', cloudSync: 'disabled' } },
 };
-let codeState = 'failed';
+let codeState = 'failed', previewState = 'ready', previewPorts = [];
 window.ezilNative = { operation: async op => {
     operations.push(op);
     if (op.op === 'workspace.list') return { ok: true, workspaces: [window.__EZIL_BOOT__.computer] };
     if (op.op === 'diagnostics.read') return { ok: true, events: [{ event: 'code_ready', t: 1000, path: '/secret', token: 'secret' }, { event: 'untrusted_message', t: 1 }] };
-    if (op.op === 'preview.list') return { ok: true, ports: [3000] };
-    return { ...op, ok: true, state: op.op.startsWith('code.') ? codeState : 'ready',
+    if (op.op === 'preview.list') return { ok: true, ports: previewPorts };
+    return { ...op, ok: true, state: op.op.startsWith('code.') ? codeState : op.op.startsWith('preview.') ? previewState : 'ready',
         url: `http://127.0.0.1:${op.op.startsWith('code.') ? 8443 : 3000}/`,
         ...(op.op === 'browser.snapshot' ? { snapshot: 'data:image/png;base64,AAAA' } : {}) };
 } };
@@ -34,6 +34,7 @@ window.eval(readFileSync(new URL('bundle.min.js', os), 'utf8'));
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 await wait(180);
 const api = window.ezil;
+assert.deepEqual([...window.document.querySelectorAll('.taskbar-item[data-app]')].map(el => el.getAttribute('data-app')).filter(id => ['desktop', 'code', 'preview', 'settings'].includes(id)), ['desktop', 'code', 'preview', 'settings']);
 const ctx = { payload: window.__EZIL_BOOT__, computer: window.__EZIL_BOOT__.computer, desktopState: window.__EZIL_BOOT__.desktopState };
 await api.registry.launch('code', ctx); await wait(100);
 const code = window.document.querySelector('.window[data-app="code"]');
@@ -53,8 +54,27 @@ await api.registry.launch('code', ctx); await wait(30);
 assert.equal(operations.filter(op => op.op === 'code.open').length, 2, 'registry reuses existing Code window');
 await api.registry.launch('preview', ctx); await wait(80);
 const preview = window.document.querySelector('.window[data-app="preview"]');
+assert.equal(preview.querySelector('.ezil-preview-unavailable').hidden, false);
+assert.ok(preview.textContent.includes('register its port in Settings'));
+previewPorts = [3000]; preview.querySelector('.ezil-preview-unavailable-retry').click(); await wait(80);
 assert.equal(preview.querySelector('iframe').src, 'http://127.0.0.1:3000/');
 assert.equal(operations.find(op => op.op === 'preview.open').port, 3000);
+preview.querySelector('iframe').dispatchEvent(new window.Event('load')); await wait(40);
+codeState = 'failed'; previewState = 'unavailable'; await wait(2200);
+for (const el of [code, preview]) {
+    assert.equal(el.querySelector('.ezil-app-spinner').hidden, false, 'post-ready failure is visible');
+    assert.equal(el.querySelector('.ezil-app-spinner').dataset.kind, 'failed');
+}
+assert.equal(code.querySelector('.ezil-app-spinner-label').textContent, 'Code is unavailable');
+assert.equal(preview.querySelector('.ezil-app-spinner-label').textContent, 'Preview is unavailable');
+assert.ok(preview.querySelector('.ezil-app-spinner-sub').textContent.includes('register its port in Settings'));
+assert.equal(code.querySelector('iframe').src, 'http://127.0.0.1:8443/', 'failure never reloads editor automatically');
+codeState = 'ready'; previewState = 'ready';
+for (const el of [code, preview]) {
+    el.querySelector('.ezil-boot-retry').click(); await wait(80);
+    el.querySelector('iframe').dispatchEvent(new window.Event('load')); await wait(40);
+    assert.equal(el.querySelector('.ezil-app-spinner').hidden, true, 'explicit Retry recovers');
+}
 await api.registry.launch('desktop', ctx); await wait(80);
 const browser = window.document.querySelector('.window[data-app="desktop"]');
 assert.ok(browser.classList.contains('ezil-desktop-window'), 'existing Browser UIWindow chrome');
@@ -68,7 +88,7 @@ browser.querySelector('[data-action="reload"]').click(); await wait(20);
 assert.ok(operations.some(op => op.op === 'browser.reload'));
 browser.dispatchEvent(new window.CustomEvent('ezil:native-cover', { detail: { covered: true } })); await wait(80);
 assert.ok(operations.some(op => op.op === 'browser.layout' && op.occluded));
-assert.ok(operations.some(op => op.op === 'browser.snapshot'));
+assert.ok(!operations.some(op => op.op === 'browser.snapshot'), 'occlusion does not wait on capture');
 assert.equal(browser.querySelector('.ezil-native-browser-cover').hidden, false);
 browser.setAttribute('data-is_minimized', 'true'); await wait(50);
 assert.equal(operations.filter(op => op.op === 'browser.layout').at(-1).visible, false);
@@ -76,8 +96,8 @@ await api.registry.launch('settings', ctx); await wait(80);
 const settings = window.document.querySelector('.window[data-app="settings"]');
 assert.equal(settings.querySelectorAll('.ezil-settings-pane').length, 5, 'real Settings tabs');
 assert.ok(operations.some(op => op.op === 'workspace.list'), 'Computers uses native workspace adapter');
-assert.equal(settings.querySelectorAll('.ezil-settings-row').length, 2, 'native workspace limit stays visible and structural');
-assert.equal(settings.querySelector('[data-action="import"]')?.textContent, 'Import project copy');
+assert.ok(settings.querySelectorAll('.ezil-settings-row').length >= 1, 'native project rows remain visible');
+assert.equal(settings.querySelector('[data-action="import"]')?.textContent, 'Open project folder…');
 settings.querySelector('[data-tab="system"]')?.click(); await wait(50);
 assert.ok(settings.textContent.includes('Cloud sync'));
 settings.querySelector('[data-tab="troubleshoot"]')?.click(); await wait(50);
@@ -87,8 +107,8 @@ assert.ok(report.includes('code_ready'), report);
 assert.ok(!report.includes('/secret') && !report.includes('untrusted_message'));
 await browser.on_before_exit(); await code.on_before_exit(); await preview.on_before_exit(); await wait(50);
 for (const op of ['browser.detach', 'code.close', 'preview.close']) assert.ok(operations.some(x => x.op === op), op);
-const before = operations.length; window.dispatchEvent(new window.Event('ezil:teardown')); await wait(40);
-assert.equal(operations.length, before, 'disposal idempotent');
+const before = operations.filter(op => !op.op.startsWith('desktop.')).length; window.dispatchEvent(new window.Event('ezil:teardown')); await wait(2200);
+assert.equal(operations.filter(op => !op.op.startsWith('desktop.')).length, before, 'surface disposal idempotent; desktop flush may persist');
 assert.equal(requests.length, 0, JSON.stringify(requests));
 assert.equal(errors.length, 0, JSON.stringify(errors));
 console.log('PASS native real-window parity: registry, Code retry/readiness, Preview port, Browser bounds/cover/minimize/disposal, Settings, diagnostics, no hosted requests');

@@ -8,7 +8,7 @@ const { execFileSync, spawn } = require('node:child_process');
 const { bundleHelper } = require('../scripts/bundle-helper.cjs');
 const { cleanEnvironment } = require('../src/vscode.cjs');
 const { Workspaces } = require('../src/workspaces.cjs');
-const { config, helperEnvironment } = require('../src/helper.cjs');
+const { config, helperEnvironment, startHelper } = require('../src/helper.cjs');
 const { verifyArchive } = require('../scripts/code-server.cjs');
 const repo = path.resolve(__dirname, '../..');
 function bunPath() {
@@ -59,6 +59,18 @@ process.emit('SIGTERM');
 `);
   const output = execute(['--no-env-file', runner], { cwd: resources, env: helperEnvironment(settings, dataRoot, workspace, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'), encoding: 'utf8', timeout: 10000 });
   assert.match(output, /PACKAGED_HELPER_OK/);
+  await t.test('isolated bundle starts a real socket and serves its packaged desktop', {
+    skip: process.env.EZIL_NATIVE_SOCKET_TESTS !== '1' && 'Enable EZIL_NATIVE_SOCKET_TESTS=1 for real packaged-helper coverage',
+  }, async () => {
+    const helper = await startHelper(config(resources, { EZIL_BUN_PATH: bun }), dataRoot, workspace);
+    try {
+      const response = await fetch(helper.url, { headers: { origin: helper.origin, authorization: `Bearer ${helper.shellCapability}` } });
+      assert.equal(response.status, 200); assert.match(await response.text(), /\/os\/bundle.min.js/);
+      const asset = await fetch(helper.origin + '/os/bundle.min.js');
+      assert.equal(asset.status, 200); assert.equal(await asset.text(), 'fixture-asset');
+    } finally { await helper.close(); }
+    assert.equal(helper.child.exitCode, 0);
+  });
 });
 test('runtime archive digest rejects changed or unpinned bytes', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-archive-')); t.after(() => fs.rmSync(root, { recursive: true }));

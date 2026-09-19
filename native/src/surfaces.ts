@@ -7,12 +7,16 @@ export type SurfaceOperation = SurfaceIdentity & (
     | { op: 'code.open' | 'code.status' | 'code.close' }
     | { op: 'preview.open'; port: number }
     | { op: 'preview.status' | 'preview.close' }
-    | { op: 'browser.attach' | 'browser.focus' | 'browser.detach' | 'browser.snapshot' }
+    | { op: 'browser.attach' | 'browser.focus' | 'browser.detach' | 'browser.snapshot' | 'browser.status' }
     | { op: 'browser.navigate'; url: string }
     | { op: 'browser.back' | 'browser.forward' | 'browser.reload' }
     | { op: 'browser.layout'; bounds: SurfaceBounds; visible: boolean; occluded: boolean }
 );
-export type SurfaceResult = { ok: true } & SurfaceIdentity & (
+export interface BrowserState {
+    revision: number; url: string; title: string; loading: boolean;
+    error: string | null; canGoBack: boolean; canGoForward: boolean;
+}
+export type SurfaceResult = { ok: true; browserState?: BrowserState } & SurfaceIdentity & (
     | { state: 'starting' | 'closed' | 'ready' | 'unavailable' | 'failed' }
     | { state: 'ready'; url: string }
     | { state: 'ready'; snapshot: string }
@@ -41,7 +45,7 @@ export function parseSurfaceOperation(value: unknown): SurfaceOperation {
     switch (b.op) {
         case 'code.open': case 'code.status': case 'code.close':
         case 'preview.status': case 'preview.close':
-        case 'browser.attach': case 'browser.focus': case 'browser.detach': case 'browser.snapshot':
+        case 'browser.attach': case 'browser.focus': case 'browser.detach': case 'browser.snapshot': case 'browser.status':
         case 'browser.back': case 'browser.forward': case 'browser.reload': break;
         case 'browser.navigate': {
             keys.push('url');

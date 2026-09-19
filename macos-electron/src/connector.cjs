@@ -2,7 +2,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
-const { treeInventory, removeInventory, privateDir, noLinks, atomic } = require('./files.cjs');
+const { treeInventory, removeInventory, privateDir, noLinks, atomic, identity } = require('./files.cjs');
 const connectorStatus = Object.freeze({ readiness: 'available', preview: 'available', modelProvider: 'available' });
 const unavailableStatus = Object.freeze({ readiness: 'unavailable', preview: 'unavailable', modelProvider: 'unavailable' });
 const forbidden = /^(?:\.env(?:\..*)?|credentials(?:\..*)?|\.git)$/i;
@@ -59,8 +59,12 @@ function descriptorValue(root, workspace, helper, value, now = Date.now()) {
       !Number.isFinite(value.expiresAt) || value.expiresAt <= now + 30_000 || value.expiresAt > now + 16 * 60_000) {
     throw Error('Invalid connector capability');
   }
+  const workspaceIdentity = identity(noLinks(workspace.files));
+  const expectedIdentity = workspace.kind === 'attached' ? workspace.sourceIdentity : workspace.children.files;
+  if (workspaceIdentity !== expectedIdentity || !fs.lstatSync(workspace.files).isDirectory()) throw Error('Workspace identity changed');
   return { contractVersion: 1, origin: helper.origin, workspaceId: workspace.id,
-    token: value.token, expiresAt: value.expiresAt, dataRoot: root, workspacePath: workspace.files };
+    token: value.token, expiresAt: value.expiresAt, dataRoot: root, workspacePath: workspace.files,
+    workspaceKind: workspace.kind, workspaceIdentity };
 }
 class ConnectorSession {
   constructor(root, workspace, helper, { fetchImpl = fetch, now = Date.now } = {}) {

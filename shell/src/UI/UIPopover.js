@@ -28,6 +28,8 @@ function UIPopover (options) {
     $('.window-active .window-app-iframe').css('pointer-events', 'none');
 
     window.global_element_id++;
+    const nativeOverlay = `popover-${window.global_element_id}`;
+    window.dispatchEvent(new CustomEvent('ezil:native-composition', { detail: { overlay: nativeOverlay, open: true } }));
 
     options.content = options.content ?? '';
 
@@ -54,6 +56,7 @@ function UIPopover (options) {
         $(options.parent_element).addClass('has-open-popover');
     }
     $(el_popover).on('remove', function () {
+        window.dispatchEvent(new CustomEvent('ezil:native-composition', { detail: { overlay: nativeOverlay, open: false } }));
         if ( options.parent_element ) {
             $(options.parent_element).removeClass('has-open-popover');
         }

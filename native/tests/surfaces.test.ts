@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
 import { randomUUID, randomBytes } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { parseOperation, NATIVE_RUNTIME } from '../src/contract.ts';
 import { SurfaceLifecycle, nativeFrameUrl, nativeEvents, type SurfaceOperation, type SurfaceResult } from '../src/surfaces.ts';
 import { createNativeRuntime } from '../src/server.ts';
@@ -37,7 +37,7 @@ test('frame URLs and diagnostics exclude arbitrary hosts, credentials and free t
 const cleanup: (() => void)[] = [];
 afterEach(() => cleanup.splice(0).forEach(fn => fn()));
 async function fixture() {
-    const root = mkdtempSync('/tmp/ezil-parity-runtime-'); const token = randomBytes(32).toString('base64url');
+    const root = realpathSync(mkdtempSync('/tmp/ezil-parity-runtime-')); const token = randomBytes(32).toString('base64url');
     const calls: SurfaceOperation[] = []; let state = 'ready'; let badUrl = false;
     const runtime = createNativeRuntime({ dataRoot: root, adminToken: token, hostAdapter: {
         async surface(op) { calls.push(op); return { ...op, ok: true, state,

@@ -70,7 +70,7 @@ const { nativeSettingsRequest } = await import(`data:text/javascript;base64,${Bu
 responder = async op => ({ ok: true, workspaces: [{ id: ctx.computer.id, name: 'Local', createdAt: '2026-01-01', root: '/secret' }], workspace: { id: ctx.computer.id, name: op.name } });
 assert.equal((await nativeSettingsRequest('computer.list', undefined, ctx)).data[0].slot, 1);
 assert.ok(!JSON.stringify(await nativeSettingsRequest('computer.list', undefined, ctx)).includes('/secret'));
-for (const [path, op] of [['create', 'create'], ['import', 'import'], ['rename', 'rename'], ['delete', 'remove'], ['select', 'select']]) {
+for (const [path, op] of [['create', 'create'], ['import', 'attach'], ['rename', 'rename'], ['delete', 'remove'], ['select', 'select']]) {
     await nativeSettingsRequest(`computer.${path}`, { id: ctx.computer.id, name: 'New', command: 'arbitrary' }, ctx);
     assert.equal(calls.at(-1).op, `workspace.${op}`); assert.ok(!('command' in calls.at(-1)));
 }

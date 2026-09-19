@@ -8,7 +8,7 @@ const { EventEmitter } = require('node:events');
 const { Workspaces } = require('../src/workspaces.cjs');
 const { identity, readJSON } = require('../src/files.cjs');
 const { config, helperEnvironment, authenticatedHeaders, registeredPreview } = require('../src/helper.cjs');
-const { connectorStatus, installConnector, hashes, ConnectorSession } = require('../src/connector.cjs');
+const { connectorStatus, installConnector, hashes, descriptorValue, ConnectorSession } = require('../src/connector.cjs');
 const { Editors } = require('../src/vscode.cjs');
 const { stageInputs, validateInputs } = require('../scripts/inputs.cjs');
 const { providerFixtures, proveProvider } = require('../src/smoke.cjs');
@@ -69,6 +69,16 @@ test('connector rejects symlinks and missing extension entrypoints', t => {
   fs.unlinkSync(path.join(w.extensions, 'ezil-vscode')); fs.unlinkSync(path.join(extension, 'extension.js'));
   assert.throws(() => installConnector(extension, w), /runnable/);
 });
+test('attached connector descriptor pins the original directory identity across renewals', t => {
+  const { root, store } = fixture(t), original = path.join(root, 'original'); fs.mkdirSync(original);
+  const w = store.attach('Original', original), now = Date.now();
+  const capability = { ok: true, token: 'a'.repeat(43), expiresAt: now + 60_000 };
+  const descriptor = descriptorValue(store.root, w, { origin: 'http://127.0.0.1:49152' }, capability, now);
+  assert.equal(descriptor.workspaceKind, 'attached'); assert.equal(descriptor.workspacePath, original);
+  assert.equal(descriptor.workspaceIdentity, identity(original));
+  fs.renameSync(original, `${original}-moved`); fs.mkdirSync(original);
+  assert.throws(() => descriptorValue(store.root, w, { origin: 'http://127.0.0.1:49152' }, capability, now), /identity/);
+});
 test('verified editor launch installs extension and passes only private descriptor paths', async t => {
   const { store, extension, root } = fixture(t), w = store.create('A');
   const executable = path.join(root, 'verified-code'); fs.writeFileSync(executable, 'fixture');
@@ -82,10 +92,10 @@ test('verified editor launch installs extension and passes only private descript
   const descriptors = { connector, model };
   assert.equal((await editors.start(w, descriptors)).status, 'running');
   assert.equal((await editors.open(w, descriptors)).status, 'running');
-  assert.deepEqual(hashes(path.join(w.extensions, 'ezil-vscode')), hashes(extension));
+  assert.deepEqual(hashes(path.join(w.extensions, 'external-vscode', 'ezil-vscode')), hashes(extension));
   for (const launch of launches) {
     assert.equal(launch.file, executable); assert.equal(launch.options.shell, false);
-    assert.ok(launch.args.includes(w.extensions)); assert.ok(launch.args.includes(w.files));
+    assert.ok(launch.args.includes(path.join(w.extensions, 'external-vscode'))); assert.ok(launch.args.includes(w.files));
     assert.equal(launch.options.env.EZIL_BROKER_FILE, connector); assert.equal(launch.options.env.EZIL_AI_BROKER_FILE, model);
     assert.equal(launch.options.env.EZIL_NATIVE_ADMIN_CAPABILITY, undefined);
   }
@@ -106,7 +116,8 @@ test('connector mints, persists, renews and removes a workspace-scoped capabilit
   assert.equal(new Headers(calls[0].init.headers).get('origin'), helper.origin);
   assert.deepEqual(JSON.parse(calls[0].init.body), { workspaceId: w.id, role: 'connector' });
   assert.deepEqual(readJSON(connector.descriptor), { contractVersion: 1, origin: helper.origin, workspaceId: w.id,
-    token: 'a'.repeat(43), expiresAt: now + 15 * 60_000, dataRoot: path.join(root, 'data'), workspacePath: w.files });
+    token: 'a'.repeat(43), expiresAt: now + 15 * 60_000, dataRoot: path.join(root, 'data'), workspacePath: w.files,
+    workspaceKind: 'managed', workspaceIdentity: identity(w.files) });
   assert.deepEqual(connector.status(), connectorStatus);
   connector.close(); assert.equal(fs.existsSync(connector.descriptor), false);
 });

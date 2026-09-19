@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, symlinkSync, chmodSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, symlinkSync, chmodSync, rmSync, lstatSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { parsePort, readBroker, readModels, sendOperation, type ModelBrokerDescriptor } from '../src/broker';
+import { localFolder, parsePort, readBroker, readModels, sendOperation, type ModelBrokerDescriptor } from '../src/broker';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -40,6 +40,36 @@ test('rejects project descriptors, symlinks, public permissions and foreign host
 test('ports accept only explicit loopback port numbers', () => {
     for (const text of ['1024', '3000', '65535']) expect(parsePort(text)).toBe(Number(text));
     for (const text of ['80', '65536', '3000.1', ' 3000', '3000;echo', 'http://127.0.0.1:3000', '-3000']) expect(parsePort(text)).toBeUndefined();
+});
+test('attached connector binds a private descriptor to the original folder identity', () => {
+    const f = fixture(), workspacePath = join(f.descriptor.dataRoot, '..', 'original');
+    mkdirSync(workspacePath);
+    const canonical = realpathSync(workspacePath), stat = lstatSync(canonical);
+    const directory = join(f.descriptor.dataRoot, 'private', 'connectors'); mkdirSync(directory, { mode: 0o700 });
+    for (const dir of [f.descriptor.dataRoot, join(f.descriptor.dataRoot, 'private')]) chmodSync(dir, 0o700);
+    const descriptor = { ...f.descriptor, workspacePath: canonical, workspaceKind: 'attached', workspaceIdentity: `${stat.dev}:${stat.ino}` };
+    const file = join(directory, `${descriptor.workspaceId}.json`);
+    writeFileSync(file, JSON.stringify(descriptor), { mode: 0o600 });
+    expect(readBroker(file, [canonical])).toEqual(descriptor);
+    writeFileSync(f.path, JSON.stringify(descriptor));
+    expect(() => readBroker(f.path, [canonical])).toThrow();
+    for (const change of [{ workspaceKind: 'managed' }, { workspaceKind: undefined }, { workspaceIdentity: '1:2' }, { workspaceIdentity: undefined }]) {
+        writeFileSync(file, JSON.stringify({ ...descriptor, ...change }));
+        expect(() => readBroker(file, [canonical])).toThrow();
+    }
+    writeFileSync(file, JSON.stringify(descriptor));
+    renameSync(canonical, `${canonical}-old`); mkdirSync(canonical);
+    expect(() => readBroker(file, [canonical])).toThrow();
+    rmSync(canonical, { recursive: true }); symlinkSync(`${canonical}-old`, canonical);
+    expect(() => readBroker(file, [canonical])).toThrow();
+});
+test('only file or loopback code-server folder URIs can bind to local descriptors', () => {
+    expect(localFolder({ scheme: 'file', authority: '', fsPath: '/project' })).toBe('/project');
+    expect(localFolder({ scheme: 'vscode-remote', authority: '127.0.0.1:49152', fsPath: '/project' })).toBe('/project');
+    for (const authority of ['ssh-remote+server', 'foreign.example:3000', 'localhost:3000', '127.0.0.1:99999', '127.0.0.1:3000/path']) {
+        expect(localFolder({ scheme: 'vscode-remote', authority, fsPath: '/project' })).toBe('');
+    }
+    expect(localFolder({ scheme: 'file', authority: 'foreign', fsPath: '/project' })).toBe('');
 });
 test('private connector descriptors can bind an Electron-owned managed root', () => {
     const f = fixture(); const workspacePath = join(f.descriptor.dataRoot, 'workspaces', f.descriptor.workspaceId, 'files');

@@ -18,14 +18,14 @@ function atomic(file, value) {
   fs.renameSync(temp, file);
 }
 function readJSON(file) { noLinks(file); return JSON.parse(fs.readFileSync(file, 'utf8')); }
-function treeInventory(root, limit = 100000) {
+function treeInventory(root, limit = 100000, { allowSymlinks = false } = {}) {
   noLinks(root); const result = []; let bytes = 0;
   function visit(file) {
     const stat = fs.lstatSync(file);
-    if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory()) || (stat.isFile() && stat.nlink !== 1)) throw Error('Link or special file refused');
+    if ((stat.isSymbolicLink() && !allowSymlinks) || (!stat.isSymbolicLink() && !stat.isFile() && !stat.isDirectory()) || (stat.isFile() && stat.nlink !== 1)) throw Error('Link or special file refused');
     bytes += stat.isFile() ? stat.size : 0;
     if (result.length >= limit || bytes > 20 * 1024 ** 3) throw Error('Workspace exceeds import/removal limits');
-    result.push({ file, identity: `${stat.dev}:${stat.ino}`, directory: stat.isDirectory() });
+    result.push({ file, identity: `${stat.dev}:${stat.ino}`, directory: stat.isDirectory(), symlink: stat.isSymbolicLink() });
     if (stat.isDirectory()) for (const child of fs.readdirSync(file).sort()) visit(path.join(file, child));
   }
   visit(root); return result;
@@ -34,9 +34,14 @@ function treeInventory(root, limit = 100000) {
 // before unlink/rmdir. This is an accidental-escape guard, not containment of
 // malicious concurrent processes running as the same Mac user.
 function removeInventory(entries) {
-  for (const entry of entries) if (identity(noLinks(entry.file)) !== entry.identity) throw Error('File identity changed');
+  function check(entry) {
+    noLinks(path.dirname(entry.file));
+    const stat = fs.lstatSync(entry.file);
+    if (`${stat.dev}:${stat.ino}` !== entry.identity || stat.isSymbolicLink() !== !!entry.symlink || stat.isDirectory() !== entry.directory) throw Error('File identity changed');
+  }
+  for (const entry of entries) check(entry);
   for (const entry of [...entries].reverse()) {
-    if (identity(noLinks(entry.file)) !== entry.identity) throw Error('File identity changed');
+    check(entry);
     if (entry.directory) fs.rmdirSync(entry.file); else fs.unlinkSync(entry.file);
   }
 }

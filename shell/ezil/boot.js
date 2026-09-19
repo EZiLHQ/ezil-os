@@ -83,6 +83,8 @@ import { PuterBackendRemovedError, puter } from '../src/ezil-stubs.js';
 import session from './session.js';
 import registry from './apps/registry.js';
 import { warm } from './warm.js';
+import { prepareNativePersistence, restoreNativeDesktop } from './native-persistence.js';
+let nativePersistence = null;
 
 const PHASE = 'ezil-os:boot';
 
@@ -811,6 +813,7 @@ async function mount (payload) {
 }
 
 async function build (payload) {
+    nativePersistence?.dispose(false); nativePersistence = null;
     const t0 = performance.now();
     const ctx = {
         payload,
@@ -820,6 +823,7 @@ async function build (payload) {
 
     set_device_class();
     shell.desktop = mount_desktop_root();
+    const nativeDesktop = ctx.desktopState?.provider === 'native-macos' ? await prepareNativePersistence(ctx) : null;
     watch_for_removal();
     const apps = registry.resolve(payload);
     current_apps = apps;
@@ -885,6 +889,7 @@ async function build (payload) {
     }
 
     console.info(`[${PHASE}] desktop + taskbar painted in ${(performance.now() - t0).toFixed(1)}ms`);
+    if (nativeDesktop) nativePersistence = await restoreNativeDesktop(nativeDesktop, ctx, registry.launch);
 
     // 🔴 LOGIN OPENS NOTHING (W3). The wallpaper and dock above ARE the boot —
     // nobody asked to watch a machine start. The owner, directly: "The moment

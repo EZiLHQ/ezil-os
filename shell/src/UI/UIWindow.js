@@ -1464,10 +1464,9 @@ async function UIWindow (options) {
                 pointer_press_pending = false;
                 return;
             }
-            // No event argument, exactly as before: passing one would enable
-            // `focusWindow`'s menubar branch and its `{msg:'click'}` postMessage
-            // to the iframe, neither of which these bindings have ever done.
-            $(el_window).focusWindow();
+            // Preserve the legacy iframe path. Native Browser needs the press
+            // identity so its toolbar keeps keyboard focus.
+            $(el_window).focusWindow(el_window.querySelector('.ezil-native-browser-toolbar') ? e : undefined);
         };
     })();
     $(el_window_head).on('pointerdown mousedown', focus_on_press);
@@ -3816,6 +3815,7 @@ $.fn.close = async function (options) {
             return; // already closing (or a concurrent close()) -- no-op
         }
         $(this).attr('data-closing', '1');
+        window.dispatchEvent(new CustomEvent('ezil:native-composition'));
         el_targets.push(this);
     });
 
@@ -4280,6 +4280,7 @@ $.fn.makeWindowInvisible = async function (options) {
 $.fn.showWindow = async function (options) {
     $(this).each(async function () {
         if ( $(this).hasClass('window') ) {
+            window.dispatchEvent(new CustomEvent('ezil:native-composition', { detail: { window: this, visible: true } }));
             // show window
             const el_window = this;
 
@@ -4422,7 +4423,9 @@ function window_zindex_base (el_window) {
 
 $.fn.focusWindow = function (event) {
     if ( this.hasClass('window') ) {
-        const $app_iframe = $(this).find('.window-app-iframe');
+        // Native Browser retains a hidden placeholder iframe, which must never
+        // take focus from its address field or the WebContentsView.
+        const $app_iframe = $(this).find('.window-app-iframe:not([hidden])');
         const win_id = $(this).attr('data-id');
 
         // remove active class from all windows, except for this window
@@ -4455,6 +4458,8 @@ $.fn.focusWindow = function (event) {
                 $(this).css('z-index', window_zindex_base(this) + (++window.last_window_zindex));
             });
         }
+
+        window.dispatchEvent(new CustomEvent('ezil:native-composition', { detail: { focus: this[0], pointer: !!event } }));
 
         // hide other global menubars
         $('.window-menubar-global').not(`.window-menubar-global[data-window-id="${win_id}"]`).hide();
@@ -5229,6 +5234,7 @@ function morph_window_from_tile (el_window, tile, morph_options = {}) {
 $.fn.hideWindow = async function (options) {
     $(this).each(async function () {
         if ( $(this).hasClass('window') ) {
+            window.dispatchEvent(new CustomEvent('ezil:native-composition', { detail: { window: this, visible: false } }));
             // get taskbar item location
             let taskbar_item_pos = $(`.taskbar .taskbar-item[data-app="${$(this).attr('data-app')}"]`).position();
 

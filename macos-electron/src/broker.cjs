@@ -57,6 +57,9 @@ function upstream(config, body) {
 }
 class Vault {
   constructor(root, safeStorage) { this.root = privateDir(root); this.storage = safeStorage; this.file = path.join(root, 'provider.enc'); }
+  // Reading Settings must never request Keychain access. Even availability
+  // probing can initialize Electron's Keychain backend and show an OS prompt.
+  status() { return { configured: fs.existsSync(this.file) }; }
   check() { if (process.platform !== 'darwin' || !this.storage.isEncryptionAvailable()) throw Error('macOS Keychain encryption is unavailable'); }
   set(config) { this.check(); atomic(this.file, this.storage.encryptString(JSON.stringify(credential(config)))); }
   get() { if (!fs.existsSync(this.file)) return null; this.check(); noLinks(this.file); return credential(JSON.parse(this.storage.decryptString(fs.readFileSync(this.file)))); }

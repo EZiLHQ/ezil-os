@@ -1,4 +1,5 @@
 'use strict';
+const { preferences } = require('./desktop-state.cjs');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const capabilities = Object.freeze({ contractVersion: 2, executionTarget: 'macos-host', isolation: 'trusted-native', editor: 'embedded-code-server', externalEditor: 'optional-microsoft-vscode', browser: 'native-chromium', cloudSync: 'disabled' });
 function uuid(value) { if (typeof value !== 'string' || !UUID.test(value)) throw Error('Invalid workspace ID'); return value; }
@@ -31,24 +32,31 @@ function surfaceSchema(input) {
 function runtimeSchema(input) {
   const op = input?.op;
   const common = ['op', 'workspaceId'];
+  if (op === 'desktop.read' || op === 'desktop.write') {
+    exact(input, [...common, ...(op === 'desktop.write' ? ['preferences'] : [])]); uuid(input.workspaceId);
+    if (op === 'desktop.write') preferences(input.preferences);
+    return input;
+  }
   if (op === 'provider.status' || op === 'provider.remove') { exact(input, ['op']); return input; }
   if (op === 'provider.configure') {
     exact(input, ['op', 'action']); if (!['azure', 'bedrock'].includes(input.action)) throw Error('Invalid provider'); return input;
   }
   if (op === 'workspace.list') { exact(input, ['op']); return input; }
   if (op === 'workspace.create') { exact(input, ['op', 'name']); name(input.name); return input; }
-  if (op === 'workspace.import') { exact(input, ['op']); return input; }
-  if (['workspace.rename', 'workspace.select', 'workspace.remove', 'diagnostics.read', 'preview.list'].includes(op)) {
-    exact(input, [...common, ...(op === 'workspace.rename' ? ['name'] : [])]); uuid(input.workspaceId);
+  if (['workspace.import', 'workspace.attach'].includes(op)) { exact(input, ['op']); return input; }
+  if (['workspace.rename', 'workspace.select', 'workspace.remove', 'workspace.relink', 'workspace.reveal', 'workspace.openVSCode', 'workspace.openXcode', 'toolchain.status', 'diagnostics.read', 'preview.list', 'preview.register', 'preview.unregister'].includes(op)) {
+    exact(input, [...common, ...(op === 'workspace.rename' ? ['name'] : []), ...(['preview.register', 'preview.unregister'].includes(op) ? ['port'] : [])]); uuid(input.workspaceId);
     if (op === 'workspace.rename') name(input.name);
+    if (['preview.register', 'preview.unregister'].includes(op) && (!Number.isInteger(input.port) || input.port < 1024 || input.port > 65535)) throw Error('Invalid preview port');
     return input;
   }
   const fields = {
     'code.open': [], 'code.status': [], 'code.close': [],
     'preview.open': ['port'], 'preview.status': [], 'preview.close': [],
     'browser.attach': [], 'browser.layout': ['bounds', 'visible', 'occluded'],
-    'browser.focus': [], 'browser.detach': [], 'browser.snapshot': [],
-    'browser.navigate': ['url'], 'browser.back': [], 'browser.forward': [], 'browser.reload': []
+    'browser.focus': [], 'browser.detach': [], 'browser.snapshot': [], 'browser.status': [],
+    'browser.navigate': ['url'], 'browser.back': [], 'browser.forward': [], 'browser.reload': [],
+    'browser.zoom-in': [], 'browser.zoom-out': [], 'browser.zoom-reset': []
   };
   if (!Object.hasOwn(fields, op)) throw Error('Unknown runtime operation');
   exact(input, [...common, 'surfaceId', 'generation', 'sequence', ...fields[op]]);

@@ -46,8 +46,11 @@ test('activation acknowledges readiness and commands register/unregister a previ
         const descriptor = join(privateRoot, 'broker.json');
         writeFileSync(descriptor, JSON.stringify({ contractVersion: 1, origin, workspaceId: record.id, dataRoot, workspacePath, token: capability.token, expiresAt: capability.expiresAt }), { mode: 0o600 });
         process.env.EZIL_BROKER_FILE = descriptor;
+        let grantTrust: (() => void) | undefined;
+        const mockWorkspace = { isTrusted: true, workspaceFolders: [{ uri: { scheme: 'file', fsPath: workspacePath } }],
+            onDidGrantWorkspaceTrust: (callback: () => void) => { grantTrust = callback; return { dispose() {} }; } };
         mock.module('vscode', () => ({
-            workspace: { isTrusted: true, workspaceFolders: [{ uri: { scheme: 'file', fsPath: workspacePath } }] },
+            workspace: mockWorkspace,
             window: {
                 showInputBox: async () => '3000',
                 showInformationMessage: (text: string) => { notifications.push(text); },
@@ -73,6 +76,14 @@ test('activation acknowledges readiness and commands register/unregister a previ
         expect(calls.at(-1)?.state).toBe('unknown');
         expect(JSON.stringify(notifications)).not.toContain(capability.token);
         expect(JSON.stringify(notifications)).not.toContain(descriptor);
+        calls.length = 0; commands.clear(); mockWorkspace.isTrusted = false;
+        await extension.activate({ subscriptions: [] } as never);
+        expect(calls).toHaveLength(0); expect(commands.size).toBe(0);
+        mockWorkspace.isTrusted = true; grantTrust!();
+        for (let count = 0; count < 50 && !commands.has('ezil.registerPreview'); count++) await Bun.sleep(5);
+        expect(calls[0]).toMatchObject({ op: 'editor.readiness', state: 'active' });
+        expect(commands.has('ezil.registerPreview')).toBe(true);
+        await extension.deactivate();
         calls.length = 0; commands.clear();
         delete process.env.EZIL_BROKER_FILE;
         process.env.EZIL_AI_BROKER_FILE = descriptor;
