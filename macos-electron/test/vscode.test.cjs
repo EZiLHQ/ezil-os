@@ -18,6 +18,29 @@ test('verifier requires Microsoft bundle, team and Developer ID identity togethe
   assert.equal(supportedVersion('1.108.2'), false); assert.equal(supportedVersion('1.109.0'), true); assert.equal(supportedVersion('2.0.0'), true); assert.equal(supportedVersion('bad'), false);
   assert.equal(discover({ platform: 'linux' }), null);
 });
+test('discovery verifies an inline signature requirement and resolves current or older signed executable names', t => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-code-discovery-')));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const app = path.join(home, 'Applications/Visual Studio Code.app');
+  fs.mkdirSync(path.join(app, 'Contents/MacOS'), { recursive: true });
+  for (const name of ['Code', 'Electron']) fs.writeFileSync(path.join(app, 'Contents/MacOS', name), 'fixture');
+  let binary = 'Code', verified = false;
+  const run = (command, args) => {
+    if (!args.at(-1).startsWith(app)) throw Error('not the disposable fixture');
+    if (command === '/usr/bin/codesign') {
+      assert.equal(args[args.indexOf('-R') + 1], '=anchor apple generic and identifier "com.microsoft.VSCode" and certificate leaf[subject.OU] = "UBF8T346G9"');
+      verified = true; return '';
+    }
+    if (args[1] === 'Print :CFBundleIdentifier') return 'com.microsoft.VSCode';
+    if (args[1] === 'Print :CFBundleShortVersionString') return '1.137.0';
+    if (args[1] === 'Print :CFBundleExecutable') { assert.ok(verified); return binary; }
+    throw Error('unexpected invocation');
+  };
+  const options = { platform: 'darwin', home, run, display: () => ({ status: 0, stderr: details }) };
+  for (binary of ['Code', 'Electron']) assert.equal(discover(options).executable, path.join(app, 'Contents/MacOS', binary));
+  for (binary of ['../Code', '/bin/sh', 'unverified']) assert.equal(discover(options), null);
+  binary = 'Code'; assert.equal(discover({ ...options, display: () => ({ status: 1, stderr: details }) }), null);
+});
 test('launch argv keeps workspace as literal argument and app-owned editor dirs', () => {
   const w = { files: '/tmp/a $(touch nope); space', editorData: '/tmp/owner/data', extensions: '/tmp/owner/extensions' };
   assert.deepEqual(argv(w), ['--new-window', '--user-data-dir', path.join(w.editorData, 'external-vscode'), '--extensions-dir', path.join(w.extensions, 'external-vscode'), w.files]);

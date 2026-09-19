@@ -22,7 +22,7 @@ claimed.
 Pinned-tool checks: Node 24.15.0, npm 11.12.1, Bun 1.3.14,
 Electron 44.4.1, code-server 4.137.0 and Playwright Core 1.62.1.
 
-- Host: **109 passed, 0 failed, 1 skipped**. The skipped check requires the
+- Host: **110 passed, 0 failed, 1 skipped**. The skipped check requires the
   actual old installed 0.0.14 source, which the user deleted.
 - Native/connector: **32 passed**, real sockets enabled.
 - Host syntax, native/connector typechecks, shell load and affected
@@ -54,6 +54,13 @@ bypassed.
 
 Logs: `evidence/final-host-tests.log`, `final-native-connector-tests.log`,
 `final-shell-load.log`, `final-shell-regressions.log`, `final-shell-drift.log`.
+
+The first package was superseded before installation after real-machine
+discovery exposed an external Microsoft VS Code detection failure. Fixed the
+inline codesign requirement syntax and resolved the verified executable name
+(`Code` on VS Code 1.137.0; `Electron` on older versions). Unit regressions and
+actual signature-verified discovery now pass. No signature protection was
+removed or relaxed.
 
 ## Historical checks before the SSD was reconnected
 

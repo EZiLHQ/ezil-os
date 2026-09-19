@@ -16,19 +16,24 @@ function supportedVersion(value) {
   const match = /^(\d+)\.(\d+)(?:\.\d+)?$/.exec(String(value).trim());
   return !!match && (Number(match[1]) > MINIMUM_VERSION.major || (Number(match[1]) === MINIMUM_VERSION.major && Number(match[2]) >= MINIMUM_VERSION.minor));
 }
-function discover({ platform = process.platform, home = os.homedir(), run = execFileSync } = {}) {
+function discover({ platform = process.platform, home = os.homedir(), run = execFileSync, display = require('node:child_process').spawnSync } = {}) {
   if (platform !== 'darwin') return null;
   for (const app of ['/Applications/Visual Studio Code.app', path.join(home, 'Applications/Visual Studio Code.app')]) {
     try {
       noLinks(app);
       const bundleID = run('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleIdentifier', path.join(app, 'Contents/Info.plist')], { encoding: 'utf8' });
-      run('/usr/bin/codesign', ['--verify', '--deep', '--strict', '-R', `anchor apple generic and identifier "${BUNDLE}" and certificate leaf[subject.OU] = "${TEAM}"`, app], { stdio: 'pipe' });
+      // A leading '=' means an inline requirement, not a requirement-file path.
+      run('/usr/bin/codesign', ['--verify', '--deep', '--strict', '-R', `=anchor apple generic and identifier "${BUNDLE}" and certificate leaf[subject.OU] = "${TEAM}"`, app], { stdio: 'pipe' });
       // codesign writes its display output to stderr even on success.
-      const details = require('node:child_process').spawnSync('/usr/bin/codesign', ['-dv', '--verbose=4', app], { encoding: 'utf8' });
+      const details = display('/usr/bin/codesign', ['-dv', '--verbose=4', app], { encoding: 'utf8' });
       if (details.status !== 0 || !validSignature(bundleID, details.stderr)) continue;
       const version = run('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleShortVersionString', path.join(app, 'Contents/Info.plist')], { encoding: 'utf8' }).trim();
       if (!supportedVersion(version)) continue;
-      const executable = path.join(app, 'Contents/MacOS/Electron');
+      const binary = run('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleExecutable', path.join(app, 'Contents/Info.plist')], { encoding: 'utf8' }).trim();
+      // Current releases use Code; older supported releases used Electron.
+      // Resolve only a known basename from the verified application manifest.
+      if (!['Code', 'Electron'].includes(binary)) continue;
+      const executable = path.join(app, 'Contents/MacOS', binary);
       noLinks(executable); return { app, executable, identity: identity(executable), version };
     } catch { /* Missing, changed or unverifiable: never fall back to PATH. */ }
   }
