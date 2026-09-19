@@ -112,7 +112,10 @@ class EditorSupervisor {
         instance.processes = new Map(); this.track(instance);
         if (!instance.rootIdentity) throw Error('Editor process identity unavailable');
         instance.monitor = setInterval(() => {
-          try { this.track(instance); } catch { instance.inventoryFailed = true; }
+          try { this.track(instance); } catch {
+            if (!instance.inventoryFailed) this.note('EDITOR_INVENTORY_FAILED');
+            instance.inventoryFailed = true;
+          }
         }, 100);
         instance.monitor.unref();
       }

@@ -72,15 +72,17 @@ function nativeButton(label, seconds = 45) {
     { timeout: (seconds + 5) * 1000 }, (error, stdout, stderr) => resolve({ clicked: !error && stdout.trim() === 'clicked',
       ...(error ? { error: error.killed ? 'automation_timeout' : 'accessibility_or_dialog_failed', code: String(error.code ?? '').slice(0, 40), detail: String(stderr || '').slice(0, 600) } : {}) })));
 }
-function nativeAddressShortcut() {
+function nativeShortcut(action) {
   const pid = electronApp.process().pid;
   assert.ok(Number.isSafeInteger(pid) && pid > 1);
+  const command = { address: 'keystroke "l" using command down', interrupt: 'keystroke "c" using control down' }[action];
+  assert.ok(command);
   // CDP key events do not exercise Electron's before-input-event bridge.
   // Send the real macOS shortcut only to this test application's process.
   execFileSync('/usr/bin/osascript', ['-e', `tell application "System Events"
 tell first application process whose unix id is ${pid}
 set frontmost to true
-keystroke "l" using command down
+${command}
 end tell
 end tell`], { timeout: 5000 });
 }
@@ -209,7 +211,7 @@ async function run() {
     await address.fill(`${origin}/__ezil_input`); await address.press('Enter');
     const browser = await until(() => electronApp.context().pages().find(page => page.url() === `${origin}/__ezil_input`));
     const typing = browser.locator('#typing'); await typing.click(); await browser.keyboard.type('before-address');
-    nativeAddressShortcut();
+    nativeShortcut('address');
     await until(() => address.evaluate(el => document.activeElement === el));
     await shellPage.keyboard.type('localhost:12345');
     assert.equal(await address.inputValue(), 'localhost:12345', 'address_shortcut_did_not_select');
@@ -226,7 +228,8 @@ async function run() {
     report.downloadDialog = await save; assert.equal(report.downloadDialog.clicked, true, 'native_download_save_not_confirmed');
     await until(() => fs.existsSync(downloadPath) && fs.readFileSync(downloadPath, 'utf8') === DOWNLOAD);
     await minimize('desktop'); await dock('desktop');
-    await typing.click(); await browser.keyboard.type('-restored'); assert.equal(await typing.inputValue(), 'after-address-restored');
+    await typing.click(); await typing.press('Meta+ArrowRight');
+    await browser.keyboard.type('-restored'); assert.equal(await typing.inputValue(), 'after-address-restored');
     await screenshot('browser-file-inputs', browser); await minimize('desktop');
   });
   await step('slow_browser_navigation_keeps_shell_responsive', async () => {
@@ -276,7 +279,9 @@ async function run() {
     assert.equal(fs.readFileSync(path.join(project.files, 'src/message.ts'), 'utf8'), sourceText('EZIL_HMR'));
   });
   await step('stop_development_server', async () => {
-    await dock('code'); await terminal.focus(); await shellPage.keyboard.press('Control+c');
+    await dock('code'); await palette('Terminal: Focus Terminal');
+    terminal = codeFrame.locator('textarea.xterm-helper-textarea').first();
+    await terminal.focus(); nativeShortcut('interrupt');
     await until(async () => { try { await fetch(origin, { signal: AbortSignal.timeout(500) }); return false; } catch { return true; } });
   });
   await step('preview_stop_restart_recovery', async () => {
@@ -285,7 +290,7 @@ async function run() {
     // stand in for an authoritative readiness check.
     await shellPage.locator('.window[data-app="preview"] > .window-head > .window-close-btn').click();
     await shellPage.locator('.window[data-app="preview"]').waitFor({ state: 'detached' });
-    const win = await dock('preview'); await win.locator('.ezil-boot-retry').waitFor({ state: 'visible' });
+    const win = await dock('preview'); await win.getByRole('button', { name: 'Try again', exact: true }).waitFor({ state: 'visible' });
     await minimize('preview'); await dock('code'); await palette('Terminal: Focus Terminal');
     terminal = codeFrame.locator('textarea.xterm-helper-textarea').first();
     await terminalCommand(`npm run dev -- --port ${port} --strictPort --config .e2e-vite.config.mjs`);
@@ -294,13 +299,13 @@ async function run() {
     const settings = await dock('settings'); await settings.locator('[data-tab="system"]').click();
     await settings.locator('#ezil-preview-port').fill(String(port)); await settings.getByRole('button', { name: 'Register preview', exact: true }).click();
     await settings.getByText(`Port ${port} is ready. Open Preview from the dock.`, { exact: true }).waitFor(); await minimize('settings');
-    const reopened = await dock('preview'); await reopened.locator('.ezil-boot-retry').click();
+    const reopened = await dock('preview'); await reopened.getByRole('button', { name: 'Try again', exact: true }).click();
     const element = await reopened.locator('iframe.window-app-iframe').elementHandle();
     preview = await until(async () => { const frame = await element.contentFrame(); return frame && await frame.locator('#message').textContent() === 'EZIL_HMR' ? frame : null; });
     assert.notEqual(await preview.locator('body').getAttribute('data-document-id'), documentId);
     await screenshot('preview-restarted');
     await minimize('preview'); await dock('code'); await palette('Terminal: Focus Terminal');
-    terminal = codeFrame.locator('textarea.xterm-helper-textarea').first(); await terminal.focus(); await shellPage.keyboard.press('Control+c');
+    terminal = codeFrame.locator('textarea.xterm-helper-textarea').first(); await terminal.focus(); nativeShortcut('interrupt');
     await until(async () => { try { await fetch(origin, { signal: AbortSignal.timeout(500) }); return false; } catch { return true; } });
   });
   report.success = true;
@@ -316,6 +321,8 @@ async function cleanup() {
     await Promise.race([electronApp.close(), new Promise((_, reject) => { timer = setTimeout(() => reject(Error('quit_timeout')), 55000); })]);
     report.quitDialog = await dialog;
     assert.equal(report.quitDialog.clicked, true, 'native_quit_confirmation_not_observed');
+    const events = JSON.parse(fs.readFileSync(path.join(required('EZIL_E2E_DATA_ROOT'), 'diagnostics.json'))).events;
+    assert.ok(!events.some(event => event.code === 'WORKSPACE_CLEANUP_FAILED'), 'workspace cleanup reported an incomplete shutdown');
     report.cleanup = 'closed';
   } catch {
     report.cleanup = 'quit_failed'; report.success = false;

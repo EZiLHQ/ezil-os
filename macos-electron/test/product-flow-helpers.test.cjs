@@ -23,6 +23,14 @@ test('native confirmation targets exact process/button and reports polling exhau
   assert.match(script, /unix id is 123/); assert.match(script, /entire contents of win/); assert.match(script, /return "clicked"/);
   assert.match(script, /error "native_dialog_not_found" number 1001/); assert.match(script, /\+ 45/);
   assert.doesNotMatch(script, /sheet 1|window 1|exit repeat/);
-  assert.match(nativeButtonScript(123, 'Save', 30), /name of control is "Save"/);
+  assert.match(nativeButtonScript(123, 'Save', 30), /name of candidateControl is "Save"/);
   for (const args of [[0, 'Save'], [123, 'Cancel'], [123, 'Save', 0], ['123', 'Save']]) assert.throws(() => nativeButtonScript(...args));
+});
+test('native confirmation scripts compile with the macOS AppleScript parser', { skip: process.platform !== 'darwin' }, t => {
+  const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-applescript-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  for (const label of ['Save', 'Stop workspace']) require('node:child_process').execFileSync('/usr/bin/osacompile', ['-o', path.join(directory, `${label}.scpt`), '-'], {
+    input: nativeButtonScript(123, label), stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000
+  });
 });

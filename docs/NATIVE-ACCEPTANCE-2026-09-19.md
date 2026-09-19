@@ -22,7 +22,7 @@ claimed.
 Pinned-tool checks: Node 24.15.0, npm 11.12.1, Bun 1.3.14,
 Electron 44.4.1, code-server 4.137.0 and Playwright Core 1.62.1.
 
-- Host: **110 passed, 0 failed, 1 skipped**. The skipped check requires the
+- Host: **112 passed, 0 failed, 1 skipped**. The skipped check requires the
   actual old installed 0.0.14 source, which the user deleted.
 - Native/connector: **32 passed**, real sockets enabled.
 - Host syntax, native/connector typechecks, shell load and affected
@@ -69,6 +69,21 @@ renames both the executable and `CFBundleExecutable` to `EZiL OS`, and the
 Browser/development harnesses assert the expected runtime mode. This is a
 packaging fix, not a production-path exception. Superseded DMGs remain on the
 SSD for diagnosis and must not be installed.
+
+Packaged Browser checks passed after the executable fix, including actual
+native-window capture. The attached-project flow subsequently passed Code
+save/build/server, native address focus, upload/download, source-edit HMR
+without a reload, ten Code detach/reopen cycles, and native Ctrl+C. Test
+corrections distinguish OS keystrokes from CDP input, compile the native dialog
+AppleScript (a reserved variable caused a syntax error), explicitly place the
+text cursor, and select the visible Preview retry button by accessible name.
+
+Process-identity auditing found a genuine helper orphan when editor shutdown
+reported failure: sequential cleanup stopped at that error. Cleanup now
+attempts every component, records a fixed diagnostic, and still rejects unsafe
+workspace removal. The exact orphan from the failed test was identity-checked
+and terminated. These fixes require fresh packaging and full acceptance;
+previous passing stages are not a complete release sign-off.
 
 ## Historical checks before the SSD was reconnected
 

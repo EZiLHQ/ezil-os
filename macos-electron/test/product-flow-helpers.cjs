@@ -30,10 +30,10 @@ if exists (first application process whose unix id is ${pid}) then
 tell first application process whose unix id is ${pid}
 repeat with win in windows
 set controls to entire contents of win
-repeat with control in controls
+repeat with candidateControl in controls
 try
-if role of control is "AXButton" and name of control is "${label}" and enabled of control then
-click control
+if role of candidateControl is "AXButton" and name of candidateControl is "${label}" and enabled of candidateControl then
+click candidateControl
 return "clicked"
 end if
 end try

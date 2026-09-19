@@ -45,6 +45,23 @@ function fixture() {
   return { context, active, actions, deferred, sent, views };
 }
 const settle = async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve)); };
+test('workspace cleanup attempts every component even when one fails and still rejects unsafe removal', async () => {
+  for (const broken of ['', 'browser', 'editor', 'helper']) {
+    const calls = [];
+    const action = name => async () => { calls.push(name); if (broken === name) throw Error('private failure detail'); };
+    const window = { isDestroyed: () => false, destroy: action('window'), webContents: { executeJavaScript: async () => {} } };
+    const host = { workspace: { id: 'fixture' }, window, gateway: { close: action('gateway') },
+      browser: { retire: action('browser') }, helper: { close: action('helper') },
+      shellSession: { closeAllConnections: action('connections'), clearStorageData: action('storage'), clearCache: action('cache') } };
+    const c = vm.createContext({ current: host, desktop: window, closing: null, setTimeout, clearTimeout, clearInterval,
+      embedded: { stop: action('editor') }, note: code => calls.push(code) });
+    vm.runInContext(definition('closeWorkspace'), c);
+    if (broken) await assert.rejects(c.closeWorkspace(true), /Workspace cleanup incomplete/);
+    else await c.closeWorkspace(true);
+    assert.deepEqual(calls, ['gateway', 'browser', 'editor', 'helper', 'window', 'connections', 'storage', 'cache', ...(broken ? ['WORKSPACE_CLEANUP_FAILED'] : [])]);
+    assert.equal(c.current, null); assert.equal(c.desktop, null); assert.equal(c.closing, null);
+  }
+});
 test('replacement retires old Browser view and never relabels old state or shortcuts', async () => {
   const { context: c, active, sent, views, actions } = fixture();
   const input = { op: 'browser.attach', workspaceId: 'active', surfaceId: 'surface', generation: 1, sequence: 1 };

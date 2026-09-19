@@ -94,14 +94,23 @@ else {
       }
       if (current === previous) current = null;
       clearInterval(previous.previewTimer);
-      previous.gateway?.close();
-      if (retireBrowser) await previous.browser?.retire(); else await previous.browser?.close();
-      await embedded.stop(previous.workspace.id);
-      await previous.helper.close();
-      if (previous.window && !previous.window.isDestroyed()) previous.window.destroy();
-      await previous.shellSession?.closeAllConnections();
-      if (retireBrowser) { await previous.shellSession?.clearStorageData(); await previous.shellSession?.clearCache(); }
+      // One component's cleanup failure must not strand the helper, browser,
+      // or window. Still reject afterward so removal/switching cannot mistake
+      // an incomplete editor shutdown for confirmed process ownership release.
+      let failed = false;
+      const cleanup = async action => { try { await action(); } catch { failed = true; } };
+      await cleanup(() => previous.gateway?.close());
+      await cleanup(() => retireBrowser ? previous.browser?.retire() : previous.browser?.close());
+      await cleanup(() => embedded.stop(previous.workspace.id));
+      await cleanup(() => previous.helper.close());
+      await cleanup(() => { if (previous.window && !previous.window.isDestroyed()) previous.window.destroy(); });
+      await cleanup(() => previous.shellSession?.closeAllConnections());
+      if (retireBrowser) {
+        await cleanup(() => previous.shellSession?.clearStorageData());
+        await cleanup(() => previous.shellSession?.clearCache());
+      }
       if (desktop === previous.window) desktop = null;
+      if (failed) { note('WORKSPACE_CLEANUP_FAILED'); throw Error('Workspace cleanup incomplete'); }
     })();
     try { await closing; } finally { closing = null; }
   }
