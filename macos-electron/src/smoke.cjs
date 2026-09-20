@@ -54,7 +54,9 @@ async function run(host) {
     if (swiftc) {
       const source = path.join(workspace.files, 'NativeProbe.swift'), binary = path.join(workspace.files, 'native-probe');
       fs.writeFileSync(source, 'import Foundation\ntry "xcode-native".write(toFile: "xcode-built.txt", atomically: true, encoding: .utf8)\n');
-      execFileSync(swiftc, [source, '-o', binary], { cwd: workspace.files, env: cleanEnvironment(), stdio: 'ignore' });
+      // xcrun supplies the selected SDK; calling the toolchain binary directly
+      // can omit the standard-library search root on current macOS/Xcode.
+      execFileSync('/usr/bin/xcrun', ['--sdk', 'macosx', 'swiftc', source, '-o', binary], { cwd: workspace.files, env: cleanEnvironment(), stdio: 'ignore' });
       execFileSync(binary, [], { cwd: workspace.files, env: cleanEnvironment(), stdio: 'ignore' });
       assert.equal(fs.readFileSync(path.join(workspace.files, 'xcode-built.txt'), 'utf8'), 'xcode-native');
       report.optional.xcode = 'passed'; check('installed Apple toolchain executes native code');

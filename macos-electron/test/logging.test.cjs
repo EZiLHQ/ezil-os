@@ -7,6 +7,21 @@ const { installBrokenPipeGuards } = require('../src/stdio-guard.cjs');
 const { Diagnostics, createDiagnosticSink } = require('../src/diagnostics.cjs');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const pipeError = () => Object.assign(Error('private error'), { code: 'EPIPE' });
+test('real disconnected stdout and stderr pipes do not terminate the child process', async () => {
+  const { spawn } = require('node:child_process');
+  const child = spawn(process.execPath, ['-e', `
+    require(${JSON.stringify(require.resolve('../src/stdio-guard.cjs'))}).installBrokenPipeGuards({ onBrokenPipe: sink => process.send(sink) });
+    process.once('message', () => {
+      process.stdout.write('output'); process.stderr.write('warning');
+      setTimeout(() => { console.error('later warning'); console.log('later output'); process.exit(0); }, 100);
+    });
+  `], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+  child.stdout.destroy(); child.stderr.destroy();
+  const seen = []; child.on('message', message => seen.push(message));
+  const exit = new Promise((resolve, reject) => { child.once('exit', (code, signal) => resolve({ code, signal })); child.once('error', reject); });
+  child.send('write');
+  assert.deepEqual(await exit, { code: 0, signal: null }); assert.deepEqual(seen.sort(), ['stderr', 'stdout']);
+});
 
 test('synchronous EPIPE disables only the broken sink and disposal restores writes', () => {
   const stdout = new EventEmitter(), stderr = new EventEmitter();

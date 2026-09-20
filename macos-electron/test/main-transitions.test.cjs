@@ -195,3 +195,15 @@ test('secure browser failure blocks attached and managed removal', async () => {
     assert.deepEqual(actions, []); assert.equal(c.transitioning, false);
   }
 });
+test('repeated quit cannot bypass cleanup and cleanup failure keeps the app available for recovery', async () => {
+  for (const failure of [false, true]) {
+    let finish; let closes = 0, quits = 0, recoveries = 0;
+    const c = vm.createContext({ current: {}, quitting: false, quitPrompt: false, quitAllowed: false, reopenRequested: true,
+      confirmLeave: async () => true, closeWorkspace: () => { closes++; return new Promise((resolve, reject) => { finish = () => failure ? reject(Error('unresolved')) : resolve(); }); },
+      broker: { close: async () => {} }, app: { quit: () => quits++ }, note() {}, showRecovery: () => recoveries++ });
+    vm.runInContext(definition('requestQuit'), c);
+    const first = c.requestQuit(); await settle(); await c.requestQuit();
+    assert.equal(closes, 1); assert.equal(c.quitAllowed, false); assert.equal(quits, 0);
+    finish(); await first; assert.equal(c.quitAllowed, !failure); assert.equal(quits, failure ? 0 : 1); assert.equal(recoveries, failure ? 1 : 0);
+  }
+});
