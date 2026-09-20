@@ -109,8 +109,16 @@ async function run(host) {
       sequence = browserSequence - 1; return invoke('browser', { operation: input });
     };
     const previewURL = `http://127.0.0.1:${server.address().port}/`;
+    const pageReady = async wc => {
+      const deadline = Date.now() + 10000;
+      while (wc.getURL() !== previewURL || wc.isLoadingMainFrame()) {
+        if (Date.now() >= deadline) throw Error('Smoke page not ready');
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    };
     await browserOp('create', { url: previewURL, bounds: { x: 100, y: 100, width: 600, height: 400 } });
     const view = current.browser.views.get('offline-smoke').view;
+    await pageReady(view.webContents);
     assert.equal(current.browser.window, desktop); assert.ok(desktop.contentView.children.includes(view));
     assert.equal(await view.webContents.executeJavaScript('typeof require'), 'undefined'); assert.equal(await view.webContents.executeJavaScript('typeof window.ezilNative'), 'undefined');
     assert.equal(await view.webContents.executeJavaScript('window.hmr'), 'hmr-ready');
@@ -119,6 +127,7 @@ async function run(host) {
     await browserOp('restore'); assert.equal(desktop.contentView.children.includes(view), true);
     await browserOp('destroy'); assert.equal(view.webContents.isDestroyed(), true);
     await browserOp('create', { url: previewURL, bounds: { x: 100, y: 100, width: 600, height: 400 } });
+    await pageReady(current.browser.views.get('offline-smoke').view.webContents);
     assert.equal(await current.browser.views.get('offline-smoke').view.webContents.executeJavaScript('localStorage.getItem("guest-canary")'), 'persisted');
     await browserOp('destroy'); check('browser composition, WS, occlusion, cleanup and profile persistence');
     // Snapshot bytes remain in memory; evidence contains only fixed check names.
@@ -137,11 +146,12 @@ async function run(host) {
     assert.equal(await getDesktop().webContents.executeJavaScript('localStorage.getItem("ezil-physical-preference")'), 'persisted');
     const reopened = getHost();
     await reopened.browser.operation({ op: 'create', workspaceId: workspace.id, generation: reopened.generation, sequence: 1, viewId: 'restart-smoke', url: previewURL, bounds: { x: 100, y: 100, width: 600, height: 400 } });
+    await pageReady(reopened.browser.views.get('restart-smoke').view.webContents);
     assert.equal(await reopened.browser.views.get('restart-smoke').view.webContents.executeJavaScript('localStorage.getItem("guest-canary")'), 'persisted');
     await reopened.browser.operation({ op: 'destroy', workspaceId: workspace.id, generation: reopened.generation, sequence: 2, viewId: 'restart-smoke' });
     check('files, shell preferences and browser profile survive workspace restart');
     await closeWorkspace(); report.success = true;
-  } catch { report.failure = 'PACKAGED_SMOKE_FAILED'; }
+  } catch (error) { report.failure = 'PACKAGED_SMOKE_FAILED'; report.failureAt = /smoke\.cjs:\d+:\d+/.exec(String(error?.stack))?.[0] || 'unavailable'; }
   finally {
     await closeWorkspace(); for (const socket of sockets) socket.destroy(); server?.close();
     atomic(path.join(evidenceRoot, 'result.json'), JSON.stringify(report, null, 2)); app.exit(report.success ? 0 : 1);

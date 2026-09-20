@@ -32,6 +32,15 @@ app.whenReady().then(async () => {
   const create = workspaceId => ({ op: 'create', workspaceId, generation, sequence: 1, viewId: 'tab', url, bounds: { x: 20, y: 40, width: 500, height: 400 } });
   await first.operation(create(a.id)); await second.operation(create(b.id));
   const remote = first.views.get('tab').view.webContents, other = second.views.get('tab').view.webContents;
+  // Composition returns before navigation by design. Read page state only
+  // after the local document commits, without changing production queues.
+  for (const wc of [remote, other]) {
+    const deadline = Date.now() + 10000;
+    while (wc.getURL() !== url || wc.isLoadingMainFrame()) {
+      assert.ok(Date.now() < deadline, 'Browser document did not commit');
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  }
   assert.equal(await remote.executeJavaScript('typeof require'), 'undefined'); assert.equal(await remote.executeJavaScript('typeof ezilNative'), 'undefined');
   assert.equal(await remote.executeJavaScript('window.hmr'), 'hmr-ready');
   await remote.executeJavaScript('localStorage.setItem("workspace", "A")'); assert.equal(await other.executeJavaScript('localStorage.getItem("workspace")'), null);
@@ -45,4 +54,4 @@ app.whenReady().then(async () => {
   await first.close(); await second.close(); assert.equal(window.contentView.children.length, 0);
   window.destroy(); for (const socket of sockets) socket.destroy(); server.close(); await session.defaultSession.clearStorageData();
   fs.rmSync(temp, { recursive: true, force: true }); console.log('Electron composition/sandbox/partition/occlusion smoke passed'); app.exit(0);
-}).catch(() => { console.error('Electron smoke failed'); app.exit(1); });
+}).catch(error => { console.error('Electron smoke failed', /(?:browser|electron-smoke)\.cjs:\d+:\d+/.exec(String(error?.stack))?.[0] || 'unavailable'); app.exit(1); });
