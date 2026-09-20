@@ -41,11 +41,15 @@ else {
   let store, vault, broker, desktop, recovery, current, closing, booting = false, quitting = false, providerBusy = false, transitioning = false;
   let reopenRequested = false, quitPrompt = false, quitAllowed = false;
   const removingWorkspaces = new Set();
-  async function confirmLeave(reason) {
+  async function confirmLeave(reason, removal) {
     if (!current) return true;
+    const detail = removal
+      ? (removal.kind === 'attached' ? 'The original project folder stays in place. ' : 'This deletes the files in this EZiL-managed workspace. Export anything you need first. ')
+        + 'Its EZiL profiles and browser data will be removed. Close this workspace’s Chrome windows first.'
+        + (removal.active ? ' Save unfinished Code work; its terminal and development servers will stop.' : '')
+      : 'Save any unfinished changes in Code first. The workspace terminal and development servers will stop. Your project files stay in place.';
     const answer = await dialog.showMessageBox(current.window, { type: 'question', message: reason,
-      detail: 'Save any unfinished changes in Code first. The workspace terminal and development servers will stop. Your project files stay in place.',
-      buttons: ['Cancel', 'Stop workspace'], defaultId: 0, cancelId: 0 });
+      detail, buttons: ['Cancel', removal ? 'Remove workspace' : 'Stop workspace'], defaultId: 0, cancelId: 0 });
     return answer.response === 1;
   }
   async function changeWorkspace(id) {
@@ -343,7 +347,7 @@ else {
         const workspace = store.get(input.workspaceId, { allowMissing: true });
         if (removingWorkspaces.has(workspace.id)) throw Error('Workspace removal already in progress');
         if (editors.state(workspace) !== 'stopped') return { ok: false, error: 'external_editor_running' };
-        if (!await confirmLeave('Remove workspace and its browser profiles?') || current !== host || quitting) return { ok: false, error: 'canceled' };
+        if (!await confirmLeave('Remove workspace and its browser profiles?', { kind: workspace.kind, active: workspace.id === host.workspace.id }) || current !== host || quitting) return { ok: false, error: 'canceled' };
         await secureBrowser.assertRemovable(workspace);
         if (workspace.id === host.workspace.id) {
           const fallback = store.list().find(candidate => candidate.id !== workspace.id && candidate.available !== false) || store.create('My workspace');

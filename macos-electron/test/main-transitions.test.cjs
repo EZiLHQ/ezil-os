@@ -47,6 +47,16 @@ function fixture() {
   return { context, active, actions, deferred, sent, views };
 }
 const settle = async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve)); };
+test('removal confirmation distinguishes owned files from attached originals and explicitly clears profiles', async () => {
+  let shown;
+  const c = vm.createContext({ current: { window: {} }, dialog: { showMessageBox: async (_window, value) => { shown = value; return { response: 0 }; } } });
+  vm.runInContext(definition('confirmLeave'), c);
+  for (const kind of ['managed', 'attached']) {
+    assert.equal(await c.confirmLeave('Remove?', { kind, active: true }), false);
+    assert.match(shown.detail, kind === 'managed' ? /deletes the files/ : /original project folder stays/);
+    assert.match(shown.detail, /browser data will be removed/); assert.equal(shown.buttons[1], 'Remove workspace');
+  }
+});
 test('workspace cleanup attempts every component even when one fails and still rejects unsafe removal', async () => {
   for (const broken of ['', 'browser', 'editor', 'helper']) {
     const calls = [];
