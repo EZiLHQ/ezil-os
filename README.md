@@ -2,17 +2,20 @@
 <img width="800" alt="EZiL-OS — a real Linux desktop streamed into the browser" src="docs/assets/hero.jpg">
 <h3 align="center">EZiL-OS</h3>
   <p align="center">
-    <strong>A real Linux computer, running in your browser.</strong>
+    <strong>A real desktop — in your browser, or locally on your Mac.</strong>
     <br />
-    Not a mockup and not a simulation — an actual sandboxed computer with a real
-    filesystem, real processes, a real browser and a real editor, that boots on
-    demand and picks up where you left it.
+    Hosted mode gives you a sandboxed Linux computer with a real filesystem,
+    processes, browser and editor, that boots on demand and picks up where you
+    left it. The Apple Silicon macOS preview brings the same desktop shell to
+    local development on your Mac.
     <br />
     <br />
     <a href="docs/PLATFORM-NOTES.md"><strong>→ Read the platform notes</strong></a>
     <br />
     <br />
     <a href="docs/RUNBOOK.md">Runbook</a>
+    ·
+    <a href="#macos-app-apple-silicon-preview">macOS Preview</a>
     ·
     <a href="https://github.com/EZiLHQ/ezil-os/issues/new?labels=bug&template=bug_report.yml">Report Bug</a>
     ·
@@ -26,26 +29,65 @@
 
 </div>
 
-> **Status: deployed and live, and you should treat it as alpha.** Everything
-> here is the real thing that runs in production — but the hosted product is
+> **Hosted status: deployed and live, and you should treat it as alpha.**
+> The hosted product is
 > **invite-only** while it is in this state, and the whole stack needs your
 > own Cloudflare, Vercel and Supabase accounts to stand up, so cloning it for
 > the hosted path gets you a codebase to read and build against, not a
 > one-command demo. If you just want a real desktop today with none of that,
-> **[local mode](docs/LOCAL-MODE.md)** needs only Docker and Bun — no
+> **[local container mode](docs/LOCAL-MODE.md)** needs only Docker and Bun — no
 > Cloudflare, no Vercel, no Supabase, no account. See
 > [Prerequisites](#prerequisites) before you start with the hosted path.
+>
+> **macOS status: internal Apple Silicon preview.** The native app runs on
+> your Mac without Docker or a VM. Its implementation is on the
+> [macOS preview branch](https://github.com/EZiLHQ/ezil-os/tree/feat/macos-local-dmg),
+> not yet on `main`; see [macOS app](#macos-app-apple-silicon-preview) below.
 
-# An open-source Linux desktop, streamed from a real container
+# An open-source desktop for the browser and macOS
 
-Every user gets their own sandboxed Ubuntu container running
+In hosted mode, every user gets their own sandboxed Ubuntu container running
 [Google Chrome](ATTRIBUTIONS.md) and
 [code-server](https://github.com/coder/code-server) against a persistent
 workspace, streamed to any browser over WebRTC or HTML5. It is built for
 freelancers and independent professionals doing real work: a computer you sign
 into from any tab, rather than a box tied to one desk.
 
-## What you can do with EZiL-OS
+## macOS app (Apple Silicon preview)
+
+EZiL-OS also runs as a local macOS application. The Electron host uses the
+shared EZiL desktop shell — wallpaper, dock, movable windows and Settings —
+with an embedded editor and browser, powered by your Mac's own compute.
+
+<img width="900" alt="EZiL OS running on macOS with the embedded Code editor, a sample TypeScript project and the desktop dock" src="docs/assets/macos-desktop.png">
+
+*EZiL OS running locally on Apple Silicon: the embedded Code editor in the
+shared desktop shell. Screenshot from an internal development test build.*
+
+- **Code inside the desktop:** bundled [code-server](https://github.com/coder/code-server)
+  provides a VS Code-based editor and integrated terminal for local projects.
+- **Browse and preview:** an embedded Chromium surface opens websites and
+  workspace-registered local development servers. It is not the standalone
+  Google Chrome application; some sites restrict embedded-browser sign-in.
+- **Persistent local workspaces:** project files, editor settings and browser
+  profiles stay on the Mac between sessions.
+- **Local guest startup:** no Docker, virtual machine or cloud account is
+  required to open the native desktop.
+
+This is **trusted native development**, not a container sandbox: project
+commands, terminal processes and editor extensions run with your Mac user's
+permissions. Remote browser content uses sandboxed renderers without access
+to the privileged EZiL bridge.
+
+The macOS implementation and build instructions currently live on
+[`feat/macos-local-dmg`](https://github.com/EZiLHQ/ezil-os/tree/feat/macos-local-dmg).
+Read the [native Mac setup and packaging guide](https://github.com/EZiLHQ/ezil-os/blob/feat/macos-local-dmg/docs/NATIVE-MAC.md)
+for pinned tools, local checks and internal DMG packaging. Internal builds are
+ad-hoc signed; **this is not a public notarized release**. Developer ID signing,
+notarization and the remaining physical-Mac acceptance gates must pass before
+broad distribution. Never disable Gatekeeper globally to install a preview.
+
+## What you can do with the hosted desktop
 
 - [x] Boot a real Linux computer from a browser tab
   - [x] A real filesystem and real processes, not an emulator
@@ -71,14 +113,14 @@ into from any tab, rather than a box tied to one desk.
   - [x] An optional MCP connector — [`mcp/`](mcp/README.md)
   - [ ] Both published to npm
 - [x] Run it anywhere
-  - [x] Runs on your own machine — Docker and Bun, no Cloudflare account, no
-        sign-in ([`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md))
+  - [x] Run the Linux desktop on your own machine — Docker and Bun, no
+        Cloudflare account, no sign-in ([`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md))
   - [x] Signed images on GHCR — keyless cosign signature plus build provenance
   - [x] CI on Linux, Windows and macOS
 
 ## Getting Started
 
-### Run it locally
+### Run the Linux desktop locally (Docker)
 
 The fastest way to see a real desktop with no accounts at all:
 
@@ -91,13 +133,15 @@ bun run --cwd local start
 Then open `http://127.0.0.1:7080/os`. See
 [`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md) for the environment variables, the
 port map, what the doctor checks, and what is (and is not) proven about it.
-The rest of this section is about the hosted path, which needs real cloud
-accounts.
+For the native Mac application, use the [macOS preview guide](#macos-app-apple-silicon-preview)
+instead. The rest of this section is about the hosted path, which needs real
+cloud accounts.
 
 ### Prerequisites
 
 Be honest with yourself about this list before cloning. Without all of it you
-can build, typecheck and test every piece — but you cannot boot a real desktop.
+can build, typecheck and test the hosted packages — but you cannot boot a
+hosted desktop.
 
 - [Bun](https://bun.sh/) and Node.js 22
 - [Docker](https://www.docker.com/), to build and run the container image
@@ -133,9 +177,9 @@ bun run test
 bun run build        # run this before a PR that touches app/
 ```
 
-Signed in, this is what you get: a desktop with its own windows, dock and
-settings, drawn entirely by the `shell/` bundle. Every computer is a real
-container, and a user may hold two.
+Signed in to hosted mode, this is what you get: a desktop with its own windows,
+dock and settings, drawn entirely by the `shell/` bundle. Each hosted computer
+is a real container, and a user may hold two.
 
 <img width="700" alt="The EZiL-OS desktop shell, with Settings open on the computers list" src="docs/assets/desktop-shell.jpg">
 
@@ -153,7 +197,7 @@ cd sdk && bun install && bun run typecheck && bun test
 cd mcp && bun install && bun run typecheck && bun test
 ```
 
-## How it works
+## How hosted mode works
 
 1. You sign in to the Next.js app, which owns the product surface and keeps its
    data in Supabase Postgres.
@@ -234,6 +278,10 @@ with no error a shell redirection would ever see. The measurement is in
 
 ## Repository layout
 
+The layout below describes `main`. The macOS preview branch additionally
+contains `macos-electron/` (the Electron app and packaging) and `native/` (the
+local workspace helper).
+
 ```text
 .
 ├── worker/  # Cloudflare Worker (Durable Objects + R2) and the container image:
@@ -255,9 +303,12 @@ with no error a shell redirection would ever see. The measurement is in
 
 ## Documentation
 
+- **[Native Mac setup and packaging (preview branch)](https://github.com/EZiLHQ/ezil-os/blob/feat/macos-local-dmg/docs/NATIVE-MAC.md)**
+  — Apple Silicon app architecture, trusted-native security model, pinned
+  tooling, internal builds and release gates.
 - **[`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md)** — running a real desktop on
-  your own machine: prerequisites, the environment variables, the port map,
-  the doctor, what is proven about it and how, and troubleshooting.
+  your own machine with Docker: prerequisites, environment variables, port map,
+  doctor, what is proven about it and how, and troubleshooting.
 - **[`docs/PLATFORM-NOTES.md`](docs/PLATFORM-NOTES.md)** — everything learned the
   hard way about Cloudflare Containers/Workers, Vercel and this stack's sharp
   edges. Read it before assuming a primitive behaves the way its docs imply.
