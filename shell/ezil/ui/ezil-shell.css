@@ -127,6 +127,11 @@ body.device-phone {
     font-size: 13px;
     line-height: 1.4;
 }
+.ezil-native-browser-auth { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 5px 10px; font-size: 11px; line-height: 1.4; background: #eef2f6; color: #334155; }
+.ezil-native-browser-auth > span:first-child { flex: 1 1 240px; }
+.ezil-native-browser-auth button { border: 1px solid #94a3b8; border-radius: 6px; padding: 5px 9px; background: white; color: #1e293b; cursor: pointer; }
+.ezil-native-browser-auth button:focus-visible { outline: 2px solid #0f766e; outline-offset: 2px; }
+.ezil-native-browser-auth [role="status"]:not(:empty) { flex-basis: 100%; }
 
 .ezil-native-browser-toolbar .ezil-native-browser-zoom-value { width: 48px; font-size: 12px; }
 

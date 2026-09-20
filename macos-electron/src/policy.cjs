@@ -32,6 +32,11 @@ function surfaceSchema(input) {
 function runtimeSchema(input) {
   const op = input?.op;
   const common = ['op', 'workspaceId'];
+  if (op === 'secureBrowser.status' || op === 'secureBrowser.open') {
+    exact(input, [...common, ...(op === 'secureBrowser.open' ? ['destination'] : [])]); uuid(input.workspaceId);
+    if (op === 'secureBrowser.open') require('./secure-browser.cjs').secureDestination(input.destination);
+    return input;
+  }
   if (op === 'desktop.read' || op === 'desktop.write') {
     exact(input, [...common, ...(op === 'desktop.write' ? ['preferences'] : [])]); uuid(input.workspaceId);
     if (op === 'desktop.write') preferences(input.preferences);

@@ -17,7 +17,9 @@ function fixture() {
   const active = { workspace: { id: 'active' }, generation: 'host', surfaces: new Map(), browserIdentities: new Map(), browserSequence: 0 };
   const actions = [], deferred = [], sent = [], views = new Map();
   const context = vm.createContext({ host: active, current: active, workspace: active.workspace, transitioning: false, booting: false, quitting: false,
+    closing: null, quitPrompt: false,
     removingWorkspaces: new Set(), setImmediate: fn => deferred.push(fn),
+    drainReopen() {}, secureBrowser: { assertRemovable: async () => {} },
     confirmLeave: async () => true, note() {}, showRecovery: () => actions.push('recovery'),
     editors: { state: () => 'stopped' }, embedded: { state: () => 'stopped', stop: async () => {} },
     store: { get: id => ({ id }), list: () => [{ id: 'active' }, { id: 'missing', available: false }, { id: 'available', available: true }],
@@ -54,11 +56,11 @@ test('workspace cleanup attempts every component even when one fails and still r
       browser: { retire: action('browser') }, helper: { close: action('helper') },
       shellSession: { closeAllConnections: action('connections'), clearStorageData: action('storage'), clearCache: action('cache') } };
     const c = vm.createContext({ current: host, desktop: window, closing: null, setTimeout, clearTimeout, clearInterval,
-      embedded: { stop: action('editor') }, note: code => calls.push(code) });
+      embedded: { stop: action('editor') }, drainReopen() {}, note: code => calls.push(code) });
     vm.runInContext(definition('closeWorkspace'), c);
     if (broken) await assert.rejects(c.closeWorkspace(true), /Workspace cleanup incomplete/);
     else await c.closeWorkspace(true);
-    assert.deepEqual(calls, ['gateway', 'browser', 'editor', 'helper', 'window', 'connections', 'storage', 'cache', ...(broken ? ['WORKSPACE_CLEANUP_FAILED'] : [])]);
+    assert.deepEqual(calls, ['editor', 'gateway', 'browser', 'helper', 'window', 'connections', 'storage', 'cache', ...(broken ? ['WORKSPACE_CLEANUP_FAILED'] : [])]);
     assert.equal(c.current, null); assert.equal(c.desktop, null); assert.equal(c.closing, null);
   }
 });
@@ -148,4 +150,48 @@ test('fallback failure and selection dialog failure release transition ownership
   c.current = active; c.confirmLeave = async () => { throw Error('dialog failed'); };
   await assert.rejects(c.runtimeOperation(active, { op: 'workspace.select', workspaceId: 'available' }), /dialog failed/);
   assert.equal(c.transitioning, false);
+});
+test('Dock activation during teardown queues exactly one reopen after cleanup', async () => {
+  let release; const events = [];
+  const host = { workspace: { id: 'a' }, window: { isDestroyed: () => false, destroy() { events.push('destroy'); }, webContents: { executeJavaScript: async () => {} } }, helper: { close: async () => {} } };
+  const c = vm.createContext({ current: host, desktop: host.window, closing: null, reopenRequested: false, booting: false, transitioning: false, quitting: false,
+    setTimeout, clearTimeout, clearInterval, note() {}, showRecovery() {}, boot: async () => events.push('boot'),
+    embedded: { stop: () => new Promise(resolve => { release = resolve; }) } });
+  for (const name of ['closeWorkspace', 'restoreDesktop', 'drainReopen']) vm.runInContext(definition(name), c);
+  const closing = c.closeWorkspace(); await settle();
+  assert.equal(host.stopping, true);
+  for (let i = 0; i < 10; i++) c.restoreDesktop();
+  assert.deepEqual(events, []); release(); await closing;
+  assert.deepEqual(events, ['destroy', 'boot']); assert.equal(c.reopenRequested, false);
+});
+test('late editor gateway is closed and never binds to the next workspace window', async () => {
+  let release; const calls = [];
+  const host = { workspace: { id: 'a' }, helper: { origin: 'http://127.0.0.1:1' }, window: { isDestroyed: () => false, webContents: { id: 10 } } };
+  const c = vm.createContext({ current: host, desktop: { webContents: { id: 99 } }, broker: null,
+    embedded: { start: async () => {}, instances: new Map() },
+    startGateway: options => { assert.equal(options.webContentsId, 10); return new Promise(resolve => { release = resolve; }); } });
+  vm.runInContext(definition('prepareEditor'), c);
+  const pending = c.prepareEditor(host); await settle(); host.stopping = true; c.current = {};
+  release({ close: async () => calls.push('gateway-closed') });
+  await assert.rejects(pending, /Workspace changed/); assert.deepEqual(calls, ['gateway-closed']); assert.equal(host.gateway, undefined);
+});
+test('close confirmation is single-flight, cancellation preserves session and cleanup errors are handled', async () => {
+  for (const confirmed of [false, true]) {
+    let resolve; let prompts = 0; const events = [], host = {};
+    const c = vm.createContext({ current: host, transitioning: false, quitPrompt: false, quitting: false,
+      confirmLeave: () => { prompts++; return new Promise(r => { resolve = r; }); },
+      closeWorkspace: async () => { events.push('close'); throw Error('failed'); }, note: code => events.push(code), showRecovery: () => events.push('recovery') });
+    vm.runInContext(definition('requestWindowClose'), c);
+    const first = c.requestWindowClose(host); await c.requestWindowClose(host); assert.equal(prompts, 1);
+    resolve(confirmed); await first;
+    assert.deepEqual(events, confirmed ? ['close', 'WORKSPACE_CLEANUP_FAILED', 'recovery'] : []); assert.equal(host.closePrompt, false);
+  }
+});
+test('secure browser failure blocks attached and managed removal', async () => {
+  for (const workspaceId of ['active', 'available']) {
+    const { context: c, active, actions } = fixture();
+    c.secureBrowser.assertRemovable = async () => { throw Object.assign(Error('busy'), { code: 'secure_browser_busy' }); };
+    await assert.rejects(c.runtimeOperation(active, { op: 'workspace.remove', workspaceId }), { code: 'secure_browser_busy' });
+    assert.deepEqual(actions, []); assert.equal(c.transitioning, false);
+  }
 });

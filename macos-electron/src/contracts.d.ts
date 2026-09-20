@@ -26,3 +26,10 @@ export interface BrowserZoomOperation {
   workspaceId: string; surfaceId: string; generation: number; sequence: number;
 }
 export type BrowserShortcutAction = 'address' | 'reload' | 'back' | 'forward' | 'new-tab' | 'close-tab' | 'next-tab' | 'previous-tab' | 'zoom-in' | 'zoom-out' | 'zoom-reset';
+export type SecureBrowserReason = 'missing' | 'outdated' | 'untrusted' | 'unavailable' | 'profile_busy';
+export type SecureBrowserOperation =
+  | { op: 'secureBrowser.status'; workspaceId: string }
+  | { op: 'secureBrowser.open'; workspaceId: string; destination?: string };
+export interface SecureBrowserStatus { available: boolean; version?: string; reason?: SecureBrowserReason }
+export interface SecureBrowserOpened { opened: boolean; reason?: SecureBrowserReason }
+export type EditorFailure = 'editor_start_failed' | 'editor_connection_lost' | 'editor_cleanup_unverified';

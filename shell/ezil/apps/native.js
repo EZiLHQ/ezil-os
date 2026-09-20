@@ -7,6 +7,16 @@ const shown = el => {
     const css = getComputedStyle(el);
     return !el.hidden && css.display !== 'none' && css.visibility !== 'hidden' && css.opacity !== '0';
 };
+export async function openSecureBrowser (ctx, destination) {
+    const adapter = selectRuntimeAdapter(ctx);
+    const workspaceId = ctx?.computer?.id ?? ctx?.payload?.computer?.id ?? window.__EZIL_BOOT__?.computer?.id;
+    const result = await adapter?.operation({ op: 'secureBrowser.open', workspaceId, ...(destination ? { destination } : {}) });
+    if (result?.opened) return 'Opened in Google Chrome. Sign in there; the session stays in this workspace’s Chrome profile.';
+    return ({ missing: 'Install Google Chrome from google.com/chrome, then try again.',
+        outdated: 'Update Google Chrome using Chrome → About Google Chrome, then try again.',
+        untrusted: 'Chrome’s Google signature could not be verified. Reinstall Chrome from google.com/chrome.',
+        profile_busy: 'This Chrome profile is busy. Close its Chrome windows and try again.' })[result?.reason] || 'Secure Browser could not open. Check Chrome and try again. Only HTTPS websites are supported.';
+}
 export function bindNativeBrowser (el, ctx) {
     const adapter = selectRuntimeAdapter(ctx), body = el.querySelector('.window-body');
     el.querySelector('.window-app-iframe').hidden = true; body.style.position = 'relative';
@@ -26,7 +36,11 @@ export function bindNativeBrowser (el, ctx) {
     const zoomReset = button('100%', 'zoom-reset', 'Reset page zoom'); zoomReset.className = 'ezil-native-browser-zoom-value';
     const zoomIn = button('+', 'zoom-in', 'Zoom in');
     const status = document.createElement('span'); status.setAttribute('role', 'status'); toolbar.append(address, zoomOut, zoomReset, zoomIn, status);
-    chrome.append(tabRow, toolbar); body.appendChild(chrome);
+    const auth = document.createElement('div'); auth.className = 'ezil-native-browser-auth';
+    const hint = document.createElement('span'); hint.textContent = 'Google sign-in requires a normal Chrome window. Embedded tabs are for browsing and previews.';
+    const secure = document.createElement('button'); secure.type = 'button'; secure.textContent = 'Open in Secure Browser';
+    const secureStatus = document.createElement('span'); secureStatus.setAttribute('role', 'status');
+    auth.append(hint, secure, secureStatus); chrome.append(tabRow, toolbar, auth); body.appendChild(chrome);
     const viewport = document.createElement('div'); viewport.className = 'ezil-native-browser-viewport';
     const cover = document.createElement('div'); cover.className = 'ezil-native-browser-cover'; cover.hidden = true;
     viewport.appendChild(cover); body.appendChild(viewport);
@@ -42,6 +56,11 @@ export function bindNativeBrowser (el, ctx) {
     // Preserve a validated submission during startup/navigation, but never an
     // unsubmitted address draft. Committed native state replaces it on arrival.
     const destination = tab => tab.submittedURL || tab.url;
+    secure.addEventListener('click', async () => {
+        secure.disabled = true;
+        try { secureStatus.textContent = await openSecureBrowser(ctx, active ? destination(active) : undefined); }
+        finally { secure.disabled = false; }
+    });
     el.ezilBrowserTabs = () => ({ tabs: tabs.map(destination), activeIndex: Math.max(0, tabs.indexOf(active)) });
     function render () {
         if (!active || disposed) return;

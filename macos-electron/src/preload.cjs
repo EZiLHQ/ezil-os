@@ -3,7 +3,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 // Sandboxed preload may only require Electron/builtin allowlisted modules.
 // Validation is duplicated here for early feedback; main is authoritative.
 const operations = new Set(['status', 'retry', 'diagnostics']);
-const runtimeErrors = new Set(['external_editor_running', 'canceled', 'preview_unavailable', 'project_unavailable']);
+const editorErrors = new Set(['editor_start_failed', 'editor_connection_lost', 'editor_cleanup_unverified']);
+const runtimeErrors = new Set(['external_editor_running', 'canceled', 'preview_unavailable', 'project_unavailable', 'secure_browser_busy', 'secure_browser_unknown', ...editorErrors]);
 const workspace = value => value && typeof value.id === 'string' && typeof value.name === 'string'
   ? { id: value.id, name: value.name, kind: value.kind === 'attached' ? 'attached' : 'managed', available: value.available !== false, ...(typeof value.createdAt === 'string' ? { createdAt: value.createdAt } : {}) } : null;
 const uuid = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
@@ -44,6 +45,9 @@ function subscribe(channel, listener, kind = 'state') {
 }
 function cleanRuntimeResult(input, result) {
   if (result?.ok !== true) return { ok: false, state: 'unavailable', ...(runtimeErrors.has(result?.error) ? { error: result.error } : {}) };
+  if (input.op === 'secureBrowser.status' || input.op === 'secureBrowser.open') return { ok: true,
+    ...(input.op === 'secureBrowser.status' ? { available: result.available === true, ...(typeof result.version === 'string' && /^\d+(\.\d+){3}$/.test(result.version) ? { version: result.version } : {}) } : { opened: result.opened === true }),
+    ...(['missing', 'outdated', 'untrusted', 'unavailable', 'profile_busy'].includes(result.reason) ? { reason: result.reason } : {}) };
   if (input.op === 'workspace.list') return { ok: true, workspaces: Array.isArray(result.workspaces) ? result.workspaces.map(workspace).filter(Boolean).slice(0, 100) : [] };
   if (input.op === 'desktop.read') {
     const p = result.preferences || {}, preferences = {};
@@ -64,6 +68,7 @@ function cleanRuntimeResult(input, result) {
   if (input.op.startsWith('provider.')) return { ok: true, configured: result.configured === true, ...(typeof result.keychainAvailable === 'boolean' ? { keychainAvailable: result.keychainAvailable } : {}) };
   if (!input.surfaceId) return { ok: true };
   const clean = { ok: true, workspaceId: result.workspaceId, surfaceId: result.surfaceId, generation: result.generation, sequence: result.sequence, state: result.state };
+  if (editorErrors.has(result.error)) clean.error = result.error;
   if (typeof result.url === 'string' && /^http:\/\/127\.0\.0\.1:\d+\/$/.test(result.url)) clean.url = result.url;
   if (typeof result.snapshot === 'string' && result.snapshot.length <= 2_000_000 && /^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(result.snapshot)) clean.snapshot = result.snapshot;
   if (result.browserState) clean.browserState = browserState(result.browserState);

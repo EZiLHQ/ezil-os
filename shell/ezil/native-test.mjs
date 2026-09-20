@@ -65,7 +65,7 @@ for (const el of [code, preview]) {
     assert.equal(el.querySelector('.ezil-app-spinner').hidden, false, 'post-ready failure is visible');
     assert.equal(el.querySelector('.ezil-app-spinner').dataset.kind, 'failed');
 }
-assert.equal(code.querySelector('.ezil-app-spinner-label').textContent, 'Code is unavailable');
+assert.equal(code.querySelector('.ezil-app-spinner-label').textContent, 'Code connection lost');
 assert.equal(preview.querySelector('.ezil-app-spinner-label').textContent, 'Preview is unavailable');
 assert.ok(preview.querySelector('.ezil-app-spinner-sub').textContent.includes('register its port in Settings'));
 assert.equal(code.querySelector('iframe').src, 'http://127.0.0.1:8443/', 'failure never reloads editor automatically');

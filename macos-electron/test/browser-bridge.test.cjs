@@ -11,6 +11,20 @@ function fixture() {
   return { ipc, bridge, invoke(input, value) { result = value; return bridge.operation(vm.runInContext(`(${JSON.stringify(input)})`, context)); } };
 }
 const identity = { workspaceId: randomUUID(), surfaceId: randomUUID(), generation: 1 };
+test('secure browser bridge has no executable/profile/argument surface and strips private host data', async () => {
+  const { runtimeSchema } = require('../src/policy.cjs');
+  const input = { op: 'secureBrowser.open', workspaceId: identity.workspaceId, destination: 'https://accounts.google.com/signin?rejected=secret' };
+  assert.deepEqual(runtimeSchema(input), input);
+  for (const patch of [{ args: [] }, { executable: '/bin/sh' }, { profile: '/personal' }, { destination: 'http://google.com/' }, { destination: 'https://user:pass@google.com/' }]) assert.throws(() => runtimeSchema({ ...input, ...patch }));
+  const { invoke } = fixture();
+  assert.deepEqual(JSON.parse(JSON.stringify(await invoke(input, { ok: true, opened: true, executable: '/private', profile: '/private', token: 'secret' }))), { ok: true, opened: true });
+  const status = await invoke({ op: 'secureBrowser.status', workspaceId: identity.workspaceId }, { ok: true, available: false, version: '150.0.0.0', reason: 'outdated' });
+  assert.equal(status.reason, 'outdated'); assert.equal(status.available, false);
+  for (const error of ['editor_start_failed', 'editor_connection_lost', 'editor_cleanup_unverified']) {
+    assert.equal((await invoke({ op: 'code.status', ...identity, sequence: 1 }, { ok: true, ...identity, sequence: 1, state: 'failed', error })).error, error);
+  }
+  assert.equal((await invoke(input, { ok: false, error: '/private/log/path' })).error, undefined);
+});
 test('page zoom keeps the finite operation/shortcut contract and validates observed factors', async () => {
   const { runtimeSchema } = require('../src/policy.cjs');
   for (const action of ['zoom-in', 'zoom-out', 'zoom-reset']) {

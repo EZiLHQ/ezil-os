@@ -8,12 +8,13 @@ const { bundleHelper } = require('./bundle-helper.cjs');
 const { stageCodeServer, binaryKind } = require('./code-server.cjs');
 const { validateInputs, stageInputs } = require('./inputs.cjs');
 const { verifyRuntimeBundle } = require('./verify-bundle.cjs');
+const { releaseConfig, signArgs, notarize, staple } = require('./signing.cjs');
 const root = path.resolve(__dirname, '..'), repo = path.dirname(root);
 const pkg = require('../package.json');
 function run(bin, args, options = {}) { return execFileSync(bin, args, { stdio: 'inherit', ...options }); }
 if (process.platform !== 'darwin' || process.arch !== 'arm64') throw Error('Package on an Apple Silicon Mac');
 if (process.version !== `v${pkg.ezilTools.node}` || run('npm', ['--version'], { stdio: 'pipe', encoding: 'utf8' }).trim() !== pkg.ezilTools.npm) throw Error('Install the exact Node/npm tool versions in package.json');
-if (process.argv.length > 2) throw Error('Only internal ad-hoc packaging is implemented. Public release requires a separately reviewed Developer ID/notarization path.');
+const signing = releaseConfig(process.argv.slice(2), process.env, run);
 const version = process.env.EZIL_BUILD_VERSION || pkg.version;
 if (!/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/.test(version)) throw Error('Invalid build version');
 const nativeSource = path.resolve(process.env.EZIL_PACKAGE_HELPER || path.join(repo, 'native'));
@@ -69,7 +70,7 @@ fs.copyFileSync(path.join(bunStage, 'package-lock.json'), path.join(resources, '
 fs.copyFileSync(path.join(root, 'package-lock.json'), path.join(resources, 'HOST-BUILD-LOCK.json'));
 const plist = path.join(bundle, 'Contents/Info.plist');
 for (const [key, value] of Object.entries({ CFBundleIdentifier: 'com.ezil.os.native', CFBundleExecutable: 'EZiL OS', CFBundleName: 'EZiL OS', CFBundleDisplayName: 'EZiL OS', CFBundleShortVersionString: version, CFBundleVersion: version.split('-')[0] })) run('/usr/libexec/PlistBuddy', ['-c', `Set :${key} ${value}`, plist]);
-const inventory = { distribution: 'internal-ad-hoc', version, gitSHA: process.env.GITHUB_SHA || run('git', ['rev-parse', 'HEAD'], { cwd: repo, stdio: 'pipe', encoding: 'utf8' }).trim(), electron: pkg.devDependencies.electron, bun: pkg.ezilTools.bun, node: process.version, files: {} };
+const inventory = { distribution: signing.release ? 'developer-id' : 'internal-ad-hoc', version, gitSHA: process.env.GITHUB_SHA || run('git', ['rev-parse', 'HEAD'], { cwd: repo, stdio: 'pipe', encoding: 'utf8' }).trim(), electron: pkg.devDependencies.electron, bun: pkg.ezilTools.bun, node: process.version, files: {} };
 inventory.inputs = inputInventory;
 inventory.architecture = 'arm64';
 inventory.codeServer = codeServerInventory;
@@ -94,25 +95,36 @@ function inventoryFiles(dir) { for (const item of fs.readdirSync(dir, { withFile
 function signTree(dir) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const file = path.join(dir, entry.name);
-    if (entry.isDirectory()) { signTree(file); if (/\.(app|framework)$/.test(file)) run('/usr/bin/codesign', ['--force', '--sign', '-', '--preserve-metadata=entitlements', file]); }
+    if (entry.isDirectory()) { signTree(file); if (/\.(app|framework)$/.test(file)) run('/usr/bin/codesign', signArgs(signing, file)); }
     else if (entry.isFile() && binaryKind(file) === 'Mach-O') {
       if (run('/usr/bin/lipo', ['-archs', file], { stdio: 'pipe', encoding: 'utf8' }).trim() !== 'arm64') throw Error('Nested binary architecture mismatch');
-      run('/usr/bin/codesign', ['--force', '--sign', '-', '--preserve-metadata=entitlements', file]);
+      run('/usr/bin/codesign', signArgs(signing, file));
       run('/usr/bin/codesign', ['--verify', '--strict', file]);
     }
   }
 }
 signTree(bundle);
 inventoryFiles(resources); atomic(path.join(resources, 'INVENTORY.json'), JSON.stringify(inventory, null, 2));
-run('/usr/bin/codesign', ['--force', '--sign', '-', '--preserve-metadata=entitlements', bundle]);
+run('/usr/bin/codesign', signArgs(signing, bundle));
 run('/usr/bin/codesign', ['--verify', '--deep', '--strict', bundle]);
+if (signing.release) {
+  const archive = path.join(build, 'notarization.zip');
+  run('/usr/bin/ditto', ['-c', '-k', '--sequesterRsrc', '--keepParent', bundle, archive]);
+  notarize(archive, signing, run); staple(bundle, run);
+  run('/usr/sbin/spctl', ['--assess', '--type', 'execute', '--verbose=4', bundle]);
+}
 const dmgStage = privateDir(path.join(build, 'image'));
 run('/usr/bin/ditto', [bundle, path.join(dmgStage, 'EZiL OS.app')]); fs.symlinkSync('/Applications', path.join(dmgStage, 'Applications'));
-const dmg = path.join(out, `EZiL-OS-${version}-AppleSilicon-internal.dmg`);
-run('/usr/bin/hdiutil', ['create', '-volname', 'EZiL OS Internal', '-srcfolder', dmgStage, '-ov', '-format', 'UDZO', dmg]);
+const dmg = path.join(out, `EZiL-OS-${version}-AppleSilicon${signing.release ? '' : '-internal'}.dmg`);
+run('/usr/bin/hdiutil', ['create', '-volname', signing.release ? 'EZiL OS' : 'EZiL OS Internal', '-srcfolder', dmgStage, '-ov', '-format', 'UDZO', dmg]);
 run('/usr/bin/hdiutil', ['verify', dmg]);
+if (signing.release) {
+  run('/usr/bin/codesign', ['--sign', signing.identity, '--timestamp', dmg]);
+  notarize(dmg, signing, run); staple(dmg, run);
+  run('/usr/sbin/spctl', ['--assess', '--type', 'open', '--context', 'context:primary-signature', '--verbose=4', dmg]);
+}
 const hash = createHash('sha256').update(fs.readFileSync(dmg)).digest('hex');
 atomic(dmg + '.sha256', `${hash}  ${path.basename(dmg)}\n`);
 fs.copyFileSync(path.join(resources, 'INVENTORY.json'), path.join(out, 'INVENTORY.json'));
 fs.copyFileSync(path.join(resources, 'SBOM.json'), path.join(out, 'SBOM.json'));
-console.log(`Internal ad-hoc artifact: ${dmg}\nSHA256: ${hash}`);
+console.log(`${signing.release ? 'Developer ID notarized' : 'Internal ad-hoc'} artifact: ${dmg}\nSHA256: ${hash}`);

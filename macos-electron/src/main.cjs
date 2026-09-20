@@ -1,4 +1,9 @@
 'use strict';
+// Electron/Node warnings can write before app readiness. Never log back into
+// a disconnected launcher pipe while reporting that pipe's failure.
+const brokenSinks = [];
+let pipeNote = () => brokenSinks.push('STDIO_PIPE_CLOSED');
+require('./stdio-guard.cjs').installBrokenPipeGuards({ onBrokenPipe: () => pipeNote('STDIO_PIPE_CLOSED') });
 const { app, BrowserWindow, ipcMain, session, dialog, shell, Menu, safeStorage, clipboard } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -12,7 +17,8 @@ const { config, startHelper, authenticatedHeaders, workspaceStatus, performOpera
 const { Browser, scaleBounds } = require('./browser.cjs');
 const { EditorSupervisor } = require('./editor.cjs');
 const { startGateway } = require('./editor-gateway.cjs');
-const { Diagnostics } = require('./diagnostics.cjs');
+const { Diagnostics, createDiagnosticSink } = require('./diagnostics.cjs');
+const { SecureBrowser } = require('./secure-browser.cjs');
 const { senderAllowed, lockSession, schema, surfaceSchema, runtimeSchema } = require('./policy.cjs');
 const { hostSchema, authorize } = require('./host-ipc.cjs');
 const { privateDir, atomic } = require('./files.cjs');
@@ -26,23 +32,27 @@ if (!app.requestSingleInstanceLock()) app.quit();
 else {
   const resources = app.isPackaged ? process.resourcesPath : path.resolve(process.env.EZIL_NATIVE_RESOURCES || path.resolve(__dirname, '../../'));
   const diagnostics = new Diagnostics(), callers = new Map();
-  const note = (code, fields) => { diagnostics.note(code, fields); atomic(path.join(dataRoot, 'diagnostics.json'), diagnostics.report()); };
+  const note = createDiagnosticSink(path.join(dataRoot, 'diagnostics.json'), diagnostics);
+  for (const code of brokenSinks) note(code);
+  pipeNote = note;
+  const secureBrowser = new SecureBrowser();
   const embedded = new EditorSupervisor({ resources, extensionSource: path.join(resources, 'extensions/ezil-vscode'), note });
   const editors = new Editors({ resources, extensionSource: path.join(resources, 'extensions/ezil-vscode'), findCode: async () => (await queryToolchain()).code });
   let store, vault, broker, desktop, recovery, current, closing, booting = false, quitting = false, providerBusy = false, transitioning = false;
+  let reopenRequested = false, quitPrompt = false, quitAllowed = false;
   const removingWorkspaces = new Set();
   async function confirmLeave(reason) {
-    if (!current || !['ready', 'starting'].includes(embedded.state(current.workspace.id))) return true;
+    if (!current) return true;
     const answer = await dialog.showMessageBox(current.window, { type: 'question', message: reason,
       detail: 'Save any unfinished changes in Code first. The workspace terminal and development servers will stop. Your project files stay in place.',
       buttons: ['Cancel', 'Stop workspace'], defaultId: 0, cancelId: 0 });
     return answer.response === 1;
   }
   async function changeWorkspace(id) {
-    if (transitioning || booting || quitting) return false;
+    if (transitioning || booting || quitting || closing || current?.stopping || current?.closePrompt || quitPrompt) return false;
     const host = current;
     transitioning = true;
-    try { if (host?.workspace.id !== id && !await confirmLeave('Switch workspace?')) return false; if (current !== host || quitting) return false; await openWorkspace(id); return true; } finally { transitioning = false; }
+    try { if (host?.workspace.id !== id && !await confirmLeave('Switch workspace?')) return false; if (current !== host || quitting) return false; await openWorkspace(id); return true; } finally { transitioning = false; drainReopen(); }
   }
   async function chooseProject(id) {
     const selection = await dialog.showOpenDialog({ title: id ? 'Locate the original project folder' : 'Open project folder', properties: ['openDirectory'] });
@@ -85,6 +95,7 @@ else {
     const previous = current;
     if (!previous) return closing;
     if (closing) return closing;
+    previous.stopping = true;
     closing = (async () => {
       if (previous.window && !previous.window.isDestroyed()) {
         let timeout;
@@ -99,9 +110,12 @@ else {
       // an incomplete editor shutdown for confirmed process ownership release.
       let failed = false;
       const cleanup = async action => { try { await action(); } catch { failed = true; } };
+      // stop cancels pre-spawn startup; drain its continuation before releasing
+      // the window/helper. A gateway can never attach to a replacement window.
+      await cleanup(() => embedded.stop(previous.workspace.id));
+      await previous.editorOpening?.catch(() => {});
       await cleanup(() => previous.gateway?.close());
       await cleanup(() => retireBrowser ? previous.browser?.retire() : previous.browser?.close());
-      await cleanup(() => embedded.stop(previous.workspace.id));
       await cleanup(() => previous.helper.close());
       await cleanup(() => { if (previous.window && !previous.window.isDestroyed()) previous.window.destroy(); });
       await cleanup(() => previous.shellSession?.closeAllConnections());
@@ -112,7 +126,7 @@ else {
       if (desktop === previous.window) desktop = null;
       if (failed) { note('WORKSPACE_CLEANUP_FAILED'); throw Error('Workspace cleanup incomplete'); }
     })();
-    try { await closing; } finally { closing = null; }
+    try { await closing; } finally { closing = null; drainReopen(); }
   }
   async function openWorkspace(id) {
     if (current?.workspace.id === id && desktop && !desktop.isDestroyed()) { desktop.show(); desktop.focus(); return; }
@@ -123,7 +137,7 @@ else {
     let host;
     const helper = await startHelper(settings, dataRoot, workspace, () => {
       if (quitting || current !== host) return;
-      note('HELPER_EXITED'); void closeWorkspace().finally(showRecovery);
+      note('HELPER_EXITED'); void closeWorkspace().catch(() => note('WORKSPACE_CLEANUP_FAILED')).then(showRecovery);
     });
     host = { workspace, generation, helper, previewOrigins: new Set(), surfaces: new Map(), browserIdentities: new Map(), browserSequence: 0 }; current = host;
     try {
@@ -168,27 +182,40 @@ else {
       window.on('close', event => {
         if (current !== host || quitting || host.allowClose) return;
         event.preventDefault();
-        void confirmLeave('Close this workspace?').then(confirmed => { if (confirmed && current === host) { host.allowClose = true; void closeWorkspace(); } });
+        void requestWindowClose(host);
       });
-      window.on('closed', () => { if (current === host) void closeWorkspace(); });
+      window.on('closed', () => { if (current === host) void closeWorkspace().catch(() => showRecovery()); });
       await window.loadURL(helper.url);
       store.index.activeID = id; store.save(); window.show(); recovery?.close(); note('WORKSPACE_OPENED');
     } catch { await closeWorkspace(); throw Error('Workspace startup failed'); }
   }
+  async function requestWindowClose(host) {
+    if (host.closePrompt || host.stopping || transitioning || quitPrompt) return;
+    host.closePrompt = true;
+    try {
+      if (await confirmLeave('Close this workspace?') && current === host && !quitting) {
+        host.allowClose = true;
+        await closeWorkspace();
+      }
+    } catch { note('WORKSPACE_CLEANUP_FAILED'); showRecovery(); }
+    finally { host.closePrompt = false; }
+  }
   function openEditor(host) {
+    if (host.stopping || current !== host) return Promise.reject(Error('Workspace changed'));
     host.editorOpening ||= prepareEditor(host).finally(() => { host.editorOpening = null; });
     return host.editorOpening;
   }
   async function prepareEditor(host) {
     if (host.gateway && embedded.state(host.workspace.id) === 'ready') return host.gateway.origin + '/';
     await embedded.start(host.workspace, { connector: host.helper.connector?.descriptor, model: broker?.descriptor });
-    if (current !== host) throw Error('Workspace changed');
-    host.gateway ||= await startGateway({ getEditor: () => embedded.instances.get(host.workspace.id), shellOrigin: host.helper.origin, webContentsId: desktop.webContents.id, shellWebContents: desktop.webContents });
-    if (current !== host) { host.gateway.close(); throw Error('Workspace changed'); }
+    if (current !== host || host.stopping || host.window.isDestroyed()) throw Error('Workspace changed');
+    const gateway = host.gateway || await startGateway({ getEditor: () => embedded.instances.get(host.workspace.id), shellOrigin: host.helper.origin, webContentsId: host.window.webContents.id, shellWebContents: host.window.webContents });
+    if (current !== host || host.stopping || host.window.isDestroyed()) { await gateway.close(); throw Error('Workspace changed'); }
+    host.gateway = gateway;
     return host.gateway.origin + '/';
   }
   async function boot() {
-    if (booting || quitting || transitioning) return; booting = true;
+    if (booting || quitting || transitioning || closing) return; booting = true;
     try {
       store ||= new Workspaces(dataRoot);
       if (!fs.existsSync(path.join(dataRoot, 'guest.json'))) {
@@ -200,7 +227,7 @@ else {
       const saved = store.list().find(w => w.id === store.index.activeID && w.available !== false) || store.list().find(w => w.available !== false) || store.create('My workspace');
       await openWorkspace(saved.id); note('HOST_READY');
     } catch { note('HOST_START_FAILED'); showRecovery(); }
-    finally { booting = false; }
+    finally { booting = false; drainReopen(); }
   }
   function acceptSurface(host, input) {
     const key = input.surfaceId, kind = input.op.split('.')[0], previous = host.surfaces.get(key);
@@ -262,6 +289,12 @@ else {
       ['browser.attach', 'browser.status'].includes(input.op) ? { browserState: host.browser.state(viewId) } : {});
   }
   async function runtimeOperation(host, input) {
+    if (host.stopping) throw Error('Workspace stopping');
+    if (input.op === 'secureBrowser.status') return { ok: true, ...await secureBrowser.status() };
+    if (input.op === 'secureBrowser.open') {
+      if (transitioning || removingWorkspaces.has(host.workspace.id)) return { ok: false, error: 'canceled' };
+      return { ok: true, ...await secureBrowser.open(host.workspace, input.destination) };
+    }
     if (input.op === 'desktop.read') return { ok: true, preferences: readDesktop(host.workspace) };
     if (input.op === 'desktop.write') { writeDesktop(host.workspace, input.preferences); return { ok: true }; }
     if (input.op === 'provider.status') return { ok: true, ...vault.status() };
@@ -299,7 +332,7 @@ else {
       try {
         if (!await confirmLeave('Switch workspace?') || current !== host || quitting) { transitioning = false; return { ok: true, canceled: true }; }
       } catch (error) { transitioning = false; throw error; }
-      setImmediate(() => { void (async () => { if (current === host && !quitting) await openWorkspace(workspace.id); })().catch(() => showRecovery()).finally(() => { transitioning = false; }); });
+      setImmediate(() => { void (async () => { if (current === host && !quitting) await openWorkspace(workspace.id); })().catch(() => showRecovery()).finally(() => { transitioning = false; drainReopen(); }); });
       return { ok: true, workspace };
     }
     if (input.op === 'workspace.remove') {
@@ -310,8 +343,9 @@ else {
         const workspace = store.get(input.workspaceId, { allowMissing: true });
         if (removingWorkspaces.has(workspace.id)) throw Error('Workspace removal already in progress');
         if (editors.state(workspace) !== 'stopped') return { ok: false, error: 'external_editor_running' };
+        if (!await confirmLeave('Remove workspace and its browser profiles?') || current !== host || quitting) return { ok: false, error: 'canceled' };
+        await secureBrowser.assertRemovable(workspace);
         if (workspace.id === host.workspace.id) {
-          if (!await confirmLeave('Remove this workspace?') || current !== host || quitting) return { ok: false, error: 'canceled' };
           const fallback = store.list().find(candidate => candidate.id !== workspace.id && candidate.available !== false) || store.create('My workspace');
           store.get(fallback.id); // Validate before retiring the active workspace.
           removingWorkspaces.add(workspace.id);
@@ -321,17 +355,19 @@ else {
               if (current !== host || quitting) return;
               await closeWorkspace(true);
               if (current || quitting) return;
+              await secureBrowser.assertRemovable(workspace);
               store.remove(workspace.id, editors.state(workspace), true); note('WORKSPACE_REMOVED');
               await openWorkspace(fallback.id);
             } catch { note('NATIVE_OPERATION_FAILED'); showRecovery(); }
-            finally { removingWorkspaces.delete(workspace.id); transitioning = false; }
+            finally { removingWorkspaces.delete(workspace.id); transitioning = false; drainReopen(); }
           })());
           return { ok: true };
         }
         if (embedded.state(workspace.id) !== 'stopped') await embedded.stop(workspace.id);
         if (current !== host || quitting) return { ok: false, error: 'canceled' };
+        await secureBrowser.assertRemovable(workspace);
         store.remove(workspace.id, editors.state(workspace), true); note('WORKSPACE_REMOVED'); return { ok: true };
-      } finally { if (!deferred) transitioning = false; }
+      } finally { if (!deferred) { transitioning = false; drainReopen(); } }
     }
     if (input.op === 'diagnostics.read') return { ok: true, events: diagnostics.rendererEvents() };
     if (input.op === 'preview.list') {
@@ -347,11 +383,11 @@ else {
     if (input.op.startsWith('browser.')) return browserOperation(host, input);
     if (input.op === 'code.open') {
       try { return surfaceResult(input, 'ready', { url: await openEditor(host) }); }
-      catch { return surfaceResult(input, 'failed'); }
+      catch { return surfaceResult(input, 'failed', { error: embedded.failure(host.workspace.id) || 'editor_start_failed' }); }
     }
     if (input.op === 'code.status') {
       const state = embedded.state(host.workspace.id);
-      return surfaceResult(input, state === 'ready' && host.gateway ? 'ready' : state, state === 'ready' && host.gateway ? { url: host.gateway.origin + '/' } : {});
+      return surfaceResult(input, state === 'ready' && host.gateway ? 'ready' : state, state === 'ready' && host.gateway ? { url: host.gateway.origin + '/' } : { error: embedded.failure(host.workspace.id) || 'editor_connection_lost' });
     }
     if (input.op === 'code.close') return surfaceResult(input, 'closed');
     const entry = host.surfaces.get(input.surfaceId), status = await workspaceStatus(host.helper, host.workspace.id), registered = status?.ports.includes(entry.port);
@@ -369,7 +405,7 @@ else {
       if (!host || caller?.role !== 'desktop' || !senderAllowed(event, caller.wc, caller.url) || caller.workspaceId !== host.workspace.id) throw Error('Sender');
       if ('workspaceId' in input && !input.op.startsWith('workspace.') && input.workspaceId !== host.workspace.id) throw Error('Workspace');
       return await runtimeOperation(host, input);
-    } catch { note('NATIVE_OPERATION_FAILED'); return { ok: false, state: 'unavailable' }; }
+    } catch (error) { note('NATIVE_OPERATION_FAILED'); return { ok: false, state: 'unavailable', ...(['secure_browser_busy', 'secure_browser_unknown'].includes(error?.code) ? { error: error.code } : {}) }; }
   });
   ipcMain.handle('ezil:host:v2', async (event, raw) => {
     try {
@@ -403,8 +439,27 @@ else {
     } catch { return { ok: false, error: 'Native operation unavailable' }; }
   });
   function restoreDesktop() {
+    if (quitting) return;
+    if (closing || transitioning || booting || current?.stopping) { reopenRequested = true; return; }
     if (desktop && !desktop.isDestroyed()) { if (desktop.isMinimized()) desktop.restore(); desktop.show(); desktop.focus(); }
-    else void boot();
+    else void boot().catch(() => showRecovery());
+  }
+  function drainReopen() {
+    if (!reopenRequested || closing || transitioning || booting || quitting) return;
+    reopenRequested = false; restoreDesktop();
+  }
+  async function requestQuit() {
+    if (quitting || quitPrompt || current?.closePrompt) return;
+    quitPrompt = true;
+    try {
+      if (!await confirmLeave('Quit EZiL OS?')) return;
+      quitting = true; reopenRequested = false;
+      await closeWorkspace();
+      await broker?.close();
+      quitAllowed = true;
+      app.quit();
+    } catch { quitting = false; note('WORKSPACE_CLEANUP_FAILED'); showRecovery(); }
+    finally { quitPrompt = false; }
   }
   function zoomBrowserPage(action) {
     const host = current;
@@ -420,11 +475,8 @@ else {
   app.on('second-instance', restoreDesktop);
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
   app.on('before-quit', event => {
-    if (quitting) return; event.preventDefault();
-    void confirmLeave('Quit EZiL OS?').then(confirmed => {
-      if (!confirmed || quitting) return; quitting = true;
-      void closeWorkspace().finally(() => { try { broker?.close(); } finally { app.quit(); } });
-    });
+    if (quitAllowed) return; event.preventDefault();
+    void requestQuit();
   });
   app.whenReady().then(async () => {
     lockSession(session.defaultSession);
@@ -445,12 +497,12 @@ else {
       ] },
       { label: 'Project', submenu: [
         { label: 'Open project folder…', accelerator: 'CmdOrCtrl+O', click: () => void openProject() },
-        { label: 'Create workspace', click: () => { const workspace = store.create('My workspace'); void changeWorkspace(workspace.id); } },
+        { label: 'Create workspace', click: () => { const workspace = store.create('My workspace'); void changeWorkspace(workspace.id).catch(() => showRecovery()); } },
         { type: 'separator' },
         { label: 'Show in Finder', click: () => { if (current) void shell.openPath(current.workspace.files); } },
         { label: 'Open in Xcode', click: () => { const host = current; if (host) void queryToolchain().then(({ xcode }) => openInXcode(host.workspace.files, { dialog, shell, discovery: xcode })).then(result => { if (!result.opened && result.reason !== 'canceled') void dialog.showMessageBox({ message: result.reason === 'unavailable' ? 'Install Xcode to open this project.' : 'No Xcode project was found.', detail: 'Use a macOS Xcode project or Swift package in this folder.' }); }).catch(() => { void dialog.showMessageBox({ message: 'Xcode discovery did not finish.', detail: 'Complete Xcode setup, then try again.' }); }); } }
       ] },
-      { label: 'Diagnostics', submenu: [{ label: 'Copy report', click: () => void report('copy') }, { label: 'Save report', click: () => void report('save') }] },
+      { label: 'Diagnostics', submenu: [{ label: 'Copy report', click: () => void report('copy').catch(() => note('DIAGNOSTICS_WRITE_FAILED')) }, { label: 'Save report', click: () => void report('save').catch(() => note('DIAGNOSTICS_WRITE_FAILED')) }] },
       { label: 'Optional tools', submenu: [{ label: 'Open external VS Code', click: () => { if (current) void editors.open(current.workspace, { connector: current.helper.connector?.descriptor, model: broker?.descriptor }).catch(() => note('EDITOR_UNAVAILABLE')); } }, { label: 'Get Microsoft VS Code', click: () => void shell.openExternal(INSTALLER) }] }
     ]));
     store = new Workspaces(dataRoot);

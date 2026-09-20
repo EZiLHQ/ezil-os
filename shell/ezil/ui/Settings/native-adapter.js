@@ -19,7 +19,12 @@ export async function nativeSettingsRequest (path, input, ctx) {
     };
     if (!Object.hasOwn(operations, path)) return { ok: false, code: 'UNSUPPORTED', message: 'Unavailable on this Mac.' };
     const result = await runtime.operation(operations[path]);
-    if (result?.ok !== true) return { ok: false, code: 'NATIVE_UNAVAILABLE', message: result?.error === 'external_editor_running' ? 'Close the EZiL VS Code window before removing this workspace.' : result?.error === 'canceled' ? 'Operation canceled.' : 'The local workspace operation could not be completed.' };
+    if (result?.ok !== true) return { ok: false, code: 'NATIVE_UNAVAILABLE', message: ({
+        external_editor_running: 'Close the EZiL VS Code window before removing this workspace.',
+        secure_browser_busy: 'Close this workspace’s Google Chrome windows before removing its browser data.',
+        secure_browser_unknown: 'Chrome profile ownership could not be verified. Close Chrome and try again. No data was removed.',
+        canceled: 'Operation canceled.',
+    })[result?.error] || 'The local workspace operation could not be completed.' };
     if (result.canceled) return { ok: true, canceled: true, data: null };
     if (['computer.reveal', 'computer.openVSCode', 'computer.openXcode'].includes(path)) return result.opened ? { ok: true, data: null } : { ok: false, code: 'NATIVE_UNAVAILABLE', message: result.reason === 'unavailable' ? 'Install Xcode to use this action.' : result.reason === 'no_project' ? 'No Xcode project or Swift package was found in this folder.' : 'The application could not be opened.' };
     const computer = (record, index = 0) => ({ id: record.id, name: record.name, slot: index + 1,

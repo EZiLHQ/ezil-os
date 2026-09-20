@@ -7,6 +7,12 @@ export const NATIVE_CAPABILITIES = Object.freeze({ contractVersion: 2, execution
 // a monotonic generation across windows. Host tombstones can then reject every
 // late message without growing for each tab/window opened during the session.
 const surfaceSlots = new Map();
+const EDITOR_ERRORS = new Set(['editor_start_failed', 'editor_connection_lost', 'editor_cleanup_unverified']);
+export function editorFailureCopy (reason) {
+    if (reason === 'editor_cleanup_unverified') return { title: 'Code cleanup needs verification', body: 'EZiL could not verify that its old processes stopped. Try again to recheck ownership. If it continues, save Diagnostics for review; unrelated apps will not be stopped.' };
+    if (reason === 'editor_connection_lost') return { title: 'Code connection lost', body: 'Your saved files are unchanged. Try again to reconnect or restart the local editor.' };
+    return { title: 'Code startup failed', body: 'Your saved files are unchanged. Try again to start the local editor. If it continues, check free disk space and save Diagnostics for review.' };
+}
 function leaseSurface (workspaceId, kind) {
     const key = `${workspaceId}:${kind}`;
     if (!surfaceSlots.has(key)) surfaceSlots.set(key, []);
@@ -38,7 +44,7 @@ export async function nativeOperation (operation) {
     let timer;
     try {
         if (HOST_DIALOG_OPERATIONS.has(operation?.op)) return await window.ezilNative.operation(operation);
-        const timeoutMs = operation?.op === 'provider.configure' ? 300_000 : operation?.op === 'code.open' ? 35_000 : 10_000;
+        const timeoutMs = operation?.op === 'provider.configure' ? 300_000 : operation?.op === 'code.open' ? 35_000 : operation?.op?.startsWith('secureBrowser.') ? 30_000 : 10_000;
         return await Promise.race([
             window.ezilNative.operation(operation),
             new Promise(resolve => { timer = setTimeout(() => resolve({ ok: false, error: 'native_unavailable' }), timeoutMs); }),
@@ -61,7 +67,7 @@ export function watchNativeSurface (surface, onFailure, { schedule = setTimeout,
         let ready = false;
         try { ready = await surface.confirm(); } catch { /* Fixed failure UI only. */ }
         if (stopped) return;
-        if (ready !== true) { stopped = true; onFailure(); }
+        if (ready !== true) { stopped = true; onFailure(surface.failure?.()); }
         else timer = schedule(check, interval);
     };
     timer = schedule(check, interval);
@@ -135,6 +141,7 @@ export function selectRuntimeAdapter (ctx) {
             const slot = leaseSurface(workspaceId, kind), surfaceId = slot.id;
             let generation = 0, sequence = 0, disposed = false, epoch = 0;
             let currentState = null;
+            let lastFailure = null;
             const stateListeners = new Set(), shortcutListeners = new Set(), newTabListeners = new Set();
             const acceptState = value => {
                 const state = browserState(value);
@@ -160,6 +167,7 @@ export function selectRuntimeAdapter (ctx) {
                 const pending = queue.then(async () => {
                     const r = await call(op);
                     if (r?.ok !== true || r.workspaceId !== workspaceId || r.surfaceId !== surfaceId || r.generation !== op.generation || r.sequence !== op.sequence) return { ok: false, error: 'native_surface_failed' };
+                    lastFailure = EDITOR_ERRORS.has(r.error) ? r.error : null;
                     if (kind === 'browser' && op.generation === generation) acceptState(r.browserState);
                     return r;
                 });
@@ -167,6 +175,7 @@ export function selectRuntimeAdapter (ctx) {
                 return pending;
             };
             return {
+                failure: () => lastFailure,
                 subscribeBrowserState (listener) { stateListeners.add(listener); if (currentState) listener({ ...currentState }); return () => stateListeners.delete(listener); },
                 subscribeBrowserShortcut (listener) { shortcutListeners.add(listener); return () => shortcutListeners.delete(listener); },
                 subscribeBrowserNewTab (listener) { newTabListeners.add(listener); return () => newTabListeners.delete(listener); },
@@ -187,7 +196,7 @@ export function selectRuntimeAdapter (ctx) {
                         await new Promise(resolve => setTimeout(resolve, 250));
                         if (!disposed && epoch === currentEpoch) r = await send('status');
                     }
-                    if (disposed || epoch !== currentEpoch || !r.ok || r.state !== 'ready') return { ok: false, errorCode: 'native_surface_failed' };
+                    if (disposed || epoch !== currentEpoch || !r.ok || r.state !== 'ready') return { ok: false, errorCode: lastFailure || 'native_surface_failed' };
                     if (kind === 'browser') return { ok: true };
                     const url = frameUrl(r.url);
                     if (!url || (kind === 'preview' && Number(new URL(url).port) !== port)) return { ok: false, errorCode: 'native_surface_failed' };

@@ -1,6 +1,6 @@
 {
   "name": "ezil-native-mac",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "EZiL OS trusted native Apple Silicon host",
   "main": "src/main.cjs",
@@ -14,7 +14,8 @@
     "start": "electron .",
     "test:electron": "electron test/electron-smoke.cjs",
     "test:browser-tabs": "node test/browser-tabs-flow.cjs",
-    "package:internal": "node scripts/package.cjs"
+    "package:internal": "node scripts/package.cjs",
+    "package:release": "node scripts/package.cjs --developer-id"
   },
   "devDependencies": {
     "electron": "44.4.1",

@@ -1,4 +1,4 @@
-import { selectRuntimeAdapter, watchNativeSurface } from '../native-runtime.js';
+import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../native-runtime.js';
 // code.js — EZiL-authored. Not Puter code.
 //
 // The Code window: code-server (VS Code Web), over plain HTTP, in an iframe.
@@ -290,8 +290,8 @@ export async function openCodeWindow (ctx = {}) {
         clearInterval(poll_timer); poll_timer = null;
     };
 
-    const progress = AppSpinner({ label: 'Opening Code…', onRetry: () => { void start_boot(); },
-        failureCopy: nativeSurface ? { title: 'Code is unavailable', body: 'The local editor could not start or its connection was lost. Try again. If this continues, reinstall EZiL OS.' } : undefined });
+    const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
+    const progress = AppSpinner({ label: 'Opening Code…', onRetry: () => { void start_boot(); }, failureCopy: nativeFailureCopy });
     el_body.appendChild(progress.el);
 
     // ── the "editor is not reachable" panel ──────────────────────────────
@@ -395,6 +395,7 @@ export async function openCodeWindow (ctx = {}) {
         stop_timers();
 
         if ( ! res.ok ) {
+            if (nativeFailureCopy) Object.assign(nativeFailureCopy, editorFailureCopy(res.errorCode));
             // `code_preview_unavailable` is the one code that means "this
             // deployment/container cannot serve code-server at all" — the
             // honest "not available" panel, not a failure to retry. Mirrors
@@ -500,8 +501,9 @@ export async function openCodeWindow (ctx = {}) {
             if ( seen === true ) {
                 progress.el.hidden = true;
                 el_unavailable.hidden = true;
-                stop_monitor = watchNativeSurface(nativeSurface, () => {
+                stop_monitor = watchNativeSurface(nativeSurface, reason => {
                     if (disposed || my_attempt !== attempt) return;
+                    if (nativeFailureCopy) Object.assign(nativeFailureCopy, editorFailureCopy(reason || 'editor_connection_lost'));
                     show_panel();
                     progress.render(computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: false }));
                 });

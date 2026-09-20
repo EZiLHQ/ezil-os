@@ -888,6 +888,11 @@ body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;backgro
 .ezil-native-browser-viewport{position:absolute;inset:var(--ezil-browser-chrome-height,78px) 0 0;overflow:hidden;background:#111}
 .ezil-native-browser-cover{position:absolute;inset:0;background:#111;pointer-events:none}
 .ezil-native-browser-toolbar{display:flex;gap:6px;align-items:center;padding:6px 8px;box-sizing:border-box;min-height:42px;background:#18191b;border-bottom:1px solid rgba(255,255,255,.1);color:#f5f5f4;color-scheme:dark;font-size:13px;line-height:1.4}
+.ezil-native-browser-auth{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:5px 10px;font-size:11px;line-height:1.4;background:#eef2f6;color:#334155}
+.ezil-native-browser-auth>span:first-child{flex:1 1 240px}
+.ezil-native-browser-auth button{border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:#fff;color:#1e293b;cursor:pointer}
+.ezil-native-browser-auth button:focus-visible{outline:#0f766e solid 2px;outline-offset:2px}
+.ezil-native-browser-auth [role=status]:not(:empty){flex-basis:100%}
 .ezil-native-browser-toolbar .ezil-native-browser-zoom-value{width:48px;font-size:12px}
 .ezil-native-browser-chrome[data-compact=true] .ezil-native-browser-toolbar{flex-wrap:wrap}
 .ezil-native-browser-chrome[data-compact=true] .ezil-native-browser-toolbar input{flex:1 1 180px;width:auto}
