@@ -1,7 +1,22 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
 const { appleCertificateIdentity, releaseConfig, validatePasskeyProfile, preparePasskeySigning, signArgs, notarize, staple } = require('../scripts/signing.cjs');
-const testCert = Buffer.from('synthetic signing certificate');
+const { X509Certificate } = require('node:crypto');
+// Public self-signed test certificate; its private key was discarded.
+const testCert = new X509Certificate(`-----BEGIN CERTIFICATE-----
+MIICGzCCAcICCQCjQGb2bcRxAjAKBggqhkjOPQQDAjAcMRowGAYDVQQDDBFFWmlM
+LXNpZ25pbmctdGVzdDAeFw0yNjA5MjIxNzQ2NDNaFw0zNjA5MTkxNzQ2NDNaMBwx
+GjAYBgNVBAMMEUVaaUwtc2lnbmluZy10ZXN0MIIBSzCCAQMGByqGSM49AgEwgfcC
+AQEwLAYHKoZIzj0BAQIhAP////8AAAABAAAAAAAAAAAAAAAA////////////////
+MFsEIP////8AAAABAAAAAAAAAAAAAAAA///////////////8BCBaxjXYqjqT57Pr
+vVV2mIa8ZR0GsMxTsPY7zjw+J9JgSwMVAMSdNgiG5wSTamZ44ROdJreBn36QBEEE
+axfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5RdiYwpZP40Li/hp/m47n60p8D54W
+K84zV2sxXs7LtkBoN79R9QIhAP////8AAAAA//////////+85vqtpxeehPO5ysL8
+YyVRAgEBA0IABGKdlNs9/mAqHwhxZSD3/Kh3H8pn2EapM6ncwSnIaADgxq4jm0mB
+TuTHWIaHoKjHUhOQceSV6uTZCPnc0OcLMgUwCgYIKoZIzj0EAwIDRwAwRAIhANq1
+M80QO3jS7+SYX8tXv28bkxOLwaGk6wGOSVhMFCv8Ah8S+QRzc1O5uyh2sEt+46WL
+Rg5gqyU+TlANHF6mB8Wh
+-----END CERTIFICATE-----`).raw;
 function profileRun(_bin, args) {
   if (args[0] === 'cms') return '<plist>synthetic fixture</plist>';
   const fields = { TeamIdentifier: '<plist><array><string>A1B2C3D4E5</string></array></plist>', 'Entitlements.keychain-access-groups': '<plist><array><string>A1B2C3D4E5.*</string></array></plist>',
@@ -51,9 +66,11 @@ test('only the main signed app receives its validated passkey keychain group', t
 test('expired, wrong team, wrong app, unauthorized group/certificate and development profiles fail closed', () => {
   const config = { team: 'A1B2C3D4E5', identity: appleCertificateIdentity(testCert) };
   validatePasskeyProfile('fixture', config, profileRun);
+  assert.throws(() => appleCertificateIdentity(Buffer.from('not a certificate')));
   for (const [field, value] of [['ExpirationDate', '2000-01-01'], ['TeamIdentifier', '["OTHERTEAM1"]'],
     ['Entitlements.com\\.apple\\.application-identifier', 'A1B2C3D4E5.other.app'],
-    ['Entitlements.keychain-access-groups', '["OTHERTEAM1.*"]'], ['DeveloperCertificates', '<array/>'], ['ProvisionsAllDevices', 'false']]) {
+    ['Entitlements.keychain-access-groups', '["OTHERTEAM1.*"]'], ['DeveloperCertificates', '<array/>'],
+    ['DeveloperCertificates', '<array><data>bm90IGEgY2VydGlmaWNhdGU=</data></array>'], ['ProvisionsAllDevices', 'false']]) {
     assert.throws(() => validatePasskeyProfile('fixture', config, (bin, args) => args[1] === field ? value : profileRun(bin, args)));
   }
 });

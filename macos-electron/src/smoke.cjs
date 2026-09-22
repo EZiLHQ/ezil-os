@@ -11,6 +11,9 @@ const { atomic, privateDir } = require('./files.cjs');
 const { discover, cleanEnvironment } = require('./vscode.cjs');
 const { workspaceStatus } = require('./helper.cjs');
 const { once } = require('node:events');
+function scriptLiteral(value) {
+  return JSON.stringify(value).replace(/[<>\u2028\u2029]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
 function providerFixtures(input) {
   if (!input) throw Error('Explicit provider fixture required');
   const file = path.resolve(input);
@@ -77,13 +80,9 @@ async function run(host) {
     const status = await desktop.webContents.executeJavaScript('window.ezilNative.request({op:"status"})');
     await desktop.webContents.executeJavaScript('localStorage.setItem("ezil-physical-preference", "persisted")');
     let sequence = status.sequence;
-    const invoke = async (op, extra = {}) => desktop.webContents.executeJavaScript(`window.ezilNative.host(${JSON.stringify({ op, workspaceId: workspace.id, generation: status.generation, sequence: ++sequence, ...extra })})`);
+    const invoke = async (op, extra = {}) => desktop.webContents.executeJavaScript(`window.ezilNative.host(${scriptLiteral({ op, workspaceId: workspace.id, generation: status.generation, sequence: ++sequence, ...extra })})`);
     const editor = await invoke('editor.start'); assert.equal(editor.state, 'ready');
-    // The editor URL is minted by the local host and constrained to loopback.
-    // JSON string encoding is the required boundary for this physical smoke's
-    // one-time script injection; it is not user-controlled source code.
-    // lgtm[js/code-injection]
-    await desktop.webContents.executeJavaScript(`(() => { const frame = document.createElement('iframe'); frame.id = 'native-editor-smoke'; frame.src = ${JSON.stringify(editor.url)}; frame.style.cssText = 'position:fixed;inset:100px;width:800px;height:500px'; document.body.appendChild(frame); })()`);
+    await desktop.webContents.executeJavaScript(`(() => { const frame = document.createElement('iframe'); frame.id = 'native-editor-smoke'; frame.src = ${scriptLiteral(editor.url)}; frame.style.cssText = 'position:fixed;inset:100px;width:800px;height:500px'; document.body.appendChild(frame); })()`);
     let workbench = false;
     for (let attempt = 0; attempt < 60; attempt++) {
       await new Promise(resolve => setTimeout(resolve, 500));
@@ -129,7 +128,10 @@ async function run(host) {
     await view.webContents.executeJavaScript('localStorage.setItem("guest-canary", "persisted")');
     const snapshot = await browserOp('snapshot'); assert.match(snapshot.snapshot, /^data:image\//); assert.equal(desktop.contentView.children.includes(view), false);
     await browserOp('restore'); assert.equal(desktop.contentView.children.includes(view), true);
-    await browserOp('destroy'); assert.equal(view.webContents.isDestroyed(), true);
+    // Closing a WebContents is asynchronous; observe actual destruction
+    // before checking cleanup or recreating the same browser slot.
+    const destroyed = once(view.webContents, 'destroyed', { signal: AbortSignal.timeout(5000) });
+    await browserOp('destroy'); await destroyed; assert.equal(view.webContents.isDestroyed(), true);
     await browserOp('create', { url: previewURL, bounds: { x: 100, y: 100, width: 600, height: 400 } });
     await pageReady(current.browser.views.get('offline-smoke').view.webContents);
     assert.equal(await current.browser.views.get('offline-smoke').view.webContents.executeJavaScript('localStorage.getItem("guest-canary")'), 'persisted');
@@ -161,4 +163,4 @@ async function run(host) {
     atomic(path.join(evidenceRoot, 'result.json'), JSON.stringify(report, null, 2)); app.exit(report.success ? 0 : 1);
   }
 }
-module.exports = { run, providerFixtures, proveProvider };
+module.exports = { run, providerFixtures, proveProvider, scriptLiteral };
