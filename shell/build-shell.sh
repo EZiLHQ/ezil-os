@@ -29,10 +29,19 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
 entry="$here/ezil/boot.js"
-out="$repo/app/public/os"
+# Override for isolated validation without modifying committed app assets.
+out="${EZIL_SHELL_OUT_DIR:-$repo/app/public/os}"
 
 ESBUILD_VERSION="0.28.1"
 CLEANCSS_VERSION="5.6.3"
+# The native Mac can use its isolated pinned npm when Bun's downloader is
+# unavailable. This changes only package execution, never minifier versions.
+runner=(bunx)
+case "${EZIL_SHELL_PACKAGE_RUNNER:-bunx}" in
+  bunx) ;;
+  npx) runner=(npx --yes) ;;
+  *) echo "Unsupported shell package runner" >&2; exit 1 ;;
+esac
 
 # Sort deterministically regardless of the caller's locale.
 export LC_ALL=C
@@ -95,7 +104,7 @@ emit() {
   mkdir -p "$dir"
 
   echo "[build-shell] js:   $entry -> $dir/bundle.min.js"
-  bunx "esbuild@$ESBUILD_VERSION" "$entry" \
+  "${runner[@]}" "esbuild@$ESBUILD_VERSION" "$entry" \
     --bundle \
     --format=iife \
     --global-name=EzilShell \
@@ -123,7 +132,7 @@ emit() {
   else
     echo "[build-shell] css:  no sheets yet -> $dir/bundle.min.css (banner only)"
   fi
-  bunx "clean-css-cli@$CLEANCSS_VERSION" -O2 --format keep-breaks \
+  "${runner[@]}" "clean-css-cli@$CLEANCSS_VERSION" -O2 --format keep-breaks \
     -o "$dir/bundle.min.css" "$tmpcss"
   rm -f "$tmpcss"
 

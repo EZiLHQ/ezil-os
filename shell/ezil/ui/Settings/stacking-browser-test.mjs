@@ -1349,6 +1349,7 @@ async function runViewport (vp) {
         pinned: !! a.pinned,
         single_instance: !! a.single_instance,
         shell_local: !! a.shell_local,
+        native_only: !! a.native_only,
         wants_settings_in_drawer: !! a.wants_settings_in_drawer,
     })));
     push(`${VP} registry exposes a non-empty APPS list`, Array.isArray(registryApps) && registryApps.length > 0,
@@ -1835,7 +1836,13 @@ async function runViewport (vp) {
         notCovered.length === 0 && coveredIds.size >= resolvedApps.length,
         `resolved=${JSON.stringify(resolvedApps)} covered=${JSON.stringify([...coveredIds])} notCovered=${JSON.stringify(notCovered)}`);
 
-    const shellLocalIds = registryApps.filter((a) => a.shell_local).map((a) => a.id);
+    // Native-only launchers are intentionally absent from this hosted boot.
+    // Require every shell-local app that is eligible for the current payload,
+    // rather than treating an intentionally filtered launcher as unresolved.
+    const nativeBoot = !! (await page.evaluate(() => window.__EZIL_BOOT__?.native));
+    const shellLocalIds = registryApps
+        .filter((a) => a.shell_local && (! a.native_only || nativeBoot))
+        .map((a) => a.id);
     const shellLocalMissing = shellLocalIds.filter((id) => ! resolvedApps.includes(id));
     push(`${VP} GUARD: every shell-local app in the full registry resolved for this boot`,
         shellLocalMissing.length === 0,

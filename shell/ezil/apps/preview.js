@@ -1,3 +1,4 @@
+import { selectRuntimeAdapter, watchNativeSurface } from '../native-runtime.js';
 // preview.js — EZiL-authored. Not Puter code.
 //
 // The Preview window: the user's own app, over plain HTTP, in an iframe.
@@ -130,6 +131,7 @@ export async function openPreviewWindow (ctx = {}) {
     const trace = ctx.trace ?? { step () {}, end () {} };
     const computer = ctx.computer ?? ctx.payload?.computer ?? null;
     const desktop_state = ctx.desktopState ?? ctx.payload?.desktopState ?? {};
+    const nativeSurface = selectRuntimeAdapter(ctx)?.surface('preview');
     // MODIFIED BY EZIL 2026-08-08: the APP's name, not the machine's — same
     // change, same reasoning, as `code.js` and `desktop-window.js`. See the
     // block in `desktop-window.js` for the full account.
@@ -189,13 +191,16 @@ export async function openPreviewWindow (ctx = {}) {
     let attempt = 0;
     let running_signal;
     let disposed = false;
+    let stop_monitor = () => {};
 
     const stop_timers = () => {
+        stop_monitor(); stop_monitor = () => {};
         clearInterval(tick_timer); tick_timer = null;
         clearInterval(poll_timer); poll_timer = null;
     };
 
-    const progress = AppSpinner({ label: 'Opening Preview…', onRetry: () => { void start_boot(); } });
+    const progress = AppSpinner({ label: 'Opening Preview…', onRetry: () => { void start_boot(); },
+        failureCopy: nativeSurface ? { title: 'Preview is unavailable', body: 'Start your development server in Code, register its port in Settings, then try again.' } : undefined });
     el_body.appendChild(progress.el);
 
     // ── the "no field yet" panel — a DIFFERENT message from any BootProgress
@@ -217,6 +222,13 @@ export async function openPreviewWindow (ctx = {}) {
             This computer's app preview hasn't been turned on for this deployment.
             The full desktop still works from its own window.
         </div>`;
+    if (nativeSurface) {
+        el_unavailable.innerHTML = '<div style="font-size:15px;font-weight:600;">Start a project preview</div>'
+            + '<div style="font-size:13px;max-width:32em;opacity:0.75;">Start your development server in Code, then register its port in Settings → System.</div>';
+        const retry = document.createElement('button'); retry.type = 'button';
+        retry.className = 'ezil-preview-unavailable-retry'; retry.textContent = 'Try again';
+        retry.addEventListener('click', () => { void start_boot(); }); el_unavailable.appendChild(retry);
+    }
     el_body.appendChild(el_unavailable);
 
     const show_panel = () => { progress.el.hidden = false; el_unavailable.hidden = true; };
@@ -252,7 +264,7 @@ export async function openPreviewWindow (ctx = {}) {
         paint();
         tick_timer = setInterval(paint, TICK_MS);
 
-        poll_timer = setInterval(async () => {
+        if (!nativeSurface) poll_timer = setInterval(async () => {
             if ( disposed || my_attempt !== attempt ) return;
             const running = await session.desktopRunning(computer.id);
             if ( disposed || my_attempt !== attempt ) return;
@@ -272,7 +284,12 @@ export async function openPreviewWindow (ctx = {}) {
         // five-minute token starts its life a few hundred milliseconds before
         // the single `el_iframe.src =` below consumes it. See the file header.
         console.info(`[${PHASE}] minting a preview URL for computer ${computer.id} (budget ${DESKTOP_BOOT_TIMEOUT_MS}ms)`);
-        const res = await session.previewUrl(computer.id);
+        let selectedPort = ctx.previewPort;
+        if (nativeSurface && selectedPort === undefined) {
+            const savedPort = Number(localStorage.getItem(`ezil:preview-port:${computer.id}`));
+            if (Number.isInteger(savedPort) && savedPort >= 1024 && savedPort <= 65535) selectedPort = savedPort;
+        }
+        const res = await (nativeSurface ? nativeSurface.open(selectedPort) : session.previewUrl(computer.id));
 
         if ( disposed || my_attempt !== attempt ) return;
         stop_timers();
@@ -371,7 +388,7 @@ export async function openPreviewWindow (ctx = {}) {
         const ask = async () => {
             if ( settled || disposed || my_attempt !== attempt ) return;
             asks++;
-            const seen = await session.confirmFrame(computer.id, el_iframe.src);
+            const seen = await (nativeSurface ? nativeSurface.confirm() : session.confirmFrame(computer.id, el_iframe.src, 'preview'));
             if ( settled || disposed || my_attempt !== attempt ) return;
 
             if ( seen === undefined ) {
@@ -390,6 +407,11 @@ export async function openPreviewWindow (ctx = {}) {
             if ( seen === true ) {
                 progress.el.hidden = true;
                 el_unavailable.hidden = true;
+                stop_monitor = watchNativeSurface(nativeSurface, () => {
+                    if (disposed || my_attempt !== attempt) return;
+                    show_panel();
+                    progress.render(computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: false }));
+                });
                 console.info(`[${PHASE}] preview frame confirmed by the server`);
                 // Terminal: unlike `desktop-window.js` there is no separate
                 // display gate here — a confirmed frame IS the whole
@@ -423,7 +445,9 @@ export async function openPreviewWindow (ctx = {}) {
     }
 
     const dispose = () => {
+        if (disposed) return;
         disposed = true;
+        nativeSurface?.dispose();
         stop_timers();
         window.removeEventListener('ezil:teardown', dispose);
         // The window can close mid-boot before any terminal point above ever

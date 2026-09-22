@@ -62,6 +62,8 @@
 import { openDesktopWindow } from './desktop-window.js';
 import { openPreviewWindow } from './preview.js';
 import { openCodeWindow } from './code.js';
+import { openSecureBrowser } from './native.js';
+import { isNative } from '../native-runtime.js';
 import { openSettingsWindow } from '../ui/Settings/index.js';
 import { ensureSettingsDrawerButton, SETTINGS_DRAWER_SVG } from '../ui/Settings/drawer-action.js';
 import telemetry from '../telemetry.js';
@@ -284,6 +286,8 @@ const CODE_ICON = appIcon('ezg-code', '#a274f5', '#5b2ec4',
 
 /** @type {readonly AppDescriptor[]} */
 export const APPS = [
+    { id: 'secure-browser', name: 'Secure Browser', icon: DESKTOP_ICON, pinned: true, shell_local: true, native_only: true,
+        open: async ctx => { const message = await openSecureBrowser(ctx); await window.UIAlert({ message, buttons: [{ label: 'OK' }] }); return null; } },
     {
         id: 'desktop',
         // MODIFIED BY EZIL 2026-08-03: renamed from 'Linux Desktop', per the
@@ -492,11 +496,11 @@ export function resolve (payload) {
     const served = payload?.apps;
     if ( ! Array.isArray(served) ) {
         log.warn(`[${PHASE}] boot payload carried no app list; showing all known apps`);
-        return [...APPS];
+        return APPS.filter(a => !a.native_only || payload?.desktopState?.provider === 'native-macos');
     }
 
     const ids = new Set(served.map(a => a?.id).filter(Boolean));
-    const allowed = APPS.filter(a => a.shell_local === true || ids.has(a.id));
+    const allowed = APPS.filter(a => (!a.native_only || payload?.desktopState?.provider === 'native-macos') && (a.shell_local === true || ids.has(a.id)));
 
     // Say so, loudly, in both directions. Either mismatch is a real bug in a
     // two-sided registry and neither is visible from the UI: a client-only
@@ -510,6 +514,12 @@ export function resolve (payload) {
     }
     for ( const id of ids ) {
         if ( ! getApp(id) ) log.warn(`[${PHASE}] server offers "${id}" but this shell cannot open it`);
+    }
+    // Native development has no container provisioning gate. Keep its core
+    // tools reachable directly from the dock, including after window close.
+    if (payload?.desktopState?.provider === 'native-macos') {
+        const order = ['desktop', 'secure-browser', 'code', 'preview', 'settings'];
+        return allowed.map(a => ({ ...a, pinned: true })).sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
     }
     return allowed;
 }
@@ -577,6 +587,7 @@ function ensureOnTop (el_window) {
 
 export async function launch (id, ctx = {}) {
     const app = getApp(id);
+    if (app?.native_only && !isNative(ctx)) return null;
     if ( ! app ) {
         log.error(`[${PHASE}] no such app: ${id}`);
         telemetry.capture({

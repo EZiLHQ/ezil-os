@@ -1,3 +1,4 @@
+import { isNative, selectRuntimeAdapter, sanitizeNativeEvents } from '../../../native-runtime.js';
 // tabs/troubleshoot.js — EZiL-authored. Not Puter code.
 //
 // A way out when the desktop is stuck: restart the desktop stack inside the
@@ -129,7 +130,7 @@ function stamp (ms) {
  *
  * See this file's header for what is and is not allowed in here.
  */
-function buildDiagnosticReport () {
+export function buildDiagnosticReport (nativeEvents = []) {
     const console_entries = log.ringBuffer();
     const events = telemetry.recentEvents();
     const trace = ambientCorrelationId();
@@ -155,6 +156,11 @@ function buildDiagnosticReport () {
     for ( const e of events ) {
         lines.push([stamp(e.t), e.eventClass, e.site, e.code, e.outcome, e.detail ?? '']
             .join(' ').trim());
+    }
+    const native = sanitizeNativeEvents(nativeEvents);
+    if (isNative() || native.length) {
+        lines.push('', `-- native events (${native.length}) --`);
+        for (const e of native) lines.push(telemetry.redact(`${stamp(e.t)} ${e.event}${e.durationMs === undefined ? '' : ` ${e.durationMs}ms`}`));
     }
     return lines.join('\n');
 }
@@ -262,7 +268,7 @@ function render ($win) {
     // restart control above follows for `restartEndpoint()`.
     const consoleCount = log.ringBuffer().length;
     const eventCount = telemetry.recentEvents().length;
-    const nothingRecorded = consoleCount + eventCount === 0;
+    const nothingRecorded = !isNative() && consoleCount + eventCount === 0;
 
     let copyHtml = '';
     if ( copyState === 'copied' ) {
@@ -278,12 +284,12 @@ function render ($win) {
 
     $body.html(`
         <p class="ezil-settings-lead">
-            If the desktop is frozen or not responding, restarting it can help. This shuts the
+            ${isNative() ? 'Close and reopen an app to retry its local connection. Cloud sync is disabled. Diagnostics include allowlisted native runtime events.' : `If the desktop is frozen or not responding, restarting it can help. This shuts the
             desktop down and starts it again inside the SAME container — your files in
-            storage are not touched, and the computer itself is not deleted.
+            storage are not touched, and the computer itself is not deleted.`}
         </p>
         <button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="restart"
-            ${disabled ? 'disabled' : ''}>${html_encode(label)}</button>
+            ${isNative() ? 'hidden' : ''} ${disabled ? 'disabled' : ''}>${html_encode(label)}</button>
         ${statusHtml}
         <hr class="ezil-settings-rule">
         <p class="ezil-settings-lead">
@@ -351,7 +357,8 @@ async function handleRestart ($win) {
 }
 
 async function handleCopyDiagnostics ($win) {
-    copyText = buildDiagnosticReport();
+    const nativeEvents = await selectRuntimeAdapter()?.diagnostics() ?? [];
+    copyText = buildDiagnosticReport(nativeEvents);
     copyState = (await copyToClipboard(copyText)) ? 'copied' : 'manual';
     render($win);
     if ( copyState === 'manual' ) {

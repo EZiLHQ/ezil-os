@@ -1,3 +1,5 @@
+import { isNative } from '../../native-runtime.js';
+import { nativeSettingsRequest } from './native-adapter.js';
 // trpc.js — EZiL-authored. Not Puter code.
 //
 // A same-origin, NON-batched caller against the app's EXISTING tRPC endpoint
@@ -48,6 +50,7 @@ const ENDPOINT = '/api/trpc';
  * @returns {Promise<{ok: true, data: any} | {ok: false, code: string, message: string}>}
  */
 async function send (path, { method, input }) {
+    if (isNative()) return nativeSettingsRequest(path, input);
     let url = `${ENDPOINT}/${path}`;
     let body;
     let headers;

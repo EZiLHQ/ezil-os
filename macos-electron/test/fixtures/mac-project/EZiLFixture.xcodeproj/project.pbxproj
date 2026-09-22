@@ -1,0 +1,50 @@
+// !$*UTF8*$!
+{
+  archiveVersion = 1;
+  classes = {};
+  objectVersion = 56;
+  objects = {
+    A00000000000000000000001 = {isa = PBXBuildFile; fileRef = A00000000000000000000003; };
+    A00000000000000000000002 = {isa = PBXBuildFile; fileRef = A00000000000000000000004; };
+    A00000000000000000000003 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EZiLFixtureApp.swift; sourceTree = "<group>"; };
+    A00000000000000000000004 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EZiLFixtureTests.swift; sourceTree = "<group>"; };
+    A00000000000000000000005 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = EZiLFixture.app; sourceTree = BUILT_PRODUCTS_DIR; };
+    A00000000000000000000006 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = EZiLFixtureTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+    A00000000000000000000007 = {isa = PBXGroup; children = (A00000000000000000000008, A00000000000000000000009, A0000000000000000000000A); sourceTree = "<group>"; };
+    A00000000000000000000008 = {isa = PBXGroup; children = (A00000000000000000000003); path = EZiLFixture; sourceTree = "<group>"; };
+    A00000000000000000000009 = {isa = PBXGroup; children = (A00000000000000000000004); path = EZiLFixtureTests; sourceTree = "<group>"; };
+    A0000000000000000000000A = {isa = PBXGroup; children = (A00000000000000000000005, A00000000000000000000006); name = Products; sourceTree = "<group>"; };
+    A0000000000000000000000B = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000001); runOnlyForDeploymentPostprocessing = 0; };
+    A0000000000000000000000C = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000002); runOnlyForDeploymentPostprocessing = 0; };
+    A0000000000000000000000D = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+    A0000000000000000000000E = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+    A0000000000000000000000F = {isa = PBXNativeTarget; buildConfigurationList = A00000000000000000000018; buildPhases = (A0000000000000000000000B, A0000000000000000000000D); buildRules = (); dependencies = (); name = EZiLFixture; productName = EZiLFixture; productReference = A00000000000000000000005; productType = "com.apple.product-type.application"; };
+    A00000000000000000000010 = {isa = PBXNativeTarget; buildConfigurationList = A00000000000000000000019; buildPhases = (A0000000000000000000000C, A0000000000000000000000E); buildRules = (); dependencies = (A00000000000000000000012); name = EZiLFixtureTests; productName = EZiLFixtureTests; productReference = A00000000000000000000006; productType = "com.apple.product-type.bundle.unit-test"; };
+    A00000000000000000000011 = {isa = PBXContainerItemProxy; containerPortal = A00000000000000000000013; proxyType = 1; remoteGlobalIDString = A0000000000000000000000F; remoteInfo = EZiLFixture; };
+    A00000000000000000000012 = {isa = PBXTargetDependency; target = A0000000000000000000000F; targetProxy = A00000000000000000000011; };
+    A00000000000000000000013 = {
+      isa = PBXProject;
+      attributes = {BuildIndependentTargetsInParallel = YES; LastUpgradeCheck = 1600; TargetAttributes = {A0000000000000000000000F = {CreatedOnToolsVersion = 16.0; }; A00000000000000000000010 = {CreatedOnToolsVersion = 16.0; TestTargetID = A0000000000000000000000F; }; }; };
+      buildConfigurationList = A00000000000000000000017;
+      compatibilityVersion = "Xcode 14.0";
+      developmentRegion = en;
+      hasScannedForEncodings = 0;
+      knownRegions = (en, Base);
+      mainGroup = A00000000000000000000007;
+      productRefGroup = A0000000000000000000000A;
+      projectDirPath = "";
+      projectRoot = "";
+      targets = (A0000000000000000000000F, A00000000000000000000010);
+    };
+    A00000000000000000000014 = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; CODE_SIGNING_ALLOWED = NO; CODE_SIGNING_REQUIRED = NO; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 5.0; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; ENABLE_TESTABILITY = YES; DEBUG_INFORMATION_FORMAT = dwarf; }; name = Debug; };
+    A00000000000000000000015 = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; CODE_SIGNING_ALLOWED = NO; CODE_SIGNING_REQUIRED = NO; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 5.0; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; }; name = Release; };
+    A00000000000000000000017 = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000014, A00000000000000000000015); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+    A00000000000000000000018 = {isa = XCConfigurationList; buildConfigurations = (A0000000000000000000001A, A0000000000000000000001B); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+    A00000000000000000000019 = {isa = XCConfigurationList; buildConfigurations = (A0000000000000000000001C, A0000000000000000000001D); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+    A0000000000000000000001A = {isa = XCBuildConfiguration; buildSettings = {GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools"; PRODUCT_BUNDLE_IDENTIFIER = dev.ezil.fixture; PRODUCT_NAME = "$(TARGET_NAME)"; COMBINE_HIDPI_IMAGES = YES; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks"); }; name = Debug; };
+    A0000000000000000000001B = {isa = XCBuildConfiguration; buildSettings = {GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools"; PRODUCT_BUNDLE_IDENTIFIER = dev.ezil.fixture; PRODUCT_NAME = "$(TARGET_NAME)"; COMBINE_HIDPI_IMAGES = YES; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks"); }; name = Release; };
+    A0000000000000000000001C = {isa = XCBuildConfiguration; buildSettings = {GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.ezil.fixture.tests; PRODUCT_NAME = "$(TARGET_NAME)"; BUNDLE_LOADER = "$(TEST_HOST)"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/EZiLFixture.app/Contents/MacOS/EZiLFixture"; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks", "@loader_path/../Frameworks"); }; name = Debug; };
+    A0000000000000000000001D = {isa = XCBuildConfiguration; buildSettings = {GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.ezil.fixture.tests; PRODUCT_NAME = "$(TARGET_NAME)"; BUNDLE_LOADER = "$(TEST_HOST)"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/EZiLFixture.app/Contents/MacOS/EZiLFixture"; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks", "@loader_path/../Frameworks"); }; name = Release; };
+  };
+  rootObject = A00000000000000000000013;
+}

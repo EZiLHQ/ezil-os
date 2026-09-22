@@ -1,3 +1,4 @@
+import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../native-runtime.js';
 // tabs/system.js — EZiL-authored. Not Puter code.
 //
 // ═══════════════════════════════════════════════════════════════════════════
@@ -60,6 +61,9 @@ let vitalsAt = 0;           // when it arrived, so staleness can be shown
 let screenObserved = null;  // { width, height } from the live read
 let screenError = null;
 let refreshTimer = null;
+let nativeProvider = { configured: false, pending: false, error: '' };
+let nativeTools = null;
+let nativePreview = { message: '', pending: false, workspaceId: null, draft: '3000' };
 let listening = false;
 
 /** The desktop window's iframe, or null when the desktop is not open. */
@@ -130,6 +134,7 @@ function linkedComputer () {
  */
 async function refreshScreen () {
     const computer = linkedComputer();
+    if (isNative(tabCtx)) { screenObserved = null; screenError = null; paint(); return; }
     if ( ! computer || typeof session.getScreen !== 'function' ) {
         screenObserved = null;
         screenError = 'not available in this deployment';
@@ -177,6 +182,37 @@ function paint () {
 
     const num = (x, unit) => (typeof x === 'number' && Number.isFinite(x) ? `${x}${unit ?? ''}` : UNKNOWN);
 
+    if (isNative(tabCtx)) {
+        const previousInput = host.querySelector('#ezil-preview-port');
+        const restoreFocus = previousInput && document.activeElement === previousInput;
+        if (nativePreview.workspaceId !== computer?.id) {
+            nativePreview = { message: '', pending: false, workspaceId: computer?.id,
+                draft: localStorage.getItem(`ezil:preview-port:${computer?.id}`) || '3000' };
+        } else if (previousInput) nativePreview.draft = previousInput.value;
+        host.innerHTML = `<h3>System</h3><h4>On this Mac</h4>
+            ${row('Name', esc(computer?.name ?? UNKNOWN))}
+            ${row('Programs', 'Run on this Mac', 'Programs run with your Mac account’s permissions.')}
+            ${row('Editor', 'Code, with a native terminal')}
+            ${row('Microsoft VS Code', nativeTools ? nativeTools.vscodeAvailable ? 'Installed' : 'Not installed' : 'Checking…')}
+            ${row('Xcode', nativeTools ? nativeTools.xcodeAvailable ? esc(nativeTools.xcodeVersion || 'Installed') : 'Not installed — install Xcode to build Mac applications' : 'Checking…')}
+            ${row('Browser', 'Chromium')}
+            ${row('Cloud sync', 'Disabled', 'Your workspace is stored on this Mac.')}
+            <h4 style="margin-top:20px">Project preview</h4>
+            <p class="ezil-settings-lead">Start your development server in Code, then enter its local port. Open Preview to see your app.</p>
+            <form data-native-preview-form style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <label for="ezil-preview-port">Port</label><input id="ezil-preview-port" name="port" class="ezil-settings-input" type="number" min="1024" max="65535" value="${esc(nativePreview.draft)}" required style="width:100px">
+              <button class="ezil-settings-btn" type="submit" ${nativePreview.pending ? 'disabled' : ''}>Register preview</button>
+            </form><p role="status">${esc(nativePreview.message)}</p>
+            <h4 style="margin-top:20px">AI provider</h4>
+            <p class="ezil-settings-lead">${nativeProvider.error ? esc(nativeProvider.error) : (nativeProvider.configured ? 'A provider is stored in macOS Keychain.' : 'No provider is connected. The desktop and editor work without one.')}</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="ezil-settings-btn" data-native-provider="azure" ${nativeProvider.pending ? 'disabled' : ''}>Connect Azure</button>
+              <button class="ezil-settings-btn" data-native-provider="bedrock" ${nativeProvider.pending ? 'disabled' : ''}>Connect Bedrock</button>
+              <button class="ezil-settings-btn" data-native-provider="remove" ${nativeProvider.pending || !nativeProvider.configured ? 'disabled' : ''}>Remove provider</button>
+            </div>`;
+        if (restoreFocus) host.querySelector('#ezil-preview-port')?.focus();
+        return;
+    }
     host.innerHTML = `
         <h3>System</h3>
         <p class="ezil-sys-lead">What this window is connected to, and how that connection is doing.
@@ -224,6 +260,35 @@ export default {
 
     init ($win, ctx) {
         tabCtx = ctx ?? tabCtx;
+        $win.off('submit.ezil-native-preview').on('submit.ezil-native-preview', '[data-native-preview-form]', async function (event) {
+            event.preventDefault();
+            if (!isNative(tabCtx) || nativePreview.pending) return;
+            const port = Number(this.elements.port.value), workspaceId = linkedComputer()?.id;
+            nativePreview = { ...nativePreview, pending: true, message: 'Checking the local server…' }; paint();
+            const result = await selectRuntimeAdapter(tabCtx).operation({ op: 'preview.register', workspaceId, port });
+            if (result.ok) {
+                localStorage.setItem(`ezil:preview-port:${workspaceId}`, String(port));
+                window.dispatchEvent(new CustomEvent('ezil:preferences-changed'));
+            }
+            if (nativePreview.workspaceId !== workspaceId) return;
+            nativePreview = { ...nativePreview, pending: false, message: result.ok ? `Port ${port} is ready. Open Preview from the dock.` : 'Start Code and its development server, then try again.' }; paint();
+        });
+        if (isNative(tabCtx)) void selectRuntimeAdapter(tabCtx).operation({ op: 'toolchain.status', workspaceId: linkedComputer()?.id }).then(result => { nativeTools = result.ok ? result.tools : null; paint(); });
+        $win.off('click.ezil-native-provider').on('click.ezil-native-provider', '[data-native-provider]', async function () {
+            if (!isNative(tabCtx) || nativeProvider.pending) return;
+            nativeProvider = { ...nativeProvider, pending: true, error: '' }; paint();
+            const action = this.getAttribute('data-native-provider');
+            try {
+                const runtime = selectRuntimeAdapter(tabCtx);
+                const result = await runtime.operation(action === 'remove' ? { op: 'provider.remove' } : { op: 'provider.configure', action });
+                if (result?.ok !== true) throw Error('Provider setup did not complete.');
+                nativeProvider = { configured: action !== 'remove', pending: false, error: '' };
+            } catch { nativeProvider = { ...nativeProvider, pending: false, error: 'Provider setup did not complete.' }; }
+            paint();
+        });
+        if (isNative(tabCtx)) void selectRuntimeAdapter(tabCtx).operation({ op: 'provider.status' }).then(result => {
+            nativeProvider = { configured: result?.ok === true && result.configured === true, pending: false, error: '' }; paint();
+        });
         paint();
     },
 

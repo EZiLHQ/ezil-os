@@ -869,16 +869,57 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-settings-system code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 #ezil-os-root{position:fixed;inset:0}
 .desktop.ezil-desktop{position:fixed;inset:0;box-sizing:border-box;width:auto;height:auto!important;background-color:#161616;background-image:radial-gradient(120% 80% at 78% 8%,rgba(0,173,181,.2) 0,rgba(0,173,181,0) 62%),radial-gradient(90% 70% at 10% 96%,rgba(0,173,181,.1) 0,rgba(0,173,181,0) 60%),linear-gradient(168deg,#1b1e1e 0,#161616 46%,#101111 100%)}
-body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;background-color:#161616}
+body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;background-color:#161616;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
+.context-menu,.popover,.taskbar,.window{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
+.window button,.window input,.window select,.window textarea{font-family:inherit}
+.ezil-native-browser-chrome{position:absolute;inset:0 0 auto;min-height:78px;z-index:2;color:#f5f5f4;background:#18191b}
+.ezil-native-browser-tab-row{display:flex;height:36px;min-width:0}
+.ezil-native-browser-tabs{display:flex;flex:1;min-width:0;overflow-x:auto;scrollbar-width:thin}
+.ezil-native-browser-tab{display:flex;flex:0 1 180px;min-width:96px;align-items:center;border-right:1px solid #444}
+.ezil-native-browser-add,.ezil-native-browser-tab button{color:inherit;background:0 0;border:0;height:30px;cursor:pointer;border-radius:5px}
+.ezil-native-browser-tab [role=tab]{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left;padding:0 8px}
+.ezil-native-browser-tab [aria-selected=true]{background:#353638}
+.ezil-native-browser-tab [aria-busy=true]::before{content:'◌ '}
+.ezil-native-browser-tab [data-failed=true]::before{content:'! ';color:#ffb4ab}
+.ezil-native-browser-tab-close{flex:0 0 26px}
+.ezil-native-browser-add{flex:0 0 34px;font-size:20px}
+.ezil-native-browser-add:disabled{opacity:.55;cursor:default}
+.ezil-native-browser-add:focus-visible,.ezil-native-browser-tab button:focus-visible{outline:#f5f5f4 solid 2px;outline-offset:-2px}
+.ezil-native-browser-viewport{position:absolute;inset:var(--ezil-browser-chrome-height,78px) 0 0;overflow:hidden;background:#111}
+.ezil-native-browser-cover{position:absolute;inset:0;background:#111;pointer-events:none}
+.ezil-native-browser-toolbar{display:flex;gap:6px;align-items:center;padding:6px 8px;box-sizing:border-box;min-height:42px;background:#18191b;border-bottom:1px solid rgba(255,255,255,.1);color:#f5f5f4;color-scheme:dark;font-size:13px;line-height:1.4}
+.ezil-native-browser-auth{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:5px 10px;font-size:11px;line-height:1.4;background:#eef2f6;color:#334155}
+.ezil-native-browser-auth>span:first-child{flex:1 1 240px}
+.ezil-native-browser-auth button{border:1px solid #94a3b8;border-radius:6px;padding:5px 9px;background:#fff;color:#1e293b;cursor:pointer}
+.ezil-native-browser-auth button:focus-visible{outline:#0f766e solid 2px;outline-offset:2px}
+.ezil-native-browser-auth [role=status]:not(:empty){flex-basis:100%}
+.ezil-native-browser-toolbar .ezil-native-browser-zoom-value{width:48px;font-size:12px}
+.ezil-native-browser-chrome[data-compact=true] .ezil-native-browser-toolbar{flex-wrap:wrap}
+.ezil-native-browser-chrome[data-compact=true] .ezil-native-browser-toolbar input{flex:1 1 180px;width:auto}
+.ezil-native-browser-chrome[data-compact=true] .ezil-native-browser-toolbar [role=status]{flex:1 0 100%;max-width:100%;min-height:0}
+.ezil-native-browser-toolbar button{width:30px;height:28px;border:0;border-radius:6px;background:0 0;color:inherit;flex-shrink:0;font-size:18px;cursor:pointer}
+.ezil-native-browser-toolbar button:disabled{opacity:.55;cursor:default}
+.ezil-native-browser-toolbar input{flex:1;min-width:60px;width:0;height:28px;padding:0 10px;border:1px solid rgba(255,255,255,.16);border-radius:7px;color:inherit;background:rgba(255,255,255,.08);box-sizing:border-box;caret-color:currentColor}
+.ezil-native-browser-toolbar input::placeholder{color:#b6b6b3;opacity:1}
+.ezil-native-browser-toolbar button:focus-visible,.ezil-native-browser-toolbar input:focus-visible{outline:#f5f5f4 solid 2px;outline-offset:2px}
+.ezil-native-browser-toolbar button:hover:not(:disabled){box-shadow:inset 0 0 0 1px #b6b6b3}
+.ezil-native-browser-toolbar [role=status]{font-size:12px;white-space:nowrap;min-width:0;max-width:25%;overflow:hidden;text-overflow:ellipsis}
+.window .ezil-settings-row{flex-wrap:wrap;min-width:0}
+.window .ezil-settings-row-meta{flex:1 1 14rem;min-width:0;max-width:100%}
+.window .ezil-settings-row-name,.window .ezil-settings-row-sub{white-space:normal;overflow-wrap:anywhere}
+.window .ezil-settings-row-actions{flex:0 1 auto;flex-wrap:wrap;min-width:0;max-width:100%}
+.window .ezil-settings-row-actions .ezil-settings-btn{box-sizing:border-box;max-width:100%;white-space:normal;overflow-wrap:anywhere}
+.window .ezil-settings-rename-form{flex-wrap:wrap;max-width:100%}
+.window .ezil-settings-rename-form .ezil-settings-input{flex-basis:12rem;box-sizing:border-box;max-width:100%}
 .ezil-desktop-window .window-body{background-color:var(--color-charcoal);position:relative;overflow:hidden}
 .ezil-desktop-window .window-app-iframe{position:absolute;left:0;top:0;width:100%;height:100%;background-color:var(--color-charcoal)}
 .ezil-boot{position:absolute;inset:0;z-index:2;display:flex;align-items:center;justify-content:center;padding:24px;background-color:#101111;color:#f5f5f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;-webkit-user-select:none;user-select:none;overflow:hidden}
 .ezil-boot[hidden]{display:none}
 .ezil-code-unavailable,.ezil-preview-unavailable{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:24px;text-align:center;background:#fff;color:#333}
 .ezil-code-unavailable[hidden],.ezil-preview-unavailable[hidden]{display:none}
-.ezil-code-unavailable-retry{margin-top:4px;padding:7px 18px;font:inherit;font-size:13px;color:#fff;background:#00adb5;border:0;border-radius:6px;cursor:pointer;min-height:34px}
-.ezil-code-unavailable-retry:hover{background:#009aa1}
-.ezil-code-unavailable-retry:focus-visible{outline:#00adb5 solid 2px;outline-offset:2px}
+.ezil-code-unavailable-retry,.ezil-preview-unavailable-retry{margin-top:4px;padding:7px 18px;font:inherit;font-size:13px;color:#fff;background:#00adb5;border:0;border-radius:6px;cursor:pointer;min-height:34px}
+.ezil-code-unavailable-retry:hover,.ezil-preview-unavailable-retry:hover{background:#009aa1}
+.ezil-code-unavailable-retry:focus-visible,.ezil-preview-unavailable-retry:focus-visible{outline:#00adb5 solid 2px;outline-offset:2px}
 .ezil-boot-panel{width:100%;max-width:340px;text-align:left}
 .ezil-boot-mark{width:28px;height:28px;margin-bottom:18px;border-radius:8px;background:linear-gradient(140deg,#00adb5 0,#007e84 100%);box-shadow:0 0 24px rgba(0,173,181,.35)}
 .ezil-boot-title{margin:0 0 6px;font-size:18px;font-weight:600;line-height:1.3;color:#f5f5f4}
@@ -935,6 +976,7 @@ to{transform:rotate(360deg)}
 .window-close-btn{order:1}
 .window-minimize-btn{order:2}
 .window-scale-btn{order:3}
+.window>.ui-resizable-nw{width:8px;height:8px}
 .window-head-draggable{order:4;padding-right:calc(3 * var(--win-ctl-size) + 4 * var(--win-ctl-gap));justify-content:center;align-items:center;min-width:0}
 .window-head-icon{float:none;margin:0 6px 0 0;flex:0 0 auto}
 .window-head-title{float:none;margin-left:0;font-weight:590;font-size:13px;letter-spacing:.01em;opacity:.62}

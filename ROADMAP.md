@@ -98,7 +98,8 @@ arm64 host with no emulation layer.
 
 ## A signed download
 
-**Status:** in progress (scripts and tarball) · **Rows:** T6 (needs T3, T5)
+**Status:** launcher/tarball complete; macOS wrapper implemented; public DMG
+blocked on Apple signing credentials · **Rows:** T6 (needs T3, T5)
 
 The download is a **launcher pair plus a tarball** — `ezil-os.sh` and
 `ezil-os.ps1` next to the local host, with `SHA256SUMS`, cosign keyless
@@ -107,10 +108,12 @@ be read before it is run; an unsigned native binary is quarantined by Gatekeeper
 or SmartScreen regardless of what else signed it, so shipping one unsigned would
 be worse than shipping none.
 
-**Native installers are blocked on org-level signing prerequisites**: an Apple
-Developer ID with notarytool credentials, and an Authenticode signing route. Both
-are account-level things a person has to obtain; no amount of code produces them,
-which is why they are named here instead of scheduled.
+The native Swift macOS wrapper now invokes that same launcher, exposes a selected
+host workspace through the existing bind mount, and has a fail-closed DMG build in
+`release.yml`. **Publishing it is still blocked on org-level signing
+prerequisites**: an Apple Developer ID with notarytool credentials. Windows still
+needs an equivalent wrapper and an Authenticode signing route. Both credentials
+are account-level things a person has to obtain; no amount of code produces them.
 
 **What would prove it:** on a clean machine with nothing installed but Docker,
 the published `SHA256SUMS` verifies against the downloaded tarball and both

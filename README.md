@@ -40,9 +40,8 @@
 > [Prerequisites](#prerequisites) before you start with the hosted path.
 >
 > **macOS status: internal Apple Silicon preview.** The native app runs on
-> your Mac without Docker or a VM. Its implementation is on the
-> [macOS preview branch](https://github.com/EZiLHQ/ezil-os/tree/feat/macos-local-dmg),
-> not yet on `main`; see [macOS app](#macos-app-apple-silicon-preview) below.
+> your Mac without Docker or a VM. Its implementation is included on `main`;
+> see [macOS app](#macos-app-apple-silicon-preview) below.
 
 # An open-source desktop for the browser and macOS
 
@@ -79,9 +78,7 @@ commands, terminal processes and editor extensions run with your Mac user's
 permissions. Remote browser content uses sandboxed renderers without access
 to the privileged EZiL bridge.
 
-The macOS implementation and build instructions currently live on
-[`feat/macos-local-dmg`](https://github.com/EZiLHQ/ezil-os/tree/feat/macos-local-dmg).
-Read the [native Mac setup and packaging guide](https://github.com/EZiLHQ/ezil-os/blob/feat/macos-local-dmg/docs/NATIVE-MAC.md)
+Read the [native Mac setup and packaging guide](docs/NATIVE-MAC.md)
 for pinned tools, local checks and internal DMG packaging. Internal builds are
 ad-hoc signed; **this is not a public notarized release**. Developer ID signing,
 notarization and the remaining physical-Mac acceptance gates must pass before
@@ -278,10 +275,6 @@ with no error a shell redirection would ever see. The measurement is in
 
 ## Repository layout
 
-The layout below describes `main`. The macOS preview branch additionally
-contains `macos-electron/` (the Electron app and packaging) and `native/` (the
-local workspace helper).
-
 ```text
 .
 ├── worker/  # Cloudflare Worker (Durable Objects + R2) and the container image:
@@ -291,6 +284,8 @@ local workspace helper).
 ├── sdk/     # @ezil-os/sdk — a typed client for the computer API
 ├── mcp/     # @ezil-os/mcp — an optional MCP connector over that SDK
 ├── local/   # The local-mode host: no Cloudflare, drives Docker directly
+├── macos-electron/ # Native Electron host, tests and Apple Silicon packaging
+├── native/  # Trusted local workspace helper used by the native Mac host
 ├── docker/  # The neko/code-server base image build inputs (pinned upstream SHAs)
 ├── deploy/  # The pinned image reference (images.env) and the release launcher
 ├── tools/   # Repo-wide scripts: the invite CLI, the plan/ledger tooling, test.sh
@@ -303,7 +298,7 @@ local workspace helper).
 
 ## Documentation
 
-- **[Native Mac setup and packaging (preview branch)](https://github.com/EZiLHQ/ezil-os/blob/feat/macos-local-dmg/docs/NATIVE-MAC.md)**
+- **[`docs/NATIVE-MAC.md`](docs/NATIVE-MAC.md)**
   — Apple Silicon app architecture, trusted-native security model, pinned
   tooling, internal builds and release gates.
 - **[`docs/LOCAL-MODE.md`](docs/LOCAL-MODE.md)** — running a real desktop on

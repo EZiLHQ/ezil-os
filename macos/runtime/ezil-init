@@ -1,0 +1,102 @@
+#!/bin/bash
+set -uo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/home/ezil
+
+mountpoint -q /proc || mount -t proc proc /proc
+mountpoint -q /sys || mount -t sysfs sysfs /sys
+mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /run /tmp /workspace
+mountpoint -q /dev/pts || mount -t devpts devpts /dev/pts
+mountpoint -q /workspace || mount -t virtiofs ezil-workspace /workspace
+chmod 1777 /tmp
+
+if ! resize2fs /dev/vda >/var/log/ezil-resize.log 2>&1; then
+    echo "EZIL_ERROR disk-resize-failed" >/dev/hvc0
+    exec sleep infinity
+fi
+
+editor_password="$(tr ' ' '\n' </proc/cmdline | sed -n 's/^ezil\.editor_password=//p' | head -1)"
+if ! [[ "$editor_password" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+    echo "EZIL_ERROR editor-password-missing" >/dev/hvc0
+    exec sleep infinity
+fi
+
+interface="$(find /sys/class/net -mindepth 1 -maxdepth 1 -printf '%f\n' | grep -v '^lo$' | head -1)"
+if [ -z "$interface" ]; then
+    echo "EZIL_ERROR network-interface-missing" >/dev/hvc0
+    exec sleep infinity
+fi
+
+ip link set "$interface" up
+dhcpcd --nobackground --timeout 20 "$interface" >/var/log/ezil-dhcp.log 2>&1 &
+dhcp_pid=$!
+for _ in $(seq 1 40); do
+    address="$(ip -4 -o address show dev "$interface" scope global | awk 'NR == 1 { sub(/\/.*/, "", $4); print $4 }')"
+    [ -n "$address" ] && break
+    sleep 0.5
+done
+
+if [ -z "${address:-}" ]; then
+    echo "EZIL_ERROR network-address-missing" >/dev/hvc0
+    wait "$dhcp_pid" || true
+    exec sleep infinity
+fi
+
+setpriv --reuid=10001 --regid=10001 --init-groups env \
+    HOME=/home/ezil PASSWORD="$editor_password" code-server \
+    --auth password \
+    --bind-addr 0.0.0.0:8443 \
+    --disable-telemetry \
+    --disable-update-check \
+    --user-data-dir /home/ezil/.local/share/code-server \
+    --extensions-dir /home/ezil/.local/share/code-server/extensions \
+    /workspace >/var/log/ezil-code-server.log 2>&1 &
+code_pid=$!
+
+if grep -qw 'ezil.e2e=1' /proc/cmdline; then
+    mkdir -p /var/lib/ezil
+    persistence="persisted"
+    if [ ! -f /var/lib/ezil/e2e-persistence ]; then
+        persistence="first"
+        printf 'created\n' > /var/lib/ezil/e2e-persistence
+    fi
+    architecture="$(uname -m)"
+    code_result="$(node -e 'const values=[1,2,3,4]; process.stdout.write(String(values.reduce((a,b)=>a+b,0)))')"
+    printf 'architecture=%s\npersistence=%s\ncode=%s\n' \
+        "$architecture" "$persistence" "$code_result" > /workspace/.ezil-e2e-result
+    echo "EZIL_E2E architecture=${architecture} persistence=${persistence} code=${code_result}" >/dev/hvc0
+fi
+
+ready=0
+for _ in $(seq 1 60); do
+    if curl --fail --silent --max-time 1 http://127.0.0.1:8443/healthz >/dev/null; then
+        echo "EZIL_READY ip=${address} editor=8443" >/dev/hvc0
+        ready=1
+        break
+    fi
+    if ! kill -0 "$code_pid" 2>/dev/null; then
+        echo "EZIL_ERROR editor-exited" >/dev/hvc0
+        exec sleep infinity
+    fi
+    sleep 0.5
+done
+if [ "$ready" -ne 1 ]; then
+    echo "EZIL_ERROR editor-timeout" >/dev/hvc0
+    kill -TERM "$code_pid" 2>/dev/null || true
+    exec sleep infinity
+fi
+
+shutdown() {
+    kill -TERM "$code_pid" 2>/dev/null || true
+    sync
+    poweroff -f
+}
+trap shutdown TERM INT PWR
+
+while kill -0 "$code_pid" 2>/dev/null; do
+    wait "$code_pid" || true
+done
+echo "EZIL_ERROR editor-stopped" >/dev/hvc0
+exec sleep infinity

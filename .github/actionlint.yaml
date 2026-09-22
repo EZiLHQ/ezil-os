@@ -1,0 +1,4 @@
+self-hosted-runner:
+  labels:
+    - ezil-vz
+    - ezil-native

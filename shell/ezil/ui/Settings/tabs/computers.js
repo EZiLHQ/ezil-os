@@ -1,3 +1,4 @@
+import { isNative } from '../../../native-runtime.js';
 // tabs/computers.js — EZiL-authored. Not Puter code.
 //
 // The Computers tab: this is where computer management lives now that login
@@ -297,6 +298,7 @@ function rowHtml (slot, computer) {
                 </div>
                 <div class="ezil-settings-row-actions">
                     <button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="create">New computer</button>
+                    ${isNative() ? '<button type="button" class="ezil-settings-btn" data-action="import">Open project folder…</button>' : ''}
                 </div>
             </div>`;
     }
@@ -304,7 +306,7 @@ function rowHtml (slot, computer) {
     // "Current" means "this is the desktop on screen right now", read from
     // the DOM rather than from a remembered id — so closing the desktop
     // window by hand correctly turns the pill back into a Switch button.
-    const isActive = openDesktopComputerId() === computer.id;
+    const isActive = (isNative() ? window.__EZIL_BOOT__?.computer?.id : openDesktopComputerId()) === computer.id;
     const isBusy = busyId === computer.id;
     const isEditing = editingId === computer.id;
     const when = timeAgo(computer.lastOpenedAt ?? computer.createdAt);
@@ -329,15 +331,16 @@ function rowHtml (slot, computer) {
             <span class="ezil-settings-row-slot">${slot}</span>
             <div class="ezil-settings-row-meta">
                 <div class="ezil-settings-row-name">${html_encode(computer.name)}</div>
-                <div class="ezil-settings-row-sub">${isActive ? 'Active now' : (when ? `Active ${when}` : 'Never opened')}</div>
+                <div class="ezil-settings-row-sub">${isNative() ? (computer.available === false ? 'Folder unavailable — locate it to continue' : computer.kind === 'attached' ? 'Original folder · edits stay in place' : 'EZiL-managed project') : (isActive ? 'Active now' : (when ? `Active ${when}` : 'Never opened'))}</div>
             </div>
             <div class="ezil-settings-row-actions">
                 ${isActive
                     ? '<span class="ezil-settings-pill">Current</span>'
-                    : `<button type="button" class="ezil-settings-btn" data-action="switch" ${isBusy ? 'disabled' : ''}>${isBusy ? 'Switching…' : 'Switch'}</button>`}
+                    : `<button type="button" class="ezil-settings-btn" data-action="switch" ${isBusy || computer.available === false ? 'disabled' : ''}>${isBusy ? 'Switching…' : 'Switch'}</button>`}
+                ${isNative() ? (computer.available === false ? '<button type="button" class="ezil-settings-btn" data-action="relink">Locate folder…</button>' : '<button type="button" class="ezil-settings-btn" data-action="reveal">Finder</button><button type="button" class="ezil-settings-btn" data-action="openVSCode">VS Code</button><button type="button" class="ezil-settings-btn" data-action="openXcode">Xcode</button>') : ''}
                 <button type="button" class="ezil-settings-btn" data-action="rename" ${isBusy ? 'disabled' : ''}>Rename</button>
                 <button type="button" class="ezil-settings-btn ezil-settings-btn-danger" data-action="delete" ${isBusy ? 'disabled' : ''}>
-                    ${isBusy ? 'Deleting…' : 'Delete'}
+                    ${isBusy ? 'Removing…' : isNative() && computer.kind === 'attached' ? 'Detach' : 'Delete'}
                 </button>
             </div>
         </div>`;
@@ -362,9 +365,10 @@ function render ($win) {
 
     const bySlot = new Map(computers.map(c => [c.slot, c]));
     let html = '';
-    for ( let slot = 1; slot <= MAX_COMPUTERS_PER_USER; slot++ ) {
+    for ( let slot = 1; slot <= (isNative() ? computers.length : MAX_COMPUTERS_PER_USER); slot++ ) {
         html += rowHtml(slot, bySlot.get(slot));
     }
+    if (isNative()) html += '<div class="ezil-settings-row"><div class="ezil-settings-row-actions"><button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="import">Open project folder…</button><button type="button" class="ezil-settings-btn" data-action="create">Create workspace</button></div></div>';
     $list.html(html);
     // `.trigger('select')` only fires the 'select' EVENT, not the browser's
     // actual text-selection — that needs the native method, hence `.get(0)`.
@@ -401,11 +405,27 @@ async function handleCreate ($win) {
     await load($win);
 }
 
+async function handleImport ($win) {
+    const res = await trpc.mutate('computer.import', {});
+    if ( ! res.ok ) {
+        reportError(res.code === 'FORBIDDEN'
+            ? "You've reached your computer limit."
+            : 'Failed to import the project. Please try again.');
+        return;
+    }
+    await load($win);
+}
+
 async function switchTo (computer, ctx, $win) {
     if ( desktopStreams(computer.id) === true || busyId ) return;
     busyId = computer.id;
     render($win);
     try {
+        if (isNative(ctx)) {
+            const selected = await trpc.mutate('computer.select', { id: computer.id });
+            if (!selected.ok) reportError(selected.message || 'Could not switch local workspaces.');
+            return; // The host confirms running work before replacing this shell.
+        }
         // 🔴 Same reason as delete, generalised: EVERY open sandbox window
         // (desktop AND Preview AND Code — single_instance only bounds each
         // app to one window each, not the count of apps open at once) is
@@ -416,6 +436,13 @@ async function switchTo (computer, ctx, $win) {
         // otherwise just re-focus. No `id` argument: we are leaving whatever
         // is open behind regardless of which computer it belonged to.
         await closeSandboxWindows();
+        if (isNative(ctx)) {
+            const selected = await trpc.mutate('computer.select', { id: computer.id });
+            if (!selected.ok) { reportError('Could not switch local workspaces.'); return; }
+            // Preload may reload /os to renew its workspace-scoped capability.
+            window.__EZIL_BOOT__.computer = computer;
+            if (ctx.payload) ctx.payload.computer = computer;
+        }
         activeComputerId = computer.id;
         const desktopState = ctx?.payload?.desktopState ?? {};
         await registry.launch('desktop', { ...ctx, computer, desktopState });
@@ -448,7 +475,11 @@ async function handleRenameSubmit (computer, name, $win) {
 
 async function handleDelete (computer, $win) {
     if ( busyId ) return;
-    const copy = deleteComputerCopy({ name: computer.name, slot: computer.slot });
+    const copy = isNative() ? {
+        title: `${computer.kind === 'attached' ? 'Detach' : 'Delete'} “${computer.name}”?`,
+        body: [computer.kind === 'attached' ? 'Your original project folder and its files will stay exactly where they are. Only its EZiL profiles and association are removed.' : 'This deletes the EZiL-managed project files and its editor and browser profiles. This cannot be undone.'],
+        confirmLabel: computer.kind === 'attached' ? 'Detach project' : 'Delete workspace', cancelLabel: 'Cancel'
+    } : deleteComputerCopy({ name: computer.name, slot: computer.slot });
     const confirmed = await confirmDelete(copy);
     if ( ! confirmed ) return;
 
@@ -477,14 +508,14 @@ async function handleDelete (computer, $win) {
         // exists to prevent. Round 1 had this backwards — it closed only on
         // a positive match against a variable that was empty on the
         // rehydrate path.
-        await closeSandboxWindows(computer.id);
+        if (!isNative()) await closeSandboxWindows(computer.id);
 
         const res = await trpc.mutate('computer.delete', { id: computer.id });
         if ( ! res.ok && res.code !== 'NOT_FOUND' ) {
             // NOT_FOUND means it is already gone (another tab, a stale
             // list) — a refresh, not a failure, mirroring `/computers`'
             // own `handleDelete`.
-            reportError('Failed to delete computer. Please try again.');
+            reportError(res.message || 'Failed to delete computer. Please try again.');
             return;
         }
         await load($win);
@@ -497,7 +528,15 @@ function bind ($win, ctx) {
     const $list = $win.find('[data-role="slot-list"]');
 
     $list.on('click', '[data-action="create"]', () => { void handleCreate($win); });
+    $list.on('click', '[data-action="import"]', () => { void handleImport($win); });
     $list.on('click', '[data-action="retry"]', () => { void load($win); });
+    $list.on('click', '[data-action="relink"], [data-action="reveal"], [data-action="openVSCode"], [data-action="openXcode"]', async function () {
+        if (!isNative(ctx)) return;
+        const id = $(this).closest('.ezil-settings-row').attr('data-id');
+        const res = await trpc.mutate(`computer.${this.dataset.action}`, { id });
+        if (!res.ok) reportError(res.message || 'The action could not complete.');
+        if (this.dataset.action === 'relink') await load($win);
+    });
 
     $list.on('click', '[data-action="switch"]', function () {
         const id = $(this).closest('.ezil-settings-row').attr('data-id');
@@ -538,9 +577,9 @@ export default {
         return `
             <div class="ezil-settings-pane-body">
                 <p class="ezil-settings-lead">
-                    Up to ${MAX_COMPUTERS_PER_USER} computers. Deleting one shuts its desktop down and
+                    ${isNative() ? 'Open an original project folder or create a managed workspace. One workspace runs at a time. Attached project files remain yours when detached.' : `Up to ${MAX_COMPUTERS_PER_USER} computers. Deleting one shuts its desktop down and
                     frees the slot — your files stay in storage, but the computer itself can't be
-                    reopened.
+                    reopened.`}
                 </p>
                 <div class="ezil-settings-slot-list" data-role="slot-list">
                     <div class="ezil-settings-loading">Loading your computers…</div>

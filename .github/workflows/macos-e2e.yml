@@ -1,0 +1,83 @@
+name: macOS Native Exact Artifact E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'Successful macos-internal workflow_dispatch run for this exact protected commit'
+        required: true
+        type: string
+      external_vscode:
+        description: 'Also test an installed external Microsoft VS Code'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: macos-native-physical
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.ref_protected && github.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    outputs:
+      artifact: ${{ steps.validate.outputs.artifact }}
+    steps:
+      - name: Authenticate exact originating build
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID" > run.json
+          jq -e --arg sha "$EXPECTED_SHA" --arg branch "$EXPECTED_BRANCH" '
+            .conclusion == "success" and
+            .event == "workflow_dispatch" and
+            .head_sha == $sha and .head_branch == $branch and
+            .path == ".github/workflows/macos-internal.yml"
+          ' run.json
+          echo "artifact=ezil-native-$EXPECTED_SHA-$BUILD_RUN_ID" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validated-native-build
+          path: run.json
+
+  physical-mac:
+    needs: validate
+    # Configure this environment to allow only protected branches and require
+    # a maintainer review. No pull_request or workflow_run event reaches here.
+    environment: native-physical
+    runs-on: [self-hosted, macOS, ARM64, ezil-native]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.validate.outputs.artifact }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/native-artifact-${{ github.run_id }}
+      - name: Install verified bytes and run logged-in GUI canaries
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/native-artifact-${{ github.run_id }}
+          EZIL_SMOKE_EXTERNAL_VSCODE: ${{ inputs.external_vscode && '1' || '0' }}
+          EVIDENCE_DIR: ${{ runner.temp }}/native-evidence-${{ github.run_id }}
+        run: bash macos-electron/scripts/physical-smoke.sh "$ARTIFACT_DIR" "$EVIDENCE_DIR"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-physical-evidence-${{ github.sha }}-${{ inputs.build_run_id }}
+          path: ${{ runner.temp }}/native-evidence-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 30

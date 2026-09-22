@@ -74,7 +74,7 @@ function whenDesktopReady (fn, retriesLeft = 100) {
     setTimeout(() => whenDesktopReady(fn, retriesLeft - 1), 50);
 }
 
-function applyWallpaper (id) {
+export function applyWallpaper (id) {
     const wallpaper = findWallpaper(id);
     whenDesktopReady((el) => {
         el.style.setProperty('background', wallpaper.css);
@@ -83,7 +83,7 @@ function applyWallpaper (id) {
     return wallpaper;
 }
 
-function applyAccent (id) {
+export function applyAccent (id) {
     const accent = findAccent(id);
     const root = document.documentElement.style;
     root.setProperty('--select-hue', String(accent.hue));
@@ -116,12 +116,14 @@ function bind ($win) {
     $pane.on('click', '[data-wallpaper]', function () {
         const id = $(this).attr('data-wallpaper');
         session.set(WALLPAPER_KEY, id);
+        window.dispatchEvent(new CustomEvent('ezil:preferences-changed'));
         applyWallpaper(id);
         render($win);
     });
     $pane.on('click', '[data-accent]', function () {
         const id = $(this).attr('data-accent');
         session.set(ACCENT_KEY, id);
+        window.dispatchEvent(new CustomEvent('ezil:preferences-changed'));
         applyAccent(id);
         render($win);
     });

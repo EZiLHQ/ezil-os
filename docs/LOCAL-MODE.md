@@ -1,18 +1,44 @@
 # Local mode — running EZiL OS on your own machine
 
-Local mode is the same desktop container the hosted product runs, driven by a
-native Bun host over the `docker` CLI instead of a Cloudflare Worker. There is
-no Cloudflare account, no Vercel project, no Supabase project and no sign-in:
-the native host serves `/os` itself, starts and stops the container itself,
-and publishes every port straight onto `127.0.0.1`. Nothing in this mode talks
-to `*.ezil.work`, `*.workers.dev` or `*.vercel.app` — enforced, not just
-intended: `local/src/server/no-hostname.test.ts` fails the build on a literal
-hostname anywhere under `local/src`.
+EZiL has two local runtimes. The Apple Silicon app is the default product: an
+Electron host packages the same responsive `/os` shell as the hosted product,
+an embedded code-server workbench, a Chromium browser surface, and a Bun helper.
+End users do not install Docker or Bun for this mode. The older cross-platform
+developer host remains under `local/`; it uses Docker and Bun to run the
+streamed Linux desktop and is documented below as **legacy local mode**.
+
+Neither local path requires Cloudflare, Vercel, Supabase, or EZiL sign-in. The
+Mac app has normal internet access for websites, Git, packages, and any Azure
+or Bedrock provider the user explicitly configures. Guest startup performs no
+EZiL authentication or workspace upload. Cloud synchronization is disabled.
 
 If you want the hosted product instead — invite-only, `os.ezil.work`, your own
 account — see the main [README](../README.md#getting-started).
 
-## Prerequisites
+## Apple Silicon Mac app
+
+Requirements: an Apple Silicon Mac and enough free space for the application,
+editor runtime, browser profile, and workspace files. Download the internal
+`EZiL-OS-<version>-AppleSilicon-internal.dmg`, install it, and approve the local
+guest workspace on first launch.
+
+The shared desktop shell and Chromium renderer run in Electron. The embedded
+editor, terminal commands, extensions, development servers, and optional
+Microsoft VS Code instance execute directly as the signed-in Mac user. Native
+Mac tools such as Xcode and Metal are therefore available when installed.
+
+This is trusted native development, not a VM security boundary. Browser
+renderer content is sandboxed, but project commands and editor extensions have
+the Mac user's permissions and can change files outside the managed workspace.
+
+Managed projects live under
+`~/Library/Application Support/EZiL OS Native/workspaces/<id>/files`, with
+separate editor and browser profiles beside them. Removing a workspace stops
+tracked processes and deletes only those verified app-owned paths. It cannot
+undo changes that trusted commands made elsewhere. Dragging the app to Trash
+alone does not remove Application Support data.
+
+## Legacy Docker/Bun mode prerequisites
 
 - [Docker](https://www.docker.com/), running.
 - [Bun](https://bun.sh/).
@@ -23,26 +49,36 @@ account — see the main [README](../README.md#getting-started).
   below), pulling it is about **1.4 GB to transfer, about 4.6 GB on disk**
   once extracted (`deploy/launcher/README.md`).
 
-🔴 **Today, that pull does not work for anyone outside the project.**
-`deploy/images.env` still ships `EZIL_DESKTOP_TAG=<to be pinned by CI>` — a
-placeholder that `local/src/container/run-spec.ts`'s `isDockerTag` refuses to
-compose into a reference, so `resolveDesktopImage` falls back to
-`LOCAL_DESKTOP_IMAGE_FALLBACK`, the image a `worker/Dockerfile` build produces
-on the machine that built it — and even once a real tag lands there, GHCR
-packages default to **private**, and `ghcr.io/ezilhq/ezil-neko-vscode` /
-`ezil-os-desktop` stay that way until a maintainer flips them to Public. Until
-both of those land, build the image yourself instead of pulling it:
+🔴 **Today, that pull does not work anonymously.** `deploy/images.env` carries
+a real immutable desktop tag, but GHCR packages default to **private**, and
+`ghcr.io/ezilhq/ezil-neko-vscode` / `ezil-os-desktop` stay that way until a
+maintainer flips them to Public. Until then, authenticate Docker with a GitHub
+token carrying `read:packages`, or build the image yourself:
 
 ```bash
-cd worker && docker build -t ezil-os-worker-sandbox:ff199202 .
+docker login ghcr.io
+# or, from this repository (the private Neko base also requires registry access):
+cd worker && docker build -t ghcr.io/ezilhq/ezil-os-desktop:3c76d43b .
 ```
 
-(that tag is the current fallback constant; building it under that exact name
-means `deploy/images.env`'s placeholder resolves to an image that is actually
-on your machine). Once a real GHCR tag is public, none of this is needed —
-`bun run --cwd local doctor` reports which one it resolved and why.
+Once both packages are public, neither step is needed — `bun run --cwd local
+doctor` reports the exact image it resolved and why.
 
 ## Starting it
+
+### From the macOS app
+
+Internal acceptance produces
+`EZiL-OS-<version>-AppleSilicon-internal.dmg`. Open the DMG, drag **EZiL OS**
+to Applications, and launch it. The app creates a random local guest profile
+and opens the shared EZiL desktop, embedded Code window, Chromium Browser
+window, and Settings without contacting GHCR or asking for a cloud login.
+
+The manual `macOS Native Internal DMG` workflow builds an ad-hoc-signed artifact
+on an Apple Silicon GitHub runner, installs the exact packaged bytes, and runs
+the offline guest/editor/browser smoke. A second protected manual workflow
+installs those same bytes on the dedicated logged-in Mac. Public distribution
+is a separate Developer ID signing and Apple notarization gate.
 
 ### From a release download
 
@@ -72,6 +108,20 @@ fallback to a fake desktop (`local/src/server/main.ts`'s own header calls this
 out: a host that quietly served a fake desktop when Docker was missing would
 be exactly the "asserting health it has not confirmed" failure this project
 keeps closing).
+
+## What “file sync” means in legacy mode
+
+The selected host directory is mounted read/write at `/home/neko/project` in
+the desktop container. There is no copy queue: a save inside EZiL OS changes
+the host file directly, and a host-side edit is visible inside the desktop.
+The data survives container replacement because the source of truth is the
+Mac folder, not the container filesystem.
+
+This is **local two-way filesystem sharing**, not an EZiL-operated cloud sync
+service. Choosing a folder managed by iCloud Drive, Dropbox, or another sync
+provider leaves cross-device replication to that provider. The desktop and
+all its published ports remain bound to `127.0.0.1`; the app does not expose
+the unauthenticated local desktop to the LAN or internet.
 
 ## Environment variables
 
