@@ -76,9 +76,29 @@ async function run(host) {
     const desktop = getDesktop(), current = getHost();
     assert.equal(new URL(desktop.webContents.getURL()).pathname, '/os');
     assert.ok(await desktop.webContents.executeJavaScript('document.body.textContent.trim().length > 10'));
+    const waitForDesktop = async (contents, expression) => {
+      const deadline = Date.now() + 10000;
+      while (!await contents.executeJavaScript(expression)) {
+        if (Date.now() >= deadline) throw Error('Smoke desktop not ready');
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    };
+    await waitForDesktop(desktop.webContents, 'typeof window.ezilFlushDesktop === "function" && !!document.querySelector(\'.taskbar-item[data-app="settings"]\')');
     check('packaged shared shell startup');
+    // The helper receives a new loopback origin on restart. Persist a real
+    // allowlisted setting through the UI/host contract, not arbitrary storage.
+    await desktop.webContents.executeJavaScript('document.querySelector(\'.taskbar-item[data-app="settings"]\').click()');
+    await waitForDesktop(desktop.webContents, '!!document.querySelector(\'.window[data-app="settings"] .ezil-settings-tab[data-tab="appearance"]\')');
+    await desktop.webContents.executeJavaScript('document.querySelector(\'.window[data-app="settings"] .ezil-settings-tab[data-tab="appearance"]\').click()');
+    await waitForDesktop(desktop.webContents, '!!document.querySelector(\'.window[data-app="settings"] [data-accent="violet"]\')');
+    await desktop.webContents.executeJavaScript('document.querySelector(\'.window[data-app="settings"] [data-accent="violet"]\').click()');
+    assert.equal(await desktop.webContents.executeJavaScript('document.documentElement.style.getPropertyValue("--select-hue")'), '262');
+    await desktop.webContents.executeJavaScript('document.querySelector(\'.window[data-app="settings"] .window-head > .window-close-btn\').click()');
+    await waitForDesktop(desktop.webContents, '!document.querySelector(\'.window[data-app="settings"]\')');
+    await desktop.webContents.executeJavaScript('window.ezilFlushDesktop()');
+    const preferences = await desktop.webContents.executeJavaScript(`window.ezilNative.operation(${scriptLiteral({ op: 'desktop.read', workspaceId: workspace.id })})`);
+    assert.equal(preferences.ok, true); assert.equal(preferences.preferences.accent, 'violet');
     const status = await desktop.webContents.executeJavaScript('window.ezilNative.request({op:"status"})');
-    await desktop.webContents.executeJavaScript('localStorage.setItem("ezil-physical-preference", "persisted")');
     let sequence = status.sequence;
     const invoke = async (op, extra = {}) => desktop.webContents.executeJavaScript(`window.ezilNative.host(${scriptLiteral({ op, workspaceId: workspace.id, generation: status.generation, sequence: ++sequence, ...extra })})`);
     const editor = await invoke('editor.start'); assert.equal(editor.state, 'ready');
@@ -150,7 +170,8 @@ async function run(host) {
     await closeWorkspace();
     await openWorkspace(workspace.id); assert.equal(store.index.activeID, workspace.id);
     assert.equal(fs.readFileSync(path.join(workspace.files, 'built.txt'), 'utf8'), 'native-arm64-build');
-    assert.equal(await getDesktop().webContents.executeJavaScript('localStorage.getItem("ezil-physical-preference")'), 'persisted');
+    await waitForDesktop(getDesktop().webContents, 'typeof window.ezilFlushDesktop === "function"');
+    assert.equal(await getDesktop().webContents.executeJavaScript('document.documentElement.style.getPropertyValue("--select-hue")'), '262');
     const reopened = getHost();
     await reopened.browser.operation({ op: 'create', workspaceId: workspace.id, generation: reopened.generation, sequence: 1, viewId: 'restart-smoke', url: previewURL, bounds: { x: 100, y: 100, width: 600, height: 400 } });
     await pageReady(reopened.browser.views.get('restart-smoke').view.webContents);
