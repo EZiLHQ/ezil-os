@@ -32,6 +32,7 @@ function surfaceSchema(input) {
 function runtimeSchema(input) {
   const op = input?.op;
   const common = ['op', 'workspaceId'];
+  if (op === 'passkeys.status') { exact(input, common); uuid(input.workspaceId); return input; }
   if (op === 'secureBrowser.status' || op === 'secureBrowser.open') {
     exact(input, [...common, ...(op === 'secureBrowser.open' ? ['destination'] : [])]); uuid(input.workspaceId);
     if (op === 'secureBrowser.open') require('./secure-browser.cjs').secureDestination(input.destination);

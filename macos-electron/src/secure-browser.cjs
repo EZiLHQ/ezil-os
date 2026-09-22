@@ -79,6 +79,35 @@ class SecureBrowser {
         if (!value || !path.isAbsolute(value) || value !== path.resolve(value) || /["'\x00-\x1f]/.test(value)) return;
         try { noLinks(value); if (fs.statSync(value).isDirectory()) row.profile = fs.realpathSync(value); } catch { /* Unknown alias or flattened argv. */ }
       }));
+      // Chrome crash reporters intentionally outlive/reparent away from browser
+      // processes. Attribute their own database, not the browser's cookie store.
+      // Only a known, verified Google bundle and a single canonical Crashpad
+      // directory establish ownership; unresolved reporters still fail closed.
+      const reporters = rows.filter(r => r.chrome && r.executable.endsWith('/chrome_crashpad_handler'));
+      if (reporters.length > 128) throw unknown();
+      const verifiedBundles = new Map();
+      await Promise.all(reporters.map(async row => {
+        const app = ['/Applications/Google Chrome.app', path.join(this.home, 'Applications/Google Chrome.app')].find(app => {
+          const prefix = app + '/Contents/Frameworks/Google Chrome Framework.framework/Versions/';
+          return row.executable.startsWith(prefix) && /^\d+\.\d+\.\d+\.\d+\/Helpers\/chrome_crashpad_handler$/.test(row.executable.slice(prefix.length));
+        });
+        if (!app) return;
+        try {
+          noLinks(row.executable);
+          const before = identity(row.executable);
+          if (!verifiedBundles.has(app)) verifiedBundles.set(app, this.invoke('/usr/bin/codesign', ['--verify', '--deep', '--strict', '-R', `=anchor apple generic and identifier "com.google.Chrome" and certificate leaf[subject.OU] = "${TEAM}"`, app]));
+          await verifiedBundles.get(app);
+          const detail = await this.invoke('/bin/ps', ['-ww', '-p', String(row.pid), '-o', 'lstart=,command=']);
+          const fields = /^(\S+\s+\S+\s+\d+\s+\S+\s+\d+)\s+(.+)$/.exec(detail);
+          if (!fields || fields[1].replace(/\s+/g, ' ') !== row.start || !fields[2].startsWith(row.executable + ' ') || identity(row.executable) !== before) return;
+          const tail = fields[2].slice(row.executable.length);
+          if ((tail.match(/--database(?:=|\s)/g) || []).length !== 1) return;
+          const value = /(?:^|\s)--database(?:=|\s+)(.*?)(?=\s+--|$)/.exec(tail)?.[1];
+          if (!value || !path.isAbsolute(value) || value !== path.resolve(value) || /["'\x00-\x1f]/.test(value) || path.basename(value) !== 'Crashpad') return;
+          noLinks(value);
+          if (fs.statSync(value).isDirectory()) row.profile = path.dirname(fs.realpathSync(value));
+        } catch { /* Keep the reporter unresolved; never guess its owner. */ }
+      }));
       // Helpers inherit only through observed ancestry, never name alone.
       const byPID = new Map(rows.map(row => [row.pid, row]));
       const rootPIDs = new Set(roots.map(row => row.pid));
@@ -122,7 +151,12 @@ class SecureBrowser {
         await this.invoke('/usr/bin/codesign', ['--verify', '--deep', '--strict', '-R', `=anchor apple generic and identifier "com.google.Chrome" and certificate leaf[subject.OU] = "${TEAM}"`, app]);
         if (Number(version.split('.')[0]) < 153) { result = { available: false, version, reason: 'outdated' }; continue; }
         return { available: true, version, executable, fingerprint: `${identity(executable)}:${s.size}:${s.mtimeMs}:${s.ctimeMs}` };
-      } catch { result = { available: false, version: '', reason: 'untrusted' }; }
+      } catch (error) {
+        // A bounded/OS timeout is not evidence of a bad Google signature.
+        // Still refuse launch, but allow retry instead of recommending reinstall.
+        const incomplete = error?.code === 'secure_browser_unknown' || error?.code === 'ETIMEDOUT' || error?.killed === true;
+        result = { available: false, version: '', reason: incomplete ? 'unavailable' : 'untrusted' };
+      }
     }
     return result;
   }

@@ -32,4 +32,12 @@ export type SecureBrowserOperation =
   | { op: 'secureBrowser.open'; workspaceId: string; destination?: string };
 export interface SecureBrowserStatus { available: boolean; version?: string; reason?: SecureBrowserReason }
 export interface SecureBrowserOpened { opened: boolean; reason?: SecureBrowserReason }
+/** Capability/configuration only, not proof that a site or credential works. */
+export interface PasskeyStatus {
+  embeddedTouchID: boolean;
+  syncedPasskeys: false;
+  existingPasskeys: 'secure-browser';
+  reason?: 'signing_required' | 'runtime_unsupported' | 'platform_unavailable' | 'setup_failed';
+}
+export interface PasskeyOperation { op: 'passkeys.status'; workspaceId: string }
 export type EditorFailure = 'editor_start_failed' | 'editor_connection_lost' | 'editor_cleanup_unverified';

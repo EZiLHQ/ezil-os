@@ -4,7 +4,7 @@
 const brokenSinks = [];
 let pipeNote = () => brokenSinks.push('STDIO_PIPE_CLOSED');
 require('./stdio-guard.cjs').installBrokenPipeGuards({ onBrokenPipe: () => pipeNote('STDIO_PIPE_CLOSED') });
-const { app, BrowserWindow, ipcMain, session, dialog, shell, Menu, safeStorage, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, session, dialog, shell, Menu, safeStorage, clipboard, systemPreferences } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { randomUUID } = require('node:crypto');
@@ -19,6 +19,7 @@ const { EditorSupervisor } = require('./editor.cjs');
 const { startGateway } = require('./editor-gateway.cjs');
 const { Diagnostics, createDiagnosticSink } = require('./diagnostics.cjs');
 const { SecureBrowser } = require('./secure-browser.cjs');
+const { configurePasskeys } = require('./passkeys.cjs');
 const { senderAllowed, lockSession, schema, surfaceSchema, runtimeSchema } = require('./policy.cjs');
 const { hostSchema, authorize } = require('./host-ipc.cjs');
 const { privateDir, atomic } = require('./files.cjs');
@@ -36,6 +37,7 @@ else {
   for (const code of brokenSinks) note(code);
   pipeNote = note;
   const secureBrowser = new SecureBrowser();
+  let passkeyStatus = { embeddedTouchID: false, syncedPasskeys: false, existingPasskeys: 'secure-browser', reason: 'signing_required' };
   const embedded = new EditorSupervisor({ resources, extensionSource: path.join(resources, 'extensions/ezil-vscode'), note });
   const editors = new Editors({ resources, extensionSource: path.join(resources, 'extensions/ezil-vscode'), findCode: async () => (await queryToolchain()).code });
   let store, vault, broker, desktop, recovery, current, closing, booting = false, quitting = false, providerBusy = false, transitioning = false;
@@ -45,7 +47,7 @@ else {
     if (!current) return true;
     const detail = removal
       ? (removal.kind === 'attached' ? 'The original project folder stays in place. ' : 'This deletes the files in this EZiL-managed workspace. Export anything you need first. ')
-        + 'Its EZiL profiles and browser data will be removed. Close this workspace’s Chrome windows first.'
+        + 'Its EZiL profiles and browser data will be removed. Device-bound passkeys created in this workspace will no longer be usable; keep another sign-in method. Close this workspace’s Chrome windows first.'
         + (removal.active ? ' Save unfinished Code work; its terminal and development servers will stop.' : '')
       : 'Save any unfinished changes in Code first. The workspace terminal and development servers will stop. Your project files stay in place.';
     const answer = await dialog.showMessageBox(current.window, { type: 'question', message: reason,
@@ -100,6 +102,7 @@ else {
     if (!previous) return closing;
     if (closing) return closing;
     previous.stopping = true;
+    previous.browser?.passkeys?.close();
     closing = (async () => {
       if (previous.window && !previous.window.isDestroyed()) {
         let timeout;
@@ -294,6 +297,7 @@ else {
   }
   async function runtimeOperation(host, input) {
     if (host.stopping) throw Error('Workspace stopping');
+    if (input.op === 'passkeys.status') return { ok: true, ...passkeyStatus };
     if (input.op === 'secureBrowser.status') return { ok: true, ...await secureBrowser.status() };
     if (input.op === 'secureBrowser.open') {
       if (transitioning || removingWorkspaces.has(host.workspace.id)) return { ok: false, error: 'canceled' };
@@ -484,6 +488,7 @@ else {
   });
   app.whenReady().then(async () => {
     lockSession(session.defaultSession);
+    passkeyStatus = await configurePasskeys({ app, systemPreferences });
     Menu.setApplicationMenu(Menu.buildFromTemplate([
       { label: 'EZiL OS', submenu: [{ label: 'Retry workspace', click: () => void boot() }, { type: 'separator' }, { role: 'quit' }] },
       { role: 'editMenu' }, { role: 'windowMenu' },

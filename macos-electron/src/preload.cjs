@@ -45,6 +45,9 @@ function subscribe(channel, listener, kind = 'state') {
 }
 function cleanRuntimeResult(input, result) {
   if (result?.ok !== true) return { ok: false, state: 'unavailable', ...(runtimeErrors.has(result?.error) ? { error: result.error } : {}) };
+  if (input.op === 'passkeys.status') return { ok: true, embeddedTouchID: result.embeddedTouchID === true,
+    syncedPasskeys: false, existingPasskeys: 'secure-browser',
+    ...(['signing_required', 'runtime_unsupported', 'platform_unavailable', 'setup_failed'].includes(result.reason) ? { reason: result.reason } : {}) };
   if (input.op === 'secureBrowser.status' || input.op === 'secureBrowser.open') return { ok: true,
     ...(input.op === 'secureBrowser.status' ? { available: result.available === true, ...(typeof result.version === 'string' && /^\d+(\.\d+){3}$/.test(result.version) ? { version: result.version } : {}) } : { opened: result.opened === true }),
     ...(['missing', 'outdated', 'untrusted', 'unavailable', 'profile_busy'].includes(result.reason) ? { reason: result.reason } : {}) };

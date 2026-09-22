@@ -196,7 +196,9 @@ test('async verification and ps yield to the event loop; status exposes only its
   await browser.assertRemovable(f.w);
   assert.ok(ticks > before); assert.ok(commands.includes('/bin/ps'));
   const stalled = new SecureBrowser({ ...f.options, timeout: 5, run: () => new Promise(() => {}) });
-  assert.deepEqual(await stalled.status(), { available: false, version: '', reason: 'untrusted' });
+  assert.deepEqual(await stalled.status(), { available: false, version: '', reason: 'unavailable' });
+  const killed = new SecureBrowser({ ...f.options, run: () => { throw Object.assign(Error('timed out'), { killed: true }); } });
+  assert.deepEqual(await killed.status(), { available: false, version: '', reason: 'unavailable' });
   const stalledSnapshot = new SecureBrowser({ ...f.options, timeout: 5, snapshot: () => new Promise(() => {}) });
   await assert.rejects(stalledSnapshot.assertRemovable(f.w), { code: 'secure_browser_unknown' });
 });
@@ -246,6 +248,43 @@ test('repeat open requires matching owned profile, executable, and lock; failed 
   row.profile = path.join(f.root, 'wrong');
   assert.deepEqual(await f.browser.open(f.w), { opened: false, reason: 'profile_busy' });
   await assert.rejects(f.browser.assertRemovable(f.w), { code: 'secure_browser_unknown' });
+});
+
+test('reparented signed Chrome crash reporters are scoped to their database without exposing arguments', async t => {
+  const f = fixture(t);
+  fs.mkdirSync(f.w.browser, { mode: 0o700 });
+  const profile = path.join(f.w.browser, 'secure-chrome'); fs.mkdirSync(profile, { mode: 0o700 });
+  const personal = path.join(f.root, 'personal profile'); fs.mkdirSync(path.join(personal, 'Crashpad'), { recursive: true });
+  const reporter = path.join(f.app, 'Contents/Frameworks/Google Chrome Framework.framework/Versions/153.0.0.0/Helpers/chrome_crashpad_handler');
+  fs.mkdirSync(path.dirname(reporter), { recursive: true }); fs.writeFileSync(reporter, 'fixture', { mode: 0o755 });
+  const start = 'Sun Sep 20 10:00:00 2026';
+  let birth = start, executable = reporter, argumentsText = `--database=${personal}/Crashpad --annotation=discard-me --url=https://example.com/private`;
+  const browser = new SecureBrowser({ ...f.options, snapshot: undefined, run: async (file, args, options) => {
+    if (file !== '/bin/ps') return f.options.run(file, args, options);
+    if (args[0] === '-axo') return `1 0 ${start} /sbin/launchd\n42 1 ${start} ${executable}`;
+    assert.deepEqual(args, ['-ww', '-p', '42', '-o', 'lstart=,command=']);
+    return `${birth} ${executable} ${argumentsText}`;
+  } });
+  // Tests model an installed bundle without touching the real Chrome app.
+  const original = fs.lstatSync;
+  t.mock.method(fs, 'lstatSync', (file, ...args) => file === '/Applications/Google Chrome.app' ? undefined : original(file, ...args));
+  await browser.assertRemovable(f.w);
+  const rows = await browser.snapshot();
+  assert.equal(rows.find(r => r.pid === 42).profile, personal);
+  assert.doesNotMatch(JSON.stringify(rows), /discard-me|https:/);
+  fs.mkdirSync(path.join(profile, 'Crashpad'));
+  argumentsText = `--database=${profile}/Crashpad`;
+  await assert.rejects(browser.assertRemovable(f.w), { code: 'secure_browser_busy' });
+  for (const args of [`--database=${personal}/Crashpad --database=${profile}/Crashpad`, `--database=${personal}/unknown`, `--database="${personal}/Crashpad"`, '--url=https://example.com/']) {
+    argumentsText = args;
+    await assert.rejects(browser.assertRemovable(f.w), { code: 'secure_browser_unknown' });
+  }
+  argumentsText = `--database=${personal}/Crashpad`; birth = 'Sun Sep 20 11:00:00 2026';
+  await assert.rejects(browser.assertRemovable(f.w), { code: 'secure_browser_unknown' });
+  birth = start; f.badSignature = true;
+  await assert.rejects(browser.assertRemovable(f.w), { code: 'secure_browser_unknown' });
+  f.badSignature = false; executable = '/untrusted/Google Chrome/chrome_crashpad_handler';
+  await assert.rejects(browser.assertRemovable(f.w), { code: 'secure_browser_unknown' });
 });
 
 test('separate workspace launches can be in flight concurrently with personal Chrome present', async t => {

@@ -14,6 +14,7 @@
     "start": "electron .",
     "test:electron": "electron test/electron-smoke.cjs",
     "test:browser-tabs": "node test/browser-tabs-flow.cjs",
+    "test:passkeys": "node test/passkeys-flow.cjs",
     "package:internal": "node scripts/package.cjs",
     "package:release": "node scripts/package.cjs --developer-id"
   },

@@ -4,6 +4,7 @@
 node_modules
 .native-tools
 .native-evidence/
+.firecrawl/
 
 # Build output (except intentionally-committed, pre-built bundles that
 # something downstream consumes without a toolchain)

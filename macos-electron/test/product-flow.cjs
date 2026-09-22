@@ -8,7 +8,7 @@ const assert = require('node:assert/strict');
 const { execFile, execFileSync } = require('node:child_process');
 const { Workspaces } = require('../src/workspaces.cjs');
 const { developmentEnvironment } = require('../src/development-environment.cjs');
-const { nativeButtonScript, DOWNLOAD } = require('./product-flow-helpers.cjs');
+const { nativeButtonScript, assertNativeSession, DOWNLOAD } = require('./product-flow-helpers.cjs');
 const READY = 30000;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const fixture = path.join(__dirname, 'fixtures/web-project');
@@ -73,6 +73,7 @@ function nativeButton(label, seconds = 45) {
       ...(error ? { error: error.killed ? 'automation_timeout' : 'accessibility_or_dialog_failed', code: String(error.code ?? '').slice(0, 40), detail: String(stderr || '').slice(0, 600) } : {}) })));
 }
 function nativeShortcut(action, point) {
+  assertNativeSession(execFileSync('/usr/sbin/ioreg', ['-n', 'Root', '-d1', '-a'], { encoding: 'utf8', timeout: 5000 }));
   const pid = electronApp.process().pid;
   assert.ok(Number.isSafeInteger(pid) && pid > 1);
   const command = { address: 'keystroke "l" using command down', interrupt: 'keystroke "c" using control down' }[action];
@@ -95,7 +96,16 @@ async function interruptTerminal() {
   terminal = codeFrame.locator('textarea.xterm-helper-textarea').first();
   const screen = codeFrame.locator('.xterm-screen:visible').first();
   await screen.waitFor({ state: 'visible' });
-  const box = await screen.boundingBox(); assert.ok(box && box.height > 0);
+  // Maximizing animates shell geometry. Native screen clicks must use settled
+  // coordinates, not the pre-animation position returned immediately by click().
+  let previous, stableSince = Date.now();
+  const box = await until(async () => {
+    const value = await screen.boundingBox();
+    if (!value || value.height <= 0) return false;
+    const next = JSON.stringify(value);
+    if (next !== previous) { previous = next; stableSince = Date.now(); return false; }
+    return Date.now() - stableSince >= 300 ? value : false;
+  });
   const hostWindow = await electronApp.browserWindow(shellPage);
   const geometry = await hostWindow.evaluate(win => ({ bounds: win.getContentBounds(), zoom: win.webContents.getZoomFactor() }));
   // Physical input establishes the native WebContents focus as a user click
@@ -175,7 +185,14 @@ async function run() {
   await step('terminal_node_bun_build', async () => {
     await palette('Terminal: Create New Terminal');
     const trust = codeFrame.getByRole('button', { name: 'Trust Folder & Continue', exact: true });
-    try { await trust.waitFor({ state: 'visible', timeout: 3000 }); await trust.click(); } catch { /* Already trusted workspaces have no prompt. */ }
+    terminal = codeFrame.locator('textarea.xterm-helper-textarea').first();
+    await until(async () => {
+      if (await trust.isVisible()) await trust.click();
+      if (!await terminal.count()) return false;
+      const label = await terminal.getAttribute('aria-label');
+      return !label.includes('environment is stale') && /, (?:zsh|bash)/.test(label)
+        && await codeFrame.locator('.xterm-decoration.terminal-command-decoration').count() > 0;
+    });
     report.terminalInputs = await codeFrame.evaluate(() => [...document.querySelectorAll('textarea, [contenteditable="true"]')].map(el => ({ tag: el.tagName, class: el.className, label: el.getAttribute('aria-label') })));
     fs.writeFileSync(path.join(evidence, 'result.json'), JSON.stringify(report, null, 2));
     terminal = codeFrame.locator('textarea.xterm-helper-textarea').first();

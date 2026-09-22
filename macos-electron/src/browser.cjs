@@ -2,6 +2,7 @@
 const path = require('node:path');
 const { browserURL, browserRequestURL, lockSession, lockRemote, exact, uuid } = require('./policy.cjs');
 const { privateDir } = require('./files.cjs');
+const { PasskeyAccounts } = require('./passkeys.cjs');
 function bounds(value, size) {
   exact(value, ['x', 'y', 'width', 'height']);
   if (['x', 'y', 'width', 'height'].some(k => !Number.isFinite(value[k]))) throw Error('Invalid bounds');
@@ -35,6 +36,11 @@ class Browser {
     this.workspace = workspace; this.window = window; this.generation = generation; this.sequence = 0; this.views = new Map(); this.closed = false;
     this.session = session.fromPath(privateDir(path.join(workspace.browser, 'profile')));
     lockSession(this.session);
+    this.passkeys = new PasskeyAccounts(this.session, window, frame => {
+      for (const item of this.views.values()) if (item.visible && !item.occluded && !item.view.webContents.isDestroyed()
+          && frame?.top === item.view.webContents.mainFrame) return item.view.webContents;
+      return null;
+    });
     this.session.webRequest.onBeforeRequest((details, callback) => { try { browserRequestURL(details.url); if (offline && !['127.0.0.1', '[::1]', 'localhost'].includes(new URL(details.url).hostname)) throw Error('Offline smoke'); callback({}); } catch { callback({ cancel: true }); } });
     this.downloadHandler = (_event, item) => {
       const filename = path.basename(item.getFilename() || 'download');
@@ -58,6 +64,7 @@ class Browser {
     if (visible && !attached) this.window.contentView.addChildView(item.view);
     if (!visible && attached) this.window.contentView.removeChildView(item.view);
     item.view.setVisible(visible);
+    this.passkeys.reconcile();
   }
   state(id) { const item = this.views.get(id); return item ? { ...item.state } : null; }
   publish(id, item, patch = {}) {
@@ -178,12 +185,13 @@ class Browser {
   destroy(id) {
     const item = this.views.get(id); if (!item) return;
     this.views.delete(id); item.snapshot = null;
+    this.passkeys.reconcile();
     if (!this.window.isDestroyed() && this.window.contentView.children.includes(item.view)) this.window.contentView.removeChildView(item.view);
     if (!item.view.webContents.isDestroyed()) item.view.webContents.close();
   }
   clear() { for (const id of [...this.views.keys()]) this.destroy(id); }
   async close() {
-    if (this.closed) return; this.closed = true; this.clear();
+    if (this.closed) return; this.closed = true; this.passkeys.close(); this.clear();
     this.window.removeListener('resize', this.resize); this.window.removeListener('closed', this.dispose);
     this.window.webContents.removeListener('destroyed', this.dispose); this.window.webContents.removeListener('did-start-navigation', this.navigation);
     this.session.removeListener('will-download', this.downloadHandler);

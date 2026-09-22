@@ -1,5 +1,9 @@
 'use strict';
 const DOWNLOAD = 'EZIL_BROWSER_DOWNLOAD\n';
+function assertNativeSession(plist) {
+  if (/<key>CGSSessionScreenIsLocked<\/key>\s*<true\s*\/>/.test(plist)) throw Error('macos_screen_locked');
+  if (!/<key>kCGSSessionOnConsoleKey<\/key>\s*<true\s*\/>/.test(plist)) throw Error('macos_console_unavailable');
+}
 const PAGE = `<!doctype html><title>Browser input acceptance</title>
 <label>Typing target <input id="typing"></label>
 <label>Upload fixture <input id="upload" type="file"></label><pre id="upload-result"></pre>
@@ -22,7 +26,7 @@ function middleware(root, { write = require('node:fs').writeFileSync, delay = se
 // Search the launched process's accessibility tree: macOS may expose a dialog
 // as a sheet, a dialog window, or nested groups. Never treat exhaustion as success.
 function nativeButtonScript(pid, label, seconds = 45) {
-  if (!Number.isSafeInteger(pid) || pid < 1 || !['Stop workspace', 'Save'].includes(label) || !Number.isInteger(seconds) || seconds < 1 || seconds > 60) throw Error('invalid_native_dialog_request');
+  if (!Number.isSafeInteger(pid) || pid < 1 || !['Stop workspace', 'Save', 'Cancel'].includes(label) || !Number.isInteger(seconds) || seconds < 1 || seconds > 60) throw Error('invalid_native_dialog_request');
   return `tell application "System Events"
 set deadline to (current date) + ${seconds}
 repeat while (current date) < deadline
@@ -46,4 +50,4 @@ end repeat
 error "native_dialog_not_found" number 1001
 end tell`;
 }
-module.exports = { middleware, nativeButtonScript, DOWNLOAD };
+module.exports = { middleware, nativeButtonScript, assertNativeSession, DOWNLOAD };

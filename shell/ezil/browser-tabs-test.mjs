@@ -34,6 +34,7 @@ window.ezilNative = {
     subscribeBrowserState: subscribe('state'), subscribeBrowserShortcut: subscribe('shortcut'), subscribeBrowserNewTab: subscribe('newTab'),
     async operation(op) {
         calls.push(op);
+        if (op.op === 'passkeys.status') return { ok: true, embeddedTouchID: false, syncedPasskeys: false, existingPasskeys: 'secure-browser', reason: 'signing_required' };
         if (op.op === 'browser.attach') {
             identities.set(op.surfaceId, op);
             if (blockAttach) { blockAttach = false; await new Promise(resolve => { releaseAttach = resolve; }); }
@@ -64,6 +65,8 @@ const address = el.querySelector('input'), add = el.querySelector('.ezil-native-
 const type = value => { address.focus(); address.value = value; address.dispatchEvent(new window.Event('input')); };
 const key = (value, extra = {}) => window.dispatchEvent(new window.KeyboardEvent('keydown', { key: value, metaKey: true, cancelable: true, ...extra }));
 await flush(); signal({}); await flush();
+assert.equal(calls.find(op => op.op === 'passkeys.status').workspaceId, ctx.computer.id);
+assert.match(el.querySelector('.ezil-native-browser-auth').textContent, /Embedded Touch ID needs an Apple-signed EZiL build/);
 assert.equal(chrome.dataset.compact, 'true', 'compact layout follows Browser window width, not outer viewport');
 assert.equal(el.querySelector('.window-body').style.getPropertyValue('--ezil-browser-chrome-height'), '112px');
 chrome.getBoundingClientRect = () => ({ x: 0, y: 0, width: 531, height: 78 }); signal({}); await flush();

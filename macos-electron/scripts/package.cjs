@@ -8,7 +8,7 @@ const { bundleHelper } = require('./bundle-helper.cjs');
 const { stageCodeServer, binaryKind } = require('./code-server.cjs');
 const { validateInputs, stageInputs } = require('./inputs.cjs');
 const { verifyRuntimeBundle } = require('./verify-bundle.cjs');
-const { releaseConfig, signArgs, notarize, staple } = require('./signing.cjs');
+const { releaseConfig, preparePasskeySigning, signArgs, notarize, staple } = require('./signing.cjs');
 const root = path.resolve(__dirname, '..'), repo = path.dirname(root);
 const pkg = require('../package.json');
 function run(bin, args, options = {}) { return execFileSync(bin, args, { stdio: 'inherit', ...options }); }
@@ -70,6 +70,7 @@ fs.copyFileSync(path.join(bunStage, 'package-lock.json'), path.join(resources, '
 fs.copyFileSync(path.join(root, 'package-lock.json'), path.join(resources, 'HOST-BUILD-LOCK.json'));
 const plist = path.join(bundle, 'Contents/Info.plist');
 for (const [key, value] of Object.entries({ CFBundleIdentifier: 'com.ezil.os.native', CFBundleExecutable: 'EZiL OS', CFBundleName: 'EZiL OS', CFBundleDisplayName: 'EZiL OS', CFBundleShortVersionString: version, CFBundleVersion: version.split('-')[0] })) run('/usr/libexec/PlistBuddy', ['-c', `Set :${key} ${value}`, plist]);
+preparePasskeySigning(signing, bundle, build, run);
 const inventory = { distribution: signing.release ? 'developer-id' : 'internal-ad-hoc', version, gitSHA: process.env.GITHUB_SHA || run('git', ['rev-parse', 'HEAD'], { cwd: repo, stdio: 'pipe', encoding: 'utf8' }).trim(), electron: pkg.devDependencies.electron, bun: pkg.ezilTools.bun, node: process.version, files: {} };
 inventory.inputs = inputInventory;
 inventory.architecture = 'arm64';
@@ -105,7 +106,7 @@ function signTree(dir) {
 }
 signTree(bundle);
 inventoryFiles(resources); atomic(path.join(resources, 'INVENTORY.json'), JSON.stringify(inventory, null, 2));
-run('/usr/bin/codesign', signArgs(signing, bundle));
+run('/usr/bin/codesign', signArgs(signing, bundle, { mainApp: true }));
 run('/usr/bin/codesign', ['--verify', '--deep', '--strict', bundle]);
 if (signing.release) {
   const archive = path.join(build, 'notarization.zip');

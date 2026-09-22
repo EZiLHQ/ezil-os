@@ -37,7 +37,8 @@ export function bindNativeBrowser (el, ctx) {
     const zoomIn = button('+', 'zoom-in', 'Zoom in');
     const status = document.createElement('span'); status.setAttribute('role', 'status'); toolbar.append(address, zoomOut, zoomReset, zoomIn, status);
     const auth = document.createElement('div'); auth.className = 'ezil-native-browser-auth';
-    const hint = document.createElement('span'); hint.textContent = 'Google sign-in requires a normal Chrome window. Embedded tabs are for browsing and previews.';
+    const hint = document.createElement('span'); hint.textContent = 'For Google sign-in and existing passkeys, use Secure Browser. Sign-in stays in Chrome.';
+    hint.title = 'Existing iCloud, phone and password-manager passkeys use the normal Chrome window. EZiL never imports your passkeys or cookies.';
     const secure = document.createElement('button'); secure.type = 'button'; secure.textContent = 'Open in Secure Browser';
     const secureStatus = document.createElement('span'); secureStatus.setAttribute('role', 'status');
     auth.append(hint, secure, secureStatus); chrome.append(tabRow, toolbar, auth); body.appendChild(chrome);
@@ -47,6 +48,14 @@ export function bindNativeBrowser (el, ctx) {
     const tabs = [], overlays = new Set();
     let active, disposed = false, forcedCover = false, explicitlyHidden = false, raf, nextId = 0;
     let composition = Promise.resolve(), compositionRevision = 0, lastComposition, canFocus = false;
+    void adapter.operation({ op: 'passkeys.status', workspaceId: ctx?.computer?.id ?? ctx?.payload?.computer?.id ?? window.__EZIL_BOOT__?.computer?.id }).then(result => {
+        if (disposed || !result?.ok) return;
+        hint.textContent = result.embeddedTouchID
+            ? 'Touch ID for passkeys created in this workspace is enabled. Use Secure Browser for existing passkeys and Google sign-in.'
+            : 'Use Secure Browser for passkeys and Google sign-in. ' + ({ signing_required: 'Embedded Touch ID needs an Apple-signed EZiL build.',
+                platform_unavailable: 'Touch ID is unavailable on this Mac.', runtime_unsupported: 'This runtime does not support embedded Touch ID.',
+                setup_failed: 'Embedded Touch ID could not be configured.' }[result.reason] || 'Embedded Touch ID is unavailable.');
+    }).catch(() => {});
     const trace = ctx.trace ?? { step () {}, end () {} };
     const progress = AppSpinner({ label: 'Opening Browser…', onRetry: () => { if (active) void start(active); },
         failureCopy: { title: 'Browser is unavailable', body: 'The local browser could not start. Try again. If this continues, relaunch EZiL OS.' } });

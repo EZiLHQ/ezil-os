@@ -11,6 +11,16 @@ function fixture() {
   return { ipc, bridge, invoke(input, value) { result = value; return bridge.operation(vm.runInContext(`(${JSON.stringify(input)})`, context)); } };
 }
 const identity = { workspaceId: randomUUID(), surfaceId: randomUUID(), generation: 1 };
+test('passkey status is typed and never exposes credential IDs, groups, paths or unsupported claims', async () => {
+  const { runtimeSchema } = require('../src/policy.cjs');
+  const input = { op: 'passkeys.status', workspaceId: identity.workspaceId };
+  assert.deepEqual(runtimeSchema(input), input);
+  for (const patch of [{ credentialId: 'secret' }, { keychainAccessGroup: 'fake' }, { platformPasskeys: true }]) assert.throws(() => runtimeSchema({ ...input, ...patch }));
+  const { invoke } = fixture();
+  const value = JSON.parse(JSON.stringify(await invoke(input, { ok: true, embeddedTouchID: false, reason: 'signing_required',
+    syncedPasskeys: true, credentialId: 'secret', keychainAccessGroup: 'group', path: '/private' })));
+  assert.deepEqual(value, { ok: true, embeddedTouchID: false, syncedPasskeys: false, existingPasskeys: 'secure-browser', reason: 'signing_required' });
+});
 test('secure browser bridge has no executable/profile/argument surface and strips private host data', async () => {
   const { runtimeSchema } = require('../src/policy.cjs');
   const input = { op: 'secureBrowser.open', workspaceId: identity.workspaceId, destination: 'https://accounts.google.com/signin?rejected=secret' };
