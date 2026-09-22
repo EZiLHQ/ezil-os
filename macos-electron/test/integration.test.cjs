@@ -11,7 +11,13 @@ const { config, helperEnvironment, authenticatedHeaders, registeredPreview } = r
 const { connectorStatus, installConnector, hashes, descriptorValue, ConnectorSession } = require('../src/connector.cjs');
 const { Editors } = require('../src/vscode.cjs');
 const { stageInputs, validateInputs } = require('../scripts/inputs.cjs');
-const { providerFixtures, proveProvider } = require('../src/smoke.cjs');
+const { providerFixtures, proveProvider, scriptLiteral } = require('../src/smoke.cjs');
+test('smoke script literals preserve data without markup or executable breaks', () => {
+  const value = { url: 'https://example.test/</script><script>alert(1)</script>', text: '"\\\n\u2028\u2029' };
+  const literal = scriptLiteral(value);
+  assert.doesNotMatch(literal, /[<>\u2028\u2029]/);
+  assert.deepEqual(JSON.parse(literal), value);
+});
 function fixture(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-integration-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

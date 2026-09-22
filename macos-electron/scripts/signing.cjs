@@ -1,7 +1,7 @@
 'use strict';
 const path = require('node:path');
 const fs = require('node:fs');
-const { createHash } = require('node:crypto');
+const { X509Certificate } = require('node:crypto');
 const { atomic } = require('../src/files.cjs');
 const { BUNDLE_ID } = require('../src/passkeys.cjs');
 function plistStrings(xml) {
@@ -11,8 +11,8 @@ function appleCertificateIdentity(bytes) {
   // Apple exposes signing identities as 40-character SHA-1 certificate
   // fingerprints. This is an opaque Keychain identifier comparison, not a
   // cryptographic integrity or signature decision.
-  // lgtm[js/weak-cryptographic-algorithm]
-  return createHash('sha1').update(bytes).digest('hex').toUpperCase();
+  // Parse a real certificate before reading its standard Apple identity.
+  return new X509Certificate(bytes).fingerprint.replaceAll(':', '').toUpperCase();
 }
 // A release never falls back to ad-hoc signing. Secrets stay in Keychain;
 // only an identity fingerprint and notarytool profile name enter the build.
