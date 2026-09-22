@@ -171,7 +171,16 @@ class Browser {
       case 'hide': item.occluded = true; item.gestureAt = null; item.snapshot = null; this.attach(item); break;
       case 'snapshot': {
         item.occluded = true; this.attach(item);
-        const image = await item.view.webContents.capturePage();
+        let image;
+        try { image = await item.view.webContents.capturePage(); }
+        catch {
+          // Some Chromium platforms cannot capture a detached WebContentsView.
+          // Occlusion is the security boundary; a missing decorative snapshot
+          // must not make hiding the native surface fail.
+          if (this.closed || this.views.get(input.viewId) !== item || item.revision !== input.sequence) throw Error('Stale snapshot');
+          item.snapshot = null;
+          return { state: 'hidden' };
+        }
         if (this.closed || this.views.get(input.viewId) !== item || item.revision !== input.sequence) throw Error('Stale snapshot');
         const snapshot = image.resize({ width: Math.min(1600, Math.max(1, item.view.getBounds().width)) }).toDataURL();
         item.snapshot = snapshot.length <= 2_000_000 ? snapshot : null;

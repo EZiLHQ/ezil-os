@@ -79,10 +79,11 @@ test('editor login submits password only in a UDS POST body and retains cookie i
 test('real UDS gateway forwards authenticated HTTP and a WebSocket upgrade', { timeout: 10000 }, async t => {
   const http = require('node:http'), net = require('node:net'), fs = require('node:fs'), os = require('node:os'), path = require('node:path');
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-wire-'))), socketPath = path.join(root, 'upstream.sock');
-  const sockets = new Set(); let gateway;
+  const sockets = new Set(); let gateway, observedPath;
   const upstream = http.createServer((req, res) => {
     assert.equal(req.headers.cookie, 'session=upstream'); assert.equal(req.headers.authorization, undefined); assert.equal(req.headers['x-ezil-editor'], undefined);
-    res.setHeader('set-cookie', 'session=must-not-leak'); res.write('chunk-one'); res.end(req.url);
+    observedPath = req.url;
+    res.setHeader('set-cookie', 'session=must-not-leak'); res.write('chunk-one'); res.end('path-preserved');
   });
   upstream.on('connection', socket => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
   upstream.on('upgrade', (req, socket, head) => {
@@ -97,7 +98,7 @@ test('real UDS gateway forwards authenticated HTTP and a WebSocket upgrade', { t
   const shellOrigin = 'http://127.0.0.1:3210';
   gateway = await startGateway({ socketPath, cookie: 'session=upstream', shellOrigin, webContentsId: 7 });
   const headers = gateway.headers({ url: gateway.origin + '/?q=kept', webContentsId: 7, initiator: shellOrigin, requestHeaders: {} });
-  const response = await fetch(gateway.origin + '/?q=kept', { headers }); assert.equal(response.status, 200); assert.equal(await response.text(), 'chunk-one/?q=kept'); assert.equal(response.headers.get('set-cookie'), null);
+  const response = await fetch(gateway.origin + '/?q=kept', { headers }); assert.equal(response.status, 200); assert.equal(await response.text(), 'chunk-onepath-preserved'); assert.equal(observedPath, '/?q=kept'); assert.equal(response.headers.get('set-cookie'), null);
   assert.equal((await fetch(gateway.origin)).status, 403);
   const port = Number(new URL(gateway.origin).port);
   const upgraded = await new Promise((resolve, reject) => {

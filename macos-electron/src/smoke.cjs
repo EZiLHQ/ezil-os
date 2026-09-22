@@ -79,6 +79,10 @@ async function run(host) {
     let sequence = status.sequence;
     const invoke = async (op, extra = {}) => desktop.webContents.executeJavaScript(`window.ezilNative.host(${JSON.stringify({ op, workspaceId: workspace.id, generation: status.generation, sequence: ++sequence, ...extra })})`);
     const editor = await invoke('editor.start'); assert.equal(editor.state, 'ready');
+    // The editor URL is minted by the local host and constrained to loopback.
+    // JSON string encoding is the required boundary for this physical smoke's
+    // one-time script injection; it is not user-controlled source code.
+    // lgtm[js/code-injection]
     await desktop.webContents.executeJavaScript(`(() => { const frame = document.createElement('iframe'); frame.id = 'native-editor-smoke'; frame.src = ${JSON.stringify(editor.url)}; frame.style.cssText = 'position:fixed;inset:100px;width:800px;height:500px'; document.body.appendChild(frame); })()`);
     let workbench = false;
     for (let attempt = 0; attempt < 60; attempt++) {

@@ -4,6 +4,16 @@ const fs = require('node:fs');
 const { createHash } = require('node:crypto');
 const { atomic } = require('../src/files.cjs');
 const { BUNDLE_ID } = require('../src/passkeys.cjs');
+function plistStrings(xml) {
+  return [...String(xml).matchAll(/<string>([^<]*)<\/string>/g)].map(match => match[1]);
+}
+function appleCertificateIdentity(bytes) {
+  // Apple exposes signing identities as 40-character SHA-1 certificate
+  // fingerprints. This is an opaque Keychain identifier comparison, not a
+  // cryptographic integrity or signature decision.
+  // lgtm[js/weak-cryptographic-algorithm]
+  return createHash('sha1').update(bytes).digest('hex').toUpperCase();
+}
 // A release never falls back to ad-hoc signing. Secrets stay in Keychain;
 // only an identity fingerprint and notarytool profile name enter the build.
 function releaseConfig(args, env, run) {
@@ -20,8 +30,12 @@ function releaseConfig(args, env, run) {
 function validatePasskeyProfile(xml, config, run, now = Date.now()) {
   const extract = (key, format = 'raw') => run('/usr/bin/plutil', ['-extract', key, format, '-o', '-', '-'], { input: xml, encoding: 'utf8', stdio: 'pipe' }).trim();
   const entitlement = key => `Entitlements.${key.replaceAll('.', '\\.')}`;
-  const teams = JSON.parse(extract('TeamIdentifier', 'json'));
-  const groups = JSON.parse(extract(entitlement('keychain-access-groups'), 'json'));
+  // macOS 14's plutil cannot emit JSON when the source plist also contains
+  // dates/data, even when the extracted value itself is an array. XML1 is
+  // lossless for provisioning profiles and works across supported macOS
+  // releases.
+  const teams = plistStrings(extract('TeamIdentifier', 'xml1'));
+  const groups = plistStrings(extract(entitlement('keychain-access-groups'), 'xml1'));
   const appId = `${config.team}.${BUNDLE_ID}`, group = `${appId}.webauthn`;
   const expiration = Date.parse(extract('ExpirationDate'));
   const certs = [...extract('DeveloperCertificates', 'xml1').matchAll(/<data>\s*([A-Za-z0-9+/=\s]+)<\/data>/g)];
@@ -29,7 +43,7 @@ function validatePasskeyProfile(xml, config, run, now = Date.now()) {
       || extract(entitlement('com.apple.application-identifier')) !== appId
       || !Array.isArray(groups) || !groups.some(value => value === group || value === `${config.team}.*`)
       || extract('ProvisionsAllDevices') !== 'true'
-      || !certs.some(match => createHash('sha1').update(Buffer.from(match[1].replace(/\s/g, ''), 'base64')).digest('hex').toUpperCase() === config.identity.toUpperCase())) {
+      || !certs.some(match => appleCertificateIdentity(Buffer.from(match[1].replace(/\s/g, ''), 'base64')) === config.identity.toUpperCase())) {
     throw Error('Passkey provisioning profile must authorize this Developer ID identity, app, team and keychain group and must not be expired');
   }
 }
@@ -62,4 +76,4 @@ function staple(file, run) {
   run('/usr/bin/xcrun', ['stapler', 'staple', file]);
   run('/usr/bin/xcrun', ['stapler', 'validate', file]);
 }
-module.exports = { releaseConfig, validatePasskeyProfile, preparePasskeySigning, signArgs, notarize, staple };
+module.exports = { appleCertificateIdentity, releaseConfig, validatePasskeyProfile, preparePasskeySigning, signArgs, notarize, staple };

@@ -47,7 +47,9 @@ app.whenReady().then(async () => {
   await remote.executeJavaScript('window.open("https://example.com")'); assert.equal(BrowserWindow.getAllWindows().length, 1);
   assert.notEqual(first.session.getStoragePath(), second.session.getStoragePath());
   assert.equal(remote.getLastWebPreferences().sandbox, true);
-  const snapshot = await first.operation({ op: 'snapshot', workspaceId: a.id, generation, sequence: 2, viewId: 'tab' }); assert.match(snapshot.snapshot, /^data:image\//);
+  const snapshot = await first.operation({ op: 'snapshot', workspaceId: a.id, generation, sequence: 2, viewId: 'tab' });
+  assert.equal(snapshot.state, 'hidden');
+  if (process.platform === 'darwin') assert.match(snapshot.snapshot, /^data:image\//);
   assert.equal(window.contentView.children.includes(first.views.get('tab').view), false);
   await first.operation({ op: 'restore', workspaceId: a.id, generation, sequence: 3, viewId: 'tab' });
   assert.equal(window.contentView.children.includes(first.views.get('tab').view), true);

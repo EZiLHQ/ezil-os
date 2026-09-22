@@ -1,11 +1,10 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
-const { releaseConfig, validatePasskeyProfile, preparePasskeySigning, signArgs, notarize, staple } = require('../scripts/signing.cjs');
-const { createHash } = require('node:crypto');
+const { appleCertificateIdentity, releaseConfig, validatePasskeyProfile, preparePasskeySigning, signArgs, notarize, staple } = require('../scripts/signing.cjs');
 const testCert = Buffer.from('synthetic signing certificate');
 function profileRun(_bin, args) {
   if (args[0] === 'cms') return '<plist>synthetic fixture</plist>';
-  const fields = { TeamIdentifier: '["A1B2C3D4E5"]', 'Entitlements.keychain-access-groups': '["A1B2C3D4E5.*"]',
+  const fields = { TeamIdentifier: '<plist><array><string>A1B2C3D4E5</string></array></plist>', 'Entitlements.keychain-access-groups': '<plist><array><string>A1B2C3D4E5.*</string></array></plist>',
     ExpirationDate: '2099-01-01T00:00:00Z', 'Entitlements.com\\.apple\\.application-identifier': 'A1B2C3D4E5.com.ezil.os.native',
     ProvisionsAllDevices: 'true', DeveloperCertificates: `<array><data>${testCert.toString('base64')}</data></array>` };
   return fields[args[1]] || '';
@@ -29,7 +28,7 @@ test('only the main signed app receives its validated passkey keychain group', t
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-passkey-signing-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const bundle = path.join(root, 'App.app'); fs.mkdirSync(path.join(bundle, 'Contents'), { recursive: true });
-  const config = { release: true, team: 'A1B2C3D4E5', identity: createHash('sha1').update(testCert).digest('hex') }, calls = [];
+  const config = { release: true, team: 'A1B2C3D4E5', identity: appleCertificateIdentity(testCert) }, calls = [];
   assert.throws(() => signArgs(config, '/App.app', { mainApp: true }));
   assert.throws(() => preparePasskeySigning(config, bundle, root, profileRun), /provisioning profile/);
   config.passkeyProfile = path.join(root, 'test.provisionprofile'); fs.writeFileSync(config.passkeyProfile, 'synthetic profile');
@@ -50,7 +49,7 @@ test('only the main signed app receives its validated passkey keychain group', t
   assert.throws(() => preparePasskeySigning({ release: true, team: '$(id)' }, '/App', root, () => {}));
 });
 test('expired, wrong team, wrong app, unauthorized group/certificate and development profiles fail closed', () => {
-  const config = { team: 'A1B2C3D4E5', identity: createHash('sha1').update(testCert).digest('hex') };
+  const config = { team: 'A1B2C3D4E5', identity: appleCertificateIdentity(testCert) };
   validatePasskeyProfile('fixture', config, profileRun);
   for (const [field, value] of [['ExpirationDate', '2000-01-01'], ['TeamIdentifier', '["OTHERTEAM1"]'],
     ['Entitlements.com\\.apple\\.application-identifier', 'A1B2C3D4E5.other.app'],
@@ -66,5 +65,5 @@ test('profile field extraction matches real macOS plutil semantics', { skip: pro
     <key>DeveloperCertificates</key><array><data>${testCert.toString('base64')}</data></array>
     <key>Entitlements</key><dict><key>com.apple.application-identifier</key><string>A1B2C3D4E5.com.ezil.os.native</string>
     <key>keychain-access-groups</key><array><string>A1B2C3D4E5.*</string></array></dict></dict></plist>`;
-  validatePasskeyProfile(xml, { team: 'A1B2C3D4E5', identity: createHash('sha1').update(testCert).digest('hex') }, execFileSync);
+  validatePasskeyProfile(xml, { team: 'A1B2C3D4E5', identity: appleCertificateIdentity(testCert) }, execFileSync);
 });
