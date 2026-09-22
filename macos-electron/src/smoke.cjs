@@ -130,8 +130,9 @@ async function run(host) {
     await browserOp('restore'); assert.equal(desktop.contentView.children.includes(view), true);
     // Closing a WebContents is asynchronous; observe actual destruction
     // before checking cleanup or recreating the same browser slot.
-    const destroyed = once(view.webContents, 'destroyed', { signal: AbortSignal.timeout(5000) });
-    await browserOp('destroy'); await destroyed; assert.equal(view.webContents.isDestroyed(), true);
+    const closingContents = view.webContents;
+    const destroyed = once(closingContents, 'destroyed', { signal: AbortSignal.timeout(5000) });
+    await browserOp('destroy'); await destroyed; assert.equal(closingContents.isDestroyed(), true);
     await browserOp('create', { url: previewURL, bounds: { x: 100, y: 100, width: 600, height: 400 } });
     await pageReady(current.browser.views.get('offline-smoke').view.webContents);
     assert.equal(await current.browser.views.get('offline-smoke').view.webContents.executeJavaScript('localStorage.getItem("guest-canary")'), 'persisted');
