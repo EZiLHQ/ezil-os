@@ -1,0 +1,58 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { credential, upstream, chatRequest, startBroker, LIMITS, authorized } = require('../src/broker.cjs');
+const { harness } = require('./http-harness.cjs');
+const azure = { provider: 'azure', endpoint: 'https://test.openai.azure.com/', deployment: 'deployment', key: 'SECRET-KEY' };
+const chat = { model: 'deployment', messages: [{ role: 'user', content: 'Hello' }], maxTokens: 10 };
+test('fixed provider destinations, no IAM signing oracle or redirects', () => {
+  assert.equal(credential(azure), azure);
+  for (const endpoint of ['http://test.openai.azure.com/', 'https://test.openai.azure.com.evil/', 'https://test.openai.azure.com/path', 'https://test.services.ai.azure.com/', 'https://test.services.ai.azure.com/models', 'https://u:p@test.openai.azure.com/', 'https://127.0.0.1/']) assert.throws(() => credential({ ...azure, endpoint }));
+  assert.throws(() => credential({ provider: 'iam', accessKey: 'x' }));
+  assert.throws(() => credential({ ...azure, destination: 'https://evil.test' }));
+  const target = upstream(azure, chat); assert.ok(target.url.startsWith('https://test.openai.azure.com/openai/deployments/deployment/')); assert.equal(target.url.includes(azure.key), false);
+  for (const endpoint of ['https://test.openai.azure.com/openai/v1/', 'https://test.services.ai.azure.com/openai/v1']) {
+    const v1 = upstream({ ...azure, endpoint }, chat);
+    assert.equal(v1.url, `${new URL(endpoint).origin}/openai/v1/chat/completions`);
+    assert.equal(v1.body.model, 'deployment');
+    assert.equal(v1.headers['api-key'], azure.key);
+  }
+  const bedrock = upstream({ provider: 'bedrock', region: 'us-east-1', model: 'anthropic.claude-v2', token: 'SECRET-TOKEN' }, chat);
+  assert.equal(bedrock.url, 'https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-v2/converse-stream'); assert.equal(bedrock.contentType, 'application/vnd.amazon.eventstream');
+});
+test('schemas and request budgets reject arbitrary payloads', () => {
+  assert.equal(chatRequest(chat, 'deployment'), chat);
+  for (const body of [{ ...chat, model: 'other' }, { ...chat, maxTokens: LIMITS.maxTokens + 1 }, { ...chat, url: 'https://evil.test' }, { ...chat, messages: [{ role: 'tool', content: 'x' }] }]) assert.throws(() => chatRequest(body, 'deployment'));
+  assert.equal(authorized('Bearer x', 'y'), false); assert.equal(authorized(undefined, 'x'), false); assert.ok(authorized('Bearer token', 'token'));
+});
+test('loopback broker auth, streaming, redaction, private descriptor and no retries', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-broker-')));
+  let calls = 0, failure = false;
+  const http = harness();
+  const broker = await startBroker(root, { get: () => azure }, { createServer: http.createServer, fetchImpl: async (_url, options) => { calls++; assert.equal(options.redirect, 'error'); assert.ok(options.signal); if (failure) throw Error('SECRET-KEY full upstream error'); return new Response('data: hello\n\n', { headers: { 'content-type': 'text/event-stream' } }); } });
+  t.after(() => { broker.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const descriptor = JSON.parse(fs.readFileSync(broker.descriptor)); assert.equal(fs.statSync(broker.descriptor).mode & 0o777, 0o600); assert.equal(fs.readFileSync(broker.descriptor, 'utf8').includes('SECRET-KEY'), false);
+  const headers = { authorization: `Bearer ${descriptor.capability}`, 'content-type': 'application/json' };
+  assert.equal((await http.request('/v1/models')).status, 403);
+  assert.equal((await http.request('/v1/models', { headers: { ...headers, origin: 'http://evil.test' } })).status, 403);
+  assert.deepEqual(await (await http.request('/v1/models', { headers })).json(), { models: ['deployment'] });
+  const options = { method: 'POST', headers, body: JSON.stringify(chat) };
+  assert.equal(await (await http.request('/v1/chat', options)).text(), 'data: hello\n\n');
+  failure = true; const response = await http.request('/v1/chat', options); assert.equal(response.status, 502); assert.equal((await response.text()).includes('SECRET'), false); assert.equal(calls, 2);
+  assert.equal((await http.request('/v1/chat', { ...options, body: 'x'.repeat(LIMITS.requestBytes + 1) })).status, 413);
+  assert.equal(broker.usage.completed, 1); assert.equal(broker.usage.failed, 1);
+});
+test('concurrency limit, timeout cancellation and no retry on ambiguous streams', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-limits-'))), http = harness();
+  let calls = 0, started; const ready = new Promise(resolve => { started = resolve; });
+  const broker = await startBroker(root, { get: () => azure }, { createServer: http.createServer, limits: { ...LIMITS, concurrent: 1, timeoutMs: 50 }, fetchImpl: (_url, { signal }) => new Promise((_resolve, reject) => { calls++; started(); signal.addEventListener('abort', () => reject(Error('aborted')), { once: true }); }) });
+  t.after(() => { broker.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const d = JSON.parse(fs.readFileSync(broker.descriptor));
+  const options = { method: 'POST', headers: { authorization: `Bearer ${d.capability}`, 'content-type': 'application/json' }, body: JSON.stringify(chat) };
+  const first = http.request('/v1/chat', options); await ready;
+  assert.equal((await http.request('/v1/chat', options)).status, 429);
+  await first; assert.equal(calls, 1); assert.equal(broker.usage.active, 0); assert.equal(broker.usage.failed, 1);
+});

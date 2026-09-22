@@ -495,6 +495,8 @@ function UIContextMenu (options) {
     }
 
     const menu_id = window.global_element_id++;
+    const nativeOverlay = `context-menu-${menu_id}`;
+    window.dispatchEvent(new CustomEvent('ezil:native-composition', { detail: { overlay: nativeOverlay, open: true } }));
 
     // Dispatch 'ctxmenu-will-open' event
     window.dispatchEvent(new CustomEvent('ctxmenu-will-open', { detail: { options: options } }));
@@ -830,6 +832,7 @@ function UIContextMenu (options) {
     }
 
     $(contextMenu).on('remove', function () {
+        window.dispatchEvent(new CustomEvent('ezil:native-composition', { detail: { overlay: nativeOverlay, open: false } }));
         if ( submenu_delay_timer ) clearTimeout(submenu_delay_timer);
         if ( $sheet_backdrop ) $sheet_backdrop.remove();
         if ( options.onClose ) options.onClose(cancel_options_);

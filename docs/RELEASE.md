@@ -1,36 +1,43 @@
 # Releases
 
-How a `v*` tag turns into a deployed, verified product and a downloadable
-tarball — the secrets it needs, what to check before the first one, the order
-things happen in, how to confirm a rollout actually took effect, and how to
-undo one.
+How a `v*` tag turns into a deployed, verified product, a downloadable
+tarball, and a native macOS DMG — the secrets it needs, what to check before
+the first one, the order things happen in, how to confirm a rollout actually
+took effect, and how to undo one.
 
 A release is a maintainer-cut `v*` tag; nothing else creates one — see
 [`GOVERNANCE.md`](../GOVERNANCE.md) § Releases. Tagging pushes three workflows
 into motion at once: [`.github/workflows/image.yml`](../.github/workflows/image.yml)
 (container images to GHCR), [`.github/workflows/release.yml`](../.github/workflows/release.yml)
-(the downloadable tarball, as a **draft** GitHub Release), and
+(the downloadable tarball and signed DMG, as a **draft** GitHub Release), and
 [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) (the hosted
 product — and the only one of the three that publishes the draft the second
-one created). This document is about the operator side of that; the workflow
-files themselves carry the mechanical detail in their own header comments.
+one created after the signed DMG is attached). This document is about the
+operator side of that; the workflow files themselves carry the mechanical
+detail in their own header comments.
 
 ## Secrets
 
 Set with `gh secret set <NAME> -R EZiLHQ/ezil-os` (it prompts for the value —
 never pass a secret as a command-line argument, which would land in shell
-history). All seven live in **repository** secrets (Settings → Secrets and
-variables → Actions), read only by `deploy.yml`.
+history). The deployment secrets and the Apple distribution credentials live
+in **repository** secrets (Settings → Secrets and variables → Actions).
 
 | Secret | Used by | Required token scope |
 |---|---|---|
-| `CLOUDFLARE_API_TOKEN` | `worker` (deploy), `release` (best-effort deployment note) | `Workers Scripts:Edit`, `Workers Containers:Edit`, `Account Settings:Read` |
+| `CLOUDFLARE_API_TOKEN` | `worker` (deploy), `release` (best-effort deployment note) | For this existing Worker: Workers `Editor` (or legacy `Workers Scripts:Edit`), `Containers:Edit`, `Workers R2 Storage:Edit`, `Account Settings:Read`, and zone `Workers Routes:Edit` limited to `ezil.org`. Use Workers product `Admin` only if CI must create the Worker. |
 | `CLOUDFLARE_ACCOUNT_ID` | `worker`, `release` | — (not a token; the account id) |
 | `VERCEL_TOKEN` | `app` | a Vercel Access Token scoped to the `ezil-os` project |
 | `VERCEL_ORG_ID` | `app` | — (from `app/.vercel/project.json`'s `orgId` after `vercel link`) |
 | `VERCEL_PROJECT_ID` | `app` | — (from the same file's `projectId`) |
 | `EZIL_E2E_EMAIL` | `verify`, `verify-container` | an EZiL OS account the production suites can sign in as |
 | `EZIL_E2E_PASSWORD` | `verify`, `verify-container` | the same account's password |
+| `APPLE_CERTIFICATE` | `release.yml` macOS job | base64-encoded Developer ID Application `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | `release.yml` macOS job | password used when the `.p12` was exported |
+| `APPLE_SIGNING_IDENTITY` | `release.yml` macOS job | full `Developer ID Application: …` identity |
+| `APPLE_ID` | `release.yml` macOS job | Apple ID used by `notarytool` |
+| `APPLE_PASSWORD` | `release.yml` macOS job | app-specific Apple ID password, not the account password |
+| `APPLE_TEAM_ID` | `release.yml` macOS job | ten-character Apple Developer team ID |
 
 ```bash
 gh secret set CLOUDFLARE_API_TOKEN -R EZiLHQ/ezil-os
@@ -40,11 +47,18 @@ gh secret set VERCEL_ORG_ID -R EZiLHQ/ezil-os
 gh secret set VERCEL_PROJECT_ID -R EZiLHQ/ezil-os
 gh secret set EZIL_E2E_EMAIL -R EZiLHQ/ezil-os
 gh secret set EZIL_E2E_PASSWORD -R EZiLHQ/ezil-os
+gh secret set APPLE_CERTIFICATE -R EZiLHQ/ezil-os
+gh secret set APPLE_CERTIFICATE_PASSWORD -R EZiLHQ/ezil-os
+gh secret set APPLE_SIGNING_IDENTITY -R EZiLHQ/ezil-os
+gh secret set APPLE_ID -R EZiLHQ/ezil-os
+gh secret set APPLE_PASSWORD -R EZiLHQ/ezil-os
+gh secret set APPLE_TEAM_ID -R EZiLHQ/ezil-os
 ```
 
-No new secret is needed for the `image` or `release` jobs `deploy.yml` gained
-in this round: `image` authenticates to GHCR with the run's own `GITHUB_TOKEN`
-(job-level `packages: read` — see that job's `permissions:` block), and
+No new secret is needed for the `image`, `worker`, or `release` jobs in
+`deploy.yml`: `image` and `worker` authenticate to GHCR with the run's own
+`GITHUB_TOKEN` (job-level `packages: read` — each job runs on a fresh runner
+and logs in separately), and
 `release` publishes with the run's own `GITHUB_TOKEN` (job-level
 `contents: write`) plus the Cloudflare pair already above. Anything not in
 this table is public by design — the app-runtime secrets
@@ -59,19 +73,17 @@ Everything here is a one-time check before the *first* tag; after that, only
 "the e2e account is still allow-listed" and "0002 is applied" are ongoing
 concerns (a schema change ships a new migration, not a rewrite of 0002).
 
-- [ ] **Vercel Root Directory is the repository root (`.`), not `app`.**
-  `app`/`deploy.yml`'s `app` job runs `vercel pull` / `vercel build` /
-  `vercel deploy` from *inside* `app/`, which is Vercel's documented shape
-  only when the project's own Root Directory setting is the repo root — if it
-  is set to `app` instead, `vercel build` looks for `app/app` and fails (see
-  that job's own comment in `deploy.yml`). **Not independently verified by
-  this row**: a stale, gitignored `app/.vercel/project.json` left on this
-  machine from an earlier `vercel link` has no `rootDirectory` key, and
-  Vercel omits that key exactly when it equals the default (the repo root) —
-  consistent with the setting already being correct, but that file is local
-  and may not reflect the live dashboard. Confirm on the Vercel dashboard
-  (Project Settings → General → Root Directory) or via `vercel pull` with
-  real credentials before the first tag, not after a failed deploy.
+- [x] **Vercel Root Directory is `app`.** This is a monorepo and the Next.js
+  package lives there. Git deployments and the CLI both apply the remote Root
+  Directory; `deploy.yml` therefore runs `vercel deploy` from the repository
+  root. Vercel builds the uploaded source in its protected environment because
+  Sensitive variables deliberately cannot be downloaded for a GitHub-side
+  prebuild. This was set and read back from the live Vercel project on
+  2026-09-16. `app/vercel.json` deliberately keeps Git production deployments
+  from `main` disabled: branches still get automatic previews, while production
+  remains the Worker-first, verified tag workflow instead of two racing deploy
+  systems. Keep the repository-root `.vercelignore`: the CLI uploads from the
+  monorepo root, and nested ignore files alone did not exclude `app/.env`.
 - [ ] **The e2e account is allow-listed.** `EZIL_E2E_EMAIL` must have a row in
   `ezil_os_access` (migration `0002_os_access.sql`) — `assertOsAccess` gates
   every protected route, so a not-allow-listed e2e account fails `verify`
@@ -101,9 +113,34 @@ concerns (a schema change ships a new migration, not a rewrite of 0002).
   Package settings → Danger Zone → Change visibility; this is not scriptable
   with `gh` today), an anonymous `docker pull` — which is what every release
   tarball's launcher does — fails with `unauthorized`, even though the CI
-  jobs that build and verify against these images (which authenticate with
-  their own `GITHUB_TOKEN`) keep working regardless. See
+  jobs that build and deploy these images authenticate with their own
+  `GITHUB_TOKEN` and keep working regardless. See
   `deploy/launcher/README.md` § "One founder step this depends on".
+- [ ] **The six Apple distribution secrets are installed before a public
+  signed release.** `release.yml` is
+  deliberately fail-closed: a missing certificate, identity, or notarization
+  credential fails the macOS job, and `deploy.yml` refuses to publish the
+  draft until the expected signed DMG asset exists. An ordinary Apple ID and
+  account password do not satisfy this: Developer ID distribution requires a
+  paid Apple Developer membership, and `APPLE_PASSWORD` must be an app-specific
+  password. Do not store the normal Apple account password in GitHub.
+
+## Internal macOS test DMG (no Apple subscription)
+
+The manual [`macOS Internal DMG`](../.github/workflows/macos-internal.yml)
+workflow builds the pinned ARM Linux runtime on `ubuntu-24.04-arm`, compiles an
+Apple Silicon app on `macos-14`, ad-hoc signs it, verifies the disk image,
+writes a SHA-256 file, and uploads both as a 14-day Actions artifact. It does
+not read any Apple or repository secret.
+
+From GitHub, open **Actions → macOS Internal DMG → Run workflow**, select
+the branch containing the macOS files, and download the
+`EZiL-OS-AppleSilicon-internal-*` artifact after the job turns green. This artifact is
+for trusted internal testers only. Because it is not Developer ID signed or
+notarized, macOS will require the tester to Control-click the app and choose
+**Open**, or approve it in **System Settings → Privacy & Security**. The
+public/tagged release workflow remains intentionally unavailable until the six
+real Apple distribution credentials exist.
 
 ## Order of events on a tag
 
@@ -120,9 +157,11 @@ git tag v0.2.0-rc.1 && git push origin v0.2.0-rc.1
         │                          deploy/images.env may never fire it at all.
         │
         ├─▶ release.yml starts ─── builds the local-mode tarball, opens a
-        │                          GitHub Release for v0.2.0-rc.1 as a DRAFT
-        │                          (--verify-tag --draft), with SHA256SUMS
-        │                          and a provenance attestation.
+        │                          GitHub Release for v0.2.0-rc.1 as a DRAFT,
+        │                          then on macOS builds/signs/notarizes the
+        │                          Apple Silicon DMG and attaches it; both artifacts
+        │                          receive provenance attestations and enter
+        │                          SHA256SUMS.
         │
         └─▶ deploy.yml starts  ─── image      : waits (up to 30 min) for
                                                  image.yml's ghcr.io/…:<sha8>
@@ -134,8 +173,9 @@ git tag v0.2.0-rc.1 && git push origin v0.2.0-rc.1
                                     verify     : needs app — runs the
                                                  production suites against
                                                  the live URL.
-                                    release    : needs [verify, image] —
-                                                 ONLY if verify passed:
+                                    release    : needs [verify, image], then
+                                                 waits for the signed DMG;
+                                                 ONLY if both are ready:
                                                  `gh release edit v0.2.0-rc.1
                                                  --draft=false`, then appends
                                                  a note with the worker

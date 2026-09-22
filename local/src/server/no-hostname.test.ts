@@ -180,15 +180,6 @@ export const DOMAIN_TOKENS: readonly string[] = FORBIDDEN_TOKENS.filter((t) => t
  */
 const VENDOR_CODE_ALLOWANCES: readonly { readonly file: string; readonly count: number; readonly why: string }[] = [
     {
-        file: 'boot/payload.ts',
-        count: 1,
-        why: '`ShellDesktopState.provider` is a LITERAL type in the app and the field is not'
-            + ' optional, so the value must be emitted for the payload to typecheck. It is'
-            + ' factually wrong for local mode, it has ZERO readers in `shell/`, and'
-            + ' `../boot/payload.ts` says both at the definition. Widening the type is a change'
-            + ' to a file this package does not own.',
-    },
-    {
         file: 'contract/shell-api.test.ts',
         count: 1,
         why: "row T0's adversarial payload fixture, which mirrors the app's literal provider tag"

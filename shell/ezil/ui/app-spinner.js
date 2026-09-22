@@ -52,8 +52,10 @@ import {
  *   Callers pass the app's own name — "Opening Browser…", "Opening
  *   Preview…", "Opening Code…" — never machine vocabulary.
  * @param {() => void} [opts.onRetry] Called by the failure state's Retry button.
+ * @param {{title: string, body: string}} [opts.failureCopy] Static app-specific
+ *   failure guidance. Changes wording only, never readiness or retry behavior.
  */
-export function AppSpinner ({ label = 'Opening…', onRetry } = {}) {
+export function AppSpinner ({ label = 'Opening…', onRetry, failureCopy } = {}) {
     const root = document.createElement('div');
     root.className = 'ezil-app-spinner';
     root.setAttribute('role', 'status');
@@ -111,7 +113,7 @@ export function AppSpinner ({ label = 'Opening…', onRetry } = {}) {
         }
 
         if ( state.kind === 'failed' ) {
-            const copy = BOOT_FAILURE_COPY[state.reason] ?? BOOT_FAILURE_COPY.unknown;
+            const copy = failureCopy ?? BOOT_FAILURE_COPY[state.reason] ?? BOOT_FAILURE_COPY.unknown;
             el_label.textContent = copy.title;
             el_sub.hidden = false;
             el_sub.textContent = copy.body;

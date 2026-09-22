@@ -66,6 +66,176 @@ body.device-tablet,
 body.device-phone {
     overflow: hidden;
     background-color: #161616;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+/* Native helper pages have no Next typography reset. Shell chrome must own
+ * its fallback font; embedded application documents retain their own fonts. */
+.window,
+.taskbar,
+.context-menu,
+.popover {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+.window button,
+.window input,
+.window select,
+.window textarea {
+    font-family: inherit;
+}
+
+/* Native tab strip and toolbar share fixed chrome geometry. The tab strip
+ * scrolls within its row; it never expands the window or covers the address. */
+.ezil-native-browser-chrome {
+    position: absolute;
+    inset: 0 0 auto;
+    min-height: 78px;
+    z-index: 2;
+    color: #f5f5f4;
+    background: #18191b;
+}
+.ezil-native-browser-tab-row { display: flex; height: 36px; min-width: 0; }
+.ezil-native-browser-tabs { display: flex; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: thin; }
+.ezil-native-browser-tab { display: flex; flex: 0 1 180px; min-width: 96px; align-items: center; border-right: 1px solid #444; }
+.ezil-native-browser-tab button,
+.ezil-native-browser-add { color: inherit; background: transparent; border: 0; height: 30px; cursor: pointer; border-radius: 5px; }
+.ezil-native-browser-tab [role="tab"] { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; padding: 0 8px; }
+.ezil-native-browser-tab [aria-selected="true"] { background: #353638; }
+.ezil-native-browser-tab [aria-busy="true"]::before { content: '◌ '; }
+.ezil-native-browser-tab [data-failed="true"]::before { content: '! '; color: #ffb4ab; }
+.ezil-native-browser-tab-close { flex: 0 0 26px; }
+.ezil-native-browser-add { flex: 0 0 34px; font-size: 20px; }
+.ezil-native-browser-add:disabled { opacity: 0.55; cursor: default; }
+.ezil-native-browser-tab button:focus-visible,
+.ezil-native-browser-add:focus-visible { outline: 2px solid #f5f5f4; outline-offset: -2px; }
+.ezil-native-browser-viewport { position: absolute; inset: var(--ezil-browser-chrome-height, 78px) 0 0; overflow: hidden; background: #111; }
+.ezil-native-browser-cover { position: absolute; inset: 0; background: #111; pointer-events: none; }
+
+/* The native toolbar sits on a dark surface, independent of body text colour. */
+.ezil-native-browser-toolbar {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    padding: 6px 8px;
+    box-sizing: border-box;
+    min-height: 42px;
+    background: #18191b;
+    border-bottom: 1px solid rgba(255,255,255,.1);
+    color: #f5f5f4;
+    color-scheme: dark;
+    font-size: 13px;
+    line-height: 1.4;
+}
+.ezil-native-browser-auth { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 5px 10px; font-size: 11px; line-height: 1.4; background: #eef2f6; color: #334155; }
+.ezil-native-browser-auth > span:first-child { flex: 1 1 240px; }
+.ezil-native-browser-auth button { border: 1px solid #94a3b8; border-radius: 6px; padding: 5px 9px; background: white; color: #1e293b; cursor: pointer; }
+.ezil-native-browser-auth button:focus-visible { outline: 2px solid #0f766e; outline-offset: 2px; }
+.ezil-native-browser-auth [role="status"]:not(:empty) { flex-basis: 100%; }
+
+.ezil-native-browser-toolbar .ezil-native-browser-zoom-value { width: 48px; font-size: 12px; }
+
+.ezil-native-browser-chrome[data-compact="true"] .ezil-native-browser-toolbar { flex-wrap: wrap; }
+.ezil-native-browser-chrome[data-compact="true"] .ezil-native-browser-toolbar input { flex: 1 1 180px; width: auto; }
+.ezil-native-browser-chrome[data-compact="true"] .ezil-native-browser-toolbar [role="status"] { flex: 1 0 100%; max-width: 100%; min-height: 0; }
+
+.ezil-native-browser-toolbar button {
+    width: 30px;
+    height: 28px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    flex-shrink: 0;
+    font-size: 18px;
+    cursor: pointer;
+}
+
+.ezil-native-browser-toolbar button:disabled {
+    opacity: 0.55;
+    cursor: default;
+}
+
+.ezil-native-browser-toolbar input {
+    flex: 1;
+    min-width: 60px;
+    width: 0;
+    height: 28px;
+    padding: 0 10px;
+    border: 1px solid rgba(255,255,255,.16);
+    border-radius: 7px;
+    color: inherit;
+    background: rgba(255,255,255,.08);
+    box-sizing: border-box;
+    caret-color: currentColor;
+}
+
+.ezil-native-browser-toolbar input::placeholder {
+    color: #b6b6b3;
+    opacity: 1;
+}
+
+.ezil-native-browser-toolbar button:focus-visible,
+.ezil-native-browser-toolbar input:focus-visible {
+    outline: 2px solid #f5f5f4;
+    outline-offset: 2px;
+}
+
+.ezil-native-browser-toolbar button:hover:not(:disabled) {
+    box-shadow: inset 0 0 0 1px #b6b6b3;
+}
+
+.ezil-native-browser-toolbar [role="status"] {
+    font-size: 12px;
+    white-space: nowrap;
+    min-width: 0;
+    max-width: 25%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Wrap at the actual pane width, including when the Settings window itself
+ * is resized on a wide desktop. Project names must not fund a single action row. */
+.window .ezil-settings-row {
+    flex-wrap: wrap;
+    min-width: 0;
+}
+
+.window .ezil-settings-row-meta {
+    flex: 1 1 14rem;
+    min-width: 0;
+    max-width: 100%;
+}
+
+.window .ezil-settings-row-name,
+.window .ezil-settings-row-sub {
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+.window .ezil-settings-row-actions {
+    flex: 0 1 auto;
+    flex-wrap: wrap;
+    min-width: 0;
+    max-width: 100%;
+}
+
+.window .ezil-settings-row-actions .ezil-settings-btn {
+    box-sizing: border-box;
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+.window .ezil-settings-rename-form {
+    flex-wrap: wrap;
+    max-width: 100%;
+}
+
+.window .ezil-settings-rename-form .ezil-settings-input {
+    flex-basis: 12rem;
+    box-sizing: border-box;
+    max-width: 100%;
 }
 
 /* ── the desktop window ───────────────────────────────────────────────────
@@ -172,7 +342,8 @@ body.device-phone {
    the `[hidden]` rule above works by `display`, and an inline `display` on a
    descendant is fine, but keeping every declaration for this panel in one
    place is what stopped the panel itself painting over a live iframe once. */
-.ezil-code-unavailable-retry {
+.ezil-code-unavailable-retry,
+.ezil-preview-unavailable-retry {
     margin-top: 4px;
     padding: 7px 18px;
     font: inherit;
@@ -185,11 +356,13 @@ body.device-phone {
     min-height: 34px;
 }
 
-.ezil-code-unavailable-retry:hover {
+.ezil-code-unavailable-retry:hover,
+.ezil-preview-unavailable-retry:hover {
     background: #009aa1;
 }
 
-.ezil-code-unavailable-retry:focus-visible {
+.ezil-code-unavailable-retry:focus-visible,
+.ezil-preview-unavailable-retry:focus-visible {
     outline: 2px solid #00adb5;
     outline-offset: 2px;
 }
@@ -738,6 +911,10 @@ body.device-phone {
 .window-close-btn    { order: 1; }
 .window-minimize-btn { order: 2; }
 .window-scale-btn    { order: 3; }
+/* The 15px upstream corner hitbox covers the close disc's center. Keep a
+   usable corner grip outside the traffic lights; backdrop-filter gives the
+   titlebar its own stacking context, so raising the button alone cannot fix it. */
+.window > .ui-resizable-nw { width: 8px; height: 8px; }
 .window-head-draggable {
     order: 4;
     /* Centre the title over the WHOLE titlebar, not over the space left after

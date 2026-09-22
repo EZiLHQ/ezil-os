@@ -1,9 +1,10 @@
-# Release — build the downloadable local-mode tarball and open a GitHub
-# Release for it as a DRAFT, with checksums and a build-provenance attestation.
+# Release — build the downloadable local-mode tarball and launchers and open
+# a GitHub Release as a DRAFT, with checksums and build provenance attestations.
+# Public macOS DMG packaging is disabled pending signing/notarization gates.
 #
 # This is deliberately separate from `image.yml` (which publishes the
 # container images) and `deploy.yml` (which deploys the hosted product): the
-# artifact here is something a person downloads and runs on their own laptop.
+# artifacts here are what a person downloads and runs on their own laptop.
 #
 # 🔴 THIS WORKFLOW NEVER PUBLISHES WHAT IT CREATES. `gh release create` below
 # passes `--draft`, on purpose: a release visible to the public is a claim
@@ -49,6 +50,9 @@ jobs:
   release:
     name: release
     runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.tag.outputs.tag }}
+      release_version: ${{ steps.tag.outputs.version }}
     steps:
       # fetch-tags: the workflow_dispatch path needs to check out a tag that
       # is not the ref this run started on; fetch-depth 0 alone does not
@@ -139,45 +143,9 @@ jobs:
           set -euo pipefail
           root="ezil-os-${RELEASE_TAG}"
           stage="$(mktemp -d)/${root}"
-          mkdir -p "${stage}"
-
-          # local/ — sources + package.json + bun.lock. NO node_modules: it
-          # has zero runtime dependencies (only @types/bun and typescript as
-          # devDependencies, both type-only), so `bun run --cwd local start`
-          # needs no `bun install` at all — verified against an extracted
-          # copy of this exact layout before this row was reported done.
-          mkdir -p "${stage}/local"
-          cp -R local/src "${stage}/local/src"
-          # A handful of *.test.ts are colocated with their sources rather
-          # than under local/tests/ (the container/browser suites T5 added).
-          # Two of them import app/src/... AS VALUES for their own assertion
-          # (not `import type`), which is not in this tarball — nothing runs
-          # a .test.ts here, so this is not a functional break, but shipping
-          # a file that cannot resolve its own import is not "sources" either.
-          find "${stage}/local/src" -name '*.test.ts' -delete
-          cp local/package.json local/bun.lock "${stage}/local/"
-
-          # worker/src/{desktop-mode,screen-modes}.ts — NOT in the row brief's
-          # tarball list, added because local/'s own runtime imports them by
-          # relative path (local/src/container/run-spec.ts and
-          # local/src/server/routes.ts both `from '../../../worker/src/...'`,
-          # real values — portFor, fitScreenRequest — not types). Without
-          # these two files `bun run --cwd local doctor` fails to resolve a
-          # module on the very first line. Both are leaf files with no
-          # imports of their own (confirmed: `bun build --target=bun` on
-          # both local/ entry points resolves cleanly with exactly these two
-          # files pulled in from outside local/ and app/public/os/).
-          mkdir -p "${stage}/worker/src"
-          cp worker/src/desktop-mode.ts worker/src/screen-modes.ts "${stage}/worker/src/"
-
-          mkdir -p "${stage}/app/public/os"
-          cp app/public/os/bundle.min.js app/public/os/bundle.min.css app/public/os/icons.js "${stage}/app/public/os/"
-
-          mkdir -p "${stage}/deploy/launcher"
-          cp deploy/images.env "${stage}/deploy/"
-          cp deploy/launcher/ezil-os.sh deploy/launcher/ezil-os.ps1 deploy/launcher/README.md "${stage}/deploy/launcher/"
-
-          cp LICENSE NOTICE ATTRIBUTIONS.md "${stage}/"
+          # The native macOS app calls this same staging script. One file list
+          # prevents the tarball and DMG from shipping different runtimes.
+          ./deploy/stage-local-runtime.sh "${stage}"
 
           # `|| true` at the end, not inside the pipe: under pipefail, a key
           # that is simply ABSENT (grep matches nothing, exit 1) would
@@ -320,3 +288,12 @@ jobs:
             echo
             echo "Provenance attestation: ${ATTESTATION_URL}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  macos-native-public-gate:
+    name: native Mac public distribution disabled pending signing
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require reviewed Developer ID and notarization pipeline
+        run: |
+          echo "Public Mac DMG disabled until Developer ID signing, hardened runtime, notarization, stapling and exact-artifact physical evidence are implemented and reviewed."

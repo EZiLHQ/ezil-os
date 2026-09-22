@@ -2,12 +2,17 @@
 # `node_modules` without a trailing slash: worktrees carry node_modules as SYMLINKS to the main tree, and a
 # directory-only pattern (trailing slash) would leave every symlink showing as untracked in every worktree.
 node_modules
+.native-tools
+.native-evidence/
+.firecrawl/
 
 # Build output (except intentionally-committed, pre-built bundles that
 # something downstream consumes without a toolchain)
 dist/
 dist-ssr/
 dist-electron/
+macos/build/
+macos/.build/
 # ...the workspace bootstrap the Docker image COPYs at build time
 !worker/bootstrap/dist
 !worker/bootstrap/dist/workspace-bootstrap.mjs
@@ -19,6 +24,7 @@ dist-electron/
 app/.next/
 app/next-env.d.ts
 app/tsconfig.tsbuildinfo
+.vercel/
 
 # Test reports written INTO the checkout rather than into a temp directory.
 # `.github/workflows/ci.yml`'s worker job runs

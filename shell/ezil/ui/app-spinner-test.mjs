@@ -112,6 +112,24 @@ const { AppSpinner } = await import('./app-spinner.js');
     push('ready / ready_unverified render without throwing', ! threw);
 }
 
+{
+    let retried = false;
+    const spinner = AppSpinner({ label: 'Opening Code…', onRetry: () => { retried = true; },
+        failureCopy: { title: 'Code is unavailable', body: 'Local editor <guidance>' } });
+    spinner.render({ kind: 'failed', reason: 'unknown' });
+    push('app-specific failure copy renders as text without changing failed state',
+        spinner.el.dataset.kind === 'failed'
+        && spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Code is unavailable'
+        && spinner.el.querySelector('.ezil-app-spinner-sub').textContent === 'Local editor <guidance>'
+        && !spinner.el.querySelector('guidance'));
+    spinner.el.querySelector('.ezil-boot-retry').click();
+    push('app-specific copy preserves explicit retry', retried);
+    spinner.render({ kind: 'progress' });
+    push('retry progress restores app label and hides failure guidance',
+        spinner.el.querySelector('.ezil-app-spinner-label').textContent === 'Opening Code…'
+        && spinner.el.querySelector('.ezil-app-spinner-sub').hidden);
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 const failed = checks.filter(c => !c.pass);
 for (const c of checks) {

@@ -1,3 +1,4 @@
+import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../native-runtime.js';
 // code.js — EZiL-authored. Not Puter code.
 //
 // The Code window: code-server (VS Code Web), over plain HTTP, in an iframe.
@@ -130,6 +131,8 @@ async function mintCodePreviewUrl (computerId) {
 
 /** One `POST /api/shell/code-preview-url`. The loop that may call it more than once is above. */
 async function mintCodePreviewUrlOnce (computerId) {
+    const started = await session.ensureLocalDesktop(computerId);
+    if ( ! started.ok ) return started;
     const endpoint = session.payload()?.desktopState?.endpoints?.codePreviewUrl
         ?? '/api/shell/code-preview-url';
 
@@ -219,6 +222,7 @@ export async function openCodeWindow (ctx = {}) {
     const trace = ctx.trace ?? { step () {}, end () {} };
     const computer = ctx.computer ?? ctx.payload?.computer ?? null;
     const desktop_state = ctx.desktopState ?? ctx.payload?.desktopState ?? {};
+    const nativeSurface = selectRuntimeAdapter(ctx)?.surface('code');
     // MODIFIED BY EZIL 2026-08-08: the APP's name, not the machine's. This was
     // `computer?.name ? \`${computer.name} — Code\` : 'Code'`, which titled the
     // window "Computer — Code" for a computer named "Computer". See
@@ -278,13 +282,16 @@ export async function openCodeWindow (ctx = {}) {
     let attempt = 0;
     let running_signal;
     let disposed = false;
+    let stop_monitor = () => {};
 
     const stop_timers = () => {
+        stop_monitor(); stop_monitor = () => {};
         clearInterval(tick_timer); tick_timer = null;
         clearInterval(poll_timer); poll_timer = null;
     };
 
-    const progress = AppSpinner({ label: 'Opening Code…', onRetry: () => { void start_boot(); } });
+    const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
+    const progress = AppSpinner({ label: 'Opening Code…', onRetry: () => { void start_boot(); }, failureCopy: nativeFailureCopy });
     el_body.appendChild(progress.el);
 
     // ── the "editor is not reachable" panel ──────────────────────────────
@@ -368,7 +375,7 @@ export async function openCodeWindow (ctx = {}) {
         paint();
         tick_timer = setInterval(paint, TICK_MS);
 
-        poll_timer = setInterval(async () => {
+        if (!nativeSurface) poll_timer = setInterval(async () => {
             if ( disposed || my_attempt !== attempt ) return;
             const running = await session.desktopRunning(computer.id);
             if ( disposed || my_attempt !== attempt ) return;
@@ -382,12 +389,13 @@ export async function openCodeWindow (ctx = {}) {
         // 🔴 THE MINT. Exactly once per genuine window-open — see the file
         // header for the three structural properties this depends on.
         console.info(`[${PHASE}] minting a code-preview URL for computer ${computer.id} (budget ${DESKTOP_BOOT_TIMEOUT_MS}ms)`);
-        const res = await mintCodePreviewUrl(computer.id);
+        const res = await (nativeSurface ? nativeSurface.open(ctx.previewPort) : mintCodePreviewUrl(computer.id));
 
         if ( disposed || my_attempt !== attempt ) return;
         stop_timers();
 
         if ( ! res.ok ) {
+            if (nativeFailureCopy) Object.assign(nativeFailureCopy, editorFailureCopy(res.errorCode));
             // `code_preview_unavailable` is the one code that means "this
             // deployment/container cannot serve code-server at all" — the
             // honest "not available" panel, not a failure to retry. Mirrors
@@ -473,7 +481,7 @@ export async function openCodeWindow (ctx = {}) {
         const ask = async () => {
             if ( settled || disposed || my_attempt !== attempt ) return;
             asks++;
-            const seen = await session.confirmFrame(computer.id, el_iframe.src);
+            const seen = await (nativeSurface ? nativeSurface.confirm() : session.confirmFrame(computer.id, el_iframe.src, 'code'));
             if ( settled || disposed || my_attempt !== attempt ) return;
 
             if ( seen === undefined ) {
@@ -493,6 +501,12 @@ export async function openCodeWindow (ctx = {}) {
             if ( seen === true ) {
                 progress.el.hidden = true;
                 el_unavailable.hidden = true;
+                stop_monitor = watchNativeSurface(nativeSurface, reason => {
+                    if (disposed || my_attempt !== attempt) return;
+                    if (nativeFailureCopy) Object.assign(nativeFailureCopy, editorFailureCopy(reason || 'editor_connection_lost'));
+                    show_panel();
+                    progress.render(computeBootUiState({ requestStatus: 'success', elapsedMs: 0, frameConfirmed: false }));
+                });
                 console.info(`[${PHASE}] code frame confirmed by the server`);
                 // Terminal: a confirmed frame IS the whole verdict for this
                 // window — there is no separate display gate here.
@@ -527,7 +541,9 @@ export async function openCodeWindow (ctx = {}) {
     }
 
     const dispose = () => {
+        if (disposed) return;
         disposed = true;
+        nativeSurface?.dispose();
         stop_timers();
         window.removeEventListener('ezil:teardown', dispose);
         // The window can close mid-boot before any terminal point above ever

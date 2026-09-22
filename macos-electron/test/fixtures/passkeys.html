@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>EZiL passkey fixture</title>
+<style>body{font:18px system-ui;background:#edf5f4;color:#102f35;padding:32px}button,a{font:inherit;padding:12px;margin:6px}output{display:block;padding:24px;background:white;margin-top:24px}p{max-width:640px}</style>
+<h1>Passkey test — local fixture</h1>
+<p>Synthetic test account only. Automated results use a virtual authenticator, not Touch ID, iCloud or Google.</p>
+<button id="register">Create test passkey</button>
+<button id="authenticate">Sign in with test passkey</button>
+<button id="discover">Choose test account</button>
+<button id="wrong-rp">Reject wrong website</button>
+<button id="cancel">Cancel request</button>
+<a href="/popup" target="_blank">Open passkey test in new tab</a>
+<output id="result" role="status">Ready</output>
+<script>
+  const encode = value => btoa(String.fromCharCode(...new Uint8Array(value))).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+  const decode = value => Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/')), ch => ch.charCodeAt(0));
+  const post = async (path, value) => {
+    const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
+    if (!response.ok) throw Error('Fixture verification failed'); return response.json();
+  };
+  let controller;
+  document.querySelector('#cancel').onclick = () => controller?.abort();
+  for (const action of ['register', 'authenticate', 'discover', 'wrong-rp']) document.getElementById(action).onclick = async () => {
+    controller?.abort(); controller = new AbortController();
+    const signal = controller.signal, output = document.querySelector('#result'); output.textContent = 'Request pending';
+    try {
+      const options = await post('/options', { action });
+      const publicKey = { challenge: decode(options.challenge), timeout: 60000 };
+      let credential;
+      if (action === 'register') {
+        Object.assign(publicKey, { rp: { id: options.rpId, name: 'EZiL local test' },
+          user: { id: new TextEncoder().encode('ezil-synthetic-test'), name: 'synthetic@example.invalid', displayName: 'Synthetic test account' },
+          pubKeyCredParams: [{ type: 'public-key', alg: -7 }], attestation: 'none',
+          authenticatorSelection: { residentKey: 'required', userVerification: 'required' } });
+        credential = await navigator.credentials.create({ publicKey, signal });
+      } else {
+        Object.assign(publicKey, { rpId: options.rpId, userVerification: 'required', allowCredentials: action !== 'discover' && options.credentialId ? [{ type: 'public-key', id: decode(options.credentialId) }] : [] });
+        credential = await navigator.credentials.get({ publicKey, signal });
+      }
+      const response = credential.response;
+      const payload = { id: credential.id, clientDataJSON: encode(response.clientDataJSON), authenticatorData: encode(action === 'register' ? response.getAuthenticatorData() : response.authenticatorData),
+        ...(action === 'register' ? { publicKey: encode(response.getPublicKey()), algorithm: response.getPublicKeyAlgorithm() } : { signature: encode(response.signature) }) };
+      if (!(await post('/verify', payload)).verified) throw Error('Fixture verification failed');
+      output.textContent = action === 'register' ? 'Registration verified' : 'Assertion verified';
+    } catch (error) { output.textContent = error.name; }
+  };
+</script>

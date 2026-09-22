@@ -1,0 +1,8 @@
+:root { color-scheme: light dark; font: 15px -apple-system, BlinkMacSystemFont, sans-serif; background: light-dark(#f4f5f7, #1b1d22); color: light-dark(#232631, #eef0f5); }
+body { margin: 0; }
+main { padding: 24px; }
+h1 { font-size: 24px; margin: 0 0 12px; }
+p { line-height: 1.5; }
+button { font: inherit; border: 1px solid #8886; border-radius: 7px; padding: 8px 12px; margin: 4px 4px 4px 0; background: light-dark(white, #30333c); color: inherit; cursor: pointer; }
+button:focus-visible { outline: 2px solid #5279e7; outline-offset: 2px; }
+#status { min-height: 18px; }
