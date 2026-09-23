@@ -4,7 +4,11 @@
     "private": true,
     "license": "AGPL-3.0-only",
     "scripts": {
-        "dev": "next dev --webpack",
+        "dev": "bun run dev:doctor && next dev --webpack --hostname 127.0.0.1",
+        "dev:setup": "bun --no-env-file scripts/local-web.ts setup",
+        "dev:doctor": "bun --no-env-file scripts/local-web.ts doctor",
+        "dev:verify": "bun --no-env-file scripts/local-web.ts verify",
+        "dev:stop": "bun --no-env-file scripts/local-web.ts stop",
         "build": "next build --webpack",
         "start": "next start",
         "lint": "eslint",
@@ -35,6 +39,7 @@
         "zod": "^3.24.1"
     },
     "devDependencies": {
+        "@next/env": "16.2.12",
         "@tailwindcss/postcss": "^4",
         "@types/node": "^20",
         "@types/react": "^19",
@@ -42,6 +47,7 @@
         "drizzle-kit": "^0.30.1",
         "eslint": "^9",
         "eslint-config-next": "16.2.12",
+        "supabase": "2.65.2",
         "tailwindcss": "^4",
         "typescript": "^5",
         "vitest": "^3.2.6"

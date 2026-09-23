@@ -344,6 +344,7 @@ GEOMETRY_SUITES=(
 )
 PORTABLE_SUITES=(
     "shell/touch-focus-browser-test.mjs"
+    "shell/ezil/apps/app-store-browser-test.mjs"
     "shell/ezil/apps/os-chrome-browser-test.mjs"
     "shell/ezil/apps/mobile-browser-test.mjs"
     "shell/ezil/ui/Settings/stacking-browser-test.mjs"

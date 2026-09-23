@@ -13,10 +13,9 @@
 // stub in `../../src/ezil-stubs.js` and this file is what the shell uses
 // instead.
 //
-// It is a static array because that is the honest shape. EZiL's shell has no
-// app store to query and no remote manifest to fetch: the set of things it can
-// open is fixed at build time, and pretending otherwise would mean a network
-// round trip whose answer never changes.
+// The built-in launchers are a static array. The shell-local App Store
+// browses these tools and planned integrations; repository installation and
+// a server-managed marketplace catalog are separate, unfinished capabilities.
 //
 // ── The one rule, and its one exception ─────────────────────────────────────
 // 🔴 A HOSTED entry exists only if BOTH sides agree it can be launched today:
@@ -62,6 +61,7 @@
 import { openDesktopWindow } from './desktop-window.js';
 import { openPreviewWindow } from './preview.js';
 import { openCodeWindow } from './code.js';
+import { openAppStoreWindow } from './app-store.js';
 import { openSecureBrowser } from './native.js';
 import { isNative } from '../native-runtime.js';
 import { openSettingsWindow } from '../ui/Settings/index.js';
@@ -258,6 +258,11 @@ const CODE_ICON = appIcon('ezg-code', '#a274f5', '#5b2ec4',
     + '<path d="M26.6 13.6 21.4 34.4" stroke-width="3"/>'
     + '</g>');
 
+const APP_STORE_ICON = appIcon('ezg-app-store', '#658ff6', '#3555b4',
+    `<g fill="none" stroke="${GLYPH}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">`
+    + '<path d="M12 18h24l2 21H10l2-21Z"/><path d="M18 19v-5a6 6 0 0 1 12 0v5"/>'
+    + '<path d="m19 28 4 4 7-8"/></g>');
+
 /**
  * @typedef {object} AppDescriptor
  * @property {string} id             Matches `data-app` on the window and the taskbar item.
@@ -321,6 +326,15 @@ export const APPS = [
         // calls out as fire-and-forget. See `owns_boot_trace`'s own doc.
         owns_boot_trace: true,
         open: openDesktopWindow,
+    },
+    {
+        id: 'app-store', name: 'App Store', icon: APP_STORE_ICON,
+        pinned: true, single_instance: true, shell_local: true,
+        open: ctx => openAppStoreWindow({
+            ...ctx,
+            apps: resolve(ctx.payload),
+            launchApp: id => launch(id, ctx),
+        }),
     },
     {
         id: 'settings',
@@ -518,7 +532,7 @@ export function resolve (payload) {
     // Native development has no container provisioning gate. Keep its core
     // tools reachable directly from the dock, including after window close.
     if (payload?.desktopState?.provider === 'native-macos') {
-        const order = ['desktop', 'secure-browser', 'code', 'preview', 'settings'];
+        const order = ['desktop', 'secure-browser', 'code', 'preview', 'app-store', 'settings'];
         return allowed.map(a => ({ ...a, pinned: true })).sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
     }
     return allowed;

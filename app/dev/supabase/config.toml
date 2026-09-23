@@ -1,0 +1,52 @@
+# Pinned to Supabase CLI 2.65.2. This is an unlinked, local-only project.
+project_id = "ezil-os-web-dev"
+
+[api]
+enabled = true
+port = 55321
+schemas = ["public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 55322
+shadow_port = 55320
+major_version = 17
+
+# The setup command journals the existing app/drizzle SQL transactionally.
+# Never replay these through db reset/push or against a hosted project.
+[db.migrations]
+enabled = false
+[db.seed]
+enabled = false
+
+[auth]
+enabled = true
+site_url = "http://127.0.0.1:3000"
+additional_redirect_urls = []
+jwt_expiry = 3600
+enable_signup = false
+enable_anonymous_sign_ins = false
+minimum_password_length = 12
+
+[auth.email]
+# In CLI 2.65.2 this also controls whether email/password login is enabled.
+# Keep the email provider enabled; auth.enable_signup=false above blocks signup.
+enable_signup = true
+enable_confirmations = true
+
+# This milestone needs Postgres, Auth, Kong, and PostgREST only.
+[studio]
+enabled = false
+port = 55323
+[inbucket]
+enabled = false
+port = 55324
+[realtime]
+enabled = false
+[storage]
+enabled = false
+[edge_runtime]
+enabled = false
+[analytics]
+enabled = false

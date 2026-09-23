@@ -231,3 +231,17 @@ anyone relies on an assumed license:
   unendorsed. Both requirements are discharged in §1 and in `NOTICE`.
 - Anything that could not be independently confirmed is marked
   **UNVERIFIED** above, with what was checked, rather than guessed at.
+
+---
+
+## 7. Local web development tooling
+
+| Package | License | Used for |
+|---|---|---|
+| [`supabase`](https://github.com/supabase/cli) 2.65.2 | MIT | Starts the dedicated local Auth/Postgres project; development only |
+| [`@next/env`](https://github.com/vercel/next.js/tree/v16.2.12/packages/next-env) 16.2.12 | MIT | Loads Next.js environment files for development configuration checks |
+
+The licenses and versions were checked in the installed packages' own
+`package.json` files. Both are pinned development dependencies in
+`app/package.json` and `app/bun.lock`; no upstream source was copied into
+the application.

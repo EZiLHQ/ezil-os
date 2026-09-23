@@ -376,7 +376,7 @@ for ( const shape of SHAPES ) {
 const FLICKER_SETTLE_MS = 210;
 
 /** One minimise + restore, sampled across the restore. */
-const cycle = (page) => page.evaluate(async () => {
+const cycle = (page) => page.evaluate(async ({ settle_ms }) => {
     const el = document.querySelector('.window[data-app="desktop"]');
     el.querySelector('.window-head .window-minimize-btn')?.click();
     await new Promise((r) => setTimeout(r, 650));
@@ -388,20 +388,29 @@ const cycle = (page) => page.evaluate(async () => {
     const t0 = performance.now();
     document.querySelector('.taskbar-item[data-app="desktop"]')
         ?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    for ( let i = 0; i < 32; i++ ) {
+    const measure = () => {
         const r = el.getBoundingClientRect();
-        samples.push({ t: performance.now() - t0, w: Math.round(r.width), h: Math.round(r.height) });
+        return { t: performance.now() - t0, w: Math.round(r.width), h: Math.round(r.height),
+            fullbleed: el.classList.contains('ezil-fullbleed') };
+    };
+    // A 20ms polling loop can stop at 192ms before its next sample passes
+    // 210ms. Measure the checkpoint itself, before the 220ms full-bleed
+    // callback can conceal a wrong restore target.
+    const checkpoint = new Promise(resolve => setTimeout(() => resolve(measure()),
+        Math.max(0, settle_ms - (performance.now() - t0))));
+    for ( let i = 0; i < 32; i++ ) {
+        samples.push(measure());
         await new Promise((r2) => setTimeout(r2, 20));
     }
     const final = samples[samples.length - 1];
-    const settled = samples.filter((s) => s.t <= 210).pop() ?? samples[0];
+    const settled = await checkpoint;
+    const after = [settled, ...samples.filter(s => s.t > settled.t)];
     let snap = 0;
-    for ( let i = 1; i < samples.length; i++ ) {
-        if ( samples[i].t <= 210 ) continue;
-        snap = Math.max(snap, Math.abs(samples[i].w - samples[i - 1].w));
+    for ( let i = 1; i < after.length; i++ ) {
+        snap = Math.max(snap, Math.abs(after[i].w - after[i - 1].w));
     }
     return { orig, final, settled, snap };
-});
+}, { settle_ms: FLICKER_SETTLE_MS });
 
 for ( const shape of [SHAPES[0], SHAPES[1], SHAPES[4]] ) {
     const L = `[flicker ${shape.label}]`;
@@ -412,7 +421,7 @@ for ( const shape of [SHAPES[0], SHAPES[1], SHAPES[4]] ) {
         c1.orig.w === c1.final.w && c1.orig.w > 0,
         `snapshot=${c1.orig.w}x${c1.orig.h} final=${c1.final.w}x${c1.final.h}`);
     push(`${L} 🔴 settled at its final size by ${FLICKER_SETTLE_MS}ms — nothing left to snap to`,
-        c1.settled.w === c1.final.w, JSON.stringify({ settled: c1.settled, final: c1.final }));
+        !c1.settled.fullbleed && c1.settled.w === c1.final.w, JSON.stringify({ settled: c1.settled, final: c1.final }));
     push(`${L} 🔴 no single-frame jump after the transition (the snap itself)`,
         c1.snap === 0, `largest post-transition frame delta = ${c1.snap}px`);
 
@@ -422,7 +431,7 @@ for ( const shape of [SHAPES[0], SHAPES[1], SHAPES[4]] ) {
     for ( let i = 0; i < 3; i++ ) {
         const c = await cycle(page);
         worst = Math.max(worst, c.snap);
-        if ( c.settled.w !== c.final.w ) mismatched++;
+        if ( c.settled.fullbleed || c.settled.w !== c.final.w ) mismatched++;
     }
     push(`${L} 🔴 three back-to-back minimise/restore cycles never snap`,
         worst === 0 && mismatched === 0, `worst delta=${worst}px, unsettled cycles=${mismatched}`);

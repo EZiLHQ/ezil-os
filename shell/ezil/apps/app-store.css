@@ -1,0 +1,138 @@
+/* EZiL-authored. Scoped to the App Store; picked up by build-shell.sh. */
+.ezil-store-window .window-body { background: var(--color-charcoal); color: var(--color-offwhite); }
+.ezil-store { height: 100%; container: app-store / inline-size; font-size: 13px; }
+.ezil-store *, .ezil-store *::before, .ezil-store *::after { box-sizing: border-box; }
+.ezil-store button, .ezil-store input { font: inherit; }
+.ezil-store button { cursor: pointer; }
+.ezil-store button:disabled { cursor: wait; opacity: .6; }
+.ezil-store button:focus-visible, .ezil-store a:focus-visible { outline: 2px solid #68d8d5; outline-offset: 3px; }
+.ezil-store h1:focus { outline: none; }
+.ezil-store svg { width: 18px; height: 18px; flex-shrink: 0; }
+.ezil-store-layout { display: grid; grid-template-columns: 174px minmax(0, 1fr); height: 100%; }
+.ezil-store-sidebar { display: flex; flex-direction: column; padding: 24px 12px 18px; background: #1b1d1d; border-right: 1px solid #ffffff0d; }
+.ezil-store-brand { display: flex; align-items: center; gap: 10px; padding: 0 6px 28px; font-size: 15px; font-weight: 600; }
+.ezil-store-brand img { width: 34px; height: 34px; }
+.ezil-store-brand small { display: block; margin-top: 4px; font-size: 10px; font-weight: 400; color: #949d9b; letter-spacing: .06em; }
+.ezil-store-sidebar nav { display: grid; gap: 6px; }
+.ezil-store-sidebar nav button { display: flex; align-items: center; gap: 10px; padding: 11px 12px; border: 0; border-radius: 7px; color: #b3bcba; background: transparent; text-align: left; white-space: nowrap; }
+.ezil-store-sidebar nav button:hover { background: #ffffff08; }
+.ezil-store-sidebar nav button[aria-pressed="true"] { background: #00adb51a; color: #8be1df; }
+.ezil-store-nav-count { margin-left: auto; font-size: 11px; color: #a1aaa8; }
+.ezil-store-sidebar-note { margin: auto 6px 0; padding-top: 24px; color: #b3bcba; font-size: 11px; line-height: 1.8; }
+.ezil-store-sidebar-note span { color: #858f8d; }
+.ezil-store-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.ezil-store-toolbar { display: flex; align-items: center; gap: 24px; min-height: 66px; padding: 14px 28px; border-bottom: 1px solid #ffffff0d; }
+.ezil-store-search { display: flex; align-items: center; gap: 9px; width: 310px; max-width: 100%; min-width: 0; padding: 0 10px; border: 1px solid #ffffff16; border-radius: 7px; color: #9aa5a2; background: #1f2221; }
+.ezil-store-search:focus-within { border-color: #63c9c6; box-shadow: 0 0 0 2px #00adb518; }
+.ezil-store-search input { width: 100%; min-width: 0; height: 34px; padding: 0; border: 0; outline: 0; background: transparent; color: var(--color-offwhite); box-shadow: none; }
+.ezil-store-search input::placeholder { color: #929d99; }
+.ezil-store-search input::-webkit-search-cancel-button { display: none; }
+.ezil-store-search button { padding: 0 3px; border: 0; background: transparent; color: #adb8b4; font-size: 20px; }
+.ezil-store-computer { display: flex; align-items: center; gap: 7px; margin-left: auto; min-width: 0; max-width: 180px; color: #9aa5a2; font-size: 11px; }
+.ezil-store-computer span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ezil-store-content { flex: 1; min-height: 0; overflow: auto; padding: 27px 28px 20px; overscroll-behavior: contain; scrollbar-color: #515956 transparent; scrollbar-width: thin; }
+.ezil-store-page-heading h1 { margin: 0; font-size: 25px; font-weight: 600; letter-spacing: -.6px; }
+.ezil-store-page-heading p { margin: 7px 0 21px; color: #a0aaa7; font-size: 12px; }
+.ezil-store-hero { position: relative; display: flex; align-items: center; justify-content: space-between; min-height: 180px; overflow: hidden; padding: 20px 26px; border: 1px solid #73cbb51e; border-radius: 12px; background: radial-gradient(ellipse at 84% 35%, #255c534f, transparent 67%), linear-gradient(115deg, #203c37, #1c2827); }
+.ezil-store-eyebrow { color: #a7d8c8; font-size: 9px; letter-spacing: .1em; font-weight: 600; }
+.ezil-store-hero h2 { margin: 11px 0 8px; color: #eef6f0; font-size: 33px; line-height: 1.12; letter-spacing: -1px; font-weight: 500; }
+.ezil-store-hero p { margin: 0 0 15px; color: #adcbc1; font-size: 12px; }
+.ezil-store-hero button { display: inline-flex; align-items: center; gap: 9px; padding: 0; border: 0; background: transparent; color: #d3efde; font-size: 11px; font-weight: 600; }
+.ezil-store-hero button svg { width: 15px; height: 15px; }
+.ezil-store-hero-art { position: relative; width: 200px; height: 140px; flex-shrink: 0; margin-right: 6px; }
+.ezil-store-hero-art::before, .ezil-store-hero-art::after { content: ''; position: absolute; inset: 8px -15px; border: 1px solid #b5dcc512; border-radius: 50%; transform: rotate(-30deg); }
+.ezil-store-hero-art::after { inset: -30px -30px; }
+.ezil-store-icon { display: block; width: 42px; height: 42px; flex-shrink: 0; border-radius: 10px; }
+.ezil-store-hero-art .ezil-store-icon { position: absolute; width: 68px; height: 68px; box-shadow: 0 12px 20px #0005; z-index: 1; }
+.ezil-store-hero-art .ezil-store-icon:nth-child(1) { left: 58px; top: 6px; transform: rotate(-10deg); }
+.ezil-store-hero-art .ezil-store-icon:nth-child(2) { left: 9px; top: 83px; transform: rotate(-15deg); }
+.ezil-store-hero-art .ezil-store-icon:nth-child(3) { left: 114px; top: 73px; transform: rotate(12deg); }
+.ezil-store-monogram { display: grid; place-items: center; background: #e0e8df; color: #26372e; font-size: 23px; font-weight: 600; }
+.ezil-store-categories { display: flex; flex-wrap: wrap; gap: 6px; margin: 23px 0 20px; }
+.ezil-store-categories button { padding: 7px 12px; border: 1px solid transparent; border-radius: 18px; color: #aeb7b4; background: transparent; font-size: 11px; }
+.ezil-store-categories button:hover { color: #e6eeeb; background: #ffffff08; }
+.ezil-store-categories button[aria-pressed="true"] { border-color: #ffffff15; background: #2b302e; color: #e6eeeb; }
+.ezil-store-section-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+.ezil-store-section-heading h2 { margin: 0; font-size: 15px; font-weight: 500; }
+.ezil-store-section-heading > span { color: #99a49f; font-size: 11px; }
+.ezil-store-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
+.ezil-store-card { display: flex; flex-direction: column; min-width: 0; padding: 17px; border: 1px solid #ffffff12; border-radius: 11px; background: #1d201f; transition: border-color .15s, background .15s; }
+.ezil-store-card:hover { border-color: #ffffff27; background: #212523; }
+.ezil-store-card-heading { display: flex; align-items: center; gap: 11px; }
+.ezil-store-card-heading > div { min-width: 0; }
+.ezil-store-card h3 { margin: 0 0 4px; font-size: 14px; line-height: 1.3; font-weight: 600; }
+.ezil-store-category { color: #9fa9a5; font-size: 10px; }
+.ezil-store-badge { display: inline-block; color: #9cafaa; font-size: 9px; font-weight: 500; white-space: nowrap; }
+.ezil-store-card-heading > .ezil-store-badge { margin-left: auto; align-self: flex-start; padding-top: 3px; }
+.ezil-store-badge-planned { padding: 3px 6px; border-radius: 4px; background: #cfae6517; color: #d7bb86; }
+.ezil-store-card p { flex: 1; margin: 15px 0 18px; color: #b0b9b5; font-size: 12px; line-height: 1.65; }
+.ezil-store-card-actions { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.ezil-store-details { display: inline-flex; align-items: center; gap: 5px; padding: 6px 0; border: 0; background: transparent; color: #aebbb5; font-size: 11px !important; }
+.ezil-store-details svg { width: 13px; height: 13px; }
+.ezil-store-details:hover { color: #e4f7ee; }
+.ezil-store-open { min-width: 63px; padding: 7px 15px; border: 1px solid #7ce0d333; border-radius: 16px; background: #4cbbb920; color: #8ee3d8; font-size: 11px !important; font-weight: 600 !important; }
+.ezil-store-open:hover { border-color: #7ce0d377; background: #4cbbb937; }
+.ezil-store-unavailable { color: #a5aaa1; font-size: 10px; }
+.ezil-store-footer { margin: 24px 0 0; padding-top: 15px; border-top: 1px solid #ffffff0c; color: #96a19b; font-size: 11px; line-height: 1.7; }
+.ezil-store-status { flex-shrink: 0; padding: 10px 28px; color: #e4bf90; background: #332a20; font-size: 12px; line-height: 1.5; }
+.ezil-store-status:empty { display: none; }
+.ezil-store-empty { padding: 30px 15px; text-align: center; }
+.ezil-store-empty > svg { width: 28px; height: 28px; color: #9dafaa; }
+.ezil-store-empty h2 { margin: 15px 0 8px; font-size: 17px; }
+.ezil-store-empty p { color: #aab7b1; margin-bottom: 20px; }
+.ezil-store-back { display: inline-block; padding: 5px 0; margin-bottom: 28px; border: 0; background: transparent; color: #b8c6bd; font-size: 12px !important; }
+.ezil-store-detail-heading { display: flex; gap: 20px; align-items: center; }
+.ezil-store-detail-heading > .ezil-store-icon { width: 80px; height: 80px; border-radius: 18px; font-size: 42px; }
+.ezil-store-detail-heading h1 { margin: 7px 0; font-size: 30px; font-weight: 600; letter-spacing: -.7px; }
+.ezil-store-detail-heading p { margin: 0; color: #b1bdb6; line-height: 1.6; }
+.ezil-store-detail-action { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; margin: 25px 0; }
+.ezil-store-detail-action > span { color: #a8b3ac; font-size: 11px; }
+.ezil-store-detail-action .ezil-store-open { min-width: 100px; }
+.ezil-store-detail-action .ezil-store-unavailable { padding: 8px 12px; border: 1px solid #ffffff1c; border-radius: 16px; }
+.ezil-store-notice { padding: 13px 15px; border: 1px solid #d7bb8624; border-radius: 7px; color: #d7c6a2; background: #cfae650a; font-size: 12px; line-height: 1.6; }
+.ezil-store-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; padding: 20px 0; margin: 0 0 24px; border-top: 1px solid #ffffff12; border-bottom: 1px solid #ffffff12; }
+.ezil-store-facts dt { margin-bottom: 7px; color: #98a49c; font-size: 11px; }
+.ezil-store-facts dd { margin: 0; color: #dbe4dd; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.ezil-store-detail-section { margin: 24px 0; max-width: 610px; }
+.ezil-store-detail-section h2 { margin: 0 0 10px; font-size: 15px; font-weight: 500; }
+.ezil-store-detail-section p { margin: 0; color: #aebcb2; font-size: 13px; line-height: 1.85; }
+.ezil-store-source { display: inline-block; margin: 0 0 12px; color: #8ee3d8; font-size: 12px; text-decoration: none; }
+.ezil-store-source:hover { text-decoration: underline; }
+@container app-store (max-width: 760px) {
+    .ezil-store-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+    .ezil-store-sidebar { flex-direction: row; align-items: center; padding: 9px 20px; border-right: 0; border-bottom: 1px solid #ffffff0d; }
+    .ezil-store-brand { padding: 0; margin-right: auto; font-size: 12px; }
+    .ezil-store-brand img { width: 28px; height: 28px; }
+    .ezil-store-brand small, .ezil-store-sidebar-note { display: none; }
+    .ezil-store-sidebar nav { display: flex; gap: 4px; }
+    .ezil-store-sidebar nav button { padding: 9px 11px; font-size: 12px; }
+    .ezil-store-sidebar nav svg { width: 15px; height: 15px; }
+    .ezil-store-nav-count { margin-left: 0; }
+    .ezil-store-toolbar { gap: 16px; min-height: 58px; padding: 12px 22px; }
+    .ezil-store-content { padding: 24px 22px 20px; }
+}
+@container app-store (max-width: 540px) {
+    .ezil-store-sidebar { padding: 8px 14px; }
+    .ezil-store-brand span { display: none; }
+    .ezil-store-toolbar { padding: 12px 18px; }
+    .ezil-store-computer { display: none; }
+    .ezil-store-search { width: 100%; }
+    .ezil-store-content { padding: 22px 18px; }
+    .ezil-store-page-heading h1 { font-size: 23px; }
+    .ezil-store-hero { min-height: 185px; padding: 22px; }
+    .ezil-store-hero h2 { font-size: 31px; }
+    .ezil-store-hero-art { width: 100px; margin-right: -8px; }
+    .ezil-store-hero-art .ezil-store-icon { width: 43px; height: 43px; }
+    .ezil-store-hero-art .ezil-store-icon:nth-child(1) { left: 32px; top: 25px; }
+    .ezil-store-hero-art .ezil-store-icon:nth-child(2) { left: 1px; top: 89px; }
+    .ezil-store-hero-art .ezil-store-icon:nth-child(3) { left: 58px; top: 100px; }
+    .ezil-store-grid { grid-template-columns: minmax(0, 1fr); }
+    .ezil-store-categories { gap: 3px; }
+    .ezil-store-categories button { padding: 7px 9px; }
+    .ezil-store-card { padding: 17px; }
+    .ezil-store-detail-heading { align-items: flex-start; gap: 14px; }
+    .ezil-store-detail-heading > .ezil-store-icon { width: 58px; height: 58px; font-size: 32px; }
+    .ezil-store-detail-heading h1 { font-size: 25px; }
+    .ezil-store-facts { gap: 10px; }
+}
+@media (prefers-reduced-motion: reduce) { .ezil-store-card { transition: none; } }

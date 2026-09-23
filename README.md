@@ -1,5 +1,6 @@
 <div align="center">
-<img width="800" alt="EZiL-OS — a real Linux desktop streamed into the browser" src="docs/assets/hero.jpg">
+<img width="800" alt="EZiL-OS App Store open on the desktop, showing Discover, categories and included apps" src="docs/assets/app-store.jpg">
+<p><em>App Store in the local web preview. Repository installation is not available yet.</em></p>
 <h3 align="center">EZiL-OS</h3>
   <p align="center">
     <strong>A real desktop — in your browser, or locally on your Mac.</strong>
@@ -160,14 +161,16 @@ bun run typecheck
 bun run test
 ```
 
-**The app** — the Next.js front door. Copy `app/.env.example` to `.env.local`
-first; `app/src/env.ts` validates the full set at boot and fails loudly if one
-is missing.
+**The app** — the Next.js front door. For local Auth, Postgres, and the OS shell,
+start Docker and use the [local web setup](docs/LOCAL-WEB.md). It needs no cloud
+credentials. For an authorized hosted environment, configure `app/.env.local`
+from `app/.env.example` instead; production validation remains fail-closed.
 
 ```bash
 cd app
-bun install
-bun run dev          # next dev
+bun install --frozen-lockfile
+bun run dev:setup    # local Supabase and two invited test accounts
+bun run dev          # checked config, then http://127.0.0.1:3000/login
 bun run typecheck
 bun run lint
 bun run test

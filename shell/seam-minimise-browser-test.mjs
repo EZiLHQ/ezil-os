@@ -339,20 +339,28 @@ const minimiseRestoreTimeline = async () => {
         const t0 = performance.now();
         document.querySelector('.taskbar-item[data-app="desktop"]')
             .dispatchEvent(new MouseEvent('click', { bubbles: true }));
-        for ( let i = 0; i < 30; i++ ) {
+        const measure = () => {
             const r = el.getBoundingClientRect();
-            samples.push({ t: performance.now() - t0, w: Math.round(r.width), h: Math.round(r.height) });
+            return { t: performance.now() - t0, w: Math.round(r.width), h: Math.round(r.height),
+                fullbleed: el.classList.contains('ezil-fullbleed') };
+        };
+        // Polling every 20ms can select a 192ms sample for a 210ms assertion.
+        // Capture the checkpoint directly and reject a late measurement
+        // taken after go_fullbleed could have hidden the original defect.
+        const checkpoint = new Promise(resolve => setTimeout(() => resolve(measure()),
+            Math.max(0, settle_ms - (performance.now() - t0))));
+        for ( let i = 0; i < 30; i++ ) {
+            samples.push(measure());
             await new Promise((r2) => setTimeout(r2, 20));
         }
         const final = samples[samples.length - 1];
-        // The last sample at or before the transition should have finished.
-        const settled = samples.filter((s) => s.t <= settle_ms).pop() ?? samples[0];
+        const settled = await checkpoint;
+        const after = [settled, ...samples.filter(s => s.t > settled.t)];
         // The largest single-frame growth AFTER the transition is over — the
-        // snap. Zero when the restore animated to the right size all along.
+        // snap. Do not include an interval that began during the animation.
         let snap = 0;
-        for ( let i = 1; i < samples.length; i++ ) {
-            if ( samples[i].t <= settle_ms ) continue;
-            snap = Math.max(snap, samples[i].w - samples[i - 1].w);
+        for ( let i = 1; i < after.length; i++ ) {
+            snap = Math.max(snap, after[i].w - after[i - 1].w);
         }
         return { orig, final, settled, snap, viewport: { w: innerWidth, h: innerHeight } };
     }, { settle_ms: FLICKER_SETTLE_MS });
@@ -366,7 +374,7 @@ push('🔴 GROUP 5 ACCEPTANCE (root cause): hideWindow snapshotted the window\'s
     JSON.stringify({ snapshot: flick.orig, viewport: flick.viewport }));
 push(`🔴 GROUP 5 ACCEPTANCE (the flicker): the window is at its FINAL size by ${FLICKER_SETTLE_MS}ms — `
     + `already settled before go_fullbleed's ${GO_FULLBLEED_MS}ms timer, so there is nothing left to snap to`,
-    flick.settled.w === flick.final.w,
+    !flick.settled.fullbleed && flick.settled.w === flick.final.w,
     JSON.stringify({ settled: flick.settled, final: flick.final }));
 push('GROUP 5: no single-frame jump after the restore transition is over (the snap itself)',
     flick.snap === 0, `largest post-transition frame growth = ${flick.snap}px`);
@@ -388,7 +396,7 @@ await page.evaluate(() => {
 const flick_mutated = await minimiseRestoreTimeline();
 push('🔴 GROUP 5 MUTATION PROOF: restoring the geometry reset on the minimise path brings the '
     + 'flicker straight back — the window settles at the WRONG size and then snaps',
-    flick_mutated.settled.w !== flick_mutated.final.w && flick_mutated.snap > 0,
+    !flick_mutated.settled.fullbleed && flick_mutated.settled.w !== flick_mutated.final.w && flick_mutated.snap > 0,
     JSON.stringify({ settled: flick_mutated.settled, final: flick_mutated.final, snap: flick_mutated.snap }));
 await page.evaluate(() => { window.exit_fullpage_chrome = window.__ezil_real_chrome; });
 

@@ -12,16 +12,22 @@ guessing.
 
 ## What an app is here
 
-There is no app store and no remote manifest. The set of things the shell can
-open is a static array, `APPS`, built into the bundle at build time
-(`shell/ezil/apps/registry.js:286-409`). The file's own header explains why:
-"EZiL's shell has no app store to query and no remote manifest to fetch: the
-set of things it can open is fixed at build time, and pretending otherwise
-would mean a network round trip whose answer never changes"
-(`registry.js:15-18`).
+The **App Store** is a pinned, shell-local window available from the dock and
+launcher. It provides search, category filters, Your apps, app details, and
+Open actions for the built-in tools. Its catalog is derived from
+`registry.resolve(payload)`, so a hosted launcher that the server withholds
+does not become available through the store. Browsing does not start compute.
 
-An "app" is therefore one entry in that array — an **`AppDescriptor`** — plus
-an `open(ctx)` function that builds a real DOM window and returns it.
+Repository installation and a server-managed marketplace are not implemented
+by this UI. Reticle is explicitly a planned integration with no Install or
+Open action. It has a text monogram, not an approved publisher logo. The store
+does not create installations, store grants, or claim that a healthy runtime
+exists. Its implementation is in `shell/ezil/apps/app-store.js` and
+`shell/ezil/apps/app-store.css`.
+
+The launchable tools remain a static `APPS` array in
+`shell/ezil/apps/registry.js`. An app is an **`AppDescriptor`** plus an
+`open(ctx)` function that builds a real DOM window and returns it.
 
 ## The `AppDescriptor` fields
 
@@ -39,10 +45,22 @@ The full shape is documented as a JSDoc `@typedef` at `registry.js:260-282`:
 | `owns_boot_trace` | `boolean?` | `open()` returning does *not* mean the boot is over — this app finishes its own trace later, at its real terminal state. See "The boot-trace contract" below. |
 | `open` | `(ctx: object) => Promise<HTMLElement\|null>` | Builds the window and returns it, or `null` if nothing opened. |
 
-The four real entries — `desktop`, `settings`, `preview`, `code`
-(`registry.js:287-408`) — are the worked examples for every field above; read
-one alongside this table if a field's purpose isn't clear from the table
-alone.
+The `desktop`, `settings`, `preview`, `code`, and `app-store` entries are
+worked examples. `secure-browser` is additionally available in native mode.
+The App Store receives the resolved descriptors and a registry launch
+callback; it does not import the registry back into itself.
+
+Its Chromium acceptance suite, `shell/ezil/apps/app-store-browser-test.mjs`,
+covers dock/launcher reachability, single-window behavior, real Settings
+launching, search/filter recovery, honest Reticle availability, served-app
+gating, safe text rendering, and narrow/phone layouts. These fixture checks
+are separate from testing the actual authenticated `/os` page locally.
+
+The store's layout was informed by Mobbin's
+[Midday catalog](https://mobbin.com/screens/03313f42-04ef-4481-80db-96429e4a63c7),
+[Whop app details](https://mobbin.com/flows/43619177-c143-488a-a7e8-a5837e2b4621),
+and [Wix app management](https://mobbin.com/screens/bf925a98-967d-4b13-8447-e24c748bd2a6).
+No reference screenshots or third-party brand assets are bundled.
 
 ### Icons
 
