@@ -28,19 +28,36 @@ bundle talking to the Worker.
 
 ## Running it
 
-Needs a Supabase Postgres instance. Copy `.env.example` to `.env.local` and fill
-it in — `src/env.ts` validates the full set eagerly at boot and fails loudly if
-one is missing.
+For an authenticated local web environment, start Docker and use the pinned
+local Supabase setup. It creates two invited test accounts and applies the
+existing migrations only to its dedicated local database:
 
 ```bash
-bun install
-bun run dev          # next dev
+bun install --frozen-lockfile
+bun run dev:setup
+bun run dev:doctor   # names-only configuration and local service checks
+bun run dev          # http://127.0.0.1:3000/login
+```
+
+Sign in with either account in `.local-web/accounts.json` (generated, ignored,
+owner-only). See [the local web guide](../docs/LOCAL-WEB.md) for prerequisites,
+two-user acceptance, stopping/restarting, and configuration conflicts.
+This runs real Auth, Postgres, and the OS shell. Browser and Code honestly
+report that the cloud desktop provider is unconfigured.
+
+For an existing authorized hosted development environment, copy `.env.example`
+to `.env.local` and fill it in instead; local setup refuses to overwrite it.
+`src/env.ts` still validates production configuration eagerly and fails closed.
+
+```bash
 bun run typecheck    # tsc --noEmit
 bun run lint         # eslint
 bun run test         # vitest run
 bun run build        # next build — run this before opening a PR that touches app/
 bun run db:generate  # drizzle-kit generate, after a schema change
 ```
+
+Use `../tools/test.sh app` for the complete required check sequence.
 
 `next dev`/`next build` deliberately pass `--webpack`: Next.js 16 with Turbopack
 breaks Vercel packaging for this project. That, and every other platform sharp

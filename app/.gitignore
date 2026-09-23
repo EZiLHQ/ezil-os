@@ -45,3 +45,8 @@ next-env.d.ts
 # local verification scratch scripts (read .env.local)
 dbq.mjs
 signup.mjs
+
+# Dedicated local Supabase state and generated test-account credentials
+/.local-web/
+/dev/supabase/.temp/
+/dev/supabase/.branches/

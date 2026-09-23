@@ -208,13 +208,14 @@ bun run typecheck          # tsc --noEmit
 bun run test                # bun test
 ```
 
-`app/` is a Next.js project (needs a Supabase Postgres instance — see
-`app/src/env.ts` for the required environment variables):
+`app/` is a Next.js project. For real local Auth and Postgres, follow
+[`docs/LOCAL-WEB.md`](docs/LOCAL-WEB.md); no production credentials are needed:
 
 ```bash
 cd app
-bun install
-bun run dev                # next dev
+bun install --frozen-lockfile
+bun run dev:setup          # dedicated local Supabase, schema, two invited users
+bun run dev                # checked configuration, then next dev on loopback
 bun run typecheck          # tsc --noEmit
 bun run lint                # eslint
 bun run test                # vitest run
