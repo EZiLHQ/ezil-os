@@ -707,9 +707,9 @@ function close_start_menu () {
 
 /**
  * The Start button's menu. Upstream opened a 500x500 popover backed by
- * `puter.apps` (recents, recommendations, search, drag-to-pin). There is no
- * app store to query, so this lists exactly what `registry.resolve()` returned
- * — today, one thing — using the ported context menu.
+ * `puter.apps` (recents, recommendations, search, drag-to-pin). This lists
+ * the launchers returned by `registry.resolve()`, including App Store,
+ * using the ported context menu.
  *
  * 🔴 THE TOGGLE. Callers must check `start_menu` themselves before calling
  * this (the `ezil:start-click` listener below does) — this function's job is

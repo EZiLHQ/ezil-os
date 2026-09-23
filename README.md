@@ -1,5 +1,6 @@
 <div align="center">
-<img width="800" alt="EZiL-OS — a real Linux desktop streamed into the browser" src="docs/assets/hero.jpg">
+<img width="800" alt="EZiL-OS App Store open on the desktop, showing Discover, categories and included apps" src="docs/assets/app-store.jpg">
+<p><em>App Store in the local web preview. Repository installation is not available yet.</em></p>
 <h3 align="center">EZiL-OS</h3>
   <p align="center">
     <strong>A real desktop — in your browser, or locally on your Mac.</strong>

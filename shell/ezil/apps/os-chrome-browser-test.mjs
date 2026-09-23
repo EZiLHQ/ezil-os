@@ -507,16 +507,17 @@ async function scenarioChrome () {
     });
 
     const appTiles = dock.filter((d) => d.app !== '(start)');
+    const expectedApps = ['desktop', 'app-store', 'settings', 'code', 'preview'];
     push(`${L} G6 the dock carries a tile for every resolved app`,
-        appTiles.length === 4 && ['desktop', 'settings', 'code', 'preview']
+        appTiles.length === expectedApps.length && expectedApps
             .every((a) => appTiles.some((t) => t.app === a)),
         JSON.stringify(appTiles.map((t) => t.app)));
     push(`${L} G6 every dock icon actually DECODED (no broken image)`,
         dock.every((d) => d.natural !== '0x0'), JSON.stringify(dock.map((d) => [d.app, d.natural])));
-    // Four apps, four different pictures. The old set shared one tile and
+    // Each app has a different picture. The old set shared one tile and
     // differed only in a thin glyph, which at 30px is not a difference.
-    push(`${L} G6 the four app icons are four DIFFERENT images`,
-        new Set(appTiles.map((t) => t.src)).size === 4,
+    push(`${L} G6 every app has a DIFFERENT icon image`,
+        new Set(appTiles.map((t) => t.src)).size === expectedApps.length,
         `${new Set(appTiles.map((t) => t.src)).size} distinct src`);
     // 🔴 The guard that would have caught the original problem. MEASURED at
     // this same 30px, by reverting registry.js to the old artwork and running

@@ -411,12 +411,12 @@ function tally (vpName, appId, n = 1) {
  * the end). `settings`/`preview`/`code` all go through the identical
  * `otherAppIds` loop + round-robin + `checkTaskbarReachable` machinery;
  * `settings` additionally eats the resize-handle regression's 6 tallies
- * (`otherAppIds[0]`, 2 per direction x 3 directions — WHICH app lands in
- * that slot is registry-order-dependent, which is exactly why this is a
- * NAMED number and not folded into a generic rule) and the full-bleed
- * drawer's "open Settings" scenario extras. */
+ * (the explicitly selected resize target, 2 per direction x 3 directions)
+ * and the full-bleed drawer's "open Settings" scenario extras. App Store's
+ * floor was measured across the same five viewports after it was added. */
 const NAMED_APP_FLOORS = {
     desktop: 9,
+    'app-store': 16,
     settings: 23,
     preview: 12,
     code: 11,
@@ -542,15 +542,15 @@ try {
 // so are outside the per-app manifest's scope, without needing a second
 // full manifest built for them.
 //
-// `MIN_TOTAL_CHECKS` is the exact total (`checks.length`, ALL sweeps
-// combined) a clean run of this file produces today — 577 (557 real checks
-// + 20 from the coverage-manifest gate itself, 4 apps x 5 viewports).
+// `MIN_TOTAL_CHECKS` is the measured total before this gate: 737 after adding
+// App Store, occluded-window recovery, and coverage for five apps across all
+// five viewports. This retains the additional app's regression coverage.
 // Bump it, with a reason, in the same commit as any change that legitimately
 // adds or removes checks anywhere in this file — the same "obvious,
 // reviewable manifest bump" discipline as `NAMED_APP_FLOORS` above, at
 // whole-suite granularity.
 // ═══════════════════════════════════════════════════════════════════════════
-const MIN_TOTAL_CHECKS = 577;
+const MIN_TOTAL_CHECKS = 737;
 const totalSoFar = checks.length;
 push(`GATE: total check count across the whole suite has not silently shrunk`,
     totalSoFar >= MIN_TOTAL_CHECKS,
@@ -1075,6 +1075,9 @@ async function runViewport (vp) {
             // gate, not a real signal — `raiseByTaskbarItemClick` still
             // covers "can a user raise this window" via the other real path.
             skip(`${label}: raise ${app} by clicking its titlebar (no titlebar pixel this window owns right now — either hidden by full-bleed, or fully occluded by another window's overlapping rect)`);
+            // Exercise recovery here too: the round-robin sweep has no
+            // separate dock click after an entirely covered titlebar.
+            await raiseByTaskbarItemClick(app, contenders, `${label} (occluded titlebar)`);
             return;
         }
         await page.mouse.click(tb[0], tb[1]);
@@ -1215,7 +1218,23 @@ async function runViewport (vp) {
      * `preventDefault()`/`stopPropagation()` regression on the same handler).
      */
     async function testResizeHandleRaisesAndResizes (app, handleDir, contenders, label) {
-        await ensureNotTopmost(app, contenders);
+        // Arrange the target directly below the smallest other window.
+        // Picking the first registry entry can now bury every handle under
+        // App Store, silently skipping all drag coverage. Focus calls only
+        // arrange this fixture; the assertions still require a real drag.
+        const smaller = await page.evaluate(({ target, ids }) => ids
+            .filter(id => id !== target)
+            .map(id => ({ id, rect: document.querySelector(`.window[data-app="${id}"]`)?.getBoundingClientRect() }))
+            .filter(item => item.rect?.width && item.rect?.height)
+            .sort((a, b) => a.rect.width * a.rect.height - b.rect.width * b.rect.height)[0]?.id,
+        { target: app, ids: contenders });
+        if (smaller) {
+            await focusApp(app);
+            await focusApp(smaller);
+            await sleep(150);
+        } else {
+            await ensureNotTopmost(app, contenders);
+        }
         const before = await rectOf(app);
         // 🔴 Same reasoning as `titlebarPoint` above (see its own doc block):
         // "the geometric midpoint of the handle's own rect" and "a pixel
@@ -1481,14 +1500,14 @@ async function runViewport (vp) {
     await checkTaskbarReachable(`${VP} after exposing the real taskbar, before opening other apps`);
 
     for ( const id of otherAppIds ) {
-        const already = await page.evaluate((a) => !! document.querySelector(`.window[data-app="${a}"]`), id);
-        if ( ! already ) {
-            await page.evaluate(({ a, ctx }) => window.ezil.registry.launch(a, ctx), {
-                a: id,
-                ctx: { payload: PAYLOAD, computer: PAYLOAD.computer, desktopState: PAYLOAD.desktopState },
-            });
-            await until((a) => !! document.querySelector(`.window[data-app="${a}"]`), id, 8000, 50);
-        }
+        // Settings may already exist from the drawer test. Launch it again
+        // through the registry so it is restored/focused even when a
+        // different app precedes it in the resolved list.
+        await page.evaluate(({ a, ctx }) => window.ezil.registry.launch(a, ctx), {
+            a: id,
+            ctx: { payload: PAYLOAD, computer: PAYLOAD.computer, desktopState: PAYLOAD.desktopState },
+        });
+        await until((a) => document.querySelector(`.window[data-app="${a}"]`)?.classList.contains('window-active'), id, 8000, 50);
         await settle(id);
 
         const opened = await page.evaluate((a) => !! document.querySelector(`.window[data-app="${a}"]`), id);
@@ -1538,7 +1557,9 @@ async function runViewport (vp) {
     // verification of this binding ever grabbed "se".
     // ═════════════════════════════════════════════════════════════════════
     if ( otherAppIds.length > 0 ) {
-        const resizeTarget = otherAppIds[0];
+        // The named Settings floor includes these resize checks; registry
+        // ordering must not silently transfer them to another app.
+        const resizeTarget = otherAppIds.includes('settings') ? 'settings' : otherAppIds[0];
         // 🔴 NOT `[bootAppId, ...otherAppIds]`: the full-bleed boot app is
         // `data-stay_on_top="true"` (`UIWindow.js` ~L122-124, set whenever
         // `window.is_fullpage_mode`), which pins its z-index to a fixed

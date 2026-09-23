@@ -195,10 +195,11 @@ push('context menu rendered its items',
 // No Puter mark anywhere in the rendered DOM or the shipped bundles.
 // The AGPL/attribution banner is REQUIRED to name Puter and is prose, not UI;
 // strip CSS comments before checking that no mark leaked into user-visible
-// markup (text, titles, alt, class names, data-*).
+// markup (text, titles, alt, class names, data-*). Match the brand as a word:
+// "computer" is ordinary UI copy and is also used in App Store CSS classes.
 const domHtml = window.document.documentElement.outerHTML.replace(/\/\*[\s\S]*?\*\//g, '');
-push('no "Puter" in the rendered DOM (attribution banner excluded)', !/puter/i.test(domHtml),
-    (domHtml.match(/.{0,40}puter.{0,40}/i) ?? [''])[0]);
+push('no "Puter" in the rendered DOM (attribution banner excluded)', !/\bputer\b/i.test(domHtml),
+    (domHtml.match(/.{0,40}\bputer\b.{0,40}/i) ?? [''])[0]);
 push('no puter.com URL in the shipped bundle', !/puter\.com/i.test(bundle) && !/puter\.com/i.test(css));
 
 let pass = 0;
