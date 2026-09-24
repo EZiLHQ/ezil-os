@@ -1,11 +1,10 @@
 # Releases
 
-How a `v*` tag turns into a deployed, verified product, a downloadable
-tarball, and a native macOS DMG — the secrets it needs, what to check before
-the first one, the order things happen in, how to confirm a rollout actually
-took effect, and how to undo one.
+How a frontend-only deployment or a `v*` tag turns into a verified product.
+A tag also produces a downloadable tarball and native macOS DMG. This document
+covers the secrets, checks, rollout order, and recovery for both paths.
 
-A release is a maintainer-cut `v*` tag; nothing else creates one — see
+A tagged release is a maintainer-cut `v*` tag; nothing else creates one — see
 [`GOVERNANCE.md`](../GOVERNANCE.md) § Releases. Tagging pushes three workflows
 into motion at once: [`.github/workflows/image.yml`](../.github/workflows/image.yml)
 (container images to GHCR), [`.github/workflows/release.yml`](../.github/workflows/release.yml)
@@ -15,6 +14,27 @@ product — and the only one of the three that publishes the draft the second
 one created after the signed DMG is attached). This document is about the
 operator side of that; the workflow files themselves carry the mechanical
 detail in their own header comments.
+
+## Frontend-only production deployment
+
+Use [`.github/workflows/deploy-app.yml`](../.github/workflows/deploy-app.yml)
+from **Actions → Deploy App → Run workflow** on `main` for a Next.js or shell
+change that requires no desktop Worker or image update. Keep
+`app/vercel.json`'s automatic main deployment disabled. The workflow checks
+that it is deploying the current main commit, verifies the committed shell
+bundle, typechecks the app, and confirms the Vercel project and existing
+`ezil-os.vercel.app` production alias before changing it. It then deploys that
+commit, waits for the live bundle digest, and signs in to the real `/os` page
+with the existing e2e account to test the App Store at desktop and phone sizes.
+The run retains screenshots as a 14-day artifact. If a check fails after the
+deployment, it restores and verifies the previous production deployment.
+
+This path uses the existing Vercel and e2e repository secrets listed below.
+It does not update the Cloudflare Worker, desktop image, GitHub Release, or any
+database. The App Store preview's Reticle card still says **Planned**: a
+successful frontend deployment does not establish an installation service or
+a running Reticle application. A desktop-image change uses the tagged release
+path and its separate fresh-container verification.
 
 ## Secrets
 
