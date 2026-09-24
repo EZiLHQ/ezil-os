@@ -53,16 +53,32 @@ try {
             const errors = [];
             page.on('pageerror', error => errors.push(error.message));
 
-            await page.goto(new URL('/login?returnUrl=%2Fos', app).toString(), { waitUntil: 'domcontentloaded' });
-            await page.locator('#email').fill(email);
-            await page.locator('#password').fill(password);
-            await page.locator('form').filter({ has: page.locator('#email') })
-                .locator('button[type="submit"]').click();
-            await page.waitForURL(url => !url.pathname.startsWith('/login'), { timeout: 60_000 });
-            await page.goto(new URL('/os', app).toString(), { waitUntil: 'domcontentloaded' });
+            try {
+                await page.goto(new URL('/login?returnUrl=%2Fos', app).toString(), { waitUntil: 'domcontentloaded' });
+                await page.locator('#email').fill(email);
+                await page.locator('#password').fill(password);
+                await page.locator('form').filter({ has: page.locator('#email') })
+                    .locator('button[type="submit"]').click();
+                await page.waitForURL(url => !url.pathname.startsWith('/login'), { timeout: 60_000 });
+                await page.goto(new URL('/os', app).toString(), { waitUntil: 'domcontentloaded' });
+
+                const dock = page.locator('.taskbar-item[data-app="app-store"]');
+                await dock.waitFor({ timeout: 45_000 });
+            } catch (error) {
+                // Keep public CI logs free of account content and URL query strings.
+                const state = await page.evaluate(() => ({
+                    path: location.pathname,
+                    shell: Boolean(document.querySelector('.taskbar')),
+                    dockItems: document.querySelectorAll('.taskbar-item').length,
+                    storeItems: document.querySelectorAll('.taskbar-item[data-app="app-store"]').length,
+                    loginForm: Boolean(document.querySelector('#email')),
+                    invitedPage: location.pathname.startsWith('/auth/invited'),
+                })).catch(() => null);
+                console.error(`Production ${shape.name} boot state: ${JSON.stringify(state)}, page error count: ${errors.length}`);
+                throw error;
+            }
 
             const dock = page.locator('.taskbar-item[data-app="app-store"]');
-            await dock.waitFor({ timeout: 45_000 });
             assert.equal(await page.locator('.window[data-app="desktop"]').count(), 0);
             await dock.click();
 
