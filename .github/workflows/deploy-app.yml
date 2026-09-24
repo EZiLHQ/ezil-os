@@ -1,0 +1,108 @@
+# Deploy only the Vercel frontend. The tagged release workflow separately
+# rebuilds the desktop Worker and image; an App Store shell change needs neither.
+name: Deploy App
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 22 }
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+      - name: Require the current main commit
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF}" = 'refs/heads/main'
+          test "$(git rev-parse HEAD)" = "$(git ls-remote origin refs/heads/main | cut -f1)"
+      - name: Check the committed shell bundle
+        run: bash shell/build-shell.sh --check
+      - name: Typecheck the app
+        working-directory: app
+        run: |
+          bun install --frozen-lockfile
+          bun run typecheck
+      - name: Install the pinned Vercel CLI
+        run: npm install --global vercel@59
+      - name: Verify the production target and record the previous deployment
+        id: before
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          project="$(vercel api "/v9/projects/${VERCEL_PROJECT_ID}" --raw --token="${VERCEL_TOKEN}")"
+          jq -e --arg project "${VERCEL_PROJECT_ID}" --arg org "${VERCEL_ORG_ID}" \
+            '.id == $project and .accountId == $org and .name == "ezil-os" and .rootDirectory == "app"' \
+            <<<"${project}" >/dev/null
+          previous="$(vercel inspect https://ezil-os.vercel.app --format=json --token="${VERCEL_TOKEN}")"
+          previous_id="$(jq -r '.id // empty' <<<"${previous}")"
+          test -n "${previous_id}"
+          jq -e '.name == "ezil-os" and .target == "production" and .readyState == "READY" and (.aliases | index("ezil-os.vercel.app")) != null' \
+            <<<"${previous}" >/dev/null
+          deployment="$(vercel api "/v13/deployments/${previous_id}" --raw --token="${VERCEL_TOKEN}")"
+          jq -e --arg project "${VERCEL_PROJECT_ID}" '.projectId == $project' <<<"${deployment}" >/dev/null
+          previous_sha="$(curl --fail --silent --show-error --location https://ezil-os.vercel.app/os/bundle.min.js | sha256sum | cut -d' ' -f1)"
+          echo "id=${previous_id}" >> "${GITHUB_OUTPUT}"
+          echo "sha=${previous_sha}" >> "${GITHUB_OUTPUT}"
+          echo "Previous production deployment: ${previous_id}, bundle sha256 ${previous_sha}"
+      - name: Deploy this commit to production
+        id: deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: vercel deploy --yes --prod --token="${VERCEL_TOKEN}"
+      - uses: ./.github/actions/setup-playwright
+      - name: Wait for production to serve this bundle
+        run: node e2e/await-deployed-bundle.mjs
+      - name: Test the authenticated production App Store
+        env:
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+          EZIL_E2E_SCREENSHOT_DIR: ${{ runner.temp }}/app-store-screenshots
+        run: node e2e/prod-app-store.mjs
+      - name: Upload visual evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-app-store-${{ github.sha }}
+          path: ${{ runner.temp }}/app-store-screenshots/*.png
+          retention-days: 14
+      - name: Restore the previous production deployment after a failed check
+        if: ${{ failure() && steps.before.outputs.id != '' }}
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          PREVIOUS_ID: ${{ steps.before.outputs.id }}
+          PREVIOUS_SHA: ${{ steps.before.outputs.sha }}
+        run: |
+          set -euo pipefail
+          current="$(vercel inspect https://ezil-os.vercel.app --format=json --token="${VERCEL_TOKEN}" | jq -r '.id // empty')"
+          if [[ "${current}" != "${PREVIOUS_ID}" ]]; then
+            vercel promote "${PREVIOUS_ID}" --yes --token="${VERCEL_TOKEN}"
+          fi
+          for attempt in {1..36}; do
+            current="$(vercel inspect https://ezil-os.vercel.app --format=json --token="${VERCEL_TOKEN}" | jq -r '.id // empty')"
+            sha="$(curl --fail --silent --show-error --location "https://ezil-os.vercel.app/os/bundle.min.js?rollback-check=${attempt}" | sha256sum | cut -d' ' -f1)"
+            if [[ "${current}" == "${PREVIOUS_ID}" && "${sha}" == "${PREVIOUS_SHA}" ]]; then
+              echo "Restored ${PREVIOUS_ID}, bundle sha256 ${PREVIOUS_SHA}"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'Previous deployment did not return to the production alias.' >&2
+          exit 1
