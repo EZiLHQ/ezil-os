@@ -51,7 +51,14 @@ try {
         try {
             const page = await context.newPage();
             const errors = [];
+            const failedRequests = [];
             page.on('pageerror', error => errors.push(error.message));
+            page.on('response', response => {
+                if (response.status() >= 400) {
+                    const url = new URL(response.url());
+                    failedRequests.push(`${response.status()} ${url.pathname}`);
+                }
+            });
 
             try {
                 await page.goto(new URL('/login?returnUrl=%2Fos', app).toString(), { waitUntil: 'domcontentloaded' });
@@ -73,8 +80,13 @@ try {
                     storeItems: document.querySelectorAll('.taskbar-item[data-app="app-store"]').length,
                     loginForm: Boolean(document.querySelector('#email')),
                     invitedPage: location.pathname.startsWith('/auth/invited'),
+                    title: document.title.slice(0, 80),
                 })).catch(() => null);
-                console.error(`Production ${shape.name} boot state: ${JSON.stringify(state)}, page error count: ${errors.length}`);
+                const safeErrors = errors.map(message => message
+                    .replace(/https?:\/\/[^\s)]+/g, '[url]')
+                    .replace(/[A-Za-z0-9_=-]{32,}/g, '[opaque]')
+                    .slice(0, 180));
+                console.error(`Production ${shape.name} boot state: ${JSON.stringify(state)}, page errors: ${JSON.stringify(safeErrors)}, failed requests: ${JSON.stringify(failedRequests.slice(0, 10))}`);
                 throw error;
             }
 
