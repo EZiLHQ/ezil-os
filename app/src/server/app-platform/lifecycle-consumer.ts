@@ -1,7 +1,8 @@
-import { and, asc, eq, inArray, isNull, or, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, notExists, or, sql } from 'drizzle-orm';
 import type { db } from '@/server/db';
 import { computers, computerRuntimes, computerInstances, computerLifecycleIntents as intents,
-    computerRecoveryIntents as recoveries, computerLifecycleJobs as jobs, computerLifecycleOutbox as outbox } from '@/server/db/schema';
+    computerRecoveryIntents as recoveries, computerLifecycleJobs as jobs, computerLifecycleOutbox as outbox,
+    computerCancellations as cancellations } from '@/server/db/schema';
 import { hasCurrentOsAccess, type OsAccessMode } from './runtime-authority';
 import { LifecycleAuthorityRequestSchema } from './lifecycle-authority-protocol';
 import { LifecycleError, type LifecycleReceipt, type LifecycleWork } from './lifecycle-protocol';
@@ -46,7 +47,8 @@ export async function claimLifecycleWork(o: BaseOptions): Promise<LifecycleClaim
         const [candidate] = await tx.select({ computerId: computers.id, jobId: jobs.id }).from(computers)
             .innerJoin(jobs, eq(jobs.computerId, computers.id)).leftJoin(intents, eq(intents.jobId, jobs.id))
             .leftJoin(recoveries, eq(recoveries.jobId, jobs.id)).innerJoin(outbox, eq(outbox.jobId, jobs.id))
-            .where(and(due(), inArray(jobs.status, active), or(sql`${intents.jobId} is not null`, sql`${recoveries.jobId} is not null`)))
+            .where(and(due(), inArray(jobs.status, active), or(sql`${intents.jobId} is not null`, sql`${recoveries.jobId} is not null`),
+                notExists(tx.select({ id: cancellations.id }).from(cancellations).where(eq(cancellations.sourceJobId, jobs.id)))))
             .orderBy(asc(outbox.availableAt), asc(jobs.id)).limit(1).for('update', { of: computers, skipLocked: true });
         if (!candidate) return null;
         const [event] = await tx.update(outbox).set({ attempts: sql`${outbox.attempts} + 1`,
@@ -60,6 +62,10 @@ async function load(tx: Transaction, c: Pick<LifecycleClaim, 'computerId' | 'job
     const [computer] = await tx.select().from(computers).where(eq(computers.id, c.computerId)).limit(1).for('update');
     const [runtime] = await tx.select().from(computerRuntimes).where(eq(computerRuntimes.computerId, c.computerId)).limit(1).for('update');
     const [job] = await tx.select().from(jobs).where(and(eq(jobs.id, c.jobId), eq(jobs.computerId, c.computerId))).limit(1).for('update');
+    // Cancellation owns reconciliation from this point. A stale lifecycle
+    // consumer cannot dispatch again, acknowledge success, or settle failure.
+    const [cancelled] = await tx.select({ id: cancellations.id }).from(cancellations).where(eq(cancellations.sourceJobId, c.jobId)).limit(1);
+    if (cancelled) return null;
     const table = job?.operation === 'recover' ? recoveries : intents;
     const document = job?.operation === 'recover' ? sql<string>`public.ezil_computer_recovery_document(${recoveries})`
         : sql<string>`public.ezil_lifecycle_intent_document(${intents})`;

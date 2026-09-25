@@ -320,6 +320,9 @@ jobs:
       - name: Computer cancellation authority and settlement (real Postgres)
         working-directory: app
         run: bun run test:db:computer-cancellations
+      - name: Computer cancellation producers and launch revocation (real Postgres)
+        working-directory: app
+        run: bun run test:db:cancellation-producer
 
   connectors:
     name: sdk + mcp (typecheck + unit)
