@@ -126,6 +126,15 @@ export function validateComputerPolicyAgainstManifest(
             reject(['launch', 'embedding', 'mode'], 'embedding_mode_mismatch');
         } else if (policy.launch.embedding.mode === 'iframe' && manifest.launch.embedding.mode === 'iframe') {
             subset(policy.launch.embedding.sandbox, manifest.launch.embedding.sandbox, ['launch', 'embedding', 'sandbox']);
+            if (policy.capabilities.length && !policy.launch.embedding.sandbox.includes('allow-same-origin')) {
+                reject(['launch', 'embedding', 'sandbox'], 'capabilities_require_same_origin');
+            }
+            if (policy.capabilities.length && !manifest.launch.embedding.sandbox.includes('allow-same-origin')) {
+                issues.push({ path: ['manifest', 'launch', 'embedding', 'sandbox'], code: 'capabilities_require_same_origin' });
+            }
+        }
+        if (policy.launch.embedding.mode === 'external' && policy.capabilities.length) {
+            reject(['capabilities'], 'external_window_has_no_bridge');
         }
     }
 

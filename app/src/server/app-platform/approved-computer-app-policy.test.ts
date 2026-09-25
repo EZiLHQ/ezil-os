@@ -18,7 +18,7 @@ function manifest(overrides: Record<string, unknown> = {}) {
         services: [{ name: 'web', protocol: 'http', scope: 'installation', internalPort: 8080,
             process: { kind: 'node', entrypoint: 'dist/server.mjs', args: [] },
             preferredHostPort: 8080, health: { path: '/health', status: 200 }, dependsOn: [] }],
-        launch: { mode: 'web', service: 'web', path: '/', embedding: { mode: 'iframe', sandbox: ['allow-scripts'] } },
+        launch: { mode: 'web', service: 'web', path: '/', embedding: { mode: 'iframe', sandbox: ['allow-scripts', 'allow-same-origin'] } },
         configuration: [], capabilities: ['projects.read'], secrets: [{ name: 'APP_TOKEN', ref: SECRET }],
         egressOrigins: ['https://api.partner.example.com'],
         resources: { cpu: 0.25, memoryMiB: 512, ephemeralDiskMiB: 1024, maxRuntimeSeconds: 3600 },
@@ -130,17 +130,30 @@ describe('ApprovedComputerAppPolicyV2', () => {
 
     it('requires explicit web embedding approval without extra sandbox authority', () => {
         issue(manifest(), { ...policy(), launch: { mode: 'web', embedding: { mode: 'iframe',
-            sandbox: ['allow-scripts', 'allow-same-origin'] } } },
-        ['policy', 'launch', 'embedding', 'sandbox', 1], 'authority_exceeds_request');
+            sandbox: ['allow-scripts', 'allow-same-origin', 'allow-popups'] } } },
+        ['policy', 'launch', 'embedding', 'sandbox', 2], 'authority_exceeds_request');
         issue(manifest(), { ...policy(), launch: { mode: 'web', embedding: { mode: 'external' } } },
             ['policy', 'launch', 'embedding', 'mode'], 'embedding_mode_mismatch');
         issue(manifest(), { ...policy(), launch: { mode: 'integration', adapter: 'reticle-v1' } },
             ['policy', 'launch', 'mode'], 'launch_mode_mismatch');
         const requested = manifest({ launch: { mode: 'web', service: 'web', path: '/',
-            embedding: { mode: 'iframe', sandbox: ['allow-scripts', 'allow-forms'] } } });
+            embedding: { mode: 'iframe', sandbox: ['allow-scripts', 'allow-same-origin', 'allow-forms'] } } });
         expect(validateComputerPolicyAgainstManifest(requested, policy(requested, {
-            launch: { mode: 'web', embedding: { mode: 'iframe', sandbox: ['allow-scripts'] } },
+            launch: { mode: 'web', embedding: { mode: 'iframe', sandbox: ['allow-scripts', 'allow-same-origin'] } },
         }))).toMatchObject({ success: true });
+    });
+
+    it('requires a same-origin iframe only when web capabilities are approved', () => {
+        issue(manifest(), { ...policy(), launch: { mode: 'web', embedding: { mode: 'iframe', sandbox: ['allow-scripts'] } } },
+            ['policy', 'launch', 'embedding', 'sandbox'], 'capabilities_require_same_origin');
+        const noSameOrigin = manifest({ launch: { mode: 'web', service: 'web', path: '/',
+            embedding: { mode: 'iframe', sandbox: ['allow-scripts'] } } });
+        issue(noSameOrigin, policy(noSameOrigin),
+            ['manifest', 'launch', 'embedding', 'sandbox'], 'capabilities_require_same_origin');
+        expect(validateComputerPolicyAgainstManifest(noSameOrigin, policy(noSameOrigin, { capabilities: [] })))
+            .toMatchObject({ success: true });
+        const external = manifest({ launch: { mode: 'web', service: 'web', path: '/', embedding: { mode: 'external' } } });
+        issue(external, policy(external), ['policy', 'capabilities'], 'external_window_has_no_bridge');
     });
 
     it('rejects a service whose approved scope or internal port differs from the manifest', () => {
