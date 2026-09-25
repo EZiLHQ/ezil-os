@@ -3,9 +3,13 @@ import { constants, lstatSync, openSync, closeSync, mkdirSync } from 'node:fs';
 import { isAbsolute, join, normalize } from 'node:path';
 import type { ControlNonceStore } from './control-auth.js';
 import { canonicalJson, intentDigest, type ReconcileCommand } from './control-protocol.js';
+import { DeliverySchema, type Delivery } from './configuration-delivery-contract.js';
 
 export type StoredIntent = { installationId: string; generation: number; desired: 'running' | 'stopped';
     command: ReconcileCommand; observed: 'unknown' | 'running' | 'stopped' | 'failed' };
+export type StoredDelivery = { delivery: Delivery; deadline: number; dispatched: boolean; cancelled: boolean;
+    outcome: 'pending' | 'succeeded' | 'failed' };
+export const deliveryKey = (value: Delivery) => `${value.operation}-${value.configurationId}`;
 
 /** Host-private recovery ledger. Postgres remains the control-plane authority.
  * The directory must be provisioned outside every application mount. The host
@@ -40,7 +44,10 @@ export class ControlStore implements ControlNonceStore {
             CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, installation TEXT NOT NULL, generation INTEGER NOT NULL, digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS runtime_leases (installation TEXT NOT NULL, generation INTEGER NOT NULL,
                 digest TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY(installation,generation));
-            CREATE TABLE IF NOT EXISTS configuration (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, digest TEXT NOT NULL);`);
+            CREATE TABLE IF NOT EXISTS configuration (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, digest TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, reference TEXT NOT NULL, deadline INTEGER NOT NULL,
+                dispatched INTEGER NOT NULL DEFAULT 0, executed INTEGER NOT NULL DEFAULT 0,
+                cancelled INTEGER NOT NULL DEFAULT 0, outcome TEXT NOT NULL DEFAULT 'pending');`);
             this.transaction(() => {
                 const identity = this.db.prepare('SELECT computer,generation FROM identity WHERE id=1').get();
                 if (identity && (identity.computer !== computerId || identity.generation !== computerGeneration)) {
@@ -157,6 +164,69 @@ export class ControlStore implements ControlNonceStore {
         if (!['unknown', 'running', 'stopped', 'failed'].includes(state)) throw new Error('invalid_observation');
         return this.db.prepare('UPDATE intents SET observed=? WHERE installation=? AND generation=?')
             .run(state, installationId, generation).changes === 1;
+    }
+    private validateDelivery(value: Delivery): string {
+        if (!DeliverySchema.safeParse(value).success || value.scope.computerId !== this.computerId
+            || value.scope.computerGeneration !== this.computerGeneration) throw new Error('delivery_scope_mismatch');
+        return canonicalJson(value);
+    }
+    deliveryByKey(key: string): StoredDelivery | undefined {
+        if (!/^(prepare|reload)-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(key)) throw new Error('delivery_key_invalid');
+        const row = this.db.prepare('SELECT * FROM deliveries WHERE id=?').get(key);
+        if (!row) return undefined;
+        const delivery = DeliverySchema.parse(JSON.parse(String(row.reference)));
+        this.validateDelivery(delivery);
+        if (deliveryKey(delivery) !== key || !['pending', 'succeeded', 'failed'].includes(String(row.outcome))) throw new Error('delivery_record_invalid');
+        return { delivery, deadline: Number(row.deadline), dispatched: Boolean(row.dispatched), cancelled: Boolean(row.cancelled),
+            outcome: row.outcome as StoredDelivery['outcome'] };
+    }
+    delivery(value: Delivery): StoredDelivery | undefined {
+        const reference = this.validateDelivery(value), current = this.deliveryByKey(deliveryKey(value));
+        if (current && canonicalJson(current.delivery) !== reference) throw new Error('delivery_reference_conflict');
+        return current;
+    }
+    /** Local process recovery only; Postgres remains authority. Commit the one
+     * dispatch allowance before systemd. Lost start responses never resend. */
+    dispatchDelivery(value: Delivery, deadline: number): boolean {
+        const reference = this.validateDelivery(value), now = Date.now();
+        if (!Number.isSafeInteger(deadline) || deadline <= now || deadline > now + 900000) throw new Error('delivery_deadline_invalid');
+        return this.transaction(() => {
+            if (this.delivery(value)) return false;
+            this.deliveryCapacity();
+            this.db.prepare('INSERT INTO deliveries(id,reference,deadline,dispatched) VALUES (?,?,?,1)')
+                .run(deliveryKey(value), reference, deadline);
+            return true;
+        });
+    }
+    /** A cancel-before-start tombstone survives agent/host restart. A late SSM
+     * invocation cannot consume another start allowance or extend a deadline. */
+    cancelDelivery(value: Delivery): void {
+        const reference = this.validateDelivery(value);
+        this.transaction(() => {
+            if (!this.delivery(value)) this.deliveryCapacity();
+            this.db.prepare(`INSERT INTO deliveries(id,reference,deadline,cancelled) VALUES (?,?,0,1)
+                ON CONFLICT(id) DO UPDATE SET cancelled=1`).run(deliveryKey(value), reference);
+        });
+    }
+    private deliveryCapacity() {
+        if (Number(this.db.prepare('SELECT count(*) AS n FROM deliveries').get()?.n) >= 100000) throw new Error('delivery_capacity');
+    }
+    beginDelivery(value: Delivery): boolean {
+        return this.transaction(() => {
+            const current = this.delivery(value);
+            if (!current?.dispatched || current.cancelled || current.outcome !== 'pending' || current.deadline <= Date.now()) return false;
+            return this.db.prepare('UPDATE deliveries SET executed=1 WHERE id=? AND executed=0').run(deliveryKey(value)).changes === 1;
+        });
+    }
+    finishDelivery(value: Delivery, succeeded: boolean): void {
+        this.transaction(() => {
+            const current = this.delivery(value);
+            if (!current?.dispatched || this.db.prepare('SELECT executed FROM deliveries WHERE id=?').get(deliveryKey(value))?.executed !== 1) {
+                throw new Error('delivery_not_dispatched');
+            }
+            const outcome = succeeded && !current.cancelled && current.deadline > Date.now() ? 'succeeded' : 'failed';
+            this.db.prepare("UPDATE deliveries SET outcome=? WHERE id=? AND outcome='pending'").run(outcome, deliveryKey(value));
+        });
     }
     close(): void { this.db.close(); }
 }

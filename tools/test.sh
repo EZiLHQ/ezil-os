@@ -461,7 +461,18 @@ run_supervisor () {
         node "$TREE/supervisor/test/run-driver-linux.mjs" || return 1
     fi
     if [[ "${1:-}" == "--linux-host" ]]; then
-        node "$TREE/supervisor/test/run-driver-linux.mjs" --host
+        node "$TREE/supervisor/test/run-driver-linux.mjs" --host || return 1
+    fi
+    if [[ "${1:-}" == "--linux-systemd" ]]; then
+        if [[ "$(uname -s)" != "Linux" ]]; then
+            say "systemd acceptance requires a disposable Linux VM; do not boot privileged systemd Docker containers"
+            return 1
+        fi
+        if [[ "$(id -u)" == "0" ]]; then
+            node "$TREE/supervisor/test/systemd-delivery.linux.mjs"
+        else
+            sudo -n "$(command -v node)" "$TREE/supervisor/test/systemd-delivery.linux.mjs"
+        fi
     fi
 }
 

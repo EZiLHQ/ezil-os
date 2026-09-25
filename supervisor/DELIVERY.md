@@ -102,5 +102,98 @@ a real SIGHUP and observes the new signed descriptor. Failure tests cover
 corruption, changed provisioning during actual Docker inspection, cancellation,
 missing disk marker, concurrent delivery locks, protected paths and cleanup.
 Metadata/S3 are local fixtures, and the test directly signals the process.
-Systemd operation, SSM dispatch and actual EC2/EBS behavior still require the
-approved Linux VM/cloud pilot; this suite is not evidence of a deployed app.
+This receiver suite does not exercise systemd or SSM dispatch. The separate
+process-management suite below covers actual systemd units; neither suite is
+evidence of a deployed app or actual EC2/EBS behavior.
+
+## Bounded systemd delivery operations
+
+`deploy/ezil-configuration@.service` runs the receiver executor as a root-owned
+service with `KillMode=control-group`, SIGTERM followed by SIGKILL after ten
+seconds, no restart policy, and an independent fifteen-minute runtime ceiling.
+Its instance key is `prepare-<configuration-uuid>` or `reload-<configuration-uuid>`.
+No caller chooses a unit, executable, PID, root path, environment or shell.
+The unit does not start on boot. It is separate from the computer supervisor
+service and from application containers, so cancelling configuration work does
+not issue a computer stop or application stop.
+
+`dist/delivery-operation.js` is the fixed SSM-facing executable. It accepts no
+arguments; `SSM_Operation` contains canonical base64 for at most 8192 JSON bytes:
+
+```text
+{ schemaVersion: 1, action: "start", delivery: <immutable reference>, deadline: <Unix milliseconds> }
+{ schemaVersion: 1, action: "observe" | "cancel", delivery: <immutable reference> }
+```
+
+`delivery` is the existing strict S3-version/writer reference, never configuration
+bytes or credentials. Start requires an unexpired deadline at most fifteen
+minutes ahead. `deploy/configuration-document.json` supplies that data using SSM
+`ENV_VAR` interpolation and invokes only the fixed Node executable. Missing
+environment interpolation on an older SSM agent fails closed. No parameter is
+inserted into shell text. The document's own command timeout is 45 seconds;
+long receiver work belongs to systemd, not the SSM agent's command process.
+
+The existing host-private `control.sqlite` gains an additive `deliveries` table.
+It records the immutable reference, original deadline, separate one-time dispatch
+and execution allowances, cancellation fence and result. It is a local recovery
+record, not a second cloud authority or new Postgres migration. Both allowances
+commit before their external operation; a lost response or process death never
+refunds either one. The executor checks the saved cancellation fence and deadline
+again before entering the receiver. A duplicate activation cannot rerun it.
+Records are capped at 100,000 per host generation and must not be pruned while
+that generation can still receive commands. Retire/fence the writer before
+removing its recovery history.
+
+Start queues the exact unit without waiting for image work. Observe opens no
+new process and never calls start. Cancel first commits its fence, including
+when start has not arrived, then stops only that unit. A successful stop request
+is insufficient: the driver reads systemd state, pending job, main PID and
+cgroup-v2 population before reporting quiescence. A queued activation arriving
+after cancellation sees the persisted fence and cannot enter the receiver.
+Provisioning must coordinate the short `delivery-management.lock` as well as
+the receiver's long `delivery.lock` when cancelling and replacing host identity.
+Do not call the manager while holding its management lock.
+
+Results contain configuration identity, scope, operation and one of `absent`,
+`unknown`, `running`, `succeeded`, `failed`, `cancelling` or `cancelled`.
+`succeeded` requires both an exact receiver result committed locally and an
+observed quiescent, nonfailed unit. Its nested `result` matches the control-plane
+workflow output contract. A saved dispatch with no process/result remains
+`unknown`; the manager never starts it again. Recovery requires controller
+reconciliation and, where necessary, a newly authorized configuration, not
+deleting the local record or extending the old deadline. Cancellation does not
+undo configuration bytes already committed before the cancellation, nor does it
+revoke loaded application authority by itself; deliver the new control-plane
+revocation snapshot. A forced kill can leave private scratch files as described
+above. Never delete user data as cancellation compensation.
+
+All CLI failures emit fixed codes. The systemd unit discards stdout/stderr;
+only the bounded, scoped result is recorded. It cannot certify loaded supervisor
+state or complete installation. The control plane still needs its signed host
+observation and current database transaction before acknowledging installation.
+
+Run `bash tools/test.sh supervisor --linux-systemd` on a disposable Linux VM
+with Node 24, systemd and cgroup v2. It uses root (or noninteractive sudo), creates
+a unique test unit and private directory, and removes them after observing stop.
+The production systemd driver, manager, executor and SQLite store run for real;
+the receiver callback is an instrumented fixture, not AWS or Docker preparation.
+Tests cover successful/failed work, a child ignoring SIGTERM, cancellation before
+activation, deadlines, abrupt process loss, duplicate unit activation, missing
+dispatch outcomes, observation without wake and forged scope. CI runs this on
+its Linux VM alongside the separate real Docker/receiver acceptance suite.
+
+Do not run privileged systemd containers inside a shared Docker VM. Local testing
+observed `systemd-binfmt` unregistering OrbStack's amd64 interpreter that way;
+an isolated Linux machine avoids that shared-host side effect. Local acceptance
+also restarted such a machine with active delivery, confirming that dispatch,
+execution, cancellation and the original deadline survived. This is host-process
+recovery evidence, not an EC2 replacement or persistent app-data acceptance test.
+
+Before activation, provision the approved Node/code/unit files, root configuration
+and scoped host IAM role; validate the pinned SSM agent and custom document;
+pin the document version/hash and restrict SendCommand to that document and
+platform-owned instances. The Standard workflow must check current database
+authority and actual EC2/EBS writer state before dispatch and throughout slow
+work, reconcile ambiguous commands and execution interruption, and verify these
+results. No workflow, IAM policy, AMI, SSM document or service is deployed by this
+change, and production installation remains disabled.

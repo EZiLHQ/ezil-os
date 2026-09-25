@@ -1,0 +1,19 @@
+[Unit]
+Description=EZiL bounded configuration delivery
+After=network-online.target
+
+[Service]
+Type=exec
+User=root
+Group=root
+UMask=0077
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/node /opt/ezil-supervisor/dist/delivery-executor.js %i
+StandardOutput=null
+StandardError=null
+RuntimeMaxSec=15min
+TimeoutStopSec=10
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+Restart=no
