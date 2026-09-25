@@ -54,6 +54,9 @@ npm --prefix supervisor/reticle/acceptance test
 The suite creates two fresh computer volumes and permanent separate internal
 networks. Named-volume mounts use `volume-nocopy`: Docker must not overwrite a
 fresh directory's provisioned ownership with the image's root-owned directory.
+The suite uses the manifest destinations `/workspace/projects` and
+`/data/reticle`, with both paths explicitly configured in the adapter. Private
+mounts are provisioned with owner-only permissions before the container starts.
 Trusted fixed-destination TCP proxies expose random loopback ports for the
 local browser; applications have no public network. These proxies are test
 infrastructure, not the production Cloudflare authorization path.

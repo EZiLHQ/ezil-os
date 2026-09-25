@@ -117,8 +117,8 @@ const previous=JSON.parse(process.argv[1]||'null');
 let files=previous?.map(x=>x.path);
 if(!files){
  files=['/data/reticle/pairing-token'];
- if(fs.existsSync('/project/.reticle/project.json')) files.push('/project/.reticle/project.json');
- const root='/project/.reticle/sessions';
+ if(fs.existsSync('/workspace/projects/.reticle/project.json')) files.push('/workspace/projects/.reticle/project.json');
+ const root='/workspace/projects/.reticle/sessions';
  for(const dir of fs.readdirSync(root)) for(const name of ['actions.jsonl','events.jsonl']){
   const p=path.join(root,dir,name); if(fs.existsSync(p)&&fs.statSync(p).size) files.push(p);
  }
@@ -149,7 +149,7 @@ try {
         docker(['run', '--rm', '--user', '0:0', '--network', 'none', '--cap-drop', 'ALL', '--cap-add', 'CHOWN',
             '--security-opt', 'no-new-privileges', '--mount', `type=volume,source=${volume},target=/computer`,
             '--entrypoint', 'node', immutableImage, '-e',
-            'const f=require("fs");for(const p of ["/computer/Projects/fixture","/computer/apps/reticle"]){f.mkdirSync(p,{recursive:true});f.chownSync(p,1000,1000)}',
+            'const f=require("fs");for(const p of ["/computer/Projects/fixture","/computer/apps/reticle"]){f.mkdirSync(p,{recursive:true,mode:0o700});f.chownSync(p,1000,1000)}',
             '--'], 30_000);
         // Docker Desktop/OrbStack may not publish an internal-network port.
         // This trusted proxy has fixed destinations and no volume/secret access.
@@ -164,7 +164,9 @@ s.on('close',()=>u.destroy());u.on('close',()=>s.destroy());s.pipe(u).pipe(s)}).
         const fixtureOrigin = `http://127.0.0.1:${port(gateway, 5301)}`;
         origins.push(origin); fixtureOrigins.push(fixtureOrigin);
         const args = [...restricted, '--network', network,
-            ...mount(volume, '/project', 'Projects/fixture'), ...mount(volume, '/data', 'apps/reticle'),
+            ...mount(volume, '/workspace/projects', 'Projects/fixture'), ...mount(volume, '/data/reticle', 'apps/reticle'),
+            '--env', 'EZIL_RETICLE_PROJECT_PATH=/workspace/projects',
+            '--env', 'EZIL_RETICLE_PRIVATE_PATH=/data/reticle',
             '--env', `EZIL_RETICLE_ALLOWED_ORIGINS=${JSON.stringify([fixtureOrigin])}`, immutableImage];
         runtimeArgs.push(args);
         launch(daemon, args);
@@ -183,7 +185,7 @@ s.on('close',()=>u.destroy());u.on('close',()=>s.destroy());s.pipe(u).pipe(s)}).
                     const processResult = spawnSync('docker', ['logs', name], { encoding: 'utf8', timeout: 5000 });
                     logs = (processResult.stdout ?? '') + (processResult.stderr ?? '');
                 } catch { /* report only exited */ }
-                const code = logs.match(/^(?:invalid_reticle_origins|reticle_mount_required|pairing_token_unavailable|invalid_project_mount|reticle_project_unavailable|unsupported_reticle_version|reticle_adapter_start_failed)$/m)?.[0];
+                const code = logs.match(/^(?:invalid_reticle_origins|invalid_reticle_paths|reticle_mount_required|pairing_token_unavailable|invalid_project_mount|reticle_project_unavailable|unsupported_reticle_version|reticle_adapter_start_failed)$/m)?.[0];
                 throw new Error(`daemon_${code ?? 'exited'}`);
             }
         }
@@ -219,7 +221,7 @@ const require=createRequire('/work/source/apps/examples/react/package.json');
 const {default:react}=await import(require.resolve('@vitejs/plugin-react'));
 const {reticle}=await import('/work/source/adapters/build/vite/dist/index.js');
 export default {root:'/work/source/apps/examples/react',cacheDir:'/tmp/vite-cache',
-plugins:[reticle({port:${new URL(origins[0]).port},token:readFileSync('/reticle-data/reticle/pairing-token','utf8').trim(),
+plugins:[reticle({port:${new URL(origins[0]).port},token:readFileSync('/reticle-data/pairing-token','utf8').trim(),
 projectId:'ezil-private-acceptance',captureErrorBodies:false}),react()],
 server:{host:'0.0.0.0',port:5301,strictPort:true,fs:{allow:['/work/source']}}};`, { mode: 0o644 });
     launch(`${id}-fixture`, [...restricted, '--network', `${id}-a`, '--user', '1000:1000',
@@ -244,9 +246,9 @@ server:{host:'0.0.0.0',port:5301,strictPort:true,fs:{allow:['/work/source']}}};`
     stage = 'capture-state';
     const baseline = JSON.parse(execute(a, snapshotScript));
     assert.ok(baseline.some(x => x.path.endsWith('/actions.jsonl') && x.bytes > 0));
-    execute(a, `const f=require('fs');f.mkdirSync('/project/.git',{recursive:true});
-f.writeFileSync('/project/.git/HEAD','ref: refs/heads/main\\n');f.writeFileSync('/project/old-name','saved');
-f.renameSync('/project/old-name','/project/new-name');f.writeFileSync('/project/deleted','gone');f.unlinkSync('/project/deleted');`);
+    execute(a, `const f=require('fs');f.mkdirSync('/workspace/projects/.git',{recursive:true});
+f.writeFileSync('/workspace/projects/.git/HEAD','ref: refs/heads/main\\n');f.writeFileSync('/workspace/projects/old-name','saved');
+f.renameSync('/workspace/projects/old-name','/workspace/projects/new-name');f.writeFileSync('/workspace/projects/deleted','gone');f.unlinkSync('/workspace/projects/deleted');`);
     for (const replacement of [false, true]) {
         stage = replacement ? 'replacement' : 'restart';
         const oldId = inspect(a).Id;
@@ -260,13 +262,13 @@ f.renameSync('/project/old-name','/project/new-name');f.writeFileSync('/project/
         if (replacement) assert.notEqual(inspect(a).Id, oldId);
         assert.deepEqual(JSON.parse(execute(a, snapshotScript, JSON.stringify(baseline))), baseline);
         assert.equal(execute(a, `const f=require('fs');process.stdout.write(String(
-f.readFileSync('/project/new-name','utf8')==='saved'&&f.existsSync('/project/.git/HEAD')
-&&!f.existsSync('/project/old-name')&&!f.existsSync('/project/deleted')))`), 'true');
+f.readFileSync('/workspace/projects/new-name','utf8')==='saved'&&f.existsSync('/workspace/projects/.git/HEAD')
+&&!f.existsSync('/workspace/projects/old-name')&&!f.existsSync('/workspace/projects/deleted')))`), 'true');
         await operate(origins[0], tokenA, fixtureOrigins[0], join(output, replacement ? 'after-replacement.png' : 'after-restart.png'));
     }
     assert.equal(execute(b, `const f=require('fs');process.stdout.write(String(
-(!f.existsSync('/project/.reticle/sessions')||f.readdirSync('/project/.reticle/sessions').length===0)
-&&!f.existsSync('/project/new-name')&&!f.existsSync('/project/.git')))`), 'true');
+(!f.existsSync('/workspace/projects/.reticle/sessions')||f.readdirSync('/workspace/projects/.reticle/sessions').length===0)
+&&!f.existsSync('/workspace/projects/new-name')&&!f.existsSync('/workspace/projects/.git')))`), 'true');
     const missing = `${id}-missing-mounts`;
     stage = 'missing-mounts';
     launch(missing, [...restricted, '--network', 'none', '--env', 'EZIL_RETICLE_ALLOWED_ORIGINS=["http://127.0.0.1"]', immutableImage]);

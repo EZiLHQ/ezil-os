@@ -263,7 +263,10 @@ The Docker recipe pins the Linux/amd64 Node image to
 Node.js is MIT-licensed with bundled third-party notices; the image retains
 its Node and Debian component notices. Supervisor development dependencies
 are TypeScript 5.9.3 (Apache-2.0), tsx 4.23.15 (MIT), and @types/node
-20.19.43 (MIT), as declared in their installed package metadata.
+24.3.0 (MIT), as declared in their installed package metadata. The host control
+protocol pins Zod 3.25.76 (MIT); Node's built-in SQLite module supplies the
+private host ledger. Host protocol dependencies are not copied into the
+standalone Reticle adapter image.
 
 The optional private acceptance package pins `@modelcontextprotocol/sdk`
 1.30.0 (MIT) and Playwright 1.62.1 (Apache-2.0), checked in their installed

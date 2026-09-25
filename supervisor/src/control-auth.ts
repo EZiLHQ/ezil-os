@@ -33,7 +33,11 @@ function canonicalBytes(method: string, path: string, timestamp: string, nonce: 
 
 /** A bounded in-process replay guard. The host service must also enforce a
  * durable installation generation and idempotency key across restarts. */
-export class ControlReplayGuard {
+export interface ControlNonceStore {
+    reserve(nonce: string, validUntilMs: number, nowMs: number): 'ok' | 'replay' | 'full';
+}
+
+export class ControlReplayGuard implements ControlNonceStore {
     private readonly seen = new Map<string, number>();
 
     reserve(nonce: string, validUntilMs: number, nowMs: number): 'ok' | 'replay' | 'full' {
@@ -52,7 +56,7 @@ export class ControlReplayGuard {
 export function verifyControlRequest(
     request: SignedControlRequest,
     secret: Uint8Array,
-    replay: ControlReplayGuard,
+    replay: ControlNonceStore,
     nowMs = Date.now(),
 ): AuthResult {
     if (secret.length < 32) throw new Error('control_secret_too_short');

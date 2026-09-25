@@ -1,4 +1,5 @@
 *
 !dist/
 !dist/reticle-adapter.js
-!package.json
+!reticle/
+!reticle/runtime-package.json

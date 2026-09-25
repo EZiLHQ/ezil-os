@@ -1,16 +1,21 @@
 # Computer admission checks and Reticle adapter
 
-This package contains host admission checks and a foreground adapter for the
-pinned Reticle 3.2.0 daemon. The HTTP supervisor, Docker reconciler, EBS
-controller, Cloudflare routing, and marketplace integration are still pending.
-The admission checks are not yet wired into a running host service.
+This package contains an authenticated HTTP control service factory, a durable
+command ledger, host admission checks, and a foreground adapter for the pinned
+Reticle 3.2.0 daemon. The executable host service, Docker reconciler, EBS
+controller, Cloudflare routing, and marketplace integration remain pending.
+The HTTP factory requires an explicitly supplied execution driver; its tests
+verify control behavior with an instrumented driver, not a production host.
 
 Control requests use a computer-specific secret of at least 32 bytes,
 provisioned outside the repository. The signature binds the method, raw path,
-timestamp, nonce, and exact body digest. The replay cache is bounded but lives
-in memory: a host service must additionally persist generations and idempotency
-before performing operations. This protocol must never be exposed through the
-unauthenticated local development server or forward Supabase tokens to apps.
+timestamp, nonce, and exact body digest. The HTTP service uses the host-private
+SQLite ledger for nonces, command generations, request idempotency, and observed
+state. Its synchronous FULL transactions persist intent before execution; a
+process restart does not reset replay protection. The standalone in-memory
+guard remains available for isolated tests. This protocol must never be exposed
+through the unauthenticated local development server or forward Supabase tokens
+to apps. See [the host control protocol](CONTROL.md) for integration requirements.
 
 The volume verifier reads Linux mount evidence and a private computer/volume
 marker. A directory on the root disk, wrong marker, or read-only mount fails
@@ -25,14 +30,19 @@ stay outside this repository. The adapter calls the actual `startDaemon` entry
 point on port 4400. It does not run the detached CLI, load project `.env` files,
 or automatically instrument projects.
 
-The container requires writable `/project` and `/data` mounts. The supervisor
-must supply only the explicitly selected project and installation directory.
-The adapter creates `/project/.reticle` before starting the daemon, after the
+The host supplies `EZIL_RETICLE_PROJECT_PATH` under `/workspace/` and
+`EZIL_RETICLE_PRIVATE_PATH` under `/data/`, matching the approved manifest's
+mount destinations. Both must be actual writable mount points; a broader
+parent mount is rejected. The private mount must have owner-only permissions.
+The legacy local defaults `/project` and `/data` remain available when both
+variables are absent. Partial or unsafe configuration fails startup.
+
+The adapter creates `.reticle` inside the selected project before startup, after the
 host has supplied the approved project mount. Without that marker Reticle
 treats a fresh directory as unapproved and selects its non-persistent home
 directory for journals. Escaping state symlinks fail startup.
-Project state lives in `/project/.reticle`; a private, durably created pairing
-token lives in `/data/reticle/pairing-token`. Provisioning failures block startup
+Project state stays inside that directory; a private, durably created pairing
+token lives inside the approved private mount. Provisioning failures block startup
 instead of allowing upstream's best-effort token creation to disable auth.
 `EZIL_RETICLE_ALLOWED_ORIGINS` is an explicit JSON array of exact HTTPS origins
 (loopback HTTP is allowed for local tests). It is configuration, not a secret.
@@ -49,8 +59,9 @@ npm --prefix supervisor ci --ignore-scripts
 bash tools/test.sh supervisor
 ```
 
-The 15 unit tests cover request replay, signature scope, mount and marker
-failures, exact origins, token provisioning races, and fail-closed startup.
+The 24 unit tests cover real HTTP signature/scope enforcement, durable replay,
+two-process generation races, stale observations, mount and marker failures,
+exact origins, token provisioning races, and fail-closed startup.
 The artifact-verifier test additionally checks content digests and rejects
 escaping symlinks and native modules. See [the private build and container
 acceptance recipe](reticle/README.md) for reproducible real-browser checks.
@@ -61,7 +72,9 @@ fixture; `reticle_look` found its counter and `reticle_act.click` changed the
 rendered count from 0 to 1. After an observed container stop/start using the
 same image, the pairing token, project configuration, event journal (7,526
 bytes), and action journal (237 bytes) matched their earlier hashes, and the
-operation succeeded again. Anonymous and cross-installation requests failed;
+operation succeeded again. The suite also passed three real operations with
+the manifest's `/workspace/projects` and `/data/reticle` mounts, including after
+container replacement. Anonymous and cross-installation requests failed;
 the second computer did not contain the first computer's project history.
 
 This establishes local adapter behavior. It does not establish EC2/EBS
