@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
-import { open, mkdir, writeFile, readFile, rm, chown, rename, chmod, symlink } from 'node:fs/promises';
+import { open, mkdir, writeFile, readFile, rm, chown, rename, chmod, symlink, stat } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Docker } from '../dist/docker.js';
 import { DockerComputerDriver } from '../dist/docker-driver.js';
 import { signControlRequest } from '../dist/control-auth.js';
+import { canonicalJson } from '../dist/control-protocol.js';
+import { prepareHostConfiguration } from '../dist/prepare.js';
+import { acquireHostLock } from '../dist/host-lock.js';
+import { verifyPreparationPull } from './prepare-pull.linux.mjs';
 
 const root = process.env.EZIL_TEST_ROOT, image = process.env.EZIL_TEST_IMAGE;
 assert.match(root ?? '', /^\/run\/ezil-driver-test-[a-f0-9-]{36}$/);
@@ -33,6 +37,8 @@ const config = { schemaVersion: 1, computerId, computerGeneration: 1, volumeId,
     controlPort: 24818, memoryBudgetMiB: 2048, suspended: false,
     approvedInstallations: [{ installationId, plan }] };
 const configPath = `${root}/config/config.json`;
+const inputPath = `${root}/config/desired.json`;
+let configurationRevision = 1;
 const command = (generation = 1, desired = 'running', requested = plan) => ({ schemaVersion: 1,
     requestId: randomUUID(), computerId, computerGeneration: 1, installationId,
     generation, operation: 'reconcile', desired, plan: requested });
@@ -103,7 +109,7 @@ async function saveConfig(value) {
 }
 async function reload(record, value, expected = 'host_configuration_reloaded') {
     const before = record.output.length;
-    await saveConfig(value);
+    await saveConfig({ ...value, configurationRevision: ++configurationRevision });
     record.child.kill('SIGHUP');
     await until(() => record.output.slice(before).includes(expected));
 }
@@ -118,13 +124,53 @@ try {
     await mkdir(`${root}/disk/Projects`); await mkdir(`${root}/disk/Projects/${projectId}`);
     await chown(`${root}/disk/Projects/${projectId}`, 1000, 1000);
     await writeFile(`${root}/config/control.key`, secret, { mode: 0o600 });
-    await saveConfig(config);
+    await verifyPreparationPull(root, config);
+    const preparedOnly = { ...config, approvedInstallations: [], preparedInstallations: [{ installationId,
+        releaseId: plan.releaseId, policyDigest: plan.policyDigest, image, privateDirectories: plan.privateDirectories }] };
+    await writeFile(inputPath, JSON.stringify(preparedOnly), { mode: 0o600 });
+    const prepared = await prepareHostConfiguration(inputPath, configPath, { privateValidation: true });
+    assert.equal(prepared.configurationRevision, 1);
+    assert.deepEqual(prepared.preparedImages, [{ reference: image, contentId: image }]);
+    const cliReceipt = JSON.parse(run('/usr/local/bin/node', ['/code/dist/prepare.js', inputPath, configPath, '--private-validation']).toString());
+    assert.equal(cliReceipt.event, 'host_prepared'); assert.equal(cliReceipt.configurationRevision, 1);
+    assert.equal((await owned()).length, 0, 'preparation never creates or starts an application');
+    const installationHost = launch(); await ready(installationHost);
+    assert.equal((await send(signed(command()))).status, 403, 'prepared image does not authorize execution or project access');
+    await stopped(installationHost);
+    const stateDir = await stat(`${root}/disk/Applications/${installationId}/state`);
+    assert.equal(stateDir.uid, 1000); assert.equal(stateDir.mode & 0o777, 0o700);
+    const activeDigest = fingerprint(await readFile(configPath));
+    const cancelled = new AbortController(); cancelled.abort();
+    await assert.rejects(prepareHostConfiguration(inputPath, configPath, { privateValidation: true, signal: cancelled.signal }), /preparation_cancelled/);
+    const preparationLock = await acquireHostLock('preparation');
+    try { await assert.rejects(prepareHostConfiguration(inputPath, configPath, { privateValidation: true }), /preparation_already_running/); }
+    finally { await preparationLock.release(); }
+    await rename(`${root}/disk/.ezil-volume.json`, `${root}/disk/held-marker`);
+    try { await assert.rejects(prepareHostConfiguration(inputPath, configPath, { privateValidation: true }), /data_marker_invalid/); }
+    finally { await rename(`${root}/disk/held-marker`, `${root}/disk/.ezil-volume.json`); }
+    const missing = structuredClone(config); missing.configurationRevision = 2;
+    missing.approvedInstallations[0].plan.image = `sha256:${'0'.repeat(64)}`;
+    await writeFile(inputPath, JSON.stringify(missing), { mode: 0o600 });
+    await assert.rejects(prepareHostConfiguration(inputPath, configPath, { privateValidation: true }), /docker_operation_failed/);
+    assert.equal(fingerprint(await readFile(configPath)), activeDigest, 'failure keeps the active approval file intact');
+    await writeFile(inputPath, JSON.stringify({ ...config, configurationRevision: 2, suspended: true }), { mode: 0o600 });
+    await prepareHostConfiguration(inputPath, configPath, { privateValidation: true });
+    await writeFile(inputPath, JSON.stringify(config), { mode: 0o600 });
+    await assert.rejects(prepareHostConfiguration(inputPath, configPath, { privateValidation: true }), /configuration_revision_conflict/);
+    configurationRevision = 3;
+    await writeFile(inputPath, JSON.stringify({ ...config, configurationRevision }), { mode: 0o600 });
+    await prepareHostConfiguration(inputPath, configPath, { privateValidation: true });
     const production = launch(false);
     await until(() => production.exit);
     assert.equal(production.exit.code, 1);
     assert(production.output.includes('production_image_or_origin_required'));
 
     let host = launch(); await ready(host);
+    const descriptor = { schemaVersion: 1, requestId: randomUUID(), computerId, computerGeneration: 1, operation: 'configuration' };
+    const loaded = await (await send(signed(descriptor))).json();
+    assert.equal(loaded.configurationRevision, configurationRevision);
+    assert.equal(loaded.configurationDigest, fingerprint(Buffer.from(canonicalJson({ ...config, configurationRevision, preparedInstallations: [] }))));
+    assert.equal((await send({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(descriptor) })).status, 401);
     const duplicate = launch(); await until(() => duplicate.exit);
     assert.equal(duplicate.exit.code, 1);
     assert(duplicate.output.includes('host_already_running'));
@@ -166,6 +212,7 @@ try {
     assert.equal(fingerprint(await readFile(dataFile)), savedDigest);
 
     await reload(host, { ...config, suspended: true });
+    assert.equal((await (await send(signed(descriptor))).json()).configurationRevision, configurationRevision);
     assert.equal((await owned())[0].State.Running, false);
     assert.equal((await send(signed(command()))).status, 403);
     await submit(command(2, 'stopped'));
@@ -191,6 +238,21 @@ try {
     await reload(host, config);
     await submit(command(4)); await until(serving);
     assert.equal((await owned())[0].State.Running, true);
+    const beforeStale = host.output.length;
+    await saveConfig({ ...config, configurationRevision: 1 });
+    host.child.kill('SIGHUP');
+    await until(() => host.output.slice(beforeStale).includes('host_configuration_reload_failed'));
+    assert((await owned()).every(item => !item.State.Running));
+    await reload(host, config);
+    await submit(command(4)); await until(serving);
+    await stopped(host, 'SIGKILL');
+    await saveConfig({ ...config, configurationRevision: 1 });
+    const staleBoot = launch(); await until(() => staleBoot.exit);
+    assert.equal(staleBoot.exit.code, 1);
+    assert((await owned()).every(item => !item.State.Running), 'stale boot file stops prior owned containers');
+    await saveConfig({ ...config, configurationRevision: ++configurationRevision });
+    host = launch(); await ready(host);
+    await submit(command(4)); await until(serving);
     await reload(host, { ...config, unexpected: 'sensitive-error-sentinel' }, 'host_configuration_reload_failed');
     assert((await owned()).every(item => !item.State.Running), 'invalid authority reload stops or removes owned apps');
     assert(!host.output.includes('sensitive-error-sentinel'));
@@ -209,7 +271,7 @@ try {
     assert.equal(linked.exit.code, 1);
     assert(linked.output.includes('host_file_unavailable'));
     for (const record of children) assert(!record.output.includes(secret.toString('hex')));
-    process.stdout.write(`PASS: actual ${reticle ? 'Reticle' : 'Node'} host process, kernel lock, SIGKILL/replay recovery, SIGTERM stop, persisted data, retained deadlines, independent expiry, fail-closed reload and secret files\n`);
+    process.stdout.write(`PASS: actual ${reticle ? 'Reticle' : 'Node'} preparation and host process, kernel locks, atomic approval files, cancelled/failed preparation, stale revision denial, SIGKILL/replay recovery, SIGTERM stop, persisted data, retained deadlines, independent expiry, fail-closed reload and secret files\n`);
 } finally {
     for (const record of children) {
         if (!record.exit) { record.child.kill('SIGKILL'); await until(() => record.exit); }

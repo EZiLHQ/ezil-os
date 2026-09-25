@@ -20,6 +20,7 @@ export type ControlServiceOptions = {
     isAvailable?: () => boolean;
     onFailure?: (code: string) => void;
     onSettled?: (result: { installationId: string; generation: number; state: StoredIntent['observed'] }) => void | Promise<void>;
+    configuration?: () => { revision: number; digest: string };
 };
 const json = (response: ServerResponse, status: number, value: unknown) => {
     response.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store',
@@ -108,6 +109,14 @@ export function createControlService(options: ControlServiceOptions) {
             const command = parsed.data;
             if (command.computerId !== options.computerId || command.computerGeneration !== options.computerGeneration) {
                 return json(response, 403, { code: 'computer_scope_mismatch' });
+            }
+            if (command.operation === 'configuration') {
+                const current = options.configuration?.();
+                if (!current || !Number.isSafeInteger(current.revision) || current.revision < 1 || !/^[a-f0-9]{64}$/.test(current.digest)) {
+                    return json(response, 503, { code: 'computer_configuration_unavailable' });
+                }
+                return json(response, 200, { computerId: options.computerId, computerGeneration: options.computerGeneration,
+                    configurationRevision: current.revision, configurationDigest: current.digest });
             }
             if (command.operation === 'observe') {
                 const before = options.store.get(command.installationId);

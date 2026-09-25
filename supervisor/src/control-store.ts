@@ -39,7 +39,8 @@ export class ControlStore implements ControlNonceStore {
                 digest TEXT NOT NULL, command TEXT NOT NULL, observed TEXT NOT NULL DEFAULT 'unknown');
             CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, installation TEXT NOT NULL, generation INTEGER NOT NULL, digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS runtime_leases (installation TEXT NOT NULL, generation INTEGER NOT NULL,
-                digest TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY(installation,generation));`);
+                digest TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY(installation,generation));
+            CREATE TABLE IF NOT EXISTS configuration (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, digest TEXT NOT NULL);`);
             this.transaction(() => {
                 const identity = this.db.prepare('SELECT computer,generation FROM identity WHERE id=1').get();
                 if (identity && (identity.computer !== computerId || identity.generation !== computerGeneration)) {
@@ -97,6 +98,21 @@ export class ControlStore implements ControlNonceStore {
         const command = JSON.parse(String(row.command)) as ReconcileCommand;
         return { installationId, generation: Number(row.generation), desired: command.desired,
             command, observed: row.observed as StoredIntent['observed'] };
+    }
+    /** A delayed provisioning write cannot restore revoked authority after a
+     * reload or process restart. Retrying identical content is idempotent. */
+    acceptConfiguration(revision: number, digest: string): void {
+        if (!Number.isInteger(revision) || revision < 1 || revision > 2_147_483_647 || !/^[a-f0-9]{64}$/.test(digest)) {
+            throw new Error('configuration_revision_invalid');
+        }
+        this.transaction(() => {
+            const current = this.db.prepare('SELECT revision,digest FROM configuration WHERE id=1').get();
+            if (current && (Number(current.revision) > revision || (current.revision === revision && current.digest !== digest))) {
+                throw new Error('configuration_revision_conflict');
+            }
+            this.db.prepare('INSERT INTO configuration VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,digest=excluded.digest')
+                .run(revision, digest);
+        });
     }
     /** Commit a deadline before Docker creation. Retries, process restarts,
      * failed starts and deleted containers cannot extend the same command's

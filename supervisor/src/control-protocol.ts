@@ -86,9 +86,10 @@ export const ExecutionPlanSchema = z.object({
     }
 });
 export type ExecutionPlan = z.infer<typeof ExecutionPlanSchema>;
-const envelope = { schemaVersion: z.literal(1), requestId: uuid, computerId: uuid, computerGeneration: generation,
-    installationId: uuid };
+const hostEnvelope = { schemaVersion: z.literal(1), requestId: uuid, computerId: uuid, computerGeneration: generation };
+const envelope = { ...hostEnvelope, installationId: uuid };
 export const ControlCommandSchema = z.discriminatedUnion('operation', [
+    z.object({ ...hostEnvelope, operation: z.literal('configuration') }).strict(),
     z.object({ ...envelope, operation: z.literal('observe') }).strict(),
     z.object({ ...envelope, operation: z.literal('reconcile'), generation,
         desired: z.enum(['running', 'stopped']), plan: ExecutionPlanSchema }).strict(),

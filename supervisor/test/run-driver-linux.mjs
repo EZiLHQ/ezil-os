@@ -1,9 +1,10 @@
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gzipSync } from 'node:zlib';
 
 const base = 'node@sha256:5cbc7caba8c2c0f0bca675d1b61b9f2857e1cf1853c6164ee9dd409501a936e7';
 const docker = args => execFileSync('docker', args, { encoding: 'utf8', timeout: 180_000 });
@@ -15,7 +16,27 @@ const host = process.argv[2] === '--host';
 if (process.argv.length > 3 || (process.argv[2] && !host)) throw new Error('invalid_acceptance_arguments');
 const fixture = mkdtempSync(join(tmpdir(), 'ezil-driver-fixture-'));
 let image = process.env.EZIL_TEST_RETICLE_IMAGE;
+let registryConfig = '';
 try {
+    if (host) {
+        // Tiny unique scratch image exercises a real registry pull without
+        // downloading another base image or using any production credentials.
+        const context = join(fixture, 'registry'); mkdirSync(context);
+        const tag = `ezil-preparation-pull-${randomUUID()}`;
+        writeFileSync(join(context, 'Dockerfile'), `FROM scratch\nCOPY fixture.txt /fixture.txt\nLABEL org.ezil.test=${tag}\n`);
+        writeFileSync(join(context, 'fixture.txt'), tag);
+        try {
+            docker(['build', '--platform', 'linux/amd64', '--quiet', '-t', tag, context]);
+            docker(['image', 'save', '-o', join(context, 'image.tar'), tag]);
+            execFileSync('tar', ['-xf', join(context, 'image.tar'), '-C', context]);
+            const manifest = JSON.parse(readFileSync(join(context, 'manifest.json'), 'utf8'));
+            registryConfig = Buffer.from(JSON.stringify({ config: readFileSync(join(context, manifest[0].Config)).toString('base64'),
+                layers: manifest[0].Layers.map(path => {
+                    const bytes = readFileSync(join(context, path));
+                    return (bytes[0] === 0x1f && bytes[1] === 0x8b ? bytes : gzipSync(bytes)).toString('base64');
+                }) })).toString('base64');
+        } finally { docker(['image', 'rm', '-f', tag]); }
+    }
     if (!image) {
         writeFileSync(join(fixture, 'Dockerfile'), `FROM ${base}\nCOPY main.mjs /opt/app/main.mjs\n`);
         writeFileSync(join(fixture, 'main.mjs'), `import { createServer } from 'node:http';
@@ -47,6 +68,7 @@ server.listen(Number(process.env.PORT),'0.0.0.0');`);
         '--mount', `type=bind,src=${code},dst=/code,readonly`,
         '--env', `EZIL_TEST_ROOT=${root}`, '--env', `EZIL_TEST_IMAGE=${image}`,
         '--env', `EZIL_TEST_RETICLE=${process.env.EZIL_TEST_RETICLE_IMAGE ? '1' : '0'}`,
+        '--env', `EZIL_TEST_REGISTRY_CONFIG=${registryConfig}`,
         '--entrypoint', 'node', hostImage, host ? '/code/test/host.linux.mjs' : '/code/test/driver.linux.mjs']);
     process.stdout.write(output);
 } finally {
