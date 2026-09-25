@@ -23,6 +23,7 @@
         "test:db:computer-configurations": "bun --no-env-file tests/computer-configurations-db.ts",
         "test:db:configuration-producer": "bun --no-env-file tests/computer-configuration-producer-db.ts",
         "test:db:configuration-delivery": "bun --no-env-file tests/configuration-delivery-db.ts",
+        "test:db:configuration-authority": "bun --no-env-file tests/configuration-authority-db.ts",
         "test:host:configuration": "bun --no-env-file tests/configuration-host-acceptance.ts",
         "db:generate": "drizzle-kit generate",
         "db:migrate": "drizzle-kit migrate",

@@ -67,8 +67,9 @@ records intact and disables producers/delivery.
 
 `produceComputerConfiguration` now compiles and persists a whole computer's
 snapshot from current database records. It is an internal operation with an
-explicit enable switch; no HTTP handler, cron, provider call or public feature
-flag invokes it yet. Apply migration 0006 before deploying a caller. Disabled
+explicit enable switch. The workflow authority endpoint below can refresh it;
+no cron, provider call or public feature flag invokes it. Apply migration 0006
+before enabling a caller. Disabled
 calls do no database work, and ordinary browser status queries remain read-only.
 
 The producer locks the computer to serialize revisions and reads its recorded
@@ -244,3 +245,72 @@ wrong bytes/versions/scope, Standard/Express distinctions, cancellation, maximum
 payload and secret-safe errors. These tests do not establish IAM enforcement,
 SSM transfer, disk attachment, cloud isolation, stopped billing or browser readiness.
 Run `bash tools/test.sh app` and the local-config production build before shipping.
+
+## Current workflow authority check (disabled by default)
+
+`POST /api/internal/apps/configuration-authority` lets the trusted delivery
+workflow check current database authority before a host operation. It performs
+no provider calls, starts no resources, and cannot acknowledge installation or
+loaded configuration. Refreshing authority can persist a new desired snapshot
+and delivery event, so this is not a read-only status endpoint.
+
+Enable only after migration 0006, reviewed workflow deployment and dedicated
+credential provisioning. `EZIL_CONFIGURATION_AUTHORITY_ENABLED` defaults to
+`false`; disabled requests return 404 without accessing the database. When
+enabled, `EZIL_CONFIGURATION_AUTHORITY_SECRET` is required at boot: a separate
+32-byte random key encoded as 64 lowercase hexadecimal characters. Do not reuse
+Supabase, host-control or browser credentials. This key belongs only in the
+control plane and trusted workflow signer, never workflow input/history, SSM
+arguments, containers or client bundles. No cookie or bearer fallback exists;
+the proxy bypasses Supabase session refresh for this exact route.
+
+Each request supplies `x-ezil-workflow-timestamp` (ten-digit Unix seconds) and
+`x-ezil-workflow-signature` (lowercase HMAC-SHA256 hex). Decode the key from hex
+and sign this UTF-8 transcript, with newlines between lines and no final newline:
+
+```text
+ezil-configuration-authority-v1
+POST
+/api/internal/apps/configuration-authority
+<timestamp>
+<lowercase SHA-256 of exact raw request bytes>
+```
+
+The body is strict JSON `{ schemaVersion: 1, configurationId, operation,
+revision, digest, scope }`. `operation` is `prepare` or `reload`; `revision`
+and `scope.computerGeneration` are positive 32-bit integers. The unprefixed
+`digest` is lowercase SHA-256. Scope contains the computer UUID, generation,
+17-hex-digit EC2 instance and EBS volume IDs, and fence UUID. The request
+contains no configuration body, secrets or storage paths. IDs must match
+immutable server records; possession of an ID grants no authority.
+
+Only JSON with optional UTF-8 charset is accepted, with no query string or
+content encoding. The actual body is limited to 4096 bytes and five seconds,
+regardless of Content-Length. Signatures have a 30-second clock tolerance,
+checked before and after body reading and again after database work. Disconnects
+and stalled/oversized bodies cancel the reader. All handler responses use fixed
+codes and `Cache-Control: no-store`; validation and database errors omit inputs.
+
+The transaction locks the computer before delivery records, reuses the producer
+to check current ownership, OS access, grants, releases, jobs, services, leases,
+project consent and quotas, and requires the exact unsuperseded snapshot. Reload
+also requires a preparation receipt. The writer must be unfenced and recorded
+running, with an observation no older than five minutes or over 30 seconds in
+the future. Per-statement and lock timeouts are five and two seconds; these are
+not a whole-transaction deadline. A freshly produced suspended snapshot remains
+deliverable after OS access is revoked so the host can remove old authority.
+
+Success is `{ authorized: true, ...validatedRequest }`. It is a point-in-time
+check, not a reusable capability. An identical fresh signed request is permitted
+to repeat only by rerunning all database checks; revocation invalidates it. The
+future workflow must make fresh checks before dispatch and during long work,
+observe actual EC2/EBS writer state, compensate known cancelled commands, and
+authenticate the final loaded descriptor. This response and the recorded writer
+observation do not prove provider state or eliminate a dispatch/revocation race.
+Host fencing and ongoing reconciliation remain required.
+
+Run `bun run test:db:configuration-authority` with loopback
+`EZIL_TEST_DATABASE_URL` for real replay/revocation, scope, suspension,
+replacement, concurrent delivery and lock-timeout tests. HTTP/unit tests cover
+signature bytes, timeouts, cancellation, strict inputs and secret-safe errors.
+No cloud, hosted migration or marketplace activation occurs in these tests.

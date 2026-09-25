@@ -70,7 +70,15 @@ const serverSchema = z.object({
     EZIL_APP_INSTALL_ENABLED: z.enum(['true', 'false']).default('false'),
     /** Enable only after durable command delivery and host provisioning exist. */
     EZIL_APP_RUNTIME_COMMANDS_ENABLED: z.enum(['true', 'false']).default('false'),
+    /** Dedicated internal workflow checks; migrate 0006 before activation. */
+    EZIL_CONFIGURATION_AUTHORITY_ENABLED: z.string().refine(value => ['true', 'false'].includes(value),
+        'invalid_configuration_authority_flag').default('false'),
+    EZIL_CONFIGURATION_AUTHORITY_SECRET: z.string().regex(/^[a-f0-9]{64}$/, 'invalid_configuration_authority_secret').optional(),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+}).superRefine((value, context) => {
+    if (value.EZIL_CONFIGURATION_AUTHORITY_ENABLED === 'true' && !value.EZIL_CONFIGURATION_AUTHORITY_SECRET) {
+        context.addIssue({ code: 'custom', path: ['EZIL_CONFIGURATION_AUTHORITY_SECRET'], message: 'configuration_authority_secret_required' });
+    }
 });
 
 /**
@@ -96,6 +104,8 @@ const parsedServer = isServer
           EZIL_APP_SUBMISSION_INTAKE_ENABLED: process.env.EZIL_APP_SUBMISSION_INTAKE_ENABLED,
           EZIL_APP_INSTALL_ENABLED: process.env.EZIL_APP_INSTALL_ENABLED,
           EZIL_APP_RUNTIME_COMMANDS_ENABLED: process.env.EZIL_APP_RUNTIME_COMMANDS_ENABLED,
+          EZIL_CONFIGURATION_AUTHORITY_ENABLED: process.env.EZIL_CONFIGURATION_AUTHORITY_ENABLED,
+          EZIL_CONFIGURATION_AUTHORITY_SECRET: process.env.EZIL_CONFIGURATION_AUTHORITY_SECRET,
           NODE_ENV: process.env.NODE_ENV,
       })
     : null;
@@ -138,6 +148,8 @@ export const env = {
         EZIL_APP_SUBMISSION_INTAKE_ENABLED: 'false' as const,
         EZIL_APP_INSTALL_ENABLED: 'false' as const,
         EZIL_APP_RUNTIME_COMMANDS_ENABLED: 'false' as const,
+        EZIL_CONFIGURATION_AUTHORITY_ENABLED: 'false' as const,
+        EZIL_CONFIGURATION_AUTHORITY_SECRET: undefined,
         NODE_ENV: process.env.NODE_ENV ?? 'development',
     }),
     ...parsedClient.data,

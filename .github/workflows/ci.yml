@@ -302,6 +302,9 @@ jobs:
       - name: Configuration delivery and installation completion
         working-directory: app
         run: bun run test:db:configuration-delivery
+      - name: Current workflow configuration authority
+        working-directory: app
+        run: bun run test:db:configuration-authority
 
   connectors:
     name: sdk + mcp (typecheck + unit)
