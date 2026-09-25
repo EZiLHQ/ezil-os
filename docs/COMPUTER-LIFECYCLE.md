@@ -86,6 +86,38 @@ reconciliation; it is never marked failed merely to admit replacement work.
 Stop/retire cleanup can proceed after owner access revocation. No operation
 permanently deletes the retained data volume.
 
+When the trusted transport factory receives a `recoveryDeployments` mapping
+from original numeric workflow versions to approved recovery versions, it can
+observe the separate cleanup workflow from PR #123. The mapping defaults to
+absent; an unconfigured, missing, running or failed recovery keeps admission
+reserved. No browser input selects this mapping and the web transport cannot
+start recovery, stop instances or delete volumes.
+
+For a failed/aborted/timed-out original execution, the adapter verifies the
+recovery execution's exact name, input, version and receipt, then independently
+reads complete original history and EC2/EBS state. An entered allocation task
+cannot disappear from the receipt. Existing writers must be present, new writers
+must match their original allocation token, every writer must be terminated,
+and the encrypted data disk must be detached and available. An empty resource
+list never causes an unscoped account-wide describe request. Successful original
+workflows are not eligible for this automatic recovery path.
+
+Only after this independent observation does the consumer atomically fence the
+recorded writers, retain the disk/AZ association, mark the original job failed
+with `lifecycle_recovered`, and acknowledge its outbox event. It performs no
+installation and does not claim that the original operation succeeded. A stale
+lease, stale observation, forged scope or storage conflict rolls back the
+acknowledgment. Historical cleanup remains valid after owner access revocation.
+These writes use existing schema; no migration is added by this consumer change.
+
+Activation still requires durable cancellation for revocation racing successful
+completion, and an explicit recovery intent that starts a new generation on a
+retained disk after its old writers are fenced. The current v1 provision contract
+cannot silently treat an existing retained disk as an empty new computer. A
+data-only interrupted allocation remains associated with its owner even if it
+never received an instance. Keep producers disabled until that recovery path,
+host bootstrap, scheduling and approved cloud acceptance are complete.
+
 `POST /api/internal/computers/lifecycle-authority` checks the current immutable
 job/digest under a dedicated 30-second HMAC. It accepts no caller-selected
 provider IDs. Cookie/bearer authentication cannot substitute for the workflow

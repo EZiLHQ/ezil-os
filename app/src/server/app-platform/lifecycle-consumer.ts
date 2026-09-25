@@ -7,6 +7,7 @@ import { hasCurrentOsAccess, type OsAccessMode } from './runtime-authority';
 import { LifecycleAuthorityRequestSchema } from './lifecycle-authority-protocol';
 import { LifecycleDeploymentSchema, LifecycleError, parseLifecycleWork, validateLifecycleReceipt,
     type LifecycleDeployment, type LifecycleIntent, type LifecycleReceipt, type LifecycleWork } from './lifecycle-protocol';
+import { validateLifecycleRecoveryReceipt, type LifecycleRecoveryReceipt } from './lifecycle-recovery-protocol';
 
 type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 export interface LifecycleClaim { computerId: string; jobId: string; attempt: number }
@@ -18,7 +19,8 @@ export interface LifecycleConsumerOptions {
     /** Submission/observation of the same version-pinned Standard execution.
      * A false allowStart permits observation only, including after revocation. */
     advance(work: LifecycleWork, allowStart: boolean, signal: AbortSignal): Promise<
-        { state: 'pending' } | { state: 'observed'; receipt: LifecycleReceipt; observedAt: Date }>;
+        { state: 'pending' } | { state: 'observed'; receipt: LifecycleReceipt; observedAt: Date }
+        | { state: 'fenced'; receipt: LifecycleRecoveryReceipt; observedAt: Date }>;
 }
 type BaseOptions = Omit<LifecycleConsumerOptions, 'advance'>;
 const active = ['queued', 'running'] as const;
@@ -107,7 +109,7 @@ export async function authorizeLifecycleWork(o: BaseOptions, input: { computerId
 
 /** No provider call runs while a database lock is held. Duplicate deliveries
  * use the same Standard execution; stale workers cannot write a receipt. */
-export async function dispatchLifecycleClaim(o: LifecycleConsumerOptions, c: LifecycleClaim): Promise<'disabled' | 'stale' | 'waiting' | 'succeeded'> {
+export async function dispatchLifecycleClaim(o: LifecycleConsumerOptions, c: LifecycleClaim): Promise<'disabled' | 'stale' | 'waiting' | 'succeeded' | 'failed'> {
     if (!o.enabled) return 'disabled';
     try {
         const prepared = await o.database.transaction(async tx => {
@@ -149,14 +151,38 @@ export async function dispatchLifecycleClaim(o: LifecycleConsumerOptions, c: Lif
             const s = await load(tx, c);
             const [event] = await tx.select().from(outbox).where(owns(c)).limit(1).for('update');
             if (!s || !event) return 'stale' as const;
-            if (!result || result.state !== 'observed') return defer(tx, c, errorCode);
-            const receipt = validateLifecycleReceipt(s.work, result.receipt);
+            if (!result || result.state === 'pending') return defer(tx, c, errorCode);
             if (!(result.observedAt instanceof Date) || !Number.isFinite(result.observedAt.getTime())) {
                 return defer(tx, c, 'lifecycle_unconfirmed');
             }
             const fresh = await tx.execute<{ fresh: boolean }>(sql`SELECT ${result.observedAt.toISOString()}::timestamptz
                 BETWEEN clock_timestamp() - interval '30 seconds' AND clock_timestamp() + interval '5 seconds' AS fresh`);
             if (!fresh[0]?.fresh) return defer(tx, c, 'lifecycle_unconfirmed');
+            if (result.state === 'fenced') {
+                const receipt = validateLifecycleRecoveryReceipt(s.work, result.receipt);
+                // Cleanup authority survives access revocation. The adapter has
+                // independently observed exact terminated writers and retained
+                // detached storage; no success or fresh launch is implied.
+                for (const writer of receipt.instances) {
+                    if (s.writer?.providerInstanceId === writer.instanceId) {
+                        await tx.update(computerInstances).set({ fencedAt: sql`clock_timestamp()`, observedState: 'stopped', observedAt: result.observedAt })
+                            .where(and(eq(computerInstances.computerId, c.computerId), eq(computerInstances.generation, writer.generation),
+                                eq(computerInstances.providerInstanceId, writer.instanceId), eq(computerInstances.fenceToken, writer.fenceToken)));
+                    } else {
+                        await tx.insert(computerInstances).values({ computerId: c.computerId, generation: writer.generation,
+                            providerInstanceId: writer.instanceId, fenceToken: writer.fenceToken, observedState: 'stopped',
+                            observedAt: result.observedAt, fencedAt: sql`clock_timestamp()` });
+                    }
+                }
+                if (receipt.volumeId) await tx.update(computerRuntimes).set({ dataVolumeId: receipt.volumeId,
+                    availabilityZone: s.intent.deployment.availabilityZone, updatedAt: sql`clock_timestamp()` })
+                    .where(eq(computerRuntimes.computerId, c.computerId));
+                await tx.update(jobs).set({ status: 'failed', errorCode: 'lifecycle_recovered', completedAt: sql`clock_timestamp()` }).where(eq(jobs.id, c.jobId));
+                const [ack] = await tx.update(outbox).set({ deliveredAt: sql`clock_timestamp()`, leaseUntil: null }).where(owns(c)).returning();
+                if (!ack) throw new LifecycleError('lifecycle_unconfirmed');
+                return 'failed' as const;
+            }
+            const receipt = validateLifecycleReceipt(s.work, result.receipt);
             // Do not certify a superseded start as successful. Its reservation
             // remains held for workflow cancellation/reconciliation.
             if (starts(s.intent) && !await allowed(tx, o, s)) return defer(tx, c, 'lifecycle_authority_denied');

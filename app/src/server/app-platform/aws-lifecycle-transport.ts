@@ -3,12 +3,14 @@ import { EC2Client, DescribeInstancesCommand, DescribeVolumesCommand,
 import { SFNClient, DescribeExecutionCommand, DescribeStateMachineCommand, StartExecutionCommand } from '@aws-sdk/client-sfn';
 import { LifecycleError, parseLifecycleWork, validateLifecycleReceipt, type LifecycleWork } from './lifecycle-protocol';
 import type { LifecycleConsumerOptions } from './lifecycle-consumer';
+import { observeLifecycleRecovery, type LifecycleRecoveryDeployments } from './aws-lifecycle-recovery';
 
 export interface AwsLifecycleTransportOptions {
     /** Dedicated short-lived OIDC federation. No shared profile, IMDS or
      * long-lived administrator credential fallback in the web control plane. */
     credentials(): Promise<{ accessKeyId: string; secretAccessKey: string; sessionToken: string; expiration: Date }>;
     requestHandler?: EC2ClientConfig['requestHandler'];
+    recoveryDeployments?: LifecycleRecoveryDeployments;
 }
 const fail = (code: LifecycleError['code']): never => { throw new LifecycleError(code); };
 const nameOf = (error: unknown) => error instanceof Error ? error.name : '';
@@ -70,7 +72,11 @@ export function createAwsLifecycleTransport(options: AwsLifecycleTransportOption
             || execution.stateMachineVersionArn !== versionArn || execution.stateMachineAliasArn || execution.name !== name
             || execution.input !== input || execution.redriveCount !== 0) return fail('lifecycle_conflict');
         if (execution.status === 'RUNNING') return { state: 'pending' as const };
-        if (execution.status !== 'SUCCEEDED') return fail('lifecycle_unconfirmed');
+        if (execution.status !== 'SUCCEEDED') {
+            const recoveryVersionArn = options.recoveryDeployments?.[versionArn];
+            if (!recoveryVersionArn || !['FAILED', 'ABORTED', 'TIMED_OUT'].includes(execution.status ?? '')) return fail('lifecycle_unconfirmed');
+            return observeLifecycleRecovery({ work, recoveryVersionArn, sourceStatus: execution.status!, sfn, ec2, signal });
+        }
         if (!execution.output || Buffer.byteLength(execution.output) > 4096) return fail('lifecycle_conflict');
         let json: unknown;
         try { json = JSON.parse(execution.output); } catch { return fail('lifecycle_conflict'); }
