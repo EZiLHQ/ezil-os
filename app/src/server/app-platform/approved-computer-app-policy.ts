@@ -165,10 +165,14 @@ export function validateComputerPolicyAgainstManifest(
         }
         if (policy.backup.mode !== manifest.persistence.backup.mode) reject(['backup'], 'backup_mismatch');
     }
-    if (manifest.launch.mode === 'integration'
-        && !policy.mounts.sharedFolders.some(({ folder, access, scope }) =>
+    if (manifest.launch.mode === 'integration') {
+        if (!policy.capabilities.includes('projects.read') || !policy.capabilities.includes('projects.write')) {
+            reject(['capabilities'], 'integration_requires_approved_project_capabilities');
+        }
+        if (!policy.mounts.sharedFolders.some(({ folder, access, scope }) =>
             folder === 'Projects' && access === 'read-write' && scope === 'selected-projects')) {
-        reject(['mounts', 'sharedFolders'], 'integration_requires_approved_projects');
+            reject(['mounts', 'sharedFolders'], 'integration_requires_approved_projects');
+        }
     }
 
     if (policy.resources.cpuLimit < manifest.resources.cpu

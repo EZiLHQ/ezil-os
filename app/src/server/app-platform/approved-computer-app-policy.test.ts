@@ -103,6 +103,12 @@ describe('ApprovedComputerAppPolicyV2', () => {
         expect(validateComputerPolicyAgainstManifest(input, reticlePolicy(input))).toMatchObject({ success: true });
         issue(input, { ...reticlePolicy(input), mounts: { privateDirectories: ['state'], sharedFolders: [] } },
             ['policy', 'mounts', 'sharedFolders'], 'integration_requires_approved_projects');
+        issue(input, { ...reticlePolicy(input), capabilities: [] },
+            ['policy', 'capabilities'], 'integration_requires_approved_project_capabilities');
+        issue(input, { ...reticlePolicy(input), capabilities: ['projects.read'] },
+            ['policy', 'capabilities'], 'integration_requires_approved_project_capabilities');
+        issue(input, { ...reticlePolicy(input), capabilities: ['projects.write'] },
+            ['policy', 'capabilities'], 'custom');
     });
 
     it('rejects an approval that widens a project mount to the whole folder', () => {
