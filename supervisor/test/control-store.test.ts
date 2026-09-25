@@ -93,3 +93,20 @@ test('runtime deadlines persist beyond process/container loss and cannot be exte
         assert.equal(store.reserveRuntimeDeadline(next, expires + 3000), expires + 3000);
     } finally { store.close(); await rm(dir, { recursive: true, force: true }); }
 });
+
+test('approval revisions cannot regress or change content across process restart', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ezil-approval-'));
+    let store = new ControlStore(dir, computerId, 1);
+    try {
+        store.acceptConfiguration(1, 'a'.repeat(64));
+        store.acceptConfiguration(1, 'a'.repeat(64));
+        assert.throws(() => store.acceptConfiguration(1, 'b'.repeat(64)), /configuration_revision_conflict/);
+        store.acceptConfiguration(3, 'b'.repeat(64));
+        store.close(); store = new ControlStore(dir, computerId, 1);
+        assert.throws(() => store.acceptConfiguration(2, 'a'.repeat(64)), /configuration_revision_conflict/);
+        assert.throws(() => store.acceptConfiguration(3, 'a'.repeat(64)), /configuration_revision_conflict/);
+        store.acceptConfiguration(3, 'b'.repeat(64));
+        store.acceptConfiguration(4, 'a'.repeat(64));
+        assert.throws(() => store.acceptConfiguration(0, 'a'.repeat(64)), /configuration_revision_invalid/);
+    } finally { store.close(); await rm(dir, { recursive: true, force: true }); }
+});

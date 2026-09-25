@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { mkdir, open, readdir, type FileHandle } from 'node:fs/promises';
+import { open, readdir, type FileHandle } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ControlCommandSchema, intentDigest, type ExecutionPlan, type ReconcileCommand } from './control-protocol.js';
@@ -9,6 +9,8 @@ import { admitMountedDataVolume, type VolumeIdentity } from './data-volume.js';
 import { Docker, DockerError, type DockerContainer } from './docker.js';
 import { openHostDirectory, openDataDirectory, stageDataDirectory, releaseDataDirectory, type StagedDirectory } from './mounts.js';
 import { createServiceProxy } from './service-proxy.js';
+import { privateDirectory } from './installation-data.js';
+import { inspectRuntimeImage } from './runtime-image.js';
 
 const label = (key: string) => `org.ezil.computer.${key}`;
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -16,32 +18,6 @@ type Options = { computerId: string; computerGeneration: number; volume: VolumeI
     dataRoot: string; stagingRoot: string; memoryBudgetMiB: number; docker?: Docker;
     approvePlan(plan: ExecutionPlan, installationId: string): boolean;
     reserveDeadline(command: ReconcileCommand, proposed: number): number };
-
-async function privateDirectory(root: FileHandle, installationId: string, name: string): Promise<FileHandle> {
-    let parent = root;
-    try {
-        const parts = ['Applications', installationId, name];
-        for (const [index, part] of parts.entries()) {
-            const path = `/proc/self/fd/${parent.fd}/${part}`;
-            let created = false;
-            try { await mkdir(path, { mode: 0o700 }); created = true; }
-            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
-            const child = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-            if (parent !== root) await parent.close();
-            parent = child;
-            const last = index === parts.length - 1;
-            if (created && last) await child.chown(1000, 1000);
-            const stat = await child.stat();
-            if (stat.uid !== (last ? 1000 : 0) || stat.mode & 0o077 || stat.dev !== (await root.stat()).dev) {
-                throw new Error('unsafe_private_directory');
-            }
-        }
-        return parent;
-    } catch {
-        if (parent !== root) await parent.close();
-        throw new Error('private_directory_unavailable');
-    }
-}
 
 /** Real Docker execution, with one serialized admission queue per host. The
  * executable host MUST hold an OS-level singleton lock before constructing
@@ -180,16 +156,9 @@ export class DockerComputerDriver implements ComputerDriver {
         if (plan.services.length !== 1 || plan.services[0]!.dependsOn.length) throw new Error('unsupported_service_layout');
         const admission = await admitMountedDataVolume(this.options.dataRoot, this.options.volume);
         if (!admission.ok) throw new Error(admission.code);
-        const image = await this.docker.call<{ Id: string; Os: string; Architecture: string;
-            RepoDigests: string[]; Config: { Volumes?: Record<string, unknown>; OnBuild?: unknown[] } }>(
-            'GET', `/images/${encodeURIComponent(plan.image)}/json`);
-        if (image.Os !== 'linux' || image.Architecture !== 'amd64'
-            || Object.keys(image.Config.Volumes ?? {}).length || image.Config.OnBuild?.length
-            || (plan.image.startsWith('sha256:') ? image.Id !== plan.image : !image.RepoDigests?.includes(plan.image))) {
-            throw new Error('unsupported_runtime_image');
-        }
-        return image.Id;
+        return inspectRuntimeImage(this.docker, plan.image);
     }
+
     private async health(plan: ExecutionPlan, tokenPath: string | undefined, current: () => boolean): Promise<void> {
         const service = plan.services[0]!;
         const deadline = Date.now() + 20_000;

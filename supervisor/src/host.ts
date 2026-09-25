@@ -1,12 +1,12 @@
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { acquireHostLock } from './host-lock.js';
 import { ensureHostDirectory, hostAuthority, hostIdentity, readHostConfig, readHostFile } from './host-config.js';
 import { ControlStore } from './control-store.js';
 import { createControlService } from './control-server.js';
 import { DockerComputerDriver } from './docker-driver.js';
-import type { ExecutionPlan } from './control-protocol.js';
+import { canonicalJson, type ExecutionPlan } from './control-protocol.js';
 
 const report = (event: string) => { process.stdout.write(`${JSON.stringify({ event })}\n`); };
 
@@ -15,6 +15,9 @@ const report = (event: string) => { process.stdout.write(`${JSON.stringify({ eve
  * publisher configuration or browser session is used to authorize execution. */
 export async function startHost(configPath: string, privateValidation = false) {
     const config = await readHostConfig(configPath, privateValidation);
+    const snapshot = (value: typeof config) => ({ revision: value.configurationRevision,
+        digest: createHash('sha256').update(canonicalJson(value)).digest('hex') });
+    let activeConfiguration = snapshot(config);
     const secretPath = join(dirname(configPath), 'control.key');
     const secret = await readHostFile(secretPath, 32);
     if (secret.length !== 32) throw new Error('host_secret_invalid');
@@ -22,7 +25,7 @@ export async function startHost(configPath: string, privateValidation = false) {
     let store: ControlStore | undefined;
     let driver: DockerComputerDriver | undefined;
     let service: ReturnType<typeof createControlService> | undefined;
-    let available = false, stopping = false, reloading = false, configurationValid = true;
+    let available = false, stopping = false, reloading = false, configurationValid = false;
     let authority = hostAuthority(config);
     let expiry: Promise<void> | undefined;
     let timer: ReturnType<typeof setInterval> | undefined;
@@ -60,9 +63,14 @@ export async function startHost(configPath: string, privateValidation = false) {
             volume: { computerId: config.computerId, volumeId: config.volumeId }, dataRoot: config.dataRoot,
             stagingRoot: config.stagingRoot, memoryBudgetMiB: config.memoryBudgetMiB, approvePlan: approve,
             reserveDeadline: (command, proposed) => store!.reserveRuntimeDeadline(command, proposed) });
+        // Construct the driver first so startup rejection still stops owned
+        // containers during shutdown. Never enable authority from stale files.
+        store.acceptConfiguration(activeConfiguration.revision, activeConfiguration.digest);
+        configurationValid = true;
         await driver.recover(store.list());
         service = createControlService({ computerId: config.computerId, computerGeneration: config.computerGeneration,
             secret, store, driver, approvePlan: approve, isAvailable: () => available && configurationValid && !stopping && !reloading,
+            configuration: () => activeConfiguration,
             onFailure: report, onSettled: ({ installationId, generation, state }) => {
                 process.stdout.write(`${JSON.stringify({ event: 'host_command_settled', installationId, generation, state })}\n`);
             } });
@@ -94,9 +102,12 @@ export async function startHost(configPath: string, privateValidation = false) {
                         }
                     } finally { key.fill(0); }
                     await service!.drain();
+                    const accepted = snapshot(next);
+                    store!.acceptConfiguration(accepted.revision, accepted.digest);
                     authority = hostAuthority(next);
                     configurationValid = true;
                     await driver!.recover(store!.list());
+                    activeConfiguration = accepted;
                     available = true;
                     report('host_configuration_reloaded');
                 } catch {

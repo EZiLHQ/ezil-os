@@ -7,14 +7,31 @@ import { openHostDirectory } from './mounts.js';
 
 const path = z.string().max(256).refine(value => isAbsolute(value) && normalize(value) === value
     && value !== '/' && !value.endsWith('/') && value.slice(1).split('/').every(part => /^[a-zA-Z0-9_-][a-zA-Z0-9._-]*$/.test(part)));
+/** Install can prepare immutable bytes/private state before a Reticle project
+ * is selected. This record never authorizes execution or shared-folder access. */
+const PreparedInstallationSchema = z.object({
+    installationId: z.string().uuid(), releaseId: z.string().uuid(),
+    policyDigest: ExecutionPlanSchema.innerType().shape.policyDigest,
+    image: ExecutionPlanSchema.innerType().shape.image,
+    privateDirectories: ExecutionPlanSchema.innerType().shape.privateDirectories,
+}).strict().superRefine((value, context) => {
+    const directories = value.privateDirectories;
+    if (new Set(directories.map(item => item.name)).size !== directories.length
+        || directories.some((item, i) => directories.some((other, j) => i !== j
+            && (item.containerPath === other.containerPath || item.containerPath.startsWith(`${other.containerPath}/`))))) {
+        context.addIssue({ code: 'custom', path: ['privateDirectories'], message: 'invalid_prepared_directories' });
+    }
+});
 export const HostConfigSchema = z.object({
     schemaVersion: z.literal(1), computerId: z.string().uuid(),
+    configurationRevision: z.number().int().min(1).max(2_147_483_647).default(1),
     computerGeneration: z.number().int().min(1).max(2_147_483_647),
     volumeId: z.string().regex(/^vol-[a-f0-9]{8}(?:[a-f0-9]{9})?$/),
     dataRoot: path, stateDirectory: path, stagingRoot: path,
     controlPort: z.number().int().min(1024).max(65535),
     memoryBudgetMiB: z.number().int().min(128).max(4096),
     suspended: z.boolean(),
+    preparedInstallations: z.array(PreparedInstallationSchema).max(128).default([]),
     approvedInstallations: z.array(z.object({ installationId: z.string().uuid(), plan: ExecutionPlanSchema }).strict()).max(128),
 }).strict().superRefine((value, context) => {
     const overlap = (a: string, b: string) => a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
@@ -24,6 +41,17 @@ export const HostConfigSchema = z.object({
     }
     const ids = value.approvedInstallations.map(item => item.installationId);
     if (new Set(ids).size !== ids.length) context.addIssue({ code: 'custom', path: ['approvedInstallations'], message: 'duplicate_installation' });
+    const preparedIds = value.preparedInstallations.map(item => item.installationId);
+    if (new Set(preparedIds).size !== preparedIds.length || new Set([...ids, ...preparedIds]).size > 128) {
+        context.addIssue({ code: 'custom', path: ['preparedInstallations'], message: 'invalid_installation_set' });
+    }
+    for (const { installationId, plan } of value.approvedInstallations) {
+        const prepared = value.preparedInstallations.find(item => item.installationId === installationId);
+        if (prepared && canonicalJson(prepared) !== canonicalJson({ installationId, releaseId: plan.releaseId,
+            policyDigest: plan.policyDigest, image: plan.image, privateDirectories: plan.privateDirectories })) {
+            context.addIssue({ code: 'custom', path: ['preparedInstallations'], message: 'prepared_release_mismatch' });
+        }
+    }
     if (value.approvedInstallations.some(item => item.plan.services.some(service => service.hostPort === value.controlPort))) {
         context.addIssue({ code: 'custom', path: ['controlPort'], message: 'control_port_conflict' });
     }
@@ -36,9 +64,9 @@ export function parseHostConfig(value: unknown, privateValidation = false): Host
     const parsed = HostConfigSchema.safeParse(value);
     if (!parsed.success) throw new Error('host_configuration_invalid');
     const config = parsed.data;
-    if (!privateValidation && config.approvedInstallations.some(({ plan }) =>
-        !/^[0-9]{12}\.dkr\.ecr\.us-east-1\.amazonaws\.com\/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$/.test(plan.image)
-        || plan.allowedOrigins.some(origin => !origin.startsWith('https://')))) {
+    if (!privateValidation && (installationPreparations(config).some(item =>
+        !/^[0-9]{12}\.dkr\.ecr\.us-east-1\.amazonaws\.com\/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$/.test(item.image))
+        || config.approvedInstallations.some(({ plan }) => plan.allowedOrigins.some(origin => !origin.startsWith('https://'))))) {
         throw new Error('production_image_or_origin_required');
     }
     return config;
@@ -101,6 +129,15 @@ export function hostAuthority(config: HostConfig) {
 }
 
 export function hostIdentity(config: HostConfig): string {
-    const { approvedInstallations: _plans, suspended: _suspended, ...identity } = config;
+    const { approvedInstallations: _plans, preparedInstallations: _prepared, suspended: _suspended, configurationRevision: _revision, ...identity } = config;
     return canonicalJson(identity);
+}
+
+export function installationPreparations(config: HostConfig): z.infer<typeof PreparedInstallationSchema>[] {
+    const entries = new Map(config.preparedInstallations.map(item => [item.installationId, item]));
+    for (const { installationId, plan } of config.approvedInstallations) {
+        entries.set(installationId, { installationId, releaseId: plan.releaseId, policyDigest: plan.policyDigest,
+            image: plan.image, privateDirectories: plan.privateDirectories });
+    }
+    return [...entries.values()];
 }

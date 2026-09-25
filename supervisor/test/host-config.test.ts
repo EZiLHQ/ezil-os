@@ -36,6 +36,8 @@ test('host approval binds the installation and every execution-plan field', () =
     assert(!approves({ ...plan, allowedOrigins: ['https://unapproved.example'] }, installationId));
     assert(!hostAuthority({ ...input, suspended: true })(plan, installationId));
     assert.equal(hostIdentity(input), hostIdentity({ ...input, suspended: true, approvedInstallations: [] }));
+    assert.equal(input.configurationRevision, 1);
+    assert.equal(hostIdentity(input), hostIdentity({ ...input, configurationRevision: 2 }));
     assert.notEqual(hostIdentity(input), hostIdentity({ ...input, computerGeneration: 2 }));
 });
 
@@ -47,5 +49,26 @@ test('configuration rejects scope overlap, control port collisions and unknown d
         { ...input, approvedInstallations: [...input.approvedInstallations, ...input.approvedInstallations] }]) {
         assert.throws(() => parseHostConfig(bad, true), error => error instanceof Error
             && error.message === 'host_configuration_invalid' && !error.message.includes('sensitive-sentinel'));
+    }
+});
+
+test('prepared release files grant no execution authority and must match any later approved plan', () => {
+    const input = config();
+    const { installationId, plan } = input.approvedInstallations[0]!;
+    const prepared = { installationId, releaseId: plan.releaseId, policyDigest: plan.policyDigest,
+        image: plan.image, privateDirectories: plan.privateDirectories };
+    const only = parseHostConfig({ ...input, approvedInstallations: [], preparedInstallations: [prepared] }, true);
+    assert.equal(hostAuthority(only)(plan, installationId), false);
+    assert.throws(() => parseHostConfig({ ...input, approvedInstallations: [], preparedInstallations: [prepared] }), /production_image_or_origin_required/);
+    assert.doesNotThrow(() => parseHostConfig({ ...input, preparedInstallations: [prepared] }, true));
+    assert.throws(() => parseHostConfig({ ...input, preparedInstallations: [{ ...prepared, releaseId: randomUUID() }] }, true), /host_configuration_invalid/);
+    assert.throws(() => parseHostConfig({ ...input, preparedInstallations: [prepared, prepared] }, true), /host_configuration_invalid/);
+    for (const directories of [
+        [{ name: 'state', containerPath: '/data/state' }, { name: 'state', containerPath: '/data/other' }],
+        [{ name: 'state', containerPath: '/data/state' }, { name: 'cache', containerPath: '/data/state' }],
+        [{ name: 'state', containerPath: '/data/state' }, { name: 'cache', containerPath: '/data/state/cache' }],
+    ]) {
+        assert.throws(() => parseHostConfig({ ...input, approvedInstallations: [],
+            preparedInstallations: [{ ...prepared, privateDirectories: directories }] }, true), /host_configuration_invalid/);
     }
 });
