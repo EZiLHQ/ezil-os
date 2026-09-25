@@ -57,6 +57,13 @@
       "when": 1790354648732,
       "tag": "0007_computer_lifecycle_intents",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1790362196347,
+      "tag": "0008_computer_recovery_intents",
+      "breakpoints": true
     }
   ]
 }

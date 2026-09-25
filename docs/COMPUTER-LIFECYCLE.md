@@ -118,6 +118,47 @@ data-only interrupted allocation remains associated with its owner even if it
 never received an instance. Keep producers disabled until that recovery path,
 host bootstrap, scheduling and approved cloud acceptance are complete.
 
+## Retained-disk recovery intent (v2)
+
+`0008_computer_recovery_intents.sql` adds a separate immutable recovery record.
+It preserves the v1 table and `ezil_lifecycle_intent_document` bytes. An explicit
+`recover` job binds its computer, last reconciled source job/version/digest,
+retained volume and observed disk generation/fence, a fresh writer generation,
+and approved deployment pins. `ezil_computer_recovery_document` produces the
+strict v2 document consumed by `parseComputerRecoveryWork`. An old consumer
+rejects this document; it cannot reinterpret it as a v1 provision or replacement.
+
+The database requires a retained volume already associated with the computer,
+all recorded prior writers fenced and stopped, and the immediately preceding
+intent failed/cancelled with confirmed cleanup recorded as `lifecycle_recovered`.
+A failure/cancellation request alone is insufficient. It checks the source
+digest and permitted disk generation/fence, prohibits storage account/AZ/KMS or
+namespace changes, and reserves a new generation without creating an instance,
+changing disk ownership or clearing a fence. This supports interrupted
+provisioning that retained a disk before allocating any instance, and a later
+recovery attempt after an earlier v2 operation was itself reconciled.
+
+V1 and v2 intents share one revision sequence and the same computer lock.
+Competing work of either version blocks another intent; intent content and
+bound job identities cannot be rewritten or removed. New records start with
+service-only RLS. Current ownership, OS access, maintainer approval and quota
+admission remain API/controller checks. The producer and workflow must
+independently observe the retained disk's actual tags, ownership and exclusive
+detachment, and confirm all historical instances are terminated before attaching
+it. Database fields alone do not prove provider fencing.
+
+This schema and contract do not enable a producer or implement the v2 workflow.
+Apply the reviewed migration before those consumers. Before any hosted apply,
+inspect the actual schema and apply only this additive migration transactionally;
+do not replay the historical migration journal. Rollback disables recovery
+producers and keeps the retained disk, intents and existing v1 history.
+
+Run `bun run test:db:recovery-intents` against a loopback test database. The suite
+applies 0008 over populated v1 data and checks preserved hashes, source/disk
+ownership, shared revision ordering, concurrent generation reservation, recovery
+after cancellation, immutability and authenticated-role denial. Also run the
+existing lifecycle-intent and consumer database suites after the migration.
+
 `POST /api/internal/computers/lifecycle-authority` checks the current immutable
 job/digest under a dedicated 30-second HMAC. It accepts no caller-selected
 provider IDs. Cookie/bearer authentication cannot substitute for the workflow
