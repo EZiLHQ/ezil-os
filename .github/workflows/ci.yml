@@ -290,6 +290,9 @@ jobs:
       - name: Test durable application launch and stop producers
         working-directory: app
         run: bun run test:db:runtime-api
+      - name: Test command delivery leases, revocation and observations
+        working-directory: app
+        run: bun run test:db:runtime-dispatcher
 
   connectors:
     name: sdk + mcp (typecheck + unit)

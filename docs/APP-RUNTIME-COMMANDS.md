@@ -125,3 +125,83 @@ uses independent database connections rather than a mocked transaction callback.
 `EZIL_TEST_COMPILED_PLANS=/absolute/output.json` optionally writes the test-generated
 Node and Reticle plans for checking against the supervisor's v1 protocol. These
 are synthetic release fixtures, not real runtime or public-release acceptance.
+
+## Dispatcher and host observations
+
+`runtime-dispatcher.ts` consumes immutable Start/Stop commands through an
+explicitly enabled internal factory. No route, cron, or process entrypoint enables
+it yet. A trusted resolver must return the provisioned computer generation's
+exact HTTPS origin, signing key, instance ID, fence token, and data-volume ID.
+Resolver lookup is bounded to five seconds. It must not provision, wake compute,
+pull images, or use caller-selected upstream addresses. Provisioning and host
+approval-file delivery remain separate work; leave the public feature flags off.
+
+The consumer leases one due event with `FOR UPDATE SKIP LOCKED`. A 45-second
+lease and monotonically increasing attempt fence delayed workers. It rechecks
+computer ownership, Supabase user deletion/ban, OS access, entitlement, approved
+release, current writer, installation authorization generation, port leases and
+selected-project consent before delivery. Exact plans are recompiled and compared
+with immutable intent. Computer, installation, outbox and authority locks remain
+held through bounded delivery; expired/superseded attempts cannot commit a result.
+The host's own monotonic command ledger fences already-sent older traffic.
+
+Requests use the host v1 HMAC protocol over exact body bytes, method, path,
+timestamp and fresh nonce. Reconcile keeps its job UUID on retry. The client
+requires HTTPS outside explicit private loopback validation, rejects redirects,
+bounds each request/body read to eight seconds and responses to 16 KiB, and emits
+fixed error codes. Origins are trusted provisioning configuration; parsing an
+HTTPS URL does not establish DNS/SSRF safety. Host credentials and provider handles
+never appear in a browser descriptor or public job response.
+
+This client requires the command-bound observation protocol introduced in #108
+(supervisor `5f82a08`). A legacy `{ installationId, state }` response is rejected.
+Success requires the matching computer/installation/command generations, canonical
+intent digest, desired state and a settled driver result. A running Start also
+requires its original durable deadline. A 202 receipt and health observed while
+reconciliation is pending do not complete a job. Stop can complete from a recorded
+provider observation that the VM is stopped; it never wakes a computer.
+
+Successful Start delivery leaves its event scheduled for observation every 30
+seconds. This is independent of browser polling and necessary to detect later
+revocation, failure or expiry. A superseded event closes without rewriting a
+previously successful job's history. A changed authority or observed expired
+reservation atomically creates a new Stop command/outbox/audit event. Merely
+cancelling Start delivery could leave an already accepted runtime running after a
+lost response. Stop uses retained owned scope even after release/project revocation.
+Failures remain retryable; logs and job errors contain codes rather than secrets
+or raw SQL/transport exceptions. Job success remains historical, not a live-health
+promise. Continuous monitoring requires a deployed consumer; this library does
+not provide a scheduler, independent watchdog, daily accounting, session
+revocation, or a strict billing cap.
+
+Run the dedicated real PostgreSQL suite on a disposable loopback database:
+
+```sh
+cd app
+EZIL_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/postgres \
+  bun --no-env-file run test:db:runtime-dispatcher
+```
+
+It uses actual independent transactions for claim races, lease takeover, Start/
+Stop ordering, authority locking, rollback and project revocation. Its host driver
+is instrumented. The cross-package check additionally sends producer-generated
+plans through the actual built Node supervisor's signature/protocol/SQLite code:
+
+```sh
+# First build supervisor in its checkout with bash tools/test.sh supervisor.
+cd app
+EZIL_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/postgres \
+  EZIL_TEST_COMPILED_PLANS=/tmp/ezil-runtime-plans.json \
+  bun --no-env-file run test:db:runtime-api
+EZIL_TEST_SUPERVISOR_ROOT=/absolute/supervisor-checkout \
+  EZIL_TEST_COMPILED_PLANS=/tmp/ezil-runtime-plans.json \
+  bun --no-env-file tests/host-control-acceptance.ts
+```
+
+The cross-package check fails if its inputs or native Node supervisor are missing.
+It verifies both Node and Reticle plans, signatures, generation-bound observations,
+unchanged retry deadlines and rejection of old Start after Stop. Its instrumented
+execution driver does not establish Docker or EC2 isolation, Cloudflare routing,
+project pairing, an installed Reticle window, or either marketplace milestone.
+The separate supervisor Linux container/host suites provide local execution
+coverage; approved cloud and authenticated OS acceptance are still required.
