@@ -1,4 +1,4 @@
-import { type NextRequest } from 'next/server';
+import { NextResponse, type NextRequest } from 'next/server';
 
 import { updateSession } from '@/utils/supabase/middleware';
 
@@ -9,6 +9,9 @@ import { updateSession } from '@/utils/supabase/middleware';
  * convention is deprecated" build warning.
  */
 export async function proxy(request: NextRequest) {
+    // This service endpoint authenticates its signed body itself. Unrelated
+    // browser cookies must not trigger Supabase refresh or Set-Cookie here.
+    if (request.nextUrl.pathname === '/api/internal/apps/configuration-authority') return NextResponse.next();
     return updateSession(request);
 }
 
