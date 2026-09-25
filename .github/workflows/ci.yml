@@ -293,6 +293,9 @@ jobs:
       - name: Test command delivery leases, revocation and observations
         working-directory: app
         run: bun run test:db:runtime-dispatcher
+      - name: Test immutable computer configuration delivery and receipts
+        working-directory: app
+        run: bun run test:db:computer-configurations
 
   connectors:
     name: sdk + mcp (typecheck + unit)
