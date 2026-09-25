@@ -42,6 +42,16 @@ ALTER TABLE "ezil_computer_lifecycle_intents" ADD CONSTRAINT "ezil_lifecycle_int
 --> statement-breakpoint
 -- Publisher/user input cannot create these records. Current authorization and
 -- provider evidence remain controller responsibilities, not claims by this DDL.
+-- Explicit v1 fields keep historical digests stable when tables gain columns.
+CREATE FUNCTION public.ezil_lifecycle_intent_document(intent public.ezil_computer_lifecycle_intents) RETURNS text
+LANGUAGE sql IMMUTABLE SET search_path = '' AS $$
+    SELECT jsonb_build_object('schemaVersion',1,'jobId',intent.job_id,'computerId',intent.computer_id,
+        'revision',intent.revision,'operation',intent.operation,'targetGeneration',intent.target_generation,
+        'fenceToken',intent.fence_token,'providerInstanceId',intent.provider_instance_id,'dataVolumeId',intent.data_volume_id,
+        'previousGeneration',intent.previous_generation,'previousInstanceId',intent.previous_instance_id,
+        'previousFenceToken',intent.previous_fence_token,'deployment',intent.deployment::jsonb)::text;
+$$;
+--> statement-breakpoint
 CREATE FUNCTION public.ezil_lifecycle_intent_insert() RETURNS trigger
 LANGUAGE plpgsql SET search_path = '' AS $$
 DECLARE runtime public.ezil_computer_runtimes%ROWTYPE;
@@ -123,7 +133,7 @@ BEGIN
     END IF;
     UPDATE public.ezil_computer_lifecycle_jobs SET target_generation=NEW.target_generation WHERE id=NEW.job_id;
     NEW.deployment := deployment::text;
-    NEW.digest := encode(sha256(convert_to((to_jsonb(NEW)-ARRAY['digest','created_at'])::text,'UTF8')),'hex');
+    NEW.digest := encode(sha256(convert_to(public.ezil_lifecycle_intent_document(NEW),'UTF8')),'hex');
     RETURN NEW;
 END;
 $$;

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { TransactionSql } from 'postgres';
 import { runtimeTestDatabase } from './helpers/runtime-database';
 
@@ -48,9 +48,13 @@ async function intent(tx: TransactionSql, c: Computer, operation = 'provision', 
 try {
     await test('provision intent reserves a generation and durable event without creating a writer or disk', async () => {
         const c = await computer(), row = await sql.begin(tx => intent(tx,c));
-        const [stored] = await sql`SELECT digest,encode(sha256(convert_to((to_jsonb(i)-ARRAY['digest','created_at'])::text,'UTF8')),'hex') AS expected
+        const [stored] = await sql`SELECT digest,public.ezil_lifecycle_intent_document(i) AS document
             FROM ezil_computer_lifecycle_intents i WHERE job_id=${row.job_id}`;
-        assert.equal(stored!.digest, stored!.expected);
+        assert.equal(stored!.digest, createHash('sha256').update(stored!.document).digest('hex'));
+        const parsed = JSON.parse(stored!.document);
+        assert.equal(parsed.schemaVersion,1); assert.equal(parsed.jobId,row.job_id);
+        assert.equal(parsed.computerId,c.computerId); assert.deepEqual(parsed.deployment,deployment);
+        assert.equal('created_at' in parsed,false); assert.equal('digest' in parsed,false);
         assert.equal((await sql`SELECT next_generation,data_volume_id,desired_state FROM ezil_computer_runtimes WHERE computer_id=${c.computerId}`)[0]!.next_generation,2);
         assert.equal((await sql`SELECT count(*)::int n FROM ezil_computer_instances WHERE computer_id=${c.computerId}`)[0]!.n,0);
         assert.equal((await sql`SELECT target_generation FROM ezil_computer_lifecycle_jobs WHERE id=${row.job_id}`)[0]!.target_generation,1);
@@ -58,6 +62,18 @@ try {
     await test('missing outbox rolls back the intent and generation reservation', async () => {
         const c = await computer(); await reject(() => sql.begin(tx => intent(tx,c,'provision',{ event:false })), '23503');
         assert.equal((await sql`SELECT next_generation FROM ezil_computer_runtimes WHERE computer_id=${c.computerId}`)[0]!.next_generation,1);
+    });
+    await test('future table columns cannot change a previously committed v1 digest', async () => {
+        const c = await computer(), row = await sql.begin(tx => intent(tx,c)), rollback = Symbol('checked');
+        try {
+            await sql.begin(async tx => {
+                await tx`ALTER TABLE ezil_computer_lifecycle_intents ADD COLUMN future_metadata text DEFAULT 'later'`;
+                const [changed] = await tx`SELECT public.ezil_lifecycle_intent_document(i) AS document
+                    FROM ezil_computer_lifecycle_intents i WHERE job_id=${row.job_id}`;
+                assert.equal(createHash('sha256').update(changed!.document).digest('hex'),row.digest);
+                throw rollback;
+            });
+        } catch (error) { if (error !== rollback) throw error; }
     });
     await test('replacement retains the previous writer until independent provider fencing', async () => {
         const c = await computer(true); await sql.begin(tx => intent(tx,c,'replace'));

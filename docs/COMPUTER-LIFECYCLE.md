@@ -19,8 +19,9 @@ pinned launch-template version and AMI, host instance-profile ARN, data KMS ARN,
 pinned Standard workflow version, and namespace. It stores references only.
 Unknown fields, mutable versions, nested values and credential fields fail.
 The database normalizes the deployment JSON and computes the digest from the
-PostgreSQL JSONB representation of the row excluding `digest` and `created_at`.
-The controller must fetch the immutable record and verify that digest; it must
+explicit v1 document returned by `ezil_lifecycle_intent_document`. That function
+returns the exact bytes to hash and does not implicitly include future columns.
+The controller must fetch that immutable document and verify its digest; it must
 not substitute a publisher manifest or reconstruct it from mutable runtime data.
 
 One queued/running intent may exist per computer when another is admitted.
