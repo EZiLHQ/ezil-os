@@ -1,4 +1,5 @@
 import { TRPCError } from '@trpc/server';
+import { randomUUID } from 'node:crypto';
 import { and, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 
@@ -7,6 +8,7 @@ import {
 } from '@/server/app-platform/approved-computer-app-policy';
 import { getComputerManifestDigest } from '@/server/app-platform/computer-app-manifest';
 import { assignComputerHostPorts } from '@/server/app-platform/port-leases';
+import { compilePreparedInstallation } from '@/server/app-platform/runtime-plan';
 import {
     appAuditEvents, appGrants, appInstallations, appJobs, appOutbox,
     appPortLeases, appPublications, appPublishers, appReleases, appServices,
@@ -104,7 +106,17 @@ export const installAppProcedure = protectedProcedure.input(z.object({
             return { installationId: current.id, jobId: job.id, status: current.status, reused: true };
         }
 
+        const installationId = randomUUID();
+        try {
+            // Preparation checks the implemented host profile without inventing
+            // a selected project, folder grant or permission to execute.
+            compilePreparedInstallation({ installationId, app: catalogApp, release });
+        } catch {
+            throw new TRPCError({ code: 'PRECONDITION_FAILED',
+                message: 'Application release is not supported by this computer runtime' });
+        }
         const [created] = await tx.insert(appInstallations).values({
+            id: installationId,
             computerId: computer.id, appId: catalogApp.id, releaseId: release.id,
             installedBy: ctx.user.id,
         }).onConflictDoNothing().returning({ id: appInstallations.id, status: appInstallations.status });

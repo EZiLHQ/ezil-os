@@ -1,10 +1,50 @@
 import { describe, expect, it } from 'vitest';
 import { runtimeRecords } from '../../../tests/fixtures/runtime-release';
-import { compileRuntimePlan, RuntimePlanError, sameRuntimePlan } from './runtime-plan';
+import { compilePreparedInstallation, compileRuntimePlan, RuntimePlanError, sameRuntimePlan } from './runtime-plan';
 
 const PROJECT = 'e5555555-5555-4555-8555-555555555555';
 const connectedReticle = () => ({ ...runtimeRecords('reticle'), projectId: PROJECT,
     grants: [{ folder: 'Projects', scope: 'selected-projects', access: 'read-write', projectId: PROJECT }] });
+
+describe('compiled installation preparation', () => {
+    it.each(['node', 'reticle'] as const)('prepares %s bytes and private directories without granting execution', kind => {
+        const records = runtimeRecords(kind);
+        const before = structuredClone(records);
+        const prepared = compilePreparedInstallation(records);
+        expect(prepared).toEqual({ installationId: records.installationId, releaseId: records.release.id,
+            policyDigest: records.release.policyDigest, image: records.release.imageReference,
+            privateDirectories: [{ name: 'state', containerPath: '/data/state' }] });
+        expect(records).toEqual(before);
+        expect(() => compileRuntimePlan(runtimeRecords('reticle'))).toThrow('project_selection_required');
+    });
+    it('matches the exact release files in a later authorized Reticle execution plan', () => {
+        const records = connectedReticle();
+        const plan = compileRuntimePlan(records);
+        expect(compilePreparedInstallation(records)).toEqual({ installationId: records.installationId,
+            releaseId: plan.releaseId, policyDigest: plan.policyDigest, image: plan.image,
+            privateDirectories: plan.privateDirectories });
+    });
+    it('rejects host-incompatible requirements during preparation as well as launch', () => {
+        for (const records of [
+            runtimeRecords('node', {}, manifest => { manifest.services.push({ ...manifest.services[0]!, name: 'api' }); }),
+            runtimeRecords('node', {}, manifest => { manifest.configuration.push({ name: 'THEME', kind: 'text', required: false }); }),
+            runtimeRecords('node', {}, manifest => { manifest.egressOrigins = ['https://api.example.com']; }),
+            runtimeRecords('node', {}, manifest => { manifest.resources.ephemeralDiskMiB = 8192; }),
+        ]) {
+            expect(() => compilePreparedInstallation(records)).toThrow(RuntimePlanError);
+            expect(() => compileRuntimePlan(records)).toThrow(RuntimePlanError);
+        }
+    });
+    it('rejects mismatched immutable evidence and malformed identity without echoing input', () => {
+        for (const field of ['manifestDigest', 'policyDigest', 'imageReference', 'provenanceDigest', 'sourceCommitSha'] as const) {
+            const records = runtimeRecords();
+            records.release[field] = 'sensitive-sentinel';
+            expect(() => compilePreparedInstallation(records)).toThrow('release_evidence_mismatch');
+        }
+        expect(() => compilePreparedInstallation({ ...runtimeRecords(), installationId: 'sensitive-sentinel' }))
+            .toThrow('invalid_installation_identity');
+    });
+});
 
 describe('compiled supervisor execution plan', () => {
     it('preserves internal ports, uses the stored lease and derives its installation origin', () => {

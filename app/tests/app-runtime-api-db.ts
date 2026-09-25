@@ -15,6 +15,7 @@ process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://runtime-api-test.supabase.co';
 process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = 'runtime-api-test-anon';
 process.env.EZIL_APP_MARKETPLACE_API_ENABLED = 'true';
 process.env.EZIL_APP_RUNTIME_COMMANDS_ENABLED = 'true';
+process.env.EZIL_APP_INSTALL_ENABLED = 'true';
 process.env.EZIL_OS_ACCESS_MODE = 'open';
 let passed = 0;
 const test = async (name: string, fn: () => Promise<void>) => { await fn(); passed++; console.log(`PASS ${name}`); };
@@ -43,8 +44,8 @@ try {
     const context = (user: string | null) => buildTRPCContext({ db: database,
         user: user ? { id: user, email: `${user}@example.com` } as User : null, headers: new Headers(), mode: 'open' });
     const aliceApi = appRouter.createCaller(context(alice)), bobApi = appRouter.createCaller(context(bob));
-    const createRelease = async (kind: 'node' | 'reticle') => {
-        const records = runtimeRecords(kind, { appId: randomUUID(), publisherId: publisher!.id, releaseId: randomUUID() });
+    const createRelease = async (kind: 'node' | 'reticle', mutate?: Parameters<typeof runtimeRecords>[2]) => {
+        const records = runtimeRecords(kind, { appId: randomUUID(), publisherId: publisher!.id, releaseId: randomUUID() }, mutate);
         await sql`INSERT INTO ezil_apps (id,publisher_id,slug,name,summary,category,visibility)
             VALUES (${records.app.id},${publisher!.id},${records.app.slug},'Test','Test','Development','grant-only')`;
         const r = records.release;
@@ -247,6 +248,48 @@ try {
         assert.equal(replayData.jobId, first.jobId);
         assert.equal(replayData.isLatestCommand, false);
         assert.deepEqual(await counts(), before);
+    });
+    await test('unsupported installation requirements fail before creating an installation, job, lease or audit', async () => {
+        for (const companion of [false, true]) {
+            const records = await createRelease('node', manifest => {
+                manifest.slug = companion ? 'needs-companion' : 'needs-configuration';
+                if (companion) manifest.services.push({ ...manifest.services[0]!, name: 'api' });
+                else manifest.configuration.push({ name: 'THEME', kind: 'text', required: false });
+            });
+            await sql`INSERT INTO ezil_app_publications (app_id,release_id,published_by)
+                VALUES (${records.app.id},${records.release.id},${admin})`;
+            const before = await counts();
+            const [beforeRows] = await sql`SELECT (SELECT count(*)::int FROM ezil_app_installations) installs,
+                (SELECT count(*)::int FROM ezil_app_port_leases) leases, (SELECT count(*)::int FROM ezil_app_audit_events) audit`;
+            const error = await aliceApi.apps.install({ computerId: a, appId: records.app.id,
+                clientRequestId: randomUUID() }).catch(error => error);
+            assert.equal(error.code, 'PRECONDITION_FAILED');
+            assert.equal(error.message, 'Application release is not supported by this computer runtime');
+            assert.equal(error.cause, undefined);
+            assert.deepEqual(await counts(), before);
+            assert.deepEqual((await sql`SELECT (SELECT count(*)::int FROM ezil_app_installations) installs,
+                (SELECT count(*)::int FROM ezil_app_port_leases) leases, (SELECT count(*)::int FROM ezil_app_audit_events) audit`)[0], beforeRows);
+        }
+    });
+    await test('Reticle installation precedes project selection and remains pending without execution or folder authority', async () => {
+        const records = await createRelease('reticle', manifest => { manifest.slug = 'install-reticle'; });
+        await sql`INSERT INTO ezil_app_publications (app_id,release_id,published_by)
+            VALUES (${records.app.id},${records.release.id},${admin})`;
+        const before = await counts();
+        const input = { computerId: a, appId: records.app.id, clientRequestId: randomUUID() };
+        const [first, second] = await Promise.all([aliceApi.apps.install(input), aliceApi.apps.install(input)]);
+        assert.equal(first.installationId, second.installationId);
+        assert.equal(first.jobId, second.jobId);
+        assert.equal(first.status, 'pending');
+        assert.equal([first, second].filter(result => !result.reused).length, 1);
+        const after = await counts();
+        assert.deepEqual(after, { ...before, jobs: before.jobs + 1, outbox: before.outbox + 1 });
+        assert.equal((await sql`SELECT count(*)::int n FROM ezil_app_folder_grants WHERE installation_id=${first.installationId}`)[0]!.n, 0);
+        const [installed] = await sql`SELECT installed_at FROM ezil_app_installations WHERE id=${first.installationId}`;
+        assert.equal(installed!.installed_at, null);
+        await reject(aliceApi.apps.launch({ computerId: a, installationId: first.installationId,
+            clientRequestId: randomUUID() }), 'PRECONDITION_FAILED');
+        await reject(bobApi.apps.install(input), 'NOT_FOUND');
     });
     if (process.env.EZIL_TEST_COMPILED_PLANS) {
         await writeFile(process.env.EZIL_TEST_COMPILED_PLANS, JSON.stringify(capturedPlans), { mode: 0o600 });

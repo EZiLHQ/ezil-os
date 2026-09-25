@@ -34,7 +34,7 @@ const alice = '11111111-1111-4111-8111-111111111111';
 const bob = '22222222-2222-4222-8222-222222222222';
 const admin = '33333333-3333-4333-8333-333333333333';
 const digest = `sha256:${'c'.repeat(64)}`;
-const image = `registry.example.com/ezil/notes@sha256:${'b'.repeat(64)}`;
+const image = `123456789012.dkr.ecr.us-east-1.amazonaws.com/notes@sha256:${'b'.repeat(64)}`;
 const commit = 'a'.repeat(40);
 const requestId = '44444444-4444-4444-8444-444444444444';
 
@@ -57,7 +57,7 @@ function manifest(appId: string, publisherId: string, slug: string) {
             internalPort: 8080, preferredHostPort: 4400,
             health: { path: '/health', status: 200 }, dependsOn: [] }],
         launch: { mode: 'web', service: 'web', path: '/', embedding: { mode: 'iframe', sandbox: ['allow-scripts'] } },
-        configuration: [{ name: 'THEME', kind: 'text', required: false }],
+        configuration: slug === 'reticle' ? [{ name: 'THEME', kind: 'text', required: false }] : [],
         capabilities: [], secrets: [], egressOrigins: [],
         resources: { cpu: 0.25, memoryMiB: 512, ephemeralDiskMiB: 1024, maxRuntimeSeconds: 3600 },
         persistence: { mode: 'computer-volume',
