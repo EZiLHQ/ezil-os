@@ -29,6 +29,13 @@
       "when": 1790311089721,
       "tag": "0003_computer_runtime",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1790313635349,
+      "tag": "0004_app_marketplace",
+      "breakpoints": true
     }
   ]
 }

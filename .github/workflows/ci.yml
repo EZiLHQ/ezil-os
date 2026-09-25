@@ -278,6 +278,9 @@ jobs:
       - name: Test the additive migration and database constraints
         working-directory: app
         run: bun run test:db:computer-runtime
+      - name: Test marketplace ownership, release, and port constraints
+        working-directory: app
+        run: bun run test:db:app-marketplace
 
   connectors:
     name: sdk + mcp (typecheck + unit)
