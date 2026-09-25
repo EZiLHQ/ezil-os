@@ -16,6 +16,7 @@
         "test": "vitest run",
         "test:db:computer-runtime": "node tests/computer-runtime-db.mjs",
         "test:db:app-marketplace": "node tests/app-marketplace-db.mjs",
+        "test:db:marketplace-api": "bun --no-env-file tests/marketplace-api-db.ts",
         "db:generate": "drizzle-kit generate",
         "db:migrate": "drizzle-kit migrate",
         "db:push": "drizzle-kit push",
