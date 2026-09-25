@@ -187,6 +187,7 @@ export const appInstallations = pgTable('ezil_app_installations', {
     }).onDelete('restrict'),
     foreignKey({ name: 'ezil_app_installations_installer_fkey', columns: [table.installedBy], foreignColumns: [authUsers.id] }).onDelete('restrict'),
     unique('ezil_app_installations_id_computer_uq').on(table.id, table.computerId),
+    unique('ezil_app_installations_id_computer_app_uq').on(table.id, table.computerId, table.appId),
     uniqueIndex('ezil_app_installations_active_uidx').on(table.computerId, table.appId)
         .where(sql.raw('uninstalled_at is null')),
     check('ezil_app_installations_provider_chk', sql.raw("computer_provider = 'aws-ec2'")),
@@ -299,6 +300,7 @@ export const appJobs = pgTable('ezil_app_jobs', {
         foreignColumns: [appInstallations.id, appInstallations.computerId],
     }).onDelete('restrict'),
     foreignKey({ name: 'ezil_app_jobs_requester_fkey', columns: [table.requestedBy], foreignColumns: [authUsers.id] }).onDelete('restrict'),
+    unique('ezil_app_jobs_command_target_uq').on(table.id, table.installationId, table.computerId, table.operation),
     uniqueIndex('ezil_app_jobs_submission_idempotency_uidx').on(table.submissionId, table.idempotencyKey)
         .where(sql.raw('submission_id is not null')),
     uniqueIndex('ezil_app_jobs_installation_idempotency_uidx').on(table.installationId, table.idempotencyKey)
