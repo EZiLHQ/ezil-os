@@ -130,6 +130,11 @@ try {
         await sql`INSERT INTO ezil_app_grants(user_id,app_id,granted_by) VALUES (${b.owner},${i.records.app.id},${admin})`;
         await sql`INSERT INTO ezil_app_installations(id,computer_id,app_id,release_id,installed_by)
             VALUES (${otherId},${b.id},${i.records.app.id},${i.records.release.id},${b.owner})`;
+        const service = i.records.services[0]!;
+        await sql`INSERT INTO ezil_app_services(installation_id,computer_id,name,protocol,scope,internal_port,health_path)
+            VALUES (${otherId},${b.id},${service.name},${service.protocol},${service.scope},${service.internalPort},${service.healthPath})`;
+        await sql`INSERT INTO ezil_app_port_leases(installation_id,computer_id,service_name,host_port)
+            VALUES (${otherId},${b.id},${service.name},4400)`;
         const [job] = await sql`INSERT INTO ezil_app_jobs(installation_id,computer_id,requested_by,operation,idempotency_key)
             VALUES (${otherId},${b.id},${b.owner},'install',${randomUUID()}) RETURNING id`;
         await sql`INSERT INTO ezil_app_outbox(job_id) VALUES (${job!.id})`;

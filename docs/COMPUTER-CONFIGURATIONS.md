@@ -118,3 +118,54 @@ snapshot against the actual Node host's production parser, explicit defaults and
 canonical digest. `tests/host-control-acceptance.ts` separately exercises the signed
 configuration read against the real control server; its driver is instrumented,
 so neither check claims Docker, file transfer or EC2 acceptance.
+
+## Delivery coordination and installation completion
+
+`configuration-delivery.ts` now coordinates durable preparation, reload requests
+and authenticated loaded observations. It remains an internal worker operation;
+no route, cron or public feature flag activates it. Its trusted provisioning
+adapter must implement protected transfer/preparation and host reload before it
+can run against AWS. This PR supplies the coordinator, not that AWS adapter.
+
+Claims lock the computer before delivery rows and allocate a 45-second lease
+with an increasing attempt. Every phase reuses the producer inside a transaction
+to verify current owner access, publisher/grants, immutable release, commands,
+project consent, quotas and writer/disk. Both pending preparation and retained
+installations require their actual approved service records and active port
+leases; a missing or released lease cannot be ignored at completion. Changed
+authority produces a newer snapshot and fences the old result.
+
+Provisioning calls run outside database transactions. `advancePreparation` is a
+bounded submit/poll operation: it uses the immutable configuration UUID as its
+stable provider-operation key across claims, and returns `pending` while a durable
+transfer/image pull runs. A new lease attempt must never start a new provider job
+merely because it is a later poll. The future Step Functions/SSM implementation
+must persist and reconcile actual operation state, enforce protected paths and
+monotonic host revisions, support cancellation, and never wake compute here.
+The coordinator cannot establish those provider guarantees through its interface.
+
+A matching preparation receipt sets only `prepared_at`. It requests a reload and
+waits for a later poll. Only the host client's authenticated `configuration()`
+response with the exact computer, generation, revision and digest can set the
+loaded receipt. A response from an older loaded revision requests another reload;
+an unexpected newer revision or conflicting digest is an error, not a rollback.
+Preparation is not repeated solely because the reload response was lost.
+
+Receipt, installation status, bound install jobs, their outbox events and redacted
+`installation.installed` audits commit together after a final authorization check.
+Any failure rolls the whole completion back. Prepared files, reload requests,
+duplicate observations and expired/reclaimed attempts cannot manufacture success.
+Suspended snapshots bind no install jobs and therefore complete none. Pending
+provider work updates job progress; errors contain fixed codes only. A stopped
+computer waits without contacting provisioning or waking its host.
+
+The concrete provisioning adapter, caller scheduling, host service management,
+resource accounting and user-facing terminal handling for omitted/revoked jobs
+remain required. Existing installation records and the new completion code do
+not demonstrate a real AWS disk mount, running application or browser window.
+
+Run `bun run test:db:configuration-delivery` against loopback Postgres. The suite
+uses real transactions and concurrent connections with instrumented provisioning
+and host clients. It checks lease takeover, cancellation/revocation during remote
+work, timeouts, stopped/replaced writers, atomic failure recovery, two computers
+and multi-installation completion. It does not exercise SSM or Docker transfer.

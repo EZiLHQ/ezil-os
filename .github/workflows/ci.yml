@@ -299,6 +299,9 @@ jobs:
       - name: Computer configuration producer
         working-directory: app
         run: bun run test:db:configuration-producer
+      - name: Configuration delivery and installation completion
+        working-directory: app
+        run: bun run test:db:configuration-delivery
 
   connectors:
     name: sdk + mcp (typecheck + unit)

@@ -110,9 +110,15 @@ export function compilePreparedInstallation(
         policyDigest: records.release.policyDigest, image: policy.image.reference, privateDirectories };
 }
 
-export function compileRuntimePlan(records: RuntimePlanRecords): RuntimePlan {
-    const { manifest, policy, service, privateDirectories, temporaryMiB, allowedOrigins } = compatibleRelease(records);
-    const { release } = records;
+/** Preparation validates service/port metadata without granting project access
+ * or starting the application. A missing or released lease is not installed. */
+export function validatePreparationServiceLease(
+    records: Pick<RuntimePlanRecords, 'installationId' | 'app' | 'release' | 'services' | 'leases'>,
+) {
+    return checkedServiceLease(compatibleRelease(records).service, records);
+}
+function checkedServiceLease(service: ReturnType<typeof compatibleRelease>['service'],
+    records: Pick<RuntimePlanRecords, 'services' | 'leases'>) {
     const storedService = records.services[0];
     const lease = records.leases[0];
     if (records.services.length !== 1 || records.leases.length !== 1 || !storedService || !lease
@@ -121,6 +127,13 @@ export function compileRuntimePlan(records: RuntimePlanRecords): RuntimePlan {
         || storedService.healthPath !== service.health.path || lease.serviceName !== service.name
         || !Number.isInteger(lease.hostPort) || lease.hostPort < 1024 || lease.hostPort > 65535
         || RESERVED_COMPUTER_PORTS.has(lease.hostPort)) return reject('service_lease_mismatch');
+    return lease;
+}
+
+export function compileRuntimePlan(records: RuntimePlanRecords): RuntimePlan {
+    const { manifest, policy, service, privateDirectories, temporaryMiB, allowedOrigins } = compatibleRelease(records);
+    const { release } = records;
+    const lease = checkedServiceLease(service, records);
     const projectGrants: RuntimePlan['projectGrants'] = [];
     if (records.projectId) {
         if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(records.projectId)) return reject('invalid_project');
