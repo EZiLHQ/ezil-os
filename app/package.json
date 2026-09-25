@@ -32,6 +32,9 @@
         "db:apply-0002": "node scripts/apply-os-access-migration.mjs"
     },
     "dependencies": {
+        "@aws-sdk/client-s3": "3.1140.0",
+        "@aws-sdk/client-secrets-manager": "3.1140.0",
+        "@aws-sdk/client-sfn": "3.1140.0",
         "@supabase/ssr": "^0.5.2",
         "@supabase/supabase-js": "^2.47.10",
         "@tanstack/react-query": "^5.62.0",

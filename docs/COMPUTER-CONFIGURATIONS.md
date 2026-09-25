@@ -125,7 +125,8 @@ so neither check claims Docker, file transfer or EC2 acceptance.
 and authenticated loaded observations. It remains an internal worker operation;
 no route, cron or public feature flag activates it. Its trusted provisioning
 adapter must implement protected transfer/preparation and host reload before it
-can run against AWS. This PR supplies the coordinator, not that AWS adapter.
+can run against AWS. The SDK adapter below now implements submission and
+observation; the actual workflow/host delivery and a scheduled caller remain absent.
 
 Claims lock the computer before delivery rows and allocate a 45-second lease
 with an increasing attempt. Every phase reuses the producer inside a transaction
@@ -159,7 +160,7 @@ Suspended snapshots bind no install jobs and therefore complete none. Pending
 provider work updates job progress; errors contain fixed codes only. A stopped
 computer waits without contacting provisioning or waking its host.
 
-The concrete provisioning adapter, caller scheduling, host service management,
+The workflow/host delivery implementation, caller scheduling, service management,
 resource accounting and user-facing terminal handling for omitted/revoked jobs
 remain required. Existing installation records and the new completion code do
 not demonstrate a real AWS disk mount, running application or browser window.
@@ -169,3 +170,77 @@ uses real transactions and concurrent connections with instrumented provisioning
 and host clients. It checks lease takeover, cancellation/revocation during remote
 work, timeouts, stopped/replaced writers, atomic failure recovery, two computers
 and multi-installation completion. It does not exercise SSM or Docker transfer.
+
+## AWS SDK transport (not enabled)
+
+`createAwsConfigurationTransport` implements the coordinator's three transport
+methods using the pinned AWS SDK. It has no environment-based activation and
+is not called by a route or cron. Trusted deployment settings supply an explicit
+account, `us-east-1`, namespace, private bucket, same-account KMS key ARN,
+**numeric version ARN** of a Step Functions Standard workflow, and the owned
+control domain. A mandatory temporary-credential provider will come from scoped
+Vercel OIDC federation; that federation/bootstrap is not implemented here.
+There is no default credential chain or stored administrator key fallback.
+
+The transport checks canonical bytes, digest and writer envelope before calling
+AWS. It conditionally creates one object at
+`<namespace>/computers/<computer-uuid>/generations/<generation>/configurations/<configuration-uuid>.json`
+using `If-None-Match: *`, expected bucket owner, SHA-256 and SSE-KMS. A lost write
+response or concurrent create recovers by reading and checking the same object.
+Bounded reads require the original bytes, checksum, KMS key and a real S3 version
+ID. The host later fetches that exact version. The complete configuration can
+be 262144 bytes; it is never a Step Functions input or an SSM command argument.
+
+Workflow input contains only `schemaVersion: 1`, `operation` (`prepare` or
+`reload`), configuration UUID, exact `HostScope`, revision, digest, and an `object`
+reference with bucket, key, version ID, SHA-256 and byte count. Execution names
+are `configuration-<operation>-<configuration-uuid>`; database lease attempts
+never enter their identity. Before starting a missing execution the adapter
+checks the configured version is ACTIVE and STANDARD. It observes an existing
+execution first and recovers ambiguous start responses using the same name.
+Every observed execution must match the exact version, input and scope and have
+zero redrives. Failed/timed-out/aborted executions do not create replacements.
+
+Standard execution names become reusable after 90 days. A missing execution
+can therefore start only within seven days of the immutable staging object's
+creation. Old staging is rejected even if AWS has removed execution history.
+Recovery then needs an explicitly superseded, newly authorized configuration,
+not automatic redrive or reuse of the same UUID. Referenced objects must remain
+available: this change adds no deletion or lifecycle-expiration rule.
+
+Successful workflow output is exactly `{ schemaVersion: 1, operation,
+configurationId, scope, descriptor }`, where `descriptor` contains `computerId`,
+`computerGeneration`, `configurationRevision` and unprefixed
+`configurationDigest`. `prepare` certifies preparation only; `reload` certifies
+the request only. Neither output establishes a loaded receipt. The coordinator
+still requires the separate signed supervisor observation and database recheck.
+
+Host lookup reads AWSCURRENT at
+`<namespace>/computers/<computer-uuid>/generations/<generation>/control`.
+The Secrets Manager response must have the exact name, same-account/region ARN,
+and JSON `{ schemaVersion: 1, scope, origin, keyHex }`. `scope` must match the
+recorded writer, volume and fence; `keyHex` encodes a 32-byte HMAC key. The origin
+is exactly `https://c-<computer-uuid>-g<generation>.<controlDomain>`. No caller
+chooses an upstream URL, service port, bucket root or signing key. Keys never
+enter workflow payloads or fixed-code errors. Each operation has an eight-second
+deadline, streaming reads are bounded/closed, and SDK retries are disabled.
+An aborted poll does not cancel a durable execution or start/stop compute.
+
+Before activation, implement and review the Standard workflow, SSM document,
+host download/verification, atomic protected-file installation and service
+reload. The workflow must recheck current database authority and the observed
+writer before each host mutation, reject stale revisions, and handle explicit
+cancellation. Provision versioned private S3 with enforced KMS/TLS and no
+overwrite/delete permission on referenced configurations. Give host delivery
+only the authorized version/prefix, never all computers' objects or secrets.
+Scope the control-plane role to the configured bucket/KMS key, exact state
+machine version and executions, and host-binding namespace; deny redrive and
+cloud administration. Protect state/history with KMS and omit payload logging.
+The existing shared host role alone does not supply these controls.
+
+The unit suite exercises actual SDK request signing and XML/JSON/stream
+serialization through a local wire handler, including races, lost responses,
+wrong bytes/versions/scope, Standard/Express distinctions, cancellation, maximum
+payload and secret-safe errors. These tests do not establish IAM enforcement,
+SSM transfer, disk attachment, cloud isolation, stopped billing or browser readiness.
+Run `bash tools/test.sh app` and the local-config production build before shipping.

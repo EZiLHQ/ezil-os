@@ -255,3 +255,13 @@ License](https://www.postgresql.org/about/licence/); the Alpine base and image
 packaging retain their own upstream notices. The image runs only in GitHub
 Actions for a rollback-only schema test and is not part of an EZiL-OS runtime
 or release artifact.
+
+## 9. AWS configuration transport
+
+`app/` pins `@aws-sdk/client-s3`, `@aws-sdk/client-sfn`, and
+`@aws-sdk/client-secrets-manager` at **3.1140.0**. All three carry
+**Apache-2.0**, verified in their installed `package.json` files. They come
+from [AWS SDK for JavaScript v3](https://github.com/aws/aws-sdk-js-v3) and
+provide signed S3 configuration staging, Step Functions submission/observation,
+and scoped Secrets Manager host binding retrieval. Upstream code is consumed
+through the packages; no AWS source is vendored or modified.
