@@ -55,10 +55,14 @@ jobs:
           jq -e --arg project "${VERCEL_PROJECT_ID}" --arg org "${VERCEL_ORG_ID}" \
             '.id == $project and .accountId == $org and .name == "ezil-os" and .rootDirectory == "app"' \
             <<<"${project}" >/dev/null
+          domains="$(vercel api "/v9/projects/${VERCEL_PROJECT_ID}/domains" --raw --token="${VERCEL_TOKEN}")"
+          jq -e '[.domains[]? | select(.name == "ezil-os.vercel.app" and .verified == true)] | length == 1' \
+            <<<"${domains}" >/dev/null
           previous="$(vercel inspect https://ezil-os.vercel.app --format=json --token="${VERCEL_TOKEN}")"
           previous_id="$(jq -r '.id // empty' <<<"${previous}")"
           test -n "${previous_id}"
-          jq -e '.name == "ezil-os" and .target == "production" and .readyState == "READY" and (.aliases | index("ezil-os.vercel.app")) != null' \
+          # Project domains need not appear in a deployment's aliases list.
+          jq -e '.name == "ezil-os" and .target == "production" and .readyState == "READY"' \
             <<<"${previous}" >/dev/null
           deployment="$(vercel api "/v13/deployments/${previous_id}" --raw --token="${VERCEL_TOKEN}")"
           jq -e --arg project "${VERCEL_PROJECT_ID}" '.projectId == $project' <<<"${deployment}" >/dev/null
