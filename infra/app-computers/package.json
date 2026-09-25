@@ -6,6 +6,7 @@
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "synth": "cdk synth --strict",
+    "synth:lifecycle": "cdk synth --strict --app \"npx tsx bin/lifecycle.ts\"",
     "synth:delivery": "cdk synth --strict --app \"npx tsx bin/delivery.ts\""
   },
   "dependencies": {
