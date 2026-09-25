@@ -264,3 +264,9 @@ Node.js is MIT-licensed with bundled third-party notices; the image retains
 its Node and Debian component notices. Supervisor development dependencies
 are TypeScript 5.9.3 (Apache-2.0), tsx 4.23.15 (MIT), and @types/node
 20.19.43 (MIT), as declared in their installed package metadata.
+
+The optional private acceptance package pins `@modelcontextprotocol/sdk`
+1.30.0 (MIT) and Playwright 1.62.1 (Apache-2.0), checked in their installed
+package metadata. The separate builder prepares pnpm 10.33.2 (MIT). These are
+local build/test tools; no source credentials or provider SDK is installed in
+the Reticle application image by the EZiL adapter.
