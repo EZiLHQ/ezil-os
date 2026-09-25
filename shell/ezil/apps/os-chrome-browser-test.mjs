@@ -705,11 +705,16 @@ async function scenarioStreamFit () {
         const w = document.querySelector('.window[data-app="desktop"]');
         const b = w?.querySelector('.window-body');
         const f = w?.querySelector('.window-app-iframe');
+        const d = w?.querySelector('.ezil-app-drawer');
         if ( ! b || ! f ) return null;
         const br = b.getBoundingClientRect();
         const fr = f.getBoundingClientRect();
+        const dr = d?.getBoundingClientRect();
         return {
             bodyW: Math.round(br.width), bodyH: Math.round(br.height),
+            bodyBottom: Math.round(br.bottom),
+            drawerTop: dr ? Math.round(dr.top) : null,
+            drawerBottom: dr ? Math.round(dr.bottom) : null,
             frameW: Math.round(fr.width), frameH: Math.round(fr.height),
             frameAspect: +(fr.width / fr.height).toFixed(3),
             // The bars, and what colour they are.
@@ -727,8 +732,10 @@ async function scenarioStreamFit () {
 
     // Full-bleed, straight off the boot, on a 1.4:1 viewport.
     const fb = await measure();
-    push(`${L} setup: full-bleed on a deliberately non-16:9 viewport`,
-        !! fb && fb.bodyW === 1400 && fb.bodyH === 1000, JSON.stringify(fb));
+    push(`${L} setup: full-bleed stream has a reserved control strip`,
+        !! fb && fb.bodyW === 1400 && fb.bodyH > 900 && fb.bodyH < 1000
+        && fb.drawerTop >= fb.bodyBottom && fb.drawerBottom <= 1000,
+        JSON.stringify(fb));
     push(`${L} G10 full-bleed: the stream's box is 16:9, not the viewport's 1.4:1`,
         !! fb && Math.abs(fb.frameAspect - 16 / 9) < 0.01, JSON.stringify(fb));
     push(`${L} G10 full-bleed: the letterbox is the OS's charcoal, not a black bar`,

@@ -833,6 +833,62 @@ async function scenarioPhonePortrait () {
         Array.isArray(second.hits) && second.hits.length > 0,
         JSON.stringify(second.hits));
 
+    // Reproduce the deployed browser failure at the actual address-bar
+    // position. A forced locator tap bypasses parent hit-testing and concealed
+    // the drawer interception; use a normal touchscreen coordinate instead.
+    await page.evaluate(() => {
+        const drawer = document.querySelector('.window[data-app="desktop"] .ezil-app-drawer');
+        drawer?.classList.add('collapsed');
+        drawer?.querySelector('.dashboard-app-drawer-toggle')?.click();
+    });
+    await sleep(550);
+    const topTap = await page.evaluate(() => {
+        const win = document.querySelector('.window[data-app="desktop"]');
+        const drawer = win?.querySelector('.ezil-app-drawer');
+        const body = win?.querySelector('.window-body-app');
+        const iframe = win?.querySelector('.window-app-iframe');
+        if ( ! win || ! drawer || ! body || ! iframe ) return null;
+        const frameBox = iframe.getBoundingClientRect();
+        const bodyBox = body.getBoundingClientRect();
+        const drawerBox = drawer.getBoundingClientRect();
+        const x = Math.round(frameBox.left + frameBox.width / 2);
+        const y = Math.round(frameBox.top + 28);
+        const hit = document.elementFromPoint(x, y);
+        return {
+            x, y, hitsIframe: hit === iframe,
+            bodyBottom: Math.round(bodyBox.bottom), drawerTop: Math.round(drawerBox.top),
+            drawerBottom: Math.round(drawerBox.bottom), windowBottom: Math.round(win.getBoundingClientRect().bottom),
+        };
+    });
+    push(`${L} the expanded OS controls occupy a reserved strip below the stream`,
+        !! topTap && topTap.drawerTop >= topTap.bodyBottom
+        && topTap.drawerBottom <= topTap.windowBottom + 1 && topTap.hitsIframe,
+        JSON.stringify(topTap));
+    const topFrame = page.frames().find((f) => f.url().includes('/frame?'));
+    if ( topTap && topFrame ) {
+        await topFrame.evaluate(() => { window.__hits = []; });
+        await page.touchscreen.tap(topTap.x, topTap.y);
+    }
+    const topHits = topFrame ? await topFrame.evaluate(() => window.__hits.slice()) : null;
+    push(`${L} one unforced tap at the remote browser address bar reaches the iframe`,
+        Array.isArray(topHits) && (topHits.includes('touchstart') || topHits.includes('pointerdown')),
+        JSON.stringify(topHits));
+    await page.evaluate(() => {
+        document.querySelector('.window[data-app="desktop"] .ezil-app-drawer')?.classList.add('collapsed');
+    });
+    await sleep(350);
+    const collapsedTop = await page.evaluate((point) => {
+        const drawer = document.querySelector('.window[data-app="desktop"] .ezil-app-drawer');
+        const body = document.querySelector('.window[data-app="desktop"] .window-body-app');
+        if ( ! drawer || ! body || ! point ) return null;
+        return { drawerTop: Math.round(drawer.getBoundingClientRect().top),
+            bodyBottom: Math.round(body.getBoundingClientRect().bottom),
+            hitsIframe: document.elementFromPoint(point.x, point.y)?.classList.contains('window-app-iframe') };
+    }, topTap);
+    push(`${L} the collapsed controls also leave the address bar tappable`,
+        !! collapsedTop && collapsedTop.drawerTop >= collapsedTop.bodyBottom && collapsedTop.hitsIframe,
+        JSON.stringify(collapsedTop));
+
     // ── the raised keyboard, contract §7.3 ─────────────────────────────────
     // 🔴 Playwright cannot raise a soft keyboard, so this drives the signal a
     // real one produces: shadow `visualViewport.height` and dispatch the

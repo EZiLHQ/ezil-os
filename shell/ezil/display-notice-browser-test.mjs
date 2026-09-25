@@ -25,10 +25,9 @@
 // the part that got clipped.
 //
 // The z-order is not the thing to change: the drawer is the only way out of a
-// full-bleed window and nothing may paint over it. The strip moved down. This
-// file pins the result as a NON-OVERLAP between two measured rectangles, not as
-// a magic number — a future drawer that grows taller fails here rather than
-// silently eating the notice again.
+// full-bleed window and nothing may paint over it. The drawer now occupies a
+// reserved strip below the desktop stream. This file pins NON-OVERLAP between
+// two measured rectangles, so a future change cannot silently hide the notice.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -179,9 +178,9 @@ for ( const vp of VIEWPORTS ) {
         m.drawer ? ! overlaps : false,
         m.drawer ? `notice ${m.notice.top.toFixed(0)}..${m.notice.bottom.toFixed(0)}`
             + ` vs drawer ${m.drawer.top.toFixed(0)}..${m.drawer.bottom.toFixed(0)}` : 'no drawer');
-    push(`🔴 ${tag}: the title line is below the drawer, not under it`,
-        !! m.title && !! m.drawer && m.title.top >= m.drawer.bottom,
-        `title top ${m.title?.top.toFixed(0)} vs drawer bottom ${m.drawer?.bottom.toFixed(0)}`);
+    push(`🔴 ${tag}: the title line is above the drawer, not under it`,
+        !! m.title && !! m.drawer && m.title.bottom <= m.drawer.top,
+        `title bottom ${m.title?.bottom.toFixed(0)} vs drawer top ${m.drawer?.top.toFixed(0)}`);
     push(`${tag}: no line of the notice is clipped by its own box`, ! m.clipped);
     push(`${tag}: ...and the Retry it offers is on screen`,
         !! m.retry && m.retry.bottom <= m.viewportH && m.retry.top >= 0,

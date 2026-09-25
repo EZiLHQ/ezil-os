@@ -730,6 +730,44 @@ body.device-phone {
     display: none;
 }
 
+/* The full-bleed drawer used to sit over the stream's top edge. On a phone,
+ * its expanded controls covered Chrome's address bar; even the collapsed
+ * tongue's invisible hit pad intercepted a normal tap. The client then sent
+ * keystrokes to the remote desktop without ever focusing the address bar.
+ * Reserve a small OS strip below the stream so every pixel of the remote
+ * browser remains tappable and the only full-bleed exit remains reachable.
+ * The stream fitting code already observes the window body when it resizes. */
+.ezil-desktop-window.ezil-fullbleed {
+    /* The drawer's content height plus its 1px visible border. */
+    --ezil-control-strip-height: 43px;
+    background-color: #11151f;
+}
+@media (pointer: coarse) {
+    .ezil-desktop-window.ezil-fullbleed {
+        --ezil-control-strip-height: 59px;
+    }
+}
+.ezil-desktop-window.ezil-fullbleed > .window-body.window-body-app {
+    height: calc(100% - var(--ezil-control-strip-height)) !important;
+}
+.ezil-desktop-window.ezil-fullbleed > .ezil-app-drawer {
+    --safe-top: 0px;
+    top: auto;
+    bottom: 0;
+    border-radius: 12px 12px 0 0;
+    border-top: 1px solid rgba(255, 255, 255, 0.22);
+    border-bottom: none;
+    transition: bottom 0.3s ease, width 0.45s cubic-bezier(0.34, 1.2, 0.4, 1),
+        height 0.45s cubic-bezier(0.34, 1.2, 0.4, 1), border-radius 0.45s ease, opacity 0.2s ease;
+}
+.ezil-desktop-window.ezil-fullbleed > .ezil-app-drawer.collapsed {
+    bottom: calc((var(--ezil-control-strip-height) - var(--shut-h)) / 2);
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    transition: bottom 0.3s ease, width 0.3s cubic-bezier(0.5, 0.05, 0.25, 1),
+        height 0.3s cubic-bezier(0.5, 0.05, 0.25, 1), border-radius 0.3s ease, opacity 0.2s ease 0.08s;
+}
+
 /* 🔴 The other half of the same trade. The desktop window is created
  * `is_resizable: true` for ONE reason — `UIWindow.js:346` renders the head's
  * minimise button only for a resizable window, and while the window is
