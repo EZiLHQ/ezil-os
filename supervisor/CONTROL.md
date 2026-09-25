@@ -2,8 +2,9 @@
 
 The `createControlService` factory supplies the authenticated HTTP boundary and
 durable intent queue. The [Docker driver](DRIVER.md) now implements real local
-execution. An executable host bootstrap, control-plane client, and provider
-controller must still be connected. No
+execution. The [Linux host executable](HOST.md) connects protected configuration,
+locking and process recovery. A control-plane client and provider controller must
+still be connected. No
 production endpoint or cloud resource is created by this package.
 
 ## Authority and wire format
@@ -58,6 +59,10 @@ stopped. The database's computer identity/generation cannot silently change.
 For that reason, a stopped command may only stop/observe already owned
 resources; it must never pull its supplied image or prepare new mounts. Image
 preparation for installation needs a separately approved operation.
+
+Runtime deadline reservations are keyed to the installation command generation
+and exact intent digest, committed before Docker creation, and never extended
+by retries or deleted containers. They do not implement daily user accounting.
 
 The store bounds live nonces to 10,000 and retained request IDs to 100,000;
 capacity/database failures fail closed. A retention/compaction policy must be

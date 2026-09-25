@@ -37,7 +37,9 @@ export class ControlStore implements ControlNonceStore {
             CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY, expires INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS intents (installation TEXT PRIMARY KEY, generation INTEGER NOT NULL,
                 digest TEXT NOT NULL, command TEXT NOT NULL, observed TEXT NOT NULL DEFAULT 'unknown');
-            CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, installation TEXT NOT NULL, generation INTEGER NOT NULL, digest TEXT NOT NULL);`);
+            CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, installation TEXT NOT NULL, generation INTEGER NOT NULL, digest TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS runtime_leases (installation TEXT NOT NULL, generation INTEGER NOT NULL,
+                digest TEXT NOT NULL, expires INTEGER NOT NULL, PRIMARY KEY(installation,generation));`);
             this.transaction(() => {
                 const identity = this.db.prepare('SELECT computer,generation FROM identity WHERE id=1').get();
                 if (identity && (identity.computer !== computerId || identity.generation !== computerGeneration)) {
@@ -95,6 +97,29 @@ export class ControlStore implements ControlNonceStore {
         const command = JSON.parse(String(row.command)) as ReconcileCommand;
         return { installationId, generation: Number(row.generation), desired: command.desired,
             command, observed: row.observed as StoredIntent['observed'] };
+    }
+    /** Commit a deadline before Docker creation. Retries, process restarts,
+     * failed starts and deleted containers cannot extend the same command's
+     * allowance. A known older Docker deadline may tighten the reservation. */
+    reserveRuntimeDeadline(command: ReconcileCommand, proposed: number): number {
+        if (command.computerId !== this.computerId || command.computerGeneration !== this.computerGeneration
+            || command.desired !== 'running' || !Number.isSafeInteger(proposed) || proposed <= 0
+            || proposed > Date.now() + command.plan.resources.maxRuntimeSeconds * 1000 + 1000) {
+            throw new Error('invalid_runtime_deadline');
+        }
+        const digest = intentDigest(command);
+        return this.transaction(() => {
+            const intent = this.db.prepare('SELECT generation,digest FROM intents WHERE installation=?').get(command.installationId);
+            if (intent?.generation !== command.generation || intent.digest !== digest) throw new Error('runtime_deadline_scope_mismatch');
+            const lease = this.db.prepare('SELECT digest,expires FROM runtime_leases WHERE installation=? AND generation=?')
+                .get(command.installationId, command.generation);
+            if (lease && lease.digest !== digest) throw new Error('runtime_deadline_scope_mismatch');
+            const expires = lease ? Math.min(Number(lease.expires), proposed) : proposed;
+            this.db.prepare(`INSERT INTO runtime_leases VALUES (?,?,?,?)
+                ON CONFLICT(installation,generation) DO UPDATE SET expires=excluded.expires`)
+                .run(command.installationId, command.generation, digest, expires);
+            return expires;
+        });
     }
     list(): StoredIntent[] {
         return this.db.prepare('SELECT installation FROM intents ORDER BY installation').all()

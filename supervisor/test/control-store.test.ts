@@ -69,3 +69,23 @@ test('refuses a symlinked host ledger instead of following it into other files',
         assert.throws(() => new ControlStore(dir, computerId, 1), /invalid_control_database/);
     } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('runtime deadlines persist beyond process/container loss and cannot be extended by a retry', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ezil-deadline-'));
+    let store = new ControlStore(dir, computerId, 1);
+    try {
+        const first = command();
+        const expires = Date.now() + 5000;
+        assert.throws(() => store.reserveRuntimeDeadline(first, expires), /runtime_deadline_scope_mismatch/);
+        store.accept(first);
+        assert.equal(store.reserveRuntimeDeadline(first, expires), expires);
+        assert.equal(store.reserveRuntimeDeadline(first, expires + 1000), expires);
+        store.close(); store = new ControlStore(dir, computerId, 1);
+        assert.equal(store.reserveRuntimeDeadline(first, expires + 2000), expires);
+        assert.equal(store.reserveRuntimeDeadline(first, expires - 100), expires - 100);
+        const next = { ...first, requestId: randomUUID(), generation: 2 };
+        store.accept(next);
+        assert.throws(() => store.reserveRuntimeDeadline(first, expires), /runtime_deadline_scope_mismatch/);
+        assert.equal(store.reserveRuntimeDeadline(next, expires + 3000), expires + 3000);
+    } finally { store.close(); await rm(dir, { recursive: true, force: true }); }
+});

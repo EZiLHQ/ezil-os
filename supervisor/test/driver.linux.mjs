@@ -19,7 +19,8 @@ const secret = randomBytes(32);
 let approved = true;
 const options = { computerId, computerGeneration: 1, volume, dataRoot: `${root}/disk`,
     stagingRoot: `${root}/stage`, memoryBudgetMiB: 2048,
-    approvePlan: plan => approved && plan.image === image };
+    approvePlan: plan => approved && plan.image === image,
+    reserveDeadline: (cmd, proposed) => store.reserveRuntimeDeadline(cmd, proposed) };
 let driver = new DockerComputerDriver(options);
 let service, store, mounted = false;
 const run = (bin, args) => execFileSync(bin, args, { stdio: 'pipe', timeout: 30_000 });

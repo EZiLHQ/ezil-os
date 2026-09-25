@@ -3,8 +3,9 @@
 `DockerComputerDriver` connects the authenticated control service to actual
 Docker containers. It currently implements one Node HTTP service or the pinned
 Reticle foreground adapter per installation. Multi-service layouts are rejected
-before resource creation. This code is not enabled in a deployed host: the
-executable bootstrap and transactional Postgres producer remain pending.
+before resource creation. This code is not enabled in a deployed host. The
+[Linux executable](HOST.md) supplies bootstrap and locking; the transactional
+Postgres producer and cloud provisioning remain pending.
 
 The bootstrap must hold an OS-level singleton lock for the computer before
 constructing this driver. Within that process, all start/stop/admission operations
@@ -12,7 +13,8 @@ share one serialized queue. Two driver processes must never manage one Docker
 host. The bootstrap must also call `expire()` periodically and on recovery,
 disconnect proxies on shutdown, and obtain its identity, signing key, exact
 approved policy/image allowlist, and volume association from trusted provisioning.
-Those requirements are not fulfilled merely by constructing this class.
+The executable fulfills the local process requirements; simply constructing this
+class does not. Its required deadline callback must persist through process loss.
 
 Starts require the actual ext4/XFS data mount and matching volume marker,
 an approved locally prepared immutable Linux/amd64 image, and available memory
@@ -36,8 +38,8 @@ network did not publish the requested loopback port in local validation, so the
 driver instead owns a loopback-only TCP proxy to the provider-observed private
 address. The port comes from the authenticated controller's persisted lease;
 collisions are rejected, not silently reallocated. This carries HTTP/WebSocket
-bytes without putting the app on an internet-enabled bridge. Existing sockets
-are severed within 250 ms of a revoked command generation or expired lease.
+bytes without putting the app on an internet-enabled bridge. A 250 ms timer
+checks existing sockets for revoked command generations or expired leases.
 Cloudflare session authorization and tunnel integration remain separate work;
 this loopback proxy must not be exposed as a public unauthenticated endpoint.
 
@@ -55,9 +57,9 @@ left by an earlier driver instance. Uncertain Docker or unmount outcomes fail
 closed and retain anchors. Networks and images remain reusable; installation
 deletion and host orphan-resource reconciliation still need controller wiring.
 
-Runtime deadlines are stored in container labels. Expiry stops compute and
-retains a stopped container as a deadline record; repeating the same generation
-cannot reset its runtime allowance. This is not the user/day accounting ledger
+Runtime deadlines are committed to the host ledger before container creation and
+copied to container labels. Expiry stops the container; removing it cannot reset
+the same generation's allowance. This is not the user/day accounting ledger
 or the computer idle-stop policy, which must be enforced by the controller.
 
 Run the complete local package/host suite:

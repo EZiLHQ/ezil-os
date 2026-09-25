@@ -16,8 +16,10 @@ export type ControlServiceOptions = {
     secret: Uint8Array;
     store: ControlStore;
     driver: ComputerDriver;
-    approvePlan(plan: ExecutionPlan): boolean;
+    approvePlan(plan: ExecutionPlan, installationId: string): boolean;
+    isAvailable?: () => boolean;
     onFailure?: (code: string) => void;
+    onSettled?: (result: { installationId: string; generation: number; state: StoredIntent['observed'] }) => void | Promise<void>;
 };
 const json = (response: ServerResponse, status: number, value: unknown) => {
     response.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store',
@@ -44,6 +46,7 @@ async function readBody(request: IncomingMessage): Promise<Buffer> {
  * persists commands and returns a receipt before long container operations. */
 export function createControlService(options: ControlServiceOptions) {
     if (options.secret.length < 32) throw new Error('control_secret_too_short');
+    const available = () => { try { return options.isAvailable?.() ?? true; } catch { return false; } };
     const reportFailure = (code: string) => {
         try { void Promise.resolve(options.onFailure?.(code)).catch(() => undefined); }
         catch { /* Logging cannot break reconciliation or expose the error. */ }
@@ -57,14 +60,24 @@ export function createControlService(options: ControlServiceOptions) {
             while (scheduled.delete(installationId)) {
                 const intent = options.store.get(installationId);
                 if (!intent) continue;
-                const isCurrent = () => options.store.get(installationId)?.generation === intent.generation;
+                const isCurrent = () => available()
+                    && options.store.get(installationId)?.generation === intent.generation;
+                const observe = (state: StoredIntent['observed']) => {
+                    const recorded = options.store.observe(installationId, intent.generation, state);
+                    if (recorded) {
+                        try { void Promise.resolve(options.onSettled?.({ installationId, generation: intent.generation, state }))
+                            .catch(() => reportFailure('control_observation_callback_failed')); }
+                        catch { reportFailure('control_observation_callback_failed'); }
+                    }
+                    return recorded;
+                };
                 try {
                     const observed = await options.driver.reconcile(intent, isCurrent);
-                    if (!options.store.observe(installationId, intent.generation, observed)) scheduled.add(installationId);
+                    if (!observe(observed)) scheduled.add(installationId);
                 } catch {
                     // Docker errors may contain paths/configuration. Log only
                     // this fixed code; leave the durable command retryable.
-                    options.store.observe(installationId, intent.generation, 'failed');
+                    observe('failed');
                     reportFailure('computer_reconcile_failed');
                 }
             }
@@ -75,12 +88,14 @@ export function createControlService(options: ControlServiceOptions) {
         running.set(installationId, task);
     };
     const handler = async (request: IncomingMessage, response: ServerResponse) => {
+        if (!available()) return json(response, 503, { code: 'computer_control_unavailable' });
         if (request.method !== 'POST' || request.url !== '/v1/control') return json(response, 404, { code: 'not_found' });
         if (!/^application\/json(?:;\s*charset=utf-8)?$/i.test(request.headers['content-type'] ?? '')) {
             return json(response, 415, { code: 'json_required' });
         }
         try {
             const body = await readBody(request);
+            if (!available()) return json(response, 503, { code: 'computer_control_unavailable' });
             const auth = verifyControlRequest({ method: request.method, path: request.url, body, headers: request.headers },
                 options.secret, options.store);
             if (!auth.ok) return json(response, 401, { code: auth.code });
@@ -101,7 +116,7 @@ export function createControlService(options: ControlServiceOptions) {
                 return json(response, 200, { installationId: command.installationId, state: observed.state });
             }
             // Revocation must not prevent stopping an already owned runtime.
-            if (command.desired === 'running' && !options.approvePlan(command.plan)) {
+            if (command.desired === 'running' && !options.approvePlan(command.plan, command.installationId)) {
                 return json(response, 403, { code: 'execution_plan_not_approved' });
             }
             const accepted = options.store.accept(command);
