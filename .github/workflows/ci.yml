@@ -814,3 +814,14 @@ jobs:
         run: |
           npm --prefix macos-electron run test:electron
           bash macos/test.sh
+
+  supervisor:
+    name: computer supervisor (typecheck + unit + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
+      - run: npm --prefix supervisor ci --ignore-scripts --no-audit --no-fund
+      - run: bash tools/test.sh supervisor

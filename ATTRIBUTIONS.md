@@ -245,3 +245,22 @@ The licenses and versions were checked in the installed packages' own
 `package.json` files. Both are pinned development dependencies in
 `app/package.json` and `app/bun.lock`; no upstream source was copied into
 the application.
+
+## 8. Computer supervisor and private Reticle validation
+
+The independently authored `supervisor/` adapter runs an externally built
+[`reticlehq/reticle`](https://github.com/reticlehq/reticle) server at commit
+`39cc34a84bfb78023154c9f4e99c61f3cbe8fc19` (3.2.0). No Reticle source or build
+artifact is committed here. Its server and init packages declare
+**FSL-1.1-ALv2**, checked in that commit's package metadata and license files.
+Those terms permit internal use and restrict competing commercial use;
+public marketplace hosting and trademark use still require explicit review.
+The local artifact retains the upstream license files. This adapter does not
+relicense Reticle under EZiL-OS's AGPL license.
+
+The Docker recipe pins the Linux/amd64 Node image to
+`sha256:5cbc7caba8c2c0f0bca675d1b61b9f2857e1cf1853c6164ee9dd409501a936e7`.
+Node.js is MIT-licensed with bundled third-party notices; the image retains
+its Node and Debian component notices. Supervisor development dependencies
+are TypeScript 5.9.3 (Apache-2.0), tsx 4.23.15 (MIT), and @types/node
+20.19.43 (MIT), as declared in their installed package metadata.
