@@ -296,6 +296,9 @@ jobs:
       - name: Test immutable computer configuration delivery and receipts
         working-directory: app
         run: bun run test:db:computer-configurations
+      - name: Computer configuration producer
+        working-directory: app
+        run: bun run test:db:configuration-producer
 
   connectors:
     name: sdk + mcp (typecheck + unit)

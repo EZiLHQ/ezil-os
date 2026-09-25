@@ -29,6 +29,7 @@ process.once('message', async init=>{
  const store=new ControlStore(init.directory,init.scope.computerId,init.scope.computerGeneration);
  const states=new Map();
  const service=createControlService({...init.scope,secret:Buffer.from(init.secret,'hex'),store,
+   configuration:()=>({revision:7,digest:'a'.repeat(64)}),
    approvePlan: plan=>init.plans.some(p=>canonicalJson(p)===canonicalJson(plan)),
    driver:{observe:async id=>({state:states.get(id)??'unknown'}),reconcile:async intent=>{
      if(intent.desired==='running')store.reserveRuntimeDeadline(intent.command,Date.now()+intent.command.plan.resources.maxRuntimeSeconds*1000);
@@ -48,6 +49,9 @@ try {
     try { port = (await Promise.race([ready, once(child, 'exit').then(() => { throw new Error('Native supervisor exited before listening'); })]))[0].port; }
     finally { clearTimeout(timer); }
     const client = createHostControlClient({ ...scope, secret, origin: `http://127.0.0.1:${port}` }, { privateValidation: true });
+    assert.deepEqual(await client.configuration(), { computerId: scope.computerId, computerGeneration: scope.computerGeneration,
+        configurationRevision: 7, configurationDigest: 'a'.repeat(64) });
+    console.log('PASS actual supervisor authenticates the configuration operation and returns its loaded descriptor');
     for (const plan of plans) {
         const installationId = randomUUID();
         const command: HostCommand = { schemaVersion: 1, requestId: randomUUID(), computerId: scope.computerId, computerGeneration: 1,
@@ -69,8 +73,9 @@ try {
     }
     const wrong = createHostControlClient({ ...scope, secret: randomBytes(32), origin: `http://127.0.0.1:${port}` }, { privateValidation: true });
     await assert.rejects(wrong.observe(randomUUID()), /host_rejected/);
+    await assert.rejects(wrong.configuration(), /host_rejected/);
     assert.ok(!diagnostics.includes(secret.toString('hex')));
-    console.log('PASS wrong generation key rejected; 3 checks passed, 0 failed, 0 skipped');
+    console.log('PASS wrong generation key rejected; 4 checks passed, 0 failed, 0 skipped');
 } finally {
     const ended = once(child, 'exit');
     if (child.connected) child.disconnect();

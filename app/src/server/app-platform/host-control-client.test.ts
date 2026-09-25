@@ -25,6 +25,34 @@ const observation = () => ({ computerId: scope.computerId, computerGeneration: 1
     desired: 'running', intentDigest: hostIntentDigest(request), state: 'running', settled: true, runtimeDeadlineMs: Date.now() + 10000 });
 
 describe('bounded supervisor client', () => {
+    it('reads the signed loaded configuration without sending installation IDs or provisioning handles', async () => {
+        const descriptor = { computerId: scope.computerId, computerGeneration: scope.computerGeneration,
+            configurationRevision: 7, configurationDigest: 'a'.repeat(64) };
+        const origin = await serve((req, res) => { let body = ''; req.on('data', chunk => { body += chunk; }); req.on('end', () => {
+            const value = JSON.parse(body) as Record<string, unknown>;
+            expect(Object.keys(value).sort()).toEqual(['schemaVersion', 'requestId', 'computerId', 'computerGeneration', 'operation'].sort());
+            expect(value.operation).toBe('configuration');
+            expect(req.headers['x-ezil-signature']).toMatch(/^[a-f0-9]{64}$/);
+            res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(descriptor));
+        }); });
+        const client = createHostControlClient({ ...scope, secret, origin }, { privateValidation: true });
+        await expect(client.configuration()).resolves.toEqual(descriptor);
+    });
+    it('rejects unavailable, cross-generation, prefixed-digest or malformed loaded descriptors', async () => {
+        for (const fields of [{ computerId: randomUUID() }, { computerGeneration: 2 }, { configurationRevision: 0 },
+            { configurationDigest: `sha256:${'a'.repeat(64)}` }, { secret: 'sensitive-sentinel' }]) {
+            const origin = await serve((_req, res) => {
+                res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ computerId: scope.computerId,
+                    computerGeneration: 1, configurationRevision: 1, configurationDigest: 'a'.repeat(64), ...fields }));
+            });
+            await expect(createHostControlClient({ ...scope, secret, origin }, { privateValidation: true }).configuration())
+                .rejects.toThrow(/^host_response_invalid$/);
+        }
+        const origin = await serve((_req, res) => { res.writeHead(503, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ code: 'computer_configuration_unavailable' })); });
+        await expect(createHostControlClient({ ...scope, secret, origin }, { privateValidation: true }).configuration())
+            .rejects.toThrow(/^host_rejected$/);
+    });
     it('rejects mutable target identity, invalid configurations and cross-computer replies', async () => {
         expect(() => createHostControlClient({ ...scope, secret, origin: 'http://127.0.0.1:1234' })).toThrow('invalid_host_control_configuration');
         expect(() => createHostControlClient({ ...scope, secret, origin: 'https://secret:password@example.com' })).toThrow('invalid_host_control_configuration');

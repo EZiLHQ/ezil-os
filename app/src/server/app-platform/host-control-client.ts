@@ -18,8 +18,15 @@ const observationSchema = z.object({
     settled: z.boolean(), runtimeDeadlineMs: z.number().int().positive().nullable(),
 }).strict();
 export type HostObservation = z.infer<typeof observationSchema>;
+const configurationSchema = z.object({ computerId: z.string().uuid(),
+    computerGeneration: z.number().int().min(1).max(2_147_483_647),
+    configurationRevision: z.number().int().min(1).max(2_147_483_647),
+    configurationDigest: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+export type HostConfigurationObservation = z.infer<typeof configurationSchema>;
 export interface HostControlClient {
     readonly scope: HostScope;
+    configuration(): Promise<HostConfigurationObservation>;
     observe(installationId: string): Promise<HostObservation | null>;
     reconcile(command: HostCommand): Promise<void>;
 }
@@ -93,6 +100,15 @@ export function createHostControlClient(target: HostScope & { origin: string; se
     };
     return {
         scope,
+        async configuration() {
+            const result = await send({ schemaVersion: 1, requestId: randomUUID(), computerId: scope.computerId,
+                computerGeneration: scope.computerGeneration, operation: 'configuration' });
+            if (result.status !== 200) throw new HostControlError('host_rejected');
+            const parsed = configurationSchema.safeParse(result.body);
+            if (!parsed.success || parsed.data.computerId !== scope.computerId
+                || parsed.data.computerGeneration !== scope.computerGeneration) throw new HostControlError('host_response_invalid');
+            return parsed.data;
+        },
         async observe(installationId) {
             const result = await send({ schemaVersion: 1, requestId: randomUUID(), computerId: scope.computerId,
                 computerGeneration: scope.computerGeneration, installationId, operation: 'observe' });
