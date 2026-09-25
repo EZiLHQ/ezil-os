@@ -712,10 +712,26 @@ export async function openDesktopWindow (ctx = {}) {
     });
 
     /** The box the stream will occupy, in device pixels — or null if nothing is measurable. */
-    const measure_screen = () => measureDesktopBox({
-        body: el_body,
-        view: typeof window !== 'undefined' ? window : null,
-    });
+    const measure_screen = () => {
+        const view = typeof window !== 'undefined' ? window : null;
+        // Full-bleed reserves a strip for the OS controls below the stream.
+        // The screen request must describe the stream's actual box, not the
+        // larger browser viewport, or the remote desktop is letterboxed by
+        // the height of that strip even after its live-resize request settles.
+        // Before full-bleed, retain the viewport projection used for boot.
+        if ( view && el_window.classList.contains('ezil-fullbleed')
+            && el_body.clientWidth > 0 && el_body.clientHeight > 0 ) {
+            return measureDesktopBox({
+                body: el_body,
+                view: {
+                    innerWidth: el_body.clientWidth,
+                    innerHeight: el_body.clientHeight,
+                    devicePixelRatio: view.devicePixelRatio,
+                },
+            });
+        }
+        return measureDesktopBox({ body: el_body, view });
+    };
 
     /**
      * Ask the server what the desktop's screen ACTUALLY is, and fold the answer

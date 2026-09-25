@@ -197,7 +197,18 @@ export function attach_app_drawer (el_window, options = {}) {
     // Touch devices open by tap instead, and since they never fire
     // pointerleave, that path self-schedules its collapse. (Upstream.)
     $drawer.on('pointerenter', (e) => {
-        if ( e.pointerType === 'mouse' ) expand();
+        if ( e.pointerType === 'mouse' ) {
+            expand();
+            // Enter can fire when full-bleed moves the drawer underneath the
+            // pointer still resting on the dock. Let that idle hover retract
+            // instead of leaving the controls open over the stream forever.
+            schedule_collapse(2600);
+        }
+    });
+    $drawer.on('pointermove', (e) => {
+        if ( e.pointerType === 'mouse' && ! drawer.classList.contains('collapsed') ) {
+            schedule_collapse(3500);
+        }
     });
     $drawer.on('pointerleave', (e) => {
         if ( e.pointerType === 'mouse' ) schedule_collapse(900);
