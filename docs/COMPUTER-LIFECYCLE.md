@@ -53,7 +53,7 @@ schema is applied. Rollback keeps additive history and disables the producer.
 ## Consumer and authority endpoint
 
 `lifecycle-consumer.ts` claims only jobs which already have an immutable intent.
-It reads the exact SQL v1 document and digest, checks the approved deployment,
+It reads the exact SQL v1 or v2 document and digest, checks the approved deployment,
 current owner/OS access, desired state and writer/disk association, and reserves
 one of two pilot computer slots before submitting work. The running job holds
 that reservation across delivery lease expiry and ambiguous AWS responses.
@@ -111,8 +111,8 @@ acknowledgment. Historical cleanup remains valid after owner access revocation.
 These writes use existing schema; no migration is added by this consumer change.
 
 Activation still requires durable cancellation for revocation racing successful
-completion, and an explicit recovery intent that starts a new generation on a
-retained disk after its old writers are fenced. The current v1 provision contract
+completion and a deployed v2 recovery workflow for starting a new generation on a
+retained disk after its old writers are fenced. The v1 provision contract
 cannot silently treat an existing retained disk as an empty new computer. A
 data-only interrupted allocation remains associated with its owner even if it
 never received an instance. Keep producers disabled until that recovery path,
@@ -165,7 +165,7 @@ provider IDs. Cookie/bearer authentication cannot substitute for the workflow
 key. Replaying a signed check repeats current database validation. The result is
 not a reusable capability and does not execute provider work.
 
-The endpoint defaults off. Before enabling it, review/apply migration 0007 and
+The endpoint defaults off. Before enabling it, review/apply migrations through 0008 and
 configure `EZIL_LIFECYCLE_AUTHORITY_ENABLED=true`, a separate 64-character hex
 `EZIL_LIFECYCLE_AUTHORITY_SECRET`, and `EZIL_LIFECYCLE_DEPLOYMENTS` as a JSON array
 of reviewed deployment records. Invalid or missing enabled configuration fails
@@ -185,3 +185,52 @@ loopback Postgres server. SDK tests exercise actual request serialization,
 signing and XML/JSON decoding with a local wire handler. Database tests exercise
 real concurrent locks and commits. Neither test suite establishes cloud IAM,
 disk mounting, physical-phone behavior, or stopped-compute billing.
+
+## V2 recovery consumer
+
+The consumer handles retained-disk recovery through the same claim, computer
+lock, lease and atomic two-computer admission path as v1. It requires the source
+job's cleanup acknowledgment, matching immutable digest and storage scope, all
+historical writers fenced with a stopped observation, current ownership/OS
+access, desired running state and an approved deployment. Source or fence changes
+during observation prevent acknowledgment. Cleanup does not restore access.
+
+The signed authority endpoint accepts `{schemaVersion:2, computerId, jobId,
+digest}` and returns `{authorized:true, ...request, writers}` only for current
+running recovery work. Each writer contains `instanceId`, `generation`,
+`fenceToken`, `observedAt` and `fencedAt`, read from server records. No request
+accepts a writer list. The list is bounded to 128; exceeding it fails closed and
+requires an explicit operational review. The workflow must recheck authority
+and independently observe those resources before each relevant mutation.
+
+The AWS adapter preserves v2 document bytes and submits a v2 envelope to its
+numeric Standard workflow version. Instance allocation uses the SHA-256 token
+of `ezil-lifecycle-v2\ninstance\n<document digest>`. Success requires a v2 receipt,
+the same disk, a fresh instance ID/token and independent EC2/EBS checks. Old
+writers must be terminated. AWS can eventually remove terminated instance IDs;
+an absent ID is accepted only for a historical writer with recorded fencing
+predating this intent. It is never accepted for the new allocation. The adapter
+rechecks the full historical set before the consumer atomically registers the
+new writer. A successful receipt does not establish host or application readiness.
+
+Failed v2 work uses a version-pinned cleanup mapping and complete source history.
+The receipt must retain the same disk and include any possibly allocated new
+writer, independently observed terminated. A data-only failure can retain the
+previous disk tags. Any `createVolume` task in recovery history is rejected.
+No compute mutation or volume deletion occurs in the web adapter. The matching
+provider workflow and cleanup graph remain a separate implementation and rollout.
+
+`EZIL_LIFECYCLE_DEPLOYMENTS` also accepts `{profileMode:"per-writer", deployment}`.
+Here `deployment` contains the same fixed pins except `instanceProfileArn`.
+The only accepted profile is derived as
+`arn:aws:iam::<account>:instance-profile/ezil/<namespace>/computers/<computer UUID>/g<generation>`.
+It matches the shared workflow convention without redeploying it per computer.
+Legacy exact-profile approvals remain supported. This does not create profiles
+or give a publisher IAM authority; host role provisioning remains separate.
+
+Run `bun run test:db:recovery-consumer` against loopback Postgres in addition to
+the existing lifecycle consumer suite. Tests cover v1 cleanup into v2 recovery,
+data-only failures and repeated recovery, mixed-version concurrent admission,
+revocation, lease/fence changes, cross-computer denial and disk preservation.
+SDK tests use actual AWS serializers with fixture responses. No AWS pilot,
+production migration or Reticle installation is established by these checks.

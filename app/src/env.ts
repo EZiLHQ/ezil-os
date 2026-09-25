@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { LifecycleDeploymentSchema } from './server/app-platform/lifecycle-deployment';
+import { LifecycleApprovalSchema } from './server/app-platform/lifecycle-approval';
 
 /**
  * Server-only environment. Validated eagerly at import time so a missing
@@ -75,13 +75,13 @@ const serverSchema = z.object({
     EZIL_CONFIGURATION_AUTHORITY_ENABLED: z.string().refine(value => ['true', 'false'].includes(value),
         'invalid_configuration_authority_flag').default('false'),
     EZIL_CONFIGURATION_AUTHORITY_SECRET: z.string().regex(/^[a-f0-9]{64}$/, 'invalid_configuration_authority_secret').optional(),
-    /** Service-only lifecycle authority; migration 0007 and a pinned workflow are required. */
+    /** Service-only lifecycle authority; migration 0008 and a pinned workflow are required. */
     EZIL_LIFECYCLE_AUTHORITY_ENABLED: z.string().refine(value => ['true', 'false'].includes(value),
         'invalid_lifecycle_authority_flag').default('false'),
     EZIL_LIFECYCLE_AUTHORITY_SECRET: z.string().regex(/^[a-f0-9]{64}$/, 'invalid_lifecycle_authority_secret').optional(),
     EZIL_LIFECYCLE_DEPLOYMENTS: z.string().max(65536).default('[]').transform((raw, ctx) => {
         try {
-            const parsed = z.array(LifecycleDeploymentSchema).max(16).safeParse(JSON.parse(raw));
+            const parsed = z.array(LifecycleApprovalSchema).max(16).safeParse(JSON.parse(raw));
             if (parsed.success) return parsed.data;
         } catch { /* Report a code only, never environment values. */ }
         ctx.addIssue({ code: 'custom', message: 'invalid_lifecycle_deployments' });

@@ -33,7 +33,8 @@
         "db:apply-0002": "node scripts/apply-os-access-migration.mjs",
         "test:db:lifecycle-intents": "bun --no-env-file tests/computer-lifecycle-intents-db.ts",
         "test:db:lifecycle-consumer": "bun --no-env-file tests/computer-lifecycle-consumer-db.ts",
-        "test:db:recovery-intents": "bun --no-env-file tests/computer-recovery-intents-db.ts"
+        "test:db:recovery-intents": "bun --no-env-file tests/computer-recovery-intents-db.ts",
+        "test:db:recovery-consumer": "bun --no-env-file tests/computer-recovery-consumer-db.ts"
     },
     "dependencies": {
         "@aws-sdk/client-ec2": "3.1140.0",

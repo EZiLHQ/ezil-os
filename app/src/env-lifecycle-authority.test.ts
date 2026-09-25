@@ -13,6 +13,12 @@ it('defaults lifecycle checks off and keeps deployment and secret settings serve
     vi.stubGlobal('window',{});const client=await load('true','ab'.repeat(32),JSON.stringify([lifecycleDeployment]));
     expect(client.EZIL_LIFECYCLE_AUTHORITY_ENABLED).toBe('false');expect(client.EZIL_LIFECYCLE_AUTHORITY_SECRET).toBeUndefined();expect(client.EZIL_LIFECYCLE_DEPLOYMENTS).toEqual([]);
 });
+it('accepts operator shared pins with a deterministic per-writer profile',async()=>{
+    const {instanceProfileArn:_profile,...deployment}=lifecycleDeployment;
+    const approvals=[{profileMode:'per-writer',deployment}];
+    expect((await load('true','ab'.repeat(32),JSON.stringify(approvals))).EZIL_LIFECYCLE_DEPLOYMENTS).toEqual(approvals);
+    expect(_profile).toBeTruthy();
+});
 it('fails closed for missing authority, mutable references or malformed settings without printing their values',async()=>{
     const output=vi.spyOn(console,'error').mockImplementation(()=>{});
     for(const [flag,secret,deployments] of [['true',undefined,undefined],['true','sensitive-sentinel',undefined],

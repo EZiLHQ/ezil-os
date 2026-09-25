@@ -1,7 +1,7 @@
 import { DescribeExecutionCommand, GetExecutionHistoryCommand, type SFNClient, type HistoryEvent } from '@aws-sdk/client-sfn';
 import { DescribeInstancesCommand, DescribeVolumesCommand, type EC2Client, type Tag } from '@aws-sdk/client-ec2';
-import { LifecycleError, parseLifecycleWork, type LifecycleWork } from './lifecycle-protocol';
-import { lifecycleAllocationToken, validateLifecycleRecoveryReceipt } from './lifecycle-recovery-protocol';
+import { LifecycleError, type LifecycleWork } from './lifecycle-protocol';
+import { parseComputerLifecycleWork, computerLifecycleAllocationToken, validateComputerLifecycleCleanup } from './computer-lifecycle-work';
 
 const fail = (): never => { throw new LifecycleError('lifecycle_unconfirmed'); };
 const tagged = (tags: Tag[] | undefined, expected: Record<string, string>) => Object.entries(expected).every(([key, value]) =>
@@ -16,7 +16,7 @@ export async function observeLifecycleRecovery(options: {
     sfn: Pick<SFNClient, 'send'>; ec2: Pick<EC2Client, 'send'>; signal: AbortSignal;
 }) {
     const { work, recoveryVersionArn: version, sfn, ec2, signal } = options;
-    const i = parseLifecycleWork(work), d = i.deployment;
+    const i = parseComputerLifecycleWork(work), d = i.deployment;
     const originalMachine = d.stateMachineVersionArn.slice(0, d.stateMachineVersionArn.lastIndexOf(':'));
     if (!new RegExp(`^arn:aws:states:us-east-1:${d.accountId}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*$`).test(version)
         || !['FAILED', 'ABORTED', 'TIMED_OUT'].includes(options.sourceStatus)) return fail();
@@ -33,7 +33,7 @@ export async function observeLifecycleRecovery(options: {
         || execution.input !== JSON.stringify({ sourceExecutionArn: sourceArn })) return fail();
     if (execution.status === 'RUNNING') return { state: 'pending' as const };
     if (execution.status !== 'SUCCEEDED' || !execution.output || Buffer.byteLength(execution.output) > 4096) return fail();
-    const receipt = validateLifecycleRecoveryReceipt(work, JSON.parse(execution.output));
+    const receipt = validateComputerLifecycleCleanup(work, JSON.parse(execution.output));
     // A fencing receipt cannot omit a possibly allocated instance or disk.
     const history: HistoryEvent[] = [];
     let nextToken: string | undefined;
@@ -48,10 +48,11 @@ export async function observeLifecycleRecovery(options: {
         || history.some((h, index) => h.id !== index + 1 || !h.timestamp
             || (h.type === 'TaskStateEntered' && !h.stateEnteredEventDetails?.name))) return fail();
     const entered = (name: string) => history.some(h => h.type === 'TaskStateEntered' && h.stateEnteredEventDetails?.name === name);
-    const originalId = i.previousInstanceId ?? i.providerInstanceId;
+    const originalId = i.schemaVersion === 1 ? i.previousInstanceId ?? i.providerInstanceId : null;
     const target = receipt.instances.find(v => v.instanceId !== originalId);
-    if (['provision', 'replace'].includes(i.operation) && entered('runInstances') !== Boolean(target)) return fail();
+    if (['provision', 'replace', 'recover'].includes(i.operation) && entered('runInstances') !== Boolean(target)) return fail();
     if (i.operation === 'provision' && entered('createVolume') !== (receipt.volumeId !== null)) return fail();
+    if (i.schemaVersion === 2 && entered('createVolume')) return fail();
     // Empty ID lists must never turn into unscoped account-wide describes.
     const [instances, volumes] = await Promise.all([
         receipt.instances.length ? ec2.send(new DescribeInstancesCommand({ InstanceIds: receipt.instances.map(v => v.instanceId) }), request) : null,
@@ -66,16 +67,18 @@ export async function observeLifecycleRecovery(options: {
         const row = rows.find(r => r.instance.InstanceId === expected.instanceId), instance = row?.instance;
         if (row?.owner !== d.accountId || !instance || instance.State?.Name !== 'terminated'
             || instance.Placement?.AvailabilityZone !== d.availabilityZone || !tagged(instance.Tags, tags(expected.generation, expected.fenceToken))
-            || (expected.instanceId !== originalId && instance.ClientToken !== lifecycleAllocationToken(work.digest, 'instance'))) return fail();
+            || (expected.instanceId !== originalId && instance.ClientToken !== computerLifecycleAllocationToken(work, 'instance'))) return fail();
     }
     if (receipt.volumeId) {
         const v = volumes?.Volumes?.[0];
+        const previousScope = i.schemaVersion === 2 ? i.dataScope : i.previousGeneration
+            ? { generation: i.previousGeneration, fenceToken: i.previousFenceToken! } : null;
         if (volumes?.Volumes?.length !== 1 || v?.VolumeId !== receipt.volumeId || v.State !== 'available' || v.Attachments?.length !== 0
             || v.Encrypted !== true || v.KmsKeyId !== d.dataKeyArn || v.Size !== 50 || v.VolumeType !== 'gp3'
             || v.MultiAttachEnabled !== false || v.AvailabilityZone !== d.availabilityZone
             || (!tagged(v.Tags, tags(i.targetGeneration, i.fenceToken))
-                && !(i.previousGeneration && tagged(v.Tags, tags(i.previousGeneration, i.previousFenceToken!))))
-            || (i.operation === 'provision' && !tagged(v.Tags, { 'ezil:allocation': lifecycleAllocationToken(work.digest, 'volume') }))) return fail();
+                && !(previousScope && tagged(v.Tags, tags(previousScope.generation, previousScope.fenceToken))))
+            || (i.operation === 'provision' && !tagged(v.Tags, { 'ezil:allocation': computerLifecycleAllocationToken(work, 'volume') }))) return fail();
     }
     if (signal.aborted) return fail();
     return { state: 'fenced' as const, receipt, observedAt: new Date() };

@@ -1,7 +1,10 @@
 import { EC2Client, DescribeInstancesCommand, DescribeVolumesCommand,
     type EC2ClientConfig, type Instance, type Tag } from '@aws-sdk/client-ec2';
 import { SFNClient, DescribeExecutionCommand, DescribeStateMachineCommand, StartExecutionCommand } from '@aws-sdk/client-sfn';
-import { LifecycleError, parseLifecycleWork, validateLifecycleReceipt, type LifecycleWork } from './lifecycle-protocol';
+import { LifecycleError, type LifecycleWork } from './lifecycle-protocol';
+import { parseComputerLifecycleWork, validateComputerLifecycleReceipt, computerLifecycleAllocationToken } from './computer-lifecycle-work';
+import { validateFencedWriters, observeFencedWriters } from './aws-fenced-writers';
+import type { FencedWriters } from './computer-recovery-authority';
 import type { LifecycleConsumerOptions } from './lifecycle-consumer';
 import { observeLifecycleRecovery, type LifecycleRecoveryDeployments } from './aws-lifecycle-recovery';
 
@@ -34,12 +37,14 @@ export function createAwsLifecycleTransport(options: AwsLifecycleTransportOption
     const sfn = new SFNClient({ ...settings, endpoint: 'https://states.us-east-1.amazonaws.com' });
     const ec2 = new EC2Client({ ...settings, endpoint: 'https://ec2.us-east-1.amazonaws.com' });
 
-    async function advance(work: LifecycleWork, allowStart: boolean, signal: AbortSignal) {
-        const i = parseLifecycleWork(work), d = i.deployment;
+    async function advance(work: LifecycleWork, allowStart: boolean, signal: AbortSignal, context?: { fencedWriters: FencedWriters }) {
+        const i = parseComputerLifecycleWork(work), d = i.deployment;
+        const writers = i.schemaVersion === 2 ? validateFencedWriters(work, context?.fencedWriters) : [];
+        const previousInstanceId = i.schemaVersion === 1 ? i.previousInstanceId : null;
         const versionArn = d.stateMachineVersionArn, machineArn = versionArn.slice(0, versionArn.lastIndexOf(':'));
         const name = `computer-${i.jobId}`, executionArn = machineArn.replace(':stateMachine:', ':execution:') + ':' + name;
         // Preserve the SQL-returned UTF-8 document exactly; do not reserialize it.
-        const input = JSON.stringify({ schemaVersion: 1, document: work.document, digest: work.digest });
+        const input = JSON.stringify({ schemaVersion: i.schemaVersion, document: work.document, digest: work.digest });
         const request = { abortSignal: signal };
         const describe = async () => {
             try { return await sfn.send(new DescribeExecutionCommand({ executionArn }), request); }
@@ -75,13 +80,15 @@ export function createAwsLifecycleTransport(options: AwsLifecycleTransportOption
         if (execution.status !== 'SUCCEEDED') {
             const recoveryVersionArn = options.recoveryDeployments?.[versionArn];
             if (!recoveryVersionArn || !['FAILED', 'ABORTED', 'TIMED_OUT'].includes(execution.status ?? '')) return fail('lifecycle_unconfirmed');
+            if (i.schemaVersion === 2) await observeFencedWriters(ec2, work, writers, signal);
             return observeLifecycleRecovery({ work, recoveryVersionArn, sourceStatus: execution.status!, sfn, ec2, signal });
         }
         if (!execution.output || Buffer.byteLength(execution.output) > 4096) return fail('lifecycle_conflict');
         let json: unknown;
         try { json = JSON.parse(execution.output); } catch { return fail('lifecycle_conflict'); }
-        const receipt = validateLifecycleReceipt(work, json);
-        const ids = [receipt.instanceId, ...(i.previousInstanceId ? [i.previousInstanceId] : [])];
+        const receipt = validateComputerLifecycleReceipt(work, json);
+        if (writers.some(w => w.instanceId === receipt.instanceId)) return fail('lifecycle_conflict');
+        const ids = [receipt.instanceId, ...(previousInstanceId ? [previousInstanceId] : [])];
         const [instances, volumes] = await Promise.all([
             ec2.send(new DescribeInstancesCommand({ InstanceIds: ids }), request),
             ec2.send(new DescribeVolumesCommand({ VolumeIds: [receipt.volumeId] }), request),
@@ -100,12 +107,16 @@ export function createAwsLifecycleTransport(options: AwsLifecycleTransportOption
         if (!identity(target) || !tagged(v.Tags, tags) || v.VolumeId !== receipt.volumeId
             || v.AvailabilityZone !== d.availabilityZone || v.Encrypted !== true || v.KmsKeyId !== d.dataKeyArn
             || v.Size !== 50 || v.VolumeType !== 'gp3' || v.MultiAttachEnabled !== false) return fail('lifecycle_conflict');
-        if (i.previousInstanceId) {
+        if (i.schemaVersion === 1 && i.previousInstanceId) {
             const old = entries.find(e => e.instance.InstanceId === i.previousInstanceId)?.instance;
             // STOPPED alone is insufficient: a delayed old StartInstances could
             // restart it. Replacement fencing requires observed termination.
             if (!identity(old, { ...tags, 'ezil:generation': String(i.previousGeneration), 'ezil:fence-token': i.previousFenceToken! })
                 || old?.State?.Name !== 'terminated') return fail('lifecycle_unconfirmed');
+        }
+        if (i.schemaVersion === 2) {
+            if (target?.ClientToken !== computerLifecycleAllocationToken(work, 'instance')) return fail('lifecycle_conflict');
+            await observeFencedWriters(ec2, work, writers, signal);
         }
         if (receipt.state === 'retired') {
             if (target?.State?.Name !== 'terminated' || v.State !== 'available' || v.Attachments?.length !== 0) {
@@ -130,8 +141,8 @@ export function createAwsLifecycleTransport(options: AwsLifecycleTransportOption
         return { state: 'observed' as const, receipt, observedAt: new Date() };
     }
     return {
-        async advance(work, allowStart, signal) {
-            try { return await advance(work, allowStart, signal); }
+        async advance(work, allowStart, signal, context) {
+            try { return await advance(work, allowStart, signal, context); }
             catch (e) { if (e instanceof LifecycleError) throw e; throw new LifecycleError('lifecycle_unavailable'); }
         },
         destroy() { sfn.destroy(); ec2.destroy(); },
