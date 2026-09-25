@@ -128,6 +128,16 @@ describe('ApprovedComputerAppPolicyV2', () => {
         expect(validateComputerPolicyAgainstManifest(manifest(), policy())).toMatchObject({ success: true });
     });
 
+    it('bounds the base host so a generated installation origin remains a valid DNS name', () => {
+        const base = `${'a'.repeat(60)}.${'b'.repeat(60)}.${'c'.repeat(60)}.${'d'.repeat(28)}.com`;
+        expect(base.length).toBe(215);
+        issue(manifest(), { ...policy(), appOriginBase: `https://${base}` },
+            ['policy', 'appOriginBase'], 'custom');
+        expect(validateComputerPolicyAgainstManifest(manifest(), {
+            ...policy(), appOriginBase: `https://${base.replace(`${'d'.repeat(28)}.com`, `${'d'.repeat(27)}.com`)}`,
+        })).toMatchObject({ success: true });
+    });
+
     it('requires explicit web embedding approval without extra sandbox authority', () => {
         issue(manifest(), { ...policy(), launch: { mode: 'web', embedding: { mode: 'iframe',
             sandbox: ['allow-scripts', 'allow-same-origin', 'allow-popups'] } } },

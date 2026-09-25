@@ -19,7 +19,10 @@ const port = z.number().int().min(1024).max(65535);
 const envName = SecretReferenceSchema.shape.name;
 const nodeEntrypoint = RelativePathSchema.refine((value) => /\.(?:js|mjs|cjs)$/.test(value) && !value.startsWith('-'));
 const argvItem = z.string().min(1).max(256).refine((value) =>
-    [...value].every((character) => character.charCodeAt(0) >= 32 && character.charCodeAt(0) !== 127));
+    [...value].every((character) => {
+        const code = character.charCodeAt(0);
+        return code >= 32 && (code < 127 || code > 159);
+    }));
 
 function containerPath(root: 'data' | 'workspace') {
     return z.string().max(240).refine((value) => value.startsWith(`/${root}/`)
@@ -81,7 +84,8 @@ const build = z.discriminatedUnion('recipe', [
     z.object({
         recipe: z.literal('pnpm-workspace-v1'),
         workspace: RelativePathSchema,
-        pnpmVersion: z.string().regex(/^[0-9]+\.[0-9]+\.[0-9]+$/),
+        pnpmVersion: z.string().max(50).regex(/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/)
+            .refine((value) => value.split('.').every((part) => Number.isSafeInteger(Number(part)))),
         lockfileDigest: Sha256DigestSchema,
         script: z.literal('build').optional(),
     }).strict(),
@@ -169,6 +173,7 @@ export const ComputerAppManifestV2Schema = z.object({
         if (item.process.kind === 'reticle-daemon-v1'
             && (manifest.source.kind !== 'github'
                 || manifest.source.url !== 'https://github.com/reticlehq/reticle'
+                || manifest.source.subdirectory !== undefined
                 || manifest.launch.mode !== 'integration'
                 || manifest.launch.service !== item.name)) {
             reject(['services', index, 'process'], 'unsupported_adapter_use');
@@ -247,6 +252,7 @@ export function checkComputerAppPilotCompatibility(manifest: ComputerAppManifest
     if (manifest.launch.mode === 'integration') {
         if (manifest.source.kind !== 'github'
             || manifest.source.url !== 'https://github.com/reticlehq/reticle'
+            || manifest.source.subdirectory !== undefined
             || manifest.build?.recipe !== 'pnpm-workspace-v1'
             || manifest.build.workspace !== 'server') {
             reject(['launch', 'adapter'], 'unsupported_integration_source');

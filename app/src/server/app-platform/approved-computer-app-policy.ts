@@ -67,6 +67,12 @@ export const ApprovedComputerAppPolicyV2Schema = z.object({
     ]),
 }).strict().superRefine((policy, ctx) => {
     const appHost = new URL(policy.appOriginBase).hostname;
+    // An installation label is "i-" plus a 36-character UUID and a dot.
+    // A syntactically valid base can still exceed DNS's 253-byte hostname
+    // limit after that label is prepended.
+    if (appHost.length > 253 - 39) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['appOriginBase'], message: 'derived_origin_too_long' });
+    }
     if (policy.allowedOsOrigins.some((origin) => {
         const osHost = new URL(origin).hostname;
         return osHost === appHost || osHost.endsWith(`.${appHost}`);

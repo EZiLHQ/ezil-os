@@ -115,6 +115,25 @@ describe('ComputerAppManifestV2', () => {
         }
     });
 
+    it('rejects terminal controls in process arguments', () => {
+        const web = nodeComputerApp().services[0];
+        for (const argument of ['safe\u009b[31m', 'safe\u0007bell', 'safe\u007fdelete']) {
+            expect(issues(nodeComputerApp({ services: [{ ...web, process: {
+                kind: 'node', entrypoint: 'dist/server.mjs', args: [argument],
+            } }] }))).toContainEqual({ path: ['services', 0, 'process', 'args', 0], code: 'custom' });
+        }
+    });
+
+    it('requires canonical, bounded pnpm versions', () => {
+        const base = reticleComputerApp();
+        for (const pnpmVersion of ['01.2.3', '1.02.3', '1.2.03']) {
+            expect(issues({ ...base, build: { ...base.build, pnpmVersion } }))
+                .toContainEqual({ path: ['build', 'pnpmVersion'], code: 'invalid_string' });
+        }
+        expect(issues({ ...base, build: { ...base.build, pnpmVersion: '9007199254740992.2.3' } }))
+            .toContainEqual({ path: ['build', 'pnpmVersion'], code: 'custom' });
+    });
+
     it('rejects unsafe source, entrypoint, paths and ports', () => {
         for (const url of ['http://github.com/acme/notes', 'https://user:pass@github.com/acme/notes',
             'https://github.com/acme/notes/tree/main', 'https://127.0.0.1/acme/notes']) {
@@ -159,6 +178,8 @@ describe('ComputerAppManifestV2', () => {
 
     it('requires Reticle integration to bind only an explicitly selected project', () => {
         const base = reticleComputerApp();
+        expect(issues({ ...base, source: { ...base.source, subdirectory: 'docs' } }))
+            .toContainEqual({ path: ['services', 0, 'process'], code: 'custom' });
         expect(issues({ ...base, source: nodeComputerApp().source }))
             .toContainEqual({ path: ['services', 0, 'process'], code: 'custom' });
         const wrongMount = { mode: 'computer-volume', privateDirectories: [],
