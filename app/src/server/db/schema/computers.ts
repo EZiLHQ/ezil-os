@@ -7,6 +7,7 @@ import {
     smallint,
     text,
     timestamp,
+    unique,
     uniqueIndex,
     uuid,
 } from 'drizzle-orm/pg-core';
@@ -55,6 +56,9 @@ export const computers = pgTable(
         id: uuid('id').primaryKey().defaultRandom(),
         userId: uuid('user_id').notNull(),
         name: text('name').notNull().default('Computer'),
+        // Existing rows remain on the Cloudflare desktop. New AWS computers
+        // opt in explicitly; provider changes require a fenced migration.
+        provider: text('provider').$type<'cloudflare' | 'aws-ec2'>().notNull().default('cloudflare'),
         // 1 | 2 — see the CHECK constraint. Cap enforced in the schema, not
         // just application code, so a concurrent double-click racing
         // `computer.create` cannot slip a 3rd row past the limit — the
@@ -73,7 +77,9 @@ export const computers = pgTable(
         uniqueIndex('ezil_computers_user_slot_uidx')
             .on(table.userId, table.slot)
             .where(sql`${table.deletedAt} is null`),
+        unique('ezil_computers_id_provider_uq').on(table.id, table.provider),
         check('ezil_computers_slot_chk', sql`${table.slot} in (1, 2)`),
+        check('ezil_computers_provider_chk', sql`${table.provider} in ('cloudflare', 'aws-ec2')`),
         foreignKey({
             name: 'ezil_computers_user_id_fkey',
             columns: [table.userId],

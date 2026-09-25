@@ -96,7 +96,7 @@ function makeLiveComputerDb(slot = 1) {
  * real SQLSTATE 23505 unique violation is injected).
  *
  * Column order for a full row, taken from the SQL drizzle actually emits:
- * id, user_id, name, slot, created_at, last_opened_at, deleted_at, metadata.
+ * id, user_id, name, provider, slot, created_at, last_opened_at, deleted_at, metadata.
  */
 function makeScriptedDb(script: (unknown[][] | Error)[]) {
     const statements: Statement[] = [];
@@ -121,7 +121,7 @@ function uniqueViolation(): Error {
 }
 
 function computerRow(id: string, slot: number, name = 'Computer'): unknown[] {
-    return [id, USER, name, slot, '2026-07-31T09:00:00.000Z', null, null, null];
+    return [id, USER, name, 'cloudflare', slot, '2026-07-31T09:00:00.000Z', null, null, null];
 }
 
 const isInsert = (s: Statement) => /^\s*insert\b/i.test(s.sql);
