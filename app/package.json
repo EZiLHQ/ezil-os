@@ -31,9 +31,11 @@
         "db:apply-0001": "node scripts/apply-telemetry-migration.mjs",
         "db:inspect-0002": "node scripts/probe-os-access-schema.mjs",
         "db:apply-0002": "node scripts/apply-os-access-migration.mjs",
-        "test:db:lifecycle-intents": "bun --no-env-file tests/computer-lifecycle-intents-db.ts"
+        "test:db:lifecycle-intents": "bun --no-env-file tests/computer-lifecycle-intents-db.ts",
+        "test:db:lifecycle-consumer": "bun --no-env-file tests/computer-lifecycle-consumer-db.ts"
     },
     "dependencies": {
+        "@aws-sdk/client-ec2": "3.1140.0",
         "@aws-sdk/client-s3": "3.1140.0",
         "@aws-sdk/client-secrets-manager": "3.1140.0",
         "@aws-sdk/client-sfn": "3.1140.0",
