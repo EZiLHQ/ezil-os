@@ -163,3 +163,56 @@ remain available for their original executions. The same reviewed shared pins
 derive profiles for each computer/generation; no new IAM privilege or provider
 is introduced here. All notification and recovery schedules remain disabled by
 default. Local fixtures and synthesis do not prove live EC2 or Reticle acceptance.
+
+## Explicit computer cancellation
+
+Cancellation is separate from automatic failure recovery. An explicit pending
+record in the control plane authorizes interruption and fencing even if the
+original execution has already succeeded. A missing or revoked launch grant
+alone does not authorize termination. The cancellation schema and consumer in
+#128–130 must be available before this workflow is enabled; #131 is its web-side
+submission and independent observation adapter.
+
+The optional `cancellation` object in `EZIL_LIFECYCLE_CONFIG` contains only
+`versionArn`, `secretArn`, and `authorityKeyArn`. It is absent by default. Use a
+separate Standard machine, a separate cancellation HMAC secret, and the KMS key
+that encrypts that secret. The construct publishes `CancellationVersionArn` and
+`CancellationHistoryKeyArn`; review their exact deployed values before setting
+the control-plane workflow mapping. The outbox dispatcher role needs access to
+that numeric version and its encrypted history. This change does not provision
+that role, schedule a dispatcher, or enable the control-plane feature flags.
+
+Each execution is named `cancel-computer-<cancellation UUID>`. Its input preserves
+the cancellation document/hash and the original document/hash. Every helper
+invocation validates that input against the pinned deployment and makes a signed
+POST to `/api/internal/computers/cancellation-authority`. The endpoint returns
+the current server-owned source, disk and writer scope. It is rechecked after
+inventory, immediately before a destructive decision. The dedicated credential
+does not authorize the normal lifecycle or configuration endpoints.
+
+A running original execution is interrupted once, then observed. Missing source
+executions, lost responses, incomplete histories and missing recent instances
+remain uncertain. The workflow never substitutes a new execution name or
+redrives work. After a terminal original and a propagation interval, complete
+bounded history and allocation-token inventories identify the exact resources.
+It clears data-disk `DeleteOnTermination`, confirms preservation, stops writers,
+and positively observes termination and detached retained storage. Every
+acknowledged step advances to observation; ambiguous mutations are not retried.
+Recorded historical fences can outlive EC2 history, while current writers cannot
+be declared terminated merely because a describe call returns no row.
+
+The workflow is bounded to ten minutes of helper decisions and a 660-second
+Standard timeout. An unconfirmed result retains control-plane admission and
+requires reconciliation; it does not mark the computer stopped or discard data.
+The helper has read access and only the dedicated cancellation secret. EC2
+mutations and `StopExecution` belong to the state-machine role, scoped to the
+approved region/stage and original execution prefix. Neither role can launch,
+attach/delete storage, or redrive executions. Workflow history is encrypted,
+payload logging is disabled, versions are retained, and failure/timeout alarms
+are defined. There is no automatic cancellation producer or activation schedule.
+
+`bash tools/test.sh infra` verifies the actual graph with local provider faults,
+the SDK/authority wire contract, IAM synthesis and existing lifecycle/recovery
+regressions. These tests do not establish live IAM enforcement, eventual resource
+visibility, stopped-compute billing, or Reticle acceptance; those remain AWS pilot
+checks before activation.
