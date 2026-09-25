@@ -51,6 +51,9 @@ bash tools/test.sh supervisor
 
 The 15 unit tests cover request replay, signature scope, mount and marker
 failures, exact origins, token provisioning races, and fail-closed startup.
+The artifact-verifier test additionally checks content digests and rejects
+escaping symlinks and native modules. See [the private build and container
+acceptance recipe](reticle/README.md) for reproducible real-browser checks.
 
 Private local Docker validation on 2026-09-25 used the pinned artifact and two
 separate computer volumes/networks. A browser connected to the real React

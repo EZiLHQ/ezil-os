@@ -1,0 +1,10 @@
+{
+  "name": "@ezil-os/reticle-private-acceptance",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node run.mjs" },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "playwright": "1.62.1"
+  }
+}
