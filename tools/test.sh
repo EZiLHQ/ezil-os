@@ -454,7 +454,7 @@ run_local () {
 # Order matters: sdk before mcp, because mcp depends on it by `file:../sdk` and
 # a break in the SDK should be reported as an SDK failure, not as a confusing
 # downstream one. Same reasoning as the `connectors` job in ci.yml.
-ALL_PACKAGES=(sdk mcp worker app shell tools local)
+ALL_PACKAGES=(sdk mcp worker app shell tools local infra)
 
 run_one () {
     local pkg="$1"; shift
@@ -467,6 +467,8 @@ run_one () {
         mcp)    run_mcp    "$@" ;;
         tools)  run_tools  "$@" ;;
         local)  run_local  "$@" ;;
+        infra)  typecheck "$TREE/infra/app-computers" npm run typecheck || return 1
+                ( cd "$TREE/infra/app-computers" && npm test && npm run synth ) ;;
         *)      say "unknown package: $pkg"; return 64 ;;
     esac
 }
