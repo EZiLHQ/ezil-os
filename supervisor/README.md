@@ -22,6 +22,11 @@ marker. A directory on the root disk, wrong marker, or read-only mount fails
 admission. The controller must separately verify encryption and attachment,
 fence previous writers, manage backups, and configure mount ordering.
 
+The [Linux mount primitive](MOUNTS.md) pins approved directories through path
+renames and stages stable binds for Docker. Its separate real Linux suite runs
+with `bash tools/test.sh supervisor --linux-mounts`; it does not replace the
+pending execution driver or EBS controller.
+
 ## Reticle runtime
 
 `reticle/Dockerfile` consumes an externally built `@reticlehq/server` artifact

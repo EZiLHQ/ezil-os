@@ -76,7 +76,8 @@ Before enabling real launches, the Docker driver and bootstrap must prove:
   filesystem roots, shell commands, Docker socket mounts, host networking, or
   cloud credentials inside applications.
 - Safe directory binding that withstands symlink/rename races in user-writable
-  projects, rather than only checking `realpath` before Docker starts.
+  projects. The [Linux mount primitive](MOUNTS.md) has real Docker race coverage;
+  the driver still needs to own its staging and cleanup lifecycle.
 - Immutable image verification, approved per-container options, private
   networks, memory/concurrency admission, and stable non-conflicting host ports.
 - Generation checks before and after asynchronous work; stop obsolete

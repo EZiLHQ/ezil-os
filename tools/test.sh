@@ -453,7 +453,10 @@ run_local () {
 
 run_supervisor () {
     typecheck "$TREE/supervisor" npm run typecheck || return 1
-    ( cd "$TREE/supervisor" && npm test && npm run build )
+    ( cd "$TREE/supervisor" && npm test && npm run build ) || return 1
+    if [[ "${1:-}" == "--linux-mounts" ]]; then
+        node "$TREE/supervisor/test/run-mounts-linux.mjs"
+    fi
 }
 
 # Order matters: sdk before mcp, because mcp depends on it by `file:../sdk` and
