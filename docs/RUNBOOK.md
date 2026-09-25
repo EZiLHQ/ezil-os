@@ -71,18 +71,28 @@ system, which is out of scope for a docs-only pass.
     [`app/drizzle/0002_os_access.sql`](../app/drizzle/0002_os_access.sql) must
     be applied to the **hosted** database before the access-gate code that
     reads `ezil_os_access` is deployed — the same rule
-    `0001_telemetry.sql` above was applied under. The migration has been
-    proven locally but has not been applied to the hosted database.
+    `0001_telemetry.sql` above was applied under. This ordering was missed on
+    the first App Store deployment and is now repaired.
   - **2026-09-24 production check:** a read-only build probe against the hosted
     connection found `ezil_computers`, `ezil_error_events`, `auth.users`, and
     `auth.role()`, but no `ezil_os_access` (44 public tables). The first App
     Store frontend deployment returned HTTP 500 on `/os` when the invite gate
     queried that missing table, and the previous Vercel deployment was restored.
     The probe ran only in protected deployment `dpl_nNVNrZsE5uV4LAi1uo2DtRaWojm6`;
-    it did not change the database or the production alias. Apply exactly 0002
-    before retrying the App Store release, then grant the intended test and
-    maintainer accounts with `tools/invite.ts add --no-invite` (existing accounts)
-    before testing `/os`. Keep the invite gate enabled.
+    it did not change the database or the production alias.
+  - **2026-09-25 repair and release:** protected, unpromoted Vercel build
+    `ezil-lehxmcir3-ezil.vercel.app` rechecked that 44-table baseline, applied
+    only the digest-pinned `0002` transaction, and verified 45 tables, RLS,
+    constraints, and policy. A second unpromoted build verified the existing
+    E2E account in `auth.users` and admitted only that account to the invite
+    table. The one-time build commands were removed afterward. Deployment
+    `dpl_B9y5vaKbEFCv7xnpvhcnoL1p4XFK` was then promoted to
+    `ezil-os.vercel.app`; the served shell bundle SHA-256 is
+    `1d8abcfb5ada190842670be751922e1c9f4e07c1dd8ed61bd3ac04b7442d9a74`.
+    Authenticated desktop and phone checks opened the App Store, searched for
+    Reticle, and confirmed its details say it is unreleased. Reticle cannot
+    be installed yet. Continue to use the invite CLI for ordinary access
+    grants; do not switch the production gate to open mode.
   - 🔴 **The invite email's redirect target changed.** It is
     `EZIL_OS_ORIGIN` + `/auth/invited` (a client page that reads the session
     out of the URL **fragment**, because Supabase invites are not PKCE and a
@@ -93,13 +103,12 @@ system, which is out of scope for a docs-only pass.
     the Site URL with no error. If the invite email template is ever changed
     to the `{{ .TokenHash }}` form instead, the server-side counterpart is
     `/auth/confirm`, and that path needs allow-listing too.
-  - 🔴 **This blocks the e2e default-host flip until an account exists.**
+  - **E2E default-host prerequisite:**
     Every `e2e/prod*.mjs` suite and `e2e/release-and-wait.mjs` sign in as
     `$EZIL_E2E_EMAIL` and then load `/os`; with `EZIL_OS_ACCESS_MODE` at its
     `invite` default, that account needs a row in `ezil_os_access` or every
-    one of those suites fails at the `/os` step. Seeding it is part of what
-    `N1` must do before row `N2`'s e2e half (the default-host flip, not the
-    docs half this file's edits are part of) can run.
+    one of those suites fails at the `/os` step. The production E2E account
+    was admitted on 2026-09-25. Any replacement account needs its own grant.
 
 ---
 
