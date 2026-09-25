@@ -1,0 +1,4 @@
+*
+!dist/
+!dist/reticle-adapter.js
+!package.json
