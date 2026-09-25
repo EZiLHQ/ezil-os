@@ -78,9 +78,13 @@ test('runtime deadlines persist beyond process/container loss and cannot be exte
         const expires = Date.now() + 5000;
         assert.throws(() => store.reserveRuntimeDeadline(first, expires), /runtime_deadline_scope_mismatch/);
         store.accept(first);
+        assert.equal(store.runtimeDeadline(first), null);
         assert.equal(store.reserveRuntimeDeadline(first, expires), expires);
         assert.equal(store.reserveRuntimeDeadline(first, expires + 1000), expires);
         store.close(); store = new ControlStore(dir, computerId, 1);
+        assert.equal(store.runtimeDeadline(first), expires);
+        assert.throws(() => store.runtimeDeadline({ ...first, computerGeneration: 2 }), /control_identity_mismatch/);
+        assert.throws(() => store.runtimeDeadline({ ...first, desired: 'stopped' }), /runtime_deadline_scope_mismatch/);
         assert.equal(store.reserveRuntimeDeadline(first, expires + 2000), expires);
         assert.equal(store.reserveRuntimeDeadline(first, expires - 100), expires - 100);
         const next = { ...first, requestId: randomUUID(), generation: 2 };

@@ -121,6 +121,18 @@ export class ControlStore implements ControlNonceStore {
             return expires;
         });
     }
+    /** Read the original reservation without creating or extending it. A
+     * controller must reconcile observed expiry, never guess from enqueue time. */
+    runtimeDeadline(command: ReconcileCommand): number | null {
+        if (command.computerId !== this.computerId || command.computerGeneration !== this.computerGeneration) {
+            throw new Error('control_identity_mismatch');
+        }
+        const lease = this.db.prepare('SELECT digest,expires FROM runtime_leases WHERE installation=? AND generation=?')
+            .get(command.installationId, command.generation);
+        if (!lease) return null;
+        if (lease.digest !== intentDigest(command)) throw new Error('runtime_deadline_scope_mismatch');
+        return Number(lease.expires);
+    }
     list(): StoredIntent[] {
         return this.db.prepare('SELECT installation FROM intents ORDER BY installation').all()
             .map(row => this.get(String(row.installation))!);
