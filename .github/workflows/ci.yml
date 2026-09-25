@@ -317,6 +317,9 @@ jobs:
       - name: Retained computer recovery consumer (real Postgres)
         working-directory: app
         run: bun run test:db:recovery-consumer
+      - name: Computer cancellation authority and settlement (real Postgres)
+        working-directory: app
+        run: bun run test:db:computer-cancellations
 
   connectors:
     name: sdk + mcp (typecheck + unit)
