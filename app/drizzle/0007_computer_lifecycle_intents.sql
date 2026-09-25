@@ -145,10 +145,15 @@ FOR EACH STATEMENT EXECUTE FUNCTION public.ezil_lifecycle_intent_immutable();
 CREATE FUNCTION public.ezil_lifecycle_job_scope_immutable() RETURNS trigger
 LANGUAGE plpgsql SET search_path = '' AS $$
 BEGIN
-    IF EXISTS(SELECT 1 FROM public.ezil_computer_lifecycle_intents WHERE job_id=OLD.id)
-        AND ROW(NEW.id,NEW.computer_id,NEW.operation,NEW.idempotency_key,NEW.target_generation,NEW.created_at)
+    IF EXISTS(SELECT 1 FROM public.ezil_computer_lifecycle_intents WHERE job_id=OLD.id) THEN
+        IF ROW(NEW.id,NEW.computer_id,NEW.operation,NEW.idempotency_key,NEW.target_generation,NEW.created_at)
             IS DISTINCT FROM ROW(OLD.id,OLD.computer_id,OLD.operation,OLD.idempotency_key,OLD.target_generation,OLD.created_at) THEN
-        RAISE EXCEPTION 'lifecycle job scope is immutable' USING ERRCODE='23514';
+            RAISE EXCEPTION 'lifecycle job scope is immutable' USING ERRCODE='23514';
+        END IF;
+        IF (OLD.status IN ('succeeded','failed','cancelled') AND NEW.status<>OLD.status)
+            OR (OLD.status='running' AND NEW.status='queued') THEN
+            RAISE EXCEPTION 'lifecycle job cannot move backwards' USING ERRCODE='23514';
+        END IF;
     END IF;
     RETURN NEW;
 END;

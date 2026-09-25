@@ -92,6 +92,7 @@ try {
         await sql`UPDATE ezil_computer_lifecycle_jobs SET status='running',started_at=now() WHERE id=${row.job_id}`;
         await reject(() => sql.begin(tx => intent(tx,c,'stop',{ revision:2 })));
         await sql`UPDATE ezil_computer_lifecycle_jobs SET status='succeeded',completed_at=now() WHERE id=${row.job_id}`;
+        await reject(() => sql`UPDATE ezil_computer_lifecycle_jobs SET status='running' WHERE id=${row.job_id}`);
         await sql.begin(tx => intent(tx,c,'stop',{ revision:2 }));
     });
     await test('concurrent reservations serialize; only one consumes a generation', async () => {

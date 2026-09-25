@@ -33,6 +33,7 @@ platform admission quotas, provider observation, revocation, backup or migration
 
 Intent content cannot be updated, deleted or truncated. Bound job identity cannot
 be rewritten, while status/timestamps remain available for the controller.
+Running jobs cannot return to queued, and terminal jobs cannot be reopened.
 The required outbox event cannot be deleted from under a retained intent. RLS is
 service-only; APIs must separately enforce ownership because their connection is
 privileged. Provider/resource IDs are never public API input.
