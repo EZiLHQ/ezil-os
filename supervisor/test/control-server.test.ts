@@ -19,7 +19,7 @@ test('real HTTP control requires signatures and scope; status does not execute o
     let approved = true;
     const service = createControlService({ computerId, computerGeneration: 1, secret, store, approvePlan: () => approved,
         driver: { reconcile: async () => { starts++; return 'running'; },
-            observe: async () => { observations++; return { state: 'stopped' }; } } });
+            observe: async () => { observations++; return { state: 'stopped', privateDriverField: 'must-not-leak' }; } } });
     service.server.listen(0, '127.0.0.1');
     await once(service.server, 'listening');
     const url = `http://127.0.0.1:${(service.server.address() as AddressInfo).port}/v1/control`;

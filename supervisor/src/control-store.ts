@@ -31,13 +31,13 @@ export class ControlStore implements ControlNonceStore {
         const file = lstatSync(path);
         if (!file.isFile() || file.isSymbolicLink() || (file.mode & 0o077)) throw new Error('invalid_control_database');
         this.db = new DatabaseSync(path);
-        this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+        try {
+            this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK(id=1), computer TEXT NOT NULL, generation INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS nonces (nonce TEXT PRIMARY KEY, expires INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS intents (installation TEXT PRIMARY KEY, generation INTEGER NOT NULL,
                 digest TEXT NOT NULL, command TEXT NOT NULL, observed TEXT NOT NULL DEFAULT 'unknown');
             CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, installation TEXT NOT NULL, generation INTEGER NOT NULL, digest TEXT NOT NULL);`);
-        try {
             this.transaction(() => {
                 const identity = this.db.prepare('SELECT computer,generation FROM identity WHERE id=1').get();
                 if (identity && (identity.computer !== computerId || identity.generation !== computerGeneration)) {
@@ -101,6 +101,7 @@ export class ControlStore implements ControlNonceStore {
             .map(row => this.get(String(row.installation))!);
     }
     observe(installationId: string, generation: number, state: StoredIntent['observed']): boolean {
+        if (!['unknown', 'running', 'stopped', 'failed'].includes(state)) throw new Error('invalid_observation');
         return this.db.prepare('UPDATE intents SET observed=? WHERE installation=? AND generation=?')
             .run(state, installationId, generation).changes === 1;
     }

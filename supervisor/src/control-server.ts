@@ -44,6 +44,10 @@ async function readBody(request: IncomingMessage): Promise<Buffer> {
  * persists commands and returns a receipt before long container operations. */
 export function createControlService(options: ControlServiceOptions) {
     if (options.secret.length < 32) throw new Error('control_secret_too_short');
+    const reportFailure = (code: string) => {
+        try { void Promise.resolve(options.onFailure?.(code)).catch(() => undefined); }
+        catch { /* Logging cannot break reconciliation or expose the error. */ }
+    };
     const scheduled = new Set<string>();
     const running = new Map<string, Promise<void>>();
     const schedule = (installationId: string) => {
@@ -61,10 +65,10 @@ export function createControlService(options: ControlServiceOptions) {
                     // Docker errors may contain paths/configuration. Log only
                     // this fixed code; leave the durable command retryable.
                     options.store.observe(installationId, intent.generation, 'failed');
-                    options.onFailure?.('computer_reconcile_failed');
+                    reportFailure('computer_reconcile_failed');
                 }
             }
-        }).catch(() => options.onFailure?.('control_store_unavailable')).finally(() => {
+        }).catch(() => reportFailure('control_store_unavailable')).finally(() => {
             running.delete(installationId);
             if (scheduled.has(installationId)) schedule(installationId);
         });
@@ -92,8 +96,9 @@ export function createControlService(options: ControlServiceOptions) {
             }
             if (command.operation === 'observe') {
                 if (!options.store.get(command.installationId)) return json(response, 404, { code: 'installation_not_found' });
-                return json(response, 200, { installationId: command.installationId,
-                    ...await options.driver.observe(command.installationId) });
+                const observed = await options.driver.observe(command.installationId);
+                if (!['unknown', 'running', 'stopped', 'failed'].includes(observed.state)) throw new Error('invalid_observation');
+                return json(response, 200, { installationId: command.installationId, state: observed.state });
             }
             // Revocation must not prevent stopping an already owned runtime.
             if (command.desired === 'running' && !options.approvePlan(command.plan)) {
