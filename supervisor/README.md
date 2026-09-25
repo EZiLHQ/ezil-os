@@ -27,6 +27,10 @@ or automatically instrument projects.
 
 The container requires writable `/project` and `/data` mounts. The supervisor
 must supply only the explicitly selected project and installation directory.
+The adapter creates `/project/.reticle` before starting the daemon, after the
+host has supplied the approved project mount. Without that marker Reticle
+treats a fresh directory as unapproved and selects its non-persistent home
+directory for journals. Escaping state symlinks fail startup.
 Project state lives in `/project/.reticle`; a private, durably created pairing
 token lives in `/data/reticle/pairing-token`. Provisioning failures block startup
 instead of allowing upstream's best-effort token creation to disable auth.
@@ -45,7 +49,7 @@ npm --prefix supervisor ci --ignore-scripts
 bash tools/test.sh supervisor
 ```
 
-The 14 unit tests cover request replay, signature scope, mount and marker
+The 15 unit tests cover request replay, signature scope, mount and marker
 failures, exact origins, token provisioning races, and fail-closed startup.
 
 Private local Docker validation on 2026-09-25 used the pinned artifact and two

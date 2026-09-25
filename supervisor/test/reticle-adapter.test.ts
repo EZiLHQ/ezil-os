@@ -3,7 +3,22 @@ import test from 'node:test';
 import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { parseReticleOrigins, persistentReticleToken, requireReticleMounts } from '../src/reticle-adapter.js';
+import { parseReticleOrigins, persistentReticleToken, prepareReticleProject, requireReticleMounts } from '../src/reticle-adapter.js';
+
+test('initializes only the selected project state and refuses escaping state links', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ezil-reticle-project-'));
+    try {
+        await prepareReticleProject(root);
+        const state = join(root, '.reticle');
+        assert.ok((await stat(state)).isDirectory());
+        await writeFile(join(state, 'existing'), 'preserved');
+        await prepareReticleProject(root);
+        assert.equal(await readFile(join(state, 'existing'), 'utf8'), 'preserved');
+        await rm(state, { recursive: true });
+        await symlink(join(root, 'outside'), state);
+        await assert.rejects(prepareReticleProject(root), { message: 'reticle_project_unavailable' });
+    } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test('requires exact approved origins and rejects credential-bearing or wildcard URLs', () => {
     assert.deepEqual(parseReticleOrigins('["https://i-example.apps.ezil.org","http://127.0.0.1:5301"]'),

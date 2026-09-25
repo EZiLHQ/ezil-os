@@ -67,6 +67,23 @@ export async function persistentReticleToken(directory: string): Promise<string>
 
 type Daemon = { close(): Promise<void>; announceShutdown?: () => void };
 
+/** The host may call this only after the user selected and approved this
+ * project mount. Reticle treats a fresh unmarked directory as a guest and
+ * otherwise sends journals to its home directory, outside the durable mount. */
+export async function prepareReticleProject(directory: string): Promise<void> {
+    try {
+        const root = await lstat(directory);
+        if (!root.isDirectory() || root.isSymbolicLink()) throw new Error('invalid_project');
+        const state = join(directory, '.reticle');
+        try { await mkdir(state, { mode: 0o700 }); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+        const stat = await lstat(state);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('invalid_project_state');
+        const parent = await open(directory, constants.O_RDONLY);
+        try { await parent.sync(); } finally { await parent.close(); }
+    } catch { throw new Error('reticle_project_unavailable'); }
+}
+
 export function requireReticleMounts(mountInfo: string): void {
     for (const point of ['/project', '/data']) {
         const matching = mountInfo.split('\n').filter((line) => line.split(' - ')[0]?.split(' ')[4] === point);
@@ -91,6 +108,7 @@ export async function runReticleAdapter(): Promise<void> {
     const token = await persistentReticleToken('/data/reticle');
     const project = await lstat('/project');
     if (!project.isDirectory() || project.isSymbolicLink()) throw new Error('invalid_project_mount');
+    await prepareReticleProject('/project');
     process.chdir('/project');
     const packageJson = JSON.parse(await readFile('/opt/reticle/package.json', 'utf8')) as Record<string, unknown>;
     if (packageJson.name !== '@reticlehq/server' || packageJson.version !== '3.2.0') {
@@ -120,9 +138,12 @@ export async function runReticleAdapter(): Promise<void> {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-    void runReticleAdapter().catch(() => {
+    void runReticleAdapter().catch((error: unknown) => {
         // Upstream errors may contain paths or request data; do not echo them.
-        process.stderr.write('reticle_adapter_start_failed\n');
+        const known = ['invalid_reticle_origins', 'reticle_mount_required', 'pairing_token_unavailable',
+            'invalid_project_mount', 'reticle_project_unavailable', 'unsupported_reticle_version'];
+        const code = error instanceof Error && known.includes(error.message) ? error.message : 'reticle_adapter_start_failed';
+        process.stderr.write(`${code}\n`);
         process.exit(1);
     });
 }
