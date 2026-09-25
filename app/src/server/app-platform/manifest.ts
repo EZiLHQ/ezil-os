@@ -56,7 +56,7 @@ export const HttpsOriginSchema = boundedString(2048).refine((value) => {
     return !!url && /^https:\/\/[^/]+\/?$/i.test(value) && url.pathname === '/';
 }).transform((value) => new URL(value).origin);
 
-const GithubRepositorySchema = boundedString(256).refine((value) => {
+export const GithubRepositorySchema = boundedString(256).refine((value) => {
     const url = httpsUrl(value);
     return url?.hostname === 'github.com'
         && /^https:\/\/github\.com\/[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?\/[a-z0-9_-][a-z0-9_.-]{0,99}\/?$/i.test(value);
@@ -72,10 +72,10 @@ export const OciImageSchema = boundedString(512).refine((value) => {
 function relativePath(value: string): boolean {
     return value.split('/').every((part) => part !== '.' && part !== '..' && /^[a-z0-9._-]+$/i.test(part));
 }
-const RelativePathSchema = boundedString(240).refine(relativePath);
-const HttpPathSchema = boundedString(512).refine((value) => value === '/'
+export const RelativePathSchema = boundedString(240).refine(relativePath);
+export const HttpPathSchema = boundedString(512).refine((value) => value === '/'
     || (value.startsWith('/') && relativePath(value.slice(1).replace(/\/$/, ''))));
-const HealthSchema = z.object({
+export const HealthSchema = z.object({
     path: HttpPathSchema,
     status: z.number().int().min(200).max(299),
 }).strict();
