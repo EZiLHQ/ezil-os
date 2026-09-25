@@ -1,8 +1,9 @@
 # Host control protocol
 
 The `createControlService` factory supplies the authenticated HTTP boundary and
-durable intent queue. An executable host bootstrap, Docker execution driver,
-control-plane client, and provider controller must still be connected. No
+durable intent queue. The [Docker driver](DRIVER.md) now implements real local
+execution. An executable host bootstrap, control-plane client, and provider
+controller must still be connected. No
 production endpoint or cloud resource is created by this package.
 
 ## Authority and wire format
@@ -68,8 +69,10 @@ recovery from authoritative records.
 
 ## Execution driver requirements
 
-The current HTTP tests use an instrumented driver to verify the boundary.
-Before enabling real launches, the Docker driver and bootstrap must prove:
+The HTTP unit tests use an instrumented driver to verify the boundary. The
+separate Linux driver suite sends signed HTTP requests to actual Docker
+containers. Before enabling production launches, driver/bootstrap integration
+must prove:
 
 - Actual data-mount/marker admission before creating or starting services.
 - Host paths and container names derived from server identities; no caller
@@ -77,7 +80,8 @@ Before enabling real launches, the Docker driver and bootstrap must prove:
   cloud credentials inside applications.
 - Safe directory binding that withstands symlink/rename races in user-writable
   projects. The [Linux mount primitive](MOUNTS.md) has real Docker race coverage;
-  the driver still needs to own its staging and cleanup lifecycle.
+  the driver owns staging and cleanup, including recovery from earlier driver
+  objects. A full host restart still needs bootstrap acceptance.
 - Immutable image verification, approved per-container options, private
   networks, memory/concurrency admission, and stable non-conflicting host ports.
 - Generation checks before and after asynchronous work; stop obsolete

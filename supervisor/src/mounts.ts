@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { mkdir, open, rmdir, type FileHandle } from 'node:fs/promises';
+import { mkdir, open, readFile, rmdir, type FileHandle } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { isAbsolute, normalize } from 'node:path';
 
@@ -89,6 +89,23 @@ async function unmount(path: string): Promise<void> {
 
 export type StagedDirectory = { source: string; release(): Promise<void> };
 
+/** Recovery may release a host-owned slot only after observing removal of
+ * every consuming container. Root and slot checks prevent arbitrary unmounts;
+ * ownership of the slot itself remains the reconciler's responsibility. */
+export async function releaseDataDirectory(stagingRoot: string, slot: string): Promise<void> {
+    if (!component.test(slot) || slot === '.' || slot === '..') throw new Error('invalid_mount_slot');
+    const root = await openHostDirectory(stagingRoot);
+    try {
+        const target = `${stagingRoot}/${slot}`;
+        const matches = (await readFile('/proc/self/mountinfo', 'utf8')).split('\n')
+            .filter(line => line.split(' - ')[0]?.split(' ')[4] === target);
+        if (matches.length > 1) throw new Error('ambiguous_staged_mount');
+        if (matches.length) await unmount(target);
+        try { await rmdir(target); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    } finally { await root.close(); }
+}
+
 /** Make a stable bind in a host-owned directory shared with the Docker
  * daemon's mount namespace. Docker sees this path, never a /proc FD which
  * could be canonicalized or reused after a supervisor restart. The caller
@@ -117,8 +134,7 @@ export async function stageDataDirectory(
         let released = false;
         return { source: target, release: async () => {
             if (released) return;
-            await unmount(target);
-            await rmdir(target);
+            await releaseDataDirectory(stagingRoot, slot);
             released = true;
         } };
     } catch {

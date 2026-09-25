@@ -454,8 +454,11 @@ run_local () {
 run_supervisor () {
     typecheck "$TREE/supervisor" npm run typecheck || return 1
     ( cd "$TREE/supervisor" && npm test && npm run build ) || return 1
-    if [[ "${1:-}" == "--linux-mounts" ]]; then
-        node "$TREE/supervisor/test/run-mounts-linux.mjs"
+    if [[ "${1:-}" == "--linux-mounts" || "${1:-}" == "--linux-driver" ]]; then
+        node "$TREE/supervisor/test/run-mounts-linux.mjs" || return 1
+    fi
+    if [[ "${1:-}" == "--linux-driver" ]]; then
+        node "$TREE/supervisor/test/run-driver-linux.mjs"
     fi
 }
 
