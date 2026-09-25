@@ -39,7 +39,7 @@ export interface RuntimePlanRecords {
 /** Caller must load these records under ownership/authorization locks. This
  * pure function validates evidence and actual host compatibility, not identity.
  * Unsupported runtime features fail explicitly instead of disappearing. */
-export function compileRuntimePlan(records: RuntimePlanRecords): RuntimePlan {
+function compatibleRelease(records: Pick<RuntimePlanRecords, 'installationId' | 'app' | 'release'>) {
     const { app, release } = records;
     const contracts = validateComputerPolicyAgainstManifest(release.manifest, release.policy);
     if (!contracts.success) return reject('release_contract_invalid');
@@ -67,6 +67,52 @@ export function compileRuntimePlan(records: RuntimePlanRecords): RuntimePlan {
         return reject('runtime_state_adapter_unsupported');
     }
     const service = manifest.services[0]!;
+    if (service.health.path.length > 256 || !/^\/(?!\/)[a-zA-Z0-9._/-]*$/.test(service.health.path)) return reject('unsupported_health_path');
+    const temporaryMiB = policy.resources.ephemeralDiskLimitMiB;
+    if (temporaryMiB < 16 || temporaryMiB > 4096) return reject('unsupported_temporary_storage');
+    const privateDirectories = manifest.persistence.mode === 'computer-volume'
+        ? manifest.persistence.privateDirectories : [];
+    if (policy.mounts.sharedFolders.some(f => f.folder !== 'Projects' || f.scope !== 'selected-projects')) {
+        return reject('unsupported_shared_folder');
+    }
+
+    if (service.process.kind === 'reticle-daemon-v1') {
+        if (service.internalPort !== 4400 || service.health.path !== '/status' || service.health.status !== 200
+            || privateDirectories.length !== 1) return reject('invalid_reticle_binding');
+    } else if (service.process.kind === 'node') {
+        if (!/^[a-zA-Z0-9_][a-zA-Z0-9._/-]*\.(?:js|mjs|cjs)$/.test(service.process.entrypoint)) {
+            return reject('unsupported_entrypoint');
+        }
+    } else return reject('unsupported_process');
+    const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+    if (!uuid.test(records.installationId) || !uuid.test(release.id)) return reject('invalid_installation_identity');
+
+    const origin = new URL(policy.appOriginBase);
+    origin.hostname = `i-${records.installationId}.${origin.hostname}`;
+    const allowedOrigins = [...new Set([...policy.allowedOsOrigins, origin.origin])].sort();
+    if (allowedOrigins.length > 8) return reject('too_many_origins');
+    if (allowedOrigins.some(value => value.length > 253)) return reject('unsupported_origin_length');
+    return { manifest, policy, service, privateDirectories, temporaryMiB, allowedOrigins };
+}
+
+/** Host preparation record for immutable bytes and private directory creation.
+ * This DTO deliberately has no executable services, origins or project grants.
+ * The caller must authorize the installation/release before transferring it. */
+export interface PreparedInstallation {
+    installationId: string; releaseId: string; policyDigest: string; image: string;
+    privateDirectories: RuntimePlan['privateDirectories'];
+}
+export function compilePreparedInstallation(
+    records: Pick<RuntimePlanRecords, 'installationId' | 'app' | 'release'>,
+): PreparedInstallation {
+    const { policy, privateDirectories } = compatibleRelease(records);
+    return { installationId: records.installationId, releaseId: records.release.id,
+        policyDigest: records.release.policyDigest, image: policy.image.reference, privateDirectories };
+}
+
+export function compileRuntimePlan(records: RuntimePlanRecords): RuntimePlan {
+    const { manifest, policy, service, privateDirectories, temporaryMiB, allowedOrigins } = compatibleRelease(records);
+    const { release } = records;
     const storedService = records.services[0];
     const lease = records.leases[0];
     if (records.services.length !== 1 || records.leases.length !== 1 || !storedService || !lease
@@ -75,15 +121,7 @@ export function compileRuntimePlan(records: RuntimePlanRecords): RuntimePlan {
         || storedService.healthPath !== service.health.path || lease.serviceName !== service.name
         || !Number.isInteger(lease.hostPort) || lease.hostPort < 1024 || lease.hostPort > 65535
         || RESERVED_COMPUTER_PORTS.has(lease.hostPort)) return reject('service_lease_mismatch');
-    if (service.health.path.length > 256 || !/^\/(?!\/)[a-zA-Z0-9._/-]*$/.test(service.health.path)) return reject('unsupported_health_path');
-    const temporaryMiB = policy.resources.ephemeralDiskLimitMiB;
-    if (temporaryMiB < 16 || temporaryMiB > 4096) return reject('unsupported_temporary_storage');
-    const privateDirectories = manifest.persistence.mode === 'computer-volume'
-        ? manifest.persistence.privateDirectories : [];
     const projectGrants: RuntimePlan['projectGrants'] = [];
-    if (policy.mounts.sharedFolders.some(f => f.folder !== 'Projects' || f.scope !== 'selected-projects')) {
-        return reject('unsupported_shared_folder');
-    }
     if (records.projectId) {
         if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(records.projectId)) return reject('invalid_project');
         const grant = records.grants.find(g => g.projectId === records.projectId
@@ -100,23 +138,14 @@ export function compileRuntimePlan(records: RuntimePlanRecords): RuntimePlan {
     }
     let process: RuntimePlan['services'][number]['process'];
     if (service.process.kind === 'reticle-daemon-v1') {
-        if (service.internalPort !== 4400 || service.health.path !== '/status' || service.health.status !== 200
-            || privateDirectories.length !== 1 || projectGrants.length !== 1
+        if (projectGrants.length !== 1
             || projectGrants[0]!.access !== 'read-write') return reject('invalid_reticle_binding');
         process = { kind: 'reticle-daemon-v1', projectId: projectGrants[0]!.projectId,
             privateDirectory: privateDirectories[0]!.name };
     } else if (service.process.kind === 'node') {
-        if (!/^[a-zA-Z0-9_][a-zA-Z0-9._/-]*\.(?:js|mjs|cjs)$/.test(service.process.entrypoint)) {
-            return reject('unsupported_entrypoint');
-        }
         process = service.process;
     } else return reject('unsupported_process');
 
-    const origin = new URL(policy.appOriginBase);
-    origin.hostname = `i-${records.installationId}.${origin.hostname}`;
-    const allowedOrigins = [...new Set([...policy.allowedOsOrigins, origin.origin])].sort();
-    if (allowedOrigins.length > 8) return reject('too_many_origins');
-    if (allowedOrigins.some(value => value.length > 253)) return reject('unsupported_origin_length');
     const plan: RuntimePlan = {
         releaseId: release.id, policyDigest: release.policyDigest, image: policy.image.reference,
         services: [{ name: service.name, internalPort: service.internalPort, hostPort: lease.hostPort,
