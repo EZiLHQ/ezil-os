@@ -64,13 +64,32 @@ unknown effects, failed observations and ambiguous allocation fail closed. The
 control-plane consumer keeps the active reservation; it must not mark the job
 terminal merely to allow another writer.
 
-Encrypted queues and alarms retain failed/timed-out/aborted execution references.
-The notification rule defaults off. **Automatic historical cleanup and
-control-plane cancellation receipts remain a required integration before
-activation.** A failed workflow can leave allocated compute or a retained disk;
-this change does not claim failed execution means stopped compute. Cleanup must
-reconcile the original execution and exact resources, fence uncertain old starts,
-and never target a replacement writer. No resource deletion is implemented.
+The optional recovery Standard workflow observes failed/timed-out/aborted
+executions from the exact original numeric version. EventBridge notifications
+and a five-minute backstop submit one deterministic cleanup execution per job.
+Both paths default off. The helper verifies the original execution and its
+complete terminal history before resolving exact historical resources. If an
+allocation task was entered but its resource cannot yet be found, it waits;
+it cannot infer that nothing was allocated. Truncated history fails closed.
+
+Recovery preserves attached data disks, requests graceful stop, and observes
+termination of each original writer. Termination positively fences a delayed
+StartInstances request that could otherwise wake a supposedly stopped writer.
+An interrupted replacement can have both an old and a newly allocated writer;
+recovery handles only those identities and rejects newer generations. Missing
+preservation evidence, unexpected attached disks, unknown effects and lost
+mutation responses cannot produce a successful fencing receipt. Recovery never
+launches, attaches, detaches, retags or deletes disks, and has no IAM permissions
+for those actions. Its ten-minute deadline is fixed to its original execution.
+
+**Control-plane recovery receipt consumption and explicit cancellation remain
+required before activation.** #122 currently keeps reservations even after
+provider cleanup; it must independently observe fencing and retained storage
+before settling the job. This recovery only handles failed/timed-out/aborted
+workflows. A revocation that races with successful workflow completion needs a
+separate durable cancellation authorization; success must not itself trigger
+historical cleanup. A failed recovery retains its reservation and raises an
+alarm; failure does not mean compute has stopped. No data deletion is implemented.
 
 Before activation also provide the reviewed supervisor AMI, per-writer host
 profiles, scoped web OIDC federation, durable consumer scheduling and job intake.
@@ -94,11 +113,13 @@ mounting, billing or an installed application.
 To synthesize the lifecycle stack itself, supply a reviewed reference-only JSON
 file to `EZIL_LIFECYCLE_CONFIG` and run `npm run synth:lifecycle` inside
 `infra/app-computers`. Its fields are `settings`, `authorityKeyArn`, and optional
-`notificationsEnabled` (default false). `settings` contains shared `deployment`
+`notificationsEnabled` (default false). Supply `recoveryVersionArn` to synthesize
+the recovery workflow and `recoveryEnabled: true` only after the required
+control-plane integration and pilot review. Its default is false. `settings` contains shared `deployment`
 pins from the intent **without** `instanceProfileArn`, `writerRolePathPrefix`,
 `authorityOrigin` and `authoritySecretArn`. No credential values belong in it.
-The emitted `WorkflowVersionArn` must equal the configured numeric version before
-the control plane permits that deployment. Review a real CDK diff before rollout.
+The emitted `WorkflowVersionArn` and `RecoveryVersionArn` must equal their
+configured numeric versions before activation. Review a real CDK diff before rollout.
 
 History/logs and failure queues use KMS encryption. Runtime logs default to seven
 days; failure queues retain fourteen days. Preserve CloudTrail EC2/KMS events and

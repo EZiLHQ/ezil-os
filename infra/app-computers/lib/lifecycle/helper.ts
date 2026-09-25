@@ -5,7 +5,7 @@ import { EnvelopeSchema, SettingsSchema, equal, phases, token, tagsFor, tagList,
 import { parseLifecycleWork, type LifecycleIntent, type LifecycleReceipt } from './intent.js';
 import { awsDependencies, type Dependencies } from './aws.js';
 const eventSchema=z.object({executionArn:z.string().max(300),phase:z.enum(phases)}).strict();
-const tagged=(actual:Tag[]|undefined,expected:Record<string,string>)=>Object.entries(expected).every(([k,v])=>
+export const tagged=(actual:Tag[]|undefined,expected:Record<string,string>)=>Object.entries(expected).every(([k,v])=>
     actual?.filter(t=>t.Key===k).length===1&&actual.find(t=>t.Key===k)?.Value===v);
 const fail=(code='lifecycle_unconfirmed'):never=>{throw new Error(code)};
 const wait=(phase:Phase)=>({decision:'wait',phase});

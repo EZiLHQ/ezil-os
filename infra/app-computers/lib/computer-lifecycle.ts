@@ -12,12 +12,14 @@ import { lifecycleDefinition } from './lifecycle/definition.js';
 export class ComputerLifecycle extends Construct {
     readonly machine:states.CfnStateMachine;
     readonly version:states.CfnStateMachineVersion;
+    readonly historyKey:kms.IKey;
     constructor(scope:Construct,id:string,props:{settings:Settings;authorityKeyArn:string;notificationsEnabled?:boolean}){
         super(scope,id);const s=SettingsSchema.parse(props.settings),d=s.deployment,stack=Stack.of(this);
         const machineArn=d.stateMachineVersionArn.slice(0,d.stateMachineVersionArn.lastIndexOf(':'));
         const machineName=machineArn.split(':').at(-1)!;
         if(!new RegExp(`^arn:aws:kms:us-east-1:${d.accountId}:key/[a-f0-9-]{36}$`).test(props.authorityKeyArn))throw new Error('invalid_authority_key');
         const key=new kms.Key(this,'HistoryKey',{enableKeyRotation:true,removalPolicy:RemovalPolicy.RETAIN});
+        this.historyKey=key;
         key.addToResourcePolicy(new iam.PolicyStatement({principals:[new iam.ServicePrincipal('logs.us-east-1.amazonaws.com')],
             actions:['kms:Encrypt*','kms:Decrypt*','kms:ReEncrypt*','kms:GenerateDataKey*','kms:Describe*'],resources:['*'],
             conditions:{ArnLike:{'kms:EncryptionContext:aws:logs:arn':`arn:aws:logs:us-east-1:${d.accountId}:log-group:*`}}}));
