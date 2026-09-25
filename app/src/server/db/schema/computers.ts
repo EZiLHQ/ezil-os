@@ -78,6 +78,9 @@ export const computers = pgTable(
             .on(table.userId, table.slot)
             .where(sql`${table.deletedAt} is null`),
         unique('ezil_computers_id_provider_uq').on(table.id, table.provider),
+        // Installations and folder grants bind the acting user to the owner
+        // of the same computer through a composite foreign key.
+        unique('ezil_computers_id_user_uq').on(table.id, table.userId),
         check('ezil_computers_slot_chk', sql`${table.slot} in (1, 2)`),
         check('ezil_computers_provider_chk', sql`${table.provider} in ('cloudflare', 'aws-ec2')`),
         foreignKey({
