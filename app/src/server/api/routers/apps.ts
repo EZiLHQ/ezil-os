@@ -2,21 +2,14 @@ import { TRPCError } from '@trpc/server';
 import { and, asc, eq, isNull, or } from 'drizzle-orm';
 import { z } from 'zod';
 
-import { env } from '@/env';
 import { validateComputerAppManifest } from '@/server/app-platform/computer-app-manifest';
 import {
     appGrants, appInstallations, appPublications, appPublishers, appReleases, apps,
 } from '@/server/db/schema';
 import { liveOwnedComputer } from './computer-store';
+import { installAppProcedure } from './app-install';
+import { requireMarketplaceApi } from './marketplace-flags';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
-
-/** The API is deployed only after 0003 and 0004 have been applied. Keeping
- * the flag closed means a code deploy cannot accidentally query absent tables. */
-export function requireMarketplaceApi(): void {
-    if (env.EZIL_APP_MARKETPLACE_API_ENABLED !== 'true') {
-        throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'Marketplace is not enabled' });
-    }
-}
 
 const visibleTo = (userId: string) => or(
     eq(apps.visibility, 'all-authenticated'),
@@ -25,6 +18,7 @@ const visibleTo = (userId: string) => or(
 
 /** A publication is catalog data, never an installation or a running app. */
 export const appsRouter = createTRPCRouter({
+    install: installAppProcedure,
     catalog: protectedProcedure.query(async ({ ctx }) => {
         requireMarketplaceApi();
         return ctx.db.select({

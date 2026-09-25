@@ -6,6 +6,7 @@ vi.hoisted(() => {
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ??= 'marketplace-test-anon';
     process.env.EZIL_APP_MARKETPLACE_API_ENABLED = 'true';
     process.env.EZIL_APP_SUBMISSION_INTAKE_ENABLED = 'true';
+    delete process.env.EZIL_APP_INSTALL_ENABLED;
 });
 
 import { TRPCError } from '@trpc/server';
@@ -106,6 +107,14 @@ describe('marketplace API gates and scope', () => {
         expect(statements[0]!.sql).toMatch(/"deleted_at" is null/);
         expect(statements[0]!.params).toContain(USER);
         expect(statements[0]!.params).toContain(OTHER);
+    });
+
+    it('keeps Install closed until a supervisor consumes installation jobs', async () => {
+        const { caller, statements } = fixture(USER);
+        const error = await caller.apps.install({ computerId: OTHER, appId: APP,
+            clientRequestId: request.clientRequestId }).catch((value: unknown) => value);
+        expect(failureCode(error)).toBe('PRECONDITION_FAILED');
+        expect(statements).toEqual([]);
     });
 
     it('accepts no repository intake from an uninvited publisher', async () => {

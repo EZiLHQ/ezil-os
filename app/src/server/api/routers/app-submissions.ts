@@ -2,10 +2,9 @@ import { TRPCError } from '@trpc/server';
 import { and, eq, inArray, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 
-import { env } from '@/env';
 import { RepositorySubmissionV1Schema, validateRepositoryInspection } from '@/server/app-platform/repository-submission';
 import { appAdmins, appAuditEvents, appJobs, appOutbox, appPublishers, appSubmissions } from '@/server/db/schema';
-import { requireMarketplaceApi } from './apps';
+import { requireMarketplaceApi, requireSubmissionIntake } from './marketplace-flags';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 const idInput = z.object({ id: z.string().uuid() }).strict();
@@ -22,9 +21,7 @@ export const appSubmissionsRouter = createTRPCRouter({
     create: protectedProcedure.input(RepositorySubmissionV1Schema)
         .mutation(async ({ ctx, input }) => {
             requireMarketplaceApi();
-            if (env.EZIL_APP_SUBMISSION_INTAKE_ENABLED !== 'true') {
-                throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'Repository intake is not enabled' });
-            }
+            requireSubmissionIntake();
             return ctx.db.transaction(async (tx) => {
                 const [admin] = await tx.select({ userId: appAdmins.userId }).from(appAdmins)
                     .where(and(eq(appAdmins.userId, ctx.user.id), isNull(appAdmins.revokedAt)))

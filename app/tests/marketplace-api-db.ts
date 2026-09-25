@@ -16,6 +16,7 @@ process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://marketplace-api-test.supabase.co
 process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = 'marketplace-api-test-anon';
 process.env.EZIL_APP_MARKETPLACE_API_ENABLED = 'true';
 process.env.EZIL_APP_SUBMISSION_INTAKE_ENABLED = 'true';
+process.env.EZIL_APP_INSTALL_ENABLED = 'true';
 process.env.EZIL_OS_ACCESS_MODE = 'open';
 
 const [{ default: postgres }, { drizzle }, { appRouter }, { buildTRPCContext }, schema] = await Promise.all([
@@ -53,7 +54,7 @@ function manifest(appId: string, publisherId: string, slug: string) {
         build: { recipe: 'npm-ci-v1', script: 'build' },
         services: [{ name: 'web', protocol: 'http', scope: 'installation',
             process: { kind: 'node', entrypoint: 'dist/server.mjs', args: [] },
-            internalPort: 8080, preferredHostPort: 8080,
+            internalPort: 8080, preferredHostPort: 4400,
             health: { path: '/health', status: 200 }, dependsOn: [] }],
         launch: { mode: 'web', service: 'web', path: '/', embedding: { mode: 'iframe', sandbox: ['allow-scripts'] } },
         configuration: [{ name: 'THEME', kind: 'text', required: false }],
@@ -110,12 +111,34 @@ try {
         const reticleApp = await makeApp('reticle', 'grant-only');
         const notesApp = await makeApp('notes', 'all-authenticated');
         async function makeRelease(appId: string, slug: string) {
+            const { ComputerAppManifestV2Schema, getComputerManifestDigest } =
+                await import('../src/server/app-platform/computer-app-manifest');
+            const { ApprovedComputerAppPolicyV2Schema, getComputerPolicyDigest,
+                validateComputerPolicyAgainstManifest } =
+                await import('../src/server/app-platform/approved-computer-app-policy');
+            const application = ComputerAppManifestV2Schema.parse(manifest(appId, publisherId, slug));
+            const manifestDigest = getComputerManifestDigest(application);
+            const approval = ApprovedComputerAppPolicyV2Schema.parse({
+                schemaVersion: 2, manifestDigest,
+                image: { reference: image, provenanceDigest: digest },
+                allowedOsOrigins: ['https://cloud.ezil.org'], appOriginBase: 'https://apps.ezil.org',
+                launch: { mode: 'web', embedding: application.launch.mode === 'web'
+                    ? application.launch.embedding : { mode: 'external' } },
+                services: [{ name: 'web', scope: 'installation', processKind: 'node', internalPort: 8080 }],
+                capabilities: [], secretBindings: [], egressOrigins: [],
+                mounts: { privateDirectories: ['state'], sharedFolders: [] },
+                resources: { cpuLimit: 0.25, memoryLimitMiB: 512,
+                    ephemeralDiskLimitMiB: 1024, maxRuntimeSeconds: 3600 },
+                lifecycle: { idleTimeoutSeconds: 600 }, quotas: { runningAppsPerComputer: 2 },
+                backup: { mode: 'daily-snapshot', retentionDays: 7 },
+            });
+            assert.equal(validateComputerPolicyAgainstManifest(application, approval).success, true);
             const [{ id }] = await tx.unsafe(
                 `INSERT INTO ezil_app_releases
                  (app_id,version,manifest,policy,manifest_digest,policy_digest,image_reference,provenance_digest,source_commit_sha)
-                 VALUES ($1,'1.0.0',$2::jsonb,$3::jsonb,$4,$4,$5,$4,$6) RETURNING id`,
-                [appId, manifest(appId, publisherId, slug),
-                    { schemaVersion: 2, image: { reference: image } }, digest, image, commit],
+                 VALUES ($1,'1.0.0',$2::jsonb,$3::jsonb,$4,$5,$6,$7,$8) RETURNING id`,
+                [appId, application, approval, manifestDigest,
+                    getComputerPolicyDigest(approval), image, digest, commit],
             );
             await tx.unsafe("UPDATE ezil_app_releases SET status='validated' WHERE id=$1", [id]);
             await tx.unsafe("UPDATE ezil_app_releases SET status='approved',approved_by=$2,approved_at=now() WHERE id=$1",
@@ -131,6 +154,10 @@ try {
         const [{ id: installationId }] = await tx.unsafe(
             'INSERT INTO ezil_app_installations (computer_id,app_id,release_id,installed_by) VALUES ($1,$2,$3,$4) RETURNING id',
             [aliceComputer, reticleApp, reticleRelease, alice]);
+        await tx.unsafe("INSERT INTO ezil_app_services (installation_id,computer_id,name,scope,internal_port,preferred_host_port,health_path) VALUES ($1,$2,'web','installation',8080,4400,'/health')",
+            [installationId, aliceComputer]);
+        await tx.unsafe("INSERT INTO ezil_app_port_leases (installation_id,computer_id,service_name,host_port) VALUES ($1,$2,'web',4400)",
+            [installationId, aliceComputer]);
 
         // pg-proxy maps SQL results through the same Drizzle schema as the
         // production postgres-js driver, while tx keeps every write rollbackable.
@@ -166,6 +193,40 @@ try {
         assert.equal(installed.length, 1);
         assert.equal(installed[0]?.id, installationId);
         assert.deepEqual(await bobCaller.apps.installed({ computerId: bobComputer }), []);
+
+        const installRequest = { computerId: aliceComputer, appId: notesApp,
+            clientRequestId: '77777777-7777-4777-8777-777777777777' };
+        assert.equal(errorCode(await bobCaller.apps.install(installRequest).catch((error) => error)), 'NOT_FOUND');
+        assert.equal(errorCode(await aliceCaller.apps.install({ ...installRequest, computerId: aliceLegacy })
+            .catch((error) => error)), 'PRECONDITION_FAILED');
+        assert.equal(errorCode(await bobCaller.apps.install({ ...installRequest, computerId: bobComputer,
+            appId: reticleApp }).catch((error) => error)), 'NOT_FOUND');
+        const installedNotes = await aliceCaller.apps.install(installRequest);
+        assert.equal(installedNotes.status, 'pending');
+        assert.equal(installedNotes.reused, false);
+        assert.deepEqual(await aliceCaller.apps.install({ ...installRequest,
+            clientRequestId: '88888888-8888-4888-8888-888888888888' }), {
+            ...installedNotes, reused: true,
+        });
+        const [{ internalPort, hostPort }] = await tx.unsafe(`SELECT
+            s.internal_port AS "internalPort", l.host_port AS "hostPort"
+            FROM ezil_app_services s JOIN ezil_app_port_leases l
+              ON l.installation_id=s.installation_id AND l.service_name=s.name
+            WHERE s.installation_id=$1`, [installedNotes.installationId]);
+        assert.deepEqual({ internalPort, hostPort }, { internalPort: 8080, hostPort: 20000 });
+        const bobNotes = await bobCaller.apps.install({ ...installRequest, computerId: bobComputer,
+            clientRequestId: '99999999-9999-4999-8999-999999999999' });
+        const [{ hostPort: bobPort }] = await tx.unsafe('SELECT host_port AS "hostPort" FROM ezil_app_port_leases WHERE installation_id=$1',
+            [bobNotes.installationId]);
+        assert.equal(bobPort, 4400, 'ports may repeat on separate computers');
+        assert.notEqual(installedNotes.installationId, bobNotes.installationId);
+        const [{ installJobs, installEvents, folderGrants }] = await tx.unsafe(`SELECT
+            (SELECT count(*)::int FROM ezil_app_jobs WHERE installation_id=$1 AND operation='install') AS "installJobs",
+            (SELECT count(*)::int FROM ezil_app_outbox WHERE job_id=$2) AS "installEvents",
+            (SELECT count(*)::int FROM ezil_app_folder_grants WHERE installation_id=$1) AS "folderGrants"`,
+        [installedNotes.installationId, installedNotes.jobId]);
+        assert.deepEqual({ installJobs, installEvents, folderGrants },
+            { installJobs: 1, installEvents: 1, folderGrants: 0 });
 
         const request = { schemaVersion: 1 as const,
             repositoryUrl: 'https://github.com/reticlehq/reticle',
@@ -206,4 +267,4 @@ try {
 } finally {
     await db.end();
 }
-console.log('marketplace API PostgreSQL integration passed (catalog, scope, intake, idempotency, cancellation)');
+console.log('marketplace API PostgreSQL integration passed (catalog, scope, intake, install, ports, idempotency, cancellation)');

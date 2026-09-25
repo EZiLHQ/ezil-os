@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import { ComputerAppManifestV2Schema, getComputerManifestDigest } from './computer-app-manifest';
-import { validateComputerPolicyAgainstManifest } from './approved-computer-app-policy';
+import { ApprovedComputerAppPolicyV2Schema, getComputerPolicyDigest,
+    validateComputerPolicyAgainstManifest } from './approved-computer-app-policy';
 
 const APP = 'a1111111-1111-4111-8111-111111111111';
 const PUBLISHER = 'b2222222-2222-4222-8222-222222222222';
@@ -89,6 +90,13 @@ function issue(inputManifest: unknown, inputPolicy: unknown, path: (string | num
 }
 
 describe('ApprovedComputerAppPolicyV2', () => {
+    it('binds policy content while ignoring JSON object key order', () => {
+        const approved = ApprovedComputerAppPolicyV2Schema.parse(policy());
+        const reordered = Object.fromEntries(Object.entries(approved).reverse()) as typeof approved;
+        expect(getComputerPolicyDigest(approved)).toBe(getComputerPolicyDigest(reordered));
+        expect(getComputerPolicyDigest(approved))
+            .not.toBe(getComputerPolicyDigest({ ...approved, quotas: { runningAppsPerComputer: 1 } }));
+    });
     it('accepts a bounded Node policy with a narrower selected-project mount', () => {
         expect(validateComputerPolicyAgainstManifest(manifest(), policy())).toMatchObject({ success: true });
         const requestedWholeFolder = manifest({ persistence: { mode: 'computer-volume',

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import {
     EgressOriginsSchema, EmbeddingSchema, HttpsOriginSchema, OciImageSchema, SecretReferencesSchema,
@@ -90,6 +91,20 @@ export const ApprovedComputerAppPolicyV2Schema = z.object({
 });
 
 export type ApprovedComputerAppPolicyV2 = z.infer<typeof ApprovedComputerAppPolicyV2Schema>;
+function canonicalJson(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+    if (value !== null && typeof value === 'object') {
+        const object = value as Record<string, unknown>;
+        return `{${Object.keys(object).filter((key) => object[key] !== undefined).sort()
+            .map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value);
+}
+
+export function getComputerPolicyDigest(policy: ApprovedComputerAppPolicyV2): string {
+    return `sha256:${createHash('sha256').update(canonicalJson(policy)).digest('hex')}`;
+}
+
 export type ValidatedComputerAppContracts = {
     manifest: ComputerAppManifestV2;
     policy: ApprovedComputerAppPolicyV2;
