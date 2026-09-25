@@ -4,7 +4,7 @@ import postgres from 'postgres';
 
 /** Unique committed local DB, so tests can exercise real concurrent locks.
  * Unlike the rollback-only schema suites, no outer transaction is mocked. */
-export async function runtimeTestDatabase() {
+export async function runtimeTestDatabase(options: { throughMigration?: string } = {}) {
     const raw = process.env.EZIL_TEST_DATABASE_URL;
     if (!raw) throw new Error('EZIL_TEST_DATABASE_URL is required');
     const url = new URL(raw);
@@ -34,8 +34,10 @@ export async function runtimeTestDatabase() {
             END $$;
             GRANT USAGE ON SCHEMA public, auth TO authenticated, service_role;`);
         const journal = JSON.parse(await readFile(new URL('../../drizzle/meta/_journal.json', import.meta.url), 'utf8')) as { entries: { tag: string }[] };
+        const last = options.throughMigration ? journal.entries.findIndex(e => e.tag === options.throughMigration) : journal.entries.length - 1;
+        if (last < 0) throw new Error('Unknown test migration boundary');
         await sql.begin(async tx => {
-            for (const { tag } of journal.entries) {
+            for (const { tag } of journal.entries.slice(0, last + 1)) {
                 const source = await readFile(new URL(`../../drizzle/${tag}.sql`, import.meta.url), 'utf8');
                 for (const statement of source.split('--> statement-breakpoint').map(s => s.trim()).filter(Boolean)) await tx.unsafe(statement);
             }

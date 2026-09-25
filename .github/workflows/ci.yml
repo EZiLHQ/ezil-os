@@ -311,6 +311,9 @@ jobs:
       - name: Computer lifecycle consumer (real Postgres)
         working-directory: app
         run: bun run test:db:lifecycle-consumer
+      - name: Retained computer recovery intents (real Postgres)
+        working-directory: app
+        run: bun run test:db:recovery-intents
 
   connectors:
     name: sdk + mcp (typecheck + unit)
