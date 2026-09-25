@@ -2,10 +2,11 @@
 
 This package contains an authenticated HTTP control service factory, a durable
 command ledger, host admission checks, and a foreground adapter for the pinned
-Reticle 3.2.0 daemon. The executable host service, Docker reconciler, EBS
-controller, Cloudflare routing, and marketplace integration remain pending.
-The HTTP factory requires an explicitly supplied execution driver; its tests
-verify control behavior with an instrumented driver, not a production host.
+Reticle 3.2.0 daemon. A [real Docker driver](DRIVER.md) now performs local
+container execution through that HTTP boundary. The executable host bootstrap,
+EBS controller, Cloudflare routing, and marketplace integration remain pending.
+The HTTP unit tests use an instrumented driver; the separate Linux acceptance
+suite uses actual Docker containers and an ext4 loop disk.
 
 Control requests use a computer-specific secret of at least 32 bytes,
 provisioned outside the repository. The signature binds the method, raw path,
@@ -24,8 +25,8 @@ fence previous writers, manage backups, and configure mount ordering.
 
 The [Linux mount primitive](MOUNTS.md) pins approved directories through path
 renames and stages stable binds for Docker. Its separate real Linux suite runs
-with `bash tools/test.sh supervisor --linux-mounts`; it does not replace the
-pending execution driver or EBS controller.
+with `bash tools/test.sh supervisor --linux-mounts`. Add the driver suite with
+`bash tools/test.sh supervisor --linux-driver`; neither establishes EBS recovery.
 
 ## Reticle runtime
 
@@ -64,7 +65,7 @@ npm --prefix supervisor ci --ignore-scripts
 bash tools/test.sh supervisor
 ```
 
-The 24 unit tests cover real HTTP signature/scope enforcement, durable replay,
+The unit tests cover real HTTP signature/scope enforcement, durable replay,
 two-process generation races, stale observations, mount and marker failures,
 exact origins, token provisioning races, and fail-closed startup.
 The artifact-verifier test additionally checks content digests and rejects

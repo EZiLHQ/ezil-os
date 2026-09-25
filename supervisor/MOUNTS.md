@@ -25,7 +25,7 @@ receive the staging root, Docker socket, or mount capabilities.
 The consumer owns each stage until every consuming container is observed
 removed. Only then may it call `release()`. Failed unmounts are not hidden with
 lazy or forced detachment, and cleanup never recursively deletes a stage.
-Name collisions do not adopt or remove an existing mount. The future driver
+Name collisions do not adopt or remove an existing mount. The execution driver
 must reconcile abandoned stages and containers using host-owned records; it
 must not infer ownership solely from an untrusted path or automatically restart
 old containers.
