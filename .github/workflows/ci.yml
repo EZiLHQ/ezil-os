@@ -323,6 +323,9 @@ jobs:
       - name: Computer cancellation producers and launch revocation (real Postgres)
         working-directory: app
         run: bun run test:db:cancellation-producer
+      - name: Cancellation delivery and provider receipt settlement (real Postgres)
+        working-directory: app
+        run: bun run test:db:cancellation-consumer
 
   connectors:
     name: sdk + mcp (typecheck + unit)
