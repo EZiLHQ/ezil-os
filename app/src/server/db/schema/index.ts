@@ -3,6 +3,7 @@ export * from './computers';
 export * from './computer-runtime';
 export * from './computer-lifecycle-intents';
 export * from './computer-recovery-intents';
+export * from './computer-cancellations';
 export * from './app-marketplace';
 export * from './app-runtime-commands';
 export * from './computer-configurations';
