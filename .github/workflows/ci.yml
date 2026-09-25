@@ -305,6 +305,9 @@ jobs:
       - name: Current workflow configuration authority
         working-directory: app
         run: bun run test:db:configuration-authority
+      - name: Immutable computer lifecycle intents (real Postgres)
+        working-directory: app
+        run: bun run test:db:lifecycle-intents
 
   connectors:
     name: sdk + mcp (typecheck + unit)
