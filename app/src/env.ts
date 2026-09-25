@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { LifecycleApprovalSchema } from './server/app-platform/lifecycle-approval';
+import { CancellationWorkflowMapSchema } from './server/app-platform/cancellation-deployment';
 
 /**
  * Server-only environment. Validated eagerly at import time so a missing
@@ -87,8 +88,29 @@ const serverSchema = z.object({
         ctx.addIssue({ code: 'custom', message: 'invalid_lifecycle_deployments' });
         return z.NEVER;
     }),
+    /** Cancellation remains independent so launch denial does not disable cleanup. */
+    EZIL_CANCELLATION_AUTHORITY_ENABLED: z.string().refine(value => ['true','false'].includes(value), 'invalid_cancellation_authority_flag').default('false'),
+    EZIL_CANCELLATION_AUTHORITY_SECRET: z.string().regex(/^[a-f0-9]{64}$/, 'invalid_cancellation_authority_secret').optional(),
+    EZIL_CANCELLATION_WORKFLOWS: z.string().max(16384).default('{}').transform((raw, ctx) => {
+        try {
+            const parsed = CancellationWorkflowMapSchema.safeParse(JSON.parse(raw));
+            if (parsed.success) return parsed.data;
+        } catch { /* Never log configuration values. */ }
+        ctx.addIssue({ code: 'custom', message: 'invalid_cancellation_workflows' });
+        return z.NEVER;
+    }),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
 }).superRefine((value, context) => {
+    if (value.EZIL_CANCELLATION_AUTHORITY_ENABLED === 'true') {
+        if (!value.EZIL_CANCELLATION_AUTHORITY_SECRET) context.addIssue({ code: 'custom',
+            path: ['EZIL_CANCELLATION_AUTHORITY_SECRET'], message: 'cancellation_authority_secret_required' });
+        else if ([value.EZIL_LIFECYCLE_AUTHORITY_SECRET,value.EZIL_CONFIGURATION_AUTHORITY_SECRET].includes(value.EZIL_CANCELLATION_AUTHORITY_SECRET)) {
+            context.addIssue({ code: 'custom', path: ['EZIL_CANCELLATION_AUTHORITY_SECRET'], message: 'dedicated_cancellation_secret_required' });
+        }
+        if (!value.EZIL_LIFECYCLE_DEPLOYMENTS.length || !Object.keys(value.EZIL_CANCELLATION_WORKFLOWS).length) {
+            context.addIssue({ code: 'custom', path: ['EZIL_CANCELLATION_WORKFLOWS'], message: 'cancellation_deployment_required' });
+        }
+    }
     if (value.EZIL_LIFECYCLE_AUTHORITY_ENABLED === 'true') {
         if (!value.EZIL_LIFECYCLE_AUTHORITY_SECRET) context.addIssue({ code: 'custom',
             path: ['EZIL_LIFECYCLE_AUTHORITY_SECRET'], message: 'lifecycle_authority_secret_required' });
@@ -128,6 +150,9 @@ const parsedServer = isServer
           EZIL_LIFECYCLE_AUTHORITY_ENABLED: process.env.EZIL_LIFECYCLE_AUTHORITY_ENABLED,
           EZIL_LIFECYCLE_AUTHORITY_SECRET: process.env.EZIL_LIFECYCLE_AUTHORITY_SECRET,
           EZIL_LIFECYCLE_DEPLOYMENTS: process.env.EZIL_LIFECYCLE_DEPLOYMENTS,
+          EZIL_CANCELLATION_AUTHORITY_ENABLED: process.env.EZIL_CANCELLATION_AUTHORITY_ENABLED,
+          EZIL_CANCELLATION_AUTHORITY_SECRET: process.env.EZIL_CANCELLATION_AUTHORITY_SECRET,
+          EZIL_CANCELLATION_WORKFLOWS: process.env.EZIL_CANCELLATION_WORKFLOWS,
           NODE_ENV: process.env.NODE_ENV,
       })
     : null;
@@ -175,6 +200,9 @@ export const env = {
         EZIL_LIFECYCLE_AUTHORITY_ENABLED: 'false' as const,
         EZIL_LIFECYCLE_AUTHORITY_SECRET: undefined,
         EZIL_LIFECYCLE_DEPLOYMENTS: [],
+        EZIL_CANCELLATION_AUTHORITY_ENABLED: 'false' as const,
+        EZIL_CANCELLATION_AUTHORITY_SECRET: undefined,
+        EZIL_CANCELLATION_WORKFLOWS: {} as Record<string,string>,
         NODE_ENV: process.env.NODE_ENV ?? 'development',
     }),
     ...parsedClient.data,

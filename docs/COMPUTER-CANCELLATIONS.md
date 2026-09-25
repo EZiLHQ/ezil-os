@@ -89,3 +89,47 @@ that read it. Wiring remains off until the cancellation workflow, independent
 provider observer, delivery consumer and approved pilot are complete. Run
 `bun run test:db:cancellation-producer` alongside the existing schema and lifecycle
 consumer suites. Its provider responses are fixtures, not live AWS receipts.
+
+## Signed authority and delivery consumer
+
+`POST /api/internal/computers/cancellation-authority` requires a dedicated HMAC
+key, signing realm and exact path. The request contains only schema version,
+computer UUID, cancellation UUID and cancellation digest. Each fresh request
+rechecks the immutable cancellation/source pair, historical deployment approval,
+exact workflow mapping and pending source/delivery state. The response contains
+server-recorded source pins, disk association and a bounded writer list. It is
+not a reusable token and stops authorizing as soon as cancellation settles.
+Supabase cookies, bearer tokens and lifecycle/configuration signatures do not
+authorize this endpoint. Response caching is disabled; input/body/time bounds
+and errors are redacted. No HTTP handler performs a provider mutation.
+
+Configuration defaults off: `EZIL_CANCELLATION_AUTHORITY_ENABLED=false`,
+`EZIL_CANCELLATION_AUTHORITY_SECRET` unset and `EZIL_CANCELLATION_WORKFLOWS={}`.
+The mapping is JSON from approved numeric source workflow versions to distinct
+numeric cancellation workflow versions in the same account and region. Enabling
+the endpoint requires a dedicated 32-byte hex secret, a mapping and historical
+`EZIL_LIFECYCLE_DEPLOYMENTS`. Secrets and mappings stay server-side. The endpoint
+can remain available while launch authority is disabled so cleanup can finish.
+
+`claimCancellation` leases the cancellation outbox with a monotonic attempt;
+`dispatchCancellation` holds computer/runtime/job locks only for database work.
+Only an unclaimed, resource-free queued provision settles without provider I/O.
+All other work submits/observes through a trusted transport with a 20-second
+deadline, including transports that ignore abort. A pending/failed call retains
+admission and both unacknowledged events for retry.
+
+The cancellation receipt binds its own UUID/digest and the original v1/v2 source
+cleanup receipt. After an independently verified fresh provider observation, the
+consumer rechecks the current lease, immutable work and entire disk/writer scope.
+It atomically records fencing, preserves disk ownership, marks the source
+cancelled and acknowledges both outboxes. Historical fences stay unchanged.
+Lease takeover, changed disk/fences, foreign receipts and stale observations do
+not settle the work. After settlement the existing v2 recovery path can reserve
+a fresh writer on the retained disk.
+
+Run `bun run test:db:cancellation-consumer` with loopback Postgres, alongside
+the producer and existing lifecycle suites. Tests exercise real transactions,
+claims, signed HTTP authorization and callback races, using fixture provider
+receipts. The real AWS transport, cancellation workflow and scheduling remain
+separate requirements. Keep production activation off until those components
+and the approved cloud acceptance pass.
