@@ -18,9 +18,8 @@
  *   - The browser only receives the opaque preview URL and provider metadata.
  *   - All calls to the Worker are server-side only.
  *   - `previewUrl`/`status`/`terminate` all derive the sandbox id from the
- *     AUTHENTICATED `ctx.user.id` + an ownership-checked computer id (via
- *     `computer.get` below) — a caller can only ever operate on their own
- *     computer's sandbox.
+ *     AUTHENTICATED `ctx.user.id` + an ownership-checked Cloudflare computer
+ *     id. AWS computers are rejected before any Worker request.
  *
  * Carried and simplified from EBuilder's
  * `apps/web/client/src/server/api/routers/cloudflare-guacamole.ts`
@@ -28,14 +27,12 @@
  * `server/lib/cloudflare-guacamole-provider.ts`'s doc comment for what was
  * dropped and why (app-preview bootstrap, Twen orchestration, the Azure
  * dual-desktop-mode machinery — none of it applies to this repo, which has
- * exactly one desktop mode and one provider).
+ * exactly one Cloudflare desktop mode).
  */
 
 import { TRPCError } from '@trpc/server';
-import { and, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 
-import { computers } from '@/server/db/schema';
 import {
     APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
     composeAppPreviewBootstrapUrl,
@@ -69,6 +66,7 @@ import {
     fitScreenRequest,
     surfacePreviewErrorAsValue,
 } from '@/server/lib/cloudflare-guacamole-provider';
+import { ownedComputerProvider } from './computer-store';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 /** Ownership check shared by every procedure below — never trust a bare computerId. */
@@ -77,13 +75,16 @@ async function assertOwnedComputer(
     userId: string,
     computerId: string,
 ): Promise<void> {
-    const computer = await db.query.computers.findFirst({
-        where: and(eq(computers.id, computerId), eq(computers.userId, userId), isNull(computers.deletedAt)),
-        columns: { id: true },
-    });
-    if (!computer) {
+    const provider = await ownedComputerProvider(db, userId, computerId);
+    if (!provider) {
         // NOT_FOUND, never FORBIDDEN — mirrors computer.get's anti-enumeration contract.
         throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
+    }
+    if (provider !== 'cloudflare') {
+        throw new TRPCError({
+            code: 'PRECONDITION_FAILED',
+            message: 'This computer does not use the Cloudflare desktop runtime.',
+        });
     }
 }
 

@@ -60,7 +60,7 @@ export async function GET(req: Request) {
             user: { id: ctx.user.id, email: ctx.user.email ?? null },
             computer: lowest ? toShellBootComputer(lowest, false) : null,
             apps: SHELL_APPS,
-            desktopState: toShellDesktopState(provider),
+            desktopState: toShellDesktopState(provider, lowest?.provider),
         };
 
         return shellJson(payload);

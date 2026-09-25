@@ -21,11 +21,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as schema from '@/server/db/schema';
 import { computerCreateError } from './computer-errors';
 import {
+    ComputerRequiresLifecycleController,
     createComputerInLowestFreeSlot,
     getOrCreateDefaultComputer,
     isUniqueViolation,
     liveComputersOf,
     liveOwnedComputer,
+    ownedComputerProvider,
     pickFreeSlot,
     softDeleteComputer,
     type ComputerCreateDb,
@@ -84,7 +86,7 @@ function makeTestDb(rows: { select?: unknown[][]; update?: unknown[][] } = {}) {
 /** A row exists and is the caller's; the UPDATE then stamps and returns it. */
 function makeLiveComputerDb(slot = 1) {
     return makeTestDb({
-        select: [[COMPUTER]],
+        select: [[COMPUTER, 'cloudflare']],
         update: [[COMPUTER, slot, DELETED_AT.toISOString()]],
     });
 }
@@ -157,6 +159,24 @@ describe('liveOwnedComputer (the filter get/rename/touch/delete use)', () => {
     });
 });
 
+describe('ownedComputerProvider', () => {
+    it('resolves an AWS row only through the owner and live-row filter', async () => {
+        const { db, statements } = makeTestDb({ select: [[COMPUTER, 'aws-ec2']] });
+
+        expect(await ownedComputerProvider(db, USER, COMPUTER)).toBe('aws-ec2');
+        expect(statements).toHaveLength(1);
+        expect(statements[0]!.sql).toMatch(/"user_id" =/);
+        expect(statements[0]!.sql).toMatch(/"deleted_at" is null/);
+        expect(statements[0]!.params).toContain(USER);
+        expect(statements[0]!.params).toContain(COMPUTER);
+    });
+
+    it('does not infer a provider for a missing or foreign computer', async () => {
+        const { db } = makeTestDb({ select: [] });
+        expect(await ownedComputerProvider(db, OTHER_USER, COMPUTER)).toBeNull();
+    });
+});
+
 // ── softDeleteComputer ───────────────────────────────────────────────────────
 
 describe('softDeleteComputer', () => {
@@ -219,6 +239,22 @@ describe('softDeleteComputer', () => {
         expect(update.sql).toMatch(/"deleted_at" is null/);
         expect(update.params).toContain(USER);
         expect(update.params).toContain(COMPUTER);
+        expect(update.params).toContain('cloudflare');
+    });
+
+    it('never deletes an AWS row through the Cloudflare sandbox teardown path', async () => {
+        const { db, statements } = makeTestDb({ select: [[COMPUTER, 'aws-ec2']] });
+        const terminateSandbox = vi.fn(async () => {});
+
+        await expect(softDeleteComputer(db, {
+            userId: USER,
+            computerId: COMPUTER,
+            terminateSandbox,
+        })).rejects.toBeInstanceOf(ComputerRequiresLifecycleController);
+
+        expect(terminateSandbox).not.toHaveBeenCalled();
+        expect(statements).toHaveLength(1);
+        expect(statements[0]!.sql).toMatch(/^select/i);
     });
 
     it("refuses another user's computer: returns null, writes nothing, terminates nothing", async () => {
@@ -284,7 +320,7 @@ describe('softDeleteComputer', () => {
     it('returns null when a concurrent delete already stamped the row', async () => {
         // Read saw a live row; by UPDATE time another request had stamped it,
         // so the live-scoped where matches nothing.
-        const { db } = makeTestDb({ select: [[COMPUTER]], update: [] });
+        const { db } = makeTestDb({ select: [[COMPUTER, 'cloudflare']], update: [] });
 
         const result = await softDeleteComputer(db, {
             userId: USER,

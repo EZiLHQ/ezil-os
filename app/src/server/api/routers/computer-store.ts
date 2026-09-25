@@ -9,13 +9,17 @@
  *
  * ## Why there is no hard delete
  *
- * A computer's `id` is used VERBATIM as the root of its R2 workspace prefix
+ * A Cloudflare computer's `id` is used VERBATIM as the root of its R2 workspace prefix
  * (`${id}/branches/${branch}/...` — see `worker/src/index.ts`'s
  * `ensureWorkspaceHydratedFromR2` / `deriveSandboxId`). The row is the ONLY
  * thing that names that prefix. Hard-deleting the row therefore orphans the
  * user's files in R2 with nothing left able to address them, forever.
  *
- * So deletion is `deleted_at = now()` and nothing else. Three layers back
+ * This helper handles Cloudflare deletion only. AWS deletion must first stop
+ * the instance and fence/detach its persistent volume through the lifecycle
+ * controller; it cannot fall through to this best-effort sandbox path.
+ *
+ * So Cloudflare deletion is `deleted_at = now()` and nothing else. Three layers back
  * that up, and this module is the third:
  *
  *   1. Schema — `src/server/db/schema/computers.ts` documents it, and the
@@ -117,6 +121,29 @@ export function liveComputersOf(userId: string): SQL | undefined {
  */
 export function liveOwnedComputer(userId: string, id: string): SQL | undefined {
     return and(eq(computers.id, id), eq(computers.userId, userId), isNull(computers.deletedAt));
+}
+
+/** Resolve a live computer only after checking its owner. A provider is never
+ * inferred from its UUID or chosen by the caller. */
+export async function ownedComputerProvider(
+    db: Pick<ComputerStoreDb, 'query'>,
+    userId: string,
+    computerId: string,
+): Promise<Computer['provider'] | null> {
+    const computer = await db.query.computers.findFirst({
+        where: liveOwnedComputer(userId, computerId),
+        columns: { id: true, provider: true },
+    });
+    return computer?.provider ?? null;
+}
+
+/** AWS deletion must be a reconciled stop/detach operation. The Cloudflare
+ * best-effort sandbox deletion path cannot safely free an EBS writer slot. */
+export class ComputerRequiresLifecycleController extends Error {
+    constructor() {
+        super('aws_computer_delete_requires_lifecycle_controller');
+        this.name = 'ComputerRequiresLifecycleController';
+    }
 }
 
 // ── Creating, and the get-or-create the OS shell boots through ──────────────
@@ -328,12 +355,12 @@ export async function softDeleteComputer(
 ): Promise<SoftDeleteComputerResult | null> {
     // 1) Ownership first — never terminate a sandbox for a computer the
     //    caller does not own, and never reveal that it exists.
-    const existing = await db.query.computers.findFirst({
-        where: liveOwnedComputer(userId, computerId),
-        columns: { id: true },
-    });
-    if (!existing) {
+    const provider = await ownedComputerProvider(db, userId, computerId);
+    if (!provider) {
         return null;
+    }
+    if (provider !== 'cloudflare') {
+        throw new ComputerRequiresLifecycleController();
     }
 
     // 2) Terminate BEFORE stamping. See `terminateSandbox`'s doc comment for
@@ -355,7 +382,7 @@ export async function softDeleteComputer(
     const [updated] = await db
         .update(computers)
         .set({ deletedAt: now })
-        .where(liveOwnedComputer(userId, computerId))
+        .where(and(liveOwnedComputer(userId, computerId), eq(computers.provider, 'cloudflare')))
         .returning({ id: computers.id, slot: computers.slot, deletedAt: computers.deletedAt });
 
     if (!updated) {

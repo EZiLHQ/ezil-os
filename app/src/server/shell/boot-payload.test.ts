@@ -219,6 +219,23 @@ describe('buildShellBootPayload', () => {
 });
 
 describe('toShellDesktopState — never implies an observation it does not have', () => {
+    it('does not treat an AWS computer as a configured Cloudflare desktop', () => {
+        const payload = buildShellBootPayload({
+            user: USER,
+            computer: computer({ provider: 'aws-ec2' }),
+            isNew: false,
+            provider: { isConfigured: true, hasHmacSecret: true },
+        });
+
+        expect(payload.desktopState).toEqual({
+            provider: 'aws-ec2',
+            configured: false,
+            hasHmacSecret: false,
+            status: 'idle',
+            endpoints: {},
+        });
+    });
+
     it('is "idle" at boot, because the page never asks the container anything', () => {
         expect(toShellDesktopState({ isConfigured: true, hasHmacSecret: true }).status).toBe('idle');
     });
