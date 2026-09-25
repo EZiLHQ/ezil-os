@@ -50,6 +50,13 @@
       "when": 1790344187756,
       "tag": "0006_computer_configurations",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1790354648732,
+      "tag": "0007_computer_lifecycle_intents",
+      "breakpoints": true
     }
   ]
 }
