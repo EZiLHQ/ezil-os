@@ -18,7 +18,7 @@ export const recoveryPhases = ['initial', 'old-preserved', 'old-stopped', 'old-t
     'target-preserved', 'target-stopped', 'target-terminated'] as const;
 export type RecoveryPhase = typeof recoveryPhases[number];
 export interface RecoveryReceipt {
-    schemaVersion: 1;
+    schemaVersion: 1 | 2;
     sourceExecutionArn: string;
     jobId: string;
     digest: string;

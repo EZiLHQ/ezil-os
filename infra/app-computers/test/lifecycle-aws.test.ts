@@ -8,9 +8,29 @@ import { awsDependencies } from '../lib/lifecycle/aws.js';
 import { AUTHORITY_PATH, token } from '../lib/lifecycle/contract.js';
 import { createLifecycleHelper } from '../lib/lifecycle/helper.js';
 import { lifecycleFixture } from './lifecycle-fixture.js';
+import { computerRecoveryFixture } from './computer-recovery-fixture.js';
 const credentials={accessKeyId:'ASIAABCDEFGHIJKLMNOP',secretAccessKey:'test-only',sessionToken:'test-only'};
 const json=(value:unknown)=>({response:{statusCode:200,headers:{'content-type':'application/x-amz-json-1.0'},body:Readable.from([JSON.stringify(value)])}});
 const xml=(action:string,value='')=>({response:{statusCode:200,headers:{'content-type':'text/xml'},body:Readable.from([`<${action}Response>${value}</${action}Response>`])}});
+
+test('v2 authority signs only immutable job scope and rejects changed scope or malformed writer evidence',async()=>{
+    const f=computerRecoveryFixture(),key='ab'.repeat(32);let mode='valid';
+    const deps=awsDependencies(f.settings,{credentials,requestHandler:{async handle(){
+        return json({ARN:f.settings.authoritySecretArn,SecretString:key,VersionStages:['AWSCURRENT']});
+    }},fetcher:(async(url,init)=>{
+        assert.equal(url,f.settings.authorityOrigin+AUTHORITY_PATH);assert.equal(init!.redirect,'error');
+        const body=String(init!.body),scope=JSON.parse(body),headers=new Headers(init!.headers),timestamp=headers.get('x-ezil-workflow-timestamp')!;
+        assert.deepEqual(scope,{schemaVersion:2,computerId:f.i.computerId,jobId:f.i.jobId,digest:f.digest});
+        assert.equal(headers.get('x-ezil-workflow-signature'),createHmac('sha256',Buffer.from(key,'hex')).update([
+            'ezil-lifecycle-authority-v1','POST',AUTHORITY_PATH,timestamp,createHash('sha256').update(body).digest('hex')].join('\n')).digest('hex'));
+        if(mode==='revoked')return Response.json({code:'lifecycle_not_current'},{status:403});
+        return Response.json({authorized:true,...scope,...(mode==='scope'?{digest:'b'.repeat(64)}:{}),
+            writers:mode==='duplicate'?[...f.writers,...f.writers]:mode==='missing'?undefined:f.writers});
+    }) as typeof fetch});
+    assert.deepEqual(await deps.recoveryAuthority!(f.i,f.digest),{writers:f.writers});
+    for(mode of ['scope','duplicate','missing'])await assert.rejects(deps.recoveryAuthority!(f.i,f.digest));
+    mode='revoked';assert.equal(await deps.recoveryAuthority!(f.i,f.digest),null);
+});
 
 test('actual lifecycle read clients serialize bounded requests and sign the application authority protocol',async()=>{
     const f=lifecycleFixture(),calls:string[]=[],key='ab'.repeat(32);

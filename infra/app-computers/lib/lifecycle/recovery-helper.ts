@@ -1,7 +1,7 @@
 import type { Instance, Volume } from '@aws-sdk/client-ec2';
 import { z } from 'zod';
 import { EnvelopeSchema, equal, tagsFor, token, writerProfile } from './contract.js';
-import { parseLifecycleWork } from './intent.js';
+import { parseComputerLifecycleWork } from './computer-recovery.js';
 import { tagged } from './helper.js';
 import { RecoveryInputSchema, RecoverySettingsSchema, machineArn, recoveryPhases,
     type RecoverySettings, type RecoveryReceipt } from './recovery-contract.js';
@@ -35,7 +35,8 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
             || source.stopDate.getTime() > began || source.stopDate.getTime() < source.startDate.getTime()
             || now - source.startDate.getTime() > 86400000) return fail();
         const envelope = EnvelopeSchema.parse(JSON.parse(source.input));
-        const i = parseLifecycleWork({ ...envelope, createdAt: source.startDate });
+        const i = parseComputerLifecycleWork({ ...envelope, createdAt: source.startDate });
+        if (envelope.schemaVersion !== i.schemaVersion) return fail();
         const { instanceProfileArn, ...pins } = i.deployment;
         if (!equal(pins, d) || instanceProfileArn !== writerProfile(settings.lifecycle, i)
             || source.name !== `computer-${i.jobId}` || sourceExecutionArn !== sourceMachine.replace(':stateMachine:', ':execution:') + ':' + source.name
@@ -51,33 +52,35 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
             || history.some((h, index) => h.id !== index + 1 || !h.timestamp || !Number.isFinite(h.timestamp.getTime())
                 || (h.type === 'TaskStateEntered' && !h.stateEnteredEventDetails?.name))) return fail();
         const entered = (name: string) => history.some(h => h.type === 'TaskStateEntered' && h.stateEnteredEventDetails?.name === name);
-        const volumes = await deps.volumes(i.dataVolumeId ? [i.dataVolumeId] : { token: token(envelope.digest, 'volume') });
+        const volumes = await deps.volumes(i.dataVolumeId ? [i.dataVolumeId] : { token: token(envelope.digest, 'volume', i.schemaVersion) });
         if (volumes.length > 1) return fail();
-        const v = volumes[0], currentTags = tagsFor(i), oldTags = tagsFor(i, i.previousGeneration ?? i.targetGeneration, i.previousFenceToken ?? i.fenceToken);
+        if (i.schemaVersion === 2 && entered('createVolume')) return fail();
+        const v = volumes[0], currentTags = tagsFor(i), oldTags = i.schemaVersion === 2 ? tagsFor(i, i.dataScope.generation, i.dataScope.fenceToken)
+            : tagsFor(i, i.previousGeneration ?? i.targetGeneration, i.previousFenceToken ?? i.fenceToken);
         if (v) {
             if (!/^vol-[a-f0-9]{17}$/.test(v.VolumeId ?? '') || (i.dataVolumeId && v.VolumeId !== i.dataVolumeId)
                 || v.Encrypted !== true || v.KmsKeyId !== d.dataKeyArn || v.VolumeType !== 'gp3' || v.Size !== 50
                 || v.MultiAttachEnabled !== false || v.AvailabilityZone !== d.availabilityZone || !Array.isArray(v.Attachments) || v.Attachments.length > 1
                 || (!tagged(v.Tags, currentTags) && !tagged(v.Tags, oldTags))
                 || (i.operation === 'provision' && (!entered('createVolume')
-                    || !tagged(v.Tags, { 'ezil:allocation': token(envelope.digest, 'volume') })))) return fail();
+                    || !tagged(v.Tags, { 'ezil:allocation': token(envelope.digest, 'volume', i.schemaVersion) })))) return fail();
         } else if (i.dataVolumeId || entered('createVolume') || entered('runInstances')) return wait();
         const targets: { role: 'old' | 'target'; instance: Instance; generation: number; fenceToken: string }[] = [];
-        const originalId = i.previousInstanceId ?? i.providerInstanceId;
-        if (originalId) {
+        const originalId = i.schemaVersion === 1 ? i.previousInstanceId ?? i.providerInstanceId : null;
+        if (i.schemaVersion === 1 && originalId) {
             const rows = await deps.instances([originalId]);
             if (rows.length !== 1 || rows[0]?.owner !== d.accountId || rows[0].instance.InstanceId !== originalId
                 || !tagged(rows[0].instance.Tags, oldTags)) return fail();
             targets.push({ role: 'old', instance: rows[0].instance, generation: i.previousGeneration ?? i.targetGeneration,
                 fenceToken: i.previousFenceToken ?? i.fenceToken });
         }
-        if (i.operation === 'provision' || i.operation === 'replace') {
-            const rows = await deps.instances({ token: token(envelope.digest, 'instance') });
+        if (i.operation === 'provision' || i.operation === 'replace' || i.operation === 'recover') {
+            const rows = await deps.instances({ token: token(envelope.digest, 'instance', i.schemaVersion) });
             if (rows.length > 1) return fail();
             if (!rows.length && entered('runInstances')) return wait();
             if (rows[0]) {
                 const row = rows[0];
-                if (!entered('runInstances') || row.owner !== d.accountId || row.instance.ClientToken !== token(envelope.digest, 'instance')
+                if (!entered('runInstances') || row.owner !== d.accountId || row.instance.ClientToken !== token(envelope.digest, 'instance', i.schemaVersion)
                     || row.instance.InstanceId === originalId || !tagged(row.instance.Tags, currentTags)) return fail();
                 targets.push({ role: 'target', instance: row.instance, generation: i.targetGeneration, fenceToken: i.fenceToken });
             }
@@ -117,7 +120,7 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
         }
         if (v && (v.State !== 'available' || v.Attachments!.length)) return wait();
         if (deps.now() - began >= 600000) return fail();
-        const receipt: RecoveryReceipt = { schemaVersion: 1, sourceExecutionArn, jobId: i.jobId, digest: envelope.digest,
+        const receipt: RecoveryReceipt = { schemaVersion: i.schemaVersion, sourceExecutionArn, jobId: i.jobId, digest: envelope.digest,
             computerId: i.computerId, state: 'fenced', volumeId: v?.VolumeId ?? null,
             instances: targets.map(t => ({ instanceId: t.instance.InstanceId!, generation: t.generation, fenceToken: t.fenceToken, state: 'terminated' })) };
         return { decision: 'success', receipt };

@@ -1,8 +1,8 @@
 # EC2 computer lifecycle workflow
 
 This package contains the **actual Standard workflow** for provision, start,
-stop, replacement and retirement. It consumes the immutable v1 lifecycle intent
-from control-plane PR #122. It is not deployed by the foundation entrypoint,
+stop, replacement, retirement and retained-disk recovery. It consumes immutable
+v1 lifecycle intents and v2 recovery intents from the control plane. It is not deployed by the foundation entrypoint,
 and it does not create an instance during synthesis. Reticle is not installed
 by a successful lifecycle execution.
 
@@ -83,9 +83,8 @@ launches, attaches, detaches, retags or deletes disks, and has no IAM permission
 for those actions. Its ten-minute deadline is fixed to its original execution.
 
 **Control-plane recovery receipt consumption and explicit cancellation remain
-required before activation.** #122 currently keeps reservations even after
-provider cleanup; it must independently observe fencing and retained storage
-before settling the job. This recovery only handles failed/timed-out/aborted
+required before activation.** The consumers in #124 and #126 independently
+observe fencing and retained storage before settling the job. This cleanup only handles failed/timed-out/aborted
 workflows. A revocation that races with successful workflow completion needs a
 separate durable cancellation authorization; success must not itself trigger
 historical cleanup. A failed recovery retains its reservation and raises an
@@ -127,3 +126,40 @@ monitor the alarms during the pilot. The controller's IAM conditions use EC2
 keys listed in AWS's policy catalog; actual account policy evaluation remains a
 pilot check. Rollback denies new admission, reconciles original executions,
 and retains volumes and immutable workflow versions.
+
+## Retained-disk recovery (v2)
+
+After confirmed failure cleanup, a v2 `recover` intent launches a new generation
+against the computer's retained volume. It is not a provision request: a missing,
+foreign, unencrypted or still-attached disk blocks launch. The original source
+job/digest, retained disk scope and new generation are immutable control-plane
+records. V1 document bytes and allocation tokens are unchanged.
+
+Each helper invocation gets the historical writer list from the signed v2
+authority response in #126 and independently checks those exact instance IDs.
+Recorded old fences must precede the current work. Terminated IDs that AWS no
+longer returns can remain fenced; stopped writers, uncertain new IDs, changed
+tags, malformed evidence and a changed writer list before mutation are rejected.
+The list is bounded to 128. No caller-supplied event can add an ID or clear a fence.
+
+The fixed Standard graph uses the v2 SHA-256 allocation token
+`ezil-lifecycle-v2\ninstance\n<digest>`, launches the approved per-writer profile,
+retags the same detached volume to the new generation, attaches it at `/dev/sdf`,
+sets `DeleteOnTermination=false` and verifies the observed attachment. A repeated
+allocation uses the same token. V2 never returns a `createVolume` action. Its
+receipt has `schemaVersion:2` and the original retained volume ID.
+
+The existing failure cleanup graph handles v2 without obtaining current launch
+authority. It resolves only the new allocation by the immutable token, preserves
+its attached disk, stops/terminates it and returns a v2 fencing receipt. An
+entered allocation task with no observed target remains uncertain. Data-only
+failures retain their prior disk tags and owner. A `createVolume` step in v2
+history is incompatible and fails closed. Cleanup never operates on another
+historical writer, launches a replacement, or handles a SUCCEEDED source.
+
+Deploy new pinned workflow/helper versions only after migration 0008 and the v2
+consumer/authority implementation are ready. The existing v1 workflow versions
+remain available for their original executions. The same reviewed shared pins
+derive profiles for each computer/generation; no new IAM privilege or provider
+is introduced here. All notification and recovery schedules remain disabled by
+default. Local fixtures and synthesis do not prove live EC2 or Reticle acceptance.
