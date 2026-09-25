@@ -195,3 +195,10 @@ preparation creates no app container, and stale approval files cannot restore
 permissions. The separate Node and Reticle runs exercise actual prepared data and
 daemon state. This does not prove authenticated ECR access, EC2/EBS attachment,
 a full VM reboot, or finished marketplace installation.
+
+## Data-volume bootstrap
+
+The supervisor's systemd unit requires the trusted data-volume mount helper.
+See [DATA-VOLUME.md](DATA-VOLUME.md) for controller first-use authority,
+retained-disk recovery and disposable Linux VM acceptance. Production delivery
+of the mount plan must be implemented before enabling this host.
