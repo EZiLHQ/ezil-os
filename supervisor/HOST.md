@@ -182,10 +182,11 @@ on `/v1/control` accepts the host identity envelope (no installation ID) and ret
 only the loaded computer generation, configuration revision and digest. It never
 loads files, pulls images or starts an app. During failed/pending reloads it is
 unavailable. Compare this loaded descriptor to the preparation receipt.
-No production file-transfer/SSM consumer or configuration-revision producer is
-wired yet; public installation and
-runtime flags must remain off. Reticle still needs the separate explicit project
-connection and authenticated OS window.
+The root [configuration receiver](DELIVERY.md) now downloads and verifies the
+authorized S3 version, calls preparation and requests service reload separately.
+The Standard/SSM workflow and production provisioning are not wired yet; public
+installation and runtime flags must remain off. Reticle still needs the separate
+explicit project connection and authenticated OS window.
 
 The Linux host acceptance suite runs the real preparation executable, a tiny local
 OCI registry with a real Docker digest pull, and actual host start/stop/recovery.

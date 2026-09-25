@@ -1,0 +1,29 @@
+[Unit]
+Description=EZiL authenticated computer supervisor
+Requires=docker.service
+After=network-online.target docker.service
+Wants=network-online.target
+RequiresMountsFor=/srv/ezil-data
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+RuntimeDirectory=ezil-supervisor
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStartPre=/usr/bin/mountpoint --quiet /srv/ezil-data
+ExecStart=/usr/local/bin/node /opt/ezil-supervisor/dist/host.js /etc/ezil-supervisor/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=75
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

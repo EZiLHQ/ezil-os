@@ -10,6 +10,7 @@ import { canonicalJson } from '../dist/control-protocol.js';
 import { prepareHostConfiguration } from '../dist/prepare.js';
 import { acquireHostLock } from '../dist/host-lock.js';
 import { verifyPreparationPull } from './prepare-pull.linux.mjs';
+import { verifyConfigurationReceiver } from './configuration-receiver.linux.mjs';
 
 const root = process.env.EZIL_TEST_ROOT, image = process.env.EZIL_TEST_IMAGE;
 assert.match(root ?? '', /^\/run\/ezil-driver-test-[a-f0-9-]{36}$/);
@@ -171,6 +172,11 @@ try {
     assert.equal(loaded.configurationRevision, configurationRevision);
     assert.equal(loaded.configurationDigest, fingerprint(Buffer.from(canonicalJson({ ...config, configurationRevision, preparedInstallations: [] }))));
     assert.equal((await send({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(descriptor) })).status, 401);
+    configurationRevision = await verifyConfigurationReceiver({ root, config, revision: configurationRevision, process: host.child,
+        observe: async () => {
+            const response = await send(signed({ ...descriptor, requestId: randomUUID() }));
+            return response.status === 200 ? response.json() : {};
+        }, until, owned });
     const duplicate = launch(); await until(() => duplicate.exit);
     assert.equal(duplicate.exit.code, 1);
     assert(duplicate.output.includes('host_already_running'));

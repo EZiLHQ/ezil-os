@@ -9,9 +9,9 @@ const DIRECTORY = '/run/ezil-supervisor';
  * The short child acquires it on inherited FD 3; the parent retains that same
  * description until close or process death. No long-lived helper can orphan
  * the lock. The fixed path is independent of config/computer IDs. */
-export async function acquireHostLock(purpose: 'host' | 'preparation' = 'host') {
+export async function acquireHostLock(purpose: 'host' | 'preparation' | 'delivery' = 'host') {
     await ensureHostDirectory(DIRECTORY);
-    if (!['host', 'preparation'].includes(purpose)) throw new Error('host_lock_unavailable');
+    if (!['host', 'preparation', 'delivery'].includes(purpose)) throw new Error('host_lock_unavailable');
     const file = await open(`${DIRECTORY}/${purpose}.lock`, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
     try {
         const stat = await file.stat();
