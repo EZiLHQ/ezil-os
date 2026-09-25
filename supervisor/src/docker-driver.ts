@@ -74,12 +74,16 @@ export class DockerComputerDriver implements ComputerDriver {
         try { return await this.docker.call('GET', `/containers/${encodeURIComponent(id)}/json`); }
         catch (error) { if (error instanceof DockerError && error.status === 404) return undefined; throw error; }
     }
-    private async containers(): Promise<DockerContainer[]> {
+    private async containers(requireGeneration = false): Promise<DockerContainer[]> {
         const filters = encodeURIComponent(JSON.stringify({ label: [`${label('id')}=${this.options.computerId}`] }));
         const rows = await this.docker.call<{ Id: string }[]>('GET', `/containers/json?all=true&filters=${filters}`);
         const containers: DockerContainer[] = [];
         for (const row of rows) {
             const value = await this.inspect(row.Id);
+            if (value && requireGeneration && !this.owns(value)
+                && (value.State.Running || value.State.Status === 'restarting')) {
+                throw new Error('computer_generation_conflict');
+            }
             if (value && this.owns(value)) containers.push(value);
         }
         return containers;
@@ -226,7 +230,7 @@ export class DockerComputerDriver implements ComputerDriver {
             const current = () => isCurrent() && this.options.approvePlan(plan);
             const image = await this.admit(plan);
             if (!current()) return 'unknown';
-            const existing = (await this.containers()).filter(item => this.owns(item, intent.installationId));
+            const existing = (await this.containers(true)).filter(item => this.owns(item, intent.installationId));
             const same = existing.length === 1 && existing[0]!.Config.Labels[label('intent')] === intentDigest(command);
             if (same) {
                 const expiry = Number(existing[0]!.Config.Labels[label('expires')]);
@@ -259,7 +263,7 @@ export class DockerComputerDriver implements ComputerDriver {
                 }
             }
             await this.remove(intent.installationId);
-            const others = await this.containers();
+            const others = await this.containers(true);
             const active = others.filter(item => item.State.Running || item.State.Status === 'created' || item.State.Status === 'restarting');
             if (active.length >= 2 || active.some(item => item.HostConfig.Memory <= 0)
                 || active.reduce((sum, item) => sum + item.HostConfig.Memory, 0) + plan.resources.memoryMiB * 1048576

@@ -75,6 +75,19 @@ try {
 
     assert.equal((await driver.observe(installationId)).state, 'stopped');
     assert.equal((await owned()).length, 0, 'observation cannot start an app');
+    const foreign = await docker.call('POST', '/containers/create', { Image: image,
+        Entrypoint: ['/usr/local/bin/node', '-e', 'setInterval(()=>{},1000)'], Cmd: [], User: '1000:1000',
+        Labels: { 'org.ezil.computer.id': computerId, 'org.ezil.computer.generation': '2',
+            'org.ezil.computer.installation': randomUUID() },
+        HostConfig: { Init: true, NetworkMode: 'none', ReadonlyRootfs: true, CapDrop: ['ALL'],
+            SecurityOpt: ['no-new-privileges'], Memory: 134217728, PidsLimit: 64 },
+    });
+    await docker.call('POST', `/containers/${foreign.Id}/start`);
+    await post(command()); await service.drain();
+    assert.equal(store.get(installationId).observed, 'failed', 'another running computer generation blocks admission');
+    assert.equal((await owned()).length, 1);
+    assert.equal((await owned())[0].State.Running, true, 'foreign generation is never stopped implicitly');
+    await docker.call('DELETE', `/containers/${foreign.Id}?force=true`);
     await Promise.all([post(command()), post(command())]);
     await service.drain();
     assert.equal(store.get(installationId).observed, 'running');

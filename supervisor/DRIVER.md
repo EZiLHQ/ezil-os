@@ -16,7 +16,8 @@ Those requirements are not fulfilled merely by constructing this class.
 
 Starts require the actual ext4/XFS data mount and matching volume marker,
 an approved locally prepared immutable Linux/amd64 image, and available memory
-within the host-configured budget. At most two applications may run. Images
+within the host-configured budget. A running foreign computer generation blocks
+admission until it is fenced separately. At most two applications may run. Images
 declaring implicit volumes or build triggers are refused. Images are never
 pulled or built during launch or observation; preparation belongs to a separate
 authorized installation job. Production approval must reject local image IDs
