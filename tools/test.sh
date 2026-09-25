@@ -454,6 +454,18 @@ run_local () {
 run_supervisor () {
     typecheck "$TREE/supervisor" npm run typecheck || return 1
     ( cd "$TREE/supervisor" && npm test && npm run build ) || return 1
+    if [[ "${1:-}" == "--linux-data-volume" ]]; then
+        if [[ "$(uname -s)" != "Linux" ]]; then
+            say "data-volume acceptance requires a disposable QEMU VM and its dedicated test NVMe disk"
+            return 1
+        fi
+        if [[ "$(id -u)" == "0" ]]; then
+            node "$TREE/supervisor/test/data-mount.linux.mjs" "${2:-}"
+        else
+            sudo -n "$(command -v node)" "$TREE/supervisor/test/data-mount.linux.mjs" "${2:-}"
+        fi
+        return $?
+    fi
     if [[ "${1:-}" == "--linux-mounts" || "${1:-}" == "--linux-driver" || "${1:-}" == "--linux-host" ]]; then
         node "$TREE/supervisor/test/run-mounts-linux.mjs" || return 1
     fi

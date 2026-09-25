@@ -1,7 +1,7 @@
 [Unit]
 Description=EZiL authenticated computer supervisor
-Requires=docker.service
-After=network-online.target docker.service
+Requires=docker.service ezil-data-mount.service
+After=network-online.target docker.service ezil-data-mount.service
 Wants=network-online.target
 RequiresMountsFor=/srv/ezil-data
 StartLimitIntervalSec=60

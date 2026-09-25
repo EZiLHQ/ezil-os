@@ -1,0 +1,22 @@
+[Unit]
+Description=EZiL computer data volume admission and mount
+After=local-fs.target
+Before=ezil-supervisor.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+Environment=PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RuntimeDirectory=ezil-supervisor
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/local/bin/node /opt/ezil-supervisor/dist/data-mount.js /etc/ezil-supervisor/data-volume.json
+TimeoutStartSec=930
+TimeoutStopSec=30
+KillMode=control-group
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
