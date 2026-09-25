@@ -281,6 +281,9 @@ jobs:
       - name: Test marketplace ownership, release, and port constraints
         working-directory: app
         run: bun run test:db:app-marketplace
+      - name: Test authenticated marketplace and repository intake APIs
+        working-directory: app
+        run: bun run test:db:marketplace-api
 
   connectors:
     name: sdk + mcp (typecheck + unit)

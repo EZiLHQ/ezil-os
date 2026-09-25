@@ -62,6 +62,10 @@ const serverSchema = z.object({
      * accident — it must be noticed.
      */
     EZIL_OS_ACCESS_MODE: z.enum(['invite', 'open']).default('invite'),
+    /** Marketplace tables must be migrated before these APIs query them. */
+    EZIL_APP_MARKETPLACE_API_ENABLED: z.enum(['true', 'false']).default('false'),
+    /** Intake stays closed until a durable inspection consumer is deployed. */
+    EZIL_APP_SUBMISSION_INTAKE_ENABLED: z.enum(['true', 'false']).default('false'),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
 });
 
@@ -84,6 +88,8 @@ const parsedServer = isServer
           CRON_SECRET: process.env.CRON_SECRET,
           TELEMETRY_ADMIN_EMAILS: process.env.TELEMETRY_ADMIN_EMAILS,
           EZIL_OS_ACCESS_MODE: process.env.EZIL_OS_ACCESS_MODE,
+          EZIL_APP_MARKETPLACE_API_ENABLED: process.env.EZIL_APP_MARKETPLACE_API_ENABLED,
+          EZIL_APP_SUBMISSION_INTAKE_ENABLED: process.env.EZIL_APP_SUBMISSION_INTAKE_ENABLED,
           NODE_ENV: process.env.NODE_ENV,
       })
     : null;
@@ -122,6 +128,8 @@ export const env = {
         // default turns into an open door. The server-only schema's
         // `.default('invite')` and this literal must always agree.
         EZIL_OS_ACCESS_MODE: 'invite' as const,
+        EZIL_APP_MARKETPLACE_API_ENABLED: 'false' as const,
+        EZIL_APP_SUBMISSION_INTAKE_ENABLED: 'false' as const,
         NODE_ENV: process.env.NODE_ENV ?? 'development',
     }),
     ...parsedClient.data,
