@@ -94,3 +94,7 @@ tags on **both** instance and data volume and preserve `DeleteOnTermination=fals
 This stack does not enable the app scheduler, create computers, install Reticle,
 change routing, migrate user data or deploy the frontend. Reconciliation rules
 default off. No cloud resources are created by the local checks.
+
+The separate [EC2 lifecycle workflow](LIFECYCLE.md) implements actual provider
+operations and documents the remaining activation gates. Use its explicit
+`synth:lifecycle` entrypoint; the foundation does not automatically deploy it.
