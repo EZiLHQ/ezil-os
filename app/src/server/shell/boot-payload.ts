@@ -46,6 +46,7 @@ import type { NativeRuntime } from '../../../../native/src/contract';
 interface ShellComputerRecord {
     id: string;
     name: string;
+    provider: 'cloudflare' | 'aws-ec2';
     slot: number;
     createdAt: Date;
     lastOpenedAt: Date | null;
@@ -204,7 +205,7 @@ export const SHELL_APPS: readonly ShellBootApp[] = [
 
 export interface ShellDesktopState {
     /** Runtime identity. Hosted payloads remain unchanged; local clients can report their real boundary. */
-    provider: 'cloudflare-guacamole' | 'local-vm' | 'native-macos';
+    provider: 'cloudflare-guacamole' | 'aws-ec2' | 'local-vm' | 'native-macos';
     /** Whether the desktop Worker is configured at all. From `cloudflareGuacamole.isConfigured`. */
     configured: boolean;
     /** Whether a signing secret is present. A configured Worker without one will reject every call. */
@@ -249,7 +250,21 @@ export function toShellBootComputer(computer: ShellComputerRecord, isNew: boolea
     };
 }
 
-export function toShellDesktopState(provider: DesktopProviderInfo | null): ShellDesktopState {
+export function toShellDesktopState(
+    provider: DesktopProviderInfo | null,
+    computerProvider: ShellComputerRecord['provider'] = 'cloudflare',
+): ShellDesktopState {
+    // The AWS lifecycle/supervisor is not deployed yet. An AWS row must never
+    // inherit a healthy Cloudflare configuration or its desktop endpoints.
+    if (computerProvider === 'aws-ec2') {
+        return {
+            provider: 'aws-ec2',
+            configured: false,
+            hasHmacSecret: false,
+            status: 'idle',
+            endpoints: {},
+        };
+    }
     return {
         provider: 'cloudflare-guacamole',
         // A provider lookup that FAILED is reported as not configured, never
@@ -272,7 +287,7 @@ export function buildShellBootPayload(input: {
         user: { id: input.user.id, email: input.user.email ?? null },
         computer: toShellBootComputer(input.computer, input.isNew),
         apps: SHELL_APPS,
-        desktopState: toShellDesktopState(input.provider),
+        desktopState: toShellDesktopState(input.provider, input.computer.provider),
     };
 }
 

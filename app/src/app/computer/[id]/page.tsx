@@ -66,7 +66,13 @@ export default async function Page({ params }: { params: Promise<{ id: string }>
                     <DesktopStatusBadge />
                 </header>
                 <div className="min-h-0 flex-1">
-                    <CloudflareGuacamoleCanvas computerId={computer.id} sessionId={computer.id} />
+                    {computer.provider === 'cloudflare' ? (
+                        <CloudflareGuacamoleCanvas computerId={computer.id} sessionId={computer.id} />
+                    ) : (
+                        <div className="flex h-full items-center justify-center p-6 text-center text-sm text-gray-300">
+                            This computer needs the AWS runtime, which is not available yet.
+                        </div>
+                    )}
                 </div>
             </div>
         </DesktopStatusProvider>

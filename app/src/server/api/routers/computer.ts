@@ -38,6 +38,7 @@ import {
 } from '@/server/lib/cloudflare-guacamole-provider';
 import { computerCreateError } from './computer-errors';
 import {
+    ComputerRequiresLifecycleController,
     createComputerInLowestFreeSlot,
     getOrCreateDefaultComputer,
     liveComputersOf,
@@ -226,22 +227,34 @@ export const computerRouter = createTRPCRouter({
      * computers is permanently stuck: `create` refuses a third and nothing
      * can release a slot.
      *
-     * Order matters and is enforced in `softDeleteComputer`: ownership check
+     * For Cloudflare computers, order matters and is enforced in `softDeleteComputer`: ownership check
      * -> terminate the sandbox (which flushes the workspace to R2 and only
      * then destroys the container) -> stamp `deleted_at`. Freeing the slot
      * falls out of the stamp via the partial unique index; nothing else is
      * written, and **no SQL DELETE is ever issued** — the row id IS the R2
      * workspace prefix, so removing the row would orphan the user's files
-     * forever (see `./computer-store.ts`).
+     * forever (see `./computer-store.ts`). AWS computers are refused until
+     * their lifecycle controller can safely stop and detach the data volume.
      */
     delete: protectedProcedure
         .input(z.object({ id: z.string().uuid() }))
         .mutation(async ({ ctx, input }) => {
-            const deleted = await softDeleteComputer(ctx.db, {
-                userId: ctx.user.id,
-                computerId: input.id,
-                terminateSandbox: () => terminateComputerSandbox(ctx.user.id, input.id),
-            });
+            let deleted;
+            try {
+                deleted = await softDeleteComputer(ctx.db, {
+                    userId: ctx.user.id,
+                    computerId: input.id,
+                    terminateSandbox: () => terminateComputerSandbox(ctx.user.id, input.id),
+                });
+            } catch (error) {
+                if (error instanceof ComputerRequiresLifecycleController) {
+                    throw new TRPCError({
+                        code: 'PRECONDITION_FAILED',
+                        message: 'AWS computer deletion requires the lifecycle controller.',
+                    });
+                }
+                throw error;
+            }
 
             if (!deleted) {
                 // Missing, already deleted, or someone else's — one
