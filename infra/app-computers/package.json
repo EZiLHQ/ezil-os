@@ -5,16 +5,23 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
-    "synth": "cdk synth --strict"
+    "synth": "cdk synth --strict",
+    "synth:delivery": "cdk synth --strict --app \"npx tsx bin/delivery.ts\""
   },
   "dependencies": {
+    "@aws-sdk/client-ec2": "3.1140.0",
+    "@aws-sdk/client-secrets-manager": "3.1140.0",
+    "@aws-sdk/client-sfn": "3.1140.0",
+    "@aws-sdk/client-ssm": "3.1140.0",
     "aws-cdk-lib": "2.270.0",
-    "constructs": "10.8.1"
+    "constructs": "10.8.1",
+    "zod": "3.25.76"
   },
   "devDependencies": {
+    "@types/node": "20.19.43",
     "aws-cdk": "2.1143.0",
+    "esbuild": "0.25.10",
     "tsx": "4.23.15",
-    "typescript": "5.9.3",
-    "@types/node": "20.19.43"
+    "typescript": "5.9.3"
   }
 }

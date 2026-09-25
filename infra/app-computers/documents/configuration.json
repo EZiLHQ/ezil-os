@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Operate a scoped EZiL configuration delivery through the fixed root receiver manager",
+  "parameters": {
+    "Operation": {
+      "type": "String",
+      "description": "Canonical base64 of the bounded versioned delivery operation, never configuration bodies or credentials",
+      "interpolationType": "ENV_VAR",
+      "allowedPattern": "^[A-Za-z0-9+/]{1,12288}={0,2}$"
+    }
+  },
+  "mainSteps": [
+    {
+      "action": "aws:runShellScript",
+      "name": "operateConfiguration",
+      "precondition": { "StringEquals": ["platformType", "Linux"] },
+      "inputs": {
+        "timeoutSeconds": "45",
+        "runCommand": ["/usr/local/bin/node /opt/ezil-supervisor/dist/delivery-operation.js"]
+      }
+    }
+  ]
+}

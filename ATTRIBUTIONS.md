@@ -245,3 +245,14 @@ The licenses and versions were checked in the installed packages' own
 `package.json` files. Both are pinned development dependencies in
 `app/package.json` and `app/bun.lock`; no upstream source was copied into
 the application.
+
+## Application-computer configuration workflow
+
+The independently authored workflow in `infra/app-computers` uses
+[`AWS SDK for JavaScript v3`](https://github.com/aws/aws-sdk-js-v3) clients
+`@aws-sdk/client-ec2`, `client-ssm`, `client-sfn`, and `client-secrets-manager`
+at 3.1140.0 (Apache-2.0). It uses Zod 3.25.76 (MIT) for strict wire validation
+and esbuild 0.25.10 (MIT) to bundle its Lambda handlers. Versions and licenses
+were checked in the installed packages' `package.json` files. The existing
+foundation pins AWS CDK 2.270.0 and constructs 10.8.1 (Apache-2.0). No third-party
+application source is included in these controller artifacts.
