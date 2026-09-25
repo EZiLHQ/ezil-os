@@ -18,6 +18,7 @@
         "test:db:app-marketplace": "node tests/app-marketplace-db.mjs",
         "test:db:marketplace-api": "bun --no-env-file tests/marketplace-api-db.ts",
         "test:db:runtime-commands": "node tests/app-runtime-commands-db.mjs",
+        "test:db:runtime-api": "bun --no-env-file tests/app-runtime-api-db.ts",
         "db:generate": "drizzle-kit generate",
         "db:migrate": "drizzle-kit migrate",
         "db:push": "drizzle-kit push",

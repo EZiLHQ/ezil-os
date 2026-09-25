@@ -7,6 +7,7 @@ vi.hoisted(() => {
     process.env.EZIL_APP_MARKETPLACE_API_ENABLED = 'true';
     process.env.EZIL_APP_SUBMISSION_INTAKE_ENABLED = 'true';
     delete process.env.EZIL_APP_INSTALL_ENABLED;
+    delete process.env.EZIL_APP_RUNTIME_COMMANDS_ENABLED;
 });
 
 import { TRPCError } from '@trpc/server';
@@ -114,6 +115,16 @@ describe('marketplace API gates and scope', () => {
         const error = await caller.apps.install({ computerId: OTHER, appId: APP,
             clientRequestId: request.clientRequestId }).catch((value: unknown) => value);
         expect(failureCode(error)).toBe('PRECONDITION_FAILED');
+        expect(statements).toEqual([]);
+    });
+
+    it('keeps launch, stop and job polling closed until command consumers are deployed', async () => {
+        const { caller, statements } = fixture(USER);
+        const input = { computerId: OTHER, installationId: APP, clientRequestId: request.clientRequestId };
+        for (const promise of [caller.apps.launch(input), caller.apps.stop(input),
+            caller.apps.jobStatus({ computerId: OTHER, jobId: JOB })]) {
+            expect(failureCode(await promise.catch((error: unknown) => error))).toBe('PRECONDITION_FAILED');
+        }
         expect(statements).toEqual([]);
     });
 

@@ -19,3 +19,9 @@ export function requireAppInstall(): void {
         throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'Application installation is not enabled' });
     }
 }
+
+export function requireAppRuntimeCommands(): void {
+    if (env.EZIL_APP_RUNTIME_COMMANDS_ENABLED !== 'true') {
+        throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'Application runtime commands are not enabled' });
+    }
+}
