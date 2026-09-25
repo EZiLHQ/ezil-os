@@ -287,6 +287,9 @@ jobs:
       - name: Test immutable runtime commands and concurrent revisions
         working-directory: app
         run: bun run test:db:runtime-commands
+      - name: Test durable application launch and stop producers
+        working-directory: app
+        run: bun run test:db:runtime-api
 
   connectors:
     name: sdk + mcp (typecheck + unit)

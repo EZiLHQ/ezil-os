@@ -8,6 +8,7 @@ import {
 } from '@/server/db/schema';
 import { liveOwnedComputer } from './computer-store';
 import { installAppProcedure } from './app-install';
+import { appRuntimeJobStatusProcedure, launchAppProcedure, stopAppProcedure } from './app-runtime';
 import { requireMarketplaceApi } from './marketplace-flags';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
@@ -19,6 +20,9 @@ const visibleTo = (userId: string) => or(
 /** A publication is catalog data, never an installation or a running app. */
 export const appsRouter = createTRPCRouter({
     install: installAppProcedure,
+    launch: launchAppProcedure,
+    stop: stopAppProcedure,
+    jobStatus: appRuntimeJobStatusProcedure,
     catalog: protectedProcedure.query(async ({ ctx }) => {
         requireMarketplaceApi();
         return ctx.db.select({

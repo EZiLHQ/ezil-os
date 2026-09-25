@@ -68,6 +68,8 @@ const serverSchema = z.object({
     EZIL_APP_SUBMISSION_INTAKE_ENABLED: z.enum(['true', 'false']).default('false'),
     /** Install jobs remain disabled until the computer supervisor consumes them. */
     EZIL_APP_INSTALL_ENABLED: z.enum(['true', 'false']).default('false'),
+    /** Enable only after durable command delivery and host provisioning exist. */
+    EZIL_APP_RUNTIME_COMMANDS_ENABLED: z.enum(['true', 'false']).default('false'),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
 });
 
@@ -93,6 +95,7 @@ const parsedServer = isServer
           EZIL_APP_MARKETPLACE_API_ENABLED: process.env.EZIL_APP_MARKETPLACE_API_ENABLED,
           EZIL_APP_SUBMISSION_INTAKE_ENABLED: process.env.EZIL_APP_SUBMISSION_INTAKE_ENABLED,
           EZIL_APP_INSTALL_ENABLED: process.env.EZIL_APP_INSTALL_ENABLED,
+          EZIL_APP_RUNTIME_COMMANDS_ENABLED: process.env.EZIL_APP_RUNTIME_COMMANDS_ENABLED,
           NODE_ENV: process.env.NODE_ENV,
       })
     : null;
@@ -134,6 +137,7 @@ export const env = {
         EZIL_APP_MARKETPLACE_API_ENABLED: 'false' as const,
         EZIL_APP_SUBMISSION_INTAKE_ENABLED: 'false' as const,
         EZIL_APP_INSTALL_ENABLED: 'false' as const,
+        EZIL_APP_RUNTIME_COMMANDS_ENABLED: 'false' as const,
         NODE_ENV: process.env.NODE_ENV ?? 'development',
     }),
     ...parsedClient.data,
