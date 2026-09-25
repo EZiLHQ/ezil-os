@@ -32,11 +32,15 @@ function manifest(overrides: Record<string, unknown> = {}) {
 }
 
 function policy(forManifest: unknown = manifest(), overrides: Record<string, unknown> = {}) {
+    const parsed = ComputerAppManifestV2Schema.parse(forManifest);
     return {
         schemaVersion: 2,
-        manifestDigest: getComputerManifestDigest(ComputerAppManifestV2Schema.parse(forManifest)),
+        manifestDigest: getComputerManifestDigest(parsed),
         image: { reference: `registry.example.com/ezil/notes@${DIGEST}`, provenanceDigest: DIGEST },
         allowedOsOrigins: ['https://os.ezil.org'], appOriginBase: 'https://apps.ezil.org',
+        launch: parsed.launch.mode === 'web'
+            ? { mode: 'web', embedding: parsed.launch.embedding }
+            : { mode: 'integration', adapter: parsed.launch.adapter },
         services: [{ name: 'web', scope: 'installation', processKind: 'node', internalPort: 8080 }],
         capabilities: ['projects.read'], secretBindings: [{ name: 'APP_TOKEN', ref: SECRET }],
         egressOrigins: ['https://api.partner.example.com'],
@@ -108,6 +112,29 @@ describe('ApprovedComputerAppPolicyV2', () => {
         issue(manifest(), { ...policy(), mounts: { privateDirectories: ['state'],
             sharedFolders: [{ folder: 'Projects', access: 'read-write', scope: 'selected-projects' }] } },
         ['policy', 'mounts', 'sharedFolders', 0], 'folder_authority_exceeds_request');
+    });
+
+    it('rejects OS origins inside the installation-origin namespace', () => {
+        issue(manifest(), { ...policy(), allowedOsOrigins: [`https://i-${APP}.apps.ezil.org`] },
+            ['policy', 'appOriginBase'], 'custom');
+        issue(manifest(), { ...policy(), allowedOsOrigins: ['https://nested.apps.ezil.org'] },
+            ['policy', 'appOriginBase'], 'custom');
+        expect(validateComputerPolicyAgainstManifest(manifest(), policy())).toMatchObject({ success: true });
+    });
+
+    it('requires explicit web embedding approval without extra sandbox authority', () => {
+        issue(manifest(), { ...policy(), launch: { mode: 'web', embedding: { mode: 'iframe',
+            sandbox: ['allow-scripts', 'allow-same-origin'] } } },
+        ['policy', 'launch', 'embedding', 'sandbox', 1], 'authority_exceeds_request');
+        issue(manifest(), { ...policy(), launch: { mode: 'web', embedding: { mode: 'external' } } },
+            ['policy', 'launch', 'embedding', 'mode'], 'embedding_mode_mismatch');
+        issue(manifest(), { ...policy(), launch: { mode: 'integration', adapter: 'reticle-v1' } },
+            ['policy', 'launch', 'mode'], 'launch_mode_mismatch');
+        const requested = manifest({ launch: { mode: 'web', service: 'web', path: '/',
+            embedding: { mode: 'iframe', sandbox: ['allow-scripts', 'allow-forms'] } } });
+        expect(validateComputerPolicyAgainstManifest(requested, policy(requested, {
+            launch: { mode: 'web', embedding: { mode: 'iframe', sandbox: ['allow-scripts'] } },
+        }))).toMatchObject({ success: true });
     });
 
     it('rejects a service whose approved scope or internal port differs from the manifest', () => {

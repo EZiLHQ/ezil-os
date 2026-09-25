@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import {
-    EgressOriginsSchema, HttpsOriginSchema, OciImageSchema, SecretReferencesSchema,
+    EgressOriginsSchema, EmbeddingSchema, HttpsOriginSchema, OciImageSchema, SecretReferencesSchema,
     Sha256DigestSchema, parseContract, uniqueArray,
 } from './manifest';
 import type { ContractIssue, ContractResult } from './manifest';
@@ -39,6 +39,10 @@ export const ApprovedComputerAppPolicyV2Schema = z.object({
         .refine((origins) => new Set(origins).size === origins.length),
     // Installation origins are derived as i-<installation UUID>.<base host>.
     appOriginBase: HttpsOriginSchema,
+    launch: z.discriminatedUnion('mode', [
+        z.object({ mode: z.literal('web'), embedding: EmbeddingSchema }).strict(),
+        z.object({ mode: z.literal('integration'), adapter: z.literal('reticle-v1') }).strict(),
+    ]),
     services: z.array(approvedService).min(1).max(8),
     capabilities: ComputerCapabilitiesSchema,
     secretBindings: SecretReferencesSchema,
@@ -62,7 +66,13 @@ export const ApprovedComputerAppPolicyV2Schema = z.object({
         z.object({ mode: z.literal('database-adapter'), adapter: z.literal('postgres-v1') }).strict(),
     ]),
 }).strict().superRefine((policy, ctx) => {
-    if (policy.allowedOsOrigins.includes(policy.appOriginBase)) {
+    const appHost = new URL(policy.appOriginBase).hostname;
+    if (policy.allowedOsOrigins.some((origin) => {
+        const osHost = new URL(origin).hostname;
+        return osHost === appHost || osHost.endsWith(`.${appHost}`);
+    })) {
+        // Every installation's browser origin lives below this base host.
+        // None of those origins may gain the OS origin's bridge authority.
         ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['appOriginBase'], message: 'origin_collision' });
     }
     if (new Set(policy.services.map(({ name }) => name)).size !== policy.services.length) {
@@ -108,6 +118,15 @@ export function validateComputerPolicyAgainstManifest(
     if (policy.manifestDigest !== getComputerManifestDigest(manifest)) reject(['manifestDigest'], 'manifest_mismatch');
     if (manifest.source.kind === 'oci' && policy.image.reference !== manifest.source.image) {
         reject(['image', 'reference'], 'source_image_mismatch');
+    }
+    if (policy.launch.mode !== manifest.launch.mode) {
+        reject(['launch', 'mode'], 'launch_mode_mismatch');
+    } else if (policy.launch.mode === 'web' && manifest.launch.mode === 'web') {
+        if (policy.launch.embedding.mode !== manifest.launch.embedding.mode) {
+            reject(['launch', 'embedding', 'mode'], 'embedding_mode_mismatch');
+        } else if (policy.launch.embedding.mode === 'iframe' && manifest.launch.embedding.mode === 'iframe') {
+            subset(policy.launch.embedding.sandbox, manifest.launch.embedding.sandbox, ['launch', 'embedding', 'sandbox']);
+        }
     }
 
     subset(policy.capabilities, manifest.capabilities, ['capabilities']);

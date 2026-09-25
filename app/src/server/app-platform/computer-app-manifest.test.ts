@@ -107,6 +107,14 @@ describe('ComputerAppManifestV2', () => {
         expect(issues(nodeComputerApp({ services: [{ ...nodeComputerApp().services[0], hostPort: 4400 }] }))).not.toHaveLength(0);
     });
 
+    it('rejects control characters in names without returning their values', () => {
+        for (const value of ['Notes\nInjected', 'Notes\u0000Injected', 'Notes\u009bInjected']) {
+            const result = validateComputerAppManifest(nodeComputerApp({ name: value }));
+            expect(result.success).toBe(false);
+            expect(JSON.stringify(result)).not.toContain(value);
+        }
+    });
+
     it('rejects unsafe source, entrypoint, paths and ports', () => {
         for (const url of ['http://github.com/acme/notes', 'https://user:pass@github.com/acme/notes',
             'https://github.com/acme/notes/tree/main', 'https://127.0.0.1/acme/notes']) {
@@ -132,6 +140,12 @@ describe('ComputerAppManifestV2', () => {
             .toContainEqual({ path: ['launch', 'service'], code: 'custom' });
         expect(issues(nodeComputerApp({ services: [{ ...web, process: { kind: 'reticle-daemon-v1' } }] })))
             .toContainEqual({ path: ['services', 0, 'process'], code: 'custom' });
+        const projectService = { ...web, name: 'project-api', scope: 'selected-project', dependsOn: [] };
+        expect(issues(nodeComputerApp({ services: [{ ...web, dependsOn: ['project-api'] }, projectService] })))
+            .toContainEqual({ path: ['services', 0, 'dependsOn', 0], code: 'custom' });
+        expect(validateComputerAppManifest(nodeComputerApp({
+            services: [web, { ...projectService, dependsOn: ['web'] }],
+        }))).toMatchObject({ success: true });
     });
 
     it('allows two independent processes to use the same internal port and preserves dependency order', () => {

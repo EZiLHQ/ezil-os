@@ -7,7 +7,11 @@ import {
 } from './manifest';
 import type { ContractIssue, ContractResult } from './manifest';
 
-const name = z.string().min(1).max(80).refine((value) => value.trim().length > 0);
+const name = z.string().min(1).max(80).refine((value) => value.trim().length > 0
+    && [...value].every((character) => {
+        const code = character.charCodeAt(0);
+        return code >= 32 && (code < 127 || code > 159);
+    }));
 const slug = z.string().max(64).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 const version = z.string().max(64).regex(/^[a-z0-9][a-z0-9.+_-]*$/i);
 const serviceName = z.string().max(48).regex(/^[a-z][a-z0-9-]*$/);
@@ -186,7 +190,15 @@ export const ComputerAppManifestV2Schema = z.object({
         for (const [index, dependency] of current.dependsOn.entries()) {
             const depIndex = indexes.get(dependency);
             if (depIndex === undefined) reject(['services', serviceIndex, 'dependsOn', index], 'unknown_service');
-            else if (visit(depIndex)) reject(['services', serviceIndex, 'dependsOn', index], 'dependency_cycle');
+            else {
+                // A computer-wide process has no selected project with which
+                // to start a project-scoped dependency. The reverse direction
+                // is safe: a project service may use a computer-wide service.
+                if (current.scope === 'installation' && manifest.services[depIndex]!.scope === 'selected-project') {
+                    reject(['services', serviceIndex, 'dependsOn', index], 'dependency_scope_mismatch');
+                }
+                if (visit(depIndex)) reject(['services', serviceIndex, 'dependsOn', index], 'dependency_cycle');
+            }
         }
         visiting.delete(current.name);
         visited.add(current.name);
