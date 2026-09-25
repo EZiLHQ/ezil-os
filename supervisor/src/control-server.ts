@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { verifyControlRequest } from './control-auth.js';
-import { ControlCommandSchema, type ExecutionPlan } from './control-protocol.js';
+import { ControlCommandSchema, intentDigest, type ExecutionPlan } from './control-protocol.js';
 import { ControlStore, type StoredIntent } from './control-store.js';
 
 export interface ComputerDriver {
@@ -110,10 +110,24 @@ export function createControlService(options: ControlServiceOptions) {
                 return json(response, 403, { code: 'computer_scope_mismatch' });
             }
             if (command.operation === 'observe') {
-                if (!options.store.get(command.installationId)) return json(response, 404, { code: 'installation_not_found' });
+                const before = options.store.get(command.installationId);
+                if (!before) return json(response, 404, { code: 'installation_not_found' });
                 const observed = await options.driver.observe(command.installationId);
                 if (!['unknown', 'running', 'stopped', 'failed'].includes(observed.state)) throw new Error('invalid_observation');
-                return json(response, 200, { installationId: command.installationId, state: observed.state });
+                if (!available()) return json(response, 503, { code: 'computer_control_unavailable' });
+                const current = options.store.get(command.installationId);
+                if (!current || current.generation !== before.generation) {
+                    return json(response, 409, { code: 'observation_superseded' });
+                }
+                // Health can become visible before reconciliation commits. Do
+                // not acknowledge completion while a driver operation is still
+                // pending, or label an old read with a newer command revision.
+                return json(response, 200, { computerId: options.computerId,
+                    computerGeneration: options.computerGeneration, installationId: command.installationId,
+                    generation: current.generation, desired: current.desired, intentDigest: intentDigest(current.command),
+                    state: observed.state, settled: !running.has(command.installationId)
+                        && current.observed !== 'unknown' && current.observed === observed.state,
+                    runtimeDeadlineMs: options.store.runtimeDeadline(current.command) });
             }
             // Revocation must not prevent stopping an already owned runtime.
             if (command.desired === 'running' && !options.approvePlan(command.plan, command.installationId)) {

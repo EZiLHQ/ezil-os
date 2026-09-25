@@ -10,6 +10,7 @@ import { ControlStore } from '../src/control-store.js';
 import { createControlService } from '../src/control-server.js';
 import { signControlRequest } from '../src/control-auth.js';
 import { command, computerId } from './control-fixture.js';
+import { intentDigest } from '../src/control-protocol.js';
 
 test('real HTTP control requires signatures and scope; status does not execute or wake a service', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'ezil-control-http-'));
@@ -42,7 +43,9 @@ test('real HTTP control requires signatures and scope; status does not execute o
         assert.equal(starts, 1);
         const observed = { schemaVersion: 1, requestId: randomUUID(), computerId, computerGeneration: 1,
             installationId: request.installationId, operation: 'observe' };
-        assert.deepEqual(await (await send(observed)).json(), { installationId: request.installationId, state: 'stopped' });
+        assert.deepEqual(await (await send(observed)).json(), { computerId, computerGeneration: 1,
+            installationId: request.installationId, generation: 1, desired: 'running', intentDigest: intentDigest(request),
+            state: 'stopped', settled: false, runtimeDeadlineMs: null });
         assert.equal(starts, 1);
         assert.equal(observations, 1);
         approved = false;
@@ -56,6 +59,70 @@ test('real HTTP control requires signatures and scope; status does not execute o
         assert.equal((await send(observed, true, fixed)).status, 200);
         assert.equal((await send(observed, true, fixed)).status, 401);
     } finally {
+        service.server.close(); service.server.closeAllConnections();
+        await service.drain(); store.close(); await rm(directory, { recursive: true, force: true });
+    }
+});
+
+test('observations bind committed intent and reject a newer Stop arriving during a slow read', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ezil-control-race-'));
+    const store = new ControlStore(directory, computerId, 1);
+    const secret = Buffer.alloc(32, 45);
+    let finishStart!: () => void;
+    const starting = new Promise<void>(resolve => { finishStart = resolve; });
+    let finishObserve: (() => void) | undefined;
+    let didObserve!: () => void;
+    const observing = new Promise<void>(resolve => { didObserve = resolve; });
+    let state: 'running' | 'stopped' = 'running';
+    const service = createControlService({ computerId, computerGeneration: 1, secret, store, approvePlan: () => true,
+        driver: {
+            reconcile: async intent => { await starting; state = intent.desired; return state; },
+            observe: async () => { const snapshot = state;
+                if (finishObserve) { didObserve(); await new Promise<void>(resolve => { finishObserve = resolve; }); }
+                return { state: snapshot };
+            },
+        } });
+    service.server.listen(0, '127.0.0.1');
+    await once(service.server, 'listening');
+    const url = `http://127.0.0.1:${(service.server.address() as AddressInfo).port}/v1/control`;
+    const send = async (value: unknown) => {
+        const body = Buffer.from(JSON.stringify(value));
+        return fetch(url, { method: 'POST', body, headers: { 'content-type': 'application/json',
+            ...signControlRequest('POST', '/v1/control', body, secret) as Record<string, string> } });
+    };
+    const start = command();
+    const observe = { schemaVersion: 1, requestId: randomUUID(), computerId, computerGeneration: 1,
+        installationId: start.installationId, operation: 'observe' };
+    try {
+        assert.equal((await send(start)).status, 202);
+        const expires = store.reserveRuntimeDeadline(start, Date.now() + 1000);
+        const pending = await (await send(observe)).json() as Record<string, unknown>;
+        assert.equal(pending.state, 'running');
+        assert.equal(pending.settled, false);
+        assert.equal(pending.runtimeDeadlineMs, expires);
+        finishStart(); await service.drain();
+        const ready = await (await send(observe)).json() as Record<string, unknown>;
+        assert.equal(ready.settled, true);
+        assert.equal(ready.intentDigest, intentDigest(start));
+        assert.equal(ready.runtimeDeadlineMs, expires);
+        finishObserve = () => {};
+        const stale = send(observe);
+        await observing;
+        const stop = { ...start, requestId: randomUUID(), generation: 2, desired: 'stopped' as const };
+        assert.equal((await send(stop)).status, 202);
+        await service.drain();
+        finishObserve!(); finishObserve = undefined;
+        const result = await stale;
+        assert.equal(result.status, 409);
+        assert.deepEqual(await result.json(), { code: 'observation_superseded' });
+        const stopped = await (await send(observe)).json() as Record<string, unknown>;
+        assert.equal(stopped.generation, 2);
+        assert.equal(stopped.state, 'stopped');
+        assert.equal(stopped.settled, true);
+        assert.equal(stopped.intentDigest, intentDigest(stop));
+        assert.equal(stopped.runtimeDeadlineMs, null);
+    } finally {
+        finishStart(); finishObserve?.();
         service.server.close(); service.server.closeAllConnections();
         await service.drain(); store.close(); await rm(directory, { recursive: true, force: true });
     }

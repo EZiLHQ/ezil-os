@@ -54,7 +54,23 @@ the primary control-plane record. It must be outside every application mount.
 Nonce reservations survive process restart. Request IDs cannot be reused for
 different intent. Conflicting plans at the same generation and older commands
 are rejected. Observations update only their matching generation; a delayed
-start result cannot overwrite a newer stop. A revoked plan can still be
+start result cannot overwrite a newer stop. HTTP observations also return the
+computer UUID/generation, installation UUID, command generation, desired state,
+canonical intent digest, observed state, `settled`, and `runtimeDeadlineMs`.
+The digest uses `intentDigest` (canonical JSON excluding requestId). A command
+change during the driver's read returns `409 observation_superseded` instead of
+labelling an older result with the new revision. `settled` is true only when no
+reconciliation is pending and the actual state matches its committed result.
+A running health check during startup therefore cannot complete a job. A
+controller must match all identity/digest fields and the expected desired state,
+and recheck its own current command and delivery lease before recording success.
+
+The deadline is the original durable host reservation, or null when none exists.
+Reading it never renews runtime. Expiry may produce an observed stopped state
+that differs from the last committed running result; the controller must record
+a new Stop intent rather than replay the expired Start for a fresh allowance.
+Observation is a point-in-time check, not a guarantee of future health or billing.
+A revoked plan can still be
 stopped. The database's computer identity/generation cannot silently change.
 For that reason, a stopped command may only stop/observe already owned
 resources; it must never pull its supplied image or prepare new mounts. Image
