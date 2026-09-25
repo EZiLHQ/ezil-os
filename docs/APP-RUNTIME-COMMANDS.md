@@ -11,13 +11,21 @@ is a consecutive revision for that installation, starting at 1. It continues
 across host replacement and is separate from `auth_generation`. Updating a
 browser session or opening another window must not manufacture a new revision.
 
+An immutable request receipt binds each accepted client request UUID to its
+command. Several Open requests can reference the same running intent. Replaying
+any of those UUIDs after Stop must return the original receipt, never enqueue a
+fresh start. Receipts are scoped to the installation and cannot be retargeted.
+
 The producer must, in one transaction:
 
-1. Lock the owned live computer, then the installation. Recheck OS access,
-   entitlement, release approval, current writer, configuration and folder grants.
+1. Lock the owned live computer, then the installation. For a start, recheck OS
+   access, entitlement, release approval, current writer, configuration and
+   folder grants. Revocation must still allow a stop of already owned resources
+   using their recorded scope; never treat a stopped command as image approval.
 2. Read the latest command and reuse identical current intent when eligible.
    Otherwise allocate the next revision from the ledger, never from the clock.
 3. Insert the start/stop job, its outbox event, then its immutable command.
+   Record the request receipt in that transaction, including when reusing intent.
 
 Composite foreign keys reject mixed installations/computers, cross-app releases,
 missing writer generations and mismatched job operations. A deferred trigger

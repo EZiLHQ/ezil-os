@@ -1,5 +1,5 @@
 {
-  "id": "cf21f936-5261-4f01-8ddb-4ec1dc35bdac",
+  "id": "fa3da660-7e17-47f2-935e-e1f3b91d7881",
   "prevId": "a36f8ed1-a00c-4679-aa67-ac008c3d2282",
   "version": "7",
   "dialect": "postgresql",
@@ -2715,6 +2715,14 @@
             "installation_id",
             "generation"
           ]
+        },
+        "ezil_app_runtime_commands_job_installation_uq": {
+          "name": "ezil_app_runtime_commands_job_installation_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "job_id",
+            "installation_id"
+          ]
         }
       },
       "policies": {},
@@ -2732,6 +2740,88 @@
           "value": "jsonb_typeof(plan) = 'object' AND octet_length(plan::text) <= 49152 AND coalesce(plan->>'releaseId','') = release_id::text AND coalesce(plan->>'policyDigest','') ~ '^sha256:[0-9a-f]{64}$'"
         }
       },
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_runtime_requests": {
+      "name": "ezil_app_runtime_requests",
+      "schema": "",
+      "columns": {
+        "installation_id": {
+          "name": "installation_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "request_id": {
+          "name": "request_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "job_id": {
+          "name": "job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "requested_by": {
+          "name": "requested_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_app_runtime_requests_command_fkey": {
+          "name": "ezil_app_runtime_requests_command_fkey",
+          "tableFrom": "ezil_app_runtime_requests",
+          "tableTo": "ezil_app_runtime_commands",
+          "columnsFrom": [
+            "job_id",
+            "installation_id"
+          ],
+          "columnsTo": [
+            "job_id",
+            "installation_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_runtime_requests_requester_fkey": {
+          "name": "ezil_app_runtime_requests_requester_fkey",
+          "tableFrom": "ezil_app_runtime_requests",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "requested_by"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "ezil_app_runtime_requests_pk": {
+          "name": "ezil_app_runtime_requests_pk",
+          "columns": [
+            "installation_id",
+            "request_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
       "isRLSEnabled": true
     },
     "public.ezil_os_access": {

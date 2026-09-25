@@ -16,6 +16,7 @@ CREATE TABLE "ezil_app_runtime_commands" (
 	"plan" jsonb NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	CONSTRAINT "ezil_app_runtime_commands_revision_uq" UNIQUE("installation_id","generation"),
+	CONSTRAINT "ezil_app_runtime_commands_job_installation_uq" UNIQUE("job_id","installation_id"),
 	CONSTRAINT "ezil_app_runtime_commands_generation_chk" CHECK (generation >= 1 AND computer_generation >= 1 AND auth_generation >= 1),
 	CONSTRAINT "ezil_app_runtime_commands_operation_chk" CHECK (operation in ('start','stop') AND outbox_event = 'reconcile'),
 	CONSTRAINT "ezil_app_runtime_commands_plan_chk" CHECK (jsonb_typeof(plan) = 'object' AND octet_length(plan::text) <= 49152 AND coalesce(plan->>'releaseId','') = release_id::text AND coalesce(plan->>'policyDigest','') ~ '^sha256:[0-9a-f]{64}$')
@@ -23,6 +24,18 @@ CREATE TABLE "ezil_app_runtime_commands" (
 --> statement-breakpoint
 
 ALTER TABLE "ezil_app_runtime_commands" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
+
+CREATE TABLE "ezil_app_runtime_requests" (
+	"installation_id" uuid NOT NULL,
+	"request_id" uuid NOT NULL,
+	"job_id" uuid NOT NULL,
+	"requested_by" uuid NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "ezil_app_runtime_requests_pk" PRIMARY KEY("installation_id","request_id")
+);
+--> statement-breakpoint
+
+ALTER TABLE "ezil_app_runtime_requests" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
 
 ALTER TABLE "ezil_app_runtime_commands" ADD CONSTRAINT "ezil_app_runtime_commands_installation_fkey" FOREIGN KEY ("installation_id","computer_id","app_id") REFERENCES "public"."ezil_app_installations"("id","computer_id","app_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 
@@ -32,7 +45,11 @@ ALTER TABLE "ezil_app_runtime_commands" ADD CONSTRAINT "ezil_app_runtime_command
 
 ALTER TABLE "ezil_app_runtime_commands" ADD CONSTRAINT "ezil_app_runtime_commands_job_fkey" FOREIGN KEY ("job_id","installation_id","computer_id","operation") REFERENCES "public"."ezil_app_jobs"("id","installation_id","computer_id","operation") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 
-ALTER TABLE "ezil_app_runtime_commands" ADD CONSTRAINT "ezil_app_runtime_commands_outbox_fkey" FOREIGN KEY ("job_id","outbox_event") REFERENCES "public"."ezil_app_outbox"("job_id","event_type") ON DELETE restrict ON UPDATE no action;
+ALTER TABLE "ezil_app_runtime_commands" ADD CONSTRAINT "ezil_app_runtime_commands_outbox_fkey" FOREIGN KEY ("job_id","outbox_event") REFERENCES "public"."ezil_app_outbox"("job_id","event_type") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+
+ALTER TABLE "ezil_app_runtime_requests" ADD CONSTRAINT "ezil_app_runtime_requests_command_fkey" FOREIGN KEY ("job_id","installation_id") REFERENCES "public"."ezil_app_runtime_commands"("job_id","installation_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+
+ALTER TABLE "ezil_app_runtime_requests" ADD CONSTRAINT "ezil_app_runtime_requests_requester_fkey" FOREIGN KEY ("requested_by") REFERENCES "auth"."users"("id") ON DELETE restrict ON UPDATE no action;
 --> statement-breakpoint
 -- Drizzle metadata captures tables/constraints; these trigger invariants are
 -- intentionally maintained in SQL. No existing rows are rewritten.
@@ -88,4 +105,15 @@ DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW EXECUTE FUNCTION public.ezil_app_runtime_job_complete();
 --> statement-breakpoint
 CREATE POLICY "Service role full access runtime commands" ON public.ezil_app_runtime_commands
+FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
+--> statement-breakpoint
+CREATE TRIGGER ezil_app_runtime_request_immutable_trg
+BEFORE UPDATE OR DELETE ON public.ezil_app_runtime_requests
+FOR EACH ROW EXECUTE FUNCTION public.ezil_app_runtime_command_guard();
+--> statement-breakpoint
+CREATE TRIGGER ezil_app_runtime_request_no_truncate_trg
+BEFORE TRUNCATE ON public.ezil_app_runtime_requests
+FOR EACH STATEMENT EXECUTE FUNCTION public.ezil_app_runtime_command_guard();
+--> statement-breakpoint
+CREATE POLICY "Service role full access runtime requests" ON public.ezil_app_runtime_requests
 FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');

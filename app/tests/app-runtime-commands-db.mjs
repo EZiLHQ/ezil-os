@@ -116,7 +116,7 @@ try {
     await test('history cannot be rewritten, deleted, truncated or detached from its outbox', async () => {
         await rejects(() => db`UPDATE ezil_app_runtime_commands SET plan='{}' WHERE job_id=${first}`, '23514');
         await rejects(() => db`DELETE FROM ezil_app_runtime_commands WHERE job_id=${first}`, '23514');
-        await rejects(() => db.unsafe('TRUNCATE ezil_app_runtime_commands'), '23514');
+        await rejects(() => db.unsafe('TRUNCATE ezil_app_runtime_commands CASCADE'), '23514');
         // PG18 distinguishes RESTRICT from a general FK violation (PG16).
         await assert.rejects(db`DELETE FROM ezil_app_outbox WHERE job_id=${first}`,
             error => ['23503', '23001'].includes(error.code));
@@ -151,12 +151,30 @@ try {
             WHERE installation_id=${a.installationId} ORDER BY generation DESC LIMIT 1`;
         assert.deepEqual({ ...row }, { generation: 3, auth_generation: 7, computer_generation: 2 });
     });
+    await test('reused Open request receipts stay bound to the original intent after Stop', async () => {
+        const requestId = randomUUID(), secondRequestId = randomUUID();
+        const receipt = (target, id, jobId) => db`INSERT INTO ezil_app_runtime_requests
+            (installation_id,request_id,job_id,requested_by) VALUES (${target.installationId},${id},${jobId},${target.userId})`;
+        await receipt(a, requestId, first);
+        await receipt(a, secondRequestId, first);
+        const [stop] = await db`SELECT job_id FROM ezil_app_runtime_commands WHERE installation_id=${a.installationId} AND generation=3`;
+        await rejects(() => receipt(a, secondRequestId, stop.job_id), '23505');
+        await rejects(() => db`UPDATE ezil_app_runtime_requests SET job_id=${stop.job_id} WHERE request_id=${requestId}`, '23514');
+        await rejects(() => db`DELETE FROM ezil_app_runtime_requests WHERE request_id=${requestId}`, '23514');
+        await rejects(() => db.unsafe('TRUNCATE ezil_app_runtime_requests'), '23514');
+        await rejects(() => receipt(b, requestId, first), '23503');
+        const [other] = await db`SELECT job_id FROM ezil_app_runtime_commands WHERE installation_id=${b.installationId}`;
+        await receipt(b, requestId, other.job_id);
+        const receipts = await db`SELECT job_id FROM ezil_app_runtime_requests WHERE installation_id=${a.installationId}`;
+        assert.deepEqual(receipts.map(r => r.job_id), [first, first]);
+    });
     await test('authenticated owners cannot read or insert commands; service role can read', async () => {
-        await db.unsafe('GRANT ALL ON ezil_app_runtime_commands, ezil_computers, ezil_app_installations TO authenticated, service_role');
+        await db.unsafe('GRANT ALL ON ezil_app_runtime_commands, ezil_app_runtime_requests, ezil_computers, ezil_app_installations TO authenticated, service_role');
         await db.begin(async tx => {
             await tx.unsafe('SET LOCAL ROLE authenticated');
             await tx`SELECT set_config('request.jwt.claim.sub',${alice},true),set_config('request.jwt.claim.role','authenticated',true)`;
             assert.equal((await tx`SELECT count(*)::int n FROM ezil_app_runtime_commands`)[0].n, 0);
+            assert.equal((await tx`SELECT count(*)::int n FROM ezil_app_runtime_requests`)[0].n, 0);
             // RLS also denies updates even to the owner's own command.
             assert.equal((await tx`UPDATE ezil_app_runtime_commands SET generation=99 WHERE job_id=${first} RETURNING job_id`).length, 0);
         });
@@ -169,10 +187,17 @@ try {
         // The invoker-rights guard sees no installation through its service-only
         // RLS policy, before PostgreSQL reaches the command's WITH CHECK policy.
         }), '23503');
+        await rejects(() => db.begin(async tx => {
+            await tx.unsafe('SET LOCAL ROLE authenticated');
+            await tx`SELECT set_config('request.jwt.claim.role','authenticated',true)`;
+            await tx`INSERT INTO ezil_app_runtime_requests (installation_id,request_id,job_id,requested_by)
+                VALUES (${a.installationId},${randomUUID()},${first},${alice})`;
+        }), '42501');
         await db.begin(async tx => {
             await tx.unsafe('SET LOCAL ROLE service_role');
             await tx`SELECT set_config('request.jwt.claim.role','service_role',true)`;
             assert.equal((await tx`SELECT count(*)::int n FROM ezil_app_runtime_commands`)[0].n, 4);
+            assert.equal((await tx`SELECT count(*)::int n FROM ezil_app_runtime_requests`)[0].n, 3);
         });
     });
     console.log(`${passed} pass, 0 fail, 0 skip — actual PostgreSQL command ledger`);
