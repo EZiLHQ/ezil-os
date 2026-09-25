@@ -308,6 +308,9 @@ jobs:
       - name: Immutable computer lifecycle intents (real Postgres)
         working-directory: app
         run: bun run test:db:lifecycle-intents
+      - name: Computer lifecycle consumer (real Postgres)
+        working-directory: app
+        run: bun run test:db:lifecycle-consumer
 
   connectors:
     name: sdk + mcp (typecheck + unit)

@@ -1,7 +1,7 @@
 # Computer lifecycle intent
 
 `0007_computer_lifecycle_intents.sql` adds an immutable record for each approved
-EC2 lifecycle job. It is the input to the future lifecycle controller, not a
+EC2 lifecycle job. It is the input to the lifecycle controller, not a
 provider observation or a permission grant. Existing Cloudflare computers are
 unchanged; no producer or cloud workflow is enabled by this migration.
 
@@ -49,3 +49,66 @@ Before a hosted rollout, inspect the actual schema and review/apply only the new
 migration transactionally. Do not replay the historical journal or run `push`.
 The controller/consumer is a separate change and must remain disabled until its
 schema is applied. Rollback keeps additive history and disables the producer.
+
+## Consumer and authority endpoint
+
+`lifecycle-consumer.ts` claims only jobs which already have an immutable intent.
+It reads the exact SQL v1 document and digest, checks the approved deployment,
+current owner/OS access, desired state and writer/disk association, and reserves
+one of two pilot computer slots before submitting work. The running job holds
+that reservation across delivery lease expiry and ambiguous AWS responses.
+Computer locks serialize acknowledgments; attempt numbers reject stale workers.
+Network requests execute outside database transactions.
+
+`aws-lifecycle-transport.ts` submits a deterministic `computer-<job UUID>` execution
+of the intent's numeric Standard workflow version. It verifies execution input,
+version, name and absence of redrive before accepting any output. It does not
+restart an absent historical execution after seven days. Submission, RUNNING,
+FAILED, ABORTED, TIMED_OUT and missing history never count as provider completion.
+There are no automatic SDK retries and no direct EC2 mutations in this transport.
+`StartInstances` has no ClientToken; the workflow must own that non-idempotent
+step and reconcile uncertainty without retrying it or releasing admission.
+
+On successful workflow output, the transport independently describes EC2 and
+EBS. It checks the exact account, ownership/generation tags, region/AZ, instance
+identity, effective launch properties, preserved encrypted 50-GiB gp3 volume,
+and exclusive attachment. Replacement requires the old instance to be observed
+**terminated**; stopped alone could be undone by a delayed start. Retirement
+requires termination and a detached, available data volume. These are provider
+receipts, not mounted-disk, loaded-supervisor or installed-application receipts.
+`DescribeInstances` does not expose a LaunchTemplate field: template selection
+is the pinned workflow's responsibility; the observer checks effective properties.
+
+After fresh provider observation the consumer atomically updates the runtime,
+writer, job and outbox. Replacement fences the previous database writer in that
+same transaction. A revoked in-flight start remains unresolved for cancellation
+reconciliation; it is never marked failed merely to admit replacement work.
+Stop/retire cleanup can proceed after owner access revocation. No operation
+permanently deletes the retained data volume.
+
+`POST /api/internal/computers/lifecycle-authority` checks the current immutable
+job/digest under a dedicated 30-second HMAC. It accepts no caller-selected
+provider IDs. Cookie/bearer authentication cannot substitute for the workflow
+key. Replaying a signed check repeats current database validation. The result is
+not a reusable capability and does not execute provider work.
+
+The endpoint defaults off. Before enabling it, review/apply migration 0007 and
+configure `EZIL_LIFECYCLE_AUTHORITY_ENABLED=true`, a separate 64-character hex
+`EZIL_LIFECYCLE_AUTHORITY_SECRET`, and `EZIL_LIFECYCLE_DEPLOYMENTS` as a JSON array
+of reviewed deployment records. Invalid or missing enabled configuration fails
+at startup without printing values. Keep historical deployments available for
+observation/cleanup; revocation must stop admission while reconciling running
+resources. Do not reuse host, configuration-delivery, Supabase or cloud keys.
+
+The lifecycle workflow, scoped OIDC credentials, intake/periodic consumer wiring,
+per-writer host bootstrap/permissions and cancellation recovery must be deployed
+and validated before any new-computer producer is enabled. This change does not
+activate a cron or start AWS resources. In particular it does not yet install
+Reticle or claim an AWS stop/start/replacement acceptance test.
+
+Validation: `bash tools/test.sh app`, a production app build with local Supabase
+configuration, and `bun run test:db:lifecycle-consumer` against a disposable
+loopback Postgres server. SDK tests exercise actual request serialization,
+signing and XML/JSON decoding with a local wire handler. Database tests exercise
+real concurrent locks and commits. Neither test suite establishes cloud IAM,
+disk mounting, physical-phone behavior, or stopped-compute billing.

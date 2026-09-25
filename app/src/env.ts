@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { LifecycleDeploymentSchema } from './server/app-platform/lifecycle-deployment';
 
 /**
  * Server-only environment. Validated eagerly at import time so a missing
@@ -74,8 +75,26 @@ const serverSchema = z.object({
     EZIL_CONFIGURATION_AUTHORITY_ENABLED: z.string().refine(value => ['true', 'false'].includes(value),
         'invalid_configuration_authority_flag').default('false'),
     EZIL_CONFIGURATION_AUTHORITY_SECRET: z.string().regex(/^[a-f0-9]{64}$/, 'invalid_configuration_authority_secret').optional(),
+    /** Service-only lifecycle authority; migration 0007 and a pinned workflow are required. */
+    EZIL_LIFECYCLE_AUTHORITY_ENABLED: z.string().refine(value => ['true', 'false'].includes(value),
+        'invalid_lifecycle_authority_flag').default('false'),
+    EZIL_LIFECYCLE_AUTHORITY_SECRET: z.string().regex(/^[a-f0-9]{64}$/, 'invalid_lifecycle_authority_secret').optional(),
+    EZIL_LIFECYCLE_DEPLOYMENTS: z.string().max(65536).default('[]').transform((raw, ctx) => {
+        try {
+            const parsed = z.array(LifecycleDeploymentSchema).max(16).safeParse(JSON.parse(raw));
+            if (parsed.success) return parsed.data;
+        } catch { /* Report a code only, never environment values. */ }
+        ctx.addIssue({ code: 'custom', message: 'invalid_lifecycle_deployments' });
+        return z.NEVER;
+    }),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
 }).superRefine((value, context) => {
+    if (value.EZIL_LIFECYCLE_AUTHORITY_ENABLED === 'true') {
+        if (!value.EZIL_LIFECYCLE_AUTHORITY_SECRET) context.addIssue({ code: 'custom',
+            path: ['EZIL_LIFECYCLE_AUTHORITY_SECRET'], message: 'lifecycle_authority_secret_required' });
+        if (!value.EZIL_LIFECYCLE_DEPLOYMENTS.length) context.addIssue({ code: 'custom',
+            path: ['EZIL_LIFECYCLE_DEPLOYMENTS'], message: 'lifecycle_deployment_required' });
+    }
     if (value.EZIL_CONFIGURATION_AUTHORITY_ENABLED === 'true' && !value.EZIL_CONFIGURATION_AUTHORITY_SECRET) {
         context.addIssue({ code: 'custom', path: ['EZIL_CONFIGURATION_AUTHORITY_SECRET'], message: 'configuration_authority_secret_required' });
     }
@@ -106,6 +125,9 @@ const parsedServer = isServer
           EZIL_APP_RUNTIME_COMMANDS_ENABLED: process.env.EZIL_APP_RUNTIME_COMMANDS_ENABLED,
           EZIL_CONFIGURATION_AUTHORITY_ENABLED: process.env.EZIL_CONFIGURATION_AUTHORITY_ENABLED,
           EZIL_CONFIGURATION_AUTHORITY_SECRET: process.env.EZIL_CONFIGURATION_AUTHORITY_SECRET,
+          EZIL_LIFECYCLE_AUTHORITY_ENABLED: process.env.EZIL_LIFECYCLE_AUTHORITY_ENABLED,
+          EZIL_LIFECYCLE_AUTHORITY_SECRET: process.env.EZIL_LIFECYCLE_AUTHORITY_SECRET,
+          EZIL_LIFECYCLE_DEPLOYMENTS: process.env.EZIL_LIFECYCLE_DEPLOYMENTS,
           NODE_ENV: process.env.NODE_ENV,
       })
     : null;
@@ -150,6 +172,9 @@ export const env = {
         EZIL_APP_RUNTIME_COMMANDS_ENABLED: 'false' as const,
         EZIL_CONFIGURATION_AUTHORITY_ENABLED: 'false' as const,
         EZIL_CONFIGURATION_AUTHORITY_SECRET: undefined,
+        EZIL_LIFECYCLE_AUTHORITY_ENABLED: 'false' as const,
+        EZIL_LIFECYCLE_AUTHORITY_SECRET: undefined,
+        EZIL_LIFECYCLE_DEPLOYMENTS: [],
         NODE_ENV: process.env.NODE_ENV ?? 'development',
     }),
     ...parsedClient.data,
