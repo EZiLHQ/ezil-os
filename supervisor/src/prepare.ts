@@ -28,7 +28,8 @@ export interface PreparationReceipt {
  * Preparing does not execute image code, modify projects, create containers,
  * start compute, reload a host or claim serving readiness. */
 export async function prepareHostConfiguration(inputPath: string, activePath: string,
-    options: { credentialsPath?: string; privateValidation?: boolean; signal?: AbortSignal; docker?: Docker } = {}): Promise<PreparationReceipt> {
+    options: { credentialsPath?: string; privateValidation?: boolean; signal?: AbortSignal; docker?: Docker;
+        beforeCommit?: () => Promise<void> } = {}): Promise<PreparationReceipt> {
     const signal = AbortSignal.any([AbortSignal.timeout(900_000), ...(options.signal ? [options.signal] : [])]);
     const checkCancelled = () => { if (signal.aborted) throw new Error('preparation_cancelled'); };
     checkCancelled();
@@ -120,6 +121,8 @@ export async function prepareHostConfiguration(inputPath: string, activePath: st
         temporaryCreated = true;
         try { await file.writeFile(canonicalJson(desired)); await file.sync(); }
         finally { await file.close(); }
+        checkCancelled();
+        await options.beforeCommit?.();
         checkCancelled();
         await rename(temporaryPath, `/proc/self/fd/${parent.fd}/${name}`);
         temporaryCreated = false;
