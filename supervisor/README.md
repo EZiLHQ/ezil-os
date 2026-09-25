@@ -2,9 +2,10 @@
 
 This package contains an authenticated HTTP control service factory, a durable
 command ledger, host admission checks, and a foreground adapter for the pinned
-Reticle 3.2.0 daemon. A [real Docker driver](DRIVER.md) now performs local
-container execution through that HTTP boundary. The executable host bootstrap,
-EBS controller, Cloudflare routing, and marketplace integration remain pending.
+Reticle 3.2.0 daemon. A [real Docker driver](DRIVER.md) performs local
+container execution through that HTTP boundary. The [Linux host executable](HOST.md)
+adds protected configuration, a kernel singleton lock and process recovery.
+The EBS controller, Cloudflare routing, and marketplace integration remain pending.
 The HTTP unit tests use an instrumented driver; the separate Linux acceptance
 suite uses actual Docker containers and an ext4 loop disk.
 
@@ -26,7 +27,8 @@ fence previous writers, manage backups, and configure mount ordering.
 The [Linux mount primitive](MOUNTS.md) pins approved directories through path
 renames and stages stable binds for Docker. Its separate real Linux suite runs
 with `bash tools/test.sh supervisor --linux-mounts`. Add the driver suite with
-`bash tools/test.sh supervisor --linux-driver`; neither establishes EBS recovery.
+`--linux-driver`, or the complete process-restart suite with `--linux-host`;
+none establishes EBS recovery.
 
 ## Reticle runtime
 

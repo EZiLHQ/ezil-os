@@ -11,6 +11,8 @@ const hostImage = docker(['image', 'inspect', base, '--format', '{{.Id}}']).trim
 const root = `/run/ezil-driver-test-${randomUUID()}`;
 const name = `ezil-driver-test-${randomUUID()}`;
 const code = fileURLToPath(new URL('..', import.meta.url));
+const host = process.argv[2] === '--host';
+if (process.argv.length > 3 || (process.argv[2] && !host)) throw new Error('invalid_acceptance_arguments');
 const fixture = mkdtempSync(join(tmpdir(), 'ezil-driver-fixture-'));
 let image = process.env.EZIL_TEST_RETICLE_IMAGE;
 try {
@@ -45,7 +47,7 @@ server.listen(Number(process.env.PORT),'0.0.0.0');`);
         '--mount', `type=bind,src=${code},dst=/code,readonly`,
         '--env', `EZIL_TEST_ROOT=${root}`, '--env', `EZIL_TEST_IMAGE=${image}`,
         '--env', `EZIL_TEST_RETICLE=${process.env.EZIL_TEST_RETICLE_IMAGE ? '1' : '0'}`,
-        '--entrypoint', 'node', hostImage, '/code/test/driver.linux.mjs']);
+        '--entrypoint', 'node', hostImage, host ? '/code/test/host.linux.mjs' : '/code/test/driver.linux.mjs']);
     process.stdout.write(output);
 } finally {
     docker(['rm', '-f', name]);

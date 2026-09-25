@@ -2,7 +2,7 @@ import { constants } from 'node:fs';
 import { mkdir, open, readdir, type FileHandle } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { ControlCommandSchema, intentDigest, type ExecutionPlan } from './control-protocol.js';
+import { ControlCommandSchema, intentDigest, type ExecutionPlan, type ReconcileCommand } from './control-protocol.js';
 import type { StoredIntent } from './control-store.js';
 import type { ComputerDriver } from './control-server.js';
 import { admitMountedDataVolume, type VolumeIdentity } from './data-volume.js';
@@ -14,7 +14,8 @@ const label = (key: string) => `org.ezil.computer.${key}`;
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 type Options = { computerId: string; computerGeneration: number; volume: VolumeIdentity;
     dataRoot: string; stagingRoot: string; memoryBudgetMiB: number; docker?: Docker;
-    approvePlan(plan: ExecutionPlan): boolean };
+    approvePlan(plan: ExecutionPlan, installationId: string): boolean;
+    reserveDeadline(command: ReconcileCommand, proposed: number): number };
 
 async function privateDirectory(root: FileHandle, installationId: string, name: string): Promise<FileHandle> {
     let parent = root;
@@ -174,8 +175,8 @@ export class DockerComputerDriver implements ComputerDriver {
                 [label('installation')]: installationId },
         })).Id;
     }
-    private async admit(plan: ExecutionPlan): Promise<string> {
-        if (!this.options.approvePlan(plan)) throw new Error('execution_plan_not_approved');
+    private async admit(plan: ExecutionPlan, installationId: string): Promise<string> {
+        if (!this.options.approvePlan(plan, installationId)) throw new Error('execution_plan_not_approved');
         if (plan.services.length !== 1 || plan.services[0]!.dependsOn.length) throw new Error('unsupported_service_layout');
         const admission = await admitMountedDataVolume(this.options.dataRoot, this.options.volume);
         if (!admission.ok) throw new Error(admission.code);
@@ -227,20 +228,26 @@ export class DockerComputerDriver implements ComputerDriver {
             if (!isCurrent()) return 'unknown';
             if (intent.desired === 'stopped') { await this.remove(intent.installationId); return 'stopped'; }
             const plan = command.plan;
-            const current = () => isCurrent() && this.options.approvePlan(plan);
-            const image = await this.admit(plan);
+            const current = () => isCurrent() && this.options.approvePlan(plan, intent.installationId);
+            const image = await this.admit(plan, intent.installationId);
             if (!current()) return 'unknown';
             const existing = (await this.containers(true)).filter(item => this.owns(item, intent.installationId));
             const same = existing.length === 1 && existing[0]!.Config.Labels[label('intent')] === intentDigest(command);
+            const observedExpiry = same ? Number(existing[0]!.Config.Labels[label('expires')]) : undefined;
+            if (observedExpiry !== undefined && (!Number.isSafeInteger(observedExpiry) || observedExpiry <= 0)) {
+                await this.stop(existing[0]!);
+                throw new Error('runtime_deadline_invalid');
+            }
+            const expires = this.options.reserveDeadline(command,
+                Math.min(observedExpiry ?? Infinity, Date.now() + plan.resources.maxRuntimeSeconds * 1000));
+            if (!Number.isSafeInteger(expires) || expires <= Date.now()) {
+                for (const container of existing) await this.stop(container);
+                throw new Error('runtime_deadline_reached');
+            }
             if (same) {
-                const expiry = Number(existing[0]!.Config.Labels[label('expires')]);
-                if (!Number.isSafeInteger(expiry) || expiry <= Date.now()) {
-                    await this.stop(existing[0]!);
-                    throw new Error('runtime_deadline_reached');
-                }
                 // A process restart reattaches to an already running container;
                 // a stopped container is recreated, never restarted via old FDs.
-                if (existing[0]!.State.Running && existing[0]!.Image === image && current()) {
+                if (existing[0]!.State.Running && existing[0]!.Image === image && observedExpiry === expires && current()) {
                     try {
                         let token: string | undefined;
                         const process = plan.services[0]!.process;
@@ -254,7 +261,7 @@ export class DockerComputerDriver implements ComputerDriver {
                             token = `${mount.Source}/pairing-token`;
                         }
                         await this.route(existing[0]!, plan, current);
-                        await this.health(plan, token, () => current() && Date.now() < expiry);
+                        await this.health(plan, token, () => current() && Date.now() < expires);
                         return 'running';
                     } catch {
                         await this.remove(intent.installationId);
@@ -312,7 +319,6 @@ export class DockerComputerDriver implements ComputerDriver {
                     entrypoint = ['/usr/local/bin/node', '/opt/ezil/reticle-adapter.js'];
                 } else entrypoint = ['/usr/local/bin/node', `/opt/app/${service.process.entrypoint}`, ...service.process.args];
                 const port = `${service.internalPort}/tcp`;
-                const expires = Date.now() + plan.resources.maxRuntimeSeconds * 1000;
                 const created = await this.docker.call<{ Id: string }>('POST', `/containers/create?name=${this.names(intent.installationId).container}`, {
                     Image: image, User: '1000:1000', Entrypoint: entrypoint, Cmd: [], WorkingDir: workingDir, Env: env,
                     Healthcheck: { Test: ['NONE'] }, StopTimeout: 10, ExposedPorts: { [port]: {} },
@@ -355,6 +361,38 @@ export class DockerComputerDriver implements ComputerDriver {
                     await this.stop(container);
                 }
             }
+        });
+    }
+    /** Recovery may stop unapproved/unknown intent; it never starts containers
+     * or reconnects a browser route. Fresh signed control is required for that. */
+    recover(intents: StoredIntent[]): Promise<void> {
+        return this.serial(async () => {
+            const mounted = await admitMountedDataVolume(this.options.dataRoot, this.options.volume);
+            for (const container of await this.containers()) {
+                const id = container.Config.Labels[label('installation')]!;
+                const intent = intents.find(item => item.installationId === id);
+                const expires = Number(container.Config.Labels[label('expires')]);
+                const authorized = mounted.ok && intent && intent.desired === 'running'
+                    && intentDigest(intent.command) === container.Config.Labels[label('intent')]
+                    && this.options.approvePlan(intent.command.plan, id)
+                    && Number.isSafeInteger(expires) && expires > 0;
+                if (!authorized || this.options.reserveDeadline(intent.command, expires) !== expires || expires <= Date.now()) {
+                    await this.closeProxy(id);
+                    await this.stop(container);
+                }
+            }
+        });
+    }
+    /** Host shutdown retains data, images and deadline records. Report success
+     * only after Docker confirms every owned container stopped. */
+    stopAll(): Promise<void> {
+        return this.serial(async () => {
+            let failed = false;
+            for (const id of this.proxies.keys()) await this.closeProxy(id);
+            for (const container of await this.containers()) {
+                try { await this.stop(container); } catch { failed = true; }
+            }
+            if (failed) throw new Error('host_shutdown_unconfirmed');
         });
     }
 }
