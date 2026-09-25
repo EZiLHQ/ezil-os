@@ -21,6 +21,8 @@
         "test:db:runtime-api": "bun --no-env-file tests/app-runtime-api-db.ts",
         "test:db:runtime-dispatcher": "bun --no-env-file tests/app-runtime-dispatcher-db.ts",
         "test:db:computer-configurations": "bun --no-env-file tests/computer-configurations-db.ts",
+        "test:db:configuration-producer": "bun --no-env-file tests/computer-configuration-producer-db.ts",
+        "test:host:configuration": "bun --no-env-file tests/configuration-host-acceptance.ts",
         "db:generate": "drizzle-kit generate",
         "db:migrate": "drizzle-kit migrate",
         "db:push": "drizzle-kit push",

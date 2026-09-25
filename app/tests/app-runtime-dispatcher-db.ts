@@ -64,6 +64,7 @@ try {
     const history = new Map<string, HostCommand>(), observations = new Map<string, HostObservation>();
     let calls = 0;
     const options: RuntimeDispatcherOptions = { database, enabled: true, osAccessMode: 'invite', resolveHost: async scope => ({ scope,
+        configuration: async () => { throw new Error('runtime dispatch must not request configuration'); },
         observe: async id => { calls++; return observations.get(id) ?? null; },
         reconcile: async command => { calls++; history.set(command.installationId, command); },
     }) };

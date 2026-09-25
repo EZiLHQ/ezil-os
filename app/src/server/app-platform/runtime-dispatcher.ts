@@ -1,9 +1,10 @@
 import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { db } from '@/server/db';
-import { appAuditEvents, appFolderGrants, appGrants, appInstallations, appJobs, appOutbox, appPortLeases,
-    appPublishers, appReleases, appRuntimeCommands, apps, appServices, computerInstances, computerLifecycleJobs,
-    computerRuntimes, computers, osAccess } from '@/server/db/schema';
-import { compileRuntimePlan, RuntimePlanError, sameRuntimePlan, type RuntimePlan } from './runtime-plan';
+import { appAuditEvents, appInstallations, appJobs, appOutbox,
+    appRuntimeCommands, computerInstances, computerLifecycleJobs,
+    computerRuntimes, computers } from '@/server/db/schema';
+import { sameRuntimePlan, type RuntimePlan } from './runtime-plan';
+import { currentStartPlan } from './runtime-authority';
 import { HostControlError, hostIntentDigest, type HostCommand, type HostControlClient, type HostScope } from './host-control-client';
 
 type Database = typeof db;
@@ -51,50 +52,6 @@ export async function claimRuntimeCommand(database: Database): Promise<RuntimeCl
 }
 const ownsLease = (claim: RuntimeClaim) => and(eq(appOutbox.id, claim.id), eq(appOutbox.jobId, claim.jobId),
     eq(appOutbox.attempts, claim.attempt), isNull(appOutbox.deliveredAt), sql`${appOutbox.leaseUntil} > clock_timestamp()`);
-const selectedProject = (command: Command): string | undefined => {
-    const grants = command.plan.projectGrants;
-    return Array.isArray(grants) && grants.length === 1 && typeof grants[0]?.projectId === 'string' ? grants[0].projectId : undefined;
-};
-async function currentStartPlan(tx: Transaction, command: Command, installation: typeof appInstallations.$inferSelect,
-    owner: string, mode: RuntimeDispatcherOptions['osAccessMode']): Promise<RuntimePlan | null> {
-    if (installation.status !== 'installed' || installation.uninstalledAt || installation.releaseId !== command.releaseId
-        || installation.authGeneration !== command.authGeneration) return null;
-    // Supabase owns these columns; read without changing the migration model.
-    // Hold identity/ban and authorization rows through the bounded delivery.
-    const users = await tx.execute<{ email: string | null }>(sql`SELECT email FROM auth.users WHERE id=${owner}
-        AND deleted_at IS NULL AND (banned_until IS NULL OR banned_until <= clock_timestamp()) FOR SHARE`);
-    const user = users[0];
-    if (!user) return null;
-    if (mode === 'invite') {
-        if (!user.email) return null;
-        const [access] = await tx.select().from(osAccess).where(eq(osAccess.email, user.email.trim().toLowerCase())).limit(1).for('share');
-        if (!access || access.revokedAt) return null;
-    }
-    const [app] = await tx.select().from(apps).where(eq(apps.id, command.appId)).limit(1).for('share');
-    if (!app) return null;
-    const [publisher] = await tx.select().from(appPublishers)
-        .where(and(eq(appPublishers.id, app.publisherId), eq(appPublishers.status, 'active'))).limit(1).for('share');
-    if (!publisher) return null;
-    if (app.visibility === 'grant-only') {
-        const [grant] = await tx.select().from(appGrants).where(and(eq(appGrants.appId, app.id),
-            eq(appGrants.userId, owner), isNull(appGrants.revokedAt))).limit(1).for('share');
-        if (!grant) return null;
-    }
-    const [release] = await tx.select().from(appReleases).where(and(eq(appReleases.id, command.releaseId),
-        eq(appReleases.appId, app.id), eq(appReleases.status, 'approved'))).limit(1).for('share');
-    if (!release) return null;
-    const services = await tx.select().from(appServices).where(and(eq(appServices.installationId, installation.id),
-        eq(appServices.computerId, command.computerId))).for('share');
-    const leases = await tx.select().from(appPortLeases).where(and(eq(appPortLeases.installationId, installation.id),
-        eq(appPortLeases.computerId, command.computerId), isNull(appPortLeases.releasedAt))).for('share');
-    const grants = await tx.select().from(appFolderGrants).where(and(eq(appFolderGrants.installationId, installation.id),
-        eq(appFolderGrants.computerId, command.computerId), eq(appFolderGrants.grantedBy, owner), isNull(appFolderGrants.revokedAt))).for('share');
-    try {
-        const plan = compileRuntimePlan({ installationId: installation.id, app, release, services, leases, grants,
-            projectId: selectedProject(command) });
-        return sameRuntimePlan(plan, command.plan) ? plan : null;
-    } catch (error) { if (error instanceof RuntimePlanError) return null; throw error; }
-}
 
 /** Cancellation alone would strand a runtime if a previous HTTP reply was
  * lost. Queue a Stop for current Start intent without forging a user receipt. */
