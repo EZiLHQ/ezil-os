@@ -2,7 +2,8 @@ import type { Instance, Volume, Tag, RunInstancesRequest } from '@aws-sdk/client
 import { z } from 'zod';
 import { EnvelopeSchema, SettingsSchema, equal, phases, token, tagsFor, tagList, initialVolumeTags, writerProfile,
     type Phase, type Action, type Settings } from './contract.js';
-import { parseLifecycleWork, type LifecycleIntent, type LifecycleReceipt } from './intent.js';
+import type { LifecycleReceipt } from './intent.js';
+import { parseComputerLifecycleWork, observeRecoveryWriters, type ComputerLifecycleIntent, type FencedWriters } from './computer-recovery.js';
 import { awsDependencies, type Dependencies } from './aws.js';
 const eventSchema=z.object({executionArn:z.string().max(300),phase:z.enum(phases)}).strict();
 export const tagged=(actual:Tag[]|undefined,expected:Record<string,string>)=>Object.entries(expected).every(([k,v])=>
@@ -26,37 +27,49 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
             ||execution.stateMachineAliasArn||execution.redriveCount!==0||execution.status!=='RUNNING'||!execution.input
             ||Buffer.byteLength(execution.input)>20000||!execution.startDate)return fail();
         const envelope=EnvelopeSchema.parse(JSON.parse(execution.input));
-        const work={...envelope,createdAt:execution.startDate},i=parseLifecycleWork(work);
+        const work={...envelope,createdAt:execution.startDate},i=parseComputerLifecycleWork(work);
+        if(envelope.schemaVersion!==i.schemaVersion)return fail('lifecycle_invalid');
         const {instanceProfileArn,...pins}=i.deployment;
         if(!equal(pins,d)||instanceProfileArn!==writerProfile(settings,i)||execution.name!==`computer-${i.jobId}`
             ||event.executionArn!==machine.replace(':stateMachine:',':execution:')+`:computer-${i.jobId}`)return fail('lifecycle_invalid');
         const now=deps.now(),started=execution.startDate.getTime();
         if(!Number.isFinite(started)||started>now+30000||now-started>900000)return fail('lifecycle_expired');
-        if(!await deps.authority(i,envelope.digest))return fail('lifecycle_authority_denied');
+        const authority=async():Promise<FencedWriters|true>=>{
+            if(i.schemaVersion===1){if(!await deps.authority(i,envelope.digest))return fail('lifecycle_authority_denied');return true;}
+            const result=await deps.recoveryAuthority?.(i,envelope.digest);
+            if(!result)return fail('lifecycle_authority_denied');
+            return result.writers;
+        };
+        const approvedWriters=await authority();
+        if(i.schemaVersion===2){
+            if(approvedWriters===true)return fail('lifecycle_authority_denied');
+            await observeRecoveryWriters(i,approvedWriters,started,deps);
+        }
         const action=async(name:Action,parameters:object)=>{
             // Reads can consume time. Recheck authority immediately before
             // returning a mutation and leave its 30-second task window intact.
-            if(!await deps.authority(i,envelope.digest))return fail('lifecycle_authority_denied');
+            if(!equal(await authority(),approvedWriters))return fail('lifecycle_authority_denied');
             if(deps.now()-started>870000)return fail('lifecycle_expired');
             return {decision:name,parameters};
         };
-        const tags=tagsFor(i),phase=event.phase,newInstance=['provision','replace'].includes(i.operation);
-        const volumes=await deps.volumes(i.dataVolumeId?[i.dataVolumeId]:{token:token(envelope.digest,'volume')});
+        const tags=tagsFor(i),phase=event.phase,newInstance=['provision','replace','recover'].includes(i.operation);
+        const volumes=await deps.volumes(i.dataVolumeId?[i.dataVolumeId]:{token:token(envelope.digest,'volume',i.schemaVersion)});
         if(volumes.length>1)return fail('lifecycle_volume_ambiguous');
         const v=volumes[0];
         if(!v){
             if(i.operation!=='provision'||!['initial','volume'].includes(phase))return fail();
             return action('createVolume',{AvailabilityZone:d.availabilityZone,Size:50,VolumeType:'gp3',Iops:3000,Throughput:125,
-                Encrypted:true,KmsKeyId:d.dataKeyArn,ClientToken:token(envelope.digest,'volume'),
+                Encrypted:true,KmsKeyId:d.dataKeyArn,ClientToken:token(envelope.digest,'volume',i.schemaVersion),
                 TagSpecifications:[{ResourceType:'volume',Tags:tagList(initialVolumeTags(i,envelope.digest))}]});
         }
         if(!volumeId(v.VolumeId)||v.VolumeType!=='gp3'||v.Size!==50||v.Encrypted!==true||v.KmsKeyId!==d.dataKeyArn
             ||v.AvailabilityZone!==d.availabilityZone||v.MultiAttachEnabled!==false||!Array.isArray(v.Attachments))return fail('lifecycle_volume_invalid');
-        const previousTags=i.operation==='replace'?tagsFor(i,i.previousGeneration!,i.previousFenceToken!):tags;
-        if(!tagged(v.Tags,tags)&&!(i.operation==='replace'&&tagged(v.Tags,previousTags)))return fail('lifecycle_volume_invalid');
+        const previousTags=i.schemaVersion===2?tagsFor(i,i.dataScope.generation,i.dataScope.fenceToken)
+            :i.operation==='replace'?tagsFor(i,i.previousGeneration!,i.previousFenceToken!):tags;
+        if(!tagged(v.Tags,tags)&&!(['replace','recover'].includes(i.operation)&&tagged(v.Tags,previousTags)))return fail('lifecycle_volume_invalid');
         if(i.dataVolumeId&&v.VolumeId!==i.dataVolumeId)return fail();
         if(i.operation==='provision'&&!tagged(v.Tags,initialVolumeTags(i,envelope.digest)))return fail();
-        const sourceId=i.previousInstanceId??i.providerInstanceId;
+        const sourceId=i.schemaVersion===1?i.previousInstanceId??i.providerInstanceId:null;
         const source=sourceId?await getInstance(sourceId,previousTags,i,deps):undefined;
         if(source&&['stop','retire','replace'].includes(i.operation)){
             const status=source.State?.Name;
@@ -88,10 +101,10 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         if(v.State==='creating')return wait(phase);
         let target=source;
         if(newInstance){
-            const found=await deps.instances({token:token(envelope.digest,'instance')});
+            const found=await deps.instances({token:token(envelope.digest,'instance',i.schemaVersion)});
             if(found.length>1)return fail('lifecycle_instance_ambiguous');
             target=found[0]?.instance;
-            if(target){if(found[0]?.owner!==d.accountId||target.ClientToken!==token(envelope.digest,'instance'))return fail();assertIdentity(target,tags,i);}
+            if(target){if(approvedWriters!==true&&approvedWriters.some(w=>w.instanceId===target!.InstanceId))return fail();if(found[0]?.owner!==d.accountId||target.ClientToken!==token(envelope.digest,'instance',i.schemaVersion))return fail();assertIdentity(target,tags,i);}
             if(!target){
                 if(v.State!=='available'||v.Attachments.length)return fail();
                 return action('runInstances',await launchParameters(i,envelope.digest,deps));
@@ -128,14 +141,14 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         return action('startInstances',{InstanceIds:[targetId]});
     };
 }
-function success(i:LifecycleIntent,digest:string,instanceId:string,volumeId:string,state:LifecycleReceipt['state']){
-    return {decision:'success',receipt:{schemaVersion:1,jobId:i.jobId,digest,computerId:i.computerId,
-        generation:i.targetGeneration,fenceToken:i.fenceToken,instanceId,volumeId,state} satisfies LifecycleReceipt};
+function success(i:ComputerLifecycleIntent,digest:string,instanceId:string,volumeId:string,state:LifecycleReceipt['state']){
+    return {decision:'success',receipt:{schemaVersion:i.schemaVersion,jobId:i.jobId,digest,computerId:i.computerId,
+        generation:i.targetGeneration,fenceToken:i.fenceToken,instanceId,volumeId,state}};
 }
-function assertIdentity(instance:Instance,tags:Record<string,string>,i:LifecycleIntent){
+function assertIdentity(instance:Instance,tags:Record<string,string>,i:ComputerLifecycleIntent){
     if(!instanceId(instance.InstanceId)||!tagged(instance.Tags,tags)||instance.Placement?.AvailabilityZone!==i.deployment.availabilityZone)return fail('lifecycle_instance_invalid');
 }
-async function getInstance(id:string,tags:Record<string,string>,i:LifecycleIntent,deps:Dependencies){
+async function getInstance(id:string,tags:Record<string,string>,i:ComputerLifecycleIntent,deps:Dependencies){
     const rows=await deps.instances([id]);if(rows.length!==1||rows[0]?.owner!==i.deployment.accountId||rows[0].instance.InstanceId!==id)return fail();
     assertIdentity(rows[0].instance,tags,i);return rows[0].instance;
 }
@@ -144,13 +157,13 @@ function assertAttached(instance:Instance,v:Volume,id:string){
     if(v.State!=='in-use'||m?.length!==1||m[0]?.DeviceName!=='/dev/sdf'||m[0]?.Ebs?.Status!=='attached'||m[0]?.Ebs?.DeleteOnTermination!==false
         ||v.Attachments?.length!==1||a?.InstanceId!==id||a.VolumeId!==v.VolumeId||a.State!=='attached'||a.Device!=='/dev/sdf'||a.DeleteOnTermination!==false)return fail('lifecycle_attachment_invalid');
 }
-function assertEffectiveInstance(v:Instance,i:LifecycleIntent){
+function assertEffectiveInstance(v:Instance,i:ComputerLifecycleIntent){
     const d=i.deployment;
     if(v.ImageId!==d.amiId||v.InstanceType!=='m7i.large'||v.Architecture!=='x86_64'||v.RootDeviceType!=='ebs'||v.SubnetId!==d.subnetId
         ||v.IamInstanceProfile?.Arn!==d.instanceProfileArn||v.SecurityGroups?.length!==1||v.SecurityGroups[0]?.GroupId!==d.securityGroupId
         ||v.MetadataOptions?.HttpTokens!=='required'||v.MetadataOptions.HttpPutResponseHopLimit!==1)return fail('lifecycle_instance_invalid');
 }
-async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencies):Promise<RunInstancesRequest>{
+async function launchParameters(i:ComputerLifecycleIntent,digest:string,deps:Dependencies):Promise<RunInstancesRequest>{
     const d=i.deployment;
     const [image,template]=await Promise.all([deps.image(d.amiId),deps.template(d.launchTemplateId,d.launchTemplateVersion)]);
     const t=template?.LaunchTemplateData;
@@ -164,7 +177,7 @@ async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencie
         ||!equal(t.SecurityGroupIds,[d.securityGroupId])
         ||t.BlockDeviceMappings?.length!==1||t.BlockDeviceMappings[0]?.DeviceName!=='/dev/xvda')return fail('lifecycle_launch_invalid');
     return {LaunchTemplate:{LaunchTemplateId:d.launchTemplateId,Version:d.launchTemplateVersion},ImageId:d.amiId,
-        InstanceType:'m7i.large',MinCount:1,MaxCount:1,ClientToken:token(digest,'instance'),
+        InstanceType:'m7i.large',MinCount:1,MaxCount:1,ClientToken:token(digest,'instance',i.schemaVersion),
         SubnetId:d.subnetId,SecurityGroupIds:[d.securityGroupId],IamInstanceProfile:{Arn:d.instanceProfileArn},
         Placement:{AvailabilityZone:d.availabilityZone},MetadataOptions:{HttpEndpoint:'enabled',HttpTokens:'required',HttpPutResponseHopLimit:1,InstanceMetadataTags:'enabled'},
         EbsOptimized:true,Monitoring:{Enabled:false},BlockDeviceMappings:[{DeviceName:'/dev/xvda',Ebs:{VolumeType:'gp3',VolumeSize:30,Encrypted:true,KmsKeyId:d.dataKeyArn,DeleteOnTermination:true}}],

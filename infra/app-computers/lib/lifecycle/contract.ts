@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { LifecycleDeploymentSchema, type LifecycleIntent } from './intent.js';
+import { LifecycleDeploymentSchema } from './intent.js';
+import type { ComputerLifecycleIntent } from './computer-recovery.js';
 
 // Infrastructure pins are shared by the workflow. A per-writer profile is
 // derived from computer/generation; adding a computer never redeploys this graph.
@@ -16,20 +17,20 @@ export const SettingsSchema = z.object({ deployment: infrastructure, writerRoleP
     }
 });
 export type Settings = z.infer<typeof SettingsSchema>;
-export const writerProfile=(settings:Settings,i:LifecycleIntent)=>`arn:aws:iam::${settings.deployment.accountId}:instance-profile/${settings.writerRolePathPrefix}/${i.computerId}/g${i.targetGeneration}`;
+export const writerProfile=(settings:Settings,i:ComputerLifecycleIntent)=>`arn:aws:iam::${settings.deployment.accountId}:instance-profile/${settings.writerRolePathPrefix}/${i.computerId}/g${i.targetGeneration}`;
 export const canonical = (v: unknown): string => JSON.stringify(v, (_key,value:unknown) => value && typeof value==='object' && !Array.isArray(value)
     ? Object.fromEntries(Object.entries(value).sort(([a],[b])=>a<b?-1:a>b?1:0)) : value);
 export const equal = (a:unknown,b:unknown) => canonical(a)===canonical(b);
-export const EnvelopeSchema = z.object({schemaVersion:z.literal(1),document:z.string().max(16384),digest:z.string().regex(/^[a-f0-9]{64}$/)}).strict();
-export const token = (digest:string,kind:'volume'|'instance') => createHash('sha256').update(`ezil-lifecycle-v1\n${kind}\n${digest}`).digest('hex');
-export const tagsFor = (i:LifecycleIntent,generation=i.targetGeneration,fence=i.fenceToken) => ({
+export const EnvelopeSchema = z.object({schemaVersion:z.union([z.literal(1),z.literal(2)]),document:z.string().max(16384),digest:z.string().regex(/^[a-f0-9]{64}$/)}).strict();
+export const token = (digest:string,kind:'volume'|'instance',version:1|2=1) => createHash('sha256').update(`ezil-lifecycle-v${version}\n${kind}\n${digest}`).digest('hex');
+export const tagsFor = (i:ComputerLifecycleIntent,generation=i.targetGeneration,fence=i.fenceToken) => ({
     'ezil:managed-by':'app-computer-platform','ezil:stage':i.deployment.namespace,
     'ezil:computer-id':i.computerId,'ezil:generation':String(generation),'ezil:fence-token':fence,
 });
 export const tagList = (tags:Record<string,string>) => Object.entries(tags).map(([Key,Value])=>({Key,Value}));
-export const initialVolumeTags = (i:LifecycleIntent,digest:string) => ({...tagsFor(i),'ezil:allocation':token(digest,'volume')});
+export const initialVolumeTags = (i:ComputerLifecycleIntent,digest:string) => ({...tagsFor(i),'ezil:allocation':token(digest,'volume',i.schemaVersion)});
 export const AUTHORITY_PATH='/api/internal/computers/lifecycle-authority';
-export const authorityFor=(i:LifecycleIntent,digest:string)=>({schemaVersion:1,computerId:i.computerId,jobId:i.jobId,digest});
+export const authorityFor=(i:ComputerLifecycleIntent,digest:string)=>({schemaVersion:i.schemaVersion,computerId:i.computerId,jobId:i.jobId,digest});
 export const phases=['initial','volume','stopped','terminated','instance','tagged','attached','preserved','started'] as const;
 export type Phase=typeof phases[number];
 export type Action='createVolume'|'runInstances'|'attachVolume'|'modifyInstanceAttribute'|'createTags'|'startInstances'|'stopInstances'|'terminateInstances';
