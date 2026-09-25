@@ -284,6 +284,9 @@ jobs:
       - name: Test authenticated marketplace and repository intake APIs
         working-directory: app
         run: bun run test:db:marketplace-api
+      - name: Test immutable runtime commands and concurrent revisions
+        working-directory: app
+        run: bun run test:db:runtime-commands
 
   connectors:
     name: sdk + mcp (typecheck + unit)

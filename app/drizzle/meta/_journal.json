@@ -36,6 +36,13 @@
       "when": 1790313635349,
       "tag": "0004_app_marketplace",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790337310846,
+      "tag": "0005_app_runtime_commands",
+      "breakpoints": true
     }
   ]
 }
