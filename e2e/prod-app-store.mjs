@@ -51,18 +51,46 @@ try {
         try {
             const page = await context.newPage();
             const errors = [];
+            const failedRequests = [];
             page.on('pageerror', error => errors.push(error.message));
+            page.on('response', response => {
+                if (response.status() >= 400) {
+                    const url = new URL(response.url());
+                    failedRequests.push(`${response.status()} ${url.pathname}`);
+                }
+            });
 
-            await page.goto(new URL('/login?returnUrl=%2Fos', app).toString(), { waitUntil: 'domcontentloaded' });
-            await page.locator('#email').fill(email);
-            await page.locator('#password').fill(password);
-            await page.locator('form').filter({ has: page.locator('#email') })
-                .locator('button[type="submit"]').click();
-            await page.waitForURL(url => !url.pathname.startsWith('/login'), { timeout: 60_000 });
-            await page.goto(new URL('/os', app).toString(), { waitUntil: 'domcontentloaded' });
+            try {
+                await page.goto(new URL('/login?returnUrl=%2Fos', app).toString(), { waitUntil: 'domcontentloaded' });
+                await page.locator('#email').fill(email);
+                await page.locator('#password').fill(password);
+                await page.locator('form').filter({ has: page.locator('#email') })
+                    .locator('button[type="submit"]').click();
+                await page.waitForURL(url => !url.pathname.startsWith('/login'), { timeout: 60_000 });
+                await page.goto(new URL('/os', app).toString(), { waitUntil: 'domcontentloaded' });
+
+                const dock = page.locator('.taskbar-item[data-app="app-store"]');
+                await dock.waitFor({ timeout: 45_000 });
+            } catch (error) {
+                // Keep public CI logs free of account content and URL query strings.
+                const state = await page.evaluate(() => ({
+                    path: location.pathname,
+                    shell: Boolean(document.querySelector('.taskbar')),
+                    dockItems: document.querySelectorAll('.taskbar-item').length,
+                    storeItems: document.querySelectorAll('.taskbar-item[data-app="app-store"]').length,
+                    loginForm: Boolean(document.querySelector('#email')),
+                    invitedPage: location.pathname.startsWith('/auth/invited'),
+                    title: document.title.slice(0, 80),
+                })).catch(() => null);
+                const safeErrors = errors.map(message => message
+                    .replace(/https?:\/\/[^\s)]+/g, '[url]')
+                    .replace(/[A-Za-z0-9_=-]{32,}/g, '[opaque]')
+                    .slice(0, 180));
+                console.error(`Production ${shape.name} boot state: ${JSON.stringify(state)}, page errors: ${JSON.stringify(safeErrors)}, failed requests: ${JSON.stringify(failedRequests.slice(0, 10))}`);
+                throw error;
+            }
 
             const dock = page.locator('.taskbar-item[data-app="app-store"]');
-            await dock.waitFor({ timeout: 45_000 });
             assert.equal(await page.locator('.window[data-app="desktop"]').count(), 0);
             await dock.click();
 

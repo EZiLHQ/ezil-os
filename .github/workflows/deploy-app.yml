@@ -4,6 +4,11 @@ name: Deploy App
 
 on:
   workflow_dispatch:
+    inputs:
+      verify_only:
+        description: 'Verify the currently served App Store without deploying (for manual recovery)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -22,6 +27,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with: { bun-version: latest }
       - name: Require the current main commit
+        if: ${{ !inputs.verify_only }}
         run: |
           set -euo pipefail
           test "${GITHUB_REF}" = 'refs/heads/main'
@@ -34,8 +40,10 @@ jobs:
           bun install --frozen-lockfile
           bun run typecheck
       - name: Install the pinned Vercel CLI
+        if: ${{ !inputs.verify_only }}
         run: npm install --global vercel@59
       - name: Verify the production target and record the previous deployment
+        if: ${{ !inputs.verify_only }}
         id: before
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
@@ -59,6 +67,7 @@ jobs:
           echo "sha=${previous_sha}" >> "${GITHUB_OUTPUT}"
           echo "Previous production deployment: ${previous_id}, bundle sha256 ${previous_sha}"
       - name: Deploy this commit to production
+        if: ${{ !inputs.verify_only }}
         id: deploy
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
