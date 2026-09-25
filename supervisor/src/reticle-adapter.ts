@@ -7,6 +7,17 @@ import { pathToFileURL } from 'node:url';
 const TOKEN = /^[A-Za-z0-9_-]{43}$/;
 const TOKEN_NAME = 'pairing-token';
 
+export function parseReticlePaths(projectPath?: string, privatePath?: string) {
+    if (projectPath === undefined && privatePath === undefined) {
+        return { project: '/project', privateData: '/data/reticle', mounts: ['/project', '/data'] };
+    }
+    const safe = (path: string | undefined, root: string): path is string => Boolean(path
+        && path.length <= 240 && path.startsWith(`/${root}/`) && path.split('/').slice(2).every(part =>
+            /^[a-zA-Z0-9._-]+$/.test(part) && part !== '.' && part !== '..'));
+    if (!safe(projectPath, 'workspace') || !safe(privatePath, 'data')) throw new Error('invalid_reticle_paths');
+    return { project: projectPath, privateData: privatePath, mounts: [projectPath, privatePath] };
+}
+
 export function parseReticleOrigins(value: string | undefined): string[] {
     let parsed: unknown;
     try { parsed = JSON.parse(value ?? ''); } catch { throw new Error('invalid_reticle_origins'); }
@@ -84,8 +95,8 @@ export async function prepareReticleProject(directory: string): Promise<void> {
     } catch { throw new Error('reticle_project_unavailable'); }
 }
 
-export function requireReticleMounts(mountInfo: string): void {
-    for (const point of ['/project', '/data']) {
+export function requireReticleMounts(mountInfo: string, points = ['/project', '/data']): void {
+    for (const point of points) {
         const matching = mountInfo.split('\n').filter((line) => line.split(' - ')[0]?.split(' ')[4] === point);
         if (matching.length !== 1) throw new Error('reticle_mount_required');
         const [mount, fs] = matching[0]!.split(' - ');
@@ -104,12 +115,13 @@ export async function runReticleAdapter(): Promise<void> {
     process.env.RETICLE_TELEMETRY = '0';
     process.env.DO_NOT_TRACK = '1';
     const origins = parseReticleOrigins(process.env.EZIL_RETICLE_ALLOWED_ORIGINS);
-    requireReticleMounts(await readFile('/proc/self/mountinfo', 'utf8'));
-    const token = await persistentReticleToken('/data/reticle');
-    const project = await lstat('/project');
+    const paths = parseReticlePaths(process.env.EZIL_RETICLE_PROJECT_PATH, process.env.EZIL_RETICLE_PRIVATE_PATH);
+    requireReticleMounts(await readFile('/proc/self/mountinfo', 'utf8'), paths.mounts);
+    const token = await persistentReticleToken(paths.privateData);
+    const project = await lstat(paths.project);
     if (!project.isDirectory() || project.isSymbolicLink()) throw new Error('invalid_project_mount');
-    await prepareReticleProject('/project');
-    process.chdir('/project');
+    await prepareReticleProject(paths.project);
+    process.chdir(paths.project);
     const packageJson = JSON.parse(await readFile('/opt/reticle/package.json', 'utf8')) as Record<string, unknown>;
     if (packageJson.name !== '@reticlehq/server' || packageJson.version !== '3.2.0') {
         throw new Error('unsupported_reticle_version');
@@ -118,7 +130,7 @@ export async function runReticleAdapter(): Promise<void> {
     const upstream = await import(modulePath) as { startDaemon(options: Record<string, unknown>): Promise<Daemon> };
     const daemon = await upstream.startDaemon({
         port: 4400, host: '0.0.0.0', token, allowedOrigins: origins,
-        reticleRoot: '/project/.reticle', pairingTokenDir: '/data/reticle',
+        reticleRoot: join(paths.project, '.reticle'), pairingTokenDir: paths.privateData,
     });
     let stopping = false;
     const stop = () => {
@@ -140,7 +152,7 @@ export async function runReticleAdapter(): Promise<void> {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
     void runReticleAdapter().catch((error: unknown) => {
         // Upstream errors may contain paths or request data; do not echo them.
-        const known = ['invalid_reticle_origins', 'reticle_mount_required', 'pairing_token_unavailable',
+        const known = ['invalid_reticle_origins', 'invalid_reticle_paths', 'reticle_mount_required', 'pairing_token_unavailable',
             'invalid_project_mount', 'reticle_project_unavailable', 'unsupported_reticle_version'];
         const code = error instanceof Error && known.includes(error.message) ? error.message : 'reticle_adapter_start_failed';
         process.stderr.write(`${code}\n`);

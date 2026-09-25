@@ -3,7 +3,21 @@ import test from 'node:test';
 import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { parseReticleOrigins, persistentReticleToken, prepareReticleProject, requireReticleMounts } from '../src/reticle-adapter.js';
+import { parseReticleOrigins, parseReticlePaths, persistentReticleToken, prepareReticleProject, requireReticleMounts } from '../src/reticle-adapter.js';
+
+test('uses explicitly approved mounts without broadening them to their parent directories', () => {
+    assert.deepEqual(parseReticlePaths('/workspace/projects', '/data/reticle'), {
+        project: '/workspace/projects', privateData: '/data/reticle', mounts: ['/workspace/projects', '/data/reticle'],
+    });
+    assert.deepEqual(parseReticlePaths().mounts, ['/project', '/data']);
+    for (const [project, data] of [['/workspace/../etc', '/data/state'], ['/workspace/projects', '/data'],
+        ['/workspace/projects', undefined], [undefined, '/data/reticle']]) {
+        assert.throws(() => parseReticlePaths(project, data), /invalid_reticle_paths/);
+    }
+    const parentMounts = '1 0 1:1 / /workspace rw - ext4 /dev/test rw\n2 0 1:1 / /data rw - ext4 /dev/test rw';
+    assert.throws(() => requireReticleMounts(parentMounts, parseReticlePaths('/workspace/projects', '/data/reticle').mounts),
+        /reticle_mount_required/);
+});
 
 test('initializes only the selected project state and refuses escaping state links', async () => {
     const root = await mkdtemp(join(tmpdir(), 'ezil-reticle-project-'));
