@@ -8,6 +8,7 @@ import { lifecycleDeployment as deployment } from './fixtures/lifecycle';
 import { createLifecycleAuthorityHandler } from '../src/server/app-platform/lifecycle-authority-http';
 import { LIFECYCLE_AUTHORITY_PATH, lifecycleAuthoritySignature } from '../src/server/app-platform/lifecycle-authority-protocol';
 import { runtimeTestDatabase } from './helpers/runtime-database';
+import type { LifecycleRecoveryReceipt } from '../src/server/app-platform/lifecycle-recovery-protocol';
 const fixture=await runtimeTestDatabase(), {sql}=fixture;
 const options: LifecycleConsumerOptions={ database:drizzle(sql,{schema}), enabled:true, osAccessMode:'invite', deployments:[deployment], advance:async()=>({state:'pending'}) };
 let passed=0;
@@ -50,6 +51,14 @@ const observed=(work:LifecycleWork)=>{
         fenceToken:i.fenceToken,instanceId:i.providerInstanceId??handle('i'),volumeId:i.dataVolumeId??handle('vol'),
         state:i.operation==='stop'?'stopped':i.operation==='retire'?'retired':'running'};
     return {state:'observed' as const,receipt,observedAt:new Date()};
+};
+const recovered=(work:LifecycleWork)=>{
+    const i=parseLifecycleWork(work),version=i.deployment.stateMachineVersionArn;
+    const receipt:LifecycleRecoveryReceipt={schemaVersion:1,sourceExecutionArn:version.slice(0,version.lastIndexOf(':')).replace(':stateMachine:',':execution:')+`:computer-${i.jobId}`,
+        jobId:i.jobId,digest:work.digest,computerId:i.computerId,state:'fenced',volumeId:i.dataVolumeId??handle('vol'),
+        instances:[...(i.previousInstanceId?[{instanceId:i.previousInstanceId,generation:i.previousGeneration!,fenceToken:i.previousFenceToken!,state:'terminated' as const}]:[]),
+            {instanceId:i.providerInstanceId??handle('i'),generation:i.targetGeneration,fenceToken:i.fenceToken,state:'terminated'}]};
+    return {state:'fenced' as const,receipt,observedAt:new Date()};
 };
 async function releaseFixtures() {
     // Tests do not claim these SQL writes prove a real stop; they isolate the
@@ -177,6 +186,55 @@ try {
         const s=await setup('retire'),c=await claim(s);assert.equal(await dispatchLifecycleClaim({...options,advance:async work=>observed(work)},c),'succeeded');
         const [r]=await sql`SELECT r.data_volume_id,i.fenced_at FROM ezil_computer_runtimes r JOIN ezil_computer_instances i ON i.computer_id=r.computer_id WHERE r.computer_id=${s.computerId}`;
         assert.equal(r!.data_volume_id,s.volume);assert.ok(r!.fenced_at);
+    });
+    await test('verified cleanup atomically fences writers and retains disk ownership without installation',async()=>{
+        for(const operation of ['provision','start','replace'] as const){
+            await releaseFixtures();const s=await setup(operation),c=await claim(s);let receipt:LifecycleRecoveryReceipt|undefined;
+            assert.equal(await dispatchLifecycleClaim({...options,advance:async work=>{const result=recovered(work);receipt=result.receipt;return result;}},c),'failed');
+            const rows=await sql`SELECT provider_instance_id,fenced_at,observed_state FROM ezil_computer_instances WHERE computer_id=${s.computerId}`;
+            assert.equal(rows.length,receipt!.instances.length);assert.ok(rows.every(r=>r.fenced_at&&r.observed_state==='stopped'));
+            assert.equal((await sql`SELECT data_volume_id FROM ezil_computer_runtimes WHERE computer_id=${s.computerId}`)[0]!.data_volume_id,receipt!.volumeId);
+            assert.equal((await state(s)).status,'failed');assert.equal((await state(s)).error_code,'lifecycle_recovered');assert.ok((await state(s)).delivered_at);
+            assert.equal((await sql`SELECT count(*)::int n FROM ezil_app_installations WHERE computer_id=${s.computerId}`)[0]!.n,0);
+        }
+    });
+    await test('cleanup after access revocation settles historical effects without restoring launch authority',async()=>{
+        await releaseFixtures();const s=await setup(),c=await claim(s);
+        assert.equal(await dispatchLifecycleClaim({...options,advance:async work=>{
+            await sql`UPDATE ezil_os_access SET revoked_at=now() WHERE email=${s.email}`;return recovered(work);
+        }},c),'failed');assert.equal((await state(s)).status,'failed');
+    });
+    await test('stale and foreign cleanup receipts cannot free a writer slot',async()=>{
+        for(const kind of ['scope','old-observation','lease']){
+            await releaseFixtures();const s=await setup(),c=await claim(s);
+            const result=dispatchLifecycleClaim({...options,advance:async work=>{
+                const result=recovered(work);
+                if(kind==='scope')result.receipt.computerId=randomUUID();
+                if(kind==='old-observation')result.observedAt=new Date(0);
+                if(kind==='lease'){
+                    await sql`UPDATE ezil_computer_lifecycle_outbox SET lease_until=now()-interval '1 second',available_at=now() WHERE job_id=${s.jobId}`;
+                    await claimLifecycleWork(options);
+                }
+                return result;
+            }},c);
+            if(kind==='scope')await assert.rejects(result);else assert.equal(await result,kind==='lease'?'stale':'waiting');
+            assert.equal((await state(s)).status,'running');assert.equal((await state(s)).delivered_at,null);
+            assert.equal((await sql`SELECT fenced_at FROM ezil_computer_instances WHERE computer_id=${s.computerId}`)[0]!.fenced_at,null);
+        }
+    });
+    await test('cleanup returns a pilot slot only after independent fencing evidence arrives',async()=>{
+        await releaseFixtures();const a=await setup(),b=await setup(),c=await setup();
+        await sql`UPDATE ezil_computer_lifecycle_jobs SET status='running' WHERE id IN (${a.jobId},${b.jobId})`;
+        const first=await claim(c);let calls=0;
+        assert.equal(await dispatchLifecycleClaim({...options,advance:async()=>{calls++;return {state:'pending'}}},first),'waiting');assert.equal(calls,0);
+        assert.equal(await dispatchLifecycleClaim({...options,advance:async work=>recovered(work)},await claim(a)),'failed');
+        assert.equal(await dispatchLifecycleClaim({...options,advance:async()=>{calls++;return {state:'pending'}}},await claim(c)),'waiting');assert.equal(calls,1);
+    });
+    await test('data-only failed provisioning retains its disk even when no instance was allocated',async()=>{
+        await releaseFixtures();const s=await setup('provision');let volume:string|null=null;
+        assert.equal(await dispatchLifecycleClaim({...options,advance:async work=>{const result=recovered(work);result.receipt.instances=[];volume=result.receipt.volumeId;return result;}},await claim(s)),'failed');
+        assert.equal((await sql`SELECT data_volume_id FROM ezil_computer_runtimes WHERE computer_id=${s.computerId}`)[0]!.data_volume_id,volume);
+        assert.equal((await sql`SELECT count(*)::int n FROM ezil_computer_instances WHERE computer_id=${s.computerId}`)[0]!.n,0);
     });
     console.log(`${passed} lifecycle consumer database checks passed; 0 failed`);
 } finally {await fixture.close();}
