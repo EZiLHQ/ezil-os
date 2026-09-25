@@ -71,10 +71,18 @@ system, which is out of scope for a docs-only pass.
     [`app/drizzle/0002_os_access.sql`](../app/drizzle/0002_os_access.sql) must
     be applied to the **hosted** database before the access-gate code that
     reads `ezil_os_access` is deployed — the same rule
-    `0001_telemetry.sql` above was applied under. It has been generated and
-    proven against a throwaway Postgres 17, never against the hosted
-    database; applying it there is a founder step, not something this round
-    did.
+    `0001_telemetry.sql` above was applied under. The migration has been
+    proven locally but has not been applied to the hosted database.
+  - **2026-09-24 production check:** a read-only build probe against the hosted
+    connection found `ezil_computers`, `ezil_error_events`, `auth.users`, and
+    `auth.role()`, but no `ezil_os_access` (44 public tables). The first App
+    Store frontend deployment returned HTTP 500 on `/os` when the invite gate
+    queried that missing table, and the previous Vercel deployment was restored.
+    The probe ran only in protected deployment `dpl_nNVNrZsE5uV4LAi1uo2DtRaWojm6`;
+    it did not change the database or the production alias. Apply exactly 0002
+    before retrying the App Store release, then grant the intended test and
+    maintainer accounts with `tools/invite.ts add --no-invite` (existing accounts)
+    before testing `/os`. Keep the invite gate enabled.
   - 🔴 **The invite email's redirect target changed.** It is
     `EZIL_OS_ORIGIN` + `/auth/invited` (a client page that reads the session
     out of the URL **fragment**, because Supabase invites are not PKCE and a
@@ -866,12 +874,21 @@ count moved by **exactly** three with RLS on and policies present before
 committing. `public` already holds ~40 tables from an older project sharing this
 database — which is why "additive only" is checked rather than assumed.
 
-**No database credentials are needed locally to run it.** `vercel env pull`
-returns 11-character placeholders for this project's encrypted variables, so the
-practical route is to run the script inside a Vercel build, where the real
-environment exists, by temporarily prefixing the `build` script with it. Revert
-that prefix afterwards: a build step that mutates the schema on every deploy is
-a different policy decision, and not one to make by accident.
+`vercel env pull` returns redacted values for this project's encrypted database
+credential. In the current operator environment, no local hosted DB credential
+is available, so the practical route is to run the script inside a Vercel build
+where the real environment exists, by temporarily prefixing the `build` script
+with it. Revert that prefix afterwards: a build step that mutates the schema on
+every deploy is a different policy decision, and not one to make by accident.
+
+For the invite-gate migration, `cd app && npm run db:inspect-0002` reports only
+schema presence, columns, policies, and RLS. `npm run db:apply-0002` applies
+only the reviewed `0002_os_access.sql` digest in one transaction, validates the
+existing base schema, and verifies columns, constraints, policy, and RLS before
+commit. It is idempotent and never inserts an invite. Run it only against the
+intended database after reviewing the inspection output. A successful schema
+migration alone does not admit anybody: add each existing account explicitly
+with the invite CLI, then promote the frontend and run its authenticated checks.
 
 ### Secret rotation
 
