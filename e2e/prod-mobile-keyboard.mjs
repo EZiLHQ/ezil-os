@@ -20,10 +20,10 @@
  * BRANDING image, not the worker image, so rebuilding the worker alone leaves
  * the old script in place while every local test passes.
  *
- * Counts the frames that actually leave for the server, by hooking
+ * Counts successful local transport sends, by hooking
  * `RTCDataChannel.prototype.send` inside the streamed client's own iframe —
- * not the textarea, and not the DOM, because what matters is what the remote
- * desktop receives.
+ * and verifies exact, balanced keysyms. This does not establish remote textbox
+ * contents or physical-phone acceptance; those require separate tests.
  */
 
 import { createRequire } from 'node:module';
@@ -31,6 +31,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { nekoInputState, probeComposedWord, composedWordPassed } from './neko-input-probe.mjs';
 
 const REQ_DIR = process.env.PLAYWRIGHT_REQUIRE_DIR;
 let chromium = null;
@@ -66,6 +67,8 @@ try {
     userAgent: 'Mozilla/5.0 (Linux; Android 14; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
   });
   const p = await ctx.newPage();
+  let pageErrors = 0;
+  p.on('pageerror', () => { pageErrors++; });
   await p.goto(`${APP}/login`, { waitUntil: 'domcontentloaded' });
   await p.fill('#email', EMAIL); await p.fill('#password', PASS);
   await Promise.all([
@@ -75,23 +78,21 @@ try {
   check('sign-in leaves /login', !/\/login/.test(p.url()));
 
   await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
-  await p.waitForTimeout(3500);
-  try { await p.locator('.taskbar-item').filter({ hasText: /browser/i }).first().click({ timeout: 12000 }); }
-  catch { await p.locator('.taskbar-item').nth(1).click({ timeout: 12000 }).catch(() => {}); }
-  await p.waitForSelector('.window[data-app="desktop"] iframe.window-app-iframe', { timeout: 180000 }).catch(() => {});
+  await p.locator('.taskbar-item[data-app="desktop"]').click({ timeout: 45000 });
+  await p.waitForSelector('.window[data-app="desktop"] iframe.window-app-iframe', { timeout: 180000 });
 
-  // Wait for the streamed client to be live inside its own frame.
+  // An overlay or ICE "checking" is not an open input channel. Keep the
+  // bounded wait tied to actual transport and control state, not a sleep.
   let frame = null;
-  for (let i = 0; i < 45; i++) {
-    await p.waitForTimeout(2000);
-    frame = p.frames().find((f) => /nekodesktop/.test(f.url()));
-    if (!frame) continue;
-    const ready = await frame.evaluate(() => !!document.querySelector('textarea.overlay')).catch(() => false);
-    if (ready) break;
+  let state = null;
+  for (let i = 0; i < 90; i++) {
+    frame = p.frames().find(f => /nekodesktop/.test(f.url()));
+    state = frame ? await frame.evaluate(nekoInputState).catch(() => null) : null;
+    if (state?.ready) break;
+    await p.waitForTimeout(1000);
   }
-  if (!frame) { check('the streamed client frame is reachable', false, 'no nekodesktop frame'); throw new Error('no frame'); }
-  check('the streamed client frame is reachable', true);
-  await p.waitForTimeout(4000);
+  check('the streamed client has an open input channel and control', state?.ready, JSON.stringify(state));
+  if (!state?.ready) throw new Error('input_not_ready');
 
   // 🔴 ONE keyboard affordance, at a real touch size.
   const buttons = await frame.evaluate(() => {
@@ -136,45 +137,15 @@ try {
   check('…and it is the client\'s own control, not one we overlay on the picture',
     buttons[0] && buttons[0].id !== 'ezil-kbd-btn', JSON.stringify(buttons[0] ?? null));
 
-  // 🔴 Each character exactly once, replaying what a predictive keyboard emits.
-  const sent = await frame.evaluate(async () => {
-    const counts = { keydown: 0, keyup: 0 };
-    const orig = RTCDataChannel.prototype.send;
-    RTCDataChannel.prototype.send = function (data) {
-      try {
-        const buf = data instanceof ArrayBuffer ? new Uint8Array(data)
-          : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
-        if (buf && buf.length >= 3) {
-          if (buf[0] === 0x03) counts.keydown++;
-          else if (buf[0] === 0x04) counts.keyup++;
-        }
-      } catch { /* ignore */ }
-      return orig.apply(this, arguments);
-    };
-    const ta = document.querySelector('textarea.overlay');
-    ta.focus();
-    const K = (t, i) => ta.dispatchEvent(new KeyboardEvent(t, Object.assign({ bubbles: true }, i)));
-    const C = (t, i) => ta.dispatchEvent(new CompositionEvent(t, Object.assign({ bubbles: true }, i)));
-    const I = (i) => ta.dispatchEvent(new InputEvent('input', Object.assign({ bubbles: true }, i)));
-    C('compositionstart', { data: '' });
-    for (const ch of 'fast') {
-      const kc = ch.toUpperCase().charCodeAt(0);
-      K('keydown', { key: ch, keyCode: kc, which: kc });
-      ta.value += ch;
-      I({ data: ch, inputType: 'insertCompositionText', isComposing: true });
-      K('keyup', { key: ch, keyCode: kc, which: kc });
-      await new Promise((r) => setTimeout(r, 25));
-    }
-    C('compositionend', { data: 'fast' });
-    await new Promise((r) => setTimeout(r, 500));
-    RTCDataChannel.prototype.send = orig;
-    return counts;
-  }).catch((e) => ({ error: String(e).slice(0, 120) }));
-
-  check('🔴 typing a 4-character word sends FOUR keydown frames, not eight',
-    sent.keydown === 4, JSON.stringify(sent));
+  const sent = await frame.evaluate(probeComposedWord).catch(() => ({ error: 'input_probe_failed' }));
+  check('composed fast sends the exact four keydown/keyup pairs successfully',
+    composedWordPassed(sent), JSON.stringify(sent));
+  check('the client did not throw during the test', pageErrors === 0, `page errors: ${pageErrors}`);
 
   await ctx.close();
+} catch {
+  // Playwright errors can contain authenticated frame URLs. Log only a code.
+  check('production keyboard test completed', false, 'browser_test_failed');
 } finally { await browser.close(); }
 
 const failed = results.filter((r) => !r.p);
