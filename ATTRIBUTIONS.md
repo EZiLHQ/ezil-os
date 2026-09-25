@@ -281,3 +281,12 @@ installed package metadata. They are from
 signed, version-specific configuration downloads and short-lived registry
 authentication. They run on the trusted host, not inside installed applications.
 No AWS source is copied or modified in this repository.
+
+The configuration process manager invokes the distribution-provided
+[systemd](https://systemd.io/) service manager through `systemctl`; no systemd
+source or binary is vendored here. The Ubuntu 24.04 package copyright reviewed
+during local Linux acceptance identifies the main code as LGPL-2.1-or-later,
+with separately licensed components (including CC0 and GPL code) listed in its
+copyright file. Any future supervisor AMI must retain the distribution's notices
+and satisfy the terms of the components it distributes. The unit files and
+process adapter here are independently authored EZiL code.
