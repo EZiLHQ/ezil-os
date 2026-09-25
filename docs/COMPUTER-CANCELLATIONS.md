@@ -58,3 +58,34 @@ do not replay the historical migration journal. Rollback disables producers and
 retains cancellation records, admission holds and persistent storage until
 provider reconciliation completes. This schema does not establish Reticle
 installation, host readiness, phone typing, cloud stop or billing acceptance.
+
+## Stop and revocation producers
+
+`requestComputerStopCancellation` takes a verified server-session user ID and
+only a computer ID in request data. It checks current OS access and either
+computer ownership or an active platform administrator grant. The separate
+internal `requestRevokedComputerCancellation` verifies deleted/changed ownership,
+desired stop/retirement, or current OS-access revocation. A lookup error rolls
+back; a healthy finalized job returns inactive even though its old lifecycle
+authority is false. Completed healthy computers require the normal stop lifecycle
+path, not retroactive cancellation of their completed start job.
+
+Both producers require approved historical deployment pins and an exact
+operator-configured cancellation workflow mapping. One transaction creates the
+immutable record, delivery and redacted audit event and changes desired state
+to stopped (preserving retirement). Repeated/concurrent requests return the same
+pending cancellation. A request cannot select an EC2 ID, volume, source job,
+digest or workflow ARN. No provider call, source settlement or resource deletion
+occurs here; running admission remains reserved.
+
+Lifecycle claims skip cancelled sources. Existing claims and v1/v2 launch
+authority recheck cancellation under the computer lock, including after provider
+observation. A result racing cancellation cannot acknowledge success or failure.
+Restoring desired running state does not rescind an immutable cancellation.
+
+These are internal functions with an explicit disabled option, not activated
+routes or scheduled producers. Apply migration 0009 before deploying consumers
+that read it. Wiring remains off until the cancellation workflow, independent
+provider observer, delivery consumer and approved pilot are complete. Run
+`bun run test:db:cancellation-producer` alongside the existing schema and lifecycle
+consumer suites. Its provider responses are fixtures, not live AWS receipts.
