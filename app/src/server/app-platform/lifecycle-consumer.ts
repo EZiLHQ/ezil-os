@@ -1,13 +1,16 @@
-import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, or, sql } from 'drizzle-orm';
 import type { db } from '@/server/db';
 import { computers, computerRuntimes, computerInstances, computerLifecycleIntents as intents,
-    computerLifecycleJobs as jobs, computerLifecycleOutbox as outbox } from '@/server/db/schema';
-import { canonicalConfiguration } from './computer-configuration';
+    computerRecoveryIntents as recoveries, computerLifecycleJobs as jobs, computerLifecycleOutbox as outbox } from '@/server/db/schema';
 import { hasCurrentOsAccess, type OsAccessMode } from './runtime-authority';
 import { LifecycleAuthorityRequestSchema } from './lifecycle-authority-protocol';
-import { LifecycleDeploymentSchema, LifecycleError, parseLifecycleWork, validateLifecycleReceipt,
-    type LifecycleDeployment, type LifecycleIntent, type LifecycleReceipt, type LifecycleWork } from './lifecycle-protocol';
-import { validateLifecycleRecoveryReceipt, type LifecycleRecoveryReceipt } from './lifecycle-recovery-protocol';
+import { LifecycleError, type LifecycleReceipt, type LifecycleWork } from './lifecycle-protocol';
+import { type LifecycleRecoveryReceipt } from './lifecycle-recovery-protocol';
+import { lifecycleDeploymentApproved, type LifecycleApproval } from './lifecycle-approval';
+import { parseComputerLifecycleWork, validateComputerLifecycleReceipt, validateComputerLifecycleCleanup,
+    type ComputerRecoveryReceipt, type ComputerRecoveryCleanup } from './computer-lifecycle-work';
+import { ComputerRecoveryAuthorityRequestSchema, loadRecoveryWriters, type ComputerRecoveryAuthorityRequest,
+    type FencedWriters } from './computer-recovery-authority';
 
 type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 export interface LifecycleClaim { computerId: string; jobId: string; attempt: number }
@@ -15,16 +18,16 @@ export interface LifecycleConsumerOptions {
     database: typeof db; enabled: boolean; osAccessMode: OsAccessMode;
     /** Operator configuration, never a submitted manifest. Empty denies new work.
      * Keep historical entries available for observation and safe cleanup. */
-    deployments: readonly LifecycleDeployment[];
+    deployments: readonly LifecycleApproval[];
     /** Submission/observation of the same version-pinned Standard execution.
      * A false allowStart permits observation only, including after revocation. */
-    advance(work: LifecycleWork, allowStart: boolean, signal: AbortSignal): Promise<
-        { state: 'pending' } | { state: 'observed'; receipt: LifecycleReceipt; observedAt: Date }
-        | { state: 'fenced'; receipt: LifecycleRecoveryReceipt; observedAt: Date }>;
+    advance(work: LifecycleWork, allowStart: boolean, signal: AbortSignal, context?: { fencedWriters: FencedWriters }): Promise<
+        { state: 'pending' } | { state: 'observed'; receipt: LifecycleReceipt | ComputerRecoveryReceipt; observedAt: Date }
+        | { state: 'fenced'; receipt: LifecycleRecoveryReceipt | ComputerRecoveryCleanup; observedAt: Date }>;
 }
 type BaseOptions = Omit<LifecycleConsumerOptions, 'advance'>;
 const active = ['queued', 'running'] as const;
-const starts = (i: LifecycleIntent) => ['provision', 'start', 'replace'].includes(i.operation);
+const starts = (i: ReturnType<typeof parseComputerLifecycleWork>) => ['provision', 'start', 'replace', 'recover'].includes(i.operation);
 const owns = (c: LifecycleClaim) => and(eq(outbox.jobId, c.jobId), eq(outbox.computerId, c.computerId),
     eq(outbox.attempts, c.attempt), isNull(outbox.deliveredAt), sql`${outbox.leaseUntil} > clock_timestamp()`);
 const due = () => and(isNull(outbox.deliveredAt), sql`${outbox.availableAt} <= clock_timestamp()`,
@@ -41,8 +44,9 @@ export async function claimLifecycleWork(o: BaseOptions): Promise<LifecycleClaim
     try { return await o.database.transaction(async tx => {
         await timeouts(tx);
         const [candidate] = await tx.select({ computerId: computers.id, jobId: jobs.id }).from(computers)
-            .innerJoin(jobs, eq(jobs.computerId, computers.id)).innerJoin(intents, eq(intents.jobId, jobs.id))
-            .innerJoin(outbox, eq(outbox.jobId, jobs.id)).where(and(due(), inArray(jobs.status, active)))
+            .innerJoin(jobs, eq(jobs.computerId, computers.id)).leftJoin(intents, eq(intents.jobId, jobs.id))
+            .leftJoin(recoveries, eq(recoveries.jobId, jobs.id)).innerJoin(outbox, eq(outbox.jobId, jobs.id))
+            .where(and(due(), inArray(jobs.status, active), or(sql`${intents.jobId} is not null`, sql`${recoveries.jobId} is not null`)))
             .orderBy(asc(outbox.availableAt), asc(jobs.id)).limit(1).for('update', { of: computers, skipLocked: true });
         if (!candidate) return null;
         const [event] = await tx.update(outbox).set({ attempts: sql`${outbox.attempts} + 1`,
@@ -56,11 +60,13 @@ async function load(tx: Transaction, c: Pick<LifecycleClaim, 'computerId' | 'job
     const [computer] = await tx.select().from(computers).where(eq(computers.id, c.computerId)).limit(1).for('update');
     const [runtime] = await tx.select().from(computerRuntimes).where(eq(computerRuntimes.computerId, c.computerId)).limit(1).for('update');
     const [job] = await tx.select().from(jobs).where(and(eq(jobs.id, c.jobId), eq(jobs.computerId, c.computerId))).limit(1).for('update');
-    const [row] = await tx.select({ digest: intents.digest, createdAt: intents.createdAt,
-        document: sql<string>`public.ezil_lifecycle_intent_document(${intents})` })
-        .from(intents).where(and(eq(intents.jobId, c.jobId), eq(intents.computerId, c.computerId))).limit(1);
+    const table = job?.operation === 'recover' ? recoveries : intents;
+    const document = job?.operation === 'recover' ? sql<string>`public.ezil_computer_recovery_document(${recoveries})`
+        : sql<string>`public.ezil_lifecycle_intent_document(${intents})`;
+    const [row] = await tx.select({ digest: table.digest, createdAt: table.createdAt, document })
+        .from(table).where(and(eq(table.jobId, c.jobId), eq(table.computerId, c.computerId))).limit(1);
     if (!computer || !runtime || !job || !row || !active.includes(job.status as typeof active[number])) return null;
-    const intent = parseLifecycleWork(row);
+    const intent = parseComputerLifecycleWork(row);
     const [writer] = await tx.select().from(computerInstances).where(and(eq(computerInstances.computerId, c.computerId),
         isNull(computerInstances.fencedAt))).limit(1).for('update');
     // Immutable schema protects this identity too; check it at the consuming boundary.
@@ -68,18 +74,23 @@ async function load(tx: Transaction, c: Pick<LifecycleClaim, 'computerId' | 'job
         || intent.targetGeneration !== job.targetGeneration || computer.provider !== 'aws-ec2'
         || runtime.region !== intent.deployment.region
         || (runtime.availabilityZone !== null && runtime.availabilityZone !== intent.deployment.availabilityZone)) return null;
+    if (intent.schemaVersion === 2) {
+        if (writer || runtime.dataVolumeId !== intent.dataVolumeId || runtime.nextGeneration !== intent.targetGeneration + 1) return null;
+        const fencedWriters = await loadRecoveryWriters(tx, intent);
+        if (!fencedWriters) return null;
+        return { computer, runtime, job, work: row, intent, writer, fencedWriters };
+    }
     const existing = intent.operation !== 'provision';
     if (existing && (runtime.dataVolumeId !== intent.dataVolumeId || !writer
         || writer.generation !== (intent.previousGeneration ?? intent.targetGeneration)
         || writer.providerInstanceId !== (intent.previousInstanceId ?? intent.providerInstanceId)
         || writer.fenceToken !== (intent.previousFenceToken ?? intent.fenceToken))) return null;
     if (!existing && (runtime.dataVolumeId !== null || writer)) return null;
-    return { computer, runtime, job, work: row, intent, writer };
+    return { computer, runtime, job, work: row, intent, writer, fencedWriters: [] as FencedWriters };
 }
 type Loaded = NonNullable<Awaited<ReturnType<typeof load>>>;
 async function allowed(tx: Transaction, o: BaseOptions, s: Loaded) {
-    if (!o.deployments.some(d => LifecycleDeploymentSchema.safeParse(d).success
-        && canonicalConfiguration(d) === canonicalConfiguration(s.intent.deployment))) return false;
+    if (!lifecycleDeploymentApproved(o.deployments, s.intent)) return false;
     const desired = s.intent.operation === 'retire' ? 'retired' : starts(s.intent) ? 'running' : 'stopped';
     if (s.runtime.desiredState !== desired) return false;
     // A trusted stop/retire intent remains usable after owner access revocation.
@@ -103,7 +114,20 @@ export async function authorizeLifecycleWork(o: BaseOptions, input: { computerId
     try { return await o.database.transaction(async tx => {
         await timeouts(tx);
         const s = await load(tx, input);
-        return Boolean(s && s.job.status === 'running' && s.work.digest === input.digest && await allowed(tx, o, s));
+        return Boolean(s && s.intent.schemaVersion === 1 && s.job.status === 'running' && s.work.digest === input.digest && await allowed(tx, o, s));
+    }); } catch { throw new LifecycleError('lifecycle_unavailable'); }
+}
+
+/** Same admission and live ownership checks, with historical writer identities
+ * loaded from server records. The signed internal endpoint is the only caller
+ * exposed to workflows; browser-selected resource IDs are never accepted. */
+export async function authorizeComputerRecoveryWork(o: BaseOptions, input: ComputerRecoveryAuthorityRequest): Promise<{ writers: FencedWriters } | null> {
+    if (!o.enabled || !ComputerRecoveryAuthorityRequestSchema.safeParse(input).success) return null;
+    try { return await o.database.transaction(async tx => {
+        await timeouts(tx);
+        const s = await load(tx, input);
+        return s && s.intent.schemaVersion === 2 && s.job.status === 'running' && s.work.digest === input.digest
+            && await allowed(tx, o, s) ? { writers: s.fencedWriters } : null;
     }); } catch { throw new LifecycleError('lifecycle_unavailable'); }
 }
 
@@ -126,13 +150,13 @@ export async function dispatchLifecycleClaim(o: LifecycleConsumerOptions, c: Lif
                     // Retain uncertain, unobserved and expired-lease work in admission.
                     const held = await tx.execute<{ count: number }>(sql`SELECT count(DISTINCT computer_id)::int AS count FROM (
                         SELECT computer_id FROM ${computerInstances} WHERE fenced_at IS NULL AND observed_state <> 'stopped'
-                        UNION SELECT computer_id FROM ${jobs} WHERE status='running' AND operation IN ('provision','start','replace')
+                        UNION SELECT computer_id FROM ${jobs} WHERE status='running' AND operation IN ('provision','start','replace','recover')
                     ) reservations WHERE computer_id <> ${c.computerId}`);
                     if ((held[0]?.count ?? 2) >= 2) return defer(tx, c, 'lifecycle_capacity');
                 }
                 await tx.update(jobs).set({ status: 'running', startedAt: sql`clock_timestamp()`, errorCode: null }).where(eq(jobs.id, c.jobId));
             }
-            return { work: s.work, canStart };
+            return { work: s.work, canStart, fencedWriters: s.fencedWriters };
         });
         if (typeof prepared === 'string') return prepared;
         let result: Awaited<ReturnType<LifecycleConsumerOptions['advance']>> | null = null;
@@ -141,7 +165,7 @@ export async function dispatchLifecycleClaim(o: LifecycleConsumerOptions, c: Lif
             // Promise deadline also bounds an adapter which ignores AbortSignal.
             const controller = new AbortController();
             let timer: ReturnType<typeof setTimeout> | undefined;
-            try { result = await Promise.race([o.advance(prepared.work, prepared.canStart, controller.signal),
+            try { result = await Promise.race([o.advance(prepared.work, prepared.canStart, controller.signal, { fencedWriters: prepared.fencedWriters }),
                 new Promise<never>((_resolve, reject) => { timer = setTimeout(() => {
                     controller.abort(); reject(new LifecycleError('lifecycle_unconfirmed'));
                 }, 20000); })]); } finally { clearTimeout(timer); }
@@ -152,6 +176,11 @@ export async function dispatchLifecycleClaim(o: LifecycleConsumerOptions, c: Lif
             const [event] = await tx.select().from(outbox).where(owns(c)).limit(1).for('update');
             if (!s || !event) return 'stale' as const;
             if (!result || result.state === 'pending') return defer(tx, c, errorCode);
+            // A receipt observes the historical identities loaded before the
+            // network call. A changed fence set requires fresh observation.
+            if (s.intent.schemaVersion === 2 && JSON.stringify(s.fencedWriters) !== JSON.stringify(prepared.fencedWriters)) {
+                return defer(tx, c, 'lifecycle_conflict');
+            }
             if (!(result.observedAt instanceof Date) || !Number.isFinite(result.observedAt.getTime())) {
                 return defer(tx, c, 'lifecycle_unconfirmed');
             }
@@ -159,7 +188,7 @@ export async function dispatchLifecycleClaim(o: LifecycleConsumerOptions, c: Lif
                 BETWEEN clock_timestamp() - interval '30 seconds' AND clock_timestamp() + interval '5 seconds' AS fresh`);
             if (!fresh[0]?.fresh) return defer(tx, c, 'lifecycle_unconfirmed');
             if (result.state === 'fenced') {
-                const receipt = validateLifecycleRecoveryReceipt(s.work, result.receipt);
+                const receipt = validateComputerLifecycleCleanup(s.work, result.receipt);
                 // Cleanup authority survives access revocation. The adapter has
                 // independently observed exact terminated writers and retained
                 // detached storage; no success or fresh launch is implied.
@@ -182,7 +211,8 @@ export async function dispatchLifecycleClaim(o: LifecycleConsumerOptions, c: Lif
                 if (!ack) throw new LifecycleError('lifecycle_unconfirmed');
                 return 'failed' as const;
             }
-            const receipt = validateLifecycleReceipt(s.work, result.receipt);
+            const receipt = validateComputerLifecycleReceipt(s.work, result.receipt);
+            if (s.fencedWriters.some(w => w.instanceId === receipt.instanceId)) return defer(tx, c, 'lifecycle_conflict');
             // Do not certify a superseded start as successful. Its reservation
             // remains held for workflow cancellation/reconciliation.
             if (starts(s.intent) && !await allowed(tx, o, s)) return defer(tx, c, 'lifecycle_authority_denied');
@@ -192,7 +222,7 @@ export async function dispatchLifecycleClaim(o: LifecycleConsumerOptions, c: Lif
                 await tx.update(computerInstances).set({ fencedAt: sql`clock_timestamp()`, observedState: 'stopped', observedAt: result.observedAt })
                     .where(and(eq(computerInstances.computerId, c.computerId), eq(computerInstances.generation, s.intent.previousGeneration!)));
             }
-            if (s.intent.operation === 'provision' || s.intent.operation === 'replace') {
+            if (s.intent.operation === 'provision' || s.intent.operation === 'replace' || s.intent.operation === 'recover') {
                 await tx.update(computerRuntimes).set({ dataVolumeId: receipt.volumeId,
                     availabilityZone: s.intent.deployment.availabilityZone, updatedAt: sql`clock_timestamp()` })
                     .where(eq(computerRuntimes.computerId, c.computerId));

@@ -1,6 +1,8 @@
 import { timingSafeEqual } from 'node:crypto';
 import { LIFECYCLE_AUTHORITY_PATH, LifecycleAuthorityRequestSchema, LifecycleAuthoritySecretSchema,
     lifecycleAuthoritySignature, type LifecycleAuthorityRequest } from './lifecycle-authority-protocol';
+import { ComputerRecoveryAuthorityRequestSchema, FencedWritersSchema,
+    type ComputerRecoveryAuthorityRequest, type FencedWriters } from './computer-recovery-authority';
 
 const MAX_BODY = 4096;
 const response = (status: number, code: string) => Response.json({ code }, { status, headers: { 'cache-control': 'no-store' } });
@@ -41,6 +43,7 @@ async function boundedBody(request: Request): Promise<Buffer> {
 export function createLifecycleAuthorityHandler(options: {
     enabled: boolean; secret?: string | undefined;
     authorize(input: LifecycleAuthorityRequest): Promise<boolean>;
+    authorizeRecovery?(input: ComputerRecoveryAuthorityRequest): Promise<{ writers: FencedWriters } | null>;
 }) {
     return async (request: Request): Promise<Response> => {
         if (!options.enabled) return response(404, 'not_found');
@@ -63,15 +66,18 @@ export function createLifecycleAuthorityHandler(options: {
         if (!timingSafeEqual(Buffer.from(signature, 'hex'), Buffer.from(expected, 'hex'))) return response(401, 'unauthorized');
         let input: unknown;
         try { input = JSON.parse(body.toString()); } catch { return response(400, 'invalid_request'); }
-        const parsed = LifecycleAuthorityRequestSchema.safeParse(input);
+        const parsed = LifecycleAuthorityRequestSchema.or(ComputerRecoveryAuthorityRequestSchema).safeParse(input);
         if (!parsed.success) return response(400, 'invalid_request');
         try {
             if (request.signal.aborted) return response(400, 'invalid_request');
-            const authorized = await options.authorize(parsed.data);
+            const authority = parsed.data.schemaVersion === 2 ? await options.authorizeRecovery?.(parsed.data) : null;
+            const writers = authority && FencedWritersSchema.safeParse(authority.writers);
+            const authorized = parsed.data.schemaVersion === 1 ? await options.authorize(parsed.data) : writers?.success === true;
             if (request.signal.aborted) return response(400, 'invalid_request');
             if (!fresh(timestamp)) return response(401, 'unauthorized');
             if (authorized !== true) return response(403, 'lifecycle_not_current');
-            return Response.json({ authorized: true, ...parsed.data }, { headers: { 'cache-control': 'no-store' } });
+            return Response.json({ authorized: true, ...parsed.data, ...(writers?.success ? { writers: writers.data } : {}) },
+                { headers: { 'cache-control': 'no-store' } });
         } catch { return response(503, 'lifecycle_authority_unavailable'); }
     };
 }

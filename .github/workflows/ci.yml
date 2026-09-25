@@ -314,6 +314,9 @@ jobs:
       - name: Retained computer recovery intents (real Postgres)
         working-directory: app
         run: bun run test:db:recovery-intents
+      - name: Retained computer recovery consumer (real Postgres)
+        working-directory: app
+        run: bun run test:db:recovery-consumer
 
   connectors:
     name: sdk + mcp (typecheck + unit)

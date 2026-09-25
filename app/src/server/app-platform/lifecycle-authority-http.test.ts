@@ -2,6 +2,7 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { createLifecycleAuthorityHandler } from './lifecycle-authority-http';
 import { LIFECYCLE_AUTHORITY_PATH, lifecycleAuthoritySignature } from './lifecycle-authority-protocol';
+import { computerRecoveryFixture } from '../../../tests/fixtures/computer-recovery';
 
 const key='ab'.repeat(32), url='https://control.example'+LIFECYCLE_AUTHORITY_PATH;
 const input={schemaVersion:1,computerId:randomUUID(),jobId:randomUUID(),digest:'a'.repeat(64)};
@@ -13,6 +14,16 @@ function request(body=JSON.stringify(input),age=0,realm='ezil-lifecycle-authorit
     return new Request(url,{method:'POST',headers:{'content-type':'application/json','x-ezil-workflow-timestamp':timestamp,'x-ezil-workflow-signature':signature},body});
 }
 describe('lifecycle authority endpoint',()=>{
+    it('v2 returns only authenticated server writer records and fails closed without v2 authority',async()=>{
+        const f=computerRecoveryFixture(), body=JSON.stringify({...input,schemaVersion:2});
+        const authorize=vi.fn(async()=>true), authorizeRecovery=vi.fn(async()=>({writers:f.writers}));
+        const handle=createLifecycleAuthorityHandler({enabled:true,secret:key,authorize,authorizeRecovery});
+        const result=await handle(request(body));expect(result.status).toBe(200);
+        expect(await result.json()).toEqual({authorized:true,...input,schemaVersion:2,writers:f.writers});
+        expect(authorize).not.toHaveBeenCalled();expect(authorizeRecovery).toHaveBeenCalledOnce();
+        expect((await createLifecycleAuthorityHandler({enabled:true,secret:key,authorize})(request(body))).status).toBe(403);
+        expect((await handle(request(JSON.stringify({...input,schemaVersion:2,writers:f.writers})))).status).toBe(400);
+    });
     it('authenticates without cookies and repeats current authority checks on replay',async()=>{
         const authorize=vi.fn(async()=>true), handle=createLifecycleAuthorityHandler({enabled:true,secret:key,authorize});
         const r=request(), first=await handle(r.clone());expect(first.status).toBe(200);expect(await first.json()).toEqual({authorized:true,...input});
