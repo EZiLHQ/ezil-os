@@ -6,6 +6,8 @@ import { produceComputerConfiguration } from '../src/server/app-platform/compute
 import { claimConfigurationDelivery, dispatchConfigurationClaim, dispatchNextConfiguration,
     type ConfigurationDeliveryOptions, type ConfigurationWork } from '../src/server/app-platform/configuration-delivery';
 import type { HostConfigurationObservation } from '../src/server/app-platform/host-control-client';
+import { computerControlKeyIdentity } from '../src/server/app-platform/computer-control-key';
+import { lifecycleDeployment } from './fixtures/lifecycle';
 import { runtimeRecords } from './fixtures/runtime-release';
 import { dataMountComputer } from './fixtures/data-mount';
 import { recordConfigurationMount, restartConfigurationComputer, ageConfigurationMount } from './fixtures/configuration-mount';
@@ -93,6 +95,104 @@ try {
         const prepare = async (s: Setup) => assert.equal(await dispatchConfigurationClaim(adapter, await claim(s)), 'waiting');
         return { adapter, calls, work, loaded, load, prepare };
     }
+    function startupTransport(s: Setup, t: ReturnType<typeof transport>) {
+        const counts={keys:0,dispatch:0}, policy={accountId:lifecycleDeployment.accountId,region:lifecycleDeployment.region,
+            namespace:lifecycleDeployment.namespace,controlDomain:'control.example.com',kmsKeyArn:lifecycleDeployment.dataKeyArn};
+        const adapter:ConfigurationDeliveryOptions={...t.adapter,startup:{deployments:[lifecycleDeployment],
+            advance:async work=>({state:'observed',observedAt:new Date(),receipt:{schemaVersion:1,
+                computerId:s.computerId,jobId:s.mountComputer.jobId,digest:work.digest,generation:s.mountComputer.generation,
+                fenceToken:s.mountComputer.fence,instanceId:s.mountComputer.instance,volumeId:s.mountComputer.volume,state:'running'}}),
+            keys:{policy,prepare:async work=>{counts.keys++;return {state:'confirmed',versionId:work.versionId,
+                secretArn:computerControlKeyIdentity(policy,work).arnPrefix+'Ab12Cd'};}},
+            advanceStart:async work=>{counts.dispatch++;return {state:'started',receipt:{schemaVersion:1,
+                authorizationId:work.authorizationId,scope:work.scope,state:'started',descriptor:{computerId:work.scope.computerId,
+                    computerGeneration:work.scope.computerGeneration,configurationRevision:work.configuration.revision,
+                    configurationDigest:work.configuration.digest}}};},
+        }};
+        const poll=async()=>dispatchConfigurationClaim(adapter,await claim(s));
+        const dueStart=async()=>{await sql`UPDATE ezil_computer_start_deliveries SET available_at=now() WHERE authorization_id IN
+            (SELECT id FROM ezil_computer_start_authorizations WHERE computer_id=${s.computerId})`;};
+        return {adapter,counts,poll,dueStart};
+    }
+    await test('first preparation issues and delivers startup before observing; receipt alone cannot finish installation',async()=>{
+        const s=await setup(),t=transport(),start=startupTransport(s,t);
+        assert.equal(await start.poll(),'waiting'); // prepares, no reload against a nonexistent supervisor
+        assert.deepEqual(t.calls,{preparation:1,reload:0,host:0});
+        assert.equal(await start.poll(),'waiting'); // issuer records a grant, no host start in this poll
+        assert.deepEqual(start.counts,{keys:1,dispatch:0});
+        await start.dueStart();assert.equal(await start.poll(),'waiting');
+        assert.deepEqual(start.counts,{keys:1,dispatch:1});
+        assert.equal((await state(s)).install_status,'pending');assert.equal((await state(s)).loaded_at,null);
+        assert.equal(t.calls.host,0);t.load(s);
+        assert.equal(await start.poll(),'loaded');assert.equal((await state(s)).install_status,'installed');
+        assert.deepEqual(start.counts,{keys:1,dispatch:1});assert.equal(t.calls.host,1);
+    });
+    await test('startup claim for one computer does not consume another computer queue',async()=>{
+        const a=await setup(),b=await setup(),ta=transport(),tb=transport(),sa=startupTransport(a,ta),sb=startupTransport(b,tb);
+        await sa.poll();await sa.poll();await sb.poll();await sb.poll();
+        await sa.dueStart();await sb.dueStart();
+        assert.equal(await sb.poll(),'waiting');assert.deepEqual(sa.counts,{keys:1,dispatch:0});
+        const rows=await sql`SELECT a.computer_id,d.started_at,d.attempts FROM ezil_computer_start_authorizations a
+            JOIN ezil_computer_start_deliveries d ON d.authorization_id=a.id WHERE a.computer_id IN (${a.computerId},${b.computerId})`;
+        assert.equal(rows.find(r=>r.computer_id===a.computerId)!.attempts,0);
+        assert.ok(rows.find(r=>r.computer_id===b.computerId)!.started_at);
+    });
+    await test('mount revocation and computer restart between issue and dispatch cannot start the supervisor',async()=>{
+        for(const kind of ['revoke','restart']) {
+            const s=await setup(),t=transport(),start=startupTransport(s,t);await start.poll();await start.poll();
+            if(kind==='revoke')await sql`UPDATE ezil_computer_data_mount_authorizations SET revoked_at=now() WHERE id=${s.mountId}`;
+            else await restartConfigurationComputer(sql,s.mountComputer);
+            await start.dueStart();assert.equal(await start.poll(),'waiting');assert.equal(start.counts.dispatch,0);
+            assert.equal(t.calls.host,0);assert.equal((await state(s)).install_status,'pending');
+        }
+    });
+    await test('unreachable started host is observed without reissuing or dispatching startup',async()=>{
+        const s=await setup(),t=transport(),start=startupTransport(s,t);await start.poll();await start.poll();
+        await start.dueStart();await start.poll();
+        start.adapter.resolveHost=async()=>{throw new Error('host unavailable');};
+        for(let n=0;n<2;n++)assert.equal(await start.poll(),'waiting');
+        assert.deepEqual(start.counts,{keys:1,dispatch:1});assert.equal((await state(s)).install_status,'pending');
+    });
+    await test('startup key revocation during host observation blocks installation acknowledgement',async()=>{
+        const s=await setup(),t=transport(),start=startupTransport(s,t);await start.poll();await start.poll();
+        await start.dueStart();await start.poll();t.load(s);
+        const resolve=start.adapter.resolveHost;
+        start.adapter.resolveHost=async(scope,signal)=>{const host=await resolve(scope,signal);return {...host,
+            configuration:async()=>{await sql`UPDATE ezil_computer_control_bindings SET revoked_at=now() WHERE computer_id=${s.computerId}`;
+                return host.configuration();}};};
+        assert.equal(await start.poll(),'waiting');assert.equal((await state(s)).install_status,'pending');
+        assert.equal((await state(s)).loaded_at,null);assert.equal((await state(s)).error_code,'computer_start_unconfirmed');
+    });
+    await test('a suspended revocation snapshot reloads without requiring or issuing startup authority',async()=>{
+        const s=await setup(),t=transport(),start=startupTransport(s,t);await start.poll();await start.poll();
+        await start.dueStart();await start.poll();t.load(s);assert.equal(await start.poll(),'loaded');
+        await sql`UPDATE ezil_os_access SET revoked_at=now() WHERE email=${s.email}`;
+        const next=await produceComputerConfiguration(options,s.computerId);assert.ok('configurationId' in next);s.configurationId=next.configurationId;
+        assert.equal(await start.poll(),'waiting');assert.equal(t.calls.reload,1);t.load(s);
+        assert.equal(await start.poll(),'loaded');assert.deepEqual(start.counts,{keys:1,dispatch:1});
+    });
+    await test('expired unfinished startup reports recovery without renewing its allowance',async()=>{
+        const s=await setup(),t=transport(),start=startupTransport(s,t);await start.poll();await start.poll();
+        await sql.begin(async tx=>{
+            // Time travel in this disposable fixture only; production grants stay immutable.
+            await tx`ALTER TABLE ezil_computer_start_authorizations DISABLE TRIGGER ezil_start_authority_write_trg`;
+            await tx`UPDATE ezil_computer_start_authorizations SET issued_at=issued_at-interval '1 hour',expires_at=expires_at-interval '1 hour',
+                provider_observed_at=provider_observed_at-interval '1 hour' WHERE computer_id=${s.computerId}`;
+            await tx`ALTER TABLE ezil_computer_start_authorizations ENABLE TRIGGER ezil_start_authority_write_trg`;
+        });
+        for(let n=0;n<2;n++)assert.equal(await start.poll(),'waiting');
+        assert.equal((await state(s)).error_code,'computer_start_recovery_required');assert.deepEqual(start.counts,{keys:1,dispatch:0});
+    });
+    await test('later configuration reload uses the already-started supervisor without another start',async()=>{
+        const s=await setup(),t=transport(),start=startupTransport(s,t);await start.poll();await start.poll();
+        await start.dueStart();await start.poll();t.load(s);assert.equal(await start.poll(),'loaded');
+        await sql`UPDATE ezil_app_grants SET revoked_at=now() WHERE app_id=${s.records.app.id} AND user_id=${s.owner}`;
+        const next=await produceComputerConfiguration(options,s.computerId);assert.ok('configurationId' in next);s.configurationId=next.configurationId;
+        assert.equal(await start.poll(),'waiting'); // new immutable preparation
+        assert.equal(await start.poll(),'waiting'); // old authenticated descriptor requests reload
+        assert.equal(t.calls.reload,1);t.load(s);assert.equal(await start.poll(),'loaded');
+        assert.deepEqual(start.counts,{keys:1,dispatch:1});
+    });
     await test('disabled consumers never access database or transport', async () => {
         const disabled = { ...options, enabled: false, database: null as never };
         assert.equal(await claimConfigurationDelivery(disabled), null);
