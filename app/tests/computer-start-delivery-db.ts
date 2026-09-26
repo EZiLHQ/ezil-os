@@ -8,6 +8,7 @@ import { computerControlKeyIdentity } from '../src/server/app-platform/computer-
 import { claimComputerStart, authorizeComputerStart, dispatchComputerStartClaim, dispatchNextComputerStart,
     type ComputerStartDeliveryOptions } from '../src/server/app-platform/computer-start-delivery';
 import type { ComputerStartWork } from '../src/server/app-platform/computer-start-protocol';
+import { createStartAuthorityHandler, START_AUTHORITY_PATH, startAuthoritySignature } from '../src/server/app-platform/computer-start-authority-http';
 import { runtimeTestDatabase } from './helpers/runtime-database';
 import { dataMountComputer } from './fixtures/data-mount';
 import { recordConfigurationMount } from './fixtures/configuration-mount';
@@ -87,6 +88,50 @@ try {
         assert.equal(await authorizeComputerStart({ ...options, keys: { policy: { ...policy, controlDomain: 'other.example.com' } } }, work), false);
         await sql`UPDATE ezil_computer_start_authorizations SET revoked_at=now() WHERE id=${c.authorizationId}`;
         assert.equal(await authorizeComputerStart(options, work), false);
+    });
+    await test('signed HTTP checks real DB authority without creating grants or reporting a host start', async () => {
+        const c = await setup(), work = await capture(c), key = 'ab'.repeat(32);
+        const handle = createStartAuthorityHandler({ enabled: true, secret: key, authorize: w => authorizeComputerStart(options, w) });
+        const signed = (w: ComputerStartWork) => {
+            const body = JSON.stringify(w), timestamp = String(Math.floor(Date.now()/1000));
+            return new Request('https://control.example'+START_AUTHORITY_PATH, { method: 'POST', body,
+                headers: { 'content-type': 'application/json', 'x-ezil-workflow-timestamp': timestamp,
+                    'x-ezil-workflow-signature': startAuthoritySignature(Buffer.from(body), key, timestamp) } });
+        };
+        const req = signed(work), response = await handle(req.clone()); assert.equal(response.status, 200);
+        assert.deepEqual(await response.json(), { authorized: true, work });
+        assert.equal(response.headers.get('cache-control'), 'no-store'); assert.equal(response.headers.get('set-cookie'), null);
+        const other = await setup(), foreign = await capture(other);
+        for (const changed of [{ ...work, authorizationId: foreign.authorizationId },
+            { ...work, mountAuthorizationId: foreign.mountAuthorizationId },
+            { ...work, configuration: foreign.configuration },
+            { ...work, scope: { ...work.scope, dataVolumeId: foreign.scope.dataVolumeId } },
+            { ...work, controlKey: { ...work.controlKey, policy: { ...policy, controlDomain: 'untrusted.example.com' } } }]) {
+            const denied = await handle(signed(changed)); assert.equal(denied.status, 403);
+            assert.deepEqual(await denied.json(), { code: 'start_not_current' });
+        }
+        assert.equal((await state(c)).started_at, null);
+        assert.equal((await sql`SELECT count(*)::int n FROM ezil_computer_start_authorizations WHERE computer_id=${c.computerId}`)[0]!.n, 1);
+        assert.equal((await sql`SELECT count(*)::int n FROM ezil_computer_control_bindings WHERE computer_id=${c.computerId}`)[0]!.n, 1);
+        await sql`UPDATE ezil_computer_start_authorizations SET revoked_at=now() WHERE id=${c.authorizationId}`;
+        assert.equal((await handle(req)).status, 403);
+    });
+    await test('signed HTTP replays fail after owner access, key, mount, writer or desired-state revocation', async () => {
+        const key = 'ab'.repeat(32), handle = createStartAuthorityHandler({ enabled: true, secret: key,
+            authorize: w => authorizeComputerStart(options, w) });
+        for (const reason of ['access', 'key', 'mount', 'fence', 'stop']) {
+            const c = await setup(), work = await capture(c), body = JSON.stringify(work), timestamp = String(Math.floor(Date.now()/1000));
+            const req = new Request('https://control.example'+START_AUTHORITY_PATH, { method: 'POST', body,
+                headers: { 'content-type': 'application/json', 'x-ezil-workflow-timestamp': timestamp,
+                    'x-ezil-workflow-signature': startAuthoritySignature(Buffer.from(body), key, timestamp) } });
+            assert.equal((await handle(req.clone())).status, 200);
+            if (reason === 'access') await sql`UPDATE ezil_os_access SET revoked_at=now() WHERE email=${c.email}`;
+            if (reason === 'key') await sql`UPDATE ezil_computer_control_bindings SET revoked_at=now() WHERE computer_id=${c.computerId}`;
+            if (reason === 'mount') await sql`UPDATE ezil_computer_data_mount_authorizations SET revoked_at=now() WHERE id=${c.mountAuthorizationId}`;
+            if (reason === 'fence') await sql`UPDATE ezil_computer_instances SET fenced_at=now() WHERE computer_id=${c.computerId}`;
+            if (reason === 'stop') await sql`UPDATE ezil_computer_runtimes SET desired_state='stopped' WHERE computer_id=${c.computerId}`;
+            assert.equal((await handle(req)).status, 403, reason); assert.equal((await state(c)).started_at, null);
+        }
     });
     await test('exact receipt settles once without completing configuration or apps', async () => {
         const c = await setup(), work = await capture(c), lease = await claim(c);
