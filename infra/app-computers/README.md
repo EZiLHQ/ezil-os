@@ -134,3 +134,59 @@ The Step Functions role alone may invoke the fixed document on platform-tagged
 instances. Mount/database scheduling, configuration gating and AWS pilot
 acceptance remain separate integration work. Local ASL/SDK/CDK fixtures are
 not evidence of AWS mounts, application readiness or Reticle installation.
+
+## Separate supervisor startup workflow
+
+`lib/computer-start-delivery.ts` defines the startup Standard workflow for the
+existing app transport input `{ schemaVersion: 1, work, configuration }`.
+It starts the supervisor on an already running, mounted, configured computer;
+it has no EC2 start/stop or disk mutation permissions. The configuration is the
+exact existing `prepare` Delivery, including its immutable S3 version. A
+different object version with identical bytes is not a replacement authority:
+the host must match its saved preparation ledger. Startup never prepares or
+reloads configuration, issues a key, or renews the five-minute grant.
+
+Each helper call reads the original `start-<authorizationId>` Standard execution
+and binds the numbered workflow version, canonical input, and zero redrives.
+Before dispatch and success it checks current authority through the dedicated
+`/api/internal/computers/start-authority` HMAC realm and independently verifies
+the approved EC2/EBS writer. The host gets the exact configuration, mount
+authorization, control-domain and key-version references. Its provisioning KMS
+reference stays the existing data/artifact key, even when the control secret
+uses a different key. No key values enter workflow input or SSM parameters.
+
+The fixed SSM document invokes only the installed `start-operation.js` manager
+(`operateStart`, 150-second timeout). There are no `SendCommand` retries. A lost
+reply only leads to observation or cancellation of the same host operation.
+Pending command visibility is bounded at 180 seconds; that does not extend the
+original grant. Normal cleanup allows five further minutes, and the independent
+recovery workflow only cancels the original writer. Stopped, replaced or unknown
+writers remain unconfirmed and require lifecycle reconciliation. An exact
+`started` receipt proves historical supervisor startup; application readiness
+still requires the authenticated configuration and functional checks.
+
+Run `bash tools/test.sh infra`. For this separate stack, set `EZIL_START_CONFIG`
+to a reviewed reference-only JSON file and run `npm run synth:start`. Its outer
+shape is `{ machineName, authorityKeyArn, reconciliationEnabled: false,
+settings }`. `settings` follows `lib/start/contract.ts`: approved lifecycle
+deployment pins, per-writer role path, bucket, dedicated authority secret/origin,
+numeric workflow/document pins, and `controlKeyPolicy` (account, region,
+namespace, control domain and control-secret KMS ARN). It contains no secrets.
+The `authorityKeyArn` protects the separate workflow HMAC secret; it grants no
+access to computer control keys. Keep all three KMS purposes explicit.
+
+Register without caller start permission or reconciliation, read back the
+numeric SSM version/hash and workflow version, then synthesize/diff the exact
+reviewed pins before activation. As with configuration delivery, the local
+document hash used in its name is not the AWS-reported `documentHash`. Retain
+versions until their active executions and recovery finish. Reconciliation
+rules default off; encrypted histories/logs/DLQ and failure alarms need operator
+monitoring. No host command is enabled at boot by this stack.
+
+Activation requires the app transport/authority from PRs #151–152, the exact
+host manager/executor/systemd package from #153, completed mount and
+configuration preparation, scoped roles, and the approved AWS pilot. The copy
+at `documents/start.json` must remain byte-identical to that host package's
+`supervisor/deploy/start-document.json`. Local graph/SDK/CDK and cross-branch
+protocol tests do not establish AWS startup, Reticle installation, stopped
+billing, or production browser behavior.
