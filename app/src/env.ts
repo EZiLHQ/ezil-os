@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { LifecycleApprovalSchema } from './server/app-platform/lifecycle-approval';
+import { ComputerControlKeyPolicySchema } from './server/app-platform/computer-control-key';
 
 /**
  * Server-only environment. Validated eagerly at import time so a missing
@@ -83,6 +84,19 @@ const serverSchema = z.object({
     EZIL_MOUNT_AUTHORITY_ENABLED: z.string().refine(value => ['true', 'false'].includes(value),
         'invalid_mount_authority_flag').default('false'),
     EZIL_MOUNT_AUTHORITY_SECRET: z.string().regex(/^[a-f0-9]{64}$/, 'invalid_mount_authority_secret').optional(),
+    /** Service-only startup checks; migration 0012 and protected delivery required. */
+    EZIL_START_AUTHORITY_ENABLED: z.string().refine(value => ['true', 'false'].includes(value),
+        'invalid_start_authority_flag').default('false'),
+    EZIL_START_AUTHORITY_SECRET: z.string().regex(/^[a-f0-9]{64}$/, 'invalid_start_authority_secret').optional(),
+    EZIL_START_CONTROL_KEY_POLICY: z.string().max(4096, 'invalid_start_control_key_policy').optional().transform((raw, ctx) => {
+        if (raw === undefined) return null;
+        try {
+            const parsed = ComputerControlKeyPolicySchema.safeParse(JSON.parse(raw));
+            if (parsed.success) return parsed.data;
+        } catch { /* Report only the setting name and code, never its contents. */ }
+        ctx.addIssue({ code: 'custom', message: 'invalid_start_control_key_policy' });
+        return z.NEVER;
+    }),
     EZIL_LIFECYCLE_DEPLOYMENTS: z.string().max(65536).default('[]').transform((raw, ctx) => {
         try {
             const parsed = z.array(LifecycleApprovalSchema).max(16).safeParse(JSON.parse(raw));
@@ -93,6 +107,19 @@ const serverSchema = z.object({
     }),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
 }).superRefine((value, context) => {
+    if (value.EZIL_START_AUTHORITY_ENABLED === 'true') {
+        if (!value.EZIL_START_AUTHORITY_SECRET) context.addIssue({ code: 'custom', path: ['EZIL_START_AUTHORITY_SECRET'], message: 'start_authority_secret_required' });
+        const policy = value.EZIL_START_CONTROL_KEY_POLICY;
+        if (!policy) context.addIssue({ code: 'custom', path: ['EZIL_START_CONTROL_KEY_POLICY'], message: 'start_control_key_policy_required' });
+        if (!value.EZIL_LIFECYCLE_DEPLOYMENTS.some(entry => {
+            const deployment = 'profileMode' in entry ? entry.deployment : entry;
+            return policy && deployment.accountId === policy.accountId && deployment.region === policy.region && deployment.namespace === policy.namespace;
+        })) context.addIssue({ code: 'custom', path: ['EZIL_LIFECYCLE_DEPLOYMENTS'], message: 'start_deployment_required' });
+        if (value.EZIL_START_AUTHORITY_SECRET && [value.EZIL_LIFECYCLE_AUTHORITY_SECRET, value.EZIL_CONFIGURATION_AUTHORITY_SECRET,
+            value.EZIL_MOUNT_AUTHORITY_SECRET].includes(value.EZIL_START_AUTHORITY_SECRET)) {
+            context.addIssue({ code: 'custom', path: ['EZIL_START_AUTHORITY_SECRET'], message: 'start_authority_distinct_key_required' });
+        }
+    }
     if (value.EZIL_MOUNT_AUTHORITY_ENABLED === 'true') {
         if (!value.EZIL_MOUNT_AUTHORITY_SECRET) context.addIssue({ code: 'custom', path: ['EZIL_MOUNT_AUTHORITY_SECRET'], message: 'mount_authority_secret_required' });
         if (!value.EZIL_LIFECYCLE_DEPLOYMENTS.length) context.addIssue({ code: 'custom', path: ['EZIL_LIFECYCLE_DEPLOYMENTS'], message: 'mount_deployment_required' });
@@ -139,6 +166,9 @@ const parsedServer = isServer
           EZIL_LIFECYCLE_AUTHORITY_SECRET: process.env.EZIL_LIFECYCLE_AUTHORITY_SECRET,
           EZIL_MOUNT_AUTHORITY_ENABLED: process.env.EZIL_MOUNT_AUTHORITY_ENABLED,
           EZIL_MOUNT_AUTHORITY_SECRET: process.env.EZIL_MOUNT_AUTHORITY_SECRET,
+          EZIL_START_AUTHORITY_ENABLED: process.env.EZIL_START_AUTHORITY_ENABLED,
+          EZIL_START_AUTHORITY_SECRET: process.env.EZIL_START_AUTHORITY_SECRET,
+          EZIL_START_CONTROL_KEY_POLICY: process.env.EZIL_START_CONTROL_KEY_POLICY,
           EZIL_LIFECYCLE_DEPLOYMENTS: process.env.EZIL_LIFECYCLE_DEPLOYMENTS,
           NODE_ENV: process.env.NODE_ENV,
       })
@@ -188,6 +218,9 @@ export const env = {
         EZIL_LIFECYCLE_AUTHORITY_SECRET: undefined,
         EZIL_MOUNT_AUTHORITY_ENABLED: 'false' as const,
         EZIL_MOUNT_AUTHORITY_SECRET: undefined,
+        EZIL_START_AUTHORITY_ENABLED: 'false' as const,
+        EZIL_START_AUTHORITY_SECRET: undefined,
+        EZIL_START_CONTROL_KEY_POLICY: null,
         EZIL_LIFECYCLE_DEPLOYMENTS: [],
         NODE_ENV: process.env.NODE_ENV ?? 'development',
     }),
