@@ -173,7 +173,7 @@ process.exit(0);
 // ═══════════════════════════════════════════════════════════════════════════
 
 /** A booted shell with the stubbed backend every scenario shares. */
-async function boot (viewport = { width: 1440, height: 900 }, { frameOk = true } = {}) {
+async function boot (viewport = { width: 1440, height: 900 }, { frameOk = true, displayDelayMs = 0 } = {}) {
     const page = await browser.newPage({ viewport });
     const page_errors = [];
     page.on('pageerror', (e) => page_errors.push(String(e)));
@@ -206,7 +206,10 @@ async function boot (viewport = { width: 1440, height: 900 }, { frameOk = true }
         if ( url.includes('/api/') ) {
             let body = { ok: true };
             if ( url.includes('confirm=frame') ) body = { ok: true, confirmed: frameOk, status: frameOk ? 200 : 500 };
-            else if ( url.includes('confirm=display') ) body = { ok: true, display: 'live' };
+            else if ( url.includes('confirm=display') ) {
+                await sleep(displayDelayMs);
+                body = { ok: true, display: 'live' };
+            }
             else if ( url.includes(ENDPOINTS.desktop) ) {
                 body = req.method() === 'POST'
                     ? { ok: true, guacamoleUrl: `${HOST}/frame?desktop=1`, frame: { confirmed: true } }
@@ -244,7 +247,13 @@ async function boot (viewport = { width: 1440, height: 900 }, { frameOk = true }
     // this same dock item. Done here rather than per scenario so there is one
     // place that decides what "a booted shell" means for this file.
     await page.evaluate(() => { $('.taskbar-item[data-app="desktop"]').trigger('click'); });
-    await sleep(1600);
+    // Boot does not await the remote display observation. A fixed delay can
+    // let full-bleed activate AFTER scenarioChrome has restored the titlebar,
+    // leaving its controls with zero rectangles on a busy runner.
+    if ( frameOk ) await waitForFullbleed(page);
+    else await page.waitForFunction(() => document.querySelector(
+        '.window[data-app="desktop"] .ezil-boot[data-kind="failed"]',
+    ), null, { timeout: 15_000 });
     return { page, page_errors };
 }
 
@@ -261,15 +270,24 @@ async function launch (page, id) {
     await sleep(700);
 }
 
-/** Leave full-bleed the way a real user does — the window's own minimise. */
+/** The visible state this fixture's successful display response must produce. */
+async function waitForFullbleed (page) {
+    await page.waitForFunction(() => {
+        const w = document.querySelector('.window[data-app="desktop"].ezil-fullbleed');
+        const r = w?.getBoundingClientRect();
+        return r && Math.abs(r.width - innerWidth) <= 1 && Math.abs(r.height - innerHeight) <= 1;
+    }, null, { timeout: 15_000 });
+}
+
+/** Minimise/restore and wait for the asynchronous full-bleed restoration. */
 async function leaveFullbleed (page) {
     await page.evaluate(() => {
         const w = document.querySelector('.window.ezil-fullbleed');
         if ( w ) w._ezil_minimise ? w._ezil_minimise() : $(w).hideWindow();
     });
-    await sleep(300);
+    await page.locator('.window[data-app="desktop"]').waitFor({ state: 'hidden', timeout: 15_000 });
     await page.evaluate(() => { $('.taskbar-item[data-app="desktop"]').trigger('click'); });
-    await sleep(300);
+    await waitForFullbleed(page);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -277,7 +295,9 @@ async function leaveFullbleed (page) {
 // ═══════════════════════════════════════════════════════════════════════════
 async function scenarioChrome () {
     const L = '[chrome]';
-    const { page, page_errors } = await boot();
+    // A slow display observation must finish before the harness restores the
+    // Browser and measures its controls. This exceeded the old 1600ms sleep.
+    const { page, page_errors } = await boot(undefined, { displayDelayMs: 2500 });
 
     // Get the Browser out of full-bleed so its head is on screen, then open
     // the other three so every window's chrome is under test at once.
