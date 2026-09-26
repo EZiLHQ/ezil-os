@@ -14,22 +14,27 @@ import { ComputerControlKeyPolicySchema, ComputerControlKeyObservationSchema, co
     type ComputerControlKeys, type ComputerControlKeyPolicy, type ComputerControlKeyWork } from './computer-control-key';
 
 type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
-type Options = LifecycleConsumerOptions & { keys: ComputerControlKeys; signal?: AbortSignal };
+export type ComputerStartAuthorityOptions = Pick<LifecycleConsumerOptions, 'database' | 'enabled' | 'osAccessMode' | 'deployments'>
+    & { keys: Pick<ComputerControlKeys, 'policy'>; signal?: AbortSignal };
+type Options = LifecycleConsumerOptions & ComputerStartAuthorityOptions & { keys: ComputerControlKeys };
 const uuid = z.string().uuid().regex(/^[a-f0-9-]+$/);
 const Input = z.object({ computerId: uuid, configurationId: uuid, mountAuthorizationId: uuid }).strict();
 type Input = z.infer<typeof Input>;
 export type ComputerStartIssueResult = { state: 'disabled' | 'denied' | 'unconfirmed' | 'recovery_required' }
     | { state: 'issued'; authorizationId: string; expiresAt: string };
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
-const policyCurrent = (o: Options, p: ComputerControlKeyPolicy) => {
+const policyCurrent = (o: ComputerStartAuthorityOptions, p: ComputerControlKeyPolicy) => {
     const current = ComputerControlKeyPolicySchema.safeParse(o.keys.policy);
     return current.success && same(current.data, p);
 };
 
 /** Computer first, then current mount/configuration authority, then queue rows.
  * A completed mount outlives its execution deadline. A stored configuration
- * still needs recompilation against live user/app authority before every effect. */
-async function load(tx: Transaction, o: Options, input: Input, policy: ComputerControlKeyPolicy) {
+ * still needs recompilation against live user/app authority before every effect.
+ * Only the issuer's first transaction may reserve a binding; delivery checks
+ * leave missing key/grant records missing. Callers retain locks through commit. */
+export async function loadComputerStartAuthority(tx: Transaction, o: ComputerStartAuthorityOptions, input: Input,
+    policy: ComputerControlKeyPolicy, reserveBinding = false) {
     if (!o.enabled || o.signal?.aborted || !policyCurrent(o, policy)) return null;
     await tx.execute(sql`SET LOCAL lock_timeout='2s'`); await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
     const [computer] = await tx.select().from(computers).where(eq(computers.id, input.computerId)).limit(1).for('update');
@@ -66,15 +71,16 @@ async function load(tx: Transaction, o: Options, input: Input, policy: ComputerC
         eq(bindings.computerGeneration, mount.computerGeneration))).limit(1).for('update');
     if (binding && (binding.revokedAt || Object.entries({ ...scope, ...policy })
         .some(([key, value]) => binding![key as keyof typeof binding] !== value))) return null;
+    if (!binding && !reserveBinding) return null;
     if (!binding) [binding] = await tx.insert(bindings).values({ ...scope, ...policy, creationMountId: mount.id }).returning();
     if (!binding) throw new Error('start_binding_unavailable');
     const [existing] = await tx.select({ grant: grants, active: sql<boolean>`${grants.expiresAt}>clock_timestamp()` }).from(grants)
         .where(and(eq(grants.computerId, computer.id), isNull(grants.revokedAt))).limit(1).for('update');
     const blocked = Boolean(existing && (!existing.active || existing.grant.configurationId !== target.id
         || existing.grant.controlBindingId !== binding.id || existing.grant.mountAuthorizationId !== mount.id));
-    return { owner: computer.userId, scope, work, fencedWriters, binding, existing: existing?.grant, blocked };
+    return { owner: computer.userId, scope, work, fencedWriters, binding, target, existing: existing?.grant, blocked };
 }
-type Authority = NonNullable<Awaited<ReturnType<typeof load>>>;
+type Authority = NonNullable<Awaited<ReturnType<typeof loadComputerStartAuthority>>>;
 const unchanged = (a: Authority, b: Authority | null): b is Authority => Boolean(b && a.owner === b.owner
     && a.binding.id === b.binding.id && same(a.scope, b.scope) && same(a.work, b.work) && same(a.fencedWriters, b.fencedWriters));
 async function fresh(tx: Transaction, observedAt: Date) {
@@ -111,7 +117,7 @@ export async function issueComputerStart(o: Options, input: unknown): Promise<Co
     const policy = ComputerControlKeyPolicySchema.safeParse(o.keys.policy);
     if (!policy.success) return { state: 'denied' };
     try {
-        const before = await o.database.transaction(tx => load(tx, o, parsed.data, policy.data));
+        const before = await o.database.transaction(tx => loadComputerStartAuthority(tx, o, parsed.data, policy.data, true));
         if (!before) return { state: 'denied' };
         if (before.blocked) return { state: 'recovery_required' };
         let observed: Awaited<ReturnType<Options['advance']>>;
@@ -126,7 +132,7 @@ export async function issueComputerStart(o: Options, input: unknown): Promise<Co
         } catch { return { state: 'unconfirmed' }; }
         const observedAt = observed.observedAt;
         const claim = await o.database.transaction(async tx => {
-            const after = await load(tx, o, parsed.data, policy.data);
+            const after = await loadComputerStartAuthority(tx, o, parsed.data, policy.data);
             if (!unchanged(before, after)) return { state: 'denied' as const };
             if (after.blocked) return { state: 'recovery_required' as const };
             if (!await fresh(tx, observedAt)) return { state: 'unconfirmed' as const };
@@ -148,7 +154,7 @@ export async function issueComputerStart(o: Options, input: unknown): Promise<Co
         if (key.versionId !== claim.work.versionId || !controlKeyArnMatches(policy.data, claim.work, key.secretArn)) return { state: 'unconfirmed' };
         const confirmed = key;
         return await o.database.transaction(async tx => {
-            const after = await load(tx, o, parsed.data, policy.data);
+            const after = await loadComputerStartAuthority(tx, o, parsed.data, policy.data);
             if (!unchanged(before, after)) return { state: 'denied' };
             if (after.blocked) return { state: 'recovery_required' };
             if (!await fresh(tx, observedAt)) return { state: 'unconfirmed' };
