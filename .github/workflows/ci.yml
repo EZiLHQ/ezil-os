@@ -323,6 +323,9 @@ jobs:
       - name: Computer filesystem identity (real Postgres)
         working-directory: app
         run: bun run test:db:filesystem-identity
+      - name: Computer mount authorization and receipts (real Postgres)
+        working-directory: app
+        run: bun run test:db:data-mounts
 
   connectors:
     name: sdk + mcp (typecheck + unit)
