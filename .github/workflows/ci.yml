@@ -335,6 +335,9 @@ jobs:
       - name: Computer startup authority and receipt races (real Postgres)
         working-directory: app
         run: bun run test:db:start-authority
+      - name: Computer startup issuer races and revocation
+        working-directory: app
+        run: bun run test:db:start-issuer
 
   connectors:
     name: sdk + mcp (typecheck + unit)
