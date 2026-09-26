@@ -79,13 +79,13 @@ async function pinDevice(d: BlockDevice) {
 
 /** Host-only bootstrap primitive. It never downloads a filesystem, repairs or
  * formats a retained volume, unmounts storage, or starts applications. */
-export async function mountComputerDataVolume(configPath: string, signal = AbortSignal.timeout(900000), beforeEffect?: () => Promise<void>) {
+async function reconcileComputerDataVolume(configPath: string, signal: AbortSignal, beforeEffect: (() => Promise<void>) | undefined, observeOnly: boolean) {
     if (process.platform !== 'linux' || process.getuid?.() !== 0) return fail();
     const plan = DataMountPlanSchema.parse(JSON.parse((await readHostFile(configPath, 4096)).toString()));
     if (configPath.startsWith(`${DATA_MOUNT}/`) || configPath.startsWith(`${journal}/`)) return fail();
     const lock = await acquireHostLock('data-mount');
     try {
-        await ensureHostDirectory(journal);
+        if (!observeOnly) await ensureHostDirectory(journal);
         const attemptPath = `${journal}/${plan.volumeId}.json`;
         const inventory = async () => {
             const d = resolveDataDevice(plan, JSON.parse(await run('/usr/bin/lsblk',
@@ -114,6 +114,7 @@ export async function mountComputerDataVolume(configPath: string, signal = Abort
             const decision = decideDataMount(plan, d, { mountInfo, marker, attempt: attempt === null ? null : JSON.parse(attempt) });
             await current(d);
             if (decision === 'ready') return { state: 'mounted' as const, computerId: plan.computerId, volumeId: plan.volumeId, filesystemUuid: plan.filesystemUuid };
+            if (observeOnly) return fail(); // Never mount, format or repair from a readiness check.
             if (decision === 'mark') {
                 // Only the exact filesystem UUID from a recorded format attempt
                 // may receive a new identity marker. Never adopt another disk.
@@ -147,6 +148,15 @@ export async function mountComputerDataVolume(configPath: string, signal = Abort
         }
         return fail();
     } finally { await lock.release(); }
+}
+
+export function mountComputerDataVolume(configPath: string, signal = AbortSignal.timeout(900000), beforeEffect?: () => Promise<void>) {
+    return reconcileComputerDataVolume(configPath, signal, beforeEffect, false);
+}
+/** Read-only device/UUID/marker verification, including descriptor-mounted
+ * filesystems whose source cannot be resolved by findmnt/udev. */
+export function observeComputerDataVolume(configPath: string, signal = AbortSignal.timeout(30000), check?: () => Promise<void>) {
+    return reconcileComputerDataVolume(configPath, signal, check, true);
 }
 
 // Node resolves the module URL through symlinks, but argv retains the launch

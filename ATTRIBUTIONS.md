@@ -275,11 +275,12 @@ local build/test tools; no source credentials or provider SDK is installed in
 the Reticle application image by the EZiL adapter.
 
 The host configuration source pins `@aws-sdk/client-s3` and
-`@aws-sdk/client-ecr` at 3.1140.0, both Apache-2.0 as checked in their
+`@aws-sdk/client-ecr`, plus the host control-key receiver's
+`@aws-sdk/client-secrets-manager`, at 3.1140.0, all Apache-2.0 as checked in their
 installed package metadata. They are from
 [AWS SDK for JavaScript v3](https://github.com/aws/aws-sdk-js-v3) and provide
 signed, version-specific configuration downloads and short-lived registry
-authentication. They run on the trusted host, not inside installed applications.
+authentication and generation-bound control-key reads. They run on the trusted host, not inside installed applications.
 No AWS source is copied or modified in this repository.
 
 The configuration process manager invokes the distribution-provided
