@@ -13,8 +13,15 @@ CREATE TABLE "ezil_computer_control_bindings" (
 	"kms_key_arn" text NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"revoked_at" timestamp with time zone,
+	"create_attempted_at" timestamp with time zone,
+	"key_confirmed_at" timestamp with time zone,
+	"secret_arn" text,
 	CONSTRAINT "ezil_control_binding_writer_uq" UNIQUE("computer_id","computer_generation"),
 	CONSTRAINT "ezil_control_binding_scope_uq" UNIQUE("id","computer_id","computer_generation"),
+	CONSTRAINT "ezil_control_binding_creation_chk" CHECK ((key_confirmed_at IS NULL) = (secret_arn IS NULL)
+        AND (key_confirmed_at IS NULL OR (create_attempted_at IS NOT NULL AND key_confirmed_at >= create_attempted_at))
+        AND (secret_arn IS NULL OR secret_arn ~ ('^arn:aws:secretsmanager:' || region || ':' || account_id || ':secret:'
+            || namespace || '/computers/' || computer_id::text || '/generations/' || computer_generation::text || '/control-[A-Za-z0-9]{6}$'))),
 	CONSTRAINT "ezil_control_binding_scope_chk" CHECK (computer_generation >= 1 AND provider_instance_id ~ '^i-[a-f0-9]{17}$' AND data_volume_id ~ '^vol-[a-f0-9]{17}$'),
 	CONSTRAINT "ezil_control_binding_reference_chk" CHECK (region = 'us-east-1' AND account_id ~ '^[0-9]{12}$'
         AND namespace ~ '^[a-z][a-z0-9-]{0,30}$' AND octet_length(control_domain) <= 190
@@ -84,14 +91,33 @@ LANGUAGE plpgsql SET search_path='' AS $$
 DECLARE a public.ezil_computer_data_mount_authorizations; deployment jsonb;
 BEGIN
     IF TG_OP='UPDATE' THEN
-        IF (to_jsonb(NEW)-'revoked_at') IS DISTINCT FROM (to_jsonb(OLD)-'revoked_at')
-            OR (OLD.revoked_at IS NOT NULL AND NEW.revoked_at IS DISTINCT FROM OLD.revoked_at) THEN
+        IF (to_jsonb(NEW)-ARRAY['revoked_at','create_attempted_at','key_confirmed_at','secret_arn'])
+            IS DISTINCT FROM (to_jsonb(OLD)-ARRAY['revoked_at','create_attempted_at','key_confirmed_at','secret_arn'])
+            OR (OLD.revoked_at IS NOT NULL AND NEW.revoked_at IS DISTINCT FROM OLD.revoked_at)
+            OR (OLD.create_attempted_at IS NOT NULL AND NEW.create_attempted_at IS DISTINCT FROM OLD.create_attempted_at)
+            OR (OLD.key_confirmed_at IS NOT NULL AND ROW(NEW.key_confirmed_at,NEW.secret_arn)
+                IS DISTINCT FROM ROW(OLD.key_confirmed_at,OLD.secret_arn)) THEN
             RAISE EXCEPTION 'control binding is immutable' USING ERRCODE='23514';
+        END IF;
+        -- Persist an attempt before CreateSecret. A crash or lost response may
+        -- only observe that reserved version, never authorize another creation.
+        IF OLD.create_attempted_at IS NULL AND NEW.create_attempted_at IS NOT NULL THEN
+            IF NEW.revoked_at IS NOT NULL OR NEW.key_confirmed_at IS NOT NULL THEN
+                RAISE EXCEPTION 'control key attempt invalid' USING ERRCODE='23514';
+            END IF;
+            NEW.create_attempted_at:=clock_timestamp();
+        END IF;
+        IF OLD.key_confirmed_at IS NULL AND NEW.key_confirmed_at IS NOT NULL THEN
+            IF OLD.create_attempted_at IS NULL OR NEW.revoked_at IS NOT NULL THEN
+                RAISE EXCEPTION 'control key confirmation invalid' USING ERRCODE='23514';
+            END IF;
+            NEW.key_confirmed_at:=clock_timestamp();
         END IF;
         IF OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL THEN NEW.revoked_at:=clock_timestamp(); END IF;
         RETURN NEW;
     END IF;
-    IF NEW.revoked_at IS NOT NULL OR NOT public.ezil_start_mount_current(NEW.creation_mount_id) THEN
+    IF NEW.revoked_at IS NOT NULL OR NEW.create_attempted_at IS NOT NULL OR NEW.key_confirmed_at IS NOT NULL OR NEW.secret_arn IS NOT NULL
+        OR NOT public.ezil_start_mount_current(NEW.creation_mount_id) THEN
         RAISE EXCEPTION 'control binding mount unavailable' USING ERRCODE='23514';
     END IF;
     SELECT * INTO a FROM public.ezil_computer_data_mount_authorizations WHERE id=NEW.creation_mount_id;
@@ -126,7 +152,7 @@ BEGIN
     IF NOT public.ezil_start_mount_current(s.mount_authorization_id) THEN RETURN false; END IF;
     SELECT * INTO a FROM public.ezil_computer_data_mount_authorizations WHERE id=s.mount_authorization_id;
     SELECT * INTO b FROM public.ezil_computer_control_bindings WHERE id=s.control_binding_id FOR SHARE;
-    IF NOT FOUND OR b.revoked_at IS NOT NULL THEN RETURN false; END IF;
+    IF NOT FOUND OR b.revoked_at IS NOT NULL OR b.key_confirmed_at IS NULL OR b.secret_arn IS NULL THEN RETURN false; END IF;
     -- The creation mount may be historical after same-generation stop/start.
     -- Reuse that immutable key reference, but require a fresh current mount.
     SELECT * INTO c FROM public.ezil_computer_configurations WHERE id=s.configuration_id;

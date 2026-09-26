@@ -7,7 +7,9 @@ import { computerInstances } from './computer-runtime';
 /** Immutable reference reservation, never a key or proof that AWS created it.
  * id is the pinned Secrets Manager VersionId. One key per writer generation;
  * revocation cannot be undone or followed by implicit same-generation rotation.
- * The issuer must independently approve domain/KMS policy and provider state. */
+ * Creation is attempted once; ambiguous retries observe instead of recreating.
+ * Confirmation stores only the AWS reference, never the key. The issuer must
+ * independently approve domain/KMS policy and provider state. */
 export const computerControlBindings = pgTable('ezil_computer_control_bindings', {
     id: uuid('id').primaryKey().defaultRandom(), computerId: uuid('computer_id').notNull(),
     computerGeneration: integer('computer_generation').notNull(), creationMountId: uuid('creation_mount_id').notNull(),
@@ -16,6 +18,8 @@ export const computerControlBindings = pgTable('ezil_computer_control_bindings',
     namespace: text('namespace').notNull(), controlDomain: text('control_domain').notNull(), kmsKeyArn: text('kms_key_arn').notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    createAttemptedAt: timestamp('create_attempted_at', { withTimezone: true }),
+    keyConfirmedAt: timestamp('key_confirmed_at', { withTimezone: true }), secretArn: text('secret_arn'),
 }, t => [
     foreignKey({ name: 'ezil_control_binding_writer_fkey', columns: [t.computerId, t.computerGeneration],
         foreignColumns: [computerInstances.computerId, computerInstances.generation] }).onDelete('restrict'),
@@ -23,6 +27,10 @@ export const computerControlBindings = pgTable('ezil_computer_control_bindings',
         foreignColumns: [computerDataMountAuthorizations.id] }).onDelete('restrict'),
     unique('ezil_control_binding_writer_uq').on(t.computerId, t.computerGeneration),
     unique('ezil_control_binding_scope_uq').on(t.id, t.computerId, t.computerGeneration),
+    check('ezil_control_binding_creation_chk', sql.raw(`(key_confirmed_at IS NULL) = (secret_arn IS NULL)
+        AND (key_confirmed_at IS NULL OR (create_attempted_at IS NOT NULL AND key_confirmed_at >= create_attempted_at))
+        AND (secret_arn IS NULL OR secret_arn ~ ('^arn:aws:secretsmanager:' || region || ':' || account_id || ':secret:'
+            || namespace || '/computers/' || computer_id::text || '/generations/' || computer_generation::text || '/control-[A-Za-z0-9]{6}$'))`)),
     check('ezil_control_binding_scope_chk', sql.raw("computer_generation >= 1 AND provider_instance_id ~ '^i-[a-f0-9]{17}$' AND data_volume_id ~ '^vol-[a-f0-9]{17}$'")),
     check('ezil_control_binding_reference_chk', sql.raw(`region = 'us-east-1' AND account_id ~ '^[0-9]{12}$'
         AND namespace ~ '^[a-z][a-z0-9-]{0,30}$' AND octet_length(control_domain) <= 190

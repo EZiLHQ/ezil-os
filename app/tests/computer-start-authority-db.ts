@@ -31,9 +31,17 @@ const bindingValues = (c: MountComputer, mount: string) => ({ computer_id: c.com
 async function binding(c: MountComputer, mount: string, changes: Record<string, unknown> = {}, db: Query = sql) {
     return (await db`INSERT INTO ezil_computer_control_bindings ${db({ ...bindingValues(c, mount), ...changes })} RETURNING *`)[0]!;
 }
-async function target(options: { prepared?: boolean; suspended?: boolean } = {}) {
+const secretArn = (b: Awaited<ReturnType<typeof binding>>) => `arn:aws:secretsmanager:${b.region}:${b.account_id}:secret:${b.namespace}/computers/${b.computer_id}/generations/${b.computer_generation}/control-Ab12Cd`;
+async function confirmKey(b: Awaited<ReturnType<typeof binding>>) {
+    // Simulated AWS evidence only; production issuance must inspect the real
+    // pinned version and persist the attempt BEFORE any CreateSecret request.
+    await sql`UPDATE ezil_computer_control_bindings SET create_attempted_at=now() WHERE id=${b.id}`;
+    return (await sql`UPDATE ezil_computer_control_bindings SET key_confirmed_at=now(),secret_arn=${secretArn(b)} WHERE id=${b.id} RETURNING *`)[0]!;
+}
+async function target(options: { prepared?: boolean; suspended?: boolean; keyReady?: boolean } = {}) {
     const c = await dataMountComputer(sql), config = await configuration(c, 1, options.prepared, options.suspended);
-    const mount = await recordConfigurationMount(sql, c), key = await binding(c, mount);
+    const mount = await recordConfigurationMount(sql, c), reserved = await binding(c, mount);
+    const key = options.keyReady === false ? reserved : await confirmKey(reserved);
     return { c, config, mount, key };
 }
 type Target = Awaited<ReturnType<typeof target>>;
@@ -75,7 +83,7 @@ try {
         });
         assert.deepEqual([...(await existing())], [...before]);
         assert.equal((await sql`SELECT * FROM ezil_computer_control_bindings`).length, 0);
-        await grant({ c, config, mount, key: await binding(c, mount) });
+        await grant({ c, config, mount, key: await confirmKey(await binding(c, mount)) });
     });
     await test('control references require completed mount and exact deployment/writer scope', async () => {
         const c = await dataMountComputer(sql), other = await dataMountComputer(sql);
@@ -92,6 +100,51 @@ try {
         const b = await binding(other, completed, { created_at: new Date(0) });
         assert.ok(b.created_at.getTime() > Date.now() - 5000);
         assert.equal(b.creation_mount_id, completed);
+    });
+    await test('a key reference alone cannot authorize startup; initial attempts and receipts cannot be forged', async () => {
+        const t = await target({ keyReady: false });
+        await reject(() => grant(t));
+        const c = await dataMountComputer(sql), mount = await recordConfigurationMount(sql, c);
+        for (const changes of [{ create_attempted_at: new Date() }, { key_confirmed_at: new Date(), secret_arn: secretArn(t.key) }]) {
+            await reject(() => binding(c, mount, changes));
+        }
+        await reject(() => sql`UPDATE ezil_computer_control_bindings SET key_confirmed_at=now(),secret_arn=${secretArn(t.key)} WHERE id=${t.key.id}`);
+        await reject(() => sql`UPDATE ezil_computer_control_bindings SET create_attempted_at=now(),key_confirmed_at=now(),secret_arn=${secretArn(t.key)} WHERE id=${t.key.id}`);
+        t.key = await confirmKey(t.key); await grant(t);
+    });
+    await test('a persisted creation attempt can be claimed only once, including concurrent workers', async () => {
+        const t = await target({ keyReady: false });
+        const claim = () => sql`UPDATE ezil_computer_control_bindings SET create_attempted_at=${new Date(0)}
+            WHERE id=${t.key.id} AND create_attempted_at IS NULL RETURNING *`;
+        const claimed = (await Promise.all([claim(), claim()])).flat(); assert.equal(claimed.length, 1);
+        assert.ok(claimed[0]!.create_attempted_at.getTime() > Date.now() - 5000);
+        assert.equal((await claim()).length, 0);
+        await reject(() => sql`UPDATE ezil_computer_control_bindings SET create_attempted_at=NULL WHERE id=${t.key.id}`);
+        await reject(() => sql`UPDATE ezil_computer_control_bindings SET create_attempted_at=clock_timestamp() WHERE id=${t.key.id}`);
+        await reject(() => grant(t));
+    });
+    await test('key confirmation binds the exact ARN, is timestamped by SQL and remains immutable', async () => {
+        const t = await target({ keyReady: false });
+        await sql`UPDATE ezil_computer_control_bindings SET create_attempted_at=now() WHERE id=${t.key.id}`;
+        for (const arn of [secretArn(t.key).replace(t.c.computerId, randomUUID()), secretArn(t.key).replace('/generations/1/', '/generations/2/'),
+            secretArn(t.key).replace(deployment.accountId, '999999999999'), secretArn(t.key).replace('/control-', '/other-')]) {
+            await reject(() => sql`UPDATE ezil_computer_control_bindings SET key_confirmed_at=now(),secret_arn=${arn} WHERE id=${t.key.id}`);
+        }
+        const [key] = await sql`UPDATE ezil_computer_control_bindings SET key_confirmed_at=${new Date(0)},secret_arn=${secretArn(t.key)} WHERE id=${t.key.id} RETURNING *`;
+        assert.ok(key!.key_confirmed_at >= key!.create_attempted_at);
+        await reject(() => sql`UPDATE ezil_computer_control_bindings SET secret_arn=${secretArn(t.key).replace('Ab12Cd', 'Ef34Gh')} WHERE id=${t.key.id}`);
+        await reject(() => sql`UPDATE ezil_computer_control_bindings SET key_confirmed_at=NULL,secret_arn=NULL WHERE id=${t.key.id}`);
+        await sql`UPDATE ezil_computer_control_bindings SET revoked_at=now() WHERE id=${t.key.id}`;
+        assert.equal((await sql`SELECT secret_arn FROM ezil_computer_control_bindings WHERE id=${t.key.id}`)[0]!.secret_arn, secretArn(t.key));
+    });
+    await test('revocation blocks new creation attempts and late key confirmation', async () => {
+        for (const attempted of [false, true]) {
+            const t = await target({ keyReady: false });
+            if (attempted) await sql`UPDATE ezil_computer_control_bindings SET create_attempted_at=now() WHERE id=${t.key.id}`;
+            await sql`UPDATE ezil_computer_control_bindings SET revoked_at=now() WHERE id=${t.key.id}`;
+            if (!attempted) await reject(() => sql`UPDATE ezil_computer_control_bindings SET create_attempted_at=now() WHERE id=${t.key.id}`);
+            await reject(() => sql`UPDATE ezil_computer_control_bindings SET key_confirmed_at=now(),secret_arn=${secretArn(t.key)} WHERE id=${t.key.id}`);
+        }
     });
     await test('control references are immutable and terminal revocation cannot rotate the same writer key', async () => {
         const t = await target();

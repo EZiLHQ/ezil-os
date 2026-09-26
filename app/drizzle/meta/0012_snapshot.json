@@ -1,5 +1,5 @@
 {
-  "id": "4e5b3f4f-2a1c-462f-a17e-b5d39b891f3b",
+  "id": "ee13c4c9-70b1-4702-9192-bcda02b39db3",
   "prevId": "f6b79807-0623-41a5-a39b-67e0491b7d42",
   "version": "7",
   "dialect": "postgresql",
@@ -1690,6 +1690,24 @@
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false
+        },
+        "create_attempted_at": {
+          "name": "create_attempted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "key_confirmed_at": {
+          "name": "key_confirmed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "secret_arn": {
+          "name": "secret_arn",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
         }
       },
       "indexes": {},
@@ -1745,6 +1763,10 @@
       },
       "policies": {},
       "checkConstraints": {
+        "ezil_control_binding_creation_chk": {
+          "name": "ezil_control_binding_creation_chk",
+          "value": "(key_confirmed_at IS NULL) = (secret_arn IS NULL)\n        AND (key_confirmed_at IS NULL OR (create_attempted_at IS NOT NULL AND key_confirmed_at >= create_attempted_at))\n        AND (secret_arn IS NULL OR secret_arn ~ ('^arn:aws:secretsmanager:' || region || ':' || account_id || ':secret:'\n            || namespace || '/computers/' || computer_id::text || '/generations/' || computer_generation::text || '/control-[A-Za-z0-9]{6}$'))"
+        },
         "ezil_control_binding_scope_chk": {
           "name": "ezil_control_binding_scope_chk",
           "value": "computer_generation >= 1 AND provider_instance_id ~ '^i-[a-f0-9]{17}$' AND data_volume_id ~ '^vol-[a-f0-9]{17}$'"
