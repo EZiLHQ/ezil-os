@@ -12,7 +12,8 @@ export async function proxy(request: NextRequest) {
     // This service endpoint authenticates its signed body itself. Unrelated
     // browser cookies must not trigger Supabase refresh or Set-Cookie here.
     if (request.nextUrl.pathname === '/api/internal/apps/configuration-authority'
-        || request.nextUrl.pathname === '/api/internal/computers/lifecycle-authority') return NextResponse.next();
+        || request.nextUrl.pathname === '/api/internal/computers/lifecycle-authority'
+        || request.nextUrl.pathname === '/api/internal/computers/mount-authority') return NextResponse.next();
     return updateSession(request);
 }
 

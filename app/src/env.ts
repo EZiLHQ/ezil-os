@@ -79,6 +79,10 @@ const serverSchema = z.object({
     EZIL_LIFECYCLE_AUTHORITY_ENABLED: z.string().refine(value => ['true', 'false'].includes(value),
         'invalid_lifecycle_authority_flag').default('false'),
     EZIL_LIFECYCLE_AUTHORITY_SECRET: z.string().regex(/^[a-f0-9]{64}$/, 'invalid_lifecycle_authority_secret').optional(),
+    /** Read-only current mount checks. Apply migration 0011 before activation. */
+    EZIL_MOUNT_AUTHORITY_ENABLED: z.string().refine(value => ['true', 'false'].includes(value),
+        'invalid_mount_authority_flag').default('false'),
+    EZIL_MOUNT_AUTHORITY_SECRET: z.string().regex(/^[a-f0-9]{64}$/, 'invalid_mount_authority_secret').optional(),
     EZIL_LIFECYCLE_DEPLOYMENTS: z.string().max(65536).default('[]').transform((raw, ctx) => {
         try {
             const parsed = z.array(LifecycleApprovalSchema).max(16).safeParse(JSON.parse(raw));
@@ -89,6 +93,12 @@ const serverSchema = z.object({
     }),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
 }).superRefine((value, context) => {
+    if (value.EZIL_MOUNT_AUTHORITY_ENABLED === 'true') {
+        if (!value.EZIL_MOUNT_AUTHORITY_SECRET) context.addIssue({ code: 'custom', path: ['EZIL_MOUNT_AUTHORITY_SECRET'], message: 'mount_authority_secret_required' });
+        if (!value.EZIL_LIFECYCLE_DEPLOYMENTS.length) context.addIssue({ code: 'custom', path: ['EZIL_LIFECYCLE_DEPLOYMENTS'], message: 'mount_deployment_required' });
+        if (value.EZIL_MOUNT_AUTHORITY_SECRET && [value.EZIL_LIFECYCLE_AUTHORITY_SECRET, value.EZIL_CONFIGURATION_AUTHORITY_SECRET]
+            .includes(value.EZIL_MOUNT_AUTHORITY_SECRET)) context.addIssue({ code: 'custom', path: ['EZIL_MOUNT_AUTHORITY_SECRET'], message: 'mount_authority_distinct_key_required' });
+    }
     if (value.EZIL_LIFECYCLE_AUTHORITY_ENABLED === 'true') {
         if (!value.EZIL_LIFECYCLE_AUTHORITY_SECRET) context.addIssue({ code: 'custom',
             path: ['EZIL_LIFECYCLE_AUTHORITY_SECRET'], message: 'lifecycle_authority_secret_required' });
@@ -127,6 +137,8 @@ const parsedServer = isServer
           EZIL_CONFIGURATION_AUTHORITY_SECRET: process.env.EZIL_CONFIGURATION_AUTHORITY_SECRET,
           EZIL_LIFECYCLE_AUTHORITY_ENABLED: process.env.EZIL_LIFECYCLE_AUTHORITY_ENABLED,
           EZIL_LIFECYCLE_AUTHORITY_SECRET: process.env.EZIL_LIFECYCLE_AUTHORITY_SECRET,
+          EZIL_MOUNT_AUTHORITY_ENABLED: process.env.EZIL_MOUNT_AUTHORITY_ENABLED,
+          EZIL_MOUNT_AUTHORITY_SECRET: process.env.EZIL_MOUNT_AUTHORITY_SECRET,
           EZIL_LIFECYCLE_DEPLOYMENTS: process.env.EZIL_LIFECYCLE_DEPLOYMENTS,
           NODE_ENV: process.env.NODE_ENV,
       })
@@ -174,6 +186,8 @@ export const env = {
         EZIL_CONFIGURATION_AUTHORITY_SECRET: undefined,
         EZIL_LIFECYCLE_AUTHORITY_ENABLED: 'false' as const,
         EZIL_LIFECYCLE_AUTHORITY_SECRET: undefined,
+        EZIL_MOUNT_AUTHORITY_ENABLED: 'false' as const,
+        EZIL_MOUNT_AUTHORITY_SECRET: undefined,
         EZIL_LIFECYCLE_DEPLOYMENTS: [],
         NODE_ENV: process.env.NODE_ENV ?? 'development',
     }),
