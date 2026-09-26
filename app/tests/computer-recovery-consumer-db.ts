@@ -10,6 +10,7 @@ import { lifecycleDeployment as deployment } from './fixtures/lifecycle';
 import { runtimeTestDatabase } from './helpers/runtime-database';
 import { createLifecycleAuthorityHandler } from '../src/server/app-platform/lifecycle-authority-http';
 import { LIFECYCLE_AUTHORITY_PATH, lifecycleAuthoritySignature } from '../src/server/app-platform/lifecycle-authority-protocol';
+import { prepareApplicationComputerStart } from '../src/server/app-platform/application-computer-start';
 
 const fixture = await runtimeTestDatabase(), { sql } = fixture;
 const { instanceProfileArn: _profile, ...shared } = deployment;
@@ -103,6 +104,18 @@ try {
             assert.equal(rows.at(-1)!.fenced_at, null); if (allocated) assert.ok(rows[0]!.fenced_at);
             assert.equal((await sql`SELECT data_volume_id FROM ezil_computer_runtimes WHERE computer_id=${s.computerId}`)[0]!.data_volume_id, s.volume);
             assert.ok((await state(s.jobId)).delivered_at);
+            // A later Open on this recovered writer must retain v2 deployment
+            // pins and the disk while emitting the existing v1 start protocol.
+            await sql`UPDATE ezil_computer_instances SET observed_state='stopped' WHERE computer_id=${s.computerId} AND fenced_at IS NULL`;
+            await options.database.transaction(tx => prepareApplicationComputerStart(tx, { computerId: s.computerId,
+                userId: s.userId, computerGeneration: received!.generation, appJobId: randomUUID(),
+                deployments: options.deployments, osAccessMode: 'invite' }));
+            const [start] = await sql`SELECT i.* FROM ezil_computer_lifecycle_intents i WHERE computer_id=${s.computerId} AND operation='start'`;
+            assert.equal(start!.target_generation, received!.generation);
+            assert.equal(start!.provider_instance_id, received!.instanceId);
+            assert.equal(start!.data_volume_id, s.volume);
+            assert.equal(JSON.parse(start!.deployment).instanceProfileArn,
+                `arn:aws:iam::123456789012:instance-profile/ezil/pilot/computers/${s.computerId}/g${received!.generation}`);
         }
     });
     await test('signed v2 authority reads current scope on replay and cannot be confused with v1 or another computer', async () => {

@@ -84,8 +84,24 @@ retry and generates a new UUID for a new user action. An older receipt may retur
 `isLatestCommand: false`; it never re-enqueues its old command. Even when several
 fresh Open requests share one job, every accepted request retains its own receipt.
 
-A prepared stopped computer gets one durable computer-start job/outbox event for
-its existing writer generation. Provisioning and replacement must establish the
+A prepared stopped computer gets one durable computer-start job, outbox event,
+and immutable lifecycle intent for its existing writer generation. All three
+commit with the application command, request receipt and audit. The producer
+uses the last canonical v1 lifecycle or v2 recovery instruction to retain the
+existing writer's deployment, checks it against `EZIL_LIFECYCLE_DEPLOYMENTS`, and
+freezes the recorded instance ID, disk ID and fence token. Empty or revoked
+deployment approval denies new requests. No browser input selects these values.
+V1 and v2 use one consecutive lifecycle revision ledger.
+
+Concurrent Opens share the same pending computer start. A pending job without
+an immutable instruction requires explicit recovery; it is never silently
+backfilled. Failed, cancelled, unacknowledged or spent work is not revived by a
+new Open. Replaying an accepted request returns its historical receipt without
+changing desired state. A running approved writer adds no computer start job.
+
+This path reads the schema through migration `0008`; apply reviewed additive
+migrations before enabling the runtime API. It does not enable any flag,
+scheduler or cloud transport. Provisioning and replacement must establish the
 runtime/disk/writer association first. The producer does not allocate resources
 or fence a writer. Pending stop/replacement/migration work blocks a new Open.
 Stop records the last owned plan without requiring a still-approved release or
@@ -125,6 +141,14 @@ uses independent database connections rather than a mocked transaction callback.
 `EZIL_TEST_COMPILED_PLANS=/absolute/output.json` optionally writes the test-generated
 Node and Reticle plans for checking against the supervisor's v1 protocol. These
 are synthetic release fixtures, not real runtime or public-release acceptance.
+
+`bun --no-env-file run test:db:application-computer-start` exercises actual
+PostgreSQL authority checks, concurrent starts, immutable deployment reuse and
+recovery refusals. The runtime API suite also passes its produced instruction
+through the existing lifecycle consumer. The recovery consumer suite verifies
+that a later application Open retains a recovered writer's per-writer profile
+and disk. Provider responses in these suites are fixtures; a settled computer
+job leaves the application job pending until separate host readiness checks pass.
 
 ## Dispatcher and host observations
 
