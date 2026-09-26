@@ -48,7 +48,7 @@ if (phase === 'install') {
     assert.notEqual((await ctl('show', 'ezil-supervisor.service', '--property=ActiveState', '--value')).stdout.trim(), 'active');
     for (const name of units) {
         assert((await readFile(`/etc/systemd/system/${name}`)).equals(await readFile(join(source, 'payload/deploy', name))));
-        assert.equal((await ctl('show', name, '--property=FragmentPath', '--value')).stdout.trim(), `/etc/systemd/system/${name}`);
+        assert.equal((await ctl('show', name.replace('@.', '@probe.'), '--property=FragmentPath', '--value')).stdout.trim(), `/etc/systemd/system/${name}`);
     }
     const marker = `${destination}/unlisted.js`; await writeFile(marker, 'extra');
     try { await failed(install()); } finally { await unlink(marker); }
@@ -61,11 +61,17 @@ if (phase === 'install') {
     console.log('PASS root-owned release, exact units and repeat installation; unknown files, permissive code and implicit upgrades are rejected');
 
     for (const [path, code] of [['dist/delivery-operation.js', 'delivery_operation_failed'], ['current/dist/mount-operation.js', 'mount_operation_failed']]) {
-        await assert.rejects(command('/usr/local/bin/node', [`${root}/${path}`, 'invalid']), e =>
+        await assert.rejects(command('/usr/local/bin/node', ['--disable-warning=ExperimentalWarning', `${root}/${path}`, 'invalid']), e =>
             e.code === 1 && e.stderr === `{"code":"${code}"}\n`);
     }
     for (const name of [`ezil-configuration@prepare-${randomUUID()}.service`, `ezil-mount@mount-${randomUUID()}.service`]) {
-        await assert.rejects(ctl('start', name));
+        // Type=exec acknowledges execve, not the executor's eventual outcome.
+        try { await ctl('start', name); } catch (e) { if (e.code !== 1) throw e; }
+        for (let n = 0; n < 100; n++) {
+            if ((await ctl('show', name, '--property=ActiveState', '--value')).stdout.trim() === 'failed') break;
+            await delay(50);
+        }
+        assert.equal((await ctl('show', name, '--property=ActiveState', '--value')).stdout.trim(), 'failed');
         assert.equal((await ctl('show', name, '--property=Result', '--value')).stdout.trim(), 'exit-code');
         assert.equal((await ctl('show', name, '--property=MainPID', '--value')).stdout.trim(), '0');
         await ctl('reset-failed', name);
@@ -83,7 +89,11 @@ if (phase === 'install') {
     await ctl('enable', 'ezil-supervisor.service', 'ezil-data-mount.service'); await ctl('start', 'ezil-supervisor.service');
 } else {
     const old = JSON.parse(await readFile(saved)); assert.notEqual(old.bootId, bootId); assert.equal(old.digest, digest);
-    assert.equal((await ctl('is-active', 'ezil-supervisor.service')).stdout.trim(), 'active');
+    for (let n = 0; n < 100; n++) {
+        if ((await ctl('show', 'ezil-supervisor.service', '--property=ActiveState', '--value')).stdout.trim() === 'active') break;
+        await delay(100);
+    }
+    assert.equal((await ctl('show', 'ezil-supervisor.service', '--property=ActiveState', '--value')).stdout.trim(), 'active');
 }
 // Load the installed release itself, not test-tree replacements.
 const { signControlRequest } = await import(`${destination}/dist/control-auth.js`);
@@ -107,4 +117,16 @@ try {
     try { assert.deepEqual(db.prepare('SELECT value FROM state').all().map(r => r.value), ['committed']); } finally { db.close(); }
     assert.equal((await command('/usr/bin/docker', ['ps', '-aq'])).stdout.trim(), '');
     console.log(`PASS installed supervisor ${phase}: signed loaded configuration, cross-computer denial and retained filesystem/SQLite; no apps started`);
+    if (phase === 'install') {
+        await ctl('stop', 'ezil-supervisor.service', 'ezil-data-mount.service');
+        try {
+            await writeFile(`${configRoot}/data-volume.json`, JSON.stringify({ ...plan, filesystemUuid: randomUUID() }));
+            await assert.rejects(ctl('start', 'ezil-supervisor.service'));
+            assert.equal((await ctl('show', 'ezil-supervisor.service', '--property=MainPID', '--value')).stdout.trim(), '0');
+        } finally {
+            await writeFile(`${configRoot}/data-volume.json`, JSON.stringify(plan));
+            await ctl('reset-failed', 'ezil-supervisor.service', 'ezil-data-mount.service');
+        }
+        console.log('PASS the installed mount dependency blocks supervisor startup with the wrong filesystem identity');
+    }
 } finally { secret.fill(0); await ctl('stop', 'ezil-supervisor.service'); }

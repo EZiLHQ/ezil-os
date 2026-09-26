@@ -26,7 +26,7 @@ async function directory(path, create = false) {
 // Pin each source ancestor and file; symlink/FIFO/device substitutions cannot
 // escape the input tree or block this privileged copy. Source owners need not
 // be root: the externally supplied release digest is the content authority.
-async function sourceFile(source, relative, limit) {
+async function sourceFile(source, relative, limit, durable = false) {
     let parent = await open(source, directoryFlags);
     try {
         const parts = relative.split('/'), name = parts.pop();
@@ -36,7 +36,7 @@ async function sourceFile(source, relative, limit) {
             const stat = await file.stat(); if (!stat.isFile() || stat.nlink !== 1 || stat.size > limit) return fail();
             const bytes = Buffer.alloc(limit + 1); let size = 0;
             while (size < bytes.length) { const r = await file.read(bytes, size, bytes.length - size); if (!r.bytesRead) break; size += r.bytesRead; }
-            if (size > limit) return fail(); return bytes.subarray(0, size);
+            if (size > limit) return fail(); if (durable) await file.sync(); return bytes.subarray(0, size);
         } finally { await file.close(); }
     } finally { await parent.close(); }
 }
@@ -52,7 +52,7 @@ async function write(path, bytes) {
 async function absentOrSame(path, bytes) {
     try {
         const s = await lstat(path); if (!s.isFile() || s.uid !== 0 || s.mode & 0o022 || s.nlink !== 1) return fail();
-        if (!(await sourceFile(dirname(path), path.split('/').pop(), bytes.length)).equals(bytes)) return fail();
+        if (!(await sourceFile(dirname(path), path.split('/').pop(), bytes.length, true)).equals(bytes)) return fail();
         return false;
     } catch (e) { if (e.code === 'ENOENT') return true; throw e; }
 }
@@ -60,8 +60,9 @@ async function link(path, target) {
     try { const s = await lstat(path); if (!s.isSymbolicLink() || s.uid !== 0 || await readlink(path) !== target) return fail(); }
     catch (e) {
         if (e.code !== 'ENOENT') throw e;
-        await symlink(target, path); const parent = await directory(dirname(path)); try { await parent.sync(); } finally { await parent.close(); }
+        await symlink(target, path);
     }
+    const parent = await directory(dirname(path)); try { await parent.sync(); } finally { await parent.close(); }
 }
 async function verifyInstalled(destination, release, manifest) {
     const expected = new Set(['release.json', ...release.files.map(f => f.path)]);
@@ -73,12 +74,13 @@ async function verifyInstalled(destination, release, manifest) {
                 if (stat.isDirectory()) await visit(child, rel);
                 else if (!expected.delete(rel) || !stat.isFile() || stat.uid !== 0 || stat.mode & 0o022 || stat.nlink !== 1) return fail();
             }
+            await d.sync();
         } finally { await d.close(); }
     }
     await visit(destination); if (expected.size) return fail();
-    if (!(await sourceFile(destination, 'release.json', limits.manifest)).equals(manifest)) return fail();
+    if (!(await sourceFile(destination, 'release.json', limits.manifest, true)).equals(manifest)) return fail();
     for (const f of release.files) {
-        const bytes = await sourceFile(destination, f.path, f.bytes);
+        const bytes = await sourceFile(destination, f.path, f.bytes, true);
         if (bytes.length !== f.bytes || hash(bytes) !== f.sha256) return fail();
     }
 }
@@ -116,8 +118,8 @@ async function install(source, digest) {
             await write(join(stage, f.path), bytes);
         }
         await write(`${stage}/release.json`, manifest); await rename(stage, destination);
-        const parent = await directory(`${root}/releases`); try { await parent.sync(); } finally { await parent.close(); }
     }
+    const parent = await directory(`${root}/releases`); try { await parent.sync(); } finally { await parent.close(); }
     // Both historic SSM/configuration paths and the mount workflow resolve to
     // one immutable code/dependency tree. Never rewrite the pinned documents.
     await link(`${root}/current`, `releases/${digest}`); await link(`${root}/dist`, 'current/dist');
@@ -125,6 +127,7 @@ async function install(source, digest) {
         const bytes = await sourceFile(destination, `deploy/${name}`, limits.file);
         if (await absentOrSame(`${systemd}/${name}`, bytes)) await write(`${systemd}/${name}`, bytes);
     }
+    const unitDirectory = await directory(systemd); try { await unitDirectory.sync(); } finally { await unitDirectory.close(); }
     execFileSync('/usr/bin/systemctl', ['daemon-reload'], { env, timeout: 15000, stdio: 'pipe' });
     return { state: 'installed', releaseDigest: digest, sourceCommit: release.sourceCommit };
 }

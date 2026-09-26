@@ -6,6 +6,8 @@ Reticle 3.2.0 daemon. A [real Docker driver](DRIVER.md) performs local
 container execution through that HTTP boundary. The [Linux host executable](HOST.md)
 adds protected configuration, a kernel singleton lock and process recovery.
 The EBS controller, Cloudflare routing, and marketplace integration remain pending.
+The [offline host installer](INSTALLATION.md) packages a verified release under
+both fixed operation paths; image publication and per-computer first start remain separate.
 The HTTP unit tests use an instrumented driver; the separate Linux acceptance
 suite uses actual Docker containers and an ext4 loop disk.
 
