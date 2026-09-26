@@ -1,7 +1,7 @@
-import { constants, realpathSync } from 'node:fs';
+import { constants } from 'node:fs';
 import { chmod, lstat, open, readdir } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
-import { pathToFileURL } from 'node:url';
+import { isEntrypoint } from './entrypoint.js';
 import { basename, dirname } from 'node:path';
 import { ensureHostDirectory, readHostFile } from './host-config.js';
 import { openHostDirectory } from './mounts.js';
@@ -148,10 +148,7 @@ export async function mountComputerDataVolume(configPath: string, signal = Abort
 
 // Node resolves the module URL through symlinks, but argv retains the launch
 // path. Deployment paths may be symlinks; never silently exit zero there.
-let isEntrypoint = false;
-try { isEntrypoint = !!process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href; }
-catch { /* A library import from stdin has no filesystem entrypoint. */ }
-if (isEntrypoint) {
+if (isEntrypoint(import.meta.url)) {
     const controller = new AbortController();
     process.once('SIGTERM', () => controller.abort()); process.once('SIGINT', () => controller.abort());
     const args = process.argv.slice(2);

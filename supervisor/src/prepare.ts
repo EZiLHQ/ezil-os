@@ -2,7 +2,7 @@ import { constants } from 'node:fs';
 import { open, rename, unlink } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { isEntrypoint } from './entrypoint.js';
 import { z } from 'zod';
 import { Docker, DockerError } from './docker.js';
 import { admitMountedDataVolume } from './data-volume.js';
@@ -154,7 +154,7 @@ async function main() {
             configurationDigest: result.configurationDigest })}\n`);
     } finally { process.removeListener('SIGTERM', cancel); process.removeListener('SIGINT', cancel); }
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isEntrypoint(import.meta.url)) {
     void main().catch((error: unknown) => {
         const codes = ['preparation_arguments_invalid', 'preparation_cancelled', 'preparation_commit_unconfirmed',
             'configuration_revision_conflict', 'host_restart_required', 'preparation_already_running',

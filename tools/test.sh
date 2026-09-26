@@ -454,15 +454,17 @@ run_local () {
 run_supervisor () {
     typecheck "$TREE/supervisor" npm run typecheck || return 1
     ( cd "$TREE/supervisor" && npm test && npm run build ) || return 1
-    if [[ "${1:-}" == "--linux-data-volume" ]]; then
+    if [[ "${1:-}" == "--linux-data-volume" || "${1:-}" == "--linux-retained-host" ]]; then
         if [[ "$(uname -s)" != "Linux" ]]; then
             say "data-volume acceptance requires a disposable QEMU VM and its dedicated test NVMe disk"
             return 1
         fi
+        local acceptance_script="data-mount.linux.mjs"
+        if [[ "$1" == "--linux-retained-host" ]]; then acceptance_script="retained-host.linux.mjs"; fi
         if [[ "$(id -u)" == "0" ]]; then
-            node "$TREE/supervisor/test/data-mount.linux.mjs" "${2:-}"
+            node "$TREE/supervisor/test/$acceptance_script" "${2:-}"
         else
-            sudo -n "$(command -v node)" "$TREE/supervisor/test/data-mount.linux.mjs" "${2:-}"
+            sudo -n "$(command -v node)" "$TREE/supervisor/test/$acceptance_script" "${2:-}"
         fi
         return $?
     fi

@@ -1,4 +1,4 @@
-import { pathToFileURL } from 'node:url';
+import { isEntrypoint } from './entrypoint.js';
 import { canonicalJson } from './control-protocol.js';
 import { validateDelivery, descriptor, type Delivery } from './configuration-delivery-contract.js';
 import { receiveConfiguration } from './configuration-receiver.js';
@@ -38,7 +38,7 @@ export async function executeDelivery(key: string, options: DeliveryHostOptions 
         clearTimeout(timer); process.removeListener('SIGTERM', cancel); process.removeListener('SIGINT', cancel); store.close();
     }
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isEntrypoint(import.meta.url)) {
     void (async () => {
         if (process.argv.length !== 3) throw new Error('delivery_execution_invalid');
         await executeDelivery(process.argv[2]!);
