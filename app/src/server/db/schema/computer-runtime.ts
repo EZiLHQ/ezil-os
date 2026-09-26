@@ -26,6 +26,9 @@ export const computerRuntimes = pgTable('ezil_computer_runtimes', {
     region: text('region').notNull(),
     availabilityZone: text('availability_zone'),
     dataVolumeId: text('data_volume_id').unique('ezil_computer_runtimes_volume_uq'),
+    // Frozen before new-disk allocation; existing disks remain unknown until
+    // their actual filesystem is inspected. A UUID is identity, not format authority.
+    dataFilesystemUuid: uuid('data_filesystem_uuid').unique('ezil_computer_runtimes_filesystem_uq'),
     nextGeneration: integer('next_generation').notNull().default(1),
     desiredState: text('desired_state').$type<'stopped' | 'running' | 'retired'>().notNull().default('stopped'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
