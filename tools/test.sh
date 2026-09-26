@@ -454,6 +454,14 @@ run_local () {
 run_supervisor () {
     typecheck "$TREE/supervisor" npm run typecheck || return 1
     ( cd "$TREE/supervisor" && npm test && npm run build ) || return 1
+    if [[ "${1:-}" == "--linux-host-install" ]]; then
+        if [[ "$(uname -s)" != "Linux" || "$(id -u)" != "0" ]]; then
+            say "host installation acceptance requires root in its disposable QEMU fixture"
+            return 1
+        fi
+        node "$TREE/supervisor/test/host-installation.linux.mjs" "${2:-}" "${3:-}"
+        return $?
+    fi
     if [[ "${1:-}" == "--linux-data-volume" || "${1:-}" == "--linux-retained-host" || "${1:-}" == "--linux-mount-delivery" || "${1:-}" == "--linux-mount-operation" ]]; then
         if [[ "$(uname -s)" != "Linux" ]]; then
             say "data-volume acceptance requires a disposable QEMU VM and its dedicated test NVMe disk"

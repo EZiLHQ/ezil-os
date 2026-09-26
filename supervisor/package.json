@@ -9,7 +9,7 @@
   "scripts": {
     "build": "tsc --project tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts && node --test reticle/verify-artifact.test.mjs"
+    "test": "node --import tsx --test test/*.test.ts && node --test reticle/verify-artifact.test.mjs deploy/*.test.mjs"
   },
   "devDependencies": {
     "@types/node": "24.3.0",
