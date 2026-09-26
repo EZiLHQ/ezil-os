@@ -15,6 +15,14 @@ export const MountRecordsSchema = z.object({ provisioning: ProvisioningSchema, a
     catch { return false; }
 }, 'invalid_mount_records');
 export type MountRecords = z.infer<typeof MountRecordsSchema>;
+/** Sync the directory's entry in its parent before acknowledging any records
+ * beneath it. Syncing only the new directory can lose the entire operation
+ * after power loss, including its dispatch/cancellation fence. */
+export async function ensureDurableDirectory(path: string) {
+    await ensureHostDirectory(path);
+    const parent = await openHostDirectory(dirname(path));
+    try { await parent.sync(); } finally { await parent.close(); }
+}
 export async function optionalProtected(path: string) {
     try { await lstat(path); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null; throw e; }
     return readHostFile(path, 16384);
@@ -51,7 +59,7 @@ export class MountOperationStore {
         if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(authorizationId)) throw new Error('mount_record_invalid');
         this.path = `${directory}/${authorizationId}`;
     }
-    async initialize() { await ensureHostDirectory(this.path); }
+    async initialize() { await ensureDurableDirectory(this.path); }
     async records() {
         const bytes = await optionalProtected(`${this.path}/records.json`);
         if (!bytes) return null;

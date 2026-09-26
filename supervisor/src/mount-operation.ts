@@ -3,11 +3,10 @@ import { isEntrypoint } from './entrypoint.js';
 import { canonicalJson } from './control-protocol.js';
 import { acquireHostLock } from './host-lock.js';
 import { instanceCredentials, type MetadataRequest } from './aws-host-identity.js';
-import { ensureHostDirectory } from './host-config.js';
 import { SystemdDelivery, type DeliveryProcess } from './systemd-delivery.js';
 import { DataMountAuthorizationSchema } from './data-mount-delivery-contract.js';
 import { MountRecordsSchema, MountOperationStore, optionalProtected, createProtected, replaceProtected,
-    mountedReceipt, type MountRecords } from './mount-operation-store.js';
+    ensureDurableDirectory, mountedReceipt, type MountRecords } from './mount-operation-store.js';
 
 export const MountOperationSchema = z.object({ schemaVersion: z.literal(1), action: z.enum(['start', 'observe', 'cancel']), records: MountRecordsSchema }).strict();
 export interface MountHostOptions {
@@ -29,7 +28,7 @@ export async function assertMountFence(r: MountRecords, store: MountOperationSto
 }
 async function provisionRoot(r: MountRecords, driver: SystemdDelivery, o: MountHostOptions) {
     const p = mountPaths(o), a = r.authorization;
-    await ensureHostDirectory(p.root);
+    await ensureDurableDirectory(p.root);
     await createProtected(p.provisioning, r.provisioning);
     const previous = await optionalProtected(p.authorization);
     if (previous?.toString() === canonicalJson(a)) return;
@@ -66,7 +65,7 @@ export async function manageMountOperation(input: unknown, o: MountHostOptions =
     try {
         await instanceCredentials({ accountId: r.provisioning.accountId, region: r.provisioning.region,
             instanceId: a.scope.providerInstanceId }, AbortSignal.timeout(10000), o.metadataRequest);
-        await ensureHostDirectory(p.state);
+        await ensureDurableDirectory(p.state);
         const store = new MountOperationStore(p.state, a.authorizationId), driver = new SystemdDelivery(o.unitPrefix, 'mount');
         const existing = await store.records();
         if (existing && canonicalJson(existing) !== canonicalJson(r)) throw new Error('mount_operation_conflict');
