@@ -27,7 +27,8 @@ Requests use explicit temporary credentials, fixed service endpoints, bounded
 cancellation and no automatic retries. The adapter never receives key bytes or
 starts EC2 instances; it submits a supervisor-start workflow for an existing writer.
 
-The approved workflow still needs implementation and deployment. It must:
+Deploy a reviewed, numbered startup Standard workflow before activating the
+consumer. The separate implementation in PR #154 provides this path. It must:
 
 - Authenticate to the startup authority endpoint against the same immutable work
   immediately before host effects, then independently verify EC2/EBS identity,
@@ -103,3 +104,39 @@ new checks; workflows must separately reconcile any already dispatched effects.
 HTTP tests cover signature binding, replay, input limits, cancellation, deadlines
 and redaction. Route tests check operator-policy wiring; the real PostgreSQL
 delivery suite exercises signed checks and denial after authority changes.
+
+## Configuration delivery integration
+
+The configuration consumer accepts an explicit server-only `startup` transport
+group: approved lifecycle deployments, the no-wake lifecycle observer, scoped
+control-key preparation, and the startup Standard transport. This composes the
+existing issuer and startup outbox; it does not add a new grant protocol or
+automatically activate a scheduler. Without this group, delivery retains the
+existing behavior for already-running supervisors.
+
+With startup configured, an active snapshot is prepared first, without sending
+a reload to a supervisor that may not exist. Subsequent polls issue the original
+five-minute startup grant, then claim and deliver only that computer's startup
+work. A startup receipt permits a later authenticated host observation; it
+cannot finish an installation. The final acknowledgement transaction rechecks
+the current mount, startup record and unrevoked control binding under locks,
+before committing configuration, installation, job and audit records together.
+
+Completed startup can load later configuration revisions and outlive its grant
+deadline. It cannot be reused across a later mount/lifecycle cycle. An expired
+unfinished grant reports `computer_start_recovery_required`; polling neither
+renews it nor creates another key. An unreachable previously started host stays
+unconfirmed instead of being restarted as a connection-error fallback.
+
+Empty suspended snapshots bypass startup issuance so they can remove existing
+authority even after startup/key revocation. They still require the existing
+authenticated reload/loaded-descriptor path; suspension does not start compute.
+
+Run the app wrapper and the disposable PostgreSQL suites
+`test:db:configuration-delivery` and `test:db:start-delivery`. These verify the
+combined database sequence with simulated provider/host transports, including
+two-computer targeting, first startup, later reload, revocation during host
+observation and expired grants. Actual AWS execution and Reticle readiness
+remain separate acceptance requirements. Production composition still requires
+reviewed migration 0012, scoped federation, the numbered startup workflow and
+host package, and an explicitly enabled controller.

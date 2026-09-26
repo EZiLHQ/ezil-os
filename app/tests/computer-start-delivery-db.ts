@@ -66,6 +66,9 @@ try {
         const o = { ...options, database: null as never };
         assert.equal(await dispatchNextComputerStart({ ...o, enabled: false }), 'disabled');
         assert.equal(await claimComputerStart({ ...o, enabled: false }), null);
+        for (const target of [null, {}, { computerId: randomUUID(), authorizationId: randomUUID(), extra: true }]) {
+            assert.equal(await claimComputerStart(o, target as never), null);
+        }
         assert.equal(await authorizeComputerStart(o, {}), false);
         assert.equal(await dispatchComputerStartClaim(o, {} as never), 'stale');
     });

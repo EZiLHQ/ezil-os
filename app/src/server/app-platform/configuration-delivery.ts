@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { appAuditEvents, appInstallations, appJobs, appOutbox, computerConfigurations,
     computerConfigurationDeliveries, computerConfigurationInstallations, computerInstances, computers } from '@/server/db/schema';
 import { produceComputerConfigurationInTransaction, type ConfigurationProducerOptions } from './computer-configuration';
+import { advanceConfigurationStartup, configurationStartupConfirmed, type ConfigurationStartupTransport } from './configuration-startup';
 import { HostControlError, HostConfigurationObservationSchema, type HostConfigurationObservation,
     type HostControlClient, type HostScope } from './host-control-client';
 import { sameRuntimePlan } from './runtime-plan';
@@ -17,6 +18,9 @@ export interface ConfigurationWork {
 const preparationSchema = z.discriminatedUnion('state', [z.object({ state: z.literal('pending') }).strict(),
     z.object({ state: z.literal('prepared'), descriptor: HostConfigurationObservationSchema }).strict()]);
 export interface ConfigurationDeliveryOptions extends ConfigurationProducerOptions {
+    /** Explicit trusted startup integration. Without it, only already-running
+     * hosts can acknowledge configuration. Never selected by an app manifest. */
+    startup?: ConfigurationStartupTransport;
     /** Trusted durable provisioning only. configurationId is the stable
      * idempotency key across polls and lease takeovers; attempts are NOT new
      * provider jobs. Return pending quickly while transfer/pull runs elsewhere.
@@ -133,6 +137,10 @@ async function acknowledge(options: ConfigurationDeliveryOptions, claim: Configu
         const current = await currentWork(tx, options, claim);
         if (typeof current === 'string') return current;
         if (!current.prepared || !descriptorMatches(current.work, descriptor)) throw new HostControlError('host_response_invalid');
+        if (options.startup && JSON.parse(current.work.configuration).suspended === false
+            && !await configurationStartupConfirmed(tx, { ...options.startup, ...options }, current.work)) {
+            return defer(tx, claim, 'computer_start_unconfirmed');
+        }
         const [loaded] = await tx.update(computerConfigurationDeliveries)
             .set({ loadedAt: sql`clock_timestamp()`, loadedDigest: current.work.digest, leaseUntil: null, errorCode: null })
             .where(ownsLease(claim)).returning();
@@ -196,12 +204,20 @@ export async function dispatchConfigurationClaim(options: ConfigurationDeliveryO
             });
             if (typeof recorded === 'string') return recorded;
             current = await refresh(); if (typeof current === 'string') return current;
+            if (options.startup && JSON.parse(work.configuration).suspended === false) return await wait();
             await bounded(signal => options.requestReload(work, signal));
             // A reload receipt is not enough. Read the loaded descriptor on a
             // later delivery poll, after service management has applied it.
             return await wait();
         }
         const work = current.work;
+        // Empty suspended snapshots revoke existing authority; delivery must
+        // remain possible without granting permission to start a supervisor.
+        if (options.startup && JSON.parse(work.configuration).suspended === false) {
+            const state = await bounded(signal => advanceConfigurationStartup({ ...options.startup!, ...options, signal }, work), 35000);
+            if (state !== 'observe') return await wait(`computer_start_${state}`);
+            current = await refresh(); if (typeof current === 'string') return current;
+        }
         const host = await bounded(signal => options.resolveHost(work.scope, signal), 5000);
         if (!sameRuntimePlan(host.scope, work.scope)) throw new HostControlError('host_rejected');
         current = await refresh(); if (typeof current === 'string') return current;

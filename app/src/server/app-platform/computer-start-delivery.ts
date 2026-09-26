@@ -61,13 +61,16 @@ export async function authorizeComputerStart(o: ComputerStartAuthorityOptions, i
         return o.enabled && !o.signal?.aborted && !!delivery;
     }); } catch { throw new Error('start_authorization_unavailable'); }
 }
-export async function claimComputerStart(o: ComputerStartAuthorityOptions): Promise<ComputerStartClaim | null> {
+export async function claimComputerStart(o: ComputerStartAuthorityOptions,
+    target?: { computerId: string; authorizationId: string }): Promise<ComputerStartClaim | null> {
     if (!o.enabled || o.signal?.aborted) return null;
+    if (target !== undefined && !ClaimSchema.omit({ attempt: true }).safeParse(target).success) return null;
     try { return await o.database.transaction(async tx => {
         await tx.execute(sql`SET LOCAL lock_timeout='2s'`); await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
         const [candidate] = await tx.select({ computerId: computers.id, authorizationId: grants.id }).from(computers)
             .innerJoin(grants, eq(grants.computerId, computers.id)).innerJoin(deliveries, eq(deliveries.authorizationId, grants.id))
-            .where(due()).orderBy(asc(deliveries.availableAt), asc(grants.id)).limit(1).for('update', { of: computers, skipLocked: true });
+            .where(and(due(), target ? and(eq(computers.id, target.computerId), eq(grants.id, target.authorizationId)) : undefined))
+            .orderBy(asc(deliveries.availableAt), asc(grants.id)).limit(1).for('update', { of: computers, skipLocked: true });
         if (!candidate) return null;
         if (!await currentWork(tx, o, candidate.computerId, candidate.authorizationId)) {
             await tx.update(deliveries).set({ availableAt: sql`clock_timestamp()+interval '60 seconds'`, errorCode: 'start_authority_denied' })
