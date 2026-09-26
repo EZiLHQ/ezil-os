@@ -824,6 +824,8 @@ jobs:
         with:
           node-version: '24.15.0'
       - run: npm --prefix supervisor ci --ignore-scripts --no-audit --no-fund
+      - name: Package a clean supervisor release with locked production dependencies
+        run: node supervisor/deploy/build-host-release.mjs "$RUNNER_TEMP/ezil-supervisor-release"
       - run: docker pull --platform linux/amd64 node@sha256:5cbc7caba8c2c0f0bca675d1b61b9f2857e1cf1853c6164ee9dd409501a936e7
       - run: bash tools/test.sh supervisor --linux-host
       - name: Verify real systemd delivery, process cancellation and replay fencing
