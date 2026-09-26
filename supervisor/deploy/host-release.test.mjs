@@ -8,7 +8,7 @@ import { hash, inventory, limits, parseRelease, required } from './host-release.
 const fixture = () => ({ schemaVersion: 1, sourceCommit: 'a'.repeat(40), nodeMajor: 24,
     files: [...required, 'node_modules/zod/index.js'].sort().map(path => ({ path, bytes: 3, sha256: hash(Buffer.from('abc')) })) });
 const parse = (value, digest) => { const bytes = Buffer.from(JSON.stringify(value)); return parseRelease(bytes, digest ?? hash(bytes)); };
-test('release binds exact bytes, required entrypoints, locked dependencies and both pinned SSM documents', () => {
+test('release binds exact bytes, required entrypoints, locked dependencies and pinned SSM documents', () => {
     const value = fixture(); assert.deepEqual(parse(value), value);
     assert.throws(() => parse(value, '0'.repeat(64)), { message: 'host_release_invalid' });
     for (const path of required) assert.throws(() => parse({ ...value, files: value.files.filter(f => f.path !== path) }));

@@ -2,10 +2,10 @@ import { createHash } from 'node:crypto';
 import { lstat, readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-export const units = ['ezil-supervisor.service', 'ezil-data-mount.service', 'ezil-configuration@.service', 'ezil-mount@.service'];
+export const units = ['ezil-supervisor.service', 'ezil-data-mount.service', 'ezil-configuration@.service', 'ezil-mount@.service', 'ezil-start@.service'];
 export const required = ['package.json', 'package-lock.json', ...units.map(name => `deploy/${name}`),
-    'deploy/configuration-document.json', 'deploy/mount-document.json',
-    ...['host', 'prepare', 'data-mount', 'delivery-operation', 'delivery-executor', 'mount-operation', 'mount-executor', 'control-bootstrap']
+    'deploy/configuration-document.json', 'deploy/mount-document.json', 'deploy/start-document.json',
+    ...['host', 'prepare', 'data-mount', 'delivery-operation', 'delivery-executor', 'mount-operation', 'mount-executor', 'control-bootstrap', 'start-operation', 'start-executor']
         .map(name => `dist/${name}.js`)];
 export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 export const limits = { files: 20000, file: 8 * 1024 * 1024, total: 128 * 1024 * 1024, manifest: 4 * 1024 * 1024 };
@@ -15,7 +15,7 @@ const keys = (value, expected) => value && typeof value === 'object' && !Array.i
 export function validPath(path) {
     return typeof path === 'string' && path.length <= 512 && !path.endsWith('.node') && path.split('/').every(p => /^[A-Za-z0-9_@.][A-Za-z0-9_@.+-]*$/.test(p) && p !== '.' && p !== '..')
         && (['package.json', 'package-lock.json'].includes(path) || /^(dist|node_modules)\//.test(path)
-            || [...units, 'configuration-document.json', 'mount-document.json'].some(name => path === `deploy/${name}`));
+            || [...units, 'configuration-document.json', 'mount-document.json', 'start-document.json'].some(name => path === `deploy/${name}`));
 }
 export function parseRelease(bytes, expected) {
     if (!Buffer.isBuffer(bytes) || bytes.length > limits.manifest || !/^[a-f0-9]{64}$/.test(expected) || hash(bytes) !== expected) return fail();

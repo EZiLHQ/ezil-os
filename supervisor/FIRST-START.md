@@ -60,3 +60,38 @@ startup replay and retained `.git`/rename/deletion/SQLite after reboot.
 
 These checks do not establish AWS IAM, secret issuance, AMI readiness, tunnel
 routing, container isolation, Neko typing or Reticle product acceptance.
+
+## Trusted SSM operation
+
+`deploy/start-document.json` invokes only `dist/start-operation.js`. Its single
+`ENV_VAR` parameter contains bounded base64 JSON:
+`{schemaVersion:1, action:"start"|"observe"|"cancel", records:{provisioning,authorization}}`.
+The trusted workflow must derive these exact records from current approved DB
+work, reauthorize through the startup authority endpoint and independently check
+EC2/EBS before sending them. No key bytes or arbitrary commands are accepted.
+Do not expose this document to users, publishers, applications or general SSM
+roles. Registering/pinning the document, workflow and IAM policy remain required
+before activation; this source change creates no AWS resource.
+
+The root manager verifies instance identity and existing protected provisioning.
+It records one dispatch and places the startup grant without changing its
+deadline. `ezil-start@.service` runs the existing first-start receiver once, with
+additional denial-only cancellation checks. Lost replies never refund dispatch
+or begin markers. The exact signed supervisor descriptor becomes a historical
+receipt; application readiness remains separate. Observe cannot start anything.
+
+Cancellation is persisted before stopping the template process group and then
+the supervisor. Both must be observed stopped before cancellation is confirmed.
+A stale cancellation cannot stop a supervisor belonging to a newer grant.
+Replacing root authority requires the same computer scope, key version and
+control domain, a newer grant, a quiescent old operation and an observed stopped
+supervisor. Attempt/cancellation history and user data are retained.
+
+The host package now requires the startup entrypoints, template and fixed SSM
+document. For local acceptance, install its reviewed package offline in a fresh
+overlay of the successful first-start VM. Run
+`bash tools/test.sh supervisor --linux-start-operation run`, reboot, then run
+the same command with `verify`. The fixture uses local AWS wire responses and
+actual installed systemd/receiver code. It checks lost dispatch, cancellation
+before/during activation, stale cancellation, no-wake replay and retained data.
+This does not validate SSM delivery or deployed AWS IAM.

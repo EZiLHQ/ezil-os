@@ -43,7 +43,7 @@ async function installKey(secret: Buffer) {
  * this receiver cannot create or refresh authority or generate a key. No unit
  * is enabled at boot. A reused attempt only observes; it never starts twice. */
 export async function bootstrapControlHost(input: unknown, options: ControlKeyTransportOptions & {
-    signal?: AbortSignal; privateValidation?: boolean;
+    signal?: AbortSignal; privateValidation?: boolean; checkAuthority?: () => Promise<void>;
 } = {}) {
     if (process.platform !== 'linux' || process.getuid?.() !== 0) throw new Error('control_bootstrap_requires_root');
     if (!options.privateValidation && (options.metadataRequest || options.requestHandler)) throw new Error('control_bootstrap_options_invalid');
@@ -66,6 +66,9 @@ export async function bootstrapControlHost(input: unknown, options: ControlKeyTr
             filesystemUuid: records.authorization.filesystemUuid, mode: 'mount' };
         store = new ControlStore(config.stateDirectory, config.computerId, config.computerGeneration);
         const check = async () => {
+            // An installed operation may add cancellation checks only; all
+            // independent receiver checks below still apply.
+            await options.checkAuthority?.();
             if (signal.aborted || a.expiresAt * 1000 <= Date.now()
                 || !(await readHostFile(`${root}/provisioning.json`, 4096)).equals(provisioned)
                 || !(await readHostFile(`${root}/control-start-authorization.json`, 8192)).equals(authorized)
