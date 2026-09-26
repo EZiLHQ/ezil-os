@@ -105,5 +105,45 @@ delivery. Provider failures leave bounded error codes, without raw messages.
 
 `bun run test:db:mount-delivery` exercises real PostgreSQL concurrency, takeover,
 rollback and authorization races with a simulated transport. The protocol is
-strictly validated in the app suite. No scheduler, S3/SSM adapter, independently
-provisioned root authority, AWS resource or hosted database is enabled here.
+strictly validated in the app suite. No scheduler, independently provisioned
+root authority, AWS resource or hosted database is enabled here.
+
+## AWS transport
+
+`createAwsComputerMountTransport` implements the consumer's `advanceMount` using
+the pinned AWS SDK. Operator settings must name the exact account, namespace,
+bucket, KMS key and numbered Standard workflow version. Only explicit temporary
+federated credentials are accepted; regional endpoints are fixed and automatic
+SDK retries are disabled.
+
+The transport conditionally creates the canonical plan at
+`<namespace>/computers/<computer>/generations/<generation>/data-mounts/<authorization>.json`.
+It verifies the bucket owner, encryption key, checksum, length, content and
+non-null object version on readback. Lost PUT responses and concurrent writers
+reuse that path without overwriting it. The host receives this exact version.
+
+The immutable workflow input is `{ schemaVersion: 1, work, object }`: `work` is
+the strictly validated grant, plan and approved lifecycle deployment;
+`object` contains bucket, key, version ID, digest and byte length. There are no
+credentials in this envelope. It uses execution name `mount-<authorizationId>`.
+The workflow must independently authorize `work`, verify provider ownership and
+attachment, provision the protected root records, and return only the exact host
+mounted receipt. The envelope is not its own source of authority.
+
+Every poll checks the pinned workflow version, exact input, execution identity,
+start time and zero redrives. A StartExecution reply only means pending. Failure,
+changed object version, altered receipt or expired authority cannot become
+success or cause a replacement execution. The original 900-second deadline also
+prevents reuse after AWS's Standard execution-name retention window.
+
+Calls have an eight-second deadline. Caller timeout stops local I/O; it does not
+claim that a remote SSM command was cancelled. The still-required trusted
+workflow must implement cancellation and expiry during host work. No workflow,
+SSM document, authority HTTP endpoint or dispatcher scheduler is created or
+enabled by this adapter, and it has no EC2 start operation. Configuration delivery
+must still wait for independently verified mounted evidence.
+
+The app suite exercises actual SDK serialization/signing and response parsing
+against a local wire handler, including lost replies, concurrent staging,
+version/content mismatches, altered executions, redaction and timeouts. This is
+not evidence of real S3/Step Functions/SSM, IAM or disk acceptance.
