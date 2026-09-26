@@ -6,6 +6,7 @@ import { produceComputerConfigurationInTransaction, type ConfigurationProducerOp
 import { HostControlError, HostConfigurationObservationSchema, type HostConfigurationObservation,
     type HostControlClient, type HostScope } from './host-control-client';
 import { sameRuntimePlan } from './runtime-plan';
+import { configurationMountConfirmed } from './configuration-mount';
 
 type Transaction = Parameters<Parameters<ConfigurationProducerOptions['database']['transaction']>[0]>[0];
 export interface ConfigurationClaim { computerId: string; configurationId: string; attempt: number }
@@ -103,6 +104,7 @@ async function currentWork(tx: Transaction, options: ConfigurationProducerOption
     const [writer] = await tx.select().from(computerInstances).where(and(eq(computerInstances.computerId, computer.id),
         eq(computerInstances.generation, target.computerGeneration))).limit(1).for('share');
     if (!writer || writer.observedState !== 'running' || !writer.observedAt) return defer(tx, claim, 'computer_not_running');
+    if (!await configurationMountConfirmed(tx, target)) return defer(tx, claim, 'computer_data_mount_unconfirmed');
     const [fresh] = await tx.select({ id: computerConfigurationDeliveries.configurationId }).from(computerConfigurationDeliveries)
         .where(and(ownsLease(claim), sql`${computerConfigurationDeliveries.leaseUntil} > clock_timestamp() + interval '12 seconds'`));
     if (!fresh) return defer(tx, claim, 'configuration_lease_short');

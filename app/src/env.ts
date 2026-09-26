@@ -71,7 +71,7 @@ const serverSchema = z.object({
     EZIL_APP_INSTALL_ENABLED: z.enum(['true', 'false']).default('false'),
     /** Enable only after durable command delivery and host provisioning exist. */
     EZIL_APP_RUNTIME_COMMANDS_ENABLED: z.enum(['true', 'false']).default('false'),
-    /** Dedicated internal workflow checks; migrate 0006 before activation. */
+    /** Dedicated internal workflow checks; migrations through 0011 are required. */
     EZIL_CONFIGURATION_AUTHORITY_ENABLED: z.string().refine(value => ['true', 'false'].includes(value),
         'invalid_configuration_authority_flag').default('false'),
     EZIL_CONFIGURATION_AUTHORITY_SECRET: z.string().regex(/^[a-f0-9]{64}$/, 'invalid_configuration_authority_secret').optional(),

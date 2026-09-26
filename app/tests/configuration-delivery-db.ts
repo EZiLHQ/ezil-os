@@ -7,6 +7,8 @@ import { claimConfigurationDelivery, dispatchConfigurationClaim, dispatchNextCon
     type ConfigurationDeliveryOptions, type ConfigurationWork } from '../src/server/app-platform/configuration-delivery';
 import type { HostConfigurationObservation } from '../src/server/app-platform/host-control-client';
 import { runtimeRecords } from './fixtures/runtime-release';
+import { dataMountComputer } from './fixtures/data-mount';
+import { recordConfigurationMount, restartConfigurationComputer, ageConfigurationMount } from './fixtures/configuration-mount';
 import { runtimeTestDatabase } from './helpers/runtime-database';
 
 const fixture = await runtimeTestDatabase(); const { sql } = fixture;
@@ -26,15 +28,12 @@ try {
     const admin = randomUUID();
     await sql`INSERT INTO auth.users(id) VALUES (${admin})`;
     await sql`INSERT INTO ezil_app_admins(user_id) VALUES (${admin})`;
-    async function setup() {
-        const computerId = randomUUID(), owner = randomUUID(), email = `${owner}@example.com`;
-        await sql`INSERT INTO auth.users(id,email) VALUES (${owner},${email})`;
+    async function setup(mounted = true) {
+        const mountComputer = await dataMountComputer(sql);
+        const { computerId, userId: owner } = mountComputer, email = `${owner}@example.com`;
+        await sql`UPDATE auth.users SET email=${email} WHERE id=${owner}`;
         await sql`INSERT INTO ezil_os_access(email,invited_by) VALUES (${email},'test')`;
-        await sql`INSERT INTO ezil_computers(id,user_id,slot,provider) VALUES (${computerId},${owner},1,'aws-ec2')`;
-        await sql`INSERT INTO ezil_computer_runtimes(computer_id,region,availability_zone,data_volume_id,desired_state)
-            VALUES (${computerId},'us-east-1','us-east-1a',${handle('vol')},'running')`;
-        await sql`INSERT INTO ezil_computer_instances(computer_id,generation,provider_instance_id,observed_state,observed_at)
-            VALUES (${computerId},1,${handle('i')},'running',now())`;
+        const mountId = mounted ? await recordConfigurationMount(sql, mountComputer) : null;
         const [publisher] = await sql`INSERT INTO ezil_app_publishers(owner_user_id,display_name,status,invited_by)
             VALUES (${owner},'Test','active',${admin}) RETURNING id`;
         const records = runtimeRecords('reticle', { appId: randomUUID(), publisherId: publisher!.id,
@@ -58,7 +57,7 @@ try {
             VALUES (${installationId},${computerId},${owner},'install',${randomUUID()}) RETURNING id`;
         await sql`INSERT INTO ezil_app_outbox(job_id) VALUES (${job!.id})`;
         const result = await produceComputerConfiguration(options, computerId); assert.ok('configurationId' in result);
-        return { computerId, owner, email, records, installationId, jobId: job!.id as string, configurationId: result.configurationId };
+        return { computerId, owner, email, records, installationId, mountComputer, mountId, jobId: job!.id as string, configurationId: result.configurationId };
     }
     type Setup = Awaited<ReturnType<typeof setup>>;
     const due = async (s: Setup) => {
@@ -100,6 +99,63 @@ try {
         assert.equal(await dispatchNextConfiguration(disabled), 'disabled');
         assert.equal(await dispatchConfigurationClaim(disabled, { computerId: randomUUID(), configurationId: randomUUID(), attempt: 1 }), 'disabled');
     });
+    await test('metadata is produced without a mount, but delivery waits without host effects until mount completion', async () => {
+        const s = await setup(false), other = await setup(), t = transport();
+        assert.ok(other.mountId); // Another computer's receipt confers no authority.
+        assert.equal(await dispatchConfigurationClaim(t.adapter, await claim(s)), 'waiting');
+        const row = await state(s);
+        assert.deepEqual(t.calls, { preparation: 0, reload: 0, host: 0 });
+        assert.equal(row.error_code, 'computer_data_mount_unconfirmed');
+        assert.equal(row.prepared_at, null); assert.equal(row.loaded_at, null); assert.equal(row.delivered_at, null);
+        assert.equal(row.install_status, 'pending'); assert.equal(row.job_status, 'queued');
+        await recordConfigurationMount(sql, s.mountComputer);
+        await t.prepare(s); t.load(s);
+        assert.equal(await dispatchConfigurationClaim(t.adapter, await claim(s)), 'loaded');
+    });
+    await test('completed in-time mount permits installation after grant expiry', async () => {
+        const s = await setup(), t = transport(); await ageConfigurationMount(sql, s.mountId!);
+        await t.prepare(s); t.load(s);
+        assert.equal(await dispatchConfigurationClaim(t.adapter, await claim(s)), 'loaded');
+    });
+    await test('mount revocation after preparation blocks reload and host observation', async () => {
+        const s = await setup(), t = transport(); await t.prepare(s); t.load(s);
+        await sql`UPDATE ezil_computer_data_mount_authorizations SET revoked_at=now() WHERE id=${s.mountId}`;
+        assert.equal(await dispatchConfigurationClaim(t.adapter, await claim(s)), 'waiting');
+        assert.deepEqual(t.calls, { preparation: 1, reload: 1, host: 0 });
+        const row = await state(s); assert.equal(row.error_code, 'computer_data_mount_unconfirmed');
+        assert.equal(row.loaded_at, null); assert.equal(row.install_status, 'pending'); assert.equal(row.delivered_at, null);
+    });
+    for (const phase of ['preparation', 'observation'] as const) for (const change of ['revocation', 'restart'] as const) {
+        await test(`${change} during ${phase} rejects delayed receipts without retaining SQL locks`, async () => {
+            const s = await setup(), t = transport();
+            if (phase === 'observation') { await t.prepare(s); t.load(s); }
+            let entered!: () => void, finish!: () => void;
+            const reached = new Promise<void>(r => { entered = r; }), gate = new Promise<void>(r => { finish = r; });
+            const blocked = { ...t.adapter, ...(phase === 'preparation' ? {
+                advancePreparation: async (w: ConfigurationWork) => { entered(); await gate; return { state: 'prepared', descriptor: descriptor(w) }; },
+            } : {
+                resolveHost: async (scope: Parameters<typeof t.adapter.resolveHost>[0]) => {
+                    const host = await t.adapter.resolveHost(scope, new AbortController().signal);
+                    return { ...host, configuration: async () => { entered(); await gate; return host.configuration(); } };
+                },
+            }) };
+            const running = dispatchConfigurationClaim(blocked, await claim(s)); await reached;
+            try {
+                if (change === 'revocation') await sql.begin(async tx => {
+                    await tx`SET LOCAL lock_timeout='1s'`;
+                    await tx`UPDATE ezil_computer_data_mount_authorizations SET revoked_at=now() WHERE id=${s.mountId}`;
+                });
+                else await restartConfigurationComputer(sql, s.mountComputer);
+            } finally { finish(); }
+            assert.equal(await running, 'waiting');
+            const row = await state(s); assert.equal(row.error_code, 'computer_data_mount_unconfirmed');
+            assert.equal(row.loaded_at, null); assert.equal(row.install_status, 'pending'); assert.equal(row.delivered_at, null);
+            assert.equal(t.calls.reload, phase === 'preparation' ? 0 : 1);
+            if (phase === 'preparation') assert.equal(row.prepared_at, null);
+            assert.equal((await sql`SELECT count(*)::int n FROM ezil_app_audit_events
+                WHERE installation_id=${s.installationId} AND action='installation.installed'`)[0]!.n, 0);
+        });
+    }
     await test('concurrent claims allocate one lease; preparation and reload cannot complete install', async () => {
         const s = await setup(), t = transport(); await due(s);
         const claims = await Promise.all([claimConfigurationDelivery(options), claimConfigurationDelivery(options)]);
@@ -197,6 +253,7 @@ try {
     });
     await test('suspension loads a revocation configuration without completing unbound install jobs', async () => {
         const s = await setup(), t = transport(); await sql`UPDATE ezil_os_access SET revoked_at=now() WHERE email=${s.email}`;
+        await sql`UPDATE ezil_computer_data_mount_authorizations SET revoked_at=now() WHERE id=${s.mountId}`;
         const produced = await produceComputerConfiguration(options, s.computerId); assert.ok('configurationId' in produced);
         s.configurationId = produced.configurationId;
         await t.prepare(s); t.load(s); assert.equal(await dispatchConfigurationClaim(t.adapter, await claim(s)), 'loaded');

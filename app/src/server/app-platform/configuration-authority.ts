@@ -2,6 +2,7 @@ import { and, eq, isNull, sql } from 'drizzle-orm';
 import { computers, computerConfigurations, computerConfigurationDeliveries, computerInstances } from '@/server/db/schema';
 import { produceComputerConfigurationInTransaction, type ConfigurationProducerOptions } from './computer-configuration';
 import { ConfigurationAuthorityRequestSchema, type ConfigurationAuthorityRequest } from './configuration-authority-protocol';
+import { configurationMountConfirmed } from './configuration-mount';
 
 /** Recompile current authority with per-statement and lock timeouts. A superseded request
  * is denied, while an exact new suspended snapshot can still remove authority
@@ -37,7 +38,7 @@ export async function authorizeConfigurationWork(options: ConfigurationProducerO
                 isNull(computerInstances.fencedAt), eq(computerInstances.observedState, 'running'),
                 sql`${computerInstances.observedAt} >= clock_timestamp() - interval '5 minutes'`,
                 sql`${computerInstances.observedAt} <= clock_timestamp() + interval '30 seconds'`)).limit(1).for('share');
-            return Boolean(writer);
+            return Boolean(writer) && await configurationMountConfirmed(tx, target);
         });
     } catch { throw new Error('configuration_authority_unavailable'); }
 }
