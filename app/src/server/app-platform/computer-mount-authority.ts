@@ -11,7 +11,8 @@ import { loadRecoveryWriters, type FencedWriters } from './computer-recovery-aut
 import type { LifecycleConsumerOptions } from './lifecycle-consumer';
 
 type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
-type Options = Pick<LifecycleConsumerOptions, 'database' | 'enabled' | 'osAccessMode' | 'deployments' | 'advance'>;
+export type MountAuthorityOptions = Pick<LifecycleConsumerOptions, 'database' | 'enabled' | 'osAccessMode' | 'deployments'>;
+type Options = MountAuthorityOptions & Pick<LifecycleConsumerOptions, 'advance'>;
 const uuid = z.string().uuid().regex(/^[a-f0-9-]+$/);
 const Input = z.object({ computerId: uuid, jobId: uuid }).strict();
 type Input = z.infer<typeof Input>;
@@ -27,7 +28,9 @@ export function mountAuthorityRecords(a: Grant) {
         schemaVersion: 1 as const, volumeId: a.dataVolumeId } };
 }
 
-async function load(tx: Transaction, o: Options, input: Input) {
+/** Current database authority only. Callers must lock through commit and must
+ * independently observe the provider before authorizing host effects. */
+export async function loadCurrentMountAuthority(tx: Transaction, o: MountAuthorityOptions, input: Input) {
     if (!o.enabled) return null;
     await tx.execute(sql`SET LOCAL lock_timeout='2s'`); await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
     const [computer] = await tx.select().from(computers).where(eq(computers.id, input.computerId)).limit(1).for('update');
@@ -61,7 +64,8 @@ async function load(tx: Transaction, o: Options, input: Input) {
     if (!fencedWriters) return null;
     const [existing] = await tx.select({ grant: grants, active: sql<boolean>`${grants.revokedAt} IS NULL AND ${grants.expiresAt}>clock_timestamp()` })
         .from(grants).where(eq(grants.lifecycleJobId, job.id)).limit(1).for('update');
-    if (existing && !existing.active) return null;
+    if (!o.enabled || (existing && (!existing.active
+        || Object.entries(fields).some(([key, value]) => existing.grant[key as keyof typeof fields] !== value)))) return null;
     return { work, fields, fencedWriters, existing: existing?.grant, owner: computer.userId };
 }
 
@@ -74,7 +78,7 @@ export async function issueComputerDataMount(o: Options, input: unknown) {
     const parsed = Input.safeParse(input);
     if (!parsed.success) return { state: 'denied' as const };
     try {
-        const before = await o.database.transaction(tx => load(tx, o, parsed.data));
+        const before = await o.database.transaction(tx => loadCurrentMountAuthority(tx, o, parsed.data));
         if (!before) return { state: 'denied' as const };
         const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined;
         let observed: Awaited<ReturnType<Options['advance']>>;
@@ -92,7 +96,7 @@ export async function issueComputerDataMount(o: Options, input: unknown) {
         if (receipt.state !== 'running' || receipt.instanceId !== before.fields.providerInstanceId
             || receipt.volumeId !== before.fields.dataVolumeId) return { state: 'unconfirmed' as const };
         return await o.database.transaction(async tx => {
-            const after = await load(tx, o, parsed.data);
+            const after = await loadCurrentMountAuthority(tx, o, parsed.data);
             if (!after || before.owner !== after.owner || before.work.document !== after.work.document || before.work.digest !== after.work.digest
                 || JSON.stringify(before.fields) !== JSON.stringify(after.fields)
                 || JSON.stringify(before.fencedWriters) !== JSON.stringify(after.fencedWriters)) return { state: 'denied' as const };

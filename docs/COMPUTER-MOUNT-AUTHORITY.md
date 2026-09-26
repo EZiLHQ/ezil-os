@@ -57,7 +57,7 @@ disabled producer during observation denies commit. Output contains only the
 host's strict v1 authorization and canonical plan records, with no credentials.
 
 The producer is still not scheduled or connected to SSM delivery. The next
-integration must claim the delivery queue, store the exact versioned S3 object,
+integration must store the exact versioned S3 object,
 provision independent root authority, invoke the host receiver, and record its
 verified mounted receipt before configuration delivery. Those calls require
 current authority checks and cancellation; invoking this function alone does
@@ -81,3 +81,29 @@ actual AWS and host-delivery acceptance remain separate.
 authorization races with simulated provider observations. SDK wire tests cover
 the real adapter's immutable allocation checks. Local cross-worktree validation
 also checks issuer output against the strict host contract in PR #137.
+
+## Delivery consumer
+
+`claimComputerMount` and `dispatchComputerMountClaim` consume the existing queue.
+They lock computers before grants/deliveries, lease one attempt for 45 seconds,
+and bound each transport call to 20 seconds outside SQL locks. Retry/takeover
+uses the same authorization ID, canonical plan, deployment and deadline.
+Unavailable work backs off without renewing authority or blocking other computers.
+
+`authorizeComputerMount` rechecks exact current work for a trusted workflow
+caller. It is independent of the short delivery lease; it checks unexpired,
+unrevoked authority, owner OS access, approved deployment, current writer and
+unsettled delivery. It is not yet an HTTP endpoint. A transport must independently
+verify provider identity and current authority before host effects and during
+cancellation. Supplying work to a function never grants those permissions.
+
+Only an exact host mounted receipt can settle an active attempt, after a second
+authority check under SQL locks. Expiry, revocation, stop, fencing, disablement
+or lease takeover rejects late results. Receipts are immutable historical mount
+evidence; the consumer does not mark apps installed/ready or invoke configuration
+delivery. Provider failures leave bounded error codes, without raw messages.
+
+`bun run test:db:mount-delivery` exercises real PostgreSQL concurrency, takeover,
+rollback and authorization races with a simulated transport. The protocol is
+strictly validated in the app suite. No scheduler, S3/SSM adapter, independently
+provisioned root authority, AWS resource or hosted database is enabled here.
