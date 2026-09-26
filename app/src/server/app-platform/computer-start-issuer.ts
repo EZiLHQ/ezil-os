@@ -89,12 +89,14 @@ async function bounded<T>(run: (signal: AbortSignal) => Promise<T>, ms: number, 
     let cancel!: () => void;
     try {
         const aborted = new Promise<never>((_resolve, reject) => {
-            cancel = () => { controller.abort(); reject(new Error('start_transport_aborted')); };
+            cancel = () => { reject(new Error('start_transport_aborted')); controller.abort(); };
             parent?.addEventListener('abort', cancel, { once: true });
             timer = setTimeout(cancel, ms);
         });
         if (parent?.aborted) { cancel(); return await aborted; }
-        return await Promise.race([aborted, run(controller.signal)]);
+        const result = await Promise.race([aborted, run(controller.signal)]);
+        if (controller.signal.aborted) throw new Error('start_transport_aborted');
+        return result;
     } finally { clearTimeout(timer); parent?.removeEventListener('abort', cancel); }
 }
 

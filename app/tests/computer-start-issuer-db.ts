@@ -203,6 +203,19 @@ try {
             assert.equal((await binding(c))!.key_confirmed_at, null);
         }
     });
+    await test('valid-looking replies produced during abort cannot turn cancellation into authority', async () => {
+        for (const phase of ['provider', 'key']) {
+            const c = await setup(), controller = new AbortController();
+            const o: Options = { ...options, advance: observer(c), signal: controller.signal, keys: { ...options.keys } };
+            const onAbort = <T>(signal: AbortSignal, value: T) => new Promise<T>(resolve => {
+                signal.addEventListener('abort', () => resolve(value), { once: true }); controller.abort();
+            });
+            if (phase === 'provider') o.advance = async (...args) => onAbort(args[2], await observer(c)(...args));
+            else o.keys.prepare = async (...args) => onAbort(args[2], await options.keys.prepare(...args));
+            assert.equal((await issueComputerStart(o, c.input)).state, 'unconfirmed'); assert.equal(await count(c), 0);
+            assert.equal((await binding(c))!.key_confirmed_at, null);
+        }
+    });
     await test('late app entitlement revocation recompiles Reticle authority and denies startup', async () => {
         const c = await setup(), admin = randomUUID(); await sql`INSERT INTO auth.users(id) VALUES (${admin})`;
         await sql`INSERT INTO ezil_app_admins(user_id) VALUES (${admin})`;
