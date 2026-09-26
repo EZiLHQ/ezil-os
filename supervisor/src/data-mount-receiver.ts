@@ -34,6 +34,8 @@ async function writeExclusive(path: string, bytes: Buffer, created?: () => void)
  * own independent provisioning or initialization authority. */
 export async function receiveDataMount(input: unknown, options: {
     signal?: AbortSignal;
+    /** Additional trusted cancellation fence; cannot relax receiver checks. */
+    checkAuthority?: () => Promise<void>;
     /** Test-only transport seams; no CLI flag or environment enables them. */
     requestHandler?: NonNullable<Parameters<typeof fetchConfiguration>[3]>['requestHandler'];
     metadataRequest?: NonNullable<NonNullable<Parameters<typeof fetchConfiguration>[3]>['metadataRequest']>;
@@ -50,6 +52,7 @@ export async function receiveDataMount(input: unknown, options: {
         let storedPlan: Buffer | undefined;
         const checkAuthority = async () => {
             if (signal.aborted || authority.expiresAt * 1000 <= Date.now()) throw new Error('data_mount_delivery_cancelled');
+            await options.checkAuthority?.();
             if (!(await readHostFile(PROVISIONING, 4096)).equals(provisioning)
                 || !(await readHostFile(AUTHORIZATION, 4096)).equals(authorization)
                 || (storedPlan && !(await readHostFile(PLAN, 4096)).equals(storedPlan))) throw new Error('data_mount_delivery_fenced');

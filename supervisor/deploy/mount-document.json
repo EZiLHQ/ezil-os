@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Operate a controller-authorized computer mount through the fixed root manager",
+  "parameters": {
+    "Operation": {
+      "type": "String",
+      "description": "Base64 of the bounded versioned mount operation; no credentials or shell commands",
+      "interpolationType": "ENV_VAR",
+      "allowedPattern": "^[A-Za-z0-9+/]{1,21846}={0,2}$"
+    }
+  },
+  "mainSteps": [{
+    "action": "aws:runShellScript",
+    "name": "operateMount",
+    "precondition": { "StringEquals": ["platformType", "Linux"] },
+    "inputs": {
+      "timeoutSeconds": "45",
+      "runCommand": ["/usr/local/bin/node /opt/ezil-supervisor/current/dist/mount-operation.js"]
+    }
+  }]
+}
