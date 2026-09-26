@@ -5,6 +5,7 @@ export * from './computer-lifecycle-intents';
 export * from './computer-recovery-intents';
 export * from './computer-cancellations';
 export * from './computer-data-mounts';
+export * from './computer-starts';
 export * from './app-marketplace';
 export * from './app-runtime-commands';
 export * from './computer-configurations';

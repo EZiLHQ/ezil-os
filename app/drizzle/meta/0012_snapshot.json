@@ -1,0 +1,5126 @@
+{
+  "id": "4e5b3f4f-2a1c-462f-a17e-b5d39b891f3b",
+  "prevId": "f6b79807-0623-41a5-a39b-67e0491b7d42",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "auth.users": {
+      "name": "users",
+      "schema": "auth",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.ezil_computers": {
+      "name": "ezil_computers",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'Computer'"
+        },
+        "provider": {
+          "name": "provider",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'cloudflare'"
+        },
+        "slot": {
+          "name": "slot",
+          "type": "smallint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "last_opened_at": {
+          "name": "last_opened_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "deleted_at": {
+          "name": "deleted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "metadata": {
+          "name": "metadata",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "ezil_computers_user_slot_uidx": {
+          "name": "ezil_computers_user_slot_uidx",
+          "columns": [
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "slot",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"ezil_computers\".\"deleted_at\" is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_computers_user_id_fkey": {
+          "name": "ezil_computers_user_id_fkey",
+          "tableFrom": "ezil_computers",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_computers_id_provider_uq": {
+          "name": "ezil_computers_id_provider_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "provider"
+          ]
+        },
+        "ezil_computers_id_user_uq": {
+          "name": "ezil_computers_id_user_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "user_id"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_computers_slot_chk": {
+          "name": "ezil_computers_slot_chk",
+          "value": "\"ezil_computers\".\"slot\" in (1, 2)"
+        },
+        "ezil_computers_provider_chk": {
+          "name": "ezil_computers_provider_chk",
+          "value": "\"ezil_computers\".\"provider\" in ('cloudflare', 'aws-ec2')"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_instances": {
+      "name": "ezil_computer_instances",
+      "schema": "",
+      "columns": {
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "generation": {
+          "name": "generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provider_instance_id": {
+          "name": "provider_instance_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "fence_token": {
+          "name": "fence_token",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "observed_state": {
+          "name": "observed_state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'pending'"
+        },
+        "observed_at": {
+          "name": "observed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "fenced_at": {
+          "name": "fenced_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "ezil_computer_instances_single_writer_uidx": {
+          "name": "ezil_computer_instances_single_writer_uidx",
+          "columns": [
+            {
+              "expression": "computer_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"ezil_computer_instances\".\"fenced_at\" is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_computer_instances_runtime_fkey": {
+          "name": "ezil_computer_instances_runtime_fkey",
+          "tableFrom": "ezil_computer_instances",
+          "tableTo": "ezil_computer_runtimes",
+          "columnsFrom": [
+            "computer_id"
+          ],
+          "columnsTo": [
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "ezil_computer_instances_pk": {
+          "name": "ezil_computer_instances_pk",
+          "columns": [
+            "computer_id",
+            "generation"
+          ]
+        }
+      },
+      "uniqueConstraints": {
+        "ezil_computer_instances_provider_id_uq": {
+          "name": "ezil_computer_instances_provider_id_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "provider_instance_id"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_computer_instances_generation_chk": {
+          "name": "ezil_computer_instances_generation_chk",
+          "value": "\"ezil_computer_instances\".\"generation\" >= 1"
+        },
+        "ezil_computer_instances_state_chk": {
+          "name": "ezil_computer_instances_state_chk",
+          "value": "\"ezil_computer_instances\".\"observed_state\" in ('pending', 'starting', 'running', 'stopping', 'stopped', 'failed')"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_lifecycle_jobs": {
+      "name": "ezil_computer_lifecycle_jobs",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "requested_by": {
+          "name": "requested_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "operation": {
+          "name": "operation",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'queued'"
+        },
+        "idempotency_key": {
+          "name": "idempotency_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "target_generation": {
+          "name": "target_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "error_code": {
+          "name": "error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "started_at": {
+          "name": "started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_computer_lifecycle_jobs_computer_fkey": {
+          "name": "ezil_computer_lifecycle_jobs_computer_fkey",
+          "tableFrom": "ezil_computer_lifecycle_jobs",
+          "tableTo": "ezil_computers",
+          "columnsFrom": [
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_computer_lifecycle_jobs_requester_fkey": {
+          "name": "ezil_computer_lifecycle_jobs_requester_fkey",
+          "tableFrom": "ezil_computer_lifecycle_jobs",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "requested_by"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_computer_lifecycle_jobs_computer_idempotency_uq": {
+          "name": "ezil_computer_lifecycle_jobs_computer_idempotency_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "computer_id",
+            "idempotency_key"
+          ]
+        },
+        "ezil_computer_lifecycle_jobs_id_computer_uq": {
+          "name": "ezil_computer_lifecycle_jobs_id_computer_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "computer_id"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_computer_lifecycle_jobs_operation_chk": {
+          "name": "ezil_computer_lifecycle_jobs_operation_chk",
+          "value": "\"ezil_computer_lifecycle_jobs\".\"operation\" in ('provision', 'start', 'stop', 'replace', 'retire', 'migrate', 'recover')"
+        },
+        "ezil_computer_lifecycle_jobs_status_chk": {
+          "name": "ezil_computer_lifecycle_jobs_status_chk",
+          "value": "\"ezil_computer_lifecycle_jobs\".\"status\" in ('queued', 'running', 'succeeded', 'failed', 'cancelled')"
+        },
+        "ezil_computer_lifecycle_jobs_generation_chk": {
+          "name": "ezil_computer_lifecycle_jobs_generation_chk",
+          "value": "\"ezil_computer_lifecycle_jobs\".\"target_generation\" is null or \"ezil_computer_lifecycle_jobs\".\"target_generation\" >= 1"
+        },
+        "ezil_computer_lifecycle_jobs_idempotency_chk": {
+          "name": "ezil_computer_lifecycle_jobs_idempotency_chk",
+          "value": "length(\"ezil_computer_lifecycle_jobs\".\"idempotency_key\") between 1 and 128"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_lifecycle_outbox": {
+      "name": "ezil_computer_lifecycle_outbox",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "job_id": {
+          "name": "job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "event_type": {
+          "name": "event_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'reconcile'"
+        },
+        "available_at": {
+          "name": "available_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "lease_until": {
+          "name": "lease_until",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempts": {
+          "name": "attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "delivered_at": {
+          "name": "delivered_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "ezil_computer_lifecycle_outbox_due_idx": {
+          "name": "ezil_computer_lifecycle_outbox_due_idx",
+          "columns": [
+            {
+              "expression": "available_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"ezil_computer_lifecycle_outbox\".\"delivered_at\" is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_computer_lifecycle_outbox_job_computer_fkey": {
+          "name": "ezil_computer_lifecycle_outbox_job_computer_fkey",
+          "tableFrom": "ezil_computer_lifecycle_outbox",
+          "tableTo": "ezil_computer_lifecycle_jobs",
+          "columnsFrom": [
+            "job_id",
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_computer_lifecycle_outbox_job_event_uq": {
+          "name": "ezil_computer_lifecycle_outbox_job_event_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "job_id",
+            "event_type"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_computer_lifecycle_outbox_event_chk": {
+          "name": "ezil_computer_lifecycle_outbox_event_chk",
+          "value": "\"ezil_computer_lifecycle_outbox\".\"event_type\" = 'reconcile'"
+        },
+        "ezil_computer_lifecycle_outbox_attempts_chk": {
+          "name": "ezil_computer_lifecycle_outbox_attempts_chk",
+          "value": "\"ezil_computer_lifecycle_outbox\".\"attempts\" >= 0"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_runtimes": {
+      "name": "ezil_computer_runtimes",
+      "schema": "",
+      "columns": {
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "provider": {
+          "name": "provider",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'aws-ec2'"
+        },
+        "region": {
+          "name": "region",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "availability_zone": {
+          "name": "availability_zone",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "data_volume_id": {
+          "name": "data_volume_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "data_filesystem_uuid": {
+          "name": "data_filesystem_uuid",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "next_generation": {
+          "name": "next_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "desired_state": {
+          "name": "desired_state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'stopped'"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_computer_runtimes_computer_provider_fkey": {
+          "name": "ezil_computer_runtimes_computer_provider_fkey",
+          "tableFrom": "ezil_computer_runtimes",
+          "tableTo": "ezil_computers",
+          "columnsFrom": [
+            "computer_id",
+            "provider"
+          ],
+          "columnsTo": [
+            "id",
+            "provider"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_computer_runtimes_volume_uq": {
+          "name": "ezil_computer_runtimes_volume_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "data_volume_id"
+          ]
+        },
+        "ezil_computer_runtimes_filesystem_uq": {
+          "name": "ezil_computer_runtimes_filesystem_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "data_filesystem_uuid"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_computer_runtimes_provider_chk": {
+          "name": "ezil_computer_runtimes_provider_chk",
+          "value": "\"ezil_computer_runtimes\".\"provider\" = 'aws-ec2'"
+        },
+        "ezil_computer_runtimes_generation_chk": {
+          "name": "ezil_computer_runtimes_generation_chk",
+          "value": "\"ezil_computer_runtimes\".\"next_generation\" >= 1"
+        },
+        "ezil_computer_runtimes_state_chk": {
+          "name": "ezil_computer_runtimes_state_chk",
+          "value": "\"ezil_computer_runtimes\".\"desired_state\" in ('stopped', 'running', 'retired')"
+        },
+        "ezil_computer_runtimes_volume_az_chk": {
+          "name": "ezil_computer_runtimes_volume_az_chk",
+          "value": "(\"ezil_computer_runtimes\".\"data_volume_id\" is null) = (\"ezil_computer_runtimes\".\"availability_zone\" is null)"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_lifecycle_intents": {
+      "name": "ezil_computer_lifecycle_intents",
+      "schema": "",
+      "columns": {
+        "job_id": {
+          "name": "job_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "revision": {
+          "name": "revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "operation": {
+          "name": "operation",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "target_generation": {
+          "name": "target_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "fence_token": {
+          "name": "fence_token",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provider_instance_id": {
+          "name": "provider_instance_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "data_volume_id": {
+          "name": "data_volume_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "previous_generation": {
+          "name": "previous_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "previous_instance_id": {
+          "name": "previous_instance_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "previous_fence_token": {
+          "name": "previous_fence_token",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "outbox_event": {
+          "name": "outbox_event",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'reconcile'"
+        },
+        "deployment": {
+          "name": "deployment",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "digest": {
+          "name": "digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "''"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_lifecycle_intents_job_fkey": {
+          "name": "ezil_lifecycle_intents_job_fkey",
+          "tableFrom": "ezil_computer_lifecycle_intents",
+          "tableTo": "ezil_computer_lifecycle_jobs",
+          "columnsFrom": [
+            "job_id",
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_lifecycle_intents_runtime_fkey": {
+          "name": "ezil_lifecycle_intents_runtime_fkey",
+          "tableFrom": "ezil_computer_lifecycle_intents",
+          "tableTo": "ezil_computer_runtimes",
+          "columnsFrom": [
+            "computer_id"
+          ],
+          "columnsTo": [
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_lifecycle_intents_outbox_fkey": {
+          "name": "ezil_lifecycle_intents_outbox_fkey",
+          "tableFrom": "ezil_computer_lifecycle_intents",
+          "tableTo": "ezil_computer_lifecycle_outbox",
+          "columnsFrom": [
+            "job_id",
+            "outbox_event"
+          ],
+          "columnsTo": [
+            "job_id",
+            "event_type"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_lifecycle_intents_previous_fkey": {
+          "name": "ezil_lifecycle_intents_previous_fkey",
+          "tableFrom": "ezil_computer_lifecycle_intents",
+          "tableTo": "ezil_computer_instances",
+          "columnsFrom": [
+            "computer_id",
+            "previous_generation"
+          ],
+          "columnsTo": [
+            "computer_id",
+            "generation"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_lifecycle_intents_revision_uq": {
+          "name": "ezil_lifecycle_intents_revision_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "computer_id",
+            "revision"
+          ]
+        },
+        "ezil_lifecycle_intents_digest_uq": {
+          "name": "ezil_lifecycle_intents_digest_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "job_id",
+            "digest"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_lifecycle_intents_generation_chk": {
+          "name": "ezil_lifecycle_intents_generation_chk",
+          "value": "revision >= 1 AND target_generation >= 1"
+        },
+        "ezil_lifecycle_intents_outbox_chk": {
+          "name": "ezil_lifecycle_intents_outbox_chk",
+          "value": "outbox_event = 'reconcile'"
+        },
+        "ezil_lifecycle_intents_scope_chk": {
+          "name": "ezil_lifecycle_intents_scope_chk",
+          "value": "\n        (provider_instance_id IS NULL OR provider_instance_id ~ '^i-[a-f0-9]{17}$')\n        AND (data_volume_id IS NULL OR data_volume_id ~ '^vol-[a-f0-9]{17}$')\n        AND (previous_instance_id IS NULL OR previous_instance_id ~ '^i-[a-f0-9]{17}$')"
+        },
+        "ezil_lifecycle_intents_shape_chk": {
+          "name": "ezil_lifecycle_intents_shape_chk",
+          "value": "\n        (operation = 'provision' AND provider_instance_id IS NULL AND data_volume_id IS NULL\n            AND previous_generation IS NULL AND previous_instance_id IS NULL AND previous_fence_token IS NULL)\n        OR (operation IN ('start','stop','retire') AND provider_instance_id IS NOT NULL AND data_volume_id IS NOT NULL\n            AND previous_generation IS NULL AND previous_instance_id IS NULL AND previous_fence_token IS NULL)\n        OR (operation = 'replace' AND provider_instance_id IS NULL AND data_volume_id IS NOT NULL\n            AND previous_generation IS NOT NULL AND previous_generation >= 1 AND previous_generation < target_generation\n            AND previous_instance_id IS NOT NULL AND previous_fence_token IS NOT NULL)"
+        },
+        "ezil_lifecycle_intents_deployment_size_chk": {
+          "name": "ezil_lifecycle_intents_deployment_size_chk",
+          "value": "octet_length(deployment) BETWEEN 2 AND 8192"
+        },
+        "ezil_lifecycle_intents_digest_chk": {
+          "name": "ezil_lifecycle_intents_digest_chk",
+          "value": "digest ~ '^[a-f0-9]{64}$'"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_recovery_intents": {
+      "name": "ezil_computer_recovery_intents",
+      "schema": "",
+      "columns": {
+        "job_id": {
+          "name": "job_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_job_id": {
+          "name": "source_job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_schema_version": {
+          "name": "source_schema_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_digest": {
+          "name": "source_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "revision": {
+          "name": "revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "target_generation": {
+          "name": "target_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "fence_token": {
+          "name": "fence_token",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "data_volume_id": {
+          "name": "data_volume_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "data_generation": {
+          "name": "data_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "data_fence_token": {
+          "name": "data_fence_token",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "outbox_event": {
+          "name": "outbox_event",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'reconcile'"
+        },
+        "deployment": {
+          "name": "deployment",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "digest": {
+          "name": "digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "''"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_recovery_intents_job_fkey": {
+          "name": "ezil_recovery_intents_job_fkey",
+          "tableFrom": "ezil_computer_recovery_intents",
+          "tableTo": "ezil_computer_lifecycle_jobs",
+          "columnsFrom": [
+            "job_id",
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_recovery_intents_source_job_fkey": {
+          "name": "ezil_recovery_intents_source_job_fkey",
+          "tableFrom": "ezil_computer_recovery_intents",
+          "tableTo": "ezil_computer_lifecycle_jobs",
+          "columnsFrom": [
+            "source_job_id",
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_recovery_intents_runtime_fkey": {
+          "name": "ezil_recovery_intents_runtime_fkey",
+          "tableFrom": "ezil_computer_recovery_intents",
+          "tableTo": "ezil_computer_runtimes",
+          "columnsFrom": [
+            "computer_id"
+          ],
+          "columnsTo": [
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_recovery_intents_outbox_fkey": {
+          "name": "ezil_recovery_intents_outbox_fkey",
+          "tableFrom": "ezil_computer_recovery_intents",
+          "tableTo": "ezil_computer_lifecycle_outbox",
+          "columnsFrom": [
+            "job_id",
+            "outbox_event"
+          ],
+          "columnsTo": [
+            "job_id",
+            "event_type"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_recovery_intents_revision_uq": {
+          "name": "ezil_recovery_intents_revision_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "computer_id",
+            "revision"
+          ]
+        },
+        "ezil_recovery_intents_digest_uq": {
+          "name": "ezil_recovery_intents_digest_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "job_id",
+            "digest"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_recovery_intents_generation_chk": {
+          "name": "ezil_recovery_intents_generation_chk",
+          "value": "revision >= 1 AND data_generation >= 1 AND target_generation > data_generation"
+        },
+        "ezil_recovery_intents_source_chk": {
+          "name": "ezil_recovery_intents_source_chk",
+          "value": "source_schema_version IN (1,2) AND source_job_id <> job_id AND fence_token <> data_fence_token"
+        },
+        "ezil_recovery_intents_volume_chk": {
+          "name": "ezil_recovery_intents_volume_chk",
+          "value": "data_volume_id ~ '^vol-[a-f0-9]{17}$'"
+        },
+        "ezil_recovery_intents_outbox_chk": {
+          "name": "ezil_recovery_intents_outbox_chk",
+          "value": "outbox_event = 'reconcile'"
+        },
+        "ezil_recovery_intents_deployment_chk": {
+          "name": "ezil_recovery_intents_deployment_chk",
+          "value": "octet_length(deployment) BETWEEN 2 AND 8192"
+        },
+        "ezil_recovery_intents_digest_chk": {
+          "name": "ezil_recovery_intents_digest_chk",
+          "value": "digest ~ '^[a-f0-9]{64}$' AND source_digest ~ '^[a-f0-9]{64}$'"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_cancellation_outbox": {
+      "name": "ezil_computer_cancellation_outbox",
+      "schema": "",
+      "columns": {
+        "cancellation_id": {
+          "name": "cancellation_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "available_at": {
+          "name": "available_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "lease_until": {
+          "name": "lease_until",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempts": {
+          "name": "attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "delivered_at": {
+          "name": "delivered_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "error_code": {
+          "name": "error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "ezil_cancellation_outbox_due_idx": {
+          "name": "ezil_cancellation_outbox_due_idx",
+          "columns": [
+            {
+              "expression": "available_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"ezil_computer_cancellation_outbox\".\"delivered_at\" IS NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_cancellation_outbox_intent_fkey": {
+          "name": "ezil_cancellation_outbox_intent_fkey",
+          "tableFrom": "ezil_computer_cancellation_outbox",
+          "tableTo": "ezil_computer_cancellations",
+          "columnsFrom": [
+            "cancellation_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_cancellation_outbox_attempts_chk": {
+          "name": "ezil_cancellation_outbox_attempts_chk",
+          "value": "attempts >= 0"
+        },
+        "ezil_cancellation_outbox_error_chk": {
+          "name": "ezil_cancellation_outbox_error_chk",
+          "value": "error_code IS NULL OR error_code ~ '^[a-z_]{1,80}$'"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_cancellations": {
+      "name": "ezil_computer_cancellations",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_job_id": {
+          "name": "source_job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_schema_version": {
+          "name": "source_schema_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_digest": {
+          "name": "source_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_state": {
+          "name": "source_state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'queued'"
+        },
+        "reason": {
+          "name": "reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "requested_by": {
+          "name": "requested_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "workflow_version_arn": {
+          "name": "workflow_version_arn",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "digest": {
+          "name": "digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "''"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_cancellations_source_fkey": {
+          "name": "ezil_cancellations_source_fkey",
+          "tableFrom": "ezil_computer_cancellations",
+          "tableTo": "ezil_computer_lifecycle_jobs",
+          "columnsFrom": [
+            "source_job_id",
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_cancellations_requester_fkey": {
+          "name": "ezil_cancellations_requester_fkey",
+          "tableFrom": "ezil_computer_cancellations",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "requested_by"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_cancellations_source_uq": {
+          "name": "ezil_cancellations_source_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "source_job_id"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_cancellations_version_chk": {
+          "name": "ezil_cancellations_version_chk",
+          "value": "source_schema_version IN (1,2)"
+        },
+        "ezil_cancellations_state_chk": {
+          "name": "ezil_cancellations_state_chk",
+          "value": "source_state IN ('queued','running')"
+        },
+        "ezil_cancellations_reason_chk": {
+          "name": "ezil_cancellations_reason_chk",
+          "value": "(reason='stop_requested' AND requested_by IS NOT NULL) OR (reason='authority_revoked' AND requested_by IS NULL)"
+        },
+        "ezil_cancellations_digest_chk": {
+          "name": "ezil_cancellations_digest_chk",
+          "value": "digest ~ '^[a-f0-9]{64}$' AND source_digest ~ '^[a-f0-9]{64}$'"
+        },
+        "ezil_cancellations_workflow_chk": {
+          "name": "ezil_cancellations_workflow_chk",
+          "value": "workflow_version_arn ~ '^arn:aws:states:us-east-1:[0-9]{12}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*$'"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_data_mount_authorizations": {
+      "name": "ezil_computer_data_mount_authorizations",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_generation": {
+          "name": "computer_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "lifecycle_job_id": {
+          "name": "lifecycle_job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "fence_token": {
+          "name": "fence_token",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provider_instance_id": {
+          "name": "provider_instance_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "data_volume_id": {
+          "name": "data_volume_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "filesystem_uuid": {
+          "name": "filesystem_uuid",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "mode": {
+          "name": "mode",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "digest": {
+          "name": "digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "''"
+        },
+        "provider_observed_at": {
+          "name": "provider_observed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "issued_at": {
+          "name": "issued_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "ezil_mount_authority_initialization_uidx": {
+          "name": "ezil_mount_authority_initialization_uidx",
+          "columns": [
+            {
+              "expression": "computer_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "mode = 'initialize'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_mount_authority_writer_fkey": {
+          "name": "ezil_mount_authority_writer_fkey",
+          "tableFrom": "ezil_computer_data_mount_authorizations",
+          "tableTo": "ezil_computer_instances",
+          "columnsFrom": [
+            "computer_id",
+            "computer_generation"
+          ],
+          "columnsTo": [
+            "computer_id",
+            "generation"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_mount_authority_job_fkey": {
+          "name": "ezil_mount_authority_job_fkey",
+          "tableFrom": "ezil_computer_data_mount_authorizations",
+          "tableTo": "ezil_computer_lifecycle_jobs",
+          "columnsFrom": [
+            "lifecycle_job_id",
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_mount_authority_job_uq": {
+          "name": "ezil_mount_authority_job_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "lifecycle_job_id"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_mount_authority_scope_chk": {
+          "name": "ezil_mount_authority_scope_chk",
+          "value": "computer_generation >= 1 AND provider_instance_id ~ '^i-[a-f0-9]{17}$' AND data_volume_id ~ '^vol-[a-f0-9]{17}$'"
+        },
+        "ezil_mount_authority_mode_chk": {
+          "name": "ezil_mount_authority_mode_chk",
+          "value": "mode IN ('initialize','mount')"
+        },
+        "ezil_mount_authority_digest_chk": {
+          "name": "ezil_mount_authority_digest_chk",
+          "value": "digest ~ '^[a-f0-9]{64}$'"
+        },
+        "ezil_mount_authority_lifetime_chk": {
+          "name": "ezil_mount_authority_lifetime_chk",
+          "value": "expires_at = issued_at + interval '900 seconds' AND provider_observed_at BETWEEN issued_at - interval '30 seconds' AND issued_at + interval '5 seconds'"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_data_mount_deliveries": {
+      "name": "ezil_computer_data_mount_deliveries",
+      "schema": "",
+      "columns": {
+        "authorization_id": {
+          "name": "authorization_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "available_at": {
+          "name": "available_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "lease_until": {
+          "name": "lease_until",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempts": {
+          "name": "attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "error_code": {
+          "name": "error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "mounted_at": {
+          "name": "mounted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "receipt": {
+          "name": "receipt",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "ezil_mount_delivery_due_idx": {
+          "name": "ezil_mount_delivery_due_idx",
+          "columns": [
+            {
+              "expression": "available_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "mounted_at IS NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_mount_delivery_authority_fkey": {
+          "name": "ezil_mount_delivery_authority_fkey",
+          "tableFrom": "ezil_computer_data_mount_deliveries",
+          "tableTo": "ezil_computer_data_mount_authorizations",
+          "columnsFrom": [
+            "authorization_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_mount_delivery_attempts_chk": {
+          "name": "ezil_mount_delivery_attempts_chk",
+          "value": "attempts >= 0"
+        },
+        "ezil_mount_delivery_error_chk": {
+          "name": "ezil_mount_delivery_error_chk",
+          "value": "error_code IS NULL OR error_code ~ '^[a-z][a-z0-9_]{1,63}$'"
+        },
+        "ezil_mount_delivery_receipt_chk": {
+          "name": "ezil_mount_delivery_receipt_chk",
+          "value": "(mounted_at IS NULL) = (receipt IS NULL) AND (receipt IS NULL OR octet_length(receipt) BETWEEN 2 AND 4096)"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_control_bindings": {
+      "name": "ezil_computer_control_bindings",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_generation": {
+          "name": "computer_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "creation_mount_id": {
+          "name": "creation_mount_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "fence_token": {
+          "name": "fence_token",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provider_instance_id": {
+          "name": "provider_instance_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "data_volume_id": {
+          "name": "data_volume_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "account_id": {
+          "name": "account_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "region": {
+          "name": "region",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'us-east-1'"
+        },
+        "namespace": {
+          "name": "namespace",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "control_domain": {
+          "name": "control_domain",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "kms_key_arn": {
+          "name": "kms_key_arn",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_control_binding_writer_fkey": {
+          "name": "ezil_control_binding_writer_fkey",
+          "tableFrom": "ezil_computer_control_bindings",
+          "tableTo": "ezil_computer_instances",
+          "columnsFrom": [
+            "computer_id",
+            "computer_generation"
+          ],
+          "columnsTo": [
+            "computer_id",
+            "generation"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_control_binding_mount_fkey": {
+          "name": "ezil_control_binding_mount_fkey",
+          "tableFrom": "ezil_computer_control_bindings",
+          "tableTo": "ezil_computer_data_mount_authorizations",
+          "columnsFrom": [
+            "creation_mount_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_control_binding_writer_uq": {
+          "name": "ezil_control_binding_writer_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "computer_id",
+            "computer_generation"
+          ]
+        },
+        "ezil_control_binding_scope_uq": {
+          "name": "ezil_control_binding_scope_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "computer_id",
+            "computer_generation"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_control_binding_scope_chk": {
+          "name": "ezil_control_binding_scope_chk",
+          "value": "computer_generation >= 1 AND provider_instance_id ~ '^i-[a-f0-9]{17}$' AND data_volume_id ~ '^vol-[a-f0-9]{17}$'"
+        },
+        "ezil_control_binding_reference_chk": {
+          "name": "ezil_control_binding_reference_chk",
+          "value": "region = 'us-east-1' AND account_id ~ '^[0-9]{12}$'\n        AND namespace ~ '^[a-z][a-z0-9-]{0,30}$' AND octet_length(control_domain) <= 190\n        AND control_domain ~ '^([a-z0-9]([a-z0-9-]*[a-z0-9])?[.])+[a-z]{2,63}$'\n        AND kms_key_arn ~ ('^arn:aws:kms:us-east-1:' || account_id || ':key/[a-f0-9-]{36}$')"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_start_authorizations": {
+      "name": "ezil_computer_start_authorizations",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_generation": {
+          "name": "computer_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "control_binding_id": {
+          "name": "control_binding_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "configuration_id": {
+          "name": "configuration_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "mount_authorization_id": {
+          "name": "mount_authorization_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provider_observed_at": {
+          "name": "provider_observed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "issued_at": {
+          "name": "issued_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "ezil_start_authority_current_uidx": {
+          "name": "ezil_start_authority_current_uidx",
+          "columns": [
+            {
+              "expression": "computer_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "revoked_at IS NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_start_authority_binding_fkey": {
+          "name": "ezil_start_authority_binding_fkey",
+          "tableFrom": "ezil_computer_start_authorizations",
+          "tableTo": "ezil_computer_control_bindings",
+          "columnsFrom": [
+            "control_binding_id",
+            "computer_id",
+            "computer_generation"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id",
+            "computer_generation"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_start_authority_configuration_fkey": {
+          "name": "ezil_start_authority_configuration_fkey",
+          "tableFrom": "ezil_computer_start_authorizations",
+          "tableTo": "ezil_computer_configurations",
+          "columnsFrom": [
+            "configuration_id",
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_start_authority_mount_fkey": {
+          "name": "ezil_start_authority_mount_fkey",
+          "tableFrom": "ezil_computer_start_authorizations",
+          "tableTo": "ezil_computer_data_mount_authorizations",
+          "columnsFrom": [
+            "mount_authorization_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_start_authority_generation_chk": {
+          "name": "ezil_start_authority_generation_chk",
+          "value": "computer_generation >= 1"
+        },
+        "ezil_start_authority_lifetime_chk": {
+          "name": "ezil_start_authority_lifetime_chk",
+          "value": "expires_at = issued_at + interval '300 seconds' AND provider_observed_at BETWEEN issued_at - interval '30 seconds' AND issued_at + interval '5 seconds'"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_start_deliveries": {
+      "name": "ezil_computer_start_deliveries",
+      "schema": "",
+      "columns": {
+        "authorization_id": {
+          "name": "authorization_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "available_at": {
+          "name": "available_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "lease_until": {
+          "name": "lease_until",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempts": {
+          "name": "attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "error_code": {
+          "name": "error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "started_at": {
+          "name": "started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "receipt": {
+          "name": "receipt",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "ezil_start_delivery_due_idx": {
+          "name": "ezil_start_delivery_due_idx",
+          "columns": [
+            {
+              "expression": "available_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "started_at IS NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_start_delivery_authority_fkey": {
+          "name": "ezil_start_delivery_authority_fkey",
+          "tableFrom": "ezil_computer_start_deliveries",
+          "tableTo": "ezil_computer_start_authorizations",
+          "columnsFrom": [
+            "authorization_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_start_delivery_attempts_chk": {
+          "name": "ezil_start_delivery_attempts_chk",
+          "value": "attempts >= 0"
+        },
+        "ezil_start_delivery_error_chk": {
+          "name": "ezil_start_delivery_error_chk",
+          "value": "error_code IS NULL OR error_code ~ '^[a-z][a-z0-9_]{1,63}$'"
+        },
+        "ezil_start_delivery_receipt_chk": {
+          "name": "ezil_start_delivery_receipt_chk",
+          "value": "(started_at IS NULL) = (receipt IS NULL) AND (receipt IS NULL OR octet_length(receipt) BETWEEN 2 AND 4096)"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_admins": {
+      "name": "ezil_app_admins",
+      "schema": "",
+      "columns": {
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "granted_by": {
+          "name": "granted_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "granted_at": {
+          "name": "granted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_app_admins_user_fkey": {
+          "name": "ezil_app_admins_user_fkey",
+          "tableFrom": "ezil_app_admins",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_admins_granter_fkey": {
+          "name": "ezil_app_admins_granter_fkey",
+          "tableFrom": "ezil_app_admins",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "granted_by"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_audit_events": {
+      "name": "ezil_app_audit_events",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "actor_user_id": {
+          "name": "actor_user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "action": {
+          "name": "action",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "app_id": {
+          "name": "app_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "release_id": {
+          "name": "release_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "submission_id": {
+          "name": "submission_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "installation_id": {
+          "name": "installation_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "reason_code": {
+          "name": "reason_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_app_audit_actor_fkey": {
+          "name": "ezil_app_audit_actor_fkey",
+          "tableFrom": "ezil_app_audit_events",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "actor_user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "ezil_app_audit_app_fkey": {
+          "name": "ezil_app_audit_app_fkey",
+          "tableFrom": "ezil_app_audit_events",
+          "tableTo": "ezil_apps",
+          "columnsFrom": [
+            "app_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_audit_release_app_fkey": {
+          "name": "ezil_app_audit_release_app_fkey",
+          "tableFrom": "ezil_app_audit_events",
+          "tableTo": "ezil_app_releases",
+          "columnsFrom": [
+            "release_id",
+            "app_id"
+          ],
+          "columnsTo": [
+            "id",
+            "app_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_audit_submission_fkey": {
+          "name": "ezil_app_audit_submission_fkey",
+          "tableFrom": "ezil_app_audit_events",
+          "tableTo": "ezil_app_submissions",
+          "columnsFrom": [
+            "submission_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_audit_installation_computer_fkey": {
+          "name": "ezil_app_audit_installation_computer_fkey",
+          "tableFrom": "ezil_app_audit_events",
+          "tableTo": "ezil_app_installations",
+          "columnsFrom": [
+            "installation_id",
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_app_audit_action_chk": {
+          "name": "ezil_app_audit_action_chk",
+          "value": "length(action) between 1 and 100"
+        },
+        "ezil_app_audit_reason_chk": {
+          "name": "ezil_app_audit_reason_chk",
+          "value": "reason_code is null or length(reason_code) <= 100"
+        },
+        "ezil_app_audit_scope_chk": {
+          "name": "ezil_app_audit_scope_chk",
+          "value": "(release_id is null or app_id is not null) and (installation_id is null or computer_id is not null)"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_folder_grants": {
+      "name": "ezil_app_folder_grants",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "installation_id": {
+          "name": "installation_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "folder": {
+          "name": "folder",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "scope": {
+          "name": "scope",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "project_id": {
+          "name": "project_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "access": {
+          "name": "access",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "granted_by": {
+          "name": "granted_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "ezil_app_folder_grants_whole_uidx": {
+          "name": "ezil_app_folder_grants_whole_uidx",
+          "columns": [
+            {
+              "expression": "installation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "folder",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "scope = 'whole-folder' and revoked_at is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "ezil_app_folder_grants_project_uidx": {
+          "name": "ezil_app_folder_grants_project_uidx",
+          "columns": [
+            {
+              "expression": "installation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "folder",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "scope = 'selected-projects' and revoked_at is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_app_folder_grants_installation_computer_fkey": {
+          "name": "ezil_app_folder_grants_installation_computer_fkey",
+          "tableFrom": "ezil_app_folder_grants",
+          "tableTo": "ezil_app_installations",
+          "columnsFrom": [
+            "installation_id",
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_folder_grants_granter_fkey": {
+          "name": "ezil_app_folder_grants_granter_fkey",
+          "tableFrom": "ezil_app_folder_grants",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "granted_by"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_folder_grants_owner_fkey": {
+          "name": "ezil_app_folder_grants_owner_fkey",
+          "tableFrom": "ezil_app_folder_grants",
+          "tableTo": "ezil_computers",
+          "columnsFrom": [
+            "computer_id",
+            "granted_by"
+          ],
+          "columnsTo": [
+            "id",
+            "user_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_app_folder_grants_folder_chk": {
+          "name": "ezil_app_folder_grants_folder_chk",
+          "value": "folder in ('Documents','Projects','Downloads')"
+        },
+        "ezil_app_folder_grants_access_chk": {
+          "name": "ezil_app_folder_grants_access_chk",
+          "value": "access in ('read','read-write')"
+        },
+        "ezil_app_folder_grants_scope_chk": {
+          "name": "ezil_app_folder_grants_scope_chk",
+          "value": "(scope = 'whole-folder' and project_id is null) or (scope = 'selected-projects' and folder = 'Projects' and project_id is not null)"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_grants": {
+      "name": "ezil_app_grants",
+      "schema": "",
+      "columns": {
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "app_id": {
+          "name": "app_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "granted_by": {
+          "name": "granted_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "granted_at": {
+          "name": "granted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_app_grants_user_fkey": {
+          "name": "ezil_app_grants_user_fkey",
+          "tableFrom": "ezil_app_grants",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_grants_app_fkey": {
+          "name": "ezil_app_grants_app_fkey",
+          "tableFrom": "ezil_app_grants",
+          "tableTo": "ezil_apps",
+          "columnsFrom": [
+            "app_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_grants_admin_fkey": {
+          "name": "ezil_app_grants_admin_fkey",
+          "tableFrom": "ezil_app_grants",
+          "tableTo": "ezil_app_admins",
+          "columnsFrom": [
+            "granted_by"
+          ],
+          "columnsTo": [
+            "user_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "ezil_app_grants_pk": {
+          "name": "ezil_app_grants_pk",
+          "columns": [
+            "user_id",
+            "app_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_installations": {
+      "name": "ezil_app_installations",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_provider": {
+          "name": "computer_provider",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'aws-ec2'"
+        },
+        "app_id": {
+          "name": "app_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "release_id": {
+          "name": "release_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "installed_by": {
+          "name": "installed_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'pending'"
+        },
+        "auth_generation": {
+          "name": "auth_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "installed_at": {
+          "name": "installed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "uninstalled_at": {
+          "name": "uninstalled_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "ezil_app_installations_active_uidx": {
+          "name": "ezil_app_installations_active_uidx",
+          "columns": [
+            {
+              "expression": "computer_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "app_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "uninstalled_at is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_app_installations_computer_provider_fkey": {
+          "name": "ezil_app_installations_computer_provider_fkey",
+          "tableFrom": "ezil_app_installations",
+          "tableTo": "ezil_computers",
+          "columnsFrom": [
+            "computer_id",
+            "computer_provider"
+          ],
+          "columnsTo": [
+            "id",
+            "provider"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_installations_owner_fkey": {
+          "name": "ezil_app_installations_owner_fkey",
+          "tableFrom": "ezil_app_installations",
+          "tableTo": "ezil_computers",
+          "columnsFrom": [
+            "computer_id",
+            "installed_by"
+          ],
+          "columnsTo": [
+            "id",
+            "user_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_installations_release_app_fkey": {
+          "name": "ezil_app_installations_release_app_fkey",
+          "tableFrom": "ezil_app_installations",
+          "tableTo": "ezil_app_releases",
+          "columnsFrom": [
+            "release_id",
+            "app_id"
+          ],
+          "columnsTo": [
+            "id",
+            "app_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_installations_installer_fkey": {
+          "name": "ezil_app_installations_installer_fkey",
+          "tableFrom": "ezil_app_installations",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "installed_by"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_app_installations_id_computer_uq": {
+          "name": "ezil_app_installations_id_computer_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "computer_id"
+          ]
+        },
+        "ezil_app_installations_id_computer_app_uq": {
+          "name": "ezil_app_installations_id_computer_app_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "computer_id",
+            "app_id"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_app_installations_provider_chk": {
+          "name": "ezil_app_installations_provider_chk",
+          "value": "computer_provider = 'aws-ec2'"
+        },
+        "ezil_app_installations_status_chk": {
+          "name": "ezil_app_installations_status_chk",
+          "value": "status in ('pending','installed','failed','uninstalled')"
+        },
+        "ezil_app_installations_generation_chk": {
+          "name": "ezil_app_installations_generation_chk",
+          "value": "auth_generation >= 1"
+        },
+        "ezil_app_installations_uninstalled_chk": {
+          "name": "ezil_app_installations_uninstalled_chk",
+          "value": "(status = 'uninstalled') = (uninstalled_at is not null)"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_jobs": {
+      "name": "ezil_app_jobs",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "submission_id": {
+          "name": "submission_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "installation_id": {
+          "name": "installation_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "requested_by": {
+          "name": "requested_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "operation": {
+          "name": "operation",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'queued'"
+        },
+        "idempotency_key": {
+          "name": "idempotency_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "error_code": {
+          "name": "error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "started_at": {
+          "name": "started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "ezil_app_jobs_submission_idempotency_uidx": {
+          "name": "ezil_app_jobs_submission_idempotency_uidx",
+          "columns": [
+            {
+              "expression": "submission_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "idempotency_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "submission_id is not null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "ezil_app_jobs_installation_idempotency_uidx": {
+          "name": "ezil_app_jobs_installation_idempotency_uidx",
+          "columns": [
+            {
+              "expression": "installation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "idempotency_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "installation_id is not null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_app_jobs_submission_fkey": {
+          "name": "ezil_app_jobs_submission_fkey",
+          "tableFrom": "ezil_app_jobs",
+          "tableTo": "ezil_app_submissions",
+          "columnsFrom": [
+            "submission_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_jobs_installation_computer_fkey": {
+          "name": "ezil_app_jobs_installation_computer_fkey",
+          "tableFrom": "ezil_app_jobs",
+          "tableTo": "ezil_app_installations",
+          "columnsFrom": [
+            "installation_id",
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_jobs_requester_fkey": {
+          "name": "ezil_app_jobs_requester_fkey",
+          "tableFrom": "ezil_app_jobs",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "requested_by"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_app_jobs_command_target_uq": {
+          "name": "ezil_app_jobs_command_target_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "installation_id",
+            "computer_id",
+            "operation"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_app_jobs_target_chk": {
+          "name": "ezil_app_jobs_target_chk",
+          "value": "((operation in ('inspect','build') and submission_id is not null and installation_id is null and computer_id is null) or (operation in ('install','start','stop','update','uninstall') and submission_id is null and installation_id is not null and computer_id is not null))"
+        },
+        "ezil_app_jobs_status_chk": {
+          "name": "ezil_app_jobs_status_chk",
+          "value": "status in ('queued','running','succeeded','failed','cancelled')"
+        },
+        "ezil_app_jobs_idempotency_chk": {
+          "name": "ezil_app_jobs_idempotency_chk",
+          "value": "length(idempotency_key) between 1 and 128"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_outbox": {
+      "name": "ezil_app_outbox",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "job_id": {
+          "name": "job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "event_type": {
+          "name": "event_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'reconcile'"
+        },
+        "available_at": {
+          "name": "available_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "lease_until": {
+          "name": "lease_until",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempts": {
+          "name": "attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "delivered_at": {
+          "name": "delivered_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "ezil_app_outbox_due_idx": {
+          "name": "ezil_app_outbox_due_idx",
+          "columns": [
+            {
+              "expression": "available_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "delivered_at is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_app_outbox_job_fkey": {
+          "name": "ezil_app_outbox_job_fkey",
+          "tableFrom": "ezil_app_outbox",
+          "tableTo": "ezil_app_jobs",
+          "columnsFrom": [
+            "job_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_app_outbox_job_event_uq": {
+          "name": "ezil_app_outbox_job_event_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "job_id",
+            "event_type"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_app_outbox_event_chk": {
+          "name": "ezil_app_outbox_event_chk",
+          "value": "event_type = 'reconcile'"
+        },
+        "ezil_app_outbox_attempts_chk": {
+          "name": "ezil_app_outbox_attempts_chk",
+          "value": "attempts >= 0"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_port_leases": {
+      "name": "ezil_app_port_leases",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "installation_id": {
+          "name": "installation_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "service_name": {
+          "name": "service_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "host_port": {
+          "name": "host_port",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "released_at": {
+          "name": "released_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "ezil_app_port_leases_computer_port_uidx": {
+          "name": "ezil_app_port_leases_computer_port_uidx",
+          "columns": [
+            {
+              "expression": "computer_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "host_port",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "released_at is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "ezil_app_port_leases_service_uidx": {
+          "name": "ezil_app_port_leases_service_uidx",
+          "columns": [
+            {
+              "expression": "installation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "service_name",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "released_at is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_app_port_leases_service_fkey": {
+          "name": "ezil_app_port_leases_service_fkey",
+          "tableFrom": "ezil_app_port_leases",
+          "tableTo": "ezil_app_services",
+          "columnsFrom": [
+            "installation_id",
+            "computer_id",
+            "service_name"
+          ],
+          "columnsTo": [
+            "installation_id",
+            "computer_id",
+            "name"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_app_port_leases_port_chk": {
+          "name": "ezil_app_port_leases_port_chk",
+          "value": "host_port between 1024 and 65535"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_publications": {
+      "name": "ezil_app_publications",
+      "schema": "",
+      "columns": {
+        "app_id": {
+          "name": "app_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "release_id": {
+          "name": "release_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "published_by": {
+          "name": "published_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "published_at": {
+          "name": "published_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_app_publications_app_fkey": {
+          "name": "ezil_app_publications_app_fkey",
+          "tableFrom": "ezil_app_publications",
+          "tableTo": "ezil_apps",
+          "columnsFrom": [
+            "app_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_publications_release_app_fkey": {
+          "name": "ezil_app_publications_release_app_fkey",
+          "tableFrom": "ezil_app_publications",
+          "tableTo": "ezil_app_releases",
+          "columnsFrom": [
+            "release_id",
+            "app_id"
+          ],
+          "columnsTo": [
+            "id",
+            "app_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_publications_admin_fkey": {
+          "name": "ezil_app_publications_admin_fkey",
+          "tableFrom": "ezil_app_publications",
+          "tableTo": "ezil_app_admins",
+          "columnsFrom": [
+            "published_by"
+          ],
+          "columnsTo": [
+            "user_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_publishers": {
+      "name": "ezil_app_publishers",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "owner_user_id": {
+          "name": "owner_user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "display_name": {
+          "name": "display_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'invited'"
+        },
+        "invited_by": {
+          "name": "invited_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_app_publishers_owner_fkey": {
+          "name": "ezil_app_publishers_owner_fkey",
+          "tableFrom": "ezil_app_publishers",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "owner_user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_publishers_inviter_fkey": {
+          "name": "ezil_app_publishers_inviter_fkey",
+          "tableFrom": "ezil_app_publishers",
+          "tableTo": "ezil_app_admins",
+          "columnsFrom": [
+            "invited_by"
+          ],
+          "columnsTo": [
+            "user_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_app_publishers_owner_uq": {
+          "name": "ezil_app_publishers_owner_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "owner_user_id"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_app_publishers_name_chk": {
+          "name": "ezil_app_publishers_name_chk",
+          "value": "length(display_name) between 1 and 120"
+        },
+        "ezil_app_publishers_status_chk": {
+          "name": "ezil_app_publishers_status_chk",
+          "value": "status in ('invited','active','revoked')"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_releases": {
+      "name": "ezil_app_releases",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "app_id": {
+          "name": "app_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "version": {
+          "name": "version",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "manifest": {
+          "name": "manifest",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "policy": {
+          "name": "policy",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "manifest_digest": {
+          "name": "manifest_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "policy_digest": {
+          "name": "policy_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "image_reference": {
+          "name": "image_reference",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provenance_digest": {
+          "name": "provenance_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_commit_sha": {
+          "name": "source_commit_sha",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'draft'"
+        },
+        "approved_by": {
+          "name": "approved_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "approved_at": {
+          "name": "approved_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_app_releases_app_fkey": {
+          "name": "ezil_app_releases_app_fkey",
+          "tableFrom": "ezil_app_releases",
+          "tableTo": "ezil_apps",
+          "columnsFrom": [
+            "app_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_releases_approver_fkey": {
+          "name": "ezil_app_releases_approver_fkey",
+          "tableFrom": "ezil_app_releases",
+          "tableTo": "ezil_app_admins",
+          "columnsFrom": [
+            "approved_by"
+          ],
+          "columnsTo": [
+            "user_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_app_releases_app_version_uq": {
+          "name": "ezil_app_releases_app_version_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "app_id",
+            "version"
+          ]
+        },
+        "ezil_app_releases_id_app_uq": {
+          "name": "ezil_app_releases_id_app_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "app_id"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_app_releases_version_chk": {
+          "name": "ezil_app_releases_version_chk",
+          "value": "version ~ '^[A-Za-z0-9][A-Za-z0-9.+_-]*$' AND length(version) <= 64"
+        },
+        "ezil_app_releases_manifest_version_chk": {
+          "name": "ezil_app_releases_manifest_version_chk",
+          "value": "coalesce(manifest->>'schemaVersion','') = '2' AND coalesce(policy->>'schemaVersion','') = '2'"
+        },
+        "ezil_app_releases_digest_chk": {
+          "name": "ezil_app_releases_digest_chk",
+          "value": "manifest_digest ~ '^sha256:[0-9a-f]{64}$' AND policy_digest ~ '^sha256:[0-9a-f]{64}$' AND provenance_digest ~ '^sha256:[0-9a-f]{64}$' AND image_reference ~ '@sha256:[0-9a-f]{64}$'"
+        },
+        "ezil_app_releases_source_pin_chk": {
+          "name": "ezil_app_releases_source_pin_chk",
+          "value": "((coalesce(manifest #>> '{source,kind}','') = 'github') and source_commit_sha is not null and source_commit_sha ~ '^[0-9a-f]{40}$' and source_commit_sha = lower(coalesce(manifest #>> '{source,commitSha}',''))) or ((coalesce(manifest #>> '{source,kind}','') = 'oci') and source_commit_sha is null and image_reference = coalesce(manifest #>> '{source,image}',''))"
+        },
+        "ezil_app_releases_policy_image_chk": {
+          "name": "ezil_app_releases_policy_image_chk",
+          "value": "image_reference = coalesce(policy #>> '{image,reference}','')"
+        },
+        "ezil_app_releases_status_chk": {
+          "name": "ezil_app_releases_status_chk",
+          "value": "status in ('draft','validated','approved','rejected','revoked')"
+        },
+        "ezil_app_releases_approval_chk": {
+          "name": "ezil_app_releases_approval_chk",
+          "value": "(status in ('draft','validated','rejected') and approved_by is null and approved_at is null and revoked_at is null) or (status = 'approved' and approved_by is not null and approved_at is not null and revoked_at is null) or (status = 'revoked' and approved_by is not null and approved_at is not null and revoked_at is not null)"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_services": {
+      "name": "ezil_app_services",
+      "schema": "",
+      "columns": {
+        "installation_id": {
+          "name": "installation_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "protocol": {
+          "name": "protocol",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'http'"
+        },
+        "scope": {
+          "name": "scope",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "internal_port": {
+          "name": "internal_port",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "preferred_host_port": {
+          "name": "preferred_host_port",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "health_path": {
+          "name": "health_path",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_app_services_installation_computer_fkey": {
+          "name": "ezil_app_services_installation_computer_fkey",
+          "tableFrom": "ezil_app_services",
+          "tableTo": "ezil_app_installations",
+          "columnsFrom": [
+            "installation_id",
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "ezil_app_services_pk": {
+          "name": "ezil_app_services_pk",
+          "columns": [
+            "installation_id",
+            "computer_id",
+            "name"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_app_services_name_chk": {
+          "name": "ezil_app_services_name_chk",
+          "value": "name ~ '^[a-z][a-z0-9-]*$' AND length(name) <= 48"
+        },
+        "ezil_app_services_protocol_chk": {
+          "name": "ezil_app_services_protocol_chk",
+          "value": "protocol = 'http'"
+        },
+        "ezil_app_services_scope_chk": {
+          "name": "ezil_app_services_scope_chk",
+          "value": "scope in ('installation','selected-project')"
+        },
+        "ezil_app_services_ports_chk": {
+          "name": "ezil_app_services_ports_chk",
+          "value": "internal_port between 1024 and 65535 AND (preferred_host_port is null or preferred_host_port between 1024 and 65535)"
+        },
+        "ezil_app_services_health_chk": {
+          "name": "ezil_app_services_health_chk",
+          "value": "health_path like '/%' AND length(health_path) <= 256"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_submissions": {
+      "name": "ezil_app_submissions",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "submitted_by": {
+          "name": "submitted_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "app_id": {
+          "name": "app_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "repository_url": {
+          "name": "repository_url",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "requested_commit_sha": {
+          "name": "requested_commit_sha",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "resolved_commit_sha": {
+          "name": "resolved_commit_sha",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'queued'"
+        },
+        "inspection": {
+          "name": "inspection",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "error_code": {
+          "name": "error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "idempotency_key": {
+          "name": "idempotency_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_app_submissions_submitter_fkey": {
+          "name": "ezil_app_submissions_submitter_fkey",
+          "tableFrom": "ezil_app_submissions",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "submitted_by"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_submissions_app_fkey": {
+          "name": "ezil_app_submissions_app_fkey",
+          "tableFrom": "ezil_app_submissions",
+          "tableTo": "ezil_apps",
+          "columnsFrom": [
+            "app_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_app_submissions_idempotency_uq": {
+          "name": "ezil_app_submissions_idempotency_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "submitted_by",
+            "idempotency_key"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_app_submissions_url_chk": {
+          "name": "ezil_app_submissions_url_chk",
+          "value": "length(repository_url) between 1 and 2048"
+        },
+        "ezil_app_submissions_pin_chk": {
+          "name": "ezil_app_submissions_pin_chk",
+          "value": "(requested_commit_sha is null or requested_commit_sha ~ '^[0-9a-f]{40}$') AND (resolved_commit_sha is null or resolved_commit_sha ~ '^[0-9a-f]{40}$')"
+        },
+        "ezil_app_submissions_status_chk": {
+          "name": "ezil_app_submissions_status_chk",
+          "value": "status in ('queued','inspecting','needs-config','building','validated','rejected','cancelled')"
+        },
+        "ezil_app_submissions_idempotency_chk": {
+          "name": "ezil_app_submissions_idempotency_chk",
+          "value": "length(idempotency_key) between 1 and 128"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_apps": {
+      "name": "ezil_apps",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "publisher_id": {
+          "name": "publisher_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "slug": {
+          "name": "slug",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "name": {
+          "name": "name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "summary": {
+          "name": "summary",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "category": {
+          "name": "category",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "logo_asset_key": {
+          "name": "logo_asset_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "visibility": {
+          "name": "visibility",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'grant-only'"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_apps_publisher_fkey": {
+          "name": "ezil_apps_publisher_fkey",
+          "tableFrom": "ezil_apps",
+          "tableTo": "ezil_app_publishers",
+          "columnsFrom": [
+            "publisher_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_apps_slug_uq": {
+          "name": "ezil_apps_slug_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "slug"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_apps_slug_chk": {
+          "name": "ezil_apps_slug_chk",
+          "value": "slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$' AND length(slug) <= 64"
+        },
+        "ezil_apps_name_chk": {
+          "name": "ezil_apps_name_chk",
+          "value": "length(name) between 1 and 80"
+        },
+        "ezil_apps_summary_chk": {
+          "name": "ezil_apps_summary_chk",
+          "value": "length(summary) between 1 and 500"
+        },
+        "ezil_apps_category_chk": {
+          "name": "ezil_apps_category_chk",
+          "value": "length(category) between 1 and 60"
+        },
+        "ezil_apps_visibility_chk": {
+          "name": "ezil_apps_visibility_chk",
+          "value": "visibility in ('grant-only','all-authenticated')"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_runtime_commands": {
+      "name": "ezil_app_runtime_commands",
+      "schema": "",
+      "columns": {
+        "job_id": {
+          "name": "job_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "installation_id": {
+          "name": "installation_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "app_id": {
+          "name": "app_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "release_id": {
+          "name": "release_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_generation": {
+          "name": "computer_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "generation": {
+          "name": "generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "auth_generation": {
+          "name": "auth_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "operation": {
+          "name": "operation",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "outbox_event": {
+          "name": "outbox_event",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'reconcile'"
+        },
+        "plan": {
+          "name": "plan",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_app_runtime_commands_installation_fkey": {
+          "name": "ezil_app_runtime_commands_installation_fkey",
+          "tableFrom": "ezil_app_runtime_commands",
+          "tableTo": "ezil_app_installations",
+          "columnsFrom": [
+            "installation_id",
+            "computer_id",
+            "app_id"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id",
+            "app_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_runtime_commands_release_fkey": {
+          "name": "ezil_app_runtime_commands_release_fkey",
+          "tableFrom": "ezil_app_runtime_commands",
+          "tableTo": "ezil_app_releases",
+          "columnsFrom": [
+            "release_id",
+            "app_id"
+          ],
+          "columnsTo": [
+            "id",
+            "app_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_runtime_commands_writer_fkey": {
+          "name": "ezil_app_runtime_commands_writer_fkey",
+          "tableFrom": "ezil_app_runtime_commands",
+          "tableTo": "ezil_computer_instances",
+          "columnsFrom": [
+            "computer_id",
+            "computer_generation"
+          ],
+          "columnsTo": [
+            "computer_id",
+            "generation"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_runtime_commands_job_fkey": {
+          "name": "ezil_app_runtime_commands_job_fkey",
+          "tableFrom": "ezil_app_runtime_commands",
+          "tableTo": "ezil_app_jobs",
+          "columnsFrom": [
+            "job_id",
+            "installation_id",
+            "computer_id",
+            "operation"
+          ],
+          "columnsTo": [
+            "id",
+            "installation_id",
+            "computer_id",
+            "operation"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_runtime_commands_outbox_fkey": {
+          "name": "ezil_app_runtime_commands_outbox_fkey",
+          "tableFrom": "ezil_app_runtime_commands",
+          "tableTo": "ezil_app_outbox",
+          "columnsFrom": [
+            "job_id",
+            "outbox_event"
+          ],
+          "columnsTo": [
+            "job_id",
+            "event_type"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_app_runtime_commands_revision_uq": {
+          "name": "ezil_app_runtime_commands_revision_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "installation_id",
+            "generation"
+          ]
+        },
+        "ezil_app_runtime_commands_job_installation_uq": {
+          "name": "ezil_app_runtime_commands_job_installation_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "job_id",
+            "installation_id"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_app_runtime_commands_generation_chk": {
+          "name": "ezil_app_runtime_commands_generation_chk",
+          "value": "generation >= 1 AND computer_generation >= 1 AND auth_generation >= 1"
+        },
+        "ezil_app_runtime_commands_operation_chk": {
+          "name": "ezil_app_runtime_commands_operation_chk",
+          "value": "operation in ('start','stop') AND outbox_event = 'reconcile'"
+        },
+        "ezil_app_runtime_commands_plan_chk": {
+          "name": "ezil_app_runtime_commands_plan_chk",
+          "value": "jsonb_typeof(plan) = 'object' AND octet_length(plan::text) <= 49152 AND coalesce(plan->>'releaseId','') = release_id::text AND coalesce(plan->>'policyDigest','') ~ '^sha256:[0-9a-f]{64}$'"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_app_runtime_requests": {
+      "name": "ezil_app_runtime_requests",
+      "schema": "",
+      "columns": {
+        "installation_id": {
+          "name": "installation_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "request_id": {
+          "name": "request_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "job_id": {
+          "name": "job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "requested_by": {
+          "name": "requested_by",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_app_runtime_requests_command_fkey": {
+          "name": "ezil_app_runtime_requests_command_fkey",
+          "tableFrom": "ezil_app_runtime_requests",
+          "tableTo": "ezil_app_runtime_commands",
+          "columnsFrom": [
+            "job_id",
+            "installation_id"
+          ],
+          "columnsTo": [
+            "job_id",
+            "installation_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_app_runtime_requests_requester_fkey": {
+          "name": "ezil_app_runtime_requests_requester_fkey",
+          "tableFrom": "ezil_app_runtime_requests",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "requested_by"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "ezil_app_runtime_requests_pk": {
+          "name": "ezil_app_runtime_requests_pk",
+          "columns": [
+            "installation_id",
+            "request_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_configuration_deliveries": {
+      "name": "ezil_computer_configuration_deliveries",
+      "schema": "",
+      "columns": {
+        "configuration_id": {
+          "name": "configuration_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "available_at": {
+          "name": "available_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "lease_until": {
+          "name": "lease_until",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attempts": {
+          "name": "attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "error_code": {
+          "name": "error_code",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "prepared_at": {
+          "name": "prepared_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "loaded_at": {
+          "name": "loaded_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "loaded_digest": {
+          "name": "loaded_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "superseded_at": {
+          "name": "superseded_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "ezil_computer_configuration_deliveries_due_idx": {
+          "name": "ezil_computer_configuration_deliveries_due_idx",
+          "columns": [
+            {
+              "expression": "available_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "loaded_at IS NULL AND superseded_at IS NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_computer_configuration_deliveries_config_fkey": {
+          "name": "ezil_computer_configuration_deliveries_config_fkey",
+          "tableFrom": "ezil_computer_configuration_deliveries",
+          "tableTo": "ezil_computer_configurations",
+          "columnsFrom": [
+            "configuration_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_computer_configuration_deliveries_digest_fkey": {
+          "name": "ezil_computer_configuration_deliveries_digest_fkey",
+          "tableFrom": "ezil_computer_configuration_deliveries",
+          "tableTo": "ezil_computer_configurations",
+          "columnsFrom": [
+            "configuration_id",
+            "loaded_digest"
+          ],
+          "columnsTo": [
+            "id",
+            "digest"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_computer_configuration_deliveries_attempts_chk": {
+          "name": "ezil_computer_configuration_deliveries_attempts_chk",
+          "value": "attempts >= 0"
+        },
+        "ezil_computer_configuration_deliveries_error_chk": {
+          "name": "ezil_computer_configuration_deliveries_error_chk",
+          "value": "error_code IS NULL OR error_code ~ '^[a-z][a-z0-9_]{1,63}$'"
+        },
+        "ezil_computer_configuration_deliveries_receipt_chk": {
+          "name": "ezil_computer_configuration_deliveries_receipt_chk",
+          "value": "\n        (loaded_at IS NULL) = (loaded_digest IS NULL)\n        AND (loaded_at IS NULL OR (prepared_at IS NOT NULL AND loaded_at >= prepared_at AND superseded_at IS NULL))\n    "
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_configuration_installations": {
+      "name": "ezil_computer_configuration_installations",
+      "schema": "",
+      "columns": {
+        "configuration_id": {
+          "name": "configuration_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "installation_id": {
+          "name": "installation_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "app_id": {
+          "name": "app_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "release_id": {
+          "name": "release_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "auth_generation": {
+          "name": "auth_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "install_job_id": {
+          "name": "install_job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "install_operation": {
+          "name": "install_operation",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'install'"
+        },
+        "install_event": {
+          "name": "install_event",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'reconcile'"
+        },
+        "runtime_job_id": {
+          "name": "runtime_job_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_computer_configuration_installations_config_fkey": {
+          "name": "ezil_computer_configuration_installations_config_fkey",
+          "tableFrom": "ezil_computer_configuration_installations",
+          "tableTo": "ezil_computer_configurations",
+          "columnsFrom": [
+            "configuration_id",
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_computer_configuration_installations_scope_fkey": {
+          "name": "ezil_computer_configuration_installations_scope_fkey",
+          "tableFrom": "ezil_computer_configuration_installations",
+          "tableTo": "ezil_app_installations",
+          "columnsFrom": [
+            "installation_id",
+            "computer_id",
+            "app_id"
+          ],
+          "columnsTo": [
+            "id",
+            "computer_id",
+            "app_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_computer_configuration_installations_release_fkey": {
+          "name": "ezil_computer_configuration_installations_release_fkey",
+          "tableFrom": "ezil_computer_configuration_installations",
+          "tableTo": "ezil_app_releases",
+          "columnsFrom": [
+            "release_id",
+            "app_id"
+          ],
+          "columnsTo": [
+            "id",
+            "app_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_computer_configuration_installations_install_job_fkey": {
+          "name": "ezil_computer_configuration_installations_install_job_fkey",
+          "tableFrom": "ezil_computer_configuration_installations",
+          "tableTo": "ezil_app_jobs",
+          "columnsFrom": [
+            "install_job_id",
+            "installation_id",
+            "computer_id",
+            "install_operation"
+          ],
+          "columnsTo": [
+            "id",
+            "installation_id",
+            "computer_id",
+            "operation"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_computer_configuration_installations_runtime_job_fkey": {
+          "name": "ezil_computer_configuration_installations_runtime_job_fkey",
+          "tableFrom": "ezil_computer_configuration_installations",
+          "tableTo": "ezil_app_runtime_commands",
+          "columnsFrom": [
+            "runtime_job_id",
+            "installation_id"
+          ],
+          "columnsTo": [
+            "job_id",
+            "installation_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "ezil_computer_configuration_installations_outbox_fkey": {
+          "name": "ezil_computer_configuration_installations_outbox_fkey",
+          "tableFrom": "ezil_computer_configuration_installations",
+          "tableTo": "ezil_app_outbox",
+          "columnsFrom": [
+            "install_job_id",
+            "install_event"
+          ],
+          "columnsTo": [
+            "job_id",
+            "event_type"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "ezil_computer_configuration_installations_pk": {
+          "name": "ezil_computer_configuration_installations_pk",
+          "columns": [
+            "configuration_id",
+            "installation_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_computer_configuration_installations_generation_chk": {
+          "name": "ezil_computer_configuration_installations_generation_chk",
+          "value": "auth_generation >= 1"
+        },
+        "ezil_computer_configuration_installations_operation_chk": {
+          "name": "ezil_computer_configuration_installations_operation_chk",
+          "value": "install_operation = 'install' AND install_event = 'reconcile'"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_computer_configurations": {
+      "name": "ezil_computer_configurations",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "computer_generation": {
+          "name": "computer_generation",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "revision": {
+          "name": "revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "provider_instance_id": {
+          "name": "provider_instance_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "fence_token": {
+          "name": "fence_token",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "data_volume_id": {
+          "name": "data_volume_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "configuration": {
+          "name": "configuration",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "digest": {
+          "name": "digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "''"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_computer_configurations_writer_fkey": {
+          "name": "ezil_computer_configurations_writer_fkey",
+          "tableFrom": "ezil_computer_configurations",
+          "tableTo": "ezil_computer_instances",
+          "columnsFrom": [
+            "computer_id",
+            "computer_generation"
+          ],
+          "columnsTo": [
+            "computer_id",
+            "generation"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "ezil_computer_configurations_revision_uq": {
+          "name": "ezil_computer_configurations_revision_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "computer_id",
+            "revision"
+          ]
+        },
+        "ezil_computer_configurations_id_computer_uq": {
+          "name": "ezil_computer_configurations_id_computer_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "computer_id"
+          ]
+        },
+        "ezil_computer_configurations_receipt_uq": {
+          "name": "ezil_computer_configurations_receipt_uq",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "digest"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {
+        "ezil_computer_configurations_generation_chk": {
+          "name": "ezil_computer_configurations_generation_chk",
+          "value": "computer_generation >= 1 AND revision >= 1"
+        },
+        "ezil_computer_configurations_scope_chk": {
+          "name": "ezil_computer_configurations_scope_chk",
+          "value": "provider_instance_id ~ '^i-([0-9a-f]{8}|[0-9a-f]{17})$' AND data_volume_id ~ '^vol-([0-9a-f]{8}|[0-9a-f]{17})$'"
+        },
+        "ezil_computer_configurations_size_chk": {
+          "name": "ezil_computer_configurations_size_chk",
+          "value": "octet_length(configuration) BETWEEN 1 AND 262144"
+        },
+        "ezil_computer_configurations_digest_chk": {
+          "name": "ezil_computer_configurations_digest_chk",
+          "value": "digest ~ '^[0-9a-f]{64}$'"
+        },
+        "ezil_computer_configurations_envelope_chk": {
+          "name": "ezil_computer_configurations_envelope_chk",
+          "value": "COALESCE((\n        jsonb_typeof(configuration::jsonb) = 'object'\n        AND configuration::jsonb ?& ARRAY['schemaVersion','computerId','computerGeneration','configurationRevision','volumeId',\n            'dataRoot','stateDirectory','stagingRoot','controlPort','memoryBudgetMiB','suspended','preparedInstallations','approvedInstallations']\n        AND configuration::jsonb - ARRAY['schemaVersion','computerId','computerGeneration','configurationRevision','volumeId',\n            'dataRoot','stateDirectory','stagingRoot','controlPort','memoryBudgetMiB','suspended','preparedInstallations','approvedInstallations'] = '{}'::jsonb\n        AND configuration::jsonb->'schemaVersion' = '1'::jsonb\n        AND configuration::jsonb->>'computerId' = computer_id::text\n        AND configuration::jsonb->'computerGeneration' = to_jsonb(computer_generation)\n        AND configuration::jsonb->'configurationRevision' = to_jsonb(revision)\n        AND configuration::jsonb->>'volumeId' = data_volume_id\n        AND jsonb_typeof(configuration::jsonb->'suspended') = 'boolean'\n        AND jsonb_typeof(configuration::jsonb->'preparedInstallations') = 'array'\n        AND jsonb_typeof(configuration::jsonb->'approvedInstallations') = 'array'\n        AND jsonb_array_length(configuration::jsonb->'preparedInstallations') <= 128\n        AND jsonb_array_length(configuration::jsonb->'approvedInstallations') <= 128\n    ), false)"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_os_access": {
+      "name": "ezil_os_access",
+      "schema": "",
+      "columns": {
+        "email": {
+          "name": "email",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "invited_by": {
+          "name": "invited_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "revoked_at": {
+          "name": "revoked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "ezil_os_access_user_id_fkey": {
+          "name": "ezil_os_access_user_id_fkey",
+          "tableFrom": "ezil_os_access",
+          "tableTo": "users",
+          "schemaTo": "auth",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_os_access_email_lower_chk": {
+          "name": "ezil_os_access_email_lower_chk",
+          "value": "\"ezil_os_access\".\"email\" = lower(\"ezil_os_access\".\"email\")"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_error_events": {
+      "name": "ezil_error_events",
+      "schema": "",
+      "columns": {
+        "event_id": {
+          "name": "event_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "schema_version": {
+          "name": "schema_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        },
+        "event_class": {
+          "name": "event_class",
+          "type": "varchar(32)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source": {
+          "name": "source",
+          "type": "varchar(16)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "fingerprint": {
+          "name": "fingerprint",
+          "type": "char(19)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "user_hash": {
+          "name": "user_hash",
+          "type": "char(10)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "site": {
+          "name": "site",
+          "type": "varchar(96)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "code": {
+          "name": "code",
+          "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "outcome": {
+          "name": "outcome",
+          "type": "varchar(16)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "detail": {
+          "name": "detail",
+          "type": "varchar(200)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "duration_ms": {
+          "name": "duration_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "correlation_id": {
+          "name": "correlation_id",
+          "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "computer_id": {
+          "name": "computer_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "attrs": {
+          "name": "attrs",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "occurred_at": {
+          "name": "occurred_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "received_at": {
+          "name": "received_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "idx_ezil_error_events_fp_time_user": {
+          "name": "idx_ezil_error_events_fp_time_user",
+          "columns": [
+            {
+              "expression": "fingerprint",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "received_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "user_hash",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_ezil_error_events_class_time": {
+          "name": "idx_ezil_error_events_class_time",
+          "columns": [
+            {
+              "expression": "event_class",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "received_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_ezil_error_events_time": {
+          "name": "idx_ezil_error_events_time",
+          "columns": [
+            {
+              "expression": "received_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_ezil_error_events_user_time": {
+          "name": "idx_ezil_error_events_user_time",
+          "columns": [
+            {
+              "expression": "user_hash",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "received_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_error_events_computer_id_fkey": {
+          "name": "ezil_error_events_computer_id_fkey",
+          "tableFrom": "ezil_error_events",
+          "tableTo": "ezil_computers",
+          "columnsFrom": [
+            "computer_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ezil_error_events_fingerprint_chk": {
+          "name": "ezil_error_events_fingerprint_chk",
+          "value": "\"ezil_error_events\".\"fingerprint\" ~ '^fp_[0-9a-f]{16}$'"
+        },
+        "ezil_error_events_user_hash_chk": {
+          "name": "ezil_error_events_user_hash_chk",
+          "value": "\"ezil_error_events\".\"user_hash\" ~ '^u_[0-9a-f]{8}$'"
+        },
+        "ezil_error_events_outcome_chk": {
+          "name": "ezil_error_events_outcome_chk",
+          "value": "\"ezil_error_events\".\"outcome\" in ('ok','error','skipped')"
+        }
+      },
+      "isRLSEnabled": true
+    },
+    "public.ezil_error_fingerprints": {
+      "name": "ezil_error_fingerprints",
+      "schema": "",
+      "columns": {
+        "fingerprint": {
+          "name": "fingerprint",
+          "type": "char(19)",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "event_class": {
+          "name": "event_class",
+          "type": "varchar(32)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source": {
+          "name": "source",
+          "type": "varchar(16)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "site": {
+          "name": "site",
+          "type": "varchar(96)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "code": {
+          "name": "code",
+          "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "normalized_detail": {
+          "name": "normalized_detail",
+          "type": "varchar(120)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "first_seen_at": {
+          "name": "first_seen_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "last_seen_at": {
+          "name": "last_seen_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "total_count": {
+          "name": "total_count",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "muted_at": {
+          "name": "muted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "notes": {
+          "name": "notes",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_ezil_error_fingerprints_last_seen": {
+          "name": "idx_ezil_error_fingerprints_last_seen",
+          "columns": [
+            {
+              "expression": "last_seen_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_ezil_error_fingerprints_class": {
+          "name": "idx_ezil_error_fingerprints_class",
+          "columns": [
+            {
+              "expression": "event_class",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "last_seen_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    },
+    "public.ezil_error_user_hours": {
+      "name": "ezil_error_user_hours",
+      "schema": "",
+      "columns": {
+        "fingerprint": {
+          "name": "fingerprint",
+          "type": "char(19)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "hour_bucket": {
+          "name": "hour_bucket",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "user_hash": {
+          "name": "user_hash",
+          "type": "char(10)",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "event_count": {
+          "name": "event_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        }
+      },
+      "indexes": {
+        "idx_ezil_error_user_hours_hour": {
+          "name": "idx_ezil_error_user_hours_hour",
+          "columns": [
+            {
+              "expression": "hour_bucket",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "ezil_error_user_hours_fingerprint_fkey": {
+          "name": "ezil_error_user_hours_fingerprint_fkey",
+          "tableFrom": "ezil_error_user_hours",
+          "tableTo": "ezil_error_fingerprints",
+          "columnsFrom": [
+            "fingerprint"
+          ],
+          "columnsTo": [
+            "fingerprint"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "cascade"
+        }
+      },
+      "compositePrimaryKeys": {
+        "ezil_error_user_hours_pkey": {
+          "name": "ezil_error_user_hours_pkey",
+          "columns": [
+            "fingerprint",
+            "hour_bucket",
+            "user_hash"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": true
+    }
+  },
+  "enums": {},
+  "schemas": {
+    "auth": "auth"
+  },
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}
