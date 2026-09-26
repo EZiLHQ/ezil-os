@@ -93,7 +93,7 @@ Unavailable work backs off without renewing authority or blocking other computer
 `authorizeComputerMount` rechecks exact current work for a trusted workflow
 caller. It is independent of the short delivery lease; it checks unexpired,
 unrevoked authority, owner OS access, approved deployment, current writer and
-unsettled delivery. It is not yet an HTTP endpoint. A transport must independently
+unsettled delivery. A transport must independently
 verify provider identity and current authority before host effects and during
 cancellation. Supplying work to a function never grants those permissions.
 
@@ -139,7 +139,7 @@ prevents reuse after AWS's Standard execution-name retention window.
 Calls have an eight-second deadline. Caller timeout stops local I/O; it does not
 claim that a remote SSM command was cancelled. The still-required trusted
 workflow must implement cancellation and expiry during host work. No workflow,
-SSM document, authority HTTP endpoint or dispatcher scheduler is created or
+SSM document or dispatcher scheduler is created or
 enabled by this adapter, and it has no EC2 start operation. Configuration delivery
 must still wait for independently verified mounted evidence.
 
@@ -147,3 +147,25 @@ The app suite exercises actual SDK serialization/signing and response parsing
 against a local wire handler, including lost replies, concurrent staging,
 version/content mismatches, altered executions, redaction and timeouts. This is
 not evidence of real S3/Step Functions/SSM, IAM or disk acceptance.
+
+## Signed current-authority callback
+
+`POST /api/internal/computers/mount-authority` accepts the exact work object.
+It requires its own HMAC key/realm, a fresh timestamp and a signature over the
+method, fixed path and body hash. Signed replays repeat current database checks;
+the response `{ authorized: true, work }` is a point-in-time answer, not a grant.
+Browser cookies and user bearers provide no access. The handler bounds body
+size/read time and authorization time, rejects changed work and emits only
+redacted errors. It cannot issue grants, call AWS or claim a mounted result.
+
+`EZIL_MOUNT_AUTHORITY_ENABLED` defaults to `false`. Activation requires migration
+0011, nonempty `EZIL_LIFECYCLE_DEPLOYMENTS`, and an independently generated
+`EZIL_MOUNT_AUTHORITY_SECRET` (64 lowercase hexadecimal characters, distinct
+from lifecycle/configuration keys). Store the same dedicated key in the approved
+workflow secret; never send it in workflow input or browser data. The provider
+writer/attachment check remains a separate mandatory workflow step. Disable the
+flag to deny checks; no scheduler or cloud resource is enabled by this route.
+
+HTTP unit tests exercise authentication, input limits, timeout/abort, redaction,
+cross-realm denial and response binding. The PostgreSQL delivery suite sends
+signed requests through the actual handler and rejects replay after revocation.

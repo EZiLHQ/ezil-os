@@ -6,6 +6,7 @@ import { issueComputerDataMount } from '../src/server/app-platform/computer-moun
 import { authorizeComputerMount, claimComputerMount, dispatchComputerMountClaim, dispatchNextComputerMount,
     type MountDeliveryOptions } from '../src/server/app-platform/computer-mount-delivery';
 import type { ComputerMountWork } from '../src/server/app-platform/computer-mount-protocol';
+import { createMountAuthorityHandler, MOUNT_AUTHORITY_PATH, mountAuthoritySignature } from '../src/server/app-platform/computer-mount-authority-http';
 import { runtimeTestDatabase } from './helpers/runtime-database';
 import { dataMountComputer } from './fixtures/data-mount';
 import { lifecycleDeployment as deployment } from './fixtures/lifecycle';
@@ -68,6 +69,16 @@ try {
         assert.equal(await dispatchComputerMountClaim(o, await claim(c)), 'waiting');
         assert.deepEqual(work, [c.work, c.work]);
         assert.equal(await authorizeComputerMount(options, c.work), true, 'workflow outlives a released delivery lease');
+    });
+    await test('signed HTTP checks bind actual database authority and recheck revocation on replay', async () => {
+        const c = await setup(), body = Buffer.from(JSON.stringify(c.work)), key = 'ab'.repeat(32), timestamp = String(Math.floor(Date.now()/1000));
+        const handle = createMountAuthorityHandler({ enabled:true, secret:key, authorize: work => authorizeComputerMount(options, work) });
+        const request = () => new Request('https://control.example'+MOUNT_AUTHORITY_PATH,{ method:'POST', body,
+            headers:{ 'content-type':'application/json','x-ezil-workflow-timestamp':timestamp,
+                'x-ezil-workflow-signature':mountAuthoritySignature(body,key,timestamp) } });
+        const first = await handle(request()); assert.equal(first.status,200); assert.deepEqual(await first.json(),{authorized:true,work:c.work});
+        await sql`UPDATE ezil_computer_data_mount_authorizations SET revoked_at=now() WHERE id=${c.authorizationId}`;
+        assert.equal((await handle(request())).status,403); assert.equal((await state(c)).mounted_at,null);
     });
     await test('exact receipts settle once, including mount-only start and replacement', async () => {
         for (const operation of ['provision', 'start', 'replace'] as const) {
