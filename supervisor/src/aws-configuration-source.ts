@@ -5,7 +5,7 @@ import type { Delivery, Provisioning } from './configuration-delivery-contract.j
 
 /** Exported for SDK wire tests; the CLI always uses real instance metadata and
  * fixed regional AWS endpoints. No credential values enter SSM input/output. */
-export async function fetchConfiguration(value: Delivery, host: Provisioning, signal: AbortSignal,
+export async function fetchConfiguration(value: Pick<Delivery, 'digest' | 'object'>, host: Provisioning, signal: AbortSignal,
     options: { requestHandler?: S3ClientConfig['requestHandler']; metadataRequest?: MetadataRequest } = {}) {
     const credentials = await instanceCredentials({ accountId: host.accountId, region: host.region,
         instanceId: host.scope.providerInstanceId }, signal, options.metadataRequest);

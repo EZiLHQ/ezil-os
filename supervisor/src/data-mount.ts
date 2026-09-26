@@ -79,7 +79,7 @@ async function pinDevice(d: BlockDevice) {
 
 /** Host-only bootstrap primitive. It never downloads a filesystem, repairs or
  * formats a retained volume, unmounts storage, or starts applications. */
-export async function mountComputerDataVolume(configPath: string, signal = AbortSignal.timeout(900000)) {
+export async function mountComputerDataVolume(configPath: string, signal = AbortSignal.timeout(900000), beforeEffect?: () => Promise<void>) {
     if (process.platform !== 'linux' || process.getuid?.() !== 0) return fail();
     const plan = DataMountPlanSchema.parse(JSON.parse((await readHostFile(configPath, 4096)).toString()));
     if (configPath.startsWith(`${DATA_MOUNT}/`) || configPath.startsWith(`${journal}/`)) return fail();
@@ -104,6 +104,8 @@ export async function mountComputerDataVolume(configPath: string, signal = Abort
         const current = async (d: BlockDevice) => {
             const fresh = DataMountPlanSchema.parse(JSON.parse((await readHostFile(configPath, 4096)).toString()));
             if (JSON.stringify(fresh) !== JSON.stringify(plan) || JSON.stringify(await inventory()) !== JSON.stringify(d) || signal.aborted) return fail();
+            await beforeEffect?.();
+            if (signal.aborted) return fail();
         };
         for (let step = 0; step < 5; step++) {
             const d = await inventory(), mountInfo = await run('/usr/bin/cat', ['/proc/self/mountinfo'], 5000, signal);
@@ -133,6 +135,7 @@ export async function mountComputerDataVolume(configPath: string, signal = Abort
                     // Persist before mkfs. An ambiguous format can be observed
                     // but is never retried, including after process death.
                     await createDurable(attemptPath, formatIdentity(plan));
+                    await beforeEffect?.();
                     await run('/usr/sbin/mkfs.ext4', ['-q', '-U', plan.filesystemUuid, '-E', 'lazy_itable_init=0,lazy_journal_init=0', '/proc/self/fd/3'], 120000, signal, device.fd);
                     await device.sync();
                 } else {

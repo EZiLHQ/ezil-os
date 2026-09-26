@@ -18,6 +18,7 @@ test('host and delivery entrypoints execute through the installed release-direct
             { name: 'configuration-receiver', args: ['invalid'], stdout: '', stderr: '{"code":"configuration_delivery_failed"}\n' },
             { name: 'delivery-operation', args: ['invalid'], stdout: '', stderr: '{"code":"delivery_operation_failed"}\n' },
             { name: 'delivery-executor', args: [], stdout: '', stderr: '{"code":"delivery_execution_failed"}\n' },
+            { name: 'data-mount-receiver', args: ['invalid'], stdout: '', stderr: '{"code":"data_mount_delivery_failed"}\n' },
         ];
         for (const value of cases) for (const directory of [dirname(source), alias]) {
             const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', '--import', 'tsx',
@@ -32,7 +33,7 @@ test('host and delivery entrypoints execute through the installed release-direct
 });
 
 test('importing host CLI modules does not perform operations or require configuration', () => {
-    for (const name of ['host', 'prepare', 'configuration-receiver', 'delivery-operation', 'delivery-executor', 'data-mount']) {
+    for (const name of ['host', 'prepare', 'configuration-receiver', 'delivery-operation', 'delivery-executor', 'data-mount', 'data-mount-receiver']) {
         const url = new URL(`../src/${name}.ts`, import.meta.url).href;
         const result = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', '--import', 'tsx',
             '--input-type=module', '--eval', `await import(${JSON.stringify(url)})`], {
