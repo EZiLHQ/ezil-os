@@ -22,7 +22,7 @@ try {
     execFileSync(process.execPath, [join(source, 'node_modules/typescript/bin/tsc'), '--project', join(source, 'tsconfig.build.json'),
         '--outDir', join(payload, 'dist')], { cwd: source, env, timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'] });
     await mkdir(join(payload, 'deploy'));
-    for (const name of [...units, 'configuration-document.json', 'mount-document.json']) await copyFile(join(source, 'deploy', name), join(payload, 'deploy', name));
+    for (const name of [...units, 'configuration-document.json', 'mount-document.json', 'start-document.json']) await copyFile(join(source, 'deploy', name), join(payload, 'deploy', name));
     const bytes = Buffer.from(JSON.stringify({ schemaVersion: 1, sourceCommit: commit, nodeMajor: 24, files: await inventory(payload) }) + '\n');
     const digest = hash(bytes); parseRelease(bytes, digest);
     // Lockfile bytes are part of the release; npm must not have rewritten them.

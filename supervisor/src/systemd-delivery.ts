@@ -9,13 +9,13 @@ export interface DeliveryProcess { quiescent: boolean; present: boolean; failed:
  * stop request alone is not proof: verify no pending job, PID or cgroup process. */
 export class SystemdDelivery {
     private readonly prefix: string;
-    constructor(privateValidationPrefix?: string, private readonly kind: 'configuration' | 'mount' = 'configuration') {
-        if (!['configuration', 'mount'].includes(kind) || (privateValidationPrefix
-            && !(kind === 'mount' ? /^ezil-mount-test-[a-f0-9]{32}$/ : /^ezil-config-test-[a-f0-9]{32}$/).test(privateValidationPrefix))) throw new Error('delivery_unit_invalid');
-        this.prefix = privateValidationPrefix ?? (kind === 'mount' ? 'ezil-mount' : 'ezil-configuration');
+    constructor(privateValidationPrefix?: string, private readonly kind: 'configuration' | 'mount' | 'start' = 'configuration') {
+        if (!['configuration', 'mount', 'start'].includes(kind) || (privateValidationPrefix
+            && !new RegExp(`^ezil-${kind === 'configuration' ? 'config' : kind}-test-[a-f0-9]{32}$`).test(privateValidationPrefix))) throw new Error('delivery_unit_invalid');
+        this.prefix = privateValidationPrefix ?? `ezil-${kind}`;
     }
     unit(key: string) {
-        const pattern = this.kind === 'mount' ? 'mount' : '(prepare|reload)';
+        const pattern = this.kind === 'configuration' ? '(prepare|reload)' : this.kind;
         if (!new RegExp(`^${pattern}-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`).test(key)) throw new Error('delivery_unit_invalid');
         return `${this.prefix}@${key}.service`;
     }
