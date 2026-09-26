@@ -84,6 +84,7 @@ export function createStartHelper(settings: Settings, deps: Dependencies) {
             || command.DocumentVersion !== expected.DocumentVersion || !equal(command.InstanceIds, expected.InstanceIds)
             || (command.Targets?.length ?? 0) !== 0 || !equal(command.Parameters, expected.Parameters)
             || command.Comment !== expected.Comment || !command.RequestedDateTime
+            || !Number.isFinite(command.RequestedDateTime.getTime())
             || command.RequestedDateTime.getTime() < attempt.issuedAt - 5000
             || command.RequestedDateTime.getTime() > now + 5000) throw new Error('invalid_command_binding');
         const invocation = await deps.invocation(event.commandId, delivery.work.scope.providerInstanceId);

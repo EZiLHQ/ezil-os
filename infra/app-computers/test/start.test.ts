@@ -133,6 +133,14 @@ test('forged SSM targets and plugin outcomes are not accepted',async()=>{
     const f=await polling();f.command.InstanceIds=['i-00000000000000000'];await assert.rejects(f.helper(f.event));
     const g=await polling();g.invocation.PluginName='operateConfiguration';await assert.rejects(g.helper(g.event));
 });
+test('missing, invalid and out-of-window command timestamps cannot authenticate output',async()=>{
+    for(const time of [new Date(NaN),new Date(0),new Date(Date.now()+3600000)]) {
+        const f=await polling();f.command.RequestedDateTime=time;
+        await assert.rejects(f.helper(f.event),/^Error: start_workflow_unavailable$/);
+    }
+    const f=await polling();f.deps.command=async()=>({...f.command,RequestedDateTime:undefined});
+    await assert.rejects(f.helper(f.event),/^Error: start_workflow_unavailable$/);
+});
 test('revocation, expiry and provider replacement during slow SSM calls prevent success',async()=>{
     for(const change of ['revoked','expired','provider']){
         const f=await polling();f.deps.invocation=async()=>{
