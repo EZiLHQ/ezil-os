@@ -22,9 +22,11 @@ The trusted controller must provision two protected regular root-owned files:
   `authorizationId`, the same `scope`, `filesystemUuid`, `mode`, plan `digest`,
   and Unix-second `issuedAt`/`expiresAt`. Lifetime is at most 900 seconds.
 
-The authorization cannot be supplied by the delivery request, application or
-publisher. Its issuer must read the durable filesystem identity, verify current
-ownership/admission/cancellation state and provider-observed disk/writer scope,
+The receiver's delivery request, application or publisher cannot authorize
+these records. The separately trusted SSM manager below can persist records
+already authorized by the controller. Their issuer must read the durable
+filesystem identity, verify current ownership/admission/cancellation state
+and provider-observed disk/writer scope,
 and explicitly distinguish a newly allocated disk from a retained one. A UUID
 reservation is not formatting authority. An existing/imported disk with unknown
 UUID cannot be initialized as a way to discover its identity. Replacement
@@ -70,6 +72,40 @@ success. Normal reboot uses only the persisted mount-only plan and the shipped
 partial plans, wrong UUIDs and uncertain attempts fail closed for inspection.
 Do not clear a real attempt journal to retry formatting.
 
+## Bounded SSM host operation
+
+`supervisor/deploy/mount-document.json` adds a separate fixed SSM document.
+Its `Operation` parameter is canonical base64 of at most 16 KiB of JSON:
+`{ schemaVersion: 1, action: "start" | "observe" | "cancel", records: {
+provisioning, authorization, delivery } }`. Records use the existing schemas
+above. No shell, caller-selected path or replacement deadline is accepted.
+The trusted workflow must validate current database authority and independently
+observe EC2/EBS scope before invoking it; possession of these JSON fields is
+not authority. Restrict document invocation to that workflow's role.
+
+The fixed manager checks IMDS identity, persists protected records and dispatches
+`ezil-mount@mount-<authorizationId>.service` at most once. The template executes
+`/opt/ezil-supervisor/current/dist/mount-executor.js`; the reviewed host image
+must install that release symlink and unit. This does not change the existing
+configuration document or its installed paths/hashes. No AMI or workflow is
+enabled by adding the files.
+
+Records and exclusive dispatch/begin flags live under
+`/var/lib/ezil-mount-deliveries/<authorizationId>`. Partial records fail closed.
+A lost dispatch reply does not allow another start. Provisioning identity is
+immutable. A newer grant for the same scope/filesystem may replace the old one
+only in mount mode after its process group is observed quiescent. The old grant
+is durably cancelled first. Cancellation is persisted before stopping the unit
+and covers late activation. Never clear these records to retry an operation.
+
+The executor rechecks the root grant/cancellation before receiver effects and
+keeps the original grant expiry. Systemd bounds the whole process group to
+15 minutes, followed by a 10-second termination grace. Observation starts no
+unit and returns one of `absent`, `unknown`, `running`, `succeeded`, `failed`,
+`cancelling`, `cancelled`. Only `succeeded` carries the exact mounted receipt;
+it requires observed process quiescence. An uncertain operation remains
+uncertain until reconciled; SSM command success alone is not a mount receipt.
+
 ## Local verification
 
 Run `bash tools/test.sh supervisor` and `bash tools/test.sh tools`. The unit
@@ -99,6 +135,24 @@ attempt ambiguity, retries, cancellation, mount-only reboot, `.git`, renames,
 deletions and committed SQLite state. It starts no application containers and
 is not Reticle acceptance. The runtime target remains Linux/amd64; an ARM64
 local VM validates host behavior without establishing EC2 image compatibility.
+
+For the new SSM manager, use another disposable root and a **fresh** 50 GiB
+NVMe disk with serial `vol33333333333333333`. Its root starts with only the
+earlier fixture's mount-only plan; no provisioning, authorization or attempt
+journal may be copied in. Run:
+
+```sh
+bash tools/test.sh supervisor --linux-mount-operation run
+# Actually reboot the same VM and data disk, then:
+bash tools/test.sh supervisor --linux-mount-operation verify
+```
+
+This checks real initialization, mounted receipts, newer mount-only grants,
+late activation, a SIGTERM-resistant child, cancellation, lost dispatch and
+expiry, then retained files and SQLite after reboot without initialization
+authority. The full blank-media scan uses the original grant's remaining time.
+Failed runs retain operation evidence and all disk/format journals; stop and
+inspect them instead of resetting a failed initialization to make a test pass.
 
 Rollback removes the unused receiver from the next host release. Keep retained
 disks, attempt journals and valid mount-only plans. No schema, feature flag,

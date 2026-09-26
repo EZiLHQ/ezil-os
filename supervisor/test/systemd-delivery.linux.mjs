@@ -117,7 +117,10 @@ executeDelivery(process.argv[2], { ...${JSON.stringify(options)}, receive: async
 
     const g = value(5); await call('start', g);
     await until(async () => (await readFile(`${root}/starts`, 'utf8')).includes(g.configurationId));
-    await ctl(['kill', '--signal=SIGKILL', driver.unit(deliveryKey(g))]);
+    // This case crashes the main receiver, which has no child processes.
+    // Target it explicitly: killing an empty auxiliary set can return EINVAL
+    // on systemd even when the main process was successfully killed.
+    await ctl(['kill', '--kill-whom=main', '--signal=SIGKILL', driver.unit(deliveryKey(g))]);
     await until(async () => (await driver.observe(deliveryKey(g))).quiescent);
     await driver.start(deliveryKey(g));
     await until(async () => (await driver.observe(deliveryKey(g))).quiescent);
