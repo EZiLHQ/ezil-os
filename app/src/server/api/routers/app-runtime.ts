@@ -1,50 +1,25 @@
 import { TRPCError } from '@trpc/server';
-import { and, desc, eq, inArray, isNull } from 'drizzle-orm';
+import { and, desc, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 
+import { env } from '@/env';
+import { ApplicationComputerStartError, prepareApplicationComputerStart } from '@/server/app-platform/application-computer-start';
 import { compileRuntimePlan, RuntimePlanError, sameRuntimePlan } from '@/server/app-platform/runtime-plan';
 import type { db } from '@/server/db';
 import {
     appAuditEvents, appFolderGrants, appGrants, appInstallations, appJobs, appOutbox,
     appPortLeases, appPublishers, appReleases, appRuntimeCommands, appRuntimeRequests,
-    apps, appServices, computerInstances, computerLifecycleJobs, computerLifecycleOutbox,
+    apps, appServices, computerInstances,
     computerRuntimes, computers,
 } from '@/server/db/schema';
 import { protectedProcedure } from '../trpc';
 import { requireAppRuntimeCommands, requireMarketplaceApi } from './marketplace-flags';
 
-type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 type Command = typeof appRuntimeCommands.$inferSelect;
 const commonInput = { computerId: z.string().uuid(), installationId: z.string().uuid(), clientRequestId: z.string().uuid() };
 const launchInput = z.object({ ...commonInput, projectId: z.string().uuid().optional() }).strict();
 const stopInput = z.object(commonInput).strict();
 const unavailable = (message: string): never => { throw new TRPCError({ code: 'PRECONDITION_FAILED', message }); };
-
-/** Queue the owning computer's existing writer, never allocate an EC2 ID or a
- * disk here. Provisioning/replacement must establish its fenced writer first.
- * The lifecycle consumer must recheck desired state and generation at delivery. */
-async function prepareComputerStart(tx: Transaction, computerId: string, generation: number,
-    observedState: string, userId: string, appJobId: string) {
-    const [pendingStop] = await tx.select({ id: computerLifecycleJobs.id }).from(computerLifecycleJobs)
-        .where(and(eq(computerLifecycleJobs.computerId, computerId),
-            inArray(computerLifecycleJobs.operation, ['stop', 'replace', 'retire', 'migrate']),
-            inArray(computerLifecycleJobs.status, ['queued', 'running']))).limit(1);
-    if (pendingStop) unavailable('Computer lifecycle operation is in progress');
-    await tx.update(computerRuntimes).set({ desiredState: 'running', updatedAt: new Date() })
-        .where(eq(computerRuntimes.computerId, computerId));
-    if (observedState === 'running') return;
-    const [existing] = await tx.select({ id: computerLifecycleJobs.id }).from(computerLifecycleJobs)
-        .where(and(eq(computerLifecycleJobs.computerId, computerId),
-            eq(computerLifecycleJobs.targetGeneration, generation), eq(computerLifecycleJobs.operation, 'start'),
-            inArray(computerLifecycleJobs.status, ['queued', 'running']))).limit(1);
-    if (existing) return;
-    const [job] = await tx.insert(computerLifecycleJobs).values({
-        computerId, targetGeneration: generation, requestedBy: userId,
-        operation: 'start', idempotencyKey: `application:${appJobId}`,
-    }).returning({ id: computerLifecycleJobs.id });
-    if (!job) throw new Error('computer_job_not_recorded');
-    await tx.insert(computerLifecycleOutbox).values({ jobId: job.id, computerId });
-}
 
 function selectedProject(plan: Record<string, unknown>): string | undefined {
     const grants = plan.projectGrants;
@@ -177,13 +152,16 @@ async function recordIntent(database: typeof db, userId: string, operation: 'sta
                 releaseId: command.releaseId, installationId: installation.id, computerId: computer.id,
                 action: operation === 'start' ? 'installation.launch-requested' : 'installation.stop-requested' });
             if (operation === 'start') {
-                await prepareComputerStart(tx, computer.id, computerGeneration, computerState, userId, command.jobId);
+                await prepareApplicationComputerStart(tx, { computerId: computer.id, computerGeneration,
+                    userId, appJobId: command.jobId, deployments: env.EZIL_LIFECYCLE_DEPLOYMENTS,
+                    osAccessMode: env.EZIL_OS_ACCESS_MODE });
             }
             return result(command, canReuse ? previousJob!.status : 'queued', Boolean(canReuse), true);
         });
     } catch (error) {
         if (error instanceof TRPCError) throw error;
         if (error instanceof RuntimePlanError) unavailable(`Application cannot launch: ${error.message}`);
+        if (error instanceof ApplicationComputerStartError) unavailable(error.code);
         // No raw SQL, provider metadata, plans or input-bearing database errors
         // are attached as a cause or exposed through tRPC error formatting.
         throw new TRPCError({ code: 'INTERNAL_SERVER_ERROR', message: 'Application request could not be recorded' });

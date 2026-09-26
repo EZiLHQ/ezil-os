@@ -290,6 +290,9 @@ jobs:
       - name: Test durable application launch and stop producers
         working-directory: app
         run: bun run test:db:runtime-api
+      - name: Test application computer-start authority and immutable intents
+        working-directory: app
+        run: bun run test:db:application-computer-start
       - name: Test command delivery leases, revocation and observations
         working-directory: app
         run: bun run test:db:runtime-dispatcher

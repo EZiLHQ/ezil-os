@@ -7,6 +7,9 @@ import superjson from 'superjson';
 import type { User } from '@supabase/supabase-js';
 import { runtimeRecords } from './fixtures/runtime-release';
 import { runtimeTestDatabase } from './helpers/runtime-database';
+import { lifecycleDeployment } from './fixtures/lifecycle';
+import { claimLifecycleWork, dispatchLifecycleClaim } from '../src/server/app-platform/lifecycle-consumer';
+import { parseLifecycleWork } from '../src/server/app-platform/lifecycle-protocol';
 
 const fixture = await runtimeTestDatabase();
 const { sql } = fixture;
@@ -17,6 +20,7 @@ process.env.EZIL_APP_MARKETPLACE_API_ENABLED = 'true';
 process.env.EZIL_APP_RUNTIME_COMMANDS_ENABLED = 'true';
 process.env.EZIL_APP_INSTALL_ENABLED = 'true';
 process.env.EZIL_OS_ACCESS_MODE = 'open';
+process.env.EZIL_LIFECYCLE_DEPLOYMENTS = JSON.stringify([lifecycleDeployment]);
 let passed = 0;
 const test = async (name: string, fn: () => Promise<void>) => { await fn(); passed++; console.log(`PASS ${name}`); };
 const reject = (promise: Promise<unknown>, code: string) => assert.rejects(promise, (error: { code?: string }) => error.code === code);
@@ -27,17 +31,33 @@ try {
         import('../src/server/api/root'), import('../src/server/api/trpc'), import('../src/server/db/schema'),
     ]);
     const database = drizzle(sql, { schema });
+    await sql`ALTER TABLE auth.users ADD COLUMN email text, ADD COLUMN banned_until timestamptz, ADD COLUMN deleted_at timestamptz`;
     const alice = randomUUID(), bob = randomUUID(), admin = randomUUID();
     await sql`INSERT INTO auth.users (id) VALUES (${alice}),(${bob}),(${admin})`;
     await sql`INSERT INTO ezil_app_admins (user_id) VALUES (${admin})`;
     const [publisher] = await sql`INSERT INTO ezil_app_publishers (owner_user_id,display_name,status,invited_by)
         VALUES (${admin},'Test','active',${admin}) RETURNING id`;
+    // Completed lifecycle history is a fixture, never provider acceptance.
+    const seedHistory = async (computerId: string, user: string, generation = 1) => {
+        const [writer] = await sql`SELECT * FROM ezil_computer_instances WHERE computer_id=${computerId} AND generation=${generation}`;
+        const [runtime] = await sql`SELECT * FROM ezil_computer_runtimes WHERE computer_id=${computerId}`;
+        const [revision] = await sql`SELECT coalesce(max(revision),0)+1 n FROM ezil_computer_lifecycle_intents WHERE computer_id=${computerId}`;
+        const [job] = await sql`INSERT INTO ezil_computer_lifecycle_jobs(computer_id,requested_by,operation,idempotency_key)
+            VALUES (${computerId},${user},'stop',${`fixture:${randomUUID()}`}) RETURNING id`;
+        await sql`INSERT INTO ezil_computer_lifecycle_outbox(job_id,computer_id) VALUES (${job!.id},${computerId})`;
+        await sql`INSERT INTO ezil_computer_lifecycle_intents(job_id,computer_id,revision,operation,target_generation,fence_token,
+            provider_instance_id,data_volume_id,deployment) VALUES (${job!.id},${computerId},${revision!.n},'stop',${generation},
+            ${writer!.fence_token},${writer!.provider_instance_id},${runtime!.data_volume_id},${JSON.stringify(lifecycleDeployment)})`;
+        await sql`UPDATE ezil_computer_lifecycle_jobs SET status='succeeded',completed_at=now() WHERE id=${job!.id}`;
+        await sql`UPDATE ezil_computer_lifecycle_outbox SET delivered_at=now() WHERE job_id=${job!.id}`;
+    };
     const makeComputer = async (user: string, slot = 1) => {
         const [computer] = await sql`INSERT INTO ezil_computers (user_id,slot,provider) VALUES (${user},${slot},'aws-ec2') RETURNING id`;
         await sql`INSERT INTO ezil_computer_runtimes (computer_id,region,availability_zone,data_volume_id)
             VALUES (${computer!.id},'us-east-1','us-east-1a',${`vol-${randomUUID().replaceAll('-', '').slice(0, 17)}`})`;
-        await sql`INSERT INTO ezil_computer_instances (computer_id,generation,observed_state)
-            VALUES (${computer!.id},1,'stopped')`;
+        await sql`INSERT INTO ezil_computer_instances (computer_id,generation,observed_state,provider_instance_id)
+            VALUES (${computer!.id},1,'stopped',${`i-${randomUUID().replaceAll('-', '').slice(0, 17)}`})`;
+        await seedHistory(computer!.id, user);
         return computer!.id as string;
     };
     const a = await makeComputer(alice), b = await makeComputer(bob);
@@ -77,8 +97,9 @@ try {
     const counts = async () => ({ ...(await sql`SELECT
         (SELECT count(*)::int FROM ezil_app_jobs) jobs, (SELECT count(*)::int FROM ezil_app_outbox) outbox,
         (SELECT count(*)::int FROM ezil_app_runtime_commands) commands, (SELECT count(*)::int FROM ezil_app_runtime_requests) receipts,
-        (SELECT count(*)::int FROM ezil_computer_lifecycle_jobs) computer_jobs,
-        (SELECT count(*)::int FROM ezil_computer_lifecycle_outbox) computer_outbox`)[0] });
+        (SELECT count(*)::int FROM ezil_computer_lifecycle_jobs WHERE idempotency_key NOT LIKE 'fixture:%') computer_jobs,
+        (SELECT count(*)::int FROM ezil_computer_lifecycle_outbox o JOIN ezil_computer_lifecycle_jobs j ON j.id=o.job_id
+            WHERE j.idempotency_key NOT LIKE 'fixture:%') computer_outbox`)[0] });
 
     await test('authentication, ownership, mismatched installation and unknown fields fail before writes', async () => {
         await reject(appRouter.createCaller(context(null)).apps.launch(request()), 'UNAUTHORIZED');
@@ -100,6 +121,24 @@ try {
         await sql`UPDATE ezil_computer_runtimes SET data_volume_id=${runtime!.data_volume_id},availability_zone=${runtime!.availability_zone} WHERE computer_id=${a}`;
         assert.equal((await counts()).jobs, 0);
     });
+    await test('a lifecycle intent failure rolls back app, audit, receipt, outboxes and desired state without leaking errors', async () => {
+        const before = await counts();
+        const [runtime] = await sql`SELECT * FROM ezil_computer_runtimes WHERE computer_id=${a}`;
+        const [audit] = await sql`SELECT count(*)::int n FROM ezil_app_audit_events`;
+        await sql.unsafe(`CREATE FUNCTION public.test_refuse_intent() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'never-echo-lifecycle-secret'; END; $$;
+            CREATE TRIGGER test_refuse_intent BEFORE INSERT ON ezil_computer_lifecycle_intents
+                FOR EACH ROW EXECUTE FUNCTION public.test_refuse_intent()`);
+        try {
+            const error = await aliceApi.apps.launch(request()).catch(error => error);
+            assert.equal(error.code, 'INTERNAL_SERVER_ERROR');
+            assert.equal(error.message, 'Application request could not be recorded');
+            assert.equal(error.cause, undefined);
+            assert.deepEqual(await counts(), before);
+            assert.deepEqual((await sql`SELECT * FROM ezil_computer_runtimes WHERE computer_id=${a}`)[0], runtime);
+            assert.deepEqual((await sql`SELECT count(*)::int n FROM ezil_app_audit_events`)[0], audit);
+        } finally { await sql.unsafe('DROP TRIGGER test_refuse_intent ON ezil_computer_lifecycle_intents; DROP FUNCTION public.test_refuse_intent()'); }
+    });
     const firstRequest = request(), secondRequest = request();
     const [first, duplicate, simultaneous] = await Promise.all([
         aliceApi.apps.launch(firstRequest), aliceApi.apps.launch(firstRequest), aliceApi.apps.launch(secondRequest),
@@ -116,6 +155,16 @@ try {
         assert.equal(command!.plan.services[0].internalPort, 8080);
         assert.equal(command!.plan.allowedOrigins.includes(`https://i-${aNotes}.apps.ezil.org`), true);
         capturedPlans.push(command!.plan);
+        const [row] = await sql`SELECT ezil_lifecycle_intent_document(i) document,i.digest,i.created_at
+            FROM ezil_computer_lifecycle_intents i JOIN ezil_computer_lifecycle_jobs j ON j.id=i.job_id
+            WHERE j.idempotency_key=${`application:${first.jobId}`}`;
+        assert.ok(row);
+        const intent = parseLifecycleWork({ document: row.document, digest: row.digest, createdAt: new Date(row.created_at) });
+        const [writer] = await sql`SELECT * FROM ezil_computer_instances WHERE computer_id=${a}`;
+        assert.equal(intent.providerInstanceId, writer!.provider_instance_id);
+        assert.equal(intent.fenceToken, writer!.fence_token);
+        assert.equal(intent.operation, 'start');
+        assert.equal(intent.revision, 2);
     });
     await test('parallel opens and distinct request IDs reuse one command and computer-start job', async () => {
         const requests = [secondRequest, request(), request(), firstRequest];
@@ -166,10 +215,15 @@ try {
     await test('a fresh Open after computer stop gets a new revision; replacement keeps revisions monotonic', async () => {
         await sql`UPDATE ezil_app_jobs SET status='succeeded',completed_at=now() WHERE installation_id=${aNotes}`;
         await sql`UPDATE ezil_computer_lifecycle_jobs SET status='succeeded',completed_at=now() WHERE computer_id=${a} AND operation='start'`;
+        await sql`UPDATE ezil_computer_lifecycle_outbox SET delivered_at=now() WHERE computer_id=${a}`;
         const reopened = await aliceApi.apps.launch(request());
         assert.equal(reopened.generation, 4);
         await sql`UPDATE ezil_computer_instances SET fenced_at=now() WHERE computer_id=${a} AND generation=1`;
-        await sql`INSERT INTO ezil_computer_instances (computer_id,generation,observed_state) VALUES (${a},2,'running')`;
+        await sql`UPDATE ezil_computer_lifecycle_jobs SET status='succeeded',completed_at=now() WHERE computer_id=${a} AND status='queued'`;
+        await sql`UPDATE ezil_computer_lifecycle_outbox SET delivered_at=now() WHERE computer_id=${a}`;
+        await sql`INSERT INTO ezil_computer_instances (computer_id,generation,observed_state,provider_instance_id)
+            VALUES (${a},2,'running',${`i-${randomUUID().replaceAll('-', '').slice(0, 17)}`})`;
+        await seedHistory(a, alice, 2);
         await sql`UPDATE ezil_computer_runtimes SET next_generation=3 WHERE computer_id=${a}`;
         const replacement = await aliceApi.apps.launch(request());
         assert.equal(replacement.generation, 5);
@@ -188,6 +242,25 @@ try {
         assert.equal(command!.plan.services[0].hostPort, 4400);
         assert.ok(command!.plan.allowedOrigins.includes(`https://i-${bNotes}.apps.ezil.org`));
         assert.ok(!command!.plan.allowedOrigins.includes(`https://i-${aNotes}.apps.ezil.org`));
+    });
+    await test('a real launch intent is claimable and settles through the existing lifecycle consumer', async () => {
+        const options = { database, enabled: true, osAccessMode: 'open' as const, deployments: [lifecycleDeployment] };
+        await sql`UPDATE ezil_computer_lifecycle_outbox SET available_at=now()+interval '1 day' WHERE computer_id<>${b}`;
+        const claim = await claimLifecycleWork(options);
+        assert.ok(claim);
+        assert.equal(claim.computerId, b);
+        assert.equal(await dispatchLifecycleClaim({ ...options, advance: async work => {
+            const intent = parseLifecycleWork(work);
+            assert.equal(intent.operation, 'start');
+            assert.equal(intent.computerId, b);
+            return { state: 'observed', observedAt: new Date(), receipt: { schemaVersion: 1, jobId: intent.jobId,
+                computerId: b, digest: work.digest, generation: intent.targetGeneration, fenceToken: intent.fenceToken,
+                instanceId: intent.providerInstanceId!, volumeId: intent.dataVolumeId!, state: 'running' } };
+        } }, claim), 'succeeded');
+        const [writer] = await sql`SELECT observed_state FROM ezil_computer_instances WHERE computer_id=${b}`;
+        assert.equal(writer!.observed_state, 'running');
+        // The mocked provider receipt says nothing about application readiness.
+        assert.equal((await sql`SELECT status FROM ezil_app_jobs WHERE computer_id=${b} AND operation='start'`)[0]!.status, 'queued');
     });
     const project = randomUUID(), otherProject = randomUUID();
     const reticleRequest = { ...request(aReticle), projectId: project };
