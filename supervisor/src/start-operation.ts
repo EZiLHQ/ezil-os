@@ -56,6 +56,7 @@ export async function manageStartOperation(input: unknown, o: Options = {}) {
     try {
         await instanceCredentials({ accountId: r.provisioning.accountId, region: r.provisioning.region,
             instanceId: r.provisioning.scope.providerInstanceId }, AbortSignal.timeout(10000), o.metadataRequest);
+        if ((await optionalProtected(`${root}/provisioning.json`))?.toString() !== canonicalJson(r.provisioning)) throw new Error('start_operation_conflict');
         const store = new StartOperationStore(a.authorizationId), driver = new SystemdDelivery(undefined, 'start'), key = `start-${a.authorizationId}`;
         const existing = await store.records();
         if (existing && canonicalJson(existing) !== canonicalJson(r)) throw new Error('start_operation_conflict');

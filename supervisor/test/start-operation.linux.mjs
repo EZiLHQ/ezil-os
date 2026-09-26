@@ -81,6 +81,11 @@ async function until(fn) {
 const stopped = async () => assert.equal((await observeSupervisor(AbortSignal.timeout(5000))).stopped, true);
 const mainPid = async () => (await ctl('show', 'ezil-supervisor.service', '--property=MainPID', '--value')).stdout.trim();
 try {
+    await fresh();
+    const foreign = { ...current, provisioning: { ...host, kmsKeyArn: `arn:aws:kms:us-east-1:${host.accountId}:key/${randomUUID()}` } };
+    for (const action of ['start', 'observe', 'cancel']) await assert.rejects(operate(action, foreign), /start_operation_unavailable/);
+    assert.equal((await operate('observe')).status, 'absent'); await stopped();
+    console.log('PASS every operation rejects changed protected provisioning before writing records');
     if (phase === 'run') {
         await fresh(); assert.equal((await operate('observe')).status, 'absent'); await stopped();
         const expired = { ...current, authorization: { ...current.authorization, issuedAt: 1800000000-10000000, expiresAt: 1800000300-10000000 } };
