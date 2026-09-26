@@ -21,7 +21,8 @@ export type FencedWriters = z.infer<typeof FencedWritersSchema>;
 /** Server records only. This does not itself prove current EC2/EBS state. A
  * workflow must independently observe these exact writers and the retained
  * disk before attaching it; the consumer observes them again before commit. */
-export async function loadRecoveryWriters(tx: Transaction, i: ComputerRecoveryIntentV2): Promise<FencedWriters | null> {
+export async function loadRecoveryWriters(tx: Transaction, i: ComputerRecoveryIntentV2,
+    completedInstanceId?: string): Promise<FencedWriters | null> {
     const table = i.source.schemaVersion === 1 ? intents : recoveries;
     const document = i.source.schemaVersion === 1
         ? sql<string>`public.ezil_lifecycle_intent_document(${intents})`
@@ -42,8 +43,19 @@ export async function loadRecoveryWriters(tx: Transaction, i: ComputerRecoveryIn
     if (!scopeMatches(old.targetGeneration, old.fenceToken) && !(old.schemaVersion === 2
         ? scopeMatches(old.dataScope.generation, old.dataScope.fenceToken)
         : scopeMatches(old.previousGeneration, old.previousFenceToken))) return null;
-    const rows = await tx.select().from(computerInstances).where(eq(computerInstances.computerId, i.computerId))
+    let rows = await tx.select().from(computerInstances).where(eq(computerInstances.computerId, i.computerId))
         .orderBy(asc(computerInstances.generation)).limit(129).for('update');
+    // Post-lifecycle mount issuance observes a successfully committed current
+    // writer as well as its fenced predecessors. Active lifecycle callers omit
+    // this argument and retain the original no-current-writer requirement.
+    if (completedInstanceId !== undefined) {
+        const [job] = await tx.select().from(jobs).where(eq(jobs.id, i.jobId)).limit(1);
+        const current = rows.find(r => r.generation === i.targetGeneration);
+        if (job?.status !== 'succeeded' || !job.completedAt || !current || current.fencedAt
+            || current.observedState !== 'running' || current.fenceToken !== i.fenceToken
+            || current.providerInstanceId !== completedInstanceId) return null;
+        rows = rows.filter(r => r !== current);
+    }
     if (rows.some(r => !r.fencedAt || !r.observedAt || r.observedState !== 'stopped' || r.generation >= i.targetGeneration
         || r.fenceToken === i.fenceToken || r.observedAt.getTime() > r.fencedAt.getTime() + 5000
         || r.fencedAt.getTime() > Date.now() + 5000)) return null;

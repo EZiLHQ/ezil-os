@@ -107,6 +107,13 @@ export function createAwsLifecycleTransport(options: AwsLifecycleTransportOption
         if (!identity(target) || !tagged(v.Tags, tags) || v.VolumeId !== receipt.volumeId
             || v.AvailabilityZone !== d.availabilityZone || v.Encrypted !== true || v.KmsKeyId !== d.dataKeyArn
             || v.Size !== 50 || v.VolumeType !== 'gp3' || v.MultiAttachEnabled !== false) return fail('lifecycle_conflict');
+        // Mount initialization requires evidence of this job's allocation,
+        // not just matching mutable management tags on an existing disk.
+        if (i.schemaVersion === 1 && ['provision', 'replace'].includes(i.operation)
+            && target?.ClientToken !== computerLifecycleAllocationToken(work, 'instance')) return fail('lifecycle_conflict');
+        if (i.operation === 'provision' && !tagged(v.Tags, {
+            'ezil:allocation': computerLifecycleAllocationToken(work, 'volume'),
+        })) return fail('lifecycle_conflict');
         if (i.schemaVersion === 1 && i.previousInstanceId) {
             const old = entries.find(e => e.instance.InstanceId === i.previousInstanceId)?.instance;
             // STOPPED alone is insufficient: a delayed old StartInstances could
