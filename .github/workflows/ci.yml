@@ -338,6 +338,9 @@ jobs:
       - name: Computer startup issuer races and revocation
         working-directory: app
         run: bun run test:db:start-issuer
+      - name: Computer startup delivery leases and receipts
+        working-directory: app
+        run: bun run test:db:start-delivery
 
   connectors:
     name: sdk + mcp (typecheck + unit)

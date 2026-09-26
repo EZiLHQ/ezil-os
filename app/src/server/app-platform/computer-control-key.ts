@@ -35,7 +35,7 @@ export function computerControlKeyIdentity(policy: ComputerControlKeyPolicy, wor
     return { name, arnPrefix: `arn:aws:secretsmanager:${policy.region}:${policy.accountId}:secret:${name}-`,
         origin: `https://c-${s.computerId}-g${s.computerGeneration}.${policy.controlDomain}` };
 }
-export function controlKeyArnMatches(policy: ComputerControlKeyPolicy, work: ComputerControlKeyWork, arn: string) {
+export function controlKeyArnMatches(policy: ComputerControlKeyPolicy, work: Pick<ComputerControlKeyWork, 'scope' | 'secretArn'>, arn: string) {
     const { arnPrefix } = computerControlKeyIdentity(policy, work);
     return arn.startsWith(arnPrefix) && /^[A-Za-z0-9]{6}$/.test(arn.slice(arnPrefix.length))
         && (work.secretArn === null || work.secretArn === arn);
