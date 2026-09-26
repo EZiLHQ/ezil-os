@@ -1,5 +1,5 @@
 import { dirname, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { isEntrypoint } from './entrypoint.js';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { acquireHostLock } from './host-lock.js';
 import { ensureHostDirectory, hostAuthority, hostIdentity, readHostConfig, readHostFile } from './host-config.js';
@@ -148,7 +148,7 @@ async function main(): Promise<void> {
     process.on('SIGHUP', () => { void host.reload().catch(() => { report('host_reload_unconfirmed'); stop(); }); });
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isEntrypoint(import.meta.url)) {
     void main().catch((error: unknown) => {
         const known = ['host_arguments_invalid', 'host_configuration_invalid', 'host_configuration_unavailable',
             'host_secret_invalid', 'host_file_unavailable', 'host_already_running', 'host_lock_unavailable',

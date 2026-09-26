@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { pathToFileURL } from 'node:url';
+import { isEntrypoint } from './entrypoint.js';
 import { ControlStore, deliveryKey, type StoredDelivery } from './control-store.js';
 import { DeliverySchema, descriptor, validateDelivery, ProvisioningSchema, type Delivery } from './configuration-delivery-contract.js';
 import { ensureHostDirectory, readHostFile } from './host-config.js';
@@ -76,7 +76,7 @@ export function parseSsmDeliveryOperation(encoded: string | undefined): unknown 
     try { const input: unknown = JSON.parse(bytes.toString()); return DeliveryOperationSchema.parse(input); }
     catch { throw new Error('delivery_operation_invalid'); }
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isEntrypoint(import.meta.url)) {
     void (async () => {
         if (process.argv.length !== 2) throw new Error('delivery_operation_invalid');
         const input = parseSsmDeliveryOperation(process.env.SSM_Operation);

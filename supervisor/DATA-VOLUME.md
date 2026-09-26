@@ -82,6 +82,43 @@ helper cannot prove provider stop, retained-volume billing or snapshot recovery.
 
 ## Repeatable isolated Linux acceptance
 
+### Loaded supervisor and retained disk
+
+After completing the disk suite below, an additional opt-in suite exercises
+the **real** supervisor, shipped systemd units and Docker daemon on that same
+dedicated QEMU fixture. It requires an empty Docker daemon, the existing test
+NVMe identity/files, no previous host configuration, and the installed
+`/opt/ezil-supervisor` symlink. It never formats or replaces the data disk.
+Do not copy a real computer's configuration, keys or application data here.
+
+Install Docker in the guest (`sudo apt-get install --no-install-recommends
+docker.io` on Ubuntu 24.04), then run from `/opt/ezil-mount-acceptance`:
+
+```sh
+sudo bash tools/test.sh supervisor --linux-retained-host setup
+sudo systemctl reboot
+# Reconnect after an actual reboot; the enabled units start the host.
+sudo bash tools/test.sh supervisor --linux-retained-host verify
+sudo systemctl poweroff
+```
+
+The suite creates a VM-only control key and an empty approved-installation
+configuration. It checks the actual host process and signed configuration
+digest, unsigned/cross-computer denial, replay denial across service restart,
+singleton locking, clean observed shutdown, and wrong-filesystem denial by the
+real mount dependency. `verify` requires a different kernel boot ID and checks
+automatic service startup plus retained `.git`, renamed/deleted files and the
+committed SQLite fixture. Each phase leaves the supervisor stopped; it stays
+enabled for the next boot. An unsuccessful fixture setup should be investigated
+or repeated on fresh overlays, without erasing existing configuration.
+
+This suite starts no application containers. It does not establish Reticle
+operations, application persistence, amd64 compatibility, EBS attachment,
+encryption, provider stop or stopped-compute billing. Those acceptance gates
+remain separate.
+
+### Disk initialization and replacement
+
 Run normal checks with `bash tools/test.sh supervisor`. The destructive disk
 suite is deliberately opt-in and refuses non-root, non-Linux and non-QEMU
 execution. Never run it in OrbStack, a privileged Docker/systemd container, an

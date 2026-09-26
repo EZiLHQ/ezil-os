@@ -3,7 +3,7 @@ import { open, unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { pathToFileURL } from 'node:url';
+import { isEntrypoint } from './entrypoint.js';
 import type { S3ClientConfig } from '@aws-sdk/client-s3';
 import { instanceCredentials, type MetadataRequest } from './aws-host-identity.js';
 import { descriptor, validateConfiguration, validateDelivery } from './configuration-delivery-contract.js';
@@ -123,6 +123,6 @@ async function main() {
         process.stdout.write(`${JSON.stringify(receipt)}\n`);
     } finally { clearTimeout(timeout); process.removeListener('SIGTERM', cancel); process.removeListener('SIGINT', cancel); }
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isEntrypoint(import.meta.url)) {
     void main().catch(() => { process.stderr.write('{"code":"configuration_delivery_failed"}\n'); process.exitCode = 1; });
 }

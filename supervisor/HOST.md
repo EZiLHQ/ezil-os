@@ -47,6 +47,12 @@ For an installed, provisioned host, the entry command is:
 sudo /usr/local/bin/node /opt/ezil-supervisor/dist/host.js /etc/ezil-supervisor/config.json
 ```
 
+`/opt/ezil-supervisor` may be a symlink to a root-owned release directory. The
+host, preparation, mount and configuration-delivery entrypoints resolve that
+path before detecting CLI execution. Missing configuration must produce a
+nonzero exit, including through the symlink; a successful process exit is not
+proof of a loaded service. Check the signed configuration acknowledgement.
+
 Production mode accepts only digest-pinned `us-east-1` ECR references and HTTPS
 origins. The explicit `--private-validation` argument permits exact local image
 IDs and loopback HTTP origins for private testing. It never disables signatures,
