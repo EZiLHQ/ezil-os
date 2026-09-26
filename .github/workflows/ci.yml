@@ -329,6 +329,9 @@ jobs:
       - name: Computer mount issuer authority races (real Postgres)
         working-directory: app
         run: bun run test:db:mount-issuer
+      - name: Computer mount delivery authority and lease races (real Postgres)
+        working-directory: app
+        run: bun run test:db:mount-delivery
 
   connectors:
     name: sdk + mcp (typecheck + unit)
