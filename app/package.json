@@ -35,7 +35,8 @@
         "test:db:lifecycle-consumer": "bun --no-env-file tests/computer-lifecycle-consumer-db.ts",
         "test:db:recovery-intents": "bun --no-env-file tests/computer-recovery-intents-db.ts",
         "test:db:recovery-consumer": "bun --no-env-file tests/computer-recovery-consumer-db.ts",
-        "test:db:computer-cancellations": "bun --no-env-file tests/computer-cancellations-db.ts"
+        "test:db:computer-cancellations": "bun --no-env-file tests/computer-cancellations-db.ts",
+        "test:db:filesystem-identity": "bun --no-env-file tests/computer-filesystem-identity-db.ts"
     },
     "dependencies": {
         "@aws-sdk/client-ec2": "3.1140.0",

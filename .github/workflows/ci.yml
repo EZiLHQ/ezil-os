@@ -320,6 +320,9 @@ jobs:
       - name: Computer cancellation authority and settlement (real Postgres)
         working-directory: app
         run: bun run test:db:computer-cancellations
+      - name: Computer filesystem identity (real Postgres)
+        working-directory: app
+        run: bun run test:db:filesystem-identity
 
   connectors:
     name: sdk + mcp (typecheck + unit)
