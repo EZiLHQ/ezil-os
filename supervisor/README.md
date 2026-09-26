@@ -7,7 +7,8 @@ container execution through that HTTP boundary. The [Linux host executable](HOST
 adds protected configuration, a kernel singleton lock and process recovery.
 The EBS controller, Cloudflare routing, and marketplace integration remain pending.
 The [offline host installer](INSTALLATION.md) packages a verified release under
-both fixed operation paths; image publication and per-computer first start remain separate.
+both fixed operation paths. The [first-start receiver](FIRST-START.md) accepts
+separate controller authorization; image publication and its cloud orchestration remain separate.
 The HTTP unit tests use an instrumented driver; the separate Linux acceptance
 suite uses actual Docker containers and an ext4 loop disk.
 

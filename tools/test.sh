@@ -454,6 +454,14 @@ run_local () {
 run_supervisor () {
     typecheck "$TREE/supervisor" npm run typecheck || return 1
     ( cd "$TREE/supervisor" && npm test && npm run build ) || return 1
+    if [[ "${1:-}" == "--linux-first-start" ]]; then
+        if [[ "$(uname -s)" != "Linux" || "$(id -u)" != "0" ]]; then
+            say "first-start acceptance requires root in its disposable QEMU fixture"
+            return 1
+        fi
+        node "$TREE/supervisor/test/control-bootstrap.linux.mjs" "${2:-}"
+        return $?
+    fi
     if [[ "${1:-}" == "--linux-host-install" ]]; then
         if [[ "$(uname -s)" != "Linux" || "$(id -u)" != "0" ]]; then
             say "host installation acceptance requires root in its disposable QEMU fixture"

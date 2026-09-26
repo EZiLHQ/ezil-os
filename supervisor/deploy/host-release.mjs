@@ -5,7 +5,7 @@ import { join } from 'node:path';
 export const units = ['ezil-supervisor.service', 'ezil-data-mount.service', 'ezil-configuration@.service', 'ezil-mount@.service'];
 export const required = ['package.json', 'package-lock.json', ...units.map(name => `deploy/${name}`),
     'deploy/configuration-document.json', 'deploy/mount-document.json',
-    ...['host', 'prepare', 'data-mount', 'delivery-operation', 'delivery-executor', 'mount-operation', 'mount-executor']
+    ...['host', 'prepare', 'data-mount', 'delivery-operation', 'delivery-executor', 'mount-operation', 'mount-executor', 'control-bootstrap']
         .map(name => `dist/${name}.js`)];
 export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 export const limits = { files: 20000, file: 8 * 1024 * 1024, total: 128 * 1024 * 1024, manifest: 4 * 1024 * 1024 };
