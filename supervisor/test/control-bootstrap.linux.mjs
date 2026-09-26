@@ -92,7 +92,7 @@ const options = { privateValidation: true,
         }
         assert.equal(req.hostname, 'secretsmanager.us-east-1.amazonaws.com'); fetched++; await onFetch?.();
         const { name } = controlSecretIdentity(host, authorization);
-        const body = typeof req.body === 'string' ? req.body : Buffer.from(req.body).toString();
+        const body = typeof req.body === 'string' ? req.body : Buffer.from(new Uint8Array(req.body)).toString();
         assert.deepEqual(JSON.parse(body), { SecretId: name, VersionId: authorization.secretVersionId, VersionStage: 'AWSCURRENT' });
         return { response: { statusCode: 200, headers: { 'content-type': 'application/x-amz-json-1.1' }, body: Readable.from([JSON.stringify({
             Name: name, ARN: `arn:aws:secretsmanager:us-east-1:${host.accountId}:secret:${name}-ABC123`, VersionId: authorization.secretVersionId,

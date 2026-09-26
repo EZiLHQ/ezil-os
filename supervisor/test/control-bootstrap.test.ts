@@ -72,7 +72,7 @@ test('Secrets Manager wire pins IMDS identity, regional endpoint, current versio
         const handler = { handle: async (req: { hostname: string; headers: Record<string, string>; body?: unknown }) => {
             calls++; assert.equal(req.hostname, 'secretsmanager.us-east-1.amazonaws.com');
             assert.match(req.headers.authorization!, /^AWS4-HMAC-SHA256 /);
-            const body = typeof req.body === 'string' ? req.body : Buffer.from(req.body as Uint8Array).toString();
+            const body = typeof req.body === 'string' ? req.body : Buffer.from(new Uint8Array(req.body as Uint8Array)).toString();
             assert.deepEqual(JSON.parse(body), { SecretId: name, VersionId: authority.secretVersionId, VersionStage: 'AWSCURRENT' });
             return { response: { statusCode: 200, headers: { 'content-type': 'application/x-amz-json-1.1' },
                 body: Readable.from([JSON.stringify({ ...good, ...change })]) } };
