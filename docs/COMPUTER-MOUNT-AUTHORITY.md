@@ -31,6 +31,38 @@ The delivery workflow must reauthorize before dispatch and handle revocation
 during host work. A stored receipt is historical mount evidence, not current
 application readiness. Status reads do not start compute.
 
+## Issuer
+
+`issueComputerDataMount` is an internal control-plane producer accepting only
+`computerId` and a completed `jobId`. It is not exposed as a browser endpoint.
+Callers supply the database, a disabled-by-default enable decision, OS-access
+policy, approved deployments and the real AWS lifecycle transport's `advance`
+method. The issuer always passes `allowStart=false`: a missing execution cannot
+start compute. The existing transport's cleanup observation path is also
+read-only. No provider resource IDs, filesystem paths or format mode are accepted
+from the request.
+
+The producer checks current ownership, OS access, deployment and writer state,
+releases SQL locks for bounded provider observation, then repeats authorization
+before committing the grant/outbox. Provisioning/replacement instances must
+match the immutable allocation token; a new volume must match the provision
+allocation tag. Retained recovery rechecks its historical fenced writers while
+excluding only the exact successfully committed current writer. Active recovery
+consumers retain their original no-current-writer requirement.
+
+Concurrent requests return the same grant and original deadline. Revoked or
+expired grants are not renewed. Missing, stale, mismatched or failed provider
+observations leave issuance unconfirmed. A stop, fence, access revocation or
+disabled producer during observation denies commit. Output contains only the
+host's strict v1 authorization and canonical plan records, with no credentials.
+
+The producer is still not scheduled or connected to SSM delivery. The next
+integration must claim the delivery queue, store the exact versioned S3 object,
+provision independent root authority, invoke the host receiver, and record its
+verified mounted receipt before configuration delivery. Those calls require
+current authority checks and cancellation; invoking this function alone does
+not initialize an EC2 disk or make Reticle installable.
+
 Apply this additive migration before shipping consumers, after reviewing the
 live hosted schema and obtaining migration authorization. Do not replay old
 migrations or run an unreviewed schema push. Disabling consumers is the rollback;
@@ -44,3 +76,8 @@ and exercises constraints, concurrent issuance, rollback, leases, revocation,
 RLS and unchanged historical lifecycle documents. Provider lifecycle regression
 suites also run with this migration. These tests simulate provider observations;
 actual AWS and host-delivery acceptance remain separate.
+
+`bun run test:db:mount-issuer` adds actual PostgreSQL issuer concurrency and
+authorization races with simulated provider observations. SDK wire tests cover
+the real adapter's immutable allocation checks. Local cross-worktree validation
+also checks issuer output against the strict host contract in PR #137.

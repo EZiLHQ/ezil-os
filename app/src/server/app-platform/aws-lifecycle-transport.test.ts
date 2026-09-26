@@ -122,6 +122,16 @@ describe('actual lifecycle SDK wire contract', () => {
     it('rejects the old stopped writer during replacement', async () => {
         const f=fixture('replace'); f.succeeded(); f.old.instanceState={name:'stopped'}; await expect(f.run()).rejects.toThrow('lifecycle_unconfirmed');
     });
+    it.each(['provision', 'replace'] as const)('binds the %s instance to its immutable allocation token', async operation => {
+        const f = fixture(operation); f.succeeded(); f.target.clientToken = 'unrelated-allocation';
+        await expect(f.run(false)).rejects.toThrow('lifecycle_conflict');
+        expect(f.calls.some(c => c.action === 'StartExecution')).toBe(false);
+    });
+    it('cannot approve initialization of a volume without the original provision allocation tag', async () => {
+        const f = fixture('provision'); f.succeeded();
+        f.volume.tagSet = (f.volume.tagSet as { key: string; value: string }[]).filter(t => t.key !== 'ezil:allocation');
+        await expect(f.run(false)).rejects.toThrow('lifecycle_conflict');
+    });
     it('rejects cross-computer tags, wrong disk encryption and a deletable data disk', async () => {
         const f=fixture(); f.succeeded(); f.target.tagSet=[]; await expect(f.run()).rejects.toThrow('lifecycle_conflict');
         const g=fixture(); g.succeeded(); g.volume.encrypted=false; await expect(g.run()).rejects.toThrow('lifecycle_conflict');

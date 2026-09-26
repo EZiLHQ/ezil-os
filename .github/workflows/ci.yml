@@ -326,6 +326,9 @@ jobs:
       - name: Computer mount authorization and receipts (real Postgres)
         working-directory: app
         run: bun run test:db:data-mounts
+      - name: Computer mount issuer authority races (real Postgres)
+        working-directory: app
+        run: bun run test:db:mount-issuer
 
   connectors:
     name: sdk + mcp (typecheck + unit)
