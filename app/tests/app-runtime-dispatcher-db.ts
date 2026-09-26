@@ -6,6 +6,7 @@ import { runtimeRecords } from './fixtures/runtime-release';
 import { runtimeTestDatabase } from './helpers/runtime-database';
 import { claimRuntimeCommand, dispatchRuntimeClaim, dispatchNextRuntimeCommand, type RuntimeDispatcherOptions } from '../src/server/app-platform/runtime-dispatcher';
 import { hostIntentDigest, type HostCommand, type HostObservation } from '../src/server/app-platform/host-control-client';
+import { lifecycleDeployment } from './fixtures/lifecycle';
 
 const fixture = await runtimeTestDatabase();
 const { sql } = fixture;
@@ -15,6 +16,7 @@ process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = 'local-test';
 process.env.EZIL_APP_MARKETPLACE_API_ENABLED = 'true';
 process.env.EZIL_APP_RUNTIME_COMMANDS_ENABLED = 'true';
 process.env.EZIL_OS_ACCESS_MODE = 'open';
+process.env.EZIL_LIFECYCLE_DEPLOYMENTS = JSON.stringify([lifecycleDeployment]);
 let passed = 0;
 const test = async (name: string, fn: () => Promise<void>) => { await fn(); passed++; console.log(`PASS ${name}`); };
 try {
@@ -36,10 +38,22 @@ try {
         const caller = appRouter.createCaller(buildTRPCContext({ db: database, user: { id: ownerId, email: 'dispatcher@example.com' } as User,
             headers: new Headers(), mode: 'open' }));
         const c = computer!.id as string;
+        const volume = `vol-${randomUUID().replaceAll('-', '').slice(0, 17)}`;
+        const instance = `i-${randomUUID().replaceAll('-', '').slice(0, 17)}`;
         await sql`INSERT INTO ezil_computer_runtimes(computer_id,region,availability_zone,data_volume_id,desired_state)
-            VALUES (${c},'us-east-1','us-east-1a',${`vol-${randomUUID()}`},'running')`;
-        await sql`INSERT INTO ezil_computer_instances(computer_id,generation,provider_instance_id,observed_state,observed_at)
-            VALUES (${c},1,${`i-${randomUUID()}`},'running',now())`;
+            VALUES (${c},'us-east-1','us-east-1a',${volume},'running')`;
+        const [writer] = await sql`INSERT INTO ezil_computer_instances(computer_id,generation,provider_instance_id,observed_state,observed_at)
+            VALUES (${c},1,${instance},'running',now()) RETURNING fence_token`;
+        // The dispatcher consumes an already prepared computer. Record its
+        // completed lifecycle fixture without claiming a real provider start.
+        const [job] = await sql`INSERT INTO ezil_computer_lifecycle_jobs(computer_id,requested_by,operation,idempotency_key)
+            VALUES (${c},${ownerId},'start',${randomUUID()}) RETURNING id`;
+        await sql`INSERT INTO ezil_computer_lifecycle_outbox(job_id,computer_id) VALUES (${job!.id},${c})`;
+        await sql`INSERT INTO ezil_computer_lifecycle_intents(job_id,computer_id,revision,operation,target_generation,fence_token,
+            provider_instance_id,data_volume_id,deployment) VALUES (${job!.id},${c},1,'start',1,${writer!.fence_token},
+            ${instance},${volume},${JSON.stringify(lifecycleDeployment)})`;
+        await sql`UPDATE ezil_computer_lifecycle_jobs SET status='succeeded',completed_at=now() WHERE id=${job!.id}`;
+        await sql`UPDATE ezil_computer_lifecycle_outbox SET delivered_at=now() WHERE job_id=${job!.id}`;
         const r = runtimeRecords(kind, { appId: randomUUID(), publisherId: publisher!.id, releaseId: randomUUID() },
             manifest => { manifest.slug = `test-${randomUUID()}`; });
         await sql`INSERT INTO ezil_apps(id,publisher_id,slug,name,summary,category,visibility)
