@@ -98,3 +98,39 @@ default off. No cloud resources are created by the local checks.
 The separate [EC2 lifecycle workflow](LIFECYCLE.md) implements actual provider
 operations and documents the remaining activation gates. Use its explicit
 `synth:lifecycle` entrypoint; the foundation does not automatically deploy it.
+
+## Separate computer mount workflow
+
+`lib/computer-mount-delivery.ts` adds a Standard mount workflow and a separate
+cancel-only recovery workflow. They consume the exact app transport input
+`{ schemaVersion: 1, work: { authorization, plan, deployment }, object }`, use
+`mount-<authorizationId>` execution names and return only the raw mounted
+receipt. They neither allocate computers nor prepare application configuration.
+
+The helper reconstructs the original numbered execution, checks current DB
+authority through `/api/internal/computers/mount-authority`, and independently
+observes the approved EC2 image/network/role, writer generation, and preserved,
+encrypted EBS attachment. Original grant expiry is never extended. Lost SSM
+replies lead to observation/cancellation, with no second start. Recovery can
+only address the original verified writer. Uncertain/stopped/replaced writers
+require lifecycle reconciliation; no command is redirected to another instance.
+
+Run `bash tools/test.sh infra` from the repository root. For a separate stack,
+provide `EZIL_MOUNT_CONFIG` and run `npm run synth:mount`. It has the same outer
+shape as the delivery config, with `settings` validated by `lib/mount/contract.ts`:
+approved lifecycle infrastructure pins, a per-writer role path prefix, bucket,
+mount workflow/document pins, and the dedicated mount-authority secret reference.
+No secret value belongs in that file. The computed document name uses the source
+hash; its `documentHash` must separately match AWS's reported numeric-version
+hash, as described above. Register with reconciliation disabled, inspect the
+actual pins, then deploy reviewed settings before enabling any caller.
+
+The SSM document in `documents/mount.json` is copied exactly from the host mount
+operation in PR #143. The reviewed AMI must install that manager, executor,
+`ezil-mount@.service` and `/opt/ezil-supervisor/current` before activation.
+Its original configuration document remains unchanged. Reconciliation rules
+default off, logs omit execution data, and the helper has read-only AWS APIs.
+The Step Functions role alone may invoke the fixed document on platform-tagged
+instances. Mount/database scheduling, configuration gating and AWS pilot
+acceptance remain separate integration work. Local ASL/SDK/CDK fixtures are
+not evidence of AWS mounts, application readiness or Reticle installation.

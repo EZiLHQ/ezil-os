@@ -7,7 +7,8 @@
     "test": "node --import tsx --test test/*.test.ts",
     "synth": "cdk synth --strict",
     "synth:lifecycle": "cdk synth --strict --app \"npx tsx bin/lifecycle.ts\"",
-    "synth:delivery": "cdk synth --strict --app \"npx tsx bin/delivery.ts\""
+    "synth:delivery": "cdk synth --strict --app \"npx tsx bin/delivery.ts\"",
+    "synth:mount": "cdk synth --strict --app \"npx tsx bin/mount.ts\""
   },
   "dependencies": {
     "@aws-sdk/client-ec2": "3.1140.0",
