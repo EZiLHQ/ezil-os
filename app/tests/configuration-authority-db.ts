@@ -4,11 +4,15 @@ import { drizzle } from 'drizzle-orm/postgres-js';
 import * as schema from '../src/server/db/schema';
 import { produceComputerConfiguration } from '../src/server/app-platform/computer-configuration';
 import { authorizeConfigurationWork } from '../src/server/app-platform/configuration-authority';
+import { configurationMountConfirmed } from '../src/server/app-platform/configuration-mount';
+import { eq } from 'drizzle-orm';
 import { createConfigurationAuthorityHandler } from '../src/server/app-platform/configuration-authority-http';
 import { CONFIGURATION_AUTHORITY_PATH, configurationAuthoritySignature,
     type ConfigurationAuthorityRequest } from '../src/server/app-platform/configuration-authority-protocol';
 import { claimConfigurationDelivery, dispatchConfigurationClaim } from '../src/server/app-platform/configuration-delivery';
 import { runtimeRecords } from './fixtures/runtime-release';
+import { dataMountComputer } from './fixtures/data-mount';
+import { recordConfigurationMount, restartConfigurationComputer, ageConfigurationMount } from './fixtures/configuration-mount';
 import { runtimeTestDatabase } from './helpers/runtime-database';
 
 const fixture = await runtimeTestDatabase(); const { sql } = fixture;
@@ -36,15 +40,12 @@ try {
     const admin = randomUUID();
     await sql`INSERT INTO auth.users(id) VALUES (${admin})`;
     await sql`INSERT INTO ezil_app_admins(user_id) VALUES (${admin})`;
-    async function setup() {
-        const computerId = randomUUID(), owner = randomUUID(), email = `${owner}@example.com`;
-        await sql`INSERT INTO auth.users(id,email) VALUES (${owner},${email})`;
+    async function setup(mounted = true) {
+        const mountComputer = await dataMountComputer(sql);
+        const { computerId, userId: owner } = mountComputer, email = `${owner}@example.com`;
+        await sql`UPDATE auth.users SET email=${email} WHERE id=${owner}`;
         await sql`INSERT INTO ezil_os_access(email,invited_by) VALUES (${email},'test')`;
-        await sql`INSERT INTO ezil_computers(id,user_id,slot,provider) VALUES (${computerId},${owner},1,'aws-ec2')`;
-        await sql`INSERT INTO ezil_computer_runtimes(computer_id,region,availability_zone,data_volume_id,desired_state)
-            VALUES (${computerId},'us-east-1','us-east-1a',${handle('vol')},'running')`;
-        await sql`INSERT INTO ezil_computer_instances(computer_id,generation,provider_instance_id,observed_state,observed_at)
-            VALUES (${computerId},1,${handle('i')},'running',now())`;
+        const mountId = mounted ? await recordConfigurationMount(sql, mountComputer) : null;
         const [publisher] = await sql`INSERT INTO ezil_app_publishers(owner_user_id,display_name,status,invited_by)
             VALUES (${owner},'Test','active',${admin}) RETURNING id`;
         const records = runtimeRecords('reticle', { appId: randomUUID(), publisherId: publisher!.id,
@@ -68,7 +69,7 @@ try {
             VALUES (${installationId},${computerId},${owner},'install',${randomUUID()}) RETURNING id`;
         await sql`INSERT INTO ezil_app_outbox(job_id) VALUES (${job!.id})`;
         const result = await produceComputerConfiguration(options, computerId); assert.ok('configurationId' in result);
-        return { computerId, owner, email, records, installationId, jobId: job!.id as string, input: await reference(result.configurationId) };
+        return { computerId, owner, email, records, installationId, mountComputer, mountId, jobId: job!.id as string, input: await reference(result.configurationId) };
     }
     type Setup = Awaited<ReturnType<typeof setup>>;
     const check = (s: Setup) => authorizeConfigurationWork(options, s.input);
@@ -90,6 +91,55 @@ try {
         await sql`UPDATE ezil_computer_configuration_deliveries SET prepared_at=now() WHERE configuration_id=${s.input.configurationId}`;
         assert.equal(await authorizeConfigurationWork(options, reload), true); await pending(s);
         assert.equal((await sql`SELECT count(*)::int n FROM ezil_computer_configurations WHERE computer_id=${s.computerId}`)[0]!.n, 1);
+    });
+    await test('running writer alone cannot authorize preparation or reload; a completed mount enables both', async () => {
+        const s = await setup(false), reload = { ...s.input, operation: 'reload' as const };
+        assert.equal(await check(s), false);
+        await sql`UPDATE ezil_computer_configuration_deliveries SET prepared_at=now() WHERE configuration_id=${s.input.configurationId}`;
+        assert.equal(await authorizeConfigurationWork(options, reload), false);
+        await recordConfigurationMount(sql, s.mountComputer);
+        assert.equal(await check(s), true); assert.equal(await authorizeConfigurationWork(options, reload), true);
+        await pending(s);
+    });
+    await test('revoked mount denies identical signed preparation and reload without changing installation state', async () => {
+        const s = await setup();
+        await sql`UPDATE ezil_computer_configuration_deliveries SET prepared_at=now() WHERE configuration_id=${s.input.configurationId}`;
+        await sql`UPDATE ezil_computer_data_mount_authorizations SET revoked_at=now() WHERE id=${s.mountId}`;
+        for (const operation of ['prepare', 'reload'] as const) {
+            const response = await handler(signed({ ...s.input, operation }));
+            assert.equal(response.status, 403); assert.deepEqual(await response.json(), { code: 'configuration_not_current' });
+        }
+        await pending(s);
+    });
+    await test('in-time completed mount remains valid after its execution grant expires', async () => {
+        const s = await setup(); await ageConfigurationMount(sql, s.mountId!);
+        assert.equal(await check(s), true); await pending(s);
+    });
+    await test('same-generation stop/start needs its own completed mount, even with identical configuration bytes', async () => {
+        const s = await setup(), restarted = await restartConfigurationComputer(sql, s.mountComputer);
+        const result = await produceComputerConfiguration(options, s.computerId);
+        assert.ok('configurationId' in result); assert.equal(result.configurationId, s.input.configurationId);
+        assert.equal(await check(s), false);
+        await recordConfigurationMount(sql, restarted);
+        assert.equal(await check(s), true); await pending(s);
+    });
+    await test('mount authority stays locked through the caller transaction, then committed revocation is visible', async () => {
+        const s = await setup(); let release!: () => void, entered!: () => void;
+        const gate = new Promise<void>(r => { release = r; }), checked = new Promise<void>(r => { entered = r; });
+        const holder = options.database.transaction(async tx => {
+            await tx.select().from(schema.computers).where(eq(schema.computers.id, s.computerId)).for('update');
+            const [target] = await tx.select().from(schema.computerConfigurations).where(eq(schema.computerConfigurations.id, s.input.configurationId));
+            assert.equal(await configurationMountConfirmed(tx, target!), true); entered(); await gate;
+        });
+        await checked;
+        try {
+            await assert.rejects(sql.begin(async tx => {
+                await tx`SET LOCAL lock_timeout='100ms'`;
+                await tx`UPDATE ezil_computer_data_mount_authorizations SET revoked_at=now() WHERE id=${s.mountId}`;
+            }), (error: { code?: string }) => error.code === '55P03');
+        } finally { release(); await holder; }
+        await sql`UPDATE ezil_computer_data_mount_authorizations SET revoked_at=now() WHERE id=${s.mountId}`;
+        assert.equal(await check(s), false); await pending(s);
     });
     await test('scope, revision, digest, fence and cross-computer forgeries fail', async () => {
         const s = await setup(), other = await setup();
@@ -123,8 +173,8 @@ try {
         assert.equal((await sql`SELECT status FROM ezil_app_installations WHERE id=${s.installationId}`)[0]!.status, 'pending');
         assert.ok((await sql`SELECT superseded_at FROM ezil_computer_configuration_deliveries WHERE configuration_id=${s.input.configurationId}`)[0]!.superseded_at);
     });
-    await test('a new suspended configuration remains deliverable after OS access revocation', async () => {
-        const s = await setup(); await revocations.osAccess!(s);
+    await test('an empty suspended configuration remains deliverable without mount evidence after OS revocation', async () => {
+        const s = await setup(false); await revocations.osAccess!(s);
         assert.equal(await check(s), false);
         const current = await produceComputerConfiguration(options, s.computerId); assert.ok('configurationId' in current);
         const ref = await reference(current.configurationId);
@@ -147,7 +197,7 @@ try {
             VALUES (${s.computerId},2,${handle('i')},'running',now())`;
         assert.equal(await check(s), false);
         const current = await produceComputerConfiguration(options, s.computerId); assert.ok('configurationId' in current);
-        assert.equal(await authorizeConfigurationWork(options, await reference(current.configurationId)), true); await pending(s);
+        assert.equal(await authorizeConfigurationWork(options, await reference(current.configurationId)), false); await pending(s);
     });
     await test('concurrent checks, producer and delivery share lock order and preserve one snapshot', async () => {
         const s = await setup();

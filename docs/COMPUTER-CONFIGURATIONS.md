@@ -137,6 +137,23 @@ installations require their actual approved service records and active port
 leases; a missing or released lease cannot be ignored at completion. Changed
 authority produces a newer snapshot and fences the old result.
 
+Apply migrations through `0011_computer_data_mount_authority.sql` before enabling
+delivery or workflow configuration authority. `configuration-mount.ts` requires
+a completed, unrevoked mount receipt for the exact computer, generation, fence,
+instance, volume and filesystem, bound to the current successful lifecycle job.
+A later lifecycle job invalidates old evidence, including stop/start that reuses
+the same instance and generation. Missing evidence defers delivery with
+`computer_data_mount_unconfirmed`, without preparation, reload or installation
+completion. Desired snapshots may still be compiled before mounting.
+
+The receipt must have been accepted within its original execution grant; expiry
+does not invalidate a mount already completed in time. Every transport phase and
+final acknowledgement rechecks evidence, holding authority locks only until the
+database transaction commits. A suspension bypasses the mount gate only when
+both installation arrays are empty, so revocation can remove authority even
+after a mount grant is revoked. These records do not replace the host's mount
+checks, independent provider observation or application readiness checks.
+
 Provisioning calls run outside database transactions. `advancePreparation` is a
 bounded submit/poll operation: it uses the immutable configuration UUID as its
 stable provider-operation key across claims, and returns `pending` while a durable
@@ -254,7 +271,7 @@ no provider calls, starts no resources, and cannot acknowledge installation or
 loaded configuration. Refreshing authority can persist a new desired snapshot
 and delivery event, so this is not a read-only status endpoint.
 
-Enable only after migration 0006, reviewed workflow deployment and dedicated
+Enable only after migrations through 0011, reviewed workflow deployment and dedicated
 credential provisioning. `EZIL_CONFIGURATION_AUTHORITY_ENABLED` defaults to
 `false`; disabled requests return 404 without accessing the database. When
 enabled, `EZIL_CONFIGURATION_AUTHORITY_SECRET` is required at boot: a separate
