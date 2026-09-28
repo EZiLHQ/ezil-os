@@ -33,7 +33,7 @@ function runtimeSchema(input) {
   const common = ['op', 'workspaceId'];
   if (op === 'provider.status' || op === 'provider.remove') { exact(input, ['op']); return input; }
   if (op === 'provider.configure') {
-    exact(input, ['op', 'action']); if (!['azure', 'bedrock'].includes(input.action)) throw Error('Invalid provider'); return input;
+    exact(input, ['op', 'action']); if (!['ezil', 'azure', 'bedrock'].includes(input.action)) throw Error('Invalid provider'); return input;
   }
   if (op === 'workspace.list') { exact(input, ['op']); return input; }
   if (op === 'workspace.create') { exact(input, ['op', 'name']); name(input.name); return input; }

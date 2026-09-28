@@ -1,4 +1,5 @@
 import { isNative, NATIVE_CAPABILITIES, selectRuntimeAdapter } from '../../../native-runtime.js';
+import { providerText } from '../provider-state.js';
 // tabs/system.js — EZiL-authored. Not Puter code.
 //
 // ═══════════════════════════════════════════════════════════════════════════
@@ -62,6 +63,7 @@ let screenObserved = null;  // { width, height } from the live read
 let screenError = null;
 let refreshTimer = null;
 let nativeProvider = { configured: false, pending: false, error: '' };
+let nativeProviderEpoch = 0;
 let listening = false;
 
 /** The desktop window's iframe, or null when the desktop is not open. */
@@ -190,11 +192,13 @@ function paint () {
             ${row('Browser', NATIVE_CAPABILITIES.browser)}
             ${row('Cloud sync', 'Disabled', 'Your workspace is stored on this Mac.')}
             <h4 style="margin-top:20px">AI provider</h4>
-            <p class="ezil-settings-lead">${nativeProvider.error ? esc(nativeProvider.error) : (nativeProvider.configured ? 'A provider is stored in macOS Keychain.' : 'No provider is connected. The desktop and editor work without one.')}</p>
+            <p class="ezil-settings-lead">${esc(providerText(nativeProvider))}</p>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="ezil-settings-btn" data-native-provider="ezil" ${nativeProvider.pending ? 'disabled' : ''}>Connect EZiL Works</button>
               <button class="ezil-settings-btn" data-native-provider="azure" ${nativeProvider.pending ? 'disabled' : ''}>Connect Azure</button>
               <button class="ezil-settings-btn" data-native-provider="bedrock" ${nativeProvider.pending ? 'disabled' : ''}>Connect Bedrock</button>
               <button class="ezil-settings-btn" data-native-provider="remove" ${nativeProvider.pending || !nativeProvider.configured ? 'disabled' : ''}>Remove provider</button>
+              <button class="ezil-settings-btn" data-native-provider="status" ${nativeProvider.pending ? 'disabled' : ''}>Refresh status</button>
             </div>`;
         return;
     }
@@ -247,19 +251,27 @@ export default {
         tabCtx = ctx ?? tabCtx;
         $win.off('click.ezil-native-provider').on('click.ezil-native-provider', '[data-native-provider]', async function () {
             if (!isNative(tabCtx) || nativeProvider.pending) return;
+            ++nativeProviderEpoch;
             nativeProvider = { ...nativeProvider, pending: true, error: '' }; paint();
             const action = this.getAttribute('data-native-provider');
             try {
                 const runtime = selectRuntimeAdapter(tabCtx);
-                const result = await runtime.operation(action === 'remove' ? { op: 'provider.remove' } : { op: 'provider.configure', action });
-                if (result?.ok !== true) throw Error('Provider setup did not complete.');
-                nativeProvider = { configured: action !== 'remove', pending: false, error: '' };
+                const result = await runtime.operation(action === 'status' ? { op: 'provider.status' } : action === 'remove' ? { op: 'provider.remove' } : { op: 'provider.configure', action });
+                if (result?.ok !== true) {
+                    const status = await runtime.operation({ op: 'provider.status' });
+                    nativeProvider = { ...status, pending: false, error: true, errorCode: result?.errorCode || status?.errorCode };
+                } else nativeProvider = { ...result, pending: false, error: '' };
             } catch { nativeProvider = { ...nativeProvider, pending: false, error: 'Provider setup did not complete.' }; }
             paint();
         });
-        if (isNative(tabCtx)) void selectRuntimeAdapter(tabCtx).operation({ op: 'provider.status' }).then(result => {
-            nativeProvider = { configured: result?.ok === true && result.configured === true, pending: false, error: '' }; paint();
-        });
+        if (isNative(tabCtx)) {
+            const epoch = ++nativeProviderEpoch;
+            nativeProvider = { ...nativeProvider, pending: true };
+            void selectRuntimeAdapter(tabCtx).operation({ op: 'provider.status' }).then(result => {
+                if (epoch !== nativeProviderEpoch) return;
+                nativeProvider = { ...result, pending: false, error: result?.ok !== true }; paint();
+            }).catch(() => { if (epoch === nativeProviderEpoch) { nativeProvider = { ...nativeProvider, pending: false, error: true }; paint(); } });
+        }
         paint();
     },
 

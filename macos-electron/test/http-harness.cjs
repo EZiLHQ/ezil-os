@@ -12,17 +12,18 @@ function harness() {
     request: async (url, options = {}) => {
       const req = Readable.from(options.body ? [Buffer.from(options.body)] : []);
       Object.assign(req, { url, method: options.method || 'GET', headers: { host: '127.0.0.1:12345', ...options.headers } });
-      const res = new EventEmitter(), chunks = []; let code = 200;
+      const res = new EventEmitter(), chunks = [], headers = new Headers(); let code = 200, destroyed = false;
       Object.assign(res, {
         headersSent: false,
-        setHeader() {},
-        writeHead(status) { code = status; this.headersSent = true; return this; },
+        setHeader(name, value) { headers.set(name, value); },
+        writeHead(status, values = {}) { code = status; for (const [name, value] of Object.entries(values)) headers.set(name, value); this.headersSent = true; return this; },
         write(chunk) { chunks.push(Buffer.from(chunk)); return true; },
         end(chunk) { if (chunk) chunks.push(Buffer.from(chunk)); return this; },
-        destroy() { this.emit('close'); }
+        destroy() { destroyed = true; this.emit('close'); }
       });
+      options.onResponse?.(res);
       await handler(req, res);
-      return { status: code, text: async () => Buffer.concat(chunks).toString(), json: async () => JSON.parse(Buffer.concat(chunks).toString()) };
+      return { status: code, headers, destroyed, text: async () => Buffer.concat(chunks).toString(), json: async () => JSON.parse(Buffer.concat(chunks).toString()) };
     }
   };
 }

@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
-import { readBroker, readModels, type ModelBrokerDescriptor } from './broker';
+import { randomUUID } from 'node:crypto';
+import { readBroker, readModelCatalog, type ModelBrokerDescriptor } from './broker';
+import { brokerError } from './broker-errors';
 
 const OUTPUT_LIMIT = 8192;
 type Emit = (part: vscode.LanguageModelResponsePart) => void;
@@ -8,7 +10,7 @@ function textContent(message: vscode.LanguageModelChatRequestMessage): string {
     const parts: string[] = [];
     for (const part of message.content) {
         if (part instanceof vscode.LanguageModelTextPart) parts.push(part.value);
-        else throw new Error('EZiL BYOK currently accepts text messages only.');
+        else throw new Error('EZiL currently accepts text messages only.');
     }
     return parts.join('');
 }
@@ -16,7 +18,8 @@ function textContent(message: vscode.LanguageModelChatRequestMessage): string {
 export function requestBody(model: vscode.LanguageModelChatInformation, messages: readonly vscode.LanguageModelChatRequestMessage[], options: vscode.ProvideLanguageModelChatResponseOptions): object {
     if (options.tools?.length) throw new Error('This configured EZiL provider does not advertise tool calling.');
     const requested = options.modelOptions?.maxTokens;
-    const maxTokens = Number.isInteger(requested) && requested > 0 ? Math.min(requested, OUTPUT_LIMIT) : Math.min(model.maxOutputTokens, 4096);
+    if (requested !== undefined && (!Number.isInteger(requested) || requested < (model.version === 'ezil-gateway' ? 16 : 1))) throw brokerError('request_invalid');
+    const maxTokens = requested !== undefined ? Math.min(requested, model.maxOutputTokens, OUTPUT_LIMIT) : Math.min(model.maxOutputTokens, 4096);
     return {
         model: model.id,
         messages: messages.map(message => {
@@ -64,23 +67,30 @@ function bedrockEvent(frame: Buffer): { type?: string; payload: unknown } {
     return { type, payload: raw ? JSON.parse(raw) : {} };
 }
 
-async function consumeSSE(body: ReadableStream<Uint8Array>, emit: Emit): Promise<void> {
-    const reader = body.getReader(); const decoder = new TextDecoder(); let buffer = '';
-    while (true) {
+async function consumeSSE(body: ReadableStream<Uint8Array>, emit: Emit, requireDone: boolean): Promise<void> {
+    const reader = body.getReader(); const decoder = new TextDecoder('utf-8', { fatal: true }); let buffer = '', terminal = false, bytes = 0;
+    try { while (true) {
         const { done, value } = await reader.read(); buffer = (buffer + decoder.decode(value, { stream: !done })).replaceAll('\r\n', '\n');
+        bytes += value?.byteLength || 0;
+        if (bytes > 8 * 1024 * 1024) throw brokerError('stream_invalid');
         let split;
         while ((split = buffer.indexOf('\n\n')) >= 0) {
             const event = buffer.slice(0, split); buffer = buffer.slice(split + 2);
-            for (const line of event.split('\n')) {
-                if (!line.startsWith('data:')) continue;
-                const data = line.slice(5).trim(); if (!data || data === '[DONE]') continue;
-                const value = JSON.parse(data); const text = value?.choices?.[0]?.delta?.content;
-                if (typeof text === 'string' && text) emit(new vscode.LanguageModelTextPart(text));
-            }
+            if (event.length > 1024 * 1024) throw brokerError('stream_invalid');
+            const data = event.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n');
+            if (!data) continue;
+            if (terminal && requireDone) throw brokerError('stream_invalid');
+            if (data === '[DONE]') { terminal = true; continue; }
+            let value; try { value = JSON.parse(data); } catch { throw brokerError('stream_invalid'); }
+            if (value?.error) throw brokerError(value.error.code);
+            const text = value?.choices?.[0]?.delta?.content;
+            if (typeof text === 'string' && text) emit(new vscode.LanguageModelTextPart(text));
         }
+        if (buffer.length > 1024 * 1024) throw brokerError('stream_invalid');
         if (done) break;
     }
-    if (buffer.trim() && buffer.trim() !== 'data: [DONE]') throw new Error('Incomplete Azure response stream.');
+    if ((buffer.trim() && (requireDone || buffer.trim() !== 'data: [DONE]')) || (requireDone && !terminal)) throw brokerError('stream_invalid');
+    } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
 }
 
 async function consumeBedrock(body: ReadableStream<Uint8Array>, emit: Emit): Promise<void> {
@@ -105,20 +115,22 @@ async function consumeBedrock(body: ReadableStream<Uint8Array>, emit: Emit): Pro
 
 export async function streamChat(descriptor: ModelBrokerDescriptor, body: object, emit: Emit, token: vscode.CancellationToken): Promise<void> {
     const controller = new AbortController();
+    // One key for this logical invocation; no automatic retries at any layer.
+    const idempotencyKey = randomUUID();
     const cancellation = token.onCancellationRequested(() => controller.abort());
     if (token.isCancellationRequested) controller.abort();
     try {
         const response = await fetch(`${descriptor.url}/v1/chat`, {
             method: 'POST', redirect: 'error', signal: controller.signal,
-            headers: { authorization: `Bearer ${descriptor.capability}`, 'content-type': 'application/json' },
+            headers: { authorization: `Bearer ${descriptor.capability}`, 'content-type': 'application/json', 'Idempotency-Key': idempotencyKey },
             body: JSON.stringify(body),
         });
-        if (!response.ok || !response.body) throw new Error('EZiL model broker is unavailable.');
+        if (!response.ok || !response.body) { await response.body?.cancel(); throw brokerError(response.headers.get('x-ezil-error')); }
         const type = response.headers.get('content-type')?.split(';', 1)[0];
-        if (type === 'text/event-stream') await consumeSSE(response.body, emit);
+        if (type === 'text/event-stream') await consumeSSE(response.body, emit, response.headers.get('x-ezil-stream') === 'responses-v1');
         else if (type === 'application/vnd.amazon.eventstream') await consumeBedrock(response.body, emit);
         else throw new Error('Unsupported provider response format.');
-    } finally { cancellation.dispose(); }
+    } finally { controller.abort(); cancellation.dispose(); }
 }
 
 export class EZiLModelProvider implements vscode.LanguageModelChatProvider {
@@ -130,8 +142,8 @@ export class EZiLModelProvider implements vscode.LanguageModelChatProvider {
     }
     async provideLanguageModelChatInformation(_options: vscode.PrepareLanguageModelChatModelOptions, token: vscode.CancellationToken): Promise<vscode.LanguageModelChatInformation[]> {
         if (token.isCancellationRequested) return [];
-        const models = await readModels(this.descriptor());
-        return models.map(id => ({ id, name: id, family: id, version: 'configured', maxInputTokens: 8192, maxOutputTokens: OUTPUT_LIMIT, capabilities: { imageInput: false, toolCalling: false } }));
+        const models = await readModelCatalog(this.descriptor());
+        return models.map(model => ({ id: model.id, name: model.id, family: model.id, version: model.gateway ? 'ezil-gateway' : 'configured', maxInputTokens: model.maxInputTokens, maxOutputTokens: model.maxOutputTokens, capabilities: { imageInput: false, toolCalling: false } }));
     }
     async provideLanguageModelChatResponse(model: vscode.LanguageModelChatInformation, messages: readonly vscode.LanguageModelChatRequestMessage[], options: vscode.ProvideLanguageModelChatResponseOptions, progress: vscode.Progress<vscode.LanguageModelResponsePart>, token: vscode.CancellationToken): Promise<void> {
         await streamChat(this.descriptor(), requestBody(model, messages, options), part => progress.report(part), token);

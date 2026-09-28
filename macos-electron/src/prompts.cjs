@@ -11,14 +11,19 @@ function prompt(label, hidden = false) {
     let output = '', exceeded = false;
     child.stdout.on('data', chunk => { output += chunk; if (output.length > 10000) { exceeded = true; child.kill('SIGTERM'); } });
     child.once('error', () => reject(Error('Native credential dialog unavailable')));
-    child.once('exit', code => code === 0 && !exceeded ? resolve(output.trim()) : reject(Error('Provider setup cancelled')));
+    child.once('exit', code => code === 0 && !exceeded ? resolve(hidden ? output.replace(/\r?\n$/, '') : output.trim()) : reject(Error('Provider setup cancelled')));
     child.stdin.end(`set answer to display dialog "${label}" default answer "" ${hidden ? 'with hidden answer' : ''} buttons {"Cancel", "Save"} default button "Save"\nreturn text returned of answer\n`);
   });
 }
-async function configureProvider(type, vault) {
+async function configureProvider(type, vault, works, ask = prompt) {
   if (type === 'remove') { vault.remove(); return; }
-  if (type === 'azure') vault.set({ provider: 'azure', endpoint: await prompt('Azure OpenAI or Foundry endpoint'), deployment: await prompt('Azure deployment'), key: await prompt('Azure API key', true) });
-  else if (type === 'bedrock') vault.set({ provider: 'bedrock', region: await prompt('Bedrock region'), model: await prompt('Bedrock model ID'), token: await prompt('Bedrock API key', true) });
+  if (type === 'ezil') {
+    // Selecting Works disables direct providers even if sign-in is cancelled.
+    vault.set({ provider: 'ezil', session: null });
+    await works.signIn(await ask('Works builder email'), await ask('Works password', true));
+  }
+  else if (type === 'azure') vault.set({ provider: 'azure', endpoint: await ask('Azure OpenAI or Foundry endpoint'), deployment: await ask('Azure deployment'), key: await ask('Azure API key', true) });
+  else if (type === 'bedrock') vault.set({ provider: 'bedrock', region: await ask('Bedrock region'), model: await ask('Bedrock model ID'), token: await ask('Bedrock API key', true) });
   else throw Error('Temporary IAM is unavailable');
 }
 module.exports = { configureProvider };

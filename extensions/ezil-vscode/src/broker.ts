@@ -1,5 +1,6 @@
 import { lstatSync, openSync, closeSync, readFileSync, fstatSync, constants } from 'node:fs';
 import { isAbsolute, relative, resolve, dirname } from 'node:path';
+import { brokerError } from './broker-errors';
 
 export interface BrokerDescriptor {
     contractVersion: 1; origin: string; workspaceId: string; token: string;
@@ -90,14 +91,26 @@ export async function sendOperation(descriptor: BrokerDescriptor, operation: Rec
 }
 
 export async function readModels(descriptor: ModelBrokerDescriptor): Promise<string[]> {
+    return (await readModelCatalog(descriptor)).map(model => model.id);
+}
+export interface BrokerModel { id: string; maxInputTokens: number; maxOutputTokens: number; gateway: boolean }
+export async function readModelCatalog(descriptor: ModelBrokerDescriptor): Promise<BrokerModel[]> {
     if (!descriptor.operations.includes('models')) throw new Error('broker_unavailable');
     const response = await fetch(`${descriptor.url}/v1/models`, {
         method: 'GET', redirect: 'error', signal: AbortSignal.timeout(5_000),
         headers: { authorization: `Bearer ${descriptor.capability}` },
     });
-    if (!response.ok) throw new Error('broker_unavailable');
-    const value = await response.json() as { models?: unknown };
+    if (!response.ok) { await response.body?.cancel(); throw brokerError(response.headers.get('x-ezil-error')); }
+    const value = await response.json() as { models?: unknown; modelInfo?: unknown };
     if (!Array.isArray(value.models) || value.models.length > 100 || value.models.some(model =>
         typeof model !== 'string' || !/^[a-zA-Z0-9._:-]{1,200}$/.test(model))) throw new Error('broker_unavailable');
-    return value.models;
+    const ids = value.models as string[];
+    if (value.modelInfo === undefined) return ids.map(id => ({ id, maxInputTokens: 8192, maxOutputTokens: 8192, gateway: false }));
+    if (!Array.isArray(value.modelInfo) || value.modelInfo.length !== ids.length) throw new Error('broker_unavailable');
+    return value.modelInfo.map((model: { id?: unknown; maxInputTokens?: unknown; maxOutputTokens?: unknown; minOutputTokens?: unknown }, i) => {
+        const cap = model?.id === 'ezil-fast' ? 8192 : model?.id === 'ezil-code' ? 4096 : 0;
+        if (!cap || model.id !== ids[i] || typeof model.maxInputTokens !== 'number' || !Number.isInteger(model.maxInputTokens) || model.maxInputTokens < 1 || model.maxInputTokens > 32768
+            || typeof model.maxOutputTokens !== 'number' || !Number.isInteger(model.maxOutputTokens) || model.maxOutputTokens < 16 || model.maxOutputTokens > cap || model.minOutputTokens !== 16) throw new Error('broker_unavailable');
+        return { id: ids[i]!, maxInputTokens: Math.min(8192, model.maxInputTokens), maxOutputTokens: model.maxOutputTokens, gateway: true };
+    });
 }

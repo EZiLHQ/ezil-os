@@ -7,6 +7,7 @@ const { pathToFileURL } = require('node:url');
 const { Workspaces } = require('./workspaces.cjs');
 const { Editors, INSTALLER } = require('./vscode.cjs');
 const { Vault, startBroker } = require('./broker.cjs');
+const { WorksSession, safeError } = require('./works-session.cjs');
 const { config, startHelper, authenticatedHeaders, workspaceStatus } = require('./helper.cjs');
 const { Browser, scaleBounds } = require('./browser.cjs');
 const { EditorSupervisor } = require('./editor.cjs');
@@ -26,7 +27,7 @@ else {
   const note = (code, fields) => { diagnostics.note(code, fields); atomic(path.join(dataRoot, 'diagnostics.json'), diagnostics.report()); };
   const embedded = new EditorSupervisor({ resources, extensionSource: path.join(resources, 'extensions/ezil-vscode'), note });
   const editors = new Editors({ extensionSource: path.join(resources, 'extensions/ezil-vscode') });
-  let store, vault, broker, desktop, recovery, current, closing, booting = false, quitting = false, providerBusy = false;
+  let store, vault, works, broker, desktop, recovery, current, closing, booting = false, quitting = false, providerBusy = false;
   const removingWorkspaces = new Set();
   function register(wc, url, role, workspaceId, generation) {
     const caller = { wc, url, role, workspaceId, generation, sequence: 0 };
@@ -166,12 +167,13 @@ else {
     return surfaceResult(input, input.op === 'browser.detach' ? 'closed' : 'ready');
   }
   async function runtimeOperation(host, input) {
-    if (input.op === 'provider.status') return { ok: true, configured: fs.existsSync(vault.file), keychainAvailable: process.platform === 'darwin' && safeStorage.isEncryptionAvailable() };
+    if (input.op === 'provider.status') return { ok: true, ...await works.status(), keychainAvailable: process.platform === 'darwin' && safeStorage.isEncryptionAvailable() };
     if (input.op === 'provider.configure' || input.op === 'provider.remove') {
       if (providerBusy) throw Error('Provider setup already open'); providerBusy = true;
-      try { await configureProvider(input.op === 'provider.remove' ? 'remove' : input.action, vault); note('PROVIDER_UPDATED'); }
+      try { await configureProvider(input.op === 'provider.remove' ? 'remove' : input.action, vault, works); note('PROVIDER_UPDATED'); }
+      catch (error) { return { ok: false, errorCode: safeError(error, 'signin_required').code }; }
       finally { providerBusy = false; }
-      return { ok: true, configured: input.op !== 'provider.remove' };
+      return { ok: true, ...await works.status() };
     }
     if (input.op === 'workspace.list') return { ok: true, workspaces: store.list() };
     if (input.op === 'workspace.create') {
@@ -294,7 +296,8 @@ else {
       catch { note('LEGACY_IMPORT_NEEDS_REVIEW'); }
     }
     vault = new Vault(path.join(dataRoot, 'private'), safeStorage);
-    broker = await startBroker(path.join(dataRoot, 'private'), vault);
+    works = new WorksSession(vault);
+    broker = await startBroker(path.join(dataRoot, 'private'), vault, { works });
     if (process.argv.includes('--native-smoke')) {
       const manifest = path.join(resources, 'INVENTORY.json');
       if (!app.isPackaged || JSON.parse(fs.readFileSync(manifest)).distribution !== 'internal-ad-hoc') throw Error('Packaged artifact required');

@@ -72,6 +72,32 @@ var vscode2 = __toESM(require("vscode"));
 // src/broker.ts
 var import_node_fs = require("node:fs");
 var import_node_path = require("node:path");
+
+// src/broker-errors.ts
+var messages = {
+  signin_required: "Sign in to Works again in native Settings.",
+  builder_required: "Sign in with an onboarded Works builder account.",
+  membership_required: "Ask Works support to enable your AI membership.",
+  credits: "Not enough Works credits for this request. Check your credit balance in Works.",
+  replay: "This request was already submitted. Check Works usage before starting another request.",
+  pending_usage: "AI usage needs reconciliation. Contact Works support before sending another request.",
+  paused: "The EZiL AI gateway is paused. Try again after service resumes.",
+  model_unavailable: "This EZiL model is disabled or unavailable. Refresh the model list.",
+  request_invalid: "Use text messages and an output limit within the selected model allowance.",
+  input_too_large: "Shorten the conversation to fit the selected model allowance.",
+  rate_limited: "Too many requests. Wait for current requests to finish.",
+  refused: "The model refused this request. Revise the request before submitting again.",
+  incomplete: "The response is incomplete. Check Works usage before sending another request.",
+  stream_invalid: "The response stream was interrupted or invalid. Check Works usage before sending another request.",
+  gateway_unavailable: "The EZiL gateway is unavailable. No retry was attempted; check Works usage before resubmitting.",
+  auth_unavailable: "Works sign-in is unavailable. Check the Works service configuration.",
+  timeout: "The request timed out. Check Works usage before sending another request."
+};
+function brokerError(code) {
+  return new Error(typeof code === "string" && Object.hasOwn(messages, code) ? messages[code] : "EZiL model broker is unavailable. No retry was attempted.");
+}
+
+// src/broker.ts
 function inside(root, path) {
   const rel = import_node_path.relative(root, path);
   return rel === "" || rel !== ".." && !rel.startsWith("../") && !import_node_path.isAbsolute(rel);
@@ -154,6 +180,9 @@ async function sendOperation(descriptor, operation) {
     throw new Error("broker_unavailable");
 }
 async function readModels(descriptor) {
+  return (await readModelCatalog(descriptor)).map((model) => model.id);
+}
+async function readModelCatalog(descriptor) {
   if (!descriptor.operations.includes("models"))
     throw new Error("broker_unavailable");
   const response = await fetch(`${descriptor.url}/v1/models`, {
@@ -162,16 +191,29 @@ async function readModels(descriptor) {
     signal: AbortSignal.timeout(5000),
     headers: { authorization: `Bearer ${descriptor.capability}` }
   });
-  if (!response.ok)
-    throw new Error("broker_unavailable");
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw brokerError(response.headers.get("x-ezil-error"));
+  }
   const value = await response.json();
   if (!Array.isArray(value.models) || value.models.length > 100 || value.models.some((model) => typeof model !== "string" || !/^[a-zA-Z0-9._:-]{1,200}$/.test(model)))
     throw new Error("broker_unavailable");
-  return value.models;
+  const ids = value.models;
+  if (value.modelInfo === undefined)
+    return ids.map((id) => ({ id, maxInputTokens: 8192, maxOutputTokens: 8192, gateway: false }));
+  if (!Array.isArray(value.modelInfo) || value.modelInfo.length !== ids.length)
+    throw new Error("broker_unavailable");
+  return value.modelInfo.map((model, i) => {
+    const cap = model?.id === "ezil-fast" ? 8192 : model?.id === "ezil-code" ? 4096 : 0;
+    if (!cap || model.id !== ids[i] || typeof model.maxInputTokens !== "number" || !Number.isInteger(model.maxInputTokens) || model.maxInputTokens < 1 || model.maxInputTokens > 32768 || typeof model.maxOutputTokens !== "number" || !Number.isInteger(model.maxOutputTokens) || model.maxOutputTokens < 16 || model.maxOutputTokens > cap || model.minOutputTokens !== 16)
+      throw new Error("broker_unavailable");
+    return { id: ids[i], maxInputTokens: Math.min(8192, model.maxInputTokens), maxOutputTokens: model.maxOutputTokens, gateway: true };
+  });
 }
 
 // src/model-provider.ts
 var vscode = __toESM(require("vscode"));
+var import_node_crypto = require("node:crypto");
 var OUTPUT_LIMIT = 8192;
 function textContent(message) {
   const parts = [];
@@ -179,18 +221,20 @@ function textContent(message) {
     if (part instanceof vscode.LanguageModelTextPart)
       parts.push(part.value);
     else
-      throw new Error("EZiL BYOK currently accepts text messages only.");
+      throw new Error("EZiL currently accepts text messages only.");
   }
   return parts.join("");
 }
-function requestBody(model, messages, options) {
+function requestBody(model, messages2, options) {
   if (options.tools?.length)
     throw new Error("This configured EZiL provider does not advertise tool calling.");
   const requested = options.modelOptions?.maxTokens;
-  const maxTokens = Number.isInteger(requested) && requested > 0 ? Math.min(requested, OUTPUT_LIMIT) : Math.min(model.maxOutputTokens, 4096);
+  if (requested !== undefined && (!Number.isInteger(requested) || requested < (model.version === "ezil-gateway" ? 16 : 1)))
+    throw brokerError("request_invalid");
+  const maxTokens = requested !== undefined ? Math.min(requested, model.maxOutputTokens, OUTPUT_LIMIT) : Math.min(model.maxOutputTokens, 4096);
   return {
     model: model.id,
-    messages: messages.map((message) => {
+    messages: messages2.map((message) => {
       if (message.role !== vscode.LanguageModelChatMessageRole.User && message.role !== vscode.LanguageModelChatMessageRole.Assistant)
         throw new Error("Unsupported chat role.");
       return { role: message.role === vscode.LanguageModelChatMessageRole.User ? "user" : "assistant", content: textContent(message) };
@@ -250,39 +294,61 @@ function bedrockEvent(frame) {
   const raw = frame.subarray(end, frame.length - 4).toString("utf8");
   return { type, payload: raw ? JSON.parse(raw) : {} };
 }
-async function consumeSSE(body, emit) {
+async function consumeSSE(body, emit, requireDone) {
   const reader = body.getReader();
-  const decoder = new TextDecoder;
-  let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    buffer = (buffer + decoder.decode(value, { stream: !done })).replaceAll(`\r
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let buffer = "", terminal = false, bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer = (buffer + decoder.decode(value, { stream: !done })).replaceAll(`\r
 `, `
 `);
-    let split;
-    while ((split = buffer.indexOf(`
+      bytes += value?.byteLength || 0;
+      if (bytes > 8 * 1024 * 1024)
+        throw brokerError("stream_invalid");
+      let split;
+      while ((split = buffer.indexOf(`
 
 `)) >= 0) {
-      const event = buffer.slice(0, split);
-      buffer = buffer.slice(split + 2);
-      for (const line of event.split(`
-`)) {
-        if (!line.startsWith("data:"))
+        const event = buffer.slice(0, split);
+        buffer = buffer.slice(split + 2);
+        if (event.length > 1024 * 1024)
+          throw brokerError("stream_invalid");
+        const data = event.split(`
+`).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join(`
+`);
+        if (!data)
           continue;
-        const data = line.slice(5).trim();
-        if (!data || data === "[DONE]")
+        if (terminal && requireDone)
+          throw brokerError("stream_invalid");
+        if (data === "[DONE]") {
+          terminal = true;
           continue;
-        const value2 = JSON.parse(data);
+        }
+        let value2;
+        try {
+          value2 = JSON.parse(data);
+        } catch {
+          throw brokerError("stream_invalid");
+        }
+        if (value2?.error)
+          throw brokerError(value2.error.code);
         const text = value2?.choices?.[0]?.delta?.content;
         if (typeof text === "string" && text)
           emit(new vscode.LanguageModelTextPart(text));
       }
+      if (buffer.length > 1024 * 1024)
+        throw brokerError("stream_invalid");
+      if (done)
+        break;
     }
-    if (done)
-      break;
+    if (buffer.trim() && (requireDone || buffer.trim() !== "data: [DONE]") || requireDone && !terminal)
+      throw brokerError("stream_invalid");
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
-  if (buffer.trim() && buffer.trim() !== "data: [DONE]")
-    throw new Error("Incomplete Azure response stream.");
 }
 async function consumeBedrock(body, emit) {
   const reader = body.getReader();
@@ -315,6 +381,7 @@ async function consumeBedrock(body, emit) {
 }
 async function streamChat(descriptor, body, emit, token) {
   const controller = new AbortController;
+  const idempotencyKey = import_node_crypto.randomUUID();
   const cancellation = token.onCancellationRequested(() => controller.abort());
   if (token.isCancellationRequested)
     controller.abort();
@@ -323,19 +390,22 @@ async function streamChat(descriptor, body, emit, token) {
       method: "POST",
       redirect: "error",
       signal: controller.signal,
-      headers: { authorization: `Bearer ${descriptor.capability}`, "content-type": "application/json" },
+      headers: { authorization: `Bearer ${descriptor.capability}`, "content-type": "application/json", "Idempotency-Key": idempotencyKey },
       body: JSON.stringify(body)
     });
-    if (!response.ok || !response.body)
-      throw new Error("EZiL model broker is unavailable.");
+    if (!response.ok || !response.body) {
+      await response.body?.cancel();
+      throw brokerError(response.headers.get("x-ezil-error"));
+    }
     const type = response.headers.get("content-type")?.split(";", 1)[0];
     if (type === "text/event-stream")
-      await consumeSSE(response.body, emit);
+      await consumeSSE(response.body, emit, response.headers.get("x-ezil-stream") === "responses-v1");
     else if (type === "application/vnd.amazon.eventstream")
       await consumeBedrock(response.body, emit);
     else
       throw new Error("Unsupported provider response format.");
   } finally {
+    controller.abort();
     cancellation.dispose();
   }
 }
@@ -356,11 +426,11 @@ class EZiLModelProvider {
   async provideLanguageModelChatInformation(_options, token) {
     if (token.isCancellationRequested)
       return [];
-    const models = await readModels(this.descriptor());
-    return models.map((id) => ({ id, name: id, family: id, version: "configured", maxInputTokens: 8192, maxOutputTokens: OUTPUT_LIMIT, capabilities: { imageInput: false, toolCalling: false } }));
+    const models = await readModelCatalog(this.descriptor());
+    return models.map((model) => ({ id: model.id, name: model.id, family: model.id, version: model.gateway ? "ezil-gateway" : "configured", maxInputTokens: model.maxInputTokens, maxOutputTokens: model.maxOutputTokens, capabilities: { imageInput: false, toolCalling: false } }));
   }
-  async provideLanguageModelChatResponse(model, messages, options, progress, token) {
-    await streamChat(this.descriptor(), requestBody(model, messages, options), (part) => progress.report(part), token);
+  async provideLanguageModelChatResponse(model, messages2, options, progress, token) {
+    await streamChat(this.descriptor(), requestBody(model, messages2, options), (part) => progress.report(part), token);
   }
   async provideTokenCount(_model, value, _token) {
     const text = typeof value === "string" ? value : textContent(value);

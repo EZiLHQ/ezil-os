@@ -39,6 +39,7 @@ test('activation acknowledges readiness and commands register/unregister a previ
         method: 'POST', headers: { host: '127.0.0.1:49152', origin, 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify(value),
     }), origin);
     let extension: typeof import('../src/extension') | undefined;
+    let gatewayBroker: { close(): void } | undefined;
     try {
         const record = (await (await request('/api/native/operations', { op: 'workspace.get', workspaceId })).json()).workspace;
         const capability = await (await request('/api/native/capabilities', { workspaceId: record.id, role: 'connector' })).json();
@@ -106,7 +107,60 @@ test('activation acknowledges readiness and commands register/unregister a previ
         streamed.length = 0;
         await provider.provideLanguageModelChatResponse(models[0], [{ role: 1, content: [new TextPart('hi')] }], { toolMode: 1 }, { report: (part: TextPart) => streamed.push(part) }, cancellation);
         expect(streamed.map(part => part.value)).toEqual(['bedrock']);
+
+        // Extension -> real Electron broker handler -> real Works session client
+        // -> synthetic service replies. Only network transport is substituted.
+        const { startBroker } = require('../../../macos-electron/src/broker.cjs');
+        const { harness } = require('../../../macos-electron/test/http-harness.cjs');
+        const { fixture, event, complete, grant } = require('../../../macos-electron/test/works-fixture.cjs');
+        const http = harness(); let mode = 'success';
+        const service = fixture((url: string) => {
+            if (!url.endsWith('/v1/responses')) return undefined;
+            if (mode === 'credits' || mode === 'replay') return Response.json({ error: { code: mode === 'credits' ? 'insufficient_credits' : 'idempotency_replay', message: grant.refreshToken } }, { status: mode === 'credits' ? 402 : 409 });
+            const end = mode === 'success' ? complete : mode === 'failed' ? event('response.failed', { response: { error: { message: grant.accessToken } } }) : '';
+            return new Response(event('response.output_text.delta', { delta: 'hello' }) + end, { headers: { 'content-type': 'text/event-stream' } });
+        });
+        const broker = await startBroker(privateRoot, service.vault, { createServer: http.createServer, fetchImpl: service.fetchImpl, works: service.works });
+        gatewayBroker = broker; process.env.EZIL_AI_BROKER_FILE = broker.descriptor;
+        globalThis.fetch = (async (url, options) => {
+            const result = await http.request(new URL(String(url)).pathname, { ...options, headers: Object.fromEntries(new Headers(options?.headers)) });
+            return new Response(await result.text(), { status: result.status, headers: result.headers });
+        }) as typeof fetch;
+        const gatewayModels = await provider.provideLanguageModelChatInformation({}, cancellation);
+        const codeModel = gatewayModels.find((m: { id: string }) => m.id === 'ezil-code');
+        expect(codeModel).toMatchObject({ maxOutputTokens: 4096, version: 'ezil-gateway' });
+        const ask = (maxTokens = 16) => provider.provideLanguageModelChatResponse(codeModel, [{ role: 1, content: [new TextPart('hi')] }], { toolMode: 1, modelOptions: { maxTokens } }, { report: (part: TextPart) => streamed.push(part) }, cancellation);
+        streamed.length = 0; await ask(9000);
+        expect(streamed.map(part => part.value)).toEqual(['hello']);
+        const posts = () => service.calls.filter((call: { url: string }) => call.url.endsWith('/v1/responses'));
+        expect(JSON.parse(posts()[0].options.body).max_output_tokens).toBe(4096);
+        expect(posts()[0].options.headers['Idempotency-Key']).toMatch(/^[a-f0-9-]{36}$/);
+        await expect(ask(15)).rejects.toThrow('output limit');
+        expect(posts()).toHaveLength(1);
+        for (const [failureMode, message] of [['credits', 'Works credits'], ['replay', 'already submitted'], ['failed', 'incomplete'], ['truncated', 'interrupted or invalid']]) {
+            mode = failureMode!; const before = posts().length;
+            await expect(ask()).rejects.toThrow(message!);
+            expect(posts()).toHaveLength(before + 1);
+        }
+        expect(new Set(posts().map((post: { options: { headers: Record<string, string> } }) => post.options.headers['Idempotency-Key'])).size).toBe(posts().length);
+        expect(JSON.stringify(streamed)).not.toContain(grant.accessToken);
+        expect(JSON.stringify(streamed)).not.toContain(grant.refreshToken);
+
+        const { streamChat } = await import('../src/model-provider');
+        const localDescriptor = { contractVersion: 1, url: origin, capability: 'c'.repeat(64), operations: ['models', 'chat'], formats: ['text/event-stream'] } as const;
+        for (const raw of ['data: {"error":{"code":"credits","message":"secret"}}\n\n', 'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n', 'data: [DONE]\n\ndata: {"error":{"code":"incomplete"}}\n\n', 'data: {bad}\n\n']) {
+            globalThis.fetch = (async () => new Response(raw, { headers: { 'content-type': 'text/event-stream', 'x-ezil-stream': 'responses-v1' } })) as typeof fetch;
+            await expect(streamChat(localDescriptor as never, {}, () => {}, cancellation)).rejects.toThrow();
+        }
+        let aborted = false, disposed = false;
+        globalThis.fetch = (async (_url, options) => {
+            aborted = options?.signal?.aborted === true;
+            throw new Error('cancelled');
+        }) as typeof fetch;
+        await expect(streamChat(localDescriptor as never, {}, () => {}, { isCancellationRequested: true, onCancellationRequested: () => ({ dispose() { disposed = true; } }) } as never)).rejects.toThrow();
+        expect(aborted).toBe(true); expect(disposed).toBe(true);
     } finally {
+        gatewayBroker?.close();
         await extension?.deactivate(); globalThis.fetch = actualFetch;
         if (previousDescriptor === undefined) delete process.env.EZIL_BROKER_FILE; else process.env.EZIL_BROKER_FILE = previousDescriptor;
         if (previousAI === undefined) delete process.env.EZIL_AI_BROKER_FILE; else process.env.EZIL_AI_BROKER_FILE = previousAI;

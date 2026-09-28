@@ -42,3 +42,14 @@ Provider registration, model discovery, Azure streaming, descriptor validation,
 and activation/preview behavior against the real helper handler are checked in
 CI. Bedrock binary event streaming is covered by parser tests and the official
 extension-host/provider calls remain physical-Mac gates.
+
+Native Settings can also explicitly select **Connect EZiL Works** to use builder
+credits through `https://ai.ezil.work`. Works sessions stay in Electron main;
+the extension receives only the local capability, enabled aliases and model caps.
+It generates one idempotency key per logical request, never retries inference,
+and surfaces only allowlisted broker errors, including midstream errors after
+partial text. The broker translates Responses SSE into the existing text stream.
+Azure and Bedrock remain separate explicit selections. See the
+[native gateway integration guide](../../macos-electron/AI-GATEWAY.md) for service
+contracts, configuration requirements, paused-inference behavior and validation
+limitations.

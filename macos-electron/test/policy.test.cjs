@@ -14,6 +14,8 @@ test('v2 runtime schema accepts typed surfaces and rejects executable or remote 
   assert.equal(runtimeSchema({ ...base, op: 'code.open' }).op, 'code.open');
   assert.equal(runtimeSchema({ ...base, op: 'browser.navigate', url: 'https://example.com/' }).op, 'browser.navigate');
   assert.equal(runtimeSchema({ op: 'provider.configure', action: 'azure' }).action, 'azure');
+  assert.equal(runtimeSchema({ op: 'provider.configure', action: 'ezil' }).action, 'ezil');
+  for (const field of ['accessToken', 'refreshToken', 'email', 'password', 'origin', 'endpoint', 'session']) assert.throws(() => runtimeSchema({ op: 'provider.configure', action: 'ezil', [field]: 'forbidden' }));
   assert.equal(runtimeSchema({ op: 'workspace.import' }).op, 'workspace.import');
   for (const input of [{ ...base, op: 'browser.navigate', url: 'http://example.com/' }, { ...base, op: 'code.open', command: 'id' }, { ...base, op: 'browser.layout', bounds: { x: 0, y: 0, width: -1, height: 1 }, visible: true, occluded: false }, { op: 'provider.configure', action: 'iam' }, { op: 'workspace.import', source: '/tmp/project' }]) assert.throws(() => runtimeSchema(input));
 });
