@@ -1,455 +1,67 @@
 /**
- * Pure (runtime-light) hydrate/flush logic that REPLACES `mountBucket()`'s s3fs
- * mount as the sandbox workspace persistence mechanism (`src/index.ts`'s
- * `ensureWorkspaceMount`).
+ * Versioned workspace checkpoints: immutable, bounded tar chunks followed by one
+ * conditional R2 manifest put. The manifest is the commit point. Missing files
+ * are deletions; older blobs are never consulted or merged during restore.
  *
- * Factored out of `index.ts` — same split as `./hmac`, `./twen`,
- * `./workspace-diag`, `./project-files`, `./workspace-seed` — so the
- * diff/ignore/walk logic can be unit-tested with plain `bun test` against
- * in-memory fakes, without the Workers runtime or a real Sandbox/R2 bucket.
- *
- * ## Why s3fs is gone
- *
- * Mounting R2 via s3fs silently drops every SECOND write: 0 bytes, `exec`
- * exits 0. Root cause is inside Cloudflare's own in-DO S3 emulator
- * (`@cloudflare/sandbox`'s `r2EgressHandler`): the even write takes s3fs's
- * copy-based metadata-update path, which discards the request's
- * `x-amz-meta-*` custom metadata and gets rejected with a 403 that only
- * surfaces from FUSE `close(2)` — which shell redirection never checks, and
- * which s3fs's own retry logic does not retry (it only retries 5xx). No
- * retry wrapper is possible around VS Code/git/npm writing through the mount.
- * Present in the latest published `@cloudflare/sandbox` (0.12.4) — no upgrade
- * fixes it.
- *
- * ## The replacement
- *
- * `/workspace` becomes plain local container disk (no mount at all). R2 is
- * reached only through the Worker's own R2 BINDING (`env.SANDBOX_WORKSPACE_R2_BUCKET`),
- * which never goes through s3fs / the R2-egress emulator:
- *
- *   - `hydrateWorkspaceFromR2()` — on (re)boot, lists every object under the
- *     project/branch's R2 prefix and writes each one into the container's
- *     local disk via the Sandbox SDK's own file RPCs (`writeFile`/`mkdir` —
- *     the SAME `sandbox.*` object `index.ts` already calls `.exec()` on, no
- *     new transport).
- *   - `flushWorkspaceToR2()` — walks the local disk (skipping the ignore
- *     list) and `bucket.put()`s files whose size/mtime changed since the last
- *     flush, using the identical `${projectId}/branches/${branch}/${rel}` key
- *     scheme `/project-files/*` already writes with (see `./project-files`),
- *     so client-side and container-side writes land on the SAME R2 objects.
- *
- * ## THE DELETE HAZARD (read this before touching `flushWorkspaceToR2`)
- *
- * A flush that treats "absent locally" as "delete in R2" would DESTROY a
- * user's project the moment it ran against a partially-hydrated workspace
- * (cold container, hydrate still in flight, or a hydrate that failed
- * part-way through). Flush here is therefore structurally incapable of
- * deleting anything:
- *
- *   - `FlushR2BucketLike` (the ONLY R2 surface `flushWorkspaceToR2` is given)
- *     declares exactly one method, `put()`. There is no `delete` in its
- *     type — the compiler itself proves this module cannot call
- *     `bucket.delete(...)`, because there is nothing typed to call it on.
- *   - `flushWorkspaceToR2` never enumerates R2 objects at all (no `list()` /
- *     `get()` in `FlushR2BucketLike` either) — it has no way to notice, and
- *     therefore no way to react to, a file that exists in R2 but not locally.
- *   - Deletion handling is explicitly OUT OF SCOPE for this module. Future
- *     work (deleting an R2 object when a user deletes a local file) belongs
- *     behind explicit filesystem-delete events observed AFTER a
- *     verified-complete hydration — not here.
- *
- * `flushWorkspaceToR2` also refuses to run at all unless the caller asserts
- * `hydrationComplete: true` (see `FlushDeps`) — a flush against a
- * partially-hydrated workspace is skipped outright, not attempted.
+ * The container codec preserves Git metadata, modes and safe relative links.
+ * It checks for concurrent edits before publication. A checkpoint is a point in
+ * time, not a filesystem journal: edits after it still require another flush.
  */
-
 import { base64ToBytes, bytesToBase64 } from './project-files';
 import { SEED_SENTINEL_FILENAME } from './workspace-seed';
+import { snapshotCommand } from './workspace-snapshot-script';
 
-// ── Ignore list (flush) ──────────────────────────────────────────────────────
-//
-// These directory NAMES (matched at any depth, exact basename match) are
-// NEVER walked or uploaded by flush. `bun install` / the dev server / a
-// template `cp -a` regenerate every one of them from source-controlled
-// inputs already present after hydrate — so excluding them is a throughput
-// requirement (whole files pass through the Durable Object one RPC call at a
-// time; walking/uploading `node_modules` would dominate every flush cycle),
-// not merely an optimization.
-export const WORKSPACE_FLUSH_IGNORE_DIR_NAMES = [
-  'node_modules',
-  '.next',
-  '.git',
-  'dist',
-  '.turbo',
-] as const;
-
-export function isIgnoredDirName(name: string): boolean {
-  return (WORKSPACE_FLUSH_IGNORE_DIR_NAMES as readonly string[]).includes(name);
-}
-
-/**
- * Root-level bookkeeping files this module itself writes into the workspace
- * (the hydrate-generation marker and the flush manifest cache). These are
- * container-local implementation detail, never real project content, and
- * must never be uploaded to R2 (nor would hydrate ever download them back —
- * they are never written to R2 in the first place, a closed loop).
- */
 export const HYDRATE_MARKER_FILENAME = '.ezil-hydrated.json';
 export const FLUSH_MANIFEST_FILENAME = '.ezil-flush-manifest.json';
-const RESERVED_ROOT_FILENAMES: readonly string[] = [HYDRATE_MARKER_FILENAME, FLUSH_MANIFEST_FILENAME];
-
-/**
- * R2-side-only heartbeat object key (basename), written unconditionally on
- * EVERY flush cycle that gets past the prefix/hydration gates — regardless
- * of whether any real project file changed that cycle.
- *
- * WHY THIS EXISTS: a computer-list UI derives "running / sleeping / off" from
- * how recently objects were flushed under a computer's R2 prefix, because
- * probing the live container directly costs several `sandbox.exec()` calls
- * and wakes it. If the flush cycle only touched R2 when a real file changed,
- * an actively-running-but-idle computer (nothing edited for a while) would
- * show a stale max-object-timestamp and read as "sleeping/off" even though
- * it is up and flushing successfully every cycle. This object's `uploaded`
- * timestamp is therefore the STABLE liveness signal to key the UI off of —
- * not the max mtime across all objects under the prefix, which is
- * content-driven and can go quiet for reasons that have nothing to do with
- * whether the computer is running.
- *
- * Lives ONLY in R2 (never written to/read from local disk) — hydrate skips
- * downloading it (see `hydrateWorkspaceFromR2`), exactly like the seed
- * sentinel, so it never round-trips into a real local file that flush would
- * then re-upload as if it were project content.
- */
 export const WORKSPACE_HEARTBEAT_FILENAME = '.ezil-heartbeat';
+export const SNAPSHOT_HEAD = '.ezil-snapshots/latest.json';
+export const SNAPSHOT_VERSION = 1;
+export const SNAPSHOT_CHUNK_BYTES = 1024 * 1024;
+const MAX_CHUNKS = 512;
+const MAX_ENTRIES = 100_000;
+const HASH = /^[a-f0-9]{64}$/;
+const GENERATION = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+const encoder = new TextEncoder();
 
-// ── Hydrate: R2 → local disk ────────────────────────────────────────────────
-
-export interface HydrateR2ObjectLike {
-  key: string;
+export interface Snapshot {
+  version: 1;
+  generation: string;
+  /** Immutable chunk owner; a no-op commit still advances the writer fence. */
+  chunkGeneration?: string;
+  sha256: string;
+  entries: number;
+  chunks: Array<{ size: number; sha256: string }>;
 }
-
-export interface HydrateR2ListResultLike {
-  objects: HydrateR2ObjectLike[];
-  truncated: boolean;
-  cursor?: string;
-}
-
 export interface HydrateR2ObjectBodyLike {
+  etag?: string;
+  size?: number;
   arrayBuffer(): Promise<ArrayBuffer>;
 }
-
-/**
- * Deliberately a MINIMAL structural subset of the real `R2Bucket` binding —
- * `list` + `get` only. Hydrate reads from R2; it never writes or deletes.
- */
 export interface HydrateR2BucketLike {
-  list(options: { prefix: string; cursor?: string; limit?: number }): Promise<HydrateR2ListResultLike>;
+  list(options: { prefix: string; cursor?: string; limit?: number }): Promise<{
+    objects: Array<{ key: string; size?: number }>;
+    truncated: boolean;
+    cursor?: string;
+  }>;
   get(key: string): Promise<HydrateR2ObjectBodyLike | null>;
 }
-
-/**
- * Minimal structural subset of the Sandbox SDK's own file RPCs (the same
- * `sandbox` object `index.ts` already calls `.exec()` on — no new transport).
- * Hydrate only ever creates directories and writes files; it never deletes.
- */
+export interface FlushR2BucketLike {
+  get(key: string): Promise<HydrateR2ObjectBodyLike | null>;
+  put(key: string, value: Uint8Array, options?: {
+    onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string };
+  }): Promise<{ etag?: string } | null>;
+}
 export interface HydrateContainerLike {
   mkdir(path: string, options?: { recursive?: boolean }): Promise<unknown>;
   writeFile(path: string, content: string, options?: { encoding?: string }): Promise<unknown>;
+  exec(command: string, options?: { timeout?: number }): Promise<{ exitCode: number; stdout: string; stderr?: string }>;
 }
-
-export interface HydrateDeps {
-  bucket: HydrateR2BucketLike;
-  container: HydrateContainerLike;
-  /** R2 key prefix with NO leading slash, e.g. `${projectId}/branches/${branch}`. */
-  realPrefix: string;
-  /** Absolute in-container path the workspace lives at, e.g. `/workspace`. */
-  mountPath: string;
-  /** Loud, non-throwing logger — a per-file failure must never crash boot. */
-  log: (message: string) => void;
-  /** Page size for `bucket.list()` pagination. Defaults to 1000 (R2's own ceiling). */
-  pageSize?: number;
-}
-
-export interface HydrateOutcome {
-  /** True iff the R2 listing itself completed AND every listed object was written locally. */
-  ok: boolean;
-  /** True iff the R2 listing completed (even if some individual files then failed to write). */
-  listOk: boolean;
-  filesWritten: number;
-  filesFailed: number;
-  /** True when the prefix had zero real objects (sentinel aside) — nothing to hydrate. */
-  emptyPrefix: boolean;
-}
-
-function dirnameOf(path: string): string {
-  const idx = path.lastIndexOf('/');
-  return idx <= 0 ? '/' : path.slice(0, idx);
-}
-
-/**
- * Download every object under `realPrefix` (except the seed sentinel) into
- * `mountPath` on local container disk. Never deletes, never lists R2 objects
- * outside the given prefix, and continues past individual file failures
- * (logging each loudly) rather than aborting the whole pass — a single
- * corrupt/oversized object must not block every other file from hydrating.
- */
-export async function hydrateWorkspaceFromR2(deps: HydrateDeps): Promise<HydrateOutcome> {
-  const { bucket, container, realPrefix, mountPath, log } = deps;
-  const pageSize = deps.pageSize ?? 1000;
-
-  // Prefix isolation is security-critical: each computer/project is a
-  // distinct R2 prefix, and `bucket.list({ prefix: '' })` matches the ENTIRE
-  // bucket — every other user's/project's files. This function must NEVER
-  // widen or default the prefix it was given; if it were ever called with an
-  // empty/falsy prefix, refuse outright rather than silently operating
-  // bucket-wide. (Callers are responsible for never passing one — this is a
-  // defense-in-depth backstop, not a fix for any known caller bug.)
-  if (!realPrefix) {
-    log('[hydrateWorkspaceFromR2] REFUSING to hydrate: realPrefix is empty — would list/read the ENTIRE bucket');
-    return { ok: false, listOk: false, filesWritten: 0, filesFailed: 0, emptyPrefix: false };
-  }
-
-  const sentinelKey = `${realPrefix}/${SEED_SENTINEL_FILENAME}`;
-  const heartbeatKey = `${realPrefix}/${WORKSPACE_HEARTBEAT_FILENAME}`;
-
-  let filesWritten = 0;
-  let filesFailed = 0;
-  let sawAnyObject = false;
-  let cursor: string | undefined;
-  let listOk = true;
-
-  do {
-    let page: HydrateR2ListResultLike;
-    try {
-      page = await bucket.list({ prefix: realPrefix, cursor, limit: pageSize });
-    } catch (err) {
-      log(
-        `[hydrateWorkspaceFromR2] R2 list FAILED (prefix=${realPrefix}, cursor=${cursor ?? '<start>'}): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      listOk = false;
-      break;
-    }
-
-    for (const object of page.objects) {
-      if (object.key === sentinelKey || object.key === heartbeatKey) continue; // internal bookkeeping only, never a real file
-      sawAnyObject = true;
-      // `realPrefix` is guaranteed non-empty (guarded above), so a key that
-      // does NOT start with `${realPrefix}/` cannot legitimately belong to
-      // this project/branch — skip it loudly rather than ever writing it
-      // somewhere under THIS workspace's local disk (would cross-contaminate
-      // one project's container with another's file path).
-      if (!object.key.startsWith(`${realPrefix}/`)) {
-        log(`[hydrateWorkspaceFromR2] SKIPPING out-of-prefix key from list() result: ${object.key} (expected prefix ${realPrefix}/)`);
-        continue;
-      }
-      const relPath = object.key.slice(realPrefix.length + 1);
-      if (!relPath) continue;
-
-      const targetPath = `${mountPath}/${relPath}`;
-      try {
-        const body = await bucket.get(object.key);
-        if (!body) {
-          // Deleted between list() and get() — not an error, just skip it this pass.
-          continue;
-        }
-        const bytes = new Uint8Array(await body.arrayBuffer());
-        const parentDir = dirnameOf(targetPath);
-        if (parentDir && parentDir !== mountPath) {
-          await container.mkdir(parentDir, { recursive: true });
-        }
-        await container.writeFile(targetPath, bytesToBase64(bytes), { encoding: 'base64' });
-        filesWritten++;
-      } catch (err) {
-        filesFailed++;
-        log(
-          `[hydrateWorkspaceFromR2] FAILED to hydrate key=${object.key} -> ${targetPath}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      }
-    }
-
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
-
-  return {
-    ok: listOk && filesFailed === 0,
-    listOk,
-    filesWritten,
-    filesFailed,
-    emptyPrefix: !sawAnyObject,
-  };
-}
-
-// ── Flush: local disk → R2 ───────────────────────────────────────────────────
-
-export interface FlushFileInfoLike {
-  name: string;
-  type: 'file' | 'directory' | 'symlink' | 'other';
-  size: number;
-  modifiedAt: string;
-}
-
-export interface FlushListFilesResultLike {
-  files: FlushFileInfoLike[];
-}
-
-export interface FlushReadFileResultLike {
-  content: string;
-  /** 'base64' for binary content, anything else (or absent) treated as UTF-8 text. */
-  encoding?: string;
-}
-
-/**
- * Minimal structural subset of the Sandbox SDK's own file RPCs. Note there is
- * no `deleteFile` here — flush never removes anything from local disk either.
- */
-export interface FlushContainerLike {
-  listFiles(path: string, options?: { recursive?: boolean; includeHidden?: boolean }): Promise<FlushListFilesResultLike>;
-  readFile(path: string, options?: { encoding?: string }): Promise<FlushReadFileResultLike>;
-  writeFile(path: string, content: string, options?: { encoding?: string }): Promise<unknown>;
+export interface FlushContainerLike extends HydrateContainerLike {
+  readFile(path: string, options?: { encoding?: string }): Promise<{ content: string; encoding?: string }>;
   exists(path: string): Promise<{ exists: boolean }>;
 }
-
-export interface FlushR2PutResultLike {
-  etag?: string;
-}
-
-/**
- * THE delete-hazard guardrail: this type is the ENTIRE R2 surface
- * `flushWorkspaceToR2` is given. It declares exactly one method. There is no
- * `delete`, no `list`, no `get` — the compiler itself is the proof that this
- * module cannot issue a delete (nor even discover what R2 currently holds).
- */
-export interface FlushR2BucketLike {
-  put(key: string, value: Uint8Array): Promise<FlushR2PutResultLike | null>;
-}
-
-export interface FlushManifestEntry {
-  size: number;
-  modifiedAt: string;
-}
-
-/** relPath -> last-flushed {size, modifiedAt}. */
-export type FlushManifest = Record<string, FlushManifestEntry>;
-
-export interface RelFileInfo {
-  relPath: string;
-  size: number;
-  modifiedAt: string;
-}
-
-/**
- * Directory-lister the walker needs — just the `listFiles` slice of
- * `FlushContainerLike`, so `walkWorkspaceTree` can be exercised in isolation
- * from read/write/exists with a narrower fake.
- */
-export type WalkFileInfoLike = FlushFileInfoLike;
-export type WalkListFilesResultLike = FlushListFilesResultLike;
-export type WalkContainerLike = Pick<FlushContainerLike, 'listFiles'>;
-
-export interface WalkResult {
-  files: RelFileInfo[];
-  skippedIgnoredDirs: number;
-  skippedUnsupported: number;
-}
-
-/**
- * Walk the workspace tree WITHOUT ever descending into an ignored directory
- * (`node_modules`, `.git`, ...) — a throughput requirement, not an
- * optimization: the Sandbox file RPCs have no server-side exclude-glob for
- * `listFiles`, so the only way to avoid enumerating a multi-thousand-file
- * `node_modules` tree is to never issue the recursive call in the first
- * place. Each directory is listed non-recursively; only entries whose name
- * is NOT in the ignore list are recursed into.
- */
-export async function walkWorkspaceTree(container: WalkContainerLike, mountPath: string): Promise<WalkResult> {
-  const files: RelFileInfo[] = [];
-  let skippedIgnoredDirs = 0;
-  let skippedUnsupported = 0;
-
-  // [absolutePath, relPathPrefix] queue — BFS, bounded by directory count, not
-  // total file count (ignored subtrees are never enqueued).
-  const queue: Array<{ absPath: string; relPrefix: string }> = [{ absPath: mountPath, relPrefix: '' }];
-  const MAX_DIRS = 200_000; // pathological-input guard, not a normal-case ceiling
-  let dirsVisited = 0;
-
-  while (queue.length > 0) {
-    const { absPath, relPrefix } = queue.shift()!;
-    dirsVisited++;
-    if (dirsVisited > MAX_DIRS) break;
-
-    const listing = await container.listFiles(absPath, { recursive: false, includeHidden: true });
-    for (const entry of listing.files) {
-      const relPath = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
-
-      if (entry.type === 'directory') {
-        if (isIgnoredDirName(entry.name)) {
-          skippedIgnoredDirs++;
-          continue;
-        }
-        queue.push({ absPath: `${absPath}/${entry.name}`, relPrefix: relPath });
-        continue;
-      }
-
-      if (entry.type !== 'file') {
-        // symlink/other: no well-defined "read bytes, base64, re-create"
-        // semantics here — skip rather than risk misreading a symlink target.
-        skippedUnsupported++;
-        continue;
-      }
-
-      if (RESERVED_ROOT_FILENAMES.includes(relPath)) continue; // our own bookkeeping, never flushed
-
-      files.push({ relPath, size: entry.size, modifiedAt: entry.modifiedAt });
-    }
-  }
-
-  return { files, skippedIgnoredDirs, skippedUnsupported };
-}
-
-export interface FlushPlan {
-  changed: RelFileInfo[];
-  unchangedCount: number;
-}
-
-/** Pure diff: a file is "changed" iff absent from the manifest or its size/modifiedAt differ. */
-export function computeFlushPlan(files: RelFileInfo[], manifest: FlushManifest): FlushPlan {
-  const changed: RelFileInfo[] = [];
-  let unchangedCount = 0;
-  for (const file of files) {
-    const prior = manifest[file.relPath];
-    if (prior && prior.size === file.size && prior.modifiedAt === file.modifiedAt) {
-      unchangedCount++;
-    } else {
-      changed.push(file);
-    }
-  }
-  return { changed, unchangedCount };
-}
-
-export interface FlushDeps {
-  container: FlushContainerLike;
-  bucket: FlushR2BucketLike;
-  /** Absolute in-container path the workspace lives at, e.g. `/workspace`. */
-  mountPath: string;
-  /** R2 key prefix with NO leading slash, e.g. `${projectId}/branches/${branch}`. */
-  realPrefix: string;
-  /** Last-known manifest (from a prior flush this container's lifetime). Not mutated. */
-  manifest: FlushManifest;
-  /**
-   * MUST be true or this function does nothing at all. Set by the caller from
-   * the recorded outcome of the most recent `hydrateWorkspaceFromR2` call —
-   * flushing a partially-hydrated (or never-hydrated) workspace risks
-   * uploading incomplete/inconsistent local state over good R2 content. See
-   * module doc — this is the "gate flush on hydration success" requirement.
-   */
-  hydrationComplete: boolean;
-  log: (message: string) => void;
-}
-
+// Retained for DO cache compatibility; never trusted to skip byte verification.
+export type FlushManifest = Record<string, { size: number; modifiedAt: string }>;
 export interface FlushOutcome {
   ok: boolean;
   uploaded: string[];
@@ -457,178 +69,268 @@ export interface FlushOutcome {
   skippedIgnored: number;
   skippedUnsupported: number;
   failed: Array<{ relPath: string; error: string }>;
-  /** Updated manifest the caller should persist for the next flush cycle. */
   manifest: FlushManifest;
-  /**
-   * `'flush_threw'` is never produced by `flushWorkspaceToR2` itself — it is
-   * the caller-side (`EzilSandboxDO.runWorkspaceFlush`) rendering of "this
-   * cycle raised instead of returning", so a thrown container RPC is reported
-   * as an ordinary FAILED outcome rather than escaping. See that method for
-   * why an escaping throw silently killed the periodic flush loop.
-   */
   skippedReason?: 'hydration_incomplete' | 'empty_prefix' | 'flush_threw';
-  /** True iff the `.ezil-heartbeat` liveness object was written this cycle (see `WORKSPACE_HEARTBEAT_FILENAME`). */
   heartbeatWritten: boolean;
+  checkpoint?: string;
 }
-
-/**
- * Upload every LOCAL file that changed since the last flush to R2, under the
- * SAME `${realPrefix}/${relPath}` key scheme `/project-files/*` writes with.
- *
- * STRICTLY ADDITIVE/UPDATING — see the module doc's "THE DELETE HAZARD"
- * section for why this function is structurally incapable of deleting
- * anything from R2 (`FlushR2BucketLike` has no delete-shaped method at all).
- */
-export async function flushWorkspaceToR2(deps: FlushDeps): Promise<FlushOutcome> {
-  const { container, bucket, mountPath, realPrefix, log } = deps;
-
-  // Prefix isolation is security-critical (each computer/project is a
-  // distinct R2 prefix). An empty `realPrefix` would make every uploaded key
-  // land at the BUCKET ROOT, indistinguishable from — and colliding with —
-  // every other computer/project that ever hit this same bug. Refuse
-  // outright rather than ever defaulting/widening. Checked BEFORE the
-  // hydration-complete gate: this is the more fundamental of the two safety
-  // conditions.
-  if (!realPrefix) {
-    log('[flushWorkspaceToR2] REFUSING to flush: realPrefix is empty — would write to the bucket root');
-    return {
-      ok: false,
-      uploaded: [],
-      skippedUnchanged: 0,
-      skippedIgnored: 0,
-      skippedUnsupported: 0,
-      failed: [],
-      manifest: deps.manifest,
-      skippedReason: 'empty_prefix',
-      heartbeatWritten: false,
-    };
-  }
-
-  if (!deps.hydrationComplete) {
-    log('[flushWorkspaceToR2] skipped: hydration not recorded complete for this workspace');
-    return {
-      ok: false,
-      uploaded: [],
-      skippedUnchanged: 0,
-      skippedIgnored: 0,
-      skippedUnsupported: 0,
-      failed: [],
-      manifest: deps.manifest,
-      skippedReason: 'hydration_incomplete',
-      heartbeatWritten: false,
-    };
-  }
-
-  const walk = await walkWorkspaceTree(container, mountPath);
-  const plan = computeFlushPlan(walk.files, deps.manifest);
-
-  const uploaded: string[] = [];
-  const failed: Array<{ relPath: string; error: string }> = [];
-  const newManifest: FlushManifest = {};
-
-  // Carry forward manifest entries for files that are unchanged AND still
-  // present (drops entries for files no longer present locally — a harmless
-  // cache cleanup; it never causes an R2 delete, it only affects whether a
-  // FUTURE reappearance of that relPath is treated as "changed").
-  for (const file of walk.files) {
-    const prior = deps.manifest[file.relPath];
-    if (prior && prior.size === file.size && prior.modifiedAt === file.modifiedAt) {
-      newManifest[file.relPath] = prior;
-    }
-  }
-
-  for (const file of plan.changed) {
-    const absPath = `${mountPath}/${file.relPath}`;
-    try {
-      const read = await container.readFile(absPath);
-      const bytes = read.encoding === 'base64' ? base64ToBytes(read.content) : new TextEncoder().encode(read.content);
-      const key = `${realPrefix}/${file.relPath}`;
-      await bucket.put(key, bytes);
-      uploaded.push(file.relPath);
-      newManifest[file.relPath] = { size: file.size, modifiedAt: file.modifiedAt };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      log(`[flushWorkspaceToR2] FAILED to upload relPath=${file.relPath}: ${message}`);
-      failed.push({ relPath: file.relPath, error: message });
-      // Deliberately NOT added to newManifest — a failed upload must be
-      // retried on the next cycle, not silently treated as "already synced".
-    }
-  }
-
-  // Unconditional liveness heartbeat — written on EVERY cycle that gets past
-  // the gates above, regardless of whether any real project file changed.
-  // See `WORKSPACE_HEARTBEAT_FILENAME`'s doc comment for why: a computer-list
-  // UI derives running/sleeping/off from R2 object recency, and a real-file
-  // no-op cycle (nothing edited) must still advance a timestamp somewhere
-  // under the prefix, or an idle-but-running computer would misreport as
-  // sleeping/off. Best-effort: a heartbeat failure is logged loudly but must
-  // not flip `ok` (that stays about file-upload/hydration correctness).
-  let heartbeatWritten = false;
-  try {
-    const heartbeatKey = `${realPrefix}/${WORKSPACE_HEARTBEAT_FILENAME}`;
-    await bucket.put(heartbeatKey, new TextEncoder().encode(new Date().toISOString()));
-    heartbeatWritten = true;
-  } catch (err) {
-    log(`[flushWorkspaceToR2] heartbeat write FAILED: ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  return {
-    ok: failed.length === 0,
-    uploaded,
-    skippedUnchanged: plan.unchangedCount,
-    skippedIgnored: walk.skippedIgnoredDirs,
-    skippedUnsupported: walk.skippedUnsupported,
-    failed,
-    manifest: newManifest,
-    heartbeatWritten,
-  };
+export interface HydrateOutcome {
+  ok: boolean;
+  listOk: boolean;
+  filesWritten: number;
+  filesFailed: number;
+  emptyPrefix: boolean;
 }
-
-// ── Hydrate-generation marker (local disk only, never uploaded to R2) ───────
-
-export interface HydrateMarker {
-  prefix: string;
+export interface HydrateDeps {
+  bucket: HydrateR2BucketLike;
+  container: HydrateContainerLike;
+  realPrefix: string;
   mountPath: string;
-  hydratedAt: string;
+  log: (message: string) => void;
+  pageSize?: number;
+}
+export interface FlushDeps {
+  container: FlushContainerLike;
+  bucket: FlushR2BucketLike;
+  mountPath: string;
+  realPrefix: string;
+  manifest: FlushManifest;
+  hydrationComplete: boolean;
+  log: (message: string) => void;
 }
 
+export function parseSnapshot(raw: string): Snapshot {
+  let s: Snapshot;
+  try { s = JSON.parse(raw) as Snapshot; }
+  catch { throw new Error('invalid workspace snapshot manifest'); }
+  if (!s || s.version !== SNAPSHOT_VERSION || !GENERATION.test(s.generation) || !HASH.test(s.sha256)
+    || (s.chunkGeneration !== undefined && !GENERATION.test(s.chunkGeneration))
+    || !Number.isInteger(s.entries) || s.entries < 0 || s.entries > MAX_ENTRIES
+    || !Array.isArray(s.chunks) || !s.chunks.length || s.chunks.length > MAX_CHUNKS
+    || s.chunks.some(c => !c || !HASH.test(c.sha256) || !Number.isInteger(c.size) || c.size <= 0 || c.size > SNAPSHOT_CHUNK_BYTES)) {
+    throw new Error('invalid workspace snapshot manifest');
+  }
+  return s;
+}
+function validPrefix(prefix: string): boolean {
+  return !!prefix && prefix.split('/').every(p => p && p !== '.' && p !== '..');
+}
+function safeRelative(path: string): boolean {
+  return !!path && !/[\\\x00-\x1f\x7f]/.test(path) && path.split('/').every(p => p && p !== '.' && p !== '..');
+}
+async function sha256(bytes: Uint8Array): Promise<string> {
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  return [...hash].map(b => b.toString(16).toLowerCase().padStart(2, '0')).join('');
+}
+async function readBounded(body: HydrateR2ObjectBodyLike, limit: number): Promise<Uint8Array> {
+  // R2ObjectBody always includes size. Refuse an unknown bound before buffering.
+  if (typeof body.size !== 'number' || !Number.isInteger(body.size) || body.size < 0 || body.size > limit) throw new Error('snapshot object too large');
+  const bytes = new Uint8Array(await body.arrayBuffer());
+  if (bytes.length > limit) throw new Error('snapshot object too large');
+  return bytes;
+}
+async function readHead(bucket: Pick<HydrateR2BucketLike, 'get'>, prefix: string) {
+  const body = await bucket.get(`${prefix}/${SNAPSHOT_HEAD}`);
+  if (!body) return null;
+  const snapshot = parseSnapshot(new TextDecoder().decode(await readBounded(body, 128 * 1024)));
+  if (!body.etag) throw new Error('snapshot manifest etag missing');
+  return { snapshot, etag: body.etag };
+}
+async function command(container: HydrateContainerLike, params: Record<string, unknown>) {
+  const result = await container.exec(snapshotCommand(params), { timeout: 120_000 });
+  if (result.exitCode !== 0) throw new Error(`workspace snapshot ${params.op} failed`);
+  return result.stdout;
+}
+function requireSdkSuccess(result: unknown): void {
+  if (result && typeof result === 'object' && 'success' in result && result.success === false) {
+    throw new Error('workspace file operation failed');
+  }
+}
+function chunkKey(prefix: string, generation: string, index: number): string {
+  return `${prefix}/.ezil-snapshots/${generation}/${index}`;
+}
+
+export async function flushWorkspaceToR2(deps: FlushDeps): Promise<FlushOutcome> {
+  const { bucket, container, mountPath: root, realPrefix: prefix, log } = deps;
+  const outcome: FlushOutcome = { ok: false, uploaded: [], skippedUnchanged: 0,
+    skippedIgnored: 0, skippedUnsupported: 0, failed: [], manifest: {}, heartbeatWritten: false };
+  if (!validPrefix(prefix)) return { ...outcome, skippedReason: 'empty_prefix' };
+  if (!deps.hydrationComplete) return { ...outcome, skippedReason: 'hydration_incomplete' };
+  const generation = crypto.randomUUID();
+  const work = `/tmp/ezil-snapshot-${generation}`;
+  try {
+    // Read before capture: CAS rejects another container publishing in between.
+    const previous = await readHead(bucket, prefix);
+    const expected = previous?.snapshot.generation ?? null;
+    const raw = await command(container, { op: 'capture', root, work, prefix, expected });
+    const snapshot = parseSnapshot(JSON.stringify({ ...JSON.parse(raw), version: SNAPSHOT_VERSION, generation }));
+    if (previous?.snapshot.sha256 !== snapshot.sha256) {
+      for (const [i, c] of snapshot.chunks.entries()) {
+        const file = await container.readFile(`${work}/${i}`, { encoding: 'base64' });
+        if (file.encoding !== 'base64') throw new Error('snapshot chunk encoding missing');
+        const bytes = base64ToBytes(file.content);
+        if (bytes.length !== c.size || await sha256(bytes) !== c.sha256) throw new Error('corrupt snapshot chunk');
+        const key = chunkKey(prefix, generation, i);
+        if (!await bucket.put(key, bytes)) throw new Error('snapshot chunk upload rejected');
+        outcome.uploaded.push(key);
+      }
+    } else {
+      // Immutable keys may still have been deleted/corrupted externally. A
+      // no-op must confirm durable bytes, not just trust the manifest hash.
+      for (const [i, c] of previous.snapshot.chunks.entries()) {
+        const body = await bucket.get(chunkKey(prefix, previous.snapshot.chunkGeneration ?? previous.snapshot.generation, i));
+        if (!body) throw new Error('snapshot chunk missing');
+        const bytes = await readBounded(body, SNAPSHOT_CHUNK_BYTES);
+        if (bytes.length !== c.size || await sha256(bytes) !== c.sha256) throw new Error('corrupt snapshot chunk');
+      }
+      outcome.skippedUnchanged = snapshot.entries;
+    }
+    // Re-read the tree, including contents/modes/Git index, after network I/O.
+    await command(container, { op: 'verify', root, work, prefix, expected, sha256: snapshot.sha256 });
+    // Even a no-op checkpoint uses CAS: it must not confirm a stale head.
+    const committed = previous?.snapshot.sha256 === snapshot.sha256
+      ? { ...snapshot, chunkGeneration: previous.snapshot.chunkGeneration ?? previous.snapshot.generation }
+      : snapshot;
+    const put = await bucket.put(`${prefix}/${SNAPSHOT_HEAD}`, encoder.encode(JSON.stringify(committed)), {
+      onlyIf: previous ? { etagMatches: previous.etag } : { etagDoesNotMatch: '*' },
+    });
+    if (!put) throw new Error('workspace checkpoint conflict');
+    await command(container, { op: 'confirm', root, work, prefix, expected, generation: committed.generation });
+    outcome.checkpoint = committed.generation;
+    outcome.ok = true;
+    try {
+      outcome.heartbeatWritten = !!await bucket.put(`${prefix}/${WORKSPACE_HEARTBEAT_FILENAME}`, encoder.encode(new Date().toISOString()));
+    } catch { log('[workspace-persist] heartbeat failed after committed checkpoint'); }
+  } catch {
+    // SDK/R2 errors and malformed JSON can contain file bytes or credentials.
+    const error = 'workspace checkpoint failed';
+    log(`[workspace-persist] ${error}`);
+    outcome.failed.push({ relPath: SNAPSHOT_HEAD, error });
+  } finally {
+    try { await command(container, { op: 'cleanup', root, work }); }
+    catch { log('[workspace-persist] snapshot staging cleanup failed'); }
+  }
+  return outcome;
+}
+
+export async function hydrateWorkspaceFromR2(deps: HydrateDeps): Promise<HydrateOutcome> {
+  const { bucket, container, mountPath: root, realPrefix: prefix, log } = deps;
+  const outcome: HydrateOutcome = { ok: false, listOk: false, filesWritten: 0, filesFailed: 0, emptyPrefix: false };
+  if (!validPrefix(prefix)) return outcome;
+  const work = `/tmp/ezil-snapshot-${crypto.randomUUID()}`;
+  const marker: HydrateMarker = { version: 1, prefix, mountPath: root, hydratedAt: new Date().toISOString() };
+  try {
+    const head = await readHead(bucket, prefix);
+    if (head) {
+      await container.mkdir(work, { recursive: false });
+      for (const [i, c] of head.snapshot.chunks.entries()) {
+        const body = await bucket.get(chunkKey(prefix, head.snapshot.chunkGeneration ?? head.snapshot.generation, i));
+        if (!body) throw new Error('snapshot chunk missing');
+        const bytes = await readBounded(body, SNAPSHOT_CHUNK_BYTES);
+        if (bytes.length !== c.size || await sha256(bytes) !== c.sha256) throw new Error('snapshot chunk corrupt');
+        requireSdkSuccess(await container.writeFile(`${work}/${i}`, bytesToBase64(bytes), { encoding: 'base64' }));
+      }
+      if ((await readHead(bucket, prefix))?.etag !== head.etag) throw new Error('workspace checkpoint changed');
+      await command(container, { op: 'restore', root, work, snapshot: head.snapshot,
+        marker: { ...marker, checkpoint: head.snapshot.generation } });
+      if ((await readHead(bucket, prefix))?.etag !== head.etag) throw new Error('workspace checkpoint changed');
+      return { ...outcome, ok: true, listOk: true, filesWritten: head.snapshot.entries };
+    }
+    // One-time legacy import. Never merge loose keys into a committed snapshot.
+    // A sentinel without content, incomplete pagination, or orphan snapshot
+    // chunks is not proof of an empty workspace and must not authorize a seed.
+    const keys: string[] = [];
+    const seenKeys = new Set<string>();
+    const cursors = new Set<string>();
+    let cursor: string | undefined;
+    let bookkeeping = false;
+    do {
+      const page = await bucket.list({ prefix: `${prefix}/`, cursor, limit: deps.pageSize ?? 1000 });
+      for (const object of page.objects) {
+        if (!object.key.startsWith(`${prefix}/`)) throw new Error('out-of-prefix object');
+        const rel = object.key.slice(prefix.length + 1);
+        if (!safeRelative(rel)) throw new Error('unsafe legacy path');
+        if (rel.startsWith('.ezil-snapshots/')) throw new Error('uncommitted snapshot');
+        if ([SEED_SENTINEL_FILENAME, WORKSPACE_HEARTBEAT_FILENAME].includes(rel)) { bookkeeping = true; continue; }
+        if ([HYDRATE_MARKER_FILENAME, FLUSH_MANIFEST_FILENAME].includes(rel.split('/')[0])) throw new Error('reserved legacy path');
+        if (seenKeys.has(rel) || keys.length >= MAX_ENTRIES) throw new Error('invalid legacy listing');
+        seenKeys.add(rel);
+        keys.push(rel);
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+      if (page.truncated && (!cursor || cursors.has(cursor))) throw new Error('incomplete legacy listing');
+      if (cursor) cursors.add(cursor);
+    } while (cursor);
+    outcome.listOk = true;
+    if (!keys.length) {
+      if (bookkeeping) throw new Error('workspace initialization incomplete');
+      return { ...outcome, ok: true, emptyPrefix: true };
+    }
+    const stage = `${root}.ezil-legacy-${work.slice('/tmp/ezil-snapshot-'.length)}`;
+    await container.mkdir(work, { recursive: false });
+    await container.mkdir(stage, { recursive: false });
+    let total = 0;
+    const versions = new Map<string, string>();
+    try {
+      for (const rel of keys) {
+        const body = await bucket.get(`${prefix}/${rel}`);
+        if (!body) throw new Error('legacy object disappeared');
+        if (!body.etag) throw new Error('legacy version missing');
+        versions.set(rel, body.etag);
+        const bytes = await readBounded(body, 8 * SNAPSHOT_CHUNK_BYTES);
+        total += bytes.length;
+        if (total > MAX_CHUNKS * SNAPSHOT_CHUNK_BYTES) throw new Error('legacy workspace too large');
+        const parent = rel.lastIndexOf('/');
+        if (parent !== -1) await container.mkdir(`${stage}/${rel.slice(0, parent)}`, { recursive: true });
+        requireSdkSuccess(await container.writeFile(`${stage}/${rel}`, bytesToBase64(bytes), { encoding: 'base64' }));
+      }
+      // Legacy storage has no atomic manifest. Refuse a changed listing or
+      // changed object rather than publish an import known to be stale.
+      const remaining = new Set(keys);
+      let checkCursor: string | undefined;
+      const checkedCursors = new Set<string>();
+      do {
+        const page = await bucket.list({ prefix: `${prefix}/`, cursor: checkCursor, limit: deps.pageSize ?? 1000 });
+        for (const object of page.objects) {
+          if (!object.key.startsWith(`${prefix}/`)) throw new Error('out-of-prefix object');
+          const rel = object.key.slice(prefix.length + 1);
+          if ([SEED_SENTINEL_FILENAME, WORKSPACE_HEARTBEAT_FILENAME].includes(rel)) continue;
+          if (!remaining.delete(rel)) throw new Error('legacy workspace changed');
+          const body = await bucket.get(object.key);
+          if (!body || body.etag !== versions.get(rel)) throw new Error('legacy workspace changed');
+          await readBounded(body, 8 * SNAPSHOT_CHUNK_BYTES);
+        }
+        checkCursor = page.truncated ? page.cursor : undefined;
+        if (page.truncated && (!checkCursor || checkedCursors.has(checkCursor))) throw new Error('incomplete legacy listing');
+        if (checkCursor) checkedCursors.add(checkCursor);
+      } while (checkCursor);
+      if (remaining.size) throw new Error('legacy workspace changed');
+      requireSdkSuccess(await container.writeFile(`${stage}/${HYDRATE_MARKER_FILENAME}`, serializeHydrateMarker(marker)));
+      if (await readHead(bucket, prefix)) throw new Error('workspace checkpoint changed');
+      await command(container, { op: 'adopt', root, work, stage });
+      outcome.filesWritten = keys.length;
+      outcome.ok = true;
+    } finally {
+      await command(container, { op: 'cleanup-legacy', root, work, stage });
+    }
+  } catch {
+    outcome.ok = false;
+    outcome.filesFailed++;
+    log('[workspace-persist] hydrate failed');
+  } finally {
+    try { await command(container, { op: 'cleanup', root, work }); }
+    catch { log('[workspace-persist] restore staging cleanup failed'); }
+  }
+  return outcome;
+}
+export interface HydrateMarker { version: 1; prefix: string; mountPath: string; hydratedAt: string; checkpoint?: string }
 export function parseHydrateMarker(raw: string): HydrateMarker | null {
   try {
-    const parsed = JSON.parse(raw) as Partial<HydrateMarker>;
-    if (typeof parsed.prefix === 'string' && typeof parsed.mountPath === 'string' && typeof parsed.hydratedAt === 'string') {
-      return { prefix: parsed.prefix, mountPath: parsed.mountPath, hydratedAt: parsed.hydratedAt };
-    }
-    return null;
-  } catch {
-    return null;
-  }
+    const m = JSON.parse(raw) as HydrateMarker;
+    return m?.version === 1 && typeof m.prefix === 'string' && typeof m.mountPath === 'string'
+      && typeof m.hydratedAt === 'string' ? m : null;
+  } catch { return null; }
 }
-
-export function serializeHydrateMarker(marker: HydrateMarker): string {
-  return JSON.stringify(marker);
-}
-
-// ── Flush manifest (de)serialization (local disk cache, never uploaded) ─────
-
-export function parseFlushManifest(raw: string): FlushManifest {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      const out: FlushManifest = {};
-      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-        const entry = value as Partial<FlushManifestEntry> | undefined;
-        if (entry && typeof entry.size === 'number' && typeof entry.modifiedAt === 'string') {
-          out[key] = { size: entry.size, modifiedAt: entry.modifiedAt };
-        }
-      }
-      return out;
-    }
-    return {};
-  } catch {
-    return {};
-  }
-}
-
-export function serializeFlushManifest(manifest: FlushManifest): string {
-  return JSON.stringify(manifest);
-}
+export function serializeHydrateMarker(marker: HydrateMarker): string { return JSON.stringify(marker); }
+export function parseFlushManifest(_raw: string): FlushManifest { return {}; }
+export function serializeFlushManifest(_manifest: FlushManifest): string { return '{}'; }

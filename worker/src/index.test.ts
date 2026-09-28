@@ -736,12 +736,13 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
   // that `ensureWorkspaceHydratedFromR2` actually WIRES it in, unconditionally,
   // inside the `if (hydrateOk)` block, so both the seeded-new-workspace path
   // and the hydrated-existing-workspace path both reach it.
-  it('runs buildEnsureTurbopackConfigCommand unconditionally inside `if (hydrateOk)`, covering BOTH the seed and hydrate-existing paths', async () => {
+  it('only applies template conveniences to new workspaces, preserving restored Git state', async () => {
     const src = readWorkerSource('./index.ts');
     const hydrateOkMatch = src.match(/if \(hydrateOk\) \{[\s\S]*?\n {2}\}\n\n {2}await recordHydrationOutcome/);
     expect(hydrateOkMatch).not.toBeNull();
     const body = hydrateOkMatch![0];
-    expect(body).toContain('await sandbox.exec(buildEnsureTurbopackConfigCommand(mountPath));');
+    expect(body).toContain("hydrateDetail === 'seeded'");
+    expect(body).toContain('await sandbox.exec(buildEnsureTurbopackConfigCommand(mountPath))');
     expect(body).toContain('parseTurbopackConfigOutcome(turbopackResult.stdout)');
   });
 
@@ -790,24 +791,16 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
 
   it('flush is invoked explicitly before/around the preview response, and before destroy inside terminateSandbox', async () => {
     const src = readWorkerSource('./index.ts');
-    // handlePreview's pre-handoff flush is still a Worker-side RPC — started
-    // unconditionally exactly once. z2-mint-latency: no longer awaited
-    // inline unconditionally (measured 441-754ms on a WARM call, paid before
-    // the response with zero benefit to it — see the call site's own doc
-    // comment) — it is handed to `ctx.waitUntil()` when available, with an
-    // inline `await` fallback for callers with no `ExecutionContext`, proven
-    // both ways in `route-auth.test.ts`'s "pre-handoff flush deferral" suite.
-    expect(src).toContain('const flushOutcome = sandbox.flushWorkspaceNow().catch(');
-    const callSites = [...src.matchAll(/sandbox\.flushWorkspaceNow\(\)/g)];
-    expect(callSites.length).toBe(1); // handlePreview (pre-handoff) only
-    expect(src).toContain('ctx.waitUntil(flushOutcome);');
-    expect(src).toContain('await flushOutcome;');
+    // Executed route tests also prove readiness remains pending until success.
+    expect(src.includes('const checkpoint = await sandbox.flushWorkspaceNow().catch(')).toBe(true);
+    expect([...src.matchAll(/sandbox\.flushWorkspaceNow\(\)/g)].length).toBe(1);
+    expect(src.includes("return json({ ok: false, error: 'workspace_checkpoint_failed' }, 503);")).toBe(true);
 
     // Terminate's pre-destroy flush moved INSIDE the DO (`terminateSandbox`),
     // where `ctx.container.running` is readable, and is now conditional on a
     // container actually being up: flushing a sleeping sandbox would cold-boot
     // it (~20s) purely in order to kill it again.
-    const terminateBody = src.match(/async terminateSandbox\(\)[\s\S]*?\n  \}/)?.[0] ?? '';
+    const terminateBody = src.match(/async terminateSandboxWithCheckpoint\(\)[\s\S]*?\n  \}/)?.[0] ?? '';
     expect(terminateBody).not.toBe('');
     expect(terminateBody).toContain('const wasRunning = this.containerIsRunning();');
     expect(terminateBody).toContain('if (wasRunning) {');
