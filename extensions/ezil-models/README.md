@@ -56,8 +56,14 @@ covering every provider type: [`examples/models.example.json`](examples/models.e
 - `apiKey`, `baseUrl`, `resource`, `apiVersion` and `headers` values may be literals, **`{env:NAME}`** or
   **`{file:/path}`** (absolute path recommended; a relative one resolves against the extension host's cwd; the file's
   content is trimmed); references are resolved when the file loads. Resolved secrets are redacted from every log line.
+  A provider whose reference cannot be resolved (variable not set, file missing or empty) is **skipped**: its models
+  are not served, one warning per provider naming the variable/path (never a value) goes to the *EZiL Models* output
+  channel and **Manage**, and every other provider keeps working — so one file can list keys you do not all have.
+  Likewise an invalid provider or model entry is reported and dropped while the rest of the file is served; only a
+  file that is not JSON or has no `providers`/`models` fails as a whole.
   While the file is being edited and is momentarily invalid, the previously loaded models stay available and the
   error is shown in **EZiL Models: Manage**.
+- `$comment` (a string) is allowed at every object level and ignored.
 - `models[].id` is what VS Code sees (unique, case-insensitive); `models[].model` is the provider model id or the
   Azure deployment name. `family` defaults to `claude` / `gpt`.
 - `maxInputTokens` (default 200000) is the budget VS Code enforces before sending — set 1000000 only for models
@@ -195,10 +201,10 @@ provider behind the bundled Copilot Chat panel, revision 2 of the image:
   `foundry-openai` (both `{env:AZURE_RESOURCE_NAME}` + `{env:AZURE_API_KEY}`) and `openai`
   (`{env:OPENAI_API_KEY}`), and models `claude-opus-5-5` (default, plan), `claude-sonnet-5`, `claude-fable-5-1`,
   `claude-haiku-4-5` (utility), a Foundry Claude deployment and example Foundry / OpenAI GPT deployments. A build
-  gate rejects any literal key. **Set the variables on the container and the models appear**; because the file is
-  validated as a whole, a variable that is *not* set makes the extension serve no models and name the variable in
-  the *EZiL Models* output channel — point `EZIL_MODELS_CONFIG` at a smaller file (or remove that provider and its
-  models) if you only have some of the keys.
+  gate rejects any literal key. **Set the variables on the container and the models appear**: each provider whose
+  variables are set is served, each one whose variables are *not* set is skipped with one warning naming the
+  variable in the *EZiL Models* output channel (set only `ANTHROPIC_API_KEY` and exactly the four Claude models
+  appear). Point `EZIL_MODELS_CONFIG` at another file to ship a different set.
 - **Settings.** `worker/scripts/start-neko.sh` (and `start-codeserver.sh`) write `<user-data-dir>/Machine/settings.json`
   on every boot with `chat.allowAnonymousAccess: true`, `chat.byokUtilityModelDefault: "mainAgent"`,
   `chat.titleBar.signIn.enabled: false`, `chat.welcomePage.signIn.enabled: false`, `github.copilot.enable: {"*": false}`

@@ -137,6 +137,30 @@ describe('ConfigStore', () => {
         expect(await until(() => store.models().length === 2)).toBe(true);
         store.dispose();
     });
+
+    test('a provider whose variable is not set is skipped with a warning; the file still loads and the other models are served', () => {
+        const file = path.join(root, 'partial', 'models.json');
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, JSON.stringify({
+            providers: { p: { type: 'openai', apiKey: 'sk-abc-12345' }, q: { type: 'anthropic', apiKey: '{env:EZIL_TEST_UNSET_KEY}' } },
+            models: [{ id: 'm', provider: 'p', model: 'gpt-5.5' }, { id: 'c', provider: 'q', model: 'claude-sonnet-5' }, { id: 'bad', provider: 'p', model: 'x', roles: ['boss'] }],
+        }));
+        const logs: string[] = [];
+        const store = new ConfigStore(file, line => logs.push(line));
+        expect(store.load()).toBe(true); // not an error: the file is usable
+        expect(store.error()).toBeUndefined();
+        expect(store.models().map(model => model.id)).toEqual(['m']);
+        expect(store.problems()).toEqual([
+            'providers.q skipped (1 model(s) not served): apiKey: environment variable EZIL_TEST_UNSET_KEY is not set',
+            'models[2].roles must be an array of default, plan, utility, utilitySmall',
+        ]);
+        const loaded = logs.at(-1)!;
+        expect(loaded).toContain('1 model(s), 2 entries not served');
+        expect(loaded).toContain('warning: providers.q skipped');
+        expect(loaded).toContain('EZIL_TEST_UNSET_KEY');
+        expect(loaded).not.toContain('sk-abc-12345');
+        store.dispose();
+    });
 });
 
 test('resolveConfigPath: env wins over the setting, the setting over the default', () => {

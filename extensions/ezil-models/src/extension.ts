@@ -34,7 +34,10 @@ export class ConfigStore implements vscode.Disposable {
     get path(): string { return this.configPath; }
     models(): ResolvedModel[] { return this.current?.models ?? []; }
     secrets(): string[] { return this.current?.secrets ?? []; }
+    /** Why the file as a whole could not be loaded (unreadable, not JSON, no providers/models). */
     error(): string | undefined { return this.lastError; }
+    /** Entries of the loaded file that are not served: providers whose secret is not set (warnings) and invalid entries (errors). */
+    problems(): string[] { return this.current ? [...this.current.warnings, ...this.current.errors] : []; }
     onChange(listener: () => void): vscode.Disposable { this.listeners.add(listener); return { dispose: () => this.listeners.delete(listener) }; }
 
     setPath(configPath: string): void {
@@ -54,7 +57,7 @@ export class ConfigStore implements vscode.Disposable {
             this.lastText = text;
             this.current = parseModelsConfig(text, { source: this.configPath });
             this.lastError = undefined;
-            this.log(`[config] loaded ${this.configPath}\n${describeConfig(this.current)}`);
+            this.log(`[config] loaded ${this.configPath}: ${this.current.models.length} model(s)${this.problems().length ? `, ${this.problems().length} entr${this.problems().length === 1 ? 'y' : 'ies'} not served (see below)` : ''}\n${describeConfig(this.current)}`);
             if (!this.watcher) this.watch(); // the directory may not have existed when watching was first attempted
         } catch (error) {
             if (!(error instanceof ConfigError)) this.lastText = undefined;
@@ -179,7 +182,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     };
     const reload = () => {
         const ok = store.load();
-        void (ok ? vscode.window.showInformationMessage(`EZiL Models: loaded ${store.models().length} model(s) from ${store.path}.`) : vscode.window.showErrorMessage(`EZiL Models: ${store.error()}`, 'Show output').then(choice => { if (choice) output.show(); }));
+        const problems = store.problems().length;
+        void (ok
+            ? problems
+                ? vscode.window.showWarningMessage(`EZiL Models: loaded ${store.models().length} model(s) from ${store.path}; ${problems} entr${problems === 1 ? 'y is' : 'ies are'} not served.`, 'Show output').then(choice => { if (choice) output.show(); })
+                : vscode.window.showInformationMessage(`EZiL Models: loaded ${store.models().length} model(s) from ${store.path}.`)
+            : vscode.window.showErrorMessage(`EZiL Models: ${store.error()}`, 'Show output').then(choice => { if (choice) output.show(); }));
     };
     const showUsage = () => { log(`[usage report]\n${usage.report()}`); output.show(); };
     const manage = async () => {
@@ -191,6 +199,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             { label: '$(clippy) Copy settings snippet', description: 'chat.defaultModel / plan / utility for the configured roles', action: async () => { await vscode.env.clipboard.writeText(JSON.stringify(settingsSnippet(store.models()), null, 2)); void vscode.window.showInformationMessage('EZiL Models: settings snippet copied to the clipboard.'); } },
         ];
         if (store.error()) items.push({ label: '$(error) Config error', detail: store.error(), action: () => output.show() });
+        for (const problem of store.problems()) items.push({ label: `$(warning) ${problem.startsWith('providers.') && problem.includes(' skipped ') ? 'Provider skipped' : 'Invalid entry'}`, detail: problem, action: () => output.show() });
         if (store.models().length) items.push({ label: 'Models', kind: vscode.QuickPickItemKind.Separator });
         for (const model of store.models()) {
             items.push({
