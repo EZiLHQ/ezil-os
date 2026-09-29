@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Boot the desktop image the way local mode does, prove the EZiL Chat contract
-# on it, then boot it again as a RETURNING user and prove it still holds.
+# Boot the desktop image the way local mode does, prove the EZiL Chat (OpenCode
+# panel) contract on it, then boot it again as a RETURNING user and prove it
+# still holds. Since image revision 2 the panel is installed but DORMANT next
+# to the bundled Copilot Chat (which e2e/copilot-ezil-image.sh covers); the
+# browser half opens it explicitly.
 #
-#   e2e/ezil-chat-image.sh [image=ezil-desktop:ezil-chat]
+#   e2e/ezil-chat-image.sh [image=ezil-desktop:rev2]
 #
 # Needs: docker, node, a Playwright install (PLAYWRIGHT_REQUIRE_DIR — a
 # node_modules containing `playwright` with chromium downloaded; set
@@ -12,11 +15,13 @@
 # container-checks.txt with the in-image facts.
 #
 # Pass 1 — FRESH user. Empty workspace. In-container facts first (no browser):
-#   * `ls lib/vscode/extensions` has no copilot; ezil-chat is there
+#   * `ls lib/vscode/extensions` has ezil-chat (and, since revision 2, copilot
+#     and ezil-models — kept on purpose)
 #   * `code-server --list-extensions` (built-ins are NOT listed there — it
 #     walks the user --extensions-dir; printed for the record, not asserted)
 #   * `opencode --version` is the pinned version
-#   * Machine/settings.json was written by start-neko.sh
+#   * Machine/settings.json was written by start-neko.sh (panel dormant:
+#     ezilChat.autoStart / revealOnStartup false)
 # Then the mock provider (e2e/ezil-chat-mock-provider.mjs) is started INSIDE
 # the container with the image's node, a project-level opencode.json in the
 # workspace points OpenCode at it (the free `opencode` Zen provider is
@@ -24,17 +29,16 @@
 # browser through a full prompt.
 #
 # Pass 2 — RETURNING user. The same workspace now carries `.ezil/settings.json`
-# with `chat.disableAIFeatures: false` and `.ezil/extensions.txt` naming
-# `GitHub.copilot-chat` (what start-neko.sh's editor-state capture would have
-# saved for someone who used Copilot before), AND a pre-populated
-# --user-data-dir (/tmp/code-server-data) whose User/settings.json also says
-# `chat.disableAIFeatures: false` — the user setting that would mask the
-# extension's configurationDefaults. The panel must still be there and
-# Copilot must still be absent (Machine settings outrank User settings; the
-# extension is a built-in, so no manifest restore can touch it). Prompt skipped.
+# with `ezilChat.autoStart: true`, `ezilChat.revealOnStartup: true` and a
+# hidden secondary sidebar (a user trying to bring the old behaviour back) and
+# `.ezil/extensions.txt` naming `GitHub.copilot-chat`, AND a pre-populated
+# --user-data-dir (/tmp/code-server-data) whose User/settings.json says the
+# same. Machine settings outrank User settings, so the sidebar must still be
+# visible and the panel still dormant-until-opened, and the built-in must
+# still be there (no manifest restore can touch it). Prompt skipped.
 set -euo pipefail
 
-IMAGE="${1:-${EZIL_CHAT_E2E_IMAGE:-ezil-desktop:ezil-chat}}"
+IMAGE="${1:-${EZIL_CHAT_E2E_IMAGE:-ezil-desktop:rev2}}"
 OUT="$(mkdir -p "${EZIL_CHAT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_CHAT_E2E_OUT:-./ezil-e2e-out}" && pwd)"
 HOST_PORT="${EZIL_CHAT_E2E_PORT:-8443}"
 MOCK_PORT=4141
@@ -93,7 +97,7 @@ container_checks() { # container_checks <report-file>
   local ok=1
   {
     echo "== code-server --version"; inx 'code-server --version 2>/dev/null | head -1'
-    echo "== lib/vscode/extensions (copilot must be absent, ezil-chat present)"
+    echo "== lib/vscode/extensions (ezil-chat present; copilot + ezil-models kept since revision 2)"
     inx 'ls /usr/lib/code-server/lib/vscode/extensions | grep -i -E "copilot|ezil" || true'
     echo "== product.json defaultChatAgent present?"; inx 'grep -c defaultChatAgent /usr/lib/code-server/lib/vscode/product.json || true'
     echo "== code-server --list-extensions (user dir; built-ins are not listed here)"
@@ -103,11 +107,9 @@ container_checks() { # container_checks <report-file>
     echo "== Machine/settings.json"; inx 'cat /tmp/code-server-data/Machine/settings.json'
     echo "== User/settings.json"; inx 'cat /tmp/code-server-data/User/settings.json'
   } 2>&1 | tee "$rep"
-  inx 'test ! -e /usr/lib/code-server/lib/vscode/extensions/copilot' && echo "PASS  no copilot built-in dir" || { echo "FAIL  copilot built-in dir present"; ok=0; }
-  inx '! ls /usr/lib/code-server/lib/vscode/extensions | grep -qi copilot' && echo "PASS  nothing named copilot among built-ins" || { echo "FAIL  something named copilot among built-ins"; ok=0; }
   inx 'test -f /usr/lib/code-server/lib/vscode/extensions/ezil-chat/package.json' && echo "PASS  ezil-chat built-in present" || { echo "FAIL  ezil-chat built-in missing"; ok=0; }
-  inx '! grep -q defaultChatAgent /usr/lib/code-server/lib/vscode/product.json' && echo "PASS  product.json has no defaultChatAgent" || { echo "FAIL  product.json still has defaultChatAgent"; ok=0; }
-  inx 'grep -q "\"chat.disableAIFeatures\": true" /tmp/code-server-data/Machine/settings.json' && echo "PASS  Machine settings disable built-in AI chat" || { echo "FAIL  Machine settings missing" ; ok=0; }
+  inx 'test -f /usr/lib/code-server/lib/vscode/extensions/copilot/package.json && test -f /usr/lib/code-server/lib/vscode/extensions/ezil-models/package.json' && echo "PASS  copilot-chat + ezil-models built-ins present (revision 2 keeps them)" || { echo "FAIL  copilot-chat or ezil-models built-in missing"; ok=0; }
+  inx 'grep -q "\"ezilChat.revealOnStartup\": false" /tmp/code-server-data/Machine/settings.json && grep -q "\"ezilChat.autoStart\": false" /tmp/code-server-data/Machine/settings.json' && echo "PASS  Machine settings keep the panel dormant" || { echo "FAIL  Machine settings missing the ezilChat keys" ; ok=0; }
   [[ "$(inx 'opencode --version' | tr -d '\r')" == "opencode v"* ]] && echo "PASS  opencode on PATH: $(inx 'opencode --version')" || { echo "FAIL  opencode --version"; ok=0; }
   [[ $ok == 1 ]]
 }
@@ -154,7 +156,7 @@ echo "[e2e] pass 2 — returning user with restored .ezil/ state and a masking U
 ST2="$WORK/returning"; WS2="$ST2/home/neko/project"; mkdir -p "$WS2/.ezil"
 cp "$WS1/opencode.json" "$WS2/opencode.json"
 cat >"$WS2/.ezil/settings.json" <<'EOF'
-{ "security.workspace.trust.enabled": false, "chat.disableAIFeatures": false, "workbench.secondarySideBar.defaultVisibility": "hidden", "editor.fontSize": 15 }
+{ "security.workspace.trust.enabled": false, "ezilChat.autoStart": true, "ezilChat.revealOnStartup": true, "workbench.secondarySideBar.defaultVisibility": "hidden", "editor.fontSize": 15 }
 EOF
 printf 'GitHub.copilot-chat\nGitHub.copilot\n' >"$WS2/.ezil/extensions.txt"
 UD2="$ST2/tmp/code-server-data"; mkdir -p "$UD2/User"

@@ -1,25 +1,26 @@
 /**
- * EZiL Chat image e2e — does the SHIPPED desktop image put EZiL Chat, and
- * nothing Copilot, in front of a user?
+ * EZiL Chat (OpenCode panel) image e2e — does the SHIPPED desktop image still
+ * carry a working EZiL Chat panel next to the bundled Copilot Chat?
  *
- * Runs against a code-server that `e2e/ezil-chat-image.sh` has already
- * started from the image (or any code-server URL you point it at). It drives
- * a real Chromium, because the three things it proves are only visible in the
- * rendered workbench, not in any file in the image:
+ * Since image revision 2 the panel is INSTALLED BUT DORMANT: the secondary
+ * sidebar opens on the Chat view (Copilot Chat on EZiL models — proven by
+ * e2e/copilot-ezil.mjs), and `ezilChat.autoStart` / `ezilChat.revealOnStartup`
+ * are false in the Machine settings. This suite therefore opens the panel the
+ * way a user would (click its "EZiL" tab; palette fallback) and proves,
+ * in a real Chromium, what is only visible in the rendered workbench:
  *
- *   1. The secondary sidebar opens by itself and holds the "EZiL" container
- *      with the EZiL Chat webview (extension baked in as a built-in, Machine
- *      settings `workbench.secondarySideBar.defaultVisibility: visible`).
- *   2. Nothing Copilot: no element whose aria-label/title mentions Copilot,
- *      no "Chat" command-center button in the title bar, no built-in chat
- *      view (`chat.disableAIFeatures` + the deleted `copilot` built-in +
- *      the stripped `product.json#defaultChatAgent`).
+ *   1. The secondary sidebar is visible by default and the Chat view — not
+ *      EZiL Chat — is what it opened on (recorded), i.e. the panel did not
+ *      steal the sidebar.
+ *   2. After opening it, the "EZiL" container is active and the EZiL Chat
+ *      webview mounts (extension baked in as a built-in).
  *   3. (unless EZIL_CHAT_E2E_PROMPT=0) A prompt typed into the panel comes
  *      back rendered as an assistant message, and the per-turn token readout
- *      appears — i.e. webview -> extension host -> `opencode serve` ->
- *      provider -> back works on this image. The runner points OpenCode at
- *      `e2e/ezil-chat-mock-provider.mjs`, so no model credentials are needed
- *      and the expected reply is known (`EZIL_CHAT_E2E_EXPECT_REPLY`).
+ *      appears — i.e. webview -> extension host -> `opencode serve` (started
+ *      on first open, not at boot) -> provider -> back works on this image.
+ *      The runner points OpenCode at `e2e/ezil-chat-mock-provider.mjs`, so no
+ *      model credentials are needed and the expected reply is known
+ *      (`EZIL_CHAT_E2E_EXPECT_REPLY`).
  *
  * Run:  PLAYWRIGHT_REQUIRE_DIR=/path/to/node_modules \
  *       EZIL_CODE_URL=http://127.0.0.1:8443 EZIL_CHAT_E2E_FOLDER=/home/neko/project \
@@ -85,19 +86,41 @@ try {
   await page.locator('.part.sidebar, .part.auxiliarybar').first().waitFor({ state: 'visible', timeout: T });
   check('workbench renders', true);
 
-  // 1. Secondary sidebar with the EZiL container and the EZiL Chat webview.
+  // 1. Secondary sidebar visible, opened on the Chat view; the EZiL panel is
+  // dormant until asked for.
   const aux = page.locator('.part.auxiliarybar');
   let auxVisible = false;
   try { await aux.waitFor({ state: 'visible', timeout: T }); auxVisible = true; } catch { /* asserted below */ }
   check('secondary sidebar is visible by default', auxVisible);
-  // The container label appears once the extension host has scanned the
-  // built-in, a moment after the (possibly empty) bar itself is laid out.
+  const chatFirst = await aux.locator('.interactive-session, .chat-widget').first().waitFor({ state: 'visible', timeout: 30_000 }).then(() => true).catch(() => false);
+  const ezilBeforeOpen = await page.locator('iframe.webview[src*="extensionId=ezil.ezil-chat"]').count();
+  check('sidebar opened on the Chat view and the EZiL Chat webview was NOT mounted yet (panel dormant)', chatFirst && ezilBeforeOpen === 0, `chatVisible=${chatFirst} ezilWebviews=${ezilBeforeOpen}`);
+
+  // 2. Open the panel the way a user would: click the "EZiL" tab in the
+  // secondary sidebar's composite bar (it appears once the extension host has
+  // scanned the built-in), falling back to the palette command.
+  const ezilTab = aux.locator('.composite-bar .action-label[aria-label="EZiL"], .composite-bar .action-label[aria-label^="EZiL"]').first();
+  let opened = false;
+  try {
+    await ezilTab.waitFor({ state: 'visible', timeout: T });
+    await ezilTab.click({ timeout: 10_000 });
+    opened = true;
+  } catch { /* fall back below */ }
+  if (!opened) {
+    await page.keyboard.press('F1');
+    const palette = page.locator('.quick-input-widget input.input');
+    await palette.waitFor({ state: 'visible', timeout: 10_000 });
+    await palette.fill('>EZiL Chat: Open');
+    await page.waitForTimeout(700);
+    await palette.locator('xpath=ancestor::*[contains(@class,"quick-input-widget")]//*[contains(@class,"monaco-list-row") and contains(., "EZiL Chat: Open")]').first().click({ timeout: 5_000 }).catch(() => page.keyboard.press('Enter'));
+  }
+  await page.waitForTimeout(1000);
   let auxText = '';
   try {
     await aux.locator('.composite-bar .action-label[aria-label*="EZiL"], .composite-bar .action-label:has-text("EZiL"), .title-label:has-text("EZiL")').first().waitFor({ state: 'visible', timeout: T });
     auxText = (await aux.innerText()).replace(/\s+/g, ' ');
   } catch { auxText = auxVisible ? (await aux.innerText().catch(() => '')).replace(/\s+/g, ' ') : ''; }
-  check('secondary sidebar shows the EZiL container', /EZiL/.test(auxText), auxText.slice(0, 120));
+  check('opening the EZiL tab reveals the EZiL container', /EZiL/.test(auxText), auxText.slice(0, 120));
 
   // VS Code does not put webview iframes inside the view's DOM: every outer
   // `iframe.webview` sits in a workbench-level layer, absolutely positioned
@@ -119,16 +142,9 @@ try {
     check('EZiL Chat webview is mounted in the secondary sidebar', /Ask EZiL/.test(placeholder ?? ''), `placeholder=${JSON.stringify(placeholder)}`);
   }
 
-  // 2. Nothing Copilot.
-  const copilotHits = await page.locator('[aria-label*="Copilot" i], [title*="Copilot" i]').count();
-  check('no element with aria-label/title mentioning Copilot', copilotHits === 0, `hits=${copilotHits}`);
-  const chatButton = await page.locator('.part.titlebar .command-center [aria-label*="Chat" i], .part.titlebar .action-item[aria-label*="Chat" i], .part.titlebar [aria-label*="Copilot" i]').count();
-  check('no Chat/Copilot button in the title bar command center', chatButton === 0, `hits=${chatButton}`);
-  const builtinChatView = await page.locator('[id="workbench.panel.chat"], [id="workbench.view.chat"], .chat-viewpane, .interactive-session').count();
-  check('no built-in chat view in the DOM', builtinChatView === 0, `hits=${builtinChatView}`);
-  // A user-visible reference anywhere would also count.
-  const bodyText = (await page.locator('body').innerText()).replace(/\s+/g, ' ');
-  check('no visible "Copilot" text anywhere in the workbench', !/copilot/i.test(bodyText));
+  // Both containers coexist: Chat (Copilot Chat on EZiL models) and EZiL.
+  const containers = await aux.locator('.composite-bar .action-label').evaluateAll((els) => els.map((e) => e.getAttribute('aria-label') ?? e.textContent ?? '').filter(Boolean));
+  check('secondary sidebar carries both the Chat and the EZiL containers', containers.some((c) => /^Chat/.test(c)) && containers.some((c) => /EZiL/.test(c)), JSON.stringify(containers));
 
   await page.screenshot({ path: join(OUT, 'workbench.png'), fullPage: false });
   if (auxVisible) await aux.screenshot({ path: join(OUT, 'panel.png') });
@@ -136,7 +152,8 @@ try {
   // 3. Prompt round trip through OpenCode.
   if (DO_PROMPT && webviewFrame) {
     const textarea = webviewFrame.locator('textarea').first();
-    // The composer is disabled until `opencode serve` reports ready.
+    // The composer is disabled until `opencode serve` reports ready — with
+    // `ezilChat.autoStart: false` that server was only spawned by the open above.
     let ready = false;
     try { await webviewFrame.locator('textarea:not([disabled])').first().waitFor({ state: 'attached', timeout: T }); ready = true; } catch { /* asserted */ }
     const banner = await webviewFrame.locator('.banner').allInnerTexts().catch(() => []);
@@ -166,8 +183,8 @@ try {
     check('prompt round trip', false, 'webview not mounted');
   }
 
-  const fatal = consoleErrors.filter((t) => /defaultChatAgent|Cannot read properties of undefined/.test(t));
-  check('no workbench console error mentioning defaultChatAgent / undefined product fields', fatal.length === 0, fatal.slice(0, 2).join(' | '));
+  const fatal = consoleErrors.filter((t) => /ezil-chat|EZiL Chat|Cannot read properties of undefined/.test(t));
+  check('no workbench console error mentioning ezil-chat / undefined product fields', fatal.length === 0, fatal.slice(0, 2).join(' | '));
 } catch (e) {
   check('suite completed without an unexpected exception', false, String(e).slice(0, 300));
 } finally {
