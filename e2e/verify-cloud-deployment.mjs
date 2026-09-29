@@ -87,6 +87,17 @@ export async function verifyCloudDeployment(env = process.env, fetchImpl = fetch
       sha, app: app.origin, project: required(env, 'VERCEL_PROJECT_ID'), target,
     });
     result.url = app.origin;
+    if (target === 'production') {
+      assert.equal(workerURL.origin, 'https://api-desktop.ezil.org', 'Unexpected production Worker URL');
+      const aliasURL = new URL('https://api.vercel.com/v13/deployments/ezil-os.vercel.app');
+      aliasURL.searchParams.set('teamId', team);
+      const alias = await request(aliasURL, { authorization: `Bearer ${env.VERCEL_TOKEN}` });
+      const aliasId = assertVercelDeployment(alias, {
+        sha, app: app.origin, project: env.VERCEL_PROJECT_ID, target,
+      });
+      assert.equal(aliasId, result.vercel_deployment, 'Canonical alias points at another deployment');
+      result.canonical_url = 'https://ezil-os.vercel.app';
+    }
   }
   return result;
 }

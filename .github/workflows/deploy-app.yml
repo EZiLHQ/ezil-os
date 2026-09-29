@@ -1,121 +1,17 @@
-# Deploy only the Vercel frontend. The tagged release workflow separately
-# rebuilds the desktop Worker and image; an App Store shell change needs neither.
+# All production paths use the current-main CI, staging, image and SQL gates.
 name: Deploy App
-
 on:
   workflow_dispatch:
-    inputs:
-      verify_only:
-        description: 'Verify the currently served App Store without deploying (for manual recovery)'
-        type: boolean
-        default: false
-
 permissions:
   contents: read
-
-concurrency:
-  group: deploy-production
-  cancel-in-progress: false
-
+  actions: read
+  pull-requests: read
+  packages: write
+  id-token: write
+  attestations: write
 jobs:
-  app:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with: { node-version: 22 }
-      - uses: oven-sh/setup-bun@v2
-        with: { bun-version: latest }
-      - name: Require the current main commit
-        if: ${{ !inputs.verify_only }}
-        run: |
-          set -euo pipefail
-          test "${GITHUB_REF}" = 'refs/heads/main'
-          test "$(git rev-parse HEAD)" = "$(git ls-remote origin refs/heads/main | cut -f1)"
-      - name: Check the committed shell bundle
-        run: bash shell/build-shell.sh --check
-      - name: Typecheck the app
-        working-directory: app
-        run: |
-          bun install --frozen-lockfile
-          bun run typecheck
-      - name: Install the pinned Vercel CLI
-        if: ${{ !inputs.verify_only }}
-        run: npm install --global vercel@59
-      - name: Verify the production target and record the previous deployment
-        if: ${{ !inputs.verify_only }}
-        id: before
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: |
-          set -euo pipefail
-          project="$(vercel api "/v9/projects/${VERCEL_PROJECT_ID}" --raw --token="${VERCEL_TOKEN}")"
-          jq -e --arg project "${VERCEL_PROJECT_ID}" --arg org "${VERCEL_ORG_ID}" \
-            '.id == $project and .accountId == $org and .name == "ezil-os" and .rootDirectory == "app"' \
-            <<<"${project}" >/dev/null
-          domains="$(vercel api "/v9/projects/${VERCEL_PROJECT_ID}/domains" --raw --token="${VERCEL_TOKEN}")"
-          jq -e '[.domains[]? | select(.name == "ezil-os.vercel.app" and .verified == true)] | length == 1' \
-            <<<"${domains}" >/dev/null
-          previous="$(vercel inspect https://ezil-os.vercel.app --format=json --token="${VERCEL_TOKEN}")"
-          previous_id="$(jq -r '.id // empty' <<<"${previous}")"
-          test -n "${previous_id}"
-          # Project domains need not appear in a deployment's aliases list.
-          jq -e '.name == "ezil-os" and .target == "production" and .readyState == "READY"' \
-            <<<"${previous}" >/dev/null
-          deployment="$(vercel api "/v13/deployments/${previous_id}" --raw --token="${VERCEL_TOKEN}")"
-          jq -e --arg project "${VERCEL_PROJECT_ID}" '.projectId == $project' <<<"${deployment}" >/dev/null
-          previous_sha="$(curl --fail --silent --show-error --location https://ezil-os.vercel.app/os/bundle.min.js | sha256sum | cut -d' ' -f1)"
-          echo "id=${previous_id}" >> "${GITHUB_OUTPUT}"
-          echo "sha=${previous_sha}" >> "${GITHUB_OUTPUT}"
-          echo "Previous production deployment: ${previous_id}, bundle sha256 ${previous_sha}"
-      - name: Deploy this commit to production
-        if: ${{ !inputs.verify_only }}
-        id: deploy
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: vercel deploy --yes --prod --token="${VERCEL_TOKEN}"
-      - uses: ./.github/actions/setup-playwright
-      - name: Wait for production to serve this bundle
-        run: node e2e/await-deployed-bundle.mjs
-      - name: Test the authenticated production App Store
-        env:
-          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
-          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
-          EZIL_E2E_SCREENSHOT_DIR: ${{ runner.temp }}/app-store-screenshots
-        run: node e2e/prod-app-store.mjs
-      - name: Upload visual evidence
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: production-app-store-${{ github.sha }}
-          path: ${{ runner.temp }}/app-store-screenshots/*.png
-          retention-days: 14
-      - name: Restore the previous production deployment after a failed check
-        if: ${{ failure() && steps.before.outputs.id != '' }}
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          PREVIOUS_ID: ${{ steps.before.outputs.id }}
-          PREVIOUS_SHA: ${{ steps.before.outputs.sha }}
-        run: |
-          set -euo pipefail
-          current="$(vercel inspect https://ezil-os.vercel.app --format=json --token="${VERCEL_TOKEN}" | jq -r '.id // empty')"
-          if [[ "${current}" != "${PREVIOUS_ID}" ]]; then
-            vercel promote "${PREVIOUS_ID}" --yes --token="${VERCEL_TOKEN}"
-          fi
-          for attempt in {1..36}; do
-            current="$(vercel inspect https://ezil-os.vercel.app --format=json --token="${VERCEL_TOKEN}" | jq -r '.id // empty')"
-            sha="$(curl --fail --silent --show-error --location "https://ezil-os.vercel.app/os/bundle.min.js?rollback-check=${attempt}" | sha256sum | cut -d' ' -f1)"
-            if [[ "${current}" == "${PREVIOUS_ID}" && "${sha}" == "${PREVIOUS_SHA}" ]]; then
-              echo "Restored ${PREVIOUS_ID}, bundle sha256 ${PREVIOUS_SHA}"
-              exit 0
-            fi
-            sleep 5
-          done
-          echo 'Previous deployment did not return to the production alias.' >&2
-          exit 1
+  gated-production:
+    uses: ./.github/workflows/preview.yml
+    with:
+      source: ${{ github.sha }}
+    secrets: inherit
