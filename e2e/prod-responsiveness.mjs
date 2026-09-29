@@ -32,6 +32,7 @@
 import { createRequire } from 'node:module';
 import { APP, configureAppContext } from './deployed-target.mjs';
 import path from 'node:path';
+import { observeScreenResizes, waitForDesktopResize } from './desktop-resize-ready.mjs';
 
 const REQ_DIR = process.env.PLAYWRIGHT_REQUIRE_DIR;
 let chromium = null;
@@ -64,26 +65,31 @@ const check = (name, pass, detail = '') => {
 /** Sign in and open the streamed desktop, or return null with a reason. */
 async function openDesktop(ctx) {
   const p = await ctx.newPage();
-  await p.goto(`${APP}/login`, { waitUntil: 'domcontentloaded' });
-  await p.fill('#email', EMAIL); await p.fill('#password', PASS);
-  await Promise.all([
-    p.waitForURL(u => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),
-    p.locator('form').filter({ has: p.locator('#email') }).locator('button[type=submit]').click(),
-  ]);
-  if (/\/login/.test(p.url())) return { p, err: 'sign-in did not leave /login' };
-  await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
-  await p.waitForTimeout(3500);
-  try { await p.locator('.taskbar-item').filter({ hasText: /browser/i }).first().click({ timeout: 12000 }); }
-  catch { await p.locator('.taskbar-item').nth(1).click({ timeout: 12000 }).catch(() => {}); }
-  const frame = await p.waitForSelector('.window[data-app="desktop"] iframe.window-app-iframe', { timeout: 180000 }).catch(() => null);
-  if (!frame) return { p, err: 'the desktop window never opened' };
-  // Wait for full-bleed to settle before measuring anything.
-  await p.waitForFunction(
-    () => document.querySelector('.window[data-app="desktop"]')?.classList.contains('ezil-fullbleed'),
-    null, { timeout: 60000 },
-  ).catch(() => {});
-  await p.waitForTimeout(4000);
-  return { p, err: null };
+  const resizes = observeScreenResizes(p, APP);
+  try {
+    await p.goto(`${APP}/login`, { waitUntil: 'domcontentloaded' });
+    await p.fill('#email', EMAIL); await p.fill('#password', PASS);
+    await Promise.all([
+      p.waitForURL(u => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),
+      p.locator('form').filter({ has: p.locator('#email') }).locator('button[type=submit]').click(),
+    ]);
+    if (/\/login/.test(p.url())) return { p, err: 'sign-in did not leave /login' };
+    await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
+    await p.waitForTimeout(3500);
+    try { await p.locator('.taskbar-item').filter({ hasText: /browser/i }).first().click({ timeout: 12000 }); }
+    catch { await p.locator('.taskbar-item').nth(1).click({ timeout: 12000 }).catch(() => {}); }
+    const frame = await p.waitForSelector('.window[data-app="desktop"] iframe.window-app-iframe', { timeout: 180000 }).catch(() => null);
+    if (!frame) return { p, err: 'the desktop window never opened' };
+    // Full-bleed starts a separate debounced resize, not a settled stream.
+    await p.waitForFunction(
+      () => document.querySelector('.window[data-app="desktop"]')?.classList.contains('ezil-fullbleed'),
+      null, { timeout: 60000 },
+    );
+    const readiness = await waitForDesktopResize(p, resizes);
+    return { p, err: null, readiness };
+  } catch (error) {
+    return { p, err: error.message };
+  } finally { resizes.dispose(); }
 }
 
 const geometry = (p) => p.evaluate(() => {
@@ -153,9 +159,9 @@ try {
       } : {}),
     });
     await configureAppContext(ctx);
-    const { p, err } = await openDesktop(ctx);
-    if (err) { check(`${L} the desktop opens at all`, false, err); await ctx.close(); continue; }
-    check(`${L} the desktop opens and reaches full-bleed`, true);
+    const { p, err, readiness } = await openDesktop(ctx);
+    if (err) { check(`${L} the desktop opens and its resize completes`, false, err); await ctx.close(); continue; }
+    check(`${L} the desktop opens and reaches full-bleed`, true, readiness);
 
     const g = await geometry(p);
     if (!g?.frame || !g?.body) {
