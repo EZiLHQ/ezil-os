@@ -21,13 +21,20 @@ export async function configureAppContext(context, { app, headers } = { app: APP
   // Scope the bypass to this deployment. Global context headers would also
   // send it to the Worker, container frames and arbitrary external resources.
   await context.route('**/*', async (route) => {
-    const request = route.request();
-    if (new URL(request.url()).origin !== app) return route.continue();
-    // fetch(maxRedirects: 0) prevents custom headers following cross-origin
-    // redirects; the browser makes the next request through this route again.
-    const response = await route.fetch({
-      headers: { ...request.headers(), ...headers }, maxRedirects: 0,
-    });
-    await route.fulfill({ response });
+    try {
+      const request = route.request();
+      if (new URL(request.url()).origin !== app) return await route.continue();
+      // fetch(maxRedirects: 0) prevents custom headers following cross-origin
+      // redirects; the browser makes the next request through this route again.
+      const response = await route.fetch({
+        headers: { ...request.headers(), ...headers }, maxRedirects: 0,
+      });
+      await route.fulfill({ response });
+    } catch (error) {
+      // A media request can still be in flight when a completed test closes its
+      // browser context. Playwright then rejects route.fetch after disposal.
+      if (String(error).includes('Request context disposed')) return;
+      throw error;
+    }
   });
 }

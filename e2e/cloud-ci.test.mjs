@@ -137,6 +137,20 @@ test('Vercel browser bypass is scoped to the app and cannot follow a redirect', 
   }
 });
 
+test('Vercel bypass route tolerates context disposal but surfaces live request errors', async () => {
+  let handler;
+  await configureAppContext({ route: async (_pattern, callback) => { handler = callback; } }, {
+    app: target.app, headers: { 'x-vercel-protection-bypass': 'test-bypass' },
+  });
+  const route = (error) => ({
+    request: () => ({ url: () => `${target.app}/os`, headers: () => ({}) }),
+    fetch: async () => { throw error; },
+    fulfill: async () => { throw new Error('fulfill should not run'); },
+  });
+  await assert.doesNotReject(handler(route(new Error('route.fetch: Request context disposed.'))));
+  await assert.rejects(handler(route(new Error('origin fetch failed'))), /origin fetch failed/);
+});
+
 test('bundle gate accepts matching bytes, rejects stale bytes and bounds hung requests', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-cloud-ci-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
