@@ -244,18 +244,108 @@ RUN chmod +x /usr/bin/neko \
   && test -f /etc/neko/neko.yaml
 
 # ── code-server (replaces the pinned Electron VS Code build above) ───────────
-# Installed via the official installer, which on Debian/Ubuntu fetches and
-# installs the .deb release from GitHub (detected automatically; see
-# https://code-server.dev/install.sh). Binds **0.0.0.0**:8443 with `--auth
-# none`; start-neko.sh/start-codeserver.sh launch it. It bound 127.0.0.1 until
-# a live test showed Cloudflare's proxy reaches containers on their routable
-# address (10.0.0.1), never loopback — see the note in start-codeserver.sh.
-# Safe because the container network is not publicly routable and the sole
-# ingress is the HMAC/cookie-gated `*-code.ezil.org` bridge.
+# Pinned .deb release from GitHub, checksummed, same shape as
+# macos/runtime/Dockerfile. This used to be `curl code-server.dev/install.sh |
+# sh`, i.e. "whatever is latest today": a rebuild of an unchanged Dockerfile
+# could ship a different IDE, and did — 4.139.x (Code 1.139) started bundling
+# GitHub Copilot Chat as a BUILT-IN extension (`lib/vscode/extensions/copilot`,
+# 170 MB, plus `product.json`'s `defaultChatAgent`), which put a second AI chat
+# next to EZiL Chat with no way for a user to uninstall it. Bump the two ARGs
+# together; the sha256 is of the amd64 .deb asset on the release page
+# (`sha256sum code-server_<version>_amd64.deb`). `engines.vscode` of the baked
+# ezil-chat extension is ^1.106 — any 4.10x+ satisfies it; 4.139.1 is the
+# release that was current (and already in the last unpinned build) when the
+# pin was introduced.
+#
+# Binds **0.0.0.0**:8443 with `--auth none`; start-neko.sh/start-codeserver.sh
+# launch it. It bound 127.0.0.1 until a live test showed Cloudflare's proxy
+# reaches containers on their routable address (10.0.0.1), never loopback —
+# see the note in start-codeserver.sh. Safe because the container network is
+# not publicly routable and the sole ingress is the HMAC/cookie-gated
+# `*-code.ezil.org` bridge.
 # This RUN step must stay in the SAME commit as the /usr/share/code
 # COPY removal above so the two IDEs are never both present in one image.
-RUN curl -fsSL https://code-server.dev/install.sh | sh \
-  && test -x /usr/bin/code-server
+ARG CODE_SERVER_VERSION=4.139.1
+ARG CODE_SERVER_SHA256=9f841557bfb5926eadce253a6c899b064cc9919f91cafb7b676245919d1a68a3
+RUN curl --fail --location --silent --show-error \
+      "https://github.com/coder/code-server/releases/download/v${CODE_SERVER_VERSION}/code-server_${CODE_SERVER_VERSION}_amd64.deb" \
+      --output /tmp/code-server.deb \
+  && echo "${CODE_SERVER_SHA256}  /tmp/code-server.deb" | sha256sum --check --strict \
+  && dpkg -i /tmp/code-server.deb \
+  && rm -f /tmp/code-server.deb \
+  && test -x /usr/bin/code-server \
+  && code-server --version | grep -q "^${CODE_SERVER_VERSION} "
+
+# ── No Copilot: the bundled built-in goes, and product.json forgets it ───────
+# EZiL Chat (below) is THE assistant in this editor. The built-in Copilot Chat
+# that code-server >= 4.139 ships is deleted from the system extensions
+# directory, and `product.json`'s `defaultChatAgent` — the block that makes
+# the workbench render a "Chat" command-center button offering to (re)install
+# GitHub Copilot from the marketplace — is removed so nothing points at it.
+# `chat.disableAIFeatures: true` (extension `configurationDefaults` + the
+# Machine-scope settings start-neko.sh writes on every boot) hides the rest
+# of the built-in chat UI. The final `ls | grep -i copilot` is the gate the
+# e2e (e2e/ezil-chat.mjs) re-checks at runtime; a future code-server that
+# renames the folder fails the BUILD here rather than shipping.
+RUN rm -rf /usr/lib/code-server/lib/vscode/extensions/copilot \
+  && ! ls /usr/lib/code-server/lib/vscode/extensions | grep -qi copilot \
+  && node -e "const fs=require('fs');const p='/usr/lib/code-server/lib/vscode/product.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));if(!j.defaultChatAgent)throw new Error('product.json has no defaultChatAgent — check whether this code-server still bundles Copilot some other way');delete j.defaultChatAgent;fs.writeFileSync(p,JSON.stringify(j,null,'\t')+'\n');" \
+  && ! grep -q defaultChatAgent /usr/lib/code-server/lib/vscode/product.json
+
+# ── EZiL Chat: baked in as a BUILT-IN (system) extension ─────────────────────
+# `worker/ezil-chat/dist/ezil-chat-<version>.vsix` is built from
+# `extensions/ezil-chat/` by `worker/ezil-chat/build-vsix.sh` and committed
+# (the extension source is outside this build context — same arrangement as
+# `bootstrap/dist/workspace-bootstrap.mjs`). It is unpacked into code-server's
+# system extensions directory, next to the other 98 built-ins, NOT installed
+# with `--install-extension` into the per-user `--extensions-dir`: a built-in
+# cannot be uninstalled from the Extensions view, needs no install step on
+# boot, does not depend on `/tmp/code-server-extensions` surviving, and is
+# invisible to start-neko.sh's `.ezil/extensions.txt` capture/restore (which
+# only walks the user directory), so an existing user's manifest can neither
+# lose it nor try to fetch it from a marketplace where it does not exist.
+# code-server 4.139 has no `--extra-builtin-extensions-dir`-style flag
+# (verified: "Unknown option"), so the directory is the only way in.
+COPY ezil-chat/dist/ezil-chat-0.1.0.vsix /tmp/ezil-chat.vsix
+RUN mkdir -p /tmp/ezil-chat \
+  && unzip -q /tmp/ezil-chat.vsix 'extension/*' -d /tmp/ezil-chat \
+  && mv /tmp/ezil-chat/extension /usr/lib/code-server/lib/vscode/extensions/ezil-chat \
+  && rm -rf /tmp/ezil-chat /tmp/ezil-chat.vsix \
+  && node -e "const j=require('/usr/lib/code-server/lib/vscode/extensions/ezil-chat/package.json');if(j.publisher!=='ezil'||j.name!=='ezil-chat')throw new Error('unexpected extension '+j.publisher+'.'+j.name);if(j.contributes.configurationDefaults['chat.disableAIFeatures']!==true)throw new Error('ezil-chat no longer disables built-in chat by default');console.log('built-in ezil-chat',j.version)" \
+  && test -f /usr/lib/code-server/lib/vscode/extensions/ezil-chat/dist/extension.js \
+  && test -f /usr/lib/code-server/lib/vscode/extensions/ezil-chat/dist/webview.js
+
+# ── OpenCode CLI (the agent runtime EZiL Chat drives) ────────────────────────
+# Pinned to the `@opencode/client` version the extension is compiled against
+# (extensions/ezil-chat/src/opencode/version.ts — bump both together). OpenCode
+# 2.x has no GitHub release assets (github.com/anomalyco/opencode releases stop
+# at 1.18.x); the v2 line is published on npm only, and `@opencode/cli` is a
+# stub that pulls a per-platform package. That package's `bin/opencode` is a
+# standalone bun-compiled ELF (libc/libm/libpthread/libdl only, ~200 MB, no
+# node at runtime), so it is fetched straight from the registry, checksummed
+# and dropped on PATH — no `npm install -g`, nothing under node_modules. The
+# sha256 is of the registry tarball; it corresponds to npm's `dist.integrity`
+# (sha512) for the same file.
+# The managed config below is the ONLY config the image ships. OpenCode reads
+# `/etc/opencode/opencode.json` on Linux as its highest-precedence layer
+# (https://opencode.ai/docs/config/ "Managed settings"), so every `opencode
+# serve` the extension spawns — whatever OPENCODE_CONFIG or per-project files
+# say — gets autoupdate off, sharing off and the Azure provider wiring. It
+# holds no secrets; credentials are `{env:...}` references.
+ARG OPENCODE_VERSION=2.0.19
+ARG OPENCODE_LINUX_X64_SHA256=1041e5a6acb4b258174064d995ea375d3bfaa82152aed3c0960894e658d627ef
+RUN curl --fail --location --silent --show-error \
+      "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-${OPENCODE_VERSION}.tgz" \
+      --output /tmp/opencode.tgz \
+  && echo "${OPENCODE_LINUX_X64_SHA256}  /tmp/opencode.tgz" | sha256sum --check --strict \
+  && tar -xzf /tmp/opencode.tgz -C /tmp package/bin/opencode \
+  && install -m 0755 /tmp/package/bin/opencode /usr/local/bin/opencode \
+  && rm -rf /tmp/opencode.tgz /tmp/package \
+  && if ldd /usr/local/bin/opencode | grep -qi "not found"; then echo "ERROR: opencode has unresolved shared libraries:" >&2; ldd /usr/local/bin/opencode | grep -i "not found" >&2; exit 1; fi \
+  && test "$(HOME=/tmp/opencode-version-probe /usr/local/bin/opencode --version)" = "opencode v${OPENCODE_VERSION}" \
+  && rm -rf /tmp/opencode-version-probe
+COPY opencode/opencode.json /etc/opencode/opencode.json
+RUN node -e "const j=JSON.parse(require('fs').readFileSync('/etc/opencode/opencode.json','utf8'));if(j.autoupdate!==false||j.share!=='disabled')throw new Error('managed opencode.json must keep autoupdate=false and share=disabled');if(JSON.stringify(j).match(/sk-[A-Za-z0-9]{8}|[0-9a-f]{32}/))throw new Error('managed opencode.json looks like it carries a literal secret');console.log('managed opencode.json ok')"
 
 # ── EZiL OS desktop assets + deterministic validators ────────────────────────
 # Explicit Openbox config (app-switch keybindings + root menu), the mandatory

@@ -2037,6 +2037,42 @@ else
   log "WARNING: could not seed ${CODE_SERVER_USER_DATA_DIR}/User/settings.json — code-server will open in Restricted Mode and its integrated terminal will prompt for workspace trust before it will start"
 fi
 
+# ── Machine-scope settings: written on EVERY boot, never user-editable ───────
+#
+# The EZiL Chat extension is baked into the image as a BUILT-IN
+# (/usr/lib/code-server/lib/vscode/extensions/ezil-chat — see the Dockerfile),
+# and its `configurationDefaults` already say `chat.disableAIFeatures: true`
+# and open the secondary sidebar. Extension defaults are the LOWEST layer,
+# though: a user whose restored `.ezil/settings.json` (or an in-session edit)
+# carries `chat.disableAIFeatures: false` would bring VS Code's built-in chat
+# UI back — a "Chat" command-center button and a chat view pointing at a
+# Copilot that this image deliberately does not contain.
+#
+# `<user-data-dir>/Machine/settings.json` is VS Code's remote-machine layer
+# (`machineSettingsResource` in the server), which ranks ABOVE User settings
+# and below only Workspace settings, and which the workbench UI has no editor
+# for. Both keys below are resource/window-scoped, so the machine layer is
+# allowed to carry them (only application-scoped settings are dropped there —
+# that is why `security.workspace.trust.enabled` stays in the User seed above
+# and is not repeated here). Unconditional overwrite, unlike the User seed:
+# these are not the user's to change, and the file is 4 lines.
+seed_codeserver_machine_settings() {
+  _cs_machine_dir="$1/Machine"
+  mkdir -p "$_cs_machine_dir" 2>/dev/null || return 1
+  cat >"$_cs_machine_dir/settings.json" <<'CODESERVER_MACHINE_SETTINGS_JSON'
+{
+  "chat.disableAIFeatures": true,
+  "workbench.secondarySideBar.defaultVisibility": "visible"
+}
+CODESERVER_MACHINE_SETTINGS_JSON
+}
+
+if seed_codeserver_machine_settings "$CODE_SERVER_USER_DATA_DIR"; then
+  log "code-server machine settings written at ${CODE_SERVER_USER_DATA_DIR}/Machine/settings.json (built-in AI chat off, secondary sidebar — EZiL Chat — visible)"
+else
+  log "WARNING: could not write ${CODE_SERVER_USER_DATA_DIR}/Machine/settings.json — a user settings.json that re-enables chat.disableAIFeatures would bring the built-in chat UI back"
+fi
+
 phase_start codeserver_launch
 log "supervising code-server ($CODE_SERVER_BIN) on 0.0.0.0:${CODE_SERVER_PORT} at $WORKSPACE_ROOT (mandatory, isolated user-data-dir)"
 supervise_app codeserver "$NEKO_APP_MAX_RESTARTS" "$CODE_SERVER_BIN" \

@@ -91,6 +91,18 @@ if [ ! -s "$USER_DATA_DIR/User/settings.json" ]; then
 CODESERVER_SETTINGS_JSON
 fi
 
+# Machine-scope layer (ranks above User settings; no UI edits it), rewritten
+# on every launch. Mirrors start-neko.sh's `seed_codeserver_machine_settings`
+# — keep the two in sync. Built-in AI chat off (the image ships no Copilot;
+# EZiL Chat is the assistant) and the secondary sidebar it lives in visible.
+mkdir -p "$USER_DATA_DIR/Machine"
+cat >"$USER_DATA_DIR/Machine/settings.json" <<'CODESERVER_MACHINE_SETTINGS_JSON'
+{
+  "chat.disableAIFeatures": true,
+  "workbench.secondarySideBar.defaultVisibility": "visible"
+}
+CODESERVER_MACHINE_SETTINGS_JSON
+
 # Keep auth none because the bridge is already HMAC/cookie-gated in front of
 # this process. 0.0.0.0 is required, NOT loopback — see the 🔴 block above; an
 # earlier version of this very comment said the opposite while the flag below
