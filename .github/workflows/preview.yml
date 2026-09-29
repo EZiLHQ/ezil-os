@@ -580,7 +580,7 @@ jobs:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: vercel promote "$(jq -er .vercel_deployment previous-release.json)" --yes --token="$VERCEL_TOKEN"
+        run: node .github/scripts/release-state.mjs vercel-rollback
       - name: Restore previous Worker version (never reverse SQL)
         if: failure() && steps.rollback_guard.outcome == 'success'
         working-directory: worker

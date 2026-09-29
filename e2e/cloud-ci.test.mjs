@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import './desktop-resize-ready.test.mjs';
 import { deployedTarget, configureAppContext } from './deployed-target.mjs';
 import { assertVercelDeployment, assertWorkerDeployment, verifyCloudDeployment } from './verify-cloud-deployment.mjs';
 
@@ -200,7 +201,7 @@ test('production requires the canonical alias to resolve the exact returned depl
 });
 
 const { imagePlan } = await import('../.github/scripts/image-plan.mjs');
-const { readState, pullCloudflareImage } = await import('../.github/scripts/release-state.mjs');
+const { readState, pullCloudflareImage, restoreVercel } = await import('../.github/scripts/release-state.mjs');
 
 test('image keys rebuild changed base and branding independently without changing local pins', () => {
   const tree = p => `${p}-original`;
@@ -230,13 +231,72 @@ test('release capture separates provider/container identities and strips configu
   const result = await readState(env, fetchState);
   assert.equal(result.worker_source, sha);
   assert.equal(result.vercel_source, sha);
+  assert.equal(result.vercel_url, deployment.url);
   assert.equal(result.cloudflare_container.digest, `sha256:${'d'.repeat(64)}`);
   assert.equal(JSON.stringify(result).includes('do-not-store'), false);
   await assert.rejects(readState(env, async()=>({ok:false,status:403})), /HTTP 403/);
 });
 
+test('Vercel rollback resolves legacy receipts and promotes the verified URL with explicit team scope', async () => {
+  const old = {...deployment, target:'production', meta:{githubCommitSha:'b'.repeat(40)}, env:{SECRET:'do-not-store'}};
+  const previous = {vercel_deployment:old.id, vercel_source:old.meta.githubCommitSha};
+  for (const receipt of [previous, {...previous, vercel_url:old.url}]) {
+    const calls = [], commands = [];
+    const result = await restoreVercel(receipt, env, async (input, options) => {
+      const url = new URL(input);
+      calls.push(url.pathname);
+      assert.equal(url.hostname, 'api.vercel.com');
+      assert.equal(url.searchParams.get('teamId'), env.VERCEL_ORG_ID);
+      assert.equal(options.redirect, 'error');
+      assert.ok(options.signal instanceof AbortSignal);
+      const value = url.pathname.endsWith(`/${old.id}`) ? old : {...deployment, id:'dpl_new', target:'production'};
+      return {ok:true, json:async()=>value};
+    }, (...args) => commands.push(args));
+    assert.deepEqual(result, {...previous, vercel_url:old.url});
+    assert.equal(JSON.stringify(result).includes('do-not-store'), false);
+    assert.deepEqual(calls, [`/v13/deployments/${old.id}`, '/v13/deployments/ezil-os.vercel.app']);
+    assert.deepEqual(commands[0].slice(0,2), ['vercel', ['promote', old.url, '--scope', env.VERCEL_ORG_ID, '--yes', `--token=${env.VERCEL_TOKEN}`]]);
+    assert.equal(commands.length, 1);
+    assert.ok(commands[0][2].timeout <= 120000);
+  }
+});
+
+test('Vercel rollback refuses mismatched identities, untrusted hostnames and lost ownership before promotion', async () => {
+  const old = {...deployment, target:'production', meta:{githubCommitSha:'b'.repeat(40)}};
+  const previous = {vercel_deployment:old.id, vercel_source:old.meta.githubCommitSha};
+  let promoted = false;
+  const exec = () => { promoted = true; };
+  const api = (target = old, current = {...deployment, target:'production'}) => async input => ({
+    ok:true, json:async()=>new URL(input).pathname.endsWith(`/${old.id}`) ? target : current,
+  });
+  for (const patch of [{id:'dpl_other'}, {projectId:'prj_other'}, {readyState:'ERROR'}, {target:null}, {meta:{}},
+    {meta:{githubCommitSha:sha}}, ...['ezil-os.vercel.app', 'https://preview-test.vercel.app', 'evil.example',
+      'preview-test.vercel.app.evil.example', 'user@preview-test.vercel.app', 'preview-test.vercel.app/?token=x',
+      '--yes', 'preview-test.vercel.app:443'].map(url=>({url}))]) {
+    await assert.rejects(restoreVercel(previous, env, api({...old,...patch}), exec));
+  }
+  await assert.rejects(restoreVercel({...previous,vercel_url:'different.vercel.app'}, env, api(), exec), /URL differs/);
+  await assert.rejects(restoreVercel(previous, {...env,VERCEL_ORG_ID:''}, api(), exec), /team scope/);
+  await assert.rejects(restoreVercel({...previous,vercel_source:null}, env, api(), exec), /source SHA/);
+  await assert.rejects(restoreVercel(previous, env, api(old, {...old,id:'dpl_other'}), exec), /Another Vercel/);
+  await assert.rejects(restoreVercel(previous, env, async()=>({ok:false,status:404}), exec), /HTTP 404/);
+  assert.equal(promoted, false);
+  await assert.rejects(restoreVercel(previous, env, api(), () => { throw new Error('token=do-not-print'); }), error => {
+    assert.match(error.message, /promotion failed/);
+    assert.doesNotMatch(error.message, /do-not-print/);
+    return true;
+  });
+});
+
 // Execute the actual admission script with fake GitHub readbacks. No checkout or secrets.
 const workflowText = fs.readFileSync('.github/workflows/preview.yml','utf8');
+test('rollback workflow keeps ownership admission and readback around the scoped Vercel helper', () => {
+  const restore = workflowText.split('      - name: Restore previous Vercel production deployment\n')[1].split('      - name:')[0];
+  assert.match(restore, /if: failure\(\) && steps\.rollback_guard\.outcome == 'success'/);
+  assert.match(restore, /VERCEL_ORG_ID: \$\{\{ secrets\.VERCEL_ORG_ID \}\}/);
+  assert.match(restore, /run: node \.github\/scripts\/release-state\.mjs vercel-rollback/);
+  assert.match(workflowText, /node \.github\/scripts\/release-state\.mjs rollback-check/);
+});
 const admissionSource = workflowText.split('          script: |\n')[1].split('\n  preview:')[0]
   .split('\n').filter(line => line.startsWith('            ')).map(line => line.slice(12)).join('\n');
 const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
