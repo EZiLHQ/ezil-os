@@ -328,3 +328,22 @@ tarball carries no separate `LICENSE` file, so its `package.json` `license`
 field is the source). Every one is permissive (MIT and/or Apache-2.0); no
 GPL, LGPL, AGPL, SSPL, or "non-commercial only" dependency was found in the
 extension's dependency tree.
+
+## 9. EZiL Models extension (`extensions/ezil-models/`) npm dependencies
+
+The extension is EZiL-authored (`"license": "AGPL-3.0-only"`) and has **no
+runtime dependencies**: it talks to model providers with the platform `fetch`
+and its own Server-Sent Events parser, and imports nothing outside the Node
+standard library and the `vscode` API. `bun build` bundles `src/extension.ts`
+into `dist/extension.js` (only `vscode` external), so the bundle contains no
+third-party code at all. The test fixtures under
+`extensions/ezil-models/tests/fixtures/copilot-*.json` are requests that
+GitHub Copilot Chat 0.67 (MIT, see code-server above) sent to a probe
+provider; they contain Copilot's prompt and tool descriptions verbatim and are
+used only by the test suite, never shipped.
+
+| Package | License | Used for |
+|---|---|---|
+| `typescript` 5.9.3 (dev) | Apache-2.0 | Type-checking — not shipped |
+| `@types/bun` 1.4.2, `bun-types` 1.4.2, `@types/node` 22.10.2, `@types/vscode` 1.106.1, `undici-types` 6.20.0 (dev) | MIT | Type declarations — not shipped |
+| `@vscode/vsce` 4.0.0 (build tool, run via `bunx`; not a declared dependency) | MIT | Packs the VSIX — not shipped |
