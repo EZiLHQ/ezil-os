@@ -182,3 +182,180 @@ test('bundle gate accepts matching bytes, rejects stale bytes and bounds hung re
   assert.equal(hung.status, 1, hung.stderr);
   assert.match(hung.stderr, /aborted/);
 });
+
+test('production requires the canonical alias to resolve the exact returned deployment', async () => {
+  const prod = { ...deployment, target: 'production' };
+  const prodEnv = { ...env, EZIL_DEPLOY_TARGET: 'production', EZIL_E2E_WORKER: 'https://api-desktop.ezil.org' };
+  const api = (alias = prod) => async (input, options) => {
+    const url = new URL(input);
+    if (url.hostname === 'api-desktop.ezil.org') return { ok:true, json:async()=>({ok:true,build:'ezil-os',supportedDesktopModes:['neko']}) };
+    if (url.pathname.endsWith('/ezil-os.vercel.app')) return {ok:true,json:async()=>alias};
+    return fakeAPI({ '/v13/deployments/preview-test.vercel.app': prod }).fetch(input, options);
+  };
+  const result = await verifyCloudDeployment(prodEnv, api());
+  assert.equal(result.canonical_url, 'https://ezil-os.vercel.app');
+  await assert.rejects(verifyCloudDeployment(prodEnv, api({...prod, id:'other-deployment'})), /another deployment/);
+  await assert.rejects(verifyCloudDeployment(prodEnv, api({...prod, meta:{githubCommitSha:'b'.repeat(40)}})), /SHA differs/);
+  await assert.rejects(verifyCloudDeployment(prodEnv, api({...prod, readyState:'ERROR'})), /not ready/);
+});
+
+const { imagePlan } = await import('../.github/scripts/image-plan.mjs');
+const { readState, pullCloudflareImage } = await import('../.github/scripts/release-state.mjs');
+
+test('image keys rebuild changed base and branding independently without changing local pins', () => {
+  const tree = p => `${p}-original`;
+  const original = imagePlan(sha, tree);
+  const branding = imagePlan('b'.repeat(40), p => p.includes('neko-branding') ? 'changed' : tree(p));
+  assert.equal(branding.base, original.base);
+  assert.notEqual(branding.overlay, original.overlay);
+  assert.notEqual(branding.desktop, original.desktop);
+  const base = imagePlan(sha, p => p === 'docker/neko' ? 'new-base' : tree(p));
+  assert.notEqual(base.base, original.base);
+  assert.notEqual(base.overlay, original.overlay);
+  assert.deepEqual(imagePlan(sha, tree), original);
+  assert.match(original.desktop, /:sha-[a-f0-9]{40}$/);
+  assert.throws(() => imagePlan('short', tree));
+});
+
+test('release capture separates provider/container identities and strips configuration', async () => {
+  const prod = {...deployment,target:'production',env:{SECRET:'do-not-store'}};
+  const fetchState = async (input, options) => {
+    const url = new URL(input);
+    if (url.pathname.endsWith('/ezil-os.vercel.app')) return {ok:true,json:async()=>prod};
+    if (url.pathname.endsWith('/containers/applications')) return {ok:true,json:async()=>[
+      {id:'container-id',name:'ezil-os-worker-sandbox',configuration:{image:`registry.cloudflare.com/account/image@sha256:${'d'.repeat(64)}`,env:{SECRET:'do-not-store'}}},
+    ]};
+    return fakeAPI().fetch(input, options);
+  };
+  const result = await readState(env, fetchState);
+  assert.equal(result.worker_source, sha);
+  assert.equal(result.vercel_source, sha);
+  assert.equal(result.cloudflare_container.digest, `sha256:${'d'.repeat(64)}`);
+  assert.equal(JSON.stringify(result).includes('do-not-store'), false);
+  await assert.rejects(readState(env, async()=>({ok:false,status:403})), /HTTP 403/);
+});
+
+// Execute the actual admission script with fake GitHub readbacks. No checkout or secrets.
+const workflowText = fs.readFileSync('.github/workflows/preview.yml','utf8');
+const admissionSource = workflowText.split('          script: |\n')[1].split('\n  preview:')[0]
+  .split('\n').filter(line => line.startsWith('            ')).map(line => line.slice(12)).join('\n');
+const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+async function admission({ event='workflow_dispatch', current=sha, conclusion='success', eventSha=sha, path='.github/workflows/ci.yml' } = {}) {
+  const outputs = {}, failures = [];
+  const run = {head_sha:eventSha,head_branch:'main',path,head_repository:{full_name:'owner/os'},status:'completed',conclusion,event:'push',workflow_id:1};
+  const github = {rest:{git:{getRef:async()=>({data:{object:{sha:current}}})},actions:{
+    listWorkflowRuns:async()=>({data:{workflow_runs:[run]}}),getWorkflow:async()=>({data:{path}}),
+  }}};
+  const core = {setOutput:(k,v)=>outputs[k]=v,warning:()=>{},setFailed:s=>failures.push(s)};
+  const context = {repo:{owner:'owner',repo:'os'},eventName:event,payload:{workflow_run:run,repository:{full_name:'owner/os'}}};
+  await new AsyncFunction('github','core','context','process',admissionSource)(github,core,context,{env:{REQUESTED_SOURCE:sha}});
+  return {outputs,failures};
+}
+test('manual, tag and automatic admission require tested current main', async () => {
+  for (const event of ['workflow_dispatch','push','workflow_run']) {
+    const good = await admission({event});
+    assert.equal(good.outputs.allowed,'true');
+    assert.equal(good.outputs.production,'true');
+    const stale = await admission({event,current:'b'.repeat(40)});
+    assert.equal(stale.outputs.allowed,'false');
+    assert.ok(stale.outputs.reason);
+    const failed = await admission({event,conclusion:'failure'});
+    assert.equal(failed.outputs.allowed,'false');
+    const wrongWorkflow = await admission({event,path:'.github/workflows/other.yml'});
+    assert.equal(wrongWorkflow.outputs.allowed,'false');
+  }
+});
+
+const { assertRollbackOwner, restoreContainer } = await import('../.github/scripts/release-state.mjs');
+test('rollback refuses another release and restores container image through a completed rollout', async () => {
+  const previous = {worker_version:'old-worker',vercel_deployment:'old-app',cloudflare_container:{id:'container',image:`registry.cloudflare.com/a/i@sha256:${'b'.repeat(64)}`}};
+  const state = {worker_source:sha,vercel_source:sha,cloudflare_container:{id:'container',image:`registry.cloudflare.com/a/i@sha256:${'a'.repeat(64)}`}};
+  assert.doesNotThrow(()=>assertRollbackOwner(previous,state,sha));
+  assert.throws(()=>assertRollbackOwner(previous,{...state,worker_source:'c'.repeat(40)},sha),/Another Worker/);
+  assert.throws(()=>assertRollbackOwner(previous,{...state,vercel_source:'c'.repeat(40)},sha),/Another Vercel/);
+  const calls=[];
+  const fake = async (url,options) => {
+    calls.push({url,options});
+    const value = options.method === 'GET' && url.endsWith('/container') ?
+      {id:'container',configuration:{image:state.cloudflare_container.image,memory_mib:2048}} :
+      url.endsWith('/rollouts') ? {id:'rollout'} : {status:'completed'};
+    return {ok:true,json:async()=>value};
+  };
+  const result = await restoreContainer(previous,state,{...env,EZIL_DEPLOY_SHA:sha},fake);
+  assert.equal(result.status,'completed');
+  assert.deepEqual(JSON.parse(calls[1].options.body),{configuration:{image:previous.cloudflare_container.image,memory_mib:2048}});
+  assert.equal(JSON.parse(calls[2].options.body).target_configuration.image,previous.cloudflare_container.image);
+  assert.equal(calls.length,4);
+  await assert.rejects(restoreContainer(previous,state,{...env,EZIL_DEPLOY_SHA:sha},async()=>({ok:false,status:403})),/restore .* manually/);
+});
+
+test('summary cannot report success when both deployments were skipped', async () => {
+  const source = workflowText.slice(workflowText.indexOf('  summary:\n')).split('          script: |\n')[1]
+    .split('\n').map(line=>line.slice(12)).join('\n');
+  const failures=[];
+  const summary={addHeading(){},addRaw(){},addTable(){},async write(){}};
+  await new AsyncFunction('core','process',source)({summary,setFailed:s=>failures.push(s)},
+    {env:{TRUSTED:'false',PREVIEW_RESULT:'skipped',PRODUCTION_RESULT:'skipped',ADMISSION_REASON:'stale source'}});
+  assert.match(failures[0],/No deployment performed: stale source/);
+});
+
+test('registry reuse never overwrites immutable tags and an absent overlay never rebuilds its base', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(),'ezil-image-publish-'));
+  t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const plan = imagePlan(sha,p=>p);
+  fs.writeFileSync(path.join(dir,'image-plan.json'),JSON.stringify(plan));
+  fs.writeFileSync(path.join(dir,'docker'), `#!/usr/bin/env bash
+set -eu
+printf '%s\\n' "$*" >> "$MOCK_CALLS"
+if [[ "$1 $2" == "manifest inspect" ]]; then
+  if [[ "$MOCK_MODE" == "denied" ]]; then echo 'unauthorized' >&2; exit 1; fi
+  if [[ "$MOCK_MODE" == "overlay-missing" && "$3" == *:overlay-* ]]; then echo 'manifest unknown' >&2; exit 1; fi
+elif [[ "$1 $2" == "buildx imagetools" ]]; then
+  printf '{"digest":"sha256:${'d'.repeat(64)}"}\\n'
+elif [[ "$1 $2" == "image inspect" ]]; then
+  printf '%s\\n' "$EZIL_DEPLOY_SHA"
+fi
+`,{mode:0o755});
+  const script = path.resolve('.github/scripts/build-images.sh');
+  const run = mode => {
+    const calls = path.join(dir,`${mode}-calls`), log = path.join(dir,`${mode}-log`);
+    const fd=fs.openSync(log,'w');
+    let result;
+    try { result=spawnSync('bash',[script],{cwd:dir,timeout:10000,
+      env:{...process.env,PATH:`${dir}:${process.env.PATH}`,EZIL_DEPLOY_SHA:sha,
+        GITHUB_OUTPUT:path.join(dir,`${mode}-outputs`),MOCK_CALLS:calls,MOCK_MODE:mode},stdio:['ignore',fd,fd]});
+    } finally { fs.closeSync(fd); }
+    assert.ifError(result.error);
+    return {status:result.status,calls:fs.readFileSync(calls,'utf8'),log:fs.readFileSync(log,'utf8')};
+  };
+  const reuse=run('exists');
+  assert.equal(reuse.status,0,reuse.log);
+  assert.doesNotMatch(reuse.calls,/^build |^push /m);
+  const overlay=run('overlay-missing');
+  assert.equal(overlay.status,0,overlay.log);
+  assert.match(overlay.calls,/^push .*:overlay-/m);
+  assert.doesNotMatch(overlay.calls,/^push .*:base-/m);
+  assert.match(overlay.calls,/BASE_NEKO_IMAGE=.*@sha256:/);
+  const denied=run('denied');
+  assert.notEqual(denied.status,0);
+  assert.doesNotMatch(denied.calls,/^build |^push /m);
+});
+
+
+test('container readback uses scoped pull credentials and removes temporary Docker authentication', async () => {
+  const env={CLOUDFLARE_ACCOUNT_ID:'a'.repeat(32),CLOUDFLARE_API_TOKEN:'test-token'};
+  const image=`registry.cloudflare.com/${env.CLOUDFLARE_ACCOUNT_ID}/desktop@sha256:${'b'.repeat(64)}`;
+  const calls=[];
+  await pullCloudflareImage(image,env,async (url,options)=>{
+    assert.equal(new URL(url).hostname,'api.cloudflare.com');
+    assert.deepEqual(JSON.parse(options.body),{expiration_minutes:15,permissions:['pull']});
+    return {ok:true,json:async()=>({result:{username:'account',password:'scoped-secret'}})};
+  },(cmd,args,options)=>{
+    calls.push({cmd,args,options});
+    if(args.includes('login')) assert.equal(options.input,'scoped-secret');
+    assert.ok(!args.includes('scoped-secret'));
+  });
+  assert.equal(calls.length,2);
+  assert.equal(fs.existsSync(calls[0].args[1]),false);
+  assert.equal(calls[1].args.at(-1),image);
+});
