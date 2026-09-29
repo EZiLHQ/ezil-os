@@ -413,8 +413,18 @@ describe('browser sidecar: a real container, a real Chrome', () => {
         // inert — but this project has been bitten three times this month by
         // checks that passed in Docker and failed elsewhere, so it is measured
         // AFTER the navigations, clicks, types and screenshots above.
+        // The window id is looked up, not hardcoded: X hands out ids in client
+        // creation order, so an image that starts one more (or one fewer) X
+        // client before Chrome shifts it — CI on 9dcabfa failed exactly that way
+        // when the moving `:latest` desktop image was rebuilt. Same lookup as
+        // the geometry pin in `start-desktop.sh`.
+        const found = dexec(['bash', '-lc',
+            'DISPLAY=:99 xdotool search --onlyvisible --class chrome 2>/dev/null | tail -n1']);
+        const wid = (found.stdout || '').trim();
+        expect(wid, `no visible Chrome window (wmctrl -l: ${xWindowTitle() || '<empty>'})`).toMatch(/^\d+$/);
+
         const info = dexec(['bash', '-lc',
-            'DISPLAY=:99 xwininfo -id 0x400003 | grep -E "Width:|Height:|Map State:|Absolute upper-left"']);
+            `DISPLAY=:99 xwininfo -id ${wid} | grep -E "Width:|Height:|Map State:|Absolute upper-left"`]);
         const text = info.stdout || '';
         expect(text).toContain('Width: 1920');
         expect(text).toContain('Height: 1080');
@@ -423,7 +433,7 @@ describe('browser sidecar: a real container, a real Chrome', () => {
         expect(text).toMatch(/Absolute upper-left Y:\s+0/);
 
         const props = dexec(['bash', '-lc',
-            'DISPLAY=:99 xprop -id 0x400003 _NET_FRAME_EXTENTS _NET_WM_STATE']);
+            `DISPLAY=:99 xprop -id ${wid} _NET_FRAME_EXTENTS _NET_WM_STATE`]);
         expect(props.stdout).toContain('_NET_FRAME_EXTENTS(CARDINAL) = 0, 0, 0, 0');
         expect(props.stdout).toContain('_OB_WM_STATE_UNDECORATED');
         expect(props.stdout).toContain('_NET_WM_STATE_MAXIMIZED_VERT');
