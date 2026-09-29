@@ -436,6 +436,9 @@ jobs:
       - name: Unit tests
         shell: bash
         run: bun test tools/
+      - name: Hosted migration helper tests
+        shell: bash
+        run: node --test app/scripts/ci-migrate.test.mjs
 
   # ── container — pulls the REAL desktop image and runs the container suites
   # for real. ──────────────────────────────────────────────────────────────

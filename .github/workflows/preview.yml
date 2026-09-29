@@ -135,6 +135,7 @@ jobs:
         with:
           ref: ${{ needs.trust.outputs.sha }}
           persist-credentials: false
+          fetch-depth: 0
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -216,6 +217,25 @@ jobs:
         env:
           LEASE_OWNER: os-${{ github.run_id }}-${{ github.run_attempt }}
         run: python3 .github/scripts/staging-lock.py acquire --owner "$LEASE_OWNER" --ttl 5400 --wait 1200
+      - name: Apply changed OS SQL to shared test database
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          files=()
+          while IFS= read -r file; do
+            [[ "$file" == app/drizzle/*.sql ]] || continue
+            files+=("${file##*/}")
+          done < <(git diff --name-only --diff-filter=ACMRT "$BASE_SHA" "$EZIL_DEPLOY_SHA" -- app/drizzle)
+          if (( ${#files[@]} == 0 )); then
+            echo 'No OS SQL changes to apply'
+            exit 0
+          fi
+          node app/scripts/ci-migrate.mjs --dry-run "${files[@]}"
+          [[ -n "$SUPABASE_ACCESS_TOKEN" ]] || { echo '::error::SUPABASE_ACCESS_TOKEN is required for changed SQL'; exit 1; }
+          node app/scripts/ci-migrate.mjs --apply "${files[@]}"
       - name: Deploy named staging Worker
         working-directory: worker
         timeout-minutes: 25
