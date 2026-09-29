@@ -19,6 +19,19 @@ did not. See [`docs/RELEASE.md`](docs/RELEASE.md) for the full mechanics.
 
 ### Added
 
+- **EZiL Chat in the desktop image.** The `extensions/ezil-chat` VS Code
+  extension (an AI coding panel in the secondary sidebar that drives a pinned
+  [OpenCode](https://opencode.ai) v2 server on loopback) is baked into
+  `worker/Dockerfile` as a built-in extension, next to `opencode` v2.0.19 and
+  a managed `/etc/opencode/opencode.json` (autoupdate off, sharing off, Azure
+  AI Foundry wired through `{env:...}` references, no secrets). code-server is
+  now pinned by version and checksum (4.139.1) instead of installed from
+  `install.sh`, and the GitHub Copilot Chat built-in that code-server started
+  bundling is removed from the image, with Machine-scope settings
+  (`chat.disableAIFeatures`) written on every boot so a returning user's own
+  settings cannot bring the built-in chat UI back. `e2e/ezil-chat-image.sh`
+  boots the image and proves the panel, the absence of Copilot and a full
+  prompt round trip against a mock provider in a real browser.
 - **Local-first Apple Silicon app.** The macOS 14+ Swift app creates an
   anonymous, application-owned workspace, provides a native WebKit browser,
   and boots a pinned ARM Linux developer runtime with code-server through
