@@ -75,7 +75,7 @@ run('opencode serve v2: health, catalog, session lifecycle, event stream and per
         for (let waited = 0; waited < 100 && !events.some(event => event.type === 'session.updated' && event.agent === 'build'); waited++) await Bun.sleep(25);
         expect(events.some(event => event.type === 'session.created' && event.session.id === session.id)).toBe(true);
         expect(events.some(event => event.type === 'session.updated' && event.sessionId === session.id && event.model?.modelID === 'claude-sonnet-4-5')).toBe(true);
-        expect(await client.getDiff(session.id)).toEqual([]);
+        expect(await client.listChildSessions(session.id)).toEqual([]);
         expect(await client.getSessionMessages(session.id)).toEqual([]);
         expect(await client.abort(session.id)).toBe(false); // nothing running: interrupt is a no-op, not an error
 

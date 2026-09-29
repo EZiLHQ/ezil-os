@@ -83,14 +83,27 @@ test('switching session clears the transcript and stale message payloads are ign
     expect(state.messages).toEqual([]);
 });
 
-test('server status and mention chips flow through the reducer', () => {
+test('server status flows through the reducer; composer-only messages leave state untouched', () => {
     let state = reduce(initialState(), { type: 'server', server: { status: 'error', message: 'crashed' } });
     expect(state.error).toBe('crashed');
     state = reduce(state, { type: 'server', server: { status: 'ready', version: '2.0.19', baseUrl: 'http://127.0.0.1:1' } });
     expect(state.server.status).toBe('ready');
-    const mention = { path: 'a.ts', start: 1, end: 3, label: 'a.ts:1-3' };
-    state = reduce(reduce(state, { type: 'mention', mention }), { type: 'mention', mention });
-    expect(state.mentions).toEqual([mention]);
+    expect(reduce(state, { type: 'mention', mention: { path: 'a.ts', label: 'a.ts' } })).toBe(state);
+    expect(reduce(state, { type: 'fileResults', requestId: 1, files: ['a.ts'] })).toBe(state);
+});
+
+test('cards raised by a subagent show on the parent transcript; cards for unrelated sessions do not', () => {
+    const state = run(withSession(), [
+        { type: 'permission.asked', request: { id: 'per_c', sessionId: 'ses_child', rootSessionId: 'ses_1', action: 'bash', resources: ['ls'] } },
+        { type: 'permission.asked', request: { id: 'per_o', sessionId: 'ses_other', action: 'bash', resources: ['ls'] } },
+        { type: 'question.asked', question: { id: 'frm_c', sessionId: 'ses_child', rootSessionId: 'ses_1', title: 'Which?', fields: [] } },
+        { type: 'question.asked', question: { id: 'frm_o', sessionId: 'ses_other', title: 'Nope', fields: [] } },
+    ]);
+    expect(state.permissions.map(request => request.id)).toEqual(['per_c']);
+    expect(state.questions.map(question => question.id)).toEqual(['frm_c']);
+    const replied = run(state, [{ type: 'permission.replied', sessionId: 'ses_child', requestId: 'per_c', decision: 'once' }, { type: 'question.replied', sessionId: 'ses_child', questionId: 'frm_c' }]);
+    expect(replied.permissions).toEqual([]);
+    expect(replied.questions).toEqual([]);
 });
 
 test('models are grouped by provider name and disabled ones hidden', () => {

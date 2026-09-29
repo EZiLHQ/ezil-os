@@ -2,17 +2,20 @@
 // session and the event pump, and translates webview requests into client
 // calls. Everything VS Code-specific is injected through `ControllerHost`
 // so the relay can be unit-tested with a fake client.
-import type { ChatEvent, ChatMessage, FileDiff, ModelId, OpenCodeClient, PromptPart } from '../opencode/adapter';
+import { errorMessage } from '../errors';
+import type { ChatEvent, ChatMessage, FileDiff, ModelId, OpenCodeClient, PermissionRequest, PromptPart } from '../opencode/adapter';
 import { modelKey } from '../opencode/adapter';
 import type { Catalog, HostToWebview, Mention, ServerStatus, WebviewToHost } from '../protocol';
 import type { ServerEndpoint, ServerState } from '../server/manager';
+import { isWebviewToHost } from './validate';
 
 export interface ControllerHost {
     post(message: HostToWebview): void;
+    /** Fallback file search (editor index) used when no server is connected or the query is empty. */
     searchFiles(query: string, limit: number): Promise<string[]>;
     openFile(path: string, line?: number): Promise<void>;
     showDiff(file: string, patch: string): Promise<void>;
-    /** Called after an edit tool finishes so the host can open a review diff. */
+    /** Called after an edit tool finishes so the host can open a review diff. Must not block the event pump. */
     filesEdited(sessionId: string, files: FileDiff[]): Promise<void>;
     log(line: string): void;
     defaults(): { agent?: string; model?: ModelId };
@@ -48,13 +51,19 @@ export function buildPromptParts(text: string, mentions: Mention[]): PromptPart[
     return parts;
 }
 
+const MAX_PARENT_DEPTH = 8;
+
 export class ChatController {
     private client: OpenCodeClient | undefined;
     private endpointKey = '';
+    /** False until the first `server.connected` of the current client; a later one means the SSE stream reconnected. */
+    private streamSeen = false;
     private currentSessionId: string | undefined;
     private pendingModel: ModelId | undefined;
     private pendingAgent: string | undefined;
     private catalog: Catalog = { models: [], providers: [], agents: [] };
+    /** Subagent session id -> root session id, so their permission cards land on the transcript they block. */
+    private readonly roots = new Map<string, string>();
     private pump: AbortController | undefined;
     private catalogTimer: ReturnType<typeof setTimeout> | undefined;
     private readonly subscription: { dispose(): void };
@@ -92,6 +101,8 @@ export class ChatController {
         this.pump?.abort();
         this.client = this.connect(endpoint);
         this.endpointKey = key;
+        this.streamSeen = false;
+        this.roots.clear();
         this.startPump(this.client);
         return { client: this.client, changed: true };
     }
@@ -123,7 +134,7 @@ export class ChatController {
                     await this.onEvent(event);
                 }
             } catch (error) {
-                if (!controller.signal.aborted) this.host.log(`event stream ended: ${describe(error)}`);
+                if (!controller.signal.aborted) this.host.log(`event stream ended: ${errorMessage(error)}`);
             }
             if (this.pump !== controller || controller.signal.aborted || this.disposed) return;
             // The stream dropped while the server is still considered up: reconnect once it answers.
@@ -136,19 +147,58 @@ export class ChatController {
     }
 
     private async onEvent(event: ChatEvent): Promise<void> {
+        if (event.type === 'server.connected') {
+            if (!this.streamSeen) { this.streamSeen = true; return; }
+            // A reconnect after a drop: anything emitted in between is gone, so rebuild from the server.
+            this.host.log('event stream reconnected; re-syncing sessions and transcript');
+            await this.resync().catch(error => this.host.log(`re-sync failed: ${errorMessage(error)}`));
+            return;
+        }
         if (event.type === 'catalog.changed') {
             // A freshly spawned server reports agents/models a moment after /api/info answers; coalesce the burst.
             if (this.catalogTimer) clearTimeout(this.catalogTimer);
             this.catalogTimer = setTimeout(() => {
                 this.catalogTimer = undefined;
-                if (!this.disposed) void this.loadCatalog().catch(error => this.host.log(`catalog reload failed: ${describe(error)}`));
+                if (!this.disposed) void this.loadCatalog().catch(error => this.host.log(`catalog reload failed: ${errorMessage(error)}`));
             }, 300);
             return;
         }
+        if (event.type === 'permission.asked' || event.type === 'question.asked') event = await this.tagRoot(event);
         this.host.post({ type: 'event', event });
         if (event.type === 'file.edited') {
-            await this.host.filesEdited(event.sessionId, event.files).catch(error => this.host.log(`diff review failed: ${describe(error)}`));
+            // Fire and forget: the reviewer may keep a diff editor open for a while and must not stall deltas.
+            void this.host.filesEdited(event.sessionId, event.files).catch(error => this.host.log(`diff review failed: ${errorMessage(error)}`));
         }
+    }
+
+    private async resync(): Promise<void> {
+        await this.loadCatalog();
+        await this.refreshSessions();
+        if (this.currentSessionId) await this.openSession(this.currentSessionId);
+    }
+
+    /** Attach `rootSessionId` to cards raised by subagent sessions so the webview shows them on the parent. */
+    private async tagRoot<E extends Extract<ChatEvent, { type: 'permission.asked' | 'question.asked' }>>(event: E): Promise<E> {
+        const sessionId = event.type === 'permission.asked' ? event.request.sessionId : event.question.sessionId;
+        if (!this.client || sessionId === this.currentSessionId) return event;
+        const root = await this.rootOf(this.client, sessionId).catch(() => sessionId);
+        if (root === sessionId) return event;
+        return event.type === 'permission.asked'
+            ? { ...event, request: { ...event.request, rootSessionId: root } }
+            : { ...event, question: { ...event.question, rootSessionId: root } };
+    }
+
+    private async rootOf(client: OpenCodeClient, sessionId: string): Promise<string> {
+        const cached = this.roots.get(sessionId);
+        if (cached) return cached;
+        let id = sessionId;
+        for (let depth = 0; depth < MAX_PARENT_DEPTH; depth++) {
+            const parent = (await client.getSession(id)).parentId;
+            if (!parent || parent === id) break;
+            id = parent;
+        }
+        this.roots.set(sessionId, id);
+        return id;
     }
 
     private async loadCatalog(): Promise<void> {
@@ -157,11 +207,16 @@ export class ChatController {
         const [models, providers, agents] = await Promise.all([client.listModels(), client.listProviders(), client.listAgents()]);
         this.catalog = { models, providers, agents };
         this.host.post({ type: 'catalog', catalog: this.catalog });
+        const defaults = this.host.defaults();
         if (!this.pendingModel) {
-            const configured = this.host.defaults().model;
-            this.pendingModel = configured && models.some(model => modelKey(model) === modelKey(configured)) ? configured : await client.defaultModel();
+            this.pendingModel = defaults.model && models.some(model => modelKey(model) === modelKey(defaults.model)) ? defaults.model : await client.defaultModel();
         }
-        if (!this.pendingAgent) this.pendingAgent = this.host.defaults().agent ?? agents.find(agent => agent.mode !== 'subagent' && !agent.hidden)?.id;
+        if (!this.pendingAgent) {
+            // Validate the configured agent against the catalog; until the server has reported agents, trust the setting.
+            const selectable = agents.filter(agent => agent.mode !== 'subagent' && !agent.hidden);
+            const configured = defaults.agent;
+            this.pendingAgent = !selectable.length || (configured && selectable.some(agent => agent.id === configured)) ? configured : selectable[0]?.id;
+        }
         this.postSelection();
     }
 
@@ -182,10 +237,22 @@ export class ChatController {
         this.host.post(message);
     }
 
+    /** Pending permissions of the session and of its subagents (tagged with the root so they render). */
+    private async pendingPermissions(client: OpenCodeClient, sessionId: string): Promise<PermissionRequest[]> {
+        const own = client.listPendingPermissions(sessionId);
+        const children = await client.listChildSessions(sessionId).catch(error => { this.host.log(`child sessions unavailable: ${errorMessage(error)}`); return []; });
+        const nested = await Promise.all(children.map(async child => {
+            this.roots.set(child.id, sessionId);
+            const requests = await client.listPendingPermissions(child.id).catch(() => []);
+            return requests.map(request => ({ ...request, rootSessionId: sessionId }));
+        }));
+        return [...await own, ...nested.flat()];
+    }
+
     private async openSession(sessionId: string): Promise<void> {
         const client = await this.ensureClient();
         this.currentSessionId = sessionId;
-        const [session, messages, permissions] = await Promise.all([client.getSession(sessionId), client.getSessionMessages(sessionId), client.listPendingPermissions(sessionId)]);
+        const [session, messages, permissions] = await Promise.all([client.getSession(sessionId), client.getSessionMessages(sessionId), this.pendingPermissions(client, sessionId)]);
         if (session.model) this.pendingModel = session.model;
         if (session.agent) this.pendingAgent = session.agent;
         this.postSelection();
@@ -231,7 +298,21 @@ export class ChatController {
         this.host.post({ type: 'event', event: { type: 'message.user', message } });
     }
 
-    async handle(message: WebviewToHost): Promise<void> {
+    private async searchFiles(query: string, limit: number): Promise<string[]> {
+        // The server's ripgrep-backed fuzzy find respects .gitignore; the editor index answers the bare "@" and outages.
+        if (this.client && query) {
+            try { return await this.client.findFiles(query, limit); } catch (error) { this.host.log(`server file search failed: ${errorMessage(error)}`); }
+        }
+        return this.host.searchFiles(query, limit);
+    }
+
+    /** Entry point for raw webview messages: anything malformed is dropped before it can reach a client call. */
+    async handle(raw: unknown): Promise<void> {
+        if (!isWebviewToHost(raw)) {
+            this.host.log(`ignored malformed webview message: ${describeShape(raw)}`);
+            return;
+        }
+        const message: WebviewToHost = raw;
         // Every branch awaits (no `return promise`) so the catch below sees rejections.
         try {
             switch (message.type) {
@@ -260,7 +341,7 @@ export class ChatController {
                 case 'permission': await (await this.ensureClient()).replyPermission(message.sessionId, message.requestId, message.decision); return;
                 case 'question': await (await this.ensureClient()).replyQuestion(message.sessionId, message.questionId, message.answer); return;
                 case 'searchFiles': {
-                    const files = await this.host.searchFiles(message.query, 20);
+                    const files = await this.searchFiles(message.query, 20);
                     this.host.post({ type: 'fileResults', requestId: message.requestId, files });
                     return;
                 }
@@ -273,14 +354,14 @@ export class ChatController {
     }
 
     private fail(error: unknown): void {
-        const text = describe(error);
+        const text = errorMessage(error);
         this.host.log(`error: ${text}`);
         this.host.post({ type: 'error', message: text });
     }
 }
 
-function describe(error: unknown): string {
-    if (error instanceof Error) return error.message;
-    if (typeof error === 'object' && error && 'message' in error) return String((error as { message: unknown }).message);
-    return String(error);
+function describeShape(value: unknown): string {
+    if (typeof value !== 'object' || value === null) return typeof value;
+    const type = (value as { type?: unknown }).type;
+    return typeof type === 'string' ? `type=${type.slice(0, 40)}` : 'no type';
 }

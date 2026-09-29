@@ -298,6 +298,7 @@ function renderPermission(request: PermissionRequest): HTMLElement {
     const reply = (decision: 'once' | 'always' | 'reject') => () => post({ type: 'permission', sessionId: request.sessionId, requestId: request.id, decision });
     const card = el('div', { class: 'card' },
         el('div', { class: 'title', text: `Permission: ${request.action}` }),
+        request.sessionId !== state.currentSessionId ? el('div', { class: 'desc', text: 'Asked by a subagent of this session' }) : null,
         request.message ? el('div', { text: request.message }) : null,
         el('div', { class: 'resources', text: request.resources.join('\n') }),
     );
@@ -312,7 +313,8 @@ function renderPermission(request: PermissionRequest): HTMLElement {
 
 function renderQuestion(question: Question): HTMLElement {
     const readers: Array<() => [string, QuestionAnswer[string]] | undefined> = [];
-    const card = el('div', { class: 'card' }, el('div', { class: 'title', text: question.title }));
+    const card = el('div', { class: 'card' }, el('div', { class: 'title', text: question.title }),
+        question.sessionId !== state.currentSessionId ? el('div', { class: 'desc', text: 'Asked by a subagent of this session' }) : null);
     for (const field of question.fields) {
         const wrapper = el('div', { class: 'field' }, el('label', { text: field.title ?? field.key }), field.description ? el('div', { class: 'desc', text: field.description }) : null);
         if (field.type === 'external') { wrapper.append(el('div', { class: 'desc', text: 'Answer this in the OpenCode web UI.' })); card.append(wrapper); continue; }

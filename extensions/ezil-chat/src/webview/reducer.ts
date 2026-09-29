@@ -4,7 +4,7 @@ import type {
     AgentSummary, ChatEvent, ChatMessage, MessagePart, ModelId, ModelSummary, PermissionRequest, ProviderSummary,
     Question, SessionSummary, TokenUsage, ToolCall,
 } from '../opencode/adapter';
-import type { HostToWebview, Mention, ServerStatus } from '../protocol';
+import type { HostToWebview, ServerStatus } from '../protocol';
 
 export interface UiState {
     server: ServerStatus;
@@ -20,12 +20,11 @@ export interface UiState {
     selectedAgent?: string;
     /** True between the user's send and the session going idle. */
     busy: boolean;
-    mentions: Mention[];
     error?: string;
 }
 
 export function initialState(): UiState {
-    return { server: { status: 'stopped' }, sessions: [], messages: [], permissions: [], questions: [], models: [], providers: [], agents: [], busy: false, mentions: [] };
+    return { server: { status: 'stopped' }, sessions: [], messages: [], permissions: [], questions: [], models: [], providers: [], agents: [], busy: false };
 }
 
 export function reduce(state: UiState, message: HostToWebview): UiState {
@@ -55,10 +54,8 @@ export function reduce(state: UiState, message: HostToWebview): UiState {
             return next;
         }
         case 'event': return applyEvent(state, message.event);
-        case 'mention': {
-            const exists = state.mentions.some(item => item.path === message.mention.path && item.start === message.mention.start && item.end === message.mention.end);
-            return exists ? state : { ...state, mentions: [...state.mentions, message.mention] };
-        }
+        // Composer-only messages: main.ts consumes them before they reach the reducer.
+        case 'mention':
         case 'fileResults': return state;
         case 'error': return { ...state, error: message.message, busy: false };
         default: return state;
@@ -214,13 +211,14 @@ export function applyEvent(state: UiState, event: ChatEvent): UiState {
             return { ...state, busy: false, error: text };
         }
         case 'permission.asked': {
-            if (!inCurrent(state, event.request.sessionId)) return state;
+            // Subagent requests carry the root session they block; show them on the parent's transcript.
+            if (!inCurrent(state, event.request.rootSessionId ?? event.request.sessionId)) return state;
             if (state.permissions.some(request => request.id === event.request.id)) return state;
             return { ...state, permissions: [...state.permissions, event.request] };
         }
         case 'permission.replied': return { ...state, permissions: state.permissions.filter(request => request.id !== event.requestId) };
         case 'question.asked': {
-            if (!inCurrent(state, event.question.sessionId)) return state;
+            if (!inCurrent(state, event.question.rootSessionId ?? event.question.sessionId)) return state;
             if (state.questions.some(question => question.id === event.question.id)) return state;
             return { ...state, questions: [...state.questions, event.question] };
         }

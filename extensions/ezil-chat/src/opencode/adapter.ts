@@ -10,6 +10,8 @@ export interface TokenUsage { input: number; output: number; reasoning: number; 
 
 export interface SessionSummary {
     id: string;
+    /** Set on subagent (task tool) sessions; the parent is what the panel shows. */
+    parentId?: string;
     title: string;
     directory: string;
     agent?: string;
@@ -56,6 +58,8 @@ export interface FileDiff { file: string; patch: string; additions: number; dele
 export interface PermissionRequest {
     id: string;
     sessionId: string;
+    /** Set by the controller when `sessionId` is a subagent of the session the panel shows. */
+    rootSessionId?: string;
     action: string;
     resources: string[];
     save?: string[];
@@ -77,7 +81,7 @@ export interface QuestionField {
     defaultValue?: string | number | boolean | string[];
 }
 /** OpenCode v2 calls these "forms"; the question tool creates one per question. */
-export interface Question { id: string; sessionId: string; title: string; fields: QuestionField[] }
+export interface Question { id: string; sessionId: string; rootSessionId?: string; title: string; fields: QuestionField[] }
 export type QuestionAnswer = Record<string, string | number | boolean | string[]>;
 
 export type ToolStatus = 'pending' | 'running' | 'completed' | 'error';
@@ -153,7 +157,10 @@ export interface ServerHealth { version: string; pid?: number }
 export interface OpenCodeClient {
     health(): Promise<ServerHealth>;
     createSession(options?: { title?: string; agent?: string; model?: ModelId }): Promise<SessionSummary>;
+    /** Root sessions in the workspace, newest first. */
     listSessions(limit?: number): Promise<SessionSummary[]>;
+    /** Subagent sessions spawned by `parentId` (their permissions belong on the parent's card list). */
+    listChildSessions(parentId: string): Promise<SessionSummary[]>;
     getSession(sessionId: string): Promise<SessionSummary>;
     /** Enqueue a prompt; the turn streams back through {@link events}. Resolves with the user message id. */
     prompt(sessionId: string, parts: PromptPart[], options?: PromptOptions): Promise<{ messageId: string }>;
@@ -169,8 +176,9 @@ export interface OpenCodeClient {
     listModels(): Promise<ModelSummary[]>;
     defaultModel(): Promise<ModelId | undefined>;
     listAgents(): Promise<AgentSummary[]>;
+    /** The newest messages of a session (up to the implementation's page size), oldest first. */
     getSessionMessages(sessionId: string): Promise<ChatMessage[]>;
-    getDiff(sessionId: string): Promise<FileDiff[]>;
+    /** Server-side fuzzy file search under the workspace (respects .gitignore). */
     findFiles(query: string, limit?: number): Promise<string[]>;
 }
 

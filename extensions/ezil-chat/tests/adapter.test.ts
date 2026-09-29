@@ -38,7 +38,10 @@ beforeAll(async () => {
         const route = `${request.method} ${url.pathname}`;
         if (route === 'GET /api/info') return json(response, 200, { version: '2.0.19', pid: 1, urls: [baseUrl], paths: { tmp: '/tmp' } });
         if (route === 'POST /api/session') return json(response, 200, { data: sessionInfo('ses_new', (body as { title?: string }).title ?? 'Untitled session') });
-        if (route === 'GET /api/session') return json(response, 200, { data: [sessionInfo('ses_1'), { ...sessionInfo('ses_child'), parentID: 'ses_1' }], cursor: {} });
+        if (route === 'GET /api/session') {
+            const children = [{ ...sessionInfo('ses_child'), parentID: 'ses_1' }];
+            return json(response, 200, { data: url.searchParams.get('parentID') === 'ses_1' ? children : [sessionInfo('ses_1'), ...children], cursor: {} });
+        }
         if (route === 'GET /api/session/ses_1') return json(response, 200, { data: sessionInfo('ses_1') });
         if (route === 'POST /api/session/ses_1/model' || route === 'POST /api/session/ses_1/agent') { response.writeHead(204); return response.end(); }
         if (route === 'POST /api/session/ses_1/prompt') return json(response, 200, { data: { id: 'msg_u1', sessionID: 'ses_1', time: { created: 1 }, type: 'user', payload: body, delivery: 'steer' } });
@@ -46,7 +49,6 @@ beforeAll(async () => {
         if (route === 'POST /api/session/ses_1/permission/per_1/reply') { response.writeHead(204); return response.end(); }
         if (route === 'POST /api/session/ses_1/form/frm_1/reply') { response.writeHead(204); return response.end(); }
         if (route === 'GET /api/session/ses_1/permission') return json(response, 200, { data: [{ id: 'per_1', sessionID: 'ses_1', action: 'edit', resources: ['/ws/a.ts'] }] });
-        if (route === 'GET /api/session/ses_1/diff') return json(response, 200, { data: [{ file: 'a.ts', patch: '@@', additions: 1, deletions: 0, status: 'modified' }] });
         if (route === 'GET /api/session/ses_1/message') return json(response, 200, { data: [
             { id: 'm2', time: { created: 2, completed: 3 }, type: 'assistant', agent: 'build', model: { id: 'x', providerID: 'p' }, content: [{ type: 'text', text: 'hello' }], finish: 'stop' },
             { id: 'm1', time: { created: 1 }, type: 'user', text: 'hi' },
@@ -103,6 +105,9 @@ test('sessions: create with location, list drops subagent children, get normaliz
     expect(sessions.map(session => session.id)).toEqual(['ses_1']);
     expect(sessions[0]?.tokens).toEqual({ input: 1, output: 2, reasoning: 3, cacheRead: 4, cacheWrite: 5 });
     expect((await c.getSession('ses_1')).cost).toBe(0.5);
+    const children = await c.listChildSessions('ses_1');
+    expect(last().query.get('parentID')).toBe('ses_1');
+    expect(children.map(session => [session.id, session.parentId])).toEqual([['ses_child', 'ses_1']]);
 });
 
 test('prompt switches model/agent first, then posts text with file mentions as file:// URIs', async () => {
@@ -132,16 +137,16 @@ test('prompt switches model/agent first, then posts text with file mentions as f
     expect(fileMentionUri('/ws', { type: 'file', path: '/abs/with space.ts' })).toBe('file:///abs/with%20space.ts');
 });
 
-test('permission, question, abort, diff, messages, catalog and file search map to v2 routes', async () => {
+test('permission, question, abort, messages, catalog and file search map to v2 routes', async () => {
     const c = client();
     await c.replyPermission('ses_1', 'per_1', 'always');
     expect(last()).toMatchObject({ method: 'POST', path: '/api/session/ses_1/permission/per_1/reply', body: { decision: 'always' } });
     await c.replyQuestion('ses_1', 'frm_1', { choice: 'a', many: ['x', 'y'] });
     expect(last()).toMatchObject({ path: '/api/session/ses_1/form/frm_1/reply', body: { answer: { choice: 'a', many: ['x', 'y'] } } });
     expect(await c.abort('ses_1')).toBe(true);
-    expect(await c.getDiff('ses_1')).toEqual([{ file: 'a.ts', patch: '@@', additions: 1, deletions: 0, status: 'modified' }]);
     expect(await c.listPendingPermissions('ses_1')).toEqual([{ id: 'per_1', sessionId: 'ses_1', action: 'edit', resources: ['/ws/a.ts'] }]);
     const messages = await c.getSessionMessages('ses_1');
+    expect(last().query.get('order')).toBe('desc'); // newest page, flipped back to chronological below
     expect(messages.map(message => [message.role, message.id])).toEqual([['user', 'm1'], ['assistant', 'm2']]);
     expect(await c.listProviders()).toEqual([{ id: 'azure', name: 'Azure', enabled: true }, { id: 'opencode', name: 'OpenCode Zen', enabled: false }]);
     const models = await c.listModels();

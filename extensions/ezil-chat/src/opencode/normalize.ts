@@ -27,6 +27,7 @@ export function session(info: SessionInfo): SessionSummary {
         id: info.id, title: info.title ?? 'Untitled session', directory: info.location.directory,
         created: info.time.created, updated: info.time.updated, tokens: usage(info.tokens), cost: info.cost,
     };
+    if (info.parentID) summary.parentId = info.parentID;
     if (info.agent) summary.agent = info.agent;
     const model = modelRef(info.model);
     if (model) summary.model = model;
@@ -165,6 +166,7 @@ export function event(raw: OpenCodeEvent): ChatEvent[] {
                 id: d.sessionID, title: d.title ?? 'Untitled session', directory: d.location.directory,
                 created: raw.created, updated: raw.created, tokens: emptyUsage(), cost: 0,
             };
+            if (d.parentID) summary.parentId = d.parentID;
             if (d.agent) summary.agent = d.agent;
             const ref = modelRef(d.model);
             if (ref) summary.model = ref;

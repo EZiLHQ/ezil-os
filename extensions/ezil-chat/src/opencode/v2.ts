@@ -2,7 +2,7 @@
 // Only this file knows the SDK; keep the surface in `adapter.ts`.
 import { OpenCode } from '@opencode/client';
 import type {
-    AgentSummary, ChatEvent, ChatMessage, FileDiff, ModelId, ModelSummary, OpenCodeClient, PermissionDecision,
+    AgentSummary, ChatEvent, ChatMessage, ModelId, ModelSummary, OpenCodeClient, PermissionDecision,
     PermissionRequest, PromptOptions, PromptPart, ProviderSummary, QuestionAnswer, ServerHealth, SessionSummary,
 } from './adapter';
 import { basicAuthHeader } from './auth';
@@ -60,6 +60,11 @@ export class V2Client implements OpenCodeClient {
     async listSessions(limit = 50): Promise<SessionSummary[]> {
         const response = await this.client.session.list({ directory: this.directory, limit, order: 'desc' });
         return response.data.filter(info => !info.parentID).map(normalize.session);
+    }
+
+    async listChildSessions(parentId: string): Promise<SessionSummary[]> {
+        const response = await this.client.session.list({ directory: this.directory, parentID: parentId, limit: 100, order: 'desc' });
+        return response.data.filter(info => info.parentID === parentId).map(normalize.session);
     }
 
     async getSession(sessionId: string): Promise<SessionSummary> {
@@ -135,17 +140,14 @@ export class V2Client implements OpenCodeClient {
     }
 
     async getSessionMessages(sessionId: string): Promise<ChatMessage[]> {
-        const response = await this.client.message.list({ sessionID: sessionId, order: 'asc', limit: 200 });
+        // Newest page first, then flipped: a long session shows its latest 200 messages, not its first.
+        const response = await this.client.message.list({ sessionID: sessionId, order: 'desc', limit: 200 });
         const messages: ChatMessage[] = [];
         for (const info of response.data) {
             const message = normalize.message(info, sessionId);
             if (message) messages.push(message);
         }
-        return messages.sort((a, b) => a.created - b.created);
-    }
-
-    async getDiff(sessionId: string): Promise<FileDiff[]> {
-        return (await this.client.session.diff({ sessionID: sessionId })).map(normalize.fileDiff);
+        return messages.reverse();
     }
 
     async findFiles(query: string, limit = 20): Promise<string[]> {
