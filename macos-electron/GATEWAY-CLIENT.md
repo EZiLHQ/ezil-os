@@ -26,6 +26,7 @@ minimum defaults to 16 and omitted default to 4,096, bounded by the model range.
 Models whose minimum exceeds the client ceiling are hidden. Each logical chat
 invocation has one Idempotency-Key; no inference is automatically retried.
 
-Scope note: native Settings' preload.cjs status sanitizer still filters its
-model-name summary to the original aliases; the broker and VS Code model catalog
-use the dynamic registry. That separate UI file is outside this worker's ownership.
+Native Settings' preload.cjs status sanitizer also accepts the dynamic registry
+IDs using the same bounded identifier pattern, with at most 100 entries. The
+broker, Settings summary and VS Code catalog no longer restrict names to the
+original two aliases.
