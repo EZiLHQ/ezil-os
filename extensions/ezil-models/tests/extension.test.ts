@@ -133,8 +133,18 @@ describe('ConfigStore', () => {
         const store = new ConfigStore(file, () => undefined);
         store.watch();
         store.load();
-        fs.writeFileSync(file, VALID_TWO);
-        expect(await until(() => store.models().length === 2)).toBe(true);
+        expect(store.models().length).toBe(1);
+        // Bun arms an inotify watcher asynchronously, so a write that lands before it is armed produces no event.
+        // Rewriting the same new bytes every 500 ms (longer than the store's 250 ms debounce) until the reload
+        // shows up keeps the test deterministic without weakening it: the test never calls load() after the
+        // rewrite, so a second model can only appear through the watcher's own `load(true)`.
+        const deadline = Date.now() + 5000;
+        let nextWrite = 0;
+        while (Date.now() < deadline && store.models().length !== 2) {
+            if (Date.now() >= nextWrite) { fs.writeFileSync(file, VALID_TWO); nextWrite = Date.now() + 500; }
+            await Bun.sleep(50);
+        }
+        expect(store.models().map(model => model.id)).toEqual(['m', 'n']);
         store.dispose();
     });
 

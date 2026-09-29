@@ -347,11 +347,11 @@ RUN mkdir -p /tmp/ezil-chat \
 # Foundry resource (`{env:AZURE_RESOURCE_NAME}` + `{env:AZURE_API_KEY}`) and
 # OpenAI (`{env:OPENAI_API_KEY}`). No secret is in the image; "just put the
 # key" = set the variable on the container. The gate rejects a literal key.
-# Note (extensions/ezil-models/src/config.ts): the file is validated as a
-# whole, so an UNSET variable makes the extension serve NO models and report
-# the missing name in its output channel until the variable is set or that
-# provider and its models are removed — override the path with
-# EZIL_MODELS_CONFIG to ship a smaller file (the e2e does exactly that).
+# Note (extensions/ezil-models/src/config.ts): a provider whose variable is
+# UNSET is skipped — its models are not served and one warning naming the
+# variable (never a value) goes to the output channel — while every other
+# provider keeps serving, so set only the keys you have. Override the path
+# with EZIL_MODELS_CONFIG to ship a smaller file (the e2e does exactly that).
 COPY ezil-models/dist/ezil-models-0.1.0.vsix /tmp/ezil-models.vsix
 RUN mkdir -p /tmp/ezil-models \
   && unzip -q /tmp/ezil-models.vsix 'extension/*' -d /tmp/ezil-models \
