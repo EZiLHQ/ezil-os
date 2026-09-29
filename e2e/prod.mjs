@@ -19,6 +19,7 @@
  * (never a pass — the whole point is that a skipped check must not look green).
  */
 import { createRequire } from 'node:module';
+import { APP, appHeaders, configureAppContext } from './deployed-target.mjs';
 
 const REQ_DIR = process.env.PLAYWRIGHT_REQUIRE_DIR;
 if (!REQ_DIR) { console.error('SKIP: PLAYWRIGHT_REQUIRE_DIR unset'); process.exit(2); }
@@ -27,7 +28,6 @@ let chromium;
 try { ({ chromium } = require_('playwright')); }
 catch (e) { console.error('SKIP: playwright unresolvable from ' + REQ_DIR); process.exit(2); }
 
-const APP    = process.env.EZIL_E2E_APP   ?? 'https://ezil-os.vercel.app';
 const WORKER = process.env.EZIL_E2E_WORKER?? 'https://api-desktop.ezil.org';
 // 🔴 NO CREDENTIAL DEFAULTS. This suite signs in to the LIVE deployment, so a
 // hardcoded fallback here is a working production account published in a
@@ -52,7 +52,7 @@ async function sanity() {
   check('sanity', 'worker reports neko mode supported',
     Array.isArray(h?.supportedDesktopModes) && h.supportedDesktopModes.includes('neko'));
 
-  const login = await fetch(`${APP}/`, { redirect: 'manual' });
+  const login = await fetch(`${APP}/`, { redirect: 'manual', headers: appHeaders });
   check('sanity', 'app root redirects unauthenticated to /login',
     login.status === 307 && (login.headers.get('location') ?? '').includes('/login'),
     `${login.status}`);
@@ -93,6 +93,7 @@ async function browserTiers() {
           userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
         } : {}),
       });
+      await configureAppContext(ctx);
       const p = await ctx.newPage();
       const consoleErrors = [];
       p.on('console', m => { if (m.type() === 'error') consoleErrors.push(m.text().slice(0, 160)); });

@@ -1,0 +1,428 @@
+# Cloud CI/CD: CI -> staging Worker -> source-built Vercel preview -> deployed
+# tests -> (main only) production Worker -> source-built Vercel app -> tests.
+# Tag desktop/image/release workflows retain their existing triggers and jobs.
+#
+# Prerequisites, configured outside this workflow:
+# - GitHub environments `staging` and `production`, with environment-scoped
+#   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, VERCEL_TOKEN, VERCEL_ORG_ID,
+#   VERCEL_PROJECT_ID, EZIL_E2E_EMAIL, EZIL_E2E_PASSWORD secrets, OS_WORKER_URL
+#   variable, and optional VERCEL_AUTOMATION_BYPASS_SECRET secret.
+# - Vercel project rootDirectory=app. Preview settings must use staging auth,
+#   database and matching Worker HMAC; production settings use production.
+#   Disable overlapping Vercel Git deployments; this workflow owns ordering.
+# - worker/wrangler.toml must define env.staging with isolated routes, Sandbox
+#   bindings/containers, R2 buckets and vars. Provision secrets/resources out of
+#   band. A workers.dev URL is insufficient for the desktop's exposed ports.
+#   The Worker owner must also isolate preview-host routing: current
+#   normalizeSandboxHostname collapses every *.ezil.org host to ezil.org.
+# No schema migration, desktop release publication or production alias promotion
+# from preview: production is rebuilt with its own environment settings.
+name: Cloud preview and main deploy
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  trust:
+    name: Admit successful trusted CI source
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      allowed: ${{ steps.source.outputs.allowed }}
+      sha: ${{ steps.source.outputs.sha }}
+      production: ${{ steps.source.outputs.production }}
+    steps:
+      # No checkout, artifacts, caches, environments or deployment secrets here.
+      # workflow_run is privileged even for a fork PR: head_repository alone
+      # is insufficient, so re-read the PR's actual head repository and SHA.
+      - uses: actions/github-script@v8
+        id: source
+        with:
+          script: |
+            core.setOutput('allowed', 'false');
+            core.setOutput('production', 'false');
+            const repo = context.repo;
+            const fullName = `${repo.owner}/${repo.repo}`;
+            if (context.eventName === 'pull_request') {
+              const number = context.payload.pull_request?.number;
+              if (!number) return;
+              const { data: initial } = await github.rest.pulls.get({ ...repo, pull_number: number });
+              if (initial.state !== 'open' || initial.draft || initial.base.ref !== 'main' ||
+                  initial.base.repo.full_name.toLowerCase() !== fullName.toLowerCase() ||
+                  initial.head.repo?.full_name.toLowerCase() !== fullName.toLowerCase()) return;
+              const sha = initial.head.sha;
+              for (let attempt = 0; attempt < 120; attempt++) {
+                const { data } = await github.rest.actions.listWorkflowRuns({
+                  ...repo, workflow_id: 'ci.yml', head_sha: sha, event: 'pull_request', per_page: 20,
+                });
+                const ci = data.workflow_runs.find(run => run.head_sha === sha && run.path === '.github/workflows/ci.yml');
+                if (ci?.status === 'completed') {
+                  if (ci.conclusion !== 'success') return;
+                  const { data: current } = await github.rest.pulls.get({ ...repo, pull_number: number });
+                  if (current.state !== 'open' || current.head.sha !== sha ||
+                      current.head.repo?.full_name.toLowerCase() !== fullName.toLowerCase()) return;
+                  core.setOutput('sha', sha);
+                  core.setOutput('allowed', 'true');
+                  return;
+                }
+                await new Promise(resolve => setTimeout(resolve, 20000));
+              }
+              core.setFailed('Timed out waiting for public CI on this PR commit');
+              return;
+            }
+            const run = context.payload.workflow_run;
+            if (run.conclusion !== 'success' || context.payload.repository?.full_name !== fullName ||
+                run.head_repository?.full_name !== fullName ||
+                !/^[a-f0-9]{40}$/.test(run.head_sha) ||
+                run.actor?.login === 'dependabot[bot]') return;
+            const { data: workflow } = await github.rest.actions.getWorkflow({
+              ...repo, workflow_id: run.workflow_id,
+            });
+            if (workflow.path !== '.github/workflows/ci.yml') return;
+            if (run.event === 'push' && run.head_branch === 'main') {
+              const { data: ref } = await github.rest.git.getRef({ ...repo, ref: 'heads/main' });
+              if (ref.object.sha !== run.head_sha) return;
+              core.setOutput('production', 'true');
+            } else return;
+            core.setOutput('sha', run.head_sha);
+            core.setOutput('allowed', 'true');
+
+  preview:
+    name: Deploy and verify staging
+    needs: trust
+    if: needs.trust.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Lock through verification so another trusted branch cannot replace the
+    # shared staging Worker while the browser suites are running.
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    environment:
+      name: staging
+      url: ${{ steps.app.outputs.url }}
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    outputs:
+      url: ${{ steps.app.outputs.url }}
+      worker_version: ${{ steps.identity.outputs.worker_version }}
+      vercel_deployment: ${{ steps.identity.outputs.vercel_deployment }}
+    env:
+      EZIL_DEPLOY_SHA: ${{ needs.trust.outputs.sha }}
+      EZIL_DEPLOY_TARGET: preview
+      EZIL_E2E_REQUIRE_TARGET: '1'
+      EZIL_E2E_WORKER: ${{ vars.OS_WORKER_URL }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.trust.outputs.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Validate cloud test helpers without network requests
+        env:
+          EZIL_E2E_APP: https://preview-test.vercel.app
+        run: node e2e/cloud-ci.test.mjs
+      - name: Check source and named staging isolation before any deployment
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EZIL_DEPLOY_SHA"
+          python3 - <<'PY'
+          import fnmatch, os, re, tomllib
+          from urllib.parse import urlparse
+          with open('worker/wrangler.toml', 'rb') as f:
+              config = tomllib.load(f)
+          stage = config.get('env', {}).get('staging')
+          assert stage, 'Configure worker/wrangler.toml [env.staging]; refusing default-env fallback'
+          name = stage.get('name', '')
+          assert re.fullmatch(r'[a-zA-Z0-9-]+', name) and name != config['name'], 'Staging needs a distinct explicit Worker name'
+          for key in ('routes', 'containers', 'durable_objects', 'r2_buckets', 'vars'):
+              assert stage.get(key), f'env.staging must explicitly configure {key}'
+          assert stage['vars'].get('SANDBOX_DEFAULT_DESKTOP_MODE') == 'neko', 'Staging must enable neko'
+          assert stage['vars'].get('SANDBOX_NEKO_ICE_POLICY') == 'relay', 'Staging must use TURN relay'
+          production_routes = {r['pattern'] for r in config.get('routes', [])}
+          assert all(r['pattern'] not in production_routes for r in stage['routes']), 'Staging reuses a production route'
+          production_zones = {r['zone_name'] for r in config.get('routes', []) if r.get('zone_name')}
+          assert all(r.get('zone_name') not in production_zones for r in stage['routes']), 'Use a separate staging zone with the current Worker routing'
+          production_buckets = {b['bucket_name'] for b in config.get('r2_buckets', [])}
+          assert all(b.get('bucket_name') and b['bucket_name'] not in production_buckets for b in stage['r2_buckets']), 'Staging must use separate R2 buckets'
+          bindings = stage['durable_objects'].get('bindings', [])
+          assert any(b.get('name') == 'Sandbox' and b.get('class_name') == 'Sandbox' for b in bindings), 'Missing staging Sandbox binding'
+          assert all(not b.get('script_name') for b in bindings), 'Staging must not bind another Worker namespace'
+          url = urlparse(os.environ['EZIL_E2E_WORKER'])
+          assert url.scheme == 'https' and url.hostname and not url.username and not url.password and not url.query and not url.fragment and url.path in ('', '/'), 'OS_WORKER_URL must be an HTTPS origin'
+          assert not url.hostname.endswith('.workers.dev'), 'Staging requires a custom desktop domain'
+          assert url.hostname != 'ezil.org' and not url.hostname.endswith('.ezil.org'), 'Current Worker folds *.ezil.org into production preview routes; use a separate staging domain'
+          assert any(fnmatch.fnmatch(f'{url.netloc}/health', r['pattern']) or
+                     (r.get('custom_domain') and r['pattern'] == url.hostname)
+                     for r in stage['routes']), 'Staging routes must cover OS_WORKER_URL'
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f'EZIL_WORKER_NAME={name}\n')
+          PY
+          bash shell/build-shell.sh --check
+      - name: Validate configured secrets
+        env: &deployment_secrets
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for key in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID EZIL_E2E_EMAIL EZIL_E2E_PASSWORD; do
+            if [[ -z "${!key}" ]]; then echo "::error::Missing staging secret: $key"; exit 1; fi
+          done
+          node e2e/verify-cloud-deployment.mjs project
+      - name: Install Worker dependencies
+        working-directory: worker
+        run: bun install --frozen-lockfile
+      - name: Install Vercel CLI
+        run: npm install --global vercel@57.0.0
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
+          aws-region: us-east-1
+      - name: Acquire shared staging lease
+        id: lease
+        env:
+          LEASE_OWNER: os-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 .github/scripts/staging-lock.py acquire --owner "$LEASE_OWNER" --ttl 5400 --wait 1200
+      - name: Apply changed OS SQL to shared test database
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          files=()
+          while IFS= read -r file; do
+            [[ "$file" == app/drizzle/*.sql ]] || continue
+            files+=("${file##*/}")
+          done < <(git diff --name-only --diff-filter=ACMRT "$BASE_SHA" "$EZIL_DEPLOY_SHA" -- app/drizzle)
+          if (( ${#files[@]} == 0 )); then
+            echo 'No OS SQL changes to apply'
+            exit 0
+          fi
+          node app/scripts/ci-migrate.mjs --dry-run "${files[@]}"
+          [[ -n "$SUPABASE_ACCESS_TOKEN" ]] || { echo '::error::SUPABASE_ACCESS_TOKEN is required for changed SQL'; exit 1; }
+          node app/scripts/ci-migrate.mjs --apply "${files[@]}"
+      - name: Deploy named staging Worker
+        working-directory: worker
+        timeout-minutes: 25
+        env: &cloudflare_secrets
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: ./node_modules/.bin/wrangler deploy --env staging --message "git:$EZIL_DEPLOY_SHA"
+      - name: Verify active staging Worker SHA and health
+        env: *cloudflare_secrets
+        run: node e2e/verify-cloud-deployment.mjs worker
+      - name: Deploy Vercel preview from repository source
+        id: app
+        timeout-minutes: 15
+        env: &vercel_secrets
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          url="$(vercel deploy --yes --token="$VERCEL_TOKEN" \
+            --meta "githubCommitSha=$EZIL_DEPLOY_SHA" \
+            --env "CLOUDFLARE_GUACAMOLE_WORKER_URL=$EZIL_E2E_WORKER" \
+            --build-env "CLOUDFLARE_GUACAMOLE_WORKER_URL=$EZIL_E2E_WORKER")"
+          [[ "$url" =~ ^https://[a-zA-Z0-9.-]+\.vercel\.app$ ]]
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "EZIL_E2E_APP=$url" >> "$GITHUB_ENV"
+      - name: Verify preview deployment identity
+        id: identity
+        env: *deployment_secrets
+        run: node e2e/verify-cloud-deployment.mjs
+      - uses: ./.github/actions/setup-playwright
+      - name: Test the returned preview URL
+        timeout-minutes: 15
+        env: &e2e_secrets
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+        run: &deployed_tests |
+          set -euo pipefail
+          node e2e/await-deployed-bundle.mjs
+          for suite in prod prod-responsiveness prod-window-stacking prod-reconcile; do
+            node "e2e/$suite.mjs"
+          done
+      - name: Confirm deployment identity after tests
+        env: *deployment_secrets
+        run: node e2e/verify-cloud-deployment.mjs
+      - name: Release shared staging lease
+        if: always() && steps.lease.outcome == 'success'
+        env:
+          LEASE_OWNER: os-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 .github/scripts/staging-lock.py release --owner "$LEASE_OWNER"
+
+  production:
+    name: Deploy main after staging passes
+    needs: [trust, preview]
+    if: needs.trust.outputs.production == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Share deploy.yml's lock, preserving tag release serialization.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    environment:
+      name: production
+      url: ${{ steps.app.outputs.url }}
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      url: ${{ steps.app.outputs.url }}
+      worker_version: ${{ steps.identity.outputs.worker_version }}
+      vercel_deployment: ${{ steps.identity.outputs.vercel_deployment }}
+    env:
+      EZIL_DEPLOY_SHA: ${{ needs.trust.outputs.sha }}
+      EZIL_DEPLOY_TARGET: production
+      EZIL_E2E_REQUIRE_TARGET: '1'
+      EZIL_E2E_WORKER: ${{ vars.OS_WORKER_URL }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.trust.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Refuse a superseded main commit
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { data: ref } = await github.rest.git.getRef({ ...context.repo, ref: 'heads/main' });
+            if (ref.object.sha !== process.env.EZIL_DEPLOY_SHA) core.setFailed('main moved; wait for its CI run');
+      - name: Validate production configuration
+        env: *deployment_secrets
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EZIL_DEPLOY_SHA"
+          for key in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID EZIL_E2E_EMAIL EZIL_E2E_PASSWORD EZIL_E2E_WORKER; do
+            if [[ -z "${!key}" ]]; then echo "::error::Missing production configuration: $key"; exit 1; fi
+          done
+          node e2e/verify-cloud-deployment.mjs project
+          python3 - <<'PY'
+          import os, tomllib
+          with open('worker/wrangler.toml', 'rb') as f:
+              config = tomllib.load(f)
+          assert config['name'] == 'ezil-os-worker', 'Unexpected production Worker'
+          assert os.environ['EZIL_E2E_WORKER'].rstrip('/') == 'https://api-desktop.ezil.org', 'Unexpected production Worker URL'
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f"EZIL_WORKER_NAME={config['name']}\n")
+          PY
+      - name: Install Worker dependencies
+        working-directory: worker
+        run: bun install --frozen-lockfile
+      - name: Install Vercel CLI
+        run: npm install --global vercel@57.0.0
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Deploy production Worker
+        working-directory: worker
+        timeout-minutes: 25
+        env: *cloudflare_secrets
+        run: ./node_modules/.bin/wrangler deploy --message "git:$EZIL_DEPLOY_SHA"
+      - name: Verify active production Worker SHA and health
+        env: *cloudflare_secrets
+        run: node e2e/verify-cloud-deployment.mjs worker
+      - name: Deploy Vercel production from repository source
+        id: app
+        timeout-minutes: 15
+        env: *vercel_secrets
+        run: |
+          set -euo pipefail
+          url="$(vercel deploy --yes --prod --token="$VERCEL_TOKEN" \
+            --meta "githubCommitSha=$EZIL_DEPLOY_SHA" \
+            --env "CLOUDFLARE_GUACAMOLE_WORKER_URL=$EZIL_E2E_WORKER" \
+            --build-env "CLOUDFLARE_GUACAMOLE_WORKER_URL=$EZIL_E2E_WORKER")"
+          [[ "$url" =~ ^https://[a-zA-Z0-9.-]+\.vercel\.app$ ]]
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "EZIL_E2E_APP=$url" >> "$GITHUB_ENV"
+      - name: Verify production deployment identity
+        id: identity
+        env: *deployment_secrets
+        run: node e2e/verify-cloud-deployment.mjs
+      - uses: ./.github/actions/setup-playwright
+      - name: Test the returned production URL
+        timeout-minutes: 15
+        env: *e2e_secrets
+        run: *deployed_tests
+      - name: Confirm deployment identity after tests
+        env: *deployment_secrets
+        run: node e2e/verify-cloud-deployment.mjs
+
+  summary:
+    name: Cloud deployment summary
+    if: always()
+    needs: [trust, preview, production]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v8
+        env:
+          SOURCE_SHA: ${{ needs.trust.outputs.sha }}
+          TRUSTED: ${{ needs.trust.outputs.allowed }}
+          PREVIEW_RESULT: ${{ needs.preview.result }}
+          PREVIEW_URL: ${{ needs.preview.outputs.url }}
+          PREVIEW_WORKER: ${{ needs.preview.outputs.worker_version }}
+          PREVIEW_DEPLOYMENT: ${{ needs.preview.outputs.vercel_deployment }}
+          PRODUCTION_RESULT: ${{ needs.production.result }}
+          PRODUCTION_URL: ${{ needs.production.outputs.url }}
+          PRODUCTION_WORKER: ${{ needs.production.outputs.worker_version }}
+          PRODUCTION_DEPLOYMENT: ${{ needs.production.outputs.vercel_deployment }}
+        with:
+          script: |
+            const e = process.env;
+            core.summary.addHeading('Cloud deployment');
+            core.summary.addRaw(`Source SHA: ${e.SOURCE_SHA || 'not admitted'}\n\n`);
+            if (e.TRUSTED !== 'true') core.summary.addRaw('No deployment: failed, stale, unsupported or untrusted CI source. Fork PRs receive public CI only.\n\n');
+            core.summary.addTable([
+              [{ data: 'Target', header: true }, { data: 'Result', header: true },
+               { data: 'URL', header: true }, { data: 'Worker version', header: true },
+               { data: 'Vercel deployment', header: true }],
+              ['staging / preview', e.PREVIEW_RESULT, e.PREVIEW_URL || '—', e.PREVIEW_WORKER || '—', e.PREVIEW_DEPLOYMENT || '—'],
+              ['production', e.PRODUCTION_RESULT, e.PRODUCTION_URL || '—', e.PRODUCTION_WORKER || '—', e.PRODUCTION_DEPLOYMENT || '—'],
+            ]);
+            core.summary.addRaw('Success requires provider SHA identity, a matching served shell bundle, and deployed browser suites. Worker SHA is verified via the control plane; /health has no commit field. No desktop release is published here.\n');
+            await core.summary.write();

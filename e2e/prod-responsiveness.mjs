@@ -30,6 +30,7 @@
  */
 
 import { createRequire } from 'node:module';
+import { APP, configureAppContext } from './deployed-target.mjs';
 import path from 'node:path';
 
 const REQ_DIR = process.env.PLAYWRIGHT_REQUIRE_DIR;
@@ -44,7 +45,6 @@ try { ({ chromium } = await import('playwright')); } catch {
 }
 if (!chromium) { console.error('playwright is required. SKIPPING (exit 2), not passing.'); process.exit(2); }
 
-const APP   = process.env.EZIL_E2E_APP   ?? 'https://ezil-os.vercel.app';
 // 🔴 NO CREDENTIAL DEFAULTS. This suite signs in to the LIVE deployment, so a
 // hardcoded fallback here is a working production account published in a
 // public repository. Absent config is "could not run" (exit 2), never a pass
@@ -152,6 +152,7 @@ try {
         userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
       } : {}),
     });
+    await configureAppContext(ctx);
     const { p, err } = await openDesktop(ctx);
     if (err) { check(`${L} the desktop opens at all`, false, err); await ctx.close(); continue; }
     check(`${L} the desktop opens and reaches full-bleed`, true);

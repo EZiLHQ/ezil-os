@@ -51,6 +51,7 @@ interface CallLog {
   destroy: number;
   flushWorkspaceNow: number;
   getExposedPorts: number;
+  getExposedPortHosts: string[];
   exec: number;
   /** Every `containerFetch(url, init, port)` the route table actually made. */
   containerFetch: Array<{ url: string; port: number; method: string; headers: Record<string, string>; body: string }>;
@@ -164,6 +165,7 @@ function fakeSandboxNamespace(options: {
     destroy: 0,
     flushWorkspaceNow: 0,
     getExposedPorts: 0,
+    getExposedPortHosts: [],
     exec: 0,
     containerFetch: [],
     wsConnect: [],
@@ -278,8 +280,9 @@ function fakeSandboxNamespace(options: {
       calls.flushWorkspaceNow++;
       return options.flushWorkspaceNow ? await options.flushWorkspaceNow() : {};
     },
-    getExposedPorts: async () => {
+    getExposedPorts: async (...args: unknown[]) => {
       calls.getExposedPorts++;
+      calls.getExposedPortHosts.push(args[0] as string);
       return options.exposedPorts ?? [];
     },
     exec: async (...args: unknown[]) => {
@@ -2032,6 +2035,132 @@ describe('POST /sandbox/preview returns appPreviewUrl + codePreviewUrl', () => {
     // …and the failure is surfaced, not swallowed.
     expect((body.codePreviewExpose as { attempted: boolean; exposed: boolean }).attempted).toBe(true);
     expect((body.codePreviewExpose as { attempted: boolean; exposed: boolean }).exposed).toBe(false);
+  });
+});
+
+describe('preview hostname isolation', () => {
+  const stagingEnv = {
+    SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.work',
+    SANDBOX_DEFAULT_DESKTOP_MODE: 'neko',
+    SANDBOX_HMAC_SECRET: SECRET,
+  };
+
+  for (const { origin, root, env } of [
+    { origin: 'https://api-desktop.ezil.org', root: 'ezil.org', env: {} },
+    { origin: 'https://api-desktop-staging.ezil.work', root: 'ezil.work', env: stagingEnv },
+  ]) {
+    for (const mode of ['neko', 'guacamole']) {
+      it(`${mode} preview on ${origin} uses one wildcard TLS label`, async () => {
+        const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
+        const workerEnv = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, ...env };
+        const res = await worker.fetch(new Request(`${origin}/sandbox/preview`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ token: await mintToken(), projectId: 'proj-1', userId: 'user-1', desktopMode: mode }),
+        }), workerEnv);
+        expect(res.status).toBe(200);
+        const body = await res.json() as Record<string, unknown>;
+        expect(body.ok).toBe(true);
+        expect(calls.getExposedPortHosts).toEqual([root]);
+        expect(calls.exposePort.length).toBeGreaterThan(0);
+        for (const exposure of calls.exposePort) expect(exposure.hostname).toBe(root);
+        const fields = mode === 'neko' ? ['guacamoleUrl', 'appPreviewUrl', 'codePreviewUrl'] : ['guacamoleUrl'];
+        for (const field of fields) {
+          const url = new URL(String(body[field]));
+          expect(url.hostname.endsWith(`.${root}`)).toBe(true);
+          const label = url.hostname.slice(0, -(root.length + 1));
+          expect(label).toMatch(/^[a-z0-9-]+$/);
+          expect(label.length).toBeLessThanOrEqual(63);
+          if (field !== 'guacamoleUrl') {
+            const bootstrap = await worker.fetch(new Request(url), workerEnv);
+            expect(bootstrap.status).toBe(302);
+            expect(bootstrap.headers.get('set-cookie')).toContain('Partitioned');
+          }
+        }
+      });
+    }
+
+    it(`status and restart on ${origin} use the same preview root`, async () => {
+      const { binding, calls } = fakeSandboxNamespace({});
+      const workerEnv = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, ...env };
+      const status = await worker.fetch(new Request(`${origin}/sandbox/${SANDBOX_NAME}/status`), workerEnv);
+      expect(status.status).toBe(200);
+      expect(calls.getExposedPortHosts).toEqual([root]);
+      const restart = await worker.fetch(new Request(`${origin}/sandbox/${SANDBOX_NAME}/restart`, {
+        method: 'POST', headers: { authorization: `Bearer ${await mintToken()}` },
+      }), workerEnv);
+      expect(restart.status).toBe(200);
+      expect(calls.restartDesktopStack[0].hostname).toBe(root);
+    });
+  }
+
+  it('uses the staging root for warm preview discovery without exposing ports again', async () => {
+    const { binding, calls } = fakeSandboxNamespace({
+      exposedPorts: [
+        { port: 8181, url: `https://8181-${SANDBOX_NAME}-nekodesktop.ezil.work`, status: 'open' },
+        { port: 3002, url: `https://3002-${SANDBOX_NAME}-app.ezil.work`, status: 'open' },
+        { port: 8443, url: `https://8443-${SANDBOX_NAME}-code.ezil.work`, status: 'open' },
+      ],
+    });
+    const res = await worker.fetch(new Request('https://api-desktop-staging.ezil.work/sandbox/preview', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: await mintToken(), projectId: 'proj-1', userId: 'user-1' }),
+    }), { Sandbox: binding, ...stagingEnv });
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.mode).toBe('neko');
+    expect(calls.getExposedPortHosts).toEqual(['ezil.work']);
+    expect(calls.exposePort).toHaveLength(0);
+    for (const field of ['guacamoleUrl', 'appPreviewUrl', 'codePreviewUrl']) {
+      expect(new URL(String(body[field])).hostname.endsWith('.ezil.work')).toBe(true);
+    }
+  });
+
+  it('rejects foreign API, bridge and desktop hosts before opening any sandbox', async () => {
+    const binding = new Proxy({}, { get() { throw new Error('must not access the namespace'); } });
+    for (const host of [
+      'api-desktop.ezil.org', `3002-${SANDBOX_NAME}-app.ezil.org`,
+      `8443-${SANDBOX_NAME}-code.ezil.org`, `8181-${SANDBOX_NAME}-nekodesktop.ezil.org`,
+      'ezil.work.attacker.invalid', 'notezil.work',
+    ]) {
+      const res = await worker.fetch(new Request(`https://${host}/sandbox/${SANDBOX_NAME}/status`), {
+        Sandbox: binding, ...stagingEnv,
+      });
+      expect(res.status).toBe(421);
+      expect(await res.json()).toEqual({ ok: false, error: 'preview_hostname_outside_zone' });
+    }
+  });
+
+  it('rejects unapproved or nested preview roots before opening a sandbox', async () => {
+    const binding = new Proxy({}, { get() { throw new Error('must not access the namespace'); } });
+    for (const root of ['', 'api-desktop-staging.ezil.work', '*.ezil.work', 'https://ezil.work',
+      'ezil.work:443', 'ezil.work/', 'ezil.work.', 'worker.workers.dev', 'attacker.invalid']) {
+      const res = await worker.fetch(new Request('https://api-desktop-staging.ezil.work/health'), {
+        Sandbox: binding, SANDBOX_PREVIEW_ZONE_ROOT: root,
+      });
+      expect(res.status).toBe(500);
+      expect(await res.json()).toEqual({ ok: false, error: 'invalid_preview_zone_root' });
+    }
+  });
+
+  it('retains workers.dev health diagnostics but refuses staging API calls there', async () => {
+    const binding = new Proxy({}, { get() { throw new Error('must not access the namespace'); } });
+    const origin = 'https://ezil-os-worker-staging.example.workers.dev';
+    const workerEnv = { Sandbox: binding, ...stagingEnv };
+    expect((await worker.fetch(new Request(`${origin}/health`), workerEnv)).status).toBe(200);
+    expect((await worker.fetch(new Request(`${origin}/sandbox/preview`, { method: 'POST' }), workerEnv)).status).toBe(421);
+  });
+
+  it('preserves localhost/IP and port normalization for local development', async () => {
+    for (const [host, normalized] of [['localhost:8787', 'localhost:8787'], ['127.0.0.1:8787', 'localhost:8787'],
+      ['0.0.0.0:8787', 'localhost:8787'], ['api-desktop-staging.ezil.work:8787', 'ezil.work:8787']]) {
+      const { binding, calls } = fakeSandboxNamespace({});
+      const res = await worker.fetch(new Request(`http://${host}/sandbox/${SANDBOX_NAME}/status`), {
+        Sandbox: binding, ...stagingEnv,
+      });
+      expect(res.status).toBe(200);
+      expect(calls.getExposedPortHosts).toEqual([normalized]);
+    }
   });
 });
 
