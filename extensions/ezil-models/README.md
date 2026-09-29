@@ -54,18 +54,28 @@ covering every provider type: [`examples/models.example.json`](examples/models.e
 ```
 
 - `apiKey`, `baseUrl`, `resource`, `apiVersion` and `headers` values may be literals, **`{env:NAME}`** or
-  **`{file:/path}`**; references are resolved when the file loads. Resolved secrets are redacted from every log line.
+  **`{file:/path}`** (absolute path recommended; a relative one resolves against the extension host's cwd; the file's
+  content is trimmed); references are resolved when the file loads. Resolved secrets are redacted from every log line.
+  While the file is being edited and is momentarily invalid, the previously loaded models stay available and the
+  error is shown in **EZiL Models: Manage**.
 - `models[].id` is what VS Code sees (unique, case-insensitive); `models[].model` is the provider model id or the
   Azure deployment name. `family` defaults to `claude` / `gpt`.
 - `maxInputTokens` (default 200000) is the budget VS Code enforces before sending — set 1000000 only for models
   and keys with 1M context enabled. `maxOutputTokens` defaults to 64000 (Claude) / 32768.
 - `thinking`: `{ "type": "adaptive", "effort": "low|medium|high|xhigh|max", "display": "summarized" }` for
   Claude 4.6+ (Opus 5/5.5, Sonnet 5, Fable 5.1 — sent as `thinking` + `output_config.effort`);
-  `{ "type": "enabled", "budgetTokens": 8192 }` for Haiku 4.5 and older. For OpenAI/Azure the effort maps to
-  `reasoning_effort` (`xhigh`/`max` → `high`). Omit for no thinking parameter.
+  `{ "type": "enabled", "budgetTokens": 8192 }` for Haiku 4.5 and older (400 on 4.7+). `"disabled"` is rejected by
+  Opus 5.5 / Fable (thinking cannot be turned off there; lower `effort` instead). `"display": "updates"` (progress
+  notes between tool calls, Fable 5.x / Opus 5.5) adds the `thinking-display-updates-2026-08-18` beta header
+  automatically. For OpenAI/Azure the effort maps to `reasoning_effort` (`xhigh`/`max` → `high`). Omit for no
+  thinking parameter.
 - `cache`: Anthropic prompt caching, on by default for Anthropic providers; `ttl` `5m` (default) or `1h`.
 - `forcedToolChoice` defaults to `false` for Opus 5.5 / Fable 5.x (they return 400 on `tool_choice: any`) and
-  `true` otherwise; when false a "required" tool call from Copilot is sent as `auto`.
+  `true` otherwise; when false a "required" tool call from Copilot is sent as `auto`. It is also sent as `auto`
+  whenever `thinking` is configured (other than `disabled`): the API only accepts `tool_choice` `auto`/`none`
+  together with extended or adaptive thinking. Copilot's own Anthropic provider never sends `tool_choice`.
+- `temperature` is passed through only when `thinking` is absent or `disabled`; Opus 4.7+, Sonnet 5, Opus 5/5.5 and
+  Fable reject sampling parameters altogether (400), so leave it unset for those models.
 - `defaults` holds per-model defaults merged into every entry; `roles` document which Copilot Chat slot a model is
   meant for (used by the settings snippet below).
 
@@ -118,7 +128,7 @@ reads on repeated system prompts, and expose error models (`mock-401`, `mock-429
 ```sh
 bun install --frozen-lockfile
 bun run typecheck      # tsc against @types/vscode 1.106.1
-bun test               # 37 tests: converters on real Copilot Chat captures, SSE, config, provider round trips
+bun test               # 47 tests: converters on real Copilot Chat captures, SSE, config, config store, provider round trips
 bun run build          # dist/extension.js (bun bundle, cjs, `vscode` external)
 bun run package:vsix   # ezil-models-0.1.0.vsix via @vscode/vsce
 ```
@@ -138,5 +148,67 @@ little; Anthropic's `count_tokens` endpoint is not called because VS Code invoke
 `enabledApiProposals` lists `languageModelSystem` and `languageModelThinkingPart`. code-server 4.139.1 enables
 all proposals for every extension; on builds where they are not enabled the extension still works: the System
 role is recognised by its numeric value (3) and thinking parts are only emitted when `vscode.LanguageModelThinkingPart`
-exists. The `isDefault` / `isUserSelectable` fields of the proposed `chatProvider` API are set on the model
-information and are ignored where that proposal is absent.
+exists. Without that class Copilot cannot hand thinking blocks back, so `thinking: { "type": "enabled" }` (Haiku 4.5
+and older, where the API insists on the previous thinking block before a `tool_use`) would fail on the second turn of
+a tool loop — prefer `adaptive` models there. The `isDefault` / `isUserSelectable` fields of the proposed
+`chatProvider` API are set on the model information and are ignored where that proposal is absent.
+
+## What Copilot Chat actually sends to a third-party vendor
+
+Facts from `vscode-copilot-chat` 0.67 that shaped the converter (see `src/anthropic.ts`):
+
+- **Cache markers**: Copilot emits its `cache_control` data parts only for the vendors in
+  `CacheBreakpointAwareModelVendors` (`anthropic`, `gemini`, `openrouter`). Vendor `ezil` never receives them, so
+  the automatic breakpoints (system prompt, last user turn, tool list) are what makes prompt caching work. Markers are
+  still honoured if they ever arrive: one inside a tool result marks the `tool_result` block itself, one ahead of a
+  message's first block marks the previous message's last block, and no filler block is ever fabricated, so the
+  4-breakpoint budget is always counted correctly.
+- **Thinking replay**: response thinking is streamed as `LanguageModelThinkingPart` deltas plus one final part whose
+  `metadata` holds `{ signature, _completeThinking }` (Copilot merges them into one `ThinkingDataItem`, keeping the
+  last metadata) and is replayed as a `thinking` block with that exact text and signature — unchanged, as the API
+  requires. A block without a signature is not replayable and is left out instead of triggering a 400.
+- **Tool pairing**: every `tool_use` must be answered by a `tool_result` in the very next message and vice versa.
+  Copilot keeps its history paired, but a cancelled turn can leave a call unanswered: the converter then inserts an
+  `is_error` result ("No result was recorded for this tool call.") and turns an orphaned result into a text block.
+- **Errors and logs**: URLs, upstream error bodies and request dumps are passed through `redact()` with every
+  resolved secret before they reach the output channel or the chat UI.
+
+## Vendor id `ezil` — do not co-install `extensions/ezil-vscode`
+
+`extensions/ezil-vscode` (the broker-based BYOK connector) also contributes `languageModelChatProviders` with
+`vendor: "ezil"`. VS Code allows one provider per vendor id: whichever extension registers second fails with
+"vendor ezil is already registered" and its models never appear. This extension keeps `ezil` because it is the one
+shipped in the desktop image; install exactly one of the two.
+
+## How the image installs it
+
+`worker/Dockerfile` (the desktop image local mode and the hosted Worker run) makes this extension the model
+provider behind the bundled Copilot Chat panel, revision 2 of the image:
+
+- **Built-in.** `worker/ezil-models/build-vsix.sh` packages this directory into the committed
+  `worker/ezil-models/dist/ezil-models-<version>.vsix` (the source is outside the `worker/` build context; run it
+  from a clean checkout and commit the VSIX after every source change — `build-vsix.sh --check` fails when it is
+  stale). The Dockerfile unpacks it into `/usr/lib/code-server/lib/vscode/extensions/ezil-models`, next to the
+  kept `copilot` built-in, and fails the build unless `contributes.languageModelChatProviders` names vendor `ezil`.
+- **Config.** `worker/ezil-models/models.json` is copied to `/etc/ezil/models.json` and `EZIL_MODELS_CONFIG` is set
+  to that path. It declares providers `anthropic` (`{env:ANTHROPIC_API_KEY}`), `foundry-anthropic` and
+  `foundry-openai` (both `{env:AZURE_RESOURCE_NAME}` + `{env:AZURE_API_KEY}`) and `openai`
+  (`{env:OPENAI_API_KEY}`), and models `claude-opus-5-5` (default, plan), `claude-sonnet-5`, `claude-fable-5-1`,
+  `claude-haiku-4-5` (utility), a Foundry Claude deployment and example Foundry / OpenAI GPT deployments. A build
+  gate rejects any literal key. **Set the variables on the container and the models appear**; because the file is
+  validated as a whole, a variable that is *not* set makes the extension serve no models and name the variable in
+  the *EZiL Models* output channel — point `EZIL_MODELS_CONFIG` at a smaller file (or remove that provider and its
+  models) if you only have some of the keys.
+- **Settings.** `worker/scripts/start-neko.sh` (and `start-codeserver.sh`) write `<user-data-dir>/Machine/settings.json`
+  on every boot with `chat.allowAnonymousAccess: true`, `chat.byokUtilityModelDefault: "mainAgent"`,
+  `chat.titleBar.signIn.enabled: false`, `chat.welcomePage.signIn.enabled: false`, `github.copilot.enable: {"*": false}`
+  and `workbench.secondarySideBar.defaultVisibility: "visible"`, and seed `<user-data-dir>/User/chatLanguageModels.json`
+  with `[{ "name": "EZiL", "vendor": "ezil" }]` (merged into groups a user added). Anonymous access is what makes a
+  cold browser activate Copilot Chat and route the very first prompt here; the group is what flips
+  `github.copilot.hasByokModels` and hides the sign-in affordances. The model pins from "Pairing with the Copilot
+  Chat UI" (`chat.defaultModel` etc.) are not written by the image — *Auto* resolves to the tool-capable EZiL model
+  and individual models are toggled in the Language Models editor.
+- **Proof.** `e2e/copilot-ezil-image.sh <image>` boots the image, points this extension at an in-container mock
+  (`e2e/copilot-ezil-models.json` via `EZIL_MODELS_CONFIG`, `e2e/copilot-ezil-mock-provider.mjs`) and drives a fresh
+  browser: Chat view active, no sign-in dialog, an Agent-mode `create_file` round trip that lands in the workspace,
+  the EZiL model listed in Manage Models — then again as a returning user whose persisted settings say the opposite.

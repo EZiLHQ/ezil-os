@@ -55,7 +55,8 @@ export function describeHttpError(model: ResolvedModel, endpoint: Endpoint, stat
 }
 
 export function buildBody(model: ResolvedModel, request: ChatRequest): { endpoint: Endpoint; body: Record<string, unknown> } {
-    const endpoint = resolveEndpoint(model.provider);
+    // `thinking.display: "updates"` (progress notes between tool calls) is behind a beta header.
+    const endpoint = resolveEndpoint(model.provider, model.thinking?.display === 'updates' ? ['thinking-display-updates-2026-08-18'] : []);
     const body = endpoint.api === 'anthropic' ? buildAnthropicBody(model, request) : buildOpenAIBody(model, request);
     return { endpoint, body };
 }

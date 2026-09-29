@@ -114,6 +114,12 @@ export async function* openaiStream(events: AsyncIterable<SseEvent>): AsyncGener
         }
         calls.clear();
     };
+    // Servers that omit `index` (some OpenAI-compatible ones): a chunk naming an id continues that call, an
+    // anonymous chunk continues the most recent call, anything else starts a new one.
+    const indexFor = (id: unknown): number => {
+        if (typeof id === 'string' && id) { for (const [index, call] of calls) if (call.id === id) return index; return calls.size; }
+        return calls.size ? Math.max(...calls.keys()) : 0;
+    };
     for await (const { data } of events) {
         const trimmed = data.trim();
         if (!trimmed) continue;
@@ -134,8 +140,8 @@ export async function* openaiStream(events: AsyncIterable<SseEvent>): AsyncGener
             if (reasoning) yield { type: 'thinking', value: reasoning };
             if (Array.isArray(delta.tool_calls)) {
                 for (const raw of delta.tool_calls as Record<string, unknown>[]) {
-                    const index = typeof raw.index === 'number' ? raw.index : calls.size;
                     const fn = (raw.function ?? {}) as Record<string, unknown>;
+                    const index = typeof raw.index === 'number' ? raw.index : indexFor(raw.id);
                     const call = calls.get(index) ?? { id: '', name: '', arguments: '' };
                     if (typeof raw.id === 'string' && raw.id) call.id = raw.id;
                     if (typeof fn.name === 'string' && fn.name) call.name += fn.name;

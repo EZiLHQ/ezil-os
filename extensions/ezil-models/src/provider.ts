@@ -147,7 +147,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 signal: controller.signal,
                 fetch: this.host.fetch,
                 onRequest: (url, body) => {
-                    this.host.log(`[request] ${resolved.id} -> ${url} messages=${request.messages.length} tools=${request.tools.length} toolMode=${request.toolMode}${options.modelOptions?.requestInitiator ? ` initiator=${String(options.modelOptions.requestInitiator)}` : ''}`);
+                    this.host.log(`[request] ${resolved.id} -> ${redact(url, this.host.secrets())} messages=${request.messages.length} tools=${request.tools.length} toolMode=${request.toolMode}${options.modelOptions?.requestInitiator ? ` initiator=${String(options.modelOptions.requestInitiator)}` : ''}`);
                     if (this.host.logRequests()) this.host.log(requestForLog(body, this.host.secrets()));
                 },
             });
@@ -181,10 +181,12 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             }
         } catch (error) {
             if (controller.signal.aborted) return;
-            const message = error instanceof Error ? error.message : String(error);
-            this.host.log(`[error] ${resolved.id}: ${redact(message, this.host.secrets())}`);
-            if (error instanceof ProviderError) throw error;
-            throw new Error(message.startsWith('EZiL Models') ? message : `EZiL Models: ${redact(message, this.host.secrets())}`);
+            // Every message shown to the user or logged is redacted: upstream error bodies and URLs are not trusted
+            // to be free of key material (a gateway may echo headers or carry the key in its path).
+            const message = redact(error instanceof Error ? error.message : String(error), this.host.secrets());
+            this.host.log(`[error] ${resolved.id}: ${message}`);
+            if (error instanceof ProviderError) throw new ProviderError(message, error.status, error.retryAfterSeconds, error.upstream && redact(error.upstream, this.host.secrets()));
+            throw new Error(message.startsWith('EZiL Models') ? message : `EZiL Models: ${message}`);
         } finally {
             cancellation.dispose();
         }

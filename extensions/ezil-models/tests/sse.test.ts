@@ -22,6 +22,19 @@ describe('sse parser', () => {
         }
     });
 
+    test('stopping early cancels the underlying body; reading to the end does not', async () => {
+        let cancelled = 0;
+        // Like a live HTTP body, the stream stays open until the server ends it (`close` false).
+        const body = (frames: string, close: boolean) => new ReadableStream<Uint8Array>({
+            start(controller) { controller.enqueue(new TextEncoder().encode(frames)); if (close) controller.close(); },
+            cancel() { cancelled += 1; },
+        });
+        for await (const event of sseEvents(body('data: 1\n\ndata: 2\n\n', false))) { expect(event.data).toBe('1'); break; }
+        expect(cancelled).toBe(1);
+        expect(await collect(sseEvents(body('data: 1\n\n', true)))).toEqual([{ data: '1' }]);
+        expect(cancelled).toBe(1);
+    });
+
     test('jsonEvents parses payloads and flags [DONE]', async () => {
         const events = await collect(jsonEvents(sseBody(['data: {"x":1}\n\ndata: [DONE]\n\n'])));
         expect(events.map(event => event.json ?? event.done)).toEqual([{ x: 1 }, true]);

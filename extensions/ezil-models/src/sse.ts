@@ -5,6 +5,7 @@ export type SseEvent = { event?: string; data: string };
 export async function* sseEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<SseEvent> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
+    let finished = false;
     let buffer = '';
     let event: string | undefined;
     let data: string[] = [];
@@ -30,6 +31,7 @@ export async function* sseEvents(body: ReadableStream<Uint8Array>): AsyncGenerat
     try {
         while (true) {
             const { done, value } = await reader.read();
+            finished = done;
             buffer += decoder.decode(value, { stream: !done });
             let newline: number;
             while ((newline = buffer.search(/\r\n|\n|\r/)) >= 0) {
@@ -46,6 +48,9 @@ export async function* sseEvents(body: ReadableStream<Uint8Array>): AsyncGenerat
         const tail = flush();
         if (tail) yield tail;
     } finally {
+        // When the consumer stops early (message_stop seen, cancellation, a thrown error) the HTTP body is
+        // still open: cancel it so the connection is released instead of lingering until GC.
+        if (!finished) await reader.cancel().catch(() => undefined);
         reader.releaseLock();
     }
 }

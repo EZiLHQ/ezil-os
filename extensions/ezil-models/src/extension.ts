@@ -15,15 +15,21 @@ export function resolveConfigPath(setting: string | undefined, env: NodeJS.Proce
     return fromSetting ? fromSetting : DEFAULT_CONFIG_PATH;
 }
 
-/** Loads the config file, watches it (atomic replaces included) and keeps the last good result. */
+/**
+ * Loads the config file, watches it (atomic replaces included) and keeps the last good result: a half-written
+ * or invalid file leaves the previously loaded models in place (with `error()` set) so in-flight and new chats
+ * keep working while the file is being edited.
+ */
 export class ConfigStore implements vscode.Disposable {
     private current: ResolvedConfig | undefined;
+    private lastText: string | undefined;
     private lastError: string | undefined;
     private watcher: fs.FSWatcher | undefined;
     private debounce: NodeJS.Timeout | undefined;
     private readonly listeners = new Set<() => void>();
 
-    constructor(private configPath: string, private readonly log: (line: string) => void) {}
+    /** `watchFs` is injectable so the reload logic can be tested without depending on the runtime's inotify behaviour. */
+    constructor(private configPath: string, private readonly log: (line: string) => void, private readonly watchFs: typeof fs.watch = fs.watch) {}
 
     get path(): string { return this.configPath; }
     models(): ResolvedModel[] { return this.current?.models ?? []; }
@@ -34,20 +40,26 @@ export class ConfigStore implements vscode.Disposable {
     setPath(configPath: string): void {
         if (configPath === this.configPath) return;
         this.configPath = configPath;
+        this.current = undefined; // a different file: nothing loaded from it yet
+        this.lastText = undefined;
         this.watch();
         this.load();
     }
 
-    load(): boolean {
+    /** (Re)loads the file. `ifChanged` skips the parse and the change notification when the bytes are as before. */
+    load(ifChanged = false): boolean {
         try {
             const text = fs.readFileSync(this.configPath, 'utf8');
+            if (ifChanged && text === this.lastText) return !this.lastError;
+            this.lastText = text;
             this.current = parseModelsConfig(text, { source: this.configPath });
             this.lastError = undefined;
             this.log(`[config] loaded ${this.configPath}\n${describeConfig(this.current)}`);
+            if (!this.watcher) this.watch(); // the directory may not have existed when watching was first attempted
         } catch (error) {
-            this.current = undefined;
+            if (!(error instanceof ConfigError)) this.lastText = undefined;
             this.lastError = error instanceof ConfigError ? error.message : (error as NodeJS.ErrnoException).code === 'ENOENT' ? `${this.configPath} does not exist.` : `${this.configPath}: ${(error as Error).message}`;
-            this.log(`[config] ${this.lastError}`);
+            this.log(`[config] ${this.lastError}${this.current ? ` (keeping the ${this.current.models.length} model(s) loaded before)` : ''}`);
         }
         for (const listener of this.listeners) listener();
         return !this.lastError;
@@ -57,13 +69,14 @@ export class ConfigStore implements vscode.Disposable {
         this.watcher?.close();
         this.watcher = undefined;
         const directory = path.dirname(this.configPath);
-        const base = path.basename(this.configPath);
         try {
-            // Watch the directory rather than the file so editors that write via rename still trigger.
-            this.watcher = fs.watch(directory, { persistent: false }, (_event, filename) => {
-                if (filename && filename.toString() !== base) return;
+            // Watch the directory rather than the file so editors that replace the file (write a temp name, then
+            // rename over it) still trigger. Such a replace may surface only as an event for the temp name (Bun
+            // reports just `rename models.json.tmp`), so every event in the directory schedules a debounced
+            // reload; `load(true)` then does nothing unless the file's bytes actually changed.
+            this.watcher = this.watchFs(directory, { persistent: false }, () => {
                 clearTimeout(this.debounce);
-                this.debounce = setTimeout(() => this.load(), 250);
+                this.debounce = setTimeout(() => this.load(true), 250);
             });
             this.watcher.on('error', error => this.log(`[config] watcher error: ${error.message}`));
         } catch (error) {

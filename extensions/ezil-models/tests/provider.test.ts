@@ -64,6 +64,7 @@ beforeAll(async () => {
             { id: 'gpt', provider: 'compat', model: 'gpt-mock' },
             { id: 'gpt-azure', provider: 'azure', model: 'gpt-deployment' },
             { id: 'bad-key', provider: 'anthropic', model: 'mock-401' },
+            { id: 'echo-key', provider: 'anthropic', model: 'mock-401-echo' },
             { id: 'limited', provider: 'anthropic', model: 'mock-429' },
             { id: 'refuses', provider: 'anthropic', model: 'mock-refusal' },
             { id: 'nowhere', provider: 'unreachable', model: 'x' },
@@ -186,6 +187,10 @@ describe('Anthropic round trip through the provider', () => {
 
     test('errors are readable and never leak keys; refusal becomes an error; cancellation is silent', async () => {
         await expect(run('bad-key', [message(1, [new TextPart('q')])], [])).rejects.toThrow(/rejected the API key \(401\).*providers\.anthropic\.apiKey/);
+        const echoed = await run('echo-key', [message(1, [new TextPart('q')])], []).then(() => undefined, (error: Error) => error);
+        expect(echoed).toBeInstanceOf(Error);
+        expect(echoed!.message).toMatch(/Upstream said: authentication_error: invalid x-api-key \[redacted\]/);
+        expect(echoed!.message).not.toContain(KEY);
         await expect(run('limited', [message(1, [new TextPart('q')])], [])).rejects.toThrow(/rate limiting \(429\); retry after 7s/);
         anthropic.next([]); // refusal before any text -> error; with text already streamed the note is appended instead
         await expect(run('refuses', [message(1, [new TextPart('q')])], [])).rejects.toThrow(/declined this request \(cyber\)/);

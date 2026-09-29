@@ -59,7 +59,7 @@
         "type": { "type": "string", "enum": ["adaptive", "enabled", "disabled"], "description": "adaptive for Claude 4.6+ (Opus 5/5.5, Sonnet 5, Fable 5.1); enabled + budgetTokens for Haiku 4.5 and older; disabled sends {type: disabled} (rejected by Opus 5.5 / Fable 5.1)." },
         "budgetTokens": { "type": "integer", "minimum": 1024, "description": "Only with type enabled." },
         "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "Anthropic output_config.effort; mapped to reasoning_effort for OpenAI/Azure (xhigh and max become high)." },
-        "display": { "type": "string", "enum": ["summarized", "omitted", "updates"], "default": "summarized", "description": "Anthropic thinking.display for adaptive thinking." }
+        "display": { "type": "string", "enum": ["summarized", "omitted", "updates"], "default": "summarized", "description": "Anthropic thinking.display for adaptive thinking. \"updates\" (Fable 5.x / Opus 5.5 progress notes) adds the thinking-display-updates-2026-08-18 beta header." }
       }
     },
     "cache": {
@@ -115,8 +115,8 @@
         "cache": { "$ref": "#/definitions/cache" },
         "default": { "type": "boolean", "description": "Exactly one model may be the default (also implied by roles containing default)." },
         "roles": { "type": "array", "uniqueItems": true, "items": { "type": "string", "enum": ["default", "plan", "utility", "utilitySmall"] }, "description": "Which Copilot Chat slots this model should fill; used by 'EZiL Models: Manage -> Copy settings snippet'." },
-        "forcedToolChoice": { "type": "boolean", "description": "Send tool_choice any/required when Copilot requires a tool call. Defaults to false for Opus 5.5 / Fable 5.x, which return 400 for forced tool use." },
-        "temperature": { "type": "number", "minimum": 0, "maximum": 2, "description": "Only sent when thinking is off." }
+        "forcedToolChoice": { "type": "boolean", "description": "Send tool_choice any/required when Copilot requires a tool call. Defaults to false for Opus 5.5 / Fable 5.x, which return 400 for forced tool use. Anthropic: never sent while thinking is configured (the API only allows auto/none with thinking); Copilot's required mode then degrades to auto." },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 2, "description": "Only sent when thinking is absent or disabled. Opus 4.7+, Sonnet 5, Opus 5/5.5 and Fable reject sampling parameters (400): leave unset there." }
       }
     }
   }

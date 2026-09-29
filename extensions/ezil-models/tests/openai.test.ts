@@ -93,6 +93,21 @@ describe('OpenAI stream parsing', () => {
         }
     });
 
+    test('tool_calls without an index are grouped by id, anonymous argument chunks continue the latest call', async () => {
+        const events = await collect([
+            chunk({ tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'create_file', arguments: '{"filePath":' } }] }),
+            chunk({ tool_calls: [{ function: { arguments: '"/a"}' } }] }),
+            chunk({ tool_calls: [{ id: 'call_2', type: 'function', function: { name: 'list_dir', arguments: '{"path":' } }] }),
+            chunk({ tool_calls: [{ id: 'call_2', function: { arguments: '"/"}' } }] }),
+            chunk({}, 'tool_calls'),
+            'data: [DONE]\n\n',
+        ]);
+        expect(events.filter(event => event.type === 'tool_call')).toEqual([
+            { type: 'tool_call', callId: 'call_1', name: 'create_file', input: { filePath: '/a' } },
+            { type: 'tool_call', callId: 'call_2', name: 'list_dir', input: { path: '/' } },
+        ]);
+    });
+
     test('error chunks, invalid tool JSON and empty streams fail loudly', async () => {
         await expect(collect([frame(undefined, { error: { message: 'boom', type: 'server_error' } })])).rejects.toThrow('Provider stream error: boom');
         await expect(collect([chunk({ tool_calls: [{ index: 0, id: 'x', function: { name: 'f', arguments: '{"a"' } }] }), chunk({}, 'tool_calls'), 'data: [DONE]\n\n'])).rejects.toThrow('invalid JSON for tool call f');

@@ -16,10 +16,12 @@ function supportsCacheControl(block: Block): boolean {
     return block.type !== 'thinking' && block.type !== 'redacted_thinking';
 }
 
-function markCache(blocks: Block[]): void {
+/** Put a cache breakpoint on the last block that accepts one; returns false when there is no such block. */
+function markCache(blocks: Block[]): boolean {
     const previous = blocks.at(-1);
-    if (previous && supportsCacheControl(previous)) previous.cache_control = { type: 'ephemeral' };
-    else blocks.push({ type: 'text', text: ' ', cache_control: { type: 'ephemeral' } });
+    if (!previous || !supportsCacheControl(previous)) return false;
+    previous.cache_control = { type: 'ephemeral' };
+    return true;
 }
 
 function dataBlock(part: Extract<Part, { type: 'data' }>): Block | undefined {
@@ -29,8 +31,15 @@ function dataBlock(part: Extract<Part, { type: 'data' }>): Block | undefined {
     return undefined;
 }
 
-function convertParts(parts: readonly Part[]): Block[] {
+/**
+ * Content blocks for one VS Code message. `leadingMarker` is set when a cache marker arrived before any
+ * block of this message: the caller attaches it to the last block of the preceding message (the prefix
+ * the marker actually closes) instead of inventing a filler block — `cache_control` never goes on an
+ * empty or fabricated block.
+ */
+function convertParts(parts: readonly Part[]): { blocks: Block[]; leadingMarker: boolean } {
     const blocks: Block[] = [];
+    let leadingMarker = false;
     for (const part of parts) {
         switch (part.type) {
             case 'text':
@@ -39,7 +48,9 @@ function convertParts(parts: readonly Part[]): Block[] {
             case 'thinking': {
                 const meta = part.metadata ?? {};
                 if (typeof meta.redactedData === 'string') blocks.push({ type: 'redacted_thinking', data: meta.redactedData });
-                else if (typeof meta._completeThinking === 'string') blocks.push({ type: 'thinking', thinking: meta._completeThinking, signature: typeof meta.signature === 'string' ? meta.signature : '' });
+                // A thinking block is replayed exactly as received (text + signature). Without a signature the API
+                // cannot verify it and rejects the request, so an unsigned block is left out rather than sent.
+                else if (typeof meta._completeThinking === 'string' && typeof meta.signature === 'string' && meta.signature) blocks.push({ type: 'thinking', thinking: meta._completeThinking, signature: meta.signature });
                 // incremental thinking deltas are not replayed
                 break;
             }
@@ -48,24 +59,60 @@ function convertParts(parts: readonly Part[]): Block[] {
                 break;
             case 'tool_result': {
                 const content: Block[] = [];
+                let cached = false;
                 for (const inner of part.content) {
                     if (inner.type === 'text') { if (inner.value !== '') content.push({ type: 'text', text: inner.value }); }
-                    else if (isCacheMarker(inner)) markCache(content);
+                    // A marker inside a tool result closes the prefix at that result: it goes on the tool_result block
+                    // itself, where applyCacheBreakpoints/stripCacheControl can see it (nested markers would escape
+                    // the 4-breakpoint budget).
+                    else if (isCacheMarker(inner)) cached = true;
                     else if (inner.type === 'data') { const block = dataBlock(inner); if (block) content.push(block); }
                 }
                 const block: Block = { type: 'tool_result', tool_use_id: part.callId };
                 if (content.length) block.content = content;
                 if (part.isError) block.is_error = true;
+                if (cached) block.cache_control = { type: 'ephemeral' };
                 blocks.push(block);
                 break;
             }
             case 'data':
-                if (isCacheMarker(part)) markCache(blocks);
+                if (isCacheMarker(part)) { if (!markCache(blocks) && !blocks.length) leadingMarker = true; }
                 else if (!isStatefulMarker(part)) { const block = dataBlock(part); if (block) blocks.push(block); }
                 break;
         }
     }
-    return blocks;
+    return { blocks, leadingMarker };
+}
+
+const MISSING_RESULT_TEXT = 'No result was recorded for this tool call.';
+
+/**
+ * The API requires every `tool_use` to be answered by a `tool_result` with the same id in the very next
+ * message, and every `tool_result` to answer a `tool_use` from the immediately preceding assistant turn.
+ * Copilot keeps its history paired, but a cancelled turn or a trimmed transcript can break that; instead
+ * of a 400 for the whole request, orphaned results are kept as text and unanswered calls get an error result.
+ */
+function pairToolCalls(messages: AnthropicMessage[]): void {
+    let pending = new Set<string>();
+    for (const message of messages) {
+        if (message.role === 'assistant') {
+            pending = new Set(message.content.filter(block => block.type === 'tool_use').map(block => String(block.id)));
+            continue;
+        }
+        const answered = new Set<string>();
+        message.content = message.content.map(block => {
+            if (block.type !== 'tool_result') return block;
+            const id = String(block.tool_use_id);
+            if (pending.has(id)) { answered.add(id); return block; }
+            const text = (block.content as Block[] | undefined)?.map(inner => (typeof inner.text === 'string' ? inner.text : `[${inner.type}]`)).join('\n') ?? '';
+            const orphan: Block = { type: 'text', text: `[Result of an earlier tool call ${id} whose request is no longer in the conversation]\n${text}` };
+            if (block.cache_control) orphan.cache_control = block.cache_control;
+            return orphan;
+        });
+        const missing = [...pending].filter(id => !answered.has(id));
+        if (missing.length) message.content.unshift(...missing.map((id): Block => ({ type: 'tool_result', tool_use_id: id, is_error: true, content: [{ type: 'text', text: MISSING_RESULT_TEXT }] })));
+        pending = new Set();
+    }
 }
 
 export function convertMessages(messages: readonly Message[]): { system: Block[]; messages: AnthropicMessage[] } {
@@ -83,12 +130,15 @@ export function convertMessages(messages: readonly Message[]): { system: Block[]
             else if (cached && system.length) system.at(-1)!.cache_control = { type: 'ephemeral' };
             continue;
         }
-        const content = convertParts(message.parts);
+        const { blocks: content, leadingMarker } = convertParts(message.parts);
+        // A marker ahead of this message's first block closes the prefix at the previous message's last block.
+        if (leadingMarker) { const previous = merged.at(-1); if (previous) markCache(previous.content); }
         if (!content.length) continue;
         const previous = merged.at(-1);
         if (previous && previous.role === message.role) previous.content.push(...content);
         else merged.push({ role: message.role, content });
     }
+    pairToolCalls(merged);
     return { system, messages: merged };
 }
 
@@ -139,7 +189,10 @@ export function buildAnthropicBody(model: ResolvedModel, request: ChatRequest): 
             if (tool.description) block.description = tool.description;
             return block;
         });
-        if (request.toolMode === 'required' && model.forcedToolChoice) body.tool_choice = { type: 'any' };
+        // Forced tool use (`any`) is rejected alongside extended/adaptive thinking (only `auto`/`none` are allowed
+        // then) and by Opus 5.5 / Fable 5.x outright; in those cases Copilot's "required" degrades to `auto`.
+        const thinkingOn = !!model.thinking && model.thinking.type !== 'disabled';
+        if (request.toolMode === 'required' && model.forcedToolChoice && !thinkingOn) body.tool_choice = { type: 'any' };
     }
     const requested = request.modelOptions.maxTokens ?? request.modelOptions.max_tokens;
     if (typeof requested === 'number' && Number.isInteger(requested) && requested > 0) body.max_tokens = Math.min(requested, model.maxOutputTokens);
@@ -222,8 +275,9 @@ export async function* anthropicStream(events: AsyncIterable<SseEvent>): AsyncGe
                         try { input = JSON.parse(pending.json); } catch { throw new Error(`The model returned invalid JSON for tool call ${pending.name}.`); }
                     }
                     yield { type: 'tool_call', callId: pending.id, name: pending.name, input };
-                } else if (pending.kind === 'thinking') {
-                    // Final part carries the complete thinking + signature so the history can be replayed (same shape Copilot uses).
+                } else if (pending.kind === 'thinking' && pending.signature) {
+                    // Final part carries the complete thinking + signature so the history can be replayed (same shape
+                    // Copilot uses). Without a signature nothing replayable exists, so no final part is emitted.
                     yield { type: 'thinking', value: '', metadata: { signature: pending.signature, _completeThinking: pending.thinking } };
                 }
                 break;

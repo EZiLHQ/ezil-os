@@ -7,7 +7,7 @@
 //    a user prompt mentioning hello.txt with a create_file tool -> text + tool_use, otherwise an echo
 //  - simulates prompt caching: the first request with a given system prompt and `cache_control` reports
 //    cache_creation_input_tokens, later ones cache_read_input_tokens
-//  - special model ids: mock-401, mock-429 (retry-after: 7), mock-refusal, mock-error-event, mock-overloaded
+//  - special model ids: mock-401, mock-401-echo (echoes the key), mock-429 (retry-after: 7), mock-refusal, mock-error-event, mock-overloaded
 
 import http from 'node:http';
 import { createHash } from 'node:crypto';
@@ -88,6 +88,7 @@ export async function startMockAnthropic(options: { apiKey: string; port?: numbe
             if (!req.headers['anthropic-version']) { fail(400, 'invalid_request_error', 'anthropic-version header is required'); return; }
             const model = String(body.model);
             if (model === 'mock-401') { fail(401, 'authentication_error', 'invalid x-api-key'); return; }
+            if (model === 'mock-401-echo') { fail(401, 'authentication_error', `invalid x-api-key ${req.headers['x-api-key']}`); return; } // a gateway that echoes the credential
             if (model === 'mock-429') { fail(429, 'rate_limit_error', 'This request would exceed your rate limit', { 'retry-after': '7' }); return; }
             if (model === 'mock-overloaded') { fail(529, 'overloaded_error', 'Overloaded'); return; }
             if (model === 'mock-404') { fail(404, 'not_found_error', `model: ${model}`); return; }

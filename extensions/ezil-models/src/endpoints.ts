@@ -19,7 +19,7 @@ export function apiKindOf(provider: ResolvedProvider): ApiKind {
  *                        (or baseUrl https://<resource>.services.ai.azure.com/openai/v1)
  *  - openai-compatible:  <baseUrl>/chat/completions                                              authorization: Bearer (if key)
  */
-export function resolveEndpoint(provider: ResolvedProvider): Endpoint {
+export function resolveEndpoint(provider: ResolvedProvider, extraBetas: readonly string[] = []): Endpoint {
     const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'text/event-stream' };
     let url: string;
     switch (provider.type) {
@@ -52,7 +52,8 @@ export function resolveEndpoint(provider: ResolvedProvider): Endpoint {
             break;
         }
     }
-    if (apiKindOf(provider) === 'anthropic' && provider.betas.length) headers['anthropic-beta'] = provider.betas.join(',');
+    const betas = [...new Set([...provider.betas, ...extraBetas])];
+    if (apiKindOf(provider) === 'anthropic' && betas.length) headers['anthropic-beta'] = betas.join(',');
     for (const [name, value] of Object.entries(provider.headers)) headers[name] = value;
     return { api: apiKindOf(provider), url, headers };
 }

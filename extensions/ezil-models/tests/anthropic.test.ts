@@ -73,16 +73,63 @@ describe('Anthropic request from real Copilot Chat captures', () => {
         const messages: Message[] = fixture.messages.map(message => ({ ...message, parts: [...message.parts] }));
         messages[0]!.parts.push(marker()); // on the system prompt
         messages[1]!.parts.push(marker()); // after the workspace-info user text
-        messages[2]!.parts.unshift(marker()); // leading marker -> attaches to previous block (none) -> ' ' text block
+        messages[2]!.parts.unshift(marker()); // leading marker -> closes the prefix at the previous message's last block; no filler block
         const body = buildAnthropicBody(model(), { ...fixture, messages }) as Body;
         expect(body.system![0]!.cache_control).toEqual({ type: 'ephemeral' });
         const user = body.messages[0]!.content;
         expect(user[0]!.cache_control).toEqual({ type: 'ephemeral' });
-        expect(user[1]).toEqual(expect.objectContaining({ type: 'text', text: ' ', cache_control: { type: 'ephemeral' } }));
+        expect(user[1]).toEqual({ type: 'text', text: messages[2]!.parts.find(part => part.type === 'text')!.value as string });
+        expect(user.some(block => block.text === ' ')).toBe(false);
         expect(cached(body).length).toBeLessThanOrEqual(MAX_CACHE_BREAKPOINTS);
-        // 3 explicit + automatic (system already marked, tools, last user) -> trimmed from the front to 4.
+        // 2 explicit + automatic (system already marked, tools, last user) -> 4.
         expect(cached(body)).toHaveLength(4);
         expect(body.messages.at(-1)!.content.at(-1)!.cache_control).toBeDefined();
+    });
+
+    test('cache_control is never placed on a fabricated block and markers inside tool results count against the budget', () => {
+        const text = (value: string) => ({ type: 'text' as const, value });
+        const call = (id: string) => ({ type: 'tool_call' as const, callId: id, name: 'create_file', input: { a: 1 } });
+        const result = (id: string, parts: Message['parts']) => ({ type: 'tool_result' as const, callId: id, content: parts });
+        const messages: Message[] = [
+            { role: 'user', parts: [marker(), text('first')] }, // nothing precedes it: dropped
+            { role: 'assistant', parts: [call('t1'), call('t2')] },
+            { role: 'user', parts: [result('t1', [text('r1'), marker()]), result('t2', [marker(), text('r2')])] },
+            { role: 'user', parts: [marker(), text('next')] }, // leading marker -> previous message's last block (the t2 result)
+            { role: 'assistant', parts: [call('t3')] },
+            { role: 'user', parts: [result('t3', [text('r3')]), marker()] },
+        ];
+        const { messages: converted } = convertMessages(messages);
+        expect(converted[0]!.content).toEqual([{ type: 'text', text: 'first' }]);
+        const results = converted[2]!.content;
+        expect(results.map(block => block.type)).toEqual(['tool_result', 'tool_result', 'text']);
+        expect(results[0]).toEqual({ type: 'tool_result', tool_use_id: 't1', content: [{ type: 'text', text: 'r1' }], cache_control: { type: 'ephemeral' } });
+        expect(results[1]).toEqual({ type: 'tool_result', tool_use_id: 't2', content: [{ type: 'text', text: 'r2' }], cache_control: { type: 'ephemeral' } });
+        expect(JSON.stringify(converted)).not.toContain('"text": " "');
+        expect(JSON.stringify(converted).match(/cache_control/g)).toHaveLength(3); // t1, t2, t3 results; nothing nested
+        // Budget: 3 explicit + system + tools + last user turn (already marked) -> 5 candidates -> trimmed to 4, earliest first.
+        const request: ChatRequest = { messages, tools: [{ name: 'create_file', inputSchema: { type: 'object' } }], toolMode: 'auto', modelOptions: {} };
+        const body = buildAnthropicBody(model(), { ...request, messages: [{ role: 'system', parts: [text('sys')] }, ...messages] }) as Body;
+        expect(cached(body)).toHaveLength(4);
+        expect(body.tools![0]!.cache_control).toBeUndefined();
+        expect(body.messages.at(-1)!.content[0]!.cache_control).toEqual({ type: 'ephemeral' });
+        const off = buildAnthropicBody(model({ cache: { enabled: false, ttl: '5m' } }), request) as Body;
+        expect(JSON.stringify(off)).not.toContain('cache_control');
+    });
+
+    test('tool_use / tool_result pairing is repaired instead of sent as a 400', () => {
+        const { messages } = convertMessages([
+            { role: 'user', parts: [{ type: 'text', value: 'go' }] },
+            { role: 'assistant', parts: [{ type: 'tool_call', callId: 'a', name: 'x', input: {} }, { type: 'tool_call', callId: 'b', name: 'y', input: {} }] },
+            // `b` was never answered (cancelled turn); `stale` answers a call that is no longer in the history.
+            { role: 'user', parts: [{ type: 'tool_result', callId: 'a', content: [{ type: 'text', value: 'ok' }] }, { type: 'tool_result', callId: 'stale', content: [{ type: 'text', value: 'old' }] }, { type: 'text', value: 'continue' }] },
+        ]);
+        expect(messages[2]!.content).toEqual([
+            { type: 'tool_result', tool_use_id: 'b', is_error: true, content: [{ type: 'text', text: 'No result was recorded for this tool call.' }] },
+            { type: 'tool_result', tool_use_id: 'a', content: [{ type: 'text', text: 'ok' }] },
+            { type: 'text', text: expect.stringContaining('stale') },
+            { type: 'text', text: 'continue' },
+        ]);
+        expect((messages[2]!.content[2]!.text as string)).toEndWith('old');
     });
 
     test('more than four explicit markers are reduced to four, keeping the latest ones', () => {
@@ -148,10 +195,14 @@ describe('Anthropic request options', () => {
         expect(none.output_config).toBeUndefined();
     });
 
-    test('required tool mode -> tool_choice any, except for models that reject forced tool use', () => {
+    test('required tool mode -> tool_choice any, except with thinking on or for models that reject forced tool use', () => {
         expect((buildAnthropicBody(model(), request) as Body).tool_choice).toEqual({ type: 'any' });
         expect((buildAnthropicBody(model({ model: 'claude-opus-5-5', forcedToolChoice: false }), request) as Body).tool_choice).toBeUndefined();
         expect((buildAnthropicBody(model(), { ...request, toolMode: 'auto' }) as Body).tool_choice).toBeUndefined();
+        // The API only allows tool_choice auto/none together with extended or adaptive thinking.
+        expect((buildAnthropicBody(model({ thinking: { type: 'adaptive' } }), request) as Body).tool_choice).toBeUndefined();
+        expect((buildAnthropicBody(model({ thinking: { type: 'enabled', budgetTokens: 2048 } }), request) as Body).tool_choice).toBeUndefined();
+        expect((buildAnthropicBody(model({ thinking: { type: 'disabled' } }), request) as Body).tool_choice).toEqual({ type: 'any' });
     });
 
     test('maxTokens from modelOptions is capped by the model limit', () => {
@@ -165,6 +216,7 @@ describe('Anthropic request options', () => {
             { role: 'assistant', parts: [
                 { type: 'thinking', value: 'partial' },
                 { type: 'thinking', value: '', metadata: { signature: 'sig', _completeThinking: 'full thought' } },
+                { type: 'thinking', value: '', metadata: { signature: '', _completeThinking: 'unsigned: the API would reject it' } },
                 { type: 'thinking', value: '', metadata: { redactedData: 'opaque' } },
                 { type: 'text', value: 'ok' },
             ] },
@@ -229,5 +281,10 @@ describe('Anthropic stream parsing', () => {
         await expect(collect([frames[0]!, frames[7]!])).rejects.toThrow('ended before a message was completed');
         const refusal = await collect([frames[0]!, frame('message_delta', { type: 'message_delta', delta: { stop_reason: 'refusal', stop_details: { type: 'refusal', category: 'cyber' } }, usage: { output_tokens: 0 } }), frame('message_stop', { type: 'message_stop' })]);
         expect(refusal.at(-1)).toEqual({ type: 'stop', reason: 'refusal', details: { type: 'refusal', category: 'cyber' } });
+    });
+
+    test('a thinking block that closes without a signature yields deltas but no replayable final part', async () => {
+        const events = await collect([frames[0]!, frames[2]!, frames[3]!, frames[6]!, ...frames.slice(18)]);
+        expect(events.filter(event => event.type === 'thinking')).toEqual([{ type: 'thinking', value: 'Let me ' }]);
     });
 });
