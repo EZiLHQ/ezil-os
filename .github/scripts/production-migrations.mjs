@@ -99,12 +99,19 @@ export function additiveSQL(sql, schemas) {
 
 export async function validate(root, manifestPath = '.github/production-migrations.json') {
   const manifest = JSON.parse(await readFile(resolve(root, manifestPath), 'utf8'));
-  fields(manifest, ['version', 'repository', 'project', 'schemas', 'sources', 'initialCatalog', 'migrations', 'trustedWorkflowRuns'], 'manifest');
+  fields(manifest, ['version', 'repository', 'project', 'schemas', 'sources', 'initialCatalog', 'migrations', 'trustedWorkflowRuns', 'reviewedEventTriggers'], 'manifest');
   check(manifest.version === 1, 'Unsupported manifest version');
   check(typeof manifest.repository === 'string' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(manifest.repository), 'Invalid repository');
   check(typeof manifest.project === 'string' && /^[a-z]{20}$/.test(manifest.project), 'Invalid project');
   check(Array.isArray(manifest.schemas) && manifest.schemas.length && manifest.schemas.every(s => typeof s === 'string' && name.test(s) && !['ezil_ci', 'pg_catalog', 'information_schema'].includes(s) && !s.startsWith('pg_')) && new Set(manifest.schemas).size === manifest.schemas.length, 'Invalid owned schemas');
   check(Array.isArray(manifest.trustedWorkflowRuns) && manifest.trustedWorkflowRuns.every(n => Number.isSafeInteger(n) && n > 0) && new Set(manifest.trustedWorkflowRuns).size === manifest.trustedWorkflowRuns.length, 'Invalid trusted workflow IDs');
+  check(Array.isArray(manifest.reviewedEventTriggers), 'Invalid reviewed event triggers');
+  const eventNames = new Set();
+  for (const trigger of manifest.reviewedEventTriggers) {
+    fields(trigger, ['name', 'sha256'], 'reviewed event trigger');
+    check(typeof trigger.name === 'string' && name.test(trigger.name) && hex.test(trigger.sha256) && !eventNames.has(trigger.name), 'Invalid/duplicate reviewed event trigger');
+    eventNames.add(trigger.name);
+  }
   if (manifest.initialCatalog !== null) {
     fields(manifest.initialCatalog, ['digest', 'capturedAt', 'objects', 'sourceDigest'], 'initialCatalog');
     check(hex.test(manifest.initialCatalog.sourceDigest) && hex.test(manifest.initialCatalog.digest) && Number.isSafeInteger(manifest.initialCatalog.objects) && manifest.initialCatalog.objects >= manifest.schemas.length && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z$/.test(manifest.initialCatalog.capturedAt) && Number.isFinite(Date.parse(manifest.initialCatalog.capturedAt)), 'Invalid initial catalog');
@@ -174,6 +181,21 @@ export function catalogSQL(schemas) {
   SELECT encode(sha256(convert_to(body::text,'UTF8')),'hex') digest, objects, (SELECT count(*)::integer FROM ns) schemas FROM snapshot`;
 }
 
+// An explicit reviewed inventory covers active platform DDL hooks. Names alone
+// are never sufficient: pin their effective trigger/function/schema definitions.
+export function eventTriggersSQL() {
+  return `SELECT COALESCE(jsonb_agg(jsonb_build_object('name',name,'sha256',sha256) ORDER BY name COLLATE "C"),'[]'::jsonb) triggers FROM (
+    SELECT t.evtname name, encode(sha256(convert_to(jsonb_build_array(
+      t.evtevent,t.evtenabled,(SELECT jsonb_agg(tag ORDER BY tag COLLATE "C") FROM unnest(t.evttags) tag),pg_get_userbyid(t.evtowner),
+      n.nspname,pg_get_userbyid(n.nspowner),n.nspacl::text,
+      pg_get_function_identity_arguments(p.oid),pg_get_functiondef(p.oid),pg_get_userbyid(p.proowner),p.proacl::text,p.proconfig,p.prosecdef,p.provolatile,p.proleakproof,
+      (SELECT jsonb_agg(jsonb_build_array(e.extname,e.extversion) ORDER BY e.extname COLLATE "C") FROM pg_depend d JOIN pg_extension e ON d.refclassid='pg_extension'::regclass AND d.refobjid=e.oid WHERE d.classid='pg_proc'::regclass AND d.objid=p.oid AND d.deptype='e')
+    )::text,'UTF8')),'hex') sha256 FROM pg_event_trigger t JOIN pg_proc p ON p.oid=t.evtfoid JOIN pg_namespace n ON n.oid=p.pronamespace WHERE t.evtenabled<>'D'
+  ) reviewed`;
+}
+
+const verifyEventTriggers = manifest => assertSQL(`(SELECT triggers FROM (${eventTriggersSQL()}) events)=${json([...(manifest.reviewedEventTriggers ?? [])].sort((a,b) => a.name < b.name ? -1 : 1))}`, 'Active event triggers differ from reviewed inventory');
+
 const digestExpression = schemas => `(SELECT digest FROM (${catalogSQL(schemas)}) catalog)`;
 export const snapshotHash = manifest => hash(JSON.stringify(manifest.sources.filter(s => s.kind === 'snapshot').map(s => ({ path: s.path, sha256: s.sha256, kind: s.kind })).sort((a,b) => a.path < b.path ? -1 : 1)));
 const repository = manifest => manifest.repository.toLowerCase();
@@ -211,7 +233,7 @@ export function applySQL({ manifest, files }) {
   const repo = literal(repository(manifest));
   let body = `DECLARE actual text; expected text; role_name text; BEGIN
   PERFORM pg_advisory_xact_lock(1702521196, 1835624306);
-  ${assertSQL(`NOT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtenabled<>'D')`, 'Active event triggers require separate review')}
+  ${verifyEventTriggers(manifest)}
   CREATE SCHEMA IF NOT EXISTS ezil_ci;
   ${assertSQL(`(to_regclass('ezil_ci.baselines') IS NULL) = (to_regclass('ezil_ci.journal') IS NULL)`, 'Incomplete journal')}
   ${assertSQL(`(SELECT nspowner=(SELECT oid FROM pg_roles WHERE rolname=current_user) FROM pg_namespace WHERE nspname='ezil_ci')`, 'Journal schema owner mismatch')}
@@ -251,7 +273,7 @@ export function applySQL({ manifest, files }) {
       INSERT INTO ezil_ci.journal(repository,id,checksum,ordinal,before_catalog,after_catalog) VALUES (${repo},${literal(m.id)},${literal(m.sha256)},${index + 1},${literal(m.before)},${literal(m.after)});
     END IF;\n`;
   });
-  body += 'END';
+  body += `${verifyEventTriggers(manifest)} END`;
   // SQL string literal, not a fixed dollar delimiter that source SQL could close.
   return `BEGIN; SET LOCAL search_path=pg_catalog; SET LOCAL standard_conforming_strings=on; SET LOCAL lock_timeout='30s'; SET LOCAL statement_timeout='120s'; DO ${literal(body)}; COMMIT;`;
 }
@@ -260,6 +282,7 @@ export function planSQL(manifest) {
   if (manifest.initialCatalog) check(hex.test(manifest.initialCatalog.sourceDigest), 'Historical source digest required');
   const repo = literal(repository(manifest));
   const body = `DECLARE actual text; expected text; applied integer := 0; BEGIN
+    ${verifyEventTriggers(manifest)}
     ${supportedCatalog(manifest.schemas)}
     ${assertSQL(`(SELECT count(*) FROM pg_namespace WHERE nspname IN (${manifest.schemas.map(literal).join(',')}))=${manifest.schemas.length}`, 'Missing owned baseline schema')}
     actual := ${digestExpression(manifest.schemas)};

@@ -5,11 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { hash, snapshotHash, tokenize, additiveSQL, validate, run, authorize, query, catalogSQL, applySQL, planSQL } from '../.github/scripts/production-migrations.mjs';
+import { hash, snapshotHash, tokenize, additiveSQL, validate, run, authorize, query, catalogSQL, applySQL, planSQL, eventTriggersSQL } from '../.github/scripts/production-migrations.mjs';
 
 const command = promisify(execFile);
 const project = 'btgqfmnzycdecmeyqubx';
-const blank = () => ({ version: 1, repository: 'example/repo', project, schemas: ['app'], sources: [], initialCatalog: null, migrations: [], trustedWorkflowRuns: [] });
+const blank = () => ({ version: 1, repository: 'example/repo', project, schemas: ['app'], sources: [], initialCatalog: null, migrations: [], trustedWorkflowRuns: [], reviewedEventTriggers: [] });
 const noNetwork = () => { throw new Error('NETWORK MUST NOT RUN'); };
 
 async function fixture(t) {
@@ -40,7 +40,7 @@ test('inventory, source byte checksums, symlinks and malformed manifests fail cl
   await assert.rejects(validate(root), /checksum/);
   await writeFile(join(root, 'history.sql'), 'DROP TABLE app.never_run;');
   const good = structuredClone(manifest);
-  for (const mutate of [m => m.version = 2, m => m.extra = true, m => m.schemas = ['ezil_ci'], m => m.sources.push(m.sources[0]), m => m.sources[0].path = '../history.sql', m => m.initialCatalog = { digest: 'fake' }, m => m.migrations = [{ id: 'bad' }], m => m.trustedWorkflowRuns = ['name'], m => m.project = '../bad']) {
+  for (const mutate of [m => m.version = 2, m => m.extra = true, m => m.schemas = ['ezil_ci'], m => m.sources.push(m.sources[0]), m => m.sources[0].path = '../history.sql', m => m.initialCatalog = { digest: 'fake' }, m => m.migrations = [{ id: 'bad' }], m => m.trustedWorkflowRuns = ['name'], m => m.project = '../bad', m => m.reviewedEventTriggers = [{name:'x',sha256:'bad'}], m => m.reviewedEventTriggers = [{name:'x',sha256:hash('x')},{name:'x',sha256:hash('x')}]]) {
     const invalid = structuredClone(good); mutate(invalid);
     await writeFile(join(root, '.github/production-migrations.json'), JSON.stringify(invalid));
     await assert.rejects(validate(root));
@@ -369,6 +369,42 @@ test(`transaction protocol (${process.env.PRODUCTION_MIGRATIONS_DOCKER === '1' ?
       await rejected(applySQL(loaded), /Active event triggers/);
       assert.equal((await db.rows("SELECT to_regnamespace('ezil_ci')::text AS name"))[0].name, null);
     } finally { await db.exec('DROP EVENT TRIGGER production_test_event; DROP FUNCTION public.production_test_event();'); }
+  });
+  await t.test('reviewed DDL hooks permit baseline registration but changes, additions and removals refuse', async () => {
+    const loaded = await fixture();
+    await db.exec(`CREATE FUNCTION public.production_test_event() RETURNS event_trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$BEGIN END$$; CREATE EVENT TRIGGER production_test_event ON ddl_command_end EXECUTE FUNCTION public.production_test_event();`);
+    try {
+      loaded.manifest.reviewedEventTriggers = (await db.rows(eventTriggersSQL()))[0].triggers;
+      assert.equal(loaded.manifest.reviewedEventTriggers.length, 1);
+      await db.exec(planSQL(loaded.manifest));
+      assert.equal((await db.rows("SELECT to_regnamespace('ezil_ci')::text AS name"))[0].name, null);
+      await db.exec(applySQL(loaded)); await db.exec(applySQL(loaded));
+      assert.equal((await state()).digest, loaded.manifest.initialCatalog.digest);
+      assert.equal((await db.rows('SELECT count(*)::integer n FROM ezil_ci.journal'))[0].n, 0);
+      const mutations = [
+        'ALTER EVENT TRIGGER production_test_event ENABLE ALWAYS',
+        'ALTER EVENT TRIGGER production_test_event DISABLE',
+        'CREATE EVENT TRIGGER unexpected ON ddl_command_end EXECUTE FUNCTION public.production_test_event()',
+        'ALTER FUNCTION public.production_test_event() SECURITY DEFINER',
+        'ALTER FUNCTION public.production_test_event() SET search_path=public',
+        'REVOKE EXECUTE ON FUNCTION public.production_test_event() FROM PUBLIC',
+        `CREATE OR REPLACE FUNCTION public.production_test_event() RETURNS event_trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$BEGIN PERFORM 1; END$$`
+      ];
+      for (const mutation of mutations) {
+        const observed = (await db.rolledBackRows(mutation, eventTriggersSQL()))[0].triggers;
+        assert.notDeepEqual(observed, loaded.manifest.reviewedEventTriggers, mutation);
+      }
+      await db.exec('ALTER FUNCTION public.production_test_event() SECURITY DEFINER;');
+      await rejected(planSQL(loaded.manifest), /event triggers differ/);
+      await rejected(applySQL(loaded), /event triggers differ/);
+      await db.exec('ALTER FUNCTION public.production_test_event() SECURITY INVOKER;');
+      await db.exec('CREATE EVENT TRIGGER unexpected ON ddl_command_end EXECUTE FUNCTION public.production_test_event();');
+      await rejected(applySQL(loaded), /event triggers differ/);
+      await db.exec('DROP EVENT TRIGGER unexpected; ALTER EVENT TRIGGER production_test_event DISABLE;');
+      await rejected(applySQL(loaded), /event triggers differ/);
+    } finally {
+      await db.exec('DROP EVENT TRIGGER IF EXISTS unexpected; DROP EVENT TRIGGER production_test_event; DROP FUNCTION public.production_test_event();');
+    }
   });
   if (process.env.PRODUCTION_MIGRATIONS_DOCKER === '1') {
     await t.test('concurrent retries share transaction advisory lock and apply once', async () => {

@@ -413,8 +413,19 @@ describe('browser sidecar: a real container, a real Chrome', () => {
         // inert — but this project has been bitten three times this month by
         // checks that passed in Docker and failed elsewhere, so it is measured
         // AFTER the navigations, clicks, types and screenshots above.
-        const info = dexec(['bash', '-lc',
-            'DISPLAY=:99 xwininfo -id 0x400003 | grep -E "Width:|Height:|Map State:|Absolute upper-left"']);
+        // X allocates IDs at runtime. Resolve the real Chrome client window
+        // after automation, and refuse missing or ambiguous browser windows.
+        const clients = dexec(['env', 'DISPLAY=:99', 'wmctrl', '-x', '-l']);
+        expect(clients.status).toBe(0);
+        const browserIds = (clients.stdout || '').trim().split('\n')
+            .map(line => line.trim().split(/\s+/))
+            .filter(columns => /chrome/i.test(columns[2] || ''))
+            .map(columns => columns[0]);
+        expect(browserIds).toHaveLength(1);
+        const windowId = browserIds[0]!;
+        expect(windowId).toMatch(/^0x[0-9a-f]+$/i);
+        const info = dexec(['env', 'DISPLAY=:99', 'xwininfo', '-id', windowId]);
+        expect(info.status).toBe(0);
         const text = info.stdout || '';
         expect(text).toContain('Width: 1920');
         expect(text).toContain('Height: 1080');
@@ -422,8 +433,8 @@ describe('browser sidecar: a real container, a real Chrome', () => {
         expect(text).toMatch(/Absolute upper-left X:\s+0/);
         expect(text).toMatch(/Absolute upper-left Y:\s+0/);
 
-        const props = dexec(['bash', '-lc',
-            'DISPLAY=:99 xprop -id 0x400003 _NET_FRAME_EXTENTS _NET_WM_STATE']);
+        const props = dexec(['env', 'DISPLAY=:99', 'xprop', '-id', windowId, '_NET_FRAME_EXTENTS', '_NET_WM_STATE']);
+        expect(props.status).toBe(0);
         expect(props.stdout).toContain('_NET_FRAME_EXTENTS(CARDINAL) = 0, 0, 0, 0');
         expect(props.stdout).toContain('_OB_WM_STATE_UNDECORATED');
         expect(props.stdout).toContain('_NET_WM_STATE_MAXIMIZED_VERT');

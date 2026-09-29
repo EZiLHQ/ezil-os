@@ -116,10 +116,7 @@ The schema and tables are private, owner-controlled and RLS-enabled; PUBLIC,
 anon, authenticated and service_role grants are revoked. Unexpected owners,
 extra grants, table shape/constraints, routines, policies, rules and application
 triggers in the journal are refused. All repositories must use the same database
-owner identity. Active database event triggers are refused before journal DDL:
-they need a separately reviewed protocol extension rather than automatic
-execution or disabling. Supabase installations may have platform event triggers;
-this check must be assessed against live metadata before enabling production.
+owner identity. Active database event triggers must match the exact reviewed inventory described below.
 
 Every apply verifies the registered baseline and historical source digest, all
 applied IDs/checksums/order/catalog links, a contiguous applied prefix, current catalog,
@@ -153,6 +150,33 @@ Catalog text is PostgreSQL-version-sensitive. Derive before/after digests with
 this exact engine, matching PostgreSQL major version, roles, extensions and
 schema metadata. A database major upgrade or broader catalog support needs
 explicit review; do not replace an existing baseline to silence drift.
+
+### Reviewed platform event triggers
+
+The `reviewedEventTriggers` inventory was reviewed against live definitions on
+2026-09-29. Each SHA-256 covers event, enabled mode, tag filters, trigger owner,
+function body/identity/owner/ACL/configuration/security properties, containing
+schema ownership/ACL and function extension membership. Both read-only plan and
+apply require the exact active inventory. Apply checks before any DDL and again
+before commit. An empty inventory permits no active triggers. No trigger is
+disabled or changed by this protocol; added, removed, disabled or modified hooks
+require a new review rather than automatic adoption.
+
+The seven existing hooks have these reviewed effects:
+
+- `ensure_rls`: enables RLS only for new tables in `public`; skips private
+  `ezil_ci`. Future public migrations must account for the RLS change in their
+  expected catalog.
+- `issue_pg_cron_access`, `issue_pg_graphql_access`, `issue_pg_net_access`: only
+  react to CREATE EXTENSION, which the additive grammar does not permit.
+- `issue_graphql_placeholder`: only reacts to DROP EXTENSION, also prohibited.
+- `pgrst_ddl_watch`, `pgrst_drop_watch`: emit transactional schema-reload
+  notifications; do not mutate application rows or schema objects.
+
+Catalog checks still require the reviewed before/after application state. Global
+role membership and arbitrary transitive callees are outside this fingerprint;
+new hook bodies must be reviewed, not merely rehashed. Supabase platform upgrades
+that change these definitions will stop releases until reviewed.
 
 ## Adding a reviewed migration
 
