@@ -115,10 +115,14 @@ If you believe an attribution is missing or inaccurate, please open an issue
   Copyright (c) 2019 Coder Technologies Inc.").
 - **Used for:** the in-browser code editor (VS Code in the browser) served
   to users, replacing the Electron VS Code build described above.
-  `worker/Dockerfile` installs it via the official installer
-  (`curl -fsSL https://code-server.dev/install.sh | sh`), which fetches a
-  prebuilt `.deb` release directly from `coder/code-server`'s own GitHub
-  releases — no code-server source is vendored or modified in this
+  `worker/Dockerfile` pins **code-server 4.139.1**: it downloads the
+  `code-server_4.139.1_amd64.deb` asset from `coder/code-server`'s own
+  GitHub releases page and verifies it against a hard-coded sha256
+  (`ARG CODE_SERVER_SHA256`) before `dpkg -i`. It used to run the official
+  installer (`curl -fsSL https://code-server.dev/install.sh | sh`), i.e.
+  whatever release was current on the day of the build; the pin replaced
+  that so a rebuild of an unchanged Dockerfile cannot change the IDE. No
+  code-server source is vendored or modified in this
   repository, and no separate Electron/Chromium renderer is composited into
   the container's display for it (code-server serves the IDE over plain
   HTTP; the note in `worker/Dockerfile` explains why the two approaches
@@ -129,6 +133,36 @@ If you believe an attribution is missing or inaccurate, please open an issue
   official binary (which the superseded Electron build above downloaded
   under the proprietary Microsoft Software License Terms) — avoids that
   proprietary-terms question entirely.
+- **Bundled GitHub Copilot Chat is removed.** code-server >= 4.139 ships
+  GitHub Copilot Chat as a built-in extension
+  (`lib/vscode/extensions/copilot`) and points `product.json`'s
+  `defaultChatAgent` at it. `worker/Dockerfile` deletes that directory and
+  strips `defaultChatAgent` in the same build step, and the build fails if
+  anything named `copilot` remains in the system-extensions directory. So
+  nothing from Copilot Chat is present in the shipped image, and it is not
+  credited here; EZiL Chat (§8) is the editor's assistant instead.
+
+### opencode (`anomalyco/opencode`)
+- **URL:** https://github.com/anomalyco/opencode
+- **License:** **MIT** (verified two ways: the `LICENSE` file at the root of
+  `anomalyco/opencode`'s default `dev` branch reads "MIT License,
+  Copyright (c) 2025 opencode", and the npm registry metadata for the exact
+  artifact the image installs, `@opencode/cli-linux-x64@2.0.19`, declares
+  `"license": "MIT"` and points its `repository` at that same GitHub repo).
+- **Used for:** the AI coding-agent backend behind EZiL Chat.
+  `worker/Dockerfile` pins **opencode 2.0.19**: it downloads the prebuilt
+  `@opencode/cli-linux-x64` tarball from `registry.npmjs.org`, verifies it
+  against a hard-coded sha256 (`ARG OPENCODE_LINUX_X64_SHA256`), and
+  installs the single `opencode` binary at `/usr/local/bin/opencode`. The
+  EZiL Chat extension (§8) starts it as `opencode serve` on loopback and
+  talks to its HTTP/SSE API; the image never runs its TUI or serves its web
+  UI. Its configuration is the EZiL-authored `worker/opencode/opencode.json`,
+  copied to `/etc/opencode/opencode.json` (autoupdate off, sharing off,
+  provider wiring through `{env:...}` references — no secrets). No opencode
+  source is vendored or modified in this repository; the binary is used
+  unmodified as a separately downloaded runtime component. This file credits
+  opencode itself; the notices for the libraries compiled into opencode's own
+  binary are upstream's to carry and are not re-enumerated here.
 
 ### Google Chrome
 - Installed via the official `google-chrome-stable` `.deb` from
@@ -215,6 +249,18 @@ anyone relies on an assumed license:
   (not assumed from memory) when it replaced the Electron VS Code build in
   the shipped image; its Open VSX-by-default behaviour was confirmed
   against Coder's own published FAQ.
+- opencode's MIT license was read from the `LICENSE` file on
+  `anomalyco/opencode`'s default branch (`dev`) and cross-checked against
+  the npm registry's `license` field for the exact
+  `@opencode/cli-linux-x64@2.0.19` tarball `worker/Dockerfile` pins by
+  sha256. The GitHub Licenses API was not reachable from the environment the
+  check ran in, so the raw file was read instead.
+- Licenses for `extensions/ezil-chat/`'s npm dependencies (§8) were read
+  from each package's installed `package.json` under
+  `extensions/ezil-chat/node_modules`, and the committed VSIX
+  (`worker/ezil-chat/dist/ezil-chat-0.1.0.vsix`) was unpacked and its
+  `dist/extension.js` grepped to establish which of them are actually
+  compiled into the shipped bundle (only `@opencode/client` is).
 - Licenses for `worker/`'s npm dependencies were read directly from each
   package's installed `package.json` under `worker/node_modules` (i.e.
   from the actual artifact this repository builds with), not assumed from
@@ -245,3 +291,40 @@ The licenses and versions were checked in the installed packages' own
 `package.json` files. Both are pinned development dependencies in
 `app/package.json` and `app/bun.lock`; no upstream source was copied into
 the application.
+
+---
+
+## 8. EZiL Chat extension (`extensions/ezil-chat/`) npm dependencies
+
+The extension itself is EZiL-authored (`"license": "AGPL-3.0-only"`; the
+repository `LICENSE` is packed into the VSIX as `extension/LICENSE.txt`) and
+is baked into the desktop image as a built-in code-server extension from the
+committed `worker/ezil-chat/dist/ezil-chat-0.1.0.vsix`. `bun build` bundles
+`src/extension.ts` into a single `dist/extension.js` (only `vscode` is
+external) and `@vscode/vsce` runs with `--no-dependencies`, so the VSIX
+carries no `node_modules` — the only third-party code that ships is what the
+bundler inlined.
+
+| Package | License | Used for |
+|---|---|---|
+| `@opencode/client` 2.0.19 | MIT | Typed HTTP/SSE client for the local `opencode serve` API. The only declared runtime dependency, and the only third-party code present in the bundled `dist/extension.js` |
+| `@opencode/protocol` 2.0.19 (transitive) | MIT | Protocol types for `@opencode/client`; type-level only, not in the bundle |
+| `@opencode/schema` 2.0.19 (transitive) | MIT | Schema definitions for `@opencode/client`; not in the bundle |
+| `@standard-schema/spec` 1.1.0 (transitive) | MIT | Schema interface spec used by `@opencode/schema`; not in the bundle |
+| `effect` 4.0.0-rc.112 (transitive) | MIT | Runtime used by `@opencode/schema` / `@opencode/protocol`; not in the bundle |
+| `fast-check` 4.10.2, `pure-rand` 8.4.2 (transitive via `effect`) | MIT | Property-testing helpers `effect` depends on; not in the bundle |
+| `msgpackr` 2.1.0, `msgpackr-extract` 3.0.4, `@msgpackr-extract/msgpackr-extract-linux-x64` 3.0.4, `node-gyp-build-optional-packages` 5.2.2 (transitive via `effect`) | MIT | MessagePack codec `effect` depends on; not in the bundle |
+| `detect-libc` 2.1.2 (transitive) | Apache-2.0 | libc detection for `msgpackr`'s optional native build; not in the bundle |
+| `typescript` 5.9.3 (dev) | Apache-2.0 | Type-checking — not shipped |
+| `@types/bun` 1.4.2, `bun-types` 1.4.2, `@types/node` 22.10.2, `@types/vscode` 1.106.1, `undici-types` 6.20.0 (dev) | MIT | Type declarations — not shipped |
+| `@vscode/vsce` 4.0.0 (build tool, run via `bunx`; not a declared dependency) | MIT | Packs the VSIX — not shipped |
+
+`@opencode/client` declares `effect` and `solid-js` as **peer** dependencies;
+neither is installed or imported by the extension, and the bundle contains
+no trace of either. All licenses above were read directly from each
+installed package's own `package.json` under
+`extensions/ezil-chat/node_modules` (the installed `@opencode/client`
+tarball carries no separate `LICENSE` file, so its `package.json` `license`
+field is the source). Every one is permissive (MIT and/or Apache-2.0); no
+GPL, LGPL, AGPL, SSPL, or "non-commercial only" dependency was found in the
+extension's dependency tree.
