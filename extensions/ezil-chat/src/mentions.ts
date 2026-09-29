@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { confinePath } from './paths';
 import type { Mention } from './protocol';
 
 /** Case-insensitive subsequence match; ranks shorter, earlier matches first. */
@@ -42,9 +43,11 @@ export function selectionMention(editor: vscode.TextEditor | undefined): Mention
     return { path: relative, start, end, label: `${relative}:${start}${end !== start ? `-${end}` : ''}` };
 }
 
+/** Open `file` (relative to the workspace or absolute inside it); anything outside the folder is refused. */
 export async function openWorkspaceFile(directory: string, file: string, line?: number): Promise<void> {
-    const uri = file.startsWith('/') ? vscode.Uri.file(file) : vscode.Uri.joinPath(vscode.Uri.file(directory), file);
-    const document = await vscode.workspace.openTextDocument(uri);
+    const absolute = confinePath(directory, file);
+    if (!absolute) throw new Error(`refusing to open ${file}: outside the workspace folder`);
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.file(absolute));
     const editor = await vscode.window.showTextDocument(document, { preview: true });
     if (line !== undefined) {
         const position = new vscode.Position(Math.max(0, line - 1), 0);

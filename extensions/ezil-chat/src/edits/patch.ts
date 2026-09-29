@@ -7,6 +7,9 @@ interface Hunk { oldStart: number; newStart: number; lines: Array<{ op: ' ' | '-
 export function parseUnifiedDiff(patch: string): Hunk[] {
     const hunks: Hunk[] = [];
     let current: Hunk | undefined;
+    // Remaining old/new line counts from the `@@` header: once both hit zero the hunk is complete, so a
+    // following `--- a/file` (next file in a multi-file patch) is a header, not the removal of "-- a/file".
+    let oldLeft = 0, newLeft = 0;
     const rawLines = patch.split('\n');
     if (rawLines[rawLines.length - 1] === '') rawLines.pop(); // trailing newline, not an empty context line
     for (const rawLine of rawLines) {
@@ -14,15 +17,20 @@ export function parseUnifiedDiff(patch: string): Hunk[] {
         const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
         if (header) {
             current = { oldStart: Number(header[1]), newStart: Number(header[3]), lines: [] };
+            oldLeft = header[2] === undefined ? 1 : Number(header[2]);
+            newLeft = header[4] === undefined ? 1 : Number(header[4]);
             hunks.push(current);
             continue;
         }
         if (!current) continue;
         if (line.startsWith('\\')) continue; // "\ No newline at end of file"
+        if (oldLeft <= 0 && newLeft <= 0) { current = undefined; continue; } // hunk complete: trailing metadata
         const op = line.charAt(0);
         if (op === ' ' || op === '-' || op === '+') current.lines.push({ op, text: line.slice(1) });
         else if (line === '') current.lines.push({ op: ' ', text: '' });
-        else current = undefined; // trailing metadata such as the next "---" header
+        else { current = undefined; continue; } // malformed line ends the hunk
+        if (op !== '+') oldLeft -= 1;
+        if (op !== '-') newLeft -= 1;
     }
     return hunks;
 }

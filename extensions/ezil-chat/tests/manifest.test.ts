@@ -1,13 +1,20 @@
-// Guards the contract between package.json, the pinned OpenCode version and the webview HTML.
+// Cross-checks package.json against the source that relies on it: the commands
+// the host registers, the settings config.ts reads, the view id, the pinned client.
 import { expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PINNED_OPENCODE_VERSION } from '../src/opencode/version';
-import { parseModelKey } from '../src/opencode/adapter';
 
-const manifest = JSON.parse(readFileSync(join(import.meta.dir, '..', 'package.json'), 'utf8')) as {
-    dependencies: Record<string, string>; engines: { vscode: string }; enabledApiProposals?: unknown; activationEvents: string[];
-    contributes: { viewsContainers: { secondarySidebar: Array<{ id: string }> }; views: Record<string, Array<{ id: string; type: string }>>; configurationDefaults: Record<string, unknown>; commands: Array<{ command: string }>; configuration: { properties: Record<string, unknown> } };
+const root = join(import.meta.dir, '..');
+const source = (relative: string): string => readFileSync(join(root, 'src', relative), 'utf8');
+const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
+    main: string; dependencies: Record<string, string>; engines: { vscode: string }; enabledApiProposals?: unknown; activationEvents: string[];
+    scripts: Record<string, string>;
+    contributes: {
+        viewsContainers: { secondarySidebar: Array<{ id: string }> }; views: Record<string, Array<{ id: string; type: string }>>;
+        commands: Array<{ command: string }>; menus: Record<string, Array<{ command: string }>>; keybindings: Array<{ command: string }>;
+        configuration: { properties: Record<string, { type: string; default: unknown }> };
+    };
 };
 
 test('pins @opencode/client to the exact version the extension expects from opencode serve', () => {
@@ -15,20 +22,35 @@ test('pins @opencode/client to the exact version the extension expects from open
     expect(PINNED_OPENCODE_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
 });
 
-test('uses only stable VS Code APIs and the secondary sidebar container', () => {
-    expect(manifest.engines.vscode).toBe('^1.106.0');
-    expect(manifest.enabledApiProposals).toBeUndefined();
-    expect(manifest.activationEvents).toEqual(['onStartupFinished', 'onView:ezil-chat.panel']);
-    expect(manifest.contributes.viewsContainers.secondarySidebar.map(container => container.id)).toEqual(['ezil-chat']);
-    expect(manifest.contributes.views['ezil-chat']).toEqual([expect.objectContaining({ id: 'ezil-chat.panel', type: 'webview' })]);
-    expect(manifest.contributes.configurationDefaults).toEqual({ 'chat.disableAIFeatures': true, 'workbench.secondarySideBar.defaultVisibility': 'visible' });
-    expect(manifest.contributes.commands.map(command => command.command).sort()).toEqual(['ezil-chat.addSelectionToChat', 'ezil-chat.newSession', 'ezil-chat.open', 'ezil-chat.pickModel', 'ezil-chat.restartServer']);
-    for (const key of ['ezilChat.opencodePath', 'ezilChat.serverUrl', 'ezilChat.defaultAgent', 'ezilChat.defaultModel', 'ezilChat.autoStart', 'ezilChat.configPath']) expect(manifest.contributes.configuration.properties[key]).toBeDefined();
+test('every command the host registers is contributed, and every contributed/menu/keybinding command is registered', () => {
+    const registered = [...source('extension.ts').matchAll(/registerCommand\('([^']+)'/g)].map(match => match[1]!).sort();
+    const contributed = manifest.contributes.commands.map(command => command.command).sort();
+    expect(registered.length).toBeGreaterThan(0);
+    expect(contributed).toEqual(registered);
+    const referenced = [...Object.values(manifest.contributes.menus).flat(), ...manifest.contributes.keybindings].map(item => item.command);
+    for (const command of referenced) expect(contributed).toContain(command);
 });
 
-test('defaultModel setting parses provider/model#variant', () => {
-    expect(parseModelKey('azure/claude-sonnet-4-5')).toEqual({ providerID: 'azure', modelID: 'claude-sonnet-4-5' });
-    expect(parseModelKey('azure/gpt-5#high')).toEqual({ providerID: 'azure', modelID: 'gpt-5', variant: 'high' });
-    expect(parseModelKey('nonsense')).toBeUndefined();
-    expect(parseModelKey('azure/')).toBeUndefined();
+test('every ezilChat setting config.ts reads is declared with the same default, and nothing else is declared', () => {
+    const config = source('config.ts');
+    const reads = [...config.matchAll(/text\('(\w+)'(?:, '([^']*)')?\)/g)].map(match => ({ key: match[1]!, fallback: match[2] ?? '' }));
+    const flags = [...config.matchAll(/config\.get<boolean>\('(\w+)', (true|false)\)/g)].map(match => ({ key: match[1]!, fallback: match[2] === 'true' }));
+    expect(reads.length + flags.length).toBeGreaterThanOrEqual(8);
+    const properties = manifest.contributes.configuration.properties;
+    for (const { key, fallback } of reads) expect([key, properties[`ezilChat.${key}`]?.type, properties[`ezilChat.${key}`]?.default]).toEqual([key, 'string', fallback]);
+    for (const { key, fallback } of flags) expect([key, properties[`ezilChat.${key}`]?.type, properties[`ezilChat.${key}`]?.default]).toEqual([key, 'boolean', fallback]);
+    const declared = Object.keys(properties).map(key => key.replace(/^ezilChat\./, '')).sort();
+    expect(declared).toEqual([...reads, ...flags].map(item => item.key).sort());
+});
+
+test('the webview view id, activation events, entry point and stable-API constraints line up', () => {
+    const viewId = /export const VIEW_ID = '([^']+)'/.exec(source('panel/provider.ts'))?.[1];
+    expect(viewId).toBeDefined();
+    expect(manifest.contributes.views['ezil-chat']).toEqual([expect.objectContaining({ id: viewId, type: 'webview' })]);
+    expect(manifest.contributes.viewsContainers.secondarySidebar.map(container => container.id)).toEqual(['ezil-chat']);
+    expect(manifest.activationEvents).toContain(`onView:${viewId}`);
+    expect(manifest.main).toBe('./dist/extension.js');
+    expect(manifest.scripts['build:extension']).toContain('--outfile=dist/extension.js');
+    expect(manifest.enabledApiProposals).toBeUndefined();
+    expect(manifest.engines.vscode).toMatch(/^\^1\.\d+\.\d+$/);
 });

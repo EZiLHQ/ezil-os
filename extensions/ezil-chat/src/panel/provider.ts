@@ -1,10 +1,11 @@
 import * as vscode from 'vscode';
-import type { HostToWebview, WebviewToHost } from '../protocol';
+import { randomBytes } from 'node:crypto';
+import type { HostToWebview } from '../protocol';
 import type { ChatController } from './controller';
 
 export const VIEW_ID = 'ezil-chat.panel';
 
-/** Hosts the webview and forwards messages both ways; the controller does the work. */
+/** Hosts the webview and forwards messages both ways; the controller validates and does the work. */
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     private view: vscode.WebviewView | undefined;
     private readonly queue: HostToWebview[] = [];
@@ -22,18 +23,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const dist = vscode.Uri.joinPath(this.extensionUri, 'dist');
         view.webview.options = { enableScripts: true, localResourceRoots: [dist] };
         view.webview.html = renderHtml(view.webview, dist);
-        view.webview.onDidReceiveMessage((message: WebviewToHost) => { void this.controller.handle(message); });
+        // Untyped on purpose: the controller runtime-checks the shape before acting on it.
+        view.webview.onDidReceiveMessage((message: unknown) => { void this.controller.handle(message); });
         view.onDidDispose(() => { if (this.view === view) this.view = undefined; });
         for (const message of this.queue.splice(0)) void view.webview.postMessage(message);
     }
 }
 
-export function nonce(): string {
-    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    let out = '';
-    for (let index = 0; index < 32; index++) out += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
-    return out;
-}
+export function nonce(): string { return randomBytes(16).toString('base64'); }
 
 export function renderHtml(webview: vscode.Webview, dist: vscode.Uri): string {
     const token = nonce();

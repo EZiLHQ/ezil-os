@@ -39,22 +39,36 @@ BROWSER (via *-code.ezil.org)              CODE-SERVER CONTAINER
   `@opencode/client` 2.0.19 and `src/opencode/normalize.ts` maps v2 wire shapes.
   A v1 or v3 client is a second file, not a rewrite.
 * `src/server/manager.ts` spawns `opencode serve --hostname 127.0.0.1 --port <free>`
-  with a random `OPENCODE_SERVER_PASSWORD`, polls `/api/info`, restarts with
-  exponential backoff after a crash, and kills the child on dispose. With
-  `ezilChat.serverUrl` set it attaches to an existing server instead.
+  in its own process group with a random `OPENCODE_SERVER_PASSWORD`, polls
+  `/api/info`, restarts with exponential backoff after a crash (never after an
+  intentional stop), and kills the whole group (bash tools, MCP servers) on
+  dispose or when a launch fails. The spawned pid is recorded in
+  `workspaceState`, so a server orphaned by an extension-host crash is reaped on
+  the next activation once it is confirmed to be ours. With `ezilChat.serverUrl`
+  set it attaches to an existing server instead. Without a workspace folder the
+  extension does not start a server and asks you to open one.
 * `src/panel/controller.ts` owns the current session and the event pump and
-  turns webview requests into client calls. `src/panel/provider.ts` hosts the
-  webview (`retainContextWhenHidden`, nonce CSP).
+  turns webview requests into client calls. Every webview message is
+  runtime-checked (`src/panel/validate.ts`) and file paths are confined to the
+  workspace folder (`src/paths.ts`). When the SSE stream reconnects the
+  controller reloads catalog, sessions and the open transcript. Permission and
+  question cards raised by subagent sessions are tagged with their root session
+  and shown on the parent transcript. `src/panel/provider.ts` hosts the webview
+  (`retainContextWhenHidden`, nonce CSP).
 * `src/webview/` is plain TypeScript + CSS on VS Code theme variables:
   streaming text, reasoning and tool cards, permission cards (Allow once /
   Always / Reject), question (form) cards, `@file` mentions with fuzzy
   autocomplete, "Add selection" chips, model picker grouped by provider,
   agent and variant pickers, per-turn token and cache read/write readout,
   session list and Stop.
-* `src/edits/diff.ts` opens every OpenCode file edit in the native diff editor.
-  The "before" side is recovered by reverse-applying the patch OpenCode reports
-  (`src/edits/patch.ts`), falling back to `git show HEAD:file`, and a
-  notification offers Keep / Revert.
+* `src/edits/diff.ts` opens OpenCode's file edits in the native diff editor,
+  one at a time so a burst of edits does not flood the editor area. The "before"
+  side is recovered by reverse-applying the patch OpenCode reports
+  (`src/edits/patch.ts`); when that no longer applies, `git show HEAD:file` is
+  shown as a labelled approximation. A notification offers Keep / Revert, and
+  Revert (`src/edits/revert.ts`) recomputes from the file as it is at click time
+  and refuses when the edit can no longer be undone on its own (a later edit,
+  the user or a formatter touched the same lines). It never writes HEAD content.
 
 ## Settings (`ezilChat.*`)
 
@@ -85,8 +99,11 @@ bun run package:vsix   # ezil-chat-0.1.0.vsix via @vscode/vsce (bundled, --no-de
 ```
 
 Unit tests mock the v2 HTTP/SSE server (`tests/adapter.test.ts`), the relay
-(`tests/controller.test.ts`), the reducer, the patch helper and the process
-manager (against `tests/fixtures/fake-opencode.mjs`). `tests/integration.test.ts`
+including message validation, SSE re-sync and subagent cards
+(`tests/controller.test.ts`), the reducer, the patch/revert helpers, path
+confinement, the manifest-vs-source contract and the process manager (launch
+cleanup, spawn errors, restart-vs-stop, process groups and orphan reaping,
+against `tests/fixtures/fake-opencode.mjs`). `tests/integration.test.ts`
 spawns a real `opencode serve` with a config that disables every provider, so
 it exercises health, catalog, sessions, the event stream and a permission
 round trip without calling a model. Point `EZIL_OPENCODE_BIN` at a binary to
