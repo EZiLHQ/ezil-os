@@ -88,7 +88,7 @@ test('CI rejects PRs, stale main, local runs and untrusted workflow_run; trusts 
   const event = { repository: { full_name: manifest.repository }, ref: 'refs/heads/main', after: sha };
   await writeFile(eventPath, JSON.stringify(event));
   const env = { GITHUB_ACTIONS: 'true', GITHUB_REF: 'refs/heads/main', GITHUB_REPOSITORY: manifest.repository, GITHUB_SHA: sha, GITHUB_EVENT_NAME: 'push', GITHUB_EVENT_PATH: eventPath, GITHUB_TOKEN: 'fixture-only' };
-  const request = async url => { assert.match(url, /api.github.com\/repos\/example\/repo\/commits\/main$/); return { ok: true, json: async () => ({ sha }) }; };
+  const request = async url => { assert.equal(url, 'https://api.github.com/repos/example/repo/commits/main'); return { ok: true, json: async () => ({ sha }) }; };
   assert.equal(await authorize(manifest, { env, root, request }), sha);
   for (const override of [{ GITHUB_ACTIONS: 'false' }, { GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_REF: 'refs/pull/1/merge' }, { GITHUB_REPOSITORY: 'attacker/repo' }]) await assert.rejects(authorize(manifest, { env: { ...env, ...override }, root, request: noNetwork }));
   await assert.rejects(authorize(manifest, { env, root, request: async () => ({ ok: true, json: async () => ({ sha: '0'.repeat(40) }) }) }), /Stale/);
