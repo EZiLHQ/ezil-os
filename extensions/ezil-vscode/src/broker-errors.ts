@@ -3,6 +3,8 @@ const messages: Record<string, string> = {
     builder_required: 'Sign in with an onboarded Works builder account.',
     membership_required: 'Ask Works support to enable your AI membership.',
     credits: 'Not enough Works credits for this request. Check your credit balance in Works.',
+    budget: 'The AI budget limit has been reached. Check the budget in Works before submitting again.',
+    key_revoked: 'The AI key was revoked. Reconnect your account in Works before submitting again.',
     replay: 'This request was already submitted. Check Works usage before starting another request.',
     pending_usage: 'AI usage needs reconciliation. Contact Works support before sending another request.',
     paused: 'The EZiL AI gateway is paused. Try again after service resumes.',
@@ -18,6 +20,7 @@ const messages: Record<string, string> = {
     timeout: 'The request timed out. Check Works usage before sending another request.',
 };
 // Never surface exception text, provider response bodies or reflected tokens.
-export function brokerError(code: unknown): Error {
-    return new Error(typeof code === 'string' && Object.hasOwn(messages, code) ? messages[code] : 'EZiL model broker is unavailable. No retry was attempted.');
+export function brokerError(code: unknown, retryAfter?: string | null): Error {
+    const suffix = retryAfter && (/^[0-9]{1,8}$/.test(retryAfter) || /^[A-Z][a-z]{2}, [0-9]{2} [A-Z][a-z]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT$/.test(retryAfter)) ? ` Retry after ${retryAfter}${/^\d+$/.test(retryAfter) ? ' seconds' : ''}.` : '';
+    return new Error((typeof code === 'string' && Object.hasOwn(messages, code) ? messages[code] : 'EZiL model broker is unavailable. No retry was attempted.') + suffix);
 }

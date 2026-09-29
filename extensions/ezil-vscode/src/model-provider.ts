@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { randomUUID } from 'node:crypto';
-import { readBroker, readModelCatalog, type ModelBrokerDescriptor } from './broker';
+import { readBroker, readModelCatalog, type BrokerModel, type ModelBrokerDescriptor } from './broker';
 import { brokerError } from './broker-errors';
 
 const OUTPUT_LIMIT = 8192;
@@ -15,11 +15,11 @@ function textContent(message: vscode.LanguageModelChatRequestMessage): string {
     return parts.join('');
 }
 
-export function requestBody(model: vscode.LanguageModelChatInformation, messages: readonly vscode.LanguageModelChatRequestMessage[], options: vscode.ProvideLanguageModelChatResponseOptions): object {
+export function requestBody(model: vscode.LanguageModelChatInformation, messages: readonly vscode.LanguageModelChatRequestMessage[], options: vscode.ProvideLanguageModelChatResponseOptions, allowance?: BrokerModel): object {
     if (options.tools?.length) throw new Error('This configured EZiL provider does not advertise tool calling.');
     const requested = options.modelOptions?.maxTokens;
-    if (requested !== undefined && (!Number.isInteger(requested) || requested < (model.version === 'ezil-gateway' ? 16 : 1))) throw brokerError('request_invalid');
-    const maxTokens = requested !== undefined ? Math.min(requested, model.maxOutputTokens, OUTPUT_LIMIT) : Math.min(model.maxOutputTokens, 4096);
+    if (requested !== undefined && (!Number.isInteger(requested) || requested < (allowance?.minOutputTokens ?? (model.version === 'ezil-gateway' ? 16 : 1)))) throw brokerError('request_invalid');
+    const maxTokens = requested !== undefined ? Math.min(requested, model.maxOutputTokens, OUTPUT_LIMIT) : Math.min(model.maxOutputTokens, allowance?.defaultOutputTokens ?? 4096);
     return {
         model: model.id,
         messages: messages.map(message => {
@@ -125,7 +125,7 @@ export async function streamChat(descriptor: ModelBrokerDescriptor, body: object
             headers: { authorization: `Bearer ${descriptor.capability}`, 'content-type': 'application/json', 'Idempotency-Key': idempotencyKey },
             body: JSON.stringify(body),
         });
-        if (!response.ok || !response.body) { await response.body?.cancel(); throw brokerError(response.headers.get('x-ezil-error')); }
+        if (!response.ok || !response.body) { await response.body?.cancel(); throw brokerError(response.headers.get('x-ezil-error'), response.headers.get('retry-after')); }
         const type = response.headers.get('content-type')?.split(';', 1)[0];
         if (type === 'text/event-stream') await consumeSSE(response.body, emit, response.headers.get('x-ezil-stream') === 'responses-v1');
         else if (type === 'application/vnd.amazon.eventstream') await consumeBedrock(response.body, emit);
@@ -134,6 +134,7 @@ export async function streamChat(descriptor: ModelBrokerDescriptor, body: object
 }
 
 export class EZiLModelProvider implements vscode.LanguageModelChatProvider {
+    private catalog = new Map<string, BrokerModel>();
     constructor(private readonly descriptorPath: () => string | undefined, private readonly folders: () => readonly string[]) {}
     private descriptor(): ModelBrokerDescriptor {
         const value = readBroker(this.descriptorPath(), this.folders());
@@ -143,10 +144,11 @@ export class EZiLModelProvider implements vscode.LanguageModelChatProvider {
     async provideLanguageModelChatInformation(_options: vscode.PrepareLanguageModelChatModelOptions, token: vscode.CancellationToken): Promise<vscode.LanguageModelChatInformation[]> {
         if (token.isCancellationRequested) return [];
         const models = await readModelCatalog(this.descriptor());
+        this.catalog = new Map(models.map(model => [model.id, model]));
         return models.map(model => ({ id: model.id, name: model.id, family: model.id, version: model.gateway ? 'ezil-gateway' : 'configured', maxInputTokens: model.maxInputTokens, maxOutputTokens: model.maxOutputTokens, capabilities: { imageInput: false, toolCalling: false } }));
     }
     async provideLanguageModelChatResponse(model: vscode.LanguageModelChatInformation, messages: readonly vscode.LanguageModelChatRequestMessage[], options: vscode.ProvideLanguageModelChatResponseOptions, progress: vscode.Progress<vscode.LanguageModelResponsePart>, token: vscode.CancellationToken): Promise<void> {
-        await streamChat(this.descriptor(), requestBody(model, messages, options), part => progress.report(part), token);
+        await streamChat(this.descriptor(), requestBody(model, messages, options, this.catalog.get(model.id)), part => progress.report(part), token);
     }
     async provideTokenCount(_model: vscode.LanguageModelChatInformation, value: string | vscode.LanguageModelChatRequestMessage, _token: vscode.CancellationToken): Promise<number> {
         const text = typeof value === 'string' ? value : textContent(value);

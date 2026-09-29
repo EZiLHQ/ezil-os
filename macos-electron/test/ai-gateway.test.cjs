@@ -47,7 +47,7 @@ test('missing session, disabled models, paused gateway and invalid requests neve
   assert.equal(f.calls.some(c => c.url.endsWith('/v1/responses')), false);
   assert.throws(() => upstream(f.vault.get(), chat));
   f.calls.length = 0;
-  for (const body of [{ ...chat, maxTokens: 4097 }, { ...chat, model: 'gpt-6-sol' }, { ...chat, url: 'https://evil.test' }]) assert.equal((await f.request(body)).status, 400);
+  for (const body of [{ ...chat, maxTokens: 8193 }, { ...chat, model: '../invalid' }, { ...chat, url: 'https://evil.test' }]) assert.equal((await f.request(body)).status, 400);
   assert.equal((await f.request(chat, { headers: { ...f.headers, 'idempotency-key': '' } })).status, 400); assert.equal(f.calls.length, 0);
 });
 test('gateway statuses are bounded, actionable, redacted and never retried or sent direct', async t => {
@@ -83,4 +83,24 @@ test('timeouts and downstream close abort inference without retry', async t => {
   let downstream; const second = f.request(chat, { onResponse: res => { downstream = res; } });
   await new Promise(resolve => setImmediate(resolve)); downstream.destroy(); await second;
   assert.equal(signal.aborted, true); assert.equal(f.calls.filter(c => c.url.endsWith('/v1/responses')).length, 2);
+});
+test('third registry alias reaches inference only within live model limits', async t => {
+  const third = { id: 'ezil-third', enabled: true, max_input_tokens: 4096, min_output_tokens: 32, default_output_tokens: 64, max_output_tokens: 128 };
+  const f = await setup(t, url => url.endsWith('/v1/models') ? Response.json({ ...modelList, data: [...modelList.data, third] }) : url.endsWith('/v1/responses') ? successful() : undefined);
+  const models = await (await f.http.request('/v1/models', { headers: f.headers })).json();
+  assert.equal(models.models[2], third.id); assert.equal(models.modelInfo[2].defaultOutputTokens, 64);
+  for (const maxTokens of [31, 129]) assert.equal((await f.request({ ...chat, model: third.id, maxTokens })).status, 400);
+  assert.equal((await f.request({ ...chat, model: third.id, maxTokens: 64, messages: [{ role: 'user', content: 'x'.repeat(4096) }] })).status, 413);
+  assert.equal(f.calls.filter(c => c.url.endsWith('/v1/responses')).length, 0);
+  assert.equal((await f.request({ ...chat, model: third.id, maxTokens: 64 })).status, 200);
+  assert.equal(f.calls.filter(c => c.url.endsWith('/v1/responses')).length, 1);
+});
+test('rate, budget and revoked-key errors retain safe Retry-After without retry', async t => {
+  for (const [status, code, safe] of [[429, 'rate_limited', 'rate_limited'], [402, 'budget_exceeded', 'budget'], [401, 'key_revoked', 'key_revoked']]) {
+    const f = await setup(t, url => url.endsWith('/v1/responses') ? Response.json({ error: { code, message: grant.refreshToken } }, { status, headers: { 'Retry-After': '30' } }) : undefined);
+    const response = await f.request();
+    assert.equal(response.headers.get('retry-after'), '30'); assert.equal(response.headers.get('x-ezil-error'), safe);
+    assert.equal((await response.text()).includes(grant.refreshToken), false);
+    assert.equal(f.calls.filter(c => c.url.endsWith('/v1/responses')).length, 1);
+  }
 });

@@ -13,7 +13,7 @@ function cleanRuntimeResult(input, result) {
     if (['none', 'ezil', 'azure', 'bedrock'].includes(result?.provider)) clean.provider = result.provider;
     if (['disconnected', 'stored', 'ready', 'paused', 'model_unavailable', 'signin_required', 'unavailable'].includes(result?.state)) clean.state = result.state;
     if (typeof result?.keychainAvailable === 'boolean') clean.keychainAvailable = result.keychainAvailable;
-    if (Array.isArray(result?.models)) clean.models = result.models.filter(id => id === 'ezil-fast' || id === 'ezil-code').slice(0, 2);
+    if (Array.isArray(result?.models)) clean.models = result.models.filter(id => typeof id === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(id)).slice(0, 100);
     return clean;
   }
   if (result?.ok !== true) return { ok: false, state: 'unavailable' };

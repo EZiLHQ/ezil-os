@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, symlinkSync, chmodSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { parsePort, readBroker, readModels, sendOperation, type ModelBrokerDescriptor } from '../src/broker';
+import { parsePort, readBroker, readModels, readModelCatalog, sendOperation, type ModelBrokerDescriptor } from '../src/broker';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -82,4 +82,27 @@ test('Electron model descriptor calls only advertised models with no Origin or p
         writeFileSync(f.path, JSON.stringify({ ...descriptor, ...change }));
         expect(() => readBroker(f.path, f.folders)).toThrow();
     }
+});
+
+test('dynamic gateway catalogs fail closed on malformed caps, IDs and unsupported capabilities', async () => {
+    const actualFetch = globalThis.fetch;
+    const descriptor = { operations: ['models'], url: 'http://127.0.0.1:49152', capability: 'c'.repeat(64) } as ModelBrokerDescriptor;
+    const row = { id: 'ezil-third', maxInputTokens: 4096, minOutputTokens: 32, defaultOutputTokens: 64, maxOutputTokens: 128,
+        capabilities: { tools: false, structured_output: false, reasoning: false }, supportedApiFormats: ['responses'] };
+    let value: unknown = { models: [row.id], modelInfo: [row] };
+    try {
+        globalThis.fetch = (async () => Response.json(value)) as typeof fetch;
+        expect((await readModelCatalog(descriptor))[0]).toMatchObject({ id: row.id, defaultOutputTokens: 64, minOutputTokens: 32 });
+        for (const bad of [{ ...row, id: '../bad' }, { ...row, maxOutputTokens: 8193 }, { ...row, minOutputTokens: 129 }, { ...row, defaultOutputTokens: 31 }, { ...row, capabilities: { tools: true, structured_output: false, reasoning: false } }, { ...row, supportedApiFormats: ['chat_completions'] }]) {
+            value = { models: [bad.id], modelInfo: [bad] };
+            await expect(readModelCatalog(descriptor)).rejects.toThrow();
+        }
+        for (const bad of [null, { models: [row.id, row.id], modelInfo: [row, row] }, { models: [row.id], modelInfo: [] }]) {
+            value = bad; await expect(readModelCatalog(descriptor)).rejects.toThrow();
+        }
+        globalThis.fetch = (async () => new Response('x'.repeat(65537), { headers: { 'content-type': 'application/json' } })) as typeof fetch;
+        await expect(readModelCatalog(descriptor)).rejects.toThrow();
+        globalThis.fetch = (async () => new Response('', { status: 429, headers: { 'x-ezil-error': 'rate_limited', 'retry-after': '30' } })) as typeof fetch;
+        await expect(readModelCatalog(descriptor)).rejects.toThrow('Retry after 30 seconds');
+    } finally { globalThis.fetch = actualFetch; }
 });

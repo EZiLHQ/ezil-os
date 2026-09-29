@@ -5,7 +5,7 @@ const accountId = '11111111-1111-4111-8111-111111111111';
 const now = 1800000000000;
 const grant = { accessToken: 'test.header.signature', refreshToken: 'synthetic-refresh-token', accountId, expiresIn: 3600, tokenType: 'bearer', role: 'builder' };
 const session = { accessToken: grant.accessToken, refreshToken: grant.refreshToken, accountId, expiresAt: now + 3600000 };
-const modelList = { killswitch: false, data: [
+const modelList = { object: 'list', killswitch: false, data: [
   { id: 'ezil-fast', enabled: true, max_input_tokens: 32768, max_output_tokens: 8192 },
   { id: 'ezil-code', enabled: true, max_input_tokens: 16384, max_output_tokens: 4096 }
 ] };

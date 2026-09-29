@@ -112,9 +112,10 @@ test('activation acknowledges readiness and commands register/unregister a previ
         // -> synthetic service replies. Only network transport is substituted.
         const { startBroker } = require('../../../macos-electron/src/broker.cjs');
         const { harness } = require('../../../macos-electron/test/http-harness.cjs');
-        const { fixture, event, complete, grant } = require('../../../macos-electron/test/works-fixture.cjs');
+        const { fixture, event, complete, grant, modelList } = require('../../../macos-electron/test/works-fixture.cjs');
         const http = harness(); let mode = 'success';
         const service = fixture((url: string) => {
+            if (url.endsWith('/v1/models')) return Response.json({ ...modelList, data: [...modelList.data, { id: 'ezil-third', enabled: true, max_input_tokens: 4096, min_output_tokens: 32, default_output_tokens: 64, max_output_tokens: 128, capabilities: { tools: true, structured_output: true, reasoning: true } }] });
             if (!url.endsWith('/v1/responses')) return undefined;
             if (mode === 'credits' || mode === 'replay') return Response.json({ error: { code: mode === 'credits' ? 'insufficient_credits' : 'idempotency_replay', message: grant.refreshToken } }, { status: mode === 'credits' ? 402 : 409 });
             const end = mode === 'success' ? complete : mode === 'failed' ? event('response.failed', { response: { error: { message: grant.accessToken } } }) : '';
@@ -145,6 +146,13 @@ test('activation acknowledges readiness and commands register/unregister a previ
         expect(new Set(posts().map((post: { options: { headers: Record<string, string> } }) => post.options.headers['Idempotency-Key'])).size).toBe(posts().length);
         expect(JSON.stringify(streamed)).not.toContain(grant.accessToken);
         expect(JSON.stringify(streamed)).not.toContain(grant.refreshToken);
+        const thirdModel = gatewayModels.find((m: { id: string }) => m.id === 'ezil-third');
+        expect(thirdModel).toMatchObject({ maxOutputTokens: 128, capabilities: { toolCalling: false } });
+        const askThird = (modelOptions = {}) => provider.provideLanguageModelChatResponse(thirdModel, [{ role: 1, content: [new TextPart('hi')] }], { toolMode: 1, modelOptions }, { report() {} }, cancellation);
+        mode = 'success'; await askThird();
+        expect(JSON.parse(posts().at(-1).options.body).max_output_tokens).toBe(64);
+        await expect(askThird({ maxTokens: 31 })).rejects.toThrow('output limit');
+
 
         const { streamChat } = await import('../src/model-provider');
         const localDescriptor = { contractVersion: 1, url: origin, capability: 'c'.repeat(64), operations: ['models', 'chat'], formats: ['text/event-stream'] } as const;

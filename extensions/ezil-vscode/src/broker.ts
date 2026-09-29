@@ -93,24 +93,39 @@ export async function sendOperation(descriptor: BrokerDescriptor, operation: Rec
 export async function readModels(descriptor: ModelBrokerDescriptor): Promise<string[]> {
     return (await readModelCatalog(descriptor)).map(model => model.id);
 }
-export interface BrokerModel { id: string; maxInputTokens: number; maxOutputTokens: number; gateway: boolean }
+export interface BrokerModel { id: string; maxInputTokens: number; maxOutputTokens: number; gateway: boolean; minOutputTokens: number; defaultOutputTokens: number }
 export async function readModelCatalog(descriptor: ModelBrokerDescriptor): Promise<BrokerModel[]> {
     if (!descriptor.operations.includes('models')) throw new Error('broker_unavailable');
     const response = await fetch(`${descriptor.url}/v1/models`, {
         method: 'GET', redirect: 'error', signal: AbortSignal.timeout(5_000),
         headers: { authorization: `Bearer ${descriptor.capability}` },
     });
-    if (!response.ok) { await response.body?.cancel(); throw brokerError(response.headers.get('x-ezil-error')); }
-    const value = await response.json() as { models?: unknown; modelInfo?: unknown };
+    if (!response.ok) { await response.body?.cancel(); throw brokerError(response.headers.get('x-ezil-error'), response.headers.get('retry-after')); }
+    if (!response.body || response.headers.get('content-type')?.split(';')[0] !== 'application/json') throw new Error('broker_unavailable');
+    const reader = response.body.getReader(); const chunks: Uint8Array[] = []; let bytes = 0;
+    let value: { models?: unknown; modelInfo?: unknown };
+    try {
+        while (true) { const part = await reader.read(); if (part.done) break; bytes += part.value.byteLength; if (bytes > 65536) throw new Error('broker_unavailable'); chunks.push(part.value); }
+        value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
+    } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+    if (!value || typeof value !== 'object') throw new Error('broker_unavailable');
     if (!Array.isArray(value.models) || value.models.length > 100 || value.models.some(model =>
         typeof model !== 'string' || !/^[a-zA-Z0-9._:-]{1,200}$/.test(model))) throw new Error('broker_unavailable');
     const ids = value.models as string[];
-    if (value.modelInfo === undefined) return ids.map(id => ({ id, maxInputTokens: 8192, maxOutputTokens: 8192, gateway: false }));
+    if (new Set(ids).size !== ids.length) throw new Error('broker_unavailable');
+    if (value.modelInfo === undefined) return ids.map(id => ({ id, maxInputTokens: 8192, maxOutputTokens: 8192, gateway: false, minOutputTokens: 1, defaultOutputTokens: 4096 }));
     if (!Array.isArray(value.modelInfo) || value.modelInfo.length !== ids.length) throw new Error('broker_unavailable');
-    return value.modelInfo.map((model: { id?: unknown; maxInputTokens?: unknown; maxOutputTokens?: unknown; minOutputTokens?: unknown }, i) => {
-        const cap = model?.id === 'ezil-fast' ? 8192 : model?.id === 'ezil-code' ? 4096 : 0;
-        if (!cap || model.id !== ids[i] || typeof model.maxInputTokens !== 'number' || !Number.isInteger(model.maxInputTokens) || model.maxInputTokens < 1 || model.maxInputTokens > 32768
-            || typeof model.maxOutputTokens !== 'number' || !Number.isInteger(model.maxOutputTokens) || model.maxOutputTokens < 16 || model.maxOutputTokens > cap || model.minOutputTokens !== 16) throw new Error('broker_unavailable');
-        return { id: ids[i]!, maxInputTokens: Math.min(8192, model.maxInputTokens), maxOutputTokens: model.maxOutputTokens, gateway: true };
+    return value.modelInfo.map((model, i) => {
+        const validCap = (n: unknown, max: number): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n >= 1 && n <= max;
+        if (!model || typeof model.id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(model.id) || model.id !== ids[i]
+            || !validCap(model.maxInputTokens, 32768) || !validCap(model.maxOutputTokens, 8192)
+            || !validCap(model.minOutputTokens, model.maxOutputTokens)
+            || !validCap(model.defaultOutputTokens, model.maxOutputTokens) || model.defaultOutputTokens < model.minOutputTokens
+            || !model.capabilities || Array.isArray(model.capabilities)
+            || Object.keys(model.capabilities).some(k => !['tools', 'structured_output', 'reasoning'].includes(k))
+            || ['tools', 'structured_output', 'reasoning'].some(k => model.capabilities[k] !== false)
+            || !Array.isArray(model.supportedApiFormats) || model.supportedApiFormats.length !== 1 || model.supportedApiFormats[0] !== 'responses') throw new Error('broker_unavailable');
+        return { id: ids[i]!, maxInputTokens: Math.min(8192, model.maxInputTokens), maxOutputTokens: model.maxOutputTokens,
+            minOutputTokens: model.minOutputTokens, defaultOutputTokens: model.defaultOutputTokens, gateway: true };
     });
 }

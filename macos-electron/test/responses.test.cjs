@@ -2,14 +2,15 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { responsesRequest, translateResponses } = require('../src/responses.cjs');
-const { ALIASES } = require('../src/works-session.cjs');
+const { catalog } = require('../src/works-session.cjs');
+const { modelList } = require('./works-fixture.cjs');
 const { event, complete } = require('./works-fixture.cjs');
 const chat = { model: 'ezil-code', messages: [{ role: 'system', content: 'instructions' }, { role: 'assistant', content: 'previous' }, { role: 'user', content: 'hello' }], maxTokens: 16 };
-const model = { id: chat.model, ...ALIASES[chat.model] };
+const model = catalog(modelList).models[1];
 test('text chat maps exactly to stateless streamed Responses, preserving ordered roles', () => {
   assert.deepEqual(responsesRequest(chat, model), { model: 'ezil-code', input: chat.messages, max_output_tokens: 16, stream: true, store: false });
   assert.equal(responsesRequest({ ...chat, maxTokens: 4096 }, model).max_output_tokens, 4096);
-  const fast = { id: 'ezil-fast', ...ALIASES['ezil-fast'] };
+  const fast = catalog(modelList).models[0];
   assert.equal(responsesRequest({ ...chat, model: fast.id, maxTokens: 8192 }, fast).max_output_tokens, 8192);
 });
 test('invalid payloads, aliases, limits and input bounds are refused before inference', () => {

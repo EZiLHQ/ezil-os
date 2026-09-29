@@ -1,11 +1,11 @@
 'use strict';
 const { exact } = require('./policy.cjs');
-const { ALIASES, failure } = require('./works-session.cjs');
+const { safeAlias, CLIENT_CAPS, failure } = require('./works-session.cjs');
 
 function responsesRequest(body, model) {
   try {
     exact(body, ['model', 'messages', 'maxTokens']);
-    if (!model || !Object.hasOwn(ALIASES, body.model) || body.model !== model.id || !Number.isInteger(body.maxTokens) || body.maxTokens < 16 || body.maxTokens > model.maxOutputTokens
+    if (!model || !safeAlias(body.model) || body.model !== model.id || !Number.isInteger(body.maxTokens) || body.maxTokens < (model.minOutputTokens ?? 1) || body.maxTokens > Math.min(model.maxOutputTokens, CLIENT_CAPS.maxOutputTokens)
       || !Array.isArray(body.messages) || body.messages.length < 1 || body.messages.length > 100) throw failure('request_invalid');
     const input = body.messages.map(message => {
       exact(message, ['role', 'content']);

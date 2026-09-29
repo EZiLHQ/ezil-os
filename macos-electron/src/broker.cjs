@@ -5,7 +5,7 @@ const http = require('node:http');
 const { randomBytes, timingSafeEqual } = require('node:crypto');
 const { exact } = require('./policy.cjs');
 const { atomic, privateDir, noLinks } = require('./files.cjs');
-const { WorksSession, storedSession, GATEWAY_ORIGIN, ALIASES, failure, safeError, fixedFetch, responseError } = require('./works-session.cjs');
+const { WorksSession, storedSession, CLIENT_CAPS, failure, safeError, fixedFetch, responseError } = require('./works-session.cjs');
 const { responsesRequest, translateResponses, frame } = require('./responses.cjs');
 const LIMITS = Object.freeze({ requestBytes: 256 * 1024, responseBytes: 8 * 1024 * 1024, concurrent: 2, timeoutMs: 60000, messages: 100, maxTokens: 8192 });
 function credential(value) {
@@ -92,7 +92,7 @@ function drain(response, signal) {
 }
 function gatewayError(res, error) {
   const safe = safeError(error);
-  if (!res.headersSent) res.writeHead(safe.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-EZiL-Error': safe.code }).end(JSON.stringify({ error: { code: safe.code, message: safe.message } }));
+  if (!res.headersSent) res.writeHead(safe.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-EZiL-Error': safe.code, ...(safe.retryAfter ? { 'Retry-After': safe.retryAfter } : {}) }).end(JSON.stringify({ error: { code: safe.code, message: safe.message } }));
   else res.end(frame({ error: { code: safe.code } }));
 }
 async function startBroker(root, vault, { fetchImpl = fetch, limits = LIMITS, createServer = http.createServer, works = new WorksSession(vault, { fetchImpl }) } = {}) {
@@ -132,17 +132,17 @@ async function startBroker(root, vault, { fetchImpl = fetch, limits = LIMITS, cr
         const idempotencyKey = req.headers['idempotency-key'];
         if (typeof idempotencyKey !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(idempotencyKey)) throw failure('request_invalid');
         // Validate the local contract before sending any request or credentials.
-        responsesRequest(body, { id: body?.model, ...ALIASES[body?.model] });
+        responsesRequest(body, { id: body?.model, ...CLIENT_CAPS, minOutputTokens: 1 });
         const catalog = await works.inspect(controller.signal);
         if (catalog.paused) throw failure('paused');
         const model = catalog.models.find(m => m.id === body.model);
         if (!model) throw failure('model_unavailable');
         const payload = responsesRequest(body, model);
         controller.signal.throwIfAborted();
-        const response = await fixedFetch(fetchImpl, `${GATEWAY_ORIGIN}/v1/responses`, {
+        const response = await fixedFetch(fetchImpl, `${works.origins.gatewayOrigin}/v1/responses`, {
           method: 'POST', headers: { Authorization: `Bearer ${catalog.session.accessToken}`, 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
           body: JSON.stringify(payload), signal: controller.signal
-        });
+        }, works.origins);
         if (!response.ok) {
           const error = await responseError(response);
           if (error.code === 'signin_required') works.invalidate(catalog.session);
