@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "repository": "EZiLHQ/ezil-os",
+  "project": "btgqfmnzycdecmeyqubx",
+  "schemas": [
+    "public"
+  ],
+  "sources": [
+    {
+      "path": "app/drizzle/0000_massive_mole_man.sql",
+      "sha256": "a387810b939c35c9768f16bd02788fec7aae001a87657465324769664e48036d",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0001_telemetry.sql",
+      "sha256": "8219140267f921e26befad7ad6be514f5f33829bb24c653f6f794750bdb98f52",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0002_os_access.sql",
+      "sha256": "4c98ec14cc82f82851905cb133218a458836b97bbaa44fc65c4fcba02f0ad397",
+      "kind": "snapshot"
+    }
+  ],
+  "initialCatalog": {
+    "digest": "4c1040575121990dbd5ad09e40c0e334be4a291e4e746fc20a08d8c07a036e7f",
+    "objects": 1794,
+    "capturedAt": "2026-09-29T15:45:14.939Z",
+    "sourceDigest": "e884a81df52d591799e97b1ca59685fa7a70449d91de414c777866f5a26438f5"
+  },
+  "migrations": [],
+  "trustedWorkflowRuns": [
+    343124584
+  ]
+}

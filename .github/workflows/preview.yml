@@ -351,6 +351,7 @@ jobs:
       url: ${{ steps.app.outputs.url }}
     permissions:
       contents: read
+      actions: read
       packages: read
       id-token: write
     outputs:
