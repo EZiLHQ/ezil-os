@@ -5,7 +5,10 @@ import type {
     AgentSummary, ChatEvent, ChatMessage, FileDiff, ModelId, ModelSummary, OpenCodeClient, PermissionDecision,
     PermissionRequest, PromptOptions, PromptPart, ProviderSummary, QuestionAnswer, ServerHealth, SessionSummary,
 } from './adapter';
+import { basicAuthHeader } from './auth';
 import * as normalize from './normalize';
+
+export { basicAuthHeader };
 
 export interface V2ClientOptions {
     baseUrl: string;
@@ -14,10 +17,6 @@ export interface V2ClientOptions {
     password?: string;
     username?: string;
     fetch?: typeof globalThis.fetch;
-}
-
-export function basicAuthHeader(username: string, password: string): string {
-    return `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`;
 }
 
 /** `file:///abs/path?start=3&end=9`, the URI shape OpenCode's own web UI sends for mentions. */

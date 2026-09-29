@@ -1,6 +1,7 @@
 // Stand-in for `opencode serve`: honours --port/--hostname, requires the
 // basic-auth password from the environment, answers /api/info, and can be
 // told to crash so the manager's restart path is exercised.
+import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 
 const args = process.argv.slice(2);
@@ -10,6 +11,8 @@ const expected = `Basic ${Buffer.from(`opencode:${process.env.OPENCODE_SERVER_PA
 const version = process.env.FAKE_OPENCODE_VERSION ?? '2.0.19';
 const startupDelay = Number(process.env.FAKE_OPENCODE_DELAY_MS ?? '0');
 if (process.env.FAKE_OPENCODE_EXIT_IMMEDIATELY) process.exit(3);
+// Optional grandchild (stands in for a bash tool / MCP server) so process-group cleanup can be verified.
+const grandchild = process.env.FAKE_OPENCODE_SPAWN_CHILD ? spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }) : undefined;
 
 const server = createServer((request, response) => {
     if (request.headers.authorization !== expected) {
@@ -18,7 +21,7 @@ const server = createServer((request, response) => {
     }
     if (request.url === '/api/info') {
         response.writeHead(200, { 'content-type': 'application/json' });
-        return response.end(JSON.stringify({ version, pid: process.pid, urls: [`http://${hostname}:${port}`], paths: { tmp: '/tmp' }, config: process.env.OPENCODE_CONFIG ?? null, cwd: process.cwd() }));
+        return response.end(JSON.stringify({ version, pid: process.pid, urls: [`http://${hostname}:${port}`], paths: { tmp: '/tmp' }, config: process.env.OPENCODE_CONFIG ?? null, cwd: process.cwd(), childPid: grandchild?.pid ?? null }));
     }
     if (request.url === '/crash') { response.end('bye'); setTimeout(() => process.exit(7), 10); return; }
     response.writeHead(404); response.end();
