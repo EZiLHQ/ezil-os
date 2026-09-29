@@ -4,13 +4,15 @@ EZiL Chat puts an AI coding panel in the **secondary sidebar** of the EZiL OS
 editor, the same slot Claude Code and Codex use, and drives a pinned
 [OpenCode](https://opencode.ai) v2 server on loopback. OpenCode owns the agent
 loop, tools, permissions, model routing and prompt caching; this extension is
-the UI and the process owner. It also ships `configurationDefaults` that turn
-off VS Code's built-in Copilot chat (`chat.disableAIFeatures`) and open the
-secondary sidebar by default.
+the UI and the process owner. It ships `configurationDefaults` that turn off
+VS Code's built-in Copilot chat (`chat.disableAIFeatures`) and open the
+secondary sidebar by default — defaults the desktop image deliberately
+overrides (see "How the image installs it": there, the bundled Copilot Chat
+UI on EZiL models is the primary panel and this one is optional).
 
 Phase 1 scope: the extension, its build/test/package pipeline and local tests.
-Image changes (pinning code-server, removing the bundled Copilot extension,
-installing the VSIX and `opencode`) are a separate change in `worker/`.
+Image changes (pinning code-server, installing the VSIX and `opencode`) are a
+separate change in `worker/`.
 
 ## Architecture
 
@@ -111,13 +113,21 @@ run it; it is skipped when none is found.
 
 ## How the image installs it
 
-`worker/Dockerfile` (the desktop image local mode and the hosted Worker run):
+`worker/Dockerfile` (the desktop image local mode and the hosted Worker run).
+**Since image revision 2 this panel is installed but optional**: the primary
+chat panel is the open-source Copilot Chat that code-server bundles, running
+on EZiL-configured models through the built-in `extensions/ezil-models`
+provider (see that README, "How the image installs it"). EZiL Chat stays a
+built-in so OpenCode is one click away — its "EZiL" icon in the secondary
+sidebar, or the command "EZiL Chat: Open" — but it does not start `opencode
+serve` or take over the sidebar on its own.
 
 * **code-server is pinned** (`CODE_SERVER_VERSION` / `CODE_SERVER_SHA256`, the
   amd64 `.deb` from the GitHub release, checksummed) instead of `curl
   install.sh | sh`. The bundled GitHub Copilot Chat built-in that code-server
-  >= 4.139 ships (`lib/vscode/extensions/copilot`) is deleted and
-  `product.json`'s `defaultChatAgent` is stripped, so no Copilot UI can appear.
+  >= 4.139 ships (`lib/vscode/extensions/copilot`, MIT) is KEPT and
+  `product.json` is left as shipped; a build gate fails if the built-in goes
+  missing.
 * **This extension is a built-in.** `worker/ezil-chat/build-vsix.sh` packages
   `extensions/ezil-chat` into the committed
   `worker/ezil-chat/dist/ezil-chat-<version>.vsix` (the source is outside the
@@ -139,21 +149,28 @@ run it; it is skipped when none is found.
   `azure` provider whose `resourceName`/`apiKey` are `{env:AZURE_RESOURCE_NAME}`
   / `{env:AZURE_API_KEY}` references with example deployment names. No secrets
   in the image; the extension never stores provider credentials either.
-* **Machine-scope settings.** `worker/scripts/start-neko.sh` writes
-  `<user-data-dir>/Machine/settings.json` on every boot with
-  `chat.disableAIFeatures: true` and
+* **Machine-scope settings keep it dormant.** `worker/scripts/start-neko.sh`
+  writes `<user-data-dir>/Machine/settings.json` on every boot; among the
+  chat keys that put Copilot Chat on EZiL models it sets
+  `chat.disableAIFeatures: false` (overriding this extension's
+  `configurationDefaults`), `ezilChat.autoStart: false` and
+  `ezilChat.revealOnStartup: false`, plus
   `workbench.secondarySideBar.defaultVisibility: "visible"`. That layer
-  outranks User settings, so a returning user whose restored `settings.json`
-  says `chat.disableAIFeatures: false` still gets no built-in chat UI.
+  outranks User settings and extension defaults, so the Chat view is what
+  the sidebar opens on and no OpenCode server is spawned until the panel is
+  opened. Everything else about the panel (pickers, permission cards, diff
+  review, token readout) is unchanged once it is open.
 
-`e2e/ezil-chat-image.sh <image>` proves all of this on a built image: it boots
-the container like local mode, checks the in-image facts, then drives a real
-browser (`e2e/ezil-chat.mjs`) through the EZiL panel — including a prompt
-answered by `e2e/ezil-chat-mock-provider.mjs`, an OpenAI-compatible mock wired
-in through a project-level `opencode.json`, so no model credentials are
-needed — and boots again as a returning user with a Copilot-era
-`.ezil/extensions.txt` and a masking User `settings.json`. Needs docker, node
-and a Playwright install (`PLAYWRIGHT_REQUIRE_DIR`, like `e2e/prod.mjs`).
+`e2e/ezil-chat-image.sh <image>` proves the OpenCode path on a built image: it
+boots the container like local mode, checks the in-image facts, then drives a
+real browser (`e2e/ezil-chat.mjs`) that opens the EZiL panel explicitly and
+sends a prompt answered by `e2e/ezil-chat-mock-provider.mjs`, an
+OpenAI-compatible mock wired in through a project-level `opencode.json`, so no
+model credentials are needed — and boots again as a returning user with a
+Copilot-era `.ezil/extensions.txt` and a masking User `settings.json`. The
+Copilot-Chat-on-EZiL-models path has its own runner,
+`e2e/copilot-ezil-image.sh`. Both need docker, node and a Playwright install
+(`PLAYWRIGHT_REQUIRE_DIR`, like `e2e/prod.mjs`).
 
 ## Running locally with code-server
 

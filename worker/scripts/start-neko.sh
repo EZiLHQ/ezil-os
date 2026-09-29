@@ -1916,9 +1916,15 @@ seed_codeserver_user_settings() {
     return 0
   fi
   mkdir -p "$_cs_user_dir" 2>/dev/null || return 1
+  # `telemetry.telemetryLevel` is APPLICATION-scoped, so it can only live here
+  # (the Machine layer below drops application-scoped keys). Belt and braces
+  # next to `--disable-telemetry`: the bundled Copilot Chat's own telemetry
+  # senders (1DS + GitHub) key off this level — see worker/README.md
+  # "Telemetry egress of the bundled Copilot Chat".
   cat >"$_cs_settings" <<'CODESERVER_SETTINGS_JSON'
 {
   "security.workspace.trust.enabled": false,
+  "telemetry.telemetryLevel": "off",
   "files.exclude": {
     "**/.ezil": true
   }
@@ -2039,38 +2045,88 @@ fi
 
 # ── Machine-scope settings: written on EVERY boot, never user-editable ───────
 #
-# The EZiL Chat extension is baked into the image as a BUILT-IN
-# (/usr/lib/code-server/lib/vscode/extensions/ezil-chat — see the Dockerfile),
-# and its `configurationDefaults` already say `chat.disableAIFeatures: true`
-# and open the secondary sidebar. Extension defaults are the LOWEST layer,
-# though: a user whose restored `.ezil/settings.json` (or an in-session edit)
-# carries `chat.disableAIFeatures: false` would bring VS Code's built-in chat
-# UI back — a "Chat" command-center button and a chat view pointing at a
-# Copilot that this image deliberately does not contain.
+# The right panel is the open-source Copilot Chat built into code-server,
+# running on EZiL-configured models through the built-in `ezil-models`
+# provider (see the Dockerfile) — no GitHub account. Two things make that
+# work on a COLD browser and both live above User settings, so a returning
+# user's restored `.ezil/settings.json` (or an in-session edit) cannot undo
+# them: `chat.allowAnonymousAccess` — the ONE core setting that activates
+# copilot-chat without a token and lets it list third-party providers
+# (measured in /workspace/copilot-byok-test/REPORT.md; without it a fresh
+# browser profile keeps the extension disabled until someone opens Manage
+# Models, and a prompt pops the "Sign in to use GitHub Copilot" dialog) — and
+# the vendor group `seed_codeserver_chat_models` writes below, which flips the
+# `github.copilot.hasByokModels` context key that hides the sign-in
+# affordances. `chat.disableAIFeatures: false` is explicit because the
+# baked-in ezil-chat extension still carries `configurationDefaults` setting
+# it to true; Machine outranks extension defaults. The ezil-chat panel stays
+# installed but DORMANT (`ezilChat.autoStart` / `revealOnStartup` false): the
+# Chat view is what the secondary sidebar opens on and no `opencode serve` is
+# spawned until someone opens the EZiL container. `github.copilot.enable:
+# {"*": false}` keeps inline completions (which need a GitHub token) from ever
+# trying; `byokUtilityModelDefault: mainAgent` sends title/progress utility
+# calls to the EZiL model instead of a Copilot endpoint.
 #
 # `<user-data-dir>/Machine/settings.json` is VS Code's remote-machine layer
 # (`machineSettingsResource` in the server), which ranks ABOVE User settings
 # and below only Workspace settings, and which the workbench UI has no editor
-# for. Both keys below are resource/window-scoped, so the machine layer is
-# allowed to carry them (only application-scoped settings are dropped there —
-# that is why `security.workspace.trust.enabled` stays in the User seed above
-# and is not repeated here). Unconditional overwrite, unlike the User seed:
-# these are not the user's to change, and the file is 4 lines.
+# for. Every key below is machine/window/resource-scoped, so the machine layer
+# is allowed to carry them (application-scoped settings are dropped there —
+# that is why `security.workspace.trust.enabled` and `telemetry.telemetryLevel`
+# live in the User seed above). `chat.newSession.defaultMode: "Plan"` is NOT
+# set: in anonymous mode the core forces Agent mode and ignores it (Plan is a
+# copilot-chat custom agent, reachable once signed in) — documented in the
+# e2e. Unconditional overwrite, unlike the User seed: these are not the user's
+# to change. Keep the heredoc byte-identical with start-codeserver.sh —
+# worker/src/codeserver-chat-settings.test.ts checks that.
 seed_codeserver_machine_settings() {
   _cs_machine_dir="$1/Machine"
   mkdir -p "$_cs_machine_dir" 2>/dev/null || return 1
   cat >"$_cs_machine_dir/settings.json" <<'CODESERVER_MACHINE_SETTINGS_JSON'
 {
-  "chat.disableAIFeatures": true,
-  "workbench.secondarySideBar.defaultVisibility": "visible"
+  "chat.disableAIFeatures": false,
+  "chat.allowAnonymousAccess": true,
+  "chat.byokUtilityModelDefault": "mainAgent",
+  "chat.titleBar.signIn.enabled": false,
+  "chat.welcomePage.signIn.enabled": false,
+  "github.copilot.enable": { "*": false },
+  "github.copilot.nextEditSuggestions.enabled": false,
+  "workbench.secondarySideBar.defaultVisibility": "visible",
+  "ezilChat.autoStart": false,
+  "ezilChat.revealOnStartup": false
 }
 CODESERVER_MACHINE_SETTINGS_JSON
 }
 
+# The profile's BYOK group list. Copilot Chat's core only asks a third-party
+# `LanguageModelChatProvider` for its models when a group naming that vendor
+# exists in `<user-data-dir>/User/chatLanguageModels.json` (default `[]`,
+# watched live, schema vscode://schemas/language-models); the group carries no
+# secret for vendor `ezil` — keys live in /etc/ezil/models.json. Seeded when
+# absent; MERGED when present so groups a user added through Manage Models in
+# this container life survive the next boot (node does the merge; it is in
+# the image). Returns non-zero only when nothing could be written.
+seed_codeserver_chat_models() {
+  _cs_models="$1/User/chatLanguageModels.json"
+  mkdir -p "$1/User" 2>/dev/null || return 1
+  if [ ! -s "$_cs_models" ]; then
+    printf '[\n  { "name": "EZiL", "vendor": "ezil" }\n]\n' >"$_cs_models" 2>/dev/null
+    return $?
+  fi
+  grep -q '"vendor"[[:space:]]*:[[:space:]]*"ezil"' "$_cs_models" 2>/dev/null && return 0
+  command -v node >/dev/null 2>&1 || return 1
+  node -e 'const fs=require("fs");const p=process.argv[1];let g=[];try{const j=JSON.parse(fs.readFileSync(p,"utf8"));if(Array.isArray(j))g=j;}catch(e){}if(!g.some(x=>x&&x.vendor==="ezil"))g.push({name:"EZiL",vendor:"ezil"});fs.writeFileSync(p,JSON.stringify(g,null,2)+"\n");' "$_cs_models" 2>/dev/null
+}
+
 if seed_codeserver_machine_settings "$CODE_SERVER_USER_DATA_DIR"; then
-  log "code-server machine settings written at ${CODE_SERVER_USER_DATA_DIR}/Machine/settings.json (built-in AI chat off, secondary sidebar — EZiL Chat — visible)"
+  log "code-server machine settings written at ${CODE_SERVER_USER_DATA_DIR}/Machine/settings.json (Copilot Chat UI on EZiL models: anonymous access on, sign-in affordances off, completions off; secondary sidebar visible; EZiL Chat panel dormant)"
 else
-  log "WARNING: could not write ${CODE_SERVER_USER_DATA_DIR}/Machine/settings.json — a user settings.json that re-enables chat.disableAIFeatures would bring the built-in chat UI back"
+  log "WARNING: could not write ${CODE_SERVER_USER_DATA_DIR}/Machine/settings.json — the chat panel will ask for a GitHub sign-in instead of using the EZiL models"
+fi
+if seed_codeserver_chat_models "$CODE_SERVER_USER_DATA_DIR"; then
+  log "code-server chat model groups seeded at ${CODE_SERVER_USER_DATA_DIR}/User/chatLanguageModels.json (vendor ezil)"
+else
+  log "WARNING: could not seed ${CODE_SERVER_USER_DATA_DIR}/User/chatLanguageModels.json — the EZiL models may not be listed until Manage Models is opened once"
 fi
 
 phase_start codeserver_launch

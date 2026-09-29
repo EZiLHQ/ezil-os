@@ -133,14 +133,46 @@ If you believe an attribution is missing or inaccurate, please open an issue
   official binary (which the superseded Electron build above downloaded
   under the proprietary Microsoft Software License Terms) — avoids that
   proprietary-terms question entirely.
-- **Bundled GitHub Copilot Chat is removed.** code-server >= 4.139 ships
-  GitHub Copilot Chat as a built-in extension
+- **Bundled GitHub Copilot Chat is KEPT and used.** code-server >= 4.139
+  ships GitHub Copilot Chat as a built-in extension
   (`lib/vscode/extensions/copilot`) and points `product.json`'s
-  `defaultChatAgent` at it. `worker/Dockerfile` deletes that directory and
-  strips `defaultChatAgent` in the same build step, and the build fails if
-  anything named `copilot` remains in the system-extensions directory. So
-  nothing from Copilot Chat is present in the shipped image, and it is not
-  credited here; EZiL Chat (§8) is the editor's assistant instead.
+  `defaultChatAgent` at it. An earlier revision of `worker/Dockerfile`
+  deleted that directory and stripped `defaultChatAgent`; since revision 2
+  both are left exactly as code-server ships them, the build fails if the
+  extension is missing, and the extension is the editor's chat panel — see
+  the next entry for its licence. `product.json` is not modified.
+
+### GitHub Copilot Chat (`microsoft/vscode`, `extensions/copilot`)
+- **URL:** https://github.com/microsoft/vscode/tree/main/extensions/copilot
+  (the extension formerly developed at `microsoft/vscode-copilot-chat`, folded
+  into the VS Code monorepo and built by code-server from its `lib/vscode`
+  submodule at tag `1.139.1`; shipped as `GitHub.copilot-chat` 0.67.0).
+- **License:** **MIT** (read from the shipped
+  `/usr/lib/code-server/lib/vscode/extensions/copilot/LICENSE.txt` in the
+  `codercom/code-server:4.139.1` image: "MIT License, Copyright (c) Microsoft
+  Corporation. All rights reserved." — the manifest says `"license": "SEE
+  LICENSE IN LICENSE.txt"`, so the file, not the field, is the source).
+- **Used for:** the chat panel in the secondary sidebar (Agent mode, tools,
+  clarifying questions, attachments, the Language Models editor). It is NOT
+  modified, vendored or rebuilt; it is run with `chat.allowAnonymousAccess`
+  and fed by the EZiL-authored `extensions/ezil-models`
+  `LanguageModelChatProvider` (§9), so it never holds a GitHub token and
+  talks only to the model endpoints named in `/etc/ezil/models.json`. Its
+  system prompt still tells the model to call itself "GitHub Copilot" and
+  some UI strings still say "Copilot"; nothing here claims otherwise. Its
+  telemetry is turned off by the seeded settings (`telemetry.telemetryLevel:
+  off`, `--disable-telemetry`); the hosts it would talk to are listed in
+  `worker/README.md`.
+- **Also bundled by code-server, not by this repository, and not used by
+  EZiL:** the core "Agent Host" runtime `@github/copilot-sdk` and
+  `@github/copilot-sdk-linux-x64` (`lib/vscode/node_modules/@github/`,
+  version `1.0.15-unstable.35393089353.gfc44743`, ~117 MB, the Copilot CLI
+  runtime behind the `Local | Copilot | Cloud` session-target picker). Both
+  packages declare **MIT** in their `package.json` (`"license": "MIT"`,
+  repository `github/copilot-sdk`); neither package ships its own `LICENSE`
+  file in the installed tree, so the declared field is what was verified.
+  The runtime starts with code-server and stays dormant without a GitHub
+  token; `worker/` does not configure, call or remove it.
 
 ### opencode (`anomalyco/opencode`)
 - **URL:** https://github.com/anomalyco/opencode
@@ -255,6 +287,11 @@ anyone relies on an assumed license:
   `@opencode/cli-linux-x64@2.0.19` tarball `worker/Dockerfile` pins by
   sha256. The GitHub Licenses API was not reachable from the environment the
   check ran in, so the raw file was read instead.
+- GitHub Copilot Chat's MIT licence was read from `LICENSE.txt` inside the
+  built-in extension directory of the `codercom/code-server:4.139.1` image
+  (`docker exec`), and the `@github/copilot-sdk*` licence fields from their
+  installed `package.json` files in the same image; the absence of a
+  `LICENSE` file in those two packages is recorded rather than papered over.
 - Licenses for `extensions/ezil-chat/`'s npm dependencies (§8) were read
   from each package's installed `package.json` under
   `extensions/ezil-chat/node_modules`, and the committed VSIX

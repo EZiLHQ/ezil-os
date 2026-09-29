@@ -248,14 +248,15 @@ RUN chmod +x /usr/bin/neko \
 # macos/runtime/Dockerfile. This used to be `curl code-server.dev/install.sh |
 # sh`, i.e. "whatever is latest today": a rebuild of an unchanged Dockerfile
 # could ship a different IDE, and did — 4.139.x (Code 1.139) started bundling
-# GitHub Copilot Chat as a BUILT-IN extension (`lib/vscode/extensions/copilot`,
-# 170 MB, plus `product.json`'s `defaultChatAgent`), which put a second AI chat
-# next to EZiL Chat with no way for a user to uninstall it. Bump the two ARGs
-# together; the sha256 is of the amd64 .deb asset on the release page
-# (`sha256sum code-server_<version>_amd64.deb`). `engines.vscode` of the baked
-# ezil-chat extension is ^1.106 — any 4.10x+ satisfies it; 4.139.1 is the
-# release that was current (and already in the last unpinned build) when the
-# pin was introduced.
+# the open-source GitHub Copilot Chat as a BUILT-IN extension
+# (`lib/vscode/extensions/copilot`, MIT, 170 MB). That built-in is now THE chat
+# panel EZiL ships (fed by the ezil-models provider below), so the pin is also
+# what guarantees the exact Copilot Chat build (0.67.0) the e2e was run
+# against. Bump the two ARGs together; the sha256 is of the amd64 .deb asset on
+# the release page (`sha256sum code-server_<version>_amd64.deb`).
+# `engines.vscode` of the baked ezil-chat / ezil-models extensions is ^1.106 —
+# any 4.10x+ satisfies it; 4.139.1 is the release that was current (and already
+# in the last unpinned build) when the pin was introduced.
 #
 # Binds **0.0.0.0**:8443 with `--auth none`; start-neko.sh/start-codeserver.sh
 # launch it. It bound 127.0.0.1 until a live test showed Cloudflare's proxy
@@ -276,21 +277,26 @@ RUN curl --fail --location --silent --show-error \
   && test -x /usr/bin/code-server \
   && code-server --version | grep -q "^${CODE_SERVER_VERSION} "
 
-# ── No Copilot: the bundled built-in goes, and product.json forgets it ───────
-# EZiL Chat (below) is THE assistant in this editor. The built-in Copilot Chat
-# that code-server >= 4.139 ships is deleted from the system extensions
-# directory, and `product.json`'s `defaultChatAgent` — the block that makes
-# the workbench render a "Chat" command-center button offering to (re)install
-# GitHub Copilot from the marketplace — is removed so nothing points at it.
-# `chat.disableAIFeatures: true` (extension `configurationDefaults` + the
-# Machine-scope settings start-neko.sh writes on every boot) hides the rest
-# of the built-in chat UI. The final `ls | grep -i copilot` is the gate the
-# e2e (e2e/ezil-chat.mjs) re-checks at runtime; a future code-server that
-# renames the folder fails the BUILD here rather than shipping.
-RUN rm -rf /usr/lib/code-server/lib/vscode/extensions/copilot \
-  && ! ls /usr/lib/code-server/lib/vscode/extensions | grep -qi copilot \
-  && node -e "const fs=require('fs');const p='/usr/lib/code-server/lib/vscode/product.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));if(!j.defaultChatAgent)throw new Error('product.json has no defaultChatAgent — check whether this code-server still bundles Copilot some other way');delete j.defaultChatAgent;fs.writeFileSync(p,JSON.stringify(j,null,'\t')+'\n');" \
-  && ! grep -q defaultChatAgent /usr/lib/code-server/lib/vscode/product.json
+# ── Copilot Chat built-in: KEPT, and it must be there ────────────────────────
+# Revision 1 of this image deleted `lib/vscode/extensions/copilot` and stripped
+# `product.json#defaultChatAgent`. Revision 2 reverses that: the open-source
+# Copilot Chat UI (MIT — microsoft/vscode `extensions/copilot`, GitHub.copilot-
+# chat 0.67.0 in this code-server) IS the chat panel, running on EZiL-
+# configured models through the `ezil-models` LanguageModelChatProvider baked
+# in below, with no GitHub account: `chat.allowAnonymousAccess` plus a seeded
+# `User/chatLanguageModels.json` vendor group, both written by start-neko.sh
+# on every boot (measured in /workspace/copilot-byok-test/REPORT.md — the
+# setting is what activates copilot-chat on a cold browser, the file is what
+# flips `github.copilot.hasByokModels` and hides the sign-in affordances).
+# product.json is left exactly as code-server ships it — `defaultChatAgent`
+# included, because the core ChatEntitlementService returns early without it
+# and the setup/BYOK plumbing the model picker relies on goes with it. The
+# gate fails the BUILD if a future code-server stops bundling the extension,
+# renames the directory or drops the provider contribution, instead of
+# shipping an image whose right panel is empty.
+RUN test -f /usr/lib/code-server/lib/vscode/extensions/copilot/package.json \
+  && node -e "const j=require('/usr/lib/code-server/lib/vscode/extensions/copilot/package.json');if(j.publisher!=='GitHub'||j.name!=='copilot-chat')throw new Error('unexpected built-in '+j.publisher+'.'+j.name);if(!(j.contributes&&j.contributes.languageModelChatProviders))throw new Error('built-in copilot-chat has no languageModelChatProviders contribution');console.log('built-in',j.publisher+'.'+j.name,j.version)" \
+  && node -e "const j=JSON.parse(require('fs').readFileSync('/usr/lib/code-server/lib/vscode/product.json','utf8'));if(!j.defaultChatAgent)throw new Error('product.json has no defaultChatAgent — the chat setup plumbing the model picker needs is gone');console.log('product.json defaultChatAgent present')"
 
 # ── EZiL Chat: baked in as a BUILT-IN (system) extension ─────────────────────
 # `worker/ezil-chat/dist/ezil-chat-<version>.vsix` is built from
@@ -306,14 +312,56 @@ RUN rm -rf /usr/lib/code-server/lib/vscode/extensions/copilot \
 # lose it nor try to fetch it from a marketplace where it does not exist.
 # code-server 4.139 has no `--extra-builtin-extensions-dir`-style flag
 # (verified: "Unknown option"), so the directory is the only way in.
+#
+# Since revision 2 the panel is INSTALLED BUT DORMANT by default: the Chat
+# view (Copilot Chat on EZiL models) is the active view of the secondary
+# sidebar, and start-neko.sh's Machine settings set `ezilChat.autoStart:
+# false` and `ezilChat.revealOnStartup: false`, so no `opencode serve` is
+# spawned and the EZiL container is not focused until a user clicks its icon
+# or runs "EZiL Chat: Open". Its `configurationDefaults`
+# (`chat.disableAIFeatures: true`) are overridden by the same Machine layer
+# (`chat.disableAIFeatures: false`), which is why that key is no longer
+# asserted here — the two settings the Machine layer relies on are.
 COPY ezil-chat/dist/ezil-chat-0.1.0.vsix /tmp/ezil-chat.vsix
 RUN mkdir -p /tmp/ezil-chat \
   && unzip -q /tmp/ezil-chat.vsix 'extension/*' -d /tmp/ezil-chat \
   && mv /tmp/ezil-chat/extension /usr/lib/code-server/lib/vscode/extensions/ezil-chat \
   && rm -rf /tmp/ezil-chat /tmp/ezil-chat.vsix \
-  && node -e "const j=require('/usr/lib/code-server/lib/vscode/extensions/ezil-chat/package.json');if(j.publisher!=='ezil'||j.name!=='ezil-chat')throw new Error('unexpected extension '+j.publisher+'.'+j.name);if(j.contributes.configurationDefaults['chat.disableAIFeatures']!==true)throw new Error('ezil-chat no longer disables built-in chat by default');console.log('built-in ezil-chat',j.version)" \
+  && node -e "const j=require('/usr/lib/code-server/lib/vscode/extensions/ezil-chat/package.json');if(j.publisher!=='ezil'||j.name!=='ezil-chat')throw new Error('unexpected extension '+j.publisher+'.'+j.name);for(const k of ['ezilChat.autoStart','ezilChat.revealOnStartup'])if(!j.contributes.configuration.properties[k])throw new Error('ezil-chat lost the setting '+k+' that start-neko.sh uses to keep the panel dormant by default');console.log('built-in ezil-chat',j.version)" \
   && test -f /usr/lib/code-server/lib/vscode/extensions/ezil-chat/dist/extension.js \
   && test -f /usr/lib/code-server/lib/vscode/extensions/ezil-chat/dist/webview.js
+
+# ── EZiL Models: the LanguageModelChatProvider behind the Copilot Chat UI ────
+# `worker/ezil-models/dist/ezil-models-<version>.vsix` is built from
+# `extensions/ezil-models/` by `worker/ezil-models/build-vsix.sh` and committed
+# (same arrangement as ezil-chat above; `build-vsix.sh --check` fails when it
+# is stale). Unpacked next to the other built-ins, it contributes vendor
+# `ezil` to `languageModelChatProviders`: Copilot Chat lists its models under
+# "EZiL" in Manage Models and routes Agent-mode requests (system prompt, 39
+# tools, tool results, images) to them. Zero runtime dependencies.
+#
+# Models come from ONE file, `/etc/ezil/models.json` (`EZIL_MODELS_CONFIG`,
+# which the extension reads before its `ezilModels.configPath` setting),
+# shipped from `worker/ezil-models/models.json`: Anthropic direct
+# (`{env:ANTHROPIC_API_KEY}`), Claude and OpenAI deployments on one Microsoft
+# Foundry resource (`{env:AZURE_RESOURCE_NAME}` + `{env:AZURE_API_KEY}`) and
+# OpenAI (`{env:OPENAI_API_KEY}`). No secret is in the image; "just put the
+# key" = set the variable on the container. The gate rejects a literal key.
+# Note (extensions/ezil-models/src/config.ts): the file is validated as a
+# whole, so an UNSET variable makes the extension serve NO models and report
+# the missing name in its output channel until the variable is set or that
+# provider and its models are removed — override the path with
+# EZIL_MODELS_CONFIG to ship a smaller file (the e2e does exactly that).
+COPY ezil-models/dist/ezil-models-0.1.0.vsix /tmp/ezil-models.vsix
+RUN mkdir -p /tmp/ezil-models \
+  && unzip -q /tmp/ezil-models.vsix 'extension/*' -d /tmp/ezil-models \
+  && mv /tmp/ezil-models/extension /usr/lib/code-server/lib/vscode/extensions/ezil-models \
+  && rm -rf /tmp/ezil-models /tmp/ezil-models.vsix \
+  && node -e "const j=require('/usr/lib/code-server/lib/vscode/extensions/ezil-models/package.json');if(j.publisher!=='ezil'||j.name!=='ezil-models')throw new Error('unexpected extension '+j.publisher+'.'+j.name);const p=(j.contributes.languageModelChatProviders||[]);if(!p.some(x=>x.vendor==='ezil'))throw new Error('ezil-models does not contribute languageModelChatProviders vendor ezil');console.log('built-in ezil-models',j.version)" \
+  && test -f /usr/lib/code-server/lib/vscode/extensions/ezil-models/dist/extension.js
+COPY ezil-models/models.json /etc/ezil/models.json
+ENV EZIL_MODELS_CONFIG=/etc/ezil/models.json
+RUN node -e "const j=JSON.parse(require('fs').readFileSync('/etc/ezil/models.json','utf8'));if(!j.providers||!Object.keys(j.providers).length||!Array.isArray(j.models)||!j.models.length)throw new Error('models.json needs providers and models');for(const [n,p] of Object.entries(j.providers)){for(const k of ['apiKey','resource']){if(p[k]!==undefined&&!/^[{](env|file):[^}]+[}]$/.test(p[k]))throw new Error('providers.'+n+'.'+k+' must be an {env:NAME} or {file:/path} reference, not a literal');}}if(JSON.stringify(j).match(/sk-[A-Za-z0-9]{8}|[0-9a-f]{32}/))throw new Error('models.json looks like it carries a literal secret');if(j.models.filter(m=>m.default===true).length!==1)throw new Error('models.json must mark exactly one default model');console.log('models.json ok:',Object.keys(j.providers).join(','),'/',j.models.map(m=>m.id).join(','))"
 
 # ── OpenCode CLI (the agent runtime EZiL Chat drives) ────────────────────────
 # Pinned to the `@opencode/client` version the extension is compiled against

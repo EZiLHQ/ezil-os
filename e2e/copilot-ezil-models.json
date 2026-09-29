@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/EZiLHQ/ezil-os/main/extensions/ezil-models/schema/models.schema.json",
+  "providers": {
+    "e2e-mock": {
+      "type": "openai-compatible",
+      "baseUrl": "http://127.0.0.1:4142/v1",
+      "apiKey": "e2e-key"
+    }
+  },
+  "models": [
+    {
+      "id": "ezil-e2e-mock",
+      "name": "EZiL e2e mock",
+      "provider": "e2e-mock",
+      "model": "mock-1",
+      "family": "gpt",
+      "detail": "e2e/copilot-ezil-mock-provider.mjs inside the container",
+      "maxInputTokens": 128000,
+      "maxOutputTokens": 4096,
+      "capabilities": { "toolCalling": true, "imageInput": true },
+      "default": true,
+      "roles": ["default", "plan", "utility", "utilitySmall"]
+    }
+  ]
+}

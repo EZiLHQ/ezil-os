@@ -19,19 +19,41 @@ did not. See [`docs/RELEASE.md`](docs/RELEASE.md) for the full mechanics.
 
 ### Added
 
-- **EZiL Chat in the desktop image.** The `extensions/ezil-chat` VS Code
-  extension (an AI coding panel in the secondary sidebar that drives a pinned
-  [OpenCode](https://opencode.ai) v2 server on loopback) is baked into
-  `worker/Dockerfile` as a built-in extension, next to `opencode` v2.0.19 and
-  a managed `/etc/opencode/opencode.json` (autoupdate off, sharing off, Azure
-  AI Foundry wired through `{env:...}` references, no secrets). code-server is
-  now pinned by version and checksum (4.139.1) instead of installed from
-  `install.sh`, and the GitHub Copilot Chat built-in that code-server started
-  bundling is removed from the image, with Machine-scope settings
-  (`chat.disableAIFeatures`) written on every boot so a returning user's own
-  settings cannot bring the built-in chat UI back. `e2e/ezil-chat-image.sh`
-  boots the image and proves the panel, the absence of Copilot and a full
-  prompt round trip against a mock provider in a real browser.
+- **Copilot Chat on EZiL models in the desktop image.** The right panel of
+  the editor is the open-source GitHub Copilot Chat UI that code-server
+  4.139.1 bundles (Agent mode, tools, clarifying questions, attachments,
+  Manage Models), running with **no GitHub account** on models EZiL
+  configures: the new `extensions/ezil-models` extension — a VS Code
+  `LanguageModelChatProvider` (vendor `ezil`) for Anthropic direct, Claude and
+  OpenAI deployments on Microsoft Foundry, OpenAI, Azure OpenAI and
+  OpenAI-compatible endpoints, with tool calling, images, thinking and
+  Anthropic prompt caching — is baked into `worker/Dockerfile` as a built-in
+  and reads `/etc/ezil/models.json` (`EZIL_MODELS_CONFIG`), shipped from
+  `worker/ezil-models/models.json` with `{env:ANTHROPIC_API_KEY}` /
+  `{env:AZURE_RESOURCE_NAME}` + `{env:AZURE_API_KEY}` / `{env:OPENAI_API_KEY}`
+  references only ("just put the key"). `start-neko.sh` writes the Machine
+  settings that make a cold browser work without sign-in
+  (`chat.allowAnonymousAccess`, utility calls routed to the main model,
+  sign-in affordances and Copilot completions off) and seeds the `ezil`
+  vendor group into `User/chatLanguageModels.json` on every boot, merging
+  with groups a user added. code-server is pinned by version and checksum
+  (4.139.1) instead of installed from `install.sh`; `product.json` is left
+  as shipped. `e2e/copilot-ezil-image.sh` boots the image and proves, in a
+  fresh browser against a mock model, that the Chat view opens, no sign-in
+  dialog appears, an Agent-mode `create_file` round trip lands in the
+  workspace and the EZiL model is listed in the Language Models editor, then
+  repeats it as a returning user whose persisted settings say the opposite.
+- **EZiL Chat (OpenCode) panel, installed but dormant.** The
+  `extensions/ezil-chat` extension (an AI coding panel in the secondary
+  sidebar that drives a pinned [OpenCode](https://opencode.ai) v2 server on
+  loopback) is baked in as a built-in next to `opencode` v2.0.19 and a
+  managed `/etc/opencode/opencode.json` (autoupdate off, sharing off, Azure
+  AI Foundry wired through `{env:...}` references, no secrets). Since image
+  revision 2 it no longer auto-starts or steals the sidebar
+  (`ezilChat.autoStart` / `ezilChat.revealOnStartup` false in the Machine
+  settings): click its "EZiL" icon or run "EZiL Chat: Open" to use OpenCode
+  next to Copilot Chat. `e2e/ezil-chat-image.sh` still proves the OpenCode
+  round trip against a mock provider in a real browser.
 - **Local-first Apple Silicon app.** The macOS 14+ Swift app creates an
   anonymous, application-owned workspace, provides a native WebKit browser,
   and boots a pinned ARM Linux developer runtime with code-server through

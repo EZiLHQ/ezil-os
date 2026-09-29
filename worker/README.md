@@ -345,3 +345,35 @@ Validated locally (`docker build` + `docker run` with the pinned
 `ezil-neko-vscode` image already present): both windows appear in
 `wmctrl -l`, the health file reports `state: running` for both apps, and
 `neko-switch-app.sh` successfully activates each window by name.
+
+## Telemetry egress of the bundled Copilot Chat
+
+Since image revision 2 the right-hand chat panel is the **open-source GitHub
+Copilot Chat** that code-server 4.139.1 bundles (`GitHub.copilot-chat` 0.67.0,
+MIT), running on EZiL-configured models through the built-in `ezil-models`
+provider with no GitHub account (`chat.allowAnonymousAccess`, written to the
+Machine settings by `scripts/start-neko.sh` on every boot). Anonymous mode is
+**not offline**: the extension still fetches its "known models" list from
+GitHub and, unless telemetry is off, builds two telemetry senders (Microsoft
+1DS and GitHub). The image turns telemetry off twice — `--disable-telemetry`
+on the code-server command line and `"telemetry.telemetryLevel": "off"` in the
+seeded User settings (application-scoped, so it cannot live in the Machine
+layer) — but nothing in `worker/` controls the container's network egress
+(there is no `/etc/hosts` rewrite or proxy in the Dockerfile or start scripts,
+and none is invented here). If the deployment has an egress policy, these are
+the telemetry hosts found in the bundled `dist/extension.js`
+(`/workspace/ezil-plan/copilot-chat-research.md` §5):
+
+| Host | What |
+|---|---|
+| `copilot-telemetry.githubusercontent.com` | GitHub-side Copilot telemetry (needs a Copilot token; nothing to attach to in anonymous mode) |
+| `mobile.events.data.microsoft.com` (`/OneCollector/1.0`) | Microsoft 1DS telemetry sender |
+| `browser.events.data.microsoft.com` (`/OneCollector/1.0/`) | Microsoft 1DS telemetry sender (browser variant) |
+
+Not telemetry, but reached in anonymous mode and worth knowing when locking
+egress down: `api.github.com` (entitlement / known-models list — harmless when
+blocked, the extension logs a warning and retries) and, if a user ever signs
+in, `api.githubcopilot.com`. The model traffic itself goes only to the
+endpoints named in `/etc/ezil/models.json` (`api.anthropic.com`,
+`<resource>.services.ai.azure.com`, `api.openai.com`, or whatever the file
+says).

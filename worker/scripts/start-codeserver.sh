@@ -86,22 +86,43 @@ if [ ! -s "$USER_DATA_DIR/User/settings.json" ]; then
     mkdir -p "$USER_DATA_DIR/User"
     cat >"$USER_DATA_DIR/User/settings.json" <<'CODESERVER_SETTINGS_JSON'
 {
-  "security.workspace.trust.enabled": false
+  "security.workspace.trust.enabled": false,
+  "telemetry.telemetryLevel": "off"
 }
 CODESERVER_SETTINGS_JSON
 fi
 
+# >>> chat-ui-seed
 # Machine-scope layer (ranks above User settings; no UI edits it), rewritten
-# on every launch. Mirrors start-neko.sh's `seed_codeserver_machine_settings`
-# — keep the two in sync. Built-in AI chat off (the image ships no Copilot;
-# EZiL Chat is the assistant) and the secondary sidebar it lives in visible.
-mkdir -p "$USER_DATA_DIR/Machine"
+# on every launch, plus the profile's BYOK group list. Mirrors start-neko.sh's
+# `seed_codeserver_machine_settings` / `seed_codeserver_chat_models` — the
+# heredoc must stay byte-identical (worker/src/codeserver-chat-settings.test.ts
+# compares them) and the long rationale lives there. Short version: the
+# bundled open-source Copilot Chat is the chat panel, running on EZiL models
+# through the built-in ezil-models provider; `chat.allowAnonymousAccess` +
+# the `ezil` vendor group make it work with no GitHub account on a cold
+# browser; the ezil-chat (OpenCode) panel stays installed but dormant.
+mkdir -p "$USER_DATA_DIR/Machine" "$USER_DATA_DIR/User"
 cat >"$USER_DATA_DIR/Machine/settings.json" <<'CODESERVER_MACHINE_SETTINGS_JSON'
 {
-  "chat.disableAIFeatures": true,
-  "workbench.secondarySideBar.defaultVisibility": "visible"
+  "chat.disableAIFeatures": false,
+  "chat.allowAnonymousAccess": true,
+  "chat.byokUtilityModelDefault": "mainAgent",
+  "chat.titleBar.signIn.enabled": false,
+  "chat.welcomePage.signIn.enabled": false,
+  "github.copilot.enable": { "*": false },
+  "github.copilot.nextEditSuggestions.enabled": false,
+  "workbench.secondarySideBar.defaultVisibility": "visible",
+  "ezilChat.autoStart": false,
+  "ezilChat.revealOnStartup": false
 }
 CODESERVER_MACHINE_SETTINGS_JSON
+if [ ! -s "$USER_DATA_DIR/User/chatLanguageModels.json" ]; then
+    printf '[\n  { "name": "EZiL", "vendor": "ezil" }\n]\n' >"$USER_DATA_DIR/User/chatLanguageModels.json"
+elif ! grep -q '"vendor"[[:space:]]*:[[:space:]]*"ezil"' "$USER_DATA_DIR/User/chatLanguageModels.json"; then
+    node -e 'const fs=require("fs");const p=process.argv[1];let g=[];try{const j=JSON.parse(fs.readFileSync(p,"utf8"));if(Array.isArray(j))g=j;}catch(e){}if(!g.some(x=>x&&x.vendor==="ezil"))g.push({name:"EZiL",vendor:"ezil"});fs.writeFileSync(p,JSON.stringify(g,null,2)+"\n");' "$USER_DATA_DIR/User/chatLanguageModels.json" || true
+fi
+# <<< chat-ui-seed
 
 # Keep auth none because the bridge is already HMAC/cookie-gated in front of
 # this process. 0.0.0.0 is required, NOT loopback — see the 🔴 block above; an
