@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "repository": "EZiLHQ/ezil-os",
+  "project": "btgqfmnzycdecmeyqubx",
+  "schemas": [
+    "public"
+  ],
+  "sources": [
+    {
+      "path": "app/drizzle/0000_massive_mole_man.sql",
+      "sha256": "a387810b939c35c9768f16bd02788fec7aae001a87657465324769664e48036d",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0001_telemetry.sql",
+      "sha256": "8219140267f921e26befad7ad6be514f5f33829bb24c653f6f794750bdb98f52",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0002_os_access.sql",
+      "sha256": "4c98ec14cc82f82851905cb133218a458836b97bbaa44fc65c4fcba02f0ad397",
+      "kind": "snapshot"
+    }
+  ],
+  "initialCatalog": {
+    "digest": "4c1040575121990dbd5ad09e40c0e334be4a291e4e746fc20a08d8c07a036e7f",
+    "objects": 1794,
+    "capturedAt": "2026-09-29T15:45:14.939Z",
+    "sourceDigest": "e884a81df52d591799e97b1ca59685fa7a70449d91de414c777866f5a26438f5"
+  },
+  "migrations": [],
+  "trustedWorkflowRuns": [
+    343124584
+  ],
+  "reviewedEventTriggers": [
+    {
+      "name": "ensure_rls",
+      "sha256": "6dbfeffefe4271c3e6f220d7dfe74b6b1b38655588b131096cd4a0759a162be8"
+    },
+    {
+      "name": "issue_graphql_placeholder",
+      "sha256": "a60579c43dceaaccd79149009565367d1a5b4dc6d0f55d965985750aaa3b22bb"
+    },
+    {
+      "name": "issue_pg_cron_access",
+      "sha256": "19f32b5a77418e8c6dae68d70ca4cc2eaec9d6a57d45aca2c182bfe6659dcf78"
+    },
+    {
+      "name": "issue_pg_graphql_access",
+      "sha256": "74e6eb7979bed3d7f866d497f64b0efd45cf7ace9e29804f374268a6b78da4db"
+    },
+    {
+      "name": "issue_pg_net_access",
+      "sha256": "6c661759cec2fb164396ba9261018aee22ca5ec6a3e61f4b080e4668b9bf3a30"
+    },
+    {
+      "name": "pgrst_ddl_watch",
+      "sha256": "28b7fd6b9f599a486d932f6b9c5b20e49b76ed19ab5a4fbf1d2d709b31bad774"
+    },
+    {
+      "name": "pgrst_drop_watch",
+      "sha256": "e2a5de61a9fd996962ad7e141c5504ba5a04b3edf61682e5606f90374d4c60e5"
+    }
+  ]
+}

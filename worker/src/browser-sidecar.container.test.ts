@@ -416,15 +416,21 @@ describe('browser sidecar: a real container, a real Chrome', () => {
         // The window id is looked up, not hardcoded: X hands out ids in client
         // creation order, so an image that starts one more (or one fewer) X
         // client before Chrome shifts it — CI on 9dcabfa failed exactly that way
-        // when the moving `:latest` desktop image was rebuilt. Same lookup as
-        // the geometry pin in `start-desktop.sh`.
-        const found = dexec(['bash', '-lc',
-            'DISPLAY=:99 xdotool search --onlyvisible --class chrome 2>/dev/null | tail -n1']);
-        const wid = (found.stdout || '').trim();
-        expect(wid, `no visible Chrome window (wmctrl -l: ${xWindowTitle() || '<empty>'})`).toMatch(/^\d+$/);
-
-        const info = dexec(['bash', '-lc',
-            `DISPLAY=:99 xwininfo -id ${wid} | grep -E "Width:|Height:|Map State:|Absolute upper-left"`]);
+        // when the moving `:latest` desktop image was rebuilt. Resolve the real
+        // Chrome client window by WM_CLASS after automation (the same
+        // `wmctrl -x -l` lookup `start-neko.sh` uses for focus), and refuse
+        // missing or ambiguous browser windows.
+        const clients = dexec(['env', 'DISPLAY=:99', 'wmctrl', '-x', '-l']);
+        expect(clients.status).toBe(0);
+        const browserIds = (clients.stdout || '').trim().split('\n')
+            .map(line => line.trim().split(/\s+/))
+            .filter(columns => /chrome/i.test(columns[2] || ''))
+            .map(columns => columns[0]);
+        expect(browserIds, `expected exactly one Chrome window (wmctrl -l: ${xWindowTitle() || '<empty>'})`).toHaveLength(1);
+        const windowId = browserIds[0]!;
+        expect(windowId).toMatch(/^0x[0-9a-f]+$/i);
+        const info = dexec(['env', 'DISPLAY=:99', 'xwininfo', '-id', windowId]);
+        expect(info.status).toBe(0);
         const text = info.stdout || '';
         expect(text).toContain('Width: 1920');
         expect(text).toContain('Height: 1080');
@@ -432,8 +438,8 @@ describe('browser sidecar: a real container, a real Chrome', () => {
         expect(text).toMatch(/Absolute upper-left X:\s+0/);
         expect(text).toMatch(/Absolute upper-left Y:\s+0/);
 
-        const props = dexec(['bash', '-lc',
-            `DISPLAY=:99 xprop -id ${wid} _NET_FRAME_EXTENTS _NET_WM_STATE`]);
+        const props = dexec(['env', 'DISPLAY=:99', 'xprop', '-id', windowId, '_NET_FRAME_EXTENTS', '_NET_WM_STATE']);
+        expect(props.status).toBe(0);
         expect(props.stdout).toContain('_NET_FRAME_EXTENTS(CARDINAL) = 0, 0, 0, 0');
         expect(props.stdout).toContain('_OB_WM_STATE_UNDECORATED');
         expect(props.stdout).toContain('_NET_WM_STATE_MAXIMIZED_VERT');

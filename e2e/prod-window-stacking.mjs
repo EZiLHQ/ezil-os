@@ -28,6 +28,7 @@
  */
 // Does Settings open ON TOP on a real phone against production?
 import { createRequire } from 'node:module'; import path from 'node:path';
+import { APP, configureAppContext } from './deployed-target.mjs';
 // 🔴 NO CREDENTIAL DEFAULTS. This suite signs in to the LIVE deployment, so a
 // hardcoded fallback here is a working production account published in a
 // public repository. Absent config is "could not run" (exit 2), never a pass
@@ -39,19 +40,22 @@ if (!EMAIL || !PASS) {
   process.exit(2);
 }
 
-const req = createRequire(path.join('/opt/ezil-testkit/node_modules','noop.js'));
+const reqDir = process.env.PLAYWRIGHT_REQUIRE_DIR;
+if (!reqDir) { console.error('SKIP: PLAYWRIGHT_REQUIRE_DIR unset'); process.exit(2); }
+const req = createRequire(path.join(reqDir, 'noop.js'));
 const { chromium } = req('playwright');
 const b = await chromium.launch({args:['--use-gl=swiftshader','--enable-unsafe-swiftshader']});
 let ok = 0, runs = 3;
 for (let n = 1; n <= runs; n++) {
   const ctx = await b.newContext({ viewport:{width:390,height:844}, hasTouch:true, isMobile:true, deviceScaleFactor:3,
     userAgent:'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1' });
+  await configureAppContext(ctx);
   const p = await ctx.newPage();
-  await p.goto('https://ezil-os.vercel.app/login',{waitUntil:'domcontentloaded'});
+  await p.goto(`${APP}/login`,{waitUntil:'domcontentloaded'});
   await p.fill('#email', EMAIL); await p.fill('#password', PASS);
   await Promise.all([p.waitForURL(u=>!/\/login/.test(u.toString()),{timeout:60000}).catch(()=>{}),
     p.locator('form').filter({has:p.locator('#email')}).locator('button[type=submit]').click()]);
-  await p.goto('https://ezil-os.vercel.app/os',{waitUntil:'domcontentloaded'});
+  await p.goto(`${APP}/os`,{waitUntil:'domcontentloaded'});
   await p.waitForTimeout(3000);
   try { await p.locator('.taskbar-item').filter({hasText:/browser/i}).first().click({timeout:12000}); }
   catch { await p.locator('.taskbar-item').nth(1).click({timeout:12000}).catch(()=>{}); }

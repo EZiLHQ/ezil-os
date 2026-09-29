@@ -934,12 +934,9 @@ describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => 
   const indexSrc = readWorkerSource('./index.ts');
 
   const zoneRoot = indexSrc.match(/^const PREVIEW_ZONE_ROOT = '([^']+)';$/m)?.[1];
-  // Only uncommented `pattern = "..."` lines count — a commented-out route
-  // routes nothing.
-  const patterns = wranglerSrc
-    .split('\n')
-    .filter((line) => /^\s*pattern\s*=/.test(line))
-    .map((line) => line.match(/"([^"]+)"/)?.[1] ?? '');
+  // Named environments have independent routes; this guard pins production.
+  const config = Bun.TOML.parse(wranglerSrc) as { routes: Array<{ pattern: string }> };
+  const patterns = config.routes.map((route) => route.pattern);
 
   // The feature CAN be put into a deliberate, fully-off state (no zone
   // verified safe to route sandbox previews on) by adding a
@@ -1041,15 +1038,8 @@ describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => 
     }
   });
 
-  it('keeps every preview host ONE label under the zone (Universal SSL limit)', () => {
-    // Universal SSL on a Free zone covers exactly [apex, *.apex]. A nested
-    // wildcard has no certificate (verified live: SNI for `a.b.<zone>` fails
-    // with TLS alert 40), so the collapse in normalizeSandboxHostname must
-    // return the BARE zone root, never a subdomain of it.
-    const fn = indexSrc.match(/function normalizeSandboxHostname\([\s\S]*?\n}\n/)?.[0] ?? '';
-    expect(fn).toContain('hostname.endsWith(`.${PREVIEW_ZONE_ROOT}`)');
-    expect(fn).toContain('return port ? `${PREVIEW_ZONE_ROOT}:${port}` : PREVIEW_ZONE_ROOT;');
-  });
+  // The one-label TLS requirement is exercised through real preview/status/
+  // restart requests for both environments in route-auth.test.ts.
 });
 
 // ── /health distinguishing marker ─────────────────────────────────────────────
@@ -1126,7 +1116,7 @@ describe('bridge-host dispatcher: generalized to app-preview AND code-server', (
   });
 
   it('the fetch() entrypoint call site was renamed too (no dangling `handleAppPreview` call)', () => {
-    expect(src).toContain('await handleBridgeHost(request, env, new URL(request.url));');
+    expect(src).toContain('await handleBridgeHost(request, env, url);');
   });
 });
 

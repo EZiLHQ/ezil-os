@@ -93,6 +93,8 @@ import { WORKER_DESKTOP_READY_TIMEOUT_MS } from './preview-timeouts';
 export { ContainerProxy } from '@cloudflare/sandbox';
 
 interface Env extends SandboxEnv {
+  /** Approved bare preview zone; unset preserves production's ezil.org routing. */
+  SANDBOX_PREVIEW_ZONE_ROOT?: string;
   /** Shared HMAC secret (set via `wrangler secret put SANDBOX_HMAC_SECRET`). */
   SANDBOX_HMAC_SECRET?: string;
   /** Alternate secret name matching the EBuilder env var. Either is accepted. */
@@ -3185,8 +3187,8 @@ function toGuacamoleUrl(exposedUrl: string, requestProtocol: string): string {
  * through would produce a two-level preview hostname with no valid
  * certificate. To guarantee every preview URL is a single label under the
  * zone (`<port>-<sandboxId>-<token>.<zone>`), any inbound host under
- * `PREVIEW_ZONE_ROOT` is collapsed to the bare zone root before being handed
- * to `exposePort`/`getExposedPorts`.
+ * `SANDBOX_PREVIEW_ZONE_ROOT` (default `PREVIEW_ZONE_ROOT`) is collapsed to
+ * the bare zone root before being handed to `exposePort`/`getExposedPorts`.
  *
  * PREVIEW_ZONE_ROOT must stay in lockstep with the `[[routes]]` block in
  * `wrangler.toml` — if they disagree, every preview URL points at a hostname
@@ -3218,16 +3220,28 @@ function toGuacamoleUrl(exposedUrl: string, requestProtocol: string): string {
  */
 const PREVIEW_ZONE_ROOT = 'ezil.org';
 
-function normalizeSandboxHostname(host: string): string {
+// Only approved bare zones: accepting an arbitrary subdomain here would mint
+// two-label preview hosts outside Universal SSL coverage. Staging's separate
+// zone and narrow routes are declared in [env.staging] in wrangler.toml.
+function resolvePreviewZoneRoot(configuredRoot?: string): string {
+  const root = configuredRoot === undefined ? PREVIEW_ZONE_ROOT : configuredRoot.trim().toLowerCase();
+  if (root !== PREVIEW_ZONE_ROOT && root !== 'ezil.work') {
+    throw new Error('invalid_preview_zone_root');
+  }
+  return root;
+}
+
+function normalizeSandboxHostname(host: string, configuredRoot?: string): string {
+  const zoneRoot = resolvePreviewZoneRoot(configuredRoot);
   const [hostname, port] = host.split(':');
   if (hostname === '0.0.0.0' || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname)) {
     return port ? `localhost:${port}` : 'localhost';
   }
   if (
-    hostname === PREVIEW_ZONE_ROOT ||
-    hostname.endsWith(`.${PREVIEW_ZONE_ROOT}`)
+    hostname === zoneRoot ||
+    hostname.endsWith(`.${zoneRoot}`)
   ) {
-    return port ? `${PREVIEW_ZONE_ROOT}:${port}` : PREVIEW_ZONE_ROOT;
+    return port ? `${zoneRoot}:${port}` : zoneRoot;
   }
   return host;
 }
@@ -3554,7 +3568,7 @@ async function handlePreview(
     const desktopDone = tl.stage('preview_lifecycle', 'sandbox.preview.desktop_ready');
     const { url: exposedUrl, appPreviewExpose, codePreviewExpose } = await ensureDesktop(
       sandbox,
-      normalizeSandboxHostname(url.host),
+      normalizeSandboxHostname(url.host, env.SANDBOX_PREVIEW_ZONE_ROOT),
       mode,
       iceEnv,
       mode === 'neko' ? (body.startupDelivery ?? null) : null,
@@ -3800,7 +3814,9 @@ async function handleStatus(env: Env, url: URL, sandboxName: string, requestedMo
   const explicitMode = requestedMode?.trim() ? modeResult.mode : undefined;
   try {
     const sandbox = openSandbox(env, sandboxName);
-    const exposed = await sandbox.getExposedPorts(normalizeSandboxHostname(url.host));
+    const exposed = await sandbox.getExposedPorts(
+      normalizeSandboxHostname(url.host, env.SANDBOX_PREVIEW_ZONE_ROOT),
+    );
     const status = describeDesktopStatus(exposed, explicitMode, modeResult.mode);
     return json({
       ok: true,
@@ -3844,7 +3860,7 @@ async function handleRestart(env: Env, url: URL, sandboxName: string, requestedM
   try {
     const sandbox = openSandbox(env, sandboxName);
     const report = await sandbox.restartDesktopStack(
-      normalizeSandboxHostname(url.host),
+      normalizeSandboxHostname(url.host, env.SANDBOX_PREVIEW_ZONE_ROOT),
       sandboxName,
       explicitMode,
       modeResult.mode,
@@ -5864,6 +5880,31 @@ async function handleBrowserSidecar(
 
 export default {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    const method = request.method.toUpperCase();
+    const path = url.pathname;
+
+    // Explicitly configured deployments must never serve another zone's API
+    // or preview hosts, even if a route is accidentally attached there. Check
+    // before both bridge dispatch and the SDK proxy, which parse the first
+    // hostname label without enforcing the deployment's zone.
+    if (env.SANDBOX_PREVIEW_ZONE_ROOT !== undefined) {
+      let zoneRoot: string;
+      try {
+        zoneRoot = resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT);
+      } catch {
+        return json({ ok: false, error: 'invalid_preview_zone_root' }, 500);
+      }
+      const hostname = url.hostname;
+      const local =
+        hostname === 'localhost' || hostname.endsWith('.localhost') ||
+        hostname === '[::1]' || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname);
+      const diagnostic = hostname.endsWith('.workers.dev') && method === 'GET' && path === '/health';
+      if (!local && !diagnostic && hostname !== zoneRoot && !hostname.endsWith(`.${zoneRoot}`)) {
+        return json({ ok: false, error: 'preview_hostname_outside_zone' }, 421);
+      }
+    }
+
     // 0) Option D bridge hostnames — app-preview (`<APP_PREVIEW_PORT>-<id>-app.<zone>`)
     //    AND code-server (`<CODE_PREVIEW_PORT>-<id>-code.<zone>`): handled
     //    ENTIRELY by our own token/cookie-gated dispatcher, BEFORE
@@ -5876,17 +5917,13 @@ export default {
     //    `null` (not a Response) for hostnames outside both bridge patterns,
     //    in which case the request continues to the normal `proxyToSandbox`
     //    path below unchanged.
-    const bridgeResponse = await handleBridgeHost(request, env, new URL(request.url));
+    const bridgeResponse = await handleBridgeHost(request, env, url);
     if (bridgeResponse) return bridgeResponse;
 
     // 1) Route exposed-port preview traffic (incl. WebSocket upgrades) into the
     //    container. Returns null for everything else.
     const proxied = await proxyToSandbox(request, env);
     if (proxied) return proxied;
-
-    const url = new URL(request.url);
-    const method = request.method.toUpperCase();
-    const path = url.pathname;
 
     if (method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders });

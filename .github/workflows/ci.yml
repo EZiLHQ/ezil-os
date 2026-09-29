@@ -140,7 +140,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: '1.3.14'
       - name: Install
         shell: bash
         working-directory: worker
@@ -216,13 +216,13 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: '22.16.0'
       # bun, not npm: `app/bun.lock` is the committed lockfile and there is no
       # `package-lock.json`, so `npm ci` would fail outright. Node is still set
       # up because the shell suites and `vitest` run under it.
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: '1.3.14'
       - name: Install
         shell: bash
         working-directory: app
@@ -258,7 +258,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: '1.3.14'
       # `sdk/` is checked FIRST and separately from `mcp/`, because `mcp/`
       # depends on it by `file:../sdk` — a break in the SDK should be reported
       # as an SDK failure, not as a confusing downstream one.
@@ -304,10 +304,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: '22.16.0'
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: '1.3.14'
       # 🔴 The committed bundle must match its sources. Without this a source
       # change without a rebuild ships the OLD behaviour while every other check
       # passes against the NEW source.
@@ -425,7 +425,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: '1.3.14'
       - name: Install (sdk)
         shell: bash
         working-directory: sdk
@@ -436,6 +436,9 @@ jobs:
       - name: Unit tests
         shell: bash
         run: bun test tools/
+      - name: Hosted migration helper tests
+        shell: bash
+        run: node --test app/scripts/ci-migrate.test.mjs
 
   # ── container — pulls the REAL desktop image and runs the container suites
   # for real. ──────────────────────────────────────────────────────────────
@@ -505,7 +508,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: '1.3.14'
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -567,7 +570,7 @@ jobs:
             exit 1
           fi
           if ! grep -qE '^ +[0-9]+ pass$' /tmp/container-test.log; then
-            echo "::error::bun's summary line (' N pass') was not found in the output above - the skip check below cannot be trusted (reporter format may have changed; this job runs bun-version: latest). Failing rather than silently reporting green."
+            echo "::error::bun's summary line (' N pass') was not found in the output above - the skip check below cannot be trusted (reporter format may have changed; this job runs bun-version: '1.3.14'). Failing rather than silently reporting green."
             exit 1
           fi
           skip_count="$(grep -oE '^ [0-9]+ skip$' /tmp/container-test.log | grep -oE '[0-9]+' || true)"
@@ -588,7 +591,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: '1.3.14'
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -748,7 +751,7 @@ jobs:
           # guard. So: first assert the parser can see ANYTHING in bun's
           # summary at all; only trust "0 skips" once that holds.
           if ! grep -qE '^ +[0-9]+ pass$' /tmp/local-test.log; then
-            echo "::error::bun's summary line (' N pass') was not found in the output above — the skip check below cannot be trusted (reporter format may have changed; this job runs bun-version: latest). Failing rather than silently reporting green."
+            echo "::error::bun's summary line (' N pass') was not found in the output above — the skip check below cannot be trusted (reporter format may have changed; this job runs bun-version: '1.3.14'). Failing rather than silently reporting green."
             exit 1
           fi
           skip_count="$(grep -oE '^ [0-9]+ skip$' /tmp/local-test.log | grep -oE '[0-9]+' || true)"
@@ -814,3 +817,30 @@ jobs:
         run: |
           npm --prefix macos-electron run test:electron
           bash macos/test.sh
+
+  cloud-release-contract:
+    name: OS cloud release contracts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: '22.16.0' }
+      - name: Cloud identity, admission and rollback tests
+        run: node e2e/cloud-ci.test.mjs
+      - name: Validate production migration manifest and lease
+        run: |
+          node .github/scripts/production-migrations.mjs validate
+          python3 -B .github/scripts/staging-lock.test.py
+      - name: Verify shared migration protocol on native PostgreSQL
+        run: |
+          docker pull postgres:16-alpine
+          PRODUCTION_MIGRATIONS_DOCKER=1 node --test e2e/production-migrations.test.mjs
+      - name: Install pinned YAML parser
+        run: python3 -m pip install PyYAML==6.0.2
+      - name: Static workflow and embedded script checks
+        run: python3 .github/scripts/check-os-workflows.py
+      - name: Actionlint
+        run: |
+          curl --fail --silent --show-error --location https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz -o "$RUNNER_TEMP/actionlint.tar.gz"
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes= .github/workflows/preview.yml .github/workflows/image.yml .github/workflows/deploy.yml .github/workflows/deploy-app.yml

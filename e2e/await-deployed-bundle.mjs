@@ -28,11 +28,16 @@
  */
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { APP, appHeaders } from './deployed-target.mjs';
 
-const APP = process.env.EZIL_E2E_APP ?? 'https://ezil-os.vercel.app';
 const BUDGET_MS = Number(process.env.EZIL_DEPLOY_WAIT_MS ?? 180_000);
 const GAP_MS = 5_000;
 const LOCAL = 'app/public/os/bundle.min.js';
+
+if (!Number.isFinite(BUDGET_MS) || BUDGET_MS <= 0) {
+    console.error('EZIL_DEPLOY_WAIT_MS must be a positive number');
+    process.exit(2);
+}
 
 if (!fs.existsSync(LOCAL)) {
     console.error(`SKIP: ${LOCAL} is missing — run shell/build-shell.sh first.`);
@@ -56,8 +61,9 @@ while (Date.now() - started < BUDGET_MS) {
         // Cache-bust: a CDN edge that already has the old object would answer
         // from cache and we would wait out the whole budget against a stale copy.
         const res = await fetch(`${APP}/os/bundle.min.js?deploy-check=${Date.now()}`, {
-            headers: { 'cache-control': 'no-cache' },
-            redirect: 'follow',
+            headers: { 'cache-control': 'no-cache', ...appHeaders },
+            redirect: 'error',
+            signal: AbortSignal.timeout(Math.max(1, Math.min(15_000, BUDGET_MS - (Date.now() - started)))),
         });
         if (!res.ok) {
             last = `HTTP ${res.status}`;
@@ -89,8 +95,8 @@ console.error(
     + `(${attempts} checks). Last: ${last}.`,
 );
 console.error(
-    'The deploy reported success but the production alias is not serving it. '
-    + 'Do NOT trust a green production suite from this run — it would have '
+    'The deploy reported success but the selected app URL is not serving it. '
+    + 'Do NOT trust a green deployed suite from this run — it would have '
     + 'tested the previous build.',
 );
 process.exit(1);
