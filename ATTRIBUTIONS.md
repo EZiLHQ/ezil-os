@@ -138,9 +138,11 @@ If you believe an attribution is missing or inaccurate, please open an issue
   (`lib/vscode/extensions/copilot`) and points `product.json`'s
   `defaultChatAgent` at it. An earlier revision of `worker/Dockerfile`
   deleted that directory and stripped `defaultChatAgent`; since revision 2
-  both are left exactly as code-server ships them, the build fails if the
-  extension is missing, and the extension is the editor's chat panel — see
-  the next entry for its licence. `product.json` is not modified.
+  the extension is kept and is the editor's chat panel, the build fails if
+  it is missing, and since revision 3 its shipped bundles are patched at
+  build time (strings and two GitHub call sites — see the next entry for the
+  licence and `worker/copilot-chat/PATCHES.md` for the patches).
+  `product.json` is not modified.
 
 ### GitHub Copilot Chat (`microsoft/vscode`, `extensions/copilot`)
 - **URL:** https://github.com/microsoft/vscode/tree/main/extensions/copilot
@@ -153,15 +155,32 @@ If you believe an attribution is missing or inaccurate, please open an issue
   Corporation. All rights reserved." — the manifest says `"license": "SEE
   LICENSE IN LICENSE.txt"`, so the file, not the field, is the source).
 - **Used for:** the chat panel in the secondary sidebar (Agent mode, tools,
-  clarifying questions, attachments, the Language Models editor). It is NOT
-  modified, vendored or rebuilt; it is run with `chat.allowAnonymousAccess`
-  and fed by the EZiL-authored `extensions/ezil-models`
-  `LanguageModelChatProvider` (§9), so it never holds a GitHub token and
-  talks only to the model endpoints named in `/etc/ezil/models.json`. Its
-  system prompt still tells the model to call itself "GitHub Copilot" and
-  some UI strings still say "Copilot"; nothing here claims otherwise. Its
-  telemetry is turned off by the seeded settings (`telemetry.telemetryLevel:
-  off`, `--disable-telemetry`); the hosts it would talk to are listed in
+  clarifying questions, attachments, the Language Models editor), presented
+  to EZiL users as **"EZiL Chat"**. It is not vendored or rebuilt, but since
+  image revision 3 it **IS modified at build time**:
+  `worker/copilot-chat/patch-copilot-chat.sh` (applied by `worker/Dockerfile`,
+  every patch documented with its anchor and gate in
+  `worker/copilot-chat/PATCHES.md`) edits the shipped minified bundles
+  (`extensions/copilot/dist/extension.js`, the workbench's `out/nls.messages.*`
+  and `out/vs/code/browser/workbench/workbench.js`) so that in anonymous mode
+  no GitHub service is called (no Copilot device token, no model-catalogue
+  CDN fetch) and the user-visible GitHub/Copilot strings on EZiL's path —
+  the chat-welcome terms sentence, the status-bar item, the Accounts-menu
+  sign-in entry, the system-prompt identity — read "EZiL Chat" instead. The
+  extension's `LICENSE.txt`, the workbench's copyright headers, `product.json`
+  and every command id / setting key are left untouched; each patched `.js`
+  carries a one-line "Modified at build time by EZiL" notice. This is a
+  derivative of an MIT-licensed work distributed under the same MIT terms;
+  nothing here claims Microsoft or GitHub endorsement, and the remaining
+  `github.copilot.*` identifiers are internal names, not branding. It is run
+  with `chat.allowAnonymousAccess` and fed by the EZiL-authored
+  `extensions/ezil-models` `LanguageModelChatProvider` (§9), so it never
+  holds a GitHub token and talks only to the model endpoints named in
+  `/etc/ezil/models.json`. Its telemetry is turned off by the seeded settings
+  (`telemetry.telemetryLevel: off`, `--disable-telemetry`,
+  `APPLICATION_INSIGHTS_NO_STATSBEAT`), and the Copilot/telemetry-only hosts
+  are additionally mapped to loopback at boot; the before/after measurement
+  is `/workspace/ezil-plan/rev3-network-audit.md`, the hosts are listed in
   `worker/README.md`.
 - **Also bundled by code-server, not by this repository, and not used by
   EZiL:** the core "Agent Host" runtime `@github/copilot-sdk` and

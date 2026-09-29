@@ -3,7 +3,7 @@
 # open-source Copilot Chat runs on EZiL-configured models with NO GitHub
 # sign-in — then boot it again as a RETURNING user and prove it still holds.
 #
-#   e2e/copilot-ezil-image.sh [image=ezil-desktop:rev2]
+#   e2e/copilot-ezil-image.sh [image=ezil-desktop:rev3]
 #
 # Needs: docker, node, a Playwright install (PLAYWRIGHT_REQUIRE_DIR — a
 # node_modules containing `playwright` with chromium downloaded; set
@@ -36,18 +36,66 @@
 # vendors present), and the same Agent-mode task must succeed.
 set -euo pipefail
 
-IMAGE="${1:-${EZIL_COPILOT_E2E_IMAGE:-ezil-desktop:rev2}}"
+#
+# Revision 3 — NO GitHub calls, "EZiL Chat" branding. Both passes run behind a
+# network sink: a sidecar DNS server (e2e/copilot-ezil-netsink.py `dns`, given
+# to the image container as --dns) answers 127.0.0.1 for EVERY name and logs
+# the query, and inside the container the same script (`http`) listens on
+# :80/:443 and logs Host/path/SNI of whatever lands there. After boot plus the
+# full Agent-mode prompt the run FAILS if any name or SNI matched a GitHub,
+# githubusercontent, githubcopilot, Microsoft-telemetry, exp-tas,
+# applicationinsights or vscode-cdn host — while the EZiL mock must still have
+# received the request. Browser-side requests are logged and aborted by the
+# Playwright script the same way. The browser half also asserts that no
+# visible "Copilot"/"GitHub" text is in the workbench after boot and after the
+# prompt, that the EZiL notice is in the chat welcome, that the status-bar
+# item, Accounts menu and session-target picker carry no Copilot branding and
+# that the system prompt identifies as EZiL Chat.
+
+IMAGE="${1:-${EZIL_COPILOT_E2E_IMAGE:-ezil-desktop:rev3}}"
 OUT="$(mkdir -p "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && pwd)"
 HOST_PORT="${EZIL_COPILOT_E2E_PORT:-8443}"
 MOCK_PORT=4142
 CAPTURE_DIR=/tmp/copilot-ezil-mock
+SINK_DIR=/tmp/copilot-ezil-netsink
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NAME="copilot-ezil-e2e-$$"
+DNS_NAME="copilot-ezil-e2e-dns-$$"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/copilot-ezil-e2e.XXXXXX")"
 fail=0
+# Hosts the chat stack must never try to reach (DNS name, or Host/SNI seen by the sink):
+BLOCKED_HOST_RE='(^|\.)(github\.com|githubusercontent\.com|githubcopilot\.com|exp-tas\.com|events\.data\.microsoft\.com|visualstudio\.com|applicationinsights\.azure\.com|vscode-cdn\.net)$'
 
-cleanup() { docker rm --force "$NAME" >/dev/null 2>&1 || true; }
+cleanup() { docker rm --force "$NAME" "$DNS_NAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
+
+# ── network sink: DNS sidecar (same image — it has python3) + in-container listener
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/sink.key" -out "$WORK/sink.crt" -subj /CN=ezil-netsink -days 2 >/dev/null 2>&1
+DNS_IP=""
+start_dns_sidecar() {
+  docker rm --force "$DNS_NAME" >/dev/null 2>&1 || true
+  docker create --name "$DNS_NAME" --entrypoint bash "$IMAGE" -c 'mkdir -p /netsink && exec python3 /netsink.py dns /netsink/dns.log' >/dev/null
+  docker cp "$here/copilot-ezil-netsink.py" "$DNS_NAME:/netsink.py"
+  docker start "$DNS_NAME" >/dev/null
+  DNS_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$DNS_NAME")"
+  [[ -n "$DNS_IP" ]] || { echo "[e2e] FAIL: DNS sidecar has no address" >&2; return 1; }
+  echo "[e2e] DNS sink $DNS_NAME at $DNS_IP (every name -> 127.0.0.1, logged)"
+}
+reset_sink_logs() { docker exec "$DNS_NAME" bash -c ': >/netsink/dns.log' 2>/dev/null || true; }
+# network_checks <prefix>: pull both logs, fail on blocked hosts, list the rest
+network_checks() {
+  local p="$1" dns http blocked
+  docker exec "$DNS_NAME" cat /netsink/dns.log >"$OUT/${p}-dns.log" 2>/dev/null || : >"$OUT/${p}-dns.log"
+  inx "cat ${SINK_DIR}/http.log 2>/dev/null" >"$OUT/${p}-sink.log" || : >"$OUT/${p}-sink.log"
+  dns="$(node -e 'const fs=require("fs");const s=new Set();for(const l of fs.readFileSync(process.argv[1],"utf8").split("\n"))if(l.trim()){try{s.add(JSON.parse(l).name)}catch{}}console.log([...s].sort().join("\n"))' "$OUT/${p}-dns.log")"
+  http="$(node -e 'const fs=require("fs");const s=new Set();for(const l of fs.readFileSync(process.argv[1],"utf8").split("\n"))if(l.trim()){try{const j=JSON.parse(l);s.add((j.host||j.sni||"?")+" "+(j.path||""))}catch{}}console.log([...s].sort().join("\n"))' "$OUT/${p}-sink.log")"
+  blocked="$( { printf '%s\n' "$dns"; printf '%s\n' "$http" | awk '{print $1}'; } | sed 's/:[0-9]*$//' | grep -E -i "$BLOCKED_HOST_RE" || true)"
+  echo "== ${p}: DNS names resolved by the container:"; printf '%s\n' "$dns" | sed 's/^/   /'
+  echo "== ${p}: requests that landed on the in-container sink (host path):"; printf '%s\n' "$http" | sed 's/^/   /'
+  if [[ -z "$blocked" ]]; then echo "PASS  ${p}: zero attempts to GitHub / githubusercontent / githubcopilot / Microsoft-telemetry / exp-tas / applicationinsights / vscode-cdn hosts (boot + full Agent-mode prompt)"; else echo "FAIL  ${p}: blocked hosts were attempted:"; printf '%s\n' "$blocked" | sed 's/^/   /'; return 1; fi
+  if inx "grep -q 'GitHub Copilot' ${CAPTURE_DIR}/captured.json 2>/dev/null"; then echo "FAIL  ${p}: the model was still told it is GitHub Copilot"; return 1; fi
+  echo "PASS  ${p}: captured model requests never mention GitHub Copilot"
+}
 
 # Same argv shape as local/src/container/run-spec.ts buildDockerRunArgv (mode
 # neko, passwords, implicit hosting, loopback ICE) minus the WebRTC ports we do
@@ -59,8 +107,12 @@ trap cleanup EXIT
 # the container root: <stage>/home/neko/project/..., <stage>/etc/ezil/...
 boot() { # boot <stage-dir>
   local stage="$1" top
-  cleanup
-  docker create --name "$NAME" --cpus=2 --memory=6g \
+  docker rm --force "$NAME" >/dev/null 2>&1 || true
+  # the in-container HTTP/HTTPS sink: its files ride along in the stage, it is
+  # started by the same shell as the desktop so nothing can race ahead of it
+  mkdir -p "$stage$SINK_DIR"
+  cp "$here/copilot-ezil-netsink.py" "$WORK/sink.key" "$WORK/sink.crt" "$stage$SINK_DIR/"
+  docker create --name "$NAME" --cpus=2 --memory=6g --dns "$DNS_IP" \
     --publish "127.0.0.1:${HOST_PORT}:8443/tcp" \
     --env DESKTOP_MODE=neko --env NEKO_SCREEN=1280x720x24 \
     --env NEKO_MEMBER_MULTIUSER_USER_PASSWORD=neko --env NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=admin \
@@ -68,7 +120,7 @@ boot() { # boot <stage-dir>
     --env NEKO_WEBRTC_UDPMUX=52100 --env NEKO_WEBRTC_TCPMUX=52100 --env NEKO_WEBRTC_NAT1TO1=127.0.0.1 --env NEKO_WEBRTC_ICELITE=true \
     --env EZIL_WORKSPACE_ROOT=/home/neko/project \
     --env EZIL_MODELS_CONFIG=/etc/ezil/models.e2e.json \
-    --entrypoint /bin/bash "$IMAGE" -c 'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh' >/dev/null
+    --entrypoint /bin/bash "$IMAGE" -c "python3 ${SINK_DIR}/copilot-ezil-netsink.py http ${SINK_DIR}/http.log ${SINK_DIR} >${SINK_DIR}/sink.out 2>&1 & DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh" >/dev/null
   for top in "$stage"/*; do
     [[ -d "$top" ]] || continue
     docker cp "$top/." "$NAME:/$(basename "$top")"
@@ -142,14 +194,21 @@ collect_logs() { # collect_logs <prefix>
 
 # ── Pass 1: fresh user ───────────────────────────────────────────────────────
 echo "[e2e] pass 1 — fresh user, image $IMAGE"
+start_dns_sidecar || exit 1
 ST1="$WORK/fresh"; WS1="$ST1/home/neko/project"; mkdir -p "$WS1" "$ST1/etc/ezil"
 echo 'hello from the e2e workspace' >"$WS1/README.md"
 cp "$here/copilot-ezil-models.json" "$ST1/etc/ezil/models.e2e.json"
 boot "$ST1"
 container_checks "$OUT/fresh-container-checks.txt" || fail=1
+inx 'grep -q "127.0.0.1 api.githubcopilot.com" /etc/hosts && grep -q "127.0.0.1 copilot-telemetry.githubusercontent.com" /etc/hosts && ! grep -q -E "127.0.0.1 (api\.)?github\.com" /etc/hosts' && echo "PASS  /etc/hosts maps the Copilot/telemetry hosts to loopback and leaves github.com alone" || { echo "FAIL  /etc/hosts block missing or too broad"; fail=1; }
+inx 'tr "\0" "\n" </proc/$(pgrep -o -f "code-server.*--bind-addr")/cmdline | grep -q -- "--disable-update-check"' && echo "PASS  code-server runs with --disable-update-check" || { echo "FAIL  code-server lacks --disable-update-check"; fail=1; }
+inx 'tr "\0" "\n" </proc/$(pgrep -o -f "code-server.*--bind-addr")/environ | grep -q "^APPLICATION_INSIGHTS_NO_STATSBEAT=true$"' && echo "PASS  APPLICATION_INSIGHTS_NO_STATSBEAT=true in the code-server process env" || { echo "FAIL  APPLICATION_INSIGHTS_NO_STATSBEAT not set"; fail=1; }
+inx '/usr/local/lib/ezil/patch-copilot-chat.sh --verify /usr/lib/code-server/lib/vscode >/dev/null 2>&1' && echo "PASS  patch-copilot-chat.sh --verify: every build-time patch gate holds in the shipped image" || { echo "FAIL  patch-copilot-chat.sh --verify failed in the image"; fail=1; }
 start_mock || fail=1
 run_browser "$OUT/fresh" || fail=1
 collect_logs fresh
+network_checks fresh || fail=1
+reset_sink_logs
 
 # ── Pass 2: returning user ───────────────────────────────────────────────────
 echo "[e2e] pass 2 — returning user with restored .ezil/ state, a masking User settings.json and a pre-existing BYOK group"
@@ -168,6 +227,7 @@ inx 'grep -q "\"vendor\": \"openai\"" /tmp/code-server-data/User/chatLanguageMod
 start_mock || fail=1
 run_browser "$OUT/returning" || fail=1
 collect_logs returning
+network_checks returning || fail=1
 
 rm -rf "$WORK" 2>/dev/null || true
 if [[ $fail == 0 ]]; then echo "[e2e] ALL PASSED — artifacts in $OUT"; else echo "[e2e] FAILURES — see $OUT" >&2; fi

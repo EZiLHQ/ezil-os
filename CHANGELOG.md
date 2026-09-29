@@ -43,6 +43,40 @@ did not. See [`docs/RELEASE.md`](docs/RELEASE.md) for the full mechanics.
   dialog appears, an Agent-mode `create_file` round trip lands in the
   workspace and the EZiL model is listed in the Language Models editor, then
   repeats it as a returning user whose persisted settings say the opposite.
+- **Image revision 3: the chat stack makes no GitHub calls, and it is
+  "EZiL Chat".** Measured behind a DNS sink, anonymous Copilot Chat on
+  revision 2 still minted a Copilot device token at
+  `api.github.com/copilot_internal/v2/nltoken` (retrying nine times when it
+  failed), fetched `main.vscode-cdn.net/extensions/copilotChat.json`, posted
+  applicationinsights Statsbeat to `westus-0.in.applicationinsights.azure.com`,
+  and code-server polled `api.github.com` for its latest release — while the
+  UI read "By continuing with GitHub Copilot, you agree to GitHub's Terms and
+  Privacy Statement", "Copilot status" and "Sign in to use GitHub Copilot…",
+  and the system prompt told the model to call itself GitHub Copilot. The
+  new `worker/copilot-chat/patch-copilot-chat.sh` (run by the Dockerfile on
+  the pinned bundles, each patch an exact-match anchor with an occurrence
+  count and a post-patch gate — `worker/copilot-chat/PATCHES.md`) removes
+  both fetches from the extension, hides the Accounts-menu sign-in entry, and
+  rebrands the strings: the welcome line is now "AI responses may be
+  inaccurate. Review changes before applying them." (no links), the status
+  item "EZiL Chat status", the identity "You are EZiL Chat, an AI coding
+  assistant". The tool/settings embeddings cache the extension pulls from
+  `embeddings.vscode-cdn.net` once Agent tooling runs is patched out too.
+  `--disable-update-check` and `APPLICATION_INSIGHTS_NO_STATSBEAT`
+  stop the other two callers; a returning user's own `User/settings.json`
+  now gets `telemetry.telemetryLevel: off` merged in at boot (every other
+  key kept — without it the GitHub telemetry sender came back on, measured
+  in the e2e's returning-user pass); the Copilot/telemetry-only hosts are also
+  mapped to loopback in `/etc/hosts` at boot (never `github.com` /
+  `api.github.com`); `github.copilot.chat.backgroundAgent.enabled` /
+  `cloudAgent.enabled` are off so the session-target picker offers Local
+  only. Strings only — no command id, setting key, `product.json` field or
+  LICENSE changes; `ATTRIBUTIONS.md` records the modification.
+  `e2e/copilot-ezil-image.sh` now boots the image behind the same DNS sink
+  and fails on any GitHub / githubusercontent / githubcopilot / Microsoft-
+  telemetry / vscode-cdn attempt during boot plus a full Agent-mode prompt,
+  on any visible "Copilot" or "GitHub" text in the workbench, and unless
+  the EZiL notice is in the chat welcome.
 - **EZiL Chat (OpenCode) panel, installed but dormant.** The
   `extensions/ezil-chat` extension (an AI coding panel in the secondary
   sidebar that drives a pinned [OpenCode](https://opencode.ai) v2 server on

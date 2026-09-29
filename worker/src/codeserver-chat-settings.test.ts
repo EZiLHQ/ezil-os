@@ -21,7 +21,7 @@
  */
 import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -79,9 +79,18 @@ function codeserverChatBlock (): string {
     return codeserver.slice(start, end);
 }
 
-function runCodeserverBlock (dir: string): { code: number | null; stderr: string } {
-    const script = `set -euo pipefail\nUSER_DATA_DIR="$1"\n${codeserverChatBlock()}\n`;
-    const r = spawnSync('bash', ['-c', script, 'bash', dir], { encoding: 'utf8' });
+function runCodeserverBlock (dir: string, hostsFile = join(dir, 'hosts')): { code: number | null; stderr: string } {
+    // The block also runs seed_blocked_ai_hosts; point it at a scratch file so a
+    // root test runner never edits the real /etc/hosts.
+    writeFileSync(hostsFile, '127.0.0.1\tlocalhost\n');
+    const script = `set -euo pipefail\nUSER_DATA_DIR="$1"\nexport EZIL_HOSTS_FILE="$2"\n${codeserverChatBlock()}\n`;
+    const r = spawnSync('bash', ['-c', script, 'bash', dir, hostsFile], { encoding: 'utf8' });
+    return { code: r.status, stderr: r.stderr };
+}
+
+function runHostsFn (src: string, hostsFile: string): { code: number | null; stderr: string } {
+    const script = `set -uo pipefail\nexport EZIL_HOSTS_FILE="$1"\n${extractFunction(src, 'seed_blocked_ai_hosts')}\nseed_blocked_ai_hosts\n`;
+    const r = spawnSync('bash', ['-c', script, 'bash', hostsFile], { encoding: 'utf8' });
     return { code: r.status, stderr: r.stderr };
 }
 
@@ -93,10 +102,30 @@ const EXPECTED_MACHINE: Record<string, unknown> = {
     'chat.welcomePage.signIn.enabled': false,
     'github.copilot.enable': { '*': false },
     'github.copilot.nextEditSuggestions.enabled': false,
+    // Revision 3: the extension's GitHub-only "Copilot CLI" / "Cloud" session
+    // types are gated by these two keys; off, the session-target picker offers Local only.
+    'github.copilot.chat.backgroundAgent.enabled': false,
+    'github.copilot.chat.cloudAgent.enabled': false,
+    // With BYOK models present the chat view shows its in-view "Sessions" list
+    // instead of the welcome view; off, an empty chat shows the welcome (and its
+    // EZiL notice) — sessions stay reachable via the view's toolbar/menu.
+    'chat.viewSessions.enabled': false,
     'workbench.secondarySideBar.defaultVisibility': 'visible',
     'ezilChat.autoStart': false,
     'ezilChat.revealOnStartup': false,
 };
+
+/** Hosts the boot-time /etc/hosts block must map to loopback (revision 3, see PATCHES.md). */
+const BLOCKED_AI_HOSTS = [
+    'api.githubcopilot.com',
+    'copilot-proxy.githubusercontent.com',
+    'copilot-telemetry.githubusercontent.com',
+    'default.exp-tas.com',
+    'mobile.events.data.microsoft.com',
+    'westus-0.in.applicationinsights.azure.com',
+    'main.vscode-cdn.net',
+    'embeddings.vscode-cdn.net',
+];
 
 describe('start-neko.sh Machine settings put Copilot Chat on EZiL models without sign-in', () => {
     it('writes valid JSON with exactly the keys the chat UI needs', () => {
@@ -193,6 +222,70 @@ describe('start-neko.sh User seed turns telemetry off (application scope, so not
         const parsed = JSON.parse(readFileSync(userPath(dir), 'utf8')) as Record<string, unknown>;
         expect(parsed['telemetry.telemetryLevel']).toBe('off');
         expect(parsed['security.workspace.trust.enabled']).toBe(false);
+    });
+});
+
+describe('revision 3: the chat stack stays off GitHub at boot (belt and braces for the build-time patches)', () => {
+    it('start-neko.sh maps the Copilot/telemetry-only hosts to loopback, idempotently, and never github.com', () => {
+        const hosts = join(tmp(), 'hosts');
+        writeFileSync(hosts, '127.0.0.1\tlocalhost\n172.17.0.2\tabc123\n');
+        const first = runHostsFn(neko, hosts);
+        expect(first.stderr).toBe('');
+        expect(first.code).toBe(0);
+        const once = readFileSync(hosts, 'utf8');
+        for (const h of BLOCKED_AI_HOSTS) expect(once).toContain(`127.0.0.1 ${h}\n`);
+        expect(once.startsWith('127.0.0.1\tlocalhost\n172.17.0.2\tabc123\n')).toBe(true);
+        // developer tooling (git, gh, the PR extension) must keep resolving GitHub itself
+        expect(once).not.toMatch(/^127\.0\.0\.1 (api\.)?github\.com$/m);
+        expect(once).not.toMatch(/\bgithub\.com\b/);
+        // second boot of the same container: no duplicate lines
+        const second = runHostsFn(neko, hosts);
+        expect(second.code).toBe(0);
+        expect(readFileSync(hosts, 'utf8')).toBe(once);
+    });
+
+    it('returns non-zero (and writes nothing) when the hosts file is not writable, so boot goes on', () => {
+        const dir = tmp();
+        const hosts = join(dir, 'hosts');
+        writeFileSync(hosts, '127.0.0.1\tlocalhost\n');
+        chmodSync(hosts, 0o444);
+        const { code } = runHostsFn(neko, hosts);
+        if (process.getuid && process.getuid() === 0) {
+            // root can write a 0444 file; the guard cannot be exercised here
+            expect([0, 1]).toContain(code);
+        } else {
+            expect(code).toBe(1);
+            expect(readFileSync(hosts, 'utf8')).toBe('127.0.0.1\tlocalhost\n');
+        }
+    });
+
+    it('start-codeserver.sh carries the byte-identical function and runs it in its seed block', () => {
+        expect(extractFunction(codeserver, 'seed_blocked_ai_hosts')).toBe(extractFunction(neko, 'seed_blocked_ai_hosts'));
+        expect(heredoc(codeserver, 'EZIL_BLOCKED_AI_HOSTS')).toBe(heredoc(neko, 'EZIL_BLOCKED_AI_HOSTS'));
+        const dir = tmp();
+        const hosts = join(dir, 'hosts');
+        const { code, stderr } = runCodeserverBlock(dir, hosts);
+        expect(stderr).toBe('');
+        expect(code).toBe(0);
+        const written = readFileSync(hosts, 'utf8');
+        for (const h of BLOCKED_AI_HOSTS) expect(written).toContain(`127.0.0.1 ${h}\n`);
+    });
+
+    it('is called in start-neko.sh after the chat seeds and before code-server launches', () => {
+        const groups = neko.indexOf('if seed_codeserver_chat_models "$CODE_SERVER_USER_DATA_DIR"');
+        const hostsCall = neko.indexOf('if seed_blocked_ai_hosts; then');
+        const launch = neko.indexOf('supervise_app codeserver');
+        expect(hostsCall).toBeGreaterThan(groups);
+        expect(launch).toBeGreaterThan(hostsCall);
+    });
+
+    it('both launchers pass --disable-update-check (code-server otherwise polls api.github.com for its latest release)', () => {
+        const nekoLaunch = neko.slice(neko.indexOf('supervise_app codeserver'), neko.indexOf('phase_end codeserver_launch'));
+        expect(nekoLaunch).toContain('--disable-update-check');
+        expect(nekoLaunch).toContain('--disable-telemetry');
+        const csLaunch = codeserver.slice(codeserver.indexOf('nohup code-server'), codeserver.indexOf('echo $! >"$PID_FILE"'));
+        expect(csLaunch).toContain('--disable-update-check');
+        expect(csLaunch).toContain('--disable-telemetry');
     });
 });
 

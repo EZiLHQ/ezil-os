@@ -5,7 +5,7 @@
 # to the bundled Copilot Chat (which e2e/copilot-ezil-image.sh covers); the
 # browser half opens it explicitly.
 #
-#   e2e/ezil-chat-image.sh [image=ezil-desktop:rev2]
+#   e2e/ezil-chat-image.sh [image=ezil-desktop:rev3]
 #
 # Needs: docker, node, a Playwright install (PLAYWRIGHT_REQUIRE_DIR — a
 # node_modules containing `playwright` with chromium downloaded; set
@@ -38,7 +38,7 @@
 # still be there (no manifest restore can touch it). Prompt skipped.
 set -euo pipefail
 
-IMAGE="${1:-${EZIL_CHAT_E2E_IMAGE:-ezil-desktop:rev2}}"
+IMAGE="${1:-${EZIL_CHAT_E2E_IMAGE:-ezil-desktop:rev3}}"
 OUT="$(mkdir -p "${EZIL_CHAT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_CHAT_E2E_OUT:-./ezil-e2e-out}" && pwd)"
 HOST_PORT="${EZIL_CHAT_E2E_PORT:-8443}"
 MOCK_PORT=4141

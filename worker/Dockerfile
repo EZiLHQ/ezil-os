@@ -298,6 +298,34 @@ RUN test -f /usr/lib/code-server/lib/vscode/extensions/copilot/package.json \
   && node -e "const j=require('/usr/lib/code-server/lib/vscode/extensions/copilot/package.json');if(j.publisher!=='GitHub'||j.name!=='copilot-chat')throw new Error('unexpected built-in '+j.publisher+'.'+j.name);if(!(j.contributes&&j.contributes.languageModelChatProviders))throw new Error('built-in copilot-chat has no languageModelChatProviders contribution');console.log('built-in',j.publisher+'.'+j.name,j.version)" \
   && node -e "const j=JSON.parse(require('fs').readFileSync('/usr/lib/code-server/lib/vscode/product.json','utf8'));if(!j.defaultChatAgent)throw new Error('product.json has no defaultChatAgent — the chat setup plumbing the model picker needs is gone');console.log('product.json defaultChatAgent present')"
 
+# ── Revision 3: EZiL Chat — no GitHub service calls, strings rebranded ───────
+# Anonymous Copilot Chat is not offline: measured on revision 2
+# (/workspace/ezil-plan/rev3-network-audit.md) the extension host minted a
+# "Copilot token for devDeviceId" at api.github.com/copilot_internal/v2/nltoken
+# (retried 9x when it failed), fetched main.vscode-cdn.net/extensions/
+# copilotChat.json, posted applicationinsights Statsbeat to
+# westus-0.in.applicationinsights.azure.com, and code-server itself asked
+# api.github.com for its latest release — while the UI still said "By
+# continuing with GitHub Copilot, you agree to GitHub's Terms…", "Copilot
+# status", "Sign in to use GitHub Copilot…" and the system prompt told the
+# model to call itself GitHub Copilot. `worker/copilot-chat/patch-copilot-chat.sh`
+# rewrites those call sites and strings in the pinned bundles with exact-match
+# anchors + occurrence counts + post-patch gates (documented one by one in
+# worker/copilot-chat/PATCHES.md); the update check is `--disable-update-check`
+# in the launchers; Statsbeat is the env below (the SDK reads it at module
+# load, before the extension's own `process.env` assignment runs); the
+# Copilot/telemetry-only hosts are additionally mapped to loopback in
+# /etc/hosts at boot (start-neko.sh `seed_blocked_ai_hosts`). Strings only —
+# no command id, setting key, contribution point or LICENSE is touched
+# (ATTRIBUTIONS.md records the modification). A code-server bump that moves an
+# anchor fails HERE, at build time, instead of shipping an image that quietly
+# phones GitHub again.
+COPY copilot-chat/patch-copilot-chat.sh /usr/local/lib/ezil/patch-copilot-chat.sh
+RUN chmod 0755 /usr/local/lib/ezil/patch-copilot-chat.sh \
+  && /usr/local/lib/ezil/patch-copilot-chat.sh /usr/lib/code-server/lib/vscode \
+  && /usr/local/lib/ezil/patch-copilot-chat.sh --verify /usr/lib/code-server/lib/vscode
+ENV APPLICATION_INSIGHTS_NO_STATSBEAT=true
+
 # ── EZiL Chat: baked in as a BUILT-IN (system) extension ─────────────────────
 # `worker/ezil-chat/dist/ezil-chat-<version>.vsix` is built from
 # `extensions/ezil-chat/` by `worker/ezil-chat/build-vsix.sh` and committed

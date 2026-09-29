@@ -1913,7 +1913,18 @@ seed_codeserver_user_settings() {
   _cs_user_dir="$1/User"
   _cs_settings="$_cs_user_dir/settings.json"
   if [ -s "$_cs_settings" ]; then
-    return 0
+    # A file the user (or a restored .ezil/settings.json) already owns: every
+    # key stays, but `telemetry.telemetryLevel: off` is re-asserted. It is
+    # APPLICATION-scoped, so this file is the only place it can live, and a
+    # returning user without it would have the bundled chat's GitHub/Microsoft
+    # telemetry senders back on (measured: copilot-telemetry.githubusercontent.com
+    # in the e2e's returning-user pass before this merge). Comments/trailing
+    # commas make the file unparsable for node — then it is left alone and the
+    # /etc/hosts block below is what still keeps those senders on loopback.
+    grep -q '"telemetry.telemetryLevel"[[:space:]]*:[[:space:]]*"off"' "$_cs_settings" 2>/dev/null && return 0
+    command -v node >/dev/null 2>&1 || return 1
+    node -e 'const fs=require("fs");const p=process.argv[1];let j;try{j=JSON.parse(fs.readFileSync(p,"utf8"));}catch(e){process.exit(1);}if(!j||typeof j!=="object"||Array.isArray(j))process.exit(1);j["telemetry.telemetryLevel"]="off";fs.writeFileSync(p,JSON.stringify(j,null,2)+"\n");' "$_cs_settings" 2>/dev/null
+    return $?
   fi
   mkdir -p "$_cs_user_dir" 2>/dev/null || return 1
   # `telemetry.telemetryLevel` is APPLICATION-scoped, so it can only live here
@@ -2091,11 +2102,54 @@ seed_codeserver_machine_settings() {
   "chat.welcomePage.signIn.enabled": false,
   "github.copilot.enable": { "*": false },
   "github.copilot.nextEditSuggestions.enabled": false,
+  "github.copilot.chat.backgroundAgent.enabled": false,
+  "github.copilot.chat.cloudAgent.enabled": false,
+  "chat.viewSessions.enabled": false,
   "workbench.secondarySideBar.defaultVisibility": "visible",
   "ezilChat.autoStart": false,
   "ezilChat.revealOnStartup": false
 }
 CODESERVER_MACHINE_SETTINGS_JSON
+}
+
+# ── Copilot / telemetry hosts resolve to loopback inside the container ───────
+#
+# Belt and braces for the build-time patches in worker/copilot-chat/ (which
+# already remove every GitHub call the chat stack makes in anonymous mode —
+# measured in /workspace/ezil-plan/rev3-network-audit.md): the hosts below are
+# used ONLY by Copilot's own services, Microsoft/GitHub telemetry, the VS Code
+# experiment service and the copilotChat.json CDN list. Mapping them to
+# 127.0.0.1 in /etc/hosts means that even a code path the patches missed dies
+# on loopback with ECONNREFUSED instead of reaching GitHub. github.com and
+# api.github.com are deliberately NOT here: git, gh and the GitHub PR extension
+# in the user's terminal need them (the two api.github.com callers, the
+# anonymous Copilot token and code-server's own update check, are handled by
+# the patch and `--disable-update-check`). Idempotent; a read-only /etc/hosts
+# (some sandboxes) is logged and skipped, never fatal. Keep the function
+# byte-identical with start-codeserver.sh — worker/src/codeserver-chat-settings.test.ts
+# checks that and executes it against a temp file.
+seed_blocked_ai_hosts() {
+  _hosts="${EZIL_HOSTS_FILE:-/etc/hosts}"
+  [ -w "$_hosts" ] || return 1
+  while IFS= read -r _h; do
+    [ -n "$_h" ] || continue
+    grep -q -F -w -- "$_h" "$_hosts" 2>/dev/null && continue
+    printf '127.0.0.1 %s\n' "$_h" >>"$_hosts" 2>/dev/null || return 1
+  done <<'EZIL_BLOCKED_AI_HOSTS'
+api.githubcopilot.com
+api-model-lab.githubcopilot.com
+copilot-proxy.githubusercontent.com
+copilot-telemetry.githubusercontent.com
+origin-tracker.githubusercontent.com
+default.exp-tas.com
+mobile.events.data.microsoft.com
+browser.events.data.microsoft.com
+dc.services.visualstudio.com
+westus-0.in.applicationinsights.azure.com
+westeurope-5.in.applicationinsights.azure.com
+main.vscode-cdn.net
+embeddings.vscode-cdn.net
+EZIL_BLOCKED_AI_HOSTS
 }
 
 # The profile's BYOK group list. Copilot Chat's core only asks a third-party
@@ -2128,6 +2182,11 @@ if seed_codeserver_chat_models "$CODE_SERVER_USER_DATA_DIR"; then
 else
   log "WARNING: could not seed ${CODE_SERVER_USER_DATA_DIR}/User/chatLanguageModels.json — the EZiL models may not be listed until Manage Models is opened once"
 fi
+if seed_blocked_ai_hosts; then
+  log "Copilot/telemetry service hosts mapped to 127.0.0.1 in /etc/hosts (belt and braces for the build-time patches; github.com and api.github.com untouched)"
+else
+  log "NOTE: /etc/hosts is not writable — relying on the build-time patches alone to keep the chat stack off GitHub"
+fi
 
 phase_start codeserver_launch
 log "supervising code-server ($CODE_SERVER_BIN) on 0.0.0.0:${CODE_SERVER_PORT} at $WORKSPACE_ROOT (mandatory, isolated user-data-dir)"
@@ -2135,6 +2194,7 @@ supervise_app codeserver "$NEKO_APP_MAX_RESTARTS" "$CODE_SERVER_BIN" \
   --bind-addr "0.0.0.0:${CODE_SERVER_PORT}" \
   --auth none \
   --disable-telemetry \
+  --disable-update-check \
   --user-data-dir="$CODE_SERVER_USER_DATA_DIR" \
   --extensions-dir="$CODE_SERVER_EXTENSIONS_DIR" \
   "$WORKSPACE_ROOT"
