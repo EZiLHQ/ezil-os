@@ -132,6 +132,22 @@ const APP_TITLES = { desktop: 'Browser', code: 'Code', preview: 'Preview', setti
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Poll a page-side predicate until it is truthy, or the deadline passes.
+ * Resolves to the predicate's final value either way — a timeout is not a
+ * throw, so the scenario that called it goes on to make its real assertion
+ * (which then fails with a legible detail) instead of dying in setup.
+ */
+async function waitFor (page, fn, { timeout = 5_000, every = 50, arg } = {}) {
+    const deadline = Date.now() + timeout;
+    let v;
+    for ( ;; ) {
+        v = await page.evaluate(fn, arg);
+        if ( v || Date.now() >= deadline ) return v;
+        await sleep(every);
+    }
+}
+
 // A stand-in for the cross-origin neko SPA. It contains its picture at 16:9 in
 // its OWN black, exactly as neko does, so a wrongly-shaped iframe shows up as
 // black bars INSIDE the frame and a correctly-shaped one shows none.
@@ -261,15 +277,52 @@ async function launch (page, id) {
     await sleep(700);
 }
 
-/** Leave full-bleed the way a real user does — the window's own minimise. */
+/**
+ * Leave full-bleed the way a real user does — the window's own minimise,
+ * then the dock — and come back with the window FULL-BLEED AGAIN, so the
+ * caller's exit is the one and only thing that windows it.
+ *
+ * 🔴 Condition-driven, not timed. This used to be two fixed 300ms sleeps,
+ * and the restore path is `showWindow` -> `data-is_minimized` flips ->
+ * `desktop-window.js`'s observer -> `setTimeout(go_fullbleed, 220)`: measured
+ * locally that `go_fullbleed` lands 555-625ms into the 600ms budget, a margin
+ * under 100ms that a loaded macOS runner eats (PR #160, 7691ee3). When it
+ * lost, the caller's "still full-bleed? then exit" check ran BEFORE the class
+ * came back, skipped, and the window went full-bleed a moment later with its
+ * head hidden — so G2/G3/G4 read three existing controls at 0x0 and
+ * `elementFromPoint` found nothing. The same three checks, with the same
+ * details, reproduce on a fast box by shaving 120ms off the second sleep.
+ * Every step now waits for the state it produces; the timeouts are only how
+ * long a REAL failure is allowed to take before the caller's assertion reads
+ * whatever state is actually there.
+ */
 async function leaveFullbleed (page) {
+    // The boot's reveal (display gate -> `go_fullbleed`) is what makes there
+    // be a full-bleed to leave. `boot()` waited a fixed 1.6s for it; on a
+    // slow runner that is not a promise, so confirm it before minimising.
+    const fullbleed = await waitFor(page, () => !! document.querySelector('.window[data-app="desktop"].ezil-fullbleed'), { timeout: 10_000 });
+    if ( ! fullbleed ) console.log('   DIAG leaveFullbleed: the Browser never went full-bleed after boot');
+
     await page.evaluate(() => {
         const w = document.querySelector('.window.ezil-fullbleed');
         if ( w ) w._ezil_minimise ? w._ezil_minimise() : $(w).hideWindow();
     });
-    await sleep(300);
+    const minimised = await waitFor(page, () => /^(true|1)$/.test(document.querySelector('.window[data-app="desktop"]')?.getAttribute('data-is_minimized') ?? ''));
+    if ( ! minimised ) console.log('   DIAG leaveFullbleed: minimise did not set data-is_minimized', await page.evaluate(() => document.querySelector('.window[data-app="desktop"]')?.getAttribute('data-is_minimized')));
+
     await page.evaluate(() => { $('.taskbar-item[data-app="desktop"]').trigger('click'); });
-    await sleep(300);
+    const restored = await waitFor(page, () => /^(false|0)$/.test(document.querySelector('.window[data-app="desktop"]')?.getAttribute('data-is_minimized') ?? ''));
+    if ( ! restored ) console.log('   DIAG leaveFullbleed: the dock click did not restore the window');
+
+    // The restore observer's deferred `go_fullbleed('restored from the
+    // taskbar')` — the step whose timing was the flake. Wait for it, so it
+    // has already happened when the caller exits full-bleed, rather than
+    // arriving afterwards and undoing that exit.
+    const again = await waitFor(page, () => !! document.querySelector('.window[data-app="desktop"].ezil-fullbleed'), { timeout: 3_000 });
+    if ( ! again ) console.log('   DIAG leaveFullbleed: the window did not return to full-bleed after restore', await page.evaluate(() => ({
+        minimized: document.querySelector('.window[data-app="desktop"]')?.getAttribute('data-is_minimized'),
+        cls: document.querySelector('.window[data-app="desktop"]')?.className,
+    })));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -289,7 +342,15 @@ async function scenarioChrome () {
             window.exit_fullpage_mode(w);
         }
     });
-    await sleep(300);
+    // Windowed means the head is back on screen: wait for its close control
+    // to have a box, not for a clock. (G2 below asserts the same thing with a
+    // legible detail if it never happens.)
+    const headed = await waitFor(page, () => {
+        const b = document.querySelector('.window[data-app="desktop"] > .window-head > .window-close-btn');
+        return !! b && b.getBoundingClientRect().width > 0;
+    });
+    if ( ! headed ) console.log('   DIAG chrome: the Browser head did not lay out after leaving full-bleed', await page.evaluate(() => document.querySelector('.window[data-app="desktop"]')?.className));
+    await sleep(100);
     for ( const id of ['code', 'preview', 'settings'] ) await launch(page, id);
     await sleep(400);
 
@@ -645,8 +706,15 @@ async function scenarioFullbleed () {
 
     // ── G9: the expand control ─────────────────────────────────────────────
     // Restore, leave full-bleed, then use the green button.
+    // 🔴 Same race as `leaveFullbleed` (see its header): the restore observer
+    // re-enters full-bleed 220ms AFTER `showWindow` flips the attribute, so
+    // wait for that to have happened before exiting, or the exit is undone
+    // a moment later and G9 reads a full-bleed window it did not expect.
     await page.evaluate(() => { $('.taskbar-item[data-app="desktop"]').trigger('click'); });
-    await sleep(600);
+    const g9restored = await waitFor(page, () => /^(false|0)$/.test(document.querySelector('.window[data-app="desktop"]')?.getAttribute('data-is_minimized') ?? ''));
+    if ( ! g9restored ) console.log(`   DIAG ${L} G9: the dock click did not restore the window`);
+    const g9again = await waitFor(page, () => !! document.querySelector('.window[data-app="desktop"].ezil-fullbleed'), { timeout: 3_000 });
+    if ( ! g9again ) console.log(`   DIAG ${L} G9: the window did not return to full-bleed after restore`);
     await page.evaluate(() => {
         const w = document.querySelector('.window[data-app="desktop"]');
         if ( w?.classList.contains('ezil-fullbleed') ) {
@@ -654,7 +722,12 @@ async function scenarioFullbleed () {
             window.exit_fullpage_mode(w);
         }
     });
-    await sleep(400);
+    const g9headed = await waitFor(page, () => {
+        const b = document.querySelector('.window[data-app="desktop"] > .window-head > .window-scale-btn');
+        return !! b && b.getBoundingClientRect().width > 0;
+    });
+    if ( ! g9headed ) console.log(`   DIAG ${L} G9: the Browser head did not lay out after leaving full-bleed`);
+    await sleep(200);
     const beforeExpand = await page.evaluate(() => ({
         fullbleed: !! document.querySelector('.window[data-app="desktop"].ezil-fullbleed'),
         maximized: document.querySelector('.window[data-app="desktop"]')?.getAttribute('data-is_maximized'),
