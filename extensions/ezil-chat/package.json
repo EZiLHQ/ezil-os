@@ -1,0 +1,174 @@
+{
+  "name": "ezil-chat",
+  "displayName": "EZiL Chat",
+  "description": "OpenCode-powered chat panel for EZiL OS: streaming turns, tool cards, permissions, diffs and model routing in the secondary sidebar.",
+  "version": "0.1.0",
+  "publisher": "ezil",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EZiLHQ/ezil-os",
+    "directory": "extensions/ezil-chat"
+  },
+  "engines": {
+    "vscode": "^1.106.0"
+  },
+  "categories": ["AI", "Chat"],
+  "main": "./dist/extension.js",
+  "icon": "media/icon.png",
+  "extensionKind": ["workspace"],
+  "activationEvents": ["onStartupFinished", "onView:ezil-chat.panel"],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "EZiL Chat runs an agent with file and shell access, so it waits for workspace trust."
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "viewsContainers": {
+      "secondarySidebar": [
+        {
+          "id": "ezil-chat",
+          "title": "EZiL",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "ezil-chat": [
+        {
+          "type": "webview",
+          "id": "ezil-chat.panel",
+          "name": "EZiL Chat",
+          "icon": "media/icon.svg",
+          "contextualTitle": "EZiL Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "ezil-chat.open",
+        "title": "EZiL Chat: Open",
+        "category": "EZiL Chat"
+      },
+      {
+        "command": "ezil-chat.newSession",
+        "title": "EZiL Chat: New Session",
+        "category": "EZiL Chat",
+        "icon": "$(add)"
+      },
+      {
+        "command": "ezil-chat.addSelectionToChat",
+        "title": "EZiL Chat: Add Selection to Chat",
+        "category": "EZiL Chat"
+      },
+      {
+        "command": "ezil-chat.restartServer",
+        "title": "EZiL Chat: Restart OpenCode Server",
+        "category": "EZiL Chat"
+      },
+      {
+        "command": "ezil-chat.pickModel",
+        "title": "EZiL Chat: Pick Model",
+        "category": "EZiL Chat"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "ezil-chat.newSession",
+          "when": "view == ezil-chat.panel",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "ezil-chat.addSelectionToChat",
+          "when": "editorHasSelection",
+          "group": "ezil@1"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "ezil-chat.addSelectionToChat",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k",
+        "when": "editorTextFocus && editorHasSelection"
+      },
+      {
+        "command": "ezil-chat.open",
+        "key": "ctrl+alt+l",
+        "mac": "cmd+alt+l"
+      }
+    ],
+    "configurationDefaults": {
+      "chat.disableAIFeatures": true,
+      "workbench.secondarySideBar.defaultVisibility": "visible"
+    },
+    "configuration": {
+      "title": "EZiL Chat",
+      "properties": {
+        "ezilChat.opencodePath": {
+          "type": "string",
+          "default": "opencode",
+          "markdownDescription": "Path to the pinned `opencode` binary the extension spawns with `opencode serve`. Ignored when `#ezilChat.serverUrl#` is set."
+        },
+        "ezilChat.serverUrl": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Attach to an already running OpenCode v2 server (for example `http://127.0.0.1:4096`) instead of spawning one. Set `#ezilChat.serverPassword#` if that server requires basic auth."
+        },
+        "ezilChat.serverPassword": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Basic-auth password (`OPENCODE_SERVER_PASSWORD`) for `#ezilChat.serverUrl#`. Spawned servers get a random password automatically."
+        },
+        "ezilChat.configPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional `opencode.json` passed to the spawned server as `OPENCODE_CONFIG`. Leave empty to use OpenCode's normal config lookup (including the managed `/etc/opencode/opencode.json`)."
+        },
+        "ezilChat.defaultAgent": {
+          "type": "string",
+          "default": "build",
+          "description": "Agent selected for new sessions (build, plan, or any primary agent the server reports)."
+        },
+        "ezilChat.defaultModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Model for new sessions as `providerID/modelID` (for example `azure/claude-sonnet-4-5`). Empty uses the server's default model."
+        },
+        "ezilChat.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start the OpenCode server when VS Code finishes loading. When off, the server starts the first time the panel is opened."
+        },
+        "ezilChat.revealOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reveal the EZiL Chat panel the first time this window activates the extension."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "bun run build:extension && bun run build:webview",
+    "build:extension": "bun build src/extension.ts --target=node --format=cjs --external=vscode --outfile=dist/extension.js",
+    "build:webview": "bun build src/webview/main.ts --target=browser --format=esm --outfile=dist/webview.js && cp src/webview/style.css dist/webview.css",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p src/webview/tsconfig.json",
+    "test": "bun test",
+    "package:vsix": "bun run build && bunx @vscode/vsce@4.0.0 package --no-dependencies --out ezil-chat-0.1.0.vsix"
+  },
+  "dependencies": {
+    "@opencode/client": "2.0.19"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "@types/node": "22.10.2",
+    "@types/vscode": "1.106.1",
+    "typescript": "5.9.3"
+  }
+}
