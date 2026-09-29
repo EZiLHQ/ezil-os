@@ -111,14 +111,49 @@ run it; it is skipped when none is found.
 
 ## How the image installs it
 
-The worker image (follow-up change) builds the VSIX above, installs the same
-`@opencode/cli` version the extension pins (`src/opencode/version.ts`), and runs
-`code-server --install-extension ezil-chat-0.1.0.vsix` into the built-in
-extensions directory so users cannot remove it. Machine-scope settings carry
-`chat.disableAIFeatures` for existing users whose restored User settings would
-otherwise mask the extension defaults. Model credentials and routing live in
-the managed `/etc/opencode/opencode.json`; the extension never stores provider
-secrets.
+`worker/Dockerfile` (the desktop image local mode and the hosted Worker run):
+
+* **code-server is pinned** (`CODE_SERVER_VERSION` / `CODE_SERVER_SHA256`, the
+  amd64 `.deb` from the GitHub release, checksummed) instead of `curl
+  install.sh | sh`. The bundled GitHub Copilot Chat built-in that code-server
+  >= 4.139 ships (`lib/vscode/extensions/copilot`) is deleted and
+  `product.json`'s `defaultChatAgent` is stripped, so no Copilot UI can appear.
+* **This extension is a built-in.** `worker/ezil-chat/build-vsix.sh` packages
+  `extensions/ezil-chat` into the committed
+  `worker/ezil-chat/dist/ezil-chat-<version>.vsix` (the source is outside the
+  `worker/` build context, same arrangement as `worker/bootstrap/dist`); the
+  Dockerfile unpacks it into `/usr/lib/code-server/lib/vscode/extensions/ezil-chat`.
+  A system extension cannot be uninstalled from the Extensions view, needs no
+  install step at boot, and is invisible to start-neko.sh's
+  `.ezil/extensions.txt` capture/restore. It does NOT show up in
+  `code-server --list-extensions` (that lists the user `--extensions-dir`
+  only). After changing extension source, rerun `build-vsix.sh` and commit the
+  VSIX; `build-vsix.sh --check` fails when the committed VSIX is stale.
+* **`opencode` v2.0.19** (`OPENCODE_VERSION`, the version `src/opencode/version.ts`
+  pins) is the standalone binary from the `@opencode/cli-linux-x64` npm
+  tarball, checksummed, at `/usr/local/bin/opencode`. OpenCode 2.x has no
+  GitHub release assets; npm is the only distribution.
+* **Managed config** `worker/opencode/opencode.json` is installed at
+  `/etc/opencode/opencode.json`, OpenCode's highest-precedence layer on Linux:
+  `autoupdate: false`, `share: "disabled"`, a `small_model` placeholder and an
+  `azure` provider whose `resourceName`/`apiKey` are `{env:AZURE_RESOURCE_NAME}`
+  / `{env:AZURE_API_KEY}` references with example deployment names. No secrets
+  in the image; the extension never stores provider credentials either.
+* **Machine-scope settings.** `worker/scripts/start-neko.sh` writes
+  `<user-data-dir>/Machine/settings.json` on every boot with
+  `chat.disableAIFeatures: true` and
+  `workbench.secondarySideBar.defaultVisibility: "visible"`. That layer
+  outranks User settings, so a returning user whose restored `settings.json`
+  says `chat.disableAIFeatures: false` still gets no built-in chat UI.
+
+`e2e/ezil-chat-image.sh <image>` proves all of this on a built image: it boots
+the container like local mode, checks the in-image facts, then drives a real
+browser (`e2e/ezil-chat.mjs`) through the EZiL panel — including a prompt
+answered by `e2e/ezil-chat-mock-provider.mjs`, an OpenAI-compatible mock wired
+in through a project-level `opencode.json`, so no model credentials are
+needed — and boots again as a returning user with a Copilot-era
+`.ezil/extensions.txt` and a masking User `settings.json`. Needs docker, node
+and a Playwright install (`PLAYWRIGHT_REQUIRE_DIR`, like `e2e/prod.mjs`).
 
 ## Running locally with code-server
 
