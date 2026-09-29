@@ -423,6 +423,7 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
           aws-region: us-east-1
+          role-duration-seconds: 7200
       - name: Acquire shared production lease
         id: production_lease
         env:
