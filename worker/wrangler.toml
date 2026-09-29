@@ -154,8 +154,8 @@ SANDBOX_NEKO_ICE_POLICY = "relay"
 # routed `*-desktop`/`*-nekodesktop`/`*-app` on **ezil.work** — the company's
 # main production website — plus a `custom_domain` entry for `os.ezil.work`.
 # The owner said not to touch ezil.work; that routing was removed from this
-# file AND unbound from the zone in Cloudflare. ezil.work remains untouched
-# and off-limits.
+# file AND unbound from the zone in Cloudflare. Production remains on ezil.org;
+# the separately requested staging configuration below now uses ezil.work.
 #
 # 2026-07-31, later same day — owner-approved narrow suffix routes on
 # **ezil.org**: `ezil.org` is production's zone — `*.ezil.org/*` is bound to
@@ -271,3 +271,66 @@ head_sampling_rate = 1.0
 [observability.logs]
 enabled = true
 invocation_logs = true
+
+# ── Isolated staging deployment (provision resources before deployment) ────
+# The API and every exposed port use ONE label directly under ezil.work, so
+# *.ezil.work TLS covers them. Provision proxied DNS for the API and preview
+# hosts. These narrow suffix routes do not claim the apex or a zone catch-all.
+# Secrets are environment-scoped and must be supplied separately:
+# SANDBOX_HMAC_SECRET (match the staging app), SANDBOX_NEKO_TURN_KEY_ID,
+# SANDBOX_NEKO_TURN_API_TOKEN. Native R2 bindings need no S3 credentials.
+[env.staging]
+name = "ezil-os-worker-staging"
+workers_dev = true
+
+[env.staging.vars]
+SANDBOX_PREVIEW_ZONE_ROOT = "ezil.work"
+SANDBOX_DEFAULT_DESKTOP_MODE = "neko"
+SANDBOX_NEKO_ICE_POLICY = "relay"
+
+# Bind to this staging Worker's own namespace, never a production script_name.
+[[env.staging.durable_objects.bindings]]
+class_name = "Sandbox"
+name = "Sandbox"
+
+[[env.staging.migrations]]
+new_sqlite_classes = ["Sandbox"]
+tag = "v1"
+
+[[env.staging.containers]]
+name = "ezil-os-worker-staging-sandbox"
+class_name = "Sandbox"
+image = "./Dockerfile"
+instance_type = "standard-3"
+max_instances = 5
+rollout_step_percentage = 100
+rollout_kind = "full_auto"
+rollout_active_grace_period = 300
+
+[[env.staging.r2_buckets]]
+binding = "SANDBOX_WORKSPACE_R2_BUCKET"
+bucket_name = "ezil-sandbox-workspaces-staging"
+
+[[env.staging.r2_buckets]]
+binding = "TELEMETRY_R2_BUCKET"
+bucket_name = "ezil-telemetry-spool-staging"
+
+[[env.staging.routes]]
+pattern = "api-desktop-staging.ezil.work/*"
+zone_name = "ezil.work"
+
+[[env.staging.routes]]
+pattern = "*-app.ezil.work/*"
+zone_name = "ezil.work"
+
+[[env.staging.routes]]
+pattern = "*-desktop.ezil.work/*"
+zone_name = "ezil.work"
+
+[[env.staging.routes]]
+pattern = "*-nekodesktop.ezil.work/*"
+zone_name = "ezil.work"
+
+[[env.staging.routes]]
+pattern = "*-code.ezil.work/*"
+zone_name = "ezil.work"
