@@ -1,0 +1,20 @@
+{
+  "name": "@ezil-os/app-computer-infra",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "synth": "cdk synth --strict"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.270.0",
+    "constructs": "10.8.1"
+  },
+  "devDependencies": {
+    "aws-cdk": "2.1143.0",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "@types/node": "20.19.43"
+  }
+}
