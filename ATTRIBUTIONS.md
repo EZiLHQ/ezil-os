@@ -245,3 +245,13 @@ The licenses and versions were checked in the installed packages' own
 `package.json` files. Both are pinned development dependencies in
 `app/package.json` and `app/bun.lock`; no upstream source was copied into
 the application.
+
+## 8. Database migration test image
+
+The CI-only computer-runtime migration job uses the official
+[`postgres:16-alpine`](https://github.com/docker-library/postgres) image at a
+fixed manifest digest. PostgreSQL carries the [PostgreSQL
+License](https://www.postgresql.org/about/licence/); the Alpine base and image
+packaging retain their own upstream notices. The image runs only in GitHub
+Actions for a rollback-only schema test and is not part of an EZiL-OS runtime
+or release artifact.

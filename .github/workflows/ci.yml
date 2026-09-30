@@ -247,6 +247,38 @@ jobs:
         working-directory: app
         run: bun run test
 
+  app-db-runtime:
+    name: app (computer runtime PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      EZIL_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install app dependencies
+        working-directory: app
+        run: bun install --frozen-lockfile
+      - name: Test the additive migration and database constraints
+        working-directory: app
+        run: bun run test:db:computer-runtime
+
   connectors:
     name: sdk + mcp (typecheck + unit)
     strategy:

@@ -32,6 +32,7 @@ function computer(overrides: Partial<Computer> = {}): Computer {
         id: '33333333-3333-3333-3333-333333333333',
         userId: USER.id,
         name: 'Computer',
+        provider: 'cloudflare',
         slot: 1,
         createdAt: new Date('2026-07-31T09:00:00.000Z'),
         lastOpenedAt: null,
