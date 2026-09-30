@@ -206,7 +206,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libxshmfence1 \
       libsecret-1-0 \
       wmctrl \
+      xclip=0.13-2 \
+  && mkdir -p /usr/local/share/ezil/third-party/xclip \
+  && sed -n 's/^deb /deb-src /p' /etc/apt/sources.list > /etc/apt/sources.list.d/ezil-xclip-source.list \
+  && apt-get update \
+  && cd /usr/local/share/ezil/third-party/xclip \
+  && apt-get source --download-only xclip=0.13-2 \
+  && cp /usr/share/doc/xclip/copyright ./copyright \
+  && cp /usr/share/common-licenses/GPL-2 ./GPL-2 \
+  && test -s xclip_0.13-2.dsc \
+  && test -s xclip_0.13.orig.tar.gz \
+  && test -s xclip_0.13-2.debian.tar.xz \
+  && rm /etc/apt/sources.list.d/ezil-xclip-source.list \
   && rm -rf /var/lib/apt/lists/*
+# Neko invokes xclip for clipboard reads/writes; copying /usr/bin/neko does
+# not bring that executable along. Preserve the matching Ubuntu source and
+# GPL notices with the unmodified binary (see ATTRIBUTIONS.md).
 # `wmctrl` (above) gives start-neko.sh a deterministic, machine-checkable way to
 # list/activate windows by class (`wmctrl -l`, `wmctrl -x -a`) for focus/app
 # switching between VS Code and the isolated Chromium instance, on top of the
@@ -268,6 +283,10 @@ COPY assets/browser-home.html    /usr/local/share/ezil/browser-home.html
 COPY scripts/validate-neko-focus.sh          /usr/local/bin/validate-neko-focus.sh
 COPY scripts/validate-neko-desktop.sh        /usr/local/bin/validate-neko-desktop.sh
 COPY scripts/validate-neko-browser-window.sh /usr/local/bin/validate-neko-browser-window.sh
+COPY scripts/validate-neko-clipboard.sh      /usr/local/bin/validate-neko-clipboard.sh
+# Use a separate X server so the build proves the actual clipboard dependency
+# works without booting a desktop, mounting user data, or requiring networking.
+RUN bash /usr/local/bin/validate-neko-clipboard.sh
 RUN chmod +x /usr/local/bin/validate-neko-focus.sh \
              /usr/local/bin/validate-neko-desktop.sh \
              /usr/local/bin/validate-neko-browser-window.sh \

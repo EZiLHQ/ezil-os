@@ -93,6 +93,19 @@ If you believe an attribution is missing or inaccurate, please open an issue
   imposes no on-screen-attribution obligation, so this is permitted; full
   attribution stays here rather than in the product UI.
 
+### xclip (Ubuntu Jammy package `0.13-2`)
+- **URL:** https://github.com/astrand/xclip
+- **License:** GPL-2.0-or-later, reviewed against the installed Ubuntu
+  package's `/usr/share/doc/xclip/copyright`. Upstream and Debian packaging
+  are both identified there as GPL-2.0+.
+- **Used for:** Neko's X11 clipboard reads and writes. It runs as a separate,
+  unmodified executable; no xclip code is linked into or vendored in EZiL.
+- **Distribution:** the image retains the copyright notice, GPL v2 text,
+  and the exact package's `.dsc`, upstream tarball, and Debian source archive
+  at `/usr/local/share/ezil/third-party/xclip/`. Ubuntu's authenticated apt
+  source indexes select these matching sources. Image builds fail if any
+  source archive is unavailable; do not publish the binary without them.
+
 ### neko-apps (`m1k1o/neko-apps`)
 - **URL:** https://github.com/m1k1o/neko-apps
 - **License: UNVERIFIED.** No upstream `LICENSE` file was found for this
