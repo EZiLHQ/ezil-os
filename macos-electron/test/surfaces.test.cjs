@@ -46,8 +46,8 @@ test('sandbox preload exposes operation alongside request and strips IPC payload
   assert.equal(calls, 1);
   result = { ok: false, error: 'secret' };
   assert.equal(JSON.stringify(await invoke(runtimeInput)), JSON.stringify(unavailable));
-  result = { ok: true, configured: true, provider: 'ezil', state: 'paused', models: ['ezil-fast', 'evil-model'], accessToken: 'secret-token', refreshToken: 'secret-refresh', session: { secret: true }, accountId: 'secret-account', error: 'secret-payload' };
-  assert.deepEqual(JSON.parse(JSON.stringify(await invoke({ op: 'provider.status' }))), { ok: true, configured: true, provider: 'ezil', state: 'paused', models: ['ezil-fast'] });
+  result = { ok: true, configured: true, provider: 'ezil', state: 'paused', models: ['ezil-fast', 'new-model', 'evil/model'], accessToken: 'secret-token', refreshToken: 'secret-refresh', session: { secret: true }, accountId: 'secret-account', error: 'secret-payload' };
+  assert.deepEqual(JSON.parse(JSON.stringify(await invoke({ op: 'provider.status' }))), { ok: true, configured: true, provider: 'ezil', state: 'paused', models: ['ezil-fast', 'new-model'] });
   result = { ok: false, errorCode: 'builder_required', error: 'secret-payload', accessToken: 'secret-token' };
   assert.deepEqual(JSON.parse(JSON.stringify(await invoke({ op: 'provider.configure', action: 'ezil' }))), { ok: false, configured: false, errorCode: 'builder_required' });
   result = { ok: false, errorCode: 'secret-token', state: 'secret-payload' };
