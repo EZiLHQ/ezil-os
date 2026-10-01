@@ -5,7 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-export const canonical = 'https://ezil-os.vercel.app';
+// The public production origin. `legacyAlias` is the Vercel alias that served
+// production before os.ezil.org; it keeps resolving to the same deployment and
+// is verified alongside the canonical host until it is retired.
+export const canonical = 'https://os.ezil.org';
+export const legacyAlias = 'https://ezil-os.vercel.app';
 // Keep only validated public identity, never provider env/configuration fields.
 export function vercelIdentity(app, project) {
   assert.equal(app.projectId, project, 'Vercel project differs');
@@ -16,7 +20,9 @@ export function vercelIdentity(app, project) {
   // The API's url is the immutable deployment hostname, not an alias or a URL
   // carrying credentials, a path, query, port, or a CLI option.
   assert.match(app.url ?? '', /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.vercel\.app$/, 'Invalid Vercel deployment hostname');
-  assert.notEqual(app.url, new URL(canonical).hostname, 'Expected deployment URL, not canonical alias');
+  for (const alias of [canonical, legacyAlias]) {
+    assert.notEqual(app.url, new URL(alias).hostname, 'Expected deployment URL, not a production alias');
+  }
   return {vercel_deployment:app.id, vercel_source:app.meta.githubCommitSha, vercel_url:app.url};
 }
 export async function restoreVercel(previous, env, fetchImpl = fetch, exec = execFileSync) {
@@ -65,7 +71,7 @@ export async function readState(env, fetchImpl = fetch) {
   assert.equal(active.versions[0].percentage, 100);
   const version = await request(`${worker}/versions/${encodeURIComponent(active.versions[0].version_id)}`, env.CLOUDFLARE_API_TOKEN);
   assert.equal(version.success, true);
-  const app = await request(`https://api.vercel.com/v13/deployments/ezil-os.vercel.app?teamId=${encodeURIComponent(env.VERCEL_ORG_ID)}`, env.VERCEL_TOKEN);
+  const app = await request(`https://api.vercel.com/v13/deployments/${new URL(canonical).hostname}?teamId=${encodeURIComponent(env.VERCEL_ORG_ID)}`, env.VERCEL_TOKEN);
   const vercel = vercelIdentity(app, env.VERCEL_PROJECT_ID);
   // Wrangler 4.128 uses the Containers applications API. Whitelist only public identity.
   const containers = await request(`${cf}/containers/applications`, env.CLOUDFLARE_API_TOKEN);

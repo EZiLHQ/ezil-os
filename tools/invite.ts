@@ -220,7 +220,7 @@ Environment (read by name; never printed)
                               unless --no-invite. NEXT_PUBLIC_SUPABASE_URL is
                               accepted as a fallback.
   EZIL_OS_ORIGIN              invite redirect target; default
-                              https://os.ezil.work
+                              https://os.ezil.org
                               (the link lands on <origin>/auth/invited, which
                               must be in the project's Redirect URLs list).
 
@@ -339,7 +339,7 @@ const sendInvite = async (email: string): Promise<void> => {
 		);
 	}
 
-	const origin = (process.env.EZIL_OS_ORIGIN ?? 'https://os.ezil.work').replace(/\/+$/, '');
+	const origin = (process.env.EZIL_OS_ORIGIN ?? 'https://os.ezil.org').replace(/\/+$/, '');
 	// 🔴 `/auth/invited`, NOT `/auth/callback`. See this file's header: an
 	// invite is not a PKCE flow, so the verify redirect carries the session in
 	// the URL fragment and `/auth/callback` (a server handler reading `?code=`)

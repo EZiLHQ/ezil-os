@@ -1,7 +1,7 @@
 # Operating EZiL-OS — the runbook
 
 **Status: deployed and live**, not a pre-launch plan. App at
-`https://ezil-os.vercel.app` (Vercel), Worker at `api-desktop.ezil.org`
+`https://os.ezil.org` (Vercel; legacy alias `ezil-os.vercel.app`), Worker at `api-desktop.ezil.org`
 (Cloudflare), container image **v8**. OBSERVED this session: an
 unauthenticated request to the app root gets a real `307 -> /login` from a
 live Vercel deployment (`curl -sD- https://ezil-os.vercel.app/`); the Worker
@@ -24,13 +24,25 @@ system, which is out of scope for a docs-only pass.
 
 ---
 
-## What is live (as of 2026-09-05)
+## What is live (as of 2026-10-01)
 
-- **App**: Vercel, `https://ezil-os.vercel.app`. `os.ezil.work` is the
-  **canonical host once the cutover lands** — Vercel project domain,
-  unproxied DNS `A` record, and the Supabase redirect allowlist (row `N1`) —
-  and it is **PENDING**, not live: `dig +short os.ezil.work` returns nothing
-  today. Do not treat it as reachable until `N1` is recorded done.
+- **App**: Vercel project `ezil-os`, canonical at `https://os.ezil.org`.
+  - The host is a Vercel project domain behind a **DNS-only** (grey-cloud)
+    record in the Cloudflare `ezil.org` zone. It must stay unproxied: the zone
+    has a `*.ezil.org/*` Worker route, and the hand-deployed landing Worker
+    `ezil-os-landing` still holds the route `os.ezil.org/*`. Re-proxying the
+    record brings that landing page back, which is also the DNS rollback.
+  - `ezil-os.vercel.app` stays a production alias of the same deployment; CI
+    verifies both (`e2e/verify-cloud-deployment.mjs`).
+  - Sign-in is Supabase (`btgqfmnzycdecmeyqubx`, shared with `app.ezil.work`
+    and `id.ezil.work`). Google is brokered by Supabase, so the Google client's
+    only redirect URI is `https://btgqfmnzycdecmeyqubx.supabase.co/auth/v1/callback`.
+    The Supabase Redirect URLs list carries `https://os.ezil.org/auth/**` and
+    `https://ezil-os.vercel.app/auth/**`. The glob is required because GoTrue
+    matches the full `redirect_to`, query string included, and a miss falls
+    back to the project's Site URL (`id.ezil.work`).
+  - `EZIL_OS_ACCESS_MODE=open` in Production: the first Google sign-in creates
+    the account. `os.ezil.work`, the host planned earlier, was never cut over.
 - **Worker**: Cloudflare, `https://api-desktop.ezil.org`.
 - **Container images**: built and pushed to GHCR by
   [`.github/workflows/image.yml`](../.github/workflows/image.yml) — a keyless
@@ -331,7 +343,7 @@ To force a drain between daily runs, without waiting for the cron:
 
 ```sh
 curl -sS -H "Authorization: Bearer $CRON_SECRET" \
-  https://ezil-os.vercel.app/api/cron/telemetry-drain | jq
+  https://os.ezil.org/api/cron/telemetry-drain | jq
 ```
 
 A healthy response is `{"ok":true,"result":{... "drainFailures":0 ...}}`.

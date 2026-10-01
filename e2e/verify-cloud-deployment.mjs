@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
+import { canonical, legacyAlias } from '../.github/scripts/release-state.mjs';
+
 function required(env, key) {
   assert.ok(env[key], `${key} is required`);
   return env[key];
@@ -89,14 +91,18 @@ export async function verifyCloudDeployment(env = process.env, fetchImpl = fetch
     result.url = app.origin;
     if (target === 'production') {
       assert.equal(workerURL.origin, 'https://api-desktop.ezil.org', 'Unexpected production Worker URL');
-      const aliasURL = new URL('https://api.vercel.com/v13/deployments/ezil-os.vercel.app');
-      aliasURL.searchParams.set('teamId', team);
-      const alias = await request(aliasURL, { authorization: `Bearer ${env.VERCEL_TOKEN}` });
-      const aliasId = assertVercelDeployment(alias, {
-        sha, app: app.origin, project: env.VERCEL_PROJECT_ID, target,
-      });
-      assert.equal(aliasId, result.vercel_deployment, 'Canonical alias points at another deployment');
-      result.canonical_url = 'https://ezil-os.vercel.app';
+      // Both production aliases must serve exactly the deployment just made:
+      // the public host and the legacy Vercel alias kept during the move.
+      for (const origin of [canonical, legacyAlias]) {
+        const aliasURL = new URL(`https://api.vercel.com/v13/deployments/${new URL(origin).hostname}`);
+        aliasURL.searchParams.set('teamId', team);
+        const alias = await request(aliasURL, { authorization: `Bearer ${env.VERCEL_TOKEN}` });
+        const aliasId = assertVercelDeployment(alias, {
+          sha, app: app.origin, project: env.VERCEL_PROJECT_ID, target,
+        });
+        assert.equal(aliasId, result.vercel_deployment, `${origin} points at another deployment`);
+      }
+      result.canonical_url = canonical;
     }
   }
   return result;

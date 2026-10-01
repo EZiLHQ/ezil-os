@@ -36,7 +36,7 @@ try { ({ chromium } = await import('playwright')); } catch {
 }
 if (!chromium) { console.error('playwright is required. SKIPPING (exit 2).'); process.exit(2); }
 
-const APP   = process.env.EZIL_E2E_APP   ?? 'https://ezil-os.vercel.app';
+const APP   = process.env.EZIL_E2E_APP   ?? 'https://os.ezil.org';
 // 🔴 NO CREDENTIAL DEFAULTS. This suite signs in to the LIVE deployment, so a
 // hardcoded fallback here is a working production account published in a
 // public repository. Absent config is "could not run" (exit 2), never a pass

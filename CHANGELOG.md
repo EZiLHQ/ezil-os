@@ -28,6 +28,14 @@ did not. See [`docs/RELEASE.md`](docs/RELEASE.md) for the full mechanics.
   Internal CI produces an ad-hoc-signed DMG, while releases still require
   Developer ID signing, notarization, stapling, checksums, and provenance.
 
+### Changed
+
+- **The hosted product moves to `https://os.ezil.org`, with Google sign-up
+  open to everyone.** CI now verifies `os.ezil.org` as the canonical
+  production host, and `ezil-os.vercel.app` as a legacy alias of the same
+  deployment. Invite links default to `os.ezil.org`. Deployments that do not
+  set `EZIL_OS_ACCESS_MODE` stay invite-only.
+
 ## [0.2.0] - 2026-09-04
 
 Local mode, three-OS CI, signed GHCR images, invite-only access, and the
