@@ -716,6 +716,9 @@ function close_start_menu () {
  * (`app/src/utils/request-origin.ts`) requires of any POST.
  */
 function sign_out () {
+    // The session ends while this document is still unloading, so the pagehide
+    // flush would be refused. Send the buffer now, with the session attached.
+    telemetry.flushNow();
     const form = document.createElement('form');
     form.method = 'POST';
     form.action = '/auth/signout';

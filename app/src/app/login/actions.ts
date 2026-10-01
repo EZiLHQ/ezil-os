@@ -4,6 +4,7 @@ import { redirect } from 'next/navigation';
 import { headers } from 'next/headers';
 
 import { Routes, safeReturnUrl } from '@/utils/constants';
+import { forwardedHost, forwardedProto } from '@/utils/forwarded';
 import { createClient } from '@/utils/supabase/server';
 
 export interface AuthActionResult {
@@ -23,9 +24,7 @@ export interface AuthActionResult {
 /** Resolves the site origin for OAuth/email redirect targets. */
 async function siteOrigin(): Promise<string> {
     const h = await headers();
-    const proto = h.get('x-forwarded-proto') ?? 'http';
-    const host = h.get('x-forwarded-host') ?? h.get('host') ?? 'localhost:3000';
-    return `${proto}://${host}`;
+    return `${forwardedProto(h) ?? 'http'}://${forwardedHost(h) ?? 'localhost:3000'}`;
 }
 
 /**
@@ -126,10 +125,4 @@ export async function signInWithGoogle(returnUrl: string): Promise<never> {
     }
 
     redirect(data.url);
-}
-
-export async function signOut(): Promise<never> {
-    const supabase = await createClient();
-    await supabase.auth.signOut();
-    redirect(Routes.LOGIN);
 }

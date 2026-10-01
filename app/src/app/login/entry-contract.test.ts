@@ -197,7 +197,6 @@ describe('there is no way to create an account from the app', () => {
         // because the file failed to load.
         expect(actions).toMatch(/export async function signInWithPassword\(/);
         expect(actions).toMatch(/export async function signInWithGoogle\(/);
-        expect(actions).toMatch(/export async function signOut\(/);
     });
 
     it('the form has no sign-up mode, toggle or new-password branch', () => {

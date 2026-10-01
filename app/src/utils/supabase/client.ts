@@ -15,6 +15,10 @@ import { authCookieOptions } from './cookie-options';
  */
 export function createClient() {
     return createBrowserClient(env.NEXT_PUBLIC_SUPABASE_URL, env.NEXT_PUBLIC_SUPABASE_ANON_KEY, {
-        cookieOptions: authCookieOptions(window.location.protocol === 'https:'),
+        // Client components also render on the server, where there is no
+        // `window`; nothing there reads cookies through this client.
+        cookieOptions: authCookieOptions(
+            typeof window !== 'undefined' && window.location.protocol === 'https:',
+        ),
     });
 }

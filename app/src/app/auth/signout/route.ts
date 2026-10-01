@@ -1,20 +1,20 @@
 import { type NextRequest, NextResponse } from 'next/server';
 
 import { Routes } from '@/utils/constants';
-import { SECURE_AUTH_COOKIE_NAME } from '@/utils/supabase/cookie-options';
+import { isLegacyAuthCookie, SECURE_AUTH_COOKIE_NAME } from '@/utils/supabase/cookie-options';
 import { createClient } from '@/utils/supabase/server';
 
 /**
  * The session's cookies: the `__Host-` name used on HTTPS and its chunks, or
  * the library default (`sb-<ref>-auth-token`, chunked) used on loopback HTTP.
  */
-const isAuthCookie = (name: string) =>
-    name.startsWith(SECURE_AUTH_COOKIE_NAME) || /^sb-[a-z0-9]+-auth-token/.test(name);
+const isAuthCookie = (name: string) => name.startsWith(SECURE_AUTH_COOKIE_NAME) || isLegacyAuthCookie(name);
 
 /**
  * `POST /auth/signout` — ends the session and lands on `/login`.
  *
- * The OS shell's Start menu posts a plain HTML form here. It is a ROUTE
+ * The OS shell's Start menu and the `/login` not-invited panel both post a
+ * plain HTML form here — there is exactly one way to sign out. It is a ROUTE
  * HANDLER rather than the `signOut` server action because the shell is not a
  * React tree: it cannot call a server action, and a form POST answered with a
  * 303 is a real document load the browser follows by itself (the same reason

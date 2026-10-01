@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import { authCookieOptions, isHttpsRequest, SECURE_AUTH_COOKIE_NAME } from './cookie-options';
+import { authCookieOptions, isHttpsRequest, isLegacyAuthCookie, SECURE_AUTH_COOKIE_NAME } from './cookie-options';
 
 describe('authCookieOptions', () => {
     it('🔴 on HTTPS the session cookie is a __Host- cookie: Secure, Path=/, no Domain', () => {
@@ -39,6 +39,39 @@ describe('isHttpsRequest', () => {
 
     it('treats a missing header as a direct local connection', () => {
         expect(isHttpsRequest(h())).toBe(false);
+    });
+});
+
+describe('isLegacyAuthCookie', () => {
+    it('matches the library-default session cookie, its chunks and its PKCE verifier', () => {
+        for (const name of [
+            'sb-btgqfmnzycdecmeyqubx-auth-token',
+            'sb-btgqfmnzycdecmeyqubx-auth-token.0',
+            'sb-btgqfmnzycdecmeyqubx-auth-token.12',
+            'sb-btgqfmnzycdecmeyqubx-auth-token-code-verifier',
+        ]) {
+            expect(isLegacyAuthCookie(name)).toBe(true);
+        }
+    });
+
+    it('never matches the current cookie or unrelated ones', () => {
+        for (const name of [SECURE_AUTH_COOKIE_NAME, `${SECURE_AUTH_COOKIE_NAME}.0`, 'theme', 'sb-x-auth-token-extra', 'xsb-a-auth-token']) {
+            expect(isLegacyAuthCookie(name)).toBe(false);
+        }
+    });
+});
+
+describe('the middleware expires stranded default-named cookies on HTTPS', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const middleware = readFileSync(path.join(here, 'middleware.ts'), 'utf8');
+
+    it('only on HTTPS, only legacy names, with maxAge 0', () => {
+        expect(middleware).toMatch(/if \(secure\) \{\s*for \(const \{ name \} of request\.cookies\.getAll\(\)\) \{\s*if \(isLegacyAuthCookie\(name\)\) response\.cookies\.set\(name, '', \{ path: '\/', maxAge: 0 \}\);/);
+    });
+
+    it('decides HTTPS exactly as the server client does', () => {
+        expect(middleware).toMatch(/const secure = isHttpsRequest\(request\.headers\);/);
+        expect(middleware).not.toMatch(/nextUrl\.protocol/);
     });
 });
 

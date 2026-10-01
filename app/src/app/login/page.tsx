@@ -3,7 +3,6 @@ import Link from 'next/link';
 import { env } from '@/env';
 import { OS_ACCESS_NOT_INVITED } from '@/server/api/os-access';
 import { MAX_COMPUTERS_PER_USER, RETURN_URL_PARAM, Routes, safeReturnUrl } from '@/utils/constants';
-import { signOut } from './actions';
 import { DesktopVisual } from './desktop-visual';
 import { LoginForm } from './login-form';
 
@@ -69,9 +68,10 @@ export default async function LoginPage({
                     <div className="space-y-8">
                         <div className="space-y-4">
                             <h2 className="text-title2 leading-tight text-offwhite">
-                                {openSignup ? 'Sign in or create your account' : 'Sign in to open your computer'}
+                                Sign in to open your computer
                             </h2>
                             <p className="text-regular text-gray-400">
+                                {openSignup && 'New here? Continue with Google and your account is created on the way in. '}
                                 One account, up to {MAX_COMPUTERS_PER_USER} computers — open an existing
                                 one or start a new one.
                             </p>
@@ -109,9 +109,10 @@ export default async function LoginPage({
  *
  * 🔴 SIGN OUT IS NOT DECORATION. A refused visitor holds a valid session; with
  * no way to drop it, every route they try refuses them and the only exit is
- * clearing cookies by hand. `signOut()` is a server action that ends the
- * session and redirects to this page with no `error` param, where the sign-in
- * form renders again — so it is also the "wrong account" escape hatch.
+ * clearing cookies by hand. The form posts to `POST /auth/signout` — the same
+ * route the OS Start menu uses — which ends the session and answers with a 303
+ * to this page with no `error` param, where the sign-in form renders again; so
+ * it is also the "wrong account" escape hatch.
  */
 function NotInvited() {
     return (
@@ -126,7 +127,7 @@ function NotInvited() {
                     you have another account, sign out and try that one.
                 </p>
             </div>
-            <form action={signOut}>
+            <form action="/auth/signout" method="post">
                 <button
                     type="submit"
                     className="w-full rounded-md border border-white/15 bg-white/5 px-4 py-2.5 text-sm font-medium text-offwhite transition-colors hover:bg-white/10"

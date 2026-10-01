@@ -3,7 +3,7 @@ import { NextResponse, type NextRequest } from 'next/server';
 
 import { env } from '@/env';
 
-import { authCookieOptions, isHttpsRequest } from './cookie-options';
+import { authCookieOptions, isHttpsRequest, isLegacyAuthCookie } from './cookie-options';
 
 /**
  * Refreshes the Supabase auth session cookie on every request. This is the
@@ -26,14 +26,13 @@ export async function updateSession(request: NextRequest) {
     requestHeaders.set('x-pathname', request.nextUrl.pathname);
 
     let response = NextResponse.next({ request: { headers: requestHeaders } });
+    const secure = isHttpsRequest(request.headers);
 
     const supabase = createServerClient(
         env.NEXT_PUBLIC_SUPABASE_URL,
         env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
         {
-            cookieOptions: authCookieOptions(
-                isHttpsRequest(request.headers) || request.nextUrl.protocol === 'https:',
-            ),
+            cookieOptions: authCookieOptions(secure),
             cookies: {
                 getAll() {
                     return request.cookies.getAll();
@@ -76,6 +75,16 @@ export async function updateSession(request: NextRequest) {
     // `getSession()` on the server is about TRUSTING the user object it
     // returns; nothing here reads it, and no access decision is made from it.
     await supabase.auth.getSession();
+
+    // On HTTPS the session moved to a `__Host-` cookie. Expire the old
+    // default-named ones a browser still carries from before: nothing reads
+    // them any more, they hold a refresh token, and they add ~4 KB to every
+    // request. Runs once per browser in practice — the next request has none.
+    if (secure) {
+        for (const { name } of request.cookies.getAll()) {
+            if (isLegacyAuthCookie(name)) response.cookies.set(name, '', { path: '/', maxAge: 0 });
+        }
+    }
 
     return response;
 }

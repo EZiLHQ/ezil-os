@@ -115,7 +115,7 @@ export function LoginForm({ returnUrl, openSignup }: { returnUrl: string; openSi
 
             <p className="text-small text-gray-400">
                 {openSignup
-                    ? 'New to EZiL OS? Continue with Google and your account is created on the way in.'
+                    ? 'Email and password work for existing accounts. New accounts start with Continue with Google.'
                     : 'EZiL OS is invite-only. If you do not have an account yet, ask a maintainer for an invitation.'}
             </p>
         </div>

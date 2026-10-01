@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { isCrossOriginWrite } from './request-origin';
+import { isCrossOriginWrite, isDocumentNavigation } from './request-origin';
 
 const req = (method: string, headers: Record<string, string>) => ({
     method,
@@ -64,6 +64,26 @@ describe('isCrossOriginWrite', () => {
             expect(isCrossOriginWrite(req('POST', { origin: 'null', host: 'os.ezil.org' }))).toBe(true);
         });
 
+        it('ignores a default port the proxy left on the Host header', () => {
+            expect(
+                isCrossOriginWrite(
+                    req('POST', { origin: 'https://os.ezil.org', host: 'os.ezil.org:443', 'x-forwarded-proto': 'https' }),
+                ),
+            ).toBe(false);
+        });
+
+        it('refuses the same host on another scheme (http:// is a different origin)', () => {
+            expect(
+                isCrossOriginWrite(
+                    req('POST', { origin: 'http://os.ezil.org', host: 'os.ezil.org', 'x-forwarded-proto': 'https' }),
+                ),
+            ).toBe(true);
+        });
+
+        it('refuses a non-web scheme', () => {
+            expect(isCrossOriginWrite(req('POST', { origin: 'chrome-extension://abc', host: 'os.ezil.org' }))).toBe(true);
+        });
+
         it('refuses when there is an Origin but no host to compare it with', () => {
             expect(isCrossOriginWrite(req('POST', { origin: 'https://os.ezil.org' }))).toBe(true);
         });
@@ -73,5 +93,17 @@ describe('isCrossOriginWrite', () => {
         // The SDK, the MCP connector, crons and webhooks authenticate with a
         // bearer or a secret of their own, which a hostile page cannot attach.
         expect(isCrossOriginWrite(req('POST', { authorization: 'Bearer token', host: 'os.ezil.org' }))).toBe(false);
+    });
+});
+
+describe('isDocumentNavigation', () => {
+    it('recognises a top-level page load', () => {
+        expect(isDocumentNavigation(req('POST', { 'sec-fetch-mode': 'navigate' }))).toBe(true);
+        expect(isDocumentNavigation(req('POST', { accept: 'text/html,application/xhtml+xml' }))).toBe(true);
+    });
+
+    it('treats fetch/XHR as an API call', () => {
+        expect(isDocumentNavigation(req('POST', { 'sec-fetch-mode': 'cors', accept: 'application/json' }))).toBe(false);
+        expect(isDocumentNavigation(req('POST', {}))).toBe(false);
     });
 });

@@ -154,7 +154,7 @@ describe('🔴 the refusal chain terminates at /login', () => {
         expect(body).toMatch(/invite-only/);
         // 🔴 A refused user holds a VALID session. Without this they cannot
         // leave, and every route they try refuses them.
-        expect(body).toMatch(/<form action=\{signOut\}>/);
+        expect(body).toMatch(/<form action="\/auth\/signout" method="post">/);
     });
 
     it('the constant the pages redirect with is the one the gate throws', () => {
@@ -225,7 +225,10 @@ describe('the sign-in copy follows EZIL_OS_ACCESS_MODE', () => {
     });
 
     it('open mode tells a newcomer that Google creates the account; invite mode keeps the invitation note', () => {
-        expect(loginForm).toMatch(/openSignup\s*\?\s*'New to EZiL OS\? Continue with Google/);
+        expect(code(loginPage)).toMatch(/openSignup && 'New here\? Continue with Google and your account is created/);
+        // The email form cannot create accounts; in open mode it must say so
+        // rather than let a newcomer type a fresh password into it.
+        expect(loginForm).toMatch(/openSignup\s*\?\s*'Email and password work for existing accounts\./);
         expect(loginForm).toMatch(/EZiL OS is invite-only\./);
     });
 

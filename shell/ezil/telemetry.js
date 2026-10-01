@@ -694,4 +694,13 @@ if ( typeof document !== 'undefined' && typeof document.addEventListener === 'fu
 // exported for a test harness that wants to (re-)arm it explicitly.
 installGlobalHandlers();
 
-export default { capture, installGlobalHandlers, recentEvents, redact, SITES };
+/**
+ * Sends whatever is buffered now, synchronously queued (`sendBeacon`). For a
+ * caller that is about to end the session — after that, the unload flush would
+ * go out without a session and be refused.
+ */
+export function flushNow () {
+    flush();
+}
+
+export default { capture, flushNow, installGlobalHandlers, recentEvents, redact, SITES };
