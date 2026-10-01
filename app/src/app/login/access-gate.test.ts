@@ -215,3 +215,23 @@ describe('the invite CLI points at a page that exists', () => {
         );
     });
 });
+
+describe('the sign-in copy follows EZIL_OS_ACCESS_MODE', () => {
+    const loginForm = read('./login-form.tsx');
+
+    it('the page derives `openSignup` from the access mode, not from anything the visitor sends', () => {
+        expect(code(loginPage)).toMatch(/const openSignup = env\.EZIL_OS_ACCESS_MODE === 'open';/);
+        expect(code(loginPage)).toMatch(/<LoginForm returnUrl=\{returnUrl\} openSignup=\{openSignup\} \/>/);
+    });
+
+    it('open mode tells a newcomer that Google creates the account; invite mode keeps the invitation note', () => {
+        expect(loginForm).toMatch(/openSignup\s*\?\s*'New to EZiL OS\? Continue with Google/);
+        expect(loginForm).toMatch(/EZiL OS is invite-only\./);
+    });
+
+    it('opening sign-up adds no sign-up call: accounts still come only from Supabase', () => {
+        // Pinned in full by `./entry-contract.test.ts`; restated here because
+        // this is the file a future "add a Create account button" edit touches.
+        expect(code(loginForm)).not.toMatch(/auth\.signUp\(/);
+    });
+});

@@ -3,6 +3,8 @@ import { NextResponse, type NextRequest } from 'next/server';
 
 import { env } from '@/env';
 
+import { authCookieOptions, isHttpsRequest } from './cookie-options';
+
 /**
  * Refreshes the Supabase auth session cookie on every request. This is the
  * standard Supabase SSR recipe for Next.js middleware: Server Components
@@ -29,6 +31,9 @@ export async function updateSession(request: NextRequest) {
         env.NEXT_PUBLIC_SUPABASE_URL,
         env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
         {
+            cookieOptions: authCookieOptions(
+                isHttpsRequest(request.headers) || request.nextUrl.protocol === 'https:',
+            ),
             cookies: {
                 getAll() {
                     return request.cookies.getAll();

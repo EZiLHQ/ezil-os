@@ -8,14 +8,16 @@ const initialState: AuthActionResult = {};
 
 /**
  * Sign IN only. There is no sign-up mode, no "Create account" toggle and no
- * `new-password` branch: EZiL OS is invite-only, accounts are created by
- * `bun tools/invite.ts add <email>`, and an invited user sets their password
- * on `/auth/invited`. See `actions.ts` and `entry-contract.test.ts`.
+ * `new-password` branch. See `actions.ts` and `entry-contract.test.ts`.
  *
- * Google sign-in stays: an allow-listed address may well be a Google account,
- * and the allow-list is keyed on the email either way.
+ * How an account comes to exist depends on `EZIL_OS_ACCESS_MODE`:
+ *   - `open` (`openSignup`): the first "Continue with Google" creates it. That
+ *     happens inside Supabase's OAuth flow, not through any sign-up call here.
+ *   - `invite`: `bun tools/invite.ts add <email>` creates it, and the invited
+ *     user sets a password on `/auth/invited` or uses Google with the same
+ *     address — the allow-list is keyed on the email either way.
  */
-export function LoginForm({ returnUrl }: { returnUrl: string }) {
+export function LoginForm({ returnUrl, openSignup }: { returnUrl: string; openSignup: boolean }) {
     /** Set once we have started leaving; keeps the button from re-arming. */
     const [leaving, setLeaving] = useState(false);
 
@@ -112,8 +114,9 @@ export function LoginForm({ returnUrl }: { returnUrl: string }) {
             </form>
 
             <p className="text-small text-gray-400">
-                EZiL OS is invite-only. If you do not have an account yet, ask a maintainer for an
-                invitation.
+                {openSignup
+                    ? 'New to EZiL OS? Continue with Google and your account is created on the way in.'
+                    : 'EZiL OS is invite-only. If you do not have an account yet, ask a maintainer for an invitation.'}
             </p>
         </div>
     );

@@ -1,5 +1,6 @@
 import Link from 'next/link';
 
+import { env } from '@/env';
 import { OS_ACCESS_NOT_INVITED } from '@/server/api/os-access';
 import { MAX_COMPUTERS_PER_USER, RETURN_URL_PARAM, Routes, safeReturnUrl } from '@/utils/constants';
 import { signOut } from './actions';
@@ -47,6 +48,9 @@ export default async function LoginPage({
     // redirect with, so a rename cannot half-land.
     const notInvited =
         (Array.isArray(error) ? error[0] : error) === OS_ACCESS_NOT_INVITED;
+    // In `open` mode a first Google sign-in creates the account, so the page
+    // says so; in `invite` mode it explains how to get in instead.
+    const openSignup = env.EZIL_OS_ACCESS_MODE === 'open';
 
     return (
         <div className="flex h-screen w-screen justify-center bg-black">
@@ -65,14 +69,14 @@ export default async function LoginPage({
                     <div className="space-y-8">
                         <div className="space-y-4">
                             <h2 className="text-title2 leading-tight text-offwhite">
-                                Sign in to open your computer
+                                {openSignup ? 'Sign in or create your account' : 'Sign in to open your computer'}
                             </h2>
                             <p className="text-regular text-gray-400">
                                 One account, up to {MAX_COMPUTERS_PER_USER} computers — open an existing
                                 one or start a new one.
                             </p>
                         </div>
-                        <LoginForm returnUrl={returnUrl} />
+                        <LoginForm returnUrl={returnUrl} openSignup={openSignup} />
                     </div>
                 )}
                 <p className="text-small text-gray-400">

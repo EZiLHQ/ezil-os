@@ -1,5 +1,6 @@
-import { type NextRequest } from 'next/server';
+import { NextResponse, type NextRequest } from 'next/server';
 
+import { isCrossOriginWrite } from '@/utils/request-origin';
 import { updateSession } from '@/utils/supabase/middleware';
 
 /**
@@ -9,6 +10,10 @@ import { updateSession } from '@/utils/supabase/middleware';
  * convention is deprecated" build warning.
  */
 export async function proxy(request: NextRequest) {
+    // Before the session is touched: a refused request must not refresh it.
+    if (isCrossOriginWrite(request)) {
+        return NextResponse.json({ error: 'cross_origin_request_refused' }, { status: 403 });
+    }
     return updateSession(request);
 }
 
