@@ -422,6 +422,14 @@ describe('CONTAINER_BUSY_LOAD1', () => {
   });
 });
 
+describe('busy-probe shutdown grace', () => {
+  it('is bounded and anchored to genuine activity rather than repeated probes', () => {
+    expect(src).toContain('const CONTAINER_BUSY_GRACE_MS = 5 * 60_000;');
+    expect(src).toContain('idleMs < IDLE_STOP_MS + CONTAINER_BUSY_GRACE_MS');
+    expect(src).not.toContain('busySince');
+  });
+});
+
 describe('probeContainerBusy: the I/O half fails safe', () => {
   const method = between(
     'private async probeContainerBusy(): Promise<{ busy: boolean; detail: string }> {',
@@ -527,18 +535,18 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
   it('🔴 a BUSY container returns without stopping, without flushing, and without destroying', () => {
     // Scope to the busy branch alone, so this cannot pass just because the
     // (correct) not-busy path further down does the right thing.
-    const busyBranch = between('if (busy.busy) {', "// Trigger stays `'alarm'`");
+    const busyBranch = between('if (busy.busy && idleMs < IDLE_STOP_MS + CONTAINER_BUSY_GRACE_MS) {', "// Trigger stays `'alarm'`");
     expect(busyBranch).not.toContain('this.stop()');
     expect(busyBranch).not.toContain('destroy()');
     expect(busyBranch).not.toContain('runWorkspaceFlush');
     expect(busyBranch).toContain('return;');
-    // Mutation-proven: deleted the `if (busy.busy) { ... return; }` block
+    // Mutation-proven: deleted the busy-and-within-grace block
     // entirely — this whole test threw on its missing start marker, and the
     // "probes before the flush" test above went red too. Restored.
   });
 
   it('a BUSY container resets to the BASE interval and re-asks next cycle, rather than backing off', () => {
-    const busyBranch = between('if (busy.busy) {', "// Trigger stays `'alarm'`");
+    const busyBranch = between('if (busy.busy && idleMs < IDLE_STOP_MS + CONTAINER_BUSY_GRACE_MS) {', "// Trigger stays `'alarm'`");
     expect(busyBranch).toContain('await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK)');
     // Persisted too, or `nextFlushRescheduleSeconds` would resume the ladder
     // from the stale rung the moment the container goes quiet again.
@@ -548,7 +556,7 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
   });
 
   it('a BUSY container is NOT marked as a stopped loop (the alarm must keep running to re-ask)', () => {
-    const busyBranch = between('if (busy.busy) {', "// Trigger stays `'alarm'`");
+    const busyBranch = between('if (busy.busy && idleMs < IDLE_STOP_MS + CONTAINER_BUSY_GRACE_MS) {', "// Trigger stays `'alarm'`");
     // With liveness derived from the scheduler, "the loop is still running" is
     // now expressed by the reschedule itself, so THAT is what this pins. A
     // busy container that failed to reschedule would silently stop being
@@ -558,7 +566,7 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
   });
 
   it('a BUSY container is not tombstoned either — busy is not termination', () => {
-    const busyBranch = between('if (busy.busy) {', "// Trigger stays `'alarm'`");
+    const busyBranch = between('if (busy.busy && idleMs < IDLE_STOP_MS + CONTAINER_BUSY_GRACE_MS) {', "// Trigger stays `'alarm'`");
     expect(busyBranch).not.toContain('storage.put(WORKSPACE_TERMINATED_KEY');
   });
 
@@ -576,8 +584,8 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
 
   it('the observed load figure is logged on BOTH the busy and the stop path', () => {
     // Without this an operator cannot distinguish "genuinely quiet" from
-    // "/proc/loadavg is reporting the host, so we answer BUSY forever and
-    // silently never idle-stop again" — see CONTAINER_BUSY_LOAD1's
+    // "/proc/loadavg is reporting the host, so the bounded grace is active"
+    // — see CONTAINER_BUSY_LOAD1's
     // "Retuning it".
     const idleBranch = between(
       'if (isIdleStopDue({ lastActivityAt, now })) {',
