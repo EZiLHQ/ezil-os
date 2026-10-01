@@ -2,11 +2,14 @@ import Link from 'next/link';
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 
+import { env } from '@/env';
 import { appRouter } from '@/server/api/root';
 import { OS_ACCESS_NOT_INVITED } from '@/server/api/os-access';
 import { createTRPCContext } from '@/server/api/trpc';
+import { EZIL_ACCOUNT_REFRESHED_PARAM, ezilAccountStepForOsPage, parseWorksApiOrigin } from '@/server/lib/ezil-account';
 import { bootPayloadScript, buildShellBootPayload } from '@/server/shell/boot-payload';
 import { Routes, getReturnUrlQueryParam } from '@/utils/constants';
+import { createClient } from '@/utils/supabase/server';
 import { BootWatchdog } from './boot-watchdog';
 import { HydrationSignal } from './hydration-signal';
 
@@ -102,7 +105,11 @@ export const metadata = {
 /** Never prerender or cache: the payload is per-user and can create a row. */
 export const dynamic = 'force-dynamic';
 
-export default async function Page() {
+export default async function Page({
+    searchParams,
+}: {
+    searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
     // The tRPC context is built here rather than reusing `src/trpc/server.ts`'s
     // `api` for one reason: this page needs the resolved user for the payload
     // AND for the auth gate, and `createTRPCContext` has already resolved it.
@@ -146,6 +153,27 @@ export default async function Page() {
     }
 
     const user = ctx.user;
+
+    /*
+     * "Create a user, then authenticate": an invited OS user has no EZiL
+     * account, so EZiL AI (ai.ezil.work) and Works refuse their token. On the
+     * first load, Works `POST /account` gives this sign-in one (role
+     * `builder`), with the user's own token and no service role here; then a
+     * Route Handler refreshes the session so the token carries the role. See
+     * `@/server/lib/ezil-account.ts`. Costs nothing for a user who already has
+     * the claim (a local decode of the cookie's token). After the access gate
+     * on purpose: only someone allowed into the OS is adopted.
+     */
+    const session = (await (await createClient()).auth.getSession()).data.session;
+    const accountStep = await ezilAccountStepForOsPage({
+        userId: user.id,
+        accessToken: session?.access_token ?? null,
+        userAppMetadata: user.app_metadata,
+        worksApiOrigin: parseWorksApiOrigin(env.EZIL_WORKS_API_ORIGIN),
+        refreshedMarker: (await searchParams)[EZIL_ACCOUNT_REFRESHED_PARAM],
+    });
+    if (accountStep.redirectTo) redirect(accountStep.redirectTo);
+
     const caller = appRouter.createCaller(ctx);
 
     // Concurrently, and neither touches a container: `getOrCreateDefault` is
