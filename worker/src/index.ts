@@ -1873,6 +1873,16 @@ const WORKSPACE_FLUSH_INTERVAL_SECONDS = 10;
 const IDLE_STOP_MS = 10 * 60_000;
 
 /**
+ * Maximum extra time a busy probe may defer an otherwise-due idle stop.
+ *
+ * `/proc/loadavg` is not guaranteed to be container-scoped (and is known to
+ * include sibling work in some runtimes), so it is only a hint that protects
+ * a recently-started build, never an unbounded shutdown veto. Deriving the
+ * deadline from genuine activity also means repeated probes cannot extend it.
+ */
+const CONTAINER_BUSY_GRACE_MS = 5 * 60_000;
+
+/**
  * The reschedule-interval ladder `computeNextFlushBackoffSeconds` steps
  * through. `[0]` (10s, == `WORKSPACE_FLUSH_INTERVAL_SECONDS`) is also the
  * value every cycle resets to the moment either a file actually changed or
@@ -2026,8 +2036,8 @@ const LOADAVG_PROBE_COMMAND = 'cat /proc/loadavg';
  * ── Residual risk, stated ───────────────────────────────────────────────────
  * A container left showing ANIMATED content raises (B) — the encoder has real
  * frames to compress — and could sit above 0.50 with nobody there. That fails
- * in the safe direction (money, not work) and the platform's own `SLEEP_AFTER`
- * still collects it.
+ * in the safe direction (money, not work) until
+ * `CONTAINER_BUSY_GRACE_MS` expires and the explicit idle stop proceeds.
  *
  * ── Retuning it ─────────────────────────────────────────────────────────────
  * `EZIL_NEKO_CPU_DIAG_ENABLED=1` makes `scripts/start-neko.sh` sample real
@@ -2037,10 +2047,10 @@ const LOADAVG_PROBE_COMMAND = 'cat /proc/loadavg';
  * to re-measure with if the image's resident set ever changes; it is also how
  * to check the one thing the bench CANNOT: whether Cloudflare's container
  * runtime namespaces `/proc/loadavg` at all. If it does not, this probe reads
- * the neighbours' load, always answers BUSY, and idle-stop silently stops
- * happening — which is why `containerBusyFromProbe` returns the observed
- * figure and `flushWorkspaceScheduled` logs it on EVERY probe, stop or no
- * stop.
+ * the neighbours' load and may answer BUSY, which is why
+ * `containerBusyFromProbe` returns the observed figure and
+ * `flushWorkspaceScheduled` logs it on EVERY probe. The bounded grace above
+ * ensures that this uncertainty can only delay, never disable, idle-stop.
  */
 const CONTAINER_BUSY_LOAD1 = 0.5;
 
@@ -2077,10 +2087,9 @@ export function parseLoadAvg1(stdout: string): number | null {
  * did not parse. Only an actual number, actually below
  * {@link CONTAINER_BUSY_LOAD1}, is allowed to authorize stopping a container.
  *
- * The asymmetry is deliberate and is the contract: a container that lingers
- * costs money and the platform's own `SLEEP_AFTER` backstop eventually
- * collects it; a container stopped mid-build costs the user work that cannot
- * be recovered.
+ * This verdict is only a hint. The caller bounds how long it may defer a stop
+ * with {@link CONTAINER_BUSY_GRACE_MS}; neither shared-host load nor a broken
+ * probe can keep a sandbox alive indefinitely.
  *
  * Returns the observed figure alongside the verdict so the caller can log
  * what it actually saw — the only way an operator can tell "genuinely idle"
@@ -2581,10 +2590,14 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // resurrect a stopped one. Runs ONLY on this branch, so a present user
       // never pays for it.
       const busy = await this.probeContainerBusy();
-      if (busy.busy) {
+      const idleMs = now - lastActivityAt;
+      // `/proc/loadavg` can include sibling containers. It may protect work
+      // briefly, but its deadline is anchored to genuine user activity so
+      // repeated execs (or hostile neighbouring load) cannot renew the veto.
+      if (busy.busy && idleMs < IDLE_STOP_MS + CONTAINER_BUSY_GRACE_MS) {
         bootLog('workspace_flush', 'end', {
           status: 'skipped',
-          detail: `idle_but_busy,${busy.detail},idleMs=${now - lastActivityAt}`,
+          detail: `idle_but_busy,${busy.detail},idleMs=${idleMs},busyGraceMs=${CONTAINER_BUSY_GRACE_MS}`,
         });
         // Back to the base interval — this sandbox is no longer "nothing is
         // happening", so stop treating it as such, and re-ask promptly rather
@@ -2609,7 +2622,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       if (outcome.ok) {
         bootLog('workspace_flush', 'end', {
           status: 'ok',
-          detail: `idle_stop,${busy.detail},idleMs=${now - lastActivityAt}`,
+          detail: `idle_stop,${busy.detail},idleMs=${idleMs}`,
         });
         // A NEW, separate state from `WORKSPACE_TERMINATED_KEY` — deliberately
         // NOT written here. See that key's doc comment: the next
