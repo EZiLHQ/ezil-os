@@ -251,3 +251,79 @@ test('requestForLog shortens base64 payloads', () => {
     expect(text).toContain('data:image/png;base64,<omitted>');
     expect(text.length).toBeLessThan(400);
 });
+
+describe('ezil-gateway through the VS Code bridge (mock EZiL AI proxy)', () => {
+    const PROXY = 'q'.repeat(64);
+    const seen: { path: string; auth: string | null; key: string | null; body?: Record<string, unknown> }[] = [];
+    let server: ReturnType<typeof Bun.serve>;
+    let gatewayConfig: ResolvedConfig;
+    let gatewayProvider: InstanceType<typeof EZiLModelsProvider>;
+    const gatewayLogs: string[] = [];
+    beforeAll(() => {
+        server = Bun.serve({
+            port: 0,
+            async fetch(request) {
+                const url = new URL(request.url);
+                const entry: (typeof seen)[number] = { path: url.pathname, auth: request.headers.get('authorization'), key: request.headers.get('idempotency-key') };
+                seen.push(entry);
+                if (url.pathname === '/ai/v1/models') return Response.json({ object: 'list', killswitch: false, pause: null, data: [{ id: 'ezil-code', enabled: true, max_input_tokens: 16384, max_output_tokens: 4096 }] });
+                entry.body = await request.json() as Record<string, unknown>;
+                const input = entry.body.input as { type?: string }[];
+                const answered = input.some(item => item.type === 'function_call_output');
+                const events = answered
+                    ? [{ type: 'response.output_text.delta', delta: 'Done.' }, { type: 'response.completed', response: { status: 'completed', usage: { input_tokens: 9, output_tokens: 2 } } }]
+                    : [
+                        { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'create_file', arguments: '' } },
+                        { type: 'response.function_call_arguments.delta', item_id: 'fc_1', delta: '{"filePath":"/w/hello.txt","content":"hi\\n"}' },
+                        { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'create_file', arguments: '{"filePath":"/w/hello.txt","content":"hi\\n"}' } },
+                        { type: 'response.completed', response: { status: 'completed', usage: { input_tokens: 7, output_tokens: 5 } } },
+                    ];
+                return new Response(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream', 'x-ezil-request-id': 'req-mock' } });
+            },
+        });
+        gatewayConfig = parseModelsConfig(JSON.stringify({
+            providers: { ezil: { type: 'ezil-gateway', baseUrl: '{env:EZIL_AI_BASE_URL}', apiKey: '{env:EZIL_AI_PROXY_TOKEN}' } },
+            models: [{ id: 'ezil-code', provider: 'ezil', model: 'ezil-code', default: true }],
+        }), { env: { EZIL_AI_BASE_URL: `http://127.0.0.1:${server.port}/ai/v1`, EZIL_AI_PROXY_TOKEN: PROXY } });
+        gatewayProvider = new EZiLModelsProvider({ ...host, models: () => gatewayConfig.models, secrets: () => gatewayConfig.secrets, log: line => gatewayLogs.push(line) });
+    });
+    afterAll(() => server.stop(true));
+
+    test('advertises the allowance minus the framing reserve, text only', () => {
+        const info = toInformation(gatewayConfig.models[0]!);
+        expect(info.maxInputTokens).toBe(16384 - 1536);
+        expect(info.maxOutputTokens).toBe(4096);
+        expect(info.capabilities).toEqual({ toolCalling: true, imageInput: false });
+    });
+
+    test('counts tokens as the gateway bound does (UTF-8 bytes of the item + 32)', async () => {
+        const info = toInformation(gatewayConfig.models[0]!);
+        expect(await gatewayProvider.provideTokenCount(info as never, 'héllo', token() as never)).toBe(Buffer.byteLength('"héllo"'));
+        expect(await gatewayProvider.provideTokenCount(info as never, message(1, [new TextPart('hi')]) as never, token() as never)).toBe(Buffer.byteLength('{"role":"user","content":"hi"}') + 1 + 32);
+    });
+
+    test('an Agent-mode tool round trip: one key per turn, proxy token only, tool call then text', async () => {
+        const info = toInformation(gatewayConfig.models[0]!);
+        const first: unknown[] = [];
+        await gatewayProvider.provideLanguageModelChatResponse(info as never, [message(3, [new TextPart('sys')]), message(1, [new TextPart('make hello.txt')])] as never, { tools: [CREATE_FILE], toolMode: 1, modelOptions: {} } as never, { report: (part: unknown) => first.push(part) }, token() as never);
+        expect(first).toEqual([new ToolCallPart('call_1', 'create_file', { filePath: '/w/hello.txt', content: 'hi\n' })]);
+        const second: unknown[] = [];
+        await gatewayProvider.provideLanguageModelChatResponse(info as never, [
+            message(3, [new TextPart('sys')]), message(1, [new TextPart('make hello.txt')]),
+            message(2, [new ToolCallPart('call_1', 'create_file', { filePath: '/w/hello.txt', content: 'hi\n' })]),
+            message(1, [new ToolResultPart('call_1', [new TextPart('created')])]),
+        ] as never, { tools: [CREATE_FILE], toolMode: 1, modelOptions: {} } as never, { report: (part: unknown) => second.push(part) }, token() as never);
+        expect(second).toEqual([new TextPart('Done.')]);
+        const posts = seen.filter(entry => entry.path === '/ai/v1/responses');
+        expect(posts).toHaveLength(2);
+        expect(posts[0]!.key).not.toBe(posts[1]!.key);
+        for (const post of posts) expect(post.auth).toBe(`Bearer ${PROXY}`);
+        expect(posts[1]!.body!.input).toEqual([
+            { role: 'user', content: 'make hello.txt' },
+            { type: 'function_call', call_id: 'call_1', name: 'create_file', arguments: '{"filePath":"/w/hello.txt","content":"hi\\n"}' },
+            { type: 'function_call_output', call_id: 'call_1', output: 'created' },
+        ]);
+        expect(gatewayLogs.join('\n')).not.toContain(PROXY);
+        expect(gatewayLogs.some(line => line.includes('request=req-mock'))).toBe(true);
+    });
+});

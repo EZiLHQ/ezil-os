@@ -1,7 +1,7 @@
 // Config file loader for EZiL Models. JSON only, zero dependencies.
 //
 //   {
-//     "providers": { "<name>": { "type": "anthropic" | "anthropic-foundry" | "openai" | "azure-openai" | "openai-compatible",
+//     "providers": { "<name>": { "type": "anthropic" | "anthropic-foundry" | "openai" | "azure-openai" | "openai-compatible" | "ezil-gateway",
 //                                 "apiKey": "{env:NAME}" | "{file:/path}" | "literal", "baseUrl"?, "resource"?, "apiVersion"?, "headers"?, "betas"? } },
 //     "models": [ { "id", "name", "provider", "model", "family", "maxInputTokens", "maxOutputTokens",
 //                   "capabilities": { "toolCalling", "imageInput" }, "thinking", "cache", "default", "roles" } ],
@@ -11,7 +11,7 @@
 // `{env:NAME}` and `{file:/path}` references are resolved at load time. Resolved secrets are collected
 // in `ResolvedConfig.secrets` so callers can redact them from anything they log.
 
-export const PROVIDER_TYPES = ['anthropic', 'anthropic-foundry', 'openai', 'azure-openai', 'openai-compatible'] as const;
+export const PROVIDER_TYPES = ['anthropic', 'anthropic-foundry', 'openai', 'azure-openai', 'openai-compatible', 'ezil-gateway'] as const;
 export type ProviderType = (typeof PROVIDER_TYPES)[number];
 
 export const MODEL_ROLES = ['default', 'plan', 'utility', 'utilitySmall'] as const;
@@ -138,6 +138,15 @@ function isAnthropic(type: ProviderType): boolean {
     return type === 'anthropic' || type === 'anthropic-foundry';
 }
 
+/** The EZiL AI gateway (`ai.ezil.work`, reached through the EZiL OS Worker proxy): Responses API, no provider key. */
+export function isGateway(type: ProviderType): boolean {
+    return type === 'ezil-gateway';
+}
+
+/** Gateway alias defaults when a model entry does not set them (`ezil-code` today: 16,384 in / 4,096 out). */
+export const GATEWAY_DEFAULT_MAX_INPUT_TOKENS = 16_384;
+export const GATEWAY_DEFAULT_MAX_OUTPUT_TOKENS = 4_096;
+
 /** Models known to reject forced `tool_choice` (`any`/`tool`) with a 400. */
 export function supportsForcedToolChoice(model: string): boolean {
     return !/opus-5-5|fable-5|mythos/i.test(model);
@@ -237,6 +246,7 @@ export function resolveModelsConfig(raw: unknown, options: LoadOptions = {}): Re
             if (!given('apiKey', apiKey) && type !== 'openai-compatible') sink.problems.push(`${where}.apiKey is required for type ${type}`);
             if ((type === 'anthropic-foundry' || type === 'azure-openai') && !given('resource', resource) && !given('baseUrl', baseUrl)) sink.problems.push(`${where}: type ${type} needs "resource" (Azure resource name) or "baseUrl"`);
             if (type === 'openai-compatible' && !given('baseUrl', baseUrl)) sink.problems.push(`${where}: type openai-compatible needs "baseUrl"`);
+            if (type === 'ezil-gateway' && !given('baseUrl', baseUrl)) sink.problems.push(`${where}: type ezil-gateway needs "baseUrl" (the EZiL OS AI proxy, e.g. {env:EZIL_AI_BASE_URL})`);
             if (baseUrl && !/^https?:\/\//.test(baseUrl)) sink.problems.push(`${where}.baseUrl must start with http:// or https://`);
             if (resource && !/^[a-z0-9-]+$/i.test(resource)) sink.problems.push(`${where}.resource must be a bare Azure resource name (letters, digits, hyphens)`);
             const provider: ResolvedProvider = {
@@ -280,8 +290,10 @@ export function resolveModelsConfig(raw: unknown, options: LoadOptions = {}): Re
             if (merged.capabilities !== undefined && !isRecord(merged.capabilities)) problems.push(`${where}.capabilities must be an object`);
             const toolCalling = capabilities.toolCalling === undefined ? true : capabilities.toolCalling;
             if (typeof toolCalling !== 'boolean' && typeof toolCalling !== 'number') problems.push(`${where}.capabilities.toolCalling must be a boolean or a number`);
-            const imageInput = capabilities.imageInput === undefined ? true : capabilities.imageInput;
+            const imageInput = capabilities.imageInput === undefined ? !isGateway(provider.type) : capabilities.imageInput;
             if (typeof imageInput !== 'boolean') problems.push(`${where}.capabilities.imageInput must be a boolean`);
+            // The gateway refuses images, files and audio (400 unsupported_content).
+            if (isGateway(provider.type) && imageInput === true) problems.push(`${where}.capabilities.imageInput must be false for ezil-gateway (the gateway accepts text only)`);
 
             let thinking: ThinkingConfig | undefined;
             if (merged.thinking !== undefined) {
@@ -345,8 +357,8 @@ export function resolveModelsConfig(raw: unknown, options: LoadOptions = {}): Re
                 version: typeof merged.version === 'string' ? merged.version : '1',
                 tooltip: typeof merged.tooltip === 'string' ? merged.tooltip : undefined,
                 detail: typeof merged.detail === 'string' ? merged.detail : undefined,
-                maxInputTokens: positiveInt(merged.maxInputTokens, 'maxInputTokens', 200_000),
-                maxOutputTokens: positiveInt(merged.maxOutputTokens, 'maxOutputTokens', isAnthropic(provider.type) ? 64_000 : 32_768),
+                maxInputTokens: positiveInt(merged.maxInputTokens, 'maxInputTokens', isGateway(provider.type) ? GATEWAY_DEFAULT_MAX_INPUT_TOKENS : 200_000),
+                maxOutputTokens: positiveInt(merged.maxOutputTokens, 'maxOutputTokens', isGateway(provider.type) ? GATEWAY_DEFAULT_MAX_OUTPUT_TOKENS : isAnthropic(provider.type) ? 64_000 : 32_768),
                 capabilities: { toolCalling: toolCalling as boolean | number, imageInput: imageInput as boolean },
                 thinking,
                 cache,

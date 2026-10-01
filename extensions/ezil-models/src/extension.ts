@@ -1,7 +1,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { ConfigError, describeConfig, parseModelsConfig, type ResolvedConfig, type ResolvedModel } from './config';
+import { ConfigError, describeConfig, isGateway, parseModelsConfig, type ResolvedConfig, type ResolvedModel } from './config';
+import { readCredits } from './gateway';
 import { EZiLModelsProvider } from './provider';
 import type { Usage } from './types';
 
@@ -190,12 +191,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             : vscode.window.showErrorMessage(`EZiL Models: ${store.error()}`, 'Show output').then(choice => { if (choice) output.show(); }));
     };
     const showUsage = () => { log(`[usage report]\n${usage.report()}`); output.show(); };
+    // EZiL AI credit state (contract §7) for the default gateway model; read fresh each time it is asked for.
+    const gatewayModel = () => store.models().find(model => isGateway(model.provider.type) && model.default) ?? store.models().find(model => isGateway(model.provider.type));
+    const showCredits = async () => {
+        const model = gatewayModel();
+        if (!model) { void vscode.window.showInformationMessage('EZiL Models: no EZiL AI model is configured.'); return; }
+        const credits = await readCredits(model.provider, model.model);
+        log(`[credits] ${model.model}: state=${credits.state}${credits.balance ? ` available_micro=${credits.balance.available_micro} held_micro=${credits.balance.held_micro}` : ''}${credits.models ? ` killswitch=${credits.models.killswitch} pause=${credits.models.pause ?? 'none'}` : ''}`);
+        void vscode.window.showInformationMessage(`EZiL AI: ${credits.text}`);
+    };
     const manage = async () => {
         type Item = vscode.QuickPickItem & { action?: () => void | Promise<void> };
         const items: Item[] = [
             { label: '$(go-to-file) Open config file', description: store.path, action: openConfig },
             { label: '$(refresh) Reload config', description: store.error() ? 'last load failed' : `${store.models().length} model(s)`, action: reload },
             { label: '$(graph) Show token usage', action: showUsage },
+            ...(gatewayModel() ? [{ label: '$(credit-card) Show AI credits', description: 'EZiL AI balance and pause state', action: showCredits }] : []),
             { label: '$(clippy) Copy settings snippet', description: 'chat.defaultModel / plan / utility for the configured roles', action: async () => { await vscode.env.clipboard.writeText(JSON.stringify(settingsSnippet(store.models()), null, 2)); void vscode.window.showInformationMessage('EZiL Models: settings snippet copied to the clipboard.'); } },
         ];
         if (store.error()) items.push({ label: '$(error) Config error', detail: store.error(), action: () => output.show() });
@@ -216,6 +227,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('ezil-models.manage', manage),
         vscode.commands.registerCommand('ezil-models.reload', reload),
         vscode.commands.registerCommand('ezil-models.showUsage', showUsage),
+        vscode.commands.registerCommand('ezil-models.showCredits', showCredits),
         vscode.commands.registerCommand('ezil-models.openConfig', openConfig),
     );
     log(`[activate] config path ${store.path}${process.env[CONFIG_ENV] ? ` (from ${CONFIG_ENV})` : ''}; proposals: languageModelThinkingPart=${'LanguageModelThinkingPart' in vscode} languageModelSystem=${(vscode.LanguageModelChatMessageRole as unknown as Record<string, unknown>).System === 3}`);

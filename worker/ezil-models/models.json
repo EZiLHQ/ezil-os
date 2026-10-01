@@ -1,48 +1,28 @@
 {
   "$schema": "https://raw.githubusercontent.com/EZiLHQ/ezil-os/main/extensions/ezil-models/schema/models.schema.json",
+  "$comment": "EZiL AI only. The chat calls ai.ezil.work through this computer's Worker proxy (docs/AI-GATEWAY.md); the Worker injects EZIL_AI_BASE_URL and the per-computer EZIL_AI_PROXY_TOKEN at boot. No provider key is in the image or the container. Direct-provider configs (Anthropic, Foundry, OpenAI) stay supported: see extensions/ezil-models/examples/models.example.json.",
   "providers": {
-    "anthropic": {
-      "type": "anthropic",
-      "apiKey": "{env:ANTHROPIC_API_KEY}"
-    },
-    "foundry-anthropic": {
-      "type": "anthropic-foundry",
-      "resource": "{env:AZURE_RESOURCE_NAME}",
-      "apiKey": "{env:AZURE_API_KEY}"
-    },
-    "foundry-openai": {
-      "type": "azure-openai",
-      "resource": "{env:AZURE_RESOURCE_NAME}",
-      "apiKey": "{env:AZURE_API_KEY}"
-    },
-    "openai": {
-      "type": "openai",
-      "apiKey": "{env:OPENAI_API_KEY}"
+    "ezil": {
+      "type": "ezil-gateway",
+      "baseUrl": "{env:EZIL_AI_BASE_URL}",
+      "apiKey": "{env:EZIL_AI_PROXY_TOKEN}"
     }
   },
   "defaults": {
     "capabilities": {
       "toolCalling": true,
-      "imageInput": true
+      "imageInput": false
     }
   },
   "models": [
     {
-      "id": "claude-opus-5-5",
-      "name": "Claude Opus 5.5",
-      "provider": "anthropic",
-      "model": "claude-opus-5-5",
-      "family": "claude",
-      "maxInputTokens": 200000,
-      "maxOutputTokens": 128000,
-      "thinking": {
-        "type": "adaptive",
-        "effort": "medium",
-        "display": "summarized"
-      },
-      "cache": {
-        "ttl": "5m"
-      },
+      "id": "ezil-code",
+      "name": "EZiL Code",
+      "provider": "ezil",
+      "model": "ezil-code",
+      "detail": "EZiL AI coding model (credits)",
+      "maxInputTokens": 16384,
+      "maxOutputTokens": 4096,
       "default": true,
       "roles": [
         "default",
@@ -50,110 +30,17 @@
       ]
     },
     {
-      "id": "claude-sonnet-5",
-      "name": "Claude Sonnet 5",
-      "provider": "anthropic",
-      "model": "claude-sonnet-5",
-      "family": "claude",
-      "maxInputTokens": 200000,
-      "maxOutputTokens": 64000,
-      "thinking": {
-        "type": "adaptive",
-        "effort": "high",
-        "display": "summarized"
-      },
-      "cache": {
-        "ttl": "5m"
-      }
-    },
-    {
-      "id": "claude-fable-5-1",
-      "name": "Claude Fable 5.1",
-      "provider": "anthropic",
-      "model": "claude-fable-5-1",
-      "family": "claude",
-      "maxInputTokens": 200000,
-      "maxOutputTokens": 64000,
-      "thinking": {
-        "type": "adaptive",
-        "effort": "medium",
-        "display": "summarized"
-      },
-      "cache": {
-        "ttl": "5m"
-      }
-    },
-    {
-      "id": "claude-haiku-4-5",
-      "name": "Claude Haiku 4.5",
-      "provider": "anthropic",
-      "model": "claude-haiku-4-5",
-      "family": "claude",
-      "maxInputTokens": 200000,
-      "maxOutputTokens": 32000,
-      "thinking": {
-        "type": "enabled",
-        "budgetTokens": 4096
-      },
+      "id": "ezil-fast",
+      "name": "EZiL Fast",
+      "provider": "ezil",
+      "model": "ezil-fast",
+      "detail": "EZiL AI utility model (credits)",
+      "maxInputTokens": 32768,
+      "maxOutputTokens": 8192,
       "roles": [
         "utility",
         "utilitySmall"
       ]
-    },
-    {
-      "id": "foundry-claude-sonnet-5",
-      "name": "Claude Sonnet 5 (Foundry)",
-      "provider": "foundry-anthropic",
-      "model": "claude-sonnet-5",
-      "family": "claude",
-      "detail": "Microsoft Foundry deployment; `model` is the deployment name",
-      "maxInputTokens": 200000,
-      "maxOutputTokens": 64000,
-      "thinking": {
-        "type": "adaptive",
-        "effort": "high",
-        "display": "summarized"
-      },
-      "cache": {
-        "ttl": "1h"
-      }
-    },
-    {
-      "id": "foundry-gpt-4-1",
-      "name": "GPT-4.1 (Foundry)",
-      "provider": "foundry-openai",
-      "model": "gpt-4.1",
-      "family": "gpt",
-      "detail": "Example Foundry OpenAI deployment; `model` is the deployment name",
-      "maxInputTokens": 1000000,
-      "maxOutputTokens": 32768
-    },
-    {
-      "id": "foundry-gpt-5",
-      "name": "GPT-5 (Foundry)",
-      "provider": "foundry-openai",
-      "model": "gpt-5",
-      "family": "gpt",
-      "detail": "Example Foundry OpenAI deployment; `model` is the deployment name",
-      "maxInputTokens": 272000,
-      "maxOutputTokens": 32768,
-      "thinking": {
-        "type": "adaptive",
-        "effort": "medium"
-      }
-    },
-    {
-      "id": "gpt-5",
-      "name": "GPT-5",
-      "provider": "openai",
-      "model": "gpt-5",
-      "family": "gpt",
-      "maxInputTokens": 272000,
-      "maxOutputTokens": 32768,
-      "thinking": {
-        "type": "adaptive",
-        "effort": "medium"
-      }
     }
   ]
 }

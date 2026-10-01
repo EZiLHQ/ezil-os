@@ -4,6 +4,7 @@
 import { anthropicStream, buildAnthropicBody } from './anthropic';
 import type { ResolvedModel } from './config';
 import { hostOf, resolveEndpoint, type Endpoint } from './endpoints';
+import { gatewayChat, type GatewayOptions } from './gateway';
 import { buildOpenAIBody, openaiStream } from './openai';
 import { sseEvents } from './sse';
 import type { ChatRequest, StreamEvent } from './types';
@@ -19,7 +20,11 @@ export type ChatOptions = {
     signal: AbortSignal;
     fetch?: typeof fetch;
     /** Called with the request URL and the exact JSON body about to be sent (contains no credentials). */
-    onRequest?: (url: string, body: Record<string, unknown>) => void;
+    onRequest?: (url: string, body: Record<string, unknown>, detail?: string) => void;
+    /** ezil-gateway only: transport log lines (request ids, Idempotency-Keys, error codes; never bodies or tokens). */
+    log?: (line: string) => void;
+    /** ezil-gateway only: test seams. */
+    gateway?: Pick<GatewayOptions, 'newIdempotencyKey' | 'sleep' | 'now'>;
 };
 
 function upstreamMessage(text: string): string | undefined {
@@ -62,6 +67,17 @@ export function buildBody(model: ResolvedModel, request: ChatRequest): { endpoin
 }
 
 export async function* chat(model: ResolvedModel, request: ChatRequest, options: ChatOptions): AsyncGenerator<StreamEvent> {
+    if (model.provider.type === 'ezil-gateway') {
+        yield* gatewayChat(model, request, {
+            signal: options.signal,
+            fetch: options.fetch,
+            log: options.log,
+            ...options.gateway,
+            onRequest: (url, built, key) => options.onRequest?.(url, built.body as unknown as Record<string, unknown>,
+                `key=${key} bound=${built.bound} tools=${built.body.tools?.length ?? 0}${built.droppedTools.length ? ` dropped=${built.droppedTools.length}(${built.droppedTools.slice(0, 8).join(',')}${built.droppedTools.length > 8 ? ',...' : ''})` : ''} max_output_tokens=${built.body.max_output_tokens}`),
+        });
+        return;
+    }
     const { endpoint, body } = buildBody(model, request);
     options.onRequest?.(endpoint.url, body);
     const doFetch = options.fetch ?? fetch;

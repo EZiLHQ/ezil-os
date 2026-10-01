@@ -370,16 +370,16 @@ RUN mkdir -p /tmp/ezil-chat \
 #
 # Models come from ONE file, `/etc/ezil/models.json` (`EZIL_MODELS_CONFIG`,
 # which the extension reads before its `ezilModels.configPath` setting),
-# shipped from `worker/ezil-models/models.json`: Anthropic direct
-# (`{env:ANTHROPIC_API_KEY}`), Claude and OpenAI deployments on one Microsoft
-# Foundry resource (`{env:AZURE_RESOURCE_NAME}` + `{env:AZURE_API_KEY}`) and
-# OpenAI (`{env:OPENAI_API_KEY}`). No secret is in the image; "just put the
-# key" = set the variable on the container. The gate rejects a literal key.
-# Note (extensions/ezil-models/src/config.ts): a provider whose variable is
-# UNSET is skipped — its models are not served and one warning naming the
-# variable (never a value) goes to the output channel — while every other
-# provider keeps serving, so set only the keys you have. Override the path
-# with EZIL_MODELS_CONFIG to ship a smaller file (the e2e does exactly that).
+# shipped from `worker/ezil-models/models.json`: EZiL AI only (provider type
+# `ezil-gateway`, aliases `ezil-code` and `ezil-fast`), reached through this
+# computer's Worker proxy (`docs/AI-GATEWAY.md`). The Worker injects
+# `EZIL_AI_BASE_URL` and the per-computer `EZIL_AI_PROXY_TOKEN` at boot; the
+# user's own session token never enters the container, and no provider key is
+# in the image or its env. The gate below rejects a literal key AND any
+# reference to a provider key variable (ANTHROPIC_*, OPENAI_*, AZURE_*), and
+# fails the build if such a variable is set in the image env. Direct-provider
+# configs remain supported by the extension (examples/models.example.json)
+# for local use with EZIL_MODELS_CONFIG (the e2e does exactly that).
 COPY ezil-models/dist/ezil-models-0.1.0.vsix /tmp/ezil-models.vsix
 RUN mkdir -p /tmp/ezil-models \
   && unzip -q /tmp/ezil-models.vsix 'extension/*' -d /tmp/ezil-models \
@@ -389,7 +389,7 @@ RUN mkdir -p /tmp/ezil-models \
   && test -f /usr/lib/code-server/lib/vscode/extensions/ezil-models/dist/extension.js
 COPY ezil-models/models.json /etc/ezil/models.json
 ENV EZIL_MODELS_CONFIG=/etc/ezil/models.json
-RUN node -e "const j=JSON.parse(require('fs').readFileSync('/etc/ezil/models.json','utf8'));if(!j.providers||!Object.keys(j.providers).length||!Array.isArray(j.models)||!j.models.length)throw new Error('models.json needs providers and models');for(const [n,p] of Object.entries(j.providers)){for(const k of ['apiKey','resource']){if(p[k]!==undefined&&!/^[{](env|file):[^}]+[}]$/.test(p[k]))throw new Error('providers.'+n+'.'+k+' must be an {env:NAME} or {file:/path} reference, not a literal');}}if(JSON.stringify(j).match(/sk-[A-Za-z0-9]{8}|[0-9a-f]{32}/))throw new Error('models.json looks like it carries a literal secret');if(j.models.filter(m=>m.default===true).length!==1)throw new Error('models.json must mark exactly one default model');console.log('models.json ok:',Object.keys(j.providers).join(','),'/',j.models.map(m=>m.id).join(','))"
+RUN node -e "const j=JSON.parse(require('fs').readFileSync('/etc/ezil/models.json','utf8'));if(!j.providers||!Object.keys(j.providers).length||!Array.isArray(j.models)||!j.models.length)throw new Error('models.json needs providers and models');for(const [n,p] of Object.entries(j.providers)){for(const k of ['apiKey','resource']){if(p[k]!==undefined&&!/^[{](env|file):[^}]+[}]$/.test(p[k]))throw new Error('providers.'+n+'.'+k+' must be an {env:NAME} or {file:/path} reference, not a literal');}}if(JSON.stringify(j).match(/sk-[A-Za-z0-9]{8}|[0-9a-f]{32}/))throw new Error('models.json looks like it carries a literal secret');if(j.models.filter(m=>m.default===true).length!==1)throw new Error('models.json must mark exactly one default model');if(/[{](env|file):[^}]*(ANTHROPIC|OPENAI|AZURE)/i.test(JSON.stringify(j)))throw new Error('models.json must not reference provider keys; the image ships EZiL AI only');const leaked=Object.keys(process.env).filter(k=>/^(ANTHROPIC|OPENAI|AZURE)_/.test(k));if(leaked.length)throw new Error('provider key variables in the image env: '+leaked.join(','));console.log('models.json ok:',Object.keys(j.providers).join(','),'/',j.models.map(m=>m.id).join(','))"
 
 # ── OpenCode CLI (the agent runtime EZiL Chat drives) ────────────────────────
 # Pinned to the `@opencode/client` version the extension is compiled against
