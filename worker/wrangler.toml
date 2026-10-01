@@ -145,6 +145,12 @@ SANDBOX_DEFAULT_DESKTOP_MODE = "neko"
 
 SANDBOX_NEKO_ICE_POLICY = "relay"
 
+# EZiL AI gateway the `/ai/v1/*` proxy forwards to (`src/ai-proxy.ts`,
+# `docs/AI-GATEWAY.md`). Non-secret. The proxy holds no provider key: it
+# forwards the signed-in user's Supabase access token, which the gateway
+# verifies on every call. `SANDBOX_AI_PROXY=off` disables the proxy.
+EZIL_AI_GATEWAY_URL = "https://ai.ezil.work"
+
 # ── Custom domain + preview routes: LIVE on ezil.org (narrow suffix routes) ──
 # (see `worker/src/index.ts`'s `PREVIEW_ZONE_ROOT` doc comment for the full
 # hostname-composition background — `<port>-<sandboxId>-<token>.<host>` — and

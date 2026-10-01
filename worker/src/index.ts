@@ -302,6 +302,19 @@ interface Env extends SandboxEnv {
   SANDBOX_NEKO_TURN_API_TOKEN?: string;
   /** Optional ephemeral TURN credential TTL in seconds (clamped to [300, 1800]). */
   SANDBOX_NEKO_TURN_TTL_SECONDS?: string;
+
+  /**
+   * EZiL AI gateway origin the `/ai/v1/*` proxy forwards to (`./ai-proxy.ts`).
+   * Non-secret; unset means `https://ai.ezil.work`.
+   */
+  EZIL_AI_GATEWAY_URL?: string;
+  /**
+   * Non-secret kill switch for the AI proxy: the code bridge host's `/ai/*`
+   * routes and `POST /sandbox/:name/ai-credential`. Enabled by default; set to
+   * `off`/`false`/`0`/`disabled`/`no` to answer 404 on both and stop injecting
+   * `EZIL_AI_*` into new containers, without a code change.
+   */
+  SANDBOX_AI_PROXY?: string;
 }
 
 /**
@@ -570,6 +583,21 @@ import {
 } from './observability';
 import { parseRequestedScreen, formatNekoScreen, fitScreenRequest } from './screen-modes';
 import {
+  aiProxyBaseUrl,
+  aiProxyDisabled,
+  chooseAiCredential,
+  deriveAiProxyToken,
+  handleAiProxyRequest,
+  isAiProxyPath,
+  parsePushedAccessToken,
+  proxyError,
+  resolveGatewayUrl,
+  usableAiCredential,
+  verifyAiCredentialSignature,
+  AI_CREDENTIAL_STORAGE_KEY,
+  type StoredAiCredential,
+} from './ai-proxy';
+import {
   selectTelemetryWorthy,
   toTelemetryEventInput,
   parseContainerTelemetryLines,
@@ -734,6 +762,13 @@ interface EzilWorkspacePersistRpc {
    * alive.
    */
   recordActivity(lastInputAgoMs: number): Promise<void>;
+  /**
+   * The AI proxy's per-sandbox user token (`./ai-proxy.ts`). Storage only —
+   * like `recordActivity`, these never touch the container.
+   */
+  putAiCredential(credential: StoredAiCredential): Promise<{ stored: boolean; expiresAt: number }>;
+  getAiCredential(): Promise<string | null>;
+  dropAiCredential(token: string): Promise<void>;
   /**
    * Observe → flush → cancel the flush loop → destroy → RE-OBSERVE, returning
    * what actually happened. Runs entirely inside the DO because only there is
@@ -2704,6 +2739,31 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, lastActivityAt);
   }
 
+  /**
+   * Store the signed-in user's Supabase access token for the AI proxy
+   * (`POST /sandbox/:name/ai-credential`, already signature- and
+   * owner-checked by the Worker). The later-expiring token wins, so a replayed
+   * older push cannot roll it back. DO storage only: the container never sees
+   * this token, and like `recordActivity` this never touches the container.
+   */
+  async putAiCredential(credential: StoredAiCredential): Promise<{ stored: boolean; expiresAt: number }> {
+    const current = await this.ctx.storage.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY);
+    const { keep, stored } = chooseAiCredential(current, credential);
+    if (stored) await this.ctx.storage.put(AI_CREDENTIAL_STORAGE_KEY, keep);
+    return { stored, expiresAt: keep.expiresAt };
+  }
+
+  /** The stored token while it has more than 30 s left, else null. Never returned to a client. */
+  async getAiCredential(): Promise<string | null> {
+    return usableAiCredential(await this.ctx.storage.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY));
+  }
+
+  /** Forget the stored token if it is still `token` (the gateway refused it with 401). */
+  async dropAiCredential(token: string): Promise<void> {
+    const current = await this.ctx.storage.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY);
+    if (current?.token === token) await this.ctx.storage.delete(AI_CREDENTIAL_STORAGE_KEY);
+  }
+
   /** True when a container is actually alive under this DO right now. */
   private containerIsRunning(): boolean {
     return this.ctx.container?.running === true;
@@ -2774,6 +2834,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    */
   override async destroy(): Promise<void> {
     await this.cancelWorkspaceFlushLoop();
+    // A torn-down computer keeps no user token for the AI proxy.
+    await this.ctx.storage.delete(AI_CREDENTIAL_STORAGE_KEY).catch(() => false);
     await super.destroy();
   }
 
@@ -3068,6 +3130,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD: nekoCreds.admin,
         NEKO_PASSWORD: nekoCreds.user,
         NEKO_PASSWORD_ADMIN: nekoCreds.admin,
+        ...(await aiProxyBootEnv(this.env, hostname, sandboxId)),
       };
 
       // 🔴 KNOWN LIMITATION — A TROUBLESHOOT RESTART DROPS THE SCREEN SIZE.
@@ -3510,6 +3573,9 @@ async function handlePreview(
       NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD: nekoCreds.admin,
       NEKO_PASSWORD: nekoCreds.user,
       NEKO_PASSWORD_ADMIN: nekoCreds.admin,
+      // EZiL AI proxy endpoint + per-sandbox proxy token for the chat
+      // extension (`./ai-proxy.ts`). Never the user's Supabase token.
+      ...(await aiProxyBootEnv(env, normalizeSandboxHostname(url.host, env.SANDBOX_PREVIEW_ZONE_ROOT), sandboxId)),
     };
 
     // ── Boot-time screen sizing ─────────────────────────────────────────────
@@ -5438,6 +5504,12 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
     return handlePreviewBootstrap(url, sandboxId, secrets, cookieSecret, target);
   }
 
+  // EZiL AI proxy (`./ai-proxy.ts`): everything under `/ai` on the CODE host
+  // belongs to the proxy and never reaches code-server. Authenticated by the
+  // per-sandbox proxy token (bound to the `sandboxId` in this hostname), not by
+  // the browser's `ezil_preview` cookie, which the proxy ignores.
+  if (target === 'code' && isAiProxyPath(path)) return handleAiProxy(request, env, sandboxId);
+
   if (target === 'code') return handleCodeBridge(request, env, url, sandboxId, secrets, port);
 
   if (target === 'app' && request.method === 'GET' && path === '/preview-status') {
@@ -5876,6 +5948,87 @@ async function handleBrowserSidecar(
   }
 }
 
+// ── EZiL AI proxy (code bridge host `/ai/v1/*` + credential push) ────────────
+//
+// See `./ai-proxy.ts` for the contract. Two halves:
+//   - `POST /sandbox/:name/ai-credential  { accessToken }` (Worker API host):
+//     the Next server pushes the signed-in user's Supabase access token, signed
+//     with `x-ezil-signature` over sandbox id + body hash. Stored in the DO only.
+//   - `/ai/v1/*` on `<8443>-<id>-code.<zone>`: the container's chat extension,
+//     authenticated by the per-sandbox proxy token injected at boot
+//     (`EZIL_AI_PROXY_TOKEN`), forwarded to the gateway with the stored token.
+
+/** Boot env for the chat extension: where the proxy is and the sandbox's proxy token. Never the user's token. */
+async function aiProxyBootEnv(env: Env, hostname: string, sandboxId: string): Promise<Record<string, string>> {
+  if (aiProxyDisabled(env.SANDBOX_AI_PROXY)) return {};
+  const secret = resolveNekoDerivationSecret(env);
+  if (!secret) return {};
+  const code = codePortFor('neko');
+  if (!code) return {};
+  return {
+    EZIL_AI_BASE_URL: aiProxyBaseUrl(hostname, sandboxId, code.port, code.token),
+    EZIL_AI_PROXY_TOKEN: await deriveAiProxyToken(secret, sandboxId),
+  };
+}
+
+async function handleAiProxy(request: Request, env: Env, sandboxId: string): Promise<Response> {
+  if (aiProxyDisabled(env.SANDBOX_AI_PROXY)) return proxyError(404, 'not_found', 'Not an EZiL AI route.');
+  let gatewayUrl: string;
+  try {
+    gatewayUrl = resolveGatewayUrl(env.EZIL_AI_GATEWAY_URL);
+  } catch {
+    return proxyError(503, 'os_ai_unavailable', 'EZiL AI is not configured for this computer.');
+  }
+  const sandbox = openSandbox(env, sandboxId);
+  return handleAiProxyRequest(request, {
+    gatewayUrl,
+    sandboxId,
+    proxySecret: resolveNekoDerivationSecret(env),
+    credential: () => sandbox.getAiCredential(),
+    dropCredential: (token) => sandbox.dropAiCredential(token),
+    fetch: (upstream) => fetch(upstream),
+    log: (fields) => console.log(JSON.stringify(fields)),
+  });
+}
+
+const AI_CREDENTIAL_MAX_BODY_BYTES = 32 * 1024;
+
+async function handleAiCredential(request: Request, env: Env, sandboxName: string): Promise<Response> {
+  if (Number(request.headers.get('content-length') ?? 0) > AI_CREDENTIAL_MAX_BODY_BYTES) {
+    return json({ ok: false, error: 'body_too_large' }, 413);
+  }
+  const raw = new Uint8Array(await request.arrayBuffer());
+  if (raw.byteLength > AI_CREDENTIAL_MAX_BODY_BYTES) return json({ ok: false, error: 'body_too_large' }, 413);
+  const auth = await verifyAiCredentialSignature(
+    request.headers.get('x-ezil-signature'),
+    resolvePreviewSecrets(env),
+    sandboxName,
+    raw,
+  );
+  if (!auth.ok) return json({ ok: false, error: auth.error }, auth.error === 'ai_proxy_not_configured' ? 503 : 401);
+
+  let body: unknown;
+  try {
+    body = JSON.parse(new TextDecoder().decode(raw));
+  } catch {
+    return json({ ok: false, error: 'invalid_json_body' }, 400);
+  }
+  const accessToken = (body as { accessToken?: unknown } | null)?.accessToken;
+  const parsed = parsePushedAccessToken(accessToken, sandboxName);
+  if (!parsed.ok) return json({ ok: false, error: parsed.error }, 400);
+
+  try {
+    const sandbox = openSandbox(env, sandboxName);
+    const result = await sandbox.putAiCredential(parsed.credential);
+    return json({ ok: true, sandboxId: sandboxName, stored: result.stored, expiresAt: result.expiresAt });
+  } catch (err) {
+    return json(
+      { ok: false, sandboxId: sandboxName, error: sanitizeErrorMessage(err instanceof Error ? err.message : String(err)) },
+      500,
+    );
+  }
+}
+
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
 export default {
@@ -6138,6 +6291,17 @@ export default {
       const unauthorized = await authorizeSignedControlRequest(request, env, url);
       if (unauthorized) return unauthorized;
       return handleTelemetryAck(request, env);
+    }
+
+    const aiCredentialMatch = path.match(/^\/sandbox\/([^/]+)\/ai-credential$/);
+    if (method === 'POST' && aiCredentialMatch) {
+      // AI proxy credential push. Its OWN signature (`x-ezil-signature`, bound
+      // to sandbox id + body hash) instead of the shared control envelope, and
+      // fail-closed when no secret is configured. `SANDBOX_AI_PROXY=off` 404s.
+      if (aiProxyDisabled(env.SANDBOX_AI_PROXY)) {
+        return json({ ok: false, error: 'ai_proxy_disabled' }, 404);
+      }
+      return handleAiCredential(request, env, decodeURIComponent(aiCredentialMatch[1]));
     }
 
     const restartMatch = path.match(/^\/sandbox\/([^/]+)\/restart$/);
