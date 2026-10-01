@@ -69,6 +69,8 @@ import {
     fitScreenRequest,
     surfacePreviewErrorAsValue,
 } from '@/server/lib/cloudflare-guacamole-provider';
+import { syncAiCredential } from '@/server/lib/ai-credential';
+import { createClient as createSupabaseServerClient } from '@/utils/supabase/server';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 /** Ownership check shared by every procedure below — never trust a bare computerId. */
@@ -206,6 +208,17 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             }
 
             const sandboxId = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
+            // EZiL AI: hand this computer's Durable Object the user's current
+            // access token for the `/ai/v1/*` proxy (`@/server/lib/ai-credential`).
+            // Best effort and never throws; `reportActivity` repeats it every beat.
+            await syncAiCredential({
+                config,
+                hmacSecret,
+                sandboxName: sandboxId,
+                userId: ctx.user.id,
+                headers: ctx.headers,
+                supabase: createSupabaseServerClient,
+            });
             const composedGuacamoleUrl = composeBrowserDesktopUrl(
                 result.guacamoleUrl,
                 hmacSecret,
@@ -1141,13 +1154,19 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
             const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
-            const result = await requestGuacamoleActivity(
-                config,
-                hmacSecret,
-                sandboxName,
-                input.lastInputAgoMs,
-                correlationId,
-            );
+            // The AI credential push rides along with every beat (see
+            // `@/server/lib/ai-credential`); it never changes this beat's answer.
+            const [result] = await Promise.all([
+                requestGuacamoleActivity(config, hmacSecret, sandboxName, input.lastInputAgoMs, correlationId),
+                syncAiCredential({
+                    config,
+                    hmacSecret,
+                    sandboxName,
+                    userId: ctx.user.id,
+                    headers: ctx.headers,
+                    supabase: createSupabaseServerClient,
+                }),
+            ]);
 
             return {
                 ok: result.ok,

@@ -72,6 +72,9 @@ interface CallLog {
    * field, so a test that reads anything else is testing a paraphrase.
    */
   startProcess: Array<{ command: string; env: Record<string, string> }>;
+  /** Every `putAiCredential` / `dropAiCredential` RPC (the AI proxy's DO storage). */
+  aiCredentialPut: Array<{ token: string; expiresAt: number }>;
+  aiCredentialDropped: string[];
 }
 
 /** Opaque stand-in for a `WebSocket`; only its identity is ever compared. */
@@ -156,6 +159,8 @@ function fakeSandboxNamespace(options: {
    * default. Defaults to an immediately-resolved `{}`.
    */
   flushWorkspaceNow?: () => Promise<unknown>;
+  /** What `getAiCredential` answers (default: the last `putAiCredential` token, else null). */
+  aiCredential?: string | null;
 }): { binding: unknown; calls: CallLog } {
   /** The sandbox id the Worker actually opened the DO with. */
   let openedWith = SANDBOX_NAME;
@@ -171,9 +176,21 @@ function fakeSandboxNamespace(options: {
     wsConnect: [],
     exposePort: [],
     startProcess: [],
+    aiCredentialPut: [],
+    aiCredentialDropped: [],
   };
 
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
+    putAiCredential: async (...args: unknown[]) => {
+      const [credential] = args as [{ token: string; expiresAt: number }];
+      calls.aiCredentialPut.push(credential);
+      return { stored: true, expiresAt: credential.expiresAt };
+    },
+    getAiCredential: async () =>
+      options.aiCredential !== undefined ? options.aiCredential : (calls.aiCredentialPut.at(-1)?.token ?? null),
+    dropAiCredential: async (...args: unknown[]) => {
+      calls.aiCredentialDropped.push(args[0] as string);
+    },
     containerFetch: async (...args: unknown[]) => {
       const [url, init, port] = args as [string, RequestInit | undefined, number];
       const headers: Record<string, string> = {};
@@ -2974,5 +2991,143 @@ describe('no other mutating route is reachable unauthenticated', () => {
       { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
     );
     expect(res.status).toBe(404);
+  });
+});
+
+// ── EZiL AI proxy: credential push + code-host `/ai/*` (see `./ai-proxy.ts`) ──
+
+describe('EZiL AI proxy routes', () => {
+  const USER_ID = 'abcdef01-2345-6789-abcd-ef0123456789';
+  const b64url = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  const userJwt = (sub = USER_ID) =>
+    `${b64url({ alg: 'ES256', kid: 'k' })}.${b64url({ sub, role: 'authenticated', exp: Math.floor(Date.now() / 1000) + 3600 })}.c2ln`;
+  const CODE_HOST = `https://8443-${SANDBOX_NAME}-code.ezil.org`;
+
+  async function push(body: unknown, sign = true, sandbox = SANDBOX_NAME) {
+    const { mintAiCredentialSignature } = await import('./ai-proxy');
+    const raw = new TextEncoder().encode(JSON.stringify(body));
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (sign) headers['x-ezil-signature'] = await mintAiCredentialSignature(SECRET, sandbox, raw);
+    return new Request(`https://api-desktop.ezil.org/sandbox/${sandbox}/ai-credential`, { method: 'POST', headers, body: raw });
+  }
+
+  it('stores a signed push for the sandbox owner, and refuses unsigned, foreign-user and unconfigured pushes', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const ok = await worker.fetch(await push({ accessToken: userJwt() }), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET });
+    expect(ok.status).toBe(200);
+    const okBody = (await ok.json()) as Record<string, unknown>;
+    expect(okBody.ok).toBe(true);
+    expect(JSON.stringify(okBody)).not.toContain(userJwt().split('.')[1]!);
+    expect(calls.aiCredentialPut).toHaveLength(1);
+
+    const unsigned = await worker.fetch(await push({ accessToken: userJwt() }, false), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET });
+    expect(unsigned.status).toBe(401);
+    // A shared control-route token is NOT accepted here: the signature binds sandbox + body.
+    const withControlToken = await worker.fetch(
+      new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/ai-credential`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${await mintToken()}` },
+        body: JSON.stringify({ accessToken: userJwt() }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    expect(withControlToken.status).toBe(401);
+    const foreign = await worker.fetch(await push({ accessToken: userJwt('00000000-1111-2222-3333-444444444444') }), {
+      Sandbox: binding,
+      SANDBOX_HMAC_SECRET: SECRET,
+    });
+    expect(foreign.status).toBe(400);
+    expect(((await foreign.json()) as { error: string }).error).toBe('access_token_wrong_user');
+    const unconfigured = await worker.fetch(await push({ accessToken: userJwt() }), { Sandbox: binding });
+    expect(unconfigured.status).toBe(503);
+    expect(calls.aiCredentialPut).toHaveLength(1);
+  });
+
+  it('forwards an allow-listed call with the stored token and never reaches code-server', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ aiCredential: userJwt() });
+    const { deriveAiProxyToken } = await import('./ai-proxy');
+    const seen: Array<{ url: string; authorization: string | null }> = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: Request) => {
+      seen.push({ url: input.url, authorization: input.headers.get('authorization') });
+      return new Response('{"object":"list","killswitch":true,"pause":"operations","data":[]}', {
+        headers: { 'content-type': 'application/json', 'x-ezil-request-id': 'req-m' },
+      });
+    }) as typeof fetch;
+    try {
+      const res = await worker.fetch(
+        new Request(`${CODE_HOST}/ai/v1/models`, {
+          headers: { authorization: `Bearer ${await deriveAiProxyToken(SECRET, SANDBOX_NAME)}`, cookie: 'ezil_preview=x' },
+        }),
+        { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get('x-ezil-request-id')).toBe('req-m');
+      expect(seen).toEqual([{ url: 'https://ai.ezil.work/v1/models', authorization: `Bearer ${userJwt()}` }]);
+
+      const admin = await worker.fetch(
+        new Request(`${CODE_HOST}/ai/v1/admin/killswitch`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${await deriveAiProxyToken(SECRET, SANDBOX_NAME)}` },
+          body: '{"engaged":false}',
+        }),
+        { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+      );
+      expect(admin.status).toBe(404);
+      const cookieOnly = await worker.fetch(new Request(`${CODE_HOST}/ai/v1/models`, { headers: { cookie: 'ezil_preview=x' } }), {
+        Sandbox: binding,
+        SANDBOX_HMAC_SECRET: SECRET,
+      });
+      expect(cookieOnly.status).toBe(401);
+      expect(seen).toHaveLength(1);
+      expect(calls.containerFetch).toHaveLength(0);
+      expect(calls.wsConnect).toHaveLength(0);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it('SANDBOX_AI_PROXY=off answers 404 on both halves', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ aiCredential: userJwt() });
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_AI_PROXY: 'off' };
+    expect((await worker.fetch(await push({ accessToken: userJwt() }), env)).status).toBe(404);
+    expect((await worker.fetch(new Request(`${CODE_HOST}/ai/v1/models`), env)).status).toBe(404);
+    expect(calls.aiCredentialPut).toHaveLength(0);
+    expect(calls.containerFetch).toHaveLength(0);
+  });
+
+  it('injects the proxy base URL and per-sandbox proxy token into the neko boot env, never a user token', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
+    await worker.fetch(
+      new Request('https://api-desktop.ezil.org/sandbox/preview', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: await mintToken(), projectId: 'proj-1', userId: 'user-1', desktopMode: 'neko' }),
+      }),
+      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+    );
+    const bootEnv = calls.startProcess[0]!.env;
+    const { deriveAiProxyToken } = await import('./ai-proxy');
+    expect(bootEnv.EZIL_AI_BASE_URL).toMatch(/^https:\/\/8443-guac-user1-proj1-code\.[a-z0-9.-]+\/ai\/v1$/);
+    expect(bootEnv.EZIL_AI_PROXY_TOKEN).toBe(await deriveAiProxyToken(SECRET, 'guac-user1-proj1'));
+    for (const [name, value] of Object.entries(bootEnv)) {
+      expect(name).not.toMatch(/SUPABASE|ANTHROPIC|OPENAI|AZURE_API_KEY|SERVICE_ROLE/);
+      expect(value).not.toMatch(/^eyJ/);
+    }
+  });
+
+  it('injects nothing AI-related without a primary secret', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
+    await worker.fetch(
+      new Request('https://api-desktop.ezil.org/sandbox/preview', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: 'local-dev', projectId: 'proj-1', userId: 'user-1', desktopMode: 'neko' }),
+      }),
+      { Sandbox: binding },
+    );
+    expect(calls.startProcess.length).toBe(1);
+    expect('EZIL_AI_PROXY_TOKEN' in calls.startProcess[0]!.env).toBe(false);
+    expect('EZIL_AI_BASE_URL' in calls.startProcess[0]!.env).toBe(false);
   });
 });
