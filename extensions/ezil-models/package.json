@@ -38,6 +38,7 @@
       { "command": "ezil-models.manage", "title": "EZiL Models: Manage", "category": "EZiL Models" },
       { "command": "ezil-models.reload", "title": "EZiL Models: Reload Config", "category": "EZiL Models" },
       { "command": "ezil-models.showUsage", "title": "EZiL Models: Show Token Usage", "category": "EZiL Models" },
+      { "command": "ezil-models.showCredits", "title": "EZiL Models: Show AI Credits", "category": "EZiL Models" },
       { "command": "ezil-models.openConfig", "title": "EZiL Models: Open Config File", "category": "EZiL Models" }
     ],
     "configuration": {

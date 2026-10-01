@@ -3,7 +3,9 @@
 
 import * as vscode from 'vscode';
 import { chat, ProviderError } from './client';
-import { redact, type ResolvedModel } from './config';
+import { isGateway, redact, type ResolvedModel } from './config';
+import { GatewayError } from './gateway';
+import { FRAMING_BASE, messageBound, textBound } from './responses';
 import { estimateMessageTokens, estimateTextTokens } from './tokens';
 import type { ChatRequest, Message, Part, Role, Tool, Usage } from './types';
 
@@ -78,6 +80,17 @@ export function toNeutralRequest(messages: readonly vscode.LanguageModelChatRequ
     };
 }
 
+/**
+ * Headroom kept below a gateway alias's allowance when telling VS Code how much it may send: the gateway's
+ * fixed framing (1024) plus a margin for the per-item and per-tool framing VS Code does not count. The
+ * request itself is still checked against the full allowance (responses.ts `buildResponsesBody`).
+ */
+export const GATEWAY_BUDGET_RESERVE = FRAMING_BASE + 512;
+
+export function advertisedMaxInputTokens(model: ResolvedModel): number {
+    return isGateway(model.provider.type) ? Math.max(1, model.maxInputTokens - GATEWAY_BUDGET_RESERVE) : model.maxInputTokens;
+}
+
 export function toInformation(model: ResolvedModel): vscode.LanguageModelChatInformation {
     const info: vscode.LanguageModelChatInformation & Record<string, unknown> = {
         id: model.id,
@@ -86,7 +99,7 @@ export function toInformation(model: ResolvedModel): vscode.LanguageModelChatInf
         version: model.version,
         tooltip: model.tooltip ?? `${model.providerName} / ${model.model}`,
         detail: model.detail ?? model.providerName,
-        maxInputTokens: model.maxInputTokens,
+        maxInputTokens: advertisedMaxInputTokens(model),
         maxOutputTokens: model.maxOutputTokens,
         capabilities: { toolCalling: model.capabilities.toolCalling, imageInput: model.capabilities.imageInput },
     };
@@ -146,8 +159,9 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             const events = chat(resolved, request, {
                 signal: controller.signal,
                 fetch: this.host.fetch,
-                onRequest: (url, body) => {
-                    this.host.log(`[request] ${resolved.id} -> ${redact(url, this.host.secrets())} messages=${request.messages.length} tools=${request.tools.length} toolMode=${request.toolMode}${options.modelOptions?.requestInitiator ? ` initiator=${String(options.modelOptions.requestInitiator)}` : ''}`);
+                log: line => this.host.log(redact(line, this.host.secrets())),
+                onRequest: (url, body, detail) => {
+                    this.host.log(`[request] ${resolved.id} -> ${redact(url, this.host.secrets())} messages=${request.messages.length} tools=${request.tools.length} toolMode=${request.toolMode}${options.modelOptions?.requestInitiator ? ` initiator=${String(options.modelOptions.requestInitiator)}` : ''}${detail ? ` ${detail}` : ''}`);
                     if (this.host.logRequests()) this.host.log(requestForLog(body, this.host.secrets()));
                 },
             });
@@ -186,13 +200,18 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             const message = redact(error instanceof Error ? error.message : String(error), this.host.secrets());
             this.host.log(`[error] ${resolved.id}: ${message}`);
             if (error instanceof ProviderError) throw new ProviderError(message, error.status, error.retryAfterSeconds, error.upstream && redact(error.upstream, this.host.secrets()));
-            throw new Error(message.startsWith('EZiL Models') ? message : `EZiL Models: ${message}`);
+            if (error instanceof GatewayError) throw new ProviderError(message, error.status, error.retryAfterSeconds, error.code);
+            throw new Error(message.startsWith('EZiL Models') || message.startsWith('EZiL AI') ? message : `EZiL Models: ${message}`);
         } finally {
             cancellation.dispose();
         }
     }
 
-    async provideTokenCount(_model: vscode.LanguageModelChatInformation, value: string | vscode.LanguageModelChatRequestMessage, _token: vscode.CancellationToken): Promise<number> {
+    async provideTokenCount(model: vscode.LanguageModelChatInformation, value: string | vscode.LanguageModelChatRequestMessage, _token: vscode.CancellationToken): Promise<number> {
+        // Gateway aliases are bounded in bytes, not tokens (contract §4): count what the gateway counts,
+        // so Copilot's own history trimming tracks the 413 bound instead of a tokenizer guess.
+        const gateway = this.host.models().find(candidate => candidate.id === model.id && isGateway(candidate.provider.type));
+        if (gateway) return typeof value === 'string' ? textBound(value) : messageBound(toNeutralMessage(value));
         if (typeof value === 'string') return estimateTextTokens(value);
         return estimateMessageTokens(toNeutralMessage(value));
     }

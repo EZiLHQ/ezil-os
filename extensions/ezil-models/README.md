@@ -11,6 +11,7 @@ JSON config file where you "just put the key" and talks directly to:
 | `openai` | `https://api.openai.com/v1/chat/completions` | `Authorization: Bearer` |
 | `azure-openai` | `https://<resource>.openai.azure.com/openai/v1/chat/completions`, or a Foundry `baseUrl` `https://<resource>.services.ai.azure.com/openai/v1` | `api-key` |
 | `openai-compatible` | `<baseUrl>/chat/completions` (vLLM, Ollama, LiteLLM, a local mock...) | `Authorization: Bearer` when a key is set |
+| `ezil-gateway` | `<baseUrl>/responses`: the EZiL AI gateway (`ai.ezil.work`) through the EZiL OS Worker proxy, OpenAI Responses subset, text only. What the image ships. | `Authorization: Bearer <computer's proxy token>` (never a provider key) |
 
 Everything Copilot Chat sends is supported: the **System** role (proposed `languageModelSystem`, value 3), tool
 definitions and **tool calling** (39 tools in Agent mode), tool results, **images** (base64 → Anthropic `image`
@@ -20,6 +21,60 @@ signatures; emitted as `LanguageModelThinkingPart` when the proposal is availabl
 added on the system prompt, the last user turn and the tool list — never more than 4, TTL `5m` or `1h`).
 Streaming responses, cancellation, per-request usage logging and readable errors (401/403/404/429 with
 `retry-after`, overloaded, unreachable host) are built in. Zero runtime dependencies: `fetch` + a small SSE parser.
+
+## EZiL AI (`ezil-gateway`) — what the EZiL OS image ships
+
+`/etc/ezil/models.json` in the image has one provider, `{"type": "ezil-gateway", "baseUrl": "{env:EZIL_AI_BASE_URL}",
+"apiKey": "{env:EZIL_AI_PROXY_TOKEN}"}`, and two models, `ezil-code` (default and plan, 16,384 in / 4,096 out) and
+`ezil-fast` (utility, 32,768 / 8,192). The Worker sets both variables at boot: the base URL is the computer's own code
+host (`https://8443-<id>-code.<zone>/ai/v1`) and the token is valid for that computer only. The Worker swaps it for the
+signed-in user's session token and forwards to `ai.ezil.work` (ezil-os `docs/AI-GATEWAY.md`); no provider key and no
+user token is in the image or the container.
+
+- **Request** (`src/responses.ts`, ezil-ai-gateway `docs/OS-INTEGRATION-CONTRACT.md` §4): `model` is the alias;
+  system messages become `instructions`; user and assistant text become `{role, content}` items; tool calls and
+  results become `function_call` / `function_call_output` items (results flattened to text); tools use the flat
+  `{type:"function", name, description, parameters}` shape (≤ 64, names `^[A-Za-z0-9_-]{1,64}$`, descriptions ≤ 8,192
+  characters); local `$ref`/`$defs` are inlined, and a tool whose schema cannot be inlined is dropped and named in the
+  log; `tool_choice` is `auto` or `required`; `max_output_tokens` is always sent, clamped to 16..the alias cap (the
+  lower of the config and `/v1/models`); `store: false`, `stream: true`. `reasoning` and `temperature` are sent only when
+  the model entry configures them, and `text.format` only as an inline `json_schema`. Images, files, thinking replay,
+  `messages`, `max_tokens`, `stream_options`, `metadata` and the like are never sent.
+- **Idempotency**: one UUID `Idempotency-Key` per chat turn; the body is serialized once and the same key and bytes
+  are reused for the only two retries: one after a transport failure before any response, and one after a session
+  refusal (`unauthorized`, `os_session_missing`, `role_mismatch`) once EZiL OS has pushed a fresh session (the turn
+  waits up to 65 s, one activity beat, polling `GET /models`). A 409 `idempotency_replay` shows "already processed";
+  nothing else is retried, and a started stream never is.
+- **Stream**: `response.output_text.delta` → text, `response.function_call_arguments.delta/.done` and
+  `response.output_item.added/.done` → tool calls, `response.reasoning_summary_text.delta` → thinking,
+  `response.completed` → usage and stop, `response.incomplete` → stop as truncated (partial output kept),
+  `response.failed` → error, `event: error` or EOF without a terminal event → "the response was interrupted (request
+  <id>)". Unknown events are ignored.
+- **Errors** map by `error.code`: `insufficient_credits` (with `no_live_grant` and the balance) → "no credits" or "not
+  enough credits for this request"; `killswitch` → "AI paused (reconciliation|operations)"; `global_cap_reached` →
+  paused; `rate_limited` / `concurrency_limit` → wait, with `Retry-After`; `input_too_large` / `body_too_large` →
+  "prompt too large"; 401 → re-authenticate; membership codes → "AI is not enabled for this account"; provider codes →
+  "model provider unavailable (request <id>)". Every message carries the request id when there is one.
+- **Credits**: *EZiL Models: Show AI Credits* (also in *Manage*) reads `/models` and `/me/balance` and shows the
+  contract §7 state: paused, model off, used, expired, not included, held, or "AI credits: N remaining".
+- **Size**: the gateway bounds input in bytes, not tokens: UTF-8 bytes of `{instructions, input, tools, tool_choice,
+  text, reasoning}` + 1,024 + 32 per item + 128 per tool (tool JSON counted `\uXXXX`-escaped). `provideTokenCount`
+  returns those bytes, and the model advertises `maxInputTokens = allowance − 1,536`, so Copilot's own history
+  trimming tracks the gateway's bound. Before sending, the request is checked against the full allowance; when it is
+  over, tools are kept greedily in priority order (`read_file`, `replace_string_in_file`, `create_file`, `apply_patch`,
+  … first) while they fit, and if the prompt does not fit even without tools the turn fails locally with "prompt too
+  large".
+
+### Measured: a default Agent-mode turn does not fit `ezil-code`
+
+From the Copilot Chat 0.67 Agent-mode captures in `tests/fixtures` (39 tools, the stock 10,564-byte agent system
+prompt, a one-line task): the gateway bound is **73,107** against `ezil-code`'s **16,384** (4.5×). The tools alone are
+54,120 bytes plus 4,992 framing. Trimmed to fit, the turn keeps **4 of 39 tools** (`read_file`, `create_file`,
+`list_dir`, `terminal_last_command`), so the agent can read and create files but not edit or run commands. Ask mode
+and Copilot's utility calls (no tools, about 2.3 K) fit. A usable Agent mode needs a gateway agent alias (or a higher
+`ezil-code` allowance) of about 80 K input at the very least; ezil-os's integration plan suggests 131,072 in /
+16,384 out, which stays under the gateway's 262,144-byte body limit. That is a gateway release and pricing decision,
+not something this extension can change.
 
 ## Config file
 

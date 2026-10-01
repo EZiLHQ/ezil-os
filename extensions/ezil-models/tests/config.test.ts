@@ -7,8 +7,10 @@ const env = { ANTHROPIC_API_KEY: 'sk-ant-secret-1234567890', AZURE_API_KEY: 'azu
 const files: Record<string, string> = { '/run/secrets/foundry-api-key': 'foundry-file-secret\n' };
 const readFile = (path: string) => { const value = files[path]; if (value === undefined) throw new Error('ENOENT'); return value; };
 const example = readFileSync(join(import.meta.dir, '..', 'examples', 'models.example.json'), 'utf8');
-/** The template the desktop image ships as /etc/ezil/models.json (four providers, all keys from the environment). */
+/** The template the desktop image ships as /etc/ezil/models.json: EZiL AI only, through the Worker proxy. */
 const shipped = readFileSync(join(import.meta.dir, '..', '..', '..', 'worker', 'ezil-models', 'models.json'), 'utf8');
+/** The image's previous template (four direct providers, keys from the environment), kept to cover per-provider skipping. */
+const directProviders = readFileSync(join(import.meta.dir, 'fixtures', 'direct-providers.models.json'), 'utf8');
 
 /** Structural failures throw; problems in individual entries come back on the config. Both are "errors" here. */
 function errorsOf(text: string): string[] {
@@ -48,10 +50,47 @@ describe('config loader', () => {
     });
 
     describe('shipped image template (worker/ezil-models/models.json)', () => {
+        const proxy = { EZIL_AI_BASE_URL: 'https://8443-guac-abc-def-code.ezil.org/ai/v1', EZIL_AI_PROXY_TOKEN: 'a'.repeat(64) };
+
+        test('serves the two EZiL AI aliases through the proxy, text only, with no provider key reference', () => {
+            const config = parseModelsConfig(shipped, { env: proxy, readFile });
+            expect(Object.keys(config.providers)).toEqual(['ezil']);
+            expect(config.providers.ezil!.type).toBe('ezil-gateway');
+            expect(config.providers.ezil!.baseUrl).toBe(proxy.EZIL_AI_BASE_URL);
+            expect(config.models.map(model => [model.id, model.model, model.maxInputTokens, model.maxOutputTokens, model.capabilities.imageInput])).toEqual([
+                ['ezil-code', 'ezil-code', 16384, 4096, false],
+                ['ezil-fast', 'ezil-fast', 32768, 8192, false],
+            ]);
+            expect(config.models.filter(model => model.default).map(model => model.id)).toEqual(['ezil-code']);
+            expect(config.secrets).toEqual([proxy.EZIL_AI_PROXY_TOKEN]);
+            expect(config.errors).toEqual([]);
+            expect(shipped).not.toMatch(/ANTHROPIC|OPENAI|AZURE/);
+        });
+
+        test('outside an EZiL OS computer (no proxy env) nothing is served and one warning names the variables', () => {
+            const config = parseModelsConfig(shipped, { env: {}, readFile });
+            expect(config.models).toEqual([]);
+            expect(config.warnings).toEqual(['providers.ezil skipped (2 model(s) not served): apiKey: environment variable EZIL_AI_PROXY_TOKEN is not set; baseUrl: environment variable EZIL_AI_BASE_URL is not set']);
+        });
+
+        test('rejects imageInput:true and a missing baseUrl for ezil-gateway', () => {
+            const config = parseModelsConfig(JSON.stringify({
+                providers: { g: { type: 'ezil-gateway', apiKey: 'k' }, h: { type: 'ezil-gateway', baseUrl: 'https://x/ai/v1', apiKey: 'k' } },
+                models: [{ id: 'a', provider: 'g', model: 'ezil-code' }, { id: 'b', provider: 'h', model: 'ezil-code', capabilities: { imageInput: true } }, { id: 'c', provider: 'h', model: 'ezil-fast' }],
+            }), { env: {}, readFile });
+            expect(config.models.map(model => model.id)).toEqual(['c']);
+            expect(config.models[0]!.maxInputTokens).toBe(16384); // gateway default, not 200000
+            expect(config.models[0]!.capabilities.imageInput).toBe(false);
+            expect(config.errors.some(error => error.includes('imageInput must be false for ezil-gateway'))).toBe(true);
+            expect(config.errors.some(error => error.includes('type ezil-gateway needs "baseUrl"'))).toBe(true);
+        });
+    });
+
+    describe('direct-provider template (the image\'s previous models.json, tests/fixtures)', () => {
         const ids = (config: { models: { id: string }[] }) => config.models.map(model => model.id);
 
         test('with every variable set, all four providers and eight models are served', () => {
-            const config = parseModelsConfig(shipped, { env: { ...env, AZURE_RESOURCE_NAME: 'my-foundry' }, readFile });
+            const config = parseModelsConfig(directProviders, { env: { ...env, AZURE_RESOURCE_NAME: 'my-foundry' }, readFile });
             expect(Object.keys(config.providers)).toEqual(['anthropic', 'foundry-anthropic', 'foundry-openai', 'openai']);
             expect(ids(config)).toEqual(['claude-opus-5-5', 'claude-sonnet-5', 'claude-fable-5-1', 'claude-haiku-4-5', 'foundry-claude-sonnet-5', 'foundry-gpt-4-1', 'foundry-gpt-5', 'gpt-5']);
             expect(config.models.filter(model => model.default).map(model => model.id)).toEqual(['claude-opus-5-5']);
@@ -61,7 +100,7 @@ describe('config loader', () => {
         });
 
         test('with only ANTHROPIC_API_KEY set, the anthropic models are served and the other providers are skipped with one warning each', () => {
-            const config = parseModelsConfig(shipped, { env: { ANTHROPIC_API_KEY: 'sk-ant-only-1234567890' }, readFile });
+            const config = parseModelsConfig(directProviders, { env: { ANTHROPIC_API_KEY: 'sk-ant-only-1234567890' }, readFile });
             expect(Object.keys(config.providers)).toEqual(['anthropic']);
             expect(ids(config)).toEqual(['claude-opus-5-5', 'claude-sonnet-5', 'claude-fable-5-1', 'claude-haiku-4-5']);
             expect(config.models[0]!.default).toBe(true);
@@ -75,7 +114,7 @@ describe('config loader', () => {
         });
 
         test('with no variable set, zero models are served and each of the four providers gets one warning naming its variables', () => {
-            const config = parseModelsConfig(shipped, { env: {}, readFile });
+            const config = parseModelsConfig(directProviders, { env: {}, readFile });
             expect(config.models).toEqual([]);
             expect(config.providers).toEqual({});
             expect(config.errors).toEqual([]);
@@ -90,7 +129,7 @@ describe('config loader', () => {
         });
 
         test('a partially resolved provider never leaks the value that did resolve', () => {
-            const config = parseModelsConfig(shipped, { env: { AZURE_API_KEY: 'azure-only-secret-value' }, readFile });
+            const config = parseModelsConfig(directProviders, { env: { AZURE_API_KEY: 'azure-only-secret-value' }, readFile });
             expect(config.models).toEqual([]);
             for (const warning of config.warnings) expect(warning).not.toContain('azure-only-secret-value');
             expect(config.warnings.filter(warning => warning.startsWith('providers.foundry-'))).toEqual([

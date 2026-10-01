@@ -41,10 +41,10 @@
         "$comment": { "type": "string", "description": "Free-form note; ignored by the extension." },
         "type": {
           "type": "string",
-          "enum": ["anthropic", "anthropic-foundry", "openai", "azure-openai", "openai-compatible"],
-          "markdownDescription": "- `anthropic`: api.anthropic.com Messages API (`x-api-key`).\n- `anthropic-foundry`: Claude on Microsoft Foundry, `https://<resource>.services.ai.azure.com/anthropic/v1/messages` (`x-api-key`).\n- `openai`: api.openai.com chat completions (Bearer).\n- `azure-openai`: `https://<resource>.openai.azure.com/openai/v1/chat/completions` or a Foundry `openai/v1` baseUrl (`api-key`).\n- `openai-compatible`: any `<baseUrl>/chat/completions` server (Bearer if a key is set)."
+          "enum": ["anthropic", "anthropic-foundry", "openai", "azure-openai", "openai-compatible", "ezil-gateway"],
+          "markdownDescription": "- `anthropic`: api.anthropic.com Messages API (`x-api-key`).\n- `anthropic-foundry`: Claude on Microsoft Foundry, `https://<resource>.services.ai.azure.com/anthropic/v1/messages` (`x-api-key`).\n- `openai`: api.openai.com chat completions (Bearer).\n- `azure-openai`: `https://<resource>.openai.azure.com/openai/v1/chat/completions` or a Foundry `openai/v1` baseUrl (`api-key`).\n- `openai-compatible`: any `<baseUrl>/chat/completions` server (Bearer if a key is set).\n- `ezil-gateway`: the EZiL AI gateway (ai.ezil.work) through the EZiL OS Worker proxy, `<baseUrl>/responses` (Responses API subset, text only). `baseUrl` is `{env:EZIL_AI_BASE_URL}` and `apiKey` is the computer's proxy token `{env:EZIL_AI_PROXY_TOKEN}`, never a provider key."
         },
-        "apiKey": { "$ref": "#/definitions/secretString", "description": "Required except for openai-compatible." },
+        "apiKey": { "$ref": "#/definitions/secretString", "description": "Required except for openai-compatible. For ezil-gateway: the EZiL OS proxy token ({env:EZIL_AI_PROXY_TOKEN}), not a provider key." },
         "baseUrl": { "$ref": "#/definitions/secretString", "description": "Overrides the endpoint base. anthropic: default https://api.anthropic.com. anthropic-foundry: ...services.ai.azure.com/anthropic. openai: https://api.openai.com/v1. azure-openai: https://<resource>.openai.azure.com/openai/v1. openai-compatible: required." },
         "resource": { "$ref": "#/definitions/secretString", "description": "Azure resource name for anthropic-foundry / azure-openai (used when baseUrl is not set)." },
         "apiVersion": { "$ref": "#/definitions/secretString", "description": "azure-openai only: appended as ?api-version=. Not needed for the openai/v1 surface." },
