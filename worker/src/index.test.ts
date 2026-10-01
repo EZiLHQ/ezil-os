@@ -510,6 +510,19 @@ describe('HMAC mission-alias: verifyPreviewToken', () => {
     if (!malformed.ok) expect(malformed.error).toBe('hmac_malformed_token');
   });
 
+  it('fails closed when no HMAC secret is configured', async () => {
+    const { verifyPreviewToken } = await import('./hmac');
+    expect(await verifyPreviewToken(undefined, [])).toEqual({
+      ok: false,
+      error: 'hmac_secret_not_configured',
+    });
+  });
+
+  it('allows missing secrets only through the explicit local-development opt-in', async () => {
+    const { verifyPreviewToken } = await import('./hmac');
+    expect(await verifyPreviewToken(undefined, [], true)).toEqual({ ok: true });
+  });
+
   it('never leaks secret material in the verification result', async () => {
     const { verifyPreviewToken, resolvePreviewSecrets } = await import('./hmac');
     const secrets = resolvePreviewSecrets({
@@ -890,7 +903,9 @@ describe('cpu-diag: retrieval route (HMAC-authed, bounded, degrades cleanly)', (
     const fnMatch = src.match(/async function handleCpuDiag\([\s\S]*?\n}\n/);
     expect(fnMatch).not.toBeNull();
     const fnSrc = fnMatch?.[0] ?? '';
-    expect(fnSrc).toContain('verifyPreviewToken(body.token, resolvePreviewSecrets(env))');
+    expect(fnSrc).toContain(
+      'verifyPreviewToken(\n    body.token,\n    resolvePreviewSecrets(env),\n    allowInsecureLocalAuth(env)',
+    );
     expect(fnSrc).toContain("return json({ ok: false, error: auth.error }, 401);");
   });
 

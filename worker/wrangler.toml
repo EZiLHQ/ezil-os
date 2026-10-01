@@ -214,7 +214,9 @@ zone_name = "ezil.org"
 
 # HMAC secret for authenticating EBuilder → Worker calls.
 # Set in production with:  wrangler secret put SANDBOX_HMAC_SECRET
-# When unset (local dev), the Worker skips HMAC verification.
+# Missing secrets fail closed. For local Wrangler only, opt in explicitly via
+# `.dev.vars`: SANDBOX_ALLOW_INSECURE_LOCAL_AUTH=true
+# NEVER configure that bypass variable on a deployed Worker.
 # ── Neko WebRTC / Cloudflare Realtime TURN (secrets by NAME only) ────────────
 # `neko` desktop-mode media (VS Code pixels + input) travels over WebRTC, which
 # needs a TURN relay behind Cloudflare's HTTP/WS-only edge. The Worker mints

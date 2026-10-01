@@ -143,8 +143,8 @@ export async function deriveNekoCredentials(
  * Verify the preview token minted by `mintSandboxPreviewToken()`.
  *   Token format: `t=<unix_ms>,v1=<hex_hmac_sha256>`
  *   Payload:      `${timestamp}.POST./sandbox/preview.`
- * When no secret is configured the Worker runs in local-dev mode and accepts
- * any token (including the literal `local-dev` placeholder).
+ * Missing secrets fail closed unless the caller explicitly opts into the
+ * insecure local-development bypass.
  *
  * `secret` may be a single secret (legacy callers) or an ordered list of
  * candidate secrets. A signature is accepted if it matches ANY candidate under
@@ -303,11 +303,16 @@ export async function verifyPreviewCookie(
 export async function verifyPreviewToken(
   token: string | undefined,
   secret: string | string[] | undefined,
+  allowInsecureLocalDev = false,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const secrets = (Array.isArray(secret) ? secret : secret ? [secret] : []).filter(
     (s) => s && s.trim(),
   );
-  if (secrets.length === 0) return { ok: true }; // local dev: verification disabled
+  if (secrets.length === 0) {
+    return allowInsecureLocalDev
+      ? { ok: true }
+      : { ok: false, error: 'hmac_secret_not_configured' };
+  }
 
   if (!token || token === 'local-dev') {
     return { ok: false, error: 'hmac_required: worker configured with a secret but request was unsigned' };
