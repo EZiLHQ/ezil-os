@@ -62,6 +62,20 @@ const serverSchema = z.object({
      * accident — it must be noticed.
      */
     EZIL_OS_ACCESS_MODE: z.enum(['invite', 'open']).default('invite'),
+    /**
+     * EZiL Works API origin (`@/server/lib/ezil-account.ts`). When set, a
+     * sign-in with no `app_metadata.ezil_role` is given an EZiL account (role
+     * `builder`) through Works `POST /account` with the user's own token, the
+     * first time it opens `/os`. Unset: no adoption. https only (http only on
+     * localhost). Not a secret: the OS holds no Works or service-role key.
+     */
+    EZIL_WORKS_API_ORIGIN: z
+        .string()
+        .url()
+        .refine((value) => /^https:\/\//.test(value) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/.test(value), {
+            message: 'EZIL_WORKS_API_ORIGIN must be an https URL',
+        })
+        .optional(),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
 });
 
@@ -84,6 +98,7 @@ const parsedServer = isServer
           CRON_SECRET: process.env.CRON_SECRET,
           TELEMETRY_ADMIN_EMAILS: process.env.TELEMETRY_ADMIN_EMAILS,
           EZIL_OS_ACCESS_MODE: process.env.EZIL_OS_ACCESS_MODE,
+          EZIL_WORKS_API_ORIGIN: process.env.EZIL_WORKS_API_ORIGIN?.trim() || undefined,
           NODE_ENV: process.env.NODE_ENV,
       })
     : null;
@@ -122,6 +137,7 @@ export const env = {
         // default turns into an open door. The server-only schema's
         // `.default('invite')` and this literal must always agree.
         EZIL_OS_ACCESS_MODE: 'invite' as const,
+        EZIL_WORKS_API_ORIGIN: undefined,
         NODE_ENV: process.env.NODE_ENV ?? 'development',
     }),
     ...parsedClient.data,
