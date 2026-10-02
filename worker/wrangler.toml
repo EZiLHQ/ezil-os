@@ -34,7 +34,16 @@ workers_dev = true
 [[containers]]
 class_name = "Sandbox"
 image = "./Dockerfile"
-instance_type = "standard-3"
+# 2026-10-02: custom 2 vCPU / 6 GiB / 16 GB replaces standard-3 (2 vCPU / 8 GiB).
+# Memory is billed on PROVISIONED size and CPU on ACTIVE use, so cutting memory
+# is the saving; CPU stays at 2 vCPU (standard-1's half core starved software
+# rendering + WebRTC encode, and the idle-stop loadavg threshold in index.ts was
+# measured at 2 vCPU). Cloudflare requires >= 3 GiB per vCPU, so 6 GiB is the
+# least memory that keeps 2 vCPU. Measured on ezil-desktop:rev3 (desktop up,
+# bun install + next dev + next build + checkpoint): cgroup peak 1.8-2.6 GiB,
+# 0 memory-pressure events even under a 4 GiB cap. 4 GiB would force 1 vCPU
+# (+49% build time measured, video encode untested).
+instance_type = { vcpu = 2, memory_mib = 6144, disk_mb = 16000 }
 max_instances = 20
 # ── Rollout: replace EVERY instance in one step ───────────────────────────────
 # 🔴 THE DEFAULT SILENTLY STRANDS DEPLOYS, AND IT DID. Without these keys
@@ -301,7 +310,7 @@ tag = "v1"
 name = "ezil-os-worker-staging-sandbox"
 class_name = "Sandbox"
 image = "./Dockerfile"
-instance_type = "standard-3"
+instance_type = { vcpu = 2, memory_mib = 6144, disk_mb = 16000 }
 max_instances = 5
 rollout_step_percentage = 100
 rollout_kind = "full_auto"
