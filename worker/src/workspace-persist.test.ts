@@ -342,7 +342,8 @@ describe.skipIf(NO_POSIX_HOST)('security regressions', () => {
   });
 });
 
-it.skipIf(NO_POSIX_HOST)('pins parent directories so a racing symlink cannot redirect a capture read', async () => {
+// Audits the opened path through /proc/self/fd, which only Linux has (the codec's only runtime).
+it.skipIf(process.platform !== 'linux')('pins parent directories so a racing symlink cannot redirect a capture read', async () => {
   const { SNAPSHOT_SCRIPT } = await import('./workspace-snapshot-script');
   const { root, base } = await workspace();
   await mkdir(`${root}/dir`); await writeFile(`${root}/dir/value`, 'workspace bytes');
