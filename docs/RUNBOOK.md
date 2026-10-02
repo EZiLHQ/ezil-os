@@ -41,8 +41,9 @@ system, which is out of scope for a docs-only pass.
     `https://ezil-os.vercel.app/auth/**`. The glob is required because GoTrue
     matches the full `redirect_to`, query string included, and a miss falls
     back to the project's Site URL (`id.ezil.work`).
-  - `EZIL_OS_ACCESS_MODE=open` in Production: the first Google sign-in creates
-    the account. `os.ezil.work`, the host planned earlier, was never cut over.
+  - Anyone can sign up: the first Google sign-in creates the account (the
+    invite gate was removed in #168). `os.ezil.work`, the host planned
+    earlier, was never cut over.
 - **Worker**: Cloudflare, `https://api-desktop.ezil.org`.
 - **Container images**: built and pushed to GHCR by
   [`.github/workflows/image.yml`](../.github/workflows/image.yml) — a keyless
@@ -69,16 +70,11 @@ system, which is out of scope for a docs-only pass.
   `container` and `local` (row `T8`, Docker-backed, Linux-only) run in CI but
   are **not yet in that required-checks list** — widening the ruleset to
   require them is unfinished, separate from getting them running at all.
-- **Access is invite-only**, gated by `EZIL_OS_ACCESS_MODE` (`app/src/env.ts`,
-  default `invite`) and enforced in exactly one place —
-  `app/src/server/api/trpc.ts`'s `protectedProcedure`, reading an
-  `ezil_os_access` allow-list row per request — plus the three page gates
-  that give the same answer earlier. `tools/invite.ts` (`add` / `revoke` /
-  `list`) is the only sanctioned way to write that table; it writes the
-  allow-list row **before** sending the Supabase invite email (exit code `2`
-  means the row was written but the email was not — never the other order,
-  which would leave an invited person with a working account the product
-  refuses and no record of why).
+- **Access is open**: any signed-in user may use EZiL OS. `protectedProcedure`
+  (`app/src/server/api/trpc.ts`) requires a signed-in user and each computer is
+  owner-checked. The invite gate that read `ezil_os_access` was removed in
+  #168; the table and its rows remain, unread, and `tools/invite.ts add` still
+  creates email/password accounts by Supabase invite.
   - 🔴 **Schema before code.** Migration
     [`app/drizzle/0002_os_access.sql`](../app/drizzle/0002_os_access.sql) must
     be applied to the **hosted** database before the access-gate code that
@@ -117,10 +113,8 @@ system, which is out of scope for a docs-only pass.
     `/auth/confirm`, and that path needs allow-listing too.
   - **E2E default-host prerequisite:**
     Every `e2e/prod*.mjs` suite and `e2e/release-and-wait.mjs` sign in as
-    `$EZIL_E2E_EMAIL` and then load `/os`; with `EZIL_OS_ACCESS_MODE` at its
-    `invite` default, that account needs a row in `ezil_os_access` or every
-    one of those suites fails at the `/os` step. The production E2E account
-    was admitted on 2026-09-25. Any replacement account needs its own grant.
+    `$EZIL_E2E_EMAIL` and then load `/os`. Any account that can sign in works;
+    no allow-list grant is needed since the invite gate was removed.
 
 ---
 
