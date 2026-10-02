@@ -1,119 +1,151 @@
 'use client';
 
-import { useActionState, useState } from 'react';
+import { unstable_rethrow } from 'next/navigation';
+import { useEffect, useRef, useState } from 'react';
 
-import { signInWithGoogle, signInWithPassword, type AuthActionResult } from './actions';
+import { signInWithGoogle, signInWithPassword } from './actions';
 
-const initialState: AuthActionResult = {};
+/** Google handles both new and existing accounts; passwords only sign in. */
+export function LoginForm({ returnUrl, startWithEmail }: { returnUrl: string; startWithEmail: boolean }) {
+    const [pending, setPending] = useState<'google' | 'password' | null>(null);
+    const [error, setError] = useState<string | null>(null);
+    const [emailOpen, setEmailOpen] = useState(startWithEmail);
+    // Synchronous guard: even two submissions before React renders cannot race.
+    const attempt = useRef<symbol | null>(null);
+    const disclosure = useRef<HTMLButtonElement>(null);
+    const email = useRef<HTMLInputElement>(null);
 
-/**
- * Sign IN only. There is no sign-up mode, no "Create account" toggle and no
- * `new-password` branch. See `actions.ts` and `entry-contract.test.ts`.
- *
- * New accounts come from "Continue with Google": the first sign-in creates the
- * account inside Supabase's OAuth flow, not through any sign-up call here.
- * Email and password are for accounts that already have one (for example one
- * created with `bun tools/invite.ts add <email>`).
- */
-export function LoginForm({ returnUrl }: { returnUrl: string }) {
-    /** Set once we have started leaving; keeps the button from re-arming. */
-    const [leaving, setLeaving] = useState(false);
+    useEffect(() => {
+        const rearm = (event: PageTransitionEvent) => {
+            if (!event.persisted) return;
+            // Ignore late results from the visit before Back/Forward restored us.
+            attempt.current = null;
+            setPending(null);
+        };
+        window.addEventListener('pageshow', rearm);
+        return () => window.removeEventListener('pageshow', rearm);
+    }, []);
 
-    const [state, formAction, isPending] = useActionState(async (
-        _prev: AuthActionResult,
-        formData: FormData,
-    ) => {
-        const result = await signInWithPassword(formData);
-        if (result.redirectTo) {
-            setLeaving(true);
-            /*
-             * 🔴 A DOCUMENT LOAD, deliberately — this is the whole point of
-             * the action returning a value instead of calling `redirect()`.
-             *
-             * `redirect()` from a server action is performed by Next's App
-             * Router as a client-side navigation. `/os` is the host document
-             * for a separate jQuery application delivered as `<script src>`
-             * tags, and a script element React inserts during a client-side
-             * navigation NEVER EXECUTES. The result is a page with the
-             * wallpaper on it and no OS behind it, forever. See
-             * `actions.ts`'s `signInWithPassword` and
-             * docs/PLATFORM-NOTES.md §17.
-             *
-             * `assign` rather than `replace` so Back still returns to the
-             * login page the user came from. The value is already narrowed to
-             * a same-origin path by `safeReturnUrl` on the server; it is not
-             * re-derived from anything the client controls.
-             */
-            window.location.assign(result.redirectTo);
+    async function submit(method: 'google' | 'password', formData?: FormData) {
+        if (attempt.current) return;
+        const current = Symbol();
+        attempt.current = current;
+        setPending(method);
+        setError(null);
+
+        try {
+            if (method === 'google') {
+                await signInWithGoogle(returnUrl);
+            } else {
+                const result = await signInWithPassword(formData!);
+                if (attempt.current !== current) return;
+                if (result.redirectTo) {
+                    // A document load is required to execute the OS shell's
+                    // scripts. Never replace this with App Router navigation.
+                    // The server already narrowed this with safeReturnUrl.
+                    window.location.assign(result.redirectTo);
+                    return;
+                }
+                setError(result.error ?? 'We could not sign you in. Please try again.');
+            }
+        } catch (cause) {
+            if (attempt.current !== current) return;
+            // OAuth succeeds by throwing Next's redirect signal. Let Next
+            // handle it; only ordinary failures should re-enable the form.
+            unstable_rethrow(cause);
+            setError('We could not sign you in. Please try again.');
         }
-        return result;
-    }, initialState);
+        if (attempt.current === current) {
+            attempt.current = null;
+            setPending(null);
+        }
+    }
 
-    const busy = isPending || leaving;
+    const busy = pending !== null;
 
     return (
-        <div className="space-y-6">
-            <form
-                action={() => {
-                    void signInWithGoogle(returnUrl);
-                }}
-            >
-                <button
-                    type="submit"
-                    className="flex w-full items-center justify-center gap-2 rounded-md border border-white/15 bg-white/5 px-4 py-2.5 text-sm font-medium text-offwhite transition-colors hover:bg-white/10"
-                >
-                    <GoogleIcon className="h-4 w-4" />
-                    Continue with Google
+        <div className="ezil-lock-auth">
+            <form action={() => submit('google')} className="w-full">
+                <button type="submit" disabled={busy} className="ezil-lock-google">
+                    <GoogleIcon className="h-[1.125rem] w-[1.125rem]" aria-hidden="true" />
+                    {pending === 'google' ? 'Connecting to Google…' : 'Continue with Google'}
                 </button>
             </form>
 
-            <div className="flex items-center gap-4">
-                <div className="h-px flex-1 bg-white/10" />
-                <span className="text-small text-gray-500">or</span>
-                <div className="h-px flex-1 bg-white/10" />
-            </div>
+            {error && <p role="alert" className="ezil-lock-error">{error}</p>}
+            <span role="status" className="sr-only">
+                {pending === 'google' ? 'Connecting to Google.' : pending === 'password' ? 'Signing in.' : ''}
+            </span>
 
-            <form action={formAction} className="space-y-3">
+            <button
+                ref={disclosure}
+                type="button"
+                disabled={busy}
+                aria-expanded={emailOpen}
+                aria-controls="email-sign-in"
+                onClick={() => {
+                    if (attempt.current) return;
+                    setEmailOpen(!emailOpen);
+                    setError(null);
+                    // The disclosed form stays mounted, preserving typed values.
+                    // Wait for the hidden attribute to update before focusing it.
+                    if (!emailOpen) requestAnimationFrame(() => email.current?.focus());
+                    else disclosure.current?.focus();
+                }}
+                className="ezil-lock-disclosure"
+            >
+                {emailOpen ? 'Hide email sign-in' : 'Sign in with email and password'}
+                <svg viewBox="0 0 16 16" className="h-3 w-3" aria-hidden="true">
+                    <path d={emailOpen ? 'm4 10 4-4 4 4' : 'm4 6 4 4 4-4'} fill="none" stroke="currentColor" strokeWidth="1.5" />
+                </svg>
+            </button>
+
+            <form
+                method="post"
+                id="email-sign-in"
+                hidden={!emailOpen}
+                aria-label="Email sign-in"
+                onSubmit={event => {
+                    event.preventDefault();
+                    void submit('password', new FormData(event.currentTarget));
+                }}
+                className="ezil-lock-email"
+            >
                 <input type="hidden" name="returnUrl" value={returnUrl} />
                 <div className="space-y-1.5">
-                    <label htmlFor="email" className="text-small text-gray-400">
-                        Email
-                    </label>
+                    <label htmlFor="email" className="text-small text-white/80">Email</label>
                     <input
+                        ref={email}
                         id="email"
                         name="email"
                         type="email"
                         required
                         autoComplete="email"
-                        className="w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-sm text-offwhite outline-none focus:border-teal"
+                        autoCapitalize="none"
+                        spellCheck={false}
+                        disabled={busy}
+                        className="ezil-lock-input"
                     />
                 </div>
-                <div className="space-y-1.5">
-                    <label htmlFor="password" className="text-small text-gray-400">
-                        Password
-                    </label>
+                <div className="mt-3 space-y-1.5">
+                    <label htmlFor="password" className="text-small text-white/80">Password</label>
                     <input
                         id="password"
                         name="password"
                         type="password"
                         required
                         autoComplete="current-password"
-                        className="w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-sm text-offwhite outline-none focus:border-teal"
+                        disabled={busy}
+                        className="ezil-lock-input"
                     />
                 </div>
-                {state.error && <p className="text-small text-red-400">{state.error}</p>}
-                <button
-                    type="submit"
-                    disabled={busy}
-                    className="w-full rounded-md bg-teal px-4 py-2.5 text-sm font-medium text-black transition-opacity hover:opacity-90 disabled:opacity-50"
-                >
-                    {busy ? 'Please wait…' : 'Sign in'}
+                <button type="submit" disabled={busy} className="ezil-lock-password">
+                    {pending === 'password' ? 'Signing in…' : 'Sign in'}
                 </button>
+                <p className="mt-3 text-center text-xs leading-relaxed text-white/65">
+                    Email and password work for existing accounts. New accounts start with Continue with Google.
+                </p>
             </form>
-
-            <p className="text-small text-gray-400">
-                Email and password work for existing accounts. New accounts start with Continue with Google.
-            </p>
         </div>
     );
 }

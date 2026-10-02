@@ -67,7 +67,7 @@ async function openDesktop(ctx) {
   const p = await ctx.newPage();
   const resizes = observeScreenResizes(p, APP);
   try {
-    await p.goto(`${APP}/login`, { waitUntil: 'domcontentloaded' });
+    await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
     await p.fill('#email', EMAIL); await p.fill('#password', PASS);
     await Promise.all([
       p.waitForURL(u => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),
