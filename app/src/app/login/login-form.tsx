@@ -1,6 +1,6 @@
 'use client';
 
-import { useActionState, useState } from 'react';
+import { useActionState, useEffect, useState } from 'react';
 
 import { signInWithGoogle, signInWithPassword, type AuthActionResult } from './actions';
 
@@ -10,14 +10,28 @@ const initialState: AuthActionResult = {};
  * Sign IN only. There is no sign-up mode, no "Create account" toggle and no
  * `new-password` branch. See `actions.ts` and `entry-contract.test.ts`.
  *
- * New accounts come from "Continue with Google": the first sign-in creates the
- * account inside Supabase's OAuth flow, not through any sign-up call here.
- * Email and password are for accounts that already have one (for example one
- * created with `bun tools/invite.ts add <email>`).
+ * One button does everything a newcomer needs: "Continue with Google" signs
+ * in an existing account, and the first sign-in creates the account inside
+ * Supabase's OAuth flow, not through any sign-up call here. Email and password
+ * are for accounts that already have one (for example one created with
+ * `bun tools/invite.ts add <email>`); that panel stays folded away until asked
+ * for, or opens straight away from `/login?method=email`.
  */
-export function LoginForm({ returnUrl }: { returnUrl: string }) {
-    /** Set once we have started leaving; keeps the button from re-arming. */
+export function LoginForm({ returnUrl, startWithEmail }: { returnUrl: string; startWithEmail: boolean }) {
+    /** Set once we have started leaving; keeps the buttons from re-arming. */
     const [leaving, setLeaving] = useState(false);
+    const [emailOpen, setEmailOpen] = useState(startWithEmail);
+
+    // Back from Google's account chooser restores this page from the
+    // back/forward cache exactly as it was left: mid-departure, buttons held
+    // down. Re-arm them, or the only way forward is a reload.
+    useEffect(() => {
+        const rearm = (event: PageTransitionEvent) => {
+            if (event.persisted) setLeaving(false);
+        };
+        window.addEventListener('pageshow', rearm);
+        return () => window.removeEventListener('pageshow', rearm);
+    }, []);
 
     const [state, formAction, isPending] = useActionState(async (
         _prev: AuthActionResult,
@@ -52,68 +66,88 @@ export function LoginForm({ returnUrl }: { returnUrl: string }) {
     const busy = isPending || leaving;
 
     return (
-        <div className="space-y-6">
+        <div className="mt-6 flex w-full flex-col items-center">
             <form
+                className="w-full max-w-[18rem]"
                 action={() => {
+                    // The server action ends in a redirect to Google, so this
+                    // page is about to unload; hold the button down until it
+                    // does rather than letting a second click start a second
+                    // flow.
+                    setLeaving(true);
                     void signInWithGoogle(returnUrl);
                 }}
             >
                 <button
                     type="submit"
-                    className="flex w-full items-center justify-center gap-2 rounded-md border border-white/15 bg-white/5 px-4 py-2.5 text-sm font-medium text-offwhite transition-colors hover:bg-white/10"
+                    disabled={leaving}
+                    className="group flex h-12 w-full items-center justify-center gap-2.5 rounded-full bg-white px-5 text-[0.9375rem] font-semibold text-[#0b0f1d] shadow-[0_10px_40px_-8px_rgba(0,200,208,0.55)] transition duration-200 hover:-translate-y-0.5 hover:shadow-[0_14px_44px_-6px_rgba(112,86,255,0.6)] focus-visible:ring-4 focus-visible:ring-teal/50 focus-visible:outline-none active:translate-y-0 disabled:translate-y-0 disabled:opacity-80"
                 >
-                    <GoogleIcon className="h-4 w-4" />
+                    {leaving && !emailOpen ? (
+                        <span className="h-4 w-4 animate-spin rounded-full border-2 border-[#0b0f1d]/25 border-t-[#0b0f1d]" aria-hidden="true" />
+                    ) : (
+                        <GoogleIcon className="h-[1.125rem] w-[1.125rem]" />
+                    )}
                     Continue with Google
                 </button>
             </form>
 
-            <div className="flex items-center gap-4">
-                <div className="h-px flex-1 bg-white/10" />
-                <span className="text-small text-gray-500">or</span>
-                <div className="h-px flex-1 bg-white/10" />
-            </div>
-
-            <form action={formAction} className="space-y-3">
-                <input type="hidden" name="returnUrl" value={returnUrl} />
-                <div className="space-y-1.5">
-                    <label htmlFor="email" className="text-small text-gray-400">
-                        Email
-                    </label>
-                    <input
-                        id="email"
-                        name="email"
-                        type="email"
-                        required
-                        autoComplete="email"
-                        className="w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-sm text-offwhite outline-none focus:border-teal"
-                    />
-                </div>
-                <div className="space-y-1.5">
-                    <label htmlFor="password" className="text-small text-gray-400">
-                        Password
-                    </label>
-                    <input
-                        id="password"
-                        name="password"
-                        type="password"
-                        required
-                        autoComplete="current-password"
-                        className="w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-sm text-offwhite outline-none focus:border-teal"
-                    />
-                </div>
-                {state.error && <p className="text-small text-red-400">{state.error}</p>}
+            {!emailOpen && (
                 <button
-                    type="submit"
-                    disabled={busy}
-                    className="w-full rounded-md bg-teal px-4 py-2.5 text-sm font-medium text-black transition-opacity hover:opacity-90 disabled:opacity-50"
+                    type="button"
+                    onClick={() => setEmailOpen(true)}
+                    className="mt-4 text-small text-white/60 underline-offset-4 transition-colors hover:text-white hover:underline"
                 >
-                    {busy ? 'Please wait…' : 'Sign in'}
+                    Sign in with email and password
                 </button>
-            </form>
+            )}
 
-            <p className="text-small text-gray-400">
-                Email and password work for existing accounts. New accounts start with Continue with Google.
-            </p>
+            {emailOpen && (
+                <form
+                    action={formAction}
+                    className="mt-5 w-full space-y-3 rounded-2xl border border-white/10 bg-white/[0.06] p-4 shadow-2xl shadow-black/40 backdrop-blur-xl"
+                >
+                    <input type="hidden" name="returnUrl" value={returnUrl} />
+                    <div className="space-y-1.5">
+                        <label htmlFor="email" className="text-small text-white/60">
+                            Email
+                        </label>
+                        <input
+                            id="email"
+                            name="email"
+                            type="email"
+                            required
+                            autoComplete="email"
+                            autoFocus={!startWithEmail}
+                            className="w-full rounded-lg border border-white/15 bg-black/30 px-3 py-2 text-sm text-white outline-none placeholder:text-white/30 focus:border-teal"
+                        />
+                    </div>
+                    <div className="space-y-1.5">
+                        <label htmlFor="password" className="text-small text-white/60">
+                            Password
+                        </label>
+                        <input
+                            id="password"
+                            name="password"
+                            type="password"
+                            required
+                            autoComplete="current-password"
+                            className="w-full rounded-lg border border-white/15 bg-black/30 px-3 py-2 text-sm text-white outline-none focus:border-teal"
+                        />
+                    </div>
+                    {state.error && <p role="alert" className="text-small text-red-300">{state.error}</p>}
+                    <button
+                        type="submit"
+                        disabled={busy}
+                        className="w-full rounded-lg bg-white/90 px-4 py-2.5 text-sm font-semibold text-[#0b0f1d] transition-opacity hover:opacity-90 disabled:opacity-50"
+                    >
+                        {busy ? 'Please wait…' : 'Sign in'}
+                    </button>
+                    <p className="text-mini text-white/45">
+                        Email and password work for existing accounts. New accounts start with Continue with Google.
+                    </p>
+                </form>
+            )}
         </div>
     );
 }

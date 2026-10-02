@@ -45,7 +45,9 @@ const WALLPAPERS = [
     // rim that rises behind the dock, with a warm sunrise where the dock sits.
     // Five gradient layers, no image. `.desktop.ezil-desktop` in
     // `ui/ezil-shell.css` server-paints the same layers so the first frame and
-    // the booted shell match.
+    // the booted shell match, and the sign-in lock screen
+    // (`.ezil-lock-wallpaper` in `app/src/app/globals.css`) uses them too, so
+    // signing in reveals the same sky. Change all three together.
     {
         id: 'horizon',
         label: 'Horizon',

@@ -112,6 +112,32 @@ describe('the sign-in page says how to get an account', () => {
     });
 });
 
+describe('the lock screen', () => {
+    it('leads with one button: Continue with Google, before any email field', () => {
+        const body = code(loginForm);
+        expect(body.indexOf('Continue with Google')).toBeGreaterThan(-1);
+        expect(body.indexOf('Continue with Google')).toBeLessThan(body.indexOf('id="email"'));
+    });
+
+    it('keeps email and password one click away, and opens them from ?method=email', () => {
+        expect(code(loginForm)).toMatch(/useState\(startWithEmail\)/);
+        expect(code(loginPage)).toMatch(/startWithEmail=\{params\[METHOD_PARAM\] === 'email'\}/);
+        expect(code(loginPage)).toMatch(/const METHOD_PARAM = 'method'/);
+    });
+
+    it('never shows the ?error value itself, only fixed wording', () => {
+        const body = code(loginPage);
+        expect(body).toMatch(/function noticeFor\(/);
+        expect(body).not.toMatch(/\{params\.error\}/);
+        expect(body).not.toMatch(/\{error\}/);
+    });
+
+    it('re-arms the buttons when Back restores the page from the bfcache', () => {
+        expect(code(loginForm)).toMatch(/addEventListener\('pageshow'/);
+        expect(code(loginForm)).toMatch(/event\.persisted/);
+    });
+});
+
 describe('the invited-user landing keeps the document-load contract', () => {
     it('/auth/confirm is a route handler, whose 3xx the browser follows', () => {
         expect(confirmRoute).toMatch(/export async function GET\(/);

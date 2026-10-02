@@ -51,7 +51,7 @@ for (let n = 1; n <= runs; n++) {
     userAgent:'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1' });
   await configureAppContext(ctx);
   const p = await ctx.newPage();
-  await p.goto(`${APP}/login`,{waitUntil:'domcontentloaded'});
+  await p.goto(`${APP}/login?method=email`,{waitUntil:'domcontentloaded'});
   await p.fill('#email', EMAIL); await p.fill('#password', PASS);
   await Promise.all([p.waitForURL(u=>!/\/login/.test(u.toString()),{timeout:60000}).catch(()=>{}),
     p.locator('form').filter({has:p.locator('#email')}).locator('button[type=submit]').click()]);

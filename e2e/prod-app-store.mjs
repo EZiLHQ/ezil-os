@@ -61,7 +61,7 @@ try {
             });
 
             try {
-                await page.goto(new URL('/login?returnUrl=%2Fos', app).toString(), { waitUntil: 'domcontentloaded' });
+                await page.goto(new URL('/login?returnUrl=%2Fos&method=email', app).toString(), { waitUntil: 'domcontentloaded' });
                 await page.locator('#email').fill(email);
                 await page.locator('#password').fill(password);
                 await page.locator('form').filter({ has: page.locator('#email') })

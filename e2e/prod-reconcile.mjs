@@ -71,7 +71,7 @@ try {
     if (/\/api\/shell\/screen/.test(r.url())) screenCalls.push(`${r.method()} ${r.url().split('?')[0]}`);
   });
 
-  await p.goto(`${APP}/login`, { waitUntil: 'domcontentloaded' });
+  await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
   await p.fill('#email', EMAIL); await p.fill('#password', PASS);
   await Promise.all([
     p.waitForURL(u => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),

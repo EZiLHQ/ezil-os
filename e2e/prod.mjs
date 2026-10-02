@@ -105,7 +105,7 @@ async function browserTiers() {
       const badResponses = [];
       p.on('response', r => { if (r.status() >= 400) badResponses.push(`${r.status()} ${r.url()}`); });
 
-      await p.goto(`${APP}/login`, { waitUntil: 'domcontentloaded' });
+      await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
       await p.fill('#email', EMAIL); await p.fill('#password', PASS);
       await Promise.all([
         p.waitForURL(u => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),

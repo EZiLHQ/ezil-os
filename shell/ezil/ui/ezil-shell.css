@@ -54,7 +54,8 @@
     height: auto !important;
     /* The default "Horizon" wallpaper, server-painted so the first frame
      * matches the booted shell. Must stay identical to the `horizon` preset
-     * in `ui/Settings/tabs/appearance.js`. */
+     * in `ui/Settings/tabs/appearance.js` and to `.ezil-lock-wallpaper` in
+     * `app/src/app/globals.css` (the sign-in lock screen). */
     background-color: #04060c;
     background-image:
         radial-gradient(24% 6% at 50% 91.2%, rgba(255, 200, 150, 0.6) 0%, rgba(255, 150, 100, 0.18) 55%, rgba(255, 150, 100, 0) 100%),
