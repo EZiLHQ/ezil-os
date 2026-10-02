@@ -289,6 +289,22 @@ describe.skipIf(!imagePresent)(`persistent compute: checkpoint survives real con
     expect((await must(b, 'ls -A /workspace | wc -l')).trim()).toBe('0');
   }, T);
 
+  it('FINDING: each changed checkpoint stores a full new snapshot and superseded generations are never deleted (unbounded growth)', async () => {
+    const store = await makeStore(); const prefix = prefixFor('growth');
+    const a = await startComputer('gro-a');
+    await must(a, 'mkdir -p /workspace && head -c 1500000 /dev/urandom > /workspace/blob.bin && echo 0 > /workspace/n.txt'); await markHydrated(a, prefix);
+    for (let i = 1; i <= 3; i++) { await must(a, `echo ${i} > /workspace/n.txt`); expect((await flush(a, store, prefix)).ok).toBe(true); }
+    const generations = new Set<string>(); let bytes = 0; let cursor: string | undefined;
+    do {
+      const page = await store.list({ prefix: `${prefix}/.ezil-snapshots/`, cursor });
+      for (const o of page.objects) { const g = o.key.slice(prefix.length + 1).split('/')[1]!; if (g !== 'latest.json') { generations.add(g); bytes += o.size ?? 0; } }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    // A one-byte edit re-uploads the whole 1.5 MB workspace; all three generations remain.
+    expect(generations.size).toBe(3);
+    expect(bytes).toBeGreaterThan(3 * 1_500_000);
+  }, T);
+
   it('FINDING: a backslash in any file name, an escaping symlink, or a >512 MiB workspace makes every checkpoint fail (readiness would 503)', async () => {
     const store = await makeStore();
     const c = await startComputer('lim-c'); const p0 = prefixFor('backslash');
