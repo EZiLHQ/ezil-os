@@ -22,6 +22,7 @@
 // trademark policy forbids shipping the marks in a modified distribution.
 // The bare `html_encode` global this file calls is still installed by
 // `lib/html-entities.js`, which `lib/ezil-vendor.js` evaluates first.
+// MODIFIED BY EZIL 2026-10-02: legal links point to the hosted OS's own pages.
 
 import en from './translations/en.js';
 
@@ -31,8 +32,8 @@ window.listSupportedLanguages = () => Object.keys(translations).map(lang => tran
 
 const variables = {
     docs: 'https://ezil.org/docs',
-    terms: 'https://ezil.org/terms',
-    privacy: 'https://ezil.org/privacy',
+    terms: 'https://os.ezil.org/terms',
+    privacy: 'https://os.ezil.org/privacy',
 };
 
 function ReplacePlaceholders (str, arg_variables = {}) {

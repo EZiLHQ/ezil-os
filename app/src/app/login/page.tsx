@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import type { Viewport } from 'next';
 
 import { RETURN_URL_PARAM, Routes, safeReturnUrl } from '@/utils/constants';
 import { LockClock } from './lock-clock';
@@ -6,6 +7,14 @@ import { LoginForm } from './login-form';
 
 /** `/login?method=email` opens the email and password panel straight away. */
 const METHOD_PARAM = 'method';
+
+// The login form scrolls with the Android keyboard; the desktop keeps its
+// separate overlay policy from the root layout.
+export const viewport: Viewport = {
+    width: 'device-width',
+    initialScale: 1,
+    interactiveWidget: 'resizes-content',
+};
 
 /**
  * What a failed sign-in says. The `error` query value is matched against known
@@ -94,20 +103,16 @@ export default async function LoginPage({
             </section>
 
             <footer className="ezil-lock-footer">
-                By continuing you agree to our{' '}
+                By continuing, you agree to our{' '}
                 <Link
-                    href="https://ezil.org/html/terms-and-conditions.html"
-                    target="_blank"
-                    rel="noopener noreferrer"
+                    href="/terms"
                     className="underline decoration-white/30 underline-offset-2 transition-colors hover:text-white"
                 >
                     Terms
                 </Link>{' '}
-                and{' '}
+                and acknowledge our{' '}
                 <Link
-                    href="https://ezil.org/html/privacy-policy.html"
-                    target="_blank"
-                    rel="noopener noreferrer"
+                    href="/privacy"
                     className="underline decoration-white/30 underline-offset-2 transition-colors hover:text-white"
                 >
                     Privacy Policy
