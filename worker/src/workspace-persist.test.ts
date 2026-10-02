@@ -162,9 +162,14 @@ describe('atomic Git workspace checkpoints (real filesystem and Git)', () => {
   });
 
   for (const target of ['/etc/passwd', '../../escape']) {
-    it(`refuses unsafe symlink ${target}`, async () => {
-      const { root } = await workspace(); const bucket = new Bucket(); await symlink(target, `${root}/link`);
-      expect((await flush(root, bucket)).ok).toBe(false); expect(bucket.data.has(headKey)).toBe(false);
+    it(`never archives unsafe symlink ${target}: skipped and reported, the rest still checkpoints`, async () => {
+      const { base, root } = await workspace(); const bucket = new Bucket(); await symlink(target, `${root}/link`);
+      await writeFile(`${root}/keep.txt`, 'keep');
+      const out = await flush(root, bucket);
+      expect(out.ok).toBe(true); expect(out.skippedUnsupported).toBe(1); expect(bucket.data.has(headKey)).toBe(true);
+      expect((await hydrate(`${base}/restored`, bucket)).ok).toBe(true);
+      expect((await container.exists(`${base}/restored/link`)).exists).toBe(false);
+      expect(await readFile(`${base}/restored/keep.txt`, 'utf8')).toBe('keep');
     });
   }
   it('refuses active Git locks and stale hydration flags after container replacement', async () => {
@@ -192,15 +197,20 @@ describe('legacy import and metadata validation', () => {
     expect((await hydrate(`${base}/new`, bucket)).ok).toBe(true);
     expect((await container.exists(`${base}/new/src/a`)).exists).toBe(false);
   });
-  it('rejects sentinel-only, path traversal and incomplete listings', async () => {
+  it('sentinel-only opens empty, path traversal is skipped (never written), incomplete listings still fail', async () => {
     const base = await temp(); const bucket = new Bucket();
     await bucket.put(`${prefix}/.ezil-seeded.json`, new TextEncoder().encode('seed'));
     // Use the actual sentinel name from the seed module.
     bucket.data.clear(); const { SEED_SENTINEL_FILENAME } = await import('./workspace-seed');
     await bucket.put(`${prefix}/${SEED_SENTINEL_FILENAME}`, new Uint8Array());
-    expect((await hydrate(`${base}/sentinel`, bucket)).ok).toBe(false);
-    bucket.data.clear(); await bucket.put(`${prefix}/../escape`, new Uint8Array());
-    expect((await hydrate(`${base}/traversal`, bucket)).ok).toBe(false);
+    const sentinelOnly = await hydrate(`${base}/sentinel`, bucket);
+    expect(sentinelOnly.ok).toBe(true); expect(sentinelOnly.filesWritten).toBe(0);
+    bucket.data.clear(); await bucket.put(`${prefix}/../escape`, new Uint8Array([1]));
+    await bucket.put(`${prefix}/kept.txt`, new TextEncoder().encode('kept'));
+    const traversal = await hydrate(`${base}/traversal`, bucket);
+    expect(traversal.ok).toBe(true); expect(traversal.skippedUnsafe).toBe(1);
+    expect(await readFile(`${base}/traversal/kept.txt`, 'utf8')).toBe('kept');
+    expect((await container.exists(`${base}/escape`)).exists).toBe(false);
     bucket.data.clear(); bucket.list = async () => ({ objects: [], truncated: true, cursor: undefined });
     expect((await hydrate(`${base}/partial`, bucket)).ok).toBe(false);
   });

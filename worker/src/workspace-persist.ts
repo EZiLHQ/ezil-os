@@ -43,7 +43,8 @@ export interface HydrateR2BucketLike {
     truncated: boolean;
     cursor?: string;
   }>;
-  get(key: string): Promise<HydrateR2ObjectBodyLike | null>;
+  /** `range` reads part of an object (R2 binding / S3 Range); used only for large legacy objects. */
+  get(key: string, options?: { range?: { offset: number; length: number } }): Promise<HydrateR2ObjectBodyLike | null>;
 }
 export interface FlushR2BucketLike {
   get(key: string): Promise<HydrateR2ObjectBodyLike | null>;
@@ -80,6 +81,8 @@ export interface HydrateOutcome {
   filesWritten: number;
   filesFailed: number;
   emptyPrefix: boolean;
+  /** Legacy objects left in the store and NOT imported (unsafe/reserved names). Visible, never fatal. */
+  skippedUnsafe?: number;
 }
 export interface HydrateDeps {
   bucket: HydrateR2BucketLike;
@@ -114,6 +117,11 @@ export function parseSnapshot(raw: string): Snapshot {
 }
 function validPrefix(prefix: string): boolean {
   return !!prefix && prefix.split('/').every(p => p && p !== '.' && p !== '..');
+}
+/** Largest legacy object read in one piece; larger ones are imported in ranges. */
+const LEGACY_INLINE_BYTES = 8 * SNAPSHOT_CHUNK_BYTES;
+function legacyImportable(rel: string): boolean {
+  return safeRelative(rel) && ![HYDRATE_MARKER_FILENAME, FLUSH_MANIFEST_FILENAME].includes(rel.split('/')[0]!);
 }
 function safeRelative(path: string): boolean {
   return !!path && !/[\\\x00-\x1f\x7f]/.test(path) && path.split('/').every(p => p && p !== '.' && p !== '..');
@@ -163,7 +171,10 @@ export async function flushWorkspaceToR2(deps: FlushDeps): Promise<FlushOutcome>
     const previous = await readHead(bucket, prefix);
     const expected = previous?.snapshot.generation ?? null;
     const raw = await command(container, { op: 'capture', root, work, prefix, expected });
-    const snapshot = parseSnapshot(JSON.stringify({ ...JSON.parse(raw), version: SNAPSHOT_VERSION, generation }));
+    const { skipped, ...captured } = JSON.parse(raw) as Record<string, unknown>;
+    outcome.skippedUnsupported = Number.isInteger(skipped) ? skipped as number : 0;
+    if (outcome.skippedUnsupported) log(`[workspace-persist] ${outcome.skippedUnsupported} unsupported entries (unsafe names, escaping links, special files) not checkpointed`);
+    const snapshot = parseSnapshot(JSON.stringify({ ...captured, version: SNAPSHOT_VERSION, generation }));
     if (previous?.snapshot.sha256 !== snapshot.sha256) {
       for (const [i, c] of snapshot.chunks.entries()) {
         const file = await container.readFile(`${work}/${i}`, { encoding: 'base64' });
@@ -240,6 +251,9 @@ export async function hydrateWorkspaceFromR2(deps: HydrateDeps): Promise<Hydrate
     // A sentinel without content, incomplete pagination, or orphan snapshot
     // chunks is not proof of an empty workspace and must not authorize a seed.
     const keys: string[] = [];
+    const sizes = new Map<string, number>();
+    let skippedUnsafe = 0;
+    let orphanChunks = 0;
     const seenKeys = new Set<string>();
     const cursors = new Set<string>();
     let cursor: string | undefined;
@@ -249,22 +263,30 @@ export async function hydrateWorkspaceFromR2(deps: HydrateDeps): Promise<Hydrate
       for (const object of page.objects) {
         if (!object.key.startsWith(`${prefix}/`)) throw new Error('out-of-prefix object');
         const rel = object.key.slice(prefix.length + 1);
-        if (!safeRelative(rel)) throw new Error('unsafe legacy path');
-        if (rel.startsWith('.ezil-snapshots/')) throw new Error('uncommitted snapshot');
+        // No head means no snapshot was ever committed (acknowledged): chunks
+        // left by a checkpoint that failed before its head put are not data.
+        if (rel.startsWith('.ezil-snapshots/')) { orphanChunks++; continue; }
         if ([SEED_SENTINEL_FILENAME, WORKSPACE_HEARTBEAT_FILENAME].includes(rel)) { bookkeeping = true; continue; }
-        if ([HYDRATE_MARKER_FILENAME, FLUSH_MANIFEST_FILENAME].includes(rel.split('/')[0])) throw new Error('reserved legacy path');
+        // Names the codec cannot restore safely stay in the store untouched
+        // (recoverable) and are reported; they must not lock the user out.
+        if (!legacyImportable(rel)) { skippedUnsafe++; continue; }
         if (seenKeys.has(rel) || keys.length >= MAX_ENTRIES) throw new Error('invalid legacy listing');
         seenKeys.add(rel);
         keys.push(rel);
+        sizes.set(rel, typeof object.size === 'number' ? object.size : -1);
       }
       cursor = page.truncated ? page.cursor : undefined;
       if (page.truncated && (!cursor || cursors.has(cursor))) throw new Error('incomplete legacy listing');
       if (cursor) cursors.add(cursor);
     } while (cursor);
     outcome.listOk = true;
+    outcome.skippedUnsafe = skippedUnsafe;
+    if (skippedUnsafe) log(`[workspace-persist] ${skippedUnsafe} legacy objects with unsafe names left in place, not imported`);
+    if (orphanChunks) log(`[workspace-persist] ${orphanChunks} uncommitted snapshot chunks ignored`);
     if (!keys.length) {
-      if (bookkeeping) throw new Error('workspace initialization incomplete');
-      return { ...outcome, ok: true, emptyPrefix: true };
+      // Only bookkeeping or uncommitted chunks: no user content was ever made
+      // durable, so the workspace is empty (what main's copy-sync restored too).
+      return { ...outcome, ok: true, emptyPrefix: !bookkeeping && !orphanChunks, skippedUnsafe };
     }
     const stage = `${root}.ezil-legacy-${work.slice('/tmp/ezil-snapshot-'.length)}`;
     await container.mkdir(work, { recursive: false });
@@ -273,15 +295,37 @@ export async function hydrateWorkspaceFromR2(deps: HydrateDeps): Promise<Hydrate
     const versions = new Map<string, string>();
     try {
       for (const rel of keys) {
+        const parent = rel.lastIndexOf('/');
+        if (parent !== -1) await container.mkdir(`${stage}/${rel.slice(0, parent)}`, { recursive: true });
+        const listedSize = sizes.get(rel) ?? -1;
+        if (listedSize > LEGACY_INLINE_BYTES) {
+          // main stored files whole, with no size cap. Stream them in bounded
+          // ranges so neither the Durable Object nor one SDK call holds the file.
+          let version: string | undefined;
+          for (let offset = 0; offset < listedSize; offset += SNAPSHOT_CHUNK_BYTES) {
+            const length = Math.min(SNAPSHOT_CHUNK_BYTES, listedSize - offset);
+            const part = await bucket.get(`${prefix}/${rel}`, { range: { offset, length } });
+            if (!part) throw new Error('legacy object disappeared');
+            if (!part.etag || (version !== undefined && part.etag !== version)) throw new Error('legacy workspace changed');
+            version = part.etag;
+            const bytes = new Uint8Array(await part.arrayBuffer());
+            if (bytes.length !== length) throw new Error('legacy range read short');
+            total += length;
+            if (total > MAX_CHUNKS * SNAPSHOT_CHUNK_BYTES) throw new Error('legacy workspace too large');
+            const partPath = `${work}/legacy-part`;
+            requireSdkSuccess(await container.writeFile(partPath, bytesToBase64(bytes), { encoding: 'base64' }));
+            await command(container, { op: 'append', root, work, stage, rel, part: partPath, create: offset === 0 });
+          }
+          versions.set(rel, version!);
+          continue;
+        }
         const body = await bucket.get(`${prefix}/${rel}`);
         if (!body) throw new Error('legacy object disappeared');
         if (!body.etag) throw new Error('legacy version missing');
         versions.set(rel, body.etag);
-        const bytes = await readBounded(body, 8 * SNAPSHOT_CHUNK_BYTES);
+        const bytes = await readBounded(body, LEGACY_INLINE_BYTES);
         total += bytes.length;
         if (total > MAX_CHUNKS * SNAPSHOT_CHUNK_BYTES) throw new Error('legacy workspace too large');
-        const parent = rel.lastIndexOf('/');
-        if (parent !== -1) await container.mkdir(`${stage}/${rel.slice(0, parent)}`, { recursive: true });
         requireSdkSuccess(await container.writeFile(`${stage}/${rel}`, bytesToBase64(bytes), { encoding: 'base64' }));
       }
       // Legacy storage has no atomic manifest. Refuse a changed listing or
@@ -295,10 +339,11 @@ export async function hydrateWorkspaceFromR2(deps: HydrateDeps): Promise<Hydrate
           if (!object.key.startsWith(`${prefix}/`)) throw new Error('out-of-prefix object');
           const rel = object.key.slice(prefix.length + 1);
           if ([SEED_SENTINEL_FILENAME, WORKSPACE_HEARTBEAT_FILENAME].includes(rel)) continue;
+          if (rel.startsWith('.ezil-snapshots/') || !legacyImportable(rel)) continue;
           if (!remaining.delete(rel)) throw new Error('legacy workspace changed');
-          const body = await bucket.get(object.key);
+          // A one-byte range is enough to compare the version without re-reading the file.
+          const body = await bucket.get(object.key, (sizes.get(rel) ?? 0) > LEGACY_INLINE_BYTES ? { range: { offset: 0, length: 1 } } : undefined);
           if (!body || body.etag !== versions.get(rel)) throw new Error('legacy workspace changed');
-          await readBounded(body, 8 * SNAPSHOT_CHUNK_BYTES);
         }
         checkCursor = page.truncated ? page.cursor : undefined;
         if (page.truncated && (!checkCursor || checkedCursors.has(checkCursor))) throw new Error('incomplete legacy listing');

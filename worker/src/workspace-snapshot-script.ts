@@ -22,6 +22,18 @@ def safe_name(name):
     assert all(x not in ('', '.', '..') for x in name.split('/')), 'unsafe archive path'
     assert name.split('/')[0] not in INTERNAL, 'reserved archive path'
 
+def representable(name):
+    # Capture-side twin of safe_name: user content we cannot archive safely is
+    # SKIPPED (and counted), never allowed to fail the whole checkpoint.
+    return (isinstance(name, str) and bool(name) and not name.startswith('/') and '\\' not in name
+        and all(x not in ('', '.', '..') for x in name.split('/')) and name.split('/')[0] not in INTERNAL)
+
+def link_ok(name, target):
+    if not target or os.path.isabs(target) or '\\' in target: return False
+    resolved = os.path.normpath(os.path.join(os.path.dirname(name), target))
+    if resolved == '..' or resolved.startswith('../'): return False
+    return os.path.commonpath([root, os.path.realpath(os.path.join(root, name))]) == root
+
 def safe_link(name, target):
     assert target and not os.path.isabs(target) and '\\' not in target, 'unsafe symlink'
     resolved = os.path.normpath(os.path.join(os.path.dirname(name), target))
@@ -93,6 +105,7 @@ def inventory():
                                 parts = path.split('/')
                                 tracked.update('/'.join(parts[:i]) for i in range(1, len(parts)+1))
     entries = []
+    skipped = []
     def visit(directory, rel=''):
         with os.scandir(directory) as iterator:
             children = sorted(iterator, key=lambda e: e.name)
@@ -103,13 +116,23 @@ def inventory():
             in_git = '.git' in name.split('/')
             if not in_git and e.name in CACHES and name not in tracked:
                 continue
+            if not in_git and not representable(name):
+                skipped.append(name)
+                continue
             safe_name(name)
             s = e.stat(follow_symlinks=False)
             assert not (in_git and name.endswith('.lock')), 'Git operation in progress'
             assert not (e.name == '.git' and not stat.S_ISDIR(s.st_mode)), 'external Git directory unsupported'
             assert not (name.endswith('/objects/info/alternates') and s.st_size), 'external Git objects unsupported'
-            assert stat.S_ISREG(s.st_mode) or stat.S_ISDIR(s.st_mode) or stat.S_ISLNK(s.st_mode), 'unsupported file type'
+            supported = stat.S_ISREG(s.st_mode) or stat.S_ISDIR(s.st_mode) or stat.S_ISLNK(s.st_mode)
+            if not supported and not in_git:
+                skipped.append(name)  # sockets, FIFOs, devices: no restorable content
+                continue
+            assert supported, 'unsupported file type'
             target = os.readlink(e.name, dir_fd=directory) if stat.S_ISLNK(s.st_mode) else None
+            if target is not None and not in_git and not link_ok(name, target):
+                skipped.append(name)  # absolute/escaping links are never archived
+                continue
             if target is not None:
                 safe_link(name, target)
                 assert os.path.commonpath([root, os.path.realpath(os.path.join(root, name))]) == root, 'escaping symlink chain'
@@ -120,14 +143,14 @@ def inventory():
                     assert os.fstat(child).st_ino == s.st_ino, 'workspace changed'
                     visit(child, name)
     with directory_fd(root) as fd: visit(fd)
-    return entries
+    return entries, skipped
 
 def stamp(entries):
     return [(n, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_ino, t) for n,s,t in entries]
 
 def capture(path):
     marker()
-    entries = inventory()
+    entries, skipped = inventory()
     with tarfile.open(path, 'w', format=tarfile.PAX_FORMAT) as tar:
         for name, s, target in entries:
             info = tarfile.TarInfo(name)
@@ -147,7 +170,7 @@ def capture(path):
                     before = os.fstat(f.fileno())
                     assert (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns), 'workspace changed'
                     tar.addfile(info, f)
-    assert stamp(entries) == stamp(inventory()), 'workspace changed'
+    assert stamp(entries) == stamp(inventory()[0]), 'workspace changed'
     assert os.path.getsize(path) <= LIMIT, 'snapshot byte limit'
     digest = hashlib.sha256()
     chunks = []
@@ -157,7 +180,7 @@ def capture(path):
             if not data: break
             digest.update(data)
             chunks.append({'size':len(data), 'sha256':hashlib.sha256(data).hexdigest()})
-    return {'sha256':digest.hexdigest(), 'chunks':chunks, 'entries':len(entries)}
+    return {'sha256':digest.hexdigest(), 'chunks':chunks, 'entries':len(entries), 'skipped':len(skipped)}
 
 def restore():
     archive = os.path.join(work, 'archive.tar')
@@ -242,6 +265,22 @@ try:
             os.replace(tmp, path)
         finally:
             if os.path.exists(tmp): os.unlink(tmp)
+    elif op == 'append':
+        # Assemble one large legacy object from bounded parts inside the staging tree.
+        stage = p['stage']
+        assert stage == root + '.ezil-legacy-' + os.path.basename(work)[len('ezil-snapshot-'):], 'invalid legacy staging path'
+        name = p['rel']
+        safe_name(name)
+        part = p['part']
+        assert part == os.path.join(work, 'legacy-part'), 'invalid part path'
+        parent, leaf = os.path.split(name)
+        flags = os.O_WRONLY | os.O_NOFOLLOW | ((os.O_CREAT | os.O_EXCL) if p.get('create') else os.O_APPEND)
+        with directory_fd(stage) as stage_fd, directory_fd(parent, stage_fd) as fd:
+            out_fd = os.open(leaf, flags, 0o644, dir_fd=fd)
+            with os.fdopen(out_fd, 'wb') as out, open(part, 'rb') as src:
+                assert stat.S_ISREG(os.fstat(out.fileno()).st_mode), 'not a regular file'
+                shutil.copyfileobj(src, out)
+        os.unlink(part)
     elif op in ('adopt', 'cleanup-legacy'):
         stage = p['stage']
         assert stage == root + '.ezil-legacy-' + os.path.basename(work)[len('ezil-snapshot-'):], 'invalid legacy staging path'

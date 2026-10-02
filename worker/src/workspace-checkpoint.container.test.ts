@@ -23,7 +23,9 @@ import { createHash, randomBytes } from 'node:crypto';
 import {
   flushWorkspaceToR2, hydrateWorkspaceFromR2, HYDRATE_MARKER_FILENAME, SNAPSHOT_HEAD, serializeHydrateMarker,
   type FlushContainerLike, type FlushR2BucketLike, type HydrateR2BucketLike,
+  WORKSPACE_HEARTBEAT_FILENAME,
 } from './workspace-persist';
+import { SEED_SENTINEL_FILENAME } from './workspace-seed';
 
 const run = promisify(execFile);
 const IMAGE = process.env.EZIL_CHECKPOINT_IMAGE ?? process.env.EZIL_VALIDATE_IMAGE ?? 'ezil-integrated:local';
@@ -48,9 +50,12 @@ class R2Fake implements Store {
   revision = 0;
   failPutFor?: (key: string) => boolean;
   beforePut?: (key: string) => Promise<void>;
-  async get(key: string) {
+  async get(key: string, options?: { range?: { offset: number; length: number } }) {
     const v = this.data.get(key);
-    return v ? { etag: v.etag, size: v.bytes.length, arrayBuffer: async () => Uint8Array.from(v.bytes).buffer } : null;
+    if (!v) return null;
+    // R2 semantics: `size` is the whole object's size even for a range read.
+    const bytes = options?.range ? v.bytes.slice(options.range.offset, options.range.offset + options.range.length) : v.bytes;
+    return { etag: v.etag, size: v.bytes.length, arrayBuffer: async () => Uint8Array.from(bytes).buffer };
   }
   async put(key: string, bytes: Uint8Array, options?: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } }) {
     await this.beforePut?.(key);
@@ -289,6 +294,67 @@ describe.skipIf(!imagePresent)(`persistent compute: checkpoint survives real con
     expect((await must(b, 'ls -A /workspace | wc -l')).trim()).toBe('0');
   }, T);
 
+  // ── Upgrade path: what every EXISTING production workspace meets on its first boot ──
+  // origin/main's flush stores each regular file as a loose object `${prefix}/${relPath}`
+  // (no size cap, any name the filesystem allows), plus the heartbeat and seed sentinel.
+  async function seedLegacy(store: Store, prefix: string, files: Record<string, Uint8Array>) {
+    for (const [rel, bytes] of Object.entries(files)) await store.put(`${prefix}/${rel}`, bytes);
+    await store.put(`${prefix}/${SEED_SENTINEL_FILENAME}`, new TextEncoder().encode('{"seededAt":"2026-09-20T00:00:00Z"}'));
+    await store.put(`${prefix}/${WORKSPACE_HEARTBEAT_FILENAME}`, new TextEncoder().encode('2026-10-01T00:00:00Z'));
+  }
+  const legacyFiles = (): Record<string, Uint8Array> => ({
+    'README.md': new TextEncoder().encode('# my project\n'),
+    'src/app/page.tsx': new TextEncoder().encode('export default function Page() { return null }\n'),
+    'assets/video.bin': new Uint8Array(randomBytes(9 * 1024 * 1024)),   // > 8 MiB: main uploads it whole
+    'data/db.sqlite': new Uint8Array(randomBytes(300_000)),
+  });
+  async function expectFiles(c: string, files: Record<string, Uint8Array>) {
+    for (const [rel, bytes] of Object.entries(files)) {
+      expect((await must(c, `sha256sum "/workspace/${rel}" | cut -c1-64`)).trim()).toBe(sha(bytes));
+    }
+  }
+
+  it('UPGRADE: a workspace written by main (loose objects, one > 8 MiB) imports, checkpoints, and restores again', async () => {
+    const store = await makeStore(); const prefix = prefixFor('legacy'); const files = legacyFiles();
+    await seedLegacy(store, prefix, files);
+    const a = await startComputer('up-a');
+    const imported = await hydrate(a, store, prefix);
+    expect(imported.ok).toBe(true);
+    await expectFiles(a, files);
+    expect((await flush(a, store, prefix)).ok).toBe(true);           // first checkpoint after the upgrade
+    await destroyComputer(a);
+    const b = await startComputer('up-b');
+    expect((await hydrate(b, store, prefix)).ok).toBe(true);        // now from the committed snapshot
+    await expectFiles(b, files);
+  }, T);
+
+  it('UPGRADE: orphan chunks from a checkpoint that died before its head put do not hide legacy files', async () => {
+    const store = await makeStore(); const prefix = prefixFor('legacy-orphan'); const files = { 'app.js': new TextEncoder().encode('ok\n') };
+    await seedLegacy(store, prefix, files);
+    await store.put(`${prefix}/.ezil-snapshots/${crypto.randomUUID()}/0`, new Uint8Array(randomBytes(1000)));
+    const a = await startComputer('uporph-a');
+    expect((await hydrate(a, store, prefix)).ok).toBe(true);
+    await expectFiles(a, files);
+  }, T);
+
+  it('UPGRADE: a prefix with only bookkeeping (seed sentinel, heartbeat) opens as an empty workspace', async () => {
+    const store = await makeStore(); const prefix = prefixFor('legacy-empty');
+    await seedLegacy(store, prefix, {});
+    const a = await startComputer('upempty-a');
+    const r = await hydrate(a, store, prefix);
+    expect(r.ok).toBe(true);
+    expect((await must(a, 'ls -A /workspace | wc -l')).trim()).toBe('0');
+  }, T);
+
+  it('UPGRADE: a legacy object whose name contains a backslash does not lock the user out', async () => {
+    const store = await makeStore(); const prefix = prefixFor('legacy-bs');
+    const files = { 'notes.txt': new TextEncoder().encode('keep me\n') };
+    await seedLegacy(store, prefix, { ...files, 'win\\path.txt': new TextEncoder().encode('x') });
+    const a = await startComputer('upbs-a');
+    expect((await hydrate(a, store, prefix)).ok).toBe(true);
+    await expectFiles(a, files);
+  }, T);
+
   it('FINDING: each changed checkpoint stores a full new snapshot and superseded generations are never deleted (unbounded growth)', async () => {
     const store = await makeStore(); const prefix = prefixFor('growth');
     const a = await startComputer('gro-a');
@@ -305,14 +371,22 @@ describe.skipIf(!imagePresent)(`persistent compute: checkpoint survives real con
     expect(bytes).toBeGreaterThan(3 * 1_500_000);
   }, T);
 
-  it('FINDING: a backslash in any file name, an escaping symlink, or a >512 MiB workspace makes every checkpoint fail (readiness would 503)', async () => {
+  it('unsupported entries (backslash names, escaping/absolute links, sockets) are skipped and reported; the checkpoint succeeds and restores without them', async () => {
+    const store = await makeStore(); const prefix = prefixFor('skips');
+    const a = await startComputer('skip-a');
+    await must(a, String.raw`mkdir -p /workspace && cd /workspace && echo keep > keep.txt && echo x > 'win\path.txt' && ln -s /etc/passwd abs-link && ln -s ../../etc esc-link && ln -s keep.txt ok-link && python3 -c "import socket;s=socket.socket(socket.AF_UNIX);s.bind('/workspace/dev.sock')"`);
+    await markHydrated(a, prefix);
+    const out = await flush(a, store, prefix);
+    expect(out.ok).toBe(true);
+    expect(out.skippedUnsupported).toBe(4);
+    await destroyComputer(a);
+    const b = await startComputer('skip-b');
+    expect((await hydrate(b, store, prefix)).ok).toBe(true);
+    expect((await must(b, 'cd /workspace && ls -A | grep -v "^.ezil" | LC_ALL=C sort')).trim().split('\n')).toEqual(['keep.txt', 'ok-link']);
+  }, T);
+
+  it('FINDING: a workspace over the 512 MiB snapshot limit still cannot checkpoint (readiness must degrade, not 503)', async () => {
     const store = await makeStore();
-    const c = await startComputer('lim-c'); const p0 = prefixFor('backslash');
-    await must(c, "mkdir -p /workspace && echo x > '/workspace/win\\path.txt' && ls /workspace | grep -c '\\\\'"); await markHydrated(c, p0);
-    expect((await flush(c, store, p0)).ok).toBe(false);
-    const a = await startComputer('lim-a'); const p1 = prefixFor('escape');
-    await must(a, 'mkdir -p /workspace && echo x > /workspace/ok.txt && ln -s /etc/passwd /workspace/escape'); await markHydrated(a, p1);
-    expect((await flush(a, store, p1)).ok).toBe(false);
     const b = await startComputer('lim-b'); const p2 = prefixFor('big');
     await must(b, 'mkdir -p /workspace && head -c 540000000 /dev/urandom > /workspace/huge.bin'); await markHydrated(b, p2);
     expect((await flush(b, store, p2)).ok).toBe(false);
