@@ -4,7 +4,7 @@ import type { WorkspaceRecord } from './workspaces.ts';
 
 export function nativeBoot(record: WorkspaceRecord): ShellBootPayload {
     return {
-        user: { id: record.guestId, email: null },
+        user: { id: record.guestId, email: null, name: null, provider: null, createdAt: null },
         computer: { id: record.id, name: record.name, slot: 0, createdAt: record.createdAt, lastOpenedAt: null, isNew: false },
         apps: [{ id: 'desktop', name: 'Browser', icon: 'desktop', kind: 'desktop' }],
         desktopState: {

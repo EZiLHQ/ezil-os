@@ -1006,8 +1006,32 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-sys-v{font-variant-numeric:tabular-nums}
 .ezil-sys-h{grid-column:2;font-size:12px;opacity:.55;line-height:1.35}
 .ezil-settings-system code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.ezil-settings-account h4{margin-top:20px}
+.ezil-account-card{border:1px solid rgba(245,245,244,.1);border-radius:10px;background:#1f1f1f}
+.ezil-account-profile{display:flex;align-items:center;gap:16px;padding:18px;background:radial-gradient(120% 140% at 0 0,rgba(0,173,181,.16) 0,rgba(0,173,181,0) 55%),#1f1f1f}
+.ezil-account-avatar{flex:none;display:grid;place-items:center;width:56px;height:56px;border-radius:50%;background:linear-gradient(140deg,#00adb5 0,#6d5dfc 100%);color:#fff;font-size:20px;font-weight:600;letter-spacing:.02em;box-shadow:0 0 0 3px rgba(0,173,181,.18)}
+.ezil-account-identity{min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:3px}
+.ezil-account-name{font-size:16px;font-weight:600;color:#f5f5f4;overflow-wrap:anywhere}
+.ezil-account-email{color:#b9b9b7;overflow-wrap:anywhere}
+.ezil-account-provider{margin-top:6px}
+.ezil-account-details{padding:4px 16px}
+.ezil-account-row{display:flex;justify-content:space-between;align-items:baseline;gap:16px;padding:11px 0;border-bottom:1px solid rgba(245,245,244,.07)}
+.ezil-account-row:last-child{border-bottom:none}
+.ezil-account-label{flex:none;color:#8a8a88}
+.ezil-account-value{min-width:0;text-align:right;color:#f5f5f4;overflow-wrap:anywhere}
+.ezil-account-value.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#cfcfce}
+.ezil-account-signout{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px}
+.ezil-account-signout-title{font-weight:600;color:#f5f5f4}
+.ezil-account-signout p{margin:3px 0 0;color:#b9b9b7;line-height:1.45}
+.ezil-settings-account{container-type:inline-size}
+@container (max-width:380px){
+.ezil-account-profile{flex-direction:column;align-items:flex-start;gap:12px;padding:16px}
+.ezil-account-row{flex-direction:column;align-items:flex-start;gap:2px}
+.ezil-account-value{text-align:left}
+.ezil-account-signout{flex-direction:column;align-items:stretch}
+}
 #ezil-os-root{position:fixed;inset:0}
-.desktop.ezil-desktop{position:fixed;inset:0;box-sizing:border-box;width:auto;height:auto!important;background-color:#161616;background-image:radial-gradient(120% 80% at 78% 8%,rgba(0,173,181,.2) 0,rgba(0,173,181,0) 62%),radial-gradient(90% 70% at 10% 96%,rgba(0,173,181,.1) 0,rgba(0,173,181,0) 60%),linear-gradient(168deg,#1b1e1e 0,#161616 46%,#101111 100%)}
+.desktop.ezil-desktop{position:fixed;inset:0;box-sizing:border-box;width:auto;height:auto!important;background-color:#04060c;background-image:radial-gradient(24% 6% at 50% 91.2%,rgba(255,200,150,.6) 0,rgba(255,150,100,.18) 55%,rgba(255,150,100,0) 100%),radial-gradient(150% 72% at 50% 138%,#04060c 0,#04060c 62%,rgba(0,200,208,.72) 63.1%,rgba(96,110,255,.38) 65.4%,rgba(112,86,255,.1) 70%,rgba(112,86,255,0) 78%),radial-gradient(55% 45% at 82% 6%,rgba(0,190,200,.4) 0,rgba(0,190,200,0) 62%),radial-gradient(50% 55% at 8% 22%,rgba(112,86,255,.34) 0,rgba(112,86,255,0) 64%),linear-gradient(180deg,#0a0e1d 0,#070a14 50%,#04060c 100%)}
 body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;background-color:#161616;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
 .context-menu,.popover,.taskbar,.window{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
 .window button,.window input,.window select,.window textarea{font-family:inherit}

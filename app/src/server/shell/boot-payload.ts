@@ -158,6 +158,52 @@ export interface ShellBootUser {
     id: string;
     /** Supabase can return a user with no email (other identity providers). Never faked. */
     email: string | null;
+    /**
+     * Display name from the identity provider (`full_name`, then `name`, from
+     * Google), trimmed and capped. `null` when the provider gave none — the
+     * Account tab then falls back to the email, never to an invented name.
+     */
+    name: string | null;
+    /** How the account signs in (`google`, `email`, …), from Supabase's `app_metadata.provider`. */
+    provider: string | null;
+    /** ISO 8601 account creation time, or `null` if Supabase did not report one. */
+    createdAt: string | null;
+}
+
+/** The subset of a Supabase `User` the payload reads. Everything optional: other callers pass less. */
+export interface ShellBootUserInput {
+    id: string;
+    email?: string | null;
+    created_at?: string | null;
+    user_metadata?: Record<string, unknown> | null;
+    app_metadata?: Record<string, unknown> | null;
+}
+
+const MAX_NAME_LENGTH = 120;
+
+/** A short, printable string or `null`. Control characters never reach the shell. */
+function cleanText(value: unknown, max: number): string | null {
+    if (typeof value !== 'string') return null;
+    // eslint-disable-next-line no-control-regex
+    const text = value.replace(/[\u0000-\u001f\u007f]/g, '').trim();
+    return text ? text.slice(0, max) : null;
+}
+
+function isoOrNull(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const time = Date.parse(value);
+    return Number.isFinite(time) ? new Date(time).toISOString() : null;
+}
+
+export function toShellBootUser(user: ShellBootUserInput): ShellBootUser {
+    const meta = user.user_metadata ?? {};
+    return {
+        id: user.id,
+        email: user.email ?? null,
+        name: cleanText(meta.full_name, MAX_NAME_LENGTH) ?? cleanText(meta.name, MAX_NAME_LENGTH),
+        provider: cleanText(user.app_metadata?.provider, 32)?.toLowerCase() ?? null,
+        createdAt: isoOrNull(user.created_at),
+    };
 }
 
 export interface ShellBootComputer {
@@ -263,13 +309,13 @@ export function toShellDesktopState(provider: DesktopProviderInfo | null): Shell
 }
 
 export function buildShellBootPayload(input: {
-    user: { id: string; email?: string | null };
+    user: ShellBootUserInput;
     computer: ShellComputerRecord;
     isNew: boolean;
     provider: DesktopProviderInfo | null;
 }): ShellBootPayload {
     return {
-        user: { id: input.user.id, email: input.user.email ?? null },
+        user: toShellBootUser(input.user),
         computer: toShellBootComputer(input.computer, input.isNew),
         apps: SHELL_APPS,
         desktopState: toShellDesktopState(input.provider),

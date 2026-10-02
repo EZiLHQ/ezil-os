@@ -22,6 +22,7 @@ import {
     buildShellBootPayload,
     serializeBootPayload,
     toShellBootComputer,
+    toShellBootUser,
     toShellDesktopState,
 } from './boot-payload';
 
@@ -344,5 +345,54 @@ describe('toShellBootComputer', () => {
         const fresh = computer({ createdAt: new Date() });
         expect(toShellBootComputer(fresh, false).isNew).toBe(false);
         expect(toShellBootComputer(fresh, true).isNew).toBe(true);
+    });
+});
+
+describe('toShellBootUser — what the Account tab may show', () => {
+    it('takes the Google display name, the provider and the creation time', () => {
+        expect(
+            toShellBootUser({
+                id: USER.id,
+                email: USER.email,
+                created_at: '2026-10-01T18:30:00.123456+00:00',
+                user_metadata: { full_name: '  Ada Lovelace  ', name: 'Ada' },
+                app_metadata: { provider: 'Google' },
+            }),
+        ).toEqual({
+            id: USER.id,
+            email: USER.email,
+            name: 'Ada Lovelace',
+            provider: 'google',
+            createdAt: '2026-10-01T18:30:00.123Z',
+        });
+    });
+
+    it('falls back from full_name to name', () => {
+        expect(toShellBootUser({ id: USER.id, user_metadata: { name: 'Ada' } }).name).toBe('Ada');
+    });
+
+    it('never invents a value the provider did not give', () => {
+        expect(toShellBootUser({ id: USER.id })).toEqual({
+            id: USER.id, email: null, name: null, provider: null, createdAt: null,
+        });
+        expect(toShellBootUser({ id: USER.id, created_at: 'not a date', user_metadata: { full_name: 42 } })).toMatchObject({
+            name: null, createdAt: null,
+        });
+    });
+
+    it('strips control characters and caps the length of a user-controlled name', () => {
+        const name = toShellBootUser({ id: USER.id, user_metadata: { full_name: `Ada\u0000\n${'x'.repeat(500)}` } }).name;
+        expect(name).not.toMatch(/[\u0000-\u001f]/);
+        expect(name?.length).toBe(120);
+    });
+
+    it('is what buildShellBootPayload puts in the payload', () => {
+        const payload = buildShellBootPayload({
+            user: { ...USER, user_metadata: { full_name: 'Ada' }, app_metadata: { provider: 'email' } },
+            computer: computer(),
+            isNew: false,
+            provider: null,
+        });
+        expect(payload.user).toMatchObject({ name: 'Ada', provider: 'email' });
     });
 });

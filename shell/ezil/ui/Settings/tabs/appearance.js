@@ -41,6 +41,20 @@ const ACCENT_KEY = 'settings.accent';
  * to. `id` is what persists; `css` is applied directly, never parsed.
  */
 const WALLPAPERS = [
+    // The default. Original to EZiL OS: a teal/violet aurora above a planet's
+    // rim that rises behind the dock, with a warm sunrise where the dock sits.
+    // Five gradient layers, no image. `.desktop.ezil-desktop` in
+    // `ui/ezil-shell.css` server-paints the same layers so the first frame and
+    // the booted shell match.
+    {
+        id: 'horizon',
+        label: 'Horizon',
+        css: 'radial-gradient(24% 6% at 50% 91.2%, rgba(255, 200, 150, 0.6) 0%, rgba(255, 150, 100, 0.18) 55%, rgba(255, 150, 100, 0) 100%), '
+            + 'radial-gradient(150% 72% at 50% 138%, #04060c 0%, #04060c 62%, rgba(0, 200, 208, 0.72) 63.1%, rgba(96, 110, 255, 0.38) 65.4%, rgba(112, 86, 255, 0.1) 70%, rgba(112, 86, 255, 0) 78%), '
+            + 'radial-gradient(55% 45% at 82% 6%, rgba(0, 190, 200, 0.4) 0%, rgba(0, 190, 200, 0) 62%), '
+            + 'radial-gradient(50% 55% at 8% 22%, rgba(112, 86, 255, 0.34) 0%, rgba(112, 86, 255, 0) 64%), '
+            + 'linear-gradient(180deg, #0a0e1d 0%, #070a14 50%, #04060c 100%)',
+    },
     { id: 'charcoal', label: 'Charcoal', css: '#161616' },
     { id: 'teal-dusk', label: 'Teal dusk', css: 'linear-gradient(160deg, #0d2b2d 0%, #161616 70%)' },
     { id: 'deep-slate', label: 'Deep slate', css: 'linear-gradient(160deg, #1f2933 0%, #0e1013 75%)' },

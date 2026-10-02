@@ -151,6 +151,15 @@ const click = (el) => el?.dispatchEvent(new window.MouseEvent('click', { bubbles
 // non-empty array. That is the exact input that silently deleted Settings
 // from every boot in round 1.
 const REAL_PAYLOAD = {
+    // `toShellBootUser`'s shape. `<b>` in the name proves the Account tab
+    // escapes it rather than rendering markup a user put in their profile.
+    user: {
+        id: '11111111-2222-3333-4444-555555555555',
+        email: 'ada@example.com',
+        name: 'Ada <b>Lovelace</b>',
+        provider: 'google',
+        createdAt: '2026-10-01T18:30:00.000Z',
+    },
     apps: [{ id: 'desktop', name: 'Linux Desktop', icon: 'desktop', kind: 'desktop' }],
     computer: { id: 'c-1', name: 'My computer', slot: 1, createdAt: new Date().toISOString(), lastOpenedAt: null, isNew: false },
     desktopState: {},
@@ -219,12 +228,17 @@ const tabIds = qa('.window[data-app="settings"] .ezil-settings-tab').map(t => t.
 // joined between `computers` and `appearance` — it answers "what is this
 // window linked to, and how is that link doing", which belongs next to the
 // machine list rather than next to the theme picker.
-push('five tabs, and only five', tabIds.length === 5, JSON.stringify(tabIds));
-push('tabs are Computers / System / Appearance / About / Troubleshoot',
-    JSON.stringify(tabIds) === JSON.stringify(['computers', 'system', 'appearance', 'about', 'troubleshoot']),
+// `account` joined at the top: EZiL's own profile + Sign out tab
+// (`tabs/account.js`), not upstream's Dashboard account page — the Dashboard
+// check below still refuses the rest of that set.
+push('six tabs, and only six', tabIds.length === 6, JSON.stringify(tabIds));
+push('tabs are Account / Computers / System / Appearance / About / Troubleshoot',
+    JSON.stringify(tabIds) === JSON.stringify(['account', 'computers', 'system', 'appearance', 'about', 'troubleshoot']),
     JSON.stringify(tabIds));
 push('no upstream Dashboard tab survived',
-    ! tabIds.some(id => ['home', 'apps', 'files', 'usage', 'account', 'security'].includes(id)));
+    ! tabIds.some(id => ['home', 'apps', 'files', 'usage', 'security'].includes(id)));
+push('Settings still opens on Computers',
+    q('.window[data-app="settings"] .ezil-settings-pane[data-pane="computers"]')?.classList.contains('active'));
 
 // ── Computers tab ──────────────────────────────────────────────────────────
 const rows = qa('.window[data-app="settings"] .ezil-settings-row');
@@ -329,6 +343,42 @@ await settle(4);
 push('picking an accent writes the theme tokens',
     doc.documentElement.style.getPropertyValue('--select-hue') !== '',
     doc.documentElement.style.getPropertyValue('--select-hue'));
+
+// ── Account tab — the one place to sign out ───────────────────────────────
+{
+    const tabs = qa('.window[data-app="settings"] .ezil-settings-tab').map(t => t.getAttribute('data-tab'));
+    push('Account is the first item in the Settings sidebar', tabs[0] === 'account', tabs.join(','));
+    clickTab('account');
+    await settle(4);
+    const pane = q('.window[data-app="settings"] .ezil-settings-pane[data-pane="account"]');
+    push('Account pane becomes active', pane?.classList.contains('active'));
+    const text = pane?.textContent ?? '';
+    push('Account shows the signed-in name and email',
+        q('[data-role="account-name"]')?.textContent === 'Ada <b>Lovelace</b>'
+        && q('[data-role="account-email"]')?.textContent === 'ada@example.com');
+    push('🔴 a name with markup is shown as text, never rendered',
+        ! pane?.querySelector('.ezil-account-name b'));
+    push('Account shows initials, the sign-in method and the account id',
+        q('.ezil-account-avatar')?.textContent === 'AL'
+        && /Signed in with Google/.test(text)
+        && text.includes(REAL_PAYLOAD.user.id));
+    push('Account shows when the account was created', /Member since/.test(text) && /2026/.test(text));
+
+    // jsdom does not implement form submission; capture it instead.
+    const submitted = [];
+    window.HTMLFormElement.prototype.submit = function () {
+        submitted.push({ method: this.method, action: this.getAttribute('action'), inBody: doc.body.contains(this) });
+    };
+    const button = pane?.querySelector('[data-action="sign-out"]');
+    push('Account has a Sign out button', button?.textContent === 'Sign out');
+    click(button);
+    await settle(2);
+    push('🔴 Sign out submits a same-origin POST to /auth/signout (a document load)',
+        submitted.length === 1 && submitted[0].method === 'post' && submitted[0].action === '/auth/signout'
+        && submitted[0].inBody, JSON.stringify(submitted));
+    push('…and the button cannot be pressed twice while the page unloads',
+        button?.disabled === true);
+}
 
 // ── About tab (AGPL §13) ───────────────────────────────────────────────────
 clickTab('about');

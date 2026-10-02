@@ -238,6 +238,13 @@ push('aria-expanded starts false', (await startExpanded()) === 'false', `value=$
 await clickStart();
 await sleep(150);
 push('click 1: exactly 1 menu in the DOM', (await menuCount()) === 1, `count=${await menuCount()}`);
+{
+    // Sign out lives in Settings → Account only. A one-click Sign out next to
+    // the app launchers is too easy to hit by accident.
+    const labels = await page.evaluate(() => Array.from(
+        document.querySelectorAll('.context-menu .contextmenu-label')).map(el => el.textContent.trim()));
+    push('🔴 the Start menu offers no Sign out', ! labels.some(l => /sign\s*out|log\s*out/i.test(l)), labels.join(' | '));
+}
 push('click 1: aria-expanded is true', (await startExpanded()) === 'true', `value=${await startExpanded()}`);
 
 await clickStart();

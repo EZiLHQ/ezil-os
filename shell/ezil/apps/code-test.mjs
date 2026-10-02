@@ -204,8 +204,16 @@ push('Code has its own icon, distinct from Preview and Settings',
     && codeDescriptor.icon !== ezil.registry.getApp('settings')?.icon
     && codeDescriptor.icon !== ezil.registry.getApp('preview')?.icon);
 
+push('Code is pinned in the dock, right after Browser',
+    !! q('.taskbar-item[data-app="code"]')
+    && (() => {
+        const order = qa('.taskbar-item[data-app]').map(el => el.getAttribute('data-app')).filter(Boolean);
+        return order.indexOf('code') === order.indexOf('desktop') + 1;
+    })(),
+    JSON.stringify(qa('.taskbar-item[data-app]').map(el => el.getAttribute('data-app'))));
+
 // ═══════════════════════════════════════════════════════════════════════════
-// 2. THE START MENU — the only entry point a non-pinned app has.
+// 2. THE START MENU — Code is listed there too, like every resolved app.
 // ═══════════════════════════════════════════════════════════════════════════
 window.$('.taskbar-item[data-name="Start"]').trigger('click');
 await settle(4);

@@ -54,6 +54,7 @@
 // vitest case under `app/src` (a path this task does not own).
 import UIWindow from '../../../src/UI/UIWindow.js';
 import telemetry from '../../telemetry.js';
+import TabAccount from './tabs/account.js';
 import TabComputers from './tabs/computers.js';
 import TabAppearance from './tabs/appearance.js';
 import TabSystem from './tabs/system.js';
@@ -70,7 +71,23 @@ const PHASE = 'ezil-os:settings';
  * the control-drawer button `drawer-action.js` injects into a full-bleed
  * window) — see `tabs/troubleshoot.js`'s header.
  */
-const TABS = [TabComputers, TabSystem, TabAppearance, TabAbout, TabTroubleshoot];
+const TABS = [TabAccount, TabComputers, TabSystem, TabAppearance, TabAbout, TabTroubleshoot];
+
+/**
+ * The tab Settings opens on. Account sits at the top of the sidebar (where
+ * people look for "who am I signed in as" and Sign out), but Settings still
+ * opens on Computers, the tab most visits are for.
+ */
+const DEFAULT_TAB = TabComputers;
+
+/**
+ * The tabs this Settings window shows. A tab may declare `available(ctx)`;
+ * Account does, because the native macOS host and local mode have no signed-in
+ * account and therefore nothing to show and nothing to sign out of.
+ */
+function tabsFor (ctx) {
+    return TABS.filter(tab => typeof tab.available !== 'function' || tab.available(ctx));
+}
 
 /**
  * Which tab is showing, so the one being LEFT can be told.
@@ -80,7 +97,7 @@ const TABS = [TabComputers, TabSystem, TabAppearance, TabAbout, TabTroubleshoot]
  * everything down, so this lives exactly as long as a tab could still be
  * visible.
  */
-let previousTabId = TABS[0]?.id ?? null;
+let previousTabId = DEFAULT_TAB.id;
 
 function sidebarItemHtml (tab, isActive) {
     return `
@@ -90,14 +107,14 @@ function sidebarItemHtml (tab, isActive) {
         </button>`;
 }
 
-function buildHtml () {
+function buildHtml (tabs) {
     let h = '<div class="ezil-settings">';
     h += '<nav class="ezil-settings-sidebar" role="tablist" aria-label="Settings">';
-    for ( const tab of TABS ) h += sidebarItemHtml(tab, tab === TABS[0]);
+    for ( const tab of tabs ) h += sidebarItemHtml(tab, tab === DEFAULT_TAB);
     h += '</nav>';
     h += '<div class="ezil-settings-content">';
-    for ( const tab of TABS ) {
-        h += `<div class="ezil-settings-pane${tab === TABS[0] ? ' active' : ''}" data-pane="${tab.id}" role="tabpanel">`;
+    for ( const tab of tabs ) {
+        h += `<div class="ezil-settings-pane${tab === DEFAULT_TAB ? ' active' : ''}" data-pane="${tab.id}" role="tabpanel">`;
         h += tab.html();
         h += '</div>';
     }
@@ -115,11 +132,12 @@ function buildHtml () {
  * @returns {Promise<HTMLElement|null>}
  */
 export async function openSettingsWindow (ctx = {}) {
+    const tabs = tabsFor(ctx);
     const el_window = await UIWindow({
         title: 'Settings',
         app: 'settings',
         icon: ctx.icon,
-        body_content: buildHtml(),
+        body_content: buildHtml(tabs),
         width: 760,
         height: 560,
         is_resizable: true,
@@ -136,13 +154,13 @@ export async function openSettingsWindow (ctx = {}) {
         // would outlive the window that asked for it and keep costing a
         // 2-vCPU container for a monitor nobody can see any more.
         on_close: () => {
-            const leaving = TABS.find(t => t.id === previousTabId);
+            const leaving = tabs.find(t => t.id === previousTabId);
             try {
                 leaving?.onDeactivate?.();
             } catch ( err ) {
                 console.error(`[${PHASE}] tab "${previousTabId}" failed to deactivate on close`, err);
             }
-            previousTabId = TABS[0]?.id ?? null;
+            previousTabId = DEFAULT_TAB.id;
         },
         body_css: {
             padding: '0',
@@ -173,7 +191,7 @@ export async function openSettingsWindow (ctx = {}) {
         $win.find('.ezil-settings-pane').removeClass('active');
         $win.find(`.ezil-settings-pane[data-pane="${id}"]`).addClass('active');
 
-        const tab = TABS.find(t => t.id === id);
+        const tab = tabs.find(t => t.id === id);
         // 🔴 Tell the tab being LEFT that it is no longer visible. Without
         // this, a tab that acquires something while active — the System tab
         // asks the streamed client to publish stream vitals every 2s — would
@@ -181,7 +199,7 @@ export async function openSettingsWindow (ctx = {}) {
         // looking at the result. `onActivate` without a matching hook is how a
         // monitor turns into a background cost.
         if ( previousTabId && previousTabId !== id ) {
-            const leaving = TABS.find(t => t.id === previousTabId);
+            const leaving = tabs.find(t => t.id === previousTabId);
             try {
                 leaving?.onDeactivate?.($win, ctx);
             } catch ( err ) {
@@ -204,7 +222,7 @@ export async function openSettingsWindow (ctx = {}) {
         }
     });
 
-    for ( const tab of TABS ) {
+    for ( const tab of tabs ) {
         try {
             tab.init?.($win, ctx);
         } catch ( err ) {

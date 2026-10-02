@@ -328,6 +328,33 @@ export const APPS = [
         open: openDesktopWindow,
     },
     {
+        id: 'code',
+        name: 'Code',
+        icon: CODE_ICON,
+        // Pinned, next to Browser: the editor and the browser are the two
+        // tools a session is built around, so both sit in the dock. Still
+        // listed in the Start menu like every resolved app.
+        pinned: true,
+        single_instance: true,
+        // 🔴 Shell-local, and for the SAME reason `preview` is — see that
+        // entry's comment. code-server is a feature the Worker can genuinely
+        // fail to serve for one deployment (no `codePreviewUrl` field, no
+        // exposed port) and the window says so
+        // (`show_unavailable()` in `../apps/code.js`); it is not a capability
+        // the server list could withhold from one user and not another.
+        shell_local: true,
+        // 🔴 Wave B / T7 — the whole point of the container swap from
+        // Electron VS Code to code-server: an HTTP window, not a focus
+        // target inside the streamed desktop. See `../apps/code.js`'s file
+        // header for why "focus code in the stream" is not a smaller version
+        // of this feature but a different, impossible one.
+        // Same fire-and-forget shape as `desktop`/`preview` — `void
+        // start_boot()` runs its mint/confirm well after `open()` returns.
+        // See `owns_boot_trace`.
+        owns_boot_trace: true,
+        open: openCodeWindow,
+    },
+    {
         id: 'app-store', name: 'App Store', icon: APP_STORE_ICON,
         pinned: true, single_instance: true, shell_local: true,
         open: ctx => openAppStoreWindow({
@@ -397,32 +424,6 @@ export const APPS = [
         // its mint/confirm well after `open()` returns. See `owns_boot_trace`.
         owns_boot_trace: true,
         open: openPreviewWindow,
-    },
-    {
-        id: 'code',
-        name: 'Code',
-        icon: CODE_ICON,
-        // Not pinned, same reasoning as `preview`: reachable from the Start
-        // menu, not a dock permanent.
-        pinned: false,
-        single_instance: true,
-        // 🔴 Shell-local, and for the SAME reason `preview` is — see that
-        // entry's comment. code-server is a feature the Worker can genuinely
-        // fail to serve for one deployment (no `codePreviewUrl` field, no
-        // exposed port) and the window says so
-        // (`show_unavailable()` in `../apps/code.js`); it is not a capability
-        // the server list could withhold from one user and not another.
-        shell_local: true,
-        // 🔴 Wave B / T7 — the whole point of the container swap from
-        // Electron VS Code to code-server: an HTTP window, not a focus
-        // target inside the streamed desktop. See `../apps/code.js`'s file
-        // header for why "focus code in the stream" is not a smaller version
-        // of this feature but a different, impossible one.
-        // Same fire-and-forget shape as `desktop`/`preview` — `void
-        // start_boot()` runs its mint/confirm well after `open()` returns.
-        // See `owns_boot_trace`.
-        owns_boot_trace: true,
-        open: openCodeWindow,
     },
 ];
 

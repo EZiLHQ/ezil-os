@@ -5,7 +5,7 @@ const { atomic, readJSON } = require('./files.cjs');
 function preferences(value) {
   if (!value || Object.getPrototypeOf(value) !== Object.prototype || Object.keys(value).some(k => !['wallpaper', 'accent', 'previewPort', 'layout', 'browser'].includes(k))) throw Error('Invalid desktop preferences');
   const result = {};
-  for (const [key, choices] of Object.entries({ wallpaper: ['charcoal', 'teal-dusk', 'deep-slate', 'aurora'], accent: ['teal', 'violet', 'amber', 'rose'] })) {
+  for (const [key, choices] of Object.entries({ wallpaper: ['horizon', 'charcoal', 'teal-dusk', 'deep-slate', 'aurora'], accent: ['teal', 'violet', 'amber', 'rose'] })) {
     if (value[key] !== undefined) { if (!choices.includes(value[key])) throw Error('Invalid appearance'); result[key] = value[key]; }
   }
   if (value.previewPort !== undefined) {

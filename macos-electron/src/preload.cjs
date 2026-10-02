@@ -54,7 +54,7 @@ function cleanRuntimeResult(input, result) {
   if (input.op === 'workspace.list') return { ok: true, workspaces: Array.isArray(result.workspaces) ? result.workspaces.map(workspace).filter(Boolean).slice(0, 100) : [] };
   if (input.op === 'desktop.read') {
     const p = result.preferences || {}, preferences = {};
-    if (['charcoal', 'teal-dusk', 'deep-slate', 'aurora'].includes(p.wallpaper)) preferences.wallpaper = p.wallpaper;
+    if (['horizon', 'charcoal', 'teal-dusk', 'deep-slate', 'aurora'].includes(p.wallpaper)) preferences.wallpaper = p.wallpaper;
     if (['teal', 'violet', 'amber', 'rose'].includes(p.accent)) preferences.accent = p.accent;
     if (Number.isInteger(p.previewPort) && p.previewPort >= 1024 && p.previewPort <= 65535) preferences.previewPort = p.previewPort;
     if (Array.isArray(p.layout)) preferences.layout = p.layout.slice(0, 4).filter(w => w && ['browser', 'code', 'preview', 'settings'].includes(w.app) && ['x', 'y', 'width', 'height'].every(k => Number.isFinite(w[k]) && Math.abs(w[k]) <= 32768)).map(w => ({ app: w.app, x: w.x, y: w.y, width: w.width, height: w.height, minimized: w.minimized === true }));

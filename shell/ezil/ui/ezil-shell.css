@@ -52,11 +52,16 @@
     box-sizing: border-box;
     width: auto;
     height: auto !important;
-    background-color: #161616;
+    /* The default "Horizon" wallpaper, server-painted so the first frame
+     * matches the booted shell. Must stay identical to the `horizon` preset
+     * in `ui/Settings/tabs/appearance.js`. */
+    background-color: #04060c;
     background-image:
-        radial-gradient(120% 80% at 78% 8%, rgba(0, 173, 181, 0.20) 0%, rgba(0, 173, 181, 0) 62%),
-        radial-gradient(90% 70% at 10% 96%, rgba(0, 173, 181, 0.10) 0%, rgba(0, 173, 181, 0) 60%),
-        linear-gradient(168deg, #1b1e1e 0%, #161616 46%, #101111 100%);
+        radial-gradient(24% 6% at 50% 91.2%, rgba(255, 200, 150, 0.6) 0%, rgba(255, 150, 100, 0.18) 55%, rgba(255, 150, 100, 0) 100%),
+        radial-gradient(150% 72% at 50% 138%, #04060c 0%, #04060c 62%, rgba(0, 200, 208, 0.72) 63.1%, rgba(96, 110, 255, 0.38) 65.4%, rgba(112, 86, 255, 0.1) 70%, rgba(112, 86, 255, 0) 78%),
+        radial-gradient(55% 45% at 82% 6%, rgba(0, 190, 200, 0.4) 0%, rgba(0, 190, 200, 0) 62%),
+        radial-gradient(50% 55% at 8% 22%, rgba(112, 86, 255, 0.34) 0%, rgba(112, 86, 255, 0) 64%),
+        linear-gradient(180deg, #0a0e1d 0%, #070a14 50%, #04060c 100%);
 }
 
 /* The shell owns the viewport on /os: a document scrollbar here would scroll
