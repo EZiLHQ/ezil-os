@@ -4,7 +4,7 @@ Computers run on Cloudflare Containers. Their `/workspace` checkpoints are writt
 
 ## Before enabling it for any user
 
-1. **Checkpoint garbage collection.** Every changed checkpoint uploads a full snapshot, and superseded generations are never deleted (`workspace-checkpoint.container.test.ts` pins this finding). Without GC, storage and PUT volume grow on every flush of an active workspace. Versioning makes this worse, because it keeps every overwritten head.
+1. **Checkpoint garbage collection is implemented.** `collectSupersededSnapshots` keeps the head and the previous generation and deletes older ones after a 1 h grace, at most every 15 min. The IAM policy allows `DeleteObject` only on `*/.ezil-snapshots/*`. With versioning, deleted chunks stay recoverable for `NoncurrentVersionDays`, and that is also how long they are billed.
 2. **Migration.** An existing computer must hydrate from R2 once, and then its first flush writes to S3. This is the read-through migrating store on `feat/persistent-compute-s3-adapter`. The switch is one-way: switching back to R2 after S3 writes would serve a stale workspace.
 3. **Staging first.** Run `worker/src/workspace-checkpoint.container.test.ts` with `EZIL_CHECKPOINT_STORE=s3` against the staging bucket. Then run the recovery mission (Notion 3eb7021e…f42ca §5) on staging.
 
@@ -23,7 +23,7 @@ aws cloudformation deploy --region us-east-1 \
 The template creates:
 - a private bucket with Block Public Access, owner-enforced ownership, SSE-S3 encryption, versioning, and a policy that refuses non-TLS requests;
 - lifecycle rules that expire noncurrent versions after 30 days and abort incomplete multipart uploads;
-- an IAM user, `/ezil/ezil-os-workspace-store-<region>`, that can only Get and Put objects and List the bucket under `workspaces/`, with no Delete;
+- an IAM user, `/ezil/ezil-os-workspace-store-<region>`, that can Get and Put objects and List the bucket under `workspaces/`, and can Delete only checkpoint-generation objects (for GC);
 - an S3 budget alarm.
 
 ## Give the Worker its credentials (never commit, never echo)

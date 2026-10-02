@@ -3,8 +3,9 @@ Description: >-
   EZiL OS durable workspace store. Computers run on Cloudflare Containers; their
   /workspace checkpoints (worker/src/workspace-persist.ts) are stored here through
   the S3 store adapter (EZIL_WORKSPACE_STORE=s3). Private, encrypted, versioned,
-  TLS-only. The Worker's IAM user can get/put/list under the workspace prefix only
-  (no delete: the checkpoint writer is put-only by design). Access keys are NOT
+  TLS-only. The Worker's IAM user can get/put/list under the workspace prefix, and
+  delete ONLY checkpoint-generation objects (superseded-snapshot GC; the flush itself
+  is put-only). Versioning keeps deleted versions for NoncurrentVersionDays. Access keys are NOT
   created here (CloudFormation would expose them); see README.md.
 
 Parameters:
@@ -87,7 +88,7 @@ Resources:
   WorkerPolicy:
     Type: AWS::IAM::Policy
     Properties:
-      PolicyName: workspace-store-rw-no-delete
+      PolicyName: workspace-store-rw-gc
       Users: [!Ref WorkerUser]
       PolicyDocument:
         Version: '2012-10-17'
@@ -96,6 +97,10 @@ Resources:
             Effect: Allow
             Action: ['s3:GetObject', 's3:PutObject']
             Resource: !Sub '${WorkspaceBucket.Arn}/${KeyPrefix}*'
+          - Sid: GcSupersededCheckpointsOnly
+            Effect: Allow
+            Action: 's3:DeleteObject'
+            Resource: !Sub '${WorkspaceBucket.Arn}/${KeyPrefix}*/.ezil-snapshots/*'
           - Sid: ListUnderPrefix
             Effect: Allow
             Action: 's3:ListBucket'
