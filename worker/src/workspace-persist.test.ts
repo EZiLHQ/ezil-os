@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import {
-  flushWorkspaceToR2, hydrateWorkspaceFromR2, HYDRATE_MARKER_FILENAME, SNAPSHOT_HEAD,
+  flushWorkspaceToR2, hydrateWorkspaceFromR2, HYDRATE_MARKER_FILENAME, SNAPSHOT_HEAD, collectSupersededSnapshots,
   parseHydrateMarker, parseSnapshot, serializeHydrateMarker,
   type FlushR2BucketLike, type HydrateR2BucketLike, type FlushContainerLike,
 } from './workspace-persist';
@@ -365,4 +365,60 @@ os.open = racing_open
   const script = SNAPSHOT_SCRIPT.replace("try:\n    op = p['op']", `${injection}\ntry:\n    op = p['op']`);
   await expect(run('python3', ['-I', '-c', script, JSON.stringify({ op: 'capture', root, work, prefix, expected: null })], { env })).rejects.toThrow();
   expect(await readFile(`${base}/opened-path`, 'utf8')).toBe(`${root}/old-dir/value`);
+});
+
+describe('garbage collection of superseded checkpoint generations', () => {
+  class GcBucket extends Bucket {
+    uploaded = new Map<string, number>();
+    deleted: string[] = [];
+    clock = 0;
+    override async put(key: string, bytes: Uint8Array, options?: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } }) {
+      const r = await super.put(key, bytes, options); if (r) this.uploaded.set(key, this.clock); return r;
+    }
+    override async list(options: { prefix: string; cursor?: string; limit?: number }) {
+      const page = await super.list(options);
+      return { ...page, objects: page.objects.map(o => ({ ...o, uploaded: this.uploaded.has(o.key) ? new Date(this.uploaded.get(o.key)!) : undefined })) };
+    }
+    async delete(keys: string[]) { for (const k of keys) { this.data.delete(k); this.deleted.push(k); } }
+  }
+  const gens = (b: GcBucket) => new Set([...b.data.keys()].filter(k => k.includes('/.ezil-snapshots/') && !k.endsWith(SNAPSHOT_HEAD)).map(k => k.split('/.ezil-snapshots/')[1]!.split('/')[0]));
+  const gc = (b: GcBucket, now: number, graceMs = 1000) => collectSupersededSnapshots({ bucket: b, realPrefix: prefix, log, now, graceMs });
+
+  it('keeps the head and previous generations, deletes older ones past the grace window, and the head still restores', async () => {
+    const { base, root } = await workspace(); const bucket = new GcBucket();
+    for (let i = 0; i < 4; i++) { bucket.clock = i * 10; await writeFile(`${root}/n.txt`, String(i)); expect((await flush(root, bucket)).ok).toBe(true); }
+    expect(gens(bucket).size).toBe(4);
+    const head = parseSnapshot(new TextDecoder().decode(bucket.data.get(headKey)!.bytes));
+    const out = await gc(bucket, 100_000);
+    expect(out).toMatchObject({ ok: true, deletedGenerations: 2, keptRecent: 0 });
+    expect(gens(bucket)).toEqual(new Set([head.chunkGeneration ?? head.generation, head.previousChunkGeneration!]));
+    expect(bucket.data.has(headKey)).toBe(true);
+    expect((await hydrate(`${base}/restored`, bucket)).ok).toBe(true);
+    expect(await readFile(`${base}/restored/n.txt`, 'utf8')).toBe('3');
+  });
+
+  it('never deletes a recent (possibly in-flight) or undated generation, and never acts without a head', async () => {
+    const { root } = await workspace(); const bucket = new GcBucket();
+    // No head: an orphan generation is not provably garbage.
+    await bucket.put(`${prefix}/.ezil-snapshots/${crypto.randomUUID()}/0`, new Uint8Array([1]));
+    expect(await gc(bucket, 1e12)).toMatchObject({ ok: true, deletedGenerations: 0 });
+    bucket.data.clear(); bucket.uploaded.clear();
+    for (let i = 0; i < 3; i++) { bucket.clock = 0; await writeFile(`${root}/n.txt`, String(i)); expect((await flush(root, bucket)).ok).toBe(true); }
+    const inflight = `${prefix}/.ezil-snapshots/${crypto.randomUUID()}/0`;
+    bucket.clock = 5_000; await bucket.put(inflight, new Uint8Array([2]));      // an uncommitted writer, 0.5 s old
+    const undated = `${prefix}/.ezil-snapshots/${crypto.randomUUID()}/0`;
+    await bucket.put(undated, new Uint8Array([3])); bucket.uploaded.delete(undated);
+    const out = await gc(bucket, 5_500);
+    expect(out).toMatchObject({ ok: true, deletedGenerations: 1, keptRecent: 2 });
+    expect(bucket.data.has(inflight)).toBe(true); expect(bucket.data.has(undated)).toBe(true);
+  });
+
+  it('aborts without deleting when the head moves during collection', async () => {
+    const { root } = await workspace(); const bucket = new GcBucket();
+    for (let i = 0; i < 3; i++) { await writeFile(`${root}/n.txt`, String(i)); expect((await flush(root, bucket)).ok).toBe(true); }
+    const realList = bucket.list.bind(bucket);
+    bucket.list = async (o) => { const page = await realList(o); const h = bucket.data.get(headKey)!; bucket.data.set(headKey, { ...h, etag: `${h.etag}-moved` }); return page; };
+    const out = await gc(bucket, 1e12);
+    expect(out.ok).toBe(false); expect(bucket.deleted).toEqual([]);
+  });
 });

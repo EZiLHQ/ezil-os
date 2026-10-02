@@ -21,7 +21,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash, randomBytes } from 'node:crypto';
 import {
-  flushWorkspaceToR2, hydrateWorkspaceFromR2, HYDRATE_MARKER_FILENAME, SNAPSHOT_HEAD, serializeHydrateMarker,
+  flushWorkspaceToR2, hydrateWorkspaceFromR2, collectSupersededSnapshots, HYDRATE_MARKER_FILENAME, SNAPSHOT_HEAD, serializeHydrateMarker,
   type FlushContainerLike, type FlushR2BucketLike, type HydrateR2BucketLike,
   WORKSPACE_HEARTBEAT_FILENAME,
 } from './workspace-persist';
@@ -39,6 +39,7 @@ const imagePresent = await run('docker', ['image', 'inspect', IMAGE]).then(() =>
 
 // ── Store under test ─────────────────────────────────────────────────────────
 type Store = FlushR2BucketLike & HydrateR2BucketLike & {
+  delete?(keys: string[]): Promise<unknown>;
   corrupt?(key: string): Promise<void>;
   failPutFor?: (key: string) => boolean;
   beforePut?: (key: string) => Promise<void>;
@@ -46,7 +47,7 @@ type Store = FlushR2BucketLike & HydrateR2BucketLike & {
 
 /** R2 binding semantics (as in workspace-persist.test.ts): etag CAS on put, paginated list. */
 class R2Fake implements Store {
-  data = new Map<string, { bytes: Uint8Array; etag: string }>();
+  data = new Map<string, { bytes: Uint8Array; etag: string; uploaded: Date }>();
   revision = 0;
   failPutFor?: (key: string) => boolean;
   beforePut?: (key: string) => Promise<void>;
@@ -64,19 +65,20 @@ class R2Fake implements Store {
     if (options?.onlyIf?.etagMatches && prior?.etag !== options.onlyIf.etagMatches) return null;
     if (options?.onlyIf?.etagDoesNotMatch === '*' && prior) return null;
     const etag = `r2-${++this.revision}`;
-    this.data.set(key, { bytes: bytes.slice(), etag });
+    this.data.set(key, { bytes: bytes.slice(), etag, uploaded: new Date() });
     return { etag };
   }
   async list(o: { prefix: string; cursor?: string; limit?: number }) {
     const keys = [...this.data.keys()].filter(k => k.startsWith(o.prefix)).sort();
     const start = Number(o.cursor ?? 0), end = start + (o.limit ?? 1000);
-    return { objects: keys.slice(start, end).map(key => ({ key, size: this.data.get(key)!.bytes.length })),
+    return { objects: keys.slice(start, end).map(key => ({ key, size: this.data.get(key)!.bytes.length, uploaded: this.data.get(key)!.uploaded })),
       truncated: end < keys.length, cursor: end < keys.length ? String(end) : undefined };
   }
   async corrupt(key: string) {
     const v = this.data.get(key)!; const b = v.bytes.slice(); b[b.length >> 1] ^= 0xff;
-    this.data.set(key, { bytes: b, etag: v.etag });
+    this.data.set(key, { ...v, bytes: b });
   }
+  async delete(keys: string[]) { for (const k of keys) this.data.delete(k); }
 }
 
 async function makeStore(): Promise<Store> {
@@ -355,20 +357,30 @@ describe.skipIf(!imagePresent)(`persistent compute: checkpoint survives real con
     await expectFiles(a, files);
   }, T);
 
-  it('FINDING: each changed checkpoint stores a full new snapshot and superseded generations are never deleted (unbounded growth)', async () => {
+  it('each changed checkpoint stores a full snapshot; GC bounds storage to the head + previous generation and the head still restores', async () => {
     const store = await makeStore(); const prefix = prefixFor('growth');
     const a = await startComputer('gro-a');
     await must(a, 'mkdir -p /workspace && head -c 1500000 /dev/urandom > /workspace/blob.bin && echo 0 > /workspace/n.txt'); await markHydrated(a, prefix);
-    for (let i = 1; i <= 3; i++) { await must(a, `echo ${i} > /workspace/n.txt`); expect((await flush(a, store, prefix)).ok).toBe(true); }
-    const generations = new Set<string>(); let bytes = 0; let cursor: string | undefined;
-    do {
-      const page = await store.list({ prefix: `${prefix}/.ezil-snapshots/`, cursor });
-      for (const o of page.objects) { const g = o.key.slice(prefix.length + 1).split('/')[1]!; if (g !== 'latest.json') { generations.add(g); bytes += o.size ?? 0; } }
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
-    // A one-byte edit re-uploads the whole 1.5 MB workspace; all three generations remain.
-    expect(generations.size).toBe(3);
-    expect(bytes).toBeGreaterThan(3 * 1_500_000);
+    for (let i = 1; i <= 4; i++) { await must(a, `echo ${i} > /workspace/n.txt`); expect((await flush(a, store, prefix)).ok).toBe(true); }
+    const census = async () => {
+      const generations = new Set<string>(); let bytes = 0; let cursor: string | undefined;
+      do {
+        const page = await store.list({ prefix: `${prefix}/.ezil-snapshots/`, cursor });
+        for (const o of page.objects) { const g = o.key.slice(prefix.length + 1).split('/')[1]!; if (g !== 'latest.json') { generations.add(g); bytes += o.size ?? 0; } }
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor);
+      return { generations: generations.size, bytes };
+    };
+    // A one-byte edit re-uploads the whole workspace; without GC every generation stays.
+    expect((await census()).generations).toBe(4);
+    if (!store.delete) return; // the S3 adapter run exercises GC once it implements delete
+    const gc = await collectSupersededSnapshots({ bucket: store as never, realPrefix: prefix, log, graceMs: 0 });
+    expect(gc).toMatchObject({ ok: true, deletedGenerations: 2 });
+    expect((await census()).generations).toBe(2);
+    await destroyComputer(a);
+    const b = await startComputer('gro-b');
+    expect((await hydrate(b, store, prefix)).ok).toBe(true);
+    expect((await must(b, 'cat /workspace/n.txt')).trim()).toBe('4');
   }, T);
 
   it('unsupported entries (backslash names, escaping/absolute links, sockets) are skipped and reported; the checkpoint succeeds and restores without them', async () => {

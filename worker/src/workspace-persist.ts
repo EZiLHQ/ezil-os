@@ -28,6 +28,8 @@ export interface Snapshot {
   generation: string;
   /** Immutable chunk owner; a no-op commit still advances the writer fence. */
   chunkGeneration?: string;
+  /** Chunk owner of the previously committed head; garbage collection keeps it as the fallback. */
+  previousChunkGeneration?: string;
   sha256: string;
   entries: number;
   chunks: Array<{ size: number; sha256: string }>;
@@ -108,6 +110,7 @@ export function parseSnapshot(raw: string): Snapshot {
   catch { throw new Error('invalid workspace snapshot manifest'); }
   if (!s || s.version !== SNAPSHOT_VERSION || !GENERATION.test(s.generation) || !HASH.test(s.sha256)
     || (s.chunkGeneration !== undefined && !GENERATION.test(s.chunkGeneration))
+    || (s.previousChunkGeneration !== undefined && !GENERATION.test(s.previousChunkGeneration))
     || !Number.isInteger(s.entries) || s.entries < 0 || s.entries > MAX_ENTRIES
     || !Array.isArray(s.chunks) || !s.chunks.length || s.chunks.length > MAX_CHUNKS
     || s.chunks.some(c => !c || !HASH.test(c.sha256) || !Number.isInteger(c.size) || c.size <= 0 || c.size > SNAPSHOT_CHUNK_BYTES)) {
@@ -199,9 +202,10 @@ export async function flushWorkspaceToR2(deps: FlushDeps): Promise<FlushOutcome>
     // Re-read the tree, including contents/modes/Git index, after network I/O.
     await command(container, { op: 'verify', root, work, prefix, expected, sha256: snapshot.sha256 });
     // Even a no-op checkpoint uses CAS: it must not confirm a stale head.
-    const committed = previous?.snapshot.sha256 === snapshot.sha256
-      ? { ...snapshot, chunkGeneration: previous.snapshot.chunkGeneration ?? previous.snapshot.generation }
-      : snapshot;
+    const committed: Snapshot = previous?.snapshot.sha256 === snapshot.sha256
+      ? { ...snapshot, chunkGeneration: previous.snapshot.chunkGeneration ?? previous.snapshot.generation,
+          ...(previous.snapshot.previousChunkGeneration ? { previousChunkGeneration: previous.snapshot.previousChunkGeneration } : {}) }
+      : { ...snapshot, ...(previous ? { previousChunkGeneration: previous.snapshot.chunkGeneration ?? previous.snapshot.generation } : {}) };
     const put = await bucket.put(`${prefix}/${SNAPSHOT_HEAD}`, encoder.encode(JSON.stringify(committed)), {
       onlyIf: previous ? { etagMatches: previous.etag } : { etagDoesNotMatch: '*' },
     });
@@ -365,6 +369,71 @@ export async function hydrateWorkspaceFromR2(deps: HydrateDeps): Promise<Hydrate
   } finally {
     try { await command(container, { op: 'cleanup', root, work }); }
     catch { log('[workspace-persist] restore staging cleanup failed'); }
+  }
+  return outcome;
+}
+// ── Garbage collection of superseded checkpoint generations ─────────────────
+export interface GcR2BucketLike {
+  get(key: string): Promise<HydrateR2ObjectBodyLike | null>;
+  list(options: { prefix: string; cursor?: string; limit?: number }): Promise<{
+    objects: Array<{ key: string; uploaded?: Date | string }>;
+    truncated: boolean;
+    cursor?: string;
+  }>;
+  delete(keys: string[]): Promise<unknown>;
+}
+export interface GcOutcome { ok: boolean; deletedGenerations: number; deletedObjects: number; keptRecent: number }
+/** A generation must be at least this old before it may be deleted: an uncommitted writer may still be uploading it. */
+export const SNAPSHOT_GC_GRACE_MS = 60 * 60_000;
+const GC_MAX_OBJECTS = 20_000;
+const CHUNK_KEY = /^\.ezil-snapshots\/([a-f0-9-]{36})\/(\d+)$/;
+
+/**
+ * Deletes chunk generations that are neither the head's nor the previous
+ * head's, and only once every object in them is older than the grace window.
+ * Separate from the put-only flush path by design. No head: nothing is
+ * provably garbage, so nothing is deleted. A head that moves mid-run aborts.
+ */
+export async function collectSupersededSnapshots(deps: {
+  bucket: GcR2BucketLike; realPrefix: string; log: (message: string) => void; now?: number; graceMs?: number;
+}): Promise<GcOutcome> {
+  const { bucket, realPrefix: prefix, log } = deps;
+  const outcome: GcOutcome = { ok: false, deletedGenerations: 0, deletedObjects: 0, keptRecent: 0 };
+  if (!validPrefix(prefix)) return outcome;
+  try {
+    const head = await readHead(bucket, prefix);
+    if (!head) return { ...outcome, ok: true };
+    const keep = new Set([head.snapshot.chunkGeneration ?? head.snapshot.generation, head.snapshot.previousChunkGeneration]
+      .filter((g): g is string => !!g));
+    const now = deps.now ?? Date.now();
+    const grace = deps.graceMs ?? SNAPSHOT_GC_GRACE_MS;
+    const generations = new Map<string, { keys: string[]; recent: boolean }>();
+    let cursor: string | undefined; let seen = 0;
+    do {
+      const page = await bucket.list({ prefix: `${prefix}/.ezil-snapshots/`, cursor, limit: 1000 });
+      for (const object of page.objects) {
+        if (++seen > GC_MAX_OBJECTS) throw new Error('gc listing too large');
+        if (!object.key.startsWith(`${prefix}/`)) throw new Error('out-of-prefix object');
+        const match = CHUNK_KEY.exec(object.key.slice(prefix.length + 1));
+        if (!match || !GENERATION.test(match[1]!) || keep.has(match[1]!)) continue;
+        const uploaded = object.uploaded === undefined ? NaN : new Date(object.uploaded).getTime();
+        const g = generations.get(match[1]!) ?? { keys: [], recent: false };
+        g.keys.push(object.key);
+        // Unknown age counts as recent: never delete what cannot be dated.
+        if (!(now - uploaded >= grace)) g.recent = true;
+        generations.set(match[1]!, g);
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    if ((await readHead(bucket, prefix))?.etag !== head.etag) throw new Error('workspace checkpoint changed');
+    for (const g of generations.values()) {
+      if (g.recent) { outcome.keptRecent++; continue; }
+      for (let i = 0; i < g.keys.length; i += 1000) await bucket.delete(g.keys.slice(i, i + 1000));
+      outcome.deletedGenerations++; outcome.deletedObjects += g.keys.length;
+    }
+    outcome.ok = true;
+  } catch {
+    log('[workspace-persist] snapshot garbage collection failed');
   }
   return outcome;
 }
