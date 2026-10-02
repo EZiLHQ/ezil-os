@@ -125,6 +125,16 @@ function sandboxWindowEls () {
 let activeComputerId;
 
 /**
+ * The computer this session is ON: the one it booted with, or the last one
+ * the user switched to. Separate from `activeComputerId` (the delete guard's
+ * "what is the desktop streaming" hint, which goes null when the desktop
+ * window closes). Closing the desktop window does not change which computer
+ * you are on, so the list keeps marking it Current instead of offering it a
+ * Switch button as if it were someone else's.
+ */
+let sessionComputerId;
+
+/**
  * The computer the open desktop window is streaming.
  *
  * @returns {string|null|undefined} the id; `null` if no desktop window is
@@ -303,10 +313,13 @@ function rowHtml (slot, computer) {
             </div>`;
     }
 
-    // "Current" means "this is the desktop on screen right now", read from
-    // the DOM rather than from a remembered id — so closing the desktop
-    // window by hand correctly turns the pill back into a Switch button.
-    const isActive = (isNative() ? window.__EZIL_BOOT__?.computer?.id : openDesktopComputerId()) === computer.id;
+    // "Current" is the computer this session is on: the desktop on screen
+    // right now (read from the DOM), or — when no desktop window is open —
+    // the computer the session booted with / last switched to. Closing the
+    // desktop window must not make your own computer look like another one.
+    const onScreen = isNative() ? window.__EZIL_BOOT__?.computer?.id : openDesktopComputerId();
+    const isActive = (onScreen ?? sessionComputerId) === computer.id;
+    const desktopClosed = !isNative() && onScreen === null;
     const isBusy = busyId === computer.id;
     const isEditing = editingId === computer.id;
     const when = timeAgo(computer.lastOpenedAt ?? computer.createdAt);
@@ -331,11 +344,11 @@ function rowHtml (slot, computer) {
             <span class="ezil-settings-row-slot">${slot}</span>
             <div class="ezil-settings-row-meta">
                 <div class="ezil-settings-row-name">${html_encode(computer.name)}</div>
-                <div class="ezil-settings-row-sub">${isNative() ? (computer.available === false ? 'Folder unavailable — locate it to continue' : computer.kind === 'attached' ? 'Original folder · edits stay in place' : 'EZiL-managed project') : (isActive ? 'Active now' : (when ? `Active ${when}` : 'Never opened'))}</div>
+                <div class="ezil-settings-row-sub">${isNative() ? (computer.available === false ? 'Folder unavailable — locate it to continue' : computer.kind === 'attached' ? 'Original folder · edits stay in place' : 'EZiL-managed project') : (isActive ? (desktopClosed ? 'Your current computer' : 'Active now') : (when ? `Active ${when}` : 'Never opened'))}</div>
             </div>
             <div class="ezil-settings-row-actions">
                 ${isActive
-                    ? '<span class="ezil-settings-pill">Current</span>'
+                    ? `<span class="ezil-settings-pill">Current</span>${desktopClosed ? `<button type="button" class="ezil-settings-btn" data-action="switch" ${isBusy ? 'disabled' : ''}>${isBusy ? 'Opening…' : 'Open'}</button>` : ''}`
                     : `<button type="button" class="ezil-settings-btn" data-action="switch" ${isBusy || computer.available === false ? 'disabled' : ''}>${isBusy ? 'Switching…' : 'Switch'}</button>`}
                 ${isNative() ? (computer.available === false ? '<button type="button" class="ezil-settings-btn" data-action="relink">Locate folder…</button>' : '<button type="button" class="ezil-settings-btn" data-action="reveal">Finder</button><button type="button" class="ezil-settings-btn" data-action="openVSCode">VS Code</button><button type="button" class="ezil-settings-btn" data-action="openXcode">Xcode</button>') : ''}
                 <button type="button" class="ezil-settings-btn" data-action="rename" ${isBusy ? 'disabled' : ''}>Rename</button>
@@ -444,6 +457,7 @@ async function switchTo (computer, ctx, $win) {
             if (ctx.payload) ctx.payload.computer = computer;
         }
         activeComputerId = computer.id;
+        sessionComputerId = computer.id;
         const desktopState = ctx?.payload?.desktopState ?? {};
         await registry.launch('desktop', { ...ctx, computer, desktopState });
     } finally {
@@ -518,6 +532,7 @@ async function handleDelete (computer, $win) {
             reportError(res.message || 'Failed to delete computer. Please try again.');
             return;
         }
+        if ( sessionComputerId === computer.id ) sessionComputerId = undefined;
         await load($win);
     } finally {
         busyId = null;
@@ -618,6 +633,9 @@ export default {
         // empty. See the note on `activeComputerId`.
         if ( activeComputerId === undefined ) {
             activeComputerId = ctx?.computer?.id ?? session.payload()?.computer?.id ?? undefined;
+        }
+        if ( sessionComputerId === undefined ) {
+            sessionComputerId = ctx?.computer?.id ?? session.payload()?.computer?.id ?? undefined;
         }
         bind($win, ctx);
         void load($win);

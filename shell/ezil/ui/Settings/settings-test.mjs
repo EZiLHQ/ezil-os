@@ -710,6 +710,32 @@ push('the desktop now streams the NEW computer (c-e)',
     q('.window[data-app="desktop"][data-ezil-computer-id="c-e"]') !== null);
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 5f. 🔴 CLOSING THE DESKTOP WINDOW DOES NOT CHANGE WHICH COMPUTER YOU ARE ON.
+//     Founder-reported 2026-10-02: with the desktop window closed, the
+//     computer the session was on was offered a "Switch" button like a
+//     stranger's computer. It must stay Current (with an Open action), and
+//     only the OTHER computer offers Switch.
+// ═══════════════════════════════════════════════════════════════════════════
+$('.window[data-app="desktop"]').close();
+await settle(10);
+push('setup: no desktop window is open', qa('.window[data-app="desktop"]').length === 0);
+await reopenSettings();
+const rowsAfterClose = qa('.window[data-app="settings"] .ezil-settings-row');
+const rowE2 = rowsAfterClose.find(r => r.getAttribute('data-id') === 'c-e');
+const rowD2 = rowsAfterClose.find(r => r.getAttribute('data-id') === 'c-d');
+push('🔴 the computer switched to (c-e) is still marked Current after its desktop window closed',
+    rowE2?.classList.contains('active') && rowE2?.querySelector('.ezil-settings-pill')?.textContent.trim() === 'Current',
+    rowE2?.outerHTML.slice(0, 200));
+push('…and offers Open (relaunch its desktop), not Switch',
+    rowE2?.querySelector('[data-action="switch"]')?.textContent.trim() === 'Open');
+push('the OTHER computer (c-d) is the one offered Switch',
+    ! rowD2?.classList.contains('active') && rowD2?.querySelector('[data-action="switch"]')?.textContent.trim() === 'Switch');
+click(rowE2?.querySelector('[data-action="switch"]'));
+await settle(20, 40);
+push('Open relaunches the desktop for the current computer (c-e)',
+    q('.window[data-app="desktop"][data-ezil-computer-id="c-e"]') !== null);
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 6. LOCAL CODE ONLY.
 // ═══════════════════════════════════════════════════════════════════════════
 const offOrigin = calls.filter(c => /^https?:\/\//.test(c.url) && ! (new URL(c.url).hostname === 'ezil.local'));
