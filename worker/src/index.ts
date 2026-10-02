@@ -162,6 +162,36 @@ interface Env extends SandboxEnv {
   /** Absolute in-container path where the workspace bucket is mounted. Defaults to `/workspace`. */
   SANDBOX_WORKSPACE_MOUNT_PATH?: string;
 
+  // ── Durable workspace STORE selection (founder decision 2026-10-02) ─────────
+  // Chooses the backend for the Worker-mediated hydrate/flush PERSISTENCE path
+  // (`hydrateWorkspace` / `runWorkspaceFlush`), NOT the s3fs mount above (which
+  // PLATFORM-NOTES §1 shows drops writes and is never used for live storage).
+  // These are DISTINCT from the legacy `SANDBOX_WORKSPACE_S3_*` mount vars.
+  // See `./workspace-store-s3.ts` and `docs/WORKSPACE-STORE.md`.
+  /**
+   * `'r2'` (default when unset) keeps the R2 binding; `'s3'` moves the durable
+   * store to AWS S3. Any other value FAILS CLOSED (`workspace_store_misconfigured`)
+   * rather than silently falling back. DELIBERATELY NOT SET in wrangler.toml so
+   * the default stays R2 — flip it per-deployment via `wrangler secret`/`[vars]`.
+   */
+  EZIL_WORKSPACE_STORE?: string;
+  /** S3 bucket for the durable workspace store (required when store='s3'). */
+  EZIL_WORKSPACE_S3_BUCKET?: string;
+  /** S3 region, e.g. `us-east-1` (required when store='s3'). */
+  EZIL_WORKSPACE_S3_REGION?: string;
+  /** S3 access key id (required when store='s3'; secret — never logged). */
+  EZIL_WORKSPACE_S3_ACCESS_KEY_ID?: string;
+  /** S3 secret access key (required when store='s3'; secret — never logged). */
+  EZIL_WORKSPACE_S3_SECRET_ACCESS_KEY?: string;
+  /** Optional S3-compatible endpoint for path-style access (MinIO/local/tests). */
+  EZIL_WORKSPACE_S3_ENDPOINT?: string;
+  /** Optional static key prefix inside the bucket, e.g. `workspaces/`. */
+  EZIL_WORKSPACE_S3_KEY_PREFIX?: string;
+  /** Optional server-side encryption: `AES256` or `aws:kms`. */
+  EZIL_WORKSPACE_S3_SSE?: string;
+  /** Optional KMS key id when `EZIL_WORKSPACE_S3_SSE='aws:kms'`. */
+  EZIL_WORKSPACE_S3_KMS_KEY_ID?: string;
+
   /**
    * Non-secret kill-switch for the HMAC-gated `workspace-diag` route. Enabled
    * by default; set to `off`/`false`/`0`/`disabled`/`no` to hard-disable the
@@ -462,6 +492,10 @@ import {
   type FlushOutcome,
   type FlushManifest,
 } from './workspace-persist';
+import {
+  resolveWorkspaceStore,
+  type WorkspaceStore,
+} from './workspace-store-s3';
 // NOTE: `TWEN_SCHEMA`, `TWEN_OPS`, `TWEN_OP_ID_RE`, `TWEN_ALLOWED_FIELDS`,
 // `TWEN_MAX_BODY_BYTES`, and `TWEN_STATUS_FILE`/`TWEN_STAT_RETRY_DELAY_MS` are
 // intentionally NOT re-exported here — they are plain `const`s, and workerd
@@ -1311,6 +1345,23 @@ async function ensureWorkspaceMount(
   env: Env,
   { projectId, branch }: { projectId: string; branch: string },
 ): Promise<{ mounted: boolean; mountPath?: string; detail?: string }> {
+  // Durable store selection takes precedence over the legacy mount config.
+  // When EZIL_WORKSPACE_STORE='s3', ALWAYS take the Worker-mediated
+  // hydrate/flush path (`hydrateWorkspace`) — NEVER the s3fs mount, which drops
+  // writes (PLATFORM-NOTES §1) — regardless of whether an R2 binding is also
+  // present (that is the migration case). The actual R2-vs-S3 read/write
+  // routing is decided inside `hydrateWorkspace`/`runWorkspaceFlush` by
+  // `resolveWorkspaceStore`. A misconfigured store fails closed here too.
+  const storeSel = resolveWorkspaceStore(env);
+  if (!storeSel.ok) return { mounted: false, detail: storeSel.detail };
+  if (storeSel.kind === 's3') {
+    const mountPath = env.SANDBOX_WORKSPACE_MOUNT_PATH?.trim() || DEFAULT_WORKSPACE_MOUNT_PATH;
+    // Standard per-project scope (leading slash per the mountBucket/seed
+    // contract; stripped to the real key prefix downstream). In-bucket scoping
+    // for the S3 store is a separate lever (EZIL_WORKSPACE_S3_KEY_PREFIX).
+    return sandbox.hydrateWorkspace({ mountPath, prefix: `/${projectId}/branches/${branch}` });
+  }
+
   const config = resolveWorkspaceMountConfig(env);
   if (!config) return { mounted: false, detail: 'workspace_bucket_not_configured' };
 
@@ -1445,7 +1496,9 @@ async function recordHydrationOutcome(
  */
 async function ensureWorkspaceHydratedFromR2(
   sandbox: Sandbox<unknown> & EzilWorkspacePersistRpc,
-  bucket: R2Bucket | undefined,
+  // Either the native R2 binding (store='r2') or an S3-backed/migrating store
+  // (store='s3'); both satisfy the checkpoint/seed modules' structural surface.
+  bucket: R2Bucket | WorkspaceStore | undefined,
   mountPath: string,
   mountPrefix: string,
 ): Promise<{ mounted: boolean; mountPath?: string; detail?: string }> {
@@ -2216,7 +2269,13 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   async hydrateWorkspace(params: { mountPath: string; prefix: string }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }> {
     return this.withWorkspacePersistence(async () => {
       try {
-        const result = await ensureWorkspaceHydratedFromR2(this, this.env.SANDBOX_WORKSPACE_R2_BUCKET, params.mountPath, params.prefix);
+        // Fail closed: a misconfigured store NEVER silently falls back to R2.
+        // A FRESH store is resolved per call so the migrating store's per-prefix
+        // read routing cache cannot outlive a migration (a stale 'R2' route
+        // would re-restore pre-migration content on a later hydrate).
+        const store = resolveWorkspaceStore(this.env);
+        if (!store.ok) return { mounted: false, detail: store.detail };
+        const result = await ensureWorkspaceHydratedFromR2(this, store.store, params.mountPath, params.prefix);
         if (!result.mounted) return result;
         const checkpoint = await this.runWorkspaceFlush('explicit');
         return checkpoint.ok ? result : { mounted: false, detail: 'workspace_checkpoint_failed' };
@@ -2252,7 +2311,14 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     }
 
     const hydrated = (await this.ctx.storage.get<boolean>(WORKSPACE_HYDRATED_KEY)) ?? false;
-    const bucket = this.env.SANDBOX_WORKSPACE_R2_BUCKET;
+    // Fail closed: a misconfigured store is skipped, never silently run on R2.
+    // Fresh per flush so no stale per-prefix read routing is reused.
+    const store = resolveWorkspaceStore(this.env);
+    if (!store.ok) {
+      bootLog('workspace_flush', 'end', { status: 'skipped', detail: `store_misconfigured,trigger=${trigger}`, phaseMs: Date.now() - t0 });
+      return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0, failed: [], manifest: {}, heartbeatWritten: false };
+    }
+    const bucket = store.store;
     if (!bucket) {
       bootLog('workspace_flush', 'end', { status: 'skipped', detail: `no_r2_binding,trigger=${trigger}`, phaseMs: Date.now() - t0 });
       return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0, failed: [], manifest: {}, heartbeatWritten: false };
