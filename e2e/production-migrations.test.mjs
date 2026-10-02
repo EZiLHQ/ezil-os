@@ -5,7 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import { pathToFileURL } from 'node:url';
 import { hash, snapshotHash, tokenize, additiveSQL, validate, run, authorize, query, catalogSQL, applySQL, planSQL, eventTriggersSQL } from '../.github/scripts/production-migrations.mjs';
+import { pinnedManifest, transitionSQL, run as reconcileVaultACL } from '../.github/scripts/reconcile-vault-acl.mjs';
 
 const command = promisify(execFile);
 const project = 'btgqfmnzycdecmeyqubx';
@@ -413,4 +415,189 @@ test(`transaction protocol (${process.env.PRODUCTION_MIGRATIONS_DOCKER === '1' ?
       assert.equal((await db.rows('SELECT count(*)::integer n FROM ezil_ci.journal'))[0].n, 1);
     });
   }
+});
+
+const productionManifest = async () => JSON.parse(await readFile(new URL('../.github/production-migrations.json', import.meta.url), 'utf8'));
+
+test('vault transition pins the reviewed manifest and cannot become a generic rebaseline', async () => {
+  const manifest = await productionManifest();
+  pinnedManifest(manifest);
+  for (const patch of [
+    { repository: 'example/repo' }, { project: 'a'.repeat(20) }, { schemas: ['other'] },
+    { trustedWorkflowRuns: [1] }, { sources: [] }, { migrations: [{ id: 'new' }] },
+    ...['digest', 'sourceDigest', 'objects', 'capturedAt'].map(key => ({ initialCatalog: { ...manifest.initialCatalog, [key]: key === 'objects' ? 1793 : 'wrong' } })),
+  ]) assert.throws(() => pinnedManifest({ ...manifest, ...patch }), /reviewed vault ACL/);
+  const sql = transitionSQL(manifest);
+  assert.doesNotMatch(sql, /\b(?:GRANT|REVOKE|CREATE|ALTER|DELETE|INSERT|DROP)\s/i);
+  assert.equal((sql.match(/UPDATE ezil_ci\.baselines SET initial_catalog=/g) ?? []).length, 1);
+});
+
+test('vault transition uses clean current-main authorization and refuses failed gates before database access', async t => {
+  const { root } = await fixture(t);
+  const manifest = await productionManifest();
+  for (const source of manifest.sources) {
+    await mkdir(join(root, source.path, '..'), { recursive: true });
+    await writeFile(join(root, source.path), await readFile(new URL(`../${source.path}`, import.meta.url)));
+  }
+  await writeFile(join(root, '.github/production-migrations.json'), JSON.stringify(manifest));
+  await command('git', ['add', '.'], { cwd: root });
+  await command('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture'], { cwd: root });
+  const sha = (await command('git', ['rev-parse', 'HEAD'], { cwd: root })).stdout.trim();
+  const eventPath = join(root, 'event.json');
+  await writeFile(eventPath, JSON.stringify({ repository: { full_name: manifest.repository }, ref: 'refs/heads/main', after: sha }));
+  const env = { GITHUB_ACTIONS: 'true', GITHUB_REF: 'refs/heads/main', GITHUB_REPOSITORY: manifest.repository,
+    GITHUB_SHA: sha, GITHUB_EVENT_NAME: 'push', GITHUB_EVENT_PATH: eventPath, GITHUB_TOKEN: 'fixture-only',
+    SUPABASE_ACCESS_TOKEN: 'fixture-only', EZIL_DEPLOY_TARGET: 'production', EZIL_DEPLOY_SHA: sha,
+    EZIL_TRANSITION_TRUSTED: 'true', EZIL_TRANSITION_STAGING: 'success', EZIL_TRANSITION_IMAGES: 'success', EZIL_TRANSITION_LEASE: 'success' };
+  let currentMain = sha;
+  const requests = [];
+  const request = async (url, init) => {
+    requests.push(url);
+    if (url === `https://api.github.com/repos/${manifest.repository}/commits/main`) return { ok: true, json: async () => ({ sha: currentMain }) };
+    assert.equal(url, `https://api.supabase.com/v1/projects/${project}/database/query`);
+    assert.equal(JSON.parse(init.body).read_only, false);
+    assert.equal(JSON.parse(init.body).query, transitionSQL(manifest));
+    return { ok: true, json: async () => [{ changed: 0 }] };
+  };
+  const options = { root, env, request, log: () => {} };
+  await reconcileVaultACL(['reconcile'], options);
+  assert.equal(requests.length, 2);
+  for (const key of ['EZIL_DEPLOY_TARGET', 'EZIL_TRANSITION_TRUSTED', 'EZIL_TRANSITION_STAGING', 'EZIL_TRANSITION_IMAGES', 'EZIL_TRANSITION_LEASE']) {
+    await assert.rejects(reconcileVaultACL(['reconcile'], { ...options, env: { ...env, [key]: 'failed' }, request: noNetwork }), /gates and acquired lease/);
+  }
+  for (const patch of [{ GITHUB_REF: 'refs/heads/topic' }, { GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_ACTIONS: 'false' }]) {
+    await assert.rejects(reconcileVaultACL(['reconcile'], { ...options, env: { ...env, ...patch }, request: noNetwork }));
+  }
+  requests.length = 0;
+  currentMain = '0'.repeat(40);
+  await assert.rejects(reconcileVaultACL(['reconcile'], options), /Stale/);
+  currentMain = sha;
+  await assert.rejects(reconcileVaultACL(['reconcile'], { ...options, env: { ...env, EZIL_DEPLOY_SHA: '0'.repeat(40) } }), /admitted release/);
+  await writeFile(join(root, manifest.sources[0].path), '-- changed');
+  await assert.rejects(reconcileVaultACL(['reconcile'], options), /checksum/);
+  assert.ok(requests.every(url => url.startsWith('https://api.github.com/')), 'refusals never reach the database');
+});
+
+test('vault ACL registry transition on PostgreSQL', async t => {
+  const db = await database(t);
+  const manifest = await productionManifest();
+  manifest.reviewedEventTriggers = [];
+  const dir = await mkdtemp(join(tmpdir(), 'vault-acl-postgres-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const observe = async (schemas = ['public']) => (await db.rolledBackRows('SET LOCAL search_path=pg_catalog', catalogSQL(schemas, true)))[0];
+  await db.exec('CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role;');
+  const fixture = async () => {
+    await db.exec(`ROLLBACK; DROP SCHEMA IF EXISTS ezil_ci CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public;
+      CREATE TABLE public.application_data(id integer, value text); INSERT INTO public.application_data VALUES (1,'unchanged');
+      CREATE FUNCTION public.get_vault_secret(secret_name text) RETURNS text LANGUAGE sql AS $$ SELECT secret_name $$;
+      REVOKE EXECUTE ON FUNCTION public.get_vault_secret(text) FROM PUBLIC;
+      GRANT EXECUTE ON FUNCTION public.get_vault_secret(text) TO anon, authenticated, service_role;`);
+    const before = await observe();
+    await db.exec(applySQL({ manifest: { ...manifest, initialCatalog: { ...manifest.initialCatalog, digest: before.digest, objects: before.objects } }, files: new Map() }));
+    await db.exec(`UPDATE ezil_ci.baselines SET registered_at='2026-09-29T16:41:32.074836Z';
+      REVOKE EXECUTE ON FUNCTION public.get_vault_secret(text) FROM anon, authenticated, public;`);
+    const after = await observe();
+    assert.equal(before.objects, after.objects);
+    assert.notEqual(before.digest, after.digest);
+    return { before, after };
+  };
+  const { before, after } = await fixture();
+  const version = (await db.rows("SELECT current_setting('server_version_num') AS version"))[0].version;
+  // Only fixture code is rewritten: production exposes no digest/version override.
+  // Exercise the exact SQL generator with a small disposable catalog on PG16/18.
+  let source = await readFile(new URL('../.github/scripts/reconcile-vault-acl.mjs', import.meta.url), 'utf8');
+  for (const [name, value] of Object.entries({ oldDigest: before.digest, newDigest: after.digest, objects: after.objects, serverVersion: version })) {
+    const pattern = new RegExp(`const ${name} = [^;]+;`, 'g');
+    assert.equal([...source.matchAll(pattern)].length, 1);
+    source = source.replace(pattern, `const ${name} = ${JSON.stringify(value)};`);
+  }
+  source = source.replace("'./production-migrations.mjs'", JSON.stringify(new URL('../.github/scripts/production-migrations.mjs', import.meta.url).href));
+  const modulePath = join(dir, 'fixture-transition.mjs');
+  await writeFile(modulePath, source);
+  const fixtureModule = await import(pathToFileURL(modulePath));
+  manifest.initialCatalog.digest = after.digest;
+  manifest.initialCatalog.objects = after.objects;
+  const sql = fixtureModule.transitionSQL(manifest);
+  const state = async () => ({
+    catalog: await observe(['public', 'ezil_ci']),
+    baseline: await db.rows('SELECT b.*,xmin::text AS row_version FROM ezil_ci.baselines b ORDER BY repository'),
+    journal: await db.rows('SELECT * FROM ezil_ci.journal ORDER BY repository,id'),
+    application: await db.rows('SELECT * FROM public.application_data'),
+  });
+  const rejectUnchanged = async (statement, pattern) => {
+    const prior = await state();
+    await assert.rejects(db.exec(statement), pattern);
+    await db.exec('ROLLBACK;');
+    assert.deepEqual(await state(), prior, 'failure must leave registry, catalog, grants and data unchanged');
+  };
+  await t.test('reconciles only initial_catalog; rerun has no row update; grants remain tightened', async () => {
+    const prior = await state();
+    await db.exec(sql);
+    const reconciled = await state();
+    assert.deepEqual(reconciled.catalog, prior.catalog);
+    assert.deepEqual(reconciled.application, prior.application);
+    assert.deepEqual(reconciled.journal, []);
+    assert.deepEqual(reconciled.baseline.map(({ row_version, ...row }) => row), prior.baseline.map(({ row_version, ...row }) => ({ ...row, initial_catalog: after.digest })));
+    assert.notEqual(reconciled.baseline[0].row_version, prior.baseline[0].row_version);
+    await db.exec(sql);
+    assert.deepEqual(await state(), reconciled);
+    const acl = (await db.rows("SELECT proacl::text acl,has_function_privilege('anon',oid,'EXECUTE') anon,has_function_privilege('authenticated',oid,'EXECUTE') authenticated FROM pg_proc WHERE oid='public.get_vault_secret(text)'::regprocedure"))[0];
+    assert.deepEqual(acl, { acl: '{postgres=X/postgres,service_role=X/postgres}', anon: false, authenticated: false });
+    await db.exec(applySQL({ manifest, files: new Map() })); // Existing apply is unblocked.
+  });
+  const refusals = [
+    ['wrong registered digest', "UPDATE ezil_ci.baselines SET initial_catalog=repeat('0',64)", /baseline identity/],
+    ['wrong project', "UPDATE ezil_ci.baselines SET project='other'", /baseline identity/],
+    ['wrong repository', "UPDATE ezil_ci.baselines SET repository='other/repo'", /baseline identity/],
+    ['wrong schemas', `UPDATE ezil_ci.baselines SET schemas='["other"]'`, /baseline identity/],
+    ['wrong historical source', "UPDATE ezil_ci.baselines SET snapshots=repeat('0',64)", /baseline identity/],
+    ['wrong registration time', "UPDATE ezil_ci.baselines SET registered_at=now()", /baseline identity/],
+    ['missing baseline', 'DELETE FROM ezil_ci.baselines', /baseline identity/],
+    ['wrong registry owner', 'ALTER SCHEMA ezil_ci OWNER TO anon', /registry\/owner/],
+    ['wrong table owner', 'ALTER TABLE ezil_ci.baselines OWNER TO anon', /object\/owner/],
+    ['public registry grant', 'GRANT USAGE ON SCHEMA ezil_ci TO PUBLIC', /schema must be private/],
+    ['table grant', 'GRANT SELECT ON ezil_ci.baselines TO anon', /tables must be private/],
+    ['registry shape', 'ALTER TABLE ezil_ci.baselines ADD COLUMN surprise text', /shape drift/],
+    ['registry policy', 'CREATE POLICY unexpected ON ezil_ci.baselines USING (true)', /routine\/rule\/policy/],
+    ['registry update trigger', `CREATE FUNCTION public.mutate_on_update() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN UPDATE public.application_data SET value='unsafe'; RETURN NEW; END$$;
+      CREATE TRIGGER unexpected BEFORE UPDATE ON ezil_ci.baselines FOR EACH ROW EXECUTE FUNCTION public.mutate_on_update()`, /Unexpected journal trigger/],
+    ['journal rows', `INSERT INTO ezil_ci.journal VALUES ('ezilhq/ezil-os','unexpected','checksum',1,'before','after',now())`, /zero OS journal/],
+    ['unrelated drift', 'ALTER TABLE public.application_data ADD COLUMN surprise text', /digest\/count/],
+    ['wrong routine owner', 'ALTER FUNCTION public.get_vault_secret(text) OWNER TO service_role', /signature\/owner\/ACL/],
+    ['old ACL still live', 'GRANT EXECUTE ON FUNCTION public.get_vault_secret(text) TO anon, authenticated', /signature\/owner\/ACL/],
+    ['public execute', 'GRANT EXECUTE ON FUNCTION public.get_vault_secret(text) TO PUBLIC', /signature\/owner\/ACL/],
+    ['wrong signature', 'ALTER FUNCTION public.get_vault_secret(text) RENAME TO other', /signature\/owner\/ACL/],
+    ['changed body', 'CREATE OR REPLACE FUNCTION public.get_vault_secret(secret_name text) RETURNS text LANGUAGE sql AS $$ SELECT NULL::text $$', /digest\/count/],
+  ];
+  for (const [name, mutation, pattern] of refusals) await t.test(`refuses ${name} unchanged`, async () => {
+    await fixture();
+    await db.exec(mutation);
+    await rejectUnchanged(sql, pattern);
+  });
+  await t.test('already reconciled registry still refuses unrelated drift', async () => {
+    await fixture(); await db.exec(sql);
+    await db.exec('ALTER TABLE public.application_data ADD COLUMN drift text');
+    await rejectUnchanged(sql, /digest\/count/);
+  });
+  await t.test('inherited access is refused even with exact routine ACL', async () => {
+    await fixture(); await db.exec('GRANT service_role TO anon');
+    try { await rejectUnchanged(sql, /must deny/); }
+    finally { await db.exec('REVOKE service_role FROM anon'); }
+  });
+  await t.test('wrong current user, count, old reconstruction and platform inventory fail unchanged', async () => {
+    await fixture();
+    await rejectUnchanged(sql.replace('BEGIN;', 'BEGIN; SET LOCAL ROLE service_role;'), /postgres identity\/version/);
+    await rejectUnchanged(sql.replace(`current_setting(''server_version_num'')=E''${version}''`, "current_setting(''server_version_num'')=E''0''"), /postgres identity\/version/);
+    await rejectUnchanged(sql.replace(`catalog.objects=${after.objects}`, `catalog.objects=${after.objects + 1}`), /digest\/count/);
+    await rejectUnchanged(sql.replaceAll(before.digest, '0'.repeat(64)).replace(`initial_catalog IN (E''${'0'.repeat(64)}''`, `initial_catalog IN (E''${before.digest}''`), /Old catalog reconstruction/);
+    await db.exec('CREATE FUNCTION public.event_hook() RETURNS event_trigger LANGUAGE plpgsql AS $$BEGIN END$$; CREATE EVENT TRIGGER unreviewed ON ddl_command_start EXECUTE FUNCTION public.event_hook()');
+    try { await rejectUnchanged(sql, /event triggers differ/); }
+    finally { await db.exec('DROP EVENT TRIGGER unreviewed; DROP FUNCTION public.event_hook()'); }
+  });
+  if (process.env.PRODUCTION_MIGRATIONS_DOCKER === '1') await t.test('concurrent retries serialize and reconcile once', async () => {
+    await fixture();
+    const results = await Promise.all([db.exec(sql), db.exec(sql)]);
+    assert.deepEqual(results.map(result => Number(result.trim())).sort(), [0, 1]);
+    assert.equal((await state()).baseline[0].initial_catalog, after.digest);
+  });
 });

@@ -92,6 +92,80 @@ repository before its initial registration, run `plan` with the management token
 supplied by the environment and copy the reviewed `observedCatalog` unchanged
 into `initialCatalog`. Never derive a hosted baseline by replaying source SQL.
 
+### Reviewed OS vault ACL transition (2026-10-02)
+
+Production run `37040140729` stopped at `Current catalog drift` after the login,
+favicon and legal changes from PR #175 had passed CI, staging and image suites.
+The following read-only evidence explains the entire drift in project
+`btgqfmnzycdecmeyqubx` on PostgreSQL 17.6, with 1794 `public` catalog
+entries. The saved reconstruction ran as `supabase_read_only_user`; separate
+readbacks confirmed the registry owner is `postgres`, which the write path
+requires:
+
+| Evidence | Exact value |
+| --- | --- |
+| Original catalog digest | `4c1040575121990dbd5ad09e40c0e334be4a291e4e746fc20a08d8c07a036e7f` |
+| Current canonical catalog digest | `e63f1fd705c4204eb370d8020182ef423d0a5df9a10c3122e0cc550fdd57f090` |
+| Historical source digest | `e884a81df52d591799e97b1ca59685fa7a70449d91de414c777866f5a26438f5` |
+| Original capture | `2026-09-29T15:45:14.939Z` |
+| OS baseline registration | `2026-09-29T16:41:32.074836Z` |
+| OS journal rows | `0` |
+| Routine | `public.get_vault_secret(text)` |
+| Original routine ACL | `{postgres=X/postgres,anon=X/postgres,authenticated=X/postgres,service_role=X/postgres}` |
+| Current routine ACL | `{postgres=X/postgres,service_role=X/postgres}` |
+
+The coordinator used the exact engine catalog SQL with
+`SET LOCAL search_path=pg_catalog`. Replacing only this routine's ACL in the
+catalog JSON matched exactly one entry and reproduced the original digest
+exactly. No live ACL was changed to obtain this proof. `pg_stat_statements`,
+with `stats_since=2026-10-01T08:27:00.058748Z`, reported one call to
+`revoke execute on function public.get_vault_secret(text) from anon, authenticated, public`.
+These statistics corroborate the restriction; they do not establish its exact
+execution time or actor.
+
+**This is an irreversible security fix for release recovery: never restore
+anon, authenticated or PUBLIC execute access.** Do not merge draft #173 or use
+its underguarded manual SQL. Its `427180...` observation used the default
+search path; the difference from canonical `e63f1f...` does not establish another
+live schema change. The proven baseline drift is the routine ACL restriction.
+
+`.github/scripts/reconcile-vault-acl.mjs reconcile` is a separate, one-time
+reviewed registry transition before the existing production apply step. The
+workflow requires trusted successful current-main CI, staging and image gates,
+and holds the shared production lease. The helper uses the existing local source
+validation, clean-checkout/current-main authorization and project-pinned query
+transport. It additionally requires the admitted release SHA and successful
+gate/lease outcomes. Those outcomes are workflow assertions, not an independent
+database proof of the lease; direct local execution is not a supported path.
+
+One transaction takes the protocol advisory lock `(1702521196, 1835624306)`,
+uses the canonical search path and 30/120-second lock/statement timeouts, and
+requires the exact server version, `postgres` identity, private owned registry
+shape, reviewed event triggers, existing baseline identity and zero OS journal
+rows. Repository, project, schemas, source inventory, historical source digest,
+registration time, catalog digests and count are pinned. The helper verifies
+the exact restricted routine ACL and denies effective anon/authenticated access
+and PUBLIC grants, including inherited access missed by an ACL-only comparison.
+It reconstructs the old digest by replacing only the matching JSON ACL field.
+
+Only after these checks can it update `ezil_ci.baselines.initial_catalog` from
+the original digest to the current one, asserting exactly one changed row.
+It never changes actual grants, application schema/data, historical snapshots,
+registration time or journal rows. A registry already holding the new digest
+passes all the same checks and performs no update. An ambiguous request outcome
+is reconciled by rerunning the same gated release. There is no reverse transition,
+automatic registry rollback, general rebaseline or drift-ignore option.
+
+The manifest now pins the new digest. Its `capturedAt` retains the original
+capture provenance and its historical `sourceDigest` remains unchanged; this
+section records the subsequent reviewed transition. The portable engine's
+default catalog SQL and apply behavior are unchanged: its small compatibility
+extension exposes the same catalog JSON body on request and exports the existing
+journal-shape checks for reuse. The helper never logs that full catalog body.
+After production has verified reconciliation, retire the workflow transition
+step through review before changing source inventory, adding migrations or
+upgrading PostgreSQL; its exact pins deliberately refuse those later changes.
+
 ## Journal, catalog and retries
 
 One transaction-scoped advisory lock, `(1702521196, 1835624306)`, serializes all
@@ -257,3 +331,13 @@ The coordinator runs the native Docker mode as well as the focused helper
 checks. All test SQL and records live in disposable databases, and are separate
 from production migrations and baseline evidence. OS uses Docker mode without
 adding a PGlite dependency. Docker mode needs the pinned image pulled first.
+
+The same suite includes the vault ACL transition: initial reconciliation and
+unchanged reruns, retained permission restrictions, current-main authorization,
+failed gates, incorrect registry identities/owners/grants/shape, journal rows,
+inherited routine access, unrelated catalog drift and failed old-digest proof.
+Its small disposable catalog substitutes only fixture digest/count/version
+constants in a temporary copy of the helper; production has no override flags.
+Docker additionally checks concurrent transition retries. These fixtures do
+not reproduce the production catalog; the pinned production digests come from
+the read-only evidence above.
