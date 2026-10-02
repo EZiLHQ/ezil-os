@@ -256,12 +256,20 @@ def capture(path):
                 fingerprint = 'd'
             elif stat.S_ISLNK(s.st_mode):
                 info.type = tarfile.SYMTYPE
-                info.linkname = os.readlink(name)
+                try:
+                    info.linkname = os.readlink(name)
+                except FileNotFoundError:
+                    continue        # removed since the walk: absence is the state to commit
                 tar.addfile(info)
                 fingerprint = 'l:' + info.linkname
             else:
-                # Fail closed: an unreadable file would silently drop out of the committed layer.
-                with open(name, 'rb') as f:
+                # Removed since the walk (temp files, journals): absence is the state to commit.
+                # Any OTHER read error fails closed: the file would silently drop out of the layer.
+                try:
+                    f = open(name, 'rb')
+                except FileNotFoundError:
+                    continue
+                with f:
                     st = os.fstat(f.fileno())
                     if (st.st_ino, st.st_size, st.st_mtime_ns) != (s.st_ino, s.st_size, s.st_mtime_ns):
                         raise AssertionError('system changed during capture')
@@ -458,7 +466,13 @@ try:
     op = p['op']
     if op == 'sys-capture':
         os.mkdir(work, 0o700)
-        result = capture(os.path.join(work, 'archive.tar'))
+        # A file rewritten mid-capture: one fresh attempt before the flush reports failure.
+        for attempt in (1, 2):
+            try:
+                result = capture(os.path.join(work, 'archive.tar'))
+                break
+            except AssertionError as e:
+                if str(e) != 'system changed during capture' or attempt == 2: raise
         if 'chunks' in result:
             with open(os.path.join(work, 'archive.tar'), 'rb') as f:
                 for i in range(len(result['chunks'])):

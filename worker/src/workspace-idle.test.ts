@@ -618,7 +618,9 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
     // The only exception to "stop only on a successful FINAL flush" is the
     // permanent too_large outcome (never retryable; refusing would bill forever).
     // A failed FINAL system-layer checkpoint (installs outside /workspace) also retries.
-    expect(idleBranch).toContain("if ((outcome.ok || outcome.skippedReason === 'too_large') && !outcome.systemCheckpointFailed) {");
+    // So is a container that never held the hydrated workspace (replaced for an image
+    // rollout): found on staging, where it retried forever and never stopped.
+    expect(idleBranch).toContain("if ((outcome.ok || outcome.skippedReason === 'too_large' || outcome.skippedReason === 'container_not_hydrated')\n          && !outcome.systemCheckpointFailed) {");
     // The idle-stop FINAL flush is never rate-limited (no allowDefer here).
     expect(idleBranch).not.toContain('allowDefer');
     // The failure path must reschedule (retry) rather than fall through to a
@@ -758,6 +760,7 @@ describe('explicit-terminate semantics still hold exactly as before', () => {
     const method = between('private async terminateSandboxWithCheckpoint(): Promise<TerminateReport> {', 'await this.cancelWorkspaceFlushLoop();');
     expect(method).toContain('this.systemFinalNext = true;');
     expect(method).toContain("if (checkpoint?.systemCheckpointFailed) {");
+    expect(method).toContain("if (checkpoint?.skippedReason === 'too_large' || checkpoint?.skippedReason === 'container_not_hydrated') {");
     expect(method).toContain("error: 'system_checkpoint_failed'");
   });
 

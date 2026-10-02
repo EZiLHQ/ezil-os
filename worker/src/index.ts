@@ -2433,6 +2433,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       }
     }
     if (outcome.ok && outcome.uploaded.length > 0) await this.ctx.storage.put(WORKSPACE_LAST_UPLOAD_AT_KEY, Date.now());
+    // The running container lost the hydrated workspace (replaced under us): stop
+    // claiming it is hydrated, so status and the next open re-hydrate from the head.
+    if (outcome.skippedReason === 'container_not_hydrated' && hydrated) await this.ctx.storage.put(WORKSPACE_HYDRATED_KEY, false);
     // System layer: never on the readiness path (it scans the system dirs).
     // Routine cycles -> interval; idle-stop (alarm, no deferral) and teardown
     // (systemFinalNext) -> final; any other explicit flush -> skipped.
@@ -2727,7 +2730,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // container forever without ever saving more. The last committed
       // checkpoint stays authoritative. A failed system checkpoint is not
       // permanent: stay up and retry, like a failed workspace flush.
-      if ((outcome.ok || outcome.skippedReason === 'too_large') && !outcome.systemCheckpointFailed) {
+      // 'container_not_hydrated': the running container provably never held the user's
+      // workspace (replaced for an image rollout) — nothing to save, retrying cannot help.
+      if ((outcome.ok || outcome.skippedReason === 'too_large' || outcome.skippedReason === 'container_not_hydrated')
+          && !outcome.systemCheckpointFailed) {
         // A real input heartbeat may arrive during the checkpoint's R2 I/O.
         // Keep that newly active desktop up and checkpoint again next cycle.
         if (await this.ctx.storage.get<number>(LAST_ACTIVITY_AT_KEY) !== lastActivityAt) {
@@ -2956,8 +2962,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       try { checkpoint = await this.runWorkspaceFlush('explicit'); } catch { /* refuse below */ }
       // A workspace over the snapshot limits can never checkpoint; refusing
       // would retry (and bill) forever. Every other failure still refuses.
-      if (checkpoint?.skippedReason === 'too_large') {
-        console.error('[terminateSandbox] workspace exceeds snapshot limits; terminating on the last committed checkpoint');
+      if (checkpoint?.skippedReason === 'too_large' || checkpoint?.skippedReason === 'container_not_hydrated') {
+        console.error(`[terminateSandbox] ${checkpoint.skippedReason === 'too_large' ? 'workspace exceeds snapshot limits' : 'container does not hold the hydrated workspace'}; terminating on the last committed checkpoint`);
       } else if (!checkpoint?.ok) {
         // Do not tombstone or cancel retries on a persistence failure.
         return { ok: false, terminated: false, stopped: false, outcome: 'flush_failed',

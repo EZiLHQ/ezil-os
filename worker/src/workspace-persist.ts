@@ -79,7 +79,7 @@ export interface FlushOutcome {
    * 'too_large': the workspace exceeds the snapshot limits (512 MiB / 100,000
    * entries). Permanent; callers must not wait for it to succeed.
    */
-  skippedReason?: 'hydration_incomplete' | 'empty_prefix' | 'flush_threw' | 'deferred' | 'too_large';
+  skippedReason?: 'hydration_incomplete' | 'container_not_hydrated' | 'empty_prefix' | 'flush_threw' | 'deferred' | 'too_large';
   heartbeatWritten: boolean;
   checkpoint?: string;
 }
@@ -161,9 +161,11 @@ export async function readHead(bucket: Pick<HydrateR2BucketLike, 'get'>, prefix:
   return { snapshot, etag: body.etag };
 }
 class SnapshotTooLargeError extends Error {}
+class WorkspaceNotHydratedError extends Error {}
 async function command(container: HydrateContainerLike, params: Record<string, unknown>) {
   const result = await container.exec(snapshotCommand(params), { timeout: 120_000 });
   if (result.exitCode === 3 && params.op === 'capture') throw new SnapshotTooLargeError('workspace snapshot too large');
+  if (result.exitCode === 4 && params.op === 'capture') throw new WorkspaceNotHydratedError('workspace not hydrated');
   if (result.exitCode !== 0) throw new Error(`workspace snapshot ${params.op} failed`);
   return result.stdout;
 }
@@ -237,6 +239,13 @@ export async function flushWorkspaceToR2(deps: FlushDeps): Promise<FlushOutcome>
     } catch { log('[workspace-persist] heartbeat failed after committed checkpoint'); }
   } catch (err) {
     if (err instanceof SnapshotTooLargeError) outcome.skippedReason = 'too_large';
+    if (err instanceof WorkspaceNotHydratedError) {
+      // E.g. Cloudflare replaced the container for an image rollout: the new one never
+      // hydrated. The committed head stays authoritative; there is nothing here to save.
+      log('[workspace-persist] container does not hold the hydrated workspace; not checkpointing');
+      outcome.skippedReason = 'container_not_hydrated';
+      return outcome; // `finally` still removes the staging directory
+    }
     // SDK/R2 errors and malformed JSON can contain file bytes or credentials.
     const error = err instanceof SnapshotTooLargeError ? 'workspace too large to checkpoint' : 'workspace checkpoint failed';
     log(`[workspace-persist] ${error}`);

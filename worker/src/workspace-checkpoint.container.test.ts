@@ -302,6 +302,21 @@ describe.skipIf(!imagePresent)(`persistent compute: checkpoint survives real con
     expect((await must(b, 'ls -A /workspace | wc -l')).trim()).toBe('0');
   }, T);
 
+  // Found on staging: Cloudflare replaced a running container for an image rollout. The new
+  // one has an empty /workspace and no marker, while the Worker still thought it hydrated.
+  it('a replacement container that was never hydrated reports container_not_hydrated and never commits', async () => {
+    const store = await makeStore(); const prefix = prefixFor('rollout');
+    const a = await startComputer('roll-a');
+    await must(a, 'mkdir -p /workspace && echo keep > /workspace/keep.txt'); await markHydrated(a, prefix);
+    expect((await flush(a, store, prefix)).ok).toBe(true);
+    const key = `${prefix}/.ezil-snapshots/latest.json`;
+    const good = new TextDecoder().decode(await (await store.get(key))!.arrayBuffer());
+    await must(a, 'rm -rf /workspace/keep.txt /workspace/.ezil-hydrated.json');      // what the replacement looks like
+    const out = await flush(a, store, prefix);
+    expect(out).toMatchObject({ ok: false, skippedReason: 'container_not_hydrated' });
+    expect(new TextDecoder().decode(await (await store.get(key))!.arrayBuffer())).toBe(good);
+  }, T);
+
   it('a failing store put fails the checkpoint (ok:false) and leaves the previous head authoritative', async () => {
     const store = await makeStore(); const prefix = prefixFor('putfail');
     const a = await startComputer('pf-a');
@@ -643,6 +658,18 @@ mkdir -p /opt/ezq && echo opt-ok > /opt/ezq/marker
     expect((await sysFlush(b, store, prefix)).ok).toBe(true);
     const next = JSON.parse(new TextDecoder().decode(await (await store.get(key))!.arrayBuffer()));
     expect(next.format).toBe(2);
+  }, T);
+
+  // Final checkpoints now gate idle-stop/teardown, so ordinary churn (temp files, SQLite
+  // journals appearing and vanishing in HOME) must never fail a capture.
+  it('files created and deleted while the capture runs never fail it', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-churn');
+    const a = await startComputer('sysch-a'); await sysHydrate(a, store, prefix);
+    await baselineSystemLayer(sdk(a)); await new Promise(r => setTimeout(r, 1100));
+    await must(a, 'mkdir -p /root/churn /opt/big && head -c 60000000 /dev/urandom > /opt/big/blob');
+    await docker(['exec', '-d', a, 'bash', '-c', 'end=$((SECONDS+40)); i=0; while [ $SECONDS -lt $end ]; do i=$((i+1)); echo $i > /root/churn/t$i; ln -sf t$i /root/churn/l$i; rm -f /root/churn/t$((i-3)) /root/churn/l$((i-3)); done']);
+    await new Promise(r => setTimeout(r, 500));
+    for (let i = 0; i < 3; i++) expect((await sysFlush(a, store, prefix)).ok).toBe(true);
   }, T);
 
   it('a system delta over the snapshot limit is reported as too_large and never half-written', async () => {

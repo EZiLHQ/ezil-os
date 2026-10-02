@@ -64,8 +64,12 @@ def workspace_file(name):
             yield stream
 
 def marker():
-    with workspace_file('.ezil-hydrated.json') as f:
-        m = json.loads(f.read(CHUNK))
+    try:
+        with workspace_file('.ezil-hydrated.json') as f:
+            m = json.loads(f.read(CHUNK))
+    except FileNotFoundError:
+        # A replacement container (image rollout, crash restart) that was never hydrated.
+        raise AssertionError('hydration incomplete')
     assert m.get('version') == 1 and m.get('prefix') == p['prefix'] and m.get('mountPath') == root, 'hydration incomplete'
     assert m.get('checkpoint') == p.get('expected'), 'workspace writer is stale'
 
@@ -309,6 +313,10 @@ except AssertionError as e:
     if op == 'capture' and str(e) in ('snapshot byte limit', 'snapshot entry limit', 'Git index byte limit', 'Git paths byte limit'):
         print('workspace snapshot too large', file=sys.stderr)
         sys.exit(3)
+    # This container does not hold the hydrated workspace: nothing in it may be committed.
+    if op == 'capture' and str(e) == 'hydration incomplete':
+        print('workspace not hydrated', file=sys.stderr)
+        sys.exit(4)
     print('workspace snapshot failed: ' + type(e).__name__, file=sys.stderr)
     sys.exit(1)
 except Exception as e:
