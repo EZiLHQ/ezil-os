@@ -205,7 +205,7 @@ export class S3WorkspaceStore implements WorkspaceStore {
     this.endpoint = config.endpoint;
     this.pathStyle = config.forcePathStyle ?? !!config.endpoint;
     // Normalize keyPrefix to either '' or something ending in exactly one '/'.
-    const kp = (config.keyPrefix ?? '').replace(/^\/+/, '').replace(/\/+$/, '');
+    const kp = trimSlashes(config.keyPrefix ?? '');
     this.keyPrefix = kp ? `${kp}/` : '';
     this.sse = config.sse;
     this.kmsKeyId = config.kmsKeyId;
@@ -233,7 +233,7 @@ export class S3WorkspaceStore implements WorkspaceStore {
 
   private originAndBucketPath(): string {
     if (this.pathStyle) {
-      const origin = (this.endpoint ?? `https://s3.${this.region}.amazonaws.com`).replace(/\/+$/, '');
+      const origin = trimTrailingSlashes(this.endpoint ?? `https://s3.${this.region}.amazonaws.com`);
       return `${origin}/${encodeURIComponent(this.bucket)}`;
     }
     return `https://${this.bucket}.s3.${this.region}.amazonaws.com`;
@@ -298,8 +298,9 @@ export class S3WorkspaceStore implements WorkspaceStore {
     const etag = normalizeEtag(etagRaw);
     if (range) {
       // 206 + `Content-Range: bytes a-b/total`: report the whole object's size (R2 semantics).
-      const total = res.status === 206 ? /\/(\d+)\s*$/.exec(res.headers.get('content-range') ?? '')?.[1] : undefined;
-      if (total === undefined) throw new Error('workspace store range not honoured');
+      const contentRange = (res.headers.get('content-range') ?? '').trim();
+      const total = res.status === 206 ? contentRange.slice(contentRange.lastIndexOf('/') + 1) : '';
+      if (!/^\d+$/.test(total)) throw new Error('workspace store range not honoured');
       return { etag, size: Number(total), arrayBuffer: async () => buf };
     }
     return { etag, size, arrayBuffer: async () => buf };
@@ -445,7 +446,19 @@ function headKey(prefix: string): string {
 
 /** Strip the trailing slash(es) a `${prefix}/` list argument carries. */
 function normalizePrefix(prefix: string): string {
-  return prefix.replace(/\/+$/, '');
+  return trimTrailingSlashes(prefix);
+}
+
+// Linear-time slash trimming (no backtracking regex on caller-controlled strings).
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47 /* '/' */) end--;
+  return value.slice(0, end);
+}
+function trimSlashes(value: string): string {
+  let start = 0;
+  while (start < value.length && value.charCodeAt(start) === 47) start++;
+  return trimTrailingSlashes(value.slice(start));
 }
 
 export class MigratingWorkspaceStore implements WorkspaceStore {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { mkdtemp, mkdir, writeFile, readFile, rm, lstat } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, lstat, realpath } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { AwsV4Signer } from 'aws4fetch';
@@ -22,6 +22,8 @@ import {
   serializeHydrateMarker,
   type FlushContainerLike,
 } from './workspace-persist';
+// The snapshot codec only ever runs in the Linux container; it needs a POSIX host here.
+const NO_POSIX_HOST = process.platform === 'win32';
 
 // ───────────────────────────── shared helpers ───────────────────────────────
 
@@ -195,7 +197,7 @@ class MemStore implements WorkspaceStore {
 const roots: string[] = [];
 const gitEnv = { PATH: '/usr/bin:/bin', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
 afterEach(async () => { await Promise.all(roots.splice(0).map((p) => rm(p, { recursive: true, force: true }))); });
-async function temp() { const root = await mkdtemp('/tmp/ezil-s3store-test-'); roots.push(root); return root; }
+async function temp() { const root = await realpath(await mkdtemp('/tmp/ezil-s3store-test-')); roots.push(root); return root; }
 const container: FlushContainerLike = {
   async mkdir(path, opts) { await mkdir(path, { recursive: opts?.recursive ?? false }); },
   async writeFile(path, content, opts) { await writeFile(path, opts?.encoding === 'base64' ? Buffer.from(content, 'base64') : content); },
@@ -221,7 +223,7 @@ const headKey = `${prefix}/${SNAPSHOT_HEAD}`;
 
 // ───────────────────────────── unit: etag ───────────────────────────────────
 
-describe('normalizeEtag', () => {
+describe.skipIf(NO_POSIX_HOST)('normalizeEtag', () => {
   it('strips weak markers and surrounding quotes, leaves bare hex', () => {
     expect(normalizeEtag('"abc123"')).toBe('abc123');
     expect(normalizeEtag('W/"abc123"')).toBe('abc123');
@@ -232,7 +234,7 @@ describe('normalizeEtag', () => {
 
 // ───────────────────────────── unit: S3WorkspaceStore ────────────────────────
 
-describe('S3WorkspaceStore: get', () => {
+describe.skipIf(NO_POSIX_HOST)('S3WorkspaceStore: get', () => {
   it('returns normalized etag + Content-Length size, 404 => null', async () => {
     const fake = makeFakeS3();
     const store = makeStore(fake);
@@ -261,7 +263,7 @@ describe('S3WorkspaceStore: get', () => {
   });
 });
 
-describe('S3WorkspaceStore: put preconditions', () => {
+describe.skipIf(NO_POSIX_HOST)('S3WorkspaceStore: put preconditions', () => {
   it('If-None-Match:* creates once, then returns null (412) — never retried', async () => {
     const fake = makeFakeS3();
     const store = makeStore(fake);
@@ -316,7 +318,7 @@ describe('S3WorkspaceStore: put preconditions', () => {
   });
 });
 
-describe('S3WorkspaceStore: list (ListObjectsV2, encoding-type=url)', () => {
+describe.skipIf(NO_POSIX_HOST)('S3WorkspaceStore: list (ListObjectsV2, encoding-type=url)', () => {
   it('parses keys, sizes, truncation and paginates by continuation-token', async () => {
     const fake = makeFakeS3();
     const store = makeStore(fake);
@@ -363,7 +365,7 @@ describe('S3WorkspaceStore: list (ListObjectsV2, encoding-type=url)', () => {
   });
 });
 
-describe('S3WorkspaceStore: SigV4 signing', () => {
+describe.skipIf(NO_POSIX_HOST)('S3WorkspaceStore: SigV4 signing', () => {
   it('signs every request (AWS4-HMAC-SHA256, x-amz-date, x-amz-content-sha256)', async () => {
     const fake = makeFakeS3();
     const store = makeStore(fake);
@@ -408,7 +410,7 @@ describe('S3WorkspaceStore: SigV4 signing', () => {
 
 // ─────────────── checkpoint module runs UNCHANGED on the S3 store ─────────────
 
-describe('checkpoint module on the S3 store (real git + fake S3)', () => {
+describe.skipIf(NO_POSIX_HOST)('checkpoint module on the S3 store (real git + fake S3)', () => {
   it('flush then hydrate round-trips a git workspace through S3', async () => {
     const fake = makeFakeS3();
     const store = makeStore(fake);
@@ -474,7 +476,7 @@ describe('checkpoint module on the S3 store (real git + fake S3)', () => {
 
 // ───────────────────────────── migration (R2 → S3) ───────────────────────────
 
-describe('migration: R2 committed checkpoint → S3', () => {
+describe.skipIf(NO_POSIX_HOST)('migration: R2 committed checkpoint → S3', () => {
   it('copies the R2 checkpoint forward, flushes to S3, leaves R2 untouched', async () => {
     const fake = makeFakeS3();
     const s3 = makeStore(fake);
@@ -558,7 +560,7 @@ describe('migration: R2 committed checkpoint → S3', () => {
   });
 });
 
-describe('migration: R2 legacy loose files → S3', () => {
+describe.skipIf(NO_POSIX_HOST)('migration: R2 legacy loose files → S3', () => {
   it('imports loose R2 files, first flush writes a full S3 snapshot, R2 untouched', async () => {
     const fake = makeFakeS3();
     const s3 = makeStore(fake);
@@ -583,7 +585,7 @@ describe('migration: R2 legacy loose files → S3', () => {
   });
 });
 
-describe('migration: read routing', () => {
+describe.skipIf(NO_POSIX_HOST)('migration: read routing', () => {
   it('reads S3 once S3 holds the head, never falling back to a stale R2', async () => {
     const fake = makeFakeS3();
     const s3 = makeStore(fake);
@@ -612,7 +614,7 @@ describe('migration: read routing', () => {
 
 // ───────────────────────────── selection (fail closed) ───────────────────────
 
-describe('resolveWorkspaceStore: fail-closed selection', () => {
+describe.skipIf(NO_POSIX_HOST)('resolveWorkspaceStore: fail-closed selection', () => {
   const s3Env = {
     EZIL_WORKSPACE_STORE: 's3',
     EZIL_WORKSPACE_S3_BUCKET: 'b',

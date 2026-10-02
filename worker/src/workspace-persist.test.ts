@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { mkdtemp, mkdir, writeFile, readFile, rm, chmod, symlink, lstat, readlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, chmod, symlink, lstat, readlink, realpath } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
@@ -8,13 +8,15 @@ import {
   parseHydrateMarker, parseSnapshot, serializeHydrateMarker,
   type FlushR2BucketLike, type HydrateR2BucketLike, type FlushContainerLike,
 } from './workspace-persist';
+// The snapshot codec only ever runs in the Linux container; it needs a POSIX host here.
+const NO_POSIX_HOST = process.platform === 'win32';
 
 const run = promisify(execFile);
 const prefix = 'project/branches/main';
 const roots: string[] = [];
 const env = { PATH: '/usr/bin:/bin', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
 afterEach(async () => { await Promise.all(roots.splice(0).map(p => rm(p, { recursive: true, force: true }))); });
-async function temp() { const root = await mkdtemp('/tmp/ezil-durable-test-'); roots.push(root); return root; }
+async function temp() { const root = await realpath(await mkdtemp('/tmp/ezil-durable-test-')); roots.push(root); return root; }
 const log = () => {};
 const digest = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
 
@@ -65,7 +67,7 @@ const hydrate = (root: string, bucket: Bucket) => hydrateWorkspaceFromR2({ conta
 const git = async (root: string, ...args: string[]) => (await run('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-C', root, ...args], { env })).stdout;
 const headKey = `${prefix}/${SNAPSHOT_HEAD}`;
 
-describe('atomic Git workspace checkpoints (real filesystem and Git)', () => {
+describe.skipIf(NO_POSIX_HOST)('atomic Git workspace checkpoints (real filesystem and Git)', () => {
   it('restores the exact index, refs, objects, staged/unstaged edits, deletions, modes and safe links after replacement', async () => {
     const { base, root } = await workspace(); const bucket = new Bucket();
     await git(root, 'init', '-b', 'main');
@@ -188,7 +190,7 @@ describe('atomic Git workspace checkpoints (real filesystem and Git)', () => {
   });
 });
 
-describe('legacy import and metadata validation', () => {
+describe.skipIf(NO_POSIX_HOST)('legacy import and metadata validation', () => {
   it('imports legacy files once and ignores loose stale keys after the first checkpoint', async () => {
     const base = await temp(); const root = `${base}/legacy`; const bucket = new Bucket();
     await bucket.put(`${prefix}/src/a`, new TextEncoder().encode('old'));
@@ -222,7 +224,7 @@ describe('legacy import and metadata validation', () => {
   });
 });
 
-describe('snapshot integrity and writer fencing', () => {
+describe.skipIf(NO_POSIX_HOST)('snapshot integrity and writer fencing', () => {
   it('rejects a stale container after a replacement has advanced the checkpoint', async () => {
     const { root, base } = await workspace(); const bucket = new Bucket(); await writeFile(`${root}/a`, 'first');
     expect((await flush(root, bucket)).ok).toBe(true);
@@ -254,7 +256,7 @@ describe('snapshot integrity and writer fencing', () => {
   }
 });
 
-describe('security regressions', () => {
+describe.skipIf(NO_POSIX_HOST)('security regressions', () => {
   it('fences the old writer when a replacement checkpoints an unchanged tree', async () => {
     const { base, root } = await workspace(); const bucket = new Bucket();
     await writeFile(`${root}/a`, 'original'); expect((await flush(root, bucket)).ok).toBe(true);
@@ -340,7 +342,7 @@ describe('security regressions', () => {
   });
 });
 
-it('pins parent directories so a racing symlink cannot redirect a capture read', async () => {
+it.skipIf(NO_POSIX_HOST)('pins parent directories so a racing symlink cannot redirect a capture read', async () => {
   const { SNAPSHOT_SCRIPT } = await import('./workspace-snapshot-script');
   const { root, base } = await workspace();
   await mkdir(`${root}/dir`); await writeFile(`${root}/dir/value`, 'workspace bytes');
@@ -367,7 +369,7 @@ os.open = racing_open
   expect(await readFile(`${base}/opened-path`, 'utf8')).toBe(`${root}/old-dir/value`);
 });
 
-describe('garbage collection of superseded checkpoint generations', () => {
+describe.skipIf(NO_POSIX_HOST)('garbage collection of superseded checkpoint generations', () => {
   class GcBucket extends Bucket {
     uploaded = new Map<string, number>();
     deleted: string[] = [];
@@ -423,7 +425,7 @@ describe('garbage collection of superseded checkpoint generations', () => {
   });
 });
 
-describe('rate-limited routine checkpoints (deferIfChanged)', () => {
+describe.skipIf(NO_POSIX_HOST)('rate-limited routine checkpoints (deferIfChanged)', () => {
   const flushDeferred = (root: string, bucket: Bucket) => flushWorkspaceToR2({ container, bucket, mountPath: root, realPrefix: prefix, hydrationComplete: true, manifest: {}, log, deferIfChanged: true });
   it('never defers the first checkpoint, defers a changed one without touching storage, and still confirms an unchanged one', async () => {
     const { root } = await workspace(); const bucket = new Bucket();
