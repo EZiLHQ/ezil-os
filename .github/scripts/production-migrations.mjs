@@ -361,7 +361,7 @@ export async function query(project, sql, { env = process.env, request = fetch, 
 export async function run(argv, options = {}) {
   const root = options.root ?? fileURLToPath(new URL('../../', import.meta.url));
   const log = options.log ?? console.log;
-  check(argv.length === 1 && ['validate','plan','apply'].includes(argv[0]), 'Usage: production-migrations.mjs validate|plan|apply');
+  check(argv.length === 1 && ['validate','plan','observe','apply'].includes(argv[0]), 'Usage: production-migrations.mjs validate|plan|observe|apply');
   const loaded = await validate(root);
   const { manifest } = loaded;
   if (argv[0] === 'validate') {
@@ -374,6 +374,18 @@ export async function run(argv, options = {}) {
     check(state, 'Missing catalog response');
     check(state.schemas === manifest.schemas.length, 'Missing owned schema; cannot baseline');
     log(JSON.stringify({ repository: manifest.repository, project: manifest.project, observedCatalog: { digest: state.digest, objects: state.objects, capturedAt: new Date().toISOString(), sourceDigest: manifest.initialCatalog?.sourceDigest ?? snapshotHash(manifest) }, currentSourceDigest: snapshotHash(manifest), baseline: manifest.initialCatalog ? 'catalog verified' : 'review this observation before setting initialCatalog', pendingMigrations: manifest.migrations.slice(state.applied).map(m => m.id) }));
+    return;
+  }
+  if (argv[0] === 'observe') {
+    // Read-only, and deliberately WITHOUT the drift assertion: report what the
+    // live catalog is right now next to what this manifest registered, so a
+    // reviewed re-baseline can copy an exact observation. It never registers,
+    // writes or verifies the journal — `plan` and `apply` keep doing that.
+    const rows = await query(manifest.project, planSQL({ ...manifest, initialCatalog: null }), { ...options, readOnly: true });
+    const state = rows.find(r => hex.test(r.digest) && Number.isInteger(r.objects) && Number.isInteger(r.schemas));
+    check(state, 'Missing catalog response');
+    const registered = manifest.initialCatalog?.digest ?? null;
+    log(JSON.stringify({ repository: manifest.repository, project: manifest.project, registeredDigest: registered, observedCatalog: { digest: state.digest, objects: state.objects, capturedAt: new Date().toISOString() }, drift: registered !== null && registered !== state.digest }));
     return;
   }
   check(manifest.initialCatalog, 'Live catalog baseline required before apply');

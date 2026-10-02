@@ -72,6 +72,27 @@ test('plan reports historical and current snapshot digests separately', async t 
   assert.notEqual(observations[1].currentSourceDigest, manifest.initialCatalog.sourceDigest);
 });
 
+test('observe reports live catalog drift read-only, without asserting or registering', async t => {
+  const { root, manifest, save } = await fixture(t);
+  manifest.initialCatalog = { digest: hash('registered catalog'), capturedAt: '2026-09-29T15:45:14.939Z', objects: 3, sourceDigest: snapshotHash(manifest) };
+  await save();
+  const sent = [];
+  const request = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    sent.push(body);
+    return { ok: true, json: async () => [{ digest: hash('moved catalog'), objects: 3, schemas: 1, applied: 0 }] };
+  };
+  const logs = [];
+  await run(['observe'], { root, env: { SUPABASE_ACCESS_TOKEN: 'fixture-only' }, request, log: line => logs.push(JSON.parse(line)) });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].read_only, true);
+  assert.match(sent[0].query, /READ ONLY/);
+  assert.doesNotMatch(sent[0].query, /Current catalog drift|ezil_ci\.baselines|INSERT/);
+  assert.equal(logs[0].registeredDigest, hash('registered catalog'));
+  assert.equal(logs[0].observedCatalog.digest, hash('moved catalog'));
+  assert.equal(logs[0].drift, true);
+});
+
 test('strict additive grammar handles comments/quoted identifiers and rejects escapes', () => {
   const accepted = ['CREATE TABLE app.example (id integer NOT NULL, name text);', '/* nested /* ; COMMIT */ comment */ ALTER TABLE "app"."example" ADD COLUMN "odd;name" varchar(80);', 'CREATE INDEX example_index ON app.example(id, "odd;name");', 'CREATE TABLE app.one (id pg_catalog.int8); CREATE TABLE app.two (id uuid)'];
   for (const sql of accepted) assert.equal(additiveSQL(sql, ['app']), sql);
