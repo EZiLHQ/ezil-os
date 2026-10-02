@@ -505,6 +505,42 @@ describe('migration: R2 committed checkpoint → S3', () => {
     expect(r2.snapshotKeys()).toBe(r2Before); // R2 untouched by the whole migration
   });
 
+  it('composes through resolveWorkspaceStore (adapter + path-style endpoint) end to end', async () => {
+    // Exercises the PRODUCTION path: resolveWorkspaceStore -> r2AsWorkspaceStore
+    // -> MigratingWorkspaceStore -> S3WorkspaceStore(endpoint=path-style), not a
+    // hand-built migrating store.
+    const fake = makeFakeS3();
+    const r2 = new MemStore();
+    const { base, root } = await markedWorkspace();
+    await writeFile(`${root}/app.txt`, 'prod content\n');
+    expect((await flushTo(root, r2)).ok).toBe(true);
+    const r2Before = r2.snapshotKeys();
+    const resolve = () => {
+      const res = resolveWorkspaceStore(
+        {
+          EZIL_WORKSPACE_STORE: 's3',
+          EZIL_WORKSPACE_S3_BUCKET: S3.bucket,
+          EZIL_WORKSPACE_S3_REGION: S3.region,
+          EZIL_WORKSPACE_S3_ACCESS_KEY_ID: S3.accessKeyId,
+          EZIL_WORKSPACE_S3_SECRET_ACCESS_KEY: S3.secretAccessKey,
+          EZIL_WORKSPACE_S3_ENDPOINT: S3.endpoint,
+          SANDBOX_WORKSPACE_R2_BUCKET: r2 as never,
+        },
+        { fetchImpl: fake.fetchImpl },
+      );
+      if (!res.ok || res.kind !== 's3') throw new Error('expected an s3 store');
+      return res.store;
+    };
+    const target = `${base}/prod-migrated`;
+    expect((await hydrateFrom(target, resolve())).ok).toBe(true);
+    expect(await readFile(`${target}/app.txt`, 'utf8')).toBe('prod content\n');
+    expect((await flushTo(target, resolve())).ok).toBe(true);
+    const target2 = `${base}/prod-from-s3`;
+    expect((await hydrateFrom(target2, resolve())).ok).toBe(true);
+    expect(await readFile(`${target2}/app.txt`, 'utf8')).toBe('prod content\n');
+    expect(r2.snapshotKeys()).toBe(r2Before);
+  });
+
   it('migrates even after the user edits the workspace post-hydrate', async () => {
     const fake = makeFakeS3();
     const s3 = makeStore(fake);

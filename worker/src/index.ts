@@ -1340,7 +1340,9 @@ function resolveWorkspaceMountConfig(env: Env): WorkspaceMountConfig | null {
  * `getProjectBranchScope()`'s `prefix` field, despite the literal argument
  * string differing by that one required leading character.
  */
-async function ensureWorkspaceMount(
+// Exported for `workspace-store-wiring.test.ts` (the store-selection gate /
+// prefix parity); same test-export pattern as `isIdleStopDue` etc. above.
+export async function ensureWorkspaceMount(
   sandbox: Sandbox<unknown> & EzilWorkspacePersistRpc,
   env: Env,
   { projectId, branch }: { projectId: string; branch: string },
@@ -1355,11 +1357,16 @@ async function ensureWorkspaceMount(
   const storeSel = resolveWorkspaceStore(env);
   if (!storeSel.ok) return { mounted: false, detail: storeSel.detail };
   if (storeSel.kind === 's3') {
-    const mountPath = env.SANDBOX_WORKSPACE_MOUNT_PATH?.trim() || DEFAULT_WORKSPACE_MOUNT_PATH;
-    // Standard per-project scope (leading slash per the mountBucket/seed
-    // contract; stripped to the real key prefix downstream). In-bucket scoping
-    // for the S3 store is a separate lever (EZIL_WORKSPACE_S3_KEY_PREFIX).
-    return sandbox.hydrateWorkspace({ mountPath, prefix: `/${projectId}/branches/${branch}` });
+    // Compute mountPath/prefix EXACTLY as the r2-binding branch below does, so a
+    // deployment that set SANDBOX_WORKSPACE_S3_PREFIX keeps the SAME per-computer
+    // prefix across the R2->S3 switch. A different prefix would make the
+    // migrating store look under a key with no R2 data, find nothing, and seed
+    // over the workspace. In-bucket scoping for the S3 store itself is a
+    // separate lever (EZIL_WORKSPACE_S3_KEY_PREFIX).
+    const cfg = resolveWorkspaceMountConfig(env);
+    const mountPath = cfg?.mountPath ?? (env.SANDBOX_WORKSPACE_MOUNT_PATH?.trim() || DEFAULT_WORKSPACE_MOUNT_PATH);
+    const prefix = cfg?.prefix ?? `/${projectId}/branches/${branch}`;
+    return sandbox.hydrateWorkspace({ mountPath, prefix });
   }
 
   const config = resolveWorkspaceMountConfig(env);
