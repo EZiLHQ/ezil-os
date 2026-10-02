@@ -1,4 +1,5 @@
 import { appRouter } from '@/server/api/root';
+import { pickDefaultComputer } from '@/server/api/routers/computer-store';
 import { createTRPCContext } from '@/server/api/trpc';
 import {
     SHELL_APPS,
@@ -53,9 +54,9 @@ export async function GET(req: Request) {
             caller.cloudflareGuacamole.isConfigured(),
         ]);
 
-        // `computer.list` is already ordered by slot ascending, so the first
-        // row IS the default computer — the same one POST would return.
-        const lowest = computers[0];
+        // The same default POST would return: the computer opened most
+        // recently, falling back to the lowest slot (`pickDefaultComputer`).
+        const lowest = pickDefaultComputer(computers);
 
         const payload: ShellSessionPayload = {
             user: toShellBootUser(ctx.user),
