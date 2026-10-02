@@ -26,11 +26,25 @@ const ACCOUNT_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
 
 const PROVIDER_LABELS = { google: 'Google', email: 'Email and password', github: 'GitHub', azure: 'Microsoft' };
 
-/** "Ada Lovelace" → "AL"; "ada@x.dev" → "A". Letters and digits only; never empty. */
+/** Remove anything tag-shaped, repeatedly, so `<<b>b>` cannot reassemble into a tag. */
+function withoutTags (text) {
+    let previous;
+    let current = text;
+    do {
+        previous = current;
+        current = current.replace(/<[^<>]*>/g, '');
+    } while ( current !== previous );
+    return current;
+}
+
+/**
+ * "Ada Lovelace" → "AL"; "ada@x.dev" → "A". Letters and digits only; never
+ * empty. Display-only: the result is still passed through `html_encode`.
+ */
 export function initialsFor (name, email) {
-    const source = (name ?? '').trim() || (email ?? '').split('@')[0] || '';
+    const source = withoutTags((name ?? '').trim()) || (email ?? '').split('@')[0] || '';
     const words = source.split(/[\s._-]+/)
-        .map(word => word.replace(/<[^>]*>/g, '').replace(/[^\p{L}\p{N}]/gu, ''))
+        .map(word => word.replace(/[^\p{L}\p{N}]/gu, ''))
         .filter(Boolean);
     const letters = words.length >= 2 ? words[0][0] + words[words.length - 1][0] : (words[0] ?? '?').slice(0, 1);
     return letters.toUpperCase();

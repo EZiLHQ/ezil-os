@@ -55,7 +55,7 @@ export const LOCAL_USER_DISPLAY_NAME = 'You';
  * (`you@localhost`) would put a string that looks like an account into a field
  * whose whole contract is that it is either real or `null`.
  */
-export const LOCAL_USER: ShellBootUser = { id: LOCAL_USER_ID, email: null };
+export const LOCAL_USER: ShellBootUser = { id: LOCAL_USER_ID, email: null, name: null, provider: null, createdAt: null };
 
 /** Prefix on every local computer id. Nothing derives meaning from it; it exists so a value in a log is obviously not a Supabase uuid. */
 export const LOCAL_COMPUTER_ID_PREFIX = 'local-';
