@@ -92,7 +92,7 @@ describe('/login never redirects, so nothing can loop through it', () => {
 
 describe('the sign-in page says how to get an account', () => {
     it('Google creates the account on first sign-in', () => {
-        expect(code(loginPage)).toMatch(/New here\? Continue with Google and your account is created on the way in\./);
+        expect(code(loginPage)).toMatch(/Sign in or get started with Google\./);
         expect(loginForm).toMatch(/Continue with Google/);
     });
 

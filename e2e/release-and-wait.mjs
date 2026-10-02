@@ -91,7 +91,7 @@ async function withDesktop(fn) {
   try {
     const ctx = await browser.newContext({ viewport: { width: 1024, height: 768 } });
     const p = await ctx.newPage();
-    await p.goto(`${APP}/login`, { waitUntil: 'domcontentloaded' });
+    await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
     await p.fill('#email', EMAIL); await p.fill('#password', PASS);
     await Promise.all([
       p.waitForURL((u) => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),
