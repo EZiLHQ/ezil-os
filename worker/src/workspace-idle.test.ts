@@ -617,7 +617,8 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
     );
     // The only exception to "stop only on a successful FINAL flush" is the
     // permanent too_large outcome (never retryable; refusing would bill forever).
-    expect(idleBranch).toContain("if (outcome.ok || outcome.skippedReason === 'too_large') {");
+    // A failed FINAL system-layer checkpoint (installs outside /workspace) also retries.
+    expect(idleBranch).toContain("if ((outcome.ok || outcome.skippedReason === 'too_large') && !outcome.systemCheckpointFailed) {");
     // The idle-stop FINAL flush is never rate-limited (no allowDefer here).
     expect(idleBranch).not.toContain('allowDefer');
     // The failure path must reschedule (retry) rather than fall through to a
@@ -751,6 +752,22 @@ describe('explicit-terminate semantics still hold exactly as before', () => {
     const method = between('async terminateSandbox(): Promise<TerminateReport> {', '\n  /**\n   * The `POST /sandbox/:name/restart`');
     expect(method).toContain(`this.runWorkspaceFlush('explicit')`);
     expect(method).toContain('this.cancelWorkspaceFlushLoop()');
+  });
+
+  it('teardown refuses when the final SYSTEM checkpoint failed, before cancelling the loop or destroying', () => {
+    const method = between('private async terminateSandboxWithCheckpoint(): Promise<TerminateReport> {', 'await this.cancelWorkspaceFlushLoop();');
+    expect(method).toContain('this.systemFinalNext = true;');
+    expect(method).toContain("if (checkpoint?.systemCheckpointFailed) {");
+    expect(method).toContain("error: 'system_checkpoint_failed'");
+  });
+
+  it('a final flush marks systemCheckpointFailed only for a failed system checkpoint, and still runs it for an oversized workspace', () => {
+    const flush = between('private async runWorkspaceFlush(', '\n  /**\n   * The system layer');
+    expect(flush).toContain("if ((outcome.ok || outcome.skippedReason === 'too_large') && systemMode !== 'skip') {");
+    expect(flush).toContain("if (systemMode === 'final' && system?.skippedReason === 'failed') outcome.systemCheckpointFailed = true;");
+    // A throw inside the system flush is a failure, not "nothing to do".
+    const sys = between('private async runSystemFlush(', '/** Superseded checkpoint generations');
+    expect(sys).toContain("return { ok: false, uploaded: 0, entries: 0, skippedReason: 'failed' };");
   });
 
   it('WORKSPACE_TERMINATED_KEY doc comment states the idle-stop distinction explicitly', () => {

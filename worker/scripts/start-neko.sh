@@ -852,6 +852,12 @@ fi
 # across restarts: re-pointing an already-correct symlink is a no-op) and
 # strictly non-fatal — a missing/not-yet-materialized workspace root, or any
 # individual mkdir/rm/ln failure, only logs a warning and lets boot continue.
+# Projects in subfolders get their node_modules back from their lockfiles
+# (node_modules lives on local disk and never persists). Background, low
+# priority, never fatal. The root project is start-devserver.sh's job.
+if [ -x /usr/local/bin/ezil-restore-deps.sh ] && [ -d "$WORKSPACE_ROOT" ]; then
+  ( /usr/local/bin/ezil-restore-deps.sh "$WORKSPACE_ROOT" >> /tmp/ezil-restore-deps.log 2>&1 & ) || true
+fi
 EZIL_LOCAL_STATE_DIR="${EZIL_LOCAL_STATE_DIR:-/var/ezil-local}"
 if mkdir -p "$EZIL_LOCAL_STATE_DIR/node_modules" "$EZIL_LOCAL_STATE_DIR/next-cache" 2>/dev/null; then
   if [ -d "$WORKSPACE_ROOT" ]; then

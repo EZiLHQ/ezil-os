@@ -26,6 +26,7 @@ import {
   WORKSPACE_HEARTBEAT_FILENAME,
 } from './workspace-persist';
 import { SEED_SENTINEL_FILENAME } from './workspace-seed';
+import { baselineSystemLayer, flushSystemLayer, hydrateSystemLayer, systemPrefixOf } from './system-persist';
 
 const run = promisify(execFile);
 const IMAGE = process.env.EZIL_CHECKPOINT_IMAGE ?? process.env.EZIL_VALIDATE_IMAGE ?? 'ezil-integrated:local';
@@ -435,5 +436,197 @@ describe.skipIf(!imagePresent)(`persistent compute: checkpoint survives real con
     expect(out.ok).toBe(false);
     expect(out.skippedReason).toBe('too_large');
     expect((await store.list({ prefix: `${p2}/` })).objects).toEqual([]);   // nothing half-written
+  }, T);
+});
+
+// ── System layer: changes OUTSIDE /workspace (apt/dpkg, npm -g, HOME) ─────────
+// Founder-reported 2026-10-02: "the moment I install any package it disappears
+// after I close the browser or sign out". Offline fixtures: a .deb built here,
+// a local package for npm -g.
+describe.skipIf(!imagePresent)(`persistent compute: system installs survive container replacement (${IMAGE})`, () => {
+  afterAll(async () => { await Promise.all(containers.map(destroyComputer)); }, 120_000);
+  const sysFlush = (c: string, store: Store, prefix: string) => flushSystemLayer({ container: sdk(c), bucket: store, realPrefix: prefix, log });
+  const sysHydrate = (c: string, store: Store, prefix: string) => hydrateSystemLayer({ container: sdk(c), bucket: store, realPrefix: prefix, log });
+  const INSTALLS = String.raw`
+set -e
+mkdir -p /tmp/ezq-deb/ezq-tool/DEBIAN /tmp/ezq-deb/ezq-tool/usr/local/bin
+printf 'Package: ezq-tool\nVersion: 1.0\nArchitecture: all\nMaintainer: qa\nDescription: qa fixture\n' > /tmp/ezq-deb/ezq-tool/DEBIAN/control
+printf '#!/bin/sh\necho ezq-tool-ok\n' > /tmp/ezq-deb/ezq-tool/usr/local/bin/ezq-tool && chmod 755 /tmp/ezq-deb/ezq-tool/usr/local/bin/ezq-tool
+dpkg-deb --build /tmp/ezq-deb/ezq-tool /tmp/ezq-tool.deb >/dev/null && dpkg -i /tmp/ezq-tool.deb >/dev/null
+mkdir -p /tmp/ezq-npm && printf '{"name":"ezq-cli","version":"1.0.0","bin":{"ezq-cli":"cli.js"}}' > /tmp/ezq-npm/package.json
+printf '#!/usr/bin/env node\nconsole.log("ezq-cli-ok")\n' > /tmp/ezq-npm/cli.js
+# A packed tarball installs as a COPY (a folder path would install a symlink back into /tmp).
+(cd /tmp/ezq-npm && npm pack --silent >/dev/null) && npm install -g --offline --no-audit --no-fund /tmp/ezq-npm/ezq-cli-1.0.0.tgz >/dev/null 2>&1
+echo 'export EZQ_DOTFILE=1' >> /root/.bashrc
+mkdir -p /opt/ezq && echo opt-ok > /opt/ezq/marker
+`;
+
+  it('apt/dpkg, npm -g, /opt and dotfiles installed after the baseline come back on a NEW container, working', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system');
+    const a = await startComputer('sys-a'); await sysHydrate(a, store, prefix);
+    expect(await baselineSystemLayer(sdk(a))).toBe(true);
+    await new Promise(r => setTimeout(r, 1100));
+    await must(a, INSTALLS);
+    const out = await sysFlush(a, store, prefix);
+    expect(out.ok).toBe(true);
+    expect(out.entries).toBeGreaterThan(5);
+    await destroyComputer(a);
+    const b = await startComputer('sys-b');
+    expect((await sh(b, 'command -v ezq-tool')).exitCode).not.toBe(0);           // fresh container: nothing yet
+    const back = await sysHydrate(b, store, prefix);
+    expect(back).toMatchObject({ ok: true, sameImage: true, conflicts: 0 });
+    expect(back.restored).toBeGreaterThan(5);
+    expect((await must(b, 'ezq-tool')).trim()).toBe('ezq-tool-ok');
+    expect((await must(b, "dpkg -s ezq-tool | grep '^Status'")).trim()).toBe('Status: install ok installed');
+    expect((await must(b, 'ezq-cli')).trim()).toBe('ezq-cli-ok');
+    expect((await must(b, 'cat /opt/ezq/marker')).trim()).toBe('opt-ok');
+    expect((await must(b, 'grep -c EZQ_DOTFILE /root/.bashrc')).trim()).toBe('1');
+    // Restoring twice on one container is refused (manifest marks it done).
+    expect((await sysHydrate(b, store, prefix)).skippedReason).toBe('already_restored');
+    // Nothing changed since the restore — only platform-style churn (identical content
+    // rewritten, directory mtimes bumped): the next checkpoint must not re-upload the layer.
+    await baselineSystemLayer(sdk(b)); await new Promise(r => setTimeout(r, 1100));
+    await must(b, 'cp /opt/ezq/marker /tmp/m && cat /tmp/m > /opt/ezq/marker && touch /opt/ezq /usr/local/bin && touch /opt/.uuid');
+    const again = await sysFlush(b, store, prefix);
+    expect(again).toMatchObject({ ok: true, unchanged: true, uploaded: 0 });
+    // A real change after that is saved.
+    await must(b, 'echo changed > /opt/ezq/marker');
+    expect(await sysFlush(b, store, prefix)).toMatchObject({ ok: true });
+    expect((await sysFlush(b, store, prefix)).unchanged).toBe(true);
+  }, T);
+
+  // Found on staging: Cloudflare gives untouched image files fresh ctimes when they are first read,
+  // so a ctime-only delta captured ~6,900 image files (zoneinfo, perl, gconv...). Only entries that
+  // DIFFER from the baked image manifest may be captured.
+  it('untouched image files whose ctime changed (as on Cloudflare) are NOT captured', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-ctime');
+    const a = await startComputer('sysct-a'); await sysHydrate(a, store, prefix);
+    await baselineSystemLayer(sdk(a)); await new Promise(r => setTimeout(r, 1100));
+    // A no-op mode change bumps ctime without changing the file, like Cloudflare's lazy image reads.
+    await must(a, 'find /usr/share/zoneinfo /usr/share/perl -type f -exec chmod u+r {} + 2>/dev/null; find /usr/share/zoneinfo -type f | wc -l');
+    await must(a, 'echo "export ONLY_ME=1" >> /root/.bashrc');
+    const out = await sysFlush(a, store, prefix);
+    expect(out.ok).toBe(true);
+    expect(out.entries).toBeLessThan(10);                                            // .bashrc (+ its parent), not ~1,800 files
+  }, T);
+
+  it('an uninstall is saved too: apt remove on the restored computer stays removed on the next one', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-rm');
+    const a = await startComputer('sysrm-a'); await sysHydrate(a, store, prefix);
+    await baselineSystemLayer(sdk(a)); await new Promise(r => setTimeout(r, 1100));
+    await must(a, INSTALLS);
+    expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+    await destroyComputer(a);
+    const b = await startComputer('sysrm-b');
+    expect((await sysHydrate(b, store, prefix)).ok).toBe(true);
+    await baselineSystemLayer(sdk(b)); await new Promise(r => setTimeout(r, 1100));
+    await must(b, 'dpkg -r ezq-tool >/dev/null && rm /usr/share/zoneinfo/Zulu');
+    expect((await sysFlush(b, store, prefix)).ok).toBe(true);
+    const head = JSON.parse(new TextDecoder().decode(await (await store.get(`${systemPrefixOf(prefix)}/.ezil-snapshots/latest.json`))!.arrayBuffer()));
+    expect(head.deleted).toBeUndefined();                                          // deletions travel inside the archive
+    await destroyComputer(b);
+    const c = await startComputer('sysrm-c');
+    expect((await sysHydrate(c, store, prefix)).ok).toBe(true);
+    expect((await sh(c, 'command -v ezq-tool')).exitCode).not.toBe(0);
+    expect((await must(c, "dpkg -s ezq-tool 2>&1 | grep -E '^Status|not installed' | head -1")).trim()).not.toBe('Status: install ok installed');
+    expect((await must(c, 'ezq-cli')).trim()).toBe('ezq-cli-ok');                    // the rest is still there
+    expect((await sh(c, 'test -e /usr/share/zoneinfo/Zulu')).exitCode).not.toBe(0); // a deleted image file stays deleted
+  }, T);
+
+  // CI rebuilds the image on every release; apt can pull newer image packages. The user's
+  // pip / /opt / /usr/local files and apt packages must survive that; the image's own
+  // package files and dpkg records must win.
+  it('after an image update: user installs survive, the new image keeps its own package files and dpkg records', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-img');
+    const a = await startComputer('sysimg-a'); await sysHydrate(a, store, prefix);
+    await baselineSystemLayer(sdk(a)); await new Promise(r => setTimeout(r, 1100));
+    await must(a, INSTALLS);
+    // The user also edited a file that belongs to an image package.
+    await must(a, 'echo user-edit >> /usr/share/zoneinfo/iso3166.tab');
+    expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+    const head = await store.get(`${systemPrefixOf(prefix)}/.ezil-snapshots/latest.json`);
+    const snap = JSON.parse(new TextDecoder().decode(await head!.arrayBuffer()));
+    expect(snap.replay.apt).toContain('ezq-tool');
+    await destroyComputer(a);
+    const b = await startComputer('sysimg-b');
+    // A "new image": a different package-set id, and an image package at a newer version.
+    await must(b, "echo different-image-build > /etc/ezil-image-id && sed -i '/^Package: bash$/,/^$/ s/^Version: .*/Version: 99.0-ezq/' /var/lib/dpkg/status");
+    const back = await sysHydrate(b, store, prefix);
+    expect(back).toMatchObject({ ok: true, sameImage: false, conflicts: 0 });
+    expect(back.skippedImageScoped).toBeGreaterThan(0);
+    expect((await must(b, 'ezq-tool')).trim()).toBe('ezq-tool-ok');                 // user apt package, files
+    expect((await must(b, "dpkg -s ezq-tool | grep '^Status'")).trim()).toBe('Status: install ok installed'); // and its dpkg record
+    expect((await must(b, 'ezq-cli')).trim()).toBe('ezq-cli-ok');                   // npm -g
+    expect((await must(b, 'cat /opt/ezq/marker')).trim()).toBe('opt-ok');           // /opt
+    expect((await must(b, 'grep -c EZQ_DOTFILE /root/.bashrc')).trim()).toBe('1');  // HOME
+    expect((await must(b, "dpkg -s bash | grep '^Version'")).trim()).toBe('Version: 99.0-ezq'); // image's record wins
+    expect((await sh(b, 'grep -q user-edit /usr/share/zoneinfo/iso3166.tab')).exitCode).not.toBe(0); // image's file wins
+    expect((await must(b, 'dpkg --audit; echo audit=$?')).trim()).toBe('audit=0');
+  }, T);
+
+  // Two containers for one computer (a replacement booting while the old one still flushes):
+  // the old one must never overwrite what the new one committed.
+  it('a stale container cannot checkpoint over a newer system layer (generation fencing)', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-fence');
+    const sysPrefix = systemPrefixOf(prefix)!;
+    const a = await startComputer('sysfn-a'); await sysHydrate(a, store, prefix);
+    await baselineSystemLayer(sdk(a)); await new Promise(r => setTimeout(r, 1100));
+    await must(a, 'mkdir -p /opt/fence && echo one > /opt/fence/v');
+    expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+    const b = await startComputer('sysfn-b');
+    expect((await sysHydrate(b, store, prefix)).ok).toBe(true);
+    await baselineSystemLayer(sdk(b)); await new Promise(r => setTimeout(r, 1100));
+    await must(b, 'echo two > /opt/fence/v');
+    expect((await sysFlush(b, store, prefix)).ok).toBe(true);
+    const newer = new TextDecoder().decode(await (await store.get(`${sysPrefix}/.ezil-snapshots/latest.json`))!.arrayBuffer());
+    await must(a, 'echo stale > /opt/fence/v');
+    expect((await sysFlush(a, store, prefix)).skippedReason).toBe('stale');
+    expect(new TextDecoder().decode(await (await store.get(`${sysPrefix}/.ezil-snapshots/latest.json`))!.arrayBuffer())).toBe(newer);
+    // The writer that holds the head keeps saving.
+    await must(b, 'echo three > /opt/fence/v');
+    expect((await sysFlush(b, store, prefix)).ok).toBe(true);
+  }, T);
+
+  it('capture is refused while dpkg/apt hold their lock, and has no baseline until the desktop is up', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-lock');
+    const a = await startComputer('syslock-a');
+    expect((await sysFlush(a, store, prefix)).skippedReason).toBe('not_restored');
+    expect(await sysHydrate(a, store, prefix)).toMatchObject({ ok: true, skippedReason: 'no_snapshot' });
+    expect((await sysFlush(a, store, prefix)).skippedReason).toBe('no_baseline');
+    await baselineSystemLayer(sdk(a));
+    await docker(['exec', '-d', a, 'python3', '-c', 'import fcntl,os,time; fd=os.open("/var/lib/dpkg/lock-frontend", os.O_RDWR|os.O_CREAT); fcntl.lockf(fd, fcntl.LOCK_EX); time.sleep(60)']);
+    await new Promise(r => setTimeout(r, 800));
+    expect((await sysFlush(a, store, prefix)).skippedReason).toBe('busy');
+  }, T);
+
+  // A container whose restore failed holds the bare image: committing it would erase the user's installs.
+  it('a failed system restore never lets that container checkpoint over the committed system layer', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-guard');
+    const sysPrefix = systemPrefixOf(prefix)!;
+    const a = await startComputer('sysgd-a'); await sysHydrate(a, store, prefix);
+    await baselineSystemLayer(sdk(a)); await new Promise(r => setTimeout(r, 1100));
+    await must(a, INSTALLS);
+    const first = await sysFlush(a, store, prefix);
+    expect(first.ok).toBe(true);
+    await destroyComputer(a);
+    const headBefore = await store.get(`${sysPrefix}/.ezil-snapshots/latest.json`);
+    const good = new TextDecoder().decode(await headBefore!.arrayBuffer());
+    await store.corrupt!(`${sysPrefix}/.ezil-snapshots/${first.checkpoint}/0`);
+    const b = await startComputer('sysgd-b');
+    expect((await sysHydrate(b, store, prefix))).toMatchObject({ ok: false, skippedReason: 'failed' });
+    await baselineSystemLayer(sdk(b)); await new Promise(r => setTimeout(r, 1100));
+    await must(b, 'echo "export LATER=1" >> /root/.bashrc');
+    expect((await sysFlush(b, store, prefix)).skippedReason).toBe('not_restored');
+    const headAfter = await store.get(`${sysPrefix}/.ezil-snapshots/latest.json`);
+    expect(new TextDecoder().decode(await headAfter!.arrayBuffer())).toBe(good);   // the committed layer is untouched
+  }, T);
+
+  it('a system delta over the snapshot limit is reported as too_large and never half-written', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-big');
+    const a = await startComputer('sysbig-a'); await sysHydrate(a, store, prefix);
+    await baselineSystemLayer(sdk(a)); await new Promise(r => setTimeout(r, 1100));
+    await must(a, 'mkdir -p /opt/big && head -c 540000000 /dev/urandom > /opt/big/blob');
+    expect((await sysFlush(a, store, prefix)).skippedReason).toBe('too_large');
+    expect((await store.list({ prefix: `${systemPrefixOf(prefix)}/` })).objects).toEqual([]);
   }, T);
 });

@@ -492,8 +492,10 @@ import {
   type FlushOutcome,
   type FlushManifest,
   collectSupersededSnapshots,
+  type FlushR2BucketLike,
   type GcR2BucketLike,
 } from './workspace-persist';
+import { baselineSystemLayer, flushSystemLayer, hydrateSystemLayer, systemPrefixOf, type SystemFlushOutcome } from './system-persist';
 import {
   resolveWorkspaceStore,
   type WorkspaceStore,
@@ -758,6 +760,8 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
  */
 interface EzilWorkspacePersistRpc {
   hydrateWorkspace(params: { mountPath: string; prefix: string }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }>;
+  /** Start capturing user changes outside /workspace (system layer). Called once the desktop is up. */
+  baselineSystem(): Promise<boolean>;
   recordWorkspaceHydration(params: { prefix: string; mountPath: string; hydrated: boolean }): Promise<void>;
   flushWorkspaceNow(): Promise<FlushOutcome>;
   /**
@@ -1790,6 +1794,9 @@ const WORKSPACE_LAST_UPLOAD_AT_KEY = 'ezil:workspaceLastUploadAt';
 const MIN_CHANGED_CHECKPOINT_MS = 60_000;
 /** When superseded checkpoint generations were last collected. */
 const WORKSPACE_LAST_GC_AT_KEY = 'ezil:workspaceLastGcAt';
+/** When the system layer (changes outside /workspace) was last captured. */
+const SYSTEM_LAST_FLUSH_AT_KEY = 'ezil:systemLastFlushAt';
+const SYSTEM_FLUSH_INTERVAL_MS = 5 * 60_000;
 const SNAPSHOT_GC_INTERVAL_MS = 15 * 60_000;
 
 /**
@@ -2292,6 +2299,15 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         if (!store.ok) return { mounted: false, detail: store.detail };
         const result = await ensureWorkspaceHydratedFromR2(this, store.store, params.mountPath, params.prefix);
         if (!result.mounted) return result;
+        // User changes outside /workspace (apt, npm -g, HOME): restored before
+        // the desktop starts. Never blocks the desktop.
+        if (store.store) {
+          const systemStartedAt = Date.now();
+          const system = await hydrateSystemLayer({ container: this, bucket: store.store, realPrefix: realR2KeyPrefix(params.prefix),
+            log: (message) => console.error(message) });
+          bootLog('system_hydrate', 'end', { status: system.ok ? 'ok' : 'error', phaseMs: Date.now() - systemStartedAt,
+            detail: `restored=${system.restored},skippedImageScoped=${system.skippedImageScoped},conflicts=${system.conflicts}${system.skippedReason ? `,reason=${system.skippedReason}` : ''}${system.sameImage === false ? ',crossImage' : ''}` });
+        }
         const checkpoint = await this.runWorkspaceFlush('explicit');
         if (checkpoint.ok) return result;
         // Over the snapshot limits the workspace can never checkpoint; locking
@@ -2305,6 +2321,14 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         return { mounted: false, detail: 'workspace_checkpoint_failed' };
       }
     });
+  }
+
+  /** Set by teardown so its final checkpoint also captures the system layer. */
+  private systemFinalNext = false;
+
+  async baselineSystem(): Promise<boolean> {
+    if (!this.containerIsRunning()) return false;
+    return baselineSystemLayer(this);
   }
 
   private async runWorkspaceFlush(trigger: 'alarm' | 'explicit', options?: { allowDefer?: boolean }): Promise<FlushOutcome> {
@@ -2409,8 +2433,45 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       }
     }
     if (outcome.ok && outcome.uploaded.length > 0) await this.ctx.storage.put(WORKSPACE_LAST_UPLOAD_AT_KEY, Date.now());
+    // System layer: never on the readiness path (it scans the system dirs).
+    // Routine cycles -> interval; idle-stop (alarm, no deferral) and teardown
+    // (systemFinalNext) -> final; any other explicit flush -> skipped.
+    const systemMode = options?.allowDefer ? 'interval' : trigger === 'alarm' || this.systemFinalNext ? 'final' : 'skip';
+    this.systemFinalNext = false;
+    // An oversized workspace never checkpoints, but the system layer still must.
+    if ((outcome.ok || outcome.skippedReason === 'too_large') && systemMode !== 'skip') {
+      const system = await this.runSystemFlush(bucket, wctx.prefix, systemMode === 'final');
+      // A FINAL checkpoint that failed must not let idle-stop / teardown discard
+      // the container: they refuse and retry, exactly as for the workspace.
+      if (systemMode === 'final' && system?.skippedReason === 'failed') outcome.systemCheckpointFailed = true;
+    }
     if (outcome.ok) await this.collectSnapshotGarbage(bucket, wctx.prefix);
     return outcome;
+  }
+
+  /**
+   * The system layer (user changes outside /workspace). Always on final
+   * checkpoints (readiness, teardown, idle-stop); otherwise at most every
+   * SYSTEM_FLUSH_INTERVAL_MS, because it scans the system directories.
+   * Never fails the workspace flush.
+   */
+  private async runSystemFlush(bucket: unknown, prefix: string, final: boolean): Promise<SystemFlushOutcome | undefined> {
+    const last = (await this.ctx.storage.get<number>(SYSTEM_LAST_FLUSH_AT_KEY)) ?? 0;
+    if (!final && Date.now() - last < SYSTEM_FLUSH_INTERVAL_MS) return undefined;
+    const t0 = Date.now();
+    try {
+      const system = await flushSystemLayer({ container: this, bucket: bucket as FlushR2BucketLike, realPrefix: prefix,
+        log: (message) => console.error(`[system_flush] ${message}`) });
+      if (system.ok || system.skippedReason === 'no_baseline' || system.skippedReason === 'busy') {
+        await this.ctx.storage.put(SYSTEM_LAST_FLUSH_AT_KEY, Date.now());
+      }
+      bootLog('system_flush', 'end', { status: system.ok ? 'ok' : system.skippedReason === 'failed' ? 'error' : 'skipped', phaseMs: Date.now() - t0,
+        detail: `uploaded=${system.uploaded},entries=${system.entries}${system.unchanged ? ',unchanged' : ''}${system.skippedReason ? `,reason=${system.skippedReason}` : ''}` });
+      return system;
+    } catch {
+      console.error('[system_flush] system flush threw');
+      return { ok: false, uploaded: 0, entries: 0, skippedReason: 'failed' };
+    }
   }
 
   /** Superseded checkpoint generations, at most once per SNAPSHOT_GC_INTERVAL_MS. Never fails the flush. */
@@ -2424,6 +2485,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         realPrefix: prefix,
         log: (message) => console.error(`[workspace_gc] ${message}`),
       });
+      const systemPrefix = systemPrefixOf(prefix);
+      if (systemPrefix) {
+        await collectSupersededSnapshots({ bucket: bucket as GcR2BucketLike, realPrefix: systemPrefix,
+          log: (message) => console.error(`[system_gc] ${message}`) });
+      }
       bootLog('workspace_gc', 'end', { status: gc.ok ? 'ok' : 'error',
         detail: `deletedGenerations=${gc.deletedGenerations},deletedObjects=${gc.deletedObjects},keptRecent=${gc.keptRecent}` });
     } catch {
@@ -2659,8 +2725,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       const outcome = await this.runWorkspaceFlush('alarm');
       // 'too_large' is permanent: refusing to stop would keep (and bill) the
       // container forever without ever saving more. The last committed
-      // checkpoint stays authoritative.
-      if (outcome.ok || outcome.skippedReason === 'too_large') {
+      // checkpoint stays authoritative. A failed system checkpoint is not
+      // permanent: stay up and retry, like a failed workspace flush.
+      if ((outcome.ok || outcome.skippedReason === 'too_large') && !outcome.systemCheckpointFailed) {
         // A real input heartbeat may arrive during the checkpoint's R2 I/O.
         // Keep that newly active desktop up and checkpoint again next cycle.
         if (await this.ctx.storage.get<number>(LAST_ACTIVITY_AT_KEY) !== lastActivityAt) {
@@ -2885,6 +2952,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     if (wasRunning) {
       // A failed final flush is a refusal, never permission to discard disk.
       let checkpoint: FlushOutcome | undefined;
+      this.systemFinalNext = true;
       try { checkpoint = await this.runWorkspaceFlush('explicit'); } catch { /* refuse below */ }
       // A workspace over the snapshot limits can never checkpoint; refusing
       // would retry (and bill) forever. Every other failure still refuses.
@@ -2894,6 +2962,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         // Do not tombstone or cancel retries on a persistence failure.
         return { ok: false, terminated: false, stopped: false, outcome: 'flush_failed',
           wasRunning: true, runningAfter: this.containerIsRunning(), error: 'workspace_checkpoint_failed' };
+      }
+      if (checkpoint?.systemCheckpointFailed) {
+        // The user's installs outside /workspace were not saved: same refusal.
+        return { ok: false, terminated: false, stopped: false, outcome: 'flush_failed',
+          wasRunning: true, runningAfter: this.containerIsRunning(), error: 'system_checkpoint_failed' };
       }
     }
 
@@ -3641,6 +3714,11 @@ async function handlePreview(
     );
     const guacamoleUrl = mode === 'neko' ? exposedUrl : toGuacamoleUrl(exposedUrl, url.protocol);
     desktopDone('ok');
+    // The desktop is up: from here on, changes outside /workspace are the
+    // user's (apt, npm -g, dotfiles) and are captured into the system layer.
+    if (workspace.mounted) {
+      try { await sandbox.baselineSystem(); } catch { console.error('[system] baseline failed (ignored)'); }
+    }
 
     // Surface (never swallow) an app-preview port exposure failure. This is
     // never fatal to the preview response itself — see `ensureDesktop`'s doc
