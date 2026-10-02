@@ -621,6 +621,30 @@ mkdir -p /opt/ezq && echo opt-ok > /opt/ezq/marker
     expect(new TextDecoder().decode(await headAfter!.arrayBuffer())).toBe(good);   // the committed layer is untouched
   }, T);
 
+  // The first build's layers (staging only) were captured without the image manifest diff.
+  it('a layer from the older format is discarded, never restored, and the next capture replaces it', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-legacy');
+    const sysPrefix = systemPrefixOf(prefix)!;
+    const a = await startComputer('syslg-a'); await sysHydrate(a, store, prefix);
+    await baselineSystemLayer(sdk(a)); await new Promise(r => setTimeout(r, 1100));
+    await must(a, 'mkdir -p /opt/legacy && echo old > /opt/legacy/f');
+    expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+    await destroyComputer(a);
+    // Rewrite the head as the older format would have stored it (no format marker).
+    const key = `${sysPrefix}/.ezil-snapshots/latest.json`;
+    const head = JSON.parse(new TextDecoder().decode(await (await store.get(key))!.arrayBuffer()));
+    delete head.format;
+    await store.put(key, new TextEncoder().encode(JSON.stringify(head)));
+    const b = await startComputer('syslg-b');
+    expect(await sysHydrate(b, store, prefix)).toMatchObject({ ok: true, skippedReason: 'legacy_discarded', restored: 0 });
+    expect((await sh(b, 'test -e /opt/legacy/f')).exitCode).not.toBe(0);
+    await baselineSystemLayer(sdk(b)); await new Promise(r => setTimeout(r, 1100));
+    await must(b, 'mkdir -p /opt/fresh && echo new > /opt/fresh/f');
+    expect((await sysFlush(b, store, prefix)).ok).toBe(true);
+    const next = JSON.parse(new TextDecoder().decode(await (await store.get(key))!.arrayBuffer()));
+    expect(next.format).toBe(2);
+  }, T);
+
   it('a system delta over the snapshot limit is reported as too_large and never half-written', async () => {
     const store = await makeStore(); const prefix = prefixFor('system-big');
     const a = await startComputer('sysbig-a'); await sysHydrate(a, store, prefix);

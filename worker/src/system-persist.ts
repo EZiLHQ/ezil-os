@@ -19,6 +19,12 @@ import { systemSnapshotCommand } from './system-snapshot-script';
 
 export const SYSTEM_MANIFEST_PATH = '/var/lib/ezil-system/manifest.json';
 const SYSTEM_SNAPSHOT_VERSION = 1;
+/**
+ * Layers captured by the first system-layer build (staging only) had no image
+ * manifest to diff against and hold thousands of stale image files; restoring
+ * them onto a newer image could shadow platform files. Only this format restores.
+ */
+const SYSTEM_LAYER_FORMAT = 2;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const encoder = new TextEncoder();
 
@@ -29,6 +35,7 @@ export function systemPrefixOf(realPrefix: string): string | null {
 }
 
 export interface SystemSnapshot extends Snapshot {
+  format?: number;
   imageId?: string;
   replay?: { apt?: string[]; npm?: string[] };
 }
@@ -48,7 +55,7 @@ export interface SystemHydrateOutcome {
   skippedImageScoped: number;
   conflicts: number;
   sameImage?: boolean;
-  skippedReason?: 'no_computer' | 'no_snapshot' | 'already_restored' | 'failed';
+  skippedReason?: 'no_computer' | 'no_snapshot' | 'already_restored' | 'legacy_discarded' | 'failed';
 }
 
 class SystemTooLargeError extends Error {}
@@ -123,6 +130,7 @@ export async function flushSystemLayer(deps: {
     });
     const committed: SystemSnapshot = {
       ...snapshot,
+      format: SYSTEM_LAYER_FORMAT,
       ...(typeof imageId === 'string' ? { imageId } : {}),
       ...(replay && typeof replay === 'object' ? { replay: replay as SystemSnapshot['replay'] } : {}),
       ...(previous ? { previousChunkGeneration: previous.snapshot.chunkGeneration ?? previous.snapshot.generation } : {}),
@@ -173,6 +181,12 @@ export async function hydrateSystemLayer(deps: {
       return { ...outcome, ok: true, skippedReason: 'no_snapshot' };
     }
     const snapshot = head.snapshot as SystemSnapshot;
+    if (snapshot.format !== SYSTEM_LAYER_FORMAT) {
+      // Never restored. Recording its generation lets this container's next capture replace it.
+      log('[system-persist] discarding a system layer from an older format');
+      await run(container, { op: 'sys-hydrated', work, generation: snapshot.generation }, 60_000);
+      return { ...outcome, ok: true, skippedReason: 'legacy_discarded' };
+    }
     await container.mkdir(work, { recursive: false });
     await forEachLimit(snapshot.chunks, SYSTEM_TRANSFER_CONCURRENCY, async (c, i) => {
       const body = await bucket.get(chunkKey(prefix, snapshot.chunkGeneration ?? snapshot.generation, i));
