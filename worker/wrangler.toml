@@ -154,6 +154,27 @@ SANDBOX_DEFAULT_DESKTOP_MODE = "neko"
 
 SANDBOX_NEKO_ICE_POLICY = "relay"
 
+# ── Durable workspace STORE (founder decision 2026-10-02) ────────────────────
+# The hydrate/flush persistence path can keep using the R2 binding above or move
+# to AWS S3 (us-east-1). This is NOT the s3fs mount (PLATFORM-NOTES §1 — that
+# path drops writes and is never used for live storage); it selects the backend
+# for the Worker-mediated checkpoint store. See worker/src/workspace-store-s3.ts
+# and docs/WORKSPACE-STORE.md.
+#
+# EZIL_WORKSPACE_STORE is DELIBERATELY NOT SET here: the default is 'r2', and an
+# S3 cutover is opt-in per deployment. To switch a deployment to S3:
+#   wrangler secret put EZIL_WORKSPACE_STORE          # value: s3
+#   wrangler secret put EZIL_WORKSPACE_S3_BUCKET      # bucket name
+#   wrangler secret put EZIL_WORKSPACE_S3_REGION      # e.g. us-east-1
+#   wrangler secret put EZIL_WORKSPACE_S3_ACCESS_KEY_ID
+#   wrangler secret put EZIL_WORKSPACE_S3_SECRET_ACCESS_KEY
+# Optional: EZIL_WORKSPACE_S3_ENDPOINT (path-style/MinIO), EZIL_WORKSPACE_S3_KEY_PREFIX,
+# EZIL_WORKSPACE_S3_SSE ('AES256'|'aws:kms'), EZIL_WORKSPACE_S3_KMS_KEY_ID.
+# Any other EZIL_WORKSPACE_STORE value, or a missing required S3 var, FAILS
+# CLOSED (workspace_store_misconfigured) — it never silently falls back to R2.
+# While the R2 binding above is still present, the FIRST hydrate after switching
+# to 's3' migrates that computer's R2 workspace into S3 (one-way — see the doc).
+
 # ── Custom domain + preview routes: LIVE on ezil.org (narrow suffix routes) ──
 # (see `worker/src/index.ts`'s `PREVIEW_ZONE_ROOT` doc comment for the full
 # hostname-composition background — `<port>-<sandboxId>-<token>.<host>` — and
