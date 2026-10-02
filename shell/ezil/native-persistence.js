@@ -3,7 +3,7 @@ import { safeBrowserTabs } from './native-runtime.js';
 import { applyWallpaper, applyAccent } from './ui/Settings/tabs/appearance.js';
 
 const APPS = Object.freeze({ browser: 'desktop', code: 'code', preview: 'preview', settings: 'settings' });
-const WALLPAPERS = new Set(['charcoal', 'teal-dusk', 'deep-slate', 'aurora']);
+const WALLPAPERS = new Set(['horizon', 'charcoal', 'teal-dusk', 'deep-slate', 'aurora']);
 const ACCENTS = new Set(['teal', 'violet', 'amber', 'rose']);
 export function safeDesktopPreferences (input = {}, width = 1280, height = 800) {
     const output = {};
@@ -37,9 +37,9 @@ export async function prepareNativePersistence (ctx) {
     if (!result?.ok) return null;
     const preferences = safeDesktopPreferences(result.preferences, window.innerWidth, window.innerHeight);
     ctx.browserTabs = preferences.browser;
-    session.set('settings.wallpaper', preferences.wallpaper ?? 'charcoal');
+    session.set('settings.wallpaper', preferences.wallpaper ?? 'horizon');
     session.set('settings.accent', preferences.accent ?? 'teal');
-    applyWallpaper(preferences.wallpaper ?? 'charcoal'); applyAccent(preferences.accent ?? 'teal');
+    applyWallpaper(preferences.wallpaper ?? 'horizon'); applyAccent(preferences.accent ?? 'teal');
     try {
         const key = `ezil:preview-port:${workspaceId}`;
         if (preferences.previewPort) localStorage.setItem(key, String(preferences.previewPort)); else localStorage.removeItem(key);

@@ -6,6 +6,7 @@ import {
     toShellBootComputer,
     toShellDesktopState,
     type ShellSessionPayload,
+    toShellBootUser,
 } from '@/server/shell/boot-payload';
 import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/shell/http';
 
@@ -57,7 +58,7 @@ export async function GET(req: Request) {
         const lowest = computers[0];
 
         const payload: ShellSessionPayload = {
-            user: { id: ctx.user.id, email: ctx.user.email ?? null },
+            user: toShellBootUser(ctx.user),
             computer: lowest ? toShellBootComputer(lowest, false) : null,
             apps: SHELL_APPS,
             desktopState: toShellDesktopState(provider),

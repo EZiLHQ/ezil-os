@@ -2,7 +2,7 @@
 export type WorkspaceKind = 'managed' | 'attached';
 export interface ProjectSummary { id: string; name: string; createdAt: string; kind: WorkspaceKind; available: boolean }
 export interface DesktopPreferences {
-  wallpaper?: 'charcoal' | 'teal-dusk' | 'deep-slate' | 'aurora';
+  wallpaper?: 'horizon' | 'charcoal' | 'teal-dusk' | 'deep-slate' | 'aurora';
   accent?: 'teal' | 'violet' | 'amber' | 'rose';
   previewPort?: number;
   browser?: { tabs: string[]; activeIndex: number };
