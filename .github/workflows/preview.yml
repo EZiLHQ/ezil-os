@@ -534,7 +534,7 @@ jobs:
       - name: Test the canonical production URL
         timeout-minutes: 15
         env:
-          EZIL_E2E_APP: https://ezil-os.vercel.app
+          EZIL_E2E_APP: https://os.ezil.org
           EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}

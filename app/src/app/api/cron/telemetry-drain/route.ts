@@ -23,7 +23,7 @@ import { createDrainTransportFromEnv } from '@/server/telemetry/spool-drain-tran
  * route is kept as the MANUAL entry point:
  *
  *     curl -sS -H "Authorization: Bearer $CRON_SECRET" \
- *       https://ezil-os.vercel.app/api/cron/telemetry-drain
+ *       https://os.ezil.org/api/cron/telemetry-drain
  *
  * Running it while the scheduled drain is also running is harmless: ingest
  * strictly precedes ack per page, ingest is idempotent on `eventId`, and an

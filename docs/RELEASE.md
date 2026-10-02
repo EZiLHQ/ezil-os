@@ -26,7 +26,8 @@ the version image alias to the tested digest, then publishes that draft.
 4. Production requires both staging and images to succeed. Under the common
    production lock, capture previous identities and reject unvalidated schema
    changes, then deploy Worker and Vercel from that source.
-5. Test both the returned Vercel URL and `https://ezil-os.vercel.app`, and verify
+5. Test both the returned Vercel URL and `https://os.ezil.org` (and check that the
+   legacy alias `https://ezil-os.vercel.app` resolves the same deployment), and verify
    the active Worker at `https://api-desktop.ezil.org`. Provider readbacks require
    the full SHA, project, ready state and exact canonical deployment ID. Main is
    rechecked before each mutation and after verification; superseded releases fail.

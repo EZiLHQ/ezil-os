@@ -107,7 +107,7 @@ test('missing inputs, API errors, bad health and stale Vercel metadata fail clos
 });
 
 test('target selection preserves legacy default but requires explicit cloud CI URL', () => {
-  assert.equal(deployedTarget({}).app, 'https://ezil-os.vercel.app');
+  assert.equal(deployedTarget({}).app, 'https://os.ezil.org');
   assert.equal(deployedTarget({ EZIL_E2E_APP: `${target.app}/` }).app, target.app);
   assert.equal(deployedTarget({ EZIL_E2E_APP: 'http://127.0.0.1:3000' }).app, 'http://127.0.0.1:3000');
   assert.throws(() => deployedTarget({ EZIL_E2E_REQUIRE_TARGET: '1' }), /required/);
@@ -213,18 +213,20 @@ test('bundle gate accepts matching bytes, rejects stale bytes and bounds hung re
   assert.match(hung.stderr, /aborted/);
 });
 
-test('production requires the canonical alias to resolve the exact returned deployment', async () => {
+test('production requires both production aliases to resolve the exact returned deployment', async () => {
   const prod = { ...deployment, target: 'production' };
   const prodEnv = { ...env, EZIL_DEPLOY_TARGET: 'production', EZIL_E2E_WORKER: 'https://api-desktop.ezil.org' };
-  const api = (alias = prod) => async (input, options) => {
+  const api = (alias = prod, legacy = prod) => async (input, options) => {
     const url = new URL(input);
     if (url.hostname === 'api-desktop.ezil.org') return { ok:true, json:async()=>({ok:true,build:'ezil-os',supportedDesktopModes:['neko']}) };
-    if (url.pathname.endsWith('/ezil-os.vercel.app')) return {ok:true,json:async()=>alias};
+    if (url.pathname.endsWith('/os.ezil.org')) return {ok:true,json:async()=>alias};
+    if (url.pathname.endsWith('/ezil-os.vercel.app')) return {ok:true,json:async()=>legacy};
     return fakeAPI({ '/v13/deployments/preview-test.vercel.app': prod }).fetch(input, options);
   };
   const result = await verifyCloudDeployment(prodEnv, api());
-  assert.equal(result.canonical_url, 'https://ezil-os.vercel.app');
-  await assert.rejects(verifyCloudDeployment(prodEnv, api({...prod, id:'other-deployment'})), /another deployment/);
+  assert.equal(result.canonical_url, 'https://os.ezil.org');
+  await assert.rejects(verifyCloudDeployment(prodEnv, api({...prod, id:'other-deployment'})), /os\.ezil\.org points at another deployment/);
+  await assert.rejects(verifyCloudDeployment(prodEnv, api(prod, {...prod, id:'other-deployment'})), /ezil-os\.vercel\.app points at another deployment/);
   await assert.rejects(verifyCloudDeployment(prodEnv, api({...prod, meta:{githubCommitSha:'b'.repeat(40)}})), /SHA differs/);
   await assert.rejects(verifyCloudDeployment(prodEnv, api({...prod, readyState:'ERROR'})), /not ready/);
 });
@@ -251,7 +253,7 @@ test('release capture separates provider/container identities and strips configu
   const prod = {...deployment,target:'production',env:{SECRET:'do-not-store'}};
   const fetchState = async (input, options) => {
     const url = new URL(input);
-    if (url.pathname.endsWith('/ezil-os.vercel.app')) return {ok:true,json:async()=>prod};
+    if (url.pathname.endsWith('/os.ezil.org')) return {ok:true,json:async()=>prod};
     if (url.pathname.endsWith('/containers/applications')) return {ok:true,json:async()=>[
       {id:'container-id',name:'ezil-os-worker-sandbox',configuration:{image:`registry.cloudflare.com/account/image@sha256:${'d'.repeat(64)}`,env:{SECRET:'do-not-store'}}},
     ]};
@@ -283,7 +285,7 @@ test('Vercel rollback resolves legacy receipts and promotes the verified URL wit
     }, (...args) => commands.push(args));
     assert.deepEqual(result, {...previous, vercel_url:old.url});
     assert.equal(JSON.stringify(result).includes('do-not-store'), false);
-    assert.deepEqual(calls, [`/v13/deployments/${old.id}`, '/v13/deployments/ezil-os.vercel.app']);
+    assert.deepEqual(calls, [`/v13/deployments/${old.id}`, '/v13/deployments/os.ezil.org']);
     assert.deepEqual(commands[0].slice(0,2), ['vercel', ['promote', old.url, '--scope', env.VERCEL_ORG_ID, '--yes', `--token=${env.VERCEL_TOKEN}`]]);
     assert.equal(commands.length, 1);
     assert.ok(commands[0][2].timeout <= 120000);
@@ -299,7 +301,7 @@ test('Vercel rollback refuses mismatched identities, untrusted hostnames and los
     ok:true, json:async()=>new URL(input).pathname.endsWith(`/${old.id}`) ? target : current,
   });
   for (const patch of [{id:'dpl_other'}, {projectId:'prj_other'}, {readyState:'ERROR'}, {target:null}, {meta:{}},
-    {meta:{githubCommitSha:sha}}, ...['ezil-os.vercel.app', 'https://preview-test.vercel.app', 'evil.example',
+    {meta:{githubCommitSha:sha}}, ...['ezil-os.vercel.app', 'os.ezil.org', 'https://preview-test.vercel.app', 'evil.example',
       'preview-test.vercel.app.evil.example', 'user@preview-test.vercel.app', 'preview-test.vercel.app/?token=x',
       '--yes', 'preview-test.vercel.app:443'].map(url=>({url}))]) {
     await assert.rejects(restoreVercel(previous, env, api({...old,...patch}), exec));

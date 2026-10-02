@@ -8,7 +8,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 
-const app = process.env.EZIL_E2E_APP ?? 'https://ezil-os.vercel.app';
+const app = process.env.EZIL_E2E_APP ?? 'https://os.ezil.org';
 const email = process.env.EZIL_E2E_EMAIL;
 const password = process.env.EZIL_E2E_PASSWORD;
 if (!email || !password) {

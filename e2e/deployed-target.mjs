@@ -3,7 +3,7 @@ export function deployedTarget(env = process.env) {
   if (env.EZIL_E2E_REQUIRE_TARGET === '1' && !env.EZIL_E2E_APP) {
     throw new Error('EZIL_E2E_APP is required for cloud CI');
   }
-  const url = new URL(env.EZIL_E2E_APP ?? 'https://ezil-os.vercel.app');
+  const url = new URL(env.EZIL_E2E_APP ?? 'https://os.ezil.org');
   if (url.username || url.password || url.search || url.hash || url.pathname !== '/'
       || (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)))) {
     throw new Error('EZIL_E2E_APP must be an HTTPS origin (HTTP is allowed only on loopback)');

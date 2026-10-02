@@ -55,7 +55,7 @@ export interface DesktopUrl {
 /** Options for {@link createEzilClient}. */
 export interface EzilClientOptions {
     /**
-     * Origin of the EZiL-OS app, e.g. `https://ezil-os.vercel.app`. A path is
+     * Origin of the EZiL-OS app, e.g. `https://os.ezil.org`. A path is
      * allowed and preserved, so a reverse-proxied deployment works.
      */
     baseUrl: string;
