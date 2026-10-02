@@ -2044,6 +2044,8 @@ describe('preview hostname isolation', () => {
     SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.work',
     SANDBOX_DEFAULT_DESKTOP_MODE: 'neko',
     SANDBOX_HMAC_SECRET: SECRET,
+    // Preview readiness now requires durable workspace storage (final checkpoint).
+    SANDBOX_WORKSPACE_R2_BUCKET: {},
   };
 
   for (const { origin, root, env } of [
@@ -2053,7 +2055,7 @@ describe('preview hostname isolation', () => {
     for (const mode of ['neko', 'guacamole']) {
       it(`${mode} preview on ${origin} uses one wildcard TLS label`, async () => {
         const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
-        const workerEnv = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, ...env };
+        const workerEnv = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_WORKSPACE_R2_BUCKET: {}, ...env };
         const res = await worker.fetch(new Request(`${origin}/sandbox/preview`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -2083,7 +2085,7 @@ describe('preview hostname isolation', () => {
 
     it(`status and restart on ${origin} use the same preview root`, async () => {
       const { binding, calls } = fakeSandboxNamespace({});
-      const workerEnv = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, ...env };
+      const workerEnv = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_WORKSPACE_R2_BUCKET: {}, ...env };
       const status = await worker.fetch(new Request(`${origin}/sandbox/${SANDBOX_NAME}/status`), workerEnv);
       expect(status.status).toBe(200);
       expect(calls.getExposedPortHosts).toEqual([root]);
