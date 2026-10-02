@@ -147,7 +147,7 @@ export async function validate(root, manifestPath = '.github/production-migratio
 
 // Definitions only: never query application rows, sequence values, or function results.
 // OIDs are resolved to stable identities; physical/statistical state is excluded.
-export function catalogSQL(schemas) {
+export function catalogSQL(schemas, includeBody = false) {
   const selected = schemas.map(literal).join(',');
   const identity = (catalog, oid) => `(CASE WHEN ${oid}<>0 THEN (pg_identify_object('pg_${catalog}'::regclass,${oid},0)).identity END)`;
   return `WITH ns AS (SELECT * FROM pg_namespace WHERE nspname IN (${selected})), families AS (SELECT f.* FROM pg_opfamily f JOIN ns n ON n.oid=f.opfnamespace), addresses AS (
@@ -178,7 +178,7 @@ export function catalogSQL(schemas) {
     UNION ALL SELECT 'extension', e.extname, jsonb_build_array(e.extversion,e.extrelocatable) FROM pg_extension e JOIN ns n ON n.oid=e.extnamespace
     UNION ALL SELECT 'schema_member', i.type||':'||i.identity, to_jsonb(i.identity) FROM pg_depend d JOIN ns n ON d.refclassid='pg_namespace'::regclass AND d.refobjid=n.oid CROSS JOIN LATERAL pg_identify_object(d.classid,d.objid,d.objsubid) i
   ), snapshot AS (SELECT COALESCE(jsonb_agg(jsonb_build_array(kind,identity,definition) ORDER BY kind COLLATE "C",identity COLLATE "C",definition::text COLLATE "C"),'[]'::jsonb) body, count(*)::integer objects FROM objects)
-  SELECT encode(sha256(convert_to(body::text,'UTF8')),'hex') digest, objects, (SELECT count(*)::integer FROM ns) schemas FROM snapshot`;
+  SELECT encode(sha256(convert_to(body::text,'UTF8')),'hex') digest, objects, (SELECT count(*)::integer FROM ns) schemas${includeBody ? ', body' : ''} FROM snapshot`;
 }
 
 // An explicit reviewed inventory covers active platform DDL hooks. Names alone
@@ -216,7 +216,7 @@ function verifyJournal(manifest) {
   ${assertSQL(`(SELECT count(*) FROM ezil_ci.journal WHERE repository=${repo}) = COALESCE((SELECT max(ordinal) FROM ezil_ci.journal WHERE repository=${repo}),0)`, 'Journal is not a contiguous prefix')}`;
 }
 
-function journalShape() {
+export function journalShape() {
   return `
   ${assertSQL(`NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='ezil_ci') AND NOT EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_class c ON c.oid=r.ev_class JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='ezil_ci') AND NOT EXISTS (SELECT 1 FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='ezil_ci')`, 'Unexpected journal routine/rule/policy')}
   ${assertSQL(`NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE n.nspname='ezil_ci' AND a.grantee<>c.relowner)`, 'Journal tables must be private')}
