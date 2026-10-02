@@ -92,6 +92,76 @@ repository before its initial registration, run `plan` with the management token
 supplied by the environment and copy the reviewed `observedCatalog` unchanged
 into `initialCatalog`. Never derive a hosted baseline by replaying source SQL.
 
+## Reviewed re-baseline after external drift (2026-10-02)
+
+**Why.** Every OS production deploy since 2026-10-01 has stopped at `Current
+catalog drift` before mutating anything. The registered OS baseline is
+`4c104057…` (1794 objects, registered 2026-09-29 16:41Z). The live `public`
+catalog now fingerprints `e63f1fd7…` with the same 1794 objects, so existing
+definitions changed in place. Evidence, gathered read-only:
+
+- `supabase_migrations.schema_migrations` has no row after `20260929120518`
+  (2026-09-29 12:05Z), so the change did not come through any migration ledger.
+- `pg_stat_statements` shows DDL against `public` run directly by other projects
+  sharing the database: added columns on an editor table, row-level-security
+  policies dropped and re-created on desktop/MCP and board tables, and
+  grant/revoke changes on tables and functions. None of these objects belong
+  to EZiL OS.
+- Two different digests were observed on 2026-10-02 (`427180cd…`, then
+  `e63f1fd7…`): the schema was still moving.
+
+**What the PR changes.** `.github/production-migrations.json`'s
+`initialCatalog.digest`/`capturedAt` take the observation from
+`production-migrations.mjs observe` (new, read-only: it reports the live digest
+next to the registered one and never asserts, registers or writes). `objects`
+and the historical `sourceDigest` are unchanged.
+
+**The founder step this needs.** The manifest alone cannot move the baseline:
+`verifyJournal` refuses a manifest whose digest differs from the registered row
+(`Baseline registration drift`), by design. Moving it is a reviewed transition
+of both halves, in this order:
+
+1. Ask the other projects to pause direct DDL on `public` for the window.
+2. Run `node .github/scripts/production-migrations.mjs observe` with the
+   management token in the environment. If `observedCatalog.digest` differs from
+   this PR's `initialCatalog.digest`, update the PR to the new observation
+   first.
+3. In the Supabase SQL editor, as the role that owns `ezil_ci`:
+
+   ```sql
+   BEGIN;
+   SELECT pg_advisory_xact_lock(1702521196, 1835624306);
+   UPDATE ezil_ci.baselines
+      SET initial_catalog = '<initialCatalog.digest from this PR>'
+    WHERE repository = 'ezilhq/ezil-os'
+      AND initial_catalog = '4c1040575121990dbd5ad09e40c0e334be4a291e4e746fc20a08d8c07a036e7f'
+   RETURNING repository, initial_catalog;   -- exactly one row, else ROLLBACK
+   COMMIT;
+   ```
+
+   The OS journal has no migration rows, so nothing else references the old
+   digest. Rollback is the same statement with the two digests swapped.
+4. Merge the PR, then re-run the main deploy. `apply` re-verifies the whole
+   catalog under the same lock before Worker, image or Vercel change.
+
+Between steps 3 and 4 deploys fail with `Baseline registration drift` instead of
+`Current catalog drift`. They were already failing, so nothing gets worse.
+
+**The durable fix.** A re-baseline only lasts until the next out-of-band
+change to shared `public`. As long as OS fingerprints the whole schema, other
+projects' DDL keeps blocking OS releases. Fingerprint only what OS owns:
+
+- *Preferred:* move the OS tables (`ezil_computers`, `ezil_os_access`, the
+  telemetry tables, and so on) into a dedicated `ezil_os` schema and fingerprint
+  that, the way Gateway owns `ezil_ai` and Works owns `ezil_universe`/`ezil_works`.
+  This needs one reviewed forward migration and an app-side schema change.
+- *Quicker:* extend `catalogSQL` with an explicit owned-object allowlist for
+  OS's tables in `public`. Smaller, but the allowlist itself becomes a contract
+  that must change with every new OS table.
+
+Either is a change to this protocol and needs its own review; neither is part
+of this PR.
+
 ## Journal, catalog and retries
 
 One transaction-scoped advisory lock, `(1702521196, 1835624306)`, serializes all
