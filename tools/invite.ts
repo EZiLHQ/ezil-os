@@ -2,14 +2,18 @@
 /**
  * The EZiL OS invite CLI — the only sanctioned way to write `ezil_os_access`.
  *
+ * 🔴 THE APP NO LONGER ENFORCES THIS LIST. Anyone can sign up with Google at
+ * os.ezil.org. `add` is still how to create an email/password account (it sends
+ * a Supabase invite that lands on `/auth/invited`), and the table still records
+ * who was invited; `revoke` no longer keeps anyone out. Wherever the text below
+ * says the gate "refuses" or "turns away", that describes the removed gate.
+ *
  *     bun tools/invite.ts add <email> [--by <who>] [--no-invite]
  *     bun tools/invite.ts revoke <email>
  *     bun tools/invite.ts list
  *
- * `ezil_os_access` is the allow-list `assertOsAccess()`
- * (`app/src/server/api/os-access.ts`) reads on every request while
- * `EZIL_OS_ACCESS_MODE` is `invite` — its default. This script is how a row
- * gets into it, and it exists for the same reason
+ * `ezil_os_access` was the allow-list the app's (now removed) access gate read
+ * on every request. This script is how a row gets into it, and it exists for the same reason
  * `app/scripts/apply-telemetry-migration.mjs` does: the alternative is a human
  * pasting DDL into the Supabase SQL editor, where a typo in an email is an
  * invite that silently never works and a mistyped `delete` is unrecoverable.
@@ -184,7 +188,11 @@ const looksLikeEmail = (email: string): boolean => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.
 
 // ── Argument parsing ───────────────────────────────────────────────────────
 
-const USAGE = `EZiL OS invite allow-list (table: ezil_os_access)
+const USAGE = `EZiL OS invites (table: ezil_os_access)
+
+  The app no longer enforces this list: anyone can sign up with Google.
+  "add" still sends a Supabase invite that creates an email/password account;
+  "revoke" only records the revocation.
 
   bun tools/invite.ts add <email> [--by <who>] [--no-invite]
   bun tools/invite.ts revoke <email>
@@ -222,8 +230,7 @@ Exit codes
   2  the allow-list row IS written, but the invite email was not sent.
 
 Notes
-  Access is only enforced while EZIL_OS_ACCESS_MODE is "invite" — its default.
-  In "open" mode this table is not consulted at all.
+  The app does not read this table; it records who was invited by email.
   The allow-list row is written BEFORE the email is sent, on purpose: see the
   comment at the top of this file.`;
 
@@ -445,7 +452,6 @@ const cmdList = async (): Promise<void> => {
 
 		if (rows.length === 0) {
 			out('[invite] ezil_os_access is empty.');
-			out('         With EZIL_OS_ACCESS_MODE unset or "invite", NOBODY can use EZiL OS.');
 			return;
 		}
 

@@ -132,6 +132,7 @@ test('Vercel browser bypass is scoped to the app and cannot follow a redirect', 
     });
     if (url.startsWith(target.app)) {
       assert.equal(calls[0][1].maxRedirects, 0);
+      assert.equal(calls[0][1].timeout, 240_000, 'a cold desktop start must not be cut off by the harness');
       assert.deepEqual(calls[0][1].headers, { accept: '*/*', ...headers });
       assert.deepEqual(calls[1], ['fulfill', { response: 'response' }]);
     } else assert.deepEqual(calls, [['continue']]);
@@ -144,12 +145,40 @@ test('Vercel bypass route tolerates context disposal but surfaces live request e
     app: target.app, headers: { 'x-vercel-protection-bypass': 'test-bypass' },
   });
   const route = (error) => ({
-    request: () => ({ url: () => `${target.app}/os`, headers: () => ({}) }),
+    request: () => ({ url: () => `${target.app}/os`, method: () => 'POST', headers: () => ({}) }),
     fetch: async () => { throw error; },
     fulfill: async () => { throw new Error('fulfill should not run'); },
   });
   await assert.doesNotReject(handler(route(new Error('route.fetch: Request context disposed.'))));
-  await assert.rejects(handler(route(new Error('origin fetch failed'))), /origin fetch failed/);
+  await assert.rejects(handler(route(new Error('origin fetch failed'))), /bypass fetch failed POST \/os: origin fetch failed/);
+});
+
+test('🔴 a failed bypass fetch never prints request headers (public CI logs)', async () => {
+  let handler;
+  await configureAppContext({ route: async (_pattern, callback) => { handler = callback; } }, {
+    app: target.app, headers: { 'x-vercel-protection-bypass': 'test-bypass' },
+  });
+  // The shape Playwright really throws: a reason line, then a call log that
+  // repeats every header of the request.
+  const playwright = Object.assign(new Error([
+    'route.fetch: Timeout 30000ms exceeded.',
+    'Call log:',
+    `  - → POST ${target.app}/api/shell/desktop`,
+    '    - cookie: __Host-ezil-os-auth=base64-SESSION-WITH-REFRESH-TOKEN',
+    '    - x-vercel-protection-bypass: test-bypass',
+  ].join('\n')), { name: 'TimeoutError' });
+  const error = await handler({
+    request: () => ({ url: () => `${target.app}/api/shell/desktop`, method: () => 'POST', headers: () => ({}) }),
+    fetch: async () => { throw playwright; },
+    fulfill: async () => { throw new Error('fulfill should not run'); },
+  }).then(() => null, (e) => e);
+  assert.ok(error, 'the failure must still surface');
+  assert.equal(error.name, 'TimeoutError');
+  assert.match(error.message, /POST \/api\/shell\/desktop: route\.fetch: Timeout 30000ms exceeded\.$/);
+  for (const secret of ['SESSION-WITH-REFRESH-TOKEN', 'test-bypass', 'cookie', 'Call log']) {
+    assert.equal(error.message.includes(secret), false, `leaked ${secret}`);
+    assert.equal(String(error.stack ?? '').includes(secret), false, `leaked ${secret} via stack`);
+  }
 });
 
 test('bundle gate accepts matching bytes, rejects stale bytes and bounds hung requests', (t) => {

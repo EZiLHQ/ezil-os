@@ -4,6 +4,7 @@ import { redirect } from 'next/navigation';
 import { headers } from 'next/headers';
 
 import { Routes, safeReturnUrl } from '@/utils/constants';
+import { forwardedHost, forwardedProto } from '@/utils/forwarded';
 import { createClient } from '@/utils/supabase/server';
 
 export interface AuthActionResult {
@@ -23,9 +24,7 @@ export interface AuthActionResult {
 /** Resolves the site origin for OAuth/email redirect targets. */
 async function siteOrigin(): Promise<string> {
     const h = await headers();
-    const proto = h.get('x-forwarded-proto') ?? 'http';
-    const host = h.get('x-forwarded-host') ?? h.get('host') ?? 'localhost:3000';
-    return `${proto}://${host}`;
+    return `${forwardedProto(h) ?? 'http'}://${forwardedHost(h) ?? 'localhost:3000'}`;
 }
 
 /**
@@ -91,13 +90,11 @@ export async function signInWithPassword(formData: FormData): Promise<AuthAction
  * 🔴 THERE IS NO SIGN-UP ACTION, AND THAT IS THE PRODUCT RULE.
  *
  * `signUpWithPassword` used to live here and called `supabase.auth.signUp`.
- * EZiL OS is invite-only (`EZIL_OS_ACCESS_MODE`, default `invite`): an account
- * is created by `bun tools/invite.ts add <email>`, which writes the
- * `ezil_os_access` row and then asks Supabase to send an invite email. A
- * self-service sign-up form does not just duplicate that — it lets anyone
- * create an account on the shared Supabase project, which is a real cost
- * (rows in `auth.users`, email quota) even though the access gate would refuse
- * every one of them at `/os`.
+ * Anyone may use EZiL OS, but new accounts come from "Continue with Google",
+ * where Google has already verified the address. An email/password sign-up
+ * form would add unverified accounts and confirmation email to the shared
+ * Supabase project for no gain. Email/password accounts can still be created
+ * by `bun tools/invite.ts add <email>`, which sends a Supabase invite.
  *
  * `login/entry-contract.test.ts` fails if `auth.signUp(` reappears anywhere
  * under `app/src`. If self-service ever becomes the intent, that test is the
@@ -126,10 +123,4 @@ export async function signInWithGoogle(returnUrl: string): Promise<never> {
     }
 
     redirect(data.url);
-}
-
-export async function signOut(): Promise<never> {
-    const supabase = await createClient();
-    await supabase.auth.signOut();
-    redirect(Routes.LOGIN);
 }

@@ -44,16 +44,12 @@ export function checkDevelopmentEnvironment(env: Environment, local = false): Di
         }
     }
     if (env.CRON_SECRET !== undefined && env.CRON_SECRET.length < 32) add('CRON_SECRET', 'invalid');
-    if (env.EZIL_OS_ACCESS_MODE !== undefined && !['invite', 'open'].includes(env.EZIL_OS_ACCESS_MODE)) {
-        add('EZIL_OS_ACCESS_MODE', 'invalid');
-    }
     if (env.NODE_ENV !== undefined && !['development', 'test', 'production'].includes(env.NODE_ENV)) {
         add('NODE_ENV', 'invalid');
     }
     if (local) {
         if (!isLocalApiUrl(env.NEXT_PUBLIC_SUPABASE_URL ?? '')) add('NEXT_PUBLIC_SUPABASE_URL', 'local_only');
         if (!isLocalDatabaseUrl(env.SUPABASE_DATABASE_URL ?? '')) add('SUPABASE_DATABASE_URL', 'local_only');
-        if ((env.EZIL_OS_ACCESS_MODE ?? 'invite') !== 'invite') add('EZIL_OS_ACCESS_MODE', 'local_only');
         for (const name of ['CLOUDFLARE_GUACAMOLE_WORKER_URL', 'CLOUDFLARE_GUACAMOLE_HMAC_SECRET']) {
             if (env[name]?.trim()) add(name, 'must_be_unset');
         }

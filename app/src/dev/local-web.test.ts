@@ -47,22 +47,21 @@ describe('development configuration diagnostics', () => {
         const secret = 'private-unprintable-value';
         const diagnostics = formatDiagnostics(checkDevelopmentEnvironment({
             ...valid, SUPABASE_DATABASE_URL: secret, NEXT_PUBLIC_SUPABASE_URL: secret,
-            EZIL_OS_ACCESS_MODE: secret, CRON_SECRET: secret, NODE_ENV: secret,
+            CRON_SECRET: secret, NODE_ENV: secret,
         }));
         expect(diagnostics).not.toContain(secret);
-        for (const name of ['SUPABASE_DATABASE_URL', 'NEXT_PUBLIC_SUPABASE_URL', 'EZIL_OS_ACCESS_MODE', 'CRON_SECRET', 'NODE_ENV']) {
+        for (const name of ['SUPABASE_DATABASE_URL', 'NEXT_PUBLIC_SUPABASE_URL', 'CRON_SECRET', 'NODE_ENV']) {
             expect(diagnostics).toContain(`${name}: invalid`);
         }
     });
 
-    it('rejects inherited cloud providers and open access in the managed local setup', () => {
+    it('rejects inherited cloud providers in the managed local setup', () => {
         const issues = checkDevelopmentEnvironment({
             ...valid, CLOUDFLARE_GUACAMOLE_WORKER_URL: 'https://worker.example.test',
-            CLOUDFLARE_GUACAMOLE_HMAC_SECRET: 'must-not-print', EZIL_OS_ACCESS_MODE: 'open',
+            CLOUDFLARE_GUACAMOLE_HMAC_SECRET: 'must-not-print',
         }, true);
         expect(issues).toContainEqual({ name: 'CLOUDFLARE_GUACAMOLE_WORKER_URL', code: 'must_be_unset' });
         expect(issues).toContainEqual({ name: 'CLOUDFLARE_GUACAMOLE_HMAC_SECRET', code: 'must_be_unset' });
-        expect(issues).toContainEqual({ name: 'EZIL_OS_ACCESS_MODE', code: 'local_only' });
     });
 
     it('preserves support for explicitly configured non-local development', () => {
@@ -102,7 +101,7 @@ describe('local mutation boundaries', () => {
 
     it('keeps the service key and cloud credentials out of app configuration', () => {
         const contents = localEnvironment(status);
-        expect(contents).toContain('EZIL_OS_ACCESS_MODE=invite');
+        expect(contents).toContain('EZIL_LOCAL_WEB=1');
         expect(contents).not.toContain(status.SERVICE_ROLE_KEY);
         expect(contents).not.toContain('CLOUDFLARE');
         expect(contents).not.toContain('CRON_SECRET');

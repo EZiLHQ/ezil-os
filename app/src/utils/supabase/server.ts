@@ -1,7 +1,9 @@
 import { createServerClient, type CookieOptions } from '@supabase/ssr';
-import { cookies } from 'next/headers';
+import { cookies, headers } from 'next/headers';
 
 import { env } from '@/env';
+
+import { authCookieOptions, isHttpsRequest } from './cookie-options';
 
 /**
  * Server-side Supabase client for use in Server Components, Route Handlers,
@@ -13,8 +15,10 @@ import { env } from '@/env';
  */
 export async function createClient() {
     const cookieStore = await cookies();
+    const secure = isHttpsRequest(await headers());
 
     return createServerClient(env.NEXT_PUBLIC_SUPABASE_URL, env.NEXT_PUBLIC_SUPABASE_ANON_KEY, {
+        cookieOptions: authCookieOptions(secure),
         cookies: {
             getAll() {
                 return cookieStore.getAll();

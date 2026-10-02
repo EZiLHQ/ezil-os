@@ -5,10 +5,12 @@ import { createInsertSchema } from 'drizzle-zod';
 import { authUsers } from './auth-users';
 
 /**
- * `ezil_os_access` — the invite allow-list. One row per invited email; a row
- * with `revoked_at is null` is the ONLY thing that lets an account past
- * `assertOsAccess` (`@/server/api/os-access.ts`) while
- * `EZIL_OS_ACCESS_MODE` is `invite` (its default — see `@/env`).
+ * `ezil_os_access` — the former invite allow-list, one row per invited email.
+ *
+ * 🔴 NOT READ BY THE APP. EZiL OS opened to everyone at os.ezil.org and the gate
+ * that consulted this table was removed. The table, its migration and its rows
+ * are kept (dropping them is irreversible and buys nothing); `tools/invite.ts`
+ * still writes here as a record of who was invited by email.
  *
  * ── Why the PRIMARY KEY is the EMAIL and not the user id ──────────────────
  * An invite has to exist BEFORE the account does. Supabase Auth only creates

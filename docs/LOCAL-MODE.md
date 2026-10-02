@@ -12,8 +12,8 @@ Mac app has normal internet access for websites, Git, packages, and any Azure
 or Bedrock provider the user explicitly configures. Guest startup performs no
 EZiL authentication or workspace upload. Cloud synchronization is disabled.
 
-If you want the hosted product instead — invite-only, `os.ezil.work`, your own
-account — see the main [README](../README.md#getting-started).
+If you want the hosted product instead — `https://os.ezil.org`, sign up with
+Google — see the main [README](../README.md#getting-started).
 
 ## Apple Silicon Mac app
 
