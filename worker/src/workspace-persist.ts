@@ -129,7 +129,7 @@ export function parseSnapshot(raw: string): Snapshot {
   }
   return s;
 }
-function validPrefix(prefix: string): boolean {
+export function validPrefix(prefix: string): boolean {
   return !!prefix && prefix.split('/').every(p => p && p !== '.' && p !== '..');
 }
 /** Largest legacy object read in one piece; larger ones are imported in ranges. */
@@ -140,18 +140,18 @@ function legacyImportable(rel: string): boolean {
 function safeRelative(path: string): boolean {
   return !!path && !/[\\\x00-\x1f\x7f]/.test(path) && path.split('/').every(p => p && p !== '.' && p !== '..');
 }
-async function sha256(bytes: Uint8Array): Promise<string> {
+export async function sha256(bytes: Uint8Array): Promise<string> {
   const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
   return [...hash].map(b => b.toString(16).toLowerCase().padStart(2, '0')).join('');
 }
-async function readBounded(body: HydrateR2ObjectBodyLike, limit: number): Promise<Uint8Array> {
+export async function readBounded(body: HydrateR2ObjectBodyLike, limit: number): Promise<Uint8Array> {
   // R2ObjectBody always includes size. Refuse an unknown bound before buffering.
   if (typeof body.size !== 'number' || !Number.isInteger(body.size) || body.size < 0 || body.size > limit) throw new Error('snapshot object too large');
   const bytes = new Uint8Array(await body.arrayBuffer());
   if (bytes.length > limit) throw new Error('snapshot object too large');
   return bytes;
 }
-async function readHead(bucket: Pick<HydrateR2BucketLike, 'get'>, prefix: string) {
+export async function readHead(bucket: Pick<HydrateR2BucketLike, 'get'>, prefix: string) {
   const body = await bucket.get(`${prefix}/${SNAPSHOT_HEAD}`);
   if (!body) return null;
   const snapshot = parseSnapshot(new TextDecoder().decode(await readBounded(body, 128 * 1024)));
@@ -165,12 +165,12 @@ async function command(container: HydrateContainerLike, params: Record<string, u
   if (result.exitCode !== 0) throw new Error(`workspace snapshot ${params.op} failed`);
   return result.stdout;
 }
-function requireSdkSuccess(result: unknown): void {
+export function requireSdkSuccess(result: unknown): void {
   if (result && typeof result === 'object' && 'success' in result && result.success === false) {
     throw new Error('workspace file operation failed');
   }
 }
-function chunkKey(prefix: string, generation: string, index: number): string {
+export function chunkKey(prefix: string, generation: string, index: number): string {
   return `${prefix}/.ezil-snapshots/${generation}/${index}`;
 }
 

@@ -170,7 +170,8 @@ COPY scripts/start-devserver.sh /usr/local/bin/start-devserver.sh
 # "code-server" launch section), but shipped here as a standalone, idempotent
 # utility for on-demand/manual relaunch.
 COPY scripts/start-codeserver.sh /usr/local/bin/start-codeserver.sh
-RUN chmod +x /usr/local/bin/start-desktop.sh /usr/local/bin/start-neko.sh /usr/local/bin/start-devserver.sh /usr/local/bin/start-codeserver.sh
+COPY scripts/ezil-restore-deps.sh /usr/local/bin/ezil-restore-deps.sh
+RUN chmod +x /usr/local/bin/start-desktop.sh /usr/local/bin/start-neko.sh /usr/local/bin/start-devserver.sh /usr/local/bin/start-codeserver.sh /usr/local/bin/ezil-restore-deps.sh
 # ── Alternate `neko` desktop mode (Phase 1, opt-in via desktopMode) ──────────
 # Guacamole above remains the default/rollback path — nothing above this
 # comment is changed by Neko's presence. The pinned Neko + VS Code runtime
@@ -370,6 +371,19 @@ RUN cd /opt/ezil-sidecar \
 # reference) once neko is already serving, which is what actually listens on
 # this port — see that script's doc comment for package-manager detection,
 # phase reporting, and why its call site is last in the boot sequence.
+# System-layer persistence (src/system-persist.ts): what this image itself
+# ships, so a computer's saved changes outside /workspace can tell "the user
+# installed it" from "the image has it", and an image update can be detected
+# (content fingerprint: packages, global npm modules, runtimes, OS release).
+RUN set -eu; \
+    apt-mark showmanual | sort -u > /etc/ezil-image-apt-manual.txt; \
+    { for d in /usr/local/lib/node_modules/*; do n="$(basename "$d")"; \
+        case "$n" in @*) for m in "$d"/*; do [ -e "$m" ] && echo "$n/$(basename "$m")"; done ;; .*) ;; *) echo "$n" ;; esac; \
+      done; } 2>/dev/null | sort -u > /etc/ezil-image-npm-global.txt; \
+    { cat /var/lib/dpkg/status /etc/ezil-image-npm-global.txt /etc/os-release; node --version 2>/dev/null || true; bun --version 2>/dev/null || true; } \
+      | sha256sum | cut -c1-32 > /etc/ezil-image-id; \
+    test -s /etc/ezil-image-id
+
 EXPOSE 8080
 EXPOSE 8181
 EXPOSE 3002

@@ -26,6 +26,7 @@ import {
   WORKSPACE_HEARTBEAT_FILENAME,
 } from './workspace-persist';
 import { SEED_SENTINEL_FILENAME } from './workspace-seed';
+import { baselineSystemLayer, flushSystemLayer, hydrateSystemLayer, systemPrefixOf } from './system-persist';
 
 const run = promisify(execFile);
 const IMAGE = process.env.EZIL_CHECKPOINT_IMAGE ?? process.env.EZIL_VALIDATE_IMAGE ?? 'ezil-integrated:local';
@@ -435,5 +436,112 @@ describe.skipIf(!imagePresent)(`persistent compute: checkpoint survives real con
     expect(out.ok).toBe(false);
     expect(out.skippedReason).toBe('too_large');
     expect((await store.list({ prefix: `${p2}/` })).objects).toEqual([]);   // nothing half-written
+  }, T);
+});
+
+// ── System layer: changes OUTSIDE /workspace (apt/dpkg, npm -g, HOME) ─────────
+// Founder-reported 2026-10-02: "the moment I install any package it disappears
+// after I close the browser or sign out". Offline fixtures: a .deb built here,
+// a local package for npm -g.
+describe.skipIf(!imagePresent)(`persistent compute: system installs survive container replacement (${IMAGE})`, () => {
+  afterAll(async () => { await Promise.all(containers.map(destroyComputer)); }, 120_000);
+  const sysFlush = (c: string, store: Store, prefix: string) => flushSystemLayer({ container: sdk(c), bucket: store, realPrefix: prefix, log });
+  const sysHydrate = (c: string, store: Store, prefix: string) => hydrateSystemLayer({ container: sdk(c), bucket: store, realPrefix: prefix, log });
+  const INSTALLS = String.raw`
+set -e
+mkdir -p /tmp/ezq-deb/ezq-tool/DEBIAN /tmp/ezq-deb/ezq-tool/usr/local/bin
+printf 'Package: ezq-tool\nVersion: 1.0\nArchitecture: all\nMaintainer: qa\nDescription: qa fixture\n' > /tmp/ezq-deb/ezq-tool/DEBIAN/control
+printf '#!/bin/sh\necho ezq-tool-ok\n' > /tmp/ezq-deb/ezq-tool/usr/local/bin/ezq-tool && chmod 755 /tmp/ezq-deb/ezq-tool/usr/local/bin/ezq-tool
+dpkg-deb --build /tmp/ezq-deb/ezq-tool /tmp/ezq-tool.deb >/dev/null && dpkg -i /tmp/ezq-tool.deb >/dev/null
+mkdir -p /tmp/ezq-npm && printf '{"name":"ezq-cli","version":"1.0.0","bin":{"ezq-cli":"cli.js"}}' > /tmp/ezq-npm/package.json
+printf '#!/usr/bin/env node\nconsole.log("ezq-cli-ok")\n' > /tmp/ezq-npm/cli.js
+# A packed tarball installs as a COPY (a folder path would install a symlink back into /tmp).
+(cd /tmp/ezq-npm && npm pack --silent >/dev/null) && npm install -g --offline --no-audit --no-fund /tmp/ezq-npm/ezq-cli-1.0.0.tgz >/dev/null 2>&1
+echo 'export EZQ_DOTFILE=1' >> /root/.bashrc
+mkdir -p /opt/ezq && echo opt-ok > /opt/ezq/marker
+`;
+
+  it('apt/dpkg, npm -g, /opt and dotfiles installed after the baseline come back on a NEW container, working', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system');
+    const a = await startComputer('sys-a');
+    expect(await baselineSystemLayer(sdk(a))).toBe(true);
+    await new Promise(r => setTimeout(r, 1100));
+    await must(a, INSTALLS);
+    const out = await sysFlush(a, store, prefix);
+    expect(out.ok).toBe(true);
+    expect(out.entries).toBeGreaterThan(5);
+    await destroyComputer(a);
+    const b = await startComputer('sys-b');
+    expect((await sh(b, 'command -v ezq-tool')).exitCode).not.toBe(0);           // fresh container: nothing yet
+    const back = await sysHydrate(b, store, prefix);
+    expect(back).toMatchObject({ ok: true, sameImage: true, conflicts: 0 });
+    expect(back.restored).toBeGreaterThan(5);
+    expect((await must(b, 'ezq-tool')).trim()).toBe('ezq-tool-ok');
+    expect((await must(b, "dpkg -s ezq-tool | grep '^Status'")).trim()).toBe('Status: install ok installed');
+    expect((await must(b, 'ezq-cli')).trim()).toBe('ezq-cli-ok');
+    expect((await must(b, 'cat /opt/ezq/marker')).trim()).toBe('opt-ok');
+    expect((await must(b, 'grep -c EZQ_DOTFILE /root/.bashrc')).trim()).toBe('1');
+    // Restoring twice on one container is refused (manifest marks it done).
+    expect((await sysHydrate(b, store, prefix)).skippedReason).toBe('already_restored');
+  }, T);
+
+  it('an uninstall is saved too: apt remove on the restored computer stays removed on the next one', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-rm');
+    const a = await startComputer('sysrm-a');
+    await baselineSystemLayer(sdk(a)); await new Promise(r => setTimeout(r, 1100));
+    await must(a, INSTALLS);
+    expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+    await destroyComputer(a);
+    const b = await startComputer('sysrm-b');
+    expect((await sysHydrate(b, store, prefix)).ok).toBe(true);
+    await baselineSystemLayer(sdk(b)); await new Promise(r => setTimeout(r, 1100));
+    await must(b, 'dpkg -r ezq-tool >/dev/null');
+    expect((await sysFlush(b, store, prefix)).ok).toBe(true);
+    await destroyComputer(b);
+    const c = await startComputer('sysrm-c');
+    expect((await sysHydrate(c, store, prefix)).ok).toBe(true);
+    expect((await sh(c, 'command -v ezq-tool')).exitCode).not.toBe(0);
+    expect((await must(c, "dpkg -s ezq-tool 2>&1 | grep -E '^Status|not installed' | head -1")).trim()).not.toBe('Status: install ok installed');
+    expect((await must(c, 'ezq-cli')).trim()).toBe('ezq-cli-ok');                    // the rest is still there
+  }, T);
+
+  it('after an image update: system files are NOT restored raw (HOME is), and the user installs are recorded for replay', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-img');
+    const a = await startComputer('sysimg-a');
+    await baselineSystemLayer(sdk(a)); await new Promise(r => setTimeout(r, 1100));
+    await must(a, INSTALLS);
+    expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+    const head = await store.get(`${systemPrefixOf(prefix)}/.ezil-snapshots/latest.json`);
+    const snap = JSON.parse(new TextDecoder().decode(await head!.arrayBuffer()));
+    expect(snap.replay.apt).toContain('ezq-tool');
+    expect(snap.replay.npm).toContain('ezq-cli');
+    await destroyComputer(a);
+    const b = await startComputer('sysimg-b');
+    await must(b, 'echo different-image-build > /etc/ezil-image-id');
+    const back = await sysHydrate(b, store, prefix);
+    expect(back).toMatchObject({ ok: true, sameImage: false });
+    expect(back.skippedImageScoped).toBeGreaterThan(0);
+    expect(back.replayStarted).toBe(true);
+    expect((await must(b, 'grep -c EZQ_DOTFILE /root/.bashrc')).trim()).toBe('1');    // HOME restored
+    expect((await sh(b, 'test -e /opt/ezq/marker')).exitCode).not.toBe(0);            // image-scoped skipped
+  }, T);
+
+  it('capture is refused while dpkg/apt hold their lock, and has no baseline until the desktop is up', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-lock');
+    const a = await startComputer('syslock-a');
+    expect((await sysFlush(a, store, prefix)).skippedReason).toBe('no_baseline');
+    await baselineSystemLayer(sdk(a));
+    await docker(['exec', '-d', a, 'python3', '-c', 'import fcntl,os,time; fd=os.open("/var/lib/dpkg/lock-frontend", os.O_RDWR|os.O_CREAT); fcntl.lockf(fd, fcntl.LOCK_EX); time.sleep(60)']);
+    await new Promise(r => setTimeout(r, 800));
+    expect((await sysFlush(a, store, prefix)).skippedReason).toBe('busy');
+  }, T);
+
+  it('a system delta over the snapshot limit is reported as too_large and never half-written', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-big');
+    const a = await startComputer('sysbig-a');
+    await baselineSystemLayer(sdk(a)); await new Promise(r => setTimeout(r, 1100));
+    await must(a, 'mkdir -p /opt/big && head -c 540000000 /dev/urandom > /opt/big/blob');
+    expect((await sysFlush(a, store, prefix)).skippedReason).toBe('too_large');
+    expect((await store.list({ prefix: `${systemPrefixOf(prefix)}/` })).objects).toEqual([]);
   }, T);
 });
