@@ -535,8 +535,10 @@ export function r2AsWorkspaceStore(r2: R2BucketLike): WorkspaceStore {
     async get(key) {
       const o = await r2.get(key);
       if (!o) return null;
-      const buf = await o.arrayBuffer();
-      return { etag: normalizeEtag(o.etag), size: o.size, arrayBuffer: async () => buf };
+      // Lazy body: the caller (readBounded) refuses an unknown/over-limit size
+      // from `o.size` BEFORE any bytes are buffered — matching the pure-R2 path,
+      // so a huge legacy loose file fails cheaply instead of being buffered whole.
+      return { etag: normalizeEtag(o.etag), size: o.size, arrayBuffer: () => o.arrayBuffer() };
     },
     async put(key, value, options) {
       const o = await r2.put(key, value, options);

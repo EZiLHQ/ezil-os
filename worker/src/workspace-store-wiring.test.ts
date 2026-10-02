@@ -121,12 +121,28 @@ describe('hydrateWorkspace store wiring', () => {
   });
 
   // Positive control: a well-formed s3 env does NOT short-circuit as
-  // misconfigured — it proceeds into hydration (which then fails on this bare
-  // fake's I/O, a DIFFERENT detail, proving we got past the selection guard).
-  it('positive control: a valid s3 env passes the selection guard', async () => {
-    const { fake } = await makeFake({ EZIL_WORKSPACE_STORE: 's3', ...S3_VARS });
-    const result = (await (await proto()).hydrateWorkspace.call(fake, { mountPath: MOUNT_PATH, prefix: PREFIX } as never)) as { mounted: boolean; detail?: string };
-    expect(result.detail).not.toBe('workspace_store_misconfigured');
+  // misconfigured — it proceeds into hydration and actually REACHES the S3 store.
+  // globalThis.fetch is stubbed (this test must not touch real AWS / the
+  // network); the recorder proves the S3 host was contacted.
+  it('positive control: a valid s3 env reaches the S3 store (no real network)', async () => {
+    const hosts: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: Request | string | URL) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      hosts.push(url.host);
+      if (url.searchParams.get('list-type') === '2') {
+        return new Response('<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>', { status: 200 });
+      }
+      return new Response('<Error><Code>NoSuchKey</Code></Error>', { status: 404 });
+    }) as typeof fetch;
+    try {
+      const { fake } = await makeFake({ EZIL_WORKSPACE_STORE: 's3', ...S3_VARS });
+      const result = (await (await proto()).hydrateWorkspace.call(fake, { mountPath: MOUNT_PATH, prefix: PREFIX } as never)) as { mounted: boolean; detail?: string };
+      expect(result.detail).not.toBe('workspace_store_misconfigured');
+      expect(hosts.some((h) => h === 'b.s3.us-east-1.amazonaws.com')).toBe(true);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 });
 
