@@ -247,6 +247,33 @@ describe.skipIf(!imagePresent)(`persistent compute: checkpoint survives real con
     expect(again.ok).toBe(true);
   }, T);
 
+  // Found only in the real runtime (wrangler dev + Sandbox SDK): the restore REPLACED /workspace,
+  // so the SDK session shell and code-server (cwd = /workspace) were left in a deleted directory
+  // and code-server crashed on getcwd -> no desktop. Restore and legacy import must keep the inode.
+  for (const mode of ['checkpoint restore', 'legacy import'] as const) {
+    it(`${mode} installs INTO the existing /workspace: same inode, a process whose cwd is the workspace keeps working`, async () => {
+      const store = await makeStore(); const prefix = prefixFor(mode === 'legacy import' ? 'cwd-legacy' : 'cwd-restore');
+      if (mode === 'legacy import') {
+        await store.put(`${prefix}/src/app.js`, new TextEncoder().encode('console.log(1)\n'));
+        await store.put(`${prefix}/${SEED_SENTINEL_FILENAME}`, new TextEncoder().encode('{}'));
+      } else {
+        const a = await startComputer('cwd-a');
+        await must(a, 'mkdir -p /workspace/src && echo "console.log(1)" > /workspace/src/app.js'); await markHydrated(a, prefix);
+        expect((await flush(a, store, prefix)).ok).toBe(true);
+        await destroyComputer(a);
+      }
+      const b = await startComputer(mode === 'legacy import' ? 'cwd-bl' : 'cwd-br');
+      const inode = (await must(b, 'stat -c %i /workspace')).trim();
+      await docker(['exec', '-d', b, 'sh', '-c', 'cd /workspace && exec sleep 600']);
+      const pid = (await must(b, 'for i in 1 2 3 4 5; do p=$(pgrep -x sleep | tail -1); [ -n "$p" ] && break; sleep 0.2; done; echo $p')).trim();
+      expect(pid).toMatch(/^\d+$/);
+      expect((await hydrate(b, store, prefix)).ok).toBe(true);
+      expect((await must(b, 'stat -c %i /workspace')).trim()).toBe(inode);
+      expect((await must(b, `readlink /proc/${pid}/cwd`)).trim()).toBe('/workspace');
+      expect((await must(b, `ls /proc/${pid}/cwd/src`)).trim()).toBe('app.js');
+    }, T);
+  }
+
   it('two computers racing on one prefix: exactly one checkpoint commits', async () => {
     const store = await makeStore(); const prefix = prefixFor('race');
     const [a, b] = [await startComputer('race-a'), await startComputer('race-b')];

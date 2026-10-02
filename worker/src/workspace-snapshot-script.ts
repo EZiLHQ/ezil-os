@@ -182,6 +182,24 @@ def capture(path):
             chunks.append({'size':len(data), 'sha256':hashlib.sha256(data).hexdigest()})
     return {'sha256':digest.hexdigest(), 'chunks':chunks, 'entries':len(entries), 'skipped':len(skipped)}
 
+def install(stage):
+    # Move the staged tree INTO the existing workspace directory; never replace
+    # the directory itself. A replaced directory leaves every process whose cwd
+    # is the workspace (the sandbox session shell and everything it starts,
+    # e.g. code-server) inside a deleted directory, and they crash on getcwd.
+    # The marker moves last, so a partly installed tree is never marked hydrated.
+    if not os.path.exists(root):
+        os.mkdir(root, 0o755)
+    assert os.path.isdir(root) and not os.path.islink(root), 'workspace is not a directory'
+    # Never overwrite a warm, unmarked workspace or its unpersisted edits.
+    assert not os.listdir(root), 'workspace is not empty'
+    for name in sorted(n for n in os.listdir(stage) if n != '.ezil-hydrated.json'):
+        os.rename(os.path.join(stage, name), os.path.join(root, name))
+    staged_marker = os.path.join(stage, '.ezil-hydrated.json')
+    if os.path.exists(staged_marker):
+        os.rename(staged_marker, os.path.join(root, '.ezil-hydrated.json'))
+    os.rmdir(stage)
+
 def restore():
     archive = os.path.join(work, 'archive.tar')
     digest = hashlib.sha256()
@@ -234,10 +252,7 @@ def restore():
                 if m.isdir(): os.chmod(os.path.join(stage, m.name), m.mode)
         with open(os.path.join(stage, '.ezil-hydrated.json'), 'x') as f:
             json.dump(p['marker'], f)
-        # Never overwrite a warm, unmarked workspace or its unpersisted edits.
-        assert not os.path.exists(root) or (os.path.isdir(root) and not os.listdir(root)), 'workspace is not empty'
-        os.chmod(stage, 0o755)
-        os.replace(stage, root)
+        install(stage)
     finally:
         if os.path.exists(stage): shutil.rmtree(stage)
 
@@ -285,8 +300,7 @@ try:
         stage = p['stage']
         assert stage == root + '.ezil-legacy-' + os.path.basename(work)[len('ezil-snapshot-'):], 'invalid legacy staging path'
         if op == 'adopt':
-            assert not os.path.exists(root) or (os.path.isdir(root) and not os.listdir(root)), 'workspace is not empty'
-            os.replace(stage, root)
+            install(stage)
         elif os.path.exists(stage): shutil.rmtree(stage)
     elif op == 'cleanup': shutil.rmtree(work, ignore_errors=True)
     else: raise ValueError('unknown operation')
