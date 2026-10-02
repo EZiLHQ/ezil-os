@@ -31,8 +31,8 @@
 </div>
 
 > **Hosted status: deployed and live, and you should treat it as alpha.**
-> The hosted product is
-> **invite-only** while it is in this state, and the whole stack needs your
+> The hosted product is at **[os.ezil.org](https://os.ezil.org)** — sign up
+> with Google — and the whole stack needs your
 > own Cloudflare, Vercel and Supabase accounts to stand up, so cloning it for
 > the hosted path gets you a codebase to read and build against, not a
 > one-command demo. If you just want a real desktop today with none of that,
@@ -215,21 +215,12 @@ cd mcp && bun install && bun run typecheck && bun test
    building is reachable directly and not only through the streamed screen.
 7. The workspace is **hydrated from R2 at boot and flushed back as it changes**.
 
-**Access to the hosted product is invite-only.** Signing in requires an
-invitation — today at `https://ezil-os.vercel.app`; `os.ezil.work` is the
-canonical host but its DNS cutover is still pending, see
-[`docs/RUNBOOK.md`](docs/RUNBOOK.md). The gate itself is an authorization
-check rather than a signup switch — the Supabase project is shared with
-`app.ezil.work`, where
-builders must keep signing up, and anyone holding the public anon key can
-create a user directly regardless of any signup form. So the check lives
-where authorization already lives: one context
-(`app/src/server/api/trpc.ts`'s `protectedProcedure`) plus the three page
-gates, all reading the same `ezil_os_access` allow-list. Every `/api/shell/*`
-route and the bearer path resolve through that same context, so the SDK and
-the MCP connector are gated with no extra code. `tools/invite.ts` is the only
-sanctioned way onto the allow-list. Local mode has no login, no Supabase and
-no gate of any kind.
+**Anyone can sign up for the hosted product with Google.** The first
+"Continue with Google" creates the account; there is no allow-list. Every
+protected page, tRPC procedure and `/api/shell/*` route requires only a
+signed-in user (the cookie session, or `Authorization: Bearer` for the SDK and
+the MCP connector), and each computer is owner-checked. Local mode has no
+login, no Supabase and no gate of any kind.
 
 🔴 **The workspace is not an R2 mount, and that is the most expensive thing this
 project learned.** `/workspace` is plain container disk. Mounting R2 through

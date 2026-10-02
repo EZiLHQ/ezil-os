@@ -10,14 +10,12 @@ const initialState: AuthActionResult = {};
  * Sign IN only. There is no sign-up mode, no "Create account" toggle and no
  * `new-password` branch. See `actions.ts` and `entry-contract.test.ts`.
  *
- * How an account comes to exist depends on `EZIL_OS_ACCESS_MODE`:
- *   - `open` (`openSignup`): the first "Continue with Google" creates it. That
- *     happens inside Supabase's OAuth flow, not through any sign-up call here.
- *   - `invite`: `bun tools/invite.ts add <email>` creates it, and the invited
- *     user sets a password on `/auth/invited` or uses Google with the same
- *     address — the allow-list is keyed on the email either way.
+ * New accounts come from "Continue with Google": the first sign-in creates the
+ * account inside Supabase's OAuth flow, not through any sign-up call here.
+ * Email and password are for accounts that already have one (for example one
+ * created with `bun tools/invite.ts add <email>`).
  */
-export function LoginForm({ returnUrl, openSignup }: { returnUrl: string; openSignup: boolean }) {
+export function LoginForm({ returnUrl }: { returnUrl: string }) {
     /** Set once we have started leaving; keeps the button from re-arming. */
     const [leaving, setLeaving] = useState(false);
 
@@ -114,9 +112,7 @@ export function LoginForm({ returnUrl, openSignup }: { returnUrl: string; openSi
             </form>
 
             <p className="text-small text-gray-400">
-                {openSignup
-                    ? 'Email and password work for existing accounts. New accounts start with Continue with Google.'
-                    : 'EZiL OS is invite-only. If you do not have an account yet, ask a maintainer for an invitation.'}
+                Email and password work for existing accounts. New accounts start with Continue with Google.
             </p>
         </div>
     );

@@ -36,7 +36,6 @@ export function localEnvironment(status: LocalStatus): string {
         `SUPABASE_DATABASE_URL=${checked.DB_URL}`,
         `NEXT_PUBLIC_SUPABASE_URL=${checked.API_URL}`,
         `NEXT_PUBLIC_SUPABASE_ANON_KEY=${checked.ANON_KEY}`,
-        'EZIL_OS_ACCESS_MODE=invite',
         '',
     ].join('\n');
 }

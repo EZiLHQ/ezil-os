@@ -90,13 +90,11 @@ export async function signInWithPassword(formData: FormData): Promise<AuthAction
  * 🔴 THERE IS NO SIGN-UP ACTION, AND THAT IS THE PRODUCT RULE.
  *
  * `signUpWithPassword` used to live here and called `supabase.auth.signUp`.
- * EZiL OS is invite-only (`EZIL_OS_ACCESS_MODE`, default `invite`): an account
- * is created by `bun tools/invite.ts add <email>`, which writes the
- * `ezil_os_access` row and then asks Supabase to send an invite email. A
- * self-service sign-up form does not just duplicate that — it lets anyone
- * create an account on the shared Supabase project, which is a real cost
- * (rows in `auth.users`, email quota) even though the access gate would refuse
- * every one of them at `/os`.
+ * Anyone may use EZiL OS, but new accounts come from "Continue with Google",
+ * where Google has already verified the address. An email/password sign-up
+ * form would add unverified accounts and confirmation email to the shared
+ * Supabase project for no gain. Email/password accounts can still be created
+ * by `bun tools/invite.ts add <email>`, which sends a Supabase invite.
  *
  * `login/entry-contract.test.ts` fails if `auth.signUp(` reappears anywhere
  * under `app/src`. If self-service ever becomes the intent, that test is the
