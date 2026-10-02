@@ -73,7 +73,11 @@ export interface FlushOutcome {
   skippedUnsupported: number;
   failed: Array<{ relPath: string; error: string }>;
   manifest: FlushManifest;
-  skippedReason?: 'hydration_incomplete' | 'empty_prefix' | 'flush_threw';
+  /**
+   * 'too_large': the workspace exceeds the snapshot limits (512 MiB / 100,000
+   * entries). Permanent; callers must not wait for it to succeed.
+   */
+  skippedReason?: 'hydration_incomplete' | 'empty_prefix' | 'flush_threw' | 'deferred' | 'too_large';
   heartbeatWritten: boolean;
   checkpoint?: string;
 }
@@ -102,6 +106,13 @@ export interface FlushDeps {
   manifest: FlushManifest;
   hydrationComplete: boolean;
   log: (message: string) => void;
+  /**
+   * Rate limit: a CHANGED workspace is captured but not uploaded
+   * (skippedReason 'deferred'). Never applies to the first checkpoint. The
+   * caller enables it only for routine alarm cycles, never for readiness,
+   * teardown or idle-stop checkpoints.
+   */
+  deferIfChanged?: boolean;
 }
 
 export function parseSnapshot(raw: string): Snapshot {
@@ -147,8 +158,10 @@ async function readHead(bucket: Pick<HydrateR2BucketLike, 'get'>, prefix: string
   if (!body.etag) throw new Error('snapshot manifest etag missing');
   return { snapshot, etag: body.etag };
 }
+class SnapshotTooLargeError extends Error {}
 async function command(container: HydrateContainerLike, params: Record<string, unknown>) {
   const result = await container.exec(snapshotCommand(params), { timeout: 120_000 });
+  if (result.exitCode === 3 && params.op === 'capture') throw new SnapshotTooLargeError('workspace snapshot too large');
   if (result.exitCode !== 0) throw new Error(`workspace snapshot ${params.op} failed`);
   return result.stdout;
 }
@@ -178,6 +191,10 @@ export async function flushWorkspaceToR2(deps: FlushDeps): Promise<FlushOutcome>
     outcome.skippedUnsupported = Number.isInteger(skipped) ? skipped as number : 0;
     if (outcome.skippedUnsupported) log(`[workspace-persist] ${outcome.skippedUnsupported} unsupported entries (unsafe names, escaping links, special files) not checkpointed`);
     const snapshot = parseSnapshot(JSON.stringify({ ...captured, version: SNAPSHOT_VERSION, generation }));
+    if (deps.deferIfChanged && previous && previous.snapshot.sha256 !== snapshot.sha256) {
+      outcome.skippedReason = 'deferred';
+      return outcome; // `finally` still removes the staging directory
+    }
     if (previous?.snapshot.sha256 !== snapshot.sha256) {
       for (const [i, c] of snapshot.chunks.entries()) {
         const file = await container.readFile(`${work}/${i}`, { encoding: 'base64' });
@@ -216,9 +233,10 @@ export async function flushWorkspaceToR2(deps: FlushDeps): Promise<FlushOutcome>
     try {
       outcome.heartbeatWritten = !!await bucket.put(`${prefix}/${WORKSPACE_HEARTBEAT_FILENAME}`, encoder.encode(new Date().toISOString()));
     } catch { log('[workspace-persist] heartbeat failed after committed checkpoint'); }
-  } catch {
+  } catch (err) {
+    if (err instanceof SnapshotTooLargeError) outcome.skippedReason = 'too_large';
     // SDK/R2 errors and malformed JSON can contain file bytes or credentials.
-    const error = 'workspace checkpoint failed';
+    const error = err instanceof SnapshotTooLargeError ? 'workspace too large to checkpoint' : 'workspace checkpoint failed';
     log(`[workspace-persist] ${error}`);
     outcome.failed.push({ relPath: SNAPSHOT_HEAD, error });
   } finally {

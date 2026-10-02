@@ -59,7 +59,7 @@ export interface WorkspacePutResult {
 }
 
 export interface WorkspaceListResult {
-  objects: Array<{ key: string; size: number; etag: string }>;
+  objects: Array<{ key: string; size: number; etag: string; uploaded?: Date }>;
   truncated: boolean;
   cursor?: string;
 }
@@ -68,10 +68,17 @@ export interface WorkspacePutOptions {
   onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string };
 }
 
+export interface WorkspaceGetOptions {
+  /** Partial read (large legacy objects). `size` on the result stays the WHOLE object's size, as on R2. */
+  range?: { offset: number; length: number };
+}
+
 export interface WorkspaceStore {
-  get(key: string): Promise<WorkspaceObjectBody | null>;
+  get(key: string, options?: WorkspaceGetOptions): Promise<WorkspaceObjectBody | null>;
   put(key: string, value: Uint8Array | string, options?: WorkspacePutOptions): Promise<WorkspacePutResult | null>;
   list(options: { prefix: string; cursor?: string; limit?: number }): Promise<WorkspaceListResult>;
+  /** Used only by checkpoint garbage collection (never by the put-only flush). */
+  delete(keys: string[]): Promise<unknown>;
 }
 
 /** Injectable `fetch` (tests inject an in-process fake S3 HTTP handler). */
@@ -152,9 +159,23 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
   return Array.from(digest).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+const DRAIN_LIMIT_BYTES = 64 * 1024;
 async function drain(res: Response): Promise<void> {
+  // Read small (error/empty) bodies to the end so the connection can be
+  // reused cleanly; only an unexpectedly large body is cancelled.
   try {
-    await res.body?.cancel();
+    const reader = res.body?.getReader();
+    if (!reader) return;
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      total += value?.byteLength ?? 0;
+      if (total > DRAIN_LIMIT_BYTES) {
+        await reader.cancel();
+        return;
+      }
+    }
   } catch {
     /* best-effort */
   }
@@ -236,10 +257,16 @@ export class S3WorkspaceStore implements WorkspaceStore {
     return this.fetchImpl(signed);
   }
 
-  async get(key: string): Promise<WorkspaceObjectBody | null> {
+  async get(key: string, options?: WorkspaceGetOptions): Promise<WorkspaceObjectBody | null> {
     // Accept-Encoding: identity so no edge/transfer compression can strip the
     // Content-Length we rely on (see docs/PLATFORM-NOTES for the R2 HEAD case).
-    const res = await this.send('GET', this.objectUrl(key), { 'accept-encoding': 'identity' });
+    const range = options?.range;
+    if (range && (!Number.isInteger(range.offset) || range.offset < 0 || !Number.isInteger(range.length) || range.length <= 0)) {
+      throw new Error('workspace store invalid range');
+    }
+    const headers: Record<string, string> = { 'accept-encoding': 'identity' };
+    if (range) headers['range'] = `bytes=${range.offset}-${range.offset + range.length - 1}`;
+    const res = await this.send('GET', this.objectUrl(key), headers);
     if (res.status === 404) {
       await drain(res);
       return null;
@@ -269,7 +296,24 @@ export class S3WorkspaceStore implements WorkspaceStore {
       throw new Error('workspace store content-length mismatch');
     }
     const etag = normalizeEtag(etagRaw);
+    if (range) {
+      // 206 + `Content-Range: bytes a-b/total`: report the whole object's size (R2 semantics).
+      const total = res.status === 206 ? /\/(\d+)\s*$/.exec(res.headers.get('content-range') ?? '')?.[1] : undefined;
+      if (total === undefined) throw new Error('workspace store range not honoured');
+      return { etag, size: Number(total), arrayBuffer: async () => buf };
+    }
     return { etag, size, arrayBuffer: async () => buf };
+  }
+
+  async delete(keys: string[]): Promise<void> {
+    // One DeleteObject per key: DeleteObjects needs Content-MD5/checksums and GC is rare and bounded.
+    for (const key of keys) {
+      const res = await this.send('DELETE', this.objectUrl(key), {});
+      await drain(res);
+      if (res.status !== 204 && res.status !== 200 && res.status !== 404) {
+        throw new Error(`workspace store delete failed (status ${res.status})`);
+      }
+    }
   }
 
   async put(key: string, value: Uint8Array | string, options?: WorkspacePutOptions): Promise<WorkspacePutResult | null> {
@@ -342,12 +386,15 @@ export class S3WorkspaceStore implements WorkspaceStore {
       if (!keyMatch) continue;
       const sizeMatch = block.match(/<Size>\s*(\d+)\s*<\/Size>/);
       const etagMatch = block.match(/<ETag>([\s\S]*?)<\/ETag>/);
+      const modifiedMatch = block.match(/<LastModified>([\s\S]*?)<\/LastModified>/);
       // `encoding-type=url` means the key is percent-encoded in the XML; XML
       // entities (if any) are decoded first, then the percent-encoding.
       const key = this.stripKeyPrefix(decodeS3Key(decodeXmlEntities(keyMatch[1])));
       const size = sizeMatch ? Number(sizeMatch[1]) : Number.NaN;
       const etag = etagMatch ? normalizeEtag(decodeXmlEntities(etagMatch[1].trim())) : '';
-      objects.push({ key, size: Number.isInteger(size) ? size : 0, etag });
+      const uploaded = modifiedMatch ? new Date(modifiedMatch[1].trim()) : undefined;
+      objects.push({ key, size: Number.isInteger(size) ? size : 0, etag,
+        ...(uploaded && !Number.isNaN(uploaded.getTime()) ? { uploaded } : {}) });
     }
     return { objects, truncated, cursor: truncated ? cursor : undefined };
   }
@@ -496,8 +543,13 @@ export class MigratingWorkspaceStore implements WorkspaceStore {
     return (await this.route(prefix)) === 's3' ? this.s3 : this.r2;
   }
 
-  async get(key: string): Promise<WorkspaceObjectBody | null> {
-    return (await this.readStore(key)).get(key);
+  async get(key: string, options?: WorkspaceGetOptions): Promise<WorkspaceObjectBody | null> {
+    return (await this.readStore(key)).get(key, options);
+  }
+
+  // GC deletes only from S3. The legacy R2 copy is never modified.
+  async delete(keys: string[]): Promise<unknown> {
+    return this.s3.delete(keys);
   }
 
   async list(options: { prefix: string; cursor?: string; limit?: number }): Promise<WorkspaceListResult> {
@@ -517,23 +569,25 @@ export class MigratingWorkspaceStore implements WorkspaceStore {
 // provided for completeness and type-fit but never called on the R2 side.
 
 interface R2BucketLike {
-  get(key: string): Promise<{ etag: string; size: number; arrayBuffer(): Promise<ArrayBuffer> } | null>;
+  get(key: string, options?: WorkspaceGetOptions): Promise<{ etag: string; size: number; arrayBuffer(): Promise<ArrayBuffer> } | null>;
   put(
     key: string,
     value: Uint8Array | string,
     options?: WorkspacePutOptions,
   ): Promise<{ key: string; etag: string } | null>;
   list(options: { prefix: string; cursor?: string; limit?: number }): Promise<{
-    objects: Array<{ key: string; size: number; etag: string }>;
+    objects: Array<{ key: string; size: number; etag: string; uploaded?: Date }>;
     truncated: boolean;
     cursor?: string;
   }>;
+  /** The R2 binding's own delete (string or batch of up to 1,000 keys). */
+  delete(keys: string | string[]): Promise<unknown>;
 }
 
 export function r2AsWorkspaceStore(r2: R2BucketLike): WorkspaceStore {
   return {
-    async get(key) {
-      const o = await r2.get(key);
+    async get(key, options) {
+      const o = await r2.get(key, options);
       if (!o) return null;
       // Lazy body: the caller (readBounded) refuses an unknown/over-limit size
       // from `o.size` BEFORE any bytes are buffered — matching the pure-R2 path,
@@ -547,10 +601,13 @@ export function r2AsWorkspaceStore(r2: R2BucketLike): WorkspaceStore {
     async list(options) {
       const r = await r2.list(options);
       return {
-        objects: r.objects.map((x) => ({ key: x.key, size: x.size, etag: normalizeEtag(x.etag) })),
+        objects: r.objects.map((x) => ({ key: x.key, size: x.size, etag: normalizeEtag(x.etag), ...(x.uploaded ? { uploaded: x.uploaded } : {}) })),
         truncated: r.truncated,
         cursor: r.cursor,
       };
+    },
+    async delete() {
+      throw new Error('the legacy R2 store is read-only during migration');
     },
   };
 }

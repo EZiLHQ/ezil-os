@@ -510,7 +510,7 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
   it('probes the container for work BEFORE the final flush and BEFORE the stop', () => {
     const idleBranch = between(
       'if (isIdleStopDue({ lastActivityAt, now })) {',
-      "const outcome = await this.runWorkspaceFlush('alarm');\n    const nextIntervalSeconds",
+      "const outcome = await this.runWorkspaceFlush('alarm', { allowDefer: true });\n    const nextIntervalSeconds",
     );
     const probeIdx = idleBranch.indexOf('await this.probeContainerBusy()');
     const flushIdx = idleBranch.indexOf("await this.runWorkspaceFlush('alarm')");
@@ -581,14 +581,14 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
     // "Retuning it".
     const idleBranch = between(
       'if (isIdleStopDue({ lastActivityAt, now })) {',
-      "const outcome = await this.runWorkspaceFlush('alarm');\n    const nextIntervalSeconds",
+      "const outcome = await this.runWorkspaceFlush('alarm', { allowDefer: true });\n    const nextIntervalSeconds",
     );
     expect(idleBranch).toContain('idle_but_busy,${busy.detail}');
     expect(idleBranch).toContain('idle_stop,${busy.detail}');
   });
 
   it('the idle-stop path calls stop(), never destroy() — a NEW state, not explicit termination', () => {
-    const idleBranch = between('if (isIdleStopDue({ lastActivityAt, now })) {', 'const outcome = await this.runWorkspaceFlush(\'alarm\');\n    const nextIntervalSeconds');
+    const idleBranch = between('if (isIdleStopDue({ lastActivityAt, now })) {', 'const outcome = await this.runWorkspaceFlush(\'alarm\', { allowDefer: true });\n    const nextIntervalSeconds');
     expect(idleBranch).toContain('await this.stop()');
     expect(idleBranch).not.toContain('this.destroy()');
     expect(idleBranch).not.toContain('super.destroy()');
@@ -599,7 +599,7 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
   it('the idle-stop success path does NOT write WORKSPACE_TERMINATED_KEY (idle-stop is not explicit termination)', () => {
     const idleBranch = between(
       'if (isIdleStopDue({ lastActivityAt, now })) {',
-      'const outcome = await this.runWorkspaceFlush(\'alarm\');\n    const nextIntervalSeconds',
+      'const outcome = await this.runWorkspaceFlush(\'alarm\', { allowDefer: true });\n    const nextIntervalSeconds',
     );
     // The identifier legitimately appears in an explanatory CODE COMMENT
     // ("A NEW, separate state from `WORKSPACE_TERMINATED_KEY`...") — the
@@ -613,9 +613,13 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
   it('only stops the container when the FINAL flush outcome.ok is true — an else branch retries instead of stopping', () => {
     const idleBranch = between(
       'if (isIdleStopDue({ lastActivityAt, now })) {',
-      'const outcome = await this.runWorkspaceFlush(\'alarm\');\n    const nextIntervalSeconds',
+      'const outcome = await this.runWorkspaceFlush(\'alarm\', { allowDefer: true });\n    const nextIntervalSeconds',
     );
-    expect(idleBranch).toContain('if (outcome.ok) {');
+    // The only exception to "stop only on a successful FINAL flush" is the
+    // permanent too_large outcome (never retryable; refusing would bill forever).
+    expect(idleBranch).toContain("if (outcome.ok || outcome.skippedReason === 'too_large') {");
+    // The idle-stop FINAL flush is never rate-limited (no allowDefer here).
+    expect(idleBranch).not.toContain('allowDefer');
     // The failure path must reschedule (retry) rather than fall through to a
     // stop. It must also not be backed off (uses the base interval).
     expect(idleBranch).toContain('idle_final_flush_failed');
@@ -629,7 +633,7 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
   it('the idle branch triggers the flush with trigger=\'alarm\', never \'explicit\' (must not bump LAST_ACTIVITY_AT_KEY)', () => {
     const idleBranch = between(
       'if (isIdleStopDue({ lastActivityAt, now })) {',
-      'const outcome = await this.runWorkspaceFlush(\'alarm\');\n    const nextIntervalSeconds',
+      'const outcome = await this.runWorkspaceFlush(\'alarm\', { allowDefer: true });\n    const nextIntervalSeconds',
     );
     expect(idleBranch).toContain(`this.runWorkspaceFlush('alarm')`);
     expect(idleBranch).not.toContain(`this.runWorkspaceFlush('explicit')`);
@@ -655,7 +659,7 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
     // its OWN reschedule seconds rather than hardcoding
     // WORKSPACE_FLUSH_INTERVAL_SECONDS the way the old, pre-idle-stop version
     // did unconditionally.
-    const tail = method.slice(method.lastIndexOf(`const outcome = await this.runWorkspaceFlush('alarm');\n    const nextIntervalSeconds`));
+    const tail = method.slice(method.lastIndexOf(`const outcome = await this.runWorkspaceFlush('alarm', { allowDefer: true });\n    const nextIntervalSeconds`));
     expect(tail).toContain('this.nextFlushRescheduleSeconds(outcome, lastActivityAt)');
     expect(tail).toContain('await this.schedule(nextIntervalSeconds, WORKSPACE_FLUSH_CALLBACK)');
   });
@@ -694,7 +698,7 @@ describe('LAST_ACTIVITY_AT_KEY is bumped only by genuine, caller-initiated paths
 
   it('runWorkspaceFlush bumps activity ONLY on the explicit trigger, never the alarm trigger', () => {
     const method = between(
-      `private async runWorkspaceFlush(trigger: 'alarm' | 'explicit'): Promise<FlushOutcome> {`,
+      `private async runWorkspaceFlush(trigger: 'alarm' | 'explicit', options?: { allowDefer?: boolean }): Promise<FlushOutcome> {`,
       '\n    const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);',
     );
     expect(method).toContain(`if (trigger === 'explicit') {`);

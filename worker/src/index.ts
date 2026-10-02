@@ -491,6 +491,8 @@ import {
   SNAPSHOT_HEAD,
   type FlushOutcome,
   type FlushManifest,
+  collectSupersededSnapshots,
+  type GcR2BucketLike,
 } from './workspace-persist';
 import {
   resolveWorkspaceStore,
@@ -1783,6 +1785,12 @@ const WORKSPACE_FLUSH_LAST_SEEN_ACTIVITY_AT_KEY = 'ezil:workspaceFlushLastSeenAc
 
 /** Current reschedule interval (seconds) for the self-perpetuating flush loop — see `computeNextFlushBackoffSeconds`. */
 const WORKSPACE_FLUSH_BACKOFF_SECONDS_KEY = 'ezil:workspaceFlushBackoffSeconds';
+/** When a checkpoint last uploaded chunks (routine changed checkpoints are rate-limited against it). */
+const WORKSPACE_LAST_UPLOAD_AT_KEY = 'ezil:workspaceLastUploadAt';
+const MIN_CHANGED_CHECKPOINT_MS = 60_000;
+/** When superseded checkpoint generations were last collected. */
+const WORKSPACE_LAST_GC_AT_KEY = 'ezil:workspaceLastGcAt';
+const SNAPSHOT_GC_INTERVAL_MS = 15 * 60_000;
 
 /**
  * Backstop ceiling (ms) for `terminateSandbox()`'s primary confirmation
@@ -2285,14 +2293,21 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         const result = await ensureWorkspaceHydratedFromR2(this, store.store, params.mountPath, params.prefix);
         if (!result.mounted) return result;
         const checkpoint = await this.runWorkspaceFlush('explicit');
-        return checkpoint.ok ? result : { mounted: false, detail: 'workspace_checkpoint_failed' };
+        if (checkpoint.ok) return result;
+        // Over the snapshot limits the workspace can never checkpoint; locking
+        // the user out would be permanent. Open it, visibly unsaved.
+        if (checkpoint.skippedReason === 'too_large') {
+          console.error('[workspace_flush] workspace exceeds snapshot limits; opened without durable checkpoints');
+          return { ...result, detail: 'workspace_too_large_unsaved' };
+        }
+        return { mounted: false, detail: 'workspace_checkpoint_failed' };
       } catch {
         return { mounted: false, detail: 'workspace_checkpoint_failed' };
       }
     });
   }
 
-  private async runWorkspaceFlush(trigger: 'alarm' | 'explicit'): Promise<FlushOutcome> {
+  private async runWorkspaceFlush(trigger: 'alarm' | 'explicit', options?: { allowDefer?: boolean }): Promise<FlushOutcome> {
     const t0 = Date.now();
     bootLog('workspace_flush', 'start', { detail: `trigger=${trigger}` });
     if (!this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)) {
@@ -2333,6 +2348,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
     const manifest: FlushManifest = {};
     let outcome: FlushOutcome;
+    // Each changed checkpoint uploads the WHOLE workspace, so routine alarm
+    // cycles upload at most once per MIN_CHANGED_CHECKPOINT_MS.
+    const lastUploadAt = (await this.ctx.storage.get<number>(WORKSPACE_LAST_UPLOAD_AT_KEY)) ?? 0;
+    const deferIfChanged = !!options?.allowDefer && Date.now() - lastUploadAt < MIN_CHANGED_CHECKPOINT_MS;
     try {
       outcome = await flushWorkspaceToR2({
         container: this,
@@ -2341,6 +2360,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         realPrefix: wctx.prefix,
         manifest,
         hydrationComplete: hydrated,
+        deferIfChanged,
         log: (message) => console.error(`[workspace_flush] ${message}`),
       });
     } catch (err) {
@@ -2388,7 +2408,27 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         console.error(`[workspace_flush] upload_failed relPath=${f.relPath} error=${f.error}`);
       }
     }
+    if (outcome.ok && outcome.uploaded.length > 0) await this.ctx.storage.put(WORKSPACE_LAST_UPLOAD_AT_KEY, Date.now());
+    if (outcome.ok) await this.collectSnapshotGarbage(bucket, wctx.prefix);
     return outcome;
+  }
+
+  /** Superseded checkpoint generations, at most once per SNAPSHOT_GC_INTERVAL_MS. Never fails the flush. */
+  private async collectSnapshotGarbage(bucket: unknown, prefix: string): Promise<void> {
+    const lastGcAt = (await this.ctx.storage.get<number>(WORKSPACE_LAST_GC_AT_KEY)) ?? 0;
+    if (Date.now() - lastGcAt < SNAPSHOT_GC_INTERVAL_MS) return;
+    await this.ctx.storage.put(WORKSPACE_LAST_GC_AT_KEY, Date.now());
+    try {
+      const gc = await collectSupersededSnapshots({
+        bucket: bucket as GcR2BucketLike,
+        realPrefix: prefix,
+        log: (message) => console.error(`[workspace_gc] ${message}`),
+      });
+      bootLog('workspace_gc', 'end', { status: gc.ok ? 'ok' : 'error',
+        detail: `deletedGenerations=${gc.deletedGenerations},deletedObjects=${gc.deletedObjects},keptRecent=${gc.keptRecent}` });
+    } catch {
+      console.error('[workspace_gc] garbage collection threw (ignored)');
+    }
   }
 
   /**
@@ -2617,7 +2657,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // Trigger stays `'alarm'` — this must NOT bump `LAST_ACTIVITY_AT_KEY`,
       // idle-triggered or not.
       const outcome = await this.runWorkspaceFlush('alarm');
-      if (outcome.ok) {
+      // 'too_large' is permanent: refusing to stop would keep (and bill) the
+      // container forever without ever saving more. The last committed
+      // checkpoint stays authoritative.
+      if (outcome.ok || outcome.skippedReason === 'too_large') {
         // A real input heartbeat may arrive during the checkpoint's R2 I/O.
         // Keep that newly active desktop up and checkpoint again next cycle.
         if (await this.ctx.storage.get<number>(LAST_ACTIVITY_AT_KEY) !== lastActivityAt) {
@@ -2663,7 +2706,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       return;
     }
 
-    const outcome = await this.runWorkspaceFlush('alarm');
+    const outcome = await this.runWorkspaceFlush('alarm', { allowDefer: true });
     const nextIntervalSeconds = await this.nextFlushRescheduleSeconds(outcome, lastActivityAt);
     try {
       await this.schedule(nextIntervalSeconds, WORKSPACE_FLUSH_CALLBACK);
@@ -2689,7 +2732,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
     const nextSeconds = computeNextFlushBackoffSeconds({
       previousIntervalSeconds,
-      wroteSomething: outcome.uploaded.length > 0,
+      // A deferred change is pending work: keep the base cadence so it uploads right after the window.
+      wroteSomething: outcome.uploaded.length > 0 || outcome.skippedReason === 'deferred',
       activityAdvanced: lastActivityAtAtCycleStart > previousActivitySeen,
     });
 
@@ -2842,7 +2886,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // A failed final flush is a refusal, never permission to discard disk.
       let checkpoint: FlushOutcome | undefined;
       try { checkpoint = await this.runWorkspaceFlush('explicit'); } catch { /* refuse below */ }
-      if (!checkpoint?.ok) {
+      // A workspace over the snapshot limits can never checkpoint; refusing
+      // would retry (and bill) forever. Every other failure still refuses.
+      if (checkpoint?.skippedReason === 'too_large') {
+        console.error('[terminateSandbox] workspace exceeds snapshot limits; terminating on the last committed checkpoint');
+      } else if (!checkpoint?.ok) {
         // Do not tombstone or cancel retries on a persistence failure.
         return { ok: false, terminated: false, stopped: false, outcome: 'flush_failed',
           wasRunning: true, runningAfter: this.containerIsRunning(), error: 'workspace_checkpoint_failed' };

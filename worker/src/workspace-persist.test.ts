@@ -422,3 +422,24 @@ describe('garbage collection of superseded checkpoint generations', () => {
     expect(out.ok).toBe(false); expect(bucket.deleted).toEqual([]);
   });
 });
+
+describe('rate-limited routine checkpoints (deferIfChanged)', () => {
+  const flushDeferred = (root: string, bucket: Bucket) => flushWorkspaceToR2({ container, bucket, mountPath: root, realPrefix: prefix, hydrationComplete: true, manifest: {}, log, deferIfChanged: true });
+  it('never defers the first checkpoint, defers a changed one without touching storage, and still confirms an unchanged one', async () => {
+    const { root } = await workspace(); const bucket = new Bucket();
+    await writeFile(`${root}/a.txt`, 'v1');
+    const first = await flushDeferred(root, bucket);
+    expect(first.ok).toBe(true); expect(first.skippedReason).toBeUndefined();
+    const head = bucket.data.get(headKey)!.etag; const puts = bucket.puts.length;
+    await writeFile(`${root}/a.txt`, 'v2');
+    const deferred = await flushDeferred(root, bucket);
+    expect(deferred).toMatchObject({ ok: false, skippedReason: 'deferred', uploaded: [] });
+    expect(bucket.puts.length).toBe(puts); expect(bucket.data.get(headKey)!.etag).toBe(head);
+    await writeFile(`${root}/a.txt`, 'v1');
+    const unchanged = await flushDeferred(root, bucket);
+    expect(unchanged.ok).toBe(true); expect(unchanged.uploaded).toEqual([]);
+    await writeFile(`${root}/a.txt`, 'v3');
+    const committed = await flush(root, bucket);       // not deferred: readiness/teardown/idle-stop path
+    expect(committed.ok).toBe(true); expect(committed.uploaded.length).toBeGreaterThan(0);
+  });
+});

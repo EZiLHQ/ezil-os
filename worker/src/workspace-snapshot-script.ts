@@ -290,6 +290,13 @@ try:
         elif os.path.exists(stage): shutil.rmtree(stage)
     elif op == 'cleanup': shutil.rmtree(work, ignore_errors=True)
     else: raise ValueError('unknown operation')
+except AssertionError as e:
+    # A size/entry limit is permanent (retrying cannot help): its own exit code.
+    if op == 'capture' and str(e) in ('snapshot byte limit', 'snapshot entry limit', 'Git index byte limit', 'Git paths byte limit'):
+        print('workspace snapshot too large', file=sys.stderr)
+        sys.exit(3)
+    print('workspace snapshot failed: ' + type(e).__name__, file=sys.stderr)
+    sys.exit(1)
 except Exception as e:
     # No file contents, Git config, environment, or credentials in errors.
     print('workspace snapshot failed: ' + type(e).__name__, file=sys.stderr)

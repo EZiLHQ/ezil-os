@@ -84,15 +84,18 @@ class R2Fake implements Store {
 async function makeStore(): Promise<Store> {
   if (process.env.EZIL_CHECKPOINT_STORE !== 's3') return new R2Fake();
   // Same assertions through the S3 adapter (feat/persistent-compute-s3-adapter).
-  const mod = await import('./workspace-store-s3' as string);
-  const inner = mod.createS3WorkspaceStore({
+  const { S3WorkspaceStore } = await import('./workspace-store-s3');
+  const inner = new S3WorkspaceStore({
     endpoint: process.env.EZIL_CHECKPOINT_S3_ENDPOINT, bucket: process.env.EZIL_CHECKPOINT_S3_BUCKET!,
     region: process.env.EZIL_CHECKPOINT_S3_REGION ?? 'us-east-1',
     accessKeyId: process.env.EZIL_CHECKPOINT_S3_ACCESS_KEY_ID!, secretAccessKey: process.env.EZIL_CHECKPOINT_S3_SECRET_ACCESS_KEY!,
     keyPrefix: `${RUN_ID}/`,
-  }) as FlushR2BucketLike & HydrateR2BucketLike;
+    // Test-environment only: Bun's pooled connection stalls on the request after
+    // a 404 from moto's development server. No connection reuse avoids it.
+    fetchImpl: (req: Request) => fetch(req, { keepalive: false } as RequestInit),
+  });
   const store: Store = {
-    get: k => inner.get(k), list: o => inner.list(o),
+    get: (k, o) => inner.get(k, o), list: o => inner.list(o), delete: keys => inner.delete(keys),
     put: async (k, b, o) => { await store.beforePut?.(k); return store.failPutFor?.(k) ? null : inner.put(k, b, o); },
     corrupt: async (k) => {
       const body = await inner.get(k); const b = new Uint8Array(await body!.arrayBuffer()); b[b.length >> 1] ^= 0xff;
@@ -397,10 +400,13 @@ describe.skipIf(!imagePresent)(`persistent compute: checkpoint survives real con
     expect((await must(b, 'cd /workspace && ls -A | grep -v "^.ezil" | LC_ALL=C sort')).trim().split('\n')).toEqual(['keep.txt', 'ok-link']);
   }, T);
 
-  it('FINDING: a workspace over the 512 MiB snapshot limit still cannot checkpoint (readiness must degrade, not 503)', async () => {
+  it('a workspace over the 512 MiB snapshot limit fails as the distinct, permanent too_large (readiness/idle-stop/teardown degrade on it)', async () => {
     const store = await makeStore();
     const b = await startComputer('lim-b'); const p2 = prefixFor('big');
     await must(b, 'mkdir -p /workspace && head -c 540000000 /dev/urandom > /workspace/huge.bin'); await markHydrated(b, p2);
-    expect((await flush(b, store, p2)).ok).toBe(false);
+    const out = await flush(b, store, p2);
+    expect(out.ok).toBe(false);
+    expect(out.skippedReason).toBe('too_large');
+    expect((await store.list({ prefix: `${p2}/` })).objects).toEqual([]);   // nothing half-written
   }, T);
 });
