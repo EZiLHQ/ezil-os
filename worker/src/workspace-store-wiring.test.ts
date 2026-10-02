@@ -174,6 +174,23 @@ describe('ensureWorkspaceMount store gate', () => {
     expect(sandbox.calls.hydrate[0].prefix).toBe('/fixed/scope');
   });
 
+  it('store=s3 with NO R2 binding still takes the persist path (not s3fs, not unconfigured)', async () => {
+    // Without the s3 gate this env resolves to no mount config at all
+    // (workspace_bucket_not_configured) or the s3fs fallback — this proves the
+    // gate routes a pure-S3 deployment to hydrate.
+    const ensureWorkspaceMount = await loadMount();
+    const sandbox = fakeSandbox();
+    const res = await ensureWorkspaceMount(
+      sandbox as never,
+      { EZIL_WORKSPACE_STORE: 's3', ...S3_VARS } as never, // no R2 binding, no legacy mount vars
+      { projectId: 'p1', branch: 'main' } as never,
+    );
+    expect(res.mounted).toBe(true);
+    expect(sandbox.calls.hydrate.length).toBe(1);
+    expect(sandbox.calls.mount).toBe(0);
+    expect(res.detail).not.toBe('workspace_bucket_not_configured');
+  });
+
   it('a misconfigured store fails closed and mounts nothing', async () => {
     const ensureWorkspaceMount = await loadMount();
     const sandbox = fakeSandbox();
