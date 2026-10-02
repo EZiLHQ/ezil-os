@@ -55,7 +55,7 @@ const browser = await chromium.launch({ args: ['--use-gl=swiftshader', '--enable
 try {
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const p = await ctx.newPage();
-  await p.goto(`${APP}/login`, { waitUntil: 'domcontentloaded' });
+  await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
   await p.fill('#email', EMAIL); await p.fill('#password', PASS);
   await Promise.all([
     p.waitForURL((u) => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),

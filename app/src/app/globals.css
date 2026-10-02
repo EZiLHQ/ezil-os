@@ -38,3 +38,204 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* ── /login: the lock screen ─────────────────────────────────────────────────
+   The sign-in page is drawn as a computer's lock screen on the same "Horizon"
+   wallpaper the desktop boots with, so signing in feels like unlocking the
+   machine rather than leaving a website for an app. 🔴 The five layers must
+   stay identical to the `horizon` preset in
+   `shell/ezil/ui/Settings/tabs/appearance.js` and to `.desktop.ezil-desktop`
+   in `shell/ezil/ui/ezil-shell.css`; change all three together. */
+.ezil-lock-wallpaper {
+  background-color: #04060c;
+  background-image:
+    radial-gradient(24% 6% at 50% 91.2%, rgba(255, 200, 150, 0.6) 0%, rgba(255, 150, 100, 0.18) 55%, rgba(255, 150, 100, 0) 100%),
+    radial-gradient(150% 72% at 50% 138%, #04060c 0%, #04060c 62%, rgba(0, 200, 208, 0.72) 63.1%, rgba(96, 110, 255, 0.38) 65.4%, rgba(112, 86, 255, 0.1) 70%, rgba(112, 86, 255, 0) 78%),
+    radial-gradient(55% 45% at 82% 6%, rgba(0, 190, 200, 0.4) 0%, rgba(0, 190, 200, 0) 62%),
+    radial-gradient(50% 55% at 8% 22%, rgba(112, 86, 255, 0.34) 0%, rgba(112, 86, 255, 0) 64%),
+    linear-gradient(180deg, #0a0e1d 0%, #070a14 50%, #04060c 100%);
+}
+
+/* Keep the wallpaper fixed while an expanded form scrolls on short screens. */
+.ezil-lock {
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  grid-template-rows: minmax(12rem, 1fr) auto minmax(4rem, 1fr);
+  justify-items: center;
+  min-height: 100svh;
+  min-height: 100dvh;
+  padding: 1.5rem max(1.25rem, env(safe-area-inset-right)) max(1.5rem, env(safe-area-inset-bottom)) max(1.25rem, env(safe-area-inset-left));
+  color: #fff;
+  color-scheme: dark;
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+}
+
+.ezil-lock-wallpaper {
+  position: fixed;
+  z-index: -1;
+  inset: 0;
+  pointer-events: none;
+}
+
+.ezil-lock-wallpaper::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse at 50% 46%, rgba(122, 147, 204, 0.07), transparent 48%);
+}
+
+.ezil-lock-brand {
+  position: absolute;
+  top: max(1.5rem, env(safe-area-inset-top));
+  left: max(1.5rem, env(safe-area-inset-left));
+}
+
+.ezil-lock-clock {
+  align-self: start;
+  padding-top: clamp(2.25rem, 5vh, 4rem);
+  text-align: center;
+  color: rgba(255, 255, 255, 0.88);
+}
+
+.ezil-lock-date { min-height: 1.5rem; font-size: 1rem; font-weight: 500; }
+.ezil-lock-time {
+  min-height: 7rem;
+  font-size: clamp(5rem, 10vw, 7rem);
+  font-weight: 550;
+  line-height: 1;
+  letter-spacing: -0.055em;
+  font-variant-numeric: tabular-nums;
+}
+
+.ezil-lock-profile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+  max-width: 22rem;
+  text-align: center;
+  animation: ezil-lock-rise 600ms ease-out both;
+}
+
+.ezil-lock-avatar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  width: 6.5rem;
+  height: 6.5rem;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 50%;
+  background: linear-gradient(145deg, rgba(216, 227, 255, 0.2), rgba(144, 161, 202, 0.06));
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.18), 0 12px 36px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(16px);
+}
+
+.ezil-lock-title { margin-top: 1.5rem; font-size: 1.5rem; font-weight: 600; letter-spacing: -0.035em; }
+.ezil-lock-auth { width: 100%; max-width: 19rem; margin-top: 1.75rem; }
+
+.ezil-lock-google,
+.ezil-lock-password {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.625rem;
+  width: 100%;
+  min-height: 3rem;
+  border: 1px solid rgba(255, 255, 255, 0.75);
+  border-radius: 999px;
+  padding: 0.625rem 1rem;
+  background: #f5f6fa;
+  color: #101525;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.18);
+  transition: background 160ms, box-shadow 160ms;
+}
+
+.ezil-lock-google:hover:not(:disabled),
+.ezil-lock-password:hover:not(:disabled) { background: #fff; box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3); }
+.ezil-lock button:not(:disabled) { cursor: pointer; }
+.ezil-lock button:disabled { cursor: wait; opacity: 0.65; }
+.ezil-lock :is(a, button, input):focus-visible { outline: 2px solid #b6e9f0; outline-offset: 4px; }
+
+.ezil-lock-disclosure {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  min-height: 2.75rem;
+  margin-top: 0.5rem;
+  padding: 0.5rem;
+  border-radius: 0.375rem;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 0.8125rem;
+}
+.ezil-lock-disclosure:hover:not(:disabled) { color: #fff; }
+
+.ezil-lock-email {
+  margin-top: 0.75rem;
+  padding: 1.25rem;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 1.25rem;
+  background: rgba(14, 20, 35, 0.8);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.15);
+  backdrop-filter: blur(20px);
+  text-align: left;
+}
+.ezil-lock-input {
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 0.5rem;
+  background: rgba(0, 0, 0, 0.24);
+  color: #fff;
+  font-size: 1rem;
+}
+.ezil-lock-password { margin-top: 1rem; min-height: 2.75rem; border-radius: 0.5rem; }
+.ezil-lock-error {
+  width: 100%;
+  margin-top: 1rem;
+  padding: 0.625rem 0.875rem;
+  border: 1px solid rgba(253, 164, 175, 0.25);
+  border-radius: 0.75rem;
+  background: rgba(63, 17, 31, 0.8);
+  color: #fecdd3;
+  font-size: 0.8125rem;
+  text-align: center;
+}
+.ezil-lock-footer { align-self: end; padding-top: 1.5rem; color: rgba(255, 255, 255, 0.65); font-size: 0.75rem; text-align: center; }
+
+@keyframes ezil-lock-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (max-width: 480px), (max-height: 740px) {
+  .ezil-lock { grid-template-rows: minmax(10rem, 1fr) auto minmax(3rem, 1fr); }
+  .ezil-lock-time { min-height: 5rem; font-size: 5rem; }
+  .ezil-lock-avatar { width: 5.5rem; height: 5.5rem; }
+  .ezil-lock-title { margin-top: 1.125rem; font-size: 1.375rem; }
+  .ezil-lock-auth { margin-top: 1.25rem; }
+}
+
+@media (max-height: 540px) {
+  .ezil-lock { grid-template-rows: auto auto auto; gap: 1rem; padding-top: 2.5rem; padding-bottom: max(1rem, env(safe-area-inset-bottom)); }
+  .ezil-lock-brand { top: max(1rem, env(safe-area-inset-top)); }
+  .ezil-lock-clock { padding-top: 0; }
+  .ezil-lock-date { font-size: 0.8125rem; min-height: 1.25rem; }
+  .ezil-lock-time { min-height: 2.75rem; font-size: 2.75rem; }
+  .ezil-lock-avatar { width: 3rem; height: 3rem; }
+  .ezil-lock-title { margin-top: 0.5rem; font-size: 1.25rem; }
+  .ezil-lock-auth { margin-top: 0.75rem; }
+  .ezil-lock-google { min-height: 2.75rem; }
+  .ezil-lock-disclosure { margin-top: 0.25rem; }
+  .ezil-lock-footer { padding-top: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ezil-lock-profile { animation: none; }
+  .ezil-lock * { transition: none; }
+}
