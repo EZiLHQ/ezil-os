@@ -111,6 +111,8 @@ interface Env extends SandboxEnv {
    * normally be ABSENT in production. Never logged or returned.
    */
   SANDBOX_MISSION_HMAC_SECRET?: string;
+  /** Explicit opt-in for unsigned requests from a local development Worker. */
+  SANDBOX_ALLOW_INSECURE_LOCAL_AUTH?: string;
 
   // ── R2 binding workspace bucket (preferred, credential-less mount path) ────
   // Bound via [[r2_buckets]] in wrangler.toml. When present, this is the
@@ -584,6 +586,10 @@ import {
   parseTelemetryAckKeys,
   TELEMETRY_SPOOL_PREFIX,
 } from './telemetry';
+
+function allowInsecureLocalAuth(env: Env): boolean {
+  return env.SANDBOX_ALLOW_INSECURE_LOCAL_AUTH === 'true';
+}
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -3411,7 +3417,11 @@ async function handlePreview(
   tl.event('web_api', 'sandbox.preview.received', 'ok');
 
   const authDone = tl.stage('project_authorization', 'sandbox.preview.authorize');
-  const auth = await verifyPreviewToken(body.token, resolvePreviewSecrets(env));
+  const auth = await verifyPreviewToken(
+    body.token,
+    resolvePreviewSecrets(env),
+    allowInsecureLocalAuth(env),
+  );
   if (!auth.ok) {
     authDone('error', auth.error);
     return json({ ok: false, error: auth.error }, 401);
@@ -3918,7 +3928,11 @@ async function handleWorkspaceDiag(
     // Allow an empty body — the diagnostic endpoint defaults op/slot.
   }
 
-  const auth = await verifyPreviewToken(body.token, resolvePreviewSecrets(env));
+  const auth = await verifyPreviewToken(
+    body.token,
+    resolvePreviewSecrets(env),
+    allowInsecureLocalAuth(env),
+  );
   if (!auth.ok) {
     tl.event('project_authorization', 'sandbox.diag.authorize', 'error', { error: auth.error });
     return json({ ok: false, error: auth.error }, 401);
@@ -4178,7 +4192,11 @@ async function handleCpuDiag(
     // Allow an empty body — the diagnostic endpoint defaults maxLines.
   }
 
-  const auth = await verifyPreviewToken(body.token, resolvePreviewSecrets(env));
+  const auth = await verifyPreviewToken(
+    body.token,
+    resolvePreviewSecrets(env),
+    allowInsecureLocalAuth(env),
+  );
   if (!auth.ok) {
     tl.event('project_authorization', 'sandbox.cpu_diag.authorize', 'error', { error: auth.error });
     return json({ ok: false, error: auth.error }, 401);
@@ -4326,7 +4344,11 @@ async function handleNekoLogs(
     // Allow an empty body — the route defaults maxLines.
   }
 
-  const auth = await verifyPreviewToken(body.token, resolvePreviewSecrets(env));
+  const auth = await verifyPreviewToken(
+    body.token,
+    resolvePreviewSecrets(env),
+    allowInsecureLocalAuth(env),
+  );
   if (!auth.ok) {
     tl.event('project_authorization', 'sandbox.neko_logs.authorize', 'error', { error: auth.error });
     return json({ ok: false, error: auth.error }, 401);
@@ -4488,7 +4510,11 @@ async function handleTwen(request: Request, env: Env, sandboxName: string): Prom
     body !== null && typeof body === 'object' && !Array.isArray(body)
       ? ((body as Record<string, unknown>).token as string | undefined)
       : undefined;
-  const auth = await verifyPreviewToken(token, resolvePreviewSecrets(env));
+  const auth = await verifyPreviewToken(
+    token,
+    resolvePreviewSecrets(env),
+    allowInsecureLocalAuth(env),
+  );
   if (!auth.ok) {
     return json({ ok: false, error: auth.error }, 401);
   }
@@ -5554,7 +5580,11 @@ async function authorizeProjectFilesRequest(
   body: Record<string, unknown>,
 ): Promise<Response | null> {
   const token = typeof body.token === 'string' ? body.token : undefined;
-  const auth = await verifyPreviewToken(token, resolvePreviewSecrets(env));
+  const auth = await verifyPreviewToken(
+    token,
+    resolvePreviewSecrets(env),
+    allowInsecureLocalAuth(env),
+  );
   if (!auth.ok) return json({ ok: false, error: auth.error }, 401);
   return null;
 }
@@ -5596,7 +5626,11 @@ async function authorizeSignedControlRequest(request: Request, env: Env, url: UR
     body,
   });
 
-  const auth = await verifyPreviewToken(token, resolvePreviewSecrets(env));
+  const auth = await verifyPreviewToken(
+    token,
+    resolvePreviewSecrets(env),
+    allowInsecureLocalAuth(env),
+  );
   if (!auth.ok) return json({ ok: false, error: auth.error }, 401);
   return null;
 }
