@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Wave 4B2A — build the in-container workspace bootstrap bundle.
 #
-# Bundles the TypeScript entry (which pulls in the pure workspace-bridge startup
-# path + @ezil/workspace-engine, and NOTHING from the Next.js app / db / tRPC
-# layer) into a single self-contained ESM module the sandbox image runs with
+# Bundles the TypeScript readiness entry and its local checkpoint validator
+# into a single self-contained ESM module the sandbox image runs with
 # `bun`. Deterministic + committed: the produced `dist/workspace-bootstrap.mjs`
 # is checked in so the image build (which has no repo-wide toolchain) can simply
 # COPY it in.
@@ -21,7 +20,14 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 entry="$here/workspace-bootstrap-entry.ts"
 out="$here/dist/workspace-bootstrap.mjs"
 
+# Bun emits source comments relative to cwd; pin it for reproducible output.
+cd "$here"
+
 mode="${1:-build}"
+if [[ "$mode" != "build" && "$mode" != "--check" ]] || [[ $# -gt 1 ]]; then
+  echo "usage: build-bootstrap.sh [--check]" >&2
+  exit 2
+fi
 
 if [[ "$mode" == "--check" ]]; then
   tmp="$(mktemp)"

@@ -274,7 +274,7 @@ export function extractSignedToken(sources: SignedTokenSources): string | undefi
  *                      exact defect this replaces.
  *   `destroy_failed` — `destroy()` threw.
  */
-export type TerminateOutcome = 'destroyed' | 'not_running' | 'still_running' | 'destroy_failed';
+export type TerminateOutcome = 'destroyed' | 'not_running' | 'still_running' | 'destroy_failed' | 'flush_failed';
 
 export interface TerminateObservation {
   /** `ctx.container.running` observed BEFORE any teardown work. */

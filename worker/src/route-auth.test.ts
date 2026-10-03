@@ -174,6 +174,7 @@ function fakeSandboxNamespace(options: {
   };
 
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
+    hydrateWorkspace: async () => ({ mounted: true, mountPath: '/workspace' }),
     containerFetch: async (...args: unknown[]) => {
       const [url, init, port] = args as [string, RequestInit | undefined, number];
       const headers: Record<string, string> = {};
@@ -278,7 +279,7 @@ function fakeSandboxNamespace(options: {
     },
     flushWorkspaceNow: async () => {
       calls.flushWorkspaceNow++;
-      return options.flushWorkspaceNow ? await options.flushWorkspaceNow() : {};
+      return options.flushWorkspaceNow ? await options.flushWorkspaceNow() : { ok: true };
     },
     getExposedPorts: async (...args: unknown[]) => {
       calls.getExposedPorts++;
@@ -1845,7 +1846,7 @@ describe('POST /sandbox/preview: NEKO_SCREEN boot env', () => {
           ...body,
         }),
       }),
-      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+      { Sandbox: binding, SANDBOX_WORKSPACE_R2_BUCKET: {}, SANDBOX_HMAC_SECRET: SECRET },
     );
   }
 
@@ -1947,7 +1948,7 @@ describe('POST /sandbox/preview returns appPreviewUrl + codePreviewUrl', () => {
           desktopMode: 'neko',
         }),
       }),
-      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, ...env },
+      { Sandbox: binding, SANDBOX_WORKSPACE_R2_BUCKET: {}, SANDBOX_HMAC_SECRET: SECRET, ...env },
     );
     return { res, body: (await res.json()) as Record<string, unknown> };
   }
@@ -1985,7 +1986,7 @@ describe('POST /sandbox/preview returns appPreviewUrl + codePreviewUrl', () => {
 
     for (const field of ['appPreviewUrl', 'codePreviewUrl'] as const) {
       const res = await worker.fetch(new Request(String(body[field])), {
-        Sandbox: binding,
+        Sandbox: binding, SANDBOX_WORKSPACE_R2_BUCKET: {},
         SANDBOX_HMAC_SECRET: SECRET,
       });
       expect(`${field} -> ${res.status}`).toBe(`${field} -> 302`);
@@ -2043,6 +2044,8 @@ describe('preview hostname isolation', () => {
     SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.work',
     SANDBOX_DEFAULT_DESKTOP_MODE: 'neko',
     SANDBOX_HMAC_SECRET: SECRET,
+    // Preview readiness now requires durable workspace storage (final checkpoint).
+    SANDBOX_WORKSPACE_R2_BUCKET: {},
   };
 
   for (const { origin, root, env } of [
@@ -2052,7 +2055,7 @@ describe('preview hostname isolation', () => {
     for (const mode of ['neko', 'guacamole']) {
       it(`${mode} preview on ${origin} uses one wildcard TLS label`, async () => {
         const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
-        const workerEnv = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, ...env };
+        const workerEnv = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_WORKSPACE_R2_BUCKET: {}, ...env };
         const res = await worker.fetch(new Request(`${origin}/sandbox/preview`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -2082,7 +2085,7 @@ describe('preview hostname isolation', () => {
 
     it(`status and restart on ${origin} use the same preview root`, async () => {
       const { binding, calls } = fakeSandboxNamespace({});
-      const workerEnv = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, ...env };
+      const workerEnv = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_WORKSPACE_R2_BUCKET: {}, ...env };
       const status = await worker.fetch(new Request(`${origin}/sandbox/${SANDBOX_NAME}/status`), workerEnv);
       expect(status.status).toBe(200);
       expect(calls.getExposedPortHosts).toEqual([root]);
@@ -2183,96 +2186,45 @@ describe('preview hostname isolation', () => {
 //     inline `await`, this test would time out, not merely mis-assert.
 //   - without ctx: the response promise must NOT have settled ahead of a
 //     Promise.resolve() sentinel, proving it is still gated on the flush.
-describe('POST /sandbox/preview: pre-handoff flush deferral (z2-mint-latency)', () => {
-  const host = 'ezil.org';
-  const id = 'guac-flushflushflush-deferdeferdefer';
-
-  function makeDeferred(): { promise: Promise<void>; resolve: () => void } {
-    let resolve!: () => void;
-    const promise = new Promise<void>((res) => {
-      resolve = res;
-    });
-    return { promise, resolve };
-  }
-
-  function warmSandboxWithControllableFlush(order: string[], deferred: { promise: Promise<void> }) {
-    return fakeSandboxNamespace({
-      exposedPorts: [{ port: 8181, url: `https://8181-${id}-nekodesktop.${host}`, status: 'open' }],
-      flushWorkspaceNow: async () => {
-        await deferred.promise;
-        order.push('flush');
-        return {};
-      },
-    });
-  }
-
-  async function signedPreviewRequest(): Promise<Request> {
-    return new Request('https://api-desktop.ezil.org/sandbox/preview', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: await mintToken(), projectId: 'proj-1', userId: 'user-1', desktopMode: 'neko' }),
-    });
-  }
-
-  it('WITH ctx.waitUntil: the response resolves without waiting for the flush', async () => {
-    const order: string[] = [];
-    const deferred = makeDeferred();
-    const { binding, calls } = warmSandboxWithControllableFlush(order, deferred);
-    const waited: Array<Promise<unknown>> = [];
-    const ctx = { waitUntil: (p: Promise<unknown>) => waited.push(p) } as unknown as ExecutionContext;
-
-    const res = await worker.fetch(
-      await signedPreviewRequest(),
-      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
-      ctx,
-    );
-    order.push('response');
-
-    expect(res.status).toBe(200);
-    // The response landed strictly BEFORE the flush did — order is exactly
-    // ['response'] at this point because `deferred.resolve()` has not been
-    // called yet, so 'flush' cannot possibly be in `order` unless the flush
-    // was awaited inline (the regression this test exists to catch).
-    expect(order).toEqual(['response']);
-    // …but the flush was genuinely started, not dropped —
-    expect(calls.flushWorkspaceNow).toBe(1);
-    // — and handed to ctx.waitUntil() so the runtime keeps it alive.
-    expect(waited).toHaveLength(1);
-
-    // Let it finish and prove it really does run to completion.
-    deferred.resolve();
-    await waited[0];
-    expect(order).toEqual(['response', 'flush']);
-  });
-
-  it('WITHOUT ctx (mutation: force the fast path off): the response still WAITS for the flush', async () => {
-    const order: string[] = [];
-    const deferred = makeDeferred();
-    const { binding, calls } = warmSandboxWithControllableFlush(order, deferred);
-
-    // No third `ctx` argument — the exact call shape every other test in this
-    // file already uses (a caller with no ExecutionContext).
-    const resPromise = worker
-      .fetch(await signedPreviewRequest(), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET })
-      .then((res) => {
-        order.push('response');
-        return res;
+describe('POST /sandbox/preview: final checkpoint gates readiness', () => {
+  for (const withContext of [true, false]) {
+    it(`waits for the checkpoint with ExecutionContext=${withContext}`, async () => {
+      let release!: () => void, entered!: () => void;
+      const gate = new Promise<void>(r => { release = r; });
+      const started = new Promise<void>(r => { entered = r; });
+      const order: string[] = [];
+      const { binding, calls } = fakeSandboxNamespace({
+        exposedPorts: [{ port: 8181, url: 'https://8181-test-nekodesktop.ezil.org', status: 'open' }],
+        flushWorkspaceNow: async () => { entered(); await gate; order.push('flush'); return { ok: true }; },
       });
-
-    // Race against an already-resolved sentinel: if the response had already
-    // settled (or settles within this microtask turn), 'response' wins. It
-    // must not — the fallback path is still gated on the flush.
-    const winner = await Promise.race([resPromise.then(() => 'response'), Promise.resolve('not-yet')]);
-    expect(winner).toBe('not-yet');
-    expect(order).toEqual([]);
-
-    deferred.resolve();
-    const res = await resPromise;
-    expect(res.status).toBe(200);
-    // Flush completed BEFORE the response — the original blocking contract.
-    expect(order).toEqual(['flush', 'response']);
-    expect(calls.flushWorkspaceNow).toBe(1);
-  });
+      const ctx = withContext ? { waitUntil: () => {} } as unknown as ExecutionContext : undefined;
+      const response = worker.fetch(new Request('https://api-desktop.ezil.org/sandbox/preview', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: await mintToken(), projectId: 'proj-1', userId: 'user-1', desktopMode: 'neko' }),
+      }), { Sandbox: binding, SANDBOX_WORKSPACE_R2_BUCKET: {}, SANDBOX_HMAC_SECRET: SECRET }, ctx)
+        .then(res => { order.push('response'); return res; });
+      await started;
+      expect(order).toEqual([]);
+      release();
+      expect((await response).status).toBe(200);
+      expect(order).toEqual(['flush', 'response']);
+      expect(calls.flushWorkspaceNow).toBe(1);
+    });
+  }
+  for (const throws of [true, false]) {
+    it(`refuses readiness on checkpoint ${throws ? 'exception' : 'failure'}`, async () => {
+      const { binding } = fakeSandboxNamespace({
+        exposedPorts: [{ port: 8181, url: 'https://8181-test-nekodesktop.ezil.org', status: 'open' }],
+        flushWorkspaceNow: async () => { if (throws) throw new Error('private file contents'); return { ok: false }; },
+      });
+      const res = await worker.fetch(new Request('https://api-desktop.ezil.org/sandbox/preview', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: await mintToken(), projectId: 'proj-1', userId: 'user-1', desktopMode: 'neko' }),
+      }), { Sandbox: binding, SANDBOX_WORKSPACE_R2_BUCKET: {}, SANDBOX_HMAC_SECRET: SECRET });
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ ok: false, error: 'workspace_checkpoint_failed' });
+    });
+  }
 });
 
 // ── Telemetry: boot phase/outcome data reaches the R2 spool ─────────────────
@@ -2316,7 +2268,7 @@ describe('telemetry: boot phase/outcome data reaches the R2 spool on a SUCCESSFU
           desktopMode: 'neko',
         }),
       }),
-      { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, ...env },
+      { Sandbox: binding, SANDBOX_WORKSPACE_R2_BUCKET: {}, SANDBOX_HMAC_SECRET: SECRET, ...env },
     );
     return { res, body: (await res.json()) as Record<string, unknown> };
   }
@@ -2950,7 +2902,7 @@ describe('no other mutating route is reachable unauthenticated', () => {
       const { binding, calls } = fakeSandboxNamespace({});
       const res = await worker.fetch(
         new Request(url, { method, ...(method === 'POST' ? { body: '{}' } : {}) }),
-        { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+        { Sandbox: binding, SANDBOX_WORKSPACE_R2_BUCKET: {}, SANDBOX_HMAC_SECRET: SECRET },
       );
       expect(`${method} ${new URL(url).pathname} -> ${res.status}`).toBe(
         `${method} ${new URL(url).pathname} -> 401`,
@@ -2975,4 +2927,54 @@ describe('no other mutating route is reachable unauthenticated', () => {
     );
     expect(res.status).toBe(404);
   });
+});
+
+describe('preview persistence is required before desktop readiness', () => {
+  it('returns 503 and never starts the desktop when the workspace bucket is missing', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
+    const res = await worker.fetch(new Request('https://api-desktop.ezil.org/sandbox/preview', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: await mintToken(), projectId: 'proj-1', userId: 'user-1', desktopMode: 'neko' }),
+    }), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET });
+    expect(res.status).toBe(503); expect(calls.startProcess).toHaveLength(0);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'workspace_persistence_unavailable' });
+  });
+  it('rejects loose-object writes after a checkpoint without mutating storage', async () => {
+    let puts = 0;
+    const res = await worker.fetch(new Request('https://api-desktop.ezil.org/project-files/put', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: await mintToken(), key: 'p/branches/main/a.txt', bodyBase64: 'YQ==' }),
+    }), { SANDBOX_HMAC_SECRET: SECRET, SANDBOX_WORKSPACE_R2_BUCKET: {
+      head: async (key: string) => key === 'p/branches/main/.ezil-snapshots/latest.json' ? {} : null,
+      put: async () => { puts++; },
+    } });
+    expect(res.status).toBe(409); expect(puts).toBe(0);
+    expect(await res.json()).toMatchObject({ error: 'workspace_git_checkpoint_authoritative' });
+  });
+});
+
+it('checks the actual list prefix even when a caller also supplies a decoy key', async () => {
+  let listed = false;
+  const res = await worker.fetch(new Request('https://api-desktop.ezil.org/project-files/list', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: await mintToken(), key: 'decoy', prefix: 'p/branches/main/' }),
+  }), { SANDBOX_HMAC_SECRET: SECRET, SANDBOX_WORKSPACE_R2_BUCKET: {
+    head: async (key: string) => key === 'p/branches/main/.ezil-snapshots/latest.json' ? {} : null,
+    list: async () => { listed = true; return { objects: [], truncated: false }; },
+  } });
+  expect(res.status).toBe(409); expect(listed).toBe(false);
+});
+
+it('refuses direct snapshot object access before any storage read', async () => {
+  for (const operation of ['put', 'get', 'head', 'delete', 'list']) {
+    let touched = false;
+    const res = await worker.fetch(new Request(`https://api-desktop.ezil.org/project-files/${operation}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: await mintToken(), key: 'p/branches/main/.ezil-snapshots/latest.json',
+        prefix: 'p/branches/main/.ezil-snapshots/', bodyBase64: 'eA==' }),
+    }), { SANDBOX_HMAC_SECRET: SECRET, SANDBOX_WORKSPACE_R2_BUCKET: {
+      head: async () => { touched = true; return null; },
+    } });
+    expect(res.status).toBe(409); expect(touched).toBe(false);
+  }
 });

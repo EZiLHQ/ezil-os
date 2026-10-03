@@ -162,6 +162,36 @@ interface Env extends SandboxEnv {
   /** Absolute in-container path where the workspace bucket is mounted. Defaults to `/workspace`. */
   SANDBOX_WORKSPACE_MOUNT_PATH?: string;
 
+  // ── Durable workspace STORE selection (founder decision 2026-10-02) ─────────
+  // Chooses the backend for the Worker-mediated hydrate/flush PERSISTENCE path
+  // (`hydrateWorkspace` / `runWorkspaceFlush`), NOT the s3fs mount above (which
+  // PLATFORM-NOTES §1 shows drops writes and is never used for live storage).
+  // These are DISTINCT from the legacy `SANDBOX_WORKSPACE_S3_*` mount vars.
+  // See `./workspace-store-s3.ts` and `docs/WORKSPACE-STORE.md`.
+  /**
+   * `'r2'` (default when unset) keeps the R2 binding; `'s3'` moves the durable
+   * store to AWS S3. Any other value FAILS CLOSED (`workspace_store_misconfigured`)
+   * rather than silently falling back. DELIBERATELY NOT SET in wrangler.toml so
+   * the default stays R2 — flip it per-deployment via `wrangler secret`/`[vars]`.
+   */
+  EZIL_WORKSPACE_STORE?: string;
+  /** S3 bucket for the durable workspace store (required when store='s3'). */
+  EZIL_WORKSPACE_S3_BUCKET?: string;
+  /** S3 region, e.g. `us-east-1` (required when store='s3'). */
+  EZIL_WORKSPACE_S3_REGION?: string;
+  /** S3 access key id (required when store='s3'; secret — never logged). */
+  EZIL_WORKSPACE_S3_ACCESS_KEY_ID?: string;
+  /** S3 secret access key (required when store='s3'; secret — never logged). */
+  EZIL_WORKSPACE_S3_SECRET_ACCESS_KEY?: string;
+  /** Optional S3-compatible endpoint for path-style access (MinIO/local/tests). */
+  EZIL_WORKSPACE_S3_ENDPOINT?: string;
+  /** Optional static key prefix inside the bucket, e.g. `workspaces/`. */
+  EZIL_WORKSPACE_S3_KEY_PREFIX?: string;
+  /** Optional server-side encryption: `AES256` or `aws:kms`. */
+  EZIL_WORKSPACE_S3_SSE?: string;
+  /** Optional KMS key id when `EZIL_WORKSPACE_S3_SSE='aws:kms'`. */
+  EZIL_WORKSPACE_S3_KMS_KEY_ID?: string;
+
   /**
    * Non-secret kill-switch for the HMAC-gated `workspace-diag` route. Enabled
    * by default; set to `off`/`false`/`0`/`disabled`/`no` to hard-disable the
@@ -457,13 +487,19 @@ import {
   flushWorkspaceToR2,
   parseHydrateMarker,
   serializeHydrateMarker,
-  parseFlushManifest,
-  serializeFlushManifest,
   HYDRATE_MARKER_FILENAME,
-  FLUSH_MANIFEST_FILENAME,
+  SNAPSHOT_HEAD,
   type FlushOutcome,
   type FlushManifest,
+  collectSupersededSnapshots,
+  type FlushR2BucketLike,
+  type GcR2BucketLike,
 } from './workspace-persist';
+import { baselineSystemLayer, flushSystemLayer, hydrateSystemLayer, systemPrefixOf, type SystemFlushOutcome } from './system-persist';
+import {
+  resolveWorkspaceStore,
+  type WorkspaceStore,
+} from './workspace-store-s3';
 // NOTE: `TWEN_SCHEMA`, `TWEN_OPS`, `TWEN_OP_ID_RE`, `TWEN_ALLOWED_FIELDS`,
 // `TWEN_MAX_BODY_BYTES`, and `TWEN_STATUS_FILE`/`TWEN_STAT_RETRY_DELAY_MS` are
 // intentionally NOT re-exported here — they are plain `const`s, and workerd
@@ -605,6 +641,7 @@ const SESSION_TTL_MS = 30 * 60 * 1000;
  * generation), the container still doesn't run unbounded — just later and
  * less predictably than the explicit 10-minute idle-stop.
  */
+// keepAlive disables the SDK's unchecked timer; the checkpoint-gated idle loop owns stop.
 const SLEEP_AFTER = '5m';
 /**
  * Max time to wait for the SELECTED desktop service to bind + serve.
@@ -722,6 +759,9 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
  * not a new transport.
  */
 interface EzilWorkspacePersistRpc {
+  hydrateWorkspace(params: { mountPath: string; prefix: string }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }>;
+  /** Start capturing user changes outside /workspace (system layer). Called once the desktop is up. */
+  baselineSystem(): Promise<boolean>;
   recordWorkspaceHydration(params: { prefix: string; mountPath: string; hydrated: boolean }): Promise<void>;
   flushWorkspaceNow(): Promise<FlushOutcome>;
   /**
@@ -760,7 +800,7 @@ interface EzilWorkspacePersistRpc {
 function openSandbox(env: Env, id: string): Sandbox<unknown> & EzilWorkspacePersistRpc {
   // normalizeId:true is REQUIRED — preview hostnames are case-insensitive, so
   // the DO key and the preview-URL token must agree on a lowercase id.
-  return getSandbox(env.Sandbox, id, { normalizeId: true, sleepAfter: SLEEP_AFTER }) as Sandbox<unknown> &
+  return getSandbox(env.Sandbox, id, { normalizeId: true, sleepAfter: SLEEP_AFTER, keepAlive: true }) as Sandbox<unknown> &
     EzilWorkspacePersistRpc;
 }
 
@@ -1306,11 +1346,35 @@ function resolveWorkspaceMountConfig(env: Env): WorkspaceMountConfig | null {
  * `getProjectBranchScope()`'s `prefix` field, despite the literal argument
  * string differing by that one required leading character.
  */
-async function ensureWorkspaceMount(
+// Exported for `workspace-store-wiring.test.ts` (the store-selection gate /
+// prefix parity); same test-export pattern as `isIdleStopDue` etc. above.
+export async function ensureWorkspaceMount(
   sandbox: Sandbox<unknown> & EzilWorkspacePersistRpc,
   env: Env,
   { projectId, branch }: { projectId: string; branch: string },
 ): Promise<{ mounted: boolean; mountPath?: string; detail?: string }> {
+  // Durable store selection takes precedence over the legacy mount config.
+  // When EZIL_WORKSPACE_STORE='s3', ALWAYS take the Worker-mediated
+  // hydrate/flush path (`hydrateWorkspace`) — NEVER the s3fs mount, which drops
+  // writes (PLATFORM-NOTES §1) — regardless of whether an R2 binding is also
+  // present (that is the migration case). The actual R2-vs-S3 read/write
+  // routing is decided inside `hydrateWorkspace`/`runWorkspaceFlush` by
+  // `resolveWorkspaceStore`. A misconfigured store fails closed here too.
+  const storeSel = resolveWorkspaceStore(env);
+  if (!storeSel.ok) return { mounted: false, detail: storeSel.detail };
+  if (storeSel.kind === 's3') {
+    // Compute mountPath/prefix EXACTLY as the r2-binding branch below does, so a
+    // deployment that set SANDBOX_WORKSPACE_S3_PREFIX keeps the SAME per-computer
+    // prefix across the R2->S3 switch. A different prefix would make the
+    // migrating store look under a key with no R2 data, find nothing, and seed
+    // over the workspace. In-bucket scoping for the S3 store itself is a
+    // separate lever (EZIL_WORKSPACE_S3_KEY_PREFIX).
+    const cfg = resolveWorkspaceMountConfig(env);
+    const mountPath = cfg?.mountPath ?? (env.SANDBOX_WORKSPACE_MOUNT_PATH?.trim() || DEFAULT_WORKSPACE_MOUNT_PATH);
+    const prefix = cfg?.prefix ?? `/${projectId}/branches/${branch}`;
+    return sandbox.hydrateWorkspace({ mountPath, prefix });
+  }
+
   const config = resolveWorkspaceMountConfig(env);
   if (!config) return { mounted: false, detail: 'workspace_bucket_not_configured' };
 
@@ -1328,7 +1392,7 @@ async function ensureWorkspaceMount(
     // `@cloudflare/sandbox` fixes it). `/workspace` is now plain local disk;
     // R2 is reached only through this Worker's own R2 BINDING, which never
     // goes through that emulator. See `ensureWorkspaceHydratedFromR2`.
-    return ensureWorkspaceHydratedFromR2(sandbox, env.SANDBOX_WORKSPACE_R2_BUCKET, config.mountPath, prefix);
+    return sandbox.hydrateWorkspace({ mountPath: config.mountPath, prefix });
   }
 
   // ── Generic S3-compatible fallback (local dev / no native R2 binding) ─────
@@ -1414,30 +1478,16 @@ async function ensureWorkspaceMount(
   return { mounted: true, mountPath: config.mountPath };
 }
 
-/**
- * Best-effort RPC to record this hydrate attempt's outcome on the sandbox's
- * own Durable Object (`EzilSandboxDO.recordWorkspaceHydration`, defined right
- * below). This is what gates the periodic flush loop — a failure to record
- * MUST be logged loudly (never swallowed), but must not fail the preview
- * itself: worst case the flush loop simply never starts for this sandbox
- * (safe — no data loss, just no background persistence until the next
- * successful `ensureWorkspaceMount` call records it).
- */
+/** Record hydration and require the background persistence loop to be available. */
 async function recordHydrationOutcome(
   sandbox: Sandbox<unknown> & EzilWorkspacePersistRpc,
   prefix: string,
   mountPath: string,
   hydrated: boolean,
 ): Promise<void> {
-  try {
-    await sandbox.recordWorkspaceHydration({ prefix, mountPath, hydrated });
-  } catch (err) {
-    console.error(
-      `[ensureWorkspaceMount] recordWorkspaceHydration RPC failed (hydrated=${hydrated}, prefix=${prefix}) — the periodic flush loop may not start/update for this sandbox: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-  }
+  // A failed record/schedule means persistence is unavailable: do not expose
+  // an editable desktop that cannot checkpoint its work.
+  await sandbox.recordWorkspaceHydration({ prefix, mountPath, hydrated });
 }
 
 /**
@@ -1454,17 +1504,14 @@ async function recordHydrationOutcome(
  * container recreation, and would therefore give a stale "yes" for a fresh,
  * empty disk) to answer it.
  *
- * `mounted:false` is reserved for "could not reach/list R2 at all" (the
- * direct analogue of the old `mount_failed` case). A partially-successful
- * hydrate (some individual files failed) still returns `mounted:true` — the
- * container has SOME usable content — but is recorded as hydration-INCOMPLETE
- * via `recordHydrationOutcome`, which strictly gates the flush loop (see that
- * function and `./workspace-persist`'s `flushWorkspaceToR2` doc comment: "if
- * hydration fails or is incomplete, do not flush at all").
+ * Any incomplete restore fails closed. The caller confirms a checkpoint before
+ * exposing the workspace, and local markers are scoped to this container disk.
  */
 async function ensureWorkspaceHydratedFromR2(
   sandbox: Sandbox<unknown> & EzilWorkspacePersistRpc,
-  bucket: R2Bucket | undefined,
+  // Either the native R2 binding (store='r2') or an S3-backed/migrating store
+  // (store='s3'); both satisfy the checkpoint/seed modules' structural surface.
+  bucket: R2Bucket | WorkspaceStore | undefined,
   mountPath: string,
   mountPrefix: string,
 ): Promise<{ mounted: boolean; mountPath?: string; detail?: string }> {
@@ -1481,13 +1528,10 @@ async function ensureWorkspaceHydratedFromR2(
     if (existsRes.exists) {
       const read = await sandbox.readFile(markerPath, { encoding: 'utf-8' });
       marker = parseHydrateMarker(read.content);
+      if (!marker) return { mounted: false, detail: 'workspace_marker_invalid' };
     }
-  } catch (err) {
-    console.error(
-      `[ensureWorkspaceMount] hydrate marker read failed (path=${markerPath}) — proceeding as unhydrated: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
+  } catch {
+    return { mounted: false, detail: 'workspace_marker_unreadable' };
   }
 
   if (marker && marker.prefix === realPrefix && marker.mountPath === mountPath) {
@@ -1506,27 +1550,23 @@ async function ensureWorkspaceHydratedFromR2(
     // for a different prefix in normal operation; if it happens, it means a
     // container was reused across sandboxIds/branches unexpectedly.)
     console.error(
-      `[ensureWorkspaceMount] LOUD: workspace prefix mismatch — this container's local disk was already hydrated for prefix=${marker.prefix} but this request wants prefix=${realPrefix}. Refusing to reuse it.`,
+      `[ensureWorkspaceMount] LOUD: workspace prefix mismatch — this container's local disk was already hydrated for a different prefix but this request wants prefix=${realPrefix}. Refusing to reuse it.`,
     );
     bootLog('workspace_hydrate', 'end', { status: 'error', detail: 'prefix_mismatch', phaseMs: Date.now() - hydrateT0 });
     await recordHydrationOutcome(sandbox, realPrefix, mountPath, false);
     return { mounted: false, detail: 'workspace_prefix_mismatch' };
   }
 
+  await recordHydrationOutcome(sandbox, realPrefix, mountPath, false);
+  // An unmarked nonempty directory may contain unflushed edits from an older
+  // container version. Refuse to seed or restore over it.
+  if ((await sandbox.exists(mountPath)).exists) {
+    const local = await sandbox.listFiles(mountPath, { recursive: false, includeHidden: true });
+    if (local.files.length) return { mounted: false, detail: 'workspace_unmarked_nonempty' };
+  }
   const copyTemplate = async () => {
     const result = await sandbox.exec(buildTemplateCopyCommand(mountPath));
-    if (templateWasMissing(result.stdout)) {
-      // Loud, not silent: the previous `[ -d ... ] && ... || true` guard
-      // swallowed this exact case for weeks — a missing baked-in template
-      // meant every genuinely-new workspace won the seed race and then
-      // copied nothing, booting to a silently empty desktop with no trace
-      // anywhere. Still must not fail boot (the sentinel is already
-      // committed by this point — see this function's doc comment), but it
-      // must never again pass without a trace in `wrangler tail`.
-      console.error(
-        `[ensureWorkspaceMount] LOUD: /opt/ezil-sandbox-template is missing from this container image — new workspace at ${mountPath} was NOT seeded with starter files (boot continues). The image was built without the template baked in; check the Dockerfile's COPY step.`,
-      );
-    }
+    if (result.exitCode !== 0 || templateWasMissing(result.stdout)) throw new Error('workspace_template_unavailable');
   };
 
   let hydrateOk = false;
@@ -1539,14 +1579,12 @@ async function ensureWorkspaceHydratedFromR2(
   let initialListFailed = false;
   let initiallyEmpty = false;
   try {
-    const initialCheck = await bucket.list({ prefix: realPrefix, limit: 1 });
+    const initialCheck = await bucket.list({ prefix: `${realPrefix}/`, limit: 1 });
     initiallyEmpty = initialCheck.objects.length === 0;
   } catch (err) {
     initialListFailed = true;
     console.error(
-      `[ensureWorkspaceMount] initial R2 emptiness check failed (prefix=${realPrefix}): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      `[ensureWorkspaceMount] initial R2 emptiness check failed (prefix=${realPrefix}): workspace_operation_failed`,
     );
   }
 
@@ -1560,11 +1598,13 @@ async function ensureWorkspaceHydratedFromR2(
       bucket,
       mountPrefix,
       copyTemplate,
-      log: (message) => console.error(message),
+      log: () => console.error('[workspace-persist] seed or hydrate operation failed'),
     });
     if (seedOutcome.seeded) {
       hydrateOk = true;
       hydrateDetail = 'seeded';
+    } else if (['list_failed', 'sentinel_put_failed', 'copy_failed'].includes(seedOutcome.reason)) {
+      return { mounted: false, detail: `workspace_seed_${seedOutcome.reason}` };
     }
     // Any `seeded:false` reason (lost_race / not_empty / list_failed /
     // sentinel_put_failed / copy_failed) falls through to a real
@@ -1601,36 +1641,23 @@ async function ensureWorkspaceHydratedFromR2(
   if (hydrateOk) {
     try {
       await sandbox.mkdir(mountPath, { recursive: true });
-      await sandbox.writeFile(
-        markerPath,
-        serializeHydrateMarker({ prefix: realPrefix, mountPath, hydratedAt: new Date().toISOString() }),
-      );
-    } catch (err) {
-      // Best-effort: if the marker write fails, a LATER preview call against
-      // this same (still-warm) container will simply re-hydrate — wasteful,
-      // never unsafe (hydrate only ever writes from R2's own truth).
-      console.error(
-        `[ensureWorkspaceMount] hydrate marker write failed (path=${markerPath}) — a later call on this container will re-hydrate: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
+      if (!(await sandbox.exists(markerPath)).exists) {
+        await sandbox.writeFile(
+          markerPath,
+          serializeHydrateMarker({ version: 1, prefix: realPrefix, mountPath, hydratedAt: new Date().toISOString() }),
+        );
+      }
+    } catch {
+      await recordHydrationOutcome(sandbox, realPrefix, mountPath, false);
+      return { mounted: false, detail: 'workspace_marker_write_failed' };
     }
 
-    // GAP (T30): `seedWorkspaceIfAbsent`'s template copy (above, on the
-    // genuinely-empty-workspace branch only) is the ONLY place the Turbopack
-    // `turbopack: { root: '/' }` fix (PLATFORM-NOTES §18) ever landed — a
-    // real, already-hydrated workspace (content already in R2 before this fix
-    // shipped, so never empty, so never seeded) never got it, and the
-    // Turbopack symlink fatal still greets it on every `next dev`. Run
-    // UNCONDITIONALLY here — after EVERY successful hydrate, seeded or not —
-    // rather than only on the non-seeded branch: cheap, and a backstop against
-    // the template itself ever losing the config file. See
-    // `buildEnsureTurbopackConfigCommand`'s doc comment in `./workspace-seed`
-    // for the full safety contract (never touches a user's own config, never
-    // touches a non-Next project, writes at most once ever per project so it
-    // cannot churn the periodic R2 flush).
+    // Template conveniences apply only at creation; a restored Git tree must
+    // retain its exact user-authored contents.
     try {
-      const turbopackResult = await sandbox.exec(buildEnsureTurbopackConfigCommand(mountPath));
+      const turbopackResult = hydrateDetail === 'seeded'
+        ? await sandbox.exec(buildEnsureTurbopackConfigCommand(mountPath))
+        : { stdout: '' };
       const outcome = parseTurbopackConfigOutcome(turbopackResult.stdout);
       if (outcome === 'written') {
         console.log(
@@ -1647,9 +1674,7 @@ async function ensureWorkspaceHydratedFromR2(
       // Best-effort, like every other step in this function: never fail boot
       // over a config-convenience fix.
       console.error(
-        `[ensureWorkspaceMount] Turbopack config check failed (path=${mountPath}) — continuing without it: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        `[ensureWorkspaceMount] Turbopack config check failed (path=${mountPath}) — continuing without it: workspace_operation_failed`,
       );
     }
   }
@@ -1657,12 +1682,7 @@ async function ensureWorkspaceHydratedFromR2(
   await recordHydrationOutcome(sandbox, realPrefix, mountPath, hydrateOk);
 
   return {
-    // `mounted:false` reserved for "couldn't reach/list R2 at all" (the
-    // direct analogue of the old `mount_failed`); a partial per-file failure
-    // still leaves a usable (if incomplete) workspace on disk, so the
-    // preview/dev-server tooling downstream is allowed to use it — the flush
-    // gate above (`recordHydrationOutcome`) is the strict signal instead.
-    mounted: listOk,
+    mounted: hydrateOk && listOk,
     mountPath,
     detail: hydrateDetail,
   };
@@ -1769,6 +1789,15 @@ const WORKSPACE_FLUSH_LAST_SEEN_ACTIVITY_AT_KEY = 'ezil:workspaceFlushLastSeenAc
 
 /** Current reschedule interval (seconds) for the self-perpetuating flush loop — see `computeNextFlushBackoffSeconds`. */
 const WORKSPACE_FLUSH_BACKOFF_SECONDS_KEY = 'ezil:workspaceFlushBackoffSeconds';
+/** When a checkpoint last uploaded chunks (routine changed checkpoints are rate-limited against it). */
+const WORKSPACE_LAST_UPLOAD_AT_KEY = 'ezil:workspaceLastUploadAt';
+const MIN_CHANGED_CHECKPOINT_MS = 60_000;
+/** When superseded checkpoint generations were last collected. */
+const WORKSPACE_LAST_GC_AT_KEY = 'ezil:workspaceLastGcAt';
+/** When the system layer (changes outside /workspace) was last captured. */
+const SYSTEM_LAST_FLUSH_AT_KEY = 'ezil:systemLastFlushAt';
+const SYSTEM_FLUSH_INTERVAL_MS = 5 * 60_000;
+const SNAPSHOT_GC_INTERVAL_MS = 15 * 60_000;
 
 /**
  * Backstop ceiling (ms) for `terminateSandbox()`'s primary confirmation
@@ -2249,40 +2278,67 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    */
   private restartInProgress = false;
 
-  /** Read the flush-manifest cache from local disk. Missing/corrupt -> empty (safe: just re-uploads everything once). */
-  private async readFlushManifest(mountPath: string): Promise<FlushManifest> {
-    const manifestPath = `${mountPath}/${FLUSH_MANIFEST_FILENAME}`;
-    try {
-      const exists = await this.exists(manifestPath);
-      if (!exists.exists) return {};
-      const read = await this.readFile(manifestPath, { encoding: 'utf-8' });
-      return parseFlushManifest(read.content);
-    } catch (err) {
-      console.error(
-        `[workspace_flush] manifest read failed (path=${manifestPath}) — starting from an empty manifest this cycle: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      return {};
-    }
+  /** Serialize hydrate, flush and teardown across this DO's await points. */
+  private workspacePersistenceTail: Promise<unknown> = Promise.resolve();
+
+  private async withWorkspacePersistence<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.workspacePersistenceTail ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(operation);
+    this.workspacePersistenceTail = next.then(() => undefined, () => undefined);
+    return next;
   }
 
-  private async writeFlushManifest(mountPath: string, manifest: FlushManifest): Promise<void> {
-    const manifestPath = `${mountPath}/${FLUSH_MANIFEST_FILENAME}`;
-    try {
-      await this.writeFile(manifestPath, serializeFlushManifest(manifest));
-    } catch (err) {
-      console.error(
-        `[workspace_flush] manifest write failed (path=${manifestPath}) — the NEXT cycle may re-upload unchanged files (wasteful, not unsafe): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
+  async hydrateWorkspace(params: { mountPath: string; prefix: string }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }> {
+    return this.withWorkspacePersistence(async () => {
+      try {
+        // Fail closed: a misconfigured store NEVER silently falls back to R2.
+        // A FRESH store is resolved per call so the migrating store's per-prefix
+        // read routing cache cannot outlive a migration (a stale 'R2' route
+        // would re-restore pre-migration content on a later hydrate).
+        const store = resolveWorkspaceStore(this.env);
+        if (!store.ok) return { mounted: false, detail: store.detail };
+        const result = await ensureWorkspaceHydratedFromR2(this, store.store, params.mountPath, params.prefix);
+        if (!result.mounted) return result;
+        // User changes outside /workspace (apt, npm -g, HOME): restored before
+        // the desktop starts. Never blocks the desktop.
+        if (store.store) {
+          const systemStartedAt = Date.now();
+          const system = await hydrateSystemLayer({ container: this, bucket: store.store, realPrefix: realR2KeyPrefix(params.prefix),
+            log: (message) => console.error(message) });
+          bootLog('system_hydrate', 'end', { status: system.ok ? 'ok' : 'error', phaseMs: Date.now() - systemStartedAt,
+            detail: `restored=${system.restored},skippedImageScoped=${system.skippedImageScoped},conflicts=${system.conflicts}${system.skippedReason ? `,reason=${system.skippedReason}` : ''}${system.sameImage === false ? ',crossImage' : ''}` });
+        }
+        const checkpoint = await this.runWorkspaceFlush('explicit');
+        if (checkpoint.ok) return result;
+        // Over the snapshot limits the workspace can never checkpoint; locking
+        // the user out would be permanent. Open it, visibly unsaved.
+        if (checkpoint.skippedReason === 'too_large') {
+          console.error('[workspace_flush] workspace exceeds snapshot limits; opened without durable checkpoints');
+          return { ...result, detail: 'workspace_too_large_unsaved' };
+        }
+        return { mounted: false, detail: 'workspace_checkpoint_failed' };
+      } catch {
+        return { mounted: false, detail: 'workspace_checkpoint_failed' };
+      }
+    });
   }
 
-  private async runWorkspaceFlush(trigger: 'alarm' | 'explicit'): Promise<FlushOutcome> {
+  /** Set by teardown so its final checkpoint also captures the system layer. */
+  private systemFinalNext = false;
+
+  async baselineSystem(): Promise<boolean> {
+    if (!this.containerIsRunning()) return false;
+    return baselineSystemLayer(this);
+  }
+
+  private async runWorkspaceFlush(trigger: 'alarm' | 'explicit', options?: { allowDefer?: boolean }): Promise<FlushOutcome> {
     const t0 = Date.now();
     bootLog('workspace_flush', 'start', { detail: `trigger=${trigger}` });
+    if (!this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)) {
+      return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0,
+        failed: [], manifest: {}, heartbeatWritten: false };
+    }
+
 
     // An EXPLICIT flush is always caller-initiated — the `/sandbox/preview`
     // pre-handoff flush and `terminateSandbox()`'s pre-destroy flush both only
@@ -2301,14 +2357,25 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     }
 
     const hydrated = (await this.ctx.storage.get<boolean>(WORKSPACE_HYDRATED_KEY)) ?? false;
-    const bucket = this.env.SANDBOX_WORKSPACE_R2_BUCKET;
+    // Fail closed: a misconfigured store is skipped, never silently run on R2.
+    // Fresh per flush so no stale per-prefix read routing is reused.
+    const store = resolveWorkspaceStore(this.env);
+    if (!store.ok) {
+      bootLog('workspace_flush', 'end', { status: 'skipped', detail: `store_misconfigured,trigger=${trigger}`, phaseMs: Date.now() - t0 });
+      return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0, failed: [], manifest: {}, heartbeatWritten: false };
+    }
+    const bucket = store.store;
     if (!bucket) {
       bootLog('workspace_flush', 'end', { status: 'skipped', detail: `no_r2_binding,trigger=${trigger}`, phaseMs: Date.now() - t0 });
       return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0, failed: [], manifest: {}, heartbeatWritten: false };
     }
 
-    const manifest = await this.readFlushManifest(wctx.mountPath);
+    const manifest: FlushManifest = {};
     let outcome: FlushOutcome;
+    // Each changed checkpoint uploads the WHOLE workspace, so routine alarm
+    // cycles upload at most once per MIN_CHANGED_CHECKPOINT_MS.
+    const lastUploadAt = (await this.ctx.storage.get<number>(WORKSPACE_LAST_UPLOAD_AT_KEY)) ?? 0;
+    const deferIfChanged = !!options?.allowDefer && Date.now() - lastUploadAt < MIN_CHANGED_CHECKPOINT_MS;
     try {
       outcome = await flushWorkspaceToR2({
         container: this,
@@ -2317,12 +2384,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         realPrefix: wctx.prefix,
         manifest,
         hydrationComplete: hydrated,
+        deferIfChanged,
         log: (message) => console.error(`[workspace_flush] ${message}`),
       });
     } catch (err) {
       // 🔴 A THROW HERE USED TO KILL THE LOOP PERMANENTLY. `flushWorkspaceToR2`
-      // walks the workspace over container RPCs (`listFiles` in
-      // `walkWorkspaceTree`, then `readFile` per file); a container that goes
+      // captures the workspace and transfers bounded chunks; a container that goes
       // away mid-cycle makes those REJECT rather than return. That rejection
       // propagated out of `flushWorkspaceScheduled`, and
       // `@cloudflare/containers`' alarm dispatcher responds to a throwing
@@ -2335,8 +2402,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // idle path's "stop only if the FINAL flush succeeded" rule still sees
       // `ok: false` — a flush that threw is emphatically not one that worked.
       // `manifest` is returned unchanged, so nothing is recorded as synced.
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`[workspace_flush] flush threw (trigger=${trigger}) — treated as a failed cycle: ${message}`);
+      console.error(`[workspace_flush] flush threw (trigger=${trigger}) — treated as a failed cycle`);
       bootLog('workspace_flush', 'end', {
         status: 'error',
         phaseMs: Date.now() - t0,
@@ -2354,12 +2420,6 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         heartbeatWritten: false,
       };
     }
-    // Persist the updated manifest even on a partial failure — the entries
-    // for files that DID upload successfully must not be re-uploaded next
-    // cycle; only the failed ones are (deliberately) absent from
-    // `outcome.manifest` so they retry.
-    await this.writeFlushManifest(wctx.mountPath, outcome.manifest);
-
     bootLog('workspace_flush', 'end', {
       status: outcome.ok ? 'ok' : outcome.skippedReason ? 'skipped' : 'error',
       phaseMs: Date.now() - t0,
@@ -2372,7 +2432,72 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         console.error(`[workspace_flush] upload_failed relPath=${f.relPath} error=${f.error}`);
       }
     }
+    if (outcome.ok && outcome.uploaded.length > 0) await this.ctx.storage.put(WORKSPACE_LAST_UPLOAD_AT_KEY, Date.now());
+    // The running container lost the hydrated workspace (replaced under us): stop
+    // claiming it is hydrated, so status and the next open re-hydrate from the head.
+    if (outcome.skippedReason === 'container_not_hydrated' && hydrated) await this.ctx.storage.put(WORKSPACE_HYDRATED_KEY, false);
+    // System layer: never on the readiness path (it scans the system dirs).
+    // Routine cycles -> interval; idle-stop (alarm, no deferral) and teardown
+    // (systemFinalNext) -> final; any other explicit flush -> skipped.
+    const systemMode = options?.allowDefer ? 'interval' : trigger === 'alarm' || this.systemFinalNext ? 'final' : 'skip';
+    this.systemFinalNext = false;
+    // An oversized workspace never checkpoints, but the system layer still must.
+    if ((outcome.ok || outcome.skippedReason === 'too_large') && systemMode !== 'skip') {
+      const system = await this.runSystemFlush(bucket, wctx.prefix, systemMode === 'final');
+      // A FINAL checkpoint that failed must not let idle-stop / teardown discard
+      // the container: they refuse and retry, exactly as for the workspace.
+      if (systemMode === 'final' && system?.skippedReason === 'failed') outcome.systemCheckpointFailed = true;
+    }
+    if (outcome.ok) await this.collectSnapshotGarbage(bucket, wctx.prefix);
     return outcome;
+  }
+
+  /**
+   * The system layer (user changes outside /workspace). Always on final
+   * checkpoints (readiness, teardown, idle-stop); otherwise at most every
+   * SYSTEM_FLUSH_INTERVAL_MS, because it scans the system directories.
+   * Never fails the workspace flush.
+   */
+  private async runSystemFlush(bucket: unknown, prefix: string, final: boolean): Promise<SystemFlushOutcome | undefined> {
+    const last = (await this.ctx.storage.get<number>(SYSTEM_LAST_FLUSH_AT_KEY)) ?? 0;
+    if (!final && Date.now() - last < SYSTEM_FLUSH_INTERVAL_MS) return undefined;
+    const t0 = Date.now();
+    try {
+      const system = await flushSystemLayer({ container: this, bucket: bucket as FlushR2BucketLike, realPrefix: prefix,
+        log: (message) => console.error(`[system_flush] ${message}`) });
+      if (system.ok || system.skippedReason === 'no_baseline' || system.skippedReason === 'busy') {
+        await this.ctx.storage.put(SYSTEM_LAST_FLUSH_AT_KEY, Date.now());
+      }
+      bootLog('system_flush', 'end', { status: system.ok ? 'ok' : system.skippedReason === 'failed' ? 'error' : 'skipped', phaseMs: Date.now() - t0,
+        detail: `uploaded=${system.uploaded},entries=${system.entries}${system.unchanged ? ',unchanged' : ''}${system.skippedReason ? `,reason=${system.skippedReason}` : ''}` });
+      return system;
+    } catch {
+      console.error('[system_flush] system flush threw');
+      return { ok: false, uploaded: 0, entries: 0, skippedReason: 'failed' };
+    }
+  }
+
+  /** Superseded checkpoint generations, at most once per SNAPSHOT_GC_INTERVAL_MS. Never fails the flush. */
+  private async collectSnapshotGarbage(bucket: unknown, prefix: string): Promise<void> {
+    const lastGcAt = (await this.ctx.storage.get<number>(WORKSPACE_LAST_GC_AT_KEY)) ?? 0;
+    if (Date.now() - lastGcAt < SNAPSHOT_GC_INTERVAL_MS) return;
+    await this.ctx.storage.put(WORKSPACE_LAST_GC_AT_KEY, Date.now());
+    try {
+      const gc = await collectSupersededSnapshots({
+        bucket: bucket as GcR2BucketLike,
+        realPrefix: prefix,
+        log: (message) => console.error(`[workspace_gc] ${message}`),
+      });
+      const systemPrefix = systemPrefixOf(prefix);
+      if (systemPrefix) {
+        await collectSupersededSnapshots({ bucket: bucket as GcR2BucketLike, realPrefix: systemPrefix,
+          log: (message) => console.error(`[system_gc] ${message}`) });
+      }
+      bootLog('workspace_gc', 'end', { status: gc.ok ? 'ok' : 'error',
+        detail: `deletedGenerations=${gc.deletedGenerations},deletedObjects=${gc.deletedObjects},keptRecent=${gc.keptRecent}` });
+    } catch {
+      console.error('[workspace_gc] garbage collection threw (ignored)');
+    }
   }
 
   /**
@@ -2431,9 +2556,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       this.deleteSchedules(WORKSPACE_FLUSH_CALLBACK);
     } catch (err) {
       console.error(
-        `[ezil-boot] phase=workspace_flush event=stale_schedule_delete_failed error=${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        `[ezil-boot] phase=workspace_flush event=stale_schedule_delete_failed error=workspace_operation_failed`,
       );
     }
 
@@ -2444,8 +2567,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // scheduler and will simply find nothing pending, so a failed start
       // retries on its own instead of latching.
       console.error(
-        `[ezil-boot] phase=workspace_flush event=schedule_failed error=${err instanceof Error ? err.message : String(err)}`,
+        `[ezil-boot] phase=workspace_flush event=schedule_failed error=workspace_operation_failed`,
       );
+      throw new Error('workspace_schedule_failed');
     }
   }
 
@@ -2467,9 +2591,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       pending = await this.listSchedules(WORKSPACE_FLUSH_CALLBACK);
     } catch (err) {
       console.error(
-        `[ezil-boot] phase=workspace_flush event=list_schedules_failed error=${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        `[ezil-boot] phase=workspace_flush event=list_schedules_failed error=workspace_operation_failed`,
       );
       return false;
     }
@@ -2521,7 +2643,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    */
   async flushWorkspaceScheduled(): Promise<void> {
     try {
-      await this.runScheduledFlushCycle();
+      await this.withWorkspacePersistence(() => this.runScheduledFlushCycle());
     } catch (err) {
       // 🔴 The SDK's alarm dispatcher deletes this callback's schedule row
       // after it returns — whether it returned or THREW — and never
@@ -2536,7 +2658,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // stopped sandbox is still refused there — this cannot resurrect a
       // container, only re-ask the question.
       console.error(
-        `[ezil-boot] phase=workspace_flush event=cycle_threw error=${err instanceof Error ? err.message : String(err)}`,
+        `[ezil-boot] phase=workspace_flush event=cycle_threw error=workspace_operation_failed`,
       );
       try {
         await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK);
@@ -2595,9 +2717,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK);
         } catch (err) {
           console.error(
-            `[ezil-boot] phase=workspace_flush event=reschedule_failed error=${
-              err instanceof Error ? err.message : String(err)
-            }`,
+            `[ezil-boot] phase=workspace_flush event=reschedule_failed error=workspace_operation_failed`,
           );
         }
         return;
@@ -2606,7 +2726,20 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // Trigger stays `'alarm'` — this must NOT bump `LAST_ACTIVITY_AT_KEY`,
       // idle-triggered or not.
       const outcome = await this.runWorkspaceFlush('alarm');
-      if (outcome.ok) {
+      // 'too_large' is permanent: refusing to stop would keep (and bill) the
+      // container forever without ever saving more. The last committed
+      // checkpoint stays authoritative. A failed system checkpoint is not
+      // permanent: stay up and retry, like a failed workspace flush.
+      // 'container_not_hydrated': the running container provably never held the user's
+      // workspace (replaced for an image rollout) — nothing to save, retrying cannot help.
+      if ((outcome.ok || outcome.skippedReason === 'too_large' || outcome.skippedReason === 'container_not_hydrated')
+          && !outcome.systemCheckpointFailed) {
+        // A real input heartbeat may arrive during the checkpoint's R2 I/O.
+        // Keep that newly active desktop up and checkpoint again next cycle.
+        if (await this.ctx.storage.get<number>(LAST_ACTIVITY_AT_KEY) !== lastActivityAt) {
+          await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK);
+          return;
+        }
         bootLog('workspace_flush', 'end', {
           status: 'ok',
           detail: `idle_stop,${busy.detail},idleMs=${now - lastActivityAt}`,
@@ -2620,10 +2753,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           await this.stop();
         } catch (err) {
           console.error(
-            `[ezil-boot] phase=workspace_flush event=idle_stop_failed error=${
-              err instanceof Error ? err.message : String(err)
-            }`,
+            `[ezil-boot] phase=workspace_flush event=idle_stop_failed error=workspace_operation_failed`,
           );
+          await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK);
         }
         return; // No reschedule: the loop is done. A future hydrate restarts it.
       }
@@ -2641,21 +2773,19 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK);
       } catch (err) {
         console.error(
-          `[ezil-boot] phase=workspace_flush event=reschedule_failed error=${
-            err instanceof Error ? err.message : String(err)
-          }`,
+          `[ezil-boot] phase=workspace_flush event=reschedule_failed error=workspace_operation_failed`,
         );
       }
       return;
     }
 
-    const outcome = await this.runWorkspaceFlush('alarm');
+    const outcome = await this.runWorkspaceFlush('alarm', { allowDefer: true });
     const nextIntervalSeconds = await this.nextFlushRescheduleSeconds(outcome, lastActivityAt);
     try {
       await this.schedule(nextIntervalSeconds, WORKSPACE_FLUSH_CALLBACK);
     } catch (err) {
       console.error(
-        `[ezil-boot] phase=workspace_flush event=reschedule_failed error=${err instanceof Error ? err.message : String(err)}`,
+        `[ezil-boot] phase=workspace_flush event=reschedule_failed error=workspace_operation_failed`,
       );
     }
   }
@@ -2675,7 +2805,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
     const nextSeconds = computeNextFlushBackoffSeconds({
       previousIntervalSeconds,
-      wroteSomething: outcome.uploaded.length > 0,
+      // A deferred change is pending work: keep the base cadence so it uploads right after the window.
+      wroteSomething: outcome.uploaded.length > 0 || outcome.skippedReason === 'deferred',
       activityAdvanced: lastActivityAtAtCycleStart > previousActivitySeen,
     });
 
@@ -2686,7 +2817,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
   /** Explicit, on-demand flush — see class doc comment for the two call sites. */
   async flushWorkspaceNow(): Promise<FlushOutcome> {
-    return this.runWorkspaceFlush('explicit');
+    return this.withWorkspacePersistence(() => this.runWorkspaceFlush('explicit'));
   }
 
   /**
@@ -2730,9 +2861,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       probe = { exitCode: res.exitCode, stdout: res.stdout ?? '' };
     } catch (err) {
       console.error(
-        `[ezil-boot] phase=workspace_flush event=busy_probe_failed error=${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        `[ezil-boot] phase=workspace_flush event=busy_probe_failed error=workspace_operation_failed`,
       );
     }
     const verdict = containerBusyFromProbe(probe);
@@ -2760,9 +2889,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       this.deleteSchedules(WORKSPACE_FLUSH_CALLBACK);
     } catch (err) {
       console.error(
-        `[ezil-boot] phase=workspace_flush event=cancel_schedule_failed error=${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        `[ezil-boot] phase=workspace_flush event=cancel_schedule_failed error=workspace_operation_failed`,
       );
     }
   }
@@ -2773,8 +2900,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * container it flushes.
    */
   override async destroy(): Promise<void> {
-    await this.cancelWorkspaceFlushLoop();
-    await super.destroy();
+    const report = await this.terminateSandbox();
+    if (!report.ok) throw new Error(report.error ?? report.outcome);
   }
 
   /**
@@ -2800,6 +2927,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * label) rather than `<sandboxId>`.
    */
   async terminateSandbox(): Promise<TerminateReport> {
+    return this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint());
+  }
+
+  private async terminateSandboxWithCheckpoint(): Promise<TerminateReport> {
     const wasRunning = this.containerIsRunning();
 
     // Capture the container's own exit signal BEFORE `destroy()` is issued
@@ -2812,7 +2943,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     let monitorPromise: Promise<void> | undefined;
     if (wasRunning) {
       try {
-        monitorPromise = this.ctx.container?.monitor();
+        monitorPromise = this.ctx.container?.monitor().catch(() => undefined);
       } catch (err) {
         // Never let this optimization block termination — fall back to the
         // polling loop below unchanged if `.monitor()` itself is unavailable.
@@ -2825,16 +2956,23 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     }
 
     if (wasRunning) {
-      // EXPLICIT flush before destroy — the container filesystem (and anything
-      // unflushed on it) is gone the moment `destroy()` returns. Best-effort:
-      // a flush failure must never block termination (that would let a stuck
-      // flush leak a container indefinitely), but it MUST be logged loudly.
-      try {
-        await this.runWorkspaceFlush('explicit');
-      } catch (err) {
-        console.error(
-          `[terminateSandbox] pre-destroy flush failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
+      // A failed final flush is a refusal, never permission to discard disk.
+      let checkpoint: FlushOutcome | undefined;
+      this.systemFinalNext = true;
+      try { checkpoint = await this.runWorkspaceFlush('explicit'); } catch { /* refuse below */ }
+      // A workspace over the snapshot limits can never checkpoint; refusing
+      // would retry (and bill) forever. Every other failure still refuses.
+      if (checkpoint?.skippedReason === 'too_large' || checkpoint?.skippedReason === 'container_not_hydrated') {
+        console.error(`[terminateSandbox] ${checkpoint.skippedReason === 'too_large' ? 'workspace exceeds snapshot limits' : 'container does not hold the hydrated workspace'}; terminating on the last committed checkpoint`);
+      } else if (!checkpoint?.ok) {
+        // Do not tombstone or cancel retries on a persistence failure.
+        return { ok: false, terminated: false, stopped: false, outcome: 'flush_failed',
+          wasRunning: true, runningAfter: this.containerIsRunning(), error: 'workspace_checkpoint_failed' };
+      }
+      if (checkpoint?.systemCheckpointFailed) {
+        // The user's installs outside /workspace were not saved: same refusal.
+        return { ok: false, terminated: false, stopped: false, outcome: 'flush_failed',
+          wasRunning: true, runningAfter: this.containerIsRunning(), error: 'system_checkpoint_failed' };
       }
     }
 
@@ -3551,9 +3689,7 @@ async function handlePreview(
     const sandbox = openSandbox(env, sandboxId);
     // Mount (and, on first use, seed) the S3 workspace bucket before the
     // desktop starts so any workspace-backed tooling sees files immediately.
-    // Best-effort: a workspace bucket mount failure never blocks the preview
-    // itself — desktop-preview mode without a persistent workspace is still
-    // useful, and `workspace` in the response tells the caller what happened.
+    // Workspace durability is required before exposing an editable desktop.
     const mountDone = tl.stage('workspace_mount', 'sandbox.preview.workspace_mount');
     const workspace = await ensureWorkspaceMount(sandbox, env, {
       projectId: workspaceProjectId,
@@ -3564,6 +3700,10 @@ async function handlePreview(
       workspace.mounted ? undefined : workspace.detail,
       workspace.mounted ? `mountPath=${workspace.mountPath ?? ''}` : undefined,
     );
+
+    if (!workspace.mounted) {
+      return json({ ok: false, error: 'workspace_persistence_unavailable', workspace }, 503);
+    }
 
     const desktopDone = tl.stage('preview_lifecycle', 'sandbox.preview.desktop_ready');
     const { url: exposedUrl, appPreviewExpose, codePreviewExpose } = await ensureDesktop(
@@ -3580,6 +3720,11 @@ async function handlePreview(
     );
     const guacamoleUrl = mode === 'neko' ? exposedUrl : toGuacamoleUrl(exposedUrl, url.protocol);
     desktopDone('ok');
+    // The desktop is up: from here on, changes outside /workspace are the
+    // user's (apt, npm -g, dotfiles) and are captured into the system layer.
+    if (workspace.mounted) {
+      try { await sandbox.baselineSystem(); } catch { console.error('[system] baseline failed (ignored)'); }
+    }
 
     // Surface (never swallow) an app-preview port exposure failure. This is
     // never fatal to the preview response itself — see `ensureDesktop`'s doc
@@ -3652,45 +3797,11 @@ async function handlePreview(
     // file tree" mechanism/contract this closes.
     const codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace));
 
-    // EXPLICIT flush before handing the ready preview URL back to the caller
-    // (in addition to the alarm-driven periodic flush — see
-    // `EzilSandboxDO.flushWorkspaceNow`'s doc comment). Closes the gap so the
-    // worst-case staleness is bounded to "the alarm-driven 10s cadence", not
-    // "however long until the next preview call happens to run
-    // ensureWorkspaceMount again". Best-effort and non-blocking-of-failure: a
-    // flush error here must never fail the preview response — logged loudly
-    // instead (never a bare `catch {}`).
-    //
-    // 🔴 PERF (z2-mint-latency): measured live against an ALREADY-RUNNING
-    // container, this RPC alone cost 441-754ms (median ~580ms across 6 warm
-    // production mints, `wrangler tail` on `ezil-os-worker`) — 15-27% of the
-    // Worker's own wall time on the warm path, paid synchronously before the
-    // response, even though the response (a streaming-desktop URL) has no
-    // dependency on R2 durability. The flush writes local container files TO
-    // R2; it reads nothing the caller's response needs. So it is handed to
-    // `ctx.waitUntil()` — the EXACT same "run to completion, don't make the
-    // response wait for it" contract `spoolTelemetry()` below already uses —
-    // instead of being awaited inline. This does NOT weaken the staleness
-    // bound described above: `waitUntil()` guarantees the flush still runs to
-    // completion on the same cadence as before, it just no longer blocks the
-    // bytes the browser is waiting on. Unlike `spoolTelemetry` (which is
-    // allowed to be silently dropped when `ctx` is absent), a dropped
-    // workspace flush is a real durability loss, so the ORIGINAL inline
-    // `await` is kept as the fallback for any caller that has no
-    // `ExecutionContext` (test harnesses calling the handler with 2 args) —
-    // see `route-auth.test.ts`'s "pre-handoff flush deferral" suite for both
-    // branches, mutation-tested.
-    const flushOutcome = sandbox.flushWorkspaceNow().catch((err) => {
-      console.error(
-        `[handlePreview] pre-handoff flushWorkspaceNow failed (sandboxId=${sandboxId}): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    });
-    if (ctx?.waitUntil) {
-      ctx.waitUntil(flushOutcome);
-    } else {
-      await flushOutcome;
+    // Readiness requires confirmation, including any edits made during launch.
+    // waitUntil has a bounded lifetime and cannot gate a response on failure.
+    const checkpoint = await sandbox.flushWorkspaceNow().catch(() => null);
+    if (!checkpoint?.ok) {
+      return json({ ok: false, error: 'workspace_checkpoint_failed' }, 503);
     }
 
     const response = json({
@@ -5552,10 +5663,32 @@ async function readProjectFilesBody(
 async function authorizeProjectFilesRequest(
   env: Env,
   body: Record<string, unknown>,
+  resource: 'key' | 'prefix' = 'key',
 ): Promise<Response | null> {
   const token = typeof body.token === 'string' ? body.token : undefined;
   const auth = await verifyPreviewToken(token, resolvePreviewSecrets(env));
   if (!auth.ok) return json({ ok: false, error: auth.error }, 401);
+  // Once checkpointed, Git on the hosted workspace is authoritative. The
+  // loose-object transport cannot represent its index, modes, or deletions;
+  // reject stale reads/writes instead of acknowledging edits we will ignore.
+  const key = typeof body[resource] === 'string' ? body[resource] as string : '';
+  if (new TextEncoder().encode(key).length > 1024) return json({ ok: false, error: 'invalid_key' }, 400);
+  if (key.split('/').includes('.ezil-snapshots')) {
+    return json({ ok: false, error: 'workspace_snapshot_reserved' }, 409);
+  }
+  const bucket = env.SANDBOX_WORKSPACE_R2_BUCKET;
+  if (bucket && key.length <= 1024) {
+    const parts = key.replace(/\/$/, '').split('/');
+    try {
+      for (let i = 1; i <= parts.length; i++) {
+        if (await bucket.head(`${parts.slice(0, i).join('/')}/${SNAPSHOT_HEAD}`)) {
+          return json({ ok: false, error: 'workspace_git_checkpoint_authoritative' }, 409);
+        }
+      }
+    } catch {
+      return json({ ok: false, error: 'workspace_checkpoint_unavailable' }, 503);
+    }
+  }
   return null;
 }
 
@@ -5675,7 +5808,7 @@ async function handleProjectFilesDelete(request: Request, env: Env): Promise<Res
 async function handleProjectFilesList(request: Request, env: Env): Promise<Response> {
   const read = await readProjectFilesBody(request, PROJECT_FILES_MAX_CONTROL_REQUEST_BYTES);
   if (!read.ok) return read.response;
-  const unauthorized = await authorizeProjectFilesRequest(env, read.body);
+  const unauthorized = await authorizeProjectFilesRequest(env, read.body, 'prefix');
   if (unauthorized) return unauthorized;
 
   const resolved = projectFilesBucket(env);

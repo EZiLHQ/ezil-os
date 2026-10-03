@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  EZiL OS durable workspace store. Computers run on Cloudflare Containers; their
+  /workspace checkpoints (worker/src/workspace-persist.ts) are stored here through
+  the S3 store adapter (EZIL_WORKSPACE_STORE=s3). Private, encrypted, versioned,
+  TLS-only. The Worker's IAM user can get/put/list under the workspace prefix, and
+  delete ONLY checkpoint-generation objects (superseded-snapshot GC; the flush itself
+  is put-only). Versioning keeps deleted versions for NoncurrentVersionDays. Access keys are NOT
+  created here (CloudFormation would expose them); see README.md.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Globally unique bucket name, e.g. ezil-os-workspaces-<account-id>-us-east-1
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+  KeyPrefix:
+    Type: String
+    Default: workspaces/
+    Description: Must equal EZIL_WORKSPACE_S3_KEY_PREFIX on the Worker. Trailing slash required.
+    AllowedPattern: '^[a-z0-9][a-z0-9/_-]*/$'
+  NoncurrentVersionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: How long overwritten/deleted object versions (e.g. old checkpoint heads) are recoverable.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 50
+    Description: Budget alarm threshold for this account's S3 spend.
+  BudgetEmail:
+    Type: String
+    Description: Address that receives the 80%/100% budget alerts.
+
+Resources:
+  WorkspaceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+            BucketKeyEnabled: true
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-noncurrent-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: !Ref NoncurrentVersionDays }
+          - Id: abort-incomplete-multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
+      Tags:
+        - { Key: ezil:managed-by, Value: workspace-store }
+
+  WorkspaceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WorkspaceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt WorkspaceBucket.Arn
+              - !Sub '${WorkspaceBucket.Arn}/*'
+            Condition: { Bool: { 'aws:SecureTransport': 'false' } }
+
+  WorkerUser:
+    Type: AWS::IAM::User
+    Properties:
+      Path: /ezil/
+      UserName: !Sub 'ezil-os-workspace-store-${AWS::Region}'
+      Tags:
+        - { Key: ezil:managed-by, Value: workspace-store }
+
+  WorkerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: workspace-store-rw-gc
+      Users: [!Ref WorkerUser]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ObjectsUnderPrefix
+            Effect: Allow
+            Action: ['s3:GetObject', 's3:PutObject']
+            Resource: !Sub '${WorkspaceBucket.Arn}/${KeyPrefix}*'
+          - Sid: GcSupersededCheckpointsOnly
+            Effect: Allow
+            Action: 's3:DeleteObject'
+            Resource: !Sub '${WorkspaceBucket.Arn}/${KeyPrefix}*/.ezil-snapshots/*'
+          - Sid: ListUnderPrefix
+            Effect: Allow
+            Action: 's3:ListBucket'
+            Resource: !GetAtt WorkspaceBucket.Arn
+            Condition: { StringLike: { 's3:prefix': [!Sub '${KeyPrefix}*'] } }
+
+  S3Budget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: ezil-os-workspace-store-s3
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref MonthlyBudgetUsd, Unit: USD }
+        CostFilters: { Service: ['Amazon Simple Storage Service'] }
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80 }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100 }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetEmail }]
+
+Outputs:
+  BucketName: { Value: !Ref WorkspaceBucket }
+  Region: { Value: !Ref 'AWS::Region' }
+  KeyPrefix: { Value: !Ref KeyPrefix }
+  WorkerUserName: { Value: !Ref WorkerUser }

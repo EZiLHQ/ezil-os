@@ -34,7 +34,16 @@ workers_dev = true
 [[containers]]
 class_name = "Sandbox"
 image = "./Dockerfile"
-instance_type = "standard-3"
+# 2026-10-02: custom 2 vCPU / 6 GiB / 16 GB replaces standard-3 (2 vCPU / 8 GiB).
+# Memory is billed on PROVISIONED size and CPU on ACTIVE use, so cutting memory
+# is the saving; CPU stays at 2 vCPU (standard-1's half core starved software
+# rendering + WebRTC encode, and the idle-stop loadavg threshold in index.ts was
+# measured at 2 vCPU). Cloudflare requires >= 3 GiB per vCPU, so 6 GiB is the
+# least memory that keeps 2 vCPU. Measured on ezil-desktop:rev3 (desktop up,
+# bun install + next dev + next build + checkpoint): cgroup peak 1.8-2.6 GiB,
+# 0 memory-pressure events even under a 4 GiB cap. 4 GiB would force 1 vCPU
+# (+49% build time measured, video encode untested).
+instance_type = { vcpu = 2, memory_mib = 6144, disk_mb = 16000 }
 max_instances = 20
 # ── Rollout: replace EVERY instance in one step ───────────────────────────────
 # 🔴 THE DEFAULT SILENTLY STRANDS DEPLOYS, AND IT DID. Without these keys
@@ -144,6 +153,27 @@ local_protocol = "http"
 SANDBOX_DEFAULT_DESKTOP_MODE = "neko"
 
 SANDBOX_NEKO_ICE_POLICY = "relay"
+
+# ── Durable workspace STORE (founder decision 2026-10-02) ────────────────────
+# The hydrate/flush persistence path can keep using the R2 binding above or move
+# to AWS S3 (us-east-1). This is NOT the s3fs mount (PLATFORM-NOTES §1 — that
+# path drops writes and is never used for live storage); it selects the backend
+# for the Worker-mediated checkpoint store. See worker/src/workspace-store-s3.ts
+# and docs/WORKSPACE-STORE.md.
+#
+# EZIL_WORKSPACE_STORE is DELIBERATELY NOT SET here: the default is 'r2', and an
+# S3 cutover is opt-in per deployment. To switch a deployment to S3:
+#   wrangler secret put EZIL_WORKSPACE_STORE          # value: s3
+#   wrangler secret put EZIL_WORKSPACE_S3_BUCKET      # bucket name
+#   wrangler secret put EZIL_WORKSPACE_S3_REGION      # e.g. us-east-1
+#   wrangler secret put EZIL_WORKSPACE_S3_ACCESS_KEY_ID
+#   wrangler secret put EZIL_WORKSPACE_S3_SECRET_ACCESS_KEY
+# Optional: EZIL_WORKSPACE_S3_ENDPOINT (path-style/MinIO), EZIL_WORKSPACE_S3_KEY_PREFIX,
+# EZIL_WORKSPACE_S3_SSE ('AES256'|'aws:kms'), EZIL_WORKSPACE_S3_KMS_KEY_ID.
+# Any other EZIL_WORKSPACE_STORE value, or a missing required S3 var, FAILS
+# CLOSED (workspace_store_misconfigured) — it never silently falls back to R2.
+# While the R2 binding above is still present, the FIRST hydrate after switching
+# to 's3' migrates that computer's R2 workspace into S3 (one-way — see the doc).
 
 # ── Custom domain + preview routes: LIVE on ezil.org (narrow suffix routes) ──
 # (see `worker/src/index.ts`'s `PREVIEW_ZONE_ROOT` doc comment for the full
@@ -301,7 +331,7 @@ tag = "v1"
 name = "ezil-os-worker-staging-sandbox"
 class_name = "Sandbox"
 image = "./Dockerfile"
-instance_type = "standard-3"
+instance_type = { vcpu = 2, memory_mib = 6144, disk_mb = 16000 }
 max_instances = 5
 rollout_step_percentage = 100
 rollout_kind = "full_auto"
