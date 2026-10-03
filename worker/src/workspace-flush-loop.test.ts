@@ -72,6 +72,7 @@
  */
 
 import { describe, expect, it, mock } from 'bun:test';
+import { createHash } from 'node:crypto';
 
 // Must be registered before `./index.ts` is imported — see `route-auth.test.ts`.
 mock.module('cloudflare:workers', () => ({
@@ -177,9 +178,11 @@ async function makeFake(opts: FakeOptions = {}): Promise<FakeDO & Record<string,
     },
     env: {
       SANDBOX_WORKSPACE_R2_BUCKET: {
+        get: async () => null,
         put: async (key: string) => {
           if (opts.bucketPutThrows) throw new Error('r2 unavailable');
           calls.r2Puts.push(key);
+          return { etag: "test-etag" };
         },
       },
     },
@@ -204,11 +207,19 @@ async function makeFake(opts: FakeOptions = {}): Promise<FakeDO & Record<string,
     destroy: async () => void calls.destroys++,
     exec: async (command: string) => {
       calls.execs.push(command);
+      if (command.startsWith('python3 ')) {
+        if (command.includes('"op":"capture"')) {
+          if (opts.listFilesThrows) throw new Error('container RPC failed: connection reset');
+          const sha256 = createHash('sha256').update('hello').digest('hex');
+          return { exitCode: 0, stdout: JSON.stringify({ sha256, entries: files.length, chunks: [{ size: 5, sha256 }] }) };
+        }
+        return { exitCode: 0, stdout: '' };
+      }
       if (opts.execThrows) throw new Error('container gone');
       return { exitCode: 0, stdout: opts.loadavg ?? '0.00 0.01 0.05 1/123 456\n' };
     },
     exists: async () => ({ exists: false }),
-    readFile: async () => ({ content: 'hello', encoding: 'utf-8' }),
+    readFile: async () => ({ content: Buffer.from('hello').toString('base64'), encoding: 'base64' }),
     writeFile: async () => ({ success: true }),
     listFiles: async () => {
       if (opts.listFilesThrows) throw new Error('container RPC failed: connection reset');
@@ -447,10 +458,11 @@ describe('flushWorkspaceScheduled: the loop survives a failing cycle', () => {
       ok: boolean;
       skippedReason?: string;
       uploaded: string[];
+      failed: unknown[];
     };
 
     expect(outcome.ok).toBe(false);
-    expect(outcome.skippedReason).toBe('flush_threw');
+    expect(outcome.failed.length).toBe(1);
     expect(outcome.uploaded).toEqual([]);
   });
 
@@ -462,7 +474,7 @@ describe('flushWorkspaceScheduled: the loop survives a failing cycle', () => {
 
     await runAlarmCycle(fake);
 
-    expect(fake.calls.r2Puts).toContain(`${PREFIX}/a.ts`);
+    expect(fake.calls.r2Puts).toContain(`${PREFIX}/.ezil-snapshots/latest.json`);
     // A cycle that actually wrote something stays on the base cadence.
     expect(fake.calls.scheduled).toEqual([{ seconds: 10, callback: FLUSH_CALLBACK }]);
   });
@@ -590,7 +602,7 @@ describe('preserved invariant: final flush before stop, and stop only if it work
 
     await runAlarmCycle(fake);
 
-    expect(fake.calls.r2Puts).toContain(`${PREFIX}/a.ts`);
+    expect(fake.calls.r2Puts).toContain(`${PREFIX}/.ezil-snapshots/latest.json`);
     expect(fake.calls.stops).toBe(1);
     expect(fake.calls.destroys).toBe(0);
     expect(fake.calls.scheduled).toEqual([]); // retired, not rescheduled
@@ -617,7 +629,7 @@ describe('preserved invariant: final flush before stop, and stop only if it work
     // The busy probe having run proves the idle branch really was taken, so
     // the surviving reschedule below is the idle-retry path rather than the
     // wrapper swallowing an early throw.
-    expect(fake.calls.execs.length).toBe(1);
+    expect(fake.calls.execs.filter(c => !c.startsWith('python3 ')).length).toBe(1);
     expect(fake.calls.stops).toBe(0);
     expect(fake.calls.scheduled).toEqual([{ seconds: 10, callback: FLUSH_CALLBACK }]);
   });
@@ -666,4 +678,65 @@ describe('preserved invariant: idle-stop is NOT termination', () => {
     expect(storeOf(fake).has(TERMINATED_KEY)).toBe(false);
     expect(fake.calls.scheduled).toEqual([{ seconds: 10, callback: FLUSH_CALLBACK }]);
   });
+});
+
+describe('explicit termination requires a confirmed checkpoint', () => {
+  for (const options of [
+    { bucketPutThrows: true, storage: hydratedStorage() },
+    { listFilesThrows: true, storage: hydratedStorage() },
+    { storage: {} },
+    { storage: hydratedStorage({ [HYDRATED_KEY]: false }) },
+  ]) {
+    it(`refuses failed or unavailable persistence: ${JSON.stringify(Object.keys(options))}`, async () => {
+      const fake = await makeFake(options);
+      const proto = await loadPrototype();
+      const result = await proto.terminateSandbox.call(fake) as { ok: boolean; outcome: string; terminated: boolean };
+      expect(result).toMatchObject({ ok: false, outcome: 'flush_failed', terminated: false });
+      expect(fake.calls.destroys).toBe(0);
+      expect(fake.calls.deleteSchedules).toEqual([]);
+      expect(storeOf(fake).has(TERMINATED_KEY)).toBe(false);
+    });
+  }
+  it('bare destroy uses the same refusal instead of bypassing the final flush', async () => {
+    const fake = await makeFake({ bucketPutThrows: true, storage: hydratedStorage() });
+    const proto = await loadPrototype();
+    await expect(proto.destroy.call(fake)).rejects.toThrow('workspace_checkpoint_failed');
+    expect(storeOf(fake).has(TERMINATED_KEY)).toBe(false);
+  });
+  it('serializes persistence operations, including after a failed operation', async () => {
+    const fake = await makeFake(); const proto = await loadPrototype();
+    const events: string[] = []; let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const lock = proto.withWorkspacePersistence as (this: unknown, op: () => Promise<unknown>) => Promise<unknown>;
+    const first = lock.call(fake, async () => { events.push('first'); await gate; throw new Error('expected'); });
+    const second = lock.call(fake, async () => { events.push('second'); });
+    await Promise.resolve(); await Promise.resolve(); expect(events).toEqual(['first']);
+    release(); await expect(first).rejects.toThrow('expected'); await second;
+    expect(events).toEqual(['first', 'second']);
+  });
+  it('destroys only after a successful checkpoint and observes the stopped container', async () => {
+    const fake = await makeFake({ storage: hydratedStorage() }); const proto = await loadPrototype();
+    const base = Object.getPrototypeOf(proto); const original = base.destroy;
+    base.destroy = async function(this: typeof fake) {
+      expect(this.calls.r2Puts).toContain(`${PREFIX}/.ezil-snapshots/latest.json`);
+      this.calls.destroys++; this.ctx.container.running = false;
+    };
+    try {
+      expect(await proto.terminateSandbox.call(fake)).toMatchObject({ ok: true, terminated: true, outcome: 'destroyed' });
+      expect(fake.calls.destroys).toBe(1); expect(storeOf(fake).get(TERMINATED_KEY)).toBe(true);
+    } finally { base.destroy = original; }
+  });
+});
+
+it('keeps the desktop alive when user activity arrives during the final idle checkpoint', async () => {
+  const fake = await makeFake({ storage: hydratedStorage({ [LAST_ACTIVITY_AT_KEY]: Date.now() - 2 * IDLE_STOP_MS }) });
+  const original = fake.exec as (command: string) => Promise<unknown>;
+  fake.exec = async (command: string) => {
+    const result = await original(command);
+    if (command.includes('"op":"confirm"')) storeOf(fake).set(LAST_ACTIVITY_AT_KEY, Date.now());
+    return result;
+  };
+  await runAlarmCycle(fake);
+  expect(fake.calls.stops).toBe(0);
+  expect(fake.calls.scheduled).toEqual([{ seconds: 10, callback: FLUSH_CALLBACK }]);
 });

@@ -6,6 +6,7 @@
       "name": "cf-guacamole-sandbox",
       "dependencies": {
         "@cloudflare/sandbox": "0.12.1",
+        "aws4fetch": "1.0.20",
       },
       "devDependencies": {
         "@cloudflare/workers-types": "^4.20241218.0",

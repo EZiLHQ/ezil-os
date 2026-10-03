@@ -1,750 +1,448 @@
-/**
- * Package-local tests for `./workspace-persist` — the hydrate/flush logic
- * that replaced `mountBucket()`'s s3fs mount. Run with `bun test`, no Workers
- * runtime or real Sandbox/R2 bucket required — exercised against in-memory
- * fakes for the container filesystem and the R2 binding, in the same style
- * as `./workspace-seed.test.ts`.
- */
-
-import { describe, expect, it } from 'bun:test';
-
+import { afterEach, describe, expect, it } from 'bun:test';
+import { mkdtemp, mkdir, writeFile, readFile, rm, chmod, symlink, lstat, readlink, realpath } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { createHash } from 'node:crypto';
 import {
-  computeFlushPlan,
-  flushWorkspaceToR2,
-  FLUSH_MANIFEST_FILENAME,
-  hydrateWorkspaceFromR2,
-  HYDRATE_MARKER_FILENAME,
-  isIgnoredDirName,
-  parseFlushManifest,
-  parseHydrateMarker,
-  serializeFlushManifest,
-  serializeHydrateMarker,
-  walkWorkspaceTree,
-  WORKSPACE_FLUSH_IGNORE_DIR_NAMES,
-  WORKSPACE_HEARTBEAT_FILENAME,
-  type FlushContainerLike,
-  type FlushFileInfoLike,
-  type FlushManifest,
-  type FlushR2BucketLike,
-  type HydrateContainerLike,
-  type HydrateR2BucketLike,
-  type RelFileInfo,
+  flushWorkspaceToR2, hydrateWorkspaceFromR2, HYDRATE_MARKER_FILENAME, SNAPSHOT_HEAD, collectSupersededSnapshots,
+  parseHydrateMarker, parseSnapshot, serializeHydrateMarker,
+  type FlushR2BucketLike, type HydrateR2BucketLike, type FlushContainerLike,
 } from './workspace-persist';
+// The snapshot codec only ever runs in the Linux container; it needs a POSIX host here.
+const NO_POSIX_HOST = process.platform === 'win32';
 
-// ── In-memory fake container filesystem ─────────────────────────────────────
-//
-// Models exactly the slice of the Sandbox SDK's file RPCs
-// (`mkdir`/`writeFile`/`readFile`/`listFiles`/`exists`) that `workspace-persist.ts`
-// depends on. A monotonic clock stands in for real wall-clock mtimes so
-// "unchanged" comparisons are deterministic across test runs.
+const run = promisify(execFile);
+const prefix = 'project/branches/main';
+const roots: string[] = [];
+const env = { PATH: '/usr/bin:/bin', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+afterEach(async () => { await Promise.all(roots.splice(0).map(p => rm(p, { recursive: true, force: true }))); });
+async function temp() { const root = await realpath(await mkdtemp('/tmp/ezil-durable-test-')); roots.push(root); return root; }
+const log = () => {};
+const digest = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
 
-interface FakeFileEntry {
-  content: string;
-  encoding: 'utf-8' | 'base64';
-  mtime: number;
+class Bucket implements FlushR2BucketLike, HydrateR2BucketLike {
+  data = new Map<string, { bytes: Uint8Array; etag: string }>();
+  puts: string[] = [];
+  revision = 0;
+  onPut?: (key: string) => void | Promise<void>;
+  failPut?: (key: string) => boolean;
+  async get(key: string) {
+    const value = this.data.get(key);
+    return value ? { etag: value.etag, size: value.bytes.length,
+      arrayBuffer: async () => Uint8Array.from(value.bytes).buffer } : null;
+  }
+  async put(key: string, bytes: Uint8Array, options?: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } }) {
+    await this.onPut?.(key);
+    if (this.failPut?.(key)) return null;
+    const prior = this.data.get(key);
+    if (options?.onlyIf?.etagMatches && prior?.etag !== options.onlyIf.etagMatches) return null;
+    if (options?.onlyIf?.etagDoesNotMatch === '*' && prior) return null;
+    const etag = String(++this.revision);
+    this.data.set(key, { bytes: bytes.slice(), etag }); this.puts.push(key);
+    return { etag };
+  }
+  async list(options: { prefix: string; cursor?: string; limit?: number }) {
+    const keys = [...this.data.keys()].filter(k => k.startsWith(options.prefix)).sort();
+    const offset = Number(options.cursor ?? 0), end = offset + (options.limit ?? 1000);
+    return { objects: keys.slice(offset, end).map(key => ({ key })), truncated: end < keys.length,
+      cursor: end < keys.length ? String(end) : undefined };
+  }
 }
+const container: FlushContainerLike = {
+  async mkdir(path, opts) { await mkdir(path, { recursive: opts?.recursive ?? false }); },
+  async writeFile(path, content, opts) { await writeFile(path, opts?.encoding === 'base64' ? Buffer.from(content, 'base64') : content); },
+  async readFile(path, opts) { const bytes = await readFile(path); return { content: bytes.toString(opts?.encoding === 'base64' ? 'base64' : 'utf8'), encoding: opts?.encoding }; },
+  async exists(path) { try { await lstat(path); return { exists: true }; } catch { return { exists: false }; } },
+  async exec(command) {
+    try { const result = await run('bash', ['-c', command], { env, maxBuffer: 1024 * 1024 }); return { ...result, exitCode: 0 }; }
+    catch { return { exitCode: 1, stdout: '', stderr: 'snapshot helper failed' }; }
+  },
+};
+async function mark(root: string) {
+  await writeFile(`${root}/${HYDRATE_MARKER_FILENAME}`, serializeHydrateMarker({ version: 1, prefix, mountPath: root, hydratedAt: new Date().toISOString() }));
+}
+async function workspace() { const base = await temp(); const root = `${base}/source`; await mkdir(root); await mark(root); return { base, root }; }
+const flush = (root: string, bucket: Bucket) => flushWorkspaceToR2({ container, bucket, mountPath: root, realPrefix: prefix, hydrationComplete: true, manifest: {}, log });
+const hydrate = (root: string, bucket: Bucket) => hydrateWorkspaceFromR2({ container, bucket, mountPath: root, realPrefix: prefix, log });
+const git = async (root: string, ...args: string[]) => (await run('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-C', root, ...args], { env })).stdout;
+const headKey = `${prefix}/${SNAPSHOT_HEAD}`;
 
-class FakeContainer implements HydrateContainerLike, FlushContainerLike {
-  files = new Map<string, FakeFileEntry>();
-  dirs = new Set<string>(['/workspace']);
-  clock = 0;
-  calls = {
-    listFiles: [] as string[],
-    readFile: [] as string[],
-    writeFile: [] as string[],
-    mkdir: [] as string[],
-  };
+describe.skipIf(NO_POSIX_HOST)('atomic Git workspace checkpoints (real filesystem and Git)', () => {
+  it('restores the exact index, refs, objects, staged/unstaged edits, deletions, modes and safe links after replacement', async () => {
+    const { base, root } = await workspace(); const bucket = new Bucket();
+    await git(root, 'init', '-b', 'main');
+    await writeFile(`${root}/a.txt`, 'committed\n'); await writeFile(`${root}/deleted.txt`, 'gone later');
+    await mkdir(`${root}/dist`); await writeFile(`${root}/dist/tracked.txt`, 'tracked build output');
+    await git(root, 'add', 'a.txt', 'deleted.txt', 'dist/tracked.txt'); await git(root, 'commit', '-m', 'unpushed commit');
+    await writeFile(`${root}/a.txt`, 'staged\n'); await git(root, 'add', 'a.txt');
+    await writeFile(`${root}/a.txt`, 'unstaged\n'); await rm(`${root}/deleted.txt`);
+    await writeFile(`${root}/run.sh`, '#!/bin/sh\nexit 0\n'); await chmod(`${root}/run.sh`, 0o755);
+    await symlink('a.txt', `${root}/link`); await mkdir(`${root}/empty`);
+    await mkdir(`${root}/node_modules`); await writeFile(`${root}/node_modules/cache`, 'regenerated');
+    // Bookkeeping itself is untracked; compare Git output with it hidden.
+    await writeFile(`${root}/.git/info/exclude`, '.ezil-hydrated.json\nnode_modules/\n');
+    const status = await git(root, 'status', '--porcelain=v1', '-z');
+    const diff = await git(root, 'diff', '--binary'); const staged = await git(root, 'diff', '--cached', '--binary');
+    const commit = await git(root, 'rev-parse', 'HEAD'); const index = await readFile(`${root}/.git/index`);
+    expect((await flush(root, bucket)).ok).toBe(true);
+    const target = `${base}/replacement`;
+    expect((await hydrate(target, bucket)).ok).toBe(true);
+    expect(await git(target, 'status', '--porcelain=v1', '-z')).toBe(status);
+    expect(await git(target, 'diff', '--binary')).toBe(diff);
+    expect(await git(target, 'diff', '--cached', '--binary')).toBe(staged);
+    expect(await git(target, 'rev-parse', 'HEAD')).toBe(commit);
+    // Git status can refresh stat data in the index. Check a second untouched restore.
+    const exact = `${base}/exact`; expect((await hydrate(exact, bucket)).ok).toBe(true);
+    expect(await readFile(`${exact}/.git/index`)).toEqual(index);
+    expect((await lstat(`${target}/run.sh`)).mode & 0o777).toBe(0o755);
+    expect(await readlink(`${target}/link`)).toBe('a.txt');
+    expect((await lstat(`${target}/empty`)).isDirectory()).toBe(true);
+    expect((await container.exists(`${target}/deleted.txt`)).exists).toBe(false);
+    expect((await container.exists(`${target}/node_modules`)).exists).toBe(false);
+    expect(await readFile(`${target}/dist/tracked.txt`, 'utf8')).toBe('tracked build output');
+    await git(target, 'fsck', '--full');
+  });
 
-  private registerAncestorDirs(path: string): void {
-    let p = path;
-    for (;;) {
-      const idx = p.lastIndexOf('/');
-      if (idx <= 0) return;
-      p = p.slice(0, idx);
-      this.dirs.add(p);
-    }
-  }
+  it('deletions, link changes, binary data and executable-bit-only edits supersede old snapshots', async () => {
+    const { base, root } = await workspace(); const bucket = new Bucket();
+    await writeFile(`${root}/removed`, 'old'); await writeFile(`${root}/binary`, Buffer.from([0, 255, 128, 1]));
+    await symlink('removed', `${root}/link`); expect((await flush(root, bucket)).ok).toBe(true);
+    await rm(`${root}/removed`); await rm(`${root}/link`); await symlink('binary', `${root}/link`); await chmod(`${root}/binary`, 0o755);
+    expect((await flush(root, bucket)).ok).toBe(true);
+    expect((await hydrate(`${base}/restored`, bucket)).ok).toBe(true);
+    expect((await container.exists(`${base}/restored/removed`)).exists).toBe(false);
+    expect(await readlink(`${base}/restored/link`)).toBe('binary');
+    expect(await readFile(`${base}/restored/binary`)).toEqual(Buffer.from([0, 255, 128, 1]));
+    expect((await lstat(`${base}/restored/binary`)).mode & 0o777).toBe(0o755);
+  });
 
-  /** Test-setup helper: seed a file directly (bypassing writeFile's call-tracking). */
-  seedFile(path: string, content: string, encoding: 'utf-8' | 'base64' = 'utf-8'): void {
-    this.clock++;
-    this.files.set(path, { content, encoding, mtime: this.clock });
-    this.registerAncestorDirs(path);
-  }
+  it('reuses immutable chunks on an unchanged checkpoint', async () => {
+    const { root } = await workspace(); const bucket = new Bucket(); await writeFile(`${root}/a`, 'a');
+    const first = await flush(root, bucket); const second = await flush(root, bucket);
+    expect(first.ok).toBe(true); expect(second.ok).toBe(true);
+    expect(second.checkpoint).not.toBe(first.checkpoint); expect(second.uploaded).toEqual([]);
+  });
 
-  async mkdir(path: string, _options?: { recursive?: boolean }) {
-    this.calls.mkdir.push(path);
-    this.dirs.add(path);
-    this.registerAncestorDirs(path);
-    return { success: true, path, recursive: true, timestamp: new Date().toISOString() };
-  }
+  it('keeps the prior head on upload failure or edits during upload', async () => {
+    const { root } = await workspace(); const bucket = new Bucket(); await writeFile(`${root}/a`, 'old');
+    expect((await flush(root, bucket)).ok).toBe(true); const old = bucket.data.get(headKey)!.bytes;
+    await writeFile(`${root}/a`, 'new'); bucket.failPut = key => key.endsWith('/0');
+    expect((await flush(root, bucket)).ok).toBe(false); expect(bucket.data.get(headKey)!.bytes).toEqual(old);
+    bucket.failPut = undefined; bucket.onPut = async key => { if (key.endsWith('/0')) await writeFile(`${root}/a`, 'changed while uploading'); };
+    expect((await flush(root, bucket)).ok).toBe(false); expect(bucket.data.get(headKey)!.bytes).toEqual(old);
+  });
 
-  async writeFile(path: string, content: string, options?: { encoding?: string }) {
-    this.calls.writeFile.push(path);
-    this.clock++;
-    this.files.set(path, {
-      content,
-      encoding: options?.encoding === 'base64' ? 'base64' : 'utf-8',
-      mtime: this.clock,
-    });
-    this.registerAncestorDirs(path);
-    return { success: true, path, timestamp: new Date().toISOString() };
-  }
+  it('rejects a competing publisher with conditional manifest commit', async () => {
+    const { root } = await workspace(); const bucket = new Bucket(); await writeFile(`${root}/a`, 'a');
+    expect((await flush(root, bucket)).ok).toBe(true);
+    bucket.onPut = key => { if (key === headKey) bucket.data.get(headKey)!.etag = 'competing-version'; };
+    expect((await flush(root, bucket)).ok).toBe(false);
+  });
 
-  async readFile(path: string, _options?: { encoding?: string }) {
-    this.calls.readFile.push(path);
-    const entry = this.files.get(path);
-    if (!entry) throw new Error(`ENOENT: no such file ${path}`);
-    return { content: entry.content, encoding: entry.encoding };
-  }
-
-  async exists(path: string) {
-    return { exists: this.files.has(path) || this.dirs.has(path) };
-  }
-
-  async listFiles(path: string, _options?: { recursive?: boolean; includeHidden?: boolean }) {
-    this.calls.listFiles.push(path);
-    const prefix = path.endsWith('/') ? path : `${path}/`;
-    const seen = new Map<string, FlushFileInfoLike>();
-
-    for (const [filePath, entry] of this.files) {
-      if (!filePath.startsWith(prefix)) continue;
-      const rest = filePath.slice(prefix.length);
-      if (rest.length === 0) continue;
-      const slash = rest.indexOf('/');
-      if (slash >= 0) {
-        const name = rest.slice(0, slash);
-        if (!seen.has(name)) seen.set(name, { name, type: 'directory', size: 0, modifiedAt: '0' });
-        continue;
+  for (const damage of ['missing chunk', 'corrupt chunk', 'corrupt head', 'unknown version']) {
+    it(`fails closed on ${damage} without publishing a partial workspace`, async () => {
+      const { base, root } = await workspace(); const bucket = new Bucket(); await writeFile(`${root}/a`, 'a');
+      expect((await flush(root, bucket)).ok).toBe(true);
+      const chunk = [...bucket.data.keys()].find(k => k.endsWith('/0'))!;
+      if (damage === 'missing chunk') bucket.data.delete(chunk);
+      if (damage === 'corrupt chunk') bucket.data.get(chunk)!.bytes[0] ^= 1;
+      if (damage === 'corrupt head') bucket.data.get(headKey)!.bytes = new TextEncoder().encode('{');
+      if (damage === 'unknown version') {
+        const value = JSON.parse(new TextDecoder().decode(bucket.data.get(headKey)!.bytes)); value.version = 2;
+        bucket.data.get(headKey)!.bytes = new TextEncoder().encode(JSON.stringify(value));
       }
-      seen.set(rest, { name: rest, type: 'file', size: entry.content.length, modifiedAt: String(entry.mtime) });
-    }
-    for (const dirPath of this.dirs) {
-      if (dirPath === path || !dirPath.startsWith(prefix)) continue;
-      const rest = dirPath.slice(prefix.length);
-      if (rest.length === 0 || rest.includes('/')) continue;
-      if (!seen.has(rest)) seen.set(rest, { name: rest, type: 'directory', size: 0, modifiedAt: '0' });
-    }
-
-    return { files: [...seen.values()] };
+      const target = `${base}/target`; expect((await hydrate(target, bucket)).ok).toBe(false);
+      expect((await container.exists(`${target}/${HYDRATE_MARKER_FILENAME}`)).exists).toBe(false);
+    });
   }
-}
 
-// ── In-memory fake R2 bucket(s) ──────────────────────────────────────────────
-
-function makeFakeHydrateBucket(objects: Record<string, string> = {}): HydrateR2BucketLike & { store: Map<string, string> } {
-  const store = new Map(Object.entries(objects));
-  return {
-    store,
-    async list({ prefix, cursor, limit }) {
-      const allKeys = [...store.keys()].filter((k) => k.startsWith(prefix)).sort();
-      const startIdx = cursor ? Number(cursor) : 0;
-      const page = allKeys.slice(startIdx, startIdx + (limit ?? 1000));
-      const truncated = startIdx + page.length < allKeys.length;
-      return {
-        objects: page.map((key) => ({ key })),
-        truncated,
-        cursor: truncated ? String(startIdx + page.length) : undefined,
-      };
-    },
-    async get(key) {
-      const value = store.get(key);
-      if (value === undefined) return null;
-      const bytes = new TextEncoder().encode(value);
-      return { async arrayBuffer() { return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer; } };
-    },
-  };
-}
-
-/**
- * `FlushR2BucketLike` declares ONLY `put()` — deliberately. There is no
- * `delete` method on this fake either, which means the fake itself is proof
- * (not just documentation) that nothing in `flushWorkspaceToR2` can call
- * `bucket.delete(...)`: if it tried, `tsc` would refuse to compile this test
- * file (the fake wouldn't satisfy `FlushR2BucketLike`, and no other bucket
- * type is accepted by `flushWorkspaceToR2`'s signature).
- */
-function makeFakeFlushBucket(): FlushR2BucketLike & { puts: Array<{ key: string; value: Uint8Array }> } {
-  const puts: Array<{ key: string; value: Uint8Array }> = [];
-  return {
-    puts,
-    async put(key, value) {
-      puts.push({ key, value });
-      return { etag: `etag-${puts.length}` };
-    },
-  };
-}
-
-function noopLog(): void {
-  // swallow in tests that don't assert on logging
-}
-
-function collectLogs(): { log: (m: string) => void; lines: string[] } {
-  const lines: string[] = [];
-  return { log: (m) => lines.push(m), lines };
-}
-
-// ── Ignore list ──────────────────────────────────────────────────────────────
-
-describe('WORKSPACE_FLUSH_IGNORE_DIR_NAMES / isIgnoredDirName', () => {
-  it('contains exactly the required five names', () => {
-    expect([...WORKSPACE_FLUSH_IGNORE_DIR_NAMES].sort()).toEqual(
-      ['.git', '.next', '.turbo', 'dist', 'node_modules'].sort(),
-    );
+  it('never overwrites a nonempty warm workspace even when its marker was lost', async () => {
+    const { base, root } = await workspace(); const bucket = new Bucket(); await writeFile(`${root}/a`, 'saved');
+    expect((await flush(root, bucket)).ok).toBe(true);
+    const target = `${base}/target`; await mkdir(target); await writeFile(`${target}/a`, 'unflushed');
+    expect((await hydrate(target, bucket)).ok).toBe(false); expect(await readFile(`${target}/a`, 'utf8')).toBe('unflushed');
   });
 
-  it('matches ignored names and rejects everything else', () => {
-    for (const name of WORKSPACE_FLUSH_IGNORE_DIR_NAMES) {
-      expect(isIgnoredDirName(name)).toBe(true);
-    }
-    expect(isIgnoredDirName('src')).toBe(false);
-    expect(isIgnoredDirName('node_modules_backup')).toBe(false); // exact-name match only, not a prefix match
-  });
-});
-
-// ── hydrateWorkspaceFromR2 ────────────────────────────────────────────────────
-
-describe('hydrateWorkspaceFromR2', () => {
-  it('first hydrate populates /workspace from every R2 object under the prefix', async () => {
-    const bucket = makeFakeHydrateBucket({
-      'proj1/branches/main/package.json': '{"name":"demo"}',
-      'proj1/branches/main/src/index.ts': 'export const x = 1;',
+  for (const target of ['/etc/passwd', '../../escape']) {
+    it(`never archives unsafe symlink ${target}: skipped and reported, the rest still checkpoints`, async () => {
+      const { base, root } = await workspace(); const bucket = new Bucket(); await symlink(target, `${root}/link`);
+      await writeFile(`${root}/keep.txt`, 'keep');
+      const out = await flush(root, bucket);
+      expect(out.ok).toBe(true); expect(out.skippedUnsupported).toBe(1); expect(bucket.data.has(headKey)).toBe(true);
+      expect((await hydrate(`${base}/restored`, bucket)).ok).toBe(true);
+      expect((await container.exists(`${base}/restored/link`)).exists).toBe(false);
+      expect(await readFile(`${base}/restored/keep.txt`, 'utf8')).toBe('keep');
     });
-    const container = new FakeContainer();
-
-    const outcome = await hydrateWorkspaceFromR2({
-      bucket,
-      container,
-      realPrefix: 'proj1/branches/main',
-      mountPath: '/workspace',
-      log: noopLog,
-    });
-
-    expect(outcome.ok).toBe(true);
-    expect(outcome.filesWritten).toBe(2);
-    expect(outcome.filesFailed).toBe(0);
-    expect(outcome.emptyPrefix).toBe(false);
-
-    const pkg = await container.readFile('/workspace/package.json');
-    expect(Buffer.from(pkg.content, 'base64').toString('utf-8')).toBe('{"name":"demo"}');
-    const idx = await container.readFile('/workspace/src/index.ts');
-    expect(Buffer.from(idx.content, 'base64').toString('utf-8')).toBe('export const x = 1;');
-    // mkdir was called for the nested file's parent directory.
-    expect(container.calls.mkdir).toContain('/workspace/src');
+  }
+  it('refuses active Git locks and stale hydration flags after container replacement', async () => {
+    const { root } = await workspace(); const bucket = new Bucket(); await git(root, 'init');
+    await writeFile(`${root}/.git/index.lock`, ''); expect((await flush(root, bucket)).ok).toBe(false);
+    await rm(`${root}/.git/index.lock`); await rm(`${root}/${HYDRATE_MARKER_FILENAME}`);
+    expect((await flush(root, bucket)).ok).toBe(false); expect(bucket.data.has(headKey)).toBe(false);
   });
 
-  it('paginates through bucket.list() across multiple pages (truncated + cursor)', async () => {
-    const objects: Record<string, string> = {};
-    for (let i = 0; i < 5; i++) objects[`proj1/branches/main/file${i}.txt`] = `content-${i}`;
-    const bucket = makeFakeHydrateBucket(objects);
-    const container = new FakeContainer();
-
-    const outcome = await hydrateWorkspaceFromR2({
-      bucket,
-      container,
-      realPrefix: 'proj1/branches/main',
-      mountPath: '/workspace',
-      log: noopLog,
-      pageSize: 2, // forces 3 pages for 5 objects
-    });
-
-    expect(outcome.ok).toBe(true);
-    expect(outcome.filesWritten).toBe(5);
-    for (let i = 0; i < 5; i++) {
-      const read = await container.readFile(`/workspace/file${i}.txt`);
-      expect(Buffer.from(read.content, 'base64').toString('utf-8')).toBe(`content-${i}`);
+  it('requires complete hydration and a scoped prefix before touching storage', async () => {
+    const { root } = await workspace(); const bucket = new Bucket();
+    for (const options of [{ hydrationComplete: false, realPrefix: prefix }, { hydrationComplete: true, realPrefix: '' }]) {
+      const result = await flushWorkspaceToR2({ container, bucket, mountPath: root, manifest: {}, log, ...options });
+      expect(result.ok).toBe(false); expect(bucket.puts).toEqual([]);
     }
   });
+});
 
-  it('skips the seed sentinel and the heartbeat object — never writes them locally', async () => {
-    const bucket = makeFakeHydrateBucket({
-      'proj1/branches/main/.ezil-seeded': '{"seededAt":"2020-01-01"}',
-      'proj1/branches/main/.ezil-heartbeat': '2020-01-01T00:00:00.000Z',
-      'proj1/branches/main/real-file.txt': 'hello',
-    });
-    const container = new FakeContainer();
-
-    const outcome = await hydrateWorkspaceFromR2({
-      bucket,
-      container,
-      realPrefix: 'proj1/branches/main',
-      mountPath: '/workspace',
-      log: noopLog,
-    });
-
-    expect(outcome.filesWritten).toBe(1);
-    expect(outcome.emptyPrefix).toBe(false); // the real file makes it non-empty
-    expect(container.files.has('/workspace/.ezil-seeded')).toBe(false);
-    expect(container.files.has('/workspace/.ezil-heartbeat')).toBe(false);
-    expect(container.files.has('/workspace/real-file.txt')).toBe(true);
+describe.skipIf(NO_POSIX_HOST)('legacy import and metadata validation', () => {
+  it('imports legacy files once and ignores loose stale keys after the first checkpoint', async () => {
+    const base = await temp(); const root = `${base}/legacy`; const bucket = new Bucket();
+    await bucket.put(`${prefix}/src/a`, new TextEncoder().encode('old'));
+    expect((await hydrate(root, bucket)).ok).toBe(true); expect((await flush(root, bucket)).ok).toBe(true);
+    await rm(`${root}/src/a`); expect((await flush(root, bucket)).ok).toBe(true);
+    expect((await hydrate(`${base}/new`, bucket)).ok).toBe(true);
+    expect((await container.exists(`${base}/new/src/a`)).exists).toBe(false);
   });
-
-  it('reports emptyPrefix:true and writes nothing when the prefix has no real objects', async () => {
-    const bucket = makeFakeHydrateBucket({});
-    const container = new FakeContainer();
-
-    const outcome = await hydrateWorkspaceFromR2({
-      bucket,
-      container,
-      realPrefix: 'proj1/branches/main',
-      mountPath: '/workspace',
-      log: noopLog,
-    });
-
-    expect(outcome.ok).toBe(true);
-    expect(outcome.emptyPrefix).toBe(true);
-    expect(outcome.filesWritten).toBe(0);
+  it('sentinel-only opens empty, path traversal is skipped (never written), incomplete listings still fail', async () => {
+    const base = await temp(); const bucket = new Bucket();
+    await bucket.put(`${prefix}/.ezil-seeded.json`, new TextEncoder().encode('seed'));
+    // Use the actual sentinel name from the seed module.
+    bucket.data.clear(); const { SEED_SENTINEL_FILENAME } = await import('./workspace-seed');
+    await bucket.put(`${prefix}/${SEED_SENTINEL_FILENAME}`, new Uint8Array());
+    const sentinelOnly = await hydrate(`${base}/sentinel`, bucket);
+    expect(sentinelOnly.ok).toBe(true); expect(sentinelOnly.filesWritten).toBe(0);
+    bucket.data.clear(); await bucket.put(`${prefix}/../escape`, new Uint8Array([1]));
+    await bucket.put(`${prefix}/kept.txt`, new TextEncoder().encode('kept'));
+    const traversal = await hydrate(`${base}/traversal`, bucket);
+    expect(traversal.ok).toBe(true); expect(traversal.skippedUnsafe).toBe(1);
+    expect(await readFile(`${base}/traversal/kept.txt`, 'utf8')).toBe('kept');
+    expect((await container.exists(`${base}/escape`)).exists).toBe(false);
+    bucket.data.clear(); bucket.list = async () => ({ objects: [], truncated: true, cursor: undefined });
+    expect((await hydrate(`${base}/partial`, bucket)).ok).toBe(false);
   });
-
-  it('a prefix containing ONLY the sentinel/heartbeat still reports emptyPrefix:true', async () => {
-    const bucket = makeFakeHydrateBucket({
-      'proj1/branches/main/.ezil-seeded': '{}',
-      'proj1/branches/main/.ezil-heartbeat': '2020-01-01T00:00:00.000Z',
-    });
-    const container = new FakeContainer();
-
-    const outcome = await hydrateWorkspaceFromR2({
-      bucket,
-      container,
-      realPrefix: 'proj1/branches/main',
-      mountPath: '/workspace',
-      log: noopLog,
-    });
-
-    expect(outcome.emptyPrefix).toBe(true);
-    expect(outcome.filesWritten).toBe(0);
-  });
-
-  it('continues past a single corrupt/failing object instead of aborting the whole pass', async () => {
-    const bucket = makeFakeHydrateBucket({
-      'proj1/branches/main/good.txt': 'fine',
-      'proj1/branches/main/bad.txt': 'also fine content, but get() will throw for this key',
-    });
-    const realGet = bucket.get.bind(bucket);
-    bucket.get = async (key: string) => {
-      if (key.endsWith('bad.txt')) throw new Error('simulated R2 get failure');
-      return realGet(key);
-    };
-    const container = new FakeContainer();
-    const { log, lines } = collectLogs();
-
-    const outcome = await hydrateWorkspaceFromR2({
-      bucket,
-      container,
-      realPrefix: 'proj1/branches/main',
-      mountPath: '/workspace',
-      log,
-    });
-
-    expect(outcome.ok).toBe(false); // filesFailed > 0
-    expect(outcome.filesWritten).toBe(1);
-    expect(outcome.filesFailed).toBe(1);
-    expect(await container.exists('/workspace/good.txt')).toEqual({ exists: true });
-    expect(lines.some((l) => l.includes('bad.txt'))).toBe(true); // failure logged loudly, not swallowed
-  });
-
-  it('SECURITY: refuses outright when given an empty realPrefix, never lists/reads the whole bucket', async () => {
-    const bucket = makeFakeHydrateBucket({ 'someone-elses-project/secret.txt': 'do not touch' });
-    let listCalled = false;
-    bucket.list = async (...args) => {
-      listCalled = true;
-      return { objects: [], truncated: false };
-    };
-    const container = new FakeContainer();
-    const { log, lines } = collectLogs();
-
-    const outcome = await hydrateWorkspaceFromR2({
-      bucket,
-      container,
-      realPrefix: '', // the hazard: an empty/defaulted prefix
-      mountPath: '/workspace',
-      log,
-    });
-
-    expect(outcome.ok).toBe(false);
-    expect(outcome.listOk).toBe(false);
-    expect(listCalled).toBe(false); // never even attempted bucket.list()
-    expect(lines.some((l) => l.toLowerCase().includes('refus'))).toBe(true);
+  it('requires the versioned local marker and validates manifest shape', () => {
+    expect(parseHydrateMarker('{"prefix":"p","mountPath":"/workspace","hydratedAt":"today"}')).toBeNull();
+    expect(parseHydrateMarker('bad')).toBeNull();
+    expect(() => parseSnapshot('{}')).toThrow();
+    expect(() => parseSnapshot(JSON.stringify({ version: 1, generation: 'a'.repeat(36), sha256: digest(new Uint8Array()), entries: 1, chunks: [] }))).toThrow();
   });
 });
 
-// ── walkWorkspaceTree ─────────────────────────────────────────────────────────
+describe.skipIf(NO_POSIX_HOST)('snapshot integrity and writer fencing', () => {
+  it('rejects a stale container after a replacement has advanced the checkpoint', async () => {
+    const { root, base } = await workspace(); const bucket = new Bucket(); await writeFile(`${root}/a`, 'first');
+    expect((await flush(root, bucket)).ok).toBe(true);
+    const replacement = `${base}/replacement`; expect((await hydrate(replacement, bucket)).ok).toBe(true);
+    await writeFile(`${replacement}/a`, 'replacement edit'); expect((await flush(replacement, bucket)).ok).toBe(true);
+    const current = bucket.data.get(headKey)!.bytes;
+    await writeFile(`${root}/a`, 'stale writer edit'); expect((await flush(root, bucket)).ok).toBe(false);
+    expect(bucket.data.get(headKey)!.bytes).toEqual(current);
+  });
+  it('restores files spanning several independently verified chunks', async () => {
+    const { base, root } = await workspace(); const bucket = new Bucket();
+    const bytes = Buffer.alloc(2 * 1024 * 1024 + 5, 173); await writeFile(`${root}/large.bin`, bytes);
+    const result = await flush(root, bucket); expect(result.ok).toBe(true); expect(result.uploaded.length).toBeGreaterThan(2);
+    expect((await hydrate(`${base}/restored`, bucket)).ok).toBe(true);
+    expect(await readFile(`${base}/restored/large.bin`)).toEqual(bytes);
+  });
+  for (const name of ['../escape', '/absolute', 'a/../../escape', '.ezil-hydrated.json']) {
+    it(`refuses a hash-valid archive with an unsafe entry ${name}`, async () => {
+      const base = await temp(); const bucket = new Bucket(); const archive = `${base}/bad.tar`;
+      await run('python3', ['-c', 'import tarfile,sys,io\nwith tarfile.open(sys.argv[1],"w") as t:\n m=tarfile.TarInfo(sys.argv[2]);m.size=1;t.addfile(m,io.BytesIO(b"x"))', archive, name], { env });
+      const bytes = await readFile(archive); const generation = crypto.randomUUID();
+      const snapshot = { version: 1, generation, sha256: digest(bytes), entries: 1, chunks: [{ size: bytes.length, sha256: digest(bytes) }] };
+      await bucket.put(headKey, new TextEncoder().encode(JSON.stringify(snapshot)));
+      await bucket.put(`${prefix}/.ezil-snapshots/${generation}/0`, bytes);
+      expect((await hydrate(`${base}/restored`, bucket)).ok).toBe(false);
+      expect((await container.exists(`${base}/restored/${HYDRATE_MARKER_FILENAME}`)).exists).toBe(false);
+      expect((await container.exists(`${base}/escape`)).exists).toBe(false);
+    });
+  }
+});
 
-describe('walkWorkspaceTree', () => {
-  it('never descends into an ignored directory — proves the throughput property, not just after-the-fact filtering', async () => {
-    const container = new FakeContainer();
-    container.seedFile('/workspace/src/app.ts', 'app');
-    container.seedFile('/workspace/node_modules/some-pkg/index.js', 'huge tree, should never be walked');
-    container.seedFile('/workspace/.git/HEAD', 'ref: refs/heads/main');
-    container.seedFile('/workspace/.next/cache/x.bin', 'cache');
-    container.seedFile('/workspace/dist/bundle.js', 'bundled');
-    container.seedFile('/workspace/.turbo/cookies.json', '{}');
+describe.skipIf(NO_POSIX_HOST)('security regressions', () => {
+  it('fences the old writer when a replacement checkpoints an unchanged tree', async () => {
+    const { base, root } = await workspace(); const bucket = new Bucket();
+    await writeFile(`${root}/a`, 'original'); expect((await flush(root, bucket)).ok).toBe(true);
+    const replacement = `${base}/replacement`; expect((await hydrate(replacement, bucket)).ok).toBe(true);
+    const acquired = await flush(replacement, bucket); expect(acquired.ok).toBe(true); expect(acquired.uploaded).toEqual([]);
+    await writeFile(`${root}/a`, 'orphan edit');
+    expect((await flush(root, bucket)).ok).toBe(false);
+    expect((await hydrate(`${base}/latest`, bucket)).ok).toBe(true);
+    expect(await readFile(`${base}/latest/a`, 'utf8')).toBe('original');
+  });
 
-    const result = await walkWorkspaceTree(container, '/workspace');
+  it('does not confirm unchanged bytes when the durable chunks are missing', async () => {
+    const { root } = await workspace(); const bucket = new Bucket();
+    expect((await flush(root, bucket)).ok).toBe(true);
+    bucket.data.delete([...bucket.data.keys()].find(k => k.endsWith('/0'))!);
+    expect((await flush(root, bucket)).ok).toBe(false);
+  });
 
-    expect(result.files.map((f) => f.relPath).sort()).toEqual(['src/app.ts']);
-    expect(result.skippedIgnoredDirs).toBe(5);
-    // The critical assertion: `listFiles` was NEVER called on any path under
-    // an ignored directory — the SDK never even enumerated node_modules/etc.
-    for (const call of container.calls.listFiles) {
-      for (const ignored of WORKSPACE_FLUSH_IGNORE_DIR_NAMES) {
-        expect(call.includes(`/${ignored}/`) || call.endsWith(`/${ignored}`)).toBe(false);
-      }
+  it('rejects an advancing head during restore without installing the stale tree', async () => {
+    const { base, root } = await workspace(); const bucket = new Bucket();
+    expect((await flush(root, bucket)).ok).toBe(true);
+    const get = bucket.get.bind(bucket);
+    bucket.get = async key => {
+      if (key.endsWith('/0')) bucket.data.get(headKey)!.etag = 'new-head';
+      return get(key);
+    };
+    expect((await hydrate(`${base}/replacement`, bucket)).ok).toBe(false);
+    expect((await container.exists(`${base}/replacement`)).exists).toBe(false);
+  });
+
+  it('rejects a legacy object changing during import', async () => {
+    const base = await temp(); const bucket = new Bucket();
+    await bucket.put(`${prefix}/a`, new TextEncoder().encode('old'));
+    const get = bucket.get.bind(bucket); let reads = 0;
+    bucket.get = async key => {
+      if (key === `${prefix}/a` && ++reads === 2) await bucket.put(key, new TextEncoder().encode('new'));
+      return get(key);
+    };
+    expect((await hydrate(`${base}/replacement`, bucket)).ok).toBe(false);
+    expect((await container.exists(`${base}/replacement`)).exists).toBe(false);
+  });
+
+  it('never loads repository Git config or runs fsmonitor while reading the index', async () => {
+    const { root, base } = await workspace(); const bucket = new Bucket();
+    await git(root, 'init'); await mkdir(`${root}/dist`); await writeFile(`${root}/dist/a`, 'tracked');
+    await git(root, 'add', 'dist/a'); await git(root, 'update-index', '--split-index');
+    const index = await readFile(`${root}/.git/index`);
+    // An invalid include would make normal Git fail. The checkpoint must not
+    // read it at all, and must not run the fsmonitor command from this config.
+    await writeFile(`${root}/.git/config`, `[core]\nrepositoryformatversion = 0\nfsmonitor = touch ${base}/hook-ran\n[include]\npath = ${base}/invalid-config\n`);
+    await writeFile(`${base}/invalid-config`, 'not valid Git config\n');
+    expect((await flush(root, bucket)).ok).toBe(true);
+    expect((await container.exists(`${base}/hook-ran`)).exists).toBe(false);
+    expect((await hydrate(`${base}/restored`, bucket)).ok).toBe(true);
+    expect(await readFile(`${base}/restored/.git/index`)).toEqual(index);
+    expect(await readFile(`${base}/restored/dist/a`, 'utf8')).toBe('tracked');
+  });
+
+  it('does not read a marker symlink', async () => {
+    const { root, base } = await workspace(); const bucket = new Bucket();
+    await rm(`${root}/${HYDRATE_MARKER_FILENAME}`);
+    await writeFile(`${base}/outside`, 'private bytes');
+    await symlink(`${base}/outside`, `${root}/${HYDRATE_MARKER_FILENAME}`);
+    expect((await flush(root, bucket)).ok).toBe(false); expect(bucket.puts).toEqual([]);
+  });
+
+  it('does not expose R2, SDK or malformed JSON contents in failure outcomes and logs', async () => {
+    const { root } = await workspace(); const messages: string[] = []; const bucket = new Bucket();
+    bucket.get = async () => { throw new Error('PRIVATE_CONTENT_OR_CREDENTIAL'); };
+    const result = await flushWorkspaceToR2({ bucket, container, mountPath: root, realPrefix: prefix, hydrationComplete: true, manifest: {}, log: m => messages.push(m) });
+    expect(result.ok).toBe(false);
+    expect(JSON.stringify({ result, messages })).not.toContain('PRIVATE_CONTENT_OR_CREDENTIAL');
+    expect(() => parseSnapshot('PRIVATE_CONTENT_OR_CREDENTIAL')).toThrow('invalid workspace snapshot manifest');
+    const restored = await hydrateWorkspaceFromR2({ bucket, container, mountPath: root, realPrefix: prefix, log: m => messages.push(m) });
+    expect(restored.ok).toBe(false); expect(messages.join(' ')).not.toContain('PRIVATE_CONTENT_OR_CREDENTIAL');
+  });
+
+  it('honors a non-throwing SDK write failure during legacy import', async () => {
+    const base = await temp(); const bucket = new Bucket();
+    await bucket.put(`${prefix}/a`, new TextEncoder().encode('a'));
+    const result = await hydrateWorkspaceFromR2({ bucket, container: { ...container, writeFile: async () => ({ success: false }) }, mountPath: `${base}/target`, realPrefix: prefix, log });
+    expect(result.ok).toBe(false); expect((await container.exists(`${base}/target`)).exists).toBe(false);
+  });
+});
+
+// Audits the opened path through /proc/self/fd, which only Linux has (the codec's only runtime).
+it.skipIf(process.platform !== 'linux')('pins parent directories so a racing symlink cannot redirect a capture read', async () => {
+  const { SNAPSHOT_SCRIPT } = await import('./workspace-snapshot-script');
+  const { root, base } = await workspace();
+  await mkdir(`${root}/dir`); await writeFile(`${root}/dir/value`, 'workspace bytes');
+  await mkdir(`${base}/outside`); await writeFile(`${base}/outside/value`, 'outside bytes');
+  const work = `/tmp/ezil-snapshot-${crypto.randomUUID()}`; roots.push(work);
+  const injection = `
+original_open = os.open
+swapped = False
+def racing_open(path, flags, *args, **kwargs):
+    global swapped
+    if path == 'value' and not swapped:
+        swapped = True
+        os.rename(root + '/dir', root + '/old-dir')
+        os.symlink(os.path.dirname(root) + '/outside', root + '/dir')
+    fd = original_open(path, flags, *args, **kwargs)
+    if path == 'value':
+        with open(os.path.dirname(root) + '/opened-path', 'w') as audit:
+            audit.write(os.readlink('/proc/self/fd/' + str(fd)))
+    return fd
+os.open = racing_open
+`;
+  const script = SNAPSHOT_SCRIPT.replace("try:\n    op = p['op']", `${injection}\ntry:\n    op = p['op']`);
+  await expect(run('python3', ['-I', '-c', script, JSON.stringify({ op: 'capture', root, work, prefix, expected: null })], { env })).rejects.toThrow();
+  expect(await readFile(`${base}/opened-path`, 'utf8')).toBe(`${root}/old-dir/value`);
+});
+
+describe.skipIf(NO_POSIX_HOST)('garbage collection of superseded checkpoint generations', () => {
+  class GcBucket extends Bucket {
+    uploaded = new Map<string, number>();
+    deleted: string[] = [];
+    clock = 0;
+    override async put(key: string, bytes: Uint8Array, options?: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } }) {
+      const r = await super.put(key, bytes, options); if (r) this.uploaded.set(key, this.clock); return r;
     }
+    override async list(options: { prefix: string; cursor?: string; limit?: number }) {
+      const page = await super.list(options);
+      return { ...page, objects: page.objects.map(o => ({ ...o, uploaded: this.uploaded.has(o.key) ? new Date(this.uploaded.get(o.key)!) : undefined })) };
+    }
+    async delete(keys: string[]) { for (const k of keys) { this.data.delete(k); this.deleted.push(k); } }
+  }
+  const gens = (b: GcBucket) => new Set([...b.data.keys()].filter(k => k.includes('/.ezil-snapshots/') && !k.endsWith(SNAPSHOT_HEAD)).map(k => k.split('/.ezil-snapshots/')[1]!.split('/')[0]));
+  const gc = (b: GcBucket, now: number, graceMs = 1000) => collectSupersededSnapshots({ bucket: b, realPrefix: prefix, log, now, graceMs });
+
+  it('keeps the head and previous generations, deletes older ones past the grace window, and the head still restores', async () => {
+    const { base, root } = await workspace(); const bucket = new GcBucket();
+    for (let i = 0; i < 4; i++) { bucket.clock = i * 10; await writeFile(`${root}/n.txt`, String(i)); expect((await flush(root, bucket)).ok).toBe(true); }
+    expect(gens(bucket).size).toBe(4);
+    const head = parseSnapshot(new TextDecoder().decode(bucket.data.get(headKey)!.bytes));
+    const out = await gc(bucket, 100_000);
+    expect(out).toMatchObject({ ok: true, deletedGenerations: 2, keptRecent: 0 });
+    expect(gens(bucket)).toEqual(new Set([head.chunkGeneration ?? head.generation, head.previousChunkGeneration!]));
+    expect(bucket.data.has(headKey)).toBe(true);
+    expect((await hydrate(`${base}/restored`, bucket)).ok).toBe(true);
+    expect(await readFile(`${base}/restored/n.txt`, 'utf8')).toBe('3');
   });
 
-  it('excludes the reserved hydrate-marker and flush-manifest filenames', async () => {
-    const container = new FakeContainer();
-    container.seedFile('/workspace/real.txt', 'content');
-    container.seedFile(`/workspace/${HYDRATE_MARKER_FILENAME}`, '{}');
-    container.seedFile(`/workspace/${FLUSH_MANIFEST_FILENAME}`, '{}');
-
-    const result = await walkWorkspaceTree(container, '/workspace');
-
-    expect(result.files.map((f) => f.relPath)).toEqual(['real.txt']);
+  it('never deletes a recent (possibly in-flight) or undated generation, and never acts without a head', async () => {
+    const { root } = await workspace(); const bucket = new GcBucket();
+    // No head: an orphan generation is not provably garbage.
+    await bucket.put(`${prefix}/.ezil-snapshots/${crypto.randomUUID()}/0`, new Uint8Array([1]));
+    expect(await gc(bucket, 1e12)).toMatchObject({ ok: true, deletedGenerations: 0 });
+    bucket.data.clear(); bucket.uploaded.clear();
+    for (let i = 0; i < 3; i++) { bucket.clock = 0; await writeFile(`${root}/n.txt`, String(i)); expect((await flush(root, bucket)).ok).toBe(true); }
+    const inflight = `${prefix}/.ezil-snapshots/${crypto.randomUUID()}/0`;
+    bucket.clock = 5_000; await bucket.put(inflight, new Uint8Array([2]));      // an uncommitted writer, 0.5 s old
+    const undated = `${prefix}/.ezil-snapshots/${crypto.randomUUID()}/0`;
+    await bucket.put(undated, new Uint8Array([3])); bucket.uploaded.delete(undated);
+    const out = await gc(bucket, 5_500);
+    expect(out).toMatchObject({ ok: true, deletedGenerations: 1, keptRecent: 2 });
+    expect(bucket.data.has(inflight)).toBe(true); expect(bucket.data.has(undated)).toBe(true);
   });
 
-  it('skips symlink/other entry types (no well-defined read-and-recreate semantics)', async () => {
-    const container = new FakeContainer();
-    container.seedFile('/workspace/real.txt', 'content');
-    // Inject a synthetic symlink entry directly via listFiles override.
-    const realListFiles = container.listFiles.bind(container);
-    container.listFiles = async (path, opts) => {
-      const base = await realListFiles(path, opts);
-      if (path === '/workspace') {
-        return { files: [...base.files, { name: 'link', type: 'symlink' as const, size: 0, modifiedAt: '0' }] };
-      }
-      return base;
-    };
-
-    const result = await walkWorkspaceTree(container, '/workspace');
-    expect(result.files.map((f) => f.relPath)).toEqual(['real.txt']);
-    expect(result.skippedUnsupported).toBe(1);
-  });
-});
-
-// ── computeFlushPlan ──────────────────────────────────────────────────────────
-
-describe('computeFlushPlan', () => {
-  it('treats a file absent from the manifest as changed', () => {
-    const files: RelFileInfo[] = [{ relPath: 'a.txt', size: 5, modifiedAt: '1' }];
-    const plan = computeFlushPlan(files, {});
-    expect(plan.changed).toEqual(files);
-    expect(plan.unchangedCount).toBe(0);
-  });
-
-  it('treats a file with identical size+modifiedAt as unchanged', () => {
-    const files: RelFileInfo[] = [{ relPath: 'a.txt', size: 5, modifiedAt: '1' }];
-    const manifest: FlushManifest = { 'a.txt': { size: 5, modifiedAt: '1' } };
-    const plan = computeFlushPlan(files, manifest);
-    expect(plan.changed).toEqual([]);
-    expect(plan.unchangedCount).toBe(1);
-  });
-
-  it('treats a size OR modifiedAt mismatch as changed', () => {
-    const manifest: FlushManifest = { 'a.txt': { size: 5, modifiedAt: '1' } };
-    expect(computeFlushPlan([{ relPath: 'a.txt', size: 6, modifiedAt: '1' }], manifest).changed).toHaveLength(1);
-    expect(computeFlushPlan([{ relPath: 'a.txt', size: 5, modifiedAt: '2' }], manifest).changed).toHaveLength(1);
+  it('aborts without deleting when the head moves during collection', async () => {
+    const { root } = await workspace(); const bucket = new GcBucket();
+    for (let i = 0; i < 3; i++) { await writeFile(`${root}/n.txt`, String(i)); expect((await flush(root, bucket)).ok).toBe(true); }
+    const realList = bucket.list.bind(bucket);
+    bucket.list = async (o) => { const page = await realList(o); const h = bucket.data.get(headKey)!; bucket.data.set(headKey, { ...h, etag: `${h.etag}-moved` }); return page; };
+    const out = await gc(bucket, 1e12);
+    expect(out.ok).toBe(false); expect(bucket.deleted).toEqual([]);
   });
 });
 
-// ── flushWorkspaceToR2 ────────────────────────────────────────────────────────
-
-describe('flushWorkspaceToR2', () => {
-  it('uploads only changed files, skipping unchanged ones per the manifest', async () => {
-    const container = new FakeContainer();
-    container.seedFile('/workspace/unchanged.txt', 'same as last time');
-    container.seedFile('/workspace/changed.txt', 'new content');
-    const bucket = makeFakeFlushBucket();
-
-    // Pre-populate a manifest as if `unchanged.txt` was already flushed with
-    // its CURRENT size/mtime, and `changed.txt` was flushed with a DIFFERENT
-    // (stale) size/mtime.
-    const unchangedInfo = (await walkWorkspaceTree(container, '/workspace')).files.find((f) => f.relPath === 'unchanged.txt')!;
-    const manifest: FlushManifest = {
-      'unchanged.txt': { size: unchangedInfo.size, modifiedAt: unchangedInfo.modifiedAt },
-      'changed.txt': { size: 999999, modifiedAt: '0' },
-    };
-
-    const outcome = await flushWorkspaceToR2({
-      container,
-      bucket,
-      mountPath: '/workspace',
-      realPrefix: 'proj1/branches/main',
-      manifest,
-      hydrationComplete: true,
-      log: noopLog,
-    });
-
-    expect(outcome.ok).toBe(true);
-    expect(outcome.uploaded).toEqual(['changed.txt']);
-    expect(outcome.skippedUnchanged).toBe(1);
-    // Only the changed file (plus the unconditional heartbeat) was put to R2.
-    const nonHeartbeatPuts = bucket.puts.filter((p) => !p.key.endsWith(WORKSPACE_HEARTBEAT_FILENAME));
-    expect(nonHeartbeatPuts.map((p) => p.key)).toEqual(['proj1/branches/main/changed.txt']);
-  });
-
-  it('an unchanged file is never re-uploaded across two consecutive flush cycles', async () => {
-    const container = new FakeContainer();
-    container.seedFile('/workspace/stable.txt', 'never changes');
-    const bucket = makeFakeFlushBucket();
-
-    const first = await flushWorkspaceToR2({
-      container,
-      bucket,
-      mountPath: '/workspace',
-      realPrefix: 'proj1/branches/main',
-      manifest: {},
-      hydrationComplete: true,
-      log: noopLog,
-    });
-    expect(first.uploaded).toEqual(['stable.txt']);
-
-    const second = await flushWorkspaceToR2({
-      container,
-      bucket,
-      mountPath: '/workspace',
-      realPrefix: 'proj1/branches/main',
-      manifest: first.manifest, // carried forward, as EzilSandboxDO does via the on-disk manifest cache
-      hydrationComplete: true,
-      log: noopLog,
-    });
-
-    expect(second.uploaded).toEqual([]);
-    expect(second.skippedUnchanged).toBe(1);
-    const fileUploadsTotal = bucket.puts.filter((p) => p.key.endsWith('stable.txt')).length;
-    expect(fileUploadsTotal).toBe(1); // uploaded exactly once across both cycles
-  });
-
-  it('excludes the ignore-list directories from what gets uploaded', async () => {
-    const container = new FakeContainer();
-    container.seedFile('/workspace/src/index.ts', 'real code');
-    container.seedFile('/workspace/node_modules/pkg/index.js', 'must never be uploaded');
-    container.seedFile('/workspace/.git/HEAD', 'must never be uploaded');
-    const bucket = makeFakeFlushBucket();
-
-    const outcome = await flushWorkspaceToR2({
-      container,
-      bucket,
-      mountPath: '/workspace',
-      realPrefix: 'proj1/branches/main',
-      manifest: {},
-      hydrationComplete: true,
-      log: noopLog,
-    });
-
-    expect(outcome.uploaded).toEqual(['src/index.ts']);
-    expect(outcome.skippedIgnored).toBeGreaterThan(0);
-    expect(bucket.puts.some((p) => p.key.includes('node_modules'))).toBe(false);
-    expect(bucket.puts.some((p) => p.key.includes('.git'))).toBe(false);
-  });
-
-  it('is skipped entirely when hydration is not recorded complete — touches neither the container nor R2', async () => {
-    const container = new FakeContainer();
-    container.seedFile('/workspace/would-be-uploaded.txt', 'content');
-    const bucket = makeFakeFlushBucket();
-
-    const outcome = await flushWorkspaceToR2({
-      container,
-      bucket,
-      mountPath: '/workspace',
-      realPrefix: 'proj1/branches/main',
-      manifest: {},
-      hydrationComplete: false,
-      log: noopLog,
-    });
-
-    expect(outcome.ok).toBe(false);
-    expect(outcome.skippedReason).toBe('hydration_incomplete');
-    expect(outcome.uploaded).toEqual([]);
-    expect(outcome.heartbeatWritten).toBe(false);
-    expect(bucket.puts).toEqual([]);
-    expect(container.calls.listFiles).toEqual([]);
-    expect(container.calls.readFile).toEqual([]);
-  });
-
-  it('SECURITY: refuses outright when given an empty realPrefix — never writes to the bucket root', async () => {
-    const container = new FakeContainer();
-    container.seedFile('/workspace/file.txt', 'content');
-    const bucket = makeFakeFlushBucket();
-
-    const outcome = await flushWorkspaceToR2({
-      container,
-      bucket,
-      mountPath: '/workspace',
-      realPrefix: '', // the hazard
-      manifest: {},
-      hydrationComplete: true,
-      log: noopLog,
-    });
-
-    expect(outcome.ok).toBe(false);
-    expect(outcome.skippedReason).toBe('empty_prefix');
-    expect(bucket.puts).toEqual([]); // never even attempted a put
-  });
-
-  it('NEVER DELETES: a manifest referencing files no longer present locally (partially-hydrated/cleaned disk) causes no error and no reference to those keys', async () => {
-    const container = new FakeContainer();
-    container.seedFile('/workspace/still-here.txt', 'present');
-    const bucket = makeFakeFlushBucket();
-
-    // Simulate stale bookkeeping: the manifest remembers a file that is no
-    // longer on local disk at all (e.g. this container generation only
-    // finished hydrating a SUBSET of a much larger previous flush's state).
-    const manifest: FlushManifest = {
-      'still-here.txt': { size: 999, modifiedAt: '0' }, // stale entry -> re-uploaded (changed)
-      'long-gone.txt': { size: 42, modifiedAt: '5' }, // no longer present locally at all
-    };
-
-    const outcome = await flushWorkspaceToR2({
-      container,
-      bucket,
-      mountPath: '/workspace',
-      realPrefix: 'proj1/branches/main',
-      manifest,
-      hydrationComplete: true,
-      log: noopLog,
-    });
-
-    expect(outcome.ok).toBe(true);
-    // `bucket` (the ENTIRE R2 surface this function is given) has no
-    // `delete` method — there is structurally nothing to call to remove
-    // `long-gone.txt` from R2, and this assertion proves the function never
-    // even references that key: only `still-here.txt` was put.
-    expect(bucket.puts.map((p) => p.key)).toEqual(
-      expect.arrayContaining(['proj1/branches/main/still-here.txt']),
-    );
-    expect(bucket.puts.some((p) => p.key.includes('long-gone.txt'))).toBe(false);
-    // The stale manifest entry is silently dropped going forward (harmless
-    // cache cleanup — it never touched R2).
-    expect(outcome.manifest['long-gone.txt']).toBeUndefined();
-    // `bucket` has no delete-shaped method for TypeScript to even let us call —
-    // this line only compiles because `FlushR2BucketLike` truly has none:
-    expect(typeof (bucket as unknown as Record<string, unknown>)['delete']).toBe('undefined');
-  });
-
-  it('writes the unconditional heartbeat object every successful cycle, even when zero files changed', async () => {
-    const container = new FakeContainer();
-    container.seedFile('/workspace/stable.txt', 'unchanging');
-    const bucket = makeFakeFlushBucket();
-    const info = (await walkWorkspaceTree(container, '/workspace')).files[0];
-    const manifest: FlushManifest = { 'stable.txt': { size: info.size, modifiedAt: info.modifiedAt } };
-
-    const outcome = await flushWorkspaceToR2({
-      container,
-      bucket,
-      mountPath: '/workspace',
-      realPrefix: 'proj1/branches/main',
-      manifest,
-      hydrationComplete: true,
-      log: noopLog,
-    });
-
-    expect(outcome.uploaded).toEqual([]); // nothing real changed
-    expect(outcome.heartbeatWritten).toBe(true);
-    expect(bucket.puts.map((p) => p.key)).toEqual(['proj1/branches/main/' + WORKSPACE_HEARTBEAT_FILENAME]);
-  });
-
-  it('does not write the heartbeat when skipped for hydration-incomplete or empty-prefix', async () => {
-    const container = new FakeContainer();
-    const bucket = makeFakeFlushBucket();
-
-    const incomplete = await flushWorkspaceToR2({
-      container,
-      bucket,
-      mountPath: '/workspace',
-      realPrefix: 'proj1/branches/main',
-      manifest: {},
-      hydrationComplete: false,
-      log: noopLog,
-    });
-    expect(incomplete.heartbeatWritten).toBe(false);
-
-    const emptyPrefix = await flushWorkspaceToR2({
-      container,
-      bucket,
-      mountPath: '/workspace',
-      realPrefix: '',
-      manifest: {},
-      hydrationComplete: true,
-      log: noopLog,
-    });
-    expect(emptyPrefix.heartbeatWritten).toBe(false);
-    expect(bucket.puts).toEqual([]);
-  });
-
-  it('binary content (base64-encoded reads) round-trips byte-for-byte through flush', async () => {
-    const container = new FakeContainer();
-    const bytes = new Uint8Array([0, 1, 2, 255, 254, 253, 128]);
-    container.seedFile('/workspace/image.bin', Buffer.from(bytes).toString('base64'), 'base64');
-    const bucket = makeFakeFlushBucket();
-
-    const outcome = await flushWorkspaceToR2({
-      container,
-      bucket,
-      mountPath: '/workspace',
-      realPrefix: 'proj1/branches/main',
-      manifest: {},
-      hydrationComplete: true,
-      log: noopLog,
-    });
-
-    expect(outcome.uploaded).toEqual(['image.bin']);
-    const put = bucket.puts.find((p) => p.key.endsWith('image.bin'))!;
-    expect([...put.value]).toEqual([...bytes]);
-  });
-
-  it('a per-file upload failure is reported and NOT marked as synced in the manifest (so it retries next cycle)', async () => {
-    const container = new FakeContainer();
-    container.seedFile('/workspace/ok.txt', 'fine');
-    container.seedFile('/workspace/boom.txt', 'will fail to read');
-    const realReadFile = container.readFile.bind(container);
-    container.readFile = async (path, opts) => {
-      if (path.endsWith('boom.txt')) throw new Error('simulated read failure');
-      return realReadFile(path, opts);
-    };
-    const bucket = makeFakeFlushBucket();
-    const { log, lines } = collectLogs();
-
-    const outcome = await flushWorkspaceToR2({
-      container,
-      bucket,
-      mountPath: '/workspace',
-      realPrefix: 'proj1/branches/main',
-      manifest: {},
-      hydrationComplete: true,
-      log,
-    });
-
-    expect(outcome.ok).toBe(false);
-    expect(outcome.uploaded).toEqual(['ok.txt']);
-    expect(outcome.failed).toEqual([{ relPath: 'boom.txt', error: 'simulated read failure' }]);
-    expect(outcome.manifest['boom.txt']).toBeUndefined();
-    expect(lines.some((l) => l.includes('boom.txt'))).toBe(true);
-  });
-});
-
-// ── Hydrate-marker / flush-manifest (de)serialization ────────────────────────
-
-describe('hydrate marker + flush manifest (de)serialization', () => {
-  it('round-trips a hydrate marker', () => {
-    const marker = { prefix: 'proj1/branches/main', mountPath: '/workspace', hydratedAt: '2020-01-01T00:00:00.000Z' };
-    expect(parseHydrateMarker(serializeHydrateMarker(marker))).toEqual(marker);
-  });
-
-  it('rejects a malformed/corrupt marker rather than throwing', () => {
-    expect(parseHydrateMarker('not json')).toBeNull();
-    expect(parseHydrateMarker('{"prefix":"x"}')).toBeNull(); // missing required fields
-  });
-
-  it('round-trips a flush manifest', () => {
-    const manifest: FlushManifest = { 'a.txt': { size: 1, modifiedAt: '1' }, 'b/c.txt': { size: 2, modifiedAt: '2' } };
-    expect(parseFlushManifest(serializeFlushManifest(manifest))).toEqual(manifest);
-  });
-
-  it('degrades to an empty manifest on corrupt/malformed input rather than throwing', () => {
-    expect(parseFlushManifest('not json')).toEqual({});
-    expect(parseFlushManifest('[]')).toEqual({});
-    expect(parseFlushManifest('{"a.txt":{"size":"not a number"}}')).toEqual({});
+describe.skipIf(NO_POSIX_HOST)('rate-limited routine checkpoints (deferIfChanged)', () => {
+  const flushDeferred = (root: string, bucket: Bucket) => flushWorkspaceToR2({ container, bucket, mountPath: root, realPrefix: prefix, hydrationComplete: true, manifest: {}, log, deferIfChanged: true });
+  it('never defers the first checkpoint, defers a changed one without touching storage, and still confirms an unchanged one', async () => {
+    const { root } = await workspace(); const bucket = new Bucket();
+    await writeFile(`${root}/a.txt`, 'v1');
+    const first = await flushDeferred(root, bucket);
+    expect(first.ok).toBe(true); expect(first.skippedReason).toBeUndefined();
+    const head = bucket.data.get(headKey)!.etag; const puts = bucket.puts.length;
+    await writeFile(`${root}/a.txt`, 'v2');
+    const deferred = await flushDeferred(root, bucket);
+    expect(deferred).toMatchObject({ ok: false, skippedReason: 'deferred', uploaded: [] });
+    expect(bucket.puts.length).toBe(puts); expect(bucket.data.get(headKey)!.etag).toBe(head);
+    await writeFile(`${root}/a.txt`, 'v1');
+    const unchanged = await flushDeferred(root, bucket);
+    expect(unchanged.ok).toBe(true); expect(unchanged.uploaded).toEqual([]);
+    await writeFile(`${root}/a.txt`, 'v3');
+    const committed = await flush(root, bucket);       // not deferred: readiness/teardown/idle-stop path
+    expect(committed.ok).toBe(true); expect(committed.uploaded.length).toBeGreaterThan(0);
   });
 });
