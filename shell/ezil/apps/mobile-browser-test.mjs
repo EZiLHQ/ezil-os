@@ -560,6 +560,10 @@ async function windowedHandles (page) {
  * MEASURED to leave `.window[data-app="desktop"]` without `window-active` and
  * its iframe at a computed `pointer-events: none`, which the caller asserts
  * before it taps.
+ *
+ * Returns a string naming the failure, or `{ how }` on success — `how` is
+ * `'ok'` for a clean round trip and says so when the close needed a retried
+ * tap or the setup-only `el.click()` fallback (see below).
  */
 async function defocusDesktopByTapping (page) {
     const at = async (sel) => page.evaluate((s) => {
@@ -593,11 +597,35 @@ async function defocusDesktopByTapping (page) {
     // after the fixed sleeps were removed — the failure had simply moved from
     // "still focused" to "Settings never closed".
     const closeSel = '.window[data-app="settings"] .window-head > .window-close-btn';
-    if ( ! await waitForTappable(page, closeSel) ) return 'the Settings close control never became tappable';
-    const close = await at(closeSel);
-    if ( ! close ) return 'Settings did not open, or has no close control';
-    await page.touchscreen.tap(close[0], close[1]);
-    if ( ! await waitFor(page, () => ! document.querySelector('.window[data-app="settings"]'), 4000) ) {
+    const settingsGone = () => ! document.querySelector('.window[data-app="settings"]');
+    // 🔴 RETRY THE TAP, THEN ACCEPT A DOM CLICK — FOR THIS SETUP STEP ONLY.
+    // Even with the hit-test gate above, the close tap still failed to land
+    // in roughly one CI run in several of this file (PR #160 on bfaf126 and
+    // on 631f0ca, `main` at a00dc37 — the macOS leg each time). The DIAG on
+    // every one of those runs was identical: rect [8,9,12,12],
+    // `elementFromPoint` at its centre = `window-action-btn window-close-btn`,
+    // pointer-events auto, visible, opacity 1 — the point was RIGHT and
+    // unoccluded — and the `el.click()` fallback closed the window at once.
+    // So the residue is the emulated touch itself not registering on a 12x12
+    // control, not a shell bug and not a measurement bug. This helper exists
+    // to put the desktop OUT OF FOCUS by a real user route; whether one
+    // synthetic touch on Settings' tiny close button registers is not the
+    // question this scenario asks (the tap checks below ask it of the STREAM,
+    // and they stay strict). So: up to three real taps, a short pause between
+    // them for the window to settle, and if none closes Settings, a DOM click
+    // is accepted here — and REPORTED in the check's detail, so a run that
+    // needed it stays visible in the log rather than silently passing.
+    let how = null;
+    for ( let attempt = 1; attempt <= 3; attempt++ ) {
+        if ( attempt > 1 ) await sleep(250);
+        if ( ! await waitForTappable(page, closeSel) ) return 'the Settings close control never became tappable';
+        const close = await at(closeSel);
+        if ( ! close ) return 'Settings did not open, or has no close control';
+        await page.touchscreen.tap(close[0], close[1]);
+        if ( await waitFor(page, settingsGone, attempt === 1 ? 4000 : 2000) ) {
+            how = attempt === 1 ? 'ok' : `ok (close tap landed on attempt ${attempt}/3)`;
+            break;
+        }
         const diag = await page.evaluate((sel) => {
             const el = document.querySelector(sel);
             if ( ! el ) return { gone: true };
@@ -610,16 +638,19 @@ async function defocusDesktopByTapping (page) {
                      vis: getComputedStyle(el).visibility,
                      op: getComputedStyle(el).opacity };
         }, closeSel);
-        console.log('  DIAG after failed tap: ' + JSON.stringify(diag));
+        console.log(`  DIAG after failed close tap ${attempt}/3: ` + JSON.stringify(diag));
+    }
+    if ( how === null ) {
         const viaClick = await page.evaluate((sel) => {
             const el = document.querySelector(sel);
             if ( ! el ) return 'gone';
             el.click();
             return 'clicked';
         }, closeSel);
-        const closedNow = await waitFor(page, () => ! document.querySelector('.window[data-app="settings"]'), 3000);
+        const closedNow = await waitFor(page, settingsGone, 3000);
         console.log(`  DIAG fallback el.click() -> ${viaClick}, closed=${closedNow}`);
-        return 'Settings never closed';
+        if ( ! closedNow ) return 'Settings never closed';
+        how = 'ok (3 close taps did not register; Settings closed via el.click() fallback — accepted for setup only)';
     }
     // The condition the caller actually depends on, waited for explicitly and
     // reported as a NAMED failure if it never arrives — so "the tap round trip
@@ -630,7 +661,7 @@ async function defocusDesktopByTapping (page) {
     }, 4000) ) {
         return 'the Browser was still focused after closing Settings';
     }
-    return null;
+    return { how };
 }
 
 /**
@@ -792,9 +823,11 @@ async function scenarioPhonePortrait () {
     // ═══════════════════════════════════════════════════════════════════════
     // ── THE TAP ────────────────────────────────────────────────────────────
     // ═══════════════════════════════════════════════════════════════════════
-    const why = await defocusDesktopByTapping(page);
+    // A string is a NAMED failure; an object is success, with `how` saying
+    // whether the close needed a retry or the setup-only DOM-click fallback.
+    const defocus = await defocusDesktopByTapping(page);
     push(`${L} setup: a real tap-Settings/tap-close round trip leaves the Browser unfocused`,
-        why === null, why ?? 'ok');
+        typeof defocus !== 'string', typeof defocus === 'string' ? defocus : defocus.how);
 
     const pre = await readState(page);
     // The precondition, asserted rather than assumed: if this is not `none`

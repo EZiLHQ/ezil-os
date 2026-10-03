@@ -1,0 +1,28 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "$comment": "EZiL OS managed OpenCode configuration. Installed by worker/Dockerfile at /etc/opencode/opencode.json, the Linux managed-config location OpenCode reads on every start (https://opencode.ai/docs/config/ > Managed settings); it merges on top of, and outranks, every user, project, OPENCODE_CONFIG and OPENCODE_CONFIG_CONTENT file. The EZiL Chat extension (extensions/ezil-chat) spawns `opencode serve` on loopback with this file in force. No secrets live here: every credential is an {env:...} reference resolved at runtime from the container environment. Keys named $comment are ignored by OpenCode (verified against opencode v2.0.19).",
+
+  "$comment_autoupdate": "The image pins the opencode binary (OPENCODE_VERSION in worker/Dockerfile) to the @opencode/client version the extension is built against; a self-update would break that contract.",
+  "autoupdate": false,
+
+  "$comment_share": "Sessions must never be published to opencode.ai share links from a customer workspace.",
+  "share": "disabled",
+
+  "$comment_small_model": "Placeholder for the cheap model OpenCode uses for session titles and other lightweight work. Points at the example Azure deployment below; change it with the real deployment name. OpenCode falls back to the primary model of the turn when this model's provider is not connected.",
+  "small_model": "azure/gpt-4.1-mini",
+
+  "provider": {
+    "azure": {
+      "$comment": "Azure AI Foundry / Azure OpenAI. Both env values come from the container environment; without them the provider is simply not connected and the model picker stays empty. `resourceName` is the first label of https://<resourceName>.openai.azure.com/ (or .services.ai.azure.com). Every key under `models` MUST equal a DEPLOYMENT name in that resource (OpenCode addresses Azure by deployment id) — the entries below are EXAMPLES to replace with the deployments that actually exist.",
+      "options": {
+        "resourceName": "{env:AZURE_RESOURCE_NAME}",
+        "apiKey": "{env:AZURE_API_KEY}"
+      },
+      "models": {
+        "gpt-4.1": { "name": "GPT-4.1 (example Azure deployment)" },
+        "gpt-4.1-mini": { "name": "GPT-4.1 mini (example Azure deployment)" }
+      }
+    }
+  }
+}

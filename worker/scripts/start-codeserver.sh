@@ -86,10 +86,77 @@ if [ ! -s "$USER_DATA_DIR/User/settings.json" ]; then
     mkdir -p "$USER_DATA_DIR/User"
     cat >"$USER_DATA_DIR/User/settings.json" <<'CODESERVER_SETTINGS_JSON'
 {
-  "security.workspace.trust.enabled": false
+  "security.workspace.trust.enabled": false,
+  "telemetry.telemetryLevel": "off"
 }
 CODESERVER_SETTINGS_JSON
+elif ! grep -q '"telemetry.telemetryLevel"[[:space:]]*:[[:space:]]*"off"' "$USER_DATA_DIR/User/settings.json"; then
+    # existing file: keep every key, re-assert telemetry off (application scope —
+    # see seed_codeserver_user_settings in start-neko.sh); unparsable -> left alone
+    node -e 'const fs=require("fs");const p=process.argv[1];let j;try{j=JSON.parse(fs.readFileSync(p,"utf8"));}catch(e){process.exit(1);}if(!j||typeof j!=="object"||Array.isArray(j))process.exit(1);j["telemetry.telemetryLevel"]="off";fs.writeFileSync(p,JSON.stringify(j,null,2)+"\n");' "$USER_DATA_DIR/User/settings.json" 2>/dev/null || true
 fi
+
+# >>> chat-ui-seed
+# Machine-scope layer (ranks above User settings; no UI edits it), rewritten
+# on every launch, plus the profile's BYOK group list. Mirrors start-neko.sh's
+# `seed_codeserver_machine_settings` / `seed_codeserver_chat_models` — the
+# heredoc must stay byte-identical (worker/src/codeserver-chat-settings.test.ts
+# compares them) and the long rationale lives there. Short version: the
+# bundled open-source Copilot Chat is the chat panel, running on EZiL models
+# through the built-in ezil-models provider; `chat.allowAnonymousAccess` +
+# the `ezil` vendor group make it work with no GitHub account on a cold
+# browser; the ezil-chat (OpenCode) panel stays installed but dormant.
+mkdir -p "$USER_DATA_DIR/Machine" "$USER_DATA_DIR/User"
+cat >"$USER_DATA_DIR/Machine/settings.json" <<'CODESERVER_MACHINE_SETTINGS_JSON'
+{
+  "chat.disableAIFeatures": false,
+  "chat.allowAnonymousAccess": true,
+  "chat.byokUtilityModelDefault": "mainAgent",
+  "chat.titleBar.signIn.enabled": false,
+  "chat.welcomePage.signIn.enabled": false,
+  "github.copilot.enable": { "*": false },
+  "github.copilot.nextEditSuggestions.enabled": false,
+  "github.copilot.chat.backgroundAgent.enabled": false,
+  "github.copilot.chat.cloudAgent.enabled": false,
+  "chat.viewSessions.enabled": false,
+  "workbench.secondarySideBar.defaultVisibility": "visible",
+  "ezilChat.autoStart": false,
+  "ezilChat.revealOnStartup": false
+}
+CODESERVER_MACHINE_SETTINGS_JSON
+if [ ! -s "$USER_DATA_DIR/User/chatLanguageModels.json" ]; then
+    printf '[\n  { "name": "EZiL", "vendor": "ezil" }\n]\n' >"$USER_DATA_DIR/User/chatLanguageModels.json"
+elif ! grep -q '"vendor"[[:space:]]*:[[:space:]]*"ezil"' "$USER_DATA_DIR/User/chatLanguageModels.json"; then
+    node -e 'const fs=require("fs");const p=process.argv[1];let g=[];try{const j=JSON.parse(fs.readFileSync(p,"utf8"));if(Array.isArray(j))g=j;}catch(e){}if(!g.some(x=>x&&x.vendor==="ezil"))g.push({name:"EZiL",vendor:"ezil"});fs.writeFileSync(p,JSON.stringify(g,null,2)+"\n");' "$USER_DATA_DIR/User/chatLanguageModels.json" || true
+fi
+# Copilot/telemetry-only hosts -> loopback (belt and braces for the build-time
+# patches in worker/copilot-chat/; github.com and api.github.com untouched).
+# Byte-identical with start-neko.sh's function, where the rationale lives.
+seed_blocked_ai_hosts() {
+  _hosts="${EZIL_HOSTS_FILE:-/etc/hosts}"
+  [ -w "$_hosts" ] || return 1
+  while IFS= read -r _h; do
+    [ -n "$_h" ] || continue
+    grep -q -F -w -- "$_h" "$_hosts" 2>/dev/null && continue
+    printf '127.0.0.1 %s\n' "$_h" >>"$_hosts" 2>/dev/null || return 1
+  done <<'EZIL_BLOCKED_AI_HOSTS'
+api.githubcopilot.com
+api-model-lab.githubcopilot.com
+copilot-proxy.githubusercontent.com
+copilot-telemetry.githubusercontent.com
+origin-tracker.githubusercontent.com
+default.exp-tas.com
+mobile.events.data.microsoft.com
+browser.events.data.microsoft.com
+dc.services.visualstudio.com
+westus-0.in.applicationinsights.azure.com
+westeurope-5.in.applicationinsights.azure.com
+main.vscode-cdn.net
+embeddings.vscode-cdn.net
+EZIL_BLOCKED_AI_HOSTS
+}
+seed_blocked_ai_hosts || true
+# <<< chat-ui-seed
 
 # Keep auth none because the bridge is already HMAC/cookie-gated in front of
 # this process. 0.0.0.0 is required, NOT loopback — see the 🔴 block above; an
@@ -106,6 +173,7 @@ nohup code-server \
     --bind-addr 0.0.0.0:${PORT} \
     --auth none \
     --disable-telemetry \
+    --disable-update-check \
     --user-data-dir="$USER_DATA_DIR" \
     --extensions-dir="$EXTENSIONS_DIR" \
     "$WORKSPACE_ROOT" \

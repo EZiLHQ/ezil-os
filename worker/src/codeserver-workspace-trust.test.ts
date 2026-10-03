@@ -100,13 +100,27 @@ describe('start-neko.sh seeds code-server settings that disable workspace trust'
         expect(existsSync(settingsPath(dir))).toBe(true);
     });
 
-    it('never clobbers settings the user already has', () => {
+    it('never clobbers settings the user already has — it only re-asserts telemetry off (revision 3)', () => {
         const dir = tmp();
         mkdirSync(join(dir, 'User'), { recursive: true });
-        writeFileSync(settingsPath(dir), '{"editor.fontSize": 42}');
+        writeFileSync(settingsPath(dir), '{"editor.fontSize": 42, "telemetry.telemetryLevel": "all"}');
         const { code } = runSeedFn(dir);
         expect(code).toBe(0);
-        expect(readFileSync(settingsPath(dir), 'utf8')).toBe('{"editor.fontSize": 42}');
+        const parsed = JSON.parse(readFileSync(settingsPath(dir), 'utf8')) as Record<string, unknown>;
+        expect(parsed['editor.fontSize']).toBe(42);
+        expect(parsed['telemetry.telemetryLevel']).toBe('off');
+        // trust is NOT forced onto an existing file — that stays the user's call
+        expect(parsed).not.toHaveProperty('security.workspace.trust.enabled');
+        // a file that already says off is left byte-for-byte alone
+        const already = '{"editor.fontSize": 42, "telemetry.telemetryLevel": "off"}';
+        writeFileSync(settingsPath(dir), already);
+        expect(runSeedFn(dir).code).toBe(0);
+        expect(readFileSync(settingsPath(dir), 'utf8')).toBe(already);
+        // a file node cannot parse (settings.json allows comments) is left alone, non-fatally
+        const commented = '{ // mine\n "editor.fontSize": 42 }';
+        writeFileSync(settingsPath(dir), commented);
+        runSeedFn(dir);
+        expect(readFileSync(settingsPath(dir), 'utf8')).toBe(commented);
     });
 });
 
@@ -142,14 +156,19 @@ describe('start-codeserver.sh seeds the same settings before it launches', () =>
         expect(parsed['security.workspace.trust.enabled']).toBe(false);
     });
 
-    it('does not clobber existing settings', () => {
+    it('does not clobber existing settings — only telemetry off is merged in (revision 3)', () => {
         const dir = tmp();
         mkdirSync(join(dir, 'User'), { recursive: true });
         writeFileSync(settingsPath(dir), '{"editor.fontSize": 7}');
         const script = `set -euo pipefail\nUSER_DATA_DIR="$1"\n${extractCodeserverSeedBlock()}\n`;
         const r = spawnSync('bash', ['-c', script, 'bash', dir], { encoding: 'utf8' });
         expect(r.status).toBe(0);
-        expect(readFileSync(settingsPath(dir), 'utf8')).toBe('{"editor.fontSize": 7}');
+        const parsed = JSON.parse(readFileSync(settingsPath(dir), 'utf8')) as Record<string, unknown>;
+        expect(parsed).toEqual({ 'editor.fontSize': 7, 'telemetry.telemetryLevel': 'off' });
+        const already = '{"editor.fontSize": 7, "telemetry.telemetryLevel": "off"}';
+        writeFileSync(settingsPath(dir), already);
+        expect(spawnSync('bash', ['-c', script, 'bash', dir], { encoding: 'utf8' }).status).toBe(0);
+        expect(readFileSync(settingsPath(dir), 'utf8')).toBe(already);
     });
 
     it('seeds after the already-running fast path and before the launch', () => {

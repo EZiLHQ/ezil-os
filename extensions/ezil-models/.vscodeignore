@@ -1,0 +1,7 @@
+**
+!dist/extension.js
+!schema/**
+!examples/**
+!README.md
+!LICENSE
+!package.json

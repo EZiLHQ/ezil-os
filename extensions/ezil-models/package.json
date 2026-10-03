@@ -1,0 +1,76 @@
+{
+  "name": "ezil-models",
+  "displayName": "EZiL Models",
+  "description": "Language model provider for the built-in Copilot Chat UI: Anthropic (direct and Microsoft Foundry), OpenAI, Azure OpenAI and OpenAI-compatible endpoints from one EZiL config file. No GitHub account.",
+  "version": "0.1.0",
+  "publisher": "ezil",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EZiLHQ/ezil-os",
+    "directory": "extensions/ezil-models"
+  },
+  "engines": {
+    "vscode": "^1.106.0"
+  },
+  "categories": ["AI", "Chat"],
+  "main": "./dist/extension.js",
+  "extensionKind": ["workspace"],
+  "activationEvents": ["onLanguageModelChat:ezil", "onLanguageModelChatProvider:ezil", "onStartupFinished"],
+  "enabledApiProposals": ["languageModelSystem", "languageModelThinkingPart"],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true,
+      "description": "The provider reads only its own config file and talks to the configured model endpoints; it never reads workspace files."
+    },
+    "virtualWorkspaces": true
+  },
+  "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "ezil",
+        "displayName": "EZiL",
+        "managementCommand": "ezil-models.manage"
+      }
+    ],
+    "commands": [
+      { "command": "ezil-models.manage", "title": "EZiL Models: Manage", "category": "EZiL Models" },
+      { "command": "ezil-models.reload", "title": "EZiL Models: Reload Config", "category": "EZiL Models" },
+      { "command": "ezil-models.showUsage", "title": "EZiL Models: Show Token Usage", "category": "EZiL Models" },
+      { "command": "ezil-models.openConfig", "title": "EZiL Models: Open Config File", "category": "EZiL Models" }
+    ],
+    "configuration": {
+      "title": "EZiL Models",
+      "properties": {
+        "ezilModels.configPath": {
+          "type": "string",
+          "default": "/etc/ezil/models.json",
+          "markdownDescription": "Path of the EZiL models config file (JSON, see the extension README). The environment variable `EZIL_MODELS_CONFIG` overrides this setting.",
+          "scope": "machine"
+        },
+        "ezilModels.logRequests": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Log every request body sent to a model provider (API keys and headers redacted) to the *EZiL Models* output channel. Useful to see exactly what Copilot Chat sends to the model.",
+          "scope": "machine"
+        }
+      }
+    },
+    "jsonValidation": [
+      { "fileMatch": ["models.json", "ezil-models.json", "*.ezil-models.json"], "url": "./schema/models.schema.json" }
+    ]
+  },
+  "scripts": {
+    "build": "bun build src/extension.ts --target=node --format=cjs --external=vscode --outfile=dist/extension.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "bun test",
+    "package:vsix": "bun run build && bunx @vscode/vsce@4.0.0 package --no-dependencies --out ezil-models-0.1.0.vsix"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "@types/node": "22.10.2",
+    "@types/vscode": "1.106.1",
+    "typescript": "5.9.3"
+  }
+}

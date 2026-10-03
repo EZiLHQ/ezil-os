@@ -345,3 +345,59 @@ Validated locally (`docker build` + `docker run` with the pinned
 `ezil-neko-vscode` image already present): both windows appear in
 `wmctrl -l`, the health file reports `state: running` for both apps, and
 `neko-switch-app.sh` successfully activates each window by name.
+
+## EZiL Chat: the bundled Copilot Chat with no GitHub calls (image revision 3)
+
+Since image revision 2 the right-hand chat panel is the **open-source GitHub
+Copilot Chat** that code-server 4.139.1 bundles (`GitHub.copilot-chat` 0.67.0,
+MIT), running on EZiL-configured models through the built-in `ezil-models`
+provider with no GitHub account (`chat.allowAnonymousAccess`, written to the
+Machine settings by `scripts/start-neko.sh` on every boot). Revision 3 ships
+it as **"EZiL Chat"**: `copilot-chat/patch-copilot-chat.sh` (run by the
+Dockerfile, gated so a code-server bump that moves an anchor fails the build;
+every patch in `copilot-chat/PATCHES.md`) removes the GitHub calls the stack
+still made in anonymous mode and rebrands the user-visible strings. Measured
+with every DNS name mapped to loopback and a logging sink on :80/:443
+(`/workspace/ezil-plan/rev3-network-audit.md`, `e2e/copilot-ezil-netsink.py`):
+
+| Call seen on revision 2 (anonymous, EZiL model) | Where from | Revision 3 |
+|---|---|---|
+| `GET api.github.com/copilot_internal/v2/nltoken` (x9 when it failed) | copilot-chat: "Copilot token for devDeviceId" | patched out (`token`) |
+| `GET main.vscode-cdn.net/extensions/copilotChat.json` | copilot-chat: BYOK "known models list" | patched out (`known-models`) |
+| `POST westus-0.in.applicationinsights.azure.com/v2.1/track` | applicationinsights Statsbeat inside the extension host (not gated by the telemetry level) | `ENV APPLICATION_INSIGHTS_NO_STATSBEAT=true` |
+| `GET api.github.com/repos/coder/code-server/releases/latest` | code-server's own update check | `--disable-update-check` in both launchers |
+| `GET embeddings.vscode-cdn.net/…/{latest.txt,core.json}` (seen once Agent/Ask tooling ran without a Copilot token) | copilot-chat: tool/settings embeddings cache | patched out (`embeddings-*`) |
+| `copilot-telemetry.githubusercontent.com` (returning user whose own `User/settings.json` lacked `telemetry.telemetryLevel`) | copilot-chat GitHub telemetry sender | the User seed now MERGES `telemetry.telemetryLevel: off` into an existing settings.json (every other key kept); belt: `/etc/hosts` |
+| `POST open-vsx.org/vscode/gallery/extensionquery` | code-server extension gallery (server and browser) | not GitHub; left as is (`extensions.autoCheckUpdates` would silence it) |
+| `clients2.google.com`, `update.googleapis.com`, `accounts.google.com`, … | the neko desktop's Chrome, not the editor | out of scope |
+
+Never observed, on either revision, because `--disable-telemetry` plus
+`"telemetry.telemetryLevel": "off"` in the seeded User settings gate them:
+`copilot-telemetry.githubusercontent.com`, `mobile.events.data.microsoft.com`,
+`browser.events.data.microsoft.com`, `dc.services.visualstudio.com`,
+`default.exp-tas.com`; nor `api.githubcopilot.com` (the model-metadata fetch
+first asks for the Copilot token, which now fails locally). Belt and braces:
+`seed_blocked_ai_hosts` (both launchers, root) maps those Copilot/telemetry-
+only hosts plus `main.vscode-cdn.net` and the two applicationinsights
+ingestion hosts to `127.0.0.1` in `/etc/hosts` on every boot — never
+`github.com` or `api.github.com`, which git/gh/the PR extension in the user's
+terminal need. The e2e (`e2e/copilot-ezil-image.sh`) boots the image behind
+the same DNS sink and fails on any attempt to a GitHub, githubusercontent,
+githubcopilot, Microsoft-telemetry or vscode-cdn host during boot plus a full
+Agent-mode prompt, while asserting the EZiL mock still received the request.
+The model traffic itself goes only to the endpoints named in
+`/etc/ezil/models.json` (`api.anthropic.com`,
+`<resource>.services.ai.azure.com`, `api.openai.com`, or whatever the file
+says).
+
+Branding (strings only, no ids/keys/licences): welcome line "AI responses may
+be inaccurate. Review changes before applying them." replaces the GitHub
+Terms/Privacy sentence; status-bar item "EZiL Chat status"; the Accounts-menu
+"Sign in to use GitHub Copilot…" entry is hidden; the system prompt says "You
+are EZiL Chat, an AI coding assistant"; the `Local` session-target picker
+offers only Local (`github.copilot.chat.backgroundAgent.enabled` /
+`cloudAgent.enabled` off in the Machine settings). Left alone on purpose:
+the GitHub sign-in dialogs behind "Manage Models → GitHub Copilot" and the
+status hover's "Enable more AI Features" button (that is the real sign-in
+flow, not disguised), setting names under `github.copilot.*`, and
+`product.json`.

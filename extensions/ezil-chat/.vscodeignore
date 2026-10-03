@@ -1,0 +1,7 @@
+# Only dist/, media/, README, LICENSE and package.json ship in the VSIX.
+**
+!dist/**
+!media/**
+!README.md
+!LICENSE
+!package.json

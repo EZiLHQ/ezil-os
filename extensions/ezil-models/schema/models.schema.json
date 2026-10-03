@@ -1,0 +1,131 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/EZiLHQ/ezil-os/extensions/ezil-models/schema/models.schema.json",
+  "title": "EZiL models config",
+  "description": "Model providers and models served to the Copilot Chat UI by the EZiL Models extension. String values may reference secrets as {env:NAME} or {file:/path}.",
+  "type": "object",
+  "required": ["providers", "models"],
+  "additionalProperties": false,
+  "properties": {
+    "$comment": { "type": "string", "description": "Free-form note; ignored by the extension." },
+    "$schema": { "type": "string" },
+    "providers": {
+      "type": "object",
+      "description": "Named provider endpoints. A model refers to one by name.",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^(\\$comment|[a-zA-Z0-9][a-zA-Z0-9._-]{0,63})$" },
+      "properties": { "$comment": { "type": "string", "description": "Free-form note; ignored by the extension." } },
+      "additionalProperties": { "$ref": "#/definitions/provider" }
+    },
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/definitions/model" }
+    },
+    "defaults": {
+      "description": "Defaults merged into every model entry (a model's own keys win).",
+      "$ref": "#/definitions/modelDefaults"
+    }
+  },
+  "definitions": {
+    "secretString": {
+      "type": "string",
+      "description": "A literal value, {env:VARIABLE_NAME} or {file:/absolute/path}.",
+      "minLength": 1
+    },
+    "provider": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "$comment": { "type": "string", "description": "Free-form note; ignored by the extension." },
+        "type": {
+          "type": "string",
+          "enum": ["anthropic", "anthropic-foundry", "openai", "azure-openai", "openai-compatible"],
+          "markdownDescription": "- `anthropic`: api.anthropic.com Messages API (`x-api-key`).\n- `anthropic-foundry`: Claude on Microsoft Foundry, `https://<resource>.services.ai.azure.com/anthropic/v1/messages` (`x-api-key`).\n- `openai`: api.openai.com chat completions (Bearer).\n- `azure-openai`: `https://<resource>.openai.azure.com/openai/v1/chat/completions` or a Foundry `openai/v1` baseUrl (`api-key`).\n- `openai-compatible`: any `<baseUrl>/chat/completions` server (Bearer if a key is set)."
+        },
+        "apiKey": { "$ref": "#/definitions/secretString", "description": "Required except for openai-compatible." },
+        "baseUrl": { "$ref": "#/definitions/secretString", "description": "Overrides the endpoint base. anthropic: default https://api.anthropic.com. anthropic-foundry: ...services.ai.azure.com/anthropic. openai: https://api.openai.com/v1. azure-openai: https://<resource>.openai.azure.com/openai/v1. openai-compatible: required." },
+        "resource": { "$ref": "#/definitions/secretString", "description": "Azure resource name for anthropic-foundry / azure-openai (used when baseUrl is not set)." },
+        "apiVersion": { "$ref": "#/definitions/secretString", "description": "azure-openai only: appended as ?api-version=. Not needed for the openai/v1 surface." },
+        "headers": { "type": "object", "description": "Extra request headers (values may be secret references).", "additionalProperties": { "$ref": "#/definitions/secretString" } },
+        "betas": { "type": "array", "items": { "type": "string" }, "description": "Anthropic beta feature ids sent in anthropic-beta." },
+        "includeUsage": { "type": "boolean", "default": true, "description": "OpenAI-style providers: request stream_options.include_usage." },
+        "maxTokensField": { "type": "string", "enum": ["max_tokens", "max_completion_tokens"], "description": "OpenAI-style providers: which field carries the output limit (default max_completion_tokens; openai-compatible defaults to max_tokens)." }
+      }
+    },
+    "thinking": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "$comment": { "type": "string", "description": "Free-form note; ignored by the extension." },
+        "type": { "type": "string", "enum": ["adaptive", "enabled", "disabled"], "description": "adaptive for Claude 4.6+ (Opus 5/5.5, Sonnet 5, Fable 5.1); enabled + budgetTokens for Haiku 4.5 and older; disabled sends {type: disabled} (rejected by Opus 5.5 / Fable 5.1)." },
+        "budgetTokens": { "type": "integer", "minimum": 1024, "description": "Only with type enabled." },
+        "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "Anthropic output_config.effort; mapped to reasoning_effort for OpenAI/Azure (xhigh and max become high)." },
+        "display": { "type": "string", "enum": ["summarized", "omitted", "updates"], "default": "summarized", "description": "Anthropic thinking.display for adaptive thinking. \"updates\" (Fable 5.x / Opus 5.5 progress notes) adds the thinking-display-updates-2026-08-18 beta header." }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "$comment": { "type": "string", "description": "Free-form note; ignored by the extension." },
+        "enabled": { "type": "boolean", "description": "Anthropic prompt caching (default true for anthropic providers, ignored elsewhere)." },
+        "ttl": { "type": "string", "enum": ["5m", "1h"], "default": "5m" }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "$comment": { "type": "string", "description": "Free-form note; ignored by the extension." },
+        "toolCalling": { "type": ["boolean", "integer"], "default": true, "description": "true, false, or the maximum number of tools." },
+        "imageInput": { "type": "boolean", "default": true }
+      }
+    },
+    "modelDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "$comment": { "type": "string", "description": "Free-form note; ignored by the extension." },
+        "family": { "type": "string" },
+        "version": { "type": "string" },
+        "tooltip": { "type": "string" },
+        "detail": { "type": "string" },
+        "maxInputTokens": { "type": "integer", "minimum": 1 },
+        "maxOutputTokens": { "type": "integer", "minimum": 1 },
+        "capabilities": { "$ref": "#/definitions/capabilities" },
+        "thinking": { "$ref": "#/definitions/thinking" },
+        "cache": { "$ref": "#/definitions/cache" },
+        "forcedToolChoice": { "type": "boolean" },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 2 }
+      }
+    },
+    "model": {
+      "type": "object",
+      "required": ["id", "provider", "model"],
+      "additionalProperties": false,
+      "properties": {
+        "$comment": { "type": "string", "description": "Free-form note; ignored by the extension." },
+        "id": { "type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$", "description": "Stable id shown to VS Code; use it in chat.defaultModel. Unique, case-insensitive." },
+        "name": { "type": "string", "description": "Display name in the model picker (defaults to id)." },
+        "provider": { "type": "string", "description": "Key in providers." },
+        "model": { "type": "string", "description": "Provider model id (claude-opus-5-5, gpt-5.5...) or the Azure deployment name." },
+        "family": { "type": "string", "description": "VS Code model family (defaults to claude or gpt). chat.defaultModel also matches on family." },
+        "version": { "type": "string", "default": "1" },
+        "tooltip": { "type": "string" },
+        "detail": { "type": "string" },
+        "maxInputTokens": { "type": "integer", "minimum": 1, "default": 200000, "description": "Context window budget VS Code enforces. Claude 4.6+: 200000 (or 1000000 when 1M context is enabled); Haiku 4.5: 200000." },
+        "maxOutputTokens": { "type": "integer", "minimum": 1, "description": "Default 64000 for Claude, 32768 otherwise. Claude 4.6+ allow up to 128000." },
+        "capabilities": { "$ref": "#/definitions/capabilities" },
+        "thinking": { "$ref": "#/definitions/thinking" },
+        "cache": { "$ref": "#/definitions/cache" },
+        "default": { "type": "boolean", "description": "Exactly one model may be the default (also implied by roles containing default)." },
+        "roles": { "type": "array", "uniqueItems": true, "items": { "type": "string", "enum": ["default", "plan", "utility", "utilitySmall"] }, "description": "Which Copilot Chat slots this model should fill; used by 'EZiL Models: Manage -> Copy settings snippet'." },
+        "forcedToolChoice": { "type": "boolean", "description": "Send tool_choice any/required when Copilot requires a tool call. Defaults to false for Opus 5.5 / Fable 5.x, which return 400 for forced tool use. Anthropic: never sent while thinking is configured (the API only allows auto/none with thinking); Copilot's required mode then degrades to auto." },
+        "temperature": { "type": "number", "minimum": 0, "maximum": 2, "description": "Only sent when thinking is absent or disabled. Opus 4.7+, Sonnet 5, Opus 5/5.5 and Fable reject sampling parameters (400): leave unset there." }
+      }
+    }
+  }
+}
