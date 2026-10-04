@@ -95,6 +95,7 @@ import { claim as claimWarm } from '../warm.js';
 import telemetry from '../telemetry.js';
 import { applyDisplayEvidence, computeBootUiState } from '../boot-phases.js';
 import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
+import { watchRuntimeOnReturn } from '../runtime-recheck.js';
 import BootProgress, { DisplayNotice } from '../ui/boot-progress.js';
 import AppSpinner from '../ui/app-spinner.js';
 import attach_app_drawer from '../ui/app-drawer.js';
@@ -1005,6 +1006,17 @@ export async function openDesktopWindow (ctx = {}) {
     };
     document.addEventListener('visibilitychange', on_heartbeat_visibility);
     start_heartbeat();
+
+    // Back after an absence long enough for the computer to have idle-stopped:
+    // its runtime may be gone and this frame's URL with it (410 STALE_PREVIEW_URL).
+    // Ask the never-waking status probe; boot again only on an explicit "not
+    // running". See `../runtime-recheck.js`.
+    const stop_runtime_recheck = watchRuntimeOnReturn({
+        computerId: computer.id,
+        isLive: () => !! el_iframe.getAttribute('src'),
+        reboot: () => { void start_boot(); },
+        desktopRunning: (id) => session.desktopRunning(id),
+    });
 
     const progress = BootProgress({ onRetry: () => { void start_boot(); } });
     el_body.appendChild(progress.el);
@@ -2108,6 +2120,17 @@ export async function openDesktopWindow (ctx = {}) {
      */
     const release_container = () => {
         if ( ! computer?.id ) return;
+        // 🔴 The computer, not this window, is what a release would stop. Another
+        // window still showing it (the Code editor, a second Browser, an app
+        // preview) means presence has NOT ended. Production 2026-10-04: a close
+        // released the computer in the same second two windows were opened on
+        // it, and the stop that followed left them on 410 STALE_PREVIEW_URL.
+        const others = [...document.querySelectorAll('.window[data-ezil-computer-id]')]
+            .filter(w => w !== el_window && w.getAttribute('data-ezil-computer-id') === String(computer.id));
+        if ( others.length > 0 ) {
+            console.info(`[${PHASE}] close: ${others.length} other window(s) still use this computer — not releasing it`);
+            return;
+        }
         // Feature-detected FIRST, exactly like the heartbeat: a deployment
         // without `endpoints.activity` gets no request and no telemetry — an
         // older server is not a failure, it is an older server.
@@ -2153,6 +2176,7 @@ export async function openDesktopWindow (ctx = {}) {
         // paths that are not a close (`ezil:teardown`) reach only this line,
         // which is the pre-existing, correct behaviour for them.
         stop_heartbeat();
+        stop_runtime_recheck();
         window.removeEventListener('focus', sample_presence);
         window.removeEventListener('blur', sample_presence);
         document.removeEventListener('visibilitychange', sample_presence);

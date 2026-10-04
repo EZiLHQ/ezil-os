@@ -802,3 +802,38 @@ describe('readiness checkpoint coalescing (open path only)', () => {
     expect(captures(fake)).toBe(2);
   });
 });
+
+// Production 2026-10-04 05:59Z: windows were opened at 05:59:34 and, in the same
+// second, the desktop window's close-release reported "presence ended 30 min
+// ago" over them; the next alarm stopped the computer under the just-opened
+// windows, which then showed 410 STALE_PREVIEW_URL. A release ends presence; it
+// must never erase an open the server itself observed.
+describe('a close-release cannot stop a computer that was just opened', () => {
+  const recordActivity = async (fake: unknown, agoMs: number) => {
+    const proto = await loadPrototype();
+    await (proto.recordActivity as (this: unknown, a: number) => Promise<void>).call(fake, agoMs);
+  };
+
+  it('🔴 open, then a 30-minute release in the same second, then the alarm: the computer keeps running', async () => {
+    const fake = await makeFake({ running: true, storage: hydratedStorage({ [LAST_ACTIVITY_AT_KEY]: Date.now() - 2 * IDLE_STOP_MS }) });
+    await hydrate(fake);                        // a window opens (preview → hydrate): a server-observed open
+    await recordActivity(fake, 30 * 60_000);    // releaseDesktop() from the window that just closed
+    await runAlarmCycle(fake);
+    expect(fake.calls.stops).toBe(0);
+    expect(fake.calls.scheduled.at(-1)?.callback).toBe(FLUSH_CALLBACK); // and the alarm rescheduled the loop
+  });
+
+  it('a release with no recent open still stops the computer on the next alarm (billing intent unchanged)', async () => {
+    const fake = await makeFake({ running: true, storage: hydratedStorage({ 'ezil:lastOpenedAt': Date.now() - 2 * IDLE_STOP_MS }) });
+    await recordActivity(fake, 30 * 60_000);
+    await runAlarmCycle(fake);
+    expect(fake.calls.stops).toBe(1);
+  });
+
+  it('an open older than the idle window does not keep a released computer alive', async () => {
+    const fake = await makeFake({ running: true, storage: hydratedStorage({ 'ezil:lastOpenedAt': Date.now() - IDLE_STOP_MS - 1_000 }) });
+    await recordActivity(fake, 30 * 60_000);
+    await runAlarmCycle(fake);
+    expect(fake.calls.stops).toBe(1);
+  });
+});

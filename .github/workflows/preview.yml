@@ -295,7 +295,7 @@ jobs:
         run: node e2e/verify-cloud-deployment.mjs
       - uses: ./.github/actions/setup-playwright
       - name: Test the returned preview URL
-        timeout-minutes: 15
+        timeout-minutes: 22
         env:
           EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
@@ -303,7 +303,7 @@ jobs:
         run: |
           set -euo pipefail
           node e2e/await-deployed-bundle.mjs
-          for suite in prod prod-responsiveness prod-window-stacking prod-reconcile; do
+          for suite in prod prod-responsiveness prod-window-stacking prod-reconcile prod-lifecycle; do
             node "e2e/$suite.mjs"
           done
       - name: Confirm deployment identity after tests

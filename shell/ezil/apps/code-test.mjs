@@ -429,6 +429,55 @@ await window.$(win4).close();
 await settle(4);
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 5b. 🔴 THE CODE WINDOW KEEPS ITS COMPUTER AWAKE WHILE SOMEONE IS WORKING IN IT.
+//     Until 2026-10-04 only the desktop window reported presence, so a user
+//     working only in Code was idle-stopped after 10 minutes and the editor
+//     fell onto 410 STALE_PREVIEW_URL. Same presence rule as the desktop.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const HEARTBEAT_MS = 60_000; // shell/ezil/activity-heartbeat.js HEARTBEAT_INTERVAL_MS
+    ENDPOINTS.activity = '/api/shell/activity';
+    const ticks = [];
+    const realSetInterval = window.setInterval;
+    window.setInterval = (fn, ms, ...rest) => {
+        if ( ms === HEARTBEAT_MS ) ticks.push(fn);
+        return realSetInterval.call(window, fn, ms, ...rest);
+    };
+    let focused = true;
+    Object.defineProperty(window.document, 'hasFocus', { value: () => focused, configurable: true, writable: true });
+    await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+    await settle(20);
+    window.setInterval = realSetInterval;
+    const hbWin = q('.window[data-app="code"]');
+    push('the Code window registers exactly one presence heartbeat at 60s', ticks.length === 1, `${ticks.length} interval(s)`);
+    const activity = () => calls.filter(c => c.url.startsWith(ENDPOINTS.activity));
+    const before = activity().length;
+    ticks[0]?.();
+    await settle(4);
+    const beats = activity().slice(before);
+    push('🔴 visible + focused Code window -> a heartbeat for THIS computer with a small presence age',
+        beats.length === 1 && beats[0].body?.computerId === COMPUTER.id
+        && typeof beats[0].body?.lastInputAgoMs === 'number' && beats[0].body.lastInputAgoMs < 5_000,
+        JSON.stringify(beats.map(b => b.body)));
+    Object.defineProperty(window.document, 'visibilityState', { value: 'hidden', configurable: true });
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    ticks[0]?.();
+    await settle(4);
+    push('🔴 a hidden tab sends no heartbeat (it can never keep an abandoned computer alive)',
+        activity().length === before + 1, `${activity().length - before} beat(s)`);
+    Object.defineProperty(window.document, 'visibilityState', { value: 'visible', configurable: true });
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    await window.$(hbWin).close();
+    await settle(4);
+    ticks[0]?.();
+    await settle(4);
+    push('after the Code window closes, its heartbeat sends nothing',
+        activity().length === before + 1, `${activity().length - before} beat(s)`);
+    delete ENDPOINTS.activity;
+    focused = true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 6. LOCAL CODE ONLY.
 // ═══════════════════════════════════════════════════════════════════════════
 // Every request must be same-origin EXCEPT the code-preview frame itself,
