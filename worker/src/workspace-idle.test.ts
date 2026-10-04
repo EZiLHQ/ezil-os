@@ -486,7 +486,7 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
     // the containerIsRunning() check and the idle-check that follows it.
     const notRunningBranch = between(
       'if (!this.containerIsRunning()) {',
-      'const lastActivityAt = (await this.ctx.storage.get<number>(LAST_ACTIVITY_AT_KEY))',
+      'const clocks = await this.activityClocks();',
     );
     expect(notRunningBranch).not.toContain('runWorkspaceFlush');
     expect(notRunningBranch).not.toContain('this.schedule(');
@@ -648,9 +648,11 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
     // is the actual root-cause guard: writing this key from the alarm is
     // exactly how the original bug worked (the alarm resetting its own idle
     // clock every cycle).
-    const putPattern = /ctx\.storage\.put\(LAST_ACTIVITY_AT_KEY/g;
+    const putPattern = /ctx\.storage\.put\((LAST_ACTIVITY_AT_KEY|LAST_OPENED_AT_KEY)/g;
     expect(method.match(putPattern)).toBeNull();
-    expect(method).toContain('ctx.storage.get<number>(LAST_ACTIVITY_AT_KEY)');
+    // Neither clock is written from the alarm, directly or via `recordOpen()`.
+    expect(method).not.toContain('recordOpen(');
+    expect(method).toContain('this.activityClocks()');
     // Mutation-proven: temporarily inserted
     // `await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, Date.now());` at the
     // top of `flushWorkspaceScheduled` — this assertion failed (found a
@@ -692,7 +694,7 @@ describe('LAST_ACTIVITY_AT_KEY is bumped only by genuine, caller-initiated paths
       'async recordWorkspaceHydration(params: { prefix: string; mountPath: string; hydrated: boolean }): Promise<void> {',
       '\n  /**\n   * The `schedule()` callback.',
     );
-    expect(method).toContain('this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, Date.now())');
+    expect(method).toContain('await this.recordOpen();');
     // Mutation-proven: temporarily deleted this line — the corresponding
     // route-level regression below (preview bumps activity via hydration)
     // would lose its only writer; verified by removing the line and
@@ -705,7 +707,7 @@ describe('LAST_ACTIVITY_AT_KEY is bumped only by genuine, caller-initiated paths
       '\n    const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);',
     );
     expect(method).toContain(`if (trigger === 'explicit') {`);
-    expect(method).toContain('this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, Date.now())');
+    expect(method).toContain('await this.recordOpen();');
     // Mutation-proven: temporarily changed the guard to
     // `if (trigger === 'alarm')` — the alarm-path assertion in the
     // `flushWorkspaceScheduled` describe block above ("never writes

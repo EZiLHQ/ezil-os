@@ -273,6 +273,40 @@ await window.$(win).close();
 await settle(8);
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 2b. 🔴 A CLOSE DOES NOT RELEASE A COMPUTER ANOTHER WINDOW STILL USES.
+//     Production 2026-10-04 05:59Z: the desktop window's release landed in the
+//     same second two other windows were opened on the computer; it was stopped
+//     under them and they showed 410 STALE_PREVIEW_URL. `registry.js` stamps
+//     `data-ezil-computer-id` on every window it opens for a computer.
+// ═══════════════════════════════════════════════════════════════════════════
+const fakeWindow = (computerId, app) => {
+    const el = doc.createElement('div');
+    el.className = 'window';
+    el.setAttribute('data-app', app);
+    el.setAttribute('data-ezil-computer-id', computerId);
+    doc.body.appendChild(el);
+    return el;
+};
+win = await openDesktop();
+const codeSameComputer = fakeWindow(String(COMPUTER.id), 'code');
+before = calls.length;
+await window.$(win).close();
+await settle(8);
+push('🔴 closing the desktop while Code is open on the SAME computer sends NO release',
+    activityCalls(before).length === 0, JSON.stringify(activityCalls(before).map(c => c.body)));
+push('…and the desktop window is still closed', qa('.window[data-app="desktop"]').length === 0);
+codeSameComputer.remove();
+
+win = await openDesktop();
+const codeOtherComputer = fakeWindow('another-computer', 'code');
+before = calls.length;
+await window.$(win).close();
+await settle(8);
+push('a window on a DIFFERENT computer does not hold this one: the close still releases',
+    activityCalls(before).length === 1, `${activityCalls(before).length} activity call(s)`);
+codeOtherComputer.remove();
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 3. 🔴 THE RELEASE CANNOT DELAY OR FAIL THE CLOSE.
 // ═══════════════════════════════════════════════════════════════════════════
 // Against a server that NEVER answers. If the close awaited the release in any

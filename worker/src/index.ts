@@ -1778,6 +1778,23 @@ const WORKSPACE_FLUSH_CALLBACK = 'flushWorkspaceScheduled';
 const LAST_ACTIVITY_AT_KEY = 'ezil:lastActivityAt';
 
 /**
+ * Last time the SERVER itself saw this computer opened (a preview mint, a
+ * hydrate, an explicit checkpoint) — the same moments that write
+ * `LAST_ACTIVITY_AT_KEY`, kept separately because `LAST_ACTIVITY_AT_KEY` is
+ * also written by the CLIENT's presence reports, and those may move it
+ * backwards on purpose (`session.js#releaseDesktop`: "the window showing it
+ * closed, presence ended 30 minutes ago").
+ *
+ * Production 2026-10-04 05:59Z: two windows were opened on a computer at
+ * 05:59:34 and, in the same second, the desktop window's close-release wrote
+ * "30 minutes ago" over them; the next alarm (05:59:49) stopped the computer
+ * under the just-opened windows, whose URLs then answered 410
+ * STALE_PREVIEW_URL. Idle-stop now uses the NEWER of the two clocks, so a
+ * release can end presence but can never erase an open the server observed.
+ */
+const LAST_OPENED_AT_KEY = 'ezil:lastOpenedAt';
+
+/**
  * Internal bookkeeping ONLY for `computeNextFlushBackoffSeconds` — the
  * `lastActivityAt` value the alarm observed as of the END of the PREVIOUS
  * flush cycle, so the current cycle can tell "did activity advance since
@@ -2295,6 +2312,21 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
   /** Serialize hydrate, flush and teardown across this DO's await points. */
   private workspacePersistenceTail: Promise<unknown> = Promise.resolve();
+  /** A server-observed open: genuine activity that no client presence report can erase. */
+  private async recordOpen(): Promise<void> {
+    const now = Date.now();
+    await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, now);
+    await this.ctx.storage.put(LAST_OPENED_AT_KEY, now);
+  }
+
+  /** Both activity clocks, raw, plus the instant idle-stop measures from (the newer of the two). */
+  private async activityClocks(): Promise<{ presence?: number; opened?: number; effective: number }> {
+    const presence = await this.ctx.storage.get<number>(LAST_ACTIVITY_AT_KEY);
+    const opened = await this.ctx.storage.get<number>(LAST_OPENED_AT_KEY);
+    const effective = Math.max(presence ?? Date.now(), opened ?? Number.NEGATIVE_INFINITY);
+    return { presence, opened, effective };
+  }
+
   /** Last successful checkpoint of THIS container (see `READINESS_CHECKPOINT_REUSE_MS`). */
   private lastOkCheckpoint: { at: number; outcome: FlushOutcome } | null = null;
   /** The readiness checkpoint concurrent opens share instead of each queueing their own. */
@@ -2337,7 +2369,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         // An already-hydrated container with a fresh checkpoint is ready as is:
         // the open is still activity, but a second ~3 s checkpoint is not needed.
         if (result.detail === 'already_hydrated' && this.freshReadinessCheckpoint()) {
-          await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, Date.now());
+          await this.recordOpen();
           return result;
         }
         const checkpoint = await this.runWorkspaceFlush('explicit');
@@ -2379,7 +2411,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     // see `LAST_ACTIVITY_AT_KEY`'s doc comment for why that would rebuild the
     // exact billing bug this file fixes.
     if (trigger === 'explicit') {
-      await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, Date.now());
+      await this.recordOpen();
     }
 
     const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
@@ -2545,7 +2577,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     // `/sandbox/:id/workspace-diag`, `/sandbox/:id/twen` — NEVER the flush
     // alarm), so it counts as genuine "desktop open/mint" activity regardless
     // of whether hydration itself succeeded. See `LAST_ACTIVITY_AT_KEY`.
-    await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, Date.now());
+    await this.recordOpen();
 
     await this.ctx.storage.put(WORKSPACE_FLUSH_CONTEXT_KEY, { prefix: params.prefix, mountPath: params.mountPath });
     await this.ctx.storage.put(WORKSPACE_HYDRATED_KEY, params.hydrated);
@@ -2724,7 +2756,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       return;
     }
 
-    const lastActivityAt = (await this.ctx.storage.get<number>(LAST_ACTIVITY_AT_KEY)) ?? Date.now();
+    // The newer of client presence and the last server-observed open: a
+    // close-release can end presence, but never erase a fresh open.
+    const clocks = await this.activityClocks();
+    const lastActivityAt = clocks.effective;
     const now = Date.now();
     if (isIdleStopDue({ lastActivityAt, now })) {
       // 🔴 SIGNAL B — "no work" is the OTHER half of the owner requirement.
@@ -2769,7 +2804,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           && !outcome.systemCheckpointFailed) {
         // A real input heartbeat may arrive during the checkpoint's R2 I/O.
         // Keep that newly active desktop up and checkpoint again next cycle.
-        if (await this.ctx.storage.get<number>(LAST_ACTIVITY_AT_KEY) !== lastActivityAt) {
+        const after = await this.activityClocks();
+        if (after.presence !== clocks.presence || after.opened !== clocks.opened) {
           await this.schedule(WORKSPACE_FLUSH_INTERVAL_SECONDS, WORKSPACE_FLUSH_CALLBACK);
           return;
         }
@@ -2857,7 +2893,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     const flight = this.withWorkspacePersistence(async () => {
       const fresh = this.freshReadinessCheckpoint();
       if (fresh) {
-        await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, Date.now());
+        await this.recordOpen();
         return fresh;
       }
       return this.runWorkspaceFlush('explicit');
