@@ -69,12 +69,29 @@ try {
 
   const codeFrame = () => p.frames().find(f => /-code\./.test(f.url()));
   const openCode = async () => {
-    await p.locator('.taskbar-item[data-app="code"]').first().click({ timeout: 15000 });
+    // The shell's own registry first (the same call its dock makes); the dock tile as fallback.
+    const launched = await p.evaluate(() => {
+      const ez = window.ezil;
+      const payload = ez?.session?.payload?.();
+      if (!ez?.registry?.launch || !payload?.computer) return false;
+      void ez.registry.launch('code', { payload, computer: payload.computer, desktopState: payload.desktopState });
+      return true;
+    }).catch(() => false);
+    if (!launched) await p.locator('.taskbar-item[data-app="code"]').first().click({ timeout: 15000 }).catch(() => {});
     for (let i = 0; i < 90; i++) {
       const f = codeFrame();
       if (f && await f.$('.monaco-workbench').catch(() => null)) return f;
       await p.waitForTimeout(2000);
     }
+    // Say what the window shows instead, so a failure here is diagnosable.
+    const seen = await p.evaluate(() => {
+      const w = document.querySelector('.window[data-app="code"]');
+      return { windows: [...document.querySelectorAll('.window')].map(x => x.getAttribute('data-app')),
+               src: w?.querySelector('iframe')?.getAttribute('src')?.replace(/token=[^&]*/, 'token=…') ?? null,
+               text: (w?.innerText ?? '').replace(/\s+/g, ' ').slice(0, 200) };
+    }).catch(e => String(e));
+    console.log('      code window:', JSON.stringify(seen), 'launched-via-registry:', launched,
+      'frames:', JSON.stringify(p.frames().map(fr => fr.url().split('?')[0].slice(0, 80))));
     return null;
   };
   const tabs = async (f) => f.$$eval('.tabs-container .tab .label-name', els => els.map(e => e.textContent)).catch(() => []);
