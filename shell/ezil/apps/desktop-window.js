@@ -1011,6 +1011,30 @@ export async function openDesktopWindow (ctx = {}) {
     // its runtime may be gone and this frame's URL with it (410 STALE_PREVIEW_URL).
     // Ask the never-waking status probe; boot again only on an explicit "not
     // running". See `../runtime-recheck.js`.
+    // 🔴 The frame itself says its runtime is gone. When the computer's
+    // container is replaced under an open window (an image rollout, a crash,
+    // an idle-stop the user comes back to), the Worker answers the frame's
+    // next navigation with a small "Reconnecting…" page that posts
+    // `ezil:preview-runtime-stale` (worker `recoverableStalePreview`) instead
+    // of the SDK's raw 410 JSON (founder screenshots, 2026-10-04). Mint a
+    // fresh URL against the ACTIVE runtime through the normal bounded boot —
+    // never re-navigate the dead URL — and at most once per
+    // `STALE_RECOVERY_MIN_GAP_MS`, so a URL that keeps coming back stale ends
+    // in the boot path's own failure state rather than a loop.
+    const STALE_RECOVERY_MIN_GAP_MS = 20_000;
+    let last_stale_recovery = 0;
+    const on_frame_message = (event) => {
+        if ( disposed || event.source !== el_iframe.contentWindow ) return;
+        if ( event.data?.type !== 'ezil:preview-runtime-stale' ) return;
+        const now = Date.now();
+        if ( now - last_stale_recovery < STALE_RECOVERY_MIN_GAP_MS ) return;
+        last_stale_recovery = now;
+        console.info(`[${PHASE}] the frame's runtime is gone; minting against the active one`);
+        telemetry.capture({ eventClass: 'display_failure', site: 'ezil-os:apps/desktop#staleRuntime', code: 'preview_runtime_stale' });
+        void start_boot();
+    };
+    window.addEventListener('message', on_frame_message);
+
     const stop_runtime_recheck = watchRuntimeOnReturn({
         computerId: computer.id,
         isLive: () => !! el_iframe.getAttribute('src'),
@@ -2177,6 +2201,7 @@ export async function openDesktopWindow (ctx = {}) {
         // which is the pre-existing, correct behaviour for them.
         stop_heartbeat();
         stop_runtime_recheck();
+        window.removeEventListener('message', on_frame_message);
         window.removeEventListener('focus', sample_presence);
         window.removeEventListener('blur', sample_presence);
         document.removeEventListener('visibilitychange', sample_presence);

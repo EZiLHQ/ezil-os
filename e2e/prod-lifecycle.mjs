@@ -96,6 +96,31 @@ try {
       'frames:', JSON.stringify(p.frames().map(fr => fr.url().split('?')[0].slice(0, 80))));
     return null;
   };
+  // 🔴 What the founder saw: the SDK's raw JSON as the page inside a window.
+  const rawStaleVisible = async () => {
+    for (const fr of p.frames()) {
+      const text = await fr.evaluate(() => document.body?.innerText ?? '').catch(() => '');
+      if (text.includes('STALE_PREVIEW_URL')) return fr.url().split('?')[0];
+    }
+    return null;
+  };
+  const desktopPaints = async () => {
+    for (let i = 0; i < 45; i++) {
+      await p.waitForTimeout(2000);
+      const f = p.frames().find(fr => /nekodesktop/.test(fr.url()));
+      if (!f) continue;
+      const px = await f.evaluate(() => {
+        const v = document.querySelector('video'); if (!v || !v.videoWidth) return null;
+        const c = document.createElement('canvas'); c.width = 64; c.height = 40;
+        const g = c.getContext('2d'); g.drawImage(v, 0, 0, 64, 40);
+        const d = g.getImageData(0, 0, 64, 40).data; let mx = 0;
+        for (let k = 0; k < d.length; k += 4) mx = Math.max(mx, d[k], d[k + 1], d[k + 2]);
+        return { w: v.videoWidth, max: mx };
+      }).catch(() => null);
+      if (px && px.max > 0) return px;
+    }
+    return null;
+  };
   const tabs = async (f) => f.$$eval('.tabs-container .tab .label-name', els => els.map(e => e.textContent)).catch(() => []);
   const closeWindow = (app) => p.evaluate((a) => window.$(`.window[data-app="${a}"]`).close(), app);
 
@@ -130,6 +155,8 @@ try {
   check('🔴 closing the desktop did not stop the computer under the open Code window (its origin still answers, not 410 STALE)',
     status === 200, `status=${status}`);
   check('🔴 no request on the page answered 410 STALE_PREVIEW_URL', stale.length === 0, stale.slice(0, 2).join(' | ').slice(0, 160));
+  const rawAfterRelease = await rawStaleVisible();
+  check('🔴 no window shows the raw STALE_PREVIEW_URL JSON', !rawAfterRelease, String(rawAfterRelease ?? ''));
 
   // 5. Close Code, reopen it on the same computer: where the user left off.
   await closeWindow('code');
@@ -140,6 +167,16 @@ try {
   await p.waitForTimeout(5000);
   const after = f ? await tabs(f) : [];
   check(`🔴 reopening Code restores the open file (${FILE})`, after.includes(TAB_LABEL), JSON.stringify(after));
+
+  // 6. The Browser/Desktop surface: reopen the desktop after its own release.
+  try { await p.locator('.taskbar-item').filter({ hasText: /browser/i }).first().click({ timeout: 12000 }); }
+  catch { await p.locator('.taskbar-item[data-app="desktop"]').first().click({ timeout: 12000 }).catch(() => {}); }
+  const t2 = Date.now();
+  const px = await desktopPaints();
+  check('🔴 the desktop reopened after its release PAINTS (a fresh URL against the active runtime)', !!px,
+    px ? `${Date.now() - t2}ms ${px.w}px` : 'no video');
+  const rawEnd = await rawStaleVisible();
+  check('🔴 …and no window shows the raw STALE_PREVIEW_URL JSON at the end either', !rawEnd, String(rawEnd ?? ''));
 
   await ctx.close();
 } finally {

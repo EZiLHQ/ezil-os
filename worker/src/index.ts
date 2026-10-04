@@ -53,6 +53,8 @@
  */
 
 import { getSandbox, proxyToSandbox, type Sandbox, type SandboxEnv } from '@cloudflare/sandbox';
+// Not exported from here: workerd treats every named export of the entry module as a handler.
+import { recoverableStalePreview } from './stale-preview';
 // Separate value import of the SAME class (under a local alias) so the
 // Durable Object subclass below (`EzilSandboxDO`) can `extends` it. The
 // `type Sandbox` import above stays untouched — every existing `Sandbox<unknown>`
@@ -6165,7 +6167,7 @@ export default {
     // 1) Route exposed-port preview traffic (incl. WebSocket upgrades) into the
     //    container. Returns null for everything else.
     const proxied = await proxyToSandbox(request, env);
-    if (proxied) return proxied;
+    if (proxied) return recoverableStalePreview(request, proxied);
 
     if (method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders });
