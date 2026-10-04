@@ -38,6 +38,8 @@ if (!EMAIL || !PASS) { console.error('SKIP: set EZIL_E2E_EMAIL and EZIL_E2E_PASS
 /** The Worker's flush alarm backs off to 60 s; a release-triggered stop lands within one cycle plus the final checkpoint. */
 const AFTER_RELEASE_WAIT_MS = 100_000;
 const FILE = 'README.md';
+/** VS Code's tab `.label-name` shows the name WITHOUT its extension (the extension is a separate span). */
+const TAB_LABEL = FILE.replace(/\.[^.]+$/, '');
 
 const results = [];
 const check = (name, ok, detail = '') => {
@@ -109,7 +111,7 @@ try {
     await p.waitForTimeout(3000);
   }
   const before = f ? await tabs(f) : [];
-  check(`a file opens in Code (${FILE})`, before.includes(FILE), JSON.stringify(before));
+  check(`a file opens in Code (${FILE})`, before.includes(TAB_LABEL), JSON.stringify(before));
 
   // 2. The desktop, then close it: the release.
   try { await p.locator('.taskbar-item').filter({ hasText: /browser/i }).first().click({ timeout: 12000 }); }
@@ -137,7 +139,7 @@ try {
   check('Code reopens to a live editor', !!f, `${Date.now() - t1}ms`);
   await p.waitForTimeout(5000);
   const after = f ? await tabs(f) : [];
-  check(`🔴 reopening Code restores the open file (${FILE})`, after.includes(FILE), JSON.stringify(after));
+  check(`🔴 reopening Code restores the open file (${FILE})`, after.includes(TAB_LABEL), JSON.stringify(after));
 
   await ctx.close();
 } finally {
