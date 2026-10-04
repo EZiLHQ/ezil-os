@@ -36,6 +36,7 @@ import { and, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { computers } from '@/server/db/schema';
+import { stampOpened } from './computer-store';
 import {
     APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS,
     composeAppPreviewBootstrapUrl,
@@ -131,6 +132,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
         )
         .query(async ({ ctx, input }) => {
             await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+            // Starting this computer's desktop is choosing it: remember it.
+            await stampOpened(ctx.db, ctx.user.id, input.computerId, { throttled: false });
 
             // Decided BEFORE the Worker call, because it is an input to the
             // container's boot env, and reported afterwards so the shell can
@@ -1128,6 +1131,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
         )
         .mutation(async ({ ctx, input }) => {
             await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+            // A long, active session keeps its computer current (hourly at most).
+            await stampOpened(ctx.db, ctx.user.id, input.computerId, { throttled: true });
 
             const config = resolveCloudflareGuacamoleConfig();
             if (!config.isConfigured) {

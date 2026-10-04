@@ -1902,6 +1902,21 @@ const WORKSPACE_FLUSH_INTERVAL_SECONDS = 10;
 const IDLE_STOP_MS = 10 * 60_000;
 
 /**
+ * How long a successful checkpoint stays good enough to answer an OPEN's
+ * readiness gate (`flushWorkspaceNow`, and the hydrate flush on an
+ * already-hydrated container) instead of running another one.
+ *
+ * Measured in production 2026-10-04: since the atomic checkpoint (7e44828) a
+ * no-op checkpoint costs ~3 s, every `/sandbox/preview` ran TWO of them, and
+ * they serialize on this DO. The app answers `sandbox_starting` after 12 s
+ * and the shell re-asks every 1.5 s per open window, so re-asks queued faster
+ * than they drained: ~30 previews in 3 minutes at 30-62 s each, until the
+ * shell gave up with "Try again". The alarm loop keeps checkpointing every
+ * 10 s regardless; teardown and idle-stop never reuse.
+ */
+const READINESS_CHECKPOINT_REUSE_MS = 10_000;
+
+/**
  * The reschedule-interval ladder `computeNextFlushBackoffSeconds` steps
  * through. `[0]` (10s, == `WORKSPACE_FLUSH_INTERVAL_SECONDS`) is also the
  * value every cycle resets to the moment either a file actually changed or
@@ -2280,6 +2295,17 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
   /** Serialize hydrate, flush and teardown across this DO's await points. */
   private workspacePersistenceTail: Promise<unknown> = Promise.resolve();
+  /** Last successful checkpoint of THIS container (see `READINESS_CHECKPOINT_REUSE_MS`). */
+  private lastOkCheckpoint: { at: number; outcome: FlushOutcome } | null = null;
+  /** The readiness checkpoint concurrent opens share instead of each queueing their own. */
+  private readinessFlight: Promise<FlushOutcome> | null = null;
+
+  /** A checkpoint this recent, of the running container, answers an open's readiness gate. */
+  private freshReadinessCheckpoint(): FlushOutcome | null {
+    const last = this.lastOkCheckpoint;
+    if (!last || Date.now() - last.at >= READINESS_CHECKPOINT_REUSE_MS || !this.containerIsRunning()) return null;
+    return last.outcome;
+  }
 
   private async withWorkspacePersistence<T>(operation: () => Promise<T>): Promise<T> {
     const previous = this.workspacePersistenceTail ?? Promise.resolve();
@@ -2307,6 +2333,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
             log: (message) => console.error(message) });
           bootLog('system_hydrate', 'end', { status: system.ok ? 'ok' : 'error', phaseMs: Date.now() - systemStartedAt,
             detail: `restored=${system.restored},skippedImageScoped=${system.skippedImageScoped},conflicts=${system.conflicts}${system.skippedReason ? `,reason=${system.skippedReason}` : ''}${system.sameImage === false ? ',crossImage' : ''}` });
+        }
+        // An already-hydrated container with a fresh checkpoint is ready as is:
+        // the open is still activity, but a second ~3 s checkpoint is not needed.
+        if (result.detail === 'already_hydrated' && this.freshReadinessCheckpoint()) {
+          await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, Date.now());
+          return result;
         }
         const checkpoint = await this.runWorkspaceFlush('explicit');
         if (checkpoint.ok) return result;
@@ -2433,6 +2465,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       }
     }
     if (outcome.ok && outcome.uploaded.length > 0) await this.ctx.storage.put(WORKSPACE_LAST_UPLOAD_AT_KEY, Date.now());
+    this.lastOkCheckpoint = outcome.ok ? { at: Date.now(), outcome } : null;
     // The running container lost the hydrated workspace (replaced under us): stop
     // claiming it is hydrated, so status and the next open re-hydrate from the head.
     if (outcome.skippedReason === 'container_not_hydrated' && hydrated) await this.ctx.storage.put(WORKSPACE_HYDRATED_KEY, false);
@@ -2817,7 +2850,22 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
   /** Explicit, on-demand flush — see class doc comment for the two call sites. */
   async flushWorkspaceNow(): Promise<FlushOutcome> {
-    return this.withWorkspacePersistence(() => this.runWorkspaceFlush('explicit'));
+    // Concurrent opens (desktop, code and app windows, each re-asking while the
+    // app reports `sandbox_starting`) share ONE readiness checkpoint; one that
+    // just succeeded is reused. See `READINESS_CHECKPOINT_REUSE_MS`.
+    if (this.readinessFlight) return this.readinessFlight;
+    const flight = this.withWorkspacePersistence(async () => {
+      const fresh = this.freshReadinessCheckpoint();
+      if (fresh) {
+        await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, Date.now());
+        return fresh;
+      }
+      return this.runWorkspaceFlush('explicit');
+    });
+    this.readinessFlight = flight;
+    const clear = () => { if (this.readinessFlight === flight) this.readinessFlight = null; };
+    flight.then(clear, clear);
+    return flight;
   }
 
   /**

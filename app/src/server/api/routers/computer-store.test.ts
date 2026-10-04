@@ -24,6 +24,8 @@ import {
     createComputerInLowestFreeSlot,
     getOrCreateDefaultComputer,
     isUniqueViolation,
+    pickDefaultComputer,
+    stampOpened,
     liveComputersOf,
     liveOwnedComputer,
     pickFreeSlot,
@@ -413,12 +415,14 @@ describe('getOrCreateDefaultComputer', () => {
         expect(statements.filter(isInsert)).toHaveLength(0);
     });
 
-    it('asks the database for the LOWEST slot rather than sorting in JS', async () => {
+    it('asks the database for the MOST RECENTLY OPENED computer, then the lowest slot (not sorting in JS)', async () => {
         const { db, statements } = makeScriptedDb([[computerRow(COMPUTER, 2)]]);
 
         await getOrCreateDefaultComputer(db, { userId: USER });
 
-        expect(statements[0]!.sql).toMatch(/order by "computers"\."slot" asc/);
+        // A returning user lands on the computer they were using (any device,
+        // after closing the browser or signing out), not silently on slot 1.
+        expect(statements[0]!.sql).toMatch(/order by "computers"\."last_opened_at" desc nulls last, "computers"\."slot" asc/);
         expect(statements[0]!.sql).toMatch(/"deleted_at" is null/);
         expect(statements[0]!.params).toContain(USER);
     });
@@ -576,5 +580,52 @@ describe('hard-delete guards', () => {
         // would silently drift apart.
         const source = readFileSync(fileURLToPath(new URL('./computer.ts', import.meta.url)), 'utf8');
         expect(source).not.toMatch(/isNull\s*\(/);
+    });
+});
+
+describe('pickDefaultComputer (the same rule for a list in hand)', () => {
+    const row = (slot: number, lastOpenedAt: string | null) => ({ id: `c${slot}`, slot, lastOpenedAt });
+    it('picks the most recently opened computer, whatever its slot', () => {
+        expect(pickDefaultComputer([row(1, '2026-08-02T13:23:57Z'), row(2, '2026-10-02T07:04:11Z')])?.slot).toBe(2);
+    });
+    it('prefers any opened computer over one never opened', () => {
+        expect(pickDefaultComputer([row(1, null), row(2, '2026-08-02T00:00:00Z')])?.slot).toBe(2);
+    });
+    it('falls back to the lowest slot when none was ever opened (the old behaviour)', () => {
+        expect(pickDefaultComputer([row(2, null), row(1, null)])?.slot).toBe(1);
+    });
+    it('accepts Date values and returns undefined for no computers', () => {
+        expect(pickDefaultComputer([{ slot: 1, lastOpenedAt: new Date(1) }, { slot: 2, lastOpenedAt: new Date(2) }])?.slot).toBe(2);
+        expect(pickDefaultComputer([])).toBeUndefined();
+    });
+});
+
+describe('stampOpened (records which computer the user is on)', () => {
+    it('stamps last_opened_at for the caller\'s own LIVE computer on desktop start', async () => {
+        const { db, statements } = makeTestDb();
+        await stampOpened(db, USER, COMPUTER, { throttled: false });
+        expect(statements).toHaveLength(1);
+        const { sql, params } = statements[0]!;
+        expect(sql).toMatch(/^update "ezil_computers" set "last_opened_at" = \$1/);
+        expect(sql).toMatch(/"id" = \$\d+/);
+        expect(sql).toMatch(/"user_id" = \$\d+/);
+        expect(sql).toMatch(/"deleted_at" is null/);
+        expect(sql).not.toMatch(/"last_opened_at" </);
+        expect(params).toEqual(expect.arrayContaining([COMPUTER, USER]));
+    });
+
+    it('the heartbeat stamp only writes when the last stamp is over an hour old (or never)', async () => {
+        const { db, statements } = makeTestDb();
+        await stampOpened(db, USER, COMPUTER, { throttled: true });
+        const { sql } = statements[0]!;
+        expect(sql).toMatch(/\("ezil_computers"\."last_opened_at" is null or "ezil_computers"\."last_opened_at" < \$\d+\)/);
+    });
+
+    it('never throws: a failed write must not fail the desktop start', async () => {
+        const db = drizzle(async () => { throw new Error('db down'); }, { schema });
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        await expect(stampOpened(db, USER, COMPUTER, { throttled: false })).resolves.toBeUndefined();
+        expect(warn).toHaveBeenCalled();
+        warn.mockRestore();
     });
 });
