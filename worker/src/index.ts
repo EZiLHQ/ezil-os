@@ -3198,6 +3198,31 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
       bootLog('restart', 'start', { detail: `mode=${mode}` });
 
+      // 🔴 0) Hydrate BEFORE starting anything. A restart can land on a container
+      // the platform replaced (an image rollout, a crash) that no open has
+      // hydrated yet; starting the desktop there lets startup write into the
+      // workspace, after which every hydrate refuses `workspace_unmarked_nonempty`
+      // and every open answers 503 until the container goes away. Staging
+      // 2026-10-04 07:36Z: rollout at 07:36:20, restart at 07:36:21, every
+      // preview 503 from 07:37:47 on. Same context the last open recorded; an
+      // already-hydrated container answers at once.
+      const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
+      if (wctx) {
+        const hydrated = await this.hydrateWorkspace({ mountPath: wctx.mountPath, prefix: wctx.prefix });
+        if (!hydrated.mounted) {
+          bootLog('restart', 'end', { status: 'error', detail: `workspace_unavailable:${hydrated.detail ?? 'unknown'}` });
+          return {
+            ok: false,
+            mode,
+            outcome: 'boot_failed',
+            wasRunning: status.desktopRunning,
+            stopConfirmed: false,
+            bootOk: false,
+            error: `workspace_unavailable:${hydrated.detail ?? 'unknown'}`,
+          };
+        }
+      }
+
       // 1) find + 2) stop the running launcher — reusing terminate_stack's
       //    OWN SIGTERM->grace->escalate contract, never a second teardown.
       const processesRaw = await this.listProcesses();

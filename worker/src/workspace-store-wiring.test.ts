@@ -260,3 +260,47 @@ describe('hydrateWorkspace on an already-hydrated container', () => {
     expect(captures.length).toBe(2);                            // stale: checkpoints again
   });
 });
+
+// Staging 2026-10-04 07:36Z: an image rollout replaced the container, a restart
+// started the desktop on it un-hydrated, startup wrote into /workspace, and every
+// open after that answered 503 `workspace_unmarked_nonempty`. A restart must
+// hydrate first, and must not start a desktop over a workspace it cannot restore.
+describe('restartDesktopStack hydrates before it starts a desktop', () => {
+  const restart = async (fake: unknown) => (await (await proto()).restartDesktopStack.call(fake,
+    'ezil.work' as never, 'guac-x' as never, 'neko' as never, 'neko' as never)) as { ok: boolean; outcome: string; error?: string };
+
+  it('🔴 a container that cannot be hydrated (unmarked, non-empty) is refused before any desktop process is touched', async () => {
+    const { fake } = await makeFake({}, { [FLUSH_CONTEXT_KEY]: { mountPath: MOUNT_PATH, prefix: PREFIX } });
+    const calls: string[] = [];
+    Object.assign(fake, {
+      getExposedPorts: async () => [],
+      exists: async () => ({ exists: true }),
+      readFile: async () => { throw new Error('ENOENT'); },
+      listFiles: async () => ({ files: [{ name: 'written-by-startup', type: 'file' }] }),
+      listProcesses: async () => { calls.push('listProcesses'); return []; },
+      startProcess: async () => { calls.push('startProcess'); return { id: 'p' }; },
+      listSchedules: async () => [], deleteSchedules: () => undefined, schedule: async () => undefined,
+    });
+    (fake as { exists: (p: string) => Promise<{ exists: boolean }> }).exists = async (p: string) => ({ exists: !p.endsWith('.ezil-hydrated.json') });
+    const report = await restart(fake);
+    expect(report).toMatchObject({ ok: false, outcome: 'boot_failed' });
+    expect(report.error).toContain('workspace_unmarked_nonempty');
+    expect(calls).toEqual([]);
+  });
+
+  it('a hydrated container goes straight on to the desktop launcher', async () => {
+    const { fake } = await makeFake({}, { [FLUSH_CONTEXT_KEY]: { mountPath: MOUNT_PATH, prefix: PREFIX }, [HYDRATED_KEY]: true });
+    const marker = JSON.stringify({ version: 1, prefix: PREFIX, mountPath: MOUNT_PATH, hydratedAt: new Date().toISOString() });
+    const calls: string[] = [];
+    Object.assign(fake, {
+      getExposedPorts: async () => [],
+      exists: async () => ({ exists: true }),
+      readFile: async (path: string) => path.endsWith('.ezil-hydrated.json')
+        ? { content: marker, encoding: 'utf-8' } : { content: Buffer.from('hello').toString('base64'), encoding: 'base64' },
+      listProcesses: async () => { calls.push('listProcesses'); throw new Error('stop here: the launcher step was reached'); },
+      listSchedules: async () => [], deleteSchedules: () => undefined, schedule: async () => undefined,
+    });
+    await restart(fake).catch(() => undefined);
+    expect(calls).toEqual(['listProcesses']);
+  });
+});
