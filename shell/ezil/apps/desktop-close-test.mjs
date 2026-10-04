@@ -307,6 +307,36 @@ push('a window on a DIFFERENT computer does not hold this one: the close still r
 codeOtherComputer.remove();
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 2c. 🔴 A FRAME WHOSE RUNTIME IS GONE IS RE-MINTED, NOT LEFT ON RAW JSON.
+//     Founder screenshots 2026-10-04: raw STALE_PREVIEW_URL JSON inside the
+//     desktop window. The Worker now answers that navigation with a page that
+//     posts `ezil:preview-runtime-stale`; the window must mint a fresh URL
+//     against the active runtime — once, bounded — and ignore anyone else.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const mints = (from = 0) => calls.slice(from).filter(c => c.url.startsWith(ENDPOINTS.desktop) && c.method === 'POST');
+    const staleWin = await openDesktop();
+    const frame = staleWin?.querySelector('iframe.window-app-iframe');
+    push('setup: the desktop window has its frame', !! frame?.contentWindow);
+    const from = calls.length;
+    window.dispatchEvent(new window.MessageEvent('message', { data: { type: 'ezil:preview-runtime-stale' }, source: window }));
+    await settle(8);
+    push('a stale-runtime message from SOMEONE ELSE (not this frame) is ignored', mints(from).length === 0, `${mints(from).length} mint(s)`);
+    window.dispatchEvent(new window.MessageEvent('message', { data: { type: 'ezil:preview-runtime-stale' }, source: frame.contentWindow }));
+    await settle(30);
+    push('🔴 the frame saying its runtime is gone -> a fresh mint against the active runtime',
+        mints(from).length === 1, `${mints(from).length} mint(s)`);
+    push('…and the window navigates to the URL that mint returned',
+        frame.getAttribute('src') === 'https://8181-guac-u1-c1-nekodesktop.ezil.org/', frame.getAttribute('src'));
+    window.dispatchEvent(new window.MessageEvent('message', { data: { type: 'ezil:preview-runtime-stale' }, source: frame.contentWindow }));
+    await settle(8);
+    push('a second stale report right after is not a loop (bounded to one recovery per interval)',
+        mints(from).length === 1, `${mints(from).length} mint(s)`);
+    await window.$(staleWin).close();
+    await settle(8);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 3. 🔴 THE RELEASE CANNOT DELAY OR FAIL THE CLOSE.
 // ═══════════════════════════════════════════════════════════════════════════
 // Against a server that NEVER answers. If the close awaited the release in any
