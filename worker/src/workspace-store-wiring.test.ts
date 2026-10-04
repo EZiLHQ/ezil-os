@@ -221,3 +221,42 @@ describe('ensureWorkspaceMount store gate', () => {
     expect(sandbox.calls.mount).toBe(0);
   });
 });
+
+// Every open hydrates first; on an already-hydrated container that used to run
+// a ~3 s checkpoint even when one had just succeeded (production 2026-10-04).
+describe('hydrateWorkspace on an already-hydrated container', () => {
+  it('reuses a fresh checkpoint instead of running another, and checkpoints again once it is stale', async () => {
+    const { fake, store } = await makeFake({}, {
+      [FLUSH_CONTEXT_KEY]: { mountPath: MOUNT_PATH, prefix: PREFIX },
+      [HYDRATED_KEY]: true,
+    });
+    const marker = JSON.stringify({ version: 1, prefix: PREFIX, mountPath: MOUNT_PATH, hydratedAt: new Date().toISOString() });
+    const captures: string[] = [];
+    const exec = (fake as { exec: (c: string) => Promise<unknown> }).exec;
+    Object.assign(fake, {
+      exists: async () => ({ exists: true }),                  // marker (and system manifest) present
+      readFile: async (path: string) => path.endsWith('.ezil-hydrated.json')
+        ? { content: marker, encoding: 'utf-8' }
+        : { content: Buffer.from('hello').toString('base64'), encoding: 'base64' },
+      exec: async (c: string) => { if (c.includes('"op":"capture"')) captures.push(c); return exec(c); },
+      // The flush loop's scheduler (the SDK's), as no-ops.
+      listSchedules: async () => [], deleteSchedules: () => undefined, schedule: async () => undefined,
+    });
+    const hydrate = async () => (await (await proto()).hydrateWorkspace.call(fake, { mountPath: MOUNT_PATH, prefix: PREFIX } as never)) as { mounted: boolean; detail?: string };
+
+    expect(await hydrate()).toMatchObject({ mounted: true, detail: 'already_hydrated' });
+    expect(captures.length).toBe(1);                            // no fresh checkpoint yet: one runs
+    store.set('ezil:lastActivityAt', 1);
+    expect(await hydrate()).toMatchObject({ mounted: true, detail: 'already_hydrated' });
+    expect(captures.length).toBe(1);                            // fresh: reused
+    expect(store.get('ezil:lastActivityAt')).toBeGreaterThan(1); // the open still counts as activity
+    const realNow = Date.now;
+    try {
+      Date.now = () => realNow() + 11_000;
+      expect((await hydrate()).mounted).toBe(true);
+    } finally {
+      Date.now = realNow;
+    }
+    expect(captures.length).toBe(2);                            // stale: checkpoints again
+  });
+});

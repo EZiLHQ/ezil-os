@@ -9,6 +9,10 @@
 // `toShellBootUser` in `app/src/server/shell/boot-payload.ts` from the
 // verified Supabase session). Nothing is fetched and nothing is invented: a
 // value the identity provider did not give is shown as absent, not guessed.
+// How the user signed in is deliberately NOT shown: the session cannot state
+// it reliably (an account linked to several providers reports one of them),
+// and a wrong claim ("Signed in with email and password" after a Google
+// sign-in) is worse than none.
 // The avatar is the user's initials, drawn locally — no request to a
 // third-party image host just to render a profile picture.
 
@@ -23,8 +27,6 @@ function userFrom (ctx) {
 const ACCOUNT_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
     + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
     + '<circle cx="12" cy="8.5" r="3.75"/><path d="M4.75 19.5a7.25 7.25 0 0 1 14.5 0"/></svg>';
-
-const PROVIDER_LABELS = { google: 'Google', email: 'Email and password', github: 'GitHub', azure: 'Microsoft' };
 
 /** Remove anything tag-shaped, repeatedly, so `<<b>b>` cannot reassemble into a tag. */
 function withoutTags (text) {
@@ -50,11 +52,6 @@ export function initialsFor (name, email) {
     return letters.toUpperCase();
 }
 
-export function providerLabel (provider) {
-    if ( ! provider ) return null;
-    return PROVIDER_LABELS[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
-}
-
 export function memberSince (iso) {
     const time = Date.parse(iso ?? '');
     if ( ! Number.isFinite(time) ) return null;
@@ -77,7 +74,6 @@ function render ($win, user) {
         return;
     }
     const displayName = user.name || (user.email ? user.email.split('@')[0] : 'Your account');
-    const provider = providerLabel(user.provider);
     const since = memberSince(user.createdAt);
 
     $pane.find('[data-role="account-body"]').html(`
@@ -86,7 +82,6 @@ function render ($win, user) {
             <div class="ezil-account-identity">
                 <div class="ezil-account-name" data-role="account-name">${html_encode(displayName)}</div>
                 <div class="ezil-account-email" data-role="account-email">${html_encode(user.email ?? 'No email on this account')}</div>
-                ${provider ? `<span class="ezil-settings-pill ezil-account-provider">Signed in with ${html_encode(provider)}</span>` : ''}
             </div>
         </section>
 
@@ -94,7 +89,6 @@ function render ($win, user) {
         <section class="ezil-account-card ezil-account-details">
             ${detailRow('Name', user.name)}
             ${detailRow('Email', user.email)}
-            ${detailRow('Sign-in method', provider)}
             ${detailRow('Member since', since)}
             ${detailRow('Account ID', user.id, { mono: true })}
         </section>
@@ -124,7 +118,7 @@ export default {
         return `
             <div class="ezil-settings-account">
                 <h3>Account</h3>
-                <p class="ezil-settings-lead">The account this OS is signed in with.</p>
+                <p class="ezil-settings-lead">Who is signed in to this OS.</p>
                 <div data-role="account-body"></div>
             </div>`;
     },
