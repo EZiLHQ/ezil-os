@@ -368,7 +368,8 @@ jobs:
                    shell/ezil/apps/registry-trace-test.mjs \
                    shell/ezil/native-test.mjs \
                    shell/ezil/local-surfaces-test.mjs \
-                   shell/ezil/ui/Settings/settings-test.mjs; do
+                   shell/ezil/ui/Settings/settings-test.mjs \
+                   shell/ezil/runtime-recheck-test.mjs; do
             echo "── $t"
             node "$t"
           done

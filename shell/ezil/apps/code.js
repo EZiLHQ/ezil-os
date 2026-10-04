@@ -87,6 +87,8 @@ import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../
 
 import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
 import telemetry from '../telemetry.js';
+import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
+import { watchRuntimeOnReturn } from '../runtime-recheck.js';
 import { computeBootUiState } from '../boot-phases.js';
 import AppSpinner from '../ui/app-spinner.js';
 import UIWindow from '../../src/UI/UIWindow.js';
@@ -540,11 +542,59 @@ export async function openCodeWindow (ctx = {}) {
         setTimeout(() => { void ask(); }, FRAME_CONFIRM_FALLBACK_MS);
     }
 
+    // ── Presence heartbeat: activity belongs to the COMPUTER ─────────────────
+    // Until 2026-10-04 only the desktop window reported presence, so someone
+    // working only in Code was idle-stopped after `IDLE_STOP_MS` and the editor
+    // fell onto 410 STALE_PREVIEW_URL. Same rule as `desktop-window.js`
+    // (`activity-heartbeat.js`): beat while visible and present, stop when the
+    // tab is hidden or nobody is there; never seeded from open time, so it can
+    // never keep an abandoned computer alive. Hosted only: a local editor has
+    // no container to keep warm.
+    let last_present_at = null;
+    let was_present = false;
+    const sample_presence = () => {
+        const present = isPresent({
+            visibilityState: document.visibilityState,
+            hasFocus: typeof document.hasFocus === 'function' ? document.hasFocus() : undefined,
+        });
+        if ( present || was_present ) last_present_at = performance.now();
+        was_present = present;
+    };
+    const heartbeat_tick = () => {
+        if ( disposed ) return;
+        sample_presence();
+        const lastPresenceAgoMs = last_present_at === null ? NaN : performance.now() - last_present_at;
+        if ( ! shouldHeartbeat({ visible: document.visibilityState === 'visible', lastPresenceAgoMs }) ) return;
+        void session.reportActivity(computer.id, Math.round(lastPresenceAgoMs));
+    };
+    const heartbeat_timer = nativeSurface || ! computer?.id ? null : setInterval(heartbeat_tick, HEARTBEAT_INTERVAL_MS);
+    if ( heartbeat_timer !== null ) {
+        window.addEventListener('focus', sample_presence);
+        window.addEventListener('blur', sample_presence);
+        document.addEventListener('visibilitychange', sample_presence);
+        sample_presence();
+    }
+    // Back after an absence long enough for an idle-stop: re-check before the
+    // stale frame is used (`../runtime-recheck.js`).
+    const stop_runtime_recheck = heartbeat_timer === null ? null : watchRuntimeOnReturn({
+        computerId: computer.id,
+        isLive: () => !! el_iframe.getAttribute('src'),
+        reboot: () => { void start_boot(); },
+        desktopRunning: (id) => session.desktopRunning(id),
+    });
+
     const dispose = () => {
         if (disposed) return;
         disposed = true;
         nativeSurface?.dispose();
         stop_timers();
+        stop_runtime_recheck?.();
+        if ( heartbeat_timer !== null ) {
+            clearInterval(heartbeat_timer);
+            window.removeEventListener('focus', sample_presence);
+            window.removeEventListener('blur', sample_presence);
+            document.removeEventListener('visibilitychange', sample_presence);
+        }
         window.removeEventListener('ezil:teardown', dispose);
         // The window can close mid-boot before any terminal point above ever
         // fires. Without this the trace would sit open until `registry.js`'s
