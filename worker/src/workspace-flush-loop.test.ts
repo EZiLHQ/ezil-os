@@ -740,3 +740,65 @@ it('keeps the desktop alive when user activity arrives during the final idle che
   expect(fake.calls.stops).toBe(0);
   expect(fake.calls.scheduled).toEqual([{ seconds: 10, callback: FLUSH_CALLBACK }]);
 });
+
+// Production 2026-10-04: every open ran two ~3 s checkpoints, serialized on the
+// DO, while the shell re-asked every 1.5 s per window — ~30 previews in 3
+// minutes at 30-62 s each, until "Try again". Opens now share ONE readiness
+// checkpoint and reuse one that just succeeded; the alarm loop never reuses.
+describe('readiness checkpoint coalescing (open path only)', () => {
+  const captures = (fake: FakeDO) => fake.calls.execs.filter((c) => c.includes('"op":"capture"')).length;
+  const flushNow = async (fake: unknown) => {
+    const proto = await loadPrototype();
+    return (await (proto.flushWorkspaceNow as (this: unknown) => Promise<unknown>).call(fake)) as { ok: boolean };
+  };
+
+  it('concurrent opens share one checkpoint, and every one of them is answered ok', async () => {
+    const fake = await makeFake({ running: true, storage: hydratedStorage() });
+    const outcomes = await Promise.all(Array.from({ length: 6 }, () => flushNow(fake)));
+    expect(outcomes.every((o) => o.ok)).toBe(true);
+    expect(captures(fake)).toBe(1);
+  });
+
+  it('an open right after a successful checkpoint reuses it, and still counts as activity', async () => {
+    const fake = await makeFake({ running: true, storage: hydratedStorage() });
+    expect((await flushNow(fake)).ok).toBe(true);
+    storeOf(fake).set(LAST_ACTIVITY_AT_KEY, 1);
+    expect((await flushNow(fake)).ok).toBe(true);
+    expect(captures(fake)).toBe(1);
+    expect(storeOf(fake).get(LAST_ACTIVITY_AT_KEY)).toBeGreaterThan(1);
+  });
+
+  it('a checkpoint older than the reuse window is not reused', async () => {
+    const fake = await makeFake({ running: true, storage: hydratedStorage() });
+    expect((await flushNow(fake)).ok).toBe(true);
+    const realNow = Date.now;
+    try {
+      Date.now = () => realNow() + 11_000;
+      expect((await flushNow(fake)).ok).toBe(true);
+    } finally {
+      Date.now = realNow;
+    }
+    expect(captures(fake)).toBe(2);
+  });
+
+  it('🔴 a stopped container never reuses a checkpoint (the open fails as before)', async () => {
+    const fake = await makeFake({ running: true, storage: hydratedStorage() });
+    expect((await flushNow(fake)).ok).toBe(true);
+    fake.ctx.container.running = false;
+    expect((await flushNow(fake)).ok).toBe(false);
+  });
+
+  it('🔴 a failed checkpoint is never reused', async () => {
+    const fake = await makeFake({ running: true, listFilesThrows: true, storage: hydratedStorage() });
+    expect((await flushNow(fake)).ok).toBe(false);
+    expect((await flushNow(fake)).ok).toBe(false);
+    expect(captures(fake)).toBe(2);
+  });
+
+  it('the alarm loop still checkpoints right after an open (persistence cadence unchanged)', async () => {
+    const fake = await makeFake({ running: true, storage: hydratedStorage({ [LAST_ACTIVITY_AT_KEY]: Date.now() }) });
+    expect((await flushNow(fake)).ok).toBe(true);
+    await runAlarmCycle(fake);
+    expect(captures(fake)).toBe(2);
+  });
+});

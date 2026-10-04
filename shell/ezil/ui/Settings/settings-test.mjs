@@ -358,10 +358,15 @@ push('picking an accent writes the theme tokens',
         && q('[data-role="account-email"]')?.textContent === 'ada@example.com');
     push('🔴 a name with markup is shown as text, never rendered',
         ! pane?.querySelector('.ezil-account-name b'));
-    push('Account shows initials, the sign-in method and the account id',
+    push('Account shows initials and the account id',
         q('.ezil-account-avatar')?.textContent === 'AL'
-        && /Signed in with Google/.test(text)
         && text.includes(REAL_PAYLOAD.user.id));
+    // 🔴 The session cannot say reliably HOW the user signed in (the payload
+    // here says google; live it said "email and password" after a Google
+    // sign-in). No provider claim of any kind is shown.
+    push('🔴 Account makes no sign-in-method claim',
+        ! /signed in with|sign-in method|email and password|google|github|microsoft/i.test(text)
+        && ! pane?.querySelector('.ezil-account-provider'), text.match(/signed in with[^.]*|sign-in method/i)?.[0]);
     push('Account shows when the account was created', /Member since/.test(text) && /2026/.test(text));
 
     // jsdom does not implement form submission; capture it instead.
@@ -707,6 +712,35 @@ push('🔴 switching away closes the OLD code window (not left streaming c-d)',
     qa('.window[data-app="code"]').length === 0,
     `${qa('.window[data-app="code"]').length} code window(s) remain`);
 push('the desktop now streams the NEW computer (c-e)',
+    q('.window[data-app="desktop"][data-ezil-computer-id="c-e"]') !== null);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5f. 🔴 CLOSING THE DESKTOP WINDOW DOES NOT CHANGE WHICH COMPUTER YOU ARE ON.
+//     Founder-reported 2026-10-02: with the desktop window closed, the
+//     computer the session was on was offered a "Switch" button like a
+//     stranger's computer. It must stay Current (with an Open action), and
+//     only the OTHER computer offers Switch.
+// ═══════════════════════════════════════════════════════════════════════════
+$('.window[data-app="desktop"]').close();
+await settle(10);
+push('setup: no desktop window is open', qa('.window[data-app="desktop"]').length === 0);
+await reopenSettings();
+const rowsAfterClose = qa('.window[data-app="settings"] .ezil-settings-row');
+const rowE2 = rowsAfterClose.find(r => r.getAttribute('data-id') === 'c-e');
+const rowD2 = rowsAfterClose.find(r => r.getAttribute('data-id') === 'c-d');
+push('🔴 the computer switched to (c-e) is still marked Current after its desktop window closed',
+    rowE2?.classList.contains('active') && rowE2?.querySelector('.ezil-settings-pill')?.textContent.trim() === 'Current',
+    rowE2?.outerHTML.slice(0, 200));
+push('🔴 with two computers and no desktop open, EXACTLY one is marked Current',
+    rowsAfterClose.filter(r => r.querySelector('.ezil-settings-pill')?.textContent.trim() === 'Current').length === 1,
+    rowsAfterClose.map(r => `${r.getAttribute('data-id')}:${r.querySelector('.ezil-settings-pill')?.textContent.trim() ?? '-'}`).join(','));
+push('…and offers Open (relaunch its desktop), not Switch',
+    rowE2?.querySelector('[data-action="switch"]')?.textContent.trim() === 'Open');
+push('the OTHER computer (c-d) is the one offered Switch',
+    ! rowD2?.classList.contains('active') && rowD2?.querySelector('[data-action="switch"]')?.textContent.trim() === 'Switch');
+click(rowE2?.querySelector('[data-action="switch"]'));
+await settle(20, 40);
+push('Open relaunches the desktop for the current computer (c-e)',
     q('.window[data-app="desktop"][data-ezil-computer-id="c-e"]') !== null);
 
 // ═══════════════════════════════════════════════════════════════════════════

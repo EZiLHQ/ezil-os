@@ -32,7 +32,7 @@
  *      "enforce it in the type system, not by convention").
  */
 
-import { and, eq, isNull, type ExtractTablesWithRelations, type SQL } from 'drizzle-orm';
+import { and, eq, isNull, lt, or, sql, type ExtractTablesWithRelations, type SQL } from 'drizzle-orm';
 import type { PgDatabase, PgQueryResultHKT } from 'drizzle-orm/pg-core';
 
 import * as schema from '@/server/db/schema';
@@ -166,15 +166,58 @@ export type CreateComputerOutcome =
     | { ok: true; computer: Computer }
     | { ok: false; reason: 'computer_limit_reached' | 'insert_returned_no_row' };
 
-/** The lowest-slot LIVE computer owned by `userId`, or undefined if they have none. */
-export async function findLowestLiveComputer(
+/** Throttle for the heartbeat stamp: at most one `last_opened_at` write per computer per hour. */
+export const OPENED_STAMP_THROTTLE_MS = 60 * 60 * 1000;
+
+/**
+ * Record that `userId` is on `computerId` (`ezil_computers.last_opened_at`).
+ * This is what lets a returning user — any device, after closing the browser
+ * or signing out — land back on the computer they were using
+ * (`findDefaultLiveComputer`), and what keeps an active session out of the
+ * 24 h reaper backstop. Never blocks or fails the caller.
+ */
+export async function stampOpened(
+    db: ComputerStoreDb,
+    userId: string,
+    computerId: string,
+    { throttled }: { throttled: boolean },
+): Promise<void> {
+    try {
+        const owned = and(eq(computers.id, computerId), eq(computers.userId, userId), isNull(computers.deletedAt));
+        const stale = or(isNull(computers.lastOpenedAt), lt(computers.lastOpenedAt, new Date(Date.now() - OPENED_STAMP_THROTTLE_MS)));
+        await db.update(computers).set({ lastOpenedAt: new Date() }).where(throttled ? and(owned, stale) : owned);
+    } catch (err) {
+        console.warn('[cloudflareGuacamole] could not record last_opened_at', {
+            computerId,
+            error: err instanceof Error ? err.message : String(err),
+        });
+    }
+}
+
+/**
+ * The computer a returning user should land on: the LIVE computer they opened
+ * most recently, falling back to the lowest slot when none has ever been
+ * opened. Signing in from any device (or after closing the browser) must
+ * reopen the computer they were working on, not silently fall back to slot 1.
+ * `last_opened_at` is stamped server-side whenever a desktop starts
+ * (`cloudflareGuacamole.previewUrl`).
+ */
+export async function findDefaultLiveComputer(
     db: ComputerCreateDb,
     userId: string,
 ): Promise<Computer | undefined> {
     return db.query.computers.findFirst({
         where: liveComputersOf(userId),
-        orderBy: (row, { asc }) => [asc(row.slot)],
+        orderBy: (row, { asc }) => [sql`${row.lastOpenedAt} desc nulls last`, asc(row.slot)],
     });
+}
+
+/** Same rule as `findDefaultLiveComputer`, for a list already in hand (`computer.list`). */
+export function pickDefaultComputer<T extends { slot: number; lastOpenedAt: Date | string | null }>(
+    rows: readonly T[],
+): T | undefined {
+    const opened = (row: T) => (row.lastOpenedAt == null ? Number.NEGATIVE_INFINITY : new Date(row.lastOpenedAt).getTime());
+    return [...rows].sort((a, b) => opened(b) - opened(a) || a.slot - b.slot)[0];
 }
 
 /**
@@ -262,7 +305,7 @@ export async function getOrCreateDefaultComputer(
     db: ComputerCreateDb,
     { userId, name }: { userId: string; name?: string },
 ): Promise<GetOrCreateDefaultComputerOutcome> {
-    const existing = await findLowestLiveComputer(db, userId);
+    const existing = await findDefaultLiveComputer(db, userId);
     if (existing) {
         return { ok: true, computer: existing, created: false };
     }
@@ -273,7 +316,7 @@ export async function getOrCreateDefaultComputer(
     }
 
     if (outcome.reason === 'computer_limit_reached') {
-        const winner = await findLowestLiveComputer(db, userId);
+        const winner = await findDefaultLiveComputer(db, userId);
         if (winner) {
             return { ok: true, computer: winner, created: false };
         }
