@@ -215,6 +215,14 @@ const FAKE_STREAM = `<!doctype html><html><head><style>
  for ( const t of ['pointerdown', 'touchstart', 'mousedown', 'click'] ) {
    window.addEventListener(t, () => { window.__hits.push(t); }, true);
  }
+ let framesDecoded = 0;
+ setInterval(() => {
+   framesDecoded++;
+   parent.postMessage({ source: 'ezil-mobile', type: 'stream_vitals',
+     attempt: new URL(location.href).searchParams.get('ezilAttempt'),
+     vitals: { connectionState: 'connected', framesDecoded, bytesReceived: framesDecoded * 100,
+       width: 1280, height: 720 } }, location.origin);
+ }, 100);
 </script></body></html>`;
 
 const COMPUTER = {

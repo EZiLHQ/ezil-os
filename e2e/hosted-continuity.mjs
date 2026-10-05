@@ -268,8 +268,29 @@ try {
   await verifyEditor(); await launch('desktop'); await live();
   const replaced = await relay(); assert.notEqual(replaced.runtimeId, firstRelay.runtimeId, 'Stop/reopen reused old runtime');
   evidence.replacementRuntimeHash = hash(replaced.runtimeId); phase('replacement persistence');
-  await page.evaluate(url => { window.__continuityVitals = []; document.querySelector('.window[data-app="desktop"] iframe').src = url; }, staleURL);
+  // Preview hostnames use stable tokens and become active again on reopen.
+  // A previous URL after reopen alone would never exercise the 410 recovery.
+  // Stop this explicitly isolated runtime with its Browser window still open.
+  const staleStop = await api('/api/shell/stop', { computerId });
+  assert.ok(staleStop.ok && staleStop.terminated, 'Stale navigation stop failed');
+  const staleResponse = page.waitForResponse(response => response.status() === 410
+    && new URL(response.url()).origin === new URL(staleURL).origin, { timeout: 30000 });
+  await page.evaluate(url => {
+    window.__continuityVitals = [];
+    const frame = document.querySelector('.window[data-app="desktop"] iframe');
+    const stale = new URL(url);
+    // The shell owns the current navigation attempt. Replace only runtime
+    // identity so the recovery document can still authenticate its message.
+    stale.searchParams.set('ezilAttempt', new URL(frame.src).searchParams.get('ezilAttempt'));
+    frame.src = stale.href;
+  }, staleURL);
+  const recoveryDocument = await staleResponse;
+  assert.ok((recoveryDocument.headers()['content-type'] || '').includes('text/html'), 'Stale navigation did not serve recovery HTML');
+  assert.equal(recoveryDocument.headers()['cache-control'], 'no-store', 'Stale recovery was cacheable');
+  assert.ok(!(await recoveryDocument.text()).includes('STALE_PREVIEW_URL'), 'Stale recovery exposed raw JSON');
   await wait(3000); await live();
+  assert.notEqual((await relay()).runtimeId, replaced.runtimeId, 'Stale recovery did not open a replacement runtime');
+  await verifyEditor();
   for (const frame of page.frames()) {
     const text = await frame.locator('body').innerText().catch(() => '');
     assert.ok(!text.includes('STALE_PREVIEW_URL'), 'Stale navigation exposed raw JSON');

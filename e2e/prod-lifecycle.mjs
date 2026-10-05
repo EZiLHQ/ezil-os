@@ -26,14 +26,14 @@ import { createRequire } from 'node:module';
 import { APP, configureAppContext } from './deployed-target.mjs';
 
 const REQ_DIR = process.env.PLAYWRIGHT_REQUIRE_DIR;
-if (!REQ_DIR) { console.error('SKIP: PLAYWRIGHT_REQUIRE_DIR unset'); process.exit(2); }
+if (!REQ_DIR) { console.error('FAIL: PLAYWRIGHT_REQUIRE_DIR unset'); process.exit(2); }
 const require_ = createRequire(REQ_DIR + '/x.js');
 let chromium;
 try { ({ chromium } = require_('playwright')); }
-catch { console.error('SKIP: playwright unresolvable from ' + REQ_DIR); process.exit(2); }
+catch { console.error('FAIL: playwright unresolvable'); process.exit(2); }
 const EMAIL = process.env.EZIL_E2E_EMAIL;
 const PASS = process.env.EZIL_E2E_PASSWORD;
-if (!EMAIL || !PASS) { console.error('SKIP: set EZIL_E2E_EMAIL and EZIL_E2E_PASSWORD'); process.exit(2); }
+if (!EMAIL || !PASS) { console.error('FAIL: set EZIL_E2E_EMAIL and EZIL_E2E_PASSWORD'); process.exit(2); }
 
 /** The Worker's flush alarm backs off to 60 s; a release-triggered stop lands within one cycle plus the final checkpoint. */
 const AFTER_RELEASE_WAIT_MS = 100_000;

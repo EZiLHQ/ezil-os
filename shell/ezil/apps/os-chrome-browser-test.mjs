@@ -138,7 +138,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const FAKE_STREAM = `<!doctype html><html><head><style>
  html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center}
  .scr{width:min(100vw,calc(100vh * 16 / 9));height:min(100vh,calc(100vw * 9 / 16));background:#14484c}
-</style></head><body><div class="scr"></div></body></html>`;
+</style></head><body><div class="scr"></div><script>
+// Media transport is a fixture; each document reports its own frame progress.
+let framesDecoded = 0;
+setInterval(() => {
+  framesDecoded++;
+  parent.postMessage({ source: 'ezil-mobile', type: 'stream_vitals',
+    attempt: new URL(location.href).searchParams.get('ezilAttempt'),
+    vitals: { connectionState: 'connected', framesDecoded, bytesReceived: framesDecoded * 100,
+      width: 1280, height: 720 } }, location.origin);
+}, 100);
+</script></body></html>`;
 
 const browser = await chromium.launch();
 let anyHardFailure = false;

@@ -227,6 +227,8 @@ function boot(opts: { uptimeSeconds: string; rc: number; maxRestarts: string; re
             NEKO_APP_MAX_RESTARTS: opts.maxRestarts,
             NEKO_APP_RESTART_DELAY: opts.restartDelay,
             EZIL_WORKSPACE_ROOT: join(root, 'workspace'),
+            CODE_SERVER_USER_DATA_DIR: join(root, 'code-data'),
+            CODE_SERVER_EXTENSIONS_DIR: join(root, 'code-extensions'),
             EZIL_LOCAL_STATE_DIR: join(root, 'local-state'),
             CHROME_PROFILE_DIR: join(root, 'chrome-profile'),
             CHROME_HOME_FILE: join(root, 'no-such-landing-page.html'),

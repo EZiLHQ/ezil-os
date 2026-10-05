@@ -55,6 +55,8 @@ const KNOWN_UNCOVERED: Record<string, string> = {
     'cloudflareGuacamole.getScreen': 'stream geometry, owned by the shell',
     'cloudflareGuacamole.setScreen': 'stream geometry, owned by the shell',
     'cloudflareGuacamole.reportActivity': 'the shell\'s presence heartbeat against the idle reaper',
+    'cloudflareGuacamole.relayState': 'runtime-scoped relay metadata for the hosted shell viewer',
+    'cloudflareGuacamole.refreshRelay': 'renews the hosted shell viewer\'s active TURN session',
 };
 
 describe('SDK surface vs. the real routers', () => {

@@ -44,16 +44,16 @@ describe('a stale preview runtime never reaches the user as raw JSON', () => {
 
   it('retains the navigation attempt without allowing inline-script breakout', async () => {
     const { recoverableStalePreview } = await import('./stale-preview');
-    const attempt = '</script><script>alert("injected")</script>';
+    const attempt = '</SCRIPT><SCRIPT>alert("injected")</SCRIPT>';
     const url = new URL('https://viewer.example/');
     url.searchParams.set('ezilAttempt', attempt);
     const response = await recoverableStalePreview(new Request(url, {
       headers: { 'sec-fetch-dest': 'iframe' },
     }), sdkStale());
     const body = await response.text();
-    expect((body.match(/<script>/g) ?? []).length).toBe(1);
-    expect((body.match(/<\/script>/g) ?? []).length).toBe(1);
-    const script = body.match(/<script>([\s\S]*?)<\/script>/)![1];
+    expect((body.match(/<script>/gi) ?? []).length).toBe(1);
+    expect((body.match(/<\/script>/gi) ?? []).length).toBe(1);
+    const script = body.match(/<script>([\s\S]*?)<\/script>/i)![1];
     let received: unknown;
     new Function('parent', script)({ postMessage: (data: unknown) => { received = data; } });
     expect(received).toEqual({ type: 'ezil:preview-runtime-stale', attempt });
