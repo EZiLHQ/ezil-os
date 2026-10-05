@@ -428,6 +428,7 @@
     // and the shell renders the difference.
     var vitalsPrev = null;
     var vitalsTimer = null;
+    var viewerNeedsVitals = false;
 
     function pumpVitals() {
         var pc = peers.length ? peers[peers.length - 1] : null;
@@ -487,10 +488,9 @@
     /**
      * Start or stop publishing vitals, on the shell's request.
      *
-     * ON DEMAND, because a monitor nobody is looking at is pure cost: one
-     * `getStats()` every 2s for the life of every session, on a 2-vCPU
-     * container budget that the encoder already dominates. The shell asks when
-     * its System view opens and withdraws when it closes.
+     * The current viewer needs counters for readiness and TURN renewal. The
+     * System monitor can also request them, but closing that monitor must not
+     * stop evidence needed by an active viewer.
      */
     function stopVitals() {
         if (!vitalsTimer) return;
@@ -525,11 +525,14 @@
             if (!d || d.source !== 'ezil-shell') return;
             if (ev.source !== window.parent) return;
             if (d.type === 'viewer_probe') {
-                if (viewerAttempt && d.attempt === viewerAttempt) startVitals();
+                if (viewerAttempt && d.attempt === viewerAttempt) {
+                    viewerNeedsVitals = true;
+                    startVitals();
+                }
                 return;
             }
             if (d.type === 'vitals_start') startVitals();
-            else if (d.type === 'vitals_stop') stopVitals();
+            else if (d.type === 'vitals_stop' && !viewerNeedsVitals) stopVitals();
         }, false);
     } catch (e) {
         warn('vitals-listen-failed', String((e && e.message) || e));
