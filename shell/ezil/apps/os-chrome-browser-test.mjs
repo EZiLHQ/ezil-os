@@ -287,7 +287,7 @@ async function leaveFullbleed (page) {
     });
     await sleep(300);
     await page.evaluate(() => { $('.taskbar-item[data-app="desktop"]').trigger('click'); });
-    await sleep(300);
+    await page.waitForSelector('.window[data-app="desktop"].ezil-fullbleed', { timeout: 10_000 });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
