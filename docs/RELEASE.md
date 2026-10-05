@@ -97,15 +97,18 @@ cannot establish live credentials, quotas, registry access or rollout behavior.
 
 ## Internal macOS test DMG (no Apple subscription)
 
-The manual [`macOS Internal DMG`](../.github/workflows/macos-internal.yml)
-workflow builds the pinned ARM Linux runtime on `ubuntu-24.04-arm`, compiles an
-Apple Silicon app on `macos-14`, ad-hoc signs it, verifies the disk image,
-writes a SHA-256 file, and uploads both as a 14-day Actions artifact. It does
-not read any Apple or repository secret.
+The [`macOS Native Internal DMG`](../.github/workflows/macos-internal.yml)
+workflow packages the native Electron Apple Silicon app on `macos-15`, runs
+native helper, connector and GUI checks, ad-hoc signs the app, verifies the
+disk image, and launches the packaged app in the offline guest smoke suite.
+It uploads the DMG, SHA-256, inventory, SBOM and smoke evidence as 14-day Actions
+artifacts. It runs manually and on relevant pull requests, without Apple or
+repository secrets. The native host CI matrix uses the same macOS runner and
+also builds and tests the legacy Swift migration package.
 
-From GitHub, open **Actions → macOS Internal DMG → Run workflow**, select
+From GitHub, open **Actions → macOS Native Internal DMG → Run workflow**, select
 the branch containing the macOS files, and download the
-`EZiL-OS-AppleSilicon-internal-*` artifact after the job turns green. This artifact is
+`ezil-native-<commit>-<run>` artifact after the job turns green. This artifact is
 for trusted internal testers only. Because it is not Developer ID signed or
 notarized, macOS will require the tester to Control-click the app and choose
 **Open**, or approve it in **System Settings → Privacy & Security**. The

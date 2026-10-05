@@ -6,7 +6,7 @@ import yaml
 
 root = Path(__file__).resolve().parents[2]
 workflows = {}
-for name in ('ci', 'preview', 'image', 'deploy', 'deploy-app'):
+for name in ('ci', 'preview', 'image', 'deploy', 'deploy-app', 'macos-internal'):
     text = (root / f'.github/workflows/{name}.yml').read_text()
     workflow = yaml.safe_load(text)
     workflows[name] = workflow
@@ -22,6 +22,14 @@ for name in ('ci', 'preview', 'image', 'deploy', 'deploy-app'):
                 script = step['with']['script']
                 result = subprocess.run(['node', '--input-type=module', '--check'], input='async function githubScript() {\n' + script + '\n}', text=True, capture_output=True)
                 assert result.returncode == 0, (name, step.get('name'), result.stderr)
+
+# Retired hosted images must not return through another workflow or matrix.
+for path in (root / '.github/workflows').glob('*.yml'):
+    assert not re.search(r'\bmacos-14(?:-(?:large|xlarge|arm64))?\b', path.read_text()), path
+assert workflows['ci']['jobs']['macos-native']['strategy']['matrix']['os'] == ['ubuntu-latest', 'macos-15']
+assert workflows['macos-internal']['jobs']['dmg']['runs-on'] == 'macos-15'
+internal_triggers = workflows['macos-internal'].get('on', workflows['macos-internal'].get(True))
+assert '.github/workflows/ci.yml' in internal_triggers['pull_request']['paths']
 
 jobs = workflows['preview']['jobs']
 assert set(jobs['production']['needs']) == {'trust', 'preview', 'images'}
