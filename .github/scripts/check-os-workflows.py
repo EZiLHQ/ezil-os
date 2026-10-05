@@ -74,6 +74,14 @@ preview = '\n'.join(s.get('run', '') for s in jobs['preview']['steps'])
 assert not re.search(r'ci-migrate|--apply|migrations apply|drizzle.*push', preview)
 production = jobs['production']['steps']
 positions = {s.get('name'): i for i, s in enumerate(production)}
+for job_name, lease_name in (('preview', 'lease'), ('production', 'production_lease')):
+    steps = jobs[job_name]['steps']
+    cleanup = next(step for step in steps if step.get('name') == f'Stop isolated {"staging" if job_name == "preview" else "production"} test computer')
+    assert cleanup['if'] == f"always() && steps.{lease_name}.outcome == 'success'"
+    assert cleanup['run'] == 'node e2e/cleanup-hosted-computer.mjs'
+    assert cleanup['timeout-minutes'] == 7
+    assert steps.index(cleanup) < next(i for i, step in enumerate(steps) if step.get('name', '').startswith('Release shared'))
+    assert steps.index(cleanup) < next(i for i, step in enumerate(steps) if step.get('name', '').startswith('Upload') and 'evidence' in step.get('name', ''))
 assert positions['Verify or apply reviewed production migrations'] < positions['Deploy production Worker']
 assert positions['Capture previous production identities'] < positions['Deploy production Worker']
 assert positions['Test the returned production URL'] < positions['Test the canonical production URL']

@@ -113,6 +113,12 @@ ordinary app requests retain their 240-second budget. Cleanup uses the signed-in
 request context even if the page fails, and requires confirmed shutdown or an
 already-stopped computer. The deployed browser suites also verify the explicit
 computer before launch; reconcile rechecks it immediately before restarting.
+Both cloud jobs run final authenticated cleanup under `always()` before releasing
+their lease, including when an earlier suite fails or later canonical checks reopen
+compute. Cleanup signs in to the computer-management page, verifies the selected
+isolated computer through the read-only session endpoint, and never loads `/os`.
+Its redacted result is uploaded with acceptance evidence; unconfirmed cleanup fails
+the job.
 
 Configure each GitHub environment with an explicitly approved isolated
 `EZIL_E2E_COMPUTER_ID` secret, an absolute `EZIL_E2E_WORKSPACE_PATH` variable,

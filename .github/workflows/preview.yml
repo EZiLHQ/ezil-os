@@ -359,13 +359,6 @@ jobs:
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
         run: node e2e/hosted-continuity.mjs
-      - name: Upload hosted continuity evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hosted-continuity-${{ needs.trust.outputs.sha }}-${{ github.run_attempt }}
-          path: hosted-continuity-evidence/
-          if-no-files-found: error
       - name: Confirm deployment identity after tests
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -376,6 +369,21 @@ jobs:
           EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
         run: node e2e/verify-cloud-deployment.mjs
+      - name: Stop isolated staging test computer
+        if: always() && steps.lease.outcome == 'success'
+        timeout-minutes: 7
+        env:
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+        run: node e2e/cleanup-hosted-computer.mjs
+      - name: Upload hosted continuity evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-continuity-${{ needs.trust.outputs.sha }}-${{ github.run_attempt }}
+          path: hosted-continuity-evidence/
+          if-no-files-found: error
       - name: Release shared staging lease
         if: always() && steps.lease.outcome == 'success'
         env:
@@ -710,6 +718,15 @@ jobs:
             sleep 5
           done
           exit 1
+      - name: Stop isolated production test computer
+        if: always() && steps.production_lease.outcome == 'success'
+        timeout-minutes: 7
+        env:
+          EZIL_E2E_APP: https://os.ezil.org
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+        run: node e2e/cleanup-hosted-computer.mjs
       - name: Upload production release and recovery evidence
         if: always()
         uses: actions/upload-artifact@v4
