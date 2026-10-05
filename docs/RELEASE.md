@@ -8,8 +8,8 @@ now a full gated release; its former frontend-only and verify-only bypasses
 are retired. Vercel Git previews remain enabled; automatic main Git deployment
 must remain disabled in `app/vercel.json`.
 
-All OS jobs use GitHub-hosted runners. Native/macOS rollout is unchanged and
-outside the automatic main cloud release. On version tags, the independent
+All OS jobs use GitHub-hosted runners, including exact-artifact Mac E2E on
+`macos-15`. Native/macOS rollout is outside the automatic main cloud release. On version tags, the independent
 release workflow still builds signed native artifacts as drafts. Deploy waits
 for successful cloud verification and the signed macOS installer, attaches
 the version image alias to the tested digest, then publishes that draft.
@@ -97,8 +97,8 @@ cannot establish live credentials, quotas, registry access or rollout behavior.
 
 Relevant PRs run the short hosted continuity suite with five-minute TURN
 credentials. Main requires the full suite before production: active video for
-36 minutes with the production30-minute TURN lifetime, real checkpoint/stop/reopen,
-and editor returns after10 and30 minutes. The suite has a90-minute limit and holds the existing staging lease;
+36 minutes with the production 30-minute TURN lifetime, real checkpoint/stop/reopen,
+and editor returns after 10 and 30 minutes. The suite has a 90-minute limit and holds the existing staging lease;
 its AWS role coordinates that lease only. Execution uses GitHub-hosted runners.
 Missing prerequisites and skipped acceptance are failures.
 
@@ -111,7 +111,11 @@ only deployment identities, hashes, timings and whitelisted media counters.
 Staging also needs `EZIL_ACCEPTANCE_SANDBOX` for that same isolated computer
 and `EZIL_ACCEPTANCE_HMAC_SECRET` matching its existing signed Worker boundary.
 Fault controls are disabled without both staging scope and the exact sandbox;
-injected failures expire within60 seconds. Production has no fault scope.
+injected failures expire within 60 seconds. Production has no fault scope.
+Production verifies persistence through `https://os.ezil.org`, and validates
+its isolated-computer prerequisites before changing a deployment. Branch
+protection must require `Hosted continuity PR gate` alongside public CI, DCO
+and CodeQL; a skipped or failed hosted gate cannot authorize a merge.
 
 ## Internal macOS test DMG (no Apple subscription)
 

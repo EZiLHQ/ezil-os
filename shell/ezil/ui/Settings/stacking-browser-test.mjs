@@ -202,7 +202,7 @@ let listRows = [{ id: 'computer-1', name: 'My Computer', slot: 1, createdAt: PAY
  * `shell/ezil/apps/code.js` and `shell/ezil/ui/Settings/trpc.js`. */
 function stub (url, method, bodyText) {
     if ( url.includes('/api/shell/desktop') && method === 'POST' ) {
-        return { ok: true, guacamoleUrl: 'about:blank?desktop-frame=1', controlMode: 'interactive', mode: 'neko', frame: { confirmed: true } };
+        return { ok: true, guacamoleUrl: `${HOST}/desktop-frame`, controlMode: 'interactive', mode: 'neko', frame: { confirmed: true } };
     }
     // 🔴 MUST come before the generic `/api/shell/desktop` GET fallback below
     // — `?confirm=frame` requests also `.includes('/api/shell/desktop')`, and
@@ -237,6 +237,17 @@ function stub (url, method, bodyText) {
 
 const HOST = 'https://ezil-stacking-test.invalid';
 const HOST_HOSTNAME = new URL(HOST).hostname;
+// Layout fixtures provide current-navigation counters; service liveness alone
+// cannot reveal a desktop. Hosted acceptance supplies real WebRTC statistics.
+const VIEWER_HTML = `<!doctype html><html><body style="background:#161616"><script>
+const attempt = new URL(location.href).searchParams.get('ezilAttempt');
+let count = 0;
+function report() { count++; parent.postMessage({ source:'ezil-mobile', type:'stream_vitals', attempt,
+    vitals:{ connectionState:'connected', bytesReceived:count*100, framesDecoded:count, width:1280, height:720 } }, '*'); }
+addEventListener('message', e => { if (e.source === parent && e.data?.type === 'viewer_probe') report(); });
+setInterval(report, 100);
+</script></body></html>`;
+
 
 // 🔴 WAVE F INTEGRATION FIX — HARNESS FIDELITY, NOT AN ASSERTION CHANGE.
 // This document copies the REAL `/os` page's element classes from
@@ -602,6 +613,7 @@ async function runViewport (vp) {
     await page.route('**/*', async (route) => {
         const req = route.request();
         const url = req.url();
+        if (new URL(url).pathname === '/desktop-frame') return route.fulfill({status:200,contentType:'text/html',body:VIEWER_HTML});
         if ( url === `${HOST}/os` ) {
             await route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
             return;
@@ -1930,6 +1942,7 @@ async function runCloseReopenSweep () {
     await page.route('**/*', async (route) => {
         const req = route.request();
         const url = req.url();
+        if (new URL(url).pathname === '/desktop-frame') return route.fulfill({status:200,contentType:'text/html',body:VIEWER_HTML});
         if ( url === `${HOST}/os` ) {
             await route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
             return;
@@ -2353,6 +2366,7 @@ async function runCloseRobustnessSweep () {
     await page.route('**/*', async (route) => {
         const req = route.request();
         const url = req.url();
+        if (new URL(url).pathname === '/desktop-frame') return route.fulfill({status:200,contentType:'text/html',body:VIEWER_HTML});
         if ( url === `${HOST}/os` ) {
             await route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
             return;
@@ -2493,6 +2507,7 @@ async function runDashboardPopstateGuardSweep () {
         await page.route('**/*', async (route) => {
             const req = route.request();
             const url = req.url();
+        if (new URL(url).pathname === '/desktop-frame') return route.fulfill({status:200,contentType:'text/html',body:VIEWER_HTML});
             if ( url === `${HOST}/os` ) {
                 await route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
                 return;

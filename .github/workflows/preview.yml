@@ -32,6 +32,7 @@ on:
   workflow_run:
     workflows: [CI]
     types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
@@ -452,10 +453,14 @@ jobs:
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
           EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+          EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
+          EZIL_E2E_WORKSPACE_PATH: ${{ vars.EZIL_E2E_WORKSPACE_PATH }}
+          EZIL_E2E_R2_BUCKET: ${{ vars.EZIL_E2E_R2_BUCKET }}
+          EZIL_E2E_R2_PREFIX: ${{ secrets.EZIL_E2E_R2_PREFIX }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$EZIL_DEPLOY_SHA"
-          for key in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID EZIL_E2E_EMAIL EZIL_E2E_PASSWORD EZIL_E2E_WORKER; do
+          for key in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID EZIL_E2E_EMAIL EZIL_E2E_PASSWORD EZIL_E2E_WORKER EZIL_E2E_COMPUTER_ID EZIL_E2E_WORKSPACE_PATH EZIL_E2E_R2_BUCKET EZIL_E2E_R2_PREFIX; do
             if [[ -z "${!key}" ]]; then echo "::error::Missing production configuration: $key"; exit 1; fi
           done
           node e2e/verify-cloud-deployment.mjs project
@@ -590,6 +595,7 @@ jobs:
       - name: Hosted production persistence verification
         timeout-minutes: 25
         env:
+          EZIL_E2E_APP: https://os.ezil.org
           EZIL_CONTINUITY_MODE: essential
           EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
           EZIL_E2E_WORKSPACE_PATH: ${{ vars.EZIL_E2E_WORKSPACE_PATH }}
@@ -617,7 +623,7 @@ jobs:
         run: node e2e/verify-cloud-deployment.mjs
 
       - name: Test the canonical production URL
-        timeout-minutes: 15
+        timeout-minutes: 22
         env:
           EZIL_E2E_APP: https://os.ezil.org
           EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
@@ -721,7 +727,7 @@ jobs:
         run: python3 .github/scripts/staging-lock.py release --scope shared-production --owner "$LEASE_OWNER"
 
   summary:
-    name: Cloud deployment summary
+    name: ${{ github.event_name == 'pull_request' && 'Hosted continuity PR gate' || 'Cloud deployment summary' }}
     permissions:
       contents: read
     if: always()

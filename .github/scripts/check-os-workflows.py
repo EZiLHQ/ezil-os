@@ -6,7 +6,7 @@ import yaml
 
 root = Path(__file__).resolve().parents[2]
 workflows = {}
-for name in ('ci', 'preview', 'image', 'deploy', 'deploy-app', 'macos-internal'):
+for name in ('ci', 'preview', 'image', 'deploy', 'deploy-app', 'macos-internal', 'macos-e2e'):
     text = (root / f'.github/workflows/{name}.yml').read_text()
     workflow = yaml.safe_load(text)
     workflows[name] = workflow
@@ -28,6 +28,7 @@ for path in (root / '.github/workflows').glob('*.yml'):
     assert not re.search(r'\bmacos-14(?:-(?:large|xlarge|arm64))?\b', path.read_text()), path
 assert workflows['ci']['jobs']['macos-native']['strategy']['matrix']['os'] == ['ubuntu-latest', 'macos-15']
 assert workflows['macos-internal']['jobs']['dmg']['runs-on'] == 'macos-15'
+assert workflows['macos-e2e']['jobs']['physical-mac']['runs-on'] == 'macos-15'
 internal_triggers = workflows['macos-internal'].get('on', workflows['macos-internal'].get(True))
 assert '.github/workflows/ci.yml' in internal_triggers['pull_request']['paths']
 
@@ -63,6 +64,8 @@ assert 'full' in continuity['env']['EZIL_CONTINUITY_MODE'] and 'short' in contin
 assert jobs['preview']['timeout-minutes'] >= 150
 assert jobs['preview']['needs'] == ['trust', 'images']
 assert jobs['images']['if'] == "needs.trust.outputs.allowed == 'true'"
+assert workflows['preview'].get('on', workflows['preview'].get(True))['workflow_run']['branches'] == ['main']
+assert 'Hosted continuity PR gate' in jobs['summary']['name']
 assert any(step.get('name') == 'Download tested candidate image identities' for step in preview_steps)
 assert 'SANDBOX_NEKO_TURN_TTL_SECONDS:$ttl' in preview and 'ttl=1800' in preview
 assert 'EZIL_ACCEPTANCE_SANDBOX' in continuity['env'] or 'EZIL_ACCEPTANCE_HMAC_SECRET' in continuity['env']
@@ -77,6 +80,10 @@ assert any('test-editor-state-linux.sh' in step.get('run', '') for step in workf
 for name in ('Test the returned production URL', 'Test the canonical production URL'):
     assert 'prod-lifecycle' in production[positions[name]]['run']
 assert 'Hosted production persistence verification' in positions
+assert production[positions['Hosted production persistence verification']]['env']['EZIL_E2E_APP'] == 'https://os.ezil.org'
+production_config = production[positions['Validate production configuration']]
+for key in ('EZIL_E2E_COMPUTER_ID', 'EZIL_E2E_WORKSPACE_PATH', 'EZIL_E2E_R2_BUCKET', 'EZIL_E2E_R2_PREFIX'):
+    assert key in production_config['env'] and key in production_config['run']
 suite = (root / 'e2e/hosted-continuity.mjs').read_text()
 assert 'SKIP' not in suite
 assert "required('EZIL_E2E_COMPUTER_ID')" in suite

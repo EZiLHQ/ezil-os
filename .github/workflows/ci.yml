@@ -627,8 +627,8 @@ jobs:
       # does (grep, never `source` — this file is deliberately not
       # shell-sourceable), check it against Docker's tag grammar before using
       # it, and pull exactly the reference `local/` will resolve. No re-tag.
-      # Nothing here sets `EZIL_LAUNCHER_IMAGE`: this job exists to prove the
-      # PIN resolves, and an override would prove something else.
+      # Verify the pin resolves, then overlay the current launchers and viewer
+      # telemetry. The hosted image gate tests the full candidate separately.
       #
       # 🔴 THE PIN, NOT THIS COMMIT'S OWN sha8 — the distinction the file
       # header's "WHICH TAG, AND WHY" is about. `image.yml` runs concurrently
@@ -672,6 +672,8 @@ jobs:
           printf '%s\n' "${pull_out}"
           digest="$(printf '%s\n' "${pull_out}" | grep -oE 'Digest: sha256:[0-9a-f]+' | head -1)"
           echo "[image] tested build: ${image}  ${digest:-<no Digest line printed by docker pull>}"
+          docker build --build-arg "DESKTOP_IMAGE=$image" -f .github/scripts/Dockerfile.local-check -t ezil-local-source:ci .
+          echo "EZIL_LAUNCHER_IMAGE=ezil-local-source:ci" >> "$GITHUB_ENV"
       # `local/tsconfig.json`'s own header comment: its typecheck reaches
       # `app/src/server/shell/boot-payload.ts`, which imports `drizzle-orm`
       # through `app/node_modules` — so `bun run --cwd local typecheck` needs

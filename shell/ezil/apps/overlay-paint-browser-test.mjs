@@ -148,6 +148,17 @@ const css = fs.readFileSync(`${OS}/bundle.min.css`, 'utf8');
 
 const HOST = 'https://ezil-overlay-paint-test.invalid';
 const HOST_HOSTNAME = new URL(HOST).hostname;
+// Layout fixtures provide current-navigation counters; service liveness alone
+// cannot reveal a desktop. Hosted acceptance supplies real WebRTC statistics.
+const VIEWER_HTML = `<!doctype html><html><body style="background:#161616"><script>
+const attempt = new URL(location.href).searchParams.get('ezilAttempt');
+let count = 0;
+function report() { count++; parent.postMessage({ source:'ezil-mobile', type:'stream_vitals', attempt,
+    vitals:{ connectionState:'connected', bytesReceived:count*100, framesDecoded:count, width:1280, height:720 } }, '*'); }
+addEventListener('message', e => { if (e.source === parent && e.data?.type === 'viewer_probe') report(); });
+setInterval(report, 100);
+</script></body></html>`;
+
 const DOC_HTML = `<!doctype html><html><head><style>${css}</style></head>
      <body class="min-h-full flex flex-col"><div id="ezil-os-root"><div id="ezil-os-root-inner"></div></div></body></html>`;
 
@@ -267,7 +278,7 @@ async function testApp (app) {
             return { ok: true, confirmed: confirmAnswer, status: confirmAnswer ? 200 : 500 };
         }
         if ( url.includes(ENDPOINTS.desktop) ) {
-            if ( method === 'POST' ) return { ok: true, guacamoleUrl: 'about:blank?desktop-frame=1', frame: { confirmed: true } };
+            if ( method === 'POST' ) return { ok: true, guacamoleUrl: `${HOST}/desktop-frame`, frame: { confirmed: true } };
             return { ok: true, guacamoleRunning: true };
         }
         if ( url.includes(ENDPOINTS.focus) ) return { ok: true };
@@ -277,6 +288,7 @@ async function testApp (app) {
     await page.route('**/*', async (route) => {
         const req = route.request();
         const url = req.url();
+        if (new URL(url).pathname === '/desktop-frame') return route.fulfill({status:200,contentType:'text/html',body:VIEWER_HTML});
         if ( url === `${HOST}/os` ) {
             await route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
             return;

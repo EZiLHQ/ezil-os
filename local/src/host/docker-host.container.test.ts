@@ -247,9 +247,11 @@ describe.skipIf(SKIP_REASON !== null)('a real desktop, booted by DockerHost', ()
     });
 
     it('exec enforces a timeout host-side, since docker exec has no flag for one', async () => {
+        const started = Date.now();
         const res = await host!.exec(COMPUTER_ID, ['sleep', '30'], { timeoutMs: 2_000 });
         expect(res.timedOut).toBe(true);
         expect(res.exitCode).toBeNull();
+        expect(Date.now() - started).toBeLessThan(10_000);
     }, 30_000);
 
     it('NO OUTBOUND IP-RETRIEVAL CALL — and the positive control is in the same log', async () => {

@@ -55,7 +55,7 @@ jobs:
     # Configure this environment to allow only protected branches and require
     # a maintainer review. No pull_request or workflow_run event reaches here.
     environment: native-physical
-    runs-on: [self-hosted, macOS, ARM64, ezil-native]
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7

@@ -541,10 +541,12 @@ describe.skipIf(SKIP_REASON !== null)('local mode, in a real browser', () => {
         const reveal = consoleLines.filter((l) => l.includes('full-bleed (')).join(' | ');
         expect(reveal).toContain('full-bleed (the display was observed streaming)');
         expect(reveal).not.toContain('could not be verified');
-        // And the gate said so in its own words, with how long it took.
-        const streaming = consoleLines.find((l) => l.includes('the display is streaming'));
-        expect(streaming ?? '(the display gate never reported streaming)').toContain('the display is streaming');
-        console.log(`\n[T5 measured] the shell REVEALED the desktop: ${reveal}\n[T5 measured] ${streaming}\n`);
+        // Independently inspect decoded frames in this actual viewer. Server
+        // watcher counts or an obsolete console phrase cannot establish that.
+        const viewer = page.frames().find((f: any) => f.url().includes(`:${desktopPort}`));
+        const decoded = await viewer.evaluate(() => document.querySelector('video')?.getVideoPlaybackQuality().totalVideoFrames);
+        expect(decoded).toBeGreaterThan(1);
+        console.log(`\n[T5 measured] the shell REVEALED the desktop: ${reveal}; decoded frames=${decoded}\n`);
         const cosmetic = failedRequests.filter((u) => !critical.includes(u));
         if (cosmetic.length > 0) console.log(`      note: ${cosmetic.length} non-critical 4xx — ${cosmetic.slice(0, 3).join(' | ')}`);
 

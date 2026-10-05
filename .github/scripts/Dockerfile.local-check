@@ -1,0 +1,9 @@
+# Check the current launchers and viewer telemetry against the published pin.
+# The gated Image workflow separately tests the full rebuilt candidate.
+ARG DESKTOP_IMAGE
+FROM ${DESKTOP_IMAGE}
+COPY worker/scripts/start-neko.sh worker/scripts/start-codeserver.sh worker/scripts/editor-state.sh /usr/local/bin/
+COPY worker/assets/neko-branding/www/ezil-mobile.js /var/www/ezil-mobile.js
+RUN chmod +x /usr/local/bin/start-neko.sh /usr/local/bin/start-codeserver.sh /usr/local/bin/editor-state.sh \
+ && test -s /var/www/ezil-mobile.js \
+ && grep -q 'src="ezil-mobile.js"' /var/www/index.html

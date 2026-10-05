@@ -1381,6 +1381,13 @@ export async function openDesktopWindow (ctx = {}) {
             },
         }) : null;
         const viewer_url = new URL(res.url);
+        if (viewer_url.origin === 'null' || !['https:', 'http:'].includes(viewer_url.protocol)) {
+            render_both({ kind: 'failed', reason: 'desktop_unreachable' });
+            show_panel();
+            stop_timers();
+            trace.end('error');
+            return;
+        }
         viewer_attempt = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `${my_attempt}-${Date.now()}-${Math.random()}`;
         viewer_origin = viewer_url.origin;
         viewer_url.searchParams.set('ezilAttempt', viewer_attempt);
@@ -1396,7 +1403,7 @@ export async function openDesktopWindow (ctx = {}) {
         active_display_gate = gate;
         el_iframe.addEventListener('load', () => {
             if ( disposed || my_attempt !== attempt ) return;
-            el_iframe.contentWindow?.postMessage({ source: 'ezil-shell', type: 'viewer_probe', attempt: viewer_attempt }, viewer_origin);
+            if (viewer_origin && viewer_origin !== 'null') el_iframe.contentWindow?.postMessage({ source: 'ezil-shell', type: 'viewer_probe', attempt: viewer_attempt }, viewer_origin);
         }, { once: true });
         settle_frame(my_attempt, res.url, gate, t0 + DESKTOP_BOOT_TIMEOUT_MS);
     }
@@ -1762,7 +1769,7 @@ export async function openDesktopWindow (ctx = {}) {
 
             // Server sessions only establish service health. This document's
             // decoded-frame telemetry is the sole source of a live verdict.
-            el_iframe.contentWindow?.postMessage({ source: 'ezil-shell', type: 'viewer_probe', attempt: viewer_attempt }, viewer_origin);
+            if (viewer_origin && viewer_origin !== 'null') el_iframe.contentWindow?.postMessage({ source: 'ezil-shell', type: 'viewer_probe', attempt: viewer_attempt }, viewer_origin);
             // 'blank' is a real answer and 'unknown' is not — but neither ends
             // the wait on its own. A desktop that has only just been navigated
             // to has not had time to negotiate WebRTC, so an early `blank` is
