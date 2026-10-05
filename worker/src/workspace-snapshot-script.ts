@@ -262,7 +262,8 @@ def restore():
 
 try:
     op = p['op']
-    if op == 'capture':
+    if op == 'check': marker()
+    elif op == 'capture':
         os.mkdir(work, 0o700)
         result = capture(os.path.join(work, 'archive.tar'))
         with open(os.path.join(work, 'archive.tar'), 'rb') as f:
@@ -314,7 +315,7 @@ except AssertionError as e:
         print('workspace snapshot too large', file=sys.stderr)
         sys.exit(3)
     # This container does not hold the hydrated workspace: nothing in it may be committed.
-    if op == 'capture' and str(e) == 'hydration incomplete':
+    if op in ('capture', 'check') and str(e) == 'hydration incomplete':
         print('workspace not hydrated', file=sys.stderr)
         sys.exit(4)
     print('workspace snapshot failed: ' + type(e).__name__, file=sys.stderr)

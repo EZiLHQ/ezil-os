@@ -352,7 +352,6 @@ try {
   const videoFrame = () => page.frames().find(f => /nekodesktop/.test(f.url()));
   const inputBefore = hash(await videoFrame().locator('video').screenshot());
   const uniqueHeading = `continuity-input-${Date.now()}`;
-  const staleURL = videoFrame().url();
   // Neko receives pointer and keyboard input through its textarea overlay.
   // Clicking the decoded video is blocked by this intentional input surface.
   const browserInput = videoFrame().locator('textarea.overlay');
@@ -468,13 +467,21 @@ try {
   await verifyEditor(); await launch('desktop'); await live();
   const replaced = await relay(); assert.notEqual(replaced.runtimeId, firstRelay.runtimeId, 'Stop/reopen reused old runtime');
   evidence.replacementRuntimeHash = hash(replaced.runtimeId); phase('replacement persistence');
-  // Preview hostnames use stable tokens and become active again on reopen.
-  // A previous URL after reopen alone would never exercise the 410 recovery.
-  // Stop this explicitly isolated runtime with its Browser window still open.
-  const staleStop = await api('/api/shell/stop', { computerId });
+  // SDK destroy intentionally revokes tokens (404). Idle/runtime stop retains
+  // authorization, so exercise its real 410 without altering auth semantics.
+  const currentStaleURL = await page.locator('.window[data-app="desktop"] iframe').getAttribute('src');
+  await close('code');
+  const timestamp = Date.now();
+  const signature = createHmac('sha256',required('EZIL_ACCEPTANCE_HMAC_SECRET')).update(`${timestamp}.POST./sandbox/preview.`).digest('hex');
+  const staleStopResponse = await fetch(`${required('EZIL_E2E_WORKER').replace(/\/$/,'')}/sandbox/${encodeURIComponent(sandboxId)}/acceptance-idle-stop`, {
+    method:'POST', headers:{authorization:`Bearer t=${timestamp},v1=${signature}`},
+    signal:AbortSignal.timeout(APP_STOP_FETCH_TIMEOUT_MS),redirect:'error',
+  });
+  assert.equal(staleStopResponse.status,200,'Isolated runtime stop prerequisite unavailable');
+  const staleStop = await staleStopResponse.json();
   assert.ok(staleStop.ok && staleStop.terminated, 'Stale navigation stop failed');
   const staleResponse = page.waitForResponse(response => response.status() === 410
-    && new URL(response.url()).origin === new URL(staleURL).origin, { timeout: 30000 });
+    && new URL(response.url()).origin === new URL(currentStaleURL).origin, { timeout: 30000 });
   await page.evaluate(url => {
     window.__continuityVitals = [];
     const frame = document.querySelector('.window[data-app="desktop"] iframe');
@@ -483,7 +490,7 @@ try {
     // identity so the recovery document can still authenticate its message.
     stale.searchParams.set('ezilAttempt', new URL(frame.src).searchParams.get('ezilAttempt'));
     frame.src = stale.href;
-  }, staleURL);
+  }, currentStaleURL);
   const recoveryDocument = await staleResponse;
   assert.ok((recoveryDocument.headers()['content-type'] || '').includes('text/html'), 'Stale navigation did not serve recovery HTML');
   assert.equal(recoveryDocument.headers()['cache-control'], 'no-store', 'Stale recovery was cacheable');

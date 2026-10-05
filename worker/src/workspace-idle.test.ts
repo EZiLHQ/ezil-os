@@ -759,7 +759,7 @@ describe('explicit-terminate semantics still hold exactly as before', () => {
   });
 
   it('teardown refuses when the final SYSTEM checkpoint failed, before cancelling the loop or destroying', () => {
-    const method = between('private async terminateSandboxWithCheckpoint(): Promise<TerminateReport> {', 'await this.cancelWorkspaceFlushLoop();');
+    const method = between('private async terminateSandboxWithCheckpoint(retainPreviewAuthorization = false): Promise<TerminateReport> {', 'await this.cancelWorkspaceFlushLoop();');
     expect(method).toContain('this.systemFinalNext = true;');
     expect(method).toContain("if (checkpoint?.systemCheckpointFailed) {");
     expect(method).toContain("if (checkpoint?.skippedReason === 'too_large' || checkpoint?.skippedReason === 'container_not_hydrated') {");

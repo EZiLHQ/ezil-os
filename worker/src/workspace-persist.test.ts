@@ -55,7 +55,7 @@ const container: FlushContainerLike = {
   async exists(path) { try { await lstat(path); return { exists: true }; } catch { return { exists: false }; } },
   async exec(command) {
     try { const result = await run('bash', ['-c', command], { env, maxBuffer: 1024 * 1024 }); return { ...result, exitCode: 0 }; }
-    catch { return { exitCode: 1, stdout: '', stderr: 'snapshot helper failed' }; }
+    catch (error) { return { exitCode: typeof (error as {code?: unknown}).code === 'number' ? (error as {code:number}).code : 1, stdout: '', stderr: 'snapshot helper failed' }; }
   },
 };
 async function mark(root: string) {
@@ -68,6 +68,16 @@ const git = async (root: string, ...args: string[]) => (await run('git', ['-c', 
 const headKey = `${prefix}/${SNAPSHOT_HEAD}`;
 
 describe.skipIf(NO_POSIX_HOST)('atomic Git workspace checkpoints (real filesystem and Git)', () => {
+  it('rejects an unhydrated physical replacement before capture can change editor settings', async () => {
+    const { root } = await workspace(); const bucket = new Bucket();
+    await rm(`${root}/${HYDRATE_MARKER_FILENAME}`);
+    let captures = 0;
+    const result = await flushWorkspaceToR2({ container, bucket, mountPath: root, realPrefix: prefix,
+      hydrationComplete: true, manifest: {}, log, beforeCapture: async () => { captures++; } });
+    expect(result.skippedReason).toBe('container_not_hydrated');
+    expect(captures).toBe(0);
+    expect(bucket.data.size).toBe(0);
+  });
   it('restores the exact index, refs, objects, staged/unstaged edits, deletions, modes and safe links after replacement', async () => {
     const { base, root } = await workspace(); const bucket = new Bucket();
     await git(root, 'init', '-b', 'main');

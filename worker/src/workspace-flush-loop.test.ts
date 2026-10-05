@@ -124,6 +124,7 @@ interface FakeOptions {
   /** Make the R2 `put` reject, so the flush reports a real failure. */
   bucketPutThrows?: boolean;
   editorCaptureFails?: boolean;
+  physicalWorkspaceMissing?: boolean;
   /** Seed values for DO storage. */
   storage?: Record<string, unknown>;
 }
@@ -212,6 +213,9 @@ async function makeFake(opts: FakeOptions = {}): Promise<FakeDO & Record<string,
         return { exitCode: opts.editorCaptureFails ? 1 : 0, stdout: '' };
       }
       if (command.startsWith('python3 ')) {
+        if (command.includes('"op":"check"') && opts.physicalWorkspaceMissing) {
+          return { exitCode: 4, stdout: '' };
+        }
         if (command.includes('"op":"capture"')) {
           if (opts.listFilesThrows) throw new Error('container RPC failed: connection reset');
           const sha256 = createHash('sha256').update('hello').digest('hex');
@@ -703,6 +707,32 @@ describe('preserved invariant: idle-stop is NOT termination', () => {
 });
 
 describe('explicit termination requires a confirmed checkpoint', () => {
+  it('checks physical hydration before editor capture and never commits an empty replacement', async () => {
+    const fake = await makeFake({ storage: hydratedStorage(), physicalWorkspaceMissing: true, editorCaptureFails: true });
+    const proto = await loadPrototype();
+    const result = await proto.runWorkspaceFlush.call(fake, 'explicit' as never) as { skippedReason?: string };
+    expect(result.skippedReason).toBe('container_not_hydrated');
+    expect(fake.calls.execs.some(c => c.startsWith('bash /usr/local/bin/editor-state.sh'))).toBe(false);
+    expect(fake.calls.r2Puts).toEqual([]);
+    expect(storeOf(fake).get(HYDRATED_KEY)).toBe(false);
+  });
+  it('does not wake stopped containers for Code or screen requests, including queued traffic', async () => {
+    const fake = await makeFake({ running: true });
+    const proto = await loadPrototype();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const lock = proto.withRuntimeMutation as (this: unknown, op: () => Promise<unknown>) => Promise<unknown>;
+    const stop = lock.call(fake, async () => { await gate; fake.ctx.container.running = false; });
+    const forward = proto.runningContainerFetch as (this: unknown, url: string) => Promise<Response>;
+    const pending = forward.call(fake, 'http://127.0.0.1:8181/api/login');
+    release(); await stop;
+    expect((await pending).status).toBe(409);
+    const request = new Request('http://127.0.0.1:8443/', {
+      headers: { 'x-ezil-running-code': '1', 'cf-container-target-port': '8443', upgrade: 'websocket' },
+    });
+    expect((await (proto.fetch as (this: unknown, request: Request) => Promise<Response>).call(fake, request)).status).toBe(409);
+    expect(fake.calls.execs).toEqual([]);
+  });
   for (const options of [
     { bucketPutThrows: true, storage: hydratedStorage() },
     { listFilesThrows: true, storage: hydratedStorage() },

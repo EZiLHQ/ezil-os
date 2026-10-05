@@ -800,7 +800,7 @@ describe('R2-binding workspace persistence: mountBucket() replaced by hydrate/fl
     // where `ctx.container.running` is readable, and is now conditional on a
     // container actually being up: flushing a sleeping sandbox would cold-boot
     // it (~20s) purely in order to kill it again.
-    const terminateBody = src.match(/async terminateSandboxWithCheckpoint\(\)[\s\S]*?\n  \}/)?.[0] ?? '';
+    const terminateBody = src.match(/async terminateSandboxWithCheckpoint\([^)]*\)[\s\S]*?\n  \}/)?.[0] ?? '';
     expect(terminateBody).not.toBe('');
     expect(terminateBody).toContain('const wasRunning = this.containerIsRunning();');
     expect(terminateBody).toContain('if (wasRunning) {');
@@ -1093,7 +1093,7 @@ describe('bridge-host dispatcher: generalized to app-preview AND code-server', (
     // hostname; with `'app'` (or the old 6-arg call) code-server's WS-router
     // origin check sees `preview.local` and 403s every single upgrade.
     expect(src).toContain(
-      "handlePreviewWsProxy(request, sandbox, sandboxId, secrets, codePath, port, 'code')",
+      "}, sandboxId, secrets, codePath, port, 'code')",
     );
   });
 

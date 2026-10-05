@@ -115,6 +115,8 @@ export interface FlushDeps {
    * teardown or idle-stop checkpoints.
    */
   deferIfChanged?: boolean;
+  /** Runs only after this runtime's marker and durable writer are verified. */
+  beforeCapture?: () => Promise<void>;
 }
 
 export function parseSnapshot(raw: string): Snapshot {
@@ -165,7 +167,7 @@ class WorkspaceNotHydratedError extends Error {}
 async function command(container: HydrateContainerLike, params: Record<string, unknown>) {
   const result = await container.exec(snapshotCommand(params), { timeout: 120_000 });
   if (result.exitCode === 3 && params.op === 'capture') throw new SnapshotTooLargeError('workspace snapshot too large');
-  if (result.exitCode === 4 && params.op === 'capture') throw new WorkspaceNotHydratedError('workspace not hydrated');
+  if (result.exitCode === 4 && ['capture', 'check'].includes(String(params.op))) throw new WorkspaceNotHydratedError('workspace not hydrated');
   if (result.exitCode !== 0) throw new Error(`workspace snapshot ${params.op} failed`);
   return result.stdout;
 }
@@ -190,6 +192,10 @@ export async function flushWorkspaceToR2(deps: FlushDeps): Promise<FlushOutcome>
     // Read before capture: CAS rejects another container publishing in between.
     const previous = await readHead(bucket, prefix);
     const expected = previous?.snapshot.generation ?? null;
+    if (deps.beforeCapture) {
+      await command(container, { op: 'check', root, work, prefix, expected });
+      await deps.beforeCapture();
+    }
     const raw = await command(container, { op: 'capture', root, work, prefix, expected });
     const { skipped, ...captured } = JSON.parse(raw) as Record<string, unknown>;
     outcome.skippedUnsupported = Number.isInteger(skipped) ? skipped as number : 0;

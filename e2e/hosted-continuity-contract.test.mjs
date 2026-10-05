@@ -7,6 +7,12 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 const source=readFileSync(new URL('./hosted-continuity.mjs',import.meta.url),'utf8');
+test('stale recovery uses an authorized runtime stop and still requires real 410 HTML',()=>{
+    assert.ok(source.includes('/acceptance-idle-stop'));
+    assert.ok(source.includes('response.status() === 410'));
+    assert.ok(source.includes("assert.equal(recoveryDocument.headers()['cache-control'], 'no-store'"));
+    assert.ok(source.includes('currentStaleURL'));
+});
 test('missing isolated computer exits nonzero and names the prerequisite before cloud access',()=>{
     const directory=mkdtempSync(join(tmpdir(),'ezil-missing-prerequisite-'));
     try {

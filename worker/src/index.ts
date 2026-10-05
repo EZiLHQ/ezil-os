@@ -768,6 +768,8 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
  * not a new transport.
  */
 interface EzilWorkspacePersistRpc {
+  runningContainerFetch(url: string, init?: RequestInit, port?: number): Promise<Response>;
+  stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport>;
   setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void>;
   desktopReachable(): Promise<boolean>;
   relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult>;
@@ -2338,9 +2340,37 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return next;
   }
   async desktopReachable(): Promise<boolean> {
-    if (!this.containerIsRunning()) return false;
-    const probe = await pollDesktopReady(this, 1000, 100, 8181, '/');
-    return probe.ready;
+    try {
+      const response = await this.runningContainerFetch('http://127.0.0.1:8181/', {}, 8181, 1000);
+      return response.ok;
+    } catch { return false; }
+  }
+  /** Viewer traffic must never cold-start a runtime after an explicit stop. */
+  async runningContainerFetch(url: string, init: RequestInit = {}, port = 8181, timeoutMs = 12000): Promise<Response> {
+    return this.withRuntimeMutation(async () => {
+      if (!this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)) {
+        return json({ ok: false, error: 'runtime_not_running' }, 409);
+      }
+      this.renewActivityTimeout();
+      return this.ctx.container!.getTcpPort(port).fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    });
+  }
+  override async fetch(request: Request): Promise<Response> {
+    // Set only by the authenticated Code bridge. The HTTP entrypoint carries
+    // WebSocket responses intact; a DO RPC cannot serialize a WebSocket.
+    if (request.headers.get('x-ezil-running-code') !== '1'
+        || new URL(request.url).hostname !== '127.0.0.1') return super.fetch(request);
+    return this.withRuntimeMutation(async () => {
+      if (!this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)) {
+        return json({ ok: false, error: 'runtime_not_running' }, 409);
+      }
+      const headers = new Headers(request.headers);
+      headers.delete('x-ezil-running-code');
+      const port = Number(headers.get('cf-container-target-port'));
+      if (port !== CODE_PREVIEW_PORT) return json({ok:false,error:'invalid_code_port'},400);
+      this.renewActivityTimeout();
+      return this.ctx.container!.getTcpPort(port).fetch(new Request(request, { headers, signal: AbortSignal.timeout(12000) }));
+    });
   }
   async relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult> {
     const requestedAt = Date.now();
@@ -2497,7 +2527,6 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     const lastUploadAt = (await this.ctx.storage.get<number>(WORKSPACE_LAST_UPLOAD_AT_KEY)) ?? 0;
     const deferIfChanged = !!options?.allowDefer && Date.now() - lastUploadAt < MIN_CHANGED_CHECKPOINT_MS;
     try {
-      if (hydrated) await captureEditorState(this, wctx.mountPath);
       outcome = await flushWorkspaceToR2({
         container: this,
         bucket: await this.acceptanceFault() === 'checkpoint_write_failed' ? failCheckpointWrites(bucket) : bucket,
@@ -2506,6 +2535,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         manifest,
         hydrationComplete: hydrated,
         deferIfChanged,
+        beforeCapture: () => captureEditorState(this, wctx.mountPath),
         log: (message) => console.error(`[workspace_flush] ${message}`),
       });
     } catch (err) {
@@ -3071,7 +3101,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return this.withRuntimeMutation(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint()));
   }
 
-  private async terminateSandboxWithCheckpoint(): Promise<TerminateReport> {
+  async stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport> {
+    assertAcceptanceScope(this.env, sandboxId);
+    return this.withRuntimeMutation(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint(true)));
+  }
+
+  private async terminateSandboxWithCheckpoint(retainPreviewAuthorization = false): Promise<TerminateReport> {
     const wasRunning = this.containerIsRunning();
 
     // Capture the container's own exit signal BEFORE `destroy()` is issued
@@ -3124,7 +3159,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // `super.destroy()` — `this.destroy()` would re-run the cancel above
       // harmlessly, but going straight to the SDK keeps this method the single
       // ordered sequence it documents.
-      await super.destroy();
+      if (retainPreviewAuthorization) await super.stop();
+      else await super.destroy();
     } catch (err) {
       destroyError = err instanceof Error ? err.message : String(err);
       console.error(`[terminateSandbox] destroy() failed: ${destroyError}`);
@@ -5095,13 +5131,13 @@ const SCREEN_RATE_HZ = 60;
  * settable, so a mode's absence from that list means nothing at all.
  */
 async function readNekoScreen(
-  sandbox: Sandbox<unknown>,
+  sandbox: { runningContainerFetch(url: string, init: RequestInit, port: number): Promise<Response> },
   origin: string,
   port: number,
   token: string,
 ): Promise<{ width: number; height: number } | null> {
   try {
-    const res = await sandbox.containerFetch(
+    const res = await sandbox.runningContainerFetch(
       `${origin}/api/room/screen`,
       // No `signal` — see `withDeadline`. The caller races this whole call.
       { method: 'GET', headers: { Accept: 'application/json', Authorization: `Bearer ${token}` } },
@@ -5204,7 +5240,7 @@ async function handleScreenRead(env: Env, sandboxName: string): Promise<Response
     if (!await sandbox.desktopReachable()) return json({ ok: false, sandboxId: sandboxName, error: 'screen_starting' }, 409);
     const creds = await deriveNekoCredentials(env, sandboxName);
 
-    const loginRes = await withDeadline(sandbox.containerFetch(
+    const loginRes = await withDeadline(sandbox.runningContainerFetch(
       `${origin}/api/login`,
       {
         method: 'POST',
@@ -5289,7 +5325,7 @@ async function handleScreen(request: Request, env: Env, sandboxName: string): Pr
     // 500ms client-side, deduplicated against the last applied size), so one
     // extra loopback round trip per resize is not worth a second cache that
     // could hand a restarted container a dead token.
-    const loginRes = await withDeadline(sandbox.containerFetch(
+    const loginRes = await withDeadline(sandbox.runningContainerFetch(
       `${origin}/api/login`,
       {
         method: 'POST',
@@ -5311,7 +5347,7 @@ async function handleScreen(request: Request, env: Env, sandboxName: string): Pr
     // screen configuration and nothing else — there are no sibling fields for a
     // POST to silently reset, which is the failure `enableImplicitHosting`'s own
     // doc comment records for the settings endpoint.
-    const setRes = await withDeadline(sandbox.containerFetch(
+    const setRes = await withDeadline(sandbox.runningContainerFetch(
       `${origin}/api/room/screen`,
       {
         method: 'POST',
@@ -5701,9 +5737,14 @@ async function handleCodeBridge(
     // `'code'` is load-bearing, not cosmetic: it selects the REAL bridge
     // hostname as `x-forwarded-host`, which is the only value code-server's
     // WS-router origin check can ever accept (see `resolveForwardedHost`).
-    return handlePreviewWsProxy(request, sandbox, sandboxId, secrets, codePath, port, 'code');
+    return handlePreviewWsProxy(request, { wsConnect: (upstream, targetPort) => {
+      const headers = new Headers(upstream.headers);
+      headers.set('x-ezil-running-code', '1');
+      return sandbox.wsConnect(new Request(upstream, { headers }), targetPort);
+    } }, sandboxId, secrets, codePath, port, 'code');
   }
-  return handlePreviewProxy(request, sandbox, sandboxId, secrets, codePath, port, 'code');
+  return handlePreviewProxy(request, { containerFetch: (upstream, init, targetPort) =>
+    sandbox.runningContainerFetch(String(upstream), init as RequestInit, targetPort) }, sandboxId, secrets, codePath, port, 'code');
 }
 
 /**
@@ -6378,6 +6419,16 @@ export default {
       );
     }
 
+    const acceptanceStop = path.match(/^\/sandbox\/([^/]+)\/acceptance-idle-stop$/);
+    if (method === 'POST' && acceptanceStop) {
+      const name = decodeURIComponent(acceptanceStop[1]);
+      try { assertAcceptanceScope(env, name); } catch { return json({ok:false,error:'acceptance_faults_disabled'},404); }
+      if (resolvePreviewSecrets(env).length === 0) return json({ok:false,error:'acceptance_auth_not_configured'},401);
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      try { return json(await openSandbox(env, name).stopRuntimeForAcceptance(name)); }
+      catch { return json({ok:false,error:'acceptance_stop_failed'},502); }
+    }
     const acceptanceMatch = path.match(/^\/sandbox\/([^/]+)\/acceptance-fault$/);
     if (method === 'POST' && acceptanceMatch) {
       const name = decodeURIComponent(acceptanceMatch[1]);

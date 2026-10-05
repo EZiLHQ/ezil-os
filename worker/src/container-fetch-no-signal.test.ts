@@ -51,12 +51,16 @@ const INDEX_SRC = readFileSync(join(import.meta.dir, 'index.ts'), 'utf8');
  */
 function containerFetchCallSites(src: string): string[] {
     const sites: string[] = [];
-    const needle = '.containerFetch(';
+    // Calls on `sandbox` cross the RPC boundary. Calls on `this` stay inside
+    // the DO, where the actual TCP fetch must have a cancellable deadline.
+    const matcher = /\bsandbox\.(?:containerFetch|runningContainerFetch)\(/g;
     let from = 0;
     for (;;) {
-        const at = src.indexOf(needle, from);
-        if (at === -1) break;
-        from = at + needle.length;
+        matcher.lastIndex = from;
+        const match = matcher.exec(src);
+        if (!match) break;
+        const at = match.index;
+        from = at + match[0].length;
         // A doc comment mentioning the name is not a call site.
         const lineStart = src.lastIndexOf('\n', at) + 1;
         const line = src.slice(lineStart, at);
