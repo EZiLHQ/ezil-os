@@ -13,6 +13,9 @@ import time
 TABLE = "ezil-ci-staging"
 REGION = "us-east-1"
 SCOPE = "shared-staging"
+# The staging job can run for 150 minutes, including the 90-minute acceptance
+# step. Lease validity is independent of the shorter OIDC credential session.
+MAX_LEASE_TTL_SECONDS = 10_800
 
 
 def aws(*args):
@@ -91,7 +94,7 @@ def main():
     parser.add_argument("--ttl", type=int, default=5400)
     parser.add_argument("--wait", type=int, default=1800)
     args = parser.parse_args()
-    if not args.owner or len(args.owner) > 200 or args.ttl < 1 or args.ttl > 7200 or args.wait < 0:
+    if not args.owner or len(args.owner) > 200 or args.ttl < 1 or args.ttl > MAX_LEASE_TTL_SECONDS or args.wait < 0:
         parser.error("invalid owner, ttl, or wait")
     if args.command == "acquire":
         return acquire(args.owner, args.ttl, args.wait, args.scope)

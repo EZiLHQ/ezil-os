@@ -2,6 +2,8 @@
 """Credential-free tests; AWS CLI is replaced by an in-memory conditional store."""
 import importlib.util
 import json
+import re
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -55,6 +57,28 @@ class LeaseTests(unittest.TestCase):
         self.assertEqual(lease.acquire('works-1', 600, 0, 'shared-production'), 0)
         self.items['shared-production']['expires_at']['N'] = '999'
         self.assertEqual(lease.acquire('works-2', 600, 0, 'shared-production'), 0)
+
+    def test_workflow_lease_lifetimes_are_accepted_by_the_real_cli(self):
+        workflow = Path(__file__).parents[1] / 'workflows' / 'preview.yml'
+        durations = re.findall(r'staging-lock\.py acquire[^\n]+--ttl (\d+)', workflow.read_text())
+        self.assertTrue(durations, 'No workflow lease commands checked')
+        self.assertIn('10800', durations)
+        for duration in durations:
+            with self.subTest(ttl=duration), patch.object(sys, 'argv', [
+                'staging-lock.py', 'acquire', '--owner', 'os-test',
+                '--ttl', duration, '--wait', '0',
+            ]):
+                self.assertEqual(lease.main(), 0)
+                self.assertEqual(int(self.items['shared-staging']['expires_at']['N']), 1000 + int(duration))
+
+    def test_cli_rejects_unbounded_lease_before_any_write(self):
+        with patch.object(sys, 'argv', [
+            'staging-lock.py', 'acquire', '--owner', 'os-test',
+            '--ttl', str(lease.MAX_LEASE_TTL_SECONDS + 1), '--wait', '0',
+        ]), self.assertRaises(SystemExit) as error:
+            lease.main()
+        self.assertEqual(error.exception.code, 2)
+        self.assertEqual(self.items, {})
 
 
 if __name__ == '__main__': unittest.main()
