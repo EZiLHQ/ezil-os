@@ -10,7 +10,14 @@ test('cloud selection refuses missing or mismatched IDs before any computer oper
   await assert.rejects(verifySelectedComputer(page, { required: true, computerId: '' }), /Missing prerequisite/);
   await assert.rejects(verifySelectedComputer(page, { required: true, computerId: 'invalid' }), /UUID/);
   assert.equal(reads, 0);
-  await assert.rejects(verifySelectedComputer(page, { required: true, computerId }), /another computer/);
+  await assert.rejects(verifySelectedComputer(page, { required: true, computerId }), error => {
+    assert.match(error.message, /another computer/);
+    for (const value of [computerId, otherId]) {
+      assert.ok(!String(error.stack).includes(value));
+      assert.ok(!JSON.stringify(error).includes(value));
+    }
+    return true;
+  });
   page.evaluate = async () => computerId;
   assert.equal(await verifySelectedComputer(page, { required: true, computerId }), computerId);
 });

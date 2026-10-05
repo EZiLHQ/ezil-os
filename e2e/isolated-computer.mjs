@@ -12,7 +12,8 @@ export async function verifySelectedComputer(page, {
   await page.waitForFunction(() => !!window.ezil?.session?.payload?.()?.computer?.id,
     null, { timeout: 45000 });
   const selected = await page.evaluate(() => window.ezil.session.payload().computer.id);
-  assert.equal(selected, computerId, 'Authenticated session selects another computer; refusing cloud operations');
+  // Do not let AssertionError print private expected/actual UUIDs in public CI.
+  assert.ok(selected === computerId, 'Authenticated session selects another computer; refusing cloud operations');
   return computerId;
 }
 
