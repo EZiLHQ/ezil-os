@@ -31,8 +31,9 @@ function browserSchema(input) {
   return input;
 }
 class Browser {
-  constructor(workspace, window, generation, { WebContentsView, session } = require('electron'), { offline = false, onState = () => {}, onShortcut = () => {}, onNewTab = () => {}, now = Date.now } = {}) {
+  constructor(workspace, window, generation, { WebContentsView, session } = require('electron'), { offline = false, onState = () => {}, onShortcut = () => {}, onNewTab = () => {}, now = Date.now, captureTimeoutMs = 3000 } = {}) {
     this.onState = onState; this.onShortcut = onShortcut; this.onNewTab = onNewTab; this.now = now; this.stateRevision = 0;
+    this.captureTimeoutMs = captureTimeoutMs;
     this.workspace = workspace; this.window = window; this.generation = generation; this.sequence = 0; this.views = new Map(); this.closed = false;
     this.session = session.fromPath(privateDir(path.join(workspace.browser, 'profile')));
     lockSession(this.session);
@@ -170,18 +171,29 @@ class Browser {
       case 'destroy': this.destroy(input.viewId); break;
       case 'hide': item.occluded = true; item.gestureAt = null; item.snapshot = null; this.attach(item); break;
       case 'snapshot': {
-        item.occluded = true; this.attach(item);
-        let image;
-        try { image = await item.view.webContents.capturePage(); }
+        let image, timer;
+        try {
+          // Queue capture while the native child still owns its render surface.
+          // Detaching first can reject or indefinitely stall capture on macOS.
+          // No await precedes occlusion: the child is hidden synchronously and
+          // stayHidden prevents capture from making it visible again.
+          const size = item.view.getBounds();
+          const capture = item.view.webContents.capturePage({ x: 0, y: 0, width: Math.max(1, size.width), height: Math.max(1, size.height) }, { stayHidden: true });
+          item.occluded = true; this.attach(item);
+          image = await Promise.race([capture, new Promise((_, reject) => {
+            timer = setTimeout(() => reject(Error('Capture timed out')), this.captureTimeoutMs);
+          })]);
+        }
         catch {
-          // Some Chromium platforms cannot capture a detached WebContentsView.
-          // Occlusion is the security boundary; a missing decorative snapshot
-          // must not make hiding the native surface fail.
+          // Occlusion must complete even when the renderer cannot capture.
           if (this.closed || this.views.get(input.viewId) !== item || item.revision !== input.sequence) throw Error('Stale snapshot');
+          item.occluded = true; this.attach(item);
           item.snapshot = null;
           return { state: 'hidden' };
         }
+        finally { clearTimeout(timer); }
         if (this.closed || this.views.get(input.viewId) !== item || item.revision !== input.sequence) throw Error('Stale snapshot');
+        if (image.isEmpty?.()) { item.snapshot = null; return { state: 'hidden' }; }
         const snapshot = image.resize({ width: Math.min(1600, Math.max(1, item.view.getBounds().width)) }).toDataURL();
         item.snapshot = snapshot.length <= 2_000_000 ? snapshot : null;
         item.occluded = true; this.attach(item);

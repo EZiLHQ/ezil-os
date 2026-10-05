@@ -8,7 +8,7 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { Browser } = require('../src/browser.cjs');
 
-function fixture(t) {
+function fixture(t, options = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-browser-')));
   const session = Object.assign(new EventEmitter(), { setPermissionRequestHandler() {}, setPermissionCheckHandler() {}, setDevicePermissionHandler() {},
     webRequest: { onBeforeRequest() {} }, closeAllConnections: async () => {} });
@@ -23,7 +23,7 @@ function fixture(t) {
     getZoomFactor() { return this.zoomFactor; }
     setZoomFactor(value) { this.zoomFactor = value; }
     close() { this.dead = true; this.emit('destroyed'); }
-    capturePage() { return new Promise(resolve => { this.capture = resolve; }); }
+    capturePage(rect, options) { this.captureArgs = { rect, options }; return new Promise(resolve => { this.capture = resolve; }); }
   }
   class View { constructor(options) { this.options = options; this.webContents = new WC(); } setBounds(b) { this.bounds = b; } getBounds() { return this.bounds; } setVisible(v) { this.visible = v; } }
   const window = Object.assign(new EventEmitter(), { isDestroyed: () => false, getContentSize: () => [1000, 800], webContents: new WC(),
@@ -33,6 +33,7 @@ function fixture(t) {
   const browser = new Browser(workspace, window, 'g', { WebContentsView: View, session: { fromPath: () => session } }, {
     onState: (id, state) => states.push({ id, ...state }), onShortcut: (id, action) => shortcuts.push({ id, action }),
     onNewTab: (id, value) => newTabs.push({ id, ...value }), now: () => now,
+    ...options,
   });
   let sequence = 0;
   const op = (op, fields = {}) => browser.operation({ op, workspaceId: workspace.id, generation: 'g', viewId: 'one', sequence: ++sequence, ...fields });
@@ -65,6 +66,35 @@ test('pending navigation never blocks composition; state is committed and destro
   await assert.rejects(pending, /Stale snapshot/);
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(states.length, count); assert.equal(browser.state('one'), null);
+});
+test('capture starts on the attached surface, hides immediately and bounds a hung renderer', async t => {
+  const { browser, window, op } = fixture(t, { captureTimeoutMs: 20 });
+  await op('create', { bounds: { x: 4, y: 8, width: 300, height: 200 } });
+  const item = browser.views.get('one'), wc = item.view.webContents;
+  const original = wc.capturePage.bind(wc);
+  wc.capturePage = (...args) => {
+    assert.ok(window.contentView.children.includes(item.view));
+    assert.equal(item.view.visible, true);
+    return original(...args);
+  };
+  const pending = op('snapshot');
+  assert.equal(item.view.visible, false);
+  assert.equal(window.contentView.children.includes(item.view), false);
+  assert.deepEqual(wc.captureArgs, { rect: { x: 0, y: 0, width: 300, height: 200 }, options: { stayHidden: true } });
+  assert.deepEqual(await pending, { state: 'hidden' });
+  wc.capture({ resize() { throw Error('Late capture must be ignored'); } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(item.snapshot, null);
+  await op('restore'); assert.equal(item.view.visible, true);
+});
+test('synchronous capture failure still hides and permits subsequent browser operations', async t => {
+  const { browser, window, op } = fixture(t);
+  await op('create', { bounds: { x: 0, y: 0, width: 300, height: 200 } });
+  const item = browser.views.get('one');
+  item.view.webContents.capturePage = () => { throw Error('Renderer unavailable'); };
+  assert.deepEqual(await op('snapshot'), { state: 'hidden' });
+  assert.equal(window.contentView.children.includes(item.view), false);
+  await op('restore'); assert.equal(item.view.visible, true);
 });
 test('user popups request sandboxed tabs without replacing the original page; shortcuts are routed', async t => {
   const { browser, op, shortcuts, newTabs, window, advance } = fixture(t);
