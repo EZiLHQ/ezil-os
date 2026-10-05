@@ -154,6 +154,15 @@ function fitScreenRequest (w, h) {
 
 const HOST = 'https://ezil-responsiveness-test.invalid';
 const DESKTOP_URL = 'https://8181-guac-x-y-nekodesktop.ezil-responsiveness-test.invalid/?usr=EZiL&pwd=x&embed=1';
+// Layout evidence belongs to this iframe navigation; real-cloud acceptance
+// separately requires measured WebRTC bytes and decoded-frame progress.
+const VIEWER_HTML = `<!doctype html><html><body><script>
+const attempt = new URL(location.href).searchParams.get('ezilAttempt');
+let count = 0;
+function report() { count++; parent.postMessage({ source:'ezil-mobile', type:'stream_vitals', attempt,
+    vitals:{ connectionState:'connected', bytesReceived:count*100, framesDecoded:count, width:1280, height:720 } }, '*'); }
+setInterval(report, 100);
+</script></body></html>`;
 const DOC_HTML = `<!doctype html><html><head><style>${css}</style></head>`
     + '<body class="min-h-full flex flex-col"><div id="ezil-os-root"></div></body></html>';
 
@@ -207,6 +216,7 @@ async function boot ({ width, height, dpr = 1, screen = true, serverScreen = nul
         const req = route.request();
         const url = req.url();
         const json = (body) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+        if (new URL(url).origin === new URL(DESKTOP_URL).origin) return route.fulfill({status:200,contentType:'text/html',body:VIEWER_HTML});
         if ( url === `${HOST}/os` ) return route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
 
         if ( url.includes('/api/shell/screen') ) {

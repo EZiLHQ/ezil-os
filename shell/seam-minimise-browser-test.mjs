@@ -128,6 +128,15 @@ push('GROUP 0: no near-miss spelling (_ezil_minimize / _ezilMinimise / …) anyw
 
 const HOST = 'https://ezil-seam-minimise-test.invalid';
 const DESKTOP_URL = 'https://8181-guac-x-y-nekodesktop.ezil-seam-minimise-test.invalid/?usr=EZiL&pwd=x&embed=1';
+// Layout evidence belongs to this iframe navigation; real-cloud acceptance
+// separately requires measured WebRTC bytes and decoded-frame progress.
+const VIEWER_HTML = `<!doctype html><html><body><script>
+const attempt = new URL(location.href).searchParams.get('ezilAttempt');
+let count = 0;
+function report() { count++; parent.postMessage({ source:'ezil-mobile', type:'stream_vitals', attempt,
+    vitals:{ connectionState:'connected', bytesReceived:count*100, framesDecoded:count, width:1280, height:720 } }, '*'); }
+setInterval(report, 100);
+</script></body></html>`;
 const DOC_HTML = `<!doctype html><html><head><style>${css}</style></head>`
     + '<body class="min-h-full flex flex-col"><div id="ezil-os-root"></div></body></html>';
 
@@ -154,6 +163,7 @@ await page.route('**/*', async (route) => {
     const req = route.request();
     const url = req.url();
     const json = (body) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+        if (new URL(url).origin === new URL(DESKTOP_URL).origin) return route.fulfill({status:200,contentType:'text/html',body:VIEWER_HTML});
     if ( url === `${HOST}/os` ) {
         return route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
     }
@@ -164,9 +174,7 @@ await page.route('**/*', async (route) => {
         });
     }
     if ( url.includes('confirm=frame') ) return json({ ok: true, confirmed: true });
-    // `display === 'live'` is the ONLY path to `ready` (the pinned contract in
-    // computeBootUiState / applyDisplayEvidence). `ready` is what calls
-    // `go_fullbleed`, which is the state this whole file is about.
+    // Server evidence is diagnostic; this viewer's frame progress establishes ready.
     if ( url.includes('confirm=display') ) return json({ ok: true, display: 'live' });
     if ( url.includes('/api/shell/desktop') ) return json({ ok: true, guacamoleRunning: true });
     if ( url.includes('/api/') ) return json({ ok: true });

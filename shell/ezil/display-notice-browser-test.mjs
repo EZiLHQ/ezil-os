@@ -11,10 +11,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // WHY THIS CANNOT BE jsdom, AND WHY IT IS WORTH A FILE
 // ═══════════════════════════════════════════════════════════════════════════
-// `boot-test.mjs` already proves the strip EXISTS, is not hidden, carries EZiL
-// copy and does not claim ready. jsdom cannot go further: it has no layout, so
-// every one of those checks passes just as happily over a strip nobody can
-// read.
+// Render the actual DisplayNotice component explicitly for its geometry check.
+// Unknown server evidence no longer causes the product to reveal a viewer:
+// boot-test.mjs separately verifies the current-viewer decoded-frame gate.
 //
 // And nobody could read it. Measured in Chromium at 1280x860, in exactly the
 // state this strip is for: the notice sat at `top: 12`..`94.5` with `z-index: 3`
@@ -72,10 +71,19 @@ const push = (name, pass, detail = '') => {
 const icons = fs.readFileSync(`${OS}/icons.js`, 'utf8');
 const bundle = fs.readFileSync(`${OS}/bundle.min.js`, 'utf8');
 const css = fs.readFileSync(`${OS}/bundle.min.css`, 'utf8');
+const noticeModule = fs.readFileSync(path.join(here, 'ui/boot-progress.js'), 'utf8');
+const phasesModule = fs.readFileSync(path.join(here, '../../app/src/components/desktop/boot-phases.shell.js'), 'utf8');
 
 const HOST = 'https://ezil-display-notice-test.invalid';
 const HOST_HOSTNAME = new URL(HOST).hostname;
 const DESKTOP_URL = 'https://8181-guac-x-y-nekodesktop.ezil-display-notice-test.invalid/?usr=EZiL&pwd=x&embed=1';
+const VIEWER_HTML = `<!doctype html><html><body><script>
+const attempt = new URL(location.href).searchParams.get('ezilAttempt');
+let count = 0;
+function report() { count++; parent.postMessage({ source:'ezil-mobile', type:'stream_vitals', attempt,
+    vitals:{ connectionState:'connected', bytesReceived:count*100, framesDecoded:count, width:1280, height:720 } }, '*'); }
+setInterval(report, 100);
+</script></body></html>`;
 const DOC_HTML = `<!doctype html><html><head><style>${css}</style></head>`
     + '<body class="min-h-full flex flex-col"><div id="ezil-os-root"></div></body></html>';
 
@@ -109,6 +117,9 @@ for ( const vp of VIEWPORTS ) {
         const req = route.request();
         const url = req.url();
         const json = (body) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+        if (url === `${HOST}/fixture/ui/boot-progress.js`) return route.fulfill({contentType:'text/javascript',body:noticeModule});
+        if (url === `${HOST}/fixture/boot-phases.js`) return route.fulfill({contentType:'text/javascript',body:phasesModule});
+        if (new URL(url).origin === new URL(DESKTOP_URL).origin) return route.fulfill({contentType:'text/html',body:VIEWER_HTML});
         if ( url === `${HOST}/os` ) {
             return route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
         }
@@ -119,9 +130,8 @@ for ( const vp of VIEWPORTS ) {
             });
         }
         if ( url.includes('confirm=frame') ) return json({ ok: true, confirmed: true });
-        // 🔴 A shape the server could not interpret — the ONLY thing that
-        // produces `ready_unverified`, which is the only state this strip
-        // appears in.
+        // An unknown server answer cannot reveal a viewer. The current iframe
+        // supplies layout-fixture frame evidence independently above.
         if ( url.includes('confirm=display') ) return json({ ok: true, display: 'something-we-do-not-recognise' });
         if ( url.includes('/api/shell/desktop') ) return json({ ok: true, guacamoleRunning: true });
         if ( url.includes('/api/') ) return json({ ok: true });
@@ -141,7 +151,17 @@ for ( const vp of VIEWPORTS ) {
     await page.evaluate((p) => {
         window.ezil.registry.launch('desktop', { payload: p, computer: p.computer, desktopState: p.desktopState });
     }, PAYLOAD);
-    await page.waitForSelector('.ezil-display-notice:not([hidden])', { timeout: 30_000 });
+    await page.waitForSelector('.window[data-app="desktop"].ezil-fullbleed', { timeout: 15_000 });
+    push(`${vp.name}: unknown server evidence never shows an unverified notice`,
+        await page.locator('.ezil-display-notice:not([hidden])').count() === 0);
+    await page.evaluate(async () => {
+        const { DisplayNotice } = await import('/fixture/ui/boot-progress.js');
+        const existing = document.querySelector('.ezil-display-notice');
+        const notice = DisplayNotice();
+        existing.replaceWith(notice.el);
+        notice.show();
+    });
+    await page.waitForSelector('.ezil-display-notice:not([hidden])');
     // The drawer FLASHES open on full-bleed (`_ezil_drawer_flash`) and collapses
     // a few seconds later. Measure while it is OPEN: that is its largest, and a
     // strip that clears the tongue but not the open drawer is still broken.

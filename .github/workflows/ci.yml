@@ -365,6 +365,7 @@ jobs:
         run: |
           set -e
           for t in shell/ezil/apps/desktop-screen-test.mjs \
+                   shell/ezil/boot-test.mjs \
                    shell/ezil/apps/desktop-close-test.mjs \
                    shell/ezil/apps/relay-renewal-test.mjs \
                    shell/ezil/apps/viewer-evidence-test.mjs \
