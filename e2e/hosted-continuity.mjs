@@ -230,12 +230,14 @@ try {
     // Browser keyboard shortcuts can be intercepted on macOS.
     if (await f.locator('.monaco-modal-editor-block:visible').count()) await closeModal(f);
     else {
-      const tab = f.locator('.tabs-container .tab.active');
+      const activeTab = f.locator('.tabs-container .tab.active');
+      const fileName = await activeTab.locator('.label-name').innerText();
+      const tab = f.locator('.tabs-container .tab').filter({ has: f.locator('.label-name').filter({ hasText: new RegExp('^' + fileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$') }) });
       await tab.getByRole('button', { name: /^Close/ }).click();
       await bounded('Code tab saved and closed', async () => {
         const save = f.getByRole('button', { name: 'Save', exact: true });
         if (await save.isVisible()) await save.click();
-        return !await f.locator('.monaco-dialog-box:visible').count();
+        return !await tab.count();
       }, 15000);
     }
   };
@@ -251,8 +253,10 @@ try {
   };
   const settings = '// continuity JSONC\n{"workbench.colorTheme":"Dark Modern","security.workspace.trust.enabled":false,"editor.accessibilitySupport":"on","files.autoSave":"off"}\n';
   const bindings = '// continuity binding\n[{"key":"ctrl+alt+k","command":"workbench.action.files.save"}]\n';
-  const marker = `continuity-${hash(computerId).slice(0, 10)}.txt`;
   const markerText = `hosted-checkpoint-${Date.now()}`;
+  // Reused test computers retain Code's restored tabs. A fresh file per run
+  // avoids overwriting an earlier probe behind a restored editor buffer.
+  const marker = `continuity-${hash(computerId).slice(0, 10)}-${hash(markerText).slice(0, 10)}.txt`;
   let shortcutChecks = 0;
   let f = await openCode();
   await command(f, 'Preferences: Open User Settings (JSON)'); await setDocument(f, settings); await verifyDarkTheme(f);
@@ -260,14 +264,15 @@ try {
   await command(f, 'File: New Untitled Text File');
   await focusEditor(f); await page.keyboard.type(markerText);
   await command(f,'File: Save As...');
-  const savePath = f.locator('.quick-input-widget input:visible');
+  const saveDialog = f.locator('.quick-input-widget:visible');
+  const savePath = saveDialog.getByRole('textbox', { name: 'Folder path - Save As', exact: true });
   await savePath.waitFor({state:'visible'});
   await savePath.fill(`${workspace}/${marker}`);
-  await savePath.press('Enter');
+  await saveDialog.getByRole('button', { name: 'OK', exact: true }).click();
+  await savePath.waitFor({state:'hidden',timeout:15000});
   await bounded('saved marker tab',async()=>{
-    const overwrite=f.getByRole('button',{name:'OK',exact:true});
-    if(await overwrite.isVisible()) await overwrite.click();
-    return f.locator('.tab').filter({hasText:marker}).count();
+    const tab = f.locator('.tab').filter({hasText:marker});
+    return await tab.count() === 1 && !await tab.evaluate(el=>el.classList.contains('dirty'));
   },15000);
   const verifyEditor = async () => {
     f = await openCode();
@@ -289,7 +294,13 @@ try {
         await page.keyboard.type(`\n${proof}`);
         await bounded('rendered shortcut edit',async()=>(await readDocument(f)).includes(proof),10000);
       },
-      pressShortcut: async () => { await page.keyboard.press('Control+Alt+K'); await wait(1200); },
+      pressShortcut: async () => {
+        const editor = await currentEditor(f);
+        const nativeInput = editor.locator('[role="textbox"]:visible');
+        const input = await nativeInput.count() ? nativeInput.first() : editor.locator('textarea').last();
+        await input.press('Control+Alt+K');
+        await bounded('shortcut saved file', () => f.locator('.tabs-container .tab.active.dirty').count().then(count => count === 0), 10000);
+      },
       revert: () => command(f, 'File: Revert File'),
     });
     evidence.shortcutSaveChecks = shortcutChecks;
@@ -303,7 +314,10 @@ try {
   // shell integration publishes a command decoration after its actual prompt.
   await bounded('terminal prompt', () => f.locator('.xterm-decoration.terminal-command-decoration').count(), 30000);
   await terminalInput().focus();
-  await page.keyboard.insertText(terminalContinuityCommand(processNonce)); await page.keyboard.press('Enter');
+  // xterm on macOS does not consistently consume Playwright insertText.
+  // Send ordinary keyboard input and confirm the command reached the terminal.
+  await terminalInput().pressSequentially(terminalContinuityCommand(processNonce));
+  await terminalInput().press('Enter');
   const processSample = async (afterSequence = -1) => {
     await command(f, 'Terminal: Focus Terminal');
     return waitForProcessSample({ nonce: processNonce, afterSequence,
@@ -325,14 +339,21 @@ try {
   const inputBefore = hash(await videoFrame().locator('video').screenshot());
   const uniqueHeading = `continuity-input-${Date.now()}`;
   const staleURL = videoFrame().url();
-  await videoFrame().locator('video').click();
-  await page.keyboard.press('Control+L'); await page.keyboard.type(`data:text/html,<title>${uniqueHeading}</title><body style="background:%23161616;color:white;height:3000px"><h1>${uniqueHeading}</h1><input autofocus><p>scroll marker</p></body>`); await page.keyboard.press('Enter'); await wait(5000);
+  // Neko receives pointer and keyboard input through its textarea overlay.
+  // Clicking the decoded video is blocked by this intentional input surface.
+  const browserInput = videoFrame().locator('textarea.overlay');
+  await browserInput.click();
+  await browserInput.press('Control+L');
+  await browserInput.pressSequentially(`data:text/html,<title>${uniqueHeading}</title><body style="background:%23161616;color:white;height:3000px"><h1>${uniqueHeading}</h1><input autofocus><p>scroll marker</p></body>`);
+  await browserInput.press('Enter');
+  if (mode !== 'essential') await bounded('Browser navigation rendered', async () => (await browserSnapshot()).title === uniqueHeading, 15000);
+  else await wait(5000);
   // Assert decoded pixels and use the existing signed observation boundary
   // to confirm the navigation and input actually reached cloud Chrome.
   const navigatedFrameHash = hash(await videoFrame().locator('video').screenshot());
   if (mode !== 'essential') assert.equal((await browserSnapshot()).title,uniqueHeading,'Browser navigation did not render requested document');
   assert.notEqual(navigatedFrameHash, inputBefore, 'Navigation produced no visible response');
-  await page.keyboard.type('hosted keyboard input'); await wait(1500);
+  await browserInput.pressSequentially('hosted keyboard input'); await wait(1500);
   const typedFrameHash = hash(await videoFrame().locator('video').screenshot());
   if (mode !== 'essential') assert.ok((await browserSnapshot()).snapshot.includes('hosted keyboard input'),'Typed input did not reach cloud Chrome');
   assert.notEqual(typedFrameHash, navigatedFrameHash, 'Typing produced no visible response');

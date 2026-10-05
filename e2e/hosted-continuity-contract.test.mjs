@@ -75,7 +75,7 @@ test('every persistence reopen verifies the restored shortcut with automatic sav
     assert.ok(source.includes('"files.autoSave":"off"'));
     const verification=source.slice(source.indexOf('  const verifyEditor = async'),source.indexOf("  await close('code'); await verifyEditor()"));
     assert.ok(verification.includes('await verifyEditorShortcut'));
-    assert.ok(verification.includes("page.keyboard.press('Control+Alt+K')"));
+    assert.ok(verification.includes("input.press('Control+Alt+K')"));
     assert.ok(verification.includes("command(f, 'File: Revert File')"));
     assert.ok(verification.includes('hash(persistedMarker)'));
 });
