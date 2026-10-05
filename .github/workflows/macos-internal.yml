@@ -11,6 +11,7 @@ on:
       - 'local/src/boot/**'
       - 'shell/**'
       - '.github/workflows/macos-internal.yml'
+      - '.github/workflows/ci.yml'
 
 permissions:
   contents: read
@@ -40,6 +41,8 @@ jobs:
         working-directory: macos-electron
         run: |
           test "$(uname -m)" = arm64
+          sw_vers
+          xcodebuild -version
           npm install --global npm@11.12.1 --no-audit --no-fund
           npm ci --no-audit --no-fund
       - name: Unit, migration compatibility and Electron GUI checks
