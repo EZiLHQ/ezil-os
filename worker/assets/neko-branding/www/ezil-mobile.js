@@ -438,16 +438,26 @@
         if (!promise || typeof promise.then !== 'function') return;
         promise.then(function (report) {
             try {
+                if (pc !== peers[peers.length - 1]) return;
                 var vid = null, pair = null;
                 report.forEach(function (e) {
                     if (!e) return;
                     if (e.type === 'inbound-rtp' && e.kind === 'video') vid = e;
-                    // `selected` is the legacy flag; `nominated` + state is the
-                    // current one. Either identifies the pair actually in use.
-                    if (e.type === 'candidate-pair'
-                        && (e.selected === true || (e.nominated === true && e.state === 'succeeded'))) pair = e;
                 });
                 if (!vid) return;
+                // A nominated pair can survive after ICE switches to another
+                // pair. Bind this video's report to its selected transport.
+                if (typeof report.get === 'function' && vid.transportId) {
+                    var transport = report.get(vid.transportId);
+                    pair = transport && report.get(transport.selectedCandidatePairId);
+                } else {
+                    // Older stats expose selection directly on the pair. Use
+                    // that explicit flag only; nomination is not selection.
+                    report.forEach(function (e) {
+                        if (e && e.type === 'candidate-pair' && e.selected === true) pair = e;
+                    });
+                }
+                if (pair && pair.type !== 'candidate-pair') pair = null;
                 var at = Date.now();
                 var out = { at: at };
                 out.connectionState = pc.connectionState;

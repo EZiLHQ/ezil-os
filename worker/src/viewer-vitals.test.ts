@@ -3,16 +3,17 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
 const source = readFileSync(new URL('../assets/neko-branding/www/ezil-mobile.js', import.meta.url), 'utf8');
-function fixture() {
+function fixture(stats?: () => Promise<Map<string, unknown>>) {
   const intervals = new Map<object, { fn: () => void; ms: number }>();
   const listeners = new Map<string, (event: unknown) => void>();
-  const messages: { type?: string; vitals?: { framesDecoded: number } }[] = [];
+  const messages: { type?: string; vitals?: { framesDecoded: number; localCandidateType?: string; relayProtocol?: string } }[] = [];
   let frames = 0;
   class Peer {
     connectionState = 'connected';
     setRemoteDescription() { return Promise.resolve(); }
     addEventListener() {}
     getStats() {
+      if (stats) return stats();
       frames++;
       return Promise.resolve(new Map([['video', { type: 'inbound-rtp', kind: 'video',
         framesDecoded: frames, bytesReceived: frames * 100, frameWidth: 1280, frameHeight: 720 }]]));
@@ -27,7 +28,7 @@ function fixture() {
     clearInterval: (id: object) => intervals.delete(id) });
   const peer = new Peer();
   peer.setRemoteDescription();
-  return { messages, intervals,
+  return { messages, intervals, replacePeer: () => { const replacement = new Peer(); replacement.setRemoteDescription(); },
     send: (type: string, attempt?: string, origin: object = parent) => listeners.get('message')?.({
       source: origin, data: { source: 'ezil-shell', type, attempt },
     }),
@@ -54,5 +55,47 @@ describe('viewer frame evidence survives System monitor close', () => {
     await f.tick();
     expect(f.messages).toHaveLength(count);
     expect([...f.intervals.values()].filter(timer => timer.ms === 2000)).toHaveLength(0);
+  });
+});
+
+describe('TURN evidence identifies the pair carrying the current video', () => {
+  const report = (videoTransport = true) => new Map<string, unknown>([
+    ['video', { type: 'inbound-rtp', kind: 'video', framesDecoded: 2, bytesReceived: 200,
+      frameWidth: 1280, frameHeight: 720, ...(videoTransport ? { transportId: 'video-transport' } : {}) }],
+    ['video-transport', { type: 'transport', selectedCandidatePairId: 'active-pair' }],
+    ['active-pair', { type: 'candidate-pair', state: 'succeeded', nominated: true,
+      localCandidateId: 'active-local', remoteCandidateId: 'active-remote' }],
+    ['active-local', { candidateType: 'relay', relayProtocol: 'tls' }],
+    ['active-remote', { candidateType: 'host' }],
+    // Deliberately last: the old implementation chose this nominated pair.
+    ['old-pair', { type: 'candidate-pair', state: 'succeeded', nominated: true,
+      localCandidateId: 'old-local', remoteCandidateId: 'old-remote' }],
+    ['old-local', { candidateType: 'host', relayProtocol: 'udp' }],
+    ['old-remote', { candidateType: 'relay' }],
+  ]);
+  it('uses the video transport selection even when another nominated pair appears later', async () => {
+    const f = fixture(async () => report());
+    f.send('viewer_probe', 'current'); await Promise.resolve();
+    expect(f.messages.at(-1)?.vitals).toMatchObject({ localCandidateType: 'relay', relayProtocol: 'tls' });
+  });
+  it('cannot infer selected TURN from nomination alone', async () => {
+    const f = fixture(async () => report(false));
+    f.send('viewer_probe', 'current'); await Promise.resolve();
+    expect(f.messages.at(-1)?.vitals?.localCandidateType).toBeUndefined();
+    expect(f.messages.at(-1)?.vitals?.relayProtocol).toBeUndefined();
+  });
+  it('retains explicit legacy selection without using an unrelated transport', async () => {
+    const stats = report(false);
+    Object.assign(stats.get('active-pair') as object, { selected: true });
+    const f = fixture(async () => stats);
+    f.send('viewer_probe', 'current'); await Promise.resolve();
+    expect(f.messages.at(-1)?.vitals).toMatchObject({ localCandidateType: 'relay', relayProtocol: 'tls' });
+  });
+  it('discards a delayed stats report from a replaced peer', async () => {
+    let finish!: (report: Map<string, unknown>) => void;
+    const f = fixture(() => new Promise(resolve => { finish = resolve; }));
+    f.send('viewer_probe', 'current');
+    f.replacePeer(); finish(report()); await Promise.resolve();
+    expect(f.messages).toHaveLength(0);
   });
 });
