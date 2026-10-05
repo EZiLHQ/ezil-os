@@ -24,6 +24,7 @@
  */
 import { createRequire } from 'node:module';
 import { APP, configureAppContext } from './deployed-target.mjs';
+import { verifySelectedComputer } from './isolated-computer.mjs';
 
 const REQ_DIR = process.env.PLAYWRIGHT_REQUIRE_DIR;
 if (!REQ_DIR) { console.error('FAIL: PLAYWRIGHT_REQUIRE_DIR unset'); process.exit(2); }
@@ -67,6 +68,7 @@ try {
   }
   check('sign-in leaves /login', !/\/login/.test(p.url()), p.url().slice(0, 60));
   await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
+  await verifySelectedComputer(p);
   await p.waitForTimeout(3500);
 
   const codeFrame = () => p.frames().find(f => /-code\./.test(f.url()));

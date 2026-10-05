@@ -7,7 +7,8 @@ import { test } from 'node:test';
 import './desktop-resize-ready.test.mjs';
 import './viewer-progress.test.mjs';
 import './process-continuity.test.mjs';
-import { deployedTarget, configureAppContext } from './deployed-target.mjs';
+import './isolated-computer.test.mjs';
+import { deployedTarget, configureAppContext, APP_FETCH_TIMEOUT_MS, APP_STOP_FETCH_TIMEOUT_MS, appFetchTimeout } from './deployed-target.mjs';
 import { assertVercelDeployment, assertWorkerDeployment, verifyCloudDeployment } from './verify-cloud-deployment.mjs';
 
 const sha = 'a'.repeat(40);
@@ -127,7 +128,7 @@ test('Vercel browser bypass is scoped to the app and cannot follow a redirect', 
   for (const url of [`${target.app}/login`, 'https://worker.staging.example/frame', 'https://third-party.example/']) {
     const calls = [];
     await handler({
-      request: () => ({ url: () => url, headers: () => ({ accept: '*/*' }) }),
+      request: () => ({ url: () => url, method: () => 'GET', headers: () => ({ accept: '*/*' }) }),
       continue: async (...args) => calls.push(['continue', ...args]),
       fetch: async (options) => { calls.push(['fetch', options]); return 'response'; },
       fulfill: async (options) => calls.push(['fulfill', options]),
@@ -139,6 +140,22 @@ test('Vercel browser bypass is scoped to the app and cannot follow a redirect', 
       assert.deepEqual(calls[1], ['fulfill', { response: 'response' }]);
     } else assert.deepEqual(calls, [['continue']]);
   }
+});
+
+test('checkpoint stop bypass leaves room for the provider budget and bounds hung requests', async () => {
+  assert.ok(APP_STOP_FETCH_TIMEOUT_MS > 270000 && APP_STOP_FETCH_TIMEOUT_MS < 300000);
+  const request = (method, path) => ({ method: () => method, url: () => `${target.app}${path}`, headers: () => ({}) });
+  assert.equal(appFetchTimeout(request('POST', '/api/shell/stop')), APP_STOP_FETCH_TIMEOUT_MS);
+  for (const [method, path] of [['GET', '/api/shell/stop'], ['POST', '/api/shell/desktop'], ['POST', '/api/shell/stop-other']]) {
+    assert.equal(appFetchTimeout(request(method, path)), APP_FETCH_TIMEOUT_MS);
+  }
+  let handler, options;
+  await configureAppContext({ route: async (_pattern, callback) => { handler = callback; } },
+    { app: target.app, headers: { 'x-vercel-protection-bypass': 'test-bypass' } });
+  await handler({ request: () => request('POST', '/api/shell/stop'),
+    fetch: async value => { options = value; return 'response'; }, fulfill: async () => {} });
+  assert.equal(options.timeout, APP_STOP_FETCH_TIMEOUT_MS);
+  assert.equal(options.maxRedirects, 0);
 });
 
 test('Vercel bypass route tolerates context disposal but surfaces live request errors', async () => {

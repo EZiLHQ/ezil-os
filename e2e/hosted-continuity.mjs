@@ -6,11 +6,12 @@ import { mkdirSync, writeFileSync, mkdtempSync, readFileSync, rmSync } from 'nod
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { APP, configureAppContext } from './deployed-target.mjs';
+import { APP, appHeaders, APP_STOP_FETCH_TIMEOUT_MS, configureAppContext } from './deployed-target.mjs';
 import { verifyCloudDeployment } from './verify-cloud-deployment.mjs';
 import { observeScreenResizes, readDesktopReadiness, waitForDesktopResize } from './desktop-resize-ready.mjs';
 import { waitForViewerProgress } from './viewer-progress.mjs';
 import { terminalContinuityCommand, assertProcessContinuity, waitForProcessSample } from './process-continuity.mjs';
+import { stopIsolatedComputer } from './isolated-computer.mjs';
 
 const required = key => { assert.ok(process.env[key], `Missing prerequisite: ${key}`); return process.env[key]; };
 const hash = value => createHash('sha256').update(String(value)).digest('hex');
@@ -19,6 +20,7 @@ const evidence = { phases: [], samples: [] };
 // verifyCloudDeployment also checks both production aliases against that ID.
 const identityEnv = { ...process.env, EZIL_E2E_APP: process.env.EZIL_CONTINUITY_IDENTITY_APP || APP };
 let browser, context, page, beforeIdentity, computerId, resizeObserver;
+let verifiedComputer = false;
 const started = Date.now();
 const phase = name => evidence.phases.push({ name, elapsedMs: Date.now() - started });
 const wait = ms => page.waitForTimeout(ms);
@@ -124,6 +126,7 @@ try {
   };
   const selected = await page.evaluate(() => window.ezil.session.payload().computer.id);
   assert.equal(selected, computerId, 'Authenticated session selects another computer; refusing to launch or stop it');
+  verifiedComputer = true;
   const launch = async app => {
     if (app === 'desktop') await page.evaluate(() => { window.__continuityVitals = []; });
     await page.evaluate(async app => { const payload = window.ezil.session.payload(); await window.ezil.registry.launch(app, { payload, computer: payload.computer, desktopState: payload.desktopState }); }, app);
@@ -406,13 +409,13 @@ try {
   process.exitCode = 1;
 } finally {
   resizeObserver?.dispose();
-  if (page && computerId) {
+  if (context && verifiedComputer) {
     try {
-      const selected = await page.evaluate(() => window.ezil?.session?.payload?.()?.computer?.id);
-      if (selected === computerId) {
-        const stopped = await page.evaluate(async computerId => { const r = await fetch('/api/shell/stop', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ computerId }) }); return r.ok && (await r.json()).terminated; }, computerId);
-        assert.ok(stopped, 'Cleanup stop failed'); evidence.cleanupStopped = true;
-      }
+      // Uses this authenticated context's cookie jar, independently of a
+      // working page. The computer was explicitly verified before any launch.
+      // APIRequestContext does not traverse the page's Vercel bypass route.
+      await stopIsolatedComputer(context, computerId, APP, appHeaders, APP_STOP_FETCH_TIMEOUT_MS);
+      evidence.cleanupStopped = true;
     } catch { evidence.cleanupStopped = false; evidence.ok = false; evidence.failure = 'cleanup_stop_failed'; process.exitCode = 1; }
   }
   try { await browser?.close(); } catch { evidence.ok = false; evidence.failure = 'browser_cleanup_failed'; process.exitCode = 1; }

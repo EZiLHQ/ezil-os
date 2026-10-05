@@ -54,6 +54,12 @@ internal_triggers = workflows['macos-internal'].get('on', workflows['macos-inter
 assert '.github/workflows/ci.yml' in internal_triggers['pull_request']['paths']
 
 jobs = workflows['preview']['jobs']
+for job in ('preview', 'production'):
+    assert jobs[job]['env']['EZIL_E2E_COMPUTER_ID'] == '${{ secrets.EZIL_E2E_COMPUTER_ID }}'
+for name in ('prod', 'prod-responsiveness', 'prod-window-stacking', 'prod-reconcile', 'prod-lifecycle'):
+    source = (root / f'e2e/{name}.mjs').read_text()
+    assert 'verifySelectedComputer(p' in source, f'{name} must verify isolated compute before launch'
+    assert source.index('verifySelectedComputer(p') > source.index('await p.goto(`${APP}/os`')
 assert set(jobs['production']['needs']) == {'trust', 'preview', 'images'}
 assert jobs['images']['with']['source'] == '${{ needs.trust.outputs.sha }}'
 assert jobs['production']['concurrency']['group'] == 'deploy-production'

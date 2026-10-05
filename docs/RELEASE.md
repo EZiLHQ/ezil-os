@@ -108,6 +108,11 @@ tests compare the committed R2 manifest before and after the rejected stop;
 unavailable TURN must produce a visible Retry state and recover after clearing
 the staging fault. Stop forwarding allows up to 270 seconds for editor capture,
 workspace/system checkpoints and confirmed shutdown within the 300-second route.
+The browser's Vercel bypass allows 290 seconds for that stop response, while
+ordinary app requests retain their 240-second budget. Cleanup uses the signed-in
+request context even if the page fails, and requires confirmed shutdown or an
+already-stopped computer. The deployed browser suites also verify the explicit
+computer before launch; reconcile rechecks it immediately before restarting.
 
 Configure each GitHub environment with an explicitly approved isolated
 `EZIL_E2E_COMPUTER_ID` secret, an absolute `EZIL_E2E_WORKSPACE_PATH` variable,

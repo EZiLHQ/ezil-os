@@ -29,6 +29,7 @@
 // Does Settings open ON TOP on a real phone against production?
 import { createRequire } from 'node:module'; import path from 'node:path';
 import { APP, configureAppContext } from './deployed-target.mjs';
+import { verifySelectedComputer } from './isolated-computer.mjs';
 // 🔴 NO CREDENTIAL DEFAULTS. This suite signs in to the LIVE deployment, so a
 // hardcoded fallback here is a working production account published in a
 // public repository. Absent config is "could not run" (exit 2), never a pass
@@ -56,6 +57,7 @@ for (let n = 1; n <= runs; n++) {
   await Promise.all([p.waitForURL(u=>!/\/login/.test(u.toString()),{timeout:60000}).catch(()=>{}),
     p.locator('form').filter({has:p.locator('#email')}).locator('button[type=submit]').click()]);
   await p.goto(`${APP}/os`,{waitUntil:'domcontentloaded'});
+  await verifySelectedComputer(p);
   await p.waitForTimeout(3000);
   try { await p.locator('.taskbar-item').filter({hasText:/browser/i}).first().click({timeout:12000}); }
   catch { await p.locator('.taskbar-item').nth(1).click({timeout:12000}).catch(()=>{}); }

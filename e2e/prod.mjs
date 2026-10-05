@@ -20,6 +20,7 @@
  */
 import { createRequire } from 'node:module';
 import { APP, appHeaders, configureAppContext } from './deployed-target.mjs';
+import { verifySelectedComputer } from './isolated-computer.mjs';
 
 const REQ_DIR = process.env.PLAYWRIGHT_REQUIRE_DIR;
 if (!REQ_DIR) { console.error('SKIP: PLAYWRIGHT_REQUIRE_DIR unset'); process.exit(2); }
@@ -114,6 +115,7 @@ async function browserTiers() {
       check(shape.tier, `${shape.label}: sign-in leaves /login`, !/\/login/.test(p.url()), p.url().slice(0, 60));
 
       await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
+      await verifySelectedComputer(p);
       await p.waitForTimeout(3500);
       const deviceClass = await p.evaluate(() => document.body.className.match(/device-\w+/)?.[0] ?? null);
       if (shape.mobile) check('regression', 'phone UA resolves to device-phone', deviceClass === 'device-phone', String(deviceClass));

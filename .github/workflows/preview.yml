@@ -167,6 +167,7 @@ jobs:
       EZIL_DEPLOY_SHA: ${{ needs.trust.outputs.sha }}
       EZIL_DEPLOY_TARGET: preview
       EZIL_E2E_REQUIRE_TARGET: '1'
+      EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
       EZIL_E2E_WORKER: ${{ vars.OS_WORKER_URL }}
     steps:
       - uses: actions/checkout@v7
@@ -421,6 +422,7 @@ jobs:
       EZIL_DEPLOY_SHA: ${{ needs.trust.outputs.sha }}
       EZIL_DEPLOY_TARGET: production
       EZIL_E2E_REQUIRE_TARGET: '1'
+      EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
       EZIL_E2E_WORKER: https://api-desktop.ezil.org
       EZIL_WORKER_NAME: ezil-os-worker
     steps:

@@ -21,6 +21,14 @@ export const { app: APP, headers: appHeaders } = deployedTarget();
 // ~210 s). Playwright's 30 s default would cut a cold `/api/shell/desktop` off
 // mid-boot and report the harness, not the app.
 export const APP_FETCH_TIMEOUT_MS = 240_000;
+// Final checkpoint + teardown has a 270 s forwarding budget, inside the
+// 300 s shell route. Its harness must leave room for the response afterward.
+export const APP_STOP_FETCH_TIMEOUT_MS = 290_000;
+
+export function appFetchTimeout(request) {
+  return request.method() === 'POST' && new URL(request.url()).pathname === '/api/shell/stop'
+    ? APP_STOP_FETCH_TIMEOUT_MS : APP_FETCH_TIMEOUT_MS;
+}
 
 /**
  * 🔴 Playwright's route.fetch errors carry a "Call log" that prints EVERY
@@ -51,7 +59,7 @@ export async function configureAppContext(context, { app, headers } = { app: APP
       // fetch(maxRedirects: 0) prevents custom headers following cross-origin
       // redirects; the browser makes the next request through this route again.
       const response = await route.fetch({
-        headers: { ...request.headers(), ...headers }, maxRedirects: 0, timeout: APP_FETCH_TIMEOUT_MS,
+        headers: { ...request.headers(), ...headers }, maxRedirects: 0, timeout: appFetchTimeout(request),
       });
       await route.fulfill({ response });
     } catch (error) {
