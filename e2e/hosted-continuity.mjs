@@ -12,6 +12,9 @@ import { verifyCloudDeployment } from './verify-cloud-deployment.mjs';
 const required = key => { assert.ok(process.env[key], `Missing prerequisite: ${key}`); return process.env[key]; };
 const hash = value => createHash('sha256').update(String(value)).digest('hex');
 const evidence = { phases: [], samples: [] };
+// Drive the canonical host while verifying its immutable Vercel deployment.
+// verifyCloudDeployment also checks both production aliases against that ID.
+const identityEnv = { ...process.env, EZIL_E2E_APP: process.env.EZIL_CONTINUITY_IDENTITY_APP || APP };
 let browser, context, page, beforeIdentity, computerId;
 const started = Date.now();
 const phase = name => evidence.phases.push({ name, elapsedMs: Date.now() - started });
@@ -36,7 +39,7 @@ try {
   if (mode !== 'essential') required('EZIL_ACCEPTANCE_HMAC_SECRET');
   const req = createRequire(required('PLAYWRIGHT_REQUIRE_DIR') + '/test.js');
   const { chromium } = req('playwright');
-  beforeIdentity = await verifyCloudDeployment(process.env);
+  beforeIdentity = await verifyCloudDeployment(identityEnv);
   const cf = await fetch(`https://api.cloudflare.com/client/v4/accounts/${required('CLOUDFLARE_ACCOUNT_ID')}/containers/applications`, {
     headers: { authorization: `Bearer ${required('CLOUDFLARE_API_TOKEN')}` }, signal: AbortSignal.timeout(15000), redirect: 'error',
   });
@@ -312,7 +315,7 @@ try {
   await bounded('fallback session ready', () => page.evaluate(() => !!window.ezil?.session?.payload?.()?.computer));
   assert.equal(await page.evaluate(() => window.ezil.session.payload().computer.id), computerId, 'Fallback selects another computer');
   fallback = true; await launch('desktop'); await live(); phase('UDP unavailable TCP/TLS fallback');
-  const afterIdentity = await verifyCloudDeployment(process.env);
+  const afterIdentity = await verifyCloudDeployment(identityEnv);
   assert.deepEqual(afterIdentity, beforeIdentity, 'Application or Worker identity changed during acceptance');
   const cfAfter = await fetch(`https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/containers/applications`, { headers: { authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` }, signal: AbortSignal.timeout(15000) });
   assert.ok(cfAfter.ok); const afterApplications = (await cfAfter.json()).result;

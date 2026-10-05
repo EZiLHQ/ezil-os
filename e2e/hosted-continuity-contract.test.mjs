@@ -26,6 +26,8 @@ test('cloud scenarios permit normal UDP before separate TCP/TLS fallback and rea
     assert.ok(source.includes("/.ezil-snapshots/latest.json"));
     assert.ok(source.includes("checkpoint.sha256"));
     assert.ok(source.includes("el.classList.contains('vs-dark')"));
+    assert.ok(source.includes('EZIL_CONTINUITY_IDENTITY_APP || APP'));
+    assert.equal((source.match(/verifyCloudDeployment\(identityEnv\)/g)||[]).length,2);
 });
 test('failure acceptance uses signed backend controls with explicit cleanup and real stop refusal',()=>{
     const helper=source.slice(source.indexOf('  const fault = async'),source.indexOf('  const selected = await'));

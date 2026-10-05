@@ -596,6 +596,7 @@ jobs:
         timeout-minutes: 25
         env:
           EZIL_E2E_APP: https://os.ezil.org
+          EZIL_CONTINUITY_IDENTITY_APP: ${{ steps.app.outputs.url }}
           EZIL_CONTINUITY_MODE: essential
           EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
           EZIL_E2E_WORKSPACE_PATH: ${{ vars.EZIL_E2E_WORKSPACE_PATH }}

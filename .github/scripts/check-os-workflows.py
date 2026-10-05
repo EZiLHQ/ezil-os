@@ -81,6 +81,7 @@ for name in ('Test the returned production URL', 'Test the canonical production 
     assert 'prod-lifecycle' in production[positions[name]]['run']
 assert 'Hosted production persistence verification' in positions
 assert production[positions['Hosted production persistence verification']]['env']['EZIL_E2E_APP'] == 'https://os.ezil.org'
+assert production[positions['Hosted production persistence verification']]['env']['EZIL_CONTINUITY_IDENTITY_APP'] == '${{ steps.app.outputs.url }}'
 production_config = production[positions['Validate production configuration']]
 for key in ('EZIL_E2E_COMPUTER_ID', 'EZIL_E2E_WORKSPACE_PATH', 'EZIL_E2E_R2_BUCKET', 'EZIL_E2E_R2_PREFIX'):
     assert key in production_config['env'] and key in production_config['run']
@@ -90,5 +91,5 @@ assert "required('EZIL_E2E_COMPUTER_ID')" in suite
 assert "36 * 60000" in suite and "30 * 60000" in suite
 assert "'/api/shell/stop'" in suite and 'stopped.ok && stopped.terminated' in suite
 assert 'framesDecoded' in suite and 'bytesReceived' in suite and "=== 'relay'" in suite
-assert 'verifyCloudDeployment(process.env)' in suite
+assert 'verifyCloudDeployment(identityEnv)' in suite
 print('OS workflows: YAML, shell, JavaScript and release contracts passed')
