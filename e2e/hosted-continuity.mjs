@@ -13,6 +13,7 @@ import { waitForViewerProgress } from './viewer-progress.mjs';
 import { terminalContinuityCommand, assertProcessContinuity, waitForProcessSample } from './process-continuity.mjs';
 import { stopIsolatedComputer } from './isolated-computer.mjs';
 import { verifyEditorShortcut } from './editor-shortcut.mjs';
+import { verifyRelayLifetime } from './relay-lifetime.mjs';
 
 const required = key => { assert.ok(process.env[key], `Missing prerequisite: ${key}`); return process.env[key]; };
 const hash = value => createHash('sha256').update(String(value)).digest('hex');
@@ -294,14 +295,10 @@ try {
   await verifyProcesses(); phase('shared Browser Code terminal continuity');
   await launch('desktop');
   const lifetime = mode === 'full' ? 36 * 60000 : mode === 'short' ? 6 * 60000 : 0;
-  const until = Date.now() + lifetime;
-  let renewed = false;
-  while (Date.now() < until) {
-    await wait(Math.min(30000, until - Date.now())); await live();
-    const current = await relay(); assert.equal(current.runtimeId, firstRelay.runtimeId, 'Renewal replaced runtime');
-    renewed ||= current.expiresAt > firstRelay.expiresAt;
-  }
-  if (lifetime) assert.ok(renewed, 'Automatic credential renewal did not occur');
+  if (lifetime) evidence.sessionHold = await verifyRelayLifetime({
+    durationMs: lifetime, expectedRuntimeId: firstRelay.runtimeId,
+    readRelay: relay, verifyViewer: live, sleep: wait,
+  });
   await context.setOffline(true); await wait(3000); await context.setOffline(false); await live(); phase('renewal and reconnect');
   await verifyProcesses();
   evidence.processContinuity = { initialIdentityHash: hash(JSON.stringify(initialProcesses)),

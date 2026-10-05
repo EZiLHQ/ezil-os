@@ -97,8 +97,11 @@ cannot establish live credentials, quotas, registry access or rollout behavior.
 
 Relevant PRs run the short hosted continuity suite with five-minute TURN
 credentials. Main requires the full suite before production: active video for
-36 minutes with the production 30-minute TURN lifetime, real checkpoint/stop/reopen,
-and editor returns after 10 and 30 minutes. The suite has a 90-minute limit and holds the existing staging lease;
+36 minutes with the production 30-minute TURN lifetime and a new expiry increase
+during that hold. Renewals from earlier interruption
+scenarios cannot satisfy the hold; received frames and the original runtime
+identity must persist throughout it. The suite also verifies real checkpoint,
+stop/reopen and editor returns after 10 and 30 minutes. The suite has a 90-minute limit and holds the existing staging lease;
 its AWS role coordinates that lease only. Execution uses GitHub-hosted runners.
 Missing prerequisites and skipped acceptance are failures.
 

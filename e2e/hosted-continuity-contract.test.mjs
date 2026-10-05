@@ -79,3 +79,10 @@ test('every persistence reopen verifies the restored shortcut with automatic sav
     assert.ok(verification.includes("command(f, 'File: Revert File')"));
     assert.ok(verification.includes('hash(persistedMarker)'));
 });
+test('long session acceptance requires a renewal after earlier recovery scenarios',()=>{
+    assert.ok(source.includes('evidence.sessionHold = await verifyRelayLifetime'));
+    assert.ok(source.includes('durationMs: lifetime, expectedRuntimeId: firstRelay.runtimeId'));
+    assert.ok(source.includes('readRelay: relay, verifyViewer: live'));
+    assert.ok(source.indexOf('verifyRelayLifetime({') > source.indexOf("phase('network recovery')"));
+    assert.ok(source.indexOf('verifyRelayLifetime({') < source.indexOf("phase('renewal and reconnect')"));
+});

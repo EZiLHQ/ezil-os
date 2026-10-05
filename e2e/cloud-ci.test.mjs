@@ -10,6 +10,7 @@ import './process-continuity.test.mjs';
 import './isolated-computer.test.mjs';
 import './cleanup-hosted-computer.test.mjs';
 import './editor-shortcut.test.mjs';
+import './relay-lifetime.test.mjs';
 import { deployedTarget, configureAppContext, APP_FETCH_TIMEOUT_MS, APP_STOP_FETCH_TIMEOUT_MS, appFetchTimeout } from './deployed-target.mjs';
 import { assertVercelDeployment, assertWorkerDeployment, verifyCloudDeployment } from './verify-cloud-deployment.mjs';
 
