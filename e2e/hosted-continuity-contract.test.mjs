@@ -1,8 +1,28 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 const source=readFileSync(new URL('./hosted-continuity.mjs',import.meta.url),'utf8');
+test('missing isolated computer exits nonzero and names the prerequisite before cloud access',()=>{
+    const directory=mkdtempSync(join(tmpdir(),'ezil-missing-prerequisite-'));
+    try {
+        const env={...process.env,EZIL_E2E_APP:'https://os.ezil.org',EZIL_CONTINUITY_MODE:'short'};
+        delete env.EZIL_E2E_COMPUTER_ID;
+        const result=spawnSync(process.execPath,[fileURLToPath(new URL('./hosted-continuity.mjs',import.meta.url))],{
+            cwd:directory,env,encoding:'utf8',timeout:10000,
+        });
+        assert.equal(result.status,1);
+        const evidence=JSON.parse(readFileSync(join(directory,'hosted-continuity-evidence/short.json'),'utf8'));
+        assert.equal(evidence.ok,false);
+        assert.equal(evidence.missingPrerequisite,'EZIL_E2E_COMPUTER_ID');
+        assert.equal(evidence.failedPhase,'setup');
+        assert.equal('deployment' in evidence,false);
+    } finally { rmSync(directory,{recursive:true,force:true}); }
+});
 test('hosted telemetry artifact whitelists current navigation counters and enums',()=>{
     const script=source.match(/const continuityInit = (\(\) => \{[\s\S]*?)\n  };\n  await context.addInitScript/)[1]+'\n}';
     let listener;

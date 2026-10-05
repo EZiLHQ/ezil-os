@@ -325,7 +325,7 @@ try {
   // Exception messages from browser drivers can include URLs/headers. Publish a
   // fixed failure and keep all diagnostics restricted to whitelisted evidence.
   evidence.ok = false; evidence.failure = 'hosted_continuity_acceptance_failed';
-  const missing = String(error?.message).match(/^Missing prerequisite: ([A-Z_]+)$/);
+  const missing = String(error?.message).match(/^Missing prerequisite: ([A-Z0-9_]+)$/);
   if (missing) evidence.missingPrerequisite = missing[1];
   evidence.failedPhase = evidence.phases.at(-1)?.name || 'setup';
   console.error('FAIL hosted continuity: prerequisite or assertion failed');
