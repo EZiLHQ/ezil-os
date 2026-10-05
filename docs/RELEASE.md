@@ -102,6 +102,13 @@ and editor returns after 10 and 30 minutes. The suite has a 90-minute limit and 
 its AWS role coordinates that lease only. Execution uses GitHub-hosted runners.
 Missing prerequisites and skipped acceptance are failures.
 
+The continuity suite first confirms the isolated computer is stopped, then opens
+Browser before Code so cold-start frame delivery is tested. Failed checkpoint
+tests compare the committed R2 manifest before and after the rejected stop;
+unavailable TURN must produce a visible Retry state and recover after clearing
+the staging fault. Stop forwarding allows up to 270 seconds for editor capture,
+workspace/system checkpoints and confirmed shutdown within the 300-second route.
+
 Configure each GitHub environment with an explicitly approved isolated
 `EZIL_E2E_COMPUTER_ID` secret, an absolute `EZIL_E2E_WORKSPACE_PATH` variable,
 `EZIL_E2E_R2_BUCKET` variable and exact `EZIL_E2E_R2_PREFIX` secret. The suite

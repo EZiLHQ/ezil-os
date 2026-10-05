@@ -99,6 +99,11 @@ const SANDBOX_COLD_START_TIMEOUT_MS = WORKER_DESKTOP_READY_TIMEOUT_MS + CLIENT_T
  */
 export const SANDBOX_WAKE_ANSWER_BUDGET_MS = 12_000;
 
+// Stop includes atomic editor capture, workspace/system checkpoints and
+// confirmed teardown. Keep the forwarding budget within the 300s shell route
+// ceiling; the previous 10s timeout cut healthy persistence work off mid-stop.
+export const SANDBOX_STOP_TIMEOUT_MS = 270_000;
+
 /** The race sentinel. A unique object, so nothing off the wire can impersonate it. */
 const WAKE_STILL_RUNNING = Symbol('sandbox_wake_still_running');
 
@@ -683,7 +688,7 @@ export async function requestGuacamoleSandboxTerminate(
         const res = await fetch(`${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}`, {
             method: 'DELETE',
             headers: { Authorization: `Bearer ${token}`, [CORRELATION_HEADER]: correlationId },
-            signal: AbortSignal.timeout(10_000),
+            signal: AbortSignal.timeout(SANDBOX_STOP_TIMEOUT_MS),
         });
 
         // The Worker answers `still_running`/`destroy_failed` as HTTP 500 (see

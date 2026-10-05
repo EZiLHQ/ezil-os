@@ -59,4 +59,15 @@ test('failure acceptance uses signed backend controls with explicit cleanup and 
     assert.ok(source.includes("finally {await fault('clear');}"));
     assert.ok(source.includes("failedStop.terminated,false"));
     assert.ok(source.includes("Failed checkpoint replaced active runtime"));
+    assert.ok(source.includes("failedStop.outcome,'flush_failed'"));
+    assert.ok(source.includes('assert.deepEqual(afterFailedWrite, beforeFailedWrite'));
+    assert.ok(source.indexOf("await fault('checkpoint_write_failed')") < source.indexOf("const beforeFailedWrite = readCommittedCheckpoint()"));
+    assert.ok(source.includes("TURN failure Retry state"));
+    assert.ok(source.includes("evidence.turnFailureRetry = true"));
+});
+test('cold Browser acceptance proves stopped compute and delivers frames before opening Code',()=>{
+    assert.ok(source.includes("confirmCold.outcome === 'not_running' && confirmCold.terminated === false"));
+    assert.ok(source.indexOf("await launch('desktop'); await live(225000)") < source.indexOf('let f = await openCode()'));
+    assert.ok(source.includes('evidence.coldOpenMs = Date.now() - coldStartedAt'));
+    assert.ok(source.includes('Warm Browser open replaced runtime'));
 });

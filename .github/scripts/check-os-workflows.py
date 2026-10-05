@@ -115,5 +115,8 @@ assert 'framesDecoded' in suite and 'bytesReceived' in suite and 'waitForViewerP
 assert 'waitForDesktopResize(page, resizeObserver)' in suite
 assert 'assertProcessContinuity(initialProcesses, current)' in suite
 assert 'terminalContinuityCommand(processNonce)' in suite
+assert suite.index('cold Browser open before Code') < suite.index('let f = await openCode()')
+assert 'Failed checkpoint changed the durable committed head' in suite
+assert 'TURN failure Retry state' in suite
 assert 'verifyCloudDeployment(identityEnv)' in suite
 print('OS workflows: YAML, shell, JavaScript and release contracts passed')

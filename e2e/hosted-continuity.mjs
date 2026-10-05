@@ -129,6 +129,49 @@ try {
     await page.evaluate(async app => { const payload = window.ezil.session.payload(); await window.ezil.registry.launch(app, { payload, computer: payload.computer, desktopState: payload.desktopState }); }, app);
   };
   const close = app => page.evaluate(app => window.$(`.window[data-app="${app}"]`).close(), app);
+  const relay = () => api(`/api/shell/relay-refresh?computerId=${encodeURIComponent(computerId)}`);
+  const sample = async () => {
+    await page.evaluate(() => { const f = document.querySelector('.window[data-app="desktop"] iframe'); if (f) f.contentWindow.postMessage({ source: 'ezil-shell', type: 'viewer_probe', attempt: new URL(f.src).searchParams.get('ezilAttempt') }, new URL(f.src).origin); });
+    return page.evaluate(() => window.__continuityVitals.at(-1));
+  };
+  let fallback = false;
+  const live = async (timeoutMs = 60000) => {
+    const afterSequence = await page.evaluate(() => window.__continuitySequence);
+    const s = await waitForViewerProgress({ sample, afterSequence, fallback, timeoutMs });
+    evidence.samples.push(s); return s;
+  };
+  // Previous staging suites can leave this isolated computer warm. Establish
+  // the stopped state before Browser is the first app to request a new runtime.
+  const prepareCold = await api('/api/shell/stop', { computerId });
+  assert.ok(prepareCold.ok && ['destroyed','not_running'].includes(prepareCold.outcome), 'Cold-start setup failed');
+  const confirmCold = await api('/api/shell/stop', { computerId });
+  assert.ok(confirmCold.ok && confirmCold.outcome === 'not_running' && confirmCold.terminated === false, 'Computer did not remain stopped before cold Browser launch');
+  const coldStartedAt = Date.now();
+  await launch('desktop'); await live(225000);
+  const firstRelay = await relay();
+  assert.ok(firstRelay.ok && firstRelay.runtimeId && firstRelay.expiresAt, 'Relay identity unavailable');
+  if (mode === 'short') assert.ok(firstRelay.expiresAt - Date.now() <= 305000, 'Short gate requires supported five-minute TURN credentials');
+  if (mode === 'full') assert.ok(firstRelay.expiresAt - Date.now() > 1200000 && firstRelay.expiresAt - Date.now() <= 1805000, 'Full release gate requires production thirty-minute TURN credentials');
+  evidence.runtimeHash = hash(firstRelay.runtimeId);
+  evidence.coldOpenMs = Date.now() - coldStartedAt;
+  phase('default TURN cold Browser open before Code');
+  const checkpointKey = `${r2Prefix.replace(/^\/+|\/+$/g, '')}/.ezil-snapshots/latest.json`;
+  const readCommittedCheckpoint = () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ezil-checkpoint-'));
+    try {
+      const file = join(directory, 'head.json');
+      execFileSync(required('EZIL_WRANGLER_BIN'), ['r2','object','get',`${required('EZIL_E2E_R2_BUCKET')}/${checkpointKey}`,'--remote','--file',file], {
+        stdio: 'pipe', timeout: 30000, env: process.env,
+      });
+      const raw = readFileSync(file);
+      assert.ok(raw.length <= 128 * 1024, 'Checkpoint manifest exceeds bound');
+      const checkpoint = JSON.parse(raw.toString('utf8'));
+      assert.equal(checkpoint.version, 1, 'Durable checkpoint format invalid');
+      assert.match(checkpoint.sha256, /^[a-f0-9]{64}$/);
+      assert.ok(Array.isArray(checkpoint.chunks) && checkpoint.chunks.length, 'Durable checkpoint chunks missing');
+      return { sha256: checkpoint.sha256, manifestHash: hash(JSON.stringify(checkpoint)), chunks: checkpoint.chunks.length };
+    } finally { rmSync(directory,{recursive:true,force:true}); }
+  };
   const code = () => page.frames().find(f => /-code\./.test(f.url()));
   const openCode = async () => { await launch('code'); return bounded('Code workbench', async () => { const f = code(); return f && await f.locator('.monaco-workbench').count() ? f : null; }); };
   const command = async (f, text) => {
@@ -195,22 +238,9 @@ try {
     assertProcessContinuity(initialProcesses, current);
     latestProcesses = current;
   };
-  const relay = () => api(`/api/shell/relay-refresh?computerId=${encodeURIComponent(computerId)}`);
   await launch('desktop');
-  const sample = async () => {
-    await page.evaluate(() => { const f = document.querySelector('.window[data-app="desktop"] iframe'); if (f) f.contentWindow.postMessage({ source: 'ezil-shell', type: 'viewer_probe', attempt: new URL(f.src).searchParams.get('ezilAttempt') }, new URL(f.src).origin); });
-    return page.evaluate(() => window.__continuityVitals.at(-1));
-  };
-  let fallback = false;
-  const live = async () => {
-    const afterSequence = await page.evaluate(() => window.__continuitySequence);
-    const s = await waitForViewerProgress({ sample, afterSequence, fallback });
-    evidence.samples.push(s); return s;
-  };
-  await live(); const firstRelay = await relay(); assert.ok(firstRelay.ok && firstRelay.runtimeId && firstRelay.expiresAt, 'Relay identity unavailable');
-  if (mode === 'short') assert.ok(firstRelay.expiresAt - Date.now() <= 305000, 'Short gate requires supported five-minute TURN credentials');
-  if (mode === 'full') assert.ok(firstRelay.expiresAt - Date.now() > 1200000 && firstRelay.expiresAt - Date.now() <= 1805000, 'Full release gate requires production thirty-minute TURN credentials');
-  evidence.runtimeHash = hash(firstRelay.runtimeId); phase('default TURN cold open');
+  await live(); assert.equal((await relay()).runtimeId, firstRelay.runtimeId, 'Warm Browser open replaced runtime');
+  phase('default TURN warm Browser open');
   await waitForDesktopResize(page, resizeObserver);
   const initialDisplay = (await readDesktopReadiness(page)).video;
   const videoFrame = () => page.frames().find(f => /nekodesktop/.test(f.url()));
@@ -272,38 +302,42 @@ try {
       const failure = await api('/api/shell/relay-refresh',{computerId,runtimeId:firstRelay.runtimeId});
       assert.equal(failure.ok,false,'Unavailable real TURN incorrectly passed refresh');
       assert.equal(failure.error,'turn_unavailable','TURN fault did not reach real renewal backend');
+      // Exercise the viewer's actual reconnect path while the backend is still
+      // unavailable. An API failure alone cannot establish bounded UI recovery.
+      await page.evaluate(() => window.dispatchEvent(new Event('online')));
+      await bounded('TURN failure Retry state', async () => {
+        const win = page.locator('.window[data-app="desktop"]');
+        return await win.getAttribute('data-relay-state') === 'error'
+          && await win.locator('.ezil-boot-retry:visible').first().isVisible();
+      }, 45000);
+      evidence.turnFailureRetry = true;
     } finally {await fault('clear');}
+    await page.locator('.window[data-app="desktop"] .ezil-boot-retry:visible').first().click();
     await live(); phase('unavailable TURN explicit failure and recovery');
-    // Force changed bytes so checkpoint cannot reuse an unchanged generation.
-    await command(f,'Preferences: Open User Settings (JSON)');
-    await setDocument(f,settings + '// force durable checkpoint failure boundary\n');
     try {
+      await fault('checkpoint_write_failed');
+      const beforeFailedWrite = readCommittedCheckpoint();
+      // Force changed bytes while writes are blocked, preventing periodic
+      // checkpoints from committing the edit before the stop fault is tested.
+      await command(f,'Preferences: Open User Settings (JSON)');
+      await setDocument(f,settings + '// force durable checkpoint failure boundary\n');
       await fault('checkpoint_write_failed');
       const failedStop=await api('/api/shell/stop',{computerId});
       assert.equal(failedStop.ok,false,'Failed durable write incorrectly passed final stop');
+      assert.equal(failedStop.outcome,'flush_failed','Stop failure did not reach real checkpoint backend');
       assert.equal(failedStop.terminated,false,'Checkpoint failure stopped the runtime');
       assert.equal((await relay()).runtimeId,firstRelay.runtimeId,'Failed checkpoint replaced active runtime');
+      const afterFailedWrite = readCommittedCheckpoint();
+      assert.deepEqual(afterFailedWrite, beforeFailedWrite, 'Failed checkpoint changed the durable committed head');
+      evidence.failedCheckpoint = { preserved: true, ...afterFailedWrite };
     } finally {await fault('clear');}
     phase('checkpoint write failure refuses stop');
   }
   await close('desktop'); await close('code');
   const stopped = await api('/api/shell/stop', { computerId }); assert.ok(stopped.ok && stopped.terminated, 'Final checkpoint/real stop failed');
-  const checkpointKey = `${required('EZIL_E2E_R2_PREFIX').replace(/^\/+|\/+$/g, '')}/.ezil-snapshots/latest.json`;
   // Wrangler's supported R2 object read downloads only this committed head.
   // Capture subprocess output privately; CLI errors may contain object paths.
-  const checkpointDir = mkdtempSync(join(tmpdir(), 'ezil-checkpoint-'));
-  let checkpoint;
-  try {
-    const checkpointFile = join(checkpointDir, 'head.json');
-    execFileSync(required('EZIL_WRANGLER_BIN'), ['r2','object','get',`${required('EZIL_E2E_R2_BUCKET')}/${checkpointKey}`,'--remote','--file',checkpointFile], {
-      stdio: 'pipe', timeout: 30000, env: process.env,
-    });
-    checkpoint = JSON.parse(readFileSync(checkpointFile,'utf8'));
-  } finally { rmSync(checkpointDir,{recursive:true,force:true}); }
-  assert.equal(checkpoint.version, 1, 'Durable checkpoint format invalid');
-  assert.match(checkpoint.sha256, /^[a-f0-9]{64}$/);
-  assert.ok(Array.isArray(checkpoint.chunks) && checkpoint.chunks.length, 'Durable checkpoint chunks missing');
-  evidence.durableCheckpoint = { sha256: checkpoint.sha256, manifestHash: hash(JSON.stringify(checkpoint)), chunks: checkpoint.chunks.length };
+  evidence.durableCheckpoint = readCommittedCheckpoint();
   phase('final checkpoint and stop');
   if (mode === 'full') await wait(10 * 60000);
   await verifyEditor(); await launch('desktop'); await live();
@@ -333,7 +367,7 @@ try {
   assert.notEqual((await relay()).runtimeId, replaced.runtimeId, 'Stale recovery did not open a replacement runtime');
   await verifyEditor();
   for (const frame of page.frames()) {
-    const text = await frame.locator('body').innerText().catch(() => '');
+    const text = await frame.locator('body').innerText({ timeout: 10000 });
     assert.ok(!text.includes('STALE_PREVIEW_URL'), 'Stale navigation exposed raw JSON');
   }
   phase('stale navigation recovery');

@@ -24,6 +24,7 @@ import {
     requestGuacamoleSandboxTerminate,
     resetNekoAdminTokenCacheForTests,
     SANDBOX_WAKE_ANSWER_BUDGET_MS,
+    SANDBOX_STOP_TIMEOUT_MS,
     type CloudflareGuacamoleConfig,
     type GuacamolePreviewError,
     type GuacamolePreviewErrorCode,
@@ -428,6 +429,46 @@ describe('🔴 previewError refuses to build an unlabelled failure', () => {
 });
 
 describe('requestGuacamoleSandboxTerminate — the regression: an unsigned, unchecked DELETE that lied', () => {
+    it('waits for a checkpoint taking longer than the old ten-second transport deadline', async () => {
+        vi.useFakeTimers();
+        const timeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation(ms => {
+            const controller = new AbortController();
+            setTimeout(() => controller.abort(new DOMException('Timed out', 'TimeoutError')), ms);
+            return controller.signal;
+        });
+        try {
+            let signal: AbortSignal | null | undefined;
+            vi.stubGlobal('fetch', vi.fn(async (_url, init: RequestInit) => {
+                signal = init.signal;
+                return new Promise<Response>((resolve, reject) => {
+                    signal?.addEventListener('abort', () => reject(signal?.reason), { once: true });
+                    setTimeout(() => resolve(new Response(JSON.stringify({ ok:true, terminated:true, outcome:'destroyed' }))), 15000);
+                });
+            }));
+            const result = requestGuacamoleSandboxTerminate(CONFIG, 'secret', 'guac-u-c');
+            await vi.advanceTimersByTimeAsync(15000);
+            expect((await result).terminated).toBe(true);
+            expect(signal?.aborted).toBe(false);
+            expect(SANDBOX_STOP_TIMEOUT_MS).toBeGreaterThan(120000);
+            expect(SANDBOX_STOP_TIMEOUT_MS).toBeLessThan(300000);
+        } finally { timeout.mockRestore(); vi.useRealTimers(); }
+    });
+    it('a hung checkpoint reaches the bounded stop deadline and cannot claim termination', async () => {
+        vi.useFakeTimers();
+        const timeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation(ms => {
+            const controller = new AbortController();
+            setTimeout(() => controller.abort(new DOMException('Timed out', 'TimeoutError')), ms);
+            return controller.signal;
+        });
+        try {
+            vi.stubGlobal('fetch', vi.fn(async (_url, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+                init.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once:true });
+            })));
+            const result = requestGuacamoleSandboxTerminate(CONFIG, 'secret', 'guac-u-c');
+            await vi.advanceTimersByTimeAsync(300000);
+            expect(await result).toMatchObject({ok:false,terminated:false});
+        } finally { timeout.mockRestore(); vi.useRealTimers(); }
+    });
     it('signs the request the same way as /sandbox/preview, as Authorization: Bearer', async () => {
         const fetchSpy = stubWorkerResponse(
             200,
