@@ -8,6 +8,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { APP, configureAppContext } from './deployed-target.mjs';
 import { verifyCloudDeployment } from './verify-cloud-deployment.mjs';
+import { observeScreenResizes, readDesktopReadiness, waitForDesktopResize } from './desktop-resize-ready.mjs';
+import { waitForViewerProgress } from './viewer-progress.mjs';
 
 const required = key => { assert.ok(process.env[key], `Missing prerequisite: ${key}`); return process.env[key]; };
 const hash = value => createHash('sha256').update(String(value)).digest('hex');
@@ -15,7 +17,7 @@ const evidence = { phases: [], samples: [] };
 // Drive the canonical host while verifying its immutable Vercel deployment.
 // verifyCloudDeployment also checks both production aliases against that ID.
 const identityEnv = { ...process.env, EZIL_E2E_APP: process.env.EZIL_CONTINUITY_IDENTITY_APP || APP };
-let browser, context, page, beforeIdentity, computerId;
+let browser, context, page, beforeIdentity, computerId, resizeObserver;
 const started = Date.now();
 const phase = name => evidence.phases.push({ name, elapsedMs: Date.now() - started });
 const wait = ms => page.waitForTimeout(ms);
@@ -56,6 +58,7 @@ try {
   await configureAppContext(context);
   const continuityInit = () => {
     window.__continuityVitals = [];
+    window.__continuitySequence = 0;
     window.addEventListener('message', e => {
       const frame = document.querySelector('.window[data-app="desktop"] iframe');
       if (!frame || e.source !== frame.contentWindow || e.origin !== new URL(frame.src).origin) return;
@@ -64,7 +67,7 @@ try {
       const raw = e.data.vitals;
       if (!raw || typeof raw !== 'object') return;
       // Only public transport counters/enums; never arbitrary client payload.
-      const safe = {};
+      const safe = { sequence: ++window.__continuitySequence, receivedAt: Date.now() };
       for (const key of ['bytesReceived', 'framesDecoded', 'width', 'height']) {
         if (Number.isFinite(raw[key]) && raw[key] >= 0) safe[key] = raw[key];
       }
@@ -78,6 +81,7 @@ try {
   };
   await context.addInitScript(continuityInit);
   page = await context.newPage();
+  resizeObserver = observeScreenResizes(page, APP);
   await page.goto(`${APP}/login?method=email`);
   await page.fill('#email', required('EZIL_E2E_EMAIL')); await page.fill('#password', required('EZIL_E2E_PASSWORD'));
   await Promise.all([page.waitForURL(url => !url.pathname.includes('/login'), { timeout: 60000 }), page.locator('form').filter({ has: page.locator('#email') }).locator('button[type=submit]').click()]);
@@ -176,19 +180,16 @@ try {
   };
   let fallback = false;
   const live = async () => {
-    const initial = await bounded('current viewer statistics', sample);
-    return bounded('TURN decoded frame progression', async () => {
-      const s = await sample(); if (!s || s.bytesReceived <= initial.bytesReceived || s.framesDecoded <= initial.framesDecoded || s.connectionState !== 'connected') return null;
-      assert.ok(s.localCandidateType === 'relay' || s.remoteCandidateType === 'relay', 'Selected ICE pair does not use TURN');
-      assert.ok(['udp','tcp','tls'].includes(s.relayProtocol), 'Selected TURN protocol missing');
-      if (fallback) assert.ok(['tcp','tls'].includes(s.relayProtocol), 'UDP unavailable test did not select TCP/TLS TURN');
-      evidence.samples.push(s); return s;
-    });
+    const afterSequence = await page.evaluate(() => window.__continuitySequence);
+    const s = await waitForViewerProgress({ sample, afterSequence, fallback });
+    evidence.samples.push(s); return s;
   };
   await live(); const firstRelay = await relay(); assert.ok(firstRelay.ok && firstRelay.runtimeId && firstRelay.expiresAt, 'Relay identity unavailable');
   if (mode === 'short') assert.ok(firstRelay.expiresAt - Date.now() <= 305000, 'Short gate requires supported five-minute TURN credentials');
   if (mode === 'full') assert.ok(firstRelay.expiresAt - Date.now() > 1200000 && firstRelay.expiresAt - Date.now() <= 1805000, 'Full release gate requires production thirty-minute TURN credentials');
   evidence.runtimeHash = hash(firstRelay.runtimeId); phase('default TURN cold open');
+  await waitForDesktopResize(page, resizeObserver);
+  const initialDisplay = (await readDesktopReadiness(page)).video;
   const videoFrame = () => page.frames().find(f => /nekodesktop/.test(f.url()));
   const inputBefore = hash(await videoFrame().locator('video').screenshot());
   const uniqueHeading = `continuity-input-${Date.now()}`;
@@ -207,7 +208,11 @@ try {
   await page.mouse.wheel(0, 300); await wait(1500);
   const scrolledFrameHash = hash(await videoFrame().locator('video').screenshot());
   assert.notEqual(scrolledFrameHash, typedFrameHash, 'Scrolling produced no visible response');
-  await page.setViewportSize({ width: 1280, height: 800 }); await live();
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await waitForDesktopResize(page, resizeObserver); await live();
+  const resizedDisplay = (await readDesktopReadiness(page)).video;
+  assert.ok(resizedDisplay.width !== initialDisplay.width || resizedDisplay.height !== initialDisplay.height, 'Viewport resize did not change decoded display dimensions');
+  evidence.display = { initial: initialDisplay, resized: resizedDisplay };
   assert.notEqual(hash(await videoFrame().locator('video').screenshot()), inputBefore, 'Browser inputs produced no visible response');
   // Chrome's streamed pixels must contain a deterministic changed page.
   // A screenshot change alone is supporting evidence, not a DOM assertion.
@@ -306,12 +311,14 @@ try {
   }
   await close('desktop');
   const storageState = await context.storageState();
+  resizeObserver.dispose();
   await context.close(); await browser.close();
   browser = await chromium.launch({ args: [...launchArgs, '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'] });
   context = await browser.newContext({ viewport: {width:1280,height:800}, storageState });
   await configureAppContext(context);
   await context.addInitScript('(' + continuityInit.toString() + ')()');
   page = await context.newPage(); await page.goto(`${APP}/os`);
+  resizeObserver = observeScreenResizes(page, APP);
   await bounded('fallback session ready', () => page.evaluate(() => !!window.ezil?.session?.payload?.()?.computer));
   assert.equal(await page.evaluate(() => window.ezil.session.payload().computer.id), computerId, 'Fallback selects another computer');
   fallback = true; await launch('desktop'); await live(); phase('UDP unavailable TCP/TLS fallback');
@@ -331,6 +338,7 @@ try {
   console.error('FAIL hosted continuity: prerequisite or assertion failed');
   process.exitCode = 1;
 } finally {
+  resizeObserver?.dispose();
   if (page && computerId) {
     try {
       const selected = await page.evaluate(() => window.ezil?.session?.payload?.()?.computer?.id);

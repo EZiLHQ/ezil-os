@@ -111,6 +111,7 @@ assert 'SKIP' not in suite
 assert "required('EZIL_E2E_COMPUTER_ID')" in suite
 assert "36 * 60000" in suite and "30 * 60000" in suite
 assert "'/api/shell/stop'" in suite and 'stopped.ok && stopped.terminated' in suite
-assert 'framesDecoded' in suite and 'bytesReceived' in suite and "=== 'relay'" in suite
+assert 'framesDecoded' in suite and 'bytesReceived' in suite and 'waitForViewerProgress' in suite
+assert 'waitForDesktopResize(page, resizeObserver)' in suite
 assert 'verifyCloudDeployment(identityEnv)' in suite
 print('OS workflows: YAML, shell, JavaScript and release contracts passed')
