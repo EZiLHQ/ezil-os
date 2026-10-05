@@ -208,7 +208,7 @@ try {
   let f = await openCode();
   await command(f, 'Preferences: Open User Settings (JSON)'); await setDocument(f, settings); await verifyDarkTheme(f);
   await command(f, 'Preferences: Open Keyboard Shortcuts (JSON)'); await setDocument(f, bindings);
-  await command(f, 'File: New Text File');
+  await command(f, 'File: New Untitled Text File');
   await f.locator('.monaco-editor:visible textarea').last().focus(); await page.keyboard.insertText(markerText);
   await page.keyboard.press('Control+Shift+S');
   const savePath = f.locator('.quick-input-widget input'); await savePath.fill(`${workspace}/${marker}`); await page.keyboard.press('Enter'); await wait(2000);
