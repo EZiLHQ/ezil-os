@@ -77,7 +77,8 @@ positions = {s.get('name'): i for i, s in enumerate(production)}
 for job_name, lease_name in (('preview', 'lease'), ('production', 'production_lease')):
     steps = jobs[job_name]['steps']
     cleanup = next(step for step in steps if step.get('name') == f'Stop isolated {"staging" if job_name == "preview" else "production"} test computer')
-    assert cleanup['if'] == f"always() && steps.{lease_name}.outcome == 'success'"
+    suffix = " && needs.trust.outputs.manual_preview != 'true'" if job_name == 'preview' else ''
+    assert cleanup['if'] == f"always() && steps.{lease_name}.outcome == 'success'" + suffix
     assert cleanup['run'] == 'node e2e/cleanup-hosted-computer.mjs'
     assert cleanup['timeout-minutes'] == 7
     assert steps.index(cleanup) < next(i for i, step in enumerate(steps) if step.get('name', '').startswith('Release shared'))
@@ -111,6 +112,9 @@ assert all(step['with']['role-duration-seconds'] == 7200 for step in lease_crede
 renew_index = next(i for i, step in enumerate(preview_steps) if step.get('name') == 'Renew staging lease credentials before long acceptance')
 assert preview_steps[renew_index + 1]['name'] == 'Hosted continuity release gate'
 assert 'SANDBOX_NEKO_TURN_TTL_SECONDS' in preview
+assert continuity['if'] == "needs.trust.outputs.manual_preview != 'true'"
+assert next(step for step in preview_steps if step.get('name') == 'Test the returned preview URL')['if'] == continuity['if']
+assert next(step for step in preview_steps if step.get('name') == 'Verify and record manual preview')['run'].endswith('node .github/scripts/record-manual-preview.mjs\n')
 assert any('test-editor-state-linux.sh' in step.get('run', '') for step in workflows['ci']['jobs']['worker']['steps'])
 for name in ('Test the returned production URL', 'Test the canonical production URL'):
     assert 'prod-lifecycle' in production[positions[name]]['run']

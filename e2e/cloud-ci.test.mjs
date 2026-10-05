@@ -353,15 +353,18 @@ test('rollback workflow keeps ownership admission and readback around the scoped
 const admissionSource = workflowText.split('          script: |\n')[1].split('\n  preview:')[0]
   .split('\n').filter(line => line.startsWith('            ')).map(line => line.slice(12)).join('\n');
 const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
-async function admission({ event='workflow_dispatch', current=sha, conclusion='success', eventSha=sha, path='.github/workflows/ci.yml' } = {}) {
+async function admission({ event='workflow_dispatch', current=sha, conclusion='success', eventSha=sha, path='.github/workflows/ci.yml', previewPR='', prPatch={}, changedPR=false, ciPatch={} } = {}) {
   const outputs = {}, failures = [];
-  const run = {head_sha:eventSha,head_branch:'main',path,head_repository:{full_name:'owner/os'},status:'completed',conclusion,event:'push',workflow_id:1};
+  const run = {head_sha:eventSha,head_branch:'main',path,head_repository:{full_name:'owner/os'},status:'completed',conclusion,event:previewPR?'pull_request':'push',workflow_id:1,...ciPatch};
+  const pr = {state:'open',draft:true,base:{ref:'main',repo:{full_name:'owner/os'}},head:{sha,repo:{full_name:'owner/os'}},...prPatch};
+  let reads = 0;
   const github = {rest:{git:{getRef:async()=>({data:{object:{sha:current}}})},actions:{
     listWorkflowRuns:async()=>({data:{workflow_runs:[run]}}),getWorkflow:async()=>({data:{path}}),
-  }}};
+  },pulls:{get:async()=>({data:changedPR && reads++ > 0 ? {...pr,head:{...pr.head,sha:'b'.repeat(40)}} : pr})}}};
   const core = {setOutput:(k,v)=>outputs[k]=v,warning:()=>{},setFailed:s=>failures.push(s)};
   const context = {repo:{owner:'owner',repo:'os'},eventName:event,payload:{workflow_run:run,repository:{full_name:'owner/os'}}};
-  await new AsyncFunction('github','core','context','process',admissionSource)(github,core,context,{env:{REQUESTED_SOURCE:sha}});
+  await new AsyncFunction('github','core','context','process','setTimeout',admissionSource)(github,core,context,
+    {env:{REQUESTED_SOURCE:sha,PREVIEW_PR:previewPR}}, callback=>callback());
   return {outputs,failures};
 }
 test('manual, tag and automatic admission require tested current main', async () => {
@@ -377,6 +380,63 @@ test('manual, tag and automatic admission require tested current main', async ()
     const wrongWorkflow = await admission({event,path:'.github/workflows/other.yml'});
     assert.equal(wrongWorkflow.outputs.allowed,'false');
   }
+});
+
+test('manual preview admits tested current draft PR without admitting production', async () => {
+  const result = await admission({ previewPR: '186' });
+  assert.equal(result.outputs.allowed, 'true');
+  assert.equal(result.outputs.manual_preview, 'true');
+  assert.equal(result.outputs.preview_pr, '186');
+  assert.equal(result.outputs.production, 'false');
+  assert.equal(result.failures.length, 0);
+});
+test('manual preview rejects invalid PRs, forks, stale source and failed CI', async () => {
+  for (const patch of [{ previewPR:'bad' }, { prPatch:{state:'closed'} },
+    { prPatch:{head:{sha,repo:{full_name:'fork/os'}}} },
+    { prPatch:{head:{sha:'b'.repeat(40),repo:{full_name:'owner/os'}}} },
+    { prPatch:{base:{ref:'other',repo:{full_name:'owner/os'}}} },
+    { conclusion:'failure' }, { changedPR:true }]) {
+    const result = await admission({previewPR:'186',...patch});
+    assert.equal(result.outputs.allowed,'false');
+    assert.equal(result.outputs.production,'false');
+    assert.ok(result.failures.length);
+  }
+});
+test('manual preview ignores a CI run from another repository or event', async () => {
+  for (const ciPatch of [{head_repository:{full_name:'fork/os'}},{event:'push'}]) {
+    const result=await admission({previewPR:'186',ciPatch});
+    assert.equal(result.outputs.allowed,'false');
+    assert.equal(result.outputs.production,'false');
+    assert.match(result.failures[0],/Timed out/);
+  }
+});
+
+const { assertPreviewImage } = await import('../.github/scripts/record-manual-preview.mjs');
+test('manual preview verifies the staged image source and exact tested layers', () => {
+  const image=`registry.cloudflare.com/${env.CLOUDFLARE_ACCOUNT_ID}/staging@sha256:${'d'.repeat(64)}`;
+  const application={name:'ezil-os-worker-staging-sandbox',configuration:{image}};
+  const images={source:sha,tested:true,desktop_digest:`sha256:${'e'.repeat(64)}`};
+  const config={...env,EZIL_WORKER_NAME:'ezil-os-worker-staging'};
+  const local={Config:{Labels:{'org.opencontainers.image.revision':sha}},RootFS:{Layers:['layer-a','layer-b']}};
+  assert.equal(assertPreviewImage(application,images,config,local,local),image);
+  for (const args of [
+    [{...application,name:'ezil-os-worker-sandbox'},images,config,local,local],
+    [application,{...images,tested:false},config,local,local],
+    [application,images,{...config,EZIL_DEPLOY_TARGET:'production'},local,local],
+    [application,images,config,{...local,RootFS:{Layers:['other']}},local],
+    [application,images,config,{...local,Config:{Labels:{'org.opencontainers.image.revision':'b'.repeat(40)}}},local],
+  ]) assert.throws(()=>assertPreviewImage(...args));
+});
+
+test('manual preview does not run disruptive acceptance or authorize its required PR status', () => {
+  const preview=workflowText.split('\n  preview:\n')[1].split('\n  images:\n')[0];
+  for (const name of ['Test the returned preview URL','Hosted continuity release gate']) {
+    assert.match(preview.split(`      - name: ${name}\n`)[1].split('      - name:')[0],
+      /if: needs\.trust\.outputs\.manual_preview != 'true'/);
+  }
+  assert.match(preview.split('      - name: Stop isolated staging test computer\n')[1],
+    /if: always\(\) && steps\.lease\.outcome == 'success' && needs\.trust\.outputs\.manual_preview != 'true'/);
+  assert.match(workflowText,/This run cannot satisfy the Hosted continuity PR gate/);
 });
 
 const { assertRollbackOwner, restoreContainer } = await import('../.github/scripts/release-state.mjs');

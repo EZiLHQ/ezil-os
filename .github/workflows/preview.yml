@@ -26,6 +26,11 @@ on:
         required: true
         type: string
   workflow_dispatch:
+    inputs:
+      preview_pr:
+        description: 'Optional same-repository PR number: create a manual staging preview only'
+        required: false
+        type: string
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -57,6 +62,8 @@ jobs:
       allowed: ${{ steps.source.outputs.allowed }}
       sha: ${{ steps.source.outputs.sha }}
       production: ${{ steps.source.outputs.production }}
+      manual_preview: ${{ steps.source.outputs.manual_preview }}
+      preview_pr: ${{ steps.source.outputs.preview_pr }}
       reason: ${{ steps.source.outputs.reason }}
     steps:
       # No checkout, artifacts, caches, environments or deployment secrets here.
@@ -66,10 +73,12 @@ jobs:
         id: source
         env:
           REQUESTED_SOURCE: ${{ inputs.source || github.sha }}
+          PREVIEW_PR: ${{ inputs.preview_pr }}
         with:
           script: |
             core.setOutput('allowed', 'false');
             core.setOutput('production', 'false');
+            core.setOutput('manual_preview', 'false');
             const deny = reason => {
               core.setOutput('reason', reason);
               core.warning(`No deployment admitted: ${reason}`);
@@ -77,6 +86,41 @@ jobs:
             core.setOutput('reason', 'CI did not qualify: source, event, trust, or current-main check failed');
             const repo = context.repo;
             const fullName = `${repo.owner}/${repo.repo}`;
+            if (context.eventName === 'workflow_dispatch' && process.env.PREVIEW_PR) {
+              const number = Number(process.env.PREVIEW_PR);
+              if (!Number.isSafeInteger(number) || number < 1) { core.setFailed('Invalid preview PR number'); return; }
+              const { data: initial } = await github.rest.pulls.get({ ...repo, pull_number: number });
+              if (initial.state !== 'open' || initial.base.ref !== 'main' ||
+                  initial.base.repo.full_name.toLowerCase() !== fullName.toLowerCase() ||
+                  initial.head.repo?.full_name.toLowerCase() !== fullName.toLowerCase() ||
+                  initial.head.sha !== process.env.REQUESTED_SOURCE) {
+                core.setFailed('Manual preview must use the current head of an open same-repository PR to main'); return;
+              }
+              const sha = initial.head.sha;
+              for (let attempt = 0; attempt < 120; attempt++) {
+                const { data } = await github.rest.actions.listWorkflowRuns({
+                  ...repo, workflow_id: 'ci.yml', head_sha: sha, event: 'pull_request', per_page: 20,
+                });
+                const ci = data.workflow_runs.find(run => run.head_sha === sha && run.path === '.github/workflows/ci.yml' &&
+                  run.event === 'pull_request' && run.head_repository?.full_name.toLowerCase() === fullName.toLowerCase());
+                if (ci?.status === 'completed') {
+                  if (ci.conclusion !== 'success') { core.setFailed(`Manual preview CI concluded ${ci.conclusion}`); return; }
+                  const { data: current } = await github.rest.pulls.get({ ...repo, pull_number: number });
+                  if (current.state !== 'open' || current.head.sha !== sha ||
+                      current.head.repo?.full_name.toLowerCase() !== fullName.toLowerCase()) {
+                    core.setFailed('Manual preview PR changed while awaiting CI'); return;
+                  }
+                  core.setOutput('sha', sha);
+                  core.setOutput('allowed', 'true');
+                  core.setOutput('manual_preview', 'true');
+                  core.setOutput('preview_pr', String(number));
+                  core.setOutput('reason', 'Tested PR admitted for manual staging preview; hosted acceptance remains pending');
+                  return;
+                }
+                await new Promise(resolve => setTimeout(resolve, 20000));
+              }
+              core.setFailed('Timed out waiting for manual preview CI'); return;
+            }
             if (context.eventName === 'workflow_dispatch' || context.eventName === 'push') {
               const sha = process.env.REQUESTED_SOURCE;
               const { data: ref } = await github.rest.git.getRef({ ...repo, ref: 'heads/main' });
@@ -159,6 +203,7 @@ jobs:
       contents: read
       packages: read
       id-token: write
+      pull-requests: read
     outputs:
       url: ${{ steps.app.outputs.url }}
       worker_version: ${{ steps.identity.outputs.worker_version }}
@@ -238,9 +283,14 @@ jobs:
           EZIL_E2E_R2_PREFIX: ${{ secrets.EZIL_E2E_R2_PREFIX }}
           EZIL_ACCEPTANCE_SANDBOX: ${{ secrets.EZIL_ACCEPTANCE_SANDBOX }}
           EZIL_ACCEPTANCE_HMAC_SECRET: ${{ secrets.EZIL_ACCEPTANCE_HMAC_SECRET }}
+          MANUAL_PREVIEW: ${{ needs.trust.outputs.manual_preview }}
         run: |
           set -euo pipefail
-          for key in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID EZIL_E2E_EMAIL EZIL_E2E_PASSWORD EZIL_E2E_COMPUTER_ID EZIL_E2E_WORKSPACE_PATH EZIL_E2E_R2_BUCKET EZIL_E2E_R2_PREFIX EZIL_ACCEPTANCE_SANDBOX EZIL_ACCEPTANCE_HMAC_SECRET; do
+          keys=(CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID)
+          if [[ "$MANUAL_PREVIEW" != true ]]; then
+            keys+=(EZIL_E2E_EMAIL EZIL_E2E_PASSWORD EZIL_E2E_COMPUTER_ID EZIL_E2E_WORKSPACE_PATH EZIL_E2E_R2_BUCKET EZIL_E2E_R2_PREFIX EZIL_ACCEPTANCE_SANDBOX EZIL_ACCEPTANCE_HMAC_SECRET)
+          fi
+          for key in "${keys[@]}"; do
             if [[ -z "${!key}" ]]; then echo "::error::Missing staging secret: $key"; exit 1; fi
           done
           node e2e/verify-cloud-deployment.mjs project
@@ -276,6 +326,18 @@ jobs:
         env:
           LEASE_OWNER: os-${{ github.run_id }}-${{ github.run_attempt }}
         run: python3 .github/scripts/staging-lock.py acquire --owner "$LEASE_OWNER" --ttl 10800 --wait 1200
+      - name: Recheck manual preview PR before deployment
+        if: needs.trust.outputs.manual_preview == 'true'
+        uses: actions/github-script@v8
+        env:
+          PREVIEW_PR: ${{ needs.trust.outputs.preview_pr }}
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: Number(process.env.PREVIEW_PR) });
+            if (pr.state !== 'open' || pr.head.sha !== process.env.EZIL_DEPLOY_SHA ||
+                pr.head.repo?.full_name.toLowerCase() !== `${context.repo.owner}/${context.repo.repo}`.toLowerCase()) {
+              core.setFailed('Manual preview PR changed before deployment');
+            }
       - name: Deploy named staging Worker
         working-directory: worker
         timeout-minutes: 25
@@ -283,12 +345,17 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           EZIL_ACCEPTANCE_SANDBOX: ${{ secrets.EZIL_ACCEPTANCE_SANDBOX }}
+          MANUAL_PREVIEW: ${{ needs.trust.outputs.manual_preview }}
         run: |
           set -euo pipefail
           ttl=300
           if [[ "${{ needs.trust.outputs.production }}" == true ]]; then ttl=1800; fi
-          test -n "$EZIL_ACCEPTANCE_SANDBOX" || { echo '::error::Missing isolated acceptance sandbox'; exit 1; }
-          ./node_modules/.bin/wrangler deploy --env staging --var "SANDBOX_NEKO_TURN_TTL_SECONDS:$ttl" --var "EZIL_ACCEPTANCE_ENV:staging" --var "EZIL_ACCEPTANCE_SANDBOX:$EZIL_ACCEPTANCE_SANDBOX" --message "git:$EZIL_DEPLOY_SHA"
+          fault_args=()
+          if [[ "$MANUAL_PREVIEW" != true ]]; then
+            test -n "$EZIL_ACCEPTANCE_SANDBOX" || { echo '::error::Missing isolated acceptance sandbox'; exit 1; }
+            fault_args=(--var "EZIL_ACCEPTANCE_ENV:staging" --var "EZIL_ACCEPTANCE_SANDBOX:$EZIL_ACCEPTANCE_SANDBOX")
+          fi
+          ./node_modules/.bin/wrangler deploy --env staging --var "SANDBOX_NEKO_TURN_TTL_SECONDS:$ttl" "${fault_args[@]}" --message "git:$EZIL_DEPLOY_SHA"
       - name: Verify active staging Worker SHA and health
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -321,8 +388,28 @@ jobs:
           EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
         run: node e2e/verify-cloud-deployment.mjs
+      - name: Verify and record manual preview
+        if: needs.trust.outputs.manual_preview == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+        run: |
+          node e2e/await-deployed-bundle.mjs
+          node .github/scripts/record-manual-preview.mjs
+      - name: Upload manual preview identity
+        if: needs.trust.outputs.manual_preview == 'true' && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manual-preview-${{ needs.trust.outputs.sha }}-${{ github.run_attempt }}
+          path: manual-preview.json
+          if-no-files-found: error
       - uses: ./.github/actions/setup-playwright
       - name: Test the returned preview URL
+        if: needs.trust.outputs.manual_preview != 'true'
         timeout-minutes: 22
         env:
           EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
@@ -335,12 +422,14 @@ jobs:
             node "e2e/$suite.mjs"
           done
       - name: Renew staging lease credentials before long acceptance
+        if: needs.trust.outputs.manual_preview != 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
           aws-region: us-east-1
           role-duration-seconds: 7200
       - name: Hosted continuity release gate
+        if: needs.trust.outputs.manual_preview != 'true'
         timeout-minutes: 90
         env:
           EZIL_CONTINUITY_MODE: ${{ needs.trust.outputs.production == 'true' && 'full' || 'short' }}
@@ -370,7 +459,7 @@ jobs:
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
         run: node e2e/verify-cloud-deployment.mjs
       - name: Stop isolated staging test computer
-        if: always() && steps.lease.outcome == 'success'
+        if: always() && steps.lease.outcome == 'success' && needs.trust.outputs.manual_preview != 'true'
         timeout-minutes: 7
         env:
           EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
@@ -378,7 +467,7 @@ jobs:
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
         run: node e2e/cleanup-hosted-computer.mjs
       - name: Upload hosted continuity evidence
-        if: always()
+        if: always() && needs.trust.outputs.manual_preview != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: hosted-continuity-${{ needs.trust.outputs.sha }}-${{ github.run_attempt }}
@@ -761,6 +850,7 @@ jobs:
           TRUSTED: ${{ needs.trust.outputs.allowed }}
           ADMISSION_REASON: ${{ needs.trust.outputs.reason }}
           PRODUCTION_REQUIRED: ${{ needs.trust.outputs.production }}
+          MANUAL_PREVIEW: ${{ needs.trust.outputs.manual_preview }}
           IMAGE_RESULT: ${{ needs.images.result }}
           PREVIEW_RESULT: ${{ needs.preview.result }}
           PREVIEW_URL: ${{ needs.preview.outputs.url }}
@@ -784,7 +874,12 @@ jobs:
               ['staging / preview', e.PREVIEW_RESULT, e.PREVIEW_URL || '—', e.PREVIEW_WORKER || '—', e.PREVIEW_DEPLOYMENT || '—'],
               ['production', e.PRODUCTION_RESULT, e.PRODUCTION_URL || '—', e.PRODUCTION_WORKER || '—', e.PRODUCTION_DEPLOYMENT || '—'],
             ]);
-            core.summary.addRaw('Success requires provider SHA identity, a matching served shell bundle, and deployed browser suites. Worker SHA is verified via the control plane; /health has no commit field. No desktop release is published here.\n');
+            if (e.MANUAL_PREVIEW === 'true') {
+              core.summary.addLink('Open manual preview', `${e.PREVIEW_URL}/os`);
+              core.summary.addRaw('\nManual preview only: deployment and image identity verified; hosted acceptance remains pending. No test computer was started or stopped. This run cannot satisfy the Hosted continuity PR gate.\n');
+            } else {
+              core.summary.addRaw('Success requires provider SHA identity, a matching served shell bundle, and deployed browser suites. Worker SHA is verified via the control plane; /health has no commit field. No desktop release is published here.\n');
+            }
             await core.summary.write();
             if (e.TRUSTED !== 'true') core.setFailed(`No deployment performed: ${e.ADMISSION_REASON}`);
             else if (e.PREVIEW_RESULT !== 'success' || (e.PRODUCTION_REQUIRED === 'true' &&

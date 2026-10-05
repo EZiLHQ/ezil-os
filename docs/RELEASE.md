@@ -80,6 +80,19 @@ Actions access must permit this repository to read and publish its images.
 Cloudflare needs Workers deployment/version reads and Containers application/
 rollout read/write permissions. No Supabase credential is used by preview.
 
+For a user-requested manual preview, dispatch `preview.yml` on the PR branch
+with `preview_pr` set to its number. The PR may remain a draft, but must be an
+open same-repository PR to main and its exact current head must pass public CI.
+The job builds and tests the candidate image, holds the shared staging lease,
+deploys only staging and a Vercel preview, then verifies Worker/app source,
+served shell bytes and exact container layers. It publishes `manual-preview.json`
+and an `/os` link in the run summary. Fault injection and automated computer
+start/stop tests do not run in this mode; the user can test the returned URL.
+Missing isolated-computer prerequisites still fail normal hosted acceptance.
+The manual run is labelled as pending acceptance and cannot satisfy the required
+`Hosted continuity PR gate` or admit production. Normal manual/tag releases
+without `preview_pr` continue to require tested current main.
+
 Failed production checks retain the failure while attempting recovery: first
 verify that these deployments still belong to this release, restore the previous
 Vercel deployment and Worker version, then PATCH only the previous container
