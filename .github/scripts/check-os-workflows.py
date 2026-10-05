@@ -29,6 +29,27 @@ for path in (root / '.github/workflows').glob('*.yml'):
 assert workflows['ci']['jobs']['macos-native']['strategy']['matrix']['os'] == ['ubuntu-latest', 'macos-15']
 assert workflows['macos-internal']['jobs']['dmg']['runs-on'] == 'macos-15'
 assert workflows['macos-e2e']['jobs']['physical-mac']['runs-on'] == 'macos-15'
+# Every discovered browser regression runs in CI, with identical local families.
+runner = (root / 'shell/run-tests.sh').read_text()
+shell_steps = workflows['ci']['jobs']['shell']['steps']
+family_paths = set()
+for family, step_name in (
+    ('PORTABLE', 'Shell real-browser suites (portable)'),
+    ('GEOMETRY', 'Shell real-browser suites (geometry — Linux only)'),
+):
+    local_family = set(re.findall(r'"(shell/[^"\n]+\.mjs)"', re.search(rf'{family}_SUITES=\(([\s\S]*?)\n\)', runner)[1]))
+    step = next(step for step in shell_steps if step.get('name') == step_name)
+    ci_family = set(re.findall(r'shell/[^\s;]+\.mjs', step['run']))
+    assert local_family == ci_family, (family, local_family ^ ci_family)
+    assert not family_paths.intersection(ci_family), family
+    family_paths.update(ci_family)
+browser_paths = {
+    str(path.relative_to(root)) for path in (root / 'shell').rglob('*-test.mjs')
+    if 'node_modules' not in path.parts
+    and (path.name.endswith('-browser-test.mjs') or 'PLAYWRIGHT_REQUIRE_DIR' in path.read_text())
+}
+assert family_paths == browser_paths, family_paths ^ browser_paths
+assert 'shell/ezil/boot-test.mjs' in next(step['run'] for step in shell_steps if step.get('name') == 'Shell unit suites')
 internal_triggers = workflows['macos-internal'].get('on', workflows['macos-internal'].get(True))
 assert '.github/workflows/ci.yml' in internal_triggers['pull_request']['paths']
 

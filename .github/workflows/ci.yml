@@ -396,6 +396,8 @@ jobs:
         run: |
           set -e
           for t in shell/touch-focus-browser-test.mjs \
+                   shell/ezil/context-menu-stack-browser-test.mjs \
+                   shell/ezil/launcher-toggle-browser-test.mjs \
                    shell/ezil/apps/app-store-browser-test.mjs \
                    shell/ezil/apps/os-chrome-browser-test.mjs \
                    shell/ezil/apps/mobile-browser-test.mjs \
@@ -414,6 +416,7 @@ jobs:
                    shell/window-chrome-browser-test.mjs \
                    shell/phone-stacking-browser-test.mjs \
                    shell/ezil/apps/overlay-paint-browser-test.mjs \
+                   shell/ezil/display-notice-browser-test.mjs \
                    shell/ezil/apps/resize-test.mjs; do
             echo "── $t"
             node "$t"
