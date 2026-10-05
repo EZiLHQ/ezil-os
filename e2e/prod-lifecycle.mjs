@@ -1,3 +1,4 @@
+import { signIn } from './sign-in.mjs';
 /**
  * EZiL-OS lifecycle check against a deployed stack: a computer must not be
  * stopped under a window that is still using it, and the editor must reopen
@@ -56,16 +57,8 @@ try {
   const stale = [];
   p.on('response', r => { if (r.status() === 410) stale.push(r.url()); });
 
-  // Sign-in is retried once: the redesigned login page occasionally stays put
-  // on the first submit in CI (an app-side flake seen across every suite).
-  for (let attempt = 1; attempt <= 2 && (attempt === 1 || /\/login/.test(p.url())); attempt++) {
-    await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
-    await p.fill('#email', EMAIL); await p.fill('#password', PASS);
-    await Promise.all([
-      p.waitForURL(u => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),
-      p.locator('form').filter({ has: p.locator('#email') }).locator('button[type=submit]').click(),
-    ]);
-  }
+  await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
+  await signIn(p, { email: EMAIL, password: PASS });
   check('sign-in leaves /login', !/\/login/.test(p.url()), p.url().slice(0, 60));
   await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
   await verifySelectedComputer(p);

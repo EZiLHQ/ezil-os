@@ -1,3 +1,4 @@
+import { signIn } from './sign-in.mjs';
 /** Hosted acceptance only. No default computer, simulated ICE, or skipped checks. */
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -88,8 +89,7 @@ try {
   page = await context.newPage();
   resizeObserver = observeScreenResizes(page, APP);
   await page.goto(`${APP}/login?method=email`);
-  await page.fill('#email', required('EZIL_E2E_EMAIL')); await page.fill('#password', required('EZIL_E2E_PASSWORD'));
-  await Promise.all([page.waitForURL(url => !url.pathname.includes('/login'), { timeout: 60000 }), page.locator('form').filter({ has: page.locator('#email') }).locator('button[type=submit]').click()]);
+  await signIn(page, { email: required('EZIL_E2E_EMAIL'), password: required('EZIL_E2E_PASSWORD') });
   await page.goto(`${APP}/os`);
   await bounded('session ready', () => page.evaluate(() => !!window.ezil?.session?.payload?.()?.computer));
   const api = async (path, body) => {

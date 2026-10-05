@@ -1,3 +1,4 @@
+import { signIn } from './sign-in.mjs';
 /** Final cloud-job cleanup, independent of whether browser acceptance reached its finally block. */
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -32,12 +33,7 @@ export async function cleanupHostedComputer(env = process.env, chromium) {
     // Login lands on the management page. Loading /os would open applications
     // and start the computer again while its cleanup is being verified.
     await page.goto(`${app}/login?method=email&returnUrl=%2Fcomputers`);
-    await page.fill('#email', env.EZIL_E2E_EMAIL);
-    await page.fill('#password', env.EZIL_E2E_PASSWORD);
-    await Promise.all([
-      page.waitForURL(url => url.pathname === '/computers', { timeout: 60000 }),
-      page.locator('form').filter({ has: page.locator('#email') }).locator('button[type=submit]').click(),
-    ]);
+    await signIn(page, { email: env.EZIL_E2E_EMAIL, password: env.EZIL_E2E_PASSWORD, destination: '/computers' });
     evidence.phase = 'computer_identity';
     const session = await context.request.get(`${app}/api/shell/session`, { headers, maxRedirects: 0, timeout: 30000 });
     try {

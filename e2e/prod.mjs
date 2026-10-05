@@ -1,3 +1,4 @@
+import { signIn } from './sign-in.mjs';
 /**
  * EZiL-OS production end-to-end check.
  *
@@ -107,13 +108,8 @@ async function browserTiers() {
       p.on('response', r => { if (r.status() >= 400) badResponses.push(`${r.status()} ${r.url()}`); });
 
       await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
-      await p.fill('#email', EMAIL); await p.fill('#password', PASS);
-      await Promise.all([
-        p.waitForURL(u => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),
-        p.locator('form').filter({ has: p.locator('#email') }).locator('button[type=submit]').click(),
-      ]);
+      await signIn(p, { email: EMAIL, password: PASS });
       check(shape.tier, `${shape.label}: sign-in leaves /login`, !/\/login/.test(p.url()), p.url().slice(0, 60));
-
       await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
       await verifySelectedComputer(p);
       await p.waitForTimeout(3500);

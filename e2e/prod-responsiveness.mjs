@@ -1,3 +1,4 @@
+import { signIn } from './sign-in.mjs';
 /**
  * prod-responsiveness.mjs — the responsiveness tier, against the LIVE
  * deployment.
@@ -69,12 +70,7 @@ async function openDesktop(ctx) {
   const resizes = observeScreenResizes(p, APP);
   try {
     await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
-    await p.fill('#email', EMAIL); await p.fill('#password', PASS);
-    await Promise.all([
-      p.waitForURL(u => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),
-      p.locator('form').filter({ has: p.locator('#email') }).locator('button[type=submit]').click(),
-    ]);
-    if (/\/login/.test(p.url())) return { p, err: 'sign-in did not leave /login' };
+    await signIn(p, { email: EMAIL, password: PASS });
     await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
     await verifySelectedComputer(p);
     await p.waitForTimeout(3500);

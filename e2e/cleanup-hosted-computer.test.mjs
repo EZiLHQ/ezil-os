@@ -10,7 +10,8 @@ function fixture({ selected = computerId, stop = { ok: true, terminated: true, o
   const calls = [];
   const page = { goto: async url => { calls.push(['goto', url]); },
     fill: async () => {}, waitForURL: async () => { if (failure === 'authentication') throw new Error('authorization: private-test-password'); },
-    locator: () => ({ filter: () => ({ locator: () => ({ click: async () => {} }) }) }),
+    locator: () => ({ getAttribute: async () => 'true', click: async () => {}, waitFor: async () => {},
+      locator: () => ({ click: async () => {} }) }),
   };
   const response = json => ({ ok: () => true, json: async () => json, dispose: async () => {} });
   const context = { route: async () => {}, newPage: async () => page, request: {

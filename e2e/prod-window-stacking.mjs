@@ -1,3 +1,4 @@
+import { signIn } from './sign-in.mjs';
 /**
  * prod-window-stacking.mjs — a window must open where the user can reach it,
  * against the LIVE deployment.
@@ -53,9 +54,7 @@ for (let n = 1; n <= runs; n++) {
   await configureAppContext(ctx);
   const p = await ctx.newPage();
   await p.goto(`${APP}/login?method=email`,{waitUntil:'domcontentloaded'});
-  await p.fill('#email', EMAIL); await p.fill('#password', PASS);
-  await Promise.all([p.waitForURL(u=>!/\/login/.test(u.toString()),{timeout:60000}).catch(()=>{}),
-    p.locator('form').filter({has:p.locator('#email')}).locator('button[type=submit]').click()]);
+  await signIn(p, { email: EMAIL, password: PASS });
   await p.goto(`${APP}/os`,{waitUntil:'domcontentloaded'});
   await verifySelectedComputer(p);
   await p.waitForTimeout(3000);
