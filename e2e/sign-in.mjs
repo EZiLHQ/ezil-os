@@ -13,6 +13,10 @@ export async function signIn(page, { email, password, destination } = {}) {
     await disclosure.click();
     await form.waitFor({ state: 'visible', timeout: 15000 });
   }
+  // Opening the form focuses Email on the next animation frame. Wait for that
+  // focus before filling Password; otherwise a fast mobile driver can insert
+  // the password into Email when that deferred focus lands.
+  await page.waitForFunction(() => document.activeElement === document.querySelector('#email'), null, { timeout: 15000 });
   await page.fill('#email', email);
   await page.fill('#password', password);
   try {

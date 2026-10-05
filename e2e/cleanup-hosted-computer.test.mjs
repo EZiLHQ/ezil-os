@@ -9,6 +9,7 @@ const env = { EZIL_E2E_APP: 'https://staging.example', EZIL_E2E_COMPUTER_ID: com
 function fixture({ selected = computerId, stop = { ok: true, terminated: true, outcome: 'destroyed' }, failure } = {}) {
   const calls = [];
   const page = { goto: async url => { calls.push(['goto', url]); },
+    waitForFunction: async () => {},
     fill: async () => {}, waitForURL: async () => { if (failure === 'authentication') throw new Error('authorization: private-test-password'); },
     locator: () => ({ getAttribute: async () => 'true', click: async () => {}, waitFor: async () => {},
       locator: () => ({ click: async () => {} }) }),
