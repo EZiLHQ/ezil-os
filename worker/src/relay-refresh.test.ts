@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { readRelayState, relayOperation } from './relay-refresh';
+import { readRelayState, relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget } from './relay-refresh';
 const runtimeId = 'a'.repeat(32);
 const current = { runtimeId, expiresAt: Date.now() + 300000 };
 function fixture(options: { loginFails?: boolean; unavailable?: boolean; postStatus?: number; wrongRuntime?: boolean } = {}) {
@@ -16,6 +16,16 @@ function fixture(options: { loginFails?: boolean; unavailable?: boolean; postSta
 }
 const mint = async () => ({ servers: [{ urls: ['turn:relay.example:3478'], username: 'ephemeral', credential: 'private-test-credential' }], expiresAt: current.expiresAt + 300000 });
 describe('relay refresh failure handling', () => {
+  it('checkpoint queueing shares the forwarding budget and fences expired operations', () => {
+    expect(remainingRelayBudget(1000, 6500)).toBe(21500);
+    expect(remainingRelayBudget(1000, 1000)).toBe(24000);
+    expect(() => remainingRelayBudget(1000, 28000)).toThrow('relay_busy');
+  });
+  it('serializes typed failures before RPC without exporting arbitrary exception text', () => {
+    const result = JSON.parse(JSON.stringify(relayFailureResult(new RelayFailure('relay_busy', 409))));
+    expect(result).toEqual({ok:false,error:'relay_busy',status:409});
+    expect(relayFailureResult(new Error('private credentials'))).toEqual({ok:false,error:'relay_refresh_failed',status:502});
+  });
   it('metadata rejects missing runtime identity and invalid expiry', () => {
     for (const value of [null, {}, { runtimeId, expiresAt: 0 }, { runtimeId: 'invalid', expiresAt: 1 }]) expect(() => readRelayState(value)).toThrow('relay_metadata_invalid');
   });

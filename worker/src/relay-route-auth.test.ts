@@ -11,7 +11,7 @@ async function fixture(extra:Record<string,unknown> = {}) {
     const mod=await import('./index');
     const env={SANDBOX_HMAC_SECRET:secret, Sandbox:{
         idFromName:(value:string)=>{opened=value;return value},
-        get:()=>({relayRefresh:async (sandboxId:string, runtimeId?:string)=>{calls.push({name:sandboxId,runtimeId});return {runtimeId:'a'.repeat(32),expiresAt:Date.now()+300000}}}),
+        get:()=>({relayRefresh:async (sandboxId:string, runtimeId?:string)=>{calls.push({name:sandboxId,runtimeId});return {ok:true,runtimeId:'a'.repeat(32),expiresAt:Date.now()+300000}}}),
     },...extra};
     return {calls,opened:()=>opened,fetch:(req:Request)=>mod.default.fetch(req,env as never)};
 }
@@ -44,6 +44,18 @@ describe('relay control uses the real signed Worker boundary',()=>{
                 headers:{Authorization:`Bearer ${await token()}`,'Content-Type':'application/json'},body}));
             expect(res.status).toBe(400);expect(f.calls).toHaveLength(0);
         }
+    });
+    it('returns serialized RPC failures with their status and no internal status field',async()=>{
+        const mod=await import('./index');
+        const env={SANDBOX_HMAC_SECRET:secret,Sandbox:{
+            idFromName:(value:string)=>value,
+            get:()=>({relayRefresh:async()=>JSON.parse(JSON.stringify({ok:false,error:'relay_busy',status:409}))}),
+        }};
+        const response=await mod.default.fetch(new Request(`https://worker.example/sandbox/${name}/relay-refresh`,{
+            headers:{Authorization:`Bearer ${await token()}`},
+        }),env as never);
+        expect(response.status).toBe(409);
+        expect(await response.json()).toEqual({ok:false,error:'relay_busy'});
     });
 });
 

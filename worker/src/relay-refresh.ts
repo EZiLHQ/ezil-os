@@ -1,6 +1,21 @@
 import { buildNekoIceEnv, type IceServerEntry } from './desktop-mode';
 
 export interface RelayState { runtimeId: string; expiresAt: number }
+export type RelayResult = ({ ok: true } & RelayState) | { ok: false; error: string; status: number };
+// Keep queue time and TCP work within the existing 30-second forwarding budget.
+export const RELAY_OPERATION_DEADLINE_MS = 27_000;
+export function remainingRelayBudget(requestedAt: number, now = Date.now()): number {
+  const remaining = RELAY_OPERATION_DEADLINE_MS - (now - requestedAt);
+  if (remaining <= 0) throw new RelayFailure('relay_busy', 409);
+  return Math.min(24_000, remaining);
+}
+// Custom Error subclasses lose their prototype across Durable Object RPC.
+// Serialize failures inside the object, while their type is still available.
+export function relayFailureResult(error: unknown): Extract<RelayResult, { ok: false }> {
+  return error instanceof RelayFailure
+    ? { ok: false, error: error.code, status: error.status }
+    : { ok: false, error: 'relay_refresh_failed', status: 502 };
+}
 interface RelayContainer {
   containerFetch(url: string, init?: RequestInit, port?: number): Promise<Response>;
 }

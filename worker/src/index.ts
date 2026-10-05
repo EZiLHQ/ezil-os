@@ -1,4 +1,4 @@
-import { relayOperation, RelayFailure, type RelayState } from './relay-refresh';
+import { relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget, type RelayState, type RelayResult } from './relay-refresh';
 import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, failCheckpointWrites,
   AcceptanceFaultError, type AcceptanceFaultState } from './acceptance-faults';
 /**
@@ -770,7 +770,7 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
 interface EzilWorkspacePersistRpc {
   setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void>;
   desktopReachable(): Promise<boolean>;
-  relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayState>;
+  relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult>;
   hydrateWorkspace(params: { mountPath: string; prefix: string }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }>;
   /** Start capturing user changes outside /workspace (system layer). Called once the desktop is up. */
   baselineSystem(): Promise<boolean>;
@@ -2342,25 +2342,28 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     const probe = await pollDesktopReady(this, 1000, 100, 8181, '/');
     return probe.ready;
   }
-  async relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayState> {
+  async relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult> {
     const requestedAt = Date.now();
-    return this.withRuntimeMutation(() => this.withWorkspacePersistence(async () => {
-      // A queued request that outlived the caller's forwarding budget must
-      // never apply a late configuration change to a resumed runtime.
-      if (Date.now() - requestedAt > 3_000) throw new RelayFailure('relay_busy', 409);
-      if (!this.containerIsRunning()) throw new RelayFailure('relay_runtime_not_running', 409);
-      const credentials = await deriveNekoCredentials(this.env, sandboxId);
-      // Local TCP transport cannot start a stopped container, and its signal
-      // is cancellable here without crossing the Sandbox RPC boundary.
-      const transport = { containerFetch: (url: string, init?: RequestInit) => this.ctx.container!.getTcpPort(8181).fetch(url, init) };
-      return relayOperation(transport, credentials.admin, { runtimeId, ...(runtimeId ? { mint: async (signal: AbortSignal) => {
-        if (await this.acceptanceFault(sandboxId) === 'turn_unavailable') throw new RelayFailure('turn_unavailable');
-        const issuedAt = Date.now();
-        const servers = await generateTurnCredentials(this.env, signal);
-        if (!servers) throw new RelayFailure('turn_unavailable');
-        return { servers, expiresAt: issuedAt + resolveTurnTtlSeconds(this.env.SANDBOX_NEKO_TURN_TTL_SECONDS) * 1000 };
-      } } : {}) });
-    }));
+    try {
+      const state = await this.withRuntimeMutation(() => this.withWorkspacePersistence(async () => {
+        // A queued request that outlived the caller's forwarding budget must
+        // never apply a late configuration change to a resumed runtime.
+        remainingRelayBudget(requestedAt);
+        if (!this.containerIsRunning()) throw new RelayFailure('relay_runtime_not_running', 409);
+        const credentials = await deriveNekoCredentials(this.env, sandboxId);
+        // Local TCP transport cannot start a stopped container, and its signal
+        // is cancellable here without crossing the Sandbox RPC boundary.
+        const transport = { containerFetch: (url: string, init?: RequestInit) => this.ctx.container!.getTcpPort(8181).fetch(url, init) };
+        return relayOperation(transport, credentials.admin, { runtimeId, budgetMs: remainingRelayBudget(requestedAt), ...(runtimeId ? { mint: async (signal: AbortSignal) => {
+          if (await this.acceptanceFault(sandboxId) === 'turn_unavailable') throw new RelayFailure('turn_unavailable');
+          const issuedAt = Date.now();
+          const servers = await generateTurnCredentials(this.env, signal);
+          if (!servers) throw new RelayFailure('turn_unavailable');
+          return { servers, expiresAt: issuedAt + resolveTurnTtlSeconds(this.env.SANDBOX_NEKO_TURN_TTL_SECONDS) * 1000 };
+        } } : {}) });
+      }));
+      return { ok: true, ...state };
+    } catch (error) { return relayFailureResult(error); }
   }
 
   /** Serialize hydrate, flush and teardown across this DO's await points. */
@@ -3974,10 +3977,16 @@ async function handlePreview(
 
     let relay: RelayState | undefined;
     if (mode === 'neko' && env.SANDBOX_NEKO_TURN_KEY_ID) {
-      relay = await sandbox.relayRefresh(sandboxId);
+      let result = await sandbox.relayRefresh(sandboxId);
+      if (!result.ok) throw new RelayFailure(result.error, result.status);
+      relay = result;
       // Warm opens apply renewal to the existing processes rather than discard
       // new credentials or replace the computer.
-      if (relay.expiresAt <= Date.now() + 60_000) relay = await sandbox.relayRefresh(sandboxId, relay.runtimeId);
+      if (relay.expiresAt <= Date.now() + 60_000) {
+        result = await sandbox.relayRefresh(sandboxId, relay.runtimeId);
+        if (!result.ok) throw new RelayFailure(result.error, result.status);
+        relay = result;
+      }
     }
     const response = json({
       ok: true,
@@ -6400,7 +6409,8 @@ export default {
           if (!body || typeof body !== 'object' || typeof body.runtimeId !== 'string' || !/^[a-f0-9]{32}$/.test(body.runtimeId)) return json({ ok:false,error:'relay_bad_request' },400);
           runtimeId = body.runtimeId;
         }
-        return json({ ok:true, ...await openSandbox(env,name).relayRefresh(name,runtimeId) });
+        const result = await openSandbox(env,name).relayRefresh(name,runtimeId);
+        return result.ok ? json(result) : json({ ok:false, error:result.error }, result.status);
       } catch (error) {
         return json({ ok:false,error:error instanceof RelayFailure ? error.code : 'relay_refresh_failed' },error instanceof RelayFailure ? error.status : 502);
       }
