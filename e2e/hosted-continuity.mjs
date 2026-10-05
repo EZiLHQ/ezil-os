@@ -286,6 +286,9 @@ try {
     await f.locator('.quick-input-widget input:visible').fill(marker);
     await f.locator('.quick-input-list .monaco-list-row:visible').filter({hasText:marker}).first().click();
     await wait(1500);
+    // Reopened Code may restore a saved model with an earlier file version.
+    // Reload disk before editing; the shortcut must still save a new edit.
+    await command(f, 'File: Revert File');
     const persistedMarker = await verifyEditorShortcut({
       read: () => readDocument(f), expected: markerText, proof: `shortcut-save-${++shortcutChecks}`,
       append: async proof => {
@@ -343,8 +346,15 @@ try {
   // Clicking the decoded video is blocked by this intentional input surface.
   const browserInput = videoFrame().locator('textarea.overlay');
   await browserInput.click();
-  await browserInput.press('Control+L');
-  await browserInput.pressSequentially(`data:text/html,<title>${uniqueHeading}</title><body style="background:%23161616;color:white;height:3000px"><h1>${uniqueHeading}</h1><input autofocus><p>scroll marker</p></body>`);
+  await bounded('current viewer owns browser control', () => browserInput.evaluate(() => {
+    const client = window.$client, remote = client?.$accessor?.remote;
+    return client?.connected && client._channel?.readyState === 'open'
+      && remote?.controlling && remote.hosting && !remote.locked;
+  }), 15000);
+  await wait(1000);
+  await browserInput.press('Control+l');
+  await wait(1000);
+  await browserInput.pressSequentially(`data:text/html,<title>${uniqueHeading}</title><body style="background:%23161616;color:white;height:3000px"><h1>${uniqueHeading}</h1><input autofocus><p>scroll marker</p></body>`, { delay: 20 });
   await browserInput.press('Enter');
   if (mode !== 'essential') await bounded('Browser navigation rendered', async () => (await browserSnapshot()).title === uniqueHeading, 15000);
   else await wait(5000);
@@ -353,7 +363,7 @@ try {
   const navigatedFrameHash = hash(await videoFrame().locator('video').screenshot());
   if (mode !== 'essential') assert.equal((await browserSnapshot()).title,uniqueHeading,'Browser navigation did not render requested document');
   assert.notEqual(navigatedFrameHash, inputBefore, 'Navigation produced no visible response');
-  await browserInput.pressSequentially('hosted keyboard input'); await wait(1500);
+  await browserInput.pressSequentially('hosted keyboard input', { delay: 20 }); await wait(1500);
   const typedFrameHash = hash(await videoFrame().locator('video').screenshot());
   if (mode !== 'essential') assert.ok((await browserSnapshot()).snapshot.includes('hosted keyboard input'),'Typed input did not reach cloud Chrome');
   assert.notEqual(typedFrameHash, navigatedFrameHash, 'Typing produced no visible response');
