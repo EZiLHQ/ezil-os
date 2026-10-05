@@ -1,0 +1,107 @@
+{
+  "$schema": "../schema/models.schema.json",
+  "providers": {
+    "anthropic": {
+      "type": "anthropic",
+      "apiKey": "{env:ANTHROPIC_API_KEY}"
+    },
+    "foundry-claude": {
+      "type": "anthropic-foundry",
+      "resource": "my-foundry-resource",
+      "apiKey": "{file:/run/secrets/foundry-api-key}"
+    },
+    "foundry-openai": {
+      "type": "azure-openai",
+      "baseUrl": "https://my-foundry-resource.services.ai.azure.com/openai/v1",
+      "apiKey": "{env:AZURE_API_KEY}"
+    },
+    "azure": {
+      "type": "azure-openai",
+      "resource": "my-azure-openai-resource",
+      "apiKey": "{env:AZURE_OPENAI_API_KEY}"
+    },
+    "openai": {
+      "type": "openai",
+      "apiKey": "{env:OPENAI_API_KEY}"
+    },
+    "local-mock": {
+      "type": "openai-compatible",
+      "baseUrl": "http://127.0.0.1:18792/v1",
+      "apiKey": "test-key"
+    }
+  },
+  "defaults": {
+    "capabilities": { "toolCalling": true, "imageInput": true }
+  },
+  "models": [
+    {
+      "id": "opus-5.5",
+      "name": "Claude Opus 5.5",
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "family": "claude",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 128000,
+      "thinking": { "type": "adaptive", "effort": "medium", "display": "summarized" },
+      "cache": { "ttl": "5m" },
+      "default": true,
+      "roles": ["default", "plan"]
+    },
+    {
+      "id": "sonnet-5",
+      "name": "Claude Sonnet 5",
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "thinking": { "type": "adaptive", "effort": "high" }
+    },
+    {
+      "id": "haiku-4.5",
+      "name": "Claude Haiku 4.5",
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 32000,
+      "roles": ["utility", "utilitySmall"]
+    },
+    {
+      "id": "foundry-sonnet-5",
+      "name": "Claude Sonnet 5 (Foundry)",
+      "provider": "foundry-claude",
+      "model": "claude-sonnet-5",
+      "detail": "Microsoft Foundry deployment",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "thinking": { "type": "adaptive", "effort": "high" },
+      "cache": { "ttl": "1h" }
+    },
+    {
+      "id": "gpt-5.5-foundry",
+      "name": "GPT-5.5 (Foundry)",
+      "provider": "foundry-openai",
+      "model": "gpt-5.5",
+      "family": "gpt",
+      "maxInputTokens": 272000,
+      "maxOutputTokens": 32768,
+      "thinking": { "type": "adaptive", "effort": "medium" }
+    },
+    {
+      "id": "gpt-5.5",
+      "name": "GPT-5.5",
+      "provider": "openai",
+      "model": "gpt-5.5",
+      "family": "gpt",
+      "maxInputTokens": 272000,
+      "maxOutputTokens": 32768
+    },
+    {
+      "id": "mock",
+      "name": "Local mock",
+      "provider": "local-mock",
+      "model": "mock-model",
+      "maxInputTokens": 32000,
+      "maxOutputTokens": 4096
+    }
+  ]
+}

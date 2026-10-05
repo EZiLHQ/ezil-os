@@ -413,15 +413,20 @@ describe('browser sidecar: a real container, a real Chrome', () => {
         // inert — but this project has been bitten three times this month by
         // checks that passed in Docker and failed elsewhere, so it is measured
         // AFTER the navigations, clicks, types and screenshots above.
-        // X allocates IDs at runtime. Resolve the real Chrome client window
-        // after automation, and refuse missing or ambiguous browser windows.
+        // The window id is looked up, not hardcoded: X hands out ids in client
+        // creation order, so an image that starts one more (or one fewer) X
+        // client before Chrome shifts it — CI on 9dcabfa failed exactly that way
+        // when the moving `:latest` desktop image was rebuilt. Resolve the real
+        // Chrome client window by WM_CLASS after automation (the same
+        // `wmctrl -x -l` lookup `start-neko.sh` uses for focus), and refuse
+        // missing or ambiguous browser windows.
         const clients = dexec(['env', 'DISPLAY=:99', 'wmctrl', '-x', '-l']);
         expect(clients.status).toBe(0);
         const browserIds = (clients.stdout || '').trim().split('\n')
             .map(line => line.trim().split(/\s+/))
             .filter(columns => /chrome/i.test(columns[2] || ''))
             .map(columns => columns[0]);
-        expect(browserIds).toHaveLength(1);
+        expect(browserIds, `expected exactly one Chrome window (wmctrl -l: ${xWindowTitle() || '<empty>'})`).toHaveLength(1);
         const windowId = browserIds[0]!;
         expect(windowId).toMatch(/^0x[0-9a-f]+$/i);
         const info = dexec(['env', 'DISPLAY=:99', 'xwininfo', '-id', windowId]);
