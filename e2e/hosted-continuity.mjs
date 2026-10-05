@@ -316,10 +316,21 @@ try {
   // An input textarea can exist before the login shell accepts input. Code's
   // shell integration publishes a command decoration after its actual prompt.
   await bounded('terminal prompt', () => f.locator('.xterm-decoration.terminal-command-decoration').count(), 30000);
-  await terminalInput().focus();
+  await command(f, 'Terminal: Focus Terminal');
+  await f.locator('.xterm-screen').last().click();
+  await bounded('terminal keyboard focus', () => terminalInput().evaluate(el => document.activeElement === el), 10000);
+  await wait(1000);
   // xterm on macOS does not consistently consume Playwright insertText.
   // Send ordinary keyboard input and confirm the command reached the terminal.
-  await terminalInput().pressSequentially(terminalContinuityCommand(processNonce));
+  const processCommand = terminalContinuityCommand(processNonce);
+  await terminalInput().pressSequentially(processCommand, { delay: 10 });
+  await bounded('terminal command received', async () => {
+    const text = await f.locator('.xterm-accessibility-tree').last().innerText();
+    // xterm's accessible tree contains visible rows, so a long command's
+    // beginning can scroll out. Its tail confirms typing completed; the
+    // nonce-bound advancing heartbeat below verifies execution of the script.
+    return text.replace(/\s/g, '').includes(processCommand.slice(-80).replace(/\s/g, ''));
+  }, 10000);
   await terminalInput().press('Enter');
   const processSample = async (afterSequence = -1) => {
     await command(f, 'Terminal: Focus Terminal');
@@ -354,7 +365,16 @@ try {
   await wait(1000);
   await browserInput.press('Control+l');
   await wait(1000);
-  await browserInput.pressSequentially(`data:text/html,<title>${uniqueHeading}</title><body style="background:%23161616;color:white;height:3000px"><h1>${uniqueHeading}</h1><input autofocus><p>scroll marker</p></body>`, { delay: 20 });
+  const inputFixture = `<title>${uniqueHeading}</title><body style="background:#161616;color:white;height:3000px"><h1>${uniqueHeading}</h1><input autofocus><p>scroll marker</p></body>`;
+  const inputURL = 'data:text/html,' + encodeURIComponent(inputFixture).replace(/%[A-F0-9]{2}/g, value => value.toLowerCase());
+  // X11 receives physical keysyms through Neko. Send Shift explicitly for
+  // punctuation so automation uses the same keyboard path as a real viewer.
+  for (const character of inputURL) {
+    const key = { ':': 'Shift+Semicolon', '%': 'Shift+Digit5', ',': 'Comma',
+      '/': 'Slash', '-': 'Minus', '_': 'Shift+Minus', '.': 'Period' }[character]
+      || (/^[A-Z]$/.test(character) ? 'Shift+Key' + character : character);
+    await browserInput.press(key, { delay: 30 });
+  }
   await browserInput.press('Enter');
   if (mode !== 'essential') await bounded('Browser navigation rendered', async () => (await browserSnapshot()).title === uniqueHeading, 15000);
   else await wait(5000);
