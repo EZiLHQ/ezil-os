@@ -123,7 +123,10 @@ emit PASS now browser.wmclass.literal "instance='${WM_INSTANCE}' class='${WM_CLA
 #    live-config: a `<decor>no</decor>` rule that targets a class no window has
 #    is now a hard failure instead of a silent no-op.
 # ─────────────────────────────────────────────────────────────────────────────
-OB_ARGS="$(ps -eo args 2>/dev/null | grep -m1 '^openbox' || true)"
+# OrbStack can prefix argv with the executable's absolute path. Identify the
+# process by comm so both native Linux and translated containers resolve the
+# config of the actual window manager.
+OB_ARGS="$(ps -eo comm=,args= 2>/dev/null | awk '$1 == "openbox" { $1=""; sub(/^[[:space:]]+/, ""); print; exit }' || true)"
 OB_CFG="$(printf '%s' "$OB_ARGS" | sed -n 's/.*--config-file[ =]\([^ ]*\).*/\1/p')"
 if [ -z "$OB_ARGS" ]; then
   bad now openbox.running "no openbox process found in ps"
