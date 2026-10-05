@@ -585,6 +585,28 @@ describe.skipIf(SKIP_REASON !== null)('local mode, in a real browser', () => {
         expect(before.has_host).toBe(false);
         const pointerBefore = await pointerLocation();
 
+        // Full-bleed schedules an actual X resize. Wait for the server AND this
+        // viewer to adopt the final dimensions before using them for input math.
+        const desktopPort = offsetPortMap(OFFSET).find((p) => p.name === 'desktop')!.host;
+        const viewer = page.frames().find((f: any) => f.url().includes(`:${desktopPort}`));
+        const resizeDeadline = Date.now() + 20_000;
+        let resized = false;
+        while (Date.now() < resizeDeadline) {
+            const currentBox = await (await page.$('.window[data-app="desktop"] iframe.window-app-iframe')).boundingBox();
+            const screen = await host!.readScreen(computerId);
+            const video = await viewer.evaluate(() => {
+                const v = document.querySelector('video');
+                return v ? { width: v.videoWidth, height: v.videoHeight } : null;
+            });
+            if (currentBox && screen.ok && screen.verified && video
+                && screen.width === Math.round(currentBox.width) && screen.height === Math.round(currentBox.height)
+                && video.width === screen.width && video.height === screen.height) {
+                resized = true;
+                break;
+            }
+            await page.waitForTimeout(100);
+        }
+        expect(resized).toBe(true);
         const box = await (await page.$('.window[data-app="desktop"] iframe.window-app-iframe')).boundingBox();
         expect(box).not.toBeNull();
 

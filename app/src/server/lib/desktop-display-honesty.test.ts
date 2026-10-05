@@ -599,7 +599,10 @@ describe.skipIf(process.platform === 'win32')('probeDesktopDisplayLongPoll — z
         const url = await listen(server);
         try {
             const t0 = performance.now();
-            const probe = await probeDesktopDisplayLongPoll(`${url}/`, ADMIN_PASSWORD, 1_000, 150);
+            // The initial probe establishes blank. Spend the remaining hold
+            // waiting, so an exhausted final request cannot turn this fixture
+            // into the separate unreachable-server case under runner load.
+            const probe = await probeDesktopDisplayLongPoll(`${url}/`, ADMIN_PASSWORD, 1_000, 1_000);
             const elapsed = performance.now() - t0;
             expect(probe).toEqual({ display: 'blank', sessions: 1 });
             expect(elapsed).toBeGreaterThanOrEqual(900);

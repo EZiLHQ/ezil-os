@@ -232,12 +232,20 @@ describe.skipIf(SKIP_REASON !== null)('a real desktop, booted by DockerHost', ()
     });
 
     it('the browser sidecar answers on 9223, reached the way the cloud reaches it', async () => {
-        const res = await host!.fetchIn(COMPUTER_ID, 9223, new Request('http://x/health'));
-        expect(res.status).toBe(200);
-        const body = (await res.json()) as { ok?: boolean; chromeConnected?: boolean };
-        expect(body.ok).toBe(true);
-        expect(body.chromeConnected).toBe(true);
-    });
+        // Neko readiness precedes the sidecar's independent CDP connection.
+        // Observe that connection within a bound rather than sampling it once.
+        const deadline = Date.now() + 20_000;
+        let connected = false;
+        while (Date.now() < deadline) {
+            const res = await host!.fetchIn(COMPUTER_ID, 9223, new Request('http://x/health'));
+            expect(res.status).toBe(200);
+            const body = (await res.json()) as { ok?: boolean; chromeConnected?: boolean };
+            expect(body.ok).toBe(true);
+            if (body.chromeConnected === true) { connected = true; break; }
+            await Bun.sleep(250);
+        }
+        expect(connected).toBe(true);
+    }, 30_000);
 
     it('exec round-trips a command as an array', async () => {
         const res = await host!.exec(COMPUTER_ID, ['bash', '-c', 'echo ok']);
