@@ -858,12 +858,12 @@ async function scenarioPhonePortrait () {
         const hit = document.elementFromPoint(x, y);
         return {
             x, y, hitsIframe: hit === iframe,
-            bodyBottom: Math.round(bodyBox.bottom), drawerTop: Math.round(drawerBox.top),
+            bodyTop: Math.round(bodyBox.top), drawerTop: Math.round(drawerBox.top),
             drawerBottom: Math.round(drawerBox.bottom), windowBottom: Math.round(win.getBoundingClientRect().bottom),
         };
     });
-    push(`${L} the expanded OS controls occupy a reserved strip below the stream`,
-        !! topTap && topTap.drawerTop >= topTap.bodyBottom
+    push(`${L} the expanded OS controls occupy a reserved strip above the stream`,
+        !! topTap && topTap.drawerTop >= 0 && topTap.drawerBottom <= topTap.bodyTop
         && topTap.drawerBottom <= topTap.windowBottom + 1 && topTap.hitsIframe,
         JSON.stringify(topTap));
     const topFrame = page.frames().find((f) => f.url().includes('/frame?'));
@@ -883,12 +883,12 @@ async function scenarioPhonePortrait () {
         const drawer = document.querySelector('.window[data-app="desktop"] .ezil-app-drawer');
         const body = document.querySelector('.window[data-app="desktop"] .window-body-app');
         if ( ! drawer || ! body || ! point ) return null;
-        return { drawerTop: Math.round(drawer.getBoundingClientRect().top),
-            bodyBottom: Math.round(body.getBoundingClientRect().bottom),
+        return { drawerBottom: Math.round(drawer.getBoundingClientRect().bottom),
+            bodyTop: Math.round(body.getBoundingClientRect().top),
             hitsIframe: document.elementFromPoint(point.x, point.y)?.classList.contains('window-app-iframe') };
     }, topTap);
     push(`${L} the collapsed controls also leave the address bar tappable`,
-        !! collapsedTop && collapsedTop.drawerTop >= collapsedTop.bodyBottom && collapsedTop.hitsIframe,
+        !! collapsedTop && collapsedTop.drawerBottom <= collapsedTop.bodyTop && collapsedTop.hitsIframe,
         JSON.stringify(collapsedTop));
 
     // ── the raised keyboard, contract §7.3 ─────────────────────────────────

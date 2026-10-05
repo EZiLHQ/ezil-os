@@ -730,7 +730,7 @@ async function scenarioStreamFit () {
         const dr = d?.getBoundingClientRect();
         return {
             bodyW: Math.round(br.width), bodyH: Math.round(br.height),
-            bodyBottom: Math.round(br.bottom),
+            bodyTop: Math.round(br.top),
             drawerTop: dr ? Math.round(dr.top) : null,
             drawerBottom: dr ? Math.round(dr.bottom) : null,
             frameW: Math.round(fr.width), frameH: Math.round(fr.height),
@@ -752,7 +752,7 @@ async function scenarioStreamFit () {
     const fb = await measure();
     push(`${L} setup: full-bleed stream has a reserved control strip`,
         !! fb && fb.bodyW === 1400 && fb.bodyH > 900 && fb.bodyH < 1000
-        && fb.drawerTop >= fb.bodyBottom && fb.drawerBottom <= 1000,
+        && fb.drawerTop >= 0 && fb.drawerBottom <= fb.bodyTop,
         JSON.stringify(fb));
     push(`${L} G10 full-bleed: the stream's box is 16:9, not the viewport's 1.4:1`,
         !! fb && Math.abs(fb.frameAspect - 16 / 9) < 0.01, JSON.stringify(fb));

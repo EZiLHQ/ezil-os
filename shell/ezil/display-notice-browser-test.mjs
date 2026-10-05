@@ -198,9 +198,9 @@ for ( const vp of VIEWPORTS ) {
         m.drawer ? ! overlaps : false,
         m.drawer ? `notice ${m.notice.top.toFixed(0)}..${m.notice.bottom.toFixed(0)}`
             + ` vs drawer ${m.drawer.top.toFixed(0)}..${m.drawer.bottom.toFixed(0)}` : 'no drawer');
-    push(`🔴 ${tag}: the title line is above the drawer, not under it`,
-        !! m.title && !! m.drawer && m.title.bottom <= m.drawer.top,
-        `title bottom ${m.title?.bottom.toFixed(0)} vs drawer top ${m.drawer?.top.toFixed(0)}`);
+    push(`🔴 ${tag}: the title line is below the top drawer and fully visible`,
+        !! m.title && !! m.drawer && m.title.top >= m.drawer.bottom,
+        `title top ${m.title?.top.toFixed(0)} vs drawer bottom ${m.drawer?.bottom.toFixed(0)}`);
     push(`${tag}: no line of the notice is clipped by its own box`, ! m.clipped);
     push(`${tag}: ...and the Retry it offers is on screen`,
         !! m.retry && m.retry.bottom <= m.viewportH && m.retry.top >= 0,
