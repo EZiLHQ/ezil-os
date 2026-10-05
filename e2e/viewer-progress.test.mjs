@@ -1,6 +1,27 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { waitForViewerProgress } from './viewer-progress.mjs';
+import { requestViewerProbe, waitForViewerProgress } from './viewer-progress.mjs';
+
+test('cold startup waits for a runtime URL and probes only its current attempt', () => {
+  const previous = globalThis.document;
+  const calls = [];
+  let frame;
+  globalThis.document = { querySelector: () => frame };
+  try {
+    assert.equal(requestViewerProbe(), false);
+    for (const src of ['', 'about:blank', 'invalid', 'https://runtime.example/']) {
+      frame = { src, contentWindow: { postMessage: (...args) => calls.push(args) } };
+      assert.equal(requestViewerProbe(), false);
+    }
+    assert.deepEqual(calls, []);
+    frame.src = 'https://runtime.example/viewer?ezilAttempt=current-attempt';
+    assert.equal(requestViewerProbe(), true);
+    assert.deepEqual(calls, [[{ source: 'ezil-shell', type: 'viewer_probe', attempt: 'current-attempt' }, 'https://runtime.example']]);
+  } finally {
+    if (previous === undefined) delete globalThis.document;
+    else globalThis.document = previous;
+  }
+});
 
 const live = (sequence, bytesReceived = sequence * 100, framesDecoded = sequence) => ({
   sequence, receivedAt: 1000, bytesReceived, framesDecoded, width: 1280, height: 720,

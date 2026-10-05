@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { APP, appHeaders, APP_STOP_FETCH_TIMEOUT_MS, configureAppContext } from './deployed-target.mjs';
 import { verifyCloudDeployment } from './verify-cloud-deployment.mjs';
 import { observeScreenResizes, readDesktopReadiness, waitForDesktopResize } from './desktop-resize-ready.mjs';
-import { waitForViewerProgress } from './viewer-progress.mjs';
+import { requestViewerProbe, waitForViewerProgress } from './viewer-progress.mjs';
 import { terminalContinuityCommand, assertProcessContinuity, waitForProcessSample } from './process-continuity.mjs';
 import { stopIsolatedComputer } from './isolated-computer.mjs';
 import { verifyEditorShortcut } from './editor-shortcut.mjs';
@@ -136,7 +136,7 @@ try {
   const close = app => page.evaluate(app => window.$(`.window[data-app="${app}"]`).close(), app);
   const relay = () => api(`/api/shell/relay-refresh?computerId=${encodeURIComponent(computerId)}`);
   const sample = async () => {
-    await page.evaluate(() => { const f = document.querySelector('.window[data-app="desktop"] iframe'); if (f) f.contentWindow.postMessage({ source: 'ezil-shell', type: 'viewer_probe', attempt: new URL(f.src).searchParams.get('ezilAttempt') }, new URL(f.src).origin); });
+    await page.evaluate(requestViewerProbe);
     return page.evaluate(() => window.__continuityVitals.at(-1));
   };
   let fallback = false;

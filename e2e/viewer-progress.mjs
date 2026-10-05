@@ -1,3 +1,15 @@
+/** Cold startup leaves the iframe blank until its runtime URL is available. */
+export function requestViewerProbe() {
+  const frame = document.querySelector('.window[data-app="desktop"] iframe');
+  if (!frame?.contentWindow || !frame.src) return false;
+  let url;
+  try { url = new URL(frame.src); } catch { return false; }
+  const attempt = url.searchParams.get('ezilAttempt');
+  if (!['https:', 'http:'].includes(url.protocol) || !attempt) return false;
+  frame.contentWindow.postMessage({ source: 'ezil-shell', type: 'viewer_probe', attempt }, url.origin);
+  return true;
+}
+
 /** Require two newly received media samples from the current navigation. */
 export async function waitForViewerProgress({ sample, afterSequence, timeoutMs = 60000,
   now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), fallback = false }) {
