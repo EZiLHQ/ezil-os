@@ -179,19 +179,67 @@ try {
   };
   const code = () => page.frames().find(f => /-code\./.test(f.url()));
   const openCode = async () => { await launch('code'); return bounded('Code workbench', async () => { const f = code(); return f && await f.locator('.monaco-workbench').count() ? f : null; }); };
+  const editorModifier = process.platform === 'darwin' ? 'Meta' : 'Control';
+  const closeModal = async f => {
+    const modal = f.locator('.monaco-modal-editor-block:visible');
+    if (await modal.count()) {
+      await modal.locator('.codicon-close').last().click();
+      await bounded('Code file saved and closed', async () => {
+        const save = f.getByRole('button', { name: 'Save', exact: true });
+        if (await save.isVisible()) await save.click();
+        return !await modal.count();
+      }, 15000);
+    }
+  };
   const command = async (f, text) => {
     await launch('code');
-    await f.locator('.monaco-workbench').click({ position: { x: 350, y: 180 } });
-    await page.keyboard.press('F1');
-    await f.locator('.quick-input-widget input').fill('>' + text);
-    await f.locator('.quick-input-list .monaco-list-row').filter({ hasText: text }).first().waitFor({ state: 'visible', timeout: 10000 });
-    await page.keyboard.press('Enter'); await wait(1200);
+    await closeModal(f);
+    const quick = f.locator('.quick-input-widget input:visible');
+    const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const row = f.locator('.quick-input-list .monaco-list-row:visible').filter({hasText:new RegExp('^'+escaped)}).first();
+    await bounded('Code command ready',async()=>{
+      if(!await quick.count())await f.locator('.command-center').click();
+      try {await quick.waitFor({state:'visible',timeout:1000});await quick.fill('>'+text);await row.waitFor({state:'visible',timeout:2000});return true;}catch{return false;}
+    },30000);
+    await row.click();await quick.waitFor({state:'hidden',timeout:15000});
+    if(text === 'Preferences: Open User Settings (JSON)') await f.locator('.monaco-modal-editor-block:visible .monaco-editor:visible .view-line').first().waitFor({state:'visible',timeout:15000});
+    await wait(1200);
+  };
+  const currentEditor = async f => {
+    const modal = f.locator('.monaco-modal-editor-block:visible');
+    if (await modal.count()) return modal.locator('.monaco-editor:visible').last();
+    return f.locator('.editor-instance .monaco-editor:visible').last();
+  };
+  const focusEditor = async f => {
+    const editor = await currentEditor(f);
+    await bounded('Code editor input focus',async()=>{
+      const line=editor.locator('.view-line').first();
+      if(!await line.count()) return false;
+      await line.click();
+      return editor.evaluate(el=>el.contains(document.activeElement));
+    },30000);
   };
   const setDocument = async (f, text) => {
-    await f.locator('.monaco-editor:visible textarea').last().focus();
-    await page.keyboard.press('Control+A'); await page.keyboard.insertText(text); await page.keyboard.press('Control+S'); await wait(1200);
+    await focusEditor(f);
+    await page.keyboard.press(editorModifier + '+A');
+    await page.keyboard.type(text);
+    await page.keyboard.press(editorModifier + '+S');
+    await wait(1200);
+    assert.ok((await readDocument(f)).includes(text.trim().split('\n')[0]),'Code document edit was not applied');
+    // Close the edited file and handle Code's explicit Save confirmation.
+    // Browser keyboard shortcuts can be intercepted on macOS.
+    if (await f.locator('.monaco-modal-editor-block:visible').count()) await closeModal(f);
+    else {
+      const tab = f.locator('.tabs-container .tab.active');
+      await tab.getByRole('button', { name: /^Close/ }).click();
+      await bounded('Code tab saved and closed', async () => {
+        const save = f.getByRole('button', { name: 'Save', exact: true });
+        if (await save.isVisible()) await save.click();
+        return !await f.locator('.monaco-dialog-box:visible').count();
+      }, 15000);
+    }
   };
-  const readDocument = f => f.locator('.monaco-editor:visible .view-lines').last().innerText();
+  const readDocument = async f => (await (await currentEditor(f)).locator('.view-lines').innerText()).replace(/\u00a0/g,' ');
   const verifyDarkTheme = async frame => {
     await bounded('rendered dark workbench', async () => frame.locator('.monaco-workbench').evaluate(el => {
       const color = getComputedStyle(el).getPropertyValue('--vscode-editor-background').trim();
@@ -201,7 +249,7 @@ try {
       return el.classList.contains('vs-dark') && Math.max(...rgb) < 100;
     }));
   };
-  const settings = '// continuity JSONC\n{"workbench.colorTheme":"Default Dark Modern","security.workspace.trust.enabled":false,"editor.accessibilitySupport":"on","files.autoSave":"off"}\n';
+  const settings = '// continuity JSONC\n{"workbench.colorTheme":"Dark Modern","security.workspace.trust.enabled":false,"editor.accessibilitySupport":"on","files.autoSave":"off"}\n';
   const bindings = '// continuity binding\n[{"key":"ctrl+alt+k","command":"workbench.action.files.save"}]\n';
   const marker = `continuity-${hash(computerId).slice(0, 10)}.txt`;
   const markerText = `hosted-checkpoint-${Date.now()}`;
@@ -210,22 +258,36 @@ try {
   await command(f, 'Preferences: Open User Settings (JSON)'); await setDocument(f, settings); await verifyDarkTheme(f);
   await command(f, 'Preferences: Open Keyboard Shortcuts (JSON)'); await setDocument(f, bindings);
   await command(f, 'File: New Untitled Text File');
-  await f.locator('.monaco-editor:visible textarea').last().focus(); await page.keyboard.insertText(markerText);
-  await page.keyboard.press('Control+Shift+S');
-  const savePath = f.locator('.quick-input-widget input'); await savePath.fill(`${workspace}/${marker}`); await page.keyboard.press('Enter'); await wait(2000);
+  await focusEditor(f); await page.keyboard.type(markerText);
+  await command(f,'File: Save As...');
+  const savePath = f.locator('.quick-input-widget input:visible');
+  await savePath.waitFor({state:'visible'});
+  await savePath.fill(`${workspace}/${marker}`);
+  await savePath.press('Enter');
+  await bounded('saved marker tab',async()=>{
+    const overwrite=f.getByRole('button',{name:'OK',exact:true});
+    if(await overwrite.isVisible()) await overwrite.click();
+    return f.locator('.tab').filter({hasText:marker}).count();
+  },15000);
   const verifyEditor = async () => {
     f = await openCode();
     await command(f, 'Preferences: Open User Settings (JSON)');
-    const restoredSettings = await readDocument(f); assert.ok(restoredSettings.includes('Default Dark Modern') && restoredSettings.includes('continuity JSONC'), 'Theme JSONC not restored'); await verifyDarkTheme(f);
+    const restoredSettings = await readDocument(f); assert.ok(restoredSettings.includes('Dark Modern') && restoredSettings.includes('continuity JSONC'), 'Theme JSONC not restored'); await verifyDarkTheme(f);
     assert.match(restoredSettings, /"files\.autoSave"\s*:\s*"off"/, 'Automatic save must stay disabled during shortcut acceptance');
     await command(f, 'Preferences: Open Keyboard Shortcuts (JSON)');
     const restoredBindings = await readDocument(f); assert.ok(restoredBindings.includes('ctrl+alt+k') && restoredBindings.includes('continuity binding'), 'Keybinding JSONC not restored');
-    await page.keyboard.press('Control+P'); await f.locator('.quick-input-widget input').fill(marker); await page.keyboard.press('Enter'); await wait(1500);
+    await closeModal(f);
+    await f.locator('.command-center').click();
+    await f.locator('.quick-input-widget input:visible').fill(marker);
+    await f.locator('.quick-input-list .monaco-list-row:visible').filter({hasText:marker}).first().click();
+    await wait(1500);
     const persistedMarker = await verifyEditorShortcut({
       read: () => readDocument(f), expected: markerText, proof: `shortcut-save-${++shortcutChecks}`,
       append: async proof => {
-        await f.locator('.monaco-editor:visible textarea').last().focus();
-        await page.keyboard.press('Control+End'); await page.keyboard.insertText(`\n${proof}`);
+        await focusEditor(f);
+        await page.keyboard.press(editorModifier === 'Meta' ? 'Meta+ArrowDown' : 'Control+End');
+        await page.keyboard.type(`\n${proof}`);
+        await bounded('rendered shortcut edit',async()=>(await readDocument(f)).includes(proof),10000);
       },
       pressShortcut: async () => { await page.keyboard.press('Control+Alt+K'); await wait(1200); },
       revert: () => command(f, 'File: Revert File'),
