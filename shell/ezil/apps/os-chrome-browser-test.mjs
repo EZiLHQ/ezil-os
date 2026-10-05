@@ -254,7 +254,15 @@ async function boot (viewport = { width: 1440, height: 900 }, { frameOk = true }
     // this same dock item. Done here rather than per scenario so there is one
     // place that decides what "a booted shell" means for this file.
     await page.evaluate(() => { $('.taskbar-item[data-app="desktop"]').trigger('click'); });
-    await sleep(1600);
+    if ( frameOk ) {
+        // Full-bleed follows decoded-frame evidence from this viewer. Waiting
+        // for that transition prevents a late boot from hiding the titlebar
+        // after the geometry scenario has already restored the window.
+        await page.waitForSelector('.window[data-app="desktop"].ezil-fullbleed', { timeout: 30_000 });
+    } else {
+        // The refused-frame scenario intentionally never reaches readiness.
+        await sleep(1600);
+    }
     return { page, page_errors };
 }
 
