@@ -40,8 +40,7 @@ if (!EMAIL || !PASS) { console.error('FAIL: set EZIL_E2E_EMAIL and EZIL_E2E_PASS
 /** The Worker's flush alarm backs off to 60 s; a release-triggered stop lands within one cycle plus the final checkpoint. */
 const AFTER_RELEASE_WAIT_MS = 100_000;
 const FILE = 'README.md';
-/** VS Code's tab `.label-name` shows the name WITHOUT its extension (the extension is a separate span). */
-const TAB_LABEL = FILE.replace(/\.[^.]+$/, '');
+const fileTab = frame => frame.locator('.tabs-container .tab').filter({hasText:FILE});
 
 const results = [];
 const check = (name, ok, detail = '') => {
@@ -124,14 +123,17 @@ try {
   let f = await openCode();
   check('Code opens to a live editor', !!f, `${Date.now() - t0}ms`);
   if (f) {
-    await p.waitForTimeout(4000);
-    await p.locator('.window[data-app="code"] iframe.window-app-iframe').click({ position: { x: 400, y: 300 } }).catch(() => {});
-    await p.keyboard.press('Control+P'); await p.waitForTimeout(1000);
-    await p.keyboard.type(FILE); await p.waitForTimeout(1500); await p.keyboard.press('Enter');
-    await p.waitForTimeout(3000);
+    // Use Code's visible file picker. An iframe click can leave focus in the
+    // workbench or welcome page, where the host shortcut never opens a file.
+    await f.locator('.command-center').click();
+    await f.locator('.quick-input-widget input:visible').fill(FILE);
+    await f.locator('.quick-input-list .monaco-list-row:visible').filter({hasText:FILE}).first().click();
+    await fileTab(f).first().waitFor({state:'visible',timeout:15000});
+    // Pin the editor tab so a preview tab can be restored on reopen.
+    await fileTab(f).first().dblclick();
   }
   const before = f ? await tabs(f) : [];
-  check(`a file opens in Code (${FILE})`, before.includes(TAB_LABEL), JSON.stringify(before));
+  check(`a file opens in Code (${FILE})`, !!f && await fileTab(f).count() === 1, JSON.stringify(before));
 
   // 2. The desktop, then close it: the release.
   try { await p.locator('.taskbar-item').filter({ hasText: /browser/i }).first().click({ timeout: 12000 }); }
@@ -161,7 +163,7 @@ try {
   check('Code reopens to a live editor', !!f, `${Date.now() - t1}ms`);
   await p.waitForTimeout(5000);
   const after = f ? await tabs(f) : [];
-  check(`🔴 reopening Code restores the open file (${FILE})`, after.includes(TAB_LABEL), JSON.stringify(after));
+  check(`🔴 reopening Code restores the open file (${FILE})`, !!f && await fileTab(f).count() === 1, JSON.stringify(after));
 
   // 6. The Browser/Desktop surface: reopen the desktop after its own release.
   try { await p.locator('.taskbar-item').filter({ hasText: /browser/i }).first().click({ timeout: 12000 }); }
