@@ -1,3 +1,6 @@
+import { relayOperation, RelayFailure, type RelayState } from './relay-refresh';
+import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, failCheckpointWrites,
+  AcceptanceFaultError, type AcceptanceFaultState } from './acceptance-faults';
 /**
  * EBuilder — Cloudflare Guacamole Sandbox Worker (production)
  *
@@ -242,6 +245,9 @@ interface Env extends SandboxEnv {
    * the one an operator can turn without redeploying an image.
    */
   SANDBOX_BROWSER?: string;
+  /** Explicit isolated staging computer only; absent in production. */
+  EZIL_ACCEPTANCE_ENV?: string;
+  EZIL_ACCEPTANCE_SANDBOX?: string;
 
   /**
    * Non-secret kill-switch for the activity-heartbeat control route
@@ -607,6 +613,7 @@ import {
   type LogEvent,
 } from './observability';
 import { parseRequestedScreen, formatNekoScreen, fitScreenRequest } from './screen-modes';
+import { captureEditorState } from './editor-state';
 import {
   selectTelemetryWorthy,
   toTelemetryEventInput,
@@ -761,6 +768,9 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
  * not a new transport.
  */
 interface EzilWorkspacePersistRpc {
+  setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void>;
+  desktopReachable(): Promise<boolean>;
+  relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayState>;
   hydrateWorkspace(params: { mountPath: string; prefix: string }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }>;
   /** Start capturing user changes outside /workspace (system layer). Called once the desktop is up. */
   baselineSystem(): Promise<boolean>;
@@ -2301,6 +2311,16 @@ export function validateActivityBody(
  * identity is unchanged, only new methods are added on top of it.
  */
 class EzilSandboxDO extends CFSandboxClass<Env> {
+  async setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void> {
+    assertAcceptanceScope(this.env, sandboxId);
+    const fault = parseAcceptanceFault(raw);
+    await this.ctx.storage.put('ezil_acceptance_fault', { sandboxId, fault });
+  }
+  private async acceptanceFault(sandboxId?: string): Promise<string | null> {
+    const saved = await this.ctx.storage.get<{sandboxId: string; fault: AcceptanceFaultState | null}>('ezil_acceptance_fault');
+    if (!saved || sandboxId && saved.sandboxId !== sandboxId) return null;
+    return activeAcceptanceFault(this.env, saved.sandboxId, saved.fault);
+  }
   /**
    * Reentrancy guard for `restartDesktopStack()`. A DO instance is a single
    * JS object handling one request at a time cooperatively, but `await`
@@ -2311,6 +2331,37 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * (`outcome: 'restart_in_progress'`) instead of a race.
    */
   private restartInProgress = false;
+  private runtimeMutationTail: Promise<unknown> = Promise.resolve();
+  private withRuntimeMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const next = (this.runtimeMutationTail ?? Promise.resolve()).catch(() => undefined).then(operation);
+    this.runtimeMutationTail = next.then(() => undefined, () => undefined);
+    return next;
+  }
+  async desktopReachable(): Promise<boolean> {
+    if (!this.containerIsRunning()) return false;
+    const probe = await pollDesktopReady(this, 1000, 100, 8181, '/');
+    return probe.ready;
+  }
+  async relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayState> {
+    const requestedAt = Date.now();
+    return this.withRuntimeMutation(() => this.withWorkspacePersistence(async () => {
+      // A queued request that outlived the caller's forwarding budget must
+      // never apply a late configuration change to a resumed runtime.
+      if (Date.now() - requestedAt > 3_000) throw new RelayFailure('relay_busy', 409);
+      if (!this.containerIsRunning()) throw new RelayFailure('relay_runtime_not_running', 409);
+      const credentials = await deriveNekoCredentials(this.env, sandboxId);
+      // Local TCP transport cannot start a stopped container, and its signal
+      // is cancellable here without crossing the Sandbox RPC boundary.
+      const transport = { containerFetch: (url: string, init?: RequestInit) => this.ctx.container!.getTcpPort(8181).fetch(url, init) };
+      return relayOperation(transport, credentials.admin, { runtimeId, ...(runtimeId ? { mint: async (signal: AbortSignal) => {
+        if (await this.acceptanceFault(sandboxId) === 'turn_unavailable') throw new RelayFailure('turn_unavailable');
+        const issuedAt = Date.now();
+        const servers = await generateTurnCredentials(this.env, signal);
+        if (!servers) throw new RelayFailure('turn_unavailable');
+        return { servers, expiresAt: issuedAt + resolveTurnTtlSeconds(this.env.SANDBOX_NEKO_TURN_TTL_SECONDS) * 1000 };
+      } } : {}) });
+    }));
+  }
 
   /** Serialize hydrate, flush and teardown across this DO's await points. */
   private workspacePersistenceTail: Promise<unknown> = Promise.resolve();
@@ -2443,9 +2494,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     const lastUploadAt = (await this.ctx.storage.get<number>(WORKSPACE_LAST_UPLOAD_AT_KEY)) ?? 0;
     const deferIfChanged = !!options?.allowDefer && Date.now() - lastUploadAt < MIN_CHANGED_CHECKPOINT_MS;
     try {
+      if (hydrated) await captureEditorState(this, wctx.mountPath);
       outcome = await flushWorkspaceToR2({
         container: this,
-        bucket,
+        bucket: await this.acceptanceFault() === 'checkpoint_write_failed' ? failCheckpointWrites(bucket) : bucket,
         mountPath: wctx.mountPath,
         realPrefix: wctx.prefix,
         manifest,
@@ -2710,7 +2762,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    */
   async flushWorkspaceScheduled(): Promise<void> {
     try {
-      await this.withWorkspacePersistence(() => this.runScheduledFlushCycle());
+      await this.withRuntimeMutation(() => this.withWorkspacePersistence(() => this.runScheduledFlushCycle()));
     } catch (err) {
       // 🔴 The SDK's alarm dispatcher deletes this callback's schedule row
       // after it returns — whether it returned or THREW — and never
@@ -3013,7 +3065,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * label) rather than `<sandboxId>`.
    */
   async terminateSandbox(): Promise<TerminateReport> {
-    return this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint());
+    return this.withRuntimeMutation(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint()));
   }
 
   private async terminateSandboxWithCheckpoint(): Promise<TerminateReport> {
@@ -3180,6 +3232,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       };
     }
     this.restartInProgress = true;
+    return this.withRuntimeMutation(async () => {
     try {
       const exposedBefore = await this.getExposedPorts(hostname);
       const status = describeDesktopStatus(exposedBefore, explicitMode, fallbackMode);
@@ -3377,6 +3430,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     } finally {
       this.restartInProgress = false;
     }
+    });
   }
 }
 
@@ -3509,7 +3563,7 @@ function normalizeSandboxHostname(host: string, configuredRoot?: string): string
  * `checkIceConfig`). Throws with a non-secret error on an API failure so the
  * caller can fail closed rather than launch a relay-less (hanging) session.
  */
-async function generateTurnCredentials(env: Env): Promise<IceServerEntry[] | null> {
+async function generateTurnCredentials(env: Env, signal: AbortSignal = AbortSignal.timeout(20_000)): Promise<IceServerEntry[] | null> {
   const keyId = env.SANDBOX_NEKO_TURN_KEY_ID?.trim();
   const apiToken = env.SANDBOX_NEKO_TURN_API_TOKEN?.trim();
   if (!keyId || !apiToken) return null;
@@ -3524,6 +3578,7 @@ async function generateTurnCredentials(env: Env): Promise<IceServerEntry[] | nul
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ ttl }),
+      signal,
     });
   } catch (err) {
     // Never include the token in the surfaced error.
@@ -3558,8 +3613,10 @@ async function generateTurnCredentials(env: Env): Promise<IceServerEntry[] | nul
  * when neither is configured (diagnostic/no-TURN path — behavior unchanged).
  */
 async function resolveNekoIceEnv(env: Env): Promise<Record<string, string> | null> {
+  const issuedAt = Date.now();
   const cloudflare = await generateTurnCredentials(env);
-  if (cloudflare) return buildNekoIceEnv(cloudflare);
+  if (cloudflare) return { ...buildNekoIceEnv(cloudflare),
+    EZIL_RELAY_EXPIRES_AT: String(issuedAt + resolveTurnTtlSeconds(env.SANDBOX_NEKO_TURN_TTL_SECONDS) * 1000) };
 
   const staticUrls = env.SANDBOX_NEKO_TURN_URLS?.trim();
   if (staticUrls) {
@@ -3915,8 +3972,16 @@ async function handlePreview(
       return json({ ok: false, error: 'workspace_checkpoint_failed' }, 503);
     }
 
+    let relay: RelayState | undefined;
+    if (mode === 'neko' && env.SANDBOX_NEKO_TURN_KEY_ID) {
+      relay = await sandbox.relayRefresh(sandboxId);
+      // Warm opens apply renewal to the existing processes rather than discard
+      // new credentials or replace the computer.
+      if (relay.expiresAt <= Date.now() + 60_000) relay = await sandbox.relayRefresh(sandboxId, relay.runtimeId);
+    }
     const response = json({
       ok: true,
+      relay,
       guacamoleUrl,
       expiresAt: Date.now() + SESSION_TTL_MS,
       provider: mode === 'neko' ? 'cloudflare-neko' : 'cloudflare-guacamole',
@@ -5127,6 +5192,7 @@ async function handleScreenRead(env: Env, sandboxName: string): Promise<Response
 
   try {
     const sandbox = openSandbox(env, sandboxName);
+    if (!await sandbox.desktopReachable()) return json({ ok: false, sandboxId: sandboxName, error: 'screen_starting' }, 409);
     const creds = await deriveNekoCredentials(env, sandboxName);
 
     const loginRes = await withDeadline(sandbox.containerFetch(
@@ -5205,6 +5271,7 @@ async function handleScreen(request: Request, env: Env, sandboxName: string): Pr
 
   try {
     const sandbox = openSandbox(env, sandboxName);
+    if (!await sandbox.desktopReachable()) return json({ ok: false, sandboxId: sandboxName, error: 'screen_starting' }, 409);
     const creds = await deriveNekoCredentials(env, sandboxName);
 
     // 🔴 No token cache here, deliberately. The app's `nekoAdminTokens` cache
@@ -6300,6 +6367,43 @@ export default {
         decodeURIComponent(browserMatch[1]),
         browserMatch[2],
       );
+    }
+
+    const acceptanceMatch = path.match(/^\/sandbox\/([^/]+)\/acceptance-fault$/);
+    if (method === 'POST' && acceptanceMatch) {
+      const name = decodeURIComponent(acceptanceMatch[1]);
+      try { assertAcceptanceScope(env, name); } catch { return json({ok:false,error:'acceptance_faults_disabled'},404); }
+      if (resolvePreviewSecrets(env).length === 0) return json({ok:false,error:'acceptance_auth_not_configured'},401);
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      try {
+        const raw = await request.json().catch(() => null);
+        parseAcceptanceFault(raw);
+        await openSandbox(env,name).setAcceptanceFault(name,raw);
+        return json({ok:true});
+      } catch (error) {
+        return json({ok:false,error:error instanceof AcceptanceFaultError ? error.code : 'acceptance_fault_failed'},
+          error instanceof AcceptanceFaultError ? error.status : 502);
+      }
+    }
+    const relayMatch = path.match(/^\/sandbox\/([^/]+)\/relay-refresh$/);
+    if ((method === 'GET' || method === 'POST') && relayMatch) {
+      if (resolvePreviewSecrets(env).length === 0) return json({ok:false,error:'relay_auth_not_configured'},401);
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      const name = decodeURIComponent(relayMatch[1]);
+      try {
+        let runtimeId: string | undefined;
+        if (method === 'POST') {
+          let body: {runtimeId?:unknown};
+          try { body = await request.json(); } catch { return json({ok:false,error:'relay_bad_request'},400); }
+          if (!body || typeof body !== 'object' || typeof body.runtimeId !== 'string' || !/^[a-f0-9]{32}$/.test(body.runtimeId)) return json({ ok:false,error:'relay_bad_request' },400);
+          runtimeId = body.runtimeId;
+        }
+        return json({ ok:true, ...await openSandbox(env,name).relayRefresh(name,runtimeId) });
+      } catch (error) {
+        return json({ ok:false,error:error instanceof RelayFailure ? error.code : 'relay_refresh_failed' },error instanceof RelayFailure ? error.status : 502);
+      }
     }
 
     const focusMatch = path.match(/^\/sandbox\/([^/]+)\/focus$/);

@@ -142,10 +142,10 @@ jobs:
 
   preview:
     name: Deploy and verify staging
-    needs: trust
+    needs: [trust, images]
     if: needs.trust.outputs.allowed == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 150
     # Lock through verification so another trusted branch cannot replace the
     # shared staging Worker while the browser suites are running.
     concurrency:
@@ -200,6 +200,7 @@ jobs:
               assert stage.get(key), f'env.staging must explicitly configure {key}'
           assert stage['vars'].get('SANDBOX_DEFAULT_DESKTOP_MODE') == 'neko', 'Staging must enable neko'
           assert stage['vars'].get('SANDBOX_NEKO_ICE_POLICY') == 'relay', 'Staging must use TURN relay'
+          assert str(stage['vars'].get('SANDBOX_NEKO_TURN_TTL_SECONDS')) == '300', 'Short cloud gate requires five-minute TURN credentials'
           production_routes = {r['pattern'] for r in config.get('routes', [])}
           assert all(r['pattern'] not in production_routes for r in stage['routes']), 'Staging reuses a production route'
           production_zones = {r['zone_name'] for r in config.get('routes', []) if r.get('zone_name')}
@@ -245,22 +246,41 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      - name: Download tested candidate image identities
+        uses: actions/download-artifact@v4
+        with:
+          name: os-images-${{ needs.trust.outputs.sha }}
+      - name: Prepare staging from the tested candidate digest
+        run: |
+          node .github/scripts/release-state.mjs prepare
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('worker/wrangler.toml')
+          path.write_text(path.read_text().replace('image = "./Dockerfile"', 'image = "./Dockerfile.release"'))
+          PY
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
           aws-region: us-east-1
+          role-duration-seconds: 7200
       - name: Acquire shared staging lease
         id: lease
         env:
           LEASE_OWNER: os-${{ github.run_id }}-${{ github.run_attempt }}
-        run: python3 .github/scripts/staging-lock.py acquire --owner "$LEASE_OWNER" --ttl 5400 --wait 1200
+        run: python3 .github/scripts/staging-lock.py acquire --owner "$LEASE_OWNER" --ttl 10800 --wait 1200
       - name: Deploy named staging Worker
         working-directory: worker
         timeout-minutes: 25
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: ./node_modules/.bin/wrangler deploy --env staging --message "git:$EZIL_DEPLOY_SHA"
+          EZIL_ACCEPTANCE_SANDBOX: ${{ secrets.EZIL_ACCEPTANCE_SANDBOX }}
+        run: |
+          set -euo pipefail
+          ttl=300
+          if [[ "${{ needs.trust.outputs.production }}" == true ]]; then ttl=1800; fi
+          test -n "$EZIL_ACCEPTANCE_SANDBOX" || { echo '::error::Missing isolated acceptance sandbox'; exit 1; }
+          ./node_modules/.bin/wrangler deploy --env staging --var "SANDBOX_NEKO_TURN_TTL_SECONDS:$ttl" --var "EZIL_ACCEPTANCE_ENV:staging" --var "EZIL_ACCEPTANCE_SANDBOX:$EZIL_ACCEPTANCE_SANDBOX" --message "git:$EZIL_DEPLOY_SHA"
       - name: Verify active staging Worker SHA and health
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -306,6 +326,38 @@ jobs:
           for suite in prod prod-responsiveness prod-window-stacking prod-reconcile prod-lifecycle; do
             node "e2e/$suite.mjs"
           done
+      - name: Renew staging lease credentials before long acceptance
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
+          aws-region: us-east-1
+          role-duration-seconds: 7200
+      - name: Hosted continuity release gate
+        timeout-minutes: 90
+        env:
+          EZIL_CONTINUITY_MODE: ${{ needs.trust.outputs.production == 'true' && 'full' || 'short' }}
+          EZIL_ACCEPTANCE_HMAC_SECRET: ${{ secrets.EZIL_ACCEPTANCE_HMAC_SECRET }}
+          EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
+          EZIL_E2E_WORKSPACE_PATH: ${{ vars.EZIL_E2E_WORKSPACE_PATH }}
+          EZIL_WRANGLER_BIN: ./worker/node_modules/.bin/wrangler
+          EZIL_E2E_R2_BUCKET: ${{ vars.EZIL_E2E_R2_BUCKET }}
+          EZIL_E2E_R2_PREFIX: ${{ secrets.EZIL_E2E_R2_PREFIX }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+        run: node e2e/hosted-continuity.mjs
+      - name: Upload hosted continuity evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-continuity-${{ needs.trust.outputs.sha }}-${{ github.run_attempt }}
+          path: hosted-continuity-evidence/
+          if-no-files-found: error
       - name: Confirm deployment identity after tests
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -325,7 +377,7 @@ jobs:
   images:
     name: Build and test release images
     needs: trust
-    if: needs.trust.outputs.production == 'true'
+    if: needs.trust.outputs.allowed == 'true'
     permissions:
       contents: read
       packages: write
@@ -526,9 +578,27 @@ jobs:
         run: |
           set -euo pipefail
           node e2e/await-deployed-bundle.mjs
-          for suite in prod prod-responsiveness prod-window-stacking prod-reconcile; do
+          for suite in prod prod-responsiveness prod-window-stacking prod-reconcile prod-lifecycle; do
             node "e2e/$suite.mjs"
           done
+      - name: Hosted production persistence verification
+        timeout-minutes: 15
+        env:
+          EZIL_CONTINUITY_MODE: essential
+          EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
+          EZIL_E2E_WORKSPACE_PATH: ${{ vars.EZIL_E2E_WORKSPACE_PATH }}
+          EZIL_WRANGLER_BIN: ./worker/node_modules/.bin/wrangler
+          EZIL_E2E_R2_BUCKET: ${{ vars.EZIL_E2E_R2_BUCKET }}
+          EZIL_E2E_R2_PREFIX: ${{ secrets.EZIL_E2E_R2_PREFIX }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+        run: node e2e/hosted-continuity.mjs
       - name: Confirm deployment identity after tests
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -550,7 +620,7 @@ jobs:
         run: |
           set -euo pipefail
           node e2e/await-deployed-bundle.mjs
-          for suite in prod prod-responsiveness prod-window-stacking prod-reconcile; do
+          for suite in prod prod-responsiveness prod-window-stacking prod-reconcile prod-lifecycle; do
             node "e2e/$suite.mjs"
           done
       - name: Record canonical identity and distinct Cloudflare container digest
@@ -636,6 +706,7 @@ jobs:
             production-release.json
             rollback-state.json
             container-rollback.json
+            hosted-continuity-evidence/
           if-no-files-found: warn
       - name: Release shared production lease
         if: always() && steps.production_lease.outcome == 'success'

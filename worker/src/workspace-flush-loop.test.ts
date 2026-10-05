@@ -123,6 +123,7 @@ interface FakeOptions {
   listFilesThrows?: boolean;
   /** Make the R2 `put` reject, so the flush reports a real failure. */
   bucketPutThrows?: boolean;
+  editorCaptureFails?: boolean;
   /** Seed values for DO storage. */
   storage?: Record<string, unknown>;
 }
@@ -207,6 +208,9 @@ async function makeFake(opts: FakeOptions = {}): Promise<FakeDO & Record<string,
     destroy: async () => void calls.destroys++,
     exec: async (command: string) => {
       calls.execs.push(command);
+      if (command.startsWith('bash /usr/local/bin/editor-state.sh capture ')) {
+        return { exitCode: opts.editorCaptureFails ? 1 : 0, stdout: '' };
+      }
       if (command.startsWith('python3 ')) {
         if (command.includes('"op":"capture"')) {
           if (opts.listFilesThrows) throw new Error('container RPC failed: connection reset');
@@ -594,6 +598,24 @@ describe('preserved invariant: the alarm never bumps LAST_ACTIVITY_AT_KEY', () =
 describe('preserved invariant: final flush before stop, and stop only if it worked', () => {
   const idleStorage = () => hydratedStorage({ [LAST_ACTIVITY_AT_KEY]: Date.now() - 2 * IDLE_STOP_MS });
 
+  it('captures editor settings before snapshot creation and refuses stop when capture fails', async () => {
+    const fake = await makeFake({ storage: idleStorage(), editorCaptureFails: true });
+    await runAlarmCycle(fake);
+    expect(fake.calls.execs.some(c => c.startsWith('bash /usr/local/bin/editor-state.sh capture '))).toBe(true);
+    expect(fake.calls.execs.some(c => c.startsWith('python3 ') && c.includes('"op":"capture"'))).toBe(false);
+    expect(fake.calls.r2Puts).toEqual([]);
+    expect(fake.calls.stops).toBe(0);
+    expect(fake.calls.scheduled.length).toBeGreaterThan(0);
+
+    const ok = await makeFake({ storage: idleStorage() });
+    await runAlarmCycle(ok);
+    const editor = ok.calls.execs.findIndex(c => c.startsWith('bash /usr/local/bin/editor-state.sh capture '));
+    const snapshot = ok.calls.execs.findIndex(c => c.startsWith('python3 ') && c.includes('"op":"capture"'));
+    expect(editor).toBeGreaterThan(-1);
+    expect(snapshot).toBeGreaterThan(editor);
+    expect(ok.calls.stops).toBe(1);
+  });
+
   it('an idle, quiet container is flushed and THEN stopped', async () => {
     const fake = await makeFake({
       storage: idleStorage(),
@@ -629,7 +651,7 @@ describe('preserved invariant: final flush before stop, and stop only if it work
     // The busy probe having run proves the idle branch really was taken, so
     // the surviving reschedule below is the idle-retry path rather than the
     // wrapper swallowing an early throw.
-    expect(fake.calls.execs.filter(c => !c.startsWith('python3 ')).length).toBe(1);
+    expect(fake.calls.execs.filter(c => !c.startsWith('python3 ') && !c.startsWith('bash /usr/local/bin/editor-state.sh')).length).toBe(1);
     expect(fake.calls.stops).toBe(0);
     expect(fake.calls.scheduled).toEqual([{ seconds: 10, callback: FLUSH_CALLBACK }]);
   });

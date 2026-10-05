@@ -1079,3 +1079,25 @@ describe('APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS', () => {
         expect(APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS).toBe(5 * 60 * 1000);
     });
 });
+
+describe('relay refresh signed transport', () => {
+    it('signs reads and runtime-fenced refreshes without returning credentials', async () => {
+        const { requestRelayRefresh } = await import('./cloudflare-guacamole-provider');
+        const runtimeId='a'.repeat(32);
+        const spy=vi.fn(async()=>Response.json({ok:true,runtimeId,expiresAt:Date.now()+300000}));
+        vi.stubGlobal('fetch',spy);
+        for (const runtime of [undefined,runtimeId]) {
+            const result=await requestRelayRefresh(CONFIG,'relay-secret-test-only','guac-owner-computer','correlation-test',runtime);
+            expect(result).toMatchObject({ok:true,runtimeId});
+            const [url,init]=spy.mock.calls.at(-1)! as unknown as [string,RequestInit];
+            expect(url).toBe(`${CONFIG.workerUrl}/sandbox/guac-owner-computer/relay-refresh`);
+            expect(init.method).toBe(runtime?'POST':'GET');
+            const authorization=new Headers(init.headers).get('authorization')!;
+            const match=authorization.match(/^Bearer t=(\d+),v1=([a-f0-9]{64})$/)!;
+            expect(match).not.toBeNull();
+            expect(match[2]).toBe(createHmac('sha256','relay-secret-test-only').update(`${match[1]}.POST./sandbox/preview.`).digest('hex'));
+            if(runtime)expect(JSON.parse(String(init.body))).toEqual({runtimeId});
+            expect(init.cache).toBe('no-store');
+        }
+    });
+});

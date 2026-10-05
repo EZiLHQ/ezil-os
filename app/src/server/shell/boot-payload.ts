@@ -53,6 +53,7 @@ interface ShellComputerRecord {
 
 /** The HTTP surface the shell talks to. Declared once; the Route Handlers live at these paths. */
 export const SHELL_API_ROUTES = {
+    relayRefresh: '/api/shell/relay-refresh',
     /** GET = read the current session (never writes). POST = get-or-create the default computer. */
     session: '/api/shell/session',
     /** GET = cheap status poll. POST = start/attach the desktop (a COLD BOOT, ~22s). */

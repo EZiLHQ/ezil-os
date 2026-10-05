@@ -1,0 +1,367 @@
+diff --git a/client/src/neko/base.ts b/client/src/neko/base.ts
+index 8ea87659..4beea489 100644
+--- a/client/src/neko/base.ts
++++ b/client/src/neko/base.ts
+@@ -19,6 +19,9 @@ export interface BaseEvents {
+ }
+ 
+ export abstract class BaseClient extends EventEmitter<BaseEvents> {
++  private _signalTail: Promise<void> = Promise.resolve()
++  private _makingOffer = false
++
+   protected _ws?: WebSocket
+   protected _ws_heartbeat?: number
+   protected _peer?: RTCPeerConnection
+@@ -70,10 +73,10 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
+       this._ws = new WebSocket(
+         `${url}?password=${encodeURIComponent(password)}&username=${encodeURIComponent(displayname)}`,
+       )
+-      this.emit('debug', `connecting to ${this._ws.url}`)
++      this.emit('debug', 'connecting websocket')
+       this._ws.onmessage = this.onMessage.bind(this)
+-      this._ws.onerror = () => this.onError.bind(this)
+-      this._ws.onclose = () => this.onDisconnected.bind(this, new Error('websocket closed'))
++      this._ws.onerror = this.onError.bind(this)
++      this._ws.onclose = () => this.onDisconnected(new Error('websocket closed'))
+       this._timeout = window.setTimeout(this.onTimeout.bind(this), 15000)
+     } catch (err: any) {
+       this.onDisconnected(err)
+@@ -330,9 +333,16 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
+ 
+     this._peer.onnegotiationneeded = async () => {
+       this.emit('warn', `negotiation is needed`)
++      if (!this._peer || this._peer.signalingState !== 'stable' || this._makingOffer) return
+ 
+-      const d = await this._peer!.createOffer()
+-      await this._peer!.setLocalDescription(d)
++      const peer = this._peer
++      this._makingOffer = true
++      let d: RTCSessionDescriptionInit
++      try {
++        d = await peer.createOffer()
++        if (peer !== this._peer || peer.signalingState !== 'stable') return
++        await peer.setLocalDescription(d)
++      } finally { this._makingOffer = false }
+ 
+       this._ws!.send(
+         JSON.stringify({
+@@ -354,6 +364,8 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
+       return
+     }
+ 
++    // Browser is the polite peer when a server renewal offer crosses a local offer.
++    if (this._peer.signalingState === 'have-local-offer') await this._peer.setLocalDescription({ type: 'rollback' })
+     await this._peer.setRemoteDescription({ type: 'offer', sdp })
+ 
+     for (const candidate of this._candidates) {
+@@ -367,7 +379,7 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
+       // add stereo=1 to answer sdp to enable stereo audio for chromium
+       d.sdp = d.sdp?.replace(/(stereo=1;)?useinbandfec=1/, 'useinbandfec=1;stereo=1')
+ 
+-      this._peer!.setLocalDescription(d)
++      await this._peer!.setLocalDescription(d)
+ 
+       this._ws!.send(
+         JSON.stringify({
+@@ -390,10 +402,15 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
+     await this._peer.setRemoteDescription({ type: 'answer', sdp })
+   }
+ 
+-  private async onMessage(e: MessageEvent) {
++  private onMessage(e: MessageEvent) {
++    this._signalTail = this._signalTail.catch(() => undefined).then(() => this.handleMessage(e))
++    return this._signalTail
++  }
++
++  private async handleMessage(e: MessageEvent) {
+     const { event, ...payload } = JSON.parse(e.data) as WebSocketMessages
+ 
+-    this.emit('debug', `received websocket event ${event} ${payload ? `with payload: ` : ''}`, payload)
++    this.emit('debug', `received websocket event ${event}`)
+ 
+     if (event === EVENT.SIGNAL.PROVIDE) {
+       const { sdp, lite, ice, id } = payload as SignalProvidePayload
+@@ -404,7 +421,8 @@ export abstract class BaseClient extends EventEmitter<BaseEvents> {
+     }
+ 
+     if (event === EVENT.SIGNAL.OFFER) {
+-      const { sdp } = payload as SignalOfferPayload
++      const { sdp, ice } = payload as SignalOfferPayload & { ice?: RTCIceServer[] }
++      if (ice && this._peer) this._peer.setConfiguration({ ...this._peer.getConfiguration(), iceServers: ice })
+       await this.setRemoteOffer(sdp)
+       return
+     }
+diff --git a/server/cmd/serve.go b/server/cmd/serve.go
+index b8ff37c4..beb96ab7 100644
+--- a/server/cmd/serve.go
++++ b/server/cmd/serve.go
+@@ -182,6 +182,8 @@ func (c *serve) Start(cmd *cobra.Command) {
+ 		c.managers.capture,
+ 	)
+ 
++	c.managers.api.AddRouter("/relay", c.managers.webRTC.RelayRoute(c.managers.session))
++
+ 	c.managers.plugins = plugins.New(
+ 		&c.configs.Plugins,
+ 	)
+diff --git a/server/internal/http/legacy/message/messages.go b/server/internal/http/legacy/message/messages.go
+index 89cf4e4c..34014aea 100644
+--- a/server/internal/http/legacy/message/messages.go
++++ b/server/internal/http/legacy/message/messages.go
+@@ -35,6 +35,7 @@ type SignalProvide struct {
+ type SignalOffer struct {
+ 	Event string `json:"event"`
+ 	SDP   string `json:"sdp"`
++	ICE []webrtc.ICEServer `json:"ice,omitempty"`
+ }
+ 
+ type SignalAnswer struct {
+diff --git a/server/internal/http/legacy/session.go b/server/internal/http/legacy/session.go
+index 678fe23a..e7950e4d 100644
+--- a/server/internal/http/legacy/session.go
++++ b/server/internal/http/legacy/session.go
+@@ -9,6 +9,7 @@ import (
+ 	"path"
+ 	"strings"
+ 	"sync"
++ "time"
+ 
+ 	oldTypes "github.com/m1k1o/neko/server/internal/http/legacy/types"
+ 
+@@ -143,7 +144,8 @@ func (s *session) toClient(payload any) error {
+ 	s.muClient.Lock()
+ 	defer s.muClient.Unlock()
+ 
+-	err := s.connClient.WriteJSON(payload)
++	if err:=s.connClient.SetWriteDeadline(time.Now().Add(2*time.Second));err!=nil{return err}
++ err := s.connClient.WriteJSON(payload)
+ 	if err != nil {
+ 		return fmt.Errorf("%w: %s", ErrWebsocketSend, err)
+ 	}
+@@ -161,7 +163,8 @@ func (s *session) toBackend(event string, payload any) error {
+ 		return err
+ 	}
+ 
+-	err = s.connBackend.WriteJSON(types.WebSocketMessage{
++	if err:=s.connBackend.SetWriteDeadline(time.Now().Add(2*time.Second));err!=nil{return err}
++ err = s.connBackend.WriteJSON(types.WebSocketMessage{
+ 		Event:   event,
+ 		Payload: rawPayload,
+ 	})
+diff --git a/server/internal/http/legacy/wstoclient.go b/server/internal/http/legacy/wstoclient.go
+index 8304acfe..f8f505f0 100644
+--- a/server/internal/http/legacy/wstoclient.go
++++ b/server/internal/http/legacy/wstoclient.go
+@@ -447,6 +447,7 @@ func (s *session) wsToClient(msg []byte) error {
+ 		return s.toClient(&oldMessage.SignalOffer{
+ 			Event: oldEvent.SIGNAL_OFFER,
+ 			SDP:   request.SDP,
++			ICE: toWebRTCICEServers(request.ICEServers),
+ 		})
+ 
+ 	case event.SIGNAL_ANSWER:
+@@ -757,3 +758,9 @@ func (s *session) wsToClient(msg []byte) error {
+ 		return fmt.Errorf("unknown event type: %s", data.Event)
+ 	}
+ }
++
++func toWebRTCICEServers(servers []types.ICEServer) []webrtc.ICEServer {
++    out := make([]webrtc.ICEServer,0,len(servers))
++    for _, s := range servers { out=append(out,webrtc.ICEServer{URLs:s.URLs,Username:s.Username,Credential:s.Credential,CredentialType:webrtc.ICECredentialTypePassword}) }
++    return out
++}
+diff --git a/server/internal/session/session.go b/server/internal/session/session.go
+index e96a3e74..086f489b 100644
+--- a/server/internal/session/session.go
++++ b/server/internal/session/session.go
+@@ -2,6 +2,7 @@ package session
+ 
+ import (
+ 	"sync"
++ "fmt"
+ 	"time"
+ 
+ 	"github.com/rs/zerolog"
+@@ -310,3 +311,13 @@ func (session *SessionCtx) GetWebRTCPeer() types.WebRTCPeer {
+ 
+ 	return session.webrtcPeer
+ }
++
++// Relay delivery is bounded and reports write failure, unlike broadcast Send.
++func (session *SessionCtx) SendRelay(event string,payload any,deadline time.Time) error {
++ session.websocketMu.Lock()
++ peer:=session.websocketPeer
++ session.websocketMu.Unlock()
++ sender,ok:=peer.(interface { SendBefore(string,any,time.Time) error })
++ if !ok { return fmt.Errorf("relay viewer disconnected") }
++ return sender.SendBefore(event,payload,deadline)
++}
+diff --git a/server/internal/webrtc/manager.go b/server/internal/webrtc/manager.go
+index c99c9af6..56fd533e 100644
+--- a/server/internal/webrtc/manager.go
++++ b/server/internal/webrtc/manager.go
+@@ -83,6 +83,8 @@ func New(desktop types.DesktopManager, capture types.CaptureManager, config *con
+ 		metrics: newMetricsManager(),
+ 
+ 		webrtcConfiguration: configuration,
++		relayRuntime: newRelayRuntime(),
++		relayExpires: initialRelayExpiry(),
+ 
+ 		desktop:     desktop,
+ 		capture:     capture,
+@@ -103,6 +105,10 @@ type WebRTCManagerCtx struct {
+ 	curPosition cursor.Position
+ 
+ 	webrtcConfiguration webrtc.Configuration
++	relayMu sync.RWMutex
++ relayOperationMu sync.Mutex
++	relayRuntime string
++	relayExpires int64
+ 
+ 	tcpMux ice.TCPMux
+ 	udpMux ice.UDPMux
+@@ -149,8 +155,6 @@ func (manager *WebRTCManagerCtx) Start() {
+ 	manager.logger.Info().
+ 		Bool("icelite", manager.config.ICELite).
+ 		Bool("icetrickle", manager.config.ICETrickle).
+-		Interface("iceservers-frontend", manager.config.ICEServersFrontend).
+-		Interface("iceservers-backend", manager.config.ICEServersBackend).
+ 		Str("nat1to1", strings.Join(manager.config.NAT1To1IPs, ",")).
+ 		Str("epr", fmt.Sprintf("%d-%d", manager.config.EphemeralMin, manager.config.EphemeralMax)).
+ 		Int("tcpmux", manager.config.TCPMux).
+@@ -168,7 +172,9 @@ func (manager *WebRTCManagerCtx) Shutdown() error {
+ }
+ 
+ func (manager *WebRTCManagerCtx) ICEServers() []types.ICEServer {
+-	return manager.config.ICEServersFrontend
++	manager.relayMu.RLock()
++	defer manager.relayMu.RUnlock()
++	return cloneRelayServers(manager.config.ICEServersFrontend)
+ }
+ 
+ func (manager *WebRTCManagerCtx) newPeerConnection(logger zerolog.Logger, codecs []codec.RTPCodec) (*webrtc.PeerConnection, cc.BandwidthEstimator, error) {
+@@ -269,6 +275,8 @@ func (manager *WebRTCManagerCtx) newPeerConnection(logger zerolog.Logger, codecs
+ }
+ 
+ func (manager *WebRTCManagerCtx) CreatePeer(session types.Session) (*webrtc.SessionDescription, types.WebRTCPeer, error) {
++	manager.relayMu.RLock()
++	defer manager.relayMu.RUnlock()
+ 	id := atomic.AddInt32(&manager.peerId, 1)
+ 
+ 	// get metrics for session
+diff --git a/server/internal/webrtc/peer.go b/server/internal/webrtc/peer.go
+index 5bf00a10..50ed7bce 100644
+--- a/server/internal/webrtc/peer.go
++++ b/server/internal/webrtc/peer.go
+@@ -1,6 +1,7 @@
+ package webrtc
+ 
+ import (
++ "fmt"
+ 	"bytes"
+ 	"encoding/binary"
+ 	"sync"
+@@ -83,7 +84,9 @@ func (peer *WebRTCPeerCtx) setLocalDescription(description webrtc.SessionDescrip
+ 			return nil, err
+ 		}
+ 
+-		<-gatherComplete
++		timer := time.NewTimer(15*time.Second)
++ defer timer.Stop()
++ select { case <-gatherComplete: case <-timer.C: return nil, fmt.Errorf("ICE gathering timed out") }
+ 	} else {
+ 		if err := peer.connection.SetLocalDescription(description); err != nil {
+ 			return nil, err
+diff --git a/server/internal/websocket/manager.go b/server/internal/websocket/manager.go
+index 9fd67fab..30aaf9de 100644
+--- a/server/internal/websocket/manager.go
++++ b/server/internal/websocket/manager.go
+@@ -31,6 +31,8 @@ const (
+ 
+ // events that are not logged in debug mode
+ var nologEvents = []string{
++ event.SIGNAL_OFFER,
++ event.SIGNAL_PROVIDE,
+ 	// don't log twice
+ 	event.SYSTEM_LOGS,
+ 	// don't log heartbeats
+diff --git a/server/internal/websocket/peer.go b/server/internal/websocket/peer.go
+index 0c2fd553..35e8fc7f 100644
+--- a/server/internal/websocket/peer.go
++++ b/server/internal/websocket/peer.go
+@@ -4,6 +4,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"sync"
++ "time"
+ 
+ 	"github.com/gorilla/websocket"
+ 	"github.com/rs/zerolog"
+@@ -28,16 +29,25 @@ func newPeer(logger zerolog.Logger, connection *websocket.Conn) *WebSocketPeerCt
+ }
+ 
+ func (peer *WebSocketPeerCtx) Send(event string, payload any) {
+-	peer.mu.Lock()
+-	defer peer.mu.Unlock()
++ _ = peer.SendBefore(event,payload,time.Now().Add(2*time.Second))
++}
++
++func (peer *WebSocketPeerCtx) SendBefore(event string,payload any,deadline time.Time) error {
++ for !peer.mu.TryLock() {
++  if time.Now().After(deadline) { return errors.New("websocket send timed out") }
++  time.Sleep(10*time.Millisecond)
++ }
++ defer peer.mu.Unlock()
++ if time.Now().After(deadline) { return errors.New("websocket send timed out") }
+ 
+ 	raw, err := json.Marshal(payload)
+ 	if err != nil {
+ 		peer.logger.Err(err).Str("event", event).Msg("message marshalling has failed")
+-		return
++		return err
+ 	}
+ 
+-	err = peer.connection.WriteJSON(types.WebSocketMessage{
++	if err := peer.connection.SetWriteDeadline(deadline); err != nil { return err }
++ err = peer.connection.WriteJSON(types.WebSocketMessage{
+ 		Event:   event,
+ 		Payload: raw,
+ 	})
+@@ -47,7 +57,7 @@ func (peer *WebSocketPeerCtx) Send(event string, payload any) {
+ 			err = e // unwrap if possible
+ 		}
+ 		peer.logger.Warn().Err(err).Str("event", event).Msg("send message error")
+-		return
++		return err
+ 	}
+ 
+ 	// log events if not ignored
+@@ -62,13 +72,15 @@ func (peer *WebSocketPeerCtx) Send(event string, payload any) {
+ 			Str("payload", string(raw)).
+ 			Msg("sending message to client")
+ 	}
++ return nil
+ }
+ 
+ func (peer *WebSocketPeerCtx) Ping() error {
+ 	peer.mu.Lock()
+ 	defer peer.mu.Unlock()
+ 
+-	// application level heartbeat
++	if err := peer.connection.SetWriteDeadline(time.Now().Add(2*time.Second)); err != nil { return err }
++ // application level heartbeat
+ 	if err := peer.connection.WriteJSON(types.WebSocketMessage{
+ 		Event: event.SYSTEM_HEARTBEAT,
+ 	}); err != nil {
+diff --git a/server/pkg/types/message/messages.go b/server/pkg/types/message/messages.go
+index b77e6d5e..6790cf12 100644
+--- a/server/pkg/types/message/messages.go
++++ b/server/pkg/types/message/messages.go
+@@ -72,6 +72,7 @@ type SignalCandidate struct {
+ 
+ type SignalDescription struct {
+ 	SDP string `json:"sdp"`
++	ICEServers []types.ICEServer `json:"iceservers,omitempty"`
+ }
+ 
+ type SignalVideo struct {

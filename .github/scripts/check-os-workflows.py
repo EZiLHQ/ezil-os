@@ -54,4 +54,34 @@ assert positions['Restore previous Worker version (never reverse SQL)'] < positi
 assert workflows['deploy']['jobs']['release']['needs'] == 'gated-production'
 assert positions['Acquire shared production lease'] < positions['Capture previous production identities']
 assert positions['Release shared production lease'] > positions['Upload production release and recovery evidence']
+# Hosted continuity is an explicit cloud gate; missing isolated IDs are failures.
+preview_steps = jobs['preview']['steps']
+continuity = next(step for step in preview_steps if step.get('name') == 'Hosted continuity release gate')
+assert continuity['timeout-minutes'] == 90
+assert continuity['env']['EZIL_E2E_COMPUTER_ID'] == '${{ secrets.EZIL_E2E_COMPUTER_ID }}'
+assert 'full' in continuity['env']['EZIL_CONTINUITY_MODE'] and 'short' in continuity['env']['EZIL_CONTINUITY_MODE']
+assert jobs['preview']['timeout-minutes'] >= 150
+assert jobs['preview']['needs'] == ['trust', 'images']
+assert jobs['images']['if'] == "needs.trust.outputs.allowed == 'true'"
+assert any(step.get('name') == 'Download tested candidate image identities' for step in preview_steps)
+assert 'SANDBOX_NEKO_TURN_TTL_SECONDS:$ttl' in preview and 'ttl=1800' in preview
+assert 'EZIL_ACCEPTANCE_SANDBOX' in continuity['env'] or 'EZIL_ACCEPTANCE_HMAC_SECRET' in continuity['env']
+assert '--ttl 10800' in preview
+lease_credentials = [step for step in preview_steps if step.get('uses') == 'aws-actions/configure-aws-credentials@v4']
+assert len(lease_credentials) == 2
+assert all(step['with']['role-duration-seconds'] == 7200 for step in lease_credentials)
+renew_index = next(i for i, step in enumerate(preview_steps) if step.get('name') == 'Renew staging lease credentials before long acceptance')
+assert preview_steps[renew_index + 1]['name'] == 'Hosted continuity release gate'
+assert 'SANDBOX_NEKO_TURN_TTL_SECONDS' in preview
+assert any('test-editor-state-linux.sh' in step.get('run', '') for step in workflows['ci']['jobs']['worker']['steps'])
+for name in ('Test the returned production URL', 'Test the canonical production URL'):
+    assert 'prod-lifecycle' in production[positions[name]]['run']
+assert 'Hosted production persistence verification' in positions
+suite = (root / 'e2e/hosted-continuity.mjs').read_text()
+assert 'SKIP' not in suite
+assert "required('EZIL_E2E_COMPUTER_ID')" in suite
+assert "36 * 60000" in suite and "30 * 60000" in suite
+assert "'/api/shell/stop'" in suite and 'stopped.ok && stopped.terminated' in suite
+assert 'framesDecoded' in suite and 'bytesReceived' in suite and "=== 'relay'" in suite
+assert 'verifyCloudDeployment(process.env)' in suite
 print('OS workflows: YAML, shell, JavaScript and release contracts passed')

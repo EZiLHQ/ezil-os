@@ -1,0 +1,40 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
+const source=readFileSync(new URL('./hosted-continuity.mjs',import.meta.url),'utf8');
+test('hosted telemetry artifact whitelists current navigation counters and enums',()=>{
+    const script=source.match(/const continuityInit = (\(\) => \{[\s\S]*?)\n  };\n  await context.addInitScript/)[1]+'\n}';
+    let listener;
+    const frame={src:'https://viewer.example/?ezilAttempt=current',contentWindow:{}};
+    const window={addEventListener:(_event,fn)=>listener=fn};
+    vm.runInNewContext('('+script+')()',{window,document:{querySelector:()=>frame},URL,Number,Object});
+    const raw={bytesReceived:100,framesDecoded:3,width:1280,height:720,connectionState:'connected',relayProtocol:'tcp',localCandidateType:'relay',credential:'secret',address:'private',token:'secret'};
+    listener({source:frame.contentWindow,origin:'https://viewer.example',data:{source:'ezil-mobile',type:'stream_vitals',attempt:'current',vitals:raw}});
+    assert.equal(window.__continuityVitals.length,1);
+    const saved=window.__continuityVitals[0];
+    assert.equal(saved.framesDecoded,3);assert.equal(saved.relayProtocol,'tcp');
+    for(const key of ['credential','address','token'])assert.equal(key in saved,false);
+    listener({source:frame.contentWindow,origin:'https://viewer.example',data:{source:'ezil-mobile',type:'stream_vitals',attempt:'old',vitals:raw}});
+    assert.equal(window.__continuityVitals.length,1);
+});
+test('cloud scenarios permit normal UDP before separate TCP/TLS fallback and read committed checkpoint',()=>{
+    const initial=source.match(/browser = await chromium.launch\(\{ args: launchArgs \}\)/);
+    assert.ok(initial);
+    assert.ok(source.includes("fallback = true; await launch('desktop'); await live()"));
+    assert.ok(source.includes("['r2','object','get'"));
+    assert.ok(source.includes("/.ezil-snapshots/latest.json"));
+    assert.ok(source.includes("checkpoint.sha256"));
+    assert.ok(source.includes("el.classList.contains('vs-dark')"));
+});
+test('failure acceptance uses signed backend controls with explicit cleanup and real stop refusal',()=>{
+    const helper=source.slice(source.indexOf('  const fault = async'),source.indexOf('  const selected = await'));
+    assert.ok(helper.includes('createHmac'));
+    assert.ok(helper.includes('/acceptance-fault'));
+    assert.equal(helper.includes('page.evaluate'),false,'Signed secret must remain in Node process');
+    assert.ok(source.includes("await fault('turn_unavailable')"));
+    assert.ok(source.includes("await fault('checkpoint_write_failed')"));
+    assert.ok(source.includes("finally {await fault('clear');}"));
+    assert.ok(source.includes("failedStop.terminated,false"));
+    assert.ok(source.includes("Failed checkpoint replaced active runtime"));
+});

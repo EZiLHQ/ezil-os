@@ -1,179 +1,128 @@
-/**
- * code-server must open the workspace ALREADY TRUSTED.
- *
- * Measured in production on container image v8 (2026-08-03), against a real
- * browser session. With `folder=` on the bridge URL — which is what ships now
- * — code-server inherits VS Code's Workspace Trust and opens in Restricted
- * Mode. The observed consequence is not cosmetic:
- *
- *   Ctrl+`  ->  `.xterm: 0`, panel reads "Drag a view here to display.",
- *               status bar reads "Restricted Mode", and a MODAL appears:
- *               "Do you trust the authors of the files in this folder?
- *                Creating a terminal process requires executing code"
- *               [Manage] [Cancel] [Trust Folder & Continue]
- *
- *   click "Trust Folder & Continue" -> Restricted Mode clears but the terminal
- *   still does not open (VS Code cancels the action that raised the prompt);
- *   a SECOND Ctrl+` is needed, and only then does `.xterm: 1` / `TERMINAL bash`
- *   / a real `root@…:/workspace` prompt appear.
- *
- * The grant is stored under `--user-data-dir`, which is under /tmp and is
- * recreated on every container start, so the prompt returns every session.
- *
- * These tests EXECUTE the real seeding code out of the two launchers rather
- * than grepping them for strings: a source-string assertion passes just as
- * happily against a script that never runs the block it is asserting on.
- */
 import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const SCRIPTS = join(import.meta.dir, '..', 'scripts');
-const START_NEKO = join(SCRIPTS, 'start-neko.sh');
-const START_CODESERVER = join(SCRIPTS, 'start-codeserver.sh');
+const scripts = join(import.meta.dir, '..', 'scripts');
+const helper = join(scripts, 'editor-state.sh');
+const saved = '// keep my comment\n{ "workbench.colorTheme": "Default Dark Modern", }\n';
 
-const tmp = (): string => mkdtempSync(join(tmpdir(), 'cs-trust-'));
+// File operations execute the shipped helper. Lock contention is a separate
+// Linux test; this shim makes the same restoration tests portable to macOS.
+function fixture() {
+  const root = mkdtempSync(join(tmpdir(), 'editor-state-'));
+  const workspace = join(root, 'workspace');
+  const userData = join(root, 'user');
+  mkdirSync(join(workspace, '.ezil'), { recursive: true });
+  const run = (command: string) => spawnSync('bash', ['-c',
+    'set -euo pipefail\nflock() { return 0; }\n. "$1"\n' + command,
+    'bash', helper, userData, workspace], { encoding: 'utf8' });
+  return { root, workspace, userData, run,
+    backup: (file = 'settings.json') => join(workspace, '.ezil', file),
+    live: (file = 'settings.json') => join(userData, 'User', file) };
+}
 
-/**
- * Pull `seed_codeserver_user_settings` out of start-neko.sh by brace-matching
- * from its definition, so the test runs the shipped implementation verbatim.
- * start-neko.sh is a 1200-line launcher that cannot be sourced wholesale.
- */
-function extractSeedFunction (): string {
-    const src = readFileSync(START_NEKO, 'utf8');
-    const start = src.indexOf('seed_codeserver_user_settings() {');
-    expect(start).toBeGreaterThan(-1);
-    let depth = 0;
-    let i = src.indexOf('{', start);
-    const open = i;
-    for (; i < src.length; i++) {
-        if (src[i] === '{') depth++;
-        else if (src[i] === '}') {
-            depth--;
-            if (depth === 0) break;
-        }
+describe('editor settings survive runtime replacement', () => {
+  it('restores JSONC settings and keybindings before defaults, then captures immediate edits', () => {
+    const f = fixture();
+    try {
+      writeFileSync(f.backup(), saved);
+      writeFileSync(f.backup('keybindings.json'), '// custom\n[{"key":"ctrl+alt+k","command":"workbench.action.files.save"}]');
+      expect(f.run('ezil_editor_prepare "$2" "$3"').status).toBe(0);
+      expect(readFileSync(f.live(), 'utf8')).toBe(saved);
+      expect(readFileSync(f.live('keybindings.json'), 'utf8')).toBe(readFileSync(f.backup('keybindings.json'), 'utf8'));
+      writeFileSync(f.live(), saved.replace('Modern', 'Plus'));
+      expect(f.run('ezil_editor_capture "$2" "$3"').status).toBe(0);
+      expect(readFileSync(f.backup(), 'utf8')).toBe(saved.replace('Modern', 'Plus'));
+    } finally { rmSync(f.root, { recursive: true }); }
+  });
+
+  it('seeds defaults only without a saved file and preserves warm runtime edits', () => {
+    const f = fixture();
+    try {
+      expect(f.run('ezil_editor_prepare "$2" "$3"').status).toBe(0);
+      expect(JSON.parse(readFileSync(f.live(), 'utf8'))['security.workspace.trust.enabled']).toBe(false);
+      writeFileSync(f.live(), saved);
+      expect(f.run('ezil_editor_prepare "$2" "$3"').status).toBe(0);
+      expect(readFileSync(f.live(), 'utf8')).toBe(saved);
+    } finally { rmSync(f.root, { recursive: true }); }
+  });
+
+  it('preserves an intentionally empty saved settings file', () => {
+    const f = fixture();
+    try {
+      writeFileSync(f.backup(), '');
+      expect(f.run('ezil_editor_prepare "$2" "$3"').status).toBe(0);
+      expect(readFileSync(f.live(), 'utf8')).toBe('');
+    } finally { rmSync(f.root, { recursive: true }); }
+  });
+
+  it('a failed restore cannot authorize capture or replace the backup with defaults', () => {
+    const f = fixture();
+    try {
+      writeFileSync(f.backup(), saved);
+      const result = f.run('ezil_editor_atomic_copy() { return 1; }; ezil_editor_prepare "$2" "$3"');
+      expect(result.status).toBe(1);
+      expect(existsSync(join(f.userData, '.ezil-state-ready'))).toBe(false);
+      mkdirSync(join(f.userData, 'User'), { recursive: true });
+      writeFileSync(f.live(), '{}');
+      expect(f.run('ezil_editor_capture "$2" "$3"').status).toBe(1);
+      expect(readFileSync(f.backup(), 'utf8')).toBe(saved);
+    } finally { rmSync(f.root, { recursive: true }); }
+  });
+
+  it('failed atomic copy leaves durable bytes intact and reports capture failure', () => {
+    const f = fixture();
+    try {
+      writeFileSync(f.backup(), saved);
+      expect(f.run('ezil_editor_prepare "$2" "$3"').status).toBe(0);
+      writeFileSync(f.live(), '{}');
+      expect(f.run('cp() { return 1; }; ezil_editor_capture "$2" "$3"').status).toBe(1);
+      expect(readFileSync(f.backup(), 'utf8')).toBe(saved);
+    } finally { rmSync(f.root, { recursive: true }); }
+  });
+
+  it('captures installed extension IDs before checkpoint and retains failed restore IDs', () => {
+    const f = fixture();
+    try {
+      writeFileSync(f.backup('extensions.txt'), 'saved.extension\n');
+      expect(f.run('ezil_editor_prepare "$2" "$3"').status).toBe(0);
+      mkdirSync(join(f.root, 'extensions', 'new.extension-1.2.3'), { recursive: true });
+      expect(f.run('export CODE_SERVER_EXTENSIONS_DIR="$(dirname "$2")/extensions"; ezil_editor_capture "$2" "$3"').status).toBe(0);
+      expect(readFileSync(f.backup('extensions.txt'), 'utf8')).toBe('new.extension\nsaved.extension\n');
+      expect(f.run('timeout() { return 1; }; ezil_editor_restore_extensions "$2" "$3" "$(dirname "$2")/extensions" false').status).toBe(0);
+      expect(readFileSync(f.backup('extensions.txt'), 'utf8')).toContain('saved.extension');
+    } finally { rmSync(f.root, { recursive: true }); }
+  });
+
+  it('keeps the configured legacy editor-state directory compatible', () => {
+    const f = fixture();
+    try {
+      mkdirSync(join(f.workspace, 'legacy'));
+      writeFileSync(join(f.workspace, 'legacy', 'settings.json'), saved);
+      expect(f.run('export EZIL_EDITOR_STATE_DIR="$3/legacy"; ezil_editor_prepare "$2" "$3"; ezil_editor_capture "$2" "$3"').status).toBe(0);
+      expect(readFileSync(f.live(), 'utf8')).toBe(saved);
+      expect(existsSync(f.backup())).toBe(false);
+    } finally { rmSync(f.root, { recursive: true }); }
+  });
+
+  it('does not copy settings into a different computer workspace', () => {
+    const f = fixture();
+    try {
+      expect(f.run('ezil_editor_prepare "$2" "$3"').status).toBe(0);
+      expect(f.run('ezil_editor_capture "$2" "$3/another"').status).toBe(1);
+    } finally { rmSync(f.root, { recursive: true }); }
+  });
+
+  it('both launch paths use the helper before code-server reads settings', () => {
+    for (const [file, launch] of [['start-neko.sh', 'supervise_app codeserver'], ['start-codeserver.sh', 'nohup code-server']]) {
+      const source = readFileSync(join(scripts, file), 'utf8');
+      expect(source).toContain('/editor-state.sh"');
+      const restore = source.indexOf('if ! ezil_editor_prepare');
+      expect(restore).toBeGreaterThan(0);
+      expect(source.indexOf(launch)).toBeGreaterThan(restore);
+      expect(source).not.toContain('<<\'CODESERVER_SETTINGS_JSON');
     }
-    expect(i).toBeLessThan(src.length);
-    return `seed_codeserver_user_settings() ${src.slice(open, i + 1)}`;
-}
-
-function runSeedFn (userDataDir: string): { code: number | null; stderr: string } {
-    const script = `set -uo pipefail\n${extractSeedFunction()}\nseed_codeserver_user_settings "$1"\n`;
-    const r = spawnSync('bash', ['-c', script, 'bash', userDataDir], { encoding: 'utf8' });
-    return { code: r.status, stderr: r.stderr };
-}
-
-const settingsPath = (dir: string): string => join(dir, 'User', 'settings.json');
-
-describe('start-neko.sh seeds code-server settings that disable workspace trust', () => {
-    it('is the function the launcher actually calls, not a dead definition', () => {
-        const src = readFileSync(START_NEKO, 'utf8');
-        // definition + a real call site, and the call must precede the launch
-        const def = src.indexOf('seed_codeserver_user_settings() {');
-        const call = src.indexOf('if seed_codeserver_user_settings "$CODE_SERVER_USER_DATA_DIR"');
-        const launch = src.indexOf('supervise_app codeserver');
-        expect(def).toBeGreaterThan(-1);
-        expect(call).toBeGreaterThan(def);
-        expect(launch).toBeGreaterThan(call);
-    });
-
-    it('writes settings.json with workspace trust disabled', () => {
-        const dir = tmp();
-        const { code, stderr } = runSeedFn(dir);
-        expect(stderr).toBe('');
-        expect(code).toBe(0);
-        expect(existsSync(settingsPath(dir))).toBe(true);
-        const parsed = JSON.parse(readFileSync(settingsPath(dir), 'utf8')) as Record<string, unknown>;
-        // Must be valid JSON — code-server silently ignores a settings file it
-        // cannot parse, which would restore Restricted Mode with no error.
-        expect(parsed['security.workspace.trust.enabled']).toBe(false);
-    });
-
-    it('creates the User/ subdirectory when the user-data-dir does not exist yet', () => {
-        // /tmp/code-server-data is recreated on every container start, so the
-        // common case is a path with nothing under it at all.
-        const dir = join(tmp(), 'not', 'yet', 'there');
-        const { code } = runSeedFn(dir);
-        expect(code).toBe(0);
-        expect(existsSync(settingsPath(dir))).toBe(true);
-    });
-
-    it('never clobbers settings the user already has', () => {
-        const dir = tmp();
-        mkdirSync(join(dir, 'User'), { recursive: true });
-        writeFileSync(settingsPath(dir), '{"editor.fontSize": 42}');
-        const { code } = runSeedFn(dir);
-        expect(code).toBe(0);
-        expect(readFileSync(settingsPath(dir), 'utf8')).toBe('{"editor.fontSize": 42}');
-    });
-});
-
-/**
- * The seeding block out of start-codeserver.sh, run verbatim.
- *
- * The whole script is deliberately NOT invoked here: it keys off a hardcoded
- * `/tmp/code-server.pid` and a real listener on :8443, both process-wide state
- * this suite does not own. Driving it made this test pass or fail depending on
- * whether an earlier run had left a pid file behind — a flaky test is worse
- * than no test, so the block is extracted and executed against a temp dir.
- */
-function extractCodeserverSeedBlock (): string {
-    const src = readFileSync(START_CODESERVER, 'utf8');
-    const start = src.indexOf('if [ ! -s "$USER_DATA_DIR/User/settings.json" ]; then');
-    expect(start).toBeGreaterThan(-1);
-    const heredocEnd = src.indexOf('CODESERVER_SETTINGS_JSON\n', src.indexOf('<<', start));
-    expect(heredocEnd).toBeGreaterThan(start);
-    const fi = src.indexOf('\nfi\n', heredocEnd);
-    expect(fi).toBeGreaterThan(heredocEnd);
-    return src.slice(start, fi + 4);
-}
-
-describe('start-codeserver.sh seeds the same settings before it launches', () => {
-    it('writes the trust-disabling settings.json when run', () => {
-        const dir = tmp();
-        const script = `set -euo pipefail\nUSER_DATA_DIR="$1"\n${extractCodeserverSeedBlock()}\n`;
-        const r = spawnSync('bash', ['-c', script, 'bash', dir], { encoding: 'utf8' });
-        expect(r.stderr).toBe('');
-        expect(r.status).toBe(0);
-        expect(existsSync(settingsPath(dir))).toBe(true);
-        const parsed = JSON.parse(readFileSync(settingsPath(dir), 'utf8')) as Record<string, unknown>;
-        expect(parsed['security.workspace.trust.enabled']).toBe(false);
-    });
-
-    it('does not clobber existing settings', () => {
-        const dir = tmp();
-        mkdirSync(join(dir, 'User'), { recursive: true });
-        writeFileSync(settingsPath(dir), '{"editor.fontSize": 7}');
-        const script = `set -euo pipefail\nUSER_DATA_DIR="$1"\n${extractCodeserverSeedBlock()}\n`;
-        const r = spawnSync('bash', ['-c', script, 'bash', dir], { encoding: 'utf8' });
-        expect(r.status).toBe(0);
-        expect(readFileSync(settingsPath(dir), 'utf8')).toBe('{"editor.fontSize": 7}');
-    });
-
-    it('seeds after the already-running fast path and before the launch', () => {
-        // Order is the whole point: seeding after `nohup code-server` would be
-        // read by nothing, and seeding before the fast-path `exit 0` would
-        // rewrite settings under a code-server that is already serving them.
-        const src = readFileSync(START_CODESERVER, 'utf8');
-        const fastPath = src.indexOf('echo already-running');
-        const seed = src.indexOf('if [ ! -s "$USER_DATA_DIR/User/settings.json" ]; then');
-        const launch = src.indexOf('nohup code-server');
-        expect(fastPath).toBeGreaterThan(-1);
-        expect(seed).toBeGreaterThan(fastPath);
-        expect(launch).toBeGreaterThan(seed);
-    });
-
-    it('passes the seeded user-data-dir to code-server, so the settings are the ones it reads', () => {
-        // A seeded file in a directory the binary is never pointed at is worth
-        // nothing — this is the seam that silently breaks if someone re-hardcodes
-        // the path on one line and not the other.
-        const src = readFileSync(START_CODESERVER, 'utf8');
-        expect(src).toContain('--user-data-dir="$USER_DATA_DIR"');
-        expect(src).not.toContain('--user-data-dir=/tmp/code-server-data');
-        const neko = readFileSync(START_NEKO, 'utf8');
-        expect(neko).toContain('--user-data-dir="$CODE_SERVER_USER_DATA_DIR"');
-        expect(neko).not.toContain('--user-data-dir=/tmp/code-server-data');
-    });
+  });
 });

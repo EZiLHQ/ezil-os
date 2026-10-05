@@ -174,6 +174,7 @@ function fakeSandboxNamespace(options: {
   };
 
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
+    desktopReachable: async () => true,
     hydrateWorkspace: async () => ({ mounted: true, mountPath: '/workspace' }),
     containerFetch: async (...args: unknown[]) => {
       const [url, init, port] = args as [string, RequestInit | undefined, number];

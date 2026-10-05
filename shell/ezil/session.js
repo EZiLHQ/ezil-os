@@ -499,6 +499,7 @@ async function openDesktopOnce (computerId, screen) {
     return {
         ok: true,
         url: data.guacamoleUrl,
+        relay: data.relay,
         // 🔴 Whether the SERVER observed the desktop origin answering, before
         // it handed this URL over. Strict `=== true`, and never defaulted to
         // true: a response that omits the field is a server that did not check,

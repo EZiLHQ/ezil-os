@@ -25,6 +25,7 @@ export async function recoverableStalePreview(request: Request, response: Respon
   if (!wantsPage) return response;
   const body = await response.clone().text();
   if (!body.includes('STALE_PREVIEW_URL')) return response;
+  const attempt = new URL(request.url).searchParams.get('ezilAttempt');
   // Observable: the SDK's own "Stale preview URL blocked" warning is not logged
   // on every stale path (its running/healthy pre-check returns silently).
   console.warn(`[ezil-boot] phase=preview_stale event=recovery_page host=${new URL(request.url).hostname.split('.')[0]}`);
@@ -32,7 +33,7 @@ export async function recoverableStalePreview(request: Request, response: Respon
     + `<style>html,body{height:100%;margin:0;background:#161616;color:#d6d6d4;font:15px system-ui,sans-serif;`
     + `display:flex;align-items:center;justify-content:center}</style></head>`
     + `<body><p data-ezil-stale-runtime>Reconnecting to your computer…</p>`
-    + `<script>try{parent.postMessage({type:${JSON.stringify(PREVIEW_RUNTIME_STALE_MESSAGE)}},'*')}catch(e){}</script>`
+    + `<script>try{parent.postMessage({type:${JSON.stringify(PREVIEW_RUNTIME_STALE_MESSAGE)},attempt:${JSON.stringify(attempt).replace(/</g, '\\u003c')}},'*')}catch(e){}</script>`
     + `</body></html>`;
   return new Response(page, {
     status: 410,

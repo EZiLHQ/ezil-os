@@ -20,7 +20,7 @@ the version image alias to the tested digest, then publishes that draft.
    its summary instead of reporting a successful deployment with two skipped jobs.
 2. Deploy and test the staging Worker and returned Vercel preview with existing
    staging lease/isolation semantics. **PRs never apply SQL to the shared DB.**
-3. The reusable Image workflow builds/reuses base, branding and desktop images
+3. The reusable Image workflow builds/reuses pinned Neko continuity, base, branding and desktop images
    for the admitted full source SHA, then runs all three existing real-container
    suites against the exact desktop digest; any skip fails the job.
 4. Production requires both staging and images to succeed. Under the common
@@ -33,8 +33,8 @@ the version image alias to the tested digest, then publishes that draft.
    rechecked before each mutation and after verification; superseded releases fail.
 
 There is no independent image push/path/tag trigger or registry polling race.
-Base tags hash all base build inputs; overlay tags also hash branding inputs
-and the base key. Desktop tags use `sha-<full SHA>`. The global image publisher
+Base tags hash all base build inputs; overlay tags also hash the pinned Neko
+continuity patch, branding inputs and the base key. Desktop tags use `sha-<full SHA>`. The global image publisher
 lock and manifest existence checks prevent overwrites, including reruns and
 partial previous builds. Only missing manifests permit builds; authorization
 and network errors fail. `latest` advances only after desktop tests pass and a
@@ -94,6 +94,24 @@ Tools: Bun 1.3.14, Node 22.16.0, Vercel CLI 57.0.0, Buildx 0.25.0,
 Playwright 1.62.1 and lockfile-resolved Wrangler 4.128.0. Provider behavior and
 large image builds still require the first hosted run; offline contract tests
 cannot establish live credentials, quotas, registry access or rollout behavior.
+
+Relevant PRs run the short hosted continuity suite with five-minute TURN
+credentials. Main requires the full suite before production: active video for
+36 minutes with the production30-minute TURN lifetime, real checkpoint/stop/reopen,
+and editor returns after10 and30 minutes. The suite has a90-minute limit and holds the existing staging lease;
+its AWS role coordinates that lease only. Execution uses GitHub-hosted runners.
+Missing prerequisites and skipped acceptance are failures.
+
+Configure each GitHub environment with an explicitly approved isolated
+`EZIL_E2E_COMPUTER_ID` secret, an absolute `EZIL_E2E_WORKSPACE_PATH` variable,
+`EZIL_E2E_R2_BUCKET` variable and exact `EZIL_E2E_R2_PREFIX` secret. The suite
+refuses to start or stop a different selected computer. It reads the durable
+R2 manifest with the repository's pinned Wrangler executable. Evidence retains
+only deployment identities, hashes, timings and whitelisted media counters.
+Staging also needs `EZIL_ACCEPTANCE_SANDBOX` for that same isolated computer
+and `EZIL_ACCEPTANCE_HMAC_SECRET` matching its existing signed Worker boundary.
+Fault controls are disabled without both staging scope and the exact sandbox;
+injected failures expire within60 seconds. Production has no fault scope.
 
 ## Internal macOS test DMG (no Apple subscription)
 
