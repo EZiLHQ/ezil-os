@@ -71,3 +71,11 @@ test('cold Browser acceptance proves stopped compute and delivers frames before 
     assert.ok(source.includes('evidence.coldOpenMs = Date.now() - coldStartedAt'));
     assert.ok(source.includes('Warm Browser open replaced runtime'));
 });
+test('every persistence reopen verifies the restored shortcut with automatic save disabled',()=>{
+    assert.ok(source.includes('"files.autoSave":"off"'));
+    const verification=source.slice(source.indexOf('  const verifyEditor = async'),source.indexOf("  await close('code'); await verifyEditor()"));
+    assert.ok(verification.includes('await verifyEditorShortcut'));
+    assert.ok(verification.includes("page.keyboard.press('Control+Alt+K')"));
+    assert.ok(verification.includes("command(f, 'File: Revert File')"));
+    assert.ok(verification.includes('hash(persistedMarker)'));
+});

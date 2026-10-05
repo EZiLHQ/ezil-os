@@ -12,6 +12,7 @@ import { observeScreenResizes, readDesktopReadiness, waitForDesktopResize } from
 import { waitForViewerProgress } from './viewer-progress.mjs';
 import { terminalContinuityCommand, assertProcessContinuity, waitForProcessSample } from './process-continuity.mjs';
 import { stopIsolatedComputer } from './isolated-computer.mjs';
+import { verifyEditorShortcut } from './editor-shortcut.mjs';
 
 const required = key => { assert.ok(process.env[key], `Missing prerequisite: ${key}`); return process.env[key]; };
 const hash = value => createHash('sha256').update(String(value)).digest('hex');
@@ -199,10 +200,11 @@ try {
       return el.classList.contains('vs-dark') && Math.max(...rgb) < 100;
     }));
   };
-  const settings = '// continuity JSONC\n{"workbench.colorTheme":"Default Dark Modern","security.workspace.trust.enabled":false,"editor.accessibilitySupport":"on"}\n';
+  const settings = '// continuity JSONC\n{"workbench.colorTheme":"Default Dark Modern","security.workspace.trust.enabled":false,"editor.accessibilitySupport":"on","files.autoSave":"off"}\n';
   const bindings = '// continuity binding\n[{"key":"ctrl+alt+k","command":"workbench.action.files.save"}]\n';
   const marker = `continuity-${hash(computerId).slice(0, 10)}.txt`;
   const markerText = `hosted-checkpoint-${Date.now()}`;
+  let shortcutChecks = 0;
   let f = await openCode();
   await command(f, 'Preferences: Open User Settings (JSON)'); await setDocument(f, settings); await verifyDarkTheme(f);
   await command(f, 'Preferences: Open Keyboard Shortcuts (JSON)'); await setDocument(f, bindings);
@@ -214,11 +216,21 @@ try {
     f = await openCode();
     await command(f, 'Preferences: Open User Settings (JSON)');
     const restoredSettings = await readDocument(f); assert.ok(restoredSettings.includes('Default Dark Modern') && restoredSettings.includes('continuity JSONC'), 'Theme JSONC not restored'); await verifyDarkTheme(f);
+    assert.match(restoredSettings, /"files\.autoSave"\s*:\s*"off"/, 'Automatic save must stay disabled during shortcut acceptance');
     await command(f, 'Preferences: Open Keyboard Shortcuts (JSON)');
     const restoredBindings = await readDocument(f); assert.ok(restoredBindings.includes('ctrl+alt+k') && restoredBindings.includes('continuity binding'), 'Keybinding JSONC not restored');
     await page.keyboard.press('Control+P'); await f.locator('.quick-input-widget input').fill(marker); await page.keyboard.press('Enter'); await wait(1500);
-    assert.ok((await readDocument(f)).includes(markerText), 'Workspace marker not restored');
-    evidence.checkpointHashes = { settings: hash(restoredSettings), bindings: hash(restoredBindings), marker: hash(markerText) };
+    const persistedMarker = await verifyEditorShortcut({
+      read: () => readDocument(f), expected: markerText, proof: `shortcut-save-${++shortcutChecks}`,
+      append: async proof => {
+        await f.locator('.monaco-editor:visible textarea').last().focus();
+        await page.keyboard.press('Control+End'); await page.keyboard.insertText(`\n${proof}`);
+      },
+      pressShortcut: async () => { await page.keyboard.press('Control+Alt+K'); await wait(1200); },
+      revert: () => command(f, 'File: Revert File'),
+    });
+    evidence.shortcutSaveChecks = shortcutChecks;
+    evidence.checkpointHashes = { settings: hash(restoredSettings), bindings: hash(restoredBindings), marker: hash(persistedMarker) };
   };
   await close('code'); await verifyEditor(); phase('immediate Code close/reopen');
   const processNonce = hash(`${computerId}-${Date.now()}`).slice(0, 24);

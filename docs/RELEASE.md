@@ -106,7 +106,10 @@ The continuity suite first confirms the isolated computer is stopped, then opens
 Browser before Code so cold-start frame delivery is tested. Failed checkpoint
 tests compare the committed R2 manifest before and after the rejected stop;
 unavailable TURN must produce a visible Retry state and recover after clearing
-the staging fault. Stop forwarding allows up to 270 seconds for editor capture,
+the staging fault. Each editor reopen also verifies the restored keybinding:
+with automatic save disabled, it inserts a fresh proof, presses the custom save
+shortcut and reloads the file from disk. Restored JSON alone cannot pass that
+check; the proof must remain after the reload. Stop forwarding allows up to 270 seconds for editor capture,
 workspace/system checkpoints and confirmed shutdown within the 300-second route.
 The browser's Vercel bypass allows 290 seconds for that stop response, while
 ordinary app requests retain their 240-second budget. Cleanup uses the signed-in
