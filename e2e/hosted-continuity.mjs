@@ -467,6 +467,9 @@ try {
   await verifyEditor(); await launch('desktop'); await live();
   const replaced = await relay(); assert.notEqual(replaced.runtimeId, firstRelay.runtimeId, 'Stop/reopen reused old runtime');
   evidence.replacementRuntimeHash = hash(replaced.runtimeId); phase('replacement persistence');
+  if (mode !== 'essential') {
+  // This staging fault scenario is covered by short/full acceptance. Production
+  // essential verification uses real stop/reopen above and has no fault access.
   // SDK destroy intentionally revokes tokens (404). Idle/runtime stop retains
   // authorization, so exercise its real 410 without altering auth semantics.
   const currentStaleURL = await page.locator('.window[data-app="desktop"] iframe').getAttribute('src');
@@ -503,6 +506,7 @@ try {
     assert.ok(!text.includes('STALE_PREVIEW_URL'), 'Stale navigation exposed raw JSON');
   }
   phase('stale navigation recovery');
+  }
   if (mode === 'full') {
     await close('desktop'); await close('code');
     assert.ok((await api('/api/shell/stop', { computerId })).terminated, 'Second stop failed');

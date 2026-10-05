@@ -12,6 +12,9 @@ test('stale recovery uses an authorized runtime stop and still requires real 410
     assert.ok(source.includes('response.status() === 410'));
     assert.ok(source.includes("assert.equal(recoveryDocument.headers()['cache-control'], 'no-store'"));
     assert.ok(source.includes('currentStaleURL'));
+    const scenario=source.slice(source.indexOf('  // This staging fault scenario'),source.indexOf("  phase('stale navigation recovery');"));
+    assert.ok(source.slice(source.indexOf('  // This staging fault scenario')-40,source.indexOf('  // This staging fault scenario')).includes("mode !== 'essential'"));
+    assert.ok(scenario.includes('/acceptance-idle-stop'));
 });
 test('missing isolated computer exits nonzero and names the prerequisite before cloud access',()=>{
     const directory=mkdtempSync(join(tmpdir(),'ezil-missing-prerequisite-'));
