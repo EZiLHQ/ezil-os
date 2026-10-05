@@ -6,6 +6,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import './desktop-resize-ready.test.mjs';
 import './viewer-progress.test.mjs';
+import './process-continuity.test.mjs';
 import { deployedTarget, configureAppContext } from './deployed-target.mjs';
 import { assertVercelDeployment, assertWorkerDeployment, verifyCloudDeployment } from './verify-cloud-deployment.mjs';
 

@@ -10,6 +10,7 @@ import { APP, configureAppContext } from './deployed-target.mjs';
 import { verifyCloudDeployment } from './verify-cloud-deployment.mjs';
 import { observeScreenResizes, readDesktopReadiness, waitForDesktopResize } from './desktop-resize-ready.mjs';
 import { waitForViewerProgress } from './viewer-progress.mjs';
+import { terminalContinuityCommand, assertProcessContinuity, waitForProcessSample } from './process-continuity.mjs';
 
 const required = key => { assert.ok(process.env[key], `Missing prerequisite: ${key}`); return process.env[key]; };
 const hash = value => createHash('sha256').update(String(value)).digest('hex');
@@ -131,9 +132,11 @@ try {
   const code = () => page.frames().find(f => /-code\./.test(f.url()));
   const openCode = async () => { await launch('code'); return bounded('Code workbench', async () => { const f = code(); return f && await f.locator('.monaco-workbench').count() ? f : null; }); };
   const command = async (f, text) => {
+    await launch('code');
     await f.locator('.monaco-workbench').click({ position: { x: 350, y: 180 } });
     await page.keyboard.press('F1');
     await f.locator('.quick-input-widget input').fill('>' + text);
+    await f.locator('.quick-input-list .monaco-list-row').filter({ hasText: text }).first().waitFor({ state: 'visible', timeout: 10000 });
     await page.keyboard.press('Enter'); await wait(1200);
   };
   const setDocument = async (f, text) => {
@@ -150,7 +153,7 @@ try {
       return el.classList.contains('vs-dark') && Math.max(...rgb) < 100;
     }));
   };
-  const settings = '// continuity JSONC\n{"workbench.colorTheme":"Default Dark Modern","security.workspace.trust.enabled":false}\n';
+  const settings = '// continuity JSONC\n{"workbench.colorTheme":"Default Dark Modern","security.workspace.trust.enabled":false,"editor.accessibilitySupport":"on"}\n';
   const bindings = '// continuity binding\n[{"key":"ctrl+alt+k","command":"workbench.action.files.save"}]\n';
   const marker = `continuity-${hash(computerId).slice(0, 10)}.txt`;
   const markerText = `hosted-checkpoint-${Date.now()}`;
@@ -172,6 +175,26 @@ try {
     evidence.checkpointHashes = { settings: hash(restoredSettings), bindings: hash(restoredBindings), marker: hash(markerText) };
   };
   await close('code'); await verifyEditor(); phase('immediate Code close/reopen');
+  const processNonce = hash(`${computerId}-${Date.now()}`).slice(0, 24);
+  await command(f, 'Terminal: Create New Terminal');
+  const terminalInput = () => f.locator('.xterm-helper-textarea').last();
+  // An input textarea can exist before the login shell accepts input. Code's
+  // shell integration publishes a command decoration after its actual prompt.
+  await bounded('terminal prompt', () => f.locator('.xterm-decoration.terminal-command-decoration').count(), 30000);
+  await terminalInput().focus();
+  await page.keyboard.insertText(terminalContinuityCommand(processNonce)); await page.keyboard.press('Enter');
+  const processSample = async (afterSequence = -1) => {
+    await command(f, 'Terminal: Focus Terminal');
+    return waitForProcessSample({ nonce: processNonce, afterSequence,
+      observe: () => f.locator('.xterm-accessibility-tree').last().innerText({ timeout: 5000 }) });
+  };
+  const initialProcesses = await processSample();
+  let latestProcesses = initialProcesses;
+  const verifyProcesses = async () => {
+    const current = await processSample(latestProcesses.sequence);
+    assertProcessContinuity(initialProcesses, current);
+    latestProcesses = current;
+  };
   const relay = () => api(`/api/shell/relay-refresh?computerId=${encodeURIComponent(computerId)}`);
   await launch('desktop');
   const sample = async () => {
@@ -223,6 +246,8 @@ try {
   await launch('desktop'); await live();
   await context.setOffline(true); await wait(5000); await context.setOffline(false); await live(); phase('network recovery');
   const other = await context.newPage(); await other.goto('about:blank'); await wait(3000); await page.bringToFront(); await live(); await other.close(); phase('tab return');
+  await verifyProcesses(); phase('shared Browser Code terminal continuity');
+  await launch('desktop');
   const lifetime = mode === 'full' ? 36 * 60000 : mode === 'short' ? 6 * 60000 : 0;
   const until = Date.now() + lifetime;
   let renewed = false;
@@ -233,6 +258,14 @@ try {
   }
   if (lifetime) assert.ok(renewed, 'Automatic credential renewal did not occur');
   await context.setOffline(true); await wait(3000); await context.setOffline(false); await live(); phase('renewal and reconnect');
+  await verifyProcesses();
+  evidence.processContinuity = { initialIdentityHash: hash(JSON.stringify(initialProcesses)),
+    heartbeatStart: initialProcesses.sequence, heartbeatEnd: latestProcesses.sequence,
+    preserved: ['chrome', 'code', 'terminal', 'shell'] };
+  // Stop this test-owned foreground probe before deliberate stop/replacement.
+  await terminalInput().focus(); await page.keyboard.press('Control+C');
+  phase('processes preserved across renewal and reconnect');
+  await launch('desktop');
   if (mode !== 'essential') {
     try {
       await fault('turn_unavailable');
