@@ -25,5 +25,57 @@
     "ezil-os:public",
     "ezil-ai-gateway:ezil_ai",
     "ezil-work:ezil_universe,ezil_works"
+  ],
+  "repos": {
+    "ezil-work": {
+      "previewJobs": [
+        "works.yml#deploy"
+      ],
+      "productionJobs": [
+        "works.yml#production"
+      ],
+      "secretInheritance": [],
+      "productionRefs": [
+        "refs/heads/main"
+      ]
+    },
+    "ezil-os": {
+      "previewJobs": [
+        "preview.yml#preview"
+      ],
+      "productionJobs": [
+        "preview.yml#production"
+      ],
+      "secretInheritance": [
+        "preview.yml#images",
+        "deploy.yml#gated-production",
+        "deploy-app.yml#gated-production"
+      ],
+      "productionRefs": [
+        "refs/heads/main",
+        "refs/tags/v*"
+      ]
+    },
+    "ezil-ai-gateway": {
+      "previewJobs": [
+        "ci.yml#staging"
+      ],
+      "productionJobs": [
+        "ci.yml#production"
+      ],
+      "secretInheritance": [],
+      "productionRefs": [
+        "refs/heads/main"
+      ]
+    }
+  },
+  "forbiddenOutsideProduction": [
+    "secrets[",
+    "toJSON(secrets",
+    "production-migrations.mjs apply",
+    "production-migrations.mjs rehearse",
+    "supabase db push",
+    "supabase db reset",
+    "supabase migration up"
   ]
 }

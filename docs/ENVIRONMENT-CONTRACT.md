@@ -47,6 +47,34 @@ Production has moved to `projects.production`, following `docs/CUTOVER-RUNBOOK.m
 Flipping the phase is one PR per repo, all landing together, with re-captured migration baselines.
 It is never a side effect of another change.
 
+## Enforcement
+
+`.github/scripts/env-contract.mjs` (byte-identical in every repo, no dependencies) has three commands:
+
+- `check --repo <name>` validates the contract and the repo's `production-migrations.json` against the phase.
+- `scan --repo <name>` reads every `.github/workflows/*.yml` and refuses:
+  - production credential names, `secrets[...]`, `toJSON(secrets)`, migration `apply`/`rehearse`
+    and `supabase db push|reset` anywhere outside the repo's `productionJobs`, workflow-level env
+    included;
+  - `secrets: inherit` outside `secretInheritance`;
+  - a non-production job that names a production environment;
+  - a preview or production job whose `assert-job` step is missing, conditional
+    (`if:`/`continue-on-error`), binds secrets, or comes after the first step that uses a secret;
+  - a production job that binds a production credential at job level, or touches the database
+    before its assertion;
+  - a repo with no non-production job running `scan` itself.
+- `assert-job --repo <name> --environment preview|production` is the runtime guard. Preview jobs
+  refuse if any production credential name is set. Production jobs refuse pull-request events and refs
+  outside `productionRefs`. `--repo` must match `GITHUB_REPOSITORY`.
+
+`repos.<name>` in the contract designates each repo's preview jobs, production jobs, the jobs allowed
+to inherit secrets (reusable-workflow callers on non-PR paths), and the refs production may run from.
+
+What in-repo checks cannot see: Vercel/Cloudflare runtime variables, repo-level secrets
+(`CLOUDFLARE_API_TOKEN`, `VERCEL_TOKEN`), the self-hosted runner's own environment and files,
+credentials under names not in `productionCredentialNames`, and a PR that edits the checker and its
+tests together. Branch protection with required checks and review on `.github/**` closes the last one.
+
 ## Credentials
 
 - Production credentials live only in the GitHub `production` environment of each repo. Each
