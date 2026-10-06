@@ -21,7 +21,9 @@ export async function signIn(page, { email, password, destination } = {}) {
   await page.fill('#password', password);
   try {
     await Promise.all([
-      page.waitForURL(url => destination ? url.pathname === destination : !url.pathname.startsWith('/login'), { timeout: 60000 }),
+      // The destination can start cloud requests while its document loads.
+      // Each suite checks application readiness after navigation commits.
+      page.waitForURL(url => destination ? url.pathname === destination : !url.pathname.startsWith('/login'), { waitUntil: 'commit', timeout: 60000 }),
       form.locator('button[type=submit]').click(),
     ]);
   } catch {

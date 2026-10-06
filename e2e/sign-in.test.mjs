@@ -12,8 +12,9 @@ function fixture({ expanded = true, hydrate = true, navigates = true } = {}) {
   const page = { locator: selector => selector === '#email-sign-in' ? form : disclosure,
     waitForFunction: async () => { calls.push(['email-focus']); },
     fill: async (selector) => { calls.push(['fill', selector]); },
-    waitForURL: async (matches) => {
+    waitForURL: async (matches, options) => {
       calls.push(['destination', matches(new URL('https://staging.example/computers'))]);
+      assert.equal(options.waitUntil, 'commit');
       if (!navigates) throw new Error('cookie: private-test-session');
     } };
   return { page, calls };

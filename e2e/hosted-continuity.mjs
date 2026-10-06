@@ -89,9 +89,9 @@ try {
   await context.addInitScript(continuityInit);
   page = await context.newPage();
   resizeObserver = observeScreenResizes(page, APP);
-  await page.goto(`${APP}/login?method=email`);
+  await page.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await signIn(page, { email: required('EZIL_E2E_EMAIL'), password: required('EZIL_E2E_PASSWORD') });
-  await page.goto(`${APP}/os`);
+  await page.goto(`${APP}/os`, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await bounded('session ready', () => page.evaluate(() => !!window.ezil?.session?.payload?.()?.computer));
   const api = async (path, body) => {
     const result = await page.evaluate(async ({ path, body }) => {
@@ -197,11 +197,22 @@ try {
     await launch('code');
     await closeModal(f);
     const quick = f.locator('.quick-input-widget input:visible');
-    const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const row = f.locator('.quick-input-list .monaco-list-row:visible').filter({hasText:new RegExp('^'+escaped)}).first();
+    // The visible row also contains shortcut and history labels. Select the
+    // command's observed workbench identity rather than concatenated row text.
+    const ids = {
+      'Preferences: Open User Settings (JSON)': 'workbench.action.openSettingsJson',
+      'Preferences: Open Keyboard Shortcuts (JSON)': 'workbench.action.openGlobalKeybindingsFile',
+      'File: New Untitled Text File': 'workbench.action.files.newUntitledFile',
+      'File: Save As...': 'workbench.action.files.saveAs',
+      'File: Revert File': 'workbench.action.files.revert',
+      'Terminal: Create New Terminal': 'workbench.action.terminal.new',
+      'Terminal: Focus Terminal': 'workbench.action.terminal.focus',
+    };
+    assert.ok(ids[text], 'Hosted command must have a verified workbench identity');
+    const row = f.locator(`.quick-input-list .monaco-list-row:visible [data-quick-input-id="${ids[text]}"]`);
     await bounded('Code command ready',async()=>{
       if(!await quick.count())await f.locator('.command-center').click();
-      try {await quick.waitFor({state:'visible',timeout:1000});await quick.fill('>'+text);await row.waitFor({state:'visible',timeout:2000});return true;}catch{return false;}
+      try {await quick.waitFor({state:'visible',timeout:1000});await quick.fill('>'+text.replace(/\.{3}$/, ''));await row.waitFor({state:'visible',timeout:2000});return true;}catch{return false;}
     },30000);
     await row.click();await quick.waitFor({state:'hidden',timeout:15000});
     if(text === 'Preferences: Open User Settings (JSON)') {
@@ -527,7 +538,7 @@ try {
   context = await browser.newContext({ viewport: {width:1280,height:800}, storageState });
   await configureAppContext(context);
   await context.addInitScript('(' + continuityInit.toString() + ')()');
-  page = await context.newPage(); await page.goto(`${APP}/os`);
+  page = await context.newPage(); await page.goto(`${APP}/os`, { waitUntil: 'domcontentloaded', timeout: 60000 });
   resizeObserver = observeScreenResizes(page, APP);
   await bounded('fallback session ready', () => page.evaluate(() => !!window.ezil?.session?.payload?.()?.computer));
   assert.equal(await page.evaluate(() => window.ezil.session.payload().computer.id), computerId, 'Fallback selects another computer');
