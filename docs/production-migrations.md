@@ -5,6 +5,13 @@ Copy it unchanged into Gateway, Works and OS; each repository supplies its own
 `.github/production-migrations.json`. Node 20+ and Git are required. The CI workflows run validation before deployment and apply only on an
 authorized production release. Application SQL is unchanged by this setup.
 
+The [environment contract](ENVIRONMENT-CONTRACT.md) requires this manifest to target
+`legacyProduction` before cutover. CI enforces it through `check-os-workflows.py`
+and `e2e/env-contract.test.mjs`; preview cannot name production credentials or run
+apply/rehearse. `env-contract.mjs assert-job` runs early in both deployment jobs,
+before production vault ACL reconciliation and migration apply. Version tags remain
+eligible only when `trust` admits the exact tested current-main source.
+
 ```sh
 node .github/scripts/production-migrations.mjs validate
 node .github/scripts/production-migrations.mjs plan

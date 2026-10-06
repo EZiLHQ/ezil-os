@@ -80,6 +80,12 @@ Actions access must permit this repository to read and publish its images.
 Cloudflare needs Workers deployment/version reads and Containers application/
 rollout read/write permissions. No Supabase credential is used by preview.
 
+The [environment contract](ENVIRONMENT-CONTRACT.md) pins production to the legacy
+project before cutover. CI's `check-os-workflows.py` rejects production credential
+names outside production and checks the manifest; `e2e/env-contract.test.mjs` pins
+the shared contract checksum. Preview and production run `env-contract.mjs assert-job`
+early, with production checked before vault ACL reconciliation and migration apply.
+
 For a user-requested manual preview, dispatch `preview.yml` on the PR branch
 with `preview_pr` set to its number. The PR may remain a draft, but must be an
 open same-repository PR to main and its exact current head must pass public CI.

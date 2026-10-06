@@ -853,7 +853,9 @@ jobs:
       - name: Install pinned YAML parser
         run: python3 -m pip install PyYAML==6.0.2
       - name: Static workflow and embedded script checks
-        run: python3 .github/scripts/check-os-workflows.py
+        run: |
+          python3 .github/scripts/check-os-workflows.py
+          node --test e2e/env-contract.test.mjs
       - name: Actionlint
         run: |
           curl --fail --silent --show-error --location https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz -o "$RUNNER_TEMP/actionlint.tar.gz"

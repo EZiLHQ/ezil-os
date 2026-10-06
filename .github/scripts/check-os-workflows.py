@@ -1,16 +1,24 @@
 """Offline contracts plus YAML and embedded-shell parsing for OS release workflows."""
 from pathlib import Path
+import json
 import re
 import subprocess
 import yaml
 
 root = Path(__file__).resolve().parents[2]
+contract = json.loads((root / '.github/environment-contract.json').read_text())
+subprocess.run(['node', '.github/scripts/env-contract.mjs', 'check'], cwd=root, check=True)
 workflows = {}
 for name in ('ci', 'preview', 'image', 'deploy', 'deploy-app', 'macos-internal', 'macos-e2e'):
     text = (root / f'.github/workflows/{name}.yml').read_text()
     workflow = yaml.safe_load(text)
     workflows[name] = workflow
     for job_name, job in workflow['jobs'].items():
+        if job_name != 'production':
+            job_text = yaml.safe_dump(job)
+            for credential in contract['productionCredentialNames']:
+                assert credential not in job_text, (name, job_name, f'Production credential {credential} outside production')
+            assert not re.search(r'production-migrations\.mjs\s+(?:apply|rehearse)\b', job_text), (name, job_name)
         assert 'self-hosted' not in str(job.get('runs-on', '')), (name, job_name)
         assert not any('latest' == str(step.get('with', {}).get(key))
                        for step in job.get('steps', []) for key in ('bun-version', 'node-version'))
@@ -54,6 +62,22 @@ internal_triggers = workflows['macos-internal'].get('on', workflows['macos-inter
 assert '.github/workflows/ci.yml' in internal_triggers['pull_request']['paths']
 
 jobs = workflows['preview']['jobs']
+assert jobs['preview']['environment']['name'] == 'staging'
+assert jobs['production']['environment']['name'] == 'production'
+assert jobs['production']['if'] == "needs.trust.outputs.production == 'true'"
+for job_name in ('preview', 'production'):
+    steps = jobs[job_name]['steps']
+    command = f'node .github/scripts/env-contract.mjs assert-job --environment {job_name}'
+    checks = [step for step in steps if step.get('run') == command]
+    assert len(checks) == 1, f'{job_name} requires one environment contract assertion'
+    check = checks[0]
+    assert not check.get('env'), f'{job_name} contract assertion must not bind secrets'
+    assert 'if' not in check and 'continue-on-error' not in check, f'{job_name} contract assertion must fail closed'
+    assert steps.index(check) == next(i for i, step in enumerate(steps) if step.get('uses', '').startswith('actions/setup-node@')) + 1
+    if job_name == 'production':
+        first_migration = next(i for i, step in enumerate(steps) if 'production-migrations.mjs' in yaml.safe_dump(step))
+        reconcile = next(i for i, step in enumerate(steps) if 'reconcile-vault-acl.mjs' in yaml.safe_dump(step))
+        assert steps.index(check) < min(first_migration, reconcile), 'Production contract must precede database writes'
 for job in ('preview', 'production'):
     assert jobs[job]['env']['EZIL_E2E_COMPUTER_ID'] == '${{ secrets.EZIL_E2E_COMPUTER_ID }}'
 for name in ('prod', 'prod-responsiveness', 'prod-window-stacking', 'prod-reconcile', 'prod-lifecycle'):
