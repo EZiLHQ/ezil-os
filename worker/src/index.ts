@@ -2370,8 +2370,16 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       const port = Number(headers.get('cf-container-target-port'));
       if (port !== CODE_PREVIEW_PORT) return json({ok:false,error:'invalid_code_port'},400);
       this.renewActivityTimeout();
-      const response = await this.ctx.container!.getTcpPort(port).fetch(new Request(request, { headers, signal: AbortSignal.timeout(12000) }));
-      return bridgeCodeSocket(response, () => this.renewActivityTimeout());
+      const controller = new AbortController();
+      const deadline = setTimeout(() => controller.abort(), 12000);
+      try {
+        const response = await this.ctx.container!.getTcpPort(port).fetch(new Request(request, { headers, signal: controller.signal }));
+        return bridgeCodeSocket(response, () => this.renewActivityTimeout());
+      } finally {
+        // Only the handshake is bounded. A timeout attached to the returned
+        // upgraded stream would disconnect an otherwise healthy Code session.
+        clearTimeout(deadline);
+      }
     });
   }
   async relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult> {
