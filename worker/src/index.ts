@@ -1,5 +1,6 @@
 import { relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget, type RelayState, type RelayResult } from './relay-refresh';
 import { bridgeCodeSocket } from './code-socket';
+import { RuntimeLifecycleMonitor } from './runtime-lifecycle';
 import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, failCheckpointWrites,
   AcceptanceFaultError, type AcceptanceFaultState } from './acceptance-faults';
 /**
@@ -2315,6 +2316,39 @@ export function validateActivityBody(
  * identity is unchanged, only new methods are added on top of it.
  */
 class EzilSandboxDO extends CFSandboxClass<Env> {
+  private lifecycleMonitor = new RuntimeLifecycleMonitor();
+  constructor(ctx: ConstructorParameters<typeof CFSandboxClass<Env>>[0], env: Env) {
+    super(ctx, env);
+    if (this.containerIsRunning()) this.observeRuntimeExit();
+  }
+  private observeRuntimeExit(): void {
+    this.lifecycleMonitor.watch(() => this.ctx.container!.monitor(), exit => {
+      this.lastOkCheckpoint = null;
+      bootLog('runtime_lifecycle', 'end', {
+        status: exit.exitCode === 0 ? 'ok' : 'error',
+        detail: `monitor,reason=${exit.reason},exitCode=${exit.exitCode ?? 'unknown'}`,
+      });
+    });
+  }
+  override async onStart(): Promise<void> {
+    this.observeRuntimeExit();
+    bootLog('runtime_lifecycle', 'start');
+    await super.onStart();
+  }
+  override async onStop(params?: {exitCode: number; reason: 'exit' | 'runtime_signal'}): Promise<void> {
+    this.lastOkCheckpoint = null;
+    bootLog('runtime_lifecycle', 'end', {
+      status: params?.exitCode === 0 ? 'ok' : 'error',
+      detail: `stop_hook,reason=${params?.reason === 'runtime_signal' ? 'runtime_signal' : 'exit'},exitCode=${Number.isSafeInteger(params?.exitCode) ? params!.exitCode : 'unknown'}`,
+    });
+    await super.onStop();
+  }
+  override async onActivityExpired(): Promise<void> {
+    bootLog('runtime_lifecycle', 'end', {
+      status: 'ok', detail: `activity_expired,keepAlive=${await this.ctx.storage.get<boolean>('keepAliveEnabled') === true}`,
+    });
+    await super.onActivityExpired();
+  }
   async setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void> {
     assertAcceptanceScope(this.env, sandboxId);
     const fault = parseAcceptanceFault(raw);
