@@ -310,6 +310,7 @@ try {
     // Reopened Code may restore a saved model with an earlier file version.
     // Reload disk before editing; the shortcut must still save a new edit.
     await command(f, 'File: Revert File');
+    await bounded('rendered restored marker', async () => (await readDocument(f)).includes(markerText), 10000);
     const persistedMarker = await verifyEditorShortcut({
       read: () => readDocument(f), expected: markerText, proof: `shortcut-save-${++shortcutChecks}`,
       append: async proof => {
@@ -325,7 +326,10 @@ try {
         await input.press('Control+Alt+K');
         await bounded('shortcut saved file', () => f.locator('.tabs-container .tab.active.dirty').count().then(count => count === 0), 10000);
       },
-      revert: () => command(f, 'File: Revert File'),
+      revert: async () => {
+        await command(f, 'File: Revert File');
+        await bounded('rendered disk reload', async () => !(await readDocument(f)).includes('unsaved-reload-probe:'), 10000);
+      },
     });
     evidence.shortcutSaveChecks = shortcutChecks;
     evidence.checkpointHashes = { settings: hash(restoredSettings), bindings: hash(restoredBindings), marker: hash(persistedMarker) };
@@ -557,6 +561,18 @@ try {
   // fixed failure and keep all diagnostics restricted to whitelisted evidence.
   evidence.ok = false; evidence.failure = 'hosted_continuity_acceptance_failed';
   evidence.errorType = ['AssertionError', 'TimeoutError'].includes(error?.name) ? error.name : 'Error';
+  // Only fixed assertion identifiers are public. Driver messages can contain
+  // private URLs, cookies and entered text, so never emit the raw exception.
+  const assertionCodes = {
+    'Workspace marker not restored': 'marker_not_restored',
+    'Shortcut test proof must be a fresh edit': 'shortcut_proof_not_fresh',
+    'Shortcut test edit did not reach Code': 'shortcut_edit_missing',
+    'Disk reload probe did not reach Code': 'reload_probe_missing',
+    'Disk reload did not discard the unsaved probe': 'reload_probe_not_discarded',
+    'Restored keybinding did not save the workspace edit': 'shortcut_not_saved',
+  };
+  const assertionCode = assertionCodes[error?.message];
+  if (assertionCode) evidence.assertionCode = assertionCode;
   const missing = String(error?.message).match(/^Missing prerequisite: ([A-Z0-9_]+)$/);
   if (missing) evidence.missingPrerequisite = missing[1];
   evidence.failedPhase = evidence.phases.at(-1)?.name || 'setup';
