@@ -29,28 +29,34 @@ export async function awaitContainerRollout(env = process.env, {
   assert.ok(Array.isArray(applications), 'Container applications unavailable');
   const initial = applications.find(a => a.name === `${env.EZIL_WORKER_NAME}-sandbox`);
   assert.ok(initial?.id && Number.isInteger(initial.version), 'Container application identity missing');
-  const image = initial.configuration?.image;
-  const digest = image?.match(/@sha256:([a-f0-9]{64})$/)?.[0]?.slice(1);
-  assert.ok(digest, 'Container immutable image missing');
-  let rolloutId;
+  let target, reachedTarget = false;
   for (;;) {
     const application = await read(`/applications/${encodeURIComponent(initial.id)}`);
-    assert.ok(application.id === initial.id && application.version === initial.version
-      && application.configuration?.image === image, 'Container application changed during rollout verification');
+    assert.equal(application.id, initial.id, 'Container application changed during rollout verification');
     const rollouts = await read(`/applications/${encodeURIComponent(initial.id)}/rollouts?limit=10`);
     assert.ok(Array.isArray(rollouts) && rollouts.length, 'Container rollout evidence missing');
     const latest = [...rollouts].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
-    assert.ok(latest.id && latest.target_version === initial.version
-      && latest.target_configuration?.image === image, 'Latest rollout does not target this container image');
-    rolloutId ??= latest.id;
-    assert.equal(latest.id, rolloutId, 'Container rollout changed during verification');
+    const image = latest.target_configuration?.image;
+    const digest = image?.match(/@sha256:([a-f0-9]{64})$/)?.[0]?.slice(1);
+    assert.ok(latest.id && Number.isInteger(latest.target_version) && digest, 'Container rollout target identity missing');
+    target ??= { id: latest.id, version: latest.target_version, image, digest };
+    assert.ok(latest.id === target.id && latest.target_version === target.version
+      && image === target.image, 'Container rollout changed during verification');
+    // During rollout, application GET retains the current configuration until
+    // every step completes. Fence both states instead of treating advancement
+    // to the selected target as an unrelated deployment.
+    const atTarget = application.version === target.version && application.configuration?.image === target.image;
+    const atCurrent = !reachedTarget && application.version === latest.current_version
+      && application.configuration?.image === latest.current_configuration?.image;
+    assert.ok(atTarget || atCurrent, 'Container application changed during rollout verification');
+    reachedTarget ||= atTarget;
     assert.ok(!['failed', 'cancelled', 'canceled', 'reverted', 'replaced'].includes(latest.status), 'Container rollout failed');
-    if (latest.status === 'completed') {
+    if (latest.status === 'completed' && atTarget) {
       assert.ok(latest.steps?.length && latest.steps.every(step => step.status === 'completed'), 'Container rollout steps incomplete');
-      return { application: initial.name, version: initial.version, image: digest,
-        rollout: rolloutId, status: 'completed', elapsedMs: now() - started };
+      return { application: initial.name, version: target.version, image: target.digest,
+        rollout: target.id, status: 'completed', elapsedMs: now() - started };
     }
-    assert.ok(['progressing', 'pending'].includes(latest.status), 'Unexpected container rollout status');
+    assert.ok(['progressing', 'pending', 'completed'].includes(latest.status), 'Unexpected container rollout status');
     assert.ok(now() < deadline, 'Container rollout did not complete within its budget');
     await sleep(Math.min(pollMs, deadline - now()));
   }

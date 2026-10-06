@@ -6,6 +6,7 @@ const env = { CLOUDFLARE_ACCOUNT_ID: 'a'.repeat(32), CLOUDFLARE_API_TOKEN: 'priv
 const application = { id: 'application', name: `${env.EZIL_WORKER_NAME}-sandbox`, version: 65,
   configuration: { image: `registry.cloudflare.com/test/desktop@sha256:${'b'.repeat(64)}` } };
 const rollout = { id: 'rollout', created_at: '2026-10-06T00:56:33Z', status: 'completed',
+  current_version: 64, current_configuration: { image: `registry.cloudflare.com/test/desktop@sha256:${'c'.repeat(64)}` },
   target_version: 65, target_configuration: application.configuration, steps: [{ status: 'completed' }] };
 
 function fixture({ states = [rollout], changeApplication, status = 200 } = {}) {
@@ -49,6 +50,23 @@ test('missing, stale, failed, changed and incomplete rollouts fail explicitly', 
   ] }).options), /changed/);
   const empty = fixture(); empty.options.fetchImpl = async () => ({ ok: true, json: async () => ({ result: [] }) });
   await assert.rejects(awaitContainerRollout(env, empty.options), /identity missing/);
+});
+
+test('application may retain current version while rollout progresses, then advance to target', async () => {
+  const f = fixture({ states: [{ ...rollout, status: 'progressing' }, rollout] });
+  const original = f.options.fetchImpl;
+  let applicationReads = 0;
+  f.options.fetchImpl = async (input, options) => {
+    const response = await original(input, options);
+    if (new URL(input).pathname.endsWith('/application') && applicationReads++ === 0) {
+      return { ok: true, json: async () => ({ result: { ...application, version: 64,
+        configuration: rollout.current_configuration } }) };
+    }
+    return response;
+  };
+  const result = await awaitContainerRollout(env, f.options);
+  assert.equal(result.version, 65);
+  assert.equal(result.elapsedMs, 5);
 });
 
 test('a stuck rollout is bounded and prerequisites fail before provider requests', async () => {
