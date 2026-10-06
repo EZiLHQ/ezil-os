@@ -472,6 +472,22 @@ const desktop_iframe = await (async () => {
 })();
 push('the desktop mint landed and navigated the iframe', !! desktop_iframe, desktop_iframe?.getAttribute('src'));
 desktop_iframe?.dispatchEvent(new window.Event('load'));
+await settle(4);
+push('server-side live evidence does not complete this viewer\'s boot trace',
+    bootSummaries().filter((s) => s.site === 'ezil-os:trace#desktop').length === 0);
+if ( desktop_iframe ) {
+    const viewerUrl = new URL(desktop_iframe.src);
+    for ( const framesDecoded of [1, 2] ) {
+        window.dispatchEvent(new window.MessageEvent('message', {
+            source: desktop_iframe.contentWindow,
+            origin: viewerUrl.origin,
+            data: { source: 'ezil-mobile', type: 'stream_vitals',
+                attempt: viewerUrl.searchParams.get('ezilAttempt'),
+                vitals: { connectionState: 'connected', bytesReceived: framesDecoded * 100,
+                    framesDecoded, width: 1280, height: 720 } },
+        }));
+    }
+}
 // Poll for the actual reveal (full-bleed) rather than a fixed `settle()` —
 // a blind sleep long enough to be SAFE against two independent asks (the
 // frame confirm and the display gate's own poll) landing would routinely

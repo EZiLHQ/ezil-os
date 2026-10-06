@@ -37,6 +37,9 @@ import {
 } from './routes.ts';
 import { startLocalServer, type LocalServer } from './server.ts';
 
+// Direct loopback media does not have Cloudflare TURN credentials to renew.
+const { relayRefresh: HOSTED_RELAY_ROUTE, ...COMMON_SHELL_API_ROUTES } = APP_SHELL_API_ROUTES;
+
 // ── Harness ──────────────────────────────────────────────────────────────────
 
 let tmp: string;
@@ -102,9 +105,9 @@ describe('the published endpoint map and the served paths are the same nine', ()
         // only import is `import type { Computer }`, which Bun erases, so
         // nothing of Next.js is loaded. Same technique as
         // `../contract/shell-api.test.ts`.
-        expect(Object.keys(SHELL_API_ROUTES).sort()).toEqual(Object.keys(APP_SHELL_API_ROUTES).sort());
-        for (const key of Object.keys(APP_SHELL_API_ROUTES) as (keyof typeof APP_SHELL_API_ROUTES)[]) {
-            expect(SHELL_API_ROUTES[key]).toBe(APP_SHELL_API_ROUTES[key]);
+        expect(Object.keys(SHELL_API_ROUTES).sort()).toEqual(Object.keys(COMMON_SHELL_API_ROUTES).sort());
+        for (const key of Object.keys(COMMON_SHELL_API_ROUTES) as (keyof typeof COMMON_SHELL_API_ROUTES)[]) {
+            expect(SHELL_API_ROUTES[key]).toBe(COMMON_SHELL_API_ROUTES[key]);
         }
     });
 
@@ -121,8 +124,15 @@ describe('the published endpoint map and the served paths are the same nine', ()
         const res = await post(SHELL_API_ROUTES.session, {});
         const body = (await res.json()) as { desktopState: { endpoints: Record<string, string> } };
         expect(Object.entries(body.desktopState.endpoints).sort()).toEqual(
-            Object.entries(APP_SHELL_API_ROUTES).sort(),
+            Object.entries(COMMON_SHELL_API_ROUTES).sort(),
         );
+    });
+
+    it('does not advertise or serve hosted TURN renewal', async () => {
+        const res = await post(SHELL_API_ROUTES.session, {});
+        const body = (await res.json()) as { desktopState: { endpoints: Record<string, string> } };
+        expect(body.desktopState.endpoints.relayRefresh).toBeUndefined();
+        expect((await get(HOSTED_RELAY_ROUTE)).status).toBe(404);
     });
 });
 

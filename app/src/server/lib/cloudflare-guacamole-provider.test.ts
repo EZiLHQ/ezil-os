@@ -24,6 +24,7 @@ import {
     requestGuacamoleSandboxTerminate,
     resetNekoAdminTokenCacheForTests,
     SANDBOX_WAKE_ANSWER_BUDGET_MS,
+    SANDBOX_STOP_TIMEOUT_MS,
     type CloudflareGuacamoleConfig,
     type GuacamolePreviewError,
     type GuacamolePreviewErrorCode,
@@ -428,6 +429,46 @@ describe('🔴 previewError refuses to build an unlabelled failure', () => {
 });
 
 describe('requestGuacamoleSandboxTerminate — the regression: an unsigned, unchecked DELETE that lied', () => {
+    it('waits for a checkpoint taking longer than the old ten-second transport deadline', async () => {
+        vi.useFakeTimers();
+        const timeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation(ms => {
+            const controller = new AbortController();
+            setTimeout(() => controller.abort(new DOMException('Timed out', 'TimeoutError')), ms);
+            return controller.signal;
+        });
+        try {
+            let signal: AbortSignal | null | undefined;
+            vi.stubGlobal('fetch', vi.fn(async (_url, init: RequestInit) => {
+                signal = init.signal;
+                return new Promise<Response>((resolve, reject) => {
+                    signal?.addEventListener('abort', () => reject(signal?.reason), { once: true });
+                    setTimeout(() => resolve(new Response(JSON.stringify({ ok:true, terminated:true, outcome:'destroyed' }))), 15000);
+                });
+            }));
+            const result = requestGuacamoleSandboxTerminate(CONFIG, 'secret', 'guac-u-c');
+            await vi.advanceTimersByTimeAsync(15000);
+            expect((await result).terminated).toBe(true);
+            expect(signal?.aborted).toBe(false);
+            expect(SANDBOX_STOP_TIMEOUT_MS).toBeGreaterThan(120000);
+            expect(SANDBOX_STOP_TIMEOUT_MS).toBeLessThan(300000);
+        } finally { timeout.mockRestore(); vi.useRealTimers(); }
+    });
+    it('a hung checkpoint reaches the bounded stop deadline and cannot claim termination', async () => {
+        vi.useFakeTimers();
+        const timeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation(ms => {
+            const controller = new AbortController();
+            setTimeout(() => controller.abort(new DOMException('Timed out', 'TimeoutError')), ms);
+            return controller.signal;
+        });
+        try {
+            vi.stubGlobal('fetch', vi.fn(async (_url, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+                init.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once:true });
+            })));
+            const result = requestGuacamoleSandboxTerminate(CONFIG, 'secret', 'guac-u-c');
+            await vi.advanceTimersByTimeAsync(300000);
+            expect(await result).toMatchObject({ok:false,terminated:false});
+        } finally { timeout.mockRestore(); vi.useRealTimers(); }
+    });
     it('signs the request the same way as /sandbox/preview, as Authorization: Bearer', async () => {
         const fetchSpy = stubWorkerResponse(
             200,
@@ -1077,5 +1118,27 @@ describe('composeAppPreviewBootstrapUrl', () => {
 describe('APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS', () => {
     it('is 5 minutes, matching worker/src/hmac.ts\'s PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS', () => {
         expect(APP_PREVIEW_BOOTSTRAP_TOKEN_MAX_AGE_MS).toBe(5 * 60 * 1000);
+    });
+});
+
+describe('relay refresh signed transport', () => {
+    it('signs reads and runtime-fenced refreshes without returning credentials', async () => {
+        const { requestRelayRefresh } = await import('./cloudflare-guacamole-provider');
+        const runtimeId='a'.repeat(32);
+        const spy=vi.fn(async()=>Response.json({ok:true,runtimeId,expiresAt:Date.now()+300000}));
+        vi.stubGlobal('fetch',spy);
+        for (const runtime of [undefined,runtimeId]) {
+            const result=await requestRelayRefresh(CONFIG,'relay-secret-test-only','guac-owner-computer','correlation-test',runtime);
+            expect(result).toMatchObject({ok:true,runtimeId});
+            const [url,init]=spy.mock.calls.at(-1)! as unknown as [string,RequestInit];
+            expect(url).toBe(`${CONFIG.workerUrl}/sandbox/guac-owner-computer/relay-refresh`);
+            expect(init.method).toBe(runtime?'POST':'GET');
+            const authorization=new Headers(init.headers).get('authorization')!;
+            const match=authorization.match(/^Bearer t=(\d+),v1=([a-f0-9]{64})$/)!;
+            expect(match).not.toBeNull();
+            expect(match[2]).toBe(createHmac('sha256','relay-secret-test-only').update(`${match[1]}.POST./sandbox/preview.`).digest('hex'));
+            if(runtime)expect(JSON.parse(String(init.body))).toEqual({runtimeId});
+            expect(init.cache).toBe('no-store');
+        }
     });
 });

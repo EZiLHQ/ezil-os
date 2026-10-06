@@ -138,6 +138,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - name: Verify Linux editor state locking and checkpoint restoration
+        if: runner.os == 'Linux'
+        run: bash worker/scripts/test-editor-state-linux.sh
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.3.14'
@@ -362,7 +365,10 @@ jobs:
         run: |
           set -e
           for t in shell/ezil/apps/desktop-screen-test.mjs \
+                   shell/ezil/boot-test.mjs \
                    shell/ezil/apps/desktop-close-test.mjs \
+                   shell/ezil/apps/relay-renewal-test.mjs \
+                   shell/ezil/apps/viewer-evidence-test.mjs \
                    shell/ezil/apps/code-test.mjs \
                    shell/ezil/apps/preview-focus-test.mjs \
                    shell/ezil/apps/registry-trace-test.mjs \
@@ -390,6 +396,8 @@ jobs:
         run: |
           set -e
           for t in shell/touch-focus-browser-test.mjs \
+                   shell/ezil/context-menu-stack-browser-test.mjs \
+                   shell/ezil/launcher-toggle-browser-test.mjs \
                    shell/ezil/apps/app-store-browser-test.mjs \
                    shell/ezil/apps/os-chrome-browser-test.mjs \
                    shell/ezil/apps/mobile-browser-test.mjs \
@@ -408,6 +416,7 @@ jobs:
                    shell/window-chrome-browser-test.mjs \
                    shell/phone-stacking-browser-test.mjs \
                    shell/ezil/apps/overlay-paint-browser-test.mjs \
+                   shell/ezil/display-notice-browser-test.mjs \
                    shell/ezil/apps/resize-test.mjs; do
             echo "── $t"
             node "$t"
@@ -622,8 +631,8 @@ jobs:
       # does (grep, never `source` — this file is deliberately not
       # shell-sourceable), check it against Docker's tag grammar before using
       # it, and pull exactly the reference `local/` will resolve. No re-tag.
-      # Nothing here sets `EZIL_LAUNCHER_IMAGE`: this job exists to prove the
-      # PIN resolves, and an override would prove something else.
+      # Verify the pin resolves, then overlay the current launchers and viewer
+      # telemetry. The hosted image gate tests the full candidate separately.
       #
       # 🔴 THE PIN, NOT THIS COMMIT'S OWN sha8 — the distinction the file
       # header's "WHICH TAG, AND WHY" is about. `image.yml` runs concurrently
@@ -667,6 +676,8 @@ jobs:
           printf '%s\n' "${pull_out}"
           digest="$(printf '%s\n' "${pull_out}" | grep -oE 'Digest: sha256:[0-9a-f]+' | head -1)"
           echo "[image] tested build: ${image}  ${digest:-<no Digest line printed by docker pull>}"
+          docker build --build-arg "DESKTOP_IMAGE=$image" -f .github/scripts/Dockerfile.local-check -t ezil-local-source:ci .
+          echo "EZIL_LAUNCHER_IMAGE=ezil-local-source:ci" >> "$GITHUB_ENV"
       # `local/tsconfig.json`'s own header comment: its typecheck reaches
       # `app/src/server/shell/boot-payload.ts`, which imports `drizzle-orm`
       # through `app/node_modules` — so `bun run --cwd local typecheck` needs
@@ -830,7 +841,7 @@ jobs:
       - uses: actions/setup-node@v7
         with: { node-version: '22.16.0' }
       - name: Cloud identity, admission and rollback tests
-        run: node e2e/cloud-ci.test.mjs
+        run: node --test e2e/cloud-ci.test.mjs e2e/hosted-continuity-contract.test.mjs
       - name: Validate production migration manifest and lease
         run: |
           node .github/scripts/production-migrations.mjs validate

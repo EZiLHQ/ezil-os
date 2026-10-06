@@ -46,6 +46,7 @@ describe('staging Worker resources and routes', () => {
       SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.work',
       SANDBOX_DEFAULT_DESKTOP_MODE: 'neko',
       SANDBOX_NEKO_ICE_POLICY: 'relay',
+      SANDBOX_NEKO_TURN_TTL_SECONDS: '300',
     });
   });
 

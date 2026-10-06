@@ -72,23 +72,10 @@ fi
 # Stale pid file with nothing listening — clean up and relaunch.
 rm -f "$PID_FILE"
 
-# ── Workspace Trust off — see the long block in start-neko.sh for the measured
-# evidence. Short version: with a folder open, an untrusted workspace boots into
-# Restricted Mode and the integrated terminal refuses to start behind a "Do you
-# trust the authors of the files in this folder? / Creating a terminal process
-# requires executing code" modal. The grant lives in --user-data-dir, which is
-# under /tmp and recreated every container start, so the prompt returns every
-# session. A SETTING, not `--disable-workspace-trust`: an unknown setting is
-# ignored, an unknown CLI option makes code-server exit non-zero.
-# Keep this in sync with start-neko.sh, which is the launcher that actually runs
-# on the mandatory boot path; this one is the idempotent on-demand fallback.
-if [ ! -s "$USER_DATA_DIR/User/settings.json" ]; then
-    mkdir -p "$USER_DATA_DIR/User"
-    cat >"$USER_DATA_DIR/User/settings.json" <<'CODESERVER_SETTINGS_JSON'
-{
-  "security.workspace.trust.enabled": false
-}
-CODESERVER_SETTINGS_JSON
+. "$(dirname "${BASH_SOURCE[0]}")/editor-state.sh"
+if ! ezil_editor_prepare "$USER_DATA_DIR" "$WORKSPACE_ROOT"; then
+    echo failed
+    exit 1
 fi
 
 # Keep auth none because the bridge is already HMAC/cookie-gated in front of
@@ -111,6 +98,11 @@ nohup code-server \
     "$WORKSPACE_ROOT" \
     >"$LOG_FILE" 2>&1 &
 echo $! >"$PID_FILE"
+
+# Extension downloads never delay editor readiness. Preserve their saved manifest
+# on installer failures, and use the same restoration as the supervised launcher.
+(ezil_editor_restore_extensions "$USER_DATA_DIR" "$WORKSPACE_ROOT" "$EXTENSIONS_DIR" "code-server") \
+    >>"$LOG_FILE" 2>&1 &
 
 # Wait for the port to open. code-server's extension host takes a few
 # seconds on a warm container so 30s is generous but not unbounded.

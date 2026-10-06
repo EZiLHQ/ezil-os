@@ -174,6 +174,7 @@ function fakeSandboxNamespace(options: {
   };
 
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
+    desktopReachable: async () => true,
     hydrateWorkspace: async () => ({ mounted: true, mountPath: '/workspace' }),
     containerFetch: async (...args: unknown[]) => {
       const [url, init, port] = args as [string, RequestInit | undefined, number];
@@ -332,6 +333,8 @@ function fakeSandboxNamespace(options: {
         }
       : {}),
   };
+  impl.runningContainerFetch = impl.containerFetch!;
+  impl.stopRuntimeForAcceptance = impl.terminateSandbox!;
 
   const stub = new Proxy(
     {},
@@ -367,6 +370,24 @@ let worker: { fetch(request: Request, env: unknown, ctx?: ExecutionContext): Pro
 
 beforeEach(async () => {
   worker = await loadWorker();
+});
+
+describe('isolated runtime stop for stale recovery acceptance', () => {
+  it('requires staging scope and signed authorization before stopping anything', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const token = await mintToken();
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET,
+      EZIL_ACCEPTANCE_ENV: 'staging', EZIL_ACCEPTANCE_SANDBOX: SANDBOX_NAME };
+    const request = (name: string, signed = true) => new Request(`https://api-desktop.ezil.org/sandbox/${name}/acceptance-idle-stop`, {
+      method: 'POST', headers: signed ? { authorization: `Bearer ${token}` } : {},
+    });
+    expect((await worker.fetch(request(SANDBOX_NAME), {...env,EZIL_ACCEPTANCE_ENV:'production'})).status).toBe(404);
+    expect((await worker.fetch(request('guac-other-computer'), env)).status).toBe(404);
+    expect((await worker.fetch(request(SANDBOX_NAME, false), env)).status).toBe(401);
+    expect(calls.terminateSandbox).toBe(0);
+    expect((await worker.fetch(request(SANDBOX_NAME), env)).status).toBe(200);
+    expect(calls.terminateSandbox).toBe(1);
+  });
 });
 
 // ── DELETE /sandbox/:name — the exploitable defect ──────────────────────────

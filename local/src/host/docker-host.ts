@@ -116,19 +116,25 @@ export type HostFetch = (input: string, init?: RequestInit) => Promise<Response>
  */
 export function spawnDocker(argv: readonly string[], options: SpawnOptions = {}): Promise<SpawnOutcome> {
     const proc = Bun.spawn(['docker', ...argv], { stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
-    let timedOut = false;
-    const timer = options.timeoutMs === undefined
-        ? null
-        : setTimeout(() => { timedOut = true; proc.kill('SIGKILL'); }, options.timeoutMs);
-    return (async () => {
+    const completed = (async () => {
         const [stdout, stderr] = await Promise.all([
             new Response(proc.stdout).text(),
             new Response(proc.stderr).text(),
         ]);
         const exitCode = await proc.exited;
-        if (timer !== null) clearTimeout(timer);
-        return { exitCode: timedOut ? null : exitCode, stdout, stderr, timedOut };
+        return { exitCode, stdout, stderr, timedOut: false };
     })();
+    if (options.timeoutMs === undefined) return completed;
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<SpawnOutcome>(resolve => {
+        timer = setTimeout(() => {
+            proc.kill('SIGKILL');
+            // Bun's pipe readers can remain pending after a Docker CLI kill.
+            // The host deadline must bound those reads as well as proc.exited.
+            resolve({ exitCode: null, stdout: '', stderr: '', timedOut: true });
+        }, options.timeoutMs);
+    });
+    return Promise.race([completed, timeout]).finally(() => clearTimeout(timer));
 }
 
 // ── Boot phases ──────────────────────────────────────────────────────────────

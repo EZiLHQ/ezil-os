@@ -54,7 +54,7 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { applyDisplayEvidence, computeBootUiState } from '@/components/desktop/boot-phases';
 import shellSession from '../../../../shell/ezil/session.js';
@@ -497,7 +497,8 @@ describe('the admin-token cache — one session per container, not one per quest
  * expires — so the client usually needs exactly one round trip instead of
  * three.
  *
- * Every case here uses a REAL HTTP server, exactly like the suite above.
+ * Transport cases use real HTTP servers. The stable-blank hold boundary uses
+ * a controlled clock so runner scheduling cannot turn it into a network test.
  */
 // Wall-clock budgets against a real loopback server, measured on Linux/macOS
 // runners. On the Windows runner the same loopback round-trips are slow enough
@@ -595,19 +596,33 @@ describe.skipIf(process.platform === 'win32')('probeDesktopDisplayLongPoll — z
     });
 
     it('a stable blank is held for the WHOLE budget, then answered honestly — never fabricated as a timeout', async () => {
-        const { server } = makeNeko({ sessions: [session('a', false)] });
-        const url = await listen(server);
+        // This case proves the hold boundary, so control both time and the
+        // already-successful transport. A real handshake within a 1s budget
+        // races runner load instead of testing that boundary. The adjacent
+        // mid-hold and hung-server cases retain real HTTP and real deadlines.
+        vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+        const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+            const path = new URL(String(input)).pathname;
+            if (path === '/api/login') return Response.json({ token: TOKEN });
+            if (path === '/api/sessions') return Response.json([session('a', false)]);
+            throw new Error(`Unexpected probe path: ${path}`);
+        });
         try {
-            const t0 = performance.now();
-            const probe = await probeDesktopDisplayLongPoll(`${url}/`, ADMIN_PASSWORD, 1_000, 150);
-            const elapsed = performance.now() - t0;
-            expect(probe).toEqual({ display: 'blank', sessions: 1 });
-            expect(elapsed).toBeGreaterThanOrEqual(900);
-            // Bounded overshoot only — not "however long the last attempt felt
-            // like taking".
-            expect(elapsed).toBeLessThan(1_800);
+            let settled = false;
+            const probe = probeDesktopDisplayLongPoll('https://neko.example/', ADMIN_PASSWORD, 1_000, 1_000)
+                .then((answer) => { settled = true; return answer; });
+            await vi.advanceTimersByTimeAsync(999);
+            expect(fetchSpy.mock.calls.map(([input]) => new URL(String(input)).pathname))
+                .toEqual(['/api/login', '/api/sessions']);
+            expect(settled).toBe(false);
+            await vi.advanceTimersByTimeAsync(1);
+            expect(settled).toBe(true);
+            await expect(probe).resolves.toEqual({ display: 'blank', sessions: 1 });
+            // No near-deadline request may replace the last honest answer.
+            expect(fetchSpy).toHaveBeenCalledTimes(2);
         } finally {
-            await close(server);
+            fetchSpy.mockRestore();
+            vi.useRealTimers();
         }
     });
 

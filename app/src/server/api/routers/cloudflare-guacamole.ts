@@ -61,6 +61,7 @@ import {
     requestGuacamoleActivity,
     requestGuacamoleDesktopRestart,
     requestGuacamoleFocusApp,
+    requestRelayRefresh,
     requestGuacamolePreview,
     requestGuacamoleSandboxTerminate,
     readGuacamoleScreen,
@@ -89,6 +90,22 @@ async function assertOwnedComputer(
 }
 
 export const cloudflareGuacamoleRouter = createTRPCRouter({
+    relayState: protectedProcedure.input(z.object({ computerId: z.string().uuid() }))
+        .query(async ({ ctx, input }) => {
+            await assertOwnedComputer(ctx.db,ctx.user.id,input.computerId);
+            const config = resolveCloudflareGuacamoleConfig();
+            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+            if (!config.isConfigured || !hmacSecret) return { ok:false as const,error:'relay_not_configured' };
+            return requestRelayRefresh(config,hmacSecret,deriveGuacamoleSandboxId(ctx.user.id,input.computerId),newCorrelationId());
+        }),
+    refreshRelay: protectedProcedure.input(z.object({ computerId: z.string().uuid(), runtimeId: z.string().regex(/^[a-f0-9]{32}$/) }))
+        .mutation(async ({ ctx, input }) => {
+            await assertOwnedComputer(ctx.db,ctx.user.id,input.computerId);
+            const config = resolveCloudflareGuacamoleConfig();
+            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+            if (!config.isConfigured || !hmacSecret) return { ok:false as const,error:'relay_not_configured' };
+            return requestRelayRefresh(config,hmacSecret,deriveGuacamoleSandboxId(ctx.user.id,input.computerId),newCorrelationId(),input.runtimeId);
+        }),
     /**
      * Check whether the desktop provider is configured. Safe to call from
      * the browser — returns only boolean metadata, never secret values or
@@ -345,6 +362,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 ok: true as const,
                 correlationId,
                 guacamoleUrl: composedGuacamoleUrl,
+                relay: result.relay,
                 expiresAt: result.expiresAt,
                 provider: 'cloudflare-guacamole' as const,
                 mode: result.mode,

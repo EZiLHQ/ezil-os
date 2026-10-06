@@ -1,3 +1,4 @@
+import { createRelayRenewal } from './relay-renewal.js';
 import { isNative } from '../native-runtime.js';
 import { bindNativeBrowser } from './native.js';
 // desktop-window.js — EZiL-authored. Not Puter code.
@@ -108,6 +109,7 @@ import {
     readAppliedScreen,
 } from './desktop-screen.js';
 import UIWindow from '../../src/UI/UIWindow.js';
+import { isCurrentViewerMessage, viewerFramesAdvance } from './viewer-evidence.js';
 
 const PHASE = 'ezil-os:desktop';
 
@@ -125,7 +127,7 @@ const POLL_MS = 2_000;
  * boot earns the detail because it is genuinely taking longer than "a
  * circular thing rotates a few seconds" covers.
  *
- * 🔴 Comfortably inside `DISPLAY_UNVERIFIED_DEADLINE_MS` (6s, below) — the
+ * Origin probes overlap the viewer handshake — the
  * phase list must have a chance to appear before the display gate's own
  * "we could not check" strip could ever fire, or a slow-but-honest boot would
  * jump straight from a bare spinner to a failure/unverified surface with no
@@ -167,52 +169,14 @@ const FRAME_CONFIRM_RETRY_MS = 1_500;
  * the boot nothing at all: the answer is already in hand when the frame check
  * lands. (Measured: this is the whole of the +1.5s the gate used to add.)
  *
- * ── Two deadlines, because they are answers to two different questions ──────
- * There used to be one, at 20s, and it was wrong in both directions at once.
- *
- * UNVERIFIED (6s) — "how long do we wait for OUR OWN plumbing before admitting
- * we cannot check?" Reached only when not one understood answer has come back,
- * which is a fact about us, never about the user's screen. Measured: a probe
- * that could not answer pushed settle from 7s to 29.7s, because each ask can
- * burn `session.js`'s 12s budget and the old deadline was only tested AFTER an
- * ask returned — so every user of a degraded deployment waited ~20 extra
- * seconds to be shown a desktop that had been working the whole time. 6s is
- * two full poll cycles plus slack, and it is enforced by a TIMER rather than by
- * the ask loop, so a probe that hangs cannot outlast it.
- *
- * BLANK (45s) — "how long may a genuinely-connecting desktop take?" This is the
- * only verdict that HIDES anything, so it must be the hardest to reach. 20s was
- * sized for ICE against STUN. There is no STUN path here: PLATFORM-NOTES §6
- * says Cloudflare Containers carry no UDP, so **every** connection is relayed
- * through TURN, and a relayed candidate is only tried after the direct ones
- * have timed out. Stack that against DTLS's own retransmit schedule
- * (1+2+4+8+16s for a single lost handshake flight) and 20s is inside the
- * envelope of a connection that was about to succeed — i.e. the old number
- * could hide a working desktop, which is the defect this gate exists to fix,
- * sign-flipped. 45s clears one full DTLS retransmit ladder. Only a failing
- * desktop ever spends it, the user watches an honest "Connecting the display"
- * on an OS that still has its taskbar, and `LONG_BOOT_MS` (35s) gives them the
- * "still working" copy before it elapses.
- *
- * FRESHNESS: how recently a well-formed `blank` must have been observed for the
- * blank verdict to stand at the deadline. Without this the flag was STICKY: one
- * `blank` at t=1s followed by 44 seconds of unanswerable probe still hid the
- * desktop, on evidence that was a minute stale. Two poll cycles.
- *
- * 🔴 z1: `session.confirmDisplay` NOW HOLDS SERVER-SIDE (see its own header in
- * `session.js`) before answering, so the common case — a peer that connects
- * within a few seconds of navigation — settles this whole gate on the FIRST
- * `ask()` below, no `DISPLAY_POLL_MS` wait ever spent. Nothing about this
- * loop's own shape changed: `ask()` still schedules the next attempt only
- * after the previous one resolves, `unverified`/`blank` are still independent
- * TIMERS (see their own comments), and a server that does not hold (older
- * deployment) degrades to exactly today's cadence — this is a pure
- * latency win on the common path, not a new mechanism the client depends on.
+ * The 45-second display budget starts after origin confirmation. A TURN
+ * connection needs room for ICE negotiation and DTLS retransmissions. The
+ * current iframe must report received bytes AND decoded-frame progress before
+ * this gate declares ready. Server session health is diagnostic only.
  */
 const DISPLAY_POLL_MS = 1_000;
 const DISPLAY_POLL_SLOW_MS = 2_000;
 const DISPLAY_POLL_SLOW_AFTER_MS = 10_000;
-const DISPLAY_UNVERIFIED_DEADLINE_MS = 6_000;
 const DISPLAY_BLANK_DEADLINE_MS = 45_000;
 const DISPLAY_BLANK_FRESHNESS_MS = 5_000;
 
@@ -436,7 +400,7 @@ function fit_stream (el_body, el_iframe, stream) {
  * `setInterval`, so `start_display_gate` pauses it with its own, smaller
  * `schedule_next_ask` instead. Either way, only the TICKING pauses: neither
  * this helper nor `schedule_next_ask` touches a single deadline
- * (`DISPLAY_UNVERIFIED_DEADLINE_MS`/`DISPLAY_BLANK_DEADLINE_MS`), which stay
+ * (`DISPLAY_BLANK_DEADLINE_MS`), which stay
  * wall-clock and keep counting whichever way the tab is showing.
  *
  * @param {() => void} tick
@@ -625,6 +589,11 @@ export async function openDesktopWindow (ctx = {}) {
     if (isNative(ctx)) return bindNativeBrowser(el_window, ctx);
 
     const el_body = el_window.querySelector('.window-body');
+    let relay_renewal = null;
+    const on_relay_return = () => { if (document.visibilityState === 'visible') relay_renewal?.resume(); };
+    const on_relay_online = () => relay_renewal?.reconnect();
+    document.addEventListener('visibilitychange',on_relay_return);
+    window.addEventListener('online',on_relay_online);
     const el_iframe = el_window.querySelector('.window-app-iframe');
 
     // ── the desktop's ACTUAL size, and the live-resize path ────────────────
@@ -649,6 +618,7 @@ export async function openDesktopWindow (ctx = {}) {
     const refit = () => fit_stream(el_body, el_iframe, stream);
     /** What this window most recently ASKED for, so a bogus `requested` can be spotted. */
     let screen_requested = null;
+    let neko_reachable = false;
 
     const screen_ctl = createScreenController({
         endpoint: session.screenEndpoint(),
@@ -746,7 +716,7 @@ export async function openDesktopWindow (ctx = {}) {
      */
     let reconcile_in_flight = false;
     function reconcile_screen (why) {
-        if ( disposed || reconcile_in_flight ) return;
+        if ( disposed || ! neko_reachable || reconcile_in_flight ) return;
         if ( typeof session.getScreen !== 'function' ) return;   // older server bundle
         reconcile_in_flight = true;
         Promise.resolve(session.getScreen(computer.id))
@@ -860,7 +830,7 @@ export async function openDesktopWindow (ctx = {}) {
                 return;
             }
             const want = measure_screen();
-            if ( want ) screen_ctl.request(want.width, want.height);
+            if ( want && neko_reachable ) screen_ctl.request(want.width, want.height);
         });
         fit_observer.observe(el_body);
     } else {
@@ -873,6 +843,12 @@ export async function openDesktopWindow (ctx = {}) {
     /** The status-poll's `visibilityGatedInterval` handle, or null between attempts. */
     let poll_gate = null;
     let attempt = 0;          // guards a stale request finishing after a retry
+    let viewer_attempt = null;
+    let viewer_origin = null;
+    let viewer_previous = null;
+    let active_display_gate = null;
+    let boot_work = null;
+    let stale_recoveries = 0;
     let running_signal;       // undefined until a poll lands; never coerced to false
     let disposed = false;
     /**
@@ -1011,6 +987,50 @@ export async function openDesktopWindow (ctx = {}) {
     // its runtime may be gone and this frame's URL with it (410 STALE_PREVIEW_URL).
     // Ask the never-waking status probe; boot again only on an explicit "not
     // running". See `../runtime-recheck.js`.
+    // 🔴 The frame itself says its runtime is gone. When the computer's
+    // container is replaced under an open window (an image rollout, a crash,
+    // an idle-stop the user comes back to), the Worker answers the frame's
+    // next navigation with a small "Reconnecting…" page that posts
+    // `ezil:preview-runtime-stale` (worker `recoverableStalePreview`) instead
+    // of the SDK's raw 410 JSON (founder screenshots, 2026-10-04). Mint a
+    // fresh URL against the ACTIVE runtime through the normal bounded boot —
+    // never re-navigate the dead URL — and at most once per
+    // `STALE_RECOVERY_MIN_GAP_MS`, so a URL that keeps coming back stale ends
+    // in the boot path's own failure state rather than a loop.
+    const STALE_RECOVERY_MIN_GAP_MS = 20_000;
+    let last_stale_recovery = 0;
+    const on_frame_message = (event) => {
+        if ( disposed || ! isCurrentViewerMessage(event, el_iframe.contentWindow, viewer_origin, viewer_attempt) ) return;
+        if (event.data?.source === 'ezil-mobile' && event.data?.type === 'peer_state' && ['failed','disconnected'].includes(event.data.state)) relay_renewal?.reconnect();
+        if ( event.data?.source === 'ezil-mobile' && event.data?.type === 'stream_vitals' ) {
+            const current = event.data.vitals;
+            if ( viewerFramesAdvance(viewer_previous, current) ) {
+                stale_recoveries = 0;
+                relay_renewal?.viewerLive();
+                active_display_gate?.viewerLive();
+            }
+            viewer_previous = current;
+            return;
+        }
+        if ( event.data?.type !== 'ezil:preview-runtime-stale' ) return;
+        const now = Date.now();
+        if ( boot_work ) return;
+        if ( stale_recoveries >= 2 || last_stale_recovery !== 0 && now - last_stale_recovery < STALE_RECOVERY_MIN_GAP_MS ) {
+            ++attempt;
+            active_display_gate?.stop();
+            stop_timers();
+            render_both({ kind: 'failed', reason: 'desktop_unreachable' });
+            show_panel();
+            return;
+        }
+        last_stale_recovery = now;
+        stale_recoveries++;
+        console.info(`[${PHASE}] the frame's runtime is gone; minting against the active one`);
+        telemetry.capture({ eventClass: 'display_failure', site: 'ezil-os:apps/desktop#staleRuntime', code: 'preview_runtime_stale' });
+        void start_boot(true);
+    };
+    window.addEventListener('message', on_frame_message);
+
     const stop_runtime_recheck = watchRuntimeOnReturn({
         computerId: computer.id,
         isLive: () => !! el_iframe.getAttribute('src'),
@@ -1107,9 +1127,23 @@ export async function openDesktopWindow (ctx = {}) {
         console.info(`[${PHASE}] full-bleed (${why})`);
     }
 
-    async function start_boot () {
+    function start_boot (recovery = false) {
+        if ( boot_work ) return boot_work;
+        if ( ! recovery ) { stale_recoveries = 0; last_stale_recovery = 0; }
+        boot_work = perform_boot().finally(() => { boot_work = null; });
+        return boot_work;
+    }
+
+    async function perform_boot () {
         if ( disposed ) return;
         const my_attempt = ++attempt;
+        neko_reachable = false;
+        screen_ctl.cancel();
+        active_display_gate?.stop();
+        active_display_gate = null;
+        viewer_attempt = null;
+        viewer_origin = null;
+        viewer_previous = null;
         stop_timers();
         clearTimeout(phase_list_timer); phase_list_timer = null;
         // A fresh attempt has earned nothing yet — start back at the spinner,
@@ -1324,7 +1358,40 @@ export async function openDesktopWindow (ctx = {}) {
         }
 
         // 🔴 The single navigation. Everything above had to have finished.
-        el_iframe.src = res.url;
+        neko_reachable = true;
+        relay_renewal?.stop();
+        const relay_endpoint = desktop_state.endpoints?.relayRefresh;
+        relay_renewal = res.relay && relay_endpoint ? createRelayRenewal({
+            state: res.relay,
+            refresh: async runtimeId => {
+                const response = await fetch(relay_endpoint, { method:'POST', credentials:'same-origin',
+                    headers:{'Content-Type':'application/json'},body:JSON.stringify({computerId:computer.id,runtimeId}),
+                    signal:AbortSignal.timeout(30000) });
+                return response.ok ? response.json() : {ok:false};
+            },
+            onState: state => {
+                if (disposed || my_attempt !== attempt) return;
+                el_window.dataset.relayState = state;
+                if (state === 'confirming') viewer_previous = null;
+                if (state === 'error') {
+                    render_both({kind:'failed', reason:'desktop_unreachable'});
+                    show_panel();
+                    telemetry.capture({eventClass:'api_failure',site:'ezil-os:apps/desktop#relay',code:'relay_refresh_failed'});
+                }
+            },
+        }) : null;
+        const viewer_url = new URL(res.url);
+        if (viewer_url.origin === 'null' || !['https:', 'http:'].includes(viewer_url.protocol)) {
+            render_both({ kind: 'failed', reason: 'desktop_unreachable' });
+            show_panel();
+            stop_timers();
+            trace.end('error');
+            return;
+        }
+        viewer_attempt = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `${my_attempt}-${Date.now()}-${Math.random()}`;
+        viewer_origin = viewer_url.origin;
+        viewer_url.searchParams.set('ezilAttempt', viewer_attempt);
+        el_iframe.src = viewer_url.href;
         // 🔴 THE GATE STARTS HERE, NOT AFTER THE FRAME CHECK. Asking Neko
         // whether a peer is connected is independent of everything
         // `settle_frame` does — it goes to Neko's own API, not to the iframe —
@@ -1333,7 +1400,12 @@ export async function openDesktopWindow (ctx = {}) {
         // (`gate.frameConfirmed`), so the two gates compose exactly as before;
         // only the waiting overlaps.
         const gate = start_display_gate(my_attempt, res.url);
-        settle_frame(my_attempt, res.url, gate);
+        active_display_gate = gate;
+        el_iframe.addEventListener('load', () => {
+            if ( disposed || my_attempt !== attempt ) return;
+            if (viewer_origin && viewer_origin !== 'null') el_iframe.contentWindow?.postMessage({ source: 'ezil-shell', type: 'viewer_probe', attempt: viewer_attempt }, viewer_origin);
+        }, { once: true });
+        settle_frame(my_attempt, res.url, gate, t0 + DESKTOP_BOOT_TIMEOUT_MS);
     }
 
     // ── the handoff ────────────────────────────────────────────────────────
@@ -1371,64 +1443,78 @@ export async function openDesktopWindow (ctx = {}) {
      *               an indefinite spinner is not more honest, and Retry re-runs
      *               the whole boot.
      */
-    function settle_frame (my_attempt, url, gate) {
+    function settle_frame (my_attempt, url, gate, boot_deadline) {
         let settled = false;
         let asks = 0;
+        let asking = false;
 
         const ask = async () => {
-            if ( settled || disposed || my_attempt !== attempt ) return;
-            asks++;
-            const seen = await session.confirmFrame(computer.id, url);
-            if ( settled || disposed || my_attempt !== attempt ) return;
+            if ( asking || settled || disposed || my_attempt !== attempt ) return;
+            asking = true;
+            try {
+                asks++;
+                const seen = await session.confirmFrame(computer.id, url);
+                if ( settled || disposed || my_attempt !== attempt ) return;
 
-            if ( seen === undefined ) {
-                // OUR request never landed. That is not an observation of the
-                // desktop, so it decides nothing — ask again, bounded.
-                if ( asks < FRAME_CONFIRM_ATTEMPTS ) {
-                    setTimeout(() => { void ask(); }, FRAME_CONFIRM_RETRY_MS);
+                if ( seen === undefined ) {
+                    // OUR request never landed. That is not an observation of the
+                    // desktop, so it decides nothing — ask again, bounded.
+                    if ( asks < FRAME_CONFIRM_ATTEMPTS ) {
+                        setTimeout(() => { void ask(); }, FRAME_CONFIRM_RETRY_MS);
+                        return;
+                    }
+                    console.warn(`[${PHASE}] gave up confirming the frame after ${asks} tries`);
+                }
+
+                // A negative origin probe during confirmed startup is not a
+                // display verdict. Retain Opening inside the original boot budget.
+                if ( seen === false && performance.now() < boot_deadline ) {
+                    const starting = await session.desktopRunning(computer.id);
+                    if ( settled || disposed || my_attempt !== attempt ) return;
+                    if ( starting === true && performance.now() < boot_deadline ) {
+                        setTimeout(() => { void ask(); }, FRAME_CONFIRM_RETRY_MS);
+                        return;
+                    }
+                }
+                settled = true;
+
+                if ( seen === true ) {
+                    // 🔴 NO LONGER THE PATH TO THE VIEWPORT. It used to be, and
+                    // that was the remaining hole: a confirmed ORIGIN is not a
+                    // confirmed PICTURE. Measured under WebKit, this branch fired
+                    // at 4.6s over `videoWidth: 0, paused: true, srcObject: false`
+                    // and handed the user a third-party spinner full-screen.
+                    //
+                    // It is now the RELEASE for the second gate, which is the one
+                    // that can actually end the boot and which has been asking
+                    // since the navigation. See `start_display_gate`.
+                    //
+                    // Not terminal on its own — the display gate below is what
+                    // actually ends this trace, once IT reaches a verdict.
+                    trace.step('confirm_ok');
+                    gate.frameConfirmed();
                     return;
                 }
-                console.warn(`[${PHASE}] gave up confirming the frame after ${asks} tries`);
-            }
 
-            settled = true;
-
-            if ( seen === true ) {
-                // 🔴 NO LONGER THE PATH TO THE VIEWPORT. It used to be, and
-                // that was the remaining hole: a confirmed ORIGIN is not a
-                // confirmed PICTURE. Measured under WebKit, this branch fired
-                // at 4.6s over `videoWidth: 0, paused: true, srcObject: false`
-                // and handed the user a third-party spinner full-screen.
-                //
-                // It is now the RELEASE for the second gate, which is the one
-                // that can actually end the boot and which has been asking
-                // since the navigation. See `start_display_gate`.
-                //
-                // Not terminal on its own — the display gate below is what
-                // actually ends this trace, once IT reaches a verdict.
-                trace.step('confirm_ok');
-                gate.frameConfirmed();
-                return;
-            }
-
-            console.error(`[${PHASE}] the frame is not a desktop (confirmFrame -> ${String(seen)})`);
-            telemetry.capture({
-                eventClass: 'display_failure', site: 'ezil-os:apps/desktop#confirmFrame', code: 'frame_not_answering',
-                attrs: { seen: String(seen) },
-            });
-            gate.stop();
-            stop_timers();
-            show_panel();
-            render_both(computeBootUiState({
-                requestStatus: 'success',
-                elapsedMs: 0,
-                frameConfirmed: false,
-            }));
-            // Terminal: the origin never confirmed as a desktop, `gate.stop()`
-            // just retired the display gate too, and nothing further will run
-            // on this attempt.
-            trace.step('confirm_error');
-            trace.end('error');
+                console.error(`[${PHASE}] the frame is not a desktop (confirmFrame -> ${String(seen)})`);
+                telemetry.capture({
+                    eventClass: 'display_failure', site: 'ezil-os:apps/desktop#confirmFrame', code: 'frame_not_answering',
+                    attrs: { seen: String(seen) },
+                });
+                gate.stop();
+                stop_timers();
+                show_panel();
+                render_both(computeBootUiState({
+                    requestStatus: 'success',
+                    elapsedMs: 0,
+                    frameConfirmed: false,
+                }));
+                // Terminal: the origin never confirmed as a desktop, `gate.stop()`
+                // just retired the display gate too, and nothing further will run
+                // on this attempt.
+                trace.step('confirm_error');
+                trace.end('error');
+            } finally { asking = false; }
         };
 
         el_iframe.addEventListener('load', () => { void ask(); }, { once: true });
@@ -1451,59 +1537,16 @@ export async function openDesktopWindow (ctx = {}) {
      * hard to reach but forbidden — an attempt throws or silently returns
      * nothing, which is worse than not checking, because it LOOKS like a check.
      *
-     * The server can, because Neko keeps the books. `session.confirmDisplay`
-     * asks it whether any session's WebRTC peer is connected, which is the far
-     * end of the very pipe whose near end we are not allowed to look at.
+     * The iframe reports scoped connection and frame counters. Only increasing
+     * received bytes and decoded frames from this navigation establish live.
+     * Server sessions are diagnostic: another viewer cannot establish readiness
+     * here. Missing local progress keeps Opening visible and ends in Retry at
+     * the 45-second budget after the origin has confirmed.
      *
-     * Three outcomes, and the third is the one that took the most care:
-     *
-     *   live    — panel down, viewport handed over. The only path to `ready`.
-     *
-     *   blank   — a real, WELL-FORMED and RECENT observation that nobody is
-     *             watching, still true at the blank deadline. EZiL's own
-     *             failure copy and a Retry, in a window on a usable OS.
-     *             Crucially the user is told whose product failed and what to
-     *             do, instead of being left staring at a vendor logo.
-     *
-     *   unknown — we never got an answer we understood. The desktop is still
-     *             revealed, because refusing to show a desktop we have no
-     *             evidence AGAINST would break every working desktop at once
-     *             the moment Neko renames a field — the same lie, sign
-     *             flipped, and total. But it is NOT called ready: the
-     *             `ready_unverified` strip says plainly that we could not
-     *             check, and offers the retry.
-     *
-     * 🔴 `unknown` NEVER BECOMES `blank`. A failure panel is shown only when we
-     * positively observed a session list with no watcher in it, RECENTLY — see
-     * `DISPLAY_BLANK_FRESHNESS_MS`. Not answering is a fact about our plumbing,
-     * never about the user's screen, and a stale fact is not an observation.
-     *
-     * 🔴 THE DEADLINES DO NOT DECIDE ANYTHING. They bound how long we keep
-     * asking, and they differ (6s / 45s) because they bound two different
-     * waits — see their declarations. The verdict at either one is whatever was
-     * actually established along the way.
-     *
-     * ── It starts at the NAVIGATION, and it releases at the frame check ──────
-     * This used to be called BY `settle_frame`, so its whole round trip sat
-     * end-to-end after a check it has nothing to do with, and a healthy warm
-     * boot paid a measured +1508ms for a question that could have been asked,
-     * and usually answered, while the frame check was still in flight. It now
-     * starts the instant the iframe is pointed at the desktop and hands
-     * `frameConfirmed` back to `settle_frame`.
-     *
-     * 🔴 THAT IS NOT A WEAKENING, AND THE DISTINCTION IS THE WHOLE THING.
-     * Nothing is revealed earlier on less evidence. `frame_state` is still
-     * `computeBootUiState`'s real verdict for a confirmed frame, the gate still
-     * refuses to spend any observation until `frameConfirmed()` says that
-     * verdict exists, and `applyDisplayEvidence` is still the only thing that
-     * turns evidence into UI. What changed is that the WAITING overlaps —
-     * exactly like the status poll, which has always run while the preview
-     * request was in flight.
-     *
-     * @returns {{frameConfirmed: () => void, stop: () => void}}
+     * @returns {{frameConfirmed: () => void, viewerLive: () => void, stop: () => void}}
      */
     function start_display_gate (my_attempt, url) {
-        const t_display = performance.now();
+        let t_display = performance.now();
         let asks = 0;
         /** Has `computeBootUiState` produced a `ready` for us to spend yet? */
         let frame_ok = false;
@@ -1513,13 +1556,10 @@ export async function openDesktopWindow (ctx = {}) {
         let revealed = false;
         /** A `live` observed before the frame check landed, held to be spent. */
         let pending_live = false;
-        /** Did the unverified deadline elapse while we were still frame-blind? */
-        let unverified_due = false;
         /** `performance.now()` of the most recent WELL-FORMED `blank`. 0 = never. */
         let last_blank_at = 0;
         /** Have we EVER understood an answer? Only this suppresses `unverified`. */
         let ever_wellformed = false;
-        let unverified_timer = null;
         let blank_timer = null;
         /** The armed "ask again" timer, or null while paused/between-schedule. See `schedule_next_ask`. */
         let ask_timer = null;
@@ -1540,7 +1580,6 @@ export async function openDesktopWindow (ctx = {}) {
 
         const stop = () => {
             done = true;
-            clearTimeout(unverified_timer); unverified_timer = null;
             clearTimeout(blank_timer); blank_timer = null;
             clearTimeout(ask_timer); ask_timer = null;
             document.removeEventListener('visibilitychange', on_gate_visibility);
@@ -1552,9 +1591,6 @@ export async function openDesktopWindow (ctx = {}) {
          * evidence directly is deliberate: the mapping from what was observed
          * to what the user is shown lives in one pure, swept-over function, and
          * this function cannot disagree with it.
-         *
-         * 🔴 `terminal: false` is the ONE non-final call, and it is only ever
-         * reachable with `unknown` — see `reveal_unverified`.
          *
          * 🔴 IT NEVER RETRACTS. A `failed` verdict arriving after the desktop
          * has been revealed is logged and dropped, not rendered. Pulling a
@@ -1622,7 +1658,7 @@ export async function openDesktopWindow (ctx = {}) {
             // fires — this is the moment the desktop actually became visible
             // to the user, `ready` or `ready_unverified` alike. A LATER call
             // that upgrades `ready_unverified` to `ready` (the poll kept
-            // asking after `reveal_unverified` already showed the desktop —
+            // asking after a diagnostic unverified reveal —
             // see `ask()`'s `pending_live`/`frame_ok` handling) re-runs this
             // whole branch, but `trace.step`/`trace.end` are both no-ops
             // once `.end()` has already fired once, so the boot_summary this
@@ -1634,24 +1670,6 @@ export async function openDesktopWindow (ctx = {}) {
         };
 
         /**
-         * Show the desktop while we keep trying to check it.
-         *
-         * Reachable ONLY while `ever_wellformed` is false — i.e. our own
-         * plumbing has not produced one intelligible answer. That is the state
-         * `ready_unverified` was built for, and making the user wait the full
-         * blank deadline first bought nothing: we were not waiting on their
-         * desktop, we were waiting on us.
-         */
-        const reveal_unverified = () => {
-            if ( ! alive() || done || revealed || ever_wellformed ) return;
-            if ( ! frame_ok ) { unverified_due = true; return; }
-            console.warn(`[${PHASE}] no intelligible answer about the display after`
-                + ` ${Math.round(age())}ms (${asks} asks) — showing it UNVERIFIED,`
-                + ' and still asking');
-            settle('unknown', false);
-        };
-
-        /**
          * The blank deadline. The last moment at which this gate is allowed to
          * hold the boot, and the only place `blank` can be reached.
          *
@@ -1660,8 +1678,8 @@ export async function openDesktopWindow (ctx = {}) {
          * by forty-four seconds of unanswerable probe still hid the desktop —
          * on evidence a minute old, which is not an observation, it is a
          * memory. `blank` now needs a well-formed blank from within the last
-         * `DISPLAY_BLANK_FRESHNESS_MS`; anything else is `unknown`, which
-         * reveals.
+         * `DISPLAY_BLANK_FRESHNESS_MS`. Missing local frame evidence also
+         * ends with Retry; it cannot establish readiness.
          */
         const conclude = () => {
             if ( ! alive() || done ) return;
@@ -1677,11 +1695,10 @@ export async function openDesktopWindow (ctx = {}) {
                 settle('blank', true);
                 return;
             }
-            console.warn(`[${PHASE}] could not determine whether the display is streaming`
-                + ` (${asks} asks, last understood answer`
-                + `${last_blank_at ? ` ${Math.round(performance.now() - last_blank_at)}ms ago` : ' never'})`
-                + ' — leaving it UNVERIFIED');
-            settle('unknown', true);
+            console.warn(`[${PHASE}] no decoded-frame progress from this viewer after ${Math.round(age())}ms`);
+            telemetry.capture({ eventClass: 'display_failure', site: 'ezil-os:apps/desktop#watch',
+                code: 'viewer_frames_missing', durationMs: age() });
+            settle('blank', true);
         };
 
         /**
@@ -1704,7 +1721,7 @@ export async function openDesktopWindow (ctx = {}) {
          * here can un-send it; its own completion runs `schedule_next_ask`
          * again, which by then correctly sees `hidden` and pauses.
          *
-         * 🔴 DOES NOT TOUCH THE DEADLINES. `unverified_timer`/`blank_timer`
+         * 🔴 DOES NOT TOUCH THE DEADLINES. `blank_timer`
          * below are unconditional `setTimeout`s already running on their own
          * wall-clock schedule; this (and `on_gate_visibility`) only ever
          * gate the PERIODIC re-ask — exactly the "only whether it is ticking
@@ -1750,39 +1767,23 @@ export async function openDesktopWindow (ctx = {}) {
 
             if ( seen === 'blank' ) { ever_wellformed = true; last_blank_at = performance.now(); }
 
-            if ( seen === 'live' ) {
-                console.info(`[${PHASE}] the display is streaming`
-                    + ` (+${Math.round(age())}ms after the navigation, ${asks} ask(s))`);
-                ever_wellformed = true;
-                // 🔴 The best answer this gate can get. If the frame check has
-                // not landed yet we hold it rather than spend it: `ready`
-                // belongs to `computeBootUiState`, and until that has said so
-                // there is nothing for `applyDisplayEvidence` to downgrade.
-                if ( frame_ok ) settle('live', true);
-                else pending_live = true;
-                return;
-            }
+            // Server sessions only establish service health. This document's
+            // decoded-frame telemetry is the sole source of a live verdict.
+            if (viewer_origin && viewer_origin !== 'null') el_iframe.contentWindow?.postMessage({ source: 'ezil-shell', type: 'viewer_probe', attempt: viewer_attempt }, viewer_origin);
             // 'blank' is a real answer and 'unknown' is not — but neither ends
             // the wait on its own. A desktop that has only just been navigated
             // to has not had time to negotiate WebRTC, so an early `blank` is
             // expected and means nothing yet.
 
-            if ( age() >= DISPLAY_BLANK_DEADLINE_MS ) { conclude(); return; }
+            if ( frame_ok && age() >= DISPLAY_BLANK_DEADLINE_MS ) { conclude(); return; }
 
             // The unverified reveal is timer-driven rather than checked here on
             // purpose: an ask that hangs burns `session.js`'s 12s budget, and a
             // deadline only tested when an ask RETURNS is a deadline a hung
             // probe can walk straight through. (It did: settle went to 29.7s.)
-            if ( unverified_due ) reveal_unverified();
 
             schedule_next_ask(age() < DISPLAY_POLL_SLOW_AFTER_MS ? DISPLAY_POLL_MS : DISPLAY_POLL_SLOW_MS);
         };
-
-        unverified_timer = setTimeout(() => {
-            unverified_timer = null;
-            unverified_due = true;
-            reveal_unverified();
-        }, DISPLAY_UNVERIFIED_DEADLINE_MS);
 
         // 🔴 BOTH DEADLINES ARE TIMERS, for the same reason. Checking one only
         // when an ask RETURNS makes it a deadline the transport can walk
@@ -1791,11 +1792,17 @@ export async function openDesktopWindow (ctx = {}) {
         // observed early, then a probe that goes silent — has no unverified
         // escape hatch by design (the user is waiting on their desktop, not on
         // us). Without this timer that boot would wait forever.
-        blank_timer = setTimeout(() => { blank_timer = null; conclude(); }, DISPLAY_BLANK_DEADLINE_MS);
+
 
         void ask();
 
         return {
+            viewerLive () {
+                if ( ! alive() || done ) return;
+                ever_wellformed = true;
+                if ( frame_ok ) settle('live', true);
+                else pending_live = true;
+            },
             /**
              * `settle_frame` has obtained the FIRST gate's `ready`. Only now may
              * anything this gate observed be turned into UI.
@@ -1803,6 +1810,8 @@ export async function openDesktopWindow (ctx = {}) {
             frameConfirmed () {
                 if ( ! alive() || done || frame_ok ) return;
                 frame_ok = true;
+                t_display = performance.now();
+                blank_timer = setTimeout(() => { blank_timer = null; conclude(); }, DISPLAY_BLANK_DEADLINE_MS);
                 // 🔴 Whatever the frame check left on the panel, the true
                 // statement until this gate settles is "Connecting the
                 // display" — so put the live progress painting back. This
@@ -1817,8 +1826,7 @@ export async function openDesktopWindow (ctx = {}) {
                 paint();
 
                 if ( pending_live ) { settle('live', true); return; }
-                if ( unverified_due ) reveal_unverified();
-            },
+                },
             stop,
         };
     }
@@ -2168,6 +2176,9 @@ export async function openDesktopWindow (ctx = {}) {
     /** Everything that must stop, whichever way this window ends. */
     const dispose = () => {
         disposed = true;
+        relay_renewal?.stop();
+        document.removeEventListener('visibilitychange',on_relay_return);
+        window.removeEventListener('online',on_relay_online);
         stop_timers();
         // Activity heartbeat (container-billing fix) — this window is the
         // only thing keeping it alive. Stopping the beats is what lets the
@@ -2177,6 +2188,7 @@ export async function openDesktopWindow (ctx = {}) {
         // which is the pre-existing, correct behaviour for them.
         stop_heartbeat();
         stop_runtime_recheck();
+        window.removeEventListener('message', on_frame_message);
         window.removeEventListener('focus', sample_presence);
         window.removeEventListener('blur', sample_presence);
         document.removeEventListener('visibilitychange', sample_presence);

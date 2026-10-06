@@ -275,6 +275,8 @@
     // the prototype chain untouched, and `setRemoteDescription` is called by
     // every peer that receives media, so it cannot be missed.
     var peers = [];
+    var viewerAttempt = null;
+    try { viewerAttempt = new URL(window.location.href).searchParams.get('ezilAttempt'); } catch (e) {}
 
     function hookPeers() {
         try {
@@ -285,7 +287,13 @@
             if (typeof orig !== 'function') return;
             P.prototype.setRemoteDescription = function () {
                 try {
-                    if (peers.indexOf(this) === -1) peers.push(this);
+                    if (peers.indexOf(this) === -1) {
+                        peers.push(this);
+                        var peer = this;
+                        peer.addEventListener('connectionstatechange', function () {
+                            window.parent.postMessage({source:NS,type:'peer_state',attempt:viewerAttempt,state:peer.connectionState},'*');
+                        });
+                    }
                 } catch (e) {
                     /* never let bookkeeping break the handshake */
                 }
@@ -420,6 +428,7 @@
     // and the shell renders the difference.
     var vitalsPrev = null;
     var vitalsTimer = null;
+    var viewerNeedsVitals = false;
 
     function pumpVitals() {
         var pc = peers.length ? peers[peers.length - 1] : null;
@@ -429,18 +438,36 @@
         if (!promise || typeof promise.then !== 'function') return;
         promise.then(function (report) {
             try {
+                if (pc !== peers[peers.length - 1]) return;
                 var vid = null, pair = null;
                 report.forEach(function (e) {
                     if (!e) return;
                     if (e.type === 'inbound-rtp' && e.kind === 'video') vid = e;
-                    // `selected` is the legacy flag; `nominated` + state is the
-                    // current one. Either identifies the pair actually in use.
-                    if (e.type === 'candidate-pair'
-                        && (e.selected === true || (e.nominated === true && e.state === 'succeeded'))) pair = e;
                 });
                 if (!vid) return;
+                // A nominated pair can survive after ICE switches to another
+                // pair. Bind this video's report to its selected transport.
+                if (typeof report.get === 'function' && vid.transportId) {
+                    var transport = report.get(vid.transportId);
+                    pair = transport && report.get(transport.selectedCandidatePairId);
+                } else {
+                    // Older stats expose selection directly on the pair. Use
+                    // that explicit flag only; nomination is not selection.
+                    report.forEach(function (e) {
+                        if (e && e.type === 'candidate-pair' && e.selected === true) pair = e;
+                    });
+                }
+                if (pair && pair.type !== 'candidate-pair') pair = null;
                 var at = Date.now();
                 var out = { at: at };
+                out.connectionState = pc.connectionState;
+                if (typeof vid.bytesReceived === 'number') out.bytesReceived = vid.bytesReceived;
+                if (typeof vid.framesDecoded === 'number') out.framesDecoded = vid.framesDecoded;
+                if (pair && typeof report.get === 'function') {
+                    var local = report.get(pair.localCandidateId), remote = report.get(pair.remoteCandidateId);
+                    if (local) { out.localCandidateType = local.candidateType; out.relayProtocol = local.relayProtocol; }
+                    if (remote) out.remoteCandidateType = remote.candidateType;
+                }
                 var v = liveVideo();
                 var w = vid.frameWidth || (v ? v.videoWidth : 0) || 0;
                 var h = vid.frameHeight || (v ? v.videoHeight : 0) || 0;
@@ -461,7 +488,7 @@
                 if (typeof vid.bytesReceived === 'number') {
                     vitalsPrev = { at: at, bytes: vid.bytesReceived };
                 }
-                window.parent.postMessage({ source: NS, type: 'stream_vitals', vitals: out }, '*');
+                window.parent.postMessage({ source: NS, type: 'stream_vitals', attempt: viewerAttempt, vitals: out }, '*');
             } catch (e) {
                 /* a stats shape we do not recognise is not evidence of anything */
             }
@@ -471,10 +498,9 @@
     /**
      * Start or stop publishing vitals, on the shell's request.
      *
-     * ON DEMAND, because a monitor nobody is looking at is pure cost: one
-     * `getStats()` every 2s for the life of every session, on a 2-vCPU
-     * container budget that the encoder already dominates. The shell asks when
-     * its System view opens and withdraws when it closes.
+     * The current viewer needs counters for readiness and TURN renewal. The
+     * System monitor can also request them, but closing that monitor must not
+     * stop evidence needed by an active viewer.
      */
     function stopVitals() {
         if (!vitalsTimer) return;
@@ -507,8 +533,16 @@
         window.addEventListener('message', function (ev) {
             var d = ev && ev.data;
             if (!d || d.source !== 'ezil-shell') return;
+            if (ev.source !== window.parent) return;
+            if (d.type === 'viewer_probe') {
+                if (viewerAttempt && d.attempt === viewerAttempt) {
+                    viewerNeedsVitals = true;
+                    startVitals();
+                }
+                return;
+            }
             if (d.type === 'vitals_start') startVitals();
-            else if (d.type === 'vitals_stop') stopVitals();
+            else if (d.type === 'vitals_stop' && !viewerNeedsVitals) stopVitals();
         }, false);
     } catch (e) {
         warn('vitals-listen-failed', String((e && e.message) || e));

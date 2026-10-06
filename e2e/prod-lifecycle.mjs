@@ -1,3 +1,4 @@
+import { signIn } from './sign-in.mjs';
 /**
  * EZiL-OS lifecycle check against a deployed stack: a computer must not be
  * stopped under a window that is still using it, and the editor must reopen
@@ -24,22 +25,22 @@
  */
 import { createRequire } from 'node:module';
 import { APP, configureAppContext } from './deployed-target.mjs';
+import { verifySelectedComputer } from './isolated-computer.mjs';
 
 const REQ_DIR = process.env.PLAYWRIGHT_REQUIRE_DIR;
-if (!REQ_DIR) { console.error('SKIP: PLAYWRIGHT_REQUIRE_DIR unset'); process.exit(2); }
+if (!REQ_DIR) { console.error('FAIL: PLAYWRIGHT_REQUIRE_DIR unset'); process.exit(2); }
 const require_ = createRequire(REQ_DIR + '/x.js');
 let chromium;
 try { ({ chromium } = require_('playwright')); }
-catch { console.error('SKIP: playwright unresolvable from ' + REQ_DIR); process.exit(2); }
+catch { console.error('FAIL: playwright unresolvable'); process.exit(2); }
 const EMAIL = process.env.EZIL_E2E_EMAIL;
 const PASS = process.env.EZIL_E2E_PASSWORD;
-if (!EMAIL || !PASS) { console.error('SKIP: set EZIL_E2E_EMAIL and EZIL_E2E_PASSWORD'); process.exit(2); }
+if (!EMAIL || !PASS) { console.error('FAIL: set EZIL_E2E_EMAIL and EZIL_E2E_PASSWORD'); process.exit(2); }
 
 /** The Worker's flush alarm backs off to 60 s; a release-triggered stop lands within one cycle plus the final checkpoint. */
 const AFTER_RELEASE_WAIT_MS = 100_000;
 const FILE = 'README.md';
-/** VS Code's tab `.label-name` shows the name WITHOUT its extension (the extension is a separate span). */
-const TAB_LABEL = FILE.replace(/\.[^.]+$/, '');
+const fileTab = frame => frame.locator('.tabs-container .tab').filter({hasText:FILE});
 
 const results = [];
 const check = (name, ok, detail = '') => {
@@ -55,18 +56,11 @@ try {
   const stale = [];
   p.on('response', r => { if (r.status() === 410) stale.push(r.url()); });
 
-  // Sign-in is retried once: the redesigned login page occasionally stays put
-  // on the first submit in CI (an app-side flake seen across every suite).
-  for (let attempt = 1; attempt <= 2 && (attempt === 1 || /\/login/.test(p.url())); attempt++) {
-    await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
-    await p.fill('#email', EMAIL); await p.fill('#password', PASS);
-    await Promise.all([
-      p.waitForURL(u => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),
-      p.locator('form').filter({ has: p.locator('#email') }).locator('button[type=submit]').click(),
-    ]);
-  }
+  await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
+  await signIn(p, { email: EMAIL, password: PASS });
   check('sign-in leaves /login', !/\/login/.test(p.url()), p.url().slice(0, 60));
   await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
+  await verifySelectedComputer(p);
   await p.waitForTimeout(3500);
 
   const codeFrame = () => p.frames().find(f => /-code\./.test(f.url()));
@@ -96,6 +90,31 @@ try {
       'frames:', JSON.stringify(p.frames().map(fr => fr.url().split('?')[0].slice(0, 80))));
     return null;
   };
+  // 🔴 What the founder saw: the SDK's raw JSON as the page inside a window.
+  const rawStaleVisible = async () => {
+    for (const fr of p.frames()) {
+      const text = await fr.evaluate(() => document.body?.innerText ?? '').catch(() => '');
+      if (text.includes('STALE_PREVIEW_URL')) return fr.url().split('?')[0];
+    }
+    return null;
+  };
+  const desktopPaints = async () => {
+    for (let i = 0; i < 45; i++) {
+      await p.waitForTimeout(2000);
+      const f = p.frames().find(fr => /nekodesktop/.test(fr.url()));
+      if (!f) continue;
+      const px = await f.evaluate(() => {
+        const v = document.querySelector('video'); if (!v || !v.videoWidth) return null;
+        const c = document.createElement('canvas'); c.width = 64; c.height = 40;
+        const g = c.getContext('2d'); g.drawImage(v, 0, 0, 64, 40);
+        const d = g.getImageData(0, 0, 64, 40).data; let mx = 0;
+        for (let k = 0; k < d.length; k += 4) mx = Math.max(mx, d[k], d[k + 1], d[k + 2]);
+        return { w: v.videoWidth, max: mx };
+      }).catch(() => null);
+      if (px && px.max > 0) return px;
+    }
+    return null;
+  };
   const tabs = async (f) => f.$$eval('.tabs-container .tab .label-name', els => els.map(e => e.textContent)).catch(() => []);
   const closeWindow = (app) => p.evaluate((a) => window.$(`.window[data-app="${a}"]`).close(), app);
 
@@ -104,14 +123,17 @@ try {
   let f = await openCode();
   check('Code opens to a live editor', !!f, `${Date.now() - t0}ms`);
   if (f) {
-    await p.waitForTimeout(4000);
-    await p.locator('.window[data-app="code"] iframe.window-app-iframe').click({ position: { x: 400, y: 300 } }).catch(() => {});
-    await p.keyboard.press('Control+P'); await p.waitForTimeout(1000);
-    await p.keyboard.type(FILE); await p.waitForTimeout(1500); await p.keyboard.press('Enter');
-    await p.waitForTimeout(3000);
+    // Use Code's visible file picker. An iframe click can leave focus in the
+    // workbench or welcome page, where the host shortcut never opens a file.
+    await f.locator('.command-center').click();
+    await f.locator('.quick-input-widget input:visible').fill(FILE);
+    await f.locator('.quick-input-list .monaco-list-row:visible').filter({hasText:FILE}).first().click();
+    await fileTab(f).first().waitFor({state:'visible',timeout:15000});
+    // Pin the editor tab so a preview tab can be restored on reopen.
+    await fileTab(f).first().dblclick();
   }
   const before = f ? await tabs(f) : [];
-  check(`a file opens in Code (${FILE})`, before.includes(TAB_LABEL), JSON.stringify(before));
+  check(`a file opens in Code (${FILE})`, !!f && await fileTab(f).count() === 1, JSON.stringify(before));
 
   // 2. The desktop, then close it: the release.
   try { await p.locator('.taskbar-item').filter({ hasText: /browser/i }).first().click({ timeout: 12000 }); }
@@ -130,6 +152,8 @@ try {
   check('🔴 closing the desktop did not stop the computer under the open Code window (its origin still answers, not 410 STALE)',
     status === 200, `status=${status}`);
   check('🔴 no request on the page answered 410 STALE_PREVIEW_URL', stale.length === 0, stale.slice(0, 2).join(' | ').slice(0, 160));
+  const rawAfterRelease = await rawStaleVisible();
+  check('🔴 no window shows the raw STALE_PREVIEW_URL JSON', !rawAfterRelease, String(rawAfterRelease ?? ''));
 
   // 5. Close Code, reopen it on the same computer: where the user left off.
   await closeWindow('code');
@@ -139,7 +163,17 @@ try {
   check('Code reopens to a live editor', !!f, `${Date.now() - t1}ms`);
   await p.waitForTimeout(5000);
   const after = f ? await tabs(f) : [];
-  check(`🔴 reopening Code restores the open file (${FILE})`, after.includes(TAB_LABEL), JSON.stringify(after));
+  check(`🔴 reopening Code restores the open file (${FILE})`, !!f && await fileTab(f).count() === 1, JSON.stringify(after));
+
+  // 6. The Browser/Desktop surface: reopen the desktop after its own release.
+  try { await p.locator('.taskbar-item').filter({ hasText: /browser/i }).first().click({ timeout: 12000 }); }
+  catch { await p.locator('.taskbar-item[data-app="desktop"]').first().click({ timeout: 12000 }).catch(() => {}); }
+  const t2 = Date.now();
+  const px = await desktopPaints();
+  check('🔴 the desktop reopened after its release PAINTS (a fresh URL against the active runtime)', !!px,
+    px ? `${Date.now() - t2}ms ${px.w}px` : 'no video');
+  const rawEnd = await rawStaleVisible();
+  check('🔴 …and no window shows the raw STALE_PREVIEW_URL JSON at the end either', !rawEnd, String(rawEnd ?? ''));
 
   await ctx.close();
 } finally {

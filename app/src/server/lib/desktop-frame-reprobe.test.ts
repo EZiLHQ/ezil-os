@@ -37,11 +37,12 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
     DESKTOP_FRAME_CONFIRM_BUDGET_MS,
     DESKTOP_FRAME_CONFIRM_GAP_MS,
+    DESKTOP_FRAME_MIN_PROBE_MS,
     confirmDesktopFrame,
     probeDesktopFrame,
 } from './cloudflare-guacamole-provider';
@@ -207,22 +208,6 @@ describe.skipIf(process.platform === 'win32')('the honesty contract is not weake
         expect(confirmed.status).toBe(410);
     });
 
-    it('🔴 never lets a starved final attempt overwrite a real answer', async () => {
-        // The exact shape that made the case above flaky: an origin that only
-        // ever 410s, and a budget short enough that the last slice is too small
-        // to complete a round trip in. The honest answer is the one the origin
-        // actually gave — `http_error` with its status — never an `unreachable`
-        // that describes the clock. Repeated, because the bug was intermittent
-        // by nature and a single green run proved nothing before.
-        for ( let i = 0; i < 25; i++ ) {
-            const { url } = await settlingOrigin(Array<number>(10_000).fill(410));
-            const confirmed = await confirmDesktopFrame(url, 220, 10);
-            if (confirmed.alive) throw new Error('an origin that only 410s must never confirm');
-            expect(`run ${i}: ${confirmed.reason}`).toBe(`run ${i}: http_error`);
-            expect(confirmed.status).toBe(410);
-        }
-    });
-
     it('still probes once even when the budget is smaller than the floor', async () => {
         // The floor must never turn into "did nothing". One attempt always
         // happens, however tight the budget, or the caller gets the initial
@@ -239,4 +224,42 @@ describe.skipIf(process.platform === 'win32')('the honesty contract is not weake
         expect(DESKTOP_FRAME_CONFIRM_BUDGET_MS).toBeLessThanOrEqual(30_000);
         expect(DESKTOP_FRAME_CONFIRM_GAP_MS).toBeLessThan(DESKTOP_FRAME_CONFIRM_BUDGET_MS);
     });
+});
+
+it('never starts a starved final probe after receiving a real HTTP answer', async () => {
+    // Observe the actual 410 first, then place the clock inside the minimum
+    // probe window. A loaded runner must not be asked to finish its FIRST
+    // loopback request in 220 ms to prove preservation of an existing answer.
+    const budget = 10000;
+    const started = 10000;
+    let clock = started;
+    let hits = 0;
+    const server = createServer((_req, res) => {
+        hits++;
+        if (hits === 1) {
+            clock = started + budget - DESKTOP_FRAME_MIN_PROBE_MS + 1;
+            res.writeHead(410, { 'content-type': 'text/plain' });
+            res.end('STALE_PREVIEW_URL');
+        } else {
+            // If the minimum-window guard regresses, a real hung request
+            // overwrites the observed HTTP result with a transport timeout.
+            clock = started + budget;
+        }
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    running = server;
+    const { port } = server.address() as AddressInfo;
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    try {
+        const confirmed = await confirmDesktopFrame(`http://127.0.0.1:${port}/`, budget, 1);
+        expect(confirmed.alive).toBe(false);
+        if (confirmed.alive) throw new Error('a 410 origin must not confirm');
+        expect(confirmed.reason).toBe('http_error');
+        expect(confirmed.status).toBe(410);
+        expect(confirmed.attempts).toBe(1);
+        expect(hits).toBe(1);
+    } finally {
+        now.mockRestore();
+        server.closeAllConnections();
+    }
 });

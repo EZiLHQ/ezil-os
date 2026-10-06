@@ -44,6 +44,10 @@ import {
     type ShellBootPayload,
 } from '../../../app/src/server/shell/boot-payload.ts';
 
+// Relay renewal belongs to Cloudflare's hosted transport. The local host
+// serves direct loopback media and must not advertise a refresh URL it lacks.
+const { relayRefresh: HOSTED_RELAY_ROUTE, ...COMMON_ROUTES } = APP_ROUTES;
+
 const encoder = new TextEncoder();
 
 /** Equality of BYTES, not of JS strings — the property the doc comments claim. */
@@ -56,17 +60,18 @@ describe('the route table has not drifted from the app', () => {
         // Without this, a module that somehow resolved to `{}` would make every
         // "same keys" assertion below vacuously true.
         expect(typeof APP_ROUTES).toBe('object');
-        expect(Object.keys(APP_ROUTES).length).toBe(9);
+        expect(Object.keys(APP_ROUTES).length).toBe(10);
+        expect(HOSTED_RELAY_ROUTE).toBe('/api/shell/relay-refresh');
         expect(typeof appSerialize).toBe('function');
     });
 
-    it('local declares exactly the app\'s nine keys, in the same order', () => {
-        expect(Object.keys(LOCAL_ROUTES)).toEqual(Object.keys(APP_ROUTES));
+    it('local declares exactly the nine shared keys, in the same order', () => {
+        expect(Object.keys(LOCAL_ROUTES)).toEqual(Object.keys(COMMON_ROUTES));
         expect(SHELL_API_ROUTE_KEYS.length).toBe(9);
     });
 
-    it('no key the app has is missing here', () => {
-        const missingLocally = Object.keys(APP_ROUTES).filter((k) => !(k in LOCAL_ROUTES));
+    it('no shared key is missing here', () => {
+        const missingLocally = Object.keys(COMMON_ROUTES).filter((k) => !(k in LOCAL_ROUTES));
         expect(missingLocally).toEqual([]);
     });
 
@@ -76,7 +81,11 @@ describe('the route table has not drifted from the app', () => {
     });
 
     it('every path string is identical', () => {
-        expect({ ...LOCAL_ROUTES }).toEqual({ ...APP_ROUTES });
+        expect({ ...LOCAL_ROUTES }).toEqual(COMMON_ROUTES);
+    });
+
+    it('does not advertise the unsupported hosted relay operation', () => {
+        expect('relayRefresh' in LOCAL_ROUTES).toBe(false);
     });
 
     it('every path is same-origin and relative — never an absolute URL', () => {

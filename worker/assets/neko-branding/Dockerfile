@@ -3,19 +3,10 @@
 # both Apache-2.0 — see ATTRIBUTIONS.md §2. That base image is built and pushed
 # out of band; it is not produced by this repository.
 #
-# Why this exists: the neko Go server bakes its whole HTML5 client bundle
-# into /var/www at upstream build time (Vue app, hashed JS/CSS chunk names).
-# Re-running that whole Vue build just to swap a handful of static files
-# would pull in a large upstream toolchain for no benefit — every asset this
-# task cares about (wordmark, favicons, tile icons, mask icon, PWA manifest,
-# the chat notification sound, and the handful of user-visible strings in
-# index.html) is a plain static file or a small, surgical whole-file
-# replacement, so this Dockerfile takes the already-built, already-verified
-# upstream image as its base and overlays EZiL's files on top of it. Nothing
-# under /usr/bin/neko, /etc/neko, or the compiled JS/CSS in /var/www/js and
-# /var/www/css is touched — only the static branding assets and index.html's
-# markup (title/theme-color/text; every <script>/<link> tag and hashed
-# filename is byte-identical to upstream) change.
+# The content-pinned continuity stage builds the pinned Neko server/client
+# with renewable ICE configuration. Copy that binary and its matching assets
+# together, then apply branding to the resulting index.html in place.
+# The base supplies runtime libraries, Chrome and code-server.
 #
 # No EZiL logo graphic exists anywhere in this repository as of this commit
 # (verified: app/public/*.svg and app/src/app/favicon.ico are the unmodified
@@ -41,7 +32,12 @@
 # the OLD overlay with no error anywhere. The suffix went 1 -> 2 when
 # www/ezil-mobile.js and the <script> tag that loads it were added.
 ARG BASE_NEKO_IMAGE=ezil-neko-vscode:d74052bb-049931d7
+ARG NEKO_CONTINUITY_IMAGE=ezil-neko-continuity:dev
+FROM ${NEKO_CONTINUITY_IMAGE} AS continuity
 FROM ${BASE_NEKO_IMAGE}
+COPY --from=continuity /neko /usr/bin/neko
+RUN rm -rf /var/www
+COPY --from=continuity /www /var/www
 
 # Favicons / PWA / tile icons — solid EZiL charcoal (#161616), sized to each
 # original asset's ACTUAL pixel dimensions (verified with `file`, not
@@ -69,7 +65,11 @@ COPY www/browserconfig.xml          /var/www/browserconfig.xml
 # edit. Confirmed by inspection to be n.eko's cat-silhouette mark (the path
 # data literally draws a cat/paw shape) — this is the "n.eko logo" this task
 # is about. Blanked out per the no-invented-logo instruction.
-COPY www/logo.svg                   /var/www/img/logo.800bec71.svg
+COPY www/logo.svg                   /tmp/ezil-logo.svg
+RUN set -eu; found=0; \
+    for logo in /var/www/img/logo.*.svg; do \
+      test -f "$logo" || continue; cp /tmp/ezil-logo.svg "$logo"; found=1; \
+    done; test "$found" = 1; rm /tmp/ezil-logo.svg
 
 # The literal "n.eko sound": js/app.4919abb0.js plays this file verbatim via
 # `new Audio("chat.mp3").play()` on the chat plugin's `newMessage` event when
@@ -165,7 +165,6 @@ RUN if grep -qi "n\.eko" /var/www/index.html; then \
       echo "ERROR: site.webmanifest still references n.eko after branding overlay" >&2; \
       exit 1; \
     fi \
-  && test -s /var/www/img/logo.800bec71.svg \
   && test -s /var/www/chat.mp3 \
   && test -s /var/www/ezil-mobile.js \
   && if ! grep -q 'src="ezil-mobile.js"' /var/www/index.html; then \

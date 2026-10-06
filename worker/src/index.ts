@@ -1,3 +1,8 @@
+import { relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget, type RelayState, type RelayResult } from './relay-refresh';
+import { bridgeCodeSocket } from './code-socket';
+import { RuntimeLifecycleMonitor } from './runtime-lifecycle';
+import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, failCheckpointWrites,
+  AcceptanceFaultError, type AcceptanceFaultState } from './acceptance-faults';
 /**
  * EBuilder — Cloudflare Guacamole Sandbox Worker (production)
  *
@@ -53,6 +58,8 @@
  */
 
 import { getSandbox, proxyToSandbox, type Sandbox, type SandboxEnv } from '@cloudflare/sandbox';
+// Not exported from here: workerd treats every named export of the entry module as a handler.
+import { recoverableStalePreview } from './stale-preview';
 // Separate value import of the SAME class (under a local alias) so the
 // Durable Object subclass below (`EzilSandboxDO`) can `extends` it. The
 // `type Sandbox` import above stays untouched — every existing `Sandbox<unknown>`
@@ -240,6 +247,9 @@ interface Env extends SandboxEnv {
    * the one an operator can turn without redeploying an image.
    */
   SANDBOX_BROWSER?: string;
+  /** Explicit isolated staging computer only; absent in production. */
+  EZIL_ACCEPTANCE_ENV?: string;
+  EZIL_ACCEPTANCE_SANDBOX?: string;
 
   /**
    * Non-secret kill-switch for the activity-heartbeat control route
@@ -485,6 +495,7 @@ import {
 import {
   hydrateWorkspaceFromR2,
   flushWorkspaceToR2,
+  workspaceIsPhysicallyUnhydrated,
   parseHydrateMarker,
   serializeHydrateMarker,
   HYDRATE_MARKER_FILENAME,
@@ -605,6 +616,7 @@ import {
   type LogEvent,
 } from './observability';
 import { parseRequestedScreen, formatNekoScreen, fitScreenRequest } from './screen-modes';
+import { captureEditorState } from './editor-state';
 import {
   selectTelemetryWorthy,
   toTelemetryEventInput,
@@ -759,6 +771,11 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
  * not a new transport.
  */
 interface EzilWorkspacePersistRpc {
+  runningContainerFetch(url: string, init?: RequestInit, port?: number): Promise<Response>;
+  stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport>;
+  setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void>;
+  desktopReachable(): Promise<boolean>;
+  relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult>;
   hydrateWorkspace(params: { mountPath: string; prefix: string }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }>;
   /** Start capturing user changes outside /workspace (system layer). Called once the desktop is up. */
   baselineSystem(): Promise<boolean>;
@@ -2299,6 +2316,49 @@ export function validateActivityBody(
  * identity is unchanged, only new methods are added on top of it.
  */
 class EzilSandboxDO extends CFSandboxClass<Env> {
+  private lifecycleMonitor = new RuntimeLifecycleMonitor();
+  constructor(ctx: ConstructorParameters<typeof CFSandboxClass<Env>>[0], env: Env) {
+    super(ctx, env);
+    if (this.containerIsRunning()) this.observeRuntimeExit();
+  }
+  private observeRuntimeExit(): void {
+    this.lifecycleMonitor.watch(() => this.ctx.container!.monitor(), exit => {
+      this.lastOkCheckpoint = null;
+      bootLog('runtime_lifecycle', 'end', {
+        status: exit.exitCode === 0 ? 'ok' : 'error',
+        detail: `monitor,reason=${exit.reason},exitCode=${exit.exitCode ?? 'unknown'}`,
+      });
+    });
+  }
+  override async onStart(): Promise<void> {
+    this.observeRuntimeExit();
+    bootLog('runtime_lifecycle', 'start');
+    await super.onStart();
+  }
+  override async onStop(params?: {exitCode: number; reason: 'exit' | 'runtime_signal'}): Promise<void> {
+    this.lastOkCheckpoint = null;
+    bootLog('runtime_lifecycle', 'end', {
+      status: params?.exitCode === 0 ? 'ok' : 'error',
+      detail: `stop_hook,reason=${params?.reason === 'runtime_signal' ? 'runtime_signal' : 'exit'},exitCode=${Number.isSafeInteger(params?.exitCode) ? params!.exitCode : 'unknown'}`,
+    });
+    await super.onStop();
+  }
+  override async onActivityExpired(): Promise<void> {
+    bootLog('runtime_lifecycle', 'end', {
+      status: 'ok', detail: `activity_expired,keepAlive=${await this.ctx.storage.get<boolean>('keepAliveEnabled') === true}`,
+    });
+    await super.onActivityExpired();
+  }
+  async setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void> {
+    assertAcceptanceScope(this.env, sandboxId);
+    const fault = parseAcceptanceFault(raw);
+    await this.ctx.storage.put('ezil_acceptance_fault', { sandboxId, fault });
+  }
+  private async acceptanceFault(sandboxId?: string): Promise<string | null> {
+    const saved = await this.ctx.storage.get<{sandboxId: string; fault: AcceptanceFaultState | null}>('ezil_acceptance_fault');
+    if (!saved || sandboxId && saved.sandboxId !== sandboxId) return null;
+    return activeAcceptanceFault(this.env, saved.sandboxId, saved.fault);
+  }
   /**
    * Reentrancy guard for `restartDesktopStack()`. A DO instance is a single
    * JS object handling one request at a time cooperatively, but `await`
@@ -2309,6 +2369,77 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * (`outcome: 'restart_in_progress'`) instead of a race.
    */
   private restartInProgress = false;
+  private runtimeMutationTail: Promise<unknown> = Promise.resolve();
+  private withRuntimeMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const next = (this.runtimeMutationTail ?? Promise.resolve()).catch(() => undefined).then(operation);
+    this.runtimeMutationTail = next.then(() => undefined, () => undefined);
+    return next;
+  }
+  async desktopReachable(): Promise<boolean> {
+    try {
+      const response = await this.runningContainerFetch('http://127.0.0.1:8181/', {}, 8181, 1000);
+      return response.ok;
+    } catch { return false; }
+  }
+  /** Viewer traffic must never cold-start a runtime after an explicit stop. */
+  async runningContainerFetch(url: string, init: RequestInit = {}, port = 8181, timeoutMs = 12000): Promise<Response> {
+    return this.withRuntimeMutation(async () => {
+      if (!this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)) {
+        return json({ ok: false, error: 'runtime_not_running' }, 409);
+      }
+      this.renewActivityTimeout();
+      return this.ctx.container!.getTcpPort(port).fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    });
+  }
+  override async fetch(request: Request): Promise<Response> {
+    // Set only by the authenticated Code bridge. The HTTP entrypoint carries
+    // WebSocket responses intact; a DO RPC cannot serialize a WebSocket.
+    if (request.headers.get('x-ezil-running-code') !== '1'
+        || new URL(request.url).hostname !== '127.0.0.1') return super.fetch(request);
+    return this.withRuntimeMutation(async () => {
+      if (!this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)) {
+        return json({ ok: false, error: 'runtime_not_running' }, 409);
+      }
+      const headers = new Headers(request.headers);
+      headers.delete('x-ezil-running-code');
+      const port = Number(headers.get('cf-container-target-port'));
+      if (port !== CODE_PREVIEW_PORT) return json({ok:false,error:'invalid_code_port'},400);
+      this.renewActivityTimeout();
+      const controller = new AbortController();
+      const deadline = setTimeout(() => controller.abort(), 12000);
+      try {
+        const response = await this.ctx.container!.getTcpPort(port).fetch(new Request(request, { headers, signal: controller.signal }));
+        return bridgeCodeSocket(response, () => this.renewActivityTimeout());
+      } finally {
+        // Only the handshake is bounded. A timeout attached to the returned
+        // upgraded stream would disconnect an otherwise healthy Code session.
+        clearTimeout(deadline);
+      }
+    });
+  }
+  async relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult> {
+    const requestedAt = Date.now();
+    try {
+      const state = await this.withRuntimeMutation(() => this.withWorkspacePersistence(async () => {
+        // A queued request that outlived the caller's forwarding budget must
+        // never apply a late configuration change to a resumed runtime.
+        remainingRelayBudget(requestedAt);
+        if (!this.containerIsRunning()) throw new RelayFailure('relay_runtime_not_running', 409);
+        const credentials = await deriveNekoCredentials(this.env, sandboxId);
+        // Local TCP transport cannot start a stopped container, and its signal
+        // is cancellable here without crossing the Sandbox RPC boundary.
+        const transport = { containerFetch: (url: string, init?: RequestInit) => this.ctx.container!.getTcpPort(8181).fetch(url, init) };
+        return relayOperation(transport, credentials.admin, { runtimeId, budgetMs: remainingRelayBudget(requestedAt), ...(runtimeId ? { mint: async (signal: AbortSignal) => {
+          if (await this.acceptanceFault(sandboxId) === 'turn_unavailable') throw new RelayFailure('turn_unavailable');
+          const issuedAt = Date.now();
+          const servers = await generateTurnCredentials(this.env, signal);
+          if (!servers) throw new RelayFailure('turn_unavailable');
+          return { servers, expiresAt: issuedAt + resolveTurnTtlSeconds(this.env.SANDBOX_NEKO_TURN_TTL_SECONDS) * 1000 };
+        } } : {}) });
+      }));
+      return { ok: true, ...state };
+    } catch (error) { return relayFailureResult(error); }
+  }
 
   /** Serialize hydrate, flush and teardown across this DO's await points. */
   private workspacePersistenceTail: Promise<unknown> = Promise.resolve();
@@ -2421,6 +2552,17 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     }
 
     const hydrated = (await this.ctx.storage.get<boolean>(WORKSPACE_HYDRATED_KEY)) ?? false;
+    if (!hydrated && trigger === 'explicit') {
+      // A prior flush may already have cleared the cached flag after observing
+      // replacement. Re-check the physical disk before allowing teardown on
+      // the last durable checkpoint; a false cache alone proves nothing.
+      try {
+        if (await workspaceIsPhysicallyUnhydrated(this, wctx.mountPath)) {
+          return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0,
+            failed: [], manifest: {}, heartbeatWritten: false, skippedReason: 'container_not_hydrated' };
+        }
+      } catch { /* preserve checkpoint refusal when the physical probe fails */ }
+    }
     // Fail closed: a misconfigured store is skipped, never silently run on R2.
     // Fresh per flush so no stale per-prefix read routing is reused.
     const store = resolveWorkspaceStore(this.env);
@@ -2443,12 +2585,13 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     try {
       outcome = await flushWorkspaceToR2({
         container: this,
-        bucket,
+        bucket: await this.acceptanceFault() === 'checkpoint_write_failed' ? failCheckpointWrites(bucket) : bucket,
         mountPath: wctx.mountPath,
         realPrefix: wctx.prefix,
         manifest,
         hydrationComplete: hydrated,
         deferIfChanged,
+        beforeCapture: () => captureEditorState(this, wctx.mountPath),
         log: (message) => console.error(`[workspace_flush] ${message}`),
       });
     } catch (err) {
@@ -2708,7 +2851,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    */
   async flushWorkspaceScheduled(): Promise<void> {
     try {
-      await this.withWorkspacePersistence(() => this.runScheduledFlushCycle());
+      await this.withRuntimeMutation(() => this.withWorkspacePersistence(() => this.runScheduledFlushCycle()));
     } catch (err) {
       // 🔴 The SDK's alarm dispatcher deletes this callback's schedule row
       // after it returns — whether it returned or THREW — and never
@@ -3011,10 +3154,15 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * label) rather than `<sandboxId>`.
    */
   async terminateSandbox(): Promise<TerminateReport> {
-    return this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint());
+    return this.withRuntimeMutation(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint()));
   }
 
-  private async terminateSandboxWithCheckpoint(): Promise<TerminateReport> {
+  async stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport> {
+    assertAcceptanceScope(this.env, sandboxId);
+    return this.withRuntimeMutation(() => this.withWorkspacePersistence(() => this.terminateSandboxWithCheckpoint(true)));
+  }
+
+  private async terminateSandboxWithCheckpoint(retainPreviewAuthorization = false): Promise<TerminateReport> {
     const wasRunning = this.containerIsRunning();
 
     // Capture the container's own exit signal BEFORE `destroy()` is issued
@@ -3067,7 +3215,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // `super.destroy()` — `this.destroy()` would re-run the cancel above
       // harmlessly, but going straight to the SDK keeps this method the single
       // ordered sequence it documents.
-      await super.destroy();
+      if (retainPreviewAuthorization) await super.stop();
+      else await super.destroy();
     } catch (err) {
       destroyError = err instanceof Error ? err.message : String(err);
       console.error(`[terminateSandbox] destroy() failed: ${destroyError}`);
@@ -3178,6 +3327,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       };
     }
     this.restartInProgress = true;
+    return this.withRuntimeMutation(async () => {
     try {
       const exposedBefore = await this.getExposedPorts(hostname);
       const status = describeDesktopStatus(exposedBefore, explicitMode, fallbackMode);
@@ -3375,6 +3525,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     } finally {
       this.restartInProgress = false;
     }
+    });
   }
 }
 
@@ -3507,7 +3658,7 @@ function normalizeSandboxHostname(host: string, configuredRoot?: string): string
  * `checkIceConfig`). Throws with a non-secret error on an API failure so the
  * caller can fail closed rather than launch a relay-less (hanging) session.
  */
-async function generateTurnCredentials(env: Env): Promise<IceServerEntry[] | null> {
+async function generateTurnCredentials(env: Env, signal: AbortSignal = AbortSignal.timeout(20_000)): Promise<IceServerEntry[] | null> {
   const keyId = env.SANDBOX_NEKO_TURN_KEY_ID?.trim();
   const apiToken = env.SANDBOX_NEKO_TURN_API_TOKEN?.trim();
   if (!keyId || !apiToken) return null;
@@ -3522,6 +3673,7 @@ async function generateTurnCredentials(env: Env): Promise<IceServerEntry[] | nul
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ ttl }),
+      signal,
     });
   } catch (err) {
     // Never include the token in the surfaced error.
@@ -3556,8 +3708,10 @@ async function generateTurnCredentials(env: Env): Promise<IceServerEntry[] | nul
  * when neither is configured (diagnostic/no-TURN path — behavior unchanged).
  */
 async function resolveNekoIceEnv(env: Env): Promise<Record<string, string> | null> {
+  const issuedAt = Date.now();
   const cloudflare = await generateTurnCredentials(env);
-  if (cloudflare) return buildNekoIceEnv(cloudflare);
+  if (cloudflare) return { ...buildNekoIceEnv(cloudflare),
+    EZIL_RELAY_EXPIRES_AT: String(issuedAt + resolveTurnTtlSeconds(env.SANDBOX_NEKO_TURN_TTL_SECONDS) * 1000) };
 
   const staticUrls = env.SANDBOX_NEKO_TURN_URLS?.trim();
   if (staticUrls) {
@@ -3913,8 +4067,22 @@ async function handlePreview(
       return json({ ok: false, error: 'workspace_checkpoint_failed' }, 503);
     }
 
+    let relay: RelayState | undefined;
+    if (mode === 'neko' && env.SANDBOX_NEKO_TURN_KEY_ID) {
+      let result = await sandbox.relayRefresh(sandboxId);
+      if (!result.ok) throw new RelayFailure(result.error, result.status);
+      relay = result;
+      // Warm opens apply renewal to the existing processes rather than discard
+      // new credentials or replace the computer.
+      if (relay.expiresAt <= Date.now() + 60_000) {
+        result = await sandbox.relayRefresh(sandboxId, relay.runtimeId);
+        if (!result.ok) throw new RelayFailure(result.error, result.status);
+        relay = result;
+      }
+    }
     const response = json({
       ok: true,
+      relay,
       guacamoleUrl,
       expiresAt: Date.now() + SESSION_TTL_MS,
       provider: mode === 'neko' ? 'cloudflare-neko' : 'cloudflare-guacamole',
@@ -5019,13 +5187,13 @@ const SCREEN_RATE_HZ = 60;
  * settable, so a mode's absence from that list means nothing at all.
  */
 async function readNekoScreen(
-  sandbox: Sandbox<unknown>,
+  sandbox: { runningContainerFetch(url: string, init: RequestInit, port: number): Promise<Response> },
   origin: string,
   port: number,
   token: string,
 ): Promise<{ width: number; height: number } | null> {
   try {
-    const res = await sandbox.containerFetch(
+    const res = await sandbox.runningContainerFetch(
       `${origin}/api/room/screen`,
       // No `signal` — see `withDeadline`. The caller races this whole call.
       { method: 'GET', headers: { Accept: 'application/json', Authorization: `Bearer ${token}` } },
@@ -5125,9 +5293,10 @@ async function handleScreenRead(env: Env, sandboxName: string): Promise<Response
 
   try {
     const sandbox = openSandbox(env, sandboxName);
+    if (!await sandbox.desktopReachable()) return json({ ok: false, sandboxId: sandboxName, error: 'screen_starting' }, 409);
     const creds = await deriveNekoCredentials(env, sandboxName);
 
-    const loginRes = await withDeadline(sandbox.containerFetch(
+    const loginRes = await withDeadline(sandbox.runningContainerFetch(
       `${origin}/api/login`,
       {
         method: 'POST',
@@ -5203,6 +5372,7 @@ async function handleScreen(request: Request, env: Env, sandboxName: string): Pr
 
   try {
     const sandbox = openSandbox(env, sandboxName);
+    if (!await sandbox.desktopReachable()) return json({ ok: false, sandboxId: sandboxName, error: 'screen_starting' }, 409);
     const creds = await deriveNekoCredentials(env, sandboxName);
 
     // 🔴 No token cache here, deliberately. The app's `nekoAdminTokens` cache
@@ -5211,7 +5381,7 @@ async function handleScreen(request: Request, env: Env, sandboxName: string): Pr
     // 500ms client-side, deduplicated against the last applied size), so one
     // extra loopback round trip per resize is not worth a second cache that
     // could hand a restarted container a dead token.
-    const loginRes = await withDeadline(sandbox.containerFetch(
+    const loginRes = await withDeadline(sandbox.runningContainerFetch(
       `${origin}/api/login`,
       {
         method: 'POST',
@@ -5233,7 +5403,7 @@ async function handleScreen(request: Request, env: Env, sandboxName: string): Pr
     // screen configuration and nothing else — there are no sibling fields for a
     // POST to silently reset, which is the failure `enableImplicitHosting`'s own
     // doc comment records for the settings endpoint.
-    const setRes = await withDeadline(sandbox.containerFetch(
+    const setRes = await withDeadline(sandbox.runningContainerFetch(
       `${origin}/api/room/screen`,
       {
         method: 'POST',
@@ -5623,9 +5793,14 @@ async function handleCodeBridge(
     // `'code'` is load-bearing, not cosmetic: it selects the REAL bridge
     // hostname as `x-forwarded-host`, which is the only value code-server's
     // WS-router origin check can ever accept (see `resolveForwardedHost`).
-    return handlePreviewWsProxy(request, sandbox, sandboxId, secrets, codePath, port, 'code');
+    return handlePreviewWsProxy(request, { wsConnect: (upstream, targetPort) => {
+      const headers = new Headers(upstream.headers);
+      headers.set('x-ezil-running-code', '1');
+      return sandbox.wsConnect(new Request(upstream, { headers }), targetPort);
+    } }, sandboxId, secrets, codePath, port, 'code');
   }
-  return handlePreviewProxy(request, sandbox, sandboxId, secrets, codePath, port, 'code');
+  return handlePreviewProxy(request, { containerFetch: (upstream, init, targetPort) =>
+    sandbox.runningContainerFetch(String(upstream), init as RequestInit, targetPort) }, sandboxId, secrets, codePath, port, 'code');
 }
 
 /**
@@ -6165,7 +6340,7 @@ export default {
     // 1) Route exposed-port preview traffic (incl. WebSocket upgrades) into the
     //    container. Returns null for everything else.
     const proxied = await proxyToSandbox(request, env);
-    if (proxied) return proxied;
+    if (proxied) return recoverableStalePreview(request, proxied);
 
     if (method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders });
@@ -6298,6 +6473,54 @@ export default {
         decodeURIComponent(browserMatch[1]),
         browserMatch[2],
       );
+    }
+
+    const acceptanceStop = path.match(/^\/sandbox\/([^/]+)\/acceptance-idle-stop$/);
+    if (method === 'POST' && acceptanceStop) {
+      const name = decodeURIComponent(acceptanceStop[1]);
+      try { assertAcceptanceScope(env, name); } catch { return json({ok:false,error:'acceptance_faults_disabled'},404); }
+      if (resolvePreviewSecrets(env).length === 0) return json({ok:false,error:'acceptance_auth_not_configured'},401);
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      try { return json(await openSandbox(env, name).stopRuntimeForAcceptance(name)); }
+      catch { return json({ok:false,error:'acceptance_stop_failed'},502); }
+    }
+    const acceptanceMatch = path.match(/^\/sandbox\/([^/]+)\/acceptance-fault$/);
+    if (method === 'POST' && acceptanceMatch) {
+      const name = decodeURIComponent(acceptanceMatch[1]);
+      try { assertAcceptanceScope(env, name); } catch { return json({ok:false,error:'acceptance_faults_disabled'},404); }
+      if (resolvePreviewSecrets(env).length === 0) return json({ok:false,error:'acceptance_auth_not_configured'},401);
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      try {
+        const raw = await request.json().catch(() => null);
+        parseAcceptanceFault(raw);
+        await openSandbox(env,name).setAcceptanceFault(name,raw);
+        return json({ok:true});
+      } catch (error) {
+        return json({ok:false,error:error instanceof AcceptanceFaultError ? error.code : 'acceptance_fault_failed'},
+          error instanceof AcceptanceFaultError ? error.status : 502);
+      }
+    }
+    const relayMatch = path.match(/^\/sandbox\/([^/]+)\/relay-refresh$/);
+    if ((method === 'GET' || method === 'POST') && relayMatch) {
+      if (resolvePreviewSecrets(env).length === 0) return json({ok:false,error:'relay_auth_not_configured'},401);
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      const name = decodeURIComponent(relayMatch[1]);
+      try {
+        let runtimeId: string | undefined;
+        if (method === 'POST') {
+          let body: {runtimeId?:unknown};
+          try { body = await request.json(); } catch { return json({ok:false,error:'relay_bad_request'},400); }
+          if (!body || typeof body !== 'object' || typeof body.runtimeId !== 'string' || !/^[a-f0-9]{32}$/.test(body.runtimeId)) return json({ ok:false,error:'relay_bad_request' },400);
+          runtimeId = body.runtimeId;
+        }
+        const result = await openSandbox(env,name).relayRefresh(name,runtimeId);
+        return result.ok ? json(result) : json({ ok:false, error:result.error }, result.status);
+      } catch (error) {
+        return json({ ok:false,error:error instanceof RelayFailure ? error.code : 'relay_refresh_failed' },error instanceof RelayFailure ? error.status : 502);
+      }
     }
 
     const focusMatch = path.match(/^\/sandbox\/([^/]+)\/focus$/);

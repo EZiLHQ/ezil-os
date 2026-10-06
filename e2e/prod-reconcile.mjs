@@ -1,3 +1,4 @@
+import { signIn } from './sign-in.mjs';
 /**
  * prod-reconcile.mjs — the reconcile path, against the LIVE deployment.
  *
@@ -27,6 +28,7 @@
 
 import { createRequire } from 'node:module';
 import { APP, configureAppContext } from './deployed-target.mjs';
+import { verifySelectedComputer } from './isolated-computer.mjs';
 import path from 'node:path';
 
 const REQ_DIR = process.env.PLAYWRIGHT_REQUIRE_DIR;
@@ -67,19 +69,27 @@ try {
   await configureAppContext(ctx);
   const p = await ctx.newPage();
   const screenCalls = [];
+  const screenResponses = [];
+  const responseReads = [];
   p.on('request', r => {
     if (/\/api\/shell\/screen/.test(r.url())) screenCalls.push(`${r.method()} ${r.url().split('?')[0]}`);
   });
+  p.on('response', r => {
+    if (!/\/api\/shell\/screen/.test(r.url())) return;
+    responseReads.push((async () => {
+      let body;
+      try { body = await r.json(); } catch { /* response failure remains visible via status */ }
+      const rawCode = body?.errorCode ?? body?.error?.code ?? body?.code ?? body?.error;
+      screenResponses.push({ method: r.request().method(), status: r.status(), ok: body?.ok === true,
+        code: typeof rawCode === 'string' && /^[a-zA-Z0-9_]{1,80}$/.test(rawCode) ? rawCode : null });
+    })());
+  });
 
   await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
-  await p.fill('#email', EMAIL); await p.fill('#password', PASS);
-  await Promise.all([
-    p.waitForURL(u => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),
-    p.locator('form').filter({ has: p.locator('#email') }).locator('button[type=submit]').click(),
-  ]);
+  await signIn(p, { email: EMAIL, password: PASS });
   check('sign-in leaves /login', !/\/login/.test(p.url()), p.url().slice(0, 50));
-
   await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
+  const isolatedComputerId = await verifySelectedComputer(p, { required: true });
   await p.waitForTimeout(3500);
   try { await p.locator('.taskbar-item').filter({ hasText: /browser/i }).first().click({ timeout: 12000 }); }
   catch { await p.locator('.taskbar-item').nth(1).click({ timeout: 12000 }).catch(() => {}); }
@@ -103,9 +113,9 @@ try {
   check('setup: the phone desktop is PORTRAIT before the restart', portraitBefore, JSON.stringify(before));
 
   // ── the restart: a real container, really restarted ──────────────────────
-  const restart = await p.evaluate(async () => {
-    const cid = window.__EZIL_BOOT__?.computer?.id;
-    if (!cid) return { ok: false, why: 'no computer id on the boot payload' };
+  const restart = await p.evaluate(async expected => {
+    const cid = window.ezil?.session?.payload?.()?.computer?.id;
+    if (cid !== expected) throw new Error('Selected computer changed; refusing restart');
     const r = await fetch('/api/shell/restart', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ computerId: cid }),
@@ -121,7 +131,7 @@ try {
     return { httpOk: r.ok, status: r.status, ok: parsed?.ok === true,
              errorCode: parsed?.errorCode ?? parsed?.error?.code ?? null,
              body: text.slice(0, 240) };
-  });
+  }, isolatedComputerId);
   check('the desktop restart actually succeeded (body.ok, NOT just HTTP 200)',
     restart.ok === true,
     `http=${restart.status} ok=${restart.ok} errorCode=${restart.errorCode} body=${String(restart.body).slice(0, 120)}`);
@@ -142,6 +152,8 @@ try {
     reads.length > 0, `${reads.length} GET /api/shell/screen call(s); all calls: ${JSON.stringify(screenCalls.slice(-4))}`);
 
   const after = await geo();
+  await Promise.all(responseReads);
+  console.log(`Screen responses (redacted): ${JSON.stringify(screenResponses)}`);
   check('🔴 the picture is still PORTRAIT after a restart — not letterboxed into a stale 1920x1080',
     !!after.frame && after.frame.h > after.frame.w,
     `before=${before.frame?.w}x${before.frame?.h} after=${after.frame?.w}x${after.frame?.h}`);

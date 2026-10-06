@@ -318,32 +318,22 @@ suite_budget () {
 # Linux only)", currently ci.yml:387-391 and :400-405 — match by step name if
 # the line numbers have drifted since.
 #
-# 🔴 THESE MUST AGREE WITH `ci.yml` BY HAND. There is no automated check that
-# diffs this copy against the workflow file — a test doing that belongs beside
-# whoever owns `.github/workflows/ci.yml`, and is out of this file's
-# `owns_files`; HAND-OFF. If ci.yml's two lists change, update these two
-# arrays in the same PR.
-#
-# 🔴 A `*-browser-test.mjs` IN NEITHER LIST IS AN ERROR, NOT A SILENT SKIP.
-# MEASURED: `shell/ezil/display-notice-browser-test.mjs`,
-# `shell/ezil/launcher-toggle-browser-test.mjs` and
-# `shell/ezil/context-menu-stack-browser-test.mjs` are real suites in this tree
-# that `ci.yml` does not name in EITHER list — so neither OS family in CI runs
-# them today. `--family all` (the default) still runs them, unfiltered, same
-# as always. `--family portable` / `--family geometry` refuse to guess which
-# family such a suite belongs to: each one is reported as a FAILURE naming the
-# gap, never silently dropped and never silently included. HAND-OFF: `ci.yml`
-# needs to add these three suites to one of its two `for` loops.
+# These families must match ci.yml. check-os-workflows.py verifies both
+# membership and coverage of every browser suite discovered in the tree.
+# Unclassified suites still fail family-specific runs explicitly.
 GEOMETRY_SUITES=(
     "shell/responsiveness-browser-test.mjs"
     "shell/seam-minimise-browser-test.mjs"
     "shell/window-chrome-browser-test.mjs"
     "shell/phone-stacking-browser-test.mjs"
     "shell/ezil/apps/overlay-paint-browser-test.mjs"
+    "shell/ezil/display-notice-browser-test.mjs"
     "shell/ezil/apps/resize-test.mjs"
 )
 PORTABLE_SUITES=(
     "shell/touch-focus-browser-test.mjs"
+    "shell/ezil/context-menu-stack-browser-test.mjs"
+    "shell/ezil/launcher-toggle-browser-test.mjs"
     "shell/ezil/apps/app-store-browser-test.mjs"
     "shell/ezil/apps/os-chrome-browser-test.mjs"
     "shell/ezil/apps/mobile-browser-test.mjs"

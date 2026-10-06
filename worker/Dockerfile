@@ -82,7 +82,7 @@
 # suffix is not yet a key in `deploy/images.env` (that file only carries the
 # BARE base tag) — see the workflow's own hand-off comment before bumping
 # either place on its own.
-ARG NEKO_IMAGE=ghcr.io/ezilhq/ezil-neko-vscode:d74052bb-049931d7-ezil-brand8
+ARG NEKO_IMAGE=ghcr.io/ezilhq/ezil-neko-vscode:d74052bb-049931d7-ezil-brand9
 FROM ${NEKO_IMAGE} AS neko
 
 FROM docker.io/cloudflare/sandbox:0.12.1
@@ -170,6 +170,7 @@ COPY scripts/start-devserver.sh /usr/local/bin/start-devserver.sh
 # "code-server" launch section), but shipped here as a standalone, idempotent
 # utility for on-demand/manual relaunch.
 COPY scripts/start-codeserver.sh /usr/local/bin/start-codeserver.sh
+COPY scripts/editor-state.sh /usr/local/bin/editor-state.sh
 COPY scripts/ezil-restore-deps.sh /usr/local/bin/ezil-restore-deps.sh
 RUN chmod +x /usr/local/bin/start-desktop.sh /usr/local/bin/start-neko.sh /usr/local/bin/start-devserver.sh /usr/local/bin/start-codeserver.sh /usr/local/bin/ezil-restore-deps.sh
 # ── Alternate `neko` desktop mode (Phase 1, opt-in via desktopMode) ──────────

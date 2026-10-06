@@ -8,8 +8,8 @@ now a full gated release; its former frontend-only and verify-only bypasses
 are retired. Vercel Git previews remain enabled; automatic main Git deployment
 must remain disabled in `app/vercel.json`.
 
-All OS jobs use GitHub-hosted runners. Native/macOS rollout is unchanged and
-outside the automatic main cloud release. On version tags, the independent
+All OS jobs use GitHub-hosted runners, including exact-artifact Mac E2E on
+`macos-15`. Native/macOS rollout is outside the automatic main cloud release. On version tags, the independent
 release workflow still builds signed native artifacts as drafts. Deploy waits
 for successful cloud verification and the signed macOS installer, attaches
 the version image alias to the tested digest, then publishes that draft.
@@ -20,7 +20,7 @@ the version image alias to the tested digest, then publishes that draft.
    its summary instead of reporting a successful deployment with two skipped jobs.
 2. Deploy and test the staging Worker and returned Vercel preview with existing
    staging lease/isolation semantics. **PRs never apply SQL to the shared DB.**
-3. The reusable Image workflow builds/reuses base, branding and desktop images
+3. The reusable Image workflow builds/reuses pinned Neko continuity, base, branding and desktop images
    for the admitted full source SHA, then runs all three existing real-container
    suites against the exact desktop digest; any skip fails the job.
 4. Production requires both staging and images to succeed. Under the common
@@ -33,8 +33,8 @@ the version image alias to the tested digest, then publishes that draft.
    rechecked before each mutation and after verification; superseded releases fail.
 
 There is no independent image push/path/tag trigger or registry polling race.
-Base tags hash all base build inputs; overlay tags also hash branding inputs
-and the base key. Desktop tags use `sha-<full SHA>`. The global image publisher
+Base tags hash all base build inputs; overlay tags also hash the pinned Neko
+continuity patch, branding inputs and the base key. Desktop tags use `sha-<full SHA>`. The global image publisher
 lock and manifest existence checks prevent overwrites, including reruns and
 partial previous builds. Only missing manifests permit builds; authorization
 and network errors fail. `latest` advances only after desktop tests pass and a
@@ -80,6 +80,19 @@ Actions access must permit this repository to read and publish its images.
 Cloudflare needs Workers deployment/version reads and Containers application/
 rollout read/write permissions. No Supabase credential is used by preview.
 
+For a user-requested manual preview, dispatch `preview.yml` on the PR branch
+with `preview_pr` set to its number. The PR may remain a draft, but must be an
+open same-repository PR to main and its exact current head must pass public CI.
+The job builds and tests the candidate image, holds the shared staging lease,
+deploys only staging and a Vercel preview, then verifies Worker/app source,
+served shell bytes and exact container layers. It publishes `manual-preview.json`
+and an `/os` link in the run summary. Fault injection and automated computer
+start/stop tests do not run in this mode; the user can test the returned URL.
+Missing isolated-computer prerequisites still fail normal hosted acceptance.
+The manual run is labelled as pending acceptance and cannot satisfy the required
+`Hosted continuity PR gate` or admit production. Normal manual/tag releases
+without `preview_pr` continue to require tested current main.
+
 Failed production checks retain the failure while attempting recovery: first
 verify that these deployments still belong to this release, restore the previous
 Vercel deployment and Worker version, then PATCH only the previous container
@@ -94,6 +107,54 @@ Tools: Bun 1.3.14, Node 22.16.0, Vercel CLI 57.0.0, Buildx 0.25.0,
 Playwright 1.62.1 and lockfile-resolved Wrangler 4.128.0. Provider behavior and
 large image builds still require the first hosted run; offline contract tests
 cannot establish live credentials, quotas, registry access or rollout behavior.
+
+Relevant PRs run the short hosted continuity suite with five-minute TURN
+credentials. Main requires the full suite before production: active video for
+36 minutes with the production 30-minute TURN lifetime and a new expiry increase
+during that hold. Renewals from earlier interruption
+scenarios cannot satisfy the hold; received frames and the original runtime
+identity must persist throughout it. The suite also verifies real checkpoint,
+stop/reopen and editor returns after 10 and 30 minutes. The suite has a 90-minute limit and holds the existing staging lease;
+its AWS role coordinates that lease only. Execution uses GitHub-hosted runners.
+Missing prerequisites and skipped acceptance are failures.
+
+The continuity suite first confirms the isolated computer is stopped, then opens
+Browser before Code so cold-start frame delivery is tested. Failed checkpoint
+tests compare the committed R2 manifest before and after the rejected stop;
+unavailable TURN must produce a visible Retry state and recover after clearing
+the staging fault. Each editor reopen also verifies the restored keybinding:
+with automatic save disabled, it inserts a fresh proof, presses the custom save
+shortcut and reloads the file from disk. Restored JSON alone cannot pass that
+check; the saved proof must remain after the reload and a second, unsaved probe
+must disappear. A failed reload cannot pass by leaving editor text unchanged.
+Stop forwarding allows up to 270 seconds for editor capture,
+workspace/system checkpoints and confirmed shutdown within the 300-second route.
+The browser's Vercel bypass allows 290 seconds for that stop response, while
+ordinary app requests retain their 240-second budget. Cleanup uses the signed-in
+request context even if the page fails, and requires confirmed shutdown or an
+already-stopped computer. The deployed browser suites also verify the explicit
+computer before launch; reconcile rechecks it immediately before restarting.
+Both cloud jobs run final authenticated cleanup under `always()` before releasing
+their lease, including when an earlier suite fails or later canonical checks reopen
+compute. Cleanup signs in to the computer-management page, verifies the selected
+isolated computer through the read-only session endpoint, and never loads `/os`.
+Its redacted result is uploaded with acceptance evidence; unconfirmed cleanup fails
+the job.
+
+Configure each GitHub environment with an explicitly approved isolated
+`EZIL_E2E_COMPUTER_ID` secret, an absolute `EZIL_E2E_WORKSPACE_PATH` variable,
+`EZIL_E2E_R2_BUCKET` variable and exact `EZIL_E2E_R2_PREFIX` secret. The suite
+refuses to start or stop a different selected computer. It reads the durable
+R2 manifest with the repository's pinned Wrangler executable. Evidence retains
+only deployment identities, hashes, timings and whitelisted media counters.
+Staging also needs `EZIL_ACCEPTANCE_SANDBOX` for that same isolated computer
+and `EZIL_ACCEPTANCE_HMAC_SECRET` matching its existing signed Worker boundary.
+Fault controls are disabled without both staging scope and the exact sandbox;
+injected failures expire within 60 seconds. Production has no fault scope.
+Production verifies persistence through `https://os.ezil.org`, and validates
+its isolated-computer prerequisites before changing a deployment. Branch
+protection must require `Hosted continuity PR gate` alongside public CI, DCO
+and CodeQL; a skipped or failed hosted gate cannot authorize a merge.
 
 ## Internal macOS test DMG (no Apple subscription)
 

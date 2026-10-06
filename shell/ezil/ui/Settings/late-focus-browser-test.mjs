@@ -144,6 +144,16 @@ function fitScreenRequest (w, h) {
 
 const HOST = 'https://ezil-responsiveness-test.invalid';
 const DESKTOP_URL = 'https://8181-guac-x-y-nekodesktop.ezil-responsiveness-test.invalid/?usr=EZiL&pwd=x&embed=1';
+// This layout fixture supplies evidence for its current iframe navigation.
+// Hosted acceptance separately requires real decoded frames and relay stats.
+const VIEWER_HTML = `<!doctype html><html><body><script>
+const attempt = new URL(location.href).searchParams.get('ezilAttempt');
+let count = 0;
+function report() { count++; parent.postMessage({ source:'ezil-mobile', type:'stream_vitals', attempt,
+    vitals:{ connectionState:'connected', bytesReceived:count*100, framesDecoded:count, width:1280, height:720 } }, '*'); }
+addEventListener('message', e => { if (e.source === parent && e.data?.type === 'viewer_probe') report(); });
+setInterval(report, 100);
+</script></body></html>`;
 const DOC_HTML = `<!doctype html><html><head><style>${css}</style></head>`
     + '<body class="min-h-full flex flex-col"><div id="ezil-os-root"></div></body></html>';
 
@@ -197,6 +207,9 @@ async function boot ({ width, height, dpr = 1, screen = true, serverScreen = nul
         const req = route.request();
         const url = req.url();
         const json = (body) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+        if ( new URL(url).origin === new URL(DESKTOP_URL).origin ) {
+            return route.fulfill({ status: 200, contentType: 'text/html', body: VIEWER_HTML });
+        }
         if ( url === `${HOST}/os` ) return route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
 
         if ( url.includes('/api/shell/screen') ) {
@@ -337,6 +350,7 @@ async function openSettingsUnderLateFocus (page, { breakFix = false } = {}) {
         setTimeout(() => { try { window.$(desk).focusWindow(); } catch { /* ignore */ } }, 80);
     });
     await page.touchscreen.tap(btn[0], btn[1]);
+    await page.waitForSelector('.window[data-app="settings"]', { timeout: 8000 });
     await sleep(1600);   // past the 80ms late focus AND the 120ms re-assert
     return true;
 }
@@ -373,7 +387,7 @@ async function openSettingsUnderLateFocus (page, { breakFix = false } = {}) {
     const top = await topWindow(page);
     const reach = await closeButtonReachable(page);
     push(`${L} 🔴 MUTATION PROOF: without the re-assert the desktop's late focus buries Settings`,
-        top.app === 'desktop' || reach.ok === false,
+        top.app === 'desktop' && reach.ok === false,
         `top=${JSON.stringify(top)} reach=${reach.why}`);
     await context.close();
 }

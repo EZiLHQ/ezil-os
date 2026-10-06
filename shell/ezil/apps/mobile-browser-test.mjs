@@ -215,6 +215,14 @@ const FAKE_STREAM = `<!doctype html><html><head><style>
  for ( const t of ['pointerdown', 'touchstart', 'mousedown', 'click'] ) {
    window.addEventListener(t, () => { window.__hits.push(t); }, true);
  }
+ let framesDecoded = 0;
+ setInterval(() => {
+   framesDecoded++;
+   parent.postMessage({ source: 'ezil-mobile', type: 'stream_vitals',
+     attempt: new URL(location.href).searchParams.get('ezilAttempt'),
+     vitals: { connectionState: 'connected', framesDecoded, bytesReceived: framesDecoded * 100,
+       width: 1280, height: 720 } }, location.origin);
+ }, 100);
 </script></body></html>`;
 
 const COMPUTER = {
@@ -312,6 +320,7 @@ const browser = await chromium.launch();
 let anyHardFailure = false;
 
 for ( const scenario of [
+    scenarioTouchActionability,
     scenarioPhonePortrait,
     scenarioPhoneLandscape,
     scenarioTablet,
@@ -586,17 +595,12 @@ async function defocusDesktopByTapping (page) {
     if ( ! await waitFor(page, () => !! document.querySelector('.window[data-app="settings"]'), 4000) ) {
         return 'Settings never opened';
     }
-    // 🔴 WAIT FOR IT TO STOP MOVING before measuring where to tap. Settings
-    // opens with a launch morph, so its close button is still travelling for
-    // a few hundred ms; a rect sampled during that lands the tap on empty
-    // space and the window never closes. That was the residue of this flake
-    // after the fixed sleeps were removed — the failure had simply moved from
-    // "still focused" to "Settings never closed".
+    // A locator tap waits for visible, stable geometry and a target that owns
+    // the input point before sending a real touch gesture. The old separate
+    // hit-test / coordinate read accepted a covering ancestor and could race
+    // the opening animation. A failed tap remains a named setup failure.
     const closeSel = '.window[data-app="settings"] .window-head > .window-close-btn';
-    if ( ! await waitForTappable(page, closeSel) ) return 'the Settings close control never became tappable';
-    const close = await at(closeSel);
-    if ( ! close ) return 'Settings did not open, or has no close control';
-    await page.touchscreen.tap(close[0], close[1]);
+    if ( ! await tapControl(page, closeSel) ) return 'the Settings close control never became tappable';
     if ( ! await waitFor(page, () => ! document.querySelector('.window[data-app="settings"]'), 4000) ) {
         const diag = await page.evaluate((sel) => {
             const el = document.querySelector(sel);
@@ -611,14 +615,6 @@ async function defocusDesktopByTapping (page) {
                      op: getComputedStyle(el).opacity };
         }, closeSel);
         console.log('  DIAG after failed tap: ' + JSON.stringify(diag));
-        const viaClick = await page.evaluate((sel) => {
-            const el = document.querySelector(sel);
-            if ( ! el ) return 'gone';
-            el.click();
-            return 'clicked';
-        }, closeSel);
-        const closedNow = await waitFor(page, () => ! document.querySelector('.window[data-app="settings"]'), 3000);
-        console.log(`  DIAG fallback el.click() -> ${viaClick}, closed=${closedNow}`);
         return 'Settings never closed';
     }
     // The condition the caller actually depends on, waited for explicitly and
@@ -633,41 +629,47 @@ async function defocusDesktopByTapping (page) {
     return null;
 }
 
-/**
- * Wait until an element is genuinely TAPPABLE at its own centre.
- *
- * 🔴 Not "does it exist", and not "has its box stopped moving" — both were
- * tried and both still flaked. Tapping is a COORDINATE operation:
- * `touchscreen.tap` goes to a point, and whatever is topmost at that point
- * receives it. Measured on failing runs of this very file, `elementFromPoint`
- * at the Settings close button's centre returned
- * `window-body window-body-app ui-droppable` — the window BODY was over the
- * head — while passing runs returned `window-action-btn window-close-btn`.
- * The rect was correct every time; the point was occluded.
- *
- * So the condition is hit-testing, which is the only thing that actually
- * predicts whether the tap will land. Roughly 2 runs in 5 of this scenario
- * failed before this existed, and the failure surfaced two checks later as
- * "the Browser is still focused" — indistinguishable from a real focus
- * regression, which is exactly what makes an unstable harness expensive.
- */
-async function waitForTappable (page, selector, timeoutMs = 5000, stepMs = 60) {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-        const ok = await page.evaluate((sel) => {
-            const el = document.querySelector(sel);
-            if ( ! el ) return false;
-            const r = el.getBoundingClientRect();
-            if ( r.width <= 0 || r.height <= 0 ) return false;
-            const x = Math.round(r.left + r.width / 2);
-            const y = Math.round(r.top + r.height / 2);
-            if ( x < 0 || y < 0 || x > innerWidth || y > innerHeight ) return false;
-            const hit = document.elementFromPoint(x, y);
-            return !! hit && (hit === el || el.contains(hit) || hit.contains(el));
-        }, selector);
-        if ( ok ) return true;
-        if ( Date.now() >= deadline ) return false;
-        await sleep(stepMs);
+async function tapControl (page, selector, timeoutMs = 5000) {
+    try {
+        await page.locator(selector).tap({ timeout: timeoutMs });
+        return true;
+    } catch (err) {
+        if (err?.name === 'TimeoutError') return false;
+        throw err;
+    }
+}
+
+async function scenarioTouchActionability () {
+    const ctx = await browser.newContext({ hasTouch: true, viewport: { width: 390, height: 844 } });
+    try {
+        const page = await ctx.newPage();
+        await page.setContent(`<div id="parent" style="position:relative;width:100px;height:100px">
+            <button id="close" style="position:absolute;left:8px;top:9px;width:12px;height:12px;padding:0;pointer-events:none">x</button>
+        </div>`);
+        await page.evaluate(() => {
+            window.__closeTaps = [];
+            document.querySelector('#close').addEventListener('click', (event) => {
+                window.__closeTaps.push({ trusted: event.isTrusted, type: event.pointerType });
+            });
+        });
+        push('[touch-actionability] a covering parent cannot satisfy the close tap',
+            ! await tapControl(page, '#close', 300)
+            && await page.evaluate(() => window.__closeTaps.length === 0));
+        await page.evaluate(() => {
+            const button = document.querySelector('#close');
+            button.style.pointerEvents = 'auto';
+            window.__closeMotionFinished = false;
+            button.animate([{ transform: 'translateX(200px)' }, { transform: 'translateX(0px)' }],
+                { duration: 400, fill: 'forwards' }).finished.then(() => { window.__closeMotionFinished = true; });
+            button.addEventListener('click', () => { window.__tappedAfterMotion = window.__closeMotionFinished; });
+        });
+        const tapped = await tapControl(page, '#close');
+        const result = await page.evaluate(() => ({ taps: window.__closeTaps, settled: window.__tappedAfterMotion }));
+        push('[touch-actionability] one real touch tap waits for a moving close button',
+            tapped && result.settled === true && result.taps.length === 1
+            && result.taps[0].trusted === true && result.taps[0].type === 'touch', JSON.stringify(result));
+    } finally {
+        await ctx.close();
     }
 }
 
@@ -856,12 +858,12 @@ async function scenarioPhonePortrait () {
         const hit = document.elementFromPoint(x, y);
         return {
             x, y, hitsIframe: hit === iframe,
-            bodyBottom: Math.round(bodyBox.bottom), drawerTop: Math.round(drawerBox.top),
+            bodyTop: Math.round(bodyBox.top), drawerTop: Math.round(drawerBox.top),
             drawerBottom: Math.round(drawerBox.bottom), windowBottom: Math.round(win.getBoundingClientRect().bottom),
         };
     });
-    push(`${L} the expanded OS controls occupy a reserved strip below the stream`,
-        !! topTap && topTap.drawerTop >= topTap.bodyBottom
+    push(`${L} the expanded OS controls occupy a reserved strip above the stream`,
+        !! topTap && topTap.drawerTop >= 0 && topTap.drawerBottom <= topTap.bodyTop
         && topTap.drawerBottom <= topTap.windowBottom + 1 && topTap.hitsIframe,
         JSON.stringify(topTap));
     const topFrame = page.frames().find((f) => f.url().includes('/frame?'));
@@ -881,12 +883,12 @@ async function scenarioPhonePortrait () {
         const drawer = document.querySelector('.window[data-app="desktop"] .ezil-app-drawer');
         const body = document.querySelector('.window[data-app="desktop"] .window-body-app');
         if ( ! drawer || ! body || ! point ) return null;
-        return { drawerTop: Math.round(drawer.getBoundingClientRect().top),
-            bodyBottom: Math.round(body.getBoundingClientRect().bottom),
+        return { drawerBottom: Math.round(drawer.getBoundingClientRect().bottom),
+            bodyTop: Math.round(body.getBoundingClientRect().top),
             hitsIframe: document.elementFromPoint(point.x, point.y)?.classList.contains('window-app-iframe') };
     }, topTap);
     push(`${L} the collapsed controls also leave the address bar tappable`,
-        !! collapsedTop && collapsedTop.drawerTop >= collapsedTop.bodyBottom && collapsedTop.hitsIframe,
+        !! collapsedTop && collapsedTop.drawerBottom <= collapsedTop.bodyTop && collapsedTop.hitsIframe,
         JSON.stringify(collapsedTop));
 
     // ── the raised keyboard, contract §7.3 ─────────────────────────────────

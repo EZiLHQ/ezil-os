@@ -1913,24 +1913,7 @@ phase_end stale_boot_reclaim ok
 CODE_SERVER_USER_DATA_DIR="${CODE_SERVER_USER_DATA_DIR:-/tmp/code-server-data}"
 CODE_SERVER_EXTENSIONS_DIR="${CODE_SERVER_EXTENSIONS_DIR:-/tmp/code-server-extensions}"
 
-# Never clobbers an existing file: within a single container life the user may
-# have changed settings through the UI, and this runs before every launch.
-seed_codeserver_user_settings() {
-  _cs_user_dir="$1/User"
-  _cs_settings="$_cs_user_dir/settings.json"
-  if [ -s "$_cs_settings" ]; then
-    return 0
-  fi
-  mkdir -p "$_cs_user_dir" 2>/dev/null || return 1
-  cat >"$_cs_settings" <<'CODESERVER_SETTINGS_JSON'
-{
-  "security.workspace.trust.enabled": false,
-  "files.exclude": {
-    "**/.ezil": true
-  }
-}
-CODESERVER_SETTINGS_JSON
-}
+. "$(dirname "${BASH_SOURCE[0]}")/editor-state.sh"
 
 # ── editor state that OUTLIVES the container ────────────────────────────────
 #
@@ -1962,85 +1945,29 @@ CODESERVER_SETTINGS_JSON
 # `files.exclude` below, so it does not clutter the file tree.
 EZIL_EDITOR_STATE_DIR="${EZIL_EDITOR_STATE_DIR:-${WORKSPACE_ROOT}/.ezil}"
 EZIL_EDITOR_EXT_MANIFEST="${EZIL_EDITOR_STATE_DIR}/extensions.txt"
-EZIL_EDITOR_SETTINGS_BACKUP="${EZIL_EDITOR_STATE_DIR}/settings.json"
-EZIL_EDITOR_KEYBINDINGS_BACKUP="${EZIL_EDITOR_STATE_DIR}/keybindings.json"
 # How often to re-capture. Cheap: a directory listing and two small file
 # copies, only written when something actually changed.
 EZIL_EDITOR_STATE_INTERVAL="${EZIL_EDITOR_STATE_INTERVAL:-30}"
-
-# The installed set, as extension ids, one per line. Read from the extensions
-# DIRECTORY rather than `code-server --list-extensions`, which spawns a whole
-# Node process and takes seconds; the directory basenames carry the id and the
-# version (`publisher.name-1.2.3`), and the version is deliberately stripped so
-# a restore installs the current release rather than pinning a stale one.
-_ezil_installed_extension_ids() {
-  [ -d "$CODE_SERVER_EXTENSIONS_DIR" ] || return 0
-  find "$CODE_SERVER_EXTENSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
-    | sed -E 's/-[0-9]+\.[0-9]+\.[0-9]+(-.*)?$//' \
-    | grep -E '^[A-Za-z0-9][A-Za-z0-9_-]*\.[A-Za-z0-9][A-Za-z0-9_.-]*$' \
-    | sort -u
-}
 
 # Write the manifest and back up the two settings files — only on a real
 # change, so an idle session does not rewrite workspace files every 30s and
 # make the flush think there is work to do.
 _ezil_capture_editor_state() {
-  mkdir -p "$EZIL_EDITOR_STATE_DIR" 2>/dev/null || return 1
-  _ids="$(_ezil_installed_extension_ids)"
-  if [ -n "$_ids" ] && [ "$_ids" != "$(cat "$EZIL_EDITOR_EXT_MANIFEST" 2>/dev/null)" ]; then
-    printf '%s\n' "$_ids" >"${EZIL_EDITOR_EXT_MANIFEST}.tmp" 2>/dev/null \
-      && mv "${EZIL_EDITOR_EXT_MANIFEST}.tmp" "$EZIL_EDITOR_EXT_MANIFEST" 2>/dev/null \
-      && log "editor state: captured $(printf '%s\n' "$_ids" | wc -l) extension id(s) for restore"
-  fi
-  for _pair in "User/settings.json:$EZIL_EDITOR_SETTINGS_BACKUP" "User/keybindings.json:$EZIL_EDITOR_KEYBINDINGS_BACKUP"; do
-    _src="${CODE_SERVER_USER_DATA_DIR}/${_pair%%:*}"
-    _dst="${_pair#*:}"
-    if [ -s "$_src" ] && ! cmp -s "$_src" "$_dst" 2>/dev/null; then
-      cp -f "$_src" "$_dst" 2>/dev/null && log "editor state: backed up $(basename "$_src")"
-    fi
-  done
+  ezil_editor_capture "$CODE_SERVER_USER_DATA_DIR" "$WORKSPACE_ROOT"
 }
 
-# Put back what the manifest names. Runs in the BACKGROUND and never gates
+# Reinstall the extensions the manifest names. Runs in the BACKGROUND and never gates
 # readiness: a restore that needs the network must not be able to delay — or
 # fail — a desktop the user is waiting for. Everything here is best-effort by
 # design; a failed reinstall costs one extension, not the session.
 _ezil_restore_editor_state() {
-  for _pair in "$EZIL_EDITOR_SETTINGS_BACKUP:User/settings.json" "$EZIL_EDITOR_KEYBINDINGS_BACKUP:User/keybindings.json"; do
-    _src="${_pair%%:*}"
-    _dst="${CODE_SERVER_USER_DATA_DIR}/${_pair#*:}"
-    if [ -s "$_src" ] && [ ! -s "$_dst" ]; then
-      mkdir -p "$(dirname "$_dst")" 2>/dev/null
-      cp -f "$_src" "$_dst" 2>/dev/null && log "editor state: restored $(basename "$_dst")"
-    fi
-  done
-
-  [ -s "$EZIL_EDITOR_EXT_MANIFEST" ] || return 0
-  _already="$(_ezil_installed_extension_ids)"
-  _want="$(grep -E '^[A-Za-z0-9][A-Za-z0-9_-]*\.[A-Za-z0-9][A-Za-z0-9_.-]*$' "$EZIL_EDITOR_EXT_MANIFEST" 2>/dev/null | sort -u)"
-  [ -n "$_want" ] || return 0
-  _missing=""
-  for _id in $_want; do
-    printf '%s\n' "$_already" | grep -qx "$_id" || _missing="$_missing $_id"
-  done
-  [ -n "$_missing" ] || return 0
-  log "editor state: reinstalling$(printf '%s' "$_missing") (from the manifest this workspace carries)"
-  for _id in $_missing; do
-    if timeout 180 "$CODE_SERVER_BIN" \
-        --user-data-dir="$CODE_SERVER_USER_DATA_DIR" \
-        --extensions-dir="$CODE_SERVER_EXTENSIONS_DIR" \
-        --install-extension "$_id" >>"$LOG" 2>&1; then
-      log "editor state: reinstalled $_id"
-    else
-      log "editor state: could NOT reinstall $_id — continuing (one extension, not the session)"
-    fi
-  done
+  ezil_editor_restore_extensions "$CODE_SERVER_USER_DATA_DIR" "$WORKSPACE_ROOT" "$CODE_SERVER_EXTENSIONS_DIR" "$CODE_SERVER_BIN" >>"$LOG" 2>&1
 }
 
-if seed_codeserver_user_settings "$CODE_SERVER_USER_DATA_DIR"; then
-  log "code-server user settings seeded at ${CODE_SERVER_USER_DATA_DIR}/User/settings.json (workspace trust disabled — no Restricted Mode, terminal works on the first Ctrl+backtick)"
-else
-  log "WARNING: could not seed ${CODE_SERVER_USER_DATA_DIR}/User/settings.json — code-server will open in Restricted Mode and its integrated terminal will prompt for workspace trust before it will start"
+if ! ezil_editor_prepare "$CODE_SERVER_USER_DATA_DIR" "$WORKSPACE_ROOT"; then
+  log "ERROR: editor settings restoration failed; saved settings retained, retry opening the computer"
+  terminate_stack "editor settings restoration failed"
+  exit 1
 fi
 
 phase_start codeserver_launch
@@ -2054,8 +1981,8 @@ supervise_app codeserver "$NEKO_APP_MAX_RESTARTS" "$CODE_SERVER_BIN" \
   "$WORKSPACE_ROOT"
 phase_end codeserver_launch ok
 
-# Restore first, then keep capturing. Both in one detached subshell so neither
-# can delay readiness — see `_ezil_restore_editor_state` for why that matters.
+# Settings are restored synchronously above. Extension downloads stay asynchronous;
+# periodic capture supplements the mandatory checkpoint-boundary capture.
 #
 # 🔴 `9>&-` IS LOAD-BEARING, and leaving it out cost a boot. The boot mutex
 # near the top of this file holds its lock on file descriptor 9 for the life

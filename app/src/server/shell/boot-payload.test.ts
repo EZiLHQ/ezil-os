@@ -233,6 +233,7 @@ describe('toShellDesktopState — never implies an observation it does not have'
 
     it('publishes the endpoints the shell must call, and only those', () => {
         expect(toShellDesktopState(null).endpoints).toEqual({
+            relayRefresh: '/api/shell/relay-refresh',
             session: '/api/shell/session',
             desktop: '/api/shell/desktop',
             previewUrl: '/api/shell/preview-url',

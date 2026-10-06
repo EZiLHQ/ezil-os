@@ -116,6 +116,23 @@ function open_desktop (window) {
 // Scenario 1 — a happy boot
 // ───────────────────────────────────────────────────────────────────────────
 const URL_OK = 'https://preview.example.invalid/guac/abc';
+function viewerURLMatches (raw) {
+    if (!raw || raw === 'about:blank') return false;
+    const url = new URL(raw);
+    url.searchParams.delete('ezilAttempt');
+    return url.href === URL_OK;
+}
+
+// Wiring evidence only: jsdom cannot decode video. Real-cloud acceptance
+// obtains these counters from the current WebRTC peer instead.
+function emitViewerFrames (window, iframe) {
+    const url = new URL(iframe.src);
+    for (const count of [1, 2]) window.dispatchEvent(new window.MessageEvent('message', {
+        source: iframe.contentWindow, origin: url.origin,
+        data: { source: 'ezil-mobile', type: 'stream_vitals', attempt: url.searchParams.get('ezilAttempt'),
+            vitals: { connectionState: 'connected', bytesReceived: count * 100, framesDecoded: count, width: 1280, height: 720 } },
+    }));
+}
 let release_preview;
 const preview_gate = new Promise((r) => { release_preview = r; });
 
@@ -144,10 +161,8 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
         // and the shell correctly refuses to hand over the viewport.
         if (url.includes('confirm=frame')) return { ok: true, confirmed: true };
         // 🔴 The SECOND gate, and the same ordering rule for the same reason.
-        // `display_answer` is a module-level let so the mutation proofs further
-        // down can flip it without forking this handler: 'live' is the only
-        // value that may retire the panel, 'blank' must produce EZiL's own
-        // failure copy, and anything else must produce `ready_unverified`.
+        // Server evidence starts the diagnostic poll. Only current-viewer
+        // decoded-frame progress may retire the panel.
         if (url.includes('confirm=display')) return { ok: true, display: display_answer };
         if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: guac_running };
         return { ok: true };
@@ -231,7 +246,7 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
     push('iframe exists but is NOT pointed at a desktop yet',
         !!iframe && iframe.getAttribute('src') === 'about:blank', iframe?.getAttribute('src'));
     push('no preview URL was composed client-side',
-        !Array.from(window.document.querySelectorAll('[src]')).some(el => el.getAttribute('src') === URL_OK));
+        !Array.from(window.document.querySelectorAll('[src]')).some(el => viewerURLMatches(el.getAttribute('src'))));
 
     const panel = $1(window, '.ezil-boot');
     push('boot panel is in the window body, not an iframe',
@@ -305,7 +320,7 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
 
     // Let the preview land.
     release_preview();
-    const swapped = await until(() => iframe.getAttribute('src') === URL_OK);
+    const swapped = await until(() => viewerURLMatches(iframe.getAttribute('src')));
     push('🔴 iframe is navigated only after previewUrl RESOLVED', !!swapped, iframe.getAttribute('src'));
     // 🔴 NOT `ready`. A resolved preview request plus a server-side frame
     // confirmation is REACHABILITY, and reachability is exactly what was true
@@ -331,6 +346,8 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
     push('🔴 a confirmed origin only triggers the SECOND question — did pixels arrive?',
         !!asked_display,
         JSON.stringify(seen.filter(r => r.url.includes('confirm=')).map(r => `${r.method} ${r.url}`)));
+    push('server watcher evidence alone does not reveal this viewer', !win.classList.contains('ezil-fullbleed'));
+    emitViewerFrames(window, iframe);
     const fullbled = await until(() => win.classList.contains('ezil-fullbleed'), 3000);
     push('🔴 full-bleed happens when the DISPLAY is observed streaming, not before', !!fullbled,
         win.className);
@@ -353,7 +370,7 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
     push('window is marked minimised',
         ['1', 'true'].includes(win.getAttribute('data-is_minimized')),
         win.getAttribute('data-is_minimized'));
-    push('the desktop kept running behind the minimise', iframe.getAttribute('src') === URL_OK);
+    push('the desktop kept running behind the minimise', viewerURLMatches(iframe.getAttribute('src')));
 
     // ── restore from the taskbar, then close ───────────────────────────────
     window.$('.taskbar-item[data-app="desktop"]').trigger('click');
@@ -557,7 +574,7 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
     }, 50);
 
     const iframe = await until(() => $1(window, '.window[data-app="desktop"] .window-app-iframe'), 10_000);
-    const booted = await until(() => iframe?.getAttribute('src') === URL_OK, 20_000);
+    const booted = await until(() => viewerURLMatches(iframe?.getAttribute('src')), 20_000);
     clearInterval(watcher);
 
     push('🔴 a container that answers "still waking" is asked again, and boots',
@@ -609,7 +626,7 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
 
     const win = await until(() => $1(window, '.window[data-app="desktop"]'));
     const iframe = await until(() => $1(window, '.window[data-app="desktop"] .window-app-iframe'));
-    await until(() => iframe?.getAttribute('src') === URL_OK, 8_000);
+    await until(() => viewerURLMatches(iframe?.getAttribute('src')), 8_000);
 
     push('🔴 an unconfirmed handoff is PROGRESS, not "Your desktop isn\'t answering"',
         $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'progress',
@@ -619,6 +636,7 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
         `actions hidden=${$1(window, '.ezil-boot-actions')?.hidden}`);
 
     iframe.dispatchEvent(new window.Event('load'));
+    emitViewerFrames(window, iframe);
     const revealed = await until(() => win.classList.contains('ezil-fullbleed'), 10_000);
     push('🔴 ...and the browser\'s own confirmation still carries it all the way to ready',
         !!revealed && $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'ready',
@@ -636,7 +654,7 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
         }
         if (url.includes('confirm=frame')) return { ok: true, confirmed: false };
         if (url.includes('confirm=display')) return { ok: true, display: 'live' };
-        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
+        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: false };
         return { ok: true };
     });
     await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
@@ -644,7 +662,7 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
 
     const win = await until(() => $1(window, '.window[data-app="desktop"]'));
     const iframe = await until(() => $1(window, '.window[data-app="desktop"] .window-app-iframe'));
-    await until(() => iframe?.getAttribute('src') === URL_OK, 8_000);
+    await until(() => viewerURLMatches(iframe?.getAttribute('src')), 8_000);
     iframe.dispatchEvent(new window.Event('load'));
 
     const failed = await until(
@@ -864,8 +882,7 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
 // ───────────────────────────────────────────────────────────────────────────
 /** Past `DISPLAY_BLANK_DEADLINE_MS` (45s) with room for jsdom's scheduler. */
 const BLANK_WAIT_MS = 55_000;
-/** Past `DISPLAY_UNVERIFIED_DEADLINE_MS` (6s), and nowhere near the blank one. */
-const UNVERIFIED_WAIT_MS = 12_000;
+// Missing viewer frames have the same bounded deadline as blank frames.
 
 /**
  * Boot a shell whose `confirm=display` answers `answer`, drive it to the point
@@ -879,7 +896,7 @@ const UNVERIFIED_WAIT_MS = 12_000;
  * a request that never comes back at all, which is what a degraded probe
  * actually looks like from the browser.
  */
-async function boot_to_display_gate (answer) {
+async function boot_to_display_gate (answer, { framesAtMs } = {}) {
     let t_nav = 0;
     const say = () => (typeof answer === 'function' ? answer(Date.now() - (t_nav || Date.now())) : answer);
     const { window, seen } = boot_shell(async (url, init) => {
@@ -907,9 +924,10 @@ async function boot_to_display_gate (answer) {
     await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
     open_desktop(window);
     const iframe = await until(() => $1(window, '.window[data-app="desktop"] .window-app-iframe'));
-    await until(() => iframe?.getAttribute('src') === URL_OK);
+    await until(() => viewerURLMatches(iframe?.getAttribute('src')));
     iframe.dispatchEvent(new window.Event('load'));
     await until(() => seen.some(r => r.url.includes('confirm=display')), 4000);
+    if (Number.isFinite(framesAtMs)) window.setTimeout(() => emitViewerFrames(window, iframe), framesAtMs);
     return { window, seen, nav_at: () => t_nav };
 }
 
@@ -961,35 +979,18 @@ async function boot_to_display_gate (answer) {
     await window.$(win).close();
 }
 
-// ── Scenario 7 — we cannot tell: shown, but never called ready ──────────────
+// ── Scenario 7 — unknown server evidence cannot establish viewer readiness ──
 {
     const { window } = await boot_to_display_gate(undefined);
     const win = $1(window, '.window[data-app="desktop"]');
-
-    const revealed = await until(() => win.classList.contains('ezil-fullbleed'), UNVERIFIED_WAIT_MS);
-    push('🔴 an unanswerable probe still REVEALS the desktop (no regression)',
-        !!revealed, win.className);
-    push('the boot panel is retired, so the desktop is genuinely usable',
-        $1(window, '.ezil-boot')?.hidden === true);
-
-    const notice = $1(window, '.ezil-display-notice');
-    push('🔴 but the user is TOLD we could not check it', notice?.hidden === false,
-        `notice hidden=${String(notice?.hidden)}`);
-    push('🔴 in EZiL copy that never says "ready"',
-        $1(window, '.ezil-display-notice-title')?.textContent === "We couldn't check your display"
-        && ($1(window, '.ezil-display-notice-body')?.textContent ?? '')
-            .includes("couldn't confirm it's actually showing"),
-        `${$1(window, '.ezil-display-notice-title')?.textContent}`);
-    push('🔴 with its own Retry', !!$1(window, '.ezil-display-notice-retry'));
-    push('the panel itself never claimed ready either',
-        $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'ready_unverified',
-        $1(window, '.ezil-boot')?.getAttribute('data-kind'));
-    push('and the notice does not cover the desktop it is annotating',
-        notice?.className === 'ezil-display-notice', notice?.className);
-
-    window.$($1(window, '.ezil-display-notice-dismiss')).trigger('click');
-    push('dismissing it leaves the desktop alone',
-        notice?.hidden === true && win.classList.contains('ezil-fullbleed'));
+    const failed = await until(() => $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'failed', BLANK_WAIT_MS);
+    push('unknown server evidence without viewer frames ends in bounded failure', !!failed);
+    push('missing-frame failure preserves the taskbar and keeps the viewer windowed',
+        !win.classList.contains('ezil-fullbleed') && window.$('.taskbar').css('display') !== 'none');
+    push('missing-frame failure offers Retry', !!$1(window, '.ezil-boot-retry')
+        && $1(window, '.ezil-boot-actions')?.hidden === false);
+    push('no unverified readiness or display notice is claimed',
+        $1(window, '.ezil-display-notice')?.hidden === true);
     await window.$(win).close();
 }
 
@@ -1010,7 +1011,7 @@ async function boot_to_display_gate (answer) {
 {
     const CONNECTS_AT_MS = 25_000;
     const { window, seen } = await boot_to_display_gate(
-        (age) => (age < CONNECTS_AT_MS ? 'blank' : 'live'));
+        (age) => (age < CONNECTS_AT_MS ? 'blank' : 'live'), { framesAtMs: CONNECTS_AT_MS });
     const win = $1(window, '.window[data-app="desktop"]');
 
     const revealed = await until(() => win.classList.contains('ezil-fullbleed'), BLANK_WAIT_MS);
@@ -1040,52 +1041,23 @@ async function boot_to_display_gate (answer) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Scenario 9 — A DEGRADED PROBE MUST NOT COST EVERY USER 20 SECONDS
-//
-// Measured before this wave: when the probe could not answer, settle went from
-// 7s to 29.7s. The desktop was revealed in the end — correctly — but the gate
-// polled to its 20s deadline first, and it only TESTED that deadline after an
-// ask came back, so each hung ask burned `session.js`'s 12s budget on the way.
-// Every user of a degraded deployment waited half a minute to be shown a
-// desktop that had been working the whole time.
-//
-// 🔴 The probe here HANGS — the request never resolves, and jsdom has no
-// `AbortSignal.timeout` to rescue it. So this measures the gate's own clock and
-// nothing else: if the reveal is not driven by a timer, it never happens.
+// Scenario 9 — a hung server probe cannot hold the viewer forever
+// The request never resolves; the independent viewer deadline must still fire.
 // ───────────────────────────────────────────────────────────────────────────
 {
     const t0 = Date.now();
     const { window } = await boot_to_display_gate('hang');
     const win = $1(window, '.window[data-app="desktop"]');
-
-    const revealed = await until(() => win.classList.contains('ezil-fullbleed'), UNVERIFIED_WAIT_MS);
-    const took = Date.now() - t0;
-    push('🔴 a probe that never answers AT ALL still reveals the desktop', !!revealed, win.className);
-    push('🔴 ...and it does so on the UNVERIFIED deadline (6s), not the blank one (45s)',
-        !!revealed && took < 12_000, `${took}ms from boot`);
-    push('🔴 it is `ready_unverified` — never `ready`, never `failed`',
-        $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'ready_unverified',
-        $1(window, '.ezil-boot')?.getAttribute('data-kind'));
-    push('and the user is told, in EZiL copy, that we could not check',
-        $1(window, '.ezil-display-notice')?.hidden === false
-        && $1(window, '.ezil-display-notice-title')?.textContent === "We couldn't check your display");
+    const failed = await until(() => $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'failed', BLANK_WAIT_MS);
+    push('a hung probe without viewer frames ends in bounded failure', !!failed, `${Date.now() - t0}ms`);
+    push('hung probe cannot claim readiness or reveal an unverified viewer', !win.classList.contains('ezil-fullbleed'));
+    push('hung-probe failure offers Retry', $1(window, '.ezil-boot-actions')?.hidden === false);
     await window.$(win).close();
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Scenario 11 — A MEMORY OF A BLANK IS NOT AN OBSERVATION OF ONE
-//
-// The gate used to latch a boolean the first time it understood an answer, and
-// spend it at the deadline however old it had become. So: one `blank` while the
-// peer was still negotiating — which is EXPECTED, and means nothing — and then
-// a probe that goes silent, and forty-four seconds later the desktop is hidden
-// on evidence from the first second of the boot.
-//
-// 🔴 This also pins the timer that gets us out at all. Once a well-formed
-// answer has been seen there is deliberately no unverified escape hatch (the
-// user is then waiting on their desktop, not on our plumbing), so if the blank
-// deadline were only tested when an ask RETURNED, an ask that never returns
-// would hold this boot open forever. It answers once, then hangs.
+// Scenario 11 — stale blank evidence cannot substitute for viewer frames
+// One answer followed by a hung probe must still reach the independent deadline.
 // ───────────────────────────────────────────────────────────────────────────
 {
     let answered = false;
@@ -1095,19 +1067,10 @@ async function boot_to_display_gate (answer) {
         return 'blank';
     });
     const win = $1(window, '.window[data-app="desktop"]');
-
-    const settled = await until(
-        () => win.classList.contains('ezil-fullbleed')
-            || $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'failed',
-        BLANK_WAIT_MS);
-    push('🔴 a boot whose probe answered once and then died still settles',
-        !!settled, `${win.className} panel=${$1(window, '.ezil-boot')?.getAttribute('data-kind')}`);
-    push('🔴 ...and it does NOT hide the desktop on a 45-second-old `blank`',
-        $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'ready_unverified'
-        && win.classList.contains('ezil-fullbleed'),
-        $1(window, '.ezil-boot')?.getAttribute('data-kind'));
-    push('the user is told we could not check, which is the true statement',
-        $1(window, '.ezil-display-notice')?.hidden === false);
+    const failed = await until(() => $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'failed', BLANK_WAIT_MS);
+    push('a probe that answered once then died still settles without viewer frames', !!failed);
+    push('stale blank evidence never reveals an unverified desktop', !win.classList.contains('ezil-fullbleed'));
+    push('the missing-frame deadline offers Retry', $1(window, '.ezil-boot-actions')?.hidden === false);
     await window.$(win).close();
 }
 
@@ -1140,13 +1103,13 @@ async function boot_to_display_gate (answer) {
         // ...while Neko cheerfully reports a watcher. Only one of these two can
         // open the gate, and it is not this one.
         if (url.includes('confirm=display')) return { ok: true, display: 'live' };
-        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: true };
+        if (url.startsWith('/api/shell/desktop')) return { ok: true, guacamoleRunning: false };
         return { ok: true };
     });
     await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
     open_desktop(window);
     const iframe = await until(() => $1(window, '.window[data-app="desktop"] .window-app-iframe'));
-    await until(() => iframe?.getAttribute('src') === URL_OK);
+    await until(() => viewerURLMatches(iframe?.getAttribute('src')));
     iframe.dispatchEvent(new window.Event('load'));
 
     const win = await until(() => $1(window, '.window[data-app="desktop"]'));
@@ -1400,18 +1363,12 @@ async function boot_to_display_gate (answer) {
     push('🔴 the display gate RESUMES asking the moment the tab is visible again', !!resumed,
         `${asks_while_hidden} -> ${seen.filter((r) => r.url.includes('confirm=display')).length}`);
 
-    // 🔴 THE DEADLINE ITSELF IS UNCHANGED. The gate has now spent real wall
-    // clock time both hidden and visible; `DISPLAY_UNVERIFIED_DEADLINE_MS`
-    // (6s) was never paused by the visibility toggle above, so by now — well
-    // past 6s of real elapsed time since `boot_to_display_gate` navigated —
-    // the gate must already have revealed the desktop UNVERIFIED, exactly as
-    // Scenario 7 proves in isolation. If pausing the PERIODIC re-ask had
-    // accidentally paused this deadline too, the desktop would still be
-    // hidden here.
-    push('🔴 the UNVERIFIED deadline itself kept running the whole time — untouched by the pause',
-        win.classList.contains('ezil-fullbleed')
-        && $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'ready_unverified',
-        `fullbleed=${win.classList.contains('ezil-fullbleed')} kind=${$1(window, '.ezil-boot')?.getAttribute('data-kind')}`);
+    // Visibility pauses only polling, never the independent missing-frame deadline.
+    Object.defineProperty(window.document, 'visibilityState', { value: 'hidden', configurable: true });
+    window.document.dispatchEvent(new window.Event('visibilitychange'));
+    const failed = await until(() => $1(window, '.ezil-boot')?.getAttribute('data-kind') === 'failed', BLANK_WAIT_MS);
+    push('the missing-frame deadline still fires while the tab is hidden',
+        !!failed && !win.classList.contains('ezil-fullbleed'));
 
     await window.$(win).close();
 }
@@ -1460,7 +1417,7 @@ async function boot_to_display_gate (answer) {
     await until(() => $1(window, '.taskbar-item[data-app="desktop"]'));
     open_desktop(window);
     const iframe = await until(() => $1(window, '.window[data-app="desktop"] .window-app-iframe'));
-    await until(() => iframe?.getAttribute('src') === URL_OK);
+    await until(() => viewerURLMatches(iframe?.getAttribute('src')));
     iframe.dispatchEvent(new window.Event('load'));
     await until(() => display_asks === 1 && release_display !== null);
     push('the display gate has exactly one ask IN FLIGHT',

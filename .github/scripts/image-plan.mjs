@@ -8,8 +8,9 @@ export function imagePlan(sha, tree) {
   const hash = (...parts) => createHash('sha256').update(parts.join('\0')).digest('hex');
   // Tree objects include paths, modes and content; overlay also includes its base inputs.
   const base = hash('base-v1', tree('docker/neko'), tree('.github/scripts/image-plan.mjs'), tree('.github/scripts/build-images.sh'));
-  const overlay = hash('overlay-v1', base, tree('worker/assets/neko-branding'));
-  return { source: sha, base: `ghcr.io/ezilhq/ezil-neko-vscode:base-${base}`,
+  const continuity = hash('continuity-v1', tree('worker/neko'));
+  const overlay = hash('overlay-v2', base, continuity, tree('worker/assets/neko-branding'));
+  return { source: sha, continuity: `ghcr.io/ezilhq/ezil-neko-continuity:sha-${continuity}`, base: `ghcr.io/ezilhq/ezil-neko-vscode:base-${base}`,
     overlay: `ghcr.io/ezilhq/ezil-neko-vscode:overlay-${overlay}`,
     desktop: `ghcr.io/ezilhq/ezil-os-desktop:sha-${sha}` };
 }

@@ -68,7 +68,7 @@ jobs:
           cosign-release: 'v2.4.3'
       - name: Sign tested image identities
         run: |
-          for kind in base overlay desktop; do
+          for kind in continuity base overlay desktop; do
             ref="$(jq -er --arg key "$kind" '.[$key]' published-images.json)"
             digest="$(jq -er --arg key "${kind}_digest" '.[$key]' published-images.json)"
             cosign sign --yes "${ref%:*}@$digest"
@@ -79,6 +79,13 @@ jobs:
         with:
           subject-name: ghcr.io/ezilhq/ezil-os-desktop
           subject-digest: ${{ steps.build.outputs.desktop_digest }}
+          push-to-registry: true
+      - name: Attest pinned Neko continuity provenance
+        if: steps.build.outputs.continuity_built == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/ezilhq/ezil-neko-continuity
+          subject-digest: ${{ steps.build.outputs.continuity_digest }}
           push-to-registry: true
       - name: Attest base provenance
         if: steps.build.outputs.base_built == 'true'

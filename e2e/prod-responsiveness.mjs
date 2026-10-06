@@ -1,3 +1,4 @@
+import { signIn } from './sign-in.mjs';
 /**
  * prod-responsiveness.mjs — the responsiveness tier, against the LIVE
  * deployment.
@@ -31,6 +32,7 @@
 
 import { createRequire } from 'node:module';
 import { APP, configureAppContext } from './deployed-target.mjs';
+import { verifySelectedComputer } from './isolated-computer.mjs';
 import path from 'node:path';
 import { observeScreenResizes, waitForDesktopResize } from './desktop-resize-ready.mjs';
 
@@ -68,13 +70,9 @@ async function openDesktop(ctx) {
   const resizes = observeScreenResizes(p, APP);
   try {
     await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
-    await p.fill('#email', EMAIL); await p.fill('#password', PASS);
-    await Promise.all([
-      p.waitForURL(u => !/\/login/.test(u.toString()), { timeout: 60000 }).catch(() => {}),
-      p.locator('form').filter({ has: p.locator('#email') }).locator('button[type=submit]').click(),
-    ]);
-    if (/\/login/.test(p.url())) return { p, err: 'sign-in did not leave /login' };
+    await signIn(p, { email: EMAIL, password: PASS });
     await p.goto(`${APP}/os`, { waitUntil: 'domcontentloaded' });
+    await verifySelectedComputer(p);
     await p.waitForTimeout(3500);
     try { await p.locator('.taskbar-item').filter({ hasText: /browser/i }).first().click({ timeout: 12000 }); }
     catch { await p.locator('.taskbar-item').nth(1).click({ timeout: 12000 }).catch(() => {}); }

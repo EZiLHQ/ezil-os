@@ -381,7 +381,7 @@ describe('neko-logs: the writers this route actually exposes are enumerated', ()
     // every line, same as for every other writer here.
     const known = new Set([
       'log()', 'echo', 'if', 'Xvfb', 'openbox', 'setsid', '--capture.video.display',
-      '_screen_has_pixels', '--install-extension',
+      '_screen_has_pixels', '--install-extension', 'ezil_editor_restore_extensions',
     ]);
     for (const w of writers) expect(known.has(w)).toBe(true);
   });

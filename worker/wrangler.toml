@@ -314,6 +314,7 @@ name = "ezil-os-worker-staging"
 workers_dev = true
 
 [env.staging.vars]
+SANDBOX_NEKO_TURN_TTL_SECONDS = "300"
 SANDBOX_PREVIEW_ZONE_ROOT = "ezil.work"
 SANDBOX_DEFAULT_DESKTOP_MODE = "neko"
 SANDBOX_NEKO_ICE_POLICY = "relay"

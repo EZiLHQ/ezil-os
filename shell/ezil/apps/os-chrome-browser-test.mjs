@@ -138,7 +138,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const FAKE_STREAM = `<!doctype html><html><head><style>
  html,body{margin:0;height:100%;background:#000;display:flex;align-items:center;justify-content:center}
  .scr{width:min(100vw,calc(100vh * 16 / 9));height:min(100vh,calc(100vw * 9 / 16));background:#14484c}
-</style></head><body><div class="scr"></div></body></html>`;
+</style></head><body><div class="scr"></div><script>
+// Media transport is a fixture; each document reports its own frame progress.
+let framesDecoded = 0;
+setInterval(() => {
+  framesDecoded++;
+  parent.postMessage({ source: 'ezil-mobile', type: 'stream_vitals',
+    attempt: new URL(location.href).searchParams.get('ezilAttempt'),
+    vitals: { connectionState: 'connected', framesDecoded, bytesReceived: framesDecoded * 100,
+      width: 1280, height: 720 } }, location.origin);
+}, 100);
+</script></body></html>`;
 
 const browser = await chromium.launch();
 let anyHardFailure = false;
@@ -244,7 +254,15 @@ async function boot (viewport = { width: 1440, height: 900 }, { frameOk = true }
     // this same dock item. Done here rather than per scenario so there is one
     // place that decides what "a booted shell" means for this file.
     await page.evaluate(() => { $('.taskbar-item[data-app="desktop"]').trigger('click'); });
-    await sleep(1600);
+    if ( frameOk ) {
+        // Full-bleed follows decoded-frame evidence from this viewer. Waiting
+        // for that transition prevents a late boot from hiding the titlebar
+        // after the geometry scenario has already restored the window.
+        await page.waitForSelector('.window[data-app="desktop"].ezil-fullbleed', { timeout: 30_000 });
+    } else {
+        // The refused-frame scenario intentionally never reaches readiness.
+        await sleep(1600);
+    }
     return { page, page_errors };
 }
 
@@ -269,7 +287,7 @@ async function leaveFullbleed (page) {
     });
     await sleep(300);
     await page.evaluate(() => { $('.taskbar-item[data-app="desktop"]').trigger('click'); });
-    await sleep(300);
+    await page.waitForSelector('.window[data-app="desktop"].ezil-fullbleed', { timeout: 10_000 });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -712,7 +730,7 @@ async function scenarioStreamFit () {
         const dr = d?.getBoundingClientRect();
         return {
             bodyW: Math.round(br.width), bodyH: Math.round(br.height),
-            bodyBottom: Math.round(br.bottom),
+            bodyTop: Math.round(br.top),
             drawerTop: dr ? Math.round(dr.top) : null,
             drawerBottom: dr ? Math.round(dr.bottom) : null,
             frameW: Math.round(fr.width), frameH: Math.round(fr.height),
@@ -734,7 +752,7 @@ async function scenarioStreamFit () {
     const fb = await measure();
     push(`${L} setup: full-bleed stream has a reserved control strip`,
         !! fb && fb.bodyW === 1400 && fb.bodyH > 900 && fb.bodyH < 1000
-        && fb.drawerTop >= fb.bodyBottom && fb.drawerBottom <= 1000,
+        && fb.drawerTop >= 0 && fb.drawerBottom <= fb.bodyTop,
         JSON.stringify(fb));
     push(`${L} G10 full-bleed: the stream's box is 16:9, not the viewport's 1.4:1`,
         !! fb && Math.abs(fb.frameAspect - 16 / 9) < 0.01, JSON.stringify(fb));

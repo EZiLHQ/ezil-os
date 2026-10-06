@@ -233,6 +233,17 @@ const css = fs.readFileSync(`${OS}/bundle.min.css`, 'utf8');
 const BREAK_BOX_MODEL = process.env.RESIZE_TEST_BREAK_BOX_MODEL === '1';
 const HOST = 'https://ezil-resize-test.invalid';
 const HOST_HOSTNAME = new URL(HOST).hostname;
+// Layout fixtures provide current-navigation counters; service liveness alone
+// cannot reveal a desktop. Hosted acceptance supplies real WebRTC statistics.
+const VIEWER_HTML = `<!doctype html><html><body style="background:#161616"><script>
+const attempt = new URL(location.href).searchParams.get('ezilAttempt');
+let count = 0;
+function report() { count++; parent.postMessage({ source:'ezil-mobile', type:'stream_vitals', attempt,
+    vitals:{ connectionState:'connected', bytesReceived:count*100, framesDecoded:count, width:1280, height:720 } }, '*'); }
+addEventListener('message', e => { if (e.source === parent && e.data?.type === 'viewer_probe') report(); });
+setInterval(report, 100);
+</script></body></html>`;
+
 const DOC_HTML = BREAK_BOX_MODEL
     ? `<!doctype html><html><head><style>${css}</style></head>
        <body class="min-h-full flex flex-col"><div id="ezil-os-root"><div id="ezil-os-root-inner"></div></div></body></html>`
@@ -262,7 +273,7 @@ const listRows = [{
 }];
 function stub (url, method) {
     if ( url.includes('/api/shell/desktop') && method === 'POST' ) {
-        return { ok: true, guacamoleUrl: 'about:blank?desktop-frame=1', controlMode: 'interactive', mode: 'neko', frame: { confirmed: true } };
+        return { ok: true, guacamoleUrl: `${HOST}/desktop-frame`, controlMode: 'interactive', mode: 'neko', frame: { confirmed: true } };
     }
     if ( url.includes('confirm=frame') ) return { ok: true, confirmed: true };
     if ( url.includes('/api/shell/desktop') ) return { ok: true, guacamoleRunning: true };
@@ -310,6 +321,7 @@ const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 await page.route('**/*', async (route) => {
     const req = route.request();
     const url = req.url();
+        if (new URL(url).pathname === '/desktop-frame') return route.fulfill({status:200,contentType:'text/html',body:VIEWER_HTML});
     if ( url === `${HOST}/os` ) return route.fulfill({ status: 200, contentType: 'text/html', body: DOC_HTML });
     if ( url.includes('/api/') ) {
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(stub(url, req.method())) });

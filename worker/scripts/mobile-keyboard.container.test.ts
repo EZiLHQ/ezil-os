@@ -164,6 +164,7 @@ import { afterAll, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import { localIceEnvFor } from '../../local/src/container/run-spec';
 
 /**
  * See the file header ("M1 — the honest-skip fix"): `EZIL_VALIDATE_IMAGE` is
@@ -201,6 +202,7 @@ function installCleanupOnExit() {
 installCleanupOnExit();
 const PORT = 18291;
 const SIDECAR_PORT = 18292;
+const MUX_PORT = 18293;
 const PAGE_PORT = 3112;   // served INSIDE the container
 const BOOT_TIMEOUT_MS = 240_000;
 
@@ -236,6 +238,16 @@ const PW_RESOLVE = `
           process.exit(2);
         }
       }`;
+
+// ICE connectivity can precede DTLS/SCTP readiness. Input requires the real
+// channel to be open; a fixed delay or client.connected alone cannot prove it.
+const WAIT_FOR_INPUT = `
+      await p.waitForSelector('textarea.overlay', { timeout: 60_000 });
+      await p.waitForFunction(() => {
+        const client = window.$client;
+        return client?.connected && client._peer?.connectionState === 'connected'
+          && client._channel?.readyState === 'open';
+      }, null, { timeout: 60_000 });`;
 
 /**
  * Whether `playwright` is reachable AT ALL — from this bun process's own
@@ -318,7 +330,9 @@ function boot(): void {
   sh('docker', ['rm', '-f', CONTAINER]);
   const run = sh('docker', [
     'run', '-d', '--name', CONTAINER, '--cpus=2',
-    '-p', `${PORT}:8181`, '-p', `${SIDECAR_PORT}:9223`,
+    '-p', `127.0.0.1:${PORT}:8181`, '-p', `127.0.0.1:${SIDECAR_PORT}:9223`,
+    '-p', `127.0.0.1:${MUX_PORT}:${MUX_PORT}/udp`, '-p', `127.0.0.1:${MUX_PORT}:${MUX_PORT}/tcp`,
+    ...Object.entries(localIceEnvFor(MUX_PORT)).flatMap(([key, value]) => ['-e', `${key}=${value}`]),
     '-e', 'DESKTOP_MODE=neko',
     // ON: the end-to-end checks read the remote page back through it, which is
     // the only way to assert the TEXT rather than a frame count.
@@ -384,12 +398,12 @@ async function framesFor(scenario: string): Promise<{ keydown: number; keyup: nu
         userAgent:'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36' });
       const p = await ctx.newPage();
       await p.goto('http://127.0.0.1:${PORT}/?usr=EZiL&pwd=s1user&embed=1',{waitUntil:'domcontentloaded'});
-      await p.waitForSelector('textarea.overlay',{timeout:60000}).catch(()=>{});
-      await p.waitForTimeout(7000);
+      ${WAIT_FOR_INPUT}
       await p.evaluate(() => {
         window.__sent = { keydown: 0, keyup: 0 };
         const orig = RTCDataChannel.prototype.send;
         RTCDataChannel.prototype.send = function (data) {
+          const sent = orig.apply(this, arguments);
           try {
             const buf = data instanceof ArrayBuffer ? new Uint8Array(data)
               : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
@@ -398,7 +412,7 @@ async function framesFor(scenario: string): Promise<{ keydown: number; keyup: nu
               else if (buf[0] === 0x04) window.__sent.keyup++;
             }
           } catch (e) {}
-          return orig.apply(this, arguments);
+          return sent;
         };
       });
       const out = await p.evaluate(async () => {
@@ -454,8 +468,7 @@ async function remoteTextAfter(sequence: string): Promise<string> {
         userAgent:'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36' });
       const p = await ctx.newPage();
       await p.goto('http://127.0.0.1:${PORT}/?usr=EZiL&pwd=s1user&embed=1',{waitUntil:'domcontentloaded'});
-      await p.waitForSelector('textarea.overlay',{timeout:60000}).catch(()=>{});
-      await p.waitForTimeout(8000);
+      ${WAIT_FOR_INPUT}
       await p.evaluate(async () => {
         const ta = document.querySelector('textarea.overlay'); ta.focus();
         const K=(t,i)=>ta.dispatchEvent(new KeyboardEvent(t,Object.assign({bubbles:true},i)));
@@ -609,7 +622,7 @@ describe('the soft keyboard types each character exactly once', () => {
           userAgent:'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36' });
         const p = await ctx.newPage();
         await p.goto('http://127.0.0.1:${PORT}/?usr=EZiL&pwd=s1user&embed=1',{waitUntil:'domcontentloaded'});
-        await p.waitForTimeout(9000);
+        ${WAIT_FOR_INPUT}
         console.log(JSON.stringify(await p.evaluate(() => {
           const out = [];
           for (const el of document.querySelectorAll('#ezil-kbd-btn, .fa-keyboard, [class*="keyboard"]')) {

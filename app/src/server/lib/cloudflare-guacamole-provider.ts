@@ -99,6 +99,11 @@ const SANDBOX_COLD_START_TIMEOUT_MS = WORKER_DESKTOP_READY_TIMEOUT_MS + CLIENT_T
  */
 export const SANDBOX_WAKE_ANSWER_BUDGET_MS = 12_000;
 
+// Stop includes atomic editor capture, workspace/system checkpoints and
+// confirmed teardown. Keep the forwarding budget within the 300s shell route
+// ceiling; the previous 10s timeout cut healthy persistence work off mid-stop.
+export const SANDBOX_STOP_TIMEOUT_MS = 270_000;
+
 /** The race sentinel. A unique object, so nothing off the wire can impersonate it. */
 const WAKE_STILL_RUNNING = Symbol('sandbox_wake_still_running');
 
@@ -197,6 +202,7 @@ export interface GuacamolePreviewRequest {
 }
 
 export interface GuacamolePreviewSuccess {
+    relay?: { runtimeId: string; expiresAt: number };
     ok: true;
     guacamoleUrl: string;
     expiresAt: number;
@@ -682,7 +688,7 @@ export async function requestGuacamoleSandboxTerminate(
         const res = await fetch(`${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}`, {
             method: 'DELETE',
             headers: { Authorization: `Bearer ${token}`, [CORRELATION_HEADER]: correlationId },
-            signal: AbortSignal.timeout(10_000),
+            signal: AbortSignal.timeout(SANDBOX_STOP_TIMEOUT_MS),
         });
 
         // The Worker answers `still_running`/`destroy_failed` as HTTP 500 (see
@@ -3044,4 +3050,23 @@ export function classifyScreenFailure(status: number, workerError: string): Scre
     if (status === 401 || status === 403 || status === 404) return 'NOT_FOUND';
     if (status === 408 || status === 504) return 'TIMEOUT';
     return 'UPSTREAM';
+}
+
+export type RelayRefreshResult = { ok: true; runtimeId: string; expiresAt: number } | { ok: false; error: string };
+/** Uses the same signed Worker boundary as all computer controls. */
+export async function requestRelayRefresh(config: CloudflareGuacamoleConfig, hmacSecret: string,
+    sandboxName: string, correlationId: string, runtimeId?: string): Promise<RelayRefreshResult> {
+    const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/relay-refresh`;
+    try {
+        const response = await fetch(endpoint, {
+            method: runtimeId ? 'POST' : 'GET',
+            headers: { Authorization: `Bearer ${mintSandboxPreviewToken(hmacSecret)}`, 'Content-Type': 'application/json', [CORRELATION_HEADER]: correlationId },
+            ...(runtimeId ? { body: JSON.stringify({ runtimeId }) } : {}),
+            signal: AbortSignal.timeout(30_000), cache: 'no-store',
+        });
+        const data = await response.json() as Partial<{ ok: boolean; runtimeId: string; expiresAt: number; error: string }>;
+        if (!response.ok || data.ok !== true) return { ok: false, error: typeof data.error === 'string' ? data.error : 'relay_refresh_failed' };
+        if (typeof data.runtimeId !== 'string' || !/^[a-f0-9]{32}$/.test(data.runtimeId) || typeof data.expiresAt !== 'number' || !Number.isSafeInteger(data.expiresAt)) return { ok: false, error: 'relay_metadata_invalid' };
+        return { ok: true, runtimeId: data.runtimeId, expiresAt: data.expiresAt };
+    } catch { return { ok: false, error: 'relay_refresh_unavailable' }; }
 }

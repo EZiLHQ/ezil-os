@@ -123,6 +123,8 @@ interface FakeOptions {
   listFilesThrows?: boolean;
   /** Make the R2 `put` reject, so the flush reports a real failure. */
   bucketPutThrows?: boolean;
+  editorCaptureFails?: boolean;
+  physicalWorkspaceMissing?: boolean;
   /** Seed values for DO storage. */
   storage?: Record<string, unknown>;
 }
@@ -207,7 +209,17 @@ async function makeFake(opts: FakeOptions = {}): Promise<FakeDO & Record<string,
     destroy: async () => void calls.destroys++,
     exec: async (command: string) => {
       calls.execs.push(command);
+      if (command.startsWith('bash /usr/local/bin/editor-state.sh capture ')) {
+        return { exitCode: opts.editorCaptureFails ? 1 : 0, stdout: '' };
+      }
       if (command.startsWith('python3 ')) {
+        if (command.includes('"op":"hydration-state"')) {
+          if (opts.listFilesThrows) throw new Error('physical observation unavailable');
+          return { exitCode: opts.physicalWorkspaceMissing ? 4 : 0, stdout: '' };
+        }
+        if (command.includes('"op":"check"') && opts.physicalWorkspaceMissing) {
+          return { exitCode: 4, stdout: '' };
+        }
         if (command.includes('"op":"capture"')) {
           if (opts.listFilesThrows) throw new Error('container RPC failed: connection reset');
           const sha256 = createHash('sha256').update('hello').digest('hex');
@@ -594,6 +606,24 @@ describe('preserved invariant: the alarm never bumps LAST_ACTIVITY_AT_KEY', () =
 describe('preserved invariant: final flush before stop, and stop only if it worked', () => {
   const idleStorage = () => hydratedStorage({ [LAST_ACTIVITY_AT_KEY]: Date.now() - 2 * IDLE_STOP_MS });
 
+  it('captures editor settings before snapshot creation and refuses stop when capture fails', async () => {
+    const fake = await makeFake({ storage: idleStorage(), editorCaptureFails: true });
+    await runAlarmCycle(fake);
+    expect(fake.calls.execs.some(c => c.startsWith('bash /usr/local/bin/editor-state.sh capture '))).toBe(true);
+    expect(fake.calls.execs.some(c => c.startsWith('python3 ') && c.includes('"op":"capture"'))).toBe(false);
+    expect(fake.calls.r2Puts).toEqual([]);
+    expect(fake.calls.stops).toBe(0);
+    expect(fake.calls.scheduled.length).toBeGreaterThan(0);
+
+    const ok = await makeFake({ storage: idleStorage() });
+    await runAlarmCycle(ok);
+    const editor = ok.calls.execs.findIndex(c => c.startsWith('bash /usr/local/bin/editor-state.sh capture '));
+    const snapshot = ok.calls.execs.findIndex(c => c.startsWith('python3 ') && c.includes('"op":"capture"'));
+    expect(editor).toBeGreaterThan(-1);
+    expect(snapshot).toBeGreaterThan(editor);
+    expect(ok.calls.stops).toBe(1);
+  });
+
   it('an idle, quiet container is flushed and THEN stopped', async () => {
     const fake = await makeFake({
       storage: idleStorage(),
@@ -629,7 +659,7 @@ describe('preserved invariant: final flush before stop, and stop only if it work
     // The busy probe having run proves the idle branch really was taken, so
     // the surviving reschedule below is the idle-retry path rather than the
     // wrapper swallowing an early throw.
-    expect(fake.calls.execs.filter(c => !c.startsWith('python3 ')).length).toBe(1);
+    expect(fake.calls.execs.filter(c => !c.startsWith('python3 ') && !c.startsWith('bash /usr/local/bin/editor-state.sh')).length).toBe(1);
     expect(fake.calls.stops).toBe(0);
     expect(fake.calls.scheduled).toEqual([{ seconds: 10, callback: FLUSH_CALLBACK }]);
   });
@@ -681,6 +711,45 @@ describe('preserved invariant: idle-stop is NOT termination', () => {
 });
 
 describe('explicit termination requires a confirmed checkpoint', () => {
+  it('stops a physically unhydrated replacement after the cached hydration flag was cleared', async () => {
+    const fake = await makeFake({ storage: hydratedStorage({ [HYDRATED_KEY]: false }), physicalWorkspaceMissing: true });
+    const proto = await loadPrototype();
+    const base = Object.getPrototypeOf(proto); const original = base.destroy;
+    base.destroy = async function(this: typeof fake) {
+      this.calls.destroys++; this.ctx.container.running = false;
+    };
+    try {
+      expect(await proto.terminateSandbox.call(fake)).toMatchObject({ok:true,terminated:true,outcome:'destroyed'});
+      expect(fake.calls.r2Puts).toEqual([]);
+      expect(fake.calls.execs.some(c => c.startsWith('bash /usr/local/bin/editor-state.sh'))).toBe(false);
+    } finally { base.destroy = original; }
+  });
+  it('checks physical hydration before editor capture and never commits an empty replacement', async () => {
+    const fake = await makeFake({ storage: hydratedStorage(), physicalWorkspaceMissing: true, editorCaptureFails: true });
+    const proto = await loadPrototype();
+    const result = await proto.runWorkspaceFlush.call(fake, 'explicit' as never) as { skippedReason?: string };
+    expect(result.skippedReason).toBe('container_not_hydrated');
+    expect(fake.calls.execs.some(c => c.startsWith('bash /usr/local/bin/editor-state.sh'))).toBe(false);
+    expect(fake.calls.r2Puts).toEqual([]);
+    expect(storeOf(fake).get(HYDRATED_KEY)).toBe(false);
+  });
+  it('does not wake stopped containers for Code or screen requests, including queued traffic', async () => {
+    const fake = await makeFake({ running: true });
+    const proto = await loadPrototype();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const lock = proto.withRuntimeMutation as (this: unknown, op: () => Promise<unknown>) => Promise<unknown>;
+    const stop = lock.call(fake, async () => { await gate; fake.ctx.container.running = false; });
+    const forward = proto.runningContainerFetch as (this: unknown, url: string) => Promise<Response>;
+    const pending = forward.call(fake, 'http://127.0.0.1:8181/api/login');
+    release(); await stop;
+    expect((await pending).status).toBe(409);
+    const request = new Request('http://127.0.0.1:8443/', {
+      headers: { 'x-ezil-running-code': '1', 'cf-container-target-port': '8443', upgrade: 'websocket' },
+    });
+    expect((await (proto.fetch as (this: unknown, request: Request) => Promise<Response>).call(fake, request)).status).toBe(409);
+    expect(fake.calls.execs).toEqual([]);
+  });
   for (const options of [
     { bucketPutThrows: true, storage: hydratedStorage() },
     { listFilesThrows: true, storage: hydratedStorage() },
