@@ -52,28 +52,43 @@ It is never a side effect of another change.
 `.github/scripts/env-contract.mjs` (byte-identical in every repo, no dependencies) has three commands:
 
 - `check --repo <name>` validates the contract and the repo's `production-migrations.json` against the phase.
-- `scan --repo <name>` reads every `.github/workflows/*.yml` and refuses:
-  - production credential names, `secrets[...]`, `toJSON(secrets)`, migration `apply`/`rehearse`
-    and `supabase db push|reset` anywhere outside the repo's `productionJobs`, workflow-level env
-    included;
-  - `secrets: inherit` outside `secretInheritance`;
-  - a non-production job that names a production environment;
-  - a preview or production job whose `assert-job` step is missing, conditional
-    (`if:`/`continue-on-error`), binds secrets, or comes after the first step that uses a secret;
-  - a production job that binds a production credential at job level, or touches the database
-    before its assertion;
-  - a repo with no non-production job running `scan` itself.
+- `scan --repo <name>` reads every `.github/workflows/*.yml` and `.github/actions/**/action.yml`.
+  Matching ignores case and spacing. It refuses:
+  - production credential names, `secrets[...]`, `toJSON(secrets)`, migration `apply`/`rehearse`,
+    `supabase … db push|reset` and `supabase … migration up` anywhere outside the repo's
+    `productionJobs`, workflow-level env and composite actions included;
+  - `secrets: inherit` (quoted or commented) outside `secretInheritance`;
+  - a non-production job whose environment names production or is computed with `${{ }}`;
+  - a production job whose environment is not exactly `production`;
+  - YAML anchors, aliases, merge keys and backslash escapes in quoted values. These would let text
+    hide from the scanner, and no workflow here needs them;
+  - a preview or production job whose assertion is not exactly `run: <assert command>`, with only
+    `name`/`id` beside it (no `if:`, `continue-on-error`, `env`, `shell` or `|| true`);
+  - any step before the assertion other than `actions/checkout`, `actions/setup-node`,
+    `oven-sh/setup-bun` or `actions/download-artifact`;
+  - a production job that binds a production credential at job level;
+  - a repo with no unconditional non-production step that runs `scan` itself as a line of its own.
 - `assert-job --repo <name> --environment preview|production` is the runtime guard. Preview jobs
   refuse if any production credential name is set. Production jobs refuse pull-request events and refs
   outside `productionRefs`. `--repo` must match `GITHUB_REPOSITORY`.
 
-`repos.<name>` in the contract designates each repo's preview jobs, production jobs, the jobs allowed
-to inherit secrets (reusable-workflow callers on non-PR paths), and the refs production may run from.
+`repos.<name>` in the contract designates each repo's preview jobs, production jobs, the reusable-workflow
+callers allowed to `secrets: inherit`, and the refs production may run from. Some of those callers run on
+PRs (OS `preview.yml#images`); the called workflow is scanned like any other, so it still cannot name a
+production credential.
+
+Job-level secrets that are not production credentials, such as the Vercel and Cloudflare deploy tokens
+and the OS E2E fixtures, are allowed in preview and production jobs. Only production credential names
+are refused at job level, because those are the ones that reach a database.
+
+**Threat model.** These checks catch *accidental* preview-to-production wiring. A deliberate bypass is
+out of scope: commands assembled from variables, scripts the workflow calls, or a PR that edits the
+checker and its tests together. Review and branch protection stop those. `assert-job` accepts any event
+on an allowed ref, including `workflow_run` on `main`. The OS trust job is what admits that path.
 
 What in-repo checks cannot see: Vercel/Cloudflare runtime variables, repo-level secrets
 (`CLOUDFLARE_API_TOKEN`, `VERCEL_TOKEN`), the self-hosted runner's own environment and files,
-credentials under names not in `productionCredentialNames`, and a PR that edits the checker and its
-tests together. Branch protection with required checks and review on `.github/**` closes the last one.
+credentials under names not in `productionCredentialNames`, and GitHub-side environment branch policies.
 
 ## Credentials
 

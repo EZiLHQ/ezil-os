@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 // EZiL Universe environment contract checker (v1). Byte-identical in ezil-work, ezil-os and
 // ezil-ai-gateway; see docs/ENVIRONMENT-CONTRACT.md. No dependencies, never prints a secret value.
+// Threat model: accidental preview->production wiring. A deliberate bypass in a PR (which can also
+// edit this file) is out of scope here and is stopped by review and branch protection.
 //
 //   node .github/scripts/env-contract.mjs check --repo <name>
 //   node .github/scripts/env-contract.mjs scan --repo <name>
 //   node .github/scripts/env-contract.mjs assert-job --repo <name> --environment preview|production
 import { createHash } from 'node:crypto';
-import { readFileSync, readdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 export const PHASES = ['pre-cutover', 'post-cutover'];
@@ -89,8 +91,9 @@ export function checkJob(contract, repo, environment, env) {
     if (env.GITHUB_EVENT_NAME === 'pull_request' || env.GITHUB_EVENT_NAME === 'pull_request_target') {
       errors.push('production job must not run for a pull request');
     }
-    if (!refAllowed(ref, rules.productionRefs ?? [])) {
-      errors.push(`production job must run from ${rules.productionRefs.join(' or ')}, not ${ref || '(unset)'}`);
+    const refs = Array.isArray(rules.productionRefs) ? rules.productionRefs : [];
+    if (!refAllowed(ref, refs)) {
+      errors.push(`production job must run from ${refs.join(' or ') || '(no productionRefs)'}, not ${ref || '(unset)'}`);
     }
   } else {
     errors.push(`unknown environment ${environment}`);
@@ -121,28 +124,37 @@ export function outline(text) {
   return root;
 }
 const render = (node) => [node.line, ...node.children.map(render)].join('\n');
-const key = (node) => /^(?:- )?([A-Za-z0-9_-]+):/.exec(node.line)?.[1];
+const key = (node) => /^(?:- )?["']?([A-Za-z0-9_-]+)["']?\s*:(?:\s|$)/.exec(node.line)?.[1];
+const value = (node) => node.line.replace(/^(?:- )?["']?[A-Za-z0-9_-]+["']?\s*:\s*/, '').replace(/\s+#.*$/, '').replace(/^["']|["']$/g, '');
 const child = (node, name) => node.children.find((c) => key(c) === name && !c.line.startsWith('- '));
 
 export function parseWorkflow(text) {
   const root = outline(text);
-  const jobsNode = root.children.find((c) => c.line === 'jobs:');
+  const jobsNode = root.children.find((c) => key(c) === 'jobs');
   const workflowText = root.children.filter((c) => c !== jobsNode).map(render).join('\n');
   const jobs = (jobsNode?.children ?? []).map((node) => {
     const stepsNode = child(node, 'steps');
     const steps = (stepsNode?.children ?? []).map((step) => {
       // A step's own keys: the first key on its "- " line plus its direct children.
       const keys = [key(step), ...step.children.map(key)].filter(Boolean);
-      return { text: render(step), keys };
+      const run = [step, ...step.children].find((c) => key(c) === 'run');
+      return { text: render(step), keys, run: run && !run.children.length ? value(run) : null, line: step.line };
     });
     const env = child(node, 'environment');
+    const envName = env ? (value(env) || (child(env, 'name') ? value(child(env, 'name')) : '')) : '';
     const head = node.children.filter((c) => c !== stepsNode).map(render).join('\n');
-    return { name: key(node), text: render(node), head, environment: env ? render(env) : '', steps };
+    const inherit = node.children.some((c) => key(c) === 'secrets' && value(c) === 'inherit');
+    return { name: key(node), text: render(node), head, environment: env ? render(env) : '', envName, inherit, steps };
   });
-  return { workflowText, jobs };
+  return { workflowText, jobs, hasJobs: Boolean(jobsNode) };
 }
 
 const squash = (s) => s.replace(/\s+/g, ' ');
+const SECRET_REF = /\bsecrets\s*[.[]|tojson\s*\(\s*secrets\b/i;
+const DB_WRITE = [/production-migrations\.mjs\b.*\b(?:apply|rehearse)\b/i, /\bsupabase\b.*\bdb\s+(?:push|reset)\b/i, /\bsupabase\b.*\bmigration\s+up\b/i];
+// YAML features that let text hide from this outline: anchors/aliases/merge keys and escapes.
+const OPAQUE = [/^\s*(?:- )?(?:["']?[\w-]+["']?\s*:\s*)?[&*][A-Za-z_][\w-]*\s*$/m, /^\s*(?:- )?<<\s*:/m, /^\s*(?:- )?["']?[\w-]+["']?\s*:\s*"[^"\n]*\\/m];
+const PRE_ASSERT = /^- uses: (?:actions\/checkout|actions\/setup-node|oven-sh\/setup-bun|actions\/download-artifact)@/;
 
 // Static policy over every workflow file of a repo.
 export function scanWorkflows(contract, repo, files) {
@@ -155,66 +167,96 @@ export function scanWorkflows(contract, repo, files) {
   const seen = new Set();
   let scanStep = false;
   const banned = (where, text) => {
-    for (const name of names) if (text.includes(name)) errors.push(`${where} names production credential ${name}`);
-    for (const pattern of forbidden) if (squash(text).includes(pattern)) errors.push(`${where} contains ${pattern}`);
+    const upper = text.toUpperCase();
+    for (const name of names) if (upper.includes(name.toUpperCase())) errors.push(`${where} names production credential ${name}`);
+    for (const pattern of forbidden) if (squash(text).toLowerCase().includes(pattern.toLowerCase())) errors.push(`${where} contains ${pattern}`);
+    if (/\bsecrets\s*\[|tojson\s*\(\s*secrets\b/i.test(text)) errors.push(`${where} references secrets dynamically`);
+    for (const re of DB_WRITE) if (re.test(text)) errors.push(`${where} runs a database write command`);
   };
   for (const [file, text] of Object.entries(files)) {
-    const { workflowText, jobs } = parseWorkflow(text);
+    const { workflowText, jobs, hasJobs } = parseWorkflow(text);
+    for (const re of OPAQUE) if (re.test(text)) errors.push(`${file} uses YAML anchors, merge keys or escapes this scanner refuses`);
+    if (file.startsWith('actions/')) { banned(file, text); continue; }
+    if (!hasJobs) errors.push(`${file} has no jobs block this scanner can read`);
     banned(`${file} (workflow level)`, workflowText);
     for (const job of jobs) {
+      if (!job.name) { errors.push(`${file} has a job this scanner cannot name`); continue; }
       const id = `${file}#${job.name}`;
       seen.add(id);
       const isProduction = rules.productionJobs.includes(id);
-      if (squash(job.text).includes(`env-contract.mjs scan --repo ${repo}`) && !isProduction) scanStep = true;
-      if (/^secrets: inherit$/m.test(job.text) && !rules.secretInheritance.includes(id)) {
+      const scanCommand = `node .github/scripts/env-contract.mjs scan --repo ${repo}`;
+      if (!isProduction && job.steps.some((s) => commandLine(s, scanCommand))) scanStep = true;
+      if ((job.inherit || /^secrets:\s*["']?inherit\b/m.test(job.text)) && !rules.secretInheritance.includes(id)) {
         errors.push(`${id} uses secrets: inherit but is not in repos.${repo}.secretInheritance`);
       }
       if (isProduction) {
         checkAssertedJob(errors, id, job, assertCommand(repo, 'production'), names, true);
-        if (!/production/i.test(job.environment)) errors.push(`${id} must use the production environment`);
+        if (job.envName.toLowerCase() !== 'production') errors.push(`${id} must use the environment named production`);
         continue;
       }
       banned(id, job.text);
-      if (/production/i.test(job.environment)) errors.push(`${id} is not a production job but names a production environment`);
+      if (/production/i.test(job.environment) || job.envName.includes('${{')) {
+        errors.push(`${id} is not a production job but names a production or computed environment`);
+      }
       if (rules.previewJobs.includes(id)) checkAssertedJob(errors, id, job, assertCommand(repo, 'preview'), names, false);
     }
   }
   for (const id of designated) if (!seen.has(id)) errors.push(`designated job ${id} does not exist`);
-  if (!scanStep) errors.push(`no non-production job runs env-contract.mjs scan --repo ${repo}`);
+  if (!scanStep) errors.push(`no non-production job runs env-contract.mjs scan --repo ${repo} as an unconditional step`);
   return errors;
 }
 
-// The assertion is one fail-closed step that runs before any secret reaches a step. For production
-// jobs, credential names may not appear in the job head (job-level env) either.
+// A contract step is exactly `run: <command>` with only name/id beside it: no if:, no
+// continue-on-error, no env, no shell tricks.
+function exactStep(step, command) {
+  return step.run === command && step.keys.every((k) => ['name', 'id', 'run'].includes(k));
+}
+
+// An unconditional step that runs `command` as a line of its own (default bash -e fails the step).
+function commandLine(step, command) {
+  if (step.keys.includes('if') || step.keys.includes('continue-on-error') || step.keys.includes('shell')) return false;
+  return step.text.split('\n').some((line) => line.trim() === command || line.trim() === `run: ${command}`);
+}
+
+// The assertion is one fail-closed step that only checkout/setup actions may precede. For production
+// jobs, production credential names may not appear in the job head (job-level env) either.
 function checkAssertedJob(errors, id, job, command, names, production) {
   const index = job.steps.findIndex((s) => squash(s.text).includes(command));
   if (index < 0) return errors.push(`${id} must run: ${command}`);
-  const step = job.steps[index];
-  if (step.keys.includes('if') || step.keys.includes('continue-on-error')) {
-    errors.push(`${id} contract assertion must not have if: or continue-on-error`);
+  if (!exactStep(job.steps[index], command)) {
+    errors.push(`${id} contract assertion must be exactly "run: ${command}" with only name/id (no if:, continue-on-error, env or shell)`);
   }
-  if (/secrets\./.test(step.text)) errors.push(`${id} contract assertion step must not bind secrets`);
-  const firstSecret = job.steps.findIndex((s) => /secrets\.|secrets\[/.test(s.text));
-  if (firstSecret >= 0 && firstSecret < index) errors.push(`${id} uses a secret in a step before its contract assertion`);
+  for (const step of job.steps.slice(0, index)) {
+    if (!PRE_ASSERT.test(step.line) || SECRET_REF.test(step.text)) {
+      errors.push(`${id} runs "${step.line.slice(0, 60)}" before its contract assertion (only checkout/setup actions may)`);
+    }
+  }
   if (production) {
-    for (const name of names) if (job.head.includes(name)) errors.push(`${id} binds ${name} at job level, before its contract assertion`);
-    const firstWrite = job.steps.findIndex((s) => /production-migrations|supabase /.test(s.text));
-    if (firstWrite >= 0 && firstWrite < index) errors.push(`${id} touches the database before its contract assertion`);
+    const upper = job.head.toUpperCase();
+    for (const name of names) if (upper.includes(name.toUpperCase())) errors.push(`${id} binds ${name} at job level, before its contract assertion`);
   }
 }
 
 export function readWorkflows(root = process.cwd()) {
   const dir = resolve(root, '.github/workflows');
-  return Object.fromEntries(readdirSync(dir).filter((f) => /\.ya?ml$/.test(f)).sort()
+  const files = Object.fromEntries(readdirSync(dir).filter((f) => /\.ya?ml$/.test(f)).sort()
     .map((f) => [f, readFileSync(resolve(dir, f), 'utf8')]));
+  const actions = resolve(root, '.github/actions');
+  const walk = (d) => readdirSync(d, { withFileTypes: true }).flatMap((e) =>
+    e.isDirectory() ? walk(join(d, e.name)) : /^action\.ya?ml$/.test(e.name) ? [join(d, e.name)] : []);
+  if (existsSync(actions)) for (const f of walk(actions).sort()) files[`actions/${relative(actions, f)}`] = readFileSync(f, 'utf8');
+  return files;
 }
 
+const FLAGS = { check: ['repo'], scan: ['repo'], 'assert-job': ['repo', 'environment'] };
 function parseArgs(argv) {
   const [command, ...rest] = argv;
   const flags = {};
   for (let i = 0; i < rest.length; i += 2) {
-    if (!rest[i]?.startsWith('--') || rest[i + 1] === undefined) return { command, bad: true };
-    flags[rest[i].slice(2)] = rest[i + 1];
+    const name = rest[i]?.startsWith('--') ? rest[i].slice(2) : null;
+    if (!name || rest[i + 1] === undefined || rest[i + 1].startsWith('--') || name in flags) return { command, bad: true };
+    if (!(FLAGS[command] ?? []).includes(name)) return { command, bad: true };
+    flags[name] = rest[i + 1];
   }
   return { command, flags };
 }
@@ -223,7 +265,9 @@ function main(argv) {
   const { command, flags = {}, bad } = parseArgs(argv);
   const repo = flags.repo;
   const { contract, sha256 } = loadContract();
-  const errors = bad ? ['malformed flags'] : checkContract(contract, loadManifestProject(), repo);
+  const errors = bad ? ['malformed, unknown or duplicate flags'] : checkContract(contract, loadManifestProject(), repo);
+  const actual = (process.env.GITHUB_REPOSITORY ?? '').split('/').pop()?.toLowerCase();
+  if (actual && actual !== repo && command !== 'assert-job') errors.push(`--repo ${repo} does not match GITHUB_REPOSITORY`);
   if (command === 'assert-job') errors.push(...checkJob(contract, repo, flags.environment, process.env));
   else if (command === 'scan') errors.push(...scanWorkflows(contract, repo, readWorkflows()));
   else if (command !== 'check') errors.push(`unknown command ${command}`);
