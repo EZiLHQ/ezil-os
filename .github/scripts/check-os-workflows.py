@@ -7,14 +7,14 @@ import yaml
 
 root = Path(__file__).resolve().parents[2]
 contract = json.loads((root / '.github/environment-contract.json').read_text())
-subprocess.run(['node', '.github/scripts/env-contract.mjs', 'check'], cwd=root, check=True)
+subprocess.run(['node', '.github/scripts/env-contract.mjs', 'check', '--repo', 'ezil-os'], cwd=root, check=True)
 workflows = {}
 for name in ('ci', 'preview', 'image', 'deploy', 'deploy-app', 'macos-internal', 'macos-e2e'):
     text = (root / f'.github/workflows/{name}.yml').read_text()
     workflow = yaml.safe_load(text)
     workflows[name] = workflow
     for job_name, job in workflow['jobs'].items():
-        if job_name != 'production':
+        if f'{name}.yml#{job_name}' not in contract['repos']['ezil-os']['productionJobs']:
             job_text = yaml.safe_dump(job)
             for credential in contract['productionCredentialNames']:
                 assert credential not in job_text, (name, job_name, f'Production credential {credential} outside production')
@@ -67,7 +67,7 @@ assert jobs['production']['environment']['name'] == 'production'
 assert jobs['production']['if'] == "needs.trust.outputs.production == 'true'"
 for job_name in ('preview', 'production'):
     steps = jobs[job_name]['steps']
-    command = f'node .github/scripts/env-contract.mjs assert-job --environment {job_name}'
+    command = f'node .github/scripts/env-contract.mjs assert-job --repo ezil-os --environment {job_name}'
     checks = [step for step in steps if step.get('run') == command]
     assert len(checks) == 1, f'{job_name} requires one environment contract assertion'
     check = checks[0]

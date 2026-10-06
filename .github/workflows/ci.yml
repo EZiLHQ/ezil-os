@@ -856,6 +856,7 @@ jobs:
         run: |
           python3 .github/scripts/check-os-workflows.py
           node --test e2e/env-contract.test.mjs
+          node .github/scripts/env-contract.mjs scan --repo ezil-os
       - name: Actionlint
         run: |
           curl --fail --silent --show-error --location https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz -o "$RUNNER_TEMP/actionlint.tar.gz"
