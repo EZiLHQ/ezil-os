@@ -214,7 +214,10 @@ try {
       if(!await quick.count())await f.locator('.command-center').click();
       try {await quick.waitFor({state:'visible',timeout:1000});await quick.fill('>'+text.replace(/\.{3}$/, ''));await row.waitFor({state:'visible',timeout:2000});return true;}catch{return false;}
     },30000);
-    await row.click();await quick.waitFor({state:'hidden',timeout:15000});
+    await row.click();
+    // Save As immediately reuses the quick-input widget for its path dialog.
+    // Wait for this command row to leave, not for every quick input to hide.
+    await row.waitFor({state:'hidden',timeout:15000});
     if(text === 'Preferences: Open User Settings (JSON)') {
       evidence.operation = 'open Code settings editor';
       await f.locator('.monaco-modal-editor-block:visible .monaco-editor:visible .view-line, .editor-instance .monaco-editor:visible .view-line').first().waitFor({state:'visible',timeout:15000});
