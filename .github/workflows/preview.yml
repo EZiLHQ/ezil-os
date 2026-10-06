@@ -408,6 +408,20 @@ jobs:
           path: manual-preview.json
           if-no-files-found: error
       - uses: ./.github/actions/setup-playwright
+      - name: Wait for staging container rollout
+        timeout-minutes: 11
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node e2e/await-container-rollout.mjs
+      - name: Prepare isolated staging computer after rollout
+        if: needs.trust.outputs.manual_preview != 'true'
+        timeout-minutes: 7
+        env:
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+        run: node e2e/prepare-hosted-computer.mjs
       - name: Test the returned preview URL
         if: needs.trust.outputs.manual_preview != 'true'
         timeout-minutes: 22
@@ -679,6 +693,19 @@ jobs:
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
         run: node e2e/verify-cloud-deployment.mjs
       - uses: ./.github/actions/setup-playwright
+      - name: Wait for production container rollout
+        timeout-minutes: 11
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node e2e/await-container-rollout.mjs
+      - name: Prepare isolated production computer after rollout
+        timeout-minutes: 7
+        env:
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+        run: node e2e/prepare-hosted-computer.mjs
       - name: Test the returned production URL
         timeout-minutes: 22
         env:

@@ -69,8 +69,20 @@ try {
   await configureAppContext(ctx);
   const p = await ctx.newPage();
   const screenCalls = [];
+  const screenResponses = [];
+  const responseReads = [];
   p.on('request', r => {
     if (/\/api\/shell\/screen/.test(r.url())) screenCalls.push(`${r.method()} ${r.url().split('?')[0]}`);
+  });
+  p.on('response', r => {
+    if (!/\/api\/shell\/screen/.test(r.url())) return;
+    responseReads.push((async () => {
+      let body;
+      try { body = await r.json(); } catch { /* response failure remains visible via status */ }
+      const rawCode = body?.errorCode ?? body?.error?.code ?? body?.code ?? body?.error;
+      screenResponses.push({ method: r.request().method(), status: r.status(), ok: body?.ok === true,
+        code: typeof rawCode === 'string' && /^[a-zA-Z0-9_]{1,80}$/.test(rawCode) ? rawCode : null });
+    })());
   });
 
   await p.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded' });
@@ -140,6 +152,8 @@ try {
     reads.length > 0, `${reads.length} GET /api/shell/screen call(s); all calls: ${JSON.stringify(screenCalls.slice(-4))}`);
 
   const after = await geo();
+  await Promise.all(responseReads);
+  console.log(`Screen responses (redacted): ${JSON.stringify(screenResponses)}`);
   check('🔴 the picture is still PORTRAIT after a restart — not letterboxed into a stale 1920x1080',
     !!after.frame && after.frame.h > after.frame.w,
     `before=${before.frame?.w}x${before.frame?.h} after=${after.frame?.w}x${after.frame?.h}`);

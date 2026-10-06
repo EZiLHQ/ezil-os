@@ -91,6 +91,17 @@ assert positions['Restore previous Worker version (never reverse SQL)'] < positi
 assert workflows['deploy']['jobs']['release']['needs'] == 'gated-production'
 assert positions['Acquire shared production lease'] < positions['Capture previous production identities']
 assert positions['Release shared production lease'] > positions['Upload production release and recovery evidence']
+for job_name, target in (('preview', 'staging'), ('production', 'production')):
+    steps = jobs[job_name]['steps']
+    names = [step.get('name') for step in steps]
+    rollout = names.index(f'Wait for {target} container rollout')
+    prepare = names.index(f'Prepare isolated {target} computer after rollout')
+    tests = names.index(f'Test the returned {"preview" if job_name == "preview" else "production"} URL')
+    assert rollout < prepare < tests
+    assert steps[rollout]['run'] == 'node e2e/await-container-rollout.mjs'
+    assert steps[prepare]['run'] == 'node e2e/prepare-hosted-computer.mjs'
+    if job_name == 'preview':
+        assert steps[prepare]['if'] == "needs.trust.outputs.manual_preview != 'true'"
 # Hosted continuity is an explicit cloud gate; missing isolated IDs are failures.
 preview_steps = jobs['preview']['steps']
 continuity = next(step for step in preview_steps if step.get('name') == 'Hosted continuity release gate')
