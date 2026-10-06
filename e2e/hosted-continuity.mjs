@@ -28,6 +28,7 @@ const started = Date.now();
 const phase = name => evidence.phases.push({ name, elapsedMs: Date.now() - started });
 const wait = ms => page.waitForTimeout(ms);
 const bounded = async (name, action, timeout = 240000) => {
+  evidence.operation = name;
   const end = Date.now() + timeout;
   while (Date.now() < end) { const result = await action(); if (result) return result; await wait(1000); }
   throw new Error(`${name}: deadline exceeded`);
@@ -192,6 +193,7 @@ try {
     }
   };
   const command = async (f, text) => {
+    evidence.command = text;
     await launch('code');
     await closeModal(f);
     const quick = f.locator('.quick-input-widget input:visible');
@@ -202,7 +204,10 @@ try {
       try {await quick.waitFor({state:'visible',timeout:1000});await quick.fill('>'+text);await row.waitFor({state:'visible',timeout:2000});return true;}catch{return false;}
     },30000);
     await row.click();await quick.waitFor({state:'hidden',timeout:15000});
-    if(text === 'Preferences: Open User Settings (JSON)') await f.locator('.monaco-modal-editor-block:visible .monaco-editor:visible .view-line').first().waitFor({state:'visible',timeout:15000});
+    if(text === 'Preferences: Open User Settings (JSON)') {
+      evidence.operation = 'open Code settings editor';
+      await f.locator('.monaco-modal-editor-block:visible .monaco-editor:visible .view-line, .editor-instance .monaco-editor:visible .view-line').first().waitFor({state:'visible',timeout:15000});
+    }
     await wait(1200);
   };
   const currentEditor = async f => {
@@ -220,11 +225,13 @@ try {
     },30000);
   };
   const setDocument = async (f, text) => {
+    evidence.operation = 'edit Code document';
     await focusEditor(f);
     await page.keyboard.press(editorModifier + '+A');
     await page.keyboard.type(text);
     await page.keyboard.press(editorModifier + '+S');
     await wait(1200);
+    evidence.operation = 'verify Code document edit';
     assert.ok((await readDocument(f)).includes(text.trim().split('\n')[0]),'Code document edit was not applied');
     // Close the edited file and handle Code's explicit Save confirmation.
     // Browser keyboard shortcuts can be intercepted on macOS.
@@ -535,6 +542,7 @@ try {
   // Exception messages from browser drivers can include URLs/headers. Publish a
   // fixed failure and keep all diagnostics restricted to whitelisted evidence.
   evidence.ok = false; evidence.failure = 'hosted_continuity_acceptance_failed';
+  evidence.errorType = ['AssertionError', 'TimeoutError'].includes(error?.name) ? error.name : 'Error';
   const missing = String(error?.message).match(/^Missing prerequisite: ([A-Z0-9_]+)$/);
   if (missing) evidence.missingPrerequisite = missing[1];
   evidence.failedPhase = evidence.phases.at(-1)?.name || 'setup';

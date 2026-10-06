@@ -1,4 +1,5 @@
 import { relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget, type RelayState, type RelayResult } from './relay-refresh';
+import { bridgeCodeSocket } from './code-socket';
 import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, failCheckpointWrites,
   AcceptanceFaultError, type AcceptanceFaultState } from './acceptance-faults';
 /**
@@ -2369,7 +2370,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       const port = Number(headers.get('cf-container-target-port'));
       if (port !== CODE_PREVIEW_PORT) return json({ok:false,error:'invalid_code_port'},400);
       this.renewActivityTimeout();
-      return this.ctx.container!.getTcpPort(port).fetch(new Request(request, { headers, signal: AbortSignal.timeout(12000) }));
+      const response = await this.ctx.container!.getTcpPort(port).fetch(new Request(request, { headers, signal: AbortSignal.timeout(12000) }));
+      return bridgeCodeSocket(response, () => this.renewActivityTimeout());
     });
   }
   async relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult> {
