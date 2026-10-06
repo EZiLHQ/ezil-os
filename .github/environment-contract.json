@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "phase": "pre-cutover",
+  "projects": {
+    "preview": "btgqfmnzycdecmeyqubx",
+    "production": "curomaahbwlrddzijatd"
+  },
+  "legacyProduction": "btgqfmnzycdecmeyqubx",
+  "routing": {
+    "local": "preview",
+    "test": "preview",
+    "pull_request": "preview",
+    "main": "production",
+    "release": "production"
+  },
+  "productionCredentialNames": [
+    "SUPABASE_ACCESS_TOKEN",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "SUPABASE_SECRET_KEY",
+    "SUPABASE_DB_PASSWORD",
+    "DATABASE_URL",
+    "PRODUCTION_DATABASE_URL"
+  ],
+  "migrationOrder": [
+    "ezil-os:public",
+    "ezil-ai-gateway:ezil_ai",
+    "ezil-work:ezil_universe,ezil_works"
+  ]
+}
