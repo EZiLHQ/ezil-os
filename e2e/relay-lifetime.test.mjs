@@ -1,8 +1,33 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { verifyRelayLifetime } from './relay-lifetime.mjs';
+import { verifyRelayLifetime, verifyRelayRefresh } from './relay-lifetime.mjs';
 
 const state = expiresAt => ({ ok: true, runtimeId: 'current-runtime', expiresAt });
+test('early renewal requires backend commit and live frames without replacing the runtime', async () => {
+  let expiry = 100000, frames = 0;
+  const result = await verifyRelayRefresh({ expectedRuntimeId: 'current-runtime', now: () => 1000,
+    readRelay: async () => state(expiry),
+    refreshRelay: async runtimeId => { assert.equal(runtimeId, 'current-runtime'); expiry = 110000; return state(expiry); },
+    verifyViewer: async () => { frames++; },
+  });
+  assert.deepEqual(result, { initialExpiresAt: 100000, finalExpiresAt: 110000 });
+  assert.equal(frames, 1);
+});
+test('backend rejection, stale expiry and replacement cannot pass early renewal', async () => {
+  for (const refreshed of [{ ok: false }, state(100000), state(5000), { ...state(110000), runtimeId: 'replacement' }]) {
+    let frames = 0;
+    await assert.rejects(verifyRelayRefresh({ expectedRuntimeId: 'current-runtime', now: () => 1000,
+      readRelay: async () => state(100000), refreshRelay: async () => refreshed, verifyViewer: async () => { frames++; },
+    }), /Relay refresh/);
+    assert.equal(frames, 0);
+  }
+});
+test('uncommitted metadata or stalled frames cannot pass early renewal', async () => {
+  const options = { expectedRuntimeId: 'current-runtime', now: () => 1000, readRelay: async () => state(100000),
+    refreshRelay: async () => state(110000), verifyViewer: async () => {} };
+  await assert.rejects(verifyRelayRefresh(options), /not committed/);
+  await assert.rejects(verifyRelayRefresh({ ...options, verifyViewer: async () => { throw new Error('frames stalled'); } }), /frames stalled/);
+});
 function fixture(samples) {
   let clock = 1000, index = 0, frames = 0;
   const sleeps = [];

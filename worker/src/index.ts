@@ -369,6 +369,7 @@ import {
   type DesktopMode,
   hasTurnConfigured,
   resolveTurnTtlSeconds,
+  turnCredentialExpiresAt,
   normalizeIceServers,
   buildNekoIceEnv,
   turnGenerateUrl,
@@ -2434,7 +2435,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           const issuedAt = Date.now();
           const servers = await generateTurnCredentials(this.env, signal);
           if (!servers) throw new RelayFailure('turn_unavailable');
-          return { servers, expiresAt: issuedAt + resolveTurnTtlSeconds(this.env.SANDBOX_NEKO_TURN_TTL_SECONDS) * 1000 };
+          return { servers, expiresAt: turnCredentialExpiresAt(issuedAt, this.env.SANDBOX_NEKO_TURN_TTL_SECONDS) };
         } } : {}) });
       }));
       return { ok: true, ...state };
@@ -3711,7 +3712,7 @@ async function resolveNekoIceEnv(env: Env): Promise<Record<string, string> | nul
   const issuedAt = Date.now();
   const cloudflare = await generateTurnCredentials(env);
   if (cloudflare) return { ...buildNekoIceEnv(cloudflare),
-    EZIL_RELAY_EXPIRES_AT: String(issuedAt + resolveTurnTtlSeconds(env.SANDBOX_NEKO_TURN_TTL_SECONDS) * 1000) };
+    EZIL_RELAY_EXPIRES_AT: String(turnCredentialExpiresAt(issuedAt, env.SANDBOX_NEKO_TURN_TTL_SECONDS)) };
 
   const staticUrls = env.SANDBOX_NEKO_TURN_URLS?.trim();
   if (staticUrls) {

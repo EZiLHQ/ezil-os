@@ -14,7 +14,7 @@ import { requestViewerProbe, waitForViewerProgress } from './viewer-progress.mjs
 import { terminalContinuityCommand, assertProcessContinuity, waitForProcessSample } from './process-continuity.mjs';
 import { stopIsolatedComputer } from './isolated-computer.mjs';
 import { verifyEditorShortcut } from './editor-shortcut.mjs';
-import { verifyRelayLifetime } from './relay-lifetime.mjs';
+import { verifyRelayLifetime, verifyRelayRefresh } from './relay-lifetime.mjs';
 
 const required = key => { assert.ok(process.env[key], `Missing prerequisite: ${key}`); return process.env[key]; };
 const hash = value => createHash('sha256').update(String(value)).digest('hex');
@@ -161,6 +161,10 @@ try {
   evidence.runtimeHash = hash(firstRelay.runtimeId);
   evidence.coldOpenMs = Date.now() - coldStartedAt;
   phase('default TURN cold Browser open before Code');
+  evidence.operation = 'authenticated TURN renewal';
+  evidence.initialRenewal = await verifyRelayRefresh({ expectedRuntimeId: firstRelay.runtimeId,
+    readRelay: relay, refreshRelay: runtimeId => api('/api/shell/relay-refresh', { computerId, runtimeId }), verifyViewer: live });
+  phase('authenticated TURN renewal and current viewer frames');
   const checkpointKey = `${r2Prefix.replace(/^\/+|\/+$/g, '')}/.ezil-snapshots/latest.json`;
   const readCommittedCheckpoint = () => {
     const directory = mkdtempSync(join(tmpdir(), 'ezil-checkpoint-'));
@@ -564,6 +568,10 @@ try {
   // Only fixed assertion identifiers are public. Driver messages can contain
   // private URLs, cookies and entered text, so never emit the raw exception.
   const assertionCodes = {
+    'Relay refresh baseline unavailable or stale': 'relay_refresh_baseline_invalid',
+    'Relay refresh rejected or changed runtime': 'relay_refresh_rejected',
+    'Relay refresh did not advance credential expiry': 'relay_refresh_expiry_unchanged',
+    'Relay refresh not committed': 'relay_refresh_uncommitted',
     'Workspace marker not restored': 'marker_not_restored',
     'Shortcut test proof must be a fresh edit': 'shortcut_proof_not_fresh',
     'Shortcut test edit did not reach Code': 'shortcut_edit_missing',

@@ -50,7 +50,7 @@ describe('relay refresh failure handling', () => {
     expect(f.requests).toHaveLength(3);
   });
   it('rejects backend failed refresh, negotiation busy, and changed runtime', async () => {
-    for (const [status, code] of [[503, 'relay_refresh_failed'], [422, 'relay_negotiation_busy'], [409, 'relay_runtime_changed']] as const) {
+    for (const [status, code] of [[400, 'relay_configuration_rejected'], [503, 'relay_refresh_failed'], [422, 'relay_negotiation_busy'], [409, 'relay_runtime_changed']] as const) {
       const f = fixture({ postStatus: status });
       await expect(relayOperation(f.container, 'admin-test-only', { runtimeId, mint })).rejects.toThrow(code);
     }
