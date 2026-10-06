@@ -262,7 +262,14 @@ def restore():
 
 try:
     op = p['op']
-    if op == 'check': marker()
+    if op == 'hydration-state':
+        # Only physical absence permits disposing an unhydrated replacement.
+        # Invalid, stale, or unreadable existing markers must still refuse stop.
+        try:
+            with workspace_file('.ezil-hydrated.json') as f: pass
+        except FileNotFoundError:
+            sys.exit(4)
+    elif op == 'check': marker()
     elif op == 'capture':
         os.mkdir(work, 0o700)
         result = capture(os.path.join(work, 'archive.tar'))

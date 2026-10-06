@@ -213,6 +213,10 @@ async function makeFake(opts: FakeOptions = {}): Promise<FakeDO & Record<string,
         return { exitCode: opts.editorCaptureFails ? 1 : 0, stdout: '' };
       }
       if (command.startsWith('python3 ')) {
+        if (command.includes('"op":"hydration-state"')) {
+          if (opts.listFilesThrows) throw new Error('physical observation unavailable');
+          return { exitCode: opts.physicalWorkspaceMissing ? 4 : 0, stdout: '' };
+        }
         if (command.includes('"op":"check"') && opts.physicalWorkspaceMissing) {
           return { exitCode: 4, stdout: '' };
         }
@@ -707,6 +711,19 @@ describe('preserved invariant: idle-stop is NOT termination', () => {
 });
 
 describe('explicit termination requires a confirmed checkpoint', () => {
+  it('stops a physically unhydrated replacement after the cached hydration flag was cleared', async () => {
+    const fake = await makeFake({ storage: hydratedStorage({ [HYDRATED_KEY]: false }), physicalWorkspaceMissing: true });
+    const proto = await loadPrototype();
+    const base = Object.getPrototypeOf(proto); const original = base.destroy;
+    base.destroy = async function(this: typeof fake) {
+      this.calls.destroys++; this.ctx.container.running = false;
+    };
+    try {
+      expect(await proto.terminateSandbox.call(fake)).toMatchObject({ok:true,terminated:true,outcome:'destroyed'});
+      expect(fake.calls.r2Puts).toEqual([]);
+      expect(fake.calls.execs.some(c => c.startsWith('bash /usr/local/bin/editor-state.sh'))).toBe(false);
+    } finally { base.destroy = original; }
+  });
   it('checks physical hydration before editor capture and never commits an empty replacement', async () => {
     const fake = await makeFake({ storage: hydratedStorage(), physicalWorkspaceMissing: true, editorCaptureFails: true });
     const proto = await loadPrototype();

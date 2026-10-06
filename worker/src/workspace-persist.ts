@@ -180,6 +180,15 @@ export function chunkKey(prefix: string, generation: string, index: number): str
   return `${prefix}/.ezil-snapshots/${generation}/${index}`;
 }
 
+/** Read-only proof for teardown after the cached hydration flag was cleared. */
+export async function workspaceIsPhysicallyUnhydrated(container: HydrateContainerLike, root: string): Promise<boolean> {
+  const result = await container.exec(snapshotCommand({ op: 'hydration-state', root,
+    work: `/tmp/ezil-snapshot-${crypto.randomUUID()}` }), { timeout: 120_000 });
+  if (result.exitCode === 4) return true;
+  if (result.exitCode !== 0) throw new Error('workspace hydration observation failed');
+  return false;
+}
+
 export async function flushWorkspaceToR2(deps: FlushDeps): Promise<FlushOutcome> {
   const { bucket, container, mountPath: root, realPrefix: prefix, log } = deps;
   const outcome: FlushOutcome = { ok: false, uploaded: [], skippedUnchanged: 0,

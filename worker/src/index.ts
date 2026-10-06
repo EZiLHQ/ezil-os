@@ -494,6 +494,7 @@ import {
 import {
   hydrateWorkspaceFromR2,
   flushWorkspaceToR2,
+  workspaceIsPhysicallyUnhydrated,
   parseHydrateMarker,
   serializeHydrateMarker,
   HYDRATE_MARKER_FILENAME,
@@ -2517,6 +2518,17 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     }
 
     const hydrated = (await this.ctx.storage.get<boolean>(WORKSPACE_HYDRATED_KEY)) ?? false;
+    if (!hydrated && trigger === 'explicit') {
+      // A prior flush may already have cleared the cached flag after observing
+      // replacement. Re-check the physical disk before allowing teardown on
+      // the last durable checkpoint; a false cache alone proves nothing.
+      try {
+        if (await workspaceIsPhysicallyUnhydrated(this, wctx.mountPath)) {
+          return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0,
+            failed: [], manifest: {}, heartbeatWritten: false, skippedReason: 'container_not_hydrated' };
+        }
+      } catch { /* preserve checkpoint refusal when the physical probe fails */ }
+    }
     // Fail closed: a misconfigured store is skipped, never silently run on R2.
     // Fresh per flush so no stale per-prefix read routing is reused.
     const store = resolveWorkspaceStore(this.env);
