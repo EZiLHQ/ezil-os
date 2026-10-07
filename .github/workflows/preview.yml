@@ -223,6 +223,8 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '22.16.0'
+      - name: Assert preview environment contract
+        run: node .github/scripts/env-contract.mjs assert-job --repo ezil-os --environment preview
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.3.14'
@@ -548,6 +550,8 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '22.16.0'
+      - name: Assert production environment contract
+        run: node .github/scripts/env-contract.mjs assert-job --repo ezil-os --environment production
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.3.14'
