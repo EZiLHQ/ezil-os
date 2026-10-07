@@ -53,7 +53,7 @@ export function tokenize(sql) {
     if (word) { tokens.push({ kind: 'word', value: word[0].toLowerCase() }); i += word[0].length; continue; }
     const number = sql.slice(i).match(/^\d+/);
     if (number) { tokens.push({ kind: 'number', value: number[0] }); i += number[0].length; continue; }
-    check('(),.;'.includes(c), 'Unsupported SQL token (bodies, escapes and operators are refused)');
+    check('(),.;=[]'.includes(c), 'Unsupported SQL token (bodies, escapes and operators are refused)');
     tokens.push({ kind: 'punctuation', value: c }); i++;
   }
   return tokens;
@@ -65,6 +65,34 @@ export function additiveSQL(sql, schemas) {
   const take = value => { check(is(value), `Unsupported additive SQL: expected ${value}`); i++; };
   const ident = () => { const t = ts[i++]; check(t && ['word', 'identifier'].includes(t.kind) && t.value.length > 0, 'Expected SQL identifier'); return t.value; };
   const qualified = () => { const schema = ident(); check(schemas.includes(schema), 'SQL target is outside owned schemas'); take('.'); ident(); };
+  const functionArgs = () => {
+    take('(');
+    if (!is(')')) {
+      for (;;) {
+        const start = i;
+        while (i < ts.length && !is(',') && !is(')')) {
+          check(!is('default'), 'Function argument defaults are refused');
+          if (['.', '[', ']'].some(is)) take(ts[i].value);
+          else ident();
+        }
+        check(i > start, 'Expected function argument');
+        if (!is(',')) break;
+        take(',');
+      }
+    }
+    take(')');
+  };
+  const identifierList = (allowed, label) => {
+    const seen = new Set();
+    for (;;) {
+      const value = ident();
+      check(allowed.includes(value), `Unsupported ${label}`);
+      check(!seen.has(value), `Duplicate ${label}`);
+      seen.add(value);
+      if (!is(',')) break;
+      take(',');
+    }
+  };
   const type = () => {
     let t = ident();
     if (t === 'pg_catalog' && is('.')) { take('.'); t = ident(); }
@@ -87,8 +115,20 @@ export function additiveSQL(sql, schemas) {
         take('index'); ident(); take('on'); qualified(); take('('); ident();
         while (is(',')) { take(','); ident(); } take(')');
       }
+    } else if (is('revoke')) {
+      take('revoke'); take('execute'); take('on'); take('function'); qualified(); functionArgs(); take('from');
+      identifierList(['public', 'anon', 'authenticated'], 'function revoke role');
     } else {
-      take('alter'); take('table'); qualified(); take('add'); take('column'); column();
+      take('alter');
+      if (is('function')) {
+        take('function'); qualified(); functionArgs(); take('set'); take('search_path');
+        if (is('=')) take('='); else take('to');
+        identifierList([...schemas, 'pg_catalog', 'pg_temp', 'extensions'], 'function search_path schema');
+      } else {
+        take('table'); qualified();
+        if (is('enable')) { take('enable'); take('row'); take('level'); take('security'); }
+        else { take('add'); take('column'); column(); }
+      }
     }
     statements++;
     if (i < ts.length) take(';');

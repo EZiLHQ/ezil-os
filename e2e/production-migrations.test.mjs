@@ -81,6 +81,97 @@ test('strict additive grammar handles comments/quoted identifiers and rejects es
   assert.equal(tokenize('-- EOF').length, 0);
 });
 
+test('hardening grammar accepts function signatures, search_path separators and API role subsets', () => {
+  const args = ['', 'uuid', 'p_id uuid', 'text[]', 'character varying', 'timestamp with time zone', 'pg_catalog.int4', 'uuid, p_labels text[], character varying, timestamp with time zone, pg_catalog.int4', '"p_id" "pg_catalog"."uuid", IN p_labels text[][]'];
+  for (const signature of args) {
+    for (const separator of ['=', 'TO']) {
+      const sql = `ALTER FUNCTION app.example (${signature}) SET search_path ${separator} app, audit, pg_catalog, pg_temp, extensions;`;
+      assert.equal(additiveSQL(sql, ['app', 'audit']), sql);
+    }
+    for (const roles of ['public', 'anon', 'authenticated', 'anon, authenticated', 'PUBLIC, anon, authenticated']) {
+      const sql = `REVOKE EXECUTE ON FUNCTION app.example (${signature}) FROM ${roles};`;
+      assert.equal(additiveSQL(sql, ['app']), sql);
+    }
+  }
+});
+
+test('hardening grammar accepts RLS, quoted identifiers, comments and separated statements', () => {
+  const accepted = [
+    'ALTER TABLE app.example ENABLE ROW LEVEL SECURITY;',
+    'alter table "app"."odd;name" enable row level security',
+    'ALTER FUNCTION "app"."odd;name" (/* signature */ "p_id" uuid) SET search_path TO "app", "pg_catalog";',
+    'REVOKE EXECUTE ON FUNCTION "app"."odd;name" () FROM "anon", "authenticated";',
+    'ALTER FUNCTION app.example() SET search_path = APP;',
+    'ALTER FUNCTION app.example() SET search_path = app; REVOKE EXECUTE ON FUNCTION app.example() FROM public; ALTER TABLE app.example ENABLE ROW LEVEL SECURITY;',
+    'CREATE TABLE app.example(id uuid); ALTER TABLE app.example ENABLE ROW LEVEL SECURITY; CREATE INDEX example_index ON app.example(id);',
+    'ALTER /* nested /* ; */ comment */ FUNCTION app.example(text[]) SET search_path -- path\n TO app, pg_temp',
+  ];
+  for (const sql of accepted) assert.equal(additiveSQL(sql, ['app']), sql);
+  const sql = 'ALTER FUNCTION public.example() SET search_path = public;';
+  assert.equal(additiveSQL(sql, ['public']), sql);
+});
+
+test('hardening grammar refuses unsafe or empty function arguments in both function forms', () => {
+  const args = ["'uuid'", 'p_id uuid DEFAULT null', 'uuid default', 'uuid = null', '123', 'uuid + text', 'numeric(10,2)', '(uuid)', 'uuid[2]', ',uuid', 'uuid,', 'uuid,,text', 'uuid; COMMIT', 'uuid => text'];
+  for (const signature of args) {
+    for (const sql of [
+      `ALTER FUNCTION app.example(${signature}) SET search_path = app;`,
+      `REVOKE EXECUTE ON FUNCTION app.example(${signature}) FROM public;`,
+    ]) assert.throws(() => additiveSQL(sql, ['app']), undefined, sql);
+  }
+});
+
+test('hardening grammar refuses unowned targets, extra privileges and syntax outside the contract', () => {
+  const refused = [
+    'ALTER FUNCTION other.example() SET search_path = app;',
+    'REVOKE EXECUTE ON FUNCTION other.example() FROM public;',
+    'ALTER TABLE other.example ENABLE ROW LEVEL SECURITY;',
+    'ALTER FUNCTION app.example() SET search_path = other;',
+    'ALTER FUNCTION app.example() SET search_path = app, other;',
+    'ALTER FUNCTION app.example() SET search_path = public;',
+    'ALTER FUNCTION app.example() SET search_path = app, APP;',
+    'ALTER FUNCTION app.example() SET search_path = app, "app";',
+    'ALTER FUNCTION app.example() SET search_path = pg_temp, pg_temp;',
+    'ALTER FUNCTION app.example() SET search_path =;',
+    'ALTER FUNCTION app.example() SET search_path = app,;',
+    "ALTER FUNCTION app.example() SET search_path = 'app';",
+    'ALTER FUNCTION app.example() SET search_path = app.example;',
+    'ALTER FUNCTION app.example() SET search_path FROM CURRENT;',
+    'ALTER FUNCTION app.example() SET work_mem = app;',
+    'ALTER FUNCTION app.example() SET search_path app;',
+    'REVOKE EXECUTE ON FUNCTION app.example() FROM service_role;',
+    'REVOKE EXECUTE ON FUNCTION app.example() FROM public, service_role;',
+    'REVOKE EXECUTE ON FUNCTION app.example() FROM anon, ANON;',
+    'REVOKE EXECUTE ON FUNCTION app.example() FROM public, "public";',
+    'REVOKE EXECUTE ON FUNCTION app.example() FROM;',
+    'REVOKE EXECUTE ON FUNCTION app.example() FROM public,;',
+    'REVOKE EXECUTE ON FUNCTION app.example() FROM public CASCADE;',
+    'REVOKE EXECUTE ON FUNCTION app.example() FROM public GRANTED BY postgres;',
+    'REVOKE ALL ON FUNCTION app.example() FROM public;',
+    'GRANT EXECUTE ON FUNCTION app.example() TO public;',
+    'ALTER TABLE app.example DISABLE ROW LEVEL SECURITY;',
+    'ALTER TABLE app.example FORCE ROW LEVEL SECURITY;',
+    'ALTER TABLE app.example OWNER TO anon;',
+    'ALTER TABLE app.example RENAME TO other;',
+    'ALTER FUNCTION app.example() OWNER TO anon;',
+    'ALTER FUNCTION app.example() SECURITY DEFINER;',
+    'ALTER FUNCTION app.example() RENAME TO other;',
+    'ALTER FUNCTION app.example() RESET search_path;',
+    'ALTER FUNCTION app.example() SET search_path = app junk;',
+    'REVOKE EXECUTE ON FUNCTION app.example() FROM public junk;',
+    'ALTER TABLE app.example ENABLE ROW LEVEL SECURITY junk;',
+    'ALTER FUNCTION app.example() SET search_path = app REVOKE EXECUTE ON FUNCTION app.example() FROM public;',
+    'REVOKE EXECUTE ON FUNCTION app.example() FROM public ALTER TABLE app.example ENABLE ROW LEVEL SECURITY;',
+    'ALTER TABLE app.example ENABLE ROW LEVEL SECURITY ALTER TABLE app.example ADD COLUMN note text;',
+    'CREATE TABLE app.example(id integer) ALTER TABLE app.example ENABLE ROW LEVEL SECURITY;',
+    'ALTER "function" app.example() SET search_path = app;',
+    'ALTER FUNCTION app.example() SET "search_path" = app;',
+    'CREATE TABLE app.example(id text[]);',
+    'ALTER TABLE app.example ADD COLUMN id integer = 1;',
+  ];
+  for (const sql of refused) assert.throws(() => additiveSQL(sql, ['app']), undefined, sql);
+});
+
 test('CI rejects PRs, stale main, local runs and untrusted workflow_run; trusts fetched main only', async t => {
   const { root, manifest } = await fixture(t);
   await command('git', ['add', '.'], { cwd: root });
@@ -211,6 +302,21 @@ test(`transaction protocol (${process.env.PRODUCTION_MIGRATIONS_DOCKER === '1' ?
     const migration = { id: 'test_add_note', path: 'test.sql', sha256: hash(sql), before, after };
     loaded.manifest.migrations.push(migration); loaded.files.set('test.sql', { sql }); return migration;
   };
+  await t.test('catalog fingerprint detects function search_path, function ACL and RLS hardening', async () => {
+    await fixture();
+    await db.exec("CREATE FUNCTION app.example(p_id uuid) RETURNS uuid LANGUAGE sql AS 'SELECT p_id';");
+    const before = await state();
+    for (const sql of [
+      'ALTER FUNCTION app.example(uuid) SET search_path = app, pg_catalog;',
+      'REVOKE EXECUTE ON FUNCTION app.example(uuid) FROM public;',
+      'ALTER TABLE app.existing ENABLE ROW LEVEL SECURITY;',
+    ]) {
+      const after = (await db.rolledBackRows(additiveSQL(sql, ['app']), catalogSQL(['app'])))[0];
+      assert.notEqual(after.digest, before.digest, sql);
+      assert.equal(after.objects, before.objects, sql);
+      assert.equal((await state()).digest, before.digest, 'Rollback restores the fingerprint');
+    }
+  });
   await t.test('readonly plan creates nothing; baseline records no historical applications; rerun is stable', async () => {
     const loaded = await fixture(); loaded.manifest.sources = [{ path: 'historical.sql', sha256: hash('DROP SCHEMA app CASCADE'), kind: 'snapshot' }];
     await db.exec(planSQL(loaded.manifest)); assert.equal((await db.rows("SELECT to_regnamespace('ezil_ci')::text AS name"))[0].name, null);
