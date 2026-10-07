@@ -298,11 +298,32 @@ The automatic grammar intentionally supports only:
   built-in types, optionally `NULL` or `NOT NULL`.
 - `ALTER TABLE owned_schema.name ADD COLUMN ...` using the same column grammar.
 - Plain, nonunique `CREATE INDEX name ON owned_schema.table (column, ...)`.
+- `ALTER FUNCTION owned_schema.name (args) SET search_path = path`, also allowing
+  `TO` instead of `=`. The path is a nonempty, comma-separated list of identifiers
+  from the owned schemas plus `pg_catalog`, `pg_temp`, and `extensions`, without
+  duplicates.
+- `REVOKE EXECUTE ON FUNCTION owned_schema.name (args) FROM role, ...`, with a
+  nonempty list drawn only from `public`, `anon`, and `authenticated`, without
+  duplicates or suffixes such as `CASCADE` or `GRANTED BY`.
+- `ALTER TABLE owned_schema.name ENABLE ROW LEVEL SECURITY`.
+
+For both function forms, `args` is empty or a comma-separated list of nonempty
+items containing only word/identifier tokens and `.`, `[`, `]`. Examples include
+`uuid`, `p_id uuid`, `text[]`, `character varying`, `timestamp with time zone`,
+and `pg_catalog.int4`. Strings, numbers, operators, nested parentheses, `=`, and
+the `DEFAULT` keyword are refused. Keywords retain the parser's existing
+unquoted, case-insensitive matching; quoted identifiers retain their case.
+Statements must be separated by semicolons; the last semicolon is optional.
+The existing catalog fingerprint includes function configuration (`proconfig`),
+function ACLs (`proacl`), and table `relrowsecurity`, so verification detects all
+three hardening changes without changing the fingerprint format.
 
 Comments (including nested block comments) and quoted identifiers are tokenized;
 statements are not split using a semicolon regex. Expressions, defaults, custom
-types, routine bodies, DO/CALL, CREATE OR REPLACE, transaction control,
-DROP/TRUNCATE/DML, SELECT/CTAS, concurrent indexes, and other syntax are refused.
+column types, routine bodies, DO/CALL, CREATE OR REPLACE, transaction control,
+DROP/TRUNCATE/DML, SELECT/CTAS, concurrent indexes, `OWNER TO`, `SECURITY DEFINER`,
+`RENAME`, `RESET`, `GRANT`, `FORCE`/`DISABLE ROW LEVEL SECURITY`, and other syntax
+are refused.
 Additional syntax requires a reviewed engine extension, not an override flag.
 Migration SQL runs inside a DO block with escaped string literals, preventing
 transaction escapes even if source text contains quotation delimiters. There
