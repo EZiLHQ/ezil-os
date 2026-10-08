@@ -550,9 +550,10 @@ test('compute picker uses server shapes, eligibility, Upgrade, and confirmation 
         changeShape: change => { changes.push(change); },
     });
     await picker.ready;
-    assert.match(picker.element.textContent, /Compute size/);
-    assert.match(picker.element.textContent, /4 virtual CPUs · 12 GiB memory · 20 GB disk/);
-    assert.match(picker.element.textContent, /Requires a subscription/);
+    // DESIGN.md §4: card layout and copy; behaviour assertions below are unchanged.
+    assert.match(picker.element.textContent, /Computer size/);
+    assert.match(picker.element.querySelector('[data-shape="performance"]').textContent, /4 vCPU.*12 GiB.*20 GB/);
+    assert.match(picker.element.textContent, /Requires EZiL Cloud/);
     assert.equal(picker.element.querySelector('script'), null);
     assert.equal(picker.element.querySelector('[data-shape="performance"]').disabled, true);
     picker.element.querySelector('[data-shape="performance"]').click();
@@ -587,14 +588,14 @@ test('compute picker separates localised eligibility reasons from shape labels',
     const assertReason = copy => {
         const button = picker.element.querySelector('[data-shape="performance"]');
         assert.equal(button.disabled, true);
-        assert.equal(button.textContent, 'performance · 4 virtual CPUs · 12 GiB memory · 20 GB disk');
-        assert.equal(button.nextElementSibling.textContent, copy);
+        // DESIGN.md §4: the localised reason is its own element inside the card.
+        assert.equal(button.querySelector('.ezil-billing-compute-reason').textContent, copy);
         assert.equal(button.title, copy);
-        assert.match(button.parentElement.textContent, /20 GB disk\s/);
+        assert.match(button.textContent, /20 GB/);
         assert.doesNotMatch(picker.element.textContent, /subscription_required|future_reason|<script>/);
         assert.equal(picker.element.querySelector('script'), null);
     };
-    assertReason('Requires a subscription');
+    assertReason('Requires EZiL Cloud');
     for ( reason of ['future_reason', 'Active subscription required <script>', undefined, null, ''] ) {
         await picker.refresh();
         assertReason('Not available on your plan');
