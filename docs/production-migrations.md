@@ -14,16 +14,21 @@ node .github/scripts/production-migrations.mjs apply
 `validate` reads local files and Git's tracked/unignored SQL inventory, checks
 every registered byte-level SHA-256, rejects missing/extra SQL, symlinks, malformed
 manifests, duplicate IDs/paths and broken catalog chains, and parses every
-executable migration. It never uses the network or needs a token. An unset initial
-catalog is an explicit valid preparation state, reported as **apply disabled**.
+SQL migration, including verify-only entries. It never uses the network or needs
+a token. An unset initial catalog is an explicit valid preparation state,
+reported as **apply disabled**.
 
 `plan` uses the Supabase Management API with `SUPABASE_ACCESS_TOKEN` supplied by
 the caller. It sends `read_only: true` and runs a repeatable-read, read-only
 transaction. It reports only the catalog digest, catalog entry count, observation
-time, historical/current snapshot digests and pending IDs. If a baseline is present in the manifest, it checks that
-the current catalog matches that baseline or the journal's applied prefix and
-refuses drift. It creates no schema, tables, baseline or migration records. A
-transaction-local PostgreSQL setting carries the pending-count result; this is
+time, historical/current snapshot digests and pending entries with `id` and
+`status`. Ordinary entries have status `pending`; verify-only entries have status
+`pending-verify-only`. If a baseline is present in the manifest, it checks that
+the current catalog matches that baseline or the journal's applied prefix.
+When the next pending entry is verify-only, it instead requires that entry's
+`after` digest. It refuses all other drift and creates no schema, tables,
+baseline or migration records. A transaction-local PostgreSQL setting carries
+the pending-count result; this is
 not an application feature flag. Plan does not prove apply authorization or
 absence of event triggers; apply makes those checks separately.
 
@@ -73,9 +78,9 @@ The manifest pins repository `EZiLHQ/ezil-os`, shared project
 `btgqfmnzycdecmeyqubx`, and catalog schemas `public`.
 On 2026-09-29T15:45:14.939Z, a read-only query observed
 1794 catalog entries. The manifest records the observed
-digest and historical source digest. All 3 current SQL files are
-inventory snapshots; there are zero pending migrations. No historical SQL was
-replayed and no application schema was changed during capture.
+digest and historical source digest. The 3 original SQL files remain
+inventory snapshots; one additional SQL file is a verify-only migration. No
+historical SQL was replayed and no application schema was changed during capture.
 
 Source inventory is not proof that every fragment is installed. Works canonical
 fragments and deliberately uninstalled paid-authorization SQL remain snapshots;
@@ -92,79 +97,12 @@ repository before its initial registration, run `plan` with the management token
 supplied by the environment and copy the reviewed `observedCatalog` unchanged
 into `initialCatalog`. Never derive a hosted baseline by replaying source SQL.
 
-### Reviewed OS vault ACL transition (2026-10-02)
+### Completed baseline transition
 
-Production run `37040140729` stopped at `Current catalog drift` after the login,
-favicon and legal changes from PR #175 had passed CI, staging and image suites.
-The following read-only evidence explains the entire drift in project
-`btgqfmnzycdecmeyqubx` on PostgreSQL 17.6, with 1794 `public` catalog
-entries. The saved reconstruction ran as `supabase_read_only_user`; separate
-readbacks confirmed the registry owner is `postgres`, which the write path
-requires:
-
-| Evidence | Exact value |
-| --- | --- |
-| Original catalog digest | `4c1040575121990dbd5ad09e40c0e334be4a291e4e746fc20a08d8c07a036e7f` |
-| Current canonical catalog digest | `e63f1fd705c4204eb370d8020182ef423d0a5df9a10c3122e0cc550fdd57f090` |
-| Historical source digest | `e884a81df52d591799e97b1ca59685fa7a70449d91de414c777866f5a26438f5` |
-| Original capture | `2026-09-29T15:45:14.939Z` |
-| OS baseline registration | `2026-09-29T16:41:32.074836Z` |
-| OS journal rows | `0` |
-| Routine | `public.get_vault_secret(text)` |
-| Original routine ACL | `{postgres=X/postgres,anon=X/postgres,authenticated=X/postgres,service_role=X/postgres}` |
-| Current routine ACL | `{postgres=X/postgres,service_role=X/postgres}` |
-
-The coordinator used the exact engine catalog SQL with
-`SET LOCAL search_path=pg_catalog`. Replacing only this routine's ACL in the
-catalog JSON matched exactly one entry and reproduced the original digest
-exactly. No live ACL was changed to obtain this proof. `pg_stat_statements`,
-with `stats_since=2026-10-01T08:27:00.058748Z`, reported one call to
-`revoke execute on function public.get_vault_secret(text) from anon, authenticated, public`.
-These statistics corroborate the restriction; they do not establish its exact
-execution time or actor.
-
-**This is an irreversible security fix for release recovery: never restore
-anon, authenticated or PUBLIC execute access.** Do not merge draft #173 or use
-its underguarded manual SQL. Its `427180...` observation used the default
-search path; the difference from canonical `e63f1f...` does not establish another
-live schema change. The proven baseline drift is the routine ACL restriction.
-
-`.github/scripts/reconcile-vault-acl.mjs reconcile` is a separate, one-time
-reviewed registry transition before the existing production apply step. The
-workflow requires trusted successful current-main CI, staging and image gates,
-and holds the shared production lease. The helper uses the existing local source
-validation, clean-checkout/current-main authorization and project-pinned query
-transport. It additionally requires the admitted release SHA and successful
-gate/lease outcomes. Those outcomes are workflow assertions, not an independent
-database proof of the lease; direct local execution is not a supported path.
-
-One transaction takes the protocol advisory lock `(1702521196, 1835624306)`,
-uses the canonical search path and 30/120-second lock/statement timeouts, and
-requires the exact server version, `postgres` identity, private owned registry
-shape, reviewed event triggers, existing baseline identity and zero OS journal
-rows. Repository, project, schemas, source inventory, historical source digest,
-registration time, catalog digests and count are pinned. The helper verifies
-the exact restricted routine ACL and denies effective anon/authenticated access
-and PUBLIC grants, including inherited access missed by an ACL-only comparison.
-It reconstructs the old digest by replacing only the matching JSON ACL field.
-
-Only after these checks can it update `ezil_ci.baselines.initial_catalog` from
-the original digest to the current one, asserting exactly one changed row.
-It never changes actual grants, application schema/data, historical snapshots,
-registration time or journal rows. A registry already holding the new digest
-passes all the same checks and performs no update. An ambiguous request outcome
-is reconciled by rerunning the same gated release. There is no reverse transition,
-automatic registry rollback, general rebaseline or drift-ignore option.
-
-The manifest now pins the new digest. Its `capturedAt` retains the original
-capture provenance and its historical `sourceDigest` remains unchanged; this
-section records the subsequent reviewed transition. The portable engine's
-default catalog SQL and apply behavior are unchanged: its small compatibility
-extension exposes the same catalog JSON body on request and exports the existing
-journal-shape checks for reuse. The helper never logs that full catalog body.
-After production has verified reconciliation, retire the workflow transition
-step through review before changing source inventory, adding migrations or
-upgrading PostgreSQL; its exact pins deliberately refuse those later changes.
+The reviewed baseline transition is complete. The registered initial digest is
+`e63f1fd705c4204eb370d8020182ef423d0a5df9a10c3122e0cc550fdd57f090`.
+The original capture time and historical source digest remain unchanged.
+Production now uses the regular migration engine without the one-time step.
 
 ## Journal, catalog and retries
 
@@ -194,7 +132,9 @@ owner identity. Active database event triggers must match the exact reviewed inv
 
 Every apply verifies the registered baseline and historical source digest, all
 applied IDs/checksums/order/catalog links, a contiguous applied prefix, current catalog,
-and each pending migration's before and after digests. Unknown IDs, missing
+and each pending migration's before and after digests. A verify-only entry checks
+the live catalog against its `after` digest without executing its SQL; its
+`before` digest must still link to the preceding entry. Unknown IDs, missing
 objects, unregistered schema additions and checksum drift stop the transaction.
 On timeout, disconnect or ambiguous HTTP result, rerun the same reviewed manifest
 from an eligible current-main run. The committed journal determines whether to
@@ -268,14 +208,30 @@ if the database catalog should stay unchanged; plan/apply still check that catal
 Any intended catalog change requires a separate reviewed forward migration.
 Never label canonical fragments as migrations merely to replay them.
 
-For that forward change, add a new SQL source with
-`kind: "migration"` and its SHA-256, then append one explicit migration object
-with exactly `id`, `path`, `sha256`, `before`, and `after`. Array order is execution
-order. `before` equals the previous `after`, or the initial digest for the first
+For that forward change, add a new SQL file under `app/drizzle/hardening/` and
+register it with `kind: "migration"` and its SHA-256, then append one explicit migration object
+with `id`, `path`, `sha256`, `before`, and `after`, plus the optional
+`verifyOnly` field described below. No other fields are accepted. Array order is
+execution order. `before` equals the previous `after`, or the initial digest for the first
 entry. Both digests must be observed, not guessed. Use a disposable database
 containing reviewed schema metadata to rehearse the change and obtain its after
-digest; do not replay Works' fragments to construct that database. No SQL for an
-actual future change is included in this initial implementation.
+digest; do not replay Works' fragments to construct that database.
+
+Use `"verifyOnly": true` only for a reviewed change already applied out of band
+after baseline registration. The reviewer must confirm that the recorded SQL
+reproduces the `after` digest from the `before` catalog using the same engine and
+matching database version, roles, extensions and schema metadata. The SQL must
+pass the same grammar and checksum checks as an executable migration, and all
+catalog chain rules remain unchanged. Omit `verifyOnly` for ordinary execution;
+when present, its value must be exactly `true`.
+
+For a pending verify-only entry, apply requires the live catalog to equal its
+`after` digest and records the same checksum and journal fields as an executed
+migration. It never executes that entry's SQL. A live catalog matching `before`
+or any other digest is refused. Verification cannot skip an earlier pending
+entry. Later ordinary migrations execute normally in the same transaction, and
+retries use the existing journal checks. Initial baseline registration still
+requires the initial digest; verify-only does not replace that check.
 
 `plan` returns the preserved historical `sourceDigest` inside `observedCatalog`
 and separately reports `currentSourceDigest` for the current snapshots. Both
@@ -305,6 +261,10 @@ The automatic grammar intentionally supports only:
 - `REVOKE EXECUTE ON FUNCTION owned_schema.name (args) FROM role, ...`, with a
   nonempty list drawn only from `public`, `anon`, and `authenticated`, without
   duplicates or suffixes such as `CASCADE` or `GRANTED BY`.
+- `REVOKE ALL [PRIVILEGES] ON TABLE owned_schema.name FROM role, ...`, with a
+  nonempty list drawn only from `public`, `anon`, and `authenticated`, without
+  duplicates. Other privilege lists, `service_role`, `CASCADE`, and `GRANTED BY`
+  are refused.
 - `ALTER TABLE owned_schema.name ENABLE ROW LEVEL SECURITY`.
 
 For both function forms, `args` is empty or a comma-separated list of nonempty
@@ -315,8 +275,8 @@ the `DEFAULT` keyword are refused. Keywords retain the parser's existing
 unquoted, case-insensitive matching; quoted identifiers retain their case.
 Statements must be separated by semicolons; the last semicolon is optional.
 The existing catalog fingerprint includes function configuration (`proconfig`),
-function ACLs (`proacl`), and table `relrowsecurity`, so verification detects all
-three hardening changes without changing the fingerprint format.
+function ACLs (`proacl`), table ACLs (`relacl`), and table `relrowsecurity`, so
+verification detects these changes without changing the fingerprint format.
 
 Comments (including nested block comments) and quoted identifiers are tokenized;
 statements are not split using a semicolon regex. Expressions, defaults, custom
@@ -353,12 +313,7 @@ checks. All test SQL and records live in disposable databases, and are separate
 from production migrations and baseline evidence. OS uses Docker mode without
 adding a PGlite dependency. Docker mode needs the pinned image pulled first.
 
-The same suite includes the vault ACL transition: initial reconciliation and
-unchanged reruns, retained permission restrictions, current-main authorization,
-failed gates, incorrect registry identities/owners/grants/shape, journal rows,
-inherited routine access, unrelated catalog drift and failed old-digest proof.
-Its small disposable catalog substitutes only fixture digest/count/version
-constants in a temporary copy of the helper; production has no override flags.
-Docker additionally checks concurrent transition retries. These fixtures do
-not reproduce the production catalog; the pinned production digests come from
-the read-only evidence above.
+The suite checks verify-only registration, unchanged retries, catalog mismatches,
+ordinary migrations after verification, and rejection of SQL outside the grammar.
+A statement that would fail if replayed proves that verification executes no
+migration SQL. Docker also checks concurrent verify-only retries.

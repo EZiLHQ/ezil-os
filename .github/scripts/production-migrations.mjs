@@ -116,8 +116,14 @@ export function additiveSQL(sql, schemas) {
         while (is(',')) { take(','); ident(); } take(')');
       }
     } else if (is('revoke')) {
-      take('revoke'); take('execute'); take('on'); take('function'); qualified(); functionArgs(); take('from');
-      identifierList(['public', 'anon', 'authenticated'], 'function revoke role');
+      take('revoke');
+      if (is('all')) {
+        take('all'); if (is('privileges')) take('privileges');
+        take('on'); take('table'); qualified();
+      } else {
+        take('execute'); take('on'); take('function'); qualified(); functionArgs();
+      }
+      take('from'); identifierList(['public', 'anon', 'authenticated'], 'revoke role');
     } else {
       take('alter');
       if (is('function')) {
@@ -173,7 +179,9 @@ export async function validate(root, manifestPath = '.github/production-migratio
   const ids = new Set(); const paths = new Set();
   let previous = manifest.initialCatalog?.digest;
   for (const migration of manifest.migrations) {
-    fields(migration, ['id', 'path', 'sha256', 'before', 'after'], 'migration');
+    const optional = Object.hasOwn(migration ?? {}, 'verifyOnly') ? ['verifyOnly'] : [];
+    fields(migration, ['id', 'path', 'sha256', 'before', 'after', ...optional], 'migration');
+    check(!optional.length || migration.verifyOnly === true, 'verifyOnly must be true when present');
     check(typeof migration.id === 'string' && /^[a-z0-9][a-z0-9_-]{0,127}$/.test(migration.id) && !ids.has(migration.id) && !paths.has(migration.path), 'Invalid/duplicate migration');
     check(hex.test(migration.sha256) && hex.test(migration.before) && hex.test(migration.after) && migration.before === previous && migration.before !== migration.after, 'Invalid catalog chain');
     const file = files.get(migration.path);
@@ -256,6 +264,15 @@ function verifyJournal(manifest) {
   ${assertSQL(`(SELECT count(*) FROM ezil_ci.journal WHERE repository=${repo}) = COALESCE((SELECT max(ordinal) FROM ezil_ci.journal WHERE repository=${repo}),0)`, 'Journal is not a contiguous prefix')}`;
 }
 
+function verifyCurrentCatalog(manifest, applied) {
+  const next = `(${json(manifest.migrations)}->(${applied}))`;
+  return `IF ${next}->>'verifyOnly'='true' THEN
+    ${assertSQL(`actual=${next}->>'after'`, 'Verify-only migration catalog mismatch; live catalog must equal the after digest')}
+  ELSE
+    ${assertSQL('actual=expected', 'Current catalog drift')}
+  END IF;`;
+}
+
 export function journalShape() {
   return `
   ${assertSQL(`NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='ezil_ci') AND NOT EXISTS (SELECT 1 FROM pg_rewrite r JOIN pg_class c ON c.oid=r.ev_class JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='ezil_ci') AND NOT EXISTS (SELECT 1 FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='ezil_ci')`, 'Unexpected journal routine/rule/policy')}
@@ -301,15 +318,16 @@ export function applySQL({ manifest, files }) {
     INSERT INTO ezil_ci.baselines(repository,project,schemas,initial_catalog,snapshots) VALUES (${repo},${literal(manifest.project)},${json([...manifest.schemas].sort())},${literal(manifest.initialCatalog.digest)},${literal(manifest.initialCatalog.sourceDigest)});
   END IF;
   expected := COALESCE((SELECT after_catalog FROM ezil_ci.journal WHERE repository=${repo} ORDER BY ordinal DESC LIMIT 1),${literal(manifest.initialCatalog.digest)});
-  ${assertSQL('actual=expected', 'Current catalog drift')}
+  ${verifyCurrentCatalog(manifest, `SELECT count(*)::integer FROM ezil_ci.journal WHERE repository=${repo}`)}
   `;
   manifest.migrations.forEach((m, index) => {
+    const sql = additiveSQL(files.get(m.path).sql, manifest.schemas);
     // Execute as a string in the enclosing DO block: transaction commands cannot
     // escape the block, even if the reviewed grammar is extended in the future.
     body += `IF NOT EXISTS (SELECT 1 FROM ezil_ci.journal WHERE repository=${repo} AND id=${literal(m.id)}) THEN
-      ${assertSQL(`${digestExpression(manifest.schemas)}=${literal(m.before)}`, 'Migration before catalog mismatch')}
-      EXECUTE ${literal(additiveSQL(files.get(m.path).sql, manifest.schemas))};
-      ${assertSQL(`${digestExpression(manifest.schemas)}=${literal(m.after)}`, 'Migration after catalog mismatch')}
+      ${m.verifyOnly === true ? '' : `${assertSQL(`${digestExpression(manifest.schemas)}=${literal(m.before)}`, 'Migration before catalog mismatch')}
+      EXECUTE ${literal(sql)};`}
+      ${assertSQL(`${digestExpression(manifest.schemas)}=${literal(m.after)}`, m.verifyOnly === true ? 'Verify-only migration catalog mismatch; live catalog must equal the after digest' : 'Migration after catalog mismatch')}
       INSERT INTO ezil_ci.journal(repository,id,checksum,ordinal,before_catalog,after_catalog) VALUES (${repo},${literal(m.id)},${literal(m.sha256)},${index + 1},${literal(m.before)},${literal(m.after)});
     END IF;\n`;
   });
@@ -335,7 +353,7 @@ export function planSQL(manifest) {
         SELECT count(*)::integer INTO applied FROM ezil_ci.journal WHERE repository=${repo};
         SELECT COALESCE((SELECT after_catalog FROM ezil_ci.journal WHERE repository=${repo} ORDER BY ordinal DESC LIMIT 1),expected) INTO expected;
       END IF;
-      ${assertSQL('actual=expected', 'Current catalog drift')}
+      ${verifyCurrentCatalog(manifest, 'applied')}
     ` : ''}
     PERFORM set_config('ezil_ci.plan_applied',applied::text,true);
   END`;
@@ -413,7 +431,7 @@ export async function run(argv, options = {}) {
     const state = rows.find(r => hex.test(r.digest) && Number.isInteger(r.objects) && Number.isInteger(r.schemas));
     check(state, 'Missing catalog response');
     check(state.schemas === manifest.schemas.length, 'Missing owned schema; cannot baseline');
-    log(JSON.stringify({ repository: manifest.repository, project: manifest.project, observedCatalog: { digest: state.digest, objects: state.objects, capturedAt: new Date().toISOString(), sourceDigest: manifest.initialCatalog?.sourceDigest ?? snapshotHash(manifest) }, currentSourceDigest: snapshotHash(manifest), baseline: manifest.initialCatalog ? 'catalog verified' : 'review this observation before setting initialCatalog', pendingMigrations: manifest.migrations.slice(state.applied).map(m => m.id) }));
+    log(JSON.stringify({ repository: manifest.repository, project: manifest.project, observedCatalog: { digest: state.digest, objects: state.objects, capturedAt: new Date().toISOString(), sourceDigest: manifest.initialCatalog?.sourceDigest ?? snapshotHash(manifest) }, currentSourceDigest: snapshotHash(manifest), baseline: manifest.initialCatalog ? 'catalog verified' : 'review this observation before setting initialCatalog', pendingMigrations: manifest.migrations.slice(state.applied).map(m => ({ id: m.id, status: m.verifyOnly === true ? 'pending-verify-only' : 'pending' })) }));
     return;
   }
   check(manifest.initialCatalog, 'Live catalog baseline required before apply');
