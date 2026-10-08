@@ -626,15 +626,6 @@ jobs:
           name: os-recovery-${{ needs.trust.outputs.sha }}-${{ github.run_attempt }}
           path: previous-release.json
           if-no-files-found: error
-      - name: Reconcile reviewed vault ACL baseline transition
-        env:
-          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-          GITHUB_TOKEN: ${{ github.token }}
-          EZIL_TRANSITION_TRUSTED: ${{ needs.trust.outputs.allowed }}
-          EZIL_TRANSITION_STAGING: ${{ needs.preview.result }}
-          EZIL_TRANSITION_IMAGES: ${{ needs.images.result }}
-          EZIL_TRANSITION_LEASE: ${{ steps.production_lease.outcome }}
-        run: node .github/scripts/reconcile-vault-acl.mjs reconcile
       - name: Verify or apply reviewed production migrations
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}

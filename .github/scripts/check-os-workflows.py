@@ -76,8 +76,7 @@ for job_name in ('preview', 'production'):
     assert steps.index(check) == next(i for i, step in enumerate(steps) if step.get('uses', '').startswith('actions/setup-node@')) + 1
     if job_name == 'production':
         first_migration = next(i for i, step in enumerate(steps) if 'production-migrations.mjs' in yaml.safe_dump(step))
-        reconcile = next(i for i, step in enumerate(steps) if 'reconcile-vault-acl.mjs' in yaml.safe_dump(step))
-        assert steps.index(check) < min(first_migration, reconcile), 'Production contract must precede database writes'
+        assert steps.index(check) < first_migration, 'Production contract must precede database writes'
 for job in ('preview', 'production'):
     assert jobs[job]['env']['EZIL_E2E_COMPUTER_ID'] == '${{ secrets.EZIL_E2E_COMPUTER_ID }}'
 for name in ('prod', 'prod-responsiveness', 'prod-window-stacking', 'prod-reconcile', 'prod-lifecycle'):

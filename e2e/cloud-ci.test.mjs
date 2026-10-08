@@ -534,21 +534,3 @@ test('container readback uses scoped pull credentials and removes temporary Dock
   assert.equal(fs.existsSync(calls[0].args[1]),false);
   assert.equal(calls[1].args.at(-1),image);
 });
-
-test('vault ACL transition runs only under gated production lease before normal apply', () => {
-  const workflow = fs.readFileSync(new URL('../.github/workflows/preview.yml', import.meta.url), 'utf8');
-  const production = workflow.split('\n  production:\n')[1].split('\n  summary:\n')[0];
-  const command = 'node .github/scripts/reconcile-vault-acl.mjs reconcile';
-  assert.equal(workflow.split(command).length - 1, 1);
-  assert.match(production, /needs: \[trust, preview, images\]/);
-  assert.match(production, /if: needs\.trust\.outputs\.production == 'true'/);
-  assert.ok(production.indexOf('Acquire shared production lease') < production.indexOf(command));
-  assert.ok(production.indexOf(command) < production.indexOf('node .github/scripts/production-migrations.mjs apply'));
-  const step = production.split('- name: Reconcile reviewed vault ACL baseline transition\n')[1].split('\n      - name:')[0];
-  for (const [key, value] of Object.entries({
-    TRUSTED: 'needs.trust.outputs.allowed', STAGING: 'needs.preview.result',
-    IMAGES: 'needs.images.result', LEASE: 'steps.production_lease.outcome',
-  })) assert.ok(step.includes(`EZIL_TRANSITION_${key}: \${{ ${value} }}`));
-  assert.doesNotMatch(step, /if:|continue-on-error/);
-  assert.ok(production.indexOf('Release shared production lease') > production.indexOf(command));
-});
