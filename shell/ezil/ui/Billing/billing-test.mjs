@@ -9,6 +9,11 @@ import {
 } from './index.js';
 
 const config = { WALLET_V2_ENABLED: true };
+const rateCodes = ['rate_limited', 'tpm_limited', 'concurrency_limit', 'spend_limit_reached'];
+const serviceCodes = [
+    'global_cap_reached', 'killswitch', 'paused', 'model_disabled',
+    'policy_unavailable', 'controls_unavailable', 'credit_policy_unavailable', 'pricing_unavailable',
+];
 const wallet = (included = '20000000', purchased = '0', plan = 'free') => ({
     version: 2, unit: 'usd_micro', plan, included: { balance: included, periodEnd: null }, purchased: { balance: purchased },
 });
@@ -33,16 +38,26 @@ function fixture (t, options = {}) {
 }
 const action = (popup, name) => popup.element?.querySelector(`[data-action="${name}"]`);
 
-test('C4 classifies all four families and rejects mismatched/unknown envelopes', () => {
+test('v1.1 A5 classifies every row and rejects mismatched/unknown envelopes', () => {
     const cases = [
         [402, 'insufficient_credits', 'topup'], [402, 'no_entitlement', 'subscribe'],
-        ...['rate_limited', 'tpm_limited', 'concurrency_limit', 'spend_limit_reached', 'global_cap_reached'].map(code => [429, code, 'retry_later']),
-        ...[502, 503, 504].flatMap(status => ['provider_error', 'provider_unavailable', 'upstream_timeout'].map(code => [status, code, 'provider'])),
+        ...rateCodes.map(code => [429, code, 'retry_later']),
+        ...serviceCodes.map(code => [503, code, 'retry_later']),
+        ...[502, 504].flatMap(status => ['upstream_error', 'upstream_unavailable', 'upstream_timeout', 'upstream_future'].map(code => [status, code, 'provider'])),
+        ...[502, 503, 504].flatMap(status => ['provider_error', 'provider_unavailable'].map(code => [status, code, 'unknown'])),
+        ...[429, 502, 504].flatMap(status => serviceCodes.map(code => [status, code, 'unknown'])),
+        ...rateCodes.map(code => [503, code, 'unknown']),
+        ...['upstream_error', 'upstream_unavailable', 'upstream_timeout'].map(code => [503, code, 'unknown']),
         [429, 'insufficient_credits', 'unknown'], [402, 'rate_limited', 'unknown'],
-        [500, 'provider_error', 'unknown'], [200, 'no_entitlement', 'unknown'], [402, 'future_code', 'unknown'],
+        [500, 'upstream_error', 'unknown'], [200, 'no_entitlement', 'unknown'],
+        ...[402, 429, 502, 503, 504].map(status => [status, 'future_code', 'unknown']),
+        ['502', 'upstream_error', 'unknown'], [502, 'not_upstream_error', 'unknown'],
     ];
-    for ( const [status, code, expected] of cases ) assert.equal(classifyGatewayError(status, { error: { code } }), expected);
-    for ( const body of [null, undefined, {}, 'rate_limited', { code: 'rate_limited' }] ) assert.equal(classifyGatewayError(429, body), 'unknown');
+    for ( const [status, code, expected] of cases ) assert.equal(classifyGatewayError(status, { error: { code } }), expected, `${status} ${code}`);
+    for ( const status of [402, 429, 502, 503, 504] ) {
+        for ( const body of [null, undefined, {}, 'rate_limited', { code: 'rate_limited' }] ) assert.equal(classifyGatewayError(status, body), 'unknown');
+        for ( const code of [null, undefined, 12, {}, ['upstream_error']] ) assert.equal(classifyGatewayError(status, { error: { code } }), 'unknown');
+    }
 });
 
 test('USD formatting stays exact for ordinary, fractional, and very large values', () => {
@@ -67,7 +82,7 @@ test('feature flag is strictly opt-in, with no DOM or reads by default', async t
     assert.equal(doc.querySelector('dialog, .ezil-wallet-badge, section'), null);
 });
 
-test('402 actions distinguish top-up and subscription; 429 never offers payment', t => {
+test('402 actions distinguish top-up and subscription', t => {
     const { popup } = fixture(t, { startCheckout: () => {}, refreshWallet: () => wallet() });
     popup.open(refusal());
     assert.equal(action(popup, 'topup').textContent, 'Top up');
@@ -78,19 +93,56 @@ test('402 actions distinguish top-up and subscription; 429 never offers payment'
     popup.open(refusal('no_entitlement'));
     assert.equal(action(popup, 'topup'), null);
     assert.ok(action(popup, 'subscribe'));
-    for ( const code of ['rate_limited', 'tpm_limited', 'concurrency_limit', 'spend_limit_reached', 'global_cap_reached', 'insufficient_credits'] ) {
-        popup.open(refusal(code, 429, { actions: ['topup', 'subscribe'], plan: 'free', retryAfterSeconds: 12 }));
+});
+
+test('429 limits and 503 service refusals, including global_cap_reached, show retry hints and never offer payment', t => {
+    const { popup } = fixture(t, { startCheckout: () => assert.fail('unexpected checkout'), refreshWallet: () => wallet() });
+    const cases = [...rateCodes.map(code => [429, code]), ...serviceCodes.map(code => [503, code])];
+    for ( const [status, code] of cases ) {
+        popup.open(refusal(code, status, { actions: ['topup', 'subscribe'], plan: 'free', retryAfterSeconds: 12 }));
         assert.equal(action(popup, 'topup'), null);
         assert.equal(action(popup, 'subscribe'), null);
         assert.equal(action(popup, 'resend'), null);
-        if ( code !== 'insufficient_credits' ) {
-            assert.equal(action(popup, 'later').textContent, 'Try again later');
-            assert.match(popup.element.textContent, /12 seconds/);
+        assert.equal(action(popup, 'later').textContent, 'Try again later');
+        assert.match(popup.element.textContent, /Try again in 12 seconds\./);
+        popup.open(refusal(code, status));
+        assert.doesNotMatch(popup.element.textContent, /Try again in/);
+    }
+});
+
+test('unknown errors never offer payment or claim nothing was charged', t => {
+    const { popup } = fixture(t);
+    for ( const [status, code] of [[429, 'global_cap_reached'], [429, 'insufficient_credits'], [503, 'provider_unavailable'], [502, 'provider_error']] ) {
+        popup.open(refusal(code, status, { actions: ['topup', 'subscribe'], charge: 'none', retryAfterSeconds: 12 }));
+        assert.equal(action(popup, 'topup'), null);
+        assert.equal(action(popup, 'subscribe'), null);
+        assert.equal(action(popup, 'resend'), null);
+        assert.equal(action(popup, 'later'), null);
+        assert.doesNotMatch(popup.element.textContent, /Nothing was charged|Try again in/);
+    }
+});
+
+test('provider copy promises no charge only for error.charge none; pending_review and missing states are reconciled', t => {
+    const { popup } = fixture(t, { onResend: () => assert.fail('automatic resend') });
+    for ( const [status, code] of [[502, 'upstream_error'], [502, 'upstream_unavailable'], [504, 'upstream_timeout'], [504, 'upstream_future']] ) {
+        for ( const charge of ['none', 'pending_review', undefined, null, '', 'NONE', 'unknown'] ) {
+            const failure = refusal(code, status, { charge });
+            failure.body.charge = 'none';
+            popup.open(failure);
+            const copy = popup.element.querySelector('h2').textContent;
+            if ( charge === 'none' ) {
+                assert.equal(copy, 'Provider problem. Nothing was charged for this request.');
+                assert.doesNotMatch(copy, /reconciled/);
+            } else {
+                assert.equal(copy, 'Provider problem. Usage will be reconciled and charged at most once.');
+                assert.doesNotMatch(copy, /Nothing was charged/);
+            }
+            assert.equal(action(popup, 'resend').textContent, 'Retry');
+            assert.equal(action(popup, 'resend').disabled, false);
+            assert.equal(action(popup, 'topup'), null);
+            assert.equal(action(popup, 'subscribe'), null);
         }
     }
-    popup.open(refusal('provider_unavailable', 503));
-    assert.match(popup.element.textContent, /Nothing was charged/);
-    assert.equal(action(popup, 'resend').textContent, 'Retry');
 });
 
 test('402 balance envelope uses USD strings without inferring USD from v1', t => {
