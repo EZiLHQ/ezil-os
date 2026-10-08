@@ -85,3 +85,56 @@ Rules for 402:
 - OS: `cd app && npx vitest run` (the existing runner; install with `bun install` first) plus the new tests. Shell: `node shell/ezil/ui/Billing/*.test.mjs`.
 - Gateway: `npm test` (vitest + PGlite migration replay).
 - Use `PATH=/root/.bun/bin:$PATH`. No hosted DB, no wrangler deploy, no AWS writes, no Cashfree calls.
+
+---
+
+## v1.1 amendment (2026-10-08, lead). Supersedes conflicting text above.
+
+Cause: the C4 table named codes and statuses the gateway does not emit. The real codes on `origin/main` `c60ac94` are below. Existing codes are **not renamed**.
+
+**A1. v2 enrolment.** An account enrols in v2 on its first accepted funding event if it has no v1 wallet, or if its v1 wallet is **empty**. Empty means:
+- zero balance
+- no grants ever
+- no ledger rows
+- no reservations
+
+That move is lossless, because nothing gets converted. A non-empty v1 wallet gets `409 policy_conflict` with `detail: "wallet_conversion_required"`, and nothing changes.
+
+**A2. Retry hints.** `rate_limited`, `tpm_limited`, `concurrency_limit` and `spend_limit_reached` are 429s. They add `error.retryAfterSeconds` (a positive integer) and a matching `Retry-After` header.
+
+**A3. Service-side refusals.** All are 503 and are refused before any provider call:
+- `global_cap_reached`
+- `killswitch`
+- `paused`
+- `model_disabled`
+- `policy_unavailable`
+- `controls_unavailable`
+- `credit_policy_unavailable`
+- `pricing_unavailable`
+
+They add `error.retryAfterSeconds` when known. The OS classifies them `retry_later` and never offers a top-up.
+
+**A4. Provider failures.** These are the existing codes:
+
+| code | status |
+|---|---|
+| `upstream_error` | 502 |
+| `upstream_unavailable` | 502 |
+| `upstream_timeout` | 504 |
+
+They add `error.charge ∈ {"none","pending_review"}`:
+- `none` means the hold was released and nothing was charged.
+- `pending_review` means cost is unknown and the hold is kept. It is reconciled from real usage and never charged twice.
+
+The OS classifies any 502/504 `upstream_*` code as `provider`. The UI says "nothing was charged" **only** when `charge === "none"`. Otherwise it says the usage will be reconciled and charged at most once. The names `provider_error` and `provider_unavailable` are withdrawn.
+
+**A5. Classifier table, final:**
+
+| status / code | class |
+|---|---|
+| 402 `insufficient_credits` | `topup` |
+| 402 `no_entitlement` | `subscribe` |
+| 429 (any A2 code) | `retry_later` |
+| 503 (any A3 code) | `retry_later` |
+| 502/504 `upstream_*` | `provider` |
+| anything else | `unknown` |
