@@ -95,6 +95,62 @@ test('402 actions distinguish top-up and subscription', t => {
     assert.ok(action(popup, 'subscribe'));
 });
 
+test('402 server actions offer both checkouts without a wallet plan', async t => {
+    const checkouts = [];
+    const { popup } = fixture(t, {
+        wallet: null, maxPollTries: 1,
+        startCheckout: value => { checkouts.push(value); },
+        refreshWallet: () => wallet('0', '0'),
+    });
+    popup.open(refusal('insufficient_credits', 402, {
+        actions: ['topup', 'subscribe'],
+        balance: { includedUsdMicro: '0', purchasedUsdMicro: '0' },
+    }));
+    assert.equal(popup.wallet.plan, undefined);
+    assert.equal(action(popup, 'topup')?.textContent, 'Top up');
+    assert.equal(action(popup, 'subscribe')?.textContent, 'Upgrade plan');
+    for ( const name of ['subscribe', 'topup'] ) {
+        assert.equal(action(popup, name).disabled, false);
+        action(popup, name).click();
+        await until(() => popup.checkoutState === 'unconfirmed');
+    }
+    assert.deepEqual(checkouts, ['subscribe', 'topup']);
+});
+
+test('402 action arrays override plan fallback and ignore unknown or duplicate actions', t => {
+    const { popup } = fixture(t);
+    const cases = [
+        [[], []],
+        [['future_action'], []],
+        [['subscribe'], ['subscribe']],
+        [['topup'], ['topup']],
+        [['subscribe', 'future_action', 'topup', 'subscribe'], ['topup', 'subscribe']],
+    ];
+    for ( const code of ['insufficient_credits', 'no_entitlement'] ) {
+        for ( const plan of ['free', 'subscriber'] ) {
+            for ( const [actions, expected] of cases ) {
+                popup.open({ ...refusal(code, 402, { actions }), wallet: wallet('0', '0', plan) });
+                const actual = [...popup.element.querySelectorAll('[data-action]')].map(button => button.dataset.action);
+                assert.deepEqual(actual, [...expected, 'resend', 'close'], `${code} ${plan} ${JSON.stringify(actions)}`);
+            }
+        }
+    }
+});
+
+test('402 missing or non-array actions preserve the current plan fallback', t => {
+    const { popup } = fixture(t);
+    for ( const actions of [undefined, null, 'subscribe', { topup: true }] ) {
+        for ( const [plan, expected] of [[undefined, ['topup']], ['free', ['topup', 'subscribe']], ['subscriber', ['topup']]] ) {
+            popup.open({ ...refusal('insufficient_credits', 402, { actions }), wallet: plan ? wallet('0', '0', plan) : null });
+            const actual = [...popup.element.querySelectorAll('[data-action]')].map(button => button.dataset.action);
+            assert.deepEqual(actual, [...expected, 'resend', 'close']);
+        }
+        popup.open(refusal('no_entitlement', 402, { actions }));
+        assert.equal(action(popup, 'topup'), null);
+        assert.ok(action(popup, 'subscribe'));
+    }
+});
+
 test('429 limits and 503 service refusals, including global_cap_reached, show retry hints and never offer payment', t => {
     const { popup } = fixture(t, { startCheckout: () => assert.fail('unexpected checkout'), refreshWallet: () => wallet() });
     const cases = [...rateCodes.map(code => [429, code]), ...serviceCodes.map(code => [503, code])];
@@ -126,7 +182,7 @@ test('provider copy promises no charge only for error.charge none; pending_revie
     const { popup } = fixture(t, { onResend: () => assert.fail('automatic resend') });
     for ( const [status, code] of [[502, 'upstream_error'], [502, 'upstream_unavailable'], [504, 'upstream_timeout'], [504, 'upstream_future']] ) {
         for ( const charge of ['none', 'pending_review', undefined, null, '', 'NONE', 'unknown'] ) {
-            const failure = refusal(code, status, { charge });
+            const failure = refusal(code, status, { charge, actions: ['topup', 'subscribe'] });
             failure.body.charge = 'none';
             popup.open(failure);
             const copy = popup.element.querySelector('h2').textContent;
@@ -305,7 +361,7 @@ test('compute picker uses server shapes, eligibility, Upgrade, and confirmation 
         config, getComputer: () => ({ id: 'c-1' }),
         getShapes: async () => [
             { id: 'standard', vcpu: 2, memoryGiB: 6, diskGB: 16, eligible: true },
-            { id: 'performance', vcpu: 4, memoryGiB: 12, diskGB: 20, eligible: upgraded, reason: 'Active subscription required <script>' },
+            { id: 'performance', vcpu: 4, memoryGiB: 12, diskGB: 20, eligible: upgraded, reason: 'subscription_required' },
         ],
         onUpgrade: () => { upgraded = true; },
         confirmChange: ({ message }) => { warning = message; return new Promise(resolve => { confirm = resolve; }); },
@@ -314,7 +370,7 @@ test('compute picker uses server shapes, eligibility, Upgrade, and confirmation 
     await picker.ready;
     assert.match(picker.element.textContent, /Compute size/);
     assert.match(picker.element.textContent, /4 virtual CPUs · 12 GiB memory · 20 GB disk/);
-    assert.match(picker.element.textContent, /Active subscription required/);
+    assert.match(picker.element.textContent, /Requires a subscription/);
     assert.equal(picker.element.querySelector('script'), null);
     assert.equal(picker.element.querySelector('[data-shape="performance"]').disabled, true);
     picker.element.querySelector('[data-shape="performance"]').click();
@@ -336,4 +392,44 @@ test('compute picker uses server shapes, eligibility, Upgrade, and confirmation 
     confirm(true);
     await tick();
     assert.deepEqual(changes, [{ computerId: 'c-1', shape: 'performance' }]);
+});
+
+test('compute picker separates localised eligibility reasons from shape labels', async t => {
+    const { doc } = fixture(t);
+    let reason = 'subscription_required';
+    const picker = mountComputeSize(doc.body, {
+        config,
+        getShapes: async () => [{ id: 'performance', vcpu: 4, memoryGiB: 12, diskGB: 20, eligible: false, reason }],
+    });
+    await picker.ready;
+    const assertReason = copy => {
+        const button = picker.element.querySelector('[data-shape="performance"]');
+        assert.equal(button.disabled, true);
+        assert.equal(button.textContent, 'performance · 4 virtual CPUs · 12 GiB memory · 20 GB disk');
+        assert.equal(button.nextElementSibling.textContent, copy);
+        assert.equal(button.title, copy);
+        assert.match(button.parentElement.textContent, /20 GB disk\s/);
+        assert.doesNotMatch(picker.element.textContent, /subscription_required|future_reason|<script>/);
+        assert.equal(picker.element.querySelector('script'), null);
+    };
+    assertReason('Requires a subscription');
+    for ( reason of ['future_reason', 'Active subscription required <script>', undefined, null, ''] ) {
+        await picker.refresh();
+        assertReason('Not available on your plan');
+    }
+    const previousI18n = globalThis.i18n;
+    t.after(() => {
+        if ( previousI18n === undefined ) delete globalThis.i18n;
+        else globalThis.i18n = previousI18n;
+    });
+    globalThis.i18n = key => ({
+        compute_subscription_required: 'Abonnement requis',
+        compute_ineligible: 'Indisponible avec votre forfait',
+    })[key] ?? key;
+    reason = 'subscription_required';
+    await picker.refresh();
+    assertReason('Abonnement requis');
+    reason = 'future_reason';
+    await picker.refresh();
+    assertReason('Indisponible avec votre forfait');
 });

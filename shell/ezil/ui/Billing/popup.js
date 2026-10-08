@@ -169,11 +169,14 @@ export function createBillingPopup ({
         const actions = node('div');
         actions.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;';
         const busy = checking || sending;
-        if ( kind === 'topup' ) {
-            actions.append(button('topup', text('billing_topup'), () => { void checkout('topup'); }, busy || ! startCheckout || ! refreshWallet));
-        }
-        if ( kind === 'subscribe' || (kind === 'topup' && plan === 'free') ) {
-            actions.append(button('subscribe', text('billing_upgrade'), () => { void checkout('subscribe'); }, busy || ! startCheckout || ! refreshWallet));
+        if ( kind === 'topup' || kind === 'subscribe' ) {
+            const serverActions = Array.isArray(error.actions) ? error.actions : null;
+            if ( serverActions ? serverActions.includes('topup') : kind === 'topup' ) {
+                actions.append(button('topup', text('billing_topup'), () => { void checkout('topup'); }, busy || ! startCheckout || ! refreshWallet));
+            }
+            if ( serverActions ? serverActions.includes('subscribe') : kind === 'subscribe' || plan === 'free' ) {
+                actions.append(button('subscribe', text('billing_upgrade'), () => { void checkout('subscribe'); }, busy || ! startCheckout || ! refreshWallet));
+            }
         }
         if ( ['topup', 'subscribe', 'provider'].includes(kind) ) {
             actions.append(button('resend', text(kind === 'provider' ? 'billing_retry' : 'billing_resend'), () => { void resend(); }, busy || ! onResend));
