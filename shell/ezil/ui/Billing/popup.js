@@ -1,6 +1,9 @@
 import { classifyGatewayError } from './classify.js';
-import { billingEnabled, billingReason, text } from './text.js';
+import { billingEnabled, text } from './text.js';
 import { formatUsdMicro, walletBalances, walletSummary } from './wallet-badge.js';
+import { billingIcon, injectBillingStyles } from './style-dialog.js';
+
+let headlineSequence = 0;
 
 function bounded (value, fallback, max) {
     return Number.isFinite(value) ? Math.max(1, Math.min(max, Math.floor(value))) : fallback;
@@ -30,6 +33,8 @@ export function createBillingPopup ({
     let checking = false;
     let checkoutState = 'idle';
     let notice = '';
+    let balanceRefreshed = false;
+    const headlineId = `ezil-billing-headline-${++headlineSequence}`;
 
     function node (tag, copy) {
         const el = doc.createElement(tag);
@@ -42,8 +47,7 @@ export function createBillingPopup ({
         el.type = 'button';
         el.dataset.action = action;
         el.disabled = disabled;
-        el.className = 'ezil-settings-btn';
-        el.style.cssText = 'padding:8px 12px;cursor:pointer;';
+        el.className = 'ezil-billing-button';
         el.addEventListener('click', event => {
             if ( event.detail > 1 || el.disabled ) return;
             handler();
@@ -61,7 +65,7 @@ export function createBillingPopup ({
     }
 
     async function resend () {
-        if ( sending || checking || destroyed || ! element || ! onResend ) return;
+        if ( sending || checking || destroyed || ! element || ! onResend || ! canResend() ) return;
         sending = true;
         notice = '';
         render();
@@ -69,11 +73,26 @@ export function createBillingPopup ({
             await onResend(draft);
             close();
         } catch {
-            notice = text('billing_resend_failed');
+            notice = text('billing_dlg_resend_failed');
         } finally {
             sending = false;
             render();
         }
+    }
+
+    function canResend () {
+        const required = failure.body?.error?.requiredUsdMicro ?? failure.body?.requiredUsdMicro;
+        // Legacy refusals have no USD requirement. Never convert their balances.
+        if ( required === undefined ) return true;
+        if ( typeof required !== 'string' || !/^\d+$/.test(required) || ! balanceRefreshed ) return false;
+        const balances = walletBalances(wallet);
+        return !! balances && balances.included + balances.purchased >= BigInt(required);
+    }
+
+    function updateWallet (next) {
+        wallet = next;
+        balanceRefreshed = true;
+        render();
     }
 
     async function readWallet () {
@@ -95,7 +114,7 @@ export function createBillingPopup ({
         if ( checking || sending || destroyed || ! element || ! startCheckout || ! refreshWallet ) return;
         checking = true;
         checkoutState = 'pending';
-        notice = text('billing_checking_wallet');
+        notice = text('billing_dlg_waiting');
         const before = wallet;
         render();
         try {
@@ -108,6 +127,7 @@ export function createBillingPopup ({
                     const next = await readWallet();
                     if ( destroyed ) break;
                     wallet = next;
+                    balanceRefreshed = true;
                     const previous = walletBalances(before);
                     const current = walletBalances(next);
                     const changed = previous && current && (action === 'subscribe'
@@ -115,7 +135,7 @@ export function createBillingPopup ({
                         : current.purchased > previous.purchased);
                     if ( changed ) {
                         checkoutState = 'updated';
-                        notice = text('billing_wallet_updated');
+                        notice = text('billing_dlg_updated');
                         break;
                     }
                 } catch {
@@ -124,11 +144,11 @@ export function createBillingPopup ({
             }
             if ( checkoutState !== 'updated' ) {
                 checkoutState = 'unconfirmed';
-                notice = text('billing_payment_unconfirmed');
+                notice = text('billing_dlg_unconfirmed');
             }
         } catch {
             checkoutState = 'failed';
-            notice = text('billing_checkout_failed');
+            notice = text('billing_dlg_checkout_failed');
         } finally {
             checking = false;
             render();
@@ -142,55 +162,109 @@ export function createBillingPopup ({
         const error = failure.body?.error ?? {};
         const plan = wallet?.plan ?? error.plan ?? failure.body?.plan;
         element.replaceChildren();
-        element.append(node('h2', billingReason(kind, failure.body)));
+        const header = node('div');
+        header.className = 'ezil-billing-header';
+        const headline = node('h2', text(kind === 'subscribe' ? 'billing_dlg_subscribe_headline' : 'billing_dlg_topup_headline'));
+        headline.id = headlineId;
+        headline.className = 'ezil-billing-headline';
+        const dismiss = button('dismiss', '×', close);
+        dismiss.classList.add('ezil-billing-dismiss');
+        dismiss.setAttribute('aria-label', text('billing_dlg_close'));
+        header.append(headline, dismiss);
+        element.append(header);
         const balances = walletBalances(wallet);
+        const required = error.requiredUsdMicro ?? failure.body?.requiredUsdMicro;
+        const subline = node('p', text('billing_dlg_draft_kept'));
+        subline.className = 'ezil-billing-subline';
+        if ( balances && required !== undefined && formatUsdMicro(required) !== '—' ) {
+            subline.textContent = `${text('billing_dlg_required', { amount: formatUsdMicro(required) })} ${subline.textContent}`;
+        }
+        element.append(subline);
         if ( balances ) {
             const list = node('dl');
+            list.className = 'ezil-billing-balances';
             for ( const bucket of ['included', 'purchased'] ) {
-                list.append(node('dt', text(`billing_${bucket}`)), node('dd', formatUsdMicro(String(balances[bucket]))));
+                const column = node('div');
+                column.className = 'ezil-billing-bucket';
+                const amount = node('dd', formatUsdMicro(String(balances[bucket])));
+                amount.className = 'ezil-billing-amount';
+                const note = node('dd');
+                note.className = 'ezil-billing-note';
+                const end = wallet?.included?.periodEnd;
+                if ( bucket === 'purchased' ) note.textContent = text('billing_dlg_purchased_note');
+                else if ( end && Number.isFinite(Date.parse(end)) ) {
+                    note.textContent = text('billing_dlg_renews', { date: new Intl.DateTimeFormat(doc.documentElement.lang || 'en', { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(new Date(end)) });
+                }
+                column.append(node('dt', text(`billing_dlg_${bucket}`)), amount, note);
+                list.append(column);
             }
             element.append(list);
         } else {
             element.append(node('p', walletSummary(wallet, formatLegacyWallet).label));
         }
-        const required = error.requiredUsdMicro ?? failure.body?.requiredUsdMicro;
-        if ( balances && required !== undefined && formatUsdMicro(required) !== '—' ) {
-            element.append(node('p', text('billing_required', { amount: formatUsdMicro(required) })));
-        }
-        const retryAfter = error.retryAfterSeconds ?? failure.body?.retryAfterSeconds;
-        if ( kind === 'retry_later' && Number.isFinite(retryAfter) && retryAfter >= 0 ) {
-            element.append(node('p', text('billing_retry_after', { seconds: Math.ceil(retryAfter) })));
-        }
-        element.append(node('p', text('billing_draft_kept')));
         const status = node('p', notice);
+        status.className = 'ezil-billing-status';
         status.setAttribute('role', 'status');
         status.setAttribute('aria-live', 'polite');
-        element.append(status);
-        const actions = node('div');
-        actions.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;';
         const busy = checking || sending;
-        if ( kind === 'topup' || kind === 'subscribe' ) {
+        if ( checking ) {
+            const spinner = billingIcon(doc, 'refresh');
+            spinner.classList.add('ezil-billing-spinner');
+            status.prepend(spinner);
+            element.append(status);
+            const confirmation = node('p', text('billing_dlg_confirmation'));
+            confirmation.className = 'ezil-billing-payment-note';
+            element.append(confirmation);
+        } else {
+            const cards = node('div');
+            cards.className = 'ezil-billing-cards';
+            function card (action, title, detail, primary) {
+                const el = button(action, '', () => { void checkout(action); }, busy || ! startCheckout || ! refreshWallet);
+                el.className = `ezil-billing-card${primary ? ' ezil-billing-card-primary' : ''}`;
+                const label = node('span', text(title));
+                label.className = 'ezil-billing-card-title';
+                const description = node('span', detail);
+                description.className = 'ezil-billing-card-detail';
+                const arrow = node('span', '›');
+                arrow.className = 'ezil-billing-card-arrow';
+                arrow.setAttribute('aria-hidden', 'true');
+                el.append(label, description, arrow);
+                cards.append(el);
+            }
             const serverActions = Array.isArray(error.actions) ? error.actions : null;
-            if ( serverActions ? serverActions.includes('topup') : kind === 'topup' ) {
-                actions.append(button('topup', text('billing_topup'), () => { void checkout('topup'); }, busy || ! startCheckout || ! refreshWallet));
+            if ( kind === 'topup' && (serverActions ? serverActions.includes('topup') : true) ) {
+                card('topup', 'billing_dlg_topup', text('billing_dlg_topup_detail'), true);
             }
             if ( serverActions ? serverActions.includes('subscribe') : kind === 'subscribe' || plan === 'free' ) {
-                actions.append(button('subscribe', text('billing_upgrade'), () => { void checkout('subscribe'); }, busy || ! startCheckout || ! refreshWallet));
+                const configuredGrant = config?.SUBSCRIPTION_INCLUDED_USD_MICRO;
+                const grant = Number.isSafeInteger(configuredGrant) && configuredGrant >= 0 ? String(configuredGrant) : configuredGrant;
+                const detail = formatUsdMicro(grant) === '—' ? text('billing_dlg_upgrade_detail')
+                    : text('billing_dlg_upgrade_credit', { amount: formatUsdMicro(grant) });
+                card('subscribe', 'billing_dlg_upgrade', detail, kind === 'subscribe');
             }
+            element.append(cards, status);
         }
-        if ( ['topup', 'subscribe', 'provider'].includes(kind) ) {
-            actions.append(button('resend', text(kind === 'provider' ? 'billing_retry' : 'billing_resend'), () => { void resend(); }, busy || ! onResend));
+        const footer = node('div');
+        footer.className = 'ezil-billing-footer';
+        const send = button('resend', text('billing_dlg_resend'), () => { void resend(); }, busy || ! onResend || ! canResend());
+        send.classList.add('ezil-billing-primary');
+        send.append(billingIcon(doc, 'refresh'));
+        footer.append(button('close', text('billing_dlg_close'), close), send);
+        element.append(footer);
+        if ( focusedAction ) {
+            const target = element.querySelector(`[data-action="${focusedAction}"]:not(:disabled)`)
+                ?? element.querySelector('[data-action="close"]');
+            target.focus();
         }
-        if ( kind === 'retry_later' ) actions.append(button('later', text('billing_try_later'), close));
-        actions.append(button('close', text('billing_close'), close));
-        element.append(actions);
-        if ( focusedAction ) element.querySelector(`[data-action="${focusedAction}"]`)?.focus();
     }
 
     function open (next) {
         if ( ! enabled || destroyed ) return false;
         if ( next ) {
+            if ( next.status !== 402 || ! ['topup', 'subscribe'].includes(classifyGatewayError(next.status, next.body)) ) return false;
             failure = { status: next.status, body: next.body };
+            balanceRefreshed = false;
+            if ( ! checking ) { checkoutState = 'idle'; notice = ''; }
             if ( next.wallet !== undefined ) wallet = next.wallet;
             else {
                 const error = next.body?.error;
@@ -198,29 +272,31 @@ export function createBillingPopup ({
                 if ( balance?.includedUsdMicro !== undefined && balance?.purchasedUsdMicro !== undefined ) {
                     wallet = {
                         version: 2, unit: 'usd_micro', plan: error?.plan ?? next.body?.plan ?? wallet?.plan,
-                        included: { balance: balance.includedUsdMicro }, purchased: { balance: balance.purchasedUsdMicro },
+                        included: { balance: balance.includedUsdMicro, periodEnd: wallet?.included?.periodEnd }, purchased: { balance: balance.purchasedUsdMicro },
                     };
                 }
             }
         }
         if ( ! element ) {
+            injectBillingStyles(doc);
             previousFocus = doc.activeElement;
             element = node('dialog');
             element.className = 'ezil-billing-popup';
-            element.setAttribute('aria-label', text('billing_dialog'));
-            element.style.cssText = 'position:fixed;inset:0;margin:auto;width:min(440px,calc(100vw - 32px));box-sizing:border-box;max-height:90vh;overflow:auto;padding:24px;border:1px solid #888;border-radius:12px;background:Canvas;color:CanvasText;z-index:2147483647;';
+            element.setAttribute('role', 'dialog');
+            element.setAttribute('aria-modal', 'true');
+            element.setAttribute('aria-labelledby', headlineId);
             element.addEventListener('cancel', event => { event.preventDefault(); close(); });
             doc.body.append(element);
             render();
             if ( typeof element.showModal === 'function' ) element.showModal();
             else element.setAttribute('open', '');
-            element.querySelector('button:not(:disabled)')?.focus();
         } else render();
+        (element.querySelector('.ezil-billing-card-primary:not(:disabled)') ?? element.querySelector('[data-action="close"]'))?.focus();
         return true;
     }
 
     return {
-        open, close,
+        open, close, updateWallet,
         get draft () { return draft; },
         get wallet () { return wallet; },
         get element () { return element; },
