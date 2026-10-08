@@ -593,7 +593,9 @@ test('compute picker separates localised eligibility reasons from shape labels',
         assert.equal(button.querySelector('.ezil-billing-compute-reason').textContent, copy);
         assert.equal(button.title, copy);
         assert.match(button.textContent, /20 GB/);
-        assert.doesNotMatch(picker.element.textContent, /subscription_required|future_reason|<script>/);
+        assert.doesNotMatch(picker.element.textContent, /subscription_required|future_reason/);
+        // Raw markup must never surface as text (substring check, any case).
+        assert.equal(picker.element.textContent.toLowerCase().includes('<script'), false);
         assert.equal(picker.element.querySelector('script'), null);
     };
     assertReason('Requires EZiL Cloud');

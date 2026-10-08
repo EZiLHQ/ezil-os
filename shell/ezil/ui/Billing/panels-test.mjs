@@ -265,7 +265,8 @@ test('Upgrade refreshes eligibility and unknown reasons remain localised text', 
         await picker.refresh();
         assert.equal(performance().querySelector('.ezil-billing-compute-reason').textContent, 'Not available on your plan');
         assert.equal(picker.element.querySelector('script'), null);
-        assert.doesNotMatch(picker.element.textContent, /future_reason|<script>/);
+        assert.doesNotMatch(picker.element.textContent, /future_reason/);
+        assert.equal(picker.element.textContent.toLowerCase().includes('<script'), false);
     }
     picker.element.querySelector('[data-action="upgrade"]').click();
     await tick();
