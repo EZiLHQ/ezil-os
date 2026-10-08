@@ -35,9 +35,9 @@ export function mountComputeSize (container, {
             row.append(button);
             if ( shape.eligible !== true ) {
                 const reason = doc.createElement('span');
-                reason.textContent = shape.reason || text('compute_ineligible');
+                reason.textContent = text(shape.reason === 'subscription_required' ? 'compute_subscription_required' : 'compute_ineligible');
                 button.title = reason.textContent;
-                row.append(reason);
+                row.append(' ', reason);
             }
             button.addEventListener('click', async event => {
                 if ( button.disabled || busy || event.detail > 1 ) return;
