@@ -414,6 +414,61 @@ test('manual preview ignores a CI run from another repository or event', async (
   }
 });
 
+// A pull request is admitted on its current source so images build during CI;
+// staging waits for pr-ci, which executes below with fake readbacks too.
+function fakePR({ prPatch = {}, ciPatch = {}, completeAfter = 0 } = {}) {
+  const pr = {state:'open',draft:false,base:{ref:'main',repo:{full_name:'owner/os'}},head:{sha,repo:{full_name:'owner/os'}},...prPatch};
+  let polls = 0;
+  const github = {rest:{actions:{listWorkflowRuns:async()=>{
+    const run = {head_sha:sha,path:'.github/workflows/ci.yml',status:polls++ >= completeAfter ? 'completed' : 'in_progress',conclusion:'success',...ciPatch};
+    return {data:{workflow_runs:[run]}};
+  }},pulls:{get:async()=>({data:pr})}}};
+  return { github, polls: () => polls };
+}
+async function runScript(source, { event='pull_request', fake, env={} }) {
+  const outputs = {}, failures = [];
+  const core = {setOutput:(k,v)=>outputs[k]=v,warning:()=>{},info:()=>{},setFailed:s=>failures.push(s)};
+  const context = {repo:{owner:'owner',repo:'os'},eventName:event,payload:{pull_request:{number:188},repository:{full_name:'owner/os'}}};
+  await new AsyncFunction('github','core','context','process','setTimeout',source)(fake.github,core,context,{env},callback=>callback());
+  return {outputs,failures};
+}
+const prCiSource = workflowText.split('\n  pr-ci:\n')[1].split('          script: |\n')[1].split('\n\n  production:')[0]
+  .split('\n').filter(line => line.startsWith('            ')).map(line => line.slice(12)).join('\n');
+test('pull request admission resolves the current source without waiting for CI', async () => {
+  const fake = fakePR({ completeAfter: Infinity });
+  const result = await runScript(admissionSource, { fake });
+  assert.equal(result.outputs.allowed, 'true');
+  assert.equal(result.outputs.sha, sha);
+  assert.equal(result.outputs.production, 'false');
+  assert.equal(fake.polls(), 0);
+  for (const prPatch of [{draft:true},{state:'closed'},{head:{sha,repo:{full_name:'fork/os'}}},{base:{ref:'other',repo:{full_name:'owner/os'}}}]) {
+    const denied = await runScript(admissionSource, { fake: fakePR({ prPatch }) });
+    assert.equal(denied.outputs.allowed, 'false');
+    assert.equal(denied.outputs.sha, undefined);
+  }
+});
+test('pr-ci passes only after successful CI on the unchanged admitted commit', async () => {
+  const env = { SOURCE_SHA: sha };
+  const passed = await runScript(prCiSource, { fake: fakePR({ completeAfter: 2 }), env });
+  assert.deepEqual(passed.failures, []);
+  for (const [options, message] of [
+    [{ ciPatch: { conclusion: 'failure' } }, /PR CI concluded failure/],
+    [{ prPatch: { head: { sha: 'b'.repeat(40), repo: { full_name: 'owner/os' } } } }, /PR changed while CI ran/],
+    [{ prPatch: { state: 'closed' } }, /PR changed while CI ran/],
+    [{ completeAfter: Infinity }, /Timed out/],
+    [{ ciPatch: { path: '.github/workflows/other.yml' } }, /Timed out/],
+    [{ ciPatch: { head_sha: 'b'.repeat(40) } }, /Timed out/],
+  ]) {
+    const result = await runScript(prCiSource, { fake: fakePR(options), env });
+    assert.equal(result.failures.length, 1);
+    assert.match(result.failures[0], message);
+  }
+  const missing = await runScript(prCiSource, { fake: fakePR(), env: {} });
+  assert.match(missing.failures[0], /Admitted PR source missing/);
+  const main = await runScript(prCiSource, { event: 'workflow_run', fake: fakePR({ completeAfter: Infinity }), env });
+  assert.deepEqual(main.failures, []);
+});
+
 const { assertPreviewImage } = await import('../.github/scripts/record-manual-preview.mjs');
 test('manual preview verifies the staged image source and exact tested layers', () => {
   const image=`registry.cloudflare.com/${env.CLOUDFLARE_ACCOUNT_ID}/staging@sha256:${'d'.repeat(64)}`;
