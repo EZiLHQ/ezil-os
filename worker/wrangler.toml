@@ -71,6 +71,14 @@ rollout_step_percentage = 100
 rollout_kind = "full_auto"
 rollout_active_grace_period = 300
 
+# DISABLED: performance shape (C1). Enable only with its class export, DO binding
+# and migration, server entitlement checks, and explicitly bounded pool config.
+# [[containers]]
+# class_name = "SandboxPerformance"
+# image = "./Dockerfile"
+# instance_type = "standard-4"
+# max_instances = 2
+
 # ── Durable Object binding (backs each Sandbox container) ─────────────────────
 [[durable_objects.bindings]]
 class_name = "Sandbox"
