@@ -1,10 +1,12 @@
 import { classifyGatewayError } from './classify.js';
 import { createBillingPopup } from './popup.js';
+import { createComposerNotice } from './composer-notice.js';
 import { createWalletBadge, fetchWallet } from './wallet-badge.js';
 import { billingEnabled } from './text.js';
 
 export { classifyGatewayError } from './classify.js';
 export { createBillingPopup } from './popup.js';
+export { createComposerNotice } from './composer-notice.js';
 export { createWalletBadge, fetchWallet, formatUsdMicro, walletBalances, walletSummary } from './wallet-badge.js';
 export { mountComputeSize } from './compute-size.js';
 
@@ -14,6 +16,7 @@ export { mountComputeSize } from './compute-size.js';
  * const billing = attachToChat({
  *     config: { WALLET_V2_ENABLED: serverConfig.WALLET_V2_ENABLED },
  *     fetchImpl: authenticatedGatewayFetch, walletMount: balanceElement,
+ *     composerMount: composerContainer, // the notice is prepended above the input
  *     startCheckout: action => checkoutAndWaitForReturn(action),
  *     onResend: (draft, { requestId }) => sendChat(draft, { requestId }),
  * });
@@ -38,7 +41,7 @@ export { mountComputeSize } from './compute-size.js';
  * the picker always obtains the restart confirmation before invoking it.
  */
 export function attachToChat ({
-    config, fetchImpl = globalThis.fetch, walletUrl = '/v1/wallet', walletMount,
+    config, fetchImpl = globalThis.fetch, walletUrl = '/v1/wallet', walletMount, composerMount,
     refreshWallet: readWallet, onResend, startCheckout, formatLegacyWallet,
     document: doc = globalThis.document,
     createRequestId = () => globalThis.crypto.randomUUID(),
@@ -49,6 +52,7 @@ export function attachToChat ({
     if ( badge.element && walletMount ) walletMount.append(badge.element);
     let wallet = null;
     let popup = null;
+    let notice = null;
     let disposed = false;
     let refreshSequence = 0;
 
@@ -59,17 +63,28 @@ export function attachToChat ({
         if ( ! disposed && ! signal?.aborted && sequence === refreshSequence ) {
             wallet = next;
             badge.update(next);
+            popup?.updateWallet(next);
         }
         return next;
     }
 
     function handleGatewayError (status, body, draft) {
-        if ( ! enabled || disposed || classifyGatewayError(status, body) === 'unknown' ) return false;
+        if ( ! enabled || disposed ) return false;
         popup?.destroy();
+        popup = null;
+        notice?.destroy();
+        notice = null;
+        const resend = onResend ? savedDraft => onResend(savedDraft, { requestId: createRequestId() }) : undefined;
+        if ( status !== 402 || classifyGatewayError(status, body) === 'unknown' ) {
+            notice = createComposerNotice({ document: doc, draft, onResend: resend });
+            notice.show({ status, body });
+            if ( composerMount ) composerMount.prepend(notice.element);
+            return true;
+        }
         popup = createBillingPopup({
             ...popupOptions, config, document: doc, wallet, draft,
             startCheckout, refreshWallet, formatLegacyWallet,
-            onResend: onResend ? savedDraft => onResend(savedDraft, { requestId: createRequestId() }) : undefined,
+            onResend: resend,
         });
         return popup.open({ status, body });
     }
@@ -84,6 +99,7 @@ export function attachToChat ({
             return handleGatewayError(response.status, body, draft);
         },
         get popup () { return popup; },
-        dispose () { disposed = true; popup?.destroy(); badge.destroy(); },
+        get notice () { return notice; },
+        dispose () { disposed = true; popup?.destroy(); notice?.destroy(); badge.destroy(); },
     };
 }
