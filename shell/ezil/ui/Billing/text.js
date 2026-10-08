@@ -6,6 +6,11 @@ export function text (key, values = {}) {
     return copy.replace(/\{\{(\w+)\}\}/g, (match, name) => String(values[name] ?? match));
 }
 
+export function billingReason (kind, body) {
+    return text(kind === 'provider' && body?.error?.charge === 'none'
+        ? 'billing_reason_provider_none' : `billing_reason_${kind}`);
+}
+
 export function billingEnabled (config) {
     return config?.WALLET_V2_ENABLED === true;
 }

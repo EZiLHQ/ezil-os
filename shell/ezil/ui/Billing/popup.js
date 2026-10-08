@@ -1,5 +1,5 @@
 import { classifyGatewayError } from './classify.js';
-import { billingEnabled, text } from './text.js';
+import { billingEnabled, billingReason, text } from './text.js';
 import { formatUsdMicro, walletBalances, walletSummary } from './wallet-badge.js';
 
 function bounded (value, fallback, max) {
@@ -142,7 +142,7 @@ export function createBillingPopup ({
         const error = failure.body?.error ?? {};
         const plan = wallet?.plan ?? error.plan ?? failure.body?.plan;
         element.replaceChildren();
-        element.append(node('h2', text(`billing_reason_${kind}`)));
+        element.append(node('h2', billingReason(kind, failure.body)));
         const balances = walletBalances(wallet);
         if ( balances ) {
             const list = node('dl');

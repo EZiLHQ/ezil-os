@@ -693,8 +693,8 @@ const en = {
         billing_dialog: 'AI billing and availability',
         billing_reason_topup: 'Not enough AI credit for this request.',
         billing_reason_subscribe: 'Your plan does not include access to this service.',
-        billing_reason_retry_later: 'A usage or rate limit was reached. Try again later.',
-        billing_reason_provider: 'Provider problem. Nothing was charged for this request.',
+        billing_reason_retry_later: 'The service is temporarily unavailable or a usage limit was reached. Try again later.',
+        billing_reason_provider: 'Provider problem. Usage will be reconciled and charged at most once.',
         billing_reason_unknown: 'This request could not be completed.',
         billing_balance: 'AI balance {{amount}}',
         billing_included: 'Included credit',
@@ -729,6 +729,7 @@ const en = {
         compute_load_failed: 'Could not load compute sizes.',
         compute_change_requested: 'Compute size change requested. The computer will restart.',
         compute_change_failed: 'Could not change compute size. Please try again.',
+        billing_reason_provider_none: 'Provider problem. Nothing was charged for this request.',
     },
 };
 
