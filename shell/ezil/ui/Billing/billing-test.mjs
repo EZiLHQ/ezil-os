@@ -563,9 +563,10 @@ test('compute picker uses server shapes, eligibility, Upgrade, and confirmation 
     const performance = () => picker.element.querySelector('[data-shape="performance"]');
     assert.equal(performance().disabled, false);
     performance().click();
-    assert.match(warning, /restarts this computer/);
-    assert.match(warning, /Saved files are kept/);
-    assert.match(warning, /Running apps, processes, open terminals, and unsaved editor buffers are not kept/);
+    // DESIGN.md §4 confirm copy: restart, files kept, running state closed.
+    assert.match(warning, /^Restart into /);
+    assert.match(warning, /Your files are kept/);
+    assert.match(warning, /Open apps, terminals and unsaved editor changes are closed/);
     assert.equal(changes.length, 0);
     confirm(false);
     await tick();
@@ -606,7 +607,7 @@ test('compute picker separates localised eligibility reasons from shape labels',
         else globalThis.i18n = previousI18n;
     });
     globalThis.i18n = key => ({
-        compute_subscription_required: 'Abonnement requis',
+        compute_card_requires_cloud: 'Abonnement requis',
         compute_ineligible: 'Indisponible avec votre forfait',
     })[key] ?? key;
     reason = 'subscription_required';
