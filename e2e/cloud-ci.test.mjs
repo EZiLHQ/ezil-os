@@ -14,6 +14,7 @@ import './relay-lifetime.test.mjs';
 import './await-container-rollout.test.mjs';
 import { deployedTarget, configureAppContext, APP_FETCH_TIMEOUT_MS, APP_STOP_FETCH_TIMEOUT_MS, appFetchTimeout } from './deployed-target.mjs';
 import './sign-in.test.mjs';
+import './code-picker.test.mjs';
 import { assertVercelDeployment, assertWorkerDeployment, verifyCloudDeployment } from './verify-cloud-deployment.mjs';
 
 const sha = 'a'.repeat(40);

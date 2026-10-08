@@ -1,4 +1,5 @@
 import { signIn } from './sign-in.mjs';
+import { openQuickInput } from './code-picker.mjs';
 /**
  * EZiL-OS lifecycle check against a deployed stack: a computer must not be
  * stopped under a window that is still using it, and the editor must reopen
@@ -125,8 +126,7 @@ try {
   if (f) {
     // Use Code's visible file picker. An iframe click can leave focus in the
     // workbench or welcome page, where the host shortcut never opens a file.
-    await f.locator('.command-center').click();
-    await f.locator('.quick-input-widget input:visible').fill(FILE);
+    await (await openQuickInput(f)).fill(FILE);
     await f.locator('.quick-input-list .monaco-list-row:visible').filter({hasText:FILE}).first().click();
     await fileTab(f).first().waitFor({state:'visible',timeout:15000});
     // Pin the editor tab so a preview tab can be restored on reopen.

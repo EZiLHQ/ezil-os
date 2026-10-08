@@ -1,4 +1,5 @@
 import { signIn } from './sign-in.mjs';
+import { openQuickInput } from './code-picker.mjs';
 /** Hosted acceptance only. No default computer, simulated ICE, or skipped checks. */
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -303,8 +304,7 @@ try {
     await command(f, 'Preferences: Open Keyboard Shortcuts (JSON)');
     const restoredBindings = await readDocument(f); assert.ok(restoredBindings.includes('ctrl+alt+k') && restoredBindings.includes('continuity binding'), 'Keybinding JSONC not restored');
     await closeModal(f);
-    await f.locator('.command-center').click();
-    await f.locator('.quick-input-widget input:visible').fill(marker);
+    await (await openQuickInput(f)).fill(marker);
     await f.locator('.quick-input-list .monaco-list-row:visible').filter({hasText:marker}).first().click();
     await wait(1500);
     // Reopened Code may restore a saved model with an earlier file version.
