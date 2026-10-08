@@ -363,8 +363,8 @@ jobs:
       - name: Shell unit suites
         shell: bash
         run: |
-          set -e
-          for t in shell/ezil/apps/desktop-screen-test.mjs \
+          node shell/run-suites.mjs --jobs 4 \
+                   shell/ezil/apps/desktop-screen-test.mjs \
                    shell/ezil/boot-test.mjs \
                    shell/ezil/apps/desktop-close-test.mjs \
                    shell/ezil/apps/relay-renewal-test.mjs \
@@ -375,10 +375,8 @@ jobs:
                    shell/ezil/native-test.mjs \
                    shell/ezil/local-surfaces-test.mjs \
                    shell/ezil/ui/Settings/settings-test.mjs \
-                   shell/ezil/runtime-recheck-test.mjs; do
-            echo "── $t"
-            node "$t"
-          done
+                   shell/ezil/runtime-recheck-test.mjs \
+                   shell/run-suites-test.mjs
       # PLAYWRIGHT_REQUIRE_DIR is exported to $GITHUB_ENV by the Setup
       # Playwright step above — no env: block needed here.
       # Two families. The PORTABLE suites assert behaviour (focus, stacking,
