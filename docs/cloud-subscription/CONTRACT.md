@@ -138,3 +138,24 @@ The OS classifies any 502/504 `upstream_*` code as `provider`. The UI says "noth
 | 503 (any A3 code) | `retry_later` |
 | 502/504 `upstream_*` | `provider` |
 | anything else | `unknown` |
+
+## v1.2 amendment (2026-10-08, lead). Gaps found by integrating the QA suite.
+
+**A6. v2 view of unenrolled accounts.** With v2 enabled, an account whose v1 wallet is missing or empty (A1 definition) is treated as v2 everywhere, with zero balances:
+- `GET /v1/wallet` returns `version:2`
+- 402 bodies use the v2 `balance` shape (`includedUsdMicro`, `purchasedUsdMicro`)
+- reserve and settle use the v2 path
+
+Only an account with a **non-empty** v1 wallet keeps the v1 view and v1 money path.
+
+**A7. SQL entry point.** The only executable money entry point for the gateway role is `ezil_ai.wallet_v2_call(p_operation text, p_args jsonb, p_config jsonb)`, with operations `funding`, `admit` and `admit_key`.
+- It supplies the transaction-local v2 config.
+- `ezil_ai.apply_funding_event` is internal. Called without that config it returns `policy_unavailable`.
+- `ezil_ai.wallet_v2(uuid)` stays a read-only function.
+
+**A8. Timestamps** in JSON responses are RFC 3339 UTC with a `Z` suffix (JS `toISOString()` form).
+
+**A9. Provider code mapping is unchanged from `origin/main`.**
+- A thrown or failed fetch is `upstream_unavailable` (502).
+- A provider HTTP error or unreadable or usage-less body is `upstream_error` (502).
+- A deadline is `upstream_timeout` (504).
