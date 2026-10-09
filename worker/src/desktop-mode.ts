@@ -123,6 +123,15 @@ export function resolveTurnTtlSeconds(raw: string | undefined): number {
   return Math.min(TURN_TTL_MAX_SECONDS, Math.max(TURN_TTL_MIN_SECONDS, n));
 }
 
+/** Conservative metadata only; the TURN provider still receives the bounded TTL.
+ * Neko checks the absolute expiry against its own clock. Leave five seconds
+ * inside that ceiling, and calculate from before minting so API latency never
+ * makes metadata outlive the credentials.
+ */
+export function turnCredentialExpiresAt(issuedAt: number, rawTtl: string | undefined): number {
+  return issuedAt + resolveTurnTtlSeconds(rawTtl) * 1000 - 5000;
+}
+
 /** Normalize the Cloudflare response `iceServers` (object or array) to an array. */
 export function normalizeIceServers(body: TurnCredentialsResponse | null | undefined): IceServerEntry[] {
   const raw = body?.iceServers;
