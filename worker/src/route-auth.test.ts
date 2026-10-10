@@ -527,11 +527,11 @@ describe('DELETE /sandbox/:name is HMAC-gated', () => {
     expect(calls.terminateSandbox).toBe(0);
   });
 
-  it('still works keyless in local dev (no secret configured), unchanged', async () => {
+  it('works without a secret only with the explicit local-dev opt-in', async () => {
     const { binding, calls } = fakeSandboxNamespace({});
     const res = await worker.fetch(
       new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}`, { method: 'DELETE' }),
-      { Sandbox: binding },
+      { Sandbox: binding, SANDBOX_ALLOW_INSECURE_LOCAL_AUTH: 'true' },
     );
     expect(res.status).toBe(200);
     expect(calls.terminateSandbox).toBe(1);
@@ -737,9 +737,12 @@ describe('GET /preview-status is no longer anonymous', () => {
     expect(calls.exec).toBe(0);
   });
 
-  it('is unchanged in local dev (no secret configured)', async () => {
+  it('allows preview status in explicitly opted-in local dev', async () => {
     const { binding } = fakeSandboxNamespace({});
-    const res = await worker.fetch(new Request(`https://${APP_HOST}/preview-status`), { Sandbox: binding });
+    const res = await worker.fetch(new Request(`https://${APP_HOST}/preview-status`), {
+      Sandbox: binding,
+      SANDBOX_ALLOW_INSECURE_LOCAL_AUTH: 'true',
+    });
     expect(res.status).toBe(200);
   });
 });
@@ -865,14 +868,14 @@ describe('POST /sandbox/:name/focus is HMAC-gated with a closed-enum `app`', () 
     expect(calls.exec).toBe(0);
   });
 
-  it('still works keyless in local dev (no secret configured), unchanged', async () => {
+  it('works without a secret only with the explicit local-dev opt-in', async () => {
     const { binding, calls } = fakeSandboxNamespace({});
     const res = await worker.fetch(
       new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/focus`, {
         method: 'POST',
         body: JSON.stringify({ app: 'vscode' }),
       }),
-      { Sandbox: binding },
+      { Sandbox: binding, SANDBOX_ALLOW_INSECURE_LOCAL_AUTH: 'true' },
     );
     expect(res.status).toBe(200);
     expect(calls.exec).toBe(1);
@@ -1771,11 +1774,11 @@ describe('POST /sandbox/:name/restart is HMAC-gated the same way as DELETE/focus
     expect(calls.restartDesktopStack.length).toBe(0);
   });
 
-  it('still works keyless in local dev (no secret configured), unchanged', async () => {
+  it('works without a secret only with the explicit local-dev opt-in', async () => {
     const { binding, calls } = fakeSandboxNamespace({});
     const res = await worker.fetch(
       new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
-      { Sandbox: binding },
+      { Sandbox: binding, SANDBOX_ALLOW_INSECURE_LOCAL_AUTH: 'true' },
     );
     expect(res.status).toBe(200);
     expect(calls.restartDesktopStack.length).toBe(1);
@@ -2903,6 +2906,21 @@ describe('code-server bridge host (8443-<id>-code.ezil.org)', () => {
 // ── Whole-surface guard ─────────────────────────────────────────────────────
 
 describe('no other mutating route is reachable unauthenticated', () => {
+  it('fails closed when the deployment has no HMAC secret', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const res = await worker.fetch(
+      new Request('https://api-desktop.ezil.org/project-files/list', {
+        method: 'POST',
+        body: '{}',
+      }),
+      { Sandbox: binding },
+    );
+
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ ok: false, error: 'hmac_secret_not_configured' });
+    expect(calls.exec + calls.terminateSandbox + calls.destroy).toBe(0);
+  });
+
   it('every mutating route rejects an unsigned request when a secret is configured', async () => {
     const mutating: Array<{ method: string; url: string }> = [
       { method: 'POST', url: `https://api-desktop.ezil.org/sandbox/preview` },

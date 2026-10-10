@@ -68,8 +68,9 @@ which serves the auto-connect landing page that redirects into
 One HMAC envelope gates every mutating route: `t=<unix_ms>,v1=<hex_hmac_sha256>`
 over `${ts}.POST./sandbox/preview.`, verified against `SANDBOX_HMAC_SECRET` /
 `CLOUDFLARE_GUACAMOLE_HMAC_SECRET` (plus the optional mission alias below).
-When no secret is configured the Worker runs in local-dev mode and skips
-verification.
+Missing secrets fail closed. Local development may explicitly opt into unsigned
+requests by setting `SANDBOX_ALLOW_INSECURE_LOCAL_AUTH=true`; never configure
+that binding on a deployed Worker.
 
 | Route | Credential |
 | --- | --- |
@@ -141,8 +142,13 @@ This package uses **bun** (see `bun.lock`).
 cd worker
 bun install            # ONLY if node_modules is absent (it is normally hydrated)
 bun run typecheck      # tsc --noEmit
+printf 'SANDBOX_ALLOW_INSECURE_LOCAL_AUTH=true\n' > .dev.vars
 bun run dev            # wrangler dev --port 8787 (builds the container image on first run)
 ```
+
+The `.dev.vars` opt-in is intentionally explicit and is used only by local
+Wrangler. Without either this flag or an HMAC secret, protected requests return
+HTTP 401 rather than silently disabling authentication.
 
 Then in `app/.env.local`:
 ```
@@ -173,6 +179,9 @@ cd worker
 bun run deploy                           # builds + pushes the container image
 wrangler secret put SANDBOX_HMAC_SECRET  # must match the control-plane secret
 ```
+
+A deployment without that secret remains reachable for health checks but all
+HMAC-protected routes fail closed with HTTP 401.
 
 ### Optional, temporary mission-signing alias (`SANDBOX_MISSION_HMAC_SECRET`)
 
