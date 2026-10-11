@@ -467,7 +467,9 @@ jobs:
       # The continuity gate above may use most of the previous 2 h credential; renew
       # again so the lease release at the end of this job never runs on expired creds.
       - name: Renew staging lease credentials before HOME persistence acceptance
-        if: needs.trust.outputs.manual_preview != 'true'
+        # Runs even when the continuity gate failed: the switch-off proof must not
+        # depend on another suite's flake. The job still fails if that gate failed.
+        if: ${{ !cancelled() && needs.trust.outputs.manual_preview != 'true' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
@@ -477,7 +479,9 @@ jobs:
       # replacement (OpenCode, a Next.js project in ~/, dotfiles). The script
       # refuses os.ezil.org and every *.ezil.org target before any browser launch.
       - name: Hosted HOME persistence acceptance
-        if: needs.trust.outputs.manual_preview != 'true'
+        # Runs even when the continuity gate failed: the switch-off proof must not
+        # depend on another suite's flake. The job still fails if that gate failed.
+        if: ${{ !cancelled() && needs.trust.outputs.manual_preview != 'true' }}
         # NOT a release gate yet: the `production` job needs this job, and this suite
         # has never run on staging. Its result is visible (step + evidence artifact);
         # making it blocking is the founder's decision once it has passed here.

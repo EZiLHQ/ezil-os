@@ -471,7 +471,8 @@ test('the workflow runs this suite only in the staging job, never for manual pre
   const production = workflow.split('\n  production:\n')[1];
   assert.ok(!production.includes('hosted-home-persistence'));
   const stepText = preview.split('      - name: Hosted HOME persistence acceptance\n')[1].split('      - name:')[0];
-  assert.match(stepText, /if: needs\.trust\.outputs\.manual_preview != 'true'/);
+  // Staging only, never manual previews; runs even if the continuity gate failed (never on cancel).
+  assert.match(stepText, /if: \$\{\{ !cancelled\(\) && needs\.trust\.outputs\.manual_preview != 'true' \}\}/);
   assert.match(stepText, /EZIL_E2E_EMAIL: \$\{\{ secrets\.EZIL_E2E_EMAIL \}\}/);
   assert.ok(!/EZIL_E2E_APP:/.test(stepText), 'the target comes from the deployed preview URL only');
   assert.ok(preview.indexOf('run: node e2e/hosted-continuity.mjs') < preview.indexOf('run: node e2e/hosted-home-persistence.mjs'));

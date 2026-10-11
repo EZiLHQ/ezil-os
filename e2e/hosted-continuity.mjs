@@ -570,6 +570,11 @@ try {
     'Disk reload probe did not reach Code': 'reload_probe_missing',
     'Disk reload did not discard the unsaved probe': 'reload_probe_not_discarded',
     'Restored keybinding did not save the workspace edit': 'shortcut_not_saved',
+    'Failed durable write incorrectly passed final stop': 'failed_write_stop_passed',
+    'Stop failure did not reach real checkpoint backend': 'failed_write_wrong_outcome',
+    'Checkpoint failure stopped the runtime': 'failed_write_terminated',
+    'Failed checkpoint replaced active runtime': 'failed_write_runtime_replaced',
+    'Failed checkpoint changed the durable committed head': 'failed_write_head_changed',
   };
   const assertionCode = assertionCodes[error?.message];
   if (assertionCode) evidence.assertionCode = assertionCode;

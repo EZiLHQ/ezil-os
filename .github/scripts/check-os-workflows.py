@@ -150,7 +150,8 @@ renew_index = next(i for i, step in enumerate(preview_steps) if step.get('name')
 assert preview_steps[renew_index + 1]['name'] == 'Hosted continuity release gate'
 home_renew = next(i for i, step in enumerate(preview_steps) if step.get('name') == 'Renew staging lease credentials before HOME persistence acceptance')
 assert preview_steps[home_renew + 1]['name'] == 'Hosted HOME persistence acceptance'
-assert preview_steps[home_renew]['if'] == preview_steps[home_renew + 1]['if'] == "needs.trust.outputs.manual_preview != 'true'"
+# Staging-only, and independent of the continuity gate's outcome (never on cancel).
+assert preview_steps[home_renew]['if'] == preview_steps[home_renew + 1]['if'] == "${{ !cancelled() && needs.trust.outputs.manual_preview != 'true' }}"
 assert 'SANDBOX_NEKO_TURN_TTL_SECONDS' in preview
 assert continuity['if'] == "needs.trust.outputs.manual_preview != 'true'"
 assert next(step for step in preview_steps if step.get('name') == 'Test the returned preview URL')['if'] == continuity['if']
