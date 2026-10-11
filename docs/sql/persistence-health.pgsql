@@ -1,7 +1,8 @@
 -- Persistence signal contract §1–2. Same query as persistenceHealth().
 -- Run: python3 .ci-support/supabase-sql.py query --project <ref> --file docs/sql/persistence-health.pgsql (the helper supplies the read-only transaction).
 -- Deliberately .pgsql, not .sql: every *.sql in this repo must be a registered production migration (.github/scripts/production-migrations.mjs).
--- The seven-day window is based on receipt time; ordering uses occurrence time.
+-- The seven-day window is based on receipt time; worker ordering uses occurrence time.
+-- Shell transitions use receipt time, then event_id, to avoid browser clock skew.
 -- Both ages are the latest worker event's own attrs at lastWorkerEventAt;
 -- missing/-1 is unknown. Daily drain lag never increases ages or flags health.
 -- Flag pause codes, system age > 1800 unless the latest worker event is a stop,
@@ -29,7 +30,7 @@ WITH clock AS (
   SELECT DISTINCT ON (computer_id) computer_id, code
   FROM   recent
   WHERE  source = 'shell' AND site = 'persist.shell_seen'
-  ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
+  ORDER  BY computer_id, received_at DESC, event_id DESC
 ), restores AS (
   SELECT DISTINCT ON (computer_id) computer_id,
          jsonb_build_object('site', site, 'code', code,
