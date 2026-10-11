@@ -133,7 +133,8 @@ Ships **disabled by default**. With every flag unset, the product behaves exactl
 | `invoice.paid` | `grant_period` (from the invoice's subscription line `period`, keyed by invoice id) |
 | `invoice.payment_failed` | `sync_subscription` |
 | `customer.subscription.created`, `…updated`, `…deleted` | `sync_subscription` |
-| `charge.refunded` | one `revoke` `{chargeId, refundId}` **per refund** in `refunds.data` (grant key = refund id) |
+| `refund.created`, `refund.updated` | `revoke` `{chargeId, refundId}` (grant key = refund id). Current API versions do not embed refunds in `charge.refunded` |
+| `charge.refunded` | one `revoke` per refund in `refunds.data` when an older API version embeds it; otherwise `[]` |
 | `charge.dispute.created` | `suspend` |
 | `charge.dispute.closed` | `restore` when won |
 | anything else | `[]` (acknowledged, ignored) |
