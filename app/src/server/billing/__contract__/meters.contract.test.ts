@@ -177,8 +177,12 @@ describe('billing summary wire contract', () => {
         expect(summary({ config: readBillingConfig(keys) }).actions).toEqual({ checkout: false, portal: false, topup: false });
         const enabled = summary({ config: readBillingConfig({ ...keys, BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1' }) });
         expect(enabled.actions.checkout).toBe(true);
-        expect(enabled.actions.portal).toBe(true);
+        // Contract §5.1: the portal is for a Pro or past-due plan only — a Free
+        // user with checkout available has nothing to manage yet.
+        expect(enabled.actions.portal).toBe(false);
         expect(enabled.actions.topup).toBe(false);
+        const pro = summary({ config: readBillingConfig({ ...keys, BILLING_TAB_ENABLED: '1', CHECKOUT_ENABLED: '1' }), subs: [subscription()] });
+        expect(pro.actions.portal).toBe(true);
     });
 
     it('serialises byte and money balances as strings without bigint or synthetic secrets', () => {

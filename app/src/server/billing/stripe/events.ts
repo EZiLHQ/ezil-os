@@ -26,7 +26,7 @@ export type BillingAction =
         eventId: string;
     }
     | { type: 'sync_subscription'; subscriptionId: string; eventId: string; eventCreated: Date }
-    | { type: 'revoke'; chargeId: string; refundIds: string[]; eventId: string }
+    | { type: 'revoke'; chargeId: string; refundId: string; eventId: string }
     | { type: 'suspend' | 'restore'; chargeId: string; disputeId: string; eventId: string };
 
 function object(value: unknown, path: string): Record<string, unknown> {
@@ -108,12 +108,20 @@ export function planStripeEvent(event: StripeEventLike): BillingAction[] {
         case 'checkout.session.completed': {
             const mode = text(payload.mode, 'checkout.session.mode');
             const paymentStatus = text(payload.payment_status, 'checkout.session.payment_status');
-            const actions: BillingAction[] = [{
-                type: 'link_customer',
-                customerId: stripeId(payload.customer, 'checkout.session.customer'),
-                clientReferenceId: text(payload.client_reference_id, 'checkout.session.client_reference_id'),
-                eventId,
-            }];
+            // Only a session our own server created carries client_reference_id.
+            // One without it (a Payment Link, a dashboard checkout) links
+            // nothing: throwing would make Stripe retry it forever, and a
+            // user is never chosen from metadata instead.
+            const actions: BillingAction[] = [];
+            const reference = payload.client_reference_id;
+            if (typeof reference === 'string' && reference.trim() !== '' && payload.customer !== null && payload.customer !== undefined) {
+                actions.push({
+                    type: 'link_customer',
+                    customerId: stripeId(payload.customer, 'checkout.session.customer'),
+                    clientReferenceId: reference,
+                    eventId,
+                });
+            }
             if (mode === 'payment' && paymentStatus === 'paid') actions.push(topup(payload, eventId));
             return actions;
         }
@@ -162,14 +170,15 @@ export function planStripeEvent(event: StripeEventLike): BillingAction[] {
         case 'charge.refunded': {
             const refunds = list(object(payload.refunds, 'charge.refunds').data, 'charge.refunds.data');
             if (refunds.length === 0) throw new TypeError('charge.refunds.data must contain a refund');
-            return [{
-                type: 'revoke',
-                chargeId: text(payload.id, 'charge.id'),
-                refundIds: refunds.map((refund, index) => (
-                    text(object(refund, `charge.refunds.data[${index}]`).id, `charge.refunds.data[${index}].id`)
-                )),
+            // One revoke per refund: the grant ledger is keyed by refund id, so a
+            // second partial refund on the same charge is its own entry.
+            const chargeId = text(payload.id, 'charge.id');
+            return refunds.map((refund, index) => ({
+                type: 'revoke' as const,
+                chargeId,
+                refundId: text(object(refund, `charge.refunds.data[${index}]`).id, `charge.refunds.data[${index}].id`),
                 eventId,
-            }];
+            }));
         }
         case 'charge.dispute.created':
         case 'charge.dispute.closed': {

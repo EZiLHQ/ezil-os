@@ -47,7 +47,7 @@ describe('Stripe event planning contract', () => {
         expect(actions.map(actionName)).toEqual(['link_customer', 'topup_paid']);
         const linked = actions.find((action: Action) => actionName(action) === 'link_customer');
         expect(linked).toBeDefined();
-        expect(field(linked!, 'userId')).toBe('user_reference');
+        expect(field(linked!, 'clientReferenceId')).toBe('user_reference');
         expect(field(linked!, 'customerId') ?? field(linked!, 'stripeCustomerId')).toBe('cus_contract');
         expect(JSON.stringify(actions)).toContain('user_reference');
         expect(JSON.stringify(actions)).not.toContain('user_metadata_attacker');
