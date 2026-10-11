@@ -8,16 +8,120 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
+import { createHmac } from 'node:crypto';
+import { runInNewContext } from 'node:vm';
 import {
   assertStagingTarget, TargetRefused, PRODUCTION_HOSTS, assertRunId, newRunId, newNonce, runPaths, checksumTargets,
   stepCommand, readMarker, parseFields, probeScript, parseProbe, checksumScript, parseChecksums, compareChecksums,
   opencodeInstallScript, parseOpencodeInstall, projectScript, depsWaitScript, parseDepsStatus, parseDepsWait,
   depsWaitOutcome, projectDepsState, devServerScript, parseDevServer, cleanupPlan, cleanupScript, parseCleanup,
-  EVIDENCE_FILE, clampWait, RUN_BUDGET_MS, CLEANUP_RESERVE_MS,
+  EVIDENCE_FILE, clampWait, RUN_BUDGET_MS, CLEANUP_RESERVE_MS, POWER_CUT_RPO_MS, powerCutAfterRpo,
+  AcceptanceFailure, FAILURE_CODES,
 } from './hosted-home-persistence.mjs';
 
 const script = fileURLToPath(new URL('./hosted-home-persistence.mjs', import.meta.url));
 const refusedCode = env => { try { assertStagingTarget(env); return null; } catch (error) { assert.ok(error instanceof TargetRefused); return error.code; } };
+
+test('power cut waits for the 90 s RPO and uses the signed acceptance fault without a duration', async () => {
+  assert.equal(POWER_CUT_RPO_MS, 90000);
+  for (const age of [0, 37000, 90000, 120000]) {
+    const lastWriteFinishedAt = 1_000_000;
+    let clock = lastWriteFinishedAt + age, calls = 0, waited = 0;
+    const evidence = {};
+    const sandboxId = 'guac-abcdef0123456789-fedcba9876543210';
+    await powerCutAfterRpo({ sandboxId, worker: 'https://worker.example.invalid/', secret: 'offline-test-secret',
+      lastWriteFinishedAt, evidence, now: () => clock,
+      wait: async ms => {
+        assert.equal(calls, 0);
+        assert.equal(evidence.operation, 'power cut RPO wait');
+        assert.ok(ms > 0 && ms <= 1000);
+        // Early timer wakeups must not shorten the guarantee.
+        const elapsed = Math.min(ms, 500); clock += elapsed; waited += elapsed;
+      },
+      fetchImpl: async (url, options) => {
+        calls++;
+        assert.ok(clock - lastWriteFinishedAt >= 90000);
+        assert.equal(evidence.operation, 'power cut');
+        assert.equal(url, `https://worker.example.invalid/sandbox/${sandboxId}/acceptance-fault`);
+        assert.equal(options.method, 'POST');
+        assert.deepEqual(JSON.parse(options.body), { fault: 'power_cut' });
+        const signature = createHmac('sha256', 'offline-test-secret').update(`${clock}.POST./sandbox/preview.`).digest('hex');
+        assert.equal(options.headers.authorization, `Bearer t=${clock},v1=${signature}`);
+        assert.equal(options.headers['content-type'], 'application/json');
+        assert.equal(options.redirect, 'error');
+        assert.ok(options.signal instanceof AbortSignal);
+        return { status: 200, json: async () => ({ ok: true }) };
+      },
+    });
+    assert.equal(calls, 1);
+    assert.equal(waited, Math.max(0, 90000 - age));
+    assert.deepEqual(evidence.powerCut, { writeAgeMs: Math.max(age, 90000), httpStatus: 200, ok: true });
+    assert.ok(!JSON.stringify(evidence).includes('offline-test-secret'));
+  }
+});
+
+test('power cut refuses failed HTTP/acknowledgment and never fires if its wait fails', async () => {
+  const options = { sandboxId: 'guac-test-computer', worker: 'https://worker.example.invalid', secret: 'test',
+    lastWriteFinishedAt: 0, now: () => 90000, evidence: {}, wait: async () => {} };
+  for (const response of [{ status: 404, json: async () => ({ ok: true }) }, { status: 200, json: async () => ({ ok: false }) }]) {
+    await assert.rejects(powerCutAfterRpo({ ...options, evidence: {}, fetchImpl: async () => response }), /power_cut_unconfirmed/);
+  }
+  let called = false;
+  await assert.rejects(powerCutAfterRpo({ ...options, now: () => 0,
+    wait: async () => { throw new Error('budget exhausted'); },
+    fetchImpl: async () => { called = true; },
+  }), /budget exhausted/);
+  assert.equal(called, false);
+});
+
+test('runStep retries terminal read errors during both typed and result checks', async () => {
+  const source = readFileSync(script, 'utf8');
+  const runStepSource = source.match(/  const runStep = async \(name, body, timeoutMs\) => \{[\s\S]*?\n  \};/)[0];
+  let line, reads = 0, enters = 0;
+  const nonce = 'a'.repeat(24);
+  const context = { evidence: {}, stepInFlight: false, newNonce: () => nonce, stepCommand, readMarker, parseFields,
+    terminalInput: () => ({ pressSequentially: async value => { line = value; }, press: async key => { assert.equal(key, 'Enter'); enters++; } }),
+    terminalText: async () => {
+      reads++;
+      if (reads === 1 || reads === 3) throw new Error('transient detached terminal');
+      return reads === 2 ? line : `EZQ:${nonce}:x=1:END`;
+    },
+    bounded: async (_name, action) => {
+      assert.equal(await action(), _name.endsWith('typed') ? false : null);
+      return action();
+    },
+  };
+  const runStep = runInNewContext(`${runStepSource}\nrunStep`, context);
+  assert.deepEqual(await runStep('probe', 'emit "x=1"', 1000), { x: '1' });
+  assert.equal(reads, 4);
+  assert.equal(enters, 1);
+  assert.equal(context.stepInFlight, false);
+});
+
+test('failure evidence retains the fixed failing operation when cleanup overwrites operation', () => {
+  const source = readFileSync(script, 'utf8');
+  const catchBody = source.match(/  \} catch \(error\) \{\n    \/\/ Driver messages[\s\S]*?\n  \} finally \{/)[0]
+    .replace(/^  \} catch \(error\) \{/, '').replace(/\n  \} finally \{$/, '');
+  const evidence = { operation: 'step next project typed', phases: [{ name: 'Code terminal ready' }] };
+  runInNewContext(catchBody, { evidence, error: new Error('private driver details'), AcceptanceFailure, FAILURE_CODES,
+    console: { error() {} }, process: {} });
+  evidence.operation = 'step cleanup result';
+  assert.equal(evidence.failedOperation, 'step next project typed');
+  assert.equal(evidence.failedPhase, 'Code terminal ready');
+  assert.ok(!JSON.stringify(evidence).includes('private driver details'));
+});
+
+test('hosted flow cuts power between checksum samples and retains graceful stop only for cleanup', () => {
+  const source = readFileSync(script, 'utf8');
+  const flow = source.slice(source.indexOf("const before = parseChecksums(await runStep('checksums before'"),
+    source.indexOf("const after = parseChecksums(await runStep('checksums after'"));
+  assert.match(flow, /const lastWriteFinishedAt = Date\.now\(\)/);
+  assert.match(flow, /await powerCutAfterRpo\(\{ sandboxId, worker, secret, lastWriteFinishedAt, evidence/);
+  assert.ok(flow.indexOf('await powerCutAfterRpo') < flow.indexOf("await close('code')"));
+  assert.ok(flow.indexOf('await powerCutAfterRpo') < flow.indexOf('await openTerminal()'));
+  assert.ok(!flow.includes('/api/shell/stop'));
+  assert.equal(source.match(/await stopIsolatedComputer\(/g).length, 1);
+});
 
 test('target guard refuses production hosts, any *.ezil.org and a missing target', () => {
   for (const host of PRODUCTION_HOSTS) assert.equal(refusedCode({ EZIL_E2E_APP: `https://${host}` }), 'production_target');
