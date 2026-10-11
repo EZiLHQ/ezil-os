@@ -221,6 +221,9 @@ export function observe(
 
   if (obs.kind === 'flush' || obs.kind === 'restore') {
     const code = toPersistenceCode(obs.code);
+    // The container was already hydrated: no restore occurred, and this must
+    // not overwrite its real restore outcome or break flush suppression.
+    if (obs.kind === 'restore' && code === 'already_restored') return { events, state: prev };
     if (TRANSIENT_CODES.has(code)) return { events, state: prev };
     const site: PersistenceSite = `persist.${obs.layer}.${obs.kind}` as PersistenceSite;
     const track = prev[obs.layer];

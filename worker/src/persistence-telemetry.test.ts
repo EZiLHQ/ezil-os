@@ -89,6 +89,24 @@ describe('persistence event shape (contract §1-§2)', () => {
 });
 
 describe('emission rule (contract §3)', () => {
+  for (const layer of ['system', 'workspace'] as const) {
+    it(`${layer}: repeated opens preserve the real restore and suppress identical flushes`, () => {
+      const restore: PersistenceObservation = { kind: 'restore', layer, code: 'failed', trigger: 'open' };
+      const already: PersistenceObservation = { ...restore, code: 'already_restored' };
+      const restored = observe(emptyTrackerState(), restore, T0).state;
+      const reopen = observe(restored, already, T0 + 1);
+      expect(reopen.state).toBe(restored);
+      expect(reopen.events).toHaveLength(0);
+      const flush: PersistenceObservation = { kind: 'flush', layer, code: 'too_large', trigger: 'interval' };
+      const { state, events } = run([restore, flush, already, flush, already, flush]);
+      expect(events.map((e) => `${e.site}:${e.code}`)).toEqual([
+        `persist.${layer}.restore:failed`, `persist.${layer}.flush:too_large`,
+      ]);
+      expect(state[layer].consecutiveFailures).toBe(4);
+      expect(observe(state, { ...restore, code: 'ok' }, T0 + 60_000).events).toHaveLength(1);
+    });
+  }
+
   it('suppresses the failed-capture loop: 30 identical too_large captures -> ONE event', () => {
     const { events, state } = run(Array.from({ length: 30 }, () => sysFlush('too_large')));
     expect(events).toHaveLength(1);
