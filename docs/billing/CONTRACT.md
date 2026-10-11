@@ -147,6 +147,7 @@ Ships **disabled by default**. With every flag unset, the product behaves exactl
   - **re-reads** the subscription or invoice from Stripe before acting;
   - resolves the user only through `ezil_billing_customers`;
   - grants via `insert … on conflict do nothing`.
+  - **No multi-statement transaction, deliberately.** Every write is idempotent and keyed by a Stripe object id, and an event whose processing throws stays `unprocessed` in the inbox and is re-run in full on Stripe's retry. A partial application therefore converges instead of needing a rollback.
 
 ## 6. Routes and API
 
