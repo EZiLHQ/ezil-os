@@ -151,6 +151,8 @@ const click = (el) => el?.dispatchEvent(new window.MouseEvent('click', { bubbles
 // non-empty array. That is the exact input that silently deleted Settings
 // from every boot in round 1.
 const REAL_PAYLOAD = {
+    // No features key: billing's default-off contract preserves these six
+    // tabs. billing-test.mjs pairs this with an enabled, seven-tab boot.
     // `toShellBootUser`'s shape. `<b>` in the name proves the Account tab
     // escapes it rather than rendering markup a user put in their profile.
     user: {
@@ -239,6 +241,9 @@ push('no upstream Dashboard tab survived',
     ! tabIds.some(id => ['home', 'apps', 'files', 'usage', 'security'].includes(id)));
 push('Settings still opens on Computers',
     q('.window[data-app="settings"] .ezil-settings-pane[data-pane="computers"]')?.classList.contains('active'));
+push('flag-off Settings still loads Computers without requesting billing',
+    calls.some(c => c.url.includes('/api/trpc/computer.list'))
+    && ! calls.some(c => c.url.includes('/api/trpc/billing.')));
 
 // ── Computers tab ──────────────────────────────────────────────────────────
 const rows = qa('.window[data-app="settings"] .ezil-settings-row');
