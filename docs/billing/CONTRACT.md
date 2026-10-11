@@ -111,6 +111,9 @@ Ships **disabled by default**. With every flag unset, the product behaves exactl
   - `storageState(used: bigint, cap: bigint): MeterState`
   - `resolvePlan(subs: SubscriptionRow[], now: Date): { plan: 'free'|'pro'; status: PlanStatus; window: {start,end}; renewsAt: Date|null; cancelsAt: Date|null }`
   - `buildSummary(input: { config: BillingConfig; now: Date; subs: SubscriptionRow[]; intervals: IntervalRow[]; storage: { computerId: string; bytes: bigint; measuredAt: Date }[] }): BillingSummaryEnabled`
+    - `storage` may hold several samples per computer; only the newest per `computerId` counts.
+    - `actions.checkout` = checkout available (flag + key); `actions.portal` = checkout available **and** the plan is Pro or past due; `actions.topup` = false until G4.
+    - Catalog cents (`unitAmountCents`, `creditCents`, `serviceFeeCents`, `totalCents`) are small integers and travel as numbers.
 - **Pro resolution in `resolvePlan`:** a subscription grants Pro when its status is `active` or `trialing` and `now ∈ [current_period_start, current_period_end)`.
   - `cancel_at_period_end` turns that into status `cancels` (`cancelsAt = current_period_end`).
   - A subscription that is `past_due` or `unpaid` gives `plan: 'free'` with `status: 'past_due'`.
@@ -125,12 +128,12 @@ Ships **disabled by default**. With every flag unset, the product behaves exactl
 
 | Stripe event | action(s) |
 |---|---|
-| `checkout.session.completed` | `link_customer` (from `client_reference_id`, `customer`); `topup_paid` when `mode=payment` and `payment_status=paid` |
+| `checkout.session.completed` | `link_customer` `{customerId, clientReferenceId}` only when `client_reference_id` is present (never from metadata; a session without it links nothing and must not throw); `topup_paid` when `mode=payment` and `payment_status=paid` |
 | `checkout.session.async_payment_succeeded` | `topup_paid` |
 | `invoice.paid` | `grant_period` (from the invoice's subscription line `period`, keyed by invoice id) |
 | `invoice.payment_failed` | `sync_subscription` |
 | `customer.subscription.created`, `…updated`, `…deleted` | `sync_subscription` |
-| `charge.refunded` | `revoke` (keyed by the refund id) |
+| `charge.refunded` | one `revoke` `{chargeId, refundId}` **per refund** in `refunds.data` (grant key = refund id) |
 | `charge.dispute.created` | `suspend` |
 | `charge.dispute.closed` | `restore` when won |
 | anything else | `[]` (acknowledged, ignored) |
