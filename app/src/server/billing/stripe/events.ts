@@ -167,9 +167,24 @@ export function planStripeEvent(event: StripeEventLike): BillingAction[] {
                 eventId,
                 eventCreated,
             }];
+        case 'refund.created':
+        case 'refund.updated':
+            // The refund object names both ids. Stripe API versions from 2022
+            // on no longer embed `refunds` in `charge.refunded`, so these
+            // events are the dependable source; the processor re-reads the
+            // charge and only a full refund revokes anything.
+            return [{
+                type: 'revoke',
+                chargeId: stripeId(payload.charge, 'refund.charge'),
+                refundId: text(payload.id, 'refund.id'),
+                eventId,
+            }];
         case 'charge.refunded': {
+            // Older API versions embed the refund list; newer ones do not, and
+            // their `refund.*` events above carry the same facts.
+            if (payload.refunds === undefined || payload.refunds === null) return [];
             const refunds = list(object(payload.refunds, 'charge.refunds').data, 'charge.refunds.data');
-            if (refunds.length === 0) throw new TypeError('charge.refunds.data must contain a refund');
+            if (refunds.length === 0) return [];
             // One revoke per refund: the grant ledger is keyed by refund id, so a
             // second partial refund on the same charge is its own entry.
             const chargeId = text(payload.id, 'charge.id');

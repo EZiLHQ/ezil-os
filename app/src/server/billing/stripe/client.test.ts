@@ -290,6 +290,21 @@ describe('Stripe response mapping', () => {
         });
     });
 
+    it('finds the invoice of a charge through Invoice Payments when the charge no longer names it', async () => {
+        const { client, fetcher } = fixture(charge);
+        fetcher.mockReset();
+        fetcher.mockResolvedValueOnce(Response.json({ ...charge, invoice: undefined, payment_intent: 'pi_fixture' }));
+        fetcher.mockResolvedValueOnce(Response.json({ data: [{ invoice: 'in_from_payments' }] }));
+        expect(await client.retrieveCharge('ch_fixture')).toEqual({ ...expectedCharge, invoiceId: 'in_from_payments' });
+        const second = fetcher.mock.calls[1][0] as string;
+        expect(second).toBe('https://api.stripe.com/v1/invoice_payments?payment[type]=payment_intent&payment[payment_intent]=pi_fixture&limit=1');
+        // Positive control: a charge that still names its invoice makes no second request.
+        fetcher.mockReset();
+        fetcher.mockResolvedValueOnce(Response.json(charge));
+        await client.retrieveCharge('ch_fixture');
+        expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+
     it('encodes resource ids as a single path segment', async () => {
         const { client, fetcher } = fixture(charge);
         expect(await client.retrieveCharge('ch_fixture/other?expand[]=customer')).toEqual(expectedCharge);

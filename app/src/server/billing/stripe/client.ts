@@ -265,11 +265,22 @@ export function createStripeClient(opts: {
 
         async retrieveCharge(id) {
             const charge = await request<ChargeResponse>(`/charges/${encodeURIComponent(id)}`);
+            const paymentIntentId = referenceId(charge.payment_intent);
+            // From API version 2025-03-31 a charge no longer names its invoice;
+            // the Invoice Payments API maps the payment back to it. Without
+            // this a refund of a subscription charge could not find the
+            // period grant it has to revoke.
+            let invoiceId = referenceId(charge.invoice);
+            if (invoiceId === null && paymentIntentId !== null) {
+                const query = `payment[type]=payment_intent&payment[payment_intent]=${encodeURIComponent(paymentIntentId)}&limit=1`;
+                const payments = await request<{ data?: Array<{ invoice?: unknown }> }>(`/invoice_payments?${query}`);
+                invoiceId = referenceId(payments.data?.[0]?.invoice as StripeReference | undefined);
+            }
             return {
                 id: charge.id,
                 customer: referenceId(charge.customer),
-                invoiceId: referenceId(charge.invoice),
-                paymentIntentId: referenceId(charge.payment_intent),
+                invoiceId,
+                paymentIntentId,
                 amount: charge.amount,
                 amountRefunded: charge.amount_refunded,
                 refunded: charge.refunded,

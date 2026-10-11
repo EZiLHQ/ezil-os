@@ -189,8 +189,7 @@ describe('planStripeEvent', () => {
         { name: 'string period', type: 'invoice.paid', valid: invoice2024, invalid: { ...invoice2024, lines: { data: [{ period: { start: String(start), end } }] } }, message: 'invoice.lines.data[0].period.start must be a non-negative Unix timestamp in seconds' },
         { name: 'reversed period', type: 'invoice.paid', valid: invoice2024, invalid: { ...invoice2024, lines: { data: [{ period: { start: end, end: start } }] } }, message: 'invoice.lines.data[0].period.end must be after its start' },
         { name: 'empty subscription id', type: 'customer.subscription.updated', valid: { id: 'sub_fixture' }, invalid: { id: '' }, message: 'subscription.id must be a non-empty string' },
-        { name: 'missing refunds', type: 'charge.refunded', valid: charge, invalid: { ...charge, refunds: null }, message: 'charge.refunds must be an object' },
-        { name: 'empty refunds', type: 'charge.refunded', valid: charge, invalid: { ...charge, refunds: { data: [] } }, message: 'charge.refunds.data must contain a refund' },
+        { name: 'refund without charge', type: 'refund.created', valid: { id: 're_fixture', charge: 'ch_fixture' }, invalid: { id: 're_fixture' }, message: 'refund.charge must be an object' },
         { name: 'missing refund id', type: 'charge.refunded', valid: charge, invalid: { ...charge, refunds: { data: [{}] } }, message: 'charge.refunds.data[0].id must be a non-empty string' },
         { name: 'missing dispute charge', type: 'charge.dispute.created', valid: dispute, invalid: { ...dispute, charge: null }, message: 'dispute.charge must be an object' },
         { name: 'missing dispute status', type: 'charge.dispute.closed', valid: dispute, invalid: { ...dispute, status: null }, message: 'dispute.status must be a non-empty string' },
@@ -213,5 +212,20 @@ describe('planStripeEvent', () => {
         const invalid = fields === null ? null : { ...valid, ...fields as object };
         expect(() => planStripeEvent(invalid as StripeEventLike)).toThrow(TypeError);
         expect(() => planStripeEvent(invalid as StripeEventLike)).toThrow(String(path));
+    });
+});
+
+describe('refunds on current Stripe API versions', () => {
+    it('plans a revoke from refund.created and refund.updated', () => {
+        for (const type of ['refund.created', 'refund.updated']) {
+            expect(planStripeEvent(event(type, { id: 're_live', charge: 'ch_live', status: 'succeeded' })))
+                .toEqual([{ type: 'revoke', chargeId: 'ch_live', refundId: 're_live', eventId }]);
+        }
+    });
+
+    it('ignores charge.refunded without an embedded refund list (positive control: with one it revokes)', () => {
+        expect(planStripeEvent(event('charge.refunded', { id: 'ch_live', refunded: true }))).toEqual([]);
+        expect(planStripeEvent(event('charge.refunded', { id: 'ch_live', refunds: { data: [{ id: 're_old' }] } })))
+            .toEqual([{ type: 'revoke', chargeId: 'ch_live', refundId: 're_old', eventId }]);
     });
 });
