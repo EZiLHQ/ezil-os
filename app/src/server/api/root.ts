@@ -1,8 +1,10 @@
+import { billingRouter } from './routers/billing';
 import { cloudflareGuacamoleRouter } from './routers/cloudflare-guacamole';
 import { computerRouter } from './routers/computer';
 import { createCallerFactory, createTRPCRouter } from './trpc';
 
 export const appRouter = createTRPCRouter({
+    billing: billingRouter,
     computer: computerRouter,
     cloudflareGuacamole: cloudflareGuacamoleRouter,
 });
