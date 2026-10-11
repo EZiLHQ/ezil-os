@@ -56,7 +56,13 @@ function assertBillingMigration(sql: string): void {
 
     const functions = parsed.filter((statement) => /^CREATE FUNCTION/i.test(statement));
     expect(functions).toHaveLength(1);
-    expect(functions[0]).toMatch(/^CREATE FUNCTION "public"\."ezil_billing_refuse_mutation"\(\)\s+RETURNS trigger\s+LANGUAGE plpgsql\s+AS \$\$\s+BEGIN\s+RAISE EXCEPTION '% is append-only: % is forbidden', TG_TABLE_NAME, TG_OP;\s+END;\s+\$\$$/i);
+    // The guard refuses every UPDATE, DELETE and TRUNCATE, with one exemption:
+    // a DELETE whose owning auth.users row is already gone, which is exactly
+    // the ON DELETE CASCADE an account deletion produces.
+    const guard = functions[0].replace(/--[^\n]*/g, '');
+    expect(guard).toMatch(/^CREATE FUNCTION "public"\."ezil_billing_refuse_mutation"\(\)\s+RETURNS trigger\s+LANGUAGE plpgsql\s+AS \$\$\s+BEGIN\s/i);
+    expect(guard).toMatch(/IF TG_OP = 'DELETE' AND NOT EXISTS \(\s*SELECT 1 FROM "auth"\."users" WHERE "id" = OLD\."user_id"\s*\) THEN\s+RETURN OLD;\s+END IF;/i);
+    expect(guard).toMatch(/RAISE EXCEPTION '% is append-only: % is forbidden', TG_TABLE_NAME, TG_OP;\s+END;\s+\$\$$/i);
 
     for (const statement of parsed) {
         if (/\bDROP\b/i.test(statement)) throw new Error('Destructive DROP statement');
