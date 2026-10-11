@@ -381,11 +381,27 @@ test('cleanup stops a process still working inside the project before removing i
   const probe = { opencodeExisted: true };
   const outside = spawnSync('bash', ['-c', 'sleep 30 > /dev/null 2>&1 & echo $!'], { cwd: home, encoding: 'utf8' });
   const inside = spawnSync('bash', ['-c', 'sleep 30 > /dev/null 2>&1 & echo $!'], { cwd: join(home, runPaths(runId).project, 'app'), encoding: 'utf8' });
-  const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const alive = pid => {
+    try { process.kill(pid, 0); } catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+    // Linux: an unreaped zombie still answers kill(pid, 0); /proc tells it apart.
+    // No /proc (macOS): kill(pid, 0) succeeding is the only signal, so it is alive.
+    if (!existsSync('/proc/self')) return true;
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      return stat[stat.lastIndexOf(')') + 2] !== 'Z';
+    } catch (error) {
+      if (error.code === 'ENOENT') return false;
+      throw error;
+    }
+  };
   const [outsidePid, insidePid] = [Number(outside.stdout.trim()), Number(inside.stdout.trim())];
   try {
     assert.ok(alive(insidePid) && alive(outsidePid));
     assert.equal(parseCleanup(step(home, cleanupScript(cleanupPlan({ runId, probe, install: { addedRcLines: {} } })))).pathsLeft, false);
+    // SIGKILL is asynchronous, and kill(pid, 0) still succeeds for an unreaped zombie.
+    const deadline = performance.now() + 2000;
+    const pause = new Int32Array(new SharedArrayBuffer(4));
+    while (alive(insidePid) && performance.now() < deadline) Atomics.wait(pause, 0, 0, 20);
     assert.equal(alive(insidePid), false, 'process inside the project survived cleanup');
     assert.equal(alive(outsidePid), true, 'cleanup killed a process outside this run');
   } finally { for (const pid of [outsidePid, insidePid]) { try { process.kill(pid, 'SIGKILL'); } catch {} } }
