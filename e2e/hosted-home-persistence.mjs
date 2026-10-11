@@ -136,19 +136,44 @@ export function stepCommand(nonce, body) {
  * stays well under the proven length.
  */
 export const MAX_TYPED_LINE = 480;
-const STEP_CHUNK = 400;
+const STEP_CHUNK = 300;
 
-/** The lines to type for one step: one line when short, else base64 chunks into a file. */
-export function stepLines(nonce, body) {
+/**
+ * How one step reaches the shell. Short steps: one line. Long steps: each base64
+ * chunk goes to its own file and the shell ACKNOWLEDGES it with the byte count it
+ * wrote; the driver waits for that exact ack (retyping a chunk on a missing or
+ * wrong ack) before the final short line decodes and runs the script. Nothing
+ * depends on the terminal echoing typed input (staging 2026-10-11: echoes were
+ * unreliable and a garbled chunk silently produced no result).
+ */
+export function stepPlan(nonce, body) {
   const single = stepCommand(nonce, body);
-  if (single.length <= MAX_TYPED_LINE) return [single];
+  if (single.length <= MAX_TYPED_LINE) return { chunks: [], run: single };
   const script = `${PRELUDE(nonce)}\n${body}\n`;
   const encoded = gzipSync(Buffer.from(script)).toString('base64');
-  const file = `/tmp/ezq-step-${assertNonce(nonce)}.b64`;
-  const lines = [`: > ${file}`];
-  for (let i = 0; i < encoded.length; i += STEP_CHUNK) lines.push(`printf %s '${encoded.slice(i, i + STEP_CHUNK)}' >> ${file}`);
-  lines.push(`bash -c "$(base64 -d ${file} | gzip -dc)"; rm -f ${file}`);
-  return lines;
+  const base = `/tmp/ezq-step-${assertNonce(nonce)}`;
+  const chunks = [];
+  for (let i = 0, index = 0; i < encoded.length; i += STEP_CHUNK, index++) {
+    const part = encoded.slice(i, i + STEP_CHUNK);
+    const file = `${base}.${String(index).padStart(3, '0')}`;
+    // The typed line contains "$(wc", never digits after the last colon, so its
+    // echo can never satisfy the ack pattern.
+    chunks.push({ index, bytes: part.length,
+      line: `printf %s '${part}' > ${file} && echo "EZQC:${nonce}:${index}:$(wc -c < ${file})"` });
+  }
+  return { chunks, run: `bash -c "$(cat ${base}.* | base64 -d | gzip -dc)"; rm -f ${base}.*` };
+}
+
+/** True when the terminal text holds this chunk's ack with the exact byte count. */
+export function chunkAcked(text, nonce, index, bytes) {
+  const compact = String(text ?? '').replace(/\s/g, '');
+  return new RegExp(`EZQC:${assertNonce(nonce)}:${index}:${bytes}(?![0-9])`).test(compact);
+}
+
+/** Every line a step may type (chunks, then the run line). */
+export function stepLines(nonce, body) {
+  const plan = stepPlan(nonce, body);
+  return [...plan.chunks.map(c => c.line), plan.run];
 }
 
 const PAYLOAD = '[A-Za-z0-9=,._+/-]*';
@@ -666,10 +691,15 @@ async function main() {
     await row.waitFor({ state: 'hidden', timeout: 15000 });
     await wait(1000);
   };
-  const terminalInput = () => f.locator('.xterm-helper-textarea').last();
+  // The terminal itself, never its sticky-scroll overlay: VS Code adds a second
+  // xterm (.terminal-sticky-scroll) once output scrolls, it takes focus, and a
+  // bare '.last()' then types into the overlay (reproduced locally on code-server,
+  // the cause of staging's silent 'step probe result').
+  const MAIN_XTERM = '.terminal-wrapper.active > .terminal-xterm-host > .xterm';
+  const terminalInput = () => f.locator(`${MAIN_XTERM} .xterm-helper-textarea`).first();
   // Every terminal's accessibility rows, not just the last: Code may restore an earlier
   // terminal beside the new one (2026-10-11 staging: 'step probe typed' never matched).
-  const terminalText = async () => (await f.locator('.xterm-accessibility-tree').allInnerTexts()).join('\n');
+  const terminalText = async () => (await f.locator(`${MAIN_XTERM} .xterm-accessibility-tree`).allInnerTexts()).join('\n');
   const openTerminal = async () => {
     terminalReady = false;
     f = await openCode();
@@ -684,7 +714,7 @@ async function main() {
       await bounded('terminal accessibility rows', () => f.locator('.xterm-accessibility-tree').count(), 15000);
     }
     await command('Terminal: Focus Terminal');
-    await f.locator('.xterm-screen').last().click();
+    await f.locator(`${MAIN_XTERM} .xterm-screen`).first().click();
     await bounded('terminal keyboard focus', () => terminalInput().evaluate(el => document.activeElement === el), 10000);
     await wait(1000);
     terminalReady = true;
@@ -695,18 +725,25 @@ async function main() {
     stepInFlight = true;
     // Ordinary keyboard input, as hosted-continuity types into xterm, in lines
     // short enough for the terminal's accessibility rows to show in full.
-    for (const line of stepLines(nonce, body)) {
+    const plan = stepPlan(nonce, body);
+    const type = async line => {
       await terminalInput().pressSequentially(line, { delay: 10, timeout: 120000 });
-      // Advisory only: the accessibility rows are an unreliable echo of input. The
-      // proof that every line arrived intact is the nonce marker the decoded script
-      // prints below (a mistyped chunk cannot decode, so no marker appears).
-      const seen = await bounded(`step ${name} typed`, async () => {
-        try { return (await terminalText()).replace(/\s/g, '').includes(line.slice(-80).replace(/\s/g, '')); } catch { return false; }
-      }, 15000).catch(() => false);
-      if (!seen) evidence.typedUnverified = (evidence.typedUnverified ?? 0) + 1;
+      await wait(200);
       await terminalInput().press('Enter');
-      await wait(300);
+    };
+    for (const chunk of plan.chunks) {
+      let acked = false;
+      for (let attempt = 1; attempt <= 3 && !acked; attempt++) {
+        if (attempt > 1) { evidence.chunkRetries = (evidence.chunkRetries ?? 0) + 1; await terminalInput().press('Control+C'); await wait(500); }
+        await type(chunk.line);
+        acked = await bounded(`step ${name} chunk`, async () => {
+          try { return chunkAcked(await terminalText(), nonce, chunk.index, chunk.bytes); } catch { return false; }
+        }, 20000).catch(() => false);
+      }
+      if (!acked) throw new Error(`step ${name} chunk: deadline exceeded`);
     }
+    evidence.operation = `step ${name}`;
+    await type(plan.run);
     const payload = await bounded(`step ${name} result`, async () => {
       try { return readMarker(await terminalText(), nonce); } catch { return null; }
     }, timeoutMs);

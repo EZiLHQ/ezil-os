@@ -12,7 +12,7 @@ import { createHmac } from 'node:crypto';
 import { runInNewContext } from 'node:vm';
 import {
   assertStagingTarget, TargetRefused, PRODUCTION_HOSTS, assertRunId, newRunId, newNonce, runPaths, checksumTargets,
-  stepCommand, stepLines, MAX_TYPED_LINE, readMarker, parseFields, probeScript, parseProbe, checksumScript, parseChecksums, compareChecksums,
+  stepCommand, stepLines, stepPlan, chunkAcked, MAX_TYPED_LINE, readMarker, parseFields, probeScript, parseProbe, checksumScript, parseChecksums, compareChecksums,
   opencodeInstallScript, parseOpencodeInstall, projectScript, depsWaitScript, parseDepsStatus, parseDepsWait,
   depsWaitOutcome, projectDepsState, devServerScript, parseDevServer, cleanupPlan, cleanupScript, parseCleanup,
   EVIDENCE_FILE, clampWait, RUN_BUDGET_MS, CLEANUP_RESERVE_MS, POWER_CUT_RPO_MS, powerCutAfterRpo,
@@ -74,26 +74,19 @@ test('power cut refuses failed HTTP/acknowledgment and never fires if its wait f
   assert.equal(called, false);
 });
 
-test('runStep retries terminal read errors during both typed and result checks', async () => {
+test('runStep retries terminal read errors while waiting for the result marker', async () => {
   const source = readFileSync(script, 'utf8');
   const runStepSource = source.match(/  const runStep = async \(name, body, timeoutMs\) => \{[\s\S]*?\n  \};/)[0];
-  let line, reads = 0, enters = 0;
+  let reads = 0, enters = 0;
   const nonce = 'a'.repeat(24);
-  const context = { evidence: {}, stepInFlight: false, newNonce: () => nonce, stepCommand, stepLines, readMarker, parseFields, wait: async () => {},
-    terminalInput: () => ({ pressSequentially: async value => { line = value; }, press: async key => { assert.equal(key, 'Enter'); enters++; } }),
-    terminalText: async () => {
-      reads++;
-      if (reads === 1 || reads === 3) throw new Error('transient detached terminal');
-      return reads === 2 ? line : `EZQ:${nonce}:x=1:END`;
-    },
-    bounded: async (_name, action) => {
-      assert.equal(await action(), _name.endsWith('typed') ? false : null);
-      return action();
-    },
+  const context = { evidence: {}, stepInFlight: false, newNonce: () => nonce, stepCommand, stepLines, stepPlan, chunkAcked, readMarker, parseFields, wait: async () => {},
+    terminalInput: () => ({ pressSequentially: async () => {}, press: async key => { assert.equal(key, 'Enter'); enters++; } }),
+    terminalText: async () => { reads++; if (reads === 1) throw new Error('transient detached terminal'); return `EZQ:${nonce}:x=1:END`; },
+    bounded: async (_name, action) => { const first = await action(); return first ?? action(); },
   };
   const runStep = runInNewContext(`${runStepSource}\nrunStep`, context);
   assert.deepEqual(await runStep('probe', 'emit "x=1"', 1000), { x: '1' });
-  assert.equal(reads, 4);
+  assert.equal(reads, 2);
   assert.equal(enters, 1);
   assert.equal(context.stepInFlight, false);
 });
@@ -549,17 +542,46 @@ test('every real hosted step types only lines within the proven length', () => {
   }
 });
 
-test('an unverified typing echo is advisory: the result marker decides', async () => {
+test('long steps upload acknowledged chunks; a lost chunk is retyped, never silently run', async () => {
   const source = readFileSync(script, 'utf8');
   const runStepSource = source.match(/  const runStep = async \(name, body, timeoutMs\) => \{[\s\S]*?\n  \};/)[0];
-  const nonce = 'd'.repeat(24);
-  let enters = 0;
-  const context = { evidence: {}, stepInFlight: false, newNonce: () => nonce, stepCommand, stepLines, readMarker, parseFields, wait: async () => {},
-    terminalInput: () => ({ pressSequentially: async () => {}, press: async () => { enters++; } }),
-    terminalText: async () => (enters ? `EZQ:${nonce}:x=1:END` : ''),
+  const nonce = 'e'.repeat(24);
+  const noise = Array.from({ length: 1500 }, (_, i) => ((i * 2654435761) >>> 0).toString(36)).join('').slice(0, 2000);
+  const body = `# ${noise}\nemit "x=1"`;
+  const plan = stepPlan(nonce, body);
+  assert.ok(plan.chunks.length >= 2);
+  for (const c of plan.chunks) assert.ok(c.line.length <= MAX_TYPED_LINE);
+  // The typed line's own echo never satisfies the ack.
+  assert.equal(chunkAcked(plan.chunks[0].line, nonce, 0, plan.chunks[0].bytes), false);
+  let screen = '', typed = [], ctrlC = 0, droppedOnce = false;
+  const context = { evidence: {}, stepInFlight: false, newNonce: () => nonce, stepCommand, stepLines, stepPlan, chunkAcked, readMarker, parseFields, wait: async () => {},
+    terminalInput: () => ({ pressSequentially: async v => { typed.push(v); }, press: async key => {
+      if (key === 'Control+C') { ctrlC++; return; }
+      const line = typed.at(-1);
+      const c = plan.chunks.find(x => x.line === line);
+      if (c && c.index === 1 && !droppedOnce) { droppedOnce = true; return; } // first try of chunk 1 is lost
+      if (c) screen += `\nEZQC:${nonce}:${c.index}:${c.bytes}\n`;
+      else if (line === plan.run) screen += `\nEZQ:${nonce}:x=1:END\n`;
+    } }),
+    terminalText: async () => screen,
     bounded: async (name, action) => { const r = await action(); if (r) return r; throw new Error(`${name}: deadline exceeded`); },
   };
   const runStep = runInNewContext(`${runStepSource}\nrunStep`, context);
-  assert.deepEqual(await runStep('probe', 'emit "x=1"', 1000), { x: '1' });
-  assert.equal(context.evidence.typedUnverified, 1);
+  assert.deepEqual(await runStep('big', body, 1000), { x: '1' });
+  assert.equal(ctrlC, 1);
+  assert.equal(context.evidence.chunkRetries, 1);
+  assert.equal(typed.filter(l => l === plan.chunks[1].line).length, 2);
+  assert.equal(typed.at(-1), plan.run);
+});
+
+test('acknowledged chunks rebuild and run the same script in a real shell', () => {
+  const nonce = 'f'.repeat(24);
+  const home = mkdtempSync(join(tmpdir(), 'ezq-ack-'));
+  const noise = Array.from({ length: 1500 }, (_, i) => ((i * 2654435761) >>> 0).toString(36)).join('').slice(0, 2000);
+  const plan = stepPlan(nonce, `# ${noise}\nemit "x=$(printf %s '${'y'.repeat(2000)}' | wc -c)"`);
+  const out = spawnSync('bash', ['-c', [...plan.chunks.map(c => c.line), plan.run].join('\n')], { env: { PATH: process.env.PATH, HOME: home }, encoding: 'utf8', timeout: 30000 });
+  assert.equal(out.status, 0, out.stderr);
+  for (const c of plan.chunks) assert.ok(chunkAcked(out.stdout, nonce, c.index, c.bytes), `chunk ${c.index} acked`);
+  assert.deepEqual(parseFields(readMarker(out.stdout, nonce)), { x: '2000' });
+  rmSync(home, { recursive: true, force: true });
 });
