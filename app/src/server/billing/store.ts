@@ -48,6 +48,7 @@ export function createBillingStore(db: Database): BillingStore {
             return db.select({
                 startedAt: billingUsageIntervals.startedAt,
                 endedAt: billingUsageIntervals.endedAt,
+                lastSeenAt: billingUsageIntervals.lastSeenAt,
             }).from(billingUsageIntervals).where(and(
                 eq(billingUsageIntervals.userId, userId),
                 or(isNull(billingUsageIntervals.endedAt), gte(billingUsageIntervals.endedAt, since)),

@@ -255,12 +255,12 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore', ()
         const rows = await store.intervalsFor(userId, instant(10));
         expect(rows).toHaveLength(3);
         expect(rows).toEqual(expect.arrayContaining([
-            { startedAt: instant(9), endedAt: instant(10) },
-            { startedAt: instant(20), endedAt: instant(30) },
-            { startedAt: instant(-100), endedAt: null },
+            expect.objectContaining({ startedAt: instant(9), endedAt: instant(10) }),
+            expect.objectContaining({ startedAt: instant(20), endedAt: instant(30) }),
+            expect.objectContaining({ startedAt: instant(-100), endedAt: null, lastSeenAt: instant(-100) }),
         ]));
         expect(await store.intervalsFor(userId, instant(0))).toHaveLength(4);
-        expect(await store.intervalsFor(otherUserId, instant(10))).toEqual([{ startedAt: instant(0), endedAt: null }]);
+        expect(await store.intervalsFor(otherUserId, instant(10))).toEqual([expect.objectContaining({ startedAt: instant(0), endedAt: null })]);
         expect(await store.intervalsFor(randomUUID(), instant(10))).toEqual([]);
     });
 
