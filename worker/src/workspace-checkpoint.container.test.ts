@@ -664,6 +664,64 @@ done
     }
   }, T);
 
+  it('an old HOME layer restores archived package files but excludes dependency and build trees, including split archive/disk manifests', async () => {
+    const { systemSnapshotCommand } = await import('./system-snapshot-script');
+    const c = await startComputer('sys-old-home');
+    const work = '/tmp/ezil-system-old-home';
+    // Construct a pre-exclusion archive directly: ~/app does not exist on disk,
+    // and its node_modules directory sorts before package.json during restore.
+    const snapshot = JSON.parse(await must(c, String.raw`python3 - <<'PY'
+import hashlib, io, json, os, tarfile
+work = '${work}'
+os.makedirs(work)
+cases = [('/root/app', 'package-lock.json', None),
+         ('/home/alice/app', 'pnpm-lock.yaml', None),
+         ('/root/bun-app', 'bun.lock', None),
+         ('/root/bun-old', 'bun.lockb', None),
+         ('/root/yarn-app', 'yarn.lock', None),
+         ('/root/disk-package', 'package-lock.json', 'package.json'),
+         ('/root/disk-lock', 'package-lock.json', 'package-lock.json'),
+         ('/root/unlocked-old', None, None),
+         ('/root/.tool-old', 'package-lock.json', None),
+         ('/root/a/b/c/deep-old', 'package-lock.json', None)]
+data = io.BytesIO()
+with tarfile.open(fileobj=data, mode='w') as tar:
+    for directory, lock, disk_file in cases:
+        files = {'package.json': b'{"name":"old-app"}', 'node_modules/x': b'old-native-module', '.next/cache/x': b'old-build'}
+        if lock: files[lock] = b'{}'
+        if disk_file:
+            os.makedirs(directory, exist_ok=True)
+            with open(directory + '/' + disk_file, 'wb') as f: f.write(files.pop(disk_file))
+        for name in ('', '/node_modules', '/.next', '/.next/cache'):
+            member = tarfile.TarInfo((directory + name).lstrip('/'))
+            member.type, member.mode = tarfile.DIRTYPE, 0o755
+            tar.addfile(member)
+        for name, body in files.items():
+            member = tarfile.TarInfo((directory + '/' + name).lstrip('/'))
+            member.size, member.mode = len(body), 0o644
+            tar.addfile(member, io.BytesIO(body))
+body = data.getvalue()
+with open(work + '/0', 'wb') as f: f.write(body)
+digest = hashlib.sha256(body).hexdigest()
+print(json.dumps({'sha256': digest, 'imageId': 'older-image', 'generation': 'old-home',
+                  'chunks': [{'size': len(body), 'sha256': digest}]}))
+PY`));
+    expect(JSON.parse(await must(c, systemSnapshotCommand({ op: 'sys-restore', work, snapshot })))).toMatchObject({ conflicts: 0 });
+    for (const [directory, lock] of [
+      ['/root/app', 'package-lock.json'], ['/home/alice/app', 'pnpm-lock.yaml'],
+      ['/root/bun-app', 'bun.lock'], ['/root/bun-old', 'bun.lockb'], ['/root/yarn-app', 'yarn.lock'],
+      ['/root/disk-package', 'package-lock.json'], ['/root/disk-lock', 'package-lock.json'],
+    ]) {
+      expect(await must(c, `cat ${directory}/package.json`)).toBe('{"name":"old-app"}');
+      expect(await must(c, `cat ${directory}/${lock}`)).toBe('{}');
+      expect((await sh(c, `test ! -e ${directory}/node_modules && test ! -e ${directory}/.next`)).exitCode).toBe(0);
+    }
+    for (const directory of ['/root/unlocked-old', '/root/.tool-old', '/root/a/b/c/deep-old']) {
+      expect(await must(c, `cat ${directory}/node_modules/x`)).toBe('old-native-module');
+      expect(await must(c, `cat ${directory}/.next/cache/x`)).toBe('old-build');
+    }
+  }, T);
+
   it('boot restore (--homes) reinstalls exactly the home projects the snapshot leaves out, from their lockfiles', async () => {
     const store = await makeStore(); const prefix = prefixFor('system-homedeps');
     const a = await startComputer('syshd-a'); await sysHydrate(a, store, prefix);
@@ -909,6 +967,52 @@ test /root/partial/node_modules/.package-lock.json -nt /run/ezil-deps/status
     expect((await sh(c, 'ezil-deps wait /root/partial --timeout 1')).exitCode).toBe(0);
     expect((await sh(c, 'ezil-deps gate /root/partial')).stderr).toBe('');
     expect((await must(c, 'ezil-deps notice'))).not.toContain('~/partial');
+  }, T);
+
+  it('native installer markers resolve FAILED only when newer than the failure record and node_modules exists', async () => {
+    const c = await startComputer('deps-native-markers');
+    await sdk(c).writeFile('/tmp/ezq-deps', await readFile(new URL('../scripts/ezil-deps.sh', import.meta.url), 'utf8'));
+    const cases = [
+      ['package-lock.json', 'node_modules/.package-lock.json'],
+      ['pnpm-lock.yaml', 'node_modules/.modules.yaml'],
+      ['yarn.lock', 'node_modules/.yarn-integrity'],
+      ['yarn.lock', 'node_modules/.yarn-state.yml'],
+      ['bun.lock', 'bun.lock'], ['bun.lockb', 'bun.lockb'],
+    ];
+    for (const [index, [lock, marker]] of cases.entries()) {
+      const dir = `/tmp/ezq-native-${index}`, state = `${dir}/state`;
+      const wait = () => sh(c, `EZIL_DEPS_STATE_DIR=${state} bash /tmp/ezq-deps wait ${dir} --timeout 0`);
+      await must(c, String.raw`
+set -e
+mkdir -p ${dir}/node_modules ${state}
+echo '{}' > ${dir}/package.json
+echo '{}' > ${dir}/${lock}
+echo '{}' > ${dir}/${marker}
+touch -d '2000-01-01 UTC' ${dir}/${lock} ${dir}/${marker}
+printf 'failed\t${dir}\n' > ${state}/status
+touch -d '2000-01-02 UTC' ${state}/status
+`);
+      expect((await wait()).exitCode).toBe(1); // stale marker
+      await must(c, `touch -r ${state}/status ${dir}/${marker}`);
+      expect((await wait()).exitCode).toBe(1); // equal timestamps are ambiguous
+      await must(c, `touch -d '2000-01-03 UTC' ${dir}/${marker}`);
+      expect((await wait()).exitCode).toBe(0);
+      expect(await must(c, `EZIL_DEPS_STATE_DIR=${state} bash /tmp/ezq-deps notice`)).toBe('');
+      for (const status of ['pending', 'restoring']) {
+        await must(c, String.raw`printf '${status}\t${dir}\n' > ${state}/status && touch -d '2000-01-02 UTC' ${state}/status`);
+        expect((await wait()).exitCode).toBe(2); // markers never resolve an active install
+      }
+      await must(c, String.raw`printf 'failed\t${dir}\n' > ${state}/status && touch -d '2000-01-02 UTC' ${state}/status && mv ${dir}/node_modules ${dir}/saved-modules`);
+      expect((await wait()).exitCode).toBe(1); // even a newer Bun lock needs node_modules
+    }
+    // A fresh npm marker cannot certify pnpm, which takes precedence over npm.
+    await must(c, String.raw`
+set -e
+mkdir -p /tmp/ezq-native-1/node_modules
+echo '{}' > /tmp/ezq-native-1/package-lock.json
+echo '{}' > /tmp/ezq-native-1/node_modules/.package-lock.json
+`);
+    expect((await sh(c, 'EZIL_DEPS_STATE_DIR=/tmp/ezq-native-1/state bash /tmp/ezq-deps wait /tmp/ezq-native-1 --timeout 0')).exitCode).toBe(1);
   }, T);
 
   // A user's own /etc/bash.bashrc or global npmrc, restored over a newer image (their edits win),

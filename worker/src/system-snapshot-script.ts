@@ -82,25 +82,30 @@ p = json.loads(sys.argv[1])
 work = p['work']
 assert os.path.dirname(work) == '/tmp' and os.path.basename(work).startswith('ezil-system-'), 'invalid staging path'
 
-def project_regenerable(path):
+def regenerable_project_directory(path):
     if path.startswith('/root/'): home, rel = '/root', path[len('/root/'):].split('/')
     elif path.startswith('/home/'):
         parts = path[len('/home/'):].split('/')
         home, rel = '/home/' + parts[0], parts[1:]
-    else: return False
+    else: return None
     for i, seg in enumerate(rel):
         if seg in PROJECT_REGENERABLE:
             project = rel[:i]
             if len(project) > PROJECT_MAX_DEPTH or any(s.startswith('.') or s == 'dist' for s in project):
-                return False
-            directory = os.path.join(home, *project)
-            return (os.path.isfile(os.path.join(directory, 'package.json'))
-                    and any(os.path.isfile(os.path.join(directory, lock)) for lock in PROJECT_LOCKFILES))
-    return False
+                return None
+            return os.path.join(home, *project)
+    return None
 
-def excluded(path):
+def project_regenerable(path, restore_projects=None):
+    directory = regenerable_project_directory(path)
+    if directory is None: return False
+    if restore_projects is not None: return directory in restore_projects
+    return (os.path.isfile(os.path.join(directory, 'package.json'))
+            and any(os.path.isfile(os.path.join(directory, lock)) for lock in PROJECT_LOCKFILES))
+
+def excluded(path, restore_projects=None):
     return (os.path.basename(path) in EXCLUDE_NAMES or any(path == e or path.startswith(e + '/') for e in EXCLUDE)
-            or project_regenerable(path))
+            or project_regenerable(path, restore_projects))
 
 def image_id():
     try:
@@ -408,12 +413,28 @@ def restore():
             elif m.name and m.name != '.':
                 members.append(m)
         members.sort(key=lambda m: (0 if m.isdir() else 1, m.name))
+        # Old snapshots include dependency/build trees, often ordered before their
+        # package files. Decide exclusions before any extraction, from the union
+        # of regular archive files and files already on disk (deltas can split them).
+        archive_files, projects = set(), set()
+        for m in members:
+            assert not any(part == '..' for part in m.name.split('/')), 'unsafe archive path'
+            path = '/' + os.path.normpath(m.name).lstrip('/')
+            if m.isfile(): archive_files.add(path)
+            directory = regenerable_project_directory(path)
+            if directory is not None: projects.add(directory)
+        def project_file_exists(directory, name):
+            path = os.path.join(directory, name)
+            return path in archive_files or os.path.isfile(path)
+        restore_projects = {directory for directory in projects
+                            if project_file_exists(directory, 'package.json')
+                            and any(project_file_exists(directory, lock) for lock in PROJECT_LOCKFILES)}
         for m in members:
             path = '/' + os.path.normpath(m.name).lstrip('/')
             assert not any(part == '..' for part in m.name.split('/')), 'unsafe archive path'
             if m.isdir() and root_ancestor(path): continue
             assert in_roots(path), 'path outside system roots'
-            if excluded(path): continue
+            if excluded(path, restore_projects): continue
             if not same_image and m.isfile() and path == DPKG_STATUS:
                 with tar.extractfile(m) as src:
                     merged = merged_dpkg_status(src.read().decode('utf-8', 'surrogateescape'))
