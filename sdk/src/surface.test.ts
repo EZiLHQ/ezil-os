@@ -57,6 +57,7 @@ const KNOWN_UNCOVERED: Record<string, string> = {
     'cloudflareGuacamole.reportActivity': 'the shell\'s presence heartbeat against the idle reaper',
     'cloudflareGuacamole.relayState': 'runtime-scoped relay metadata for the hosted shell viewer',
     'cloudflareGuacamole.refreshRelay': 'renews the hosted shell viewer\'s active TURN session',
+    'cloudflareGuacamole.persistenceState': 'whether the hosted shell viewer\'s computer is currently saving (docs/PERSISTENCE-SIGNAL-CONTRACT.md §5)',
 };
 
 describe('SDK surface vs. the real routers', () => {

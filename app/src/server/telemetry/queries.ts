@@ -424,7 +424,7 @@ export interface PersistenceHealthRow {
  * worker persistence event carrying an age attr; missing/-1 means unknown,
  * with no per-layer fallback to an older sample. Staleness uses the latest
  * persistence event of any source, and a latest persist.stop is not stale.
- * Keep docs/sql/persistence-health.sql equivalent to this read-only query.
+ * Keep docs/sql/persistence-health.pgsql equivalent to this read-only query.
  */
 export async function persistenceHealth(
     db: QueryDb,

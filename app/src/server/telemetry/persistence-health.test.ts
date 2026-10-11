@@ -169,7 +169,7 @@ describe('persistenceHealth', () => {
     });
 
     it('keeps the standalone read-only SQL identical to the application query', async () => {
-        const document = readFileSync(path.resolve(__dirname, '../../../../docs/sql/persistence-health.sql'), 'utf8');
+        const document = readFileSync(path.resolve(__dirname, '../../../../docs/sql/persistence-health.pgsql'), 'utf8');
         const sql = document.replace(/^--.*$/gm, '').trim();
         expect(sql).not.toMatch(/\b(?:BEGIN|COMMIT)\b/i);
         expect(sql).toMatch(/^WITH clock AS/);

@@ -1,5 +1,6 @@
 -- Persistence signal contract §1–2. Same query as persistenceHealth().
--- Run: python3 .ci-support/supabase-sql.py query --project <ref> --file docs/sql/persistence-health.sql (the helper supplies the read-only transaction).
+-- Run: python3 .ci-support/supabase-sql.py query --project <ref> --file docs/sql/persistence-health.pgsql (the helper supplies the read-only transaction).
+-- Deliberately .pgsql, not .sql: every *.sql in this repo must be a registered production migration (.github/scripts/production-migrations.mjs).
 -- The seven-day window is based on receipt time; ordering, activity, and
 -- elapsed ages use occurrence time so delayed delivery cannot refresh them.
 -- Both ages use the latest worker event with an age attr; missing/-1 is unknown.
