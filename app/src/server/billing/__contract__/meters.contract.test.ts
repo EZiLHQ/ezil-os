@@ -138,7 +138,7 @@ describe('billing summary wire contract', () => {
         const intervals = [
             { computerId: 'computer_contract', startedAt: date('2026-10-02T00:00:00.000Z'), endedAt: date('2026-10-02T00:01:00.000Z') },
             { computerId: 'computer_contract', startedAt: now, endedAt: new Date(now.getTime() + 1) },
-        ] as SummaryInput['intervals'];
+        ] as unknown as SummaryInput['intervals'];
         const free = summary({ intervals });
         const pro = summary({ intervals, subs: [subscription()] });
         expect(free.meters.workspace.allowanceSeconds).toBe(28_800);
