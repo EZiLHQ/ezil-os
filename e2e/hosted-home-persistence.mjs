@@ -9,8 +9,8 @@
  *   1. installs OpenCode with its official installer, creates a real Next.js
  *      app (npm install -> package-lock.json), a note and a config file, all
  *      under per-run names, and records their sha256;
- *   2. stops the computer through the real stop route (final checkpoint +
- *      teardown) and proves the container was replaced (a /tmp sentinel, which
+ *   2. waits at least 90 s after the last write, cuts power without a final
+ *      checkpoint and proves the container was replaced (a /tmp sentinel, which
  *      no snapshot captures, is gone);
  *   3. asserts identical checksums, a resolvable working `opencode`,
  *      `ezil-deps wait` success, and `npm run dev` serving the page marker;
@@ -22,7 +22,7 @@
  * errors or terminal text.
  */
 import assert from 'node:assert/strict';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { createRequire } from 'node:module';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -532,6 +532,7 @@ export function parseCleanup(fields) {
 // CLEANUP_RESERVE_MS (cleanup step + ~290 s final stop + evidence).
 export const RUN_BUDGET_MS = 38 * 60000;
 export const CLEANUP_RESERVE_MS = 7 * 60000;
+export const POWER_CUT_RPO_MS = 90000;
 
 /** A wait capped at the work deadline; 0 means the budget is spent. Cleanup is never capped. */
 export function clampWait(requestedMs, { now, started, cleanup = false, budgetMs = RUN_BUDGET_MS, reserveMs = CLEANUP_RESERVE_MS }) {
@@ -549,11 +550,35 @@ export class AcceptanceFailure extends Error {
 export const FAILURE_CODES = Object.freeze([
   'home_not_root', 'run_names_not_fresh', 'opencode_install_failed', 'opencode_unusable_before_stop',
   'project_install_failed', 'setup_files_missing',
-  'stop_unconfirmed', 'container_not_replaced', 'checksums_changed', 'opencode_not_resolved', 'opencode_not_in_home',
+  'power_cut_unconfirmed', 'container_not_replaced', 'checksums_changed', 'opencode_not_resolved', 'opencode_not_in_home',
   'opencode_version_failed', 'deps_tool_missing', 'deps_wait_failed', 'checksums_changed_after_restore',
   'dev_server_not_200', 'dev_marker_missing', 'cleanup_incomplete',
 ]);
 const check = (condition, code) => { if (!condition) throw new AcceptanceFailure(code); };
+
+/** Same signed control request as hosted-continuity; no final-save endpoint. */
+export async function powerCutAfterRpo({ sandboxId, worker, secret, lastWriteFinishedAt, evidence,
+  wait, now = Date.now, fetchImpl = fetch }) {
+  assert.ok(Number.isFinite(lastWriteFinishedAt), 'Missing last write completion time');
+  assert.match(sandboxId, /^guac-[a-z0-9]{1,16}-[a-z0-9]{1,16}$/);
+  evidence.operation = 'power cut RPO wait';
+  let remaining;
+  while ((remaining = lastWriteFinishedAt + POWER_CUT_RPO_MS - now()) > 0) {
+    await wait(Math.min(1000, remaining));
+  }
+  evidence.operation = 'power cut';
+  const timestamp = now();
+  const signature = createHmac('sha256', secret).update(`${timestamp}.POST./sandbox/preview.`).digest('hex');
+  evidence.powerCut = { writeAgeMs: timestamp - lastWriteFinishedAt };
+  const response = await fetchImpl(`${worker.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxId)}/acceptance-fault`, {
+    method: 'POST', headers: { authorization: `Bearer t=${timestamp},v1=${signature}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ fault: 'power_cut' }), signal: AbortSignal.timeout(15000), redirect: 'error',
+  });
+  evidence.powerCut.httpStatus = response.status;
+  check(response.status === 200, 'power_cut_unconfirmed');
+  evidence.powerCut.ok = (await response.json()).ok === true;
+  check(evidence.powerCut.ok, 'power_cut_unconfirmed');
+}
 
 
 // ---------------------------------------------------------------------------
@@ -647,7 +672,9 @@ async function main() {
     stepInFlight = true;
     // Ordinary keyboard input, as hosted-continuity types into xterm.
     await terminalInput().pressSequentially(line, { delay: 10, timeout: 120000 });
-    await bounded(`step ${name} typed`, async () => (await terminalText()).replace(/\s/g, '').includes(line.slice(-80).replace(/\s/g, '')), 15000);
+    await bounded(`step ${name} typed`, async () => {
+      try { return (await terminalText()).replace(/\s/g, '').includes(line.slice(-80).replace(/\s/g, '')); } catch { return false; }
+    }, 15000);
     await terminalInput().press('Enter');
     const payload = await bounded(`step ${name} result`, async () => {
       try { return readMarker(await terminalText(), nonce); } catch { return null; }
@@ -667,6 +694,7 @@ async function main() {
     computerId = required('EZIL_E2E_COMPUTER_ID');
     assert.match(computerId, /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i, 'Explicit isolated computer UUID required');
     const email = required('EZIL_E2E_EMAIL'), password = required('EZIL_E2E_PASSWORD');
+    const worker = required('EZIL_E2E_WORKER'), secret = required('EZIL_ACCEPTANCE_HMAC_SECRET');
     const playwrightDir = required('PLAYWRIGHT_REQUIRE_DIR');
     const target = await import('./deployed-target.mjs');
     ({ APP, appHeaders, APP_STOP_FETCH_TIMEOUT_MS } = target);
@@ -690,6 +718,11 @@ async function main() {
     await page.goto(`${APP}/os`, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await isolated.verifySelectedComputer(page, { computerId, required: true });
     verifiedComputer = true;
+    const sandboxId = await page.evaluate(() => {
+      const payload = window.ezil.session.payload();
+      const compact = id => id.replace(/[^a-z0-9]/gi, '').slice(0, 16);
+      return `guac-${compact(payload.user.id)}-${compact(payload.computer.id)}`;
+    });
     phase('signed in to the isolated computer');
 
     await openTerminal();
@@ -717,22 +750,24 @@ async function main() {
     check(opencodeBefore.resolved && opencodeBefore.inHome && opencodeBefore.versionExit === 0, 'opencode_unusable_before_stop');
 
     const before = parseChecksums(await runStep('checksums before', checksumScript(runId, { sentinel: 'write' }), 120000), runId);
+    const lastWriteFinishedAt = Date.now();
     evidence.steps.checksumsBefore = before;
     check(before.sentinelPresent && Object.values(before.prefixes).every(v => v !== 'MISSING'), 'setup_files_missing');
     phase('checksums recorded');
 
-    // The real stop path: final workspace + system checkpoint, then teardown.
-    await close('desktop'); await close('code');
+    // Keep Code open during the RPO window, then pull power without saving.
+    await powerCutAfterRpo({ sandboxId, worker, secret, lastWriteFinishedAt, evidence,
+      wait: async ms => {
+        if (clampWait(ms, { now: Date.now(), started }) < ms) {
+          evidence.budgetExhausted = true;
+          throw new Error('power cut RPO wait: deadline exceeded');
+        }
+        await wait(ms);
+      },
+    });
     terminalReady = false;
-    const stopped = await page.evaluate(async computerId => {
-      const response = await fetch('/api/shell/stop', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ computerId }), cache: 'no-store' });
-      let json = null; try { json = await response.json(); } catch {}
-      return { status: response.status, ok: json?.ok === true, outcome: json?.outcome, terminated: json?.terminated === true };
-    }, computerId);
-    evidence.stop = { httpStatus: stopped.status, ok: stopped.ok, terminated: stopped.terminated,
-      outcome: ['destroyed', 'not_running', 'flush_failed'].includes(stopped.outcome) ? stopped.outcome : 'other' };
-    check(stopped.status === 200 && stopped.ok && stopped.outcome === 'destroyed' && stopped.terminated, 'stop_unconfirmed');
-    phase('computer stopped through the real stop route');
+    phase('computer power cut without a final checkpoint');
+    await close('desktop'); await close('code');
 
     await openTerminal();
     phase('computer reopened');
@@ -774,6 +809,7 @@ async function main() {
     evidence.ok = true;
   } catch (error) {
     // Driver messages may carry URLs, headers or typed text: publish fixed codes only.
+    evidence.failedOperation = evidence.operation;
     evidence.ok = false;
     evidence.failure = 'hosted_home_persistence_failed';
     evidence.errorType = ['AssertionError', 'TimeoutError', 'TargetRefused', 'AcceptanceFailure'].includes(error?.name) ? error.name : 'Error';

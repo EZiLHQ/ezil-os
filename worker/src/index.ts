@@ -2382,6 +2382,13 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   async setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void> {
     assertAcceptanceScope(this.env, sandboxId);
     const fault = parseAcceptanceFault(raw);
+    if (fault?.fault === 'power_cut') {
+      // Native SIGKILL: @cloudflare/containers delegates destroy() to this
+      // binding. Bypass both Sandbox teardown overrides, with no final flush
+      // or DO storage changes (including the hydrated keys).
+      await this.ctx.container!.destroy();
+      return;
+    }
     await this.ctx.storage.put('ezil_acceptance_fault', { sandboxId, fault });
   }
   private async acceptanceFault(sandboxId?: string): Promise<string | null> {
