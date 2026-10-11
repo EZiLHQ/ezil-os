@@ -406,3 +406,23 @@ describe('buildSummary', () => {
         expect(result.catalog).toEqual({ pro: catalogPro(), packs: AI_PACKS });
     });
 });
+
+describe('open intervals that stopped heartbeating', () => {
+    const window = { start: new Date('2026-10-01T00:00:00.000Z'), end: new Date('2026-11-01T00:00:00.000Z') };
+    const startedAt = new Date('2026-10-10T10:00:00.000Z');
+    const now = new Date('2026-10-10T14:00:00.000Z');
+
+    it('counts to now while heartbeats are recent (positive control)', () => {
+        const lastSeenAt = new Date('2026-10-10T13:59:00.000Z');
+        expect(workspaceUsedSeconds([{ startedAt, endedAt: null, lastSeenAt }], window, now)).toBe(4 * 3600);
+    });
+
+    it('stops counting 15 minutes after the last heartbeat', () => {
+        const lastSeenAt = new Date('2026-10-10T11:00:00.000Z');
+        expect(workspaceUsedSeconds([{ startedAt, endedAt: null, lastSeenAt }], window, now)).toBe(3600 + 15 * 60);
+    });
+
+    it('still counts to now when no heartbeat is known', () => {
+        expect(workspaceUsedSeconds([{ startedAt, endedAt: null }], window, now)).toBe(4 * 3600);
+    });
+});
