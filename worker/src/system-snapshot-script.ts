@@ -69,21 +69,33 @@ EXCLUDE_NAMES = ('.uuid',)
 # caches beside them they pass the snapshot limits and freeze every later capture (too_large). Excluded EXACTLY where that restore reaches: a project dir at most 3 levels below
 # /root or /home/<user> (the home itself included), with no hidden or 'dist' dir on the way. Hidden
 # tool dirs (~/.opencode, ~/.nvm, ~/.npm-global), /usr/local/lib/node_modules (npm -g) and deeper
-# projects stay captured. Path-only: capture, restore and deletion detection agree.
+# projects stay captured. The project must currently have package.json AND a supported
+# lockfile, exactly like restore-deps; a global npm prefix or an unlocked project cannot
+# be rebuilt. Use this same predicate for capture, restore and deletion detection.
+# If the lockfile disappears later, the next capture keeps the trees again. Older
+# snapshots keep their own manifest + lockfile for rebuilding; exclusion itself never
+# records a tree as deleted, so removing a lockfile cannot cause a later restore to wipe it.
 PROJECT_REGENERABLE = ('node_modules', '.next')
+PROJECT_LOCKFILES = ('bun.lock', 'bun.lockb', 'pnpm-lock.yaml', 'yarn.lock', 'package-lock.json')
 PROJECT_MAX_DEPTH = 3
 p = json.loads(sys.argv[1])
 work = p['work']
 assert os.path.dirname(work) == '/tmp' and os.path.basename(work).startswith('ezil-system-'), 'invalid staging path'
 
 def project_regenerable(path):
-    if path.startswith('/root/'): rel = path[len('/root/'):].split('/')
-    elif path.startswith('/home/'): rel = path[len('/home/'):].split('/')[1:]
+    if path.startswith('/root/'): home, rel = '/root', path[len('/root/'):].split('/')
+    elif path.startswith('/home/'):
+        parts = path[len('/home/'):].split('/')
+        home, rel = '/home/' + parts[0], parts[1:]
     else: return False
     for i, seg in enumerate(rel):
         if seg in PROJECT_REGENERABLE:
             project = rel[:i]
-            return len(project) <= PROJECT_MAX_DEPTH and not any(s.startswith('.') or s == 'dist' for s in project)
+            if len(project) > PROJECT_MAX_DEPTH or any(s.startswith('.') or s == 'dist' for s in project):
+                return False
+            directory = os.path.join(home, *project)
+            return (os.path.isfile(os.path.join(directory, 'package.json'))
+                    and any(os.path.isfile(os.path.join(directory, lock)) for lock in PROJECT_LOCKFILES))
     return False
 
 def excluded(path):
@@ -260,7 +272,7 @@ def capture(path):
         with open(BASELINE_MISSING) as f: missing_at_baseline = set(json.load(f))
     except (OSError, ValueError): missing_at_baseline = set()
     _, previously_deleted = load_manifest()
-    deleted = sorted((missing_image_paths(image) - missing_at_baseline) | {p for p in previously_deleted if not os.path.lexists(p)})
+    deleted = sorted((missing_image_paths(image) - missing_at_baseline) | {p for p in previously_deleted if not excluded(p) and not os.path.lexists(p)})
     assert len(deleted) <= MAX_DELETED, 'snapshot entry limit'
     logical = hashlib.sha256()
     entries = 0

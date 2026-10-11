@@ -20,9 +20,22 @@ LOG="${EZIL_DEPS_LOG:-/tmp/ezil-restore-deps.log}"
 scanning() { [ -e "$MARK" ] && [ ! -e "$SCANNED" ]; }
 canonical() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"; }
 lookup() { [ -f "$STATUS" ] && awk -F'\t' -v d="$1" '$2 == d { print $1; exit }' "$STATUS"; }
-# A recorded failed/missing is resolved once the user installs by hand (node_modules exists).
-# Never pending/restoring: an install in progress creates node_modules early.
-resolved() { case "$1" in failed|missing) [ -d "$2/node_modules" ] && echo ready || echo "$1" ;; *) echo "$1" ;; esac; }
+# A failed install usually leaves partial node_modules. Only accept npm's completion
+# marker from a later hand install, never the directory or a marker predating failure.
+# STATUS is atomically rewritten: its mtime is at least as new as this failure. Other
+# projects can advance it too, so ambiguous repairs conservatively stay failed.
+# Never resolve pending/restoring: an install in progress creates node_modules early.
+resolved() {
+  case "$1" in
+    failed)
+      if [ -d "$2/node_modules" ] && [ -f "$STATUS" ] &&
+          [ -f "$2/node_modules/.package-lock.json" ] && [ "$2/node_modules/.package-lock.json" -nt "$STATUS" ]; then
+        echo ready
+      else echo failed; fi ;;
+    missing) [ -d "$2/node_modules" ] && echo ready || echo missing ;;
+    *) echo "$1" ;;
+  esac
+}
 state_of() {
   local s; s="$(lookup "$1")"; [ -n "$s" ] || s="$(lookup "$(canonical "$1")")"
   if [ -n "$s" ]; then resolved "$s" "$1"; elif scanning; then echo scanning; else echo untracked; fi
