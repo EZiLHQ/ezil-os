@@ -464,6 +464,15 @@ jobs:
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
         run: node e2e/hosted-continuity.mjs
+      # The continuity gate above may use most of the previous 2 h credential; renew
+      # again so the lease release at the end of this job never runs on expired creds.
+      - name: Renew staging lease credentials before HOME persistence acceptance
+        if: needs.trust.outputs.manual_preview != 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
+          aws-region: us-east-1
+          role-duration-seconds: 7200
       # Staging-only regression for HOME persistence across container
       # replacement (OpenCode, a Next.js project in ~/, dotfiles). The script
       # refuses os.ezil.org and every *.ezil.org target before any browser launch.
