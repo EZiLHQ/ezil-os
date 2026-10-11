@@ -66,8 +66,8 @@ describe('persistenceHealth', () => {
 
     it('uses occurrence order with stable receipt/event tie breakers for all latest event selections', async () => {
         const query = await generatedSql();
-        expect(query.match(/SELECT DISTINCT ON \(computer_id\)/g)).toHaveLength(5);
-        expect(query.match(/ORDER BY computer_id, occurred_at DESC, received_at DESC, event_id DESC/g)).toHaveLength(5);
+        expect(query.match(/SELECT DISTINCT ON \(computer_id\)/g)).toHaveLength(6);
+        expect(query.match(/ORDER BY computer_id, occurred_at DESC, received_at DESC, event_id DESC/g)).toHaveLength(6);
         expect(query).toContain("WHERE site IN ('persist.system.restore', 'persist.workspace.restore')");
         expect(query).toContain("jsonb_build_object('site', site, 'code', code, 'outcome', outcome, 'at', occurred_at)");
         expect(query).toContain("WHERE site IN ('persist.system.flush', 'persist.system.restore')");
@@ -129,6 +129,30 @@ describe('persistenceHealth', () => {
         expect(query).not.toMatch(/"workspaceOkAgeS"\s*>/);
     });
 
+    it('retains the latest worker blocked-open timestamp and code independently of later recovery', async () => {
+        const query = await generatedSql();
+        const blocked = query.split('open_blocked_events AS ( ')[1]!.split('), totals AS (')[0]!;
+        expect(blocked.trim()).toBe(
+            'SELECT DISTINCT ON (computer_id) computer_id, code, occurred_at FROM recent ' +
+            "WHERE source = 'worker' AND site = 'persist.open_blocked' " +
+            'ORDER BY computer_id, occurred_at DESC, received_at DESC, event_id DESC',
+        );
+        expect(query).toContain('LEFT JOIN open_blocked_events ob USING (computer_id)');
+        expect(query).toContain('ob.occurred_at AS "openBlockedAt", ob.code AS "openBlockedCode"');
+        const finalFields = query.split('SELECT h.')[1]!.split('coalesce(')[0]!;
+        expect(finalFields).toContain('h."openBlockedAt", h."openBlockedCode"');
+    });
+
+    it('flags a latest worker blocked open even with healthy layers, but not historical blocked opens', async () => {
+        const query = await generatedSql();
+        const flag = query.split('coalesce("systemCode"')[1]!.split(' AS flagged')[0]!;
+        // A separate OR flags both blocked-open codes regardless of layer
+        // codes/ages. Later worker events clear this condition; shell reports
+        // cannot replace the latest worker event (pinned above).
+        expect(flag).toContain(`OR coalesce("lastWorkerEventSite" = 'persist.open_blocked', false)`);
+        expect(flag).not.toMatch(/openBlockedAt|openBlockedCode/);
+    });
+
     it('does not flag drain lag or missing/old heartbeats', async () => {
         const query = await generatedSql();
         expect(query).not.toMatch(/interval '(?:30 minutes|2 hours)'/);
@@ -159,6 +183,8 @@ describe('persistenceHealth', () => {
         const row: PersistenceHealthRow = {
             computerShort: 'b8f8e62a',
             lastRestore: { site: 'persist.system.restore', code: 'ok', outcome: 'ok', at: '2026-10-11T11:00:00Z' },
+            openBlockedAt: null,
+            openBlockedCode: null,
             systemCode: 'ok',
             workspaceCode: null,
             systemOkAgeS: 0,

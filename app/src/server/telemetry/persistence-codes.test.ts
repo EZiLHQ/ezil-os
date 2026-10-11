@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { PERSISTENCE_OK_CODES, PERSISTENCE_PAUSE_CODES } from './queries';
+import { PERSISTENCE_ERROR_CODES, PERSISTENCE_OK_CODES, PERSISTENCE_PAUSE_CODES } from './queries';
 
 // Read cross-runtime sources as text: importing the worker or shell would
 // couple app tests to Cloudflare/browser globals and their dependency graphs.
@@ -25,8 +25,13 @@ function setCodes(source: string, name: string): string[] {
 }
 
 describe('persistence code lists agree across runtimes', () => {
-    it('matches the worker OK outcome codes used by the rollup query', () => {
+    it('matches the worker OK outcome codes', () => {
         expect(setCodes(worker, 'OK_CODES')).toEqual([...PERSISTENCE_OK_CODES].sort());
+    });
+
+    it('matches the worker error outcome codes used by the rollup query', () => {
+        expect(setCodes(worker, 'ERROR_CODES')).toEqual([...PERSISTENCE_ERROR_CODES].sort());
+        expect(worker).toMatch(/if \(ERROR_CODES\.has\(code\)\) return 'error';/);
     });
 
     it('matches the worker pause codes used by persistence health', () => {

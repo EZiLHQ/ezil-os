@@ -5,7 +5,8 @@
 -- Both ages are the latest worker event's own attrs at lastWorkerEventAt;
 -- missing/-1 is unknown. Daily drain lag never increases ages or flags health.
 -- Flag pause codes, system age > 1800 unless the latest worker event is a stop,
--- or the latest shell pause report. Heartbeat time is display-only.
+-- the latest shell pause report, or a latest worker event of persist.open_blocked.
+-- Keep the latest blocked-open metadata after recovery. Heartbeat time is display-only.
 -- Only MD5 prefixes leave SQL.
 
 WITH clock AS (
@@ -46,6 +47,11 @@ WITH clock AS (
   FROM   recent
   WHERE  site IN ('persist.workspace.flush', 'persist.workspace.restore')
   ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
+), open_blocked_events AS (
+  SELECT DISTINCT ON (computer_id) computer_id, code, occurred_at
+  FROM   recent
+  WHERE  source = 'worker' AND site = 'persist.open_blocked'
+  ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
 ), totals AS (
   SELECT computer_id,
          count(*) FILTER (WHERE site = 'persist.stop'
@@ -57,6 +63,7 @@ WITH clock AS (
 ), health AS (
   SELECT left(md5(t.computer_id::text), 8) AS "computerShort",
          r.restore AS "lastRestore",
+         ob.occurred_at AS "openBlockedAt", ob.code AS "openBlockedCode",
          s.code AS "systemCode", w.code AS "workspaceCode",
          CASE WHEN jsonb_typeof(l.attrs -> 'system_age_s') = 'number'
               THEN nullif((l.attrs ->> 'system_age_s')::double precision, -1)
@@ -74,13 +81,16 @@ WITH clock AS (
   LEFT   JOIN restores r USING (computer_id)
   LEFT   JOIN system_events s USING (computer_id)
   LEFT   JOIN workspace_events w USING (computer_id)
+  LEFT   JOIN open_blocked_events ob USING (computer_id)
 )
 SELECT h."computerShort", h."lastRestore", h."systemCode", h."workspaceCode",
+       h."openBlockedAt", h."openBlockedCode",
        h."systemOkAgeS", h."workspaceOkAgeS", h."discardedUnsaved",
        h."lastHeartbeatAt", h."lastSeenAt", h."lastWorkerEventAt",
        coalesce("systemCode" IN ('too_large', 'stale', 'not_restored'), false)
        OR coalesce("workspaceCode" IN ('too_large', 'stale', 'not_restored'), false)
        OR coalesce("lastWorkerEventSite" <> 'persist.stop' AND "systemOkAgeS" > 1800, false)
+       OR coalesce("lastWorkerEventSite" = 'persist.open_blocked', false)
        OR coalesce("shellCode" IN ('too_large', 'stale', 'not_restored'), false) AS flagged
 FROM   health h
 ORDER  BY flagged DESC, "lastSeenAt" DESC, "computerShort";

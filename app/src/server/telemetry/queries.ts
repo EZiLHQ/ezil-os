@@ -17,9 +17,12 @@ import { WORKER_SENTINEL_USER_HASH } from './types';
 
 // Kept in sync with the producer and shell by persistence-codes.test.ts.
 export const PERSISTENCE_OK_CODES = ['ok', 'unchanged', 'already_restored', 'no_snapshot'] as const;
+export const PERSISTENCE_ERROR_CODES = [
+    'failed', 'flush_threw', 'unknown', 'workspace_persistence_unavailable', 'workspace_checkpoint_failed',
+] as const;
 export const PERSISTENCE_PAUSE_CODES = ['too_large', 'stale', 'not_restored'] as const;
 
-const persistenceOkCodesSql = sql.join(PERSISTENCE_OK_CODES.map(code => sql`${code}`), sql`, `);
+const persistenceErrorCodesSql = sql.join(PERSISTENCE_ERROR_CODES.map(code => sql`${code}`), sql`, `);
 const persistencePauseCodesSql = sql.join(PERSISTENCE_PAUSE_CODES.map(code => sql`${code}`), sql`, `);
 
 export type QueryDb = Pick<
@@ -135,9 +138,9 @@ export interface RollupLeaderboardRow {
 /** Same question as `fingerprintLeaderboard`, but from the hour-rollup table
  * — EXACT (not estimated) distinct-user counts beyond the raw-retention
  * horizon, since raw events are pruned but the rollup is kept 90 days.
- * The rollup has no outcome column: exclude persistence OK codes using the
+ * The rollup has no outcome column: include only persistence error codes using the
  * producer's outcomeOf mapping (worker/src/persistence-telemetry.ts).
- * Scope this exclusion to persistence so boot_summary counts stay unchanged. */
+ * Scope this filter to persistence so boot_summary counts stay unchanged. */
 /**
  * 🔴 Same sentinel exclusion as `fingerprintLeaderboard`, same reason: a
  * `FILTER` on the aggregate, not a `WHERE`, so a worker-only fingerprint's
@@ -156,8 +159,8 @@ export async function fingerprintLeaderboardFromRollup(
         FROM   ezil_error_user_hours
         JOIN   ezil_error_fingerprints f USING (fingerprint)
         WHERE  hour_bucket >= now() - (${days} || ' days')::interval
-          AND  NOT (f.event_class = 'persistence'
-                    AND f.code IN (${persistenceOkCodesSql}))
+          AND  (f.event_class <> 'persistence'
+                OR f.code IN (${persistenceErrorCodesSql}))
         GROUP  BY fingerprint
         ORDER  BY "distinctUsers" DESC
         LIMIT  ${limit}
@@ -417,6 +420,8 @@ export async function bootPhaseFailureRanking(db: QueryDb, hours = 24): Promise<
 export interface PersistenceHealthRow {
     computerShort: string;
     lastRestore: { site: string; code: string; outcome: string; at: string } | null;
+    openBlockedAt: string | null;
+    openBlockedCode: string | null;
     systemCode: string | null;
     workspaceCode: string | null;
     systemOkAgeS: number | null;
@@ -435,7 +440,9 @@ export interface PersistenceHealthRow {
  * alongside lastWorkerEventAt; missing/-1 means unknown, with no fallback.
  * Daily drain lag is not evidence of stale saving. Flag pause codes, a system
  * age over 1800 at the latest worker event (unless it is persist.stop), or
- * the latest shell pause report. Heartbeat time is display-only.
+ * the latest shell pause report. Also flag when the latest worker event is
+ * persist.open_blocked; retain the latest blocked-open metadata after recovery.
+ * Heartbeat time is display-only.
  * Keep docs/sql/persistence-health.pgsql equivalent to this read-only query.
  */
 export async function persistenceHealth(
@@ -482,6 +489,11 @@ export async function persistenceHealth(
           FROM   recent
           WHERE  site IN ('persist.workspace.flush', 'persist.workspace.restore')
           ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
+        ), open_blocked_events AS (
+          SELECT DISTINCT ON (computer_id) computer_id, code, occurred_at
+          FROM   recent
+          WHERE  source = 'worker' AND site = 'persist.open_blocked'
+          ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
         ), totals AS (
           SELECT computer_id,
                  count(*) FILTER (WHERE site = 'persist.stop'
@@ -493,6 +505,7 @@ export async function persistenceHealth(
         ), health AS (
           SELECT left(md5(t.computer_id::text), 8) AS "computerShort",
                  r.restore AS "lastRestore",
+                 ob.occurred_at AS "openBlockedAt", ob.code AS "openBlockedCode",
                  s.code AS "systemCode", w.code AS "workspaceCode",
                  CASE WHEN jsonb_typeof(l.attrs -> 'system_age_s') = 'number'
                       THEN nullif((l.attrs ->> 'system_age_s')::double precision, -1)
@@ -510,13 +523,16 @@ export async function persistenceHealth(
           LEFT   JOIN restores r USING (computer_id)
           LEFT   JOIN system_events s USING (computer_id)
           LEFT   JOIN workspace_events w USING (computer_id)
+          LEFT   JOIN open_blocked_events ob USING (computer_id)
         )
         SELECT h."computerShort", h."lastRestore", h."systemCode", h."workspaceCode",
+               h."openBlockedAt", h."openBlockedCode",
                h."systemOkAgeS", h."workspaceOkAgeS", h."discardedUnsaved",
                h."lastHeartbeatAt", h."lastSeenAt", h."lastWorkerEventAt",
                coalesce("systemCode" IN (${persistencePauseCodesSql}), false)
                OR coalesce("workspaceCode" IN (${persistencePauseCodesSql}), false)
                OR coalesce("lastWorkerEventSite" <> 'persist.stop' AND "systemOkAgeS" > 1800, false)
+               OR coalesce("lastWorkerEventSite" = 'persist.open_blocked', false)
                OR coalesce("shellCode" IN (${persistencePauseCodesSql}), false) AS flagged
         FROM   health h
         ORDER  BY flagged DESC, "lastSeenAt" DESC, "computerShort"

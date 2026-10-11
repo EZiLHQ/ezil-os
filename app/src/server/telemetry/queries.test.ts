@@ -18,6 +18,7 @@ import {
     errorRateOverTime,
     fingerprintLeaderboard,
     fingerprintLeaderboardFromRollup,
+    PERSISTENCE_ERROR_CODES,
     PERSISTENCE_OK_CODES,
     recentTraces,
     spikeDetection,
@@ -87,18 +88,21 @@ describe('Q1 — fingerprintLeaderboard (fleet-wide "what is hurting people now"
         expect(statements[0]!.sql).not.toMatch(/ezil_error_events/);
     });
 
-    it('excludes persistence OK codes from rollups without excluding boot_summary successes', async () => {
+    it('includes only persistence error codes in rollups without excluding boot_summary successes', async () => {
         const { db, statements } = makeTestDb();
         await fingerprintLeaderboardFromRollup(db);
         const generated = statements[0]!.sql.replace(/\s+/g, ' ');
-        // Rollups do not retain outcome. The producer maps these four codes
-        // to OK; all other persistence codes and all other classes survive.
+        // Rollups do not retain outcome. Only the producer's error codes
+        // qualify for persistence; all other classes keep their behavior.
         expect(generated).toContain('JOIN ezil_error_fingerprints f USING (fingerprint)');
         expect(generated).toContain(
-            "AND NOT (f.event_class = 'persistence' " +
-            "AND f.code IN ($3, $4, $5, $6)) GROUP BY fingerprint",
+            "AND (f.event_class <> 'persistence' " +
+            "OR f.code IN ($3, $4, $5, $6, $7)) GROUP BY fingerprint",
         );
-        expect(statements[0]!.params.slice(2, 6)).toEqual(PERSISTENCE_OK_CODES);
+        expect(statements[0]!.params).toEqual([WORKER_SENTINEL_USER_HASH, 90, ...PERSISTENCE_ERROR_CODES, 50]);
+        for (const code of [...PERSISTENCE_OK_CODES, 'too_large', 'stale', 'not_restored', 'no_baseline', 'container_not_hydrated']) {
+            expect(statements[0]!.params).not.toContain(code);
+        }
         expect(generated).not.toContain('boot_summary');
         expect(generated).not.toMatch(/\boutcome\b/);
     });
