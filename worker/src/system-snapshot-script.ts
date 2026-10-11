@@ -40,6 +40,7 @@ MAX_ENTRIES = 100000
 STATE = '/var/lib/ezil-system'
 MANIFEST = STATE + '/manifest.json'
 BASELINE = STATE + '/baseline'
+CAPTURE_STARTED = STATE + '/capture-started'
 # Written only once this container holds the computer's committed system layer
 # (restored, or there was none). Capture refuses without it: a container whose
 # restore failed must never commit its bare image over the user's installs.
@@ -106,6 +107,28 @@ def project_regenerable(path, restore_projects=None):
 def excluded(path, restore_projects=None):
     return (os.path.basename(path) in EXCLUDE_NAMES or any(path == e or path.startswith(e + '/') for e in EXCLUDE)
             or project_regenerable(path, restore_projects))
+
+def system_dirty():
+    try: since = os.lstat(CAPTURE_STARTED).st_mtime_ns
+    except FileNotFoundError: return True
+    def newer(path):
+        try: s = os.lstat(path)
+        except OSError: return False  # An install can remove an entry during the probe.
+        return ((stat.S_ISREG(s.st_mode) or stat.S_ISDIR(s.st_mode) or stat.S_ISLNK(s.st_mode))
+                and s.st_mtime_ns > since)
+    for root in ROOTS:
+        if excluded(root): continue
+        if newer(root): return True
+        if not os.path.isdir(root) or os.path.islink(root): continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            if excluded(dirpath):
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames if not excluded(os.path.join(dirpath, d))]
+            for name in dirnames + filenames:
+                path = os.path.join(dirpath, name)
+                if not excluded(path) and newer(path): return True
+    return False
 
 def image_id():
     try:
@@ -259,7 +282,7 @@ class HashingReader:
         self.h.update(data)
         return data
 
-def capture(path):
+def capture(path, mark_started=True):
     if not os.path.exists(HYDRATED):
         return {'skipped': 'not_restored'}
     if not os.path.exists(BASELINE):
@@ -269,6 +292,14 @@ def capture(path):
     locks = hold_package_locks(block=False)
     if locks is None:
         return {'skipped': 'busy'}
+    if mark_started:
+        # The start of this walk becomes the dirty baseline ONLY once the Worker
+        # has committed it (op sys-committed): a capture that fails, is refused
+        # or loses the R2 race must leave its changes dirty. Kept across retries
+        # so writes during either walk stay dirty afterwards.
+        os.makedirs(STATE, mode=0o700, exist_ok=True)
+        with open(CAPTURE_STARTED + '.pending', 'a'): pass
+        os.utime(CAPTURE_STARTED + '.pending', None)
     since = os.lstat(BASELINE).st_mtime_ns
     image = load_image_manifest()
     picked = inventory(since, image)
@@ -522,7 +553,7 @@ try:
         # A file rewritten mid-capture: one fresh attempt before the flush reports failure.
         for attempt in (1, 2):
             try:
-                result = capture(os.path.join(work, 'archive.tar'))
+                result = capture(os.path.join(work, 'archive.tar'), mark_started=attempt == 1)
                 break
             except AssertionError as e:
                 if str(e) != 'system changed during capture' or attempt == 2: raise
@@ -531,6 +562,12 @@ try:
                 for i in range(len(result['chunks'])):
                     with open(os.path.join(work, str(i)), 'xb') as out: out.write(f.read(CHUNK))
         print(json.dumps(result))
+    elif op == 'sys-dirty': print(json.dumps({'dirty': system_dirty()}))
+    elif op == 'sys-committed':
+        # Promote the committed capture's start to the dirty baseline.
+        try: os.replace(CAPTURE_STARTED + '.pending', CAPTURE_STARTED); promoted = True
+        except FileNotFoundError: promoted = False
+        print(json.dumps({'committed': promoted}))
     elif op == 'sys-restore': restore()
     elif op == 'sys-baseline': baseline()
     elif op == 'sys-hydrated':

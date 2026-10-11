@@ -87,7 +87,22 @@ async function run(container: HydrateContainerLike, params: Record<string, unkno
   return result.stdout;
 }
 
+/** Unknown probes leave the five-minute periodic capture as the backstop. */
+export async function probeSystemDirty(container: HydrateContainerLike): Promise<boolean | null> {
+  try {
+    const result = JSON.parse(await run(container, { op: 'sys-dirty', work: '/tmp/ezil-system-dirty' }, 60_000));
+    return typeof result?.dirty === 'boolean' ? result.dirty : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Capture what changed outside /workspace and commit it as the computer's system layer. */
+/** The committed capture's start becomes the sys-dirty baseline (contract §6). Never throws. */
+async function markCommitted(container: FlushContainerLike, work: string, log: (message: string) => void): Promise<void> {
+  try { await run(container, { op: 'sys-committed', work }, 60_000); } catch { log('[system-persist] could not advance the dirty baseline'); }
+}
+
 export async function flushSystemLayer(deps: {
   container: FlushContainerLike; bucket: FlushR2BucketLike; realPrefix: string; log: (message: string) => void;
 }): Promise<SystemFlushOutcome> {
@@ -119,7 +134,10 @@ export async function flushSystemLayer(deps: {
     const { imageId, replay, expectedGeneration: _expected, deletedCount: _deleted, ...shape } = captured;
     const snapshot = parseSnapshot(JSON.stringify({ ...shape, version: SYSTEM_SNAPSHOT_VERSION, generation })) as SystemSnapshot;
     outcome.entries = snapshot.entries;
-    if (previous?.snapshot.sha256 === snapshot.sha256) return { ...outcome, ok: true, unchanged: true };
+    if (previous?.snapshot.sha256 === snapshot.sha256) {
+      await markCommitted(container, work, log);
+      return { ...outcome, ok: true, unchanged: true };
+    }
     await forEachLimit(snapshot.chunks, SYSTEM_TRANSFER_CONCURRENCY, async (c, i) => {
       const file = await container.readFile(`${work}/${i}`, { encoding: 'base64' });
       if (file.encoding !== 'base64') throw new Error('system chunk encoding missing');
@@ -144,6 +162,7 @@ export async function flushSystemLayer(deps: {
     // This container now holds the committed generation. If recording that fails,
     // the next capture is refused as stale: fail-safe, the head stays good.
     try { await run(container, { op: 'sys-hydrated', work, generation }, 60_000); } catch { log('[system-persist] could not record the committed generation'); }
+    await markCommitted(container, work, log);
     return { ...outcome, ok: true, checkpoint: generation };
   } catch (err) {
     if (err instanceof SystemTooLargeError) {
