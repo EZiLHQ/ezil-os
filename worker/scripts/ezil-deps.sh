@@ -20,16 +20,40 @@ LOG="${EZIL_DEPS_LOG:-/tmp/ezil-restore-deps.log}"
 scanning() { [ -e "$MARK" ] && [ ! -e "$SCANNED" ]; }
 canonical() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"; }
 lookup() { [ -f "$STATUS" ] && awk -F'\t' -v d="$1" '$2 == d { print $1; exit }' "$STATUS"; }
-# A failed install usually leaves partial node_modules. Only accept npm's completion
+# A failed install usually leaves partial node_modules. Only accept an installer's
 # marker from a later hand install, never the directory or a marker predating failure.
 # STATUS is atomically rewritten: its mtime is at least as new as this failure. Other
 # projects can advance it too, so ambiguous repairs conservatively stay failed.
 # Never resolve pending/restoring: an install in progress creates node_modules early.
+hand_install_completed() {
+  local dir="$1" marker
+  local -a markers=()
+  [ -d "$dir/node_modules" ] && [ -f "$STATUS" ] || return 1
+  # Match ezil-restore-deps.sh's lockfile_pm precedence; another installer's stale
+  # tree must not certify the package manager selected for this project.
+  if [ -f "$dir/bun.lock" ] || [ -f "$dir/bun.lockb" ]; then
+    # Bun writes bun.lock (text) or bun.lockb (older binary format) on install.
+    # Accept only a rewritten lockfile together with an existing dependency tree.
+    markers=(bun.lock bun.lockb)
+  elif [ -f "$dir/pnpm-lock.yaml" ]; then
+    # pnpm writes the installed modules layout to node_modules/.modules.yaml.
+    markers=(node_modules/.modules.yaml)
+  elif [ -f "$dir/yarn.lock" ]; then
+    # Yarn Classic saves .yarn-integrity; Berry's node-modules linker saves .yarn-state.yml.
+    markers=(node_modules/.yarn-integrity node_modules/.yarn-state.yml)
+  elif [ -f "$dir/package-lock.json" ]; then
+    # npm writes this hidden lockfile for its installed node_modules tree.
+    markers=(node_modules/.package-lock.json)
+  fi
+  for marker in "${markers[@]}"; do
+    [ -f "$dir/$marker" ] && [ "$dir/$marker" -nt "$STATUS" ] && return 0
+  done
+  return 1
+}
 resolved() {
   case "$1" in
     failed)
-      if [ -d "$2/node_modules" ] && [ -f "$STATUS" ] &&
-          [ -f "$2/node_modules/.package-lock.json" ] && [ "$2/node_modules/.package-lock.json" -nt "$STATUS" ]; then
+      if hand_install_completed "$2"; then
         echo ready
       else echo failed; fi ;;
     missing) [ -d "$2/node_modules" ] && echo ready || echo missing ;;
