@@ -1847,6 +1847,8 @@ const MIN_CHANGED_CHECKPOINT_MS = 60_000;
 const WORKSPACE_LAST_GC_AT_KEY = 'ezil:workspaceLastGcAt';
 /** When the system layer (changes outside /workspace) was last captured. */
 const SYSTEM_LAST_FLUSH_AT_KEY = 'ezil:systemLastFlushAt';
+const SYSTEM_LAST_DIRTY_PROBE_AT_KEY = 'ezil:systemLastDirtyProbeAt';
+const SYSTEM_LAST_CAPTURE_STARTED_AT_KEY = 'ezil:systemLastCaptureStartedAt';
 /**
  * When a system capture last ended too_large / stale / not_restored.
  * `SYSTEM_LAST_FLUSH_AT_KEY` deliberately does not advance on
@@ -1861,6 +1863,8 @@ const PERSISTENCE_TRACKER_KEY = 'ezil:persistenceTracker';
 /** The real `ezil_computers.id` the app sent as `projectId` — only ever a UUID, never the sandboxId. */
 const PERSISTENCE_COMPUTER_ID_KEY = 'ezil:persistenceComputerId';
 const SYSTEM_FLUSH_INTERVAL_MS = 5 * 60_000;
+const SYSTEM_DIRTY_PROBE_MS = 15_000;
+const SYSTEM_DIRTY_MIN_GAP_MS = 20_000;
 const SNAPSHOT_GC_INTERVAL_MS = 15 * 60_000;
 
 /**
@@ -2786,19 +2790,35 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
   /**
    * The system layer (user changes outside /workspace). Always on final
-   * checkpoints (readiness, teardown, idle-stop); otherwise at most every
-   * SYSTEM_FLUSH_INTERVAL_MS, because it scans the system directories.
+   * checkpoints (readiness, teardown, idle-stop); otherwise when dirty,
+   * with SYSTEM_FLUSH_INTERVAL_MS as the periodic backstop.
    * Never fails the workspace flush.
    */
   private async runSystemFlush(bucket: unknown, prefix: string, final: boolean,
     trigger: PersistenceTrigger = final ? 'final' : 'interval'): Promise<SystemFlushOutcome | undefined> {
-    const last = (await this.ctx.storage.get<number>(SYSTEM_LAST_FLUSH_AT_KEY)) ?? 0;
-    if (!final && Date.now() - last < SYSTEM_FLUSH_INTERVAL_MS) return undefined;
     if (!final) {
-      const backoffAt = (await this.ctx.storage.get<number>(SYSTEM_FLUSH_BACKOFF_AT_KEY)) ?? 0;
-      if (Date.now() - backoffAt < SYSTEM_FLUSH_INTERVAL_MS) return undefined;
+      try {
+        const now = Date.now();
+        const last = await this.ctx.storage.get<number>(SYSTEM_LAST_FLUSH_AT_KEY);
+        if (last !== undefined && now - last < SYSTEM_FLUSH_INTERVAL_MS) {
+          const lastProbe = await this.ctx.storage.get<number>(SYSTEM_LAST_DIRTY_PROBE_AT_KEY);
+          if (lastProbe !== undefined && now - lastProbe < SYSTEM_DIRTY_PROBE_MS) return undefined;
+          await this.ctx.storage.put(SYSTEM_LAST_DIRTY_PROBE_AT_KEY, now);
+          const { probeSystemDirty } = await import('./system-persist');
+          if (await probeSystemDirty(this) !== true) return undefined;
+          const captureStarted = (await this.ctx.storage.get<number>(SYSTEM_LAST_CAPTURE_STARTED_AT_KEY)) ?? last;
+          if (Date.now() - captureStarted < SYSTEM_DIRTY_MIN_GAP_MS) return undefined;
+        }
+        const backoffAt = await this.ctx.storage.get<number>(SYSTEM_FLUSH_BACKOFF_AT_KEY);
+        if (backoffAt !== undefined && Date.now() - backoffAt < SYSTEM_FLUSH_INTERVAL_MS) return undefined;
+      } catch {
+        // Dirty detection and its bookkeeping must never break the workspace cycle.
+        console.error('[system_flush] interval eligibility check failed');
+        return undefined;
+      }
     }
     const t0 = Date.now();
+    try { await this.ctx.storage.put(SYSTEM_LAST_CAPTURE_STARTED_AT_KEY, t0); } catch { /* best effort */ }
     const system = await this.captureSystemLayer(bucket, prefix, t0);
     // B2: persistent refusals back interval captures off; transient failures retry next cycle.
     if (system.ok) {
