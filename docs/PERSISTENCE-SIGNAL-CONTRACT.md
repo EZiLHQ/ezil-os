@@ -127,7 +127,7 @@ This is unchanged.
 **Marker.** `sys-capture` touches `capture-started` *before* its walk. A change made during a capture is therefore seen as dirty by the next probe.
 
 **Durable Object.** On each flush cycle, if at least `SYSTEM_DIRTY_PROBE_MS` (15 s) has passed since the last probe, it runs `sys-dirty`.
-- If the layer is dirty and at least `SYSTEM_DIRTY_MIN_GAP_MS` (20 s) has passed since the last system capture, and B2 backoff is not active, it runs an interval system capture now.
+- If the layer is dirty and at least `SYSTEM_DIRTY_MIN_GAP_MS` (45 s) has passed since the last system capture, and B2 backoff is not active, it runs an interval system capture now.
 - The 5-min periodic capture stays as a backstop.
 - Final captures (idle-stop, teardown, readiness) are unchanged.
 

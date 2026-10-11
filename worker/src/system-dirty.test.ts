@@ -136,20 +136,20 @@ describe('system dirty flush cycles', () => {
     expect(f.calls.probes).toHaveLength(19);
   });
 
-  it('probes at most every 15 seconds and waits 20 seconds between capture starts', async () => {
+  it('probes at most every 15 seconds and waits 45 seconds between capture starts', async () => {
     const f = await fixture();
     f.state.content = 'dirty';
-    for (const elapsed of [0, 14_999, 15_000, 20_000, 29_999]) {
+    for (const elapsed of [0, 14_999, 15_000, 30_000, 44_999]) {
       at(elapsed);
       await f.flush();
     }
-    expect(f.calls.probes).toEqual([START, START + 15_000]);
+    expect(f.calls.probes).toEqual([START, START + 15_000, START + 30_000]);
     expect(f.calls.captures).toHaveLength(0);
-    at(30_000);
+    at(45_000);
     await f.flush();
-    expect(f.calls.captures).toEqual([START + 30_000]);
-    expect(f.store.get(LAST_PROBE)).toBe(START + 30_000);
-    expect(f.store.get(LAST_START)).toBe(START + 30_000);
+    expect(f.calls.captures).toEqual([START + 45_000]);
+    expect(f.store.get(LAST_PROBE)).toBe(START + 45_000);
+    expect(f.store.get(LAST_START)).toBe(START + 45_000);
     expect(f.calls.order.indexOf(`put:${LAST_START}`)).toBeLessThan(f.calls.order.indexOf('sys-capture'));
   });
 
@@ -173,10 +173,10 @@ describe('system dirty flush cycles', () => {
     const f = await fixture();
     f.state.content = 'dirty';
     f.state.tooLarge = true;
-    at(20_000);
+    at(45_000);
     await f.cycle();
-    expect(f.store.get(BACKOFF)).toBe(START + 20_000);
-    at(60_000);
+    expect(f.store.get(BACKOFF)).toBe(START + 45_000);
+    at(100_000);
     await f.cycle();
     expect(f.calls.captures).toHaveLength(1);
     expect(f.calls.scheduled).toHaveLength(2);
@@ -209,14 +209,15 @@ describe('system dirty flush cycles', () => {
 
   it('uses capture start, not completion, for the minimum gap', async () => {
     const f = await fixture();
-    f.state.captureMs = 30_000;
+    f.state.captureMs = 50_000;
     await f.flush(true);
     expect(f.store.get(LAST_START)).toBe(START);
-    expect(f.store.get(LAST_FLUSH)).toBe(START + 30_000);
+    expect(f.store.get(LAST_FLUSH)).toBe(START + 50_000);
     f.state.content = 'changed during or after capture';
     f.state.captureMs = 0;
     await f.flush();
-    expect(f.calls.captures).toEqual([START, START + 30_000]);
+    // 50 s since the previous capture STARTED (>= 45 s), 0 s since it completed.
+    expect(f.calls.captures).toEqual([START, START + 50_000]);
   });
 
   for (const field of ['getError', 'putError'] as const) {

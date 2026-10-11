@@ -1864,7 +1864,9 @@ const PERSISTENCE_TRACKER_KEY = 'ezil:persistenceTracker';
 const PERSISTENCE_COMPUTER_ID_KEY = 'ezil:persistenceComputerId';
 const SYSTEM_FLUSH_INTERVAL_MS = 5 * 60_000;
 const SYSTEM_DIRTY_PROBE_MS = 15_000;
-const SYSTEM_DIRTY_MIN_GAP_MS = 20_000;
+// 45 s keeps the switch-off RPO (<= 90 s, contract §6) while a busy terminal
+// (history, caches) cannot run a full capture every cycle.
+const SYSTEM_DIRTY_MIN_GAP_MS = 45_000;
 const SNAPSHOT_GC_INTERVAL_MS = 15 * 60_000;
 
 /**

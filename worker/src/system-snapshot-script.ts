@@ -557,6 +557,16 @@ def baseline():
 
 try:
     op = p['op']
+    if op in ('sys-capture', 'sys-dirty'):
+        # Background saves must never compete with the desktop, Code or the user's
+        # own processes: lowest CPU priority and the idle I/O class (best effort).
+        try: os.nice(15)
+        except OSError: pass
+        try:
+            import ctypes, platform
+            nr = {'x86_64': 251, 'aarch64': 30}.get(platform.machine())
+            if nr: ctypes.CDLL(None, use_errno=True).syscall(nr, 1, 0, 3 << 13)  # IOPRIO_WHO_PROCESS, self, IDLE
+        except Exception: pass
     if op == 'sys-capture':
         os.mkdir(work, 0o700)
         # A file rewritten mid-capture: one fresh attempt before the flush reports failure.
