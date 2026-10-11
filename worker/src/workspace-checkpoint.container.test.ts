@@ -19,6 +19,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import { URL } from 'node:url';
 import { readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
@@ -98,7 +99,7 @@ async function makeStore(): Promise<Store> {
     fetchImpl: (req: Request) => fetch(req, { keepalive: false } as RequestInit),
   });
   const store: Store = {
-    get: (k, o) => inner.get(k, o), list: o => inner.list(o), delete: keys => inner.delete(keys),
+    get: (k, o?: { range?: { offset: number; length: number } }) => inner.get(k, o), list: o => inner.list(o), delete: keys => inner.delete(keys),
     put: async (k, b, o) => { await store.beforePut?.(k); return store.failPutFor?.(k) ? null : inner.put(k, b, o); },
     corrupt: async (k) => {
       const body = await inner.get(k); const b = new Uint8Array(await body!.arrayBuffer()); b[b.length >> 1] ^= 0xff;
@@ -518,7 +519,7 @@ mkdir -p /opt/ezq && echo opt-ok > /opt/ezq/marker
   // Next.js node_modules into /root. That pushed every later system capture over the snapshot
   // limits (too_large), so saving silently stopped: after the next replacement `opencode` (installed
   // by its curl installer into ~/.opencode + a .bashrc PATH line), a note and node_modules were gone.
-  const HOME_PROJECT = String.raw`
+  const HOME_PROJECT_BASE = String.raw`
 set -e
 mkdir -p /root/.opencode/bin && printf '#!/bin/sh\necho opencode-ok\n' > /root/.opencode/bin/opencode && chmod 755 /root/.opencode/bin/opencode
 echo 'export PATH=/root/.opencode/bin:$PATH' >> /root/.bashrc
@@ -536,6 +537,8 @@ echo 'export default function Page() { return "hi" }' > /root/proj/src/page.js
 printf '{"name":"oc-internal","version":"1.0.0","dependencies":{"ezq-dep":"file:/root/proj/vendor/ezq-dep-1.0.0.tgz"}}' > /root/.opencode/package.json && echo '{}' > /root/.opencode/package-lock.json
 (cd /root/proj && npm install --offline --no-audit --no-fund >/dev/null 2>&1)
 test -f /root/proj/package-lock.json && test -x /root/proj/node_modules/.bin/ezq-dep
+`;
+  const HOME_PROJECT = HOME_PROJECT_BASE + String.raw`
 # Over the 100,000-entry snapshot limit on its own (pins the entry limit; a real Next.js 16
 # node_modules is ~11k entries / ~350 MiB, see the Next.js test).
 python3 -c "
@@ -551,7 +554,7 @@ mkdir -p /root/proj/.next/cache && echo build > /root/proj/.next/cache/x
   const KEPT = ['/root/.opencode/bin/opencode', '/root/.opencode/package.json', '/root/.opencode/package-lock.json', '/root/.bashrc',
     '/root/notes.md', '/root/.config/ezq/settings.json', '/root/.npm-global/lib/node_modules/ezq-g/marker',
     '/root/proj/package.json', '/root/proj/package-lock.json', '/root/proj/src/page.js', '/root/proj/vendor/ezq-dep-1.0.0.tgz'];
-  const checksums = (c: string) => must(c, `sha256sum ${KEPT.join(' ')}`);
+  const checksums = (c: string, files: string[] = KEPT) => must(c, `sha256sum ${files.join(' ')}`);
   /** Capture the HOME-project fixture on one container, replace it, restore on a NEW one. */
   async function homeProjectAcrossReplacement(tag: string) {
     const store = await makeStore(); const prefix = prefixFor(`system-${tag}`);
@@ -566,6 +569,141 @@ mkdir -p /root/proj/.next/cache && echo build > /root/proj/.next/cache/x
     const back = await sysHydrate(b, store, prefix);
     return { out, back, b, before };
   }
+
+  describe('switch-off (power cut)', () => {
+    const MARKER = '/var/lib/ezil-system/capture-started';
+    const FILES = [...KEPT.map(p => p.replace('/root/proj/', '/root/app/')),
+      '/root/notes/n.txt', '/workspace/work.txt', '/workspace/.ezil/settings.json',
+      '/root/app/node_modules/ezq-dep/package.json', '/root/app/node_modules/ezq-dep/cli.js',
+      '/usr/local/lib/node_modules/ezq-dep/package.json', '/usr/local/lib/node_modules/ezq-dep/cli.js'];
+    async function dirty(c: string) {
+      const { systemSnapshotCommand } = await import('./system-snapshot-script');
+      return JSON.parse(await must(c, systemSnapshotCommand({ op: 'sys-dirty', work: '/tmp/ezil-system-dirty' })));
+    }
+    async function prepare(tag: string) {
+      // Always local: these power-cut tests need no S3 credentials or endpoint.
+      const store = new R2Fake(); const prefix = prefixFor(`power-cut-${tag}`);
+      const a = await startComputer(`power-cut-${tag}-a`);
+      expect((await hydrate(a, store, prefix)).emptyPrefix).toBe(true);
+      expect((await sysHydrate(a, store, prefix)).ok).toBe(true);
+      expect(await baselineSystemLayer(sdk(a))).toBe(true);
+      await markHydrated(a, prefix);
+      await new Promise(r => setTimeout(r, 1100));
+      // Reuse the offline HOME fixture without the separate 100k-entry stress tree.
+      await must(a, HOME_PROJECT_BASE.replaceAll('/root/proj', '/root/app')
+        // An offline stand-in also exposes the contract's `next` executable.
+        .replace('"bin":{"ezq-dep":"cli.js"}', '"bin":{"ezq-dep":"cli.js","next":"cli.js"}'));
+      await must(a, String.raw`
+set -e
+npm install -g --prefix /usr/local --offline --no-audit --no-fund /root/app/vendor/ezq-dep-1.0.0.tgz >/dev/null 2>&1
+mkdir -p /root/notes /workspace/.ezil
+printf 'saved note\n' > /root/notes/n.txt
+printf 'saved workspace\n' > /workspace/work.txt
+printf '{"editor.fontSize":16}\n' > /workspace/.ezil/settings.json
+`);
+      return { a, store, prefix };
+    }
+    async function commit(a: string, store: Store, prefix: string) {
+      // The Worker commits both layers through these same persistence entry points.
+      expect((await flush(a, store, prefix)).ok).toBe(true);
+      expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+      expect(await store.get(`${prefix}/${SNAPSHOT_HEAD}`)).not.toBeNull();
+      expect(await store.get(`${systemPrefixOf(prefix)}/${SNAPSHOT_HEAD}`)).not.toBeNull();
+    }
+    async function powerCut(a: string) {
+      // SIGKILL first: no SIGTERM, shutdown handler, or final checkpoint can run.
+      expect((await docker(['kill', '-s', 'KILL', a])).code).toBe(0);
+      expect((await docker(['wait', a])).stdout.toString().trim()).toBe('137');
+      expect((await docker(['rm', a])).code).toBe(0);
+      expect((await docker(['inspect', a])).code).not.toBe(0);
+    }
+    async function restore(tag: string, store: Store, prefix: string) {
+      const b = await startComputer(`power-cut-${tag}-b`);
+      expect((await sh(b, 'test -e /root/app/package.json')).exitCode).not.toBe(0);
+      expect((await hydrate(b, store, prefix)).ok).toBe(true);
+      expect(await sysHydrate(b, store, prefix)).toMatchObject({ ok: true, sameImage: true, conflicts: 0 });
+      await markHydrated(b, prefix);
+      return b;
+    }
+
+    it('committed tools, HOME project, notes and editor settings survive SIGKILL and switch on', async () => {
+      const { a, store, prefix } = await prepare('saved');
+      const before = await checksums(a, FILES);
+      expect(await dirty(a)).toEqual({ dirty: true });
+      await commit(a, store, prefix);
+      await powerCut(a);
+      const b = await restore('saved', store, prefix);
+      // The hydrated-generation marker is not a capture-start marker. On a fresh
+      // container sys-dirty conservatively returns true until its first capture.
+      expect((await sh(b, `test -e ${MARKER}`)).exitCode).not.toBe(0);
+      expect(await dirty(b)).toEqual({ dirty: true });
+      expect(await dirty(b)).toEqual({ dirty: true });
+      expect((await sh(b, 'test -e /root/app/node_modules')).exitCode).not.toBe(0);
+      const script = await readFile(new URL('../scripts/ezil-restore-deps.sh', import.meta.url), 'utf8');
+      expect((await sh(b, 'cat > /usr/local/bin/ezil-restore-deps.sh && chmod 755 /usr/local/bin/ezil-restore-deps.sh', script)).exitCode).toBe(0);
+      // start-neko's --boot mode includes --homes and skips the workspace root.
+      await must(b, 'npm_config_offline=true /usr/local/bin/ezil-restore-deps.sh --boot /workspace');
+      expect(await must(b, 'cat /run/ezil-deps/status')).toContain('ready\t/root/app\t');
+      expect(await checksums(b, FILES)).toBe(before);
+      expect((await must(b, "bash -ic 'command -v opencode' 2>/dev/null")).trim()).toBe('/root/.opencode/bin/opencode');
+      expect((await must(b, '/root/.opencode/bin/opencode')).trim()).toBe('opencode-ok');
+      expect(JSON.parse(await must(b, 'cd /root/app && npm ls --offline --json ezq-dep')).dependencies['ezq-dep'].version).toBe('1.0.0');
+      expect((await must(b, 'cd /root/app && npm exec --offline -- ezq-dep')).trim()).toBe('ezq-dep-ok');
+      expect((await must(b, 'readlink -f /root/app/node_modules/.bin/ezq-dep')).trim()).toBe('/root/app/node_modules/ezq-dep/cli.js');
+      expect((await must(b, 'cd /root/app && PATH="$PWD/node_modules/.bin:$PATH" command -v next')).trim()).toBe('/root/app/node_modules/.bin/next');
+      expect((await must(b, 'cd /root/app && npm exec --offline -- next')).trim()).toBe('ezq-dep-ok');
+      expect(JSON.parse(await must(b, 'npm ls -g --prefix /usr/local --offline --json ezq-dep')).dependencies['ezq-dep'].version).toBe('1.0.0');
+      expect((await must(b, '/usr/local/bin/ezq-dep')).trim()).toBe('ezq-dep-ok');
+      expect((await sh(b, 'test -e /root/.opencode/node_modules')).exitCode).not.toBe(0);
+    }, T);
+
+    it('RPO is real: a dirty write after the last commit is lost on SIGKILL', async () => {
+      const { a, store, prefix } = await prepare('rpo');
+      expect(await dirty(a)).toEqual({ dirty: true });
+      await commit(a, store, prefix);
+      expect(await dirty(a)).toEqual({ dirty: false });
+      await new Promise(r => setTimeout(r, 1100));
+      await must(a, "printf 'not committed\\n' > /root/late.txt");
+      expect(await dirty(a)).toEqual({ dirty: true });
+      await powerCut(a);
+      const b = await restore('rpo', store, prefix);
+      expect((await sh(b, 'test -e /root/late.txt')).exitCode).not.toBe(0);
+      expect(await must(b, 'cat /root/notes/n.txt')).toBe('saved note\n');
+      expect(await must(b, 'cat /workspace/work.txt')).toBe('saved workspace\n');
+    }, T);
+
+    it('a change during capture remains dirty for the next capture', async () => {
+      const { a, store, prefix } = await prepare('during');
+      await commit(a, store, prefix);
+      // A payload keeps the codec busy after its start marker is visible. The
+      // writer exits before the codec returns, so post-capture churn cannot pass.
+      await must(a, 'mkdir -p /opt/ezq-during && head -c 33554432 /dev/urandom > /opt/ezq-during/blob');
+      const writer = String.raw`
+import pathlib, time
+marker = pathlib.Path('/var/lib/ezil-system/capture-started')
+before = marker.stat().st_mtime_ns
+pathlib.Path('/tmp/ezq-writer-ready').touch()
+deadline = time.monotonic() + 60
+while marker.stat().st_mtime_ns == before:
+    if time.monotonic() > deadline: raise RuntimeError('capture did not start')
+    time.sleep(0.001)
+time.sleep(0.02)
+pathlib.Path('/root/during.txt').write_text('changed during capture\n')
+pathlib.Path('/tmp/ezq-writer-done').touch()
+`;
+      expect((await docker(['exec', '-d', a, 'python3', '-c', writer])).code).toBe(0);
+      await must(a, 'timeout 10 bash -c \'until test -e /tmp/ezq-writer-ready; do sleep 0.01; done\'');
+      const container = sdk(a);
+      const exec = container.exec.bind(container);
+      container.exec = (command, options) => exec(command.includes('"op":"sys-capture"')
+        ? `${command}\nrc=$?; test -e /tmp/ezq-writer-done || exit 99; exit "$rc"` : command, options);
+      expect((await flushSystemLayer({ container, bucket: store, realPrefix: prefix, log })).ok).toBe(true);
+      expect(await must(a, 'cat /root/during.txt')).toBe('changed during capture\n');
+      // This fails if capture resets its marker at the end and forgets the write.
+      await must(a, `test /root/during.txt -nt ${MARKER}`);
+      expect(await dirty(a)).toEqual({ dirty: true });
+    }, T);
+  });
 
   it('a HOME project with a huge node_modules does not freeze the system layer: tools, PATH, notes, sources and lockfiles survive a NEW container', async () => {
     const { out, back, b, before } = await homeProjectAcrossReplacement('syshp');
