@@ -73,7 +73,12 @@ export interface BillingStore {
 
     // writes — each idempotent
     linkCustomer(userId: string, stripeCustomerId: string): Promise<'linked' | 'exists' | 'conflict'>;
-    recordEvent(event: { eventId: string; type: string; livemode: boolean; payloadSha256: string }): Promise<'new' | 'duplicate'>;
+    /**
+     * Inbox insert. `processed` = seen and successfully applied (acknowledge, do
+     * nothing); `unprocessed` = seen before but never finished (re-run: every
+     * write below is idempotent, so reprocessing is safe).
+     */
+    recordEvent(event: { eventId: string; type: string; livemode: boolean; payloadSha256: string }): Promise<'new' | 'processed' | 'unprocessed'>;
     markEventProcessed(eventId: string, outcome: string): Promise<void>;
     upsertSubscription(row: SubscriptionUpsert): Promise<'applied' | 'stale'>;
     insertGrant(grant: GrantInsert): Promise<'inserted' | 'duplicate'>;
@@ -84,6 +89,8 @@ export interface BillingStore {
     touchInterval(computerId: string, at: Date): Promise<void>;
     closeInterval(computerId: string, at: Date, reason: string): Promise<void>;
     insertStorageSample(userId: string, sample: StorageSample & { source: string }): Promise<void>;
+    /** Close every open interval last seen before `staleBefore`, ending it at its `last_seen_at`. Returns how many. */
+    closeStaleIntervals(staleBefore: Date, reason: string): Promise<number>;
 }
 
 // ── Stripe (implemented by `stripe/client.ts`) ───────────────────────────────
@@ -147,4 +154,26 @@ export interface StripeApi {
     retrieveInvoice(id: string): Promise<StripeInvoice>;
     retrieveCheckoutSession(id: string): Promise<StripeCheckoutSession>;
     retrieveCharge(id: string): Promise<StripeCharge>;
+}
+
+// ── Processor / handlers ──────────────────────────────────────────────────────
+
+/** A signed event from the desktop Worker (`POST /api/billing/usage`). Instants are ISO strings; bytes a decimal string. */
+export type UsageEvent =
+    | { type: 'start' | 'stop' | 'heartbeat'; computerId: string; at: string; reason?: string }
+    | { type: 'storage'; computerId: string; at: string; bytes: string };
+
+export interface ProcessorDeps {
+    store: BillingStore;
+    stripe: StripeApi;
+    now: () => Date;
+}
+
+/** What routes and tRPC procedures receive (built once by `deps.ts`). */
+export interface BillingDeps {
+    config: import('./config').BillingConfig;
+    store: BillingStore;
+    /** Null unless `STRIPE_SECRET` is set. */
+    stripe: StripeApi | null;
+    now: () => Date;
 }
