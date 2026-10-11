@@ -680,11 +680,13 @@ printf '{"editor.fontSize":16}\n' > /workspace/.ezil/settings.json
       await must(a, 'mkdir -p /opt/ezq-during && head -c 33554432 /dev/urandom > /opt/ezq-during/blob');
       const writer = String.raw`
 import pathlib, time
-marker = pathlib.Path('/var/lib/ezil-system/capture-started')
-before = marker.stat().st_mtime_ns
+# A capture stamps the PENDING marker at its start; the committed baseline
+# (capture-started) only takes that time once the Worker commits (sys-committed).
+marker = pathlib.Path('/var/lib/ezil-system/capture-started.pending')
+before = marker.stat().st_mtime_ns if marker.exists() else 0
 pathlib.Path('/tmp/ezq-writer-ready').touch()
 deadline = time.monotonic() + 60
-while marker.stat().st_mtime_ns == before:
+while (marker.stat().st_mtime_ns if marker.exists() else 0) == before:
     if time.monotonic() > deadline: raise RuntimeError('capture did not start')
     time.sleep(0.001)
 time.sleep(0.02)
