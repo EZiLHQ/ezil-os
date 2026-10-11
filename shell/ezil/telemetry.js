@@ -90,6 +90,8 @@ const SEND_TIMEOUT_MS = 3_000;
 const EVENT_CLASSES = new Set([
     'boot_phase', 'boot_summary', 'boot_stall', 'crash', 'window_error',
     'api_failure', 'display_failure', 'worker_exception', 'contract_violation',
+    // docs/PERSISTENCE-SIGNAL-CONTRACT.md §5 — persist.shell_seen relays.
+    'persistence',
 ]);
 
 // 🔴 `MAX_PER_KEY` would throttle `boot_summary` to three app-opens per page:

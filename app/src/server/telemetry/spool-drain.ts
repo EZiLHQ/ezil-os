@@ -37,9 +37,9 @@
  * just means the spool grows a little larger and the next scheduled run
  * catches up.
  */
-import { ingestBatch, type IngestDb } from './ingest';
+import { ingestOwnerAttributedBatch, type IngestDb } from './ingest';
 import { parseTelemetryBatch } from './schema';
-import { TELEMETRY_LIMITS, TELEMETRY_SCHEMA_VERSION, WORKER_SENTINEL_USER_HASH } from './types';
+import { TELEMETRY_LIMITS, TELEMETRY_SCHEMA_VERSION } from './types';
 
 const NOT_FOUND = (): Response => new Response(null, { status: 404 });
 
@@ -131,11 +131,14 @@ export interface SpoolDrainEngineDeps {
  * The pure drain loop: page through the Worker's spool, parse+ingest every
  * NDJSON line through the SAME validator the shell's own ingest route uses
  * (`parseTelemetryBatch` -> `ingestBatch`), then ack only what was ingested
- * without error. Every drained event is stored under
- * `WORKER_SENTINEL_USER_HASH` — worker/container events carry no real user,
- * and `ezil_error_events.userHash` is `NOT NULL` (see that constant's own
- * doc comment for why it must then be excluded from every distinct-user
- * count downstream).
+ * without error. A drained event that names a real computer (`computerId`,
+ * the `ezil_computers.id` the app handed the Worker) is stored under that
+ * computer OWNER's pseudonymous `safeUserHash` — so "whose persistence is
+ * broken" is answerable (docs/PERSISTENCE-SIGNAL-CONTRACT.md §4). Every other
+ * drained event keeps `WORKER_SENTINEL_USER_HASH` and a NULL `computer_id`:
+ * it carries no real user, and `ezil_error_events.userHash` is `NOT NULL`
+ * (see that constant's own doc comment for why it must then be excluded from
+ * every distinct-user count downstream).
  */
 export async function runTelemetrySpoolDrain(deps: SpoolDrainEngineDeps): Promise<SpoolDrainResult> {
     const maxPages = deps.maxPages ?? DEFAULT_MAX_PAGES;
@@ -208,7 +211,9 @@ export async function runTelemetrySpoolDrain(deps: SpoolDrainEngineDeps): Promis
             eventsDroppedInvalid += parsed.droppedInvalid;
             if (parsed.events.length === 0) continue;
             try {
-                const result = await ingestBatch(deps.db, parsed.events, WORKER_SENTINEL_USER_HASH);
+                // Owner-attributed: a worker event naming a real computer is stored
+                // under its owner's pseudonymous hash; the rest keep the sentinel.
+                const result = await ingestOwnerAttributedBatch(deps.db, parsed.events);
                 eventsIngested += result.inserted;
             } catch (err) {
                 console.error('[telemetry] spool-drain ingest failed', { m: String((err as Error)?.message ?? err) });

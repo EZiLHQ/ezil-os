@@ -69,11 +69,36 @@ describe('Q1 — fingerprintLeaderboard (fleet-wide "what is hurting people now"
         expect(statements[0]!.params).toContain(200);
     });
 
+    it('excludes routine persistence OK events and heartbeats from the raw leaderboard', async () => {
+        const { db, statements } = makeTestDb();
+        await fingerprintLeaderboard(db);
+        // This existing error-only predicate also preserves boot_summary
+        // behavior: successes remain available elsewhere as denominators.
+        expect(statements[0]!.sql.replace(/\s+/g, ' ')).toContain(
+            "AND e.outcome = 'error' AND f.muted_at IS NULL",
+        );
+    });
+
     it('fingerprintLeaderboardFromRollup reads ezil_error_user_hours, not the raw events', async () => {
         const { db, statements } = makeTestDb([]);
         await fingerprintLeaderboardFromRollup(db, { days: 90 });
         expect(statements[0]!.sql).toMatch(/ezil_error_user_hours/);
         expect(statements[0]!.sql).not.toMatch(/ezil_error_events/);
+    });
+
+    it('excludes persistence OK codes from rollups without excluding boot_summary successes', async () => {
+        const { db, statements } = makeTestDb();
+        await fingerprintLeaderboardFromRollup(db);
+        const generated = statements[0]!.sql.replace(/\s+/g, ' ');
+        // Rollups do not retain outcome. The producer maps these four codes
+        // to OK; all other persistence codes and all other classes survive.
+        expect(generated).toContain('JOIN ezil_error_fingerprints f USING (fingerprint)');
+        expect(generated).toContain(
+            "AND NOT (f.event_class = 'persistence' " +
+            "AND f.code IN ('ok', 'unchanged', 'already_restored', 'no_snapshot')) GROUP BY fingerprint",
+        );
+        expect(generated).not.toContain('boot_summary');
+        expect(generated).not.toMatch(/\boutcome\b/);
     });
 
     // 🔴 The worker-sentinel exclusion: `errorEvents.userHash` is NOT NULL and

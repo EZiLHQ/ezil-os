@@ -1,4 +1,5 @@
 import { createRelayRenewal } from './relay-renewal.js';
+import { createPersistenceWatcher } from './persistence-status.js';
 import { isNative } from '../native-runtime.js';
 import { bindNativeBrowser } from './native.js';
 // desktop-window.js — EZiL-authored. Not Puter code.
@@ -94,6 +95,7 @@ import { bindNativeBrowser } from './native.js';
 import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
 import { claim as claimWarm } from '../warm.js';
 import telemetry from '../telemetry.js';
+import trpc from '../ui/Settings/trpc.js';
 import { applyDisplayEvidence, computeBootUiState } from '../boot-phases.js';
 import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
 import { watchRuntimeOnReturn } from '../runtime-recheck.js';
@@ -1077,6 +1079,31 @@ export async function openDesktopWindow (ctx = {}) {
     // once the desktop has been revealed without having been checked.
     const notice = DisplayNotice({ onRetry: () => { void start_boot(); } });
     el_body.appendChild(notice.el);
+
+    const persistence_notice = document.createElement('div');
+    persistence_notice.className = 'ezil-display-notice ezil-persistence-notice';
+    persistence_notice.hidden = true;
+    persistence_notice.setAttribute('role', 'status');
+    el_body.appendChild(persistence_notice);
+    const persistence_watcher = createPersistenceWatcher({
+        fetchStatus: async computerId => {
+            const result = await trpc.query('cloudflareGuacamole.persistenceState', { computerId });
+            return result.ok ? result.data : { ok: false };
+        },
+        emit: event => telemetry.capture(event),
+        render: text => {
+            if ( persistence_notice.textContent === (text ?? '') ) return;
+            persistence_notice.textContent = text ?? '';
+            persistence_notice.title = text ?? '';
+            persistence_notice.hidden = ! text;
+        },
+    });
+    const on_persistence_visibility = () => {
+        if ( document.visibilityState === 'hidden' ) persistence_watcher.pause();
+        else void persistence_watcher.resume();
+    };
+    document.addEventListener('visibilitychange', on_persistence_visibility);
+    on_persistence_visibility();
 
     /**
      * Show whichever of the two surfaces is currently earned, and hide the
@@ -2177,6 +2204,8 @@ export async function openDesktopWindow (ctx = {}) {
     const dispose = () => {
         disposed = true;
         relay_renewal?.stop();
+        persistence_watcher.stop();
+        document.removeEventListener('visibilitychange', on_persistence_visibility);
         document.removeEventListener('visibilitychange',on_relay_return);
         window.removeEventListener('online',on_relay_online);
         stop_timers();
@@ -2230,6 +2259,9 @@ export async function openDesktopWindow (ctx = {}) {
     // racing the rebuilt window for the same container.
     window.addEventListener('ezil:teardown', dispose);
 
+    // Only a configured provider has a Worker to ask: an unconfigured
+    // deployment sends no request at all (boot-test "no pointless request").
+    if ( desktop_state.configured === true ) void persistence_watcher.start(computer.id);
     void start_boot();
     return el_window;
 }

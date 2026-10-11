@@ -127,7 +127,10 @@ export interface RollupLeaderboardRow {
 
 /** Same question as `fingerprintLeaderboard`, but from the hour-rollup table
  * — EXACT (not estimated) distinct-user counts beyond the raw-retention
- * horizon, since raw events are pruned but the rollup is kept 90 days. */
+ * horizon, since raw events are pruned but the rollup is kept 90 days.
+ * The rollup has no outcome column: exclude persistence OK codes using the
+ * producer's outcomeOf mapping (worker/src/persistence-telemetry.ts).
+ * Scope this exclusion to persistence so boot_summary counts stay unchanged. */
 /**
  * 🔴 Same sentinel exclusion as `fingerprintLeaderboard`, same reason: a
  * `FILTER` on the aggregate, not a `WHERE`, so a worker-only fingerprint's
@@ -144,7 +147,10 @@ export async function fingerprintLeaderboardFromRollup(
                count(DISTINCT user_hash) FILTER (WHERE user_hash <> ${WORKER_SENTINEL_USER_HASH})::int AS "distinctUsers",
                sum(event_count)::int          AS events
         FROM   ezil_error_user_hours
+        JOIN   ezil_error_fingerprints f USING (fingerprint)
         WHERE  hour_bucket >= now() - (${days} || ' days')::interval
+          AND  NOT (f.event_class = 'persistence'
+                    AND f.code IN ('ok', 'unchanged', 'already_restored', 'no_snapshot'))
         GROUP  BY fingerprint
         ORDER  BY "distinctUsers" DESC
         LIMIT  ${limit}
@@ -395,4 +401,118 @@ export async function bootPhaseFailureRanking(db: QueryDb, hours = 24): Promise<
         ORDER  BY failures DESC
     `);
     return rowsOf<BootPhaseFailureRow>(result);
+}
+
+export interface PersistenceHealthRow {
+    computerShort: string;
+    lastRestore: { site: string; code: string; outcome: string; at: string } | null;
+    systemCode: string | null;
+    workspaceCode: string | null;
+    systemOkAgeS: number | null;
+    workspaceOkAgeS: number | null;
+    discardedUnsaved: number;
+    lastHeartbeatAt: string | null;
+    lastSeenAt: string;
+    flagged: boolean;
+}
+
+/**
+ * Persistence contract §1–2: one row per attributed computer, never user IDs.
+ * The retention window uses received_at, like the other telemetry queries.
+ * Event order and elapsed ages use occurred_at so a delayed spool drain does
+ * not make an old heartbeat look current. Both ages come from the latest
+ * worker persistence event carrying an age attr; missing/-1 means unknown,
+ * with no per-layer fallback to an older sample. Staleness uses the latest
+ * persistence event of any source, and a latest persist.stop is not stale.
+ * Keep docs/sql/persistence-health.sql equivalent to this read-only query.
+ */
+export async function persistenceHealth(
+    db: QueryDb,
+    opts: { now?: Date } = {},
+): Promise<PersistenceHealthRow[]> {
+    const asOf = opts.now ? sql`${opts.now.toISOString()}::timestamptz` : sql`now()`;
+    const result = await db.execute(sql`
+        WITH clock AS (
+          SELECT ${asOf} AS at
+        ), recent AS (
+          SELECT e.computer_id, e.event_id, e.source, e.site, e.code, e.outcome,
+                 e.attrs, e.occurred_at, e.received_at
+          FROM   ezil_error_events e CROSS JOIN clock c
+          WHERE  e.event_class = 'persistence'
+            AND  e.computer_id IS NOT NULL
+            AND  e.received_at >= c.at - interval '7 days'
+            AND  e.received_at <= c.at
+        ), latest AS (
+          SELECT DISTINCT ON (computer_id) computer_id, attrs, occurred_at
+          FROM   recent
+          WHERE  source = 'worker'
+            AND  site <> 'persist.shell_seen'
+            AND  (attrs ? 'system_age_s' OR attrs ? 'workspace_age_s')
+          ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
+        ), latest_events AS (
+          SELECT DISTINCT ON (computer_id) computer_id, site
+          FROM   recent
+          ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
+        ), restores AS (
+          SELECT DISTINCT ON (computer_id) computer_id,
+                 jsonb_build_object('site', site, 'code', code,
+                                    'outcome', outcome, 'at', occurred_at) AS restore
+          FROM   recent
+          WHERE  site IN ('persist.system.restore', 'persist.workspace.restore')
+          ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
+        ), system_events AS (
+          SELECT DISTINCT ON (computer_id) computer_id, code
+          FROM   recent
+          WHERE  site IN ('persist.system.flush', 'persist.system.restore')
+          ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
+        ), workspace_events AS (
+          SELECT DISTINCT ON (computer_id) computer_id, code
+          FROM   recent
+          WHERE  site IN ('persist.workspace.flush', 'persist.workspace.restore')
+          ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
+        ), totals AS (
+          SELECT computer_id,
+                 count(*) FILTER (WHERE site = 'persist.stop'
+                   AND attrs -> 'discarded_unsaved' = 'true'::jsonb)::int AS discarded,
+                 max(occurred_at) FILTER (WHERE site = 'persist.heartbeat') AS heartbeat_at,
+                 max(occurred_at) AS seen_at
+          FROM   recent
+          GROUP  BY computer_id
+        ), health AS (
+          SELECT left(md5(t.computer_id::text), 8) AS "computerShort",
+                 r.restore AS "lastRestore",
+                 s.code AS "systemCode", w.code AS "workspaceCode",
+                 CASE WHEN jsonb_typeof(l.attrs -> 'system_age_s') = 'number'
+                      THEN nullif((l.attrs ->> 'system_age_s')::double precision, -1)
+                           + extract(epoch FROM (c.at - l.occurred_at))::double precision
+                 END AS "systemOkAgeS",
+                 CASE WHEN jsonb_typeof(l.attrs -> 'workspace_age_s') = 'number'
+                      THEN nullif((l.attrs ->> 'workspace_age_s')::double precision, -1)
+                           + extract(epoch FROM (c.at - l.occurred_at))::double precision
+                 END AS "workspaceOkAgeS",
+                 t.discarded AS "discardedUnsaved",
+                 t.heartbeat_at AS "lastHeartbeatAt", t.seen_at AS "lastSeenAt",
+                 e.site AS "lastEventSite"
+          FROM   totals t
+          JOIN   latest_events e USING (computer_id)
+          LEFT   JOIN latest l USING (computer_id)
+          LEFT   JOIN restores r USING (computer_id)
+          LEFT   JOIN system_events s USING (computer_id)
+          LEFT   JOIN workspace_events w USING (computer_id)
+          CROSS  JOIN clock c
+        )
+        SELECT h."computerShort", h."lastRestore", h."systemCode", h."workspaceCode",
+               h."systemOkAgeS", h."workspaceOkAgeS", h."discardedUnsaved",
+               h."lastHeartbeatAt", h."lastSeenAt",
+               coalesce("systemCode" IN ('too_large', 'stale', 'not_restored'), false)
+               OR coalesce("workspaceCode" IN ('too_large', 'stale', 'not_restored'), false)
+               OR coalesce("lastSeenAt" >= c.at - interval '30 minutes'
+                           AND "systemOkAgeS" > 1800, false)
+               OR coalesce("lastSeenAt" < c.at - interval '30 minutes'
+                           AND "lastEventSite" <> 'persist.stop'
+                           AND "lastSeenAt" >= c.at - interval '2 hours', false) AS flagged
+        FROM   health h CROSS JOIN clock c
+        ORDER  BY flagged DESC, "lastSeenAt" DESC, "computerShort"
+    `);
+    return rowsOf<PersistenceHealthRow>(result);
 }

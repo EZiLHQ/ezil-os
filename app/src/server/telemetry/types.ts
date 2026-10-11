@@ -26,6 +26,8 @@ export const EVENT_CLASSES = [
     'display_failure',
     'worker_exception',
     'contract_violation',
+    // docs/PERSISTENCE-SIGNAL-CONTRACT.md — restore/save outcomes per computer, metadata only.
+    'persistence',
 ] as const;
 export type EventClass = (typeof EVENT_CLASSES)[number];
 
@@ -49,6 +51,15 @@ export const ATTRS_ALLOW_LIST: Record<EventClass, readonly string[]> = {
     boot_stall: [],
     worker_exception: [],
     contract_violation: [],
+    persistence: [
+        'entries',
+        'size_bucket',
+        'system_age_s',
+        'workspace_age_s',
+        'consecutive_failures',
+        'trigger',
+        'discarded_unsaved',
+    ],
 };
 
 /**

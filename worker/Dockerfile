@@ -172,7 +172,18 @@ COPY scripts/start-devserver.sh /usr/local/bin/start-devserver.sh
 COPY scripts/start-codeserver.sh /usr/local/bin/start-codeserver.sh
 COPY scripts/editor-state.sh /usr/local/bin/editor-state.sh
 COPY scripts/ezil-restore-deps.sh /usr/local/bin/ezil-restore-deps.sh
-RUN chmod +x /usr/local/bin/start-desktop.sh /usr/local/bin/start-neko.sh /usr/local/bin/start-devserver.sh /usr/local/bin/start-codeserver.sh /usr/local/bin/ezil-restore-deps.sh
+# Dependency-restore status after a restart (see ezil-restore-deps.sh): the
+# `ezil-deps` CLI, npm's script-shell (npm run waits, bounded, while the
+# project it runs is still restoring) and a one-line notice in interactive
+# shells. Asserted below so a build can never ship them half-wired.
+COPY scripts/ezil-deps.sh /usr/local/bin/ezil-deps
+COPY scripts/npm-script-shell.sh /usr/local/lib/ezil/npm-script-shell
+RUN chmod +x /usr/local/bin/start-desktop.sh /usr/local/bin/start-neko.sh /usr/local/bin/start-devserver.sh /usr/local/bin/start-codeserver.sh /usr/local/bin/ezil-restore-deps.sh \
+      /usr/local/bin/ezil-deps /usr/local/lib/ezil/npm-script-shell \
+  && /usr/local/bin/ezil-deps install-hooks \
+  && test "$(npm config get script-shell)" = /usr/local/lib/ezil/npm-script-shell \
+  && test -x /usr/local/bin/ezil-deps && test -x /usr/local/lib/ezil/npm-script-shell \
+  && grep -q 'ezil-deps notice' /etc/bash.bashrc
 # ── Alternate `neko` desktop mode (Phase 1, opt-in via desktopMode) ──────────
 # Guacamole above remains the default/rollback path — nothing above this
 # comment is changed by Neko's presence. The pinned Neko + VS Code runtime

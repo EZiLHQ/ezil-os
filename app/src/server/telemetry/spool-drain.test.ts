@@ -17,6 +17,7 @@ import {
     type SpoolDrainEngineDeps,
 } from './spool-drain';
 import type { IngestDb } from './ingest';
+import { safeUserHash } from './sanitize';
 import { WORKER_SENTINEL_USER_HASH } from './types';
 
 interface Statement {
@@ -85,6 +86,39 @@ describe('runTelemetrySpoolDrain — the core loop', () => {
         const insertStmt = statements.find((s) => /insert into "ezil_error_events"/i.test(s.sql));
         expect(insertStmt).toBeTruthy();
         expect(insertStmt!.params).toContain(WORKER_SENTINEL_USER_HASH);
+    });
+
+    it('a drained event naming a real computer is stored under its OWNER\'s hash; an unknown one keeps the sentinel and NULL', async () => {
+        const OWNER = '11111111-1111-4111-8111-111111111111';
+        const KNOWN = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+        const UNKNOWN = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+        const statements: Statement[] = [];
+        const proxy = drizzle(
+            async (sql, params) => {
+                statements.push({ sql, params });
+                if (/^\s*select\b/i.test(sql) && /from "ezil_computers"/i.test(sql)) {
+                    return { rows: (params as string[]).filter((id) => id === KNOWN).map((id) => [id, OWNER]) };
+                }
+                if (/returning\s+"event_id"/i.test(sql)) return { rows: [['x']] };
+                return { rows: [] };
+            },
+            { schema },
+        );
+        const db = { transaction: (cb: (tx: typeof proxy) => Promise<unknown>) => cb(proxy) } as unknown as IngestDb;
+        const body = [
+            rawEventLine({ eventId: '550e8400-e29b-41d4-a716-446655440001', eventClass: 'persistence', site: 'persist.system.flush', code: 'too_large', outcome: 'skipped', computerId: KNOWN }),
+            rawEventLine({ eventId: '550e8400-e29b-41d4-a716-446655440002', eventClass: 'persistence', site: 'persist.system.flush', code: 'too_large', outcome: 'skipped', computerId: UNKNOWN }),
+        ].join('\n');
+        const drainPage = vi.fn().mockResolvedValueOnce(page([{ key: 'v1/p.ndjson', body }]));
+        await runTelemetrySpoolDrain({ db, drainPage, ack: vi.fn().mockResolvedValue(true) });
+
+        const inserts = statements.filter((s) => /insert into "ezil_error_events"/i.test(s.sql));
+        expect(inserts).toHaveLength(2);
+        const ownerInsert = inserts.find((s) => s.params.includes(safeUserHash(OWNER)))!;
+        expect(ownerInsert.params).toContain(KNOWN);
+        const sentinelInsert = inserts.find((s) => s.params.includes(WORKER_SENTINEL_USER_HASH))!;
+        expect(sentinelInsert.params).not.toContain(UNKNOWN);
+        expect(JSON.stringify(statements.map((s) => s.params))).not.toContain(OWNER);
     });
 
     it('acks a page ONLY after ingest for that page has resolved without throwing', async () => {

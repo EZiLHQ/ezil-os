@@ -632,6 +632,16 @@ import {
   parseTelemetryAckKeys,
   TELEMETRY_SPOOL_PREFIX,
 } from './telemetry';
+import {
+  isComputerUuid,
+  loadTrackerState,
+  observe as observePersistenceState,
+  statusFrom as persistenceStatusFrom,
+  toPersistenceCode,
+  type PersistenceObservation,
+  type PersistenceStatus,
+  type PersistenceTrigger,
+} from './persistence-telemetry';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -776,6 +786,12 @@ interface EzilWorkspacePersistRpc {
   setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void>;
   desktopReachable(): Promise<boolean>;
   relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult>;
+  /** Remember the computer UUID for persistence telemetry. Non-UUIDs are ignored. */
+  setPersistenceComputerId(computerId: string): Promise<void>;
+  /** The preview open was refused for persistence (`persist.open_blocked`). */
+  recordPersistenceOpenBlocked(code: 'workspace_persistence_unavailable' | 'workspace_checkpoint_failed'): Promise<void>;
+  /** Contract §5 status for `GET /sandbox/:name/persistence`. */
+  persistenceStatus(): Promise<PersistenceStatus>;
   hydrateWorkspace(params: { mountPath: string; prefix: string }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }>;
   /** Start capturing user changes outside /workspace (system layer). Called once the desktop is up. */
   baselineSystem(): Promise<boolean>;
@@ -1830,6 +1846,19 @@ const MIN_CHANGED_CHECKPOINT_MS = 60_000;
 const WORKSPACE_LAST_GC_AT_KEY = 'ezil:workspaceLastGcAt';
 /** When the system layer (changes outside /workspace) was last captured. */
 const SYSTEM_LAST_FLUSH_AT_KEY = 'ezil:systemLastFlushAt';
+/**
+ * When a system capture last ended too_large / stale / not_restored.
+ * `SYSTEM_LAST_FLUSH_AT_KEY` deliberately does not advance on
+ * those outcomes, so without this every 10-60 s alarm cycle re-walked and
+ * re-tarred up to 512 MiB only to fail the same way. Interval captures wait
+ * `SYSTEM_FLUSH_INTERVAL_MS` after one; final captures never consult it.
+ */
+const SYSTEM_FLUSH_BACKOFF_AT_KEY = 'ezil:systemFlushBackoffAt';
+const SYSTEM_FLUSH_BACKOFF_REASONS: ReadonlySet<string> = new Set(['too_large', 'stale', 'not_restored']);
+/** `persistence-telemetry.ts`'s tracker (docs/PERSISTENCE-SIGNAL-CONTRACT.md). */
+const PERSISTENCE_TRACKER_KEY = 'ezil:persistenceTracker';
+/** The real `ezil_computers.id` the app sent as `projectId` — only ever a UUID, never the sandboxId. */
+const PERSISTENCE_COMPUTER_ID_KEY = 'ezil:persistenceComputerId';
 const SYSTEM_FLUSH_INTERVAL_MS = 5 * 60_000;
 const SNAPSHOT_GC_INTERVAL_MS = 15 * 60_000;
 
@@ -2477,6 +2506,51 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return next;
   }
 
+  // ── Persistence signal (docs/PERSISTENCE-SIGNAL-CONTRACT.md) ──────────────
+  // Telemetry only: nothing here may throw into, delay on failure, or change
+  // any persistence decision. Every entry point swallows its own errors.
+
+  private persistenceSignalErrorLogged = false;
+
+  async setPersistenceComputerId(computerId: string): Promise<void> {
+    try {
+      if (!isComputerUuid(computerId)) return;
+      const id = computerId.toLowerCase();
+      if ((await this.ctx.storage.get<string>(PERSISTENCE_COMPUTER_ID_KEY)) !== id) {
+        await this.ctx.storage.put(PERSISTENCE_COMPUTER_ID_KEY, id);
+      }
+    } catch { /* telemetry only */ }
+  }
+
+  async recordPersistenceOpenBlocked(code: 'workspace_persistence_unavailable' | 'workspace_checkpoint_failed'): Promise<void> {
+    await this.observePersistence({ kind: 'open_blocked', code });
+  }
+
+  async persistenceStatus(): Promise<PersistenceStatus> {
+    let raw: unknown;
+    try { raw = await this.ctx.storage.get(PERSISTENCE_TRACKER_KEY); } catch { raw = undefined; }
+    return persistenceStatusFrom(loadTrackerState(raw), Date.now());
+  }
+
+  private async observePersistence(obs: PersistenceObservation): Promise<void> {
+    try {
+      const now = Date.now();
+      const prev = loadTrackerState(await this.ctx.storage.get(PERSISTENCE_TRACKER_KEY));
+      const storedId = await this.ctx.storage.get<string>(PERSISTENCE_COMPUTER_ID_KEY);
+      const { events, state } = observePersistenceState(prev, obs, now, { computerId: storedId });
+      if (state !== prev) await this.ctx.storage.put(PERSISTENCE_TRACKER_KEY, state);
+      if (events.length === 0) return;
+      const bucket = this.env.TELEMETRY_R2_BUCKET;
+      if (!bucket) return;
+      await bucket.put(buildTelemetryR2Key(new Date(now), `persist-${events[0]!.eventId}`), serializeTelemetryBatch(events));
+    } catch (err) {
+      if (!this.persistenceSignalErrorLogged) {
+        this.persistenceSignalErrorLogged = true;
+        console.error(`[persistence_signal] spool failed: ${err instanceof Error ? err.name : 'unknown'}`);
+      }
+    }
+  }
+
   async hydrateWorkspace(params: { mountPath: string; prefix: string }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }> {
     return this.withWorkspacePersistence(async () => {
       try {
@@ -2486,7 +2560,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         // would re-restore pre-migration content on a later hydrate).
         const store = resolveWorkspaceStore(this.env);
         if (!store.ok) return { mounted: false, detail: store.detail };
+        const restoreStartedAt = Date.now();
         const result = await ensureWorkspaceHydratedFromR2(this, store.store, params.mountPath, params.prefix);
+        await this.observePersistence({ kind: 'restore', layer: 'workspace', trigger: 'open', durationMs: Date.now() - restoreStartedAt,
+          code: result.mounted ? (result.detail === 'already_hydrated' ? 'already_restored' : 'ok')
+            : result.detail ? toPersistenceCode(result.detail) : 'failed' });
         if (!result.mounted) return result;
         // User changes outside /workspace (apt, npm -g, HOME): restored before
         // the desktop starts. Never blocks the desktop.
@@ -2494,6 +2572,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           const systemStartedAt = Date.now();
           const system = await hydrateSystemLayer({ container: this, bucket: store.store, realPrefix: realR2KeyPrefix(params.prefix),
             log: (message) => console.error(message) });
+          await this.observePersistence({ kind: 'restore', layer: 'system', trigger: 'open', durationMs: Date.now() - systemStartedAt,
+            entries: system.restored,
+            code: system.skippedReason ? toPersistenceCode(system.skippedReason) : system.ok ? 'ok' : 'failed' });
           bootLog('system_hydrate', 'end', { status: system.ok ? 'ok' : 'error', phaseMs: Date.now() - systemStartedAt,
             detail: `restored=${system.restored},skippedImageScoped=${system.skippedImageScoped},conflicts=${system.conflicts}${system.skippedReason ? `,reason=${system.skippedReason}` : ''}${system.sameImage === false ? ',crossImage' : ''}` });
         }
@@ -2648,15 +2729,21 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     // Routine cycles -> interval; idle-stop (alarm, no deferral) and teardown
     // (systemFinalNext) -> final; any other explicit flush -> skipped.
     const systemMode = options?.allowDefer ? 'interval' : trigger === 'alarm' || this.systemFinalNext ? 'final' : 'skip';
+    const persistTrigger: PersistenceTrigger = options?.allowDefer ? 'interval'
+      : trigger === 'alarm' ? 'idle_stop' : this.systemFinalNext ? 'teardown' : 'readiness';
     this.systemFinalNext = false;
+    await this.observePersistence({ kind: 'flush', layer: 'workspace', trigger: persistTrigger, durationMs: Date.now() - t0,
+      code: outcome.ok ? (outcome.uploaded.length > 0 ? 'ok' : 'unchanged')
+        : outcome.skippedReason ? toPersistenceCode(outcome.skippedReason) : 'failed' });
     // An oversized workspace never checkpoints, but the system layer still must.
     if ((outcome.ok || outcome.skippedReason === 'too_large') && systemMode !== 'skip') {
-      const system = await this.runSystemFlush(bucket, wctx.prefix, systemMode === 'final');
+      const system = await this.runSystemFlush(bucket, wctx.prefix, systemMode === 'final', persistTrigger);
       // A FINAL checkpoint that failed must not let idle-stop / teardown discard
       // the container: they refuse and retry, exactly as for the workspace.
       if (systemMode === 'final' && system?.skippedReason === 'failed') outcome.systemCheckpointFailed = true;
     }
     if (outcome.ok) await this.collectSnapshotGarbage(bucket, wctx.prefix);
+    await this.observePersistence({ kind: 'heartbeat', running: this.containerIsRunning() });
     return outcome;
   }
 
@@ -2666,10 +2753,26 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * SYSTEM_FLUSH_INTERVAL_MS, because it scans the system directories.
    * Never fails the workspace flush.
    */
-  private async runSystemFlush(bucket: unknown, prefix: string, final: boolean): Promise<SystemFlushOutcome | undefined> {
+  private async runSystemFlush(bucket: unknown, prefix: string, final: boolean,
+    trigger: PersistenceTrigger = final ? 'final' : 'interval'): Promise<SystemFlushOutcome | undefined> {
     const last = (await this.ctx.storage.get<number>(SYSTEM_LAST_FLUSH_AT_KEY)) ?? 0;
     if (!final && Date.now() - last < SYSTEM_FLUSH_INTERVAL_MS) return undefined;
+    if (!final) {
+      const backoffAt = (await this.ctx.storage.get<number>(SYSTEM_FLUSH_BACKOFF_AT_KEY)) ?? 0;
+      if (Date.now() - backoffAt < SYSTEM_FLUSH_INTERVAL_MS) return undefined;
+    }
     const t0 = Date.now();
+    const system = await this.captureSystemLayer(bucket, prefix, t0);
+    // B2: persistent refusals back interval captures off; transient failures retry next cycle.
+    if (system.skippedReason && SYSTEM_FLUSH_BACKOFF_REASONS.has(system.skippedReason)) {
+      try { await this.ctx.storage.put(SYSTEM_FLUSH_BACKOFF_AT_KEY, Date.now()); } catch { /* next cycle retries */ }
+    }
+    await this.observePersistence({ kind: 'flush', layer: 'system', trigger, durationMs: Date.now() - t0, entries: system.entries,
+      code: system.ok ? (system.unchanged ? 'unchanged' : 'ok') : toPersistenceCode(system.skippedReason ?? 'failed') });
+    return system;
+  }
+
+  private async captureSystemLayer(bucket: unknown, prefix: string, t0: number): Promise<SystemFlushOutcome> {
     try {
       const system = await flushSystemLayer({ container: this, bucket: bucket as FlushR2BucketLike, realPrefix: prefix,
         log: (message) => console.error(`[system_flush] ${message}`) });
@@ -2963,6 +3066,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         // marking this loop retired.
         try {
           await this.stop();
+          await this.observePersistence({ kind: 'stop', trigger: 'idle_stop' });
         } catch (err) {
           console.error(
             `[ezil-boot] phase=workspace_flush event=idle_stop_failed error=workspace_operation_failed`,
@@ -3217,6 +3321,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // ordered sequence it documents.
       if (retainPreviewAuthorization) await super.stop();
       else await super.destroy();
+      if (wasRunning) await this.observePersistence({ kind: 'stop', trigger: 'teardown' });
     } catch (err) {
       destroyError = err instanceof Error ? err.message : String(err);
       console.error(`[terminateSandbox] destroy() failed: ${destroyError}`);
@@ -3950,6 +4055,10 @@ async function handlePreview(
 
   try {
     const sandbox = openSandbox(env, sandboxId);
+    // Persistence signal attribution: the app's computer UUID (never the sandboxId).
+    if (isComputerUuid(scopeId)) {
+      try { await sandbox.setPersistenceComputerId(scopeId); } catch { /* telemetry only */ }
+    }
     // Mount (and, on first use, seed) the S3 workspace bucket before the
     // desktop starts so any workspace-backed tooling sees files immediately.
     // Workspace durability is required before exposing an editable desktop.
@@ -3965,6 +4074,7 @@ async function handlePreview(
     );
 
     if (!workspace.mounted) {
+      try { await sandbox.recordPersistenceOpenBlocked('workspace_persistence_unavailable'); } catch { /* telemetry only */ }
       return json({ ok: false, error: 'workspace_persistence_unavailable', workspace }, 503);
     }
 
@@ -4064,6 +4174,7 @@ async function handlePreview(
     // waitUntil has a bounded lifetime and cannot gate a response on failure.
     const checkpoint = await sandbox.flushWorkspaceNow().catch(() => null);
     if (!checkpoint?.ok) {
+      try { await sandbox.recordPersistenceOpenBlocked('workspace_checkpoint_failed'); } catch { /* telemetry only */ }
       return json({ ok: false, error: 'workspace_checkpoint_failed' }, 503);
     }
 
@@ -6500,6 +6611,20 @@ export default {
       } catch (error) {
         return json({ok:false,error:error instanceof AcceptanceFaultError ? error.code : 'acceptance_fault_failed'},
           error instanceof AcceptanceFaultError ? error.status : 502);
+      }
+    }
+    const persistenceMatch = path.match(/^\/sandbox\/([^/]+)\/persistence$/);
+    if (method === 'GET' && persistenceMatch) {
+      // Contract §5. Same signed-control gate as relay-refresh: metadata only
+      // (reason codes and ages), but still per-computer, so never unsigned.
+      if (resolvePreviewSecrets(env).length === 0) return json({ok:false,error:'persistence_auth_not_configured'},401);
+      const unauthorized = await authorizeSignedControlRequest(request, env, url);
+      if (unauthorized) return unauthorized;
+      try {
+        const status = await openSandbox(env, decodeURIComponent(persistenceMatch[1]!)).persistenceStatus();
+        return json({ ok: true, status });
+      } catch {
+        return json({ ok: false, error: 'persistence_status_unavailable' }, 502);
       }
     }
     const relayMatch = path.match(/^\/sandbox\/([^/]+)\/relay-refresh$/);

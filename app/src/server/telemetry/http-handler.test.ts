@@ -173,3 +173,48 @@ describe('handleTelemetryPost: the guarantee — always 202, nothing to branch o
         expect(schedule).not.toHaveBeenCalled();
     });
 });
+
+describe('handleTelemetryPost: computerId is owner-checked (docs/PERSISTENCE-SIGNAL-CONTRACT.md §4)', () => {
+    afterEach(() => {
+        resetRateLimitForTests();
+        resetLoadShedCacheForTests();
+    });
+
+    it('stores the session user\'s own computer, and NULL for anyone else\'s', async () => {
+        setLoadShedCacheForTests(0);
+        const MINE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+        const THEIRS = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+        const OTHER_USER = '22222222-2222-4222-8222-222222222222';
+        const statements: { sql: string; params: unknown[] }[] = [];
+        const proxy = drizzle(
+            async (sql, params) => {
+                statements.push({ sql, params });
+                if (/^\s*select\b/i.test(sql) && /from "ezil_computers"/i.test(sql)) {
+                    const owners: Record<string, string> = { [MINE]: AUTH_USER.id, [THEIRS]: OTHER_USER };
+                    return { rows: (params as string[]).filter((id) => id in owners).map((id) => [id, owners[id]]) };
+                }
+                return { rows: [] };
+            },
+            { schema },
+        );
+        const db = {
+            transaction: (cb: (tx: typeof proxy) => Promise<unknown>) => cb(proxy),
+            execute: (proxy as unknown as { execute: (q: unknown) => Promise<unknown> }).execute.bind(proxy),
+        } as unknown as TelemetryRequestContext['db'];
+        const schedule = vi.fn();
+        await handleTelemetryPost(
+            jsonRequest({
+                schemaVersion: 1,
+                events: [
+                    { ...validEvent('550e8400-e29b-41d4-a716-446655440001'), computerId: MINE },
+                    { ...validEvent('550e8400-e29b-41d4-a716-446655440002'), computerId: THEIRS },
+                ],
+            }),
+            { getContext: async () => ({ user: AUTH_USER, db }), schedule },
+        );
+        await schedule.mock.calls[0]![0]!();
+        const insert = statements.find((s) => /insert into "ezil_error_events"/i.test(s.sql))!;
+        expect(insert.params).toContain(MINE);
+        expect(insert.params).not.toContain(THEIRS);
+    });
+});

@@ -61,6 +61,7 @@ import {
     requestGuacamoleActivity,
     requestGuacamoleDesktopRestart,
     requestGuacamoleFocusApp,
+    requestPersistenceStatus,
     requestRelayRefresh,
     requestGuacamolePreview,
     requestGuacamoleSandboxTerminate,
@@ -90,6 +91,14 @@ async function assertOwnedComputer(
 }
 
 export const cloudflareGuacamoleRouter = createTRPCRouter({
+    persistenceState: protectedProcedure.input(z.object({ computerId: z.string().uuid() }))
+        .query(async ({ ctx, input }) => {
+            await assertOwnedComputer(ctx.db, ctx.user.id, input.computerId);
+            const config = resolveCloudflareGuacamoleConfig();
+            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
+            if (!config.isConfigured || !hmacSecret) return { ok: false as const, error: 'persistence_not_configured' };
+            return requestPersistenceStatus(config, hmacSecret, deriveGuacamoleSandboxId(ctx.user.id, input.computerId), newCorrelationId());
+        }),
     relayState: protectedProcedure.input(z.object({ computerId: z.string().uuid() }))
         .query(async ({ ctx, input }) => {
             await assertOwnedComputer(ctx.db,ctx.user.id,input.computerId);

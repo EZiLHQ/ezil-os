@@ -28,15 +28,15 @@
  * with `drizzle-orm/pg-proxy` in tests, no live Postgres required, and the
  * production `ctx.db` (`@/server/db`) satisfies the same type.
  */
-import { sql, type ExtractTablesWithRelations } from 'drizzle-orm';
+import { inArray, sql, type ExtractTablesWithRelations } from 'drizzle-orm';
 import type { PgDatabase, PgQueryResultHKT } from 'drizzle-orm/pg-core';
 
 import * as schema from '@/server/db/schema';
-import { errorEvents, errorFingerprints, errorUserHours } from '@/server/db/schema';
+import { computers, errorEvents, errorFingerprints, errorUserHours } from '@/server/db/schema';
 import { fingerprint, normalizeDetail } from './fingerprint';
 import { sanitizeAttrs, type ParsedTelemetryEventInput } from './schema';
-import { sanitizeErrorMessage } from './sanitize';
-import { TELEMETRY_LIMITS } from './types';
+import { safeUserHash, sanitizeErrorMessage } from './sanitize';
+import { TELEMETRY_LIMITS, WORKER_SENTINEL_USER_HASH } from './types';
 
 export type IngestDb = Pick<
     PgDatabase<PgQueryResultHKT, typeof schema, ExtractTablesWithRelations<typeof schema>>,
@@ -54,6 +54,35 @@ export interface IngestResult {
 
 const EMPTY_RESULT: IngestResult = { fingerprintsTouched: 0, inserted: 0, attempted: 0 };
 
+type IngestTx = Parameters<Parameters<IngestDb['transaction']>[0]>[0];
+
+export interface IngestOptions {
+    /**
+     * The authenticated user's raw id (shell path). A `computerId` that is not
+     * one of THIS user's computers is stored as NULL — the client cannot attach
+     * its events to someone else's computer. Never stored, never hashed here.
+     */
+    computerOwner?: string;
+}
+
+/**
+ * `computer_id` carries a real FK to `ezil_computers(id)`. One unknown UUID
+ * (a deleted computer, a stale tab, a forged id) used to fail the WHOLE
+ * transaction and lose every sibling event. Look the ids up first, in the same
+ * transaction, and return the owner of each one that exists — one query.
+ */
+async function resolveComputerOwners(tx: IngestTx, events: readonly ParsedTelemetryEventInput[]) {
+    const ids = [...new Set(events.map((e) => e.computerId).filter((id): id is string => !!id))];
+    const owners = new Map<string, string>();
+    if (ids.length === 0) return owners;
+    const found = await tx
+        .select({ id: computers.id, userId: computers.userId })
+        .from(computers)
+        .where(inArray(computers.id, ids));
+    for (const row of found) owners.set(row.id, row.userId);
+    return owners;
+}
+
 /**
  * Ingest an already-validated (`schema.ts`) batch of events for one caller.
  *
@@ -64,6 +93,62 @@ const EMPTY_RESULT: IngestResult = { fingerprintsTouched: 0, inserted: 0, attemp
  */
 export async function ingestBatch(
     db: IngestDb,
+    events: ParsedTelemetryEventInput[],
+    userHash: string,
+    options: IngestOptions = {},
+): Promise<IngestResult> {
+    if (events.length === 0) return EMPTY_RESULT;
+    const capped = events.slice(0, TELEMETRY_LIMITS.MAX_EVENTS_PER_BATCH);
+    return db.transaction(async (tx) => {
+        const owners = await resolveComputerOwners(tx, capped);
+        const attributed = capped.map((e) => {
+            if (!e.computerId) return e;
+            const owner = owners.get(e.computerId);
+            const keep = owner !== undefined && (options.computerOwner === undefined || owner === options.computerOwner);
+            return keep ? e : { ...e, computerId: undefined };
+        });
+        return ingestInTx(tx, attributed, userHash);
+    });
+}
+
+/**
+ * The Worker/container spool path (docs/PERSISTENCE-SIGNAL-CONTRACT.md §4).
+ * A worker event carries no session, but one that names a real computer is
+ * stored under that computer's OWNER's pseudonymous `safeUserHash` — so
+ * "whose persistence is broken" is answerable. Events with no computer, or an
+ * unknown one, keep `WORKER_SENTINEL_USER_HASH` and a NULL `computer_id`.
+ * One owner lookup, then one ingest per owner group, all in one transaction.
+ */
+export async function ingestOwnerAttributedBatch(
+    db: IngestDb,
+    events: ParsedTelemetryEventInput[],
+): Promise<IngestResult> {
+    if (events.length === 0) return EMPTY_RESULT;
+    const capped = events.slice(0, TELEMETRY_LIMITS.MAX_EVENTS_PER_BATCH);
+    return db.transaction(async (tx) => {
+        const owners = await resolveComputerOwners(tx, capped);
+        const groups = new Map<string, ParsedTelemetryEventInput[]>();
+        for (const e of capped) {
+            const owner = e.computerId ? owners.get(e.computerId) : undefined;
+            const hash = owner !== undefined ? safeUserHash(owner) : WORKER_SENTINEL_USER_HASH;
+            const row = owner !== undefined ? e : e.computerId ? { ...e, computerId: undefined } : e;
+            const list = groups.get(hash);
+            if (list) list.push(row);
+            else groups.set(hash, [row]);
+        }
+        const total: IngestResult = { fingerprintsTouched: 0, inserted: 0, attempted: 0 };
+        for (const [hash, group] of groups) {
+            const r = await ingestInTx(tx, group, hash);
+            total.fingerprintsTouched += r.fingerprintsTouched;
+            total.inserted += r.inserted;
+            total.attempted += r.attempted;
+        }
+        return total;
+    });
+}
+
+async function ingestInTx(
+    tx: IngestTx,
     events: ParsedTelemetryEventInput[],
     userHash: string,
 ): Promise<IngestResult> {
@@ -128,7 +213,7 @@ export async function ingestBatch(
         return [...byFingerprint.values()];
     }
 
-    return db.transaction(async (tx) => {
+    {
         /**
          * 1. The events themselves, FIRST, and idempotently on `event_id`.
          *
@@ -245,5 +330,5 @@ export async function ingestBatch(
             inserted: stored.length,
             attempted: rows.length,
         };
-    });
+    }
 }
