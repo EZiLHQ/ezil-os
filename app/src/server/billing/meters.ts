@@ -127,9 +127,17 @@ export function buildSummary(input: {
     const usedSeconds = workspaceUsedSeconds(intervals, resolved.window, now);
     const remainingSeconds = Math.max(0, allowanceSeconds - usedSeconds);
     const capBytes = storageCapBytes(resolved.plan, config.largeStorageEnabled);
+    // Only the newest sample per computer counts, even if a caller passes
+    // history: storage is a level, not a flow, so summing samples over time
+    // would multiply it.
+    const newest = new Map<string, { bytes: bigint; measuredAt: Date }>();
+    for (const sample of storage) {
+        const seen = newest.get(sample.computerId);
+        if (!seen || sample.measuredAt.getTime() > seen.measuredAt.getTime()) newest.set(sample.computerId, sample);
+    }
     let usedBytes = BigInt(0);
     let measuredAt: Date | null = null;
-    for (const sample of storage) {
+    for (const sample of newest.values()) {
         usedBytes += sample.bytes;
         if (measuredAt === null || sample.measuredAt.getTime() > measuredAt.getTime()) {
             measuredAt = sample.measuredAt;

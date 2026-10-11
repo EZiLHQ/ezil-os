@@ -67,7 +67,10 @@ const fixtures: { name: string; input: StripeEventLike; expected: BillingAction[
     { name: 'customer.subscription.deleted', input: event('customer.subscription.deleted', { id: 'sub_fixture' }), expected: [sync] },
     {
         name: 'charge.refunded', input: event('charge.refunded', charge),
-        expected: [{ type: 'revoke', chargeId: 'ch_fixture', refundIds: ['re_first', 're_second'], eventId }],
+        expected: [
+            { type: 'revoke', chargeId: 'ch_fixture', refundId: 're_first', eventId },
+            { type: 'revoke', chargeId: 'ch_fixture', refundId: 're_second', eventId },
+        ],
     },
     {
         name: 'charge.dispute.created', input: event('charge.dispute.created', { id: 'dp_fixture', charge: 'ch_fixture' }),
@@ -153,9 +156,10 @@ describe('planStripeEvent', () => {
         const payload = { ...checkout };
         Object.defineProperty(payload, 'metadata', { get() { throw new Error('metadata was read'); } });
         expect(planStripeEvent(event('checkout.session.completed', payload))).toEqual([link, paid]);
-        expect(() => planStripeEvent(event('checkout.session.completed', {
+        // Without client_reference_id nothing is linked — and metadata is still not a fallback.
+        expect(planStripeEvent(event('checkout.session.completed', {
             ...checkout, client_reference_id: null, metadata: { user_id: 'user_from_metadata' },
-        }))).toThrow(new TypeError('checkout.session.client_reference_id must be a non-empty string'));
+        }))).toEqual([paid]);
     });
 
     it('preserves event identity and created time without filtering live mode', () => {
