@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
     BOOT_FAILURE_COPY,
@@ -379,6 +379,8 @@ describe('computeBootUiState — never fabricates progress', () => {
             'timeout',
             'unknown',
             'worker_unreachable',
+            'workspace_checkpoint_failed',
+            'workspace_persistence_unavailable',
         ]);
     });
 });
@@ -532,6 +534,8 @@ describe('isRetryableBootErrorCode mirrors the server\'s classification exactly'
         'fetch_failed',
         'sandbox_runtime_blocked',
         'sandbox_start_failed',
+        'workspace_persistence_unavailable',
+        'workspace_checkpoint_failed',
         'sandbox_starting',
         'worker_http_error',
         'desktop_unreachable',
@@ -556,13 +560,14 @@ describe('isRetryableBootErrorCode mirrors the server\'s classification exactly'
         expect([...answers].sort()).toEqual([false, true]);
     });
 
-    it('names the five deterministic codes and nothing else', () => {
+    it('names the six deterministic codes and nothing else', () => {
         expect(EVERY_CODE.filter((c) => !isRetryableBootErrorCode(c))).toEqual([
             'bad_request',
             'unauthorized',
             'preconditions_unmet',
             'custom_domain_required',
             'sandbox_runtime_blocked',
+            'workspace_persistence_unavailable',
         ]);
     });
 
@@ -574,6 +579,33 @@ describe('isRetryableBootErrorCode mirrors the server\'s classification exactly'
         expect(isRetryableBootErrorCode(undefined)).toBe(true);
         expect(isRetryableBootErrorCode('')).toBe(true);
         expect(isRetryableBootErrorCode('some_future_code')).toBe(true);
+    });
+});
+
+describe('persistence boot failures', () => {
+    it.each([
+        ['workspace_persistence_unavailable', false, 'Workspace saving is unavailable. Please contact support before reopening your computer.'],
+        ['workspace_checkpoint_failed', true, 'Your workspace could not be saved. Please try opening your computer again.'],
+    ] as const)('%s preserves the provider copy and retry classification in the shell', async (errorCode, retryable, body) => {
+        expect(computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode })).toEqual({
+            kind: 'failed', reason: errorCode,
+        });
+        expect(BOOT_FAILURE_COPY[errorCode].body).toBe(body);
+        expect(isRetryableBootErrorCode(errorCode)).toBe(retryable);
+
+        vi.useFakeTimers();
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        try {
+            const failure = { ok: false as const, errorCode };
+            const issue = vi.fn().mockResolvedValue(failure);
+            const result = shellSession.withWakeAndOneRetry(issue, 'persistence-test');
+            await vi.runAllTimersAsync();
+            expect(await result).toEqual(failure);
+            expect(issue).toHaveBeenCalledTimes(retryable ? 2 : 1);
+        } finally {
+            vi.useRealTimers();
+            info.mockRestore();
+        }
     });
 });
 
