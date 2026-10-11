@@ -264,6 +264,14 @@ def inventory(since_ns, image):
             parent = os.path.dirname(parent)
     return picked
 
+def set_dirty_baseline():
+    # Right after a restore (or a start with nothing committed) the disk IS the
+    # committed state: changes from here on are what sys-dirty must report. Without
+    # this every fresh container looks dirty and runs a full capture at boot.
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    with open(CAPTURE_STARTED, 'a'): pass
+    os.utime(CAPTURE_STARTED, None)
+
 def mark_hydrated(generation):
     os.makedirs(STATE, mode=0o700, exist_ok=True)
     with open(HYDRATED + '.tmp', 'w') as f: json.dump({'generation': generation, 'at': time.time()}, f)
@@ -529,6 +537,7 @@ def restore():
         json.dump({'paths': restored, 'deleted': deleted, 'imageId': image_id(), 'snapshotImageId': p['snapshot'].get('imageId'), 'restoredAt': time.time()}, f)
     os.replace(MANIFEST + '.tmp', MANIFEST)
     mark_hydrated(p['snapshot'].get('generation'))
+    set_dirty_baseline()
     print(json.dumps({'restored': len(restored), 'skippedImageScoped': skipped, 'conflicts': conflicts, 'sameImage': same_image}))
 
 def baseline():
@@ -572,6 +581,7 @@ try:
     elif op == 'sys-baseline': baseline()
     elif op == 'sys-hydrated':
         mark_hydrated(p.get('generation'))
+        if p.get('baseline') is True: set_dirty_baseline()
         print(json.dumps({'hydrated': True}))
     elif op == 'sys-cleanup': shutil.rmtree(work, ignore_errors=True)
     else: raise ValueError('unknown operation')

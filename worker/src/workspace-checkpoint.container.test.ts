@@ -633,11 +633,10 @@ printf '{"editor.fontSize":16}\n' > /workspace/.ezil/settings.json
       await commit(a, store, prefix);
       await powerCut(a);
       const b = await restore('saved', store, prefix);
-      // The hydrated-generation marker is not a capture-start marker. On a fresh
-      // container sys-dirty conservatively returns true until its first capture.
-      expect((await sh(b, `test -e ${MARKER}`)).exitCode).not.toBe(0);
-      expect(await dirty(b)).toEqual({ dirty: true });
-      expect(await dirty(b)).toEqual({ dirty: true });
+      // Right after a restore the disk IS the committed layer: the restore sets the
+      // dirty baseline, so a fresh container does not run a full capture at boot.
+      expect((await sh(b, `test -e ${MARKER}`)).exitCode).toBe(0);
+      expect(await dirty(b)).toEqual({ dirty: false });
       expect((await sh(b, 'test -e /root/app/node_modules')).exitCode).not.toBe(0);
       const script = await readFile(new URL('../scripts/ezil-restore-deps.sh', import.meta.url), 'utf8');
       expect((await sh(b, 'cat > /usr/local/bin/ezil-restore-deps.sh && chmod 755 /usr/local/bin/ezil-restore-deps.sh', script)).exitCode).toBe(0);

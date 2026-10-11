@@ -196,14 +196,14 @@ export async function hydrateSystemLayer(deps: {
     const head = await readHead(bucket, prefix);
     if (!head) {
       // Nothing committed yet: this container's state IS the computer's system layer.
-      await run(container, { op: 'sys-hydrated', work, generation: null }, 60_000);
+      await run(container, { op: 'sys-hydrated', work, generation: null, baseline: true }, 60_000);
       return { ...outcome, ok: true, skippedReason: 'no_snapshot' };
     }
     const snapshot = head.snapshot as SystemSnapshot;
     if (snapshot.format !== SYSTEM_LAYER_FORMAT) {
       // Never restored. Recording its generation lets this container's next capture replace it.
       log('[system-persist] discarding a system layer from an older format');
-      await run(container, { op: 'sys-hydrated', work, generation: snapshot.generation }, 60_000);
+      await run(container, { op: 'sys-hydrated', work, generation: snapshot.generation, baseline: true }, 60_000);
       return { ...outcome, ok: true, skippedReason: 'legacy_discarded' };
     }
     await container.mkdir(work, { recursive: false });

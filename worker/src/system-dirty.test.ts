@@ -482,4 +482,14 @@ open(CAPTURE_STARTED + '.pending', 'w').close()
 stamp(CAPTURE_STARTED + '.pending', OLD + 10)
 `, 'sys-committed')).toEqual({ committed: true });
   });
+  it('a fresh container is clean right after hydration (no capture at boot)', async () => {
+    expect(await python(`
+marker()
+settle()
+stamp(ROOTS[0], OLD + 5)
+os.remove(CAPTURE_STARTED)
+mark_hydrated(None)
+set_dirty_baseline()
+`, 'sys-dirty')).toEqual({ dirty: false });
+  });
 });
