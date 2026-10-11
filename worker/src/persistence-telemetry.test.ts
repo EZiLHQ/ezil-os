@@ -4,6 +4,7 @@ import {
   emptyTrackerState,
   isComputerUuid,
   loadTrackerState,
+  markEmitted,
   observe,
   outcomeOf,
   PERSISTENCE_ATTR_KEYS,
@@ -19,11 +20,17 @@ const COMPUTER = '3f6f1c2e-9a1b-4c3d-8e5f-0123456789ab';
 const T0 = Date.UTC(2026, 9, 10, 12, 41, 0);
 const MIB = 1024 * 1024;
 
+/** Existing emission-rule cases model a successful spool after each observation. */
+function observeAndSpool(...args: Parameters<typeof observe>): ReturnType<typeof observe> {
+  const result = observe(...args);
+  return { events: result.events, state: markEmitted(result.state, result.events, args[2]) };
+}
+
 function run(obs: PersistenceObservation[], start: PersistenceTrackerState = emptyTrackerState(), stepMs = 10_000, ctx = { computerId: COMPUTER }) {
   let state = start;
   const events: ReturnType<typeof observe>['events'] = [];
   obs.forEach((o, i) => {
-    const r = observe(state, o, T0 + i * stepMs, ctx);
+    const r = observeAndSpool(state, o, T0 + i * stepMs, ctx);
     state = r.state;
     events.push(...r.events);
   });
@@ -93,8 +100,8 @@ describe('emission rule (contract §3)', () => {
     it(`${layer}: repeated opens preserve the real restore and suppress identical flushes`, () => {
       const restore: PersistenceObservation = { kind: 'restore', layer, code: 'failed', trigger: 'open' };
       const already: PersistenceObservation = { ...restore, code: 'already_restored' };
-      const restored = observe(emptyTrackerState(), restore, T0).state;
-      const reopen = observe(restored, already, T0 + 1);
+      const restored = observeAndSpool(emptyTrackerState(), restore, T0).state;
+      const reopen = observeAndSpool(restored, already, T0 + 1);
       expect(reopen.state).toBe(restored);
       expect(reopen.events).toHaveLength(0);
       const flush: PersistenceObservation = { kind: 'flush', layer, code: 'too_large', trigger: 'interval' };
@@ -103,7 +110,7 @@ describe('emission rule (contract §3)', () => {
         `persist.${layer}.restore:failed`, `persist.${layer}.flush:too_large`,
       ]);
       expect(state[layer].consecutiveFailures).toBe(4);
-      expect(observe(state, { ...restore, code: 'ok' }, T0 + 60_000).events).toHaveLength(1);
+      expect(observeAndSpool(state, { ...restore, code: 'ok' }, T0 + 60_000).events).toHaveLength(1);
     });
   }
 
@@ -184,23 +191,23 @@ describe('emission rule (contract §3)', () => {
   });
 
   it('heartbeat: none before 15 min of silence, one at 15 min, none when not running', () => {
-    let state = observe(emptyTrackerState(), sysFlush('ok'), T0).state;
-    expect(observe(state, { kind: 'heartbeat', running: true }, T0 + PERSISTENCE_HEARTBEAT_MS - 1).events).toHaveLength(0);
-    expect(observe(state, { kind: 'heartbeat', running: false }, T0 + PERSISTENCE_HEARTBEAT_MS).events).toHaveLength(0);
-    const hb = observe(state, { kind: 'heartbeat', running: true }, T0 + PERSISTENCE_HEARTBEAT_MS);
+    let state = observeAndSpool(emptyTrackerState(), sysFlush('ok'), T0).state;
+    expect(observeAndSpool(state, { kind: 'heartbeat', running: true }, T0 + PERSISTENCE_HEARTBEAT_MS - 1).events).toHaveLength(0);
+    expect(observeAndSpool(state, { kind: 'heartbeat', running: false }, T0 + PERSISTENCE_HEARTBEAT_MS).events).toHaveLength(0);
+    const hb = observeAndSpool(state, { kind: 'heartbeat', running: true }, T0 + PERSISTENCE_HEARTBEAT_MS);
     expect(hb.events).toHaveLength(1);
     expect(hb.events[0]).toMatchObject({ site: 'persist.heartbeat', code: 'ok', attrs: { trigger: 'heartbeat', system_age_s: 900 } });
     state = hb.state;
     // The heartbeat itself resets the clock.
-    expect(observe(state, { kind: 'heartbeat', running: true }, T0 + PERSISTENCE_HEARTBEAT_MS + 60_000).events).toHaveLength(0);
+    expect(observeAndSpool(state, { kind: 'heartbeat', running: true }, T0 + PERSISTENCE_HEARTBEAT_MS + 60_000).events).toHaveLength(0);
   });
 
   it('a frozen computer still heartbeats with its blocking code while suppressed', () => {
     let state = emptyTrackerState();
     let count = 0;
     for (let t = 0; t <= 60 * 60_000; t += 10_000) {
-      const a = observe(state, sysFlush('too_large'), T0 + t);
-      const b = observe(a.state, { kind: 'heartbeat', running: true }, T0 + t);
+      const a = observeAndSpool(state, sysFlush('too_large'), T0 + t);
+      const b = observeAndSpool(a.state, { kind: 'heartbeat', running: true }, T0 + t);
       state = b.state;
       count += a.events.length + b.events.length;
       for (const e of b.events) expect(e.code).toBe('too_large');
@@ -212,13 +219,13 @@ describe('emission rule (contract §3)', () => {
 
 describe('tracker identity', () => {
   it('returns the same state for suppressed heartbeats and transient observations', () => {
-    const state = observe(emptyTrackerState(), sysFlush('ok'), T0).state;
+    const state = observeAndSpool(emptyTrackerState(), sysFlush('ok'), T0).state;
     const before = structuredClone(state);
     for (const obs of [
       { kind: 'heartbeat', running: false }, { kind: 'heartbeat', running: true },
       sysFlush('busy'), wsFlush('deferred'),
     ] as PersistenceObservation[]) {
-      const result = observe(state, obs, T0 + 1);
+      const result = observeAndSpool(state, obs, T0 + 1);
       expect(result.state).toBe(state);
       expect(result.events).toHaveLength(0);
     }
@@ -227,17 +234,17 @@ describe('tracker identity', () => {
 
   it('returns the same state for an identical successful restore or a flush at the same time', () => {
     const restore: PersistenceObservation = { kind: 'restore', layer: 'system', code: 'ok', trigger: 'open' };
-    const restored = observe(emptyTrackerState(), restore, T0).state;
-    expect(observe(restored, restore, T0 + 10_000).state).toBe(restored);
-    const flushed = observe(restored, sysFlush('ok'), T0).state;
-    expect(observe(flushed, sysFlush('ok'), T0).state).toBe(flushed);
+    const restored = observeAndSpool(emptyTrackerState(), restore, T0).state;
+    expect(observeAndSpool(restored, restore, T0 + 10_000).state).toBe(restored);
+    const flushed = observeAndSpool(restored, sysFlush('ok'), T0).state;
+    expect(observeAndSpool(flushed, sysFlush('ok'), T0).state).toBe(flushed);
   });
 
   it('still updates commit times and failure counts when an event is suppressed, without mutating prior state', () => {
     for (const code of ['ok', 'failed']) {
-      const prev = observe(emptyTrackerState(), sysFlush(code), T0).state;
+      const prev = observeAndSpool(emptyTrackerState(), sysFlush(code), T0).state;
       const before = structuredClone(prev);
-      const result = observe(prev, sysFlush(code), T0 + 10_000);
+      const result = observeAndSpool(prev, sysFlush(code), T0 + 10_000);
       expect(result.events).toHaveLength(0);
       expect(result.state).not.toBe(prev);
       expect(prev).toEqual(before);
@@ -246,16 +253,83 @@ describe('tracker identity', () => {
     }
   });
 
-  it('emitting an event only changes state when its stored timestamp or stop flag changes', () => {
+  it('stop events advance the emission clock only after acknowledgement', () => {
     const obs: PersistenceObservation = { kind: 'stop', trigger: 'idle_stop' };
-    const prev = observe(emptyTrackerState(), obs, T0).state;
+    const prev = observeAndSpool(emptyTrackerState(), obs, T0).state;
     const repeat = observe(prev, obs, T0);
     expect(repeat.events).toHaveLength(1);
-    expect(repeat.state).toBe(prev);
-    const later = observe(prev, obs, T0 + 1);
+    expect(repeat.state.lastEventAt).toBe(T0);
+    expect(repeat.state.pending).toEqual(repeat.events);
+    const later = observeAndSpool(prev, obs, T0 + 1);
     expect(later.state).not.toBe(prev);
     expect(later.state.lastEventAt).toBe(T0 + 1);
     expect(prev.lastEventAt).toBe(T0);
+  });
+});
+
+describe('confirmed spool markers', () => {
+  it('updates status immediately, retries failures, and suppresses only after acknowledgement', () => {
+    const first = observe(emptyTrackerState(), sysFlush('too_large'), T0);
+    expect(statusFrom(first.state, T0)).toMatchObject({ savingPaused: true, pausedReason: 'too_large' });
+    expect(first.state.lastEventAt).toBeNull();
+    expect(first.state.emitted.system).toBeNull();
+    let state = loadTrackerState(structuredClone(first.state));
+    for (let i = 1; i <= 30; i++) {
+      const retry = observe(state, sysFlush('too_large'), T0 + i);
+      expect(retry.events).toHaveLength(1);
+      expect(retry.state.pending).toEqual(retry.events);
+      expect(retry.state.lastEventAt).toBeNull();
+      state = retry.state;
+    }
+    const confirmed = markEmitted(state, state.pending, T0 + 31);
+    expect(confirmed.pending).toHaveLength(0);
+    expect(confirmed.lastEventAt).toBe(T0 + 31);
+    expect(observe(confirmed, sysFlush('too_large'), T0 + 32).events).toHaveLength(0);
+    expect(confirmed.system.consecutiveFailures).toBe(31);
+  });
+
+  it('keeps only the newest pending batch and preserves live status when an older write completes', () => {
+    const healthy = observeAndSpool(emptyTrackerState(), sysFlush('ok'), T0).state;
+    const failed = observe(healthy, sysFlush('failed'), T0 + 1);
+    const recovered = observe(failed.state, sysFlush('ok'), T0 + 2);
+    expect(recovered.events.map((event) => event.code)).toEqual(['ok']);
+    expect(recovered.state.pending).toHaveLength(1);
+    const oldWrite = markEmitted(recovered.state, failed.events, T0 + 3);
+    expect(oldWrite.system.code).toBe('ok');
+    expect(oldWrite.system.lastOkCommitAt).toBe(T0 + 2);
+    expect(oldWrite.emitted.system?.code).toBe('failed');
+    expect(oldWrite.pending).toEqual(recovered.events);
+    expect(markEmitted(oldWrite, recovered.events, T0 + 4).pending).toHaveLength(0);
+  });
+
+  it('acknowledges only the emitted layer and coalesces identical in-flight repeats', () => {
+    const first = observe(emptyTrackerState(), sysFlush('failed'), T0);
+    const repeat = observe(first.state, sysFlush('failed'), T0 + 1);
+    const confirmed = markEmitted(repeat.state, first.events, T0 + 2);
+    expect(confirmed.pending).toHaveLength(0);
+    expect(confirmed.system.consecutiveFailures).toBe(2);
+    const workspace = observe(first.state, wsFlush('too_large'), T0 + 1);
+    const otherLayer = markEmitted(workspace.state, first.events, T0 + 2);
+    expect(otherLayer.pending).toEqual(workspace.events);
+    expect(otherLayer.emitted.workspace).toBeNull();
+    expect(otherLayer.workspace.code).toBe('too_large');
+  });
+
+  it('retries a pending transition on a heartbeat without replacing it or advancing the clock', () => {
+    const first = observe(emptyTrackerState(), sysFlush('failed'), T0);
+    const retry = observe(first.state, { kind: 'heartbeat', running: true }, T0 + PERSISTENCE_HEARTBEAT_MS);
+    expect(retry.events).toEqual(first.events);
+    expect(retry.state.lastEventAt).toBeNull();
+    const heartbeat = observe(emptyTrackerState(), { kind: 'heartbeat', running: true }, T0);
+    expect(observe(heartbeat.state, { kind: 'heartbeat', running: true }, T0 + 1).events).toEqual(heartbeat.events);
+  });
+
+  it('retains legacy operational status without trusting its pre-spool deduplication state', () => {
+    const { emitted, pending, ...legacy } = observeAndSpool(emptyTrackerState(), sysFlush('failed'), T0).state;
+    const loaded = loadTrackerState(legacy);
+    expect(loaded.system).toEqual(legacy.system);
+    expect(loaded.lastEventAt).toBeNull();
+    expect(observe(loaded, sysFlush('failed'), T0 + 1).events).toHaveLength(1);
   });
 });
 
