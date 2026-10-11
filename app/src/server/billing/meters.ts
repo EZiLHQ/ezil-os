@@ -21,6 +21,22 @@ export interface SubscriptionRow {
 export interface IntervalRow {
     startedAt: Date;
     endedAt: Date | null;
+    /**
+     * Last heartbeat for an open interval. A Worker that dies without sending
+     * `stop` leaves the interval open; it then stops counting
+     * `OPEN_INTERVAL_GRACE_MS` after this instant instead of running to `now`
+     * until the reconciler closes it.
+     */
+    lastSeenAt?: Date;
+}
+
+/** How long an open interval keeps counting past its last heartbeat. */
+export const OPEN_INTERVAL_GRACE_MS = 15 * 60_000;
+
+function openIntervalEnd(interval: IntervalRow, now: Date): number {
+    if (interval.endedAt) return interval.endedAt.getTime();
+    if (!interval.lastSeenAt) return now.getTime();
+    return Math.min(now.getTime(), interval.lastSeenAt.getTime() + OPEN_INTERVAL_GRACE_MS);
 }
 
 type Window = { start: Date; end: Date };
@@ -42,7 +58,7 @@ export function freeWindow(now: Date): Window {
 export function workspaceUsedSeconds(intervals: IntervalRow[], window: Window, now: Date): number {
     return intervals.reduce((total, interval) => {
         const start = Math.max(interval.startedAt.getTime(), window.start.getTime());
-        const end = Math.min((interval.endedAt ?? now).getTime(), window.end.getTime());
+        const end = Math.min(openIntervalEnd(interval, now), window.end.getTime());
         const durationMs = Math.max(0, end - start);
         return total + Math.ceil(durationMs / 60_000) * 60;
     }, 0);
