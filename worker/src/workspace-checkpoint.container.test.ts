@@ -680,7 +680,9 @@ printf '#!/usr/bin/env node\nconsole.log("ezq-dep-ok")\n' > /tmp/ezq-dep/cli.js
 mkdir -p /root/.ezq-vendor && (cd /tmp/ezq-dep && npm pack --silent --pack-destination /root/.ezq-vendor >/dev/null)
 id alice >/dev/null 2>&1 || useradd -m alice
 for d in ${[...PROJECTS, DEEP].join(' ')}; do
-  mkdir -p "$d" && printf '{"name":"p","version":"0.1.0","dependencies":{"ezq-dep":"file:/root/.ezq-vendor/ezq-dep-1.0.0.tgz"}}' > "$d/package.json"
+  # Each owner must be able to read its saved tarball without access to /root.
+  mkdir -p "$d/vendor" && cp /root/.ezq-vendor/ezq-dep-1.0.0.tgz "$d/vendor/"
+  printf '{"name":"p","version":"0.1.0","dependencies":{"ezq-dep":"file:vendor/ezq-dep-1.0.0.tgz"}}' > "$d/package.json"
   (cd "$d" && npm install --offline --no-audit --no-fund >/dev/null 2>&1) && test -f "$d/package-lock.json"
 done
 chown -R alice:alice /home/alice/app
@@ -705,6 +707,43 @@ mkdir -p /home/alice/ws/site && cp /root/work/apps/web/package.json /root/work/a
     expect((await must(b, 'stat -c %U /home/alice/app/node_modules')).trim()).toBe('alice');
     expect((await sh(b, 'test -e /root/.opencode/node_modules')).exitCode).not.toBe(0);
     expect((await sh(b, 'test -e /home/alice/ws/site/node_modules')).exitCode).not.toBe(0);
+  }, T);
+
+  it('boot restore runs a non-root HOME project install and lifecycle scripts as its owner with that HOME config', async () => {
+    const c = await startComputer('deps-owner');
+    const script = await readFile(new URL('../scripts/ezil-restore-deps.sh', import.meta.url), 'utf8');
+    expect((await sh(c, 'cat > /usr/local/bin/ezil-restore-deps.sh && chmod 755 /usr/local/bin/ezil-restore-deps.sh', script)).exitCode).toBe(0);
+    await must(c, String.raw`
+set -e
+useradd -m -U -s /bin/bash ezq-deps-owner
+mkdir -p /home/ezq-deps-owner/app/vendor /tmp/ezq-owner-package/package
+printf '{"name":"ezq-owner-dep","version":"1.0.0"}' > /tmp/ezq-owner-package/package/package.json
+tar -czf /home/ezq-deps-owner/app/vendor/ezq-owner-dep.tgz -C /tmp/ezq-owner-package package
+cat > /home/ezq-deps-owner/app/package.json <<'JSON'
+{"name":"owner-project","version":"1.0.0","dependencies":{"ezq-owner-dep":"file:vendor/ezq-owner-dep.tgz"},"scripts":{"postinstall":"node postinstall.cjs && npm config get cache > cache-path"}}
+JSON
+cat > /home/ezq-deps-owner/app/postinstall.cjs <<'JS'
+require('node:fs').writeFileSync('generated.json', JSON.stringify({ uid: process.getuid(), gid: process.getgid(), home: process.env.HOME, restoring: process.env.EZIL_DEPS_RESTORING }));
+JS
+printf 'cache=/home/ezq-deps-owner/.ezq-cache\n' > /home/ezq-deps-owner/.npmrc
+(cd /home/ezq-deps-owner/app && npm install --package-lock-only --ignore-scripts --offline --no-audit --no-fund >/dev/null 2>&1)
+chown -R ezq-deps-owner:ezq-deps-owner /home/ezq-deps-owner
+test -f /home/ezq-deps-owner/app/package-lock.json
+test ! -e /home/ezq-deps-owner/app/node_modules
+HOME=/root /usr/local/bin/ezil-restore-deps.sh --homes > /tmp/ezil-restore-deps.log 2>&1
+`);
+    const uid = Number((await must(c, 'id -u ezq-deps-owner')).trim());
+    const gid = Number((await must(c, 'id -g ezq-deps-owner')).trim());
+    expect(uid).not.toBe(0);
+    expect(JSON.parse(await must(c, 'cat /home/ezq-deps-owner/app/generated.json'))).toEqual({
+      uid, gid, home: '/home/ezq-deps-owner', restoring: '1',
+    });
+    expect((await must(c, 'cat /home/ezq-deps-owner/app/cache-path')).trim()).toBe('/home/ezq-deps-owner/.ezq-cache');
+    for (const path of ['node_modules', 'node_modules/ezq-owner-dep/package.json', 'generated.json', 'cache-path']) {
+      expect((await must(c, `stat -c %u:%g /home/ezq-deps-owner/app/${path}`)).trim()).toBe(`${uid}:${gid}`);
+    }
+    expect(await must(c, 'cat /run/ezil-deps/status')).toContain('ready\t/home/ezq-deps-owner/app\t/tmp/ezil-restore-deps.log');
+    expect(await must(c, 'cat /tmp/ezil-restore-deps.log')).toContain('[restore-deps] /home/ezq-deps-owner/app: done');
   }, T);
 
   it('HOME content that is NOT regenerable still fails visibly as too_large over the limits (never reported saved)', async () => {

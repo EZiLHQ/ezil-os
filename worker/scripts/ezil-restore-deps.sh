@@ -107,18 +107,39 @@ for item in "${plan[@]+"${plan[@]}"}"; do
   command -v "$pm" >/dev/null 2>&1 || { echo "[restore-deps] $dir: $pm not installed, skipped"; set_state failed "$dir"; continue; }
   echo "[restore-deps] $dir: installing with $pm"
   set_state restoring "$dir"
+  install_as=()
+  case "$dir" in /home/*)
+    owner_uid="$(stat -c %u "$dir")"
+    if [ "$owner_uid" != 0 ]; then
+      owner_gid="$(stat -c %g "$dir")"
+      owner_home="$(getent passwd "$owner_uid" | cut -d: -f6)"
+      # An unregistered owner will fail the identity switch, not install as root.
+      home_path="${dir#/home/}"
+      owner_home="${owner_home:-/home/${home_path%%/*}}"
+      # The Ubuntu base normally supplies setpriv/runuser via util-linux.
+      if command -v setpriv >/dev/null 2>&1; then
+        install_as=(setpriv --reuid "$owner_uid" --regid "$owner_gid" --init-groups env "HOME=$owner_home")
+      elif command -v runuser >/dev/null 2>&1; then
+        install_as=(runuser -u "$(stat -c %U "$dir")" -g "$(stat -c %G "$dir")" -- env "HOME=$owner_home")
+      elif command -v su >/dev/null 2>&1; then
+        install_as=(su -s /bin/sh -g "$(stat -c %G "$dir")" "$(stat -c %U "$dir")" -c 'exec "$@"' -- sh env "HOME=$owner_home")
+      else
+        echo "[restore-deps] $dir: WARNING: setpriv, runuser and su unavailable; installing as current user"
+      fi
+    fi
+  esac
   # EZIL_DEPS_RESTORING: the npm script-shell must not wait on the install it is part of.
   if ( cd "$dir" && export EZIL_DEPS_RESTORING=1 && case "$pm" in
-      bun)  $NICE bun install --no-progress ;;
-      pnpm) $NICE pnpm install --prefer-frozen-lockfile ;;
-      yarn) $NICE yarn install --frozen-lockfile ;;
-      npm)  $NICE npm ci --no-audit --no-fund || $NICE npm install --no-audit --no-fund ;;
+      bun)  "${install_as[@]}" $NICE bun install --no-progress ;;
+      pnpm) "${install_as[@]}" $NICE pnpm install --prefer-frozen-lockfile ;;
+      yarn) "${install_as[@]}" $NICE yarn install --frozen-lockfile ;;
+      npm)  "${install_as[@]}" $NICE npm ci --no-audit --no-fund || "${install_as[@]}" $NICE npm install --no-audit --no-fund ;;
     esac ); then
     echo "[restore-deps] $dir: done"; set_state ready "$dir"
   else
     echo "[restore-deps] $dir: FAILED (exit $?)"; set_state failed "$dir"
   fi
-  # Installed as root into another user's home: hand the tree to the project's owner.
+  # Preserve ownership repair for installs where no identity-switch tool is available.
   if [ -d "$dir/node_modules" ] && [ "$(stat -c %u "$dir")" != "$(id -u)" ]; then
     chown -R "$(stat -c %u:%g "$dir")" "$dir/node_modules" 2>/dev/null || true
   fi
