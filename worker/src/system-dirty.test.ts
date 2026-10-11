@@ -292,7 +292,9 @@ work = test_root + '/work'
   return JSON.parse(result.stdout);
 }
 
-describe('system dirty Python codec', () => {
+// The codec is POSIX-only (fcntl, lstat ns) and needs python3, as in workspace-persist.test.ts.
+const NO_POSIX_HOST = process.platform === 'win32';
+describe.skipIf(NO_POSIX_HOST)('system dirty Python codec', () => {
   it('missing marker is dirty; equal nanosecond mtimes are clean', async () => {
     expect(await python('settle()')).toEqual({ dirty: true });
     expect(await python('marker()\nsettle()')).toEqual({ dirty: false });
