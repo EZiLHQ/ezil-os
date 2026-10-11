@@ -1,0 +1,72 @@
+.shell {
+    --marketing-text: #d3d9e2;
+    --marketing-muted: #a3afbf;
+    --marketing-link: #91e0df;
+    box-sizing: border-box;
+    min-height: 100svh;
+    min-height: 100dvh;
+    background: radial-gradient(ellipse at 80% 0, #14232d 0, transparent 36rem), #0b1018;
+    color: var(--marketing-text);
+    color-scheme: dark;
+    font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+    font-size: 1rem;
+    line-height: 1.8;
+    overflow-wrap: anywhere;
+}
+
+.shell *, .shell *::before, .shell *::after { box-sizing: border-box; }
+.shell a { color: var(--marketing-link); text-decoration: underline; text-underline-offset: 0.22em; }
+.shell a:hover { color: #d3ffff; }
+.shell :is(a, summary, [tabindex]):focus-visible { outline: 2px solid #b5efee; outline-offset: 5px; border-radius: 2px; }
+.header, .main, .footer { width: min(100% - 3rem, 73rem); margin-inline: auto; }
+
+.header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; padding-block: 1.5rem; border-bottom: 1px solid #29313d; }
+.header .brand { display: inline-flex; align-items: center; gap: 0.45rem; min-height: 2.75rem; color: #f3f6fa; font-size: 1.125rem; font-weight: 650; text-decoration: none; }
+.brandMark { width: 2rem; height: 2rem; margin-right: 0.25rem; border-radius: 0.35rem; }
+.brandSuffix { color: var(--marketing-muted); font-weight: 400; }
+.backLink { display: inline-flex; align-items: center; gap: 0.5rem; padding-block: 0.6rem; font-size: 0.875rem; }
+.skipLink { position: fixed; top: 1rem; left: 1rem; z-index: 10; padding: 0.65rem 1rem; background: #162531; transform: translateY(-200%); }
+.skipLink:focus { transform: none; }
+
+.main { padding-block: clamp(2rem, 5vw, 4rem) 5rem; }
+.intro { max-width: 48rem; }
+.intro h1 { margin: 0; color: #f5f7fa; font-size: clamp(2.15rem, 5vw, 3.5rem); font-weight: 600; line-height: 1.15; letter-spacing: -0.04em; }
+.description { margin: 1.25rem 0; max-width: 42rem; color: #b7c2d1; font-size: 1.125rem; line-height: 1.75; }
+.plans { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.5rem; margin-top: 2.75rem; }
+.card { display: flex; flex-direction: column; min-width: 0; padding: clamp(1.25rem, 3vw, 2rem); border: 1px solid #3d5763; border-radius: 0.75rem; background: #12202b; }
+.card h2, .section h2 { margin: 0 0 1rem; color: #f1f5f9; font-size: 1.375rem; font-weight: 600; line-height: 1.45; letter-spacing: -0.02em; }
+.card p { margin: 0 0 1rem; }
+.card .price { color: #f5f7fa; font-size: clamp(1.75rem, 4vw, 2.5rem); font-weight: 600; line-height: 1.3; }
+.note, .rowNote { color: var(--marketing-muted); font-size: 0.875rem; }
+.rows { margin-block: 0 1.5rem; }
+.rows > div { padding-block: 1rem; border-bottom: 1px solid #3d5763; }
+.rows dt { color: #f1f5f9; font-weight: 600; }
+.rows dd { margin: 0.25rem 0 0; }
+.rowNote { display: block; }
+.cardAction { margin-top: auto; padding-top: 0.5rem; }
+.shell .cta { display: block; padding: 0.7rem 1rem; border: 1px solid #91e0df; border-radius: 0.4rem; background: #91e0df; color: #0b1018; text-align: center; font-weight: 600; text-decoration: none; }
+.shell .cta:hover { background: #d3ffff; color: #0b1018; }
+.cardAction .note { margin: 0.75rem 0 0; }
+.section { max-width: 48rem; margin-top: 3.5rem; scroll-margin-top: 1.5rem; }
+.packs { list-style: disc; margin: 1rem 0; padding-left: 1.35rem; }
+.packs li { margin-block: 0.5rem; }
+.faq { border-bottom: 1px solid #3d5763; }
+.faq summary { padding-block: 1rem; color: #f1f5f9; font-weight: 500; cursor: pointer; }
+.faq p { margin: 0 0 1.25rem; }
+.footer { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.5rem 2rem; padding-block: 1.5rem 2rem; border-top: 1px solid #29313d; color: var(--marketing-muted); font-size: 0.8125rem; }
+.footer p { margin: 0; }
+.footer nav { display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; }
+.footer a { display: inline-block; padding-block: 0.65rem; }
+
+@media (max-width: 719px) {
+    .plans { grid-template-columns: minmax(0, 1fr); }
+    .header, .main, .footer { width: calc(100% - 2rem); }
+    .header { gap: 0.5rem; padding-block: 0.9rem; }
+    .backLink { font-size: 0.8125rem; }
+    .description { font-size: 1rem; }
+    .main { padding-bottom: 3rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .shell, .shell *, .shell *::before, .shell *::after { animation: none; transition: none; scroll-behavior: auto; }
+}
