@@ -13,7 +13,7 @@ import { runInNewContext } from 'node:vm';
 import {
   assertStagingTarget, TargetRefused, PRODUCTION_HOSTS, assertRunId, newRunId, newNonce, runPaths, checksumTargets,
   stepCommand, stepLines, stepPlan, chunkAcked, MAX_TYPED_LINE, readMarker, parseFields, probeScript, parseProbe, checksumScript, parseChecksums, compareChecksums,
-  opencodeInstallScript, parseOpencodeInstall, projectScript, depsWaitScript, parseDepsStatus, parseDepsWait,
+  opencodeInstallScript, parseOpencodeInstall, opencodeCheckScript, projectScript, depsWaitScript, parseDepsStatus, parseDepsWait,
   depsWaitOutcome, projectDepsState, devServerScript, parseDevServer, cleanupPlan, cleanupScript, parseCleanup,
   EVIDENCE_FILE, clampWait, RUN_BUDGET_MS, CLEANUP_RESERVE_MS, POWER_CUT_RPO_MS, powerCutAfterRpo,
   AcceptanceFailure, FAILURE_CODES,
