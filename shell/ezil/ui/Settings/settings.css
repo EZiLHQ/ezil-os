@@ -566,6 +566,124 @@
     container-type: inline-size;
 }
 
+/* Billing stays a single column even when the sidebar leaves little space.
+ * In particular, checkout copy must wrap instead of widening the window. */
+.ezil-settings-billing {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.ezil-billing-card {
+    min-width: 0;
+    margin-top: 12px;
+    padding: 14px;
+    border: 1px solid rgba(245, 245, 244, 0.1);
+    border-radius: 10px;
+    background: #1f1f1f;
+}
+
+.ezil-billing-plan {
+    border-color: rgba(0, 173, 181, 0.4);
+}
+
+.ezil-billing-card p {
+    margin: 6px 0 0;
+    line-height: 1.5;
+}
+
+.ezil-billing-usage {
+    font-variant-numeric: tabular-nums;
+}
+
+.ezil-billing-timing,
+.ezil-billing-note {
+    color: #b9b9b7;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.ezil-billing-progress {
+    height: 7px;
+    margin-top: 10px;
+    overflow: hidden;
+    border-radius: 8px;
+    background: rgba(245, 245, 244, 0.12);
+}
+
+.ezil-billing-progress span {
+    display: block;
+    height: 100%;
+    background: #00adb5;
+}
+
+.ezil-billing-meter.is-low .ezil-billing-progress span {
+    background: #e9bd60;
+}
+
+.ezil-billing-meter.is-exhausted .ezil-billing-progress span,
+.ezil-billing-meter.is-over_cap .ezil-billing-progress span {
+    background: #ff8a80;
+}
+
+.ezil-billing-meter.is-unavailable .ezil-billing-progress {
+    opacity: 0.45;
+}
+
+.ezil-billing-actions,
+.ezil-billing-footer {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 16px;
+}
+
+.ezil-settings-billing .ezil-settings-btn {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+.ezil-billing-pack {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    min-width: 0;
+}
+
+.ezil-billing-pack select {
+    width: 100%;
+    min-width: 0;
+    padding: 6px;
+    background: #1f1f1f;
+    color: #f5f5f4;
+    border: 1px solid rgba(245, 245, 244, 0.15);
+    border-radius: 6px;
+    font: inherit;
+}
+
+.ezil-settings-billing .ezil-settings-error {
+    flex-wrap: wrap;
+}
+
+.ezil-billing-action-error {
+    color: #ff8a80;
+}
+
+.ezil-billing-footer a {
+    color: #4fd8de;
+}
+
+@media (max-width: 480px) {
+    .ezil-settings-content {
+        padding: 16px 12px;
+    }
+
+    .ezil-billing-card {
+        padding: 10px;
+    }
+}
+
 @container (max-width: 380px) {
     .ezil-account-profile {
         flex-direction: column;
