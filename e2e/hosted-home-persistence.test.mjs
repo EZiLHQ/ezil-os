@@ -79,7 +79,7 @@ test('runStep retries terminal read errors during both typed and result checks',
   const runStepSource = source.match(/  const runStep = async \(name, body, timeoutMs\) => \{[\s\S]*?\n  \};/)[0];
   let line, reads = 0, enters = 0;
   const nonce = 'a'.repeat(24);
-  const context = { evidence: {}, stepInFlight: false, newNonce: () => nonce, stepCommand, stepLines, readMarker, parseFields,
+  const context = { evidence: {}, stepInFlight: false, newNonce: () => nonce, stepCommand, stepLines, readMarker, parseFields, wait: async () => {},
     terminalInput: () => ({ pressSequentially: async value => { line = value; }, press: async key => { assert.equal(key, 'Enter'); enters++; } }),
     terminalText: async () => {
       reads++;
@@ -547,4 +547,19 @@ test('every real hosted step types only lines within the proven length', () => {
   for (const body of [probeScript(id), opencodeInstallScript(id), projectScript(id), checksumScript(id, { sentinel: 'write' })]) {
     for (const line of stepLines(nonce, body)) assert.ok(line.length <= MAX_TYPED_LINE);
   }
+});
+
+test('an unverified typing echo is advisory: the result marker decides', async () => {
+  const source = readFileSync(script, 'utf8');
+  const runStepSource = source.match(/  const runStep = async \(name, body, timeoutMs\) => \{[\s\S]*?\n  \};/)[0];
+  const nonce = 'd'.repeat(24);
+  let enters = 0;
+  const context = { evidence: {}, stepInFlight: false, newNonce: () => nonce, stepCommand, stepLines, readMarker, parseFields, wait: async () => {},
+    terminalInput: () => ({ pressSequentially: async () => {}, press: async () => { enters++; } }),
+    terminalText: async () => (enters ? `EZQ:${nonce}:x=1:END` : ''),
+    bounded: async (name, action) => { const r = await action(); if (r) return r; throw new Error(`${name}: deadline exceeded`); },
+  };
+  const runStep = runInNewContext(`${runStepSource}\nrunStep`, context);
+  assert.deepEqual(await runStep('probe', 'emit "x=1"', 1000), { x: '1' });
+  assert.equal(context.evidence.typedUnverified, 1);
 });

@@ -667,7 +667,9 @@ async function main() {
     await wait(1000);
   };
   const terminalInput = () => f.locator('.xterm-helper-textarea').last();
-  const terminalText = () => f.locator('.xterm-accessibility-tree').last().innerText({ timeout: 5000 });
+  // Every terminal's accessibility rows, not just the last: Code may restore an earlier
+  // terminal beside the new one (2026-10-11 staging: 'step probe typed' never matched).
+  const terminalText = async () => (await f.locator('.xterm-accessibility-tree').allInnerTexts()).join('\n');
   const openTerminal = async () => {
     terminalReady = false;
     f = await openCode();
@@ -695,10 +697,15 @@ async function main() {
     // short enough for the terminal's accessibility rows to show in full.
     for (const line of stepLines(nonce, body)) {
       await terminalInput().pressSequentially(line, { delay: 10, timeout: 120000 });
-      await bounded(`step ${name} typed`, async () => {
+      // Advisory only: the accessibility rows are an unreliable echo of input. The
+      // proof that every line arrived intact is the nonce marker the decoded script
+      // prints below (a mistyped chunk cannot decode, so no marker appears).
+      const seen = await bounded(`step ${name} typed`, async () => {
         try { return (await terminalText()).replace(/\s/g, '').includes(line.slice(-80).replace(/\s/g, '')); } catch { return false; }
-      }, 15000);
+      }, 15000).catch(() => false);
+      if (!seen) evidence.typedUnverified = (evidence.typedUnverified ?? 0) + 1;
       await terminalInput().press('Enter');
+      await wait(300);
     }
     const payload = await bounded(`step ${name} result`, async () => {
       try { return readMarker(await terminalText(), nonce); } catch { return null; }
