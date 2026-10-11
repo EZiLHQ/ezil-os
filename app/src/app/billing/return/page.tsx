@@ -7,6 +7,13 @@ import { getReturnUrlQueryParam, Routes } from '@/utils/constants';
 
 import { CheckoutStatus } from './checkout-status';
 
+/**
+ * Rendered per request. The flag and the session are read at runtime: left
+ * static, a build made with CHECKOUT_ENABLED unset prerenders a permanent 404
+ * that turning the flag on later would never replace.
+ */
+export const dynamic = 'force-dynamic';
+
 /** Use the same session gate as computers so the return URL cannot establish ownership. */
 export default async function Page({ searchParams }: {
     searchParams: Promise<{ session_id?: string | string[] }>;
