@@ -7,7 +7,7 @@
  * from `EzilSandboxDO.prototype`, only the SDK's I/O is shadowed, so every
  * method this package wrote runs for real.
  */
-import { describe, expect, it, mock } from 'bun:test';
+import { describe, expect, it, mock, spyOn } from 'bun:test';
 import { createHash } from 'node:crypto';
 
 mock.module('cloudflare:workers', () => ({
@@ -18,7 +18,10 @@ mock.module('cloudflare:workers', () => ({
   env: {},
 }));
 import { hmacSha256Hex, PREVIEW_TOKEN_PAYLOAD } from './hmac';
-import { emptyTrackerState, observe, PERSISTENCE_HEARTBEAT_MS, type PersistenceObservation } from './persistence-telemetry';
+import { emptyTrackerState, markEmitted, observe, PERSISTENCE_HEARTBEAT_MS,
+  type PersistenceObservation, type PersistenceTrackerState } from './persistence-telemetry';
+import { SYSTEM_MANIFEST_PATH } from './system-persist';
+import * as workspacePersistence from './workspace-persist';
 
 const HYDRATED_KEY = 'ezil:workspaceHydrated';
 const FLUSH_CONTEXT_KEY = 'ezil:workspaceFlushContext';
@@ -30,12 +33,17 @@ const COMPUTER = '3f6f1c2e-9a1b-4c3d-8e5f-0123456789ab';
 const PREFIX = `${COMPUTER}/branches/main`;
 const IDLE_STOP_MS = 10 * 60_000;
 
-type SysCapture = 'too_large' | 'stale' | 'not_restored' | 'ok';
+type SysCapture = 'too_large' | 'stale' | 'not_restored' | 'ok' | 'unchanged';
 interface Opts {
   sysCapture?: SysCapture;
   systemPutThrows?: boolean;
   stopThrows?: boolean;
   telemetryPutThrows?: boolean;
+  telemetryPutNull?: boolean;
+  telemetryPutGate?: Promise<void>;
+  trackerPutGate?: Promise<void>;
+  systemReadThrows?: boolean;
+  backoffDeleteThrows?: boolean;
   noTelemetryBucket?: boolean;
   storage?: Record<string, unknown>;
 }
@@ -50,10 +58,20 @@ async function makeFake(opts: Opts = {}) {
   const store = new Map<string, unknown>(Object.entries(opts.storage ?? {}));
   const calls = { stops: 0, sysCaptures: 0, scheduled: 0, trackerPuts: 0, io: [] as string[] };
   const spooled: Spooled[] = [];
+  const background: Promise<unknown>[] = [];
+  const files = new Map<string, string>();
   const sha256 = createHash('sha256').update('hello').digest('hex');
+  const generation = '11111111-2222-4333-8444-555555555555';
   const env: Record<string, unknown> = {
     SANDBOX_WORKSPACE_R2_BUCKET: {
-      get: async () => null,
+      get: async (key: string) => {
+        if (!key.startsWith(`${COMPUTER}/system/`)) return null;
+        if (opts.systemReadThrows) throw new Error('system R2 unavailable');
+        if (opts.sysCapture !== 'unchanged') return null;
+        const body = new TextEncoder().encode(JSON.stringify({ version: 1, generation, sha256,
+          entries: 0, chunks: [{ size: 5, sha256 }] }));
+        return { etag: 'e', size: body.length, arrayBuffer: async () => body.buffer };
+      },
       put: async (key: string) => {
         calls.io.push(`r2:${key}`);
         if (opts.systemPutThrows && key.startsWith(`${COMPUTER}/system/`)) throw new Error('system R2 unavailable');
@@ -67,23 +85,37 @@ async function makeFake(opts: Opts = {}) {
       put: async (key: string, body: string) => {
         const batch = body.split('\n').map((l) => JSON.parse(l));
         calls.io.push(...batch.map((e) => `telemetry:${e.site}`));
+        if (opts.telemetryPutGate) await opts.telemetryPutGate;
         if (opts.telemetryPutThrows) throw new Error('r2 down');
+        if (opts.telemetryPutNull) return null;
         spooled.push({ key, events: batch });
+        return { etag: 'telemetry' };
       },
     };
   }
   const fake = Object.assign(Object.create(await proto()) as object, {
     ctx: {
       storage: {
-        get: async (key: string) => { calls.io.push(`get:${key}`); return store.get(key); },
+        get: async (key: string | string[]) => {
+          calls.io.push(`get:${key}`);
+          return Array.isArray(key) ? new Map(key.filter((k) => store.has(k)).map((k) => [k, store.get(k)])) : store.get(key);
+        },
         put: async (key: string, value: unknown) => {
           calls.io.push(`put:${key}`);
-          if (key === TRACKER_KEY) calls.trackerPuts++;
+          if (key === TRACKER_KEY) {
+            calls.trackerPuts++;
+            if (opts.trackerPutGate) await opts.trackerPutGate;
+          }
           store.set(key, value);
         },
-        delete: async (key: string) => void store.delete(key),
+        delete: async (key: string) => {
+          calls.io.push(`delete:${key}`);
+          if (key === BACKOFF_AT_KEY && opts.backoffDeleteThrows) throw new Error('storage unavailable');
+          return store.delete(key);
+        },
       },
       container: { running: true },
+      waitUntil: (promise: Promise<unknown>) => { background.push(promise); },
     },
     env,
     listSchedules: async () => [],
@@ -103,22 +135,27 @@ async function makeFake(opts: Opts = {}) {
           if (opts.sysCapture === 'too_large') return { exitCode: 3, stdout: '', stderr: 'system snapshot too large' };
           if (opts.sysCapture === 'stale') return { exitCode: 0, stdout: JSON.stringify({ expectedGeneration: 'other-writer' }) };
           if (opts.sysCapture === 'not_restored') return { exitCode: 0, stdout: JSON.stringify({ skipped: 'not_restored' }) };
-          if (opts.sysCapture === 'ok') return { exitCode: 0, stdout: JSON.stringify({ sha256, entries: 0, chunks: [{ size: 5, sha256 }] }) };
+          if (opts.sysCapture === 'ok' || opts.sysCapture === 'unchanged') return { exitCode: 0,
+            stdout: JSON.stringify({ sha256, entries: 0, chunks: [{ size: 5, sha256 }],
+              ...(opts.sysCapture === 'unchanged' ? { expectedGeneration: generation } : {}) }) };
           return { exitCode: 0, stdout: JSON.stringify({ skipped: 'no_baseline' }) };
         }
         if (command.includes('"op":"capture"')) {
           return { exitCode: 0, stdout: JSON.stringify({ sha256, entries: 0, chunks: [{ size: 5, sha256 }] }) };
         }
+        if (command.includes('"op":"sys-hydrated"')) files.set(SYSTEM_MANIFEST_PATH, '{}');
         return { exitCode: 0, stdout: '' };
       }
       return { exitCode: 0, stdout: '0.00 0.01 0.05 1/123 456\n' };
     },
-    exists: async () => ({ exists: false }),
-    readFile: async () => ({ content: Buffer.from('hello').toString('base64'), encoding: 'base64' }),
-    writeFile: async () => ({ success: true }),
+    exists: async (path: string) => ({ exists: files.has(path) }),
+    readFile: async (path: string) => files.has(path) ? { content: files.get(path)!, encoding: 'utf-8' }
+      : { content: Buffer.from('hello').toString('base64'), encoding: 'base64' },
+    writeFile: async (path: string, content: string) => { files.set(path, content); return { success: true }; },
+    mkdir: async () => ({ success: true }),
     listFiles: async () => ({ files: [] }),
   });
-  return { fake, store, calls, spooled };
+  return { fake, store, calls, spooled, background };
 }
 
 const active = (extra: Record<string, unknown> = {}) => ({
@@ -134,6 +171,26 @@ async function call(fake: unknown, name: string, ...args: unknown[]) {
 const events = (s: Spooled[]) => s.flatMap((b) => b.events);
 
 describe('B2: persistent refusals back off, transient failures retry next cycle', () => {
+  for (const sysCapture of ['ok', 'unchanged'] as const) {
+    for (const final of [false, true]) {
+      it(`${sysCapture} clears an old refusal after a successful ${final ? 'final' : 'interval'} capture`, async () => {
+        const { fake, store, calls } = await makeFake({ sysCapture,
+          storage: active({ [BACKOFF_AT_KEY]: Date.now() - (final ? 0 : 5 * 60_000) }) });
+        expect(await call(fake, 'runSystemFlush', fake.env.SANDBOX_WORKSPACE_R2_BUCKET, PREFIX, final))
+          .toMatchObject({ ok: true, ...(sysCapture === 'unchanged' ? { unchanged: true } : {}) });
+        expect(calls.sysCaptures).toBe(1);
+        expect(store.has(BACKOFF_AT_KEY)).toBe(false);
+        expect(calls.io).toContain(`delete:${BACKOFF_AT_KEY}`);
+      });
+    }
+  }
+
+  it('a backoff deletion failure does not turn a successful capture into a failed checkpoint', async () => {
+    const { fake } = await makeFake({ sysCapture: 'ok', backoffDeleteThrows: true,
+      storage: active({ [BACKOFF_AT_KEY]: Date.now() }) });
+    expect(await call(fake, 'runSystemFlush', fake.env.SANDBOX_WORKSPACE_R2_BUCKET, PREFIX, true)).toMatchObject({ ok: true });
+  });
+
   it('too_large: 6 alarm cycles -> ONE sys-capture, ONE persistence event', async () => {
     const { fake, calls, spooled, store } = await makeFake({ sysCapture: 'too_large', storage: active({ [COMPUTER_ID_KEY]: COMPUTER }) });
     for (let i = 0; i < 6; i++) await call(fake, 'flushWorkspaceScheduled');
@@ -239,10 +296,22 @@ describe('stop observations follow the container operation', () => {
 });
 
 describe('DO tracker writes only on real state changes', () => {
+  it('already_restored observations do no I/O and leave the last outcome intact', async () => {
+    const initial = observe(emptyTrackerState(), { kind: 'flush', layer: 'system', code: 'too_large', trigger: 'interval' }, Date.now()).state;
+    const { fake, store, calls, background } = await makeFake({ storage: { [TRACKER_KEY]: initial } });
+    for (const layer of ['system', 'workspace']) {
+      await call(fake, 'observePersistence', { kind: 'restore', layer, code: 'already_restored', trigger: 'open' });
+    }
+    expect(store.get(TRACKER_KEY)).toBe(initial);
+    expect(calls.io).toEqual([]);
+    expect(background).toEqual([]);
+  });
+
   it('skips no-op observations but stores suppressed counter changes and due heartbeats', async () => {
     const restore: PersistenceObservation = { kind: 'restore', layer: 'system', code: 'ok', trigger: 'open' };
-    const initial = observe(emptyTrackerState(), restore, Date.now()).state;
-    const { fake, calls, store, spooled } = await makeFake({ storage: { [TRACKER_KEY]: initial } });
+    const observed = observe(emptyTrackerState(), restore, Date.now());
+    const initial = markEmitted(observed.state, observed.events, Date.now());
+    const { fake, calls, store, spooled, background } = await makeFake({ storage: { [TRACKER_KEY]: initial } });
     for (const obs of [restore, { kind: 'heartbeat', running: true }, { kind: 'heartbeat', running: false },
       { kind: 'flush', layer: 'system', code: 'busy', trigger: 'interval' },
       { kind: 'flush', layer: 'workspace', code: 'deferred', trigger: 'interval' }]) {
@@ -253,16 +322,154 @@ describe('DO tracker writes only on real state changes', () => {
     expect(spooled).toHaveLength(0);
     const failure = { kind: 'flush', layer: 'system', code: 'failed', trigger: 'interval' };
     await call(fake, 'observePersistence', failure);
+    await Promise.all(background);
     await call(fake, 'observePersistence', failure);
-    expect(calls.trackerPuts).toBe(2);
+    expect(calls.trackerPuts).toBe(3); // Two status writes and one confirmed spool marker.
     expect(store.get(TRACKER_KEY)).toMatchObject({ system: { consecutiveFailures: 2 } });
     expect(events(spooled)).toHaveLength(1);
     const current = store.get(TRACKER_KEY) as typeof initial;
     store.set(TRACKER_KEY, { ...current, lastEventAt: Date.now() - PERSISTENCE_HEARTBEAT_MS });
     await call(fake, 'observePersistence', { kind: 'heartbeat', running: true });
-    expect(calls.trackerPuts).toBe(3);
+    await Promise.all(background);
+    expect(calls.trackerPuts).toBe(5); // Pending heartbeat, then its acknowledgement.
     expect(events(spooled).at(-1)!.site).toBe('persist.heartbeat');
   });
+});
+
+describe('R2 spool runs off the critical path', () => {
+  for (const telemetryPutThrows of [false, true]) {
+    it(`awaits tracker storage, but returns before R2 settles (R2 rejects: ${telemetryPutThrows})`, async () => {
+      let releaseTracker!: () => void;
+      let releaseR2!: () => void;
+      const trackerPutGate = new Promise<void>((resolve) => { releaseTracker = resolve; });
+      const telemetryPutGate = new Promise<void>((resolve) => { releaseR2 = resolve; });
+      const { fake, store, calls, spooled, background } = await makeFake({ telemetryPutThrows, trackerPutGate, telemetryPutGate,
+        storage: { [COMPUTER_ID_KEY]: COMPUTER } });
+      let completed = false;
+      const operation = call(fake, 'observePersistence', { kind: 'restore', layer: 'system', code: 'ok', trigger: 'open' })
+        .then(() => { completed = true; });
+      try {
+        await Bun.sleep(0);
+        expect(calls.trackerPuts).toBe(1);
+        expect(completed).toBe(false);
+        expect(background).toHaveLength(0);
+        releaseTracker();
+        await Bun.sleep(0);
+        expect(completed).toBe(true);
+        expect(store.get(TRACKER_KEY)).toMatchObject({ system: { code: 'ok' }, lastEventAt: null,
+          emitted: { system: null } });
+        expect(calls.io.filter((io) => io.startsWith('get:'))).toEqual([`get:${TRACKER_KEY},${COMPUTER_ID_KEY}`]);
+        expect(background).toHaveLength(1);
+        expect(spooled).toHaveLength(0);
+      } finally {
+        releaseTracker();
+        releaseR2();
+        await operation;
+      }
+      await expect(Promise.all(background)).resolves.toEqual([undefined]);
+      expect(spooled).toHaveLength(telemetryPutThrows ? 0 : 1);
+      const state = store.get(TRACKER_KEY) as PersistenceTrackerState;
+      expect(state.pending).toHaveLength(telemetryPutThrows ? 1 : 0);
+      expect(state.emitted.system?.code ?? null).toBe(telemetryPutThrows ? null : 'ok');
+      expect(state.lastEventAt === null).toBe(telemetryPutThrows);
+      if (!telemetryPutThrows) expect(events(spooled)[0]).toMatchObject({ computerId: COMPUTER });
+    });
+  }
+});
+
+describe('spool retries retain live persistence status', () => {
+  for (const failure of ['reject', 'null', 'absent'] as const) {
+    it(`${failure}: retains one pending transition and emits it after the spool recovers`, async () => {
+      const opts: Opts = { telemetryPutThrows: failure === 'reject', telemetryPutNull: failure === 'null' };
+      const { fake, store, spooled, background, calls } = await makeFake(opts);
+      const bucket = fake.env.TELEMETRY_R2_BUCKET;
+      if (failure === 'absent') delete fake.env.TELEMETRY_R2_BUCKET;
+      for (const code of ['failed', 'failed', 'too_large']) {
+        await call(fake, 'observePersistence', { kind: 'flush', layer: 'workspace', code, trigger: 'interval' });
+        await Promise.all(background);
+        const state = store.get(TRACKER_KEY) as PersistenceTrackerState;
+        expect(state.pending).toHaveLength(1);
+        expect(state.pending[0]!.code).toBe(code);
+        expect(state.emitted.workspace).toBeNull();
+        expect(state.lastEventAt).toBeNull();
+      }
+      expect(spooled).toHaveLength(0);
+      expect(calls.io.filter((io) => io.startsWith('telemetry:'))).toHaveLength(failure === 'absent' ? 0 : 3);
+      expect(await call(fake, 'persistenceStatus')).toMatchObject({ savingPaused: true, pausedLayer: 'workspace',
+        workspace: { code: 'too_large' } });
+      opts.telemetryPutThrows = false;
+      opts.telemetryPutNull = false;
+      fake.env.TELEMETRY_R2_BUCKET = bucket;
+      await call(fake, 'observePersistence', { kind: 'heartbeat', running: true });
+      await Promise.all(background);
+      expect(events(spooled).map((event) => event.code)).toEqual(['too_large']);
+      expect(store.get(TRACKER_KEY)).toMatchObject({ pending: [], emitted: { workspace: { code: 'too_large' } } });
+      await call(fake, 'observePersistence', { kind: 'flush', layer: 'workspace', code: 'too_large', trigger: 'interval' });
+      await Promise.all(background);
+      expect(events(spooled)).toHaveLength(1);
+    });
+  }
+
+  it('bounds in-flight writes and preserves the newest status when an older spool completes', async () => {
+    let release!: () => void;
+    const telemetryPutGate = new Promise<void>((resolve) => { release = resolve; });
+    const { fake, store, spooled, background, calls } = await makeFake({ telemetryPutGate });
+    try {
+      await call(fake, 'observePersistence', { kind: 'flush', layer: 'system', code: 'failed', trigger: 'interval' });
+      for (let i = 0; i < 20; i++) {
+        await call(fake, 'observePersistence', { kind: 'flush', layer: 'system', code: 'too_large', trigger: 'interval' });
+      }
+      await call(fake, 'observePersistence', { kind: 'flush', layer: 'system', code: 'ok', trigger: 'interval' });
+      const latest = store.get(TRACKER_KEY) as PersistenceTrackerState;
+      expect(latest.pending).toHaveLength(1);
+      expect(latest.pending[0]!.code).toBe('ok');
+      expect(latest.emitted.system).toBeNull();
+      expect(latest.lastEventAt).toBeNull();
+      expect(background).toHaveLength(1);
+      expect(calls.io.filter((io) => io.startsWith('telemetry:'))).toHaveLength(1);
+      expect(await call(fake, 'persistenceStatus')).toMatchObject({ savingPaused: false, system: { code: 'ok' } });
+    } finally { release(); }
+    await Promise.all(background);
+    expect(events(spooled).map((event) => event.code)).toEqual(['failed', 'ok']);
+    expect(store.get(TRACKER_KEY)).toMatchObject({ system: { code: 'ok', consecutiveFailures: 0 },
+      emitted: { system: { code: 'ok' } }, pending: [] });
+  });
+
+  it('retains a pending batch across a DO restart', async () => {
+    const first = await makeFake({ noTelemetryBucket: true });
+    await call(first.fake, 'observePersistence', { kind: 'flush', layer: 'workspace', code: 'failed', trigger: 'interval' });
+    const restarted = await makeFake({ storage: { [TRACKER_KEY]: structuredClone(first.store.get(TRACKER_KEY)) } });
+    await call(restarted.fake, 'observePersistence', { kind: 'heartbeat', running: true });
+    await Promise.all(restarted.background);
+    expect(events(restarted.spooled)).toMatchObject([{ site: 'persist.workspace.flush', code: 'failed' }]);
+    expect(restarted.store.get(TRACKER_KEY)).toMatchObject({ pending: [], emitted: { workspace: { code: 'failed' } } });
+  });
+});
+
+describe('thrown workspace flushes update the persistence signal', () => {
+  for (const variant of ['healthySpool', 'telemetryPutThrows', 'noTelemetryBucket'] as const) {
+    it(`${variant}: repeated exceptions replace healthy status and count failures`, async () => {
+      const healthy = observe(emptyTrackerState(), { kind: 'flush', layer: 'workspace', code: 'ok', trigger: 'interval' }, Date.now());
+      const initial = markEmitted(healthy.state, healthy.events, Date.now());
+      const { fake, store, spooled, background } = await makeFake({ [variant]: true, storage: active({ [TRACKER_KEY]: initial }) });
+      const flush = spyOn(workspacePersistence, 'flushWorkspaceToR2').mockRejectedValue(new Error('container RPC rejected'));
+      try {
+        for (let i = 1; i <= 2; i++) {
+          await expect(call(fake, 'runWorkspaceFlush', 'alarm', { allowDefer: true })).resolves.toMatchObject({
+            ok: false, skippedReason: 'flush_threw', heartbeatWritten: false,
+          });
+          await Promise.all(background);
+          expect(await call(fake, 'persistenceStatus')).toMatchObject({ workspace: { code: 'flush_threw', outcome: 'error' } });
+          expect(store.get(TRACKER_KEY)).toMatchObject({ workspace: { consecutiveFailures: i,
+            lastOkCommitAt: initial.workspace.lastOkCommitAt } });
+        }
+        if (variant === 'healthySpool') {
+          expect(events(spooled)).toMatchObject([{ site: 'persist.workspace.flush', code: 'flush_threw', outcome: 'error',
+            attrs: { trigger: 'interval' } }]);
+        } else expect(spooled).toHaveLength(0);
+      } finally { flush.mockRestore(); }
+    });
+  }
 });
 
 describe('attribution', () => {
@@ -343,10 +550,41 @@ describe('GET /sandbox/:name/persistence', () => {
 describe('restore observations (hydrateWorkspace)', () => {
   it('records a workspace restore and a system restore event for the computer', async () => {
     const { fake, spooled } = await makeFake({ sysCapture: 'ok', storage: { [COMPUTER_ID_KEY]: COMPUTER, [LAST_ACTIVITY_AT_KEY]: Date.now() } });
-    (fake as { withWorkspacePersistence: (fn: () => Promise<unknown>) => Promise<unknown> }).withWorkspacePersistence = (fn) => fn();
-    await call(fake, 'hydrateWorkspace', { mountPath: '/workspace', prefix: PREFIX });
+    expect(await call(fake, 'hydrateWorkspace', { mountPath: '/workspace', prefix: PREFIX })).toMatchObject({ mounted: true });
     const sites = events(spooled).map((e) => `${e.site}:${e.code}`);
-    expect(sites.some((s) => s.startsWith('persist.workspace.restore:'))).toBe(true);
+    expect(sites).toContain('persist.workspace.restore:ok');
+    expect(sites).toContain('persist.system.restore:no_snapshot');
     for (const e of events(spooled)) expect(e.computerId).toBe(COMPUTER);
+  });
+
+  it('repeated preview hydrations preserve real restores and flush suppression, and retain current-container backoff', async () => {
+    const { fake, spooled, store } = await makeFake({ storage: { [COMPUTER_ID_KEY]: COMPUTER } });
+    const params = { mountPath: '/workspace', prefix: PREFIX };
+    expect(await call(fake, 'hydrateWorkspace', params)).toMatchObject({ mounted: true });
+    const firstEvents = events(spooled);
+    const backoffAt = Date.now();
+    store.set(BACKOFF_AT_KEY, backoffAt);
+    for (let i = 0; i < 3; i++) {
+      expect(await call(fake, 'hydrateWorkspace', params)).toMatchObject({ mounted: true, detail: 'already_hydrated' });
+      await call(fake, 'runWorkspaceFlush', 'explicit');
+    }
+    expect(events(spooled)).toEqual(firstEvents);
+    expect(store.get(BACKOFF_AT_KEY)).toBe(backoffAt);
+  });
+
+  for (const systemReadThrows of [false, true]) {
+    it(`fresh system hydration clears old-container backoff (restore fails: ${systemReadThrows})`, async () => {
+      const { fake, store, calls, spooled } = await makeFake({ systemReadThrows,
+        storage: { [BACKOFF_AT_KEY]: Date.now() } });
+      expect(await call(fake, 'hydrateWorkspace', { mountPath: '/workspace', prefix: PREFIX })).toMatchObject({ mounted: true });
+      expect(store.has(BACKOFF_AT_KEY)).toBe(false);
+      expect(calls.io).toContain(`delete:${BACKOFF_AT_KEY}`);
+      expect(events(spooled).find((e) => e.site === 'persist.system.restore')?.code).toBe(systemReadThrows ? 'failed' : 'no_snapshot');
+    });
+  }
+
+  it('a backoff deletion failure does not block hydration', async () => {
+    const { fake } = await makeFake({ backoffDeleteThrows: true, storage: { [BACKOFF_AT_KEY]: Date.now() } });
+    expect(await call(fake, 'hydrateWorkspace', { mountPath: '/workspace', prefix: PREFIX })).toMatchObject({ mounted: true });
   });
 });

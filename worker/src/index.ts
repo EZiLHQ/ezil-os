@@ -635,6 +635,7 @@ import {
 import {
   isComputerUuid,
   loadTrackerState,
+  markEmitted,
   observe as observePersistenceState,
   statusFrom as persistenceStatusFrom,
   toPersistenceCode,
@@ -2511,6 +2512,15 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   // any persistence decision. Every entry point swallows its own errors.
 
   private persistenceSignalErrorLogged = false;
+  private persistenceSignalTail: Promise<void> | null = null;
+  private persistenceSpoolRunning = false;
+
+  /** Serialize tracker changes, including acknowledgements, without waiting on R2. */
+  private async withPersistenceSignal<T>(operation: () => Promise<T>): Promise<T> {
+    const next = (this.persistenceSignalTail ?? Promise.resolve()).catch(() => undefined).then(operation);
+    this.persistenceSignalTail = next.then(() => undefined, () => undefined);
+    return next;
+  }
 
   async setPersistenceComputerId(computerId: string): Promise<void> {
     try {
@@ -2533,21 +2543,47 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   }
 
   private async observePersistence(obs: PersistenceObservation): Promise<void> {
-    try {
-      const now = Date.now();
-      const prev = loadTrackerState(await this.ctx.storage.get(PERSISTENCE_TRACKER_KEY));
-      const storedId = await this.ctx.storage.get<string>(PERSISTENCE_COMPUTER_ID_KEY);
-      const { events, state } = observePersistenceState(prev, obs, now, { computerId: storedId });
-      if (state !== prev) await this.ctx.storage.put(PERSISTENCE_TRACKER_KEY, state);
-      if (events.length === 0) return;
-      const bucket = this.env.TELEMETRY_R2_BUCKET;
-      if (!bucket) return;
-      await bucket.put(buildTelemetryR2Key(new Date(now), `persist-${events[0]!.eventId}`), serializeTelemetryBatch(events));
-    } catch (err) {
+    // Reopening a hydrated container did not restore anything. Keep the real
+    // restore outcome and the flush suppression state, without any storage I/O.
+    if (obs.kind === 'restore' && obs.code === 'already_restored') return;
+    const reportError = (err: unknown) => {
       if (!this.persistenceSignalErrorLogged) {
         this.persistenceSignalErrorLogged = true;
         console.error(`[persistence_signal] spool failed: ${err instanceof Error ? err.name : 'unknown'}`);
       }
+    };
+    try {
+      const events = await this.withPersistenceSignal(async () => {
+        const stored = await this.ctx.storage.get([PERSISTENCE_TRACKER_KEY, PERSISTENCE_COMPUTER_ID_KEY]);
+        const prev = loadTrackerState(stored.get(PERSISTENCE_TRACKER_KEY));
+        const { events, state } = observePersistenceState(prev, obs, Date.now(), {
+          computerId: stored.get(PERSISTENCE_COMPUTER_ID_KEY),
+        });
+        if (state !== prev) await this.ctx.storage.put(PERSISTENCE_TRACKER_KEY, state);
+        return events;
+      });
+      if (events.length === 0) return;
+      const bucket = this.env.TELEMETRY_R2_BUCKET;
+      if (!bucket || this.persistenceSpoolRunning) return;
+      this.persistenceSpoolRunning = true;
+      // One PUT at a time, plus the newest pending batch in storage. A failed
+      // or absent spool is retried by a later observation, never in a busy loop.
+      this.ctx.waitUntil((async () => {
+        let batch = events;
+        while (batch.length > 0) {
+          const written = await bucket.put(buildTelemetryR2Key(new Date(batch[0]!.occurredAt), `persist-${batch[0]!.eventId}`),
+            serializeTelemetryBatch(batch));
+          if (!written) return;
+          batch = await this.withPersistenceSignal(async () => {
+            const latest = loadTrackerState(await this.ctx.storage.get(PERSISTENCE_TRACKER_KEY));
+            const confirmed = markEmitted(latest, batch, Date.now());
+            await this.ctx.storage.put(PERSISTENCE_TRACKER_KEY, confirmed);
+            return confirmed.pending;
+          });
+        }
+      })().catch(reportError).finally(() => { this.persistenceSpoolRunning = false; }));
+    } catch (err) {
+      reportError(err);
     }
   }
 
@@ -2572,6 +2608,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           const systemStartedAt = Date.now();
           const system = await hydrateSystemLayer({ container: this, bucket: store.store, realPrefix: realR2KeyPrefix(params.prefix),
             log: (message) => console.error(message) });
+          if (system.skippedReason !== 'already_restored') {
+            // A fresh container must not inherit the old container's refusal.
+            try { await this.ctx.storage.delete(SYSTEM_FLUSH_BACKOFF_AT_KEY); } catch { /* best effort */ }
+          }
           await this.observePersistence({ kind: 'restore', layer: 'system', trigger: 'open', durationMs: Date.now() - systemStartedAt,
             entries: system.restored,
             code: system.skippedReason ? toPersistenceCode(system.skippedReason) : system.ok ? 'ok' : 'failed' });
@@ -2691,12 +2731,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // `ok: false` — a flush that threw is emphatically not one that worked.
       // `manifest` is returned unchanged, so nothing is recorded as synced.
       console.error(`[workspace_flush] flush threw (trigger=${trigger}) — treated as a failed cycle`);
-      bootLog('workspace_flush', 'end', {
-        status: 'error',
-        phaseMs: Date.now() - t0,
-        detail: `trigger=${trigger},reason=flush_threw,hydrated=${hydrated}`,
-      });
-      return {
+      // Continue through the ordinary observation path so repeated exceptions
+      // replace a prior healthy status and increment its failure count too.
+      outcome = {
         ok: false,
         uploaded: [],
         skippedUnchanged: 0,
@@ -2709,7 +2746,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       };
     }
     bootLog('workspace_flush', 'end', {
-      status: outcome.ok ? 'ok' : outcome.skippedReason ? 'skipped' : 'error',
+      status: outcome.ok ? 'ok' : outcome.skippedReason && outcome.skippedReason !== 'flush_threw' ? 'skipped' : 'error',
       phaseMs: Date.now() - t0,
       detail: `trigger=${trigger},uploaded=${outcome.uploaded.length},failed=${outcome.failed.length},unchanged=${outcome.skippedUnchanged},ignoredDirs=${outcome.skippedIgnored},hydrated=${hydrated},heartbeat=${outcome.heartbeatWritten}${
         outcome.skippedReason ? `,reason=${outcome.skippedReason}` : ''
@@ -2764,7 +2801,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     const t0 = Date.now();
     const system = await this.captureSystemLayer(bucket, prefix, t0);
     // B2: persistent refusals back interval captures off; transient failures retry next cycle.
-    if (system.skippedReason && SYSTEM_FLUSH_BACKOFF_REASONS.has(system.skippedReason)) {
+    if (system.ok) {
+      try { await this.ctx.storage.delete(SYSTEM_FLUSH_BACKOFF_AT_KEY); } catch { /* best effort */ }
+    } else if (system.skippedReason && SYSTEM_FLUSH_BACKOFF_REASONS.has(system.skippedReason)) {
       try { await this.ctx.storage.put(SYSTEM_FLUSH_BACKOFF_AT_KEY, Date.now()); } catch { /* next cycle retries */ }
     }
     await this.observePersistence({ kind: 'flush', layer: 'system', trigger, durationMs: Date.now() - t0, entries: system.entries,

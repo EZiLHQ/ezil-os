@@ -113,6 +113,10 @@ export interface PersistenceTrackerState {
   v: 1;
   system: LayerTrack;
   workspace: LayerTrack;
+  /** Deduplication follows confirmed spool writes, independently of live status. */
+  emitted: Record<PersistenceLayer, Pick<LayerTrack, 'site' | 'code'> | null>;
+  /** One retry batch only; a newer transition replaces it. */
+  pending: TelemetryEventInput[];
   /** Epoch ms of the last persistence event spooled (any site). */
   lastEventAt: number | null;
   lastStopDiscardedUnsaved: boolean;
@@ -120,7 +124,8 @@ export interface PersistenceTrackerState {
 
 export function emptyTrackerState(): PersistenceTrackerState {
   const layer = (): LayerTrack => ({ site: null, code: null, outcome: null, lastOkCommitAt: null, consecutiveFailures: 0 });
-  return { v: 1, system: layer(), workspace: layer(), lastEventAt: null, lastStopDiscardedUnsaved: false };
+  return { v: 1, system: layer(), workspace: layer(), emitted: { system: null, workspace: null }, pending: [],
+    lastEventAt: null, lastStopDiscardedUnsaved: false };
 }
 
 /** Accepts whatever DO storage returned; anything unrecognisable starts fresh. */
@@ -128,7 +133,40 @@ export function loadTrackerState(raw: unknown): PersistenceTrackerState {
   if (!raw || typeof raw !== 'object' || (raw as { v?: unknown }).v !== 1) return emptyTrackerState();
   const r = raw as PersistenceTrackerState;
   if (!r.system || !r.workspace) return emptyTrackerState();
+  // Older trackers recorded observations before R2 confirmed them. Do not
+  // assume those observations were emitted when upgrading an existing DO.
+  if (!r.emitted || !Array.isArray(r.pending)) {
+    return { ...r, emitted: { system: null, workspace: null }, pending: [], lastEventAt: null };
+  }
   return r;
+}
+
+function eventLayer(event: TelemetryEventInput): PersistenceLayer | undefined {
+  if (event.site === 'persist.system.flush' || event.site === 'persist.system.restore') return 'system';
+  if (event.site === 'persist.workspace.flush' || event.site === 'persist.workspace.restore') return 'workspace';
+  return undefined;
+}
+
+/** Apply only after a truthy spool result, to the latest stored operational state. */
+export function markEmitted(
+  state: PersistenceTrackerState, events: TelemetryEventInput[], now: number,
+): PersistenceTrackerState {
+  if (events.length === 0) return state;
+  const emitted = { ...state.emitted };
+  for (const event of events) {
+    const layer = eventLayer(event);
+    if (layer) emitted[layer] = { site: event.site as PersistenceSite, code: toPersistenceCode(event.code) };
+  }
+  // An observation while the PUT was in flight may have replaced the batch.
+  // Preserve newer transitions, but discard repeats of the confirmed state.
+  const confirmed = state.pending.every((event) => {
+    if (events.some((sent) => sent.eventId === event.eventId)) return true;
+    const layer = eventLayer(event);
+    const marker = layer ? emitted[layer] : null;
+    return !!marker?.code && marker.site === event.site && stateKey(marker.code) === stateKey(toPersistenceCode(event.code));
+  });
+  return { ...state, emitted, pending: confirmed ? [] : state.pending,
+    lastEventAt: Math.max(state.lastEventAt ?? now, now) };
 }
 
 export type PersistenceObservation =
@@ -203,7 +241,8 @@ function buildEvent(
 }
 
 /**
- * Contract §3. Returns the events to spool NOW and the next tracker state.
+ * Contract §3. Returns the pending events to spool and the next live state.
+ * Call markEmitted only after the spool confirms the write.
  * - flush/restore: emitted only when the layer's (site, state) changed;
  *   identical repeats — e.g. the failed-capture loop — are suppressed.
  * - stop / open_blocked: always emitted.
@@ -221,10 +260,15 @@ export function observe(
 
   if (obs.kind === 'flush' || obs.kind === 'restore') {
     const code = toPersistenceCode(obs.code);
-    if (TRANSIENT_CODES.has(code)) return { events, state: prev };
+    // The container was already hydrated: no restore occurred, and this must
+    // not overwrite its real restore outcome or break flush suppression.
+    if (obs.kind === 'restore' && code === 'already_restored') return { events, state: prev };
+    if (TRANSIENT_CODES.has(code)) return { events: prev.pending, state: prev };
     const site: PersistenceSite = `persist.${obs.layer}.${obs.kind}` as PersistenceSite;
     const track = prev[obs.layer];
-    const changed = track.site !== site || track.code === null || stateKey(track.code) !== stateKey(code);
+    const marker = prev.emitted[obs.layer];
+    const changed = marker?.site !== site || !marker.code || stateKey(marker.code) !== stateKey(code)
+      || (prev.pending.length > 0 && (track.site !== site || !track.code || stateKey(track.code) !== stateKey(code)));
     const outcome = outcomeOf(code);
     const nextTrack: LayerTrack = {
       site, code, outcome,
@@ -249,13 +293,14 @@ export function observe(
   } else if (obs.kind === 'open_blocked') {
     events.push(buildEvent('persist.open_blocked', obs.code, state, now, ctx, { trigger: 'open' }));
   } else if (obs.kind === 'heartbeat') {
-    if (obs.running && (state.lastEventAt === null || now - state.lastEventAt >= PERSISTENCE_HEARTBEAT_MS)) {
+    if (obs.running && state.pending.length === 0
+        && (state.lastEventAt === null || now - state.lastEventAt >= PERSISTENCE_HEARTBEAT_MS)) {
       events.push(buildEvent('persist.heartbeat', worstCode(state), state, now, ctx, { trigger: 'heartbeat' }));
     }
   }
 
-  if (events.length > 0 && state.lastEventAt !== now) state = { ...state, lastEventAt: now };
-  return { events, state };
+  if (events.length > 0) state = { ...state, pending: events };
+  return { events: state.pending, state };
 }
 
 export interface PersistenceLayerStatus {
