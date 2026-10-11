@@ -25,6 +25,7 @@ import {
     phaseVisualState,
 } from './boot-phases.shell.js';
 import * as ported from './boot-phases.shell.js';
+import * as shipped from '../../../../shell/ezil/boot-phases.js';
 
 type BootProgressState = original.BootProgressState;
 
@@ -238,6 +239,8 @@ describe('computeBootUiState — never fabricates progress', () => {
             'timeout',
             'unknown',
             'worker_unreachable',
+            'workspace_checkpoint_failed',
+            'workspace_persistence_unavailable',
         ]);
     });
 });
@@ -401,6 +404,8 @@ describe('the port is a module-format conversion and nothing more', () => {
         'fetch_failed',
         'sandbox_runtime_blocked',
         'sandbox_start_failed',
+        'workspace_persistence_unavailable',
+        'workspace_checkpoint_failed',
         'sandbox_starting',
         'worker_http_error',
         'desktop_unreachable',
@@ -414,6 +419,13 @@ describe('the port is a module-format conversion and nothing more', () => {
 
     it('exports exactly the same names', () => {
         expect(Object.keys(ported).sort()).toEqual(Object.keys(original).sort());
+    });
+
+    it('ships the same module through the shell adoption seam', () => {
+        expect(Object.keys(shipped).sort()).toEqual(Object.keys(ported).sort());
+        for (const name of Object.keys(ported) as (keyof typeof ported)[]) {
+            expect(shipped[name]).toBe(ported[name]);
+        }
     });
 
     it('agrees on every constant and every user-facing string', () => {

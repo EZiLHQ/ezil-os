@@ -6,6 +6,7 @@ import { handleTelemetryPost, type TelemetryRequestContext } from './http-handle
 import { resetLoadShedCacheForTests, setLoadShedCacheForTests, SHED_ABOVE_ROWS } from './load-shed';
 import { resetRateLimitForTests } from './rate-limit';
 import { TELEMETRY_LIMITS } from './types';
+import * as telemetrySchema from './schema';
 
 function validEvent(id = '550e8400-e29b-41d4-a716-446655440000') {
     return {
@@ -89,6 +90,51 @@ describe('handleTelemetryPost: the guarantee — always 202, nothing to branch o
         const res = await handleTelemetryPost(req, { getContext: async () => ({ user: AUTH_USER, db }), schedule });
         expect(res.status).toBe(202);
         expect(schedule).not.toHaveBeenCalled();
+    });
+
+    it.each(['worker', 'app', 'container'])('drops an authenticated batch claiming source %s', async (source) => {
+        const { db, statements } = makeDb();
+        const schedule = vi.fn();
+        const res = await handleTelemetryPost(
+            jsonRequest({ schemaVersion: 1, events: [{ ...validEvent(), source }] }),
+            { getContext: async () => ({ user: AUTH_USER, db }), schedule },
+        );
+        expect(res.status).toBe(202);
+        expect(schedule).not.toHaveBeenCalled();
+        expect(statements).toHaveLength(0);
+    });
+
+    it('counts spoofed persistence events as dropped and still ingests shell siblings', async () => {
+        setLoadShedCacheForTests(0);
+        const { db, statements } = makeDb();
+        const schedule = vi.fn();
+        const parse = vi.spyOn(telemetrySchema, 'parseTelemetryBatch');
+        const shellEvent = { ...validEvent(), eventClass: 'persistence', site: 'persist.shell_seen', code: 'failed' };
+        const spoofed = ['worker', 'app', 'container'].map((source, i) => ({
+            ...validEvent(`550e8400-e29b-41d4-a716-44665544000${i + 1}`),
+            eventClass: 'persistence', source, site: 'persist.workspace.flush', code: 'ok', outcome: 'ok',
+            computerId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        }));
+        try {
+            const res = await handleTelemetryPost(
+                jsonRequest({ schemaVersion: 1, events: [shellEvent, ...spoofed, { ...validEvent(), source: 'invalid' }] }),
+                { getContext: async () => ({ user: AUTH_USER, db }), schedule },
+            );
+            expect(res.status).toBe(202);
+            expect(parse.mock.results[0]!.value.droppedInvalid).toBe(4);
+            expect(schedule).toHaveBeenCalledTimes(1);
+            expect(statements).toHaveLength(0);
+            await schedule.mock.calls[0]![0]!();
+            const insert = statements.find((s) => /insert into "ezil_error_events"/i.test(s.sql))!;
+            expect(insert.params).toContain(shellEvent.eventId);
+            expect(insert.params).toContain('shell');
+            for (const event of spoofed) {
+                expect(insert.params).not.toContain(event.eventId);
+                expect(insert.params).not.toContain(event.source);
+            }
+        } finally {
+            parse.mockRestore();
+        }
     });
 
     it('a batch of entirely invalid events (e.g. one smuggling userId) -> 202, nothing scheduled', async () => {

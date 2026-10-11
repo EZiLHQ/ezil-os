@@ -238,6 +238,8 @@ export type BootFailureReason =
     | 'sandbox_crashed'
     | 'desktop_unreachable'
     | 'display_not_streaming'
+    | 'workspace_persistence_unavailable'
+    | 'workspace_checkpoint_failed'
     | 'timeout'
     | 'unknown';
 
@@ -301,6 +303,8 @@ export type BootErrorCode =
     | 'fetch_failed'
     | 'sandbox_runtime_blocked'
     | 'sandbox_start_failed'
+    | 'workspace_persistence_unavailable'
+    | 'workspace_checkpoint_failed'
     | 'sandbox_starting'
     | 'worker_http_error'
     | 'desktop_unreachable'
@@ -325,6 +329,7 @@ const DETERMINISTIC_BOOT_ERROR_CODES: readonly string[] = [
     'preconditions_unmet',
     'custom_domain_required',
     'sandbox_runtime_blocked',
+    'workspace_persistence_unavailable',
 ];
 
 /**
@@ -394,6 +399,9 @@ function classifyFailure(errorCode: BootErrorCode | undefined): BootFailureReaso
             return 'sandbox_crashed';
         case 'desktop_unreachable':
             return 'desktop_unreachable';
+        case 'workspace_persistence_unavailable':
+        case 'workspace_checkpoint_failed':
+            return errorCode;
         // `sandbox_starting` is the server saying "still waking, ask again" —
         // it is normally consumed as PROGRESS by the caller's wake loop and
         // never reaches here at all. It only lands in this switch when that
@@ -598,6 +606,14 @@ export interface BootFailureCopy {
 }
 
 export const BOOT_FAILURE_COPY: Record<BootFailureReason, BootFailureCopy> = {
+    workspace_persistence_unavailable: {
+        title: 'Workspace saving is unavailable',
+        body: 'Workspace saving is unavailable. Please contact support before reopening your computer.',
+    },
+    workspace_checkpoint_failed: {
+        title: 'Your workspace could not be saved',
+        body: 'Your workspace could not be saved. Please try opening your computer again.',
+    },
     worker_unreachable: {
         title: "Can't reach your computer",
         body: "The service that runs your computer isn't responding right now. This is usually temporary — try again in a moment.",

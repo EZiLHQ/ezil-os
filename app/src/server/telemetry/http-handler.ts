@@ -101,6 +101,13 @@ export async function handleTelemetryPost(req: Request, deps: TelemetryHandlerDe
         }
 
         const batch = parseTelemetryBatch(parsedJson);
+        // This authenticated browser route cannot establish Worker/container
+        // provenance, even when the caller owns the named computer.
+        batch.events = batch.events.filter((event) => {
+            if (event.source === 'shell') return true;
+            batch.droppedInvalid++;
+            return false;
+        });
         if (batch.events.length === 0) return ACCEPTED();
 
         // user_hash is derived HERE, server-side, from the authenticated
