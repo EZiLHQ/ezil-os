@@ -95,3 +95,63 @@ type PersistenceStatus = {
 **Shell:** while a computer is open, the shell polls this no faster than every 60 s.
 - When `savingPaused` is true, it shows one line: "Saving is paused: your home folder is over the 512 MB limit" (`system`/`too_large`), or the workspace equivalent. "stale" and "not_restored" say that saving stopped and that reopening the computer restores it.
 - It relays a `persistence` event through the authenticated `POST /api/shell/telemetry` on each change of `pausedReason`, with site `persist.shell_seen` and the code being the reason (or `ok` when cleared). That makes broken saving visible within seconds for anyone who has the computer open, without waiting for the daily spool drain.
+
+## 6. Switch-off guarantee (power cut)
+
+A computer must behave like a machine with a disk. Pull the plug with no
+warning, no SIGTERM and no final save. Switch it on again, and everything that
+was finished on disk is back.
+
+Cloudflare containers have no persistent disk. "On disk" therefore means
+"committed to R2", and the guarantee is time-bounded:
+
+> **Anything finished at least 90 s before a sudden switch-off is restored**
+> on the next start. That covers `/workspace`, files and installs under HOME,
+> npm -g, apt, `/opt`, dotfiles and the editor's settings backup.
+> Dependency trees that restore-deps rebuilds come back through restore-deps.
+
+### Mechanism
+
+**Workspace.** Each 10–60 s cycle uploads a changed workspace at most every 60 s.
+This is unchanged.
+
+**System layer, dirty-triggered capture.** This replaces "every 5 min only".
+
+**Probe.** The new codec op is `sys-dirty`. It answers whether any entry under the system ROOTS (minus EXCLUDE and regenerable project trees) has an mtime newer than `/var/lib/ezil-system/capture-started`.
+- Directories count, because creating or deleting a file bumps its directory's mtime.
+- It stops at the first hit.
+- It prints `{"dirty": true|false}` and exits 0.
+- A missing marker means dirty.
+- Cost on the real image: about 0.2–0.4 s warm, about 4 s for the first cold walk.
+
+**Marker.** `sys-capture` touches `capture-started` *before* its walk. A change made during a capture is therefore seen as dirty by the next probe.
+
+**Durable Object.** On each flush cycle, if at least `SYSTEM_DIRTY_PROBE_MS` (15 s) has passed since the last probe, it runs `sys-dirty`.
+- If the layer is dirty and at least `SYSTEM_DIRTY_MIN_GAP_MS` (20 s) has passed since the last system capture, and B2 backoff is not active, it runs an interval system capture now.
+- The 5-min periodic capture stays as a backstop.
+- Final captures (idle-stop, teardown, readiness) are unchanged.
+
+**Power cut (staging acceptance only).** The new acceptance fault is `power_cut`. It exists only in the scoped staging acceptance sandbox, like the existing faults. It destroys the running container at once:
+- no final flush;
+- no idle-stop path;
+- no SIGTERM handling relied on.
+
+The next open must hydrate from R2.
+
+### Tests that prove it (all required)
+
+1. **Worker unit, with a fake clock and container.**
+   - A change, then cycles, then a capture happens within 90 s.
+   - A clean probe means no capture.
+   - B2 backoff is respected.
+   - After a power cut (container gone, no final flush), hydrate restores the last commit.
+2. **Container suite, real image, `docker kill -s KILL`.**
+   - Install tools, a HOME project with a lockfile, dotfiles, and workspace and editor files.
+   - Probe returns dirty, then capture, then the power cut.
+   - A fresh container restores, then restore-deps runs.
+   - Checksums match, `command -v opencode` resolves, and `next` resolves.
+   - Work done *after* the last capture is reported dirty and is lost, which documents the RPO.
+3. **Staging (real Cloudflare), `e2e/hosted-home-persistence.mjs`.**
+   - Install with the official OpenCode installer, create a Next.js project in HOME, edit dotfiles.
+   - Wait at least 90 s, then `power_cut`, then reopen.
+   - Checksums and the commands must still work.
