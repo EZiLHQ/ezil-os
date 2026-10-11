@@ -1,10 +1,12 @@
 -- Persistence signal contract §1–2. Same query as persistenceHealth().
 -- Run: python3 .ci-support/supabase-sql.py query --project <ref> --file docs/sql/persistence-health.pgsql (the helper supplies the read-only transaction).
 -- Deliberately .pgsql, not .sql: every *.sql in this repo must be a registered production migration (.github/scripts/production-migrations.mjs).
--- The seven-day window is based on receipt time; ordering, activity, and
--- elapsed ages use occurrence time so delayed delivery cannot refresh them.
--- Both ages use the latest worker event with an age attr; missing/-1 is unknown.
--- Staleness uses the latest persistence event; a latest persist.stop is exempt.
+-- The seven-day window is based on receipt time; ordering uses occurrence time.
+-- Both ages are the latest worker event's own attrs at lastWorkerEventAt;
+-- missing/-1 is unknown. Daily drain lag never increases ages or flags health.
+-- Flag pause codes, system age > 1800 unless the latest worker event is a stop,
+-- the latest shell pause report, or a latest worker event of persist.open_blocked.
+-- Keep the latest blocked-open metadata after recovery. Heartbeat time is display-only.
 -- Only MD5 prefixes leave SQL.
 
 WITH clock AS (
@@ -18,15 +20,15 @@ WITH clock AS (
     AND  e.received_at >= c.at - interval '7 days'
     AND  e.received_at <= c.at
 ), latest AS (
-  SELECT DISTINCT ON (computer_id) computer_id, attrs, occurred_at
+  SELECT DISTINCT ON (computer_id) computer_id, site, attrs, occurred_at
   FROM   recent
   WHERE  source = 'worker'
     AND  site <> 'persist.shell_seen'
-    AND  (attrs ? 'system_age_s' OR attrs ? 'workspace_age_s')
   ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
-), latest_events AS (
-  SELECT DISTINCT ON (computer_id) computer_id, site
+), shell_events AS (
+  SELECT DISTINCT ON (computer_id) computer_id, code
   FROM   recent
+  WHERE  source = 'shell' AND site = 'persist.shell_seen'
   ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
 ), restores AS (
   SELECT DISTINCT ON (computer_id) computer_id,
@@ -45,6 +47,11 @@ WITH clock AS (
   FROM   recent
   WHERE  site IN ('persist.workspace.flush', 'persist.workspace.restore')
   ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
+), open_blocked_events AS (
+  SELECT DISTINCT ON (computer_id) computer_id, code, occurred_at
+  FROM   recent
+  WHERE  source = 'worker' AND site = 'persist.open_blocked'
+  ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
 ), totals AS (
   SELECT computer_id,
          count(*) FILTER (WHERE site = 'persist.stop'
@@ -56,35 +63,34 @@ WITH clock AS (
 ), health AS (
   SELECT left(md5(t.computer_id::text), 8) AS "computerShort",
          r.restore AS "lastRestore",
+         ob.occurred_at AS "openBlockedAt", ob.code AS "openBlockedCode",
          s.code AS "systemCode", w.code AS "workspaceCode",
          CASE WHEN jsonb_typeof(l.attrs -> 'system_age_s') = 'number'
               THEN nullif((l.attrs ->> 'system_age_s')::double precision, -1)
-                   + extract(epoch FROM (c.at - l.occurred_at))::double precision
          END AS "systemOkAgeS",
          CASE WHEN jsonb_typeof(l.attrs -> 'workspace_age_s') = 'number'
               THEN nullif((l.attrs ->> 'workspace_age_s')::double precision, -1)
-                   + extract(epoch FROM (c.at - l.occurred_at))::double precision
          END AS "workspaceOkAgeS",
          t.discarded AS "discardedUnsaved",
          t.heartbeat_at AS "lastHeartbeatAt", t.seen_at AS "lastSeenAt",
-         e.site AS "lastEventSite"
+         l.occurred_at AS "lastWorkerEventAt",
+         l.site AS "lastWorkerEventSite", sh.code AS "shellCode"
   FROM   totals t
-  JOIN   latest_events e USING (computer_id)
   LEFT   JOIN latest l USING (computer_id)
+  LEFT   JOIN shell_events sh USING (computer_id)
   LEFT   JOIN restores r USING (computer_id)
   LEFT   JOIN system_events s USING (computer_id)
   LEFT   JOIN workspace_events w USING (computer_id)
-  CROSS  JOIN clock c
+  LEFT   JOIN open_blocked_events ob USING (computer_id)
 )
 SELECT h."computerShort", h."lastRestore", h."systemCode", h."workspaceCode",
+       h."openBlockedAt", h."openBlockedCode",
        h."systemOkAgeS", h."workspaceOkAgeS", h."discardedUnsaved",
-       h."lastHeartbeatAt", h."lastSeenAt",
+       h."lastHeartbeatAt", h."lastSeenAt", h."lastWorkerEventAt",
        coalesce("systemCode" IN ('too_large', 'stale', 'not_restored'), false)
        OR coalesce("workspaceCode" IN ('too_large', 'stale', 'not_restored'), false)
-       OR coalesce("lastSeenAt" >= c.at - interval '30 minutes'
-                   AND "systemOkAgeS" > 1800, false)
-       OR coalesce("lastSeenAt" < c.at - interval '30 minutes'
-                   AND "lastEventSite" <> 'persist.stop'
-                   AND "lastSeenAt" >= c.at - interval '2 hours', false) AS flagged
-FROM   health h CROSS JOIN clock c
+       OR coalesce("lastWorkerEventSite" <> 'persist.stop' AND "systemOkAgeS" > 1800, false)
+       OR coalesce("lastWorkerEventSite" = 'persist.open_blocked', false)
+       OR coalesce("shellCode" IN ('too_large', 'stale', 'not_restored'), false) AS flagged
+FROM   health h
 ORDER  BY flagged DESC, "lastSeenAt" DESC, "computerShort";
