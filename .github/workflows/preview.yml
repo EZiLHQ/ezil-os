@@ -464,6 +464,33 @@ jobs:
           EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
         run: node e2e/hosted-continuity.mjs
+      # Staging-only regression for HOME persistence across container
+      # replacement (OpenCode, a Next.js project in ~/, dotfiles). The script
+      # refuses os.ezil.org and every *.ezil.org target before any browser launch.
+      - name: Hosted HOME persistence acceptance
+        if: needs.trust.outputs.manual_preview != 'true'
+        # NOT a release gate yet: the `production` job needs this job, and this suite
+        # has never run on staging. Its result is visible (step + evidence artifact);
+        # making it blocking is the founder's decision once it has passed here.
+        continue-on-error: true
+        timeout-minutes: 45
+        env:
+          EZIL_CONTINUITY_MODE: ${{ needs.trust.outputs.production == 'true' && 'full' || 'short' }}
+          EZIL_ACCEPTANCE_HMAC_SECRET: ${{ secrets.EZIL_ACCEPTANCE_HMAC_SECRET }}
+          EZIL_E2E_COMPUTER_ID: ${{ secrets.EZIL_E2E_COMPUTER_ID }}
+          EZIL_E2E_WORKSPACE_PATH: ${{ vars.EZIL_E2E_WORKSPACE_PATH }}
+          EZIL_WRANGLER_BIN: ./worker/node_modules/.bin/wrangler
+          EZIL_E2E_R2_BUCKET: ${{ vars.EZIL_E2E_R2_BUCKET }}
+          EZIL_E2E_R2_PREFIX: ${{ secrets.EZIL_E2E_R2_PREFIX }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          EZIL_E2E_EMAIL: ${{ secrets.EZIL_E2E_EMAIL }}
+          EZIL_E2E_PASSWORD: ${{ secrets.EZIL_E2E_PASSWORD }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+        run: node e2e/hosted-home-persistence.mjs
       - name: Confirm deployment identity after tests
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -489,6 +516,13 @@ jobs:
           name: hosted-continuity-${{ needs.trust.outputs.sha }}-${{ github.run_attempt }}
           path: hosted-continuity-evidence/
           if-no-files-found: error
+      - name: Upload hosted HOME persistence evidence
+        if: always() && needs.trust.outputs.manual_preview != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-home-persistence-${{ needs.trust.outputs.sha }}-${{ github.run_attempt }}
+          path: hosted-home-persistence-evidence/
+          if-no-files-found: warn
       - name: Release shared staging lease
         if: always() && steps.lease.outcome == 'success'
         env:
