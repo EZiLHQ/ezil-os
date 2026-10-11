@@ -129,6 +129,28 @@ export function stepCommand(nonce, body) {
   return `bash -c "$(echo ${encoded} | base64 -d | gzip -dc)"`;
 }
 
+/**
+ * Longest line ever typed into the hosted terminal. Staging (2026-10-11) showed a
+ * 605-char line verified and an 853-char one never did: xterm's accessibility rows
+ * do not reliably expose the tail of a long wrapped input line. Every typed line
+ * stays well under the proven length.
+ */
+export const MAX_TYPED_LINE = 480;
+const STEP_CHUNK = 400;
+
+/** The lines to type for one step: one line when short, else base64 chunks into a file. */
+export function stepLines(nonce, body) {
+  const single = stepCommand(nonce, body);
+  if (single.length <= MAX_TYPED_LINE) return [single];
+  const script = `${PRELUDE(nonce)}\n${body}\n`;
+  const encoded = gzipSync(Buffer.from(script)).toString('base64');
+  const file = `/tmp/ezq-step-${assertNonce(nonce)}.b64`;
+  const lines = [`: > ${file}`];
+  for (let i = 0; i < encoded.length; i += STEP_CHUNK) lines.push(`printf %s '${encoded.slice(i, i + STEP_CHUNK)}' >> ${file}`);
+  lines.push(`bash -c "$(base64 -d ${file} | gzip -dc)"; rm -f ${file}`);
+  return lines;
+}
+
 const PAYLOAD = '[A-Za-z0-9=,._+/-]*';
 /** Last complete marker for this nonce in terminal text; soft wraps are removed. */
 export function readMarker(text, nonce) {
@@ -668,14 +690,16 @@ async function main() {
   const runStep = async (name, body, timeoutMs) => {
     evidence.operation = `step ${name}`;
     const nonce = newNonce();
-    const line = stepCommand(nonce, body);
     stepInFlight = true;
-    // Ordinary keyboard input, as hosted-continuity types into xterm.
-    await terminalInput().pressSequentially(line, { delay: 10, timeout: 120000 });
-    await bounded(`step ${name} typed`, async () => {
-      try { return (await terminalText()).replace(/\s/g, '').includes(line.slice(-80).replace(/\s/g, '')); } catch { return false; }
-    }, 15000);
-    await terminalInput().press('Enter');
+    // Ordinary keyboard input, as hosted-continuity types into xterm, in lines
+    // short enough for the terminal's accessibility rows to show in full.
+    for (const line of stepLines(nonce, body)) {
+      await terminalInput().pressSequentially(line, { delay: 10, timeout: 120000 });
+      await bounded(`step ${name} typed`, async () => {
+        try { return (await terminalText()).replace(/\s/g, '').includes(line.slice(-80).replace(/\s/g, '')); } catch { return false; }
+      }, 15000);
+      await terminalInput().press('Enter');
+    }
     const payload = await bounded(`step ${name} result`, async () => {
       try { return readMarker(await terminalText(), nonce); } catch { return null; }
     }, timeoutMs);

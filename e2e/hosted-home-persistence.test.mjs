@@ -12,7 +12,7 @@ import { createHmac } from 'node:crypto';
 import { runInNewContext } from 'node:vm';
 import {
   assertStagingTarget, TargetRefused, PRODUCTION_HOSTS, assertRunId, newRunId, newNonce, runPaths, checksumTargets,
-  stepCommand, readMarker, parseFields, probeScript, parseProbe, checksumScript, parseChecksums, compareChecksums,
+  stepCommand, stepLines, MAX_TYPED_LINE, readMarker, parseFields, probeScript, parseProbe, checksumScript, parseChecksums, compareChecksums,
   opencodeInstallScript, parseOpencodeInstall, projectScript, depsWaitScript, parseDepsStatus, parseDepsWait,
   depsWaitOutcome, projectDepsState, devServerScript, parseDevServer, cleanupPlan, cleanupScript, parseCleanup,
   EVIDENCE_FILE, clampWait, RUN_BUDGET_MS, CLEANUP_RESERVE_MS, POWER_CUT_RPO_MS, powerCutAfterRpo,
@@ -79,7 +79,7 @@ test('runStep retries terminal read errors during both typed and result checks',
   const runStepSource = source.match(/  const runStep = async \(name, body, timeoutMs\) => \{[\s\S]*?\n  \};/)[0];
   let line, reads = 0, enters = 0;
   const nonce = 'a'.repeat(24);
-  const context = { evidence: {}, stepInFlight: false, newNonce: () => nonce, stepCommand, readMarker, parseFields,
+  const context = { evidence: {}, stepInFlight: false, newNonce: () => nonce, stepCommand, stepLines, readMarker, parseFields,
     terminalInput: () => ({ pressSequentially: async value => { line = value; }, press: async key => { assert.equal(key, 'Enter'); enters++; } }),
     terminalText: async () => {
       reads++;
@@ -523,4 +523,27 @@ test('waits before cleanup end inside the CI step budget; cleanup itself is neve
   assert.equal(clampWait(60000, { now: workEnd, started }), 0);
   assert.equal(clampWait(60000, { now: workEnd + 1, started }), 0);
   assert.equal(clampWait(120000, { now: workEnd + 600000, started, cleanup: true }), 120000);
+});
+
+test('long steps are typed as short chunks that rebuild and run the same script', () => {
+  const nonce = 'b'.repeat(24);
+  const home = mkdtempSync(join(tmpdir(), 'ezq-chunk-'));
+  // Incompressible payload, so the encoded step really exceeds one typed line.
+  const noise = Array.from({ length: 1500 }, (_, i) => ((i * 2654435761) >>> 0).toString(36)).join('').slice(0, 2000);
+  const body = `# ${noise}\nemit "x=$(printf %s '${'y'.repeat(2000)}' | wc -c)"`;
+  const lines = stepLines(nonce, body);
+  assert.ok(lines.length > 2, 'a long step is chunked');
+  for (const line of lines) assert.ok(line.length <= MAX_TYPED_LINE, `typed line ${line.length} > ${MAX_TYPED_LINE}`);
+  const out = spawnSync('bash', ['-c', lines.join('\n')], { env: { PATH: process.env.PATH, HOME: home }, encoding: 'utf8', timeout: 30000 });
+  assert.equal(out.status, 0, out.stderr);
+  assert.deepEqual(parseFields(readMarker(out.stdout, nonce)), { x: '2000' });
+  assert.deepEqual(stepLines(nonce, 'emit "x=1"'), [stepCommand(nonce, 'emit "x=1"')]);
+  rmSync(home, { recursive: true, force: true });
+});
+
+test('every real hosted step types only lines within the proven length', () => {
+  const id = newRunId(), nonce = 'c'.repeat(24);
+  for (const body of [probeScript(id), opencodeInstallScript(id), projectScript(id), checksumScript(id, { sentinel: 'write' })]) {
+    for (const line of stepLines(nonce, body)) assert.ok(line.length <= MAX_TYPED_LINE);
+  }
 });
