@@ -585,3 +585,9 @@ test('acknowledged chunks rebuild and run the same script in a real shell', () =
   assert.deepEqual(parseFields(readMarker(out.stdout, nonce)), { x: '2000' });
   rmSync(home, { recursive: true, force: true });
 });
+
+test('interactive-shell checks run in their own session so they cannot seize the hosted terminal', () => {
+  const body = opencodeCheckScript();
+  assert.equal((body.match(/bash -ic/g) ?? []).length, (body.match(/setsid -w bash -ic/g) ?? []).length);
+  assert.ok(/setsid -w bash -ic 'command -v opencode'/.test(body) && /setsid -w bash -ic 'opencode --version'/.test(body));
+});

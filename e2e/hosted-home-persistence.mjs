@@ -380,11 +380,14 @@ export function compareChecksums(before, after) {
 export function opencodeCheckScript() {
   return [
     'H="$HOME"',
-    // An interactive bash reads ~/.bashrc, exactly as a new terminal would.
-    "p=$(timeout 60 bash -ic 'command -v opencode' 2>/dev/null < /dev/null | tail -n 1)",
+    // An interactive bash reads ~/.bashrc, exactly as a new terminal would. setsid gives it
+    // its own session: run inside the hosted terminal, a bare 'bash -ic' takes over the
+    // terminal's foreground group and the rest of this step is stopped (SIGTTOU/SIGTTIN)
+    // before it can print its marker (reproduced locally on code-server).
+    "p=$(timeout 60 setsid -w bash -ic 'command -v opencode' 2>/dev/null < /dev/null | tail -n 1)",
     'resolved=0; [ -n "$p" ] && resolved=1',
     'inhome=0; [ "$p" = "$H/.opencode/bin/opencode" ] && inhome=1',
-    "timeout 120 bash -ic 'opencode --version' > /dev/null 2>&1 < /dev/null; vrc=$?",
+    "timeout 120 setsid -w bash -ic 'opencode --version' > /dev/null 2>&1 < /dev/null; vrc=$?",
     'emit "resolved=$resolved,inhome=$inhome,vrc=$vrc"',
   ].join('\n');
 }
