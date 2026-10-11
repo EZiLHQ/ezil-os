@@ -436,6 +436,8 @@ export interface PersistenceHealthRow {
 /**
  * Persistence contract §1–2: one row per attributed computer, never user IDs.
  * The retention window uses received_at, like the other telemetry queries.
+ * Shell transitions use receipt order so browser clock skew cannot pin state;
+ * worker events retain occurrence order across delayed spool drains.
  * Both ages are the latest worker event's own attrs AT EVENT TIME, displayed
  * alongside lastWorkerEventAt; missing/-1 means unknown, with no fallback.
  * Daily drain lag is not evidence of stale saving. Flag pause codes, a system
@@ -471,7 +473,7 @@ export async function persistenceHealth(
           SELECT DISTINCT ON (computer_id) computer_id, code
           FROM   recent
           WHERE  source = 'shell' AND site = 'persist.shell_seen'
-          ORDER  BY computer_id, occurred_at DESC, received_at DESC, event_id DESC
+          ORDER  BY computer_id, received_at DESC, event_id DESC
         ), restores AS (
           SELECT DISTINCT ON (computer_id) computer_id,
                  jsonb_build_object('site', site, 'code', code,

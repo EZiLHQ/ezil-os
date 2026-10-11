@@ -101,9 +101,12 @@ export default async function TelemetryAdminPage({
                 <section>
                     <h2 className="text-base font-semibold">Persistence health</h2>
                     <p className="mt-1 text-xs text-offwhite/50">
-                        Computers reporting in the last 7 days, flagged first. Flags indicate a blocked save,
-                        a system commit over 30 minutes old on a recently seen computer, or a heartbeat
-                        over 30 minutes old on a computer seen within 2 hours. Ages are in seconds;
+                        Computers reporting in the last 7 days, flagged first. Flags indicate a latest system
+                        or workspace code of too_large, stale, or not_restored; a system commit age reported
+                        as over 30 minutes at the latest worker event, unless that event is persist.stop;
+                        a latest worker event of persist.open_blocked; or a latest shell report with one of
+                        those pause codes. Heartbeat age is informational: worker events arrive through an
+                        approximately daily drain. Commit ages are in seconds, as reported at event time;
                         — means unknown. Computer labels are MD5 prefixes.
                     </p>
                     {persistence.length === 0 ? (

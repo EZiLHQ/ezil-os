@@ -64,10 +64,11 @@ describe('persistenceHealth', () => {
         expect(query).not.toMatch(/SELECT (?:e\.|t\.|l\.)?\*/);
     });
 
-    it('uses occurrence order with stable receipt/event tie breakers for all latest event selections', async () => {
+    it('uses occurrence order for worker selections and receipt order for shell transitions', async () => {
         const query = await generatedSql();
         expect(query.match(/SELECT DISTINCT ON \(computer_id\)/g)).toHaveLength(6);
-        expect(query.match(/ORDER BY computer_id, occurred_at DESC, received_at DESC, event_id DESC/g)).toHaveLength(6);
+        expect(query.match(/ORDER BY computer_id, occurred_at DESC, received_at DESC, event_id DESC/g)).toHaveLength(5);
+        expect(query.match(/ORDER BY computer_id, received_at DESC, event_id DESC/g)).toHaveLength(1);
         expect(query).toContain("WHERE site IN ('persist.system.restore', 'persist.workspace.restore')");
         expect(query).toContain("jsonb_build_object('site', site, 'code', code, 'outcome', outcome, 'at', occurred_at)");
         expect(query).toContain("WHERE site IN ('persist.system.flush', 'persist.system.restore')");
@@ -167,7 +168,7 @@ describe('persistenceHealth', () => {
         expect(shellEvents.trim()).toBe(
             'SELECT DISTINCT ON (computer_id) computer_id, code FROM recent ' +
             "WHERE source = 'shell' AND site = 'persist.shell_seen' " +
-            'ORDER BY computer_id, occurred_at DESC, received_at DESC, event_id DESC',
+            'ORDER BY computer_id, received_at DESC, event_id DESC',
         );
         expect(query).toContain('LEFT JOIN shell_events sh USING (computer_id)');
         expect(query).toContain('l.site AS "lastWorkerEventSite", sh.code AS "shellCode"');
@@ -177,6 +178,38 @@ describe('persistenceHealth', () => {
         expect(finalFields).not.toContain('lastWorkerEventSite');
         expect(finalFields).not.toContain('shellCode');
         expect(finalFields).not.toContain('*');
+    });
+
+    it.each([
+        ['too_large', 'ok'],
+        ['ok', 'stale'],
+    ])('does not let a future-dated shell %s report pin a later %s transition', async (previousCode, latestCode) => {
+        const query = await generatedSql();
+        const shellEvents = query.split('shell_events AS ( ')[1]!.split('), restores AS (')[0]!;
+        const events = [
+            { event_id: '003', occurred_at: '2099-01-01T00:00:00Z', received_at: '2026-10-11T10:00:00Z', code: previousCode },
+            { event_id: '001', occurred_at: '2100-01-01T00:00:00Z', received_at: '2026-10-11T11:00:00Z', code: previousCode },
+            { event_id: '002', occurred_at: '2026-10-11T11:00:00Z', received_at: '2026-10-11T11:00:00Z', code: latestCode },
+        ];
+        // Exercise the actual generated ordering against skewed-clock fixtures
+        // for one computer, including equal receipt times. This pg-proxy suite
+        // does not execute the full query against Postgres.
+        type OrderColumn = 'occurred_at' | 'received_at' | 'event_id';
+        const ordering = shellEvents.split('ORDER BY computer_id, ')[1]!.trim().split(', ').map(term => {
+            const [column, direction] = term.split(' ');
+            expect(['occurred_at', 'received_at', 'event_id']).toContain(column);
+            expect(['ASC', 'DESC']).toContain(direction);
+            return { column: column as OrderColumn, descending: direction === 'DESC' };
+        });
+        events.sort((a, b) => {
+            for (const { column, descending } of ordering) {
+                const comparison = a[column].localeCompare(b[column]);
+                if (comparison !== 0) return descending ? -comparison : comparison;
+            }
+            return 0;
+        });
+        expect(events[0]!.code).toBe(latestCode);
+        expect(events[0]!.event_id).toBe('002');
     });
 
     it('preserves the typed driver result, including null metadata, zero ages and counts', async () => {
