@@ -74,9 +74,12 @@ describe('🔴 no surface consults an allow-list', () => {
 });
 
 describe('/login never redirects, so nothing can loop through it', () => {
-    it('/ sends a signed-in visitor to /os and everyone else to /login', () => {
-        // Also pinned by `../page-entry.test.ts`.
-        expect(code(rootPage)).toMatch(/redirect\(user \? Routes\.OS : Routes\.LOGIN\)/);
+    it('/ keeps signed-in OS entry and gates the anonymous home page', () => {
+        // Both flag states and signed-in cases are exercised by `../page-entry.test.ts`.
+        expect(code(rootPage)).toMatch(/if \(user\) redirect\(Routes\.OS\)/);
+        expect(code(rootPage)).toMatch(/const config = readBillingConfig\(\)/);
+        expect(code(rootPage)).toMatch(/if \(!config\.pricingPageEnabled\) redirect\(Routes\.LOGIN\)/);
+        expect(code(rootPage)).toMatch(/return <MarketingHome/);
     });
 
     it('/login performs no redirect of its own', () => {

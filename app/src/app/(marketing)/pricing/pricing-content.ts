@@ -5,31 +5,23 @@ interface PricingLink {
     href: string;
 }
 
-interface PricingRow {
+interface Allowance {
+    id: 'workspace' | 'storage' | 'ai';
     label: string;
     value: string;
-    note?: string;
+    unit: string;
+    caption: string;
 }
 
 interface PricingPlan {
     id: 'free' | 'pro';
     name: string;
     price: string;
-    billingNote?: string;
-    description: string;
-    rows: readonly PricingRow[];
-    sharedNote: string;
+    interval: string;
+    billingNote: string;
+    badge?: string;
+    allowances: readonly Allowance[];
     cta: PricingLink;
-    ctaNote?: string;
-}
-
-interface PricingContent {
-    hero: { title: string; description: string };
-    plansLabel: string;
-    plans: readonly [PricingPlan, PricingPlan];
-    topUps: { title: string; packs: readonly string[]; note: string };
-    limits: { title: string; rows: readonly PricingRow[] };
-    faq: { title: string; items: readonly { question: string; answer: string }[] };
 }
 
 export const pricingMetadata = {
@@ -37,21 +29,21 @@ export const pricingMetadata = {
     description: 'Start free. Upgrade for more AI credits, more workspace time and more storage.',
 } as const;
 
-export const marketingContent: {
-    skipLink: string;
-    brand: string;
-    brandSuffix: string;
-    brandLabel: string;
-    backLink: PricingLink;
-    seller: string;
-    footerLabel: string;
-    links: readonly PricingLink[];
-} = {
+export const marketingContent = {
     skipLink: 'Skip to content',
-    brand: 'EZiL',
-    brandSuffix: 'OS',
-    brandLabel: 'EZiL OS — back to login',
-    backLink: { label: 'Back to login', href: '/login' },
+    brand: 'EZiL OS',
+    navigationLabel: 'Main navigation',
+    plansLink: { label: 'Plans', href: '#plans' },
+    startLink: { label: 'Start free', href: '/login' },
+    signInLink: { label: 'Sign in', href: '/login?method=email' },
+    desktop: { browser: 'Browser', editor: 'VS Code' },
+    featuresLabel: 'Your workspace',
+    features: [
+        { title: 'A real desktop', description: 'Windows, files and apps that stay where you left them.' },
+        { title: 'Browser and VS Code built in', description: 'Build and preview without installing anything.' },
+        { title: 'AI assistant', badge: 'coming soon' },
+    ],
+    closing: 'Start building for free',
     seller: 'Sold by EZiL LLC',
     footerLabel: 'Legal and support',
     links: [
@@ -60,72 +52,74 @@ export const marketingContent: {
         { label: 'Refunds', href: '/refunds' },
         { label: 'Support', href: 'mailto:contact@ezil.work' },
     ],
-};
+} as const;
 
 /** Keep whole-dollar prices compact while preserving cents on trials and fees. */
 function dollars(amount: number): string {
     return `$${amount.toFixed(Number.isInteger(amount) ? 0 : 2)}`;
 }
 
-const storage = (bytes: bigint) => `${Number(bytes) / 1_000_000_000} GB`;
-const workspace = (seconds: number) => `${seconds / 3600} hours / month`;
+const storage = (bytes: bigint) => `${Number(bytes) / 1_000_000_000}`;
 
-/**
- * One scan covers the complete offer, including the storage gate's two states.
- * Catalog values stay authoritative so marketing cannot drift from billing.
- */
-export function getPricingContent(largeStorageEnabled: boolean): PricingContent {
+/** Both storage states use the billing catalog, so the public offer cannot drift. */
+export function getPricingContent(largeStorageEnabled: boolean) {
     const aiNote = 'AI assistant coming soon';
-    const sharedNote = 'Same EZiL OS, same standard computer, same AI assistant.';
-    const proStorage = storage(storageCapBytes('pro', largeStorageEnabled));
+    const billingNote = `${PRO_PLAN.currency.toUpperCase()} · before applicable tax · cancel anytime`;
+    const plans: readonly PricingPlan[] = [
+        {
+            id: 'free',
+            name: 'Free',
+            price: dollars(0),
+            interval: '',
+            billingNote,
+            cta: marketingContent.startLink,
+            allowances: [
+                { id: 'workspace', label: 'Workspace time', value: `${FREE_PLAN.workspaceSeconds / 3600}`, unit: 'h/month', caption: 'while a computer runs' },
+                { id: 'storage', label: 'Saved storage', value: storage(FREE_PLAN.storageBytes), unit: 'GB', caption: 'for your saved files' },
+                { id: 'ai', label: 'AI credits', value: dollars(Number(FREE_PLAN.aiTrialMicro) / 1_000_000), unit: 'one-time', caption: aiNote },
+            ],
+        },
+        {
+            id: 'pro',
+            name: 'Pro',
+            price: dollars(PRO_PLAN.unitAmountCents / 100),
+            interval: `/${PRO_PLAN.interval}`,
+            billingNote,
+            badge: 'Most flexible',
+            cta: { label: 'Get Pro', href: '/login?returnUrl=%2Fos%3Fsettings%3Dbilling%26upgrade%3Dpro' },
+            allowances: [
+                { id: 'workspace', label: 'Workspace time', value: `${PRO_PLAN.workspaceSeconds / 3600}`, unit: 'h/month', caption: 'while a computer runs' },
+                {
+                    id: 'storage', label: 'Saved storage',
+                    value: storage(storageCapBytes('pro', largeStorageEnabled)),
+                    unit: largeStorageEnabled ? 'GB' : `GB today · ${storage(PRO_PLAN.storageBytes)} GB soon`,
+                    caption: 'for your saved files',
+                },
+                { id: 'ai', label: 'AI credits', value: dollars(Number(PRO_PLAN.aiIncludedMicro) / 1_000_000), unit: '/month', caption: aiNote },
+            ],
+        },
+    ];
 
     return {
         hero: {
+            eyebrow: 'Your computer in the cloud',
             title: 'Open EZiL OS and get to work.',
-            description: pricingMetadata.description,
+            description: 'A full desktop with a browser and VS Code, in any tab. Start free — upgrade when you need more time, storage and AI.',
+            caption: 'No card needed for Free.',
         },
-        plansLabel: 'Choose your plan',
-        plans: [
-            {
-                id: 'free',
-                name: 'EZiL Free',
-                price: dollars(0),
-                description: 'Start building with a free workspace and a small AI trial.',
-                rows: [
-                    { label: 'Workspace time', value: workspace(FREE_PLAN.workspaceSeconds) },
-                    { label: 'Saved storage', value: storage(FREE_PLAN.storageBytes) },
-                    { label: 'AI credits', value: `${dollars(Number(FREE_PLAN.aiTrialMicro) / 1_000_000)} one-time trial`, note: aiNote },
-                ],
-                sharedNote,
-                cta: { label: 'Start free', href: '/login' },
-            },
-            {
-                id: 'pro',
-                name: 'EZiL Pro',
-                price: `${dollars(PRO_PLAN.unitAmountCents / 100)} / ${PRO_PLAN.interval}`,
-                billingNote: `${PRO_PLAN.currency.toUpperCase()}, before applicable tax · billed monthly · cancel anytime`,
-                description: 'More AI credits. More time to build. More storage for your projects.',
-                rows: [
-                    { label: 'Workspace time', value: workspace(PRO_PLAN.workspaceSeconds) },
-                    { label: 'Saved storage', value: largeStorageEnabled ? proStorage : `${proStorage} today — ${storage(PRO_PLAN.storageBytes)} coming soon` },
-                    { label: 'AI credits', value: `${dollars(Number(PRO_PLAN.aiIncludedMicro) / 1_000_000)} included every month`, note: aiNote },
-                ],
-                sharedNote,
-                cta: { label: 'Upgrade', href: '/login?next=/os' },
-                ctaNote: 'Upgrade from Settings → Billing after you sign in',
-            },
-        ],
+        plansLabel: 'Plans',
+        plans,
+        sharedNote: 'Same EZiL OS, same standard computer, same AI assistant on both plans.',
         topUps: {
-            title: 'Need more AI? Add credits without changing your plan.',
-            packs: AI_PACKS.map(pack => `${dollars(pack.creditCents / 100)} of AI credits + ${dollars(pack.serviceFeeCents / 100)} service fee`),
-            note: 'Available when the AI assistant launches.',
+            title: `Need more AI? Add credits any time — ${AI_PACKS.map(pack => dollars(pack.creditCents / 100)).join(' or ')} packs, plus a small service fee.`,
+            note: 'when the assistant launches',
         },
         limits: {
-            title: 'What happens when you run out',
+            title: 'When you run out',
             rows: [
-                { label: 'AI credits', value: 'AI requests pause. Everything else keeps working. Add credits any time.' },
                 { label: 'Workspace time', value: 'Your work is saved and the computer pauses until your allowance renews or you upgrade.' },
                 { label: 'Saved storage', value: 'New saves pause. Your files stay readable and downloadable.' },
+                { label: 'AI credits', value: 'AI requests pause. Everything else keeps working. Add credits any time.' },
             ],
         },
         faq: {
