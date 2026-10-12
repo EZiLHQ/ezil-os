@@ -85,9 +85,9 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
             <button type="button" class="ezil-upgrade-close" data-action="close-sheet" aria-label="Close upgrade sheet">×</button>
             <div class="ezil-upgrade-columns">
                 <details class="ezil-upgrade-summary" open>
-                    <summary><span id="ezil-upgrade-title">Upgrade to EZiL Pro</span><span class="ezil-upgrade-compact-title" hidden>EZiL Pro · $20/month · Tax calculated at checkout</span></summary>
+                    <summary><span id="ezil-upgrade-title">Upgrade to EZiL Pro</span><span class="ezil-upgrade-compact-title" hidden>EZiL Pro · $20/month · before applicable tax</span></summary>
                     <p class="ezil-upgrade-price">$20 <span>/month</span></p>
-                    <p class="ezil-upgrade-caption">USD · before applicable tax<br>Tax calculated at checkout</p>
+                    <p class="ezil-upgrade-caption">USD · before applicable tax<br>Any applicable tax is shown before you pay</p>
                     <ul class="ezil-upgrade-allowances">
                         <li><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span>20 h workspace time each month</span></li>
                         <li><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 14h18M7 17h2"/></svg><span>2 GB storage today · 20 GB soon</span></li>

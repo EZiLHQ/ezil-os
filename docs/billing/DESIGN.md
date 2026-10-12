@@ -148,7 +148,7 @@ It is a modal sheet inside the Settings window: 560px wide, full width under 600
 - **Left column, order summary (Webflow / Mixpanel pattern):**
   - `EZiL Pro` / `$20.00 /month`;
   - the three allowance lines;
-  - `Tax calculated at checkout`;
+  - `Any applicable tax is shown before you pay` (Stripe Tax is opt-in: `BILLING_AUTOMATIC_TAX=1`);
   - **`Due today`**, which Stripe fills in;
   - the renewal sentence: `Renews monthly until you cancel in Settings → Billing.`
 - **Right column, payment:**
