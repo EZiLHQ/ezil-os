@@ -141,14 +141,44 @@ export interface CheckoutRequest {
     customerId: string;
     userId: string;
     sku: string;
+    /**
+     * `embedded` (default for the OS): Stripe Embedded Checkout mounted in an
+     * OS window — `ui_mode=embedded`, `return_url` = `returnUrl`,
+     * `redirect_on_completion=if_required`, so card / Link / wallet payments
+     * finish in place with no redirect. `hosted`: the redirect page, kept for
+     * clients that cannot load Stripe.js (`successUrl` / `cancelUrl`).
+     */
+    uiMode: 'embedded' | 'hosted';
+    returnUrl: string;
     successUrl: string;
     cancelUrl: string;
     idempotencyKey: string;
 }
 
+export interface CheckoutSessionCreated {
+    id: string;
+    /** Hosted mode only. */
+    url: string | null;
+    /** Embedded mode only — handed to Stripe.js `initEmbeddedCheckout`. */
+    clientSecret: string | null;
+}
+
+export interface StripeInvoiceSummary {
+    id: string;
+    number: string | null;
+    status: string;
+    amountPaidCents: number;
+    currency: string;
+    created: Date;
+    hostedInvoiceUrl: string | null;
+    description: string | null;
+}
+
 export interface StripeApi {
     createCustomer(input: { userId: string; email: string | null; idempotencyKey: string }): Promise<{ id: string }>;
-    createCheckoutSession(input: CheckoutRequest): Promise<{ id: string; url: string }>;
+    createCheckoutSession(input: CheckoutRequest): Promise<CheckoutSessionCreated>;
+    /** Newest first. */
+    listInvoices(customerId: string, limit: number): Promise<StripeInvoiceSummary[]>;
     createPortalSession(input: { customerId: string; returnUrl: string }): Promise<{ url: string }>;
     retrieveSubscription(id: string): Promise<StripeSubscription>;
     retrieveInvoice(id: string): Promise<StripeInvoice>;

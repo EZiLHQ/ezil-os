@@ -18,6 +18,8 @@ export interface BillingConfig {
     largeStorageEnabled: boolean;
     stripeSecret: string | undefined;
     stripeWebhookSecret: string | undefined;
+    /** Publishable key (`pk_…`) for Stripe.js Embedded Checkout. Public by design. */
+    stripePublishableKey: string | undefined;
     /** Optional: a dashboard-managed Price for Pro; otherwise Checkout uses inline price data. */
     stripePriceProMonthly: string | undefined;
     /** HMAC secret the desktop Worker signs usage events with. */
@@ -30,6 +32,8 @@ export interface BillingConfig {
 type Env = Record<string, string | undefined>;
 
 const on = (v: string | undefined) => v === '1';
+/** Only a `pk_` key may ever be sent to a browser. */
+const publishable = (v: string | undefined) => (v && /^pk_(test|live)_/.test(v.trim()) ? v.trim() : undefined);
 const nonEmpty = (v: string | undefined) => (v && v.trim() !== '' ? v : undefined);
 
 export function readBillingConfig(env: Env = process.env): BillingConfig {
@@ -41,6 +45,7 @@ export function readBillingConfig(env: Env = process.env): BillingConfig {
         largeStorageEnabled: on(env.BILLING_LARGE_STORAGE),
         stripeSecret: nonEmpty(env.STRIPE_SECRET),
         stripeWebhookSecret: nonEmpty(env.STRIPE_WEBHOOK_SECRET),
+        stripePublishableKey: publishable(env.STRIPE_PUBLISHABLE_KEY ?? env.STRIPE_KEY),
         stripePriceProMonthly: nonEmpty(env.STRIPE_PRICE_PRO_MONTHLY),
         usageHmacSecret: nonEmpty(env.BILLING_USAGE_HMAC_SECRET),
         fundingUrl: nonEmpty(env.BILLING_FUNDING_URL),
