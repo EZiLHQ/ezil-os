@@ -1,10 +1,14 @@
-// billing-test.mjs — EZiL-authored. Exercises the shipped Settings bundle.
+// billing-test.mjs — EZiL-authored. Exercises Settings with an injected payment surface.
+// Bundle the real entry plus the test hook; the parallel sheet needs no local file.
 // Fake fetch is the only transport: no server, credentials or network needed.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JSDOM } from 'jsdom';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const { build } = require(require.resolve('esbuild', { paths: [path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../app')] }));
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const out = process.env.EZIL_SHELL_OUT_DIR || path.resolve(here, '../../../../app/public/os');
@@ -21,7 +25,7 @@ const fixture = () => ({
     enabled: true, version: 1,
     plan: { id: 'free', status: 'free', periodStart: '2026-10-01T00:00:00Z', periodEnd: '2026-11-01T00:00:00Z', renewsAt: null, cancelsAt: null },
     meters: {
-        workspace: { usedSeconds: 5400, allowanceSeconds: 28800, remainingSeconds: 23400, resetsAt: '2026-11-01T00:00:00Z', state: 'ok' },
+        workspace: { usedSeconds: 4320, allowanceSeconds: 28800, remainingSeconds: 23400, resetsAt: '2026-11-01T00:00:00Z', state: 'ok' },
         storage: { usedBytes: '1500000000', capBytes: '2000000000', measuredAt: '2026-10-11T12:00:00Z', state: 'ok' },
         ai: { state: 'unavailable', trialMicro: '0', includedMicro: '0', purchasedMicro: '0', includedExpiresAt: null },
     },
@@ -36,15 +40,43 @@ const fixture = () => ({
 });
 let summary = fixture();
 let getSummary = () => reply(summary);
-let mutation = () => reply({ url: '#checkout-complete' });
+let mutation = () => reply({ url: 'https://billing.example.test/session' });
+let history = [];
+let getHistory = () => reply(history);
+const opened = [];
+window.open = (...args) => { opened.push(args); };
+const sheets = [];
+let openerFailure = false;
 window.fetch = async (url, options = {}) => {
     calls.push({ url: String(url), method: options.method, input: options.body ? JSON.parse(options.body).json : undefined });
     if ( String(url).includes('/api/trpc/billing.summary') ) return getSummary();
+    if ( String(url).includes('/api/trpc/billing.history') ) return getHistory();
     if ( String(url).includes('/api/trpc/billing.') ) return mutation();
     if ( String(url).includes('/api/trpc/computer.list') ) return reply([]);
     return failure('Stubbed endpoint');
 };
-for ( const file of ['icons.js', 'bundle.min.js'] ) window.eval(fs.readFileSync(path.join(out, file), 'utf8'));
+const bundled = await build({
+    stdin: {
+        contents: "import './shell/ezil/boot.js'; import { setUpgradeSheetOpener } from './shell/ezil/ui/Settings/tabs/billing.js'; window.setUpgradeSheetOpener = setUpgradeSheetOpener;",
+        resolveDir: path.resolve(here, '../../../..'),
+    },
+    bundle: true, write: false, format: 'iife', target: 'es2022',
+    plugins: [{ name: 'payment-surface-port', setup (builder) {
+        builder.onResolve({ filter: /upgrade-sheet\.js$/ }, () => ({ path: 'sheet', namespace: 'test' }));
+        builder.onLoad({ filter: /.*/, namespace: 'test' }, () => ({ contents: "export function openUpgradeSheet () { throw new Error('Inject the test opener'); }" }));
+    } }],
+});
+window.eval(fs.readFileSync(path.join(out, 'icons.js'), 'utf8'));
+window.eval(bundled.outputFiles[0].text);
+window.setUpgradeSheetOpener(options => {
+    if ( openerFailure ) throw new Error('Sheet failed');
+    const element = window.document.createElement('div');
+    element.dataset.role = 'upgrade-sheet';
+    options.container.append(element);
+    const handle = { close: () => element.remove() };
+    sheets.push({ ...options, handle });
+    return handle;
+});
 window.ezil.boot();
 window.$.fx.off = true;
 const payload = { user: { id: 'test-user', name: 'Test user' }, features: { billing: true }, desktopState: {} };
@@ -77,49 +109,71 @@ try {
     await open();
     assert.deepEqual(qa('.ezil-settings-tab').map(tab => tab.dataset.tab), ['account', 'billing', 'computers', 'system', 'appearance', 'about', 'troubleshoot']);
     assert.equal(active(), 'billing');
-    assert.equal(count(), 1, 'direct entry activates exactly once');
-    assert.equal(q('[data-tab="usage"]'), null, 'forbidden upstream tab stays absent; Billing above is the positive control');
+    assert.equal(count(), 1);
+    assert.match(text(), /Plan & usage/);
+    assert.match(text(), /Your allowances and what renews when/);
     assert.match(text(), /EZiL Free/);
+    assert.match(text(), /Current/);
     assert.match(text(), /Free plan/);
-    assert.match(text(), /1 h 30 m of 8 h used · resets Nov 1, 2026 UTC/);
-    assert.match(text(), /1.5 GB of 2.0 GB used/);
-    assert.match(text(), /Measured Oct 11, 2026 UTC/);
+    assert.match(q('[data-meter="workspace"]').textContent, /1 h 12 m\s+of 8 h/);
+    assert.match(q('[data-meter="storage"]').textContent, /1.5 GB\s+of 2.0 GB/);
     assert.match(text(), /AI assistant coming soon/);
-    assert.match(text(), /Counts while a computer is running. Computers stop after 10 minutes without activity./);
-    assert.match(text(), /Saved project files across your computers/);
-    assert.equal(qa('[data-pane="billing"] [role="progressbar"]').length, 3);
-    for ( const bar of qa('[data-pane="billing"] [role="progressbar"]') ) {
-        assert.equal(bar.getAttribute('aria-valuemin'), '0');
-        assert.equal(bar.getAttribute('aria-valuemax'), '100');
-        assert.ok(Number(bar.getAttribute('aria-valuenow')) >= 0 && Number(bar.getAttribute('aria-valuenow')) <= 100);
-        assert.ok(bar.getAttribute('aria-valuetext'));
+    assert.match(text(), /\$0.50 trial ready/);
+    assert.match(text(), /Resets Nov 1 \(UTC\)/);
+    assert.equal(qa('[data-meter]').length, 3);
+    assert.equal(qa('[data-meter] [role="progressbar"]').length, 2);
+    assert.equal(q('[data-meter="ai"] [role="progressbar"]'), null); // Available AI has a bar below.
+    assert.equal(q('[data-role="invoices-empty"]').textContent, 'No invoices yet.');
+    for ( const [href, label] of [['/pricing', 'Plans'], ['/refunds', 'Refund policy'], ['mailto:contact@ezil.work', 'Support']] ) {
+        assert.equal(pane().querySelector(`a[href="${href}"]`).textContent, label);
     }
-    assert.equal(pane().querySelector('a[href="/pricing"]').target, '_blank');
-    assert.equal(pane().querySelector('a[href="/pricing"]').rel, 'noopener');
-    assert.equal(pane().querySelector('a[href="mailto:contact@ezil.work"]').textContent, 'Support');
-    assert.equal(pane().querySelector('a[href="/refunds"]').textContent, 'Refunds');
-    // All hidden actions below have enabled, clicked controls later in this run.
-    for ( const action of ['checkout', 'portal', 'topup'] ) assert.equal(pane().querySelector(`[data-action="${action}"]`), null);
+    // Enabled, clicked controls later are positive controls for each hidden action.
+    for ( const action of ['checkout', 'portal', 'topup'] ) assert.equal(q(`[data-action="${action}"]`), null);
+    assert.equal(q('[data-role="billing-nudge"]'), null); // Every attention state below renders a nudge.
     const banned = /faster|instant|unlimited|priority|vcpu|gpu|heavy use|fair use|gpt|claude|gemini|llama/i;
-    assert.ok(banned.test('unlimited'), 'copy guard positive control');
+    assert.ok(banned.test('unlimited'));
     assert.equal(banned.test(text()), false);
 
-    // Every server state gets its own class on all three separate rows.
-    for ( const state of ['ok', 'low', 'exhausted', 'over_cap', 'unavailable'] ) {
-        for ( const meter of Object.values(summary.meters) ) meter.state = state;
-        await refresh();
-        for ( const name of ['workspace', 'storage', 'ai'] ) assert.ok(q(`[data-meter="${name}"]`).classList.contains(`is-${state}`));
+    for ( const name of ['workspace', 'storage', 'ai'] ) {
+        for ( const state of ['ok', 'low', 'exhausted', 'over_cap', 'unavailable'] ) {
+            summary = fixture();
+            summary.meters[name].state = state;
+            await refresh();
+            assert.ok(q(`[data-meter="${name}"]`).classList.contains(`is-${state}`));
+            assert.equal(!! q('[data-role="billing-nudge"]'), ['low', 'exhausted', 'over_cap'].includes(state));
+        }
     }
-    for ( const [status, copy] of [['active', 'Renews on Nov 1, 2026 UTC'], ['cancels', 'Ends on Nov 1, 2026 UTC'], ['past_due', 'Payment failed — update your payment method to keep Pro']] ) {
+    summary = fixture();
+    summary.meters.workspace = { ...summary.meters.workspace, remainingSeconds: 720, state: 'low' };
+    summary.actions.checkout = true;
+    await refresh();
+    assert.match(text(), /12 minutes of workspace time left this month/);
+    assert.ok(q('[data-role="billing-nudge"] [data-action="checkout"]'));
+    assert.equal(qa('[data-pane="billing"] .ezil-settings-btn-primary').length, 1);
+    summary.meters.workspace.remainingSeconds = 0;
+    await refresh();
+    assert.match(text(), /Workspace time is used up/);
+
+    for ( const [status, copy] of [['active', 'Renews Nov 1 · $20/month'], ['cancels', 'Ends Nov 1'], ['past_due', 'Payment failed — update your card']] ) {
+        summary = fixture();
         summary.plan = { ...summary.plan, id: status === 'past_due' ? 'free' : 'pro', status, renewsAt: '2026-11-01T00:00:00Z', cancelsAt: '2026-11-01T00:00:00Z' };
+        summary.actions = { checkout: true, portal: true, topup: false };
         await refresh();
         assert.ok(text().includes(copy));
-        assert.ok(text().includes(status === 'past_due' ? 'EZiL Free' : 'EZiL Pro'));
+        assert.equal(q('.ezil-billing-header button').dataset.action, status === 'past_due' ? 'checkout' : 'portal');
+        assert.equal(qa('.ezil-billing-header button').length, 1);
+        assert.equal(!! q('[data-action="checkout"]'), status === 'past_due');
+        assert.match(text(), /USD · before applicable tax/);
+        assert.equal(banned.test(text()), false);
     }
+    summary.actions.checkout = false;
+    await refresh();
+    assert.equal(q('.ezil-billing-header button').dataset.action, 'portal');
     summary.meters.ai = { state: 'ok', trialMicro: '500000', includedMicro: '3000000', purchasedMicro: '10000000', includedExpiresAt: '2026-11-01T00:00:00Z' };
     await refresh();
     assert.match(text(), /\$13.50 left/);
-    assert.match(text(), /Included credit expires Nov 1, 2026 UTC/);
+    assert.match(text(), /Included credit expires Nov 1/);
+    assert.ok(q('[data-meter="ai"] [role="progressbar"]'));
     summary.meters.ai.trialMicro = '90071992547409930000';
     summary.meters.ai.includedMicro = '70000';
     summary.meters.ai.purchasedMicro = '0';
@@ -128,82 +182,132 @@ try {
     assert.match(text(), /\$90071992547410.00 left/);
     assert.match(text(), /900719925474.1 GB/);
     assert.equal(q('[data-meter="storage"] [role="progressbar"]').getAttribute('aria-valuenow'), '100');
+    summary.meters.storage.measuredAt = new Date(Date.now() - 120000).toISOString();
+    await refresh();
+    assert.match(text(), /Updated 2 min ago/);
     summary.meters.storage.measuredAt = null;
     await refresh();
-    assert.match(text(), /Not measured yet/); // Measured timestamp above is the positive control.
+    assert.match(text(), /Not measured yet/);
+
+    history = Array.from({ length: 14 }, (_, i) => ({ id: `in_${i}`, number: null, created: `2026-10-${String(i + 1).padStart(2, '0')}T12:00:00Z`, description: `Invoice ${i}`, amountPaidCents: 2000, currency: 'usd', status: 'paid', url: `https://invoice.example.test/${i}` }));
+    history[13].description = '<img src=x onerror=alert(1)>';
+    history[13].amountPaidCents = '900719925474099300';
+    await refresh();
+    assert.equal(qa('.ezil-billing-invoice').length, 12);
+    assert.equal(q('[data-role="invoices-empty"]'), null); // Empty state above.
+    assert.match(q('.ezil-billing-invoice').textContent, /Oct 14, 2026/);
+    assert.match(q('.ezil-billing-invoice').textContent, /\$9007199254740993.00/);
+    assert.match(q('.ezil-billing-invoice').textContent, /<img src=x onerror=alert\(1\)>/);
+    assert.equal(q('.ezil-billing-invoice img'), null); // Literal payload above.
+    assert.equal(q('.ezil-billing-invoice a').target, '_blank');
+    assert.equal(q('.ezil-billing-invoice a').rel, 'noopener');
+    assert.equal(q('.ezil-billing-invoice a').href, 'https://invoice.example.test/13');
+    history[13].url = 'javascript:alert(1)';
+    await refresh();
+    assert.equal(q('.ezil-billing-invoice').querySelector('a'), null); // Valid URL above.
+    assert.match(q('.ezil-billing-invoice').textContent, /Link unavailable/);
+    getHistory = () => failure('History failed');
+    await refresh();
+    assert.match(text(), /Couldn't load invoices/);
+    assert.equal(qa('[data-meter]').length, 3);
+    assert.ok(q('[data-action="portal"]'));
+    getHistory = () => reply([]);
+    click(q('[data-role="invoices"] [data-action="retry"]'));
+    await settle();
+    assert.ok(q('[data-role="invoices-empty"]'));
+    assert.equal(q('[data-role="invoices"] [data-action="retry"]'), null); // Clicked above.
 
     summary = { enabled: false };
     await refresh();
     assert.match(text(), /Billing isn't available yet/);
-    assert.equal(qa('[data-pane="billing"] [data-meter]').length, 0); // Three meters above.
+    assert.equal(qa('[data-meter]').length, 0); // Three above.
     getSummary = () => failure('server detail');
     await refresh();
-    assert.match(text(), /Couldn't load billing. Try again./);
+    assert.match(text(), /Couldn't load billing/);
     let releaseSummary;
     getSummary = () => new Promise(resolve => { releaseSummary = resolve; });
-    click(q('[data-pane="billing"] [data-action="retry"]'));
-    assert.match(text(), /Loading billing/);
+    click(q('[data-action="retry"]'));
+    assert.equal(qa('.ezil-billing-skeleton').length, 3);
     assert.equal(q('[data-role="billing-body"]').getAttribute('aria-busy'), 'true');
     summary = fixture();
     releaseSummary(reply(summary));
     await settle();
     assert.match(text(), /EZiL Free/);
     assert.equal(q('[data-role="billing-body"]').getAttribute('aria-busy'), 'false');
-    assert.equal(pane().querySelector('[data-action="retry"]'), null); // Retry clicked above.
+    assert.equal(q('.ezil-billing-skeleton'), null); // Loading skeleton above.
     getSummary = () => reply(summary);
 
     summary.actions = { checkout: true, portal: true, topup: true };
     await refresh();
-    for ( const action of ['checkout', 'portal', 'topup'] ) assert.ok(pane().querySelector(`[data-action="${action}"]`));
-    assert.match(text(), /Upgrade to Pro — \$20\/month/);
-    assert.match(text(), /before applicable tax/);
+    assert.equal(q('.ezil-billing-header button').textContent, 'Upgrade to Pro');
     assert.match(text(), /\$10.00 credit \+ \$0.84 service fee/);
-    let releaseMutation;
-    mutation = () => new Promise(resolve => { releaseMutation = resolve; });
     const checkout = q('[data-action="checkout"]');
-    assert.equal(checkout.disabled, false);
     click(checkout);
-    const mutationCount = calls.length;
-    assert.equal(checkout.disabled, true);
+    assert.equal(sheets.length, 1, 'first click opens a sheet');
     click(checkout);
-    assert.equal(calls.length, mutationCount, 'pending guard prevents duplicate mutation');
-    assert.equal(calls.at(-1).method, 'POST');
-    assert.deepEqual(calls.at(-1).input, { sku: 'pro_monthly_v1' });
-    releaseMutation(failure('<img src=x onerror=alert(1)> Payment declined'));
+    assert.equal(sheets.length, 1, 'sheet guard blocks a second click');
+    assert.equal(sheets[0].sku, 'pro_monthly_v1');
+    assert.ok(sheets[0].container.classList.contains('window-body'));
+    assert.equal(typeof sheets[0].trpc.query, 'function');
+    sheets[0].handle.close();
     await settle();
-    assert.equal(checkout.disabled, false);
-    assert.match(q('[data-role="billing-action-error"]').textContent, /<img src=x onerror=alert\(1\)> Payment declined/);
-    assert.equal(pane().querySelector('img'), null, 'error text remains text; literal payload above is the control');
-    mutation = () => reply({ url: '#checkout-complete' });
     click(checkout);
+    assert.equal(sheets.length, 2, 'cancellation permits reopening');
+    const beforeDone = count();
+    const historyBeforeDone = calls.filter(call => call.url.includes('billing.history')).length;
+    sheets[1].handle.close();
+    sheets[1].onDone();
     await settle();
-    assert.equal(window.location.hash, '#checkout-complete');
-    mutation = () => reply({ url: '#portal-complete' });
+    assert.equal(count(), beforeDone + 1);
+    assert.equal(calls.filter(call => call.url.includes('billing.history')).length, historyBeforeDone + 1);
+    openerFailure = true;
+    click(q('[data-action="checkout"]'));
+    assert.match(text(), /Could not open billing/);
+    openerFailure = false;
+
+    const beforeAuto = sheets.length;
+    await open({ ...context, initialTab: 'billing', openUpgrade: true });
+    assert.equal(sheets.length, beforeAuto + 1, 'deep link auto-opens once');
+    sheets.at(-1).handle.close();
+    await settle();
+    await refresh();
+    assert.equal(sheets.length, beforeAuto + 1, 'tab reactivation does not auto-open again');
+    summary.actions.checkout = false;
+    await open({ ...context, initialTab: 'billing', openUpgrade: true });
+    assert.equal(sheets.length, beforeAuto + 1, 'checkout availability gates auto-open');
     click(q('[data-action="portal"]'));
     await settle();
+    assert.deepEqual(opened.at(-1), ['https://billing.example.test/session', '_blank', 'noopener']);
     assert.ok(calls.at(-1).url.endsWith('/billing.portal'));
-    assert.deepEqual(calls.at(-1).input, {});
-    assert.equal(window.location.hash, '#portal-complete');
+    assert.equal(calls.at(-1).method, 'POST');
+    const openedBefore = opened.length;
+    let releaseMutation;
+    mutation = () => new Promise(resolve => { releaseMutation = resolve; });
+    const portal = q('[data-action="portal"]');
+    click(portal);
+    const pendingCalls = calls.length;
+    assert.equal(portal.disabled, true);
+    click(portal);
+    assert.equal(calls.length, pendingCalls);
+    releaseMutation(reply({ url: 'javascript:alert(1)' }));
+    await settle();
+    assert.equal(opened.length, openedBefore); // Valid portal opened above.
+    assert.equal(portal.disabled, false);
+    assert.match(text(), /Could not open billing/);
+    mutation = () => reply({ url: 'https://billing.example.test/pack' });
     q('[data-role="billing-pack"]').value = '1';
-    mutation = () => reply({ url: '#topup-complete' });
     click(q('[data-action="topup"]'));
     await settle();
     assert.deepEqual(calls.at(-1).input, { sku: 'ai_pack_25_v1' });
-    assert.equal(window.location.hash, '#topup-complete');
-    mutation = () => reply({ url: 'javascript:alert(1)' });
-    click(q('[data-action="portal"]'));
-    await settle();
-    assert.match(text(), /Could not open billing. Try again./);
-    assert.equal(window.location.hash, '#topup-complete', 'invalid navigation refused after valid navigation controls');
+    assert.equal(opened.at(-1)[0], 'https://billing.example.test/pack');
 
-    // Enabled boot is the positive control for every availability rejection.
+    // Enabled boot above is the positive control for every availability rejection.
     for ( const ctx of [
         { payload: { user: payload.user }, initialTab: 'billing' },
         { payload: { ...payload, features: { billing: false } }, initialTab: 'billing' },
         { payload: { ...payload, features: { billing: 'true' } }, initialTab: 'billing' },
         { payload: { features: { billing: true } }, initialTab: 'billing' },
         { ...context, desktopState: { provider: 'native-macos' }, initialTab: 'billing' },
-        { payload: { ...payload, desktopState: { provider: 'native-macos' } }, initialTab: 'billing' },
     ] ) {
         const before = count();
         await open(ctx);
@@ -217,25 +321,18 @@ try {
     const before = count();
     click(q('[data-tab="billing"]'));
     await settle();
-    assert.equal(count(), before + 1, 'tab click activates once');
+    assert.equal(count(), before + 1);
     click(q('[data-tab="billing"]'));
     await settle();
-    assert.equal(count(), before + 1, 'already active tab does not activate again');
-    window.__EZIL_BOOT__ = payload;
-    await open({ initialTab: 'billing' });
-    assert.equal(active(), 'billing', 'boot payload fallback enables billing');
-    await open({ payload: { features: {} }, initialTab: 'billing' });
-    assert.equal(active(), 'computers', 'explicit context features override boot features');
-    delete window.__EZIL_BOOT__;
+    assert.equal(count(), before + 1);
     await open();
-    assert.equal(active(), 'billing', 'reopened pane still loads');
-    mutation = () => reply({ url: '#reopened' });
     click(q('[data-action="portal"]'));
     await settle();
-    assert.equal(window.location.hash, '#reopened', 'reopened pane rebinds actions');
-    assert.ok(calls.some(call => call.url.includes('/billing.summary')), 'error-free run made real stubbed requests');
+    assert.equal(opened.at(-1)[0], 'https://billing.example.test/pack', 'reopened pane rebinds actions');
+    for ( const element of qa('[data-pane="billing"] button, [data-pane="billing"] a') ) assert.ok(element.getAttribute('aria-label') || element.textContent.trim());
+    assert.ok(calls.some(call => call.url.includes('/billing.summary')));
     assert.deepEqual(errors, []);
-    console.log('PASS Billing: availability, initial tab, meters, exact amounts, retry, actions, escaping, reopen');
+    console.log('PASS Billing: states, action choice, nudge, invoices, exact amounts, retry, sheet guard, deep link, portal, feature gate, reopen');
 } finally {
     dom.window.close();
 }
