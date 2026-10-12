@@ -6,7 +6,7 @@
  * a replaced container lost OpenCode (~/.opencode + its ~/.bashrc PATH line),
  * the project's `next` binary and the user's notes. On the explicitly isolated
  * E2E computer, through Code's ordinary terminal, this suite:
- *   1. installs OpenCode with its official installer, creates a real Next.js
+ *   1. installs OpenCode (pinned OPENCODE_VERSION) with its official installer, creates a real Next.js
  *      app (npm install -> package-lock.json), a note and a config file, all
  *      under per-run names, and records their sha256;
  *   2. waits at least 90 s after the last write, cuts power without a final
@@ -254,18 +254,60 @@ const rcAddedShell = (label, file, out) => [
   `else : > "${out}"; fi`,
 ].join('\n');
 
-export function opencodeInstallScript(runId) {
+/**
+ * The OpenCode release the suite installs, with the official installer. Pinned
+ * because the installer's latest-version lookup is an unauthenticated
+ * api.github.com call (60/h per IP; Cloudflare egress is shared) made BEFORE it
+ * checks an existing install: rate-limited, it exits 1 even with OpenCode
+ * installed. `--version V` skips that lookup (opencode.ai/install, read
+ * 2026-10-12): it HEADs github.com/anomalyco/opencode/releases/tag/vV (fails
+ * only on 404), exits 0 when `opencode --version` on PATH already prints V, and
+ * otherwise downloads releases/download/vV/opencode-linux-x64*.tar.gz.
+ * 1.18.35 (2026-10-06) is the newest patch of the previous minor line; 1.19.0
+ * was one day old. `opencode --version` prints the bare version.
+ */
+export const OPENCODE_VERSION = '1.18.35';
+export const OPENCODE_INSTALLER_URL = 'https://opencode.ai/install';
+/** The only install failure detail that leaves the container, found by grep. */
+export const OPENCODE_INSTALL_FAILURES = Object.freeze([
+  'none', 'timeout', 'installer_fetch', 'version_fetch', 'release_missing', 'download', 'extract', 'version_mismatch', 'other',
+]);
+
+export function opencodeInstallScript(runId, { installerUrl = OPENCODE_INSTALLER_URL, version = OPENCODE_VERSION,
+  timeoutSeconds = 600, retryDelaySeconds = 5 } = {}) {
   const p = runPaths(runId);
+  assert.match(version, /^\d+\.\d+\.\d+$/, 'Invalid OpenCode version');
+  assert.ok(installerUrl === OPENCODE_INSTALLER_URL || /^file:\/\/\/[A-Za-z0-9._/-]+$/.test(installerUrl), 'Invalid installer URL');
+  assert.ok(Number.isInteger(timeoutSeconds) && timeoutSeconds > 0 && timeoutSeconds <= 600, 'Invalid install timeout');
+  assert.ok(Number.isInteger(retryDelaySeconds) && retryDelaySeconds >= 0 && retryDelaySeconds <= 30, 'Invalid retry delay');
   return [
     'H="$HOME"',
     `S=${p.scratch}`,
     'mkdir -p "$S"',
-    // The official installer, exactly as the user ran it. Its output stays in
-    // the per-container scratch log; the terminal shows only the result.
-    'timeout 600 bash -c "curl -fsSL https://opencode.ai/install | bash" > "$S/opencode-install.log" 2>&1 < /dev/null; rc=$?',
+    'set -o pipefail',
+    `V=${version}`,
+    'before=0; [ -x "$H/.opencode/bin/opencode" ] && before=1',
+    // The official installer, saved to a file first: `curl | bash` exits 0 when
+    // the fetch fails, so a pre-existing binary passed without any install.
+    'I="$S/opencode-install.sh"; L="$S/opencode-install.log"; rm -f "$I"; : > "$L"; fetched=0',
+    `for a in 1 2 3; do curl -fsSL --connect-timeout 20 --max-time 120 -o "$I" '${installerUrl}' >> "$S/opencode-fetch.log" 2>&1 && [ -s "$I" ] && { fetched=1; break; }; [ "$a" -lt 3 ] && sleep ${retryDelaySeconds}; done`,
+    // Its output stays in the per-container scratch log; the terminal shows only the result.
+    `rc=1; [ "$fetched" = 1 ] && { timeout ${timeoutSeconds} bash "$I" --version "$V" > "$L" 2>&1 < /dev/null; rc=$?; }`,
     'bin=0; [ -x "$H/.opencode/bin/opencode" ] && bin=1',
+    // Pass only on the pinned version at the installer's own location: an existing binary alone proves nothing.
+    'got=""; [ "$bin" = 1 ] && got=$(timeout 60 "$H/.opencode/bin/opencode" --version 2>/dev/null < /dev/null | head -n 1 | tr -cd "A-Za-z0-9._-")',
+    'ver=0; [ -n "$got" ] && [ "$got" = "$V" ] && ver=1',
+    'if [ "$fetched" != 1 ]; then fail=installer_fetch',
+    'elif [ "$rc" = 124 ] || [ "$rc" = 137 ]; then fail=timeout',
+    'elif [ "$rc" != 0 ] && grep -q "Failed to fetch version information" "$L"; then fail=version_fetch',
+    'elif [ "$rc" != 0 ] && grep -qE "Release v[^ ]* not found" "$L"; then fail=release_missing',
+    'elif [ "$rc" != 0 ] && grep -qE "^(tar|gzip): |not in gzip format" "$L"; then fail=extract',
+    'elif [ "$rc" != 0 ] && grep -qE "curl: \\([0-9]+\\)" "$L"; then fail=download',
+    'elif [ "$rc" != 0 ]; then fail=other',
+    'elif [ "$ver" != 1 ]; then fail=version_mismatch',
+    'else fail=none; fi',
     ...RC_FILES.map(([label, file]) => rcAddedShell(label, file, `$S/rc-added-${label}`)),
-    `out="rc=$rc,bin=$bin"`,
+    'out="rc=$rc,bin=$bin,ver=$ver,fail=$fail,before=$before"',
     ...RC_FILES.map(([label]) => `[ -s "$S/rc-added-${label}" ] && out="$out,rc_${label}=$(b64 < "$S/rc-added-${label}")"`),
     'emit "$out"',
   ].join('\n');
@@ -280,7 +322,11 @@ export function parseOpencodeInstall(fields) {
     assert.ok(lines.every(line => /opencode/i.test(line) && !/[\0\r]/.test(line)), 'Unexpected rc lines');
     if (lines.length) addedRcLines[label] = lines;
   }
-  return { exitCode: intField(fields, 'rc'), binary: flagField(fields, 'bin'), addedRcLines };
+  assert.ok(OPENCODE_INSTALL_FAILURES.includes(fields.fail), 'Step result fail missing');
+  return {
+    exitCode: intField(fields, 'rc'), binary: flagField(fields, 'bin'), versionMatches: flagField(fields, 'ver'),
+    failure: fields.fail, before: flagField(fields, 'before'), addedRcLines,
+  };
 }
 
 export function projectScript(runId) {
@@ -649,6 +695,25 @@ export const FAILURE_CODES = Object.freeze([
 ]);
 const check = (condition, code) => { if (!condition) throw new AcceptanceFailure(code); };
 
+// Phase and operation names are code literals; anything else (a URL, typed text) prints as `unlisted`.
+const NAME = /^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,79}$/;
+const publicName = value => value === undefined || value === null ? 'none' : (NAME.test(value) && !value.includes('//') ? value : 'unlisted');
+const ERROR_TYPES = ['AssertionError', 'TimeoutError', 'TargetRefused', 'AcceptanceFailure', 'Error'];
+
+/** One stdout line for the public job log: allow-listed codes and literal names only, never raw errors. */
+export function publicFailureLine({ failureCode, failedPhase, failedOperation, errorType, install, missingPrerequisite } = {}) {
+  const fields = [
+    ['code', FAILURE_CODES.includes(failureCode) ? failureCode : 'none'],
+    ['phase', publicName(failedPhase)],
+    ['operation', publicName(failedOperation)],
+    ['error', ERROR_TYPES.includes(errorType) ? errorType : 'none'],
+    ['install_fail', OPENCODE_INSTALL_FAILURES.includes(install?.failure) ? install.failure : 'none'],
+    ['install_before', typeof install?.before === 'boolean' ? (install.before ? '1' : '0') : 'none'],
+    ['missing', /^[A-Z][A-Z0-9_]{0,63}$/.test(missingPrerequisite ?? '') ? missingPrerequisite : 'none'],
+  ];
+  return `FAIL-DETAIL hosted HOME persistence: ${fields.map(([k, v]) => `${k}=${v}`).join('; ')}`;
+}
+
 /** Same signed control request as hosted-continuity; no final-save endpoint. */
 export async function powerCutAfterRpo({ sandboxId, worker, secret, lastWriteFinishedAt, evidence,
   wait, now = Date.now, fetchImpl = fetch }) {
@@ -902,8 +967,9 @@ async function main() {
     setupStarted = true;
 
     install = parseOpencodeInstall(await runStep('opencode install', opencodeInstallScript(runId), 660000));
-    evidence.steps.opencodeInstall = { exitCode: install.exitCode, binary: install.binary, rcFilesEdited: Object.keys(install.addedRcLines) };
-    check(install.exitCode === 0 && install.binary, 'opencode_install_failed');
+    evidence.steps.opencodeInstall = { exitCode: install.exitCode, binary: install.binary, versionMatches: install.versionMatches,
+      failure: install.failure, before: install.before, pinnedVersion: OPENCODE_VERSION, rcFilesEdited: Object.keys(install.addedRcLines) };
+    check(install.exitCode === 0 && install.binary && install.versionMatches && install.failure === 'none', 'opencode_install_failed');
     phase('OpenCode installed by its official installer');
 
     const project = parseProject(await runStep('next project', projectScript(runId), 960000));
@@ -996,6 +1062,8 @@ async function main() {
     console.error(evidence.refused
       ? `REFUSED hosted HOME persistence: ${evidence.refused} (staging only)`
       : 'FAIL hosted HOME persistence: prerequisite or assertion failed');
+    // The job log must explain a failure without the artifact: fixed fields only.
+    if (!evidence.refused) console.log(publicFailureLine({ ...evidence, install: evidence.steps?.opencodeInstall }));
     process.exitCode = 1;
   } finally {
     // A step that never returned: from a NEW terminal, record which known processes
