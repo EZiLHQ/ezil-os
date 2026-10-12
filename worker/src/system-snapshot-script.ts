@@ -45,10 +45,14 @@ CAPTURE_STARTED = STATE + '/capture-started'
 # (restored, or there was none). Capture refuses without it: a container whose
 # restore failed must never commit its bare image over the user's installs.
 HYDRATED = STATE + '/hydrated'
+# Kind/mode/owner of every entry in the committed layer (restored, or the last
+# committed capture). sys-dirty compares metadata-only changes against it.
+COMMITTED_META = STATE + '/committed-meta.json'
 DELETED_MEMBER = '.ezil-deleted.json'
 DPKG_STATUS = '/var/lib/dpkg/status'
 BASELINE_MISSING = STATE + '/baseline-missing.json'
 IMAGE_MANIFEST = '/etc/ezil-image-manifest.tsv'
+IMAGE_ID = '/etc/ezil-image-id'
 MAX_DELETED = 20000
 ROOTS = ['/usr', '/etc', '/opt', '/var/lib/dpkg', '/var/lib/apt', '/root', '/home']
 # Caches, logs, per-boot platform files and anything credential-like the
@@ -105,17 +109,57 @@ def project_regenerable(path, restore_projects=None):
             and any(os.path.isfile(os.path.join(directory, lock)) for lock in PROJECT_LOCKFILES))
 
 def excluded(path, restore_projects=None):
-    return (os.path.basename(path) in EXCLUDE_NAMES or any(path == e or path.startswith(e + '/') for e in EXCLUDE)
+    # The image's own id and manifest belong to the image: capturing them (they get a
+    # fresh ctime when read) would roll a newer image back to the old ones on restore.
+    return (path == IMAGE_MANIFEST or path == IMAGE_ID or os.path.basename(path) in EXCLUDE_NAMES
+            or any(path == e or path.startswith(e + '/') for e in EXCLUDE)
             or project_regenerable(path, restore_projects))
+
+def meta_of(path, s):
+    if stat.S_ISDIR(s.st_mode): kind = 'd'
+    elif stat.S_ISLNK(s.st_mode): kind = 'l'
+    else: kind = 'f'
+    return [kind, None if kind == 'l' else stat.S_IMODE(s.st_mode), s.st_uid, s.st_gid]
+
+def write_committed_meta(path, entries):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    with open(path + '.tmp', 'w') as f: json.dump({'version': 1, 'entries': entries}, f)
+    os.replace(path + '.tmp', path)
 
 def system_dirty():
     try: since = os.lstat(CAPTURE_STARTED).st_mtime_ns
     except FileNotFoundError: return True
+    known = {}
+    def metadata_changed(path, s):
+        # chmod/chown bump ctime only. Count one exactly where the next capture would hold a
+        # different entry than the committed layer. ctime alone never counts: on Cloudflare
+        # an untouched image file gets a fresh ctime when it is first read. Loaded on the
+        # first ctime-only candidate, so mtime hits and quiet walks never pay for it.
+        if not known:
+            try:
+                with open(COMMITTED_META) as f: known['committed'] = json.load(f).get('entries')
+            except (OSError, ValueError, AttributeError): known['committed'] = None
+            known['previous'] = load_manifest()[0]
+            try: known['baseline'] = os.lstat(BASELINE).st_mtime_ns
+            except OSError: known['baseline'] = None
+            try: known['image'] = load_image_manifest()
+            except (OSError, ValueError): known['image'] = None
+        committed = known['committed']
+        if isinstance(committed, dict) and path in committed:
+            # Back to the baked mode counts too: the layer still holds the user's.
+            return committed[path] != meta_of(path, s)
+        if path in ROOTS or known['image'] is None: return False  # capture never takes a root alone
+        # Restored by a codec that kept no record: capture takes it, so compare with the image.
+        if path in known['previous']: return differs(known['image'], path, s)
+        # Elsewhere capture takes only entries changed after the baseline (not platform boot).
+        if known['baseline'] is None or s.st_ctime_ns <= known['baseline']: return False
+        return differs(known['image'], path, s)
     def newer(path):
         try: s = os.lstat(path)
         except OSError: return False  # An install can remove an entry during the probe.
-        return ((stat.S_ISREG(s.st_mode) or stat.S_ISDIR(s.st_mode) or stat.S_ISLNK(s.st_mode))
-                and s.st_mtime_ns > since)
+        if not (stat.S_ISREG(s.st_mode) or stat.S_ISDIR(s.st_mode) or stat.S_ISLNK(s.st_mode)): return False
+        if s.st_mtime_ns > since: return True
+        return s.st_ctime_ns > since and metadata_changed(path, s)
     for root in ROOTS:
         if excluded(root): continue
         if newer(root): return True
@@ -132,7 +176,7 @@ def system_dirty():
 
 def image_id():
     try:
-        with open('/etc/ezil-image-id') as f: return f.read().strip() or 'unknown'
+        with open(IMAGE_ID) as f: return f.read().strip() or 'unknown'
     except OSError: return 'unknown'
 
 def in_roots(path):
@@ -320,6 +364,7 @@ def capture(path, mark_started=True):
     assert len(deleted) <= MAX_DELETED, 'snapshot entry limit'
     logical = hashlib.sha256()
     entries = 0
+    record = {}
     with tarfile.open(path, 'w', format=tarfile.PAX_FORMAT) as tar:
         for name in names:
             s = picked[name]
@@ -355,6 +400,7 @@ def capture(path, mark_started=True):
                     tar.addfile(info, reader)
                     fingerprint = 'f:' + reader.h.hexdigest()
             entries += 1
+            record[name] = meta_of(name, s)
             logical.update(json.dumps([name, info.mode, info.uid, info.gid, fingerprint]).encode() + b'\n')
         data = json.dumps(deleted).encode()
         info = tarfile.TarInfo(DELETED_MEMBER)
@@ -364,6 +410,8 @@ def capture(path, mark_started=True):
         logical.update(b'deleted\n' + data)
     for fd in locks: os.close(fd)
     assert os.path.getsize(path) <= LIMIT, 'snapshot byte limit'
+    # What this capture archived. It becomes the committed record only with sys-committed.
+    write_committed_meta(COMMITTED_META + '.pending', record)
     digest, chunks = hashlib.sha256(), []
     with open(path, 'rb') as f:
         while True:
@@ -532,6 +580,11 @@ def restore():
         try: os.utime(path, (mtime, mtime), follow_symlinks=False)
         except OSError: pass
     for fd in locks: os.close(fd)
+    record = {}
+    for path in restored:
+        try: record[path] = meta_of(path, os.lstat(path))
+        except OSError: pass
+    write_committed_meta(COMMITTED_META, record)
     os.makedirs(STATE, mode=0o700, exist_ok=True)
     with open(MANIFEST + '.tmp', 'w') as f:
         json.dump({'paths': restored, 'deleted': deleted, 'imageId': image_id(), 'snapshotImageId': p['snapshot'].get('imageId'), 'restoredAt': time.time()}, f)
@@ -539,6 +592,15 @@ def restore():
     mark_hydrated(p['snapshot'].get('generation'))
     set_dirty_baseline()
     print(json.dumps({'restored': len(restored), 'skippedImageScoped': skipped, 'conflicts': conflicts, 'sameImage': same_image}))
+
+def promote_committed():
+    # The committed capture's start becomes the dirty baseline, and what it archived
+    # becomes the committed record.
+    try: os.replace(CAPTURE_STARTED + '.pending', CAPTURE_STARTED); promoted = True
+    except FileNotFoundError: promoted = False
+    try: os.replace(COMMITTED_META + '.pending', COMMITTED_META)
+    except FileNotFoundError: pass
+    return promoted
 
 def baseline():
     os.makedirs(STATE, mode=0o700, exist_ok=True)
@@ -582,11 +644,7 @@ try:
                     with open(os.path.join(work, str(i)), 'xb') as out: out.write(f.read(CHUNK))
         print(json.dumps(result))
     elif op == 'sys-dirty': print(json.dumps({'dirty': system_dirty()}))
-    elif op == 'sys-committed':
-        # Promote the committed capture's start to the dirty baseline.
-        try: os.replace(CAPTURE_STARTED + '.pending', CAPTURE_STARTED); promoted = True
-        except FileNotFoundError: promoted = False
-        print(json.dumps({'committed': promoted}))
+    elif op == 'sys-committed': print(json.dumps({'committed': promote_committed()}))
     elif op == 'sys-restore': restore()
     elif op == 'sys-baseline': baseline()
     elif op == 'sys-hydrated':
