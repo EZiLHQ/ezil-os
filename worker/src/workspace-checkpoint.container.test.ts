@@ -693,6 +693,44 @@ printf '{"editor.fontSize":16}\n' > /workspace/.ezil/settings.json
       expect(await must(b, 'cat /workspace/work.txt')).toBe('saved workspace\n');
     }, T);
 
+    it('metadata-only changes are dirty within one probe on the real image: a chmod, and a chmod back to the exact baked mode after a power cut', async () => {
+      const TOOL = '/usr/local/bin/ezil-deps';
+      const timed = async (c: string) => { const t0 = Date.now(); const r = await dirty(c); return { ...r, ms: Date.now() - t0 }; };
+      const { a, store, prefix } = await prepare('meta');
+      const baked = (await must(a, `stat -c %a ${TOOL}`)).trim();
+      expect(baked).toBe('755');
+      await commit(a, store, prefix);
+      expect(await dirty(a)).toEqual({ dirty: false });
+      await new Promise(r => setTimeout(r, 1100));
+      await must(a, `chmod 700 ${TOOL}`);
+      const chmodded = await timed(a);
+      expect(chmodded.dirty).toBe(true);
+      expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+      expect(await dirty(a)).toEqual({ dirty: false });
+      await powerCut(a);
+      const b = await restore('meta', store, prefix);
+      expect((await must(b, `stat -c %a ${TOOL}`)).trim()).toBe('700');
+      expect(await baselineSystemLayer(sdk(b))).toBe(true);  // the desktop is up
+      await new Promise(r => setTimeout(r, 1100));
+      // Docker has no lazy ctime: bump ctimes the way Cloudflare does, without changing
+      // anything, on image and restored entries alike. That alone is never dirty.
+      await must(b, 'for p in /usr/local/bin /usr/local/lib /usr/local/bin/ezil-deps /root/notes /root/notes/n.txt; do chmod "$(stat -c %a "$p")" "$p"; done');
+      const lazy = await timed(b);
+      expect(lazy.dirty).toBe(false);
+      // Back to EXACTLY the baked mode: the committed layer still says 700.
+      await must(b, `chmod ${baked} ${TOOL}`);
+      const reverted = await timed(b);
+      expect(reverted.dirty).toBe(true);
+      expect((await sysFlush(b, store, prefix)).ok).toBe(true);
+      expect(await dirty(b)).toEqual({ dirty: false });
+      await powerCut(b);
+      const c = await startComputer('power-cut-meta-c');
+      expect((await hydrate(c, store, prefix)).ok).toBe(true);
+      expect((await sysHydrate(c, store, prefix)).ok).toBe(true);
+      expect((await must(c, `stat -c %a ${TOOL}`)).trim()).toBe(baked);
+      console.log(`[metadata probe ms] chmod=${chmodded.ms} lazyCtimeOnly=${lazy.ms} revertToBaked=${reverted.ms}`);
+    }, T);
+
     it('a change during capture remains dirty for the next capture', async () => {
       const { a, store, prefix } = await prepare('during');
       await commit(a, store, prefix);
