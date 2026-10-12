@@ -16,6 +16,8 @@ export interface BillingConfig {
     enforcementEnabled: boolean;
     /** Gate G-STOR: Pro's 20 GB cap may be offered. */
     largeStorageEnabled: boolean;
+    /** Stripe Tax on Checkout. Turn on once EZiL LLC has a tax registration. */
+    automaticTaxEnabled: boolean;
     stripeSecret: string | undefined;
     stripeWebhookSecret: string | undefined;
     /** Publishable key (`pk_…`) for Stripe.js Embedded Checkout. Public by design. */
@@ -43,6 +45,7 @@ export function readBillingConfig(env: Env = process.env): BillingConfig {
         checkoutEnabled: on(env.CHECKOUT_ENABLED),
         enforcementEnabled: on(env.BILLING_ENFORCEMENT),
         largeStorageEnabled: on(env.BILLING_LARGE_STORAGE),
+        automaticTaxEnabled: on(env.BILLING_AUTOMATIC_TAX),
         stripeSecret: nonEmpty(env.STRIPE_SECRET),
         stripeWebhookSecret: nonEmpty(env.STRIPE_WEBHOOK_SECRET),
         stripePublishableKey: publishable(env.STRIPE_PUBLISHABLE_KEY ?? env.STRIPE_KEY),

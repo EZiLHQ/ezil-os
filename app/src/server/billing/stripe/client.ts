@@ -3,7 +3,7 @@ import type { StripeApi, StripeCheckoutSession } from '../ports';
 
 const STRIPE_BASE_URL = 'https://api.stripe.com/v1';
 /** Pin the response schema independently of the Stripe account's default version. */
-const STRIPE_API_VERSION = '2025-09-30.clover';
+const STRIPE_API_VERSION = '2026-03-25.dahlia';
 
 type FormValue = string | number | boolean | undefined | FormValue[] | { [key: string]: FormValue };
 type FormFields = { [key: string]: FormValue };
@@ -72,10 +72,26 @@ interface ChargeResponse {
 }
 
 /** Stripe messages can echo request data; expose status and machine codes instead. */
+/** Stripe's own error text names the bad parameter; keys are scrubbed defensively. */
+function scrub(text: string | null): string | null {
+    if (text === null) return null;
+    return text
+        .replace(/authorization\s*:?\s*(bearer|basic)?\s*\S*/gi, '[redacted]')
+        .replace(/\b(bearer|basic)\s+\S+/gi, '[redacted]')
+        .replace(/\b(sk|rk|pk|whsec)_(test|live)?_?[A-Za-z0-9]+/g, '$1_[redacted]')
+        .slice(0, 300);
+}
+
 export class StripeRequestError extends Error {
-    constructor(public status: number, public code: string | null, public type: string | null) {
-        super(`Stripe request failed (HTTP ${status})`);
+    public readonly param: string | null;
+    public readonly detail: string | null;
+
+    constructor(public status: number, public code: string | null, public type: string | null, param: string | null = null, detail: string | null = null) {
+        const safeDetail = scrub(detail);
+        super(`Stripe request failed (HTTP ${status})${param ? ` on ${param}` : ''}${safeDetail ? `: ${safeDetail}` : ''}`);
         this.name = 'StripeRequestError';
+        this.param = param;
+        this.detail = safeDetail;
     }
 }
 
@@ -149,6 +165,8 @@ export function createStripeClient(opts: {
                 response.status,
                 typeof error.code === 'string' ? error.code : null,
                 typeof error.type === 'string' ? error.type : null,
+                typeof error.param === 'string' ? error.param : null,
+                typeof error.message === 'string' ? error.message : null,
             );
         }
         return response.json() as Promise<T>;
@@ -172,8 +190,15 @@ export function createStripeClient(opts: {
                 customer: input.customerId,
                 client_reference_id: input.userId,
                 metadata: { sku: input.sku },
-                automatic_tax: { enabled: true },
-                customer_update: { address: 'auto', name: 'auto' },
+                // Stripe Tax makes Checkout ask US buyers for a full street
+                // address (and hides Google Pay unless a shipping address is
+                // collected). It only collects where EZiL LLC is registered, so
+                // until a registration exists it adds friction and $0 of tax:
+                // off unless BILLING_AUTOMATIC_TAX=1 (contract §7).
+                ...(input.automaticTax ? {
+                    automatic_tax: { enabled: true },
+                    customer_update: { address: 'auto', name: 'auto' },
+                } : {}),
                 billing_address_collection: 'auto',
                 saved_payment_method_options: { payment_method_save: 'enabled' },
                 ...(input.uiMode === 'embedded' ? {

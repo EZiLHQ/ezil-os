@@ -12,6 +12,7 @@ const checkoutRequest: CheckoutRequest = {
     userId: 'user_fixture',
     sku: 'pro_monthly_v1',
     uiMode: 'hosted',
+    automaticTax: true,
     returnUrl: 'https://example.com/billing/return?session_id={CHECKOUT_SESSION_ID}',
     successUrl: 'https://example.com/billing/return?session_id={CHECKOUT_SESSION_ID}&source=billing',
     cancelUrl: 'https://example.com/settings?tab=billing',
@@ -99,7 +100,7 @@ describe('createStripeClient requests', () => {
         expect(sent.url).toBe('https://api.stripe.com/v1/customers');
         expect(sent.init?.method).toBe('POST');
         expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
-        expect(sent.headers.get('Stripe-Version')).toBe('2025-09-30.clover');
+        expect(sent.headers.get('Stripe-Version')).toBe('2026-03-25.dahlia');
         expect(sent.headers.get('Content-Type')).toBe('application/x-www-form-urlencoded');
         expect(sent.headers.get('Idempotency-Key')).toBe(customerRequest.idempotencyKey);
         expect(sent.body).toEqual({ 'metadata[user_id]': 'user_fixture', email: customerRequest.email });
@@ -115,7 +116,7 @@ describe('createStripeClient requests', () => {
         expect(sent.url).toBe('https://api.stripe.com/v1/checkout/sessions');
         expect(sent.init?.method).toBe('POST');
         expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
-        expect(sent.headers.get('Stripe-Version')).toBe('2025-09-30.clover');
+        expect(sent.headers.get('Stripe-Version')).toBe('2026-03-25.dahlia');
         expect(sent.headers.get('Content-Type')).toBe('application/x-www-form-urlencoded');
         expect(sent.headers.get('Idempotency-Key')).toBe(checkoutRequest.idempotencyKey);
         expect(sent.body).toEqual(inlinePro());
@@ -260,7 +261,7 @@ describe('Stripe response mapping', () => {
         expect(sent.url).toBe('https://api.stripe.com/v1/subscriptions/sub_fixture');
         expect(sent.init?.method).toBe('GET');
         expect(sent.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
-        expect(sent.headers.get('Stripe-Version')).toBe('2025-09-30.clover');
+        expect(sent.headers.get('Stripe-Version')).toBe('2026-03-25.dahlia');
         expect(sent.init?.body).toBeUndefined();
     });
 
@@ -393,11 +394,23 @@ describe('Stripe request failures', () => {
         } }, { status, statusText: `Authorization: Bearer ${secretKey}` }));
         const error: unknown = await client.createCustomer(customerRequest).catch((error: unknown) => error);
         expect(error).toBeInstanceOf(StripeRequestError);
-        expect(error).toMatchObject({ name: 'StripeRequestError', status, code, type, message: `Stripe request failed (HTTP ${status})` });
+        expect(error).toMatchObject({ name: 'StripeRequestError', status, code, type });
+        // Stripe's own message is kept for diagnosis, scrubbed of any credential.
+        expect((error as Error).message).toMatch(new RegExp(`^Stripe request failed \\(HTTP ${status}\\)`));
         expect(inspect(fetcher, 1).headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
         expect(String(error)).not.toContain(secretKey);
         expect(String(error)).not.toContain('Authorization');
         expect(String(error)).not.toContain('Bearer');
+    });
+
+    it('keeps Stripe\'s parameter and message for diagnosis (positive control for the scrubbing above)', async () => {
+        const { client, fetcher } = fixture({ id: 'cus_fixture' });
+        fetcher.mockResolvedValueOnce(Response.json({ error: {
+            type: 'invalid_request_error', param: 'ui_mode', message: 'Invalid ui_mode: embedded_page.',
+        } }, { status: 400 }));
+        const error = await client.createCustomer(customerRequest).catch((e: unknown) => e) as StripeRequestError;
+        expect(error.param).toBe('ui_mode');
+        expect(error.message).toBe('Stripe request failed (HTTP 400) on ui_mode: Invalid ui_mode: embedded_page.');
     });
 
     it.each(['not json', '{}', '{"error":{"code":42,"type":false}}', 'null'])('maps malformed HTTP errors to null codes: %s', async body => {
@@ -415,5 +428,23 @@ describe('Stripe request failures', () => {
         const failure = new TypeError('fixture network failure');
         fetcher.mockRejectedValueOnce(failure);
         await expect(client.retrieveCharge('ch_fixture')).rejects.toBe(failure);
+    });
+});
+
+describe('automatic tax is opt-in', () => {
+    it('omits Stripe Tax and address saving when automaticTax is false (positive control: true sends both)', async () => {
+        const bodies: URLSearchParams[] = [];
+        const fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
+            bodies.push(new URLSearchParams(String(init?.body ?? '')));
+            return Response.json({ id: 'cs_fixture', url: null, client_secret: 'cs_secret' });
+        });
+        const client = createStripeClient({ secretKey, fetch: fetcher as unknown as typeof fetch });
+        await client.createCheckoutSession({ ...checkoutRequest, uiMode: 'embedded', automaticTax: false });
+        await client.createCheckoutSession({ ...checkoutRequest, uiMode: 'embedded', automaticTax: true });
+        expect(bodies[0].has('automatic_tax[enabled]')).toBe(false);
+        expect(bodies[0].has('customer_update[address]')).toBe(false);
+        expect(bodies[0].get('billing_address_collection')).toBe('auto');
+        expect(bodies[1].get('automatic_tax[enabled]')).toBe('true');
+        expect(bodies[1].get('customer_update[address]')).toBe('auto');
     });
 });

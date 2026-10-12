@@ -149,6 +149,8 @@ export interface CheckoutRequest {
      * clients that cannot load Stripe.js (`successUrl` / `cancelUrl`).
      */
     uiMode: 'embedded' | 'hosted';
+    /** Stripe Tax on the session (`BILLING_AUTOMATIC_TAX=1`). */
+    automaticTax: boolean;
     returnUrl: string;
     successUrl: string;
     cancelUrl: string;

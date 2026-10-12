@@ -74,6 +74,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 userId: ctx.user.id,
                 sku: input.sku,
                 uiMode: publishableKey ? 'embedded' : 'hosted',
+                automaticTax: deps.config.automaticTaxEnabled,
                 returnUrl,
                 successUrl: returnUrl,
                 cancelUrl: `${origin}/os`,
