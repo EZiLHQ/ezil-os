@@ -31,6 +31,112 @@
  * the generation restored, and capture reports it so the Worker can refuse a
  * stale writer.
  */
+/**
+ * Which HOME workspace members a locked root's install rebuilds (PR195 r4241774149).
+ * Embedded VERBATIM in worker/scripts/ezil-restore-deps.sh too, so the trees the
+ * system layer leaves out are exactly the ones restore-deps rebuilds; a test pins
+ * the two copies byte for byte. Needs os, json and fnmatch imported.
+ */
+export const WORKSPACE_PREDICATE_PY = String.raw`def lockfile_manager(directory, exists):
+    # ezil-restore-deps.sh lockfile_pm's precedence: the manager that installs this dir.
+    if exists(os.path.join(directory, 'bun.lock')) or exists(os.path.join(directory, 'bun.lockb')): return 'bun'
+    if exists(os.path.join(directory, 'pnpm-lock.yaml')): return 'pnpm'
+    if exists(os.path.join(directory, 'yarn.lock')): return 'yarn'
+    if exists(os.path.join(directory, 'package-lock.json')): return 'npm'
+    return None
+
+def yaml_without_comment(line):
+    if line.lstrip().startswith('#'): return ''
+    at = line.find(' #')
+    return line if at < 0 else line[:at]
+
+def pnpm_workspace_packages(text):
+    # The 'packages' list of pnpm-workspace.yaml, read without a YAML library: a block list
+    # of plain or quoted scalars, or a one-line flow list. Any other shape (anchors, tags,
+    # nested values, multi-line flow) returns None: claim no member rather than guess.
+    def scalar(raw):
+        raw = raw.strip()
+        if raw[:1] in ('"', "'"):
+            end = raw.find(raw[0], 1)
+            return raw[1:end] if end > 1 and not raw[end + 1:].strip() else None
+        return raw if raw and raw[0] not in '&*!|>[]{}@%,?:-' else None
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if not line.startswith('packages:'): continue
+        rest = yaml_without_comment(line[len('packages:'):]).strip()
+        if rest:
+            if not (rest.startswith('[') and rest.endswith(']')): return None
+            items = [scalar(x) for x in rest[1:-1].split(',') if x.strip()]
+            return items if items and None not in items else None
+        items = []
+        for follow in lines[i + 1:]:
+            body = yaml_without_comment(follow)
+            if not body.strip(): continue
+            if not follow[:1].isspace(): break
+            stripped = body.strip()
+            item = scalar(stripped[2:]) if stripped.startswith('- ') else None
+            if item is None: return None
+            items.append(item)
+        return items or None
+    return None
+
+def workspace_patterns(root, manager, read):
+    if manager == 'pnpm':
+        text = read(os.path.join(root, 'pnpm-workspace.yaml'))
+        return None if text is None else pnpm_workspace_packages(text)
+    text = read(os.path.join(root, 'package.json'))
+    try: manifest = json.loads(text) if text is not None else None
+    except ValueError: return None
+    workspaces = manifest.get('workspaces') if isinstance(manifest, dict) else None
+    if isinstance(workspaces, dict) and manager in ('yarn', 'bun'): workspaces = workspaces.get('packages')
+    return workspaces if isinstance(workspaces, list) else None
+
+WORKSPACE_GLOB_UNSUPPORTED = set('{}[]()?+')
+
+def glob_segments_match(parts, segments):
+    if not parts: return not segments
+    if parts[0] == '**':
+        if len(parts) == 1: return len(segments) >= 1
+        return any(glob_segments_match(parts[1:], segments[i:]) for i in range(len(segments) + 1))
+    return bool(segments) and fnmatch.fnmatchcase(segments[0], parts[0]) and glob_segments_match(parts[1:], segments[1:])
+
+def workspace_member(patterns, rel):
+    # rel: the member dir relative to the root. Subset of the package managers' globs:
+    # literal segments, '*' within one segment, '**' across segments (a trailing '**' needs
+    # one), './' and '/' trims, and '!' exclusions (any match excludes). Any other syntax,
+    # an absolute or parent path, matches nothing; an exclusion this reader cannot evaluate
+    # claims no member at all.
+    if not rel or not isinstance(patterns, list): return False
+    segments = rel.split('/')
+    included = False
+    for raw in patterns:
+        if not isinstance(raw, str): return False
+        negate = raw.startswith('!')
+        pattern = raw[1:] if negate else raw
+        while pattern.startswith('./'): pattern = pattern[2:]
+        pattern = pattern.rstrip('/')
+        parts = pattern.split('/')
+        if (not pattern or any(c in WORKSPACE_GLOB_UNSUPPORTED for c in pattern)
+                or any(part in ('', '.', '..') for part in parts)):
+            if negate: return False
+            continue
+        if glob_segments_match(parts, segments):
+            if negate: return False
+            included = True
+    return included
+
+def workspace_root_within(home, project, exists, read):
+    # The root whose install builds this member's trees (project: the member's segments
+    # below home): the nearest ancestor (home itself included) with package.json and a
+    # supported lockfile, and only when that root's package manager declares the member.
+    for depth in range(len(project) - 1, -1, -1):
+        root = os.path.join(home, *project[:depth])
+        manager = lockfile_manager(root, exists)
+        if manager is None or not exists(os.path.join(root, 'package.json')): continue
+        return root if workspace_member(workspace_patterns(root, manager, read), '/'.join(project[depth:])) else None
+    return None
+`;
+
 export const SYSTEM_SNAPSHOT_SCRIPT = String.raw`
 import os, sys, json, stat, tarfile, hashlib, shutil, subprocess, tempfile, time, fcntl, fnmatch
 
@@ -124,107 +230,10 @@ def read_small_text(path, limit=CHUNK):
     except OSError: return None
     return None if len(data) > limit else data.decode('utf-8', 'replace')
 
-def lockfile_manager(directory, exists):
-    # ezil-restore-deps.sh lockfile_pm's precedence: the manager that installs this dir.
-    if exists(os.path.join(directory, 'bun.lock')) or exists(os.path.join(directory, 'bun.lockb')): return 'bun'
-    if exists(os.path.join(directory, 'pnpm-lock.yaml')): return 'pnpm'
-    if exists(os.path.join(directory, 'yarn.lock')): return 'yarn'
-    if exists(os.path.join(directory, 'package-lock.json')): return 'npm'
-    return None
-
-def yaml_without_comment(line):
-    if line.lstrip().startswith('#'): return ''
-    at = line.find(' #')
-    return line if at < 0 else line[:at]
-
-def pnpm_workspace_packages(text):
-    # The 'packages' list of pnpm-workspace.yaml, read without a YAML library: a block list
-    # of plain or quoted scalars, or a one-line flow list. Any other shape (anchors, tags,
-    # nested values, multi-line flow) returns None: claim no member rather than guess.
-    def scalar(raw):
-        raw = raw.strip()
-        if raw[:1] in ('"', "'"):
-            end = raw.find(raw[0], 1)
-            return raw[1:end] if end > 1 and not raw[end + 1:].strip() else None
-        return raw if raw and raw[0] not in '&*!|>[]{}@%,?:-' else None
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        if not line.startswith('packages:'): continue
-        rest = yaml_without_comment(line[len('packages:'):]).strip()
-        if rest:
-            if not (rest.startswith('[') and rest.endswith(']')): return None
-            items = [scalar(x) for x in rest[1:-1].split(',') if x.strip()]
-            return items if items and None not in items else None
-        items = []
-        for follow in lines[i + 1:]:
-            body = yaml_without_comment(follow)
-            if not body.strip(): continue
-            if not follow[:1].isspace(): break
-            stripped = body.strip()
-            item = scalar(stripped[2:]) if stripped.startswith('- ') else None
-            if item is None: return None
-            items.append(item)
-        return items or None
-    return None
-
-def workspace_patterns(root, manager, read):
-    if manager == 'pnpm':
-        text = read(os.path.join(root, 'pnpm-workspace.yaml'))
-        return None if text is None else pnpm_workspace_packages(text)
-    text = read(os.path.join(root, 'package.json'))
-    try: manifest = json.loads(text) if text is not None else None
-    except ValueError: return None
-    workspaces = manifest.get('workspaces') if isinstance(manifest, dict) else None
-    if isinstance(workspaces, dict) and manager in ('yarn', 'bun'): workspaces = workspaces.get('packages')
-    return workspaces if isinstance(workspaces, list) else None
-
-WORKSPACE_GLOB_UNSUPPORTED = set('{}[]()?+')
-
-def glob_segments_match(parts, segments):
-    if not parts: return not segments
-    if parts[0] == '**':
-        if len(parts) == 1: return len(segments) >= 1
-        return any(glob_segments_match(parts[1:], segments[i:]) for i in range(len(segments) + 1))
-    return bool(segments) and fnmatch.fnmatchcase(segments[0], parts[0]) and glob_segments_match(parts[1:], segments[1:])
-
-def workspace_member(patterns, rel):
-    # rel: the member dir relative to the root. Subset of the package managers' globs:
-    # literal segments, '*' within one segment, '**' across segments (a trailing '**' needs
-    # one), './' and '/' trims, and '!' exclusions (any match excludes). Any other syntax,
-    # an absolute or parent path, matches nothing; an exclusion this reader cannot evaluate
-    # claims no member at all.
-    if not rel or not isinstance(patterns, list): return False
-    segments = rel.split('/')
-    included = False
-    for raw in patterns:
-        if not isinstance(raw, str): return False
-        negate = raw.startswith('!')
-        pattern = raw[1:] if negate else raw
-        while pattern.startswith('./'): pattern = pattern[2:]
-        pattern = pattern.rstrip('/')
-        parts = pattern.split('/')
-        if (not pattern or any(c in WORKSPACE_GLOB_UNSUPPORTED for c in pattern)
-                or any(part in ('', '.', '..') for part in parts)):
-            if negate: return False
-            continue
-        if glob_segments_match(parts, segments):
-            if negate: return False
-            included = True
-    return included
-
+${WORKSPACE_PREDICATE_PY}
 def workspace_root_of(directory, exists, read):
-    # The root whose install builds this member's trees: the nearest ancestor in the same home
-    # (the home itself included) with package.json and a supported lockfile, and only when
-    # that root's package manager declares the member. None otherwise.
     found = split_home(directory + '/')
-    if found is None: return None
-    home, project = found[0], [s for s in found[1] if s]
-    for depth in range(len(project) - 1, -1, -1):
-        root = os.path.join(home, *project[:depth])
-        manager = lockfile_manager(root, exists)
-        if manager is None or not exists(os.path.join(root, 'package.json')): continue
-        return root if workspace_member(workspace_patterns(root, manager, read), '/'.join(project[depth:])) else None
-    return None
+    return None if found is None else workspace_root_within(found[0], [s for s in found[1] if s], exists, read)
 
 def project_rebuildable(directory, exists, read):
     # package.json AND either its own lockfile (restore-deps installs it) or a workspace root
