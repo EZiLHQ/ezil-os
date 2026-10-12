@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { createPrinter, createSourceFile, ScriptKind, ScriptTarget } from 'typescript';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AI_PACKS, FREE_PLAN, PRO_PLAN, storageCapBytes } from '@/server/billing/catalog';
@@ -25,6 +26,7 @@ vi.mock('../../login/actions', () => ({ signInWithGoogle: vi.fn(), signInWithPas
 
 import PricingPage, { dynamic, metadata } from './page';
 import MarketingHome from '../_components/home-page';
+import styles from '../marketing.module.css';
 import { viewport } from '../layout';
 import LoginPage from '../../login/page';
 
@@ -34,7 +36,7 @@ const sources = ['./page.tsx', '../layout.tsx', '../_components/home-page.tsx', 
 const css = read('../marketing.module.css');
 const banned = /faster|instant|unlimited|priority|vcpu|gpu|heavy\s+use|fair\s+use|gpt|claude|gemini|llama/i;
 
-/** Include metadata and accessible names as well as all rendered text, even closed FAQ answers. */
+/** Include metadata and accessible names as well as all rendered text and FAQ answers. */
 function strings(value: unknown): string[] {
     if (typeof value === 'string') return [value];
     if (Array.isArray(value)) return value.flatMap(strings);
@@ -43,6 +45,21 @@ function strings(value: unknown): string[] {
 }
 const render = (largeStorageEnabled = false, focusPlans = false) => renderToStaticMarkup(MarketingHome({ largeStorageEnabled, focusPlans }));
 const textContent = (html: string) => html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
+
+/** Comments are not public copy; parsing preserves strings and JSX in every source branch. */
+function withoutComments(source: string): string {
+    return createPrinter({ removeComments: true }).printFile(
+        createSourceFile('copy.tsx', source, ScriptTarget.Latest, true, ScriptKind.TSX),
+    );
+}
+
+function expectSectionOrder(html: string, markers: string[]): void {
+    let previous = -1;
+    for (const marker of markers) {
+        expect(html.indexOf(marker), marker).toBeGreaterThan(previous);
+        previous = html.indexOf(marker);
+    }
+}
 
 beforeEach(() => {
     flags.pricingPageEnabled = false;
@@ -56,11 +73,26 @@ describe('the complete public offer follows the copy contract', () => {
 
     it.each([false, true])('scans all content, metadata, accessible labels and rendered text (storage: %s)', storage => {
         const copy = strings([getPricingContent(storage), marketingContent, pricingMetadata]);
-        const html = render(storage);
+        const pages = [render(storage), render(storage, true)];
         expect(copy).toContain('Open EZiL OS and get to work.');
-        expect(html).toContain('Is a computer always available?');
+        for (const html of pages) {
+            expect(html).toContain('Is a computer always available?');
+            expect(html).toContain(`aria-label="${marketingContent.navigationLabel}"`);
+        }
         expect(banned.test('Build faster')).toBe(true);
-        for (const value of [...copy, textContent(html), ...sources]) expect(value).not.toMatch(banned);
+        for (const value of [...copy, ...pages, ...pages.map(textContent), ...sources.map(withoutComments)]) expect(value).not.toMatch(banned);
+    });
+
+    it('excludes comments from the copy scan while preserving metadata, labels and JSX text', () => {
+        const comment = '// Build faster\n/* unlimited */\nconst copy = <p>{/* instant */}Start free</p>;';
+        expect(comment).toMatch(banned);
+        expect(withoutComments(comment)).toContain('Start free');
+        expect(withoutComments(comment)).not.toMatch(banned);
+        for (const source of [
+            "const metadata = { title: 'Build faster' };",
+            'const label = <nav aria-label="Build faster" />;',
+            'const heading = <h1>Build faster</h1>;',
+        ]) expect(withoutComments(source)).toMatch(banned);
     });
 
     it.each([false, true])('derives prices and all six allowances from the catalog (storage: %s)', storage => {
@@ -89,12 +121,30 @@ describe('the complete public offer follows the copy contract', () => {
 });
 
 describe('shared home document', () => {
-    it('gates /pricing per request, then renders the same home with native plans focus', () => {
+    it('gates /pricing per request, then renders plans first with one plans h1', () => {
         expect(() => PricingPage()).toThrow('pricing disabled');
         flags.pricingPageEnabled = true;
         const html = renderToStaticMarkup(PricingPage());
         expect(html).toBe(render(false, true));
-        expect(html).toMatch(/<section id="plans"[^>]*tabindex="-1"[^>]*autofocus=""/);
+        expect(html).toMatch(/<main\b[^>]*><section id="plans"[^>]*><h1 id="plans-title">Plans<\/h1>/);
+        expect(html.match(/<h1\b/g)).toHaveLength(1);
+        expect(html.match(/<section\b/g)).toHaveLength(5);
+        expectSectionOrder(html, ['<header', 'id="plans"', 'id="top-ups-title"', 'id="limits-title"', 'id="faq-title"', 'id="closing-title"', '<footer']);
+        expect(html).toContain('href="#plans"');
+        expect(html).toContain('Sold by EZiL LLC');
+        for (const id of ['plan-free', 'plan-pro', 'cta-get-pro']) expect(html).toContain(`data-testid="${id}"`);
+        const home = render();
+        for (const marker of ['data-testid="home-hero"', `class="${styles.desktop}"`, `aria-label="${marketingContent.featuresLabel}"`]) {
+            expect(home).toContain(marker);
+            expect(html).not.toContain(marker);
+        }
+        const focusAttribute = /\s(?:autofocus|tabindex)=/i;
+        for (const attribute of ['autofocus=""', 'tabindex="-1"']) expect(`<section ${attribute}>`).toMatch(focusAttribute);
+        const plans = html.match(/<section id="plans"[^>]*>/)?.[0];
+        expect(plans).toContain('aria-labelledby="plans-title"');
+        expect(plans).not.toMatch(focusAttribute);
+        expect('<section autofocus="">').toMatch(/\sautofocus=/i);
+        expect(html).not.toMatch(/\sautofocus=/i);
         expect(dynamic).toBe('force-dynamic');
         expect(metadata.title).toBe('Plans · EZiL OS');
         expect(viewport.interactiveWidget).toBe('resizes-content');
@@ -102,27 +152,40 @@ describe('shared home document', () => {
         expect(renderToStaticMarkup(PricingPage())).toBe(render(true, true));
         expect(render(false)).toContain('GB today · 20 GB soon');
         expect(render(true)).not.toContain('GB today · 20 GB soon');
+        flags.pricingPageEnabled = false;
+        expect(() => PricingPage()).toThrow('pricing disabled');
     });
 
     it('renders all ten sections in order and every pinned selector', () => {
         const html = render();
         expect(html.match(/<h1\b/g)).toHaveLength(1);
+        expect(html).toMatch(/data-testid="home-hero"[^>]*>[\s\S]*?<h1 id="home-title">Open EZiL OS and get to work\.<\/h1>/);
+        expect(html).toContain('<h2 id="plans-title">Plans</h2>');
         expect(html.match(/<article\b/g)).toHaveLength(2);
-        expect(html.match(/<details\b/g)).toHaveLength(6);
-        expect(html.match(/<summary\b/g)).toHaveLength(6);
-        let previous = -1;
-        for (const marker of ['<header', 'data-testid="home-hero"', 'aria-hidden="true"', 'aria-label="Your workspace"', 'id="plans"', 'id="top-ups-title"', 'id="limits-title"', 'id="faq-title"', 'id="closing-title"', '<footer']) {
-            expect(html.indexOf(marker)).toBeGreaterThan(previous);
-            previous = html.indexOf(marker);
-        }
+        expect(html.match(/<section\b/g)).toHaveLength(7);
+        expectSectionOrder(html, ['<header', 'data-testid="home-hero"', `class="${styles.desktop}" aria-hidden="true"`, 'aria-label="Your workspace"', 'id="plans"', 'id="top-ups-title"', 'id="limits-title"', 'id="faq-title"', 'id="closing-title"', '<footer']);
         for (const id of ['home-hero', 'cta-start-free', 'cta-sign-in', 'plan-free', 'plan-pro', 'cta-get-pro']) {
             expect(html).toContain(`data-testid="${id}"`);
         }
         for (const link of marketingContent.links) expect(html).toContain(`href="${link.href}">${link.label}</a>`);
         expect(html).toContain('Sold by EZiL LLC');
-        for (const match of html.matchAll(/<(a|summary)\b[^>]*>([\s\S]*?)<\/\1>/g)) {
+        for (const match of html.matchAll(/<(a)\b[^>]*>([\s\S]*?)<\/\1>/g)) {
             expect(textContent(match[2]).trim().length).toBeGreaterThan(0);
         }
+    });
+
+    it.each([false, true])('renders six FAQ questions as h3 headings with visible answers (plans first: %s)', focusPlans => {
+        const html = render(false, focusPlans);
+        const faq = html.match(/<section[^>]*aria-labelledby="faq-title"[\s\S]*?<\/section>/)?.[0] ?? '';
+        expect(faq).toContain('<h2 id="faq-title">Frequently asked questions</h2>');
+        expect(faq.match(/<h3\b/g)).toHaveLength(6);
+        expect(faq.match(/<p\b/g)).toHaveLength(6);
+        for (const item of getPricingContent(false).faq.items) {
+            expect(faq).toContain(`<div class="${styles.faq}"><h3>${item.question}</h3><p>${item.answer}</p></div>`);
+        }
+        const disclosure = /<\/?(?:details|summary)\b/i;
+        for (const control of ['<details>Answer</details>', '<summary>Question</summary>']) expect(control).toMatch(disclosure);
+        expect(html).not.toMatch(disclosure);
     });
 
     it('pins CTA destinations and their placement before the allowance tiles', () => {
