@@ -3079,6 +3079,53 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     }
   }
 
+  /**
+   * A fresh container now holds the committed system layer, so it is clean
+   * (19c3f17). Restart the clocks: the first interval cycle probes instead of
+   * running a full walk and tar because the old container's last flush is more
+   * than SYSTEM_FLUSH_INTERVAL_MS old, and the old container's pending change
+   * does not carry over. Never throws.
+   */
+  private async noteFreshSystemLayer(): Promise<void> {
+    const now = Date.now();
+    try {
+      await this.ctx.storage.put(SYSTEM_LAST_FLUSH_AT_KEY, now);
+      await this.ctx.storage.put(SYSTEM_LAST_CAPTURE_STARTED_AT_KEY, now);
+      await this.ctx.storage.delete(SYSTEM_DIRTY_PENDING_AT_KEY);
+    } catch { /* best effort: at worst the old behaviour, one full capture */ }
+  }
+
+  /**
+   * A sooner next cycle while a system change may be waiting (contract §6, 90 s).
+   * Without it the cadence backs off to 60 s, and a change made during a capture's
+   * walk waited for a whole slow cycle after that capture. Never extends the cadence,
+   * never loops: only a pending gap that has not ended, or a capture this cycle.
+   */
+  private async systemRecheckSeconds(cycleStartedAt: number): Promise<number | undefined> {
+    try {
+      const now = Date.now();
+      const backoffAt = await this.ctx.storage.get<number>(SYSTEM_FLUSH_BACKOFF_AT_KEY);
+      if (backoffAt !== undefined && now - backoffAt < SYSTEM_FLUSH_INTERVAL_MS) return undefined;
+      const started = (await this.ctx.storage.get<number>(SYSTEM_LAST_CAPTURE_STARTED_AT_KEY))
+        ?? (await this.ctx.storage.get<number>(SYSTEM_LAST_FLUSH_AT_KEY));
+      if (started === undefined) return undefined;
+      const seconds = (ms: number) => Math.min(WORKSPACE_FLUSH_INTERVAL_SECONDS, Math.max(1, Math.ceil(ms / 1000)));
+      if (await this.ctx.storage.get<number>(SYSTEM_DIRTY_PENDING_AT_KEY) !== undefined) {
+        const gapEndsIn = started + SYSTEM_DIRTY_MIN_GAP_MS - now;
+        return gapEndsIn > 0 ? seconds(gapEndsIn) : undefined;
+      }
+      if (started >= cycleStartedAt) {
+        // A change made during that capture's walk is not in it: probe as soon as the
+        // probe spacing allows.
+        const lastProbe = (await this.ctx.storage.get<number>(SYSTEM_LAST_DIRTY_PROBE_AT_KEY)) ?? started;
+        return seconds(lastProbe + SYSTEM_DIRTY_PROBE_MS - now);
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** The real body of {@link flushWorkspaceScheduled} — see that method's doc comment for the ordered contract. */
   private async runScheduledFlushCycle(): Promise<void> {
     const terminated = (await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)) ?? false;
@@ -3191,63 +3238,16 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       return;
     }
 
+    // The cadence, made sooner only while a system change may be waiting (`systemRecheckSeconds`).
     const outcome = await this.runWorkspaceFlush('alarm', { allowDefer: true });
-    const nextIntervalSeconds = await this.nextFlushRescheduleSeconds(outcome, lastActivityAt);
-    const systemSeconds = await this.systemRecheckSeconds(now);
+    const nextIntervalSeconds = Math.min(await this.nextFlushRescheduleSeconds(outcome, lastActivityAt),
+      (await this.systemRecheckSeconds(now)) ?? Infinity);
     try {
-      await this.schedule(systemSeconds === undefined ? nextIntervalSeconds : Math.min(nextIntervalSeconds, systemSeconds),
-        WORKSPACE_FLUSH_CALLBACK);
+      await this.schedule(nextIntervalSeconds, WORKSPACE_FLUSH_CALLBACK);
     } catch (err) {
       console.error(
         `[ezil-boot] phase=workspace_flush event=reschedule_failed error=workspace_operation_failed`,
       );
-    }
-  }
-
-  /**
-   * A fresh container now holds the committed system layer, so it is clean
-   * (19c3f17). Restart the clocks: the first interval cycle probes instead of
-   * running a full walk and tar because the old container's last flush is more
-   * than SYSTEM_FLUSH_INTERVAL_MS old, and the old container's pending change
-   * does not carry over. Never throws.
-   */
-  private async noteFreshSystemLayer(): Promise<void> {
-    const now = Date.now();
-    try {
-      await this.ctx.storage.put(SYSTEM_LAST_FLUSH_AT_KEY, now);
-      await this.ctx.storage.put(SYSTEM_LAST_CAPTURE_STARTED_AT_KEY, now);
-      await this.ctx.storage.delete(SYSTEM_DIRTY_PENDING_AT_KEY);
-    } catch { /* best effort: at worst the old behaviour, one full capture */ }
-  }
-
-  /**
-   * A sooner next cycle while a system change may be waiting (contract §6, 90 s).
-   * Without it the cadence backs off to 60 s, and a change made during a capture's
-   * walk waited for a whole slow cycle after that capture. Never extends the cadence,
-   * never loops: only a pending gap that has not ended, or a capture this cycle.
-   */
-  private async systemRecheckSeconds(cycleStartedAt: number): Promise<number | undefined> {
-    try {
-      const now = Date.now();
-      const backoffAt = await this.ctx.storage.get<number>(SYSTEM_FLUSH_BACKOFF_AT_KEY);
-      if (backoffAt !== undefined && now - backoffAt < SYSTEM_FLUSH_INTERVAL_MS) return undefined;
-      const started = (await this.ctx.storage.get<number>(SYSTEM_LAST_CAPTURE_STARTED_AT_KEY))
-        ?? (await this.ctx.storage.get<number>(SYSTEM_LAST_FLUSH_AT_KEY));
-      if (started === undefined) return undefined;
-      const seconds = (ms: number) => Math.min(WORKSPACE_FLUSH_INTERVAL_SECONDS, Math.max(1, Math.ceil(ms / 1000)));
-      if (await this.ctx.storage.get<number>(SYSTEM_DIRTY_PENDING_AT_KEY) !== undefined) {
-        const gapEndsIn = started + SYSTEM_DIRTY_MIN_GAP_MS - now;
-        return gapEndsIn > 0 ? seconds(gapEndsIn) : undefined;
-      }
-      if (started >= cycleStartedAt) {
-        // A change made during that capture's walk is not in it: probe as soon as the
-        // probe spacing allows.
-        const lastProbe = (await this.ctx.storage.get<number>(SYSTEM_LAST_DIRTY_PROBE_AT_KEY)) ?? started;
-        return seconds(lastProbe + SYSTEM_DIRTY_PROBE_MS - now);
-      }
-      return undefined;
-    } catch {
-      return undefined;
     }
   }
 
