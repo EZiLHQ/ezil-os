@@ -156,6 +156,8 @@ function fakeSandboxNamespace(options: {
    * default. Defaults to an immediately-resolved `{}`.
    */
   flushWorkspaceNow?: () => Promise<unknown>;
+  /** Replace or add individual Durable Object RPC methods (e.g. `hydrateWorkspace`). */
+  rpc?: Record<string, (...args: unknown[]) => Promise<unknown>>;
 }): { binding: unknown; calls: CallLog } {
   /** The sandbox id the Worker actually opened the DO with. */
   let openedWith = SANDBOX_NAME;
@@ -335,6 +337,7 @@ function fakeSandboxNamespace(options: {
   };
   impl.runningContainerFetch = impl.containerFetch!;
   impl.stopRuntimeForAcceptance = impl.terminateSandbox!;
+  Object.assign(impl, options.rpc ?? {});
 
   const stub = new Proxy(
     {},
@@ -2959,6 +2962,32 @@ describe('preview persistence is required before desktop readiness', () => {
     }), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET });
     expect(res.status).toBe(503); expect(calls.startProcess).toHaveLength(0);
     expect(await res.json()).toMatchObject({ ok: false, error: 'workspace_persistence_unavailable' });
+  });
+  const previewWith = async (hydrateDetail: string | undefined) => {
+    const blocked: unknown[] = [];
+    const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true, rpc: {
+      hydrateWorkspace: async () => ({ mounted: false, ...(hydrateDetail === undefined ? {} : { detail: hydrateDetail }) }),
+      recordPersistenceOpenBlocked: async (code: unknown) => { blocked.push(code); },
+    } });
+    const res = await worker.fetch(new Request('https://api-desktop.ezil.org/sandbox/preview', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: await mintToken(), projectId: 'proj-1', userId: 'user-1', desktopMode: 'neko' }),
+    }), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_WORKSPACE_R2_BUCKET: {} });
+    return { res, calls, blocked };
+  };
+  it('a failed initial checkpoint answers the retryable checkpoint code, never unavailable persistence', async () => {
+    const { res, calls, blocked } = await previewWith('workspace_checkpoint_failed');
+    expect(res.status).toBe(503); expect(calls.startProcess).toHaveLength(0);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'workspace_checkpoint_failed' });
+    expect(blocked).toEqual(['workspace_checkpoint_failed']);
+  });
+  it('every other unmounted detail still blocks the open as unavailable persistence', async () => {
+    for (const detail of ['workspace_restore_failed', 'workspace_unmarked_nonempty', 'workspace_store_misconfigured', undefined]) {
+      const { res, calls, blocked } = await previewWith(detail);
+      expect(res.status).toBe(503); expect(calls.startProcess).toHaveLength(0);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'workspace_persistence_unavailable' });
+      expect(blocked).toEqual(['workspace_persistence_unavailable']);
+    }
   });
   it('rejects loose-object writes after a checkpoint without mutating storage', async () => {
     let puts = 0;

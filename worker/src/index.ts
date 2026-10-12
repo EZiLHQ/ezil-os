@@ -4154,8 +4154,12 @@ async function handlePreview(
     );
 
     if (!workspace.mounted) {
-      try { await sandbox.recordPersistenceOpenBlocked('workspace_persistence_unavailable'); } catch { /* telemetry only */ }
-      return json({ ok: false, error: 'workspace_persistence_unavailable', workspace }, 503);
+      // A failed initial checkpoint is transient (the next open checkpoints again)
+      // and keeps its own code, which the app retries. Every other unmounted
+      // detail means durability is unavailable: the open stays blocked.
+      const code = workspace.detail === 'workspace_checkpoint_failed' ? 'workspace_checkpoint_failed' : 'workspace_persistence_unavailable';
+      try { await sandbox.recordPersistenceOpenBlocked(code); } catch { /* telemetry only */ }
+      return json({ ok: false, error: code, workspace }, 503);
     }
 
     const desktopDone = tl.stage('preview_lifecycle', 'sandbox.preview.desktop_ready');

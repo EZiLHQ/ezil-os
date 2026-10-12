@@ -180,6 +180,11 @@ describe.each([
         expect(surfacePreviewErrorAsValue(errorCode, retryable)).toBe(true);
     });
 
+    it('classifies the exact Worker body, which also carries the unmounted workspace result', () => {
+        const body = { ok: false, error: errorCode, workspace: { mounted: false, detail: 'workspace_checkpoint_failed' } };
+        expect(classifyWorkerHttpFailure(503, JSON.stringify(body))).toBe(errorCode);
+    });
+
     it.each([200, 503])('returns its own code, retry policy and readable message on HTTP %i', async (status) => {
         stubResponse({ ok: false, error: errorCode }, status);
         expect(await requestGuacamolePreview(CONFIG, SECRET, {
