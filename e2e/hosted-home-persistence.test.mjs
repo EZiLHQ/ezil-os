@@ -371,6 +371,12 @@ test('deps and dev steps use the pinned tool path, a lockfile-restoring wait and
   assert.ok(!/\|\s*bash/.test(install), 'never pipe the installer into bash: a failed fetch exits 0');
   assert.ok(install.includes(`'${OPENCODE_INSTALLER_URL}'`) && install.includes(`V=${OPENCODE_VERSION}`));
   assert.ok(install.includes('bash "$I" --version "$V"'), 'the official installer runs from a file, pinned');
+  // Worst case stays inside the step's 660 s runStep budget, so a slow install reports its own class.
+  const budget = 3 * Number(install.match(/--max-time (\d+)/)[1]) + 2 * 5 + Number(install.match(/timeout (\d+) bash "\$I"/)[1])
+    + Number(install.match(/got=\$\(timeout (\d+) /)[1]);
+  assert.ok(budget <= 650, `install step worst case ${budget}s`);
+  const flow = readFileSync(script, 'utf8');
+  assert.match(flow, /runStep\('opencode install', opencodeInstallScript\(runId\), 660000\)/);
 });
 
 // A stand-in for the official installer's contract (opencode.ai/install, read 2026-10-12):

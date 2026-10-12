@@ -274,7 +274,7 @@ export const OPENCODE_INSTALL_FAILURES = Object.freeze([
 ]);
 
 export function opencodeInstallScript(runId, { installerUrl = OPENCODE_INSTALLER_URL, version = OPENCODE_VERSION,
-  timeoutSeconds = 600, retryDelaySeconds = 5 } = {}) {
+  timeoutSeconds = 420, retryDelaySeconds = 5 } = {}) {
   const p = runPaths(runId);
   assert.match(version, /^\d+\.\d+\.\d+$/, 'Invalid OpenCode version');
   assert.ok(installerUrl === OPENCODE_INSTALLER_URL || /^file:\/\/\/[A-Za-z0-9._/-]+$/.test(installerUrl), 'Invalid installer URL');
@@ -290,12 +290,13 @@ export function opencodeInstallScript(runId, { installerUrl = OPENCODE_INSTALLER
     // The official installer, saved to a file first: `curl | bash` exits 0 when
     // the fetch fails, so a pre-existing binary passed without any install.
     'I="$S/opencode-install.sh"; L="$S/opencode-install.log"; rm -f "$I"; : > "$L"; fetched=0',
-    `for a in 1 2 3; do curl -fsSL --connect-timeout 20 --max-time 120 -o "$I" '${installerUrl}' >> "$S/opencode-fetch.log" 2>&1 && [ -s "$I" ] && { fetched=1; break; }; [ "$a" -lt 3 ] && sleep ${retryDelaySeconds}; done`,
+    // Bounded inside the step's 660 s: fetch <= 3 x 60 s + 2 x 5 s, install <= 420 s, version <= 30 s.
+    `for a in 1 2 3; do curl -fsSL --connect-timeout 15 --max-time 60 -o "$I" '${installerUrl}' >> "$S/opencode-fetch.log" 2>&1 && [ -s "$I" ] && { fetched=1; break; }; [ "$a" -lt 3 ] && sleep ${retryDelaySeconds}; done`,
     // Its output stays in the per-container scratch log; the terminal shows only the result.
     `rc=1; [ "$fetched" = 1 ] && { timeout ${timeoutSeconds} bash "$I" --version "$V" > "$L" 2>&1 < /dev/null; rc=$?; }`,
     'bin=0; [ -x "$H/.opencode/bin/opencode" ] && bin=1',
     // Pass only on the pinned version at the installer's own location: an existing binary alone proves nothing.
-    'got=""; [ "$bin" = 1 ] && got=$(timeout 60 "$H/.opencode/bin/opencode" --version 2>/dev/null < /dev/null | head -n 1 | tr -cd "A-Za-z0-9._-")',
+    'got=""; [ "$bin" = 1 ] && got=$(timeout 30 "$H/.opencode/bin/opencode" --version 2>/dev/null < /dev/null | head -n 1 | tr -cd "A-Za-z0-9._-")',
     'ver=0; [ -n "$got" ] && [ "$got" = "$V" ] && ver=1',
     'if [ "$fetched" != 1 ]; then fail=installer_fetch',
     'elif [ "$rc" = 124 ] || [ "$rc" = 137 ]; then fail=timeout',
