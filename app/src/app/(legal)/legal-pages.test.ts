@@ -98,7 +98,7 @@ describe('billing disclosures while paid plans are unavailable', () => {
         expect(plans).toContain('Settings → Billing');
         expect(plans).toContain('Pro continues to the end of the paid period');
         expect(plans).toContain('prices exclude applicable taxes');
-        expect(plans).toContain('calculated at checkout');
+        expect(plans).toContain('any applicable tax is shown before you pay');
         expect(plans).toContain('flat service fee');
         expect(plans).toContain('no cash value and are not transferable');
         expect(plans).toContain('expires at the end of each billing period');
