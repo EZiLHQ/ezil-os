@@ -1040,6 +1040,7 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-billing-meter h4{color:var(--text);text-transform:none;letter-spacing:normal;font-size:14px}
 .ezil-billing-meter p{margin:8px 0 0}
 .ezil-billing-usage{font-size:28px;font-weight:600;line-height:34px}
+.ezil-billing-meter.is-unavailable .ezil-billing-usage{font-size:18px;line-height:34px;color:var(--muted,#9aa3ad)}
 .ezil-billing-allowance,.ezil-billing-note,.ezil-billing-timing{color:var(--muted);font-size:12px;line-height:16px}
 .ezil-billing-progress{height:7px;margin:12px 0;overflow:hidden;border-radius:999px;background:var(--bg)}
 .ezil-billing-progress span{display:block;height:100%;background:var(--accent)}

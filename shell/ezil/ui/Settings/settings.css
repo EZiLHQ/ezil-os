@@ -658,6 +658,8 @@
 .ezil-billing-meter h4 { color: var(--text); text-transform: none; letter-spacing: normal; font-size: 14px; }
 .ezil-billing-meter p { margin: 8px 0 0; }
 .ezil-billing-usage { font-size: 28px; font-weight: 600; line-height: 34px; }
+/* "Coming soon" is a label, not a number: keep it from dominating the row. */
+.ezil-billing-meter.is-unavailable .ezil-billing-usage { font-size: 18px; line-height: 34px; color: var(--muted, #9aa3ad); }
 .ezil-billing-allowance,
 .ezil-billing-timing,
 .ezil-billing-note { color: var(--muted); font-size: 12px; line-height: 16px; }
