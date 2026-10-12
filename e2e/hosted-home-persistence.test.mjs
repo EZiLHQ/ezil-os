@@ -13,7 +13,7 @@ import { runInNewContext } from 'node:vm';
 import {
   assertStagingTarget, TargetRefused, PRODUCTION_HOSTS, assertRunId, newRunId, newNonce, runPaths, checksumTargets,
   stepCommand, stepLines, stepPlan, chunkAcked, MAX_TYPED_LINE, readMarker, parseFields, probeScript, parseProbe, checksumScript, parseChecksums, compareChecksums,
-  opencodeInstallScript, parseOpencodeInstall, opencodeCheckScript, hangDiagnosticScript, projectScript, depsWaitScript, parseDepsStatus, parseDepsWait,
+  opencodeInstallScript, parseOpencodeInstall, opencodeCheckScript, hangDiagnosticScript, restoreFactsScript, projectScript, depsWaitScript, parseDepsStatus, parseDepsWait,
   depsWaitOutcome, projectDepsState, devServerScript, parseDevServer, cleanupPlan, cleanupScript, parseCleanup,
   EVIDENCE_FILE, clampWait, RUN_BUDGET_MS, CLEANUP_RESERVE_MS, POWER_CUT_RPO_MS, powerCutAfterRpo,
   AcceptanceFailure, FAILURE_CODES,
@@ -631,4 +631,14 @@ test('the hang diagnostic reports fixed process names and states, the load, and 
     process.kill(Number(sleeper.stdout.trim()), 'SIGKILL');
     rmSync(`/tmp/ezq-step-${stuck}.000`, { force: true });
   }
+});
+
+test('restore facts report fixed 0/1 values and counts only', () => {
+  const nonce = 'e'.repeat(24), runId = newRunId();
+  const out = spawnSync('bash', ['-c', stepCommand(nonce, restoreFactsScript(runId))], { env: { PATH: process.env.PATH, HOME: mkdtempSync(join(tmpdir(), 'ezq-facts-')) }, encoding: 'utf8', timeout: 30000 });
+  assert.equal(out.status, 0, out.stderr);
+  const fields = parseFields(readMarker(out.stdout, nonce));
+  for (const key of ['replaced', 'pkg', 'lock', 'nm', 'opencode', 'sysmanifest', 'syshydrated', 'log', 'bootmarker', 'scanned', 'script']) assert.match(fields[key], /^[01]$/, key);
+  for (const key of ['sysage', 'installing', 'done', 'failed', 'tracked', 'running']) assert.match(fields[key], /^-?[0-9]+$/, key);
+  assert.equal(fields.replaced, '1'); assert.equal(fields.pkg, '0');
 });

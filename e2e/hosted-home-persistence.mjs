@@ -415,6 +415,35 @@ export const DEPS_WAIT_OUTCOMES = Object.freeze({ 0: 'ready', 1: 'failed', 2: 't
 export const DEPS_STATES = Object.freeze(['pending', 'restoring', 'ready', 'failed', 'missing']);
 export const depsWaitOutcome = code => DEPS_WAIT_OUTCOMES[code] ?? (code === 124 ? 'harness_timeout' : code === 127 ? 'not_installed' : 'unexpected_exit');
 
+/**
+ * Fixed facts right after the switch-on (counts and 0/1 only, no paths or contents):
+ * was the container really replaced, which saved files came back, did the system
+ * layer restore, and did the dependency restore start, log or finish anything.
+ */
+export function restoreFactsScript(runId) {
+  const p = runPaths(runId);
+  const f = (name, test) => `${name}=0; ${test} && ${name}=1`;
+  return [
+    'H="$HOME"',
+    `replaced=1; [ -e ${p.sentinel} ] && replaced=0`,
+    f('pkg', `[ -f "$H/${p.project}/package.json" ]`),
+    f('lock', `[ -f "$H/${p.project}/package-lock.json" ]`),
+    f('nm', `[ -e "$H/${p.project}/node_modules" ]`),
+    f('opencode', '[ -x "$H/.opencode/bin/opencode" ]'),
+    f('sysmanifest', '[ -f /var/lib/ezil-system/manifest.json ]'),
+    f('syshydrated', '[ -f /var/lib/ezil-system/hydrated ]'),
+    'sysage=-1; [ -f /var/lib/ezil-system/manifest.json ] && sysage=$(( $(date +%s) - $(stat -c %Y /var/lib/ezil-system/manifest.json) ))',
+    f('log', '[ -f /tmp/ezil-restore-deps.log ]'),
+    'installing=$(grep -c ": installing" /tmp/ezil-restore-deps.log 2>/dev/null); done_=$(grep -c ": done" /tmp/ezil-restore-deps.log 2>/dev/null); failed=$(grep -c ": FAILED" /tmp/ezil-restore-deps.log 2>/dev/null)',
+    'tracked=$(wc -l < /run/ezil-deps/status 2>/dev/null)',
+    f('bootmarker', '[ -e /run/ezil-deps/boot-restore ]'),
+    f('scanned', '[ -e /run/ezil-deps/scanned ]'),
+    'running=$(pgrep -fc ezil-restore-deps 2>/dev/null)',
+    f('script', '[ -x /usr/local/bin/ezil-restore-deps.sh ]'),
+    'emit "replaced=$replaced,pkg=$pkg,lock=$lock,nm=$nm,opencode=$opencode,sysmanifest=$sysmanifest,syshydrated=$syshydrated,sysage=$sysage,log=$log,installing=${installing:-0},done=${done_:-0},failed=${failed:-0},tracked=${tracked:-0},bootmarker=$bootmarker,scanned=$scanned,running=${running:-0},script=$script"',
+  ].join('\n');
+}
+
 export function depsWaitScript(runId, timeoutSeconds = 600) {
   const p = runPaths(runId);
   assert.ok(Number.isInteger(timeoutSeconds) && timeoutSeconds > 0 && timeoutSeconds <= 3600, 'Invalid deps timeout');
@@ -899,6 +928,9 @@ async function main() {
     // Right after a replacement the computer is busiest: the boot restore is
     // reinstalling the HOME project's dependencies. Wait for that first (what a
     // user would see), then compare; the first comparison still gets 10 min.
+    // Observation only: what the replacement container holds right after the switch-on.
+    try { evidence.restoreFacts = parseFields(await runStep('restore facts', restoreFactsScript(runId), 60000)); }
+    catch { evidence.restoreFacts = { unavailable: '1' }; }
     const deps = parseDepsWait(await runStep('ezil-deps wait', depsWaitScript(runId, 600), 780000), `/root/${paths.project}`);
     evidence.steps.depsWait = deps;
     check(deps.installed, 'deps_tool_missing');
