@@ -95,3 +95,20 @@ export type BillingSummary = BillingSummaryEnabled | { enabled: false };
 
 /** `billing.checkoutStatus` — what the return page polls. It never grants anything. */
 export type CheckoutStatus = 'pending' | 'complete' | 'expired' | 'unknown';
+
+/** `billing.createCheckout` — how the shell starts payment. */
+export type CheckoutStart =
+    | { mode: 'embedded'; sessionId: string; clientSecret: string; publishableKey: string }
+    | { mode: 'redirect'; sessionId: string; url: string };
+
+/** `billing.history` rows (newest first). Amounts are integer cents. */
+export interface BillingInvoice {
+    id: string;
+    number: string | null;
+    status: string;
+    amountPaidCents: number;
+    currency: string;
+    created: string;
+    url: string | null;
+    description: string | null;
+}
