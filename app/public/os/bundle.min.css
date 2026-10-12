@@ -945,58 +945,57 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-store-detail-heading h1{font-size:25px}
 .ezil-store-facts{gap:10px}
 }
-@media (prefers-reduced-motion:reduce){
-.ezil-store-card{transition:none}
-}
-.ezil-settings-window .window-body{background:#161616;color:#f5f5f4}
-.ezil-settings{display:flex;height:100%;width:100%;font-size:13px}
-.ezil-settings-sidebar{display:flex;flex-direction:column;gap:2px;width:176px;flex-shrink:0;padding:12px 8px;background:#1a1a1a;border-right:1px solid rgba(245,245,244,.08);overflow-y:auto}
-.ezil-settings-tab{display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;border:none;background:0 0;color:#b9b9b7;border-radius:6px;font:inherit;text-align:left;cursor:pointer}
-.ezil-settings-tab:hover{background:rgba(245,245,244,.06);color:#f5f5f4}
-.ezil-settings-tab.active{background:rgba(0,173,181,.16);color:#f5f5f4}
-.ezil-settings-tab-icon{display:inline-flex;width:18px;height:18px;flex-shrink:0}
+.ezil-settings-window{--bg:#04060c;--surface:#0d1118;--surface-2:#141a23;--border:rgba(255, 255, 255, 0.08);--text:#f5f5f4;--muted:#9aa3ad;--accent:#00adb5;--accent-ink:#04060c;--warn:#f5a524;--danger:#f05d5e;container-type:inline-size;container-name:ezil-settings-window;max-width:100vw}
+.ezil-settings-window .window-body{background:var(--bg);color:var(--text)}
+.ezil-settings,.ezil-settings *{box-sizing:border-box}
+.ezil-settings{display:flex;height:100%;width:100%;font:14px/20px system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-variant-numeric:tabular-nums}
+.ezil-settings-sidebar{display:flex;flex-direction:column;gap:2px;width:200px;box-sizing:border-box;flex-shrink:0;padding:12px 8px;background:var(--surface);border-right:1px solid rgba(245,245,244,.08);overflow-y:auto}
+.ezil-settings-tab{display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;border:none;background:0 0;color:var(--muted);border-radius:8px;font:inherit;font-size:13px;text-align:left;cursor:pointer}
+.ezil-settings-tab:hover{background:rgba(245,245,244,.06);color:var(--text)}
+.ezil-settings-tab.active{background:var(--surface-2);color:var(--text)}
+.ezil-settings-tab-icon{display:inline-flex;width:16px;height:16px;flex-shrink:0}
 .ezil-settings-tab-icon svg{width:100%;height:100%}
-.ezil-settings-tab.active .ezil-settings-tab-icon{color:#00adb5}
-.ezil-settings-content{flex:1;min-width:0;overflow-y:auto;padding:20px 24px 24px}
-.ezil-settings-pane{display:none}
+.ezil-settings-tab.active .ezil-settings-tab-icon{color:var(--accent)}
+.ezil-settings-content{flex:1;min-width:0;min-height:0;overflow-y:auto;padding:24px}
+.ezil-settings-pane{display:none;max-width:640px;margin-inline:auto;min-width:0}
 .ezil-settings-pane.active{display:block}
-.ezil-settings-content h3{margin:0 0 6px;font-size:16px;font-weight:600;color:#f5f5f4}
-.ezil-settings-content h4{margin:0 0 6px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:#8a8a88}
-.ezil-settings-lead{margin:0 0 16px;color:#b9b9b7;line-height:1.5}
+.ezil-settings-content h3{margin:0 0 6px;font-size:20px;line-height:28px;font-weight:600;color:var(--text)}
+.ezil-settings-content h4{margin:0 0 6px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+.ezil-settings-lead{font-size:13px;margin:0 0 16px;color:var(--muted);line-height:1.5}
 .ezil-settings-section{margin:0 0 22px}
-.ezil-settings-section p{margin:0 0 8px;line-height:1.55;color:#cfcfce}
-.ezil-settings-section a{color:#00adb5}
+.ezil-settings-section p{margin:0 0 8px;line-height:1.55;color:var(--muted)}
+.ezil-settings-section a{color:var(--accent)}
 .ezil-settings-section code{background:rgba(245,245,244,.08);padding:1px 5px;border-radius:3px;font-size:.9em}
-.ezil-settings-muted{color:#7d7d7b}
-.ezil-settings-btn{padding:6px 12px;border-radius:6px;border:1px solid rgba(245,245,244,.15);background:rgba(245,245,244,.04);color:#f5f5f4;font:inherit;font-size:12px;cursor:pointer;white-space:nowrap}
+.ezil-settings-muted{color:var(--muted)}
+.ezil-settings-btn{padding:6px 12px;border-radius:8px;border:1px solid rgba(245,245,244,.15);background:rgba(245,245,244,.04);color:var(--text);font:inherit;font-size:12px;cursor:pointer;white-space:normal;max-width:100%}
 .ezil-settings-btn:hover:not(:disabled){background:rgba(245,245,244,.1)}
 .ezil-settings-btn:disabled{opacity:.5;cursor:default}
-.ezil-settings-btn-primary{background:#00adb5;border-color:#00adb5;color:#06181a;font-weight:600}
-.ezil-settings-btn-primary:hover:not(:disabled){background:#05c2cb}
-.ezil-settings-btn-danger{color:#ff8a80;border-color:rgba(255,138,128,.35)}
+.ezil-settings-btn-primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
+.ezil-settings-btn-primary:hover:not(:disabled){background:var(--accent);opacity:.9}
+.ezil-settings-btn-danger{color:var(--danger);border-color:rgba(255,138,128,.35)}
 .ezil-settings-btn-danger:hover:not(:disabled){background:rgba(255,138,128,.12)}
 .ezil-settings-pill{padding:3px 10px;border-radius:999px;background:rgba(0,173,181,.18);color:#4fd8de;font-size:11px;font-weight:600}
 .ezil-settings-slot-list{display:flex;flex-direction:column;gap:10px}
-.ezil-settings-error,.ezil-settings-loading{padding:14px;color:#b9b9b7;display:flex;align-items:center;gap:10px}
-.ezil-settings-row{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:8px;border:1px solid rgba(245,245,244,.1);background:#1f1f1f}
+.ezil-settings-error,.ezil-settings-loading{padding:14px;color:var(--muted);display:flex;align-items:center;gap:10px}
+.ezil-settings-row{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:8px;border:1px solid rgba(245,245,244,.1);background:var(--surface-2)}
 .ezil-settings-row.active{border-color:rgba(0,173,181,.5)}
 .ezil-settings-row-empty{border-style:dashed;background:0 0}
-.ezil-settings-row-slot{display:flex;align-items:center;justify-content:center;width:28px;height:28px;flex-shrink:0;border-radius:6px;background:rgba(0,0,0,.3);color:#8a8a88;font-size:11px;font-weight:600}
+.ezil-settings-row-slot{display:flex;align-items:center;justify-content:center;width:28px;height:28px;flex-shrink:0;border-radius:8px;background:rgba(0,0,0,.3);color:var(--muted);font-size:11px;font-weight:600}
 .ezil-settings-row-meta{flex:1;min-width:0}
-.ezil-settings-row-name{font-weight:500;color:#f5f5f4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ezil-settings-row-sub{font-size:11px;color:#8a8a88;margin-top:2px}
+.ezil-settings-row-name{font-weight:500;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ezil-settings-row-sub{font-size:11px;color:var(--muted);margin-top:2px}
 .ezil-settings-row-actions{display:flex;align-items:center;gap:6px;flex-shrink:0}
 .ezil-settings-rename-form{display:flex;align-items:center;gap:10px;flex:1;min-width:0}
-.ezil-settings-input{flex:1;min-width:0;padding:6px 8px;border-radius:6px;border:1px solid rgba(0,173,181,.5);background:#161616;color:#f5f5f4;font:inherit}
-.ezil-settings-input:focus{outline:0;border-color:#00adb5}
+.ezil-settings-input{flex:1;min-width:0;padding:6px 8px;border-radius:8px;border:1px solid rgba(0,173,181,.5);background:var(--bg);color:var(--text);font:inherit}
+.ezil-settings-input:focus{outline:2px solid var(--accent);outline-offset:2px;border-color:var(--accent)}
 .ezil-settings-swatch-row{display:flex;flex-wrap:wrap;gap:10px}
 .ezil-settings-swatch{position:relative;width:84px;height:52px;border-radius:8px;border:2px solid transparent;cursor:pointer;padding:0;overflow:hidden}
-.ezil-settings-swatch.active{border-color:#f5f5f4;box-shadow:0 0 0 2px #00adb5}
+.ezil-settings-swatch.active{border-color:var(--text);box-shadow:0 0 0 2px var(--accent)}
 .ezil-settings-swatch-label{position:absolute;left:0;right:0;bottom:0;padding:2px 6px;font-size:10px;color:#fff;background:rgba(0,0,0,.45);text-align:left}
-.ezil-settings-about-version{color:#8a8a88;margin:0 0 18px}
+.ezil-settings-about-version{color:var(--muted);margin:0 0 18px}
 .dashboard-app-drawer-settings{margin-right:2px}
 .ezil-settings-rule{border:0;border-top:1px solid rgba(245,245,244,.1);margin:22px 0 18px}
-.ezil-settings-diagnostic{display:block;width:100%;margin-top:10px;padding:8px 10px;box-sizing:border-box;resize:vertical;border-radius:6px;border:1px solid rgba(245,245,244,.15);background:#1f1f1f;color:#cfcfce;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.45;white-space:pre;overflow:auto}
+.ezil-settings-diagnostic{display:block;width:100%;margin-top:10px;padding:8px 10px;box-sizing:border-box;resize:vertical;border-radius:8px;border:1px solid rgba(245,245,244,.15);background:var(--surface-2);color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.45;white-space:pre;overflow:auto}
 .ezil-settings-system h4{margin:18px 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;opacity:.6}
 .ezil-settings-system h4:first-of-type{margin-top:10px}
 .ezil-sys-lead{margin:4px 0 0;font-size:13px;opacity:.75}
@@ -1007,43 +1006,84 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-sys-h{grid-column:2;font-size:12px;opacity:.55;line-height:1.35}
 .ezil-settings-system code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 .ezil-settings-account h4{margin-top:20px}
-.ezil-account-card{border:1px solid rgba(245,245,244,.1);border-radius:10px;background:#1f1f1f}
-.ezil-account-profile{display:flex;align-items:center;gap:16px;padding:18px;background:radial-gradient(120% 140% at 0 0,rgba(0,173,181,.16) 0,rgba(0,173,181,0) 55%),#1f1f1f}
-.ezil-account-avatar{flex:none;display:grid;place-items:center;width:56px;height:56px;border-radius:50%;background:linear-gradient(140deg,#00adb5 0,#6d5dfc 100%);color:#fff;font-size:20px;font-weight:600;letter-spacing:.02em;box-shadow:0 0 0 3px rgba(0,173,181,.18)}
+.ezil-account-card{border:1px solid rgba(245,245,244,.1);border-radius:12px;background:var(--surface-2)}
+.ezil-account-profile{display:flex;align-items:center;gap:16px;padding:18px;background:radial-gradient(120% 140% at 0 0,rgba(0,173,181,.16) 0,rgba(0,173,181,0) 55%),var(--surface-2)}
+.ezil-account-avatar{flex:none;display:grid;place-items:center;width:56px;height:56px;border-radius:50%;background:linear-gradient(140deg,var(--accent) 0,#6d5dfc 100%);color:#fff;font-size:20px;font-weight:600;letter-spacing:.02em;box-shadow:0 0 0 3px rgba(0,173,181,.18)}
 .ezil-account-identity{min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:3px}
-.ezil-account-name{font-size:16px;font-weight:600;color:#f5f5f4;overflow-wrap:anywhere}
-.ezil-account-email{color:#b9b9b7;overflow-wrap:anywhere}
+.ezil-account-name{font-size:16px;font-weight:600;color:var(--text);overflow-wrap:anywhere}
+.ezil-account-email{color:var(--muted);overflow-wrap:anywhere}
 .ezil-account-details{padding:4px 16px}
 .ezil-account-row{display:flex;justify-content:space-between;align-items:baseline;gap:16px;padding:11px 0;border-bottom:1px solid rgba(245,245,244,.07)}
 .ezil-account-row:last-child{border-bottom:none}
-.ezil-account-label{flex:none;color:#8a8a88}
-.ezil-account-value{min-width:0;text-align:right;color:#f5f5f4;overflow-wrap:anywhere}
-.ezil-account-value.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#cfcfce}
+.ezil-account-label{flex:none;color:var(--muted)}
+.ezil-account-value{min-width:0;text-align:right;color:var(--text);overflow-wrap:anywhere}
+.ezil-account-value.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:var(--muted)}
 .ezil-account-signout{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px}
-.ezil-account-signout-title{font-weight:600;color:#f5f5f4}
-.ezil-account-signout p{margin:3px 0 0;color:#b9b9b7;line-height:1.45}
+.ezil-account-signout-title{font-weight:600;color:var(--text)}
+.ezil-account-signout p{margin:3px 0 0;color:var(--muted);line-height:1.45}
 .ezil-settings-account{container-type:inline-size}
-.ezil-settings-billing{min-width:0;overflow-wrap:anywhere}
-.ezil-billing-card{min-width:0;margin-top:12px;padding:14px;border:1px solid rgba(245,245,244,.1);border-radius:10px;background:#1f1f1f}
-.ezil-billing-plan{border-color:rgba(0,173,181,.4)}
-.ezil-billing-card p{margin:6px 0 0;line-height:1.5}
-.ezil-billing-usage{font-variant-numeric:tabular-nums}
-.ezil-billing-note,.ezil-billing-timing{color:#b9b9b7;font-size:12px;line-height:1.5}
-.ezil-billing-progress{height:7px;margin-top:10px;overflow:hidden;border-radius:8px;background:rgba(245,245,244,.12)}
-.ezil-billing-progress span{display:block;height:100%;background:#00adb5}
-.ezil-billing-meter.is-low .ezil-billing-progress span{background:#e9bd60}
-.ezil-billing-meter.is-exhausted .ezil-billing-progress span,.ezil-billing-meter.is-over_cap .ezil-billing-progress span{background:#ff8a80}
-.ezil-billing-meter.is-unavailable .ezil-billing-progress{opacity:.45}
-.ezil-billing-actions,.ezil-billing-footer{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}
-.ezil-settings-billing .ezil-settings-btn{max-width:100%;white-space:normal;overflow-wrap:anywhere}
+.ezil-settings-billing{min-width:0;overflow-wrap:anywhere;container-type:inline-size}
+.ezil-settings-window :is(button,a,input,select,textarea,summary,[tabindex]):focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.ezil-settings-window :is(button,a){transition:opacity 150ms,transform 150ms}
+.ezil-billing-header,.ezil-billing-plan-heading{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px}
+.ezil-billing-header{justify-content:space-between;align-items:flex-start;margin-bottom:20px}
+.ezil-billing-header .ezil-settings-lead{margin:0}
+.ezil-billing-header>button{margin-left:auto}
+.ezil-billing-card{min-width:0;padding:16px;border:1px solid var(--border);border-radius:12px;background:var(--surface)}
+.ezil-billing-plan.is-pro{border-color:var(--accent)}
+.ezil-billing-plan p{margin:8px 0 0}
+.ezil-billing-plan-heading h4{margin:0;font-size:16px;color:var(--text);text-transform:none;letter-spacing:normal}
+.ezil-billing-price{margin-left:auto;font-size:20px;font-weight:600;line-height:28px}
+.ezil-billing-status{color:var(--muted)}
+.ezil-billing-meters{display:grid;grid-template-columns:minmax(0,1fr);gap:12px;margin-top:16px}
+.ezil-billing-meter{min-width:0;padding:16px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2)}
+.ezil-billing-meter h4{color:var(--text);text-transform:none;letter-spacing:normal;font-size:14px}
+.ezil-billing-meter p{margin:8px 0 0}
+.ezil-billing-usage{font-size:28px;font-weight:600;line-height:34px}
+.ezil-billing-allowance,.ezil-billing-note,.ezil-billing-timing{color:var(--muted);font-size:12px;line-height:16px}
+.ezil-billing-progress{height:7px;margin:12px 0;overflow:hidden;border-radius:999px;background:var(--bg)}
+.ezil-billing-progress span{display:block;height:100%;background:var(--accent)}
+.ezil-billing-meter.is-low .ezil-billing-progress span{background:var(--warn)}
+.ezil-billing-meter.is-exhausted .ezil-billing-progress span,.ezil-billing-meter.is-over_cap .ezil-billing-progress span{background:var(--danger)}
+.ezil-billing-nudge{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:16px;padding:12px 16px;border-left:2px solid var(--warn);background:var(--surface)}
+.ezil-billing-nudge p{flex:1 1 180px;margin:0}
+.ezil-billing-actions,.ezil-billing-footer{display:flex;flex-wrap:wrap;gap:12px;margin-top:20px}
 .ezil-billing-pack{display:flex;flex-direction:column;gap:6px;width:100%;min-width:0}
-.ezil-billing-pack select{width:100%;min-width:0;padding:6px;background:#1f1f1f;color:#f5f5f4;border:1px solid rgba(245,245,244,.15);border-radius:6px;font:inherit}
+.ezil-billing-pack select{width:100%;min-width:0;padding:8px;background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:8px;font:inherit}
 .ezil-settings-billing .ezil-settings-error{flex-wrap:wrap}
-.ezil-billing-action-error{color:#ff8a80}
-.ezil-billing-footer a{color:#4fd8de}
-@media (max-width:480px){
-.ezil-settings-content{padding:16px 12px}
-.ezil-billing-card{padding:10px}
+.ezil-billing-action-error{color:var(--danger)}
+.ezil-billing-action-error:empty{display:none}
+.ezil-billing-footer a,.ezil-billing-invoice a{color:var(--accent);text-underline-offset:3px}
+.ezil-billing-invoices{margin-top:24px}
+.ezil-billing-invoice-list{list-style:none;padding:0;margin:0}
+.ezil-billing-invoice{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 12px;padding:12px 0;border-bottom:1px solid var(--border)}
+.ezil-billing-invoice>*{min-width:0}
+.ezil-billing-invoice time{color:var(--muted);font-size:12px}
+.ezil-billing-skeleton{min-height:140px}
+.ezil-billing-skeleton span{display:block;height:16px;margin:12px 0;width:70%;border-radius:8px;background:var(--border)}
+.ezil-billing-skeleton span:nth-child(2){height:32px;width:90%}
+@container ezil-settings-window (min-width:640px){
+.ezil-billing-meters{grid-template-columns:repeat(3,minmax(0,1fr))}
+}
+@container (min-width:640px){
+.ezil-billing-invoice{grid-template-columns:96px minmax(0,1fr) auto auto auto;align-items:baseline}
+}
+@container (max-width:600px){
+.ezil-settings{flex-direction:column}
+.ezil-settings-sidebar{flex-direction:row;flex-wrap:wrap;width:100%;gap:4px;padding:8px;border-right:0;border-bottom:1px solid var(--border)}
+.ezil-settings-tab{width:auto;flex:1 1 auto;padding:6px 8px;gap:6px}
+.ezil-settings-content{padding:16px}
+.ezil-settings-row,.ezil-settings-row-actions{flex-wrap:wrap}
+.ezil-sys-row{grid-template-columns:minmax(0,1fr)}
+.ezil-sys-h{grid-column:1}
+}
+.ezil-settings-system h4,.ezil-sys-h,.ezil-sys-k,.ezil-sys-lead,.ezil-sys-note{color:var(--muted);opacity:1}
+@media (max-width:600px){
+.ezil-settings-window{left:0!important;width:100%!important}
+}
+@media (prefers-reduced-motion:reduce){
+.ezil-store-card{transition:none}
+.ezil-settings-window *,.ezil-settings-window ::after,.ezil-settings-window ::before{animation:none!important;transition:none!important}
 }
 @container (max-width:380px){
 .ezil-account-profile{flex-direction:column;align-items:flex-start;gap:12px;padding:16px}
