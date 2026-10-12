@@ -33,6 +33,22 @@ try {
     process.exit(2);
 }
 
+/** Bundle app/src/server/billing/stripe/client.ts with the app's own esbuild and import it. */
+let realClientFactory;
+async function realStripeClient(secretKey) {
+    if (!realClientFactory) {
+        const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+        const { build } = await import(path.join(root, 'app/node_modules/esbuild/lib/main.js'));
+        const outfile = path.join(root, 'e2e', '.billing-client.bundle.mjs');
+        await build({
+            entryPoints: [path.join(root, 'app/src/server/billing/stripe/client.ts')],
+            bundle: true, format: 'esm', platform: 'node', outfile, logLevel: 'silent',
+        });
+        ({ createStripeClient: realClientFactory } = await import(`${outfile}?t=${Date.now()}`));
+    }
+    return realClientFactory({ secretKey });
+}
+
 async function stripe(endpoint, fields) {
     const response = await fetch(`https://api.stripe.com/v1/${endpoint}`, {
         method: fields ? 'POST' : 'GET',
@@ -109,25 +125,17 @@ async function fixture() {
                     email: payload.user.email, name: label, description: label,
                     'metadata[test_suite]': label, 'metadata[user_id]': userId,
                 });
-                const session = await stripe('checkout/sessions', {
-                    customer: customer.id, ui_mode: 'embedded_page', mode: 'subscription',
-                    'payment_method_types[0]': 'card',
-                    'line_items[0][quantity]': '1',
-                    'line_items[0][price_data][currency]': 'usd',
-                    'line_items[0][price_data][unit_amount]': '2000',
-                    'line_items[0][price_data][recurring][interval]': 'month',
-                    'line_items[0][price_data][product_data][name]': label,
-                    redirect_on_completion: 'if_required',
-                    return_url: 'http://localhost/billing/return?session_id={CHECKOUT_SESSION_ID}',
-                    billing_address_collection: 'auto', 'customer_update[address]': 'auto',
-                    'automatic_tax[enabled]': 'true',
-                    'saved_payment_method_options[payment_method_save]': 'enabled',
-                    'metadata[sku]': 'pro_monthly_v1', 'metadata[test_suite]': label,
-                    'subscription_data[metadata][sku]': 'pro_monthly_v1',
-                    'subscription_data[metadata][test_suite]': label,
-                    'subscription_data[description]': label,
-                    client_reference_id: userId,
+                // The session comes from the app's REAL Stripe client, so this
+                // suite pays through exactly the parameters production sends.
+                const client = await realStripeClient(keys.secret);
+                const created = await client.createCheckoutSession({
+                    customerId: customer.id, userId, sku: 'pro_monthly_v1',
+                    uiMode: 'embedded', automaticTax: process.env.BILLING_AUTOMATIC_TAX === '1',
+                    returnUrl: 'http://localhost/billing/return?session_id={CHECKOUT_SESSION_ID}',
+                    successUrl: 'http://localhost/billing/return?session_id={CHECKOUT_SESSION_ID}',
+                    cancelUrl: 'http://localhost/os', idempotencyKey: `checkout:${randomUUID()}`,
                 });
+                const session = { id: created.id, client_secret: created.clientSecret };
                 sessionIds.push(session.id);
                 state.sessions.push(session.id);
                 assert(session.client_secret, 'Real embedded session has a client secret');
@@ -234,6 +242,17 @@ async function pay(page, card) {
         await frame.getByRole('option', { name: 'United States', exact: true }).click();
     }
     await (await field(frame, /ZIP|postal code/i)).fill('10001');
+    // Friction guard (DESIGN.md §4): with Stripe Tax off, Checkout must not ask
+    // for a street address or city — only card, name, country and postal code.
+    if (process.env.BILLING_AUTOMATIC_TAX !== '1') {
+        for (const extra of [/address line 1/i, /^city$/i]) {
+            const visible = [];
+            for (const candidate of [frame, ...await Promise.all([...Array(await frame.locator('iframe').count()).keys()].map(i => frame.frameLocator('iframe').nth(i)))]) {
+                for (const match of await candidate.getByRole('textbox', { name: extra }).all()) if (await match.isVisible()) visible.push(match);
+            }
+            assert.equal(visible.length, 0, `Checkout asked for ${extra} — address friction is back`);
+        }
+    }
     await frame.getByRole('button', { name: /^(Subscribe|Pay)(\b|\s)/i }).click();
     return frame;
 }

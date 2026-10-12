@@ -46,7 +46,7 @@ async function stripe<T = { id: string }>(method: 'GET' | 'POST', path: string, 
         headers: {
             Authorization: `Bearer ${secret}`,
             'Content-Type': 'application/x-www-form-urlencoded',
-            'Stripe-Version': '2025-09-30.clover',
+            'Stripe-Version': '2026-03-25.dahlia',
         },
         body: body ? new URLSearchParams(body).toString() : undefined,
     });
@@ -106,7 +106,7 @@ describe.skipIf(!enabled)('Stripe test-mode round trip (live, opt-in)', () => {
         expect(await store.linkCustomer(userId, customerId)).toBe('linked');
         const session = await client.createCheckoutSession({
             customerId, userId, sku: 'pro_monthly_v1',
-            uiMode: 'hosted',
+            uiMode: 'hosted', automaticTax: false,
             returnUrl: 'https://os.ezil.org/billing/return?session_id={CHECKOUT_SESSION_ID}',
             successUrl: 'https://os.ezil.org/billing/return?session_id={CHECKOUT_SESSION_ID}',
             cancelUrl: 'https://os.ezil.org/os', idempotencyKey: `checkout:${randomUUID()}`,
