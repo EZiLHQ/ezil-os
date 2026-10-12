@@ -139,6 +139,7 @@ async function fixture() {
                 const created = await client.createCheckoutSession({
                     customerId: customer.id, userId, sku: 'pro_monthly_v1',
                     uiMode: 'embedded', automaticTax: process.env.BILLING_AUTOMATIC_TAX === '1',
+                    managedPayments: process.env.BILLING_MANAGED_PAYMENTS === '1',
                     returnUrl: 'http://localhost/billing/return?session_id={CHECKOUT_SESSION_ID}',
                     successUrl: 'http://localhost/billing/return?session_id={CHECKOUT_SESSION_ID}',
                     cancelUrl: 'http://localhost/os', idempotencyKey: `checkout:${randomUUID()}`,
@@ -267,7 +268,8 @@ async function pay(page, card) {
     await (await field(frame, /ZIP|postal code/i)).fill('10001');
     // Friction guard (DESIGN.md §4): with Stripe Tax off, Checkout must not ask
     // for a street address or city — only card, name, country and postal code.
-    if (process.env.BILLING_AUTOMATIC_TAX !== '1') {
+    // Merchant-of-record (Managed Payments) and Stripe Tax legitimately need a billing address.
+    if (process.env.BILLING_AUTOMATIC_TAX !== '1' && process.env.BILLING_MANAGED_PAYMENTS !== '1') {
         for (const extra of [/address line 1/i, /^city$/i]) {
             const visible = [];
             for (const candidate of [frame, ...await Promise.all([...Array(await frame.locator('iframe').count()).keys()].map(i => frame.frameLocator('iframe').nth(i)))]) {
