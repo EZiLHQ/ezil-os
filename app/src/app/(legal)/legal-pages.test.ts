@@ -78,7 +78,7 @@ describe('hosted legal identity and navigation', () => {
     });
 
     it('links Terms, Privacy, and Refunds from the shared footer', () => {
-        const html = renderToStaticMarkup(createElement(LegalLayout, { children: 'Legal content' }));
+        const html = renderToStaticMarkup(createElement(LegalLayout, null, 'Legal content'));
         const footer = html.match(/<footer\b[^>]*>([\s\S]*?)<\/footer>/)?.[1];
         expect(footer).toContain('aria-label="Legal footer"');
         for (const [route, label] of [['terms', 'Terms'], ['privacy', 'Privacy'], ['refunds', 'Refunds']]) {
