@@ -41,6 +41,9 @@ function commonCheckout(sku = checkoutRequest.sku) {
         'customer_update[address]': 'auto',
         'customer_update[name]': 'auto',
         billing_address_collection: 'auto',
+        'payment_method_types[0]': 'card',
+        'payment_method_types[1]': 'link',
+        'adaptive_pricing[enabled]': 'false',
         'saved_payment_method_options[payment_method_save]': 'enabled',
         success_url: checkoutRequest.successUrl,
         cancel_url: checkoutRequest.cancelUrl,
@@ -446,5 +449,18 @@ describe('automatic tax is opt-in', () => {
         expect(bodies[0].get('billing_address_collection')).toBe('auto');
         expect(bodies[1].get('automatic_tax[enabled]')).toBe('true');
         expect(bodies[1].get('customer_update[address]')).toBe('auto');
+    });
+
+    it('turns Adaptive Pricing off unless asked (positive control: on when adaptivePricing is true)', async () => {
+        const bodies: URLSearchParams[] = [];
+        const fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
+            bodies.push(new URLSearchParams(String(init?.body ?? '')));
+            return Response.json({ id: 'cs_fixture', url: null, client_secret: 'cs_secret' });
+        });
+        const client = createStripeClient({ secretKey, fetch: fetcher as unknown as typeof fetch });
+        await client.createCheckoutSession({ ...checkoutRequest, uiMode: 'embedded', automaticTax: false });
+        await client.createCheckoutSession({ ...checkoutRequest, uiMode: 'embedded', automaticTax: false, adaptivePricing: true });
+        expect(bodies[0].get('adaptive_pricing[enabled]')).toBe('false');
+        expect(bodies[1].get('adaptive_pricing[enabled]')).toBe('true');
     });
 });

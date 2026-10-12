@@ -75,6 +75,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 sku: input.sku,
                 uiMode: publishableKey ? 'embedded' : 'hosted',
                 automaticTax: deps.config.automaticTaxEnabled,
+                adaptivePricing: deps.config.adaptivePricingEnabled,
                 returnUrl,
                 successUrl: returnUrl,
                 cancelUrl: `${origin}/os`,

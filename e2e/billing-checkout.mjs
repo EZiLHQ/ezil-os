@@ -109,7 +109,15 @@ async function fixture() {
                 previewUrl: '/api/shell/preview-url', focus: '/api/shell/focus', codePreviewUrl: '/api/shell/code-preview-url' },
         },
     };
-    page.on('pageerror', error => state.errors.push(redact(error)));
+    // Only the shell's own errors fail the run. Stripe's iframes report their own
+    // internal noise here too (e.g. Link's third-party cookie fetch, which
+    // headless Chromium blocks, and "Could not retrieve elements store" retries);
+    // those are Stripe's to handle and are counted separately for visibility.
+    page.on('pageerror', error => {
+        const text = `${error?.message ?? error}\n${error?.stack ?? ''}`;
+        if (/stripe\.(?:com|network)|stripecdn|elements store/i.test(text)) { state.stripeNoise = (state.stripeNoise ?? 0) + 1; return; }
+        state.errors.push(redact(error));
+    });
 
     async function procedure(name, input) {
         switch (name) {
@@ -155,9 +163,16 @@ async function fixture() {
             const request = route.request();
             const url = new URL(request.url());
             const host = url.hostname;
-            if (host === 'stripe.com' || host.endsWith('.stripe.com')
-                || host === 'stripe.network' || host.endsWith('.stripe.network')) return route.continue();
-            if (url.origin !== origin) return route.abort('blockedbyclient');
+            // Stripe Checkout also loads assets from stripecdn.com, Link from
+            // link.com and fraud checks from hCaptcha; aborting any of them makes
+            // Stripe report "Your internet connection is unstable" and the
+            // payment cannot be confirmed in the form.
+            const stripeHosts = ['stripe.com', 'stripe.network', 'stripecdn.com', 'link.com', 'hcaptcha.com'];
+            if (stripeHosts.some(domain => host === domain || host.endsWith(`.${domain}`))) return route.continue();
+            if (url.origin !== origin) {
+                if (process.env.BILLING_E2E_DEBUG) console.error(`[e2e] blocked ${url.hostname}`);
+                return route.abort('blockedbyclient');
+            }
             if (url.pathname === '/os') {
                 return route.fulfill({ contentType: 'text/html', body: `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>${css}</style><style>html{height:100%}body{min-height:100%;margin:0}</style></head><body><div id="ezil-os-root"><div id="ezil-os-root-inner"></div></div></body></html>` });
             }
@@ -198,12 +213,18 @@ async function fixture() {
     }
 }
 
+let sheetShot = false;
 async function sheetReady(page) {
     const sheet = page.locator('[data-role="upgrade-sheet"]');
     await sheet.waitFor({ state: 'visible' });
     assert.equal(await sheet.getAttribute('role'), 'dialog');
     assert.equal(await sheet.getAttribute('aria-modal'), 'true');
     await page.locator('#ezil-embedded-checkout iframe').first().waitFor({ state: 'visible', timeout: 60_000 });
+    if (process.env.BILLING_SCREENSHOTS && !sheetShot) {
+        sheetShot = true;
+        await delay(2500);
+        await page.screenshot({ path: path.join(process.env.BILLING_SCREENSHOTS, 'billing-checkout-sheet-top.png') });
+    }
     return page.frameLocator('#ezil-embedded-checkout iframe').first();
 }
 
@@ -228,8 +249,10 @@ async function field(frame, expression, role = 'textbox') {
 
 async function pay(page, card) {
     const frame = await sheetReady(page);
-    const cardOption = frame.getByRole('radio', { name: /card/i });
-    if (await cardOption.count() && await cardOption.first().isVisible()) await cardOption.first().click();
+    // With several methods (Card, Cash App Pay, Bank) Stripe shows an accordion
+    // with nothing preselected; open "Card" the way a person does — by its row.
+    const cardRow = frame.getByRole('button', { name: /^pay with card$/i }).first();
+    if (await cardRow.isVisible().catch(() => false)) await cardRow.click();
     await (await field(frame, /card number/i)).fill(card);
     await (await field(frame, /expiration|expiry|MM\s*\/\s*YY/i)).fill('12/34');
     await (await field(frame, /security code|CVC|CVV/i)).fill('123');
@@ -253,7 +276,36 @@ async function pay(page, card) {
             assert.equal(visible.length, 0, `Checkout asked for ${extra} — address friction is back`);
         }
     }
-    await frame.getByRole('button', { name: /^(Subscribe|Pay)(\b|\s)/i }).click();
+    // Exact names: "Pay with card" / "Pay with Link" are method buttons, not submit.
+    const submit = frame.getByRole('button', { name: /^(Subscribe|Pay(?: \S+)?\s*[$€£₹]?[\d.,]*)$/i })
+        .filter({ hasNotText: /with/i }).first();
+    await submit.scrollIntoViewIfNeeded();
+    if (process.env.BILLING_E2E_DEBUG) {
+        const box = await submit.boundingBox();
+        const hit = box && await page.evaluate(([x, y]) => {
+            const element = document.elementFromPoint(x, y);
+            return element ? `${element.tagName}.${element.className}#${element.id}` : null;
+        }, [box.x + box.width / 2, box.y + box.height / 2]);
+        console.error(`[e2e] submit box ${JSON.stringify(box)} parent hit ${hit}`);
+    }
+    // Stripe validates the last field (postal code, Link lookup) asynchronously;
+    // a click in that window is ignored. Let it settle, click, and click once
+    // more only if Stripe shows no processing state — Stripe itself prevents a
+    // second charge for the same session. The retry is reported, not hidden.
+    await delay(1200);
+    await submit.click();
+    const processing = frame.getByText(/processing|subscribing|payment (?:is )?complete|declined|thank you/i).first();
+    if (!await processing.isVisible().catch(() => false)) {
+        await delay(4000);
+        if (!await processing.isVisible().catch(() => false) && await submit.isEnabled().catch(() => false)) {
+            console.error('[e2e] submit retried once: no processing state after the first click');
+            await submit.click();
+        }
+    }
+    if (process.env.BILLING_SCREENSHOTS && process.env.BILLING_E2E_DEBUG) {
+        await delay(1500);
+        await page.screenshot({ path: path.join(process.env.BILLING_SCREENSHOTS, `billing-checkout-after-submit-${Date.now()}.png`) });
+    }
     return frame;
 }
 
@@ -310,7 +362,7 @@ try {
     });
     await scenario('declined-payment', async ({ page, state }) => {
         const frame = await pay(page, '4000000000000002');
-        await frame.getByText(/your card (?:was|has been) declined|card has been declined/i).first().waitFor({ state: 'visible' });
+        await frame.getByText(/(?:card|credit card|debit card) (?:was|has been) declined/i).first().waitFor({ state: 'visible' });
         assert.equal(state.pro, false);
         await noSuccess(page);
         const session = await stripe(`checkout/sessions/${encodeURIComponent(state.sessions[0])}`);
