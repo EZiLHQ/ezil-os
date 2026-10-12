@@ -40,6 +40,8 @@ const osPage = read('../os/page.tsx');
 const loginPage = read('./page.tsx');
 const pricingPage = read('../(marketing)/pricing/page.tsx');
 const marketingLayout = read('../(marketing)/layout.tsx');
+const marketingHome = read('../(marketing)/_components/home-page.tsx');
+const rootPage = read('../page.tsx');
 
 /** The body of one exported function, from its signature to the next one. */
 function functionBody(source: string, name: string): string {
@@ -117,7 +119,7 @@ describe('/os checks its own arrival, because senders are a convention', () => {
         // should be a deliberate act, so this fails first.
         const clientOsLink = /<Link[^>]*href=["'{]*\/os["'}]/;
         expect(clientOsLink.test('<Link href="/os">Open</Link>')).toBe(true);
-        for (const [name, source] of Object.entries({ form, callback, osPage, actions, loginPage, pricingPage, marketingLayout })) {
+        for (const [name, source] of Object.entries({ form, callback, osPage, actions, loginPage, pricingPage, marketingLayout, marketingHome, rootPage })) {
             expect(code(source), name).not.toMatch(clientOsLink);
         }
     });
@@ -125,8 +127,8 @@ describe('/os checks its own arrival, because senders are a convention', () => {
     it('marketing entry links remain document loads even when destinations come from copy', () => {
         const clientLink = /<Link\b/;
         expect(clientLink.test('<Link href="/login?next=/os">Upgrade</Link>')).toBe(true);
-        for (const source of [pricingPage, marketingLayout]) {
-            expect(code(source)).toMatch(/<a\b/);
+        expect(code(marketingHome)).toMatch(/<a\b/);
+        for (const source of [pricingPage, marketingLayout, marketingHome, rootPage]) {
             expect(code(source)).not.toMatch(clientLink);
         }
     });

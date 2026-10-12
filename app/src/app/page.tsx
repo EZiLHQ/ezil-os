@@ -1,31 +1,19 @@
 import { redirect } from 'next/navigation';
 
+import { readBillingConfig } from '@/server/billing/config';
 import { Routes } from '@/utils/constants';
 import { createClient } from '@/utils/supabase/server';
+import MarketingHome from './(marketing)/_components/home-page';
+
+export const dynamic = 'force-dynamic';
 
 /**
- * `/` has no content of its own — this app has no marketing page or chat
- * editor to land on. An authenticated visitor goes straight into their OS;
- * anyone else goes to `/login`.
+ * Signed-in visitors still enter their OS. The public home page is opt-in,
+ * read per request so an unset flag preserves the original login redirect.
  *
- * 🔴 Now `Routes.OS`, matching login's own default (see `safeReturnUrl`).
- * This used to be deliberately `Routes.COMPUTERS` instead: the only known
- * client-side sender to `/` was `<Link href={Routes.HOME}>` — the logo on
- * `/login` — and a `redirect()` here runs as an App Router SOFT navigation
- * for anyone who lands on it that way, not a document load. `/os` is a
- * separate application delivered as `<script src>` tags that only execute on
- * a real document load (see `login/actions.ts` and docs/PLATFORM-NOTES.md
- * §17), so sending a soft-nav visitor to `Routes.OS` used to reproduce that
- * dead-page defect.
- *
- * That sender is now fixed: `/login`'s logo is a plain `<a href={Routes.HOME}>`
- * (see `login/page.tsx`), so reaching `/` always means a real document load,
- * and this redirect always executes as one too — there is no other known
- * client-side path to `/`. `entry-contract.test.ts` pins that the logo stays
- * an `<a>`, not a `<Link>`; if it is ever converted back, that test fails
- * before this route can regress into the dead-page defect again.
- * `/computers` remains reachable as the escape hatch from `/os` and
- * `/computer/[id]`, just no longer the default landing spot for `/`.
+ * Entry links must stay plain anchors: the shell's script tags only execute
+ * on a document load, so a Next soft navigation through this redirect would
+ * leave the OS blank. The sender-side tests pin that contract.
  */
 export default async function HomePage() {
     const supabase = await createClient();
@@ -33,5 +21,10 @@ export default async function HomePage() {
         data: { user },
     } = await supabase.auth.getUser();
 
-    redirect(user ? Routes.OS : Routes.LOGIN);
+    if (user) redirect(Routes.OS);
+
+    const config = readBillingConfig();
+    if (!config.pricingPageEnabled) redirect(Routes.LOGIN);
+
+    return <MarketingHome largeStorageEnabled={config.largeStorageEnabled} />;
 }
