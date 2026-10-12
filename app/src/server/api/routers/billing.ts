@@ -6,7 +6,7 @@ import { checkoutAvailable } from '@/server/billing/config';
 import { getBillingDeps } from '@/server/billing/deps';
 import { buildSummary, freeWindow, resolvePlan } from '@/server/billing/meters';
 import type { BillingDeps } from '@/server/billing/ports';
-import type { BillingSummary, CheckoutStatus } from '@/server/billing/types';
+import type { BillingInvoice, BillingSummary, CheckoutStart, CheckoutStatus } from '@/server/billing/types';
 
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
@@ -42,7 +42,7 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
             return buildSummary({ config: deps.config, now, subs, intervals, storage });
         }),
 
-        createCheckout: protectedProcedure.input(z.object({ sku: z.string() })).mutation(async ({ ctx, input }) => {
+        createCheckout: protectedProcedure.input(z.object({ sku: z.string() })).mutation(async ({ ctx, input }): Promise<CheckoutStart> => {
             const deps = getDeps();
             if (!checkoutAvailable(deps.config) || !deps.stripe) {
                 throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'billing_not_configured' });
@@ -67,15 +67,48 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
                 customerId = customer.id;
             }
             const origin = requestOrigin(ctx.headers);
+            const publishableKey = deps.config.stripePublishableKey;
+            const returnUrl = `${origin}/billing/return?session_id={CHECKOUT_SESSION_ID}`;
             const session = await deps.stripe.createCheckoutSession({
                 customerId,
                 userId: ctx.user.id,
                 sku: input.sku,
-                successUrl: `${origin}/billing/return?session_id={CHECKOUT_SESSION_ID}`,
+                uiMode: publishableKey ? 'embedded' : 'hosted',
+                returnUrl,
+                successUrl: returnUrl,
                 cancelUrl: `${origin}/os`,
                 idempotencyKey: `checkout:${ctx.user.id}:${input.sku}:${crypto.randomUUID()}`,
             });
-            return { url: session.url };
+            if (publishableKey) {
+                if (!session.clientSecret) throw new TRPCError({ code: 'INTERNAL_SERVER_ERROR', message: 'checkout_unavailable' });
+                return { mode: 'embedded', sessionId: session.id, clientSecret: session.clientSecret, publishableKey };
+            }
+            if (!session.url) throw new TRPCError({ code: 'INTERNAL_SERVER_ERROR', message: 'checkout_unavailable' });
+            return { mode: 'redirect', sessionId: session.id, url: session.url };
+        }),
+
+        history: protectedProcedure.query(async ({ ctx }): Promise<BillingInvoice[]> => {
+            const deps = getDeps();
+            if (!checkoutAvailable(deps.config) || !deps.stripe) return [];
+            try {
+                const customerId = await deps.store.stripeCustomerFor(ctx.user.id);
+                if (!customerId) return [];
+                const invoices = await deps.stripe.listInvoices(customerId, 12);
+                return invoices.sort((a, b) => b.created.getTime() - a.created.getTime()).slice(0, 12).map(invoice => ({
+                    id: invoice.id,
+                    number: invoice.number,
+                    status: invoice.status,
+                    amountPaidCents: invoice.amountPaidCents,
+                    currency: invoice.currency,
+                    created: invoice.created.toISOString(),
+                    url: invoice.hostedInvoiceUrl,
+                    description: invoice.description,
+                }));
+            } catch {
+                // Provider failures must not hide usage; error bodies can contain billing data.
+                console.error('Billing invoice history unavailable');
+                return [];
+            }
         }),
 
         portal: protectedProcedure.mutation(async ({ ctx }) => {

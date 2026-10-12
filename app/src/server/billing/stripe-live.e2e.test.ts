@@ -36,7 +36,11 @@ const enabled = process.env.STRIPE_E2E === '1' && secret.startsWith('sk_test_') 
 const API = 'https://api.stripe.com/v1';
 const WEBHOOK_SECRET = `whsec_e2e_${randomUUID()}`;
 
-async function stripe(method: 'GET' | 'POST', path: string, body?: Record<string, string>) {
+interface InvoicePayments {
+    payments?: { data?: { payment?: { payment_intent?: string | { id: string } | null } }[] };
+}
+
+async function stripe<T = { id: string }>(method: 'GET' | 'POST', path: string, body?: Record<string, string>): Promise<T> {
     const response = await fetch(`${API}${path}`, {
         method,
         headers: {
@@ -46,20 +50,25 @@ async function stripe(method: 'GET' | 'POST', path: string, body?: Record<string
         },
         body: body ? new URLSearchParams(body).toString() : undefined,
     });
-    const json = await response.json() as Record<string, any>;
-    if (!response.ok) throw new Error(`Stripe ${method} ${path}: ${json?.error?.message ?? response.status}`);
-    return json;
+    if (!response.ok) throw new Error(`Stripe ${method} ${path}: HTTP ${response.status}`);
+    return response.json() as Promise<T>;
 }
 
 /** Poll Stripe's event list for the first event of `type` about `objectId`. */
-async function eventFor(type: string, match: (object: Record<string, any>) => boolean): Promise<StripeEventLike> {
+async function eventFor(type: string, match: (object: Record<string, unknown>) => boolean): Promise<StripeEventLike> {
     for (let attempt = 0; attempt < 30; attempt += 1) {
-        const page = await stripe('GET', `/events?type=${encodeURIComponent(type)}&limit=20`);
-        const found = (page.data as StripeEventLike[]).find(e => match(e.data.object as Record<string, any>));
+        const page = await stripe<{ data: StripeEventLike[] }>('GET', `/events?type=${encodeURIComponent(type)}&limit=20`);
+        const found = page.data.find(e => match(e.data.object));
         if (found) return found;
         await new Promise(resolve => setTimeout(resolve, 2000));
     }
     throw new Error(`no ${type} event arrived`);
+}
+
+function eventObjectId(event: StripeEventLike): string {
+    const id = event.data.object.id;
+    if (typeof id !== 'string' || id === '') throw new Error('Stripe event is missing its object id');
+    return id;
 }
 
 function signed(event: StripeEventLike): Request {
@@ -97,6 +106,8 @@ describe.skipIf(!enabled)('Stripe test-mode round trip (live, opt-in)', () => {
         expect(await store.linkCustomer(userId, customerId)).toBe('linked');
         const session = await client.createCheckoutSession({
             customerId, userId, sku: 'pro_monthly_v1',
+            uiMode: 'hosted',
+            returnUrl: 'https://os.ezil.org/billing/return?session_id={CHECKOUT_SESSION_ID}',
             successUrl: 'https://os.ezil.org/billing/return?session_id={CHECKOUT_SESSION_ID}',
             cancelUrl: 'https://os.ezil.org/os', idempotencyKey: `checkout:${randomUUID()}`,
         });
@@ -116,7 +127,7 @@ describe.skipIf(!enabled)('Stripe test-mode round trip (live, opt-in)', () => {
         subscriptionId = subscription.id;
 
         const paid = await eventFor('invoice.paid', o => o.customer === customerId);
-        invoiceId = (paid.data.object as Record<string, any>).id;
+        invoiceId = eventObjectId(paid);
         const process = (event: StripeEventLike, d: { store: typeof store; stripe: typeof client; now: () => Date }) => processStripeEvent(event, d);
 
         const first = await handleStripeWebhook(signed(paid), deps, process);
@@ -150,14 +161,15 @@ describe.skipIf(!enabled)('Stripe test-mode round trip (live, opt-in)', () => {
     }, 60_000);
 
     it('a full refund revokes the period grant once', async () => {
-        const invoice = await stripe('GET', `/invoices/${invoiceId}?expand[]=payments`);
+        const invoice = await stripe<InvoicePayments>('GET', `/invoices/${invoiceId}?expand[]=payments`);
         const payment = invoice.payments?.data?.[0]?.payment;
         const paymentIntent = typeof payment?.payment_intent === 'string' ? payment.payment_intent : payment?.payment_intent?.id;
         expect(paymentIntent).toBeTruthy();
+        if (!paymentIntent) throw new Error('Paid invoice is missing its payment intent');
         await stripe('POST', '/refunds', { payment_intent: paymentIntent });
-        const refunded = await eventFor('refund.created', o => o.charge && o.status === 'succeeded' && o.payment_intent === paymentIntent);
+        const refunded = await eventFor('refund.created', o => Boolean(o.charge) && o.status === 'succeeded' && o.payment_intent === paymentIntent);
         expect((await handleStripeWebhook(signed(refunded), deps, processStripeEvent)).status).toBe(200);
-        const refundId = (refunded.data.object as Record<string, any>).id as string;
+        const refundId = eventObjectId(refunded);
         const revokes = await store.grantsBySource('refund', refundId);
         expect(revokes.map(g => g.amount)).toEqual([BigInt(-72_000)]);
     }, 120_000);
