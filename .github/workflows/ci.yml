@@ -580,10 +580,19 @@ jobs:
           npm install next@16.4.0 react@19 react-dom@19 --cache /tmp/next-npm-cache --no-audit --no-fund
           echo "EZIL_NEXT_NPM_CACHE=/tmp/next-npm-cache" >> "$GITHUB_ENV"
           # The user's real tool: the official OpenCode installer, run inside the pulled image (not
-          # on the runner). Required: do not silently omit OpenCode persistence checks.
+          # on the runner). Required: do not silently omit OpenCode persistence checks. Pinned to the
+          # same release as test-desktop.sh and e2e/hosted-home-persistence.mjs OPENCODE_VERSION:
+          # --version skips the installer's unauthenticated GitHub API lookup, and the file + version
+          # check means a failed fetch can never pass on its own.
+          opencode_version=1.18.35
           mkdir -p /tmp/opencode-out
-          if docker run --rm -v /tmp/opencode-out:/out --entrypoint bash ezil-integrated:local -c \
-              'curl -fsSL https://opencode.ai/install | bash >/dev/null && cp -a /root/.opencode /out/'; then
+          if docker run --rm -v /tmp/opencode-out:/out --entrypoint bash ezil-integrated:local -c "
+              set -euo pipefail
+              curl -fsSL --retry 3 --retry-delay 5 -o /tmp/opencode-install.sh https://opencode.ai/install
+              test -s /tmp/opencode-install.sh
+              bash /tmp/opencode-install.sh --version $opencode_version > /dev/null
+              test \"\$(/root/.opencode/bin/opencode --version)\" = $opencode_version
+              cp -a /root/.opencode /out/"; then
             echo "EZIL_OPENCODE_DIR=/tmp/opencode-out/.opencode" >> "$GITHUB_ENV"
             echo "EZIL_REQUIRE_OPENCODE=1" >> "$GITHUB_ENV"
           else

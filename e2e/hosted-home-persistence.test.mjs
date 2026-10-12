@@ -844,3 +844,17 @@ test('the exact candidate image runs every required container suite, persistence
   assert.match(sh, /EZIL_REQUIRE_OPENCODE=1/);
   assert.match(sh, /EZIL_NEXT_NPM_CACHE=/);
 });
+
+test("ci.yml's container job installs the same pinned OpenCode, never by piping the installer into bash", () => {
+  // Without --version the official installer asks the unauthenticated GitHub API for the latest
+  // release first (rate-limited on shared egress), and `curl | bash` without pipefail exits 0 when
+  // the fetch fails.
+  const yml = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const step = yml.slice(yml.indexOf('mkdir -p /tmp/opencode-out'), yml.indexOf('EZIL_REQUIRE_OPENCODE=1'));
+  assert.ok(step.length > 0, 'the container job no longer installs OpenCode');
+  assert.ok(yml.includes(`opencode_version=${OPENCODE_VERSION}`), 'ci.yml pins the same OpenCode release as the hosted suite');
+  assert.ok(!/\|\s*bash/.test(step), 'never pipe an installer into bash');
+  assert.match(step, /set -euo pipefail/);
+  assert.match(step, /--version \$opencode_version/);
+  assert.match(step, /opencode --version\)\\?"\s*=\s*\$opencode_version/);
+});
