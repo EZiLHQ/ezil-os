@@ -68,10 +68,11 @@ export function getPricingContent(largeStorageEnabled: boolean) {
     const plans: readonly PricingPlan[] = [
         {
             id: 'free',
+            // Free has nothing to cancel; its reassurance is that no card is asked for.
             name: 'Free',
             price: dollars(0),
             interval: '',
-            billingNote,
+            billingNote: `${PRO_PLAN.currency.toUpperCase()} · no card needed`,
             cta: marketingContent.startLink,
             allowances: [
                 { id: 'workspace', label: 'Workspace time', value: `${FREE_PLAN.workspaceSeconds / 3600}`, unit: 'h/month', caption: 'while a computer runs' },
