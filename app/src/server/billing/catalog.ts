@@ -10,6 +10,13 @@ import type { CatalogPack, CatalogPro } from './types';
  */
 export const CATALOG_VERSION = 1;
 
+/**
+ * Managed Payments requires an eligible code on every inline product, including
+ * pack service fees: Software as a service (SaaS) – personal use. A dashboard
+ * Pro Price needs this code on its Product instead (contract §7).
+ */
+export const MANAGED_PAYMENTS_TAX_CODE = 'txcd_10103000';
+
 const HOUR = 3600;
 const GB = BigInt(1_000_000_000);
 
