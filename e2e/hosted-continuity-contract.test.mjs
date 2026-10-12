@@ -104,6 +104,7 @@ test('the public continuity failure line prints fixed codes and literal names on
         'FAIL-DETAIL hosted continuity: mode=full; phase=replacement persistence; operation=Code command ready; error=TimeoutError; assertion=marker_not_restored; missing=none');
     assert.equal(line({failedPhase:'https://x.example/?token=secret',operation:'typed: rm -rf ~',errorType:'Weird',assertionCode:'free text',missingPrerequisite:'lower'},'evil; mode=x'),
         'FAIL-DETAIL hosted continuity: mode=none; phase=unlisted; operation=unlisted; error=none; assertion=none; missing=none');
+    assert.match(line({failedPhase:'cdn.example//private/path'},'short'),/; phase=unlisted;/);
     const catchBody=source.slice(source.indexOf('\n} catch (error) {'),source.indexOf('\n} finally {'));
     assert.ok(catchBody.includes('console.log(continuityFailureLine(evidence, process.env.EZIL_CONTINUITY_MODE))'));
 });

@@ -780,6 +780,7 @@ test('the public failure line holds fixed fields only and drops anything URL- or
   const hostile = publicFailureLine({ failureCode: 'not-a-code', failedPhase: 'https://x.example/?t=secret', failedOperation: 'a;b=c',
     errorType: 'Error', install: { failure: 'rm -rf', before: 'x' }, missingPrerequisite: 'lower_case' });
   assert.equal(hostile, 'FAIL-DETAIL hosted HOME persistence: code=none; phase=unlisted; operation=unlisted; error=Error; install_fail=none; install_before=none; missing=none');
+  assert.match(publicFailureLine({ failedPhase: 'cdn.example//private/path' }), /; phase=unlisted;/);
 });
 
 test('the script prints the public failure line to stdout when a prerequisite is missing', () => {
