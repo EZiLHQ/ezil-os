@@ -118,17 +118,26 @@ This is unchanged.
 
 **System layer, dirty-triggered capture.** This replaces "every 5 min only".
 
-**Probe.** The new codec op is `sys-dirty`. It answers whether any entry under the system ROOTS (minus EXCLUDE and regenerable project trees) has an mtime newer than `/var/lib/ezil-system/capture-started`.
+**Probe.** The new codec op is `sys-dirty`. It answers whether any entry under the system ROOTS (minus EXCLUDE, package caches in every home and regenerable project trees) has an mtime newer than `/var/lib/ezil-system/capture-started`, or a metadata-only change (chmod/chown: a newer ctime) that the next capture would save differently.
 - Directories count, because creating or deleting a file bumps its directory's mtime.
-- It stops at the first hit.
+- **Metadata.** A newer ctime with an unchanged mtime counts only where the capture would now hold a different entry than the committed layer:
+  - an entry the committed record holds (`/var/lib/ezil-system/committed-meta.json`: kind, mode and owner of every entry restored or committed) counts when its kind, mode or owner differs from that record, so a chmod back to the exact baked mode counts too;
+  - elsewhere, an entry counts when it differs from the image manifest and its ctime is newer than the desktop-up baseline.
+  - A newer ctime alone never counts (on Cloudflare, untouched image files get a fresh ctime when first read), nor a root's own ctime, nor a platform change before the baseline.
+  - Restore writes the record; capture stages it, and `sys-committed` promotes it with the marker. A container restored by a codec without the record compares restored entries with the image manifest instead.
+- It stops at the first hit. The image manifest and the record load only at the first metadata-only candidate.
 - It prints `{"dirty": true|false}` and exits 0.
 - A missing marker means dirty.
-- Cost on the real image: about 0.2–0.4 s warm, about 4 s for the first cold walk.
+- Cost on the real image: about 0.2–0.4 s warm, about 4 s for the first cold walk; about 0.8 s for a metadata hit and 1.4 s for a full walk over fresh ctimes (local image, 2026-10-12).
 
 **Marker.** `sys-capture` touches `capture-started` *before* its walk. A change made during a capture is therefore seen as dirty by the next probe.
 
 **Durable Object.** On each flush cycle, if at least `SYSTEM_DIRTY_PROBE_MS` (15 s) has passed since the last probe, it runs `sys-dirty`.
-- If the layer is dirty and at least `SYSTEM_DIRTY_MIN_GAP_MS` (45 s) has passed since the last system capture, and B2 backoff is not active, it runs an interval system capture now.
+- If the layer is dirty and at least `SYSTEM_DIRTY_MIN_GAP_MS` (45 s) has passed since the last system capture start, and B2 backoff is not active, it runs an interval system capture now.
+- If the layer is dirty inside the gap, the Durable Object remembers it (`ezil:systemDirtyPendingAt`, no re-probe) and schedules the next cycle for the gap's end instead of its backed-off cadence.
+- After an interval capture, the next cycle comes as soon as the probe spacing allows, because a change made during the capture's walk is not in it.
+- These never shorten a cycle below 1 s, never lengthen the cadence, and never apply during B2 backoff.
+- A successful restore into a fresh container restarts the system clocks: its first cycle probes rather than running a full capture.
 - The 5-min periodic capture stays as a backstop.
 - Final captures (idle-stop, teardown, readiness) are unchanged.
 
