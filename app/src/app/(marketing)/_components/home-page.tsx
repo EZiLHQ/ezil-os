@@ -53,29 +53,37 @@ export default function MarketingHome({ largeStorageEnabled, focusPlans = false 
                 </div>
             </header>
             <main id="home-content" tabIndex={-1} className={styles.main}>
+                {!focusPlans && (
+                    <>
                 <section className={styles.hero} data-testid="home-hero" aria-labelledby="home-title">
-                    <p className={styles.pill}>{copy.hero.eyebrow}</p>
-                    <h1 id="home-title">{copy.hero.title}</h1>
-                    <p className={styles.description}>{copy.hero.description}</p>
-                    <div className={styles.heroActions}>
-                        <a data-testid="cta-start-free" className={styles.primary} href={chrome.startLink.href}>{chrome.startLink.label}</a>
-                        <a data-testid="cta-sign-in" className={styles.outline} href={chrome.signInLink.href}>{chrome.signInLink.label}</a>
-                    </div>
-                    <p className={styles.caption}>{copy.hero.caption}</p>
-                </section>
-                <ProductFrame />
-                <section className={styles.features} aria-label={chrome.featuresLabel}>
-                    {chrome.features.map((feature, index) => (
-                        <div className={styles.feature} key={feature.title}>
-                            <span className={styles.icon} aria-hidden="true">{['▣', '⌘', '✦'][index]}</span>
-                            <h2>{feature.title}</h2>
-                            {'description' in feature && <p>{feature.description}</p>}
-                            {'badge' in feature && <p className={styles.pill}>{feature.badge}</p>}
+                        <p className={styles.pill}>{copy.hero.eyebrow}</p>
+                        <h1 id="home-title">{copy.hero.title}</h1>
+                        <p className={styles.description}>{copy.hero.description}</p>
+                        <div className={styles.heroActions}>
+                            <a data-testid="cta-start-free" className={styles.primary} href={chrome.startLink.href}>{chrome.startLink.label}</a>
+                            <a data-testid="cta-sign-in" className={styles.outline} href={chrome.signInLink.href}>{chrome.signInLink.label}</a>
                         </div>
-                    ))}
-                </section>
-                <section id="plans" className={styles.section} aria-labelledby="plans-title" tabIndex={focusPlans ? -1 : undefined} autoFocus={focusPlans}>
-                    <h2 id="plans-title">{copy.plansLabel}</h2>
+                        <p className={styles.caption}>{copy.hero.caption}</p>
+                    </section>
+                    <ProductFrame />
+                    <section className={styles.features} aria-label={chrome.featuresLabel}>
+                        {chrome.features.map((feature, index) => (
+                            <div className={styles.feature} key={feature.title}>
+                                <span className={styles.icon} aria-hidden="true">{['▣', '⌘', '✦'][index]}</span>
+                                <h2>{feature.title}</h2>
+                                {'description' in feature && <p>{feature.description}</p>}
+                                {'badge' in feature && <p className={styles.pill}>{feature.badge}</p>}
+                            </div>
+                        ))}
+                    </section>
+                    </>
+                )}
+                {/* /pricing is plans-first: no hero above the cards, so the plans are
+                    in view on load without any scrolling script. */}
+                <section id="plans" className={styles.section} aria-labelledby="plans-title">
+                    {focusPlans
+                        ? <h1 id="plans-title">{copy.plansLabel}</h1>
+                        : <h2 id="plans-title">{copy.plansLabel}</h2>}
                     <div className={styles.plans}>
                         {copy.plans.map(plan => (
                             <article key={plan.id} data-testid={`plan-${plan.id}`} className={`${styles.card} ${plan.id === 'pro' ? styles.pro : ''}`} aria-labelledby={`plan-${plan.id}-title`}>
@@ -117,9 +125,12 @@ export default function MarketingHome({ largeStorageEnabled, focusPlans = false 
                 <section className={styles.section} aria-labelledby="faq-title">
                     <h2 id="faq-title">{copy.faq.title}</h2>
                     {copy.faq.items.map(item => (
-                        <details key={item.question} className={styles.faq}>
-                            <summary>{item.question}</summary><p>{item.answer}</p>
-                        </details>
+                        // Open questions rather than <details>: six short answers read
+                        // faster on one screen, and Chromium exposes <summary> only as
+                        // text to assistive technology (found by e2e/billing-home.mjs).
+                        <div key={item.question} className={styles.faq}>
+                            <h3>{item.question}</h3><p>{item.answer}</p>
+                        </div>
                     ))}
                 </section>
                 <section className={styles.closing} aria-labelledby="closing-title">

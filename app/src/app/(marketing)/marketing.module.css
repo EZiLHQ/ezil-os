@@ -109,7 +109,7 @@
 .limits > div { padding: 8px 0; }
 .limits dt { margin: 12px 0 8px; font-weight: 600; }
 .faq { border-bottom: 1px solid var(--border); }
-.faq summary { padding: 20px 4px; cursor: pointer; font-weight: 500; }
+.faq h3 { margin: 0; padding: 20px 4px 8px; font-size: 15px; line-height: 22px; font-weight: 600; }
 .faq p { max-width: 760px; padding: 0 4px 20px; color: var(--muted); }
 .closing { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 24px; margin: 72px 0; padding: 32px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; }
 .footer { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 16px; padding-block: 24px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; line-height: 16px; }
