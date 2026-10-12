@@ -82,9 +82,11 @@ import { PuterBackendRemovedError, puter } from '../src/ezil-stubs.js';
 
 import session from './session.js';
 import registry from './apps/registry.js';
+import { parseBillingDeepLink } from './ui/Settings/upgrade-sheet.js';
 import { warm } from './warm.js';
 import { prepareNativePersistence, restoreNativeDesktop } from './native-persistence.js';
 let nativePersistence = null;
+let billingDeepLinkHandled = false;
 
 const PHASE = 'ezil-os:boot';
 
@@ -902,6 +904,21 @@ async function build (payload) {
     // nobody can see.
     console.info(`[${PHASE}] resolved ${apps.length} app(s); opening none automatically`,
         apps.map(a => a.id));
+
+    // A return link is explicit launch intent. Reserve it before awaiting the
+    // launcher so a shell rebuild cannot open the same checkout twice.
+    const billingLink = ! billingDeepLinkHandled && parseBillingDeepLink(window.location.search);
+    if ( billingLink ) {
+        billingDeepLinkHandled = true;
+        const { initialTab, openUpgrade, search } = billingLink;
+        try {
+            if ( payload.features?.billing === true ) {
+                await registry.launch('settings', { ...ctx, initialTab, openUpgrade });
+            }
+        } finally {
+            window.history.replaceState(window.history.state, '', `${window.location.pathname}${search}${window.location.hash}`);
+        }
+    }
 
     // 🔴 LOGIN NO LONGER WARMS (container-billing fix). This used to fire
     // `warm()` SILENTLY, right here, the instant the desktop painted — well
