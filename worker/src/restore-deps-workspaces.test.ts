@@ -37,7 +37,9 @@ exit 0
     chmodSync(join(bin, pm), 0o755);
   }
   const run = () => spawnSync('bash', [SCRIPT, ws], {
-    env: { PATH: `${bin}:/usr/bin:/bin`, EZIL_DEPS_STATE_DIR: state, EZIL_DEPS_LOG: join(base, 'restore.log') }, encoding: 'utf8',
+    // The stubs shadow the real package managers; everything else (node, which restore-deps
+    // uses to read dependencies) comes from the runner's own PATH. CI's node is not in /usr/bin.
+    env: { PATH: `${bin}:${process.env.PATH ?? ''}`, EZIL_DEPS_STATE_DIR: state, EZIL_DEPS_LOG: join(base, 'restore.log') }, encoding: 'utf8',
   });
   const status = () => Object.fromEntries((existsSync(join(state, 'status')) ? readFileSync(join(state, 'status'), 'utf8') : '')
     .split('\n').filter(Boolean).map((line) => { const [s, d] = line.split('\t'); return [d!.slice(ws.length), s]; }));
@@ -47,10 +49,19 @@ exit 0
   return { ws, run, status, installs, during };
 }
 
+/** Why the script-executing cases may not run here. `null` means they CAN. Same idiom as
+ *  `./neko-teardown-orphans.test.ts`. */
+const LINUX_ONLY_REASON = process.platform === 'linux'
+  ? null
+  : `executes scripts/ezil-restore-deps.sh for real (flock and the GNU userland of the Linux `
+  + `desktop image, the only place it runs) - not meaningful on ${process.platform}`;
+if (LINUX_ONLY_REASON) console.warn(`SKIPPING the restore-deps workspace cases: ${LINUX_ONLY_REASON}.`);
+const describeIf = LINUX_ONLY_REASON ? describe.skip : describe;
+
 const WS = (...patterns: string[]) => JSON.stringify({ name: 'root', private: true, workspaces: patterns });
 const DEP = JSON.stringify({ name: 'member', dependencies: { react: '19' } });
 
-describe('restore-deps: workspace members are restored by their root', () => {
+describeIf('restore-deps: workspace members are restored by their root', () => {
   it('npm: installs the root once and tracks each member with the root, never inside a member', () => {
     const f = fixture({
       'repo/package.json': WS('apps/*'), 'repo/package-lock.json': '{}', 'repo/.members': 'apps/web apps/docs',
@@ -97,8 +108,12 @@ describe('restore-deps: workspace members are restored by their root', () => {
     expect(f.status()).toEqual({ '/repo/apps/own': 'ready' });
   });
 
+});
+
+describe('restore-deps: the embedded workspace predicate', () => {
   it('restore-deps embeds the system layer\'s workspace predicate byte for byte', () => {
-    const script = readFileSync(SCRIPT, 'utf8');
+    // A Windows checkout may turn LF into CRLF; the image always gets LF.
+    const script = readFileSync(SCRIPT, 'utf8').replace(/\r\n/g, '\n');
     const begin = '# --- WORKSPACE_PREDICATE_PY ---\n', end = '# --- end WORKSPACE_PREDICATE_PY ---\n';
     expect(script.slice(script.indexOf(begin) + begin.length, script.indexOf(end))).toBe(WORKSPACE_PREDICATE_PY);
     expect(SYSTEM_SNAPSHOT_SCRIPT).toContain(WORKSPACE_PREDICATE_PY);

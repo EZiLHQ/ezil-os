@@ -754,11 +754,14 @@ printf '{"name":"gen"}' > /root/mono/tools/gen/package.json && echo kept > /root
     }, T);
 
     it('metadata-only changes are dirty within one probe on the real image: a chmod, and a chmod back to the exact baked mode after a power cut', async () => {
-      const TOOL = '/usr/local/bin/ezil-deps';
+      // A baked tool every image ships (CI's container job tests the previous main image, which
+      // predates ezil-deps). Its baked mode differs between images (775 before 10-03, 755 after).
+      const TOOL = '/usr/local/bin/start-neko.sh';
       const timed = async (c: string) => { const t0 = Date.now(); const r = await dirty(c); return { ...r, ms: Date.now() - t0 }; };
       const { a, store, prefix } = await prepare('meta');
       const baked = (await must(a, `stat -c %a ${TOOL}`)).trim();
-      expect(baked).toBe('755');
+      expect(baked).toMatch(/^[0-7]{3}$/);
+      expect(baked).not.toBe('700');  // the chmod below must be a real change
       await commit(a, store, prefix);
       expect(await dirty(a)).toEqual({ dirty: false });
       await new Promise(r => setTimeout(r, 1100));
@@ -776,7 +779,7 @@ printf '{"name":"gen"}' > /root/mono/tools/gen/package.json && echo kept > /root
       await new Promise(r => setTimeout(r, 1100));
       // Docker has no lazy ctime: bump ctimes the way Cloudflare does, without changing
       // anything, on image and restored entries alike. That alone is never dirty.
-      await must(b, 'for p in /usr/local/bin /usr/local/lib /usr/local/bin/ezil-deps /root/notes /root/notes/n.txt; do chmod "$(stat -c %a "$p")" "$p"; done');
+      await must(b, `for p in /usr/local/bin /usr/local/lib ${TOOL} /root/notes /root/notes/n.txt; do chmod "$(stat -c %a "$p")" "$p"; done`);
       const lazy = await timed(b);
       expect(lazy.dirty).toBe(false);
       // Back to EXACTLY the baked mode: the committed layer still says 700.
