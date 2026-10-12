@@ -22,6 +22,7 @@ interface SubscriptionResponse {
 }
 
 interface InvoiceLine {
+    description?: string | null;
     type?: string;
     subscription?: StripeReference;
     parent?: {
@@ -38,6 +39,15 @@ interface InvoiceResponse {
     subscription?: StripeReference;
     parent?: { subscription_details?: { subscription?: StripeReference } | null } | null;
     lines?: { data: InvoiceLine[] };
+}
+
+interface InvoiceSummaryResponse extends InvoiceResponse {
+    number?: string | null;
+    amount_paid: number;
+    currency: string;
+    created: number;
+    hosted_invoice_url?: string | null;
+    description?: string | null;
 }
 
 interface CheckoutResponse {
@@ -163,11 +173,17 @@ export function createStripeClient(opts: {
                 client_reference_id: input.userId,
                 metadata: { sku: input.sku },
                 automatic_tax: { enabled: true },
-                customer_update: { address: 'auto' },
-                billing_address_collection: 'required',
-                success_url: input.successUrl,
-                cancel_url: input.cancelUrl,
-                allow_promotion_codes: false,
+                customer_update: { address: 'auto', name: 'auto' },
+                billing_address_collection: 'auto',
+                saved_payment_method_options: { payment_method_save: 'enabled' },
+                ...(input.uiMode === 'embedded' ? {
+                    ui_mode: 'embedded',
+                    return_url: input.returnUrl,
+                    redirect_on_completion: 'if_required',
+                } : {
+                    success_url: input.successUrl,
+                    cancel_url: input.cancelUrl,
+                }),
             };
             if (input.sku === PRO_PLAN.sku) {
                 fields.mode = 'subscription';
@@ -200,8 +216,25 @@ export function createStripeClient(opts: {
                 }));
                 fields.payment_intent_data = { metadata: { sku: pack.sku } };
             }
-            const session = await request<{ id: string; url: string }>('/checkout/sessions', fields, input.idempotencyKey);
-            return { id: session.id, url: session.url };
+            const session = await request<{ id: string; url?: string | null; client_secret?: string | null }>(
+                '/checkout/sessions', fields, input.idempotencyKey,
+            );
+            return { id: session.id, url: session.url ?? null, clientSecret: session.client_secret ?? null };
+        },
+
+        async listInvoices(customerId, limit) {
+            const query = new URLSearchParams({ customer: customerId, limit: String(limit) });
+            const invoices = await request<{ data: InvoiceSummaryResponse[] }>(`/invoices?${query}`);
+            return invoices.data.map(invoice => ({
+                id: invoice.id,
+                number: invoice.number ?? null,
+                status: invoice.status,
+                amountPaidCents: invoice.amount_paid,
+                currency: invoice.currency,
+                created: new Date(invoice.created * 1000),
+                hostedInvoiceUrl: invoice.hosted_invoice_url ?? null,
+                description: invoice.description ?? invoice.lines?.data[0]?.description ?? null,
+            }));
         },
 
         async createPortalSession(input) {
