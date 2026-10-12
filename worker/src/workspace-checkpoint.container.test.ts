@@ -705,7 +705,9 @@ printf '{"editor.fontSize":16}\n' > /workspace/.ezil/settings.json
       await must(a, `chmod 700 ${TOOL}`);
       const chmodded = await timed(a);
       expect(chmodded.dirty).toBe(true);
+      const c0 = Date.now();
       expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+      const captureMs = Date.now() - c0;
       expect(await dirty(a)).toEqual({ dirty: false });
       await powerCut(a);
       const b = await restore('meta', store, prefix);
@@ -728,7 +730,7 @@ printf '{"editor.fontSize":16}\n' > /workspace/.ezil/settings.json
       expect((await hydrate(c, store, prefix)).ok).toBe(true);
       expect((await sysHydrate(c, store, prefix)).ok).toBe(true);
       expect((await must(c, `stat -c %a ${TOOL}`)).trim()).toBe(baked);
-      console.log(`[metadata probe ms] chmod=${chmodded.ms} lazyCtimeOnly=${lazy.ms} revertToBaked=${reverted.ms}`);
+      console.log(`[metadata probe ms] chmod=${chmodded.ms} lazyCtimeOnly=${lazy.ms} revertToBaked=${reverted.ms} systemCapture=${captureMs}`);
     }, T);
 
     it('a change during capture remains dirty for the next capture', async () => {
