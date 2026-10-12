@@ -43,7 +43,7 @@ CACHES = ['/root/.local/share/pnpm/store/v3/files/00/a', '/home/alice/.npm/_caca
           '/home/alice/.npm/_logs/debug.log', '/home/alice/.cache/node/x', '/home/bob/.bun/install/cache/pkg/index.js',
           '/home/bob/.local/share/pnpm/store/v3/files/00/b']
 KEPT = ['/home/alice/.yarn/berry/cache/pkg.zip', '/home/alice/.npmrc', '/home/alice/app/.cache-notes',
-        '/home/bob/.local/share/other', '/root/.opencode/bin/opencode']
+        '/home/bob/.local/share/other', '/root/.opencode/bin/opencode', '/home/alice/.cache-old/x']
 `;
   const insertion = '\ntry:\n    op = p[\'op\']';
   expect(SYSTEM_SNAPSHOT_SCRIPT).toContain(insertion);
@@ -60,7 +60,7 @@ describe.skipIf(NO_POSIX_HOST)('system layer: package caches in every home', () 
 print(json.dumps({'caches': [excluded(p) for p in CACHES], 'kept': [excluded(p) for p in KEPT],
                   'edge': [excluded('/home/.cache'), excluded('/home/alice/app/.cache/x'), excluded('/home/alice/.cache')]}))
 sys.exit(0)
-`, 'sys-dirty', false)).toEqual({ caches: [true, true, true, true, true, true], kept: [false, false, false, false, false],
+`, 'sys-dirty', false)).toEqual({ caches: [true, true, true, true, true, true], kept: [false, false, false, false, false, false],
       edge: [false, false, true] });
   });
 
@@ -71,7 +71,7 @@ picked = inventory(OLD - 1, {})
 print(json.dumps({'caches': [test_root + p in picked for p in CACHES], 'kept': [test_root + p in picked for p in KEPT]}))
 sys.exit(0)
 `);
-    expect(result).toEqual({ caches: [false, false, false, false, false, false], kept: [true, true, true, true, true] });
+    expect(result).toEqual({ caches: [false, false, false, false, false, false], kept: [true, true, true, true, true, true] });
   });
 
   it('restore skips caches that an older snapshot archived', async () => {
@@ -96,7 +96,7 @@ with contextlib.redirect_stdout(io.StringIO()): restore()
 print(json.dumps({'caches': [os.path.exists(test_root + p) for p in CACHES], 'kept': [os.path.exists(test_root + p) for p in KEPT]}))
 sys.exit(0)
 `);
-    expect(result).toEqual({ caches: [false, false, false, false, false, false], kept: [true, true, true, true, true] });
+    expect(result).toEqual({ caches: [false, false, false, false, false, false], kept: [true, true, true, true, true, true] });
   });
 
   it('a cleared cache is never recorded as a deletion', async () => {
@@ -106,7 +106,7 @@ missing = missing_image_paths(image)
 print(json.dumps({'caches': [test_root + p in missing for p in CACHES], 'kept': [test_root + p in missing for p in KEPT]}))
 sys.exit(0)
 `);
-    expect(result).toEqual({ caches: [false, false, false, false, false, false], kept: [true, true, true, true, true] });
+    expect(result).toEqual({ caches: [false, false, false, false, false, false], kept: [true, true, true, true, true, true] });
   });
 
   it('writes into caches never make the layer dirty', async () => {
