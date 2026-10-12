@@ -842,6 +842,8 @@ test('the exact candidate image runs every required container suite, persistence
   assert.ok(sh.includes(`opencode_version=${OPENCODE_VERSION}`), 'the image test pins the same OpenCode release as the hosted suite');
   assert.ok(!/\|\s*bash/.test(sh), 'never pipe an installer into bash');
   assert.match(sh, /EZIL_REQUIRE_OPENCODE=1/);
+  // workspace-checkpoint.container.test.ts reads EZIL_CHECKPOINT_IMAGE before EZIL_VALIDATE_IMAGE.
+  assert.match(sh, /export EZIL_CHECKPOINT_IMAGE="\$EZIL_VALIDATE_IMAGE"/, 'the persistence suite must test this exact digest');
   assert.match(sh, /EZIL_NEXT_NPM_CACHE=/);
 });
 

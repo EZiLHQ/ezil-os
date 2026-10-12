@@ -27,6 +27,9 @@ docker run --rm -v "$work/opencode-out:/out" --entrypoint bash "$EZIL_VALIDATE_I
 export EZIL_NEXT_NPM_CACHE="$work/next-npm-cache"
 export EZIL_OPENCODE_DIR="$work/opencode-out/.opencode"
 export EZIL_REQUIRE_OPENCODE=1
+# The persistence suite reads EZIL_CHECKPOINT_IMAGE first: pin it to this digest too, so an
+# ambient value can never send it to another image.
+export EZIL_CHECKPOINT_IMAGE="$EZIL_VALIDATE_IMAGE"
 
 # Every suite in the required-case inventory, against this exact digest. A skip,
 # a missing required case or a contradictory summary fails, like a failure.
