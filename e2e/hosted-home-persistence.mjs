@@ -663,7 +663,12 @@ async function main() {
   // never reused, even while the closed window's iframe is still attached.
   const retiredFrames = new Set();
   let commandReadyMs = 30000;
-  const codeFrame = () => page.frames().filter(frame => /-code\./.test(frame.url()) && !frame.isDetached() && !retiredFrames.has(frame)).at(-1);
+  // Only a Code window's own frame: VS Code's webview iframes live on the same
+  // -code host INSIDE it and hold no workbench (picking one hung staging run
+  // 38196982158 at 'Code workbench' for 6 min).
+  const isCode = frame => /-code\./.test(frame?.url() ?? '');
+  const codeFrame = () => page.frames().filter(frame => isCode(frame) && !isCode(frame.parentFrame())
+    && !frame.isDetached() && !retiredFrames.has(frame)).at(-1);
   const openCode = async () => {
     await launch('code');
     // A cold computer boots here: hydrate, system layer restore, desktop start.

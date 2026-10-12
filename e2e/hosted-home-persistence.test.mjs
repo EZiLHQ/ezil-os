@@ -601,6 +601,14 @@ test('after the power cut the dead container\'s Code frame is never reused and C
   assert.match(between, /retiredFrames\.add\(f\)/);
   assert.match(between, /commandReadyMs = 120000/);
   assert.match(source, /!frame\.isDetached\(\) && !retiredFrames\.has\(frame\)/);
+  // Never a webview nested inside a Code frame.
+  const pick = runInNewContext(`(() => { const retiredFrames = new Set(); ${source.match(/  const isCode = [^\n]+\n  const codeFrame = [^;]+;/)[0]}; return codeFrame; })()`,
+    { page: { frames: () => frames } });
+  const top = { url: () => 'https://8443-guac-a-b-t.code.example/?folder=/workspace', parentFrame: () => null, isDetached: () => false };
+  top.url = () => 'https://8443-guac-a-b-t-code.example.org/?folder=/workspace';
+  const webview = { url: () => 'https://8443-guac-a-b-t-code.example.org/stable/webview/index.html', parentFrame: () => top, isDetached: () => false };
+  var frames = [top, webview];
+  assert.equal(pick(), top);
   // A failed click is a retry, never an exception out of the readiness loop.
   const ready = source.slice(source.indexOf("await bounded('Code command ready'"), source.indexOf('}, commandReadyMs);'));
   assert.ok(ready.indexOf('try {') < ready.indexOf(".command-center').click"));
