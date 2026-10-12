@@ -1,46 +1,56 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { describe, expect, it } from 'vitest';
+const state = vi.hoisted(() => ({ user: null as { id: string } | null, enabled: false }));
+const redirect = vi.hoisted(() => vi.fn((destination: string): never => { throw new Error(`redirect:${destination}`); }));
+vi.mock('next/navigation', () => ({ redirect }));
+vi.mock('@/utils/supabase/server', () => ({
+    createClient: async () => ({ auth: { getUser: async () => ({ data: { user: state.user } }) } }),
+}));
+vi.mock('@/server/billing/config', async importOriginal => {
+    const actual = await importOriginal<typeof import('@/server/billing/config')>();
+    return { ...actual, readBillingConfig: () => actual.readBillingConfig({ PRICING_PAGE_ENABLED: state.enabled ? '1' : undefined }) };
+});
 
-/**
- * 🔴 Pins the decision documented on `page.tsx`: the root route `/` now
- * sends an authenticated visitor into `Routes.OS`, matching login's own
- * default (`safeReturnUrl`'s empty-input branch).
- *
- * This flip is only safe because the one known client-side sender to `/` —
- * the logo on `/login` — is a real `<a href={Routes.HOME}>`, not a Next
- * `<Link>`. A `<Link>` would make `redirect()` here run as an App Router
- * SOFT navigation, and `/os` only boots on a real document load (see
- * `login/actions.ts`, `login/entry-contract.test.ts`,
- * docs/PLATFORM-NOTES.md §17). So this file also pins the sender: if the
- * logo is ever converted back to a `<Link>`, this test (and
- * `login/entry-contract.test.ts`) must fail before the dead-page defect can
- * come back.
- *
- * Reads source, like `login/entry-contract.test.ts`, because the property
- * under test is about which literal this line redirects to and which JSX
- * element sends the request, not about behaviour a mocked Supabase client
- * could fake either way.
- */
+import HomePage, { dynamic } from './page';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const read = (p: string) => readFileSync(path.resolve(here, p), 'utf8').replace(/\r\n/g, '\n');
 
-describe('/ (root) redirects an authenticated visitor into the OS', () => {
-    it('🔴 redirects to Routes.OS, not Routes.COMPUTERS', () => {
-        const source = read('./page.tsx');
-        expect(source).toMatch(/redirect\(user \? Routes\.OS : Routes\.LOGIN\)/);
+beforeEach(() => {
+    state.user = null;
+    state.enabled = false;
+    redirect.mockClear();
+});
+
+describe('root entry routing reads the public home flag per request', () => {
+    it('renders for anonymous visitors with the flag on, and preserves the exact login redirect with it off', async () => {
+        await expect(HomePage()).rejects.toThrow('redirect:/login');
+        expect(redirect).toHaveBeenCalledWith('/login');
+        redirect.mockClear();
+        state.enabled = true;
+        const html = renderToStaticMarkup(await HomePage());
+        expect(html).toContain('data-testid="home-hero"');
+        expect(html).toContain('Open EZiL OS and get to work.');
+        expect(redirect).not.toHaveBeenCalled();
+        expect(dynamic).toBe('force-dynamic');
     });
 
-    it('this is only safe because /login no longer soft-links to Routes.HOME', () => {
-        // If this ever becomes a <Link> again (or gains any other
-        // client-side sender to Routes.HOME), the redirect above would run
-        // as a soft navigation and `/os` would never boot. See
-        // `login/entry-contract.test.ts` for the sender-side assertion.
-        const loginSource = read('./login/page.tsx');
-        expect(loginSource).toMatch(/<a href=\{Routes\.HOME\}/);
-        expect(loginSource).not.toMatch(/<Link[^>]*href=\{Routes\.HOME\}/);
+    it.each([false, true])('signed-in visitors always enter /os (flag: %s)', async enabled => {
+        state.enabled = enabled;
+        state.user = { id: 'signed-in-user' };
+        await expect(HomePage()).rejects.toThrow('redirect:/os');
+        expect(redirect).toHaveBeenCalledExactlyOnceWith('/os');
+    });
+
+    it('keeps the login logo a document link so the OS can boot', () => {
+        const source = read('./login/page.tsx');
+        const softLink = /<Link[^>]*href=\{Routes\.HOME\}/;
+        expect(softLink.test('<Link href={Routes.HOME}>Home</Link>')).toBe(true);
+        expect(source).toMatch(/<a href=\{Routes\.HOME\}/);
+        expect(source).not.toMatch(softLink);
     });
 });
