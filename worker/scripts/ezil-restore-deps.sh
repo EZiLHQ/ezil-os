@@ -44,6 +44,10 @@ case "${1:-}" in
   *) roots+=("0${TAB}${1:-/workspace}") ;;
 esac
 mkdir -p "$STATE_DIR" 2>/dev/null || true
+# One run at a time: the Worker starts a run right after restoring a fresh
+# container, and the desktop boot starts one too. A second run waits, re-scans,
+# and skips every project the first one already restored.
+exec 8>"$STATE_DIR/.run.lock" 2>/dev/null && { flock 8 2>/dev/null || true; }
 
 # Atomic per-project update; readers never see a half-written file.
 set_state() {

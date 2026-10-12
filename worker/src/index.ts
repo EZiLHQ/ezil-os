@@ -1032,6 +1032,17 @@ async function drainContainerBootTelemetry(sandbox: Sandbox<unknown>): Promise<C
   }
 }
 
+/**
+ * Background dependency restore for a freshly hydrated container: the same
+ * boot-restore marker and log as start-neko.sh, so `ezil-deps` reports
+ * "checking projects" at once. The path is validated, never interpolated raw.
+ */
+export function restoreDepsCommand(mountPath: string): string {
+  if (!/^\/[A-Za-z0-9._\/-]+$/.test(mountPath) || mountPath.includes('..')) throw new Error('invalid workspace path');
+  return `bash -c 'mkdir -p /run/ezil-deps && rm -f /run/ezil-deps/scanned && : > /run/ezil-deps/boot-restore; `
+    + `exec /usr/local/bin/ezil-restore-deps.sh --boot ${mountPath} >> /tmp/ezil-restore-deps.log 2>&1'`;
+}
+
 async function ensureDesktop(
   sandbox: Sandbox<unknown>,
   hostname: string,
@@ -2630,6 +2641,16 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
             code: system.skippedReason ? toPersistenceCode(system.skippedReason) : system.ok ? 'ok' : 'failed' });
           bootLog('system_hydrate', 'end', { status: system.ok ? 'ok' : 'error', phaseMs: Date.now() - systemStartedAt,
             detail: `restored=${system.restored},skippedImageScoped=${system.skippedImageScoped},conflicts=${system.conflicts}${system.skippedReason ? `,reason=${system.skippedReason}` : ''}${system.sameImage === false ? ',crossImage' : ''}` });
+          // Dependency trees left out of the saved layers (HOME and /workspace
+          // projects) are rebuilt by restore-deps. Start it HERE, the moment a fresh
+          // container holds the restored files. The desktop boot script launches it
+          // only when it really boots and skips it entirely when a desktop is already
+          // serving on the container (staging 2026-10-12, after a power cut: project
+          // 'untracked', next: not found). restore-deps serialises its own runs.
+          if (result.detail !== 'already_hydrated' || (system.ok && !system.skippedReason)) {
+            try { await this.startProcess(restoreDepsCommand(params.mountPath)); }
+            catch { console.error('[restore-deps] could not start after restore'); }
+          }
         }
         // An already-hydrated container with a fresh checkpoint is ready as is:
         // the open is still activity, but a second ~3 s checkpoint is not needed.
