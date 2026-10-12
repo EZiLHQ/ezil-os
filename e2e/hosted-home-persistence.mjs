@@ -704,6 +704,22 @@ async function main() {
   const close = app => page.evaluate(app => { try { window.$(`.window[data-app="${app}"]`).close(); } catch {} }, app).catch(() => {});
   // Frames of a Code window from a container that no longer exists (power cut):
   // never reused, even while the closed window's iframe is still attached.
+  // Fixed observations from the app (session cookies, same routes the shell uses):
+  // the runtime id changes whenever the container is replaced; persistence codes
+  // are the Worker's own restore/save outcomes. Hashes and codes only.
+  const runtimeHash = async () => {
+    try {
+      const r = await page.evaluate(async id => { const res = await fetch(`/api/shell/relay-refresh?computerId=${encodeURIComponent(id)}`, { cache: 'no-store' }); return { status: res.status, json: await res.json().catch(() => ({})) }; }, computerId);
+      return r.json?.ok && typeof r.json.runtimeId === 'string' ? hash(r.json.runtimeId).slice(0, 16) : `http_${r.status}`;
+    } catch { return 'unavailable'; }
+  };
+  const persistenceCodes = async () => {
+    try {
+      const r = await page.evaluate(async id => { const res = await fetch(`/api/trpc/cloudflareGuacamole.persistenceState?input=${encodeURIComponent(JSON.stringify({ json: { computerId: id } }))}`, { cache: 'no-store' }); return res.json().catch(() => null); }, computerId);
+      const st = r?.result?.data?.json?.status;
+      return st ? { system: st.system?.code, workspace: st.workspace?.code, paused: st.savingPaused, lastStopDiscarded: st.lastStopDiscardedUnsaved } : { unavailable: true };
+    } catch { return { unavailable: true }; }
+  };
   const retiredFrames = new Set();
   let commandReadyMs = 30000;
   let lastStepNonce = null;
@@ -924,6 +940,7 @@ async function main() {
     commandReadyMs = 120000;
     await openTerminal();
     phase('computer reopened');
+    evidence.runtimeAtReopen = await runtimeHash();
 
     // Right after a replacement the computer is busiest: the boot restore is
     // reinstalling the HOME project's dependencies. Wait for that first (what a
@@ -984,6 +1001,11 @@ async function main() {
     // A step that never returned: from a NEW terminal, record which known processes
     // are alive and in what state (R run, S sleep, D disk wait, T stopped), the load,
     // and whether the stuck step ever wrote its result. Fixed names, no paths.
+    if (!evidence.ok && page && evidence.runtimeAtReopen) {
+      evidence.runtimeAtFailure = await runtimeHash();
+      evidence.containerReplacedAgain = evidence.runtimeAtFailure !== evidence.runtimeAtReopen;
+      evidence.persistenceAtFailure = await persistenceCodes();
+    }
     if (!evidence.ok && stepInFlight && lastStepNonce && page) {
       try {
         const stuck = lastStepNonce;
