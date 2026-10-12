@@ -56,6 +56,9 @@ function unwrap (result) {
  * releases that reservation immediately; late responses cannot mount into a
  * later sheet that happens to use the same Stripe element id.
  */
+/** How often an open payment form re-checks its session (see watchSession). */
+const WATCH_INTERVAL_MS = 4000;
+
 export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = defaultLoadStripe, now = Date.now }) {
     container = container?.get?.(0) ?? container;
     const doc = container.ownerDocument;
@@ -171,6 +174,14 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
     function later (fn, delay) {
         const timer = win.setTimeout(() => { timers.delete(timer); fn(); }, delay);
         timers.add(timer);
+        return timer;
+    }
+    let watchTimer = null;
+    function stopWatching () {
+        if ( watchTimer === null ) return;
+        win.clearTimeout(watchTimer);
+        timers.delete(watchTimer);
+        watchTimer = null;
     }
     function destroy (instance) {
         try { instance?.destroy(); } catch { /* Teardown must still restore focus. */ }
@@ -261,9 +272,27 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
         } catch { /* A transient read failure must not imply that payment failed. */ }
         if ( ! closed && ! finished ) later(() => { void poll(); }, 1500);
     }
+    /**
+     * Stripe's form can lose its own confirmation (seen in a real run: "Your
+     * internet connection is unstable. Your payment may have been successful…")
+     * and then never calls onComplete — leaving someone who has PAID looking at
+     * a form. So while the form is open the sheet also asks the server about the
+     * session itself; a completed session is handled exactly like onComplete.
+     * Read-only: it never grants anything (the webhook does).
+     */
+    async function watchSession () {
+        if ( closed || polling || finished ) return;
+        try {
+            const status = unwrap(await trpc.query('billing.checkoutStatus', { sessionId: session.sessionId }));
+            if ( closed || polling || finished ) return;
+            if ( status.status === 'complete' ) { startPolling(true); return; }
+        } catch { /* A failed check is retried on the next tick. */ }
+        if ( ! closed && ! polling && ! finished ) watchTimer = later(watchSession, WATCH_INTERVAL_MS);
+    }
     function startPolling (completed = false) {
         if ( closed || polling ) return;
         polling = true;
+        stopWatching();
         // onComplete starts verification; checkoutStatus still confirms receipt.
         if ( completed ) { confirming = true; mount.hidden = true; show('Confirming your payment…'); }
         deadline = now() + 30000;
@@ -291,6 +320,7 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
             checkout = instance;
             instance.mount('#ezil-embedded-checkout');
             if ( ! polling ) show('');
+            watchTimer = later(watchSession, WATCH_INTERVAL_MS);
         } catch {
             if ( closed ) return;
             destroy(checkout);

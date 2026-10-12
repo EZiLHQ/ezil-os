@@ -489,7 +489,20 @@ test('default loader is single-flight, times out in 15 seconds and retries witho
     await settle();
     assert.equal(h.mounted, 1);
     assert.equal(h.count('billing.createCheckout'), 1);
-    assert.equal(h.timers.size, 0, 'loader timer existed above');
+    // The loader's 15 s timer is gone; the one remaining timer is the session watcher.
+    assert.equal(h.timers.size, 1, 'loader timer existed above; only the session watcher remains');
+});
+
+test('a paid session is noticed even when Stripe never calls onComplete', async h => {
+    h.open();
+    await settle();
+    assert.equal(h.mounted, 1);
+    assert.equal(h.count('billing.checkoutStatus'), 0, 'positive control: nothing polled before the first watch tick');
+    h.status = async () => ({ status: 'complete' });
+    await h.tick(4000);
+    await settle();
+    assert.ok(h.count('billing.checkoutStatus') >= 1, 'the watcher asked the server about the session');
+    assert.match(h.text(), /Confirming your payment|You're on EZiL Pro|Payment received/);
 });
 
 test('closing while the default script loads cancels its timeout', async h => {

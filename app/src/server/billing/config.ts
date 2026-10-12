@@ -18,6 +18,8 @@ export interface BillingConfig {
     largeStorageEnabled: boolean;
     /** Stripe Tax on Checkout. Turn on once EZiL LLC has a tax registration. */
     automaticTaxEnabled: boolean;
+    /** Stripe Adaptive Pricing (local currency at checkout). */
+    adaptivePricingEnabled: boolean;
     stripeSecret: string | undefined;
     stripeWebhookSecret: string | undefined;
     /** Publishable key (`pk_…`) for Stripe.js Embedded Checkout. Public by design. */
@@ -46,6 +48,7 @@ export function readBillingConfig(env: Env = process.env): BillingConfig {
         enforcementEnabled: on(env.BILLING_ENFORCEMENT),
         largeStorageEnabled: on(env.BILLING_LARGE_STORAGE),
         automaticTaxEnabled: on(env.BILLING_AUTOMATIC_TAX),
+        adaptivePricingEnabled: on(env.BILLING_ADAPTIVE_PRICING),
         stripeSecret: nonEmpty(env.STRIPE_SECRET),
         stripeWebhookSecret: nonEmpty(env.STRIPE_WEBHOOK_SECRET),
         stripePublishableKey: publishable(env.STRIPE_PUBLISHABLE_KEY ?? env.STRIPE_KEY),

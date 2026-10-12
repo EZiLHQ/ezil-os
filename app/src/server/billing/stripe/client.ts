@@ -200,6 +200,14 @@ export function createStripeClient(opts: {
                     customer_update: { address: 'auto', name: 'auto' },
                 } : {}),
                 billing_address_collection: 'auto',
+                // Card (with Apple Pay / Google Pay wallets) and Link only: with
+                // more methods Stripe shows an accordion with nothing selected,
+                // one more decision before the card form even opens.
+                payment_method_types: ['card', 'link'],
+                // Adaptive Pricing showed a US-priced plan as INR "incl. 4%
+                // conversion fee" beside our "$20 USD" summary. Off unless
+                // BILLING_ADAPTIVE_PRICING=1, so the form and summary agree.
+                adaptive_pricing: { enabled: input.adaptivePricing ? 'true' : 'false' },
                 saved_payment_method_options: { payment_method_save: 'enabled' },
                 ...(input.uiMode === 'embedded' ? {
                     // `embedded_page` since Stripe's 2026-03-25 enum rename; the

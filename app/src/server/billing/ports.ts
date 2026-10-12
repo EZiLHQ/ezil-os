@@ -151,6 +151,8 @@ export interface CheckoutRequest {
     uiMode: 'embedded' | 'hosted';
     /** Stripe Tax on the session (`BILLING_AUTOMATIC_TAX=1`). */
     automaticTax: boolean;
+    /** Stripe Adaptive Pricing / local currency (`BILLING_ADAPTIVE_PRICING=1`). Optional, default off. */
+    adaptivePricing?: boolean;
     returnUrl: string;
     successUrl: string;
     cancelUrl: string;
