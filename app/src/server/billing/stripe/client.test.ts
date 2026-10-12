@@ -6,11 +6,13 @@ import { createStripeClient, StripeRequestError } from './client';
 const secretKey = 'sk_test_client_fixture';
 const start = 1_799_000_000;
 const end = 1_801_000_000;
-const checkoutResult = { id: 'cs_fixture', url: 'https://checkout.stripe.com/fixture' };
+const checkoutResult = { id: 'cs_fixture', url: 'https://checkout.stripe.com/fixture', clientSecret: null };
 const checkoutRequest: CheckoutRequest = {
     customerId: 'cus_fixture',
     userId: 'user_fixture',
     sku: 'pro_monthly_v1',
+    uiMode: 'hosted',
+    returnUrl: 'https://example.com/billing/return?session_id={CHECKOUT_SESSION_ID}',
     successUrl: 'https://example.com/billing/return?session_id={CHECKOUT_SESSION_ID}&source=billing',
     cancelUrl: 'https://example.com/settings?tab=billing',
     idempotencyKey: 'checkout_fixture',
@@ -36,10 +38,11 @@ function commonCheckout(sku = checkoutRequest.sku) {
         'metadata[sku]': sku,
         'automatic_tax[enabled]': 'true',
         'customer_update[address]': 'auto',
-        billing_address_collection: 'required',
+        'customer_update[name]': 'auto',
+        billing_address_collection: 'auto',
+        'saved_payment_method_options[payment_method_save]': 'enabled',
         success_url: checkoutRequest.successUrl,
         cancel_url: checkoutRequest.cancelUrl,
-        allow_promotion_codes: 'false',
     };
 }
 
@@ -117,6 +120,65 @@ describe('createStripeClient requests', () => {
         expect(sent.headers.get('Idempotency-Key')).toBe(checkoutRequest.idempotencyKey);
         expect(sent.body).toEqual(inlinePro());
         expect(sent.size).toBe(Object.keys(inlinePro()).length);
+    });
+
+    it('keeps embedded and hosted redirect parameters mutually exclusive', async () => {
+        const { client, fetcher } = fixture({ id: 'cs_embedded', client_secret: 'cs_embedded_secret_fixture' });
+        expect(await client.createCheckoutSession({ ...checkoutRequest, uiMode: 'embedded' })).toEqual({
+            id: 'cs_embedded', url: null, clientSecret: 'cs_embedded_secret_fixture',
+        });
+        const embedded = inspect(fetcher);
+        const { success_url, cancel_url, ...shared } = inlinePro();
+        expect(embedded.body).toEqual({
+            ...shared, ui_mode: 'embedded', return_url: checkoutRequest.returnUrl, redirect_on_completion: 'if_required',
+        });
+        expect(embedded.headers.get('Idempotency-Key')).toBe(checkoutRequest.idempotencyKey);
+        expect(embedded.body).not.toHaveProperty('success_url');
+        expect(embedded.body).not.toHaveProperty('cancel_url');
+
+        fetcher.mockResolvedValueOnce(Response.json(checkoutResult));
+        expect(await client.createCheckoutSession(checkoutRequest)).toEqual(checkoutResult);
+        const hosted = inspect(fetcher, 1).body;
+        expect(hosted).toEqual(inlinePro());
+        expect(hosted).toMatchObject({ success_url, cancel_url });
+        for (const key of ['ui_mode', 'return_url', 'redirect_on_completion']) {
+            expect(embedded.body).toHaveProperty(key);
+            expect(hosted).not.toHaveProperty(key);
+        }
+        for (const body of [embedded.body, hosted]) {
+            expect(body).toHaveProperty('saved_payment_method_options[payment_method_save]', 'enabled');
+            expect(body).not.toHaveProperty('allow_promotion_codes');
+        }
+    });
+
+    it('normalizes missing checkout fields to null while preserving provided fields', async () => {
+        const { client, fetcher } = fixture({ id: 'cs_fixture' });
+        expect(await client.createCheckoutSession(checkoutRequest)).toEqual({ id: 'cs_fixture', url: null, clientSecret: null });
+        fetcher.mockResolvedValueOnce(Response.json({ id: 'cs_fixture', url: checkoutResult.url, client_secret: 'secret_fixture' }));
+        expect(await client.createCheckoutSession(checkoutRequest)).toEqual({ ...checkoutResult, clientSecret: 'secret_fixture' });
+    });
+
+    it('lists invoices for one encoded customer and maps descriptions and nullable fields', async () => {
+        const base = { ...invoice, amount_paid: 2000, currency: 'usd', created: start };
+        const { client, fetcher } = fixture({ data: [
+            { ...base, number: 'INV-1', hosted_invoice_url: 'https://invoice.stripe.com/fixture', description: 'Invoice description', lines: { data: [{ description: 'Line description' }] } },
+            { ...base, id: 'in_line', number: null, hosted_invoice_url: null, description: null, lines: { data: [{ description: 'EZiL Pro' }] } },
+            { ...base, id: 'in_empty', status: 'draft', amount_paid: 0, lines: { data: [] } },
+            { ...base, id: 'in_no_lines' },
+        ] });
+        const mapped = { id: base.id, number: null, status: 'paid', amountPaidCents: 2000, currency: 'usd', created: new Date(start * 1000), hostedInvoiceUrl: null, description: null };
+        expect(await client.listInvoices('cus_fixture&limit=99', 12)).toEqual([
+            { ...mapped, number: 'INV-1', hostedInvoiceUrl: 'https://invoice.stripe.com/fixture', description: 'Invoice description' },
+            { ...mapped, id: 'in_line', description: 'EZiL Pro' },
+            { ...mapped, id: 'in_empty', status: 'draft', amountPaidCents: 0 },
+            { ...mapped, id: 'in_no_lines' },
+        ]);
+        const sent = inspect(fetcher);
+        expect(sent.url).toBe('https://api.stripe.com/v1/invoices?customer=cus_fixture%26limit%3D99&limit=12');
+        expect(sent.init?.method).toBe('GET');
+        expect(sent.body).toEqual({});
+        fetcher.mockResolvedValueOnce(Response.json({ data: [] }));
+        expect(await client.listInvoices('cus_fixture', 12)).toEqual([]);
     });
 
     it.each([

@@ -1,8 +1,8 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { readBillingConfig } from '@/server/billing/config';
 import type { SubscriptionRow } from '@/server/billing/meters';
-import type { BillingDeps, BillingStore, StripeApi, StripeCheckoutSession } from '@/server/billing/ports';
+import type { BillingDeps, BillingStore, StripeApi, StripeCheckoutSession, StripeInvoiceSummary } from '@/server/billing/ports';
 import type { createTRPCContext } from '../trpc';
 
 vi.mock('@/server/db', () => ({ db: {} }));
@@ -20,6 +20,16 @@ const session: StripeCheckoutSession = {
     id: 'cs_fixture', customer: 'cus_fixture', clientReferenceId: userId,
     mode: 'subscription', status: 'open', paymentStatus: 'unpaid', paymentIntentId: null, sku,
 };
+const invoice: StripeInvoiceSummary = {
+    id: 'in_fixture', number: 'INV-1', status: 'paid', amountPaidCents: 2000,
+    currency: 'usd', created: now, hostedInvoiceUrl: 'https://invoice.stripe.com/fixture', description: 'EZiL Pro',
+};
+const history = [{
+    id: invoice.id, number: invoice.number, status: invoice.status, amountPaidCents: invoice.amountPaidCents,
+    currency: invoice.currency, created: now.toISOString(), url: invoice.hostedInvoiceUrl, description: invoice.description,
+}];
+
+afterEach(() => vi.restoreAllMocks());
 
 function subscription(overrides: Partial<SubscriptionRow> = {}): SubscriptionRow {
     return {
@@ -57,7 +67,11 @@ function fixture() {
     } satisfies BillingStore;
     const stripe = {
         createCustomer: vi.fn(async () => ({ id: 'cus_fixture' })),
-        createCheckoutSession: vi.fn(async () => ({ id: session.id, url: 'https://checkout.example/session' })),
+        createCheckoutSession: vi.fn<StripeApi['createCheckoutSession']>(async input => ({
+            id: session.id, url: input.uiMode === 'hosted' ? 'https://checkout.example/session' : null,
+            clientSecret: input.uiMode === 'embedded' ? 'cs_fixture_secret_fixture' : null,
+        })),
+        listInvoices: vi.fn<StripeApi['listInvoices']>(async () => [{ ...invoice }]),
         createPortalSession: vi.fn(async () => ({ url: 'https://billing.example/portal' })),
         retrieveCheckoutSession: vi.fn(async () => ({ ...session })),
         retrieveSubscription: vi.fn<StripeApi['retrieveSubscription']>(),
@@ -78,7 +92,7 @@ function fixture() {
 }
 
 async function checkoutControl(f = fixture()) {
-    await expect(f.caller.createCheckout({ sku })).resolves.toEqual({ url: 'https://checkout.example/session' });
+    await expect(f.caller.createCheckout({ sku })).resolves.toEqual({ mode: 'redirect', sessionId: session.id, url: 'https://checkout.example/session' });
     expect(f.stripe.createCheckoutSession).toHaveBeenCalledTimes(1);
     return f;
 }
@@ -116,6 +130,8 @@ describe('billing router', () => {
         await expect(f.caller.createCheckout({ sku })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
         await expect(f.caller.portal()).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
         await expect(f.caller.checkoutStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+        await expect(f.caller.history()).resolves.toEqual([]);
+        expect(f.stripe.listInvoices).toHaveBeenCalledTimes(0);
         expect(f.stripe.createCheckoutSession).toHaveBeenCalledTimes(0);
         expect(f.stripe.createPortalSession).toHaveBeenCalledTimes(0);
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledTimes(0);
@@ -125,6 +141,8 @@ describe('billing router', () => {
         await checkoutControl(f);
         await expect(f.caller.portal()).resolves.toEqual({ url: 'https://billing.example/portal' });
         await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending' });
+        await expect(f.caller.history()).resolves.toEqual(history);
+        expect(f.stripe.listInvoices).toHaveBeenCalledWith('cus_fixture', 12);
         expect(f.stripe.createPortalSession).toHaveBeenCalledTimes(1);
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledTimes(1);
     });
@@ -166,6 +184,7 @@ describe('billing router', () => {
         expect(calls).toHaveLength(2);
         expect(calls[0][0]).toMatchObject({
             userId, customerId: 'cus_fixture', sku,
+            uiMode: 'hosted', returnUrl: 'https://app.example/billing/return?session_id={CHECKOUT_SESSION_ID}',
             successUrl: 'https://app.example/billing/return?session_id={CHECKOUT_SESSION_ID}', cancelUrl: 'https://app.example/os',
         });
         expect(calls[0][0].idempotencyKey).toMatch(new RegExp(`^checkout:${userId}:${sku}:`));
@@ -225,16 +244,94 @@ describe('billing router', () => {
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledTimes(1);
     });
 
-    it('protects all four procedures with the real authentication middleware', async () => {
+    it('protects all five procedures with the real authentication middleware', async () => {
         const f = fixture();
         const anonymous = f.router.createCaller({ ...f.ctx, user: null });
         await expect(anonymous.summary()).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
         await expect(anonymous.createCheckout({ sku })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
         await expect(anonymous.portal()).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
         await expect(anonymous.checkoutStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+        await expect(anonymous.history()).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
         await expect(f.caller.summary()).resolves.toMatchObject({ enabled: true });
         await checkoutControl(f);
         await expect(f.caller.portal()).resolves.toMatchObject({ url: 'https://billing.example/portal' });
         await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending' });
+        await expect(f.caller.history()).resolves.toEqual(history);
+    });
+
+    it('starts embedded checkout with the configured publishable key and session secret', async () => {
+        const f = fixture();
+        f.deps.config.stripePublishableKey = 'pk_test_fixture';
+        await expect(f.caller.createCheckout({ sku })).resolves.toEqual({
+            mode: 'embedded', sessionId: session.id, clientSecret: 'cs_fixture_secret_fixture', publishableKey: 'pk_test_fixture',
+        });
+        expect(f.stripe.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({
+            customerId: 'cus_fixture', userId, sku, uiMode: 'embedded',
+            returnUrl: 'https://app.example/billing/return?session_id={CHECKOUT_SESSION_ID}',
+        }));
+    });
+
+    it.each(['embedded', 'hosted'] as const)('rejects an unusable %s session and accepts a complete response', async mode => {
+        const f = fixture();
+        if (mode === 'embedded') f.deps.config.stripePublishableKey = 'pk_test_fixture';
+        f.stripe.createCheckoutSession.mockResolvedValueOnce({ id: session.id, url: null, clientSecret: null });
+        await expect(f.caller.createCheckout({ sku })).rejects.toMatchObject({ code: 'INTERNAL_SERVER_ERROR', message: 'checkout_unavailable' });
+        await expect(f.caller.createCheckout({ sku })).resolves.toMatchObject({ mode: mode === 'embedded' ? 'embedded' : 'redirect', sessionId: session.id });
+    });
+
+    it('returns empty history without a customer and loads invoices for the session customer', async () => {
+        const f = fixture();
+        await expect(f.caller.history()).resolves.toEqual([]);
+        expect(f.stripe.listInvoices).toHaveBeenCalledTimes(0);
+        expect(f.store.stripeCustomerFor).toHaveBeenCalledWith(userId);
+        await f.store.linkCustomer(userId, 'cus_fixture');
+        await expect(f.caller.history()).resolves.toEqual(history);
+        expect(f.stripe.listInvoices).toHaveBeenCalledWith('cus_fixture', 12);
+        f.stripe.listInvoices.mockResolvedValueOnce([]);
+        await expect(f.caller.history()).resolves.toEqual([]);
+    });
+
+    it('serializes at most the twelve newest invoices, including nullable fields', async () => {
+        const f = fixture();
+        await f.store.linkCustomer(userId, 'cus_fixture');
+        f.stripe.listInvoices.mockResolvedValueOnce(Array.from({ length: 14 }, (_, i) => ({
+            ...invoice, id: `in_${i}`, created: new Date(now.getTime() + i * 1000),
+            number: null, hostedInvoiceUrl: null, description: null,
+        })));
+        const rows = await f.caller.history();
+        expect(rows).toHaveLength(12);
+        expect(rows.map(row => row.id)).toEqual(Array.from({ length: 12 }, (_, i) => `in_${13 - i}`));
+        expect(rows[0]).toEqual({ ...history[0], id: 'in_13', created: new Date(now.getTime() + 13_000).toISOString(), number: null, url: null, description: null });
+        expect(f.stripe.listInvoices).toHaveBeenCalledWith('cus_fixture', 12);
+    });
+
+    it('returns empty history and logs safely after Stripe errors, then recovers', async () => {
+        const f = fixture();
+        await f.store.linkCustomer(userId, 'cus_fixture');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+        f.stripe.listInvoices.mockRejectedValueOnce(new Error('upstream private billing data'));
+        await expect(f.caller.history()).resolves.toEqual([]);
+        expect(log).toHaveBeenCalledExactlyOnceWith('Billing invoice history unavailable');
+        await expect(f.caller.history()).resolves.toEqual(history);
+    });
+});
+
+describe('billing publishable-key configuration', () => {
+    it.each(['STRIPE_PUBLISHABLE_KEY', 'STRIPE_KEY'])('accepts only public Stripe keys from %s', async name => {
+        for (const value of ['pk_test_fixture', 'pk_live_fixture']) {
+            expect(readBillingConfig({ [name]: ` ${value} ` }).stripePublishableKey).toBe(value);
+        }
+        for (const value of ['sk_test_fixture', 'sk_live_fixture', 'rk_test_fixture', 'whsec_fixture', 'pk_invalid', 'prefix_pk_test_fixture', '', ' ']) {
+            const f = fixture();
+            f.deps.config = readBillingConfig({ CHECKOUT_ENABLED: '1', STRIPE_SECRET: 'sk_test_fixture', [name]: value });
+            expect(f.deps.config.stripePublishableKey).toBeUndefined();
+            await checkoutControl(f);
+        }
+    });
+
+    it('prefers the explicit public key and never sources it from the secret', () => {
+        expect(readBillingConfig({ STRIPE_PUBLISHABLE_KEY: 'pk_live_explicit', STRIPE_KEY: 'pk_test_legacy' }).stripePublishableKey).toBe('pk_live_explicit');
+        expect(readBillingConfig({ STRIPE_PUBLISHABLE_KEY: 'sk_test_invalid', STRIPE_KEY: 'pk_test_legacy' }).stripePublishableKey).toBeUndefined();
+        expect(readBillingConfig({ STRIPE_SECRET: 'sk_test_fixture' }).stripePublishableKey).toBeUndefined();
     });
 });

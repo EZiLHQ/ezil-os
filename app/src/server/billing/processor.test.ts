@@ -136,6 +136,7 @@ class MemoryStripe implements StripeApi {
     };
     async createCustomer(): Promise<never> { throw new Error('Unexpected createCustomer'); }
     async createCheckoutSession(): Promise<never> { throw new Error('Unexpected createCheckoutSession'); }
+    async listInvoices(): Promise<never> { throw new Error('Unexpected listInvoices'); }
     async createPortalSession(): Promise<never> { throw new Error('Unexpected createPortalSession'); }
     async retrieveSubscription(id: string) { this.reads.push(`subscription:${id}`); return this.subscription; }
     async retrieveInvoice(id: string) { this.reads.push(`invoice:${id}`); return this.invoice; }
