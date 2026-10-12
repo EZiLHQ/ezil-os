@@ -16,7 +16,7 @@ import {
   opencodeInstallScript, parseOpencodeInstall, opencodeCheckScript, hangDiagnosticScript, restoreFactsScript, projectScript, depsWaitScript, parseDepsStatus, parseDepsWait,
   depsWaitOutcome, projectDepsState, devServerScript, parseDevServer, cleanupPlan, cleanupScript, parseCleanup,
   EVIDENCE_FILE, clampWait, RUN_BUDGET_MS, CLEANUP_RESERVE_MS, POWER_CUT_RPO_MS, powerCutAfterRpo,
-  AcceptanceFailure, FAILURE_CODES, OPENCODE_VERSION, OPENCODE_INSTALLER_URL, OPENCODE_INSTALL_FAILURES, publicFailureLine,
+  AcceptanceFailure, FAILURE_CODES, OPENCODE_VERSION, OPENCODE_INSTALLER_URL, OPENCODE_INSTALL_FAILURES, publicFailureLine, assertAppOrigin,
 } from './hosted-home-persistence.mjs';
 
 const script = fileURLToPath(new URL('./hosted-home-persistence.mjs', import.meta.url));
@@ -796,4 +796,29 @@ test('the hosted install check requires the pinned version and no failure class,
   const source = readFileSync(script, 'utf8');
   assert.match(source, /check\(install\.exitCode === 0 && install\.binary && install\.versionMatches && install\.failure === 'none', 'opencode_install_failed'\);/);
   assert.equal((source.match(/'opencode_install_failed'\)/g) ?? []).length, 1);
+});
+
+test('the page must still be on the approved staging origin, or credentials are never typed', () => {
+  const app = 'https://ezil-os-abc123-ezil.vercel.app';
+  assert.doesNotThrow(() => assertAppOrigin(`${app}/login?method=email`, app));
+  assert.doesNotThrow(() => assertAppOrigin(`${app}/os#x`, app));
+  for (const url of ['https://os.ezil.org/login?method=email', 'http://ezil-os-abc123-ezil.vercel.app/login',
+    'https://ezil-os-abc123-ezil.vercel.app.evil.example/login', 'about:blank', 'not a url', '']) {
+    assert.throws(() => assertAppOrigin(url, app), error => error instanceof AcceptanceFailure && error.code === 'app_origin_mismatch', url);
+  }
+  assert.ok(FAILURE_CODES.includes('app_origin_mismatch'));
+});
+
+test('every navigation is origin-checked before sign-in and before any computer is touched', () => {
+  const source = readFileSync(script, 'utf8');
+  const flow = source.slice(source.indexOf('async function main()'));
+  const gotos = [...flow.matchAll(/await page\.goto\(/g)].map(m => m.index);
+  assert.ok(gotos.length >= 2);
+  for (const at of gotos) {
+    const next = flow.slice(at).split('\n').slice(1, 2).join('');
+    assert.match(next, /assertAppOrigin\(page\.url\(\), APP\);/, `navigation at ${at} is not followed by an origin check`);
+  }
+  const signInAt = flow.indexOf('await signIn(');
+  assert.ok(flow.lastIndexOf('assertAppOrigin(page.url(), APP)', signInAt) > flow.lastIndexOf('await page.goto(', signInAt));
+  assert.ok(flow.indexOf('assertAppOrigin(page.url(), APP)', signInAt) < flow.indexOf('verifySelectedComputer'));
 });

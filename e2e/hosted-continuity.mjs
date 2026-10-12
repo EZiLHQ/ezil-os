@@ -22,6 +22,13 @@ const hash = value => createHash('sha256').update(String(value)).digest('hex');
 // The job log must explain a failure without the evidence artifact. Phase and
 // operation names are code literals; anything else (a URL, typed text) prints
 // as `unlisted`, and codes outside their fixed forms print as `none`.
+// A redirect away from the approved deployment (say, to production) must never
+// receive the E2E credentials or drive a computer: Playwright follows redirects.
+const assertAppOrigin = currentUrl => {
+  let origin = null;
+  try { origin = new URL(currentUrl).origin; } catch { /* not a URL */ }
+  if (origin === null || origin === 'null' || origin !== new URL(APP).origin) assert.fail('App origin mismatch');
+};
 const continuityFailureLine = (evidence, mode) => {
   const name = value => value === undefined || value === null ? 'none'
     : (/^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,79}$/.test(value) && !value.includes('//') ? value : 'unlisted');
@@ -107,8 +114,11 @@ try {
   page = await context.newPage();
   resizeObserver = observeScreenResizes(page, APP);
   await page.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  assertAppOrigin(page.url());
   await signIn(page, { email: required('EZIL_E2E_EMAIL'), password: required('EZIL_E2E_PASSWORD') });
+  assertAppOrigin(page.url());
   await page.goto(`${APP}/os`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  assertAppOrigin(page.url());
   await bounded('session ready', () => page.evaluate(() => !!window.ezil?.session?.payload?.()?.computer));
   const api = async (path, body) => {
     const result = await page.evaluate(async ({ path, body }) => {
@@ -562,6 +572,7 @@ try {
   await configureAppContext(context);
   await context.addInitScript('(' + continuityInit.toString() + ')()');
   page = await context.newPage(); await page.goto(`${APP}/os`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  assertAppOrigin(page.url());
   resizeObserver = observeScreenResizes(page, APP);
   await bounded('fallback session ready', () => page.evaluate(() => !!window.ezil?.session?.payload?.()?.computer));
   assert.equal(await page.evaluate(() => window.ezil.session.payload().computer.id), computerId, 'Fallback selects another computer');
@@ -591,6 +602,7 @@ try {
     'Checkpoint failure stopped the runtime': 'failed_write_terminated',
     'Failed checkpoint replaced active runtime': 'failed_write_runtime_replaced',
     'Failed checkpoint changed the durable committed head': 'failed_write_head_changed',
+    'App origin mismatch': 'app_origin_mismatch',
   };
   const assertionCode = assertionCodes[error?.message];
   if (assertionCode) evidence.assertionCode = assertionCode;

@@ -691,9 +691,20 @@ export const FAILURE_CODES = Object.freeze([
   'project_install_failed', 'setup_files_missing',
   'power_cut_unconfirmed', 'container_not_replaced', 'checksums_changed', 'opencode_not_resolved', 'opencode_not_in_home',
   'opencode_version_failed', 'deps_tool_missing', 'deps_wait_failed', 'checksums_changed_after_restore',
-  'dev_server_not_200', 'dev_marker_missing', 'cleanup_incomplete',
+  'dev_server_not_200', 'dev_marker_missing', 'cleanup_incomplete', 'app_origin_mismatch',
 ]);
 const check = (condition, code) => { if (!condition) throw new AcceptanceFailure(code); };
+
+/**
+ * The page must still be on the approved staging origin. Playwright follows
+ * redirects, so a misconfigured preview could land on production: credentials
+ * are never typed and no computer is touched anywhere else.
+ */
+export function assertAppOrigin(currentUrl, app) {
+  let origin = null;
+  try { origin = new URL(currentUrl).origin; } catch { /* not a URL */ }
+  check(origin !== null && origin !== 'null' && origin === new URL(app).origin, 'app_origin_mismatch');
+}
 
 // Phase and operation names are code literals; anything else (a URL, typed text) prints as `unlisted`.
 const NAME = /^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,79}$/;
@@ -946,8 +957,11 @@ async function main() {
     await target.configureAppContext(context);
     page = await context.newPage();
     await page.goto(`${APP}/login?method=email`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    assertAppOrigin(page.url(), APP);
     await signIn(page, { email, password });
+    assertAppOrigin(page.url(), APP);
     await page.goto(`${APP}/os`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    assertAppOrigin(page.url(), APP);
     await isolated.verifySelectedComputer(page, { computerId, required: true });
     verifiedComputer = true;
     const sandboxId = await page.evaluate(() => {
