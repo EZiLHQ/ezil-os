@@ -117,6 +117,107 @@ function harness () {
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 
+test('page-level sheet escapes Settings geometry and restores page scrolling on close', async h => {
+    const container = h.q('#container');
+    container.style.cssText = 'width: 760px; height: 560px; position: static; overflow: hidden;';
+    const originalStyle = container.getAttribute('style');
+    h.document.body.style.overflow = 'auto';
+    h.open();
+    await settle();
+    const sheet = h.q('[data-role="upgrade-sheet"]');
+    const backdrop = sheet.parentElement;
+    assert.equal(backdrop.parentElement, h.document.body, 'body owns the backdrop and its dialog');
+    assert.equal(container.contains(sheet), false, 'positive ownership is document.body above');
+    assert.equal(container.getAttribute('style'), originalStyle);
+    assert.equal(h.document.body.style.overflow, 'hidden');
+    assert.ok(container.hasAttribute('inert'));
+    assert.equal(h.mounted, 1);
+    h.handle.close();
+    assert.equal(h.q('[data-role="upgrade-sheet"]'), null, 'page-level dialog existed above');
+    assert.equal(h.document.body.style.overflow, 'auto');
+    assert.equal(container.hasAttribute('inert'), false, 'container was inert while the dialog was open');
+    assert.equal(h.destroyed, 1);
+});
+
+test('backdrop dismisses idle checkout but preserves confirmation until it finishes', async h => {
+    h.summary = async () => free;
+    h.open();
+    await settle();
+    const first = h.q('[data-role="upgrade-sheet"]');
+    h.click('.ezil-upgrade-payment');
+    assert.equal(h.q('[data-role="upgrade-sheet"]'), first, 'clicks inside the dialog keep it open');
+    h.click('.ezil-upgrade-backdrop');
+    assert.equal(h.q('[data-role="upgrade-sheet"]'), null, 'the same idle dialog closes on its backdrop');
+    assert.equal(h.destroyed, 1);
+    h.open();
+    await settle();
+    h.complete();
+    const confirming = h.q('[data-role="upgrade-sheet"]');
+    h.click('.ezil-upgrade-backdrop');
+    assert.equal(h.q('[data-role="upgrade-sheet"]'), confirming, 'onComplete protects even the pending status read');
+    await settle();
+    assert.match(h.text(), /Confirming your payment…/);
+    assert.ok(h.timers.size > 0);
+    h.click('.ezil-upgrade-backdrop');
+    assert.equal(h.q('[data-role="upgrade-sheet"]'), confirming, 'receipt verification also keeps the dialog open');
+    assert.equal(h.destroyed, 1, 'only the earlier idle checkout was destroyed');
+    h.summary = async () => pro;
+    await h.tick(1500);
+    assert.ok(h.q('[data-role="upgrade-success"]'));
+    h.click('.ezil-upgrade-backdrop');
+    assert.equal(h.q('[data-role="upgrade-sheet"]'), null, 'finished confirmation permits backdrop dismissal');
+    assert.equal(h.destroyed, 2);
+    assert.equal(h.timers.size, 0, 'verification timers existed above');
+});
+
+test('redirect polling allows dismissal before payment and protects a received payment until timeout', async h => {
+    h.create = async () => ({ mode: 'redirect', sessionId: 'cs_redirect', url: 'https://checkout.stripe.com/test' });
+    h.status = async () => ({ status: 'pending' });
+    h.open();
+    await settle();
+    assert.match(h.text(), /Finish in the new tab/);
+    h.click('.ezil-upgrade-backdrop');
+    assert.equal(h.q('[data-role="upgrade-sheet"]'), null, 'pending hosted checkout was visible above');
+    h.status = async () => ({ status: 'complete' });
+    h.summary = async () => free;
+    h.open();
+    await settle();
+    assert.match(h.text(), /Confirming your payment…/);
+    const sheet = h.q('[data-role="upgrade-sheet"]');
+    h.click('.ezil-upgrade-backdrop');
+    assert.equal(h.q('[data-role="upgrade-sheet"]'), sheet);
+    await h.tick(30000);
+    assert.match(h.text(), /Payment received — your plan updates in a moment/);
+    h.click('.ezil-upgrade-backdrop');
+    assert.equal(h.q('[data-role="upgrade-sheet"]'), null, 'timeout releases the protected dialog above');
+});
+
+test('viewport width controls the compact class at 760px and resize cleanup releases its listener', async h => {
+    h.window.innerWidth = 390;
+    h.open();
+    const backdrop = h.q('.ezil-upgrade-backdrop');
+    const summary = h.q('details');
+    assert.ok(backdrop.classList.contains('is-compact'));
+    assert.equal(summary.open, false, 'desktop expansion is the positive control below');
+    assert.equal(h.q('.ezil-upgrade-compact-title').textContent, 'EZiL Pro · $20/month · Tax calculated at checkout');
+    assert.equal(h.q('.ezil-upgrade-compact-title').hidden, false);
+    h.window.innerWidth = 760;
+    h.window.dispatchEvent(new h.window.Event('resize'));
+    assert.equal(backdrop.classList.contains('is-compact'), false, '390px applied the compact class above');
+    assert.equal(summary.open, true);
+    assert.equal(h.q('.ezil-upgrade-compact-title').hidden, true, 'compact title was visible above');
+    h.window.innerWidth = 759;
+    h.window.dispatchEvent(new h.window.Event('resize'));
+    assert.ok(backdrop.classList.contains('is-compact'));
+    h.handle.close();
+    h.window.innerWidth = 1280;
+    h.window.dispatchEvent(new h.window.Event('resize'));
+    assert.ok(backdrop.classList.contains('is-compact'), 'released listener cannot update the detached backdrop; live resize did above');
+    h.open();
+    assert.equal(h.q('details').open, true);
+    assert.equal(h.q('.ezil-upgrade-backdrop').classList.contains('is-compact'), false, 'the fresh desktop sheet differs from the compact sheet above');
+});
+
 test('embedded payment verifies status, waits for the webhook, then Done refreshes and closes', async h => {
     let summaries = 0;
     h.create = async () => ({ ok: true, data: embedded });
