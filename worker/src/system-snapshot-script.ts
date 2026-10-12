@@ -32,7 +32,7 @@
  * stale writer.
  */
 export const SYSTEM_SNAPSHOT_SCRIPT = String.raw`
-import os, sys, json, stat, tarfile, hashlib, shutil, subprocess, tempfile, time, fcntl
+import os, sys, json, stat, tarfile, hashlib, shutil, subprocess, tempfile, time, fcntl, fnmatch
 
 CHUNK = 1024 * 1024
 LIMIT = 512 * CHUNK
@@ -84,6 +84,14 @@ HOME_CACHES = ('.cache', '.npm/_cacache', '.npm/_logs', '.bun/install/cache', '.
 # If the lockfile disappears later, the next capture keeps the trees again. Older
 # snapshots keep their own manifest + lockfile for rebuilding; exclusion itself never
 # records a tree as deleted, so removing a lockfile cannot cause a later restore to wipe it.
+# A workspace MEMBER (~/repo/apps/web with no lockfile of its own) counts too when its
+# nearest locked ancestor in the same home (~/repo: package.json + a supported lockfile)
+# declares it: restore-deps installs that root, and the root's install builds the member's
+# trees. Only the root's own package manager's declaration counts, chosen by the same
+# lockfile precedence as restore-deps (bun, pnpm, yarn, npm): pnpm reads
+# pnpm-workspace.yaml 'packages'; npm reads package.json "workspaces" as an array; Yarn and
+# Bun also read {"packages": [...]}. Globs are a strict subset (workspace_member); anything
+# this reader cannot be sure of claims no member, so that member's trees stay captured.
 PROJECT_REGENERABLE = ('node_modules', '.next')
 PROJECT_LOCKFILES = ('bun.lock', 'bun.lockb', 'pnpm-lock.yaml', 'yarn.lock', 'package-lock.json')
 PROJECT_MAX_DEPTH = 3
@@ -91,12 +99,17 @@ p = json.loads(sys.argv[1])
 work = p['work']
 assert os.path.dirname(work) == '/tmp' and os.path.basename(work).startswith('ezil-system-'), 'invalid staging path'
 
-def regenerable_project_directory(path):
-    if path.startswith('/root/'): home, rel = '/root', path[len('/root/'):].split('/')
-    elif path.startswith('/home/'):
+def split_home(path):
+    if path.startswith('/root/'): return '/root', path[len('/root/'):].split('/')
+    if path.startswith('/home/'):
         parts = path[len('/home/'):].split('/')
-        home, rel = '/home/' + parts[0], parts[1:]
-    else: return None
+        return '/home/' + parts[0], parts[1:]
+    return None
+
+def regenerable_project_directory(path):
+    found = split_home(path)
+    if found is None: return None
+    home, rel = found
     for i, seg in enumerate(rel):
         if seg in PROJECT_REGENERABLE:
             project = rel[:i]
@@ -105,12 +118,130 @@ def regenerable_project_directory(path):
             return os.path.join(home, *project)
     return None
 
+def read_small_text(path, limit=CHUNK):
+    try:
+        with open(path, 'rb') as f: data = f.read(limit + 1)
+    except OSError: return None
+    return None if len(data) > limit else data.decode('utf-8', 'replace')
+
+def lockfile_manager(directory, exists):
+    # ezil-restore-deps.sh lockfile_pm's precedence: the manager that installs this dir.
+    if exists(os.path.join(directory, 'bun.lock')) or exists(os.path.join(directory, 'bun.lockb')): return 'bun'
+    if exists(os.path.join(directory, 'pnpm-lock.yaml')): return 'pnpm'
+    if exists(os.path.join(directory, 'yarn.lock')): return 'yarn'
+    if exists(os.path.join(directory, 'package-lock.json')): return 'npm'
+    return None
+
+def yaml_without_comment(line):
+    if line.lstrip().startswith('#'): return ''
+    at = line.find(' #')
+    return line if at < 0 else line[:at]
+
+def pnpm_workspace_packages(text):
+    # The 'packages' list of pnpm-workspace.yaml, read without a YAML library: a block list
+    # of plain or quoted scalars, or a one-line flow list. Any other shape (anchors, tags,
+    # nested values, multi-line flow) returns None: claim no member rather than guess.
+    def scalar(raw):
+        raw = raw.strip()
+        if raw[:1] in ('"', "'"):
+            end = raw.find(raw[0], 1)
+            return raw[1:end] if end > 1 and not raw[end + 1:].strip() else None
+        return raw if raw and raw[0] not in '&*!|>[]{}@%,?:-' else None
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if not line.startswith('packages:'): continue
+        rest = yaml_without_comment(line[len('packages:'):]).strip()
+        if rest:
+            if not (rest.startswith('[') and rest.endswith(']')): return None
+            items = [scalar(x) for x in rest[1:-1].split(',') if x.strip()]
+            return items if items and None not in items else None
+        items = []
+        for follow in lines[i + 1:]:
+            body = yaml_without_comment(follow)
+            if not body.strip(): continue
+            if not follow[:1].isspace(): break
+            stripped = body.strip()
+            item = scalar(stripped[2:]) if stripped.startswith('- ') else None
+            if item is None: return None
+            items.append(item)
+        return items or None
+    return None
+
+def workspace_patterns(root, manager, read):
+    if manager == 'pnpm':
+        text = read(os.path.join(root, 'pnpm-workspace.yaml'))
+        return None if text is None else pnpm_workspace_packages(text)
+    text = read(os.path.join(root, 'package.json'))
+    try: manifest = json.loads(text) if text is not None else None
+    except ValueError: return None
+    workspaces = manifest.get('workspaces') if isinstance(manifest, dict) else None
+    if isinstance(workspaces, dict) and manager in ('yarn', 'bun'): workspaces = workspaces.get('packages')
+    return workspaces if isinstance(workspaces, list) else None
+
+WORKSPACE_GLOB_UNSUPPORTED = set('{}[]()?+')
+
+def glob_segments_match(parts, segments):
+    if not parts: return not segments
+    if parts[0] == '**':
+        if len(parts) == 1: return len(segments) >= 1
+        return any(glob_segments_match(parts[1:], segments[i:]) for i in range(len(segments) + 1))
+    return bool(segments) and fnmatch.fnmatchcase(segments[0], parts[0]) and glob_segments_match(parts[1:], segments[1:])
+
+def workspace_member(patterns, rel):
+    # rel: the member dir relative to the root. Subset of the package managers' globs:
+    # literal segments, '*' within one segment, '**' across segments (a trailing '**' needs
+    # one), './' and '/' trims, and '!' exclusions (any match excludes). Any other syntax,
+    # an absolute or parent path, matches nothing; an exclusion this reader cannot evaluate
+    # claims no member at all.
+    if not rel or not isinstance(patterns, list): return False
+    segments = rel.split('/')
+    included = False
+    for raw in patterns:
+        if not isinstance(raw, str): return False
+        negate = raw.startswith('!')
+        pattern = raw[1:] if negate else raw
+        while pattern.startswith('./'): pattern = pattern[2:]
+        pattern = pattern.rstrip('/')
+        parts = pattern.split('/')
+        if (not pattern or any(c in WORKSPACE_GLOB_UNSUPPORTED for c in pattern)
+                or any(part in ('', '.', '..') for part in parts)):
+            if negate: return False
+            continue
+        if glob_segments_match(parts, segments):
+            if negate: return False
+            included = True
+    return included
+
+def workspace_root_of(directory, exists, read):
+    # The root whose install builds this member's trees: the nearest ancestor in the same home
+    # (the home itself included) with package.json and a supported lockfile, and only when
+    # that root's package manager declares the member. None otherwise.
+    found = split_home(directory + '/')
+    if found is None: return None
+    home, project = found[0], [s for s in found[1] if s]
+    for depth in range(len(project) - 1, -1, -1):
+        root = os.path.join(home, *project[:depth])
+        manager = lockfile_manager(root, exists)
+        if manager is None or not exists(os.path.join(root, 'package.json')): continue
+        return root if workspace_member(workspace_patterns(root, manager, read), '/'.join(project[depth:])) else None
+    return None
+
+def project_rebuildable(directory, exists, read):
+    # package.json AND either its own lockfile (restore-deps installs it) or a workspace root
+    # whose install builds it (restore-deps installs that root).
+    if not exists(os.path.join(directory, 'package.json')): return False
+    return (any(exists(os.path.join(directory, lock)) for lock in PROJECT_LOCKFILES)
+            or workspace_root_of(directory, exists, read) is not None)
+
+# Per process: one decision per project directory, not one per file in a captured tree.
+REBUILDABLE = {}
+
 def project_regenerable(path, restore_projects=None):
     directory = regenerable_project_directory(path)
     if directory is None: return False
     if restore_projects is not None: return directory in restore_projects
-    return (os.path.isfile(os.path.join(directory, 'package.json'))
-            and any(os.path.isfile(os.path.join(directory, lock)) for lock in PROJECT_LOCKFILES))
+    if directory not in REBUILDABLE: REBUILDABLE[directory] = project_rebuildable(directory, os.path.isfile, read_small_text)
+    return REBUILDABLE[directory]
 
 def home_cache(path):
     if path.startswith('/root/'): rel = path[len('/root/'):]
@@ -516,19 +647,23 @@ def restore():
         # Old snapshots include dependency/build trees, often ordered before their
         # package files. Decide exclusions before any extraction, from the union
         # of regular archive files and files already on disk (deltas can split them).
-        archive_files, projects = set(), set()
+        archive_files, projects = {}, set()
         for m in members:
             assert not any(part == '..' for part in m.name.split('/')), 'unsafe archive path'
             path = '/' + os.path.normpath(m.name).lstrip('/')
-            if m.isfile(): archive_files.add(path)
+            if m.isfile(): archive_files[path] = m
             directory = regenerable_project_directory(path)
             if directory is not None: projects.add(directory)
-        def project_file_exists(directory, name):
-            path = os.path.join(directory, name)
+        def project_file_exists(path):
             return path in archive_files or os.path.isfile(path)
+        def project_file_text(path):
+            # The archive's version is what this restore writes, so it decides.
+            m = archive_files.get(path)
+            if m is None: return read_small_text(path)
+            if m.size > CHUNK: return None
+            with tar.extractfile(m) as f: return f.read().decode('utf-8', 'replace')
         restore_projects = {directory for directory in projects
-                            if project_file_exists(directory, 'package.json')
-                            and any(project_file_exists(directory, lock) for lock in PROJECT_LOCKFILES)}
+                            if project_rebuildable(directory, project_file_exists, project_file_text)}
         for m in members:
             path = '/' + os.path.normpath(m.name).lstrip('/')
             assert not any(part == '..' for part in m.name.split('/')), 'unsafe archive path'
