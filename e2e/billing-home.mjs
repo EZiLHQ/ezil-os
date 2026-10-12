@@ -27,6 +27,16 @@ async function check(name, run) {
     }
 }
 
+/**
+ * Vercel previews sit behind SSO. VERCEL_AUTOMATION_BYPASS_SECRET (the same
+ * name e2e/deployed-target.mjs and preview.yml use) is sent as a header only;
+ * redact() already scrubs x-vercel-protection-bypass from any error text.
+ */
+function bypassHeaders() {
+    const secret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+    return secret ? { 'x-vercel-protection-bypass': secret } : {};
+}
+
 async function assertHref(page, selector, href) {
     const link = page.locator(selector);
     assert.equal(await link.count(), 1, `${selector} must be unique`);
@@ -59,7 +69,7 @@ try {
     for (const [width, height] of [[390, 844], [1280, 900]]) {
         for (const pathname of ['/', '/pricing']) {
             await check(`${pathname} at ${width}×${height}`, async () => {
-                const context = await browser.newContext({ viewport: { width, height }, reducedMotion: 'reduce' });
+                const context = await browser.newContext({ viewport: { width, height }, reducedMotion: 'reduce', extraHTTPHeaders: bypassHeaders() });
                 const page = await context.newPage();
                 const errors = [];
                 page.on('pageerror', error => errors.push(redact(error)));
@@ -124,7 +134,7 @@ try {
     }
     if (process.env.HOME_FLAG_OFF_BASE_URL) {
         await check('flag off redirects signed-out root to login', async () => {
-            const context = await browser.newContext();
+            const context = await browser.newContext({ extraHTTPHeaders: bypassHeaders() });
             try {
                 const page = await context.newPage();
                 const response = await page.goto(new URL('/', process.env.HOME_FLAG_OFF_BASE_URL).href);
