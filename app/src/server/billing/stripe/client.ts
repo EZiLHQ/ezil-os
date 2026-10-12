@@ -177,7 +177,9 @@ export function createStripeClient(opts: {
                 billing_address_collection: 'auto',
                 saved_payment_method_options: { payment_method_save: 'enabled' },
                 ...(input.uiMode === 'embedded' ? {
-                    ui_mode: 'embedded',
+                    // `embedded_page` since Stripe's 2026-03-25 enum rename; the
+                    // pinned API version rejects the old `embedded` value.
+                    ui_mode: 'embedded_page',
                     return_url: input.returnUrl,
                     redirect_on_completion: 'if_required',
                 } : {
