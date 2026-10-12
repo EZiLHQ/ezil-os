@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, mock, setSystemTime } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { probeSystemDirty } from './system-persist';
 import { SYSTEM_SNAPSHOT_SCRIPT } from './system-snapshot-script';
 import { SNAPSHOT_HEAD, type HydrateContainerLike } from './workspace-persist';
@@ -18,6 +20,7 @@ const LAST_FLUSH = 'ezil:systemLastFlushAt';
 const LAST_PROBE = 'ezil:systemLastDirtyProbeAt';
 const LAST_START = 'ezil:systemLastCaptureStartedAt';
 const BACKOFF = 'ezil:systemFlushBackoffAt';
+const PENDING = 'ezil:systemDirtyPendingAt';
 const digest = (content: string) => createHash('sha256').update(content).digest('hex');
 const at = (elapsed: number) => setSystemTime(new Date(START + elapsed));
 
@@ -31,10 +34,11 @@ async function fixture() {
     ['ezil:lastActivityAt', START], [LAST_FLUSH, START], [LAST_START, START],
   ]);
   const objects = new Map<string, Uint8Array>();
-  const calls = { probes: [] as number[], captures: [] as number[], commits: [] as number[],
+  const calls = { probes: [] as number[], captures: [] as number[], commits: [] as number[], captureContents: [] as string[], commitContents: [] as string[],
     scheduled: [] as number[], stops: 0, order: [] as string[] };
   const state = { content: 'base', captured: 'base', generation: null as string | null,
-    probeError: false, captureMs: 0, getError: '', putError: '', tooLarge: false };
+    probeError: false, captureMs: 0, getError: '', putError: '', tooLarge: false,
+    onCapture: undefined as undefined | (() => void) };
   const bucket = {
     get: async (key: string) => {
       const bytes = objects.get(key);
@@ -43,7 +47,7 @@ async function fixture() {
     },
     put: async (key: string, bytes: Uint8Array) => {
       objects.set(key, bytes.slice());
-      if (key.includes('/system/') && key.endsWith(SNAPSHOT_HEAD)) calls.commits.push(Date.now());
+      if (key.includes('/system/') && key.endsWith(SNAPSHOT_HEAD)) { calls.commits.push(Date.now()); calls.commitContents.push(state.captured); }
       return { etag: digest(Buffer.from(bytes).toString()) };
     },
     list: async () => ({ objects: [], truncated: false }), delete: async () => undefined,
@@ -80,7 +84,9 @@ async function fixture() {
         calls.order.push('sys-capture');
         calls.captures.push(Date.now());
         if (state.tooLarge) return { exitCode: 3, stdout: '' };
+        calls.captureContents.push(state.content);
         state.captured = state.content;
+        state.onCapture?.();
         setSystemTime(new Date(Date.now() + state.captureMs));
         return { exitCode: 0, stdout: JSON.stringify({ expectedGeneration: state.generation,
           sha256: digest(state.captured), entries: 1,
@@ -138,19 +144,80 @@ describe('system dirty flush cycles', () => {
 
   it('probes at most every 15 seconds and waits 45 seconds between capture starts', async () => {
     const f = await fixture();
-    f.state.content = 'dirty';
-    for (const elapsed of [0, 14_999, 15_000, 30_000, 44_999]) {
+    for (const elapsed of [0, 14_999, 15_000]) {
       at(elapsed);
       await f.flush();
     }
+    expect(f.calls.probes).toEqual([START, START + 15_000]);
+    f.state.content = 'dirty';
+    for (const elapsed of [29_999, 30_000, 44_999]) {
+      at(elapsed);
+      await f.flush();
+    }
+    // Dirty inside the gap is remembered, not probed again: the change cannot undo itself.
     expect(f.calls.probes).toEqual([START, START + 15_000, START + 30_000]);
+    expect(f.store.get(PENDING)).toBe(START + 30_000);
     expect(f.calls.captures).toHaveLength(0);
     at(45_000);
     await f.flush();
     expect(f.calls.captures).toEqual([START + 45_000]);
-    expect(f.store.get(LAST_PROBE)).toBe(START + 45_000);
+    expect(f.calls.probes).toHaveLength(3);
+    expect(f.store.has(PENDING)).toBe(false);
     expect(f.store.get(LAST_START)).toBe(START + 45_000);
     expect(f.calls.order.indexOf(`put:${LAST_START}`)).toBeLessThan(f.calls.order.indexOf('sys-capture'));
+  });
+
+  it('while dirty inside the gap the loop comes back when the gap ends, never sooner than 1 s or later than 10 s', async () => {
+    const f = await fixture();
+    f.state.content = 'dirty';
+    at(20_000);
+    await f.cycle();
+    expect(f.store.get(PENDING)).toBe(START + 20_000);
+    expect(f.calls.scheduled.at(-1)).toBe(10);
+    at(40_000);
+    await f.cycle();
+    expect(f.calls.scheduled.at(-1)).toBe(5);
+    at(45_000);
+    await f.cycle();
+    expect(f.calls.captures).toEqual([START + 45_000]);
+    // A capture this cycle: probe again as soon as the 15 s spacing allows (the last
+    // probe was 25 s ago), then back to the cadence once the probe is clean.
+    expect(f.calls.scheduled.at(-1)).toBe(1);
+    at(46_000);
+    await f.cycle();
+    expect(f.calls.probes.at(-1)).toBe(START + 46_000);
+    expect(f.calls.scheduled.at(-1)).toBeGreaterThanOrEqual(10);
+  });
+
+  it('B2 backoff never shortens the cadence for a pending change', async () => {
+    const f = await fixture();
+    await followSchedule(f, 600_000, () => f.calls.scheduled.at(-1) === 60);
+    const from = f.calls.scheduled.length;
+    // A refused capture just started (B2 backoff), and the layer is dirty again.
+    f.store.set(BACKOFF, Date.now());
+    f.store.set(LAST_START, Date.now());
+    f.store.set(LAST_FLUSH, Date.now());
+    f.state.content = 'dirty';
+    const captures = f.calls.captures.length;
+    at(Date.now() - START + 20_000);
+    await f.cycle();
+    expect(f.store.has(PENDING)).toBe(true);
+    await followSchedule(f, Date.now() - START + 120_000, () => false);
+    expect(f.calls.captures).toHaveLength(captures);
+    expect(f.calls.scheduled.slice(from)).toEqual([60, 60, 60]);
+  });
+
+  it('a pending change whose gap has ended never becomes a 1 s loop when the cycle could not capture', async () => {
+    const f = await fixture();
+    f.state.content = 'dirty';
+    at(20_000);
+    await f.cycle();
+    expect(f.store.get(PENDING)).toBe(START + 20_000);
+    f.state.getError = LAST_FLUSH;
+    at(70_000);
+    await f.cycle();
+    expect(f.calls.captures).toHaveLength(0);
+    expect(f.calls.scheduled.at(-1)).toBeGreaterThanOrEqual(10);
   });
 
   it('B2 backoff blocks dirty and periodic captures until expiry', async () => {
@@ -218,6 +285,64 @@ describe('system dirty flush cycles', () => {
     await f.flush();
     // 50 s since the previous capture STARTED (>= 45 s), 0 s since it completed.
     expect(f.calls.captures).toEqual([START, START + 50_000]);
+  });
+
+  // Worst cases for contract §6 (P1 4242645460): the cycles follow the cadence the
+  // Durable Object itself schedules, and a capture takes real time.
+  async function followSchedule(f: Awaited<ReturnType<typeof fixture>>, untilMs: number, done: () => boolean) {
+    while (Date.now() - START < untilMs && !done()) {
+      at(Date.now() - START + (f.calls.scheduled.at(-1) ?? 10) * 1000);
+      await f.cycle();
+    }
+  }
+  const latency = (f: Awaited<ReturnType<typeof fixture>>, changeAt: number, content: string) => {
+    const i = f.calls.commitContents.indexOf(content);
+    return i < 0 ? Infinity : f.calls.commits[i]! - changeAt;
+  };
+  for (const captureMs of [0, 3_000, 25_000]) {
+    it(`a change made just after a capture's marker commits within 90 s (capture takes ${captureMs / 1000} s)`, async () => {
+      const f = await fixture();
+      f.state.captureMs = captureMs;
+      at(1);
+      f.state.content = 'first';
+      let changeAt = 0;
+      f.state.onCapture = () => { if (!changeAt) { changeAt = Date.now() + 1; f.state.content = 'second'; } };
+      await followSchedule(f, 900_000, () => f.calls.commitContents.includes('second'));
+      expect(changeAt).toBeGreaterThan(0);
+      expect(latency(f, changeAt, 'second')).toBeLessThanOrEqual(90_000);
+    });
+
+    it(`a change on an idle computer commits within 90 s (capture takes ${captureMs / 1000} s)`, async () => {
+      const f = await fixture();
+      f.state.captureMs = captureMs;
+      // Quiet until the cadence has backed off to its slowest rung.
+      await followSchedule(f, 600_000, () => f.calls.scheduled.at(-1) === 60);
+      expect(f.calls.scheduled.at(-1)).toBe(60);
+      const changeAt = Date.now() + 1;
+      f.state.content = 'idle change';
+      await followSchedule(f, Date.now() - START + 900_000, () => f.calls.commitContents.includes('idle change'));
+      expect(latency(f, changeAt, 'idle change')).toBeLessThanOrEqual(90_000);
+    });
+  }
+
+  it('a fresh system restore resets the clocks: the first cycle probes instead of a full walk and tar', async () => {
+    const f = await fixture();
+    f.store.set(LAST_FLUSH, START - 10 * 60_000);
+    f.store.set(LAST_START, START - 10 * 60_000);
+    f.store.set(PENDING, START - 10 * 60_000 + 1);
+    at(1_000);
+    await f.fake.noteFreshSystemLayer();
+    at(20_000);
+    await f.cycle();
+    expect(f.calls.captures).toHaveLength(0);
+    expect(f.calls.probes).toEqual([START + 20_000]);
+    expect(f.store.has(PENDING)).toBe(false);
+    // The call site: only a successful restore into a fresh container.
+    const source = readFileSync(join(import.meta.dir, 'index.ts'), 'utf8');
+    expect(source).toContain(`if (system.skippedReason !== 'already_restored') {
+            // A fresh container must not inherit the old container's refusal.
+            try { await this.ctx.storage.delete(SYSTEM_FLUSH_BACKOFF_AT_KEY); } catch { /* best effort */ }
+            if (system.ok) await this.noteFreshSystemLayer();`);
   });
 
   for (const field of ['getError', 'putError'] as const) {
