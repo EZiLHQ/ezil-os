@@ -199,7 +199,7 @@ test('viewport width controls the compact class at 760px and resize cleanup rele
     const summary = h.q('details');
     assert.ok(backdrop.classList.contains('is-compact'));
     assert.equal(summary.open, false, 'desktop expansion is the positive control below');
-    assert.equal(h.q('.ezil-upgrade-compact-title').textContent, 'EZiL Pro · $20/month · Tax calculated at checkout');
+    assert.equal(h.q('.ezil-upgrade-compact-title').textContent, 'EZiL Pro · $20/month · before applicable tax');
     assert.equal(h.q('.ezil-upgrade-compact-title').hidden, false);
     h.window.innerWidth = 760;
     h.window.dispatchEvent(new h.window.Event('resize'));

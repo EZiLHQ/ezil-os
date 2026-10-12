@@ -143,7 +143,7 @@ export function getPricingContent(largeStorageEnabled: boolean) {
                 },
                 {
                     question: 'How are taxes handled?',
-                    answer: 'Prices are before applicable tax. Tax is calculated at checkout, and receipts arrive by email. Sold by EZiL LLC.',
+                    answer: 'Prices are before applicable tax; any applicable tax is shown before you pay, and receipts arrive by email. Sold by EZiL LLC.',
                 },
                 {
                     question: 'Is a computer always available?',
