@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { MANAGED_PAYMENTS_TAX_CODE } from '../catalog';
 import type { CheckoutRequest } from '../ports';
 import { createStripeClient, StripeRequestError } from './client';
 
@@ -431,6 +432,90 @@ describe('Stripe request failures', () => {
         const failure = new TypeError('fixture network failure');
         fetcher.mockRejectedValueOnce(failure);
         await expect(client.retrieveCharge('ch_fixture')).rejects.toBe(failure);
+    });
+});
+
+describe.each(['hosted', 'embedded'] as const)('Managed Payments in %s checkout', uiMode => {
+    it.each([
+        { sku: 'pro_monthly_v1', mode: 'subscription', amounts: ['2000'], names: ['EZiL Pro'] },
+        { sku: 'ai_pack_10_v1', mode: 'payment', amounts: ['1000', '84'], names: ['AI credits', 'Service fee'] },
+        { sku: 'ai_pack_25_v1', mode: 'payment', amounts: ['2500', '161'], names: ['AI credits', 'Service fee'] },
+    ])('sets eligible tax codes and excludes every incompatible field for $sku', async ({ sku, mode, amounts, names }) => {
+        const { client, fetcher } = fixture(checkoutResult);
+        const input = { ...checkoutRequest, sku, uiMode, automaticTax: true, adaptivePricing: true };
+        await client.createCheckoutSession({ ...input, managedPayments: false });
+        await client.createCheckoutSession({ ...input, managedPayments: true });
+        const ordinary = inspect(fetcher).body;
+        const sent = inspect(fetcher, 1);
+        expect(ordinary).toMatchObject({
+            'automatic_tax[enabled]': 'true',
+            'adaptive_pricing[enabled]': 'true',
+            'customer_update[name]': 'auto',
+            'customer_update[address]': 'auto',
+            'payment_method_types[0]': 'card',
+            'payment_method_types[1]': 'link',
+        });
+        expect(sent.body).toMatchObject({
+            'managed_payments[enabled]': 'true', mode,
+            customer: input.customerId, client_reference_id: input.userId,
+            'metadata[sku]': sku, billing_address_collection: 'auto',
+            'saved_payment_method_options[payment_method_save]': 'enabled',
+            [mode === 'subscription' ? 'subscription_data[metadata][sku]' : 'payment_intent_data[metadata][sku]']: sku,
+            ...(uiMode === 'embedded' ? {
+                ui_mode: 'embedded_page', return_url: input.returnUrl, redirect_on_completion: 'if_required',
+            } : { success_url: input.successUrl, cancel_url: input.cancelUrl }),
+        });
+        expect(sent.headers.get('Stripe-Version')).toBe('2026-03-25.dahlia');
+        expect(sent.headers.get('Idempotency-Key')).toBe(input.idempotencyKey);
+        expect(ordinary).not.toHaveProperty('managed_payments[enabled]');
+        expect(MANAGED_PAYMENTS_TAX_CODE).toBe('txcd_10103000');
+        amounts.forEach((amount, index) => {
+            const prefix = `line_items[${index}][price_data]`;
+            expect(sent.body).toHaveProperty(`${prefix}[unit_amount]`, amount);
+            expect(sent.body).toHaveProperty(`${prefix}[product_data][name]`, names[index]);
+            expect(sent.body).toHaveProperty(`${prefix}[product_data][tax_code]`, MANAGED_PAYMENTS_TAX_CODE);
+            expect(ordinary).not.toHaveProperty(`${prefix}[product_data][tax_code]`);
+        });
+        expect(Object.keys(sent.body).filter(key => key.endsWith('[tax_code]'))).toHaveLength(amounts.length);
+
+        for (const forbidden of [
+            'adaptive_pricing',
+            'automatic_tax',
+            'tax_id_collection',
+            'payment_method_types',
+            'payment_method_configuration',
+            'customer_update[name]',
+            'customer_update[address]',
+            'invoice_creation',
+            'subscription_data[invoice_settings]',
+            'payment_intent_data[statement_descriptor]',
+            'payment_intent_data[statement_descriptor_suffix]',
+            'payment_intent_data[receipt_email]',
+        ]) {
+            const matches = (body: Record<string, string>) => Object.keys(body)
+                .filter(key => key === forbidden || key.startsWith(`${forbidden}[`));
+            // Some forbidden fields have never been emitted by this client.
+            // A contaminated form proves each check detects its named field.
+            const key = forbidden.endsWith(']') ? forbidden : `${forbidden}[enabled]`;
+            expect(matches({ ...sent.body, [key]: 'fixture' }), forbidden).toEqual([key]);
+            expect(matches(sent.body), forbidden).toEqual([]);
+        }
+    });
+
+    it('leaves a dashboard Pro Product responsible for its own tax code', async () => {
+        const input = { ...checkoutRequest, uiMode, managedPayments: true };
+        const inline = fixture(checkoutResult);
+        await inline.client.createCheckoutSession(input);
+        expect(inspect(inline.fetcher).body).toHaveProperty('line_items[0][price_data][product_data][tax_code]', MANAGED_PAYMENTS_TAX_CODE);
+
+        const { client, fetcher } = fixture(checkoutResult, { priceProMonthly: 'price_pro_fixture' });
+        await client.createCheckoutSession(input);
+        const body = inspect(fetcher).body;
+        expect(body).toMatchObject({
+            'managed_payments[enabled]': 'true', mode: 'subscription',
+            'line_items[0][quantity]': '1', 'line_items[0][price]': 'price_pro_fixture',
+        });
+        expect(Object.keys(body).filter(key => key.startsWith('line_items[0][price_data]'))).toEqual([]);
     });
 });
 

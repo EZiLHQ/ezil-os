@@ -1,4 +1,4 @@
-import { findPack, PRO_PLAN } from '../catalog';
+import { findPack, MANAGED_PAYMENTS_TAX_CODE, PRO_PLAN } from '../catalog';
 import type { StripeApi, StripeCheckoutSession } from '../ports';
 
 const STRIPE_BASE_URL = 'https://api.stripe.com/v1';
@@ -190,24 +190,23 @@ export function createStripeClient(opts: {
                 customer: input.customerId,
                 client_reference_id: input.userId,
                 metadata: { sku: input.sku },
-                // Stripe Tax makes Checkout ask US buyers for a full street
-                // address (and hides Google Pay unless a shipping address is
-                // collected). It only collects where EZiL LLC is registered, so
-                // until a registration exists it adds friction and $0 of tax:
-                // off unless BILLING_AUTOMATIC_TAX=1 (contract §7).
-                ...(input.automaticTax ? {
-                    automatic_tax: { enabled: true },
-                    customer_update: { address: 'auto', name: 'auto' },
-                } : {}),
+                // As merchant of record, Stripe controls tax, currency and
+                // payment methods and rejects the corresponding seller fields.
+                ...(input.managedPayments ? {
+                    managed_payments: { enabled: true },
+                } : {
+                    // Stripe Tax adds address collection but collects only where
+                    // EZiL LLC is registered: opt in after registration (§7).
+                    ...(input.automaticTax ? {
+                        automatic_tax: { enabled: true },
+                        customer_update: { address: 'auto', name: 'auto' },
+                    } : {}),
+                    // Card wallets and Link avoid an extra payment-method decision.
+                    payment_method_types: ['card', 'link'],
+                    // Keep the USD summary and checkout aligned unless opted in.
+                    adaptive_pricing: { enabled: input.adaptivePricing ? 'true' : 'false' },
+                }),
                 billing_address_collection: 'auto',
-                // Card (with Apple Pay / Google Pay wallets) and Link only: with
-                // more methods Stripe shows an accordion with nothing selected,
-                // one more decision before the card form even opens.
-                payment_method_types: ['card', 'link'],
-                // Adaptive Pricing showed a US-priced plan as INR "incl. 4%
-                // conversion fee" beside our "$20 USD" summary. Off unless
-                // BILLING_ADAPTIVE_PRICING=1, so the form and summary agree.
-                adaptive_pricing: { enabled: input.adaptivePricing ? 'true' : 'false' },
                 saved_payment_method_options: { payment_method_save: 'enabled' },
                 ...(input.uiMode === 'embedded' ? {
                     // `embedded_page` since Stripe's 2026-03-25 enum rename; the
@@ -230,7 +229,10 @@ export function createStripeClient(opts: {
                             unit_amount: PRO_PLAN.unitAmountCents,
                             recurring: { interval: PRO_PLAN.interval },
                             tax_behavior: 'exclusive',
-                            product_data: { name: 'EZiL Pro' },
+                            product_data: {
+                                name: 'EZiL Pro',
+                                ...(input.managedPayments ? { tax_code: MANAGED_PAYMENTS_TAX_CODE } : {}),
+                            },
                         },
                     }),
                 }];
@@ -246,7 +248,10 @@ export function createStripeClient(opts: {
                         currency: 'usd',
                         unit_amount: item.amount,
                         tax_behavior: 'exclusive',
-                        product_data: { name: item.name },
+                        product_data: {
+                            name: item.name,
+                            ...(input.managedPayments ? { tax_code: MANAGED_PAYMENTS_TAX_CODE } : {}),
+                        },
                     },
                 }));
                 fields.payment_intent_data = { metadata: { sku: pack.sku } };
