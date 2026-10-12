@@ -822,3 +822,19 @@ test('every navigation is origin-checked before sign-in and before any computer 
   assert.ok(flow.lastIndexOf('assertAppOrigin(page.url(), APP)', signInAt) > flow.lastIndexOf('await page.goto(', signInAt));
   assert.ok(flow.indexOf('assertAppOrigin(page.url(), APP)', signInAt) < flow.indexOf('verifySelectedComputer'));
 });
+
+test('the exact candidate image runs every required container suite, persistence included, with the pinned OpenCode', () => {
+  // Review r4242645464: ci.yml's container job tests the previous good main image; image.yml tests
+  // the candidate digest through test-desktop.sh, which ran only three of the four suites.
+  const root = new URL('../', import.meta.url);
+  const sh = readFileSync(new URL('.github/scripts/test-desktop.sh', root), 'utf8');
+  const required = JSON.parse(readFileSync(new URL('.github/scripts/container-required-cases.json', root), 'utf8'));
+  for (const suite of Object.keys(required)) assert.ok(sh.includes(suite), `test-desktop.sh never runs ${suite}`);
+  assert.ok(sh.includes('worker/src/workspace-checkpoint.container.test.ts'));
+  assert.match(sh, /EZIL_TEST_REQUIRED=\.github\/scripts\/container-required-cases\.json/);
+  assert.match(sh, /bash \.github\/scripts\/run-checked-tests\.sh container-test\.log bun test/);
+  assert.ok(sh.includes(`opencode_version=${OPENCODE_VERSION}`), 'the image test pins the same OpenCode release as the hosted suite');
+  assert.ok(!/\|\s*bash/.test(sh), 'never pipe an installer into bash');
+  assert.match(sh, /EZIL_REQUIRE_OPENCODE=1/);
+  assert.match(sh, /EZIL_NEXT_NPM_CACHE=/);
+});
