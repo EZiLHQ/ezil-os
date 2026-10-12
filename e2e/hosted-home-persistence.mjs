@@ -353,6 +353,18 @@ export function checksumScript(runId, { sentinel = 'none' } = {}) {
   ].filter(Boolean).join('\n');
 }
 
+/** Fixed-vocabulary process snapshot for a step that never returned (no paths, no args). */
+export function hangDiagnosticScript(stuckNonce) {
+  assertNonce(stuckNonce);
+  return [
+    "procs=$(ps -eo stat=,comm= 2>/dev/null | awk '{print $2\"_\"substr($1,1,1)}' | grep -E '^(sha256sum|cat|base64|gzip|tee|npm|node|python3|tar|sleep|bash|sh|ezil-deps|ezil-restore-d)_' | sort | uniq -c | awk '{printf \"%s-%s.\", $2, $1}')",
+    "load=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)",
+    `result=0; [ -f /tmp/ezq-result-${stuckNonce} ] && result=1`,
+    `chunks=$(ls /tmp/ezq-step-${stuckNonce}.* 2>/dev/null | wc -l)`,
+    'emit "procs=${procs:-none},load=${load:-0},result=$result,chunks=$chunks"',
+  ].join('\n');
+}
+
 export function parseChecksums(fields, runId) {
   assert.match(fields.digest ?? '', /^[a-f0-9]{64}$/, 'Checksum digest missing');
   const prefixes = {};
@@ -665,6 +677,7 @@ async function main() {
   // never reused, even while the closed window's iframe is still attached.
   const retiredFrames = new Set();
   let commandReadyMs = 30000;
+  let lastStepNonce = null;
   // Only a Code window's own frame: VS Code's webview iframes live on the same
   // -code host INSIDE it and hold no workbench (picking one hung staging run
   // 38196982158 at 'Code workbench' for 6 min).
@@ -743,6 +756,7 @@ async function main() {
   const runStep = async (name, body, timeoutMs) => {
     evidence.operation = `step ${name}`;
     const nonce = newNonce();
+    lastStepNonce = nonce;
     stepInFlight = true;
     // Ordinary keyboard input, as hosted-continuity types into xterm, in lines
     // short enough for the terminal's accessibility rows to show in full.
@@ -882,7 +896,16 @@ async function main() {
     await openTerminal();
     phase('computer reopened');
 
-    const after = parseChecksums(await runStep('checksums after', checksumScript(runId, { sentinel: 'check' }), 120000), runId);
+    // Right after a replacement the computer is busiest: the boot restore is
+    // reinstalling the HOME project's dependencies. Wait for that first (what a
+    // user would see), then compare; the first comparison still gets 10 min.
+    const deps = parseDepsWait(await runStep('ezil-deps wait', depsWaitScript(runId, 600), 780000), `/root/${paths.project}`);
+    evidence.steps.depsWait = deps;
+    check(deps.installed, 'deps_tool_missing');
+    check(deps.exitCode === 0, 'deps_wait_failed');
+    phase('project dependencies restored');
+
+    const after = parseChecksums(await runStep('checksums after', checksumScript(runId, { sentinel: 'check' }), 600000), runId);
     evidence.steps.checksumsAfter = after;
     // Recorded, not asserted: whether a VM boot id changes is a runtime detail.
     evidence.bootIdChanged = before.bootHash && after.bootHash ? before.bootHash !== after.bootHash : null;
@@ -898,12 +921,6 @@ async function main() {
     check(opencode.inHome, 'opencode_not_in_home');
     check(opencode.versionExit === 0, 'opencode_version_failed');
     phase('opencode resolves and runs');
-
-    const deps = parseDepsWait(await runStep('ezil-deps wait', depsWaitScript(runId, 600), 780000), `/root/${paths.project}`);
-    evidence.steps.depsWait = deps;
-    check(deps.installed, 'deps_tool_missing');
-    check(deps.exitCode === 0, 'deps_wait_failed');
-    phase('project dependencies restored');
 
     // A restore must not rewrite the user's manifest or lockfile.
     const settled = parseChecksums(await runStep('checksums after restore', checksumScript(runId), 120000), runId);
@@ -932,6 +949,16 @@ async function main() {
       : 'FAIL hosted HOME persistence: prerequisite or assertion failed');
     process.exitCode = 1;
   } finally {
+    // A step that never returned: from a NEW terminal, record which known processes
+    // are alive and in what state (R run, S sleep, D disk wait, T stopped), the load,
+    // and whether the stuck step ever wrote its result. Fixed names, no paths.
+    if (!evidence.ok && stepInFlight && lastStepNonce && page) {
+      try {
+        const stuck = lastStepNonce;
+        stepInFlight = false; await openTerminal();
+        evidence.hangDiagnostic = parseFields(await runStep('hang diagnostic', hangDiagnosticScript(stuck), 60000));
+      } catch { evidence.hangDiagnostic = { unavailable: '1' }; }
+    }
     // Remove what this run created, in the terminal, BEFORE the final stop:
     // that stop's checkpoint is what makes the removal durable.
     cleanupMode = true;

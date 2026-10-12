@@ -13,7 +13,7 @@ import { runInNewContext } from 'node:vm';
 import {
   assertStagingTarget, TargetRefused, PRODUCTION_HOSTS, assertRunId, newRunId, newNonce, runPaths, checksumTargets,
   stepCommand, stepLines, stepPlan, chunkAcked, MAX_TYPED_LINE, readMarker, parseFields, probeScript, parseProbe, checksumScript, parseChecksums, compareChecksums,
-  opencodeInstallScript, parseOpencodeInstall, opencodeCheckScript, projectScript, depsWaitScript, parseDepsStatus, parseDepsWait,
+  opencodeInstallScript, parseOpencodeInstall, opencodeCheckScript, hangDiagnosticScript, projectScript, depsWaitScript, parseDepsStatus, parseDepsWait,
   depsWaitOutcome, projectDepsState, devServerScript, parseDevServer, cleanupPlan, cleanupScript, parseCleanup,
   EVIDENCE_FILE, clampWait, RUN_BUDGET_MS, CLEANUP_RESERVE_MS, POWER_CUT_RPO_MS, powerCutAfterRpo,
   AcceptanceFailure, FAILURE_CODES,
@@ -612,4 +612,23 @@ test('after the power cut the dead container\'s Code frame is never reused and C
   // A failed click is a retry, never an exception out of the readiness loop.
   const ready = source.slice(source.indexOf("await bounded('Code command ready'"), source.indexOf('}, commandReadyMs);'));
   assert.ok(ready.indexOf('try {') < ready.indexOf(".command-center').click"));
+});
+
+test('the hang diagnostic reports fixed process names and states, the load, and the stuck step\'s files', () => {
+  const nonce = 'c'.repeat(24), stuck = 'd'.repeat(24);
+  writeFileSync(`/tmp/ezq-step-${stuck}.000`, 'x');
+  const sleeper = spawnSync('bash', ['-c', 'sleep 30 >/dev/null 2>&1 & echo $!'], { encoding: 'utf8' });
+  try {
+    const out = spawnSync('bash', ['-c', stepCommand(nonce, hangDiagnosticScript(stuck))], { encoding: 'utf8', timeout: 30000 });
+    assert.equal(out.status, 0, out.stderr);
+    const fields = parseFields(readMarker(out.stdout, nonce));
+    assert.match(fields.procs, /sleep_S-\d+\./);
+    assert.match(fields.load, /^[0-9.]+$/);
+    assert.equal(fields.result, '0');
+    assert.equal(fields.chunks, '1');
+    assert.ok(!/\//.test(fields.procs), 'no paths');
+  } finally {
+    process.kill(Number(sleeper.stdout.trim()), 'SIGKILL');
+    rmSync(`/tmp/ezq-step-${stuck}.000`, { force: true });
+  }
 });
