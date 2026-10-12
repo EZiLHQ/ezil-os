@@ -110,7 +110,7 @@ async function fixture() {
                     'metadata[test_suite]': label, 'metadata[user_id]': userId,
                 });
                 const session = await stripe('checkout/sessions', {
-                    customer: customer.id, ui_mode: 'embedded', mode: 'subscription',
+                    customer: customer.id, ui_mode: 'embedded_page', mode: 'subscription',
                     'payment_method_types[0]': 'card',
                     'line_items[0][quantity]': '1',
                     'line_items[0][price_data][currency]': 'usd',
@@ -243,6 +243,8 @@ async function noSuccess(page) {
 }
 
 async function scenario(name, run) {
+    // BILLING_E2E_ONLY=<name> runs one scenario while debugging.
+    if (process.env.BILLING_E2E_ONLY && process.env.BILLING_E2E_ONLY !== name) return;
     let fixtureState;
     try {
         fixtureState = await fixture();
@@ -254,6 +256,10 @@ async function scenario(name, run) {
         }
         steps.push({ name, passed: true });
     } catch (error) {
+        // A failure screenshot is the only way to see what Stripe's iframe showed.
+        if (process.env.BILLING_SCREENSHOTS && fixtureState?.page) {
+            await fixtureState.page.screenshot({ path: path.join(process.env.BILLING_SCREENSHOTS, `billing-checkout-${name}-FAILED.png`), fullPage: true }).catch(() => {});
+        }
         steps.push({ name, passed: false, error: redact(error), routeErrors: fixtureState?.state.routeErrors || [] });
     } finally { await fixtureState?.context.close(); }
 }

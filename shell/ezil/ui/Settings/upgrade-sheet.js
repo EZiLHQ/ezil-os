@@ -258,7 +258,13 @@ export function openUpgradeSheet ({ container, sku, trpc, onDone, loadStripe = d
         try {
             const stripe = await loadStripe(session.publishableKey, { signal: controller.signal });
             if ( closed ) return;
-            const instance = await stripe.initEmbeddedCheckout({
+            // Stripe.js renamed initEmbeddedCheckout to createEmbeddedCheckoutPage
+            // (same options and return type); prefer the new name, keep the old
+            // one for a cached older Stripe.js.
+            const create = typeof stripe.createEmbeddedCheckoutPage === 'function'
+                ? stripe.createEmbeddedCheckoutPage.bind(stripe)
+                : stripe.initEmbeddedCheckout.bind(stripe);
+            const instance = await create({
                 fetchClientSecret: async () => session.clientSecret,
                 onComplete: () => startPolling(true),
             });

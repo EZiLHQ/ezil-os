@@ -198,6 +198,19 @@ test('late Stripe initialization is destroyed without mounting into a reopened s
     assert.equal(h.mounted, 1);
 });
 
+test('current Stripe.js createEmbeddedCheckoutPage is preferred over the legacy initializer', async h => {
+    let legacyCalls = 0;
+    h.stripe.initEmbeddedCheckout = async () => { legacyCalls++; return h.instance; };
+    h.stripe.createEmbeddedCheckoutPage = async ({ fetchClientSecret }) => {
+        assert.ok(await fetchClientSecret());
+        return h.instance;
+    };
+    h.open();
+    await settle();
+    assert.equal(h.mounted, 1, 'the new initializer mounts the form');
+    assert.equal(legacyCalls, 0, 'legacy initializer is only a fallback (positive control: every other test uses it alone)');
+});
+
 test('Stripe load failure retries the loader without creating another checkout', async h => {
     let attempts = 0;
     h.open({ loadStripe: async () => { if ( ++attempts === 1 ) throw new Error('offline'); return h.stripe; } });

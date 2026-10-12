@@ -130,7 +130,7 @@ describe('createStripeClient requests', () => {
         const embedded = inspect(fetcher);
         const { success_url, cancel_url, ...shared } = inlinePro();
         expect(embedded.body).toEqual({
-            ...shared, ui_mode: 'embedded', return_url: checkoutRequest.returnUrl, redirect_on_completion: 'if_required',
+            ...shared, ui_mode: 'embedded_page', return_url: checkoutRequest.returnUrl, redirect_on_completion: 'if_required',
         });
         expect(embedded.headers.get('Idempotency-Key')).toBe(checkoutRequest.idempotencyKey);
         expect(embedded.body).not.toHaveProperty('success_url');
