@@ -1,4 +1,7 @@
 const POLL_MS = 60_000;
+// No observation yet in this window. Unlike null (healthy), so the first real
+// result, healthy included, is always reported once.
+const UNKNOWN = Symbol('unknown');
 const PAUSED_REASONS = new Set([null, 'too_large', 'stale', 'not_restored']);
 
 function noticeText ({ savingPaused, pausedLayer, pausedReason }) {
@@ -21,7 +24,7 @@ function noticeText ({ savingPaused, pausedLayer, pausedReason }) {
 export function createPersistenceWatcher ({ fetchStatus, emit, render,
     setTimer = setTimeout, clearTimer = clearTimeout, now = Date.now }) {
     let timer, flight, computerId, started = false, stopped = false, paused = false;
-    let lastPollAt = -Infinity, lastReason = null;
+    let lastPollAt = -Infinity, lastReason = UNKNOWN;
 
     const arm = () => {
         clearTimer(timer);
@@ -47,7 +50,8 @@ export function createPersistenceWatcher ({ fetchStatus, emit, render,
             const reason = result.status.pausedReason;
             if ( ! PAUSED_REASONS.has(reason) ) return;
             render(noticeText(result.status));
-            // Starting at null suppresses the first healthy observation.
+            // Each window reports its first observation once, `ok` included: a
+            // pause reported by an earlier window clears when saving recovered.
             if ( reason === lastReason ) return;
             lastReason = reason;
             emit({ eventClass: 'persistence', source: 'shell', site: 'persist.shell_seen',

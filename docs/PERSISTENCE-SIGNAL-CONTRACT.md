@@ -94,7 +94,8 @@ type PersistenceStatus = {
 
 **Shell:** while a computer is open, the shell polls this no faster than every 60 s.
 - When `savingPaused` is true, it shows one line: "Saving is paused: your home folder is over the 512 MB limit" (`system`/`too_large`), or the workspace equivalent. "stale" and "not_restored" say that saving stopped and that reopening the computer restores it.
-- It relays a `persistence` event through the authenticated `POST /api/shell/telemetry` on each change of `pausedReason`, with site `persist.shell_seen` and the code being the reason (or `ok` when cleared). That makes broken saving visible within seconds for anyone who has the computer open, without waiting for the daily spool drain.
+- It relays a `persistence` event through the authenticated `POST /api/shell/telemetry` on each window's first observation (`ok` included) and on each change of `pausedReason`, with site `persist.shell_seen` and the code being the reason (or `ok` when cleared). That makes broken saving visible within seconds for anyone who has the computer open, without waiting for the daily spool drain. The first observation is what clears a pause reported by an earlier window once saving has recovered.
+- The shell's telemetry never drops a change of code for a computer (the per-key cap of three does not apply to this class). Identical repeats, one per window open, share a cap of 20 per page life.
 
 ## 6. Switch-off guarantee (power cut)
 

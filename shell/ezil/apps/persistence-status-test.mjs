@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createPersistenceWatcher } from './persistence-status.js';
+import { createAdmission } from '../telemetry.js';
 
 const COMPUTER_ID = '00000000-0000-4000-8000-000000000001';
 const SYSTEM_NOTICE = "Saving is paused: your home folder is over the 512 MB limit. Recent changes outside your workspace won't be kept.";
@@ -236,12 +238,16 @@ test('renders the exact notice for every paused reason and layer, or null', asyn
   }
 });
 
-test('emits only reason changes, including recovery, and updates text on a layer change', async () => {
+const seen = code => ({ eventClass: 'persistence', source: 'shell', site: 'persist.shell_seen', code,
+  outcome: code === 'ok' ? 'ok' : 'skipped', computerId: COMPUTER_ID });
+
+test('emits the first observation once, then only reason changes, including recovery, and updates text on a layer change', async () => {
   let current = status();
   const f = fixture(() => current);
   await f.watcher.start(COMPUTER_ID);
   await f.tick();
-  assert.deepEqual(f.events, []);
+  assert.deepEqual(f.events, [seen('ok')]);
+  f.events.length = 0;
   for (const [reason, layer] of [
     ['too_large', 'system'], ['too_large', 'system'], ['too_large', 'workspace'],
     ['stale', 'system'], ['stale', 'system'], ['not_restored', 'system'],
@@ -252,10 +258,7 @@ test('emits only reason changes, including recovery, and updates text on a layer
   }
   assert.deepEqual(f.notices, [null, null, SYSTEM_NOTICE, SYSTEM_NOTICE, WORKSPACE_NOTICE,
     STOPPED_NOTICE, STOPPED_NOTICE, STOPPED_NOTICE, null, null]);
-  assert.deepEqual(f.events, ['too_large', 'stale', 'not_restored', 'ok'].map(code => ({
-    eventClass: 'persistence', source: 'shell', site: 'persist.shell_seen', code,
-    outcome: code === 'ok' ? 'ok' : 'skipped', computerId: COMPUTER_ID,
-  })));
+  assert.deepEqual(f.events, ['too_large', 'stale', 'not_restored', 'ok'].map(seen));
   // Repeated changes are real observations, not duplicate events to throttle.
   for (let i = 0; i < 4; i++) {
     current = status('too_large'); await f.tick();
@@ -291,16 +294,82 @@ test('fetch failures are swallowed, preserve the last state, and keep polling', 
   f.watcher.stop();
 });
 
-test('an initial failure shows nothing and does not make the first null emit', async () => {
+test('an initial failure shows and emits nothing; the first real observation emits once', async () => {
   let current = { ok: false, error: 'unavailable' };
   const f = fixture(() => current);
   await f.watcher.start(COMPUTER_ID);
   assert.deepEqual(f.notices, []);
+  assert.deepEqual(f.events, []);
   current = status();
   await f.tick();
-  assert.deepEqual(f.notices, [null]);
-  assert.deepEqual(f.events, []);
+  await f.tick();
+  assert.deepEqual(f.notices, [null, null]);
+  assert.deepEqual(f.events, [seen('ok')]);
   f.watcher.stop();
+});
+
+test('a window reopened after saving recovered clears the pause an earlier window reported', async () => {
+  // Review r4245675566: window A reports too_large and closes; saving recovers;
+  // window B's first healthy poll must report `ok`, or the computer stays flagged.
+  const emitted = [];
+  const a = fixture(() => status('too_large'), event => emitted.push(event));
+  await a.watcher.start(COMPUTER_ID);
+  a.watcher.stop();
+  const b = fixture(() => status(), event => emitted.push(event));
+  await b.watcher.start(COMPUTER_ID);
+  await b.tick();
+  b.watcher.stop();
+  assert.deepEqual(emitted, [seen('too_large'), seen('ok')]);
+});
+
+test('telemetry admits every persistence state change past MAX_PER_KEY; other classes keep the per-key cap', () => {
+  // Review r4241774146: after three `ok` recoveries in one page life the fourth was dropped.
+  const admit = createAdmission();
+  const admitted = [];
+  for (let i = 0; i < 4; i++) for (const code of ['too_large', 'ok']) admitted.push(admit(seen(code)));
+  assert.deepEqual(admitted, Array(8).fill(true));
+  const crash = { eventClass: 'crash', site: 'ezil-os:x', code: 'y' };
+  assert.deepEqual([1, 2, 3, 4].map(() => admit(crash)), [true, true, true, false]);
+  const boot = { eventClass: 'boot_summary', site: 'ezil-os:trace#code', code: 'ok' };
+  assert.equal(Array.from({ length: 13 }, () => admit(boot)).filter(Boolean).length, 12);
+});
+
+test('identical persistence repeats (one per window open) share a bounded page cap; a change always passes', () => {
+  const admit = createAdmission();
+  const other = '00000000-0000-4000-8000-000000000002';
+  assert.equal(admit(seen('ok')), true);
+  const repeats = Array.from({ length: 30 }, () => admit(seen('ok')));
+  assert.equal(repeats.filter(Boolean).length, 20);
+  assert.equal(admit(seen('ok')), false);
+  assert.equal(admit(seen('too_large')), true, 'a change passes after the repeat cap');
+  assert.equal(admit(seen('ok')), true);
+  assert.equal(Array.from({ length: 25 }, () => admit(seen('ok'))).filter(Boolean).length, 0, 'repeat cap spent');
+  assert.equal(admit({ ...seen('ok'), computerId: other }), true, 'another computer\'s first observation is a change, not a repeat');
+});
+
+test('capture() routes every armed event through the admission before buffering', () => {
+  const source = readFileSync(new URL('../telemetry.js', import.meta.url), 'utf8');
+  const body = source.slice(source.indexOf('export function capture ('), source.indexOf('if ( buffer.length >= MAX_BUFFER )'));
+  assert.match(body, /if \( ! admit\(\{ eventClass, site, code, computerId: input\.computerId \}\) \) return;/);
+  assert.ok(body.indexOf('isArmed()') < body.indexOf('admit('), 'the local mirror still records unadmitted events');
+});
+
+test('stale pause clears through the real telemetry admission after three earlier healthy windows', async () => {
+  const admit = createAdmission();
+  const admitted = [];
+  const emit = event => { if (admit(event)) admitted.push(event.code); };
+  for (let i = 0; i < 3; i++) {
+    const w = fixture(() => status(), emit);
+    await w.watcher.start(COMPUTER_ID);
+    w.watcher.stop();
+  }
+  let current = status('too_large');
+  const last = fixture(() => current, emit);
+  await last.watcher.start(COMPUTER_ID);
+  current = status();
+  await last.tick();
+  last.watcher.stop();
+  assert.deepEqual(admitted, ['ok', 'ok', 'ok', 'too_large', 'ok']);
 });
 
 test('telemetry errors cannot prevent rendering or the next poll', async () => {
