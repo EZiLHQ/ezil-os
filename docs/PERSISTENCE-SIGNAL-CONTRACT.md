@@ -141,6 +141,12 @@ This is unchanged.
 - The 5-min periodic capture stays as a backstop.
 - Final captures (idle-stop, teardown, readiness) are unchanged.
 
+**Measured bound — open for a founder decision (2026-10-12).** Let D be the system capture's duration. Measured with the Durable Object's own scheduled cadence:
+- A change made just after a capture starts commits within max(45 s, D + 1 s) + D.
+- A change on a computer whose cadence has backed off to 60 s commits within 60 s + D.
+
+So the 90 s promise above holds while D ≤ 30 s. A small layer took D = 2.2 s on a local real-image run. A layer near the 512 MiB limit can take longer, and then exceeds 90 s. This promise is not changed here.
+
 **Power cut (staging acceptance only).** The new acceptance fault is `power_cut`. It exists only in the scoped staging acceptance sandbox, like the existing faults. It destroys the running container at once:
 - no final flush;
 - no idle-stop path;
