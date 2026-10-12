@@ -271,8 +271,10 @@ CAPTURE_STARTED = STATE + '/capture-started'
 BASELINE = STATE + '/baseline'
 HYDRATED = STATE + '/hydrated'
 MANIFEST = STATE + '/manifest.json'
+COMMITTED_META = STATE + '/committed-meta.json'
 BASELINE_MISSING = STATE + '/baseline-missing.json'
 IMAGE_MANIFEST = STATE + '/image.tsv'
+IMAGE_ID = STATE + '/image-id'
 EXCLUDE = [ROOTS[0] + '/excluded', STATE]
 OLD = 1700000000000000000
 def stamp(path, ns=OLD): os.utime(path, ns=(ns, ns), follow_symlinks=False)
@@ -492,5 +494,261 @@ os.remove(CAPTURE_STARTED)
 mark_hydrated(None)
 set_dirty_baseline()
 `, 'sys-dirty')).toEqual({ dirty: false });
+  });
+});
+
+
+// Metadata (chmod/chown) changes bump ctime only. In these fixtures every settled
+// entry already has a ctime newer than OLD, exactly like Cloudflare's lazy ctime,
+// so a rule that counted ctime alone would report every case dirty.
+const META = String.raw`
+import time, contextlib, io
+def marker_now():
+    time.sleep(0.02)
+    open(CAPTURE_STARTED, 'w').close()
+    t = time.time_ns()
+    os.utime(CAPTURE_STARTED, ns=(t, t))
+    time.sleep(0.02)
+def baseline_at(ns=OLD):
+    with open(BASELINE, 'w'): pass
+    os.utime(BASELINE, ns=(ns, ns))
+def write_image_manifest(paths, owner=None):
+    rows = []
+    for path in paths:
+        s = os.lstat(path)
+        kind = 'd' if stat.S_ISDIR(s.st_mode) else 'l' if stat.S_ISLNK(s.st_mode) else 'f'
+        uid, gid = owner or (s.st_uid, s.st_gid)
+        rows.append('\t'.join([path, kind, str(s.st_size if kind == 'f' else 0), str(int(s.st_mtime)),
+                               os.readlink(path) if kind == 'l' else '', str(stat.S_IMODE(s.st_mode)), str(uid), str(gid)]))
+    with open(IMAGE_MANIFEST, 'w') as f: f.write('\n'.join(rows) + '\n')
+def restored(paths, record=None):
+    # The state a restore leaves: restored paths, plus (current codec) their committed metadata.
+    with open(MANIFEST, 'w') as f: json.dump({'paths': paths, 'deleted': []}, f)
+    if record is not None:
+        with open(COMMITTED_META, 'w') as f: json.dump({'version': 1, 'entries': record}, f)
+def record_of(path):
+    s = os.lstat(path)
+    kind = 'd' if stat.S_ISDIR(s.st_mode) else 'l' if stat.S_ISLNK(s.st_mode) else 'f'
+    return [kind, None if kind == 'l' else stat.S_IMODE(s.st_mode), s.st_uid, s.st_gid]
+tool = ROOTS[0] + '/tool'
+with open(tool, 'w') as f: f.write('baked')
+os.chmod(tool, 0o755)
+lib = ROOTS[0] + '/lib'
+os.mkdir(lib)
+os.chmod(lib, 0o755)
+`;
+
+describe.skipIf(NO_POSIX_HOST)('system dirty Python codec: metadata-only changes (contract §6, 90 s)', () => {
+  it('a chmod of an image file is dirty within the probe', async () => {
+    expect(await python(`${META}
+settle()
+write_image_manifest([tool, lib])
+baseline_at()
+marker_now()
+os.chmod(tool, 0o700)
+`)).toEqual({ dirty: true });
+  });
+
+  it('a chown of an image file is dirty within the probe', async () => {
+    expect(await python(`${META}
+settle()
+if os.geteuid() == 0:
+    write_image_manifest([tool, lib])
+    baseline_at()
+    marker_now()
+    os.chown(tool, 4321, 4321)
+else:
+    # Unprivileged hosts cannot chown: bake a different owner and bump ctime instead.
+    s = os.lstat(tool)
+    write_image_manifest([tool, lib], owner=(s.st_uid + 1, s.st_gid))
+    baseline_at()
+    marker_now()
+    os.chmod(tool, 0o755)
+`)).toEqual({ dirty: true });
+  });
+
+  it('a chmod of a file the user added since the baseline is dirty', async () => {
+    expect(await python(`${META}
+added = ROOTS[0] + '/added'
+open(added, 'w').close()
+settle()
+write_image_manifest([tool, lib])
+baseline_at()
+marker_now()
+os.chmod(added, 0o600)
+`)).toEqual({ dirty: true });
+  });
+
+  it('lazy ctime alone (image file, image directory, the root itself) is never dirty', async () => {
+    expect(await python(`${META}
+settle()
+write_image_manifest([tool, lib])
+baseline_at()
+marker_now()
+os.chmod(tool, 0o755)
+os.chmod(lib, 0o755)
+os.chmod(ROOTS[0], stat.S_IMODE(os.lstat(ROOTS[0]).st_mode))
+`)).toEqual({ dirty: false });
+  });
+
+  it('a metadata change made before the baseline (platform boot) is not dirty, as capture would not take it', async () => {
+    expect(await python(`${META}
+boot = ROOTS[0] + '/boot-written'
+open(boot, 'w').close()
+settle()
+write_image_manifest([tool, lib])
+marker_now()
+os.chmod(boot, 0o600)
+time.sleep(0.02)
+baseline_at(time.time_ns())
+`)).toEqual({ dirty: false });
+  });
+
+  it('loads the image manifest only once a ctime-only candidate appears', async () => {
+    expect(await python(`${META}
+settle()
+write_image_manifest([tool, lib])
+baseline_at()
+open(CAPTURE_STARTED, 'w').close()
+stamp(CAPTURE_STARTED, OLD - 1)
+def forbidden_manifest(): raise AssertionError('manifest loaded for an mtime hit')
+load_image_manifest = forbidden_manifest
+`)).toEqual({ dirty: true });
+  });
+
+  it('a restored entry chmodded back EXACTLY to its baked mode is dirty (no 5-min wait)', async () => {
+    expect(await python(`${META}
+os.chmod(tool, 0o700)
+settle()
+os.chmod(tool, 0o755)
+write_image_manifest([tool, lib])
+os.chmod(tool, 0o700)
+restored([tool], {tool: record_of(tool)})
+baseline_at()
+marker_now()
+os.chmod(tool, 0o755)
+`)).toEqual({ dirty: true });
+  });
+
+  it('lazy ctime on a restored directory whose mode matches the committed layer is not dirty', async () => {
+    // The restored mode differs from the baked one, so "restored ⇒ dirty" or
+    // "differs from the image ⇒ dirty" would both capture on every restored boot.
+    expect(await python(`${META}
+settle()
+write_image_manifest([tool, lib])
+os.chmod(lib, 0o750)
+restored([lib], {lib: record_of(lib)})
+baseline_at()
+marker_now()
+os.chmod(lib, 0o750)
+`)).toEqual({ dirty: false });
+  });
+
+  it('without a committed record (older restore) a restored entry keeps the image-difference rule', async () => {
+    expect(await python(`${META}
+settle()
+write_image_manifest([tool, lib])
+os.chmod(tool, 0o700)
+restored([tool])
+baseline_at()
+marker_now()
+os.chmod(tool, 0o600)
+`)).toEqual({ dirty: true });
+    expect(await python(`${META}
+settle()
+write_image_manifest([tool, lib])
+os.chmod(tool, 0o700)
+restored([tool])
+baseline_at()
+marker_now()
+os.chmod(tool, 0o755)
+`)).toEqual({ dirty: false });
+  });
+
+  it('capture records the archived metadata; sys-committed promotes it and the revert then counts', async () => {
+    const result = await python(`${META}
+added = ROOTS[0] + '/added'
+open(added, 'w').close()
+os.chmod(added, 0o640)
+settle()
+write_image_manifest([tool, lib])
+baseline_at()
+for path in (HYDRATED,): open(path, 'w').close()
+hold_package_locks = lambda block: []
+replay_lists = lambda: {}
+image_id = lambda: 'test'
+os.mkdir(work)
+os.chmod(tool, 0o700)
+capture(work + '/archive.tar')
+before = os.path.exists(COMMITTED_META)
+promote_committed()
+with open(COMMITTED_META) as f: record = json.load(f)['entries']
+clean = system_dirty()
+time.sleep(0.02)
+os.chmod(tool, 0o755)
+reverted = system_dirty()
+print(json.dumps({'before': before, 'tool': record.get(tool), 'added': record.get(added), 'clean': clean, 'reverted': reverted}))
+sys.exit(0)
+`);
+    expect(result).toEqual({ before: false, tool: ['f', 0o700, expect.any(Number), expect.any(Number)],
+      added: ['f', 0o640, expect.any(Number), expect.any(Number)], clean: false, reverted: true });
+  });
+
+  it('restore records the committed metadata of what it restored', async () => {
+    const result = await python(`${META}
+import tarfile
+settle()
+write_image_manifest([tool, lib])
+hold_package_locks = lambda block: []
+image_id = lambda: 'test'
+os.mkdir(work)
+archive = test_root + '/built.tar'
+with tarfile.open(archive, 'w', format=tarfile.PAX_FORMAT) as tar:
+    for path, mode, data in ((lib, 0o750, None), (tool, 0o700, b'user')):
+        info = tarfile.TarInfo(path.lstrip('/'))
+        info.mode, info.uid, info.gid, info.mtime = mode, os.getuid(), os.getgid(), 1700000000
+        if data is None:
+            info.type = tarfile.DIRTYPE
+            tar.addfile(info)
+        else:
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    info = tarfile.TarInfo(DELETED_MEMBER); info.size, info.mode = 2, 0o600
+    tar.addfile(info, io.BytesIO(b'[]'))
+with open(archive, 'rb') as f: data = f.read()
+with open(work + '/0', 'wb') as f: f.write(data)
+p['snapshot'] = {'chunks': [{'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}],
+                 'sha256': hashlib.sha256(data).hexdigest(), 'archiveSha256': hashlib.sha256(data).hexdigest(),
+                 'imageId': 'test', 'generation': 'g1'}
+with contextlib.redirect_stdout(io.StringIO()): restore()
+with open(COMMITTED_META) as f: record = json.load(f)['entries']
+print(json.dumps({'tool': record.get(tool), 'lib': record.get(lib), 'dirty': system_dirty()}))
+sys.exit(0)
+`);
+    expect(result).toEqual({ tool: ['f', 0o700, expect.any(Number), expect.any(Number)],
+      lib: ['d', 0o750, expect.any(Number), expect.any(Number)], dirty: false });
+  });
+
+  it('never captures or restores the image id and image manifest', async () => {
+    const result = await python(`${META}
+import tarfile
+etc = ROOTS[0] + '/etc'
+os.mkdir(etc)
+IMAGE_ID = etc + '/ezil-image-id'
+with open(IMAGE_ID, 'w') as f: f.write('old-image')
+real_manifest = etc + '/ezil-image-manifest.tsv'
+settle()
+IMAGE_MANIFEST = real_manifest
+write_image_manifest([tool, lib])
+baseline_at()
+picked = sorted(inventory(OLD, load_image_manifest()))
+print(json.dumps({'id': IMAGE_ID in picked, 'manifest': IMAGE_MANIFEST in picked,
+                  'excluded': [excluded(IMAGE_ID), excluded(IMAGE_MANIFEST)]}))
+sys.exit(0)
+`);
+    expect(result).toEqual({ id: false, manifest: false, excluded: [true, true] });
+    // The fixture redirects both constants; these are the real image's paths.
+    expect(SYSTEM_SNAPSHOT_SCRIPT).toContain("IMAGE_ID = '/etc/ezil-image-id'\n");
+    expect(SYSTEM_SNAPSHOT_SCRIPT).toContain("IMAGE_MANIFEST = '/etc/ezil-image-manifest.tsv'\n");
   });
 });
