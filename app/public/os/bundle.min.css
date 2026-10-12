@@ -1087,39 +1087,43 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-account-value{text-align:left}
 .ezil-account-signout{flex-direction:column;align-items:stretch}
 }
-.ezil-upgrade-backdrop{--bg:#04060c;--surface:#0d1118;--surface-2:#141a23;--border:rgba(255, 255, 255, 0.08);--text:#f5f5f4;--muted:#9aa3ad;--accent:#00adb5;--accent-ink:#04060c;--warn:#f5a524;--danger:#f05d5e;position:absolute;inset:0;z-index:100;display:flex;align-items:flex-start;justify-content:center;padding:16px;overflow:auto;background:rgba(4,6,12,.8);color:var(--text);font:14px/20px system-ui,sans-serif;font-variant-numeric:tabular-nums;container-type:inline-size}
+.ezil-upgrade-backdrop{--bg:#04060c;--surface:#0d1118;--surface-2:#141a23;--border:rgba(255, 255, 255, 0.08);--text:#f5f5f4;--muted:#9aa3ad;--accent:#00adb5;--accent-ink:#04060c;--warn:#f5a524;--danger:#f05d5e;position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;overflow:hidden;overscroll-behavior:contain;background:rgba(4,6,12,.8);color:var(--text);font:14px/20px system-ui,sans-serif;font-variant-numeric:tabular-nums}
 .ezil-upgrade-backdrop,.ezil-upgrade-backdrop *{box-sizing:border-box}
-.ezil-upgrade-sheet{position:relative;width:560px;max-width:100%;min-width:0;border:1px solid var(--border);border-radius:12px;background:var(--surface);overflow-wrap:anywhere}
-.ezil-upgrade-columns{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr);padding-top:48px}
-.ezil-upgrade-payment,.ezil-upgrade-summary{min-width:0;padding:16px}
-.ezil-upgrade-summary{background:var(--surface-2);border-radius:0 0 0 12px}
-.ezil-upgrade-summary summary{cursor:pointer;font-weight:600}
-.ezil-upgrade-summary summary span{display:block}
-.ezil-upgrade-summary summary span:first-child{font-size:20px;line-height:28px}
-.ezil-upgrade-summary li,.ezil-upgrade-summary p{color:var(--muted)}
-.ezil-upgrade-summary ul{padding-left:16px}
-.ezil-upgrade-summary li+li{margin-top:8px}
-.ezil-upgrade-summary strong{color:var(--text)}
-.ezil-upgrade-price{font-variant-numeric:tabular-nums}
+.ezil-upgrade-sheet{position:relative;width:min(960px,calc(100vw - 32px));max-height:min(760px,calc(100dvh - 32px));min-width:0;border:1px solid var(--border);border-radius:12px;background:var(--surface);overflow:auto;overscroll-behavior:contain;overflow-wrap:anywhere}
+.ezil-upgrade-columns{display:grid;grid-template-columns:300px minmax(420px,1fr)}
+.ezil-upgrade-payment,.ezil-upgrade-summary{min-width:0}
+.ezil-upgrade-summary{padding:32px 24px;background:var(--surface-2)}
+.ezil-upgrade-payment{padding:56px 16px 24px}
+.ezil-upgrade-summary summary{cursor:pointer;font-weight:600;list-style:none}
+.ezil-upgrade-summary summary::-webkit-details-marker{display:none}
+.ezil-upgrade-summary #ezil-upgrade-title{font-size:20px;line-height:28px}
+.ezil-upgrade-summary p{margin:16px 0;color:var(--muted)}
+.ezil-upgrade-summary .ezil-upgrade-price{margin:24px 0 8px;color:var(--text);font-size:44px;line-height:52px;font-weight:600}
+.ezil-upgrade-price span{color:var(--muted);font-size:14px;font-weight:400}
+.ezil-upgrade-summary .ezil-upgrade-caption{margin-top:8px;font-size:12px;line-height:16px}
+.ezil-upgrade-allowances{display:grid;gap:16px;margin:28px 0;padding:0;list-style:none}
+.ezil-upgrade-allowances li,.ezil-upgrade-security{display:flex;align-items:flex-start;gap:10px}
+.ezil-upgrade-summary svg{flex:0 0 18px;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.ezil-upgrade-allowances svg{color:var(--accent)}
+.ezil-upgrade-summary hr{margin:24px 0;border:0;border-top:1px solid var(--border)}
+.ezil-upgrade-total{display:flex;gap:16px;align-items:baseline}
+.ezil-upgrade-total strong{flex-shrink:0}
+.ezil-upgrade-total>span{color:var(--muted);font-size:12px;line-height:16px}
+.ezil-upgrade-summary .ezil-upgrade-security{margin-top:24px;font-size:12px;line-height:16px}
 .ezil-upgrade-sheet button{min-height:40px;max-width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:8px;background:var(--accent);color:var(--accent-ink);font:inherit;font-weight:600;cursor:pointer;white-space:normal}
 .ezil-upgrade-sheet .ezil-upgrade-close{position:absolute;top:8px;right:8px;width:40px;background:var(--surface-2);color:var(--text);font-size:24px}
 .ezil-upgrade-sheet :is(button,summary,a,iframe,[tabindex]):focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .ezil-upgrade-sheet [data-focus-edge]{position:absolute;width:1px;height:1px;overflow:hidden}
-.ezil-upgrade-sheet #ezil-embedded-checkout{width:100%;min-width:0}
+.ezil-upgrade-sheet #ezil-embedded-checkout{width:100%;min-width:0;min-height:560px}
 .ezil-upgrade-sheet iframe{width:100%;max-width:100%;border:0}
 .ezil-upgrade-sheet [hidden]{display:none}
 .ezil-upgrade-sheet [data-role=upgrade-success]>span{color:var(--accent);font-size:28px}
-@media (max-width:599px){
-.ezil-upgrade-backdrop{padding:0}
-.ezil-upgrade-sheet{width:100%}
-.ezil-upgrade-columns{grid-template-columns:minmax(0,1fr)}
-.ezil-upgrade-summary{border-radius:0}
-.ezil-upgrade-summary summary span{display:inline;font-size:14px;line-height:20px}
-.ezil-upgrade-summary summary span+span{margin-left:8px}
-}
-@container (max-width:480px){
-.ezil-upgrade-columns{grid-template-columns:minmax(0,1fr)}
-}
+.ezil-upgrade-payment [data-role=checkout-state]>p:empty{display:none}
+.ezil-upgrade-backdrop.is-compact .ezil-upgrade-sheet{position:absolute;inset:0;width:100%;max-height:100%;border:0;border-radius:0}
+.ezil-upgrade-backdrop.is-compact .ezil-upgrade-columns{grid-template-columns:minmax(0,1fr)}
+.ezil-upgrade-backdrop.is-compact .ezil-upgrade-summary{padding:56px 12px 16px}
+.ezil-upgrade-backdrop.is-compact .ezil-upgrade-payment{padding:16px 12px}
+.ezil-upgrade-compact-title{font-size:12px;line-height:16px;font-weight:400}
 @media (prefers-reduced-motion:reduce){
 .ezil-store-card{transition:none}
 .ezil-settings-window *,.ezil-settings-window ::after,.ezil-settings-window ::before{animation:none!important;transition:none!important}
