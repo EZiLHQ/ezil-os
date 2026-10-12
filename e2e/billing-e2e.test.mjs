@@ -47,3 +47,12 @@ test('test-mode guard accepts an explicit pair and refuses either live, missing 
         assert.throws(() => requireTestKeys(...pair), /live or missing keys are refused/);
     }
 });
+
+test('redact scrubs the Vercel bypass header and the configured secret', () => {
+    process.env.VERCEL_AUTOMATION_BYPASS_SECRET = 'bypassSecretValue123';
+    try {
+        const out = redact('x-vercel-protection-bypass: bypassSecretValue123 and again bypassSecretValue123');
+        assert.equal(out.includes('bypassSecretValue123'), false);
+        assert.match(redact('plain text'), /plain text/, 'positive control: ordinary text is untouched');
+    } finally { delete process.env.VERCEL_AUTOMATION_BYPASS_SECRET; }
+});

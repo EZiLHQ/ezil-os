@@ -2,7 +2,9 @@
 export function redact(value) {
     return String(value)
         .replace(/(?:sk|pk|rk)_(?:test|live)_[A-Za-z0-9_-]+/gi, '[REDACTED_STRIPE_KEY]')
-        .replace(/cs_(?:test|live)_[A-Za-z0-9_-]*_secret_[A-Za-z0-9_-]+/gi, '[REDACTED_CHECKOUT_SECRET]');
+        .replace(/cs_(?:test|live)_[A-Za-z0-9_-]*_secret_[A-Za-z0-9_-]+/gi, '[REDACTED_CHECKOUT_SECRET]')
+        .replace(/(x-vercel-protection-bypass)["']?\s*[:=]\s*["']?[^\s"',}]+/gi, '$1: [redacted]')
+        .replace(process.env.VERCEL_AUTOMATION_BYPASS_SECRET ? new RegExp(process.env.VERCEL_AUTOMATION_BYPASS_SECRET.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g') : /$^/, '[redacted]');
 }
 
 /** Substring matching follows CONTRACT §8, including claims inside longer words. */
