@@ -44,6 +44,9 @@ export default function MarketingHome({ largeStorageEnabled, focusPlans = false 
             <a className={styles.skipLink} href="#home-content">{chrome.skipLink}</a>
             <header className={styles.header}>
                 <div className={styles.headerInner}>
+                    {/* A real document load on purpose: `/` redirects signed-in visitors to /os,
+                        which only boots on a document load (see app/src/app/page.tsx). */}
+                    {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
                     <a href="/" className={styles.brand}>{chrome.brand}</a>
                     <nav aria-label={chrome.navigationLabel}>
                         <a href={chrome.plansLink.href} className={styles.plansLink}>{chrome.plansLink.label}</a>
