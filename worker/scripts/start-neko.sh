@@ -867,7 +867,8 @@ fi
 [ -x /usr/local/bin/ezil-deps ] && /usr/local/bin/ezil-deps install-hooks >/dev/null 2>&1 || true
 if [ -x /usr/local/bin/ezil-restore-deps.sh ]; then
   mkdir -p /run/ezil-deps 2>/dev/null && rm -f /run/ezil-deps/scanned && : > /run/ezil-deps/boot-restore
-  ( /usr/local/bin/ezil-restore-deps.sh --boot "$WORKSPACE_ROOT" >> /tmp/ezil-restore-deps.log 2>&1 & ) || true
+  # 9>&-: a long restore must never hold the boot mutex past a restart (see the note above).
+  ( /usr/local/bin/ezil-restore-deps.sh --boot "$WORKSPACE_ROOT" >> /tmp/ezil-restore-deps.log 2>&1 9>&- & ) || true
 fi
 EZIL_LOCAL_STATE_DIR="${EZIL_LOCAL_STATE_DIR:-/var/ezil-local}"
 if mkdir -p "$EZIL_LOCAL_STATE_DIR/node_modules" "$EZIL_LOCAL_STATE_DIR/next-cache" 2>/dev/null; then
