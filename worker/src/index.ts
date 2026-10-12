@@ -1,6 +1,8 @@
 import { relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget, type RelayState, type RelayResult } from './relay-refresh';
 import { bridgeCodeSocket } from './code-socket';
 import { RuntimeLifecycleMonitor } from './runtime-lifecycle';
+import { restoreDepsCommand } from './restore-deps-command';
+export { restoreDepsCommand };
 import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, failCheckpointWrites,
   AcceptanceFaultError, type AcceptanceFaultState } from './acceptance-faults';
 /**
@@ -1030,17 +1032,6 @@ async function drainContainerBootTelemetry(sandbox: Sandbox<unknown>): Promise<C
   } catch {
     return EMPTY_CONTAINER_TELEMETRY;
   }
-}
-
-/**
- * Background dependency restore for a freshly hydrated container: the same
- * boot-restore marker and log as start-neko.sh, so `ezil-deps` reports
- * "checking projects" at once. The path is validated, never interpolated raw.
- */
-export function restoreDepsCommand(mountPath: string): string {
-  if (!/^\/[A-Za-z0-9._\/-]+$/.test(mountPath) || mountPath.includes('..')) throw new Error('invalid workspace path');
-  return `bash -c 'mkdir -p /run/ezil-deps && rm -f /run/ezil-deps/scanned && : > /run/ezil-deps/boot-restore; `
-    + `exec /usr/local/bin/ezil-restore-deps.sh --boot ${mountPath} >> /tmp/ezil-restore-deps.log 2>&1'`;
 }
 
 async function ensureDesktop(

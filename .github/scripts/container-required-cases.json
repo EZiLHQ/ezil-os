@@ -74,6 +74,7 @@
     "an old HOME layer restores archived package files but excludes dependency and build trees, including split archive/disk manifests",
     "boot restore runs a non-root HOME project install and lifecycle scripts as its owner with that HOME config",
     "a failed install with partial node_modules stays FAILED until a later successful hand install",
-    "native installer markers resolve FAILED only when newer than the failure record and node_modules exists"
+    "native installer markers resolve FAILED only when newer than the failure record and node_modules exists",
+    "after a power cut the Worker trigger alone rebuilds HOME deps, serialised with a desktop boot run"
   ]
 }

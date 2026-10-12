@@ -656,6 +656,28 @@ printf '{"editor.fontSize":16}\n' > /workspace/.ezil/settings.json
       expect((await sh(b, 'test -e /root/.opencode/node_modules')).exitCode).not.toBe(0);
     }, T);
 
+    it('after a power cut the Worker trigger alone rebuilds HOME deps, serialised with a desktop boot run', async () => {
+      const { a, store, prefix } = await prepare('trigger');
+      const before = await checksums(a, FILES);
+      await commit(a, store, prefix);
+      await powerCut(a);
+      const b = await restore('trigger', store, prefix);
+      expect((await sh(b, 'test -e /root/app/node_modules')).exitCode).not.toBe(0);
+      const script = await readFile(new URL('../scripts/ezil-restore-deps.sh', import.meta.url), 'utf8');
+      expect((await sh(b, 'cat > /usr/local/bin/ezil-restore-deps.sh && chmod 755 /usr/local/bin/ezil-restore-deps.sh', script)).exitCode).toBe(0);
+      // Exactly what the Durable Object starts after hydrating a fresh container
+      // (staging 2026-10-12: without it the project stayed 'untracked').
+      const { restoreDepsCommand } = await import('./restore-deps-command');
+      const trigger = restoreDepsCommand('/workspace');
+      // The desktop boot's own run races it; the lock must serialise the two.
+      await must(b, `export npm_config_offline=true; ( ${trigger} ) & ( /usr/local/bin/ezil-restore-deps.sh --boot /workspace >> /tmp/ezil-restore-deps.log 2>&1 ) & wait`);
+      expect(await must(b, 'cat /run/ezil-deps/status')).toContain('ready\t/root/app\t');
+      expect(await must(b, 'grep -c "/root/app: installing" /tmp/ezil-restore-deps.log')).toBe('1\n');
+      expect((await sh(b, 'test -e /run/ezil-deps/boot-restore')).exitCode).not.toBe(0);
+      expect(await checksums(b, FILES)).toBe(before);
+      expect((await must(b, 'cd /root/app && npm exec --offline -- next')).trim()).toBe('ezq-dep-ok');
+    }, T);
+
     it('RPO is real: a dirty write after the last commit is lost on SIGKILL', async () => {
       const { a, store, prefix } = await prepare('rpo');
       expect(await dirty(a)).toEqual({ dirty: true });
