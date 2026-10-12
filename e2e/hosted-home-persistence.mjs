@@ -114,7 +114,9 @@ const PRELUDE = (nonce) => [
   `N=${assertNonce(nonce)}`,
   // The marker is assembled here, inside the encoded script, so the typed
   // command line can never match the result parser.
-  "emit() { printf 'EZQ:%s:%s:END\\n' \"$N\" \"$1\"; }",
+  // The result is also kept in a file, so the driver can show it again if the
+  // line scrolled out of (or never rendered in) the terminal's visible rows.
+  "emit() { printf 'EZQ:%s:%s:END\\n' \"$N\" \"$1\" | tee -a \"/tmp/ezq-result-$N\"; }",
   'b64() { base64 -w0; }',
 ].join('\n');
 
@@ -763,9 +765,28 @@ async function main() {
     }
     evidence.operation = `step ${name}`;
     await type(plan.run);
+    // If the marker is not on screen, re-show the persisted result with a short
+    // line every 20 s; a missing file means the script itself has not finished.
+    let lastReshow = Date.now();
     const payload = await bounded(`step ${name} result`, async () => {
-      try { return readMarker(await terminalText(), nonce); } catch { return null; }
-    }, timeoutMs);
+      let found = null;
+      try { found = readMarker(await terminalText(), nonce); } catch {}
+      if (found) return found;
+      if (Date.now() - lastReshow >= 20000) {
+        lastReshow = Date.now();
+        evidence.resultReshows = (evidence.resultReshows ?? 0) + 1;
+        try { await type(`cat /tmp/ezq-result-${nonce} 2>/dev/null || echo "EZQS:${nonce}:pending:$(ls /tmp/ezq-step-${nonce}.* 2>/dev/null | wc -l)"`); } catch {}
+      }
+      return null;
+    }, timeoutMs).catch(async error => {
+      // Fixed diagnostics only: did the script ever finish, and are its chunks still there?
+      try {
+        const text = (await terminalText()).replace(/\s/g, '');
+        const status = text.match(new RegExp(`EZQS:${nonce}:pending:([0-9]+)`, 'g'));
+        evidence.resultDiagnostic = status ? { resultFile: false, chunkFiles: Number(status.at(-1).split(':').at(-1)) } : { resultFile: 'unknown' };
+      } catch {}
+      throw error;
+    });
     stepInFlight = false;
     return parseFields(payload);
   };
