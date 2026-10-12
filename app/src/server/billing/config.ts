@@ -20,6 +20,8 @@ export interface BillingConfig {
     automaticTaxEnabled: boolean;
     /** Stripe Adaptive Pricing (local currency at checkout). */
     adaptivePricingEnabled: boolean;
+    /** Stripe is merchant of record; enable only after accepting its Managed Payments terms. */
+    managedPaymentsEnabled: boolean;
     stripeSecret: string | undefined;
     stripeWebhookSecret: string | undefined;
     /** Publishable key (`pk_…`) for Stripe.js Embedded Checkout. Public by design. */
@@ -49,6 +51,7 @@ export function readBillingConfig(env: Env = process.env): BillingConfig {
         largeStorageEnabled: on(env.BILLING_LARGE_STORAGE),
         automaticTaxEnabled: on(env.BILLING_AUTOMATIC_TAX),
         adaptivePricingEnabled: on(env.BILLING_ADAPTIVE_PRICING),
+        managedPaymentsEnabled: on(env.BILLING_MANAGED_PAYMENTS),
         stripeSecret: nonEmpty(env.STRIPE_SECRET),
         stripeWebhookSecret: nonEmpty(env.STRIPE_WEBHOOK_SECRET),
         stripePublishableKey: publishable(env.STRIPE_PUBLISHABLE_KEY ?? env.STRIPE_KEY),

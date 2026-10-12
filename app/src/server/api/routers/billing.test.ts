@@ -271,6 +271,20 @@ describe('billing router', () => {
         }));
     });
 
+    it.each(['embedded', 'hosted'] as const)('forwards the Managed Payments flag in %s checkout', async mode => {
+        const f = fixture();
+        if (mode === 'embedded') f.deps.config.stripePublishableKey = 'pk_test_fixture';
+        for (const enabled of [false, true]) {
+            f.deps.config.managedPaymentsEnabled = enabled;
+            await expect(f.caller.createCheckout({ sku })).resolves.toMatchObject({
+                mode: mode === 'embedded' ? 'embedded' : 'redirect', sessionId: session.id,
+            });
+            expect(f.stripe.createCheckoutSession).toHaveBeenLastCalledWith(expect.objectContaining({
+                managedPayments: enabled, uiMode: mode, userId, sku,
+            }));
+        }
+    });
+
     it.each(['embedded', 'hosted'] as const)('rejects an unusable %s session and accepts a complete response', async mode => {
         const f = fixture();
         if (mode === 'embedded') f.deps.config.stripePublishableKey = 'pk_test_fixture';
@@ -313,6 +327,17 @@ describe('billing router', () => {
         await expect(f.caller.history()).resolves.toEqual([]);
         expect(log).toHaveBeenCalledExactlyOnceWith('Billing invoice history unavailable');
         await expect(f.caller.history()).resolves.toEqual(history);
+    });
+});
+
+describe('Managed Payments configuration', () => {
+    it('enables only the exact string 1 and defaults off', () => {
+        expect(readBillingConfig({ BILLING_MANAGED_PAYMENTS: '1' }).managedPaymentsEnabled).toBe(true);
+        for (const value of [undefined, '', '0', 'true', 'TRUE', 'yes', 'on', '01', ' 1', '1 ', '1\n']) {
+            expect(readBillingConfig({ BILLING_MANAGED_PAYMENTS: value }).managedPaymentsEnabled).toBe(false);
+        }
+        expect(readBillingConfig({}).managedPaymentsEnabled).toBe(false);
+        expect(readBillingConfig({ BILLING_AUTOMATIC_TAX: '1', BILLING_ADAPTIVE_PRICING: '1' }).managedPaymentsEnabled).toBe(false);
     });
 });
 

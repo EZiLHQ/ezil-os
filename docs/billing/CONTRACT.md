@@ -184,6 +184,9 @@ Ships **disabled by default**. With every flag unset, the product behaves exactl
 - `CHECKOUT_ENABLED`
 - `BILLING_ENFORCEMENT`
 - `BILLING_LARGE_STORAGE`
+- `BILLING_AUTOMATIC_TAX`
+- `BILLING_ADAPTIVE_PRICING`
+- `BILLING_MANAGED_PAYMENTS` (default off; takes precedence over automatic tax and Adaptive Pricing)
 
 **Secrets** — only ever tested for presence, never logged:
 - `STRIPE_SECRET`
@@ -192,6 +195,14 @@ Ships **disabled by default**. With every flag unset, the product behaves exactl
 - `BILLING_USAGE_HMAC_SECRET`
 - `BILLING_FUNDING_URL`
 - `BILLING_FUNDING_HMAC_SECRET`
+
+### Tax
+
+This subsection governs Checkout tax behavior, including the references in §1 and §6. By default, Stripe Tax is off: EZiL LLC has no tax registrations. The recommended live setting is `BILLING_MANAGED_PAYMENTS=1` **after the founder accepts Stripe Managed Payments terms in the Stripe dashboard**. Stripe becomes the merchant of record, handling sales tax/VAT/GST in 80+ countries, fraud, disputes and buyer support for an additional 3.5% per transaction. Buyers enter their name and billing address; Stripe chooses payment methods and shows local currency.
+
+Managed Payments ignores `BILLING_AUTOMATIC_TAX` and `BILLING_ADAPTIVE_PRICING` and omits their incompatible Checkout fields. Every inline product (Pro, AI credits and the service fee) uses `MANAGED_PAYMENTS_TAX_CODE = txcd_10103000` ("Software as a service (SaaS) – personal use"). When `STRIPE_PRICE_PRO_MONTHLY` selects a dashboard Price, set that tax code on its Product in Stripe; Checkout sends no inline product data for that Price.
+
+Alternatively, keep Managed Payments off and enable Stripe Tax with `BILLING_AUTOMATIC_TAX=1` once EZiL LLC has the required tax registrations.
 
 ## 8. Copy rules (checked by a test)
 

@@ -153,6 +153,8 @@ export interface CheckoutRequest {
     automaticTax: boolean;
     /** Stripe Adaptive Pricing / local currency (`BILLING_ADAPTIVE_PRICING=1`). Optional, default off. */
     adaptivePricing?: boolean;
+    /** Stripe is merchant of record; when true, automaticTax/adaptivePricing are ignored. */
+    managedPayments?: boolean;
     returnUrl: string;
     successUrl: string;
     cancelUrl: string;
