@@ -69,25 +69,37 @@ try {
                     assert.equal(new URL(page.url()).pathname, pathname, 'Signed-out route renders without redirecting');
                     await page.evaluate(() => document.fonts.ready);
                     assert.equal(await page.locator('h1').count(), 1);
-                    assert.equal((await page.locator('[data-testid="home-hero"] h1').innerText()).trim(), 'Open EZiL OS and get to work.');
-                    await assertHref(page, '[data-testid="cta-start-free"]', '/login');
-                    await assertHref(page, '[data-testid="cta-sign-in"]', '/login?method=email');
+                    if (pathname === '/') {
+                        assert.equal((await page.locator('[data-testid="home-hero"] h1').innerText()).trim(), 'Open EZiL OS and get to work.');
+                        await assertHref(page, '[data-testid="cta-start-free"]', '/login');
+                        await assertHref(page, '[data-testid="cta-sign-in"]', '/login?method=email');
+                    } else {
+                        // /pricing is plans-first: no hero, the plans title is the page's h1
+                        // and the plans are in view on load without any scrolling.
+                        assert.equal(await page.locator('[data-testid="home-hero"]').count(), 0);
+                        assert.equal(await page.locator('#plans h1').count(), 1);
+                    }
                     await assertHref(page, '[data-testid="cta-get-pro"]', '/login?returnUrl=%2Fos%3Fsettings%3Dbilling%26upgrade%3Dpro');
                     await assertHref(page, '[data-testid="plan-free"] a', '/login');
                     assert.equal(await page.locator('#plans').count(), 1);
                     for (const plan of ['free', 'pro']) {
                         const card = page.locator(`[data-testid="plan-${plan}"]`);
                         assert.equal(await card.count(), 1);
-                        assert.match(await card.innerText(), /USD\s*·\s*before applicable tax/);
+                        assert.match(await card.innerText(), plan === 'pro' ? /USD\s*·\s*before applicable tax/ : /USD\s*·\s*no card needed/);
                         assert.match(await card.innerText(), plan === 'pro' ? /\$20/ : /\$0/);
                         for (const meter of ['workspace', 'storage', 'ai']) {
                             assert.equal(await card.locator(`[data-testid="allowance-${plan}-${meter}"]`).count(), 1);
                         }
                         assert.match(await card.locator(`[data-testid="allowance-${plan}-ai"]`).innerText(), /assistant coming soon/i);
                     }
-                    assert.equal(await page.locator('details').count(), 6);
-                    const decor = page.locator('[aria-hidden="true"]').filter({ hasText: 'Browser' }).filter({ hasText: 'VS Code' });
-                    assert(await decor.count() > 0, 'Product frame is decorative and aria-hidden');
+                    // FAQ is six open questions (h3) — no <details>/<summary>, which Chromium
+                    // exposes to assistive technology only as plain text.
+                    assert.equal(await page.locator('section[aria-labelledby="faq-title"] h3').count(), 6);
+                    assert.equal(await page.locator('details, summary').count(), 0);
+                    if (pathname === '/') {
+                        const decor = page.locator('[aria-hidden="true"]').filter({ hasText: 'Browser' }).filter({ hasText: 'VS Code' });
+                        assert(await decor.count() > 0, 'Product frame is decorative and aria-hidden');
+                    }
                     assert.deepEqual(scanCopy(await page.locator('body').innerText()), [], 'Visible copy follows CONTRACT §8');
                     const dimensions = await page.evaluate(() => ({
                         viewportWidth: document.documentElement.clientWidth,

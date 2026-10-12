@@ -101,8 +101,9 @@ describe('the complete public offer follows the copy contract', () => {
         expect(free.price).toBe('$0');
         expect(pro.price).toBe(`$${PRO_PLAN.unitAmountCents / 100}`);
         expect(pro.interval).toBe(`/${PRO_PLAN.interval}`);
+        expect(free.billingNote).toBe('USD · no card needed');
+        expect(pro.billingNote).toBe('USD · before applicable tax · cancel anytime');
         for (const plan of plans) {
-            expect(plan.billingNote).toBe('USD · before applicable tax · cancel anytime');
             expect(plan.allowances[2].caption).toBe('AI assistant coming soon');
             for (const tile of plan.allowances) {
                 expect(render(storage)).toContain(`data-testid="allowance-${plan.id}-${tile.id}"`);
@@ -195,8 +196,9 @@ describe('shared home document', () => {
         expect(html).toMatch(/data-testid="cta-get-pro"[^>]*href="\/login\?returnUrl=%2Fos%3Fsettings%3Dbilling%26upgrade%3Dpro">Get Pro<\/a>/);
         for (const plan of ['free', 'pro']) {
             const card = html.match(new RegExp(`<article[^>]*data-testid="plan-${plan}"[\\s\\S]*?</article>`))?.[0] ?? '';
-            expect(card).toContain('before applicable tax');
-            expect(card.indexOf('<a ')).toBeGreaterThan(card.indexOf('before applicable tax'));
+            const note = plan === 'pro' ? 'before applicable tax' : 'no card needed';
+            expect(card).toContain(note);
+            expect(card.indexOf('<a ')).toBeGreaterThan(card.indexOf(note));
             expect(card.indexOf('<dl ')).toBeGreaterThan(card.indexOf('<a '));
         }
     });
