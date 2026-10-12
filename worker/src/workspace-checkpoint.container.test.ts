@@ -678,6 +678,66 @@ printf '{"editor.fontSize":16}\n' > /workspace/.ezil/settings.json
       expect((await must(b, 'cd /root/app && npm exec --offline -- next')).trim()).toBe('ezq-dep-ok');
     }, T);
 
+    it('a HOME workspace monorepo: member trees stay out of the layer and one root install rebuilds them after a power cut', async () => {
+      // PR195 r4241774149: ~/mono/package-lock.json owns apps/web and packages/ui through
+      // "workspaces". A version conflict nests ezq-dep 2.0.0 under the member itself.
+      const store = new R2Fake(); const prefix = prefixFor('power-cut-mono');
+      const a = await startComputer('power-cut-mono-a');
+      expect((await hydrate(a, store, prefix)).emptyPrefix).toBe(true);
+      expect((await sysHydrate(a, store, prefix)).ok).toBe(true);
+      expect(await baselineSystemLayer(sdk(a))).toBe(true);
+      await markHydrated(a, prefix);
+      await new Promise(r => setTimeout(r, 1100));
+      await must(a, String.raw`
+set -e
+for v in 1 2; do
+  mkdir -p /tmp/ezq-v$v
+  printf '{"name":"ezq-dep","version":"%s.0.0","bin":{"ezq-dep":"cli.js"}}' $v > /tmp/ezq-v$v/package.json
+  printf '#!/usr/bin/env node\nconsole.log("ezq-dep-%s")\n' $v > /tmp/ezq-v$v/cli.js
+  mkdir -p /root/mono/vendor && (cd /tmp/ezq-v$v && npm pack --silent --pack-destination /root/mono/vendor >/dev/null)
+done
+mkdir -p /root/mono/apps/web/src /root/mono/packages/ui /root/mono/tools/gen/node_modules
+printf '{"name":"mono","private":true,"workspaces":["apps/*","packages/*"],"dependencies":{"ezq-dep":"file:vendor/ezq-dep-1.0.0.tgz"}}' > /root/mono/package.json
+printf '{"name":"@ezq/ui","version":"1.0.0"}' > /root/mono/packages/ui/package.json
+printf '{"name":"web","version":"0.1.0","dependencies":{"@ezq/ui":"1.0.0","ezq-dep":"file:../../vendor/ezq-dep-2.0.0.tgz"}}' > /root/mono/apps/web/package.json
+printf 'export default 1\n' > /root/mono/apps/web/src/page.js
+(cd /root/mono && npm install --offline --no-audit --no-fund >/dev/null 2>&1) && test -f /root/mono/package-lock.json
+mkdir -p /root/mono/apps/web/.next/cache && echo build-ok > /root/mono/apps/web/.next/cache/marker
+# Not declared by the root: its node_modules is not rebuilt by anything, so it stays captured.
+printf '{"name":"gen"}' > /root/mono/tools/gen/package.json && echo kept > /root/mono/tools/gen/node_modules/marker
+`);
+      expect(JSON.parse(await must(a, 'cat /root/mono/apps/web/node_modules/ezq-dep/package.json')).version).toBe('2.0.0');
+      expect(JSON.parse(await must(a, 'cat /root/mono/node_modules/ezq-dep/package.json')).version).toBe('1.0.0');
+      const files = ['/root/mono/package.json', '/root/mono/package-lock.json', '/root/mono/apps/web/package.json',
+        '/root/mono/apps/web/src/page.js', '/root/mono/packages/ui/package.json', '/root/mono/vendor/ezq-dep-1.0.0.tgz',
+        '/root/mono/vendor/ezq-dep-2.0.0.tgz', '/root/mono/tools/gen/package.json', '/root/mono/tools/gen/node_modules/marker'];
+      const before = await checksums(a, files);
+      await commit(a, store, prefix);
+      await powerCut(a);
+      const b = await restore('mono', store, prefix);
+      expect(await dirty(b)).toEqual({ dirty: false });
+      for (const tree of ['/root/mono/node_modules', '/root/mono/apps/web/node_modules', '/root/mono/apps/web/.next'])
+        expect((await sh(b, `test -e ${tree}`)).exitCode).not.toBe(0);                     // left out of the layer
+      expect(await checksums(b, files)).toBe(before);                                      // everything else came back
+      const script = await readFile(new URL('../scripts/ezil-restore-deps.sh', import.meta.url), 'utf8');
+      expect((await sh(b, 'cat > /usr/local/bin/ezil-restore-deps.sh && chmod 755 /usr/local/bin/ezil-restore-deps.sh', script)).exitCode).toBe(0);
+      await must(b, 'npm_config_offline=true /usr/local/bin/ezil-restore-deps.sh --boot /workspace > /tmp/ezil-restore-deps.log 2>&1');
+      const status = await must(b, 'cat /run/ezil-deps/status');
+      for (const d of ['/root/mono', '/root/mono/apps/web', '/root/mono/packages/ui']) expect(status).toContain(`ready\t${d}\t`);
+      expect(status).not.toContain('missing');
+      const log = await must(b, 'cat /tmp/ezil-restore-deps.log');
+      expect(log.match(/: installing with /g)).toEqual([': installing with ']);             // the root, once
+      expect(log).toContain('/root/mono: installing with npm');
+      expect(JSON.parse(await must(b, 'cat /root/mono/apps/web/node_modules/ezq-dep/package.json')).version).toBe('2.0.0');
+      expect((await must(b, 'cd /root/mono/apps/web && npm exec --offline -- ezq-dep')).trim()).toBe('ezq-dep-2');
+      expect((await must(b, 'cd /root/mono && npm exec --offline -- ezq-dep')).trim()).toBe('ezq-dep-1');
+      expect((await must(b, 'readlink /root/mono/node_modules/web')).trim()).toBe('../apps/web');
+      expect(await checksums(b, files)).toBe(before);
+      // A build output is not a dependency: like a top-level project's, .next is rebuilt by
+      // the user's next build/dev, never by restore-deps.
+      expect((await sh(b, 'test -e /root/mono/apps/web/.next')).exitCode).not.toBe(0);
+    }, T);
+
     it('RPO is real: a dirty write after the last commit is lost on SIGKILL', async () => {
       const { a, store, prefix } = await prepare('rpo');
       expect(await dirty(a)).toEqual({ dirty: true });
