@@ -63,7 +63,9 @@ const bundled = await build({
     bundle: true, write: false, format: 'iife', target: 'es2022',
     plugins: [{ name: 'payment-surface-port', setup (builder) {
         builder.onResolve({ filter: /upgrade-sheet\.js$/ }, () => ({ path: 'sheet', namespace: 'test' }));
-        builder.onLoad({ filter: /.*/, namespace: 'test' }, () => ({ contents: "export function openUpgradeSheet () { throw new Error('Inject the test opener'); }" }));
+        builder.onLoad({ filter: /.*/, namespace: 'test' }, () => ({ contents: "export function openUpgradeSheet () { throw new Error('Inject the test opener'); }\n"
+            // boot.js also imports the deep-link parser; the stub has no deep link to parse.
+            + "export function parseBillingDeepLink () { return null; }" }));
     } }],
 });
 window.eval(fs.readFileSync(path.join(out, 'icons.js'), 'utf8'));
