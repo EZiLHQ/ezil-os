@@ -103,6 +103,14 @@ def layout():
     put('/root/.tool/package-lock.json', '{}')
     put('/root/.tool/apps/a/package.json', '{"name":"a"}')
     put('/root/.tool/apps/a/node_modules/x/index.js')
+    # the NEAREST locked ancestor decides: inner has its own lockfile and declares nothing,
+    # so outer's broader declaration does not claim inner/a
+    put('/root/outer/package.json', WS('inner/*'))
+    put('/root/outer/package-lock.json', '{}')
+    put('/root/outer/inner/package.json', '{"name":"inner"}')
+    put('/root/outer/inner/package-lock.json', '{}')
+    put('/root/outer/inner/a/package.json', '{"name":"a"}')
+    put('/root/outer/inner/a/node_modules/x/index.js')
     # another user's home, Bun workspaces
     put('/home/alice/proj/package.json', WS('web'))
     put('/home/alice/proj/bun.lock', '{}')
@@ -116,7 +124,8 @@ EXCLUDED = ['/root/repo/node_modules/dep/index.js', '/root/repo/apps/web/node_mo
 KEPT = ['/root/repo/apps/web/src/page.js', '/root/repo/tools/gen/node_modules/x/index.js',
         '/root/mono/apps/legacy/node_modules/x/index.js', '/root/pn2/apps/a/node_modules/x/index.js',
         '/root/free/apps/a/node_modules/x/index.js', '/root/npmobj/apps/a/node_modules/x/index.js',
-        '/root/brace/apps/a/node_modules/x/index.js', '/root/.tool/apps/a/node_modules/x/index.js']
+        '/root/brace/apps/a/node_modules/x/index.js', '/root/.tool/apps/a/node_modules/x/index.js',
+        '/root/outer/inner/a/node_modules/x/index.js']
 # predicate(rel) is True when the codec leaves rel out of the layer.
 def report(predicate):
     return {'excluded': [rel for rel in EXCLUDED if not predicate(rel)], 'kept': [rel for rel in KEPT if predicate(rel)]}
