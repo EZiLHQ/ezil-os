@@ -97,7 +97,7 @@ function summaryHtml (summary) {
     const price = dollars(catalog.pro.unitAmountCents, true);
     const status = plan.status === 'past_due' ? 'Payment failed — update your card'
         : plan.status === 'cancels' ? `Ends ${dateLabel(plan.cancelsAt)}`
-        : plan.status === 'active' ? `Renews ${dateLabel(plan.renewsAt)} · ${price}/month` : 'Free plan';
+        : plan.status === 'active' ? `Renews ${dateLabel(plan.renewsAt)} · ${price}/month` : '';
     const unavailable = ai.state === 'unavailable';
     const balance = BigInt(ai.trialMicro) + BigInt(ai.includedMicro) + BigInt(ai.purchasedMicro);
     // v1 has no AI spent total. Its bar expresses available balance, never
@@ -112,7 +112,7 @@ function summaryHtml (summary) {
             <div class="ezil-billing-plan-heading"><h4>${plan.id === 'pro' ? 'EZiL Pro' : 'EZiL Free'}</h4>
                 <span class="ezil-settings-pill">Current</span><span class="ezil-billing-price">${plan.id === 'pro' ? `${price}/month` : '$0'}</span></div>
             <p>${html_encode(`${hours(workspace.allowanceSeconds)} workspace · ${gigabytes(storage.capBytes)} storage · ${plan.id === 'pro' ? '$3 AI credits/month' : '$0.50 AI trial'}`)}</p>
-            <p class="ezil-billing-status">${html_encode(status)}</p>
+            ${status ? `<p class="ezil-billing-status">${html_encode(status)}</p>` : ''}
             <p class="ezil-billing-note">USD · before applicable tax</p>
         </section>
         <div class="ezil-billing-meters">

@@ -116,7 +116,8 @@ try {
     assert.match(text(), /Your allowances and what renews when/);
     assert.match(text(), /EZiL Free/);
     assert.match(text(), /Current/);
-    assert.match(text(), /Free plan/);
+    assert.match(text(), /EZiL Free/);
+    assert.doesNotMatch(text(), /Free plan/, 'no redundant status line under "EZiL Free · Current"');
     assert.match(q('[data-meter="workspace"]').textContent, /1 h 12 m\s+of 8 h/);
     assert.match(q('[data-meter="storage"]').textContent, /1.5 GB\s+of 2.0 GB/);
     assert.match(text(), /AI assistant coming soon/);
