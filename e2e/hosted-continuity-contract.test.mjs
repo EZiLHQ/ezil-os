@@ -30,6 +30,8 @@ test('missing isolated computer exits nonzero and names the prerequisite before 
         assert.equal(evidence.missingPrerequisite,'EZIL_E2E_COMPUTER_ID');
         assert.equal(evidence.failedPhase,'setup');
         assert.equal('deployment' in evidence,false);
+        // The job log explains the failure without the artifact: one fixed-field stdout line.
+        assert.match(result.stdout,/^FAIL-DETAIL hosted continuity: mode=short; phase=setup; operation=none; error=AssertionError; assertion=none; missing=EZIL_E2E_COMPUTER_ID$/m);
     } finally { rmSync(directory,{recursive:true,force:true}); }
 });
 test('hosted telemetry artifact whitelists current navigation counters and enums',()=>{
@@ -94,4 +96,14 @@ test('long session acceptance requires a renewal after earlier recovery scenario
     assert.ok(source.includes('readRelay: relay, verifyViewer: live'));
     assert.ok(source.indexOf('verifyRelayLifetime({') > source.indexOf("phase('network recovery')"));
     assert.ok(source.indexOf('verifyRelayLifetime({') < source.indexOf("phase('renewal and reconnect')"));
+});
+test('the public continuity failure line prints fixed codes and literal names only',()=>{
+    const body=source.match(/const continuityFailureLine = [\s\S]*?\n};\n/)[0];
+    const line=vm.runInNewContext(body+'continuityFailureLine',{});
+    assert.equal(line({failedPhase:'replacement persistence',operation:'Code command ready',errorType:'TimeoutError',assertionCode:'marker_not_restored'},'full'),
+        'FAIL-DETAIL hosted continuity: mode=full; phase=replacement persistence; operation=Code command ready; error=TimeoutError; assertion=marker_not_restored; missing=none');
+    assert.equal(line({failedPhase:'https://x.example/?token=secret',operation:'typed: rm -rf ~',errorType:'Weird',assertionCode:'free text',missingPrerequisite:'lower'},'evil; mode=x'),
+        'FAIL-DETAIL hosted continuity: mode=none; phase=unlisted; operation=unlisted; error=none; assertion=none; missing=none');
+    const catchBody=source.slice(source.indexOf('\n} catch (error) {'),source.indexOf('\n} finally {'));
+    assert.ok(catchBody.includes('console.log(continuityFailureLine(evidence, process.env.EZIL_CONTINUITY_MODE))'));
 });

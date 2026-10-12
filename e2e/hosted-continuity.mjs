@@ -19,6 +19,22 @@ import { verifyRelayLifetime } from './relay-lifetime.mjs';
 
 const required = key => { assert.ok(process.env[key], `Missing prerequisite: ${key}`); return process.env[key]; };
 const hash = value => createHash('sha256').update(String(value)).digest('hex');
+// The job log must explain a failure without the evidence artifact. Phase and
+// operation names are code literals; anything else (a URL, typed text) prints
+// as `unlisted`, and codes outside their fixed forms print as `none`.
+const continuityFailureLine = (evidence, mode) => {
+  const name = value => value === undefined || value === null ? 'none'
+    : (/^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,79}$/.test(value) && !value.includes('//') ? value : 'unlisted');
+  const fields = [
+    ['mode', ['short', 'full', 'essential'].includes(mode) ? mode : 'none'],
+    ['phase', name(evidence.failedPhase)],
+    ['operation', name(evidence.operation)],
+    ['error', ['AssertionError', 'TimeoutError', 'Error'].includes(evidence.errorType) ? evidence.errorType : 'none'],
+    ['assertion', /^[a-z][a-z0-9_]{0,63}$/.test(evidence.assertionCode ?? '') ? evidence.assertionCode : 'none'],
+    ['missing', /^[A-Z][A-Z0-9_]{0,63}$/.test(evidence.missingPrerequisite ?? '') ? evidence.missingPrerequisite : 'none'],
+  ];
+  return `FAIL-DETAIL hosted continuity: ${fields.map(([k, v]) => `${k}=${v}`).join('; ')}`;
+};
 const evidence = { phases: [], samples: [] };
 // Drive the canonical host while verifying its immutable Vercel deployment.
 // verifyCloudDeployment also checks both production aliases against that ID.
@@ -582,6 +598,7 @@ try {
   if (missing) evidence.missingPrerequisite = missing[1];
   evidence.failedPhase = evidence.phases.at(-1)?.name || 'setup';
   console.error('FAIL hosted continuity: prerequisite or assertion failed');
+  console.log(continuityFailureLine(evidence, process.env.EZIL_CONTINUITY_MODE));
   process.exitCode = 1;
 } finally {
   resizeObserver?.dispose();
