@@ -372,6 +372,7 @@ jobs:
                    shell/ezil/apps/code-test.mjs \
                    shell/ezil/apps/preview-focus-test.mjs \
                    shell/ezil/apps/registry-trace-test.mjs \
+                   shell/ezil/apps/persistence-status-test.mjs \
                    shell/ezil/native-test.mjs \
                    shell/ezil/local-surfaces-test.mjs \
                    shell/ezil/ui/Settings/settings-test.mjs \
