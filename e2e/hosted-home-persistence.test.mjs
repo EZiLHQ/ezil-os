@@ -591,3 +591,17 @@ test('interactive-shell checks run in their own session so they cannot seize the
   assert.equal((body.match(/bash -ic/g) ?? []).length, (body.match(/setsid -w bash -ic/g) ?? []).length);
   assert.ok(/setsid -w bash -ic 'command -v opencode'/.test(body) && /setsid -w bash -ic 'opencode --version'/.test(body));
 });
+
+test('after the power cut the dead container\'s Code frame is never reused and Code gets a cold-boot budget', () => {
+  const source = readFileSync(script, 'utf8');
+  const cut = source.indexOf("phase('computer power cut without a final checkpoint')");
+  const reopen = source.indexOf('await openTerminal();', cut);
+  const between = source.slice(cut, reopen);
+  assert.ok(cut > 0 && reopen > cut);
+  assert.match(between, /retiredFrames\.add\(f\)/);
+  assert.match(between, /commandReadyMs = 120000/);
+  assert.match(source, /!frame\.isDetached\(\) && !retiredFrames\.has\(frame\)/);
+  // A failed click is a retry, never an exception out of the readiness loop.
+  const ready = source.slice(source.indexOf("await bounded('Code command ready'"), source.indexOf('}, commandReadyMs);'));
+  assert.ok(ready.indexOf('try {') < ready.indexOf(".command-center').click"));
+});

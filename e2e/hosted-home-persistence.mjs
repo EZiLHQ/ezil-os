@@ -659,7 +659,11 @@ async function main() {
     await window.ezil.registry.launch(app, { payload, computer: payload.computer, desktopState: payload.desktopState });
   }, app);
   const close = app => page.evaluate(app => { try { window.$(`.window[data-app="${app}"]`).close(); } catch {} }, app).catch(() => {});
-  const codeFrame = () => page.frames().find(frame => /-code\./.test(frame.url()));
+  // Frames of a Code window from a container that no longer exists (power cut):
+  // never reused, even while the closed window's iframe is still attached.
+  const retiredFrames = new Set();
+  let commandReadyMs = 30000;
+  const codeFrame = () => page.frames().filter(frame => /-code\./.test(frame.url()) && !frame.isDetached() && !retiredFrames.has(frame)).at(-1);
   const openCode = async () => {
     await launch('code');
     // A cold computer boots here: hydrate, system layer restore, desktop start.
@@ -686,10 +690,17 @@ async function main() {
     await closeModal();
     const quick = f.locator('.quick-input-widget input:visible');
     const row = f.locator(`.quick-input-list .monaco-list-row:visible [data-quick-input-id="${commandIds[text]}"]`);
+    let attempt = 0;
     await bounded('Code command ready', async () => {
-      if (!await quick.count()) await f.locator('.command-center').click();
-      try { await quick.waitFor({ state: 'visible', timeout: 1000 }); await quick.fill('>' + text); await row.waitFor({ state: 'visible', timeout: 2000 }); return true; } catch { return false; }
-    }, 30000);
+      try {
+        // A cold workbench may not have its title-bar search yet: alternate with F1.
+        if (!await quick.count()) {
+          if (attempt++ % 2 === 0) await f.locator('.command-center').click({ timeout: 2000 });
+          else await f.locator('.monaco-workbench').press('F1', { timeout: 2000 });
+        }
+        await quick.waitFor({ state: 'visible', timeout: 1000 }); await quick.fill('>' + text); await row.waitFor({ state: 'visible', timeout: 2000 }); return true;
+      } catch { return false; }
+    }, commandReadyMs);
     await row.click();
     await row.waitFor({ state: 'hidden', timeout: 15000 });
     await wait(1000);
@@ -838,8 +849,10 @@ async function main() {
     });
     terminalReady = false;
     phase('computer power cut without a final checkpoint');
+    if (f) retiredFrames.add(f);
     await close('desktop'); await close('code');
-
+    // The replacement container cold-boots: restore, system layer, desktop, Code.
+    commandReadyMs = 120000;
     await openTerminal();
     phase('computer reopened');
 
