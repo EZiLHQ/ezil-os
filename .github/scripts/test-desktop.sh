@@ -8,8 +8,10 @@ docker image inspect "$EZIL_VALIDATE_IMAGE" >/dev/null
 # from the official installer run INSIDE this exact image. The release is pinned
 # (keep it equal to OPENCODE_VERSION in e2e/hosted-home-persistence.mjs): the
 # installer's latest-version lookup is an unauthenticated GitHub API call.
-work="${RUNNER_TEMP:-/tmp}/ezil-persistence-inputs"
-rm -rf "$work"
+# A private directory per run: a fixed path under a shared /tmp would let two runs delete
+# each other's inputs. Not removed on exit: the image writes ~/.opencode as root, and CI's
+# RUNNER_TEMP is per job.
+work="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ezil-persistence-inputs.XXXXXX")"
 mkdir -p "$work/next-warm" "$work/opencode-out"
 (
   cd "$work/next-warm"
