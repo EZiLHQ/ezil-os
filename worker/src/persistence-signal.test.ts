@@ -583,6 +583,44 @@ describe('restore observations (hydrateWorkspace)', () => {
     });
   }
 
+  // Review r4242108522: Durable Object storage outlives the container, so without a reset the
+  // first interval after a reopen >5 min later skips the dirty probe and runs a full walk and tar.
+  const LAST_FLUSH_KEY = 'ezil:systemLastFlushAt';
+  const LAST_CAPTURE_START_KEY = 'ezil:systemLastCaptureStartedAt';
+  const DIRTY_PENDING_KEY = 'ezil:systemDirtyPendingAt';
+  const oldClocks = () => {
+    const old = Date.now() - 10 * 60_000;
+    return { [LAST_FLUSH_KEY]: old, [LAST_CAPTURE_START_KEY]: old, [DIRTY_PENDING_KEY]: old + 1 };
+  };
+
+  it('a fresh system hydration resets the system flush clocks to now and drops the old pending change', async () => {
+    const { fake, store } = await makeFake({ storage: { [COMPUTER_ID_KEY]: COMPUTER, ...oldClocks() } });
+    const before = Date.now();
+    expect(await call(fake, 'hydrateWorkspace', { mountPath: '/workspace', prefix: PREFIX })).toMatchObject({ mounted: true });
+    expect(store.get(LAST_FLUSH_KEY) as number).toBeGreaterThanOrEqual(before);
+    expect(store.get(LAST_CAPTURE_START_KEY) as number).toBeGreaterThanOrEqual(before);
+    expect(store.has(DIRTY_PENDING_KEY)).toBe(false);
+  });
+
+  it('a failed system restore keeps the old clocks (the 5-min backstop still applies)', async () => {
+    const clocks = oldClocks();
+    const { fake, store } = await makeFake({ systemReadThrows: true, storage: { [COMPUTER_ID_KEY]: COMPUTER, ...clocks } });
+    expect(await call(fake, 'hydrateWorkspace', { mountPath: '/workspace', prefix: PREFIX })).toMatchObject({ mounted: true });
+    expect(store.get(LAST_FLUSH_KEY)).toBe(clocks[LAST_FLUSH_KEY]);
+    expect(store.get(LAST_CAPTURE_START_KEY)).toBe(clocks[LAST_CAPTURE_START_KEY]);
+    expect(store.get(DIRTY_PENDING_KEY)).toBe(clocks[DIRTY_PENDING_KEY]);
+  });
+
+  it('a repeated hydration of the same container (already_restored) never resets the clocks', async () => {
+    const { fake, store } = await makeFake({ storage: { [COMPUTER_ID_KEY]: COMPUTER } });
+    const params = { mountPath: '/workspace', prefix: PREFIX };
+    expect(await call(fake, 'hydrateWorkspace', params)).toMatchObject({ mounted: true });
+    const clocks = oldClocks();
+    for (const [k, v] of Object.entries(clocks)) store.set(k, v);
+    expect(await call(fake, 'hydrateWorkspace', params)).toMatchObject({ mounted: true, detail: 'already_hydrated' });
+    for (const [k, v] of Object.entries(clocks)) expect(store.get(k)).toBe(v);
+  });
+
   it('a backoff deletion failure does not block hydration', async () => {
     const { fake } = await makeFake({ backoffDeleteThrows: true, storage: { [BACKOFF_AT_KEY]: Date.now() } });
     expect(await call(fake, 'hydrateWorkspace', { mountPath: '/workspace', prefix: PREFIX })).toMatchObject({ mounted: true });
