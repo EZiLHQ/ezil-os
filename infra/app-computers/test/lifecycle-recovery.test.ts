@@ -178,3 +178,18 @@ test('recovery accepts a grown data disk inside the range and refuses one outsid
         else { assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.deepEqual(result.calls, []); }
     }
 });
+test('recovery refuses a data disk under another KMS key or with multi-attach', async () => {
+    for (const mutate of [(v: any) => { v.KmsKeyId = v.KmsKeyId.replace(/1111-4111/, '9999-4999'); }, (v: any) => { v.MultiAttachEnabled = true; }]) {
+        const f = fixture(); mutate(f.state.volumes[0]!);
+        const result = await run(f); assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.deepEqual(result.calls, []);
+    }
+});
+test('recovery lets interrupted SDK tasks settle for 60 s before reading terminal history', async () => {
+    const f = fixture(); f.source.stopDate = new Date(f.state.now - 10000);
+    let historyReads = 0; const original = f.deps.history; f.deps.history = async arn => { historyReads++; return original(arn); };
+    const first = await createRecoveryHelper(f.settings, f.deps)({ executionArn: f.arn, phase: 'initial' });
+    assert.deepEqual(first, { decision: 'wait', phase: 'initial' }); assert.equal(historyReads, 0);
+    f.state.now += 51000;
+    const later = await createRecoveryHelper(f.settings, f.deps)({ executionArn: f.arn, phase: 'initial' });
+    assert.notDeepEqual(later, { decision: 'wait', phase: 'initial' }); assert.ok(historyReads > 0);
+});

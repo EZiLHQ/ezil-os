@@ -1,0 +1,1056 @@
+{
+  "AppCallerRoleDefaultPolicy61BE57D2": {
+    "Type": "AWS::IAM::Policy",
+    "PolicyDocument": {
+      "Statement": [
+        {
+          "Action": "states:StartExecution",
+          "Effect": "Allow",
+          "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle:1"
+        },
+        {
+          "Action": "ec2:Describe*",
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "*"
+        }
+      ],
+      "Version": "2012-10-17"
+    },
+    "Roles": [
+      {
+        "Ref": "AppCallerRoleEA1CB1F0"
+      }
+    ]
+  },
+  "AppCallerRoleEA1CB1F0": {
+    "Type": "AWS::IAM::Role",
+    "AssumeRolePolicyDocument": {
+      "Statement": [
+        {
+          "Action": "sts:AssumeRoleWithWebIdentity",
+          "Condition": {
+            "StringEquals": {
+              "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+              "token.actions.githubusercontent.com:sub": "repo:ezilhq@1/ezil-os@2:environment:production"
+            }
+          },
+          "Effect": "Allow",
+          "Principal": {
+            "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+          }
+        }
+      ],
+      "Version": "2012-10-17"
+    }
+  },
+  "LifecycleControllerRole1FB8E154": {
+    "Type": "AWS::IAM::Role",
+    "AssumeRolePolicyDocument": {
+      "Statement": [
+        {
+          "Action": "sts:AssumeRole",
+          "Condition": {
+            "StringEquals": {
+              "aws:SourceAccount": "123456789012"
+            },
+            "ArnEquals": {
+              "aws:SourceArn": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle"
+            }
+          },
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "states.amazonaws.com"
+          }
+        }
+      ],
+      "Version": "2012-10-17"
+    }
+  },
+  "LifecycleControllerRoleDefaultPolicy31C0D948": {
+    "Type": "AWS::IAM::Policy",
+    "PolicyDocument": {
+      "Statement": [
+        {
+          "Action": "lambda:InvokeFunction",
+          "Effect": "Allow",
+          "Resource": {
+            "Ref": "LifecycleObserverCurrentVersion3A1B23A0ca4627c0f140ff41cc123e9e7c7bf52c"
+          }
+        },
+        {
+          "Action": [
+            "kms:Decrypt",
+            "kms:Encrypt",
+            "kms:ReEncrypt*",
+            "kms:GenerateDataKey*"
+          ],
+          "Effect": "Allow",
+          "Resource": {
+            "Fn::GetAtt": [
+              "LifecycleHistoryKey897F7B53",
+              "Arn"
+            ]
+          }
+        },
+        {
+          "Action": [
+            "ec2:StartInstances",
+            "ec2:StopInstances",
+            "ec2:TerminateInstances"
+          ],
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1",
+              "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+              "ec2:ResourceTag/ezil:stage": "pilot"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*"
+        },
+        {
+          "Action": "ec2:AttachVolume",
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1",
+              "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+              "ec2:ResourceTag/ezil:stage": "pilot",
+              "ec2:AvailabilityZoneId": "aps1-az1"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": [
+            "arn:aws:ec2:ap-south-1:123456789012:instance/*",
+            "arn:aws:ec2:ap-south-1:123456789012:volume/*"
+          ]
+        },
+        {
+          "Action": "ec2:CreateVolume",
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1",
+              "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+              "aws:RequestTag/ezil:stage": "pilot",
+              "ec2:VolumeType": "gp3",
+              "ec2:AvailabilityZoneId": "aps1-az1"
+            },
+            "ArnEquals": {
+              "ec2:KmsKeyId": "arn:aws:kms:ap-south-1:123456789012:key/11111111-1111-4111-8111-111111111111"
+            },
+            "Bool": {
+              "ec2:Encrypted": "true"
+            },
+            "NumericGreaterThanEquals": {
+              "ec2:VolumeSize": "20"
+            },
+            "NumericLessThanEquals": {
+              "ec2:VolumeSize": "100"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:ec2:ap-south-1:123456789012:volume/*"
+        },
+        {
+          "Action": "ec2:RunInstances",
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1"
+            },
+            "ArnEquals": {
+              "ec2:LaunchTemplate": "arn:aws:ec2:ap-south-1:123456789012:launch-template/lt-11111111111111111"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": [
+            "arn:aws:ec2:ap-south-1::image/ami-11111111111111111",
+            "arn:aws:ec2:ap-south-1:123456789012:subnet/subnet-11111111111111111",
+            "arn:aws:ec2:ap-south-1:123456789012:security-group/sg-11111111111111111",
+            "arn:aws:ec2:ap-south-1:123456789012:launch-template/lt-11111111111111111",
+            "arn:aws:ec2:ap-south-1:123456789012:network-interface/*"
+          ]
+        },
+        {
+          "Action": "ec2:RunInstances",
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1",
+              "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+              "aws:RequestTag/ezil:stage": "pilot",
+              "ec2:InstanceType": [
+                "m6i.large",
+                "c6i.xlarge"
+              ],
+              "ec2:MetadataHttpTokens": "required",
+              "ec2:InstanceMetadataTags": "disabled",
+              "ec2:AvailabilityZoneId": "aps1-az1"
+            },
+            "NumericLessThanEquals": {
+              "ec2:MetadataHttpPutResponseHopLimit": "1"
+            },
+            "Null": {
+              "ec2:InstanceProfile": "true"
+            },
+            "ArnEquals": {
+              "ec2:LaunchTemplate": "arn:aws:ec2:ap-south-1:123456789012:launch-template/lt-11111111111111111"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*"
+        },
+        {
+          "Action": "ec2:RunInstances",
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1",
+              "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+              "aws:RequestTag/ezil:stage": "pilot",
+              "ec2:VolumeType": "gp3"
+            },
+            "Bool": {
+              "ec2:Encrypted": "true"
+            },
+            "NumericLessThanEquals": {
+              "ec2:VolumeSize": "20"
+            },
+            "ArnEquals": {
+              "ec2:LaunchTemplate": "arn:aws:ec2:ap-south-1:123456789012:launch-template/lt-11111111111111111"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:ec2:ap-south-1:123456789012:volume/*"
+        },
+        {
+          "Action": "ec2:CreateTags",
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1",
+              "ec2:CreateAction": [
+                "RunInstances",
+                "CreateVolume"
+              ]
+            }
+          },
+          "Effect": "Allow",
+          "Resource": [
+            "arn:aws:ec2:ap-south-1:123456789012:instance/*",
+            "arn:aws:ec2:ap-south-1:123456789012:volume/*"
+          ]
+        },
+        {
+          "Action": "ec2:CreateTags",
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1",
+              "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+              "ec2:ResourceTag/ezil:stage": "pilot"
+            },
+            "ForAllValues:StringEquals": {
+              "aws:TagKeys": [
+                "ezil:generation",
+                "ezil:fence-token"
+              ]
+            },
+            "Null": {
+              "aws:TagKeys": "false"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:ec2:ap-south-1:123456789012:volume/*"
+        },
+        {
+          "Action": "ec2:CreateTags",
+          "Condition": {
+            "ForAnyValue:StringEquals": {
+              "aws:TagKeys": [
+                "ezil:computer-id",
+                "ezil:managed-by",
+                "ezil:stage"
+              ]
+            },
+            "Null": {
+              "ec2:CreateAction": "true"
+            }
+          },
+          "Effect": "Deny",
+          "Resource": "*"
+        },
+        {
+          "Action": [
+            "ec2:DeleteVolume",
+            "ec2:DeleteSnapshot",
+            "ec2:DetachVolume",
+            "ec2:ModifyInstanceAttribute",
+            "ec2:ModifyInstanceMetadataOptions",
+            "ec2:DeleteTags",
+            "iam:PassRole"
+          ],
+          "Effect": "Deny",
+          "Resource": "*"
+        },
+        {
+          "Action": [
+            "kms:Decrypt",
+            "kms:Encrypt",
+            "kms:GenerateDataKeyWithoutPlaintext",
+            "kms:ReEncrypt*",
+            "kms:DescribeKey"
+          ],
+          "Condition": {
+            "StringEquals": {
+              "kms:ViaService": "ec2.ap-south-1.amazonaws.com"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:kms:ap-south-1:123456789012:key/11111111-1111-4111-8111-111111111111"
+        },
+        {
+          "Action": "kms:CreateGrant",
+          "Condition": {
+            "Bool": {
+              "kms:GrantIsForAWSResource": "true"
+            },
+            "StringEquals": {
+              "kms:ViaService": "ec2.ap-south-1.amazonaws.com"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:kms:ap-south-1:123456789012:key/11111111-1111-4111-8111-111111111111"
+        },
+        {
+          "Action": [
+            "logs:CreateLogDelivery",
+            "logs:GetLogDelivery",
+            "logs:UpdateLogDelivery",
+            "logs:DeleteLogDelivery",
+            "logs:ListLogDeliveries",
+            "logs:PutResourcePolicy",
+            "logs:DescribeResourcePolicies",
+            "logs:DescribeLogGroups"
+          ],
+          "Effect": "Allow",
+          "Resource": "*"
+        }
+      ],
+      "Version": "2012-10-17"
+    },
+    "Roles": [
+      {
+        "Ref": "LifecycleControllerRole1FB8E154"
+      }
+    ]
+  },
+  "LifecycleHistoryKey897F7B53": {
+    "Type": "AWS::KMS::Key",
+    "KeyPolicy": {
+      "Statement": [
+        {
+          "Action": "kms:*",
+          "Effect": "Allow",
+          "Principal": {
+            "AWS": {
+              "Fn::Join": [
+                "",
+                [
+                  "arn:",
+                  {
+                    "Ref": "AWS::Partition"
+                  },
+                  ":iam::123456789012:root"
+                ]
+              ]
+            }
+          },
+          "Resource": "*"
+        },
+        {
+          "Action": [
+            "kms:Encrypt*",
+            "kms:Decrypt*",
+            "kms:ReEncrypt*",
+            "kms:GenerateDataKey*",
+            "kms:Describe*"
+          ],
+          "Condition": {
+            "ArnLike": {
+              "kms:EncryptionContext:aws:logs:arn": "arn:aws:logs:ap-south-1:123456789012:log-group:*"
+            }
+          },
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "logs.ap-south-1.amazonaws.com"
+          },
+          "Resource": "*"
+        },
+        {
+          "Action": [
+            "kms:Decrypt",
+            "kms:GenerateDataKey"
+          ],
+          "Condition": {
+            "ArnEquals": {
+              "aws:SourceArn": "arn:aws:events:ap-south-1:123456789012:rule/ezil-pilot-lifecycle-unconfirmed"
+            },
+            "StringEquals": {
+              "aws:SourceAccount": "123456789012"
+            }
+          },
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "events.amazonaws.com"
+          },
+          "Resource": "*"
+        }
+      ],
+      "Version": "2012-10-17"
+    }
+  },
+  "LifecycleNotificationFailuresPolicy12249094": {
+    "Type": "AWS::SQS::QueuePolicy",
+    "PolicyDocument": {
+      "Statement": [
+        {
+          "Action": "sqs:SendMessage",
+          "Condition": {
+            "ArnEquals": {
+              "aws:SourceArn": "arn:aws:events:ap-south-1:123456789012:rule/ezil-pilot-lifecycle-unconfirmed"
+            },
+            "StringEquals": {
+              "aws:SourceAccount": "123456789012"
+            }
+          },
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "events.amazonaws.com"
+          },
+          "Resource": {
+            "Fn::GetAtt": [
+              "LifecycleNotificationFailures43DA1255",
+              "Arn"
+            ]
+          }
+        }
+      ],
+      "Version": "2012-10-17"
+    },
+    "Queues": [
+      {
+        "Ref": "LifecycleNotificationFailures43DA1255"
+      }
+    ]
+  },
+  "LifecycleObserverServiceRole0EE4CA0D": {
+    "Type": "AWS::IAM::Role",
+    "AssumeRolePolicyDocument": {
+      "Statement": [
+        {
+          "Action": "sts:AssumeRole",
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "lambda.amazonaws.com"
+          }
+        }
+      ],
+      "Version": "2012-10-17"
+    },
+    "ManagedPolicyArns": [
+      {
+        "Fn::Join": [
+          "",
+          [
+            "arn:",
+            {
+              "Ref": "AWS::Partition"
+            },
+            ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+          ]
+        ]
+      }
+    ]
+  },
+  "LifecycleObserverServiceRoleDefaultPolicy537A1B52": {
+    "Type": "AWS::IAM::Policy",
+    "PolicyDocument": {
+      "Statement": [
+        {
+          "Action": [
+            "ec2:DescribeInstances",
+            "ec2:DescribeVolumes",
+            "ec2:DescribeImages",
+            "ec2:DescribeLaunchTemplateVersions"
+          ],
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "*"
+        },
+        {
+          "Action": "states:DescribeExecution",
+          "Effect": "Allow",
+          "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-lifecycle:computer-*"
+        },
+        {
+          "Action": "secretsmanager:GetSecretValue",
+          "Effect": "Allow",
+          "Resource": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/lifecycle-key-abcdef"
+        },
+        {
+          "Action": "kms:Decrypt",
+          "Condition": {
+            "StringEquals": {
+              "kms:ViaService": "secretsmanager.ap-south-1.amazonaws.com",
+              "kms:EncryptionContext:SecretARN": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/lifecycle-key-abcdef"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:kms:ap-south-1:123456789012:key/22222222-2222-4222-8222-222222222222"
+        },
+        {
+          "Action": "kms:Decrypt",
+          "Effect": "Allow",
+          "Resource": {
+            "Fn::GetAtt": [
+              "LifecycleHistoryKey897F7B53",
+              "Arn"
+            ]
+          }
+        }
+      ],
+      "Version": "2012-10-17"
+    },
+    "Roles": [
+      {
+        "Ref": "LifecycleObserverServiceRole0EE4CA0D"
+      }
+    ]
+  },
+  "LifecycleUnconfirmedExecutionsPolicyEECC654E": {
+    "Type": "AWS::SQS::QueuePolicy",
+    "PolicyDocument": {
+      "Statement": [
+        {
+          "Action": "sqs:SendMessage",
+          "Condition": {
+            "ArnEquals": {
+              "aws:SourceArn": "arn:aws:events:ap-south-1:123456789012:rule/ezil-pilot-lifecycle-unconfirmed"
+            },
+            "StringEquals": {
+              "aws:SourceAccount": "123456789012"
+            }
+          },
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "events.amazonaws.com"
+          },
+          "Resource": {
+            "Fn::GetAtt": [
+              "LifecycleUnconfirmedExecutionsC1D056E2",
+              "Arn"
+            ]
+          }
+        }
+      ],
+      "Version": "2012-10-17"
+    },
+    "Queues": [
+      {
+        "Ref": "LifecycleUnconfirmedExecutionsC1D056E2"
+      }
+    ]
+  },
+  "RecoveryHistoryKey77005C2A": {
+    "Type": "AWS::KMS::Key",
+    "KeyPolicy": {
+      "Statement": [
+        {
+          "Action": "kms:*",
+          "Effect": "Allow",
+          "Principal": {
+            "AWS": {
+              "Fn::Join": [
+                "",
+                [
+                  "arn:",
+                  {
+                    "Ref": "AWS::Partition"
+                  },
+                  ":iam::123456789012:root"
+                ]
+              ]
+            }
+          },
+          "Resource": "*"
+        },
+        {
+          "Action": [
+            "kms:Encrypt*",
+            "kms:Decrypt*",
+            "kms:ReEncrypt*",
+            "kms:GenerateDataKey*",
+            "kms:Describe*"
+          ],
+          "Condition": {
+            "ArnLike": {
+              "kms:EncryptionContext:aws:logs:arn": "arn:aws:logs:ap-south-1:123456789012:log-group:*"
+            }
+          },
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "logs.ap-south-1.amazonaws.com"
+          },
+          "Resource": "*"
+        },
+        {
+          "Action": [
+            "kms:Decrypt",
+            "kms:GenerateDataKey"
+          ],
+          "Condition": {
+            "ArnEquals": {
+              "aws:SourceArn": "arn:aws:events:ap-south-1:123456789012:rule/ezil-pilot-recovery-interrupted"
+            },
+            "StringEquals": {
+              "aws:SourceAccount": "123456789012"
+            }
+          },
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "events.amazonaws.com"
+          },
+          "Resource": "*"
+        },
+        {
+          "Action": [
+            "kms:Decrypt",
+            "kms:GenerateDataKey"
+          ],
+          "Condition": {
+            "ArnEquals": {
+              "aws:SourceArn": "arn:aws:events:ap-south-1:123456789012:rule/ezil-pilot-recovery-backstop"
+            },
+            "StringEquals": {
+              "aws:SourceAccount": "123456789012"
+            }
+          },
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "events.amazonaws.com"
+          },
+          "Resource": "*"
+        },
+        {
+          "Action": [
+            "kms:Decrypt",
+            "kms:GenerateDataKey"
+          ],
+          "Condition": {
+            "ArnEquals": {
+              "aws:SourceArn": "arn:aws:events:ap-south-1:123456789012:rule/ezil-pilot-recovery-failed"
+            },
+            "StringEquals": {
+              "aws:SourceAccount": "123456789012"
+            }
+          },
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "events.amazonaws.com"
+          },
+          "Resource": "*"
+        }
+      ],
+      "Version": "2012-10-17"
+    }
+  },
+  "RecoveryObserverServiceRole86BC9AF2": {
+    "Type": "AWS::IAM::Role",
+    "AssumeRolePolicyDocument": {
+      "Statement": [
+        {
+          "Action": "sts:AssumeRole",
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "lambda.amazonaws.com"
+          }
+        }
+      ],
+      "Version": "2012-10-17"
+    },
+    "ManagedPolicyArns": [
+      {
+        "Fn::Join": [
+          "",
+          [
+            "arn:",
+            {
+              "Ref": "AWS::Partition"
+            },
+            ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+          ]
+        ]
+      }
+    ]
+  },
+  "RecoveryObserverServiceRoleDefaultPolicyA036F4CB": {
+    "Type": "AWS::IAM::Policy",
+    "PolicyDocument": {
+      "Statement": [
+        {
+          "Action": "states:DescribeExecution",
+          "Effect": "Allow",
+          "Resource": [
+            "arn:aws:states:ap-south-1:123456789012:execution:ezil-lifecycle:computer-*",
+            "arn:aws:states:ap-south-1:123456789012:execution:ezil-lifecycle-recovery:cleanup-computer-*"
+          ]
+        },
+        {
+          "Action": "states:GetExecutionHistory",
+          "Effect": "Allow",
+          "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-lifecycle:computer-*"
+        },
+        {
+          "Action": [
+            "ec2:DescribeInstances",
+            "ec2:DescribeVolumes"
+          ],
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "*"
+        },
+        {
+          "Action": "kms:Decrypt",
+          "Effect": "Allow",
+          "Resource": {
+            "Fn::GetAtt": [
+              "LifecycleHistoryKey897F7B53",
+              "Arn"
+            ]
+          }
+        },
+        {
+          "Action": "kms:Decrypt",
+          "Effect": "Allow",
+          "Resource": {
+            "Fn::GetAtt": [
+              "RecoveryHistoryKey77005C2A",
+              "Arn"
+            ]
+          }
+        }
+      ],
+      "Version": "2012-10-17"
+    },
+    "Roles": [
+      {
+        "Ref": "RecoveryObserverServiceRole86BC9AF2"
+      }
+    ]
+  },
+  "RecoveryReconcilerAllowEventsSnapshotRecoveryBackstop4FAB58865290348D": {
+    "Type": "AWS::Lambda::Permission",
+    "Action": "lambda:InvokeFunction",
+    "FunctionName": {
+      "Fn::GetAtt": [
+        "RecoveryReconciler46E1B8CD",
+        "Arn"
+      ]
+    },
+    "Principal": "events.amazonaws.com",
+    "SourceAccount": "123456789012",
+    "SourceArn": "arn:aws:events:ap-south-1:123456789012:rule/ezil-pilot-recovery-backstop"
+  },
+  "RecoveryReconcilerAllowEventsSnapshotRecoveryInterrupted05FE252DF004801F": {
+    "Type": "AWS::Lambda::Permission",
+    "Action": "lambda:InvokeFunction",
+    "FunctionName": {
+      "Fn::GetAtt": [
+        "RecoveryReconciler46E1B8CD",
+        "Arn"
+      ]
+    },
+    "Principal": "events.amazonaws.com",
+    "SourceAccount": "123456789012",
+    "SourceArn": "arn:aws:events:ap-south-1:123456789012:rule/ezil-pilot-recovery-interrupted"
+  },
+  "RecoveryReconcilerServiceRole26601C37": {
+    "Type": "AWS::IAM::Role",
+    "AssumeRolePolicyDocument": {
+      "Statement": [
+        {
+          "Action": "sts:AssumeRole",
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "lambda.amazonaws.com"
+          }
+        }
+      ],
+      "Version": "2012-10-17"
+    },
+    "ManagedPolicyArns": [
+      {
+        "Fn::Join": [
+          "",
+          [
+            "arn:",
+            {
+              "Ref": "AWS::Partition"
+            },
+            ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+          ]
+        ]
+      }
+    ]
+  },
+  "RecoveryReconcilerServiceRoleDefaultPolicyCA221DAC": {
+    "Type": "AWS::IAM::Policy",
+    "PolicyDocument": {
+      "Statement": [
+        {
+          "Action": "sqs:SendMessage",
+          "Effect": "Allow",
+          "Resource": {
+            "Fn::GetAtt": [
+              "RecoveryUnconfirmed78000004",
+              "Arn"
+            ]
+          }
+        },
+        {
+          "Action": "states:DescribeExecution",
+          "Effect": "Allow",
+          "Resource": "arn:aws:states:ap-south-1:123456789012:execution:ezil-lifecycle:computer-*"
+        },
+        {
+          "Action": "states:ListExecutions",
+          "Effect": "Allow",
+          "Resource": [
+            "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle",
+            "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle:1"
+          ]
+        },
+        {
+          "Action": "states:StartExecution",
+          "Effect": "Allow",
+          "Resource": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-recovery:1"
+        },
+        {
+          "Action": "kms:Decrypt",
+          "Effect": "Allow",
+          "Resource": {
+            "Fn::GetAtt": [
+              "LifecycleHistoryKey897F7B53",
+              "Arn"
+            ]
+          }
+        },
+        {
+          "Action": [
+            "kms:Decrypt",
+            "kms:Encrypt",
+            "kms:ReEncrypt*",
+            "kms:GenerateDataKey*"
+          ],
+          "Effect": "Allow",
+          "Resource": {
+            "Fn::GetAtt": [
+              "RecoveryHistoryKey77005C2A",
+              "Arn"
+            ]
+          }
+        }
+      ],
+      "Version": "2012-10-17"
+    },
+    "Roles": [
+      {
+        "Ref": "RecoveryReconcilerServiceRole26601C37"
+      }
+    ]
+  },
+  "RecoveryRecoveryRole1B60FF4C": {
+    "Type": "AWS::IAM::Role",
+    "AssumeRolePolicyDocument": {
+      "Statement": [
+        {
+          "Action": "sts:AssumeRole",
+          "Condition": {
+            "StringEquals": {
+              "aws:SourceAccount": "123456789012"
+            },
+            "ArnEquals": {
+              "aws:SourceArn": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-recovery"
+            }
+          },
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "states.amazonaws.com"
+          }
+        }
+      ],
+      "Version": "2012-10-17"
+    }
+  },
+  "RecoveryRecoveryRoleDefaultPolicy2A415109": {
+    "Type": "AWS::IAM::Policy",
+    "PolicyDocument": {
+      "Statement": [
+        {
+          "Action": "lambda:InvokeFunction",
+          "Effect": "Allow",
+          "Resource": {
+            "Ref": "RecoveryObserverCurrentVersion680AB0D7e46923f596ed75089bb7b7ff05b11369"
+          }
+        },
+        {
+          "Action": [
+            "kms:Decrypt",
+            "kms:Encrypt",
+            "kms:ReEncrypt*",
+            "kms:GenerateDataKey*"
+          ],
+          "Effect": "Allow",
+          "Resource": {
+            "Fn::GetAtt": [
+              "RecoveryHistoryKey77005C2A",
+              "Arn"
+            ]
+          }
+        },
+        {
+          "Action": [
+            "ec2:StopInstances",
+            "ec2:TerminateInstances"
+          ],
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "ap-south-1",
+              "ec2:ResourceTag/ezil:managed-by": "app-computer-platform",
+              "ec2:ResourceTag/ezil:stage": "pilot"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*"
+        },
+        {
+          "Action": [
+            "ec2:DeleteVolume",
+            "ec2:DeleteSnapshot",
+            "ec2:DetachVolume",
+            "ec2:ModifyInstanceAttribute",
+            "ec2:ModifyInstanceMetadataOptions",
+            "ec2:DeleteTags",
+            "iam:PassRole"
+          ],
+          "Effect": "Deny",
+          "Resource": "*"
+        },
+        {
+          "Action": [
+            "logs:CreateLogDelivery",
+            "logs:GetLogDelivery",
+            "logs:UpdateLogDelivery",
+            "logs:DeleteLogDelivery",
+            "logs:ListLogDeliveries",
+            "logs:PutResourcePolicy",
+            "logs:DescribeResourcePolicies",
+            "logs:DescribeLogGroups"
+          ],
+          "Effect": "Allow",
+          "Resource": "*"
+        }
+      ],
+      "Version": "2012-10-17"
+    },
+    "Roles": [
+      {
+        "Ref": "RecoveryRecoveryRole1B60FF4C"
+      }
+    ]
+  },
+  "RecoveryUnconfirmedPolicyD74ADBE0": {
+    "Type": "AWS::SQS::QueuePolicy",
+    "PolicyDocument": {
+      "Statement": [
+        {
+          "Action": "sqs:SendMessage",
+          "Condition": {
+            "ArnEquals": {
+              "aws:SourceArn": "arn:aws:events:ap-south-1:123456789012:rule/ezil-pilot-recovery-interrupted"
+            },
+            "StringEquals": {
+              "aws:SourceAccount": "123456789012"
+            }
+          },
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "events.amazonaws.com"
+          },
+          "Resource": {
+            "Fn::GetAtt": [
+              "RecoveryUnconfirmed78000004",
+              "Arn"
+            ]
+          }
+        },
+        {
+          "Action": "sqs:SendMessage",
+          "Condition": {
+            "ArnEquals": {
+              "aws:SourceArn": "arn:aws:events:ap-south-1:123456789012:rule/ezil-pilot-recovery-backstop"
+            },
+            "StringEquals": {
+              "aws:SourceAccount": "123456789012"
+            }
+          },
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "events.amazonaws.com"
+          },
+          "Resource": {
+            "Fn::GetAtt": [
+              "RecoveryUnconfirmed78000004",
+              "Arn"
+            ]
+          }
+        },
+        {
+          "Action": "sqs:SendMessage",
+          "Condition": {
+            "ArnEquals": {
+              "aws:SourceArn": "arn:aws:events:ap-south-1:123456789012:rule/ezil-pilot-recovery-failed"
+            },
+            "StringEquals": {
+              "aws:SourceAccount": "123456789012"
+            }
+          },
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "events.amazonaws.com"
+          },
+          "Resource": {
+            "Fn::GetAtt": [
+              "RecoveryUnconfirmed78000004",
+              "Arn"
+            ]
+          }
+        }
+      ],
+      "Version": "2012-10-17"
+    },
+    "Queues": [
+      {
+        "Ref": "RecoveryUnconfirmed78000004"
+      }
+    ]
+  }
+}

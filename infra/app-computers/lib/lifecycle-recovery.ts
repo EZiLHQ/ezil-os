@@ -1,11 +1,12 @@
 import { join } from 'node:path';
 import { CfnOutput, Duration, RemovalPolicy, aws_cloudwatch as cloudwatch, aws_events as events,
-    aws_events_targets as targets, aws_iam as iam, aws_kms as kms, aws_lambda as lambda,
+    aws_iam as iam, aws_kms as kms, aws_lambda as lambda,
     aws_lambda_nodejs as nodejs, aws_logs as logs, aws_sqs as sqs, aws_stepfunctions as states } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import { RecoverySettingsSchema, machineArn, type RecoverySettings } from './lifecycle/recovery-contract.js';
 import { recoveryDefinition } from './lifecycle/recovery-definition.js';
 import { DENIED_ACTIONS } from './computer-lifecycle.js';
+import { GuardedTarget, ruleArn } from './guarded-target.js';
 
 export class ComputerLifecycleRecovery extends Construct {
     readonly machine: states.CfnStateMachine;
@@ -68,16 +69,22 @@ export class ComputerLifecycleRecovery extends Construct {
         dispatcher.addToRolePolicy(new iam.PolicyStatement({ actions: ['states:ListExecutions'], resources: [originalMachine, d.stateMachineVersionArn] }));
         dispatcher.addToRolePolicy(new iam.PolicyStatement({ actions: ['states:StartExecution'], resources: [s.recoveryVersionArn] }));
         props.sourceHistoryKey.grantDecrypt(dispatcher); key.grantEncryptDecrypt(dispatcher);
-        new events.Rule(this, 'Interrupted', { enabled: props.enabled === true,
+        // Every events.amazonaws.com grant names its exact rule and account.
+        const names = { interrupted: `ezil-${d.namespace}-recovery-interrupted`, backstop: `ezil-${d.namespace}-recovery-backstop`,
+            failed: `ezil-${d.namespace}-recovery-failed` };
+        const guarded = (destination: ConstructorParameters<typeof GuardedTarget>[0], name: string, withDlq: boolean) =>
+            new GuardedTarget(destination, { ruleArn: ruleArn(r, d.accountId, name), account: d.accountId,
+                ...(withDlq ? { deadLetter: { queue: dlq, key }, retryAttempts: 2, maxEventAge: Duration.hours(1) } : {}) });
+        new events.Rule(this, 'Interrupted', { ruleName: names.interrupted, enabled: props.enabled === true,
             eventPattern: { source: ['aws.states'], detailType: ['Step Functions Execution Status Change'],
                 detail: { stateMachineArn: [originalMachine], status: ['FAILED', 'TIMED_OUT', 'ABORTED'] } },
-            targets: [new targets.LambdaFunction(dispatcher, { deadLetterQueue: dlq, retryAttempts: 2, maxEventAge: Duration.hours(1) })] });
-        new events.Rule(this, 'Backstop', { enabled: props.enabled === true, schedule: events.Schedule.rate(Duration.minutes(5)),
-            targets: [new targets.LambdaFunction(dispatcher, { deadLetterQueue: dlq, retryAttempts: 2, maxEventAge: Duration.hours(1) })] });
-        new events.Rule(this, 'FailedRecovery', { enabled: props.enabled === true,
+            targets: [guarded({ fn: dispatcher }, names.interrupted, true)] });
+        new events.Rule(this, 'Backstop', { ruleName: names.backstop, enabled: props.enabled === true, schedule: events.Schedule.rate(Duration.minutes(5)),
+            targets: [guarded({ fn: dispatcher }, names.backstop, true)] });
+        new events.Rule(this, 'FailedRecovery', { ruleName: names.failed, enabled: props.enabled === true,
             eventPattern: { source: ['aws.states'], detailType: ['Step Functions Execution Status Change'],
                 detail: { stateMachineArn: [recoveryMachine], status: ['FAILED', 'TIMED_OUT', 'ABORTED'] } },
-            targets: [new targets.SqsQueue(dlq)] });
+            targets: [guarded({ queue: dlq, key }, names.failed, false)] });
         new cloudwatch.Alarm(this, 'UnconfirmedAlarm', { metric: dlq.metricApproximateNumberOfMessagesVisible(), threshold: 1, evaluationPeriods: 1 });
         new cloudwatch.Alarm(this, 'RecoveryFailureAlarm', { metric: new cloudwatch.Metric({ namespace: 'AWS/States', metricName: 'ExecutionsFailed',
             dimensionsMap: { StateMachineArn: this.machine.ref }, statistic: 'Sum', period: Duration.minutes(5) }), threshold: 1, evaluationPeriods: 1 });

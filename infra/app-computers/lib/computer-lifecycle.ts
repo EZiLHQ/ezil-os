@@ -1,10 +1,11 @@
 import { join } from 'node:path';
 import { CfnOutput, Duration, RemovalPolicy, Stack, aws_cloudwatch as cloudwatch,
-    aws_events as events, aws_events_targets as targets, aws_iam as iam, aws_kms as kms, aws_lambda as lambda,
+    aws_events as events, aws_iam as iam, aws_kms as kms, aws_lambda as lambda,
     aws_lambda_nodejs as nodejs, aws_logs as logs, aws_sqs as sqs, aws_stepfunctions as states } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import { RETAG_KEYS, SettingsSchema, type Settings } from './lifecycle/contract.js';
 import { lifecycleDefinition } from './lifecycle/definition.js';
+import { GuardedTarget, ruleArn } from './guarded-target.js';
 
 /** Shared graph and trusted control role; it does not allocate a computer.
  * Hosts launch with no instance role (R5), so there is no iam:PassRole here.
@@ -52,9 +53,11 @@ export class ComputerLifecycle extends Construct {
         const failures=new sqs.Queue(this,'UnconfirmedExecutions',{encryption:sqs.QueueEncryption.KMS,encryptionMasterKey:key,
             retentionPeriod:Duration.days(14),removalPolicy:RemovalPolicy.RETAIN});
         const dlq=new sqs.Queue(this,'NotificationFailures',{encryption:sqs.QueueEncryption.KMS,encryptionMasterKey:key,retentionPeriod:Duration.days(14),removalPolicy:RemovalPolicy.RETAIN});
-        new events.Rule(this,'Unconfirmed',{enabled:props.notificationsEnabled===true,eventPattern:{source:['aws.states'],detailType:['Step Functions Execution Status Change'],
+        const unconfirmedRule=`ezil-${d.namespace}-lifecycle-unconfirmed`;
+        new events.Rule(this,'Unconfirmed',{ruleName:unconfirmedRule,enabled:props.notificationsEnabled===true,eventPattern:{source:['aws.states'],detailType:['Step Functions Execution Status Change'],
             detail:{stateMachineArn:[machineArn],status:['FAILED','TIMED_OUT','ABORTED']}},
-            targets:[new targets.SqsQueue(failures,{deadLetterQueue:dlq,retryAttempts:2,maxEventAge:Duration.hours(1)})]});
+            targets:[new GuardedTarget({queue:failures,key},{ruleArn:ruleArn(r,d.accountId,unconfirmedRule),account:d.accountId,
+                deadLetter:{queue:dlq,key},retryAttempts:2,maxEventAge:Duration.hours(1)})]});
         new cloudwatch.Alarm(this,'UnconfirmedAlarm',{metric:failures.metricApproximateNumberOfMessagesVisible(),threshold:1,evaluationPeriods:1});
         new cloudwatch.Alarm(this,'FailuresAlarm',{metric:new cloudwatch.Metric({namespace:'AWS/States',metricName:'ExecutionsFailed',
             dimensionsMap:{StateMachineArn:this.machine.ref},statistic:'Sum',period:Duration.minutes(5)}),threshold:1,evaluationPeriods:1});
@@ -72,9 +75,14 @@ export function controllerStatements(s:Settings):iam.PolicyStatement[]{
     const existing={StringEquals:{...region,...managed}};
     const requestTags={...region,'aws:RequestTag/ezil:managed-by':'app-computer-platform','aws:RequestTag/ezil:stage':d.namespace};
     const template={ArnEquals:{'ec2:LaunchTemplate':arn('launch-template',d.launchTemplateId)}};
+    // C-6 nonce delivery to a stopped instance. The Deny on every other
+    // attribute is narrowed only once staging has proven how ec2:Attribute
+    // evaluates; until then ModifyInstanceAttribute stays denied outright.
+    const userDataOpen=s.features.userDataNonce&&s.features.userDataAttributeKeyVerified;
+    const denied=DENIED_ACTIONS.filter(a=>!(userDataOpen&&a==='ec2:ModifyInstanceAttribute'));
     return [
-        // No ModifyInstanceAttribute: instance type, user data and disk
-        // flags cannot be changed after launch (R10).
+        // ModifyInstanceAttribute is never allowed for type, disk flags or
+        // anything but userData (R10, C-6).
         new iam.PolicyStatement({actions:['ec2:StartInstances','ec2:StopInstances','ec2:TerminateInstances'],
             resources:[arn('instance')],conditions:existing}),
         new iam.PolicyStatement({actions:['ec2:AttachVolume'],resources:[arn('instance'),arn('volume')],
@@ -108,7 +116,15 @@ export function controllerStatements(s:Settings):iam.PolicyStatement[]{
             'ForAllValues:StringEquals':{'aws:TagKeys':[...RETAG_KEYS]},Null:{'aws:TagKeys':'false'}}}),
         new iam.PolicyStatement({effect:iam.Effect.DENY,actions:['ec2:CreateTags'],resources:['*'],conditions:{
             'ForAnyValue:StringEquals':{'aws:TagKeys':[...IDENTITY_TAG_KEYS]},Null:{'ec2:CreateAction':'true'}}}),
-        new iam.PolicyStatement({effect:iam.Effect.DENY,actions:[...DENIED_ACTIONS],resources:['*']}),
+        new iam.PolicyStatement({effect:iam.Effect.DENY,actions:denied,resources:['*']}),
+        ...(userDataOpen?[
+            new iam.PolicyStatement({actions:['ec2:ModifyInstanceAttribute'],resources:[arn('instance')],
+                conditions:{StringEquals:{...region,...managed,'ec2:Attribute':'userData'}}}),
+            new iam.PolicyStatement({effect:iam.Effect.DENY,actions:['ec2:ModifyInstanceAttribute'],resources:['*'],
+                conditions:{StringNotEquals:{'ec2:Attribute':'userData'}}}),
+            new iam.PolicyStatement({effect:iam.Effect.DENY,actions:['ec2:ModifyInstanceAttribute'],resources:['*'],
+                conditions:{Null:{'ec2:Attribute':'true'}}}),
+        ]:[]),
         new iam.PolicyStatement({actions:['kms:Decrypt','kms:Encrypt','kms:GenerateDataKeyWithoutPlaintext','kms:ReEncrypt*','kms:DescribeKey'],resources:[d.dataKeyArn],
             conditions:{StringEquals:{'kms:ViaService':`ec2.${r}.amazonaws.com`}}}),
         new iam.PolicyStatement({actions:['kms:CreateGrant'],resources:[d.dataKeyArn],conditions:{Bool:{'kms:GrantIsForAWSResource':'true'},

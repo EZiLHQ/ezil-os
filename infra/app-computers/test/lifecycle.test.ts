@@ -224,3 +224,23 @@ test('userData is required on launches and absent on stop and retire',()=>{
     for(const op of ['stop','retire'] as const){const f=lifecycleFixture(op);assert.equal(LifecycleIntentSchema.safeParse({...f.i,userData:'bm9uY2U='}).success,false,op);}
     const f=lifecycleFixture('start');assert.equal(LifecycleIntentSchema.safeParse({...f.i,userData:'not base64!'}).success,false);
 });
+
+// ── Reviewer survivors: behaviour guards ──
+test('second-writer guard: no RunInstances while the data volume is attached anywhere',async()=>{
+    const f=lifecycleFixture('provision'),v=f.volume();v.State='in-use';
+    v.Attachments=[{InstanceId:'i-99999999999999999',VolumeId:v.VolumeId,State:'attached',Device:'/dev/sdf',DeleteOnTermination:false}];f.state.volumes.push(v);
+    const r=await run('provision',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');
+    assert.equal(r.calls.filter(c=>c.action==='runInstances').length,0);assert.deepEqual(r.calls,[]);
+});
+test('a multi-attach data volume is refused before any mutation',async()=>{
+    const f=lifecycleFixture('start');f.state.volumes[0]!.MultiAttachEnabled=true;
+    const r=await run('start',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_volume_invalid/);assert.deepEqual(r.calls,[]);
+});
+test('replace waits for a stopping writer and never issues a second stop',async()=>{
+    const f=lifecycleFixture('replace');f.state.instances[0]!.State={Name:'stopping'};
+    const original=f.deps.instances;let reads=0;
+    f.deps.instances=async selector=>{const rows=await original(selector);
+        if(Array.isArray(selector)&&++reads===3)f.state.instances[0]!.State={Name:'stopped'};return rows;};
+    const r=await run('replace',{fixture:f});assert.equal(r.error,undefined);
+    assert.equal(r.calls.filter(c=>c.action==='stopInstances').length,0);assert.equal(r.calls[0]!.action,'terminateInstances');
+});
