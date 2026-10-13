@@ -97,7 +97,7 @@
       },
       "method": "POST",
       "path": "/sandbox/guac-user0123456789ab-comp0123456789ab/focus",
-      "body": "{\"note\":\"café ✓\"}",
+      "body": "{\"note\":\"caf\u00e9 \u2713\"}",
       "bodySha256": "9e43e5636553d8b51e38c500a373d54574970efd052973228cd148091ca56ed6",
       "payload": "v2|1760000000000|POST|/sandbox/guac-user0123456789ab-comp0123456789ab/focus|guac-user0123456789ab-comp0123456789ab|comp-0123456789ab|user-0123456789ab|cloudflare||0|0|9e43e5636553d8b51e38c500a373d54574970efd052973228cd148091ca56ed6",
       "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiY2xvdWRmbGFyZSIsInN0b3JlIjoiIiwiZ2VuZXJhdGlvbiI6MCwibGVhc2VFcG9jaCI6MH0.e3b86981539aab9c24f31eeafbc361fce0baf667bab865da1fddf9c032d46876"
@@ -208,5 +208,7 @@
       "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
       "error": "hmac_v2_malformed_token"
     }
-  ]
+  ],
+  "queryPolicy": "A v2-authenticated request must have an empty query string; the Worker refuses any query (hmac_v2_query_not_allowed). The path in the payload is the URL pathname only.",
+  "replay": "No nonce (C-5 does not require one): a captured token is replayable for the same method, path and body within maxAgeMs."
 }

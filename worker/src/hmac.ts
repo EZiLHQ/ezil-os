@@ -363,6 +363,11 @@ export async function verifyPreviewToken(
 //     a Cloudflare computer sends 0 and 0;
 //   - ts: unix ms, same 5-minute window as v1.
 //
+// Query strings are NOT signed: a request authenticated by v2 must carry no
+// query at all (the Worker refuses one with `hmac_v2_query_not_allowed`).
+// Replay: there is no nonce (C-5 does not require one), so a captured token
+// can be replayed for the SAME method, path and body within the 5-minute TTL.
+//
 // Unlike v1, v2 has NO local-dev bypass: no secret configured => refused
 // (`hmac_secret_not_configured`), matching #166's fail-closed rule.
 

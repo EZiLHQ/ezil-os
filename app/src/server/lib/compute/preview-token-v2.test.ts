@@ -114,6 +114,15 @@ describe('adapter wire: the Worker verifier accepts what the app sends', () => {
         }
     });
 
+    it('no v2 call carries a query string (the Worker refuses one under v2)', async () => {
+        await v2.ensure(ctx, computer, { sessionId: 's', desktopMode: 'neko' });
+        await v2.terminate(ctx, computer);
+        await v2.activity(ctx, computer, { lastInputAgoMs: 1 });
+        await v2.restart(ctx, computer);
+        for (const w of wire) expect(new URL(w.url).search).toBe('');
+        expect(vectors.queryPolicy).toContain('hmac_v2_query_not_allowed');
+    });
+
     it('flag off: no v2 header, v1 envelope exactly as before', async () => {
         await v1.ensure(ctx, computer, { sessionId: 's', desktopMode: 'neko' });
         await v1.terminate(ctx, computer);

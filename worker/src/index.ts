@@ -6309,6 +6309,9 @@ async function readBoundedBody(request: Request, maxBytes: number): Promise<Uint
 async function preauthorizeV2(request: Request, env: Env, url: URL): Promise<Response | null> {
   const token = request.headers.get(PREVIEW_TOKEN_V2_HEADER);
   if (token === null) return null;
+  // v2 signs the pathname only. A query string would be unsigned input a
+  // replayed token could vary (e.g. `?desktopMode=`), so v2 refuses any query.
+  if (url.search !== '') return json({ ok: false, error: 'hmac_v2_query_not_allowed' }, 401);
   let body: Uint8Array;
   try {
     const read = await readBoundedBody(request, V2_MAX_BODY_BYTES);
@@ -6785,6 +6788,8 @@ export default {
         mode: 'production',
         supportedDesktopModes: DESKTOP_MODES,
         build: 'ezil-os',
+        // Lets the app refuse to enable v2 against a Worker that predates it.
+        previewTokenVersions: previewTokenV1Accepted(env.EZIL_PREVIEW_TOKEN_V1_UNTIL) ? ['v1', 'v2'] : ['v2'],
       });
     }
 

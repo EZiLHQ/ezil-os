@@ -171,6 +171,43 @@ Today's preview HMAC signs a constant (`${ts}.POST./sandbox/preview.`), so it bi
   digest of the body.
 - v1 is accepted only during a time-boxed rollout window, then removed.
 
+**v2 rollout (implemented on `feat/worker-token-v2-store`, P4a/P4b)**
+- Wire: header `x-ezil-auth: v2.<base64url claims>.<hex hmac>`, never in the body (the body
+  is digested). Payload: `v2|ts|METHOD|path|sandboxId|computerId|userId|provider|store|generation|leaseEpoch|sha256hex(body)`.
+  Shared vectors: `worker/src/preview-token-v2.vectors.json`.
+- `path` is the URL pathname only. A v2 request with **any query string is refused**
+  (`hmac_v2_query_not_allowed`): the query is not signed.
+- **Replay:** there is no nonce (C-5 does not require one). A captured token can be replayed
+  for the same method, path and body within the 5-minute TTL.
+- An empty `store` claim means "no claim"; the Cloudflare adapter always sends `''`, because
+  the app has no per-computer store record and the Worker refuses a claim that differs from
+  the computer's sticky store.
+- v2 has no unsigned local-dev mode: no secret means `hmac_secret_not_configured`.
+- `GET /health` advertises `previewTokenVersions` (`["v1","v2"]`, or `["v2"]` once v1 is
+  retired). An old Worker omits the field.
+
+**Rollout order**
+1. Deploy the Worker (P4a). Confirm `GET /health` lists `"v2"`.
+2. Only then set the app's `EZIL_PREVIEW_TOKEN_V2=1`. If the Worker is rolled back below P4a
+   while the flag is on, every v2 call is refused (401); unset the flag first.
+3. **Do NOT set `EZIL_PREVIEW_TOKEN_V1_UNTIL`** until every v1 minter is migrated. Today these
+   still mint v1 (`t=…,v1=…`):
+   - app: focus, screen and relay-refresh calls in `cloudflare-guacamole-provider.ts`, and the
+     telemetry-drain and telemetry-maintenance crons (`app/src/app/api/cron/*`,
+     `app/src/server/telemetry/spool-drain-transport.ts`);
+   - `worker/scripts/*` (`reap-idle-sandboxes.mjs`, `pull-neko-log.mjs`,
+     `twen-live-validate.mjs`, `run-workspace-isolation-mission.ts`);
+   - `e2e/hosted-continuity.mjs`.
+   After the cutoff these all get `hmac_v1_token_retired`. An unparseable cutoff value
+   refuses v1 (fail closed). The cutoff never affects the `/preview-bootstrap` token or the
+   `ezil_preview` cookie.
+
+**Open PR #166 (fail closed without a secret) — verified two-line resolution, not merged here**
+- Add `SANDBOX_ALLOW_INSECURE_LOCAL_AUTH?: string` to `Env`.
+- In `authorizeSigned`, call `verifyPreviewToken(legacyToken, resolvePreviewSecrets(env), allowInsecureLocalAuth(env))`.
+  Every signed route already goes through `authorizeSigned`, so this is the only v1 call site;
+  #166's per-route edits collapse into it. v2 already fails closed.
+
 **Routing an `aws-ec2` computer**
 - The origin hostname is derived from signed fields:
   `c-<sandboxId>-g<generation>-e<leaseEpoch>.<AWS_ORIGIN_ZONE>`.
@@ -226,6 +263,13 @@ A user who replays their own computer's material can reach only their own comput
 - Garbage collection is suspended for the migrating prefix during export.
 - Oversized workspaces or system deltas, beyond the checkpoint caps, are **refused**, never
   truncated.
+
+**Final-stop policy for the Cloudflare system layer** (`classifyFinalSystemCheckpoint`, worker)
+- `stale` and `not_restored` are permanent for that container: idle-stop and teardown (user,
+  reaper, computer delete) proceed on the last committed layer and record
+  `systemChangesNotSaved` (teardown report, `persistenceHealth()` RPC, boot log).
+- `busy` and `failed` block for at most 3 retries (1, 3, 5 min) or 15 minutes from the first
+  result, whichever comes first; then the stop proceeds and records the same signal.
 
 **Rollback from AWS to Cloudflare is refused when it would lose data.** That covers:
 - state beyond the checkpoint caps

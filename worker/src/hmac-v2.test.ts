@@ -94,3 +94,10 @@ describe('EZIL_PREVIEW_TOKEN_V1_UNTIL', () => {
     }
   });
 });
+
+describe('fixture documents the query and replay rules', () => {
+  it('pins them so both sides read the same contract', () => {
+    expect(vectors.queryPolicy).toContain('hmac_v2_query_not_allowed');
+    expect(vectors.replay).toContain('No nonce');
+  });
+});

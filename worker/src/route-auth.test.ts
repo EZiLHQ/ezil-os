@@ -3111,6 +3111,24 @@ describe('v2 signed envelope on the real route table', () => {
     expect(calls.terminateSandbox).toBe(1);
   });
 
+  it('a v2 request with ANY query string is refused (the query is not signed)', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const restart = async (query: string) => {
+      const token = await mintPreviewTokenV2(SECRET, claims({ sandboxId: SANDBOX_NAME }),
+        { method: 'POST', path: `/sandbox/${SANDBOX_NAME}/restart`, body: '{}' });
+      return worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart${query}`, {
+        method: 'POST', headers: { 'x-ezil-auth': token }, body: '{}',
+      }), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET });
+    };
+    for (const q of ['?desktopMode=guacamole', '?a=1', '?token=x']) {
+      const res = await restart(q);
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ ok: false, error: 'hmac_v2_query_not_allowed' });
+    }
+    expect(calls.restartDesktopStack).toHaveLength(0);
+    expect((await restart('')).status).not.toBe(401); // positive control: same token, no query
+  });
+
   it('a v2 token signed for another route is refused (path is bound)', async () => {
     const { binding, calls } = fakeSandboxNamespace({});
     const token = await mintPreviewTokenV2(SECRET, claims({ sandboxId: SANDBOX_NAME }),
@@ -3156,6 +3174,13 @@ describe('v2 signed envelope on the real route table', () => {
     expect(other.status).toBe(401);
     expect(await other.json()).toEqual({ ok: false, error: 'hmac_v2_scope_mismatch' });
     expect((await files(`${PROJECT}/branches/main/a.txt`)).status).not.toBe(401);
+  });
+
+  it('GET /health advertises the accepted token versions', async () => {
+    const health = async (extra: Record<string, unknown>) =>
+      (await (await worker.fetch(new Request('https://api-desktop.ezil.org/health'), { SANDBOX_HMAC_SECRET: SECRET, ...extra })).json()) as { previewTokenVersions?: string[] };
+    expect((await health({})).previewTokenVersions).toEqual(['v1', 'v2']);
+    expect((await health({ EZIL_PREVIEW_TOKEN_V1_UNTIL: '2000-01-01T00:00:00Z' })).previewTokenVersions).toEqual(['v2']);
   });
 
   describe('EZIL_PREVIEW_TOKEN_V1_UNTIL', () => {

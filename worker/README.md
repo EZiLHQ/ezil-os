@@ -71,6 +71,16 @@ over `${ts}.POST./sandbox/preview.`, verified against `SANDBOX_HMAC_SECRET` /
 When no secret is configured the Worker runs in local-dev mode and skips
 verification.
 
+**v2 signed envelope.** A request may instead carry `x-ezil-auth: v2.…`, which
+binds the method, pathname, body digest, sandbox, user, computer, provider,
+store, generation and lease epoch (contract C-5; vectors in
+`src/preview-token-v2.vectors.json`). A v2 request must have no query string,
+and v2 fails closed without a secret. There is no nonce, so a token is
+replayable for the same request within its 5-minute TTL. `GET /health` lists
+`previewTokenVersions`. Rollout: deploy this Worker first, then set the app's
+`EZIL_PREVIEW_TOKEN_V2=1`; do not set `EZIL_PREVIEW_TOKEN_V1_UNTIL` until every
+v1 minter is migrated (list and #166 resolution: `docs/AWS-COMPUTERS.md`, C-5).
+
 | Route | Credential |
 | --- | --- |
 | `GET /health` | none (read-only) |

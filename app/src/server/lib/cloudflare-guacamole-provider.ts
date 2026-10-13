@@ -183,9 +183,12 @@ function v2AuthHeader(
     url: string,
     body: string,
 ): Record<string, string> {
+    const target = new URL(url);
+    // The Worker refuses any query under v2 (it is not signed): never send one.
+    if (target.search !== '') throw new Error('v2 requests carry no query string');
     const token = mintPreviewTokenV2(hmacSecret, { ...auth.claims, ts: Date.now() }, {
         method,
-        path: new URL(url).pathname,
+        path: target.pathname,
         body,
     });
     return { [PREVIEW_TOKEN_V2_HEADER]: token };
