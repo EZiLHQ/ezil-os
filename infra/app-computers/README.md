@@ -321,19 +321,50 @@ Workload stacks are deployed with `aws cloudformation deploy --role-arn <exec ro
   test asserts no `BootstrapVersion`.
 - **Other stacks have no assets.** Foundation, ops and identity use `BootstraplessSynthesizer`.
 
-**Boundary.** It is attached to:
+**Namespaces.** A namespace is lowercase letters and digits only, with no `-`, so
+`ezil-<ns>-*` can never match another namespace's names. Reserved names are refused:
+`identity`, `operators`, `ops` and the other names in `RESERVED_NAMESPACES`. Without that rule,
+a namespace called `identity` would make the workload path equal `/ezil/identity/`. State
+machines must be named `ezil-<ns>-*`.
+
+**Boundary: an allowlist.** It is attached to:
 - the deploy role
 - the execution role
-- every workload role (an aspect puts them under `/ezil/<ns>/` with the boundary)
+- every workload role (an aspect puts them under `/ezil/<ns>/` with the boundary and tags every
+  resource `ezil:namespace=<ns>`)
 
-It denies:
-- any region but the configured one (global services exempt)
-- creating users and access keys, and removing a boundary
-- creating a role without this boundary
-- IAM writes outside `/ezil/<ns>/` (the identity objects sit in `/ezil/identity/`, so CI
-  cannot edit its own roles)
+It **allows** only:
+- `states`, `lambda`, `logs`, `sqs`, `events` and `cloudwatch`
+- a few `sns`, `secretsmanager`, `ecr` and change-set actions
+- IAM `Get*` and `List*`
+- a fixed EC2 list: network, launch template, and the lifecycle compute writes
+- a fixed KMS list, with no key deletion or disabling
+- the asset bucket
+- role writes under `/ezil/<ns>/`
+- `PassRole` on workload roles and the execution role
+
+It **denies**, explicitly:
+- any region but the configured one (`iam:*` is the only exemption left)
+- users, groups, MFA devices, login profiles, access keys and other credentials
+- boundary removal
+- role writes whose role lacks this boundary
+- attaching any managed policy except `AWSLambdaBasicExecutionRole`
+- every IAM policy write
+- `PassRole` or `sts:AssumeRole` outside the workload roles (plus the execution role for
+  `PassRole`)
+- OIDC and SAML provider writes
 - `DeleteVolume`, `DeleteSnapshot`, `DetachVolume` and `DeleteTags`
-- organizations, account and billing writes
+- the `ezil:backup` tag except at creation
+- `organizations:*`, and account and billing writes
+- route53, cloudfront and budgets writes
+- purchases and reservations
+
+A role **trust policy naming an external principal** cannot be blocked by a condition key: IAM
+exposes no key for the principals in `CreateRole` or `UpdateAssumeRolePolicy`. What contains
+it:
+- only the execution role can write roles, and only through reviewed templates
+- every such role is bounded, so the boundary still caps an outside principal that assumes it
+- the IAM snapshot test would show any new trust statement
 
 **Deploy role.** Its trust is `token.actions.githubusercontent.com` with
 `aud=sts.amazonaws.com` and the immutable-ID subject `...:environment:aws-pilot`. Sessions last
@@ -343,59 +374,116 @@ at most 1 h. It can only:
 - pass that one role to CloudFormation
 - read and write `assets/` and `templates/` in the bucket
 
-**Execution role.** It is scoped to exactly the resource types the workload stacks create. A
-test maps every type to its create action and fails on any unmapped type. It can create roles
-only under `/ezil/<ns>/`, only with the boundary. The exact action lists are a best effort:
-the first staging deploy will show any missing read action. Add each one deliberately; never
-widen to a service `*`.
+**Execution role.** It covers exactly the foundation, lifecycle and app-caller stacks; a test
+fails on any unmapped resource type.
+- EC2 network and launch-template creates need `aws:RequestTag/ezil:namespace=<ns>`.
+- Mutations of existing EC2 resources need the same `aws:ResourceTag`.
+- `CreateTags` is allowed only on create.
+- KMS `CreateKey` needs the namespace tag on the request, and the other key writes (including
+  `PutKeyPolicy`) need it on the key.
+- Logs, states, lambda, events, alarms, SQS and ECR are scoped to `ezil-<ns>-*` names.
+- Every role write that can carry `iam:PermissionsBoundary` requires this boundary.
+- It may attach, detach and list exactly `AWSLambdaBasicExecutionRole`, which CDK puts on
+  Lambda roles; a test resolves the managed ARNs in the template.
+- It holds **no** `dlm`, `budgets` or `sns` rights and no IAM policy writes.
+
+The exact action lists are a best effort; the first staging deploy will show any missing read
+action. Add each one deliberately, and never widen to a service `*`.
+
+### Escalation paths
+
+Every path below is blocked; the statement that blocks it is named.
+
+| Path | Blocked by |
+|---|---|
+| A namespace named `identity` puts workload writes on the boundary or the deploy/exec roles | `NamespaceSchema` (reserved names; `identityNames` also refuses) |
+| A namespace `pilot-prod` matches `ezil-pilot-*` | `NamespaceSchema` (no `-`) |
+| Exec, deploy or a workload role edits the boundary policy | `IamWritesOnlyUnderWorkloadPath`, and no policy writes in the allowlist |
+| Exec rewrites the deploy or exec role's trust or policies | `IamWritesOnlyUnderWorkloadPath` (both live in `/ezil/identity/`) |
+| Exec creates or edits a role without the boundary | `RolesCarryThisBoundary` (all keyed role writes) |
+| Exec attaches `AdministratorAccess` to a workload role | `OnlyLambdaBasicManagedPolicy`, plus the exec `ArnEquals iam:PolicyARN` |
+| Pass or assume any role outside the namespace | `PassOnlyWorkloadAndExecRoles`, `AssumeOnlyWorkloadRoles` |
+| Create a user or access key, or a new OIDC/SAML trust | `NoUsersGroupsKeysOrBoundaryRemoval`, `NoIdentityProviderWrites` |
+| CI weakens DLM retention, edits budgets, or detaches the kill switch | ops is founder-deployed; exec has no `dlm`, `budgets` or policy writes; `OnlyLambdaBasicManagedPolicy` blocks detaching anything else |
+| Tag a root disk or foreign volume `ezil:backup` to get or stop snapshots | `BackupTagOnlyAtCreation`; the controller deny list also covers `ezil:backup` |
+| Touch another namespace's or a non-EZiL VPC, key or launch template | exec `aws:ResourceTag/ezil:namespace` conditions |
+| Buy reservations, savings plans or spot capacity | `NoPurchasesOrReservations`, and not in the allowlist |
+| Work in another region | `RegionLock` |
 
 ## Founder bootstrap (run once, not by CI)
 
 **Identity.** The founder runs this once, with **their own administrator session**: an IAM
 Identity Center `AdministratorAccess` permission-set session with MFA, in the target account.
-Never the root user, and never a CI role. Every later deploy goes through the deploy role.
+Never the root user, and never a CI role. The same applies to the **ops stack**: DLM, budgets
+and the kill switch are founder change sets only, because they sit outside the boundary.
+
+**No prior deployment.** The foundation stack is now `ezil-<ns>-foundation` (it was
+`EzilAppComputers-<stage>`). The lead verified on 2026-10-13 that ap-south-1 is empty and that
+us-east-1 holds only the CI runner, so no deployed stack has the old name.
 
 ```sh
 aws sts get-caller-identity              # must NOT end in :root
 cd infra/app-computers && npm ci
-cp config/identity.example.json config/identity.pilot.json
+cp config/identity.example.json config/identity.pilot.json   # gitignored; never committed
 #   set accountId, deploySubject (repo:<org>@<orgId>/<repo>@<repoId>:environment:aws-pilot),
 #   assetBucketName, and the existing GitHub OIDC provider ARN
-# 1. The AWS-managed DLM role (once per account; used by the ops stack)
-aws dlm create-default-role --resource-type snapshot --region ap-south-1
-# 2. Synthesize offline and review the template
-EZIL_IDENTITY_CONFIG=config/identity.pilot.json npx cdk synth --strict --no-lookups --no-notices -q \
-  -o cdk.out/identity --app "npx tsx bin/identity.ts"
-# 3. Create, review, then execute the change set
-aws cloudformation deploy --region ap-south-1 --stack-name ezil-identity-pilot \
-  --template-file cdk.out/identity/ezil-identity-pilot.template.json \
-  --capabilities CAPABILITY_NAMED_IAM --no-execute-changeset
-aws cloudformation describe-change-set --region ap-south-1 --stack-name ezil-identity-pilot \
-  --change-set-name <name printed above>
-aws cloudformation execute-change-set --region ap-south-1 --stack-name ezil-identity-pilot \
-  --change-set-name <name printed above>
+# 1. Offline synth: the script unsets AWS_* credentials and blanks the config files
+EZIL_IDENTITY_CONFIG=config/identity.pilot.json npm run synth:identity
+# 2. Create the change set, review it, then execute it
+aws cloudformation create-change-set --region ap-south-1 --stack-name ezil-identity-pilot \
+  --change-set-name identity-1 --change-set-type CREATE --capabilities CAPABILITY_NAMED_IAM \
+  --template-body file://cdk.out/identity/ezil-identity-pilot.template.json
+aws cloudformation wait change-set-create-complete --region ap-south-1 \
+  --stack-name ezil-identity-pilot --change-set-name identity-1
+aws cloudformation describe-change-set --region ap-south-1 \
+  --stack-name ezil-identity-pilot --change-set-name identity-1     # review every resource
+aws cloudformation execute-change-set --region ap-south-1 \
+  --stack-name ezil-identity-pilot --change-set-name identity-1
 aws cloudformation update-termination-protection --region ap-south-1 \
   --stack-name ezil-identity-pilot --enable-termination-protection
 aws cloudformation describe-stacks --region ap-south-1 --stack-name ezil-identity-pilot \
   --query 'Stacks[0].Outputs'
+# 3. Ops (founder only): the AWS-managed DLM role if absent, then a reviewed change set
+aws iam get-role --role-name AWSDataLifecycleManagerDefaultRole >/dev/null 2>&1 \
+  || aws dlm create-default-role --resource-type snapshot --region ap-south-1
+cp config/ops.example.json config/ops.pilot.json && EZIL_OPS_CONFIG=config/ops.pilot.json npm run synth:ops
+#   then create-change-set / wait / describe / execute exactly as above, with
+#   stack ezil-pilot-ops, template cdk.out/ops/ezil-pilot-ops.template.json, CAPABILITY_NAMED_IAM
 ```
 
 **GitHub.** Create environment `aws-pilot` with required reviewers. Store the `DeployRoleArn`,
 `ExecRoleArn` and `AssetBucketName` outputs as environment *variables*; none of them is secret.
 
-**Workload deploys** (a future gated workflow, or the founder; not this round). They run as the
-deploy role, in order foundation → lifecycle → ops:
+**Required check.** Making the CI check required is a GitHub ruleset change, which is
+founder-only. `tools/triage.ts` `REQUIRED_CONTEXTS` mirrors the *live* ruleset and is compared
+with it, so it is updated only after the ruleset changes.
+
+**Workload deploys** (foundation, then lifecycle; a future gated workflow or the founder, not
+this round). They run as the deploy role, through a reviewed change set. Paths match the npm
+synth scripts:
 
 ```sh
-npx cdk publish-assets ezil-pilot-lifecycle --app "npx tsx bin/lifecycle.ts"   # EZIL_LIFECYCLE_CONFIG set
-aws cloudformation deploy --region ap-south-1 --stack-name ezil-pilot-lifecycle \
-  --template-file cdk.out/ezil-pilot-lifecycle.template.json --role-arn <ExecRoleArn> \
-  --s3-bucket <AssetBucketName> --s3-prefix templates --capabilities CAPABILITY_IAM
+EZIL_LIFECYCLE_CONFIG=config/lifecycle.pilot.json npm run synth:lifecycle
+EZIL_LIFECYCLE_CONFIG=config/lifecycle.pilot.json npx cdk publish-assets ezil-pilot-lifecycle \
+  --app cdk.out/lifecycle --no-lookups --no-notices          # Lambda zips -> s3://<bucket>/assets/
+aws s3 cp cdk.out/lifecycle/ezil-pilot-lifecycle.template.json \
+  s3://<AssetBucketName>/templates/ezil-pilot-lifecycle-<git-sha>.json
+aws cloudformation create-change-set --region ap-south-1 --stack-name ezil-pilot-lifecycle \
+  --change-set-name lifecycle-<git-sha> --change-set-type CREATE \
+  --template-url https://<AssetBucketName>.s3.ap-south-1.amazonaws.com/templates/ezil-pilot-lifecycle-<git-sha>.json \
+  --role-arn <ExecRoleArn> --capabilities CAPABILITY_IAM
+aws cloudformation wait change-set-create-complete --region ap-south-1 \
+  --stack-name ezil-pilot-lifecycle --change-set-name lifecycle-<git-sha>
+aws cloudformation describe-change-set --region ap-south-1 \
+  --stack-name ezil-pilot-lifecycle --change-set-name lifecycle-<git-sha>    # review
+aws cloudformation execute-change-set --region ap-south-1 \
+  --stack-name ezil-pilot-lifecycle --change-set-name lifecycle-<git-sha>
 ```
 
-The lifecycle template is over 51 kB, hence `--s3-bucket`. The foundation and ops stacks use the
-same command without `publish-assets`. Ops needs `CAPABILITY_NAMED_IAM`, for the named
-kill-switch policy.
+- Use `--change-set-type UPDATE` for later changes.
+- The lifecycle template is over 51 kB, so it goes through S3.
+- The foundation stack has no assets: it follows the same steps without `publish-assets`, with
+  `cdk.out/foundation/ezil-pilot-foundation.template.json`.
 
 ## Ops guardrails (I6)
 
@@ -427,11 +515,13 @@ kill-switch policy.
 
 ### Kill-switch drill (§4)
 
-The ops stack outputs a managed policy, `ezil-<ns>-kill-switch`. It denies:
-- `RunInstances`
-- `StartInstances`
-- `AttachVolume`
-- `states:StartExecution`
+The ops stack outputs a managed policy, `ezil-<ns>-kill-switch`, in `/ezil/operators/`.
+
+It is **authoritative only because the founder deploys and attaches it**: no bounded principal
+can create, change, attach or detach it. It denies:
+- `RunInstances`, `StartInstances`, `AttachVolume` and `CreateVolume`
+- `CreateFleet` and `RequestSpot*`
+- `states:StartExecution`, `StartSyncExecution` and `RedriveExecution`
 
 It never denies `StopInstances` and never touches storage. To run the drill:
 
