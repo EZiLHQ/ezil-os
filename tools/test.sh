@@ -456,6 +456,19 @@ run_local () {
 # downstream one. Same reasoning as the `connectors` job in ci.yml.
 ALL_PACKAGES=(sdk mcp worker app shell tools local)
 
+# infra/app-computers (AWS persistent computers). Not in ALL_PACKAGES yet: it
+# needs its own `npm ci` and no CI job runs it this wave (see its README).
+# Typecheck, unit + graph tests, and both CDK synths, all offline: the synth
+# scripts blank the AWS credential chain and never look anything up.
+run_infra () {
+    local dir="$TREE/infra/app-computers"
+    if [ ! -d "$dir/node_modules" ]; then
+        ( cd "$dir" && npm ci --no-audit --no-fund ) || return 1
+    fi
+    typecheck "$dir" npm run typecheck || return 1
+    ( cd "$dir" && npm test && npm run synth && npm run synth:lifecycle )
+}
+
 run_one () {
     local pkg="$1"; shift
     say "── ${pkg} ─────────────────────────────────────────────────────────"
@@ -467,6 +480,7 @@ run_one () {
         mcp)    run_mcp    "$@" ;;
         tools)  run_tools  "$@" ;;
         local)  run_local  "$@" ;;
+        infra)  run_infra  "$@" ;;
         *)      say "unknown package: $pkg"; return 64 ;;
     esac
 }

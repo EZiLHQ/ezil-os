@@ -1,0 +1,44 @@
+{
+  "settings": {
+    "deployment": {
+      "accountId": "123456789012",
+      "region": "ap-south-1",
+      "zoneId": "aps1-az1",
+      "subnetId": "subnet-00000000000000000",
+      "securityGroupId": "sg-00000000000000000",
+      "launchTemplateId": "lt-00000000000000000",
+      "launchTemplateVersion": "1",
+      "amiId": "ami-00000000000000000",
+      "namespace": "pilot",
+      "instanceTypes": [
+        "m6i.large",
+        "c6i.xlarge"
+      ],
+      "storage": {
+        "rootGiB": 20,
+        "dataMinGiB": 20,
+        "dataMaxGiB": 100
+      },
+      "dataKeyArn": "arn:aws:kms:ap-south-1:123456789012:key/00000000-0000-4000-8000-000000000000",
+      "stateMachineVersionArn": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-pilot:1"
+    },
+    "authorityOrigin": "https://control.example.com",
+    "authoritySecretArn": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/lifecycle-authority-AbCdEf"
+  },
+  "authorityKeyArn": "arn:aws:kms:ap-south-1:123456789012:key/00000000-0000-4000-8000-000000000001",
+  "notificationsEnabled": false,
+  "recoveryVersionArn": "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-recovery-pilot:1",
+  "recoveryEnabled": false,
+  "appCaller": {
+    "enabled": false,
+    "providers": [
+      {
+        "name": "github",
+        "providerArn": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com",
+        "issuerHost": "token.actions.githubusercontent.com",
+        "audience": "sts.amazonaws.com",
+        "subject": "repo:<org>@<orgId>/<repo>@<repoId>:environment:<env>"
+      }
+    ]
+  }
+}
