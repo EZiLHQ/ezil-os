@@ -365,10 +365,15 @@ def run_job(cfg, lease, root_fd):
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "EZIL_REBASE_DISABLE", "EZIL_REBASE_FAULT_AFTER")}
     env["PYTHONPATH"] = lib
     p = subprocess.run([sys.executable, "-m", "ezil_host.rebase", os.path.join(cfg.dataMount, "root/upper"),
-                        cfgmod.lower_dir(cfg, r["fromDigest"]), cfgmod.lower_dir(cfg, r["toDigest"])],
+                        # lowers live on the trusted root volume; resolve an operator symlink there
+                        os.path.realpath(cfgmod.lower_dir(cfg, r["fromDigest"])),
+                        os.path.realpath(cfgmod.lower_dir(cfg, r["toDigest"]))],
                        env=env, capture_output=True, text=True)
     if p.returncode != 0:
         state.update(state="rebase_failed", exitCode=p.returncode, stderr=p.stderr[-2000:])
+        os.makedirs(cfg.runDir, mode=0o700, exist_ok=True)
+        with open(os.path.join(cfg.runDir, "rebase-error.txt"), "w") as f:
+            f.write(p.stderr[-8000:])
         write_file_durable_at(root_fd, REBASE_STATE, (json.dumps(state) + "\n").encode(), 0o600)
         raise Refused("rebase_failed", f"exit {p.returncode}; restore snapshot {r['snapshotId']}")
     os.makedirs(cfg.runDir, mode=0o700, exist_ok=True)
