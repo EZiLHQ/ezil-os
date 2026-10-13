@@ -25,12 +25,23 @@ const fields = (value, keys, label) => {
 export function tokenize(sql) {
   const tokens = [];
   let i = 0;
+  // Match PostgreSQL's lexer: whitespace is [ \t\n\r\f\v] only (other Unicode
+  // spaces are identifier characters there), and `--` comments end at CR or LF.
+  // A lone CR is refused everywhere: PostgreSQL ends a comment at it, while an
+  // editor or reviewer may not render it as a line break.
+  const noLoneCR = j => check(sql[j] !== '\r' || sql[j + 1] === '\n', 'Lone carriage return is unsupported; use LF or CRLF line endings');
   while (i < sql.length) {
-    if (/\s/.test(sql[i])) { i++; continue; }
-    if (sql.startsWith('--', i)) { const end = sql.indexOf('\n', i); i = end < 0 ? sql.length : end + 1; continue; }
+    if (/[ \t\n\r\f\v]/.test(sql[i])) { noLoneCR(i); i++; continue; }
+    check(!/\s/.test(sql[i]), 'Only ASCII whitespace is supported outside quotes');
+    if (sql.startsWith('--', i)) {
+      const end = sql.slice(i).search(/[\r\n]/);
+      if (end < 0) { i = sql.length; continue; }
+      i += end; noLoneCR(i); i += sql[i] === '\r' ? 2 : 1; continue;
+    }
     if (sql.startsWith('/*', i)) {
       i += 2; let depth = 1;
       while (i < sql.length && depth) {
+        noLoneCR(i);
         if (sql.startsWith('/*', i)) { depth++; i += 2; }
         else if (sql.startsWith('*/', i)) { depth--; i += 2; }
         else i++;
@@ -44,7 +55,7 @@ export function tokenize(sql) {
         if (sql[i] === c) {
           if (sql[i + 1] === c) { value += c; i += 2; }
           else { i++; closed = true; break; }
-        } else { check(sql[i] !== '\\' && sql[i] !== '\0', 'SQL escape syntax is unsupported'); value += sql[i++]; }
+        } else { check(sql[i] !== '\\' && sql[i] !== '\0', 'SQL escape syntax is unsupported'); noLoneCR(i); value += sql[i++]; }
       }
       check(closed, 'Unterminated SQL quote');
       tokens.push({ kind: c === '"' ? 'identifier' : 'string', value }); continue;
@@ -70,7 +81,7 @@ export function additiveSQL(sql, schemas) {
   const is = value => ts[i]?.value === value && ts[i]?.kind !== 'identifier' && ts[i]?.kind !== 'string';
   const take = value => { check(is(value), `Unsupported additive SQL: expected ${value}`); i++; };
   const ident = () => { const t = ts[i++]; check(t && ['word', 'identifier'].includes(t.kind) && t.value.length > 0, 'Expected SQL identifier'); return t.value; };
-  const qualified = () => { const schema = ident(); check(schemas.includes(schema), 'SQL target is outside owned schemas'); take('.'); ident(); };
+  const qualified = () => { const schema = ident(); check(schemas.includes(schema), 'SQL target is outside owned schemas'); take('.'); return ident(); };
   const functionArgs = () => {
     take('(');
     if (!is(')')) {
@@ -114,11 +125,13 @@ export function additiveSQL(sql, schemas) {
   const plainName = label => { check(!(ts[i]?.kind === 'word' && bareKeywords.has(ts[i].value)), `Reserved word as ${label}; quote it`); return ident(); };
   const indexColumns = () => { take('('); plainName('index column'); while (is(',')) { take(','); plainName('index column'); } take(')'); };
   // Partial UNIQUE predicate: AND-joined `col IS [NOT] NULL` / `col = literal`
-  // terms only. No OR, NOT, parentheses, operators, casts, calls or columns of
-  // other tables; PostgreSQL resolves each column against the indexed table.
-  const predicate = () => {
+  // terms only. No OR, NOT, parentheses, operators, casts or calls. A name is
+  // resolved by PostgreSQL against the indexed table only, and a name equal to
+  // that table's own name (its only range-variable alias here) is a WHOLE-ROW
+  // reference, not a column: `WHERE x IS NULL` on table x tests the row.
+  const predicate = table => {
     for (;;) {
-      plainName('predicate column');
+      check(plainName('predicate column') !== table, 'Partial index predicate names the table itself (a whole-row reference), not a column');
       check(is('is') || is('='), 'Partial index predicate allows only IS [NOT] NULL or = literal');
       if (is('is')) { take('is'); if (is('not')) take('not'); take('null'); }
       else {
@@ -136,8 +149,8 @@ export function additiveSQL(sql, schemas) {
         take('table'); qualified(); take('('); column();
         while (is(',')) { take(','); column(); } take(')');
       } else if (is('unique')) {
-        take('unique'); take('index'); plainName('index name'); take('on'); qualified(); indexColumns();
-        if (is('where')) { take('where'); predicate(); }
+        take('unique'); take('index'); plainName('index name'); take('on'); const table = qualified(); indexColumns();
+        if (is('where')) { take('where'); predicate(table); }
       } else {
         take('index'); plainName('index name'); take('on'); qualified(); indexColumns();
         check(!is('where'), 'Partial indexes must be UNIQUE');

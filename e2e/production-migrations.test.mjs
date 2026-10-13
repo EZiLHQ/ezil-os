@@ -427,6 +427,13 @@ test(`transaction protocol (${process.env.PRODUCTION_MIGRATIONS_DOCKER === '1' ?
       assert.equal((await state()).digest, before.digest, 'Rollback restores the fingerprint');
     }
   });
+  await t.test('F9 a predicate naming the indexed table is a whole-row test in PostgreSQL, so the grammar refuses it', async () => {
+    await db.exec('ROLLBACK; DROP SCHEMA IF EXISTS ezil_ci CASCADE; DROP SCHEMA IF EXISTS app CASCADE; CREATE SCHEMA app; CREATE TABLE app.x (id integer, state text);');
+    const sql = 'CREATE UNIQUE INDEX x_row_key ON app.x (id) WHERE x IS NULL';
+    const [row] = await db.rolledBackRows(sql, "SELECT pg_get_indexdef('app.x_row_key'::regclass) def");
+    assert.match(row.def, /WHERE \(x\.\* IS NULL\)|WHERE \(x IS NULL\)/, 'PostgreSQL accepts it as a row-valued predicate');
+    assert.throws(() => additiveSQL(sql, ['app']), /names the table itself/);
+  });
   await t.test('F9 catalog fingerprint detects uniqueness, partial predicates and their removal', async () => {
     await db.exec('ROLLBACK; DROP SCHEMA IF EXISTS ezil_ci CASCADE; DROP SCHEMA IF EXISTS app CASCADE; CREATE SCHEMA app; CREATE TABLE app.p (owner uuid, state text); CREATE INDEX p_owner ON app.p (owner);');
     const plain = (await state()).digest;
