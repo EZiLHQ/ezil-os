@@ -33,6 +33,8 @@ DEFAULTS = {
              "flushTimeoutSeconds": 120},
     "shutdownCmd": ["/usr/sbin/shutdown", "-h", "now"],
     "stopWarnSeconds": 60,
+    # cloud-init's cached copies of user data (they hold the nonce); wiped after use
+    "userDataCopies": ["/var/lib/cloud/instance/user-data.txt", "/var/lib/cloud/instance/user-data.txt.i"],
 }
 
 

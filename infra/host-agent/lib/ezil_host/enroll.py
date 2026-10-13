@@ -80,6 +80,8 @@ def wipe_nonce(cfg, lease):
     lease.pop("nonce", None)
     lease["nonceConsumed"] = True
     _write_private(os.path.join(cfg.runDir, "lease.json"), json.dumps(lease).encode())
+    for copy in cfg.get("userDataCopies") or []:
+        wipe(copy)
     return lease
 
 

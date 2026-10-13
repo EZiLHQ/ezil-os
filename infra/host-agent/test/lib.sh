@@ -48,7 +48,7 @@ host_new() {
     local h="$1" lowers="${2:-}" H="$T/hosts/$1"
     if findmnt -rn -o TARGET | grep -q "^$H/"; then log "host $h still has mounts; refusing to reset"; return 1; fi
     rm -rf "$H"
-    mkdir -p "$H"/{etc,state,run,byid,stub,srv}
+    mkdir -p "$H"/{etc,state,run,byid,stub,srv,cloud}
     chmod 700 "$H/state"
     [ -n "$lowers" ] || lowers="$H/lowers"
     echo "$DIGEST" > "$H/etc/lower-image-digest"
@@ -63,7 +63,8 @@ host_new() {
  "cloudflaredBin": "$H/stub/cloudflared", "containerId": "${TAG}-$h", "netnsName": "${TAG}-$h",
  "cgroupsPath": "system.slice:${TAG}:$h", "networkMode": "none",
  "idle": {"inactivitySeconds": 3, "load1Busy": 1000, "intervalSeconds": 1, "flushTimeoutSeconds": 20},
- "shutdownCmd": ["$HA/test/stub-shutdown", "$H/run/shutdown-called"], "stopWarnSeconds": 1}
+ "shutdownCmd": ["$HA/test/stub-shutdown", "$H/run/shutdown-called"], "stopWarnSeconds": 1,
+ "userDataCopies": ["$H/cloud/user-data.txt"]}
 EOF
     printf '#!/bin/sh\nSTUB_CF_DIR=%s exec %s "$@"\n' "$H/stub" "$HA/test/stub-cloudflared" > "$H/stub/cloudflared"
     chmod 755 "$H/stub/cloudflared"

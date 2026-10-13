@@ -24,6 +24,7 @@ agent e data-down >/dev/null
 
 # --- successful enrollment (new epoch, new nonce)
 userdata e 1 2 false; agent e lease >/dev/null; agent e guard >/dev/null; : > "$H/stub/enroll-requests.jsonl"
+cp "$H/stub/user-data" "$H/cloud/user-data.txt"      # what cloud-init would have cached
 check "enroll succeeds over verified TLS (test CA, SNI app.ezil.test)" agent e enroll
 REQ="$(tail -n 1 "$H/stub/enroll-requests.jsonl")"
 check "request = {computerId, generation, leaseEpoch, nonce, identityDocument, signature}" \
@@ -31,6 +32,7 @@ check "request = {computerId, generation, leaseEpoch, nonce, identityDocument, s
 TOKEN="$(jq -r .tunnelToken "$H/stub/issue.json")"
 check "token stored host-only: state dir 0700, file 0600, bound to (gen 1, epoch 2)" bash -c "[ \$(stat -c %a '$H/state') = 700 ] && [ \$(stat -c %a '$H/state/tunnel.json') = 600 ] && jq -e '.generation==1 and .leaseEpoch==2' '$H/state/tunnel.json'"
 check "token appears nowhere on the data volume" bash -c "! grep -rqs -- '$TOKEN' '$D'"
+check "cloud-init's cached user-data copy (holds the nonce) wiped" test ! -e "$H/cloud/user-data.txt"
 check "nonce wiped from local lease state after use" jq -e '(has("nonce")|not) and .nonceConsumed' "$H/run/lease.json"
 tls_probe() { python3 -c "
 import sys; sys.path.insert(0, '$HA/lib')
