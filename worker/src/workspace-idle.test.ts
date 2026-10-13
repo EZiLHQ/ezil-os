@@ -620,7 +620,8 @@ describe('flushWorkspaceScheduled: ordering and guards', () => {
     // A failed FINAL system-layer checkpoint (installs outside /workspace) also retries.
     // So is a container that never held the hydrated workspace (replaced for an image
     // rollout): found on staging, where it retried forever and never stopped.
-    expect(idleBranch).toContain("if ((outcome.ok || outcome.skippedReason === 'too_large' || outcome.skippedReason === 'container_not_hydrated')\n          && !outcome.systemCheckpointFailed) {");
+    // A migrated head (C-7) is fenced: nothing on Cloudflare can be saved, so it may stop.
+    expect(idleBranch).toContain("if ((outcome.ok || outcome.skippedReason === 'too_large' || outcome.skippedReason === 'container_not_hydrated'\n          || outcome.skippedReason === 'migrated')\n          && !outcome.systemCheckpointFailed) {");
     // The idle-stop FINAL flush is never rate-limited (no allowDefer here).
     expect(idleBranch).not.toContain('allowDefer');
     // The failure path must reschedule (retry) rather than fall through to a
@@ -762,14 +763,15 @@ describe('explicit-terminate semantics still hold exactly as before', () => {
     const method = between('private async terminateSandboxWithCheckpoint(retainPreviewAuthorization = false): Promise<TerminateReport> {', 'await this.cancelWorkspaceFlushLoop();');
     expect(method).toContain('this.systemFinalNext = true;');
     expect(method).toContain("if (checkpoint?.systemCheckpointFailed) {");
-    expect(method).toContain("if (checkpoint?.skippedReason === 'too_large' || checkpoint?.skippedReason === 'container_not_hydrated') {");
+    expect(method).toContain("if (checkpoint?.skippedReason === 'too_large' || checkpoint?.skippedReason === 'container_not_hydrated'\n          || checkpoint?.skippedReason === 'migrated') {");
     expect(method).toContain("error: 'system_checkpoint_failed'");
   });
 
-  it('a final flush marks systemCheckpointFailed only for a failed system checkpoint, and still runs it for an oversized workspace', () => {
+  // Behaviour (busy/stale/not_restored block exactly like failed) is executed in workspace-stop-fence.test.ts.
+  it('a final flush marks systemCheckpointFailed for a system checkpoint that saved nothing, and still runs it for an oversized workspace', () => {
     const flush = between('private async runWorkspaceFlush(', '\n  /**\n   * The system layer');
     expect(flush).toContain("if ((outcome.ok || outcome.skippedReason === 'too_large') && systemMode !== 'skip') {");
-    expect(flush).toContain("if (systemMode === 'final' && system?.skippedReason === 'failed') outcome.systemCheckpointFailed = true;");
+    expect(flush).toContain("if (systemMode === 'final' && system && finalSystemCheckpointBlocksStop(system)) outcome.systemCheckpointFailed = true;");
     // A throw inside the system flush is a failure, not "nothing to do".
     const sys = between('private async runSystemFlush(', '/** Superseded checkpoint generations');
     expect(sys).toContain("return { ok: false, uploaded: 0, entries: 0, skippedReason: 'failed' };");

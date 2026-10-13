@@ -79,7 +79,9 @@ export interface FlushOutcome {
    * 'too_large': the workspace exceeds the snapshot limits (512 MiB / 100,000
    * entries). Permanent; callers must not wait for it to succeed.
    */
-  skippedReason?: 'hydration_incomplete' | 'container_not_hydrated' | 'empty_prefix' | 'flush_threw' | 'deferred' | 'too_large';
+  skippedReason?: 'hydration_incomplete' | 'container_not_hydrated' | 'empty_prefix' | 'flush_threw' | 'deferred' | 'too_large'
+    /** The head is the terminal `migrated` marker (C-7): this computer moved; Cloudflare never writes it again. */
+    | 'migrated';
   heartbeatWritten: boolean;
   checkpoint?: string;
 }
@@ -155,12 +157,89 @@ export async function readBounded(body: HydrateR2ObjectBodyLike, limit: number):
   if (bytes.length > limit) throw new Error('snapshot object too large');
   return bytes;
 }
+// ── Terminal `migrated` head (docs/AWS-COMPUTERS.md C-7) ──────────────────
+//
+// Written by compare-and-swap OVER the last committed snapshot head when a
+// computer's state has been exported to another provider. Version 2, so a
+// Worker without this code also refuses it (`parseSnapshot` requires 1). It
+// keeps the exported snapshot addressable (generation, chunk generations,
+// sha256) for the rollback window; GC keeps those chunks (it never deletes
+// under a migrated head). No Cloudflare flush may replace it: `readHead`
+// throws `WorkspaceMigratedError`, and a flush that read the old head before
+// the marker landed loses the etag CAS.
+export const MIGRATED_HEAD_VERSION = 2;
+export const MIGRATION_TARGETS = ['aws-ec2', 'cloudflare'] as const;
+export type MigrationTarget = (typeof MIGRATION_TARGETS)[number];
+export interface MigratedHead {
+  version: 2;
+  kind: 'migrated';
+  targetProvider: MigrationTarget;
+  migratedAt: string;
+  /** The exported snapshot, still addressable. */
+  exported: { generation: string; chunkGeneration: string; previousChunkGeneration?: string; sha256: string; entries: number };
+}
+/** Marker under a prefix while an export runs: garbage collection is suspended. Outside the chunk-key pattern. */
+export const MIGRATING_FLAG = '.ezil-snapshots/migrating.json';
+export class WorkspaceMigratedError extends Error {
+  constructor(readonly head: MigratedHead) { super('workspace migrated'); }
+}
+export function parseMigratedHead(raw: string): MigratedHead | null {
+  let m: MigratedHead;
+  try { m = JSON.parse(raw) as MigratedHead; } catch { return null; }
+  if (!m || m.version !== MIGRATED_HEAD_VERSION || m.kind !== 'migrated') return null;
+  const e = m.exported;
+  if (!(MIGRATION_TARGETS as readonly unknown[]).includes(m.targetProvider) || typeof m.migratedAt !== 'string'
+    || !Number.isFinite(Date.parse(m.migratedAt)) || !e || !GENERATION.test(e.generation) || !GENERATION.test(e.chunkGeneration)
+    || (e.previousChunkGeneration !== undefined && !GENERATION.test(e.previousChunkGeneration))
+    || !HASH.test(e.sha256) || !Number.isInteger(e.entries) || e.entries < 0 || e.entries > MAX_ENTRIES) {
+    throw new Error('invalid migrated head');
+  }
+  return m;
+}
 export async function readHead(bucket: Pick<HydrateR2BucketLike, 'get'>, prefix: string) {
   const body = await bucket.get(`${prefix}/${SNAPSHOT_HEAD}`);
   if (!body) return null;
-  const snapshot = parseSnapshot(new TextDecoder().decode(await readBounded(body, 128 * 1024)));
+  const raw = new TextDecoder().decode(await readBounded(body, 128 * 1024));
+  const migrated = parseMigratedHead(raw);
+  if (migrated) throw new WorkspaceMigratedError(migrated);
+  const snapshot = parseSnapshot(raw);
   if (!body.etag) throw new Error('snapshot manifest etag missing');
   return { snapshot, etag: body.etag };
+}
+
+/** The migrated marker under `prefix`, or null when the head is absent or an ordinary snapshot. */
+export async function readMigratedHead(bucket: Pick<HydrateR2BucketLike, 'get'>, prefix: string): Promise<MigratedHead | null> {
+  try { await readHead(bucket, prefix); return null; }
+  catch (err) { if (err instanceof WorkspaceMigratedError) return err.head; throw err; }
+}
+
+/**
+ * Replace the committed snapshot head with the terminal `migrated` marker, by
+ * compare-and-swap on the head etag the export read. Refuses when the head
+ * moved since (a late Cloudflare checkpoint landed: export again), when there
+ * is no head, or when it is already migrated.
+ */
+export async function writeMigratedHead(deps: {
+  bucket: FlushR2BucketLike; realPrefix: string; targetProvider: MigrationTarget; expectedEtag: string; now?: Date;
+}): Promise<{ ok: true; head: MigratedHead } | { ok: false; reason: 'no_head' | 'already_migrated' | 'head_moved' | 'invalid' }> {
+  const { bucket, realPrefix: prefix } = deps;
+  if (!validPrefix(prefix) || !(MIGRATION_TARGETS as readonly unknown[]).includes(deps.targetProvider) || !deps.expectedEtag) {
+    return { ok: false, reason: 'invalid' };
+  }
+  let current: Awaited<ReturnType<typeof readHead>>;
+  try { current = await readHead(bucket, prefix); }
+  catch (err) { if (err instanceof WorkspaceMigratedError) return { ok: false, reason: 'already_migrated' }; throw err; }
+  if (!current) return { ok: false, reason: 'no_head' };
+  if (current.etag !== deps.expectedEtag) return { ok: false, reason: 'head_moved' };
+  const s = current.snapshot;
+  const head: MigratedHead = {
+    version: MIGRATED_HEAD_VERSION, kind: 'migrated', targetProvider: deps.targetProvider,
+    migratedAt: (deps.now ?? new Date()).toISOString(),
+    exported: { generation: s.generation, chunkGeneration: s.chunkGeneration ?? s.generation,
+      ...(s.previousChunkGeneration ? { previousChunkGeneration: s.previousChunkGeneration } : {}), sha256: s.sha256, entries: s.entries },
+  };
+  const put = await bucket.put(`${prefix}/${SNAPSHOT_HEAD}`, encoder.encode(JSON.stringify(head)), { onlyIf: { etagMatches: current.etag } });
+  return put ? { ok: true, head } : { ok: false, reason: 'head_moved' };
 }
 class SnapshotTooLargeError extends Error {}
 class WorkspaceNotHydratedError extends Error {}
@@ -253,6 +332,12 @@ export async function flushWorkspaceToR2(deps: FlushDeps): Promise<FlushOutcome>
       outcome.heartbeatWritten = !!await bucket.put(`${prefix}/${WORKSPACE_HEARTBEAT_FILENAME}`, encoder.encode(new Date().toISOString()));
     } catch { log('[workspace-persist] heartbeat failed after committed checkpoint'); }
   } catch (err) {
+    if (err instanceof WorkspaceMigratedError) {
+      // Terminal: the computer's state was exported; nothing Cloudflare holds may replace it.
+      log('[workspace-persist] workspace head is migrated; Cloudflare checkpoint refused');
+      outcome.skippedReason = 'migrated';
+      return outcome; // `finally` still removes the staging directory
+    }
     if (err instanceof SnapshotTooLargeError) outcome.skippedReason = 'too_large';
     if (err instanceof WorkspaceNotHydratedError) {
       // E.g. Cloudflare replaced the container for an image rollout: the new one never
@@ -426,7 +511,11 @@ export interface GcR2BucketLike {
   }>;
   delete(keys: string[]): Promise<unknown>;
 }
-export interface GcOutcome { ok: boolean; deletedGenerations: number; deletedObjects: number; keptRecent: number }
+export interface GcOutcome {
+  ok: boolean; deletedGenerations: number; deletedObjects: number; keptRecent: number;
+  /** GC did not run: an export is in progress (`MIGRATING_FLAG`) or the head is the migrated marker. */
+  suspended?: 'migrating' | 'migrated';
+}
 /** A generation must be at least this old before it may be deleted: an uncommitted writer may still be uploading it. */
 export const SNAPSHOT_GC_GRACE_MS = 60 * 60_000;
 const GC_MAX_OBJECTS = 20_000;
@@ -440,12 +529,22 @@ const CHUNK_KEY = /^\.ezil-snapshots\/([a-f0-9-]{36})\/(\d+)$/;
  */
 export async function collectSupersededSnapshots(deps: {
   bucket: GcR2BucketLike; realPrefix: string; log: (message: string) => void; now?: number; graceMs?: number;
+  /** Prefixes whose `MIGRATING_FLAG` suspends this run (default: this prefix). */
+  fencePrefixes?: string[];
 }): Promise<GcOutcome> {
   const { bucket, realPrefix: prefix, log } = deps;
   const outcome: GcOutcome = { ok: false, deletedGenerations: 0, deletedObjects: 0, keptRecent: 0 };
   if (!validPrefix(prefix)) return outcome;
+  const fences = [...new Set([prefix, ...(deps.fencePrefixes ?? [])])];
+  const migrating = async () => {
+    for (const p of fences) if (await bucket.get(`${p}/${MIGRATING_FLAG}`)) return true;
+    return false;
+  };
   try {
-    const head = await readHead(bucket, prefix);
+    if (await migrating()) { log('[workspace-persist] export in progress; garbage collection suspended'); return { ...outcome, ok: true, suspended: 'migrating' }; }
+    let head: Awaited<ReturnType<typeof readHead>>;
+    try { head = await readHead(bucket, prefix); }
+    catch (err) { if (err instanceof WorkspaceMigratedError) return { ...outcome, ok: true, suspended: 'migrated' }; throw err; }
     if (!head) return { ...outcome, ok: true };
     const keep = new Set([head.snapshot.chunkGeneration ?? head.snapshot.generation, head.snapshot.previousChunkGeneration]
       .filter((g): g is string => !!g));
@@ -470,6 +569,8 @@ export async function collectSupersededSnapshots(deps: {
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
     if ((await readHead(bucket, prefix))?.etag !== head.etag) throw new Error('workspace checkpoint changed');
+    // Re-checked right before deleting: an export may have started during the listing.
+    if (await migrating()) { log('[workspace-persist] export in progress; garbage collection suspended'); return { ...outcome, ok: true, suspended: 'migrating' }; }
     for (const g of generations.values()) {
       if (g.recent) { outcome.keptRecent++; continue; }
       for (let i = 0; i < g.keys.length; i += 1000) await bucket.delete(g.keys.slice(i, i + 1000));

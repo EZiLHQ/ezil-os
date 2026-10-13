@@ -509,6 +509,13 @@ import {
   type FlushOutcome,
   type FlushManifest,
   collectSupersededSnapshots,
+  readHead,
+  readMigratedHead,
+  writeMigratedHead,
+  WorkspaceMigratedError,
+  MIGRATING_FLAG,
+  MIGRATION_TARGETS,
+  type MigrationTarget,
   type FlushR2BucketLike,
   type GcR2BucketLike,
 } from './workspace-persist';
@@ -1724,6 +1731,20 @@ async function ensureWorkspaceHydratedFromR2(
   };
 }
 
+/**
+ * A FINAL system-layer checkpoint that did not save the user's changes outside
+ * /workspace keeps the computer up (idle-stop retries; teardown refuses):
+ * 'failed', and also 'busy' (package manager running), 'stale' (another
+ * writer's head) and 'not_restored' (this container never restored the
+ * layer). Only outcomes that have nothing to save let it stop: ok,
+ * no_computer, no_baseline, no_manifest, too_large (permanent; the last
+ * committed layer stays authoritative) and migrated (fenced, C-7).
+ */
+export function finalSystemCheckpointBlocksStop(system: SystemFlushOutcome): boolean {
+  return system.skippedReason === 'failed' || system.skippedReason === 'busy'
+    || system.skippedReason === 'stale' || system.skippedReason === 'not_restored';
+}
+
 // ── Durable Object storage keys (EzilSandboxDO) ──────────────────────────────
 const WORKSPACE_FLUSH_CONTEXT_KEY = 'ezil:workspaceFlushContext';
 const WORKSPACE_HYDRATED_KEY = 'ezil:workspaceHydrated';
@@ -1856,6 +1877,14 @@ const WORKSPACE_LAST_UPLOAD_AT_KEY = 'ezil:workspaceLastUploadAt';
 const MIN_CHANGED_CHECKPOINT_MS = 60_000;
 /** When superseded checkpoint generations were last collected. */
 const WORKSPACE_LAST_GC_AT_KEY = 'ezil:workspaceLastGcAt';
+/**
+ * Whether this computer's LAST definitive workspace / system checkpoint was
+ * over the snapshot caps (512 MiB / 100,000 entries). Then the committed head
+ * is older than the live state, and exporting it would silently truncate:
+ * migration export is refused while either is true (C-7).
+ */
+const WORKSPACE_TOO_LARGE_KEY = 'ezil:workspaceTooLarge';
+const SYSTEM_TOO_LARGE_KEY = 'ezil:systemTooLarge';
 /** When the system layer (changes outside /workspace) was last captured. */
 const SYSTEM_LAST_FLUSH_AT_KEY = 'ezil:systemLastFlushAt';
 const SYSTEM_FLUSH_INTERVAL_MS = 5 * 60_000;
@@ -2553,6 +2582,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
             && !await store.store.get(`${realR2KeyPrefix(params.prefix)}/${SNAPSHOT_HEAD}`)) {
           return { mounted: false, detail: 'workspace_store_head_missing' };
         }
+        // C-7: a migrated computer is never restored on Cloudflare again.
+        if (store.store && await readMigratedHead(store.store, realR2KeyPrefix(params.prefix))) {
+          return { mounted: false, detail: 'workspace_migrated' };
+        }
         const result = await ensureWorkspaceHydratedFromR2(this, store.store, params.mountPath, params.prefix);
         if (!result.mounted) return result;
         if (store.kind === 'r2') await this.pinWorkspaceStore('r2');
@@ -2711,6 +2744,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     if (outcome.ok && outcome.uploaded.length > 0) await this.ctx.storage.put(WORKSPACE_LAST_UPLOAD_AT_KEY, Date.now());
     // A committed checkpoint proves this computer's head lives in this store.
     if (outcome.ok && !store.pinned) await this.pinWorkspaceStore(store.kind);
+    if (outcome.ok || outcome.skippedReason === 'too_large') {
+      await this.ctx.storage.put(WORKSPACE_TOO_LARGE_KEY, outcome.skippedReason === 'too_large');
+    }
     this.lastOkCheckpoint = outcome.ok ? { at: Date.now(), outcome } : null;
     // The running container lost the hydrated workspace (replaced under us): stop
     // claiming it is hydrated, so status and the next open re-hydrate from the head.
@@ -2725,7 +2761,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       const system = await this.runSystemFlush(bucket, wctx.prefix, systemMode === 'final');
       // A FINAL checkpoint that failed must not let idle-stop / teardown discard
       // the container: they refuse and retry, exactly as for the workspace.
-      if (systemMode === 'final' && system?.skippedReason === 'failed') outcome.systemCheckpointFailed = true;
+      if (systemMode === 'final' && system && finalSystemCheckpointBlocksStop(system)) outcome.systemCheckpointFailed = true;
     }
     if (outcome.ok) await this.collectSnapshotGarbage(bucket, wctx.prefix);
     return outcome;
@@ -2746,6 +2782,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         log: (message) => console.error(`[system_flush] ${message}`) });
       if (system.ok || system.skippedReason === 'no_baseline' || system.skippedReason === 'busy') {
         await this.ctx.storage.put(SYSTEM_LAST_FLUSH_AT_KEY, Date.now());
+      }
+      if (system.ok || system.skippedReason === 'too_large') {
+        await this.ctx.storage.put(SYSTEM_TOO_LARGE_KEY, system.skippedReason === 'too_large');
       }
       bootLog('system_flush', 'end', { status: system.ok ? 'ok' : system.skippedReason === 'failed' ? 'error' : 'skipped', phaseMs: Date.now() - t0,
         detail: `uploaded=${system.uploaded},entries=${system.entries}${system.unchanged ? ',unchanged' : ''}${system.skippedReason ? `,reason=${system.skippedReason}` : ''}` });
@@ -2769,7 +2808,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       });
       const systemPrefix = systemPrefixOf(prefix);
       if (systemPrefix) {
-        await collectSupersededSnapshots({ bucket: bucket as GcR2BucketLike, realPrefix: systemPrefix,
+        await collectSupersededSnapshots({ bucket: bucket as GcR2BucketLike, realPrefix: systemPrefix, fencePrefixes: [prefix],
           log: (message) => console.error(`[system_gc] ${message}`) });
       }
       bootLog('workspace_gc', 'end', { status: gc.ok ? 'ok' : 'error',
@@ -3014,7 +3053,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // permanent: stay up and retry, like a failed workspace flush.
       // 'container_not_hydrated': the running container provably never held the user's
       // workspace (replaced for an image rollout) — nothing to save, retrying cannot help.
-      if ((outcome.ok || outcome.skippedReason === 'too_large' || outcome.skippedReason === 'container_not_hydrated')
+      // 'migrated': the head is the terminal C-7 marker; this container's state is fenced
+      // off and can never be checkpointed again, so staying up would only bill.
+      if ((outcome.ok || outcome.skippedReason === 'too_large' || outcome.skippedReason === 'container_not_hydrated'
+          || outcome.skippedReason === 'migrated')
           && !outcome.systemCheckpointFailed) {
         // A real input heartbeat may arrive during the checkpoint's R2 I/O.
         // Keep that newly active desktop up and checkpoint again next cycle.
@@ -3096,6 +3138,93 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     await this.ctx.storage.put(WORKSPACE_FLUSH_LAST_SEEN_ACTIVITY_AT_KEY, lastActivityAtAtCycleStart);
     await this.ctx.storage.put(WORKSPACE_FLUSH_BACKOFF_SECONDS_KEY, nextSeconds);
     return nextSeconds;
+  }
+
+  // ── Migration export (C-7). Operator tooling (M1) drives these; no route yet. ──
+
+  /**
+   * Start exporting this computer: take a final checkpoint of a running
+   * container, REFUSE when the workspace or system layer is over the caps
+   * (the committed head would be stale: exporting it would truncate), then
+   * raise the migrating flag (suspends GC on both prefixes) and return the
+   * heads the export must copy and later commit against.
+   */
+  async beginMigrationExport(): Promise<
+    | { ok: true; store: WorkspaceStoreKind; prefix: string; head: { generation: string; chunkGeneration: string; sha256: string; entries: number; chunks: number; etag: string }; systemEtag: string | null }
+    | { ok: false; reason: string }
+  > {
+    return this.withWorkspacePersistence(async () => {
+      const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
+      if (!wctx) return { ok: false as const, reason: 'no_context' };
+      const store = await this.selectWorkspaceStore();
+      if (!store.ok || !store.store) return { ok: false as const, reason: 'store_unavailable' };
+      const bucket = store.store as unknown as FlushR2BucketLike;
+      if (this.containerIsRunning()) {
+        this.systemFinalNext = true;
+        const outcome = await this.runWorkspaceFlush('explicit');
+        if (outcome.skippedReason === 'too_large') return { ok: false as const, reason: 'workspace_too_large' };
+        if (outcome.skippedReason === 'migrated') return { ok: false as const, reason: 'already_migrated' };
+        if (!outcome.ok || outcome.systemCheckpointFailed) return { ok: false as const, reason: 'final_checkpoint_failed' };
+      }
+      if (await this.ctx.storage.get<boolean>(WORKSPACE_TOO_LARGE_KEY)) return { ok: false as const, reason: 'workspace_too_large' };
+      if (await this.ctx.storage.get<boolean>(SYSTEM_TOO_LARGE_KEY)) return { ok: false as const, reason: 'system_too_large' };
+      let head: Awaited<ReturnType<typeof readHead>>;
+      let systemHead: Awaited<ReturnType<typeof readHead>> = null;
+      try {
+        head = await readHead(bucket, wctx.prefix);
+        const sp = systemPrefixOf(wctx.prefix);
+        if (sp) systemHead = await readHead(bucket, sp);
+      } catch (err) {
+        return { ok: false as const, reason: err instanceof WorkspaceMigratedError ? 'already_migrated' : 'head_unreadable' };
+      }
+      if (!head) return { ok: false as const, reason: 'no_checkpoint' };
+      const flag = new TextEncoder().encode(JSON.stringify({ startedAt: new Date().toISOString(), headEtag: head.etag }));
+      if (!await bucket.put(`${wctx.prefix}/${MIGRATING_FLAG}`, flag)) return { ok: false as const, reason: 'flag_write_failed' };
+      const s = head.snapshot;
+      return {
+        ok: true as const, store: store.kind, prefix: wctx.prefix, systemEtag: systemHead?.etag ?? null,
+        head: { generation: s.generation, chunkGeneration: s.chunkGeneration ?? s.generation, sha256: s.sha256,
+          entries: s.entries, chunks: s.chunks.length, etag: head.etag },
+      };
+    });
+  }
+
+  /**
+   * Make the export terminal: CAS the `migrated` marker over the exported
+   * workspace head (refused if any checkpoint landed since), then over the
+   * system head the export read. Every later Cloudflare flush is refused.
+   */
+  async commitMigration(params: { targetProvider: MigrationTarget; expectedEtag: string; expectedSystemEtag: string | null }): Promise<
+    { ok: true; systemFenced: boolean } | { ok: false; reason: string }
+  > {
+    return this.withWorkspacePersistence(async () => {
+      if (!(MIGRATION_TARGETS as readonly unknown[]).includes(params.targetProvider)) return { ok: false as const, reason: 'invalid' };
+      const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
+      if (!wctx) return { ok: false as const, reason: 'no_context' };
+      const store = await this.selectWorkspaceStore();
+      if (!store.ok || !store.store) return { ok: false as const, reason: 'store_unavailable' };
+      const bucket = store.store as unknown as FlushR2BucketLike;
+      const ws = await writeMigratedHead({ bucket, realPrefix: wctx.prefix, targetProvider: params.targetProvider, expectedEtag: params.expectedEtag });
+      if (!ws.ok) return { ok: false as const, reason: ws.reason };
+      const sp = systemPrefixOf(wctx.prefix);
+      let systemFenced = params.expectedSystemEtag === null;
+      if (sp && params.expectedSystemEtag !== null) {
+        const sys = await writeMigratedHead({ bucket, realPrefix: sp, targetProvider: params.targetProvider, expectedEtag: params.expectedSystemEtag });
+        systemFenced = sys.ok;
+      }
+      return { ok: true as const, systemFenced };
+    });
+  }
+
+  /** Abandon an export before commit: lower the migrating flag so GC resumes. */
+  async abortMigrationExport(): Promise<{ ok: boolean }> {
+    return this.withWorkspacePersistence(async () => {
+      const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
+      const store = await this.selectWorkspaceStore();
+      if (!wctx || !store.ok || !store.store) return { ok: false };
+      await (store.store as unknown as { delete(keys: string[]): Promise<unknown> }).delete([`${wctx.prefix}/${MIGRATING_FLAG}`]);
+      return { ok: true };
+    });
   }
 
   /** Explicit, on-demand flush — see class doc comment for the two call sites. */
@@ -3265,7 +3394,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       try { checkpoint = await this.runWorkspaceFlush('explicit'); } catch { /* refuse below */ }
       // A workspace over the snapshot limits can never checkpoint; refusing
       // would retry (and bill) forever. Every other failure still refuses.
-      if (checkpoint?.skippedReason === 'too_large' || checkpoint?.skippedReason === 'container_not_hydrated') {
+      if (checkpoint?.skippedReason === 'too_large' || checkpoint?.skippedReason === 'container_not_hydrated'
+          || checkpoint?.skippedReason === 'migrated') {
         console.error(`[terminateSandbox] ${checkpoint.skippedReason === 'too_large' ? 'workspace exceeds snapshot limits' : 'container does not hold the hydrated workspace'}; terminating on the last committed checkpoint`);
       } else if (!checkpoint?.ok) {
         // Do not tombstone or cancel retries on a persistence failure.
