@@ -46,6 +46,8 @@ shared_lower() { # one extraction reused by tests that are not about host replac
 # host_new <name> [lowersDir]  — a simulated host: its own root-volume dirs and config.
 host_new() {
     local h="$1" lowers="${2:-}" H="$T/hosts/$1"
+    if findmnt -rn -o TARGET | grep -q "^$H/"; then log "host $h still has mounts; refusing to reset"; return 1; fi
+    rm -rf "$H"
     mkdir -p "$H"/{etc,state,run,byid,stub,srv}
     chmod 700 "$H/state"
     [ -n "$lowers" ] || lowers="$H/lowers"
