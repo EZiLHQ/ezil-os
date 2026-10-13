@@ -282,3 +282,30 @@ describe('a signed store claim must match the computer\'s store', () => {
     expect(r2.calls.length).toBeGreaterThan(0);
   });
 });
+
+describe('ensureWorkspaceMount: a store claim cannot be honoured by the s3fs fallback', () => {
+  const s3fsEnv = {
+    SANDBOX_WORKSPACE_S3_ENDPOINT: 'http://127.0.0.1:9', SANDBOX_WORKSPACE_S3_BUCKET: 'b',
+    SANDBOX_WORKSPACE_S3_ACCESS_KEY_ID: 'k', SANDBOX_WORKSPACE_S3_SECRET_ACCESS_KEY: 's',
+  };
+  const sandbox = () => {
+    const calls = { mount: 0, hydrate: 0 };
+    return { calls, mountBucket: async () => { calls.mount++; }, hydrateWorkspace: async () => { calls.hydrate++; return { mounted: true }; },
+      exec: async () => ({ exitCode: 0, stdout: '' }) };
+  };
+  const mount = async () => (await import('./index')).ensureWorkspaceMount as unknown as
+    (s: unknown, e: unknown, p: unknown, o?: unknown) => Promise<{ mounted: boolean; detail?: string }>;
+
+  it('refuses a claimed store instead of mounting something else', async () => {
+    const sb = sandbox();
+    const res = await (await mount())(sb, s3fsEnv, { projectId: 'p1', branch: 'main' }, { expectedStore: 's3' });
+    expect(res).toEqual({ mounted: false, detail: 'workspace_store_claim_mismatch' });
+    expect(sb.calls.mount).toBe(0);
+  });
+
+  it('positive control: without a claim the local-dev s3fs mount is unchanged', async () => {
+    const sb = sandbox();
+    await (await mount())(sb, s3fsEnv, { projectId: 'p1', branch: 'main' });
+    expect(sb.calls.mount).toBeGreaterThan(0);
+  });
+});
