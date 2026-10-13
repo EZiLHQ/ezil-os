@@ -8,7 +8,7 @@
  *   Every existing lifecycle caller uses it, unchanged.
  * - `resolveComputeProvider(db, computer)` — placement-aware. 🔴 With
  *   `EZIL_AWS_COMPUTERS_ENABLED` unset it returns the Cloudflare adapter
- *   WITHOUT reading the database: `ezil_computer_placements` does not exist in
+ *   WITHOUT reading the database: the placement table does not exist in
  *   production until the founder registers it (docs/aws-computers/sql), and a
  *   read would fail every Cloudflare computer. With the flag on it reads the
  *   placement (no row → Cloudflare) and fails closed on a duplicate or unknown

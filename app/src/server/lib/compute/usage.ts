@@ -1,6 +1,6 @@
 /**
  * Usage-ledger accounting (docs/AWS-COMPUTERS.md §4, R9). Pure functions over
- * `ezil_compute_usage` rows as `placement.ts` reads them; no database here.
+ * usage-ledger rows as `placement.ts` reads them; no database here.
  *
  * - Months are UTC calendar months.
  * - Hours: each row covers `[started_at, stopped_at ?? now]`, clipped to the
