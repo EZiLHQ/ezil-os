@@ -252,6 +252,8 @@ for(const [label,name,cause] of [
     ['InternalError','Ec2.InternalErrorException','An internal error has occurred'],
     ['ServiceUnavailable','Ec2.ServiceUnavailableException','Service is temporarily unable to handle the request'],
     ['transport: HTTP request','States.TaskFailed','Unable to execute HTTP request: Connection reset'],
+    // Not States.TaskFailed: only the transport patterns can classify this one.
+    ['transport: client exception','Ec2.SdkClientException','Unable to execute HTTP request: connection reset by peer'],
     ['transport: generic task failure without status','States.TaskFailed','The task failed'],
 ] as const) test(`uncertain EC2 error (${label}) is observed, not rejected`,async()=>{
     // The request DID take effect; only observation can learn that.
