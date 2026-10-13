@@ -34,6 +34,33 @@ engine's own `additiveSQL`, so it cannot drift outside the hosted grammar.
 5. `node .github/scripts/production-migrations.mjs validate`, then release through the
    normal main-push apply path.
 
-Only after the tables exist in production may `EZIL_AWS_COMPUTERS_ENABLED=1` be set:
-with the flag on, provider selection reads `ezil_computer_placements` and a missing
-table fails every lifecycle call.
+## Flags, in order
+
+1. `EZIL_COMPUTE_PLACEMENT_READS=1` turns on placement reads in provider selection.
+   Set it only after the tables exist: with reads on, a missing table fails every
+   lifecycle call (it is never treated as "no row").
+   **One-way: once on, never turn it off.** With reads off every computer resolves to
+   Cloudflare, so a computer with an `aws-ec2` placement would silently open an empty
+   Cloudflare workspace instead of refusing.
+2. `EZIL_AWS_COMPUTERS_ENABLED=1` gates AWS admission and the aws-ec2 provider. It
+   implies placement reads. With reads on and AWS off, an `aws-ec2` computer refuses
+   with `aws_disabled`.
+
+## Ownership caveat (`ezil_computers` RLS)
+
+Admission's ownership and per-user checks read `ezil_computers`, which signed-in users
+can write through the Supabase API (`app/drizzle/0000_massive_mole_man.sql`):
+
+- the "Users can update own computers" policy pins `user_id = auth.uid()` in both
+  USING and WITH CHECK, so a user cannot move a computer to another user id;
+- but no column is protected, so a user can change `id` (re-key) or `deleted_at`, and
+  "Users can insert own computers" lets them insert a row with a chosen `id`, including
+  a soft-deleted one that takes no slot.
+
+Admission therefore also counts placements metered to the user in the usage ledger,
+refuses a computer whose usage was metered to another user, and refuses a soft-deleted
+computer. Residual gap: a placement that has never run (no usage rows) can be hidden by
+re-keying its row, or claimed by inserting a row with its id after the owner's account
+is deleted. Follow-up (P3, before Stage A): record the owning user on the placement
+(C-2 change) and/or revoke column `UPDATE (id)` and supplied ids on insert from
+`authenticated`.

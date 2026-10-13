@@ -4,7 +4,11 @@
  *
  * What it models, and how faithfully:
  * - `pg_advisory_xact_lock` — a real async mutex per (namespace, key), held
- *   until the fake transaction commits or rolls back.
+ *   until the fake transaction commits or rolls back. The key follows the SQL:
+ *   `hashtext($n::uuid::text)` keys on the lower-cased id (uuid canonical
+ *   text), `hashtext($n::text)` on the raw string — as Postgres does. The
+ *   statement answers `isolation` from the `isolation` option.
+ * - uuid comparisons (`= $n::uuid`) are case-insensitive, as in Postgres.
  * - The CAS `UPDATE` — the WHERE and SET clauses are PARSED FROM THE SQL TEXT,
  *   and an unrecognised predicate throws. Removing a guard from the SQL
  *   therefore changes which rows match: the guard mutations are honest.
@@ -63,7 +67,13 @@ const RUNNING_EXCLUDED = new Set(['STOPPED', 'RETIRED', 'PURGE_ELIGIBLE']);
 export interface FakeSeed {
     placements?: Row[];
     usage?: Row[];
-    computers?: { id: string; user_id: string }[];
+    computers?: { id: string; user_id: string; deleted_at?: Date | null }[];
+}
+
+export interface FakeOptions {
+    clock?: () => Date;
+    /** What `current_setting('transaction_isolation')` answers. */
+    isolation?: string;
 }
 
 export function placementRow(over: Row & { computer_id: string }): Row {
@@ -89,7 +99,11 @@ export function placementRow(over: Row & { computer_id: string }): Row {
     };
 }
 
-export function createFakePlacementDb(seed: FakeSeed = {}, clock: () => Date = () => new Date('2026-10-13T12:00:00Z')) {
+const uuidEq = (a: unknown, b: unknown) => String(a).toLowerCase() === String(b).toLowerCase();
+
+export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions = {}) {
+    const clock = options.clock ?? (() => new Date('2026-10-13T12:00:00Z'));
+    const isolation = options.isolation ?? 'read committed';
     const placements: Row[] = (seed.placements ?? []).map((r) => ({ ...r }));
     const usage: Row[] = (seed.usage ?? []).map((r) => ({ ...r }));
     const computers = seed.computers ?? [];
@@ -120,23 +134,27 @@ export function createFakePlacementDb(seed: FakeSeed = {}, clock: () => Date = (
             case 'lock-computer':
             case 'lock-admission': {
                 if (!tx) throw new Error('fake db: pg_advisory_xact_lock outside a transaction is a no-op in Postgres');
-                const key = `${tag}:${JSON.stringify(params)}`;
+                const canonical = /hashtext\(\$\d+::uuid::text\)/.test(text);
+                const keyParams = params.map((p, i) => (canonical && i === params.length - 1 ? String(p).toLowerCase() : p));
+                const key = `${tag}:${JSON.stringify(keyParams)}`;
                 let m = locks.get(key);
                 if (!m) locks.set(key, (m = new Mutex()));
                 await m.acquire();
                 tx.locks.push(m);
-                return { rows: [{ pg_advisory_xact_lock: '' }] };
+                return { rows: [{ pg_advisory_xact_lock: '', isolation }] };
             }
             case 'read':
-                return { rows: placements.filter((r) => r.computer_id === params[0]).slice(0, 2).map(present) };
+                return { rows: placements.filter((r) => uuidEq(r.computer_id, params[0])).slice(0, 2).map(present) };
             case 'duplicates': {
                 const counts = new Map<string, number>();
                 for (const r of placements) counts.set(String(r.computer_id), (counts.get(String(r.computer_id)) ?? 0) + 1);
                 return { rows: [...counts].filter(([, n]) => n > 1).map(([computer_id, rows]) => ({ computer_id, rows })) };
             }
             case 'computer-owner': {
-                const c = computers.find((x) => x.id === params[0]);
-                return { rows: c ? [{ user_id: c.user_id }] : [] };
+                const c = computers.find((x) => uuidEq(x.id, params[0]));
+                if (!c) return { rows: [] };
+                const foreign_usage = usage.filter((u) => uuidEq(u.computer_id, c.id) && !uuidEq(u.user_id, c.user_id)).length;
+                return { rows: [{ user_id: c.user_id, deleted: c.deleted_at != null, foreign_usage }] };
             }
             case 'count-running': {
                 const states = new Set(params as string[]);
@@ -144,11 +162,15 @@ export function createFakePlacementDb(seed: FakeSeed = {}, clock: () => Date = (
                 return { rows: [{ n }] };
             }
             case 'count-user': {
-                const [userId, computerId] = params as string[];
-                const owned = new Set(computers.filter((c) => c.user_id === userId).map((c) => c.id));
-                const n = placements.filter(
-                    (r) => r.provider === 'aws-ec2' && owned.has(String(r.computer_id)) && r.computer_id !== computerId && r.state !== 'PURGE_ELIGIBLE',
-                ).length;
+                const [computerId, userId] = params as string[];
+                const mine = (cid: unknown) =>
+                    computers.some((c) => uuidEq(c.id, cid) && uuidEq(c.user_id, userId)) ||
+                    usage.some((u) => uuidEq(u.computer_id, cid) && uuidEq(u.user_id, userId));
+                const n = new Set(
+                    placements
+                        .filter((r) => r.provider === 'aws-ec2' && mine(r.computer_id) && !uuidEq(r.computer_id, computerId) && r.state !== 'PURGE_ELIGIBLE')
+                        .map((r) => String(r.computer_id).toLowerCase()),
+                ).size;
                 return { rows: [{ n }] };
             }
             case 'usage-month': {
@@ -188,7 +210,7 @@ export function createFakePlacementDb(seed: FakeSeed = {}, clock: () => Date = (
                     return (r: Row) => (r[set[1]!] = value(set[2]!.trim(), params));
                 });
                 // Atomic match-and-apply, like row-locked UPDATE re-evaluation.
-                const hit = placements.filter((r) => where.every(([col, v]) => String(r[col]) === String(v)));
+                const hit = placements.filter((r) => where.every(([col, v]) => (col === 'computer_id' ? uuidEq(r[col], v) : String(r[col]) === String(v))));
                 for (const r of hit) {
                     const before = { ...r };
                     sets.forEach((apply) => apply(r));

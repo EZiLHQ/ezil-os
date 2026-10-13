@@ -49,6 +49,14 @@ describe('purge eligibility (§6, dry run)', () => {
         expect(input).toEqual(before);
     });
 
+    it.each([
+        ['an unknown state', { state: 'retired' }],
+        ['a bad timestamp', { updated_at: 'never' }],
+    ])('a candidate row with %s fails closed instead of being skipped or listed', async (_label, over) => {
+        const db = { execute: async () => ({ rows: [{ computer_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', state: 'RETIRED', updated_at: daysAgo(30), ...over }] }) };
+        await expect(listPurgeEligible(db, { cancellations: [], now: NOW })).rejects.toThrow(/placement_integrity:invalid_row/);
+    });
+
     it('the database path issues one read-only SELECT and changes no row', async () => {
         const seed = [
             placementRow({ computer_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', state: 'RETIRED', updated_at: daysAgo(15) }),

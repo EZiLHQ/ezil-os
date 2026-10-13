@@ -24,7 +24,7 @@
  *   duplicate check: a second row for the computer, whatever its keys,
  *   refuses the transition. Zero rows is a lost race, never retried here.
  * - **Leasing** (`STOPPED → LEASED`, `lease_epoch + 1`) and AWS creation need
- *   an `AdmissionLock`, which only `takeAdmissionLock` can mint, in the same
+ *   an `AdmissionLock`, which only `withAdmission` can mint, for the same
  *   transaction (C-3: admission runs under one global advisory lock).
  *
  * ## Locks
@@ -273,7 +273,8 @@ async function selectRows(db: PlacementExecutor, computerId: string): Promise<Re
 }
 
 /** C-2 read rule. Throws `PlacementIntegrityError` rather than guessing. */
-export async function readPlacement(db: PlacementExecutor, computerId: string): Promise<ResolvedPlacement> {
+export async function readPlacement(db: PlacementExecutor, rawComputerId: string): Promise<ResolvedPlacement> {
+    const computerId = canonicalId(rawComputerId);
     const rows = await selectRows(db, computerId);
     if (rows.length === 0) return DEFAULT_PLACEMENT;
     if (rows.length > 1) throw new PlacementIntegrityError('duplicate_placement', computerId);
@@ -294,23 +295,67 @@ export async function findDuplicatePlacements(db: PlacementExecutor): Promise<{ 
 
 // ── Locks ────────────────────────────────────────────────────────────────
 
+/**
+ * Ids are uuids: Postgres compares them by value, so `A…` and `a…` are one
+ * computer. Every id is lower-cased at this module's boundary, and the lock
+ * key hashes the CANONICAL `::uuid::text` form — hashing the raw string gave
+ * mixed-case creators two different locks and two rows (review, real PG 16).
+ */
+const canonicalId = (id: string) => id.toLowerCase();
+
+/** Thrown when a lock is taken outside READ COMMITTED (see module doc). */
+export class PlacementIsolationError extends Error {
+    constructor(readonly isolation: string) {
+        super(`placement locks require READ COMMITTED, got ${isolation}`);
+        this.name = 'PlacementIsolationError';
+    }
+}
+
+/**
+ * Both locks return the transaction's isolation level from the SAME
+ * statement and refuse anything but READ COMMITTED: under REPEATABLE READ
+ * (e.g. a role or database `default_transaction_isolation`) the reads after
+ * the lock would use a snapshot from before it, and two admissions at the
+ * cap both won (review, 20/20 on PG 16).
+ */
+function assertReadCommitted(result: unknown): void {
+    const isolation = rowsOf(result)[0]?.isolation;
+    if (isolation !== 'read committed') throw new PlacementIsolationError(String(isolation));
+}
+
 async function lockComputer(tx: PlacementExecutor, computerId: string): Promise<void> {
-    await tx.execute(
-        sql`/* placement:lock-computer */ SELECT pg_advisory_xact_lock(${PLACEMENT_LOCK_NAMESPACE}::int4, hashtext(${computerId}::text))`,
+    assertReadCommitted(
+        await tx.execute(
+            sql`/* placement:lock-computer */ SELECT pg_advisory_xact_lock(${PLACEMENT_LOCK_NAMESPACE}::int4, hashtext(${computerId}::uuid::text)), current_setting('transaction_isolation') AS isolation`,
+        ),
     );
 }
 
 const ADMISSION_BRAND: unique symbol = Symbol('admission-lock');
 
-/** Proof that the global admission lock is held by THIS transaction. Mint-only via `takeAdmissionLock`. */
+/** Proof that the global admission lock is held by THIS transaction. Minted only inside `withAdmission`. */
 export interface AdmissionLock {
     readonly [ADMISSION_BRAND]: PlacementExecutor;
 }
 
-/** Must be the first statement of the admission transaction (see module doc on isolation). */
-export async function takeAdmissionLock(tx: PlacementExecutor): Promise<AdmissionLock> {
-    await tx.execute(sql`/* placement:lock-admission */ SELECT pg_advisory_xact_lock(${ADMISSION_LOCK_NAMESPACE}::int4, 0)`);
+/** Private: the lock must be the first statement of a transaction this module opened. */
+async function takeAdmissionLock(tx: PlacementExecutor): Promise<AdmissionLock> {
+    assertReadCommitted(
+        await tx.execute(
+            sql`/* placement:lock-admission */ SELECT pg_advisory_xact_lock(${ADMISSION_LOCK_NAMESPACE}::int4, 0), current_setting('transaction_isolation') AS isolation`,
+        ),
+    );
     return Object.freeze({ [ADMISSION_BRAND]: tx });
+}
+
+/**
+ * The ONLY way to obtain an `AdmissionLock`: opens the transaction itself,
+ * takes the global lock as its first statement, and hands both to `fn`.
+ * There is no way to mint a lock on a non-transactional executor, where it
+ * would be released as soon as the statement ended.
+ */
+export function withAdmission<T>(db: PlacementDb, fn: (tx: PlacementExecutor, lock: AdmissionLock) => Promise<T>): Promise<T> {
+    return db.transaction(async (tx) => fn(tx, await takeAdmissionLock(tx)));
 }
 
 function assertAdmissionLock(tx: PlacementExecutor, lock: AdmissionLock): void {
@@ -330,7 +375,8 @@ export interface CreatePlacementInput {
 
 export type CreatePlacementResult = { ok: true; placement: Placement } | { ok: false; reason: 'placement_exists' };
 
-async function createInTx(tx: PlacementExecutor, input: CreatePlacementInput): Promise<CreatePlacementResult> {
+async function createInTx(tx: PlacementExecutor, rawInput: CreatePlacementInput): Promise<CreatePlacementResult> {
+    const input = { ...rawInput, computerId: canonicalId(rawInput.computerId) };
     await lockComputer(tx, input.computerId);
     if ((await selectRows(tx, input.computerId)).length > 0) return { ok: false, reason: 'placement_exists' };
     const fields = input.fields ?? {};
@@ -394,13 +440,14 @@ export type TransitionResult =
 
 async function casInTx(
     tx: PlacementExecutor,
-    computerId: string,
+    rawComputerId: string,
     expected: CasExpectation,
     to: PlacementState,
     bump: { generation: 0 | 1; leaseEpoch: 0 | 1 },
     fields: PlacementFields,
     provider?: PlacementProvider,
 ): Promise<TransitionResult> {
+    const computerId = canonicalId(rawComputerId);
     // A duplicate whose keys do not match the CAS would let this writer win
     // while every reader fails closed. Refuse first, inside the transaction.
     if ((await selectRows(tx, computerId)).length > 1) throw new PlacementIntegrityError('duplicate_placement', computerId);
@@ -470,26 +517,37 @@ export interface UsageRow {
 export interface AdmissionCounters {
     /** `ezil_computers.user_id` of the target, or null when no such computer exists. */
     targetOwnerId: string | null;
+    /** The target computer row is soft-deleted. */
+    targetDeleted: boolean;
+    /** Usage rows for the target recorded under a user other than its current owner. */
+    targetForeignUsage: number;
     /** aws-ec2 placements in a running-class state, any user. */
     runningCount: number;
-    /** The user's OTHER aws-ec2 placements not yet PURGE_ELIGIBLE, soft-deleted computers included. */
+    /**
+     * The user's OTHER aws-ec2 placements not yet PURGE_ELIGIBLE, soft-deleted
+     * computers included. "The user's" = owned via `ezil_computers` OR ever
+     * metered to the user in the usage ledger, so re-keying a computer row
+     * cannot hide a placement that has run.
+     */
     userOtherAwsComputers: number;
     duplicates: { computerId: string; rows: number }[];
     /** Usage rows overlapping [monthStart, now], every user. */
     usage: UsageRow[];
 }
 
-/** Read every admission input. Call only after `takeAdmissionLock`, in the same transaction. */
+/** Read every admission input, inside `withAdmission`. */
 export async function readAdmissionCounters(
     tx: PlacementExecutor,
     lock: AdmissionLock,
-    input: { userId: string; computerId: string; monthStart: Date; now: Date },
+    rawInput: { userId: string; computerId: string; monthStart: Date; now: Date },
 ): Promise<AdmissionCounters> {
     assertAdmissionLock(tx, lock);
+    const input = { ...rawInput, userId: canonicalId(rawInput.userId), computerId: canonicalId(rawInput.computerId) };
     const ownerRows = rowsOf(
-        await tx.execute(sql`/* placement:computer-owner */ SELECT user_id::text AS user_id
-            FROM public.ezil_computers
-            WHERE id = ${input.computerId}::uuid`),
+        await tx.execute(sql`/* placement:computer-owner */ SELECT c.user_id::text AS user_id, (c.deleted_at IS NOT NULL) AS deleted,
+                (SELECT count(*)::int FROM public.ezil_compute_usage u WHERE u.computer_id = c.id AND u.user_id <> c.user_id) AS foreign_usage
+            FROM public.ezil_computers c
+            WHERE c.id = ${input.computerId}::uuid`),
     );
     const running = sql.join(RUNNING_CLASS_STATES.map((s) => sql`${s}`), sql`, `);
     const runningRows = rowsOf(
@@ -500,11 +558,11 @@ export async function readAdmissionCounters(
     // No `deleted_at IS NULL`: soft-deleting a computer must not free the per-user slot
     // while its volume still exists.
     const userRows = rowsOf(
-        await tx.execute(sql`/* placement:count-user */ SELECT count(*)::int AS n
+        await tx.execute(sql`/* placement:count-user */ SELECT count(DISTINCT p.computer_id)::int AS n
             FROM public.ezil_computer_placements p
-            JOIN public.ezil_computers c ON c.id = p.computer_id
-            WHERE p.provider = 'aws-ec2' AND c.user_id = ${input.userId}::uuid
-              AND p.computer_id <> ${input.computerId}::uuid AND p.state <> 'PURGE_ELIGIBLE'`),
+            WHERE p.provider = 'aws-ec2' AND p.computer_id <> ${input.computerId}::uuid AND p.state <> 'PURGE_ELIGIBLE'
+              AND (EXISTS (SELECT 1 FROM public.ezil_computers c WHERE c.id = p.computer_id AND c.user_id = ${input.userId}::uuid)
+                OR EXISTS (SELECT 1 FROM public.ezil_compute_usage u WHERE u.computer_id = p.computer_id AND u.user_id = ${input.userId}::uuid))`),
     );
     const duplicates = await findDuplicatePlacements(tx);
     const usageRows = rowsOf(
@@ -519,9 +577,13 @@ export async function readAdmissionCounters(
         if (n === null) throw new Error('admission counter query returned no count');
         return n;
     };
-    const owner = ownerRows[0]?.user_id;
+    const owner = ownerRows[0];
+    const foreign = owner ? counter(owner.foreign_usage) : 0;
+    if (foreign === null) throw new Error('admission owner query returned no usage count');
     return {
-        targetOwnerId: typeof owner === 'string' ? owner : null,
+        targetOwnerId: typeof owner?.user_id === 'string' ? owner.user_id : null,
+        targetDeleted: owner?.deleted === true,
+        targetForeignUsage: foreign,
         runningCount: count(runningRows),
         userOtherAwsComputers: count(userRows),
         duplicates,

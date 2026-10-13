@@ -51,6 +51,38 @@ describe('resolveComputeProvider', () => {
         await expect(resolveComputeProvider(db, computer, ON)).rejects.toThrow(/does not exist/);
     });
 
+    describe('flag matrix: reads x AWS x row', () => {
+        const ctx = { correlationId: 'c' };
+        const rows = {
+            none: [],
+            cloudflare: [placementRow({ computer_id: computerId, provider: 'cloudflare', workspace_store: 'r2' })],
+            'aws-ec2': [placementRow({ computer_id: computerId })],
+        } as const;
+        const cases = [undefined, '0', '1'].flatMap((reads) =>
+            [undefined, '1'].flatMap((aws) => (Object.keys(rows) as (keyof typeof rows)[]).map((row) => [reads, aws, row] as const)),
+        );
+        it.each(cases)('READS=%s AWS=%s row=%s', async (reads, aws, row) => {
+            const env = { EZIL_COMPUTE_PLACEMENT_READS: reads, EZIL_AWS_COMPUTERS_ENABLED: aws };
+            const { db, statements } = createFakePlacementDb({ placements: [...rows[row]] });
+            const provider = await resolveComputeProvider(db, computer, env);
+            const readsOn = reads === '1' || aws === '1';
+            if (!readsOn) {
+                expect(provider).toBe(cloudflareComputeProvider);
+                expect(statements).toEqual([]);
+                return;
+            }
+            expect(statements).toHaveLength(1);
+            if (row !== 'aws-ec2') {
+                expect(provider).toBe(cloudflareComputeProvider);
+                return;
+            }
+            expect(provider.kind).toBe('aws-ec2');
+            const ensure = provider.ensure(ctx, computer, { sessionId: 's', desktopMode: 'neko' });
+            if (aws === '1') await expect(ensure).rejects.toBeInstanceOf(AwsProviderNotImplementedError);
+            else expect(await ensure).toEqual({ ok: false, error: 'aws_disabled', errorCode: 'aws_disabled', retryable: false });
+        });
+    });
+
     it('selectComputeProvider (existing callers) is unchanged', () => {
         expect(selectComputeProvider(computer)).toBe(cloudflareComputeProvider);
         expect(providerForPlacement({ provider: 'cloudflare' })).toBe(cloudflareComputeProvider);

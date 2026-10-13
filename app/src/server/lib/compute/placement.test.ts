@@ -13,6 +13,7 @@ import { describe, expect, it } from 'vitest';
 
 import type * as schema from '@/server/db/schema';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
+import * as Placement from './placement';
 import {
     createAwsPlacement,
     createPlacement,
@@ -25,7 +26,9 @@ import {
     placementTrpcError,
     readPlacement,
     RUNNING_CLASS_STATES,
-    takeAdmissionLock,
+    readAdmissionCounters,
+    withAdmission,
+    PlacementIsolationError,
     transitionPlacement,
     type PlacementDb,
 } from './placement';
@@ -70,6 +73,11 @@ describe('read: no row = cloudflare + r2; anything doubtful fails closed', () =>
         expect(p.record?.computerId).toBe(A);
     });
 
+    it('a row for a different computer fails closed', async () => {
+        const db = { execute: async () => ({ rows: [{ ...placementRow({ computer_id: B }), generation: '1', lease_epoch: '0' }] }) };
+        expect((await integrity(readPlacement(db, A))).reason).toBe('invalid_row');
+    });
+
     it('two rows for one computer fail closed as duplicate_placement', async () => {
         const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A }), placementRow({ computer_id: A })] });
         expect((await integrity(readPlacement(db, A))).reason).toBe('duplicate_placement');
@@ -85,6 +93,7 @@ describe('read: no row = cloudflare + r2; anything doubtful fails closed', () =>
         ['non-numeric generation', { generation: 'x' }, 'invalid_row'],
         ['negative lease epoch', { lease_epoch: -1 }, 'invalid_row'],
         ['bad timestamp', { lease_until: 'not a date' }, 'invalid_row'],
+        ['generation above MAX_SAFE_INTEGER', { generation: '9007199254740993' }, 'invalid_row'],
     ] as const)('%s fails closed', async (_label, over, reason) => {
         const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A, ...over })] });
         expect((await integrity(readPlacement(db, A))).reason).toBe(reason);
@@ -121,11 +130,38 @@ describe('create: per-computer advisory lock, then refuse an existing row', () =
         await createPlacement(db, { computerId: A, provider: 'cloudflare', state: 'STOPPED' });
         const sqls = statements.map((s) => s.sql);
         expect(sqls[0]).toBe('BEGIN');
-        expect(sqls[1]).toMatch(/SELECT pg_advisory_xact_lock\(\$1::int4, hashtext\(\$2::text\)\)/);
+        expect(sqls[1]).toMatch(/SELECT pg_advisory_xact_lock\(\$1::int4, hashtext\(\$2::uuid::text\)\), current_setting\('transaction_isolation'\) AS isolation/);
         expect(statements[1]!.params[1]).toBe(A);
         expect(sqls[2]).toMatch(/placement:read/);
         expect(sqls[3]).toMatch(/INSERT INTO public\.ezil_computer_placements/);
         expect(sqls[4]).toBe('COMMIT');
+    });
+
+    it('mixed-case creators of one computer serialise on ONE lock: exactly one row', async () => {
+        const { db, placements } = createFakePlacementDb();
+        const results = await Promise.all([
+            createPlacement(db, { computerId: A, provider: 'cloudflare', state: 'STOPPED' }),
+            createPlacement(db, { computerId: A.toUpperCase(), provider: 'cloudflare', state: 'STOPPED' }),
+        ]);
+        expect(results.filter((r) => r.ok)).toHaveLength(1);
+        expect(placements).toHaveLength(1);
+        expect(placements[0]!.computer_id).toBe(A);
+    });
+
+    it('the lock key hashes the canonical uuid text', async () => {
+        const { db, statements } = createFakePlacementDb();
+        await createPlacement(db, { computerId: A.toUpperCase(), provider: 'cloudflare', state: 'STOPPED' });
+        const lock = statements.find((s) => /lock-computer/.test(s.sql))!;
+        expect(lock.sql).toMatch(/hashtext\(\$2::uuid::text\)/);
+        expect(lock.params[1]).toBe(A);
+    });
+
+    it('refuses to create outside READ COMMITTED, before any read or write', async () => {
+        const { db, placements, statements } = createFakePlacementDb({}, { isolation: 'repeatable read' });
+        await expect(createPlacement(db, { computerId: A, provider: 'cloudflare', state: 'STOPPED' })).rejects.toBeInstanceOf(PlacementIsolationError);
+        expect(placements).toEqual([]);
+        expect(statements.map((s) => s.sql)).not.toContainEqual(expect.stringMatching(/placement:(read|insert)/));
+        expect(statements.at(-1)!.sql).toBe('ROLLBACK');
     });
 
     it('a new row starts at generation 1, lease_epoch 0, with the provider store', async () => {
@@ -223,7 +259,7 @@ describe('transitions: CAS on (computer_id, generation, lease_epoch, state)', ()
         await transitionPlacement(db, { computerId: A, expected: { generation: 2, leaseEpoch: 5, state: 'LEASED' }, to: 'STARTING' });
         const cas = statements.find((s) => /placement:cas/.test(s.sql))!;
         expect(cas.sql).toMatch(/WHERE computer_id = \$\d+::uuid AND generation = \$\d+ AND lease_epoch = \$\d+ AND state = \$\d+\s+RETURNING/);
-        expect(statements.map((s) => s.sql)).not.toContainEqual(expect.stringMatching(/set transaction|isolation/i));
+        expect(statements.map((s) => s.sql)).not.toContainEqual(expect.stringMatching(/set transaction|set session|isolation level/i));
     });
 });
 
@@ -231,25 +267,40 @@ describe('leasing and AWS creation need the admission lock of the same transacti
     it('leasing bumps lease_epoch by one (and generation only on replace)', async () => {
         const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A, generation: 2, lease_epoch: 5 })] });
         const until = new Date('2026-10-13T13:00:00Z');
-        const r = await db.transaction(async (tx) => leasePlacement(tx, await takeAdmissionLock(tx), { computerId: A, expected: { generation: 2, leaseEpoch: 5 }, leaseUntil: until }));
+        const r = await withAdmission(db, (tx, lock) => leasePlacement(tx, lock, { computerId: A, expected: { generation: 2, leaseEpoch: 5 }, leaseUntil: until }));
         expect(r.ok && r.placement).toMatchObject({ state: 'LEASED', generation: 2, leaseEpoch: 6, leaseUntil: until });
         // LEASED → STOPPED (a lapsed lease), then a replace lease reserves generation + 1 as well.
         await transitionPlacement(db, { computerId: A, expected: { generation: 2, leaseEpoch: 6, state: 'LEASED' }, to: 'STOPPED' });
-        const r2 = await db.transaction(async (tx) =>
-            leasePlacement(tx, await takeAdmissionLock(tx), { computerId: A, expected: { generation: 2, leaseEpoch: 6 }, leaseUntil: until, replace: true }),
+        const r2 = await withAdmission(db, (tx, lock) =>
+            leasePlacement(tx, lock, { computerId: A, expected: { generation: 2, leaseEpoch: 6 }, leaseUntil: until, replace: true }),
         );
         expect(r2.ok && r2.placement).toMatchObject({ generation: 3, leaseEpoch: 7 });
     });
 
     it('a lock minted in another transaction is refused', async () => {
         const { db, placements } = createFakePlacementDb({ placements: [placementRow({ computer_id: A })] });
-        const foreign = await db.transaction((tx) => takeAdmissionLock(tx));
+        const foreign = await withAdmission(db, async (_tx, lock) => lock);
         await expect(
             db.transaction((tx) => leasePlacement(tx, foreign, { computerId: A, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: new Date() })),
         ).rejects.toThrow(/admission lock/);
         await expect(db.transaction((tx) => createAwsPlacement(tx, foreign, { computerId: B }))).rejects.toThrow(/admission lock/);
+        const counters = { userId: A, computerId: B, monthStart: new Date(0), now: new Date() };
+        await expect(db.transaction((tx) => readAdmissionCounters(tx, foreign, counters))).rejects.toThrow(/admission lock/);
+        // Even inside ANOTHER admission, a lock from a different transaction is refused.
+        await expect(withAdmission(db, (tx) => readAdmissionCounters(tx, foreign, counters))).rejects.toThrow(/admission lock/);
         expect(placements).toHaveLength(1);
         expect(placements[0]!.state).toBe('STOPPED');
+    });
+
+    it('no lock can be minted outside withAdmission: takeAdmissionLock is not exported', () => {
+        expect('takeAdmissionLock' in Placement).toBe(false);
+        expect(typeof Placement.withAdmission).toBe('function');
+    });
+
+    it('withAdmission opens the transaction and takes the global lock as its first statement', async () => {
+        const { db, statements } = createFakePlacementDb();
+        await withAdmission(db, async () => undefined);
+        expect(statements.map((s) => s.sql.slice(0, 40))).toEqual(['BEGIN', expect.stringMatching(/placement:lock-admission/), 'COMMIT']);
     });
 
     it('a forged lock object is refused', async () => {

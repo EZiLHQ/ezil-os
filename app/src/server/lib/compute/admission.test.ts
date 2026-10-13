@@ -29,7 +29,7 @@ const ENV = {
     EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '200',
 };
 const config = readAwsAdmissionConfig(ENV);
-const empty: Pick<AdmissionCounters, 'targetOwnerId' | 'runningCount' | 'userOtherAwsComputers' | 'duplicates' | 'usage'> = { targetOwnerId: U1, runningCount: 0, userOtherAwsComputers: 0, duplicates: [], usage: [] };
+const empty: Pick<AdmissionCounters, 'targetOwnerId' | 'targetDeleted' | 'targetForeignUsage' | 'runningCount' | 'userOtherAwsComputers' | 'duplicates' | 'usage'> = { targetOwnerId: U1, targetDeleted: false, targetForeignUsage: 0, runningCount: 0, userOtherAwsComputers: 0, duplicates: [], usage: [] };
 const hoursRow = (userId: string, hours: number, egressBytes: number | null = 0) => ({
     computerId: C3,
     userId,
@@ -52,7 +52,7 @@ describe('config: absent or invalid means disabled', () => {
         });
     });
 
-    it.each(Object.values(AWS_CAP_ENV).flatMap((name) => [undefined, '', 'NaN', '-1', '1.5', ' 2', '1e3', 'two'].map((v) => [name, v] as const)))(
+    it.each(Object.values(AWS_CAP_ENV).flatMap((name) => [undefined, '', 'NaN', '-1', '1.5', ' 2', '1e3', 'two', '9007199254740993'].map((v) => [name, v] as const)))(
         '%s=%j disables admission',
         (name, v) => {
             const cfg = readAwsAdmissionConfig({ ...ENV, [name]: v });
@@ -78,6 +78,8 @@ describe('decideAdmission (pure)', () => {
         ['disabled', {}, readAwsAdmissionConfig({}), 'aws_disabled'],
         ['not the owner', { targetOwnerId: U2 }, config, 'computer_not_owned'],
         ['no such computer', { targetOwnerId: null }, config, 'computer_not_owned'],
+        ['usage metered to another user', { targetForeignUsage: 1 }, config, 'computer_not_owned'],
+        ['soft-deleted computer', { targetDeleted: true }, config, 'computer_deleted'],
         ['kill switch', {}, readAwsAdmissionConfig({ ...ENV, EZIL_AWS_KILL_SWITCH: '1' }), 'kill_switch'],
         ['duplicates', { duplicates: [{ computerId: C1, rows: 2 }] }, config, 'duplicate_placement'],
         ['running at cap', { runningCount: 2 }, config, 'max_running'],
@@ -120,12 +122,12 @@ describe('runAdmission (transactional)', () => {
         expect(await runAdmission(db, lease(U1, C1), deps)).toMatchObject({ admitted: true, placement: { state: 'LEASED', leaseEpoch: 1 } });
         const sqls = statements.map((s) => s.sql);
         expect(sqls[0]).toBe('BEGIN');
-        expect(sqls[1]).toMatch(/SELECT pg_advisory_xact_lock\(\$1::int4, 0\)/);
+        expect(sqls[1]).toMatch(/SELECT pg_advisory_xact_lock\(\$1::int4, 0\), current_setting\('transaction_isolation'\) AS isolation/);
         expect(sqls.slice(2, 7).map((s) => s.match(/placement:([a-z-]+)/)?.[1])).toEqual(['computer-owner', 'count-running', 'count-user', 'duplicates', 'usage-month']);
         expect(sqls[7]).toMatch(/placement:read/); // the CAS duplicate pre-check
         expect(sqls[8]).toMatch(/placement:cas/);
         expect(sqls[9]).toBe('COMMIT');
-        expect(sqls).not.toContainEqual(expect.stringMatching(/set transaction|isolation/i));
+        expect(sqls).not.toContainEqual(expect.stringMatching(/set transaction|set session|isolation level/i));
     });
 
     it('the counter SQL counts running-class aws-ec2 rows and the user\'s other aws-ec2 rows, soft-deleted included', async () => {
@@ -136,9 +138,10 @@ describe('runAdmission (transactional)', () => {
         expect(running.params).toContain('UNCONFIRMED');
         expect(running.params).not.toContain('STOPPED');
         const user = statements.find((s) => /count-user/.test(s.sql))!;
-        expect(user.sql).toMatch(/JOIN public\.ezil_computers c ON c\.id = p\.computer_id/);
+        expect(user.sql).toMatch(/p\.computer_id <> \$1::uuid AND p\.state <> 'PURGE_ELIGIBLE'/);
+        expect(user.sql).toMatch(/EXISTS \(SELECT 1 FROM public\.ezil_computers c WHERE c\.id = p\.computer_id AND c\.user_id = \$2::uuid\)/);
+        expect(user.sql).toMatch(/OR EXISTS \(SELECT 1 FROM public\.ezil_compute_usage u WHERE u\.computer_id = p\.computer_id AND u\.user_id = \$3::uuid\)/);
         expect(user.sql).not.toMatch(/deleted_at/);
-        expect(user.sql).toMatch(/p\.computer_id <> \$2::uuid AND p\.state <> 'PURGE_ELIGIBLE'/);
     });
 
     it('two concurrent admissions at the running cap: exactly one winner', async () => {
@@ -204,6 +207,51 @@ describe('runAdmission (transactional)', () => {
         });
         expect(await runAdmission(db, lease(U1, C1), deps)).toMatchObject({ admitted: false, reason: 'cas_conflict' });
         expect(placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 0 });
+    });
+
+    it('a re-keyed computer row cannot hide an AWS computer that has run (usage ledger counts)', async () => {
+        // C3's ezil_computers row is gone (re-keyed by its owner), but the ledger metered it to U1.
+        const { db } = createFakePlacementDb({
+            placements: [placementRow({ computer_id: C3 })],
+            computers: [{ id: C1, user_id: U1 }],
+            usage: [{ computer_id: C3, user_id: U1, started_at: new Date('2026-09-01T00:00:00Z'), stopped_at: new Date('2026-09-01T01:00:00Z'), egress_bytes: 0 }],
+        });
+        expect(await runAdmission(db, { kind: 'create', userId: U1, computerId: C1 }, deps)).toMatchObject({ admitted: false, reason: 'user_has_aws_computer' });
+    });
+
+    it('a placement whose usage was metered to another user is not leasable by the current row owner', async () => {
+        const { db, placements } = createFakePlacementDb({
+            placements: [placementRow({ computer_id: C1 })],
+            computers: [{ id: C1, user_id: U1 }],
+            usage: [{ computer_id: C1, user_id: U2, started_at: new Date('2026-09-01T00:00:00Z'), stopped_at: new Date('2026-09-01T01:00:00Z'), egress_bytes: 0 }],
+        });
+        expect(await runAdmission(db, lease(U1, C1), deps)).toMatchObject({ admitted: false, reason: 'computer_not_owned' });
+        expect(placements[0]!.state).toBe('STOPPED');
+    });
+
+    it('a soft-deleted computer is not admitted', async () => {
+        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1, deleted_at: NOW }] });
+        expect(await runAdmission(db, lease(U1, C1), deps)).toMatchObject({ admitted: false, reason: 'computer_deleted' });
+    });
+
+    it('a malformed egress_bytes refuses admission instead of counting as 0', async () => {
+        const { db, placements } = createFakePlacementDb({
+            placements: [placementRow({ computer_id: C1 })],
+            computers: [{ id: C1, user_id: U1 }],
+            usage: [{ computer_id: C1, user_id: U1, started_at: new Date(NOW.getTime() - 3_600_000), stopped_at: null, egress_bytes: 'lots' }],
+        });
+        await expect(runAdmission(db, lease(U1, C1), deps)).rejects.toThrow(/egress_bytes/);
+        expect(placements[0]!.state).toBe('STOPPED');
+    });
+
+    it('refuses outside READ COMMITTED before reading any counter', async () => {
+        const { db, statements, placements } = createFakePlacementDb(
+            { placements: [placementRow({ computer_id: C1 })], computers: [{ id: C1, user_id: U1 }] },
+            { isolation: 'repeatable read' },
+        );
+        await expect(runAdmission(db, lease(U1, C1), deps)).rejects.toThrow(/READ COMMITTED/);
+        expect(statements.map((s) => s.sql)).not.toContainEqual(expect.stringMatching(/placement:(computer-owner|count-running|cas)/));
+        expect(placements[0]!.state).toBe('STOPPED');
     });
 
     it('duplicate placements anywhere close admission', async () => {

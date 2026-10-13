@@ -12,9 +12,21 @@
 
 export type Env = Record<string, string | undefined>;
 
-/** The only value that enables anything AWS. */
+/** The only value that enables AWS admission and the aws-ec2 provider. */
 export function isAwsComputersEnabled(env: Env = process.env): boolean {
     return env.EZIL_AWS_COMPUTERS_ENABLED === '1';
+}
+
+/**
+ * Whether provider selection reads the placement table.
+ *
+ * 🔴 ONE-WAY. Once any placement row may exist this must stay on: with
+ * reads off every computer resolves to Cloudflare, so an aws-ec2 computer
+ * would silently fall back to an empty Cloudflare workspace. AWS admission
+ * implies reads, so the AWS flag can never be on with reads off.
+ */
+export function isPlacementReadEnabled(env: Env = process.env): boolean {
+    return env.EZIL_COMPUTE_PLACEMENT_READS === '1' || isAwsComputersEnabled(env);
 }
 
 export interface AwsAdmissionCaps {

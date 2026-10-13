@@ -2,7 +2,8 @@
  * AWS admission (docs/AWS-COMPUTERS.md C-3 "Leasing and admission", §4, R9).
  *
  * One READ COMMITTED transaction:
- *   1. `takeAdmissionLock` — the global advisory lock, FIRST statement.
+ *   1. `withAdmission` — opens the transaction; the global advisory lock is
+ *      its FIRST statement, and READ COMMITTED is asserted in that statement.
  *   2. `readAdmissionCounters` — the target computer's owner, running count, the user's other AWS
  *      computers, duplicate placements, this month's usage rows.
  *   3. `decideAdmission` — pure, below.
@@ -14,7 +15,7 @@
  */
 
 import {
-    takeAdmissionLock,
+    withAdmission,
     createAwsPlacement,
     leasePlacement,
     readAdmissionCounters,
@@ -30,6 +31,7 @@ export type AdmissionRefusal =
     | 'aws_disabled'
     | 'aws_config_invalid'
     | 'computer_not_owned'
+    | 'computer_deleted'
     | 'kill_switch'
     | 'duplicate_placement'
     | 'max_running'
@@ -47,7 +49,7 @@ export type AdmissionDecision = { admit: true } | { admit: false; reason: Admiss
  */
 export function decideAdmission(input: {
     config: AwsAdmissionConfig;
-    counters: Pick<AdmissionCounters, 'targetOwnerId' | 'runningCount' | 'userOtherAwsComputers' | 'duplicates' | 'usage'>;
+    counters: Pick<AdmissionCounters, 'targetOwnerId' | 'targetDeleted' | 'targetForeignUsage' | 'runningCount' | 'userOtherAwsComputers' | 'duplicates' | 'usage'>;
     userId: string;
     now: Date;
 }): AdmissionDecision {
@@ -58,7 +60,16 @@ export function decideAdmission(input: {
     const reasons: AdmissionRefusal[] = [];
     // The caller's pair is re-checked here: caps are per user, so admitting
     // for a computer the user does not own would bypass them.
-    if (counters.targetOwnerId === null || counters.targetOwnerId.toLowerCase() !== input.userId.toLowerCase()) reasons.push('computer_not_owned');
+    // Usage metered to another user means the computer row changed hands
+    // (see the ezil_computers RLS note in docs/aws-computers/sql/README.md).
+    if (
+        counters.targetOwnerId === null ||
+        counters.targetOwnerId.toLowerCase() !== input.userId.toLowerCase() ||
+        counters.targetForeignUsage > 0
+    ) {
+        reasons.push('computer_not_owned');
+    }
+    if (counters.targetDeleted) reasons.push('computer_deleted');
     if (config.killSwitch) reasons.push('kill_switch');
     if (counters.duplicates.length > 0) reasons.push('duplicate_placement');
     if (counters.runningCount >= caps.maxRunning) reasons.push('max_running');
@@ -88,8 +99,7 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
     if (!config.enabled) return { admitted: false, reason: config.reason, reasons: [config.reason] };
     const now = (deps.now ?? (() => new Date()))();
 
-    return db.transaction(async (tx) => {
-        const lock = await takeAdmissionLock(tx);
+    return withAdmission(db, async (tx, lock) => {
         const counters = await readAdmissionCounters(tx, lock, {
             userId: request.userId,
             computerId: request.computerId,
