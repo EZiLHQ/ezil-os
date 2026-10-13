@@ -274,7 +274,8 @@ volume as hostile input.
 
 | Control | Value / rule |
 |---|---|
-| Enable flag | `EZIL_AWS_COMPUTERS_ENABLED=1`; absent means no placement reads and no AWS admission |
+| Placement reads | `EZIL_COMPUTE_PLACEMENT_READS=1` turns on per-computer placement reads. It is **one-way**: once on (or once AWS has been enabled) it must never be turned off, or computers on EBS would start on Cloudflare. Absent means no placement statements at all |
+| AWS enable | `EZIL_AWS_COMPUTERS_ENABLED=1` gates AWS admission and the AWS provider, and implies placement reads. Absent means an `aws-ec2` computer refuses (`aws_disabled`); it never falls back to Cloudflare |
 | Running computers | `AWS_MAX_RUNNING`; pilot value 2 |
 | Computers per user | 1 |
 | Instance-hours | monthly aggregate cap, including idle running and pool hours; per-user cap |
