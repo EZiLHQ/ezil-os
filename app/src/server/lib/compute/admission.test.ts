@@ -120,8 +120,9 @@ describe('runAdmission (transactional)', () => {
         expect(sqls[0]).toBe('BEGIN');
         expect(sqls[1]).toMatch(/SELECT pg_advisory_xact_lock\(\$1::int4, 0\)/);
         expect(sqls.slice(2, 6).map((s) => s.match(/placement:([a-z-]+)/)?.[1])).toEqual(['count-running', 'count-user', 'duplicates', 'usage-month']);
-        expect(sqls[6]).toMatch(/placement:cas/);
-        expect(sqls[7]).toBe('COMMIT');
+        expect(sqls[6]).toMatch(/placement:read/); // the CAS duplicate pre-check
+        expect(sqls[7]).toMatch(/placement:cas/);
+        expect(sqls[8]).toBe('COMMIT');
         expect(sqls).not.toContainEqual(expect.stringMatching(/set transaction|isolation/i));
     });
 

@@ -20,8 +20,9 @@
  *   so the lock is the only thing that stops two creators.
  * - **Transitions** are compare-and-swap:
  *   `UPDATE … WHERE computer_id = $1 AND generation = $g AND lease_epoch = $e
- *   AND state = $from RETURNING`. Zero rows is a lost race, never retried
- *   here. More than one row means duplicates: the transaction is rolled back.
+ *   AND state = $from RETURNING`, preceded in the same transaction by a
+ *   duplicate check: a second row for the computer, whatever its keys,
+ *   refuses the transition. Zero rows is a lost race, never retried here.
  * - **Leasing** (`STOPPED → LEASED`, `lease_epoch + 1`) and AWS creation need
  *   an `AdmissionLock`, which only `takeAdmissionLock` can mint, in the same
  *   transaction (C-3: admission runs under one global advisory lock).
@@ -399,6 +400,9 @@ async function casInTx(
     bump: { generation: 0 | 1; leaseEpoch: 0 | 1 },
     fields: PlacementFields,
 ): Promise<TransitionResult> {
+    // A duplicate whose keys do not match the CAS would let this writer win
+    // while every reader fails closed. Refuse first, inside the transaction.
+    if ((await selectRows(tx, computerId)).length > 1) throw new PlacementIntegrityError('duplicate_placement', computerId);
     const sets: SQL[] = [
         sql`state = ${to}`,
         sql`generation = generation + ${bump.generation}`,
@@ -415,7 +419,7 @@ async function casInTx(
             RETURNING ${SELECT_COLUMNS}`),
     );
     if (rows.length === 0) return { ok: false, reason: 'cas_conflict' };
-    // Throwing inside the transaction rolls the multi-row update back.
+    // Belt and braces behind the pre-read: throwing inside the transaction rolls a multi-row update back.
     if (rows.length > 1) throw new PlacementIntegrityError('duplicate_placement', computerId);
     return { ok: true, placement: parsePlacementRow(rows[0]!, computerId) };
 }

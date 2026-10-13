@@ -194,6 +194,15 @@ describe('transitions: CAS on (computer_id, generation, lease_epoch, state)', ()
         expect(placements.map((p) => p.state)).toEqual(['LEASED', 'LEASED']);
     });
 
+    it('a duplicate with DIFFERENT keys still refuses the transition (found on real Postgres)', async () => {
+        const { db, placements } = createFakePlacementDb({
+            placements: [placementRow({ computer_id: A, state: 'LEASED', lease_epoch: 1 }), placementRow({ computer_id: A, state: 'STOPPED' })],
+        });
+        const e = await integrity(transitionPlacement(db, { computerId: A, expected: { generation: 1, leaseEpoch: 1, state: 'LEASED' }, to: 'STARTING' }));
+        expect(e.reason).toBe('duplicate_placement');
+        expect(placements.map((p) => p.state)).toEqual(['LEASED', 'STOPPED']);
+    });
+
     it('illegal edges are refused without a statement; LEASED is reachable only by leasing', async () => {
         const { db, statements } = at({ state: 'STOPPED' });
         expect(await transitionPlacement(db, { computerId: A, expected: { generation: 2, leaseEpoch: 5, state: 'STOPPED' }, to: 'LEASED' })).toEqual({ ok: false, reason: 'illegal_transition' });
