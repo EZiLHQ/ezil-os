@@ -48,6 +48,7 @@ check "merged overlay is nodev (§3a.7)" bash -c "findmnt -n -o OPTIONS '$H/run/
 check "data volume nosuid,nodev; profiles bind noexec" bash -c "findmnt -n -o OPTIONS '$D' | grep -q nosuid,nodev && ctr_sh a 'grep \" /var/lib/ezil-profiles \" /proc/mounts | grep -q noexec'"
 check "seccomp filter active, defaultAction ERRNO (allowlist mechanism)" bash -c "ctr_sh a 'grep -q \"^Seccomp:[[:space:]]*2\" /proc/self/status' && jq -e '.defaultAction==\"SCMP_ACT_ERRNO\"' '$HA/security/seccomp.json'"
 check "no_new_privs set" ctr_sh a 'grep -q "^NoNewPrivs:[[:space:]]*1" /proc/self/status'
+check "desktop runs WITHOUT CAP_NET_RAW (CapEff bit 13 clear)" ctr_sh a 'c=$((16#$(awk "/^CapEff/{print \$2}" /proc/self/status))); [ $((c & 0x2000)) -eq 0 ]'
 check "AppArmor: dedicated profile enforced" ctr_sh a "grep -q '${AA_PROFILE} (enforce)' /proc/self/attr/current"
 check "nested user namespace refused" ctr_sh a '! unshare -U true'
 check "mount refused" ctr_sh a '! mount -t tmpfs none /mnt'

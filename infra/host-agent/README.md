@@ -86,13 +86,15 @@ points at 10.200.0.1. Three dedicated chains carry the rules:
 
 | Chain | Rules |
 |---|---|
-| `EZIL-CT-FWD` (from FORWARD, first) | drop to 169.254/16, 10/8, 172.16/12, 192.168/16, 100.64/10, 0/8, 224/4, 240/4 and `vpcCidr`; accept the rest out; accept ESTABLISHED back; drop new inbound |
-| `EZIL-CT-IN` (from INPUT, first) | accept DNS udp/tcp 53 to 10.200.0.1; accept ESTABLISHED (replies to host-initiated connections, e.g. cloudflared → desktop); drop the rest |
+| `EZIL-CT-FWD` (from FORWARD, first) | **anti-spoof:** drop anything from `ezh0` not sourced from 10.200.0.2; drop to 169.254/16, 10/8, 172.16/12, 192.168/16, 100.64/10, 0/8, 224/4, 240/4 and `vpcCidr`; accept the rest out; accept ESTABLISHED back; drop new inbound |
+| `EZIL-CT-IN` (from INPUT, first) | anti-spoof as above; accept DNS udp/tcp 53 to 10.200.0.1; accept ESTABLISHED (replies to host-initiated connections, e.g. cloudflared → desktop); drop the rest |
 | `EZIL-CT-NAT` (nat POSTROUTING) | MASQUERADE the container out |
+| `EZIL-CT-FWD6`, `EZIL-CT-IN6` (ip6tables FORWARD/INPUT, first) | drop everything in or out of `ezh0`. IPv6 is also **disabled on `ezh0`** (`net.ipv6.conf.ezh0.disable_ipv6=1`, set when the veth is created, before the link comes up, so it never gets a link-local address) and in the container; the ip6tables drops are the second layer |
 
 `ensure_rules` is idempotent:
 - a chain already exactly as desired is left alone;
 - otherwise a fresh chain is built and swapped in behind a single jump;
+- the drift check also requires IPv6 to be off on `ezh0`, and `net-ensure` turns it back off;
 - `net-check` reports drift and `net-ensure` repairs it.
 
 The AMI makes systemd-resolved answer on 10.200.0.1 (`DNSStubListenerExtra`).
@@ -106,6 +108,12 @@ The AMI makes systemd-resolved answer on 10.200.0.1 (`DNSStubListenerExtra`).
 - The probe container resolves names through the host resolver and reaches the internet
   peer, but not the metadata, link-local, RFC1918 or host ports.
 - The host can still connect into the container.
+- **Anti-spoof:** a forged source (192.0.2.7, added outside the container, with a return
+  path in place) gets no connection, and the internet peer only ever sees the NATed
+  source.
+- **IPv6:** `ezh0` has IPv6 disabled and no address, not even link-local. With IPv6
+  deliberately re-enabled on both ends (test only), the container still cannot reach the
+  host over v6; the drift check reports it, and `net-ensure` restores it.
 - Re-applying the rules leaves `iptables-save` identical. A deleted rule is detected as
   drift, actually reopens the hole, and is repaired.
 - The real host's `ezh0`, `EZIL-CT` rules, `ip_forward` and test links are compared before
@@ -113,7 +121,9 @@ The AMI makes systemd-resolved answer on 10.200.0.1 (`DNSStubListenerExtra`).
 
 ## Container confinement (`desktop.py build_spec`)
 
-- Docker's default 14 capabilities only.
+- Docker's default capabilities **minus `CAP_NET_RAW`** (13): no raw or packet sockets, so
+  the container cannot forge packets. The full desktop (Xvfb, openbox, neko, Chrome,
+  code-server) boots and passes its gate without it (`test-boot`).
 - `noNewPrivileges`.
 - seccomp `security/seccomp.json`.
 - AppArmor `ezil-desktop` (`security/apparmor-ezil-desktop`).
@@ -253,6 +263,12 @@ directory, and it counts as killed only if the named check fails.
 | M33 | profile quarantine → refuse | `test-guard`: planted profiles/chrome |
 | M34 | an unpinned apt install | `test-units`: AMI pins |
 | M35 | obj.pkl not scrubbed | `test-units`: default scrub list |
+| M36 | anti-spoof rule removed | `test-network`: forged source |
+| M37 | ip6tables INPUT drop removed | `test-network`: v6 to the host with IPv6 re-enabled |
+| M38 | `net-ensure` no longer disables IPv6 on `ezh0` | `test-network`: repair |
+| M39 | drift check ignores IPv6 on `ezh0` | `test-network`: drift reported |
+| M40 | `CAP_NET_RAW` back in the spec | `test-network` (probe container) |
+| M41 | IPv6 never disabled on `ezh0` (both places) | `test-network`: no IPv6 address. Removing only the early, pre-link-up setting survives: `ensure_rules` sets it as well, and the early one only closes the window before the rules run |
 
 `worker/src/neko-persistent-profiles.test.ts` (bun) executes the real `start-neko.sh`
 profile block. It fails against the pre-change script.

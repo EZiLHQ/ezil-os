@@ -10,11 +10,11 @@ mutate() { # mutate <id> <file> <old> <new> <test> <expected FAIL substring>
     local id="$1" file="$2" old="$3" new="$4" test="$5" want="$6"
     if [ -n "${MUT_ONLY:-}" ] && [[ " $MUT_ONLY " != *" $id "* ]]; then return; fi
     rm -rf "$M"; cp -a "$HA" "$M"; find "$M" -name __pycache__ -prune -exec rm -rf {} \; 2>/dev/null
-    python3 - "$M/$file" "$old" "$new" <<'PY' || { echo "ERROR $id: anchor not found exactly once"; SURVIVED=$((SURVIVED+1)); return; }
+    python3 - "$M/$file" "$old" "$new" "${7:-one}" <<'PY' || { echo "ERROR $id: anchor not found as expected"; SURVIVED=$((SURVIVED+1)); return; }
 import sys
-p, old, new = sys.argv[1:4]
+p, old, new, mode = sys.argv[1:5]
 s = open(p).read()
-if s.count(old) != 1: sys.exit(1)
+if (mode == "one" and s.count(old) != 1) or (mode == "all" and s.count(old) < 1): sys.exit(1)
 open(p, "w").write(s.replace(old, new))
 PY
     # a mutated guard can let a long-running step start: bound every run, then clean up
@@ -64,6 +64,15 @@ mutate M33 lib/ezil_host/guard.py '            os.rename(leaf, moved, src_dir_fd
 mutate M34 ami/build-host-ami.sh 'apt-mark hold runc' 'apt-get install -y -q curl
 apt-mark hold runc' test-units.sh "AMI: every apt install is version-pinned"
 mutate M35 lib/ezil_host/config.py '"/var/lib/cloud/instances/*/obj.pkl", ' '' test-units.sh "agent default scrubs every cloud-init user-data copy"
+mutate M36 lib/ezil_host/desktop.py '    fwd = [["-i", HOST_IF, "!", "-s", f"{CT_IP}/32", "-j", "DROP"]]' '    fwd = []' test-network.sh "spoofed source 192.0.2.7 is dropped"
+mutate M37 lib/ezil_host/desktop.py '    in6 = [["-i", HOST_IF, "-j", "DROP"]]' '    in6 = []' test-network.sh "v6 to the host on ezh0 unreachable"
+mutate M38 lib/ezil_host/desktop.py '        _run(cfg, ["sysctl", "-q", "-w", f"net.ipv6.conf.{HOST_IF}.disable_ipv6=1"])
+        changed.append' '        changed.append' test-network.sh "net-ensure repairs: IPv6 off again on ezh0"
+mutate M39 lib/ezil_host/desktop.py '    return host_if_ipv6_off(cfg) and all(' '    return all(' test-network.sh "IPv6 re-enabled on ezh0 is reported as drift"
+mutate M40 lib/ezil_host/desktop.py 'CAPS = ["CAP_CHOWN",' 'CAPS = ["CAP_NET_RAW", "CAP_CHOWN",' test-network.sh "container has no CAP_NET_RAW"
+# M41: BOTH places that disable IPv6 on ezh0 removed (each alone is redundant with the
+# other for the end state; the early one only closes the window before ensure_rules runs)
+mutate M41 lib/ezil_host/desktop.py 'f"net.ipv6.conf.{HOST_IF}.disable_ipv6=1"' 'f"net.ipv6.conf.{HOST_IF}.forwarding=0"' test-network.sh "ezh0: IPv6 disabled and no IPv6 address" all
 if [ "${1:-}" != --quick ]; then
 mutate M17 lib/ezil_host/agent.py '        if blockable and dpkg_lock_held(self.cfg):
             return "busy"' '' test-boot.sh "a held dpkg lock (install in progress) blocks the idle stop"

@@ -16,7 +16,9 @@ import time
 from . import config as cfgmod
 from .fsops import Refused, clear_dir, remove_singletons
 
-CAPS = ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FSETID", "CAP_FOWNER", "CAP_MKNOD", "CAP_NET_RAW", "CAP_SETGID",
+# Docker's default set MINUS CAP_NET_RAW: no raw/packet sockets, so no forged packets
+# (the anti-spoof rule is the network-side fence). The desktop boots without it (test-boot).
+CAPS = ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FSETID", "CAP_FOWNER", "CAP_MKNOD", "CAP_SETGID",
         "CAP_SETUID", "CAP_SETFCAP", "CAP_SETPCAP", "CAP_NET_BIND_SERVICE", "CAP_SYS_CHROOT", "CAP_KILL",
         "CAP_AUDIT_WRITE"]
 OVL_OPTS = "index=off,redirect_dir=off,metacopy=off,xino=off"
@@ -77,8 +79,12 @@ HOST_IF, CT_IF = "ezh0", "ezc0"
 # "this network", multicast and reserved. The VPC CIDR is added when configured.
 BLOCKED = ["169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
            "0.0.0.0/8", "224.0.0.0/4", "240.0.0.0/4"]
-CHAINS = {("filter", "EZIL-CT-FWD"): ("FORWARD", "-I"), ("filter", "EZIL-CT-IN"): ("INPUT", "-I"),
-          ("nat", "EZIL-CT-NAT"): ("POSTROUTING", "-A")}
+CHAINS = {("iptables", "filter", "EZIL-CT-FWD"): ("FORWARD", "-I"),
+          ("iptables", "filter", "EZIL-CT-IN"): ("INPUT", "-I"),
+          ("iptables", "nat", "EZIL-CT-NAT"): ("POSTROUTING", "-A"),
+          # IPv6 is disabled on both veth ends; these drops are the belt-and-braces layer
+          ("ip6tables", "filter", "EZIL-CT-FWD6"): ("FORWARD", "-I"),
+          ("ip6tables", "filter", "EZIL-CT-IN6"): ("INPUT", "-I")}
 
 
 def _hostns(cfg):
@@ -94,29 +100,36 @@ def _run(cfg, argv, check=True, host=True):
 
 
 def desired_rules(cfg):
-    fwd = [["-i", HOST_IF, "-d", net, "-j", "DROP"] for net in BLOCKED + ([cfg["vpcCidr"]] if cfg.get("vpcCidr") else [])]
+    # anti-spoof first: the container may only send from its own address
+    fwd = [["-i", HOST_IF, "!", "-s", f"{CT_IP}/32", "-j", "DROP"]]
+    fwd += [["-i", HOST_IF, "-d", net, "-j", "DROP"] for net in BLOCKED + ([cfg["vpcCidr"]] if cfg.get("vpcCidr") else [])]
     fwd += [["-i", HOST_IF, "-j", "ACCEPT"],
             ["-o", HOST_IF, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
             ["-o", HOST_IF, "-j", "DROP"]]
-    inp = [["-i", HOST_IF, "-d", f"{HOST_IP}/32", "-p", "udp", "--dport", "53", "-j", "ACCEPT"],
+    inp = [["-i", HOST_IF, "!", "-s", f"{CT_IP}/32", "-j", "DROP"],
+           ["-i", HOST_IF, "-d", f"{HOST_IP}/32", "-p", "udp", "--dport", "53", "-j", "ACCEPT"],
            ["-i", HOST_IF, "-d", f"{HOST_IP}/32", "-p", "tcp", "--dport", "53", "-j", "ACCEPT"],
            ["-i", HOST_IF, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
            ["-i", HOST_IF, "-j", "DROP"]]
     nat = [["-s", f"{CT_IP}/32", "!", "-o", HOST_IF, "-j", "MASQUERADE"]]
-    return {("filter", "EZIL-CT-FWD"): fwd, ("filter", "EZIL-CT-IN"): inp, ("nat", "EZIL-CT-NAT"): nat}
+    fwd6 = [["-i", HOST_IF, "-j", "DROP"], ["-o", HOST_IF, "-j", "DROP"]]
+    in6 = [["-i", HOST_IF, "-j", "DROP"]]
+    return {("iptables", "filter", "EZIL-CT-FWD"): fwd, ("iptables", "filter", "EZIL-CT-IN"): inp,
+            ("iptables", "nat", "EZIL-CT-NAT"): nat,
+            ("ip6tables", "filter", "EZIL-CT-FWD6"): fwd6, ("ip6tables", "filter", "EZIL-CT-IN6"): in6}
 
 
-def _chain_ok(cfg, table, chain, rules):
-    listing = _run(cfg, ["iptables", "-w", "-t", table, "-S", chain], check=False)
+def _chain_ok(cfg, tool, table, chain, rules):
+    listing = _run(cfg, [tool, "-w", "-t", table, "-S", chain], check=False)
     if listing.returncode != 0:
         return False
     if len([l for l in listing.stdout.splitlines() if l.startswith("-A ")]) != len(rules):
         return False
     for r in rules:
-        if _run(cfg, ["iptables", "-w", "-t", table, "-C", chain] + r, check=False).returncode != 0:
+        if _run(cfg, [tool, "-w", "-t", table, "-C", chain] + r, check=False).returncode != 0:
             return False
-    parent, how = CHAINS[(table, chain)]
-    lines = _run(cfg, ["iptables", "-w", "-t", table, "-S", parent], check=False).stdout.splitlines()
+    parent, how = CHAINS[(tool, table, chain)]
+    lines = _run(cfg, [tool, "-w", "-t", table, "-S", parent], check=False).stdout.splitlines()
     jumps = [i for i, l in enumerate(lines) if l.split()[-2:] == ["-j", chain]]
     if len(jumps) != 1:
         return False
@@ -124,30 +137,39 @@ def _chain_ok(cfg, table, chain, rules):
     return how != "-I" or jumps[0] == 1
 
 
+def host_if_ipv6_off(cfg):
+    r = _run(cfg, ["sysctl", "-n", f"net.ipv6.conf.{HOST_IF}.disable_ipv6"], check=False)
+    return r.returncode == 0 and r.stdout.strip() == "1"
+
+
 def rules_ok(cfg):
-    return all(_chain_ok(cfg, t, c, r) for (t, c), r in desired_rules(cfg).items())
+    """The drift check: every chain exactly as desired AND IPv6 off on the host veth end."""
+    return host_if_ipv6_off(cfg) and all(_chain_ok(cfg, tool, t, c, r) for (tool, t, c), r in desired_rules(cfg).items())
 
 
 def ensure_rules(cfg):
     """Idempotent: a chain already exactly as desired is left alone; otherwise a fresh
     chain is built and swapped in behind the parent jump (no window without rules)."""
     changed = []
-    for (table, chain), rules in desired_rules(cfg).items():
-        if _chain_ok(cfg, table, chain, rules):
+    if not host_if_ipv6_off(cfg):
+        _run(cfg, ["sysctl", "-q", "-w", f"net.ipv6.conf.{HOST_IF}.disable_ipv6=1"])
+        changed.append(f"{HOST_IF}.disable_ipv6")
+    for (tool, table, chain), rules in desired_rules(cfg).items():
+        if _chain_ok(cfg, tool, table, chain, rules):
             continue
-        parent, how = CHAINS[(table, chain)]
+        parent, how = CHAINS[(tool, table, chain)]
         tmp = chain + "-N"
-        _run(cfg, ["iptables", "-w", "-t", table, "-F", tmp], check=False)
-        _run(cfg, ["iptables", "-w", "-t", table, "-X", tmp], check=False)
-        _run(cfg, ["iptables", "-w", "-t", table, "-N", tmp])
+        _run(cfg, [tool, "-w", "-t", table, "-F", tmp], check=False)
+        _run(cfg, [tool, "-w", "-t", table, "-X", tmp], check=False)
+        _run(cfg, [tool, "-w", "-t", table, "-N", tmp])
         for r in rules:
-            _run(cfg, ["iptables", "-w", "-t", table, "-A", tmp] + r)
-        _run(cfg, ["iptables", "-w", "-t", table, how, parent] + (["1"] if how == "-I" else []) + ["-j", tmp])
-        while _run(cfg, ["iptables", "-w", "-t", table, "-D", parent, "-j", chain], check=False).returncode == 0:
+            _run(cfg, [tool, "-w", "-t", table, "-A", tmp] + r)
+        _run(cfg, [tool, "-w", "-t", table, how, parent] + (["1"] if how == "-I" else []) + ["-j", tmp])
+        while _run(cfg, [tool, "-w", "-t", table, "-D", parent, "-j", chain], check=False).returncode == 0:
             pass
-        _run(cfg, ["iptables", "-w", "-t", table, "-F", chain], check=False)
-        _run(cfg, ["iptables", "-w", "-t", table, "-X", chain], check=False)
-        _run(cfg, ["iptables", "-w", "-t", table, "-E", tmp, chain])
+        _run(cfg, [tool, "-w", "-t", table, "-F", chain], check=False)
+        _run(cfg, [tool, "-w", "-t", table, "-X", chain], check=False)
+        _run(cfg, [tool, "-w", "-t", table, "-E", tmp, chain])
         changed.append(chain)
     if not rules_ok(cfg):
         raise Refused("network_rules_not_applied")
@@ -170,6 +192,8 @@ def netns_up(cfg):
     ns = cfg.netnsName
     if _run(cfg, ["ip", "link", "show", HOST_IF], check=False).returncode != 0:
         _run(cfg, ["ip", "link", "add", HOST_IF, "type", "veth", "peer", "name", CT_IF, "netns", ns])
+    # no IPv6 on the host end, set BEFORE the link comes up (so no link-local address exists)
+    _run(cfg, ["sysctl", "-q", "-w", f"net.ipv6.conf.{HOST_IF}.disable_ipv6=1"])
     _run(cfg, ["ip", "addr", "replace", f"{HOST_IP}/30", "dev", HOST_IF])
     _run(cfg, ["ip", "link", "set", HOST_IF, "up"])
     subprocess.run(["ip", "-n", ns, "addr", "replace", f"{CT_IP}/30", "dev", CT_IF], check=True)
