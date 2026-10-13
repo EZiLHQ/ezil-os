@@ -1,5 +1,5 @@
---- a/.github/scripts/production-migrations.mjs	2026-10-13 15:49:40.144438242 +0000
-+++ b/.github/scripts/production-migrations.mjs	2026-10-13 15:49:40.145983301 +0000
+--- a/.github/scripts/production-migrations.mjs	2026-10-13 16:11:18.394673080 +0000
++++ b/.github/scripts/production-migrations.mjs	2026-10-13 16:11:18.396781058 +0000
 @@ -94,6 +94,12 @@
  const routineTypes = { text: 'text', boolean: 'boolean', bool: 'boolean', smallint: 'smallint', int2: 'smallint', integer: 'integer', int: 'integer', int4: 'integer', bigint: 'bigint', int8: 'bigint', uuid: 'uuid', json: 'json', jsonb: 'jsonb', bytea: 'bytea', date: 'date', timestamp: 'timestamp without time zone', timestamptz: 'timestamp with time zone', numeric: 'numeric', decimal: 'numeric', varchar: 'character varying', real: 'real', float4: 'real', float8: 'double precision', interval: 'interval' };
  const reservedGrantees = ['public', 'current_user', 'session_user', 'current_role', 'group'];
@@ -13,18 +13,20 @@
  function parser(ts, schemas) {
    const p = { i: 0 };
    const is = value => ts[p.i]?.value === value && (ts[p.i].kind === 'word' || ts[p.i].kind === 'punctuation');
-@@ -205,6 +211,24 @@
+@@ -205,6 +211,26 @@
  export function parseMigrationSQL(sql, schemas) {
    const g = parser(tokenize(sql), schemas); const { p, ts, is, take, ident, qualified, column } = g;
    const routines = new Map(); const privileges = new Set(); const dropConstraints = new Set(); const dropTargets = []; let statements = 0;
 +  const plainName = label => { check(!(ts[p.i]?.kind === 'word' && bareKeywords.has(ts[p.i].value)), `Reserved word as ${label}; quote it`); return ident(); };
 +  const indexColumns = () => { take('('); plainName('index column'); while (is(',')) { take(','); plainName('index column'); } take(')'); };
 +  // Partial UNIQUE predicate: AND-joined `col IS [NOT] NULL` / `col = literal`
-+  // terms only. No OR, NOT, parentheses, operators, casts, calls or columns of
-+  // other tables; PostgreSQL resolves each column against the indexed table.
-+  const predicate = () => {
++  // terms only. No OR, NOT, parentheses, operators, casts or calls. A name is
++  // resolved by PostgreSQL against the indexed table only, and a name equal to
++  // that table's own name (its only range-variable alias here) is a WHOLE-ROW
++  // reference, not a column: `WHERE x IS NULL` on table x tests the row.
++  const predicate = table => {
 +    for (;;) {
-+      plainName('predicate column');
++      check(plainName('predicate column') !== table, 'Partial index predicate names the table itself (a whole-row reference), not a column');
 +      check(is('is') || is('='), 'Partial index predicate allows only IS [NOT] NULL or = literal');
 +      if (is('is')) { take('is'); if (is('not')) take('not'); take('null'); }
 +      else {
@@ -38,13 +40,13 @@
    const routine = () => {
      const routineName = g.routineName(); const identity = `${routineName}(${g.routineArgs().join(',')})`;
      check(!routines.has(identity), `Routine replaced twice: ${identity}`);
-@@ -280,9 +304,12 @@
+@@ -280,9 +306,12 @@
          take('or'); take('replace'); take('function'); routine();
        } else if (is('trigger')) {
          trigger();
 +      } else if (is('unique')) {
-+        take('unique'); take('index'); plainName('index name'); take('on'); qualified(); indexColumns();
-+        if (is('where')) { take('where'); predicate(); }
++        take('unique'); take('index'); plainName('index name'); take('on'); const [, table] = qualified(); indexColumns();
++        if (is('where')) { take('where'); predicate(table); }
        } else {
 -        take('index'); ident(); take('on'); qualified(); take('('); ident();
 -        while (is(',')) { take(','); ident(); } take(')');
