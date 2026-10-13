@@ -16,7 +16,9 @@ s = open(p).read()
 if s.count(old) != 1: sys.exit(1)
 open(p, "w").write(s.replace(old, new))
 PY
-    local out; out="$(EZIL_HOST_REPO="$REPO" "$M/test/$test" 2>&1)"
+    # a mutated guard can let a long-running step start: bound every run, then clean up
+    local out; out="$(EZIL_HOST_REPO="$REPO" timeout -k 10 900 "$M/test/$test" 2>&1)"
+    "$HERE/cleanup.sh" --keep-scratch >/dev/null 2>&1
     if grep -F "FAIL" <<<"$out" | grep -qF -- "$want"; then
         KILLED=$((KILLED+1)); printf 'KILLED    %-4s %-55s by %s: "%s"\n' "$id" "$(cut -c1-55 <<<"$4")" "$test" "$want"
     else

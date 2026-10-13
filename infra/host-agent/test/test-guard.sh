@@ -72,7 +72,7 @@ out="$(agent g boot-chain enroll 2>&1)"; rc=$?
 check "boot-chain stops at the guard (rc 2)" test $rc -eq 2
 check "boot-chain printed no step after the guard" bash -c "! grep -qE '^\[(clean|overlay|desktop|enroll)\]' <<<'$out'"
 for s in clean overlay desktop enroll cloudflared agent; do
-    expect_refuse "downstream step '$s' refuses without a guard stamp" guard_not_passed agent g "$s"
+    expect_refuse "downstream step '$s' refuses without a guard stamp" guard_not_passed timeout -k 5 20 env "$(host_env g)" "$AGENT" "$s"
 done
 check "no overlay mounted, no container created" bash -c "! mountpoint -q '$H/run/rootfs' && ! runc --root '$H/run/runc' state ${TAG}-g >/dev/null 2>&1"
 # a stamp from an older lease does not satisfy a newer one
