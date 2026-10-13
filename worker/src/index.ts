@@ -1766,9 +1766,10 @@ export function classifyFinalSystemCheckpoint(system: SystemFlushOutcome): Final
  * The 15-minute wall-clock cap holds even when alarms or caller retries
  * (teardown, reaper) arrive late or early.
  */
-export const SYSTEM_FINAL_MAX_RETRIES = 3;
-export const SYSTEM_FINAL_MAX_WAIT_MS = 15 * 60_000;
-export const SYSTEM_FINAL_RETRY_BACKOFF_SECONDS = [60, 180, 300] as const;
+// NOT exported: index.ts is the workerd entrypoint, and an exported non-handler value fails boot (boot.test.ts).
+const SYSTEM_FINAL_MAX_RETRIES = 3;
+const SYSTEM_FINAL_MAX_WAIT_MS = 15 * 60_000;
+const SYSTEM_FINAL_RETRY_BACKOFF_SECONDS = [60, 180, 300] as const;
 
 // ── Durable Object storage keys (EzilSandboxDO) ──────────────────────────────
 const WORKSPACE_FLUSH_CONTEXT_KEY = 'ezil:workspaceFlushContext';
