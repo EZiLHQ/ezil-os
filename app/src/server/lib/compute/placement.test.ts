@@ -63,6 +63,13 @@ describe('read: no row = cloudflare + r2; anything doubtful fails closed', () =>
         expect(p.record).toMatchObject({ generation: 3, leaseEpoch: 7, state: 'STOPPED' });
     });
 
+    it('an uppercase id from a caller still matches the lowercase ::text column', async () => {
+        // Postgres compares uuids by value and returns `::text` lowercase.
+        const db = { execute: async () => ({ rows: [{ ...placementRow({ computer_id: A }), generation: '1', lease_epoch: '0' }] }) };
+        const p = await readPlacement(db, A.toUpperCase());
+        expect(p.record?.computerId).toBe(A);
+    });
+
     it('two rows for one computer fail closed as duplicate_placement', async () => {
         const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A }), placementRow({ computer_id: A })] });
         expect((await integrity(readPlacement(db, A))).reason).toBe('duplicate_placement');

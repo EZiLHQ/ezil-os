@@ -240,7 +240,7 @@ export function parsePlacementRow(row: Record<string, unknown>, computerId: stri
     const state = oneOf(PLACEMENT_STATES, row.state) ? row.state : fail('unknown_state');
     const generation = counter(row.generation) ?? fail('invalid_row');
     const leaseEpoch = counter(row.lease_epoch) ?? fail('invalid_row');
-    if (row.computer_id !== computerId) fail('invalid_row');
+    if (typeof row.computer_id !== 'string' || row.computer_id.toLowerCase() !== computerId.toLowerCase()) fail('invalid_row');
     const text = (key: string) => {
         const v = nullableText(row[key]);
         return v === undefined ? fail('invalid_row') : v;
@@ -251,7 +251,7 @@ export function parsePlacementRow(row: Record<string, unknown>, computerId: stri
     };
     const updatedAt = time('updated_at') ?? fail('invalid_row');
     return {
-        computerId, provider, store, generation, leaseEpoch, state,
+        computerId: row.computer_id as string, provider, store, generation, leaseEpoch, state,
         region: text('region'), zoneId: text('zone_id'), instanceId: text('instance_id'),
         instanceType: text('instance_type'), volumeId: text('volume_id'), fsUuid: text('fs_uuid'),
         tunnelId: text('tunnel_id'), enrollNonceHash: text('enroll_nonce_hash'),
@@ -399,6 +399,7 @@ async function casInTx(
     to: PlacementState,
     bump: { generation: 0 | 1; leaseEpoch: 0 | 1 },
     fields: PlacementFields,
+    provider?: PlacementProvider,
 ): Promise<TransitionResult> {
     // A duplicate whose keys do not match the CAS would let this writer win
     // while every reader fails closed. Refuse first, inside the transaction.
@@ -415,7 +416,7 @@ async function casInTx(
     const rows = rowsOf(
         await tx.execute(sql`/* placement:cas */ UPDATE public.ezil_computer_placements
             SET ${sql.join(sets, sql`, `)}
-            WHERE computer_id = ${computerId}::uuid AND generation = ${expected.generation} AND lease_epoch = ${expected.leaseEpoch} AND state = ${expected.state}
+            WHERE computer_id = ${computerId}::uuid AND generation = ${expected.generation} AND lease_epoch = ${expected.leaseEpoch} AND state = ${expected.state}${provider ? sql` AND provider = ${provider}` : sql``}
             RETURNING ${SELECT_COLUMNS}`),
     );
     if (rows.length === 0) return { ok: false, reason: 'cas_conflict' };
@@ -452,6 +453,7 @@ export async function leasePlacement(
         'LEASED',
         { generation: input.replace ? 1 : 0, leaseEpoch: 1 },
         { leaseUntil: input.leaseUntil },
+        'aws-ec2', // a Cloudflare row is never leased under AWS caps
     );
 }
 
@@ -466,6 +468,8 @@ export interface UsageRow {
 }
 
 export interface AdmissionCounters {
+    /** `ezil_computers.user_id` of the target, or null when no such computer exists. */
+    targetOwnerId: string | null;
     /** aws-ec2 placements in a running-class state, any user. */
     runningCount: number;
     /** The user's OTHER aws-ec2 placements not yet PURGE_ELIGIBLE, soft-deleted computers included. */
@@ -482,6 +486,11 @@ export async function readAdmissionCounters(
     input: { userId: string; computerId: string; monthStart: Date; now: Date },
 ): Promise<AdmissionCounters> {
     assertAdmissionLock(tx, lock);
+    const ownerRows = rowsOf(
+        await tx.execute(sql`/* placement:computer-owner */ SELECT user_id::text AS user_id
+            FROM public.ezil_computers
+            WHERE id = ${input.computerId}::uuid`),
+    );
     const running = sql.join(RUNNING_CLASS_STATES.map((s) => sql`${s}`), sql`, `);
     const runningRows = rowsOf(
         await tx.execute(sql`/* placement:count-running */ SELECT count(*)::int AS n
@@ -510,7 +519,9 @@ export async function readAdmissionCounters(
         if (n === null) throw new Error('admission counter query returned no count');
         return n;
     };
+    const owner = ownerRows[0]?.user_id;
     return {
+        targetOwnerId: typeof owner === 'string' ? owner : null,
         runningCount: count(runningRows),
         userOtherAwsComputers: count(userRows),
         duplicates,

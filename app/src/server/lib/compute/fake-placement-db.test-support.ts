@@ -134,6 +134,10 @@ export function createFakePlacementDb(seed: FakeSeed = {}, clock: () => Date = (
                 for (const r of placements) counts.set(String(r.computer_id), (counts.get(String(r.computer_id)) ?? 0) + 1);
                 return { rows: [...counts].filter(([, n]) => n > 1).map(([computer_id, rows]) => ({ computer_id, rows })) };
             }
+            case 'computer-owner': {
+                const c = computers.find((x) => x.id === params[0]);
+                return { rows: c ? [{ user_id: c.user_id }] : [] };
+            }
             case 'count-running': {
                 const states = new Set(params as string[]);
                 const n = placements.filter((r) => r.provider === 'aws-ec2' && states.has(String(r.state))).length;

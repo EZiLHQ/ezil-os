@@ -29,7 +29,7 @@ const ENV = {
     EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '200',
 };
 const config = readAwsAdmissionConfig(ENV);
-const empty: Pick<AdmissionCounters, 'runningCount' | 'userOtherAwsComputers' | 'duplicates' | 'usage'> = { runningCount: 0, userOtherAwsComputers: 0, duplicates: [], usage: [] };
+const empty: Pick<AdmissionCounters, 'targetOwnerId' | 'runningCount' | 'userOtherAwsComputers' | 'duplicates' | 'usage'> = { targetOwnerId: U1, runningCount: 0, userOtherAwsComputers: 0, duplicates: [], usage: [] };
 const hoursRow = (userId: string, hours: number, egressBytes: number | null = 0) => ({
     computerId: C3,
     userId,
@@ -76,6 +76,8 @@ describe('decideAdmission (pure)', () => {
 
     it.each([
         ['disabled', {}, readAwsAdmissionConfig({}), 'aws_disabled'],
+        ['not the owner', { targetOwnerId: U2 }, config, 'computer_not_owned'],
+        ['no such computer', { targetOwnerId: null }, config, 'computer_not_owned'],
         ['kill switch', {}, readAwsAdmissionConfig({ ...ENV, EZIL_AWS_KILL_SWITCH: '1' }), 'kill_switch'],
         ['duplicates', { duplicates: [{ computerId: C1, rows: 2 }] }, config, 'duplicate_placement'],
         ['running at cap', { runningCount: 2 }, config, 'max_running'],
@@ -119,10 +121,10 @@ describe('runAdmission (transactional)', () => {
         const sqls = statements.map((s) => s.sql);
         expect(sqls[0]).toBe('BEGIN');
         expect(sqls[1]).toMatch(/SELECT pg_advisory_xact_lock\(\$1::int4, 0\)/);
-        expect(sqls.slice(2, 6).map((s) => s.match(/placement:([a-z-]+)/)?.[1])).toEqual(['count-running', 'count-user', 'duplicates', 'usage-month']);
-        expect(sqls[6]).toMatch(/placement:read/); // the CAS duplicate pre-check
-        expect(sqls[7]).toMatch(/placement:cas/);
-        expect(sqls[8]).toBe('COMMIT');
+        expect(sqls.slice(2, 7).map((s) => s.match(/placement:([a-z-]+)/)?.[1])).toEqual(['computer-owner', 'count-running', 'count-user', 'duplicates', 'usage-month']);
+        expect(sqls[7]).toMatch(/placement:read/); // the CAS duplicate pre-check
+        expect(sqls[8]).toMatch(/placement:cas/);
+        expect(sqls[9]).toBe('COMMIT');
         expect(sqls).not.toContainEqual(expect.stringMatching(/set transaction|isolation/i));
     });
 
@@ -186,6 +188,22 @@ describe('runAdmission (transactional)', () => {
             usage: [{ computer_id: C1, user_id: U1, started_at: new Date(NOW.getTime() - 100 * 3_600_000), stopped_at: null, egress_bytes: null }],
         });
         expect(await runAdmission(db, lease(U1, C1), deps)).toMatchObject({ admitted: false, reason: 'user_hours_cap' });
+    });
+
+    it("a create for another user's computer is refused before any write", async () => {
+        const { db, placements } = createFakePlacementDb({ computers: [{ id: C1, user_id: U2 }] });
+        expect(await runAdmission(db, { kind: 'create', userId: U1, computerId: C1 }, deps)).toMatchObject({ admitted: false, reason: 'computer_not_owned' });
+        expect(await runAdmission(db, { kind: 'create', userId: U1, computerId: C2 }, deps)).toMatchObject({ admitted: false, reason: 'computer_not_owned' });
+        expect(placements).toEqual([]);
+    });
+
+    it('a STOPPED Cloudflare row is never leased under AWS admission', async () => {
+        const { db, placements } = createFakePlacementDb({
+            placements: [placementRow({ computer_id: C1, provider: 'cloudflare', workspace_store: 'r2' })],
+            computers: [{ id: C1, user_id: U1 }],
+        });
+        expect(await runAdmission(db, lease(U1, C1), deps)).toMatchObject({ admitted: false, reason: 'cas_conflict' });
+        expect(placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 0 });
     });
 
     it('duplicate placements anywhere close admission', async () => {

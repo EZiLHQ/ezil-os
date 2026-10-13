@@ -3,7 +3,7 @@
  *
  * One READ COMMITTED transaction:
  *   1. `takeAdmissionLock` — the global advisory lock, FIRST statement.
- *   2. `readAdmissionCounters` — running count, the user's other AWS
+ *   2. `readAdmissionCounters` — the target computer's owner, running count, the user's other AWS
  *      computers, duplicate placements, this month's usage rows.
  *   3. `decideAdmission` — pure, below.
  *   4. On admit: `leasePlacement` (STOPPED → LEASED, lease_epoch + 1, by CAS)
@@ -29,6 +29,7 @@ import { BYTES_PER_GB, summarizeUsage, utcMonthStart } from './usage';
 export type AdmissionRefusal =
     | 'aws_disabled'
     | 'aws_config_invalid'
+    | 'computer_not_owned'
     | 'kill_switch'
     | 'duplicate_placement'
     | 'max_running'
@@ -46,7 +47,7 @@ export type AdmissionDecision = { admit: true } | { admit: false; reason: Admiss
  */
 export function decideAdmission(input: {
     config: AwsAdmissionConfig;
-    counters: Pick<AdmissionCounters, 'runningCount' | 'userOtherAwsComputers' | 'duplicates' | 'usage'>;
+    counters: Pick<AdmissionCounters, 'targetOwnerId' | 'runningCount' | 'userOtherAwsComputers' | 'duplicates' | 'usage'>;
     userId: string;
     now: Date;
 }): AdmissionDecision {
@@ -55,6 +56,9 @@ export function decideAdmission(input: {
     const { caps } = config;
     const usage = summarizeUsage(counters.usage, input.userId, input.now);
     const reasons: AdmissionRefusal[] = [];
+    // The caller's pair is re-checked here: caps are per user, so admitting
+    // for a computer the user does not own would bypass them.
+    if (counters.targetOwnerId === null || counters.targetOwnerId.toLowerCase() !== input.userId.toLowerCase()) reasons.push('computer_not_owned');
     if (config.killSwitch) reasons.push('kill_switch');
     if (counters.duplicates.length > 0) reasons.push('duplicate_placement');
     if (counters.runningCount >= caps.maxRunning) reasons.push('max_running');
