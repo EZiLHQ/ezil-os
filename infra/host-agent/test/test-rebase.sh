@@ -119,7 +119,7 @@ check "planted /.ezil-rebase-preserved renamed aside, /etc untouched" bash -c "j
 check "collision still preserved into a real preserve dir" bash -c "pd=\$(jq -r .preserved_dir '$T/hz.report'); [ -f '$T/hz'\$pd/usr/local/bin/ezil-collide ] && [ ! -L '$T/hz/.ezil-rebase-preserved' ]"
 check "whole deep tree walked (max_depth >= 5000) and the bottom file kept" bash -c "jq -e '.max_depth >= 5000 and .long_paths_kept >= 1' '$T/hz.report'"
 mk_hostile "$T/hz2"
-git -C "$HA" show fb6e296:infra/host-agent/spike/rebase-upper.py > "$T/spike-rebase.py" 2>/dev/null
+git -C "${EZIL_HOST_REPO:-$HA}" show fb6e296:infra/host-agent/spike/rebase-upper.py > "$T/spike-rebase.py" 2>/dev/null
 python3 "$T/spike-rebase.py" "$T/hz2" "$OLDL" "$NEWV" > /dev/null 2>"$T/hz2.err"; rc=$?
 check "(evidence) the recursive S1 spike rebase aborts on the same input (rc != 0)" test $rc -ne 0
 rm -rf "$T/hz" "$T/hz2" "$T/mut" "$T/seed-upper"
