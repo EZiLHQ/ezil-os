@@ -49,7 +49,6 @@ import {
     describeAppliedScreen,
     enableImplicitHosting,
     FOCUSABLE_APPS,
-    getGuacamoleSandboxStatus,
     isOwnDesktopOrigin,
     mintAppPreviewBootstrapToken,
     newCorrelationId,
@@ -58,12 +57,8 @@ import {
     probeDesktopFrame,
     readDesktopScreen,
     readWorkerBridgeUrl,
-    requestGuacamoleActivity,
-    requestGuacamoleDesktopRestart,
     requestGuacamoleFocusApp,
     requestRelayRefresh,
-    requestGuacamolePreview,
-    requestGuacamoleSandboxTerminate,
     readGuacamoleScreen,
     requestGuacamoleScreen,
     resolveCloudflareGuacamoleConfig,
@@ -71,6 +66,7 @@ import {
     fitScreenRequest,
     surfacePreviewErrorAsValue,
 } from '@/server/lib/cloudflare-guacamole-provider';
+import { selectComputeProvider } from '@/server/lib/compute/select';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 /** Ownership check shared by every procedure below — never trust a bare computerId. */
@@ -170,13 +166,12 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
             const correlationId = newCorrelationId();
 
-            const result = await requestGuacamolePreview(
-                config,
-                hmacSecret,
+            const computer = { userId: ctx.user.id, computerId: input.computerId };
+            const result = await selectComputeProvider(computer).ensure(
+                { correlationId },
+                computer,
                 {
                     sessionId: input.sessionId,
-                    userId: ctx.user.id,
-                    projectId: input.computerId,
                     desktopMode: 'neko',
                     // 🔴 OMITTED, not defaulted, when nothing usable was asked
                     // for. The Worker only injects `NEKO_SCREEN` when this
@@ -187,7 +182,6 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                         ? {}
                         : { screen: { width: screen.width, height: screen.height } }),
                 },
-                correlationId,
             );
 
             if (!result.ok) {
@@ -425,20 +419,14 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
             const correlationId = newCorrelationId();
 
-            const result = await requestGuacamolePreview(
-                config,
-                hmacSecret,
-                {
-                    // Same correlation convention as `../desktop/route.ts`'s
-                    // POST handler: defaulting sessionId to the computer id
-                    // when the shell has no separate session concept for it.
-                    sessionId: input.computerId,
-                    userId: ctx.user.id,
-                    projectId: input.computerId,
-                    desktopMode: 'neko',
-                },
-                correlationId,
-            );
+            const computer = { userId: ctx.user.id, computerId: input.computerId };
+            const result = await selectComputeProvider(computer).ensure({ correlationId }, computer, {
+                // Same correlation convention as `../desktop/route.ts`'s
+                // POST handler: defaulting sessionId to the computer id
+                // when the shell has no separate session concept for it.
+                sessionId: input.computerId,
+                desktopMode: 'neko',
+            });
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -602,17 +590,11 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
             const correlationId = newCorrelationId();
 
-            const result = await requestGuacamolePreview(
-                config,
-                hmacSecret,
-                {
-                    sessionId: input.computerId,
-                    userId: ctx.user.id,
-                    projectId: input.computerId,
-                    desktopMode: 'neko',
-                },
-                correlationId,
-            );
+            const computer = { userId: ctx.user.id, computerId: input.computerId };
+            const result = await selectComputeProvider(computer).ensure({ correlationId }, computer, {
+                sessionId: input.computerId,
+                desktopMode: 'neko',
+            });
 
             if (!result.ok) {
                 const logSafe = result.error.slice(0, 200);
@@ -871,7 +853,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
 
             const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
-            const status = await getGuacamoleSandboxStatus(config, sandboxName, correlationId);
+            const computer = { userId: ctx.user.id, computerId: input.computerId };
+            const status = await selectComputeProvider(computer).status({ correlationId }, computer);
 
             return { ...status, sandboxName, correlationId, provider: 'cloudflare-guacamole' as const };
         }),
@@ -887,10 +870,10 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 return { ok: false as const, error: 'provider_not_configured', provider: 'cloudflare-guacamole' as const };
             }
 
-            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
             const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
-            const result = await requestGuacamoleSandboxTerminate(config, hmacSecret, sandboxName, correlationId);
+            const computer = { userId: ctx.user.id, computerId: input.computerId };
+            const result = await selectComputeProvider(computer).terminate({ correlationId }, computer);
             // Report what the Worker actually confirmed, not a hardcoded
             // success — `result.ok` is false for still_running/destroy_failed,
             // a rejected signature, or an unreachable Worker.
@@ -1161,16 +1144,11 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 };
             }
 
-            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
-            const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
-            const result = await requestGuacamoleActivity(
-                config,
-                hmacSecret,
-                sandboxName,
-                input.lastInputAgoMs,
-                correlationId,
-            );
+            const computer = { userId: ctx.user.id, computerId: input.computerId };
+            const result = await selectComputeProvider(computer).activity({ correlationId }, computer, {
+                lastInputAgoMs: input.lastInputAgoMs,
+            });
 
             return {
                 ok: result.ok,
@@ -1209,10 +1187,9 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 };
             }
 
-            const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
-            const sandboxName = deriveGuacamoleSandboxId(ctx.user.id, input.computerId);
             const correlationId = newCorrelationId();
-            const result = await requestGuacamoleDesktopRestart(config, hmacSecret, sandboxName, correlationId);
+            const computer = { userId: ctx.user.id, computerId: input.computerId };
+            const result = await selectComputeProvider(computer).restart({ correlationId }, computer);
 
             if (!result.ok) {
                 return {

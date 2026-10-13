@@ -30,12 +30,8 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
 import { computers } from '@/server/db/schema';
-import {
-    deriveGuacamoleSandboxId,
-    newCorrelationId,
-    requestGuacamoleSandboxTerminate,
-    resolveCloudflareGuacamoleConfig,
-} from '@/server/lib/cloudflare-guacamole-provider';
+import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
+import { selectComputeProvider } from '@/server/lib/compute/select';
 import { computerCreateError } from './computer-errors';
 import {
     createComputerInLowestFreeSlot,
@@ -69,13 +65,8 @@ export { MAX_COMPUTERS_PER_USER, pickFreeSlot };
 async function terminateComputerSandbox(userId: string, computerId: string): Promise<void> {
     const config = resolveCloudflareGuacamoleConfig();
     if (!config.isConfigured) return;
-    const hmacSecret = process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '';
-    const result = await requestGuacamoleSandboxTerminate(
-        config,
-        hmacSecret,
-        deriveGuacamoleSandboxId(userId, computerId),
-        newCorrelationId(),
-    );
+    const computer = { userId, computerId };
+    const result = await selectComputeProvider(computer).terminate({ correlationId: newCorrelationId() }, computer);
     if (!result.ok) {
         throw new Error(`sandbox_terminate_not_confirmed: ${result.error ?? result.outcome ?? 'unknown'}`);
     }
