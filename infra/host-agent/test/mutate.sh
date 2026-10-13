@@ -59,6 +59,8 @@ mutate M29 lib/ezil_host/desktop.py '"-p", "udp", "--dport", "53", "-j", "ACCEPT
 mutate M30 lib/ezil_host/desktop.py '        if _chain_ok(cfg, table, chain, rules):
             continue' '' test-network.sh "net-ensure again changes nothing"
 mutate M31 lib/ezil_host/desktop.py '           ["-i", HOST_IF, "-j", "DROP"]]' '           ]' test-network.sh "host's own non-DNS port unreachable"
+mutate M32 lib/ezil_host/rebase.py '        if on("3") and is_owned(rel):' '        if (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)) and on("3") and is_owned(rel):' test-hostile.sh "FIFO and device node at image-owned paths are moved aside"
+mutate M33 lib/ezil_host/guard.py '            os.rename(leaf, moved, src_dir_fd=pfd, dst_dir_fd=pfd)' '            raise Refused("layout_not_a_real_directory", rel)' test-guard.sh "planted profiles/chrome symlink + FIFO: guard succeeds"
 if [ "${1:-}" != --quick ]; then
 mutate M17 lib/ezil_host/agent.py '        if blockable and dpkg_lock_held(self.cfg):
             return "busy"' '' test-boot.sh "a held dpkg lock (install in progress) blocks the idle stop"

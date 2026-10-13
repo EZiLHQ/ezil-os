@@ -17,7 +17,7 @@ Rules (from the S1 spike; each has a test that fails without it, test/test-rebas
   1  dpkg status: new image stanzas + the user's stanzas for packages the image lacks
      (user's original kept in the preserve dir). A non-regular status is moved aside.
   2  dpkg info/<pkg>.* of packages the new image ships: moved aside.
-  3  upper files/symlinks at paths the new image owns (dpkg-owned, or any non-dir the
+  3  upper files/symlinks/FIFOs/sockets/device nodes at paths the new image owns (dpkg-owned, or any non-dir the
      new lower ships under usr/ opt/ container-server/), /etc excluded: MOVED ASIDE to
      /.ezil-rebase-preserved/<ts>/<path>, never deleted (§3a.5).
   3w whiteouts at owned paths: removed (no data).
@@ -261,7 +261,10 @@ def rebase(upper_path, old_path, new_path, disabled=frozenset(), fault_after=Non
             else:
                 rep["kept"] += 1
             return
-        if (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)) and on("3") and is_owned(rel):
+        if on("3") and is_owned(rel):
+            # any non-directory at an image-owned path — file, symlink, FIFO, socket or
+            # device node — gives way to the image; only an identical regular file is
+            # dropped, everything else is moved aside by rename (never opened)
             if stat.S_ISREG(st.st_mode) and identical_to_old(dfd, name, rel, st):
                 os.unlink(name, dir_fd=dfd)
                 rep["removed_identical"].append("/" + rel)

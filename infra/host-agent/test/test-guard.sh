@@ -68,8 +68,18 @@ lease 2 6 true; expect_refuse "provision lease cannot re-init a non-empty volume
 mnt_rw; cp "$T/m.bak" "$M"; printf '{"state":"rebase_failed"}' > "$H/srv/ezil-data/.ezil-rebase-state.json"; unmnt
 lease 2 6 false; expect_refuse "rebase_failed state blocks the boot" rebase_failed agent g guard
 mnt_rw; rm -f "$H/srv/ezil-data/.ezil-rebase-state.json"; mv "$H/srv/ezil-data/profiles" "$T/profiles.bak" 2>/dev/null; ln -s /etc "$H/srv/ezil-data/profiles"; unmnt
-lease 2 6 false; expect_refuse "planted symlink in the volume layout" layout_not_a_real_directory agent g guard
+lease 2 7 false; expect_refuse "planted symlink at a host-only layout dir (data/profiles itself)" layout_not_a_real_directory agent g guard
+check "a layout refusal does not bump the marker (still epoch 3)" bash -c "mount -o ro,nosuid,nodev '$DEV' '$H/srv/ezil-data' && jq -e '.leaseEpoch==3' '$M'; rc=\$?; umount '$H/srv/ezil-data'; exit \$rc"
 mnt_rw; rm -f "$H/srv/ezil-data/profiles"; mv "$T/profiles.bak" "$H/srv/ezil-data/profiles"; unmnt
+
+# guest-planted profile entries (reachable through the profiles bind) are quarantined, not fatal
+mnt_rw; rm -rf "$H/srv/ezil-data/profiles/chrome" "$H/srv/ezil-data/profiles/code-server-data"
+ln -s /etc "$H/srv/ezil-data/profiles/chrome"; mkfifo "$H/srv/ezil-data/profiles/code-server-data"; unmnt
+lease 2 6 false; gout="$(agent g guard 2>&1)"
+check "planted profiles/chrome symlink + FIFO: guard succeeds and reports the quarantine" grep -q 'quarantined=profiles/chrome.ezil-quarantine-.*profiles/code-server-data.ezil-quarantine-' <<<"$gout"
+check "profiles/chrome is now a real directory; the symlink kept aside, /etc untouched" bash -c "[ -d '$H/srv/ezil-data/profiles/chrome' ] && [ ! -L '$H/srv/ezil-data/profiles/chrome' ] && [ -L \$(ls -d '$H'/srv/ezil-data/profiles/chrome.ezil-quarantine-* | head -n1) ] && [ -e /etc/hostname ]"
+check "profiles/code-server-data is a real directory; the FIFO kept aside" bash -c "[ -d '$H/srv/ezil-data/profiles/code-server-data' ] && [ -p \$(ls -d '$H'/srv/ezil-data/profiles/code-server-data.ezil-quarantine-* | head -n1) ]"
+agent g data-down >/dev/null
 
 # --- nothing downstream starts if the guard refused
 lease 2 2 false

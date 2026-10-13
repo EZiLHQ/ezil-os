@@ -17,7 +17,7 @@ intact() { ( cd "$HOST" && find . -type f -print0 | sort -z | xargs -0 sha256sum
 for v in old new; do mkdir -p "$W/$v/var/lib/dpkg/info" "$W/$v/usr/local/bin"; done
 printf 'Package: base\nStatus: install ok installed\nArchitecture: all\nVersion: 1\n' > "$W/old/var/lib/dpkg/status"
 printf 'Package: base\nStatus: install ok installed\nArchitecture: all\nVersion: 2\n' > "$W/new/var/lib/dpkg/status"
-printf '/.\n/usr/local/bin/start-neko.sh\n' > "$W/new/var/lib/dpkg/info/base.list"; echo v2 > "$W/new/usr/local/bin/start-neko.sh"
+printf '/.\n/usr/local/bin/start-neko.sh\n/usr/local/bin/tool2\n' > "$W/new/var/lib/dpkg/info/base.list"; echo v2 > "$W/new/usr/local/bin/start-neko.sh"; echo v2 > "$W/new/usr/local/bin/tool2"
 rb() { PYTHONPATH="$HA/lib" python3 -m ezil_host.rebase "$W/upper" "$W/old" "$W/new" >/dev/null 2>&1; }
 up() { rm -rf "$W/upper"; mkdir -p "$W/upper/var/lib/dpkg" "$W/upper/usr/local"; }
 py() { PYTHONPATH="$HA/lib" python3 -c "$1" >/dev/null 2>&1; }
@@ -29,6 +29,10 @@ check "rebase: dpkg/status = block device: device untouched" intact
 reset_host; up; mkfifo "$W/upper/var/lib/dpkg/status"
 PYTHONPATH="$HA/lib" timeout 20 python3 -m ezil_host.rebase "$W/upper" "$W/old" "$W/new" >/dev/null 2>&1; rc=$?
 check "rebase: dpkg/status = FIFO: never opened (no hang), moved aside" bash -c "[ $rc -eq 0 ] && [ ! -e '$W/upper/var/lib/dpkg/status' ]"
+reset_host; up; mkdir -p "$W/upper/usr/local/bin"; mkfifo "$W/upper/usr/local/bin/start-neko.sh"; mknod "$W/upper/usr/local/bin/tool2" c 1 3
+PYTHONPATH="$HA/lib" timeout 20 python3 -m ezil_host.rebase "$W/upper" "$W/old" "$W/new" > "$W/sp.json" 2>/dev/null; rc=$?
+check "rebase: FIFO and device node at image-owned paths are moved aside (not left shadowing the image)" bash -c "[ $rc -eq 0 ] && [ ! -e '$W/upper/usr/local/bin/start-neko.sh' ] && [ ! -e '$W/upper/usr/local/bin/tool2' ] && jq -e '(.moved_aside|index(\"/usr/local/bin/start-neko.sh\")) and (.moved_aside|index(\"/usr/local/bin/tool2\"))' '$W/sp.json'"
+check "rebase: moved-aside special files keep their type (renamed, never opened)" bash -c "pd=\$(jq -r .preserved_dir '$W/sp.json'); [ -p '$W/upper'\$pd/usr/local/bin/start-neko.sh ] && [ -c '$W/upper'\$pd/usr/local/bin/tool2 ]"
 reset_host; up; rmdir "$W/upper/var/lib/dpkg"; ln -s "$HOST/dpkg" "$W/upper/var/lib/dpkg"; ln -s "$HOST/bin" "$W/upper/usr/local/bin"; rb
 check "rebase: symlinked parents leave host files alone" intact
 reset_host; rm -rf "$W/upper"; ln -s "$HOST/rootdir" "$W/upper"; rb; rm -f "$W/upper"

@@ -19,6 +19,7 @@ import json
 import os
 import stat
 import subprocess
+import time
 
 from . import config as cfgmod
 from .fsops import DIR_FLAGS, Refused, read_regular_at, write_file_durable_at
@@ -165,10 +166,17 @@ def run_guard(cfg, lease, rebase_runner=None):
             root = os.open(cfg.dataMount, DIR_FLAGS)
             if verdict == "rebase_needed":
                 rebase_runner(cfg, lease, root)        # raises Refused('rebase_failed') on failure
+            for d in ("root/upper", "root/work", "workspace", "profiles"):
+                _mkdirs_nofollow(root, d)          # not reachable by the guest: refuse if odd
+            quarantined = []
+            for d in GUEST_LAYOUT:
+                q = _ensure_guest_dir(root, d)       # guest-writable: move an odd entry aside
+                if q:
+                    quarantined.append(q)
+            if quarantined:
+                verdict += " quarantined=" + ",".join(quarantined)
+            # the marker is bumped only after every check, rebase and layout step passed
             write_file_durable_at(root, MARKER, (json.dumps(new_marker(lease, digest)) + "\n").encode(), 0o600)
-            for d in ("root/upper", "root/work", "workspace", "profiles/chrome", "profiles/code-server-data",
-                      "profiles/code-server-extensions"):
-                _mkdirs_nofollow(root, d)
         finally:
             if root is not None:
                 os.close(root)
@@ -179,6 +187,33 @@ def run_guard(cfg, lease, rebase_runner=None):
     with open(stamp, "w") as f:
         json.dump({"generation": lease["generation"], "leaseEpoch": lease["leaseEpoch"]}, f)
     return verdict
+
+
+# Profile dirs live inside the /var/lib/ezil-profiles bind, so guest root can replace
+# them with a symlink, FIFO or file. Refusing would block the computer forever; instead
+# the odd entry is renamed aside (rename never follows) and a real directory created.
+GUEST_LAYOUT = ("profiles/chrome", "profiles/code-server-data", "profiles/code-server-extensions")
+
+
+def _ensure_guest_dir(root, rel):
+    parent, leaf = rel.rsplit("/", 1)
+    pfd = os.open(parent, DIR_FLAGS, dir_fd=root)
+    try:
+        try:
+            st = os.stat(leaf, dir_fd=pfd, follow_symlinks=False)
+        except FileNotFoundError:
+            st = None
+        moved = None
+        if st is not None and not stat.S_ISDIR(st.st_mode):
+            moved = f"{leaf}.ezil-quarantine-{int(time.time())}-{os.getpid()}"
+            os.rename(leaf, moved, src_dir_fd=pfd, dst_dir_fd=pfd)
+        if st is None or moved:
+            os.mkdir(leaf, 0o755, dir_fd=pfd)
+        os.close(os.open(leaf, DIR_FLAGS, dir_fd=pfd))      # must now be a real directory
+        os.fsync(pfd)
+        return f"{parent}/{moved}" if moved else None
+    finally:
+        os.close(pfd)
 
 
 def _mkdirs_nofollow(root, rel):
