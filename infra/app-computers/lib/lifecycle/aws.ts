@@ -17,11 +17,12 @@ export interface Dependencies {
 }
 /** Mutating SDK calls deliberately do not exist here. Standard owns them. */
 export function awsDependencies(settings:Settings,test?:{requestHandler:EC2ClientConfig['requestHandler'];credentials:EC2ClientConfig['credentials'];fetcher:typeof fetch}):Dependencies {
-    const opts={region:'us-east-1',maxAttempts:1,...(test?{credentials:test.credentials}:{}),
+    const region=settings.deployment.region;
+    const opts={region,maxAttempts:1,...(test?{credentials:test.credentials}:{}),
         requestHandler:test?.requestHandler??{connectionTimeout:2000,requestTimeout:5000,throwOnRequestTimeout:true}};
-    const ec2=new EC2Client({...opts,endpoint:'https://ec2.us-east-1.amazonaws.com'});
-    const sfn=new SFNClient({...opts,endpoint:'https://states.us-east-1.amazonaws.com'});
-    const secrets=new SecretsManagerClient({...opts,endpoint:'https://secretsmanager.us-east-1.amazonaws.com'});
+    const ec2=new EC2Client({...opts,endpoint:`https://ec2.${region}.amazonaws.com`});
+    const sfn=new SFNClient({...opts,endpoint:`https://states.${region}.amazonaws.com`});
+    const secrets=new SecretsManagerClient({...opts,endpoint:`https://secretsmanager.${region}.amazonaws.com`});
     const request=()=>({abortSignal:AbortSignal.timeout(6000)});
     return {now:Date.now,
         execution:arn=>sfn.send(new DescribeExecutionCommand({executionArn:arn}),request()),

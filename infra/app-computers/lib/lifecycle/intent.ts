@@ -4,14 +4,21 @@ import { z } from 'zod';
 const uuid = z.string().uuid().regex(/^[a-f0-9-]+$/);
 const positive = z.number().int().min(1).max(2147483647);
 export { LifecycleDeploymentSchema, type LifecycleDeployment } from './deployment.js';
-import { LifecycleDeploymentSchema } from './deployment.js';
+import { InstanceTypeSchema, LifecycleDeploymentSchema } from './deployment.js';
 const instance = z.string().regex(/^i-[a-f0-9]{17}$/), volume = z.string().regex(/^vol-[a-f0-9]{17}$/);
 export const LifecycleIntentSchema = z.object({
     schemaVersion: z.literal(1), jobId: uuid, computerId: uuid, revision: positive,
     operation: z.enum(['provision', 'start', 'stop', 'replace', 'retire']), targetGeneration: positive, fenceToken: uuid,
     providerInstanceId: instance.nullable(), dataVolumeId: volume.nullable(), previousGeneration: positive.nullable(),
     previousInstanceId: instance.nullable(), previousFenceToken: uuid.nullable(), deployment: LifecycleDeploymentSchema,
+    // R10/R11: the computer's tier picks a type from the deployment allowlist
+    // and, on provision only, a data size inside the configured range.
+    instanceType: InstanceTypeSchema, dataVolumeGiB: z.number().int().min(1).max(16384).nullable(),
 }).strict().refine(i => {
+    if (!i.deployment.instanceTypes.includes(i.instanceType)) return false;
+    if ((i.operation === 'provision') !== (i.dataVolumeGiB !== null)) return false;
+    if (i.dataVolumeGiB !== null && (i.dataVolumeGiB < i.deployment.storage.dataMinGiB
+        || i.dataVolumeGiB > i.deployment.storage.dataMaxGiB)) return false;
     if (i.operation === 'replace') return i.providerInstanceId === null && i.dataVolumeId !== null
         && i.previousGeneration !== null && i.previousGeneration < i.targetGeneration
         && i.previousInstanceId !== null && i.previousFenceToken !== null && i.previousFenceToken !== i.fenceToken;

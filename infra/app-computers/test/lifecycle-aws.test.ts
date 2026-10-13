@@ -3,7 +3,7 @@ import test from 'node:test';
 import { Readable } from 'node:stream';
 import { createHmac, createHash } from 'node:crypto';
 import { EC2Client, CreateVolumeCommand, RunInstancesCommand, StartInstancesCommand, StopInstancesCommand, TerminateInstancesCommand,
-    AttachVolumeCommand, ModifyInstanceAttributeCommand, CreateTagsCommand } from '@aws-sdk/client-ec2';
+    AttachVolumeCommand, CreateTagsCommand } from '@aws-sdk/client-ec2';
 import { awsDependencies } from '../lib/lifecycle/aws.js';
 import { AUTHORITY_PATH, token } from '../lib/lifecycle/contract.js';
 import { createLifecycleHelper } from '../lib/lifecycle/helper.js';
@@ -18,7 +18,7 @@ test('actual lifecycle read clients serialize bounded requests and sign the appl
         const body=typeof request.body==='string'?request.body:Buffer.from(request.body??[]).toString();
         const params=new URLSearchParams(body),action=request.headers['x-amz-target']?.split('.').at(-1)??params.get('Action');calls.push(action);
         assert.match(request.headers.authorization,/AWS4-HMAC-SHA256/);
-        assert.ok(['ec2.us-east-1.amazonaws.com','states.us-east-1.amazonaws.com','secretsmanager.us-east-1.amazonaws.com'].includes(request.hostname));
+        assert.ok(['ec2.ap-south-1.amazonaws.com','states.ap-south-1.amazonaws.com','secretsmanager.ap-south-1.amazonaws.com'].includes(request.hostname),request.hostname);
         if(action==='DescribeExecution')return json({...f.state.execution,startDate:f.state.now/1000});
         if(action==='GetSecretValue')return json({ARN:f.settings.authoritySecretArn,SecretString:key,VersionStages:['AWSCURRENT']});
         if(action==='DescribeInstances'){assert.equal(params.get('Filter.1.Name'),'client-token');assert.equal(params.get('Filter.1.Value.1'),token(f.digest,'instance'));return xml(action,'<reservationSet/>');}
@@ -42,7 +42,7 @@ test('actual lifecycle read clients serialize bounded requests and sign the appl
 });
 test('the actual EC2 SDK accepts allocation parameters and omits any invented StartInstances ClientToken',async()=>{
     const f=lifecycleFixture(),helper=createLifecycleHelper(f.settings,f.deps),requests:URLSearchParams[]=[];
-    const client=new EC2Client({region:'us-east-1',credentials,maxAttempts:1,requestHandler:{async handle(r:any){
+    const client=new EC2Client({region:'ap-south-1',credentials,maxAttempts:1,requestHandler:{async handle(r:any){
         const p=new URLSearchParams(typeof r.body==='string'?r.body:Buffer.from(r.body).toString());requests.push(p);return xml(p.get('Action')!);
     }}});
     try{
@@ -52,12 +52,14 @@ test('the actual EC2 SDK accepts allocation parameters and omits any invented St
         await client.send(new StopInstancesCommand({InstanceIds:[id],Force:false,Hibernate:false,SkipOsShutdown:false}));
         await client.send(new TerminateInstancesCommand({InstanceIds:[id]}));
         await client.send(new AttachVolumeCommand({InstanceId:id,VolumeId:f.state.volumes[0]!.VolumeId,Device:'/dev/sdf'}));
-        await client.send(new ModifyInstanceAttributeCommand({InstanceId:id,BlockDeviceMappings:[{DeviceName:'/dev/sdf',Ebs:{DeleteOnTermination:false}}]}));
         await client.send(new CreateTagsCommand({Resources:[f.state.volumes[0]!.VolumeId!],Tags:[{Key:'ezil:generation',Value:'1'}]}));
         assert.equal(requests[0]!.get('ClientToken'),token(f.digest,'volume'));assert.equal(requests[0]!.get('Encrypted'),'true');
         assert.equal(requests[1]!.get('LaunchTemplate.Version'),'1');assert.equal(requests[1]!.get('ClientToken'),token(f.digest,'instance'));
-        assert.equal(requests[1]!.get('BlockDeviceMapping.1.Ebs.VolumeSize'),'30');
+        assert.equal(requests[0]!.get('AvailabilityZoneId'),'aps1-az1');assert.equal(requests[0]!.get('AvailabilityZone'),null);
+        assert.equal(requests[0]!.get('Size'),'20');
+        assert.equal(requests[1]!.get('BlockDeviceMapping.1.Ebs.VolumeSize'),'20');assert.equal(requests[1]!.get('InstanceType'),'m6i.large');
+        assert.equal(requests[1]!.get('MetadataOptions.InstanceMetadataTags'),'disabled');assert.equal(requests[1]!.get('HibernationOptions.Configured'),'false');
+        assert.equal(requests[1]!.get('IamInstanceProfile.Arn'),null);
         assert.equal(requests[2]!.get('ClientToken'),null);assert.equal(requests[3]!.get('SkipOsShutdown'),'false');
-        assert.equal(requests[6]!.get('BlockDeviceMapping.1.Ebs.DeleteOnTermination'),'false');
     }finally{client.destroy()}
 });

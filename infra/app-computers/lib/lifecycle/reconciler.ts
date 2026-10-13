@@ -28,6 +28,11 @@ export function createLifecycleReconciler(settings: RecoverySettings, client: Pi
                 await reconcile(event.detail.executionArn);
             } else {
                 if (event?.source !== 'aws.events' || event['detail-type'] !== 'Scheduled Event') throw new Error();
+                // One bad entry must not abort the scan: reconcile each entry in
+                // isolation, finish every page, then surface the failures so the
+                // DLQ and alarm see them. Recovery names are deterministic, so a
+                // retried scan cannot start a second cleanup for the same job.
+                let failed = 0;
                 for (const status of ['FAILED', 'TIMED_OUT', 'ABORTED'] as const) {
                     let nextToken: string | undefined;
                     for (let page = 0; page < 10; page++) {
@@ -35,18 +40,24 @@ export function createLifecycleReconciler(settings: RecoverySettings, client: Pi
                             statusFilter: status, maxResults: 100, nextToken }), { abortSignal: AbortSignal.timeout(6000) });
                         let old = false;
                         for (const e of result.executions ?? []) {
-                            if (!e.executionArn || !e.startDate) throw new Error();
-                            if (now() - e.startDate.getTime() > 86400000) { old = true; break; }
-                            await reconcile(e.executionArn);
+                            if (e.startDate && now() - e.startDate.getTime() > 86400000) { old = true; break; }
+                            try {
+                                if (!e.executionArn || !e.startDate) throw new Error();
+                                await reconcile(e.executionArn);
+                            } catch { failed++; }
                         }
                         nextToken = result.nextToken;
                         if (!nextToken || old) break;
-                        if (page === 9) throw new Error();
+                        if (page === 9) failed++;
                     }
                 }
+                if (failed) throw new Error(`lifecycle_reconciliation_partial:${failed}`);
             }
             return { status: 'recovery_requested' };
-        } catch { throw new Error('lifecycle_reconciliation_unavailable'); }
+        } catch (error) {
+            if (error instanceof Error && /^lifecycle_reconciliation_partial:\d+$/.test(error.message)) throw error;
+            throw new Error('lifecycle_reconciliation_unavailable');
+        }
     };
 }
 let run: ReturnType<typeof createLifecycleReconciler> | undefined;
@@ -54,8 +65,9 @@ export async function handler(input: unknown) {
     try {
         if (!run) {
             const settings = RecoverySettingsSchema.parse(JSON.parse(process.env.EZIL_LIFECYCLE_RECOVERY_SETTINGS ?? ''));
-            run = createLifecycleReconciler(settings, new SFNClient({ region: 'us-east-1', maxAttempts: 1,
-                endpoint: 'https://states.us-east-1.amazonaws.com',
+            const region = settings.lifecycle.deployment.region;
+            run = createLifecycleReconciler(settings, new SFNClient({ region, maxAttempts: 1,
+                endpoint: `https://states.${region}.amazonaws.com`,
                 requestHandler: { connectionTimeout: 2000, requestTimeout: 5000, throwOnRequestTimeout: true } }));
         }
         return await run(input);

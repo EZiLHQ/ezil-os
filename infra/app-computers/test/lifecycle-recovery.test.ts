@@ -7,11 +7,13 @@ import { machineArn, type RecoverySettings } from '../lib/lifecycle/recovery-con
 import type { RecoveryDependencies } from '../lib/lifecycle/recovery-aws.js';
 import { tagsFor, tagList } from '../lib/lifecycle/contract.js';
 import { lifecycleFixture } from './lifecycle-fixture.js';
+import { runAsl, taskError } from './asl.js';
+import { toLambdaError } from '../lib/lifecycle/errors.js';
 
 function fixture(operation: Parameters<typeof lifecycleFixture>[0] = 'provision', allocated = true) {
     const f = lifecycleFixture(operation);
     const settings: RecoverySettings = { lifecycle: f.settings,
-        recoveryVersionArn: 'arn:aws:states:us-east-1:123456789012:stateMachine:ezil-lifecycle-recovery:1' };
+        recoveryVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-recovery:1' };
     const name = `cleanup-computer-${f.i.jobId}`;
     const arn = machineArn(settings.recoveryVersionArn).replace(':stateMachine:', ':execution:') + ':' + name;
     const source = { ...f.state.execution, status: 'FAILED', startDate: new Date(f.state.now - 120000), stopDate: new Date(f.state.now - 61000) };
@@ -41,9 +43,8 @@ function fixture(operation: Parameters<typeof lifecycleFixture>[0] = 'provision'
 
 async function run(f = fixture(), options: { lose?: string; noEffect?: string; staleOld?: boolean } = {}) {
     const helper = createRecoveryHelper(f.settings, f.deps), graph = recoveryDefinition('helper');
-    const data: Record<string, any> = {}, calls: { action: string; parameters: any }[] = [];
-    let next = graph.StartAt, lost = false;
-    const at = (path: string): any => path === '$$.Execution.Id' ? f.arn : path.slice(2).split('.').reduce((v, k) => v?.[k], data);
+    const calls: { action: string; parameters: any }[] = [];
+    let lost = false;
     if (options.staleOld) {
         const original = f.deps.instances; let stale = false;
         f.deps.instances = async selector => {
@@ -54,41 +55,28 @@ async function run(f = fixture(), options: { lose?: string; noEffect?: string; s
             return rows;
         };
     }
-    for (let n = 0; n < 1500; n++) {
-        const s = graph.States[next]; assert.ok(s);
-        if (s.Type === 'Fail') return { error: s.Error, calls, f };
-        if (s.Type === 'Pass') return { receipt: at(s.InputPath), calls, f };
-        if (s.Type === 'Choice') { next = s.Choices.find((c: any) => at(c.Variable) === c.StringEquals)?.Next ?? s.Default; continue; }
-        if (s.Type === 'Wait') { f.state.now += s.Seconds * 1000; next = s.Next; continue; }
-        assert.equal(s.Type, 'Task'); assert.equal(s.Retry, undefined);
-        const parameters = Object.fromEntries(Object.entries(s.Parameters as Record<string, any>)
-            .map(([key, value]) => [key.endsWith('.$') ? key.slice(0, -2) : key, key.endsWith('.$') ? at(value) : value]));
-        try {
-            if (s.Resource === 'helper') data.step = await helper(parameters);
-            else {
-                const action = s.Resource.split(':').at(-1)!; calls.push({ action, parameters });
-                const target = f.state.instances.find(i => i.InstanceId === (parameters.InstanceIds?.[0] ?? parameters.InstanceId))!;
-                if (action !== options.noEffect) {
-                    if (action === 'modifyInstanceAttribute') {
-                        assert.equal(parameters.BlockDeviceMappings[0].Ebs.DeleteOnTermination, false);
-                        target.BlockDeviceMappings!.find(m => m.Ebs?.VolumeId === f.state.volumes[0]!.VolumeId)!.Ebs!.DeleteOnTermination = false;
-                        f.state.volumes[0]!.Attachments![0]!.DeleteOnTermination = false;
-                    } else if (action === 'stopInstances') target.State = { Name: 'stopped' };
-                    else if (action === 'terminateInstances') {
-                        assert.equal(target.State?.Name, 'stopped');
-                        assert.ok(target.BlockDeviceMappings!.every(m => m.DeviceName === '/dev/xvda' || m.Ebs?.DeleteOnTermination === false));
-                        target.State = { Name: 'terminated' }; target.BlockDeviceMappings = [];
-                        const v = f.state.volumes[0]!;
-                        v.Attachments = v.Attachments!.filter(a => a.InstanceId !== target.InstanceId);
-                        if (!v.Attachments.length) v.State = 'available';
-                    } else assert.fail(`forbidden cleanup action: ${action}`);
-                }
-                if (action === options.lose && !lost) { lost = true; throw new Error('lost response'); }
+    for (const s of Object.values(graph.States) as any[]) if (s.Type === 'Task' && s.Resource !== 'helper') assert.equal(s.Retry, undefined);
+    const result = await runAsl(graph, { input: { sourceExecutionArn: f.executionArn }, executionArn: f.arn, maxSteps: 3000,
+        sleep: seconds => { f.state.now += seconds * 1000; },
+        invoke: async (resource, parameters) => {
+            if (resource === 'helper') { try { return await helper(parameters); } catch (error) { throw toLambdaError(error, 'lifecycle_recovery_unconfirmed'); } }
+            const action = resource.split(':').at(-1)!; calls.push({ action, parameters });
+            const target = f.state.instances.find(i => i.InstanceId === (parameters.InstanceIds?.[0] ?? parameters.InstanceId))!;
+            if (action !== options.noEffect) {
+                if (action === 'stopInstances') target.State = { Name: 'stopped' };
+                else if (action === 'terminateInstances') {
+                    assert.equal(target.State?.Name, 'stopped');
+                    assert.ok(target.BlockDeviceMappings!.every(m => m.DeviceName === '/dev/xvda' || m.Ebs?.DeleteOnTermination === false));
+                    target.State = { Name: 'terminated' }; target.BlockDeviceMappings = [];
+                    const v = f.state.volumes[0]!;
+                    v.Attachments = v.Attachments!.filter(a => a.InstanceId !== target.InstanceId);
+                    if (!v.Attachments.length) v.State = 'available';
+                } else assert.fail(`forbidden cleanup action: ${action}`);
             }
-            next = s.Next;
-        } catch { next = s.Catch[0].Next; }
-    }
-    throw new Error('unbounded recovery');
+            if (action === options.lose && !lost) { lost = true; throw taskError('Ec2.Ec2Exception', 'lost response'); }
+            return {};
+        } });
+    return { error: result.error, cause: result.cause, receipt: result.output, calls, f };
 }
 
 for (const operation of ['provision', 'start', 'stop', 'replace', 'retire'] as const) test(`recovery fences ${operation} writers and retains their data disk`, async () => {
@@ -113,18 +101,11 @@ for (const action of ['createVolume', 'runInstances']) test(`uncertain ${action}
     if (action === 'runInstances') { f.state.volumes.push(f.volume()); f.entered('runInstances'); }
     const result = await run(f); assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.equal(result.receipt, undefined); assert.deepEqual(result.calls, []);
 });
-test('recovery repairs DeleteOnTermination before terminating an interrupted attachment', async () => {
-    const f = fixture(); f.state.instances[0]!.BlockDeviceMappings![0]!.Ebs!.DeleteOnTermination = true;
+test('a data disk marked DeleteOnTermination is refused, never repaired or terminated', async () => {
+    const f = fixture(); f.state.instances.at(-1)!.BlockDeviceMappings!.find(m => m.DeviceName === '/dev/sdf')!.Ebs!.DeleteOnTermination = true;
     f.state.volumes[0]!.Attachments![0]!.DeleteOnTermination = true;
-    const result = await run(f); assert.equal(result.error, undefined);
-    assert.deepEqual(result.calls.map(c => c.action), ['modifyInstanceAttribute', 'stopInstances', 'terminateInstances']);
-});
-test('an uncertain preservation change never permits termination or reports fenced', async () => {
-    const f = fixture(); f.state.instances[0]!.BlockDeviceMappings![0]!.Ebs!.DeleteOnTermination = true;
-    f.state.volumes[0]!.Attachments![0]!.DeleteOnTermination = true;
-    const result = await run(f, { lose: 'modifyInstanceAttribute', noEffect: 'modifyInstanceAttribute' });
-    assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.equal(result.receipt, undefined);
-    assert.deepEqual(result.calls.map(c => c.action), ['modifyInstanceAttribute']);
+    const result = await run(f); assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.equal(result.receipt, undefined);
+    assert.deepEqual(result.calls, []); assert.match(result.cause!, /lifecycle_recovery_unconfirmed/);
 });
 test('a delayed allocation is observed and fenced without relaunching it', async () => {
     const f = fixture(), original = f.deps.instances; let reads = 0;

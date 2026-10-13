@@ -8,7 +8,7 @@ import { canonical } from '../lib/lifecycle/contract.js';
 import { lifecycleFixture } from './lifecycle-fixture.js';
 
 function wire(handle: (action: string, body: any) => { value: unknown; status?: number }) {
-    return new SFNClient({ region: 'us-east-1', maxAttempts: 1, endpoint: 'https://states.us-east-1.amazonaws.com',
+    return new SFNClient({ region: 'ap-south-1', maxAttempts: 1, endpoint: 'https://states.ap-south-1.amazonaws.com',
         credentials: { accessKeyId: 'ASIAABCDEFGHIJKLMNOP', secretAccessKey: 'test-only', sessionToken: 'test-only' },
         requestHandler: { async handle(request: any) {
             assert.match(request.headers.authorization, /AWS4-HMAC-SHA256/);
@@ -36,7 +36,7 @@ test('actual history requests follow pagination without execution data and rejec
 });
 test('actual reconciler requests bind the original numeric version and reuse a single cleanup name', async () => {
     const f = lifecycleFixture(), settings = { lifecycle: f.settings,
-        recoveryVersionArn: 'arn:aws:states:us-east-1:123456789012:stateMachine:ezil-lifecycle-recovery:1' };
+        recoveryVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-recovery:1' };
     let starts = 0, lists = 0, sourceStatus = 'FAILED'; const seen: string[] = [];
     const client = wire((action, body) => {
         seen.push(action);
@@ -64,7 +64,7 @@ test('actual reconciler requests bind the original numeric version and reuse a s
 });
 test('reconciliation refuses a redriven source before starting recovery', async () => {
     const f = lifecycleFixture(), settings = { lifecycle: f.settings,
-        recoveryVersionArn: 'arn:aws:states:us-east-1:123456789012:stateMachine:ezil-lifecycle-recovery:1' };
+        recoveryVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-recovery:1' };
     const client = wire(action => {
         assert.equal(action, 'DescribeExecution');
         return { value: { ...f.state.execution, startDate: f.state.now / 1000, redriveCount: 1, status: 'FAILED' } };
@@ -72,4 +72,28 @@ test('reconciliation refuses a redriven source before starting recovery', async 
     try { await assert.rejects(createLifecycleReconciler(settings, client)({ source: 'aws.states',
         detail: { stateMachineArn: f.state.execution.stateMachineArn, executionArn: f.executionArn } }), /reconciliation_unavailable/); }
     finally { client.destroy(); }
+});
+
+test('one bad scan entry cannot abort the scan; the failure is surfaced after every entry is tried', async () => {
+    const good = lifecycleFixture(), settings = { lifecycle: good.settings,
+        recoveryVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-recovery:1' };
+    const machine = good.state.execution.stateMachineArn.replace(':stateMachine:', ':execution:');
+    const bad = machine + ':computer-00000000-0000-4000-8000-000000000000', forged = machine + ':forged-entry';
+    const started: string[] = [];
+    const client = wire((action, body) => {
+        if (action === 'ListExecutions') return { value: { executions: body.statusFilter === 'FAILED'
+            ? [{ executionArn: forged, startDate: good.state.now / 1000 }, { executionArn: bad, startDate: good.state.now / 1000 },
+                { executionArn: good.executionArn, startDate: good.state.now / 1000 }] : [] } };
+        if (action === 'DescribeExecution') {
+            if (body.executionArn === bad) return { status: 500, value: { __type: 'InternalError', message: 'boom' } };
+            return { value: { ...good.state.execution, status: 'FAILED', startDate: good.state.now / 1000 } };
+        }
+        if (action === 'StartExecution') { started.push(body.name); return { value: { executionArn: 'x', startDate: good.state.now / 1000 } }; }
+        throw new Error('unexpected provider call');
+    });
+    try {
+        await assert.rejects(createLifecycleReconciler(settings, client, () => good.state.now)({ source: 'aws.events', 'detail-type': 'Scheduled Event' }),
+            /lifecycle_reconciliation_partial:2/);
+        assert.deepEqual(started, [`cleanup-computer-${good.i.jobId}`]);
+    } finally { client.destroy(); }
 });

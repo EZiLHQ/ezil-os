@@ -1,51 +1,83 @@
 import {
     CfnOutput, CfnParameter, RemovalPolicy, Stack, type StackProps,
-    aws_ec2 as ec2, aws_ecr as ecr, aws_iam as iam,
+    aws_ec2 as ec2, aws_ecr as ecr,
 } from 'aws-cdk-lib';
 import type { Construct } from 'constructs';
+import { z } from 'zod';
+import { DEFAULT_STORAGE, InstanceTypeSchema, REGION_PATTERN, ZONE_ID_PATTERN, zoneIdMatchesRegion } from './lifecycle/deployment.js';
+
+/** Foundation configuration. Region and ZoneIds are configuration, never
+ * literals (R1); zone names are never stored because they are account-mapped. */
+export const FoundationConfigSchema = z.object({
+    stage: z.enum(['pilot', 'production']),
+    region: z.string().regex(REGION_PATTERN),
+    /** One public subnet per ZoneId. A pilot uses exactly one. */
+    zoneIds: z.array(z.string().regex(ZONE_ID_PATTERN)).min(1).max(3),
+    /** Launch-template default; the lifecycle supplies the per-computer type. */
+    instanceType: InstanceTypeSchema,
+    rootVolumeGiB: z.number().int().min(8).max(64).default(DEFAULT_STORAGE.rootGiB),
+}).strict().superRefine((c, ctx) => {
+    if (new Set(c.zoneIds).size !== c.zoneIds.length) ctx.addIssue({ code: 'custom', path: ['zoneIds'], message: 'duplicate_zone_id' });
+    for (const zoneId of c.zoneIds) if (!zoneIdMatchesRegion(zoneId, c.region)) {
+        ctx.addIssue({ code: 'custom', path: ['zoneIds'], message: 'zone_not_in_region' });
+    }
+});
+export type FoundationConfig = z.infer<typeof FoundationConfigSchema>;
 
 export interface AppComputerFoundationProps extends StackProps {
-    readonly stage: 'pilot' | 'production';
+    readonly config: FoundationConfig;
 }
 
-/** Shared resources only. The lifecycle controller later creates one encrypted
- * data volume per computer and may launch an instance only after it has an
- * approved, pinned supervisor AMI and a generation-fenced runtime record. */
+/** Shared resources only. The lifecycle workflow later creates one encrypted
+ * data volume per computer and launches an instance only from an approved,
+ * pinned host AMI under a generation-fenced placement. */
 export class AppComputerFoundationStack extends Stack {
     constructor(scope: Construct, id: string, props: AppComputerFoundationProps) {
         super(scope, id, props);
+        const config = FoundationConfigSchema.parse(props.config);
+        if (props.env?.region !== config.region) throw new Error('stack region must equal the configured region');
 
-        const vpc = new ec2.Vpc(this, 'ComputerVpc', {
-            ipAddresses: ec2.IpAddresses.cidr('10.76.0.0/24'),
-            maxAzs: 1,
-            natGateways: 0,
-            subnetConfiguration: [{
-                name: 'computer-public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 27,
-            }],
+        // L1 networking on purpose: the L2 Vpc places subnets by account-mapped
+        // zone *names* (Fn::GetAZs / context lookups). A subnet here is pinned by
+        // AvailabilityZoneId and nothing else.
+        const vpc = new ec2.CfnVPC(this, 'ComputerVpc', {
+            cidrBlock: '10.76.0.0/24', enableDnsHostnames: true, enableDnsSupport: true,
+            tags: [{ key: 'Name', value: `ezil-app-computers-${config.stage}` }],
         });
-        // A public subnet gives the outbound Tunnel, SSM, ECR, and TURN a
-        // network path without a continuously billed NAT gateway. Security
-        // groups admit no inbound traffic; app ports bind only to loopback or
-        // private container networks. A pilot must validate TURN egress.
-        const subnet = vpc.publicSubnets[0];
-        if (!subnet) throw new Error('public computer subnet missing');
-        const cfnSubnet = subnet.node.defaultChild;
-        if (!(cfnSubnet instanceof ec2.CfnSubnet)) throw new Error('unexpected subnet construct');
-        cfnSubnet.mapPublicIpOnLaunch = true;
-
-        const securityGroup = new ec2.SecurityGroup(this, 'ComputerSecurityGroup', {
-            vpc, description: 'EZiL application computers; no inbound connections',
-            allowAllOutbound: false,
+        const gateway = new ec2.CfnInternetGateway(this, 'InternetGateway');
+        const attachment = new ec2.CfnVPCGatewayAttachment(this, 'InternetGatewayAttachment', {
+            vpcId: vpc.ref, internetGatewayId: gateway.ref,
         });
-        securityGroup.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443),
-            'Tunnel, ECR, SSM, and trusted HTTPS endpoints');
-        securityGroup.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.udp(3478),
-            'TURN media candidate for pilot validation');
-        securityGroup.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(3478),
-            'TURN TCP fallback candidate for pilot validation');
-        // Service-level egress allowlists are enforced by the host supervisor,
-        // not by this shared host security group.
+        const routes = new ec2.CfnRouteTable(this, 'PublicRoutes', { vpcId: vpc.ref });
+        const defaultRoute = new ec2.CfnRoute(this, 'DefaultRoute', {
+            routeTableId: routes.ref, destinationCidrBlock: '0.0.0.0/0', gatewayId: gateway.ref,
+        });
+        defaultRoute.addResourceDependency(attachment);
+        // R6: a public subnet gives the outbound tunnel and developer egress a
+        // path without a NAT gateway that bills while every computer is stopped.
+        // No load balancer; the security group admits no inbound traffic.
+        config.zoneIds.forEach((zoneId, index) => {
+            const subnet = new ec2.CfnSubnet(this, `ComputerSubnet${index}`, {
+                vpcId: vpc.ref, availabilityZoneId: zoneId, cidrBlock: `10.76.0.${index * 32}/27`,
+                mapPublicIpOnLaunch: true,
+                tags: [{ key: 'ezil:zone-id', value: zoneId }],
+            });
+            new ec2.CfnSubnetRouteTableAssociation(this, `ComputerSubnetRoutes${index}`, {
+                subnetId: subnet.ref, routeTableId: routes.ref,
+            });
+            new CfnOutput(this, `SubnetId${index}`, { value: subnet.ref, description: `Public computer subnet in ${zoneId}` });
+        });
 
+        // R6: no inbound rules at all; all outbound for developer-desktop parity
+        // (apt over 80, git over ssh). Egress is bounded by out-of-guest metering.
+        const securityGroup = new ec2.CfnSecurityGroup(this, 'ComputerSecurityGroup', {
+            vpcId: vpc.ref, groupDescription: 'EZiL application computers; no inbound connections',
+            securityGroupIngress: [],
+            securityGroupEgress: [{ ipProtocol: '-1', cidrIp: '0.0.0.0/0', description: 'All outbound (metered outside the guest)' }],
+        });
+
+        // The host AMI build pulls from this registry; hosts do not (R3: the
+        // image is pre-pulled into the AMI), so no host credential is needed.
         const imageRepository = new ecr.Repository(this, 'ApplicationImages', {
             imageTagMutability: ecr.TagMutability.IMMUTABLE,
             imageScanOnPush: true,
@@ -57,54 +89,48 @@ export class AppComputerFoundationStack extends Stack {
         // L2 omits AES_256 because it is ECR's default. Keep the reviewed
         // CloudFormation artifact explicit about encryption at creation.
         cfnRepository.encryptionConfiguration = { encryptionType: 'AES256' };
-        const instanceRole = new iam.Role(this, 'ComputerInstanceRole', {
-            assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
-            description: 'Host-only access for EZiL application computer supervisor',
-            managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore')],
-        });
-        imageRepository.grantPull(instanceRole);
-        const instanceProfile = new iam.CfnInstanceProfile(this, 'ComputerInstanceProfile', {
-            roles: [instanceRole.roleName],
-        });
 
-        // The controller supplies the exact AMI ID after it has been built,
-        // reviewed and tested. An unpinned latest AMI lookup is not a release.
-        const supervisorAmi = new CfnParameter(this, 'SupervisorAmiId', {
+        // R5: no instance role and no instance profile. See README "Host role".
+        const hostAmi = new CfnParameter(this, 'HostAmiId', {
             type: 'AWS::EC2::Image::Id',
-            description: 'Approved Linux/amd64 AMI containing the authenticated supervisor',
+            description: 'Approved Linux/amd64 host AMI (OS plus pre-pulled desktop image)',
         });
         const launchTemplate = new ec2.CfnLaunchTemplate(this, 'ComputerLaunchTemplate', {
-            launchTemplateName: `ezil-app-computer-${props.stage}`,
+            launchTemplateName: `ezil-app-computer-${config.stage}`,
             launchTemplateData: {
-                imageId: supervisorAmi.valueAsString,
-                instanceType: 'm7i.large',
-                securityGroupIds: [securityGroup.securityGroupId],
-                iamInstanceProfile: { arn: instanceProfile.attrArn },
+                imageId: hostAmi.valueAsString,
+                instanceType: config.instanceType,
+                securityGroupIds: [securityGroup.attrGroupId],
                 ebsOptimized: true,
                 monitoring: { enabled: false },
+                // R9: a guest-initiated shutdown stops (never terminates).
+                instanceInitiatedShutdownBehavior: 'stop',
+                // R12: hibernation off.
+                hibernationOptions: { configured: false },
+                // R5: IMDSv2 only, hop limit 1, instance tags not exposed.
                 metadataOptions: {
-                    httpEndpoint: 'enabled', httpTokens: 'required', httpPutResponseHopLimit: 1,
+                    httpEndpoint: 'enabled', httpTokens: 'required', httpPutResponseHopLimit: 1, instanceMetadataTags: 'disabled',
                 },
                 blockDeviceMappings: [{
-                    // The approved AMI must report this root device name.
+                    // R3: the root disk is disposable (OS + pre-pulled image) and
+                    // encrypted. The retained data disk is created per computer
+                    // by the lifecycle workflow, never by this template.
                     deviceName: '/dev/xvda',
-                    ebs: { volumeType: 'gp3', volumeSize: 30, encrypted: true, deleteOnTermination: true },
+                    ebs: { volumeType: 'gp3', volumeSize: config.rootVolumeGiB, encrypted: true, deleteOnTermination: true },
                 }],
                 tagSpecifications: [{
                     resourceType: 'instance',
                     tags: [
                         { key: 'ezil:managed-by', value: 'app-computer-platform' },
-                        { key: 'ezil:stage', value: props.stage },
+                        { key: 'ezil:stage', value: config.stage },
                     ],
                 }],
             },
         });
 
-        new CfnOutput(this, 'VpcId', { value: vpc.vpcId });
-        new CfnOutput(this, 'SubnetId', { value: subnet.subnetId });
-        new CfnOutput(this, 'SecurityGroupId', { value: securityGroup.securityGroupId });
+        new CfnOutput(this, 'VpcId', { value: vpc.ref });
+        new CfnOutput(this, 'SecurityGroupId', { value: securityGroup.attrGroupId });
         new CfnOutput(this, 'LaunchTemplateId', { value: launchTemplate.ref });
         new CfnOutput(this, 'ApplicationImageRepositoryUri', { value: imageRepository.repositoryUri });
-        new CfnOutput(this, 'InstanceProfileArn', { value: instanceProfile.attrArn });
     }
 }

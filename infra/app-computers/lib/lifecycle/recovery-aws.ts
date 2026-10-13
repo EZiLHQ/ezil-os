@@ -7,8 +7,9 @@ export interface RecoveryDependencies extends Pick<Dependencies, 'execution' | '
 }
 export function recoveryDependencies(settings: RecoverySettings): RecoveryDependencies {
     const reads = awsDependencies(settings.lifecycle);
-    const client = new SFNClient({ region: 'us-east-1', maxAttempts: 1,
-        endpoint: 'https://states.us-east-1.amazonaws.com',
+    const region = settings.lifecycle.deployment.region;
+    const client = new SFNClient({ region, maxAttempts: 1,
+        endpoint: `https://states.${region}.amazonaws.com`,
         requestHandler: { connectionTimeout: 2000, requestTimeout: 5000, throwOnRequestTimeout: true } });
     return { ...reads, history: arn => readRecoveryHistory(client, arn) };
 }

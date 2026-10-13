@@ -1,16 +1,21 @@
 import type { Instance, Volume, Tag, RunInstancesRequest } from '@aws-sdk/client-ec2';
 import { z } from 'zod';
-import { EnvelopeSchema, SettingsSchema, equal, phases, token, tagsFor, tagList, initialVolumeTags, writerProfile,
+import { EnvelopeSchema, SettingsSchema, equal, phases, token, tagsFor, retagsFor, tagList, initialVolumeTags,
     type Phase, type Action, type Settings } from './contract.js';
+import { MAX_THROTTLE_RETRIES, NO_ERROR, RecordedErrorSchema, classifyProviderError, throttleDelaySeconds, toLambdaError } from './errors.js';
 import { parseLifecycleWork, type LifecycleIntent, type LifecycleReceipt } from './intent.js';
 import { awsDependencies, type Dependencies } from './aws.js';
-const eventSchema=z.object({executionArn:z.string().max(300),phase:z.enum(phases)}).strict();
+const eventSchema=z.object({executionArn:z.string().max(300),phase:z.enum(phases),
+    lastError:RecordedErrorSchema.default(NO_ERROR),throttles:z.number().int().min(0).max(100).default(0)}).strict();
 export const tagged=(actual:Tag[]|undefined,expected:Record<string,string>)=>Object.entries(expected).every(([k,v])=>
     actual?.filter(t=>t.Key===k).length===1&&actual.find(t=>t.Key===k)?.Value===v);
 const fail=(code='lifecycle_unconfirmed'):never=>{throw new Error(code)};
 const wait=(phase:Phase)=>({decision:'wait',phase});
 const instanceId=(v:string|undefined):v is string=>/^i-[a-f0-9]{17}$/.test(v??'');
 const volumeId=(v:string|undefined):v is string=>/^vol-[a-f0-9]{17}$/.test(v??'');
+const ROOT_DEVICE='/dev/xvda',DATA_DEVICE='/dev/sdf';
+const dataSizeValid=(size:number|undefined,d:Settings['deployment'])=>
+    Number.isInteger(size)&&size!>=d.storage.dataMinGiB&&size!<=d.storage.dataMaxGiB;
 
 /** Reconstruct each operation from original Standard input, never caller IDs.
  * Uncertain operations retain their control-plane reservation. No mutations
@@ -27,8 +32,7 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
             ||Buffer.byteLength(execution.input)>20000||!execution.startDate)return fail();
         const envelope=EnvelopeSchema.parse(JSON.parse(execution.input));
         const work={...envelope,createdAt:execution.startDate},i=parseLifecycleWork(work);
-        const {instanceProfileArn,...pins}=i.deployment;
-        if(!equal(pins,d)||instanceProfileArn!==writerProfile(settings,i)||execution.name!==`computer-${i.jobId}`
+        if(!equal(i.deployment,d)||execution.name!==`computer-${i.jobId}`
             ||event.executionArn!==machine.replace(':stateMachine:',':execution:')+`:computer-${i.jobId}`)return fail('lifecycle_invalid');
         const now=deps.now(),started=execution.startDate.getTime();
         if(!Number.isFinite(started)||started>now+30000||now-started>900000)return fail('lifecycle_expired');
@@ -40,18 +44,27 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
             if(deps.now()-started>870000)return fail('lifecycle_expired');
             return {decision:name,parameters};
         };
+        // C-3: record the provider's answer to the previous task. Capacity and
+        // quota refusals end the run with their code; throttling (a definite
+        // no-effect rejection) re-arms the same step after a bounded backoff.
+        const previous=classifyProviderError(event.lastError);
+        if(previous.kind==='capacity')return {decision:'refused',code:previous.code};
+        if(previous.kind==='throttled'){
+            if(event.throttles>=MAX_THROTTLE_RETRIES)return fail('lifecycle_throttled');
+            return {decision:'backoff',phase:'initial',delaySeconds:throttleDelaySeconds(event.throttles)};
+        }
         const tags=tagsFor(i),phase=event.phase,newInstance=['provision','replace'].includes(i.operation);
         const volumes=await deps.volumes(i.dataVolumeId?[i.dataVolumeId]:{token:token(envelope.digest,'volume')});
         if(volumes.length>1)return fail('lifecycle_volume_ambiguous');
         const v=volumes[0];
         if(!v){
             if(i.operation!=='provision'||!['initial','volume'].includes(phase))return fail();
-            return action('createVolume',{AvailabilityZone:d.availabilityZone,Size:50,VolumeType:'gp3',Iops:3000,Throughput:125,
+            return action('createVolume',{AvailabilityZoneId:d.zoneId,Size:i.dataVolumeGiB,VolumeType:'gp3',Iops:3000,Throughput:125,
                 Encrypted:true,KmsKeyId:d.dataKeyArn,ClientToken:token(envelope.digest,'volume'),
                 TagSpecifications:[{ResourceType:'volume',Tags:tagList(initialVolumeTags(i,envelope.digest))}]});
         }
-        if(!volumeId(v.VolumeId)||v.VolumeType!=='gp3'||v.Size!==50||v.Encrypted!==true||v.KmsKeyId!==d.dataKeyArn
-            ||v.AvailabilityZone!==d.availabilityZone||v.MultiAttachEnabled!==false||!Array.isArray(v.Attachments))return fail('lifecycle_volume_invalid');
+        if(!volumeId(v.VolumeId)||v.VolumeType!=='gp3'||!dataSizeValid(v.Size,d)||v.Encrypted!==true||v.KmsKeyId!==d.dataKeyArn
+            ||v.AvailabilityZoneId!==d.zoneId||v.MultiAttachEnabled!==false||!Array.isArray(v.Attachments))return fail('lifecycle_volume_invalid');
         const previousTags=i.operation==='replace'?tagsFor(i,i.previousGeneration!,i.previousFenceToken!):tags;
         if(!tagged(v.Tags,tags)&&!(i.operation==='replace'&&tagged(v.Tags,previousTags)))return fail('lifecycle_volume_invalid');
         if(i.dataVolumeId&&v.VolumeId!==i.dataVolumeId)return fail();
@@ -76,6 +89,7 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
                     }
                     if(!['initial','stopped'].includes(phase))return wait(phase);
                     assertAttached(source,v,sourceId!);
+                    assertOnlyExpectedDisks(source,v);
                     return action('terminateInstances',{InstanceIds:[sourceId]});
                 }
                 if(status==='stopping')return wait(phase);
@@ -105,17 +119,19 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
             if(!tagged(v.Tags,tags)){
                 if(v.State!=='available'||v.Attachments.length)return fail();
                 if(phase==='tagged')return wait(phase);
-                return action('createTags',{Resources:[v.VolumeId],Tags:tagList(tags)});
+                // Only generation and fence move; identity tags were set at creation.
+                if(!tagged(v.Tags,{...tags,...{'ezil:generation':String(i.previousGeneration),'ezil:fence-token':i.previousFenceToken!}}))return fail('lifecycle_volume_invalid');
+                return action('createTags',{Resources:[v.VolumeId],Tags:tagList(retagsFor(i))});
             }
             if(v.State==='available'&&v.Attachments.length===0){
-                if(phase==='attached'||phase==='preserved')return wait(phase);
+                if(phase==='attached')return wait(phase);
                 if(target.State?.Name!=='running')return wait(phase);
-                return action('attachVolume',{Device:'/dev/sdf',InstanceId:targetId,VolumeId:v.VolumeId});
+                return action('attachVolume',{Device:DATA_DEVICE,InstanceId:targetId,VolumeId:v.VolumeId});
             }
             if(v.Attachments.length!==1||v.Attachments[0]?.InstanceId!==targetId||v.Attachments[0]?.VolumeId!==v.VolumeId)return fail();
             if(v.Attachments[0]?.State==='attaching'||!target.BlockDeviceMappings?.some(m=>m.Ebs?.VolumeId===v.VolumeId))return wait(phase);
-            if(phase!=='preserved')return action('modifyInstanceAttribute',{InstanceId:targetId,
-                BlockDeviceMappings:[{DeviceName:'/dev/sdf',Ebs:{VolumeId:v.VolumeId,DeleteOnTermination:false}}]});
+            // AttachVolume leaves DeleteOnTermination=false. The workflow has no
+            // ModifyInstanceAttribute right, so anything else fails closed here.
             assertAttached(target,v,targetId);
             if(target.State?.Name!=='running')return wait(phase);
             return success(i,envelope.digest,targetId,v.VolumeId,'running');
@@ -133,7 +149,17 @@ function success(i:LifecycleIntent,digest:string,instanceId:string,volumeId:stri
         generation:i.targetGeneration,fenceToken:i.fenceToken,instanceId,volumeId,state} satisfies LifecycleReceipt};
 }
 function assertIdentity(instance:Instance,tags:Record<string,string>,i:LifecycleIntent){
-    if(!instanceId(instance.InstanceId)||!tagged(instance.Tags,tags)||instance.Placement?.AvailabilityZone!==i.deployment.availabilityZone)return fail('lifecycle_instance_invalid');
+    // The subnet is bound to the configured ZoneId; a reported ZoneId must agree.
+    if(!instanceId(instance.InstanceId)||!tagged(instance.Tags,tags)||instance.SubnetId!==i.deployment.subnetId
+        ||(instance.Placement?.AvailabilityZoneId!==undefined&&instance.Placement.AvailabilityZoneId!==i.deployment.zoneId))return fail('lifecycle_instance_invalid');
+}
+/** Terminate guard: an instance carrying anything beyond its root disk and
+ * this computer's data disk is never terminated; the extra disk may be data. */
+export function assertOnlyExpectedDisks(instance:Instance,v:Volume){
+    const mappings=instance.BlockDeviceMappings;
+    if(!Array.isArray(mappings)||instance.RootDeviceName!==ROOT_DEVICE
+        ||mappings.filter(m=>m.DeviceName===ROOT_DEVICE).length>1
+        ||mappings.some(m=>m.DeviceName!==ROOT_DEVICE&&!(m.DeviceName===DATA_DEVICE&&m.Ebs?.VolumeId===v.VolumeId)))return fail('lifecycle_unexpected_disk');
 }
 async function getInstance(id:string,tags:Record<string,string>,i:LifecycleIntent,deps:Dependencies){
     const rows=await deps.instances([id]);if(rows.length!==1||rows[0]?.owner!==i.deployment.accountId||rows[0].instance.InstanceId!==id)return fail();
@@ -141,14 +167,15 @@ async function getInstance(id:string,tags:Record<string,string>,i:LifecycleInten
 }
 function assertAttached(instance:Instance,v:Volume,id:string){
     const m=instance.BlockDeviceMappings?.filter(m=>m.Ebs?.VolumeId===v.VolumeId),a=v.Attachments?.[0];
-    if(v.State!=='in-use'||m?.length!==1||m[0]?.DeviceName!=='/dev/sdf'||m[0]?.Ebs?.Status!=='attached'||m[0]?.Ebs?.DeleteOnTermination!==false
-        ||v.Attachments?.length!==1||a?.InstanceId!==id||a.VolumeId!==v.VolumeId||a.State!=='attached'||a.Device!=='/dev/sdf'||a.DeleteOnTermination!==false)return fail('lifecycle_attachment_invalid');
+    if(v.State!=='in-use'||m?.length!==1||m[0]?.DeviceName!==DATA_DEVICE||m[0]?.Ebs?.Status!=='attached'||m[0]?.Ebs?.DeleteOnTermination!==false
+        ||v.Attachments?.length!==1||a?.InstanceId!==id||a.VolumeId!==v.VolumeId||a.State!=='attached'||a.Device!==DATA_DEVICE||a.DeleteOnTermination!==false)return fail('lifecycle_attachment_invalid');
 }
 function assertEffectiveInstance(v:Instance,i:LifecycleIntent){
     const d=i.deployment;
-    if(v.ImageId!==d.amiId||v.InstanceType!=='m7i.large'||v.Architecture!=='x86_64'||v.RootDeviceType!=='ebs'||v.SubnetId!==d.subnetId
-        ||v.IamInstanceProfile?.Arn!==d.instanceProfileArn||v.SecurityGroups?.length!==1||v.SecurityGroups[0]?.GroupId!==d.securityGroupId
-        ||v.MetadataOptions?.HttpTokens!=='required'||v.MetadataOptions.HttpPutResponseHopLimit!==1)return fail('lifecycle_instance_invalid');
+    if(v.ImageId!==d.amiId||v.InstanceType!==i.instanceType||!d.instanceTypes.includes(v.InstanceType)||v.Architecture!=='x86_64'||v.RootDeviceType!=='ebs'||v.SubnetId!==d.subnetId
+        ||v.IamInstanceProfile!==undefined||v.SecurityGroups?.length!==1||v.SecurityGroups[0]?.GroupId!==d.securityGroupId
+        ||v.MetadataOptions?.HttpTokens!=='required'||v.MetadataOptions.HttpPutResponseHopLimit!==1
+        ||v.MetadataOptions.InstanceMetadataTags!=='disabled'||v.HibernationOptions?.Configured===true)return fail('lifecycle_instance_invalid');
 }
 async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencies):Promise<RunInstancesRequest>{
     const d=i.deployment;
@@ -157,22 +184,27 @@ async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencie
     if(image?.ImageId!==d.amiId||image.Architecture!=='x86_64'||image.RootDeviceType!=='ebs'||image.RootDeviceName!=='/dev/xvda'
         ||image.State!=='available'||image.VirtualizationType!=='hvm'||image.BlockDeviceMappings?.length!==1
         ||image.BlockDeviceMappings[0]?.DeviceName!=='/dev/xvda'||!image.BlockDeviceMappings[0]?.Ebs?.VolumeSize
-        ||image.BlockDeviceMappings[0].Ebs.VolumeSize>30||!t||template?.LaunchTemplateId!==d.launchTemplateId
+        ||image.BlockDeviceMappings[0].Ebs.VolumeSize>d.storage.rootGiB||!t||template?.LaunchTemplateId!==d.launchTemplateId
         ||String(template.VersionNumber)!==d.launchTemplateVersion)return fail('lifecycle_launch_invalid');
-    const allowed=['ImageId','InstanceType','SecurityGroupIds','IamInstanceProfile','EbsOptimized','Monitoring','MetadataOptions','BlockDeviceMappings','TagSpecifications'];
-    if(Object.keys(t).some(k=>!allowed.includes(k))||t.ImageId!==d.amiId||t.InstanceType!=='m7i.large'
+    const allowed=['ImageId','InstanceType','SecurityGroupIds','EbsOptimized','Monitoring','MetadataOptions','BlockDeviceMappings','TagSpecifications',
+        'InstanceInitiatedShutdownBehavior','HibernationOptions'];
+    if(Object.keys(t).some(k=>!allowed.includes(k))||t.ImageId!==d.amiId||(t.InstanceType!==undefined&&!d.instanceTypes.includes(t.InstanceType as never))
+        ||t.HibernationOptions?.Configured===true
         ||!equal(t.SecurityGroupIds,[d.securityGroupId])
         ||t.BlockDeviceMappings?.length!==1||t.BlockDeviceMappings[0]?.DeviceName!=='/dev/xvda')return fail('lifecycle_launch_invalid');
     return {LaunchTemplate:{LaunchTemplateId:d.launchTemplateId,Version:d.launchTemplateVersion},ImageId:d.amiId,
-        InstanceType:'m7i.large',MinCount:1,MaxCount:1,ClientToken:token(digest,'instance'),
-        SubnetId:d.subnetId,SecurityGroupIds:[d.securityGroupId],IamInstanceProfile:{Arn:d.instanceProfileArn},
-        Placement:{AvailabilityZone:d.availabilityZone},MetadataOptions:{HttpEndpoint:'enabled',HttpTokens:'required',HttpPutResponseHopLimit:1,InstanceMetadataTags:'enabled'},
-        EbsOptimized:true,Monitoring:{Enabled:false},BlockDeviceMappings:[{DeviceName:'/dev/xvda',Ebs:{VolumeType:'gp3',VolumeSize:30,Encrypted:true,KmsKeyId:d.dataKeyArn,DeleteOnTermination:true}}],
+        InstanceType:i.instanceType,MinCount:1,MaxCount:1,ClientToken:token(digest,'instance'),
+        SubnetId:d.subnetId,SecurityGroupIds:[d.securityGroupId],
+        MetadataOptions:{HttpEndpoint:'enabled',HttpTokens:'required',HttpPutResponseHopLimit:1,InstanceMetadataTags:'disabled'},
+        HibernationOptions:{Configured:false},
+        EbsOptimized:true,Monitoring:{Enabled:false},
+        // R3: the root disk is disposable (OS + pre-pulled image); the data disk is retained.
+        BlockDeviceMappings:[{DeviceName:ROOT_DEVICE,Ebs:{VolumeType:'gp3',VolumeSize:d.storage.rootGiB,Encrypted:true,KmsKeyId:d.dataKeyArn,DeleteOnTermination:true}}],
         TagSpecifications:[{ResourceType:'instance',Tags:tagList(tagsFor(i))},{ResourceType:'volume',Tags:tagList({...tagsFor(i),'ezil:disk-kind':'root'})}]};
 }
 let helper:ReturnType<typeof createLifecycleHelper>|undefined;
 export async function handler(input:unknown){
     try {if(!helper){const settings=SettingsSchema.parse(JSON.parse(process.env.EZIL_LIFECYCLE_SETTINGS??''));helper=createLifecycleHelper(settings,awsDependencies(settings));}
         return await helper(input);
-    }catch{return fail('lifecycle_unconfirmed')}
+    }catch(error){throw toLambdaError(error,'lifecycle_unconfirmed')}
 }

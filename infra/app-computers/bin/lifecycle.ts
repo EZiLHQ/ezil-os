@@ -16,4 +16,4 @@ try {
     if(config.recoveryVersionArn)new ComputerLifecycleRecovery(stack,'Recovery',{
         settings:{lifecycle:config.settings,recoveryVersionArn:config.recoveryVersionArn},
         sourceHistoryKey:lifecycle.historyKey,enabled:config.recoveryEnabled});
-}catch{throw new Error('EZIL_LIFECYCLE_CONFIG is missing or invalid; supply reviewed references without credentials')}
+}catch(cause){throw new Error("EZIL_LIFECYCLE_CONFIG is missing or invalid; supply reviewed references without credentials",{cause})}

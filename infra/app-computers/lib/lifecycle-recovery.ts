@@ -5,18 +5,19 @@ import { CfnOutput, Duration, RemovalPolicy, aws_cloudwatch as cloudwatch, aws_e
 import { Construct } from 'constructs';
 import { RecoverySettingsSchema, machineArn, type RecoverySettings } from './lifecycle/recovery-contract.js';
 import { recoveryDefinition } from './lifecycle/recovery-definition.js';
+import { DENIED_ACTIONS } from './computer-lifecycle.js';
 
 export class ComputerLifecycleRecovery extends Construct {
     readonly machine: states.CfnStateMachine;
     readonly version: states.CfnStateMachineVersion;
     constructor(scope: Construct, id: string, props: { settings: RecoverySettings; sourceHistoryKey: kms.IKey; enabled?: boolean }) {
         super(scope, id);
-        const s = RecoverySettingsSchema.parse(props.settings), d = s.lifecycle.deployment;
+        const s = RecoverySettingsSchema.parse(props.settings), d = s.lifecycle.deployment, r = d.region;
         const originalMachine = machineArn(d.stateMachineVersionArn), recoveryMachine = machineArn(s.recoveryVersionArn);
         const key = new kms.Key(this, 'HistoryKey', { enableKeyRotation: true, removalPolicy: RemovalPolicy.RETAIN });
-        key.addToResourcePolicy(new iam.PolicyStatement({ principals: [new iam.ServicePrincipal('logs.us-east-1.amazonaws.com')],
+        key.addToResourcePolicy(new iam.PolicyStatement({ principals: [new iam.ServicePrincipal(`logs.${r}.amazonaws.com`)],
             actions: ['kms:Encrypt*', 'kms:Decrypt*', 'kms:ReEncrypt*', 'kms:GenerateDataKey*', 'kms:Describe*'], resources: ['*'],
-            conditions: { ArnLike: { 'kms:EncryptionContext:aws:logs:arn': `arn:aws:logs:us-east-1:${d.accountId}:log-group:*` } } }));
+            conditions: { ArnLike: { 'kms:EncryptionContext:aws:logs:arn': `arn:aws:logs:${r}:${d.accountId}:log-group:*` } } }));
         const log = (name: string) => new logs.LogGroup(this, name, { encryptionKey: key,
             retention: logs.RetentionDays.ONE_WEEK, removalPolicy: RemovalPolicy.RETAIN });
         const observer = new nodejs.NodejsFunction(this, 'Observer', {
@@ -31,15 +32,16 @@ export class ComputerLifecycleRecovery extends Construct {
         observer.addToRolePolicy(new iam.PolicyStatement({ actions: ['states:GetExecutionHistory'],
             resources: [originalMachine.replace(':stateMachine:', ':execution:') + ':computer-*'] }));
         observer.addToRolePolicy(new iam.PolicyStatement({ actions: ['ec2:DescribeInstances', 'ec2:DescribeVolumes'], resources: ['*'],
-            conditions: { StringEquals: { 'aws:RequestedRegion': 'us-east-1' } } }));
+            conditions: { StringEquals: { 'aws:RequestedRegion': r } } }));
         props.sourceHistoryKey.grantDecrypt(observer); key.grantDecrypt(observer);
         const role = new iam.Role(this, 'RecoveryRole', { assumedBy: new iam.ServicePrincipal('states.amazonaws.com', {
             conditions: { StringEquals: { 'aws:SourceAccount': d.accountId }, ArnEquals: { 'aws:SourceArn': recoveryMachine } } }) });
         observer.currentVersion.grantInvoke(role); key.grantEncryptDecrypt(role);
-        role.addToPolicy(new iam.PolicyStatement({ actions: ['ec2:StopInstances', 'ec2:TerminateInstances', 'ec2:ModifyInstanceAttribute'],
-            resources: [`arn:aws:ec2:us-east-1:${d.accountId}:instance/*`], conditions: { StringEquals: {
-                'aws:RequestedRegion': 'us-east-1', 'ec2:ResourceTag/ezil:managed-by': 'app-computer-platform',
+        role.addToPolicy(new iam.PolicyStatement({ actions: ['ec2:StopInstances', 'ec2:TerminateInstances'],
+            resources: [`arn:aws:ec2:${r}:${d.accountId}:instance/*`], conditions: { StringEquals: {
+                'aws:RequestedRegion': r, 'ec2:ResourceTag/ezil:managed-by': 'app-computer-platform',
                 'ec2:ResourceTag/ezil:stage': d.namespace } } }));
+        role.addToPolicy(new iam.PolicyStatement({ effect: iam.Effect.DENY, actions: [...DENIED_ACTIONS], resources: ['*'] }));
         role.addToPolicy(new iam.PolicyStatement({ actions: ['logs:CreateLogDelivery', 'logs:GetLogDelivery', 'logs:UpdateLogDelivery',
             'logs:DeleteLogDelivery', 'logs:ListLogDeliveries', 'logs:PutResourcePolicy', 'logs:DescribeResourcePolicies', 'logs:DescribeLogGroups'], resources: ['*'] }));
         const workflowLogs = log('WorkflowLogs');

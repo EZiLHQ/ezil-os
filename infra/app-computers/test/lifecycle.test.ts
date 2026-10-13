@@ -5,58 +5,61 @@ import { lifecycleDefinition } from '../lib/lifecycle/definition.js';
 import { token } from '../lib/lifecycle/contract.js';
 import type { LifecycleIntent } from '../lib/lifecycle/intent.js';
 import { lifecycleFixture } from './lifecycle-fixture.js';
+import { runAsl, taskError } from './asl.js';
+import { toLambdaError, MAX_THROTTLE_RETRIES } from '../lib/lifecycle/errors.js';
+import { LifecycleIntentSchema } from '../lib/lifecycle/intent.js';
 
-async function run(operation:LifecycleIntent['operation'],options:{lose?:string;noEffect?:string;revokeAfter?:string;foreignDisk?:boolean;deleteDisk?:boolean;staleOldAfterLaunch?:boolean}={}){
-    const f=lifecycleFixture(operation),helper=createLifecycleHelper(f.settings,f.deps),graph=lifecycleDefinition('helper');
+type Options={lose?:string;noEffect?:string;revokeAfter?:string;foreignDisk?:boolean;deleteDisk?:boolean;staleOldAfterLaunch?:boolean;
+    fail?:{action:string;times:number;error:Error};extraDisk?:boolean;fixture?:ReturnType<typeof lifecycleFixture>};
+async function run(operation:LifecycleIntent['operation'],options:Options={}){
+    const f=options.fixture??lifecycleFixture(operation),helper=createLifecycleHelper(f.settings,f.deps),graph=lifecycleDefinition('helper');
     if(options.foreignDisk)f.state.volumes[0]!.Tags=[];
-    if(options.deleteDisk)f.state.instances[0]!.BlockDeviceMappings![0]!.Ebs!.DeleteOnTermination=true;
+    if(options.deleteDisk)f.state.instances[0]!.BlockDeviceMappings!.find(m=>m.DeviceName==='/dev/sdf')!.Ebs!.DeleteOnTermination=true;
+    if(options.extraDisk)f.state.instances[0]!.BlockDeviceMappings!.push({DeviceName:'/dev/sdg',Ebs:{VolumeId:'vol-99999999999999999',Status:'attached',DeleteOnTermination:false}});
     if(options.staleOldAfterLaunch){const original=f.deps.instances;let stale=true;f.deps.instances=async selector=>{
         const rows=await original(selector);if(Array.isArray(selector)&&f.state.instances.length===2&&stale){stale=false;rows[0]!.instance.State={Name:'stopped'};}return rows;};}
-    const data:Record<string,any>={},calls:{action:string;parameters:any}[]=[];let lost=false,next=graph.StartAt;
-    const at=(path:string):any=>path==='$$.Execution.Id'?f.executionArn:path.slice(2).split('.').reduce((o,k)=>o?.[k],data);
-    for(let n=0;n<1000;n++){
-        const s=graph.States[next];assert.ok(s,next);
-        if(s.Type==='Fail')return {error:s.Error,calls,f};
-        if(s.Type==='Pass')return {receipt:at(s.InputPath),calls,f};
-        if(s.Type==='Choice'){next=s.Choices.find((c:any)=>at(c.Variable)===c.StringEquals)?.Next??s.Default;continue;}
-        if(s.Type==='Wait'){f.state.now+=s.Seconds*1000;next=s.Next;continue;}
-        assert.equal(s.Type,'Task');assert.equal(s.Retry,undefined);
-        const parameters=Object.fromEntries(Object.entries(s.Parameters as Record<string,any>).map(([k,v])=>[k.endsWith('.$')?k.slice(0,-2):k,k.endsWith('.$')?at(v):v]));
-        try{
-            if(s.Resource==='helper')data.step=await helper(parameters);
-            else{
-                const action=s.Resource.split(':').at(-1)!;calls.push({action,parameters});
-                const target=f.state.instances.find(i=>i.InstanceId===(parameters.InstanceIds?.[0]??parameters.InstanceId));
-                if(action!==options.noEffect){
-                    if(action==='createVolume')f.state.volumes.push(f.volume());
-                    if(action==='runInstances')f.state.instances.push(f.instance('i-33333333333333333'));
-                    if(action==='startInstances')target!.State={Name:'running'};
-                    if(action==='stopInstances')target!.State={Name:'stopped'};
-                    if(action==='terminateInstances'){assert.equal(target!.State?.Name,'stopped');target!.State={Name:'terminated'};
-                        const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];target!.BlockDeviceMappings=[];}
-                    if(action==='createTags')f.state.volumes[0]!.Tags=parameters.Tags;
-                    if(action==='attachVolume')f.attach(f.state.volumes[0]!,target!);
-                    if(action==='modifyInstanceAttribute'){assert.equal(parameters.BlockDeviceMappings[0].Ebs.DeleteOnTermination,false);}
-                }
-                if(action===options.revokeAfter)f.state.authorized=false;
-                if(action===options.lose&&!lost){lost=true;throw new Error('lost response');}
+    const calls:{action:string;parameters:any}[]=[];let lost=false,failures=0;
+    for(const s of Object.values(graph.States) as any[])if(s.Type==='Task'&&s.Resource!=='helper')assert.equal(s.Retry,undefined,'EC2 tasks never retry automatically');
+    const result=await runAsl(graph,{input:f.envelope,executionArn:f.executionArn,sleep:seconds=>{f.state.now+=seconds*1000;},
+        invoke:async(resource,parameters)=>{
+            if(resource==='helper'){try{return await helper(parameters);}catch(error){throw toLambdaError(error,'lifecycle_unconfirmed');}}
+            const action=resource.split(':').at(-1)!;calls.push({action,parameters});
+            if(options.fail?.action===action&&failures<options.fail.times){failures++;throw options.fail.error;}
+            const target=f.state.instances.find(i=>i.InstanceId===(parameters.InstanceIds?.[0]??parameters.InstanceId));
+            if(action!==options.noEffect){
+                if(action==='createVolume')f.state.volumes.push(f.volume());
+                if(action==='runInstances')f.state.instances.push(f.instance('i-33333333333333333'));
+                if(action==='startInstances')target!.State={Name:'running'};
+                if(action==='stopInstances')target!.State={Name:'stopped'};
+                if(action==='terminateInstances'){assert.equal(target!.State?.Name,'stopped');target!.State={Name:'terminated'};
+                    const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];target!.BlockDeviceMappings=[];}
+                if(action==='createTags'){const v=f.state.volumes[0]!;v.Tags=[...v.Tags!.filter(t=>!parameters.Tags.some((n:any)=>n.Key===t.Key)),...parameters.Tags];}
+                if(action==='attachVolume')f.attach(f.state.volumes[0]!,target!);
             }
-            next=s.Next;
-        }catch{next=s.Catch[0].Next;}
-    }throw new Error('unbounded workflow');
+            if(action===options.revokeAfter)f.state.authorized=false;
+            if(action===options.lose&&!lost){lost=true;throw taskError('Ec2.Ec2Exception','lost response');}
+            return {};
+        }});
+    return {error:result.error,cause:result.cause,receipt:result.output,calls,f,visited:result.visited};
 }
 for(const operation of ['provision','start','stop','replace','retire'] as const)test(`${operation}: shipped Standard graph observes real operation sequence and retained data disk`,async()=>{
     const r=await run(operation);assert.equal(r.error,undefined);assert.ok(r.receipt);assert.equal(r.receipt.jobId,r.f.i.jobId);
     assert.equal(r.receipt.state,operation==='stop'?'stopped':operation==='retire'?'retired':'running');assert.equal(r.f.state.volumes.length,1);
     assert.equal(r.receipt.volumeId,r.f.state.volumes[0]!.VolumeId);assert.ok(r.f.state.authorityCalls>0);
     if(operation==='replace'){
-        assert.deepEqual(r.calls.map(c=>c.action),['stopInstances','terminateInstances','runInstances','createTags','attachVolume','modifyInstanceAttribute']);
+        assert.deepEqual(r.calls.map(c=>c.action),['stopInstances','terminateInstances','runInstances','createTags','attachVolume']);
         assert.equal(r.f.state.instances[0]!.State?.Name,'terminated');
+        // Retag moves only generation and fence; identity tags are creation-only.
+        assert.deepEqual(r.calls.find(c=>c.action==='createTags')!.parameters.Tags.map((t:any)=>t.Key).sort(),['ezil:fence-token','ezil:generation']);
     }
     if(operation==='provision'){
-        const allocation=r.calls.find(c=>c.action==='createVolume')!.parameters;assert.equal(allocation.Size,50);assert.equal(allocation.Encrypted,true);
+        const allocation=r.calls.find(c=>c.action==='createVolume')!.parameters;assert.equal(allocation.Size,20);assert.equal(allocation.Encrypted,true);
+        assert.equal(allocation.AvailabilityZoneId,'aps1-az1');assert.equal(allocation.AvailabilityZone,undefined);
         const launch=r.calls.find(c=>c.action==='runInstances')!.parameters;assert.equal(launch.MinCount,1);assert.equal(launch.MaxCount,1);
-        assert.equal(launch.MetadataOptions.HttpPutResponseHopLimit,1);assert.equal(launch.BlockDeviceMappings[0].Ebs.VolumeSize,30);
+        assert.equal(launch.InstanceType,'m6i.large');assert.equal(launch.IamInstanceProfile,undefined);assert.equal(launch.Placement,undefined);
+        assert.deepEqual(launch.MetadataOptions,{HttpEndpoint:'enabled',HttpTokens:'required',HttpPutResponseHopLimit:1,InstanceMetadataTags:'disabled'});
+        assert.deepEqual(launch.HibernationOptions,{Configured:false});
+        assert.equal(launch.BlockDeviceMappings[0].Ebs.VolumeSize,20);assert.equal(launch.BlockDeviceMappings[0].Ebs.Encrypted,true);
         assert.equal(launch.UserData,undefined);assert.equal(launch.ClientToken,token(r.f.digest,'instance'));
     }
 });
@@ -66,16 +69,19 @@ for(const [operation,action]of [['start','startInstances'],['stop','stopInstance
     test(`uncertain ${action} never retries or frees the lifecycle reservation`,async()=>{const r=await run(operation,{lose:action,noEffect:action});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.receipt,undefined);assert.equal(r.calls.filter(c=>c.action===action).length,1);});
 test('revocation after allocation never starts compute or reports completion',async()=>{const r=await run('provision',{revokeAfter:'createVolume'});assert.equal(r.error,'LifecycleUnconfirmed');assert.deepEqual(r.calls.map(c=>c.action),['createVolume']);assert.equal(r.f.state.volumes.length,1);});
 test('cross-tenant or deletable disk prevents stop/terminate',async()=>{for(const options of [{foreignDisk:true},{deleteDisk:true}]){const r=await run('replace',options);assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);}});
+test('helper failure codes are recorded on the terminal state, not discarded',async()=>{
+    const r=await run('replace',{foreignDisk:true});assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_volume_invalid/);
+    const lost=await run('start',{lose:'startInstances',noEffect:'startInstances'});assert.match(lost.cause!,/lifecycle_expired/);
+});
 test('immutable execution identity, deployment and redrive are enforced before effects',async()=>{
     for(const field of ['stateMachineVersionArn','name','input','redriveCount','stateMachineAliasArn']){
         const f=lifecycleFixture();(f.state.execution as Record<string,unknown>)[field]=field==='redriveCount'?1:'forged';
         await assert.rejects(createLifecycleHelper(f.settings,f.deps)({executionArn:f.executionArn,phase:'initial'}));assert.equal(f.state.authorityCalls,0);
     }
 });
-test('unsupported AMI/template and out-of-scope writer profiles cannot launch',async()=>{
-    for(const kind of ['image','template','profile']){
+test('unsupported AMI/template cannot launch',async()=>{
+    for(const kind of ['image','template']){
         const f=lifecycleFixture();f.state.volumes.push(f.volume());if(kind==='image')f.state.imageBad=true;if(kind==='template')f.state.templateBad=true;
-        if(kind==='profile')f.settings.writerRolePathPrefix='ezil/another/computers';
         await assert.rejects(createLifecycleHelper(f.settings,f.deps)({executionArn:f.executionArn,phase:'initial'}));
     }
 });
@@ -110,4 +116,75 @@ test('unexpected AMI data devices cannot silently allocate extra volumes',async(
 test('a stale old-writer observation after launching replacement never repeats stop or termination',async()=>{
     const r=await run('replace',{staleOldAfterLaunch:true});assert.equal(r.error,undefined);
     assert.equal(r.calls.filter(c=>c.action==='stopInstances').length,1);assert.equal(r.calls.filter(c=>c.action==='terminateInstances').length,1);
+});
+
+// ── Item 7: error codes, fail-fast capacity, throttling backoff, observation retries ──
+for(const [name,cause,code] of [
+    ['Ec2.InsufficientInstanceCapacityException','We currently do not have sufficient m6i.large capacity in the Availability Zone you requested','InsufficientInstanceCapacity'],
+    ['Ec2.Ec2Exception','You have requested more vCPU capacity than your current vCPU limit of 2 allows (Service: Ec2, Status Code: 400) VcpuLimitExceeded','VcpuLimitExceeded'],
+] as const) test(`${code} fails fast to a refused terminal that carries the code`,async()=>{
+    const r=await run('provision',{fail:{action:'runInstances',times:99,error:taskError(name,cause)}});
+    assert.equal(r.error,'LifecycleRefused');assert.equal(r.cause,code);assert.equal(r.receipt,undefined);
+    assert.equal(r.calls.filter(c=>c.action==='runInstances').length,1,'a capacity refusal is never reissued');
+});
+test('a generic capacity message without a code still fails fast',async()=>{
+    const r=await run('provision',{fail:{action:'runInstances',times:99,error:taskError('Ec2.Ec2Exception','We currently do not have sufficient c6i.xlarge capacity')}});
+    assert.equal(r.error,'LifecycleRefused');assert.equal(r.cause,'InsufficientCapacity');
+});
+test('throttled StartInstances is reissued after backoff and then succeeds',async()=>{
+    const r=await run('start',{fail:{action:'startInstances',times:2,error:taskError('Ec2.RequestLimitExceededException','Request limit exceeded.')}});
+    assert.equal(r.error,undefined);assert.equal(r.receipt.state,'running');
+    assert.equal(r.calls.filter(c=>c.action==='startInstances').length,3);assert.ok(r.visited.includes('Backoff'));
+});
+test('persistent throttling is bounded and ends unconfirmed with its code',async()=>{
+    const r=await run('stop',{fail:{action:'stopInstances',times:99,error:taskError('Ec2.Ec2Exception','Request limit exceeded.')}});
+    assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_throttled/);
+    assert.equal(r.calls.filter(c=>c.action==='stopInstances').length,MAX_THROTTLE_RETRIES+1);
+});
+test('a non-throttle error after StartInstances is never reissued',async()=>{
+    const r=await run('start',{fail:{action:'startInstances',times:1,error:taskError('Ec2.Ec2Exception','IncorrectInstanceState')},noEffect:'startInstances'});
+    assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.filter(c=>c.action==='startInstances').length,1);
+});
+test('a transient observation failure is retried, not treated as unconfirmed',async()=>{
+    const f=lifecycleFixture('start'),original=f.deps.instances;let throws=2;
+    f.deps.instances=async selector=>{if(throws-->0){const e=new Error('slow down');e.name='RequestLimitExceeded';throw e;}return original(selector);};
+    const r=await run('start',{fixture:f});assert.equal(r.error,undefined);assert.equal(r.receipt.state,'running');
+});
+
+// ── Item 8: terminate guard ──
+for(const operation of ['replace','retire'] as const) test(`${operation}: an unexpected attached disk blocks TerminateInstances`,async()=>{
+    const r=await run(operation,{extraDisk:true});assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_unexpected_disk/);
+    assert.equal(r.calls.filter(c=>c.action==='terminateInstances').length,0);
+});
+
+// ── Items 1, 2, 5: zone, type and size come from configuration ──
+test('premium type and size from the allowlist provision end to end',async()=>{
+    const r=await run('provision',{fixture:lifecycleFixture('provision',{instanceType:'c6i.xlarge',dataVolumeGiB:50})});
+    assert.equal(r.error,undefined);assert.equal(r.calls.find(c=>c.action==='runInstances')!.parameters.InstanceType,'c6i.xlarge');
+    assert.equal(r.calls.find(c=>c.action==='createVolume')!.parameters.Size,50);
+});
+test('intent refuses types outside the deployment allowlist and sizes outside the range',()=>{
+    const f=lifecycleFixture();
+    assert.ok(LifecycleIntentSchema.safeParse(f.i).success);
+    for(const bad of [{instanceType:'m7i.large'},{instanceType:'t3.large'},{dataVolumeGiB:19},{dataVolumeGiB:101},{dataVolumeGiB:null}])
+        assert.equal(LifecycleIntentSchema.safeParse({...f.i,...bad}).success,false,JSON.stringify(bad));
+    const narrow={...f.i,deployment:{...f.i.deployment,instanceTypes:['m6i.large']},instanceType:'c6i.xlarge'};
+    assert.equal(LifecycleIntentSchema.safeParse(narrow).success,false);
+    const start=lifecycleFixture('start');assert.equal(LifecycleIntentSchema.safeParse({...start.i,dataVolumeGiB:20}).success,false);
+});
+test('a grown data volume inside the range is accepted; outside the range or zone is refused',async()=>{
+    for(const [mutate,ok] of [[(v:any)=>{v.Size=80;},true],[(v:any)=>{v.Size=101;},false],[(v:any)=>{v.Size=19;},false],
+        [(v:any)=>{v.AvailabilityZoneId='aps1-az2';},false],[(v:any)=>{delete v.AvailabilityZoneId;},false]] as const){
+        const f=lifecycleFixture('start');mutate(f.state.volumes[0]!);
+        const r=await run('start',{fixture:f});
+        if(ok)assert.equal(r.error,undefined);else{assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_volume_invalid/);}
+    }
+});
+test('an instance with an instance profile, other type, metadata tags or wrong subnet is refused',async()=>{
+    for(const mutate of [(i:any)=>{i.IamInstanceProfile={Arn:'arn:aws:iam::123456789012:instance-profile/x'};},(i:any)=>{i.InstanceType='m7i.large';},
+        (i:any)=>{i.MetadataOptions.InstanceMetadataTags='enabled';},(i:any)=>{i.MetadataOptions.HttpPutResponseHopLimit=2;},
+        (i:any)=>{i.SubnetId='subnet-22222222222222222';},(i:any)=>{i.Placement={AvailabilityZoneId:'aps1-az3'};}]){
+        const f=lifecycleFixture('start');mutate(f.state.instances[0]!);
+        const r=await run('start',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);
+    }
 });

@@ -1,6 +1,7 @@
 import type { Instance, Volume } from '@aws-sdk/client-ec2';
 import { z } from 'zod';
-import { EnvelopeSchema, equal, tagsFor, token, writerProfile } from './contract.js';
+import { EnvelopeSchema, equal, tagsFor, token } from './contract.js';
+import { toLambdaError } from './errors.js';
 import { parseLifecycleWork } from './intent.js';
 import { tagged } from './helper.js';
 import { RecoveryInputSchema, RecoverySettingsSchema, machineArn, recoveryPhases,
@@ -11,8 +12,8 @@ const Event = z.object({ executionArn: z.string().max(300), phase: z.enum(recove
 const fail = (): never => { throw new Error('lifecycle_recovery_unconfirmed'); };
 const terminal = ['FAILED', 'ABORTED', 'TIMED_OUT'];
 
-/** Recovery can preserve/stop/terminate only exact historical writers. It has
- * no launch, attach, retag, detach, delete or current-authority capability. */
+/** Recovery can only stop/terminate exact historical writers. It has
+ * no launch, attach, retag, detach, modify, delete or current-authority capability. */
 export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryDependencies) {
     return async (input: unknown): Promise<Record<string, unknown>> => {
         const e = Event.parse(input), d = settings.lifecycle.deployment;
@@ -36,8 +37,7 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
             || now - source.startDate.getTime() > 86400000) return fail();
         const envelope = EnvelopeSchema.parse(JSON.parse(source.input));
         const i = parseLifecycleWork({ ...envelope, createdAt: source.startDate });
-        const { instanceProfileArn, ...pins } = i.deployment;
-        if (!equal(pins, d) || instanceProfileArn !== writerProfile(settings.lifecycle, i)
+        if (!equal(i.deployment, d)
             || source.name !== `computer-${i.jobId}` || sourceExecutionArn !== sourceMachine.replace(':stateMachine:', ':execution:') + ':' + source.name
             || execution.name !== `cleanup-computer-${i.jobId}`
             || e.executionArn !== recoveryMachine.replace(':stateMachine:', ':execution:') + ':' + execution.name) return fail();
@@ -56,8 +56,9 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
         const v = volumes[0], currentTags = tagsFor(i), oldTags = tagsFor(i, i.previousGeneration ?? i.targetGeneration, i.previousFenceToken ?? i.fenceToken);
         if (v) {
             if (!/^vol-[a-f0-9]{17}$/.test(v.VolumeId ?? '') || (i.dataVolumeId && v.VolumeId !== i.dataVolumeId)
-                || v.Encrypted !== true || v.KmsKeyId !== d.dataKeyArn || v.VolumeType !== 'gp3' || v.Size !== 50
-                || v.MultiAttachEnabled !== false || v.AvailabilityZone !== d.availabilityZone || !Array.isArray(v.Attachments) || v.Attachments.length > 1
+                || v.Encrypted !== true || v.KmsKeyId !== d.dataKeyArn || v.VolumeType !== 'gp3' || !Number.isInteger(v.Size)
+                || v.Size! < d.storage.dataMinGiB || v.Size! > d.storage.dataMaxGiB
+                || v.MultiAttachEnabled !== false || v.AvailabilityZoneId !== d.zoneId || !Array.isArray(v.Attachments) || v.Attachments.length > 1
                 || (!tagged(v.Tags, currentTags) && !tagged(v.Tags, oldTags))
                 || (i.operation === 'provision' && (!entered('createVolume')
                     || !tagged(v.Tags, { 'ezil:allocation': token(envelope.digest, 'volume') })))) return fail();
@@ -84,7 +85,8 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
         }
         if (targets.length && !v) return fail();
         for (const { instance } of targets) {
-            if (!/^i-[a-f0-9]{17}$/.test(instance.InstanceId ?? '') || instance.Placement?.AvailabilityZone !== d.availabilityZone) return fail();
+            if (!/^i-[a-f0-9]{17}$/.test(instance.InstanceId ?? '') || instance.SubnetId !== d.subnetId
+                || (instance.Placement?.AvailabilityZoneId !== undefined && instance.Placement.AvailabilityZoneId !== d.zoneId)) return fail();
         }
         if (v?.Attachments?.some(a => !targets.some(t => t.instance.InstanceId === a.InstanceId) || a.VolumeId !== v.VolumeId)) return fail();
         const action = (decision: string, parameters: object) => {
@@ -103,13 +105,11 @@ export function createRecoveryHelper(settings: RecoverySettings, deps: RecoveryD
             const phaseIndex = recoveryPhases.indexOf(e.phase);
             if (phaseIndex >= recoveryPhases.indexOf(`${role}-terminated`)) return wait();
             if (!['running', 'pending', 'stopping', 'stopped'].includes(state ?? '')) return fail();
+            // Recovery has no ModifyInstanceAttribute right: a data disk that
+            // would be deleted with its writer is never repaired here, only refused.
             const preserved = preservation(instance, v!);
             if (preserved === 'wait') return wait();
-            if (!preserved) {
-                if (phaseIndex >= recoveryPhases.indexOf(`${role}-preserved`)) return wait();
-                return action(`preserve-${role}`, { InstanceId: id,
-                    BlockDeviceMappings: [{ DeviceName: '/dev/sdf', Ebs: { VolumeId: v!.VolumeId, DeleteOnTermination: false } }] });
-            }
+            if (!preserved) return fail();
             if (state === 'pending' || state === 'stopping') return wait();
             if (state === 'stopped') return action(`terminate-${role}`, { InstanceIds: [id] });
             if (phaseIndex >= recoveryPhases.indexOf(`${role}-stopped`)) return wait();
@@ -129,7 +129,7 @@ function preservation(instance: Instance, volume: Volume): boolean | 'wait' {
     const data = instance.BlockDeviceMappings.filter(m => m.Ebs?.VolumeId === volume.VolumeId);
     const attachments = volume.Attachments!.filter(a => a.InstanceId === instance.InstanceId);
     // An unexpected attached volume must not be destroyed with the root disk.
-    if (instance.BlockDeviceMappings.some(m => m.DeviceName !== '/dev/xvda' && m.Ebs?.VolumeId !== volume.VolumeId)) return fail();
+    if (instance.BlockDeviceMappings.some(m => m.DeviceName !== '/dev/xvda' && !(m.DeviceName === '/dev/sdf' && m.Ebs?.VolumeId === volume.VolumeId))) return fail();
     if (!data.length && !attachments.length) return true;
     if (data.length !== 1 || attachments.length !== 1) return 'wait';
     if (data[0]!.DeviceName !== '/dev/sdf' || attachments[0]!.Device !== '/dev/sdf') return fail();
@@ -143,5 +143,5 @@ export async function handler(input: unknown) {
         if (!helper) { const settings = RecoverySettingsSchema.parse(JSON.parse(process.env.EZIL_LIFECYCLE_RECOVERY_SETTINGS ?? ''));
             helper = createRecoveryHelper(settings, recoveryDependencies(settings)); }
         return await helper(input);
-    } catch { return fail(); }
+    } catch (error) { throw toLambdaError(error, 'lifecycle_recovery_unconfirmed'); }
 }
