@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Stub cloudflared: records argv + whether the token came via the environment, then
+# runs until killed. If $STUB_CF_DIR/crash-once exists it exits 1 once (restart test).
+D="${STUB_CF_DIR:-$(dirname "$0")}"
+{ echo "start $$ argv=[$*] token_env=$([ -n "${TUNNEL_TOKEN:-}" ] && echo yes || echo no) token_in_argv=$(printf '%s' "$*" | grep -q 'tunnel-token' && echo yes || echo no)"; } >> "$D/cf.log"
+echo $$ > "$D/cf.child.pid"
+if [ -f "$D/crash-once" ]; then rm -f "$D/crash-once"; exit 1; fi
+trap 'echo "term $$" >> "$D/cf.log"; exit 0' TERM
+while :; do sleep 0.2; done

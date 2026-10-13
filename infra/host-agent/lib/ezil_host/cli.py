@@ -66,6 +66,14 @@ def main(argv=None):
             desktop.stop(cfg)
             os.sync()
             return 0
+        if cmd == "overlay-down":
+            desktop.overlay_umount(cfg)
+            desktop.netns_down(cfg)
+            return 0
+        if cmd == "data-down":
+            os.sync()
+            os.system(f"mountpoint -q {cfg.dataMount} && umount {cfg.dataMount}")
+            return 0
         if cmd == "teardown":
             desktop.stop(cfg, kill="--kill" in argv)
             desktop.overlay_umount(cfg)
