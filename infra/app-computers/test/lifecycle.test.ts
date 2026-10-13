@@ -265,3 +265,10 @@ test('a definite 4xx with a status code is still rejected',async()=>{
     const r=await run('start',{fail:{action:'startInstances',times:1,error:taskError('States.TaskFailed','Not authorized (Service: Ec2, Status Code: 403)')},noEffect:'startInstances'});
     assert.ok(r.visited.includes('Rejected'));
 });
+test('I6: only the data volume carries the namespace backup tag DLM targets; the root disk never does',async()=>{
+    const r=await run('provision');assert.equal(r.error,undefined);
+    const dataTags=r.calls.find(c=>c.action==='createVolume')!.parameters.TagSpecifications[0].Tags;
+    assert.deepEqual(dataTags.filter((t:any)=>t.Key==='ezil:backup'),[{Key:'ezil:backup',Value:'pilot'}]);
+    const launch=r.calls.find(c=>c.action==='runInstances')!.parameters;
+    for(const spec of launch.TagSpecifications)assert.ok(!spec.Tags.some((t:any)=>t.Key==='ezil:backup'),spec.ResourceType);
+});
