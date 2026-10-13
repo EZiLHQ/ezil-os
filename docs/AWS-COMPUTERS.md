@@ -85,7 +85,7 @@ must stay inside the hosted migration grammar (`docs/production-migrations.md`).
 ```sql
 CREATE TABLE public.ezil_computer_placements (
   computer_id uuid NOT NULL, provider text NOT NULL, workspace_store text NULL,
-  generation bigint NOT NULL, state text NOT NULL, region text NULL, zone_id text NULL,
+  generation bigint NOT NULL, lease_epoch bigint NOT NULL, state text NOT NULL, region text NULL, zone_id text NULL,
   instance_id text NULL, instance_type text NULL, volume_id text NULL, fs_uuid uuid NULL,
   tunnel_id text NULL, enroll_nonce_hash text NULL, enroll_expires_at timestamptz NULL,
   lease_until timestamptz NULL, presence_at timestamptz NULL, updated_at timestamptz NOT NULL);
@@ -106,7 +106,8 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
   value, fails closed.
 - **Writing.** Every write goes through one module.
   - Creation takes `pg_advisory_xact_lock` on the computer.
-  - Every transition is `UPDATE … WHERE computer_id = $1 AND generation = $expected RETURNING`.
+  - Every transition is `UPDATE … WHERE computer_id = $1 AND generation = $g AND lease_epoch = $e RETURNING`.
+  - **Two counters.** `generation` is the *writer* generation: it changes only when the instance is replaced or recovered, and it matches the lifecycle tags on the instance and volume. `lease_epoch` increases on every lease (each start or claim) without retagging AWS resources.
   - A periodic duplicate check (`HAVING count(*) > 1`) alarms and closes admission.
 
 ### C-3 Lifecycle states
@@ -117,7 +118,7 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 - Stage B slots: `WARMING → READY → CLAIMED → terminated`.
 
 **Leasing and admission**
-- `LEASED` reserves `generation + 1`.
+- `LEASED` reserves `lease_epoch + 1`. A replace or recovery also reserves `generation + 1`.
 - Admission runs in the same transaction, under one global advisory lock. All of these must hold:
   - running-class count < `AWS_MAX_RUNNING`
   - one AWS computer per user
@@ -133,11 +134,11 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 ### C-4 Disk marker (bug fence only)
 
 `/srv/ezil-data/.ezil-marker.json` holds:
-`{computerId, volumeId, fsUuid, generation, lowerImageDigest}`.
+`{computerId, volumeId, fsUuid, generation, leaseEpoch, lowerImageDigest}`.
 
 - The host agent mounts by filesystem UUID.
-- It refuses to mount on any mismatch, or if `generation` is not below the lease generation.
-- It writes the new generation, and fsyncs, before starting the desktop.
+- It refuses to mount on any mismatch, if `generation` is above the lease's writer generation, or if `leaseEpoch` is not below the lease epoch.
+- It writes the new epoch (and generation), and fsyncs, before starting the desktop.
 
 A root user can rewrite this file, so it catches bugs, not attacks. The security fences are:
 - EBS single-attach
@@ -150,13 +151,13 @@ A root user can rewrite this file, so it catches bugs, not attacks. The security
 Today's preview HMAC signs a constant (`${ts}.POST./sandbox/preview.`), so it binds nothing.
 
 **v2 token**
-- Signs `ts, method, path, sandboxId, computerId, userId, provider, store, generation` plus a
+- Signs `ts, method, path, sandboxId, computerId, userId, provider, store, generation, leaseEpoch` plus a
   digest of the body.
 - v1 is accepted only during a time-boxed rollout window, then removed.
 
 **Routing an `aws-ec2` computer**
 - The origin hostname is derived from signed fields:
-  `c-<sandboxId>-g<generation>.<AWS_ORIGIN_ZONE>`.
+  `c-<sandboxId>-g<generation>-e<leaseEpoch>.<AWS_ORIGIN_ZONE>`.
 - The zone comes from a Worker-side allowlist, never from the request.
 - The Worker attaches a gateway access credential and a generation-bound HMAC, which the
   host verifies.
@@ -173,8 +174,12 @@ generation and a one-time nonce.
 
 1. **Issue.** When the control plane leases generation N for instance I, it creates a random
    one-time nonce. It stores only the nonce's hash and expiry, of at most 10 minutes, on the
-   placement. The plaintext nonce goes to the host through launch user data for that
-   generation.
+   placement. The plaintext nonce goes to the host through **instance user data written
+   by the lifecycle workflow for that epoch**:
+   - on a launch, as launch user data;
+   - on a start-in-place, by `ModifyInstanceAttribute` while the instance is stopped. The
+     lifecycle role may call it **only** for the `userData` attribute, and every other
+     attribute stays denied.
    - User data is readable on that host, and only there.
    - For a pool claim, the nonce goes through the workflow that performs the claim.
 2. **Present.** The host posts `{computerId, generation, nonce, identityDocument, signature}`
@@ -182,18 +187,18 @@ generation and a one-time nonce.
 3. **Verify.** The app refuses unless every check passes:
    - the signature verifies against the region's published AWS certificate
    - `instanceId` and ZoneId equal the placement
-   - `generation` equals the placement generation, and the state is `STARTING` or `MOUNTING`
+   - `generation` and `leaseEpoch` equal the placement's, and the state is `STARTING` or `MOUNTING`
    - the nonce hash matches and has not expired
    - a **live** describe call shows instance I `running` in that ZoneId, with the data volume
      attached to it
 4. **Consume.** The nonce is cleared by compare-and-swap, so it works once. A second
-   enrollment for the same generation is refused.
+   enrollment for the same epoch is refused.
 5. **Tunnel.** Only then does the app ask the Worker to create the per-generation tunnel. The
-   Worker alone holds the Cloudflare API token. The tunnel token is returned once.
+   Worker alone holds the Cloudflare API token. The tunnel is per epoch, and its token is returned once.
    - After the connector connects, the Worker checks that the connector's origin address
      equals the instance's public address. On mismatch it deletes the tunnel and fences the
      generation.
-6. **Fence.** A new generation, a stop or a retire deletes the previous tunnel and its
+6. **Fence.** A new epoch, a stop or a retire deletes the previous tunnel and its
    connections.
 
 A user who replays their own computer's material can reach only their own computer.
