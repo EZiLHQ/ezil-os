@@ -27,6 +27,7 @@ import {
     type CloudflareGuacamoleConfig,
 } from '@/server/lib/cloudflare-guacamole-provider';
 
+import { previewTokenV2Enabled, type WorkerAuth } from './preview-token-v2';
 import type {
     ActivitySignal,
     ComputeCtx,
@@ -40,19 +41,47 @@ export interface CloudflareComputeDeps {
     resolveConfig: () => CloudflareGuacamoleConfig;
     /** Read at call time, never cached: same as the call sites this replaces. */
     readHmacSecret: () => string;
+    /**
+     * Sign Worker calls with the v2 envelope (C-5) instead of v1. Read at call
+     * time. Default OFF: `EZIL_PREVIEW_TOKEN_V2=1` only, and only once the
+     * Worker that verifies v2 is deployed.
+     */
+    useTokenV2: () => boolean;
 }
 
 const defaultDeps: CloudflareComputeDeps = {
     resolveConfig: resolveCloudflareGuacamoleConfig,
     readHmacSecret: () => process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '',
+    useTokenV2: () => previewTokenV2Enabled(),
 };
 
 export function createCloudflareComputeProvider(overrides: Partial<CloudflareComputeDeps> = {}) {
     const deps: CloudflareComputeDeps = { ...defaultDeps, ...overrides };
     const sandboxOf = (c: ComputerRef) => deriveGuacamoleSandboxId(c.userId, c.computerId);
+    /**
+     * v2 claims for a Cloudflare computer: no generation or lease (0, 0), and
+     * NO store claim (''): this app has no per-computer store record, and a
+     * guessed 'r2' would lock every S3-pinned computer out (the Worker refuses
+     * a store claim that differs from the computer's sticky store).
+     */
+    const authOf = (c: ComputerRef): WorkerAuth =>
+        deps.useTokenV2()
+            ? {
+                kind: 'v2',
+                claims: {
+                    sandboxId: sandboxOf(c),
+                    computerId: c.computerId,
+                    userId: c.userId,
+                    provider: 'cloudflare',
+                    store: '',
+                    generation: 0,
+                    leaseEpoch: 0,
+                },
+            }
+            : { kind: 'v1' };
 
     const terminate = (ctx: ComputeCtx, c: ComputerRef) =>
-        requestGuacamoleSandboxTerminate(deps.resolveConfig(), deps.readHmacSecret(), sandboxOf(c), ctx.correlationId);
+        requestGuacamoleSandboxTerminate(deps.resolveConfig(), deps.readHmacSecret(), sandboxOf(c), ctx.correlationId, authOf(c));
 
     return {
         kind: 'cloudflare' as const,
@@ -70,6 +99,7 @@ export function createCloudflareComputeProvider(overrides: Partial<CloudflareCom
                     ...(opts.screen ? { screen: opts.screen } : {}),
                 },
                 ctx.correlationId,
+                authOf(c),
             ),
 
         /**
@@ -87,10 +117,11 @@ export function createCloudflareComputeProvider(overrides: Partial<CloudflareCom
                 sandboxOf(c),
                 s.lastInputAgoMs,
                 ctx.correlationId,
+                authOf(c),
             ),
 
         restart: (ctx: ComputeCtx, c: ComputerRef) =>
-            requestGuacamoleDesktopRestart(deps.resolveConfig(), deps.readHmacSecret(), sandboxOf(c), ctx.correlationId),
+            requestGuacamoleDesktopRestart(deps.resolveConfig(), deps.readHmacSecret(), sandboxOf(c), ctx.correlationId, authOf(c)),
 
         stop: (ctx: ComputeCtx, c: ComputerRef, reason: StopReason) => {
             void reason; // Cloudflare has one teardown, whatever the reason.
