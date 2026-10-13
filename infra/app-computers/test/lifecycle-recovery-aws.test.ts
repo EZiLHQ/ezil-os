@@ -3,7 +3,7 @@ import test from 'node:test';
 import { Readable } from 'node:stream';
 import { SFNClient } from '@aws-sdk/client-sfn';
 import { readRecoveryHistory } from '../lib/lifecycle/recovery-aws.js';
-import { createLifecycleReconciler } from '../lib/lifecycle/reconciler.js';
+import { createLifecycleReconciler, handlerError } from '../lib/lifecycle/reconciler.js';
 import { canonical } from '../lib/lifecycle/contract.js';
 import { lifecycleFixture } from './lifecycle-fixture.js';
 
@@ -96,4 +96,8 @@ test('one bad scan entry cannot abort the scan; the failure is surfaced after ev
             /lifecycle_reconciliation_partial:2/);
         assert.deepEqual(started, [`cleanup-computer-${good.i.jobId}`]);
     } finally { client.destroy(); }
+});
+test('the Lambda handler keeps the partial-scan count and collapses everything else', () => {
+    assert.equal(handlerError(new Error('lifecycle_reconciliation_partial:3')).message, 'lifecycle_reconciliation_partial:3');
+    assert.equal(handlerError(new Error('secret detail')).message, 'lifecycle_reconciliation_unavailable');
 });
