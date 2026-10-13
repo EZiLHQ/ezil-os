@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { SYSTEM_SNAPSHOT_SCRIPT, WORKSPACE_PREDICATE_PY } from './system-snapshot-script';
 
 // PR195 review r4241774149, restore side: the system layer leaves out a HOME workspace
@@ -10,7 +11,8 @@ import { SYSTEM_SNAPSHOT_SCRIPT, WORKSPACE_PREDICATE_PY } from './system-snapsho
 // restore-deps must install that root once, never inside the member, and must never
 // call the member unrestorable ("missing") or leave it untracked while the root's
 // install is still running (the npm script-shell gate would not wait).
-const SCRIPT = new URL('../scripts/ezil-restore-deps.sh', import.meta.url).pathname;
+// fileURLToPath, never URL.pathname: on Windows the pathname is '/D:/a/...', which no API opens.
+const SCRIPT = fileURLToPath(new URL('../scripts/ezil-restore-deps.sh', import.meta.url));
 const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
