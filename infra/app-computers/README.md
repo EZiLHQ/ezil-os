@@ -152,6 +152,15 @@ These cannot be proven offline:
   matches both `Error` and `Cause` (codes and provider messages) on purpose.
 - **ZoneId in describe output.** Whether `DescribeVolumes` reports `AvailabilityZoneId`. The
   helper fails closed when it is absent.
+- **Live allow proofs.** `IfExists` was removed, so a key that is absent from a correct
+  request now denies it. The canary must show that a correct provision, attach, retag,
+  start, stop and terminate are *allowed*, not only that bad requests are denied. The
+  riskiest key is `ec2:AvailabilityZoneId` on `RunInstances`: no `Placement` is sent, and
+  the zone comes from the subnet. The same key on `AttachVolume` is also at risk, and so
+  are the IMDS keys when they are evaluated from the launch template.
+- **Capacity refusals alarm.** A refusal ends `FAILED`, so it lands in the
+  `UnconfirmedExecutions` queue and fires its alarm. Admission (A2) must treat it as a
+  refusal reason, not an incident.
 - **Live access-denied proofs** for:
   - a disallowed type
   - an unencrypted or out-of-range volume

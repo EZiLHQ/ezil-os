@@ -71,5 +71,9 @@ export async function handler(input: unknown) {
                 requestHandler: { connectionTimeout: 2000, requestTimeout: 5000, throwOnRequestTimeout: true } }));
         }
         return await run(input);
-    } catch { throw new Error('lifecycle_reconciliation_unavailable'); }
+    } catch (error) {
+        // Keep the partial-scan count visible to the DLQ and alarm.
+        if (error instanceof Error && /^lifecycle_reconciliation_partial:\d+$/.test(error.message)) throw error;
+        throw new Error('lifecycle_reconciliation_unavailable');
+    }
 }
