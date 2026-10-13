@@ -34,7 +34,7 @@ pre-booted hosts.
 | R5 | **Threat model: the user may become root on their own host.** Everything the guest says is advisory: agent reports, the disk marker, load, connector state. The host holds no useful cloud credentials: no instance role, or a custom minimal one. IMDSv2 is required, with hop limit 1, instance metadata tags disabled, and container traffic to the metadata address dropped. |
 | R6 | No inbound network rules, no NAT gateway, no load balancer. Outbound is open for developer-desktop parity, bounded by out-of-guest egress metering and caps. Each computer reaches the gateway only through a per-generation Cloudflare Tunnel. |
 | R7 | A Step Functions lifecycle workflow owns EC2/EBS mutations. The app may only start executions of exact workflow versions and describe resources. The Cloudflare Worker holds no EC2 or IAM rights; it keeps only its existing workspace-store S3 scope, and mints presigned URLs from it. EC2 state-change events are reconciled into the database. |
-| R8 | Single writer per computer, enforced by compare-and-swap on a generation number under a per-computer advisory lock. EBS single-attach is the physical fence. A reviewed migration-grammar extension adds UNIQUE indexes (required before Stage B). |
+| R8 | Single writer per computer, enforced by compare-and-swap on a generation number under a per-computer advisory lock. EBS single-attach is the physical fence. A reviewed migration-grammar extension adds UNIQUE indexes (required before Stage B). The engine copies in sibling repositories have diverged, so the extension is ported to each one separately with shared test vectors. |
 | R9 | Idle stop may be guest-initiated, but caps are not. Lease renewal comes only from gateway-observed, authenticated user presence. Hour, egress and lease limits are enforced by the control plane: warn, then flush, then stop, regardless of what the guest reports. |
 | R10 | Instance types come from a closed allowlist. Pilot: one standard 2 vCPU / 8 GiB type; one 4 vCPU / 8 GiB type for benchmarks only. No burstable-credit types. |
 | R11 | Volume sizes come from an allowlist or range, with capped online growth. Automation never deletes volumes or snapshots and never force-detaches. Purge is a separate operator action. |
@@ -53,17 +53,24 @@ hostnames, tokens, zones or buckets, following the `SandboxHost` non-goals in
 
 ```ts
 export type ProviderKind = 'cloudflare' | 'aws-ec2';
+export type StopReason = 'idle_reap' | 'user' | 'cap' | 'lease_expired';
 export interface ComputeProvider {
   readonly kind: ProviderKind;
-  ensure(ctx: ComputeCtx, c: ComputerRef): Promise<EnsureResult>;   // ready | starting | refused(reason)
-  status(ctx: ComputeCtx, c: ComputerRef): Promise<ComputeStatus>;  // authenticated
-  activity(ctx: ComputeCtx, c: ComputerRef, s: ActivitySignal): Promise<void>;
-  restart(ctx: ComputeCtx, c: ComputerRef): Promise<void>;
-  stop(ctx: ComputeCtx, c: ComputerRef, reason: StopReason): Promise<void>;
-  terminate(ctx: ComputeCtx, c: ComputerRef): Promise<void>;        // aws-ec2: retire, keep volume
-  persistenceStatus(ctx: ComputeCtx, c: ComputerRef): Promise<PersistenceStatus>;
+  // opts carries sessionId, desktopMode and screen; result is the full preview result | starting | refused(reason)
+  ensure(ctx: ComputeCtx, c: ComputerRef, opts: EnsureOptions): Promise<EnsureResult>;
+  status(ctx: ComputeCtx, c: ComputerRef): Promise<ComputeStatus>;
+  activity(ctx: ComputeCtx, c: ComputerRef, s: ActivitySignal): Promise<ActivityResult>;
+  restart(ctx: ComputeCtx, c: ComputerRef): Promise<RestartResult>;
+  stop(ctx: ComputeCtx, c: ComputerRef, reason: StopReason): Promise<StopResult>;
+  terminate(ctx: ComputeCtx, c: ComputerRef): Promise<TerminateResult>; // aws-ec2: retire, keep volume
+  persistenceStatus(ctx: ComputeCtx, c: ComputerRef): Promise<PersistenceStatus>; // added once the persistence-health change lands
 }
 ```
+
+- Operations return result objects, not `void`, because callers report their outcomes.
+- **Cloudflare:** `stop` and `terminate` are the same call (DELETE: flush to R2, then destroy).
+  `status` stays the existing unsigned GET.
+- **aws-ec2:** `status` must be authenticated.
 
 - Desktop-control calls (focus, screen, relay refresh) stay Worker endpoints. The Worker
   routes them per placement.
