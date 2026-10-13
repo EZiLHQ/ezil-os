@@ -44,6 +44,10 @@ mutate M13 lib/ezil_host/enroll.py '    wipe_nonce(cfg, lease)
 mutate M14 lib/ezil_host/agent.py 'if not isinstance(mac, str) or not hmac.compare_digest(mac, sign(self.key, msg)):' 'if False:' test-enroll-tunnel.sh "bad MAC refused"
 mutate M15 lib/ezil_host/agent.py 'if msg.get("leaseEpoch") != self.lease["leaseEpoch"]:' 'if False:' test-enroll-tunnel.sh "wrong epoch refused"
 mutate M16 systemd/ezil-host-clean.service 'Requires=ezil-guard.service' 'Wants=ezil-guard.service' test-units.sh "ezil-host-clean: Requires=ezil-guard.service"
+mutate M19 lib/ezil_host/cli.py '            guard.clear_stamp(cfg)            # nothing may start on this host until the guard runs again' '            pass' test-guard.sh "after data-down, 'overlay' refuses"
+mutate M20 lib/ezil_host/guard.py '    assert_data_mounted(cfg, lease)
+' '' test-guard.sh "volume unmounted behind the agent's back: 'overlay' refuses"
+mutate M21 lib/ezil_host/guard.py '    if os.path.realpath(usrc) != dev:' '    if False:' test-guard.sh "upper redirected onto the host disk"
 if [ "${1:-}" != --quick ]; then
 mutate M17 lib/ezil_host/agent.py '        if blockable and dpkg_lock_held(self.cfg):
             return "busy"' '' test-boot.sh "a held dpkg lock (install in progress) blocks the idle stop"

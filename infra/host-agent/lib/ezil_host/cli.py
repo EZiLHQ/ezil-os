@@ -71,10 +71,12 @@ def main(argv=None):
             desktop.netns_down(cfg)
             return 0
         if cmd == "data-down":
+            guard.clear_stamp(cfg)            # nothing may start on this host until the guard runs again
             os.sync()
             os.system(f"mountpoint -q {cfg.dataMount} && umount {cfg.dataMount}")
             return 0
         if cmd == "teardown":
+            guard.clear_stamp(cfg)
             rc = 0
             for fn in (lambda: desktop.stop(cfg, kill="--kill" in argv), lambda: desktop.overlay_umount(cfg),
                        lambda: os.system(f"mountpoint -q {cfg.dataMount} && umount {cfg.dataMount}"),

@@ -198,8 +198,36 @@ def _mkdirs_nofollow(root, rel):
         os.close(fd)
 
 
+def clear_stamp(cfg):
+    try:
+        os.unlink(os.path.join(cfg.runDir, "guard-ok"))
+    except FileNotFoundError:
+        pass
+
+
+def assert_data_mounted(cfg, lease):
+    """The upper must be on THIS lease's data volume — never on the host root disk.
+    Checks: dataMount is a mount point whose source is the lease's volume device, the
+    device's fs UUID is the lease's, and the upper dir resolves to that same mount."""
+    dev = device_for_volume(cfg, lease["volumeId"])
+    if not is_mounted(cfg.dataMount):
+        raise Refused("data_not_mounted", cfg.dataMount)
+    src = subprocess.run(["findmnt", "-n", "-o", "SOURCE", "--mountpoint", cfg.dataMount],
+                         capture_output=True, text=True).stdout.strip()
+    if os.path.realpath(src) != dev:
+        raise Refused("data_mount_wrong_device", f"mounted={src} lease={dev}")
+    if fs_uuid(dev) != lease["fsUuid"]:
+        raise Refused("fs_uuid_mismatch", "mounted device")
+    upper = os.path.join(cfg.dataMount, "root", "upper")
+    usrc = subprocess.run(["findmnt", "-n", "-o", "SOURCE", "-T", upper], capture_output=True, text=True).stdout.strip()
+    if os.path.realpath(usrc) != dev:
+        raise Refused("upper_not_on_data_volume", f"{upper} is on {usrc}")
+
+
 def require_stamp(cfg, lease):
-    """Every downstream unit calls this: nothing starts unless THIS lease passed the guard."""
+    """Every downstream unit calls this: nothing starts unless THIS lease passed the guard
+    AND the guarded data volume is still the one mounted (data-down removes the stamp;
+    a manual umount or a different device is caught by the mount check)."""
     try:
         with open(os.path.join(cfg.runDir, "guard-ok")) as f:
             s = json.load(f)
@@ -207,3 +235,4 @@ def require_stamp(cfg, lease):
         raise Refused("guard_not_passed")
     if s != {"generation": lease["generation"], "leaseEpoch": lease["leaseEpoch"]}:
         raise Refused("guard_stamp_stale", json.dumps(s))
+    assert_data_mounted(cfg, lease)

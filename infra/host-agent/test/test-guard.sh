@@ -81,12 +81,36 @@ for s in clean overlay desktop enroll cloudflared agent; do
 done
 check "no overlay mounted, no container created" bash -c "! mountpoint -q '$H/run/rootfs' && ! runc --root '$H/run/runc' state ${TAG}-g >/dev/null 2>&1"
 # a stamp from an older lease does not satisfy a newer one
-lease 2 7 false; agent g guard >/dev/null; agent g data-down >/dev/null
+lease 2 7 false; agent g guard >/dev/null; umount "$H/srv/ezil-data"     # raw umount keeps the epoch-7 stamp
 lease 2 8 false
 expect_refuse "stale stamp (epoch 7) does not satisfy lease epoch 8" guard_stamp_stale agent g clean
 
+# --- the upper must be on the guarded data volume (review fix 1)
+no_desktop() { ! mountpoint -q "$H/run/rootfs" && ! runc --root "$H/run/runc" state "${TAG}-g" >/dev/null 2>&1; }
+lease 2 10 false; agent g guard >/dev/null; agent g data-down >/dev/null
+check "data-down removes the guard stamp" test ! -e "$H/run/guard-ok"
+for s in clean overlay desktop; do
+    expect_refuse "after data-down, '$s' refuses" guard_not_passed timeout -k 5 20 env "$(host_env g)" "$AGENT" "$s"
+done
+check "after data-down: no overlay, no container" no_desktop
+lease 2 11 false; agent g guard >/dev/null; umount "$H/srv/ezil-data"           # raw umount keeps the stamp
+check "(setup) stamp still present after a raw umount" test -e "$H/run/guard-ok"
+for s in clean overlay desktop; do
+    expect_refuse "volume unmounted behind the agent's back: '$s' refuses" data_not_mounted timeout -k 5 20 env "$(host_env g)" "$AGENT" "$s"
+done
+check "upper never landed on the host root disk: no overlay, no container, no upper dir created on the host" bash -c "! mountpoint -q '$H/run/rootfs' && [ ! -e '$H/srv/ezil-data/root' ]"
+OTHER="$(vol_new g-other 64M)"; mkfs.ext4 -q -F "$OTHER"; ODEV="$(losetup --find --show "$OTHER")"
+mount -o nosuid,nodev "$ODEV" "$H/srv/ezil-data"; mkdir -p "$H/srv/ezil-data/root/upper"
+expect_refuse "a different device mounted at the data path" data_mount_wrong_device timeout -k 5 20 env "$(host_env g)" "$AGENT" overlay
+umount "$H/srv/ezil-data"; losetup -d "$ODEV"; rm -f "$OTHER"
+mount -o nosuid,nodev "$DEV" "$H/srv/ezil-data"; mkdir -p "$T/hostroot-upper/upper"
+mount --bind "$T/hostroot-upper" "$H/srv/ezil-data/root"
+expect_refuse "upper redirected onto the host disk (bind over data/root)" upper_not_on_data_volume timeout -k 5 20 env "$(host_env g)" "$AGENT" overlay
+umount "$H/srv/ezil-data/root"; umount "$H/srv/ezil-data"; rm -rf "$T/hostroot-upper"
+check "none of the refusals mounted an overlay or started a container" no_desktop
+
 # --- durability: fsync(tmp) -> rename -> fsync(dir), observed
-lease 2 9 false
+lease 2 12 false
 strace -f -y -qq -e trace=fsync,rename,renameat,renameat2 -o "$T/strace.out" env "$(host_env g)" "$AGENT" guard >/dev/null 2>&1
 check "marker write order: fsync(tmp) -> rename(tmp, marker) -> fsync(data root)" awk -v mp="$H/srv/ezil-data" '
     /fsync\(/ && /\.ezil-marker\.json\.tmp\./ && st==0 {st=1; next}

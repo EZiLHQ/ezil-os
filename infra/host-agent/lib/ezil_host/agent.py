@@ -30,7 +30,7 @@ import subprocess
 import threading
 import time
 
-from . import desktop, tunnel
+from . import desktop, guard, tunnel
 from .fsops import Refused, open_dir_below
 
 LOAD_RE = re.compile(r"^\d+(\.\d+)?$")
@@ -183,6 +183,7 @@ class Agent:
         for name, fn in (("desktop", lambda: desktop.stop(self.cfg)),
                          ("overlay", lambda: desktop.overlay_umount(self.cfg)),
                          ("sync", lambda: subprocess.run(["sync"], check=True)),
+                         ("stamp", lambda: guard.clear_stamp(self.cfg)),
                          ("data", lambda: subprocess.run(["umount", self.cfg.dataMount], check=True)),
                          ("netns", lambda: desktop.netns_down(self.cfg))):
             try:
