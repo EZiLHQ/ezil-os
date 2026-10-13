@@ -25,12 +25,13 @@ import json
 import os
 import re
 import socket
+import stat
 import subprocess
 import threading
 import time
 
 from . import desktop, tunnel
-from .fsops import Refused
+from .fsops import Refused, open_dir_below
 
 LOAD_RE = re.compile(r"^\d+(\.\d+)?$")
 
@@ -40,6 +41,37 @@ def parse_load1(text):
     if not first or not LOAD_RE.match(first[0]):
         return None
     return float(first[0])
+
+
+def dpkg_lock_held(cfg, proc_locks="/proc/locks"):
+    """Is apt/dpkg running in the guest? Host-side: lstat the guest's dpkg lock files
+    through the merged overlay (no-follow, regular files only) and look their inode up in
+    /proc/locks (POSIX fcntl locks as dpkg/apt take them, and flock). Matched by inode
+    number only — the device shown in /proc/locks is not the overlay's (measured) — so
+    an unrelated inode collision reads as busy: conservative, it only delays a stop."""
+    inos = set()
+    for rel in ("var/lib/dpkg/lock-frontend", "var/lib/dpkg/lock"):
+        try:
+            fd = open_dir_below(desktop.merged(cfg), os.path.dirname(rel))
+        except Refused:
+            continue
+        try:
+            st = os.stat(os.path.basename(rel), dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISREG(st.st_mode):
+                inos.add(st.st_ino)
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(fd)
+    if not inos:
+        return False
+    with open(proc_locks) as f:
+        for line in f:
+            parts = line.split()
+            dev_ino = next((p for p in parts if p.count(":") == 2), None)
+            if dev_ino and int(dev_ino.rsplit(":", 1)[1]) in inos:
+                return True
+    return False
 
 
 def idle_due(last_activity, now, inactivity):
@@ -52,7 +84,7 @@ def sign(key, msg):
 
 
 class Agent:
-    def __init__(self, cfg, lease, clock=time.time, log=print):
+    def __init__(self, cfg, lease, clock=time.time, log=lambda m: print(m, flush=True)):
         self.cfg, self.lease, self.clock, self.log = cfg, lease, clock, log
         self.last_presence = clock()          # boot counts as activity
         self.stop_request = None
@@ -133,11 +165,8 @@ class Agent:
                 return "stale"
         except (OSError, ValueError):
             return "stale"
-        if blockable and desktop.state(self.cfg) == "running":
-            for lock in ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock"):
-                r = desktop.exec_(self.cfg, ["flock", "-n", "-E", "99", lock, "true"], capture_output=True, timeout=30)
-                if r.returncode == 99:
-                    return "busy"
+        if blockable and dpkg_lock_held(self.cfg):
+            return "busy"
         try:
             desktop.stop(self.cfg, grace=float(self.cfg.idle["flushTimeoutSeconds"]))
             r = subprocess.run(["sync", "-f", self.cfg.dataMount], timeout=self.cfg.idle["flushTimeoutSeconds"])
@@ -149,11 +178,17 @@ class Agent:
         self.log(f"shutdown: {why}")
         tunnel.fence(self.cfg, why)          # cloudflared stops and wipes its token
         time.sleep(1.0)
-        desktop.stop(self.cfg)
-        desktop.overlay_umount(self.cfg)
-        subprocess.run(["sync"])
-        subprocess.run(["umount", self.cfg.dataMount])
-        desktop.netns_down(self.cfg)
+        # Ordered quiesce. Each step is attempted even if an earlier one failed: the OS
+        # shutdown that follows must happen regardless (it also unmounts).
+        for name, fn in (("desktop", lambda: desktop.stop(self.cfg)),
+                         ("overlay", lambda: desktop.overlay_umount(self.cfg)),
+                         ("sync", lambda: subprocess.run(["sync"], check=True)),
+                         ("data", lambda: subprocess.run(["umount", self.cfg.dataMount], check=True)),
+                         ("netns", lambda: desktop.netns_down(self.cfg))):
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001
+                self.log(f"quiesce step {name} failed: {e}")
         subprocess.run(list(self.cfg.shutdownCmd))
 
     # ------------------------------------------------------------------- loop

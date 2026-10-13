@@ -11,7 +11,11 @@ profile ezil-desktop flags=(attach_disconnected,mediate_deleted) {
   capability,
   file,
   umount,
+  # The host stops the container with `runc kill`; on Ubuntu 24.04 runc runs under its
+  # own (unconfined-flagged) profile named "runc", so allow that peer as well (measured:
+  # without it `runc kill` fails with "unable to signal init: permission denied").
   signal (receive) peer=unconfined,
+  signal (receive) peer=runc,
   signal (send,receive) peer=ezil-desktop,
   ptrace (trace,read,tracedby,readby) peer=ezil-desktop,
 

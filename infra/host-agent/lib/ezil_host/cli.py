@@ -75,11 +75,16 @@ def main(argv=None):
             os.system(f"mountpoint -q {cfg.dataMount} && umount {cfg.dataMount}")
             return 0
         if cmd == "teardown":
-            desktop.stop(cfg, kill="--kill" in argv)
-            desktop.overlay_umount(cfg)
-            os.system(f"umount {cfg.dataMount} 2>/dev/null")
-            desktop.netns_down(cfg)
-            return 0
+            rc = 0
+            for fn in (lambda: desktop.stop(cfg, kill="--kill" in argv), lambda: desktop.overlay_umount(cfg),
+                       lambda: os.system(f"mountpoint -q {cfg.dataMount} && umount {cfg.dataMount}"),
+                       lambda: desktop.netns_down(cfg)):
+                try:
+                    fn()
+                except Exception as e:  # noqa: BLE001
+                    print(f"teardown step failed: {e}", file=sys.stderr)
+                    rc = 1
+            return rc
         print(step(cfg, cmd, detach="--detach" in argv), flush=True)
         return 0
     except Refused as e:

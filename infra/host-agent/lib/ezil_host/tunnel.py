@@ -36,7 +36,7 @@ def _stop(child, grace=10):
         child.wait()
 
 
-def supervise(cfg, lease, max_backoff=30, poll=0.5, log=print):
+def supervise(cfg, lease, max_backoff=30, poll=0.5, log=lambda m: print(m, flush=True)):
     tok_path = os.path.join(cfg.stateDir, TOKEN_FILE)
     stop = {"sig": False}
     signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__("sig", True))
