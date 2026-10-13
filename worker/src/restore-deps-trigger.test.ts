@@ -24,8 +24,11 @@ describe('restore-deps after a fresh restore', () => {
   // Worker's trigger re-appends the readiness wiring itself, BEFORE the restore starts (and after
   // the boot-restore marker, so a gated npm run waits), and a
   // failing or absent ezil-deps must never stop the restore.
+  // These cases execute the generated command with /bin/sh against stand-in scripts, so they need a
+  // POSIX shell (same idiom as system-dirty.test.ts). The command only ever runs in the Linux desktop
+  // image; its construction and path checks below run on every OS.
   for (const mode of ['ok', 'fails', 'absent'] as const) {
-    it(`marks the boot restore, re-installs the readiness hooks, then restores (ezil-deps ${mode})`, () => {
+    it.skipIf(process.platform === 'win32')(`marks the boot restore, re-installs the readiness hooks, then restores (ezil-deps ${mode})`, () => {
       const dir = mkdtempSync(join(tmpdir(), 'ezil-trigger-'));
       try {
         const bin = join(dir, 'bin'), run = join(dir, 'run'), calls = join(dir, 'calls');
