@@ -466,7 +466,7 @@ run_infra () {
         ( cd "$dir" && npm ci --no-audit --no-fund ) || return 1
     fi
     typecheck "$dir" npm run typecheck || return 1
-    ( cd "$dir" && npm test && npm run synth && npm run synth:lifecycle )
+    ( cd "$dir" && npm test && npm run synth:all )
 }
 
 run_one () {

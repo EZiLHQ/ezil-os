@@ -35,7 +35,10 @@ export const tagsFor = (i:LifecycleIntent,generation=i.targetGeneration,fence=i.
 export const RETAG_KEYS = ['ezil:generation','ezil:fence-token'] as const;
 export const retagsFor = (i:LifecycleIntent) => ({'ezil:generation':String(i.targetGeneration),'ezil:fence-token':i.fenceToken});
 export const tagList = (tags:Record<string,string>) => Object.entries(tags).map(([Key,Value])=>({Key,Value}));
-export const initialVolumeTags = (i:LifecycleIntent,digest:string) => ({...tagsFor(i),'ezil:allocation':token(digest,'volume')});
+/** DLM (I6) snapshots data volumes carrying this tag, valued with the
+ * namespace. Set only at creation; root disks never carry it. */
+export const BACKUP_TAG='ezil:backup';
+export const initialVolumeTags = (i:LifecycleIntent,digest:string) => ({...tagsFor(i),'ezil:allocation':token(digest,'volume'),[BACKUP_TAG]:i.deployment.namespace});
 export const AUTHORITY_PATH='/api/internal/computers/lifecycle-authority';
 export const authorityFor=(i:LifecycleIntent,digest:string)=>({schemaVersion:1,computerId:i.computerId,jobId:i.jobId,leaseEpoch:i.leaseEpoch,digest});
 export const phases=['initial','volume','stopped','terminated','instance','tagged','attached','userdata','started'] as const;

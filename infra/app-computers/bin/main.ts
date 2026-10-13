@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { App } from 'aws-cdk-lib';
+import { App, BootstraplessSynthesizer } from 'aws-cdk-lib';
 
 import { AppComputerFoundationStack, FoundationConfigSchema } from '../lib/foundation.js';
 
@@ -9,8 +9,9 @@ const path = process.env.EZIL_FOUNDATION_CONFIG;
 if (!path) throw new Error('EZIL_FOUNDATION_CONFIG must name a reviewed foundation config file');
 const config = FoundationConfigSchema.parse(JSON.parse(readFileSync(path, 'utf8')));
 const app = new App();
-new AppComputerFoundationStack(app, `EzilAppComputers-${config.stage}`, {
-    config,
+// No roles and no assets: deployable with `aws cloudformation deploy`, no CDK bootstrap.
+new AppComputerFoundationStack(app, `ezil-${config.stage}-foundation`, {
+    config, synthesizer: new BootstraplessSynthesizer(),
     env: { region: config.region },
     terminationProtection: config.stage === 'production',
 });

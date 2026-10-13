@@ -1,0 +1,8 @@
+{
+  "namespace": "pilot",
+  "accountId": "123456789012",
+  "region": "ap-south-1",
+  "monthlyBudgetUsd": 100,
+  "budgetEmails": [],
+  "egressBytesPer5Min": 3000000000
+}

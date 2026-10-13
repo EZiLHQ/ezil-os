@@ -40,5 +40,8 @@
         "subject": "repo:<org>@<orgId>/<repo>@<repoId>:environment:<env>"
       }
     ]
+  },
+  "deploy": {
+    "assetBucketName": "ezil-pilot-deploy-assets-123456789012"
   }
 }
