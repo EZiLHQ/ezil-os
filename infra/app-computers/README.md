@@ -65,21 +65,78 @@ Existing volumes are accepted anywhere in `[dataMinGiB, dataMaxGiB]`, so a volum
 still validates. The intent also carries `instanceType`, which must be in the deployment
 allowlist. The file holds **no secret values**: the authority secret is referenced by ARN only.
 
+The intent also carries two contract fields:
+- **`leaseEpoch` (C-2/C-3).** It rises on every lease. `generation` stays the *writer*
+  generation and is the only value retagged on AWS resources. The epoch travels in the
+  receipt (`validateLifecycleReceipt` checks it) and in the signed authority body.
+- **`userData` (C-6).** Base64, at most 4096 characters, carrying the one-time enrollment
+  nonce. It is required on provision and replace, optional on start, and absent on stop
+  and retire.
+
+`settings.features` holds two flags, both default off:
+
+| Flag | Effect |
+|---|---|
+| `userDataNonce` | Adds the start-in-place step `ModifyInstanceAttribute(InstanceId, UserData)`, used only while the instance is stopped and before `StartInstances`. With the flag off, a start that carries `userData` is refused (`lifecycle_userdata_disabled`). |
+| `userDataAttributeKeyVerified` | Only together with `userDataNonce`, it replaces the unconditional `ModifyInstanceAttribute` Deny with three statements: Allow when `ec2:Attribute` = `userData`, Deny when `ec2:Attribute` is anything else, and Deny when `ec2:Attribute` is Null. |
+
+The second flag exists because the IAM service reference lists `ec2:Attribute` for
+`ModifyInstanceAttribute`, but no AWS document confirms the value it takes for a UserData
+change. Until staging proves it, the fence stays closed: with only the first flag on, the step
+is denied and the run fails closed.
+
+**Nonce exposure.** The plaintext nonce sits in the intent and therefore in the Step Functions
+execution history. That history is encrypted with the history key. In this stack, only the
+control-plane roles can read it: the observer, the controller and the recovery reader. Account
+administrators can too, through the key's account-root statement and IAM. The nonce is
+single-use, expires after 10 minutes, and is bound to the live instance and the epoch (C-6),
+so a copy read later is useless.
+
+`appCaller` (default `{ enabled: false }`) creates the app's federated role (I5, partial). It
+takes one trust statement per configured OIDC provider, with exact `aud` and `sub`
+(`StringEquals`; wildcards are rejected):
+- **GitHub.** Uses the immutable-ID subject, for example
+  `repo:<org>@<orgId>/<repo>@<repoId>:environment:<env>`.
+- **Vercel.** A separate provider slot. TODO: confirm the team's audience and subject format
+  before enabling it.
+
+The role's policy allows only:
+- `states:StartExecution` on the exact lifecycle version ARN
+- `ec2:Describe*` on `*`, conditioned on `aws:RequestedRegion`
+
 ## Security posture (what the tests prove)
 
-| Rule | Where | Test |
+**IAM is tested by exact equality, not by "contains" checks.**
+- `test/iam-exact.test.ts` writes out the controller policy as the reviewed specification:
+  every action, resource, condition and effect, with the userData fence both closed and
+  open. It does the same for the app-caller policy and trust.
+- It also compares every IAM role and policy, KMS key policy, SQS queue policy and Lambda
+  invoke permission in the synthesized stacks against
+  `test/__snapshots__/iam-policies.json`.
+- Regenerate the snapshot only on purpose, with `UPDATE_IAM_SNAPSHOT=1 npm test`, then review
+  the diff.
+- The first round's "contains" assertions let 10 of 12 reviewer mutants survive. The
+  exact-equality tests replace them.
+
+| Rule | Where | Proven by |
 |---|---|---|
-| R1: ZoneId only; no zone names, no `Fn::GetAZs` | L1 `CfnSubnet({availabilityZoneId})`; `CreateVolume.AvailabilityZoneId`; IAM `ec2:AvailabilityZoneId` | `foundation.test.ts` item 1, `lifecycle-infra.test.ts` |
-| R10: closed type allowlist | IAM `StringEquals ec2:InstanceType` (no `IfExists`); helper rejects other types | item 2 |
-| No type change after launch | `ModifyInstanceAttribute` absent and explicitly denied | item 2 |
-| R5: no host credentials | no instance role or profile, no `iam:PassRole`; `RunInstances` requires `Null ec2:InstanceProfile` | item 3 |
-| R5: IMDS | `HttpTokens=required`, hop limit 1, `InstanceMetadataTags=disabled`, in the template, the launch call and IAM conditions | item 4 |
-| R6: network | no ingress, all egress, no NAT, no load balancer | item 4 |
-| R3/R12: storage | every EBS volume is encrypted; the data disk's `DeleteOnTermination=false` is verified and fails closed; hibernation off | items 4–5 |
-| R11: sizes and deletion | size range in IAM and validation; no `DeleteVolume`, `DeleteSnapshot`, `DetachVolume` or `DeleteTags` (explicit deny) | items 5–6 |
-| Tag integrity | identity tags only with `ec2:CreateAction`; retag limited to `ezil:generation` and `ezil:fence-token` | item 6 |
-| C-3: errors | recorded at `$.ctl.lastError`; capacity and quota end in `LifecycleRefused` carrying the code; throttling backs off and retries (max 5) | item 7 |
-| Terminate guard | any disk beyond root plus this computer's data disk blocks `TerminateInstances` | item 8 |
+| R1: ZoneId only; no zone names, no `Fn::GetAZs` | L1 `CfnSubnet({availabilityZoneId})`; `CreateVolume.AvailabilityZoneId`; IAM `ec2:AvailabilityZoneId` on CreateVolume, RunInstances and AttachVolume | `foundation.test.ts`; exact IAM spec |
+| R10: closed type allowlist | IAM `StringEquals ec2:InstanceType` (no `IfExists`); the helper rejects other types | exact IAM spec; `lifecycle.test.ts` |
+| No type, disk-flag or metadata change after launch | `ModifyInstanceAttribute` and `ModifyInstanceMetadataOptions` under an unconditional Deny (see the userData flags above) | exact IAM spec, both flag states |
+| R5: no host credentials | no instance role or profile and no `iam:PassRole`; `RunInstances` requires `Null ec2:InstanceProfile` | exact IAM spec; the snapshot has no `InstanceProfile` |
+| R5: IMDS | `HttpTokens=required`, hop limit ≤ 1 and `InstanceMetadataTags=disabled`, in the template, the launch call and IAM | `foundation.test.ts`; exact IAM spec; `lifecycle.test.ts` |
+| R6: network | no ingress, all egress, no NAT, no load balancer | `foundation.test.ts` |
+| Launch scope | RunInstances requires the exact launch template (`ec2:LaunchTemplate`) on every resource statement, plus the request tags on the instance and root volume | exact IAM spec |
+| Managed-resource scope | Start, Stop, Terminate and AttachVolume require the `managed-by` and `stage` resource tags | exact IAM spec |
+| Data key | data-key use only `kms:ViaService` EC2 in the region; `CreateVolume` requires `ec2:KmsKeyId` = the data key | exact IAM spec |
+| R3/R12: storage | every EBS volume is encrypted; the data disk's `DeleteOnTermination=false` and single-attach (`MultiAttachEnabled=false`) are verified and fail closed; hibernation off | `lifecycle.test.ts`, `lifecycle-recovery.test.ts` |
+| R11: sizes and deletion | size range in IAM and in both helpers; explicit Deny of `DeleteVolume`, `DeleteSnapshot`, `DetachVolume` and `DeleteTags` on both workflow roles | exact IAM spec and snapshot |
+| Tag integrity | identity tags only with `ec2:CreateAction`; retag limited to `ezil:generation` and `ezil:fence-token` | exact IAM spec; `lifecycle.test.ts` |
+| Second-writer guard | no `RunInstances` while the data volume has any attachment | `lifecycle.test.ts` |
+| Confused deputy | every `events.amazonaws.com` grant carries `aws:SourceArn` (the exact rule) and `aws:SourceAccount`. This covers both history key policies, every queue policy and the Lambda invoke permissions. | snapshot plus an explicit check that no grant is unconditioned |
+| C-3: errors | EC2 errors are recorded at `$.ctl.lastError`, observation errors at `$.ctl.observeError` (neither overwrites the other); terminals record both. Capacity and quota errors go to `LifecycleRefused` with the code. Throttling backs off and retries (max 5). Timeouts and 5xx are observed. Any other EC2 error fails fast to `Rejected` (`LifecycleUnconfirmed`) with the code. | `lifecycle.test.ts` |
+| Recovery settle | recovery waits 60 s after the source stops before trusting its history | `lifecycle-recovery.test.ts` |
+| Terminate guard | any disk beyond the root and this computer's data disk blocks `TerminateInstances` | `lifecycle.test.ts`, `lifecycle-recovery.test.ts` |
 
 The graph tests run the shipped state machines through `test/asl.ts`. This is a strict ASL
 interpreter: a missing reference path throws, as `States.Runtime` does in AWS.
@@ -107,6 +164,29 @@ The cost is that there is no Session Manager shell. Operators debug through the 
 own reporting (I4). If SSM is ever required, it must be one shared host role with a custom
 minimal policy. It must not use the AWS-managed policy, and the change must update this
 section, the `Null ec2:InstanceProfile` condition and the item 3 tests together.
+
+### Root-volume KMS key: why there is no `ec2:KmsKeyId` condition
+
+The IAM service reference lists `ec2:KmsKeyId` for `CreateVolume`, but not for the `volume`
+resource of `RunInstances`. A condition on a key that is never present would deny every
+launch. The root-volume statement therefore requires only:
+- `ec2:Encrypted=true`
+- gp3
+- the size cap
+- the request tags
+- the exact launch template
+
+The residual risk is narrow:
+- The helper always sends `KmsKeyId` = the data key (tested).
+- The role's KMS rights cover only the data key, through EC2. A request naming any other
+  customer key fails at KMS.
+- The one gap is the AWS-managed `aws/ebs` key, which EC2 may use for any principal in the
+  account. A malformed request could therefore encrypt a **root** volume with `aws/ebs`.
+  That volume holds only the OS and the pre-pulled image (R3), never user data.
+- Data volumes are pinned to the data key by `CreateVolume`'s `ec2:KmsKeyId`.
+
+Staging: confirm that a launch naming `aws/ebs` succeeds and that a launch naming another CMK is
+denied.
 
 ### Why the root disk is `DeleteOnTermination=true`
 
@@ -152,6 +232,14 @@ These cannot be proven offline:
   matches both `Error` and `Cause` (codes and provider messages) on purpose.
 - **ZoneId in describe output.** Whether `DescribeVolumes` reports `AvailabilityZoneId`. The
   helper fails closed when it is absent.
+- **Cross-computer attach.** The fence is a workflow refusal plus the authority callback.
+  The helper attaches only the volume named in, or created by, the signed intent, and only
+  when its `computer-id`, `generation` and `fence-token` tags match. IAM cannot tie a volume's
+  `computer-id` to an instance's `computer-id` for a shared role, so this is not an IAM
+  access-denied proof.
+- **`ec2:Attribute` for UserData.** Prove that `ModifyInstanceAttribute` with a UserData value
+  presents `ec2:Attribute=userData`, and that other attributes are denied. Only then set
+  `userDataAttributeKeyVerified`.
 - **Live allow proofs.** `IfExists` was removed, so a key that is absent from a correct
   request now denies it. The canary must show that a correct provision, attach, retag,
   start, stop and terminate are *allowed*, not only that bad requests are denied. The
@@ -178,8 +266,8 @@ These cannot be proven offline:
 
   It is not implemented. Today the range check simply accepts grown volumes.
 - **Retained-computer recovery** from #127 (intent v2) is not ported.
-- **EC2 state-change EventBridge rule** to the app API destination (R7) is not built.
-- **Capacity refusals and recovery.** A capacity refusal after `CreateVolume` leaves a retained
+- **EventBridge reconcile rule.** EC2 state-change events to the app's API destination (R7).
+- **Capacity refusals and recovery** (stranded-volume path; needs #127's retained intent). A capacity refusal after `CreateVolume` leaves a retained
   volume and a `FAILED` execution. The recovery workflow then sees `runInstances` entered with
   no instance, and waits until its deadline. Teaching recovery that a recorded capacity code
   proves no launch is future work.
