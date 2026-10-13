@@ -20,8 +20,11 @@ agent therefore:
   `/var/lib/ezil-host` (0700/0600), never in the container's view or on the data volume.
 
 The guest has no network path to the instance metadata service: its network namespace has
-loopback only in tests. The production veth/NAT mode drops the metadata address (see
-"Open items").
+loopback only in `none` mode. In `veth-nat` mode (production) it can reach only the
+internet through NAT and the host resolver at 10.200.0.1:53. All of 169.254/16 (instance
+metadata included), RFC1918 (the VPC and its peers), CGNAT, the configured VPC CIDR and
+every other host port are dropped (see "Network" below; exercised in disposable
+namespaces).
 
 The marker catches **bugs**, not attacks (C-4). The fences that hold against a hostile
 guest are EBS single-attach, generation compare-and-swap, tunnel deletion and the
@@ -30,13 +33,19 @@ migration head.
 ## Boot order (systemd, `systemd/`)
 
 Each unit `Requires=` and is `After=` its predecessor, so a failed step stops everything
-below it. Every step after the guard also refuses unless the guard's run stamp matches
-this lease's (generation, epoch), so a unit started by hand cannot skip it.
+below it. Every step after the guard also refuses unless two things hold:
+- the guard's run stamp matches this lease's (generation, epoch);
+- the data volume is still mounted from **the lease's device**, and the upper resolves
+  to it (`findmnt -T`).
+
+`data-down` and any shutdown remove the stamp. A unit started by hand, or a volume
+unmounted or swapped behind the agent's back, therefore cannot put the upper on the host
+root disk.
 
 | # | Unit | Step | Refuses on |
 |---|---|---|---|
 | 1 | `ezil-lease` | IMDSv2 token PUT → user data (lease + one-time nonce), identity document, PKCS7 → `/run/ezil-host/lease.json` (0600) | malformed user data, IMDS failure |
-| 2 | `ezil-guard` | Resolve the NVMe device from the lease `volumeId` and check its fs UUID. Provisioning formats an *empty* device with the control plane's `fsUuid`. Mount **read-only** `nosuid,nodev`, then run the C-4 checks; on a digest change with a receipt, run the rebase job. Remount rw, write the marker (tmp → fsync → rename → fsync dir), then write the stamp | device missing or not a block device; fs UUID ≠ lease; marker missing (unless provisioning an empty volume) or malformed; computerId/volumeId/fsUuid mismatch; `generation` above the lease; `leaseEpoch` not below the lease; digest mismatch without a valid snapshot receipt; `rebase_failed` state; a planted symlink in the volume layout |
+| 2 | `ezil-guard` | Resolve the NVMe device from the lease `volumeId` and check its fs UUID. Provisioning formats an *empty* device with the control plane's `fsUuid`. Mount **read-only** `nosuid,nodev`, then run the C-4 checks; on a digest change with a receipt, run the rebase job. Remount rw, write the marker (tmp → fsync → rename → fsync dir), then write the stamp | device missing or not a block device; fs UUID ≠ lease; marker missing (unless provisioning an empty volume) or malformed; computerId/volumeId/fsUuid mismatch; `generation` above the lease; `leaseEpoch` not below the lease; digest mismatch without a valid snapshot receipt; `rebase_failed` state; a planted symlink at a host-only layout dir. Guest-reachable profile entries (`profiles/chrome`, `profiles/code-server-*`) that are not real directories are **quarantined** (renamed aside, never followed) instead. The marker is bumped only after all of this passes |
 | 3 | `ezil-host-clean` | No-follow removal of Chrome `Singleton*` (R15, only after the guard) and of legacy `upper/tmp`, `upper/run` | a symlinked path component |
 | 4 | `ezil-overlay` | Overlay `nodev,index=off,redirect_dir=off,metacopy=off,xino=off`; netns; OCI spec | lower missing, unknown network mode |
 | 5 | `ezil-desktop` | `runc run` with the hardened spec (below); stop = TERM → KILL → delete → sync | |
@@ -59,6 +68,48 @@ and runs `shutdown -h now`.
 
 **Control-plane stop.** warn → flush (cannot be blocked) → the same ordered stop. The agent
 **never renews its lease** and makes no outbound call after enrollment.
+
+**Control channel.** Each request carries `{op, leaseEpoch, ts, seq, mac}`.
+- `mac` = HMAC-SHA256 with the per-epoch control key.
+- `ts` must be finite, at most 120 s old and at most 5 s ahead of the host.
+- `seq` is an integer that must strictly increase within the epoch. The high-water mark
+  is persisted host-only (0600) and fsynced *before* the request acts, so a replay is
+  refused even across an agent restart.
+- `warnSeconds` must be an integer in 0..900.
+- Malformed requests never kill the channel.
+
+## Network (`networkMode: veth-nat`)
+
+The veth pair is `ezh0` (host, 10.200.0.1/30) and `ezc0` (container, 10.200.0.2/30). The
+container's default route goes via the host, IPv6 is off inside it, and `resolv.conf`
+points at 10.200.0.1. Three dedicated chains carry the rules:
+
+| Chain | Rules |
+|---|---|
+| `EZIL-CT-FWD` (from FORWARD, first) | drop to 169.254/16, 10/8, 172.16/12, 192.168/16, 100.64/10, 0/8, 224/4, 240/4 and `vpcCidr`; accept the rest out; accept ESTABLISHED back; drop new inbound |
+| `EZIL-CT-IN` (from INPUT, first) | accept DNS udp/tcp 53 to 10.200.0.1; accept ESTABLISHED (replies to host-initiated connections, e.g. cloudflared → desktop); drop the rest |
+| `EZIL-CT-NAT` (nat POSTROUTING) | MASQUERADE the container out |
+
+`ensure_rules` is idempotent:
+- a chain already exactly as desired is left alone;
+- otherwise a fresh chain is built and swapped in behind a single jump;
+- `net-check` reports drift and `net-ensure` repairs it.
+
+The AMI makes systemd-resolved answer on 10.200.0.1 (`DNSStubListenerExtra`).
+
+`test/test-network.sh` exercises all of this **without touching the machine's networking**.
+- A disposable namespace plays the host (`hostNetns`, a test-only setting; if the namespace
+  is missing the commands fail rather than fall back to the real host).
+- Namespaces play the internet (203.0.113.2), an RFC1918 VPC peer (10.0.0.2) and link-local
+  metadata (169.254.169.254, 169.254.10.10). Each peer has a positive control from the fake
+  host.
+- The probe container resolves names through the host resolver and reaches the internet
+  peer, but not the metadata, link-local, RFC1918 or host ports.
+- The host can still connect into the container.
+- Re-applying the rules leaves `iptables-save` identical. A deleted rule is detected as
+  drift, actually reopens the hole, and is repaired.
+- The real host's `ezh0`, `EZIL-CT` rules, `ip_forward` and test links are compared before
+  and after.
 
 ## Container confinement (`desktop.py build_spec`)
 
@@ -85,7 +136,7 @@ and runs `shutdown -h now`.
 | 5 Rebase: collisions moved aside; every rule has a failing test | `rebase.py move_aside` | `test-rebase.sh` (per-rule mutation table, collisions under `/usr/local` and `/opt`) |
 | 6 Upper on the data device; durable marker | `guard.py write_file_durable_at` | `test-boot.sh` (`findmnt -T` on both hosts); `test-guard.sh` (strace order) + mutation M6 |
 | 7 Merged overlay `nodev` | `desktop.py overlay_mount` | `test-hostile.sh` (device node through the merged path refused; control without `nodev` reads it); `test-boot.sh` |
-| 8 Rebase failure → snapshot restore; planted preserve dir; deep trees | `rebase.py run_job`, state file `.ezil-rebase-state.json` on the data root (invisible to the guest); iterative one-fd walk | `test-rebase.sh` (receipt required, fault → sticky `rebase_failed`, nothing downstream, restore + rebase, planted preserve symlink, 5000-deep tree; the recursive spike aborts on the same input) |
+| 8 Rebase failure → snapshot restore; planted preserve dir; deep trees; FIFOs/devices at image paths moved aside | `rebase.py run_job`, state file `.ezil-rebase-state.json` on the data root (invisible to the guest); iterative one-fd walk | `test-rebase.sh` (receipt required, fault → sticky `rebase_failed`, nothing downstream, restore + rebase, planted preserve symlink, 5000-deep tree; the recursive spike aborts on the same input) |
 | 9 Profiles `noexec` | profiles bind | `test-boot.sh` (asserted). Extensions with native binaries are **not yet re-tested** |
 | 10 Allowlist seccomp + dedicated AppArmor | `security/gen-seccomp.py`, `security/apparmor-ezil-desktop` | `test-units.sh`, `test-boot.sh` (the desktop boots under both) |
 
@@ -108,6 +159,23 @@ An image upgrade is a per-computer job.
    - The desktop never starts on a half-rebased upper.
 
 ## AMI (`ami/`)
+
+**Packages are pinned.** The base must be Ubuntu 24.04. Every apt package is installed at
+an exact version: the set the I4 tests ran with, overridable only by an explicit `PIN_*`
+variable. They are then held. A pin that has left the archive fails the build, so either
+bump it in review or set `UBUNTU_SNAPSHOT` for a fixed snapshot.ubuntu.com point in time.
+cloudflared is pinned by version and SHA-256.
+
+**cloud-init, verified versus unverified:**
+
+| Item | Status |
+|---|---|
+| The agent wipes, after enrollment: `instances/*/user-data.txt`, `user-data.txt.i`, `obj.pkl`, `instance/…`, `/run/cloud-init/instance-data-sensitive.json` | **verified here** against a simulated cloud-init tree; unrelated cloud-init state (`sem/`, `datasource`) is untouched, and no nonce copy is left in the agent's tree |
+| `allow_userdata: false` stops cloud-init from acting on the JSON user data | **unverified on a real AMI** |
+| cloud-init rebuilds a missing `obj.pkl` on the next boot without re-running per-instance modules | **unverified** (it is a cache that `cloud-init clean` also removes) |
+| `cloud-init clean --logs --seed` at build removes the build instance's own cached data | **unverified on a real build** |
+| `DNSStubListenerExtra=10.200.0.1` binds although `ezh0` appears only after resolved starts | **unverified**; if it does not, the agent must restart resolved after `netns_up` |
+| The AMI build as a whole | **not run** (no cloud calls) |
 
 `build-host-ami.sh` runs on the Image Builder instance (`imagebuilder-component.yaml`).
 It installs:
@@ -168,12 +236,37 @@ directory, and it counts as killed only if the named check fails.
 | M16 | unit `Requires=` → `Wants=` | `test-units` |
 | M17 | idle: dpkg-lock busy check removed | `test-boot` (real desktop) |
 | M18 | spec: `noNewPrivileges` false | `test-boot` |
+| M19 | data-down keeps the stamp | `test-guard`: steps refuse after data-down |
+| M20 | data-device assertion removed | `test-guard`: volume unmounted behind the agent's back |
+| M21 | upper-on-data-volume check removed | `test-guard`: upper bind-redirected to the host disk |
+| M22 | non-finite ts accepted | `test-enroll-tunnel`: NaN ts |
+| M23 | seq replay check removed | `test-enroll-tunnel`: exact replay |
+| M24 | seq high-water mark not reloaded | `test-enroll-tunnel`: replay across a restart |
+| M25 | warnSeconds bounds removed | `test-enroll-tunnel`: warnSeconds=901 |
+| M26 | future skew 120 s | `test-enroll-tunnel`: ts +60 s |
+| M27 | link-local not blocked | `test-network`: 169.254.10.10 |
+| M28 | 10/8 not blocked | `test-network`: RFC1918 peer |
+| M29 | DNS to the host dropped | `test-network`: DNS through the host resolver |
+| M30 | ensure_rules always rebuilds | `test-network`: re-apply changes nothing |
+| M31 | INPUT final drop removed | `test-network`: host port from the container |
+| M32 | special files at image paths kept | `test-hostile`: FIFO/device moved aside |
+| M33 | profile quarantine → refuse | `test-guard`: planted profiles/chrome |
+| M34 | an unpinned apt install | `test-units`: AMI pins |
+| M35 | obj.pkl not scrubbed | `test-units`: default scrub list |
 
 `worker/src/neko-persistent-profiles.test.ts` (bun) executes the real `start-neko.sh`
 profile block. It fails against the pre-change script.
 
 ## Operator runbook (stubs)
 
+- **Guest planted something in its profiles.** Boot does not stop: the guard renames the
+  odd `profiles/<name>` entry to `profiles/<name>.ezil-quarantine-<time>-<pid>` (never
+  following it) and creates a real directory; `journalctl -u ezil-guard` shows
+  `quarantined=…`. The user's old profile content is in that entry if it was a directory
+  tree elsewhere; delete it once reviewed. If the **host-only** layout (`data/profiles`,
+  `data/workspace`, `data/root`) is odd, the guard refuses
+  (`layout_not_a_real_directory`): the guest cannot reach those paths, so this means
+  operator error or corruption; attach the volume to a recovery host and inspect it.
 - **Host will not become ready.** Run `journalctl -u ezil-guard`. A `REFUSE <code>` line
   names the check; the volume is left unmounted.
   - `epoch_not_increasing` or `generation_ahead`: a stale or duplicate lease. Recover
@@ -197,13 +290,9 @@ These are interim or prototype:
 - **User namespaces: not adopted, so the decision is still open (§3a.4).** The S1
   experiment showed that only an idmapped lower with a plain upper boots, and it shifts
   on-disk ownership. Decide before the first user.
-- **Production networking (`networkMode: veth-nat`):** rendered by `netns_veth_plan` and
-  set by the AMI recipe, but **never exercised**. The shared test host forbids touching
-  host networking.
-  - Its rules: the container is NATed out, cannot reach the metadata address, and is
-    dropped on the host's INPUT.
-  - The cloudflared ingress mapping to the desktop and to the control socket belongs to
-    the gateway lane and does not exist yet.
+- **Production networking:** exercised only in disposable namespaces, not on a real EC2
+  host. The cloudflared ingress mapping to the desktop and the control socket belongs to
+  the gateway lane and does not exist yet.
 - **Enrollment response shape** `{tunnelToken, controlKey}` and the HMAC control
   protocol are defined here and need the app and gateway lanes to adopt them.
 - **Not tested:**
