@@ -3350,8 +3350,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   async recordActivity(lastInputAgoMs: number): Promise<void> {
     const lastActivityAt = computeActivityTimestamp({ now: Date.now(), lastInputAgoMs });
     await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, lastActivityAt);
-    // A user present again ends any bounded wait on a final system checkpoint: the next idle starts afresh.
-    await this.ctx.storage.delete(SYSTEM_FINAL_RETRY_KEY);
+    // A user present AGAIN ends a bounded wait on a final system checkpoint, so the next idle
+    // starts afresh. Only presence newer than the wait's first result counts: the shell keeps
+    // heartbeating stale presence (up to 30 min old) after idle-stop is due, and that must
+    // not hold the computer up past the bound.
+    const retry = await this.ctx.storage.get<{ firstAt: number; attempts: number }>(SYSTEM_FINAL_RETRY_KEY);
+    if (retry && lastActivityAt > retry.firstAt) await this.ctx.storage.delete(SYSTEM_FINAL_RETRY_KEY);
   }
 
   /** True when a container is actually alive under this DO right now. */

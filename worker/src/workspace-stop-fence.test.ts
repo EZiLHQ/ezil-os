@@ -172,8 +172,23 @@ describe('final system checkpoint stop policy: permanent outcomes never block, r
     expect(await (await proto()).persistenceHealth.call(fake)).toEqual({ systemChangesNotSaved: null });
   });
 
+  it('busy + stale-presence heartbeats before every idle cycle: still stops after the bound', async () => {
+    const { fake, calls, store } = await makeFake({ sysCapture: { exitCode: 0, stdout: '{"skipped":"busy"}' }, idle: true });
+    const p = await proto();
+    for (let i = 0; i < 3; i++) {
+      // The shell reports presence up to 30 min old; idle-stop is due at 10.
+      await p.recordActivity.call(fake, (25 * 60_000) as never);
+      await idleCycle(fake);
+      expect(calls.stops).toBe(0);
+    }
+    await p.recordActivity.call(fake, (25 * 60_000) as never);
+    await idleCycle(fake);
+    expect(calls.stops).toBe(1);
+    expect(store.get('ezil:systemChangesNotSaved')).toMatchObject({ reason: 'busy' });
+  });
+
   it('genuine activity resets the bounded wait, so the next idle period starts afresh', async () => {
-    const { fake, store } = await makeFake({ storage: { 'ezil:systemFinalRetry': { firstAt: 1, attempts: 3 } } });
+    const { fake, store } = await makeFake({ storage: { 'ezil:systemFinalRetry': { firstAt: Date.now() - 60_000, attempts: 3 } } });
     await (await proto()).runWorkspaceFlush.call(fake, 'explicit' as never); // teardown's own flush is NOT presence
     expect(store.has('ezil:systemFinalRetry')).toBe(true);
     await (await proto()).recordActivity.call(fake, 0 as never); // a real input heartbeat is
