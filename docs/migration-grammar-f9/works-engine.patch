@@ -1,0 +1,54 @@
+--- a/.github/scripts/production-migrations.mjs	2026-10-13 15:49:40.136285755 +0000
++++ b/.github/scripts/production-migrations.mjs	2026-10-13 15:49:40.137876029 +0000
+@@ -69,6 +69,12 @@
+   return tokens;
+ }
+ 
++// PostgreSQL 16 reserved and type/function-name keywords. Unquoted, these are
++// never a plain column or index name: CONCURRENTLY becomes an option, NULL/TRUE
++// a constant, CURRENT_USER/LOCALTIMESTAMP a function call. Quote to use as a name.
++const bareKeywords = new Set(['all', 'analyse', 'analyze', 'and', 'any', 'array', 'as', 'asc', 'asymmetric', 'both', 'case', 'cast', 'check', 'collate', 'column', 'constraint', 'create', 'current_catalog', 'current_date', 'current_role', 'current_time', 'current_timestamp', 'current_user', 'default', 'deferrable', 'desc', 'distinct', 'do', 'else', 'end', 'except', 'false', 'fetch', 'for', 'foreign', 'from', 'grant', 'group', 'having', 'in', 'initially', 'intersect', 'into', 'lateral', 'leading', 'limit', 'localtime', 'localtimestamp', 'not', 'null', 'offset', 'on', 'only', 'or', 'order', 'placing', 'primary', 'references', 'returning', 'select', 'session_user', 'some', 'symmetric', 'system_user', 'table', 'then', 'to', 'trailing', 'true', 'union', 'unique', 'user', 'using', 'variadic', 'when', 'where', 'window', 'with',
++  'authorization', 'binary', 'collation', 'concurrently', 'cross', 'current_schema', 'freeze', 'full', 'ilike', 'inner', 'is', 'isnull', 'join', 'left', 'like', 'natural', 'notnull', 'outer', 'overlaps', 'right', 'similar', 'tablesample', 'verbose']);
++
+ export function additiveSQL(sql, schemas) {
+   const ts = tokenize(sql); let i = 0; let statements = 0;
+   const is = value => ts[i]?.value === value && ts[i]?.kind !== 'identifier' && ts[i]?.kind !== 'string';
+@@ -115,15 +121,36 @@
+     }
+   };
+   const column = () => { ident(); type(); if (is('not')) { take('not'); take('null'); } else if (is('null')) take('null'); };
++  const plainName = label => { check(!(ts[i]?.kind === 'word' && bareKeywords.has(ts[i].value)), `Reserved word as ${label}; quote it`); return ident(); };
++  const indexColumns = () => { take('('); plainName('index column'); while (is(',')) { take(','); plainName('index column'); } take(')'); };
++  // Partial UNIQUE predicate: AND-joined `col IS [NOT] NULL` / `col = literal`
++  // terms only. No OR, NOT, parentheses, operators, casts, calls or columns of
++  // other tables; PostgreSQL resolves each column against the indexed table.
++  const predicate = () => {
++    for (;;) {
++      plainName('predicate column');
++      check(is('is') || is('='), 'Partial index predicate allows only IS [NOT] NULL or = literal');
++      if (is('is')) { take('is'); if (is('not')) take('not'); take('null'); }
++      else {
++        take('='); const t = ts[i++];
++        check(t?.kind === 'string' || t?.kind === 'number' || (t?.kind === 'word' && ['true', 'false'].includes(t.value)), 'Partial index predicate compares only to a string, integer or boolean literal');
++      }
++      if (!is('and')) break;
++      take('and');
++    }
++  };
+   while (i < ts.length) {
+     if (is('create')) {
+       take('create');
+       if (is('table')) {
+         take('table'); qualified(); take('('); column();
+         while (is(',')) { take(','); column(); } take(')');
++      } else if (is('unique')) {
++        take('unique'); take('index'); plainName('index name'); take('on'); qualified(); indexColumns();
++        if (is('where')) { take('where'); predicate(); }
+       } else {
+-        take('index'); ident(); take('on'); qualified(); take('('); ident();
+-        while (is(',')) { take(','); ident(); } take(')');
++        take('index'); plainName('index name'); take('on'); qualified(); indexColumns();
++        check(!is('where'), 'Partial indexes must be UNIQUE');
+       }
+     } else if (is('revoke')) {
+       take('revoke'); take('execute'); take('on'); take('function'); qualified(); functionArgs(); take('from');
