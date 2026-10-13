@@ -7,12 +7,13 @@ import type { LifecycleIntent } from '../lib/lifecycle/intent.js';
 import { lifecycleFixture } from './lifecycle-fixture.js';
 import { runAsl, taskError } from './asl.js';
 import { toLambdaError, MAX_THROTTLE_RETRIES } from '../lib/lifecycle/errors.js';
-import { LifecycleIntentSchema } from '../lib/lifecycle/intent.js';
+import { LifecycleIntentSchema, validateLifecycleReceipt } from '../lib/lifecycle/intent.js';
+import { authorityFor } from '../lib/lifecycle/contract.js';
 
 type Options={lose?:string;noEffect?:string;revokeAfter?:string;foreignDisk?:boolean;deleteDisk?:boolean;staleOldAfterLaunch?:boolean;
     fail?:{action:string;times:number;error:Error};extraDisk?:boolean;fixture?:ReturnType<typeof lifecycleFixture>};
 async function run(operation:LifecycleIntent['operation'],options:Options={}){
-    const f=options.fixture??lifecycleFixture(operation),helper=createLifecycleHelper(f.settings,f.deps),graph=lifecycleDefinition('helper');
+    const f=options.fixture??lifecycleFixture(operation),helper=createLifecycleHelper(f.settings,f.deps),graph=lifecycleDefinition('helper',f.settings.features);
     if(options.foreignDisk)f.state.volumes[0]!.Tags=[];
     if(options.deleteDisk)f.state.instances[0]!.BlockDeviceMappings!.find(m=>m.DeviceName==='/dev/sdf')!.Ebs!.DeleteOnTermination=true;
     if(options.extraDisk)f.state.instances[0]!.BlockDeviceMappings!.push({DeviceName:'/dev/sdg',Ebs:{VolumeId:'vol-99999999999999999',Status:'attached',DeleteOnTermination:false}});
@@ -35,9 +36,10 @@ async function run(operation:LifecycleIntent['operation'],options:Options={}){
                     const v=f.state.volumes[0]!;v.State='available';v.Attachments=[];target!.BlockDeviceMappings=[];}
                 if(action==='createTags'){const v=f.state.volumes[0]!;v.Tags=[...v.Tags!.filter(t=>!parameters.Tags.some((n:any)=>n.Key===t.Key)),...parameters.Tags];}
                 if(action==='attachVolume')f.attach(f.state.volumes[0]!,target!);
+                if(action==='modifyInstanceAttribute')assert.equal(target!.State?.Name,'stopped');
             }
             if(action===options.revokeAfter)f.state.authorized=false;
-            if(action===options.lose&&!lost){lost=true;throw taskError('Ec2.Ec2Exception','lost response');}
+            if(action===options.lose&&!lost){lost=true;throw taskError('States.Timeout','Task timed out (lost response)');}
             return {};
         }});
     return {error:result.error,cause:result.cause,receipt:result.output,calls,f,visited:result.visited};
@@ -60,7 +62,7 @@ for(const operation of ['provision','start','stop','replace','retire'] as const)
         assert.deepEqual(launch.MetadataOptions,{HttpEndpoint:'enabled',HttpTokens:'required',HttpPutResponseHopLimit:1,InstanceMetadataTags:'disabled'});
         assert.deepEqual(launch.HibernationOptions,{Configured:false});
         assert.equal(launch.BlockDeviceMappings[0].Ebs.VolumeSize,20);assert.equal(launch.BlockDeviceMappings[0].Ebs.Encrypted,true);
-        assert.equal(launch.UserData,undefined);assert.equal(launch.ClientToken,token(r.f.digest,'instance'));
+        assert.equal(launch.UserData,r.f.i.userData);assert.ok(launch.UserData);assert.equal(launch.ClientToken,token(r.f.digest,'instance'));
     }
 });
 for(const [operation,action]of [['provision','createVolume'],['provision','runInstances'],['provision','attachVolume'],['start','startInstances'],['stop','stopInstances'],['retire','terminateInstances']] as const)
@@ -71,7 +73,10 @@ test('revocation after allocation never starts compute or reports completion',as
 test('cross-tenant or deletable disk prevents stop/terminate',async()=>{for(const options of [{foreignDisk:true},{deleteDisk:true}]){const r=await run('replace',options);assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);}});
 test('helper failure codes are recorded on the terminal state, not discarded',async()=>{
     const r=await run('replace',{foreignDisk:true});assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_volume_invalid/);
-    const lost=await run('start',{lose:'startInstances',noEffect:'startInstances'});assert.match(lost.cause!,/lifecycle_expired/);
+    // An uncertain (timed-out) StartInstances keeps the EC2 error AND the later
+    // observation error: the observe Catch no longer overwrites lastError.
+    const lost=await run('start',{lose:'startInstances',noEffect:'startInstances'});
+    const ctl=JSON.parse(lost.cause!);assert.equal(ctl.lastError.Error,'States.Timeout');assert.match(ctl.observeError.Cause,/lifecycle_expired/);
 });
 test('immutable execution identity, deployment and redrive are enforced before effects',async()=>{
     for(const field of ['stateMachineVersionArn','name','input','redriveCount','stateMachineAliasArn']){
@@ -141,9 +146,13 @@ test('persistent throttling is bounded and ends unconfirmed with its code',async
     assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_throttled/);
     assert.equal(r.calls.filter(c=>c.action==='stopInstances').length,MAX_THROTTLE_RETRIES+1);
 });
-test('a non-throttle error after StartInstances is never reissued',async()=>{
-    const r=await run('start',{fail:{action:'startInstances',times:1,error:taskError('Ec2.Ec2Exception','IncorrectInstanceState')},noEffect:'startInstances'});
+for(const [name,cause] of [['Ec2.IncorrectInstanceStateException','The instance is not in a state from which it can be started.'],
+    ['Ec2.Ec2Exception','You are not authorized to perform this operation. UnauthorizedOperation (Service: Ec2, Status Code: 403)']] as const)
+test(`a definite EC2 rejection (${name}) fails fast with its code, never reissued and never waiting for expiry`,async()=>{
+    const r=await run('start',{fail:{action:'startInstances',times:1,error:taskError(name,cause)},noEffect:'startInstances'});
     assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.filter(c=>c.action==='startInstances').length,1);
+    assert.ok(r.cause!.startsWith(name+': '),r.cause);assert.ok(r.visited.includes('Rejected'));assert.ok(!r.visited.includes('Unconfirmed'));
+    assert.ok(r.f.state.now-r.f.state.execution.startDate.getTime()<60000,'fails within a minute, not at the deadline');
 });
 test('a transient observation failure is retried, not treated as unconfirmed',async()=>{
     const f=lifecycleFixture('start'),original=f.deps.instances;let throws=2;
@@ -187,4 +196,31 @@ test('an instance with an instance profile, other type, metadata tags or wrong s
         const f=lifecycleFixture('start');mutate(f.state.instances[0]!);
         const r=await run('start',{fixture:f});assert.equal(r.error,'LifecycleUnconfirmed');assert.equal(r.calls.length,0);
     }
+});
+
+// ── Contract follow-up: per-lease epoch and userData-only nonce delivery ──
+test('leaseEpoch travels in the receipt and the authority body; a receipt for another epoch is refused',async()=>{
+    const r=await run('start');assert.equal(r.receipt.leaseEpoch,r.f.i.leaseEpoch);
+    assert.equal(authorityFor(r.f.i,r.f.digest).leaseEpoch,r.f.i.leaseEpoch);
+    const work={document:r.f.envelope.document,digest:r.f.digest,createdAt:new Date()};
+    assert.deepEqual(validateLifecycleReceipt(work,r.receipt),r.receipt);
+    assert.throws(()=>validateLifecycleReceipt(work,{...r.receipt,leaseEpoch:r.f.i.leaseEpoch+1}),/lifecycle_conflict/);
+    assert.equal(LifecycleIntentSchema.safeParse({...r.f.i,leaseEpoch:0}).success,false);
+});
+test('start-in-place writes the epoch nonce as userData while stopped, then starts (flag on)',async()=>{
+    const f=lifecycleFixture('start',{userData:'bm9uY2UtZTM=',userDataNonce:true});
+    const r=await run('start',{fixture:f});assert.equal(r.error,undefined);assert.equal(r.receipt.state,'running');
+    assert.deepEqual(r.calls.map(c=>c.action),['modifyInstanceAttribute','startInstances']);
+    assert.deepEqual(r.calls[0]!.parameters,{InstanceId:f.state.instances[0]!.InstanceId,UserData:{Value:'bm9uY2UtZTM='}});
+});
+test('nonce delivery to a stopped instance is refused while the flag is off, and the graph has no modify step',async()=>{
+    const r=await run('start',{fixture:lifecycleFixture('start',{userData:'bm9uY2UtZTM='})});
+    assert.equal(r.error,'LifecycleUnconfirmed');assert.match(r.cause!,/lifecycle_userdata_disabled/);assert.deepEqual(r.calls,[]);
+    assert.equal(lifecycleDefinition('helper').States.modifyInstanceAttribute,undefined);
+    assert.ok(lifecycleDefinition('helper',{userDataNonce:true}).States.modifyInstanceAttribute);
+});
+test('userData is required on launches and absent on stop and retire',()=>{
+    for(const op of ['provision','replace'] as const){const f=lifecycleFixture(op);assert.equal(LifecycleIntentSchema.safeParse({...f.i,userData:null}).success,false,op);}
+    for(const op of ['stop','retire'] as const){const f=lifecycleFixture(op);assert.equal(LifecycleIntentSchema.safeParse({...f.i,userData:'bm9uY2U='}).success,false,op);}
+    const f=lifecycleFixture('start');assert.equal(LifecycleIntentSchema.safeParse({...f.i,userData:'not base64!'}).success,false);
 });

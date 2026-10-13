@@ -53,6 +53,7 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
             if(event.throttles>=MAX_THROTTLE_RETRIES)return fail('lifecycle_throttled');
             return {decision:'backoff',phase:'initial',delaySeconds:throttleDelaySeconds(event.throttles)};
         }
+        if(previous.kind==='failed')return {decision:'rejected',code:previous.code};
         const tags=tagsFor(i),phase=event.phase,newInstance=['provision','replace'].includes(i.operation);
         const volumes=await deps.volumes(i.dataVolumeId?[i.dataVolumeId]:{token:token(envelope.digest,'volume')});
         if(volumes.length>1)return fail('lifecycle_volume_ambiguous');
@@ -141,12 +142,17 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         if(target.State?.Name==='running')return success(i,envelope.digest,targetId,v.VolumeId,'running');
         if(target.State?.Name==='pending'||target.State?.Name==='stopping'||phase==='started')return wait(phase);
         if(target.State?.Name!=='stopped')return fail();
+        if(i.userData!==null){
+            // C-6: write this epoch's nonce while stopped, then start.
+            if(!settings.features.userDataNonce)return fail('lifecycle_userdata_disabled');
+            if(phase!=='userdata')return action('modifyInstanceAttribute',{InstanceId:targetId,UserData:{Value:i.userData}});
+        }
         return action('startInstances',{InstanceIds:[targetId]});
     };
 }
 function success(i:LifecycleIntent,digest:string,instanceId:string,volumeId:string,state:LifecycleReceipt['state']){
     return {decision:'success',receipt:{schemaVersion:1,jobId:i.jobId,digest,computerId:i.computerId,
-        generation:i.targetGeneration,fenceToken:i.fenceToken,instanceId,volumeId,state} satisfies LifecycleReceipt};
+        generation:i.targetGeneration,leaseEpoch:i.leaseEpoch,fenceToken:i.fenceToken,instanceId,volumeId,state} satisfies LifecycleReceipt};
 }
 function assertIdentity(instance:Instance,tags:Record<string,string>,i:LifecycleIntent){
     // The subnet is bound to the configured ZoneId; a reported ZoneId must agree.
@@ -193,7 +199,7 @@ async function launchParameters(i:LifecycleIntent,digest:string,deps:Dependencie
         ||!equal(t.SecurityGroupIds,[d.securityGroupId])
         ||t.BlockDeviceMappings?.length!==1||t.BlockDeviceMappings[0]?.DeviceName!=='/dev/xvda')return fail('lifecycle_launch_invalid');
     return {LaunchTemplate:{LaunchTemplateId:d.launchTemplateId,Version:d.launchTemplateVersion},ImageId:d.amiId,
-        InstanceType:i.instanceType,MinCount:1,MaxCount:1,ClientToken:token(digest,'instance'),
+        InstanceType:i.instanceType,MinCount:1,MaxCount:1,ClientToken:token(digest,'instance'),UserData:i.userData!,
         SubnetId:d.subnetId,SecurityGroupIds:[d.securityGroupId],
         MetadataOptions:{HttpEndpoint:'enabled',HttpTokens:'required',HttpPutResponseHopLimit:1,InstanceMetadataTags:'disabled'},
         HibernationOptions:{Configured:false},

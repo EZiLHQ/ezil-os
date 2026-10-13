@@ -8,7 +8,7 @@ export function recoveryDefinition(helperArn: string) {
         [`terminate-${role}`, { operation: 'terminateInstances', fields: ['InstanceIds'], phase: `${role}-terminated` }],
     ])) as Record<string, { operation: string; fields: string[]; phase: RecoveryPhase }>;
     const States: Record<string, any> = {
-        Init: { Type: 'Pass', Result: { lastError: NO_ERROR }, ResultPath: '$.ctl', Next: 'Observe-initial' },
+        Init: { Type: 'Pass', Result: { lastError: NO_ERROR, observeError: NO_ERROR }, ResultPath: '$.ctl', Next: 'Observe-initial' },
         Decide: { Type: 'Choice', Choices: [...Object.keys(actions).map(action => ({ Variable: '$.step.decision', StringEquals: action, Next: action })),
             { Variable: '$.step.decision', StringEquals: 'wait', Next: 'Wait' },
             { Variable: '$.step.decision', StringEquals: 'success', Next: 'Fenced' }], Default: 'Unconfirmed' },
@@ -19,7 +19,7 @@ export function recoveryDefinition(helperArn: string) {
     };
     for (const phase of recoveryPhases) States['Observe-' + phase] = { Type: 'Task', Resource: helperArn, TimeoutSeconds: 60,
         Parameters: { 'executionArn.$': '$$.Execution.Id', phase }, ResultPath: '$.step', Next: 'Decide', Retry: observationRetry,
-        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ctl.lastError', Next: 'Unconfirmed' }] };
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ctl.observeError', Next: 'Unconfirmed' }] };
     for (const [name, action] of Object.entries(actions)) {
         States[name] = { Type: 'Task', Resource: `arn:aws:states:::aws-sdk:ec2:${action.operation}`, TimeoutSeconds: 30,
             Parameters: Object.fromEntries(action.fields.map(key => [key + '.$', '$.step.parameters.' + key])),

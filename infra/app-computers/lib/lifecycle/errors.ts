@@ -20,14 +20,26 @@ export const MAX_THROTTLE_RETRIES = 5;
 const capacityMessages = [/\bsufficient \S+ capacity/i, /vcpu (capacity|limit)/i];
 const throttleMessages = [/request limit exceeded/i, /rate exceeded/i];
 
-export type ProviderErrorClass = { kind: 'none' } | { kind: 'capacity'; code: string } | { kind: 'throttled' } | { kind: 'other' };
+/** The request may or may not have taken effect: only observation can tell. */
+const uncertainNames = new Set(['States.Timeout', 'States.HeartbeatTimeout']);
+const uncertainText = [/InternalError/, /ServiceUnavailable/, /\bUnavailable\b/, /Status Code: 5\d\d/];
+
+export type ProviderErrorClass = { kind: 'none' } | { kind: 'capacity'; code: string } | { kind: 'throttled' }
+    | { kind: 'uncertain' } | { kind: 'failed'; code: string };
+/** The code a terminal records for a definite provider rejection. */
+export function errorCode(e: RecordedError): string {
+    return `${e.Error}: ${e.Cause}`.slice(0, 512);
+}
 export function classifyProviderError(e: RecordedError): ProviderErrorClass {
     if (e.Error === NO_ERROR.Error && e.Cause === NO_ERROR.Cause) return { kind: 'none' };
     const text = `${e.Error}\n${e.Cause}`;
     for (const code of CAPACITY_CODES) if (text.includes(code)) return { kind: 'capacity', code };
     if (capacityMessages.some(r => r.test(text))) return { kind: 'capacity', code: 'InsufficientCapacity' };
     if (THROTTLE_CODES.some(code => text.includes(code)) || throttleMessages.some(r => r.test(text))) return { kind: 'throttled' };
-    return { kind: 'other' };
+    if (uncertainNames.has(e.Error) || uncertainText.some(r => r.test(text))) return { kind: 'uncertain' };
+    // A definite rejection (UnauthorizedOperation, IncorrectInstanceState, ...)
+    // fails fast with its code instead of waiting for the deadline.
+    return { kind: 'failed', code: errorCode(e) };
 }
 /** Bounded exponential backoff with full jitter, in whole seconds. */
 export function throttleDelaySeconds(attempt: number, random = Math.random): number {

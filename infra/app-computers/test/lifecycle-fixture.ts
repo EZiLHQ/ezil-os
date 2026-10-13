@@ -4,7 +4,7 @@ import type { Dependencies } from '../lib/lifecycle/aws.js';
 import { SettingsSchema, tagsFor, tagList, token, initialVolumeTags } from '../lib/lifecycle/contract.js';
 import type { LifecycleIntent } from '../lib/lifecycle/intent.js';
 export const REGION='ap-south-1',ZONE_ID='aps1-az1';
-export function lifecycleFixture(operation:LifecycleIntent['operation']='provision',options:{instanceType?:'m6i.large'|'c6i.xlarge';dataVolumeGiB?:number}={}){
+export function lifecycleFixture(operation:LifecycleIntent['operation']='provision',options:{instanceType?:'m6i.large'|'c6i.xlarge';dataVolumeGiB?:number;userData?:string|null;userDataNonce?:boolean}={}){
     const computerId=randomUUID(),generation=operation==='replace'?2:1;
     const deployment={accountId:'123456789012',region:REGION,zoneId:ZONE_ID,
         subnetId:'subnet-11111111111111111',securityGroupId:'sg-11111111111111111',launchTemplateId:'lt-11111111111111111',launchTemplateVersion:'1',
@@ -12,14 +12,15 @@ export function lifecycleFixture(operation:LifecycleIntent['operation']='provisi
         storage:{rootGiB:20,dataMinGiB:20,dataMaxGiB:100},
         dataKeyArn:`arn:aws:kms:${REGION}:123456789012:key/11111111-1111-4111-8111-111111111111`,
         stateMachineVersionArn:`arn:aws:states:${REGION}:123456789012:stateMachine:ezil-lifecycle:1`};
-    const settings=SettingsSchema.parse({deployment,authorityOrigin:'https://control.example',
+    const settings=SettingsSchema.parse({deployment,features:{userDataNonce:options.userDataNonce??false},authorityOrigin:'https://control.example',
         authoritySecretArn:`arn:aws:secretsmanager:${REGION}:123456789012:secret:ezil/lifecycle-key-abcdef`});
     const instanceType=options.instanceType??'m6i.large',dataVolumeGiB=operation==='provision'?options.dataVolumeGiB??20:null;
     const i:LifecycleIntent={schemaVersion:1,jobId:randomUUID(),computerId,revision:1,operation,targetGeneration:generation,fenceToken:randomUUID(),
         providerInstanceId:['provision','replace'].includes(operation)?null:'i-11111111111111111',dataVolumeId:operation==='provision'?null:'vol-11111111111111111',
         previousGeneration:operation==='replace'?1:null,previousInstanceId:operation==='replace'?'i-22222222222222222':null,
         previousFenceToken:operation==='replace'?randomUUID():null,
-        deployment,instanceType,dataVolumeGiB};
+        deployment,instanceType,dataVolumeGiB,leaseEpoch:operation==='provision'?1:3,
+        userData:options.userData!==undefined?options.userData:['provision','replace'].includes(operation)?'ZXppbC1ub25jZQ==':null};
     const document=JSON.stringify(i),digest=createHash('sha256').update(document).digest('hex');
     const envelope={schemaVersion:1,document,digest};const machine=deployment.stateMachineVersionArn.slice(0,-2);
     const executionArn=machine.replace(':stateMachine:',':execution:')+`:computer-${i.jobId}`;

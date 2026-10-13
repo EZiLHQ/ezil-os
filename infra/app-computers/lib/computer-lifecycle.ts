@@ -43,7 +43,7 @@ export class ComputerLifecycle extends Construct {
         role.addToPolicy(new iam.PolicyStatement({actions:['logs:CreateLogDelivery','logs:GetLogDelivery','logs:UpdateLogDelivery','logs:DeleteLogDelivery',
             'logs:ListLogDeliveries','logs:PutResourcePolicy','logs:DescribeResourcePolicies','logs:DescribeLogGroups'],resources:['*']}));
         this.machine=new states.CfnStateMachine(this,'Workflow',{stateMachineName:machineName,stateMachineType:'STANDARD',roleArn:role.roleArn,
-            definitionString:JSON.stringify(lifecycleDefinition(helper.currentVersion.functionArn)),
+            definitionString:JSON.stringify(lifecycleDefinition(helper.currentVersion.functionArn,s.features)),
             encryptionConfiguration:{type:'CUSTOMER_MANAGED_KMS_KEY',kmsKeyId:key.keyArn},
             loggingConfiguration:{level:'ERROR',includeExecutionData:false,destinations:[{cloudWatchLogsLogGroup:{logGroupArn:workflowLogs.logGroupArn+':*'}}]}});
         this.machine.node.addDependency(role);

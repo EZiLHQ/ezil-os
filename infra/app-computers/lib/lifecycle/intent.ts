@@ -14,7 +14,14 @@ export const LifecycleIntentSchema = z.object({
     // R10/R11: the computer's tier picks a type from the deployment allowlist
     // and, on provision only, a data size inside the configured range.
     instanceType: InstanceTypeSchema, dataVolumeGiB: z.number().int().min(1).max(16384).nullable(),
+    // C-2/C-3: generation is the writer generation (tags); leaseEpoch rises on
+    // every lease without retagging AWS resources.
+    leaseEpoch: positive,
+    // C-6: base64 user data carrying the one-time enrollment nonce. Required on
+    // a launch, optional on a start-in-place (flagged), absent otherwise.
+    userData: z.string().max(4096).regex(/^(?:[A-Za-z0-9+/]{4})+(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$|^(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)$/).nullable(),
 }).strict().refine(i => {
+    if (['provision', 'replace'].includes(i.operation) !== (i.userData !== null) && i.operation !== 'start') return false;
     if (!i.deployment.instanceTypes.includes(i.instanceType)) return false;
     if ((i.operation === 'provision') !== (i.dataVolumeGiB !== null)) return false;
     if (i.dataVolumeGiB !== null && (i.dataVolumeGiB < i.deployment.storage.dataMinGiB
@@ -44,7 +51,7 @@ export function parseLifecycleWork(work: LifecycleWork): LifecycleIntent {
  * configuration, application readiness, ownership or permission to launch. */
 export const LifecycleReceiptSchema = z.object({
     schemaVersion: z.literal(1), jobId: uuid, digest: z.string().regex(/^[a-f0-9]{64}$/),
-    computerId: uuid, generation: positive, fenceToken: uuid, instanceId: instance, volumeId: volume,
+    computerId: uuid, generation: positive, leaseEpoch: positive, fenceToken: uuid, instanceId: instance, volumeId: volume,
     state: z.enum(['running', 'stopped', 'retired']),
 }).strict();
 export type LifecycleReceipt = z.infer<typeof LifecycleReceiptSchema>;
@@ -54,7 +61,7 @@ export function validateLifecycleReceipt(work: LifecycleWork, input: unknown): L
     const r = parsed.data;
     const state = intent.operation === 'retire' ? 'retired' : intent.operation === 'stop' ? 'stopped' : 'running';
     if (r.jobId !== intent.jobId || r.digest !== work.digest || r.computerId !== intent.computerId
-        || r.generation !== intent.targetGeneration || r.fenceToken !== intent.fenceToken || r.state !== state
+        || r.generation !== intent.targetGeneration || r.leaseEpoch !== intent.leaseEpoch || r.fenceToken !== intent.fenceToken || r.state !== state
         || (intent.providerInstanceId !== null && r.instanceId !== intent.providerInstanceId)
         || (intent.dataVolumeId !== null && r.volumeId !== intent.dataVolumeId)
         || r.instanceId === intent.previousInstanceId) throw new LifecycleError('lifecycle_conflict');
