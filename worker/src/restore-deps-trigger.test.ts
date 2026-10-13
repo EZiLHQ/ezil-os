@@ -21,16 +21,17 @@ describe('restore-deps after a fresh restore', () => {
   });
   // Review r4254722070: the system restore may put the user's own /etc/bash.bashrc or global
   // npmrc over the image's, and a Guacamole-mode container never runs start-neko.sh. So the
-  // Worker's trigger re-appends the readiness wiring itself, BEFORE the restore starts, and a
+  // Worker's trigger re-appends the readiness wiring itself, BEFORE the restore starts (and after
+  // the boot-restore marker, so a gated npm run waits), and a
   // failing or absent ezil-deps must never stop the restore.
   for (const mode of ['ok', 'fails', 'absent'] as const) {
-    it(`runs ezil-deps install-hooks first, then the marked restore (ezil-deps ${mode})`, () => {
+    it(`marks the boot restore, re-installs the readiness hooks, then restores (ezil-deps ${mode})`, () => {
       const dir = mkdtempSync(join(tmpdir(), 'ezil-trigger-'));
       try {
         const bin = join(dir, 'bin'), run = join(dir, 'run'), calls = join(dir, 'calls');
         mkdirSync(bin);
         if (mode !== 'absent') {
-          writeFileSync(join(bin, 'ezil-deps'), `#!/bin/bash\necho "hooks $*" >> ${calls}\n${mode === 'fails' ? 'exit 1' : 'exit 0'}\n`);
+          writeFileSync(join(bin, 'ezil-deps'), `#!/bin/bash\necho "hooks $* marker=$([ -e ${run}/boot-restore ] && echo yes || echo no)" >> ${calls}\necho noise; echo noise >&2\n${mode === 'fails' ? 'exit 1' : 'exit 0'}\n`);
           chmodSync(join(bin, 'ezil-deps'), 0o755);
         }
         writeFileSync(join(bin, 'ezil-restore-deps.sh'),
@@ -41,8 +42,10 @@ describe('restore-deps after a fresh restore', () => {
         const r = spawnSync('/bin/sh', ['-c', cmd], { encoding: 'utf8' });
         expect(r.status).toBe(0);
         const lines = readFileSync(calls, 'utf8').trim().split('\n');
-        expect(lines).toEqual([...(mode === 'absent' ? [] : ['hooks install-hooks']), 'restore --boot /workspace marker=yes']);
+        // The marker exists before the hooks are wired, so a gated `npm run` waits ("scanning").
+        expect(lines).toEqual([...(mode === 'absent' ? [] : ['hooks install-hooks marker=yes']), 'restore --boot /workspace marker=yes']);
         expect(existsSync(join(run, 'boot-restore'))).toBe(true);
+        expect(r.stdout + r.stderr).toBe('');                                     // hook output never leaks
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
   }
