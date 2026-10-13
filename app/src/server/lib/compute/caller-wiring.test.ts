@@ -43,14 +43,18 @@ vi.mock('@/app/api/cron/sandbox-reap/handler', () => ({
 import { GET as reapGET } from '@/app/api/cron/sandbox-reap/route';
 import { cloudflareGuacamoleRouter } from '@/server/api/routers/cloudflare-guacamole';
 import { computerRouter } from '@/server/api/routers/computer';
-import { deriveGuacamoleSandboxId, mintSandboxPreviewToken } from '@/server/lib/cloudflare-guacamole-provider';
+import {
+    deriveGuacamoleSandboxId,
+    mintSandboxPreviewToken,
+    resolveScreenRequest,
+} from '@/server/lib/cloudflare-guacamole-provider';
 
 const userId = '11111111-1111-4111-8111-111111111111';
 const computerId = '22222222-2222-4222-8222-222222222222';
 const sandbox = deriveGuacamoleSandboxId(userId, computerId);
 const base = 'https://worker.example';
 
-let calls: { method: string; url: string; auth: string | undefined }[] = [];
+let calls: { method: string; url: string; auth: string | undefined; body?: string }[] = [];
 let reply: unknown = { ok: true };
 
 beforeEach(() => {
@@ -62,7 +66,12 @@ beforeEach(() => {
         'fetch',
         vi.fn(async (url: string, init: RequestInit = {}) => {
             const headers = (init.headers ?? {}) as Record<string, string>;
-            calls.push({ method: init.method ?? 'GET', url: String(url), auth: headers.Authorization });
+            calls.push({
+                method: init.method ?? 'GET',
+                url: String(url),
+                auth: headers.Authorization,
+                ...(typeof init.body === 'string' ? { body: init.body } : {}),
+            });
             return Response.json(reply);
         }),
     );
@@ -110,11 +119,51 @@ describe('router lifecycle procedures address the owner-derived sandbox', () => 
         expect(out).toMatchObject({ ok: true, outcome: 'restarted', wasRunning: true });
     });
 
+    /** The preview body minus its time-dependent HMAC token. */
+    const previewBody = () => {
+        expect(calls).toHaveLength(1);
+        expect(calls[0]).toMatchObject({ method: 'POST', url: `${base}/sandbox/preview` });
+        const { token, ...rest } = JSON.parse(calls[0]!.body!) as Record<string, unknown>;
+        expect(typeof token).toBe('string');
+        return rest;
+    };
+    const sessionId = '33333333-3333-4333-8333-333333333333';
+
+    it('previewUrl WITH a usable screen → the snapped screen reaches the Worker body', async () => {
+        reply = { ok: false, error: 'stop here', errorCode: 'unknown' };
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        const requested = { width: 1280, height: 800 };
+        const snapped = resolveScreenRequest(requested);
+        expect(snapped.source).not.toBe('default'); // the case must exercise the spread
+        await owner().previewUrl({ sessionId, computerId, screen: requested }).catch(() => undefined);
+        expect(previewBody()).toEqual({
+            sessionId,
+            userId,
+            projectId: computerId,
+            desktopMode: 'neko',
+            screen: { width: snapped.width, height: snapped.height },
+        });
+    });
+
+    it('previewUrl WITHOUT a screen → `screen` is omitted, not defaulted', async () => {
+        reply = { ok: false, error: 'stop here', errorCode: 'unknown' };
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        await owner().previewUrl({ sessionId, computerId }).catch(() => undefined);
+        expect(previewBody()).toEqual({ sessionId, userId, projectId: computerId, desktopMode: 'neko' });
+    });
+
+    it('codePreviewUrl → POST /sandbox/preview keyed by the computer, no screen', async () => {
+        reply = { ok: false, error: 'stop here', errorCode: 'unknown' };
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        await owner().codePreviewUrl({ computerId }).catch(() => undefined);
+        expect(previewBody()).toEqual({ sessionId: computerId, userId, projectId: computerId, desktopMode: 'neko' });
+    });
+
     it('appPreviewUrl → POST /sandbox/preview with this owner and computer in the body', async () => {
         reply = { ok: false, error: 'stop here', errorCode: 'unknown' };
         vi.spyOn(console, 'error').mockImplementation(() => {});
         await owner().appPreviewUrl({ computerId }).catch(() => undefined);
-        expect(calls).toMatchObject([{ method: 'POST', url: `${base}/sandbox/preview` }]);
+        expect(previewBody()).toEqual({ sessionId: computerId, userId, projectId: computerId, desktopMode: 'neko' });
     });
 });
 
