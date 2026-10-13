@@ -256,6 +256,16 @@ volume as hostile input.
    it.
 6. **Tests.** Assert where the upper is mounted from (the data device), and that the marker
    guard is durable (fsync).
+7. **Overlay `nodev`.** The merged overlay mount is itself `nodev`. Otherwise a device node
+   the guest created in the upper is usable through the merged path on the host.
+8. **Rebase failure.** Any non-zero rebase exit restores the pre-rebase snapshot. The rebase
+   tolerates a planted `/.ezil-rebase-preserved` and very deep trees without aborting part
+   way.
+9. **Profiles.** Profiles mount `noexec`. Re-test code-server extensions that ship native
+   binaries, and relax this only for the extensions directory if needed.
+10. **Seccomp and AppArmor.** The spike's denylist seccomp profile and docker-default
+    AppArmor are placeholders. Production uses an allowlist profile and a dedicated AppArmor
+    profile.
 
 ## 4. Caps and cost controls
 
