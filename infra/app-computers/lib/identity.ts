@@ -1,7 +1,7 @@
 import { CfnOutput, Duration, RemovalPolicy, Stack, type StackProps, aws_iam as iam, aws_s3 as s3 } from 'aws-cdk-lib';
 import type { Construct } from 'constructs';
 import { z } from 'zod';
-import { NamespaceSchema, REGION_PATTERN } from './lifecycle/deployment.js';
+import { DEFAULT_STORAGE, INSTANCE_TYPES, NamespaceSchema, REGION_PATTERN } from './lifecycle/deployment.js';
 
 /** I5 deploy identity. Created ONCE by the founder with their own admin
  * identity (README "Founder bootstrap"); never deployed by CI. No CDK
@@ -20,6 +20,8 @@ export const IdentityConfigSchema = z.object({
     assetBucketName: z.string().regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/),
     /** Founder-controlled §4 kill switch, enforced by the boundary. */
     killSwitch: z.boolean().default(false),
+    /** Cost cap for any bounded principal: largest EBS volume it may create. */
+    maxVolumeGiB: z.number().int().min(8).max(16384).default(DEFAULT_STORAGE.dataMaxGiB),
 }).strict().superRefine((c, ctx) => {
     if (c.githubOidcProviderArn !== `arn:aws:iam::${c.accountId}:oidc-provider/token.actions.githubusercontent.com`)
         ctx.addIssue({ code: 'custom', path: ['githubOidcProviderArn'], message: 'must be this account\'s GitHub OIDC provider' });
@@ -112,9 +114,13 @@ const PURCHASES = ['ec2:Purchase*', 'ec2:AllocateHosts', 'ec2:ModifyHosts', 'ec2
     'savingsplans:*', 'rds:PurchaseReserved*', 'elasticache:PurchaseReserved*', 'redshift:PurchaseReserved*', 'es:PurchaseReserved*',
     'dynamodb:PurchaseReserved*', 'aws-marketplace:Subscribe', 'aws-marketplace:AcceptAgreement*'] as const;
 
-/** Read and log-delivery actions that have no resource type at all (IAM
- * service reference), so they cannot be scoped below `*`:
- * - ec2:Describe*, iam:Get*, iam:List*, kms:ListAliases: reads only.
+/** Read and log-delivery actions granted on `*`:
+ * - ec2:Describe*, iam:Get*, iam:List*: read-only wildcards. Some actions they
+ *   match are resource-typed, but listing them one by one buys nothing for
+ *   reads. The one read that exposes a secret, ec2:DescribeInstanceAttribute
+ *   (userData), is denied on every instance outside the namespace
+ *   (`NoForeignInstanceAttributes`).
+ * - kms:ListAliases: no resource type (IAM service reference).
  * - logs:DescribeLogGroups and the seven log-delivery actions: Step Functions
  *   execution logging is configured through account-level log deliveries and
  *   a CloudWatch Logs resource policy; the state machine role and the
@@ -161,8 +167,13 @@ export function boundaryStatements(c: IdentityConfig): iam.PolicyStatement[] {
             { StringEquals: nsTag('Resource') }),
         ...networkCreateStatements(c, x => x),
         allow('AllowEc2NetworkMutateTagged', EC2_NETWORK_MUTATIONS, ['*'], { StringEquals: nsTag('Resource') }),
-        allow('AllowLaunchTagged', ['ec2:RunInstances', 'ec2:CreateVolume'], [ec2('instance'), ec2('volume'), ec2('network-interface')],
-            { StringEquals: compute('Request') }),
+        // Cost caps duplicated from the controller so a planted role is bounded too.
+        allow('AllowLaunchAllowlistedTypes', ['ec2:RunInstances'], [ec2('instance')],
+            { StringEquals: { ...compute('Request'), 'ec2:InstanceType': [...INSTANCE_TYPES] } }),
+        allow('AllowCappedEncryptedGp3Volumes', ['ec2:RunInstances', 'ec2:CreateVolume'], [ec2('volume')],
+            { StringEquals: { ...compute('Request'), 'ec2:VolumeType': 'gp3' }, Bool: { 'ec2:Encrypted': 'true' },
+                NumericLessThanEquals: { 'ec2:VolumeSize': String(c.maxVolumeGiB) } }),
+        allow('AllowLaunchInterfacesTagged', ['ec2:RunInstances'], [ec2('network-interface')], { StringEquals: compute('Request') }),
         allow('AllowLaunchIntoNamespaceNetwork', ['ec2:RunInstances'], [ec2('subnet'), ec2('security-group'), ec2('launch-template')],
             { StringEquals: nsTag('Resource') }),
         allow('AllowLaunchImages', ['ec2:RunInstances'], [`arn:aws:ec2:${r}::image/*`]),
@@ -193,6 +204,14 @@ export function boundaryStatements(c: IdentityConfig): iam.PolicyStatement[] {
         deny('NoOrgAccountBillingWrites', ACCOUNT_WRITES),
         deny('NoEdgeOrBudgetWrites', EDGE_AND_BUDGET_WRITES),
         deny('NoPurchasesOrReservations', PURCHASES),
+        // Alarms may not drive EC2/SSM automation (e.g. terminate any instance);
+        // with ops founder-only, bounded principals get no alarm actions at all.
+        deny('NoAlarmAutomation', ['cloudwatch:PutMetricAlarm', 'cloudwatch:PutCompositeAlarm'], { conditions: {
+            'ForAnyValue:StringLike': { 'cloudwatch:AlarmActions': ['arn:aws:automate:*', 'arn:aws:ssm*'] } } }),
+        deny('NoAlarmActions', ['cloudwatch:PutMetricAlarm', 'cloudwatch:PutCompositeAlarm'], { conditions: {
+            Null: { 'cloudwatch:AlarmActions': 'false' } } }),
+        deny('NoForeignInstanceAttributes', ['ec2:DescribeInstanceAttribute'], { resources: [`arn:aws:ec2:${r}:${a}:instance/*`],
+            conditions: { StringNotEquals: { 'aws:ResourceTag/ezil:stage': c.namespace } } }),
         ...(c.killSwitch ? [deny('KillSwitch', KILL_SWITCH_ACTIONS)] : []),
     ];
 }

@@ -263,6 +263,9 @@ These cannot be proven offline:
   state machine role.
 - **External keys.** The data and authority keys must carry `ezil:namespace=<ns>`; check that
   `CreateGrant`, `Decrypt` through Secrets Manager, and EBS encryption then succeed.
+- **Alarm-action key.** Confirm that `cloudwatch:AlarmActions` also covers the OK and
+  INSUFFICIENT_DATA action lists. Otherwise, add explicit denies for those lists once the
+  matching keys are confirmed.
 - **Unscopable reads.** Confirm no further read action turns out unscopable. Add any that do to
   `UNSCOPABLE` with a reason.
 - **Live allow proofs.** `IfExists` was removed, so a key that is absent from a correct
@@ -366,15 +369,27 @@ A role CI plants under `/ezil/<ns>/` inherits exactly this ceiling, so every all
     AMIs are not tag-scoped; the controller pins the AMI ID.
   - A volume can be restored only from a snapshot tagged `ezil:backup=<ns>`.
   - Start, stop, terminate, attach and modify need the compute resource tags.
+  - **Cost caps**, duplicated from the controller so a planted role is bounded too:
+    - launches only with `ec2:InstanceType` in {m6i.large, c6i.xlarge}
+    - volumes only gp3, encrypted, and at most `maxVolumeGiB` (identity config, default 100)
+- **No alarm actions.** `NoAlarmAutomation` denies `PutMetricAlarm` and `PutCompositeAlarm` when
+  `cloudwatch:AlarmActions` names `arn:aws:automate:*` or `arn:aws:ssm*`, and `NoAlarmActions`
+  denies any alarm action at all. Alarms with actions live only in the founder-deployed ops
+  stack.
 - **No adoption.** `CreateTags` is allowed only on create (`ec2:CreateAction`) or on resources
   that already carry the namespace or compute tags, so a foreign resource can never be tagged
   into the namespace.
 - **The asset bucket**, role writes under `/ezil/<ns>/`, and `PassRole` on workload roles and
   the execution role.
 
-**Unscopable `*` allows.** These actions have no resource type in the IAM service reference,
-so they cannot be scoped:
-- `ec2:Describe*`, `iam:Get*`, `iam:List*` and `kms:ListAliases`: reads.
+**`*` allows.**
+- **Read-only wildcards.** `ec2:Describe*`, `iam:Get*` and `iam:List*`. Some of the actions they
+  match are resource-typed; listing them one by one buys nothing for reads.
+- **The one secret-bearing read is excluded.** `ec2:DescribeInstanceAttribute` exposes
+  `userData`, which carries the enrollment nonce. It is denied on every instance whose
+  `ezil:stage` is not this namespace (`NoForeignInstanceAttributes`).
+- **No resource type at all** (IAM service reference), so these cannot be scoped:
+  - `kms:ListAliases`
 - `logs:DescribeLogGroups` and the log-delivery and Logs resource-policy actions: Step Functions
   execution logging needs them. Their blast radius is CloudWatch Logs delivery.
 - `cloudformation:ValidateTemplate`: no side effects.
@@ -452,6 +467,9 @@ Both are capped by the boundary. Today the account is empty in the pilot region,
 | Mutate a foreign VPC, or create inside it | BLOCKED (tag conditions) | Only namespace-tagged network (`AllowEc2NetworkMutateTagged`, `AllowEc2CreateOnlyInNamespaceVpc`) |
 | Restore a volume from a foreign snapshot | n/a | Only `ezil:backup=<ns>` snapshots (`AllowRestoreNamespaceSnapshots`) |
 | Adopt a foreign resource by tagging it | BLOCKED (tag on create only) | BLOCKED (`AllowTagOnCreate`, retag only already-tagged; `BackupTagOnlyAtCreation`) |
+| Attach EC2 terminate/stop automation to an alarm on any instance | n/a (lifecycle alarms carry no actions) | BLOCKED (`NoAlarmAutomation`, `NoAlarmActions`) |
+| Launch large instances or huge volumes | n/a | BLOCKED (`AllowLaunchAllowlistedTypes`, `AllowCappedEncryptedGp3Volumes`) |
+| Read a foreign instance's userData | BLOCKED (`NoForeignInstanceAttributes`) | BLOCKED (same) |
 | Launch inside the namespace with any AMI | n/a | **Residual:** AMIs are not tag-scoped. The instance is still namespace-tagged, namespace-networked and bounded. |
 | Change DLM, budgets, or the boundary kill switch | BLOCKED (founder-only ops and identity; no `dlm`, `budgets` or policy writes) | BLOCKED (same) |
 | Account-wide CloudWatch Logs resource policy | `logs:PutResourcePolicy` on `*` (unscopable; Step Functions logging) | **Residual:** same; it only affects Logs delivery |

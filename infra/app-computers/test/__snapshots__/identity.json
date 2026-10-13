@@ -216,6 +216,22 @@
             "Sid": "AllowEc2NetworkMutateTagged"
           },
           {
+            "Action": "ec2:RunInstances",
+            "Condition": {
+              "StringEquals": {
+                "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                "aws:RequestTag/ezil:stage": "pilot",
+                "ec2:InstanceType": [
+                  "m6i.large",
+                  "c6i.xlarge"
+                ]
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*",
+            "Sid": "AllowLaunchAllowlistedTypes"
+          },
+          {
             "Action": [
               "ec2:RunInstances",
               "ec2:CreateVolume"
@@ -223,16 +239,31 @@
             "Condition": {
               "StringEquals": {
                 "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                "aws:RequestTag/ezil:stage": "pilot",
+                "ec2:VolumeType": "gp3"
+              },
+              "Bool": {
+                "ec2:Encrypted": "true"
+              },
+              "NumericLessThanEquals": {
+                "ec2:VolumeSize": "100"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:123456789012:volume/*",
+            "Sid": "AllowCappedEncryptedGp3Volumes"
+          },
+          {
+            "Action": "ec2:RunInstances",
+            "Condition": {
+              "StringEquals": {
+                "aws:RequestTag/ezil:managed-by": "app-computer-platform",
                 "aws:RequestTag/ezil:stage": "pilot"
               }
             },
             "Effect": "Allow",
-            "Resource": [
-              "arn:aws:ec2:ap-south-1:123456789012:instance/*",
-              "arn:aws:ec2:ap-south-1:123456789012:volume/*",
-              "arn:aws:ec2:ap-south-1:123456789012:network-interface/*"
-            ],
-            "Sid": "AllowLaunchTagged"
+            "Resource": "arn:aws:ec2:ap-south-1:123456789012:network-interface/*",
+            "Sid": "AllowLaunchInterfacesTagged"
           },
           {
             "Action": "ec2:RunInstances",
@@ -598,6 +629,48 @@
             "Effect": "Deny",
             "Resource": "*",
             "Sid": "NoPurchasesOrReservations"
+          },
+          {
+            "Action": [
+              "cloudwatch:PutMetricAlarm",
+              "cloudwatch:PutCompositeAlarm"
+            ],
+            "Condition": {
+              "ForAnyValue:StringLike": {
+                "cloudwatch:AlarmActions": [
+                  "arn:aws:automate:*",
+                  "arn:aws:ssm*"
+                ]
+              }
+            },
+            "Effect": "Deny",
+            "Resource": "*",
+            "Sid": "NoAlarmAutomation"
+          },
+          {
+            "Action": [
+              "cloudwatch:PutMetricAlarm",
+              "cloudwatch:PutCompositeAlarm"
+            ],
+            "Condition": {
+              "Null": {
+                "cloudwatch:AlarmActions": "false"
+              }
+            },
+            "Effect": "Deny",
+            "Resource": "*",
+            "Sid": "NoAlarmActions"
+          },
+          {
+            "Action": "ec2:DescribeInstanceAttribute",
+            "Condition": {
+              "StringNotEquals": {
+                "aws:ResourceTag/ezil:stage": "pilot"
+              }
+            },
+            "Effect": "Deny",
+            "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*",
+            "Sid": "NoForeignInstanceAttributes"
           }
         ],
         "Version": "2012-10-17"

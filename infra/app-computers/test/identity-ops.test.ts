@@ -66,8 +66,13 @@ function expectedBoundary(killSwitch: boolean) {
                 'ec2:CreateRoute', 'ec2:ReplaceRoute', 'ec2:DeleteRoute', 'ec2:DeleteRouteTable', 'ec2:AssociateRouteTable', 'ec2:DisassociateRouteTable',
                 'ec2:ModifySubnetAttribute', 'ec2:DeleteSubnet', 'ec2:AuthorizeSecurityGroupEgress', 'ec2:RevokeSecurityGroupEgress',
                 'ec2:DeleteSecurityGroup', 'ec2:CreateLaunchTemplateVersion', 'ec2:ModifyLaunchTemplate', 'ec2:DeleteLaunchTemplate'] },
-        { Sid: 'AllowLaunchTagged', Effect: 'Allow', Action: ['ec2:RunInstances', 'ec2:CreateVolume'],
-            Resource: [EC2('instance'), EC2('volume'), EC2('network-interface')], Condition: { StringEquals: COMPUTE('Request') } },
+        { Sid: 'AllowLaunchAllowlistedTypes', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: EC2('instance'),
+            Condition: { StringEquals: { ...COMPUTE('Request'), 'ec2:InstanceType': ['m6i.large', 'c6i.xlarge'] } } },
+        { Sid: 'AllowCappedEncryptedGp3Volumes', Effect: 'Allow', Action: ['ec2:RunInstances', 'ec2:CreateVolume'], Resource: EC2('volume'),
+            Condition: { StringEquals: { ...COMPUTE('Request'), 'ec2:VolumeType': 'gp3' }, Bool: { 'ec2:Encrypted': 'true' },
+                NumericLessThanEquals: { 'ec2:VolumeSize': '100' } } },
+        { Sid: 'AllowLaunchInterfacesTagged', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: EC2('network-interface'),
+            Condition: { StringEquals: COMPUTE('Request') } },
         { Sid: 'AllowLaunchIntoNamespaceNetwork', Effect: 'Allow', Action: 'ec2:RunInstances',
             Resource: [EC2('subnet'), EC2('security-group'), EC2('launch-template')], Condition: { StringEquals: NS('Resource') } },
         { Sid: 'AllowLaunchImages', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: `arn:aws:ec2:${R}::image/*` },
@@ -120,6 +125,12 @@ function expectedBoundary(killSwitch: boolean) {
             'ec2:RequestSpot*', 'ec2:CreateFleet', 'savingsplans:*', 'rds:PurchaseReserved*', 'elasticache:PurchaseReserved*',
             'redshift:PurchaseReserved*', 'es:PurchaseReserved*', 'dynamodb:PurchaseReserved*', 'aws-marketplace:Subscribe',
             'aws-marketplace:AcceptAgreement*'] },
+        { Sid: 'NoAlarmAutomation', Effect: 'Deny', Resource: '*', Action: ['cloudwatch:PutMetricAlarm', 'cloudwatch:PutCompositeAlarm'],
+            Condition: { 'ForAnyValue:StringLike': { 'cloudwatch:AlarmActions': ['arn:aws:automate:*', 'arn:aws:ssm*'] } } },
+        { Sid: 'NoAlarmActions', Effect: 'Deny', Resource: '*', Action: ['cloudwatch:PutMetricAlarm', 'cloudwatch:PutCompositeAlarm'],
+            Condition: { Null: { 'cloudwatch:AlarmActions': 'false' } } },
+        { Sid: 'NoForeignInstanceAttributes', Effect: 'Deny', Action: 'ec2:DescribeInstanceAttribute', Resource: EC2('instance'),
+            Condition: { StringNotEquals: { 'aws:ResourceTag/ezil:stage': 'pilot' } } },
         ...(killSwitch ? [{ Sid: 'KillSwitch', Effect: 'Deny', Resource: '*', Action: ['ec2:RunInstances', 'ec2:StartInstances',
             'ec2:AttachVolume', 'ec2:CreateVolume', 'ec2:CreateFleet', 'ec2:RequestSpot*', 'states:StartExecution', 'states:StartSyncExecution',
             'states:RedriveExecution', 'lambda:InvokeFunction', 'events:PutTargets'] }] : []),
@@ -136,6 +147,9 @@ test('I5 boundary: every allow is scoped by name, namespace tag or compute tag; 
 test('I5 boundary: the founder kill switch adds one deny covering every bounded role', () => {
     const on = IdentityConfigSchema.parse({ ...cfg, killSwitch: true });
     assert.deepEqual(json(boundaryStatements(on)), expectedBoundary(true));
+    // The volume cap follows the identity config.
+    const capped = json(boundaryStatements(IdentityConfigSchema.parse({ ...cfg, maxVolumeGiB: 50 }))) as any[];
+    assert.equal(capped.find(s => s.Sid === 'AllowCappedEncryptedGp3Volumes').Condition.NumericLessThanEquals['ec2:VolumeSize'], '50');
 });
 
 test('item 1: namespaces are lowercase alphanumeric, never reserved, never identity', () => {
