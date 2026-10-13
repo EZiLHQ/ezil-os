@@ -107,7 +107,10 @@ test('item 6: no DeleteVolume, DeleteSnapshot or DetachVolume is allowed, and ea
     const { t } = synth(true), all = statements(t);
     for (const action of ['ec2:DeleteVolume', 'ec2:DeleteSnapshot', 'ec2:DetachVolume']) {
         assert.equal(allows(all, action).length, 0, action);
-        assert.ok(all.some(s => s.Effect === 'Deny' && actions(s).includes(action)), `deny ${action}`);
+        // Each workflow role carries its own explicit deny.
+        for (const prefix of ['LifecycleControllerRole', 'RecoveryRecoveryRole']) {
+            assert.ok(statements(t, prefix).some(s => s.Effect === 'Deny' && actions(s).includes(action)), `${prefix} denies ${action}`);
+        }
     }
     assert.ok(!all.some(s => s.Effect === 'Allow' && actions(s).some(a => a === 'ec2:*' || a === '*' || a === 'iam:CreateRole')));
     const stop = allows(all, 'ec2:StopInstances');

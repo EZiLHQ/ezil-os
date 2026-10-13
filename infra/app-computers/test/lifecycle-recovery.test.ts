@@ -170,3 +170,11 @@ test('slow recovery reads cannot issue a mutation beyond the original recovery d
     f.deps.instances = async selector => { const rows = await original(selector); f.state.now += 580000; return rows; };
     const result = await run(f); assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.deepEqual(result.calls, []);
 });
+test('recovery accepts a grown data disk inside the range and refuses one outside it', async () => {
+    for (const [size, ok] of [[80, true], [101, false], [19, false]] as const) {
+        const f = fixture(); f.state.volumes[0]!.Size = size;
+        const result = await run(f);
+        if (ok) assert.equal(result.error, undefined);
+        else { assert.equal(result.error, 'LifecycleRecoveryUnconfirmed'); assert.deepEqual(result.calls, []); }
+    }
+});
