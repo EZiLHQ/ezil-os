@@ -2,8 +2,8 @@
 // need bash/coreutils run for real against a temporary HOME.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, appendFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { chmodSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, existsSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -865,7 +865,7 @@ test('the Next.js npm cache is warmed from a reviewed lockfile with no lifecycle
   }
   assert.match(warm, /npm ci --ignore-scripts/);
   assert.match(warm, /env -i PATH="\$PATH" HOME="\$work\/home" DOCKER_CONFIG="\$work\/docker"/);
-  assert.match(warm, /npm_config_userconfig=\/dev\/null npm_config_globalconfig=\/dev\/null/);
+  assert.match(warm, /npm_config_userconfig="\$work\/user\.npmrc" npm_config_globalconfig="\$work\/global\.npmrc"/);
   const manifest = JSON.parse(read('.github/scripts/next-warm/package.json'));
   for (const [dep, version] of Object.entries(manifest.dependencies)) assert.match(version, /^\d+\.\d+\.\d+$/, `${dep} is pinned exactly`);
   assert.equal(manifest.dependencies.next, '16.4.0');
@@ -882,6 +882,33 @@ test('the Next.js npm cache is warmed from a reviewed lockfile with no lifecycle
   // The container installs exactly this tree offline.
   const suite = read('worker/src/workspace-checkpoint.container.test.ts');
   assert.ok(suite.includes('.github/scripts/next-warm/${f}') && suite.includes('npm ci --offline --cache /tmp/npmcache'));
+});
+
+test('warm-next-cache.sh really runs: npm loads its scrubbed config, gets exactly `ci --ignore-scripts`, and inherits no secrets', () => {
+  // Executes the real script (offline). A stand-in npm first loads the real npm's config
+  // under the same environment (npm refuses e.g. one file as both user and global config), then
+  // records its arguments and environment instead of downloading anything.
+  const realNpm = execFileSync('bash', ['-c', 'command -v npm'], { encoding: 'utf8' }).trim();
+  const dir = mkdtempSync(join(tmpdir(), 'ezil-warm-test-'));
+  try {
+    const bin = join(dir, 'bin'); mkdirSync(bin);
+    writeFileSync(join(bin, 'npm'), `#!/bin/bash
+"${realNpm}" config get registry > "${dir}/registry" 2> "${dir}/config.err" || exit 97
+printf '%s\\n' "$@" > "${dir}/args"; env > "${dir}/env"; pwd > "${dir}/cwd"; ls > "${dir}/files"
+`);
+    chmodSync(join(bin, 'npm'), 0o755);
+    const script = fileURLToPath(new URL('../.github/scripts/warm-next-cache.sh', import.meta.url));
+    const r = spawnSync('bash', [script, join(dir, 'cache')], { encoding: 'utf8',
+      env: { PATH: `${bin}:${process.env.PATH}`, RUNNER_TEMP: dir, GH_TOKEN: 'leak-me', DOCKER_CONFIG: '/root/.docker', NODE_OPTIONS: '--require=/x' } });
+    assert.equal(r.status, 0, `warm failed: ${r.stderr}${existsSync(join(dir, 'config.err')) ? readFileSync(join(dir, 'config.err'), 'utf8') : ''}`);
+    assert.equal(readFileSync(join(dir, 'registry'), 'utf8').trim(), 'https://registry.npmjs.org/');
+    assert.deepEqual(readFileSync(join(dir, 'args'), 'utf8').trim().split('\n'), ['ci', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', join(dir, 'cache')]);
+    const env = readFileSync(join(dir, 'env'), 'utf8');
+    assert.ok(!/GH_TOKEN|NODE_OPTIONS|leak-me/.test(env), 'no inherited secret or node option reaches npm');
+    assert.ok(!env.includes('DOCKER_CONFIG=/root/.docker'), 'never the real Docker config');
+    assert.deepEqual(readFileSync(join(dir, 'files'), 'utf8').trim().split('\n').sort(), ['package-lock.json', 'package.json']);
+    assert.deepEqual(readdirSync(dir).filter((n) => n.startsWith('ezil-next-warm.')), [], 'staging dir removed on exit');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("ci.yml's container job installs the same pinned OpenCode, never by piping the installer into bash", () => {

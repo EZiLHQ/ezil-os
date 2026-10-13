@@ -15,12 +15,15 @@ mkdir -p "$cache"
 cache="$(cd "$cache" && pwd)"
 src="$(cd "$(dirname "${BASH_SOURCE[0]}")/next-warm" && pwd)"
 work="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ezil-next-warm.XXXXXX")"
+trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/home" "$work/docker" "$work/project"
+# Two distinct empty npmrc files: npm refuses one path as both user and global config.
+: > "$work/user.npmrc"
+: > "$work/global.npmrc"
 cp "$src/package.json" "$src/package-lock.json" "$work/project/"
 (
   cd "$work/project"
   env -i PATH="$PATH" HOME="$work/home" DOCKER_CONFIG="$work/docker" \
-    npm_config_userconfig=/dev/null npm_config_globalconfig=/dev/null \
+    npm_config_userconfig="$work/user.npmrc" npm_config_globalconfig="$work/global.npmrc" \
     npm ci --ignore-scripts --no-audit --no-fund --cache "$cache"
 )
-rm -rf "$work"
