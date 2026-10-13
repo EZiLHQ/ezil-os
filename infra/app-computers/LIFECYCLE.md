@@ -21,34 +21,28 @@ may repeat only with the same SHA256 intent-derived ClientToken and exact
 parameters. StartInstances has no ClientToken and is never blindly repeated.
 Neither are stop, termination or attachment. Status reads cannot wake compute.
 
-Provisioning creates a 50-GiB encrypted gp3 data disk in the approved AZ. It
-starts one m7i.large using a numeric launch-template version, the approved
-Linux/amd64 AMI and a 30-GiB encrypted disposable root disk. The AMI must have a
+Provisioning creates an encrypted gp3 data disk of the intent's size (inside
+the configured range) in the configured ZoneId. It starts one instance of the
+intent's allowlisted type (`m6i.large` or `c6i.xlarge`) using a numeric
+launch-template version, the approved Linux/amd64 AMI and an encrypted
+disposable root disk of the configured size (default 20 GiB). The AMI must have a
 single `/dev/xvda` root device; additional implicit disks, user-data scripts,
 network-interface overrides and unsupported launch-template fields fail.
-Detailed monitoring is explicitly disabled. IMDSv2 is required with hop limit
-one; app containers must not obtain the host role. Non-secret computer and
-generation tags are available to the fixed host bootstrap.
+Detailed monitoring is explicitly disabled and hibernation is off. IMDSv2 is
+required with hop limit one and instance metadata tags are disabled. Hosts
+launch with **no instance role** (see README "Host role"); the workflow has no
+`iam:PassRole` and IAM refuses a `RunInstances` that names a profile. A new
+computer uses the shared workflow; it does not require redeploying the graph.
 
-An instance profile is derived as:
-
-```
-arn:aws:iam::<account>:instance-profile/ezil/<namespace>/computers/<computer UUID>/g<generation>
-```
-
-Its underlying role must use the corresponding role path. The controller can
-pass only that namespace's writer roles to EC2. These profiles/roles must be
-provisioned separately with narrow S3/KMS/Secrets Manager/ECR permissions. They
-are not the workflow's control role. A new computer uses the shared workflow;
-it does not require redeploying the graph.
-
-The data disk attaches at the EC2 device mapping `/dev/sdf` and is explicitly
-preserved with `DeleteOnTermination=false`. The host must resolve the real Nitro
+The data disk attaches at the EC2 device mapping `/dev/sdf`. A volume attached
+after launch defaults to `DeleteOnTermination=false`; the helper verifies it and
+fails closed otherwise (the workflow has no `ModifyInstanceAttribute` right). The host must resolve the real Nitro
 NVMe device by volume identity, not assume the guest path is `/dev/sdf`. No app
 is ready until the separate host mount guard confirms that disk.
 
 Stop requests use normal OS shutdown (`Force=false`, `SkipOsShutdown=false`).
-Replacement observes the old writer stopped, verifies preservation, terminates
+Replacement observes the old writer stopped, verifies preservation and that no
+unexpected disk is attached (otherwise termination is refused), terminates
 it, waits for provider termination and disk detachment, and attaches the same
 disk to the new generation. It never force-detaches or deletes a data volume.
 Retirement terminates compute while retaining the detached volume. The database
@@ -57,6 +51,15 @@ A successful workflow output is a provider receipt, not a mounted-disk,
 loaded-supervisor or installed-application receipt.
 
 ## Failure and activation boundary
+
+Every task failure is recorded at `$.ctl.lastError` and becomes the cause of a
+failed terminal. Capacity and quota errors (`InsufficientInstanceCapacity`,
+`VcpuLimitExceeded`, ...) end the run at `LifecycleRefused` with the code.
+Throttling (a definite no-effect rejection) re-arms the same step after a
+bounded, jittered backoff, at most five times. Observation tasks are read-only
+and retry transient Lambda/SDK failures; other helper codes are kept, not
+collapsed. The scheduled reconciler isolates each execution so one bad entry
+cannot abort a scan, then reports the partial failure.
 
 The helper uses the original 15-minute execution deadline, with a final mutation
 window and a 16-minute outer workflow timeout. Revocation, expired work,
@@ -72,7 +75,8 @@ complete terminal history before resolving exact historical resources. If an
 allocation task was entered but its resource cannot yet be found, it waits;
 it cannot infer that nothing was allocated. Truncated history fails closed.
 
-Recovery preserves attached data disks, requests graceful stop, and observes
+Recovery verifies attached data disks are preserved (it refuses rather than
+repairs a disk marked for deletion), requests graceful stop, and observes
 termination of each original writer. Termination positively fences a delayed
 StartInstances request that could otherwise wake a supposedly stopped writer.
 An interrupted replacement can have both an old and a newly allocated writer;
@@ -91,8 +95,7 @@ separate durable cancellation authorization; success must not itself trigger
 historical cleanup. A failed recovery retains its reservation and raises an
 alarm; failure does not mean compute has stopped. No data deletion is implemented.
 
-Before activation also provide the reviewed supervisor AMI, per-writer host
-profiles, scoped web OIDC federation, durable consumer scheduling and job intake.
+Before activation also provide the reviewed host AMI, scoped web OIDC federation, durable consumer scheduling and job intake.
 Wire the existing configuration delivery workflow through actual loaded-host
 observation. Validate IAM, same-AZ attachments, mount failures, stop/start,
 replacement and stopped-compute evidence in the approved capped AWS pilot.
@@ -115,9 +118,9 @@ file to `EZIL_LIFECYCLE_CONFIG` and run `npm run synth:lifecycle` inside
 `infra/app-computers`. Its fields are `settings`, `authorityKeyArn`, and optional
 `notificationsEnabled` (default false). Supply `recoveryVersionArn` to synthesize
 the recovery workflow and `recoveryEnabled: true` only after the required
-control-plane integration and pilot review. Its default is false. `settings` contains shared `deployment`
-pins from the intent **without** `instanceProfileArn`, `writerRolePathPrefix`,
-`authorityOrigin` and `authoritySecretArn`. No credential values belong in it.
+control-plane integration and pilot review. Its default is false. `settings` contains the shared `deployment`
+pins from the intent plus `authorityOrigin` and `authoritySecretArn`; see the
+README configuration section and `config/lifecycle.example.json`. No credential values belong in it.
 The emitted `WorkflowVersionArn` and `RecoveryVersionArn` must equal their
 configured numeric versions before activation. Review a real CDK diff before rollout.
 
