@@ -30,7 +30,7 @@ pre-booted hosts.
 | R1 | One region per deployment, configured. Zones are addressed only by **ZoneId** (for example `aps1-az1`), never by account-mapped zone names. A pilot uses one ZoneId. |
 | R2 | **Stage A:** one VM per user, stopped and started in place. **Stage B:** a bounded single-use pool of running blank hosts. Stage B ships default-off and stays off until Stage A acceptance (§7). |
 | R3 | **State of record = one retained encrypted gp3 data volume per computer.** It holds the desktop container's overlay upper layer (system installs), `/workspace`, HOME, and the browser and editor profiles. The host root volume is disposable: OS plus pre-pulled image. Backups are scheduled EBS snapshots. Periodic checkpoints to object storage are **off** for AWS computers. Export to S3 happens only for migration, rollback or explicit export, through short-lived per-key presigned URLs. |
-| R4 | The desktop runs as one container on the host, with no privileged mode and the default capability set. **Decided by the S1 spike: overlay rootfs.** The image rootfs is the read-only lower layer on the disposable root volume; the upper and work directories sit on the data volume. An OCI runtime (runc) runs it with a spec that mirrors local mode's `run-spec.ts` (entrypoint, env, no published ports). Docker with `data-root` on the data volume was rejected: it copies the full image (~4.5 GB) onto every user volume and cannot be rebased. Before user traffic the host agent must add seccomp/AppArmor, clear `/tmp` and `/run` in the upper before each start, and set `EZIL_PERSISTENT_PROFILES=1`. |
+| R4 | The desktop runs as one container on the host. **Decided by the S1 spike: overlay rootfs.** The image rootfs is the read-only lower layer on the disposable root volume; the upper and work directories sit on the data volume. runc runs it from a host-generated OCI spec that reuses the image's entrypoint and environment, as local mode's `run-spec.ts` does; it is not built by that argv builder. No ports are published. Docker with `data-root` on the data volume was rejected: it copies the full image (~4.5 GB) onto every user volume and cannot be rebased. Section 3a lists the host-agent rules that must hold before user traffic. |
 | R5 | **Threat model: the user may become root on their own host.** Everything the guest says is advisory: agent reports, the disk marker, load, connector state. The host holds no useful cloud credentials: no instance role, or a custom minimal one. IMDSv2 is required, with hop limit 1, instance metadata tags disabled, and container traffic to the metadata address dropped. |
 | R6 | No inbound network rules, no NAT gateway, no load balancer. Outbound is open for developer-desktop parity, bounded by out-of-guest egress metering and caps. Each computer reaches the gateway only through a per-generation Cloudflare Tunnel. |
 | R7 | A Step Functions lifecycle workflow owns EC2/EBS mutations. The app may only start executions of exact workflow versions and describe resources. The Cloudflare Worker holds no EC2 or IAM rights; it keeps only its existing workspace-store S3 scope, and mints presigned URLs from it. EC2 state-change events are reconciled into the database. |
@@ -217,6 +217,32 @@ A user who replays their own computer's material can reach only their own comput
 - browser profiles
 
 The operator sees the exact list. AWS-only state is never silently dropped.
+
+### 3a. Host-agent safety rules (must hold before any user runs on a host)
+
+The guest's root user controls every byte of the data volume. The host agent treats the
+volume as hostile input.
+
+1. **Host operations on volume content.** Rebase, clearing `/tmp` and `/run`, and the
+   Chrome `Singleton*` cleanup must either run inside the container, or use no-follow,
+   type-checked, `openat`-relative operations (`O_NOFOLLOW`, `S_ISREG`). A symlink or device
+   node in the upper must never redirect a host write.
+2. **Mount options.** The data volume, and every bind from it, is mounted `nosuid,nodev`
+   (and `noexec` where the layout allows).
+3. **Container confinement.**
+   - A seccomp profile that blocks nested user namespaces and mount.
+   - An AppArmor profile.
+   - `noNewPrivileges`.
+   - A pids limit.
+   - Read-only `hosts`, `hostname` and `resolv.conf` binds.
+   - Separate tmpfs for `/tmp` and `/run`.
+4. **User namespaces.** Decide on them before the first user. Adding id-shifting later
+   means rewriting every existing upper.
+5. **Rebase.** User files whose paths collide with new image files under `/usr/local` or
+   `/opt` are moved aside, never deleted. Every rebase rule has a test that fails without
+   it.
+6. **Tests.** Assert where the upper is mounted from (the data device), and that the marker
+   guard is durable (fsync).
 
 ## 4. Caps and cost controls
 
