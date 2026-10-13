@@ -56,11 +56,13 @@ describe('placement SQL is inside the hosted additive grammar', () => {
         }
     });
 
-    it('the grammar check is not vacuous: UNIQUE is refused', async () => {
+    it('the grammar check is not vacuous: a column DEFAULT is refused', async () => {
+        // UNIQUE indexes become legal once the narrow unique-index grammar lands, so probe
+        // with a column DEFAULT, which every grammar version refuses.
         const { additiveSQL } = await engine();
-        const unique = sql.replace('CREATE INDEX ezil_computer_placements_computer_idx', 'CREATE UNIQUE INDEX ezil_computer_placements_computer_idx');
-        expect(unique).not.toBe(sql);
-        expect(() => additiveSQL(unique, ['public'])).toThrow();
+        const withDefault = sql.replace('updated_at timestamptz NOT NULL', 'updated_at timestamptz NOT NULL DEFAULT now()');
+        expect(withDefault).not.toBe(sql);
+        expect(() => additiveSQL(withDefault, ['public'])).toThrow();
     });
 
     it('is not a *.sql file, so the unregistered copy stays out of the migration inventory', () => {
