@@ -124,8 +124,19 @@ test('plan labels pending verification and execution entries after the applied p
 test('strict additive grammar handles comments/quoted identifiers and rejects escapes', () => {
   const accepted = ['CREATE TABLE app.example (id integer NOT NULL, name text);', '/* nested /* ; COMMIT */ comment */ ALTER TABLE "app"."example" ADD COLUMN "odd;name" varchar(80);', 'CREATE INDEX example_index ON app.example(id, "odd;name");', 'CREATE TABLE app.one (id pg_catalog.int8); CREATE TABLE app.two (id uuid)'];
   for (const sql of accepted) assert.equal(additiveSQL(sql, ['app']), sql);
-  for (const sql of ['COMMIT;', 'BEGIN;', 'ROLLBACK;', 'DROP TABLE app.x;', 'TRUNCATE app.x;', 'DELETE FROM app.x;', 'INSERT INTO app.x VALUES (1);', 'UPDATE app.x SET id=1;', 'CREATE OR REPLACE VIEW app.x AS SELECT 1;', 'CREATE FUNCTION app.x() RETURNS void AS $$BEGIN COMMIT; END$$ LANGUAGE plpgsql;', 'DO $$BEGIN END$$;', 'CREATE TABLE app.x AS SELECT 1;', 'CREATE TABLE app.x (id integer DEFAULT app.mutate());', 'CREATE TABLE app.x (id app.custom);', 'ALTER TABLE app.x ADD COLUMN id integer; COMMIT;', 'ALTER TABLE app.x ADD COLUMN id integer, DROP COLUMN secret;', 'CREATE INDEX x ON app.x ((app.mutate()));', 'CREATE TABLE public.x(id integer);', 'CREATE TABLE app.x(id integer); \\gexec', 'CREATE TABLE app.x(id integer); /*', 'CREATE TABLE app."broken(id integer);', 'CREATE TABLE app.x(id integer); $tag$COMMIT$tag$', "CREATE TABLE app.x(id text DEFAULT E'\\');COMMIT;--');", 'CREATE TABLE app.x(id integer) INHERITS (app.old);', 'CREATE UNIQUE INDEX x ON app.x(id);']) assert.throws(() => additiveSQL(sql, ['app']), undefined, sql);
+  for (const sql of ['COMMIT;', 'BEGIN;', 'ROLLBACK;', 'DROP TABLE app.x;', 'TRUNCATE app.x;', 'DELETE FROM app.x;', 'INSERT INTO app.x VALUES (1);', 'UPDATE app.x SET id=1;', 'CREATE OR REPLACE VIEW app.x AS SELECT 1;', 'CREATE FUNCTION app.x() RETURNS void AS $$BEGIN COMMIT; END$$ LANGUAGE plpgsql;', 'DO $$BEGIN END$$;', 'CREATE TABLE app.x AS SELECT 1;', 'CREATE TABLE app.x (id integer DEFAULT app.mutate());', 'CREATE TABLE app.x (id app.custom);', 'ALTER TABLE app.x ADD COLUMN id integer; COMMIT;', 'ALTER TABLE app.x ADD COLUMN id integer, DROP COLUMN secret;', 'CREATE INDEX x ON app.x ((app.mutate()));', 'CREATE TABLE public.x(id integer);', 'CREATE TABLE app.x(id integer); \\gexec', 'CREATE TABLE app.x(id integer); /*', 'CREATE TABLE app."broken(id integer);', 'CREATE TABLE app.x(id integer); $tag$COMMIT$tag$', "CREATE TABLE app.x(id text DEFAULT E'\\');COMMIT;--');", 'CREATE TABLE app.x(id integer) INHERITS (app.old);']) assert.throws(() => additiveSQL(sql, ['app']), undefined, sql);
   assert.equal(tokenize('-- EOF').length, 0);
+});
+
+// F9: one vector file drives this repo's test and every ported copy's test.
+const uniqueVectors = JSON.parse(await readFile(new URL('./fixtures/migration-grammar-unique.json', import.meta.url), 'utf8'));
+
+test('F9 unique-index vectors: accepted forms parse; every refusal names its own reason', () => {
+  assert.ok(uniqueVectors.cases.some(c => c.accept) && uniqueVectors.cases.some(c => !c.accept));
+  for (const c of uniqueVectors.cases) {
+    if (c.accept) assert.equal(additiveSQL(c.sql, uniqueVectors.schemas), c.sql, c.why);
+    else assert.throws(() => additiveSQL(c.sql, uniqueVectors.schemas), new RegExp(c.error), c.why);
+  }
 });
 
 test('hardening grammar accepts function signatures, search_path separators and API role subsets', () => {
@@ -405,6 +416,42 @@ test(`transaction protocol (${process.env.PRODUCTION_MIGRATIONS_DOCKER === '1' ?
       assert.equal(after.objects, before.objects, sql);
       assert.equal((await state()).digest, before.digest, 'Rollback restores the fingerprint');
     }
+  });
+  await t.test('F9 accepted unique-index vectors are valid PostgreSQL and each changes the catalog', async () => {
+    await db.exec(`ROLLBACK; DROP SCHEMA IF EXISTS ezil_ci CASCADE; DROP SCHEMA IF EXISTS app CASCADE; CREATE SCHEMA app; ${uniqueVectors.setup}`);
+    const before = await state();
+    for (const c of uniqueVectors.cases.filter(v => v.accept)) {
+      // Newline: a vector may end in a line comment.
+      const after = (await db.rolledBackRows(`${additiveSQL(c.sql, uniqueVectors.schemas)}\n`, catalogSQL(['app'])))[0];
+      assert.notEqual(after.digest, before.digest, c.why);
+      assert.equal((await state()).digest, before.digest, 'Rollback restores the fingerprint');
+    }
+  });
+  await t.test('F9 catalog fingerprint detects uniqueness, partial predicates and their removal', async () => {
+    await db.exec('ROLLBACK; DROP SCHEMA IF EXISTS ezil_ci CASCADE; DROP SCHEMA IF EXISTS app CASCADE; CREATE SCHEMA app; CREATE TABLE app.p (owner uuid, state text); CREATE INDEX p_owner ON app.p (owner);');
+    const plain = (await state()).digest;
+    const digests = new Map([['non-unique', plain]]);
+    for (const [label, sql] of [
+      ['unique, same columns', 'DROP INDEX app.p_owner; CREATE UNIQUE INDEX p_owner ON app.p (owner);'],
+      ['unique partial IS NULL', "DROP INDEX app.p_owner; CREATE UNIQUE INDEX p_owner ON app.p (owner) WHERE state IS NULL;"],
+      ['unique partial other predicate', "DROP INDEX app.p_owner; CREATE UNIQUE INDEX p_owner ON app.p (owner) WHERE state = 'running';"],
+      ['dropped', 'DROP INDEX app.p_owner;'],
+    ]) {
+      const after = (await db.rolledBackRows(sql, catalogSQL(['app'])))[0].digest;
+      assert.ok(![...digests.values()].includes(after), `${label} is distinguishable from ${[...digests.keys()].join(', ')}`);
+      digests.set(label, after);
+      assert.equal((await state()).digest, plain, 'Rollback restores the fingerprint');
+    }
+  });
+  await t.test('F9 predicate naming a column the table lacks fails apply and rolls back everything', async () => {
+    const loaded = await fixture(); const before = (await state()).digest;
+    const sql = 'CREATE UNIQUE INDEX existing_missing_key ON app.existing (id) WHERE missing IS NULL;';
+    additiveSQL(sql, ['app']); // The grammar has no column knowledge; PostgreSQL resolves the name.
+    loaded.manifest.migrations.push({ id: 'missing_column', path: 'missing.sql', sha256: hash(sql), before, after: hash('unreachable') });
+    loaded.files.set('missing.sql', { sql });
+    await rejected(applySQL(loaded), /column "missing" does not exist/);
+    assert.equal((await state()).digest, before);
+    assert.equal((await db.rows("SELECT to_regclass('ezil_ci.journal') IS NULL AS absent"))[0].absent, true);
   });
   await t.test('readonly plan creates nothing; baseline records no historical applications; rerun is stable', async () => {
     const loaded = await fixture(); loaded.manifest.sources = [{ path: 'historical.sql', sha256: hash('DROP SCHEMA app CASCADE'), kind: 'snapshot' }];
