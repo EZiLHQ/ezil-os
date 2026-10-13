@@ -56,17 +56,7 @@ check "cloudflared restarted after a crash" test "$(grep -c '^start' "$H/stub/cf
 check "token passed in the environment, not argv" bash -c "grep -q 'token_env=yes token_in_argv=no' '$H/stub/cf.log' && ! grep -q 'token_env=no' '$H/stub/cf.log'"
 check "argv is 'tunnel --no-autoupdate run'" grep -q 'argv=\[tunnel --no-autoupdate run\]' "$H/stub/cf.log"
 CHILD="$(cat "$H/stub/cf.child.pid")"
-agent_ctl() { # agent_ctl <op-json>  (signs with the stored control key)
-    python3 - "$H" "$1" <<'EOF'
-import json, os, sys, time
-sys.path.insert(0, os.path.join(os.environ["HA"], "lib"))
-from ezil_host import agent, config
-cfg = config.load(os.path.join(sys.argv[1], "etc/agent.json"))
-key = open(os.path.join(cfg.stateDir, "control.key"), "rb").read()
-msg = json.loads(sys.argv[2]); msg.setdefault("ts", time.time())
-print(json.dumps(agent.client(cfg, key, msg)))
-EOF
-}
+agent_ctl() { python3 "$HA/test/ctl.py" "$H" "$1"; }   # signs, fills ts and seq
 export HA H
 export -f agent_ctl
 # fence via the file the control channel writes
@@ -90,15 +80,34 @@ sleep 1.5; kill -TERM $CFP; wait $CFP
 check "SIGTERM: cloudflared stopped and token wiped" bash -c "[ ! -e '$H/state/tunnel.json' ] && grep -q 'stopped (sigterm)' '$H/run/cf3.out'"
 
 # --- control channel: authentication
-agent e agent > "$H/run/agent.out" 2>&1 & echo $! > "$H/run/agent.pid"
+env "$(host_env e)" "$AGENT" agent > "$H/run/agent.out" 2>&1 & echo $! > "$H/run/agent.pid"   # $! must be the agent itself, not a subshell
 for i in $(seq 1 40); do [ -S "$H/run/control.sock" ] && break; sleep 0.1; done
 check "control socket is root-only (0600)" test "$(stat -c %a "$H/run/control.sock")" = 600
 check "valid presence accepted" bash -c "agent_ctl '{\"op\":\"presence\",\"leaseEpoch\":2}' | jq -e .ok"
 check "wrong epoch refused" bash -c "agent_ctl '{\"op\":\"presence\",\"leaseEpoch\":1}' | jq -e '.error==\"wrong_epoch\"'"
 check "stale timestamp refused" bash -c "agent_ctl '{\"op\":\"presence\",\"leaseEpoch\":2,\"ts\":1}' | jq -e '.error==\"stale_request\"'"
-check "bad MAC refused" bash -c "python3 -c \"
-import json,socket; s=socket.socket(socket.AF_UNIX); s.connect('$H/run/control.sock')
-s.sendall(json.dumps({'op':'stop','leaseEpoch':2,'ts':__import__('time').time(),'mac':'00'}).encode()+b'\n'); print(s.recv(999).decode())\" | jq -e '.error==\"bad_mac\"'"
+check "bad MAC refused" bash -c "python3 '$HA/test/ctl.py' '$H' '{\"raw\":\"{\\\"op\\\":\\\"stop\\\",\\\"leaseEpoch\\\":2,\\\"ts\\\":1,\\\"seq\\\":99,\\\"mac\\\":\\\"00\\\"}\"}' | jq -e '.error==\"bad_mac\"'"
+ctl_err() { agent_ctl "$1" | jq -r '.error // "ok"'; }
+check "non-finite ts (NaN) refused" test "$(ctl_err '{"op":"presence","leaseEpoch":2,"ts_raw":"nan"}')" = bad_ts
+check "non-finite ts (inf) refused" test "$(ctl_err '{"op":"presence","leaseEpoch":2,"ts_raw":"inf"}')" = bad_ts
+check "ts 60 s in the future refused (skew bound 5 s)" test "$(ctl_err '{"op":"presence","leaseEpoch":2,"ts_offset":60}')" = stale_request
+check "ts 3 s in the future accepted" test "$(ctl_err '{"op":"presence","leaseEpoch":2,"ts_offset":3}')" = ok
+check "zero seq refused" test "$(ctl_err '{"op":"presence","leaseEpoch":2,"seq":0}')" = bad_seq
+check "boolean seq refused" test "$(ctl_err '{"op":"presence","leaseEpoch":2,"seq":true}')" = bad_seq
+SEQ=$(( $(cat "$H/run/test-seq") + 1 )); echo $SEQ > "$H/run/test-seq"
+check "fresh seq accepted" test "$(ctl_err "{\"op\":\"presence\",\"leaseEpoch\":2,\"seq\":$SEQ}")" = ok
+check "exact replay (same seq) refused" test "$(ctl_err "{\"op\":\"presence\",\"leaseEpoch\":2,\"seq\":$SEQ}")" = replayed
+check "lower seq refused" test "$(ctl_err "{\"op\":\"presence\",\"leaseEpoch\":2,\"seq\":$((SEQ-1))}")" = replayed
+check "seq high-water mark persisted host-only (0600)" bash -c "jq -e '.leaseEpoch==2 and .seq==$SEQ' '$H/state/control-seq.json' && [ \$(stat -c %a '$H/state/control-seq.json') = 600 ]"
+kill "$(cat "$H/run/agent.pid")"; sleep 1
+env "$(host_env e)" "$AGENT" agent >> "$H/run/agent.out" 2>&1 & echo $! > "$H/run/agent.pid"
+for i in $(seq 1 40); do [ -S "$H/run/control.sock" ] && break; sleep 0.1; done; sleep 0.3
+check "replay refused across an agent restart" test "$(ctl_err "{\"op\":\"presence\",\"leaseEpoch\":2,\"seq\":$SEQ}")" = replayed
+for w in -1 901 '"5"' true 1.5; do
+    check "stop with warnSeconds=$w refused (bounds 0..900, integer)" test "$(ctl_err "{\"op\":\"stop\",\"leaseEpoch\":2,\"warnSeconds\":$w}")" = bad_warn
+done
+check "non-object JSON refused, channel stays up" bash -c "[ \"\$(python3 '$HA/test/ctl.py' '$H' '{\"raw\":\"[1,2]\"}' | jq -r .error)\" = bad_json ] && [ \"\$(agent_ctl '{\"op\":\"presence\",\"leaseEpoch\":2}' | jq -r .ok)\" = true ]"
+check "no stop was triggered by any refused request" test ! -e "$H/run/shutdown-called"
 check "agent never calls out: no http/enroll import in agent.py" bash -c "! grep -qE '^from \. import .*\b(http|enroll)\b|^import .*http' '$HA/lib/ezil_host/agent.py'"
 # control-plane stop: warn -> flush -> stop (ordered unmount, then shutdown)
 agent e overlay >/dev/null 2>&1   # overlay + netns so the ordered unmount has work to do (no container)
@@ -108,4 +117,5 @@ check "stop: shutdown -h called" test -e "$H/run/shutdown-called"
 check "stop: overlay and data volume were unmounted BEFORE shutdown" test "$(sed -n 2p "$H/run/shutdown-called" 2>/dev/null)" = 0
 check "stop: warn logged, flush not blockable" bash -c "grep -q 'warn: stopping in 1s (cap)' '$H/run/agent.out' && grep -q 'shutdown: stop:cap flush=' '$H/run/agent.out'"
 check "stop: fence file written (cloudflared would stop and wipe)" test -e "$H/run/fence"
+cp "$H/run/agent.out" "$T/agent-e.out" 2>/dev/null
 summary "enrollment + tunnel + control channel"

@@ -88,11 +88,7 @@ check "token not visible inside the container (/proc/*/environ, /tmp, /run, /roo
 check "token not on the data volume" bash -c "! grep -rqs -- '$TOKEN' '$D'"
 env "$(host_env a)" "$AGENT" agent > "$H/run/agent.out" 2>&1 & echo $! > "$H/run/agent.pid"
 for i in $(seq 1 40); do [ -S "$H/run/control.sock" ] && break; sleep 0.1; done
-presence() { python3 -c "
-import sys,time,os; sys.path.insert(0,'$HA/lib')
-from ezil_host import agent, config
-c=config.load('$H/etc/agent.json'); k=open(c.stateDir+'/control.key','rb').read()
-print(agent.client(c,k,{'op':'presence','leaseEpoch':1,'ts':time.time()}))" >/dev/null; }
+presence() { python3 "$HA/test/ctl.py" "$H" '{"op":"presence","leaseEpoch":1}' >/dev/null; }
 for i in $(seq 1 6); do presence; sleep 1; done
 check "presence within the inactivity window keeps the computer up" bash -c "[ ! -e '$H/run/shutdown-called' ] && runc --root '$H/run/runc' state ${TAG}-a | jq -e '.status==\"running\"'"
 # apt/dpkg take POSIX (fcntl) locks: hold one the same way for 12 s

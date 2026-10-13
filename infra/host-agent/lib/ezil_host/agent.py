@@ -22,6 +22,7 @@ cfg.shutdownCmd (`shutdown -h now`).
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import socket
@@ -34,6 +35,13 @@ from . import desktop, guard, tunnel
 from .fsops import Refused, open_dir_below
 
 LOAD_RE = re.compile(r"^\d+(\.\d+)?$")
+MAX_PAST = 120        # seconds a request may be old
+MAX_FUTURE = 5        # seconds of clock skew tolerated ahead of this host
+MAX_WARN = 900        # a control-plane stop warns for at most 15 minutes
+
+
+def _is_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
 def parse_load1(text):
@@ -91,35 +99,73 @@ class Agent:
         self.lock = threading.Lock()
         with open(os.path.join(cfg.stateDir, "control.key"), "rb") as f:
             self.key = f.read()
+        self.last_seq = self._load_seq()
 
     # ---------------------------------------------------------------- control
     def handle(self, raw):
+        """Authenticate (HMAC), bind to this epoch, check freshness and replay, then act.
+        Every request carries ts (finite, at most MAX_PAST s old and MAX_FUTURE s ahead)
+        and seq (integer, strictly increasing within the epoch; the high-water mark is
+        persisted host-only and fsynced BEFORE the request takes effect, so a replay is
+        refused even across an agent restart)."""
         try:
             msg = json.loads(raw)
-            mac = msg.get("mac", "")
         except ValueError:
             return {"ok": False, "error": "bad_json"}
+        if not isinstance(msg, dict):
+            return {"ok": False, "error": "bad_json"}
+        mac = msg.get("mac", "")
         if not isinstance(mac, str) or not hmac.compare_digest(mac, sign(self.key, msg)):
             return {"ok": False, "error": "bad_mac"}
-        if msg.get("leaseEpoch") != self.lease["leaseEpoch"]:
+        if msg.get("leaseEpoch") != self.lease["leaseEpoch"] or isinstance(msg.get("leaseEpoch"), bool):
             return {"ok": False, "error": "wrong_epoch"}
         ts = msg.get("ts")
-        if not isinstance(ts, (int, float)) or abs(self.clock() - ts) > 120:
+        if not _is_number(ts) or not math.isfinite(ts):
+            return {"ok": False, "error": "bad_ts"}
+        now = self.clock()
+        if ts < now - MAX_PAST or ts > now + MAX_FUTURE:
             return {"ok": False, "error": "stale_request"}
+        seq = msg.get("seq")
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+            return {"ok": False, "error": "bad_seq"}
         op = msg.get("op")
+        if op == "stop":
+            warn = msg.get("warnSeconds", self.cfg.stopWarnSeconds)
+            if not isinstance(warn, int) or isinstance(warn, bool) or not 0 <= warn <= MAX_WARN:
+                return {"ok": False, "error": "bad_warn"}
+        elif op not in ("presence", "fence"):
+            return {"ok": False, "error": "unknown_op"}
         with self.lock:
+            if seq <= self.last_seq:
+                return {"ok": False, "error": "replayed"}
+            self._persist_seq(seq)
             if op == "presence":
-                self.last_presence = max(self.last_presence, float(ts))
+                self.last_presence = max(self.last_presence, min(float(ts), now))
                 return {"ok": True}
             if op == "stop":
-                self.stop_request = {"kind": "stop", "warn": int(msg.get("warnSeconds", self.cfg.stopWarnSeconds)),
-                                     "reason": str(msg.get("reason", "control_plane"))}
+                self.stop_request = {"kind": "stop", "warn": warn, "reason": str(msg.get("reason", "control_plane"))[:64]}
                 return {"ok": True}
-            if op == "fence":
-                tunnel.fence(self.cfg, f"fence:{msg.get('newEpoch')}")
-                self.stop_request = {"kind": "fence", "warn": 0, "reason": "fence"}
-                return {"ok": True}
-        return {"ok": False, "error": "unknown_op"}
+            tunnel.fence(self.cfg, f"fence:{str(msg.get('newEpoch'))[:32]}")
+            self.stop_request = {"kind": "fence", "warn": 0, "reason": "fence"}
+            return {"ok": True}
+
+    def _seq_path(self):
+        return os.path.join(self.cfg.stateDir, "control-seq.json")
+
+    def _load_seq(self):
+        try:
+            with open(self._seq_path()) as f:
+                d = json.load(f)
+            if d.get("leaseEpoch") == self.lease["leaseEpoch"] and isinstance(d.get("seq"), int):
+                return d["seq"]
+        except (OSError, ValueError, AttributeError):
+            pass
+        return 0
+
+    def _persist_seq(self, seq):
+        from .enroll import _write_private
+        _write_private(self._seq_path(), json.dumps({"leaseEpoch": self.lease["leaseEpoch"], "seq": seq}).encode())
+        self.last_seq = seq
 
     def serve(self, stop_event):
         path = os.path.join(self.cfg.runDir, "control.sock")
@@ -148,7 +194,11 @@ class Agent:
                         if not chunk:
                             break
                         data += chunk
-                    c.sendall((json.dumps(self.handle(data)) + "\n").encode())
+                    try:
+                        resp = self.handle(data)
+                    except Exception as e:  # noqa: BLE001 — a bad request must never kill the channel
+                        resp = {"ok": False, "error": "internal", "detail": type(e).__name__}
+                    c.sendall((json.dumps(resp) + "\n").encode())
                 except OSError:
                     pass
         s.close()

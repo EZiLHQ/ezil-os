@@ -48,6 +48,11 @@ mutate M19 lib/ezil_host/cli.py '            guard.clear_stamp(cfg)            #
 mutate M20 lib/ezil_host/guard.py '    assert_data_mounted(cfg, lease)
 ' '' test-guard.sh "volume unmounted behind the agent's back: 'overlay' refuses"
 mutate M21 lib/ezil_host/guard.py '    if os.path.realpath(usrc) != dev:' '    if False:' test-guard.sh "upper redirected onto the host disk"
+mutate M22 lib/ezil_host/agent.py 'if not _is_number(ts) or not math.isfinite(ts):' 'if not _is_number(ts):' test-enroll-tunnel.sh "non-finite ts (NaN) refused"
+mutate M23 lib/ezil_host/agent.py '            if seq <= self.last_seq:' '            if False:' test-enroll-tunnel.sh "exact replay (same seq) refused"
+mutate M24 lib/ezil_host/agent.py '        self.last_seq = self._load_seq()' '        self.last_seq = 0' test-enroll-tunnel.sh "replay refused across an agent restart"
+mutate M25 lib/ezil_host/agent.py 'not 0 <= warn <= MAX_WARN' 'False' test-enroll-tunnel.sh "stop with warnSeconds=901 refused"
+mutate M26 lib/ezil_host/agent.py 'MAX_FUTURE = 5 ' 'MAX_FUTURE = 120 ' test-enroll-tunnel.sh "ts 60 s in the future refused"
 if [ "${1:-}" != --quick ]; then
 mutate M17 lib/ezil_host/agent.py '        if blockable and dpkg_lock_held(self.cfg):
             return "busy"' '' test-boot.sh "a held dpkg lock (install in progress) blocks the idle stop"
