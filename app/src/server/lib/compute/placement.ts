@@ -331,12 +331,19 @@ async function lockComputer(tx: PlacementExecutor, computerId: string): Promise<
     );
 }
 
-const ADMISSION_BRAND: unique symbol = Symbol('admission-lock');
+declare const ADMISSION_BRAND: unique symbol;
 
-/** Proof that the global admission lock is held by THIS transaction. Minted only inside `withAdmission`. */
+/**
+ * Proof that the global admission lock is held by THIS transaction. Minted
+ * only inside `withAdmission`. Opaque: the transaction it belongs to is kept
+ * in a module-private WeakMap, so a copied or hand-built object (even one
+ * carrying the right transaction) is never accepted.
+ */
 export interface AdmissionLock {
-    readonly [ADMISSION_BRAND]: PlacementExecutor;
+    readonly [ADMISSION_BRAND]: true;
 }
+
+const MINTED_LOCKS = new WeakMap<object, PlacementExecutor>();
 
 /** Private: the lock must be the first statement of a transaction this module opened. */
 async function takeAdmissionLock(tx: PlacementExecutor): Promise<AdmissionLock> {
@@ -345,7 +352,9 @@ async function takeAdmissionLock(tx: PlacementExecutor): Promise<AdmissionLock> 
             sql`/* placement:lock-admission */ SELECT pg_advisory_xact_lock(${ADMISSION_LOCK_NAMESPACE}::int4, 0), current_setting('transaction_isolation') AS isolation`,
         ),
     );
-    return Object.freeze({ [ADMISSION_BRAND]: tx });
+    const lock = Object.freeze({}) as AdmissionLock;
+    MINTED_LOCKS.set(lock, tx);
+    return lock;
 }
 
 /**
@@ -359,7 +368,7 @@ export function withAdmission<T>(db: PlacementDb, fn: (tx: PlacementExecutor, lo
 }
 
 function assertAdmissionLock(tx: PlacementExecutor, lock: AdmissionLock): void {
-    if (!lock || lock[ADMISSION_BRAND] !== tx) {
+    if (!lock || typeof lock !== 'object' || MINTED_LOCKS.get(lock) !== tx) {
         throw new Error('admission lock is not held by this transaction');
     }
 }

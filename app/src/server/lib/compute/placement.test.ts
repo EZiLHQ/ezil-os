@@ -303,6 +303,17 @@ describe('leasing and AWS creation need the admission lock of the same transacti
         expect(statements.map((s) => s.sql.slice(0, 40))).toEqual(['BEGIN', expect.stringMatching(/placement:lock-admission/), 'COMMIT']);
     });
 
+    it('a hand-built lock carrying the right transaction is refused (no symbol to copy)', async () => {
+        const { db, placements } = createFakePlacementDb({ placements: [placementRow({ computer_id: A })] });
+        const real = await withAdmission(db, async (_tx, lock) => lock);
+        expect(Object.getOwnPropertySymbols(real)).toEqual([]);
+        expect(Object.keys(real)).toEqual([]);
+        await expect(
+            db.transaction((tx) => leasePlacement(tx, { ...real } as never, { computerId: A, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: new Date() })),
+        ).rejects.toThrow(/admission lock/);
+        expect(placements[0]!.state).toBe('STOPPED');
+    });
+
     it('a forged lock object is refused', async () => {
         const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A })] });
         await expect(
