@@ -66,8 +66,10 @@ export interface FlushContainerLike extends HydrateContainerLike {
 // Retained for DO cache compatibility; never trusted to skip byte verification.
 export type FlushManifest = Record<string, { size: number; modifiedAt: string }>;
 export interface FlushOutcome {
-  /** Set by the Worker when this flush's FINAL system-layer checkpoint failed (idle-stop / teardown must refuse). */
+  /** Set by the Worker when this flush's FINAL system-layer checkpoint is retryable-unsaved (busy / failed). */
   systemCheckpointFailed?: boolean;
+  /** Set by the Worker when a FINAL system checkpoint saved nothing: busy | failed | stale | not_restored. */
+  systemFinalReason?: 'busy' | 'failed' | 'stale' | 'not_restored';
   ok: boolean;
   uploaded: string[];
   skippedUnchanged: number;

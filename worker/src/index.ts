@@ -1732,18 +1732,43 @@ async function ensureWorkspaceHydratedFromR2(
 }
 
 /**
- * A FINAL system-layer checkpoint that did not save the user's changes outside
- * /workspace keeps the computer up (idle-stop retries; teardown refuses):
- * 'failed', and also 'busy' (package manager running), 'stale' (another
- * writer's head) and 'not_restored' (this container never restored the
- * layer). Only outcomes that have nothing to save let it stop: ok,
- * no_computer, no_baseline, no_manifest, too_large (permanent; the last
- * committed layer stays authoritative) and migrated (fenced, C-7).
+ * How a FINAL system-layer checkpoint (user changes outside /workspace)
+ * affects idle-stop and teardown. The last COMMITTED system layer always stays
+ * authoritative; the question is only whether waiting can save more.
+ *
+ * - 'unsaved':   'stale' (another writer's head, or this container's own
+ *                `sys-hydrated` record failed after its commit) and
+ *                'not_restored' (the restore failed; nothing retries it). Both
+ *                are PERMANENT for this container: waiting saves nothing and
+ *                would bill forever, refusing DELETE, the reaper and computer
+ *                delete. Never block; record "not saved".
+ * - 'retryable': 'busy' (package manager running) and 'failed' (transfer or
+ *                store error). Block for a BOUNDED window only
+ *                (`SYSTEM_FINAL_MAX_RETRIES` / `SYSTEM_FINAL_MAX_WAIT_MS`),
+ *                then proceed and record "not saved".
+ * - 'clean':     everything else (ok, no_computer, no_baseline, no_manifest,
+ *                too_large — permanent, committed layer authoritative — and
+ *                migrated, fenced by C-7).
  */
-export function finalSystemCheckpointBlocksStop(system: SystemFlushOutcome): boolean {
-  return system.skippedReason === 'failed' || system.skippedReason === 'busy'
-    || system.skippedReason === 'stale' || system.skippedReason === 'not_restored';
+export type FinalSystemClass = 'clean' | 'unsaved' | 'retryable';
+export function classifyFinalSystemCheckpoint(system: SystemFlushOutcome): FinalSystemClass {
+  if (system.skippedReason === 'stale' || system.skippedReason === 'not_restored') return 'unsaved';
+  if (system.skippedReason === 'busy' || system.skippedReason === 'failed') return 'retryable';
+  return 'clean';
 }
+
+/**
+ * Bound for a retryable final system checkpoint. 3 retries at 1, 3 and 5
+ * minutes (≈9 min) cover a normal `apt`/`npm -g` run finishing (busy) and a
+ * transient store blip (failed); anything still failing after that is almost
+ * certainly persistent (store outage, corrupt staging, a package manager
+ * wedged), and holding the computer up longer only bills without saving more.
+ * The 15-minute wall-clock cap holds even when alarms or caller retries
+ * (teardown, reaper) arrive late or early.
+ */
+export const SYSTEM_FINAL_MAX_RETRIES = 3;
+export const SYSTEM_FINAL_MAX_WAIT_MS = 15 * 60_000;
+export const SYSTEM_FINAL_RETRY_BACKOFF_SECONDS = [60, 180, 300] as const;
 
 // ── Durable Object storage keys (EzilSandboxDO) ──────────────────────────────
 const WORKSPACE_FLUSH_CONTEXT_KEY = 'ezil:workspaceFlushContext';
@@ -1884,6 +1909,15 @@ const WORKSPACE_LAST_GC_AT_KEY = 'ezil:workspaceLastGcAt';
  * migration export is refused while either is true (C-7).
  */
 const WORKSPACE_TOO_LARGE_KEY = 'ezil:workspaceTooLarge';
+/** `{ firstAt, attempts }` of the current bounded wait on a retryable final system checkpoint. */
+const SYSTEM_FINAL_RETRY_KEY = 'ezil:systemFinalRetry';
+/**
+ * Persistence-health signal: `{ reason, at }` when a stop/teardown proceeded
+ * although this session's system changes were NOT saved. Cleared by the next
+ * clean final system checkpoint. Read via the `persistenceHealth()` RPC and
+ * returned as `systemChangesNotSaved` on the teardown report.
+ */
+const SYSTEM_CHANGES_NOT_SAVED_KEY = 'ezil:systemChangesNotSaved';
 const SYSTEM_TOO_LARGE_KEY = 'ezil:systemTooLarge';
 /** When the system layer (changes outside /workspace) was last captured. */
 const SYSTEM_LAST_FLUSH_AT_KEY = 'ezil:systemLastFlushAt';
@@ -2761,7 +2795,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       const system = await this.runSystemFlush(bucket, wctx.prefix, systemMode === 'final');
       // A FINAL checkpoint that failed must not let idle-stop / teardown discard
       // the container: they refuse and retry, exactly as for the workspace.
-      if (systemMode === 'final' && system && finalSystemCheckpointBlocksStop(system)) outcome.systemCheckpointFailed = true;
+      if (systemMode === 'final' && system) {
+        const cls = classifyFinalSystemCheckpoint(system);
+        if (cls !== 'clean') outcome.systemFinalReason = system.skippedReason as NonNullable<FlushOutcome['systemFinalReason']>;
+        if (cls === 'retryable') outcome.systemCheckpointFailed = true;
+      }
     }
     if (outcome.ok) await this.collectSnapshotGarbage(bucket, wctx.prefix);
     return outcome;
@@ -3055,9 +3093,15 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // workspace (replaced for an image rollout) — nothing to save, retrying cannot help.
       // 'migrated': the head is the terminal C-7 marker; this container's state is fenced
       // off and can never be checkpointed again, so staying up would only bill.
-      if ((outcome.ok || outcome.skippedReason === 'too_large' || outcome.skippedReason === 'container_not_hydrated'
-          || outcome.skippedReason === 'migrated')
-          && !outcome.systemCheckpointFailed) {
+      if (outcome.ok || outcome.skippedReason === 'too_large' || outcome.skippedReason === 'container_not_hydrated'
+          || outcome.skippedReason === 'migrated') {
+        // The system layer: permanent "unsaved" never blocks; busy/failed block, bounded.
+        const gate = await this.systemStopGate(outcome);
+        if (!gate.proceed) {
+          console.error(`[ezil-boot] phase=workspace_flush event=idle_system_checkpoint_retry detail=${outcome.systemFinalReason},retryIn=${gate.retryAfterSeconds}`);
+          await this.schedule(gate.retryAfterSeconds, WORKSPACE_FLUSH_CALLBACK);
+          return;
+        }
         // A real input heartbeat may arrive during the checkpoint's R2 I/O.
         // Keep that newly active desktop up and checkpoint again next cycle.
         const after = await this.activityClocks();
@@ -3140,6 +3184,44 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return nextSeconds;
   }
 
+  /**
+   * Whether a final stop/teardown may proceed given its FINAL system checkpoint
+   * (see `classifyFinalSystemCheckpoint`). Records the persistence-health
+   * signal whenever it proceeds without the session's system changes saved.
+   */
+  private async systemStopGate(outcome: FlushOutcome): Promise<
+    { proceed: true; unsaved?: string } | { proceed: false; retryAfterSeconds: number }
+  > {
+    const reason = outcome.systemFinalReason;
+    if (!reason) {
+      await this.ctx.storage.delete(SYSTEM_FINAL_RETRY_KEY);
+      // Only a final checkpoint that actually ran clean clears the signal.
+      if (outcome.ok) await this.ctx.storage.delete(SYSTEM_CHANGES_NOT_SAVED_KEY);
+      return { proceed: true };
+    }
+    const now = Date.now();
+    // `systemCheckpointFailed` is set exactly for the 'retryable' class (classifyFinalSystemCheckpoint).
+    if (outcome.systemCheckpointFailed) {
+      const prior = await this.ctx.storage.get<{ firstAt: number; attempts: number }>(SYSTEM_FINAL_RETRY_KEY);
+      const state = prior && Number.isFinite(prior.firstAt) && Number.isInteger(prior.attempts)
+        ? { firstAt: prior.firstAt, attempts: prior.attempts + 1 } : { firstAt: now, attempts: 1 };
+      if (state.attempts <= SYSTEM_FINAL_MAX_RETRIES && now - state.firstAt < SYSTEM_FINAL_MAX_WAIT_MS) {
+        await this.ctx.storage.put(SYSTEM_FINAL_RETRY_KEY, state);
+        const backoff = SYSTEM_FINAL_RETRY_BACKOFF_SECONDS[state.attempts - 1] ?? SYSTEM_FINAL_RETRY_BACKOFF_SECONDS[2];
+        return { proceed: false, retryAfterSeconds: backoff };
+      }
+    }
+    await this.ctx.storage.delete(SYSTEM_FINAL_RETRY_KEY);
+    await this.ctx.storage.put(SYSTEM_CHANGES_NOT_SAVED_KEY, { reason, at: now });
+    bootLog('system_flush', 'end', { status: 'error', detail: `persistence_health=system_changes_not_saved,reason=${reason}` });
+    return { proceed: true, unsaved: reason };
+  }
+
+  /** Persistence-health signals for operators and the app (no file content). */
+  async persistenceHealth(): Promise<{ systemChangesNotSaved: { reason: string; at: number } | null }> {
+    return { systemChangesNotSaved: (await this.ctx.storage.get<{ reason: string; at: number }>(SYSTEM_CHANGES_NOT_SAVED_KEY)) ?? null };
+  }
+
   // ── Migration export (C-7). Operator tooling (M1) drives these; no route yet. ──
 
   /**
@@ -3164,7 +3246,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         const outcome = await this.runWorkspaceFlush('explicit');
         if (outcome.skippedReason === 'too_large') return { ok: false as const, reason: 'workspace_too_large' };
         if (outcome.skippedReason === 'migrated') return { ok: false as const, reason: 'already_migrated' };
-        if (!outcome.ok || outcome.systemCheckpointFailed) return { ok: false as const, reason: 'final_checkpoint_failed' };
+        if (!outcome.ok || outcome.systemCheckpointFailed || outcome.systemFinalReason) return { ok: false as const, reason: 'final_checkpoint_failed' };
       }
       // Only a recorded `false` proves the head is current. Unknown (a computer that last
       // checkpointed before this release, and is stopped now) is refused: start it first.
@@ -3267,6 +3349,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   async recordActivity(lastInputAgoMs: number): Promise<void> {
     const lastActivityAt = computeActivityTimestamp({ now: Date.now(), lastInputAgoMs });
     await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, lastActivityAt);
+    // A user present again ends any bounded wait on a final system checkpoint: the next idle starts afresh.
+    await this.ctx.storage.delete(SYSTEM_FINAL_RETRY_KEY);
   }
 
   /** True when a container is actually alive under this DO right now. */
@@ -3394,6 +3478,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       }
     }
 
+    let systemChangesNotSaved: string | undefined;
     if (wasRunning) {
       // A failed final flush is a refusal, never permission to discard disk.
       let checkpoint: FlushOutcome | undefined;
@@ -3410,10 +3495,15 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         return { ok: false, terminated: false, stopped: false, outcome: 'flush_failed',
           wasRunning: true, runningAfter: this.containerIsRunning(), error: 'workspace_checkpoint_failed' };
       }
-      if (checkpoint?.systemCheckpointFailed) {
-        // The user's installs outside /workspace were not saved: same refusal.
-        return { ok: false, terminated: false, stopped: false, outcome: 'flush_failed',
-          wasRunning: true, runningAfter: this.containerIsRunning(), error: 'system_checkpoint_failed' };
+      if (checkpoint) {
+        // The user's installs outside /workspace: same bounded policy as idle-stop.
+        const gate = await this.systemStopGate(checkpoint);
+        if (!gate.proceed) {
+          return { ok: false, terminated: false, stopped: false, outcome: 'flush_failed',
+            wasRunning: true, runningAfter: this.containerIsRunning(), error: 'system_checkpoint_failed',
+            retryAfterSeconds: gate.retryAfterSeconds };
+        }
+        systemChangesNotSaved = gate.unsaved;
       }
     }
 
@@ -3458,7 +3548,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       runningAfter = this.containerIsRunning();
     }
 
-    const report = buildTerminateReport({ wasRunning, runningAfter, destroyError });
+    const report: TerminateReport = { ...buildTerminateReport({ wasRunning, runningAfter, destroyError }),
+      ...(systemChangesNotSaved ? { systemChangesNotSaved } : {}) };
     bootLog('terminate', 'end', {
       status: report.ok ? 'ok' : 'error',
       detail: `outcome=${report.outcome},wasRunning=${wasRunning},runningAfter=${runningAfter}`,

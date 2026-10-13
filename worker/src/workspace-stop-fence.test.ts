@@ -89,40 +89,96 @@ async function makeFake(opts: { sysCapture?: SysCapture; wsCaptureExit?: number;
   return { fake, store, objects, calls, bucket };
 }
 
-const SYSTEM_OUTCOMES: Array<[string, SysCapture, boolean]> = [
-  ['failed', { exitCode: 1, stdout: '' }, true],
-  ['busy', { exitCode: 0, stdout: '{"skipped":"busy"}' }, true],
-  ['not_restored', { exitCode: 0, stdout: '{"skipped":"not_restored"}' }, true],
-  ['stale', { exitCode: 0, stdout: '{"expectedGeneration":"another-writer"}' }, true],
-  ['too_large', { exitCode: 3, stdout: '' }, false],
-  ['no_baseline', { exitCode: 0, stdout: '{"skipped":"no_baseline"}' }, false],
-  ['no_manifest', { exitCode: 0, stdout: '{"skipped":"no_manifest"}' }, false],
+const SYSTEM_OUTCOMES: Array<[string, SysCapture, 'stops' | 'bounded']> = [
+  ['stale', { exitCode: 0, stdout: '{"expectedGeneration":"another-writer"}' }, 'stops'],
+  ['not_restored', { exitCode: 0, stdout: '{"skipped":"not_restored"}' }, 'stops'],
+  ['too_large', { exitCode: 3, stdout: '' }, 'stops'],
+  ['no_baseline', { exitCode: 0, stdout: '{"skipped":"no_baseline"}' }, 'stops'],
+  ['no_manifest', { exitCode: 0, stdout: '{"skipped":"no_manifest"}' }, 'stops'],
+  ['busy', { exitCode: 0, stdout: '{"skipped":"busy"}' }, 'bounded'],
+  ['failed', { exitCode: 1, stdout: '' }, 'bounded'],
 ];
+const UNSAVED = new Set(['stale', 'not_restored', 'busy', 'failed']);
 
-describe('flush-blocks-stop: a final system checkpoint that saved nothing keeps the computer up', () => {
-  for (const [reason, sysCapture, blocks] of SYSTEM_OUTCOMES) {
-    it(`idle-stop with a ${reason} system checkpoint ${blocks ? 'reschedules instead of stopping' : 'stops'}`, async () => {
-      const { fake, calls } = await makeFake({ sysCapture, idle: true });
-      await (await proto()).flushWorkspaceScheduled.call(fake);
-      if (blocks) {
-        expect(calls.stops).toBe(0);
-        expect(calls.scheduled.length).toBeGreaterThan(0);
-      } else {
+async function idleCycle(fake: unknown) { await (await proto()).flushWorkspaceScheduled.call(fake); }
+async function teardown(fake: unknown) {
+  const p = await proto();
+  const base = Object.getPrototypeOf(p); const original = base.destroy;
+  base.destroy = async function (this: { ctx: { container: { running: boolean } } }) { this.ctx.container.running = false; };
+  try { return await p.terminateSandbox.call(fake) as { ok: boolean; outcome?: string; error?: string; systemChangesNotSaved?: string; retryAfterSeconds?: number }; }
+  finally { base.destroy = original; }
+}
+
+describe('final system checkpoint stop policy: permanent outcomes never block, retryable ones are bounded', () => {
+  for (const [reason, sysCapture, policy] of SYSTEM_OUTCOMES) {
+    if (policy === 'stops') {
+      it(`idle-stop with a PERMANENT ${reason} system checkpoint stops (every time)`, async () => {
+        const { fake, calls, store } = await makeFake({ sysCapture, idle: true });
+        await idleCycle(fake);
         expect(calls.stops).toBe(1);
-      }
-    });
-    it(`teardown with a ${reason} system checkpoint ${blocks ? 'is refused' : 'proceeds'}`, async () => {
-      const { fake } = await makeFake({ sysCapture });
-      const p = await proto();
-      const base = Object.getPrototypeOf(p); const original = base.destroy;
-      base.destroy = async function (this: { ctx: { container: { running: boolean } } }) { this.ctx.container.running = false; };
-      try {
-        const report = await p.terminateSandbox.call(fake) as { ok: boolean; outcome?: string; error?: string };
-        if (blocks) expect(report).toMatchObject({ ok: false, outcome: 'flush_failed', error: 'system_checkpoint_failed' });
-        else expect(report.outcome).not.toBe('flush_failed');
-      } finally { base.destroy = original; }
-    });
+        expect(store.has('ezil:systemChangesNotSaved')).toBe(UNSAVED.has(reason));
+        if (UNSAVED.has(reason)) expect(store.get('ezil:systemChangesNotSaved')).toMatchObject({ reason });
+      });
+      it(`teardown with a ${reason} system checkpoint proceeds${UNSAVED.has(reason) ? ' and reports the changes not saved' : ''}`, async () => {
+        const { fake } = await makeFake({ sysCapture });
+        const report = await teardown(fake);
+        expect(report.outcome).not.toBe('flush_failed');
+        if (UNSAVED.has(reason)) expect(report.systemChangesNotSaved).toBe(reason);
+        else expect(report.systemChangesNotSaved).toBeUndefined();
+      });
+    } else {
+      it(`idle-stop with a ${reason} system checkpoint blocks with backoff, then stops after 3 retries`, async () => {
+        const { fake, calls, store } = await makeFake({ sysCapture, idle: true });
+        for (const expected of [60, 180, 300]) {
+          await idleCycle(fake);
+          expect(calls.stops).toBe(0);
+          expect(calls.scheduled.at(-1)).toBe(expected);
+          store.set('ezil:lastActivityAt', Date.now() - 11 * 60_000); // still idle
+        }
+        await idleCycle(fake); // the 3rd retry: bound reached
+        expect(calls.stops).toBe(1);
+        expect(store.get('ezil:systemChangesNotSaved')).toMatchObject({ reason });
+        expect(store.has('ezil:systemFinalRetry')).toBe(false);
+      });
+      it(`idle-stop with a ${reason} system checkpoint stops once 15 minutes passed since the first, even before 3 retries`, async () => {
+        const { fake, calls, store } = await makeFake({ sysCapture, idle: true });
+        await idleCycle(fake);
+        expect(calls.stops).toBe(0);
+        store.set('ezil:systemFinalRetry', { firstAt: Date.now() - 15 * 60_000, attempts: 1 });
+        await idleCycle(fake);
+        expect(calls.stops).toBe(1);
+      });
+      it(`teardown (user or reaper) with a ${reason} system checkpoint is refused, bounded, then proceeds`, async () => {
+        const { fake } = await makeFake({ sysCapture });
+        for (let i = 0; i < 3; i++) {
+          const refused = await teardown(fake);
+          expect(refused).toMatchObject({ ok: false, outcome: 'flush_failed', error: 'system_checkpoint_failed' });
+          expect(refused.retryAfterSeconds).toBeGreaterThan(0);
+        }
+        const done = await teardown(fake);
+        expect(done.outcome).not.toBe('flush_failed');
+        expect(done.systemChangesNotSaved).toBe(reason);
+      });
+    }
   }
+
+  it('a clean final checkpoint clears both the bounded wait and the not-saved signal', async () => {
+    const { fake, store } = await makeFake({ idle: true, storage: {
+      'ezil:systemFinalRetry': { firstAt: Date.now(), attempts: 2 },
+      'ezil:systemChangesNotSaved': { reason: 'busy', at: 1 } } });
+    await idleCycle(fake);
+    expect(store.has('ezil:systemFinalRetry')).toBe(false);
+    expect(store.has('ezil:systemChangesNotSaved')).toBe(false);
+    expect(await (await proto()).persistenceHealth.call(fake)).toEqual({ systemChangesNotSaved: null });
+  });
+
+  it('genuine activity resets the bounded wait, so the next idle period starts afresh', async () => {
+    const { fake, store } = await makeFake({ storage: { 'ezil:systemFinalRetry': { firstAt: 1, attempts: 3 } } });
+    await (await proto()).runWorkspaceFlush.call(fake, 'explicit' as never); // teardown's own flush is NOT presence
+    expect(store.has('ezil:systemFinalRetry')).toBe(true);
+    await (await proto()).recordActivity.call(fake, 0 as never); // a real input heartbeat is
+    expect(store.has('ezil:systemFinalRetry')).toBe(false);
+  });
 });
 
 async function migrate(objects: Map<string, { bytes: Uint8Array; etag: string }>, bucket: { put: (k: string, v: string, o?: unknown) => Promise<unknown> }) {
