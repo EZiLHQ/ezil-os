@@ -66,6 +66,13 @@ def main(argv=None):
             desktop.stop(cfg)
             os.sync()
             return 0
+        if cmd == "net-ensure":
+            print("net-ensure changed: " + (",".join(desktop.ensure_rules(cfg)) or "nothing"))
+            return 0
+        if cmd == "net-check":
+            ok = desktop.rules_ok(cfg)
+            print("net-check " + ("ok" if ok else "DRIFT"))
+            return 0 if ok else 2
         if cmd == "overlay-down":
             desktop.overlay_umount(cfg)
             desktop.netns_down(cfg)

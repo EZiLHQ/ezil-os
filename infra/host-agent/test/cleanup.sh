@@ -19,6 +19,7 @@ for s in /sys/fs/cgroup/system.slice/${TAG}-*.scope; do [ -d "$s" ] && echo 1 > 
 kill_matching "stub_servers.py (imds|app) $T/"
 kill_matching "ezil-host-agent (cloudflared|agent)$"
 kill_matching "$T/mut-ha/test/"
+kill_matching "infra/host-agent/test/stub_(dns|tcp).py"
 sleep 1
 findmnt -rn -o TARGET | grep -F "$T/" | sort -r | while read -r m; do umount "$m" 2>/dev/null || umount -l "$m"; done
 losetup -a | grep -F "$T/" | cut -d: -f1 | while read -r d; do losetup -d "$d"; done

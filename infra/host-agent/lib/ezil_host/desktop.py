@@ -70,40 +70,121 @@ def overlay_umount(cfg):
 
 
 # ----------------------------------------------------------------------- netns
+HOST_IP, CT_IP = "10.200.0.1", "10.200.0.2"
+HOST_IF, CT_IF = "ezh0", "ezc0"
+# Destinations the container may never reach (R5, §3a): all link-local (instance
+# metadata and everything else in 169.254/16), RFC1918 (the VPC and its peers), CGNAT,
+# "this network", multicast and reserved. The VPC CIDR is added when configured.
+BLOCKED = ["169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+           "0.0.0.0/8", "224.0.0.0/4", "240.0.0.0/4"]
+CHAINS = {("filter", "EZIL-CT-FWD"): ("FORWARD", "-I"), ("filter", "EZIL-CT-IN"): ("INPUT", "-I"),
+          ("nat", "EZIL-CT-NAT"): ("POSTROUTING", "-A")}
+
+
+def _hostns(cfg):
+    """Command prefix for the HOST network namespace. Production: [] (the real host).
+    Tests set cfg.hostNetns to a disposable namespace so veth-nat is exercised without
+    touching the shared machine's networking; if that namespace is missing the command
+    fails instead of falling back to the real host."""
+    return ["ip", "netns", "exec", cfg["hostNetns"]] if cfg.get("hostNetns") else []
+
+
+def _run(cfg, argv, check=True, host=True):
+    return subprocess.run((_hostns(cfg) if host else []) + argv, check=check, capture_output=True, text=True)
+
+
+def desired_rules(cfg):
+    fwd = [["-i", HOST_IF, "-d", net, "-j", "DROP"] for net in BLOCKED + ([cfg["vpcCidr"]] if cfg.get("vpcCidr") else [])]
+    fwd += [["-i", HOST_IF, "-j", "ACCEPT"],
+            ["-o", HOST_IF, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+            ["-o", HOST_IF, "-j", "DROP"]]
+    inp = [["-i", HOST_IF, "-d", f"{HOST_IP}/32", "-p", "udp", "--dport", "53", "-j", "ACCEPT"],
+           ["-i", HOST_IF, "-d", f"{HOST_IP}/32", "-p", "tcp", "--dport", "53", "-j", "ACCEPT"],
+           ["-i", HOST_IF, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+           ["-i", HOST_IF, "-j", "DROP"]]
+    nat = [["-s", f"{CT_IP}/32", "!", "-o", HOST_IF, "-j", "MASQUERADE"]]
+    return {("filter", "EZIL-CT-FWD"): fwd, ("filter", "EZIL-CT-IN"): inp, ("nat", "EZIL-CT-NAT"): nat}
+
+
+def _chain_ok(cfg, table, chain, rules):
+    listing = _run(cfg, ["iptables", "-w", "-t", table, "-S", chain], check=False)
+    if listing.returncode != 0:
+        return False
+    if len([l for l in listing.stdout.splitlines() if l.startswith("-A ")]) != len(rules):
+        return False
+    for r in rules:
+        if _run(cfg, ["iptables", "-w", "-t", table, "-C", chain] + r, check=False).returncode != 0:
+            return False
+    parent, how = CHAINS[(table, chain)]
+    lines = _run(cfg, ["iptables", "-w", "-t", table, "-S", parent], check=False).stdout.splitlines()
+    jumps = [i for i, l in enumerate(lines) if l.split()[-2:] == ["-j", chain]]
+    if len(jumps) != 1:
+        return False
+    # filter jumps must come first (line 0 is the -P policy), ahead of anything that accepts
+    return how != "-I" or jumps[0] == 1
+
+
+def rules_ok(cfg):
+    return all(_chain_ok(cfg, t, c, r) for (t, c), r in desired_rules(cfg).items())
+
+
+def ensure_rules(cfg):
+    """Idempotent: a chain already exactly as desired is left alone; otherwise a fresh
+    chain is built and swapped in behind the parent jump (no window without rules)."""
+    changed = []
+    for (table, chain), rules in desired_rules(cfg).items():
+        if _chain_ok(cfg, table, chain, rules):
+            continue
+        parent, how = CHAINS[(table, chain)]
+        tmp = chain + "-N"
+        _run(cfg, ["iptables", "-w", "-t", table, "-F", tmp], check=False)
+        _run(cfg, ["iptables", "-w", "-t", table, "-X", tmp], check=False)
+        _run(cfg, ["iptables", "-w", "-t", table, "-N", tmp])
+        for r in rules:
+            _run(cfg, ["iptables", "-w", "-t", table, "-A", tmp] + r)
+        _run(cfg, ["iptables", "-w", "-t", table, how, parent] + (["1"] if how == "-I" else []) + ["-j", tmp])
+        while _run(cfg, ["iptables", "-w", "-t", table, "-D", parent, "-j", chain], check=False).returncode == 0:
+            pass
+        _run(cfg, ["iptables", "-w", "-t", table, "-F", chain], check=False)
+        _run(cfg, ["iptables", "-w", "-t", table, "-X", chain], check=False)
+        _run(cfg, ["iptables", "-w", "-t", table, "-E", tmp, chain])
+        changed.append(chain)
+    if not rules_ok(cfg):
+        raise Refused("network_rules_not_applied")
+    return changed
+
+
 def netns_up(cfg):
-    """networkMode none: loopback only (= docker --network none). veth-nat (production
-    egress for developer parity, R6) is rendered by netns_veth_plan() and documented;
-    it is not exercised on the shared test host."""
+    """networkMode none: loopback only (= docker --network none).
+    networkMode veth-nat: veth pair to the host, default route via the host, NAT out,
+    IPv6 off in the container, DNS only to the host resolver at HOST_IP:53, and the
+    BLOCKED destinations dropped (ensure_rules)."""
     names = subprocess.run(["ip", "netns", "list"], capture_output=True, text=True).stdout.split()
     if cfg.netnsName not in names:
         subprocess.run(["ip", "netns", "add", cfg.netnsName], check=True)
     subprocess.run(["ip", "-n", cfg.netnsName, "link", "set", "lo", "up"], check=True)
-    if cfg.networkMode == "veth-nat":
-        for cmd in netns_veth_plan(cfg):
-            subprocess.run(cmd, check=True)
-    elif cfg.networkMode != "none":
+    if cfg.networkMode == "none":
+        return
+    if cfg.networkMode != "veth-nat":
         raise Refused("network_mode_unknown", cfg.networkMode)
-
-
-def netns_veth_plan(cfg, host_ip="10.200.0.1", ct_ip="10.200.0.2"):
     ns = cfg.netnsName
-    return [
-        ["ip", "link", "add", "ezh0", "type", "veth", "peer", "name", "ezc0", "netns", ns],
-        ["ip", "addr", "add", f"{host_ip}/30", "dev", "ezh0"], ["ip", "link", "set", "ezh0", "up"],
-        ["ip", "-n", ns, "addr", "add", f"{ct_ip}/30", "dev", "ezc0"], ["ip", "-n", ns, "link", "set", "ezc0", "up"],
-        ["ip", "-n", ns, "route", "add", "default", "via", host_ip],
-        # R5: the container never reaches instance metadata or the host itself.
-        ["iptables", "-I", "FORWARD", "-s", f"{ct_ip}/32", "-d", "169.254.169.254/32", "-j", "DROP"],
-        ["iptables", "-I", "INPUT", "-i", "ezh0", "-j", "DROP"],
-        ["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", f"{ct_ip}/32", "!", "-o", "ezh0", "-j", "MASQUERADE"],
-        ["sysctl", "-w", "net.ipv4.ip_forward=1"],
-    ]
+    if _run(cfg, ["ip", "link", "show", HOST_IF], check=False).returncode != 0:
+        _run(cfg, ["ip", "link", "add", HOST_IF, "type", "veth", "peer", "name", CT_IF, "netns", ns])
+    _run(cfg, ["ip", "addr", "replace", f"{HOST_IP}/30", "dev", HOST_IF])
+    _run(cfg, ["ip", "link", "set", HOST_IF, "up"])
+    subprocess.run(["ip", "-n", ns, "addr", "replace", f"{CT_IP}/30", "dev", CT_IF], check=True)
+    subprocess.run(["ip", "-n", ns, "link", "set", CT_IF, "up"], check=True)
+    subprocess.run(["ip", "-n", ns, "route", "replace", "default", "via", HOST_IP], check=True)
+    for k in ("all", "default", CT_IF, "lo"):
+        subprocess.run(["ip", "netns", "exec", ns, "sysctl", "-q", "-w", f"net.ipv6.conf.{k}.disable_ipv6=1"], check=True)
+    _run(cfg, ["sysctl", "-q", "-w", "net.ipv4.ip_forward=1"])
+    ensure_rules(cfg)
 
 
 def netns_down(cfg):
     names = subprocess.run(["ip", "netns", "list"], capture_output=True, text=True).stdout.split()
     if cfg.netnsName in names:
-        subprocess.run(["ip", "netns", "delete", cfg.netnsName])
+        subprocess.run(["ip", "netns", "delete", cfg.netnsName])     # removes the veth pair too
 
 
 # ------------------------------------------------------------------------ spec
@@ -115,7 +196,7 @@ def build_spec(cfg, lease, mode="desktop", extra_binds=()):
     os.makedirs(gen_dir, mode=0o755, exist_ok=True)
     files = {"hostname": host + "\n",
              "hosts": f"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.1.1\t{host}\n",
-             "resolv.conf": "# managed by ezil-host-agent\n" + ("nameserver 10.200.0.1\n" if cfg.networkMode == "veth-nat" else "")}
+             "resolv.conf": "# managed by ezil-host-agent\n" + (f"nameserver {HOST_IP}\n" if cfg.networkMode == "veth-nat" else "")}
     for n, body in files.items():
         with open(os.path.join(gen_dir, n), "w") as f:
             f.write(body)

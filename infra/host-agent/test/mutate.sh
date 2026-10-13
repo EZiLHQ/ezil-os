@@ -53,6 +53,12 @@ mutate M23 lib/ezil_host/agent.py '            if seq <= self.last_seq:' '      
 mutate M24 lib/ezil_host/agent.py '        self.last_seq = self._load_seq()' '        self.last_seq = 0' test-enroll-tunnel.sh "replay refused across an agent restart"
 mutate M25 lib/ezil_host/agent.py 'not 0 <= warn <= MAX_WARN' 'False' test-enroll-tunnel.sh "stop with warnSeconds=901 refused"
 mutate M26 lib/ezil_host/agent.py 'MAX_FUTURE = 5 ' 'MAX_FUTURE = 120 ' test-enroll-tunnel.sh "ts 60 s in the future refused"
+mutate M27 lib/ezil_host/desktop.py 'BLOCKED = ["169.254.0.0/16", ' 'BLOCKED = [' test-network.sh "169.254.10.10 (other link-local) unreachable"
+mutate M28 lib/ezil_host/desktop.py '"10.0.0.0/8", "172.16.0.0/12"' '"172.16.0.0/12"' test-network.sh "RFC1918 peer 10.0.0.2 unreachable"
+mutate M29 lib/ezil_host/desktop.py '"-p", "udp", "--dport", "53", "-j", "ACCEPT"]' '"-p", "udp", "--dport", "53", "-j", "DROP"]' test-network.sh "DNS works through the host resolver"
+mutate M30 lib/ezil_host/desktop.py '        if _chain_ok(cfg, table, chain, rules):
+            continue' '' test-network.sh "net-ensure again changes nothing"
+mutate M31 lib/ezil_host/desktop.py '           ["-i", HOST_IF, "-j", "DROP"]]' '           ]' test-network.sh "host's own non-DNS port unreachable"
 if [ "${1:-}" != --quick ]; then
 mutate M17 lib/ezil_host/agent.py '        if blockable and dpkg_lock_held(self.cfg):
             return "busy"' '' test-boot.sh "a held dpkg lock (install in progress) blocks the idle stop"
