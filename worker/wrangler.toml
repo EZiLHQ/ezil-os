@@ -247,7 +247,14 @@ zone_name = "ezil.org"
 
 # HMAC secret for authenticating EBuilder → Worker calls.
 # Set in production with:  wrangler secret put SANDBOX_HMAC_SECRET
-# When unset (local dev), the Worker skips HMAC verification.
+# When unset (local dev), the Worker skips HMAC verification (v1 only; v2
+# always fails closed without a secret).
+#
+# EZIL_PREVIEW_TOKEN_V1_UNTIL (ISO timestamp) retires the v1 envelope. Leave it
+# UNSET until every v1 minter is migrated (list: docs/AWS-COMPUTERS.md, C-5):
+# app focus / screen / relay / telemetry-drain / telemetry-maintenance,
+# worker/scripts/*, e2e/hosted-continuity.mjs. Rollout order: deploy this
+# Worker first, then set the app's EZIL_PREVIEW_TOKEN_V2=1.
 # ── Neko WebRTC / Cloudflare Realtime TURN (secrets by NAME only) ────────────
 # `neko` desktop-mode media (VS Code pixels + input) travels over WebRTC, which
 # needs a TURN relay behind Cloudflare's HTTP/WS-only edge. The Worker mints

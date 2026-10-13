@@ -11,7 +11,7 @@
  */
 import { base64ToBytes, bytesToBase64 } from './project-files';
 import {
-  chunkKey, parseSnapshot, readBounded, readHead, requireSdkSuccess, sha256, validPrefix,
+  chunkKey, parseSnapshot, readBounded, readHead, requireSdkSuccess, sha256, validPrefix, WorkspaceMigratedError,
   SNAPSHOT_CHUNK_BYTES, SNAPSHOT_HEAD,
   type FlushContainerLike, type FlushR2BucketLike, type HydrateContainerLike, type HydrateR2BucketLike, type Snapshot,
 } from './workspace-persist';
@@ -46,7 +46,9 @@ export interface SystemFlushOutcome {
   entries: number;
   unchanged?: boolean;
   checkpoint?: string;
-  skippedReason?: 'no_computer' | 'not_restored' | 'stale' | 'no_baseline' | 'no_manifest' | 'busy' | 'too_large' | 'failed';
+  skippedReason?: 'no_computer' | 'not_restored' | 'stale' | 'no_baseline' | 'no_manifest' | 'busy' | 'too_large' | 'failed'
+    /** The system head is the terminal migrated marker (C-7): never replaced from Cloudflare. */
+    | 'migrated';
 }
 
 export interface SystemHydrateOutcome {
@@ -146,6 +148,10 @@ export async function flushSystemLayer(deps: {
     try { await run(container, { op: 'sys-hydrated', work, generation }, 60_000); } catch { log('[system-persist] could not record the committed generation'); }
     return { ...outcome, ok: true, checkpoint: generation };
   } catch (err) {
+    if (err instanceof WorkspaceMigratedError) {
+      log('[system-persist] system head is migrated; Cloudflare checkpoint refused');
+      return { ...outcome, skippedReason: 'migrated' };
+    }
     if (err instanceof SystemTooLargeError) {
       log('[system-persist] system changes exceed the snapshot limits; not checkpointed');
       return { ...outcome, skippedReason: 'too_large' };

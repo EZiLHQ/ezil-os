@@ -1,0 +1,214 @@
+{
+  "description": "Preview token v2 shared test vectors (docs/AWS-COMPUTERS.md C-5). Read by worker/src/hmac-v2.test.ts (verifier) and app/src/server/lib/compute/preview-token-v2.test.ts (minter). Regenerate only with a contract change.",
+  "secret": "ezil-preview-token-v2-test-vector-secret",
+  "payloadFormat": "v2|ts|METHOD|path|sandboxId|computerId|userId|provider|store|generation|leaseEpoch|sha256hex(body)",
+  "tokenFormat": "v2.<base64url(JSON claims in key order ts,sandboxId,computerId,userId,provider,store,generation,leaseEpoch)>.<hex hmac_sha256(secret, payload)>",
+  "header": "x-ezil-auth",
+  "maxAgeMs": 300000,
+  "verifyAt": 1760000001000,
+  "valid": [
+    {
+      "name": "preview-cloudflare-no-store-claim",
+      "claims": {
+        "ts": 1760000000000,
+        "sandboxId": "guac-user0123456789ab-comp0123456789ab",
+        "computerId": "comp-0123456789ab",
+        "userId": "user-0123456789ab",
+        "provider": "cloudflare",
+        "store": "",
+        "generation": 0,
+        "leaseEpoch": 0
+      },
+      "method": "POST",
+      "path": "/sandbox/preview",
+      "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "bodySha256": "e53db755fbf6e4c7850fb26f07564372cc8eb8384d49b5f82bfc0181988a667a",
+      "payload": "v2|1760000000000|POST|/sandbox/preview|guac-user0123456789ab-comp0123456789ab|comp-0123456789ab|user-0123456789ab|cloudflare||0|0|e53db755fbf6e4c7850fb26f07564372cc8eb8384d49b5f82bfc0181988a667a",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiY2xvdWRmbGFyZSIsInN0b3JlIjoiIiwiZ2VuZXJhdGlvbiI6MCwibGVhc2VFcG9jaCI6MH0.96c67d9894ca057a63b06d52d5936f34ba4548ce0d5f36d8e2fd53779393996f"
+    },
+    {
+      "name": "preview-cloudflare-r2-claim",
+      "claims": {
+        "ts": 1760000000000,
+        "sandboxId": "guac-user0123456789ab-comp0123456789ab",
+        "computerId": "comp-0123456789ab",
+        "userId": "user-0123456789ab",
+        "provider": "cloudflare",
+        "store": "r2",
+        "generation": 0,
+        "leaseEpoch": 0
+      },
+      "method": "POST",
+      "path": "/sandbox/preview",
+      "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "bodySha256": "e53db755fbf6e4c7850fb26f07564372cc8eb8384d49b5f82bfc0181988a667a",
+      "payload": "v2|1760000000000|POST|/sandbox/preview|guac-user0123456789ab-comp0123456789ab|comp-0123456789ab|user-0123456789ab|cloudflare|r2|0|0|e53db755fbf6e4c7850fb26f07564372cc8eb8384d49b5f82bfc0181988a667a",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiY2xvdWRmbGFyZSIsInN0b3JlIjoicjIiLCJnZW5lcmF0aW9uIjowLCJsZWFzZUVwb2NoIjowfQ.1702e267f755d6b1c8950710aa91735426a2bc38961b19509d1b72b2bf96a1b5"
+    },
+    {
+      "name": "control-delete-empty-body",
+      "claims": {
+        "ts": 1760000000000,
+        "sandboxId": "guac-user0123456789ab-comp0123456789ab",
+        "computerId": "comp-0123456789ab",
+        "userId": "user-0123456789ab",
+        "provider": "cloudflare",
+        "store": "",
+        "generation": 0,
+        "leaseEpoch": 0
+      },
+      "method": "DELETE",
+      "path": "/sandbox/guac-user0123456789ab-comp0123456789ab",
+      "body": "",
+      "bodySha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "payload": "v2|1760000000000|DELETE|/sandbox/guac-user0123456789ab-comp0123456789ab|guac-user0123456789ab-comp0123456789ab|comp-0123456789ab|user-0123456789ab|cloudflare||0|0|e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiY2xvdWRmbGFyZSIsInN0b3JlIjoiIiwiZ2VuZXJhdGlvbiI6MCwibGVhc2VFcG9jaCI6MH0.b2e010da5aecb8d08f01bf70584dd35aba71ffb7e1b8df24ae91eac362a7c7fe"
+    },
+    {
+      "name": "aws-s3-generation-epoch",
+      "claims": {
+        "ts": 1760000000000,
+        "sandboxId": "guac-user0123456789ab-comp0123456789ab",
+        "computerId": "comp-0123456789ab",
+        "userId": "user-0123456789ab",
+        "provider": "aws-ec2",
+        "store": "s3",
+        "generation": 7,
+        "leaseEpoch": 42
+      },
+      "method": "POST",
+      "path": "/sandbox/guac-user0123456789ab-comp0123456789ab/activity",
+      "body": "{\"lastInputAgoMs\":1200}",
+      "bodySha256": "35eeaf629c087a0f1c5e0c149ebea2069367808dcb4516d28919920f83dac5ea",
+      "payload": "v2|1760000000000|POST|/sandbox/guac-user0123456789ab-comp0123456789ab/activity|guac-user0123456789ab-comp0123456789ab|comp-0123456789ab|user-0123456789ab|aws-ec2|s3|7|42|35eeaf629c087a0f1c5e0c149ebea2069367808dcb4516d28919920f83dac5ea",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiYXdzLWVjMiIsInN0b3JlIjoiczMiLCJnZW5lcmF0aW9uIjo3LCJsZWFzZUVwb2NoIjo0Mn0.d5f605cfc87db60ee24ca50ad879d23688eeae40ace431244479927dd4290558"
+    },
+    {
+      "name": "utf8-body",
+      "claims": {
+        "ts": 1760000000000,
+        "sandboxId": "guac-user0123456789ab-comp0123456789ab",
+        "computerId": "comp-0123456789ab",
+        "userId": "user-0123456789ab",
+        "provider": "cloudflare",
+        "store": "",
+        "generation": 0,
+        "leaseEpoch": 0
+      },
+      "method": "POST",
+      "path": "/sandbox/guac-user0123456789ab-comp0123456789ab/focus",
+      "body": "{\"note\":\"caf\u00e9 \u2713\"}",
+      "bodySha256": "9e43e5636553d8b51e38c500a373d54574970efd052973228cd148091ca56ed6",
+      "payload": "v2|1760000000000|POST|/sandbox/guac-user0123456789ab-comp0123456789ab/focus|guac-user0123456789ab-comp0123456789ab|comp-0123456789ab|user-0123456789ab|cloudflare||0|0|9e43e5636553d8b51e38c500a373d54574970efd052973228cd148091ca56ed6",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiY2xvdWRmbGFyZSIsInN0b3JlIjoiIiwiZ2VuZXJhdGlvbiI6MCwibGVhc2VFcG9jaCI6MH0.e3b86981539aab9c24f31eeafbc361fce0baf667bab865da1fddf9c032d46876"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "tampered-body",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiY2xvdWRmbGFyZSIsInN0b3JlIjoiIiwiZ2VuZXJhdGlvbiI6MCwibGVhc2VFcG9jaCI6MH0.96c67d9894ca057a63b06d52d5936f34ba4548ce0d5f36d8e2fd53779393996f",
+      "method": "POST",
+      "path": "/sandbox/preview",
+      "body": "{\"sessionId\":\"s-2\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "error": "hmac_signature_mismatch"
+    },
+    {
+      "name": "tampered-sandboxId",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy1hdHRhY2tlci12aWN0aW0iLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiY2xvdWRmbGFyZSIsInN0b3JlIjoiIiwiZ2VuZXJhdGlvbiI6MCwibGVhc2VFcG9jaCI6MH0.96c67d9894ca057a63b06d52d5936f34ba4548ce0d5f36d8e2fd53779393996f",
+      "method": "POST",
+      "path": "/sandbox/preview",
+      "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "error": "hmac_signature_mismatch"
+    },
+    {
+      "name": "tampered-provider",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiYXdzLWVjMiIsInN0b3JlIjoiIiwiZ2VuZXJhdGlvbiI6MCwibGVhc2VFcG9jaCI6MH0.96c67d9894ca057a63b06d52d5936f34ba4548ce0d5f36d8e2fd53779393996f",
+      "method": "POST",
+      "path": "/sandbox/preview",
+      "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "error": "hmac_signature_mismatch"
+    },
+    {
+      "name": "tampered-store",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiY2xvdWRmbGFyZSIsInN0b3JlIjoiczMiLCJnZW5lcmF0aW9uIjowLCJsZWFzZUVwb2NoIjowfQ.96c67d9894ca057a63b06d52d5936f34ba4548ce0d5f36d8e2fd53779393996f",
+      "method": "POST",
+      "path": "/sandbox/preview",
+      "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "error": "hmac_signature_mismatch"
+    },
+    {
+      "name": "tampered-leaseEpoch",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiY2xvdWRmbGFyZSIsInN0b3JlIjoiIiwiZ2VuZXJhdGlvbiI6MCwibGVhc2VFcG9jaCI6MX0.96c67d9894ca057a63b06d52d5936f34ba4548ce0d5f36d8e2fd53779393996f",
+      "method": "POST",
+      "path": "/sandbox/preview",
+      "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "error": "hmac_signature_mismatch"
+    },
+    {
+      "name": "tampered-generation",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiY2xvdWRmbGFyZSIsInN0b3JlIjoiIiwiZ2VuZXJhdGlvbiI6MSwibGVhc2VFcG9jaCI6MH0.96c67d9894ca057a63b06d52d5936f34ba4548ce0d5f36d8e2fd53779393996f",
+      "method": "POST",
+      "path": "/sandbox/preview",
+      "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "error": "hmac_signature_mismatch"
+    },
+    {
+      "name": "tampered-method",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiY2xvdWRmbGFyZSIsInN0b3JlIjoiIiwiZ2VuZXJhdGlvbiI6MCwibGVhc2VFcG9jaCI6MH0.96c67d9894ca057a63b06d52d5936f34ba4548ce0d5f36d8e2fd53779393996f",
+      "method": "PUT",
+      "path": "/sandbox/preview",
+      "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "error": "hmac_signature_mismatch"
+    },
+    {
+      "name": "tampered-path",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiY2xvdWRmbGFyZSIsInN0b3JlIjoiIiwiZ2VuZXJhdGlvbiI6MCwibGVhc2VFcG9jaCI6MH0.96c67d9894ca057a63b06d52d5936f34ba4548ce0d5f36d8e2fd53779393996f",
+      "method": "POST",
+      "path": "/sandbox/other/preview",
+      "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "error": "hmac_signature_mismatch"
+    },
+    {
+      "name": "unknown-provider",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiZ2NwIiwic3RvcmUiOiIiLCJnZW5lcmF0aW9uIjowLCJsZWFzZUVwb2NoIjowfQ.96c67d9894ca057a63b06d52d5936f34ba4548ce0d5f36d8e2fd53779393996f",
+      "method": "POST",
+      "path": "/sandbox/preview",
+      "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "error": "hmac_v2_invalid_claims"
+    },
+    {
+      "name": "unknown-store",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiY2xvdWRmbGFyZSIsInN0b3JlIjoiZ2NzIiwiZ2VuZXJhdGlvbiI6MCwibGVhc2VFcG9jaCI6MH0.96c67d9894ca057a63b06d52d5936f34ba4548ce0d5f36d8e2fd53779393996f",
+      "method": "POST",
+      "path": "/sandbox/preview",
+      "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "error": "hmac_v2_invalid_claims"
+    },
+    {
+      "name": "separator-in-field",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJhfGIiLCJwcm92aWRlciI6ImNsb3VkZmxhcmUiLCJzdG9yZSI6IiIsImdlbmVyYXRpb24iOjAsImxlYXNlRXBvY2giOjB9.96c67d9894ca057a63b06d52d5936f34ba4548ce0d5f36d8e2fd53779393996f",
+      "method": "POST",
+      "path": "/sandbox/preview",
+      "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "error": "hmac_v2_invalid_claims"
+    },
+    {
+      "name": "wrong-secret",
+      "token": "v2.eyJ0cyI6MTc2MDAwMDAwMDAwMCwic2FuZGJveElkIjoiZ3VhYy11c2VyMDEyMzQ1Njc4OWFiLWNvbXAwMTIzNDU2Nzg5YWIiLCJjb21wdXRlcklkIjoiY29tcC0wMTIzNDU2Nzg5YWIiLCJ1c2VySWQiOiJ1c2VyLTAxMjM0NTY3ODlhYiIsInByb3ZpZGVyIjoiY2xvdWRmbGFyZSIsInN0b3JlIjoiIiwiZ2VuZXJhdGlvbiI6MCwibGVhc2VFcG9jaCI6MH0.ac8268a8d5fd7c7d8fcbd191d75892d1ceaf231cc5cd04f83ea08542bb815855",
+      "method": "POST",
+      "path": "/sandbox/preview",
+      "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "error": "hmac_signature_mismatch"
+    },
+    {
+      "name": "v1-envelope",
+      "token": "t=1760000000000,v1=0000000000000000000000000000000000000000000000000000000000000000",
+      "method": "POST",
+      "path": "/sandbox/preview",
+      "body": "{\"sessionId\":\"s-1\",\"userId\":\"user-0123456789ab\",\"projectId\":\"comp-0123456789ab\",\"desktopMode\":\"neko\"}",
+      "error": "hmac_v2_malformed_token"
+    }
+  ],
+  "queryPolicy": "A v2-authenticated request must have an empty query string; the Worker refuses any query (hmac_v2_query_not_allowed). The path in the payload is the URL pathname only.",
+  "replay": "No nonce (C-5 does not require one): a captured token is replayable for the same method, path and body within maxAgeMs."
+}

@@ -56,7 +56,7 @@ describe('neko-logs: the path is fixed by the container script, not by a caller'
       indexSource.indexOf('async function handleNekoLogs('),
       indexSource.indexOf('* Twen workspace orchestration endpoint'),
     );
-    expect(body).toContain('verifyPreviewToken(body.token, resolvePreviewSecrets(env))');
+    expect(body).toContain('authorizeSigned(request, env, body.token)');
     expect(body).toContain('return json({ ok: false, error: auth.error }, 401);');
   });
 

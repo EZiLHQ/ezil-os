@@ -31,6 +31,8 @@
 
 import { createHmac, randomUUID } from 'node:crypto';
 
+import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER, type WorkerAuth } from './compute/preview-token-v2';
+
 // ─── Correlation ──────────────────────────────────────────────────────────────
 
 /**
@@ -168,6 +170,31 @@ export function mintSandboxPreviewToken(hmacSecret: string): string {
     const sig = createHmac('sha256', hmacSecret).update(payload).digest('hex');
     return `t=${timestamp},v1=${sig}`;
 }
+
+/**
+ * The `x-ezil-auth` header for a v2-signed Worker call (C-5): signs the exact
+ * `body` string sent, the method and the URL's pathname. Throws without a
+ * secret (v2 has no unsigned local-dev mode); callers check first.
+ */
+function v2AuthHeader(
+    hmacSecret: string,
+    auth: Extract<WorkerAuth, { kind: 'v2' }>,
+    method: string,
+    url: string,
+    body: string,
+): Record<string, string> {
+    const target = new URL(url);
+    // The Worker refuses any query under v2 (it is not signed): never send one.
+    if (target.search !== '') throw new Error('v2 requests carry no query string');
+    const token = mintPreviewTokenV2(hmacSecret, { ...auth.claims, ts: Date.now() }, {
+        method,
+        path: target.pathname,
+        body,
+    });
+    return { [PREVIEW_TOKEN_V2_HEADER]: token };
+}
+
+const V2_SECRET_MISSING = 'hmac_secret_not_configured';
 
 // ─── Worker call helpers ──────────────────────────────────────────────────────
 
@@ -507,6 +534,7 @@ export async function requestGuacamolePreview(
     hmacSecret: string,
     input: Omit<GuacamolePreviewRequest, 'token'>,
     correlationId: string = newCorrelationId(),
+    auth: WorkerAuth = { kind: 'v1' },
 ): Promise<GuacamolePreviewResult> {
     if (!config.isConfigured) {
         // Deterministic by definition: no amount of retrying supplies a
@@ -518,14 +546,22 @@ export async function requestGuacamolePreview(
         );
     }
 
-    const token = mintSandboxPreviewToken(hmacSecret);
-    const body: GuacamolePreviewRequest = { ...input, token };
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return previewError(V2_SECRET_MISSING, 'preconditions_unmet');
+    const previewUrl = `${config.workerUrl.replace(/\/$/, '')}/sandbox/preview`;
+    // v1 carries its token in the body; v2 signs the body and travels in a header.
+    const bodyText = auth.kind === 'v2'
+        ? JSON.stringify(input)
+        : JSON.stringify({ ...input, token: mintSandboxPreviewToken(hmacSecret) } satisfies GuacamolePreviewRequest);
 
     try {
-        const workerCall = fetch(`${config.workerUrl.replace(/\/$/, '')}/sandbox/preview`, {
+        const workerCall = fetch(previewUrl, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', [CORRELATION_HEADER]: correlationId },
-            body: JSON.stringify(body),
+            headers: {
+                'Content-Type': 'application/json',
+                [CORRELATION_HEADER]: correlationId,
+                ...(auth.kind === 'v2' ? v2AuthHeader(hmacSecret, auth, 'POST', previewUrl, bodyText) : {}),
+            },
+            body: bodyText,
             // Generous timeout to allow the container's cold start.
             signal: AbortSignal.timeout(SANDBOX_COLD_START_TIMEOUT_MS),
         });
@@ -676,18 +712,22 @@ export async function requestGuacamoleSandboxTerminate(
     hmacSecret: string,
     sandboxName: string,
     correlationId: string = newCorrelationId(),
+    auth: WorkerAuth = { kind: 'v1' },
 ): Promise<GuacamoleTerminateResult> {
     if (!config.isConfigured) {
         // No provider configured -> no sandbox to tear down. Not a failure.
         return { ok: true, terminated: false };
     }
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return { ok: false, terminated: false, error: V2_SECRET_MISSING };
 
-    const token = mintSandboxPreviewToken(hmacSecret);
+    const terminateUrl = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}`;
 
     try {
-        const res = await fetch(`${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}`, {
+        const res = await fetch(terminateUrl, {
             method: 'DELETE',
-            headers: { Authorization: `Bearer ${token}`, [CORRELATION_HEADER]: correlationId },
+            headers: auth.kind === 'v2'
+                ? { ...v2AuthHeader(hmacSecret, auth, 'DELETE', terminateUrl, ''), [CORRELATION_HEADER]: correlationId }
+                : { Authorization: `Bearer ${mintSandboxPreviewToken(hmacSecret)}`, [CORRELATION_HEADER]: correlationId },
             signal: AbortSignal.timeout(SANDBOX_STOP_TIMEOUT_MS),
         });
 
@@ -925,23 +965,31 @@ export async function requestGuacamoleActivity(
     sandboxName: string,
     lastInputAgoMs: number,
     correlationId: string = newCorrelationId(),
+    auth: WorkerAuth = { kind: 'v1' },
 ): Promise<GuacamoleActivityResult> {
     if (!config.isConfigured) {
         return { ok: false, error: 'provider_not_configured' };
     }
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return { ok: false, error: V2_SECRET_MISSING };
 
-    const token = mintSandboxPreviewToken(hmacSecret);
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/activity`;
+    const activityBody = JSON.stringify({ lastInputAgoMs });
 
     try {
         const res = await fetch(endpoint, {
             method: 'POST',
-            headers: {
-                Authorization: `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                [CORRELATION_HEADER]: correlationId,
-            },
-            body: JSON.stringify({ lastInputAgoMs }),
+            headers: auth.kind === 'v2'
+                ? {
+                    ...v2AuthHeader(hmacSecret, auth, 'POST', endpoint, activityBody),
+                    'Content-Type': 'application/json',
+                    [CORRELATION_HEADER]: correlationId,
+                }
+                : {
+                    Authorization: `Bearer ${mintSandboxPreviewToken(hmacSecret)}`,
+                    'Content-Type': 'application/json',
+                    [CORRELATION_HEADER]: correlationId,
+                },
+            body: activityBody,
             // A Durable Object storage write, not a container call — generous
             // against any transient edge latency, well under any route budget.
             signal: AbortSignal.timeout(10_000),
@@ -1045,22 +1093,29 @@ export async function requestGuacamoleDesktopRestart(
     hmacSecret: string,
     sandboxName: string,
     correlationId: string = newCorrelationId(),
+    auth: WorkerAuth = { kind: 'v1' },
 ): Promise<GuacamoleRestartResult> {
     if (!config.isConfigured) {
         return { ok: false, error: 'provider_not_configured' };
     }
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return { ok: false, error: V2_SECRET_MISSING };
 
-    const token = mintSandboxPreviewToken(hmacSecret);
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/restart`;
 
     try {
         const res = await fetch(endpoint, {
             method: 'POST',
-            headers: {
-                Authorization: `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                [CORRELATION_HEADER]: correlationId,
-            },
+            headers: auth.kind === 'v2'
+                ? {
+                    ...v2AuthHeader(hmacSecret, auth, 'POST', endpoint, '{}'),
+                    'Content-Type': 'application/json',
+                    [CORRELATION_HEADER]: correlationId,
+                }
+                : {
+                    Authorization: `Bearer ${mintSandboxPreviewToken(hmacSecret)}`,
+                    'Content-Type': 'application/json',
+                    [CORRELATION_HEADER]: correlationId,
+                },
             // No `desktopMode`: an omitted mode is what makes the Worker
             // AUTO-DETECT whatever is actually running (`handleRestart`'s
             // `explicitMode` stays undefined), which is the honest thing to do

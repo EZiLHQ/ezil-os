@@ -118,6 +118,12 @@ interface Env extends SandboxEnv {
    * normally be ABSENT in production. Never logged or returned.
    */
   SANDBOX_MISSION_HMAC_SECRET?: string;
+  /**
+   * ISO timestamp. While it is in the future (or when it is absent) the v1
+   * preview envelope (`t=…,v1=…`) is still accepted; at/after it only the v2
+   * signed envelope (`x-ezil-auth`) is. Unparseable => v1 refused (fail closed).
+   */
+  EZIL_PREVIEW_TOKEN_V1_UNTIL?: string;
 
   // ── R2 binding workspace bucket (preferred, credential-less mount path) ────
   // Bound via [[r2_buckets]] in wrangler.toml. When present, this is the
@@ -503,12 +509,23 @@ import {
   type FlushOutcome,
   type FlushManifest,
   collectSupersededSnapshots,
+  readHead,
+  readMigratedHead,
+  writeMigratedHead,
+  WorkspaceMigratedError,
+  MIGRATING_FLAG,
+  MIGRATION_TARGETS,
+  type MigrationTarget,
   type FlushR2BucketLike,
   type GcR2BucketLike,
 } from './workspace-persist';
 import { baselineSystemLayer, flushSystemLayer, hydrateSystemLayer, systemPrefixOf, type SystemFlushOutcome } from './system-persist';
 import {
   resolveWorkspaceStore,
+  resolvePinnedWorkspaceStore,
+  isWorkspaceStoreKind,
+  type WorkspaceStoreKind,
+  type WorkspaceStoreResolution,
   type WorkspaceStore,
 } from './workspace-store-s3';
 // NOTE: `TWEN_SCHEMA`, `TWEN_OPS`, `TWEN_OP_ID_RE`, `TWEN_ALLOWED_FIELDS`,
@@ -607,6 +624,11 @@ import {
   verifyPreviewBootstrapToken,
   mintPreviewBootstrapToken,
   PREVIEW_COOKIE_NAME,
+  PREVIEW_TOKEN_V2_HEADER,
+  isPreviewTokenV2,
+  previewTokenV1Accepted,
+  verifyPreviewTokenV2,
+  type PreviewTokenV2Claims,
 } from './hmac';
 import {
   LifecycleTimeline,
@@ -776,7 +798,7 @@ interface EzilWorkspacePersistRpc {
   setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void>;
   desktopReachable(): Promise<boolean>;
   relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult>;
-  hydrateWorkspace(params: { mountPath: string; prefix: string }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }>;
+  hydrateWorkspace(params: { mountPath: string; prefix: string; expectedStore?: WorkspaceStoreKind }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }>;
   /** Start capturing user changes outside /workspace (system layer). Called once the desktop is up. */
   baselineSystem(): Promise<boolean>;
   recordWorkspaceHydration(params: { prefix: string; mountPath: string; hydrated: boolean }): Promise<void>;
@@ -1369,7 +1391,9 @@ export async function ensureWorkspaceMount(
   sandbox: Sandbox<unknown> & EzilWorkspacePersistRpc,
   env: Env,
   { projectId, branch }: { projectId: string; branch: string },
+  opts?: { expectedStore?: WorkspaceStoreKind },
 ): Promise<{ mounted: boolean; mountPath?: string; detail?: string }> {
+  const expectedStore = opts?.expectedStore;
   // Durable store selection takes precedence over the legacy mount config.
   // When EZIL_WORKSPACE_STORE='s3', ALWAYS take the Worker-mediated
   // hydrate/flush path (`hydrateWorkspace`) — NEVER the s3fs mount, which drops
@@ -1389,7 +1413,7 @@ export async function ensureWorkspaceMount(
     const cfg = resolveWorkspaceMountConfig(env);
     const mountPath = cfg?.mountPath ?? (env.SANDBOX_WORKSPACE_MOUNT_PATH?.trim() || DEFAULT_WORKSPACE_MOUNT_PATH);
     const prefix = cfg?.prefix ?? `/${projectId}/branches/${branch}`;
-    return sandbox.hydrateWorkspace({ mountPath, prefix });
+    return sandbox.hydrateWorkspace({ mountPath, prefix, ...(expectedStore ? { expectedStore } : {}) });
   }
 
   const config = resolveWorkspaceMountConfig(env);
@@ -1409,7 +1433,7 @@ export async function ensureWorkspaceMount(
     // `@cloudflare/sandbox` fixes it). `/workspace` is now plain local disk;
     // R2 is reached only through this Worker's own R2 BINDING, which never
     // goes through that emulator. See `ensureWorkspaceHydratedFromR2`.
-    return sandbox.hydrateWorkspace({ mountPath: config.mountPath, prefix });
+    return sandbox.hydrateWorkspace({ mountPath: config.mountPath, prefix, ...(expectedStore ? { expectedStore } : {}) });
   }
 
   // ── Generic S3-compatible fallback (local dev / no native R2 binding) ─────
@@ -1417,6 +1441,8 @@ export async function ensureWorkspaceMount(
   // S3-compatible endpoint, e.g. local Supabase Storage, does not run through
   // Cloudflare's in-DO R2 emulation layer), so this branch is deliberately
   // left mounting via s3fs exactly as before.
+  // It has no Durable Object store choice to match a signed store claim against.
+  if (expectedStore) return { mounted: false, detail: 'workspace_store_claim_mismatch' };
   const MOUNT_ATTEMPTS = 4;
   let mountErr = '';
   let mounted = false;
@@ -1705,9 +1731,58 @@ async function ensureWorkspaceHydratedFromR2(
   };
 }
 
+/**
+ * How a FINAL system-layer checkpoint (user changes outside /workspace)
+ * affects idle-stop and teardown. The last COMMITTED system layer always stays
+ * authoritative; the question is only whether waiting can save more.
+ *
+ * - 'unsaved':   'stale' (another writer's head, or this container's own
+ *                `sys-hydrated` record failed after its commit) and
+ *                'not_restored' (the restore failed; nothing retries it). Both
+ *                are PERMANENT for this container: waiting saves nothing and
+ *                would bill forever, refusing DELETE, the reaper and computer
+ *                delete. Never block; record "not saved".
+ * - 'retryable': 'busy' (package manager running) and 'failed' (transfer or
+ *                store error). Block for a BOUNDED window only
+ *                (`SYSTEM_FINAL_MAX_RETRIES` / `SYSTEM_FINAL_MAX_WAIT_MS`),
+ *                then proceed and record "not saved".
+ * - 'clean':     everything else (ok, no_computer, no_baseline, no_manifest,
+ *                too_large — permanent, committed layer authoritative — and
+ *                migrated, fenced by C-7).
+ */
+export type FinalSystemClass = 'clean' | 'unsaved' | 'retryable';
+export function classifyFinalSystemCheckpoint(system: SystemFlushOutcome): FinalSystemClass {
+  if (system.skippedReason === 'stale' || system.skippedReason === 'not_restored') return 'unsaved';
+  if (system.skippedReason === 'busy' || system.skippedReason === 'failed') return 'retryable';
+  return 'clean';
+}
+
+/**
+ * Bound for a retryable final system checkpoint. 3 retries at 1, 3 and 5
+ * minutes (≈9 min) cover a normal `apt`/`npm -g` run finishing (busy) and a
+ * transient store blip (failed); anything still failing after that is almost
+ * certainly persistent (store outage, corrupt staging, a package manager
+ * wedged), and holding the computer up longer only bills without saving more.
+ * The 15-minute wall-clock cap holds even when alarms or caller retries
+ * (teardown, reaper) arrive late or early.
+ */
+// NOT exported: index.ts is the workerd entrypoint, and an exported non-handler value fails boot (boot.test.ts).
+const SYSTEM_FINAL_MAX_RETRIES = 3;
+const SYSTEM_FINAL_MAX_WAIT_MS = 15 * 60_000;
+const SYSTEM_FINAL_RETRY_BACKOFF_SECONDS = [60, 180, 300] as const;
+
 // ── Durable Object storage keys (EzilSandboxDO) ──────────────────────────────
 const WORKSPACE_FLUSH_CONTEXT_KEY = 'ezil:workspaceFlushContext';
 const WORKSPACE_HYDRATED_KEY = 'ezil:workspaceHydrated';
+/**
+ * Sticky per-computer workspace store ('r2' | 's3', R13). Written once, when a
+ * checkpoint first commits in a store (or an R2 hydrate succeeds); from then
+ * on every hydrate and every alarm flush uses it, whatever
+ * `EZIL_WORKSPACE_STORE` says. Never rewritten from 's3' to 'r2'. Computers
+ * that last hydrated before this key existed have no pin: they bootstrap from
+ * env exactly once (legacy branch in `selectWorkspaceStore`) and pin then.
+ */
+const WORKSPACE_STORE_KIND_KEY = 'ezil:workspaceStoreKind';
 /**
  * 🔴 REMOVED, deliberately — read this before reintroducing anything like it.
  *
@@ -1828,6 +1903,23 @@ const WORKSPACE_LAST_UPLOAD_AT_KEY = 'ezil:workspaceLastUploadAt';
 const MIN_CHANGED_CHECKPOINT_MS = 60_000;
 /** When superseded checkpoint generations were last collected. */
 const WORKSPACE_LAST_GC_AT_KEY = 'ezil:workspaceLastGcAt';
+/**
+ * Whether this computer's LAST definitive workspace / system checkpoint was
+ * over the snapshot caps (512 MiB / 100,000 entries). Then the committed head
+ * is older than the live state, and exporting it would silently truncate:
+ * migration export is refused while either is true (C-7).
+ */
+const WORKSPACE_TOO_LARGE_KEY = 'ezil:workspaceTooLarge';
+/** `{ firstAt, attempts }` of the current bounded wait on a retryable final system checkpoint. */
+const SYSTEM_FINAL_RETRY_KEY = 'ezil:systemFinalRetry';
+/**
+ * Persistence-health signal: `{ reason, at }` when a stop/teardown proceeded
+ * although this session's system changes were NOT saved. Cleared by the next
+ * clean final system checkpoint. Read via the `persistenceHealth()` RPC and
+ * returned as `systemChangesNotSaved` on the teardown report.
+ */
+const SYSTEM_CHANGES_NOT_SAVED_KEY = 'ezil:systemChangesNotSaved';
+const SYSTEM_TOO_LARGE_KEY = 'ezil:systemTooLarge';
 /** When the system layer (changes outside /workspace) was last captured. */
 const SYSTEM_LAST_FLUSH_AT_KEY = 'ezil:systemLastFlushAt';
 const SYSTEM_FLUSH_INTERVAL_MS = 5 * 60_000;
@@ -2477,17 +2569,61 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return next;
   }
 
-  async hydrateWorkspace(params: { mountPath: string; prefix: string }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }> {
+  /**
+   * This computer's workspace store (R13). Order: the PINNED choice (DO
+   * storage), else — legacy, never pinned yet — the env selector. A request's
+   * signed store claim must equal the choice or the request is refused; an
+   * empty claim is no claim. Fail closed on an unreadable pin.
+   */
+  private async selectWorkspaceStore(claim?: WorkspaceStoreKind): Promise<
+    (WorkspaceStoreResolution & { ok: true; pinned: boolean }) | { ok: false; detail: string }
+  > {
+    const pinned = await this.ctx.storage.get<unknown>(WORKSPACE_STORE_KIND_KEY);
+    if (pinned !== undefined && !isWorkspaceStoreKind(pinned)) return { ok: false, detail: 'workspace_store_pin_invalid' };
+    if (pinned !== undefined) {
+      if (claim !== undefined && claim !== pinned) {
+        return { ok: false, detail: pinned === 's3' ? 'workspace_store_downgrade_refused' : 'workspace_store_claim_mismatch' };
+      }
+      const sel = resolvePinnedWorkspaceStore(this.env, pinned);
+      return sel.ok ? { ...sel, pinned: true } : sel;
+    }
+    // Fresh per call so the migrating store's per-prefix read routing cache
+    // cannot outlive a migration (a stale 'R2' route would re-restore
+    // pre-migration content on a later hydrate).
+    const sel = resolveWorkspaceStore(this.env);
+    if (!sel.ok) return sel;
+    if (claim !== undefined && claim !== sel.kind) return { ok: false, detail: 'workspace_store_claim_mismatch' };
+    return { ...sel, pinned: false };
+  }
+
+  /** Pin the store a checkpoint just committed to. Never moves an existing pin (so never S3 -> R2). */
+  private async pinWorkspaceStore(kind: WorkspaceStoreKind): Promise<void> {
+    const current = await this.ctx.storage.get<unknown>(WORKSPACE_STORE_KIND_KEY);
+    if (current !== undefined) return;
+    await this.ctx.storage.put(WORKSPACE_STORE_KIND_KEY, kind);
+  }
+
+  async hydrateWorkspace(params: { mountPath: string; prefix: string; expectedStore?: WorkspaceStoreKind }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }> {
     return this.withWorkspacePersistence(async () => {
       try {
         // Fail closed: a misconfigured store NEVER silently falls back to R2.
-        // A FRESH store is resolved per call so the migrating store's per-prefix
-        // read routing cache cannot outlive a migration (a stale 'R2' route
-        // would re-restore pre-migration content on a later hydrate).
-        const store = resolveWorkspaceStore(this.env);
+        const claim = params.expectedStore;
+        if (claim !== undefined && !isWorkspaceStoreKind(claim)) return { mounted: false, detail: 'workspace_store_claim_mismatch' };
+        const store = await this.selectWorkspaceStore(claim);
         if (!store.ok) return { mounted: false, detail: store.detail };
+        // An S3-pinned computer committed its head to S3. A missing S3 head is
+        // an anomaly, not an empty workspace: never seed over it.
+        if (store.pinned && store.kind === 's3'
+            && !await store.store.get(`${realR2KeyPrefix(params.prefix)}/${SNAPSHOT_HEAD}`)) {
+          return { mounted: false, detail: 'workspace_store_head_missing' };
+        }
+        // C-7: a migrated computer is never restored on Cloudflare again.
+        if (store.store && await readMigratedHead(store.store, realR2KeyPrefix(params.prefix))) {
+          return { mounted: false, detail: 'workspace_migrated' };
+        }
         const result = await ensureWorkspaceHydratedFromR2(this, store.store, params.mountPath, params.prefix);
         if (!result.mounted) return result;
+        if (store.kind === 'r2') await this.pinWorkspaceStore('r2');
         // User changes outside /workspace (apt, npm -g, HOME): restored before
         // the desktop starts. Never blocks the desktop.
         if (store.store) {
@@ -2564,8 +2700,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       } catch { /* preserve checkpoint refusal when the physical probe fails */ }
     }
     // Fail closed: a misconfigured store is skipped, never silently run on R2.
-    // Fresh per flush so no stale per-prefix read routing is reused.
-    const store = resolveWorkspaceStore(this.env);
+    // The PINNED choice decides (the alarm loop has no request context); env
+    // only for a computer never pinned (legacy), which pins on success below.
+    const store = await this.selectWorkspaceStore();
     if (!store.ok) {
       bootLog('workspace_flush', 'end', { status: 'skipped', detail: `store_misconfigured,trigger=${trigger}`, phaseMs: Date.now() - t0 });
       return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0, failed: [], manifest: {}, heartbeatWritten: false };
@@ -2640,6 +2777,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       }
     }
     if (outcome.ok && outcome.uploaded.length > 0) await this.ctx.storage.put(WORKSPACE_LAST_UPLOAD_AT_KEY, Date.now());
+    // A committed checkpoint proves this computer's head lives in this store.
+    if (outcome.ok && !store.pinned) await this.pinWorkspaceStore(store.kind);
+    if (outcome.ok || outcome.skippedReason === 'too_large') {
+      await this.ctx.storage.put(WORKSPACE_TOO_LARGE_KEY, outcome.skippedReason === 'too_large');
+    }
     this.lastOkCheckpoint = outcome.ok ? { at: Date.now(), outcome } : null;
     // The running container lost the hydrated workspace (replaced under us): stop
     // claiming it is hydrated, so status and the next open re-hydrate from the head.
@@ -2654,7 +2796,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       const system = await this.runSystemFlush(bucket, wctx.prefix, systemMode === 'final');
       // A FINAL checkpoint that failed must not let idle-stop / teardown discard
       // the container: they refuse and retry, exactly as for the workspace.
-      if (systemMode === 'final' && system?.skippedReason === 'failed') outcome.systemCheckpointFailed = true;
+      if (systemMode === 'final' && system) {
+        const cls = classifyFinalSystemCheckpoint(system);
+        if (cls !== 'clean') outcome.systemFinalReason = system.skippedReason as NonNullable<FlushOutcome['systemFinalReason']>;
+        if (cls === 'retryable') outcome.systemCheckpointFailed = true;
+      }
     }
     if (outcome.ok) await this.collectSnapshotGarbage(bucket, wctx.prefix);
     return outcome;
@@ -2675,6 +2821,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         log: (message) => console.error(`[system_flush] ${message}`) });
       if (system.ok || system.skippedReason === 'no_baseline' || system.skippedReason === 'busy') {
         await this.ctx.storage.put(SYSTEM_LAST_FLUSH_AT_KEY, Date.now());
+      }
+      if (system.ok || system.skippedReason === 'too_large') {
+        await this.ctx.storage.put(SYSTEM_TOO_LARGE_KEY, system.skippedReason === 'too_large');
       }
       bootLog('system_flush', 'end', { status: system.ok ? 'ok' : system.skippedReason === 'failed' ? 'error' : 'skipped', phaseMs: Date.now() - t0,
         detail: `uploaded=${system.uploaded},entries=${system.entries}${system.unchanged ? ',unchanged' : ''}${system.skippedReason ? `,reason=${system.skippedReason}` : ''}` });
@@ -2698,7 +2847,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       });
       const systemPrefix = systemPrefixOf(prefix);
       if (systemPrefix) {
-        await collectSupersededSnapshots({ bucket: bucket as GcR2BucketLike, realPrefix: systemPrefix,
+        await collectSupersededSnapshots({ bucket: bucket as GcR2BucketLike, realPrefix: systemPrefix, fencePrefixes: [prefix],
           log: (message) => console.error(`[system_gc] ${message}`) });
       }
       bootLog('workspace_gc', 'end', { status: gc.ok ? 'ok' : 'error',
@@ -2943,8 +3092,17 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // permanent: stay up and retry, like a failed workspace flush.
       // 'container_not_hydrated': the running container provably never held the user's
       // workspace (replaced for an image rollout) — nothing to save, retrying cannot help.
-      if ((outcome.ok || outcome.skippedReason === 'too_large' || outcome.skippedReason === 'container_not_hydrated')
-          && !outcome.systemCheckpointFailed) {
+      // 'migrated': the head is the terminal C-7 marker; this container's state is fenced
+      // off and can never be checkpointed again, so staying up would only bill.
+      if (outcome.ok || outcome.skippedReason === 'too_large' || outcome.skippedReason === 'container_not_hydrated'
+          || outcome.skippedReason === 'migrated') {
+        // The system layer: permanent "unsaved" never blocks; busy/failed block, bounded.
+        const gate = await this.systemStopGate(outcome);
+        if (!gate.proceed) {
+          console.error(`[ezil-boot] phase=workspace_flush event=idle_system_checkpoint_retry detail=${outcome.systemFinalReason},retryIn=${gate.retryAfterSeconds}`);
+          await this.schedule(gate.retryAfterSeconds, WORKSPACE_FLUSH_CALLBACK);
+          return;
+        }
         // A real input heartbeat may arrive during the checkpoint's R2 I/O.
         // Keep that newly active desktop up and checkpoint again next cycle.
         const after = await this.activityClocks();
@@ -3027,6 +3185,138 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return nextSeconds;
   }
 
+  /**
+   * Whether a final stop/teardown may proceed given its FINAL system checkpoint
+   * (see `classifyFinalSystemCheckpoint`). Records the persistence-health
+   * signal whenever it proceeds without the session's system changes saved.
+   */
+  private async systemStopGate(outcome: FlushOutcome): Promise<
+    { proceed: true; unsaved?: string } | { proceed: false; retryAfterSeconds: number }
+  > {
+    const reason = outcome.systemFinalReason;
+    if (!reason) {
+      await this.ctx.storage.delete(SYSTEM_FINAL_RETRY_KEY);
+      // Only a final checkpoint that actually ran clean clears the signal.
+      if (outcome.ok) await this.ctx.storage.delete(SYSTEM_CHANGES_NOT_SAVED_KEY);
+      return { proceed: true };
+    }
+    const now = Date.now();
+    // `systemCheckpointFailed` is set exactly for the 'retryable' class (classifyFinalSystemCheckpoint).
+    if (outcome.systemCheckpointFailed) {
+      const prior = await this.ctx.storage.get<{ firstAt: number; attempts: number }>(SYSTEM_FINAL_RETRY_KEY);
+      const state = prior && Number.isFinite(prior.firstAt) && Number.isInteger(prior.attempts)
+        ? { firstAt: prior.firstAt, attempts: prior.attempts + 1 } : { firstAt: now, attempts: 1 };
+      if (state.attempts <= SYSTEM_FINAL_MAX_RETRIES && now - state.firstAt < SYSTEM_FINAL_MAX_WAIT_MS) {
+        await this.ctx.storage.put(SYSTEM_FINAL_RETRY_KEY, state);
+        const backoff = SYSTEM_FINAL_RETRY_BACKOFF_SECONDS[state.attempts - 1] ?? SYSTEM_FINAL_RETRY_BACKOFF_SECONDS[2];
+        return { proceed: false, retryAfterSeconds: backoff };
+      }
+    }
+    await this.ctx.storage.delete(SYSTEM_FINAL_RETRY_KEY);
+    await this.ctx.storage.put(SYSTEM_CHANGES_NOT_SAVED_KEY, { reason, at: now });
+    bootLog('system_flush', 'end', { status: 'error', detail: `persistence_health=system_changes_not_saved,reason=${reason}` });
+    return { proceed: true, unsaved: reason };
+  }
+
+  /** Persistence-health signals for operators and the app (no file content). */
+  async persistenceHealth(): Promise<{ systemChangesNotSaved: { reason: string; at: number } | null }> {
+    return { systemChangesNotSaved: (await this.ctx.storage.get<{ reason: string; at: number }>(SYSTEM_CHANGES_NOT_SAVED_KEY)) ?? null };
+  }
+
+  // ── Migration export (C-7). Operator tooling (M1) drives these; no route yet. ──
+
+  /**
+   * Start exporting this computer: take a final checkpoint of a running
+   * container, REFUSE when the workspace or system layer is over the caps
+   * (the committed head would be stale: exporting it would truncate), then
+   * raise the migrating flag (suspends GC on both prefixes) and return the
+   * heads the export must copy and later commit against.
+   */
+  async beginMigrationExport(): Promise<
+    | { ok: true; store: WorkspaceStoreKind; prefix: string; head: { generation: string; chunkGeneration: string; sha256: string; entries: number; chunks: number; etag: string }; systemEtag: string | null }
+    | { ok: false; reason: string }
+  > {
+    return this.withWorkspacePersistence(async () => {
+      const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
+      if (!wctx) return { ok: false as const, reason: 'no_context' };
+      const store = await this.selectWorkspaceStore();
+      if (!store.ok || !store.store) return { ok: false as const, reason: 'store_unavailable' };
+      const bucket = store.store as unknown as FlushR2BucketLike;
+      if (this.containerIsRunning()) {
+        this.systemFinalNext = true;
+        const outcome = await this.runWorkspaceFlush('explicit');
+        if (outcome.skippedReason === 'too_large') return { ok: false as const, reason: 'workspace_too_large' };
+        if (outcome.skippedReason === 'migrated') return { ok: false as const, reason: 'already_migrated' };
+        if (!outcome.ok || outcome.systemCheckpointFailed || outcome.systemFinalReason) return { ok: false as const, reason: 'final_checkpoint_failed' };
+      }
+      // Only a recorded `false` proves the head is current. Unknown (a computer that last
+      // checkpointed before this release, and is stopped now) is refused: start it first.
+      const workspaceTooLarge = await this.ctx.storage.get<boolean>(WORKSPACE_TOO_LARGE_KEY);
+      if (workspaceTooLarge === true) return { ok: false as const, reason: 'workspace_too_large' };
+      if (workspaceTooLarge !== false) return { ok: false as const, reason: 'workspace_size_unknown' };
+      let head: Awaited<ReturnType<typeof readHead>>;
+      let systemHead: Awaited<ReturnType<typeof readHead>> = null;
+      try {
+        head = await readHead(bucket, wctx.prefix);
+        const sp = systemPrefixOf(wctx.prefix);
+        if (sp) systemHead = await readHead(bucket, sp);
+      } catch (err) {
+        return { ok: false as const, reason: err instanceof WorkspaceMigratedError ? 'already_migrated' : 'head_unreadable' };
+      }
+      if (!head) return { ok: false as const, reason: 'no_checkpoint' };
+      // An oversized system delta may never have committed a head at all: refuse on the flag alone.
+      const systemTooLarge = await this.ctx.storage.get<boolean>(SYSTEM_TOO_LARGE_KEY);
+      if (systemTooLarge === true) return { ok: false as const, reason: 'system_too_large' };
+      if (systemHead && systemTooLarge !== false) return { ok: false as const, reason: 'system_size_unknown' };
+      const flag = new TextEncoder().encode(JSON.stringify({ startedAt: new Date().toISOString(), headEtag: head.etag }));
+      if (!await bucket.put(`${wctx.prefix}/${MIGRATING_FLAG}`, flag)) return { ok: false as const, reason: 'flag_write_failed' };
+      const s = head.snapshot;
+      return {
+        ok: true as const, store: store.kind, prefix: wctx.prefix, systemEtag: systemHead?.etag ?? null,
+        head: { generation: s.generation, chunkGeneration: s.chunkGeneration ?? s.generation, sha256: s.sha256,
+          entries: s.entries, chunks: s.chunks.length, etag: head.etag },
+      };
+    });
+  }
+
+  /**
+   * Make the export terminal: CAS the `migrated` marker over the exported
+   * workspace head (refused if any checkpoint landed since), then over the
+   * system head the export read. Every later Cloudflare flush is refused.
+   */
+  async commitMigration(params: { targetProvider: MigrationTarget; expectedEtag: string; expectedSystemEtag: string | null }): Promise<
+    { ok: true; systemFenced: boolean } | { ok: false; reason: string }
+  > {
+    return this.withWorkspacePersistence(async () => {
+      if (!(MIGRATION_TARGETS as readonly unknown[]).includes(params.targetProvider)) return { ok: false as const, reason: 'invalid' };
+      const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
+      if (!wctx) return { ok: false as const, reason: 'no_context' };
+      const store = await this.selectWorkspaceStore();
+      if (!store.ok || !store.store) return { ok: false as const, reason: 'store_unavailable' };
+      const bucket = store.store as unknown as FlushR2BucketLike;
+      const ws = await writeMigratedHead({ bucket, realPrefix: wctx.prefix, targetProvider: params.targetProvider, expectedEtag: params.expectedEtag });
+      if (!ws.ok) return { ok: false as const, reason: ws.reason };
+      const sp = systemPrefixOf(wctx.prefix);
+      let systemFenced = params.expectedSystemEtag === null;
+      if (sp && params.expectedSystemEtag !== null) {
+        const sys = await writeMigratedHead({ bucket, realPrefix: sp, targetProvider: params.targetProvider, expectedEtag: params.expectedSystemEtag });
+        systemFenced = sys.ok;
+      }
+      return { ok: true as const, systemFenced };
+    });
+  }
+
+  /** Abandon an export before commit: lower the migrating flag so GC resumes. */
+  async abortMigrationExport(): Promise<{ ok: boolean }> {
+    return this.withWorkspacePersistence(async () => {
+      const wctx = await this.ctx.storage.get<WorkspaceFlushContext>(WORKSPACE_FLUSH_CONTEXT_KEY);
+      const store = await this.selectWorkspaceStore();
+      if (!wctx || !store.ok || !store.store) return { ok: false };
+      await (store.store as unknown as { delete(keys: string[]): Promise<unknown> }).delete([`${wctx.prefix}/${MIGRATING_FLAG}`]);
+      return { ok: true };
+    });
+  }
+
   /** Explicit, on-demand flush — see class doc comment for the two call sites. */
   async flushWorkspaceNow(): Promise<FlushOutcome> {
     // Concurrent opens (desktop, code and app windows, each re-asking while the
@@ -3060,6 +3350,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   async recordActivity(lastInputAgoMs: number): Promise<void> {
     const lastActivityAt = computeActivityTimestamp({ now: Date.now(), lastInputAgoMs });
     await this.ctx.storage.put(LAST_ACTIVITY_AT_KEY, lastActivityAt);
+    // A user present AGAIN ends a bounded wait on a final system checkpoint, so the next idle
+    // starts afresh. Only presence newer than the wait's first result counts: the shell keeps
+    // heartbeating stale presence (up to 30 min old) after idle-stop is due, and that must
+    // not hold the computer up past the bound.
+    const retry = await this.ctx.storage.get<{ firstAt: number; attempts: number }>(SYSTEM_FINAL_RETRY_KEY);
+    if (retry && lastActivityAt > retry.firstAt) await this.ctx.storage.delete(SYSTEM_FINAL_RETRY_KEY);
   }
 
   /** True when a container is actually alive under this DO right now. */
@@ -3187,6 +3483,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       }
     }
 
+    let systemChangesNotSaved: string | undefined;
     if (wasRunning) {
       // A failed final flush is a refusal, never permission to discard disk.
       let checkpoint: FlushOutcome | undefined;
@@ -3194,17 +3491,24 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       try { checkpoint = await this.runWorkspaceFlush('explicit'); } catch { /* refuse below */ }
       // A workspace over the snapshot limits can never checkpoint; refusing
       // would retry (and bill) forever. Every other failure still refuses.
-      if (checkpoint?.skippedReason === 'too_large' || checkpoint?.skippedReason === 'container_not_hydrated') {
-        console.error(`[terminateSandbox] ${checkpoint.skippedReason === 'too_large' ? 'workspace exceeds snapshot limits' : 'container does not hold the hydrated workspace'}; terminating on the last committed checkpoint`);
+      if (checkpoint?.skippedReason === 'too_large' || checkpoint?.skippedReason === 'container_not_hydrated'
+          || checkpoint?.skippedReason === 'migrated') {
+        console.error(`[terminateSandbox] ${checkpoint.skippedReason === 'too_large' ? 'workspace exceeds snapshot limits'
+          : checkpoint.skippedReason === 'migrated' ? 'workspace head is migrated (fenced)' : 'container does not hold the hydrated workspace'}; terminating on the last committed checkpoint`);
       } else if (!checkpoint?.ok) {
         // Do not tombstone or cancel retries on a persistence failure.
         return { ok: false, terminated: false, stopped: false, outcome: 'flush_failed',
           wasRunning: true, runningAfter: this.containerIsRunning(), error: 'workspace_checkpoint_failed' };
       }
-      if (checkpoint?.systemCheckpointFailed) {
-        // The user's installs outside /workspace were not saved: same refusal.
-        return { ok: false, terminated: false, stopped: false, outcome: 'flush_failed',
-          wasRunning: true, runningAfter: this.containerIsRunning(), error: 'system_checkpoint_failed' };
+      if (checkpoint) {
+        // The user's installs outside /workspace: same bounded policy as idle-stop.
+        const gate = await this.systemStopGate(checkpoint);
+        if (!gate.proceed) {
+          return { ok: false, terminated: false, stopped: false, outcome: 'flush_failed',
+            wasRunning: true, runningAfter: this.containerIsRunning(), error: 'system_checkpoint_failed',
+            retryAfterSeconds: gate.retryAfterSeconds };
+        }
+        systemChangesNotSaved = gate.unsaved;
       }
     }
 
@@ -3249,7 +3553,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       runningAfter = this.containerIsRunning();
     }
 
-    const report = buildTerminateReport({ wasRunning, runningAfter, destroyError });
+    const report: TerminateReport = { ...buildTerminateReport({ wasRunning, runningAfter, destroyError }),
+      ...(systemChangesNotSaved ? { systemChangesNotSaved } : {}) };
     bootLog('terminate', 'end', {
       status: report.ok ? 'ok' : 'error',
       detail: `outcome=${report.outcome},wasRunning=${wasRunning},runningAfter=${runningAfter}`,
@@ -3812,7 +4117,7 @@ async function handlePreview(
   tl.event('web_api', 'sandbox.preview.received', 'ok');
 
   const authDone = tl.stage('project_authorization', 'sandbox.preview.authorize');
-  const auth = await verifyPreviewToken(body.token, resolvePreviewSecrets(env));
+  const auth = await authorizeSigned(request, env, body.token);
   if (!auth.ok) {
     authDone('error', auth.error);
     return json({ ok: false, error: auth.error }, 401);
@@ -3878,6 +4183,22 @@ async function handlePreview(
   const sandboxId = deriveSandboxId(body.userId ?? 'anon', scopeId);
   tl.setSandboxId(sandboxId);
   bootSandboxId = sandboxId;
+
+  // v2: the signed claims must name exactly the computer this body boots. The
+  // body is digested, so these are the signer's own values; a mismatch means
+  // the token was minted for a different computer.
+  const v2 = auth.v2;
+  if (v2) {
+    if (v2.sandboxId !== sandboxId || v2.userId !== body.userId || v2.computerId !== scopeId) {
+      tl.event('project_authorization', 'sandbox.preview.v2_binding', 'error', { error: 'hmac_v2_identity_mismatch' });
+      return json({ ok: false, error: 'hmac_v2_identity_mismatch' }, 401);
+    }
+    // This Worker serves Cloudflare computers only; AWS routing is P5 (C-5).
+    if (v2.provider !== 'cloudflare') {
+      tl.event('project_authorization', 'sandbox.preview.v2_binding', 'error', { error: 'provider_not_routable' });
+      return json({ ok: false, error: 'provider_not_routable' }, 401);
+    }
+  }
 
   // The R2 workspace mount prefix is keyed on the FULL scope id + branch
   // (not the truncated/sanitized `sandboxId`) so it matches the write
@@ -3954,10 +4275,11 @@ async function handlePreview(
     // desktop starts so any workspace-backed tooling sees files immediately.
     // Workspace durability is required before exposing an editable desktop.
     const mountDone = tl.stage('workspace_mount', 'sandbox.preview.workspace_mount');
+    const mountOpts = auth.v2?.store ? { expectedStore: auth.v2.store } : undefined;
     const workspace = await ensureWorkspaceMount(sandbox, env, {
       projectId: workspaceProjectId,
       branch: workspaceBranch,
-    });
+    }, mountOpts);
     mountDone(
       workspace.mounted ? 'ok' : 'error',
       workspace.mounted ? undefined : workspace.detail,
@@ -4306,7 +4628,7 @@ async function handleWorkspaceDiag(
     // Allow an empty body — the diagnostic endpoint defaults op/slot.
   }
 
-  const auth = await verifyPreviewToken(body.token, resolvePreviewSecrets(env));
+  const auth = await authorizeSigned(request, env, body.token);
   if (!auth.ok) {
     tl.event('project_authorization', 'sandbox.diag.authorize', 'error', { error: auth.error });
     return json({ ok: false, error: auth.error }, 401);
@@ -4566,7 +4888,7 @@ async function handleCpuDiag(
     // Allow an empty body — the diagnostic endpoint defaults maxLines.
   }
 
-  const auth = await verifyPreviewToken(body.token, resolvePreviewSecrets(env));
+  const auth = await authorizeSigned(request, env, body.token);
   if (!auth.ok) {
     tl.event('project_authorization', 'sandbox.cpu_diag.authorize', 'error', { error: auth.error });
     return json({ ok: false, error: auth.error }, 401);
@@ -4714,7 +5036,7 @@ async function handleNekoLogs(
     // Allow an empty body — the route defaults maxLines.
   }
 
-  const auth = await verifyPreviewToken(body.token, resolvePreviewSecrets(env));
+  const auth = await authorizeSigned(request, env, body.token);
   if (!auth.ok) {
     tl.event('project_authorization', 'sandbox.neko_logs.authorize', 'error', { error: auth.error });
     return json({ ok: false, error: auth.error }, 401);
@@ -4876,7 +5198,7 @@ async function handleTwen(request: Request, env: Env, sandboxName: string): Prom
     body !== null && typeof body === 'object' && !Array.isArray(body)
       ? ((body as Record<string, unknown>).token as string | undefined)
       : undefined;
-  const auth = await verifyPreviewToken(token, resolvePreviewSecrets(env));
+  const auth = await authorizeSigned(request, env, token);
   if (!auth.ok) {
     return json({ ok: false, error: auth.error }, 401);
   }
@@ -5943,19 +6265,122 @@ async function readProjectFilesBody(
   return { ok: true, body: parsed as Record<string, unknown> };
 }
 
+// ── Signed-request authorization (v1 envelope + v2 signed envelope, C-5) ────
+
+/** v2 claims verified for THIS request object by `preauthorizeV2` (top of `fetch`). */
+const verifiedV2Claims = new WeakMap<Request, PreviewTokenV2Claims>();
+
+/**
+ * The per-sandbox path segment a request targets (`/sandbox/<id>` or
+ * `/sandbox/<id>/…`), or null. `/sandbox/preview` names its sandbox in the body.
+ */
+function sandboxIdFromPath(path: string): string | null {
+  const m = /^\/sandbox\/([^/]+)(?:\/|$)/.exec(path);
+  if (!m || m[1] === 'preview') return null;
+  try { return decodeURIComponent(m[1]!); } catch { return null; }
+}
+
+/**
+ * Verify a v2 envelope (`x-ezil-auth`) BEFORE any route reads the body: the
+ * signature covers the exact body bytes, the method and the pathname, all
+ * recomputed here from the request itself. Returns a 401 on any failure — a
+ * request that presents v2 is never re-tried as v1. No header: `null`, and
+ * the route's own `authorizeSigned` applies the v1 rules.
+ */
+/** No signed route accepts a larger body (project-files put is the largest); refused before buffering. */
+const V2_MAX_BODY_BYTES = PROJECT_FILES_MAX_PUT_REQUEST_BYTES;
+
+async function readBoundedBody(request: Request, maxBytes: number): Promise<Uint8Array | 'too_large'> {
+  const declared = request.headers.get('content-length');
+  if (declared !== null && !(Number(declared) <= maxBytes)) return 'too_large';
+  const stream = request.clone().body;
+  if (!stream) return new Uint8Array(0);
+  const reader = stream.getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) { void reader.cancel().catch(() => undefined); return 'too_large'; }
+    parts.push(value);
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const part of parts) { out.set(part, at); at += part.byteLength; }
+  return out;
+}
+
+async function preauthorizeV2(request: Request, env: Env, url: URL): Promise<Response | null> {
+  const token = request.headers.get(PREVIEW_TOKEN_V2_HEADER);
+  if (token === null) return null;
+  // v2 signs the pathname only. A query string would be unsigned input a
+  // replayed token could vary (e.g. `?desktopMode=`), so v2 refuses any query.
+  if (url.search !== '') return json({ ok: false, error: 'hmac_v2_query_not_allowed' }, 401);
+  let body: Uint8Array;
+  try {
+    const read = await readBoundedBody(request, V2_MAX_BODY_BYTES);
+    if (read === 'too_large') return json({ ok: false, error: 'request_too_large' }, 413);
+    body = read;
+  } catch {
+    return json({ ok: false, error: 'hmac_v2_body_unreadable' }, 401);
+  }
+  const verdict = await verifyPreviewTokenV2(token, resolvePreviewSecrets(env), {
+    method: request.method.toUpperCase(),
+    path: url.pathname,
+    body,
+  });
+  if (!verdict.ok) return json({ ok: false, error: verdict.error }, 401);
+  const target = sandboxIdFromPath(url.pathname);
+  if (target !== null && target !== verdict.claims.sandboxId) {
+    return json({ ok: false, error: 'hmac_v2_sandbox_mismatch' }, 401);
+  }
+  verifiedV2Claims.set(request, verdict.claims);
+  return null;
+}
+
+/**
+ * The single authorizer every signed route calls. A v2-verified request is
+ * accepted on its claims; otherwise the legacy token is checked as v1, and
+ * only while `EZIL_PREVIEW_TOKEN_V1_UNTIL` allows v1. A v2 token found in the
+ * body / bearer / query (where its body digest cannot hold) is refused.
+ */
+async function authorizeSigned(
+  request: Request,
+  env: Env,
+  legacyToken: string | undefined,
+): Promise<{ ok: true; v2?: PreviewTokenV2Claims } | { ok: false; error: string }> {
+  const v2 = verifiedV2Claims.get(request);
+  if (v2) return { ok: true, v2 };
+  if (request.headers.get(PREVIEW_TOKEN_V2_HEADER) !== null) {
+    // Presented v2 but never verified (route reached without the pre-check): refuse.
+    return { ok: false, error: 'hmac_v2_unverified' };
+  }
+  if (isPreviewTokenV2(legacyToken)) return { ok: false, error: 'hmac_v2_token_misplaced' };
+  if (!previewTokenV1Accepted(env.EZIL_PREVIEW_TOKEN_V1_UNTIL)) {
+    return { ok: false, error: 'hmac_v1_token_retired' };
+  }
+  return verifyPreviewToken(legacyToken, resolvePreviewSecrets(env));
+}
+
 /** Verify the shared HMAC envelope against a parsed project-files body's `token` field. Returns a 401 `Response` on failure, `null` on success. */
 async function authorizeProjectFilesRequest(
+  request: Request,
   env: Env,
   body: Record<string, unknown>,
   resource: 'key' | 'prefix' = 'key',
 ): Promise<Response | null> {
   const token = typeof body.token === 'string' ? body.token : undefined;
-  const auth = await verifyPreviewToken(token, resolvePreviewSecrets(env));
+  const auth = await authorizeSigned(request, env, token);
   if (!auth.ok) return json({ ok: false, error: auth.error }, 401);
   // Once checkpointed, Git on the hosted workspace is authoritative. The
   // loose-object transport cannot represent its index, modes, or deletions;
   // reject stale reads/writes instead of acknowledging edits we will ignore.
   const key = typeof body[resource] === 'string' ? body[resource] as string : '';
+  // v2 names one computer: its keys live under `<computerId>/` only.
+  if (auth.v2 && key !== auth.v2.computerId && !key.startsWith(`${auth.v2.computerId}/`)) {
+    return json({ ok: false, error: 'hmac_v2_scope_mismatch' }, 401);
+  }
   if (new TextEncoder().encode(key).length > 1024) return json({ ok: false, error: 'invalid_key' }, 400);
   if (key.split('/').includes('.ezil-snapshots')) {
     return json({ ok: false, error: 'workspace_snapshot_reserved' }, 409);
@@ -6013,7 +6438,7 @@ async function authorizeSignedControlRequest(request: Request, env: Env, url: UR
     body,
   });
 
-  const auth = await verifyPreviewToken(token, resolvePreviewSecrets(env));
+  const auth = await authorizeSigned(request, env, token);
   if (!auth.ok) return json({ ok: false, error: auth.error }, 401);
   return null;
 }
@@ -6027,7 +6452,7 @@ function projectFilesBucket(env: Env): Response | { bucket: NonNullable<Env['SAN
 async function handleProjectFilesPut(request: Request, env: Env): Promise<Response> {
   const read = await readProjectFilesBody(request, PROJECT_FILES_MAX_PUT_REQUEST_BYTES);
   if (!read.ok) return read.response;
-  const unauthorized = await authorizeProjectFilesRequest(env, read.body);
+  const unauthorized = await authorizeProjectFilesRequest(request, env, read.body);
   if (unauthorized) return unauthorized;
 
   const resolved = projectFilesBucket(env);
@@ -6047,7 +6472,7 @@ async function handleProjectFilesPut(request: Request, env: Env): Promise<Respon
 async function handleProjectFilesGet(request: Request, env: Env): Promise<Response> {
   const read = await readProjectFilesBody(request, PROJECT_FILES_MAX_CONTROL_REQUEST_BYTES);
   if (!read.ok) return read.response;
-  const unauthorized = await authorizeProjectFilesRequest(env, read.body);
+  const unauthorized = await authorizeProjectFilesRequest(request, env, read.body);
   if (unauthorized) return unauthorized;
 
   const resolved = projectFilesBucket(env);
@@ -6061,7 +6486,7 @@ async function handleProjectFilesGet(request: Request, env: Env): Promise<Respon
 async function handleProjectFilesHead(request: Request, env: Env): Promise<Response> {
   const read = await readProjectFilesBody(request, PROJECT_FILES_MAX_CONTROL_REQUEST_BYTES);
   if (!read.ok) return read.response;
-  const unauthorized = await authorizeProjectFilesRequest(env, read.body);
+  const unauthorized = await authorizeProjectFilesRequest(request, env, read.body);
   if (unauthorized) return unauthorized;
 
   const resolved = projectFilesBucket(env);
@@ -6075,7 +6500,7 @@ async function handleProjectFilesHead(request: Request, env: Env): Promise<Respo
 async function handleProjectFilesDelete(request: Request, env: Env): Promise<Response> {
   const read = await readProjectFilesBody(request, PROJECT_FILES_MAX_CONTROL_REQUEST_BYTES);
   if (!read.ok) return read.response;
-  const unauthorized = await authorizeProjectFilesRequest(env, read.body);
+  const unauthorized = await authorizeProjectFilesRequest(request, env, read.body);
   if (unauthorized) return unauthorized;
 
   const resolved = projectFilesBucket(env);
@@ -6092,7 +6517,7 @@ async function handleProjectFilesDelete(request: Request, env: Env): Promise<Res
 async function handleProjectFilesList(request: Request, env: Env): Promise<Response> {
   const read = await readProjectFilesBody(request, PROJECT_FILES_MAX_CONTROL_REQUEST_BYTES);
   if (!read.ok) return read.response;
-  const unauthorized = await authorizeProjectFilesRequest(env, read.body, 'prefix');
+  const unauthorized = await authorizeProjectFilesRequest(request, env, read.body, 'prefix');
   if (unauthorized) return unauthorized;
 
   const resolved = projectFilesBucket(env);
@@ -6342,6 +6767,11 @@ export default {
     const proxied = await proxyToSandbox(request, env);
     if (proxied) return recoverableStalePreview(request, proxied);
 
+    // 1b) v2 signed envelope: verified against the raw body before any route
+    //     parses it. Absent header => unchanged v1 behaviour per route.
+    const v2Refusal = await preauthorizeV2(request, env, url);
+    if (v2Refusal) return v2Refusal;
+
     if (method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
@@ -6363,6 +6793,8 @@ export default {
         mode: 'production',
         supportedDesktopModes: DESKTOP_MODES,
         build: 'ezil-os',
+        // Lets the app refuse to enable v2 against a Worker that predates it.
+        previewTokenVersions: previewTokenV1Accepted(env.EZIL_PREVIEW_TOKEN_V1_UNTIL) ? ['v1', 'v2'] : ['v2'],
       });
     }
 

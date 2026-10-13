@@ -883,7 +883,7 @@ describe('cpu-diag: retrieval route (HMAC-authed, bounded, degrades cleanly)', (
     const fnMatch = src.match(/async function handleCpuDiag\([\s\S]*?\n}\n/);
     expect(fnMatch).not.toBeNull();
     const fnSrc = fnMatch?.[0] ?? '';
-    expect(fnSrc).toContain('verifyPreviewToken(body.token, resolvePreviewSecrets(env))');
+    expect(fnSrc).toContain('authorizeSigned(request, env, body.token)');
     expect(fnSrc).toContain("return json({ ok: false, error: auth.error }, 401);");
   });
 
