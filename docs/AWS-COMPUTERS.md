@@ -256,8 +256,10 @@ Budget alarms are alerts, not enforcement. Cost figures in public documents desc
 ## 7. Acceptance before enabling
 
 **Stage A canary.** Staging evidence is required:
-- live access-denied proofs for cross-computer attach, disallowed type, unencrypted volume
-  and retagging
+- live access-denied proofs for disallowed type, unencrypted volume, IMDSv1 and retagging
+- cross-computer attach: **workflow refusal plus authority callback**, shown live. IAM cannot
+  tie a volume's computer to an instance's computer for a shared workflow role, so this is a
+  code fence backed by EBS single-attach, not an IAM denial
 - metadata unreachable from containers
 - ≥ 20 lifecycle cycles with unchanged volume IDs
 - ≥ 5 byte-identical Cloudflare→AWS→Cloudflare round trips, including a late-flush injection
