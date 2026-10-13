@@ -3,7 +3,8 @@
 This package holds the AWS side of [docs/AWS-COMPUTERS.md](../../docs/AWS-COMPUTERS.md).
 It is **off by default**: nothing here creates a computer, and nothing here is deployed by CI.
 
-It contains two CDK stacks.
+It contains four CDK stacks. Every stack is named `ezil-<namespace>-<kind>`, except the
+identity stack, which is `ezil-identity-<namespace>`.
 
 - **Foundation** (`lib/foundation.ts`, `bin/main.ts`):
   - a VPC with one public subnet per configured ZoneId
@@ -13,6 +14,12 @@ It contains two CDK stacks.
 - **Lifecycle** (`lib/computer-lifecycle.ts`, `lib/lifecycle/*`, `bin/lifecycle.ts`):
   - the Step Functions Standard workflow that owns every EC2/EBS mutation (R7)
   - an optional, default-off recovery workflow that fences interrupted executions
+
+- **Deploy identity (I5)** (`lib/identity.ts`, `bin/identity.ts`): the permission boundary,
+  the CloudFormation execution role, the GitHub OIDC deploy role and the asset bucket. The
+  founder creates it once (see "Founder bootstrap"). CI never deploys it.
+- **Ops guardrails (I6)** (`lib/ops.ts`, `bin/ops.ts`): DLM snapshots, the egress alarm,
+  budget alerts, the alert topic and the kill-switch policy.
 
 [LIFECYCLE.md](LIFECYCLE.md) describes the workflow's behaviour.
 
@@ -213,6 +220,9 @@ npm run typecheck
 npm test                 # unit, graph and CDK assertion tests
 npm run synth            # foundation, config/foundation.example.json
 npm run synth:lifecycle  # lifecycle + recovery, config/lifecycle.example.json
+npm run synth:identity   # I5 deploy identity, config/identity.example.json
+npm run synth:ops        # I6 ops guardrails, config/ops.example.json
+npm run synth:all        # all four
 # or, from the repository root:
 bash tools/test.sh infra
 ```
@@ -276,32 +286,209 @@ These cannot be proven offline:
   no instance, and waits until its deadline. Teaching recovery that a recorded capacity code
   proves no launch is future work.
 
-## Proposed CI job (not added this wave)
+## CI
 
-`ci.yml` does not run this package. To make it a required check:
-1. add the job below to `.github/workflows/ci.yml`
-2. add `computer infrastructure (typecheck + test + synth)` to the ruleset
-3. extend `.github/scripts/check-os-workflows.py` if it should assert the job
+`.github/workflows/ci.yml` job `computer-infrastructure` runs `bash tools/test.sh infra`. Its check
+name is `computer infrastructure (typecheck + test + synth)`.
+- **When:** on every pull request and on every push to main.
+- **Node:** pinned to `24.15.0`, the Lambda runtime. Main's other jobs pin `22.16.0`; this
+  suite has not been run on 22.
+- **Credentials:** none. The job has no secrets, no environment and no AWS credentials.
+- **Required check:** making it required is a ruleset change, which is founder-only.
 
-The job contains no secrets and has no AWS access. Node 24 matches the Lambda runtime
-(`NODEJS_24_X`) and the version the suite was verified on. Main's other jobs pin
-`22.16.0`; this suite has not been run on 22.
+## Deploy identity (I5): no CDK bootstrap (decision)
 
-```yaml
-  computer-infrastructure:
-    name: computer infrastructure (typecheck + test + synth)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24.15.0'
-      - name: Install
-        working-directory: infra/app-computers
-        run: npm ci --no-audit --no-fund
-      - name: Typecheck, test, offline synth
-        run: bash tools/test.sh infra
+**Decision.** No `cdk bootstrap`. The identity stack carries its own pieces:
+- an encrypted, versioned, private asset bucket
+- one execution role for CloudFormation
+- one GitHub OIDC deploy role
+- the permission boundary
+
+Workload stacks are deployed with `aws cloudformation deploy --role-arn <exec role>`.
+
+**Why this is smaller and safer:**
+- **Fewer, unreviewed resources with bootstrap.** A custom bootstrap creates five roles
+  (deploy, file publishing, image publishing, lookup, CFN execution), an ECR repository, an
+  SSM version parameter and a bucket. They come from a CDK-owned template we do not review
+  line by line. The deploy role trusts the account root and is broad by default. Its CFN
+  execution role defaults to `AdministratorAccess` unless every bootstrap is run with the
+  right flags.
+- **Every grant is tested here.** Without bootstrap there are 3 IAM objects and 1 bucket,
+  all in our template, all checked by exact-equality tests.
+- **Small asset need.** Only the lifecycle stack has assets: two Lambda zips. It uses
+  `CliCredentialsStackSynthesizer`, which writes to `s3://<asset bucket>/assets/` with the
+  caller's own credentials. There are no publishing roles and no bootstrap version rule; a
+  test asserts no `BootstrapVersion`.
+- **Other stacks have no assets.** Foundation, ops and identity use `BootstraplessSynthesizer`.
+
+**Boundary.** It is attached to:
+- the deploy role
+- the execution role
+- every workload role (an aspect puts them under `/ezil/<ns>/` with the boundary)
+
+It denies:
+- any region but the configured one (global services exempt)
+- creating users and access keys, and removing a boundary
+- creating a role without this boundary
+- IAM writes outside `/ezil/<ns>/` (the identity objects sit in `/ezil/identity/`, so CI
+  cannot edit its own roles)
+- `DeleteVolume`, `DeleteSnapshot`, `DetachVolume` and `DeleteTags`
+- organizations, account and billing writes
+
+**Deploy role.** Its trust is `token.actions.githubusercontent.com` with
+`aud=sts.amazonaws.com` and the immutable-ID subject `...:environment:aws-pilot`. Sessions last
+at most 1 h. It can only:
+- create, describe and execute change sets on `ezil-<ns>-*` stacks, and only with
+  `cloudformation:RoleArn` = the execution role
+- pass that one role to CloudFormation
+- read and write `assets/` and `templates/` in the bucket
+
+**Execution role.** It is scoped to exactly the resource types the workload stacks create. A
+test maps every type to its create action and fails on any unmapped type. It can create roles
+only under `/ezil/<ns>/`, only with the boundary. The exact action lists are a best effort:
+the first staging deploy will show any missing read action. Add each one deliberately; never
+widen to a service `*`.
+
+## Founder bootstrap (run once, not by CI)
+
+**Identity.** The founder runs this once, with **their own administrator session**: an IAM
+Identity Center `AdministratorAccess` permission-set session with MFA, in the target account.
+Never the root user, and never a CI role. Every later deploy goes through the deploy role.
+
+```sh
+aws sts get-caller-identity              # must NOT end in :root
+cd infra/app-computers && npm ci
+cp config/identity.example.json config/identity.pilot.json
+#   set accountId, deploySubject (repo:<org>@<orgId>/<repo>@<repoId>:environment:aws-pilot),
+#   assetBucketName, and the existing GitHub OIDC provider ARN
+# 1. The AWS-managed DLM role (once per account; used by the ops stack)
+aws dlm create-default-role --resource-type snapshot --region ap-south-1
+# 2. Synthesize offline and review the template
+EZIL_IDENTITY_CONFIG=config/identity.pilot.json npx cdk synth --strict --no-lookups --no-notices -q \
+  -o cdk.out/identity --app "npx tsx bin/identity.ts"
+# 3. Create, review, then execute the change set
+aws cloudformation deploy --region ap-south-1 --stack-name ezil-identity-pilot \
+  --template-file cdk.out/identity/ezil-identity-pilot.template.json \
+  --capabilities CAPABILITY_NAMED_IAM --no-execute-changeset
+aws cloudformation describe-change-set --region ap-south-1 --stack-name ezil-identity-pilot \
+  --change-set-name <name printed above>
+aws cloudformation execute-change-set --region ap-south-1 --stack-name ezil-identity-pilot \
+  --change-set-name <name printed above>
+aws cloudformation update-termination-protection --region ap-south-1 \
+  --stack-name ezil-identity-pilot --enable-termination-protection
+aws cloudformation describe-stacks --region ap-south-1 --stack-name ezil-identity-pilot \
+  --query 'Stacks[0].Outputs'
 ```
+
+**GitHub.** Create environment `aws-pilot` with required reviewers. Store the `DeployRoleArn`,
+`ExecRoleArn` and `AssetBucketName` outputs as environment *variables*; none of them is secret.
+
+**Workload deploys** (a future gated workflow, or the founder; not this round). They run as the
+deploy role, in order foundation → lifecycle → ops:
+
+```sh
+npx cdk publish-assets ezil-pilot-lifecycle --app "npx tsx bin/lifecycle.ts"   # EZIL_LIFECYCLE_CONFIG set
+aws cloudformation deploy --region ap-south-1 --stack-name ezil-pilot-lifecycle \
+  --template-file cdk.out/ezil-pilot-lifecycle.template.json --role-arn <ExecRoleArn> \
+  --s3-bucket <AssetBucketName> --s3-prefix templates --capabilities CAPABILITY_IAM
+```
+
+The lifecycle template is over 51 kB, hence `--s3-bucket`. The foundation and ops stacks use the
+same command without `publish-assets`. Ops needs `CAPABILITY_NAMED_IAM`, for the named
+kill-switch policy.
+
+## Ops guardrails (I6)
+
+- **Snapshots.**
+  - **Schedule.** DLM takes a snapshot every 12 hours and keeps 14 (7 days rolling).
+  - **Targets.** Volumes tagged `ezil:backup=<namespace>`. The lifecycle sets that tag only
+    when it creates a data volume, so root disks are never snapshotted.
+  - **Role.** It runs as the AWS-managed `AWSDataLifecycleManagerDefaultRole`. That role is
+    deliberately outside the boundary, because DLM must delete the snapshots it rotates and the
+    boundary denies `DeleteSnapshot`. It acts only on snapshots its own policies created.
+- **Egress backstop.**
+  - **Alarm.** One alarm on `MAX(NetworkOut)` over every instance in the region, per 5 minutes.
+    It fires when any single instance exceeds `egressBytesPer5Min`.
+  - **Delivery.** Alerts go to the SNS topic `ezil-<ns>-ops-alerts`, which the app can
+    subscribe to. Publishers are conditioned on `aws:SourceAccount` and `aws:SourceArn`. The
+    topic is unencrypted on purpose: CloudWatch and Budgets cannot publish to an
+    `aws/sns`-encrypted topic, and alerts carry no user data.
+  - **Not done this round:** no automatic stop.
+- **Budget.** Alerts at 50, 80 and 100 % of `monthlyBudgetUsd`, on actual spend, to the topic
+  and optional emails. Alerts only.
+- **Retention (§6).**
+  - Automation never deletes a volume.
+  - A RETIRED computer keeps its retained data volume, and with it the rolling 7-day DLM
+    snapshots, until an operator purges it.
+  - Purge must wait 14 days after RETIRED.
+  - Snapshot retention therefore follows the volume. A separate retired-only, age-based
+    policy (`ezil:retired=<ns>`, 14 days) needs a retire-time tag, and the lifecycle IAM cannot
+    set one today (retag is limited to generation and fence). That is an open item.
+
+### Kill-switch drill (§4)
+
+The ops stack outputs a managed policy, `ezil-<ns>-kill-switch`. It denies:
+- `RunInstances`
+- `StartInstances`
+- `AttachVolume`
+- `states:StartExecution`
+
+It never denies `StopInstances` and never touches storage. To run the drill:
+
+1. **Admission off.** Set `EZIL_AWS_KILL_SWITCH=1` in the app environment.
+2. **Disable recovery.**
+   - `aws events disable-rule --name ezil-<ns>-recovery-interrupted`
+   - `aws events disable-rule --name ezil-<ns>-recovery-backstop`
+3. **Attach the policy** to the lifecycle controller role and the reconciler role (role names
+   are in the lifecycle stack resources):
+   ```sh
+   aws iam attach-role-policy --role-name <ControllerRole> --policy-arn <KillSwitchPolicyArn>
+   aws iam attach-role-policy --role-name <ReconcilerServiceRole> --policy-arn <KillSwitchPolicyArn>
+   ```
+4. **Graceful stop.** Issue a lifecycle `stop` intent for each running computer; the controller
+   keeps `StopInstances`. Fallback: `aws ec2 stop-instances --instance-ids ...`, never with
+   `--force`.
+5. **Verify.**
+   - The count from `aws ec2 describe-volumes --filters Name=tag:ezil:backup,Values=<ns>
+     --query 'length(Volumes)'` is unchanged from before step 1.
+   - Every instance is `stopped`.
+   - A start attempt fails with AccessDenied.
+6. **Lift.** Detach the policy, re-enable both rules, then unset the kill switch.
+
+### Purge operator role (TODO design; not created this round)
+
+Purge runs per computer from the M1 tooling, after the 14-day retention:
+- **Who.** A human operator role with MFA, created by the founder outside the boundary (the
+  boundary denies deletion).
+- **Audit.** Every call is recorded by CloudTrail.
+
+Proposed trust, conditioned on MFA, on an Identity Center admin session, and on a 1 h session:
+
+```json
+{ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Action": "sts:AssumeRole",
+  "Principal": { "AWS": "arn:aws:iam::<account>:root" },
+  "Condition": { "Bool": { "aws:MultiFactorAuthPresent": "true" },
+    "NumericLessThan": { "aws:MultiFactorAuthAge": "3600" },
+    "ArnLike": { "aws:PrincipalArn": "arn:aws:iam::<account>:role/aws-reserved/sso.amazonaws.com/*/AWSReservedSSO_AdministratorAccess_*" } } }] }
+```
+
+Proposed policy (path `/ezil/operators/`, name `ezil-<ns>-purge`):
+
+```json
+{ "Version": "2012-10-17", "Statement": [
+  { "Sid": "Read", "Effect": "Allow", "Action": ["ec2:DescribeVolumes", "ec2:DescribeSnapshots"], "Resource": "*",
+    "Condition": { "StringEquals": { "aws:RequestedRegion": "<region>" } } },
+  { "Sid": "PurgeManagedVolumes", "Effect": "Allow", "Action": "ec2:DeleteVolume",
+    "Resource": "arn:aws:ec2:<region>:<account>:volume/*",
+    "Condition": { "StringEquals": { "aws:RequestedRegion": "<region>",
+      "ec2:ResourceTag/ezil:managed-by": "app-computer-platform", "ec2:ResourceTag/ezil:stage": "<ns>" } } },
+  { "Sid": "PurgeManagedSnapshots", "Effect": "Allow", "Action": "ec2:DeleteSnapshot",
+    "Resource": "arn:aws:ec2:<region>::snapshot/*",
+    "Condition": { "StringEquals": { "aws:RequestedRegion": "<region>", "ec2:ResourceTag/ezil:backup": "<ns>" } } }
+] }
+```
+
+Snapshots inherit `ezil:backup` because the DLM policy sets `copyTags`.
 
 References:
 - [Preserve data when an instance is terminated](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/preserving-volumes-on-termination.html):
