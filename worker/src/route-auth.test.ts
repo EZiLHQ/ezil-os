@@ -3122,6 +3122,28 @@ describe('v2 signed envelope on the real route table', () => {
     expect(calls.terminateSandbox).toBe(0);
   });
 
+  it('an oversized body is refused before it is buffered for the digest', async () => {
+    const { binding, hydrations } = previewNs();
+    const big = 'x'.repeat(32 * 1024 * 1024); // over the largest signed-route cap (~26.7 MiB)
+    const res = await worker.fetch(new Request('https://api-desktop.ezil.org/sandbox/preview', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-ezil-auth': 'v2.garbage.00' }, body: big,
+    }), env(binding));
+    expect(res.status).toBe(413);
+    expect(await res.json()).toEqual({ ok: false, error: 'request_too_large' });
+    expect(hydrations).toHaveLength(0);
+    // Without a Content-Length (a streamed body) the bounded reader still stops it.
+    const stream = new ReadableStream<Uint8Array>({ start(c) { for (let i = 0; i < 32; i++) c.enqueue(new Uint8Array(1024 * 1024)); c.close(); } });
+    const streamed = await worker.fetch(new Request('https://api-desktop.ezil.org/sandbox/preview', {
+      method: 'POST', headers: { 'x-ezil-auth': 'v2.garbage.00' }, body: stream, duplex: 'half',
+    } as RequestInit), env(binding));
+    expect(streamed.status).toBe(413);
+    // A declared Content-Length over the cap is refused without reading a byte.
+    const declared = await worker.fetch(new Request('https://api-desktop.ezil.org/sandbox/preview', {
+      method: 'POST', headers: { 'x-ezil-auth': 'v2.garbage.00', 'content-length': String(64 * 1024 * 1024) }, body: '{}',
+    }), env(binding));
+    expect(declared.status).toBe(413);
+  });
+
   it('project-files: a v2 token reaches only its own computer\'s keys', async () => {
     const files = async (key: string) => {
       const body = JSON.stringify({ key });

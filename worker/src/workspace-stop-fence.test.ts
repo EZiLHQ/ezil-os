@@ -169,6 +169,23 @@ describe('C-7 on the Durable Object', () => {
     expect(objects.has(FLAG)).toBe(false);
   });
 
+  it('export: a stopped computer whose size was never recorded is refused, not trusted', async () => {
+    const { fake, objects } = await makeFake();
+    await (await proto()).runWorkspaceFlush.call(fake, 'alarm' as never);
+    const { fake: legacy, store } = await makeFake();
+    Object.assign(legacy, { env: (fake as { env: unknown }).env });
+    (legacy as { ctx: { container: { running: boolean } } }).ctx.container.running = false;
+    expect(store.has('ezil:workspaceTooLarge')).toBe(false);
+    expect(await (await proto()).beginMigrationExport.call(legacy)).toEqual({ ok: false, reason: 'workspace_size_unknown' });
+    expect(objects.has(FLAG)).toBe(false);
+    // Workspace size known, but a system head exists whose size was never recorded.
+    store.set('ezil:workspaceTooLarge', false);
+    objects.set(`${COMPUTER}/system/.ezil-snapshots/latest.json`, objects.get(HEAD)!);
+    expect(await (await proto()).beginMigrationExport.call(legacy)).toEqual({ ok: false, reason: 'system_size_unknown' });
+    store.set('ezil:systemTooLarge', false);
+    expect(await (await proto()).beginMigrationExport.call(legacy)).toMatchObject({ ok: true });
+  });
+
   it('export: refused for an oversized system delta', async () => {
     const { fake, objects } = await makeFake({ sysCapture: { exitCode: 3, stdout: '' } });
     expect(await (await proto()).beginMigrationExport.call(fake)).toEqual({ ok: false, reason: 'system_too_large' });

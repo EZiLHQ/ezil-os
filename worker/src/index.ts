@@ -3166,8 +3166,11 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         if (outcome.skippedReason === 'migrated') return { ok: false as const, reason: 'already_migrated' };
         if (!outcome.ok || outcome.systemCheckpointFailed) return { ok: false as const, reason: 'final_checkpoint_failed' };
       }
-      if (await this.ctx.storage.get<boolean>(WORKSPACE_TOO_LARGE_KEY)) return { ok: false as const, reason: 'workspace_too_large' };
-      if (await this.ctx.storage.get<boolean>(SYSTEM_TOO_LARGE_KEY)) return { ok: false as const, reason: 'system_too_large' };
+      // Only a recorded `false` proves the head is current. Unknown (a computer that last
+      // checkpointed before this release, and is stopped now) is refused: start it first.
+      const workspaceTooLarge = await this.ctx.storage.get<boolean>(WORKSPACE_TOO_LARGE_KEY);
+      if (workspaceTooLarge === true) return { ok: false as const, reason: 'workspace_too_large' };
+      if (workspaceTooLarge !== false) return { ok: false as const, reason: 'workspace_size_unknown' };
       let head: Awaited<ReturnType<typeof readHead>>;
       let systemHead: Awaited<ReturnType<typeof readHead>> = null;
       try {
@@ -3178,6 +3181,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
         return { ok: false as const, reason: err instanceof WorkspaceMigratedError ? 'already_migrated' : 'head_unreadable' };
       }
       if (!head) return { ok: false as const, reason: 'no_checkpoint' };
+      // An oversized system delta may never have committed a head at all: refuse on the flag alone.
+      const systemTooLarge = await this.ctx.storage.get<boolean>(SYSTEM_TOO_LARGE_KEY);
+      if (systemTooLarge === true) return { ok: false as const, reason: 'system_too_large' };
+      if (systemHead && systemTooLarge !== false) return { ok: false as const, reason: 'system_size_unknown' };
       const flag = new TextEncoder().encode(JSON.stringify({ startedAt: new Date().toISOString(), headEtag: head.etag }));
       if (!await bucket.put(`${wctx.prefix}/${MIGRATING_FLAG}`, flag)) return { ok: false as const, reason: 'flag_write_failed' };
       const s = head.snapshot;
@@ -3396,7 +3403,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       // would retry (and bill) forever. Every other failure still refuses.
       if (checkpoint?.skippedReason === 'too_large' || checkpoint?.skippedReason === 'container_not_hydrated'
           || checkpoint?.skippedReason === 'migrated') {
-        console.error(`[terminateSandbox] ${checkpoint.skippedReason === 'too_large' ? 'workspace exceeds snapshot limits' : 'container does not hold the hydrated workspace'}; terminating on the last committed checkpoint`);
+        console.error(`[terminateSandbox] ${checkpoint.skippedReason === 'too_large' ? 'workspace exceeds snapshot limits'
+          : checkpoint.skippedReason === 'migrated' ? 'workspace head is migrated (fenced)' : 'container does not hold the hydrated workspace'}; terminating on the last committed checkpoint`);
       } else if (!checkpoint?.ok) {
         // Do not tombstone or cancel retries on a persistence failure.
         return { ok: false, terminated: false, stopped: false, outcome: 'flush_failed',
@@ -6183,12 +6191,38 @@ function sandboxIdFromPath(path: string): string | null {
  * request that presents v2 is never re-tried as v1. No header: `null`, and
  * the route's own `authorizeSigned` applies the v1 rules.
  */
+/** No signed route accepts a larger body (project-files put is the largest); refused before buffering. */
+const V2_MAX_BODY_BYTES = PROJECT_FILES_MAX_PUT_REQUEST_BYTES;
+
+async function readBoundedBody(request: Request, maxBytes: number): Promise<Uint8Array | 'too_large'> {
+  const declared = request.headers.get('content-length');
+  if (declared !== null && !(Number(declared) <= maxBytes)) return 'too_large';
+  const stream = request.clone().body;
+  if (!stream) return new Uint8Array(0);
+  const reader = stream.getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) { void reader.cancel().catch(() => undefined); return 'too_large'; }
+    parts.push(value);
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const part of parts) { out.set(part, at); at += part.byteLength; }
+  return out;
+}
+
 async function preauthorizeV2(request: Request, env: Env, url: URL): Promise<Response | null> {
   const token = request.headers.get(PREVIEW_TOKEN_V2_HEADER);
   if (token === null) return null;
   let body: Uint8Array;
   try {
-    body = new Uint8Array(await request.clone().arrayBuffer());
+    const read = await readBoundedBody(request, V2_MAX_BODY_BYTES);
+    if (read === 'too_large') return json({ ok: false, error: 'request_too_large' }, 413);
+    body = read;
   } catch {
     return json({ ok: false, error: 'hmac_v2_body_unreadable' }, 401);
   }
