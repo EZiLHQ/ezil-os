@@ -110,6 +110,19 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
   - **Two counters.** `generation` is the *writer* generation: it changes only when the instance is replaced or recovered, and it matches the lifecycle tags on the instance and volume. `lease_epoch` increases on every lease (each start or claim) without retagging AWS resources.
   - A periodic duplicate check (`HAVING count(*) > 1`) alarms and closes admission.
 
+- **Values.** `provider` ∈ {`cloudflare`, `aws-ec2`}. `workspace_store` is `r2` or `s3` for
+  `cloudflare`, and `ebs` for `aws-ec2`. Any other pairing fails closed.
+- **Ownership.** The owner comes from `ezil_computers.user_id`. Admission re-checks it in the
+  same transaction.
+- **Single writer includes reconcilers.** The EC2 state-change reconciler and the usage
+  observer write only through the placement module (`app/src/server/lib/compute/placement.ts`).
+  A test fails if any other file names these tables.
+- **Usage windows.** Each usage row covers one observation window. Egress is attributed per
+  row, and a new row starts at each month boundary, so monthly egress needs no clipping.
+- **Registration.** The SQL is kept as `docs/aws-computers/sql/*.sql.txt` until the founder
+  rehearses it and registers it in the migration manifest with observed digests. An
+  unregistered `.sql` file anywhere in the repository fails `validate`.
+
 ### C-3 Lifecycle states
 
 - Main path: `PROVISIONING → STOPPED → LEASED → STARTING → MOUNTING → RUNNING → DRAINING → STOPPING → STOPPED`.
@@ -248,12 +261,14 @@ volume as hostile input.
 
 | Control | Value / rule |
 |---|---|
+| Enable flag | `EZIL_AWS_COMPUTERS_ENABLED=1`; absent means no placement reads and no AWS admission |
 | Running computers | `AWS_MAX_RUNNING`; pilot value 2 |
 | Computers per user | 1 |
 | Instance-hours | monthly aggregate cap, including idle running and pool hours; per-user cap |
 | Egress | monthly GB caps per user and aggregate, measured outside the guest (CloudWatch `NetworkOut`) |
 | Storage | volume size allowlist; growth capped |
-| Kill switch | admission off → recovery workflow disabled → graceful stop of every instance → deny-start policy attached; no volume deleted |
+| Cap configuration | `EZIL_AWS_{USER,GLOBAL}_MONTHLY_HOURS`, `EZIL_AWS_{USER,GLOBAL}_MONTHLY_EGRESS_GB`; strict integers, no defaults, malformed or absent disables admission. Pilot: global hours 600 |
+| Kill switch | `EZIL_AWS_KILL_SWITCH=1`: admission off → recovery workflow disabled → graceful stop of every instance → deny-start policy attached; no volume deleted |
 
 Budget alarms are alerts, not enforcement. Cost figures in public documents describe
 *method* only; operators compute their own from their region's price list.
