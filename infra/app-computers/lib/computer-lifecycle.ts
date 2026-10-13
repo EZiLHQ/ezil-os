@@ -121,7 +121,7 @@ export function controllerStatements(s:Settings):iam.PolicyStatement[]{
             new iam.PolicyStatement({actions:['ec2:ModifyInstanceAttribute'],resources:[arn('instance')],
                 conditions:{StringEquals:{...region,...managed,'ec2:Attribute':'userData'}}}),
             new iam.PolicyStatement({effect:iam.Effect.DENY,actions:['ec2:ModifyInstanceAttribute'],resources:['*'],
-                conditions:{StringNotEquals:{'ec2:Attribute':'userData'}}}),
+                conditions:{'ForAnyValue:StringNotEquals':{'ec2:Attribute':'userData'}}}),
             new iam.PolicyStatement({effect:iam.Effect.DENY,actions:['ec2:ModifyInstanceAttribute'],resources:['*'],
                 conditions:{Null:{'ec2:Attribute':'true'}}}),
         ]:[]),

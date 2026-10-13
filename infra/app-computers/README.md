@@ -78,7 +78,7 @@ The intent also carries two contract fields:
 | Flag | Effect |
 |---|---|
 | `userDataNonce` | Adds the start-in-place step `ModifyInstanceAttribute(InstanceId, UserData)`, used only while the instance is stopped and before `StartInstances`. With the flag off, a start that carries `userData` is refused (`lifecycle_userdata_disabled`). |
-| `userDataAttributeKeyVerified` | Only together with `userDataNonce`, it replaces the unconditional `ModifyInstanceAttribute` Deny with three statements: Allow when `ec2:Attribute` = `userData`, Deny when `ec2:Attribute` is anything else, and Deny when `ec2:Attribute` is Null. |
+| `userDataAttributeKeyVerified` | Only together with `userDataNonce`, it replaces the unconditional `ModifyInstanceAttribute` Deny with three statements: Allow when `ec2:Attribute` = `userData`, Deny when any `ec2:Attribute` value is not `userData` (`ForAnyValue:StringNotEquals`), and Deny when `ec2:Attribute` is Null. |
 
 The second flag exists because the IAM service reference lists `ec2:Attribute` for
 `ModifyInstanceAttribute`, but no AWS document confirms the value it takes for a UserData
@@ -134,7 +134,7 @@ The role's policy allows only:
 | Tag integrity | identity tags only with `ec2:CreateAction`; retag limited to `ezil:generation` and `ezil:fence-token` | exact IAM spec; `lifecycle.test.ts` |
 | Second-writer guard | no `RunInstances` while the data volume has any attachment | `lifecycle.test.ts` |
 | Confused deputy | every `events.amazonaws.com` grant carries `aws:SourceArn` (the exact rule) and `aws:SourceAccount`. This covers both history key policies, every queue policy and the Lambda invoke permissions. | snapshot plus an explicit check that no grant is unconditioned |
-| C-3: errors | EC2 errors are recorded at `$.ctl.lastError`, observation errors at `$.ctl.observeError` (neither overwrites the other); terminals record both. Capacity and quota errors go to `LifecycleRefused` with the code. Throttling backs off and retries (max 5). Timeouts and 5xx are observed. Any other EC2 error fails fast to `Rejected` (`LifecycleUnconfirmed`) with the code. | `lifecycle.test.ts` |
+| C-3: errors | EC2 errors are recorded at `$.ctl.lastError`, observation errors at `$.ctl.observeError` (neither overwrites the other); terminals record both. Capacity and quota errors go to `LifecycleRefused` with the code. Throttling backs off and retries (max 5). These are observed: timeouts, 5xx and InternalError/ServiceUnavailable, transport failures (no HTTP response, connection reset), and a generic `States.TaskFailed` without a status code. Any other EC2 error fails fast to `Rejected` (`LifecycleUnconfirmed`) with the code. | `lifecycle.test.ts` |
 | Recovery settle | recovery waits 60 s after the source stops before trusting its history | `lifecycle-recovery.test.ts` |
 | Terminate guard | any disk beyond the root and this computer's data disk blocks `TerminateInstances` | `lifecycle.test.ts`, `lifecycle-recovery.test.ts` |
 
@@ -167,8 +167,9 @@ section, the `Null ec2:InstanceProfile` condition and the item 3 tests together.
 
 ### Root-volume KMS key: why there is no `ec2:KmsKeyId` condition
 
-The IAM service reference lists `ec2:KmsKeyId` for `CreateVolume`, but not for the `volume`
-resource of `RunInstances`. A condition on a key that is never present would deny every
+**UNVERIFIED:** the npm dataset `@cloud-copilot/iam-data` (0.21.202610131), built from the
+IAM service reference, lists `ec2:KmsKeyId` for `CreateVolume` but not for the `volume`
+resource of `RunInstances`. A reviewer recalls it may be listed there. Staging must settle it. A condition on a key that is never present would deny every
 launch. The root-volume statement therefore requires only:
 - `ec2:Encrypted=true`
 - gp3
@@ -240,6 +241,9 @@ These cannot be proven offline:
 - **`ec2:Attribute` for UserData.** Prove that `ModifyInstanceAttribute` with a UserData value
   presents `ec2:Attribute=userData`, and that other attributes are denied. Only then set
   `userDataAttributeKeyVerified`.
+- **`ec2:KmsKeyId` on the RunInstances volume resource.** Check whether this key is
+  evaluated for a launch. If it is, add `ArnEquals ec2:KmsKeyId` = the data key to the root-volume
+  statement and close the `aws/ebs` gap described above.
 - **Live allow proofs.** `IfExists` was removed, so a key that is absent from a correct
   request now denies it. The canary must show that a correct provision, attach, retag,
   start, stop and terminate are *allowed*, not only that bad requests are denied. The

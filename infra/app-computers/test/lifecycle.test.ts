@@ -11,7 +11,7 @@ import { LifecycleIntentSchema, validateLifecycleReceipt } from '../lib/lifecycl
 import { authorityFor } from '../lib/lifecycle/contract.js';
 
 type Options={lose?:string;noEffect?:string;revokeAfter?:string;foreignDisk?:boolean;deleteDisk?:boolean;staleOldAfterLaunch?:boolean;
-    fail?:{action:string;times:number;error:Error};extraDisk?:boolean;fixture?:ReturnType<typeof lifecycleFixture>};
+    fail?:{action:string;times:number;error:Error};applyBeforeFail?:boolean;extraDisk?:boolean;fixture?:ReturnType<typeof lifecycleFixture>};
 async function run(operation:LifecycleIntent['operation'],options:Options={}){
     const f=options.fixture??lifecycleFixture(operation),helper=createLifecycleHelper(f.settings,f.deps),graph=lifecycleDefinition('helper',f.settings.features);
     if(options.foreignDisk)f.state.volumes[0]!.Tags=[];
@@ -25,7 +25,7 @@ async function run(operation:LifecycleIntent['operation'],options:Options={}){
         invoke:async(resource,parameters)=>{
             if(resource==='helper'){try{return await helper(parameters);}catch(error){throw toLambdaError(error,'lifecycle_unconfirmed');}}
             const action=resource.split(':').at(-1)!;calls.push({action,parameters});
-            if(options.fail?.action===action&&failures<options.fail.times){failures++;throw options.fail.error;}
+            if(options.fail?.action===action&&failures<options.fail.times&&!options.applyBeforeFail){failures++;throw options.fail.error;}
             const target=f.state.instances.find(i=>i.InstanceId===(parameters.InstanceIds?.[0]??parameters.InstanceId));
             if(action!==options.noEffect){
                 if(action==='createVolume')f.state.volumes.push(f.volume());
@@ -38,6 +38,7 @@ async function run(operation:LifecycleIntent['operation'],options:Options={}){
                 if(action==='attachVolume')f.attach(f.state.volumes[0]!,target!);
                 if(action==='modifyInstanceAttribute')assert.equal(target!.State?.Name,'stopped');
             }
+            if(options.applyBeforeFail&&options.fail?.action===action&&failures<options.fail.times){failures++;throw options.fail.error;}
             if(action===options.revokeAfter)f.state.authorized=false;
             if(action===options.lose&&!lost){lost=true;throw taskError('States.Timeout','Task timed out (lost response)');}
             return {};
@@ -243,4 +244,22 @@ test('replace waits for a stopping writer and never issues a second stop',async(
         if(Array.isArray(selector)&&++reads===3)f.state.instances[0]!.State={Name:'stopped'};return rows;};
     const r=await run('replace',{fixture:f});assert.equal(r.error,undefined);
     assert.equal(r.calls.filter(c=>c.action==='stopInstances').length,0);assert.equal(r.calls[0]!.action,'terminateInstances');
+});
+
+// ── Uncertain provider errors are observed, never rejected ──
+for(const [label,name,cause] of [
+    ['5xx status only','Ec2.Ec2Exception','We encountered an error. (Service: Ec2, Status Code: 503, Request ID: r)'],
+    ['InternalError','Ec2.InternalErrorException','An internal error has occurred'],
+    ['ServiceUnavailable','Ec2.ServiceUnavailableException','Service is temporarily unable to handle the request'],
+    ['transport: HTTP request','States.TaskFailed','Unable to execute HTTP request: Connection reset'],
+    ['transport: generic task failure without status','States.TaskFailed','The task failed'],
+] as const) test(`uncertain EC2 error (${label}) is observed, not rejected`,async()=>{
+    // The request DID take effect; only observation can learn that.
+    const r=await run('start',{fail:{action:'startInstances',times:1,error:taskError(name,cause)},noEffect:undefined,applyBeforeFail:true});
+    assert.equal(r.error,undefined,r.cause);assert.equal(r.receipt.state,'running');
+    assert.ok(!r.visited.includes('Rejected'));assert.equal(r.calls.filter(c=>c.action==='startInstances').length,1);
+});
+test('a definite 4xx with a status code is still rejected',async()=>{
+    const r=await run('start',{fail:{action:'startInstances',times:1,error:taskError('States.TaskFailed','Not authorized (Service: Ec2, Status Code: 403)')},noEffect:'startInstances'});
+    assert.ok(r.visited.includes('Rejected'));
 });

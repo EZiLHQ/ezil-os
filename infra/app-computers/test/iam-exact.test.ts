@@ -50,7 +50,7 @@ function expectedController(userDataOpen: boolean) {
         ...(userDataOpen ? [
             { Effect: 'Allow', Action: 'ec2:ModifyInstanceAttribute', Resource: ec2('instance/*'),
                 Condition: { StringEquals: { ...REGION_EQ, ...MANAGED, 'ec2:Attribute': 'userData' } } },
-            { Effect: 'Deny', Action: 'ec2:ModifyInstanceAttribute', Resource: '*', Condition: { StringNotEquals: { 'ec2:Attribute': 'userData' } } },
+            { Effect: 'Deny', Action: 'ec2:ModifyInstanceAttribute', Resource: '*', Condition: { 'ForAnyValue:StringNotEquals': { 'ec2:Attribute': 'userData' } } },
             { Effect: 'Deny', Action: 'ec2:ModifyInstanceAttribute', Resource: '*', Condition: { Null: { 'ec2:Attribute': 'true' } } },
         ] : []),
         { Effect: 'Allow', Action: ['kms:Decrypt', 'kms:Encrypt', 'kms:GenerateDataKeyWithoutPlaintext', 'kms:ReEncrypt*', 'kms:DescribeKey'],
@@ -77,7 +77,7 @@ test('controller policy with userData delivery verified: allow userData only, de
 });
 
 const GITHUB = { name: 'github' as const, providerArn: `arn:aws:iam::${A}:oidc-provider/token.actions.githubusercontent.com`,
-    issuerHost: 'token.actions.githubusercontent.com', audience: 'sts.amazonaws.com', subject: 'repo:ezilhq@1/ezil-os@2:environment:production' };
+    issuerHost: 'token.actions.githubusercontent.com', audience: 'sts.amazonaws.com', subject: 'repo:<org>@<orgId>/<repo>@<repoId>:environment:<env>' };
 const VERSION = `arn:aws:states:${R}:${A}:stateMachine:ezil-lifecycle:1`;
 test('item 9: app caller can only start the exact lifecycle version and describe EC2 in region', () => {
     assert.deepEqual(json(appCallerStatements(R, [VERSION])), [
@@ -86,7 +86,7 @@ test('item 9: app caller can only start the exact lifecycle version and describe
     ]);
     assert.throws(() => appCallerStatements(R, [VERSION.replace(/:1$/, '')]), /invalid_version_arn/);
     assert.equal(AppCallerConfigSchema.parse({}).enabled, false, 'disabled by default');
-    for (const bad of [{ ...GITHUB, subject: 'repo:ezilhq/*' }, { ...GITHUB, issuerHost: 'oidc.vercel.com/team' }])
+    for (const bad of [{ ...GITHUB, subject: 'repo:<org>/*' }, { ...GITHUB, issuerHost: 'oidc.vercel.com/team' }])
         assert.equal(AppCallerConfigSchema.safeParse({ enabled: true, providers: [bad] }).success, false);
     assert.equal(AppCallerConfigSchema.safeParse({ enabled: true, providers: [] }).success, false);
 });

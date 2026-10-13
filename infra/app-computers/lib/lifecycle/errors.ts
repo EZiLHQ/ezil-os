@@ -23,6 +23,10 @@ const throttleMessages = [/request limit exceeded/i, /rate exceeded/i];
 /** The request may or may not have taken effect: only observation can tell. */
 const uncertainNames = new Set(['States.Timeout', 'States.HeartbeatTimeout']);
 const uncertainText = [/InternalError/, /ServiceUnavailable/, /\bUnavailable\b/, /Status Code: 5\d\d/];
+/** Client or transport failures: the request may have reached EC2, so observe. */
+const transportText = [/Unable to execute HTTP request/i, /connection (?:reset|refused|closed)/i, /ECONNRESET|ETIMEDOUT|EPIPE/,
+    /SdkClientException/, /(?:read|connect) timed out/i];
+const hasStatus = (text: string) => /Status Code: \d{3}/.test(text);
 
 export type ProviderErrorClass = { kind: 'none' } | { kind: 'capacity'; code: string } | { kind: 'throttled' }
     | { kind: 'uncertain' } | { kind: 'failed'; code: string };
@@ -37,6 +41,9 @@ export function classifyProviderError(e: RecordedError): ProviderErrorClass {
     if (capacityMessages.some(r => r.test(text))) return { kind: 'capacity', code: 'InsufficientCapacity' };
     if (THROTTLE_CODES.some(code => text.includes(code)) || throttleMessages.some(r => r.test(text))) return { kind: 'throttled' };
     if (uncertainNames.has(e.Error) || uncertainText.some(r => r.test(text))) return { kind: 'uncertain' };
+    if (transportText.some(r => r.test(text))) return { kind: 'uncertain' };
+    // A generic task failure with no HTTP status never proves EC2 refused it.
+    if (e.Error === 'States.TaskFailed' && !hasStatus(text)) return { kind: 'uncertain' };
     // A definite rejection (UnauthorizedOperation, IncorrectInstanceState, ...)
     // fails fast with its code instead of waiting for the deadline.
     return { kind: 'failed', code: errorCode(e) };
