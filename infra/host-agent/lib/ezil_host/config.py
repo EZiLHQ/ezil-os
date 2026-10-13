@@ -33,8 +33,14 @@ DEFAULTS = {
              "flushTimeoutSeconds": 120},
     "shutdownCmd": ["/usr/sbin/shutdown", "-h", "now"],
     "stopWarnSeconds": 60,
-    # cloud-init's cached copies of user data (they hold the nonce); wiped after use
-    "userDataCopies": ["/var/lib/cloud/instance/user-data.txt", "/var/lib/cloud/instance/user-data.txt.i"],
+    # cloud-init's cached copies of user data (they hold the nonce); globs; wiped after use.
+    # obj.pkl is cloud-init's pickled datasource cache (it embeds the raw user data); it is
+    # a cache that cloud-init rebuilds when missing. instance-data-sensitive.json is the
+    # root-only instance-data dump. See README "cloud-init" for what is verified.
+    "userDataCopies": ["/var/lib/cloud/instances/*/user-data.txt", "/var/lib/cloud/instances/*/user-data.txt.i",
+                       "/var/lib/cloud/instances/*/obj.pkl", "/var/lib/cloud/instance/obj.pkl",
+                       "/var/lib/cloud/instance/user-data.txt", "/var/lib/cloud/instance/user-data.txt.i",
+                       "/run/cloud-init/instance-data-sensitive.json"],
 }
 
 

@@ -25,6 +25,9 @@ agent e data-down >/dev/null
 # --- successful enrollment (new epoch, new nonce)
 userdata e 1 2 false; agent e lease >/dev/null; agent e guard >/dev/null; : > "$H/stub/enroll-requests.jsonl"
 cp "$H/stub/user-data" "$H/cloud/user-data.txt"      # what cloud-init would have cached
+mkdir -p "$H/cloud/instances/i-0abc/sem" "$H/cloud/run"
+for f in user-data.txt user-data.txt.i obj.pkl; do cp "$H/stub/user-data" "$H/cloud/instances/i-0abc/$f"; done
+cp "$H/stub/user-data" "$H/cloud/run/instance-data-sensitive.json"; echo keep > "$H/cloud/instances/i-0abc/sem/config_x"; echo keep > "$H/cloud/instances/i-0abc/datasource"
 check "enroll succeeds over verified TLS (test CA, SNI app.ezil.test)" agent e enroll
 REQ="$(tail -n 1 "$H/stub/enroll-requests.jsonl")"
 check "request = {computerId, generation, leaseEpoch, nonce, identityDocument, signature}" \
@@ -33,6 +36,9 @@ TOKEN="$(jq -r .tunnelToken "$H/stub/issue.json")"
 check "token stored host-only: state dir 0700, file 0600, bound to (gen 1, epoch 2)" bash -c "[ \$(stat -c %a '$H/state') = 700 ] && [ \$(stat -c %a '$H/state/tunnel.json') = 600 ] && jq -e '.generation==1 and .leaseEpoch==2' '$H/state/tunnel.json'"
 check "token appears nowhere on the data volume" bash -c "! grep -rqs -- '$TOKEN' '$D'"
 check "cloud-init's cached user-data copy (holds the nonce) wiped" test ! -e "$H/cloud/user-data.txt"
+check "cloud-init per-instance copies wiped (user-data.txt, .i, obj.pkl, instance-data-sensitive.json)" bash -c "[ -z \"\$(ls '$H/cloud/instances/i-0abc' | grep -E 'user-data|obj.pkl')\" ] && [ ! -e '$H/cloud/run/instance-data-sensitive.json' ]"
+check "cloud-init's other state untouched (sem/, datasource)" bash -c "[ -e '$H/cloud/instances/i-0abc/sem/config_x' ] && [ -e '$H/cloud/instances/i-0abc/datasource' ]"
+check "no copy of the nonce left anywhere on the host test tree" bash -c "! grep -rqs -- \"\$(jq -r .nonce '$H/stub/user-data')\" '$H/cloud' '$H/run' '$H/state'"
 check "nonce wiped from local lease state after use" jq -e '(has("nonce")|not) and .nonceConsumed' "$H/run/lease.json"
 tls_probe() { python3 -c "
 import sys; sys.path.insert(0, '$HA/lib')

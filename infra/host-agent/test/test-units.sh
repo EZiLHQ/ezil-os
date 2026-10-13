@@ -54,4 +54,14 @@ check "seccomp.json is reproducible from gen-seccomp.py" bash -c "python3 '$HA/s
 check "AppArmor profile parses" apparmor_parser -Q -K "$HA/security/apparmor-ezil-desktop"
 check "AMI recipe: no secrets, no AWS CLI calls, pinned cloudflared checksum" bash -c "
 f='$HA/ami/build-host-ami.sh'; [ -f \$f ] && ! grep -nE '(^|[^-])aws [a-z]|AKIA|SECRET|PASSWORD=' \$f && grep -q "CLOUDFLARED_SHA256:?" \$f && grep -q 'sha256sum -c' \$f"
+AMI="$HA/ami/build-host-ami.sh"
+check "AMI: every apt install is version-pinned" bash -c "! grep -E '^ *apt-get install' '$AMI' | grep -vE '\"\\\$\{PINS\[@\]\}\"|docker.io=' | grep -q ."
+check "AMI: each pin names an exact version" bash -c "grep -cE '^  \"[a-z0-9.-]+=\\\$\{PIN_[A-Z0-9_]+:-[^}]+\}\"$' '$AMI' | grep -qx 9"
+check "AMI: pinned packages held; refuses a non-noble base" bash -c "grep -q 'apt-mark hold' '$AMI' && grep -q 'VERSION_CODENAME:-}\" = noble' '$AMI'"
+check "AMI: cloud-init seed/cache from the build instance cleaned; user data not acted on" bash -c "grep -q 'cloud-init clean --logs --seed' '$AMI' && grep -q 'allow_userdata: false' '$AMI'"
+check "AMI: container DNS listener configured on the veth host address" grep -q 'DNSStubListenerExtra=10.200.0.1' "$AMI"
+check "agent default scrubs every cloud-init user-data copy (incl. obj.pkl)" py "
+from ezil_host import config
+c=config.DEFAULTS['userDataCopies']
+assert '/var/lib/cloud/instances/*/obj.pkl' in c and '/run/cloud-init/instance-data-sensitive.json' in c and '/var/lib/cloud/instances/*/user-data.txt.i' in c"
 summary "units + pure functions"

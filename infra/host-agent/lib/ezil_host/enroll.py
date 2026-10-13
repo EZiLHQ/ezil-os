@@ -11,6 +11,7 @@ The nonce is single-use (the app clears it by compare-and-swap): the client neve
 retries an enrollment with a nonce that was already sent and got an answer.
 """
 import base64
+import glob
 import json
 import os
 
@@ -80,8 +81,9 @@ def wipe_nonce(cfg, lease):
     lease.pop("nonce", None)
     lease["nonceConsumed"] = True
     _write_private(os.path.join(cfg.runDir, "lease.json"), json.dumps(lease).encode())
-    for copy in cfg.get("userDataCopies") or []:
-        wipe(copy)
+    for pattern in cfg.get("userDataCopies") or []:
+        for copy in sorted(glob.glob(pattern)):
+            wipe(copy)
     return lease
 
 

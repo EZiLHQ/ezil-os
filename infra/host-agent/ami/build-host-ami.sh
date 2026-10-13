@@ -23,10 +23,28 @@ CLOUDFLARED_SHA256="${CLOUDFLARED_SHA256:?CLOUDFLARED_SHA256 is required (no def
 [[ "$ENROLL_URL" == https://* ]] || { echo "ENROLL_URL must be https" >&2; exit 1; }
 export DEBIAN_FRONTEND=noninteractive
 
-# 1. host packages (Ubuntu archive; versions recorded in the build log)
-apt-get update -q
-apt-get install -y -q runc python3 util-linux e2fsprogs apparmor apparmor-utils jq iproute2 iptables nvme-cli
-dpkg-query -W runc python3 util-linux apparmor | tee /etc/ezil-host-packages.txt
+# 1. host packages, PINNED (Ubuntu 24.04 "noble"). The defaults are the exact versions the
+#    I4 tests ran against. A pin that is no longer in the archive FAILS the build: bump it
+#    in review, or set UBUNTU_SNAPSHOT (snapshot.ubuntu.com, e.g. 20261013T000000Z) to
+#    install from a fixed point in time. Overridable only by explicit environment.
+. /etc/os-release
+[ "${VERSION_CODENAME:-}" = noble ] || { echo "base image must be Ubuntu 24.04 (noble), got ${VERSION_CODENAME:-?}" >&2; exit 1; }
+PINS=(
+  "runc=${PIN_RUNC:-1.3.4-0ubuntu1~24.04.1}"
+  "python3=${PIN_PYTHON3:-3.12.3-0ubuntu2.1}"
+  "util-linux=${PIN_UTIL_LINUX:-2.39.3-9ubuntu6.6}"
+  "e2fsprogs=${PIN_E2FSPROGS:-1.47.0-2.4~exp1ubuntu4.1}"
+  "apparmor=${PIN_APPARMOR:-4.0.1really4.0.1-0ubuntu0.24.04.6}"
+  "jq=${PIN_JQ:-1.7.1-3ubuntu0.24.04.2}"
+  "iproute2=${PIN_IPROUTE2:-6.1.0-1ubuntu6.3}"
+  "iptables=${PIN_IPTABLES:-1.8.10-3ubuntu2}"
+  "nvme-cli=${PIN_NVME_CLI:-2.8-1ubuntu0.1}"
+)
+SNAP=(); [ -n "${UBUNTU_SNAPSHOT:-}" ] && SNAP=(--snapshot "$UBUNTU_SNAPSHOT")
+apt-get update -q "${SNAP[@]}"
+apt-get install -y -q --no-install-recommends "${SNAP[@]}" "${PINS[@]}"
+apt-mark hold runc python3 util-linux e2fsprogs apparmor jq iproute2 iptables nvme-cli >/dev/null
+dpkg-query -W runc python3 util-linux e2fsprogs apparmor jq iproute2 iptables nvme-cli | tee /etc/ezil-host-packages.txt
 
 # 2. cloudflared, pinned and checksum-verified
 tmp="$(mktemp -d)"
@@ -48,7 +66,7 @@ jq -n --arg u "$ENROLL_URL" '{enrollUrl: $u, networkMode: "veth-nat"}' > /etc/ez
 install -d -m 0700 /var/lib/ezil-host
 
 # 4. desktop image rootfs by digest -> lower; record lowerImageDigest
-apt-get install -y -q docker.io
+apt-get install -y -q --no-install-recommends "${SNAP[@]}" "docker.io=${PIN_DOCKER_IO:-29.1.3-0ubuntu3~24.04.2}"
 extract() { # extract <ref@digest> <expected image id>
   docker pull "$1"
   local id; id="$(docker image inspect --format '{{.Id}}' "$1")"
@@ -65,12 +83,21 @@ cp "/var/lib/ezil/lowers/${DESKTOP_IMAGE_ID#sha256:}.image-config.json" /etc/ezi
 if [ -n "${PREVIOUS_DESKTOP_IMAGE_REF:-}" ]; then extract "$PREVIOUS_DESKTOP_IMAGE_REF" "${PREVIOUS_DESKTOP_IMAGE_ID:?}"; fi
 apt-get purge -y -q docker.io && rm -rf /var/lib/docker /var/lib/containerd
 
-# 5. user data is data, not a script; cloud-init must not run or keep it
+# 5. user data is data, not a script: cloud-init must not act on it. cloud-init still
+#    CACHES it (instances/<id>/user-data.txt*, obj.pkl, /run/cloud-init/
+#    instance-data-sensitive.json); the agent wipes those copies after enrollment
+#    (agent.json userDataCopies). Remove anything baked from the build instance's own boot.
 cat > /etc/cloud/cloud.cfg.d/99-ezil-host.cfg <<'CFG'
 allow_userdata: false
 CFG
+cloud-init clean --logs --seed
 
-# 6. enable the host chain
+# 6. the container's DNS resolver (veth-nat): systemd-resolved also answers on the host
+#    end of the veth, 10.200.0.1:53 (the agent allows only that from the container).
+install -d /etc/systemd/resolved.conf.d
+printf '[Resolve]\nDNSStubListenerExtra=10.200.0.1\n' > /etc/systemd/resolved.conf.d/90-ezil-container.conf
+
+# 7. enable the host chain
 systemctl daemon-reload
 systemctl enable ezil-host.target ezil-lease.service ezil-guard.service ezil-host-clean.service \
   ezil-overlay.service ezil-desktop.service ezil-enroll.service ezil-cloudflared.service ezil-agent.service

@@ -64,7 +64,8 @@ host_new() {
  "cgroupsPath": "system.slice:${TAG}:$h", "networkMode": "none",
  "idle": {"inactivitySeconds": 3, "load1Busy": 1000, "intervalSeconds": 1, "flushTimeoutSeconds": 20},
  "shutdownCmd": ["$HA/test/stub-shutdown", "$H/run/shutdown-called"], "stopWarnSeconds": 1,
- "userDataCopies": ["$H/cloud/user-data.txt"]}
+ "userDataCopies": ["$H/cloud/user-data.txt", "$H/cloud/instances/*/user-data.txt", "$H/cloud/instances/*/user-data.txt.i",
+                    "$H/cloud/instances/*/obj.pkl", "$H/cloud/run/instance-data-sensitive.json"]}
 EOF
     printf '#!/bin/sh\nSTUB_CF_DIR=%s exec %s "$@"\n' "$H/stub" "$HA/test/stub-cloudflared" > "$H/stub/cloudflared"
     chmod 755 "$H/stub/cloudflared"
