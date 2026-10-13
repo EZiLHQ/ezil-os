@@ -4,11 +4,11 @@ import type { Construct } from 'constructs';
 import { z } from 'zod';
 import { REGION_PATTERN } from './lifecycle/deployment.js';
 import { BACKUP_TAG } from './lifecycle/contract.js';
-import { workloadPath } from './workload-identity.js';
+import { NamespaceSchema } from './lifecycle/deployment.js';
 
 /** I6 operational guardrails. Alerts only: nothing here stops or deletes. */
 export const OpsConfigSchema = z.object({
-    namespace: z.string().regex(/^[a-z][a-z0-9-]{0,20}$/),
+    namespace: NamespaceSchema,
     accountId: z.string().regex(/^\d{12}$/),
     region: z.string().regex(REGION_PATTERN),
     /** Monthly cost budget in USD; alerts at 50/80/100 % of actual spend. */
@@ -26,14 +26,19 @@ export const SNAPSHOT_INTERVAL_HOURS = 12, SNAPSHOT_RETAIN_COUNT = 14;
  * snapshots created by its own policies. */
 export const dlmRoleArn = (accountId: string) => `arn:aws:iam::${accountId}:role/service-role/AWSDataLifecycleManagerDefaultRole`;
 
+/** Founder-owned operator objects live here, outside every bounded path. */
+export const OPERATOR_PATH = '/ezil/operators/';
 /** §4 kill switch. Attached by an operator to the lifecycle controller role and
  * the recovery reconciler's role; detached to lift it. Graceful StopInstances
- * stays allowed; nothing deletes a volume. Exported for exact-equality tests. */
+ * stays allowed; nothing deletes a volume. It is authoritative only because
+ * the ops stack is founder-deployed: no bounded principal can create, change,
+ * attach or detach it. Exported for exact-equality tests. */
 export function killSwitchStatements(): iam.PolicyStatement[] {
     return [
         new iam.PolicyStatement({ sid: 'KillSwitchNoCompute', effect: iam.Effect.DENY, resources: ['*'],
-            actions: ['ec2:RunInstances', 'ec2:StartInstances', 'ec2:AttachVolume'] }),
-        new iam.PolicyStatement({ sid: 'KillSwitchNoWorkflows', effect: iam.Effect.DENY, resources: ['*'], actions: ['states:StartExecution'] }),
+            actions: ['ec2:RunInstances', 'ec2:StartInstances', 'ec2:AttachVolume', 'ec2:CreateVolume', 'ec2:CreateFleet', 'ec2:RequestSpot*'] }),
+        new iam.PolicyStatement({ sid: 'KillSwitchNoWorkflows', effect: iam.Effect.DENY, resources: ['*'],
+            actions: ['states:StartExecution', 'states:StartSyncExecution', 'states:RedriveExecution'] }),
     ];
 }
 
@@ -52,7 +57,7 @@ export class OpsStack extends Stack {
             actions: ['sns:Publish'], resources: [this.topic.topicArn],
             conditions: { StringEquals: { 'aws:SourceAccount': a }, ArnLike: { 'aws:SourceArn': sourceArn } } });
         this.topic.addToResourcePolicy(publisher('cloudwatch.amazonaws.com', `arn:aws:cloudwatch:${c.region}:${a}:alarm:ezil-${c.namespace}-*`));
-        this.topic.addToResourcePolicy(publisher('budgets.amazonaws.com', `arn:aws:budgets::${a}:*`));
+        this.topic.addToResourcePolicy(publisher('budgets.amazonaws.com', `arn:aws:budgets::${a}:budget/ezil-${c.namespace}-monthly`));
 
         // R3: 12-hourly snapshots, 14 kept, of data volumes carrying this
         // namespace's backup tag (set only at creation; root disks lack it).
@@ -93,7 +98,7 @@ export class OpsStack extends Stack {
         });
 
         const killSwitch = new iam.ManagedPolicy(this, 'KillSwitch', { managedPolicyName: `ezil-${c.namespace}-kill-switch`,
-            path: workloadPath(c.namespace), description: 'Attach to the lifecycle controller and reconciler roles to stop all compute starts',
+            path: OPERATOR_PATH, description: 'Attach to the lifecycle controller and reconciler roles to stop all compute starts',
             document: new iam.PolicyDocument({ statements: killSwitchStatements() }) });
         new CfnOutput(this, 'AlertTopicArn', { value: this.topic.topicArn });
         new CfnOutput(this, 'KillSwitchPolicyArn', { value: killSwitch.managedPolicyArn });

@@ -1,4 +1,5 @@
-import { Aspects, CliCredentialsStackSynthesizer, type IAspect, type Stack, aws_iam as iam } from 'aws-cdk-lib';
+import { Aspects, CliCredentialsStackSynthesizer, Tags, type IAspect, type Stack, aws_iam as iam } from 'aws-cdk-lib';
+import { NAMESPACE_TAG } from './identity.js';
 import type { IConstruct } from 'constructs';
 import { z } from 'zod';
 
@@ -6,7 +7,7 @@ import { z } from 'zod';
  * the workload path and carry the boundary, and its assets go to the identity
  * stack's bucket (no CDK bootstrap). */
 export const WorkloadDeploySchema = z.object({
-    assetBucketName: z.string().regex(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/),
+    assetBucketName: z.string().regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/),
 }).strict();
 export type WorkloadDeploy = z.infer<typeof WorkloadDeploySchema>;
 
@@ -22,8 +23,13 @@ class RolePath implements IAspect {
     constructor(private readonly path: string) {}
     visit(node: IConstruct) { if (node instanceof iam.CfnRole) node.path = this.path; }
 }
-/** Every role in the stack: workload path + permission boundary. */
+/** Every taggable resource carries the namespace tag the execution role's
+ * EC2 and KMS rights are conditioned on. */
+export function tagWorkload(stack: Stack, namespace: string) { Tags.of(stack).add(NAMESPACE_TAG, namespace); }
+/** Every role in the stack: workload path + permission boundary; every
+ * resource: the namespace tag. */
 export function applyWorkloadIdentity(stack: Stack, accountId: string, namespace: string) {
+    tagWorkload(stack, namespace);
     Aspects.of(stack).add(new RolePath(workloadPath(namespace)));
     iam.PermissionsBoundary.of(stack).apply(iam.ManagedPolicy.fromManagedPolicyArn(stack, 'WorkloadBoundary', boundaryArn(accountId, namespace)));
 }

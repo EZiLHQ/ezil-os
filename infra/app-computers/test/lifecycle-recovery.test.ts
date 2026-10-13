@@ -13,7 +13,7 @@ import { toLambdaError } from '../lib/lifecycle/errors.js';
 function fixture(operation: Parameters<typeof lifecycleFixture>[0] = 'provision', allocated = true) {
     const f = lifecycleFixture(operation);
     const settings: RecoverySettings = { lifecycle: f.settings,
-        recoveryVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-lifecycle-recovery:1' };
+        recoveryVersionArn: 'arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-recovery:1' };
     const name = `cleanup-computer-${f.i.jobId}`;
     const arn = machineArn(settings.recoveryVersionArn).replace(':stateMachine:', ':execution:') + ':' + name;
     const source = { ...f.state.execution, status: 'FAILED', startDate: new Date(f.state.now - 120000), stopDate: new Date(f.state.now - 61000) };

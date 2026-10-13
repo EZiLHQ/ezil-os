@@ -11,7 +11,7 @@ export function lifecycleFixture(operation:LifecycleIntent['operation']='provisi
         amiId:'ami-11111111111111111',namespace:'pilot',instanceTypes:['m6i.large','c6i.xlarge'] as ('m6i.large'|'c6i.xlarge')[],
         storage:{rootGiB:20,dataMinGiB:20,dataMaxGiB:100},
         dataKeyArn:`arn:aws:kms:${REGION}:123456789012:key/11111111-1111-4111-8111-111111111111`,
-        stateMachineVersionArn:`arn:aws:states:${REGION}:123456789012:stateMachine:ezil-lifecycle:1`};
+        stateMachineVersionArn:`arn:aws:states:${REGION}:123456789012:stateMachine:ezil-pilot-lifecycle:1`};
     const settings=SettingsSchema.parse({deployment,features:{userDataNonce:options.userDataNonce??false},authorityOrigin:'https://control.example',
         authoritySecretArn:`arn:aws:secretsmanager:${REGION}:123456789012:secret:ezil/lifecycle-key-abcdef`});
     const instanceType=options.instanceType??'m6i.large',dataVolumeGiB=operation==='provision'?options.dataVolumeGiB??20:null;
