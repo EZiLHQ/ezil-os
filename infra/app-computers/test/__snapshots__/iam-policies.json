@@ -79,7 +79,7 @@
           "Action": "lambda:InvokeFunction",
           "Effect": "Allow",
           "Resource": {
-            "Ref": "LifecycleObserverCurrentVersion3A1B23A0ca4627c0f140ff41cc123e9e7c7bf52c"
+            "Ref": "LifecycleObserverCurrentVersion3A1B23A0<code-hash>"
           }
         },
         {
@@ -908,7 +908,7 @@
           "Action": "lambda:InvokeFunction",
           "Effect": "Allow",
           "Resource": {
-            "Ref": "RecoveryObserverCurrentVersion680AB0D7e46923f596ed75089bb7b7ff05b11369"
+            "Ref": "RecoveryObserverCurrentVersion680AB0D7<code-hash>"
           }
         },
         {

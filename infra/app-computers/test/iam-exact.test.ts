@@ -121,7 +121,9 @@ test('every role, key, queue and invoke policy in the synthesized stacks equals 
     new ComputerLifecycleRecovery(stack, 'Recovery', { settings: { lifecycle: f.settings,
         recoveryVersionArn: `arn:aws:states:${R}:${A}:stateMachine:ezil-lifecycle-recovery:1` }, sourceHistoryKey: lifecycle.historyKey });
     new AppCaller(stack, 'AppCaller', { config: { enabled: true, providers: [GITHUB] }, region: R, versionArns: [f.settings.deployment.stateMachineVersionArn] });
-    const actual = policies(stack), file = join(__dirname, '__snapshots__', 'iam-policies.json');
+    // Lambda version logical IDs embed the code hash; normalize them so the
+    // snapshot changes only when a policy changes, not when handler code does.
+    const actual = JSON.parse(JSON.stringify(policies(stack)).replace(/CurrentVersion([A-F0-9]{8})[a-f0-9]{32}/g, 'CurrentVersion$1<code-hash>')), file = join(__dirname, '__snapshots__', 'iam-policies.json');
     if (process.env.UPDATE_IAM_SNAPSHOT === '1') writeFileSync(file, JSON.stringify(actual, null, 2) + '\n');
     assert.ok(existsSync(file), 'snapshot missing: run UPDATE_IAM_SNAPSHOT=1 npm test and review it');
     assert.deepEqual(actual, JSON.parse(readFileSync(file, 'utf8')));
