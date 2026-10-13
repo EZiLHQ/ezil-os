@@ -56,7 +56,7 @@ mutate M26 lib/ezil_host/agent.py 'MAX_FUTURE = 5 ' 'MAX_FUTURE = 120 ' test-enr
 mutate M27 lib/ezil_host/desktop.py 'BLOCKED = ["169.254.0.0/16", ' 'BLOCKED = [' test-network.sh "169.254.10.10 (other link-local) unreachable"
 mutate M28 lib/ezil_host/desktop.py '"10.0.0.0/8", "172.16.0.0/12"' '"172.16.0.0/12"' test-network.sh "RFC1918 peer 10.0.0.2 unreachable"
 mutate M29 lib/ezil_host/desktop.py '"-p", "udp", "--dport", "53", "-j", "ACCEPT"]' '"-p", "udp", "--dport", "53", "-j", "DROP"]' test-network.sh "DNS works through the host resolver"
-mutate M30 lib/ezil_host/desktop.py '        if _chain_ok(cfg, table, chain, rules):
+mutate M30 lib/ezil_host/desktop.py '        if _chain_ok(cfg, tool, table, chain, rules):
             continue' '' test-network.sh "net-ensure again changes nothing"
 mutate M31 lib/ezil_host/desktop.py '           ["-i", HOST_IF, "-j", "DROP"]]' '           ]' test-network.sh "host's own non-DNS port unreachable"
 mutate M32 lib/ezil_host/rebase.py '        if on("3") and is_owned(rel):' '        if (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)) and on("3") and is_owned(rel):' test-hostile.sh "FIFO and device node at image-owned paths are moved aside"
