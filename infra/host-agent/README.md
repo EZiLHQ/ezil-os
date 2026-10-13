@@ -128,8 +128,9 @@ It bakes in no secrets: `agent.json` holds only the enrollment URL. It was **not
 Run as root on a Linux host with Docker, runc, AppArmor and the `ezil-final` image:
 
 ```
-test/test-units.sh  test/test-guard.sh  test/test-hostile.sh  test/test-enroll-tunnel.sh
-test/test-rebase.sh test/test-boot.sh   test/mutate.sh
+test/run-all.sh       # cleanup -> units, guard, hostile, enroll/tunnel, rebase, full boot, worker test
+test/mutate.sh        # mutation proof (--quick skips the two full-boot mutants); MUT_ONLY="M2 M9"
+test/cleanup.sh       # removes every container, mount, loop device, netns, profile and scratch
 ```
 
 **What is real:**
@@ -143,6 +144,30 @@ test/test-rebase.sh test/test-boot.sh   test/mutate.sh
 
 The container network is loopback only, and no ports are published. Scratch goes under
 `/var/tmp/ezil-host-fb25d9f4`.
+
+**Mutation proof** (`test/mutate.sh`). Each mutant is applied to a throwaway copy of this
+directory, and it counts as killed only if the named check fails.
+
+| # | Mutation | Killed by |
+|---|---|---|
+| M1 | guard: epoch check removed | `test-guard`: same epoch replayed |
+| M2 | guard: device fs-UUID check removed | `test-guard`: forged/copied marker that agrees with the lease |
+| M3 | guard: generation-ahead check removed | `test-guard` |
+| M4 | guard: digest mismatch accepted without receipt | `test-guard` |
+| M5 | downstream units: stamp check removed | `test-guard`: steps refuse without a stamp |
+| M6 | durable write: fsync(tmp) removed | `test-guard`: strace order |
+| M7 | fsops: `O_NOFOLLOW` removed | `test-hostile`: symlinked profiles/chrome |
+| M8 | rebase: move-aside → delete | `test-rebase`: collisions preserved |
+| M9 | rebase: open non-regular dpkg status | `test-hostile`: FIFO never opened |
+| M10 | rebase: failure swallowed | `test-rebase`: fault → `rebase_failed` |
+| M11 | overlay without `nodev` | `test-hostile` (static; the `nodev` behaviour itself is shown by the control case) |
+| M12 | tunnel: token not wiped on fence | `test-enroll-tunnel` |
+| M13 | enroll: nonce kept after an answer | `test-enroll-tunnel` |
+| M14 | control: HMAC check removed | `test-enroll-tunnel` |
+| M15 | control: epoch check removed | `test-enroll-tunnel` |
+| M16 | unit `Requires=` → `Wants=` | `test-units` |
+| M17 | idle: dpkg-lock busy check removed | `test-boot` (real desktop) |
+| M18 | spec: `noNewPrivileges` false | `test-boot` |
 
 `worker/src/neko-persistent-profiles.test.ts` (bun) executes the real `start-neko.sh`
 profile block. It fails against the pre-change script.
