@@ -298,10 +298,11 @@ describe('runAdmission (transactional)', () => {
         });
 
         it('create records the session user as owner, lower-cased, whatever ezil_computers says later', async () => {
-            const { db, placements } = createFakePlacementDb({ computers: [{ id: C1, user_id: U1 }] });
-            const r = await runAdmission(db, { kind: 'create', userId: U1.toUpperCase(), computerId: C1 }, deps);
-            expect(r).toMatchObject({ admitted: true, placement: { ownerUserId: U1 } });
-            expect(placements[0]!.owner_user_id).toBe(U1);
+            const UA = 'abcdefab-cdef-4abc-8def-abcdefabcdef'; // letters, so case actually matters
+            const { db, placements } = createFakePlacementDb({ computers: [{ id: C1, user_id: UA }] });
+            const r = await runAdmission(db, { kind: 'create', userId: UA.toUpperCase(), computerId: C1 }, deps);
+            expect(r).toMatchObject({ admitted: true, placement: { ownerUserId: UA } });
+            expect(placements[0]!.owner_user_id).toBe(UA);
         });
     });
 

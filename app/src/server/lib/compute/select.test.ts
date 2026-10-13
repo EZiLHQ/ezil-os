@@ -96,8 +96,9 @@ describe('resolveComputeProvider', () => {
     });
 
     it('the owner matches case-insensitively', async () => {
-        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: computerId })] });
-        expect((await resolveComputeProvider(db, { userId: userId.toUpperCase(), computerId }, ON)).kind).toBe('aws-ec2');
+        const UA = 'abcdefab-cdef-4abc-8def-abcdefabcdef';
+        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: computerId, owner_user_id: UA })] });
+        expect((await resolveComputeProvider(db, { userId: UA.toUpperCase(), computerId }, ON)).kind).toBe('aws-ec2');
     });
 
     it('selectComputeProvider (existing callers) is unchanged', () => {
