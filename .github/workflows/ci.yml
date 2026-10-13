@@ -428,6 +428,26 @@ jobs:
   # `sdk/node_modules/@types`, and its `typecheck` script (`tsc --noEmit`)
   # needs `tsc` itself resolved from `sdk/node_modules/.bin` on PATH (O2's
   # 2026-09-04 hand-off). So: install `sdk/`, put its `.bin` on PATH, run.
+  # AWS persistent-computer infrastructure (infra/app-computers): typecheck,
+  # unit + graph + exact-IAM tests, and every CDK synth. Fully offline: the
+  # synth scripts blank the AWS credential chain and never look anything up.
+  # No secrets and no AWS credentials, ever; deploys are founder-gated.
+  computer-infrastructure:
+    name: computer infrastructure (typecheck + test + synth)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.15.0'
+      - name: Install
+        shell: bash
+        working-directory: infra/app-computers
+        run: npm ci --no-audit --no-fund
+      - name: Typecheck, test, offline synth
+        shell: bash
+        run: bash tools/test.sh infra
+
   tools:
     name: tools (typecheck + unit)
     runs-on: ubuntu-latest
