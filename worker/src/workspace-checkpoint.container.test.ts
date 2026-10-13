@@ -1308,6 +1308,37 @@ cp /tmp/user.bashrc /etc/bash.bashrc && cp /tmp/user.npmrc "$G"
     expect((await must(c, 'npm config get script-shell')).trim()).toBe('/bin/bash');
   }, T);
 
+  // Review r4254722070: the same restored config on a Guacamole-mode container, which never runs
+  // start-neko.sh. The Worker's post-restore trigger alone must re-add the wiring, append-only.
+  it("the Worker's post-restore trigger re-adds the readiness wiring over a user's restored bash.bashrc and npmrc", async () => {
+    const c = await startComputer('deps-hooks-trigger');
+    await installReadiness(c);
+    await must(c, String.raw`
+set -e
+G="$(npm config get globalconfig)"
+grep -v 'ezil-deps notice' /etc/bash.bashrc | grep -v 'EZiL: dependency-restore' > /tmp/user.bashrc
+printf "alias ezq-ll='ls -l'   # the user's own line, no trailing newline" >> /tmp/user.bashrc
+printf 'registry=https://registry.example.invalid/\n# user comment\nfund=false' > /tmp/user.npmrc
+cp /tmp/user.bashrc /etc/bash.bashrc && cp /tmp/user.npmrc "$G"
+`);
+    expect((await sh(c, 'npm config get script-shell')).stdout.trim()).not.toBe('/usr/local/lib/ezil/npm-script-shell');   // the defect
+    const userSums = await must(c, 'sha256sum < /tmp/user.bashrc; sha256sum < /tmp/user.npmrc');
+    const { restoreDepsCommand } = await import('./restore-deps-command');
+    const trigger = restoreDepsCommand('/workspace');
+    await must(c, `export npm_config_offline=true; ${trigger}`); await must(c, `export npm_config_offline=true; ${trigger}`);   // idempotent
+    const G = (await must(c, 'npm config get globalconfig')).trim();
+    expect(await must(c, `head -c "$(stat -c %s /tmp/user.bashrc)" /etc/bash.bashrc | sha256sum; head -c "$(stat -c %s /tmp/user.npmrc)" ${G} | sha256sum`)).toBe(userSums);
+    expect((await must(c, 'grep -c "ezil-deps notice" /etc/bash.bashrc')).trim()).toBe('1');
+    expect((await must(c, `grep -c "^script-shell=" ${G}`)).trim()).toBe('1');
+    expect((await must(c, 'npm config get script-shell')).trim()).toBe('/usr/local/lib/ezil/npm-script-shell');
+    expect((await must(c, 'npm config get registry')).trim()).toBe('https://registry.example.invalid/');
+    expect(await must(c, 'cat /run/ezil-deps/status 2>/dev/null; test -e /run/ezil-deps/scanned && echo scanned')).toContain('scanned');
+    // A script-shell the user chose is theirs: the trigger never replaces it.
+    await must(c, `printf 'script-shell=/bin/bash\n' > ${G}`);
+    await must(c, `export npm_config_offline=true; ${trigger}`);
+    expect((await must(c, 'npm config get script-shell')).trim()).toBe('/bin/bash');
+  }, T);
+
   // A real Next.js 16 app (finding 4). Packages come from an npm cache the host warmed from the
   // official registry (EZIL_NEXT_NPM_CACHE), copied into the --network none containers, standing
   // in for the registry. The cache is excluded from the snapshot, so B gets its own copy.

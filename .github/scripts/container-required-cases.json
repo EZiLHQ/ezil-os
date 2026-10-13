@@ -53,6 +53,7 @@
     "HOME content that is NOT regenerable still fails visibly as too_large over the limits (never reported saved)",
     "right after a restart: npm run waits for its restoring project and says so; failed, missing, timeout and the terminal notice are explicit",
     "a user's own restored bash.bashrc and npmrc keep their lines; boot re-adds the readiness wiring once",
+    "the Worker's post-restore trigger re-adds the readiness wiring over a user's restored bash.bashrc and npmrc",
     "a real Next.js app in HOME: sources survive a NEW container, deps restore from its lockfile, and an immediate npm run dev waits, then serves",
     "untouched image files whose ctime changed (as on Cloudflare) are NOT captured",
     "an uninstall is saved too: apt remove on the restored computer stays removed on the next one",
