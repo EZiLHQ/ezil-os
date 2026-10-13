@@ -49,6 +49,13 @@
  * the Worker — the only value that satisfies both the `uuid` column and the
  * no-raw-identity rule. Until then, worker/container events join on
  * `correlationId` and the R2 key's `dt=/hh=` layout only.
+ *
+ * 2026-10-11 (live read, Supabase): the drain DOES now run — daily, with a
+ * 13-16 h median lag — and all 898 drained worker/container rows carried the
+ * sentinel user hash and no computer. The real UUID IS now plumbed down for
+ * one class: `persistence` events (docs/PERSISTENCE-SIGNAL-CONTRACT.md) take
+ * it from `/sandbox/preview`'s `projectId`, UUID-checked. Request and
+ * container events are unchanged and still carry no `computerId`.
  */
 
 import type { LogEvent } from './observability';
@@ -67,6 +74,8 @@ export const TELEMETRY_EVENT_CLASSES = [
   'display_failure',
   'worker_exception',
   'contract_violation',
+  // docs/PERSISTENCE-SIGNAL-CONTRACT.md — restore/save outcomes per computer.
+  'persistence',
 ] as const;
 export type TelemetryEventClass = (typeof TELEMETRY_EVENT_CLASSES)[number];
 
@@ -114,13 +123,25 @@ export interface TelemetryEventInput {
    *      whatever the field it sits in is called. The Worker's own precedent
    *      for identity in structured output is a HASH (`userHash`, `u_xxxxxxxx`).
    *
-   * Left unset, deliberately. Worker and container events join by
-   * `correlationId` and by the R2 key's own `dt=/hh=` layout; per-computer
-   * attribution from the worker side needs a real computer UUID to be handed
-   * down from the app, which no route does today. See this module's
-   * `KNOWN GAP` note.
+   * Left unset on request/container events, deliberately: they join by
+   * `correlationId` and by the R2 key's own `dt=/hh=` layout.
+   *
+   * EXCEPTION — `persistence` events (docs/PERSISTENCE-SIGNAL-CONTRACT.md):
+   * the app DOES hand the real computer UUID down, as `/sandbox/preview`'s
+   * `projectId` (`cloudflareGuacamole.previewUrl` sends `input.computerId`).
+   * The Durable Object keeps that value ONLY if it is a UUID
+   * (`isComputerUuid`, `persistence-telemetry.ts`) and stamps it on its
+   * persistence events, so the app's drain can attribute them to the
+   * computer and its owner. Everything above about the sandboxId still holds:
+   * it is never written here.
    */
   computerId?: string;
+  /**
+   * Bounded allow-listed extras — the app strips any key not on the class's
+   * `ATTRS_ALLOW_LIST`. Only `persistence` events set them (contract §2:
+   * counts, size buckets, ages, triggers; never a path, name or command).
+   */
+  attrs?: Record<string, string | number | boolean>;
 }
 
 /**

@@ -18,6 +18,8 @@ import {
     errorRateOverTime,
     fingerprintLeaderboard,
     fingerprintLeaderboardFromRollup,
+    PERSISTENCE_ERROR_CODES,
+    PERSISTENCE_OK_CODES,
     recentTraces,
     spikeDetection,
     traceTimeline,
@@ -69,11 +71,40 @@ describe('Q1 — fingerprintLeaderboard (fleet-wide "what is hurting people now"
         expect(statements[0]!.params).toContain(200);
     });
 
+    it('excludes routine persistence OK events and heartbeats from the raw leaderboard', async () => {
+        const { db, statements } = makeTestDb();
+        await fingerprintLeaderboard(db);
+        // This existing error-only predicate also preserves boot_summary
+        // behavior: successes remain available elsewhere as denominators.
+        expect(statements[0]!.sql.replace(/\s+/g, ' ')).toContain(
+            "AND e.outcome = 'error' AND f.muted_at IS NULL",
+        );
+    });
+
     it('fingerprintLeaderboardFromRollup reads ezil_error_user_hours, not the raw events', async () => {
         const { db, statements } = makeTestDb([]);
         await fingerprintLeaderboardFromRollup(db, { days: 90 });
         expect(statements[0]!.sql).toMatch(/ezil_error_user_hours/);
         expect(statements[0]!.sql).not.toMatch(/ezil_error_events/);
+    });
+
+    it('includes only persistence error codes in rollups without excluding boot_summary successes', async () => {
+        const { db, statements } = makeTestDb();
+        await fingerprintLeaderboardFromRollup(db);
+        const generated = statements[0]!.sql.replace(/\s+/g, ' ');
+        // Rollups do not retain outcome. Only the producer's error codes
+        // qualify for persistence; all other classes keep their behavior.
+        expect(generated).toContain('JOIN ezil_error_fingerprints f USING (fingerprint)');
+        expect(generated).toContain(
+            "AND (f.event_class <> 'persistence' " +
+            "OR f.code IN ($3, $4, $5, $6, $7)) GROUP BY fingerprint",
+        );
+        expect(statements[0]!.params).toEqual([WORKER_SENTINEL_USER_HASH, 90, ...PERSISTENCE_ERROR_CODES, 50]);
+        for (const code of [...PERSISTENCE_OK_CODES, 'too_large', 'stale', 'not_restored', 'no_baseline', 'container_not_hydrated']) {
+            expect(statements[0]!.params).not.toContain(code);
+        }
+        expect(generated).not.toContain('boot_summary');
+        expect(generated).not.toMatch(/\boutcome\b/);
     });
 
     // 🔴 The worker-sentinel exclusion: `errorEvents.userHash` is NOT NULL and
@@ -140,14 +171,31 @@ describe('Q2 — errorRateOverTime: the LEFT JOIN class filter bug the design ca
         expect(classFilterIndex).toBeLessThan(groupByIndex);
     });
 
-    it('omits the class filter entirely with no eventClass given', async () => {
+    it('omits the optional class filter with no eventClass given', async () => {
         const { db, statements } = makeTestDb([]);
         await errorRateOverTime(db, { hours: 24 });
-        expect(statements[0]!.sql).not.toMatch(/event_class/i);
+        expect(statements[0]!.sql).not.toMatch(/event_class\s*=/i);
+    });
+
+    it.each([undefined, 'crash', 'persistence'])('excludes daily persistence batches inside the LEFT JOIN (class %s)', async (eventClass) => {
+        const { db, statements } = makeTestDb();
+        await errorRateOverTime(db, { eventClass });
+        const generated = statements[0]!.sql.replace(/\s+/g, ' ');
+        const join = generated.split('LEFT JOIN ezil_error_events e ')[1]!.split(' GROUP BY')[0]!;
+        expect(join).toContain("AND e.event_class <> 'persistence'");
+        // Exclude both numerator and denominator without losing empty hours.
+        expect(generated.replace(/FILTER \(WHERE [^)]*\)/g, '')).not.toMatch(/\bWHERE\b/);
     });
 });
 
 describe('Q3 — spikeDetection: never divides by zero, needs 3+ users to call a new fingerprint a spike', () => {
+    it('excludes persistence from recent candidates regardless of real user attribution', async () => {
+        const { db, statements } = makeTestDb();
+        await spikeDetection(db);
+        const recent = statements[0]!.sql.replace(/\s+/g, ' ').split('baseline AS (')[0]!;
+        expect(recent).toContain("AND outcome = 'error' AND event_class <> 'persistence' GROUP BY fingerprint");
+    });
+
     it('uses greatest(sd, 1) to guard the z-score division', async () => {
         const { db, statements } = makeTestDb([]);
         await spikeDetection(db);

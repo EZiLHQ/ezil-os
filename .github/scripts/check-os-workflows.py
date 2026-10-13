@@ -141,10 +141,17 @@ assert 'SANDBOX_NEKO_TURN_TTL_SECONDS:$ttl' in preview and 'ttl=1800' in preview
 assert 'EZIL_ACCEPTANCE_SANDBOX' in continuity['env'] or 'EZIL_ACCEPTANCE_HMAC_SECRET' in continuity['env']
 assert '--ttl 10800' in preview
 lease_credentials = [step for step in preview_steps if step.get('uses') == 'aws-actions/configure-aws-credentials@v4']
-assert len(lease_credentials) == 2
+# Initial lease credential + one renewal before each long staging acceptance
+# (continuity gate up to 90 min, HOME persistence up to 45 min), so the lease
+# release at the end of the job never runs on an expired 2 h credential.
+assert len(lease_credentials) == 3
 assert all(step['with']['role-duration-seconds'] == 7200 for step in lease_credentials)
 renew_index = next(i for i, step in enumerate(preview_steps) if step.get('name') == 'Renew staging lease credentials before long acceptance')
 assert preview_steps[renew_index + 1]['name'] == 'Hosted continuity release gate'
+home_renew = next(i for i, step in enumerate(preview_steps) if step.get('name') == 'Renew staging lease credentials before HOME persistence acceptance')
+assert preview_steps[home_renew + 1]['name'] == 'Hosted HOME persistence acceptance'
+# Staging-only, and independent of the continuity gate's outcome (never on cancel).
+assert preview_steps[home_renew]['if'] == preview_steps[home_renew + 1]['if'] == "${{ !cancelled() && needs.trust.outputs.manual_preview != 'true' }}"
 assert 'SANDBOX_NEKO_TURN_TTL_SECONDS' in preview
 assert continuity['if'] == "needs.trust.outputs.manual_preview != 'true'"
 assert next(step for step in preview_steps if step.get('name') == 'Test the returned preview URL')['if'] == continuity['if']

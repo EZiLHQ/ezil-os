@@ -188,3 +188,49 @@ describe('the browser-fix contract §8 rows survive ingest validation', () => {
         expect(stripped).toBeUndefined();
     });
 });
+
+describe('persistence class (docs/PERSISTENCE-SIGNAL-CONTRACT.md §2)', () => {
+    it('keeps exactly the contract attrs keys and strips anything path- or command-like', () => {
+        const kept = sanitizeAttrs('persistence', {
+            entries: 12,
+            size_bucket: 'over_cap',
+            system_age_s: 900,
+            workspace_age_s: -1,
+            consecutive_failures: 3,
+            trigger: 'interval',
+            discarded_unsaved: true,
+            path: '/root/sports-web/node_modules',
+            command: 'npm install',
+            package: 'next',
+        });
+        expect(kept).toEqual({
+            entries: 12,
+            size_bucket: 'over_cap',
+            system_age_s: 900,
+            workspace_age_s: -1,
+            consecutive_failures: 3,
+            trigger: 'interval',
+            discarded_unsaved: true,
+        });
+    });
+
+    it('accepts a persistence event and rejects a non-UUID computerId (the sandboxId must never ride here)', () => {
+        const base = {
+            eventId: '550e8400-e29b-41d4-a716-446655440000',
+            schemaVersion: 1,
+            eventClass: 'persistence',
+            source: 'worker',
+            occurredAt: '2026-10-11T00:00:00.000Z',
+            site: 'persist.system.flush',
+            code: 'too_large',
+            outcome: 'skipped',
+        };
+        expect(parseTelemetryBatch({ schemaVersion: 1, events: [base] }).events).toHaveLength(1);
+        const bad = parseTelemetryBatch({
+            schemaVersion: 1,
+            events: [{ ...base, computerId: 'guac-0123456789abcdef-0123456789abcdef' }],
+        });
+        expect(bad.events).toHaveLength(0);
+        expect(bad.droppedInvalid).toBe(1);
+    });
+});

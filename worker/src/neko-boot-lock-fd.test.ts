@@ -67,6 +67,28 @@ describe('start-neko.sh: the boot mutex must not leak into background jobs', () 
     expect(offenders).toEqual([]);
   });
 
+  it('🔴 a background job mid-line — `( job & ) || true` — closes fd 9 too', () => {
+    // The end-of-line rule above misses `&` followed by more shell: the boot's
+    // dependency restore was launched as `( … & ) || true`, kept fd 9, and so a
+    // troubleshoot restart during a long npm/pnpm restore could not take the lock
+    // (PR195 review r4242108528). Any `&` that is not part of `&&`, `>&`, `<&` or
+    // `&>` is a background operator; its line must close fd 9.
+    const offenders: string[] = [];
+    SRC.split('\n').forEach((line, i) => {
+      // Arithmetic `$(( a & b ))` is a bitwise and, not a job.
+      const code = line.replace(/#.*$/, '').replace(/\$\(\([^)]*\)\)/g, '');
+      for (let j = 0; j < code.length; j++) {
+        if (code[j] !== '&') continue;
+        const before = code[j - 1] ?? '';
+        const after = code[j + 1] ?? '';
+        if (after === '&' || before === '&' || before === '>' || before === '<' || after === '>') continue;
+        if (!code.includes('9>&-')) offenders.push(`${i + 1}: ${line.trim().slice(0, 100)}`);
+        break;
+      }
+    });
+    expect(offenders).toEqual([]);
+  });
+
   it('the three known background jobs are all still covered', () => {
     // A zero-match regex above would pass vacuously. These are the jobs that
     // existed when the defect was found; if one is renamed away, this goes red

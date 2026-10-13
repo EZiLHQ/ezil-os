@@ -90,6 +90,8 @@ const SEND_TIMEOUT_MS = 3_000;
 const EVENT_CLASSES = new Set([
     'boot_phase', 'boot_summary', 'boot_stall', 'crash', 'window_error',
     'api_failure', 'display_failure', 'worker_exception', 'contract_violation',
+    // docs/PERSISTENCE-SIGNAL-CONTRACT.md §5 — persist.shell_seen relays.
+    'persistence',
 ]);
 
 // 🔴 `MAX_PER_KEY` would throttle `boot_summary` to three app-opens per page:
@@ -102,6 +104,13 @@ const EVENT_CLASSES = new Set([
 // per-PAGE cap instead — see `capture()`'s branch below.
 const BOOT_EVENT_CLASSES = new Set(['boot_summary', 'boot_phase']);
 const MAX_BOOT_EVENTS_PER_PAGE = 12;
+// 🔴 `persistence` events are STATE (docs/PERSISTENCE-SIGNAL-CONTRACT.md §5):
+// ingest keeps flagging a computer on its latest shell pause report, so a
+// dropped `ok` leaves a recovered computer flagged. MAX_PER_KEY dropped the
+// fourth `ok` of a page life. A change of code for a computer always passes
+// (the watcher polls at most once a minute per window); identical repeats,
+// one per window open, share this per-page cap.
+const MAX_PERSISTENCE_REPEATS_PER_PAGE = 20;
 
 /**
  * The `site` values `docs/BROWSER-FIX-CONTRACT.md` §8 assigns to the
@@ -264,8 +273,6 @@ let consecutiveFailures = 0;
 let killed = false;        // two consecutive transport failures -> stop for good
 let flushTimer = null;
 let dropped = 0;
-const perKeySeen = new Map();
-let bootEventCount = 0;    // shared per-page counter for BOOT_EVENT_CLASSES
 let reentering = false;    // stops capture() recursing through its own onerror
 
 function endpointUrl () {
@@ -400,6 +407,40 @@ function firstFrame (err) {
 function keyFor (eventClass, site, code) {
     return `${eventClass}${site}${code}`;
 }
+
+/**
+ * Which captures reach the send buffer in one page life: boot classes share a
+ * page cap (BOOT_EVENT_CLASSES), persistence changes always pass and their
+ * repeats share a page cap (MAX_PERSISTENCE_REPEATS_PER_PAGE), everything else
+ * gets MAX_PER_KEY per (eventClass+site+code). Exported for the unit suites.
+ */
+export function createAdmission () {
+    const perKeySeen = new Map();
+    const lastPersistenceCode = new Map();
+    let bootEventCount = 0, persistenceRepeats = 0;
+    return function admit ({ eventClass, site, code, computerId }) {
+        if ( BOOT_EVENT_CLASSES.has(eventClass) ) {
+            if ( bootEventCount >= MAX_BOOT_EVENTS_PER_PAGE ) return false;
+            bootEventCount += 1;
+            return true;
+        }
+        if ( eventClass === 'persistence' ) {
+            const computer = typeof computerId === 'string' ? computerId : '';
+            if ( lastPersistenceCode.get(computer) === code ) {
+                if ( persistenceRepeats >= MAX_PERSISTENCE_REPEATS_PER_PAGE ) return false;
+                persistenceRepeats += 1;
+            }
+            lastPersistenceCode.set(computer, code);
+            return true;
+        }
+        const key = keyFor(eventClass, site, code);
+        const seen = perKeySeen.get(key) ?? 0;
+        if ( seen >= MAX_PER_KEY ) return false;
+        perKeySeen.set(key, seen + 1);
+        return true;
+    };
+}
+const admit = createAdmission();
 
 /**
  * Record one capture in the LOCAL diagnostic mirror. Bounded, oldest evicted,
@@ -555,19 +596,11 @@ export function capture (input) {
 
         if ( ! isArmed() ) return;
 
-        if ( BOOT_EVENT_CLASSES.has(eventClass) ) {
-            // 🔴 Exempt from the per-(class+site+code) dedup below — see
-            // BOOT_EVENT_CLASSES' own comment for why that dedup would
-            // throttle repeat app-opens to three per page. A shared per-page
-            // cap still bounds the worst case (a pathological loop of opens).
-            if ( bootEventCount >= MAX_BOOT_EVENTS_PER_PAGE ) return;
-            bootEventCount += 1;
-        } else {
-            const key = keyFor(eventClass, site, code);
-            const seen = perKeySeen.get(key) ?? 0;
-            if ( seen >= MAX_PER_KEY ) return;
-            perKeySeen.set(key, seen + 1);
-        }
+        // 🔴 Boot classes are exempt from the per-(class+site+code) dedup — see
+        // BOOT_EVENT_CLASSES' own comment for why it would throttle repeat
+        // app-opens to three per page — and so are persistence changes. Shared
+        // per-page caps still bound the worst case (a pathological loop).
+        if ( ! admit({ eventClass, site, code, computerId: input.computerId }) ) return;
 
         if ( buffer.length >= MAX_BUFFER ) {
             buffer.shift();

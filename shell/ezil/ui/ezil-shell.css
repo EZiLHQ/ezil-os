@@ -638,6 +638,22 @@ body.device-phone {
     top: 55px;
 }
 
+/* A single quiet line, clear of both the display notice and control drawer. */
+.ezil-desktop-window .ezil-display-notice.ezil-persistence-notice {
+    top: auto;
+    bottom: 12px;
+    max-width: none;
+    padding: 6px 10px;
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.ezil-desktop-window .ezil-persistence-notice[hidden] {
+    display: none;
+}
+
 .ezil-display-notice-text {
     flex: 1 1 260px;
     min-width: 0;

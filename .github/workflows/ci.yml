@@ -372,6 +372,7 @@ jobs:
                    shell/ezil/apps/code-test.mjs \
                    shell/ezil/apps/preview-focus-test.mjs \
                    shell/ezil/apps/registry-trace-test.mjs \
+                   shell/ezil/apps/persistence-status-test.mjs \
                    shell/ezil/native-test.mjs \
                    shell/ezil/local-surfaces-test.mjs \
                    shell/ezil/ui/Settings/settings-test.mjs \
@@ -561,21 +562,62 @@ jobs:
         with:
           version: '1.62.1'
       # 🔴 HARD-FAIL ON A SKIP, NOT JUST ON A FAILURE — same reasoning as the
-      # `local` job below, applied to the three suites this job exists to run
+      # `local` job below, applied to the four suites this job exists to run
       # for real. A skip here means EZIL_VALIDATE_IMAGE / EZIL_NEKO_IMAGE did
       # not resolve to an image these suites recognise (the step above
       # failed, or a suite's own gate found the image missing something it
       # needs — e.g. row M1's branding-overlay check), or that Playwright
       # itself did not resolve (the "SETUP PLAYWRIGHT" step above) — never a
       # pass.
-      - name: Container suites (real image)
+      # The persistence suite's real Next.js test installs from an npm cache
+      # (its containers run --network none); warm one from the official
+      # registry here. Without it that test SKIPS, which fails this job below.
+      - name: Warm a Next.js npm cache (persistence suite)
         shell: bash
         run: |
-          if ! bun test --reporter=junit --reporter-outfile=/tmp/container-junit.xml \
+          # The same reviewed lockfile and no-scripts, scrubbed-environment warm as the
+          # candidate image test (this job holds a GHCR login for the private image).
+          bash .github/scripts/warm-next-cache.sh /tmp/next-npm-cache
+          echo "EZIL_NEXT_NPM_CACHE=/tmp/next-npm-cache" >> "$GITHUB_ENV"
+          # The user's real tool: the official OpenCode installer, run inside the pulled image (not
+          # on the runner). Required: do not silently omit OpenCode persistence checks. Pinned to the
+          # same release as test-desktop.sh and e2e/hosted-home-persistence.mjs OPENCODE_VERSION:
+          # --version skips the installer's unauthenticated GitHub API lookup, and the file + version
+          # check means a failed fetch can never pass on its own.
+          opencode_version=1.18.35
+          mkdir -p /tmp/opencode-out
+          if docker run --rm -v /tmp/opencode-out:/out --entrypoint bash ezil-integrated:local -c "
+              set -euo pipefail
+              curl -fsSL --retry 3 --retry-delay 5 -o /tmp/opencode-install.sh https://opencode.ai/install
+              test -s /tmp/opencode-install.sh
+              bash /tmp/opencode-install.sh --version $opencode_version > /dev/null
+              test \"\$(/root/.opencode/bin/opencode --version)\" = $opencode_version
+              cp -a /root/.opencode /out/"; then
+            echo "EZIL_OPENCODE_DIR=/tmp/opencode-out/.opencode" >> "$GITHUB_ENV"
+            echo "EZIL_REQUIRE_OPENCODE=1" >> "$GITHUB_ENV"
+          else
+            echo "::error::official OpenCode installer failed; required persistence acceptance cannot run"
+            exit 1
+          fi
+      - name: Verify acceptance wrapper
+        run: |
+          bash .github/scripts/run-checked-tests.test.sh
+          python3 .github/scripts/validate-test-junit.test.py
+      - name: Container suites (real image)
+        env:
+          EZIL_TEST_JUNIT: /tmp/container-junit.xml
+          EZIL_TEST_REQUIRED: .github/scripts/container-required-cases.json
+        shell: bash
+        run: |
+          # workspace-checkpoint: workspace + system-layer persistence across a REAL
+          # container replacement (docker rm -f), incl. HOME projects (2026-10-10:
+          # a home node_modules froze the system layer; opencode, notes and deps
+          # were lost) and honest dependency readiness after a restart.
+          if ! bash .github/scripts/run-checked-tests.sh /tmp/container-test.log bun test --reporter=junit --reporter-outfile=/tmp/container-junit.xml \
               worker/src/browser-sidecar.container.test.ts \
               worker/src/neko-browser-window.container.test.ts \
               worker/scripts/mobile-keyboard.container.test.ts \
-              2>&1 | tee /tmp/container-test.log; then
+              worker/src/workspace-checkpoint.container.test.ts; then
             echo "::error::the container suites failed outright against the real pulled image - see the log above. This is a real product/test defect, not an image-gate problem."
             exit 1
           fi
@@ -589,6 +631,17 @@ jobs:
             grep -iE 'SKIPPING|skip reason|not present locally' /tmp/container-test.log || true
             exit 1
           fi
+
+      - name: Preserve container acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /tmp/container-test.log
+            /tmp/container-junit.xml
+            .github/scripts/container-required-cases.json
+          if-no-files-found: warn
 
   # ── local (typecheck + unit + smoke) — pulls the real image too ────────────
   local:
@@ -841,7 +894,7 @@ jobs:
       - uses: actions/setup-node@v7
         with: { node-version: '22.16.0' }
       - name: Cloud identity, admission and rollback tests
-        run: node --test e2e/cloud-ci.test.mjs e2e/hosted-continuity-contract.test.mjs
+        run: node --test e2e/cloud-ci.test.mjs e2e/hosted-continuity-contract.test.mjs e2e/hosted-home-persistence.test.mjs
       - name: Validate production migration manifest and lease
         run: |
           node .github/scripts/production-migrations.mjs validate

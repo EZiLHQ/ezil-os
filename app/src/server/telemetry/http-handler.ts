@@ -101,18 +101,28 @@ export async function handleTelemetryPost(req: Request, deps: TelemetryHandlerDe
         }
 
         const batch = parseTelemetryBatch(parsedJson);
+        // This authenticated browser route cannot establish Worker/container
+        // provenance, even when the caller owns the named computer.
+        batch.events = batch.events.filter((event) => {
+            if (event.source === 'shell') return true;
+            batch.droppedInvalid++;
+            return false;
+        });
         if (batch.events.length === 0) return ACCEPTED();
 
         // user_hash is derived HERE, server-side, from the authenticated
         // session — the client never sends one and is never trusted with one.
         const userHash = safeUserHash(ctx.user.id);
+        const computerOwner = ctx.user.id;
 
         if (isRateLimited(userHash)) return ACCEPTED();
         if (shouldShedLoad(ctx.db)) return ACCEPTED();
 
         deps.schedule(async () => {
             try {
-                await ingestBatch(ctx.db, batch.events, userHash);
+                // computerOwner: a computerId that is not one of THIS user's
+                // computers is stored as NULL (never attributed elsewhere).
+                await ingestBatch(ctx.db, batch.events, userHash, { computerOwner });
             } catch (err) {
                 // The one place this route is allowed to be noisy: server logs,
                 // never the response. Matches the shell's own console.error

@@ -855,8 +855,20 @@ fi
 # Projects in subfolders get their node_modules back from their lockfiles
 # (node_modules lives on local disk and never persists). Background, low
 # priority, never fatal. The root project is start-devserver.sh's job.
-if [ -x /usr/local/bin/ezil-restore-deps.sh ] && [ -d "$WORKSPACE_ROOT" ]; then
-  ( /usr/local/bin/ezil-restore-deps.sh "$WORKSPACE_ROOT" >> /tmp/ezil-restore-deps.log 2>&1 & ) || true
+# Home projects too (/root, /home/<user>): the system layer (restored before
+# this script runs) keeps their sources but never their node_modules. One after
+# the other, so two installs never compete for the CPU during boot.
+# The marker is raised HERE, before anything is backgrounded, so a terminal
+# opened in the first second already hears "checking projects" (ezil-deps);
+# one scan then records every project as pending before any install starts.
+# The system layer was restored before this script ran; a user's own restored
+# /etc/bash.bashrc or global npmrc would lack the readiness wiring: re-append it
+# (never rewrites their lines, keeps a script-shell they chose).
+[ -x /usr/local/bin/ezil-deps ] && /usr/local/bin/ezil-deps install-hooks >/dev/null 2>&1 || true
+if [ -x /usr/local/bin/ezil-restore-deps.sh ]; then
+  mkdir -p /run/ezil-deps 2>/dev/null && rm -f /run/ezil-deps/scanned && : > /run/ezil-deps/boot-restore
+  # 9>&-: a long restore must never hold the boot mutex past a restart (see the note above).
+  ( /usr/local/bin/ezil-restore-deps.sh --boot "$WORKSPACE_ROOT" >> /tmp/ezil-restore-deps.log 2>&1 9>&- & ) || true
 fi
 EZIL_LOCAL_STATE_DIR="${EZIL_LOCAL_STATE_DIR:-/var/ezil-local}"
 if mkdir -p "$EZIL_LOCAL_STATE_DIR/node_modules" "$EZIL_LOCAL_STATE_DIR/next-cache" 2>/dev/null; then

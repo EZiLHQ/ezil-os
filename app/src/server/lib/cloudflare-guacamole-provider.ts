@@ -30,6 +30,7 @@
  */
 
 import { createHmac, randomUUID } from 'node:crypto';
+import { z } from 'zod';
 
 // ─── Correlation ──────────────────────────────────────────────────────────────
 
@@ -309,6 +310,8 @@ export type GuacamolePreviewErrorCode =
     | 'fetch_failed'
     | 'sandbox_runtime_blocked'
     | 'sandbox_start_failed'
+    | 'workspace_persistence_unavailable'
+    | 'workspace_checkpoint_failed'
     /**
      * The container is WAKING and this request is not going to wait for it.
      * A soft, labelled, retryable "not ready yet" — see
@@ -339,6 +342,8 @@ export type GuacamolePreviewErrorCode =
  *   sandbox_runtime_blocked—the container runtime is blocked at the platform
  *                           level (`setsockoptint`); retrying has never once
  *                           resolved it.
+ *   workspace_persistence_unavailable — workspace durability is unavailable;
+ *                           opening stays blocked until storage is restored.
  *
  * Everything else is retryable, notably: connection_refused / fetch_failed
  * (the Worker never answered — it may next time), sandbox_start_failed
@@ -355,6 +360,7 @@ const DETERMINISTIC_PREVIEW_ERROR_CODES: ReadonlySet<string> = new Set<Guacamole
     'preconditions_unmet',
     'custom_domain_required',
     'sandbox_runtime_blocked',
+    'workspace_persistence_unavailable',
 ]);
 
 /** True when re-sending the identical preview request could plausibly change the answer. */
@@ -374,6 +380,8 @@ const OPERATIONAL_PREVIEW_ERROR_CODES: ReadonlySet<string> = new Set<GuacamolePr
     'sandbox_runtime_blocked',
     'sandbox_start_failed',
     'sandbox_starting',
+    'workspace_persistence_unavailable',
+    'workspace_checkpoint_failed',
     'timeout',
 ]);
 
@@ -420,6 +428,16 @@ export function surfacePreviewErrorAsValue(
  */
 const CUSTOM_DOMAIN_REQUIRED_RE = /CustomDomainRequiredError|Port exposure requires a custom domain/i;
 
+const PERSISTENCE_PREVIEW_ERROR_MESSAGES = {
+    workspace_persistence_unavailable: 'Workspace saving is unavailable. Please contact support before reopening your computer.',
+    workspace_checkpoint_failed: 'Your workspace could not be saved. Please try opening your computer again.',
+} as const;
+
+function persistencePreviewErrorCode(value: unknown): keyof typeof PERSISTENCE_PREVIEW_ERROR_MESSAGES | undefined {
+    return value === 'workspace_persistence_unavailable' || value === 'workspace_checkpoint_failed'
+        ? value : undefined;
+}
+
 /**
  * Classify a non-2xx response from the Worker. Body text is matched before
  * status, because the two failures that arrive with a misleading status
@@ -427,6 +445,11 @@ const CUSTOM_DOMAIN_REQUIRED_RE = /CustomDomainRequiredError|Port exposure requi
  * Worker's catch-all 500) are deterministic and must not be retried as 5xx.
  */
 export function classifyWorkerHttpFailure(status: number, body: string): GuacamolePreviewErrorCode {
+    try {
+        const data = JSON.parse(body) as { error?: unknown; errorCode?: unknown } | null;
+        const code = persistencePreviewErrorCode(data?.error) ?? persistencePreviewErrorCode(data?.errorCode);
+        if (code) return code;
+    } catch { /* Non-JSON failures still use the message/status classification below. */ }
     if (/setsockoptint/i.test(body)) return 'sandbox_runtime_blocked';
     if (CUSTOM_DOMAIN_REQUIRED_RE.test(body)) return 'custom_domain_required';
     // 408/429 are the 4xx statuses that mean "later", not "never" — leave them
@@ -487,7 +510,13 @@ export type GuacamolePreviewResult = GuacamolePreviewSuccess | GuacamolePreviewE
  * `cloudflare-guacamole-provider.test.ts` for the compile-time proof.
  */
 function previewError(error: string, errorCode: GuacamolePreviewErrorCode): GuacamolePreviewError {
-    return { ok: false, error, errorCode, retryable: isRetryablePreviewErrorCode(errorCode) };
+    const persistenceCode = persistencePreviewErrorCode(errorCode);
+    return {
+        ok: false,
+        error: persistenceCode ? PERSISTENCE_PREVIEW_ERROR_MESSAGES[persistenceCode] : error,
+        errorCode,
+        retryable: isRetryablePreviewErrorCode(errorCode),
+    };
 }
 
 /**
@@ -586,7 +615,10 @@ export async function requestGuacamolePreview(
             const existing = wire.errorCode;
             let errorCode: GuacamolePreviewErrorCode = existing ?? 'unknown';
             if (!existing) {
-                if (/setsockoptint/i.test(errMsg)) {
+                const persistenceCode = persistencePreviewErrorCode(errMsg);
+                if (persistenceCode) {
+                    errorCode = persistenceCode;
+                } else if (/setsockoptint/i.test(errMsg)) {
                     errorCode = 'sandbox_runtime_blocked';
                 } else if (CUSTOM_DOMAIN_REQUIRED_RE.test(errMsg)) {
                     // Same deterministic failure as the 500 path above — the
@@ -3050,6 +3082,76 @@ export function classifyScreenFailure(status: number, workerError: string): Scre
     if (status === 401 || status === 403 || status === 404) return 'NOT_FOUND';
     if (status === 408 || status === 504) return 'TIMEOUT';
     return 'UPSTREAM';
+}
+
+// Pinned wire contract: docs/PERSISTENCE-SIGNAL-CONTRACT.md §5. Object schemas
+// strip unknown keys so only validated metadata crosses the app boundary.
+const persistenceLayerStatusSchema = z.object({
+    code: z.string().regex(/^[a-z0-9_]{1,64}$/),
+    outcome: z.enum(['ok', 'skipped', 'error']),
+    committedAgeS: z.number().int().nonnegative().safe().nullable(),
+});
+const persistenceStatusSchema = z.object({
+    system: persistenceLayerStatusSchema,
+    workspace: persistenceLayerStatusSchema,
+    savingPaused: z.boolean(),
+    pausedLayer: z.enum(['system', 'workspace']).nullable(),
+    pausedReason: z.enum(['too_large', 'stale', 'not_restored']).nullable(),
+    lastStopDiscardedUnsaved: z.boolean(),
+});
+
+export type PersistenceLayerStatus = z.infer<typeof persistenceLayerStatusSchema>;
+export type PersistenceStatus = z.infer<typeof persistenceStatusSchema>;
+export type PersistenceStatusResult = { ok: true; status: PersistenceStatus } | { ok: false; error: string };
+
+/** Read persistence metadata through the same signed boundary as relayState. */
+export async function requestPersistenceStatus(
+    config: CloudflareGuacamoleConfig,
+    hmacSecret: string,
+    sandboxName: string,
+    correlationId: string,
+): Promise<PersistenceStatusResult> {
+    const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/persistence`;
+    try {
+        const response = await fetch(endpoint, {
+            method: 'GET',
+            headers: {
+                Authorization: `Bearer ${mintSandboxPreviewToken(hmacSecret)}`,
+                'Content-Type': 'application/json',
+                [CORRELATION_HEADER]: correlationId,
+            },
+            signal: AbortSignal.timeout(30_000),
+            cache: 'no-store',
+        });
+        let data: unknown;
+        try {
+            data = await response.json();
+        } catch (error) {
+            // Invalid JSON is a contract failure; a failed/aborted body read
+            // is a transport failure, just like a rejected fetch.
+            return {
+                ok: false,
+                error: response.ok && error instanceof SyntaxError
+                    ? 'persistence_status_invalid' : 'persistence_status_unavailable',
+            };
+        }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            return { ok: false, error: response.ok ? 'persistence_status_invalid' : 'persistence_status_unavailable' };
+        }
+        const wire = data as Record<string, unknown>;
+        if (!response.ok || wire.ok !== true) {
+            return {
+                ok: false,
+                error: typeof wire.error === 'string' ? wire.error
+                    : response.ok ? 'persistence_status_invalid' : 'persistence_status_unavailable',
+            };
+        }
+        const parsed = persistenceStatusSchema.safeParse(wire.status);
+        if (!parsed.success) return { ok: false, error: 'persistence_status_invalid' };
+        return { ok: true, status: parsed.data };
+    } catch {
+        return { ok: false, error: 'persistence_status_unavailable' };
+    }
 }
 
 export type RelayRefreshResult = { ok: true; runtimeId: string; expiresAt: number } | { ok: false; error: string };

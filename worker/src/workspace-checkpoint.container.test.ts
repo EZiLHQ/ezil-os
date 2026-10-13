@@ -19,6 +19,9 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import { URL } from 'node:url';
+import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import {
   flushWorkspaceToR2, hydrateWorkspaceFromR2, collectSupersededSnapshots, HYDRATE_MARKER_FILENAME, SNAPSHOT_HEAD, serializeHydrateMarker,
@@ -96,7 +99,7 @@ async function makeStore(): Promise<Store> {
     fetchImpl: (req: Request) => fetch(req, { keepalive: false } as RequestInit),
   });
   const store: Store = {
-    get: (k, o) => inner.get(k, o), list: o => inner.list(o), delete: keys => inner.delete(keys),
+    get: (k, o?: { range?: { offset: number; length: number } }) => inner.get(k, o), list: o => inner.list(o), delete: keys => inner.delete(keys),
     put: async (k, b, o) => { await store.beforePut?.(k); return store.failPutFor?.(k) ? null : inner.put(k, b, o); },
     corrupt: async (k) => {
       const body = await inner.get(k); const b = new Uint8Array(await body!.arrayBuffer()); b[b.length >> 1] ^= 0xff;
@@ -199,10 +202,12 @@ printf 'staged\n' > repo/s.txt; $G add s.txt; printf 'unstaged\n' >> repo/f.txt;
 `;
 
 describe.skipIf(!imagePresent)(`persistent compute: checkpoint survives real container replacement (${IMAGE})`, () => {
+  // Docker startup can exceed Bun's default 5s hook timeout under CI load.
+  // Keep setup bounded and fail with the original probe error, never skip tests.
   beforeAll(async () => {
     const v = await run('docker', ['run', '--rm', '--entrypoint', 'sh', IMAGE, '-c', 'python3 --version; git --version; id -u']);
     console.log(`[checkpoint.container] image=${IMAGE} ${v.stdout.replace(/\n/g, ' ')}`);
-  });
+  }, 120_000);
   afterAll(async () => { await Promise.all(containers.map(destroyComputer)); }, 120_000);
 
   it('restores the exact workspace (files, modes, links, unicode, empty dirs, Git refs/stash/index) into a NEW container; deletions stay deleted; caches and HOME are not carried', async () => {
@@ -508,6 +513,911 @@ mkdir -p /opt/ezq && echo opt-ok > /opt/ezq/marker
     await must(b, 'echo changed > /opt/ezq/marker');
     expect(await sysFlush(b, store, prefix)).toMatchObject({ ok: true });
     expect((await sysFlush(b, store, prefix)).unchanged).toBe(true);
+  }, T);
+
+  // Founder-reported 2026-10-10: a project made in HOME (~/sports-web) and `npm install`ed put a
+  // Next.js node_modules into /root. That pushed every later system capture over the snapshot
+  // limits (too_large), so saving silently stopped: after the next replacement `opencode` (installed
+  // by its curl installer into ~/.opencode + a .bashrc PATH line), a note and node_modules were gone.
+  const HOME_PROJECT_BASE = String.raw`
+set -e
+mkdir -p /root/.opencode/bin && printf '#!/bin/sh\necho opencode-ok\n' > /root/.opencode/bin/opencode && chmod 755 /root/.opencode/bin/opencode
+echo 'export PATH=/root/.opencode/bin:$PATH' >> /root/.bashrc
+echo 'remember this' > /root/notes.md
+mkdir -p /root/.config/ezq && echo '{"theme":"dark"}' > /root/.config/ezq/settings.json
+# Global installs under a hidden prefix (npm config prefix ~/.npm-global, nvm) ARE tools: kept.
+mkdir -p /root/.npm-global/lib/node_modules/ezq-g && echo g-ok > /root/.npm-global/lib/node_modules/ezq-g/marker
+mkdir -p /tmp/ezq-dep && printf '{"name":"ezq-dep","version":"1.0.0","bin":{"ezq-dep":"cli.js"}}' > /tmp/ezq-dep/package.json
+printf '#!/usr/bin/env node\nconsole.log("ezq-dep-ok")\n' > /tmp/ezq-dep/cli.js
+mkdir -p /root/proj/vendor /root/proj/src && (cd /tmp/ezq-dep && npm pack --silent --pack-destination /root/proj/vendor >/dev/null)
+printf '{"name":"proj","version":"0.1.0","dependencies":{"ezq-dep":"file:vendor/ezq-dep-1.0.0.tgz"}}' > /root/proj/package.json
+echo 'export default function Page() { return "hi" }' > /root/proj/src/page.js
+# A tool dir that happens to carry a manifest + lockfile must never be "restored" as a project
+# (a wrongful install would create ~/.opencode/node_modules from this offline dependency).
+printf '{"name":"oc-internal","version":"1.0.0","dependencies":{"ezq-dep":"file:/root/proj/vendor/ezq-dep-1.0.0.tgz"}}' > /root/.opencode/package.json && echo '{}' > /root/.opencode/package-lock.json
+(cd /root/proj && npm install --offline --no-audit --no-fund >/dev/null 2>&1)
+test -f /root/proj/package-lock.json && test -x /root/proj/node_modules/.bin/ezq-dep
+`;
+  const HOME_PROJECT = HOME_PROJECT_BASE + String.raw`
+# Over the 100,000-entry snapshot limit on its own (pins the entry limit; a real Next.js 16
+# node_modules is ~11k entries / ~350 MiB, see the Next.js test).
+python3 -c "
+import os
+d='/root/proj/node_modules/bulk'
+for i in range(400):
+    os.makedirs(f'{d}/{i}', exist_ok=True)
+    for j in range(260): open(f'{d}/{i}/{j}.js','w').close()
+"
+mkdir -p /root/proj/.next/cache && echo build > /root/proj/.next/cache/x
+`;
+  // User files, sources, manifests, lockfiles, hidden tool/config dirs and global installs.
+  const KEPT = ['/root/.opencode/bin/opencode', '/root/.opencode/package.json', '/root/.opencode/package-lock.json', '/root/.bashrc',
+    '/root/notes.md', '/root/.config/ezq/settings.json', '/root/.npm-global/lib/node_modules/ezq-g/marker',
+    '/root/proj/package.json', '/root/proj/package-lock.json', '/root/proj/src/page.js', '/root/proj/vendor/ezq-dep-1.0.0.tgz'];
+  const checksums = (c: string, files: string[] = KEPT) => must(c, `sha256sum ${files.join(' ')}`);
+  /** Capture the HOME-project fixture on one container, replace it, restore on a NEW one. */
+  async function homeProjectAcrossReplacement(tag: string) {
+    const store = await makeStore(); const prefix = prefixFor(`system-${tag}`);
+    const a = await startComputer(`${tag}-a`); await sysHydrate(a, store, prefix);
+    expect(await baselineSystemLayer(sdk(a))).toBe(true);
+    await new Promise(r => setTimeout(r, 1100));
+    await must(a, HOME_PROJECT);
+    const before = await checksums(a);
+    const out = await sysFlush(a, store, prefix);
+    await destroyComputer(a);
+    const b = await startComputer(`${tag}-b`);
+    const back = await sysHydrate(b, store, prefix);
+    return { out, back, b, before };
+  }
+
+  describe('switch-off (power cut)', () => {
+    const MARKER = '/var/lib/ezil-system/capture-started';
+    const FILES = [...KEPT.map(p => p.replace('/root/proj/', '/root/app/')),
+      '/root/notes/n.txt', '/workspace/work.txt', '/workspace/.ezil/settings.json',
+      '/root/app/node_modules/ezq-dep/package.json', '/root/app/node_modules/ezq-dep/cli.js',
+      '/usr/local/lib/node_modules/ezq-dep/package.json', '/usr/local/lib/node_modules/ezq-dep/cli.js'];
+    async function dirty(c: string) {
+      const { systemSnapshotCommand } = await import('./system-snapshot-script');
+      return JSON.parse(await must(c, systemSnapshotCommand({ op: 'sys-dirty', work: '/tmp/ezil-system-dirty' })));
+    }
+    async function prepare(tag: string) {
+      // Always local: these power-cut tests need no S3 credentials or endpoint.
+      const store = new R2Fake(); const prefix = prefixFor(`power-cut-${tag}`);
+      const a = await startComputer(`power-cut-${tag}-a`);
+      expect((await hydrate(a, store, prefix)).emptyPrefix).toBe(true);
+      expect((await sysHydrate(a, store, prefix)).ok).toBe(true);
+      expect(await baselineSystemLayer(sdk(a))).toBe(true);
+      await markHydrated(a, prefix);
+      await new Promise(r => setTimeout(r, 1100));
+      // Reuse the offline HOME fixture without the separate 100k-entry stress tree.
+      await must(a, HOME_PROJECT_BASE.replaceAll('/root/proj', '/root/app')
+        // An offline stand-in also exposes the contract's `next` executable.
+        .replace('"bin":{"ezq-dep":"cli.js"}', '"bin":{"ezq-dep":"cli.js","next":"cli.js"}'));
+      await must(a, String.raw`
+set -e
+npm install -g --prefix /usr/local --offline --no-audit --no-fund /root/app/vendor/ezq-dep-1.0.0.tgz >/dev/null 2>&1
+mkdir -p /root/notes /workspace/.ezil
+printf 'saved note\n' > /root/notes/n.txt
+printf 'saved workspace\n' > /workspace/work.txt
+printf '{"editor.fontSize":16}\n' > /workspace/.ezil/settings.json
+`);
+      return { a, store, prefix };
+    }
+    async function commit(a: string, store: Store, prefix: string) {
+      // The Worker commits both layers through these same persistence entry points.
+      expect((await flush(a, store, prefix)).ok).toBe(true);
+      expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+      expect(await store.get(`${prefix}/${SNAPSHOT_HEAD}`)).not.toBeNull();
+      expect(await store.get(`${systemPrefixOf(prefix)}/${SNAPSHOT_HEAD}`)).not.toBeNull();
+    }
+    async function powerCut(a: string) {
+      // SIGKILL first: no SIGTERM, shutdown handler, or final checkpoint can run.
+      expect((await docker(['kill', '-s', 'KILL', a])).code).toBe(0);
+      expect((await docker(['wait', a])).stdout.toString().trim()).toBe('137');
+      expect((await docker(['rm', a])).code).toBe(0);
+      expect((await docker(['inspect', a])).code).not.toBe(0);
+    }
+    async function restore(tag: string, store: Store, prefix: string) {
+      const b = await startComputer(`power-cut-${tag}-b`);
+      expect((await sh(b, 'test -e /root/app/package.json')).exitCode).not.toBe(0);
+      expect((await hydrate(b, store, prefix)).ok).toBe(true);
+      expect(await sysHydrate(b, store, prefix)).toMatchObject({ ok: true, sameImage: true, conflicts: 0 });
+      await markHydrated(b, prefix);
+      return b;
+    }
+
+    it('committed tools, HOME project, notes and editor settings survive SIGKILL and switch on', async () => {
+      const { a, store, prefix } = await prepare('saved');
+      const before = await checksums(a, FILES);
+      expect(await dirty(a)).toEqual({ dirty: true });
+      await commit(a, store, prefix);
+      await powerCut(a);
+      const b = await restore('saved', store, prefix);
+      // Right after a restore the disk IS the committed layer: the restore sets the
+      // dirty baseline, so a fresh container does not run a full capture at boot.
+      expect((await sh(b, `test -e ${MARKER}`)).exitCode).toBe(0);
+      expect(await dirty(b)).toEqual({ dirty: false });
+      expect((await sh(b, 'test -e /root/app/node_modules')).exitCode).not.toBe(0);
+      const script = await readFile(new URL('../scripts/ezil-restore-deps.sh', import.meta.url), 'utf8');
+      expect((await sh(b, 'cat > /usr/local/bin/ezil-restore-deps.sh && chmod 755 /usr/local/bin/ezil-restore-deps.sh', script)).exitCode).toBe(0);
+      // start-neko's --boot mode includes --homes and skips the workspace root.
+      await must(b, 'npm_config_offline=true /usr/local/bin/ezil-restore-deps.sh --boot /workspace');
+      expect(await must(b, 'cat /run/ezil-deps/status')).toContain('ready\t/root/app\t');
+      expect(await checksums(b, FILES)).toBe(before);
+      expect((await must(b, "bash -ic 'command -v opencode' 2>/dev/null")).trim()).toBe('/root/.opencode/bin/opencode');
+      expect((await must(b, '/root/.opencode/bin/opencode')).trim()).toBe('opencode-ok');
+      expect(JSON.parse(await must(b, 'cd /root/app && npm ls --offline --json ezq-dep')).dependencies['ezq-dep'].version).toBe('1.0.0');
+      expect((await must(b, 'cd /root/app && npm exec --offline -- ezq-dep')).trim()).toBe('ezq-dep-ok');
+      expect((await must(b, 'readlink -f /root/app/node_modules/.bin/ezq-dep')).trim()).toBe('/root/app/node_modules/ezq-dep/cli.js');
+      expect((await must(b, 'cd /root/app && PATH="$PWD/node_modules/.bin:$PATH" command -v next')).trim()).toBe('/root/app/node_modules/.bin/next');
+      expect((await must(b, 'cd /root/app && npm exec --offline -- next')).trim()).toBe('ezq-dep-ok');
+      expect(JSON.parse(await must(b, 'npm ls -g --prefix /usr/local --offline --json ezq-dep')).dependencies['ezq-dep'].version).toBe('1.0.0');
+      expect((await must(b, '/usr/local/bin/ezq-dep')).trim()).toBe('ezq-dep-ok');
+      expect((await sh(b, 'test -e /root/.opencode/node_modules')).exitCode).not.toBe(0);
+    }, T);
+
+    it('after a power cut the Worker trigger alone rebuilds HOME deps, serialised with a desktop boot run', async () => {
+      const { a, store, prefix } = await prepare('trigger');
+      const before = await checksums(a, FILES);
+      await commit(a, store, prefix);
+      await powerCut(a);
+      const b = await restore('trigger', store, prefix);
+      expect((await sh(b, 'test -e /root/app/node_modules')).exitCode).not.toBe(0);
+      const script = await readFile(new URL('../scripts/ezil-restore-deps.sh', import.meta.url), 'utf8');
+      expect((await sh(b, 'cat > /usr/local/bin/ezil-restore-deps.sh && chmod 755 /usr/local/bin/ezil-restore-deps.sh', script)).exitCode).toBe(0);
+      // Exactly what the Durable Object starts after hydrating a fresh container
+      // (staging 2026-10-12: without it the project stayed 'untracked').
+      const { restoreDepsCommand } = await import('./restore-deps-command');
+      const trigger = restoreDepsCommand('/workspace');
+      // The desktop boot's own run races it; the lock must serialise the two.
+      await must(b, `export npm_config_offline=true; ( ${trigger} ) & ( /usr/local/bin/ezil-restore-deps.sh --boot /workspace >> /tmp/ezil-restore-deps.log 2>&1 ) & wait`);
+      expect(await must(b, 'cat /run/ezil-deps/status')).toContain('ready\t/root/app\t');
+      expect(await must(b, 'grep -c "/root/app: installing" /tmp/ezil-restore-deps.log')).toBe('1\n');
+      expect((await sh(b, 'test -e /run/ezil-deps/boot-restore')).exitCode).not.toBe(0);
+      expect(await checksums(b, FILES)).toBe(before);
+      expect((await must(b, 'cd /root/app && npm exec --offline -- next')).trim()).toBe('ezq-dep-ok');
+    }, T);
+
+    it('a HOME workspace monorepo: member trees stay out of the layer and one root install rebuilds them after a power cut', async () => {
+      // PR195 r4241774149: ~/mono/package-lock.json owns apps/web and packages/ui through
+      // "workspaces". A version conflict nests ezq-dep 2.0.0 under the member itself.
+      const store = new R2Fake(); const prefix = prefixFor('power-cut-mono');
+      const a = await startComputer('power-cut-mono-a');
+      expect((await hydrate(a, store, prefix)).emptyPrefix).toBe(true);
+      expect((await sysHydrate(a, store, prefix)).ok).toBe(true);
+      expect(await baselineSystemLayer(sdk(a))).toBe(true);
+      await markHydrated(a, prefix);
+      await new Promise(r => setTimeout(r, 1100));
+      await must(a, String.raw`
+set -e
+for v in 1 2; do
+  mkdir -p /tmp/ezq-v$v
+  printf '{"name":"ezq-dep","version":"%s.0.0","bin":{"ezq-dep":"cli.js"}}' $v > /tmp/ezq-v$v/package.json
+  printf '#!/usr/bin/env node\nconsole.log("ezq-dep-%s")\n' $v > /tmp/ezq-v$v/cli.js
+  mkdir -p /root/mono/vendor && (cd /tmp/ezq-v$v && npm pack --silent --pack-destination /root/mono/vendor >/dev/null)
+done
+mkdir -p /root/mono/apps/web/src /root/mono/packages/ui /root/mono/tools/gen/node_modules
+printf '{"name":"mono","private":true,"workspaces":["apps/*","packages/*"],"dependencies":{"ezq-dep":"file:vendor/ezq-dep-1.0.0.tgz"}}' > /root/mono/package.json
+printf '{"name":"@ezq/ui","version":"1.0.0"}' > /root/mono/packages/ui/package.json
+printf '{"name":"web","version":"0.1.0","dependencies":{"@ezq/ui":"1.0.0","ezq-dep":"file:../../vendor/ezq-dep-2.0.0.tgz"}}' > /root/mono/apps/web/package.json
+printf 'export default 1\n' > /root/mono/apps/web/src/page.js
+(cd /root/mono && npm install --offline --no-audit --no-fund >/dev/null 2>&1) && test -f /root/mono/package-lock.json
+mkdir -p /root/mono/apps/web/.next/cache && echo build-ok > /root/mono/apps/web/.next/cache/marker
+# Not declared by the root: its node_modules is not rebuilt by anything, so it stays captured.
+printf '{"name":"gen"}' > /root/mono/tools/gen/package.json && echo kept > /root/mono/tools/gen/node_modules/marker
+`);
+      expect(JSON.parse(await must(a, 'cat /root/mono/apps/web/node_modules/ezq-dep/package.json')).version).toBe('2.0.0');
+      expect(JSON.parse(await must(a, 'cat /root/mono/node_modules/ezq-dep/package.json')).version).toBe('1.0.0');
+      const files = ['/root/mono/package.json', '/root/mono/package-lock.json', '/root/mono/apps/web/package.json',
+        '/root/mono/apps/web/src/page.js', '/root/mono/packages/ui/package.json', '/root/mono/vendor/ezq-dep-1.0.0.tgz',
+        '/root/mono/vendor/ezq-dep-2.0.0.tgz', '/root/mono/tools/gen/package.json', '/root/mono/tools/gen/node_modules/marker'];
+      const before = await checksums(a, files);
+      await commit(a, store, prefix);
+      await powerCut(a);
+      const b = await restore('mono', store, prefix);
+      expect(await dirty(b)).toEqual({ dirty: false });
+      for (const tree of ['/root/mono/node_modules', '/root/mono/apps/web/node_modules', '/root/mono/apps/web/.next'])
+        expect((await sh(b, `test -e ${tree}`)).exitCode).not.toBe(0);                     // left out of the layer
+      expect(await checksums(b, files)).toBe(before);                                      // everything else came back
+      const script = await readFile(new URL('../scripts/ezil-restore-deps.sh', import.meta.url), 'utf8');
+      expect((await sh(b, 'cat > /usr/local/bin/ezil-restore-deps.sh && chmod 755 /usr/local/bin/ezil-restore-deps.sh', script)).exitCode).toBe(0);
+      await must(b, 'npm_config_offline=true /usr/local/bin/ezil-restore-deps.sh --boot /workspace > /tmp/ezil-restore-deps.log 2>&1');
+      const status = await must(b, 'cat /run/ezil-deps/status');
+      for (const d of ['/root/mono', '/root/mono/apps/web', '/root/mono/packages/ui']) expect(status).toContain(`ready\t${d}\t`);
+      expect(status).not.toContain('missing');
+      const log = await must(b, 'cat /tmp/ezil-restore-deps.log');
+      expect(log.match(/: installing with /g)).toEqual([': installing with ']);             // the root, once
+      expect(log).toContain('/root/mono: installing with npm');
+      expect(JSON.parse(await must(b, 'cat /root/mono/apps/web/node_modules/ezq-dep/package.json')).version).toBe('2.0.0');
+      expect((await must(b, 'cd /root/mono/apps/web && npm exec --offline -- ezq-dep')).trim()).toBe('ezq-dep-2');
+      expect((await must(b, 'cd /root/mono && npm exec --offline -- ezq-dep')).trim()).toBe('ezq-dep-1');
+      expect((await must(b, 'readlink /root/mono/node_modules/web')).trim()).toBe('../apps/web');
+      expect(await checksums(b, files)).toBe(before);
+      // A build output is not a dependency: like a top-level project's, .next is rebuilt by
+      // the user's next build/dev, never by restore-deps.
+      expect((await sh(b, 'test -e /root/mono/apps/web/.next')).exitCode).not.toBe(0);
+    }, T);
+
+    it('RPO is real: a dirty write after the last commit is lost on SIGKILL', async () => {
+      const { a, store, prefix } = await prepare('rpo');
+      expect(await dirty(a)).toEqual({ dirty: true });
+      await commit(a, store, prefix);
+      expect(await dirty(a)).toEqual({ dirty: false });
+      await new Promise(r => setTimeout(r, 1100));
+      await must(a, "printf 'not committed\\n' > /root/late.txt");
+      expect(await dirty(a)).toEqual({ dirty: true });
+      await powerCut(a);
+      const b = await restore('rpo', store, prefix);
+      expect((await sh(b, 'test -e /root/late.txt')).exitCode).not.toBe(0);
+      expect(await must(b, 'cat /root/notes/n.txt')).toBe('saved note\n');
+      expect(await must(b, 'cat /workspace/work.txt')).toBe('saved workspace\n');
+    }, T);
+
+    it('metadata-only changes are dirty within one probe on the real image: a chmod, and a chmod back to the exact baked mode after a power cut', async () => {
+      // A baked tool every image ships (CI's container job tests the previous main image, which
+      // predates ezil-deps). Its baked mode differs between images (775 before 10-03, 755 after).
+      const TOOL = '/usr/local/bin/start-neko.sh';
+      const timed = async (c: string) => { const t0 = Date.now(); const r = await dirty(c); return { ...r, ms: Date.now() - t0 }; };
+      const { a, store, prefix } = await prepare('meta');
+      const baked = (await must(a, `stat -c %a ${TOOL}`)).trim();
+      expect(baked).toMatch(/^[0-7]{3}$/);
+      expect(baked).not.toBe('700');  // the chmod below must be a real change
+      await commit(a, store, prefix);
+      expect(await dirty(a)).toEqual({ dirty: false });
+      await new Promise(r => setTimeout(r, 1100));
+      await must(a, `chmod 700 ${TOOL}`);
+      const chmodded = await timed(a);
+      expect(chmodded.dirty).toBe(true);
+      const c0 = Date.now();
+      expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+      const captureMs = Date.now() - c0;
+      expect(await dirty(a)).toEqual({ dirty: false });
+      await powerCut(a);
+      const b = await restore('meta', store, prefix);
+      expect((await must(b, `stat -c %a ${TOOL}`)).trim()).toBe('700');
+      expect(await baselineSystemLayer(sdk(b))).toBe(true);  // the desktop is up
+      await new Promise(r => setTimeout(r, 1100));
+      // Docker has no lazy ctime: bump ctimes the way Cloudflare does, without changing
+      // anything, on image and restored entries alike. That alone is never dirty.
+      await must(b, `for p in /usr/local/bin /usr/local/lib ${TOOL} /root/notes /root/notes/n.txt; do chmod "$(stat -c %a "$p")" "$p"; done`);
+      const lazy = await timed(b);
+      expect(lazy.dirty).toBe(false);
+      // Back to EXACTLY the baked mode: the committed layer still says 700.
+      await must(b, `chmod ${baked} ${TOOL}`);
+      const reverted = await timed(b);
+      expect(reverted.dirty).toBe(true);
+      expect((await sysFlush(b, store, prefix)).ok).toBe(true);
+      expect(await dirty(b)).toEqual({ dirty: false });
+      await powerCut(b);
+      const c = await startComputer('power-cut-meta-c');
+      expect((await hydrate(c, store, prefix)).ok).toBe(true);
+      expect((await sysHydrate(c, store, prefix)).ok).toBe(true);
+      expect((await must(c, `stat -c %a ${TOOL}`)).trim()).toBe(baked);
+      console.log(`[metadata probe ms] chmod=${chmodded.ms} lazyCtimeOnly=${lazy.ms} revertToBaked=${reverted.ms} systemCapture=${captureMs}`);
+    }, T);
+
+    it('a change during capture remains dirty for the next capture', async () => {
+      const { a, store, prefix } = await prepare('during');
+      await commit(a, store, prefix);
+      // A payload keeps the codec busy after its start marker is visible. The
+      // writer exits before the codec returns, so post-capture churn cannot pass.
+      await must(a, 'mkdir -p /opt/ezq-during && head -c 33554432 /dev/urandom > /opt/ezq-during/blob');
+      const writer = String.raw`
+import pathlib, time
+# A capture stamps the PENDING marker at its start; the committed baseline
+# (capture-started) only takes that time once the Worker commits (sys-committed).
+marker = pathlib.Path('/var/lib/ezil-system/capture-started.pending')
+before = marker.stat().st_mtime_ns if marker.exists() else 0
+pathlib.Path('/tmp/ezq-writer-ready').touch()
+deadline = time.monotonic() + 60
+while (marker.stat().st_mtime_ns if marker.exists() else 0) == before:
+    if time.monotonic() > deadline: raise RuntimeError('capture did not start')
+    time.sleep(0.001)
+time.sleep(0.02)
+pathlib.Path('/root/during.txt').write_text('changed during capture\n')
+pathlib.Path('/tmp/ezq-writer-done').touch()
+`;
+      expect((await docker(['exec', '-d', a, 'python3', '-c', writer])).code).toBe(0);
+      await must(a, 'timeout 10 bash -c \'until test -e /tmp/ezq-writer-ready; do sleep 0.01; done\'');
+      const container = sdk(a);
+      const exec = container.exec.bind(container);
+      container.exec = (command, options) => exec(command.includes('"op":"sys-capture"')
+        ? `${command}\nrc=$?; test -e /tmp/ezq-writer-done || exit 99; exit "$rc"` : command, options);
+      expect((await flushSystemLayer({ container, bucket: store, realPrefix: prefix, log })).ok).toBe(true);
+      expect(await must(a, 'cat /root/during.txt')).toBe('changed during capture\n');
+      // This fails if capture resets its marker at the end and forgets the write.
+      await must(a, `test /root/during.txt -nt ${MARKER}`);
+      expect(await dirty(a)).toEqual({ dirty: true });
+    }, T);
+  });
+
+  it('a HOME project with a huge node_modules does not freeze the system layer: tools, PATH, notes, sources and lockfiles survive a NEW container', async () => {
+    const { out, back, b, before } = await homeProjectAcrossReplacement('syshp');
+    expect(out.skippedReason).toBeUndefined();                                       // was 'too_large'
+    expect(out.ok).toBe(true);
+    expect(out.entries).toBeLessThan(100);
+    expect(back).toMatchObject({ ok: true });
+    expect(await checksums(b)).toBe(before);                                         // byte-identical
+    expect((await must(b, '/root/.opencode/bin/opencode')).trim()).toBe('opencode-ok');
+    expect((await must(b, 'bash -ic "command -v opencode" 2>/dev/null')).trim()).toBe('/root/.opencode/bin/opencode');
+    // Only the regenerable trees are left out.
+    expect((await must(b, 'cd /root/proj && ls -A | LC_ALL=C sort')).trim().split('\n')).toEqual(['package-lock.json', 'package.json', 'src', 'vendor']);
+  }, T);
+
+  it('HOME npm prefixes keep their global node_modules across a NEW container', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-home-prefixes');
+    const a = await startComputer('sysprefix-a'); await sysHydrate(a, store, prefix);
+    expect(await baselineSystemLayer(sdk(a))).toBe(true);
+    await new Promise(r => setTimeout(r, 1100));
+    const dirs = ['/root/npm-global/lib', '/root/n/lib', '/root/lib'];
+    await must(a, String.raw`
+set -e
+for d in ${dirs.join(' ')}; do
+  mkdir -p "$d/node_modules/ezq-global"
+  printf '{"name":"ezq-global","version":"1.0.0"}' > "$d/node_modules/ezq-global/package.json"
+  echo global-ok > "$d/node_modules/ezq-global/marker"
+done
+`);
+    const files = dirs.map(d => `${d}/node_modules/ezq-global/marker`).join(' ');
+    const before = await must(a, `sha256sum ${files}`);
+    expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+    await destroyComputer(a);
+    const b = await startComputer('sysprefix-b');
+    expect(await sysHydrate(b, store, prefix)).toMatchObject({ ok: true });
+    expect(await must(b, `sha256sum ${files}`)).toBe(before);
+  }, T);
+
+  it('a HOME project without a lockfile keeps node_modules and .next across a NEW container', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-home-unlocked');
+    const a = await startComputer('sysunlocked-a'); await sysHydrate(a, store, prefix);
+    expect(await baselineSystemLayer(sdk(a))).toBe(true);
+    await new Promise(r => setTimeout(r, 1100));
+    await must(a, String.raw`
+set -e
+mkdir -p /root/unlocked/node_modules/ezq-dep /root/unlocked/.next/cache
+printf '{"name":"unlocked","dependencies":{"ezq-dep":"1.0.0"}}' > /root/unlocked/package.json
+echo dependency-ok > /root/unlocked/node_modules/ezq-dep/marker
+echo build-ok > /root/unlocked/.next/cache/marker
+`);
+    const files = '/root/unlocked/package.json /root/unlocked/node_modules/ezq-dep/marker /root/unlocked/.next/cache/marker';
+    const before = await must(a, `sha256sum ${files}`);
+    expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+    await destroyComputer(a);
+    const b = await startComputer('sysunlocked-b');
+    expect(await sysHydrate(b, store, prefix)).toMatchObject({ ok: true });
+    expect(await must(b, `sha256sum ${files}`)).toBe(before);
+  }, T);
+
+  it('HOME projects with supported lockfiles exclude node_modules and .next; removing the lockfile keeps them on the next save', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-home-locked');
+    const a = await startComputer('syslocked-a'); await sysHydrate(a, store, prefix);
+    expect(await baselineSystemLayer(sdk(a))).toBe(true);
+    await new Promise(r => setTimeout(r, 1100));
+    const locks = ['bun.lock', 'bun.lockb', 'pnpm-lock.yaml', 'yarn.lock', 'package-lock.json'];
+    await must(a, String.raw`
+set -e
+for lock in ${locks.join(' ')}; do
+  d="/root/locked-$lock"
+  mkdir -p "$d/node_modules/ezq-dep" "$d/.next/cache"
+  echo '{"name":"locked"}' > "$d/package.json"
+  echo '{}' > "$d/$lock"
+  echo dependency-ok > "$d/node_modules/ezq-dep/marker"
+  echo build-ok > "$d/.next/cache/marker"
+done
+`);
+    expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+    const b = await startComputer('syslocked-b');
+    expect(await sysHydrate(b, store, prefix)).toMatchObject({ ok: true });
+    for (const lock of locks) {
+      const d = `/root/locked-${lock}`;
+      expect((await sh(b, `test -f ${d}/package.json && test -f ${d}/${lock}`)).exitCode).toBe(0);
+      for (const tree of ['node_modules', '.next']) expect((await sh(b, `test -e ${d}/${tree}`)).exitCode).not.toBe(0);
+    }
+    // The previous snapshot can rebuild from its saved lockfiles. After their removal,
+    // a new snapshot must carry the existing dependency/build trees themselves.
+    for (const lock of locks) await must(a, `rm /root/locked-${lock}/${lock}`);
+    expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+    await destroyComputer(a);
+    const c = await startComputer('syslocked-c');
+    expect(await sysHydrate(c, store, prefix)).toMatchObject({ ok: true });
+    for (const lock of locks) {
+      const d = `/root/locked-${lock}`;
+      expect((await sh(c, `test -e ${d}/${lock}`)).exitCode).not.toBe(0);
+      expect((await must(c, `cat ${d}/node_modules/ezq-dep/marker`)).trim()).toBe('dependency-ok');
+      expect((await must(c, `cat ${d}/.next/cache/marker`)).trim()).toBe('build-ok');
+    }
+  }, T);
+
+  it('an old HOME layer restores archived package files but excludes dependency and build trees, including split archive/disk manifests', async () => {
+    const { systemSnapshotCommand } = await import('./system-snapshot-script');
+    const c = await startComputer('sys-old-home');
+    const work = '/tmp/ezil-system-old-home';
+    // Construct a pre-exclusion archive directly: ~/app does not exist on disk,
+    // and its node_modules directory sorts before package.json during restore.
+    const snapshot = JSON.parse(await must(c, String.raw`python3 - <<'PY'
+import hashlib, io, json, os, tarfile
+work = '${work}'
+os.makedirs(work)
+cases = [('/root/app', 'package-lock.json', None),
+         ('/home/alice/app', 'pnpm-lock.yaml', None),
+         ('/root/bun-app', 'bun.lock', None),
+         ('/root/bun-old', 'bun.lockb', None),
+         ('/root/yarn-app', 'yarn.lock', None),
+         ('/root/disk-package', 'package-lock.json', 'package.json'),
+         ('/root/disk-lock', 'package-lock.json', 'package-lock.json'),
+         ('/root/unlocked-old', None, None),
+         ('/root/.tool-old', 'package-lock.json', None),
+         ('/root/a/b/c/deep-old', 'package-lock.json', None)]
+data = io.BytesIO()
+with tarfile.open(fileobj=data, mode='w') as tar:
+    for directory, lock, disk_file in cases:
+        files = {'package.json': b'{"name":"old-app"}', 'node_modules/x': b'old-native-module', '.next/cache/x': b'old-build'}
+        if lock: files[lock] = b'{}'
+        if disk_file:
+            os.makedirs(directory, exist_ok=True)
+            with open(directory + '/' + disk_file, 'wb') as f: f.write(files.pop(disk_file))
+        for name in ('', '/node_modules', '/.next', '/.next/cache'):
+            member = tarfile.TarInfo((directory + name).lstrip('/'))
+            member.type, member.mode = tarfile.DIRTYPE, 0o755
+            tar.addfile(member)
+        for name, body in files.items():
+            member = tarfile.TarInfo((directory + '/' + name).lstrip('/'))
+            member.size, member.mode = len(body), 0o644
+            tar.addfile(member, io.BytesIO(body))
+body = data.getvalue()
+with open(work + '/0', 'wb') as f: f.write(body)
+digest = hashlib.sha256(body).hexdigest()
+print(json.dumps({'sha256': digest, 'imageId': 'older-image', 'generation': 'old-home',
+                  'chunks': [{'size': len(body), 'sha256': digest}]}))
+PY`));
+    expect(JSON.parse(await must(c, systemSnapshotCommand({ op: 'sys-restore', work, snapshot })))).toMatchObject({ conflicts: 0 });
+    for (const [directory, lock] of [
+      ['/root/app', 'package-lock.json'], ['/home/alice/app', 'pnpm-lock.yaml'],
+      ['/root/bun-app', 'bun.lock'], ['/root/bun-old', 'bun.lockb'], ['/root/yarn-app', 'yarn.lock'],
+      ['/root/disk-package', 'package-lock.json'], ['/root/disk-lock', 'package-lock.json'],
+    ]) {
+      expect(await must(c, `cat ${directory}/package.json`)).toBe('{"name":"old-app"}');
+      expect(await must(c, `cat ${directory}/${lock}`)).toBe('{}');
+      expect((await sh(c, `test ! -e ${directory}/node_modules && test ! -e ${directory}/.next`)).exitCode).toBe(0);
+    }
+    for (const directory of ['/root/unlocked-old', '/root/.tool-old', '/root/a/b/c/deep-old']) {
+      expect(await must(c, `cat ${directory}/node_modules/x`)).toBe('old-native-module');
+      expect(await must(c, `cat ${directory}/.next/cache/x`)).toBe('old-build');
+    }
+  }, T);
+
+  it('boot restore (--homes) reinstalls exactly the home projects the snapshot leaves out, from their lockfiles', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-homedeps');
+    const a = await startComputer('syshd-a'); await sysHydrate(a, store, prefix);
+    expect(await baselineSystemLayer(sdk(a))).toBe(true);
+    await new Promise(r => setTimeout(r, 1100));
+    // Projects at the boundaries of the restore search: the home itself, 3 levels down, another
+    // user's home; one 4 levels down is beyond it, so its node_modules must stay captured instead.
+    const PROJECTS = ['/root', '/root/work/apps/web', '/home/alice/app'];
+    const DEEP = '/root/a/b/c/d';
+    await must(a, String.raw`
+set -e
+mkdir -p /tmp/ezq-dep && printf '{"name":"ezq-dep","version":"1.0.0","bin":{"ezq-dep":"cli.js"}}' > /tmp/ezq-dep/package.json
+printf '#!/usr/bin/env node\nconsole.log("ezq-dep-ok")\n' > /tmp/ezq-dep/cli.js
+mkdir -p /root/.ezq-vendor && (cd /tmp/ezq-dep && npm pack --silent --pack-destination /root/.ezq-vendor >/dev/null)
+id alice >/dev/null 2>&1 || useradd -m alice
+for d in ${[...PROJECTS, DEEP].join(' ')}; do
+  # Each owner must be able to read its saved tarball without access to /root.
+  mkdir -p "$d/vendor" && cp /root/.ezq-vendor/ezq-dep-1.0.0.tgz "$d/vendor/"
+  printf '{"name":"p","version":"0.1.0","dependencies":{"ezq-dep":"file:vendor/ezq-dep-1.0.0.tgz"}}' > "$d/package.json"
+  (cd "$d" && npm install --offline --no-audit --no-fund >/dev/null 2>&1) && test -f "$d/package-lock.json"
+done
+chown -R alice:alice /home/alice/app
+# A tool dir that happens to carry a manifest + lockfile must never be "restored" as a project.
+mkdir -p /root/.opencode && cp /root/work/apps/web/package.json /root/work/apps/web/package-lock.json /root/.opencode/
+# The workspace is start-devserver's job: --homes must not enter it (start-neko passes it as the skip).
+mkdir -p /home/alice/ws/site && cp /root/work/apps/web/package.json /root/work/apps/web/package-lock.json /home/alice/ws/site/
+`);
+    expect((await sysFlush(a, store, prefix)).ok).toBe(true);
+    await destroyComputer(a);
+
+    const b = await startComputer('syshd-b');
+    expect(await sysHydrate(b, store, prefix)).toMatchObject({ ok: true });
+    for (const d of PROJECTS) expect((await sh(b, `test -e ${d}/node_modules`)).exitCode).not.toBe(0);   // left out
+    expect((await must(b, `${DEEP}/node_modules/.bin/ezq-dep`)).trim()).toBe('ezq-dep-ok');              // captured
+    // start-neko.sh runs exactly this after the system restore. The local test image predates this
+    // change, so install the script under test into the container.
+    const script = await readFile(new URL('../scripts/ezil-restore-deps.sh', import.meta.url), 'utf8');
+    expect((await sh(b, 'cat > /usr/local/bin/ezil-restore-deps.sh && chmod 755 /usr/local/bin/ezil-restore-deps.sh', script)).exitCode).toBe(0);
+    await must(b, 'EZIL_RESTORE_SKIP=/home/alice/ws /usr/local/bin/ezil-restore-deps.sh --homes');
+    for (const d of PROJECTS) expect((await must(b, `cd ${d} && npm exec --offline -- ezq-dep`)).trim()).toBe('ezq-dep-ok');
+    expect((await must(b, 'stat -c %U /home/alice/app/node_modules')).trim()).toBe('alice');
+    expect((await sh(b, 'test -e /root/.opencode/node_modules')).exitCode).not.toBe(0);
+    expect((await sh(b, 'test -e /home/alice/ws/site/node_modules')).exitCode).not.toBe(0);
+  }, T);
+
+  it('boot restore runs a non-root HOME project install and lifecycle scripts as its owner with that HOME config', async () => {
+    const c = await startComputer('deps-owner');
+    const script = await readFile(new URL('../scripts/ezil-restore-deps.sh', import.meta.url), 'utf8');
+    expect((await sh(c, 'cat > /usr/local/bin/ezil-restore-deps.sh && chmod 755 /usr/local/bin/ezil-restore-deps.sh', script)).exitCode).toBe(0);
+    await must(c, String.raw`
+set -e
+useradd -m -U -s /bin/bash ezq-deps-owner
+mkdir -p /home/ezq-deps-owner/app/vendor /tmp/ezq-owner-package/package
+printf '{"name":"ezq-owner-dep","version":"1.0.0"}' > /tmp/ezq-owner-package/package/package.json
+tar -czf /home/ezq-deps-owner/app/vendor/ezq-owner-dep.tgz -C /tmp/ezq-owner-package package
+cat > /home/ezq-deps-owner/app/package.json <<'JSON'
+{"name":"owner-project","version":"1.0.0","dependencies":{"ezq-owner-dep":"file:vendor/ezq-owner-dep.tgz"},"scripts":{"postinstall":"node postinstall.cjs && npm config get cache > cache-path"}}
+JSON
+cat > /home/ezq-deps-owner/app/postinstall.cjs <<'JS'
+require('node:fs').writeFileSync('generated.json', JSON.stringify({ uid: process.getuid(), gid: process.getgid(), home: process.env.HOME, restoring: process.env.EZIL_DEPS_RESTORING }));
+JS
+printf 'cache=/home/ezq-deps-owner/.ezq-cache\n' > /home/ezq-deps-owner/.npmrc
+(cd /home/ezq-deps-owner/app && npm install --package-lock-only --ignore-scripts --offline --no-audit --no-fund >/dev/null 2>&1)
+chown -R ezq-deps-owner:ezq-deps-owner /home/ezq-deps-owner
+test -f /home/ezq-deps-owner/app/package-lock.json
+test ! -e /home/ezq-deps-owner/app/node_modules
+HOME=/root /usr/local/bin/ezil-restore-deps.sh --homes > /tmp/ezil-restore-deps.log 2>&1
+`);
+    const uid = Number((await must(c, 'id -u ezq-deps-owner')).trim());
+    const gid = Number((await must(c, 'id -g ezq-deps-owner')).trim());
+    expect(uid).not.toBe(0);
+    expect(JSON.parse(await must(c, 'cat /home/ezq-deps-owner/app/generated.json'))).toEqual({
+      uid, gid, home: '/home/ezq-deps-owner', restoring: '1',
+    });
+    expect((await must(c, 'cat /home/ezq-deps-owner/app/cache-path')).trim()).toBe('/home/ezq-deps-owner/.ezq-cache');
+    for (const path of ['node_modules', 'node_modules/ezq-owner-dep/package.json', 'generated.json', 'cache-path']) {
+      expect((await must(c, `stat -c %u:%g /home/ezq-deps-owner/app/${path}`)).trim()).toBe(`${uid}:${gid}`);
+    }
+    expect(await must(c, 'cat /run/ezil-deps/status')).toContain('ready\t/home/ezq-deps-owner/app\t/tmp/ezil-restore-deps.log');
+    expect(await must(c, 'cat /tmp/ezil-restore-deps.log')).toContain('[restore-deps] /home/ezq-deps-owner/app: done');
+  }, T);
+
+  it('HOME content that is NOT regenerable still fails visibly as too_large over the limits (never reported saved)', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-homebig');
+    const a = await startComputer('syshb-a'); await sysHydrate(a, store, prefix);
+    expect(await baselineSystemLayer(sdk(a))).toBe(true);
+    await new Promise(r => setTimeout(r, 1100));
+    await must(a, String.raw`python3 -c "
+import os
+d='/root/photos'
+for i in range(400):
+    os.makedirs(f'{d}/{i}', exist_ok=True)
+    for j in range(260): open(f'{d}/{i}/{j}.txt','w').close()
+"`);
+    const out = await sysFlush(a, store, prefix);
+    expect(out.skippedReason).toBe('too_large');
+    expect(out.ok).not.toBe(true);
+  }, T);
+
+  // ── Honest readiness right after a restart (coordinator finding 3) ──────────
+  // The restore runs in the background, so `npm run dev` right after boot used to
+  // print `next: not found` as if the computer were ready. These tests install the
+  // scripts and run the Dockerfile's own RUN block and start-neko.sh's own boot
+  // block, both extracted from the sources, on the real image.
+  const DOCKERFILE = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8');
+  const START_NEKO = readFileSync(new URL('../scripts/start-neko.sh', import.meta.url), 'utf8');
+  /** The RUN instruction (with continuations) that starts with `prefix`. */
+  function dockerRun(prefix: string): string {
+    const lines = DOCKERFILE.split('\n'); const i = lines.findIndex(l => l.startsWith(`RUN ${prefix}`));
+    expect(i).toBeGreaterThan(-1);
+    const out: string[] = [];
+    for (let j = i; ; j++) { out.push(lines[j]!); if (!lines[j]!.trimEnd().endsWith('\\')) break; }
+    return out.join('\n').replace(/^RUN /, '').replace(/\\\n/g, ' ');
+  }
+  /** start-neko.sh's boot block (hook reconciliation + dependency restore), verbatim. */
+  function startNekoRestoreBlock(): string {
+    const i = START_NEKO.indexOf('[ -x /usr/local/bin/ezil-deps ] && /usr/local/bin/ezil-deps install-hooks');
+    const j = START_NEKO.indexOf('if [ -x /usr/local/bin/ezil-restore-deps.sh ]; then');
+    expect(i).toBeGreaterThan(-1); expect(j).toBeGreaterThan(i);
+    return START_NEKO.slice(i, START_NEKO.indexOf('\nfi', j) + 3);
+  }
+  const READINESS_FILES = [['ezil-restore-deps.sh', '/usr/local/bin/ezil-restore-deps.sh'], ['ezil-deps.sh', '/usr/local/bin/ezil-deps'],
+    ['npm-script-shell.sh', '/usr/local/lib/ezil/npm-script-shell']] as const;
+  /** An image built from this tree already carries the scripts and wiring: test those as built.
+   *  An older image gets the scripts plus the Dockerfile's own RUN block (wiring + its asserts). */
+  async function installReadiness(c: string) {
+    let built = true;
+    for (const [src, dst] of READINESS_FILES) {
+      const body = await readFile(new URL(`../scripts/${src}`, import.meta.url), 'utf8');
+      if ((await sh(c, `sha256sum < ${dst} 2>/dev/null | cut -c1-64`)).stdout.trim() !== sha(body)) built = false;
+    }
+    if (built && (await sh(c, 'npm config get script-shell')).stdout.trim() === '/usr/local/lib/ezil/npm-script-shell') return 'built';
+    for (const [src, dst] of READINESS_FILES) {
+      const body = await readFile(new URL(`../scripts/${src}`, import.meta.url), 'utf8');
+      expect((await sh(c, `mkdir -p "$(dirname ${dst})" && cat > ${dst}`, body)).exitCode).toBe(0);
+    }
+    await must(c, dockerRun('chmod +x /usr/local/bin/start-desktop.sh'));
+    return 'installed';
+  }
+  const bootRestore = (c: string, env = '') => must(c, `${env} WORKSPACE_ROOT=/workspace; ${startNekoRestoreBlock()}`);
+
+  it('right after a restart: npm run waits for its restoring project and says so; failed, missing, timeout and the terminal notice are explicit', async () => {
+    const c = await startComputer('deps-ready');
+    await installReadiness(c);
+    await must(c, String.raw`
+set -e
+mkdir -p /tmp/ezq-slow /root/.ezq-vendor
+cat > /tmp/ezq-slow/package.json <<'JSON'
+{"name":"ezq-slow","version":"1.0.0","scripts":{"postinstall":"sleep 8"}}
+JSON
+echo 'module.exports = "slow-ok"' > /tmp/ezq-slow/index.js
+(cd /tmp/ezq-slow && npm pack --silent --pack-destination /root/.ezq-vendor >/dev/null)
+for d in slow nolock bad; do mkdir -p /root/$d; cat > /root/$d/package.json <<'JSON'
+{"name":"p","version":"0.1.0","scripts":{"dev":"node -p \"require('ezq-slow')\""},"dependencies":{"ezq-slow":"file:/root/.ezq-vendor/ezq-slow-1.0.0.tgz"}}
+JSON
+done
+# A user's own install runs lifecycle scripts through the script-shell: never gated.
+(cd /root/slow && npm install --offline --no-audit --no-fund >/dev/null 2>&1) && rm -rf /root/slow/node_modules
+# Unrestorable: an unreadable lockfile (npm ci fails) and a dependency file that is gone (npm install fails).
+echo '{ not json' > /root/bad/package-lock.json && sed -i 's#ezq-slow-1.0.0.tgz#gone.tgz#' /root/bad/package.json
+`);
+    const early = await bootRestore(c, '');
+    expect(early).toBe('');
+    const first = await must(c, 'ezil-deps status /root/slow; true');
+    expect(first).toMatch(/^(scanning|pending|restoring)/m);                       // not yet ready when npm run starts
+    const dev = await sh(c, 'cd /root/slow && npm run --silent dev');
+    expect(dev.exitCode).toBe(0);
+    expect(dev.stdout.trim()).toBe('slow-ok');
+    expect(dev.stderr).toContain('EZiL: restoring dependencies for ~/slow after the computer restarted');
+    expect(dev.stderr).toContain('EZiL: dependencies for ~/slow are ready.');
+    expect((await sh(c, 'ezil-deps wait /root/slow --timeout 120')).exitCode).toBe(0);
+    expect((await sh(c, 'ezil-deps wait /root/bad --timeout 120')).exitCode).toBe(1);
+    expect((await sh(c, 'ezil-deps wait /root/nolock --timeout 5')).exitCode).toBe(4);
+    expect((await sh(c, 'ezil-deps wait /root/nothing-here --timeout 5')).exitCode).toBe(3);
+    expect((await sh(c, 'cd /root/bad && npm run --silent dev')).stderr).toContain('EZiL: restoring dependencies for ~/bad FAILED');
+    expect((await sh(c, 'cd /root/nolock && npm run --silent dev')).stderr).toContain('EZiL: dependencies for ~/nolock are not installed: no lockfile was saved');
+    // Interactive terminals hear it once (image /etc/bash.bashrc); ready projects are not listed.
+    const notice = (await sh(c, 'bash -ic true 2>/dev/null')).stdout;
+    expect(notice).toContain('EZiL: project dependencies after the restart');
+    expect(notice).toMatch(/FAILED +~\/bad/);
+    expect(notice).toMatch(/not installed +~\/nolock/);
+    expect(notice).not.toContain('~/slow');
+    // Silent when everything is ready; bounded wait; opt-out; exact project only; install lifecycle never gated.
+    await must(c, String.raw`mkdir -p /tmp/s-ready /tmp/s-busy && printf 'ready\t/root/slow\tx\n' > /tmp/s-ready/status && printf 'restoring\t/root/slow\tx\n' > /tmp/s-busy/status`);
+    expect((await must(c, 'EZIL_DEPS_STATE_DIR=/tmp/s-ready ezil-deps notice'))).toBe('');
+    const t0 = Date.now();
+    const timedOut = await sh(c, 'cd /root/slow && EZIL_DEPS_STATE_DIR=/tmp/s-busy EZIL_DEPS_WAIT_SECONDS=2 npm run --silent dev');
+    expect(Date.now() - t0).toBeLessThan(15_000);
+    expect(timedOut.stdout.trim()).toBe('slow-ok');
+    expect(timedOut.stderr).toContain('are still restoring after 2s; running anyway');
+    expect((await sh(c, 'cd /root/slow && EZIL_DEPS_STATE_DIR=/tmp/s-busy EZIL_DEPS_WAIT_SECONDS=0 npm run --silent dev')).stderr).not.toContain('EZiL:');
+    const wrap = (event: string, pkg = '/root/slow/package.json') =>
+      sh(c, `EZIL_DEPS_STATE_DIR=/tmp/s-busy EZIL_DEPS_WAIT_SECONDS=1 npm_package_json=${pkg} npm_lifecycle_event=${event} /usr/local/lib/ezil/npm-script-shell -c 'echo ran'`);
+    for (const event of ['postinstall', 'install', 'prepare']) expect((await wrap(event)).stderr).not.toContain('EZiL:');
+    expect((await wrap('dev', '/root/other/package.json')).stderr).not.toContain('EZiL:');
+    expect((await wrap('dev')).stderr).toContain('EZiL: restoring dependencies for ~/slow');
+    expect((await must(c, 'cat /tmp/ezil-restore-deps.log'))).toContain('/root/nolock: no lockfile was saved');
+    expect((await sh(c, 'test -e /run/ezil-deps/boot-restore')).exitCode).not.toBe(0);   // cleared at the end
+    // The user follows the advice and installs by hand: neither project is reported again.
+    await must(c, String.raw`
+set -e
+sed -i 's#gone.tgz#ezq-slow-1.0.0.tgz#' /root/bad/package.json && rm -f /root/bad/package-lock.json
+for d in nolock bad; do (cd /root/$d && npm install --offline --no-audit --no-fund >/dev/null 2>&1); done
+`);
+    expect((await sh(c, 'ezil-deps wait /root/nolock --timeout 5')).exitCode).toBe(0);
+    expect((await sh(c, 'ezil-deps wait /root/bad --timeout 5')).exitCode).toBe(0);
+    for (const d of ['nolock', 'bad']) {
+      const r = await sh(c, `cd /root/${d} && npm run --silent dev`);
+      expect(r.stdout.trim()).toBe('slow-ok');
+      expect(r.stderr).not.toContain('EZiL:');
+    }
+    expect((await sh(c, 'bash -ic true 2>/dev/null')).stdout).toBe('');
+  }, T);
+
+  it('a failed install with partial node_modules stays FAILED until a later successful hand install', async () => {
+    const c = await startComputer('deps-partial');
+    await installReadiness(c);
+    await must(c, String.raw`
+set -e
+mkdir -p /tmp/ezq-partial-dep /root/partial/vendor
+echo '{"name":"ezq-partial-dep","version":"1.0.0"}' > /tmp/ezq-partial-dep/package.json
+echo 'module.exports = "partial-ok"' > /tmp/ezq-partial-dep/index.js
+(cd /tmp/ezq-partial-dep && npm pack --silent --pack-destination /root/partial/vendor >/dev/null)
+printf '{"name":"partial","scripts":{"postinstall":"exit 1"},"dependencies":{"ezq-partial-dep":"file:vendor/ezq-partial-dep-1.0.0.tgz"}}' > /root/partial/package.json
+(cd /root/partial && npm install --package-lock-only --ignore-scripts --offline --no-audit --no-fund >/dev/null 2>&1)
+/usr/local/bin/ezil-restore-deps.sh --homes >/tmp/partial-restore.log 2>&1
+test -d /root/partial/node_modules/ezq-partial-dep
+`);
+    expect((await must(c, 'ezil-deps status /root/partial'))).toBe('failed\t/root/partial\n');
+    expect((await sh(c, 'ezil-deps wait /root/partial --timeout 1')).exitCode).toBe(1);
+    expect((await sh(c, 'ezil-deps gate /root/partial')).stderr).toContain('~/partial FAILED');
+    expect((await must(c, 'ezil-deps notice'))).toMatch(/FAILED +~\/partial/);
+    // Even a stale hidden lockfile is not evidence of a repair after the failure.
+    await must(c, String.raw`echo '{}' > /root/partial/node_modules/.package-lock.json && touch -d '2000-01-01 UTC' /root/partial/node_modules/.package-lock.json`);
+    expect((await sh(c, 'ezil-deps wait /root/partial --timeout 1')).exitCode).toBe(1);
+    await must(c, String.raw`
+set -e
+sed -i 's/exit 1/exit 0/' /root/partial/package.json
+sleep 1
+(cd /root/partial && npm install --offline --no-audit --no-fund >/dev/null 2>&1)
+test /root/partial/node_modules/.package-lock.json -nt /run/ezil-deps/status
+`);
+    expect((await sh(c, 'ezil-deps wait /root/partial --timeout 1')).exitCode).toBe(0);
+    expect((await sh(c, 'ezil-deps gate /root/partial')).stderr).toBe('');
+    expect((await must(c, 'ezil-deps notice'))).not.toContain('~/partial');
+  }, T);
+
+  it('native installer markers resolve FAILED only when newer than the failure record and node_modules exists', async () => {
+    const c = await startComputer('deps-native-markers');
+    await sdk(c).writeFile('/tmp/ezq-deps', await readFile(new URL('../scripts/ezil-deps.sh', import.meta.url), 'utf8'));
+    const cases = [
+      ['package-lock.json', 'node_modules/.package-lock.json'],
+      ['pnpm-lock.yaml', 'node_modules/.modules.yaml'],
+      ['yarn.lock', 'node_modules/.yarn-integrity'],
+      ['yarn.lock', 'node_modules/.yarn-state.yml'],
+      ['bun.lock', 'bun.lock'], ['bun.lockb', 'bun.lockb'],
+    ];
+    for (const [index, [lock, marker]] of cases.entries()) {
+      const dir = `/tmp/ezq-native-${index}`, state = `${dir}/state`;
+      const wait = () => sh(c, `EZIL_DEPS_STATE_DIR=${state} bash /tmp/ezq-deps wait ${dir} --timeout 0`);
+      await must(c, String.raw`
+set -e
+mkdir -p ${dir}/node_modules ${state}
+echo '{}' > ${dir}/package.json
+echo '{}' > ${dir}/${lock}
+echo '{}' > ${dir}/${marker}
+touch -d '2000-01-01 UTC' ${dir}/${lock} ${dir}/${marker}
+printf 'failed\t${dir}\n' > ${state}/status
+touch -d '2000-01-02 UTC' ${state}/status
+`);
+      expect((await wait()).exitCode).toBe(1); // stale marker
+      await must(c, `touch -r ${state}/status ${dir}/${marker}`);
+      expect((await wait()).exitCode).toBe(1); // equal timestamps are ambiguous
+      await must(c, `touch -d '2000-01-03 UTC' ${dir}/${marker}`);
+      expect((await wait()).exitCode).toBe(0);
+      expect(await must(c, `EZIL_DEPS_STATE_DIR=${state} bash /tmp/ezq-deps notice`)).toBe('');
+      for (const status of ['pending', 'restoring']) {
+        await must(c, String.raw`printf '${status}\t${dir}\n' > ${state}/status && touch -d '2000-01-02 UTC' ${state}/status`);
+        expect((await wait()).exitCode).toBe(2); // markers never resolve an active install
+      }
+      await must(c, String.raw`printf 'failed\t${dir}\n' > ${state}/status && touch -d '2000-01-02 UTC' ${state}/status && mv ${dir}/node_modules ${dir}/saved-modules`);
+      expect((await wait()).exitCode).toBe(1); // even a newer Bun lock needs node_modules
+    }
+    // A fresh npm marker cannot certify pnpm, which takes precedence over npm.
+    await must(c, String.raw`
+set -e
+mkdir -p /tmp/ezq-native-1/node_modules
+echo '{}' > /tmp/ezq-native-1/package-lock.json
+echo '{}' > /tmp/ezq-native-1/node_modules/.package-lock.json
+`);
+    expect((await sh(c, 'EZIL_DEPS_STATE_DIR=/tmp/ezq-native-1/state bash /tmp/ezq-deps wait /tmp/ezq-native-1 --timeout 0')).exitCode).toBe(1);
+  }, T);
+
+  // A user's own /etc/bash.bashrc or global npmrc, restored over a newer image (their edits win),
+  // used to drop the readiness wiring. Boot re-appends it; their lines stay byte-identical.
+  it("a user's own restored bash.bashrc and npmrc keep their lines; boot re-adds the readiness wiring once", async () => {
+    const c = await startComputer('deps-hooks');
+    await installReadiness(c);
+    await must(c, String.raw`
+set -e
+G="$(npm config get globalconfig)"
+grep -v 'ezil-deps notice' /etc/bash.bashrc | grep -v 'EZiL: dependency-restore' > /tmp/user.bashrc
+printf "alias ezq-ll='ls -l'   # the user's own line, no trailing newline" >> /tmp/user.bashrc
+printf 'registry=https://registry.example.invalid/\n# user comment\nfund=false' > /tmp/user.npmrc
+cp /tmp/user.bashrc /etc/bash.bashrc && cp /tmp/user.npmrc "$G"
+`);
+    expect((await sh(c, 'npm config get script-shell')).stdout.trim()).not.toBe('/usr/local/lib/ezil/npm-script-shell');   // the defect
+    const userSums = await must(c, 'sha256sum < /tmp/user.bashrc; sha256sum < /tmp/user.npmrc');
+    await bootRestore(c, ''); await bootRestore(c, '');                               // two boots: idempotent
+    const G = (await must(c, 'npm config get globalconfig')).trim();
+    expect(await must(c, `head -c "$(stat -c %s /tmp/user.bashrc)" /etc/bash.bashrc | sha256sum; head -c "$(stat -c %s /tmp/user.npmrc)" ${G} | sha256sum`)).toBe(userSums);
+    expect((await must(c, 'grep -c "ezil-deps notice" /etc/bash.bashrc')).trim()).toBe('1');
+    expect((await must(c, `grep -c "^script-shell=" ${G}`)).trim()).toBe('1');
+    expect((await must(c, 'npm config get script-shell')).trim()).toBe('/usr/local/lib/ezil/npm-script-shell');
+    expect((await must(c, 'npm config get registry')).trim()).toBe('https://registry.example.invalid/');
+    expect((await must(c, "bash -ic 'type ezq-ll' 2>/dev/null"))).toContain('ls -l');
+    // A script-shell the user chose is theirs: never replaced.
+    await must(c, `printf 'script-shell=/bin/bash\n' > ${G}`);
+    await bootRestore(c, '');
+    expect((await must(c, 'npm config get script-shell')).trim()).toBe('/bin/bash');
+  }, T);
+
+  // Review r4254722070: the same restored config on a Guacamole-mode container, which never runs
+  // start-neko.sh. The Worker's post-restore trigger alone must re-add the wiring, append-only.
+  it("the Worker's post-restore trigger re-adds the readiness wiring over a user's restored bash.bashrc and npmrc", async () => {
+    const c = await startComputer('deps-hooks-trigger');
+    await installReadiness(c);
+    await must(c, String.raw`
+set -e
+G="$(npm config get globalconfig)"
+grep -v 'ezil-deps notice' /etc/bash.bashrc | grep -v 'EZiL: dependency-restore' > /tmp/user.bashrc
+printf "alias ezq-ll='ls -l'   # the user's own line, no trailing newline" >> /tmp/user.bashrc
+printf 'registry=https://registry.example.invalid/\n# user comment\nfund=false' > /tmp/user.npmrc
+cp /tmp/user.bashrc /etc/bash.bashrc && cp /tmp/user.npmrc "$G"
+`);
+    expect((await sh(c, 'npm config get script-shell')).stdout.trim()).not.toBe('/usr/local/lib/ezil/npm-script-shell');   // the defect
+    const userSums = await must(c, 'sha256sum < /tmp/user.bashrc; sha256sum < /tmp/user.npmrc');
+    const { restoreDepsCommand } = await import('./restore-deps-command');
+    const trigger = restoreDepsCommand('/workspace');
+    await must(c, `export npm_config_offline=true; ${trigger}`); await must(c, `export npm_config_offline=true; ${trigger}`);   // idempotent
+    const G = (await must(c, 'npm config get globalconfig')).trim();
+    expect(await must(c, `head -c "$(stat -c %s /tmp/user.bashrc)" /etc/bash.bashrc | sha256sum; head -c "$(stat -c %s /tmp/user.npmrc)" ${G} | sha256sum`)).toBe(userSums);
+    expect((await must(c, 'grep -c "ezil-deps notice" /etc/bash.bashrc')).trim()).toBe('1');
+    expect((await must(c, `grep -c "^script-shell=" ${G}`)).trim()).toBe('1');
+    expect((await must(c, 'npm config get script-shell')).trim()).toBe('/usr/local/lib/ezil/npm-script-shell');
+    expect((await must(c, 'npm config get registry')).trim()).toBe('https://registry.example.invalid/');
+    expect(await must(c, 'cat /run/ezil-deps/status 2>/dev/null; test -e /run/ezil-deps/scanned && echo scanned')).toContain('scanned');
+    // A script-shell the user chose is theirs: the trigger never replaces it.
+    await must(c, `printf 'script-shell=/bin/bash\n' > ${G}`);
+    await must(c, `export npm_config_offline=true; ${trigger}`);
+    expect((await must(c, 'npm config get script-shell')).trim()).toBe('/bin/bash');
+  }, T);
+
+  // A real Next.js 16 app (finding 4). Packages come from an npm cache the host warmed from the
+  // official registry (EZIL_NEXT_NPM_CACHE), copied into the --network none containers, standing
+  // in for the registry. The cache is excluded from the snapshot, so B gets its own copy.
+  const NEXT_CACHE = process.env.EZIL_NEXT_NPM_CACHE;
+  const OPENCODE_DIR = process.env.EZIL_OPENCODE_DIR;
+  if (process.env.EZIL_REQUIRE_OPENCODE === '1' && (!NEXT_CACHE || !OPENCODE_DIR)) {
+    throw new Error('Required real OpenCode acceptance needs EZIL_NEXT_NPM_CACHE and EZIL_OPENCODE_DIR');
+  }
+  it.skipIf(!NEXT_CACHE)('a real Next.js app in HOME: sources survive a NEW container, deps restore from its lockfile, and an immediate npm run dev waits, then serves', async () => {
+    const store = await makeStore(); const prefix = prefixFor('system-next');
+    const a = await startComputer('next-a'); await sysHydrate(a, store, prefix);
+    expect(await baselineSystemLayer(sdk(a))).toBe(true);
+    await new Promise(r => setTimeout(r, 1100));
+    expect((await docker(['cp', NEXT_CACHE!, `${a}:/tmp/npmcache`])).code).toBe(0);
+    // The project is the reviewed fixture the cache was warmed from (.github/scripts/next-warm:
+    // pinned versions, integrity hashes), so the offline install resolves exactly that tree.
+    await must(a, 'mkdir -p /root/sports-web/app');
+    for (const f of ['package.json', 'package-lock.json']) {
+      const body = await readFile(new URL(`../../.github/scripts/next-warm/${f}`, import.meta.url), 'utf8');
+      expect((await sh(a, `cat > /root/sports-web/${f}`, body)).exitCode).toBe(0);
+    }
+    await must(a, String.raw`
+set -e
+cd /root/sports-web
+npm ci --offline --cache /tmp/npmcache --no-audit --no-fund >/dev/null 2>&1
+test -f package-lock.json && test -x node_modules/.bin/next
+printf 'export default function RootLayout({ children }) { return <html><body>{children}</body></html> }\n' > app/layout.js
+printf 'export default function Page() { return <h1>ezq-sports-marker</h1> }\n' > app/page.js
+`);
+    // The user's sequence: a real OpenCode install (EZIL_OPENCODE_DIR: ~/.opencode produced by the official
+    // installer, ~178 MiB) with its PATH line, and `npm run dev` once, which leaves a .next dev cache.
+    if (OPENCODE_DIR) {
+      expect((await docker(['cp', OPENCODE_DIR, `${a}:/root/.opencode`])).code).toBe(0);
+      await must(a, "printf '\\n# opencode\\nexport PATH=/root/.opencode/bin:$PATH\\n' >> /root/.bashrc && /root/.opencode/bin/opencode --version");
+    }
+    await must(a, String.raw`
+cd /root/sports-web && NEXT_TELEMETRY_DISABLED=1 setsid npm run dev -- -p 3124 > /tmp/a-dev.log 2>&1 < /dev/null & echo $! > /tmp/a-dev.pid
+for i in $(seq 1 120); do curl -fsS --max-time 20 http://127.0.0.1:3124/ >/dev/null 2>&1 && break; sleep 1; done
+kill -TERM -- "-$(cat /tmp/a-dev.pid)" 2>/dev/null; sleep 2; kill -KILL -- "-$(cat /tmp/a-dev.pid)" 2>/dev/null; test -d /root/sports-web/.next
+`);
+    const homeBytes = await must(a, 'du -sb --apparent-size /root/sports-web/node_modules /root/sports-web/.next /root/.opencode 2>/dev/null | python3 -c "import sys; print(sum(int(l.split()[0]) for l in sys.stdin))"');
+    console.error(`[next-test] node_modules + .next + .opencode = ${(Number(homeBytes) / 1048576).toFixed(1)} MiB`);
+    const files = 'package.json package-lock.json app/page.js app/layout.js';
+    const before = await must(a, `cd /root/sports-web && sha256sum ${files}`);
+    const ocBefore = OPENCODE_DIR ? await must(a, 'sha256sum < /root/.opencode/bin/opencode') : '';
+    const out = await sysFlush(a, store, prefix);
+    expect(out).toMatchObject({ ok: true });
+    expect(out.skippedReason).toBeUndefined();
+    await destroyComputer(a);
+
+    const b = await startComputer('next-b');
+    expect(await sysHydrate(b, store, prefix)).toMatchObject({ ok: true });
+    expect(await must(b, `cd /root/sports-web && sha256sum ${files}`)).toBe(before);
+    if (OPENCODE_DIR) {
+      expect(await must(b, 'sha256sum < /root/.opencode/bin/opencode')).toBe(ocBefore);
+      expect((await must(b, "bash -ic 'command -v opencode' 2>/dev/null")).trim()).toBe('/root/.opencode/bin/opencode');
+      expect((await sh(b, "bash -ic 'opencode --version' 2>/dev/null")).exitCode).toBe(0);
+    }
+    expect((await sh(b, 'test -e /root/sports-web/.next')).exitCode).not.toBe(0);           // build cache: regenerable, not stored
+    expect((await sh(b, 'test -e /root/sports-web/node_modules')).exitCode).not.toBe(0);
+    expect((await docker(['cp', NEXT_CACHE!, `${b}:/tmp/npmcache`])).code).toBe(0);
+    await installReadiness(b);
+    const env = 'export npm_config_cache=/tmp/npmcache npm_config_offline=true NEXT_TELEMETRY_DISABLED=1;';
+    await bootRestore(b, env);
+    expect(await must(b, 'ezil-deps status /root/sports-web; true')).toMatch(/^(scanning|pending|restoring)/m);
+    expect((await docker(['exec', '-d', b, 'bash', '-c',
+      `${env} cd /root/sports-web && npm run dev -- -p 3123 > /tmp/next.out 2> /tmp/next.err`])).code).toBe(0);
+    const deadline = Date.now() + 300_000; let body = '';
+    while (Date.now() < deadline) {
+      const r = await sh(b, 'curl -fsS --max-time 20 http://127.0.0.1:3123/');
+      if (r.exitCode === 0) { body = r.stdout; break; }
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    expect(body).toContain('ezq-sports-marker');
+    const err = await must(b, 'cat /tmp/next.err');
+    expect(err).toContain('EZiL: restoring dependencies for ~/sports-web after the computer restarted');
+    expect(err).toContain('EZiL: dependencies for ~/sports-web are ready.');
+    expect(err).not.toContain('not found');
+    expect((await must(b, 'ezil-deps status /root/sports-web'))).toBe('ready\t/root/sports-web\n');
   }, T);
 
   // Found on staging: Cloudflare gives untouched image files fresh ctimes when they are first read,

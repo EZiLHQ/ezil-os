@@ -1,38 +1,58 @@
 # Telemetry — what EZiL-OS collects, what it does not, and how to turn it off
 
 EZiL-OS is a public, AGPL-licensed project handling real users. This document is the
-trust surface for that: an exact account of the crash/error telemetry the shell, the
-Worker, and the container send to EZiL's own servers, written so a stranger reading the
-source can verify every claim against the code cited.
+trust surface for that: an exact account of the crash/error and persistence telemetry
+the shell, the Worker, and the container send to EZiL's own servers, written so a
+stranger reading the source can verify every claim against the code cited.
 
 Design source of truth: the telemetry design this implementation follows is not
 reproduced here in full — read the code it describes instead:
 `app/src/server/telemetry/` (schema, fingerprinting, ingest, retention, queries) and
 `app/src/server/db/schema/telemetry.ts` (the three Postgres tables). This document is
 the plain-language summary of what that code does, kept in sync with it.
+Persistence's binding contract is [the persistence signal contract](PERSISTENCE-SIGNAL-CONTRACT.md);
+its §§1–2 pin the event vocabulary and the metadata allowed on the wire.
 
 ## What is collected
 
-One thing only: **structured records of failures** — a crash, a boot phase that failed,
-an API call that returned an error, a desktop window that failed to open. Nine closed
+**Structured records of failures and persistence outcomes** — a crash, a boot phase that
+failed, an API call that returned an error, a desktop window that failed to open, or the
+outcome of restoring, saving or stopping a computer's persistent layers. Ten closed
 event classes exist (`boot_phase`, `boot_summary`, `boot_stall`, `crash`, `window_error`,
-`api_failure`, `display_failure`, `worker_exception`, `contract_violation`); nothing
-outside that list is accepted — `POST /api/shell/telemetry` validates every event against
-a strict schema (`app/src/server/telemetry/schema.ts`) and silently drops anything that
-doesn't match, rather than storing an unrecognised shape.
+`api_failure`, `display_failure`, `worker_exception`, `contract_violation`,
+`persistence`); nothing outside that list is accepted — `POST /api/shell/telemetry`
+validates every event against a strict schema (`app/src/server/telemetry/schema.ts`)
+and silently drops anything that doesn't match, rather than storing an unrecognised shape.
+
+`persistence` describes per-computer restore/save/stop outcomes for the workspace and
+system layers. Beyond the event's identity, timing and outcome fields, it carries only
+reason codes, counts, size buckets, ages since the last OK commits, a trigger and a
+`discarded_unsaved` flag (on `persist.stop`). It never carries paths, file or package
+names, commands or content; `detail` is never set. That boundary is deliberate: the
+signal stays valid once saved layers are end-to-end encrypted. Verify the seven allowed
+`attrs` keys in `app/src/server/telemetry/types.ts` against contract §2; unknown keys
+are stripped by `app/src/server/telemetry/schema.ts`.
+
+**Persistence also records routine OK outcomes and a 15-minute heartbeat.** Apart from
+the boot denominators (`boot_summary` / `boot_phase` OK rows, which already existed),
+the other classes remain failure-only. A layer's `(site, code)` change is emitted immediately;
+identical repeats are suppressed. `persist.stop` and `persist.open_blocked` are always
+emitted. `persist.heartbeat` reports both layers while the computer is running, once
+at least 15 minutes have passed since its last persistence event (contract §3).
 
 Each stored row carries, at most:
 
 | Field | What it is |
 |---|---|
 | `fingerprint` | A SHA-256 hash of the error's *type*, computed server-side from an already-redacted, already-normalised description — never of anything a person typed |
-| `user_hash` | A **pseudonym** derived from your account id (`u_xxxxxxxx`, unsalted 32-bit FNV-1a). It exists so we can count "how many distinct people hit this" without our dashboards, exports or on-call screenshots displaying an account id. It is *not* anonymisation — see the note below, which says exactly what it does and does not protect against |
-| `site` / `code` | A hand-written, low-cardinality label for *where* and *what kind* of failure this was (e.g. `sandbox_start_failed`) — never a file path or a URL |
-| `detail` | A short (≤200 char), redacted description. Redacted twice before it is written: once by the sender (`redact`, best-effort) and once again on our server (`sanitizeErrorMessage`, the actual boundary — it, not the sender, produces the value stored) |
+| `user_hash` | A **pseudonym** derived from your account id (`u_xxxxxxxx`, unsalted 32-bit FNV-1a), or the `u_00000000` sentinel for worker/container events without a known computer. It exists so we can count "how many distinct people hit this" without our dashboards, exports or on-call screenshots displaying an account id. It is *not* anonymisation — see the note below, which says exactly what it does and does not protect against |
+| `site` / `code` | A hand-written, low-cardinality label for *where* and *what kind* of failure or persistence outcome this was (e.g. `sandbox_start_failed`, or `persist.system.flush` / `too_large`) — never a file path or a URL |
+| `detail` | Absent for persistence. For other classes, a short (≤200 char), redacted description. Redacted twice before it is written: once by the sender (`redact`, best-effort) and once again on our server (`sanitizeErrorMessage`, the actual boundary — it, not the sender, produces the value stored) |
 | `duration_ms`, `outcome`, `occurred_at` | Timing and pass/fail bookkeeping |
 | `computer_id` | The random UUID your own computer row already uses — it identifies no one outside our own database and is already visible to you in the product |
+| `attrs` | Extras allowed for that event class. For persistence, only `entries`, `size_bucket`, `system_age_s`, `workspace_age_s`, `consecutive_failures`, `trigger`, `discarded_unsaved` (contract §2) |
 
-That's the entire row. See `app/src/server/db/schema/telemetry.ts` for the literal column
+See `app/src/server/db/schema/telemetry.ts` for the literal column
 list and `app/src/server/telemetry/types.ts` for the wire contract the shell sends.
 
 > **CORRECTED 2026-08-19 by integration.** This paragraph used to read *"Not
@@ -43,20 +63,20 @@ list and `app/src/server/telemetry/types.ts` for the wire contract the shell sen
 **It is collected, and it is readable.** `app/drizzle/0001_telemetry.sql` was
 applied to the live project on or before **2026-08-04**. All three tables exist
 with RLS on, 3 policies, 7 indexes, 3 CHECKs and 2 FKs — an exact structural match
-for the file. `ezil_error_events` holds **84 live rows** (199 inserts / 109
-deletes), and the 14-day retention cron is running.
+for the file. At the **2026-08-19** check, `ezil_error_events` held **84 live rows**
+(199 inserts / 109 deletes), and the 14-day retention cron was running.
 
-Three caveats that matter more than the correction:
+Three caveats from that dated production check, not a claim about today's drain state:
 
-- 🔴 **Only the shell producer has ever worked.** All 193 recorded occurrences are
-  `source='shell'`. **Zero** rows have ever arrived with `source='worker'` or
+- 🔴 **Only the shell producer had worked.** All 193 recorded occurrences were
+  `source='shell'`. **Zero** rows had arrived with `source='worker'` or
   `source='container'`. Do not read an empty container slice as "nothing failed".
-- 🔴 **The R2 spool has never been drained.** `ezil-telemetry-spool` has been
+- 🔴 **The R2 spool had never been drained.** `ezil-telemetry-spool` had been
   accumulating worker/container events since 2026-08-03 — 173 objects / 467 kB as
-  of 2026-08-19 — and not one has reached Postgres. That is the mechanical reason
+  of 2026-08-19 — and not one had reached Postgres. That was the mechanical reason
   for the point above. See `docs/RUNBOOK.md`, "OPEN OUTAGE".
-- 🔴 **`computer_id` is NULL on all 84 rows**, contradicting the table above. Error
-  events cannot currently be joined to a computer.
+- 🔴 **`computer_id` was NULL on all 84 rows.** Those rows could not be joined to a
+  computer. This snapshot predates the per-computer persistence signal below.
 
 ### What `user_hash` is honestly worth
 
@@ -87,15 +107,39 @@ here is the accurate version:
 
 ### `computer_id` and the Worker
 
-`computer_id` is filled in only by the **browser**, which knows the real UUID.
+The **browser** knows the real computer UUID. **Worker persistence events** also carry
+that `ezil_computers.id`: the app hands it down as `projectId` when opening the preview,
+and the Worker stores it in Durable Object storage (contract §1). It is never the
+sandbox id, `guac-<16 chars of your user id>-<16 chars of your computer id>` — that is a
+*truncated copy of your account id*, not an anonymous token.
 
-The **Worker** and the **container** deliberately leave it empty, and it is worth saying
-why rather than leaving a blank column looking like an oversight. All the Worker has is
-its sandbox id, `guac-<16 chars of your user id>-<16 chars of your computer id>` — which
-is a *truncated copy of your account id*, not an anonymous token, and putting it in a
-field named `computer_id` would have quietly made this document's "your raw account id is
-never collected" untrue. Worker- and container-side records join to a request by
-`correlation_id` instead. See the `computerId` doc comment in `worker/src/telemetry.ts`.
+The drain resolves that computer's owner and stores the owner's pseudonymous
+`user_hash`, using the same `safeUserHash`, instead of `u_00000000`. Worker events
+without a computer, or with an unknown computer, keep that sentinel and have
+`computer_id = NULL`. Non-persistence Worker/container events still leave
+`computer_id` NULL and join to a request by `correlation_id`. Verify the attribution
+against `app/src/server/telemetry/spool-drain.ts` and contract §4.
+
+An unknown computer UUID does not cost the rest of a batch: ingest nulls that row's
+`computer_id` and still inserts it. On the shell path it also nulls a computer id that
+is not owned by the signed-in user, instead of rejecting the batch. UUID syntax is
+still validated by the schema. See `app/src/server/telemetry/ingest.ts`,
+`app/src/server/telemetry/http-handler.ts` and contract §4.
+
+### What the shell shows
+
+While a computer is open, the shell polls its persistence status no faster than every
+60 seconds through `cloudflareGuacamole.persistenceState({ computerId })`, which checks
+ownership. When `savingPaused` is true, it shows a one-line notice explaining the
+affected layer and reason: for example, "Saving is paused: your home folder is over
+the 512 MB limit". The `stale` and `not_restored` notices explain that reopening the
+computer restores saving.
+
+Each change of `pausedReason` is reported through authenticated
+`POST /api/shell/telemetry` as a `persistence` event with source `shell` and site
+`persist.shell_seen`; its code is the reason, or `ok` when cleared. The notice comes
+from the status poll; delivery of telemetry is not required to show it. Contract §5
+pins the status response and shell behavior; `shell/ezil/telemetry.js` is the sender.
 
 ## What is never collected — named so nobody adds it back thinking it was an oversight
 
@@ -135,28 +179,28 @@ never collected" untrue. Worker- and container-side records join to a request by
 - **Browser/OS fingerprinting signals** (User-Agent, screen size, locale, timezone).
   None of these answer the one question this system exists to answer ("how many people
   hit this specific bug"), so none are collected.
-- **A behavioural trail of what you clicked or typed.** Only failures are recorded, and
-  only the failure itself — never a breadcrumb history leading up to it.
+- **A behavioural trail of what you clicked or typed.** Records describe failures or
+  the persistence outcomes above — never a breadcrumb history leading up to them.
 
 ## How to turn it off
 
-Telemetry is **best-effort and silently optional by construction**, not a setting to
-find and flip:
+Browser telemetry is **best-effort and silently optional by construction**, not a
+setting to find and flip:
 
-- It only exists for a signed-in session — there is no anonymous collection path.
+- Browser collection requires a signed-in session — there is no anonymous browser path.
 - If your browser has JavaScript disabled, or blocks `navigator.sendBeacon`/`fetch`
-  requests to this origin (an ad blocker, a strict extension, a corporate proxy), nothing
-  is sent, and nothing in the product behaves any differently — see the "always 202,
-  nothing to branch on" contract below.
+  requests to this origin (an ad blocker, a strict extension, a corporate proxy), no
+  browser telemetry is sent — see the "always 202, nothing to branch on" contract below.
 - Blocking requests to `/api/shell/telemetry` at the browser or network level (a
-  userscript, an extension rule, a hosts-file entry, a proxy filter) fully disables it.
+  userscript, an extension rule, a hosts-file entry, a proxy filter) disables browser
+  telemetry, including `persist.shell_seen`.
   Because the ingest route never changes what the product does based on whether a batch
   arrived, blocking it has no functional side effect on EZiL-OS itself.
 
-There is deliberately no in-product toggle yet, because there is deliberately no
-telemetry to opt out of beyond crash/error records already stripped of anything
-identifying. If that changes — if a future version collects anything beyond failure
-records — this document and a real settings toggle are expected to change together.
+There is no in-product telemetry toggle yet. Collection is limited to crash/error
+records and the persistence metadata described above. Blocking browser telemetry does
+not disable Worker persistence events in the R2 spool or the app's drain of those
+events. The same pseudonym limitations apply to those attributed rows.
 
 ## The guarantee: telemetry can never affect what you see
 

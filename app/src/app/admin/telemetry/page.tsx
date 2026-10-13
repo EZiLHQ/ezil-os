@@ -8,6 +8,7 @@ import {
     errorRateOverTime,
     fingerprintLeaderboard,
     fingerprintLeaderboardFromRollup,
+    persistenceHealth,
     recentTraces,
     spikeDetection,
     traceTimeline,
@@ -32,7 +33,7 @@ import { env } from '@/env';
  * uses the service-role connection.
  *
  * Windows are fixed at 24h (leaderboard, boot-phase ranking), 48h (error
- * rate) and 90d (the rollup leaderboard) — no filters beyond the one
+ * rate), 7d (persistence health) and 90d (the rollup leaderboard) — no filters beyond the one
  * documented exception below, on purpose: this is a look-in, not a tool.
  *
  * The ONE query param this page reads: `?trace=<correlationId>`, a drill-down
@@ -60,7 +61,7 @@ export default async function TelemetryAdminPage({
     const rawTrace = params.trace;
     const traceId = typeof rawTrace === 'string' && rawTrace.trim() !== '' ? rawTrace.trim() : null;
 
-    const [leaderboard, bootPhases, errorRate, traces, spikes, rollupLeaderboard, timeline] = await Promise.all([
+    const [leaderboard, bootPhases, errorRate, traces, spikes, rollupLeaderboard, timeline, persistence] = await Promise.all([
         fingerprintLeaderboard(db, { windowHours: 24, limit: 25 }),
         bootPhaseFailureRanking(db, 24),
         errorRateOverTime(db, { hours: 48 }),
@@ -68,6 +69,7 @@ export default async function TelemetryAdminPage({
         spikeDetection(db),
         fingerprintLeaderboardFromRollup(db, { days: 90, limit: 25 }),
         traceId ? traceTimeline(db, traceId) : Promise.resolve([]),
+        persistenceHealth(db),
     ]);
 
     const totalErrors = errorRate.reduce((sum, b) => sum + b.errors, 0);
@@ -94,6 +96,68 @@ export default async function TelemetryAdminPage({
                         <SummaryStat label="Boot attempts (24h)" value={bootAttempts} />
                         <SummaryStat label="Boot-phase failures (24h)" value={bootFailures} />
                     </dl>
+                </section>
+
+                <section>
+                    <h2 className="text-base font-semibold">Persistence health</h2>
+                    <p className="mt-1 text-xs text-offwhite/50">
+                        Computers reporting in the last 7 days, flagged first. Flags indicate a latest system
+                        or workspace code of too_large, stale, or not_restored; a system commit age reported
+                        as over 30 minutes at the latest worker event, unless that event is persist.stop;
+                        a latest worker event of persist.open_blocked; or a latest shell report with one of
+                        those pause codes. Heartbeat age is informational: worker events arrive through an
+                        approximately daily drain. Commit ages are in seconds, as reported at event time;
+                        — means unknown. Computer labels are MD5 prefixes.
+                    </p>
+                    {persistence.length === 0 ? (
+                        <EmptyRow text="No persistence events in the last 7 days." />
+                    ) : (
+                        <div className="mt-3 overflow-x-auto">
+                            <table className="w-full min-w-[1100px] border-collapse text-left text-sm">
+                                <thead>
+                                    <tr className="border-b border-offwhite/20 text-offwhite/60">
+                                        <Th>Computer</Th>
+                                        <Th>Flagged</Th>
+                                        <Th>Last restore</Th>
+                                        <Th>System code</Th>
+                                        <Th>Workspace code</Th>
+                                        <Th align="right">System OK age (s)</Th>
+                                        <Th align="right">Workspace OK age (s)</Th>
+                                        <Th align="right">Unsaved stops (7d)</Th>
+                                        <Th>Last heartbeat</Th>
+                                        <Th>Last seen</Th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {persistence.map((row, i) => (
+                                        <tr
+                                            key={`${row.computerShort}-${i}`}
+                                            className={`border-b border-offwhite/10 ${row.flagged ? 'bg-offwhite/5' : ''}`}
+                                        >
+                                            <Td mono>{row.computerShort}</Td>
+                                            <Td>{row.flagged ? 'yes' : 'no'}</Td>
+                                            <Td>
+                                                {row.lastRestore ? (
+                                                    <>
+                                                        <span className="font-mono text-xs">{row.lastRestore.site}</span>
+                                                        <div>{row.lastRestore.code} · {row.lastRestore.outcome}</div>
+                                                        <div>{formatTimestamp(row.lastRestore.at)}</div>
+                                                    </>
+                                                ) : '—'}
+                                            </Td>
+                                            <Td mono>{row.systemCode ?? '—'}</Td>
+                                            <Td mono>{row.workspaceCode ?? '—'}</Td>
+                                            <Td align="right">{formatAgeSeconds(row.systemOkAgeS)}</Td>
+                                            <Td align="right">{formatAgeSeconds(row.workspaceOkAgeS)}</Td>
+                                            <Td align="right">{row.discardedUnsaved}</Td>
+                                            <Td>{row.lastHeartbeatAt ? formatTimestamp(row.lastHeartbeatAt) : '—'}</Td>
+                                            <Td>{formatTimestamp(row.lastSeenAt)}</Td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
                 </section>
 
                 <section>
@@ -427,4 +491,8 @@ function EmptyRow({ text }: { text: string }) {
 function formatTimestamp(value: string): string {
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? value : date.toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+}
+
+function formatAgeSeconds(value: number | null): string {
+    return value === null ? '—' : Math.floor(value).toLocaleString();
 }

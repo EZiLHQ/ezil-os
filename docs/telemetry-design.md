@@ -34,7 +34,9 @@ and `BOOT_FAILURE_COPY`'s keys (`worker_unreachable`, `sandbox_crashed`,
 
 ## 1. Event taxonomy
 
-One row per event. Nine classes, closed set. `source` ∈ `shell | app | worker | container`.
+One row per event. Ten classes, closed set. `source` ∈ `shell | app | worker | container`.
+The persistence addition is pinned by [the persistence signal contract](PERSISTENCE-SIGNAL-CONTRACT.md),
+which governs its metadata, emission rules, attribution and shell status reporting.
 
 | class | source(s) | when | REQUIRED fields | optional fields |
 | --- | --- | --- | --- | --- |
@@ -47,6 +49,7 @@ One row per event. Nine classes, closed set. `source` ∈ `shell | app | worker 
 | `display_failure` | shell | WebRTC/display gate: `confirmFrame` unanswered, nothing watching, `display_not_streaming` | `site`, `code` | `duration_ms`, `attrs.seen` |
 | `worker_exception` | worker | any `LifecycleTimeline` event with `outcome:'error'`, plus a top-level `fetch()` catch | `site`(=`event` name), `code`, `outcome` | `duration_ms`, `detail`, `correlation_id` |
 | `contract_violation` | shell | an invariant the code already refuses to proceed on — "returned ok with no URL", "UIWindow returned nothing", "no such app", removed-backend stubs | `site`, `code` | `detail` |
+| `persistence` | worker, shell | per-computer workspace/system restore, save and stop outcomes; routine OK, 15-minute heartbeats and shell pause changes (contract §§1–3, §5) | `site`, `code`, `outcome` | real `computerId`, `durationMs`, allow-listed `attrs`; never `detail` |
 
 ### 1.1 Every existing `console.error` site, mapped
 
@@ -79,6 +82,7 @@ export const TELEMETRY_SCHEMA_VERSION = 1; // mirrors LOG_SCHEMA_VERSION's disci
 export const EVENT_CLASSES = [
   'boot_phase', 'boot_summary', 'boot_stall', 'crash', 'window_error',
   'api_failure', 'display_failure', 'worker_exception', 'contract_violation',
+  'persistence',
 ] as const;
 export type EventClass = (typeof EVENT_CLASSES)[number];
 
@@ -1035,7 +1039,7 @@ Public AGPL repo, real users. Every field, and why it is safe.
 | --- | --- |
 | `event_id` | client-generated random UUIDv4; carries no information |
 | `schema_version` | integer constant |
-| `event_class`, `source`, `outcome` | closed enums, 9 / 4 / 3 members |
+| `event_class`, `source`, `outcome` | closed enums, 10 / 4 / 3 members |
 | `fingerprint` | SHA-256 of already-redacted, already-normalised text. Every id, path, URL, token and IP was replaced by a placeholder *before* hashing (§2.3's privacy control), so there is no preimage to recover |
 | `user_hash` | `safeUserHash()`, the existing FNV-1a construction — **explicitly a correlation key, not a security primitive** (§3). It keeps identity out of every dashboard and export. It does **not** protect against an attacker holding both the DB and the user list; nothing in a first-party analytics store does |
 | `site` | hand-written literal from a closed set. Never a URL, never a file path, never a file:line |
@@ -1059,6 +1063,10 @@ Anything not on this list is **stripped by the zod schema**, not rejected:
 `boot_summary` → `phases` (array of `{name, ms, status}`, names from the closed
 set of 11), `total_ms`
 `boot_phase`, `boot_stall`, `worker_exception`, `contract_violation` → none.
+`persistence` → `entries`, `size_bucket`, `system_age_s`, `workspace_age_s`,
+`consecutive_failures`, `trigger`, `discarded_unsaved` (types and closed values in
+the persistence signal contract §2). No paths, file or package names, commands or
+content; this signal remains valid when saved layers are end-to-end encrypted.
 
 ### 8.3 Not collected, deliberately
 
