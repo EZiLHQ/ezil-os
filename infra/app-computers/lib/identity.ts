@@ -18,6 +18,8 @@ export const IdentityConfigSchema = z.object({
     deploySubject: z.string().max(256).regex(/^repo:[A-Za-z0-9_.-]{1,39}@\d{1,20}\/[A-Za-z0-9_.-]{1,100}@\d{1,20}:environment:aws-pilot$/),
     /** No dots: one DNS label, so virtual-host S3 URLs and TLS stay simple. */
     assetBucketName: z.string().regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/),
+    /** Founder-controlled §4 kill switch, enforced by the boundary. */
+    killSwitch: z.boolean().default(false),
 }).strict().superRefine((c, ctx) => {
     if (c.githubOidcProviderArn !== `arn:aws:iam::${c.accountId}:oidc-provider/token.actions.githubusercontent.com`)
         ctx.addIssue({ code: 'custom', path: ['githubOidcProviderArn'], message: 'must be this account\'s GitHub OIDC provider' });
@@ -53,6 +55,24 @@ export function identityNames(c: IdentityConfig) {
 export const GLOBAL_SERVICES = ['iam:*'] as const;
 const EC2_NETWORK_CREATES = ['ec2:CreateVpc', 'ec2:CreateSubnet', 'ec2:CreateInternetGateway', 'ec2:CreateRouteTable',
     'ec2:CreateSecurityGroup', 'ec2:CreateLaunchTemplate'] as const;
+/** Creates that also act on an existing parent VPC. */
+const EC2_CREATES_IN_VPC = ['ec2:CreateSubnet', 'ec2:CreateRouteTable', 'ec2:CreateSecurityGroup'] as const;
+/** Network creates, split so a new resource needs the namespace tag in the
+ * request and its parent VPC must already carry it: nothing is created inside
+ * a foreign VPC. `extra` adds conditions (the execution role adds its region). */
+function networkCreateStatements(c: { region: string; accountId: string; namespace: string }, sid: (s: string) => string | undefined,
+    extra: Record<string, unknown> = {}) {
+    const ec2 = (kind: string) => `arn:aws:ec2:${c.region}:${c.accountId}:${kind}/*`;
+    const tag = (k: string) => ({ StringEquals: { ...extra, [`aws:${k}Tag/${NAMESPACE_TAG}`]: c.namespace } });
+    return [
+        new iam.PolicyStatement({ sid: sid('AllowEc2TopLevelCreateTagged'), actions: ['ec2:CreateVpc', 'ec2:CreateInternetGateway', 'ec2:CreateLaunchTemplate'],
+            resources: [ec2('vpc'), ec2('internet-gateway'), ec2('launch-template')], conditions: tag('Request') }),
+        new iam.PolicyStatement({ sid: sid('AllowEc2InVpcCreateTagged'), actions: [...EC2_CREATES_IN_VPC],
+            resources: [ec2('subnet'), ec2('route-table'), ec2('security-group')], conditions: tag('Request') }),
+        new iam.PolicyStatement({ sid: sid('AllowEc2CreateOnlyInNamespaceVpc'), actions: [...EC2_CREATES_IN_VPC], resources: [ec2('vpc')],
+            conditions: tag('Resource') }),
+    ];
+}
 const EC2_NETWORK_MUTATIONS = ['ec2:ModifyVpcAttribute', 'ec2:DeleteVpc', 'ec2:AttachInternetGateway', 'ec2:DetachInternetGateway',
     'ec2:DeleteInternetGateway', 'ec2:CreateRoute', 'ec2:ReplaceRoute', 'ec2:DeleteRoute', 'ec2:DeleteRouteTable',
     'ec2:AssociateRouteTable', 'ec2:DisassociateRouteTable', 'ec2:ModifySubnetAttribute', 'ec2:DeleteSubnet',
@@ -92,25 +112,71 @@ const PURCHASES = ['ec2:Purchase*', 'ec2:AllocateHosts', 'ec2:ModifyHosts', 'ec2
     'savingsplans:*', 'rds:PurchaseReserved*', 'elasticache:PurchaseReserved*', 'redshift:PurchaseReserved*', 'es:PurchaseReserved*',
     'dynamodb:PurchaseReserved*', 'aws-marketplace:Subscribe', 'aws-marketplace:AcceptAgreement*'] as const;
 
-/** §5 permission boundary: an ALLOWLIST of what EZiL workloads, the execution
- * role and the deploy role use, then explicit denies. Exported for tests. */
+/** Read and log-delivery actions that have no resource type at all (IAM
+ * service reference), so they cannot be scoped below `*`:
+ * - ec2:Describe*, iam:Get*, iam:List*, kms:ListAliases: reads only.
+ * - logs:DescribeLogGroups and the seven log-delivery actions: Step Functions
+ *   execution logging is configured through account-level log deliveries and
+ *   a CloudWatch Logs resource policy; the state machine role and the
+ *   execution role need them. Blast radius: CloudWatch Logs delivery only.
+ * - cloudformation:ValidateTemplate: no side effects. */
+export const UNSCOPABLE = ['ec2:Describe*', 'iam:Get*', 'iam:List*', 'kms:ListAliases', 'logs:DescribeLogGroups', 'logs:CreateLogDelivery',
+    'logs:GetLogDelivery', 'logs:UpdateLogDelivery', 'logs:DeleteLogDelivery', 'logs:ListLogDeliveries', 'logs:PutResourcePolicy',
+    'logs:DescribeResourcePolicies', 'cloudformation:ValidateTemplate'] as const;
+/** §4 kill switch, enforced by the founder-owned boundary on every bounded
+ * role, including roles created later. Set `killSwitch: true` in the identity
+ * config and update the identity stack. */
+export const KILL_SWITCH_ACTIONS = ['ec2:RunInstances', 'ec2:StartInstances', 'ec2:AttachVolume', 'ec2:CreateVolume', 'ec2:CreateFleet',
+    'ec2:RequestSpot*', 'states:StartExecution', 'states:StartSyncExecution', 'states:RedriveExecution', 'lambda:InvokeFunction',
+    'events:PutTargets'] as const;
+
+/** §5 permission boundary: an ALLOWLIST scoped by resource — namespace names,
+ * namespace tags, or the compute tags — then explicit denies. A role planted
+ * by CI under /ezil/<ns>/ inherits exactly this ceiling. Exported for tests. */
 export function boundaryStatements(c: IdentityConfig): iam.PolicyStatement[] {
-    const n = identityNames(c), bucket = `arn:aws:s3:::${c.assetBucketName}`;
+    const n = identityNames(c), r = c.region, a = c.accountId, p = n.stackPrefix, bucket = `arn:aws:s3:::${c.assetBucketName}`;
+    const ec2 = (kind: string) => `arn:aws:ec2:${r}:${a}:${kind}/*`;
+    const nsTag = (k: 'Request' | 'Resource') => ({ [`aws:${k}Tag/${NAMESPACE_TAG}`]: c.namespace });
+    const compute = (k: 'Request' | 'Resource') => ({ [`aws:${k}Tag/ezil:managed-by`]: 'app-computer-platform', [`aws:${k}Tag/ezil:stage`]: c.namespace });
+    const allow = (sid: string, actions: readonly string[], resources: string[], conditions?: Record<string, Record<string, unknown>>) =>
+        new iam.PolicyStatement({ sid, actions: [...actions], resources, ...(conditions ? { conditions } : {}) });
     const deny = (sid: string, actions: readonly string[], extra: Partial<iam.PolicyStatementProps> = {}) =>
         new iam.PolicyStatement({ sid, effect: iam.Effect.DENY, actions: [...actions], resources: ['*'], ...extra });
     return [
-        new iam.PolicyStatement({ sid: 'AllowWorkloadServices', resources: ['*'], actions: ['states:*', 'lambda:*', 'logs:*', 'sqs:*',
-            'events:*', 'cloudwatch:*', 'sns:Publish', 'sns:GetTopicAttributes', 'sns:ListTopics', 'sns:ListSubscriptionsByTopic',
-            'secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret', 'ecr:CreateRepository', 'ecr:DescribeRepositories',
-            'ecr:PutImageScanningConfiguration', 'ecr:PutImageTagMutability', 'ecr:TagResource', 'ecr:ListTagsForResource',
-            ...DEPLOY_CFN, 'iam:Get*', 'iam:List*'] }),
-        new iam.PolicyStatement({ sid: 'AllowEc2Scoped', resources: ['*'],
-            actions: ['ec2:Describe*', 'ec2:CreateTags', ...EC2_NETWORK_CREATES, ...EC2_NETWORK_MUTATIONS, ...EC2_COMPUTE] }),
-        new iam.PolicyStatement({ sid: 'AllowKmsScoped', resources: ['*'], actions: [...KMS_USE] }),
-        new iam.PolicyStatement({ sid: 'AllowOwnBucket', actions: ['s3:GetObject', 's3:PutObject', 's3:ListBucket', 's3:GetBucketLocation'],
-            resources: [bucket, `${bucket}/*`] }),
-        new iam.PolicyStatement({ sid: 'AllowRoleWritesUnderWorkloadPath', actions: [...ROLE_WRITES], resources: [n.workloadRoles] }),
-        new iam.PolicyStatement({ sid: 'AllowPassWorkloadAndExecRoles', actions: ['iam:PassRole'], resources: [n.workloadRoles, n.execRoleArn] }),
+        allow('AllowNamespacedWorkloadResources', ['states:*', 'lambda:*', 'logs:*', 'sqs:*', 'events:*', 'cloudwatch:*'], [
+            `arn:aws:lambda:${r}:${a}:function:${p}*`, `arn:aws:states:${r}:${a}:stateMachine:${p}*`, `arn:aws:states:${r}:${a}:execution:${p}*`,
+            `arn:aws:logs:${r}:${a}:log-group:${p}*`, `arn:aws:sqs:${r}:${a}:${p}*`, `arn:aws:events:${r}:${a}:rule/${p}*`,
+            `arn:aws:cloudwatch:${r}:${a}:alarm:${p}*`]),
+        allow('AllowUnscopableReadsAndLogDelivery', UNSCOPABLE, ['*']),
+        allow('AllowNamespaceSecrets', ['secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret'],
+            [`arn:aws:secretsmanager:${r}:${a}:secret:ezil/${c.namespace}/*`]),
+        allow('AllowNamespaceRepositories', ['ecr:CreateRepository', 'ecr:DescribeRepositories', 'ecr:PutImageScanningConfiguration',
+            'ecr:PutImageTagMutability', 'ecr:TagResource', 'ecr:ListTagsForResource'], [`arn:aws:ecr:${r}:${a}:repository/${p}*`]),
+        allow('AllowNamespaceStacks', DEPLOY_CFN.filter(x => x !== 'cloudformation:CreateChangeSet' && x !== 'cloudformation:ValidateTemplate'),
+            [`arn:aws:cloudformation:${r}:${a}:stack/${p}*/*`]),
+        allow('AllowChangeSetsOnlyViaExec', ['cloudformation:CreateChangeSet'], [`arn:aws:cloudformation:${r}:${a}:stack/${p}*/*`],
+            { ArnEquals: { 'cloudformation:RoleArn': n.execRoleArn } }),
+        allow('AllowKmsCreateTagged', ['kms:CreateKey'], ['*'], { StringEquals: nsTag('Request') }),
+        allow('AllowKmsOnNamespaceKeys', KMS_USE.filter(x => x !== 'kms:CreateKey' && x !== 'kms:ListAliases'), [`arn:aws:kms:${r}:${a}:key/*`],
+            { StringEquals: nsTag('Resource') }),
+        ...networkCreateStatements(c, x => x),
+        allow('AllowEc2NetworkMutateTagged', EC2_NETWORK_MUTATIONS, ['*'], { StringEquals: nsTag('Resource') }),
+        allow('AllowLaunchTagged', ['ec2:RunInstances', 'ec2:CreateVolume'], [ec2('instance'), ec2('volume'), ec2('network-interface')],
+            { StringEquals: compute('Request') }),
+        allow('AllowLaunchIntoNamespaceNetwork', ['ec2:RunInstances'], [ec2('subnet'), ec2('security-group'), ec2('launch-template')],
+            { StringEquals: nsTag('Resource') }),
+        allow('AllowLaunchImages', ['ec2:RunInstances'], [`arn:aws:ec2:${r}::image/*`]),
+        allow('AllowRestoreNamespaceSnapshots', ['ec2:CreateVolume'], [`arn:aws:ec2:${r}::snapshot/*`],
+            { StringEquals: { 'aws:ResourceTag/ezil:backup': c.namespace } }),
+        allow('AllowComputeOnManaged', ['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances', 'ec2:AttachVolume',
+            'ec2:ModifyInstanceAttribute'], [ec2('instance'), ec2('volume')], { StringEquals: compute('Resource') }),
+        allow('AllowTagOnCreate', ['ec2:CreateTags'], ['*'], { StringEquals: { 'ec2:CreateAction': [...EC2_NETWORK_CREATES.map(x => x.slice(4)),
+            'RunInstances', 'CreateVolume'] } }),
+        allow('AllowRetagNamespaceNetwork', ['ec2:CreateTags'], ['*'], { StringEquals: nsTag('Resource') }),
+        allow('AllowRetagManagedCompute', ['ec2:CreateTags'], [ec2('instance'), ec2('volume')], { StringEquals: compute('Resource') }),
+        allow('AllowOwnBucket', ['s3:GetObject', 's3:PutObject', 's3:ListBucket', 's3:GetBucketLocation'], [bucket, `${bucket}/*`]),
+        allow('AllowRoleWritesUnderWorkloadPath', ROLE_WRITES, [n.workloadRoles]),
+        allow('AllowPassWorkloadAndExecRoles', ['iam:PassRole'], [n.workloadRoles, n.execRoleArn]),
         deny('RegionLock', [], { actions: undefined, notActions: [...GLOBAL_SERVICES],
             conditions: { StringNotEquals: { 'aws:RequestedRegion': c.region } } }),
         deny('NoUsersGroupsKeysOrBoundaryRemoval', IDENTITY_PRINCIPAL_WRITES),
@@ -127,6 +193,7 @@ export function boundaryStatements(c: IdentityConfig): iam.PolicyStatement[] {
         deny('NoOrgAccountBillingWrites', ACCOUNT_WRITES),
         deny('NoEdgeOrBudgetWrites', EDGE_AND_BUDGET_WRITES),
         deny('NoPurchasesOrReservations', PURCHASES),
+        ...(c.killSwitch ? [deny('KillSwitch', KILL_SWITCH_ACTIONS)] : []),
     ];
 }
 
@@ -143,7 +210,7 @@ export function execStatements(c: IdentityConfig): iam.PolicyStatement[] {
     const own = (service: string, kind: string) => `arn:aws:${service}:${r}:${a}:${kind}${n.stackPrefix}*`;
     return [
         regional(['ec2:Describe*']),
-        regional([...EC2_NETWORK_CREATES], ['*'], requestTag),
+        ...networkCreateStatements(c, () => undefined, inRegion),
         regional(['ec2:CreateTags'], ['*'], { StringEquals: { [`aws:RequestTag/${NAMESPACE_TAG}`]: c.namespace, 'ec2:CreateAction': [...EC2_NETWORK_CREATES.map(x => x.slice(4))] } }),
         regional([...EC2_NETWORK_MUTATIONS], ['*'], resourceTag),
         regional(['ecr:CreateRepository', 'ecr:DescribeRepositories', 'ecr:PutImageScanningConfiguration', 'ecr:PutImageTagMutability',

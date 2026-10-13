@@ -14,20 +14,64 @@
               "logs:*",
               "sqs:*",
               "events:*",
-              "cloudwatch:*",
-              "sns:Publish",
-              "sns:GetTopicAttributes",
-              "sns:ListTopics",
-              "sns:ListSubscriptionsByTopic",
+              "cloudwatch:*"
+            ],
+            "Effect": "Allow",
+            "Resource": [
+              "arn:aws:lambda:ap-south-1:123456789012:function:ezil-pilot-*",
+              "arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-*",
+              "arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-*",
+              "arn:aws:logs:ap-south-1:123456789012:log-group:ezil-pilot-*",
+              "arn:aws:sqs:ap-south-1:123456789012:ezil-pilot-*",
+              "arn:aws:events:ap-south-1:123456789012:rule/ezil-pilot-*",
+              "arn:aws:cloudwatch:ap-south-1:123456789012:alarm:ezil-pilot-*"
+            ],
+            "Sid": "AllowNamespacedWorkloadResources"
+          },
+          {
+            "Action": [
+              "ec2:Describe*",
+              "iam:Get*",
+              "iam:List*",
+              "kms:ListAliases",
+              "logs:DescribeLogGroups",
+              "logs:CreateLogDelivery",
+              "logs:GetLogDelivery",
+              "logs:UpdateLogDelivery",
+              "logs:DeleteLogDelivery",
+              "logs:ListLogDeliveries",
+              "logs:PutResourcePolicy",
+              "logs:DescribeResourcePolicies",
+              "cloudformation:ValidateTemplate"
+            ],
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": "AllowUnscopableReadsAndLogDelivery"
+          },
+          {
+            "Action": [
               "secretsmanager:GetSecretValue",
-              "secretsmanager:DescribeSecret",
+              "secretsmanager:DescribeSecret"
+            ],
+            "Effect": "Allow",
+            "Resource": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/pilot/*",
+            "Sid": "AllowNamespaceSecrets"
+          },
+          {
+            "Action": [
               "ecr:CreateRepository",
               "ecr:DescribeRepositories",
               "ecr:PutImageScanningConfiguration",
               "ecr:PutImageTagMutability",
               "ecr:TagResource",
-              "ecr:ListTagsForResource",
-              "cloudformation:CreateChangeSet",
+              "ecr:ListTagsForResource"
+            ],
+            "Effect": "Allow",
+            "Resource": "arn:aws:ecr:ap-south-1:123456789012:repository/ezil-pilot-*",
+            "Sid": "AllowNamespaceRepositories"
+          },
+          {
+            "Action": [
               "cloudformation:DescribeChangeSet",
               "cloudformation:ExecuteChangeSet",
               "cloudformation:DeleteChangeSet",
@@ -35,25 +79,113 @@
               "cloudformation:DescribeStackEvents",
               "cloudformation:GetTemplate",
               "cloudformation:GetTemplateSummary",
-              "cloudformation:ListStackResources",
-              "cloudformation:ValidateTemplate",
-              "iam:Get*",
-              "iam:List*"
+              "cloudformation:ListStackResources"
             ],
             "Effect": "Allow",
+            "Resource": "arn:aws:cloudformation:ap-south-1:123456789012:stack/ezil-pilot-*/*",
+            "Sid": "AllowNamespaceStacks"
+          },
+          {
+            "Action": "cloudformation:CreateChangeSet",
+            "Condition": {
+              "ArnEquals": {
+                "cloudformation:RoleArn": "arn:aws:iam::123456789012:role/ezil/identity/ezil-pilot-cfn-exec"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:cloudformation:ap-south-1:123456789012:stack/ezil-pilot-*/*",
+            "Sid": "AllowChangeSetsOnlyViaExec"
+          },
+          {
+            "Action": "kms:CreateKey",
+            "Condition": {
+              "StringEquals": {
+                "aws:RequestTag/ezil:namespace": "pilot"
+              }
+            },
+            "Effect": "Allow",
             "Resource": "*",
-            "Sid": "AllowWorkloadServices"
+            "Sid": "AllowKmsCreateTagged"
           },
           {
             "Action": [
-              "ec2:Describe*",
-              "ec2:CreateTags",
+              "kms:DescribeKey",
+              "kms:GetKeyPolicy",
+              "kms:PutKeyPolicy",
+              "kms:EnableKeyRotation",
+              "kms:GetKeyRotationStatus",
+              "kms:TagResource",
+              "kms:ListResourceTags",
+              "kms:Encrypt",
+              "kms:Decrypt",
+              "kms:ReEncrypt*",
+              "kms:GenerateDataKey*",
+              "kms:CreateGrant"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:ResourceTag/ezil:namespace": "pilot"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:kms:ap-south-1:123456789012:key/*",
+            "Sid": "AllowKmsOnNamespaceKeys"
+          },
+          {
+            "Action": [
               "ec2:CreateVpc",
-              "ec2:CreateSubnet",
               "ec2:CreateInternetGateway",
+              "ec2:CreateLaunchTemplate"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:RequestTag/ezil:namespace": "pilot"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": [
+              "arn:aws:ec2:ap-south-1:123456789012:vpc/*",
+              "arn:aws:ec2:ap-south-1:123456789012:internet-gateway/*",
+              "arn:aws:ec2:ap-south-1:123456789012:launch-template/*"
+            ],
+            "Sid": "AllowEc2TopLevelCreateTagged"
+          },
+          {
+            "Action": [
+              "ec2:CreateSubnet",
               "ec2:CreateRouteTable",
-              "ec2:CreateSecurityGroup",
-              "ec2:CreateLaunchTemplate",
+              "ec2:CreateSecurityGroup"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:RequestTag/ezil:namespace": "pilot"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": [
+              "arn:aws:ec2:ap-south-1:123456789012:subnet/*",
+              "arn:aws:ec2:ap-south-1:123456789012:route-table/*",
+              "arn:aws:ec2:ap-south-1:123456789012:security-group/*"
+            ],
+            "Sid": "AllowEc2InVpcCreateTagged"
+          },
+          {
+            "Action": [
+              "ec2:CreateSubnet",
+              "ec2:CreateRouteTable",
+              "ec2:CreateSecurityGroup"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:ResourceTag/ezil:namespace": "pilot"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1:123456789012:vpc/*",
+            "Sid": "AllowEc2CreateOnlyInNamespaceVpc"
+          },
+          {
+            "Action": [
               "ec2:ModifyVpcAttribute",
               "ec2:DeleteVpc",
               "ec2:AttachInternetGateway",
@@ -72,39 +204,134 @@
               "ec2:DeleteSecurityGroup",
               "ec2:CreateLaunchTemplateVersion",
               "ec2:ModifyLaunchTemplate",
-              "ec2:DeleteLaunchTemplate",
+              "ec2:DeleteLaunchTemplate"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:ResourceTag/ezil:namespace": "pilot"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": "AllowEc2NetworkMutateTagged"
+          },
+          {
+            "Action": [
               "ec2:RunInstances",
+              "ec2:CreateVolume"
+            ],
+            "Condition": {
+              "StringEquals": {
+                "aws:RequestTag/ezil:managed-by": "app-computer-platform",
+                "aws:RequestTag/ezil:stage": "pilot"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": [
+              "arn:aws:ec2:ap-south-1:123456789012:instance/*",
+              "arn:aws:ec2:ap-south-1:123456789012:volume/*",
+              "arn:aws:ec2:ap-south-1:123456789012:network-interface/*"
+            ],
+            "Sid": "AllowLaunchTagged"
+          },
+          {
+            "Action": "ec2:RunInstances",
+            "Condition": {
+              "StringEquals": {
+                "aws:ResourceTag/ezil:namespace": "pilot"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": [
+              "arn:aws:ec2:ap-south-1:123456789012:subnet/*",
+              "arn:aws:ec2:ap-south-1:123456789012:security-group/*",
+              "arn:aws:ec2:ap-south-1:123456789012:launch-template/*"
+            ],
+            "Sid": "AllowLaunchIntoNamespaceNetwork"
+          },
+          {
+            "Action": "ec2:RunInstances",
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1::image/*",
+            "Sid": "AllowLaunchImages"
+          },
+          {
+            "Action": "ec2:CreateVolume",
+            "Condition": {
+              "StringEquals": {
+                "aws:ResourceTag/ezil:backup": "pilot"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:ec2:ap-south-1::snapshot/*",
+            "Sid": "AllowRestoreNamespaceSnapshots"
+          },
+          {
+            "Action": [
               "ec2:StartInstances",
               "ec2:StopInstances",
               "ec2:TerminateInstances",
               "ec2:AttachVolume",
-              "ec2:CreateVolume",
               "ec2:ModifyInstanceAttribute"
             ],
+            "Condition": {
+              "StringEquals": {
+                "aws:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "aws:ResourceTag/ezil:stage": "pilot"
+              }
+            },
             "Effect": "Allow",
-            "Resource": "*",
-            "Sid": "AllowEc2Scoped"
+            "Resource": [
+              "arn:aws:ec2:ap-south-1:123456789012:instance/*",
+              "arn:aws:ec2:ap-south-1:123456789012:volume/*"
+            ],
+            "Sid": "AllowComputeOnManaged"
           },
           {
-            "Action": [
-              "kms:CreateKey",
-              "kms:DescribeKey",
-              "kms:GetKeyPolicy",
-              "kms:PutKeyPolicy",
-              "kms:EnableKeyRotation",
-              "kms:GetKeyRotationStatus",
-              "kms:TagResource",
-              "kms:ListResourceTags",
-              "kms:ListAliases",
-              "kms:Encrypt",
-              "kms:Decrypt",
-              "kms:ReEncrypt*",
-              "kms:GenerateDataKey*",
-              "kms:CreateGrant"
-            ],
+            "Action": "ec2:CreateTags",
+            "Condition": {
+              "StringEquals": {
+                "ec2:CreateAction": [
+                  "CreateVpc",
+                  "CreateSubnet",
+                  "CreateInternetGateway",
+                  "CreateRouteTable",
+                  "CreateSecurityGroup",
+                  "CreateLaunchTemplate",
+                  "RunInstances",
+                  "CreateVolume"
+                ]
+              }
+            },
             "Effect": "Allow",
             "Resource": "*",
-            "Sid": "AllowKmsScoped"
+            "Sid": "AllowTagOnCreate"
+          },
+          {
+            "Action": "ec2:CreateTags",
+            "Condition": {
+              "StringEquals": {
+                "aws:ResourceTag/ezil:namespace": "pilot"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": "AllowRetagNamespaceNetwork"
+          },
+          {
+            "Action": "ec2:CreateTags",
+            "Condition": {
+              "StringEquals": {
+                "aws:ResourceTag/ezil:managed-by": "app-computer-platform",
+                "aws:ResourceTag/ezil:stage": "pilot"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": [
+              "arn:aws:ec2:ap-south-1:123456789012:instance/*",
+              "arn:aws:ec2:ap-south-1:123456789012:volume/*"
+            ],
+            "Sid": "AllowRetagManagedCompute"
           },
           {
             "Action": [
@@ -418,10 +645,7 @@
               {
                 "Action": [
                   "ec2:CreateVpc",
-                  "ec2:CreateSubnet",
                   "ec2:CreateInternetGateway",
-                  "ec2:CreateRouteTable",
-                  "ec2:CreateSecurityGroup",
                   "ec2:CreateLaunchTemplate"
                 ],
                 "Condition": {
@@ -431,7 +655,45 @@
                   }
                 },
                 "Effect": "Allow",
-                "Resource": "*"
+                "Resource": [
+                  "arn:aws:ec2:ap-south-1:123456789012:vpc/*",
+                  "arn:aws:ec2:ap-south-1:123456789012:internet-gateway/*",
+                  "arn:aws:ec2:ap-south-1:123456789012:launch-template/*"
+                ]
+              },
+              {
+                "Action": [
+                  "ec2:CreateSubnet",
+                  "ec2:CreateRouteTable",
+                  "ec2:CreateSecurityGroup"
+                ],
+                "Condition": {
+                  "StringEquals": {
+                    "aws:RequestedRegion": "ap-south-1",
+                    "aws:RequestTag/ezil:namespace": "pilot"
+                  }
+                },
+                "Effect": "Allow",
+                "Resource": [
+                  "arn:aws:ec2:ap-south-1:123456789012:subnet/*",
+                  "arn:aws:ec2:ap-south-1:123456789012:route-table/*",
+                  "arn:aws:ec2:ap-south-1:123456789012:security-group/*"
+                ]
+              },
+              {
+                "Action": [
+                  "ec2:CreateSubnet",
+                  "ec2:CreateRouteTable",
+                  "ec2:CreateSecurityGroup"
+                ],
+                "Condition": {
+                  "StringEquals": {
+                    "aws:RequestedRegion": "ap-south-1",
+                    "aws:ResourceTag/ezil:namespace": "pilot"
+                  }
+                },
+                "Effect": "Allow",
+                "Resource": "arn:aws:ec2:ap-south-1:123456789012:vpc/*"
               },
               {
                 "Action": "ec2:CreateTags",

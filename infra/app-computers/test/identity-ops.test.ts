@@ -12,6 +12,7 @@ import { ComputerLifecycleRecovery } from '../lib/lifecycle-recovery.js';
 import { applyWorkloadIdentity, tagWorkload, workloadSynthesizer } from '../lib/workload-identity.js';
 import { lifecycleFixture, REGION } from './lifecycle-fixture.js';
 import { LifecycleDeploymentSchema } from '../lib/lifecycle/deployment.js';
+import { SettingsSchema } from '../lib/lifecycle/contract.js';
 
 const A = '123456789012', R = REGION;
 const cfg = IdentityConfigSchema.parse({ namespace: 'pilot', accountId: A, region: R,
@@ -23,30 +24,63 @@ const opsCfg = OpsConfigSchema.parse({ namespace: 'pilot', accountId: A, region:
 
 const ROLES = `arn:aws:iam::${A}:role/ezil/pilot/*`, BUCKET = `arn:aws:s3:::ezil-pilot-deploy-assets-${A}`;
 const BASIC = 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole';
-test('I5 boundary is an allowlist plus explicit denies, exactly as reviewed', () => {
+const EC2 = (kind: string) => `arn:aws:ec2:${R}:${A}:${kind}/*`;
+const NS = (k: string) => ({ [`aws:${k}Tag/ezil:namespace`]: 'pilot' });
+const COMPUTE = (k: string) => ({ [`aws:${k}Tag/ezil:managed-by`]: 'app-computer-platform', [`aws:${k}Tag/ezil:stage`]: 'pilot' });
+function expectedBoundary(killSwitch: boolean) {
     const roleWrites = ['iam:CreateRole', 'iam:DeleteRole', 'iam:UpdateRole', 'iam:UpdateRoleDescription', 'iam:UpdateAssumeRolePolicy',
         'iam:PutRolePolicy', 'iam:DeleteRolePolicy', 'iam:AttachRolePolicy', 'iam:DetachRolePolicy', 'iam:PutRolePermissionsBoundary',
         'iam:TagRole', 'iam:UntagRole'];
-    assert.deepEqual(json(boundaryStatements(cfg)), [
-        { Sid: 'AllowWorkloadServices', Effect: 'Allow', Resource: '*', Action: ['states:*', 'lambda:*', 'logs:*', 'sqs:*', 'events:*',
-            'cloudwatch:*', 'sns:Publish', 'sns:GetTopicAttributes', 'sns:ListTopics', 'sns:ListSubscriptionsByTopic',
-            'secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret', 'ecr:CreateRepository', 'ecr:DescribeRepositories',
-            'ecr:PutImageScanningConfiguration', 'ecr:PutImageTagMutability', 'ecr:TagResource', 'ecr:ListTagsForResource',
-            'cloudformation:CreateChangeSet', 'cloudformation:DescribeChangeSet', 'cloudformation:ExecuteChangeSet',
-            'cloudformation:DeleteChangeSet', 'cloudformation:DescribeStacks', 'cloudformation:DescribeStackEvents',
-            'cloudformation:GetTemplate', 'cloudformation:GetTemplateSummary', 'cloudformation:ListStackResources',
-            'cloudformation:ValidateTemplate', 'iam:Get*', 'iam:List*'] },
-        { Sid: 'AllowEc2Scoped', Effect: 'Allow', Resource: '*', Action: ['ec2:Describe*', 'ec2:CreateTags', 'ec2:CreateVpc', 'ec2:CreateSubnet',
-            'ec2:CreateInternetGateway', 'ec2:CreateRouteTable', 'ec2:CreateSecurityGroup', 'ec2:CreateLaunchTemplate', 'ec2:ModifyVpcAttribute',
-            'ec2:DeleteVpc', 'ec2:AttachInternetGateway', 'ec2:DetachInternetGateway', 'ec2:DeleteInternetGateway', 'ec2:CreateRoute',
-            'ec2:ReplaceRoute', 'ec2:DeleteRoute', 'ec2:DeleteRouteTable', 'ec2:AssociateRouteTable', 'ec2:DisassociateRouteTable',
-            'ec2:ModifySubnetAttribute', 'ec2:DeleteSubnet', 'ec2:AuthorizeSecurityGroupEgress', 'ec2:RevokeSecurityGroupEgress',
-            'ec2:DeleteSecurityGroup', 'ec2:CreateLaunchTemplateVersion', 'ec2:ModifyLaunchTemplate', 'ec2:DeleteLaunchTemplate',
-            'ec2:RunInstances', 'ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances', 'ec2:AttachVolume', 'ec2:CreateVolume',
-            'ec2:ModifyInstanceAttribute'] },
-        { Sid: 'AllowKmsScoped', Effect: 'Allow', Resource: '*', Action: ['kms:CreateKey', 'kms:DescribeKey', 'kms:GetKeyPolicy',
-            'kms:PutKeyPolicy', 'kms:EnableKeyRotation', 'kms:GetKeyRotationStatus', 'kms:TagResource', 'kms:ListResourceTags',
-            'kms:ListAliases', 'kms:Encrypt', 'kms:Decrypt', 'kms:ReEncrypt*', 'kms:GenerateDataKey*', 'kms:CreateGrant'] },
+    const stacks = `arn:aws:cloudformation:${R}:${A}:stack/ezil-pilot-*/*`;
+    return [
+        { Sid: 'AllowNamespacedWorkloadResources', Effect: 'Allow', Action: ['states:*', 'lambda:*', 'logs:*', 'sqs:*', 'events:*', 'cloudwatch:*'],
+            Resource: [`arn:aws:lambda:${R}:${A}:function:ezil-pilot-*`, `arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-*`,
+                `arn:aws:states:${R}:${A}:execution:ezil-pilot-*`, `arn:aws:logs:${R}:${A}:log-group:ezil-pilot-*`, `arn:aws:sqs:${R}:${A}:ezil-pilot-*`,
+                `arn:aws:events:${R}:${A}:rule/ezil-pilot-*`, `arn:aws:cloudwatch:${R}:${A}:alarm:ezil-pilot-*`] },
+        { Sid: 'AllowUnscopableReadsAndLogDelivery', Effect: 'Allow', Resource: '*', Action: ['ec2:Describe*', 'iam:Get*', 'iam:List*',
+            'kms:ListAliases', 'logs:DescribeLogGroups', 'logs:CreateLogDelivery', 'logs:GetLogDelivery', 'logs:UpdateLogDelivery',
+            'logs:DeleteLogDelivery', 'logs:ListLogDeliveries', 'logs:PutResourcePolicy', 'logs:DescribeResourcePolicies',
+            'cloudformation:ValidateTemplate'] },
+        { Sid: 'AllowNamespaceSecrets', Effect: 'Allow', Action: ['secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret'],
+            Resource: `arn:aws:secretsmanager:${R}:${A}:secret:ezil/pilot/*` },
+        { Sid: 'AllowNamespaceRepositories', Effect: 'Allow', Action: ['ecr:CreateRepository', 'ecr:DescribeRepositories',
+            'ecr:PutImageScanningConfiguration', 'ecr:PutImageTagMutability', 'ecr:TagResource', 'ecr:ListTagsForResource'],
+            Resource: `arn:aws:ecr:${R}:${A}:repository/ezil-pilot-*` },
+        { Sid: 'AllowNamespaceStacks', Effect: 'Allow', Resource: stacks, Action: ['cloudformation:DescribeChangeSet',
+            'cloudformation:ExecuteChangeSet', 'cloudformation:DeleteChangeSet', 'cloudformation:DescribeStacks', 'cloudformation:DescribeStackEvents',
+            'cloudformation:GetTemplate', 'cloudformation:GetTemplateSummary', 'cloudformation:ListStackResources'] },
+        { Sid: 'AllowChangeSetsOnlyViaExec', Effect: 'Allow', Action: 'cloudformation:CreateChangeSet', Resource: stacks,
+            Condition: { ArnEquals: { 'cloudformation:RoleArn': EXEC } } },
+        { Sid: 'AllowKmsCreateTagged', Effect: 'Allow', Action: 'kms:CreateKey', Resource: '*', Condition: { StringEquals: NS('Request') } },
+        { Sid: 'AllowKmsOnNamespaceKeys', Effect: 'Allow', Resource: `arn:aws:kms:${R}:${A}:key/*`, Condition: { StringEquals: NS('Resource') },
+            Action: ['kms:DescribeKey', 'kms:GetKeyPolicy', 'kms:PutKeyPolicy', 'kms:EnableKeyRotation', 'kms:GetKeyRotationStatus',
+                'kms:TagResource', 'kms:ListResourceTags', 'kms:Encrypt', 'kms:Decrypt', 'kms:ReEncrypt*', 'kms:GenerateDataKey*', 'kms:CreateGrant'] },
+        { Sid: 'AllowEc2TopLevelCreateTagged', Effect: 'Allow', Action: ['ec2:CreateVpc', 'ec2:CreateInternetGateway', 'ec2:CreateLaunchTemplate'],
+            Resource: [EC2('vpc'), EC2('internet-gateway'), EC2('launch-template')], Condition: { StringEquals: NS('Request') } },
+        { Sid: 'AllowEc2InVpcCreateTagged', Effect: 'Allow', Action: ['ec2:CreateSubnet', 'ec2:CreateRouteTable', 'ec2:CreateSecurityGroup'],
+            Resource: [EC2('subnet'), EC2('route-table'), EC2('security-group')], Condition: { StringEquals: NS('Request') } },
+        { Sid: 'AllowEc2CreateOnlyInNamespaceVpc', Effect: 'Allow', Action: ['ec2:CreateSubnet', 'ec2:CreateRouteTable', 'ec2:CreateSecurityGroup'],
+            Resource: EC2('vpc'), Condition: { StringEquals: NS('Resource') } },
+        { Sid: 'AllowEc2NetworkMutateTagged', Effect: 'Allow', Resource: '*', Condition: { StringEquals: NS('Resource') },
+            Action: ['ec2:ModifyVpcAttribute', 'ec2:DeleteVpc', 'ec2:AttachInternetGateway', 'ec2:DetachInternetGateway', 'ec2:DeleteInternetGateway',
+                'ec2:CreateRoute', 'ec2:ReplaceRoute', 'ec2:DeleteRoute', 'ec2:DeleteRouteTable', 'ec2:AssociateRouteTable', 'ec2:DisassociateRouteTable',
+                'ec2:ModifySubnetAttribute', 'ec2:DeleteSubnet', 'ec2:AuthorizeSecurityGroupEgress', 'ec2:RevokeSecurityGroupEgress',
+                'ec2:DeleteSecurityGroup', 'ec2:CreateLaunchTemplateVersion', 'ec2:ModifyLaunchTemplate', 'ec2:DeleteLaunchTemplate'] },
+        { Sid: 'AllowLaunchTagged', Effect: 'Allow', Action: ['ec2:RunInstances', 'ec2:CreateVolume'],
+            Resource: [EC2('instance'), EC2('volume'), EC2('network-interface')], Condition: { StringEquals: COMPUTE('Request') } },
+        { Sid: 'AllowLaunchIntoNamespaceNetwork', Effect: 'Allow', Action: 'ec2:RunInstances',
+            Resource: [EC2('subnet'), EC2('security-group'), EC2('launch-template')], Condition: { StringEquals: NS('Resource') } },
+        { Sid: 'AllowLaunchImages', Effect: 'Allow', Action: 'ec2:RunInstances', Resource: `arn:aws:ec2:${R}::image/*` },
+        { Sid: 'AllowRestoreNamespaceSnapshots', Effect: 'Allow', Action: 'ec2:CreateVolume', Resource: `arn:aws:ec2:${R}::snapshot/*`,
+            Condition: { StringEquals: { 'aws:ResourceTag/ezil:backup': 'pilot' } } },
+        { Sid: 'AllowComputeOnManaged', Effect: 'Allow', Action: ['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances',
+            'ec2:AttachVolume', 'ec2:ModifyInstanceAttribute'], Resource: [EC2('instance'), EC2('volume')], Condition: { StringEquals: COMPUTE('Resource') } },
+        { Sid: 'AllowTagOnCreate', Effect: 'Allow', Action: 'ec2:CreateTags', Resource: '*', Condition: { StringEquals: { 'ec2:CreateAction': [
+            'CreateVpc', 'CreateSubnet', 'CreateInternetGateway', 'CreateRouteTable', 'CreateSecurityGroup', 'CreateLaunchTemplate',
+            'RunInstances', 'CreateVolume'] } } },
+        { Sid: 'AllowRetagNamespaceNetwork', Effect: 'Allow', Action: 'ec2:CreateTags', Resource: '*', Condition: { StringEquals: NS('Resource') } },
+        { Sid: 'AllowRetagManagedCompute', Effect: 'Allow', Action: 'ec2:CreateTags', Resource: [EC2('instance'), EC2('volume')],
+            Condition: { StringEquals: COMPUTE('Resource') } },
         { Sid: 'AllowOwnBucket', Effect: 'Allow', Action: ['s3:GetObject', 's3:PutObject', 's3:ListBucket', 's3:GetBucketLocation'],
             Resource: [BUCKET, `${BUCKET}/*`] },
         { Sid: 'AllowRoleWritesUnderWorkloadPath', Effect: 'Allow', Action: roleWrites, Resource: ROLES },
@@ -86,8 +120,22 @@ test('I5 boundary is an allowlist plus explicit denies, exactly as reviewed', ()
             'ec2:RequestSpot*', 'ec2:CreateFleet', 'savingsplans:*', 'rds:PurchaseReserved*', 'elasticache:PurchaseReserved*',
             'redshift:PurchaseReserved*', 'es:PurchaseReserved*', 'dynamodb:PurchaseReserved*', 'aws-marketplace:Subscribe',
             'aws-marketplace:AcceptAgreement*'] },
-    ]);
+        ...(killSwitch ? [{ Sid: 'KillSwitch', Effect: 'Deny', Resource: '*', Action: ['ec2:RunInstances', 'ec2:StartInstances',
+            'ec2:AttachVolume', 'ec2:CreateVolume', 'ec2:CreateFleet', 'ec2:RequestSpot*', 'states:StartExecution', 'states:StartSyncExecution',
+            'states:RedriveExecution', 'lambda:InvokeFunction', 'events:PutTargets'] }] : []),
+    ];
+}
+test('I5 boundary: every allow is scoped by name, namespace tag or compute tag; explicit denies; kill switch off', () => {
+    assert.deepEqual(json(boundaryStatements(cfg)), expectedBoundary(false));
+    assert.equal(cfg.killSwitch, false, 'kill switch defaults off');
     assert.deepEqual([...GLOBAL_SERVICES], ['iam:*']);
+    // The only `*` allows are the enumerated unscopable reads/log deliveries, and creates/retags gated by tag or CreateAction.
+    for (const s of expectedBoundary(false).filter(s => s.Effect === 'Allow' && s.Resource === '*' && !('Condition' in s)))
+        assert.equal(s.Sid, 'AllowUnscopableReadsAndLogDelivery');
+});
+test('I5 boundary: the founder kill switch adds one deny covering every bounded role', () => {
+    const on = IdentityConfigSchema.parse({ ...cfg, killSwitch: true });
+    assert.deepEqual(json(boundaryStatements(on)), expectedBoundary(true));
 });
 
 test('item 1: namespaces are lowercase alphanumeric, never reserved, never identity', () => {
@@ -101,6 +149,9 @@ test('item 1: namespaces are lowercase alphanumeric, never reserved, never ident
     assert.equal(LifecycleDeploymentSchema.safeParse({ ...f.settings.deployment,
         stateMachineVersionArn: `arn:aws:states:${R}:${A}:stateMachine:ezil-other-lifecycle:1` }).success, false);
     assert.equal(IdentityConfigSchema.safeParse({ ...cfg, namespace: 'pilot2' }).success, true);
+    // Bounded roles may read only secrets named ezil/<ns>/*.
+    assert.equal(SettingsSchema.safeParse({ ...f.settings, authoritySecretArn: `arn:aws:secretsmanager:${R}:${A}:secret:ezil/other/key-abcdef` }).success, false);
+    assert.equal(SettingsSchema.safeParse({ ...f.settings, authoritySecretArn: `arn:aws:secretsmanager:${R}:${A}:secret:prod/db-abcdef` }).success, false);
     // A valid namespace can never collide with another's prefix: no '-' inside a namespace.
     assert.ok(!`ezil-pilot2-x`.startsWith(identityNames(cfg).stackPrefix));
 });

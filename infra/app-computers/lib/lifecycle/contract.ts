@@ -16,7 +16,8 @@ export const SettingsSchema = z.object({ deployment: LifecycleDeploymentSchema,
     authorityOrigin: z.string(), authoritySecretArn: z.string(), features: FeaturesSchema.default({}) }).strict().superRefine((s,ctx)=>{
     const d=s.deployment;
     if(!/^https:\/\/(?:[a-z0-9][a-z0-9-]*\.)+[a-z]{2,}$/.test(s.authorityOrigin)
-        ||!new RegExp(`^arn:aws:secretsmanager:${d.region}:${d.accountId}:secret:[A-Za-z0-9/_+=.@-]{1,512}-[A-Za-z0-9]{6}$`).test(s.authoritySecretArn)){
+        // The boundary lets bounded roles read only secrets named ezil/<ns>/*.
+        ||!new RegExp(`^arn:aws:secretsmanager:${d.region}:${d.accountId}:secret:ezil/${d.namespace}/[A-Za-z0-9/_+=.@-]{1,480}-[A-Za-z0-9]{6}$`).test(s.authoritySecretArn)){
         ctx.addIssue({code:'custom',message:'invalid_lifecycle_settings'});
     }
 });

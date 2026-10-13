@@ -500,14 +500,14 @@
         {
           "Action": "secretsmanager:GetSecretValue",
           "Effect": "Allow",
-          "Resource": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/lifecycle-key-abcdef"
+          "Resource": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/pilot/lifecycle-key-abcdef"
         },
         {
           "Action": "kms:Decrypt",
           "Condition": {
             "StringEquals": {
               "kms:ViaService": "secretsmanager.ap-south-1.amazonaws.com",
-              "kms:EncryptionContext:SecretARN": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/lifecycle-key-abcdef"
+              "kms:EncryptionContext:SecretARN": "arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/pilot/lifecycle-key-abcdef"
             }
           },
           "Effect": "Allow",

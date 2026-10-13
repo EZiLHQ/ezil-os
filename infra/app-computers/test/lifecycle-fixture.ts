@@ -13,7 +13,7 @@ export function lifecycleFixture(operation:LifecycleIntent['operation']='provisi
         dataKeyArn:`arn:aws:kms:${REGION}:123456789012:key/11111111-1111-4111-8111-111111111111`,
         stateMachineVersionArn:`arn:aws:states:${REGION}:123456789012:stateMachine:ezil-pilot-lifecycle:1`};
     const settings=SettingsSchema.parse({deployment,features:{userDataNonce:options.userDataNonce??false},authorityOrigin:'https://control.example',
-        authoritySecretArn:`arn:aws:secretsmanager:${REGION}:123456789012:secret:ezil/lifecycle-key-abcdef`});
+        authoritySecretArn:`arn:aws:secretsmanager:${REGION}:123456789012:secret:ezil/pilot/lifecycle-key-abcdef`});
     const instanceType=options.instanceType??'m6i.large',dataVolumeGiB=operation==='provision'?options.dataVolumeGiB??20:null;
     const i:LifecycleIntent={schemaVersion:1,jobId:randomUUID(),computerId,revision:1,operation,targetGeneration:generation,fenceToken:randomUUID(),
         providerInstanceId:['provision','replace'].includes(operation)?null:'i-11111111111111111',dataVolumeId:operation==='provision'?null:'vol-11111111111111111',
