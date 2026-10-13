@@ -118,6 +118,12 @@ interface Env extends SandboxEnv {
    * normally be ABSENT in production. Never logged or returned.
    */
   SANDBOX_MISSION_HMAC_SECRET?: string;
+  /**
+   * ISO timestamp. While it is in the future (or when it is absent) the v1
+   * preview envelope (`t=…,v1=…`) is still accepted; at/after it only the v2
+   * signed envelope (`x-ezil-auth`) is. Unparseable => v1 refused (fail closed).
+   */
+  EZIL_PREVIEW_TOKEN_V1_UNTIL?: string;
 
   // ── R2 binding workspace bucket (preferred, credential-less mount path) ────
   // Bound via [[r2_buckets]] in wrangler.toml. When present, this is the
@@ -509,6 +515,10 @@ import {
 import { baselineSystemLayer, flushSystemLayer, hydrateSystemLayer, systemPrefixOf, type SystemFlushOutcome } from './system-persist';
 import {
   resolveWorkspaceStore,
+  resolvePinnedWorkspaceStore,
+  isWorkspaceStoreKind,
+  type WorkspaceStoreKind,
+  type WorkspaceStoreResolution,
   type WorkspaceStore,
 } from './workspace-store-s3';
 // NOTE: `TWEN_SCHEMA`, `TWEN_OPS`, `TWEN_OP_ID_RE`, `TWEN_ALLOWED_FIELDS`,
@@ -607,6 +617,11 @@ import {
   verifyPreviewBootstrapToken,
   mintPreviewBootstrapToken,
   PREVIEW_COOKIE_NAME,
+  PREVIEW_TOKEN_V2_HEADER,
+  isPreviewTokenV2,
+  previewTokenV1Accepted,
+  verifyPreviewTokenV2,
+  type PreviewTokenV2Claims,
 } from './hmac';
 import {
   LifecycleTimeline,
@@ -776,7 +791,7 @@ interface EzilWorkspacePersistRpc {
   setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void>;
   desktopReachable(): Promise<boolean>;
   relayRefresh(sandboxId: string, runtimeId?: string): Promise<RelayResult>;
-  hydrateWorkspace(params: { mountPath: string; prefix: string }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }>;
+  hydrateWorkspace(params: { mountPath: string; prefix: string; expectedStore?: WorkspaceStoreKind }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }>;
   /** Start capturing user changes outside /workspace (system layer). Called once the desktop is up. */
   baselineSystem(): Promise<boolean>;
   recordWorkspaceHydration(params: { prefix: string; mountPath: string; hydrated: boolean }): Promise<void>;
@@ -1369,7 +1384,9 @@ export async function ensureWorkspaceMount(
   sandbox: Sandbox<unknown> & EzilWorkspacePersistRpc,
   env: Env,
   { projectId, branch }: { projectId: string; branch: string },
+  opts?: { expectedStore?: WorkspaceStoreKind },
 ): Promise<{ mounted: boolean; mountPath?: string; detail?: string }> {
+  const expectedStore = opts?.expectedStore;
   // Durable store selection takes precedence over the legacy mount config.
   // When EZIL_WORKSPACE_STORE='s3', ALWAYS take the Worker-mediated
   // hydrate/flush path (`hydrateWorkspace`) — NEVER the s3fs mount, which drops
@@ -1389,7 +1406,7 @@ export async function ensureWorkspaceMount(
     const cfg = resolveWorkspaceMountConfig(env);
     const mountPath = cfg?.mountPath ?? (env.SANDBOX_WORKSPACE_MOUNT_PATH?.trim() || DEFAULT_WORKSPACE_MOUNT_PATH);
     const prefix = cfg?.prefix ?? `/${projectId}/branches/${branch}`;
-    return sandbox.hydrateWorkspace({ mountPath, prefix });
+    return sandbox.hydrateWorkspace({ mountPath, prefix, ...(expectedStore ? { expectedStore } : {}) });
   }
 
   const config = resolveWorkspaceMountConfig(env);
@@ -1409,7 +1426,7 @@ export async function ensureWorkspaceMount(
     // `@cloudflare/sandbox` fixes it). `/workspace` is now plain local disk;
     // R2 is reached only through this Worker's own R2 BINDING, which never
     // goes through that emulator. See `ensureWorkspaceHydratedFromR2`.
-    return sandbox.hydrateWorkspace({ mountPath: config.mountPath, prefix });
+    return sandbox.hydrateWorkspace({ mountPath: config.mountPath, prefix, ...(expectedStore ? { expectedStore } : {}) });
   }
 
   // ── Generic S3-compatible fallback (local dev / no native R2 binding) ─────
@@ -1417,6 +1434,8 @@ export async function ensureWorkspaceMount(
   // S3-compatible endpoint, e.g. local Supabase Storage, does not run through
   // Cloudflare's in-DO R2 emulation layer), so this branch is deliberately
   // left mounting via s3fs exactly as before.
+  // It has no Durable Object store choice to match a signed store claim against.
+  if (expectedStore) return { mounted: false, detail: 'workspace_store_claim_mismatch' };
   const MOUNT_ATTEMPTS = 4;
   let mountErr = '';
   let mounted = false;
@@ -1708,6 +1727,15 @@ async function ensureWorkspaceHydratedFromR2(
 // ── Durable Object storage keys (EzilSandboxDO) ──────────────────────────────
 const WORKSPACE_FLUSH_CONTEXT_KEY = 'ezil:workspaceFlushContext';
 const WORKSPACE_HYDRATED_KEY = 'ezil:workspaceHydrated';
+/**
+ * Sticky per-computer workspace store ('r2' | 's3', R13). Written once, when a
+ * checkpoint first commits in a store (or an R2 hydrate succeeds); from then
+ * on every hydrate and every alarm flush uses it, whatever
+ * `EZIL_WORKSPACE_STORE` says. Never rewritten from 's3' to 'r2'. Computers
+ * that last hydrated before this key existed have no pin: they bootstrap from
+ * env exactly once (legacy branch in `selectWorkspaceStore`) and pin then.
+ */
+const WORKSPACE_STORE_KIND_KEY = 'ezil:workspaceStoreKind';
 /**
  * 🔴 REMOVED, deliberately — read this before reintroducing anything like it.
  *
@@ -2477,17 +2505,57 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return next;
   }
 
-  async hydrateWorkspace(params: { mountPath: string; prefix: string }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }> {
+  /**
+   * This computer's workspace store (R13). Order: the PINNED choice (DO
+   * storage), else — legacy, never pinned yet — the env selector. A request's
+   * signed store claim must equal the choice or the request is refused; an
+   * empty claim is no claim. Fail closed on an unreadable pin.
+   */
+  private async selectWorkspaceStore(claim?: WorkspaceStoreKind): Promise<
+    (WorkspaceStoreResolution & { ok: true; pinned: boolean }) | { ok: false; detail: string }
+  > {
+    const pinned = await this.ctx.storage.get<unknown>(WORKSPACE_STORE_KIND_KEY);
+    if (pinned !== undefined && !isWorkspaceStoreKind(pinned)) return { ok: false, detail: 'workspace_store_pin_invalid' };
+    if (pinned !== undefined) {
+      if (claim !== undefined && claim !== pinned) {
+        return { ok: false, detail: pinned === 's3' ? 'workspace_store_downgrade_refused' : 'workspace_store_claim_mismatch' };
+      }
+      const sel = resolvePinnedWorkspaceStore(this.env, pinned);
+      return sel.ok ? { ...sel, pinned: true } : sel;
+    }
+    // Fresh per call so the migrating store's per-prefix read routing cache
+    // cannot outlive a migration (a stale 'R2' route would re-restore
+    // pre-migration content on a later hydrate).
+    const sel = resolveWorkspaceStore(this.env);
+    if (!sel.ok) return sel;
+    if (claim !== undefined && claim !== sel.kind) return { ok: false, detail: 'workspace_store_claim_mismatch' };
+    return { ...sel, pinned: false };
+  }
+
+  /** Pin the store a checkpoint just committed to. Never moves an existing pin (so never S3 -> R2). */
+  private async pinWorkspaceStore(kind: WorkspaceStoreKind): Promise<void> {
+    const current = await this.ctx.storage.get<unknown>(WORKSPACE_STORE_KIND_KEY);
+    if (current !== undefined) return;
+    await this.ctx.storage.put(WORKSPACE_STORE_KIND_KEY, kind);
+  }
+
+  async hydrateWorkspace(params: { mountPath: string; prefix: string; expectedStore?: WorkspaceStoreKind }): Promise<{ mounted: boolean; mountPath?: string; detail?: string }> {
     return this.withWorkspacePersistence(async () => {
       try {
         // Fail closed: a misconfigured store NEVER silently falls back to R2.
-        // A FRESH store is resolved per call so the migrating store's per-prefix
-        // read routing cache cannot outlive a migration (a stale 'R2' route
-        // would re-restore pre-migration content on a later hydrate).
-        const store = resolveWorkspaceStore(this.env);
+        const claim = params.expectedStore;
+        if (claim !== undefined && !isWorkspaceStoreKind(claim)) return { mounted: false, detail: 'workspace_store_claim_mismatch' };
+        const store = await this.selectWorkspaceStore(claim);
         if (!store.ok) return { mounted: false, detail: store.detail };
+        // An S3-pinned computer committed its head to S3. A missing S3 head is
+        // an anomaly, not an empty workspace: never seed over it.
+        if (store.pinned && store.kind === 's3'
+            && !await store.store.get(`${realR2KeyPrefix(params.prefix)}/${SNAPSHOT_HEAD}`)) {
+          return { mounted: false, detail: 'workspace_store_head_missing' };
+        }
         const result = await ensureWorkspaceHydratedFromR2(this, store.store, params.mountPath, params.prefix);
         if (!result.mounted) return result;
+        if (store.kind === 'r2') await this.pinWorkspaceStore('r2');
         // User changes outside /workspace (apt, npm -g, HOME): restored before
         // the desktop starts. Never blocks the desktop.
         if (store.store) {
@@ -2564,8 +2632,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       } catch { /* preserve checkpoint refusal when the physical probe fails */ }
     }
     // Fail closed: a misconfigured store is skipped, never silently run on R2.
-    // Fresh per flush so no stale per-prefix read routing is reused.
-    const store = resolveWorkspaceStore(this.env);
+    // The PINNED choice decides (the alarm loop has no request context); env
+    // only for a computer never pinned (legacy), which pins on success below.
+    const store = await this.selectWorkspaceStore();
     if (!store.ok) {
       bootLog('workspace_flush', 'end', { status: 'skipped', detail: `store_misconfigured,trigger=${trigger}`, phaseMs: Date.now() - t0 });
       return { ok: false, uploaded: [], skippedUnchanged: 0, skippedIgnored: 0, skippedUnsupported: 0, failed: [], manifest: {}, heartbeatWritten: false };
@@ -2640,6 +2709,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       }
     }
     if (outcome.ok && outcome.uploaded.length > 0) await this.ctx.storage.put(WORKSPACE_LAST_UPLOAD_AT_KEY, Date.now());
+    // A committed checkpoint proves this computer's head lives in this store.
+    if (outcome.ok && !store.pinned) await this.pinWorkspaceStore(store.kind);
     this.lastOkCheckpoint = outcome.ok ? { at: Date.now(), outcome } : null;
     // The running container lost the hydrated workspace (replaced under us): stop
     // claiming it is hydrated, so status and the next open re-hydrate from the head.
@@ -3812,7 +3883,7 @@ async function handlePreview(
   tl.event('web_api', 'sandbox.preview.received', 'ok');
 
   const authDone = tl.stage('project_authorization', 'sandbox.preview.authorize');
-  const auth = await verifyPreviewToken(body.token, resolvePreviewSecrets(env));
+  const auth = await authorizeSigned(request, env, body.token);
   if (!auth.ok) {
     authDone('error', auth.error);
     return json({ ok: false, error: auth.error }, 401);
@@ -3878,6 +3949,22 @@ async function handlePreview(
   const sandboxId = deriveSandboxId(body.userId ?? 'anon', scopeId);
   tl.setSandboxId(sandboxId);
   bootSandboxId = sandboxId;
+
+  // v2: the signed claims must name exactly the computer this body boots. The
+  // body is digested, so these are the signer's own values; a mismatch means
+  // the token was minted for a different computer.
+  const v2 = auth.v2;
+  if (v2) {
+    if (v2.sandboxId !== sandboxId || v2.userId !== body.userId || v2.computerId !== scopeId) {
+      tl.event('project_authorization', 'sandbox.preview.v2_binding', 'error', { error: 'hmac_v2_identity_mismatch' });
+      return json({ ok: false, error: 'hmac_v2_identity_mismatch' }, 401);
+    }
+    // This Worker serves Cloudflare computers only; AWS routing is P5 (C-5).
+    if (v2.provider !== 'cloudflare') {
+      tl.event('project_authorization', 'sandbox.preview.v2_binding', 'error', { error: 'provider_not_routable' });
+      return json({ ok: false, error: 'provider_not_routable' }, 401);
+    }
+  }
 
   // The R2 workspace mount prefix is keyed on the FULL scope id + branch
   // (not the truncated/sanitized `sandboxId`) so it matches the write
@@ -3954,10 +4041,11 @@ async function handlePreview(
     // desktop starts so any workspace-backed tooling sees files immediately.
     // Workspace durability is required before exposing an editable desktop.
     const mountDone = tl.stage('workspace_mount', 'sandbox.preview.workspace_mount');
+    const mountOpts = auth.v2?.store ? { expectedStore: auth.v2.store } : undefined;
     const workspace = await ensureWorkspaceMount(sandbox, env, {
       projectId: workspaceProjectId,
       branch: workspaceBranch,
-    });
+    }, mountOpts);
     mountDone(
       workspace.mounted ? 'ok' : 'error',
       workspace.mounted ? undefined : workspace.detail,
@@ -4306,7 +4394,7 @@ async function handleWorkspaceDiag(
     // Allow an empty body — the diagnostic endpoint defaults op/slot.
   }
 
-  const auth = await verifyPreviewToken(body.token, resolvePreviewSecrets(env));
+  const auth = await authorizeSigned(request, env, body.token);
   if (!auth.ok) {
     tl.event('project_authorization', 'sandbox.diag.authorize', 'error', { error: auth.error });
     return json({ ok: false, error: auth.error }, 401);
@@ -4566,7 +4654,7 @@ async function handleCpuDiag(
     // Allow an empty body — the diagnostic endpoint defaults maxLines.
   }
 
-  const auth = await verifyPreviewToken(body.token, resolvePreviewSecrets(env));
+  const auth = await authorizeSigned(request, env, body.token);
   if (!auth.ok) {
     tl.event('project_authorization', 'sandbox.cpu_diag.authorize', 'error', { error: auth.error });
     return json({ ok: false, error: auth.error }, 401);
@@ -4714,7 +4802,7 @@ async function handleNekoLogs(
     // Allow an empty body — the route defaults maxLines.
   }
 
-  const auth = await verifyPreviewToken(body.token, resolvePreviewSecrets(env));
+  const auth = await authorizeSigned(request, env, body.token);
   if (!auth.ok) {
     tl.event('project_authorization', 'sandbox.neko_logs.authorize', 'error', { error: auth.error });
     return json({ ok: false, error: auth.error }, 401);
@@ -4876,7 +4964,7 @@ async function handleTwen(request: Request, env: Env, sandboxName: string): Prom
     body !== null && typeof body === 'object' && !Array.isArray(body)
       ? ((body as Record<string, unknown>).token as string | undefined)
       : undefined;
-  const auth = await verifyPreviewToken(token, resolvePreviewSecrets(env));
+  const auth = await authorizeSigned(request, env, token);
   if (!auth.ok) {
     return json({ ok: false, error: auth.error }, 401);
   }
@@ -5943,19 +6031,93 @@ async function readProjectFilesBody(
   return { ok: true, body: parsed as Record<string, unknown> };
 }
 
+// ── Signed-request authorization (v1 envelope + v2 signed envelope, C-5) ────
+
+/** v2 claims verified for THIS request object by `preauthorizeV2` (top of `fetch`). */
+const verifiedV2Claims = new WeakMap<Request, PreviewTokenV2Claims>();
+
+/**
+ * The per-sandbox path segment a request targets (`/sandbox/<id>` or
+ * `/sandbox/<id>/…`), or null. `/sandbox/preview` names its sandbox in the body.
+ */
+function sandboxIdFromPath(path: string): string | null {
+  const m = /^\/sandbox\/([^/]+)(?:\/|$)/.exec(path);
+  if (!m || m[1] === 'preview') return null;
+  try { return decodeURIComponent(m[1]!); } catch { return null; }
+}
+
+/**
+ * Verify a v2 envelope (`x-ezil-auth`) BEFORE any route reads the body: the
+ * signature covers the exact body bytes, the method and the pathname, all
+ * recomputed here from the request itself. Returns a 401 on any failure — a
+ * request that presents v2 is never re-tried as v1. No header: `null`, and
+ * the route's own `authorizeSigned` applies the v1 rules.
+ */
+async function preauthorizeV2(request: Request, env: Env, url: URL): Promise<Response | null> {
+  const token = request.headers.get(PREVIEW_TOKEN_V2_HEADER);
+  if (token === null) return null;
+  let body: Uint8Array;
+  try {
+    body = new Uint8Array(await request.clone().arrayBuffer());
+  } catch {
+    return json({ ok: false, error: 'hmac_v2_body_unreadable' }, 401);
+  }
+  const verdict = await verifyPreviewTokenV2(token, resolvePreviewSecrets(env), {
+    method: request.method.toUpperCase(),
+    path: url.pathname,
+    body,
+  });
+  if (!verdict.ok) return json({ ok: false, error: verdict.error }, 401);
+  const target = sandboxIdFromPath(url.pathname);
+  if (target !== null && target !== verdict.claims.sandboxId) {
+    return json({ ok: false, error: 'hmac_v2_sandbox_mismatch' }, 401);
+  }
+  verifiedV2Claims.set(request, verdict.claims);
+  return null;
+}
+
+/**
+ * The single authorizer every signed route calls. A v2-verified request is
+ * accepted on its claims; otherwise the legacy token is checked as v1, and
+ * only while `EZIL_PREVIEW_TOKEN_V1_UNTIL` allows v1. A v2 token found in the
+ * body / bearer / query (where its body digest cannot hold) is refused.
+ */
+async function authorizeSigned(
+  request: Request,
+  env: Env,
+  legacyToken: string | undefined,
+): Promise<{ ok: true; v2?: PreviewTokenV2Claims } | { ok: false; error: string }> {
+  const v2 = verifiedV2Claims.get(request);
+  if (v2) return { ok: true, v2 };
+  if (request.headers.get(PREVIEW_TOKEN_V2_HEADER) !== null) {
+    // Presented v2 but never verified (route reached without the pre-check): refuse.
+    return { ok: false, error: 'hmac_v2_unverified' };
+  }
+  if (isPreviewTokenV2(legacyToken)) return { ok: false, error: 'hmac_v2_token_misplaced' };
+  if (!previewTokenV1Accepted(env.EZIL_PREVIEW_TOKEN_V1_UNTIL)) {
+    return { ok: false, error: 'hmac_v1_token_retired' };
+  }
+  return verifyPreviewToken(legacyToken, resolvePreviewSecrets(env));
+}
+
 /** Verify the shared HMAC envelope against a parsed project-files body's `token` field. Returns a 401 `Response` on failure, `null` on success. */
 async function authorizeProjectFilesRequest(
+  request: Request,
   env: Env,
   body: Record<string, unknown>,
   resource: 'key' | 'prefix' = 'key',
 ): Promise<Response | null> {
   const token = typeof body.token === 'string' ? body.token : undefined;
-  const auth = await verifyPreviewToken(token, resolvePreviewSecrets(env));
+  const auth = await authorizeSigned(request, env, token);
   if (!auth.ok) return json({ ok: false, error: auth.error }, 401);
   // Once checkpointed, Git on the hosted workspace is authoritative. The
   // loose-object transport cannot represent its index, modes, or deletions;
   // reject stale reads/writes instead of acknowledging edits we will ignore.
   const key = typeof body[resource] === 'string' ? body[resource] as string : '';
+  // v2 names one computer: its keys live under `<computerId>/` only.
+  if (auth.v2 && key !== auth.v2.computerId && !key.startsWith(`${auth.v2.computerId}/`)) {
+    return json({ ok: false, error: 'hmac_v2_scope_mismatch' }, 401);
+  }
   if (new TextEncoder().encode(key).length > 1024) return json({ ok: false, error: 'invalid_key' }, 400);
   if (key.split('/').includes('.ezil-snapshots')) {
     return json({ ok: false, error: 'workspace_snapshot_reserved' }, 409);
@@ -6013,7 +6175,7 @@ async function authorizeSignedControlRequest(request: Request, env: Env, url: UR
     body,
   });
 
-  const auth = await verifyPreviewToken(token, resolvePreviewSecrets(env));
+  const auth = await authorizeSigned(request, env, token);
   if (!auth.ok) return json({ ok: false, error: auth.error }, 401);
   return null;
 }
@@ -6027,7 +6189,7 @@ function projectFilesBucket(env: Env): Response | { bucket: NonNullable<Env['SAN
 async function handleProjectFilesPut(request: Request, env: Env): Promise<Response> {
   const read = await readProjectFilesBody(request, PROJECT_FILES_MAX_PUT_REQUEST_BYTES);
   if (!read.ok) return read.response;
-  const unauthorized = await authorizeProjectFilesRequest(env, read.body);
+  const unauthorized = await authorizeProjectFilesRequest(request, env, read.body);
   if (unauthorized) return unauthorized;
 
   const resolved = projectFilesBucket(env);
@@ -6047,7 +6209,7 @@ async function handleProjectFilesPut(request: Request, env: Env): Promise<Respon
 async function handleProjectFilesGet(request: Request, env: Env): Promise<Response> {
   const read = await readProjectFilesBody(request, PROJECT_FILES_MAX_CONTROL_REQUEST_BYTES);
   if (!read.ok) return read.response;
-  const unauthorized = await authorizeProjectFilesRequest(env, read.body);
+  const unauthorized = await authorizeProjectFilesRequest(request, env, read.body);
   if (unauthorized) return unauthorized;
 
   const resolved = projectFilesBucket(env);
@@ -6061,7 +6223,7 @@ async function handleProjectFilesGet(request: Request, env: Env): Promise<Respon
 async function handleProjectFilesHead(request: Request, env: Env): Promise<Response> {
   const read = await readProjectFilesBody(request, PROJECT_FILES_MAX_CONTROL_REQUEST_BYTES);
   if (!read.ok) return read.response;
-  const unauthorized = await authorizeProjectFilesRequest(env, read.body);
+  const unauthorized = await authorizeProjectFilesRequest(request, env, read.body);
   if (unauthorized) return unauthorized;
 
   const resolved = projectFilesBucket(env);
@@ -6075,7 +6237,7 @@ async function handleProjectFilesHead(request: Request, env: Env): Promise<Respo
 async function handleProjectFilesDelete(request: Request, env: Env): Promise<Response> {
   const read = await readProjectFilesBody(request, PROJECT_FILES_MAX_CONTROL_REQUEST_BYTES);
   if (!read.ok) return read.response;
-  const unauthorized = await authorizeProjectFilesRequest(env, read.body);
+  const unauthorized = await authorizeProjectFilesRequest(request, env, read.body);
   if (unauthorized) return unauthorized;
 
   const resolved = projectFilesBucket(env);
@@ -6092,7 +6254,7 @@ async function handleProjectFilesDelete(request: Request, env: Env): Promise<Res
 async function handleProjectFilesList(request: Request, env: Env): Promise<Response> {
   const read = await readProjectFilesBody(request, PROJECT_FILES_MAX_CONTROL_REQUEST_BYTES);
   if (!read.ok) return read.response;
-  const unauthorized = await authorizeProjectFilesRequest(env, read.body, 'prefix');
+  const unauthorized = await authorizeProjectFilesRequest(request, env, read.body, 'prefix');
   if (unauthorized) return unauthorized;
 
   const resolved = projectFilesBucket(env);
@@ -6341,6 +6503,11 @@ export default {
     //    container. Returns null for everything else.
     const proxied = await proxyToSandbox(request, env);
     if (proxied) return recoverableStalePreview(request, proxied);
+
+    // 1b) v2 signed envelope: verified against the raw body before any route
+    //     parses it. Absent header => unchanged v1 behaviour per route.
+    const v2Refusal = await preauthorizeV2(request, env, url);
+    if (v2Refusal) return v2Refusal;
 
     if (method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders });

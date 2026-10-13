@@ -34,7 +34,7 @@ mock.module('cloudflare:workers', () => ({
   env: {},
 }));
 
-import { hmacSha256Hex, PREVIEW_TOKEN_PAYLOAD, TOKEN_MAX_AGE_MS } from './hmac';
+import { hmacSha256Hex, mintPreviewTokenV2, PREVIEW_TOKEN_PAYLOAD, TOKEN_MAX_AGE_MS, type PreviewTokenV2Claims } from './hmac';
 import { SCREEN_MODES } from './screen-modes';
 
 const SECRET = 'route-auth-test-secret';
@@ -156,6 +156,8 @@ function fakeSandboxNamespace(options: {
    * default. Defaults to an immediately-resolved `{}`.
    */
   flushWorkspaceNow?: () => Promise<unknown>;
+  /** Records/answers the DO's `hydrateWorkspace` RPC (v2 store claim tests). */
+  hydrateWorkspace?: (params: unknown) => Promise<unknown>;
 }): { binding: unknown; calls: CallLog } {
   /** The sandbox id the Worker actually opened the DO with. */
   let openedWith = SANDBOX_NAME;
@@ -175,7 +177,8 @@ function fakeSandboxNamespace(options: {
 
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
     desktopReachable: async () => true,
-    hydrateWorkspace: async () => ({ mounted: true, mountPath: '/workspace' }),
+    hydrateWorkspace: async (...args: unknown[]) =>
+      options.hydrateWorkspace ? options.hydrateWorkspace(args[0]) : ({ mounted: true, mountPath: '/workspace' }),
     containerFetch: async (...args: unknown[]) => {
       const [url, init, port] = args as [string, RequestInit | undefined, number];
       const headers: Record<string, string> = {};
@@ -2998,4 +3001,177 @@ it('refuses direct snapshot object access before any storage read', async () => 
     } });
     expect(res.status).toBe(409); expect(touched).toBe(false);
   }
+});
+
+// ── v2 signed envelope (C-5): bound to method, path, body and computer ──────
+
+describe('v2 signed envelope on the real route table', () => {
+  const USER = 'user-1';
+  const PROJECT = 'proj-1';
+  const PREVIEW_SANDBOX = 'guac-user1-proj1';
+  const PORTS = [{ port: 8181, url: 'https://8181-test-nekodesktop.ezil.org', status: 'open' }];
+  const claims = (patch: Partial<PreviewTokenV2Claims> = {}): PreviewTokenV2Claims => ({
+    ts: Date.now(), sandboxId: PREVIEW_SANDBOX, computerId: PROJECT, userId: USER,
+    provider: 'cloudflare', store: '', generation: 0, leaseEpoch: 0, ...patch,
+  });
+  const previewBody = JSON.stringify({ projectId: PROJECT, userId: USER, desktopMode: 'neko' });
+  async function signedPreview(opts: { claims?: PreviewTokenV2Claims; signBody?: string; sendBody?: string; secret?: string } = {}) {
+    const body = opts.signBody ?? previewBody;
+    const token = await mintPreviewTokenV2(opts.secret ?? SECRET, opts.claims ?? claims(), { method: 'POST', path: '/sandbox/preview', body });
+    return new Request('https://api-desktop.ezil.org/sandbox/preview', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-ezil-auth': token }, body: opts.sendBody ?? body,
+    });
+  }
+  function previewNs() {
+    const hydrations: unknown[] = [];
+    const ns = fakeSandboxNamespace({
+      exposedPorts: PORTS,
+      flushWorkspaceNow: async () => ({ ok: true }),
+      hydrateWorkspace: async (p) => { hydrations.push(p); return { mounted: true, mountPath: '/workspace' }; },
+    });
+    return { ...ns, hydrations };
+  }
+  const env = (binding: unknown, extra: Record<string, unknown> = {}) =>
+    ({ Sandbox: binding, SANDBOX_WORKSPACE_R2_BUCKET: {}, SANDBOX_HMAC_SECRET: SECRET, ...extra });
+
+  it('accepts a valid v2 preview and boots exactly the signed computer', async () => {
+    const { binding, hydrations } = previewNs();
+    const res = await worker.fetch(await signedPreview(), env(binding));
+    expect(res.status).toBe(200);
+    expect(hydrations).toHaveLength(1);
+    expect(hydrations[0]).not.toHaveProperty('expectedStore');
+  });
+
+  it('forwards a non-empty store claim to the Durable Object, which owns the decision', async () => {
+    const { binding, hydrations } = previewNs();
+    const res = await worker.fetch(await signedPreview({ claims: claims({ store: 's3' }) }), env(binding));
+    expect(res.status).toBe(200);
+    expect(hydrations[0]).toMatchObject({ expectedStore: 's3' });
+  });
+
+  for (const [name, mutate] of [
+    ['tampered body', { sendBody: previewBody.replace(PROJECT, 'proj-2') }],
+    ['tampered sandboxId', { claims: claims({ sandboxId: 'guac-user1-proj2' }) }],
+    ['claims for another user', { claims: claims({ userId: 'user-2', sandboxId: 'guac-user2-proj1' }) }],
+    ['provider not served by this Worker', { claims: claims({ provider: 'aws-ec2' }) }],
+    ['expired token', { claims: claims({ ts: Date.now() - 6 * 60_000 }) }],
+    ['wrong secret', { secret: 'not-the-secret' }],
+  ] as const) {
+    it(`refuses ${name} with 401 and never reaches the computer`, async () => {
+      const { binding, calls, hydrations } = previewNs();
+      const res = await worker.fetch(await signedPreview(mutate), env(binding));
+      expect(res.status).toBe(401);
+      expect(hydrations).toHaveLength(0);
+      expect(calls.startProcess).toHaveLength(0);
+    });
+  }
+
+  it('a failing v2 header is never retried as v1, even with a valid v1 body token', async () => {
+    const { binding, hydrations } = previewNs();
+    const bodyWithV1 = JSON.stringify({ token: await mintToken(), projectId: PROJECT, userId: USER, desktopMode: 'neko' });
+    const req = await signedPreview({ signBody: previewBody, sendBody: bodyWithV1 });
+    const res = await worker.fetch(req, env(binding));
+    expect(res.status).toBe(401);
+    expect(hydrations).toHaveLength(0);
+  });
+
+  it('refuses a v2 token placed in the body (its digest cannot cover itself)', async () => {
+    const { binding, hydrations } = previewNs();
+    const token = await mintPreviewTokenV2(SECRET, claims(), { method: 'POST', path: '/sandbox/preview', body: previewBody });
+    const res = await worker.fetch(new Request('https://api-desktop.ezil.org/sandbox/preview', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, projectId: PROJECT, userId: USER, desktopMode: 'neko' }),
+    }), env(binding));
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ ok: false, error: 'hmac_v2_token_misplaced' });
+    expect(hydrations).toHaveLength(0);
+  });
+
+  it('fails closed with no secret configured', async () => {
+    const { binding, hydrations } = previewNs();
+    const res = await worker.fetch(await signedPreview(), { Sandbox: binding, SANDBOX_WORKSPACE_R2_BUCKET: {} });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ ok: false, error: 'hmac_secret_not_configured' });
+    expect(hydrations).toHaveLength(0);
+  });
+
+  it('per-sandbox routes: the signed sandboxId must be the path target', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const del = async (signedFor: string) => new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}`, {
+      method: 'DELETE',
+      headers: { 'x-ezil-auth': await mintPreviewTokenV2(SECRET, claims({ sandboxId: signedFor }),
+        { method: 'DELETE', path: `/sandbox/${SANDBOX_NAME}`, body: '' }) },
+    });
+    const wrong = await worker.fetch(await del('guac-someone-else'), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET });
+    expect(wrong.status).toBe(401);
+    expect(await wrong.json()).toEqual({ ok: false, error: 'hmac_v2_sandbox_mismatch' });
+    expect(calls.terminateSandbox).toBe(0);
+    const right = await worker.fetch(await del(SANDBOX_NAME), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET });
+    expect(right.status).toBe(200);
+    expect(calls.terminateSandbox).toBe(1);
+  });
+
+  it('a v2 token signed for another route is refused (path is bound)', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const token = await mintPreviewTokenV2(SECRET, claims({ sandboxId: SANDBOX_NAME }),
+      { method: 'POST', path: `/sandbox/${SANDBOX_NAME}/restart`, body: '' });
+    const res = await worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}`, {
+      method: 'DELETE', headers: { 'x-ezil-auth': token },
+    }), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET });
+    expect(res.status).toBe(401);
+    expect(calls.terminateSandbox).toBe(0);
+  });
+
+  it('project-files: a v2 token reaches only its own computer\'s keys', async () => {
+    const files = async (key: string) => {
+      const body = JSON.stringify({ key });
+      const token = await mintPreviewTokenV2(SECRET, claims(), { method: 'POST', path: '/project-files/get', body });
+      return worker.fetch(new Request('https://api-desktop.ezil.org/project-files/get', {
+        method: 'POST', headers: { 'x-ezil-auth': token }, body,
+      }), { SANDBOX_HMAC_SECRET: SECRET, SANDBOX_WORKSPACE_R2_BUCKET: { head: async () => null, get: async () => null } });
+    };
+    const other = await files('proj-2/branches/main/a.txt');
+    expect(other.status).toBe(401);
+    expect(await other.json()).toEqual({ ok: false, error: 'hmac_v2_scope_mismatch' });
+    expect((await files(`${PROJECT}/branches/main/a.txt`)).status).not.toBe(401);
+  });
+
+  describe('EZIL_PREVIEW_TOKEN_V1_UNTIL', () => {
+    const v1Delete = async () => new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}`, {
+      method: 'DELETE', headers: { authorization: `Bearer ${await mintToken()}` },
+    });
+    it('v1 is accepted while the cutoff is in the future', async () => {
+      const { binding, calls } = fakeSandboxNamespace({});
+      const res = await worker.fetch(await v1Delete(), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET,
+        EZIL_PREVIEW_TOKEN_V1_UNTIL: new Date(Date.now() + 3_600_000).toISOString() });
+      expect(res.status).toBe(200);
+      expect(calls.terminateSandbox).toBe(1);
+    });
+    for (const [label, until] of [['after the cutoff', new Date(Date.now() - 1000).toISOString()], ['with an unparseable cutoff', 'soon']] as const) {
+      it(`v1 is refused ${label}, on every signed route family`, async () => {
+        const { binding, calls, hydrations } = previewNs();
+        const e = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_WORKSPACE_R2_BUCKET: {}, EZIL_PREVIEW_TOKEN_V1_UNTIL: until };
+        const del = await worker.fetch(await v1Delete(), e);
+        expect(del.status).toBe(401);
+        expect(await del.json()).toEqual({ ok: false, error: 'hmac_v1_token_retired' });
+        const preview = await worker.fetch(new Request('https://api-desktop.ezil.org/sandbox/preview', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ token: await mintToken(), projectId: PROJECT, userId: USER, desktopMode: 'neko' }),
+        }), e);
+        expect(preview.status).toBe(401);
+        const diag = await worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/workspace-diag`, {
+          method: 'POST', body: JSON.stringify({ token: await mintToken() }),
+        }), e);
+        expect(diag.status).toBe(401);
+        const files = await worker.fetch(new Request('https://api-desktop.ezil.org/project-files/get', {
+          method: 'POST', body: JSON.stringify({ token: await mintToken(), key: 'proj-1/branches/main/a.txt' }),
+        }), e);
+        expect(files.status).toBe(401);
+        expect(calls.terminateSandbox).toBe(0);
+        expect(hydrations).toHaveLength(0);
+        // v2 still works after the cutoff.
+        expect((await worker.fetch(await signedPreview(), e)).status).toBe(200);
+      });
+    }
+  });
 });
