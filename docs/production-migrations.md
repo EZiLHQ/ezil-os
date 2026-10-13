@@ -317,8 +317,8 @@ comparisons and qualified columns.
   apply transaction (tested). Existing duplicate rows also fail `CREATE UNIQUE
   INDEX` at apply and roll everything back; check for them before proposing one.
 - **Catalog digest.** No fingerprint change is needed. The index row already
-  hashes `pg_get_indexdef`, which renders `UNIQUE`, the `WHERE` predicate and
-  `NULLS NOT DISTINCT`, and unique constraints have their own rows. The
+  hashes `pg_get_indexdef`, which renders `UNIQUE` and the `WHERE` predicate,
+  and unique constraints have their own rows. The
   transaction test shows that non-unique to unique, full to partial, a changed
   predicate and a dropped index each change the digest.
 - **Test vectors.** `e2e/fixtures/migration-grammar-unique.json` holds every
@@ -356,9 +356,15 @@ Port steps in each repository:
 Measured on 2026-10-13 against scratch copies (PGlite, offline):
 
 - **Works:** 41/41 before and after.
-- **Gateway:** 55 pass, 0 fail of 62, before and after; the rest are
-  Docker-only.
+- **Gateway:** 62 tests, 55 pass, 0 fail, 7 skipped, before and after.
 - **Vectors:** all 68 pass on both ported engines.
+- **Journaled migrations:** the ported grammar newly refuses none of them.
+  Gateway: 4 re-parsed. Works: the manifest's 6 entries are all
+  `hosted-rollout`, which `additiveSQL` never parses.
+
+Works has a second SQL gate. `packages/db/tools/hosted-rollout.ts` plans
+hosted rollouts and already recognises `CREATE [UNIQUE] INDEX` on its own
+terms. F9 does not change it.
 
 This is a founder-reviewed cross-repo change. Neither repository has been
 edited.
