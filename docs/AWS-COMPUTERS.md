@@ -84,7 +84,7 @@ must stay inside the hosted migration grammar (`docs/production-migrations.md`).
 
 ```sql
 CREATE TABLE public.ezil_computer_placements (
-  computer_id uuid NOT NULL, provider text NOT NULL, workspace_store text NULL,
+  computer_id uuid NOT NULL, owner_user_id uuid NOT NULL, provider text NOT NULL, workspace_store text NULL,
   generation bigint NOT NULL, lease_epoch bigint NOT NULL, state text NOT NULL, region text NULL, zone_id text NULL,
   instance_id text NULL, instance_type text NULL, volume_id text NULL, fs_uuid uuid NULL,
   tunnel_id text NULL, enroll_nonce_hash text NULL, enroll_expires_at timestamptz NULL,
@@ -112,8 +112,11 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 
 - **Values.** `provider` ∈ {`cloudflare`, `aws-ec2`}. `workspace_store` is `r2` or `s3` for
   `cloudflare`, and `ebs` for `aws-ec2`. Any other pairing fails closed.
-- **Ownership.** The owner comes from `ezil_computers.user_id`. Admission re-checks it in the
-  same transaction.
+- **Ownership.** The owner is recorded on the placement as `owner_user_id`, set once from the
+  authenticated session at creation, and never taken from `ezil_computers`. Users can update
+  and insert `ezil_computers` rows (including their `id`), so that table cannot prove
+  ownership. Admission and every provider operation compare the caller with
+  `owner_user_id`, and per-user caps count placements by `owner_user_id`.
 - **Single writer includes reconcilers.** The EC2 state-change reconciler and the usage
   observer write only through the placement module (`app/src/server/lib/compute/placement.ts`).
   A test fails if any other file names these tables.
