@@ -1,0 +1,523 @@
+{
+  "description": "F9 accept/reject vectors for CREATE UNIQUE INDEX in the hosted migration grammar (.github/scripts/production-migrations.mjs additiveSQL). Each `error` is a regular expression the refusal message must match. Ported repos run the same file against their own copy of the engine.",
+  "schemas": [
+    "app"
+  ],
+  "setup": "CREATE TABLE app.t (id uuid NOT NULL, owner uuid, state text, generation bigint, active boolean, \"odd;name\" text, \"user\" text); CREATE TABLE app.x (id uuid NOT NULL, state text);",
+  "cases": [
+    {
+      "sql": "CREATE UNIQUE INDEX t_id_key ON app.t (id)",
+      "accept": true,
+      "why": "single-column unique"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_owner_state_key ON app.t (owner, state);",
+      "accept": true,
+      "why": "multi-column unique"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_live_key ON app.t (owner) WHERE state IS NULL",
+      "accept": true,
+      "why": "partial: IS NULL"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_active_key ON app.t (owner) WHERE state IS NOT NULL AND active = true",
+      "accept": true,
+      "why": "partial: IS NOT NULL AND boolean"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_running_key ON app.t (owner, generation) WHERE state = 'running' AND generation = 7 AND active = false",
+      "accept": true,
+      "why": "partial: string, integer and boolean literals"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_quote_key ON app.t (owner) WHERE state = 'it''s'",
+      "accept": true,
+      "why": "doubled quote inside a string literal"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX \"t_odd\" ON \"app\".\"t\" (\"odd;name\") WHERE \"odd;name\" IS NOT NULL",
+      "accept": true,
+      "why": "quoted identifiers"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_user_key ON app.t (\"user\") WHERE \"user\" IS NOT NULL",
+      "accept": true,
+      "why": "quoted reserved word is a column"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_comment_key ON app.t (id) /* reviewed */ WHERE state IS NULL -- trailing",
+      "accept": true,
+      "why": "comments are inert"
+    },
+    {
+      "sql": "CREATE TABLE app.u (k text NOT NULL); CREATE UNIQUE INDEX u_k ON app.u (k); ALTER TABLE app.u ENABLE ROW LEVEL SECURITY",
+      "accept": true,
+      "why": "unique index inside a multi-statement migration"
+    },
+    {
+      "sql": "CREATE INDEX t_plain ON app.t (owner, state)",
+      "accept": true,
+      "why": "existing non-unique index form still accepted"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_crlf_key ON app.t (id)\r\nWHERE state IS NULL -- reviewed\r\n;",
+      "accept": true,
+      "why": "CRLF line endings, including after a line comment"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX x_live_key ON app.x (id) WHERE state IS NULL",
+      "accept": true,
+      "why": "table x: a real column in the predicate"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_ff_key ON app.t (id)\fWHERE\tstate IS NULL",
+      "accept": true,
+      "why": "ASCII form feed and tab are whitespace"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX CONCURRENTLY t_x ON app.t (id)",
+      "accept": false,
+      "why": "CONCURRENTLY",
+      "error": "Reserved word as"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX CONCURRENTLY ON app.t (id)",
+      "accept": false,
+      "why": "CONCURRENTLY, nameless",
+      "error": "Reserved word as"
+    },
+    {
+      "sql": "CREATE INDEX CONCURRENTLY ON app.t (id)",
+      "accept": false,
+      "why": "CONCURRENTLY on the existing non-unique form",
+      "error": "Reserved word as"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX ON app.t (id)",
+      "accept": false,
+      "why": "nameless index",
+      "error": "Reserved word as"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX IF NOT EXISTS t_x ON app.t (id)",
+      "accept": false,
+      "why": "IF NOT EXISTS",
+      "error": "expected on"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t USING btree (id)",
+      "accept": false,
+      "why": "USING",
+      "error": "expected \\("
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON ONLY app.t (id)",
+      "accept": false,
+      "why": "ON ONLY",
+      "error": "outside owned schemas"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON public.t (id)",
+      "accept": false,
+      "why": "unowned schema",
+      "error": "outside owned schemas"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) INCLUDE (state)",
+      "accept": false,
+      "why": "INCLUDE",
+      "error": "expected ;"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) NULLS NOT DISTINCT",
+      "accept": false,
+      "why": "NULLS NOT DISTINCT",
+      "error": "expected ;"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WITH (fillfactor = 50)",
+      "accept": false,
+      "why": "storage parameters",
+      "error": "expected ;"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) TABLESPACE pg_default",
+      "accept": false,
+      "why": "tablespace",
+      "error": "expected ;"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (lower(state))",
+      "accept": false,
+      "why": "function call in column list",
+      "error": "expected \\)"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t ((id))",
+      "accept": false,
+      "why": "expression in column list",
+      "error": "Expected SQL identifier"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (current_user)",
+      "accept": false,
+      "why": "keyword-function in column list",
+      "error": "Reserved word as"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (state text_pattern_ops)",
+      "accept": false,
+      "why": "operator class",
+      "error": "expected \\)"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id DESC)",
+      "accept": false,
+      "why": "DESC",
+      "error": "expected \\)"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id ASC)",
+      "accept": false,
+      "why": "ASC",
+      "error": "expected \\)"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id NULLS FIRST)",
+      "accept": false,
+      "why": "NULLS FIRST",
+      "error": "expected \\)"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (state COLLATE \"C\")",
+      "accept": false,
+      "why": "COLLATE in column list",
+      "error": "expected \\)"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state IS NULL OR active = true",
+      "accept": false,
+      "why": "OR",
+      "error": "expected ;"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE NOT active = true",
+      "accept": false,
+      "why": "NOT",
+      "error": "Reserved word as"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE active IS TRUE",
+      "accept": false,
+      "why": "IS TRUE",
+      "error": "expected null"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state IS NOT DISTINCT FROM 'x'",
+      "accept": false,
+      "why": "IS NOT DISTINCT FROM",
+      "error": "expected null"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE active",
+      "accept": false,
+      "why": "bare boolean column",
+      "error": "allows only IS \\[NOT\\] NULL or = literal"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state ISNULL",
+      "accept": false,
+      "why": "ISNULL postfix",
+      "error": "allows only IS \\[NOT\\] NULL or = literal"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state <> 'x'",
+      "accept": false,
+      "why": "<> operator",
+      "error": "Unsupported SQL token"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state != 'x'",
+      "accept": false,
+      "why": "!= operator",
+      "error": "Unsupported SQL token"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE generation > 1",
+      "accept": false,
+      "why": "> operator",
+      "error": "Unsupported SQL token"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE generation = -1",
+      "accept": false,
+      "why": "negative literal",
+      "error": "Unsupported SQL token"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE generation = 1.5",
+      "accept": false,
+      "why": "non-integer literal",
+      "error": "expected ;"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state = E'x'",
+      "accept": false,
+      "why": "escape-string literal",
+      "error": "compares only to a string, integer or boolean literal"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state = owner",
+      "accept": false,
+      "why": "column compared to column",
+      "error": "compares only to a string, integer or boolean literal"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE active = \"true\"",
+      "accept": false,
+      "why": "quoted identifier is not a boolean literal",
+      "error": "compares only to a string, integer or boolean literal"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state = lower('x')",
+      "accept": false,
+      "why": "function call on the literal side",
+      "error": "compares only to a string, integer or boolean literal"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE lower(state) = 'x'",
+      "accept": false,
+      "why": "function call on the column side",
+      "error": "allows only IS \\[NOT\\] NULL or = literal"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE id = (SELECT id FROM app.t)",
+      "accept": false,
+      "why": "scalar subquery",
+      "error": "compares only to a string, integer or boolean literal"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE id IN (SELECT id FROM app.t)",
+      "accept": false,
+      "why": "IN subquery",
+      "error": "allows only IS \\[NOT\\] NULL or = literal"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE EXISTS (SELECT 1)",
+      "accept": false,
+      "why": "EXISTS subquery",
+      "error": "allows only IS \\[NOT\\] NULL or = literal"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state = 'x'::text",
+      "accept": false,
+      "why": "cast",
+      "error": "Unsupported SQL token"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state COLLATE \"C\" = 'x'",
+      "accept": false,
+      "why": "COLLATE in predicate",
+      "error": "allows only IS \\[NOT\\] NULL or = literal"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state = $1",
+      "accept": false,
+      "why": "parameter",
+      "error": "Unsupported SQL token"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE (state IS NULL)",
+      "accept": false,
+      "why": "parenthesised predicate",
+      "error": "Expected SQL identifier"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE other.state IS NULL",
+      "accept": false,
+      "why": "qualified column (other relation)",
+      "error": "allows only IS \\[NOT\\] NULL or = literal"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state[1] IS NULL",
+      "accept": false,
+      "why": "subscript",
+      "error": "allows only IS \\[NOT\\] NULL or = literal"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE null IS NULL",
+      "accept": false,
+      "why": "constant NULL as a column",
+      "error": "Reserved word as"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE true = true",
+      "accept": false,
+      "why": "constant TRUE as a column",
+      "error": "Reserved word as"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE current_user = 'x'",
+      "accept": false,
+      "why": "keyword-function current_user",
+      "error": "Reserved word as"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE localtimestamp IS NULL",
+      "accept": false,
+      "why": "keyword-function localtimestamp",
+      "error": "Reserved word as"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE",
+      "accept": false,
+      "why": "empty predicate",
+      "error": "Expected SQL identifier"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state IS NULL AND",
+      "accept": false,
+      "why": "dangling AND",
+      "error": "Expected SQL identifier"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state IS NULL; AND active = true",
+      "accept": false,
+      "why": "semicolon inside the predicate",
+      "error": "expected alter"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state IS NULL /* hidden */ OR active = true",
+      "accept": false,
+      "why": "OR after a comment",
+      "error": "expected ;"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state IS NULL --\n; DROP TABLE app.t",
+      "accept": false,
+      "why": "line comment then a second statement",
+      "error": "expected alter"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX t_x ON app.t (id) WHERE state IS NULL /* unterminated",
+      "accept": false,
+      "why": "unterminated comment",
+      "error": "Unterminated SQL comment"
+    },
+    {
+      "sql": "CREATE INDEX t_x ON app.t (id) WHERE state IS NULL",
+      "accept": false,
+      "why": "non-unique partial index",
+      "error": "Partial indexes must be UNIQUE"
+    },
+    {
+      "sql": "CREATE UNIQUE TABLE app.x (id integer)",
+      "accept": false,
+      "why": "UNIQUE on something other than an index",
+      "error": "expected index"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u3 ON app.x (id); -- note\rDROP TABLE app.y;",
+      "accept": false,
+      "why": "lone CR ends a -- comment in PostgreSQL (hidden DROP)",
+      "error": "Lone carriage return"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u4 ON app.x (id) WHERE state IS NULL -- c\rOR true;",
+      "accept": false,
+      "why": "lone CR ends a -- comment (hidden OR)",
+      "error": "Lone carriage return"
+    },
+    {
+      "sql": "CREATE INDEX u4b ON app.x (id) -- c\rWHERE state IS NULL;",
+      "accept": false,
+      "why": "lone CR ends a -- comment (hidden non-unique partial)",
+      "error": "Lone carriage return"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u4c ON app.x (id)\rWHERE state IS NULL",
+      "accept": false,
+      "why": "lone CR as plain whitespace",
+      "error": "Lone carriage return"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u4d ON app.x (id) /* a\rb */ WHERE state IS NULL",
+      "accept": false,
+      "why": "lone CR inside a block comment",
+      "error": "Lone carriage return"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u4e ON app.x (id) WHERE state = 'a\rb'",
+      "accept": false,
+      "why": "lone CR inside a string literal",
+      "error": "Lone carriage return"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u5 ON app\u00a0.x (id);",
+      "accept": false,
+      "why": "NBSP (U+00A0) is an identifier character in PostgreSQL",
+      "error": "Only ASCII whitespace"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u5b ON app.x (id)\u2028WHERE state IS NULL",
+      "accept": false,
+      "why": "LINE SEPARATOR (U+2028)",
+      "error": "Only ASCII whitespace"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u5c ON app.x (id)\u2029WHERE state IS NULL",
+      "accept": false,
+      "why": "PARAGRAPH SEPARATOR (U+2029)",
+      "error": "Only ASCII whitespace"
+    },
+    {
+      "sql": "\ufeffCREATE UNIQUE INDEX u5d ON app.x (id)",
+      "accept": false,
+      "why": "byte-order mark (U+FEFF)",
+      "error": "Only ASCII whitespace"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u5e ON app.x (id)\u3000WHERE state IS NULL",
+      "accept": false,
+      "why": "IDEOGRAPHIC SPACE (U+3000)",
+      "error": "Only ASCII whitespace"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u5f ON app.x (id)\u0085WHERE state IS NULL",
+      "accept": false,
+      "why": "NEXT LINE (U+0085, not JS whitespace)",
+      "error": "Unsupported SQL token"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u5g ON app.x (id)\u2009WHERE state IS NULL",
+      "accept": false,
+      "why": "THIN SPACE (U+2009)",
+      "error": "Only ASCII whitespace"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u5h ON app.x (id)\u200bWHERE state IS NULL",
+      "accept": false,
+      "why": "ZERO WIDTH SPACE (U+200B, not JS whitespace)",
+      "error": "Unsupported SQL token"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u6 ON app.x (id) WHERE x IS NULL",
+      "accept": false,
+      "why": "predicate names the indexed table (whole-row test)",
+      "error": "names the table itself"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u6b ON app.x (id) WHERE state IS NULL AND x IS NOT NULL",
+      "accept": false,
+      "why": "second predicate term names the indexed table",
+      "error": "names the table itself"
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX u6c ON app.\"x\" (id) WHERE \"x\" IS NULL",
+      "accept": false,
+      "why": "quoted table name in the predicate",
+      "error": "names the table itself"
+    }
+  ]
+}
