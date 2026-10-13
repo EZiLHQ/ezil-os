@@ -12,12 +12,10 @@ docker image inspect "$EZIL_VALIDATE_IMAGE" >/dev/null
 # each other's inputs. Not removed on exit: the image writes ~/.opencode as root, and CI's
 # RUNNER_TEMP is per job.
 work="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ezil-persistence-inputs.XXXXXX")"
-mkdir -p "$work/next-warm" "$work/opencode-out"
-(
-  cd "$work/next-warm"
-  printf '{"name":"warm","version":"0.0.0","private":true}' > package.json
-  npm install next@16.4.0 react@19 react-dom@19 --cache "$work/next-npm-cache" --no-audit --no-fund
-)
+mkdir -p "$work/opencode-out"
+# This job already holds the GHCR publisher login: the cache is warmed from a reviewed
+# lockfile with no lifecycle scripts and a scrubbed environment (see warm-next-cache.sh).
+bash "$(dirname "${BASH_SOURCE[0]}")/warm-next-cache.sh" "$work/next-npm-cache"
 opencode_version=1.18.35
 docker run --rm -v "$work/opencode-out:/out" --entrypoint bash "$EZIL_VALIDATE_IMAGE" -c "
   set -euo pipefail

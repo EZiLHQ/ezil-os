@@ -575,9 +575,9 @@ jobs:
       - name: Warm a Next.js npm cache (persistence suite)
         shell: bash
         run: |
-          mkdir -p /tmp/next-warm && cd /tmp/next-warm
-          printf '{"name":"warm","version":"0.0.0","private":true}' > package.json
-          npm install next@16.4.0 react@19 react-dom@19 --cache /tmp/next-npm-cache --no-audit --no-fund
+          # The same reviewed lockfile and no-scripts, scrubbed-environment warm as the
+          # candidate image test (this job holds a GHCR login for the private image).
+          bash .github/scripts/warm-next-cache.sh /tmp/next-npm-cache
           echo "EZIL_NEXT_NPM_CACHE=/tmp/next-npm-cache" >> "$GITHUB_ENV"
           # The user's real tool: the official OpenCode installer, run inside the pulled image (not
           # on the runner). Required: do not silently omit OpenCode persistence checks. Pinned to the

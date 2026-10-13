@@ -850,6 +850,40 @@ test('the exact candidate image runs every required container suite, persistence
   assert.match(sh, /EZIL_NEXT_NPM_CACHE=/);
 });
 
+test('the Next.js npm cache is warmed from a reviewed lockfile with no lifecycle scripts and no inherited credentials', () => {
+  // Codex security review r4254513721: test-desktop.sh runs after image.yml's GHCR login (packages:
+  // write), and ci.yml's container job holds a GHCR login too. A host-side `npm install` of
+  // floating versions there would run third-party lifecycle scripts next to publishing credentials.
+  const root = new URL('../', import.meta.url);
+  const read = (rel) => readFileSync(new URL(rel, root), 'utf8');
+  const desktop = read('.github/scripts/test-desktop.sh');
+  const yml = read('.github/workflows/ci.yml');
+  const warm = read('.github/scripts/warm-next-cache.sh');
+  for (const [name, text] of [['test-desktop.sh', desktop], ['ci.yml', yml]]) {
+    assert.ok(text.includes('warm-next-cache.sh'), `${name} warms through warm-next-cache.sh`);
+    assert.ok(!/npm install next@/.test(text), `${name} never installs floating Next/React on the host`);
+  }
+  assert.match(warm, /npm ci --ignore-scripts/);
+  assert.match(warm, /env -i PATH="\$PATH" HOME="\$work\/home" DOCKER_CONFIG="\$work\/docker"/);
+  assert.match(warm, /npm_config_userconfig=\/dev\/null npm_config_globalconfig=\/dev\/null/);
+  const manifest = JSON.parse(read('.github/scripts/next-warm/package.json'));
+  for (const [dep, version] of Object.entries(manifest.dependencies)) assert.match(version, /^\d+\.\d+\.\d+$/, `${dep} is pinned exactly`);
+  assert.equal(manifest.dependencies.next, '16.4.0');
+  const lock = JSON.parse(read('.github/scripts/next-warm/package-lock.json'));
+  assert.equal(lock.lockfileVersion, 3);
+  assert.deepEqual(lock.packages[''].dependencies, manifest.dependencies, 'the lockfile matches the reviewed manifest');
+  const entries = Object.entries(lock.packages).filter(([key]) => key);
+  assert.ok(entries.length > 10);
+  for (const [key, entry] of entries) {
+    assert.match(entry.integrity ?? '', /^sha512-/, `${key} has an integrity hash`);
+    assert.ok((entry.resolved ?? '').startsWith('https://registry.npmjs.org/'), `${key} resolves from the npm registry`);
+    assert.ok(!entry.hasInstallScript, `${key} has no install script`);
+  }
+  // The container installs exactly this tree offline.
+  const suite = read('worker/src/workspace-checkpoint.container.test.ts');
+  assert.ok(suite.includes('.github/scripts/next-warm/${f}') && suite.includes('npm ci --offline --cache /tmp/npmcache'));
+});
+
 test("ci.yml's container job installs the same pinned OpenCode, never by piping the installer into bash", () => {
   // Without --version the official installer asks the unauthenticated GitHub API for the latest
   // release first (rate-limited on shared egress), and `curl | bash` without pipefail exits 0 when

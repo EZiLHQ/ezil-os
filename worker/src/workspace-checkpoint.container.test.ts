@@ -1322,11 +1322,17 @@ cp /tmp/user.bashrc /etc/bash.bashrc && cp /tmp/user.npmrc "$G"
     expect(await baselineSystemLayer(sdk(a))).toBe(true);
     await new Promise(r => setTimeout(r, 1100));
     expect((await docker(['cp', NEXT_CACHE!, `${a}:/tmp/npmcache`])).code).toBe(0);
+    // The project is the reviewed fixture the cache was warmed from (.github/scripts/next-warm:
+    // pinned versions, integrity hashes), so the offline install resolves exactly that tree.
+    await must(a, 'mkdir -p /root/sports-web/app');
+    for (const f of ['package.json', 'package-lock.json']) {
+      const body = await readFile(new URL(`../../.github/scripts/next-warm/${f}`, import.meta.url), 'utf8');
+      expect((await sh(a, `cat > /root/sports-web/${f}`, body)).exitCode).toBe(0);
+    }
     await must(a, String.raw`
 set -e
-mkdir -p /root/sports-web/app && cd /root/sports-web
-printf '{"name":"sports-web","version":"0.1.0","private":true,"scripts":{"dev":"next dev"}}' > package.json
-npm install next@16.4.0 react@19 react-dom@19 --offline --cache /tmp/npmcache --no-audit --no-fund >/dev/null 2>&1
+cd /root/sports-web
+npm ci --offline --cache /tmp/npmcache --no-audit --no-fund >/dev/null 2>&1
 test -f package-lock.json && test -x node_modules/.bin/next
 printf 'export default function RootLayout({ children }) { return <html><body>{children}</body></html> }\n' > app/layout.js
 printf 'export default function Page() { return <h1>ezq-sports-marker</h1> }\n' > app/page.js
