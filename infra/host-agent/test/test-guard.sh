@@ -39,6 +39,11 @@ done
 # device UUID != lease fsUuid (wrong disk attached)
 jq '.fsUuid="7c2f1d0e-2e3b-4d4c-8f9a-1b2c3d4e5f60"' "$H/stub/user-data" > "$T/ud" && cp "$T/ud" "$H/stub/user-data"; agent g lease >/dev/null
 expect_refuse "device fs UUID != lease fsUuid" fs_uuid_mismatch agent g guard
+# wrong disk whose marker was rewritten to agree with the lease: only the DEVICE uuid check catches it
+mnt_rw; cp "$M" "$T/m.bak"; jq '.fsUuid="7c2f1d0e-2e3b-4d4c-8f9a-1b2c3d4e5f60"' "$T/m.bak" > "$M"; unmnt
+out="$(agent g guard 2>&1)"
+check "device fs UUID != lease even when the marker agrees (forged/copied marker)" bash -c "grep -q 'REFUSE fs_uuid_mismatch: device=' <<<'$out'"
+mnt_rw; cp "$T/m.bak" "$M"; unmnt
 # lease names a volume whose device is not attached
 jq '.volumeId="vol-0aaaaaaaaaaaaaaa0"' "$H/stub/user-data" > "$T/ud" && cp "$T/ud" "$H/stub/user-data"; agent g lease >/dev/null
 expect_refuse "lease volume not attached" volume_device_missing agent g guard

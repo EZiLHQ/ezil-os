@@ -8,6 +8,7 @@ T=/var/tmp/ezil-host-fb25d9f4; M="$T/mut-ha"; REPO="$(git -C "$HA" rev-parse --s
 KILLED=0; SURVIVED=0
 mutate() { # mutate <id> <file> <old> <new> <test> <expected FAIL substring>
     local id="$1" file="$2" old="$3" new="$4" test="$5" want="$6"
+    if [ -n "${MUT_ONLY:-}" ] && [[ " $MUT_ONLY " != *" $id "* ]]; then return; fi
     rm -rf "$M"; cp -a "$HA" "$M"; find "$M" -name __pycache__ -prune -exec rm -rf {} \; 2>/dev/null
     python3 - "$M/$file" "$old" "$new" <<'PY' || { echo "ERROR $id: anchor not found exactly once"; SURVIVED=$((SURVIVED+1)); return; }
 import sys
@@ -26,7 +27,7 @@ PY
     fi
 }
 mutate M1 lib/ezil_host/guard.py 'if m["leaseEpoch"] >= lease["leaseEpoch"]:' 'if False:' test-guard.sh "same epoch replayed"
-mutate M2 lib/ezil_host/guard.py 'if uuid != lease["fsUuid"]:' 'if False:' test-guard.sh "device fs UUID != lease fsUuid"
+mutate M2 lib/ezil_host/guard.py 'if uuid != lease["fsUuid"]:' 'if False:' test-guard.sh "device fs UUID != lease even when the marker agrees"
 mutate M3 lib/ezil_host/guard.py 'if m["generation"] > lease["generation"]:' 'if False:' test-guard.sh "writer generation above the lease"
 mutate M4 lib/ezil_host/guard.py 'if rebase_runner is None or not lease.get("rebase"):' 'if False:' test-guard.sh "lowerImageDigest mismatch, no receipt"
 mutate M5 lib/ezil_host/guard.py 'raise Refused("guard_not_passed")' 'return' test-guard.sh "refuses without a guard stamp"
@@ -34,7 +35,7 @@ mutate M6 lib/ezil_host/fsops.py '        os.write(fd, data)
         os.fsync(fd)' '        os.write(fd, data)' test-guard.sh "marker write order"
 mutate M7 lib/ezil_host/fsops.py 'DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC' 'DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC' test-hostile.sh "singleton cleanup: profiles/chrome -> host dir"
 mutate M8 lib/ezil_host/rebase.py 'if not on("P"):' 'if True:' test-rebase.sh "colliding /usr/local and /opt user files moved aside intact"
-mutate M9 lib/ezil_host/rebase.py 'body = read_regular_at(dfd, name, st) if stat.S_ISREG(st.st_mode) else None' 'body = open(os.path.join("/proc/self/fd", str(dfd), name), "rb").read() if not stat.S_ISDIR(st.st_mode) else None' test-hostile.sh "rebase: dpkg/status = block device"
+mutate M9 lib/ezil_host/rebase.py 'body = read_regular_at(dfd, name, st) if stat.S_ISREG(st.st_mode) else None' 'body = open(os.path.join("/proc/self/fd", str(dfd), name), "rb").read() if not stat.S_ISDIR(st.st_mode) else None' test-hostile.sh "rebase: dpkg/status = FIFO"
 mutate M10 lib/ezil_host/rebase.py 'raise RuntimeError("injected rebase fault (EZIL_REBASE_FAULT_AFTER)")' 'pass' test-rebase.sh "rebase fault after 5 entries"
 mutate M11 lib/ezil_host/desktop.py '"nodev,lowerdir=' '"lowerdir=' test-hostile.sh "production overlay_mount passes nodev"
 mutate M12 lib/ezil_host/tunnel.py 'wiped = wipe(tok_path)' 'wiped = False' test-enroll-tunnel.sh "fence: local token wiped"

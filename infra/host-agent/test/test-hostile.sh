@@ -26,6 +26,9 @@ reset_host; up; ln -s "$HOST/dpkg/status" "$W/upper/var/lib/dpkg/status"; rb
 check "rebase: dpkg/status -> host file: host file untouched" intact
 reset_host; up; mknod "$W/upper/var/lib/dpkg/status" b "$MAJ" "$MIN"; rb
 check "rebase: dpkg/status = block device: device untouched" intact
+reset_host; up; mkfifo "$W/upper/var/lib/dpkg/status"
+PYTHONPATH="$HA/lib" timeout 20 python3 -m ezil_host.rebase "$W/upper" "$W/old" "$W/new" >/dev/null 2>&1; rc=$?
+check "rebase: dpkg/status = FIFO: never opened (no hang), moved aside" bash -c "[ $rc -eq 0 ] && [ ! -e '$W/upper/var/lib/dpkg/status' ]"
 reset_host; up; rmdir "$W/upper/var/lib/dpkg"; ln -s "$HOST/dpkg" "$W/upper/var/lib/dpkg"; ln -s "$HOST/bin" "$W/upper/usr/local/bin"; rb
 check "rebase: symlinked parents leave host files alone" intact
 reset_host; rm -rf "$W/upper"; ln -s "$HOST/rootdir" "$W/upper"; rb; rm -f "$W/upper"
