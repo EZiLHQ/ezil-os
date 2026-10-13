@@ -46,21 +46,18 @@ engine's own `additiveSQL`, so it cannot drift outside the hosted grammar.
    implies placement reads. With reads on and AWS off, an `aws-ec2` computer refuses
    with `aws_disabled`.
 
-## Ownership caveat (`ezil_computers` RLS)
+## Ownership (`owner_user_id`)
 
-Admission's ownership and per-user checks read `ezil_computers`, which signed-in users
-can write through the Supabase API (`app/drizzle/0000_massive_mole_man.sql`):
+`ezil_computer_placements.owner_user_id` is set once, at creation, from the
+authenticated session user, and no later write changes it. Admission, the lease CAS
+and every provider operation compare the caller with it; per-user caps count placements
+by it (and usage metered to the user). `ezil_computers` is only a precondition (the
+computer exists, is live and is the caller's), never the owner.
 
-- the "Users can update own computers" policy pins `user_id = auth.uid()` in both
-  USING and WITH CHECK, so a user cannot move a computer to another user id;
-- but no column is protected, so a user can change `id` (re-key) or `deleted_at`, and
-  "Users can insert own computers" lets them insert a row with a chosen `id`, including
-  a soft-deleted one that takes no slot.
-
-Admission therefore also counts placements metered to the user in the usage ledger,
-refuses a computer whose usage was metered to another user, and refuses a soft-deleted
-computer. Residual gap: a placement that has never run (no usage rows) can be hidden by
-re-keying its row, or claimed by inserting a row with its id after the owner's account
-is deleted. Follow-up (P3, before Stage A): record the owning user on the placement
-(C-2 change) and/or revoke column `UPDATE (id)` and supplied ids on insert from
-`authenticated`.
+That matters because `ezil_computers` is user-writable through the Supabase API
+(`app/drizzle/0000_massive_mole_man.sql`): the update policy pins `user_id` but no
+column is protected, so a user can change `id` (re-key) and `deleted_at`, and the
+insert policy accepts a caller-chosen `id`, including a soft-deleted row that takes no
+slot. **Founder finding, not fixed here:** consider revoking `UPDATE (id)` and
+caller-chosen ids on insert from `authenticated`; R2 prefixes and other tables keyed by
+the computer id have the same exposure.

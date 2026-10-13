@@ -76,8 +76,12 @@ export interface FakeOptions {
     isolation?: string;
 }
 
+/** Default owner of seeded rows (tests' U1 / `userId`). */
+export const DEFAULT_OWNER = '11111111-1111-4111-8111-111111111111';
+
 export function placementRow(over: Row & { computer_id: string }): Row {
     return {
+        owner_user_id: DEFAULT_OWNER,
         provider: 'aws-ec2',
         workspace_store: 'ebs',
         generation: 1,
@@ -153,8 +157,11 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
             case 'computer-owner': {
                 const c = computers.find((x) => uuidEq(x.id, params[0]));
                 if (!c) return { rows: [] };
-                const foreign_usage = usage.filter((u) => uuidEq(u.computer_id, c.id) && !uuidEq(u.user_id, c.user_id)).length;
-                return { rows: [{ user_id: c.user_id, deleted: c.deleted_at != null, foreign_usage }] };
+                return { rows: [{ user_id: c.user_id, deleted: c.deleted_at != null }] };
+            }
+            case 'usage-foreign': {
+                const [computerId, userId] = params as string[];
+                return { rows: [{ n: usage.filter((u) => uuidEq(u.computer_id, computerId) && !uuidEq(u.user_id, userId)).length }] };
             }
             case 'count-running': {
                 const states = new Set(params as string[]);
@@ -163,12 +170,11 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
             }
             case 'count-user': {
                 const [computerId, userId] = params as string[];
-                const mine = (cid: unknown) =>
-                    computers.some((c) => uuidEq(c.id, cid) && uuidEq(c.user_id, userId)) ||
-                    usage.some((u) => uuidEq(u.computer_id, cid) && uuidEq(u.user_id, userId));
+                const mine = (r: Row) =>
+                    uuidEq(r.owner_user_id, userId) || usage.some((u) => uuidEq(u.computer_id, r.computer_id) && uuidEq(u.user_id, userId));
                 const n = new Set(
                     placements
-                        .filter((r) => r.provider === 'aws-ec2' && mine(r.computer_id) && !uuidEq(r.computer_id, computerId) && r.state !== 'PURGE_ELIGIBLE')
+                        .filter((r) => r.provider === 'aws-ec2' && mine(r) && !uuidEq(r.computer_id, computerId) && r.state !== 'PURGE_ELIGIBLE')
                         .map((r) => String(r.computer_id).toLowerCase()),
                 ).size;
                 return { rows: [{ n }] };
@@ -210,7 +216,7 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                     return (r: Row) => (r[set[1]!] = value(set[2]!.trim(), params));
                 });
                 // Atomic match-and-apply, like row-locked UPDATE re-evaluation.
-                const hit = placements.filter((r) => where.every(([col, v]) => (col === 'computer_id' ? uuidEq(r[col], v) : String(r[col]) === String(v))));
+                const hit = placements.filter((r) => where.every(([col, v]) => (col === 'computer_id' || col === 'owner_user_id' ? uuidEq(r[col], v) : String(r[col]) === String(v))));
                 for (const r of hit) {
                     const before = { ...r };
                     sets.forEach((apply) => apply(r));

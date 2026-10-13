@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { AwsProviderNotImplementedError, createAwsEc2StubProvider } from './aws-ec2';
 import { cloudflareComputeProvider } from './cloudflare';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { PlacementIntegrityError } from './placement';
+import { PlacementIntegrityError, PlacementOwnerError } from './placement';
 import { providerForPlacement, resolveComputeProvider, selectComputeProvider } from './select';
 
 const userId = '11111111-1111-4111-8111-111111111111';
@@ -81,6 +81,23 @@ describe('resolveComputeProvider', () => {
             if (aws === '1') await expect(ensure).rejects.toBeInstanceOf(AwsProviderNotImplementedError);
             else expect(await ensure).toEqual({ ok: false, error: 'aws_disabled', errorCode: 'aws_disabled', retryable: false });
         });
+    });
+
+    it('a placement owned by someone else refuses every provider operation (re-inserted computer row)', async () => {
+        const { db } = createFakePlacementDb({
+            placements: [placementRow({ computer_id: computerId, owner_user_id: '66666666-6666-4666-8666-666666666666' })],
+        });
+        await expect(resolveComputeProvider(db, computer, ON)).rejects.toBeInstanceOf(PlacementOwnerError);
+        await expect(resolveComputeProvider(db, computer, { EZIL_COMPUTE_PLACEMENT_READS: '1' })).rejects.toBeInstanceOf(PlacementOwnerError);
+        const cf = createFakePlacementDb({
+            placements: [placementRow({ computer_id: computerId, provider: 'cloudflare', workspace_store: 'r2', owner_user_id: '66666666-6666-4666-8666-666666666666' })],
+        });
+        await expect(resolveComputeProvider(cf.db, computer, ON)).rejects.toBeInstanceOf(PlacementOwnerError);
+    });
+
+    it('the owner matches case-insensitively', async () => {
+        const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: computerId })] });
+        expect((await resolveComputeProvider(db, { userId: userId.toUpperCase(), computerId }, ON)).kind).toBe('aws-ec2');
     });
 
     it('selectComputeProvider (existing callers) is unchanged', () => {

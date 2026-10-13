@@ -16,7 +16,8 @@
  *   value. A missing table is NOT treated as "no row". An aws-ec2 row resolves
  *   to the aws-ec2 provider even with the AWS flag off, which REFUSES
  *   (`aws_disabled`) — it never falls back to Cloudflare. Reads are one-way:
- *   see `isPlacementReadEnabled`.
+ *   see `isPlacementReadEnabled`. A placement whose `owner_user_id` is not
+ *   the caller throws `PlacementOwnerError` (→ NOT_FOUND).
  *
  * Callers move from the first to the second in the caller-wiring PR (P3),
  * after the SQL is applied; that PR also narrows the callers to
@@ -26,7 +27,7 @@
 import { isPlacementReadEnabled, type Env } from './aws-config';
 import { awsEc2StubProvider, createAwsEc2StubProvider } from './aws-ec2';
 import { cloudflareComputeProvider, type CloudflareComputeProvider } from './cloudflare';
-import { readPlacement, type PlacementExecutor, type ResolvedPlacement } from './placement';
+import { PlacementOwnerError, readPlacement, type PlacementExecutor, type ResolvedPlacement } from './placement';
 import type { ComputeProvider, ComputerRef } from './provider';
 
 export function selectComputeProvider(computer: ComputerRef): CloudflareComputeProvider {
@@ -55,5 +56,11 @@ export async function resolveComputeProvider(
     env: Env = process.env,
 ): Promise<ComputeProvider> {
     if (!isPlacementReadEnabled(env)) return cloudflareComputeProvider;
-    return providerForPlacement(await readPlacement(db, computer.computerId), env);
+    const placement = await readPlacement(db, computer.computerId);
+    // Every provider operation is the recorded owner's only (C-2): `computer.userId` is the
+    // authenticated session user; a re-keyed or re-inserted ezil_computers row changes nothing.
+    if (placement.record && placement.record.ownerUserId !== computer.userId.toLowerCase()) {
+        throw new PlacementOwnerError(placement.record.computerId);
+    }
+    return providerForPlacement(placement, env);
 }

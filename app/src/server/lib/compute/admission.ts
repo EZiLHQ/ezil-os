@@ -49,7 +49,7 @@ export type AdmissionDecision = { admit: true } | { admit: false; reason: Admiss
  */
 export function decideAdmission(input: {
     config: AwsAdmissionConfig;
-    counters: Pick<AdmissionCounters, 'targetOwnerId' | 'targetDeleted' | 'targetForeignUsage' | 'runningCount' | 'userOtherAwsComputers' | 'duplicates' | 'usage'>;
+    counters: Pick<AdmissionCounters, 'targetOwnerId' | 'targetPlacementOwnerId' | 'targetDeleted' | 'targetForeignUsage' | 'runningCount' | 'userOtherAwsComputers' | 'duplicates' | 'usage'>;
     userId: string;
     now: Date;
 }): AdmissionDecision {
@@ -60,9 +60,12 @@ export function decideAdmission(input: {
     const reasons: AdmissionRefusal[] = [];
     // The caller's pair is re-checked here: caps are per user, so admitting
     // for a computer the user does not own would bypass them.
-    // Usage metered to another user means the computer row changed hands
-    // (see the ezil_computers RLS note in docs/aws-computers/sql/README.md).
+    // The placement's owner_user_id is authoritative (C-2). ezil_computers is
+    // user-writable, so its row is only a precondition; usage metered to
+    // anyone else means the computer changed hands.
+    const caller = input.userId.toLowerCase();
     if (
+        (counters.targetPlacementOwnerId !== null && counters.targetPlacementOwnerId.toLowerCase() !== caller) ||
         counters.targetOwnerId === null ||
         counters.targetOwnerId.toLowerCase() !== input.userId.toLowerCase() ||
         counters.targetForeignUsage > 0
@@ -82,6 +85,7 @@ export function decideAdmission(input: {
 }
 
 export type AdmissionRequest =
+    /** `userId` is the AUTHENTICATED session user; on create it becomes `owner_user_id`. */
     | { kind: 'lease'; userId: string; computerId: string; expected: { generation: number; leaseEpoch: number }; leaseUntil: Date; replace?: boolean }
     | { kind: 'create'; userId: string; computerId: string; fields?: PlacementFields };
 
@@ -113,11 +117,12 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
             request.kind === 'lease'
                 ? await leasePlacement(tx, lock, {
                       computerId: request.computerId,
+                      ownerUserId: request.userId,
                       expected: request.expected,
                       leaseUntil: request.leaseUntil,
                       replace: request.replace,
                   })
-                : await createAwsPlacement(tx, lock, { computerId: request.computerId, fields: request.fields });
+                : await createAwsPlacement(tx, lock, { computerId: request.computerId, ownerUserId: request.userId, fields: request.fields });
         if (!result.ok) return { admitted: false, reason: result.reason === 'illegal_transition' ? 'cas_conflict' : result.reason };
         return { admitted: true, placement: result.placement };
     });

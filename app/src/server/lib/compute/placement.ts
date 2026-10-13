@@ -49,12 +49,14 @@ import { sql, type SQL } from 'drizzle-orm';
 export const PLACEMENT_PROVIDERS = ['cloudflare', 'aws-ec2'] as const;
 export type PlacementProvider = (typeof PLACEMENT_PROVIDERS)[number];
 
-/** `r2`: checkpointed to R2 (Cloudflare). `ebs`: retained data volume (AWS, R3). */
-export const WORKSPACE_STORES = ['r2', 'ebs'] as const;
+/** `r2` / `s3`: checkpointed object store (Cloudflare). `ebs`: retained data volume (AWS, R3). */
+export const WORKSPACE_STORES = ['r2', 's3', 'ebs'] as const;
 export type WorkspaceStore = (typeof WORKSPACE_STORES)[number];
 
-/** The only provider/store pairs a row may carry. Anything else fails closed. */
-const STORE_FOR_PROVIDER: Record<PlacementProvider, WorkspaceStore> = { cloudflare: 'r2', 'aws-ec2': 'ebs' };
+/** C-2 pinned pairs: `cloudflare` → `r2` | `s3`, `aws-ec2` → `ebs`. Anything else fails closed. */
+const STORES_FOR_PROVIDER: Record<PlacementProvider, readonly WorkspaceStore[]> = { cloudflare: ['r2', 's3'], 'aws-ec2': ['ebs'] };
+/** The store a newly created row records. */
+const DEFAULT_STORE: Record<PlacementProvider, WorkspaceStore> = { cloudflare: 'r2', 'aws-ec2': 'ebs' };
 
 /** C-3. Stage B's "terminated" is the end of a slot, not a stored state. */
 export const PLACEMENT_STATES = [
@@ -122,6 +124,19 @@ export class PlacementIntegrityError extends Error {
     }
 }
 
+/** The caller is not the placement's recorded owner. */
+export class PlacementOwnerError extends Error {
+    constructor(readonly computerId: string) {
+        super('placement_not_owned');
+        this.name = 'PlacementOwnerError';
+    }
+}
+
+/** Same answer the routers give for another user's computer: NOT_FOUND, never a distinguishing FORBIDDEN. */
+export function placementOwnerTrpcError(error: PlacementOwnerError): TRPCError {
+    return new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found.', cause: error });
+}
+
 /** Wire mapping: a typed refusal, never a 500 and never a silent default. */
 export function placementTrpcError(error: PlacementIntegrityError): TRPCError {
     return new TRPCError({ code: 'PRECONDITION_FAILED', message: error.message, cause: error });
@@ -152,6 +167,8 @@ export const ADMISSION_LOCK_NAMESPACE = 1163551076;
 
 export interface Placement {
     computerId: string;
+    /** Set once at creation from the authenticated session; never from `ezil_computers`. */
+    ownerUserId: string;
     provider: PlacementProvider;
     store: WorkspaceStore;
     generation: number;
@@ -200,7 +217,7 @@ export type PlacementFields = Partial<{
 
 const SELECT_COLUMNS = sql.raw(
     [
-        'computer_id::text AS computer_id', 'provider', 'workspace_store', 'generation::text AS generation',
+        'computer_id::text AS computer_id', 'owner_user_id::text AS owner_user_id', 'provider', 'workspace_store', 'generation::text AS generation',
         'lease_epoch::text AS lease_epoch', 'state', 'region', 'zone_id', 'instance_id', 'instance_type',
         'volume_id', 'fs_uuid::text AS fs_uuid', 'tunnel_id', 'enroll_nonce_hash', 'enroll_expires_at',
         'lease_until', 'presence_at', 'updated_at',
@@ -236,7 +253,7 @@ export function parsePlacementRow(row: Record<string, unknown>, computerId: stri
     };
     const provider = oneOf(PLACEMENT_PROVIDERS, row.provider) ? row.provider : fail('unknown_provider');
     const store = oneOf(WORKSPACE_STORES, row.workspace_store) ? row.workspace_store : fail('unknown_store');
-    if (STORE_FOR_PROVIDER[provider] !== store) fail('unknown_store');
+    if (!STORES_FOR_PROVIDER[provider].includes(store)) fail('unknown_store');
     const state = oneOf(PLACEMENT_STATES, row.state) ? row.state : fail('unknown_state');
     const generation = counter(row.generation) ?? fail('invalid_row');
     const leaseEpoch = counter(row.lease_epoch) ?? fail('invalid_row');
@@ -250,8 +267,9 @@ export function parsePlacementRow(row: Record<string, unknown>, computerId: stri
         return v === undefined ? fail('invalid_row') : v;
     };
     const updatedAt = time('updated_at') ?? fail('invalid_row');
+    const ownerUserId = typeof row.owner_user_id === 'string' && UUID.test(row.owner_user_id) ? row.owner_user_id.toLowerCase() : fail('invalid_row');
     return {
-        computerId: row.computer_id as string, provider, store, generation, leaseEpoch, state,
+        computerId: row.computer_id as string, ownerUserId, provider, store, generation, leaseEpoch, state,
         region: text('region'), zoneId: text('zone_id'), instanceId: text('instance_id'),
         instanceType: text('instance_type'), volumeId: text('volume_id'), fsUuid: text('fs_uuid'),
         tunnelId: text('tunnel_id'), enrollNonceHash: text('enroll_nonce_hash'),
@@ -302,6 +320,7 @@ export async function findDuplicatePlacements(db: PlacementExecutor): Promise<{ 
  * mixed-case creators two different locks and two rows (review, real PG 16).
  */
 const canonicalId = (id: string) => id.toLowerCase();
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Thrown when a lock is taken outside READ COMMITTED (see module doc). */
 export class PlacementIsolationError extends Error {
@@ -377,6 +396,8 @@ function assertAdmissionLock(tx: PlacementExecutor, lock: AdmissionLock): void {
 
 export interface CreatePlacementInput {
     computerId: string;
+    /** The AUTHENTICATED session user. Recorded once; no later write changes it. */
+    ownerUserId: string;
     provider: PlacementProvider;
     state: PlacementState;
     fields?: PlacementFields;
@@ -385,16 +406,17 @@ export interface CreatePlacementInput {
 export type CreatePlacementResult = { ok: true; placement: Placement } | { ok: false; reason: 'placement_exists' };
 
 async function createInTx(tx: PlacementExecutor, rawInput: CreatePlacementInput): Promise<CreatePlacementResult> {
-    const input = { ...rawInput, computerId: canonicalId(rawInput.computerId) };
+    const input = { ...rawInput, computerId: canonicalId(rawInput.computerId), ownerUserId: canonicalId(rawInput.ownerUserId) };
     await lockComputer(tx, input.computerId);
     if ((await selectRows(tx, input.computerId)).length > 0) return { ok: false, reason: 'placement_exists' };
     const fields = input.fields ?? {};
     const keys = (Object.keys(MUTABLE_COLUMNS) as (keyof typeof MUTABLE_COLUMNS)[]).filter((k) => fields[k] !== undefined);
-    const columns = ['computer_id', 'provider', 'workspace_store', 'generation', 'lease_epoch', 'state', 'updated_at', ...keys.map((k) => MUTABLE_COLUMNS[k][0])];
+    const columns = ['computer_id', 'owner_user_id', 'provider', 'workspace_store', 'generation', 'lease_epoch', 'state', 'updated_at', ...keys.map((k) => MUTABLE_COLUMNS[k][0])];
     const values: SQL[] = [
         sql`${input.computerId}::uuid`,
+        sql`${input.ownerUserId}::uuid`,
         sql`${input.provider}`,
-        sql`${STORE_FOR_PROVIDER[input.provider]}`,
+        sql`${DEFAULT_STORE[input.provider]}`,
         sql`1`,
         sql`0`,
         sql`${input.state}`,
@@ -429,10 +451,10 @@ export async function createPlacement(db: PlacementDb, input: CreatePlacementInp
 export async function createAwsPlacement(
     tx: PlacementExecutor,
     lock: AdmissionLock,
-    input: { computerId: string; fields?: PlacementFields },
+    input: { computerId: string; ownerUserId: string; fields?: PlacementFields },
 ): Promise<CreatePlacementResult> {
     assertAdmissionLock(tx, lock);
-    return createInTx(tx, { computerId: input.computerId, provider: 'aws-ec2', state: 'PROVISIONING', fields: input.fields });
+    return createInTx(tx, { computerId: input.computerId, ownerUserId: input.ownerUserId, provider: 'aws-ec2', state: 'PROVISIONING', fields: input.fields });
 }
 
 // ── Transitions (CAS) ────────────────────────────────────────────────────
@@ -454,7 +476,7 @@ async function casInTx(
     to: PlacementState,
     bump: { generation: 0 | 1; leaseEpoch: 0 | 1 },
     fields: PlacementFields,
-    provider?: PlacementProvider,
+    lease?: { provider: PlacementProvider; ownerUserId: string },
 ): Promise<TransitionResult> {
     const computerId = canonicalId(rawComputerId);
     // A duplicate whose keys do not match the CAS would let this writer win
@@ -472,7 +494,7 @@ async function casInTx(
     const rows = rowsOf(
         await tx.execute(sql`/* placement:cas */ UPDATE public.ezil_computer_placements
             SET ${sql.join(sets, sql`, `)}
-            WHERE computer_id = ${computerId}::uuid AND generation = ${expected.generation} AND lease_epoch = ${expected.leaseEpoch} AND state = ${expected.state}${provider ? sql` AND provider = ${provider}` : sql``}
+            WHERE computer_id = ${computerId}::uuid AND generation = ${expected.generation} AND lease_epoch = ${expected.leaseEpoch} AND state = ${expected.state}${lease ? sql` AND provider = ${lease.provider} AND owner_user_id = ${canonicalId(lease.ownerUserId)}::uuid` : sql``}
             RETURNING ${SELECT_COLUMNS}`),
     );
     if (rows.length === 0) return { ok: false, reason: 'cas_conflict' };
@@ -499,7 +521,7 @@ export async function transitionPlacement(
 export async function leasePlacement(
     tx: PlacementExecutor,
     lock: AdmissionLock,
-    input: { computerId: string; expected: { generation: number; leaseEpoch: number }; leaseUntil: Date; replace?: boolean },
+    input: { computerId: string; ownerUserId: string; expected: { generation: number; leaseEpoch: number }; leaseUntil: Date; replace?: boolean },
 ): Promise<TransitionResult> {
     assertAdmissionLock(tx, lock);
     return casInTx(
@@ -509,7 +531,9 @@ export async function leasePlacement(
         'LEASED',
         { generation: input.replace ? 1 : 0, leaseEpoch: 1 },
         { leaseUntil: input.leaseUntil },
-        'aws-ec2', // a Cloudflare row is never leased under AWS caps
+        // Only the recorded owner's aws-ec2 row matches: a Cloudflare row is never leased under
+        // AWS caps, and a re-keyed or re-inserted ezil_computers row cannot claim a placement.
+        { provider: 'aws-ec2', ownerUserId: input.ownerUserId },
     );
 }
 
@@ -526,17 +550,18 @@ export interface UsageRow {
 export interface AdmissionCounters {
     /** `ezil_computers.user_id` of the target, or null when no such computer exists. */
     targetOwnerId: string | null;
+    /** `owner_user_id` of the target's placement, or null when it has none. Authoritative. */
+    targetPlacementOwnerId: string | null;
     /** The target computer row is soft-deleted. */
     targetDeleted: boolean;
-    /** Usage rows for the target recorded under a user other than its current owner. */
+    /** Usage rows for the target metered to anyone but the caller. */
     targetForeignUsage: number;
     /** aws-ec2 placements in a running-class state, any user. */
     runningCount: number;
     /**
-     * The user's OTHER aws-ec2 placements not yet PURGE_ELIGIBLE, soft-deleted
-     * computers included. "The user's" = owned via `ezil_computers` OR ever
-     * metered to the user in the usage ledger, so re-keying a computer row
-     * cannot hide a placement that has run.
+     * The user's OTHER aws-ec2 placements not yet PURGE_ELIGIBLE: counted by
+     * `owner_user_id` (or usage metered to the user), never through
+     * `ezil_computers`, so re-keying a computer row hides nothing.
      */
     userOtherAwsComputers: number;
     duplicates: { computerId: string; rows: number }[];
@@ -552,11 +577,18 @@ export async function readAdmissionCounters(
 ): Promise<AdmissionCounters> {
     assertAdmissionLock(tx, lock);
     const input = { ...rawInput, userId: canonicalId(rawInput.userId), computerId: canonicalId(rawInput.computerId) };
+    // ezil_computers is user-writable (id, deleted_at, chosen ids on insert): it is a
+    // precondition here (the computer exists, is live and is the caller's), never the owner.
     const ownerRows = rowsOf(
-        await tx.execute(sql`/* placement:computer-owner */ SELECT c.user_id::text AS user_id, (c.deleted_at IS NOT NULL) AS deleted,
-                (SELECT count(*)::int FROM public.ezil_compute_usage u WHERE u.computer_id = c.id AND u.user_id <> c.user_id) AS foreign_usage
+        await tx.execute(sql`/* placement:computer-owner */ SELECT c.user_id::text AS user_id, (c.deleted_at IS NOT NULL) AS deleted
             FROM public.ezil_computers c
             WHERE c.id = ${input.computerId}::uuid`),
+    );
+    const target = await readPlacement(tx, input.computerId);
+    const foreignRows = rowsOf(
+        await tx.execute(sql`/* placement:usage-foreign */ SELECT count(*)::int AS n
+            FROM public.ezil_compute_usage
+            WHERE computer_id = ${input.computerId}::uuid AND user_id <> ${input.userId}::uuid`),
     );
     const running = sql.join(RUNNING_CLASS_STATES.map((s) => sql`${s}`), sql`, `);
     const runningRows = rowsOf(
@@ -570,7 +602,7 @@ export async function readAdmissionCounters(
         await tx.execute(sql`/* placement:count-user */ SELECT count(DISTINCT p.computer_id)::int AS n
             FROM public.ezil_computer_placements p
             WHERE p.provider = 'aws-ec2' AND p.computer_id <> ${input.computerId}::uuid AND p.state <> 'PURGE_ELIGIBLE'
-              AND (EXISTS (SELECT 1 FROM public.ezil_computers c WHERE c.id = p.computer_id AND c.user_id = ${input.userId}::uuid)
+              AND (p.owner_user_id = ${input.userId}::uuid
                 OR EXISTS (SELECT 1 FROM public.ezil_compute_usage u WHERE u.computer_id = p.computer_id AND u.user_id = ${input.userId}::uuid))`),
     );
     const duplicates = await findDuplicatePlacements(tx);
@@ -587,12 +619,11 @@ export async function readAdmissionCounters(
         return n;
     };
     const owner = ownerRows[0];
-    const foreign = owner ? counter(owner.foreign_usage) : 0;
-    if (foreign === null) throw new Error('admission owner query returned no usage count');
     return {
         targetOwnerId: typeof owner?.user_id === 'string' ? owner.user_id : null,
+        targetPlacementOwnerId: target.record?.ownerUserId ?? null,
         targetDeleted: owner?.deleted === true,
-        targetForeignUsage: foreign,
+        targetForeignUsage: count(foreignRows),
         runningCount: count(runningRows),
         userOtherAwsComputers: count(userRows),
         duplicates,

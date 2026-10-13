@@ -38,7 +38,7 @@ describe('placement SQL is inside the hosted additive grammar', () => {
                 .filter(Boolean);
         };
         expect(columns('ezil_computer_placements')).toEqual([
-            'computer_id uuid', 'provider text', 'workspace_store text', 'generation bigint', 'lease_epoch bigint',
+            'computer_id uuid', 'owner_user_id uuid', 'provider text', 'workspace_store text', 'generation bigint', 'lease_epoch bigint',
             'state text', 'region text', 'zone_id text', 'instance_id text', 'instance_type text', 'volume_id text',
             'fs_uuid uuid', 'tunnel_id text', 'enroll_nonce_hash text', 'enroll_expires_at timestamptz',
             'lease_until timestamptz', 'presence_at timestamptz', 'updated_at timestamptz',

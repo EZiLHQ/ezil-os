@@ -14,6 +14,7 @@
 
 CREATE TABLE public.ezil_computer_placements (
   computer_id uuid NOT NULL,
+  owner_user_id uuid NOT NULL,
   provider text NOT NULL,
   workspace_store text NULL,
   generation bigint NOT NULL,
