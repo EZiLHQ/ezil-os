@@ -1,0 +1,10 @@
+[Unit]
+Description=EZiL: read this epoch's lease and identity from IMDSv2
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
+UMask=0077
+ExecStart=/opt/ezil-host/bin/ezil-host-agent lease

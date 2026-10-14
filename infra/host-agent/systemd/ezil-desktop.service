@@ -1,0 +1,12 @@
+[Unit]
+Description=EZiL: desktop container (runc, hardened spec)
+Requires=ezil-overlay.service
+After=ezil-overlay.service
+[Service]
+Type=simple
+Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
+UMask=0077
+ExecStart=/opt/ezil-host/bin/ezil-host-agent desktop
+ExecStop=/opt/ezil-host/bin/ezil-host-agent desktop-stop
+TimeoutStopSec=90
+KillMode=mixed

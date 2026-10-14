@@ -1,0 +1,11 @@
+[Unit]
+Description=EZiL: mount the data volume by volume id + fs UUID (nosuid,nodev) and run the C-4 marker guard
+Requires=ezil-lease.service
+After=ezil-lease.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
+UMask=0077
+ExecStart=/opt/ezil-host/bin/ezil-host-agent guard
+ExecStop=/opt/ezil-host/bin/ezil-host-agent data-down

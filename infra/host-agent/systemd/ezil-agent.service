@@ -1,0 +1,9 @@
+[Unit]
+Description=EZiL: control channel, idle predicate and quiesce/shutdown (R9)
+Requires=ezil-enroll.service ezil-desktop.service
+After=ezil-enroll.service ezil-desktop.service
+[Service]
+Type=simple
+Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
+UMask=0077
+ExecStart=/opt/ezil-host/bin/ezil-host-agent agent

@@ -1,0 +1,41 @@
+# EC2 Image Builder component for the EZiL computer host (I4). Parameters carry no
+# secrets. The pipeline (I1/CDK) supplies AgentSrcS3Uri pointing at a reviewed tarball of
+# infra/host-agent; the build instance role needs only read access to that object and
+# the image registry.
+name: ezil-computer-host
+schemaVersion: 1.0
+parameters:
+  - AgentSrcS3Uri: {type: string}
+  - DesktopImageRef: {type: string, description: "<registry>/<repo>@sha256:<manifest digest>"}
+  - DesktopImageId: {type: string, description: "image config digest sha256:… (lowerImageDigest)"}
+  - CloudflaredVersion: {type: string}
+  - CloudflaredSha256: {type: string}
+  - EnrollUrl: {type: string}
+phases:
+  - name: build
+    steps:
+      - name: FetchAgent
+        action: S3Download
+        inputs:
+          - source: '{{ AgentSrcS3Uri }}'
+            destination: /tmp/ezil-host-agent.tgz
+      - name: Build
+        action: ExecuteBash
+        inputs:
+          commands:
+            - mkdir -p /tmp/ezil-host-agent && tar -C /tmp/ezil-host-agent -xzf /tmp/ezil-host-agent.tgz
+            - >-
+              AGENT_SRC=/tmp/ezil-host-agent DESKTOP_IMAGE_REF='{{ DesktopImageRef }}'
+              DESKTOP_IMAGE_ID='{{ DesktopImageId }}' CLOUDFLARED_VERSION='{{ CloudflaredVersion }}'
+              CLOUDFLARED_SHA256='{{ CloudflaredSha256 }}' ENROLL_URL='{{ EnrollUrl }}'
+              bash /tmp/ezil-host-agent/ami/build-host-ami.sh
+  - name: validate
+    steps:
+      - name: Validate
+        action: ExecuteBash
+        inputs:
+          commands:
+            - test -x /usr/local/bin/cloudflared && test -x /usr/sbin/runc
+            - test -s /etc/ezil-host/lower-image-digest && test -d "/var/lib/ezil/lowers/$(cut -d: -f2 /etc/ezil-host/lower-image-digest)/usr"
+            - systemctl is-enabled ezil-host.target
+            - apparmor_parser -Q -K /etc/apparmor.d/ezil-desktop

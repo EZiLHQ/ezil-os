@@ -2016,7 +2016,14 @@ log "editor state: restore+capture loop started (manifest ${EZIL_EDITOR_EXT_MANI
 # because that block needs it before this `rm -rf` runs — deleting the profile
 # of a still-live orphaned Chrome is how you turn a recoverable stale boot into
 # a corrupted one).
-rm -rf "$CHROME_PROFILE_DIR" 2>/dev/null || true
+if [ "${EZIL_PERSISTENT_PROFILES:-0}" = 1 ]; then
+  # AWS computers (docs/AWS-COMPUTERS.md R15): the profile lives on the retained
+  # data volume. Never wipe it. Stale Singleton* locks were already cleared by the
+  # host agent AFTER the single-writer lease was confirmed (infra/host-agent).
+  log "browser profile: persistent (${CHROME_PROFILE_DIR}), not wiped"
+else
+  rm -rf "$CHROME_PROFILE_DIR" 2>/dev/null || true
+fi
 mkdir -p "$CHROME_PROFILE_DIR" 2>/dev/null || true
 
 # ── The browser must NOT draw its own window frame ───────────────────────────

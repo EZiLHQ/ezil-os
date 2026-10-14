@@ -1,0 +1,10 @@
+[Unit]
+Description=EZiL: cloudflared supervisor (per-epoch tunnel; fence stops it and wipes the token)
+Requires=ezil-enroll.service
+After=ezil-enroll.service
+[Service]
+Type=simple
+Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
+UMask=0077
+ExecStart=/opt/ezil-host/bin/ezil-host-agent cloudflared
+TimeoutStopSec=30

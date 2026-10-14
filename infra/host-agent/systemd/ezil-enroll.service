@@ -1,0 +1,10 @@
+[Unit]
+Description=EZiL: C-6 enrollment (identity document + signature + one-time nonce)
+Requires=ezil-desktop.service
+After=ezil-desktop.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json
+UMask=0077
+ExecStart=/opt/ezil-host/bin/ezil-host-agent enroll
