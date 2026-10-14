@@ -13,7 +13,14 @@
  * 🔴 Never log a nonce, a control key or a tunnel token.
  */
 
-import { createHash, randomBytes as nodeRandomBytes } from 'node:crypto';
+import { createHash, randomBytes as nodeRandomBytes, timingSafeEqual } from 'node:crypto';
+import { z } from 'zod';
+
+import { isAwsComputersEnabled, type Env as AwsEnv } from './aws-config';
+import { readIdentityCertificate, verifyIdentitySignature } from './aws-identity';
+import { readLifecycleDeployments } from './aws-intent';
+import { consumeEnrollmentNonce, ENROLLABLE_STATES, readPlacement, type Placement, type PlacementDb } from './placement';
+import { mintPreviewTokenV2 } from './preview-token-v2';
 
 /** C-6: at most 10 minutes between issue and enrollment. */
 export const ENROLL_NONCE_TTL_SECONDS = 600;
@@ -87,4 +94,269 @@ export function buildEnrollmentUserData(i: EnrollmentUserDataInput): string {
     const encoded = Buffer.from(JSON.stringify(lease), 'utf8').toString('base64');
     if (encoded.length > USER_DATA_MAX) throw new EnrollmentUserDataError('too_large');
     return encoded;
+}
+
+// ── Enrollment endpoint (C-6 steps 3-5) ──────────────────────────────────
+
+/** What a live EC2 describe shows about the enrolling instance (C-6 step 3, last check). */
+export interface Ec2EnrollmentView {
+    instanceId: string;
+    /** EC2 state name: only `running` enrolls. */
+    state: string;
+    availabilityZone: string;
+    /** The ZoneId (e.g. `aps1-az1`): compared with the placement's. */
+    availabilityZoneId: string;
+    publicIp: string | null;
+    tags: Readonly<Record<string, string>>;
+    /** Every EBS volume attached to the instance. */
+    volumes: readonly { volumeId: string; deleteOnTermination: boolean; tags: Readonly<Record<string, string>> }[];
+}
+
+/** Injected: a read-only EC2 describe in the placement's region. null = no such instance. */
+export interface Ec2EnrollmentDescriber {
+    describeForEnrollment(region: string, instanceId: string): Promise<Ec2EnrollmentView | null>;
+}
+
+/** GW-1 request body (GATEWAY-CONTRACT-v1). `controlKey` is base64. */
+export interface TunnelRequest {
+    computerId: string;
+    sandboxId: string;
+    generation: number;
+    leaseEpoch: number;
+    instanceId: string;
+    region: string;
+    publicIp: string;
+    controlKey: string;
+}
+export type TunnelResult = { ok: true; tunnelToken: string } | { ok: false; status: number; code: string };
+
+/** Injected: the Worker's tunnel API (GW-1). The app never holds a Cloudflare token. */
+export interface TunnelClient {
+    createTunnel(owner: { userId: string }, request: TunnelRequest): Promise<TunnelResult>;
+    deleteTunnel(owner: { userId: string }, request: Pick<TunnelRequest, 'computerId' | 'sandboxId' | 'generation' | 'leaseEpoch'>): Promise<{ ok: boolean; status?: number }>;
+}
+
+/** GW-1 path on the Worker. */
+export const TUNNELS_PATH = '/internal/aws/tunnels';
+
+/** GATEWAY-CONTRACT-v1: the first 16 alphanumerics of the computer id (lower case). */
+export function awsSandboxId(computerId: string): string {
+    return computerId.replace(/[^a-z0-9]/gi, '').slice(0, 16).toLowerCase();
+}
+
+/**
+ * GW-1 over HTTPS with the app's v2 envelope (provider aws-ec2, no store claim).
+ * The claims' computer, sandbox, user, generation and epoch equal the body's.
+ */
+export function createWorkerTunnelClient(cfg: { workerUrl: string; secret: string; fetch?: typeof fetch; now?: () => Date }): TunnelClient {
+    const doFetch = cfg.fetch ?? fetch;
+    const nowSeconds = () => Math.floor((cfg.now?.() ?? new Date()).getTime() / 1000);
+    const call = async (method: 'POST' | 'DELETE', owner: { userId: string }, body: Record<string, unknown> & { computerId: string; sandboxId: string; generation: number; leaseEpoch: number }) => {
+        const text = JSON.stringify(body);
+        const auth = mintPreviewTokenV2(
+            cfg.secret,
+            { ts: nowSeconds(), sandboxId: body.sandboxId, computerId: body.computerId, userId: owner.userId, provider: 'aws-ec2', store: '', generation: body.generation, leaseEpoch: body.leaseEpoch },
+            { method, path: TUNNELS_PATH, body: text },
+        );
+        return doFetch(`${cfg.workerUrl.replace(/\/$/, '')}${TUNNELS_PATH}`, {
+            method,
+            headers: { 'content-type': 'application/json', 'x-ezil-auth': auth },
+            body: text,
+            redirect: 'error',
+            signal: AbortSignal.timeout(15_000),
+        });
+    };
+    return {
+        async createTunnel(owner, request) {
+            let res: Response;
+            try {
+                res = await call('POST', owner, { ...request });
+            } catch {
+                return { ok: false, status: 0, code: 'tunnel_transport' };
+            }
+            if (res.status !== 200) return { ok: false, status: res.status, code: `tunnel_http_${res.status}` };
+            try {
+                const json = (await res.json()) as { tunnelToken?: unknown };
+                if (typeof json.tunnelToken !== 'string' || json.tunnelToken.length < 16) return { ok: false, status: 502, code: 'tunnel_response_malformed' };
+                return { ok: true, tunnelToken: json.tunnelToken };
+            } catch {
+                return { ok: false, status: 502, code: 'tunnel_response_malformed' };
+            }
+        },
+        async deleteTunnel(owner, request) {
+            try {
+                const res = await call('DELETE', owner, { ...request });
+                return { ok: res.status === 200, status: res.status };
+            } catch {
+                return { ok: false };
+            }
+        },
+    };
+}
+
+/** From the app's existing Worker settings (`CLOUDFLARE_GUACAMOLE_WORKER_URL`, shared HMAC secret); null when either is unset. */
+export function workerTunnelClientFromEnv(env: AwsEnv): TunnelClient | null {
+    const workerUrl = env.CLOUDFLARE_GUACAMOLE_WORKER_URL?.trim();
+    const secret = env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim();
+    if (!workerUrl || !secret || !/^https:\/\//.test(workerUrl)) return null;
+    return createWorkerTunnelClient({ workerUrl, secret });
+}
+
+const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+/** The host body (`enroll.py`): exactly these fields. */
+export const EnrollBodySchema = z
+    .object({
+        computerId: uuid,
+        generation: z.number().int().min(1).max(2147483647),
+        leaseEpoch: z.number().int().min(1).max(2147483647),
+        nonce: z.string().regex(NONCE_RE),
+        identityDocument: z.string().min(2).max(8192),
+        signature: z.string().min(16).max(16384),
+    })
+    .strict();
+
+const IdentityDocumentSchema = z
+    .object({
+        accountId: z.string().regex(/^\d{12}$/),
+        instanceId: z.string().regex(/^i-[a-f0-9]{8,17}$/),
+        instanceType: z.string(),
+        region: z.string(),
+        availabilityZone: z.string().min(1),
+    })
+    .passthrough();
+
+export interface EnrollDeps {
+    db: PlacementDb;
+    env: AwsEnv;
+    now: () => Date;
+    randomBytes?: (n: number) => Buffer;
+    describer?: Ec2EnrollmentDescriber | null;
+    tunnels?: TunnelClient | null;
+}
+
+export interface EnrollResponse {
+    status: number;
+    body: Record<string, unknown>;
+}
+
+const refuse = (status: number, error: string): EnrollResponse => ({ status, body: { error } });
+
+const sameHash = (a: string, b: string) => {
+    const x = Buffer.from(a, 'utf8');
+    const y = Buffer.from(b, 'utf8');
+    return x.length === y.length && timingSafeEqual(x, y);
+};
+
+/** Tags infra `tagsFor` puts on the generation's instance and data volume. */
+function expectedTags(p: Placement, namespace: string): Record<string, string> {
+    return {
+        'ezil:managed-by': 'app-computer-platform',
+        'ezil:stage': namespace,
+        'ezil:computer-id': p.computerId.toLowerCase(),
+        'ezil:generation': String(p.generation),
+        'ezil:fence-token': p.fenceToken ?? '',
+    };
+}
+const carries = (tags: Readonly<Record<string, string>>, want: Record<string, string>) => Object.entries(want).every(([k, v]) => tags[k] === v);
+
+/**
+ * POST /api/compute/aws/enroll (C-6 steps 3-5). Every check passes, or the
+ * request is refused and NOTHING changes; the nonce is consumed by one
+ * compare-and-swap only after all of them. A failure after the swap is still
+ * non-200: the host never re-sends a nonce that got an answer (enroll.py).
+ * 🔴 Never logs or echoes the nonce, the control key or the tunnel token.
+ */
+export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promise<EnrollResponse> {
+    if (!isAwsComputersEnabled(deps.env)) return refuse(404, 'not_found');
+    if (!deps.describer || !deps.tunnels) return refuse(503, 'enroll_unavailable');
+    const parsed = EnrollBodySchema.safeParse(raw);
+    if (!parsed.success) return refuse(400, 'enroll_request_invalid');
+    const body = parsed.data;
+    const now = deps.now();
+
+    // Placement: an aws-ec2 computer in a boot that expects exactly this enrollment.
+    const { record: p } = await readPlacement(deps.db, body.computerId);
+    if (!p || p.provider !== 'aws-ec2' || !p.region || !p.zoneId || !p.fenceToken || !p.instanceType) return refuse(403, 'enroll_refused');
+    if (!ENROLLABLE_STATES.includes(p.state)) return refuse(403, 'enroll_state');
+    if (p.generation !== body.generation || p.leaseEpoch !== body.leaseEpoch) return refuse(403, 'enroll_stale_epoch');
+    if (!p.enrollNonceHash || !p.enrollExpiresAt) return refuse(403, 'enroll_nonce_invalid');
+    if (!sameHash(nonceHashOf(body.nonce), p.enrollNonceHash)) return refuse(403, 'enroll_nonce_invalid');
+    if (p.enrollExpiresAt.getTime() <= now.getTime()) return refuse(403, 'enroll_nonce_expired');
+
+    // The signed identity document, against the region's configured AWS certificate.
+    const cert = readIdentityCertificate(deps.env, p.region);
+    const deployments = readLifecycleDeployments(deps.env, [p.region]);
+    if (!cert || !deployments.ok) return refuse(503, 'enroll_unavailable');
+    const deployment = deployments.deployments[p.region]!;
+    const signature = verifyIdentitySignature(body.identityDocument, body.signature, cert, now);
+    if (!signature.ok) return refuse(403, signature.reason);
+    let doc: z.infer<typeof IdentityDocumentSchema>;
+    try {
+        const d = IdentityDocumentSchema.safeParse(JSON.parse(body.identityDocument));
+        if (!d.success) return refuse(403, 'identity_document_invalid');
+        doc = d.data;
+    } catch {
+        return refuse(403, 'identity_document_invalid');
+    }
+    if (doc.region !== p.region || doc.accountId !== deployment.accountId || doc.instanceType !== p.instanceType) return refuse(403, 'identity_document_mismatch');
+
+    // Live describe: this instance is running NOW, in the placement's ZoneId, tagged as this
+    // generation (fence included) and holding the computer's data volume.
+    let view: Ec2EnrollmentView | null;
+    try {
+        view = await deps.describer.describeForEnrollment(p.region, doc.instanceId);
+    } catch {
+        return refuse(503, 'enroll_describe_unavailable');
+    }
+    if (!view || view.instanceId !== doc.instanceId) return refuse(403, 'enroll_instance_unknown');
+    if (view.state !== 'running') return refuse(403, 'enroll_instance_not_running');
+    if (view.availabilityZone !== doc.availabilityZone || view.availabilityZoneId !== p.zoneId) return refuse(403, 'enroll_zone_mismatch');
+    const tags = expectedTags(p, deployment.namespace);
+    if (!carries(view.tags, tags)) return refuse(403, 'enroll_instance_mismatch');
+    if (!view.publicIp) return refuse(403, 'enroll_instance_mismatch');
+    let volumeId: string;
+    if (p.volumeId) {
+        const v = view.volumes.filter((x) => x.volumeId === p.volumeId);
+        if (v.length !== 1 || v[0]!.deleteOnTermination !== false) return refuse(403, 'enroll_volume_mismatch');
+        volumeId = p.volumeId;
+    } else {
+        // Provision: the data volume is the one non-root, retained volume tagged for this computer.
+        const data = view.volumes.filter((x) => x.deleteOnTermination === false && x.tags['ezil:disk-kind'] === undefined && x.tags['ezil:computer-id'] === tags['ezil:computer-id']);
+        if (data.length !== 1) return refuse(403, 'enroll_volume_mismatch');
+        volumeId = data[0]!.volumeId;
+    }
+
+    // Consume: one compare-and-swap on the exact boot, nonce hash and unexpired deadline.
+    const consumed = await consumeEnrollmentNonce(deps.db, {
+        computerId: p.computerId,
+        expected: p,
+        nonceHash: p.enrollNonceHash,
+        now,
+        fields: { instanceId: doc.instanceId, volumeId },
+    });
+    if (!consumed.ok) return refuse(409, 'enroll_nonce_consumed');
+
+    const controlKey = (deps.randomBytes ?? nodeRandomBytes)(32);
+    if (!Buffer.isBuffer(controlKey) || controlKey.length !== 32) return refuse(500, 'enroll_failed');
+    const keyB64 = controlKey.toString('base64');
+    let tunnel: TunnelResult;
+    try {
+        tunnel = await deps.tunnels.createTunnel(
+            { userId: p.ownerUserId },
+            {
+                computerId: p.computerId.toLowerCase(),
+                sandboxId: awsSandboxId(p.computerId),
+                generation: p.generation,
+                leaseEpoch: p.leaseEpoch,
+                instanceId: doc.instanceId,
+                region: p.region,
+                publicIp: view.publicIp,
+                controlKey: keyB64,
+            },
+        );
+    } catch {
+        tunnel = { ok: false, status: 0, code: 'tunnel_transport' };
+    }
+    if (!tunnel.ok) return refuse(502, 'tunnel_unavailable');
+    return { status: 200, body: { tunnelToken: tunnel.tunnelToken, controlKey: keyB64 } };
 }

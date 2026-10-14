@@ -285,6 +285,23 @@ generation and a one-time nonce.
 
 A user who replays their own computer's material can reach only their own computer.
 
+**App implementation (`app/src/server/lib/compute/aws-enroll.ts`, route `POST /api/compute/aws/enroll`)**
+- Issue: every provision and wake writes `sha256(nonce)` and a 10-minute deadline in the same compare-and-swap that admits
+  the boot; the plaintext goes only into that launch's user data (the host lease JSON of `lease.py`, plus `enrollUrl`).
+- Signature: CMS/PKCS7 (IMDS `/pkcs7`, RSA or DSA, SHA-256 or SHA-1, with or without signed attributes) verified against
+  the region's AWS certificate from `EZIL_AWS_IDENTITY_CERTS` only; embedded certificates are ignored.
+- Live describe (injected): the instance is `running`, in the placement's ZoneId, carries the CURRENT generation's tags
+  (computer id, generation, fence token, namespace), has a public address, and holds the data volume (provision: the one
+  retained, non-root volume tagged for the computer, which is then recorded). An old-generation instance fails on its fence.
+- Consume: one CAS on generation, epoch, state, provider, nonce hash and an unexpired deadline clears the nonce and
+  records the verified instance and volume. Then `controlKey` (32 bytes) and GW-1 `POST /internal/aws/tunnels`.
+- Not wired yet: the EC2 describe needs the app's AWS caller (Vercel OIDC) and `@aws-sdk/client-ec2`. Until then
+  `awsEnrollmentDescriber()` returns null and the endpoint answers 503 `enroll_unavailable`, consuming nothing.
+- Host gap: `lease.py` requires `volumeId` in the user data, but a provision's volume does not exist when its intent is
+  built. The app omits it on a provision (`provision: true`); the host must resolve the single attached data volume in
+  that case (host-agent follow-up).
+
+
 ### C-7 Migration fence and export rules
 
 - The Cloudflare checkpoint protocol gains a terminal `migrated` head, written by
