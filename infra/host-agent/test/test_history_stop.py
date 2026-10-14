@@ -44,7 +44,8 @@ class Shell:
             if self.pid == 0:
                 os.execve(BASH, [BASH, *args, "-i"], env)
         else:
-            p = subprocess.Popen([BASH, "-c", "sleep 30"], env=env, stdin=subprocess.DEVNULL,
+            # two commands: `bash -c 'sleep 30'` alone would exec sleep and stop being bash
+            p = subprocess.Popen([BASH, "-c", "sleep 30; :"], env=env, stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             self.pid, self.fd, self.popen = p.pid, None, p
         self.buf = b""
@@ -214,6 +215,9 @@ class HangupBeforeStop(unittest.TestCase):
         if cat_pid == 0:
             os.execvp("cat", ["cat"])
         try:
+            time.sleep(0.3)
+            self.assertEqual(desktop._proc_shell_on_tty(script.pid), ("bash", 0), "precondition: a real bash with no tty")
+            self.assertEqual(desktop._proc_shell_on_tty(cat_pid)[0], "cat")
             n = desktop.hangup_shells(self.cfg, settle=0.5, pids=[script.pid, cat_pid, 999999999])
             self.assertEqual(n, 0)
             self.assertTrue(script.alive())
