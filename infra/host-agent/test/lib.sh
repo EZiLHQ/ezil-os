@@ -113,7 +113,7 @@ userdata() {
     printf '%s' "$n" > "$H/stub/nonce"
     jq -nc --arg c "$CID_COMPUTER" --argjson g "$g" --argjson e "$e" '{computerId:$c, generation:$g, leaseEpoch:$e}' > "$H/stub/expect.json"
     jq -nc --arg t "tunnel-token-$(head -c 24 /dev/urandom | base64 | tr -d '/+=')" --arg k "$(head -c 32 /dev/urandom | base64)" \
-        '{tunnelToken:$t, controlKey:$k}' > "$H/stub/issue.json"
+        '{tunnelToken:$t, controlKey:$k, sandboxId:"guac-a-b", zone:"preview.example.org"}' > "$H/stub/issue.json"
     printf '{"instanceId":"i-0abc","availabilityZone":"ap-south-1a","region":"ap-south-1","accountId":"000000000000"}' > "$H/stub/identity.json"
     printf 'MIAGCSqGSIb3DQEHAqCAMIACAQExDzANBglghkgBZQMEAgEFADCABgkqhkiG9w0BBwGggCSABIIB' > "$H/stub/pkcs7"
 }

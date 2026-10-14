@@ -14,11 +14,23 @@ import base64
 import glob
 import json
 import os
+import re
 
 from . import guard, http, lease as leasemod
 from .fsops import Refused
 
 TOKEN_FILE = "tunnel.json"
+# The Worker's routable sandbox id and its browser-host zone (worker/src/aws-origin.ts): the
+# app returns both at enrollment so the edge can recognise `aws-<port>-<sandboxId>-aws.<zone>`.
+SANDBOX_ID_RE = re.compile(r"guac-[a-z0-9]{1,16}-[a-z0-9]{1,16}")
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def valid_zone(zone):
+    if not isinstance(zone, str) or not 3 <= len(zone) <= 253:
+        return False
+    labels = zone.split(".")
+    return len(labels) >= 2 and all(_DNS_LABEL.fullmatch(l) for l in labels) and not labels[-1].isdigit()
 
 
 def _write_private(path, data):
@@ -112,7 +124,10 @@ def enroll(cfg, lease):
     try:
         r = json.loads(resp)
         token, key = r["tunnelToken"], base64.b64decode(r["controlKey"], validate=True)
+        sandbox_id, zone = r["sandboxId"], r["zone"]
         if not isinstance(token, str) or len(token) < 16 or len(key) < 32:
+            raise ValueError
+        if not isinstance(sandbox_id, str) or not SANDBOX_ID_RE.fullmatch(sandbox_id) or not valid_zone(zone):
             raise ValueError
     except (ValueError, KeyError, TypeError):
         raise Refused("enroll_response_malformed")
@@ -120,4 +135,7 @@ def enroll(cfg, lease):
                    json.dumps({"token": token, "generation": lease["generation"],
                                "leaseEpoch": lease["leaseEpoch"]}).encode())
     _write_private(os.path.join(cfg.stateDir, "control.key"), key)
+    # The edge (started after this unit) reads its browser-host binding from the lease.
+    routed = dict(load_lease(cfg), sandboxId=sandbox_id, zone=zone)
+    _write_private(os.path.join(cfg.runDir, "lease.json"), json.dumps(routed).encode())
     return True

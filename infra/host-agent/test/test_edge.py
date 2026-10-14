@@ -169,7 +169,7 @@ class Presence(unittest.TestCase):
 class HostBinding(unittest.TestCase):
     def test_binding_comes_only_from_config_or_lease(self):
         binding = {"sandboxId": "guac-a-b", "zone": "preview.example.org"}
-        browser, tunnel = "aws-8181-guac-a-b.preview.example.org", "c-x.origin.example.net"
+        browser, tunnel = "aws-8181-guac-a-b-aws.preview.example.org", "c-x.origin.example.net"
         cases = [(binding, LEASE, browser), ({}, {**LEASE, **binding}, browser),
                  (binding, {**LEASE, "sandboxId": "other", "zone": "other.org"}, browser),
                  ({}, LEASE, tunnel), ({"sandboxId": "guac-a-b"}, LEASE, tunnel),
@@ -402,21 +402,23 @@ class EdgeE2E(unittest.TestCase):
     # -------------------------------------------------------------- forwarding
     def test_verified_get_is_forwarded_stripped_with_browser_host(self):
         p = f"/__p/{self.desk.port}/hello"
-        out = raw(self.port, self.req("GET", p + "?x=1", headers=["X-Forwarded-Host: aws-8181-guac-a-b.preview.example.org",
+        out = raw(self.port, self.req("GET", p + "?x=1", headers=["X-Forwarded-Host: aws-8181-guac-a-b-aws.preview.example.org",
                                                                    "Connection: keep-alive"]))
         self.assertTrue(out.startswith(b"HTTP/1.1 200") and out.endswith(b"upstrm!"), out)
         sent = self.desk.requests[0].decode()
         self.assertTrue(sent.startswith("GET /hello?x=1 HTTP/1.1\r\n"), sent)
         self.assertNotIn("x-ezil-gw", sent.lower())
-        self.assertIn("Host: aws-8181-guac-a-b.preview.example.org", sent)
+        self.assertIn("Host: aws-8181-guac-a-b-aws.preview.example.org", sent)
         self.assertIn("Connection: close", sent)
         self.assertNotIn("keep-alive", sent.lower())
 
     def test_only_exact_browser_hosts_for_this_sandbox_and_zone_are_used(self):
-        valid = [f"aws-{port}-guac-a-b.preview.example.org" for port in (8181, 8080, 3002, 8443)]
+        valid = [f"aws-{port}-guac-a-b-aws.preview.example.org" for port in (8181, 8080, 3002, 8443)]
         invalid = ["attacker.example", "aws-8181-other.preview.example.org",
-                   "aws-8181-guac-a-b.evil.example.org", "aws-8181-guac-a-b.previewXexample.org",
-                   "aws-9223-guac-a-b.preview.example.org", valid[0] + ".evil.org",
+                   # the Worker never serves a browser host without its route suffix
+                   "aws-8181-guac-a-b.preview.example.org", "aws-8181-guac-a-b-awsx.preview.example.org",
+                   "aws-8181-guac-a-b-aws.evil.example.org", "aws-8181-guac-a-b-aws.previewXexample.org",
+                   "aws-9223-guac-a-b-aws.preview.example.org", valid[0] + ".evil.org",
                    valid[0] + ":443", "prefix." + valid[0], valid[0] + ", attacker.example"]
         cases = [([f"X-Forwarded-Host: {host}"], host) for host in valid]
         cases += [([f"X-Forwarded-Host: {host}"], "c-x.origin.example.net") for host in invalid]
@@ -435,13 +437,13 @@ class EdgeE2E(unittest.TestCase):
                  "X-Forwarded-Anything", "X-Real-IP", "True-Client-IP", "CF-Connecting-IP",
                  "CF-Connecting-IPv6", "CF-Pseudo-IPv4", "CF-Visitor", "X-Ezil-Other")
         headers = [f"{name}: injected" for name in names]
-        headers.append("X-Forwarded-Host: aws-8181-guac-a-b.preview.example.org")
+        headers.append("X-Forwarded-Host: aws-8181-guac-a-b-aws.preview.example.org")
         out = raw(self.port, self.req("GET", f"/__p/{self.desk.port}/x", headers=headers))
         self.assertTrue(out.startswith(b"HTTP/1.1 200"), out)
         sent = self.desk.requests[-1].lower()
         for name in (*names, "x-forwarded-host", "x-ezil-gw"):
             self.assertNotIn(name.lower().encode() + b":", sent)
-        self.assertIn(b"host: aws-8181-guac-a-b.preview.example.org\r\n", sent)
+        self.assertIn(b"host: aws-8181-guac-a-b-aws.preview.example.org\r\n", sent)
 
     def test_one_request_per_connection_no_smuggling(self):
         p = f"/__p/{self.desk.port}/first"
