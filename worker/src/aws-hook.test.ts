@@ -411,6 +411,48 @@ describe('AWS desktop relay through the hook (aws-ice)', () => {
     expect(rec.opened.length).toBeGreaterThan(0);
   });
 
+  /** Every AWS-claimed control route, signed for `c`. */
+  async function awsControls(e: never, c = claims()) {
+    return [
+      await worker.fetch(await signed('POST', `/sandbox/${SID}/focus`, JSON.stringify({ app: 'code' }), c), e),
+      await worker.fetch(await signed('GET', `/sandbox/${SID}/screen`, '', c), e),
+      await worker.fetch(await signed('POST', `/sandbox/${SID}/screen`, JSON.stringify({ width: 1920, height: 1080 }), c), e),
+      await worker.fetch(await signed('GET', `/sandbox/${SID}/relay-refresh`, '', c), e),
+    ];
+  }
+
+  it('Codex PR #200: an AWS-claimed control with NO tunnel record is refused, never served by a Cloudflare sandbox', async () => {
+    const rec = sandboxRecorder();
+    const e = relayEnv({ Sandbox: rec.ns });
+    const host = installAwsHost();
+    for (const res of await awsControls(e)) {
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual({ ok: false, error: 'aws_origin_unavailable' });
+    }
+    expect(rec.opened).toEqual([]);
+    expect(host.paths).toEqual([]);
+  });
+
+  it('an AWS-claimed control for a fenced or replaced epoch is refused, never Cloudflare', async () => {
+    const rec = sandboxRecorder();
+    const e = relayEnv({ Sandbox: rec.ns });
+    await withTunnel(e);
+    const host = installAwsHost({ configured: true, desktop: 'running', ice: 'applied' });
+    for (const res of await awsControls(e, claims({ leaseEpoch: 3 }))) {
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual({ ok: false, error: 'aws_origin_unavailable' });
+    }
+    expect(rec.opened).toEqual([]);
+    expect(host.paths).toEqual([]);
+  });
+
+  it('with AWS routing OFF an AWS-claimed control is refused too (never falls back to Cloudflare)', async () => {
+    const rec = sandboxRecorder();
+    const e = env({ Sandbox: rec.ns });
+    for (const res of await awsControls(e)) expect(res.status).toBe(502);
+    expect(rec.opened).toEqual([]);
+  });
+
   it('relay-refresh with v2 claims for ANOTHER sandbox is refused before any host call', async () => {
     const e = relayEnv();
     await withTunnel(e);

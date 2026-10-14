@@ -116,6 +116,7 @@ const FENCE_KEY = 'fenced_epoch';
 const INSTANCE_ID = /^i-[0-9a-f]{8,17}$/;
 const REGION = /^[a-z]{2}(?:-[a-z]+)+-\d$/;
 const CREATE_KEYS = 'computerId,controlKey,generation,instanceId,leaseEpoch,publicIp,region,sandboxId';
+const CREATE_REPLAY_KEYS = 'computerId,controlKey,generation,instanceId,leaseEpoch,publicIp,region,replay,sandboxId';
 const DELETE_KEYS = 'computerId,generation,leaseEpoch';
 
 export interface TunnelCreateBody {
@@ -127,6 +128,8 @@ export interface TunnelCreateBody {
   region: string;
   publicIp: string;
   controlKey: string;
+  /** Read-only replay of this epoch's completed create (see `create`). */
+  replay?: true;
 }
 
 export interface TunnelDeleteBody {
@@ -167,8 +170,8 @@ function parseStrict(text: string, keys: string): Record<string, unknown> | null
 }
 
 export function parseCreateBody(text: string): TunnelCreateBody | null {
-  const b = parseStrict(text, CREATE_KEYS);
-  if (!b) return null;
+  const b = parseStrict(text, CREATE_KEYS) ?? parseStrict(text, CREATE_REPLAY_KEYS);
+  if (!b || ('replay' in b && b.replay !== true)) return null;
   const ok = isComputerId(b.computerId) && isRoutableSandboxId(b.sandboxId) && isEpoch(b.generation) && isEpoch(b.leaseEpoch)
     && typeof b.instanceId === 'string' && INSTANCE_ID.test(b.instanceId) && typeof b.region === 'string' && REGION.test(b.region)
     && isPublicIpv4(b.publicIp) && decodeControlKey(b.controlKey) !== null;
@@ -185,6 +188,22 @@ export function parseDeleteBody(text: string): TunnelDeleteBody | null {
 function claimsMatch(c: PreviewTokenV2Claims, b: { computerId: string; generation: number; leaseEpoch: number; sandboxId?: string }): boolean {
   return c.provider === 'aws-ec2' && c.computerId === b.computerId && c.generation === b.generation && c.leaseEpoch === b.leaseEpoch
     && (b.sandboxId === undefined || c.sandboxId === b.sandboxId);
+}
+
+/** How long after a tunnel's create an exact replay may still read its token: the enrollment nonce's lifetime. */
+export const TUNNEL_REPLAY_WINDOW_MS = 10 * 60_000;
+
+/** Same computer, sandbox, epoch, instance and address, and the same control key (constant time). */
+function isExactReplay(existing: AwsTunnelRecord, body: TunnelCreateBody): boolean {
+  if (existing.computerId !== body.computerId || existing.sandboxId !== body.sandboxId || existing.generation !== body.generation
+    || existing.leaseEpoch !== body.leaseEpoch || existing.instanceId !== body.instanceId || existing.region !== body.region
+    || existing.publicIp !== body.publicIp) return false;
+  const a = new TextEncoder().encode(existing.controlKey);
+  const b = new TextEncoder().encode(body.controlKey);
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i]! ^ b[i]!;
+  return diff === 0;
 }
 
 export interface AwsTunnelServiceDeps {
@@ -257,6 +276,19 @@ export function createAwsTunnelService(deps: AwsTunnelServiceDeps) {
       if (!deps.api || !deps.zone) return fail(503, 'tunnel_api_not_configured');
       const api = deps.api;
       const existing = (await deps.storage.get<AwsTunnelRecord>(RECORD_KEY)) ?? null;
+      if (body.replay) {
+        // Read-only replay of THIS epoch's completed create: the app re-derives the same control key
+        // when a host retries an enrollment whose 200 was lost. Only the exact record, key included,
+        // inside the window, gets the SAME tunnel's token; a replay never creates or replaces anything.
+        if (!existing || !isExactReplay(existing, body) || now() - existing.createdAt > TUNNEL_REPLAY_WINDOW_MS) {
+          return fail(409, 'tunnel_replay_refused');
+        }
+        try {
+          return { status: 200, body: { tunnelToken: await api.getTunnelToken(existing.tunnelId) } };
+        } catch {
+          return fail(502, 'tunnel_create_failed');
+        }
+      }
       if (existing) {
         if (existing.leaseEpoch > body.leaseEpoch || (existing.leaseEpoch === body.leaseEpoch && existing.generation !== body.generation)) {
           return fail(409, 'stale_epoch');

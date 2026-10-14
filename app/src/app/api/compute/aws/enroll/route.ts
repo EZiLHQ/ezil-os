@@ -28,7 +28,11 @@ export async function POST(req: Request): Promise<Response> {
         return NextResponse.json({ error: 'enroll_request_invalid' }, { status: 400, headers: NO_STORE });
     }
     const result = await handleAwsEnrollment(
-        { db, env: process.env, now: () => new Date(), describer: awsEnrollmentDescriber(process.env), tunnels: workerTunnelClientFromEnv(process.env) },
+        {
+            db, env: process.env, now: () => new Date(), describer: awsEnrollmentDescriber(process.env), tunnels: workerTunnelClientFromEnv(process.env),
+            // The app↔Worker HMAC secret also derives each epoch's control key (aws-enroll.ts `deriveControlKey`).
+            controlKeySecret: process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '',
+        },
         body,
     );
     return NextResponse.json(result.body, { status: result.status, headers: NO_STORE });

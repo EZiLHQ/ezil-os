@@ -3897,16 +3897,29 @@ function awsRegistryFor(env: Env): RegistryFor | null {
  * screen): the registered AWS tunnel for `name` when AWS routing is on, a refusal, or null
  * for the Cloudflare path. An AWS computer is never served by opening (and waking) a
  * Cloudflare Sandbox of the same name. v2 claims bind the computer: a token for another
- * sandbox, or for a non-AWS provider, is refused before any host call.
+ * sandbox, or for a non-AWS provider, is refused before any host call; a v2 `aws-ec2` claim
+ * with no matching live tunnel is refused (502 `aws_origin_unavailable`), never null.
  */
 async function awsControlTarget(env: Env, request: Request, name: string, prefix: string):
   Promise<{ record: AwsTunnelRecord; zone: string } | Response | null> {
+  const v2c = verifiedV2Claims.get(request);
+  if (v2c && v2c.sandboxId !== name) return json({ ok: false, error: `${prefix}_claims_mismatch` }, 401);
   const registry = awsRoutingEnabled(env.AWS_ROUTING_ENABLED) ? awsRegistryFor(env) : null;
   const zone = registry ? resolveAwsOriginZone(env) : null;
   const record = registry && zone ? await lookupAwsTunnel(registry, name) : null;
-  if (!record || !zone) return null;
-  const v2c = verifiedV2Claims.get(request);
-  if (v2c && (v2c.sandboxId !== name || v2c.provider !== 'aws-ec2')) return json({ ok: false, error: `${prefix}_claims_mismatch` }, 401);
+  if (v2c?.provider === 'aws-ec2') {
+    // The app said AWS: without this epoch's live tunnel (absent, fenced, or routing off) the
+    // control is REFUSED, like an AWS preview (aws-origin.ts handleAwsPreview), never served by
+    // opening, and so waking, a Cloudflare Sandbox of the same name.
+    if (!record || !zone || record.computerId !== v2c.computerId || record.sandboxId !== v2c.sandboxId
+      || record.generation !== v2c.generation || record.leaseEpoch !== v2c.leaseEpoch) {
+      return json({ ok: false, error: 'aws_origin_unavailable' }, 502);
+    }
+  } else if (!record || !zone) {
+    return null;
+  } else if (v2c) {
+    return json({ ok: false, error: `${prefix}_claims_mismatch` }, 401);
+  }
   if (!record.originVerified) return json({ ok: false, error: 'aws_origin_starting' }, 503);
   return { record, zone };
 }

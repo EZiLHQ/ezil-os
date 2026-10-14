@@ -197,6 +197,16 @@ function v2AuthHeader(
 
 const V2_SECRET_MISSING = 'hmac_secret_not_configured';
 
+/**
+ * Auth headers for a sandbox control call: the v2 envelope for `auth.kind === 'v2'` (an AWS
+ * computer, compute/aws-control-auth.ts), else the legacy v1 bearer, unchanged.
+ */
+function controlAuthHeaders(hmacSecret: string, auth: WorkerAuth, method: string, endpoint: string, body: string): Record<string, string> {
+    return auth.kind === 'v2'
+        ? v2AuthHeader(hmacSecret, auth, method, endpoint, body)
+        : { Authorization: `Bearer ${mintSandboxPreviewToken(hmacSecret)}` };
+}
+
 // ─── Worker call helpers ──────────────────────────────────────────────────────
 
 export interface GuacamolePreviewRequest {
@@ -857,23 +867,25 @@ export async function requestGuacamoleFocusApp(
     sandboxName: string,
     app: FocusableApp,
     correlationId: string = newCorrelationId(),
+    auth: WorkerAuth = { kind: 'v1' },
 ): Promise<GuacamoleFocusResult> {
     if (!config.isConfigured) {
         return { ok: false, error: 'provider_not_configured' };
     }
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return { ok: false, error: V2_SECRET_MISSING };
 
-    const token = mintSandboxPreviewToken(hmacSecret);
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/focus`;
+    const focusBody = JSON.stringify({ app });
 
     try {
         const res = await fetch(endpoint, {
             method: 'POST',
             headers: {
-                Authorization: `Bearer ${token}`,
+                ...controlAuthHeaders(hmacSecret, auth, 'POST', endpoint, focusBody),
                 'Content-Type': 'application/json',
                 [CORRELATION_HEADER]: correlationId,
             },
-            body: JSON.stringify({ app }),
+            body: focusBody,
             // Generous against the measured 150-400ms round trip, and well
             // under any route budget: this must not sit on a slow path.
             signal: AbortSignal.timeout(15_000),
@@ -2827,19 +2839,20 @@ export async function readGuacamoleScreen(
     hmacSecret: string,
     sandboxName: string,
     correlationId: string = newCorrelationId(),
+    auth: WorkerAuth = { kind: 'v1' },
 ): Promise<GuacamoleScreenResult> {
     if (!config.isConfigured) {
         return { ok: false, code: 'NOT_FOUND', message: 'provider_not_configured' };
     }
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return { ok: false, code: 'UPSTREAM', message: V2_SECRET_MISSING };
 
-    const token = mintSandboxPreviewToken(hmacSecret);
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/screen`;
 
     try {
         const res = await fetch(endpoint, {
             method: 'GET',
             headers: {
-                Authorization: `Bearer ${token}`,
+                ...controlAuthHeaders(hmacSecret, auth, 'GET', endpoint, ''),
                 Accept: 'application/json',
                 [CORRELATION_HEADER]: correlationId,
             },
@@ -2894,6 +2907,7 @@ export async function requestGuacamoleScreen(
     width: number,
     height: number,
     correlationId: string = newCorrelationId(),
+    auth: WorkerAuth = { kind: 'v1' },
 ): Promise<GuacamoleScreenResult> {
     if (!config.isConfigured) {
         return { ok: false, code: 'NOT_FOUND', message: 'provider_not_configured' };
@@ -2910,19 +2924,20 @@ export async function requestGuacamoleScreen(
     if (!fitted || fitted.width !== width || fitted.height !== height) {
         return { ok: false, code: 'BAD_REQUEST', message: 'not_an_applicable_screen' };
     }
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return { ok: false, code: 'UPSTREAM', message: V2_SECRET_MISSING };
 
-    const token = mintSandboxPreviewToken(hmacSecret);
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/screen`;
+    const screenBody = JSON.stringify({ width, height });
 
     try {
         const res = await fetch(endpoint, {
             method: 'POST',
             headers: {
-                Authorization: `Bearer ${token}`,
+                ...controlAuthHeaders(hmacSecret, auth, 'POST', endpoint, screenBody),
                 'Content-Type': 'application/json',
                 [CORRELATION_HEADER]: correlationId,
             },
-            body: JSON.stringify({ width, height }),
+            body: screenBody,
             // A mode set is a capture-pipeline restart inside the container.
             // Its real cost is UNMEASURED (no container run was available);
             // 20s is above the 15s the sibling control routes use and still
@@ -3136,13 +3151,16 @@ export function classifyScreenFailure(status: number, workerError: string): Scre
 export type RelayRefreshResult = { ok: true; runtimeId: string; expiresAt: number } | { ok: false; error: string };
 /** Uses the same signed Worker boundary as all computer controls. */
 export async function requestRelayRefresh(config: CloudflareGuacamoleConfig, hmacSecret: string,
-    sandboxName: string, correlationId: string, runtimeId?: string): Promise<RelayRefreshResult> {
+    sandboxName: string, correlationId: string, runtimeId?: string, auth: WorkerAuth = { kind: 'v1' }): Promise<RelayRefreshResult> {
+    if (auth.kind === 'v2' && !hmacSecret.trim()) return { ok: false, error: V2_SECRET_MISSING };
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/relay-refresh`;
+    const method = runtimeId ? 'POST' : 'GET';
+    const relayBody = runtimeId ? JSON.stringify({ runtimeId }) : '';
     try {
         const response = await fetch(endpoint, {
-            method: runtimeId ? 'POST' : 'GET',
-            headers: { Authorization: `Bearer ${mintSandboxPreviewToken(hmacSecret)}`, 'Content-Type': 'application/json', [CORRELATION_HEADER]: correlationId },
-            ...(runtimeId ? { body: JSON.stringify({ runtimeId }) } : {}),
+            method,
+            headers: { ...controlAuthHeaders(hmacSecret, auth, method, endpoint, relayBody), 'Content-Type': 'application/json', [CORRELATION_HEADER]: correlationId },
+            ...(runtimeId ? { body: relayBody } : {}),
             signal: AbortSignal.timeout(30_000), cache: 'no-store',
         });
         const data = await response.json() as Partial<{ ok: boolean; runtimeId: string; expiresAt: number; error: string }>;

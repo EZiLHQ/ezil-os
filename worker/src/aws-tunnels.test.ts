@@ -16,6 +16,7 @@ import {
   routeAwsTunnels,
   type CloudflareTunnelApi,
   type TunnelStorage,
+  TUNNEL_REPLAY_WINDOW_MS,
 } from './aws-tunnels';
 
 const ZONE = 'origin.example.net';
@@ -54,6 +55,63 @@ const claims = (over: Partial<PreviewTokenV2Claims> = {}): PreviewTokenV2Claims 
 const body = (over: Record<string, unknown> = {}) => JSON.stringify({
   computerId: CID, sandboxId: SID, generation: 1, leaseEpoch: 2, instanceId: 'i-0123456789abcdef0',
   region: 'ap-south-1', publicIp: '13.200.1.2', controlKey: vectors.controlKeyBase64, ...over,
+});
+
+describe('replay of a completed create (Codex PR #200: enrollment 200 lost)', () => {
+  const OTHER_KEY = Buffer.alloc(32, 0x5a).toString('base64');
+  const replay = (over: Record<string, unknown> = {}) => body({ replay: true, ...over });
+
+  it('an exact replay gets the SAME tunnel token and creates nothing', async () => {
+    const s = memStorage(); const { api, calls } = fakeApi();
+    let t = 1_000;
+    const svc = createAwsTunnelService({ api, storage: s, zone: ZONE, nowMs: () => t });
+    const first = await svc.create(claims(), body());
+    calls.length = 0;
+    t += TUNNEL_REPLAY_WINDOW_MS;
+    expect(await svc.create(claims(), replay())).toEqual(first);
+    expect(calls).toEqual(['getTunnelToken tun-1']);
+    expect((s.map.get('tunnel') as AwsTunnelRecord).tunnelId).toBe('tun-1');
+  });
+
+  it.each([
+    ['another control key (another nonce)', { controlKey: OTHER_KEY }],
+    ['another instance', { instanceId: 'i-0123456789abcdef9' }],
+    ['another address', { publicIp: '13.200.1.9' }],
+  ])('%s is refused without any Cloudflare call', async (_name, over) => {
+    const s = memStorage(); const { api, calls } = fakeApi();
+    const svc = createAwsTunnelService({ api, storage: s, zone: ZONE });
+    await svc.create(claims(), body());
+    calls.length = 0;
+    expect(await svc.create(claims(), replay(over))).toEqual({ status: 409, body: { ok: false, error: 'tunnel_replay_refused' } });
+    expect(calls).toEqual([]);
+  });
+
+  it('past the window, with no record, or after the epoch was fenced: refused, and a replay never creates a tunnel', async () => {
+    const s = memStorage(); const { api, calls } = fakeApi();
+    let t = 1_000;
+    const svc = createAwsTunnelService({ api, storage: s, zone: ZONE, nowMs: () => t });
+    expect((await svc.create(claims(), replay())).body.error).toBe('tunnel_replay_refused');
+    expect(calls).toEqual([]);
+    await svc.create(claims(), body());
+    t += TUNNEL_REPLAY_WINDOW_MS + 1;
+    expect((await svc.create(claims(), replay())).body.error).toBe('tunnel_replay_refused');
+    await svc.remove(claims(), JSON.stringify({ computerId: CID, generation: 1, leaseEpoch: 2 }));
+    t = 1_000;
+    expect((await svc.create(claims(), replay())).status).toBe(409);
+  });
+
+  it('a create without the replay flag stays refused for a live epoch', async () => {
+    const s = memStorage(); const { api } = fakeApi();
+    const svc = createAwsTunnelService({ api, storage: s, zone: ZONE });
+    await svc.create(claims(), body());
+    expect((await svc.create(claims(), body())).body.error).toBe('tunnel_exists');
+  });
+
+  it('the replay flag must be exactly true', async () => {
+    const svc = createAwsTunnelService({ api: fakeApi().api, storage: memStorage(), zone: ZONE });
+    expect((await svc.create(claims(), body({ replay: false }))).body.error).toBe('tunnel_request_invalid');
+    expect((await svc.create(claims(), body({ replay: 'yes' }))).body.error).toBe('tunnel_request_invalid');
+  });
 });
 
 describe('create (fence-first, once per epoch)', () => {

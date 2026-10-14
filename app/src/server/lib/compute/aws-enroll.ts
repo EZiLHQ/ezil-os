@@ -13,14 +13,14 @@
  * 🔴 Never log a nonce, a control key or a tunnel token.
  */
 
-import { createHash, randomBytes as nodeRandomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes as nodeRandomBytes, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 
 import { isAwsComputersEnabled, type Env as AwsEnv } from './aws-config';
 import { readIdentityCertificate, verifyIdentitySignature } from './aws-identity';
 import { readLifecycleDeployments } from './aws-intent';
 import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
-import { consumeEnrollmentNonce, ENROLLABLE_STATES, finishEnrollment, readPlacement, type Placement, type PlacementDb } from './placement';
+import { consumeEnrollmentNonce, ENROLLABLE_STATES, ENROLLMENT_SUCCEEDED, finishEnrollment, readPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
 import { mintPreviewTokenV2 } from './preview-token-v2';
 
 /** C-6: at most 10 minutes between issue and enrollment. */
@@ -128,6 +128,12 @@ export interface TunnelRequest {
     region: string;
     publicIp: string;
     controlKey: string;
+    /**
+     * Read-only replay of THIS epoch's completed create (a host retrying after its 200 was
+     * lost): the Worker answers with the existing tunnel's token only when the record matches
+     * exactly, key included, inside its window; it never creates a tunnel for a replay.
+     */
+    replay?: true;
 }
 export type TunnelResult = { ok: true; tunnelToken: string } | { ok: false; status: number; code: string };
 
@@ -255,7 +261,8 @@ export interface EnrollDeps {
     db: PlacementDb;
     env: AwsEnv;
     now: () => Date;
-    randomBytes?: (n: number) => Buffer;
+    /** Derives the per-epoch control key (`deriveControlKey`); the app↔Worker HMAC secret. Unset: unavailable. */
+    controlKeySecret?: string;
     describer?: Ec2EnrollmentDescriber | null;
     tunnels?: TunnelClient | null;
 }
@@ -264,6 +271,28 @@ export interface EnrollResponse {
     status: number;
     body: Record<string, unknown>;
 }
+
+const CONTROL_KEY_INFO = 'ezil-aws-control-key-v1';
+
+/**
+ * The epoch's GW-5 control key, DERIVED rather than random, so a host that retries an
+ * enrollment whose 200 was lost gets the SAME key back:
+ * HMAC-SHA256(secret, "ezil-aws-control-key-v1|computerId|generation|leaseEpoch|nonceHash").
+ *
+ * Nothing extra is stored for a replay. The only copies of the key stay where they already
+ * were: the Worker's tunnel record (GW-1) and the host. A replay re-derives the key from the
+ * nonce the host presents, and the Worker answers only when it equals the stored key exactly
+ * (worker/src/aws-tunnels.ts `isExactReplay`), so a wrong nonce gets nothing. The secret is the
+ * app↔Worker HMAC secret, whose holder can already sign Worker calls: no new exposure.
+ */
+export function deriveControlKey(secret: string, input: { computerId: string; generation: number; leaseEpoch: number; nonceHash: string }): Buffer {
+    if (!secret.trim()) throw new Error('control_key_secret_not_configured');
+    const info = [CONTROL_KEY_INFO, input.computerId.toLowerCase(), input.generation, input.leaseEpoch, input.nonceHash].join('|');
+    return createHmac('sha256', secret).update(info).digest();
+}
+
+/** A completed enrollment may be replayed while its boot is still in flight or already running. */
+const REPLAYABLE_STATES: readonly PlacementState[] = [...ENROLLABLE_STATES, 'RUNNING'];
 
 const refuse = (status: number, error: string): EnrollResponse => ({ status, body: { error } });
 /**
@@ -311,11 +340,18 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     // Placement: an aws-ec2 computer in a boot that expects exactly this enrollment.
     const { record: p } = await readPlacement(deps.db, body.computerId);
     if (!p || p.provider !== 'aws-ec2' || !p.region || !p.zoneId || !p.fenceToken || !p.instanceType) return refuse(403, 'enroll_refused');
-    if (!ENROLLABLE_STATES.includes(p.state)) return refuse(403, 'enroll_state');
+    const nonceHash = nonceHashOf(body.nonce);
+    // This epoch's enrollment already completed (nonce consumed, tunnel created, success recorded)
+    // and the host is retrying because the 200 never reached it. Its nonce can no longer be checked
+    // here; the Worker checks it instead, through the derived key (`deriveControlKey`).
+    const replay = !p.enrollNonceHash && p.lastError === ENROLLMENT_SUCCEEDED && p.instanceId !== null;
+    if (!(replay ? REPLAYABLE_STATES : ENROLLABLE_STATES).includes(p.state)) return refuse(403, 'enroll_state');
     if (p.generation !== body.generation || p.leaseEpoch !== body.leaseEpoch) return refuse(403, 'enroll_stale_epoch');
-    if (!p.enrollNonceHash || !p.enrollExpiresAt) return refuse(403, 'enroll_nonce_invalid');
-    if (!sameHash(nonceHashOf(body.nonce), p.enrollNonceHash)) return refuse(403, 'enroll_nonce_invalid');
-    if (p.enrollExpiresAt.getTime() <= now.getTime()) return refuse(403, 'enroll_nonce_expired');
+    if (!replay) {
+        if (!p.enrollNonceHash || !p.enrollExpiresAt) return refuse(403, 'enroll_nonce_invalid');
+        if (!sameHash(nonceHash, p.enrollNonceHash)) return refuse(403, 'enroll_nonce_invalid');
+        if (p.enrollExpiresAt.getTime() <= now.getTime()) return refuse(403, 'enroll_nonce_expired');
+    }
 
     // The signed identity document, against the region's configured AWS certificate.
     const cert = readIdentityCertificate(deps.env, p.region);
@@ -367,20 +403,48 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
         volumeId = data[0]!.volumeId;
     }
 
-    // Generate the key before consuming: even a broken random source leaves the nonce intact.
+    // Derive the key before consuming: a missing secret leaves the nonce intact.
     let controlKey: Buffer;
     try {
-        controlKey = (deps.randomBytes ?? nodeRandomBytes)(32);
-        if (!Buffer.isBuffer(controlKey) || controlKey.length !== 32) throw new Error('invalid control key');
+        controlKey = deriveControlKey(deps.controlKeySecret ?? '', { computerId: p.computerId, generation: p.generation, leaseEpoch: p.leaseEpoch, nonceHash });
     } catch {
-        return retryLater(500, 'enroll_failed');
+        return retryLater(503, 'enroll_unavailable');
+    }
+    const keyB64 = controlKey.toString('base64');
+    const sandboxId = awsSandboxId(p.ownerUserId, p.computerId);
+    const tunnelRequest = (instanceId: string, publicIp: string): TunnelRequest => ({
+        computerId: p.computerId.toLowerCase(),
+        sandboxId,
+        generation: p.generation,
+        leaseEpoch: p.leaseEpoch,
+        instanceId,
+        region: p.region!,
+        publicIp,
+        controlKey: keyB64,
+    });
+    const success = (tunnelToken: string): EnrollResponse =>
+        // sandboxId + zone let the host's edge recognise its own browser hosts (edge.py).
+        ({ status: 200, body: { tunnelToken, controlKey: keyB64, sandboxId, zone: browserZone } });
+
+    if (replay) {
+        // Read-only: the Worker returns this epoch's existing tunnel token only for the exact record
+        // (same instance, address and key) inside its window. No consume, no new tunnel, no write.
+        let replayed: TunnelResult;
+        try {
+            replayed = await deps.tunnels.createTunnel({ userId: p.ownerUserId }, { ...tunnelRequest(doc.instanceId, view.publicIp), replay: true });
+        } catch {
+            replayed = { ok: false, status: 0, code: 'tunnel_transport' };
+        }
+        if (replayed.ok) return success(replayed.tunnelToken);
+        // 409: not this epoch's key (another nonce), no such tunnel, or past the window. Final.
+        return replayed.status === 409 ? refuse(409, 'enroll_nonce_consumed') : retryLater(503, 'tunnel_unavailable');
     }
 
     let expected = p;
     let consumed: Placement | null = null;
     for (let attempt = 0; attempt < 2; attempt++) {
         const result = await consumeEnrollmentNonce(deps.db, {
-            computerId: p.computerId, expected, nonceHash: nonceHashOf(body.nonce),
+            computerId: p.computerId, expected, nonceHash,
             fields: { instanceId: doc.instanceId, volumeId },
         });
         if (result.ok) {
@@ -391,36 +455,21 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
         const { record: current } = await readPlacement(deps.db, p.computerId);
         if (!current || current.generation !== p.generation || current.leaseEpoch !== p.leaseEpoch) return refuse(409, 'enroll_stale_epoch');
         if (!current.enrollNonceHash) return refuse(409, 'enroll_nonce_consumed');
-        if (!sameHash(current.enrollNonceHash, nonceHashOf(body.nonce))) return refuse(403, 'enroll_nonce_invalid');
+        if (!sameHash(current.enrollNonceHash, nonceHash)) return refuse(403, 'enroll_nonce_invalid');
         if (current.instanceId !== null && current.instanceId !== doc.instanceId) return refuse(403, 'instance_mismatch');
         if (!current.enrollExpiresAt || current.enrollExpiresAt.getTime() <= deps.now().getTime()) return refuse(403, 'enroll_nonce_expired');
         if (!ENROLLABLE_STATES.includes(current.state)) return refuse(409, 'enroll_state');
         expected = current;
     }
     if (!consumed) return retryLater(503, 'enroll_conflict');
-    const keyB64 = controlKey.toString('base64');
-    const sandboxId = awsSandboxId(p.ownerUserId, p.computerId);
     let tunnel: TunnelResult;
     try {
-        tunnel = await deps.tunnels.createTunnel(
-            { userId: p.ownerUserId },
-            {
-                computerId: p.computerId.toLowerCase(),
-                sandboxId,
-                generation: p.generation,
-                leaseEpoch: p.leaseEpoch,
-                instanceId: doc.instanceId,
-                region: p.region,
-                publicIp: view.publicIp,
-                controlKey: keyB64,
-            },
-        );
+        tunnel = await deps.tunnels.createTunnel({ userId: p.ownerUserId }, tunnelRequest(doc.instanceId, view.publicIp));
     } catch {
         tunnel = { ok: false, status: 0, code: 'tunnel_transport' };
     }
     const finished = await finishEnrollment(deps.db, { computerId: p.computerId, expected: consumed, success: tunnel.ok });
     if (!tunnel.ok) return refuse(502, 'tunnel_unavailable');
     if (!finished.ok) return refuse(409, 'enroll_conflict');
-    // sandboxId + zone let the host's edge recognise its own browser hosts (edge.py).
-    return { status: 200, body: { tunnelToken: tunnel.tunnelToken, controlKey: keyB64, sandboxId, zone: browserZone } };
+    return success(tunnel.tunnelToken);
 }
