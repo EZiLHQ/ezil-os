@@ -21,6 +21,7 @@ describe('buildLifecycleWork', () => {
         ['provision-ap-south-1', fixtureIntent('provision')],
         ['stop-us-east-1', fixtureIntent('stop', 'us-east-1')],
         ['provision-free-ap-south-1', fixtureIntent('provision', 'ap-south-1', 't3a.medium', FREE_TIER_DEPLOYMENT_TYPES)],
+        ['replace-free-ap-south-1', fixtureIntent('replace', 'ap-south-1', 't3a.medium', FREE_TIER_DEPLOYMENT_TYPES)],
     ] as const)('%s matches the pinned fixture byte for byte', (key, intent) => {
         const w = buildLifecycleWork(intent);
         expect({ name: w.name, stateMachineArn: w.stateMachineArn, digest: w.digest, input: w.input }).toEqual(fixtures[key]);
@@ -64,6 +65,17 @@ describe('buildLifecycleWork', () => {
     ];
     it.each(bad)('refuses %s', (_name, mutate) => {
         expect(() => buildLifecycleWork(mutate(fixtureIntent('start')))).toThrow(LifecycleIntentInvalidError);
+    });
+
+    it('replace (wake) needs user data, the retained volume, the previous writer and a NEW fence, and no data size', () => {
+        const r = fixtureIntent('replace', 'ap-south-1', 't3a.medium', FREE_TIER_DEPLOYMENT_TYPES);
+        expect(buildLifecycleWork(r).intent.operation).toBe('replace');
+        expect(() => buildLifecycleWork({ ...r, userData: null })).toThrow(LifecycleIntentInvalidError);
+        expect(() => buildLifecycleWork({ ...r, dataVolumeId: null })).toThrow(LifecycleIntentInvalidError);
+        expect(() => buildLifecycleWork({ ...r, providerInstanceId: 'i-11111111111111111' })).toThrow(LifecycleIntentInvalidError);
+        expect(() => buildLifecycleWork({ ...r, previousFenceToken: r.fenceToken })).toThrow(LifecycleIntentInvalidError);
+        expect(() => buildLifecycleWork({ ...r, previousGeneration: 2 })).toThrow(LifecycleIntentInvalidError);
+        expect(() => buildLifecycleWork({ ...r, dataVolumeGiB: 20 })).toThrow(LifecycleIntentInvalidError);
     });
 
     it('provision needs user data, a data size in range and no instance or volume', () => {

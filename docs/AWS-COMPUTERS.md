@@ -154,10 +154,40 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
   transaction, computer, user and kind (create or lease), and only after that computer's counters were read under the
   lock. AWS creation and leasing refuse without it. Only the admission module mints tickets (a repository scan test).
 
+**Wake mode (`EZIL_AWS_WAKE_MODE`, app)**
+- `replace` (default): a STOPPED computer wakes as a NEW instance of its recorded type on the retained data volume. The
+  lease reserves `generation + 1` and `lease_epoch + 1`, and a new fence token. The intent hands the stopped writer's
+  instance, generation and fence on as `previous*`; the helper stops and terminates it, never the volume. The launch
+  user data carries this boot's enrollment nonce (C-6), so no attribute write is needed. The disposable root boots fresh
+  from the AMI; user state lives on the data volume (overlay upper, HOME).
+- `start`: the same instance starts in place (epoch + 1 only). Its nonce must be written into user data while stopped,
+  which the lifecycle deployment allows only with `features.userDataNonce` after the staging proof. The app refuses
+  `start` (`aws_config_invalid`) unless the operator also sets `EZIL_AWS_LIFECYCLE_USERDATA_NONCE=1`, because a started
+  host without a fresh nonce could never enroll.
+- Every boot's job id, intent digest, fence token and enrollment nonce hash are written by the SAME compare-and-swap that
+  admits the boot (the creation insert or the lease). The intent is built first: the CAS moves generation and epoch by
+  exactly one, so nothing about it depends on the write. Starts and stops of a generation carry that generation's
+  recorded fence token: the instance and volume are tagged with it, and the helper refuses any other.
+- A refused `StartExecution` after a start-in-place lease returns the row to STOPPED (only the epoch moved). After a
+  replace lease it goes to UNCONFIRMED: the generation already moved, so recovery decides.
+
 **Errors**
 - Capacity and quota errors fail fast.
 - Throttling errors retry.
 - Every error is recorded on `UNCONFIRMED`.
+
+**Receipts (app, `aws-receipts.ts`; the reconciler path)**
+- Only the placement's CURRENT job is read (`DescribeExecution` on `computer-<jobId>` under the region's machine). Its
+  success output must match that job, digest, generation, lease epoch, fence, data volume and the expected state
+  (`running` for a boot, `stopped` for a stop); anything else goes UNCONFIRMED (`receipt_conflict` / `receipt_invalid`)
+  and keeps the job for recovery.
+- A boot is RUNNING only when BOTH the provider receipt arrived AND its host enrolled (nonce consumed): STARTING →
+  MOUNTING on the receipt, MOUNTING → RUNNING once enrolled; a provision goes PROVISIONING → RUNNING once both hold.
+- A stop receipt lands STOPPED and fences that generation's tunnel (GW-1 DELETE).
+- A failed execution goes UNCONFIRMED with `last_error`: `capacity:<code>:<type>` for `LifecycleRefused` + a capacity code,
+  else `failed:<error>`. A capacity-refused computer answers `capacity_unavailable` and never moves region. Retrying the
+  tier's next type (t3a.medium → t3.medium) needs infra recovery to prove nothing launched and to keep the volume's
+  previous-generation tags (LIFECYCLE.md); `nextInstanceTypeAfterCapacity` exists but is not wired.
 
 ### C-4 Disk marker (bug fence only)
 
@@ -267,6 +297,23 @@ generation and a one-time nonce.
    connections.
 
 A user who replays their own computer's material can reach only their own computer.
+
+**App implementation (`app/src/server/lib/compute/aws-enroll.ts`, route `POST /api/compute/aws/enroll`)**
+- Issue: every provision and wake writes `sha256(nonce)` and a 10-minute deadline in the same compare-and-swap that admits
+  the boot; the plaintext goes only into that launch's user data (the host lease JSON of `lease.py`, plus `enrollUrl`).
+- Signature: CMS/PKCS7 (IMDS `/pkcs7`, RSA or DSA, SHA-256 or SHA-1, with or without signed attributes) verified against
+  the region's AWS certificate from `EZIL_AWS_IDENTITY_CERTS` only; embedded certificates are ignored.
+- Live describe (injected): the instance is `running`, in the placement's ZoneId, carries the CURRENT generation's tags
+  (computer id, generation, fence token, namespace), has a public address, and holds the data volume (provision: the one
+  retained, non-root volume tagged for the computer, which is then recorded). An old-generation instance fails on its fence.
+- Consume: one CAS on generation, epoch, state, provider, nonce hash and an unexpired deadline clears the nonce and
+  records the verified instance and volume. Then `controlKey` (32 bytes) and GW-1 `POST /internal/aws/tunnels`.
+- Not wired yet: the EC2 describe needs the app's AWS caller (Vercel OIDC) and `@aws-sdk/client-ec2`. Until then
+  `awsEnrollmentDescriber()` returns null and the endpoint answers 503 `enroll_unavailable`, consuming nothing.
+- Host gap: `lease.py` requires `volumeId` in the user data, but a provision's volume does not exist when its intent is
+  built. The app omits it on a provision (`provision: true`); the host must resolve the single attached data volume in
+  that case (host-agent follow-up).
+
 
 ### C-7 Migration fence and export rules
 

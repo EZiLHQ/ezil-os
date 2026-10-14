@@ -197,6 +197,19 @@ export interface Placement {
     enrollExpiresAt: Date | null;
     leaseUntil: Date | null;
     presenceAt: Date | null;
+    /**
+     * The fence token the CURRENT generation's instance and data volume are tagged
+     * with (infra `tagsFor`). Minted by a provision or replace only; every start and
+     * stop of that generation must carry it, or the lifecycle helper refuses
+     * (`lifecycle_volume_invalid`). A replace hands it on as `previousFenceToken`.
+     */
+    fenceToken: string | null;
+    /** The lifecycle job this placement is waiting on: execution `computer-<jobId>`, answered by the authority check. */
+    lifecycleJobId: string | null;
+    /** sha256 of that job's intent document (the execution input's `digest`). */
+    lifecycleDigest: string | null;
+    /** Machine-readable cause of the last failed job (e.g. `capacity:InsufficientInstanceCapacity:t3a.medium`). */
+    lastError: string | null;
     updatedAt: Date;
 }
 
@@ -222,6 +235,10 @@ const MUTABLE_COLUMNS = {
     enrollExpiresAt: ['enroll_expires_at', 'timestamptz'],
     leaseUntil: ['lease_until', 'timestamptz'],
     presenceAt: ['presence_at', 'timestamptz'],
+    fenceToken: ['fence_token', 'uuid'],
+    lifecycleJobId: ['lifecycle_job_id', 'uuid'],
+    lifecycleDigest: ['lifecycle_digest', 'text'],
+    lastError: ['last_error', 'text'],
 } as const;
 export type PlacementFields = Partial<{
     [K in keyof typeof MUTABLE_COLUMNS]: (typeof MUTABLE_COLUMNS)[K][1] extends 'timestamptz' ? Date | null : string | null;
@@ -232,7 +249,8 @@ const SELECT_COLUMNS = sql.raw(
         'computer_id::text AS computer_id', 'owner_user_id::text AS owner_user_id', 'provider', 'workspace_store', 'generation::text AS generation',
         'lease_epoch::text AS lease_epoch', 'state', 'region', 'zone_id', 'instance_id', 'instance_type',
         'volume_id', 'fs_uuid::text AS fs_uuid', 'tunnel_id', 'enroll_nonce_hash', 'enroll_expires_at',
-        'lease_until', 'presence_at', 'updated_at',
+        'lease_until', 'presence_at', 'fence_token::text AS fence_token', 'lifecycle_job_id::text AS lifecycle_job_id',
+        'lifecycle_digest', 'last_error', 'updated_at',
     ].join(', '),
 );
 
@@ -286,6 +304,8 @@ export function parsePlacementRow(row: Record<string, unknown>, computerId: stri
         instanceType: text('instance_type'), volumeId: text('volume_id'), fsUuid: text('fs_uuid'),
         tunnelId: text('tunnel_id'), enrollNonceHash: text('enroll_nonce_hash'),
         enrollExpiresAt: time('enroll_expires_at'), leaseUntil: time('lease_until'), presenceAt: time('presence_at'),
+        fenceToken: text('fence_token'), lifecycleJobId: text('lifecycle_job_id'), lifecycleDigest: text('lifecycle_digest'),
+        lastError: text('last_error'),
         updatedAt,
     };
 }
@@ -553,7 +573,7 @@ async function casInTx(
     to: PlacementState,
     bump: { generation: 0 | 1; leaseEpoch: 0 | 1 },
     fields: PlacementFields,
-    guard: { provider?: PlacementProvider; ownerUserId?: string } = {},
+    guard: { provider?: PlacementProvider; ownerUserId?: string; enrollNonceHash?: string; enrollNotExpiredAt?: Date } = {},
 ): Promise<TransitionResult> {
     const computerId = canonicalId(rawComputerId);
     // A duplicate whose keys do not match the CAS would let this writer win
@@ -571,7 +591,7 @@ async function casInTx(
     const rows = rowsOf(
         await tx.execute(sql`/* placement:cas */ UPDATE public.ezil_computer_placements
             SET ${sql.join(sets, sql`, `)}
-            WHERE computer_id = ${computerId}::uuid AND generation = ${expected.generation} AND lease_epoch = ${expected.leaseEpoch} AND state = ${expected.state}${guard.provider ? sql` AND provider = ${guard.provider}` : sql``}${guard.ownerUserId !== undefined ? sql` AND owner_user_id = ${canonicalId(guard.ownerUserId)}::uuid` : sql``}
+            WHERE computer_id = ${computerId}::uuid AND generation = ${expected.generation} AND lease_epoch = ${expected.leaseEpoch} AND state = ${expected.state}${guard.provider ? sql` AND provider = ${guard.provider}` : sql``}${guard.ownerUserId !== undefined ? sql` AND owner_user_id = ${canonicalId(guard.ownerUserId)}::uuid` : sql``}${guard.enrollNonceHash !== undefined ? sql` AND enroll_nonce_hash = ${guard.enrollNonceHash}` : sql``}${guard.enrollNotExpiredAt !== undefined ? sql` AND enroll_expires_at > ${guard.enrollNotExpiredAt.toISOString()}::timestamptz` : sql``}
             RETURNING ${SELECT_COLUMNS}`),
     );
     if (rows.length === 0) return { ok: false, reason: 'cas_conflict' };
@@ -624,7 +644,15 @@ export async function leasePlacement(
     tx: PlacementExecutor,
     lock: AdmissionLock,
     ticket: AdmissionTicket,
-    input: { computerId: string; ownerUserId: string; expected: { generation: number; leaseEpoch: number }; leaseUntil: Date; replace?: boolean },
+    input: {
+        computerId: string;
+        ownerUserId: string;
+        expected: { generation: number; leaseEpoch: number };
+        leaseUntil: Date;
+        replace?: boolean;
+        /** Written in the SAME compare-and-swap as the lease: the job, fence and enrollment nonce hash of this boot. */
+        fields?: PlacementFields;
+    },
 ): Promise<TransitionResult> {
     assertAdmissionLock(tx, lock);
     consumeTicket(tx, ticket, { computerId: input.computerId, userId: input.ownerUserId, kind: 'lease' });
@@ -634,10 +662,44 @@ export async function leasePlacement(
         { ...input.expected, state: 'STOPPED' },
         'LEASED',
         { generation: input.replace ? 1 : 0, leaseEpoch: 1 },
-        { leaseUntil: input.leaseUntil },
+        { ...input.fields, leaseUntil: input.leaseUntil },
         // Only the recorded owner's aws-ec2 row matches: a Cloudflare row is never leased under
         // AWS caps, and a re-keyed or re-inserted ezil_computers row cannot claim a placement.
         { provider: 'aws-ec2', ownerUserId: input.ownerUserId },
+    );
+}
+
+// ── Enrollment (C-6) ─────────────────────────────────────────────────────
+
+/** States a host may enroll in: the provision's first boot, or a wake's boot (C-6 step 3). */
+export const ENROLLABLE_STATES: readonly PlacementState[] = ['PROVISIONING', 'STARTING', 'MOUNTING'];
+
+/**
+ * C-6 step 4: consume the boot's one-time enrollment nonce. ONE compare-and-swap
+ * matches the exact generation, lease epoch, state, provider, the nonce's sha256
+ * AND an unexpired deadline, and clears both nonce columns; so a nonce works once
+ * and a second enrollment for the same epoch finds zero rows (`cas_conflict`).
+ * The state does not change. `fields` records what the verified host proved
+ * (its instance and data volume). No owner predicate: the caller is a host, not
+ * a user; the nonce, the signed identity document and the live describe are the
+ * authority. Only the enrollment handler may call it.
+ */
+export async function consumeEnrollmentNonce(
+    db: PlacementDb,
+    input: { computerId: string; expected: CasExpectation; nonceHash: string; now: Date; fields?: Pick<PlacementFields, 'instanceId' | 'volumeId'> },
+): Promise<TransitionResult> {
+    if (!ENROLLABLE_STATES.includes(input.expected.state)) return { ok: false, reason: 'illegal_transition' };
+    if (!/^[a-f0-9]{64}$/.test(input.nonceHash)) return { ok: false, reason: 'cas_conflict' };
+    return db.transaction((tx) =>
+        casInTx(
+            tx,
+            input.computerId,
+            input.expected,
+            input.expected.state,
+            { generation: 0, leaseEpoch: 0 },
+            { ...input.fields, enrollNonceHash: null, enrollExpiresAt: null },
+            { provider: 'aws-ec2', enrollNonceHash: input.nonceHash, enrollNotExpiredAt: input.now },
+        ),
     );
 }
 
