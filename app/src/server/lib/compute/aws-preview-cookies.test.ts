@@ -58,7 +58,9 @@ afterEach(() => {
     resetNekoAdminTokenCacheForTests();
 });
 
-const toOrigin = () => seen.filter((s) => s.url.startsWith(ORIGIN) && !s.url.includes('/preview-bootstrap'));
+// Compare parsed origins, never URL prefixes: `https://a.example` is a prefix of `https://a.example.evil`.
+const originOf = (url: string) => new URL(url).origin;
+const toOrigin = () => seen.filter((s) => originOf(s.url) === ORIGIN && new URL(s.url).pathname !== '/preview-bootstrap');
 
 describe('frame probe through an AWS bootstrap', () => {
     it('carries the bootstrap cookie to the same origin, so a working desktop is alive', async () => {
@@ -71,7 +73,7 @@ describe('frame probe through an AWS bootstrap', () => {
     it('never forwards the cookie to another origin', async () => {
         bootstrapTarget = `${ELSEWHERE}/landing`;
         await expect(probeDesktopFrame(BOOTSTRAP)).resolves.toEqual({ alive: true, status: 200 });
-        const hop = seen.find((s) => s.url.startsWith(ELSEWHERE));
+        const hop = seen.find((s) => originOf(s.url) === ELSEWHERE);
         expect(hop).toBeDefined();
         expect(hop!.cookie).toBeNull();
     });
@@ -92,7 +94,7 @@ describe('frame probe through an AWS bootstrap', () => {
 describe('display probe through an AWS bootstrap', () => {
     it('takes the cookie first and sends it on login and sessions to that origin', async () => {
         await expect(probeDesktopDisplay(BOOTSTRAP, 'admin-pass')).resolves.toMatchObject({ display: 'live', watching: 1 });
-        const api = seen.filter((s) => s.url.startsWith(`${ORIGIN}/api/`));
+        const api = seen.filter((s) => originOf(s.url) === ORIGIN && new URL(s.url).pathname.startsWith('/api/'));
         expect(api.map((s) => new URL(s.url).pathname)).toEqual(['/api/login', '/api/sessions']);
         for (const s of api) expect(s.cookie).toBe(COOKIE);
     });
