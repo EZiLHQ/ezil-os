@@ -469,9 +469,10 @@ describe('stop and status', () => {
         }
     });
 
-    it('activity and restart refuse explicitly (host-side presence)', async () => {
-        const { provider } = setup({ placements: [stopped()] });
-        expect(await provider.activity(ctx, { userId: U1, computerId: C1 }, { lastInputAgoMs: 0 })).toEqual({ ok: false, error: 'aws_not_supported' });
+    it('activity on a stopped computer renews nothing; restart refuses explicitly', async () => {
+        const { provider, placements } = setup({ placements: [stopped()] });
+        expect(await provider.activity(ctx, { userId: U1, computerId: C1 }, { lastInputAgoMs: 0 })).toEqual({ ok: false, error: 'placement_stopped' });
+        expect(placements[0]).toMatchObject({ lease_until: null, presence_at: null });
         expect(await provider.restart(ctx, { userId: U1, computerId: C1 })).toMatchObject({ ok: false, error: 'aws_not_supported' });
     });
 });
@@ -630,5 +631,117 @@ describe('Codex #6: a guest-initiated idle stop is reconciled into the placement
         expect(asked).toEqual(['ap-south-1 i-11111111111111111']);
         expect(calls.map((c) => [c.intent.operation, c.intent.computerId])).toEqual([['stop', C2]]);
         expect(placements.find((r) => r.computer_id === C2)).toMatchObject({ state: 'STOPPING', owner_user_id: U2 });
+    });
+});
+
+describe('Codex 4275911832: the lease deadline and hour caps bind during a session', () => {
+    const me = { userId: U1, computerId: C1 };
+    const HOUR = 3_600_000;
+    const at = (v: unknown) => new Date(v as string | Date).getTime();
+    const running = (over: Record<string, unknown> = {}) => stopped({ state: 'RUNNING', lease_epoch: 4, lease_until: new Date(NOW.getTime() + HOUR), ...over });
+    /** A closed usage row of `h` hours ending now (inside this UTC month). */
+    const hours = (h: number, user = U1) => ({
+        computer_id: C1, user_id: user, instance_id: 'i-1', instance_type: 't3a.medium', started_at: new Date(NOW.getTime() - h * HOUR), stopped_at: NOW,
+        egress_bytes: null, observed_by: 'x', updated_at: NOW,
+    });
+    const casCount = (statements: { sql: string }[]) => statements.filter((s) => s.sql.includes('placement:cas')).length;
+
+    it('a provision leases for an hour, like every wake', async () => {
+        const { provider, placements } = setup();
+        await provider.ensure(ctx, me, opts);
+        expect(at(placements[0]!.lease_until)).toBe(NOW.getTime() + HOUR);
+    });
+
+    it('status: a lapsed lease stops the instance through the ordinary lifecycle stop (lease_expired)', async () => {
+        const { provider, placements, calls } = setup({ placements: [running({ lease_until: new Date(NOW.getTime() - 1) })] });
+        expect(await provider.status(ctx, me)).toMatchObject({ state: 'stopping', placementState: 'STOPPING' });
+        expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
+        expect(calls[0]!.intent).toMatchObject({ providerInstanceId: 'i-11111111111111111', fenceToken: FENCE, leaseEpoch: 4 });
+        expect(placements[0]).toMatchObject({ state: 'STOPPING', last_error: 'lease_expired', lifecycle_job_id: calls[0]!.intent.jobId });
+    });
+
+    it('a RUNNING row with no lease at all is treated as lapsed (fail closed)', async () => {
+        const { provider, placements, calls } = setup({ placements: [running({ lease_until: null })] });
+        expect(await provider.status(ctx, me)).toMatchObject({ state: 'stopping' });
+        expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
+        expect(placements[0]).toMatchObject({ last_error: 'lease_expired' });
+    });
+
+    it('status is not presence: a live lease is neither renewed nor stopped, and nothing is written', async () => {
+        const lease = new Date(NOW.getTime() + 10 * 60_000);
+        const { provider, placements, calls, statements } = setup({ placements: [running({ lease_until: lease })] });
+        expect(await provider.status(ctx, me)).toMatchObject({ state: 'running' });
+        expect(calls).toEqual([]);
+        expect(at(placements[0]!.lease_until)).toBe(lease.getTime());
+        expect(casCount(statements)).toBe(0);
+    });
+
+    it.each([
+        ['the user', () => [hours(100)], 'user_hours_cap'],
+        ['everyone (global)', () => Array.from({ length: 6 }, () => hours(100, U2)), 'global_hours_cap'],
+    ] as const)('status: %s at the monthly hour cap → the running instance is stopped (%s)', async (_n, usage, code) => {
+        const { provider, placements, calls } = setup({ placements: [running()], usage: usage() });
+        expect(await provider.status(ctx, me)).toMatchObject({ state: 'stopping' });
+        expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
+        expect(placements[0]).toMatchObject({ last_error: code });
+    });
+
+    it('under the caps with a live lease, nothing stops', async () => {
+        const { provider, calls } = setup({ placements: [running()], usage: [hours(99)] });
+        expect(await provider.status(ctx, me)).toMatchObject({ state: 'running' });
+        expect(calls).toEqual([]);
+    });
+
+    it('activity: fresh presence renews the lease from the presence instant, and not on every beat', async () => {
+        const { provider, placements, statements } = setup({ placements: [running({ lease_until: new Date(NOW.getTime() + 10 * 60_000) })] });
+        expect(await provider.activity(ctx, me, { lastInputAgoMs: 60_000 })).toEqual({ ok: true });
+        expect(at(placements[0]!.presence_at)).toBe(NOW.getTime() - 60_000);
+        expect(at(placements[0]!.lease_until)).toBe(NOW.getTime() - 60_000 + HOUR);
+        // More than half of the renewed lease is left: the next beat writes nothing.
+        const before = casCount(statements);
+        expect(await provider.activity(ctx, me, { lastInputAgoMs: 0 })).toEqual({ ok: true });
+        expect(casCount(statements)).toBe(before);
+    });
+
+    it('activity: the release beat (presence 30 min ago) renews nothing, so a lapsed lease is stopped', async () => {
+        const { provider, placements, calls } = setup({ placements: [running({ lease_until: new Date(NOW.getTime() - 1) })] });
+        expect(await provider.activity(ctx, me, { lastInputAgoMs: 30 * 60_000 })).toEqual({ ok: false, error: 'lease_expired' });
+        expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
+        expect(placements[0]).toMatchObject({ state: 'STOPPING', last_error: 'lease_expired', presence_at: null });
+    });
+
+    it('activity: an owner at the hour cap is stopped within a beat, presence notwithstanding', async () => {
+        const { provider, placements, calls } = setup({ placements: [running()], usage: [hours(100)] });
+        expect(await provider.activity(ctx, me, { lastInputAgoMs: 0 })).toEqual({ ok: false, error: 'user_hours_cap' });
+        expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
+        expect(placements[0]).toMatchObject({ last_error: 'user_hours_cap' });
+    });
+
+    it('activity never shortens a lease', async () => {
+        const far = new Date(NOW.getTime() + 5 * HOUR);
+        const { provider, placements, statements } = setup({ placements: [running({ lease_until: far })] });
+        expect(await provider.activity(ctx, me, { lastInputAgoMs: 0 })).toEqual({ ok: true });
+        expect(at(placements[0]!.lease_until)).toBe(far.getTime());
+        expect(casCount(statements)).toBe(0);
+    });
+
+    it("another user's heartbeat renews nothing (NOT_FOUND upstream)", async () => {
+        const lease = new Date(NOW.getTime() + 60_000);
+        const { provider, placements } = setup({ placements: [running({ lease_until: lease })] });
+        await expect(provider.activity(ctx, { userId: U2, computerId: C1 }, { lastInputAgoMs: 0 })).rejects.toBeInstanceOf(PlacementOwnerError);
+        expect(at(placements[0]!.lease_until)).toBe(lease.getTime());
+    });
+
+    it('ensure (an explicit open) renews a lapsed lease instead of stopping what the owner is opening', async () => {
+        const { provider, placements, calls } = setup({ placements: [running({ lease_until: new Date(NOW.getTime() - 1) })] });
+        expect(await provider.ensure(ctx, me, opts)).toEqual({ ok: true });
+        expect(calls).toEqual([]);
+        expect(at(placements[0]!.lease_until)).toBe(NOW.getTime() + HOUR);
+    });
+
+    it('ensure at the hour cap stops the running computer and answers the cap', async () => {
+        const { provider, calls } = setup({ placements: [running()], usage: [hours(100)] });
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ ok: false, errorCode: 'user_hours_cap' });
+        expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
     });
 });

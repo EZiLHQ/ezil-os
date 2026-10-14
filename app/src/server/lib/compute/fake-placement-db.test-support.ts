@@ -103,6 +103,7 @@ export function placementRow(over: Row & { computer_id: string }): Row {
         lifecycle_digest: null,
         last_error: null,
         updated_at: new Date('2026-10-01T00:00:00Z'),
+        reconciled_at: null,
         ...over,
     };
 }
@@ -235,16 +236,28 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 tx.undo.push(() => usage.splice(usage.indexOf(row), 1));
                 return { rows: [] };
             }
-            case 'reconcile-list': {
+            case 'reconcile-claim': {
+                // The rotation is the point: the SQL text is pinned, the model claims the
+                // least recently reconciled rows (never-reconciled first) and stamps them.
+                if (!/SET reconciled_at = now\(\)\s+WHERE computer_id IN \(SELECT computer_id FROM [\w.]+\s+WHERE provider = 'aws-ec2' AND state IN \([^)]*\)\s+ORDER BY reconciled_at ASC NULLS FIRST, updated_at ASC, computer_id ASC\s+LIMIT \$\d+\s+FOR UPDATE SKIP LOCKED\)/.test(text)) {
+                    throw new Error('fake db: unexpected reconcile-claim SQL');
+                }
                 const limit = Number(params.at(-1));
                 const states = new Set(params.slice(0, -1) as string[]);
-                return {
-                    rows: placements
-                        .filter((r) => r.provider === 'aws-ec2' && states.has(String(r.state)))
-                        .sort((a, b) => new Date(a.updated_at as Date).getTime() - new Date(b.updated_at as Date).getTime())
-                        .slice(0, limit)
-                        .map((r) => ({ computer_id: r.computer_id, owner_user_id: r.owner_user_id })),
-                };
+                const at = (v: unknown) => (v === null || v === undefined ? -Infinity : new Date(v as Date).getTime());
+                const picked = placements
+                    .filter((r) => r.provider === 'aws-ec2' && states.has(String(r.state)))
+                    .sort((a, b) => at(a.reconciled_at) - at(b.reconciled_at) || at(a.updated_at) - at(b.updated_at)
+                        || String(a.computer_id).localeCompare(String(b.computer_id)))
+                    .slice(0, limit);
+                const ids = new Set(picked.map((r) => String(r.computer_id).toLowerCase()));
+                const hit = placements.filter((r) => ids.has(String(r.computer_id).toLowerCase()));
+                for (const r of hit) {
+                    const before = r.reconciled_at;
+                    r.reconciled_at = clock();
+                    tx?.undo.push(() => { r.reconciled_at = before; });
+                }
+                return { rows: hit.map((r) => ({ computer_id: r.computer_id, owner_user_id: r.owner_user_id })) };
             }
             case 'retire-pending': {
                 // LEFT JOIN ezil_computers: the computer row is gone or soft-deleted.

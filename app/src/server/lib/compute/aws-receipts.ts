@@ -14,15 +14,16 @@ import { randomUUID } from 'node:crypto';
 
 import { z } from 'zod';
 
-import { AWS_TIERS, isAwsComputersEnabled, readAwsRegions, type AwsTier, type Env } from './aws-config';
+import { AWS_TIERS, isAwsComputersEnabled, readAwsAdmissionConfig, readAwsRegions, type AwsAdmissionCaps, type AwsTier, type Env } from './aws-config';
 import type { LifecycleStarter } from './aws-ec2';
 import { awsSandboxId, type Ec2EnrollmentDescriber, type TunnelClient } from './aws-enroll';
 import { buildLifecycleWork, currentGenerationIntent, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
 import {
     ENROLLMENT_SUCCEEDED,
+    claimAwsPlacementsToReconcile,
     listAwsPlacementsPendingRetire,
-    listAwsPlacementsToReconcile,
     PlacementIntegrityError,
+    readMonthUsage,
     readPlacement,
     transitionPlacementAsReconciler,
     type Placement,
@@ -30,7 +31,9 @@ import {
     type PlacementFields,
     type PlacementState,
     type UsageEffect,
+    type UsageRow,
 } from './placement';
+import { summarizeUsage, utcMonthStart } from './usage';
 
 /** Read-only `DescribeExecution` in the placement's region (Step Functions). */
 export interface LifecycleExecutionReader {
@@ -211,6 +214,8 @@ export interface GuestStopDeps extends ReceiptDeps {
     starter?: LifecycleStarter;
     /** Lower-case uuid v4. */
     newId?: () => string;
+    /** The background pass's clock (session limits); tests inject it. */
+    clock?: () => Date;
 }
 
 /**
@@ -234,6 +239,20 @@ export async function reconcileGuestStop(deps: GuestStopDeps, p: Placement, depl
         return false; // Unknown: leave it, try again on the next look.
     }
     if (!view || (view.state !== 'stopping' && view.state !== 'stopped')) return false;
+    return startStopAsReconciler(deps, p, deployment, null);
+}
+
+/**
+ * The ORDINARY lifecycle stop of a RUNNING placement, started by the reconciler (a
+ * guest idle stop, a lapsed lease, an hour cap). The helper stops the instance with
+ * an OS shutdown, so the host quiesces and flushes exactly as for a user stop; the
+ * receipt path then fences the tunnel, closes the usage row and marks it STOPPED.
+ * The job is recorded first (DRAINING), so the authority check finds it; `lastError`
+ * says why it stopped. Returns true when a stop was started.
+ */
+async function startStopAsReconciler(deps: GuestStopDeps, p: Placement, deployment: LifecycleDeployment, reason: string | null): Promise<boolean> {
+    if (p.state !== 'RUNNING' || p.provider !== 'aws-ec2' || !deps.starter) return false;
+    if (!p.region || !p.instanceId || !p.volumeId || !p.fenceToken || !p.instanceType) return false;
     let work: LifecycleWork;
     try {
         work = buildLifecycleWork(currentGenerationIntent(p, 'stop', deployment, { jobId: (deps.newId ?? randomUUID)(), userData: null, leaseEpoch: p.leaseEpoch }));
@@ -243,7 +262,7 @@ export async function reconcileGuestStop(deps: GuestStopDeps, p: Placement, depl
     }
     // Same order as a user stop: the job is recorded first, so the authority check finds it.
     const draining = await transitionPlacementAsReconciler(deps.db, {
-        computerId: p.computerId, expected: p, to: 'DRAINING', fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
+        computerId: p.computerId, expected: p, to: 'DRAINING', fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: reason },
     });
     if (!draining.ok) return false;
     try {
@@ -256,23 +275,88 @@ export async function reconcileGuestStop(deps: GuestStopDeps, p: Placement, depl
     return true;
 }
 
+// ── Session limits: lease deadline and monthly hour caps (R9, §4) ─────────
+
+/**
+ * Why a RUNNING computer must stop now, or null.
+ * - `lease_expired`: `lease_until` has passed. The lease is set at provision and at
+ *   every wake, and renewed only by the AUTHENTICATED owner's presence (aws-ec2.ts:
+ *   the shell's activity heartbeat and an explicit open). A RUNNING row with no lease
+ *   is treated as lapsed: fail closed, an instance nobody can account for costs money.
+ * - `user_hours_cap` / `global_hours_cap`: the month's usage (usage.ts, open rows count
+ *   up to now) reached the configured cap. Admission refuses the next wake with the
+ *   same codes. Egress caps cannot bind yet (egress is not measured, usage.ts).
+ */
+export type SessionLimit = 'lease_expired' | 'user_hours_cap' | 'global_hours_cap';
+
+export interface SessionLimitPolicy {
+    now: Date;
+    /** Hour caps from the admission config; null when they cannot be read (then only the lease binds). */
+    caps: Pick<AwsAdmissionCaps, 'userMonthlyHours' | 'globalMonthlyHours'> | null;
+    /** This month's usage rows, when the caller already read them (a fleet pass reads once). */
+    usage?: readonly UsageRow[];
+}
+
+export function sessionLimitFor(p: Placement, policy: SessionLimitPolicy, usage: readonly UsageRow[] | null): SessionLimit | null {
+    if (p.state !== 'RUNNING' || p.provider !== 'aws-ec2') return null;
+    if (!p.leaseUntil || p.leaseUntil.getTime() <= policy.now.getTime()) return 'lease_expired';
+    if (policy.caps && usage) {
+        const totals = summarizeUsage(usage, p.ownerUserId.toLowerCase(), policy.now);
+        if (totals.user.hours >= policy.caps.userMonthlyHours) return 'user_hours_cap';
+        if (totals.global.hours >= policy.caps.globalMonthlyHours) return 'global_hours_cap';
+    }
+    return null;
+}
+
+/** The hour caps from `env`, or null when admission is off or misconfigured (only the lease then binds). */
+export function sessionLimitCaps(env: Env): SessionLimitPolicy['caps'] {
+    const config = readAwsAdmissionConfig(env);
+    return config.enabled ? { userMonthlyHours: config.caps.userMonthlyHours, globalMonthlyHours: config.caps.globalMonthlyHours } : null;
+}
+
+/**
+ * Stop a RUNNING placement whose lease lapsed or whose hour cap is reached, through
+ * the ordinary lifecycle stop (flushes like any stop), recording the reason in
+ * `last_error`. Run on every status and ensure, on every activity heartbeat, and by the
+ * fleet pass (the sandbox-reap cron, a capacity refusal). Returns the limit it acted
+ * on, or null when none applies or the stop could not be started (the next pass retries).
+ */
+export async function enforceSessionLimits(
+    deps: GuestStopDeps,
+    p: Placement,
+    deployment: LifecycleDeployment,
+    policy: SessionLimitPolicy,
+): Promise<SessionLimit | null> {
+    if (p.state !== 'RUNNING' || p.provider !== 'aws-ec2') return null;
+    const usage = policy.caps ? policy.usage ?? (await readMonthUsage(deps.db, policy.now, utcMonthStart(policy.now))) : null;
+    const limit = sessionLimitFor(p, policy, usage);
+    if (!limit) return null;
+    return (await startStopAsReconciler(deps, p, deployment, limit)) ? limit : null;
+}
+
 /** Most placements one fleet pass looks at (each RUNNING one costs a DescribeInstances). */
 export const FLEET_RECONCILE_LIMIT = 20;
 
 /**
- * Settle every aws-ec2 placement that may hold running capacity: apply its current
- * receipt, then catch a guest-initiated stop. Run when admission is refused for
- * capacity, so a fleet of idle-stopped rows cannot exhaust the cohort. One bad row
- * never blocks the rest. Returns how many stops it started.
+ * Settle aws-ec2 placements that may hold running capacity: apply the current receipt,
+ * catch a guest-initiated stop, then stop a RUNNING one whose lease lapsed or whose
+ * hour cap is reached (`policy`). Run when admission is refused for capacity and by the
+ * sandbox-reap cron. The pass ROTATES (`claimAwsPlacementsToReconcile`): repeated passes
+ * cover every row, not the oldest `limit` forever. One bad row never blocks the rest.
  */
 export async function reconcileAwsFleet(
     deps: GuestStopDeps,
     deployments: Readonly<Record<string, LifecycleDeployment>>,
     limit = FLEET_RECONCILE_LIMIT,
-): Promise<{ checked: number; stopsStarted: number }> {
+    policy?: SessionLimitPolicy,
+): Promise<{ checked: number; stopsStarted: number; limitStops: number }> {
     let checked = 0;
     let stopsStarted = 0;
-    for (const { computerId } of await listAwsPlacementsToReconcile(deps.db, limit)) {
+    let limitStops = 0;
+    const claimed = await claimAwsPlacementsToReconcile(deps.db, limit);
+    // One usage read per pass, only when caps can bind and a row may be RUNNING.
+    const usage = policy?.caps && claimed.length > 0 ? policy.usage ?? (await readMonthUsage(deps.db, policy.now, utcMonthStart(policy.now))) : undefined;
+    for (const { computerId } of claimed) {
         try {
             const { record } = await readPlacement(deps.db, computerId);
             const deployment = record && record.provider === 'aws-ec2' ? deployments[record.region ?? ''] : undefined;
@@ -280,12 +364,17 @@ export async function reconcileAwsFleet(
             checked += 1;
             await applyLifecycleReceipt(deps, record, deployment);
             const { record: now } = await readPlacement(deps.db, computerId);
-            if (now && (await reconcileGuestStop(deps, now, deployment))) stopsStarted += 1;
+            if (!now) continue;
+            if (await reconcileGuestStop(deps, now, deployment)) {
+                stopsStarted += 1;
+                continue;
+            }
+            if (policy && (await enforceSessionLimits(deps, now, deployment, { ...policy, usage }))) limitStops += 1;
         } catch (error) {
             if (!(error instanceof PlacementIntegrityError)) throw error;
         }
     }
-    return { checked, stopsStarted };
+    return { checked, stopsStarted, limitStops };
 }
 
 // ── Background retirement of deleted computers (§6, R11) ─────────────────
@@ -371,6 +460,7 @@ export async function runAwsBackgroundReconcile(
     const d = readLifecycleDeployments(env, regions.regions.map((r) => r.name));
     if (!d.ok) return { ok: true, skipped: 'aws_config_invalid' };
     const deleted = await reconcileDeletedAwsComputers(deps, d.deployments);
-    const fleet = await reconcileAwsFleet(deps, d.deployments);
+    // Lapsed leases and reached hour caps are stopped here too, for computers nobody touches.
+    const fleet = await reconcileAwsFleet(deps, d.deployments, FLEET_RECONCILE_LIMIT, { now: (deps.clock ?? (() => new Date()))(), caps: sessionLimitCaps(env) });
     return { ok: true, deleted, fleet };
 }

@@ -635,6 +635,27 @@ export async function transitionPlacement(
 }
 
 /**
+ * Lease renewal (R9, GW-3: "lease renewal stays with the control plane"): the
+ * AUTHENTICATED owner's presence on a RUNNING computer moves `presence_at` and
+ * `lease_until`. No state change, so no transition edge: an owner-guarded CAS on the
+ * row's generation, epoch and RUNNING state that keeps the state. Best effort: a lost
+ * race (`cas_conflict`) means someone else moved the row, and the next beat renews.
+ * The caller never shortens a lease (aws-ec2.ts `renewLease`).
+ */
+export async function renewPlacementLease(
+    db: PlacementDb,
+    input: { computerId: string; ownerUserId: string; expected: CasExpectation; presenceAt: Date; leaseUntil: Date },
+): Promise<TransitionResult> {
+    if (typeof input.ownerUserId !== 'string' || !UUID.test(input.ownerUserId)) throw new Error('renewPlacementLease requires the caller ownerUserId');
+    if (input.expected.state !== 'RUNNING') return { ok: false, reason: 'illegal_transition' };
+    return db.transaction((tx) =>
+        casInTx(tx, input.computerId, input.expected, 'RUNNING', { generation: 0, leaseEpoch: 0 },
+            { presenceAt: input.presenceAt, leaseUntil: input.leaseUntil },
+            { ownerUserId: input.ownerUserId, provider: 'aws-ec2', preserveState: true }),
+    );
+}
+
+/**
  * RECONCILER ONLY: a C-3 transition with NO owner predicate, for the lifecycle
  * receipt path (execution results, EC2 observations), which moves a placement
  * whoever owns it. The same legal-edge table and CAS guards apply. A user-facing
@@ -702,23 +723,40 @@ async function applyUsageInTx(tx: PlacementExecutor, p: Placement, effect: Usage
 
 /**
  * Reconciler input (aws-receipts.ts `reconcileAwsFleet`): aws-ec2 placements that may
- * hold running capacity — RUNNING (a guest may have stopped its instance) and the
- * states waiting on a lifecycle receipt. Oldest change first, bounded.
+ * hold running capacity — RUNNING (a guest may have stopped its instance, or its lease
+ * or hour cap may have lapsed) and the states waiting on a lifecycle receipt.
+ *
+ * ROTATING, so a bounded pass never starves rows: the pass CLAIMS up to `limit` rows,
+ * least recently reconciled first (never reconciled first of all), and stamps their
+ * `reconciled_at`. Healthy long-running rows keep their old `updated_at`, so ordering by
+ * it alone selected the same oldest rows forever and a guest-stopped row behind them was
+ * never seen. `reconciled_at` is bookkeeping only: no CAS reads it and `updated_at` is
+ * untouched. SKIP LOCKED leaves a row a writer holds to that writer; two passes never
+ * claim the same row. A duplicate placement's rows are returned once; the caller's own
+ * read then fails closed on it.
  */
-export async function listAwsPlacementsToReconcile(db: PlacementExecutor, limit: number): Promise<{ computerId: string; ownerUserId: string }[]> {
+export async function claimAwsPlacementsToReconcile(db: PlacementExecutor, limit: number): Promise<{ computerId: string; ownerUserId: string }[]> {
     const states = sql.join(RECONCILABLE_STATES.map((s) => sql`${s}`), sql`, `);
     const rows = rowsOf(
-        await db.execute(sql`/* placement:reconcile-list */ SELECT computer_id::text AS computer_id, owner_user_id::text AS owner_user_id
-            FROM public.ezil_computer_placements
-            WHERE provider = 'aws-ec2' AND state IN (${states})
-            ORDER BY updated_at ASC
-            LIMIT ${Math.max(1, Math.min(Math.trunc(limit), 100))}`),
+        await db.execute(sql`/* placement:reconcile-claim */ UPDATE public.ezil_computer_placements
+            SET reconciled_at = now()
+            WHERE computer_id IN (SELECT computer_id FROM public.ezil_computer_placements
+                WHERE provider = 'aws-ec2' AND state IN (${states})
+                ORDER BY reconciled_at ASC NULLS FIRST, updated_at ASC, computer_id ASC
+                LIMIT ${Math.max(1, Math.min(Math.trunc(limit), 100))}
+                FOR UPDATE SKIP LOCKED)
+            RETURNING computer_id::text AS computer_id, owner_user_id::text AS owner_user_id`),
     );
-    return rows.map((r) => {
+    const seen = new Set<string>();
+    const claimed: { computerId: string; ownerUserId: string }[] = [];
+    for (const r of rows) {
         const computerId = String(r.computer_id);
         if (!UUID.test(computerId) || typeof r.owner_user_id !== 'string' || !UUID.test(r.owner_user_id)) throw new PlacementIntegrityError('invalid_row', computerId);
-        return { computerId, ownerUserId: r.owner_user_id };
-    });
+        if (seen.has(computerId.toLowerCase())) continue;
+        seen.add(computerId.toLowerCase());
+        claimed.push({ computerId, ownerUserId: r.owner_user_id });
+    }
+    return claimed;
 }
 
 /** States a deleted computer's placement is driven out of, toward RETIRED (`listAwsPlacementsPendingRetire`). */
@@ -760,7 +798,7 @@ export function noNonCloudflarePlacement(computerId: SQL): SQL {
     return sql`NOT EXISTS (SELECT 1 FROM public.ezil_computer_placements p WHERE p.computer_id = ${computerId} AND p.provider <> 'cloudflare')`;
 }
 
-/** States `listAwsPlacementsToReconcile` returns: RUNNING plus every state waiting on a receipt. */
+/** States `claimAwsPlacementsToReconcile` claims: RUNNING plus every state waiting on a receipt. */
 export const RECONCILABLE_STATES: readonly PlacementState[] = ['RUNNING', 'PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING'];
 
 /**
@@ -921,6 +959,31 @@ export async function readCanaryComputer(
     return { userId: canonicalId(row!.user_id), deleted: row!.deleted, createdAt };
 }
 
+/**
+ * Every usage row overlapping the UTC month that contains `now` (usage.ts sums them).
+ * Admission reads it under its lock; session-limit enforcement (aws-receipts.ts
+ * `enforceSessionLimits`) reads it without one: a cap is checked again by the next pass.
+ */
+export async function readMonthUsage(db: PlacementExecutor, now: Date, monthStart: Date): Promise<UsageRow[]> {
+    const rows = rowsOf(
+        await db.execute(sql`/* placement:usage-month */ SELECT computer_id::text AS computer_id, user_id::text AS user_id,
+                started_at, stopped_at, egress_bytes::text AS egress_bytes
+            FROM public.ezil_compute_usage
+            WHERE started_at < ${now.toISOString()}::timestamptz
+              AND (stopped_at IS NULL OR stopped_at >= ${monthStart.toISOString()}::timestamptz)`),
+    );
+    return rows.map((r) => {
+        const startedAt = timestamp(r.started_at);
+        const stoppedAt = timestamp(r.stopped_at);
+        if (!startedAt || stoppedAt === undefined) throw new Error('usage row has an invalid timestamp');
+        const egress = r.egress_bytes === null || r.egress_bytes === undefined ? null : counter(r.egress_bytes);
+        if (egress === null && r.egress_bytes !== null && r.egress_bytes !== undefined) {
+            throw new Error('usage row has an invalid egress_bytes');
+        }
+        return { computerId: String(r.computer_id), userId: String(r.user_id), startedAt, stoppedAt, egressBytes: egress };
+    });
+}
+
 /** Read every admission input, inside `withAdmission`. */
 export async function readAdmissionCounters(
     tx: PlacementExecutor,
@@ -964,13 +1027,7 @@ export async function readAdmissionCounters(
                 OR EXISTS (SELECT 1 FROM public.ezil_compute_usage u WHERE u.computer_id = p.computer_id AND u.user_id = ${input.userId}::uuid))`),
     );
     const duplicates = await findDuplicatePlacements(tx);
-    const usageRows = rowsOf(
-        await tx.execute(sql`/* placement:usage-month */ SELECT computer_id::text AS computer_id, user_id::text AS user_id,
-                started_at, stopped_at, egress_bytes::text AS egress_bytes
-            FROM public.ezil_compute_usage
-            WHERE started_at < ${input.now.toISOString()}::timestamptz
-              AND (stopped_at IS NULL OR stopped_at >= ${input.monthStart.toISOString()}::timestamptz)`),
-    );
+    const usage = await readMonthUsage(tx, input.now, input.monthStart);
     const count = (rows: Record<string, unknown>[]) => {
         const n = counter(rows[0]?.n);
         if (n === null) throw new Error('admission counter query returned no count');
@@ -998,16 +1055,7 @@ export async function readAdmissionCounters(
         runningUnplaced,
         userOtherAwsComputers: count(userRows),
         duplicates,
-        usage: usageRows.map((r) => {
-            const startedAt = timestamp(r.started_at);
-            const stoppedAt = timestamp(r.stopped_at);
-            if (!startedAt || stoppedAt === undefined) throw new Error('usage row has an invalid timestamp');
-            const egress = r.egress_bytes === null || r.egress_bytes === undefined ? null : counter(r.egress_bytes);
-            if (egress === null && r.egress_bytes !== null && r.egress_bytes !== undefined) {
-                throw new Error('usage row has an invalid egress_bytes');
-            }
-            return { computerId: String(r.computer_id), userId: String(r.user_id), startedAt, stoppedAt, egressBytes: egress };
-        }),
+        usage,
     };
 }
 

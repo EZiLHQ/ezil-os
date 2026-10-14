@@ -49,9 +49,9 @@ import {
     type LifecycleOperation,
     type LifecycleWork,
 } from './aws-intent';
-import { ENROLLMENT_FAILED, PlacementOwnerError, readPlacement, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
-import { applyLifecycleReceipt, reconcileAwsFleet, reconcileGuestStop, type LifecycleExecutionReader } from './aws-receipts';
-import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult, TerminateResult } from './provider';
+import { ENROLLMENT_FAILED, PlacementOwnerError, readPlacement, renewPlacementLease, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
+import { applyLifecycleReceipt, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
+import type { ActivityResult, ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult, TerminateResult } from './provider';
 
 export const AWS_DISABLED = 'aws_disabled';
 
@@ -131,9 +131,17 @@ export interface AwsProviderDeps {
      * stop (R9), which no lifecycle job reports. Without it such a stop is never seen.
      */
     describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'>;
-    /** Lease length on a wake. */
+    /** Lease length: set at provision and at every wake, renewed by the owner's presence. */
     leaseSeconds?: number;
 }
+
+/**
+ * How recent the owner's presence must be to renew a lease: the shell's own
+ * `ACTIVITY_FRESH_MS` (shell/ezil/activity-heartbeat.js, 30 min), past which it stops
+ * heartbeating, and the value its release beat reports. Presence at least this old
+ * renews nothing.
+ */
+export const AWS_PRESENCE_FRESH_MS = 30 * 60_000;
 
 export type AwsComputerState = 'starting' | 'running' | 'stopping' | 'stopped' | 'error';
 export interface AwsComputeStatus extends ComputeStatus {
@@ -254,20 +262,53 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
 
     /**
      * The caller's own placement, settled: its current receipt applied, then a
-     * guest-initiated idle stop caught (aws-receipts.ts). Returns it re-read.
+     * guest-initiated idle stop caught (aws-receipts.ts), then — unless `limits` is
+     * off — a RUNNING one whose lease lapsed or whose hour cap is reached is stopped
+     * (`enforceSessionLimits`). Returns it re-read, with the limit acted on.
      */
-    const reconcileOwn = async (c: ComputerRef, p: Placement, deployments: Record<string, LifecycleDeployment>): Promise<Placement> => {
+    const reconcileOwn = async (
+        c: ComputerRef,
+        p: Placement,
+        deployments: Record<string, LifecycleDeployment>,
+        e: Env,
+        limits = true,
+    ): Promise<{ placement: Placement; limit: SessionLimit | null }> => {
         const deployment = deployments[p.region ?? ''];
-        if (!deployment || p.provider !== 'aws-ec2') return p;
+        if (!deployment || p.provider !== 'aws-ec2') return { placement: p, limit: null };
         await applyLifecycleReceipt(reconcileDeps(), p, deployment);
         let fresh = (await ownPlacement(c)) ?? p;
-        if (await reconcileGuestStop(reconcileDeps(), fresh, deployment)) fresh = (await ownPlacement(c)) ?? fresh;
-        return fresh;
+        if (await reconcileGuestStop(reconcileDeps(), fresh, deployment)) return { placement: (await ownPlacement(c)) ?? fresh, limit: null };
+        if (!limits) return { placement: fresh, limit: null };
+        const limit = await enforceSessionLimits(reconcileDeps(), fresh, deployment, { now: now(), caps: sessionLimitCaps(e) });
+        if (limit) fresh = (await ownPlacement(c)) ?? fresh;
+        return { placement: fresh, limit };
+    };
+
+    /**
+     * Renew the lease of the caller's RUNNING placement from the owner's PRESENCE
+     * (`presenceAt`): an explicit open, or an activity heartbeat whose presence is
+     * fresher than `AWS_PRESENCE_FRESH_MS`. Never shortens a lease; writes only once
+     * half of it is used, so a heartbeat a minute is not a write a minute. Returns the
+     * placement as it now stands.
+     */
+    const renewLease = async (c: ComputerRef, p: Placement, presenceAt: Date): Promise<Placement> => {
+        if (p.state !== 'RUNNING' || p.provider !== 'aws-ec2') return p;
+        const t = now().getTime();
+        if (t - presenceAt.getTime() >= AWS_PRESENCE_FRESH_MS) return p;
+        const target = presenceAt.getTime() + leaseSeconds * 1000;
+        const current = p.leaseUntil?.getTime() ?? -Infinity;
+        if (current >= target || (current > t && current - t > (leaseSeconds * 1000) / 2)) return p;
+        const r = await renewPlacementLease(deps.db, {
+            computerId: p.computerId, ownerUserId: c.userId, expected: p, presenceAt, leaseUntil: new Date(Math.max(current, target)),
+        });
+        return r.ok ? r.placement : p;
     };
 
     /** A capacity refusal may be idle-stopped rows still counted as running: settle the fleet, then refuse. */
-    const capacityRefusal = async (reason: string, deployments: Record<string, LifecycleDeployment>): Promise<EnsureResult> => {
-        if ((CAPACITY_REFUSALS as readonly string[]).includes(reason)) await reconcileAwsFleet(reconcileDeps(), deployments);
+    const capacityRefusal = async (reason: string, deployments: Record<string, LifecycleDeployment>, e: Env): Promise<EnsureResult> => {
+        if ((CAPACITY_REFUSALS as readonly string[]).includes(reason)) {
+            await reconcileAwsFleet(reconcileDeps(), deployments, FLEET_RECONCILE_LIMIT, { now: now(), caps: sessionLimitCaps(e) });
+        }
         return refusal(reason);
     };
 
@@ -331,7 +372,15 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             if (!deps.starter) return notReady('aws_lifecycle_unconfigured');
             const found = await ownPlacement(c);
             // Settle an existing placement first: a receipt may have landed, or its host idle-stopped itself.
-            const placement = found && found.provider === 'aws-ec2' ? await reconcileOwn(c, found, cfg.deployments) : found;
+            // An explicit open is the owner's presence: it renews the lease BEFORE the session limits
+            // are checked, so only an hour cap (never a lapsed lease) can stop what the owner is opening.
+            let placement = found && found.provider === 'aws-ec2' ? (await reconcileOwn(c, found, cfg.deployments, cfg.e, false)).placement : found;
+            if (placement && placement.provider === 'aws-ec2' && placement.state === 'RUNNING') {
+                placement = await renewLease(c, placement, now());
+                const settled = await reconcileOwn(c, placement, cfg.deployments, cfg.e);
+                if (settled.limit) return notReady(settled.limit);
+                placement = settled.placement;
+            }
 
             if (!placement) {
                 if (!deps.tierFor) return notReady('aws_tier_unavailable');
@@ -379,6 +428,8 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                                     zoneId: deployment.zoneId, fsUuid, fenceToken,
                                     enrollNonceHash: nonce.nonceHash, enrollExpiresAt: nonce.expiresAt,
                                     lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest,
+                                    // The provision is the first lease: it has a deadline like every wake.
+                                    leaseUntil: new Date(now().getTime() + leaseSeconds * 1000),
                                 };
                             },
                         },
@@ -388,7 +439,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     if (error instanceof LifecycleIntentInvalidError || error instanceof EnrollmentUserDataError) return notReady('aws_intent_invalid');
                     throw error;
                 }
-                if (!admitted.admitted) return capacityRefusal(admitted.reason, cfg.deployments);
+                if (!admitted.admitted) return capacityRefusal(admitted.reason, cfg.deployments, cfg.e);
                 const p = admitted.placement;
                 // The row must be exactly what the intent was built for (generation 1, epoch 1).
                 if (!work || p.generation !== 1 || p.leaseEpoch !== work.intent.leaseEpoch || p.lifecycleJobId !== work.intent.jobId) {
@@ -461,7 +512,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                         },
                         { env: cfg.e, now },
                     );
-                    if (!leased.admitted) return leased.reason === 'cas_conflict' ? notReady('computer_starting', true) : capacityRefusal(leased.reason, cfg.deployments);
+                    if (!leased.admitted) return leased.reason === 'cas_conflict' ? notReady('computer_starting', true) : capacityRefusal(leased.reason, cfg.deployments, cfg.e);
                     const p = leased.placement;
                     // A replace cannot be undone by compare-and-swap (the generation already moved):
                     // a refused StartExecution leaves it for recovery (UNCONFIRMED). A start-in-place
@@ -490,7 +541,8 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             if (!cfg.ok) return { ok: false, error: cfg.code };
             let p = await ownPlacement(c);
             if (!p || p.provider !== 'aws-ec2') return { ok: false, error: 'aws_placement_missing' };
-            p = await reconcileOwn(c, p, cfg.deployments);
+            // A status poll is not presence: it renews nothing, and a lapsed lease or a reached cap stops here.
+            p = (await reconcileOwn(c, p, cfg.deployments, cfg.e)).placement;
             const state = AWS_STATE_FOR[p.state];
             return { ok: state !== 'error', ...(state === 'error' ? { error: `placement_${p.state.toLowerCase()}` } : {}), state, placementState: p.state, region: p.region };
         },
@@ -508,9 +560,25 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             return startStop(c, p, deployment);
         },
 
-        // Presence on AWS is reported by the host agent through the tunnel (P5); the
-        // reaper never stops an AWS computer (the host idle-stops itself).
-        activity: async () => ({ ok: false, error: 'aws_not_supported' }),
+        /**
+         * The shell's activity heartbeat (`reportActivity`, every minute while the owner
+         * is PRESENT: tab visible and focused). It is the control plane's lease renewal
+         * source (GW-3: the host edge never renews leases): fresh presence renews the
+         * lease, then the session limits are enforced, so an owner over the hour cap is
+         * stopped within a beat. A release beat or stale presence renews nothing. The
+         * host's own idle stop (600 s without gateway presence) is unchanged.
+         */
+        async activity(_ctx, c, s): Promise<ActivityResult> {
+            const cfg = configured();
+            if (!cfg.ok) return { ok: false, error: cfg.code };
+            const found = await ownPlacement(c);
+            if (!found || found.provider !== 'aws-ec2') return { ok: false, error: 'aws_placement_missing' };
+            let p = (await reconcileOwn(c, found, cfg.deployments, cfg.e, false)).placement;
+            if (p.state !== 'RUNNING') return { ok: false, error: `placement_${p.state.toLowerCase()}` };
+            p = await renewLease(c, p, new Date(now().getTime() - s.lastInputAgoMs));
+            const { limit } = await reconcileOwn(c, p, cfg.deployments, cfg.e);
+            return limit ? { ok: false, error: limit } : { ok: true };
+        },
         restart: async () => ({ ok: false, outcome: 'aws_not_supported', error: 'aws_not_supported' }),
         /**
          * computer.delete (§6, R11). ok only once nothing can still run: no placement
@@ -528,7 +596,8 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             const found = await ownPlacement(c);
             if (!found) return { ok: true, terminated: true, outcome: 'no_placement' };
             if (found.provider !== 'aws-ec2') return { ok: false, terminated: false, outcome: 'provider_mismatch', error: 'provider_mismatch' };
-            const p = await reconcileOwn(c, found, cfg.deployments);
+            // A delete retires whatever the lease says: no session-limit stop first.
+            const p = (await reconcileOwn(c, found, cfg.deployments, cfg.e, false)).placement;
             if (p.state === 'RETIRED' || p.state === 'PURGE_ELIGIBLE') return { ok: true, terminated: true, outcome: 'retired' };
             if (p.state === 'RUNNING' || p.state === 'STOPPED') {
                 if (!deps.starter) return { ok: false, terminated: false, outcome: 'aws_lifecycle_unconfigured', error: 'aws_lifecycle_unconfigured' };
