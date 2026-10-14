@@ -395,8 +395,13 @@ These are interim or prototype:
   experiment showed that only an idmapped lower with a plain upper boots, and it shifts
   on-disk ownership. Decide before the first user.
 - **Production networking:** exercised only in disposable namespaces, not on a real EC2
-  host. The cloudflared ingress mapping to the desktop and the control socket belongs to
-  the gateway lane and does not exist yet.
+  host. The gateway now exists as `ezil_host/edge.py` (`ezil-edge.service`), built to
+  GATEWAY-CONTRACT-v1: cloudflared's tunnel ingress (set by the Worker) points at
+  127.0.0.1:18080; the edge verifies `x-ezil-gw` gw1 against `control.key` and the lease,
+  forwards `/__p/<port>` to the desktop's exposed ports, relays presence (every verified
+  request, every 30 s per open WebSocket) and `/__ezil/control/stop|fence` to the agent
+  socket, and is the socket's only client (it owns `seq`). Exercised in a disposable netns
+  (`test-edge.sh`), not yet through a real tunnel.
 - **Enrollment response shape** `{tunnelToken, controlKey}` and the HMAC control
   protocol are defined here and need the app and gateway lanes to adopt them.
 - **Stop outcome to the control plane.** `lastStop` is only in the boot log for now. The

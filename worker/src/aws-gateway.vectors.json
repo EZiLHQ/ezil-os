@@ -1,0 +1,111 @@
+{
+  "description": "AWS gateway gw1 shared test vectors (reports/2026-10-14-aws-azure-first-lead/GATEWAY-CONTRACT-v1.md GW-2). Read by worker/src/aws-origin.test.ts (signer) and infra/host-agent/test/test_edge.py (verifier). Regenerate only with a contract change.",
+  "controlKeyBase64": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+  "payloadFormat": "gw1|ts|computerId|generation|leaseEpoch|METHOD|path",
+  "headerFormat": "gw1.<ts unix seconds>.<hex hmac_sha256(controlKey raw bytes, payload)>",
+  "header": "x-ezil-gw",
+  "skewSeconds": {
+    "past": 120,
+    "future": 5
+  },
+  "valid": [
+    {
+      "name": "desktop-root-get",
+      "ts": 1791964800,
+      "computerId": "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b",
+      "generation": 1,
+      "leaseEpoch": 2,
+      "method": "GET",
+      "path": "/__p/8181/",
+      "payload": "gw1|1791964800|0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b|1|2|GET|/__p/8181/",
+      "header": "gw1.1791964800.59e8891558472b46550735ac68bbd396405975eb0d596f71074522d8c0bb336d"
+    },
+    {
+      "name": "desktop-ws-upgrade",
+      "ts": 1791964801,
+      "computerId": "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b",
+      "generation": 1,
+      "leaseEpoch": 2,
+      "method": "GET",
+      "path": "/__p/8181/api/ws",
+      "payload": "gw1|1791964801|0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b|1|2|GET|/__p/8181/api/ws",
+      "header": "gw1.1791964801.411b527d9687873d33b11165364ab9bebf1dcaa383b7515d833d9f1716d0682d"
+    },
+    {
+      "name": "code-post",
+      "ts": 1791964802,
+      "computerId": "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b",
+      "generation": 3,
+      "leaseEpoch": 7,
+      "method": "POST",
+      "path": "/__p/8443/vscode/api/file",
+      "payload": "gw1|1791964802|0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b|3|7|POST|/__p/8443/vscode/api/file",
+      "header": "gw1.1791964802.86b7367a3886d0c90a87546fea8a1871f70c38d75c5b8578274c0823dc503e16"
+    },
+    {
+      "name": "control-stop",
+      "ts": 1791964803,
+      "computerId": "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b",
+      "generation": 1,
+      "leaseEpoch": 2,
+      "method": "POST",
+      "path": "/__ezil/control",
+      "payload": "gw1|1791964803|0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b|1|2|POST|/__ezil/control",
+      "header": "gw1.1791964803.1ebd493a2388187db5e4959348f9c69860f3fe7541c2058621b1cd600973fb55"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "path-tampered",
+      "present": {
+        "ts": 1791964800,
+        "computerId": "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b",
+        "generation": 1,
+        "leaseEpoch": 2,
+        "method": "GET",
+        "path": "/__p/8443/"
+      },
+      "header": "gw1.1791964800.59e8891558472b46550735ac68bbd396405975eb0d596f71074522d8c0bb336d",
+      "error": "gw_bad_mac"
+    },
+    {
+      "name": "epoch-tampered",
+      "present": {
+        "ts": 1791964800,
+        "computerId": "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b",
+        "generation": 1,
+        "method": "GET",
+        "path": "/__p/8181/",
+        "leaseEpoch": 3
+      },
+      "header": "gw1.1791964800.59e8891558472b46550735ac68bbd396405975eb0d596f71074522d8c0bb336d",
+      "error": "gw_bad_mac"
+    },
+    {
+      "name": "method-tampered",
+      "present": {
+        "ts": 1791964800,
+        "computerId": "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b",
+        "generation": 1,
+        "leaseEpoch": 2,
+        "path": "/__p/8181/",
+        "method": "POST"
+      },
+      "header": "gw1.1791964800.59e8891558472b46550735ac68bbd396405975eb0d596f71074522d8c0bb336d",
+      "error": "gw_bad_mac"
+    },
+    {
+      "name": "malformed",
+      "present": {
+        "ts": 1791964800,
+        "computerId": "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b",
+        "generation": 1,
+        "leaseEpoch": 2,
+        "method": "GET",
+        "path": "/__p/8181/"
+      },
+      "header": "gw1.1791964800.zz",
+      "error": "gw_malformed"
+    }
+  ]
+}

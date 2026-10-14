@@ -1,7 +1,7 @@
 [Unit]
 Description=EZiL: cloudflared supervisor (per-epoch tunnel; fence stops it and wipes the token)
-Requires=ezil-enroll.service
-After=ezil-enroll.service
+Requires=ezil-enroll.service ezil-edge.service
+After=ezil-enroll.service ezil-edge.service
 [Service]
 Type=simple
 Environment=EZIL_HOST_CONFIG=/etc/ezil-host/agent.json

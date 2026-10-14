@@ -27,6 +27,9 @@ from ezil_host.fsops import Refused  # noqa: E402
 BASH = shutil.which("bash")
 
 
+HOST_NS = os.readlink(f"/proc/{os.getpid()}/ns/pid")
+
+
 def env_list_to_dict(env):
     return dict(e.split("=", 1) for e in env)
 
@@ -202,7 +205,7 @@ class HangupBeforeStop(unittest.TestCase):
             sh.run("sleep 30 # ezil-unit-running")
             time.sleep(0.5)
             self.assertNotIn("ezil-unit-running", sh.history())
-            n = desktop.hangup_shells(self.cfg, settle=5.0, pids=[sh.pid])
+            n = desktop.hangup_shells(self.cfg, settle=5.0, pids=[sh.pid], scope=HOST_NS)
             self.assertEqual(n, 1)
             self.assertTrue(sh.wait_exit(5), "hung-up shell must exit")
             self.assertIn("sleep 30 # ezil-unit-running", sh.history())
@@ -218,13 +221,80 @@ class HangupBeforeStop(unittest.TestCase):
             time.sleep(0.3)
             self.assertEqual(desktop._proc_shell_on_tty(script.pid), ("bash", 0), "precondition: a real bash with no tty")
             self.assertEqual(desktop._proc_shell_on_tty(cat_pid)[0], "cat")
-            n = desktop.hangup_shells(self.cfg, settle=0.5, pids=[script.pid, cat_pid, 999999999])
+            n = desktop.hangup_shells(self.cfg, settle=0.5, pids=[script.pid, cat_pid, 999999999], scope=HOST_NS)
             self.assertEqual(n, 0)
             self.assertTrue(script.alive())
             self.assertEqual(os.waitpid(cat_pid, os.WNOHANG)[0], 0)
         finally:
             script.popen.kill(); script.popen.wait()
             os.kill(cat_pid, signal.SIGKILL); os.waitpid(cat_pid, 0); os.close(cat_fd)
+
+
+@unittest.skipUnless(BASH, "bash required")
+class HangupScope(unittest.TestCase):
+    """The pid -> pidfd race: membership is re-checked after the pin (container pid ns)."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="ezil-hist-unit-")
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.cfg = config.Config(json.loads(json.dumps(config.DEFAULTS)))
+
+    def test_a_terminal_shell_outside_the_container_namespace_is_never_hung_up(self):
+        sh = Shell(self.home)                 # a real bash on a tty, but in the HOST pid ns
+        try:
+            time.sleep(0.3)
+            n = desktop.hangup_shells(self.cfg, settle=0.5, pids=[sh.pid], scope="pid:[1]")
+            self.assertEqual(n, 0)
+            self.assertTrue(sh.alive(), "a host shell (e.g. a recycled pid) must not get SIGHUP")
+        finally:
+            sh.kill()
+
+    def test_membership_is_read_after_the_pidfd_pin(self):
+        sh = Shell(self.home)
+        order = []
+        real_open, real_ns = os.pidfd_open, desktop._pid_ns
+        try:
+            time.sleep(0.3)
+            with mock.patch.object(desktop.os, "pidfd_open", side_effect=lambda p: (order.append("pin"), real_open(p))[1]), \
+                 mock.patch.object(desktop, "_pid_ns", side_effect=lambda p: (order.append("ns"), real_ns(p))[1]):
+                n = desktop.hangup_shells(self.cfg, settle=5.0, pids=[sh.pid], scope=HOST_NS)
+            self.assertEqual(n, 1)
+            self.assertEqual(order[:2], ["pin", "ns"], "the namespace must be checked on the pinned process")
+        finally:
+            sh.kill()
+
+    def test_no_container_means_nothing_is_signalled(self):
+        sh = Shell(self.home)
+        try:
+            time.sleep(0.3)
+            with mock.patch.object(desktop, "container_scope", return_value=None):
+                self.assertEqual(desktop.hangup_shells(self.cfg, settle=0.5, pids=[sh.pid]), 0)
+            self.assertTrue(sh.alive())
+        finally:
+            sh.kill()
+
+    def test_no_scope_and_unreadable_namespace_never_match(self):
+        # None == None must not count as membership: with the container gone and a pid whose
+        # /proc/<pid>/ns/pid cannot be read, nothing is signalled.
+        sh = Shell(self.home)
+        try:
+            time.sleep(0.3)
+            with mock.patch.object(desktop, "container_scope", return_value=None), \
+                 mock.patch.object(desktop, "_pid_ns", return_value=None):
+                self.assertEqual(desktop.hangup_shells(self.cfg, settle=0.5, pids=[sh.pid]), 0)
+            self.assertTrue(sh.alive())
+        finally:
+            sh.kill()
+
+    def test_container_scope_is_the_init_pid_namespace(self):
+        class R:
+            def __init__(self, rc, out):
+                self.returncode, self.stdout = rc, out
+        with mock.patch.object(desktop, "runc", return_value=R(0, json.dumps({"pid": os.getpid()}))):
+            self.assertEqual(desktop.container_scope(self.cfg), HOST_NS)
+        for r in (R(1, ""), R(0, json.dumps({"pid": 1})), R(0, json.dumps({"pid": True})), R(0, "not json")):
+            with mock.patch.object(desktop, "runc", return_value=r):
+                self.assertIsNone(desktop.container_scope(self.cfg))
 
 
 class StopOutcome(unittest.TestCase):

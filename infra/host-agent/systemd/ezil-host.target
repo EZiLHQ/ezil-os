@@ -1,4 +1,4 @@
 [Unit]
 Description=EZiL AWS computer host (I4)
-Wants=ezil-agent.service ezil-cloudflared.service
-After=ezil-agent.service ezil-cloudflared.service
+Wants=ezil-agent.service ezil-edge.service ezil-cloudflared.service
+After=ezil-agent.service ezil-edge.service ezil-cloudflared.service
