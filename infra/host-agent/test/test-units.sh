@@ -81,6 +81,7 @@ c=config.DEFAULTS['userDataCopies']
 assert '/var/lib/cloud/instances/*/obj.pkl' in c and '/run/cloud-init/instance-data-sensitive.json' in c and '/var/lib/cloud/instances/*/user-data.txt.i' in c"
 pyunit() { (cd "$HA/test" && python3 -m unittest -q "$@"); }
 check "canary: default off, public console schema, persistence and lifecycle ordering" pyunit test_canary
+check "enroll: the app's browser-host binding (sandboxId, zone) lands in the lease; a malformed one stores nothing" pyunit test_enroll_routing
 check "history: env + read-only profile.d make an open terminal append each command (real pty bash)" pyunit test_history_stop.HistoryInjection
 check "history: a still-running command is saved when the terminal shell is hung up before the stop" pyunit test_history_stop.HangupBeforeStop
 check "hangup: a shell outside the container pid namespace is never signalled; membership read after the pidfd pin" pyunit test_history_stop.HangupScope

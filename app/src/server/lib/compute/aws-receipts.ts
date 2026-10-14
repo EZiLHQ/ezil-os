@@ -142,7 +142,7 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         // No tunnel client = nothing to fence: the stop still completes.
         if (deps.tunnels) {
             const fenced = await deps.tunnels
-                .deleteTunnel({ userId: p.ownerUserId }, { computerId: p.computerId.toLowerCase(), sandboxId: awsSandboxId(p.computerId), generation: p.generation, leaseEpoch: p.leaseEpoch })
+                .deleteTunnel({ userId: p.ownerUserId }, { computerId: p.computerId.toLowerCase(), sandboxId: awsSandboxId(p.ownerUserId, p.computerId), generation: p.generation, leaseEpoch: p.leaseEpoch })
                 .catch(() => ({ ok: false }));
             if (!fenced.ok) return;
         }

@@ -40,6 +40,8 @@ check "cloud-init per-instance copies wiped (user-data.txt, .i, obj.pkl, instanc
 check "cloud-init's other state untouched (sem/, datasource)" bash -c "[ -e '$H/cloud/instances/i-0abc/sem/config_x' ] && [ -e '$H/cloud/instances/i-0abc/datasource' ]"
 check "no copy of the nonce left anywhere on the host test tree" bash -c "! grep -rqs -- \"\$(jq -r .nonce '$H/stub/user-data')\" '$H/cloud' '$H/run' '$H/state'"
 check "nonce wiped from local lease state after use" jq -e '(has("nonce")|not) and .nonceConsumed' "$H/run/lease.json"
+check "the edge's browser-host binding (sandboxId, zone) recorded in the lease, still 0600" \
+    bash -c "jq -e '.sandboxId==\"guac-a-b\" and .zone==\"preview.example.org\" and .nonceConsumed' '$H/run/lease.json' && [ \$(stat -c %a '$H/run/lease.json') = 600 ]"
 tls_probe() { python3 -c "
 import sys; sys.path.insert(0, '$HA/lib')
 from ezil_host import http

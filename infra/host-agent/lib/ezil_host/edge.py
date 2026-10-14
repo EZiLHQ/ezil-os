@@ -318,11 +318,14 @@ class Edge:
                         "leaseEpoch": lease["leaseEpoch"]}
         sandbox_id = cfg.get("sandboxId") or lease.get("sandboxId")
         zone = cfg.get("zone") or lease.get("zone")
-        # These fields are trusted configuration, never inferred from a request.
+        # These fields are trusted configuration (enrollment writes them into the lease),
+        # never inferred from a request. Browser hosts are the Worker's
+        # `aws-<port>-<sandboxId>-aws.<zone>` (worker/src/aws-origin.ts): the fixed `-aws`
+        # suffix is what the Worker's narrow route claims.
         self.browser_host_re = None
         if isinstance(sandbox_id, str) and sandbox_id and isinstance(zone, str) and zone:
             self.browser_host_re = re.compile(
-                r"aws-(8181|8080|3002|8443)-" + re.escape(sandbox_id) + r"\." + re.escape(zone))
+                r"aws-(8181|8080|3002|8443)-" + re.escape(sandbox_id) + r"-aws\." + re.escape(zone))
         self._ws_lock = threading.Lock()
         self._websockets = 0
 

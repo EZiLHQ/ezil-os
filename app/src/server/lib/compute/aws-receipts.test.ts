@@ -47,6 +47,7 @@ const env = (over: Record<string, string> = {}) => ({
     [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ 'ap-south-1': D }),
     EZIL_AWS_ENROLL_URL: 'https://app.example.test/api/compute/aws/enroll',
     [AWS_IDENTITY_CERTS_ENV]: JSON.stringify({ 'ap-south-1': fx.cert_rsa }),
+    EZIL_AWS_BROWSER_ZONE: 'ezil.org',
     ...over,
 });
 
@@ -290,7 +291,7 @@ describe('stop receipts', () => {
         const { status, placements, deleted } = setup([stopping()], { status: 'SUCCEEDED', output: receiptOf({ state: 'stopped' }) });
         expect(await status()).toMatchObject({ state: 'stopped', placementState: 'STOPPED' });
         expect(placements[0]).toMatchObject({ lifecycle_job_id: null });
-        expect(deleted).toEqual([{ owner: { userId: U1 }, req: { computerId: C1, sandboxId: 'c1c1c1c1c1c14c1c', generation: 2, leaseEpoch: 3 } }]);
+        expect(deleted).toEqual([{ owner: { userId: U1 }, req: { computerId: C1, sandboxId: 'guac-1111111111114111-c1c1c1c1c1c14c1c', generation: 2, leaseEpoch: 3 } }]);
     });
 
     it('keeps a failed tunnel fence pending and retries on the next poll', async () => {

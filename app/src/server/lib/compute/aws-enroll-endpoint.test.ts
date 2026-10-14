@@ -8,6 +8,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+    AWS_BROWSER_ZONE_ENV,
     awsSandboxId,
     createWorkerTunnelClient,
     handleAwsEnrollment,
@@ -21,11 +22,13 @@ import {
 import { AWS_IDENTITY_CERTS_ENV } from './aws-identity';
 import { LIFECYCLE_DEPLOYMENTS_ENV } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
+import { applyLifecycleReceipt, lifecycleExecutionArn } from './aws-receipts';
 import fx from './aws-identity.fixtures.json';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { readPlacement } from './placement';
 import * as placement from './placement';
 import { mintPreviewTokenV2 } from './preview-token-v2';
+import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const C1 = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
@@ -42,8 +45,11 @@ const env = (over: Record<string, string> = {}) => ({
     EZIL_AWS_COMPUTERS_ENABLED: '1',
     [AWS_IDENTITY_CERTS_ENV]: JSON.stringify({ 'ap-south-1': fx.cert_rsa }),
     [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ 'ap-south-1': fixtureDeployment('ap-south-1', TYPES) }),
+    [AWS_BROWSER_ZONE_ENV]: 'ezil.org',
     ...over,
 });
+/** The Worker's routable form (worker/src/aws-origin.ts SANDBOX_ID). */
+const SID = 'guac-1111111111114111-c1c1c1c1c1c14c1c';
 
 /** A replace boot (generation 2, epoch 3) waiting for its host. */
 const booting = (over: Record<string, unknown> = {}) =>
@@ -110,19 +116,23 @@ describe('a valid enrollment', () => {
     it('200 {tunnelToken, controlKey}; the nonce is cleared and the verified instance + volume recorded; GW-1 called once', async () => {
         const { enroll, placements, tunnels, described } = setup();
         const r = await enroll();
-        expect(r).toEqual({ status: 200, body: { tunnelToken: TOKEN, controlKey: KEY.toString('base64') } });
+        expect(r).toEqual({ status: 200, body: { tunnelToken: TOKEN, controlKey: KEY.toString('base64'), sandboxId: SID, zone: 'ezil.org' } });
         expect(placements[0]).toMatchObject({ enroll_nonce_hash: null, enroll_expires_at: null, instance_id: DOC.instanceId, volume_id: 'vol-11111111111111111', state: 'STARTING', last_error: placement.ENROLLMENT_SUCCEEDED });
         expect(described).toEqual([{ region: 'ap-south-1', instanceId: DOC.instanceId }]);
         expect(tunnels).toEqual([
             {
                 owner: { userId: U1 },
                 request: {
-                    computerId: C1, sandboxId: awsSandboxId(C1), generation: 2, leaseEpoch: 3, instanceId: DOC.instanceId, region: 'ap-south-1', publicIp: '13.0.0.5',
+                    computerId: C1, sandboxId: SID, generation: 2, leaseEpoch: 3, instanceId: DOC.instanceId, region: 'ap-south-1', publicIp: '13.0.0.5',
                     controlKey: KEY.toString('base64'),
                 },
             },
         ]);
-        expect(awsSandboxId(C1)).toBe('c1c1c1c1c1c14c1c');
+        // Codex PR #200: the Worker's tunnel route accepts only `guac-<user>-<computer>` ids, and the
+        // preview path derives the same one, so the tunnel and the browser name one sandbox.
+        expect(awsSandboxId(U1, C1)).toBe(SID);
+        expect(SID).toMatch(/^guac-[a-z0-9]{1,16}-[a-z0-9]{1,16}$/);
+        expect(awsSandboxId(U1.toUpperCase(), C1.toUpperCase())).toBe(deriveGuacamoleSandboxId(U1, C1));
     });
 
     it('works once: a second enrollment for the same epoch is refused and opens no tunnel', async () => {
@@ -289,6 +299,26 @@ describe('every refusal changes nothing (nonce kept, no tunnel)', () => {
     });
 });
 
+describe('the browser zone the host is told (EZIL_AWS_BROWSER_ZONE)', () => {
+    it.each([undefined, '', 'EZIL.ORG', 'org', 'ezil..org', '-ezil.org', 'ezil.org.', 'a/b.org', '10.0.0.1', 'https://ezil.org'])(
+        '%j: 503 before anything changes (nonce intact, no tunnel)',
+        async (zone) => {
+            const e = env();
+            if (zone === undefined) delete (e as Record<string, string>)[AWS_BROWSER_ZONE_ENV];
+            else e[AWS_BROWSER_ZONE_ENV] = zone;
+            const { enroll, placements, tunnels } = setup([booting()], { e });
+            expect(await enroll()).toEqual({ status: 503, body: { error: 'enroll_unavailable' } });
+            expect(placements[0]).toMatchObject({ enroll_nonce_hash: nonceHashOf(NONCE), instance_id: null });
+            expect(tunnels).toEqual([]);
+        },
+    );
+
+    it('a valid zone is returned verbatim with the routable sandbox id', async () => {
+        const { enroll } = setup([booting()], { e: env({ [AWS_BROWSER_ZONE_ENV]: ' ezil.work ' }) });
+        expect((await enroll()).body).toMatchObject({ sandboxId: SID, zone: 'ezil.work' });
+    });
+});
+
 describe('after the nonce is consumed', () => {
     it('a tunnel failure is non-200, the nonce stays consumed, and no control key is returned', async () => {
         const { enroll, placements } = setup([booting()], { tunnel: async () => ({ ok: false, status: 409, code: 'tunnel_exists' }) });
@@ -316,12 +346,52 @@ describe('after the nonce is consumed', () => {
         expect(await s.enroll()).toEqual({ status: 409, body: { error: 'enroll_conflict' } });
         expect(s.placements[0]).toMatchObject({ last_error: placement.ENROLLMENT_PENDING, enroll_nonce_hash: null });
     });
+
+    // Codex PR #200: the shell's status poll can apply the boot's receipt (STARTING → MOUNTING,
+    // job cleared) while createTunnel is in flight. Completion must still succeed: the host
+    // discards its nonce on any answer, so a 409 here would strand the boot.
+    it('receipt progress (STARTING → MOUNTING) during createTunnel still completes: 200, then RUNNING', async () => {
+        const JOB = 'ababab00-abab-4bab-8bab-abababababab';
+        const DIGEST = 'd'.repeat(64);
+        const deployment = fixtureDeployment('ap-south-1', TYPES);
+        const s = setup([booting({ lifecycle_job_id: JOB, lifecycle_digest: DIGEST })]);
+        const executions = {
+            async describe(_region: string, arn: string) {
+                expect(arn).toBe(lifecycleExecutionArn(deployment, JOB));
+                return {
+                    status: 'SUCCEEDED',
+                    output: JSON.stringify({
+                        schemaVersion: 1, jobId: JOB, digest: DIGEST, computerId: C1, generation: 2, leaseEpoch: 3, fenceToken: FENCE,
+                        instanceId: DOC.instanceId, volumeId: 'vol-11111111111111111', state: 'running',
+                    }),
+                };
+            },
+        };
+        const poll = async () => {
+            const { record } = await readPlacement(s.db, C1);
+            await applyLifecycleReceipt({ db: s.db, executions }, record!, deployment);
+        };
+        s.deps.tunnels = {
+            createTunnel: async () => {
+                await poll();
+                expect(s.placements[0]).toMatchObject({ state: 'MOUNTING', lifecycle_job_id: null, last_error: placement.ENROLLMENT_PENDING });
+                return { ok: true, tunnelToken: TOKEN };
+            },
+            deleteTunnel: async () => ({ ok: true }),
+        };
+        const r = await s.enroll();
+        expect(r.status).toBe(200);
+        expect(r.body).toMatchObject({ tunnelToken: TOKEN, controlKey: KEY.toString('base64') });
+        expect(s.placements[0]).toMatchObject({ state: 'MOUNTING', last_error: placement.ENROLLMENT_SUCCEEDED, enroll_nonce_hash: null });
+        await poll();
+        expect(s.placements[0]).toMatchObject({ state: 'RUNNING', last_error: placement.ENROLLMENT_SUCCEEDED });
+    });
 });
 
 describe('createWorkerTunnelClient (GW-1 over HTTPS)', () => {
     const SECRET = 's'.repeat(32);
     const req: TunnelRequest = {
-        computerId: C1, sandboxId: awsSandboxId(C1), generation: 2, leaseEpoch: 3, instanceId: DOC.instanceId, region: 'ap-south-1', publicIp: '13.0.0.5', controlKey: KEY.toString('base64'),
+        computerId: C1, sandboxId: SID, generation: 2, leaseEpoch: 3, instanceId: DOC.instanceId, region: 'ap-south-1', publicIp: '13.0.0.5', controlKey: KEY.toString('base64'),
     };
 
     it('POSTs the exact body to /internal/aws/tunnels with a v2 aws-ec2 envelope bound to the body', async () => {

@@ -19,6 +19,7 @@ import { z } from 'zod';
 import { isAwsComputersEnabled, type Env as AwsEnv } from './aws-config';
 import { readIdentityCertificate, verifyIdentitySignature } from './aws-identity';
 import { readLifecycleDeployments } from './aws-intent';
+import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
 import { consumeEnrollmentNonce, ENROLLABLE_STATES, finishEnrollment, readPlacement, type Placement, type PlacementDb } from './placement';
 import { mintPreviewTokenV2 } from './preview-token-v2';
 
@@ -139,9 +140,31 @@ export interface TunnelClient {
 /** GW-1 path on the Worker. */
 export const TUNNELS_PATH = '/internal/aws/tunnels';
 
-/** GATEWAY-CONTRACT-v1: the first 16 alphanumerics of the computer id (lower case). */
-export function awsSandboxId(computerId: string): string {
-    return computerId.replace(/[^a-z0-9]/gi, '').slice(0, 16).toLowerCase();
+/**
+ * The Worker's routable sandbox id, `guac-<user16>-<computer16>` (worker/src/aws-origin.ts
+ * `isRoutableSandboxId`): the SAME derivation as the Cloudflare path and `aws-preview.ts`,
+ * so the tunnel, the preview token and the browser host all name one sandbox. Ids are
+ * lower-cased first: the Worker accepts lower case only, and placement ids are canonical.
+ */
+export function awsSandboxId(ownerUserId: string, computerId: string): string {
+    return deriveGuacamoleSandboxId(ownerUserId.toLowerCase(), computerId.toLowerCase());
+}
+
+/**
+ * The zone the Worker serves AWS browser hosts on (`aws-<port>-<sandboxId>-aws.<zone>`,
+ * worker/src/aws-origin.ts), e.g. `ezil.org`. The host's edge trusts `x-forwarded-host`
+ * only when it is one of those hosts, so enrollment hands the host this value and its
+ * sandbox id. Explicit configuration, never derived from a request: unset or malformed
+ * means enrollment is unavailable.
+ */
+export const AWS_BROWSER_ZONE_ENV = 'EZIL_AWS_BROWSER_ZONE';
+const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+export function readAwsBrowserZone(env: AwsEnv): string | null {
+    const zone = env[AWS_BROWSER_ZONE_ENV]?.trim();
+    if (!zone || zone.length > 253) return null;
+    const labels = zone.split('.');
+    return labels.length >= 2 && labels.every((l) => DNS_LABEL.test(l)) && !/^\d+$/.test(labels.at(-1)!) ? zone : null;
 }
 
 /**
@@ -288,7 +311,8 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     // The signed identity document, against the region's configured AWS certificate.
     const cert = readIdentityCertificate(deps.env, p.region);
     const deployments = readLifecycleDeployments(deps.env, [p.region]);
-    if (!cert || !deployments.ok) return refuse(503, 'enroll_unavailable');
+    const browserZone = readAwsBrowserZone(deps.env);
+    if (!cert || !deployments.ok || !browserZone) return refuse(503, 'enroll_unavailable');
     const deployment = deployments.deployments[p.region]!;
     const signature = verifyIdentitySignature(body.identityDocument, body.signature, cert, now);
     if (!signature.ok) return refuse(403, signature.reason);
@@ -361,13 +385,14 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     }
     if (!consumed) return refuse(503, 'enroll_conflict');
     const keyB64 = controlKey.toString('base64');
+    const sandboxId = awsSandboxId(p.ownerUserId, p.computerId);
     let tunnel: TunnelResult;
     try {
         tunnel = await deps.tunnels.createTunnel(
             { userId: p.ownerUserId },
             {
                 computerId: p.computerId.toLowerCase(),
-                sandboxId: awsSandboxId(p.computerId),
+                sandboxId,
                 generation: p.generation,
                 leaseEpoch: p.leaseEpoch,
                 instanceId: doc.instanceId,
@@ -382,5 +407,6 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     const finished = await finishEnrollment(deps.db, { computerId: p.computerId, expected: consumed, success: tunnel.ok });
     if (!tunnel.ok) return refuse(502, 'tunnel_unavailable');
     if (!finished.ok) return refuse(409, 'enroll_conflict');
-    return { status: 200, body: { tunnelToken: tunnel.tunnelToken, controlKey: keyB64 } };
+    // sandboxId + zone let the host's edge recognise its own browser hosts (edge.py).
+    return { status: 200, body: { tunnelToken: tunnel.tunnelToken, controlKey: keyB64, sandboxId, zone: browserZone } };
 }
