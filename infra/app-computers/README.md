@@ -80,6 +80,27 @@ types": free computers must be cheap. The cost of that choice is the T3 baseline
 build session on a free computer slows down when its credits are spent, and it stays slow rather
 than adding to the bill.
 
+**Changing tier (upgrade or downgrade).** A stopped computer changes tier through the existing
+`replace` intent, carrying the new tier's `instanceType`:
+- stop, then terminate the disposable root;
+- run a new instance of the new type (T types with standard credits);
+- retag and re-attach the **same** retained data volume, at generation + 1.
+
+It is never a `ModifyInstanceAttribute` instance-type change; the boundary denies that outright.
+`lifecycle.test.ts` ("tier change") proves t3a.medium → m6i.large and m6i.large → t3a.medium on
+the same volume.
+
+Not built yet:
+- **App.** The app must issue that `replace` with the new type, record it on the placement, and
+  mint the new generation's enrollment `userData` (A1/A3).
+- **Volume growth.** `dataVolumeGiB` applies at provision only, and there is no capped
+  `ModifyVolume` step and no host filesystem grow. An upgraded computer keeps its free-tier
+  data-volume size until that step exists.
+- **No shrink.** A downgrade cannot shrink a volume; a grown volume stays inside
+  `[dataMinGiB, dataMaxGiB]` and keeps costing its size.
+- **Capacity fallback within a tier.** The workflow ends a capacity refusal with its code. The
+  app must retry with the tier's next type (for example t3a.medium → t3.medium) as a new intent.
+
 Existing volumes are accepted anywhere in `[dataMinGiB, dataMaxGiB]`, so a volume grown online
 still validates. The intent also carries `instanceType`, which must be in the deployment
 allowlist. The file holds **no secret values**: the authority secret is referenced by ARN only.
@@ -381,14 +402,27 @@ A role CI plants under `/ezil/<ns>/` inherits exactly this ceiling, so every all
   - A launch may go only into namespace-tagged subnets, security groups and launch templates.
     AMIs are not tag-scoped; the controller pins the AMI ID.
   - A volume can be restored only from a snapshot tagged `ezil:backup=<ns>`.
-  - Start, stop, terminate, attach and modify need the compute resource tags.
+  - Start, stop, terminate and attach need the compute resource tags.
+  - **No attribute change after launch.** `ec2:ModifyInstanceAttribute` is denied outright
+    (`NoModifyInstanceAttribute`), so no bounded role can stop a computer, change its instance
+    type and start it past the launch-time type cap. With `userDataAttributeKeyVerified: true`
+    in the identity config (set it only together with the lifecycle's `userDataNonce` and
+    `userDataAttributeKeyVerified`, after the staging proof below), the only carve-out is
+    `ec2:Attribute` = `userData` on compute-tagged instances (`AllowUserDataOnlyOnManaged`);
+    any other or missing attribute is denied (`ModifyAttributeOnlyUserData`,
+    `ModifyAttributeKeyRequired`).
   - **Cost caps**, duplicated from the controller so a planted role is bounded too:
-    - launches only with `ec2:InstanceType` in {m6i.large, c6i.xlarge}
+    - launches only with `ec2:InstanceType` in {t3a.medium, t3.medium, m6i.large, c6i.xlarge}
     - volumes only gp3, encrypted, and at most `maxVolumeGiB` (identity config, default 100)
-- **No alarm actions.** `NoAlarmAutomation` denies `PutMetricAlarm` and `PutCompositeAlarm` when
-  `cloudwatch:AlarmActions` names `arn:aws:automate:*` or `arn:aws:ssm*`, and `NoAlarmActions`
-  denies any alarm action at all. Alarms with actions live only in the founder-deployed ops
-  stack.
+- **No alarm actions (alarm-action list only, verified in code; OK and INSUFFICIENT_DATA
+  lists UNVERIFIED).** `NoAlarmAutomation` denies `PutMetricAlarm` and `PutCompositeAlarm`
+  when `cloudwatch:AlarmActions` names `arn:aws:automate:*` or `arn:aws:ssm*`, and
+  `NoAlarmActions` denies any request that carries `cloudwatch:AlarmActions`. Both key only on
+  `cloudwatch:AlarmActions`. Whether AWS also populates that key for `OKActions` and
+  `InsufficientDataActions` is not yet proven: an alarm whose only actions are OK or
+  INSUFFICIENT_DATA actions may not be denied. That is the "Alarm-action key" staging proof
+  below; until it passes, do not rely on these denies for those two lists. Alarms with actions
+  live only in the founder-deployed ops stack.
 - **No adoption.** `CreateTags` is allowed only on create (`ec2:CreateAction`) or on resources
   that already carry the namespace or compute tags, so a foreign resource can never be tagged
   into the namespace.
@@ -476,11 +510,12 @@ Both are capped by the boundary. Today the account is empty in the pilot region,
 | Use, re-policy or grant on a foreign KMS key | BLOCKED (tag-conditioned) | Only keys tagged `ezil:namespace=<ns>` (`AllowKmsOnNamespaceKeys`) |
 | Change foreign Lambda code, state machines, queues, rules, alarms | BLOCKED (`ezil-<ns>-*` names) | Only `ezil-<ns>-*` (`AllowNamespacedWorkloadResources`) |
 | Change sets on a foreign stack, or with another role | BLOCKED (deploy-role conditions) | Only `ezil-<ns>-*` stacks, only with the exec role (`AllowChangeSetsOnlyViaExec`) |
-| Terminate, start or modify a foreign instance | n/a (exec has no compute) | Only `managed-by` + `stage=<ns>` (`AllowComputeOnManaged`) |
+| Terminate or start a foreign instance | n/a (exec has no compute) | Only `managed-by` + `stage=<ns>` (`AllowComputeOnManaged`) |
+| Stop a managed instance, change its type (or any attribute) and start it | n/a | BLOCKED (`NoModifyInstanceAttribute`; with the userData flag on, only `ec2:Attribute=userData` is allowed) |
 | Mutate a foreign VPC, or create inside it | BLOCKED (tag conditions) | Only namespace-tagged network (`AllowEc2NetworkMutateTagged`, `AllowEc2CreateOnlyInNamespaceVpc`) |
 | Restore a volume from a foreign snapshot | n/a | Only `ezil:backup=<ns>` snapshots (`AllowRestoreNamespaceSnapshots`) |
 | Adopt a foreign resource by tagging it | BLOCKED (tag on create only) | BLOCKED (`AllowTagOnCreate`, retag only already-tagged; `BackupTagOnlyAtCreation`) |
-| Attach EC2 terminate/stop automation to an alarm on any instance | n/a (lifecycle alarms carry no actions) | BLOCKED (`NoAlarmAutomation`, `NoAlarmActions`) |
+| Attach EC2 terminate/stop automation to an alarm on any instance | n/a (lifecycle alarms carry no actions) | BLOCKED for the alarm-action list (`NoAlarmAutomation`, `NoAlarmActions`); OK / INSUFFICIENT_DATA lists unverified (staging proof) |
 | Launch large instances or huge volumes | n/a | BLOCKED (`AllowLaunchAllowlistedTypes`, `AllowCappedEncryptedGp3Volumes`) |
 | Read a foreign instance's userData | BLOCKED (`NoForeignInstanceAttributes`) | BLOCKED (same) |
 | Launch inside the namespace with any AMI | n/a | **Residual:** AMIs are not tag-scoped. The instance is still namespace-tagged, namespace-networked and bounded. |

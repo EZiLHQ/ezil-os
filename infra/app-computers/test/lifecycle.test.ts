@@ -208,6 +208,18 @@ test('tier map: free = t3a.medium then t3.medium (burstable), plus = m6i.large; 
         assert.equal(TierMapSchema.safeParse(bad).success,false,JSON.stringify(bad));
     assert.deepEqual(BURSTABLE_CREDITS,{CpuCredits:'standard'});
 });
+test('tier change: replace relaunches the disposable root with the NEW type on the retained data volume (never ModifyInstanceAttribute)',async()=>{
+    for(const [from,to] of [['t3a.medium','m6i.large'],['m6i.large','t3a.medium']] as const){
+        const f=lifecycleFixture('replace',{instanceType:to,instanceTypes:[...TIERED]});
+        f.state.instances[0]!.InstanceType=from;
+        const r=await run('replace',{fixture:f});assert.equal(r.error,undefined,`${from}->${to}`);
+        assert.deepEqual(r.calls.map(c=>c.action),['stopInstances','terminateInstances','runInstances','createTags','attachVolume']);
+        const launch=r.calls.find(c=>c.action==='runInstances')!.parameters;assert.equal(launch.InstanceType,to);
+        assert.equal('CreditSpecification' in launch,to==='t3a.medium');
+        assert.equal(r.receipt.volumeId,f.state.volumes[0]!.VolumeId);assert.equal(r.receipt.generation,f.i.targetGeneration);
+        assert.ok(!r.calls.some(c=>c.action==='modifyInstanceAttribute'));
+    }
+});
 test('a free-tier type outside the deployment allowlist is refused by the intent',()=>{
     const f=lifecycleFixture();
     assert.equal(LifecycleIntentSchema.safeParse({...f.i,instanceType:'t3a.medium'}).success,false,'default deployment lists no burstable type');

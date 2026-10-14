@@ -22,6 +22,13 @@ export const IdentityConfigSchema = z.object({
     killSwitch: z.boolean().default(false),
     /** Cost cap for any bounded principal: largest EBS volume it may create. */
     maxVolumeGiB: z.number().int().min(8).max(16384).default(DEFAULT_STORAGE.dataMaxGiB),
+    /** C-6 userData nonce delivery. Off (default): the boundary denies
+     * ec2:ModifyInstanceAttribute outright, so no bounded role can change an
+     * instance's type, disk flags or anything else after launch. On (set only
+     * together with the lifecycle's userDataNonce + userDataAttributeKeyVerified,
+     * after the README staging proof): allowed for ec2:Attribute=userData on
+     * compute-tagged instances, denied for any other or missing attribute. */
+    userDataAttributeKeyVerified: z.boolean().default(false),
 }).strict().superRefine((c, ctx) => {
     if (c.githubOidcProviderArn !== `arn:aws:iam::${c.accountId}:oidc-provider/token.actions.githubusercontent.com`)
         ctx.addIssue({ code: 'custom', path: ['githubOidcProviderArn'], message: 'must be this account\'s GitHub OIDC provider' });
@@ -179,8 +186,13 @@ export function boundaryStatements(c: IdentityConfig): iam.PolicyStatement[] {
         allow('AllowLaunchImages', ['ec2:RunInstances'], [`arn:aws:ec2:${r}::image/*`]),
         allow('AllowRestoreNamespaceSnapshots', ['ec2:CreateVolume'], [`arn:aws:ec2:${r}::snapshot/*`],
             { StringEquals: { 'aws:ResourceTag/ezil:backup': c.namespace } }),
-        allow('AllowComputeOnManaged', ['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances', 'ec2:AttachVolume',
-            'ec2:ModifyInstanceAttribute'], [ec2('instance'), ec2('volume')], { StringEquals: compute('Resource') }),
+        // R-ID F1: no ModifyInstanceAttribute here. Unconditioned, it let a planted
+        // role stop a tagged instance, change its InstanceType and start it,
+        // past the launch-time type cap above.
+        allow('AllowComputeOnManaged', ['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances', 'ec2:AttachVolume'],
+            [ec2('instance'), ec2('volume')], { StringEquals: compute('Resource') }),
+        ...(c.userDataAttributeKeyVerified ? [allow('AllowUserDataOnlyOnManaged', ['ec2:ModifyInstanceAttribute'], [ec2('instance')],
+            { StringEquals: { ...compute('Resource'), 'ec2:Attribute': 'userData' } })] : []),
         allow('AllowTagOnCreate', ['ec2:CreateTags'], ['*'], { StringEquals: { 'ec2:CreateAction': [...EC2_NETWORK_CREATES.map(x => x.slice(4)),
             'RunInstances', 'CreateVolume'] } }),
         allow('AllowRetagNamespaceNetwork', ['ec2:CreateTags'], ['*'], { StringEquals: nsTag('Resource') }),
@@ -212,6 +224,13 @@ export function boundaryStatements(c: IdentityConfig): iam.PolicyStatement[] {
             Null: { 'cloudwatch:AlarmActions': 'false' } } }),
         deny('NoForeignInstanceAttributes', ['ec2:DescribeInstanceAttribute'], { resources: [`arn:aws:ec2:${r}:${a}:instance/*`],
             conditions: { StringNotEquals: { 'aws:ResourceTag/ezil:stage': c.namespace } } }),
+        // Type, disk-flag and every other attribute change after launch is denied for
+        // every bounded role; only the flagged userData nonce write is carved out.
+        ...(c.userDataAttributeKeyVerified ? [
+            deny('ModifyAttributeOnlyUserData', ['ec2:ModifyInstanceAttribute'],
+                { conditions: { 'ForAnyValue:StringNotEquals': { 'ec2:Attribute': 'userData' } } }),
+            deny('ModifyAttributeKeyRequired', ['ec2:ModifyInstanceAttribute'], { conditions: { Null: { 'ec2:Attribute': 'true' } } }),
+        ] : [deny('NoModifyInstanceAttribute', ['ec2:ModifyInstanceAttribute'])]),
         ...(c.killSwitch ? [deny('KillSwitch', KILL_SWITCH_ACTIONS)] : []),
     ];
 }

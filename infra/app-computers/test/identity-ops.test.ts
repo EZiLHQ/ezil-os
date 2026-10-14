@@ -27,7 +27,7 @@ const BASIC = 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
 const EC2 = (kind: string) => `arn:aws:ec2:${R}:${A}:${kind}/*`;
 const NS = (k: string) => ({ [`aws:${k}Tag/ezil:namespace`]: 'pilot' });
 const COMPUTE = (k: string) => ({ [`aws:${k}Tag/ezil:managed-by`]: 'app-computer-platform', [`aws:${k}Tag/ezil:stage`]: 'pilot' });
-function expectedBoundary(killSwitch: boolean) {
+function expectedBoundary(killSwitch: boolean, userData = false) {
     const roleWrites = ['iam:CreateRole', 'iam:DeleteRole', 'iam:UpdateRole', 'iam:UpdateRoleDescription', 'iam:UpdateAssumeRolePolicy',
         'iam:PutRolePolicy', 'iam:DeleteRolePolicy', 'iam:AttachRolePolicy', 'iam:DetachRolePolicy', 'iam:PutRolePermissionsBoundary',
         'iam:TagRole', 'iam:UntagRole'];
@@ -79,7 +79,9 @@ function expectedBoundary(killSwitch: boolean) {
         { Sid: 'AllowRestoreNamespaceSnapshots', Effect: 'Allow', Action: 'ec2:CreateVolume', Resource: `arn:aws:ec2:${R}::snapshot/*`,
             Condition: { StringEquals: { 'aws:ResourceTag/ezil:backup': 'pilot' } } },
         { Sid: 'AllowComputeOnManaged', Effect: 'Allow', Action: ['ec2:StartInstances', 'ec2:StopInstances', 'ec2:TerminateInstances',
-            'ec2:AttachVolume', 'ec2:ModifyInstanceAttribute'], Resource: [EC2('instance'), EC2('volume')], Condition: { StringEquals: COMPUTE('Resource') } },
+            'ec2:AttachVolume'], Resource: [EC2('instance'), EC2('volume')], Condition: { StringEquals: COMPUTE('Resource') } },
+        ...(userData ? [{ Sid: 'AllowUserDataOnlyOnManaged', Effect: 'Allow', Action: 'ec2:ModifyInstanceAttribute', Resource: EC2('instance'),
+            Condition: { StringEquals: { ...COMPUTE('Resource'), 'ec2:Attribute': 'userData' } } }] : []),
         { Sid: 'AllowTagOnCreate', Effect: 'Allow', Action: 'ec2:CreateTags', Resource: '*', Condition: { StringEquals: { 'ec2:CreateAction': [
             'CreateVpc', 'CreateSubnet', 'CreateInternetGateway', 'CreateRouteTable', 'CreateSecurityGroup', 'CreateLaunchTemplate',
             'RunInstances', 'CreateVolume'] } } },
@@ -131,6 +133,12 @@ function expectedBoundary(killSwitch: boolean) {
             Condition: { Null: { 'cloudwatch:AlarmActions': 'false' } } },
         { Sid: 'NoForeignInstanceAttributes', Effect: 'Deny', Action: 'ec2:DescribeInstanceAttribute', Resource: EC2('instance'),
             Condition: { StringNotEquals: { 'aws:ResourceTag/ezil:stage': 'pilot' } } },
+        ...(userData ? [
+            { Sid: 'ModifyAttributeOnlyUserData', Effect: 'Deny', Resource: '*', Action: 'ec2:ModifyInstanceAttribute',
+                Condition: { 'ForAnyValue:StringNotEquals': { 'ec2:Attribute': 'userData' } } },
+            { Sid: 'ModifyAttributeKeyRequired', Effect: 'Deny', Resource: '*', Action: 'ec2:ModifyInstanceAttribute',
+                Condition: { Null: { 'ec2:Attribute': 'true' } } },
+        ] : [{ Sid: 'NoModifyInstanceAttribute', Effect: 'Deny', Resource: '*', Action: 'ec2:ModifyInstanceAttribute' }]),
         ...(killSwitch ? [{ Sid: 'KillSwitch', Effect: 'Deny', Resource: '*', Action: ['ec2:RunInstances', 'ec2:StartInstances',
             'ec2:AttachVolume', 'ec2:CreateVolume', 'ec2:CreateFleet', 'ec2:RequestSpot*', 'states:StartExecution', 'states:StartSyncExecution',
             'states:RedriveExecution', 'lambda:InvokeFunction', 'events:PutTargets'] }] : []),
@@ -152,6 +160,28 @@ test('I5 boundary: the founder kill switch adds one deny covering every bounded 
     assert.equal(capped.find(s => s.Sid === 'AllowCappedEncryptedGp3Volumes').Condition.NumericLessThanEquals['ec2:VolumeSize'], '50');
 });
 
+test('R-ID F1: no bounded role may change an instance type after launch; only the flagged userData write is carved out', () => {
+    assert.equal(cfg.userDataAttributeKeyVerified, false, 'userData carve-out defaults off');
+    const on = IdentityConfigSchema.parse({ ...cfg, userDataAttributeKeyVerified: true });
+    assert.deepEqual(json(boundaryStatements(on)), expectedBoundary(false, true));
+    assert.deepEqual(json(boundaryStatements(IdentityConfigSchema.parse({ ...on, killSwitch: true }))), expectedBoundary(true, true));
+    // Semantic: in both modes every Allow that could match ModifyInstanceAttribute
+    // (exact or wildcard) carries ec2:Attribute=userData, and a Deny covers the rest.
+    const matches = (pattern: string) => new RegExp('^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$')
+        .test('ec2:ModifyInstanceAttribute');
+    for (const config of [cfg, on]) {
+        const statements = json(boundaryStatements(config)) as any[];
+        for (const st of statements.filter(x => x.Effect === 'Allow' && [x.Action].flat().some((a: string) => matches(a)))) {
+            assert.equal(st.Condition?.StringEquals?.['ec2:Attribute'], 'userData', `${st.Sid} grants ModifyInstanceAttribute beyond userData`);
+            assert.deepEqual([st.Resource].flat(), [EC2('instance')], `${st.Sid} must be instance-only`);
+        }
+        const denies = statements.filter(x => x.Effect === 'Deny' && [x.Action].flat().includes('ec2:ModifyInstanceAttribute'));
+        if (config.userDataAttributeKeyVerified) {
+            assert.deepEqual(denies.map(d => d.Condition), [{ 'ForAnyValue:StringNotEquals': { 'ec2:Attribute': 'userData' } },
+                { Null: { 'ec2:Attribute': 'true' } }]);
+        } else assert.deepEqual(denies.map(d => [d.Sid, d.Condition]), [['NoModifyInstanceAttribute', undefined]]);
+    }
+});
 test('item 1: namespaces are lowercase alphanumeric, never reserved, never identity', () => {
     for (const ns of ['identity', 'operators', 'ops', 'pilot-prod', 'Pilot', '1pilot', '', 'a'.repeat(22)])
         assert.equal(IdentityConfigSchema.safeParse({ ...cfg, namespace: ns }).success, false, ns);

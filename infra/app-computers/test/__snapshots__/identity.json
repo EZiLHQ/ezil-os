@@ -304,8 +304,7 @@
               "ec2:StartInstances",
               "ec2:StopInstances",
               "ec2:TerminateInstances",
-              "ec2:AttachVolume",
-              "ec2:ModifyInstanceAttribute"
+              "ec2:AttachVolume"
             ],
             "Condition": {
               "StringEquals": {
@@ -673,6 +672,12 @@
             "Effect": "Deny",
             "Resource": "arn:aws:ec2:ap-south-1:123456789012:instance/*",
             "Sid": "NoForeignInstanceAttributes"
+          },
+          {
+            "Action": "ec2:ModifyInstanceAttribute",
+            "Effect": "Deny",
+            "Resource": "*",
+            "Sid": "NoModifyInstanceAttribute"
           }
         ],
         "Version": "2012-10-17"
