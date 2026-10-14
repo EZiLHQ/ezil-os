@@ -150,6 +150,9 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
   - per-user and global monthly instance-hours under their caps
   - per-user and global monthly egress under their caps
 - Refusals carry a machine-readable reason.
+- Holding the admission lock is not enough to write. An admitted decision mints a single-use ticket bound to this
+  transaction, computer, user and kind (create or lease), and only after that computer's counters were read under the
+  lock. AWS creation and leasing refuse without it. Only the admission module mints tickets (a repository scan test).
 
 **Errors**
 - Capacity and quota errors fail fast.

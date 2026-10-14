@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 import { decideAdmission, runAdmission, type RegionalCounters, type RegionPlan } from './admission';
 import { AWS_CAP_ENV, AWS_TIERS, instanceTypeForTier, isAwsTier, readAwsAdmissionConfig, regionCapEnv, type AwsAdmissionConfig } from './aws-config';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { leasePlacement, withAdmission, type AdmissionCounters } from './placement';
+import { leasePlacement, mintAdmissionTicket, readAdmissionCounters, withAdmission, type AdmissionCounters } from './placement';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -297,11 +297,14 @@ describe('runAdmission (transactional)', () => {
             expect(placements).toEqual([expect.objectContaining({ owner_user_id: GONE, state: 'STOPPED', lease_epoch: 0 })]);
         });
 
-        it('the lease CAS itself only matches the owner, even if the decision were bypassed', async () => {
+        it('the lease CAS itself only matches the owner, even with a ticket minted despite the decision', async () => {
             const { db, placements } = createFakePlacementDb({ placements: [awsRow({ computer_id: C9, owner_user_id: GONE })] });
-            const r = await withAdmission(db, (tx, lock) =>
-                leasePlacement(tx, lock, { computerId: C9, ownerUserId: U2, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: NOW }),
-            );
+            const r = await withAdmission(db, async (tx, lock) => {
+                // A ticket the decision would never have issued (U2 does not own C9): the CAS still refuses.
+                await readAdmissionCounters(tx, lock, { userId: U2, computerId: C9, monthStart: new Date(0), now: NOW });
+                const ticket = mintAdmissionTicket(tx, lock, { computerId: C9, userId: U2, kind: 'lease' });
+                return leasePlacement(tx, lock, ticket, { computerId: C9, ownerUserId: U2, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: NOW });
+            });
             expect(r).toEqual({ ok: false, reason: 'cas_conflict' });
             expect(placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 0 });
         });

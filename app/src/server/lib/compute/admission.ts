@@ -7,8 +7,9 @@
  *   2. `readAdmissionCounters` — the target computer's owner, running count, the user's other AWS
  *      computers, duplicate placements, this month's usage rows.
  *   3. `decideAdmission` — pure, below.
- *   4. On admit: `leasePlacement` (STOPPED → LEASED, lease_epoch + 1, by CAS)
- *      or `createAwsPlacement`. Both live in `placement.ts`, the only writer.
+ *   4. On admit: `mintAdmissionTicket`, then `leasePlacement` (STOPPED → LEASED,
+ *      lease_epoch + 1, by CAS) or `createAwsPlacement` with that ticket. All
+ *      live in `placement.ts`, the only writer; neither runs on the lock alone.
  *
  * A disabled or invalid configuration refuses BEFORE any statement, so with
  * AWS off this module never touches the (not yet created) tables.
@@ -18,6 +19,7 @@ import {
     withAdmission,
     createAwsPlacement,
     leasePlacement,
+    mintAdmissionTicket,
     readAdmissionCounters,
     readPlacement,
     type AdmissionCounters,
@@ -168,16 +170,18 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
         const decision = decideAdmission({ config, counters, userId: request.userId, now, region });
         if (!decision.admit) return { admitted: false, reason: decision.reason, reasons: decision.reasons };
 
+        // The only place a ticket is minted: after the decision admitted this exact request.
+        const ticket = mintAdmissionTicket(tx, lock, { computerId: request.computerId, userId: request.userId, kind: request.kind });
         const result =
             request.kind === 'lease'
-                ? await leasePlacement(tx, lock, {
+                ? await leasePlacement(tx, lock, ticket, {
                       computerId: request.computerId,
                       ownerUserId: request.userId,
                       expected: request.expected,
                       leaseUntil: request.leaseUntil,
                       replace: request.replace,
                   })
-                : await createAwsPlacement(tx, lock, {
+                : await createAwsPlacement(tx, lock, ticket, {
                       computerId: request.computerId,
                       ownerUserId: request.userId,
                       fields: { ...request.fields, region: decision.region!, instanceType: instanceTypeForTier(request.tier) },

@@ -404,6 +404,66 @@ function assertAdmissionLock(tx: PlacementExecutor, lock: AdmissionLock): void {
     }
 }
 
+declare const TICKET_BRAND: unique symbol;
+
+/**
+ * Proof that admission ADMITTED one exact request (computer, user, create or
+ * lease) inside THIS transaction, after `readAdmissionCounters` read that
+ * computer's counters under the same lock. Opaque and single use, kept in a
+ * module-private WeakMap like `AdmissionLock`. Holding the lock alone no
+ * longer creates or leases an AWS placement (review R-PL F3): a caller that
+ * skips the decision cannot get past the per-user and running caps.
+ */
+export interface AdmissionTicket {
+    readonly [TICKET_BRAND]: true;
+}
+
+interface TicketRecord {
+    tx: PlacementExecutor;
+    computerId: string;
+    userId: string;
+    kind: 'create' | 'lease';
+    used: boolean;
+}
+
+const MINTED_TICKETS = new WeakMap<object, TicketRecord>();
+/** Lock → the computer whose admission counters were read under it. */
+const COUNTED = new WeakMap<object, string>();
+
+/**
+ * ADMISSION ONLY: `admission.ts` calls this once `decideAdmission` has admitted
+ * the request. No other non-test module may name it; `placement.test.ts` scans
+ * the repository for that. It refuses unless the lock is this transaction's
+ * and the counters for this very computer were read under it.
+ */
+export function mintAdmissionTicket(
+    tx: PlacementExecutor,
+    lock: AdmissionLock,
+    input: { computerId: string; userId: string; kind: 'create' | 'lease' },
+): AdmissionTicket {
+    assertAdmissionLock(tx, lock);
+    const computerId = canonicalId(input.computerId);
+    if (COUNTED.get(lock) !== computerId) throw new Error('admission counters were not read for this computer under this lock');
+    const ticket = Object.freeze({}) as AdmissionTicket;
+    MINTED_TICKETS.set(ticket, { tx, computerId, userId: canonicalId(input.userId), kind: input.kind, used: false });
+    return ticket;
+}
+
+function consumeTicket(tx: PlacementExecutor, ticket: AdmissionTicket, expected: { computerId: string; userId: string; kind: 'create' | 'lease' }): void {
+    const record = ticket && typeof ticket === 'object' ? MINTED_TICKETS.get(ticket) : undefined;
+    if (
+        !record ||
+        record.tx !== tx ||
+        record.used ||
+        record.kind !== expected.kind ||
+        record.computerId !== canonicalId(expected.computerId) ||
+        record.userId !== canonicalId(expected.userId)
+    ) {
+        throw new Error('admission ticket is not valid for this request');
+    }
+    record.used = true;
+}
+
 // ── Create ───────────────────────────────────────────────────────────────
 
 export interface CreatePlacementInput {
@@ -459,13 +519,18 @@ export async function createPlacement(db: PlacementDb, input: CreatePlacementInp
     return db.transaction((tx) => createInTx(tx, input));
 }
 
-/** AWS creation, inside the admission transaction. Starts at PROVISIONING, generation 1, lease_epoch 1 (the provision is the first lease). */
+/**
+ * AWS creation, inside the admission transaction, with that admission's ticket.
+ * Starts at PROVISIONING, generation 1, lease_epoch 1 (the provision is the first lease).
+ */
 export async function createAwsPlacement(
     tx: PlacementExecutor,
     lock: AdmissionLock,
+    ticket: AdmissionTicket,
     input: { computerId: string; ownerUserId: string; fields?: PlacementFields },
 ): Promise<CreatePlacementResult> {
     assertAdmissionLock(tx, lock);
+    consumeTicket(tx, ticket, { computerId: input.computerId, userId: input.ownerUserId, kind: 'create' });
     return createInTx(tx, { computerId: input.computerId, ownerUserId: input.ownerUserId, provider: 'aws-ec2', state: 'PROVISIONING', fields: input.fields });
 }
 
@@ -552,14 +617,17 @@ export async function transitionPlacementAsReconciler(
 
 /**
  * `STOPPED → LEASED`, reserving `lease_epoch + 1` (and `generation + 1` for a
- * replace or recovery, C-3). Only inside the admission transaction.
+ * replace or recovery, C-3). Only inside the admission transaction, with that
+ * admission's ticket.
  */
 export async function leasePlacement(
     tx: PlacementExecutor,
     lock: AdmissionLock,
+    ticket: AdmissionTicket,
     input: { computerId: string; ownerUserId: string; expected: { generation: number; leaseEpoch: number }; leaseUntil: Date; replace?: boolean },
 ): Promise<TransitionResult> {
     assertAdmissionLock(tx, lock);
+    consumeTicket(tx, ticket, { computerId: input.computerId, userId: input.ownerUserId, kind: 'lease' });
     return casInTx(
         tx,
         input.computerId,
@@ -677,6 +745,8 @@ export async function readAdmissionCounters(
         else throw new Error('admission region counter returned a duplicate or invalid region');
     }
     const owner = ownerRows[0];
+    // Every read above succeeded for this computer under this lock: admission may now mint a ticket for it.
+    COUNTED.set(lock, input.computerId);
     return {
         targetOwnerId: typeof owner?.user_id === 'string' ? owner.user_id : null,
         targetPlacementOwnerId: target.record?.ownerUserId ?? null,

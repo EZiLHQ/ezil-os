@@ -7,6 +7,7 @@
  * backends; the SQL text the races depend on is pinned below as well.
  */
 
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
@@ -24,6 +25,7 @@ import {
     DEFAULT_PLACEMENT,
     findDuplicatePlacements,
     leasePlacement,
+    mintAdmissionTicket,
     PLACEMENT_STATES,
     PLACEMENT_TRANSITIONS,
     PlacementIntegrityError,
@@ -37,10 +39,19 @@ import {
     PlacementIsolationError,
     transitionPlacement,
     transitionPlacementAsReconciler,
+    type AdmissionLock,
     type PlacementDb,
+    type PlacementExecutor,
 } from './placement';
 
 const A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+/** No admission ticket: for tests that must fail on the lock before the ticket is looked at. */
+const NO_TICKET = undefined as never;
+/** What runAdmission does before writing: read this computer's counters under the lock, then mint its ticket. */
+async function ticketFor(tx: PlacementExecutor, lock: AdmissionLock, computerId: string, userId: string, kind: 'create' | 'lease') {
+    await readAdmissionCounters(tx, lock, { userId, computerId, monthStart: new Date(0), now: new Date('2026-10-13T12:00:00Z') });
+    return mintAdmissionTicket(tx, lock, { computerId, userId, kind });
+}
 const B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
 // Compile-time: the production database and the SQL-capture database both satisfy the surface.
@@ -194,7 +205,7 @@ describe('create: per-computer advisory lock, then refuse an existing row', () =
 
     it('an aws-ec2 row starts at lease_epoch 1: the provision is its first lease (C-4 marker fence)', async () => {
         const { db } = createFakePlacementDb();
-        const r = await withAdmission(db, (tx, lock) => createAwsPlacement(tx, lock, { computerId: A, ownerUserId: OWNER }));
+        const r = await withAdmission(db, async (tx, lock) => createAwsPlacement(tx, lock, await ticketFor(tx, lock, A, OWNER, 'create'), { computerId: A, ownerUserId: OWNER }));
         expect(r.ok && r.placement).toMatchObject({ provider: 'aws-ec2', store: 'ebs', state: 'PROVISIONING', generation: 1, leaseEpoch: 1 });
     });
 
@@ -356,16 +367,101 @@ describe('R-PL F2: user transitions are owner-guarded; the reconciler path is se
     });
 });
 
+describe('R-PL F3: AWS create and lease need the admission ticket, not just the lock', () => {
+    const U2 = '22222222-2222-4222-8222-222222222222';
+    const stoppedA = () => createFakePlacementDb({ placements: [placementRow({ computer_id: A, generation: 2, lease_epoch: 5 })] });
+    const leaseA = { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 5 }, leaseUntil: new Date('2026-10-13T13:00:00Z') };
+
+    it('the F3 bypass: two direct creates for one user under the lock alone are both refused, nothing written', async () => {
+        const { db, placements } = createFakePlacementDb();
+        for (const id of [A, B]) {
+            await expect(withAdmission(db, (tx, lock) => createAwsPlacement(tx, lock, NO_TICKET, { computerId: id, ownerUserId: OWNER }))).rejects.toThrow(/admission ticket/);
+        }
+        expect(placements).toEqual([]);
+    });
+
+    it('a lease under the lock alone is refused and the row is unchanged', async () => {
+        const { db, placements } = stoppedA();
+        await expect(withAdmission(db, (tx, lock) => leasePlacement(tx, lock, NO_TICKET, leaseA))).rejects.toThrow(/admission ticket/);
+        expect(placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 5 });
+    });
+
+    it.each([
+        ['another computer', { computerId: B, userId: OWNER, kind: 'lease' }],
+        ['another user', { computerId: A, userId: U2, kind: 'lease' }],
+        ['the other kind', { computerId: A, userId: OWNER, kind: 'create' }],
+    ] as const)('a ticket for %s is refused', async (_n, mint) => {
+        const { db, placements } = createFakePlacementDb({ placements: [placementRow({ computer_id: A, generation: 2, lease_epoch: 5 }), placementRow({ computer_id: B })] });
+        await expect(
+            withAdmission(db, async (tx, lock) => {
+                await readAdmissionCounters(tx, lock, { userId: mint.userId, computerId: mint.computerId, monthStart: new Date(0), now: new Date() });
+                return leasePlacement(tx, lock, mintAdmissionTicket(tx, lock, mint), leaseA);
+            }),
+        ).rejects.toThrow(/admission ticket/);
+        expect(placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 5 });
+    });
+
+    it('a ticket is single use', async () => {
+        const { db, placements } = stoppedA();
+        await expect(
+            withAdmission(db, async (tx, lock) => {
+                const ticket = await ticketFor(tx, lock, A, OWNER, 'lease');
+                const first = await leasePlacement(tx, lock, ticket, leaseA);
+                expect(first.ok).toBe(true);
+                return leasePlacement(tx, lock, ticket, { ...leaseA, expected: { generation: 2, leaseEpoch: 6 } });
+            }),
+        ).rejects.toThrow(/admission ticket/);
+        // The transaction rolled back as a whole.
+        expect(placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 5 });
+    });
+
+    it('a ticket from another transaction is refused', async () => {
+        const { db, placements } = stoppedA();
+        const stale = await withAdmission(db, (tx, lock) => ticketFor(tx, lock, A, OWNER, 'lease'));
+        await expect(withAdmission(db, (tx, lock) => leasePlacement(tx, lock, stale, leaseA))).rejects.toThrow(/admission ticket/);
+        expect(placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 5 });
+    });
+
+    it('no ticket is minted unless that computer\'s counters were read under this lock', async () => {
+        const { db } = stoppedA();
+        await expect(withAdmission(db, async (tx, lock) => mintAdmissionTicket(tx, lock, { computerId: A, userId: OWNER, kind: 'lease' }))).rejects.toThrow(/counters were not read/);
+        await expect(
+            withAdmission(db, async (tx, lock) => {
+                await readAdmissionCounters(tx, lock, { userId: OWNER, computerId: B, monthStart: new Date(0), now: new Date() });
+                return mintAdmissionTicket(tx, lock, { computerId: A, userId: OWNER, kind: 'lease' });
+            }),
+        ).rejects.toThrow(/counters were not read/);
+        const foreign = await withAdmission(db, async (_tx, lock) => lock);
+        await expect(db.transaction(async (tx) => mintAdmissionTicket(tx, foreign, { computerId: A, userId: OWNER, kind: 'lease' }))).rejects.toThrow(/admission lock/);
+    });
+
+    it('only admission.ts mints tickets: no other non-test file in the repository names the minter', () => {
+        const REPO = path.resolve(__dirname, '../../../../..');
+        const files = execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], { cwd: REPO, encoding: 'utf8' })
+            .split('\0')
+            .filter((f) => /\.(ts|tsx|js|mjs|cjs)$/.test(f) && !f.startsWith('docs/') && !/\.test(-support)?\.(ts|tsx|mjs|js)$/.test(f));
+        expect(files.length).toBeGreaterThan(300); // a real tree, not a vacuous pass
+        const naming = files.filter((f) => {
+            try {
+                return /\bmintAdmissionTicket\b/.test(readFileSync(path.join(REPO, f), 'utf8'));
+            } catch {
+                return false;
+            }
+        });
+        expect(naming.sort()).toEqual(['app/src/server/lib/compute/admission.ts', 'app/src/server/lib/compute/placement.ts']);
+    });
+});
+
 describe('leasing and AWS creation need the admission lock of the same transaction', () => {
     it('leasing bumps lease_epoch by one (and generation only on replace)', async () => {
         const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A, generation: 2, lease_epoch: 5 })] });
         const until = new Date('2026-10-13T13:00:00Z');
-        const r = await withAdmission(db, (tx, lock) => leasePlacement(tx, lock, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 5 }, leaseUntil: until }));
+        const r = await withAdmission(db, async (tx, lock) => leasePlacement(tx, lock, await ticketFor(tx, lock, A, OWNER, 'lease'), { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 5 }, leaseUntil: until }));
         expect(r.ok && r.placement).toMatchObject({ state: 'LEASED', generation: 2, leaseEpoch: 6, leaseUntil: until });
         // LEASED → STOPPED (a lapsed lease), then a replace lease reserves generation + 1 as well.
         await transitionPlacement(db, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 6, state: 'LEASED' }, to: 'STOPPED' });
-        const r2 = await withAdmission(db, (tx, lock) =>
-            leasePlacement(tx, lock, { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 6 }, leaseUntil: until, replace: true }),
+        const r2 = await withAdmission(db, async (tx, lock) =>
+            leasePlacement(tx, lock, await ticketFor(tx, lock, A, OWNER, 'lease'), { computerId: A, ownerUserId: OWNER, expected: { generation: 2, leaseEpoch: 6 }, leaseUntil: until, replace: true }),
         );
         expect(r2.ok && r2.placement).toMatchObject({ generation: 3, leaseEpoch: 7 });
     });
@@ -374,9 +470,9 @@ describe('leasing and AWS creation need the admission lock of the same transacti
         const { db, placements } = createFakePlacementDb({ placements: [placementRow({ computer_id: A })] });
         const foreign = await withAdmission(db, async (_tx, lock) => lock);
         await expect(
-            db.transaction((tx) => leasePlacement(tx, foreign, { computerId: A, ownerUserId: OWNER, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: new Date() })),
+            db.transaction((tx) => leasePlacement(tx, foreign, NO_TICKET, { computerId: A, ownerUserId: OWNER, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: new Date() })),
         ).rejects.toThrow(/admission lock/);
-        await expect(db.transaction((tx) => createAwsPlacement(tx, foreign, { computerId: B, ownerUserId: OWNER }))).rejects.toThrow(/admission lock/);
+        await expect(db.transaction((tx) => createAwsPlacement(tx, foreign, NO_TICKET, { computerId: B, ownerUserId: OWNER }))).rejects.toThrow(/admission lock/);
         const counters = { userId: A, computerId: B, monthStart: new Date(0), now: new Date() };
         await expect(db.transaction((tx) => readAdmissionCounters(tx, foreign, counters))).rejects.toThrow(/admission lock/);
         // Even inside ANOTHER admission, a lock from a different transaction is refused.
@@ -402,7 +498,7 @@ describe('leasing and AWS creation need the admission lock of the same transacti
         expect(Object.getOwnPropertySymbols(real)).toEqual([]);
         expect(Object.keys(real)).toEqual([]);
         await expect(
-            db.transaction((tx) => leasePlacement(tx, { ...real } as never, { computerId: A, ownerUserId: OWNER, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: new Date() })),
+            db.transaction((tx) => leasePlacement(tx, { ...real } as never, NO_TICKET, { computerId: A, ownerUserId: OWNER, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: new Date() })),
         ).rejects.toThrow(/admission lock/);
         expect(placements[0]!.state).toBe('STOPPED');
     });
@@ -410,7 +506,7 @@ describe('leasing and AWS creation need the admission lock of the same transacti
     it('a forged lock object is refused', async () => {
         const { db } = createFakePlacementDb({ placements: [placementRow({ computer_id: A })] });
         await expect(
-            db.transaction((tx) => leasePlacement(tx, {} as never, { computerId: A, ownerUserId: OWNER, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: new Date() })),
+            db.transaction((tx) => leasePlacement(tx, {} as never, NO_TICKET, { computerId: A, ownerUserId: OWNER, expected: { generation: 1, leaseEpoch: 0 }, leaseUntil: new Date() })),
         ).rejects.toThrow(/admission lock/);
     });
 });
