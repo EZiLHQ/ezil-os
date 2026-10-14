@@ -138,6 +138,15 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 - Retirement: `RETIRING → RETIRED → PURGE_ELIGIBLE`. The purge itself is a separate operator action (§6).
 - Stage B slots: `WARMING → READY → CLAIMED → terminated`.
 
+**Lifecycle authority (app)**
+- The workflow calls `POST /api/internal/computers/lifecycle-authority` before each mutation. Set
+  `EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET` to the same 64 lowercase hex characters as the Secrets Manager
+  `authoritySecretArn` secret's `AWSCURRENT` value. The app decodes it as a 32-byte HMAC-SHA256 key, verifies
+  the signed request bytes and Unix timestamp (±300 seconds), and requires the AWS placement's current job,
+  digest and lease epoch to match in `PROVISIONING`, `LEASED`, `STARTING`, `MOUNTING`, `DRAINING`, `STOPPING`
+  or `RETIRING`. A match returns 200 with `{authorized:true, ...authorityFields}`; refusal returns 403.
+  A missing/malformed secret or unavailable placement read returns 503 (uncertain, never authorized).
+
 **Leasing and admission**
 - `LEASED` reserves `lease_epoch + 1`. A replace or recovery also reserves `generation + 1`.
 - An AWS placement is created at `lease_epoch` 1, because the provision is the computer's first lease. Its intent carries
