@@ -137,13 +137,16 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     const done: PlacementFields = { instanceId: r.instanceId, volumeId: r.volumeId, lifecycleJobId: null, lifecycleDigest: null, lastError: null };
     if (stopping) {
         if (p.state === 'DRAINING') p = await step(p, 'STOPPING');
-        if (p) p = await step(p, 'STOPPED', done);
-        // Fence: the stopped generation's tunnel goes (GW-1 DELETE). A later epoch also fences it first.
-        if (p && deps.tunnels) {
-            await deps.tunnels
+        if (!p) return;
+        // Keep the stop pending until GW-1 confirms fencing, so failures can be retried.
+        // No tunnel client = nothing to fence: the stop still completes.
+        if (deps.tunnels) {
+            const fenced = await deps.tunnels
                 .deleteTunnel({ userId: p.ownerUserId }, { computerId: p.computerId.toLowerCase(), sandboxId: awsSandboxId(p.computerId), generation: p.generation, leaseEpoch: p.leaseEpoch })
                 .catch(() => ({ ok: false }));
+            if (!fenced.ok) return;
         }
+        await step(p, 'STOPPED', done);
         return;
     }
     if (p.state === 'PROVISIONING') {

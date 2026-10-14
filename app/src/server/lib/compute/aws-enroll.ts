@@ -152,7 +152,9 @@ export function createWorkerTunnelClient(cfg: { workerUrl: string; secret: strin
     const doFetch = cfg.fetch ?? fetch;
     const nowSeconds = () => Math.floor((cfg.now?.() ?? new Date()).getTime() / 1000);
     const call = async (method: 'POST' | 'DELETE', owner: { userId: string }, body: Record<string, unknown> & { computerId: string; sandboxId: string; generation: number; leaseEpoch: number }) => {
-        const text = JSON.stringify(body);
+        const text = JSON.stringify(method === 'DELETE'
+            ? { computerId: body.computerId, generation: body.generation, leaseEpoch: body.leaseEpoch }
+            : body);
         const auth = mintPreviewTokenV2(
             cfg.secret,
             { ts: nowSeconds(), sandboxId: body.sandboxId, computerId: body.computerId, userId: owner.userId, provider: 'aws-ec2', store: '', generation: body.generation, leaseEpoch: body.leaseEpoch },

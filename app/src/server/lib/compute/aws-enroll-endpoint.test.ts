@@ -267,7 +267,7 @@ describe('createWorkerTunnelClient (GW-1 over HTTPS)', () => {
         const seen: RequestInit[] = [];
         const client = createWorkerTunnelClient({ workerUrl: 'https://w.example.test', secret: SECRET, fetch: (async (_u: string, init: RequestInit) => (seen.push(init), new Response('{"deleted":true}', { status: 200 }))) as typeof fetch });
         expect(await client.deleteTunnel({ userId: U1 }, { computerId: C1, sandboxId: req.sandboxId, generation: 2, leaseEpoch: 3 })).toEqual({ ok: true, status: 200 });
-        expect(seen[0]).toMatchObject({ method: 'DELETE', body: JSON.stringify({ computerId: C1, sandboxId: req.sandboxId, generation: 2, leaseEpoch: 3 }) });
+        expect(seen[0]).toMatchObject({ method: 'DELETE', body: JSON.stringify({ computerId: C1, generation: 2, leaseEpoch: 3 }) });
     });
 });
 

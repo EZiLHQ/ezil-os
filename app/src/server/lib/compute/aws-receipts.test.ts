@@ -66,7 +66,7 @@ const row = (over: Record<string, unknown> = {}) =>
         enroll_nonce_hash: nonceHashOf(NONCE), enroll_expires_at: new Date(NOW.getTime() + 300_000), ...over,
     });
 
-function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => Exec) | 'throw' = { status: 'RUNNING' }) {
+function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => Exec) | 'throw' = { status: 'RUNNING' }, opts: { noTunnels?: boolean } = {}) {
     const fake = createFakePlacementDb({ placements: rows, computers: [{ id: C1, user_id: U1 }] });
     const read: string[] = [];
     const executions: LifecycleExecutionReader = {
@@ -91,7 +91,7 @@ function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => E
     };
     const provider = createAwsEc2Provider({
         db: fake.db, env: () => env(), now: () => NOW, newId: () => crypto.randomUUID(), starter, tierFor: async () => 'free',
-        randomBytes: () => Buffer.from(NONCE_BYTES), executions, tunnels,
+        randomBytes: () => Buffer.from(NONCE_BYTES), executions, ...(opts.noTunnels ? {} : { tunnels }),
     });
     const status = () => provider.status(ctx, { userId: U1, computerId: C1 });
     return { ...fake, provider, status, read, deleted, created, starts, tunnels };
@@ -212,6 +212,22 @@ describe('stop receipts', () => {
         expect(await status()).toMatchObject({ state: 'stopped', placementState: 'STOPPED' });
         expect(placements[0]).toMatchObject({ lifecycle_job_id: null });
         expect(deleted).toEqual([{ owner: { userId: U1 }, req: { computerId: C1, sandboxId: 'c1c1c1c1c1c14c1c', generation: 2, leaseEpoch: 3 } }]);
+    });
+
+    it('keeps a failed tunnel fence pending and retries on the next poll', async () => {
+        const s = setup([stopping()], { status: 'SUCCEEDED', output: receiptOf({ state: 'stopped' }) });
+        s.tunnels.deleteTunnel = async () => ({ ok: false, status: 502 });
+        expect(await s.status()).toMatchObject({ placementState: 'STOPPING' });
+        expect(s.placements[0]).toMatchObject({ lifecycle_job_id: JOB, lifecycle_digest: DIGEST });
+        s.tunnels.deleteTunnel = async () => ({ ok: true });
+        expect(await s.status()).toMatchObject({ placementState: 'STOPPED' });
+        expect(s.placements[0]).toMatchObject({ lifecycle_job_id: null });
+    });
+
+    it('with no tunnel client, a stop still completes (nothing to fence)', async () => {
+        const s = setup([stopping()], { status: 'SUCCEEDED', output: receiptOf({ state: 'stopped' }) }, { noTunnels: true });
+        expect(await s.status()).toMatchObject({ placementState: 'STOPPED' });
+        expect(s.deleted).toEqual([]);
     });
 
     it('DRAINING (start accepted, STOPPING not yet written) → STOPPING → STOPPED', async () => {
