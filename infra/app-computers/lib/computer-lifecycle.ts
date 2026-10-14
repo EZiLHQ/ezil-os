@@ -24,6 +24,8 @@ export class ComputerLifecycle extends Construct {
         key.addToResourcePolicy(new iam.PolicyStatement({principals:[new iam.ServicePrincipal(`logs.${r}.amazonaws.com`)],
             actions:['kms:Encrypt*','kms:Decrypt*','kms:ReEncrypt*','kms:GenerateDataKey*','kms:Describe*'],resources:['*'],
             conditions:{ArnLike:{'kms:EncryptionContext:aws:logs:arn':`arn:aws:logs:${r}:${d.accountId}:log-group:*`}}}));
+        // Step Functions docs: an encrypted state machine with logging needs vended-log delivery to decrypt.
+        key.addToResourcePolicy(new iam.PolicyStatement({principals:[new iam.ServicePrincipal('delivery.logs.amazonaws.com')],actions:['kms:Decrypt'],resources:['*']}));
         const helperLogs=new logs.LogGroup(this,'HelperLogs',{encryptionKey:key,retention:logs.RetentionDays.ONE_WEEK,removalPolicy:RemovalPolicy.RETAIN});
         const helper=new nodejs.NodejsFunction(this,'Observer',{entry:join(__dirname,'lifecycle/helper.ts'),handler:'handler',runtime:lambda.Runtime.NODEJS_24_X,
             timeout:Duration.seconds(55),memorySize:256,...(props.lambdaReservedConcurrency===null?{}:{reservedConcurrentExecutions:props.lambdaReservedConcurrency??2}),logGroup:helperLogs,
@@ -46,7 +48,7 @@ export class ComputerLifecycle extends Construct {
         this.machine=new states.CfnStateMachine(this,'Workflow',{stateMachineName:machineName,stateMachineType:'STANDARD',roleArn:role.roleArn,
             definitionString:JSON.stringify(lifecycleDefinition(helper.currentVersion.functionArn,s.features)),
             encryptionConfiguration:{type:'CUSTOMER_MANAGED_KMS_KEY',kmsKeyId:key.keyArn},
-            loggingConfiguration:{level:'ERROR',includeExecutionData:false,destinations:[{cloudWatchLogsLogGroup:{logGroupArn:workflowLogs.logGroupArn+':*'}}]}});
+            loggingConfiguration:{level:'ERROR',includeExecutionData:false,destinations:[{cloudWatchLogsLogGroup:{logGroupArn:workflowLogs.logGroupArn}}]}});
         this.machine.node.addDependency(role);
         this.version=new states.CfnStateMachineVersion(this,'Version',{stateMachineArn:this.machine.ref,stateMachineRevisionId:this.machine.attrStateMachineRevisionId});
         this.version.applyRemovalPolicy(RemovalPolicy.RETAIN);

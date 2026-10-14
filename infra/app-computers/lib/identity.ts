@@ -264,6 +264,9 @@ export function execStatements(c: IdentityConfig): iam.PolicyStatement[] {
         regional(['kms:ListAliases']),
         regional(['kms:DescribeKey', 'kms:GetKeyPolicy', 'kms:PutKeyPolicy', 'kms:EnableKeyRotation', 'kms:GetKeyRotationStatus',
             'kms:TagResource', 'kms:ListResourceTags'], [`arn:aws:kms:${r}:${a}:key/*`], resourceTag),
+        // CreateStateMachine/DescribeStateMachine with a customer key call KMS as the caller, via Step Functions.
+        regional(['kms:GenerateDataKey', 'kms:Decrypt'], [`arn:aws:kms:${r}:${a}:key/*`],
+            { StringEquals: { [`aws:ResourceTag/${NAMESPACE_TAG}`]: c.namespace, 'kms:ViaService': `states.${r}.amazonaws.com` } }),
         regional(['logs:CreateLogGroup', 'logs:DeleteLogGroup', 'logs:PutRetentionPolicy', 'logs:DeleteRetentionPolicy',
             'logs:AssociateKmsKey', 'logs:TagResource', 'logs:ListTagsForResource'], [own('logs', 'log-group:')]),
         regional(['logs:DescribeLogGroups']),

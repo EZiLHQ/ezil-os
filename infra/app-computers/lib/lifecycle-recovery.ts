@@ -19,6 +19,8 @@ export class ComputerLifecycleRecovery extends Construct {
         key.addToResourcePolicy(new iam.PolicyStatement({ principals: [new iam.ServicePrincipal(`logs.${r}.amazonaws.com`)],
             actions: ['kms:Encrypt*', 'kms:Decrypt*', 'kms:ReEncrypt*', 'kms:GenerateDataKey*', 'kms:Describe*'], resources: ['*'],
             conditions: { ArnLike: { 'kms:EncryptionContext:aws:logs:arn': `arn:aws:logs:${r}:${d.accountId}:log-group:*` } } }));
+        // Step Functions docs: an encrypted state machine with logging needs vended-log delivery to decrypt.
+        key.addToResourcePolicy(new iam.PolicyStatement({ principals: [new iam.ServicePrincipal('delivery.logs.amazonaws.com')], actions: ['kms:Decrypt'], resources: ['*'] }));
         const log = (name: string) => new logs.LogGroup(this, name, { encryptionKey: key,
             retention: logs.RetentionDays.ONE_WEEK, removalPolicy: RemovalPolicy.RETAIN });
         const observer = new nodejs.NodejsFunction(this, 'Observer', {
@@ -50,7 +52,7 @@ export class ComputerLifecycleRecovery extends Construct {
             stateMachineType: 'STANDARD', roleArn: role.roleArn, definitionString: JSON.stringify(recoveryDefinition(observer.currentVersion.functionArn)),
             encryptionConfiguration: { type: 'CUSTOMER_MANAGED_KMS_KEY', kmsKeyId: key.keyArn },
             loggingConfiguration: { level: 'ERROR', includeExecutionData: false,
-                destinations: [{ cloudWatchLogsLogGroup: { logGroupArn: workflowLogs.logGroupArn + ':*' } }] } });
+                destinations: [{ cloudWatchLogsLogGroup: { logGroupArn: workflowLogs.logGroupArn } }] } });
         this.machine.node.addDependency(role);
         this.version = new states.CfnStateMachineVersion(this, 'Version', {
             stateMachineArn: this.machine.ref, stateMachineRevisionId: this.machine.attrStateMachineRevisionId });

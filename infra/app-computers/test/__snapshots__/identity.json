@@ -700,6 +700,21 @@
               },
               {
                 "Action": [
+                  "kms:GenerateDataKey",
+                  "kms:Decrypt"
+                ],
+                "Condition": {
+                  "StringEquals": {
+                    "aws:RequestedRegion": "ap-south-1",
+                    "aws:ResourceTag/ezil:namespace": "pilot",
+                    "kms:ViaService": "states.ap-south-1.amazonaws.com"
+                  }
+                },
+                "Effect": "Allow",
+                "Resource": "arn:aws:kms:ap-south-1:123456789012:key/*"
+              },
+              {
+                "Action": [
                   "logs:CreateLogGroup",
                   "logs:DeleteLogGroup",
                   "logs:PutRetentionPolicy",

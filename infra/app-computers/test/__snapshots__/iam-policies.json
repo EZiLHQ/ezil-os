@@ -397,6 +397,14 @@
           "Resource": "*"
         },
         {
+          "Action": "kms:Decrypt",
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "delivery.logs.amazonaws.com"
+          },
+          "Resource": "*"
+        },
+        {
           "Action": [
             "kms:Decrypt",
             "kms:GenerateDataKey"
@@ -614,6 +622,14 @@
           "Effect": "Allow",
           "Principal": {
             "Service": "logs.ap-south-1.amazonaws.com"
+          },
+          "Resource": "*"
+        },
+        {
+          "Action": "kms:Decrypt",
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "delivery.logs.amazonaws.com"
           },
           "Resource": "*"
         },

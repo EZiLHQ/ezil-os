@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
 import { join } from 'node:path';
 import test from 'node:test';
 import { App, BootstraplessSynthesizer, assertions } from 'aws-cdk-lib';
@@ -72,6 +73,16 @@ function assertDeniesRetained(oldStatements: Statement[], current: Statement[]) 
     }
 }
 
+/** Reviewed grants added after Design A. Each must still fit inside the legacy
+ * boundary (assertAllowsWithin below); everything else stays frozen.
+ * 2026-10-14 live: CreateStateMachine/DescribeStateMachine with a customer key
+ * call KMS as the CloudFormation caller, via Step Functions. */
+function addedAfterDesignA(c: { region: string; accountId: string; namespace: string }): Record<string, Statement[]> {
+    return { deploy: [], exec: [{ Action: ['kms:GenerateDataKey', 'kms:Decrypt'], Effect: 'Allow', Resource: `arn:aws:kms:${c.region}:${c.accountId}:key/*`,
+        Condition: { StringEquals: { 'aws:RequestedRegion': c.region, 'aws:ResourceTag/ezil:namespace': c.namespace,
+            'kms:ViaService': `states.${c.region}.amazonaws.com` } } }] };
+}
+
 for (const killSwitch of [false, true]) for (const userDataAttributeKeyVerified of [false, true]) {
     test(`Design A: unchanged identity grants, old allow containment and attached denies ${JSON.stringify({ killSwitch, userDataAttributeKeyVerified })}`, () => {
         const config = IdentityConfigSchema.parse({ ...before.config, killSwitch, userDataAttributeKeyVerified });
@@ -97,7 +108,10 @@ for (const killSwitch of [false, true]) for (const userDataAttributeKeyVerified 
                     || (resource.Type === 'AWS::IAM::RolePolicy' && p.RoleName?.Ref === id))
                     inline.push(...p.PolicyDocument.Statement);
             }
-            assert.deepEqual(inline, before[name], `${name} inline policy changed`);
+            const added = addedAfterDesignA(config)[name]!;
+            const frozen = inline.filter((s: Statement) => !added.some(a => isDeepStrictEqual(a, s)));
+            assert.equal(inline.length - frozen.length, added.length, `${name} reviewed additions missing`);
+            assert.deepEqual(frozen, before[name], `${name} inline policy changed`);
             assertAllowsWithin(inline, legacy);
             // The shortened purchase bans may deny entire services only because
             // neither deployment identity uses any action in these services.
