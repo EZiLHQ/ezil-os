@@ -111,7 +111,7 @@ function setup(rows: Record<string, unknown>[], exec: Exec | ((arn: string) => E
         };
         return handleAwsEnrollment(
             {
-                db: fake.db, env: env(), now: () => NOW, tunnels,
+                db: fake.db, env: env(), now: () => NOW, tunnels, controlKeySecret: 'control-key-secret-for-tests',
                 describer: { describeForEnrollment: async () => ({
                     instanceId: I_NEW, state: 'running', availabilityZone: 'ap-south-1a', availabilityZoneId: 'aps1-az1',
                     publicIp: '13.0.0.5', tags, volumes: [{ volumeId: VOL, deleteOnTermination: false, tags }],
@@ -490,7 +490,7 @@ describe('one computer, end to end (fake AWS; real admission, provider, enrollme
         };
         const enroll = () =>
             handleAwsEnrollment(
-                { db: s.db, env: env(), now: () => NOW, randomBytes: () => Buffer.alloc(32, 9), describer: { describeForEnrollment: async () => view() }, tunnels: s.tunnels },
+                { db: s.db, env: env(), now: () => NOW, controlKeySecret: 'control-key-secret-for-tests', describer: { describeForEnrollment: async () => view() }, tunnels: s.tunnels },
                 {
                     computerId: C1, generation: Number(s.placements[0]!.generation), leaseEpoch: Number(s.placements[0]!.lease_epoch), nonce: NONCE,
                     identityDocument: fx.document, signature: fx.pkcs7_rsa_detached,

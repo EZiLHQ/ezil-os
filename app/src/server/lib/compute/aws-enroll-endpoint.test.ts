@@ -11,6 +11,7 @@ import {
     AWS_BROWSER_ZONE_ENV,
     awsSandboxId,
     createWorkerTunnelClient,
+    deriveControlKey,
     handleAwsEnrollment,
     nonceHashOf,
     TUNNELS_PATH,
@@ -30,6 +31,7 @@ import * as placement from './placement';
 import { mintPreviewTokenV2 } from './preview-token-v2';
 import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
 import { verifyPreviewTokenV2 } from '../../../../../worker/src/hmac';
+import { createAwsTunnelService, TUNNEL_REPLAY_WINDOW_MS, type CloudflareTunnelApi } from '../../../../../worker/src/aws-tunnels';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const C1 = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
@@ -38,7 +40,9 @@ const NOW = new Date('2026-10-20T00:00:00Z');
 const NONCE = Buffer.alloc(32, 5).toString('base64url');
 const FENCE = 'fdfdfdfd-fdfd-4dfd-8dfd-fdfdfdfdfdfd';
 const DOC = JSON.parse(fx.document) as { instanceId: string; availabilityZone: string };
-const KEY = Buffer.alloc(32, 0xab);
+const CONTROL_SECRET = 'control-key-secret-for-tests';
+/** The derived control key of the default boot (generation 2, epoch 3, NONCE). */
+const KEY = deriveControlKey(CONTROL_SECRET, { computerId: C1, generation: 2, leaseEpoch: 3, nonceHash: nonceHashOf(NONCE) });
 const TOKEN = 'tunnel-token-' + 'x'.repeat(40);
 const TYPES = ['t3a.medium', 't3.medium', 'm6i.large'];
 
@@ -90,7 +94,7 @@ function setup(rows = [booting()], over: Partial<EnrollDeps> & { e?: Record<stri
         db: fake.db,
         env: over.e ?? env(),
         now: () => NOW,
-        randomBytes: over.randomBytes ?? (() => Buffer.from(KEY)),
+        controlKeySecret: 'controlKeySecret' in over ? over.controlKeySecret : CONTROL_SECRET,
         describer:
             'describer' in over
                 ? over.describer
@@ -112,6 +116,46 @@ function setup(rows = [booting()], over: Partial<EnrollDeps> & { e?: Record<stri
 }
 
 afterEach(() => vi.restoreAllMocks());
+
+/**
+ * The app's REAL GW-1 client (createWorkerTunnelClient) against the Worker's REAL tunnel
+ * service (aws-tunnels.ts), v2-verified by the Worker's own hmac.ts, over a fake Cloudflare
+ * API that counts the tunnels it is asked to create.
+ */
+function workerBackedTunnels(clockMs: () => number = () => NOW.getTime()) {
+    const map = new Map<string, unknown>();
+    const storage = {
+        async get<T>(k: string) { return map.get(k) as T | undefined; },
+        async put<T>(k: string, v: T) { map.set(k, structuredClone(v)); },
+        async delete(k: string) { return map.delete(k); },
+    };
+    let n = 0;
+    const created: string[] = [];
+    const api: CloudflareTunnelApi = {
+        async createTunnel(name) { created.push(name); return { id: `tun-${++n}` }; },
+        async getTunnelToken(id) { return `token-for-${id}-${'x'.repeat(24)}`; },
+        async putTunnelIngress() {},
+        async createDnsCname() { return { id: `dns-${n}` }; },
+        async deleteDnsRecord() {},
+        async deleteTunnel() {},
+        async listConnectorOrigins() { return []; },
+    };
+    const service = createAwsTunnelService({ api, storage, zone: 'origin.example.net', nowMs: clockMs });
+    const secret = 'worker-hmac-secret-for-tests';
+    const client = createWorkerTunnelClient({
+        workerUrl: 'https://w.example.test', secret, now: () => new Date(clockMs()),
+        fetch: (async (url: string, init: RequestInit) => {
+            const body = String(init.body);
+            const method = String(init.method);
+            const auth = (init.headers as Record<string, string>)['x-ezil-auth'];
+            const v = await verifyPreviewTokenV2(auth, secret, { method, path: new URL(url).pathname, body }, clockMs());
+            if (!v.ok) return new Response(JSON.stringify({ ok: false, error: v.error }), { status: 401 });
+            const r = method === 'POST' ? await service.create(v.claims, body) : await service.remove(v.claims, body);
+            return new Response(JSON.stringify(r.body), { status: r.status });
+        }) as typeof fetch,
+    });
+    return { client, created };
+}
 
 describe('a valid enrollment', () => {
     it('200 {tunnelToken, controlKey}; the nonce is cleared and the verified instance + volume recorded; GW-1 called once', async () => {
@@ -136,11 +180,54 @@ describe('a valid enrollment', () => {
         expect(awsSandboxId(U1.toUpperCase(), C1.toUpperCase())).toBe(deriveGuacamoleSandboxId(U1, C1));
     });
 
-    it('works once: a second enrollment for the same epoch is refused and opens no tunnel', async () => {
-        const { enroll, tunnels } = setup();
+    it('works once: another nonce for a completed epoch gets nothing and opens no tunnel', async () => {
+        const w = workerBackedTunnels();
+        const { enroll } = setup([booting()], { tunnels: w.client });
         expect((await enroll()).status).toBe(200);
-        expect(await enroll()).toEqual({ status: 403, body: { error: 'enroll_nonce_invalid' } });
-        expect(tunnels).toHaveLength(1);
+        const other = Buffer.alloc(32, 6).toString('base64url');
+        expect(await enroll(hostBody({ nonce: other }))).toEqual({ status: 409, body: { error: 'enroll_nonce_consumed' } });
+        expect(w.created).toHaveLength(1);
+    });
+
+    it('Codex PR #200: a host whose 200 was lost replays with its nonce and gets the SAME credentials; no second tunnel', async () => {
+        const w = workerBackedTunnels();
+        const { enroll, placements } = setup([booting()], { tunnels: w.client });
+        const first = await enroll();
+        expect(first.status).toBe(200);
+        expect(first.body.controlKey).toBe(KEY.toString('base64'));
+        const after = { ...placements[0] };
+        // The response never reached the host; it retries with the nonce it kept (enroll.py).
+        expect(await enroll()).toEqual(first);
+        expect(w.created).toHaveLength(1);
+        expect(placements[0]).toEqual(after); // a replay writes nothing
+    });
+
+    it('the replay also works once the boot is RUNNING, and not after the window', async () => {
+        let t = NOW.getTime();
+        const w = workerBackedTunnels(() => t);
+        const { enroll, placements } = setup([booting()], { tunnels: w.client });
+        const first = await enroll();
+        placements[0]!.state = 'RUNNING';
+        expect(await enroll()).toEqual(first);
+        t += TUNNEL_REPLAY_WINDOW_MS + 1;
+        expect(await enroll()).toEqual({ status: 409, body: { error: 'enroll_nonce_consumed' } });
+        expect(w.created).toHaveLength(1);
+    });
+
+    it('a replay from another instance is refused before any tunnel call', async () => {
+        const w = workerBackedTunnels();
+        const s = setup([booting()], { tunnels: w.client });
+        expect((await s.enroll()).status).toBe(200);
+        s.placements[0]!.instance_id = 'i-33333333333333333';
+        expect(await s.enroll()).toEqual({ status: 403, body: { error: 'instance_mismatch' } });
+        expect(w.created).toHaveLength(1);
+    });
+
+    it('only a completed enrollment replays: a failed one (UNCONFIRMED) stays refused', async () => {
+        const s = setup([booting()], { tunnel: async () => ({ ok: false, status: 502, code: 'tunnel_create_failed' }) });
+        expect((await s.enroll()).status).toBe(502);
+        expect(s.placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: placement.ENROLLMENT_FAILED });
+        expect((await s.enroll()).status).toBe(403);
     });
 
     it('two concurrent enrollments: exactly one wins the compare-and-swap', async () => {
@@ -295,9 +382,9 @@ describe('every refusal changes nothing (nonce kept, no tunnel)', () => {
         expect(s.tunnels).toEqual([]);
     });
 
-    it.each([() => Buffer.alloc(16), () => { throw new Error('random'); }])('a broken random source leaves the nonce intact', async (randomBytes) => {
-        const s = setup([booting()], { randomBytes });
-        expect(await s.enroll()).toEqual({ status: 500, body: { error: 'enroll_failed', retryable: true } });
+    it.each([undefined, '', '   '])('no control-key secret (%j) leaves the nonce intact', async (controlKeySecret) => {
+        const s = setup([booting()], { controlKeySecret });
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_unavailable', retryable: true } });
         expect(s.placements[0]!.enroll_nonce_hash).toBe(nonceHashOf(NONCE));
         expect(s.tunnels).toEqual([]);
     });
