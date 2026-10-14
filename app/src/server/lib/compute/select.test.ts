@@ -78,8 +78,10 @@ describe('resolveComputeProvider', () => {
             }
             expect(provider.kind).toBe('aws-ec2');
             const ensure = provider.ensure(ctx, computer, { sessionId: 's', desktopMode: 'neko' });
-            if (aws === '1') await expect(ensure).rejects.toBeInstanceOf(AwsProviderNotImplementedError);
+            // AWS on but no caps/regions configured: the real provider refuses before any write.
+            if (aws === '1') expect(await ensure).toEqual({ ok: false, error: 'aws_config_invalid', errorCode: 'aws_config_invalid', retryable: false });
             else expect(await ensure).toEqual({ ok: false, error: 'aws_disabled', errorCode: 'aws_disabled', retryable: false });
+            expect(statements).toHaveLength(1);
         });
     });
 

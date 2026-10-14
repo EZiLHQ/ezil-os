@@ -1,0 +1,242 @@
+/**
+ * Real aws-ec2 provider (C-1, C-3) against the fake placement database and a
+ * recording lifecycle starter. No AWS calls. Persistence model under test:
+ * stop = instance stopped on its retained volume; wake = cold boot of the
+ * same instance in the SAME region; a full home region refuses, never hops.
+ */
+
+import { describe, expect, it } from 'vitest';
+
+import { AWS_STATE_FOR, createAwsEc2Provider, type AwsProviderDeps, type LifecycleStarter } from './aws-ec2';
+import type { AwsTier } from './aws-config';
+import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
+import { fixtureDeployment } from './aws-intent.test-support';
+import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
+import { PLACEMENT_STATES, PlacementOwnerError } from './placement';
+
+const U1 = '11111111-1111-4111-8111-111111111111';
+const U2 = '22222222-2222-4222-8222-222222222222';
+const C1 = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
+const NOW = new Date('2026-10-14T06:00:00Z');
+const ctx = { correlationId: 'corr' };
+const opts = { sessionId: 's', desktopMode: 'neko' } as const;
+const TYPES = ['t3a.medium', 't3.medium', 'm6i.large'];
+const DEPLOYMENTS = { 'ap-south-1': fixtureDeployment('ap-south-1', TYPES), 'us-east-1': fixtureDeployment('us-east-1', TYPES) };
+
+const env = (over: Record<string, string> = {}) => ({
+    EZIL_AWS_COMPUTERS_ENABLED: '1',
+    AWS_MAX_RUNNING: '10',
+    EZIL_AWS_USER_MONTHLY_HOURS: '100',
+    EZIL_AWS_GLOBAL_MONTHLY_HOURS: '600',
+    EZIL_AWS_USER_MONTHLY_EGRESS_GB: '50',
+    EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '200',
+    AWS_REGIONS: 'ap-south-1,us-east-1',
+    EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '2',
+    EZIL_AWS_MAX_RUNNING_US_EAST_1: '2',
+    [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify(DEPLOYMENTS),
+    ...over,
+});
+
+function recordingStarter(fail = false) {
+    const calls: { region: string; stateMachineArn: string; name: string; intent: LifecycleIntent; digest: string }[] = [];
+    const starter: LifecycleStarter = {
+        async start(region, work) {
+            const envelope = JSON.parse(work.input) as { document: string; digest: string };
+            calls.push({ region, stateMachineArn: work.stateMachineArn, name: work.name, intent: JSON.parse(envelope.document), digest: envelope.digest });
+            if (fail) throw new Error('ExecutionLimitExceeded');
+        },
+    };
+    return { starter, calls };
+}
+
+function setup(seed: Parameters<typeof createFakePlacementDb>[0] = {}, over: Partial<AwsProviderDeps> & { e?: Record<string, string>; tier?: AwsTier; failStart?: boolean } = {}) {
+    const fake = createFakePlacementDb({ computers: [{ id: C1, user_id: U1 }], ...seed });
+    const rec = recordingStarter(over.failStart);
+    const provider = createAwsEc2Provider({
+        db: fake.db,
+        env: () => over.e ?? env(),
+        now: () => NOW,
+        newId: () => crypto.randomUUID(),
+        starter: 'starter' in over ? over.starter : rec.starter,
+        tierFor: 'tierFor' in over ? over.tierFor : async () => over.tier ?? 'free',
+        enrollment: 'enrollment' in over ? over.enrollment : { issue: async () => ({ userData: 'ZXppbC1ub25jZQ==' }) },
+    });
+    return { ...fake, ...rec, provider };
+}
+
+const stopped = (over: Record<string, unknown> = {}) =>
+    placementRow({ computer_id: C1, region: 'ap-south-1', instance_type: 't3a.medium', instance_id: 'i-11111111111111111', volume_id: 'vol-11111111111111111', ...over });
+
+describe('configuration refusals happen before any statement', () => {
+    it.each([
+        ['flag off', { e: { ...env(), EZIL_AWS_COMPUTERS_ENABLED: '0' } }, 'aws_disabled'],
+        ['no regions', { e: env({ AWS_REGIONS: '' }) }, 'aws_config_invalid'],
+        ['no deployment for a configured region', { e: env({ [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ 'ap-south-1': DEPLOYMENTS['ap-south-1'] }) }) }, 'aws_config_invalid'],
+        ['no lifecycle starter', { starter: undefined }, 'aws_lifecycle_unconfigured'],
+    ] as const)('%s → %s', async (_n, over, code) => {
+        const { provider, statements, calls } = setup({}, over as never);
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: false, error: code, errorCode: code, retryable: false });
+        expect(statements).toEqual([]);
+        expect(calls).toEqual([]);
+    });
+
+    it.each([
+        ['no tier source', { tierFor: undefined }, 'aws_tier_unavailable'],
+        ['tier source fails', { tierFor: async () => { throw new Error('billing down'); } }, 'aws_tier_unavailable'],
+        ['no enrollment issuer', { enrollment: undefined }, 'aws_enrollment_unavailable'],
+    ] as const)('new computer with %s → %s and no placement written', async (_n, over, code) => {
+        const { provider, placements, calls } = setup({}, over as never);
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: code, retryable: false });
+        expect(placements).toEqual([]);
+        expect(calls).toEqual([]);
+    });
+});
+
+describe('ensure: a new computer', () => {
+    it('Mumbai full → provisioned in the US region with the free tier (2 vCPU / 4 GiB) and its own deployment', async () => {
+        const { provider, placements, calls } = setup({}, { e: env({ EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '0' }) });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true });
+        expect(placements).toHaveLength(1);
+        expect(placements[0]).toMatchObject({ region: 'us-east-1', instance_type: 't3a.medium', state: 'PROVISIONING', owner_user_id: U1 });
+        expect(calls).toHaveLength(1);
+        const [call] = calls;
+        expect(call).toMatchObject({ region: 'us-east-1', stateMachineArn: DEPLOYMENTS['us-east-1'].stateMachineVersionArn, name: `computer-${call!.intent.jobId}` });
+        expect(call!.intent).toMatchObject({
+            operation: 'provision', computerId: C1, instanceType: 't3a.medium', dataVolumeGiB: 20, leaseEpoch: 1, targetGeneration: 1,
+            providerInstanceId: null, dataVolumeId: null, userData: 'ZXppbC1ub25jZQ==', deployment: DEPLOYMENTS['us-east-1'],
+        });
+    });
+
+    it('plus tier records the 2 vCPU / 8 GiB type and a 50 GiB disk', async () => {
+        const { provider, placements, calls } = setup({}, { tier: 'plus' });
+        await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(placements[0]).toMatchObject({ region: 'ap-south-1', instance_type: 'm6i.large' });
+        expect(calls[0]!.intent).toMatchObject({ instanceType: 'm6i.large', dataVolumeGiB: 50, deployment: DEPLOYMENTS['ap-south-1'] });
+    });
+
+    it('every region full → capacity_unavailable, nothing written, nothing started', async () => {
+        const { provider, placements, calls } = setup({}, { e: env({ EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '0', EZIL_AWS_MAX_RUNNING_US_EAST_1: '0' }) });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: false, error: 'region_capacity', errorCode: 'capacity_unavailable', retryable: false });
+        expect(placements).toEqual([]);
+        expect(calls).toEqual([]);
+    });
+
+    it('a region deployment that does not allow the tier type: the intent is refused and the placement does not stay PROVISIONING', async () => {
+        const e = env({ [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ ...DEPLOYMENTS, 'ap-south-1': fixtureDeployment('ap-south-1', ['m6i.large']) }) });
+        const { provider, placements, calls } = setup({}, { e });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'aws_intent_invalid' });
+        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+        expect(calls).toEqual([]);
+    });
+
+    it('StartExecution refused → the placement is UNCONFIRMED, never a PROVISIONING row without an execution', async () => {
+        const { provider, placements, calls } = setup({}, { failStart: true });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'aws_lifecycle_start_failed', retryable: false });
+        expect(calls).toHaveLength(1);
+        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+    });
+
+    it('enrollment failure after admission → UNCONFIRMED, nothing started', async () => {
+        const { provider, placements, calls } = setup({}, { enrollment: { issue: async () => { throw new Error('no nonce'); } } });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'aws_enrollment_unavailable' });
+        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+        expect(calls).toEqual([]);
+    });
+});
+
+describe('ensure: wake (cold boot of the same instance, same volume, same region)', () => {
+    it('STOPPED → leased (epoch + 1) → start intent for the same instance and volume → STARTING', async () => {
+        const { provider, placements, calls } = setup({ placements: [stopped()] });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true });
+        expect(calls).toHaveLength(1);
+        expect(calls[0]).toMatchObject({ region: 'ap-south-1', stateMachineArn: DEPLOYMENTS['ap-south-1'].stateMachineVersionArn });
+        expect(calls[0]!.intent).toMatchObject({
+            operation: 'start', providerInstanceId: 'i-11111111111111111', dataVolumeId: 'vol-11111111111111111', leaseEpoch: 1,
+            dataVolumeGiB: null, userData: null, instanceType: 't3a.medium', targetGeneration: 1,
+        });
+        expect(placements[0]).toMatchObject({ state: 'STARTING', lease_epoch: 1, region: 'ap-south-1' });
+    });
+
+    it('a US computer wakes in the US even though Mumbai comes first', async () => {
+        const { provider, calls } = setup({ placements: [stopped({ region: 'us-east-1' })] });
+        await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(calls[0]).toMatchObject({ region: 'us-east-1' });
+        expect(calls[0]!.intent.deployment).toEqual(DEPLOYMENTS['us-east-1']);
+    });
+
+    it('home region full → capacity_unavailable; never another region, placement untouched', async () => {
+        const { provider, placements, calls } = setup({ placements: [stopped()] }, { e: env({ EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '0', EZIL_AWS_MAX_RUNNING_US_EAST_1: '9' }) });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: false, error: 'region_capacity', errorCode: 'capacity_unavailable', retryable: false });
+        expect(calls).toEqual([]);
+        expect(placements[0]).toMatchObject({ state: 'STOPPED', lease_epoch: 0, region: 'ap-south-1' });
+    });
+
+    it('StartExecution refused on wake → back to STOPPED, not left LEASED', async () => {
+        const { provider, placements } = setup({ placements: [stopped()] }, { failStart: true });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'aws_lifecycle_start_failed' });
+        expect(placements[0]).toMatchObject({ state: 'STOPPED' });
+    });
+
+    it('a STOPPED row missing its instance or volume is not started', async () => {
+        const { provider, calls } = setup({ placements: [stopped({ instance_id: null })] });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'aws_placement_incomplete' });
+        expect(calls).toEqual([]);
+    });
+
+    it.each([
+        ['RUNNING', { ok: true }],
+        ['STARTING', { ok: false, errorCode: 'computer_starting', retryable: true }],
+        ['MOUNTING', { ok: false, errorCode: 'computer_starting', retryable: true }],
+        ['STOPPING', { ok: false, errorCode: 'computer_stopping', retryable: true }],
+        ['UNCONFIRMED', { ok: false, errorCode: 'computer_recovering', retryable: false }],
+        ['RETIRED', { ok: false, errorCode: 'computer_unavailable', retryable: false }],
+    ] as const)('%s answers %j without starting anything', async (state, answer) => {
+        const { provider, calls } = setup({ placements: [stopped({ state })] });
+        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject(answer);
+        expect(calls).toEqual([]);
+    });
+
+    it("another user's placement is NOT_FOUND upstream (PlacementOwnerError), whatever ezil_computers says", async () => {
+        const { provider, calls } = setup({ placements: [stopped({ owner_user_id: U2 })] });
+        await expect(provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).rejects.toBeInstanceOf(PlacementOwnerError);
+        await expect(provider.stop(ctx, { userId: U1, computerId: C1 }, 'user')).rejects.toBeInstanceOf(PlacementOwnerError);
+        expect(calls).toEqual([]);
+    });
+});
+
+describe('stop and status', () => {
+    it('RUNNING → DRAINING → stop intent → STOPPING; not confirmed until the receipt', async () => {
+        const { provider, placements, calls } = setup({ placements: [stopped({ state: 'RUNNING', lease_epoch: 4 })] });
+        expect(await provider.stop(ctx, { userId: U1, computerId: C1 }, 'user')).toEqual({ ok: false, terminated: false, outcome: 'stopping' });
+        expect(calls[0]!.intent).toMatchObject({ operation: 'stop', providerInstanceId: 'i-11111111111111111', dataVolumeId: 'vol-11111111111111111', leaseEpoch: 4 });
+        expect(placements[0]).toMatchObject({ state: 'STOPPING' });
+    });
+
+    it('stop start failure → UNCONFIRMED (the reconciler decides), never back to RUNNING', async () => {
+        const { provider, placements } = setup({ placements: [stopped({ state: 'RUNNING', lease_epoch: 4 })] }, { failStart: true });
+        expect(await provider.stop(ctx, { userId: U1, computerId: C1 }, 'user')).toMatchObject({ ok: false, outcome: 'aws_lifecycle_start_failed' });
+        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+    });
+
+    it('an already stopped computer is confirmed stopped without starting anything', async () => {
+        const { provider, calls } = setup({ placements: [stopped()] });
+        expect(await provider.stop(ctx, { userId: U1, computerId: C1 }, 'idle_reap')).toEqual({ ok: true, terminated: false, outcome: 'already_stopped' });
+        expect(calls).toEqual([]);
+    });
+
+    it('status maps every placement state (exhaustive) and reports the region', async () => {
+        expect(Object.keys(AWS_STATE_FOR).sort()).toEqual([...PLACEMENT_STATES].sort());
+        for (const [state, want] of [['RUNNING', 'running'], ['STOPPED', 'stopped'], ['LEASED', 'starting'], ['STOPPING', 'stopping'], ['UNCONFIRMED', 'error']] as const) {
+            const { provider } = setup({ placements: [stopped({ state, region: 'us-east-1' })] });
+            const s = await provider.status(ctx, { userId: U1, computerId: C1 });
+            expect(s).toMatchObject({ ok: want !== 'error', state: want, placementState: state, region: 'us-east-1' });
+        }
+    });
+
+    it('activity, restart and terminate refuse explicitly (host-side presence; retire lands with retention)', async () => {
+        const { provider } = setup({ placements: [stopped()] });
+        expect(await provider.activity(ctx, { userId: U1, computerId: C1 }, { lastInputAgoMs: 0 })).toEqual({ ok: false, error: 'aws_not_supported' });
+        expect(await provider.restart(ctx, { userId: U1, computerId: C1 })).toMatchObject({ ok: false, error: 'aws_not_supported' });
+        expect(await provider.terminate(ctx, { userId: U1, computerId: C1 })).toMatchObject({ ok: false, terminated: false });
+    });
+});

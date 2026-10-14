@@ -86,6 +86,9 @@ export const AWS_TIERS = {
 } as const satisfies Record<string, readonly string[]>;
 export type AwsTier = keyof typeof AWS_TIERS;
 
+/** Data-volume size at provision (infra DEFAULT_DATA_TIERS_GIB: free 20, premium 50); must fall inside the deployment's range. */
+export const AWS_TIER_DATA_GIB: Readonly<Record<AwsTier, number>> = { free: 20, plus: 50 };
+
 export function isAwsTier(value: unknown): value is AwsTier {
     return typeof value === 'string' && Object.prototype.hasOwnProperty.call(AWS_TIERS, value);
 }

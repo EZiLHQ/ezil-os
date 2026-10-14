@@ -25,9 +25,9 @@
  */
 
 import { isPlacementReadEnabled, type Env } from './aws-config';
-import { awsEc2StubProvider, createAwsEc2StubProvider } from './aws-ec2';
+import { awsEc2StubProvider, createAwsEc2Provider, createAwsEc2StubProvider, type AwsProviderDeps } from './aws-ec2';
 import { cloudflareComputeProvider, type CloudflareComputeProvider } from './cloudflare';
-import { PlacementOwnerError, readPlacement, type PlacementExecutor, type ResolvedPlacement } from './placement';
+import { PlacementOwnerError, readPlacement, type PlacementDb, type PlacementExecutor, type ResolvedPlacement } from './placement';
 import type { ComputeProvider, ComputerRef } from './provider';
 
 export function selectComputeProvider(computer: ComputerRef): CloudflareComputeProvider {
@@ -35,13 +35,22 @@ export function selectComputeProvider(computer: ComputerRef): CloudflareComputeP
     return cloudflareComputeProvider;
 }
 
-/** Placement → adapter. Exhaustive: an unknown provider is a type error here and a fail-closed read upstream. */
-export function providerForPlacement(placement: Pick<ResolvedPlacement, 'provider'>, env?: Env): ComputeProvider {
+/**
+ * Placement → adapter. Exhaustive: an unknown provider is a type error here and a fail-closed read upstream.
+ * With a transactional database the aws-ec2 adapter is the real provider (`aws` supplies its
+ * lifecycle starter, tier source and enrollment issuer; without them it refuses before any write).
+ * Without one it is the stub. Either way, with the AWS flag off it REFUSES (aws_disabled); never Cloudflare.
+ */
+export function providerForPlacement(
+    placement: Pick<ResolvedPlacement, 'provider'>,
+    env?: Env,
+    aws?: AwsProviderDeps,
+): ComputeProvider {
     switch (placement.provider) {
         case 'cloudflare':
             return cloudflareComputeProvider;
         case 'aws-ec2':
-            // With the AWS flag off this provider REFUSES (aws_disabled); never Cloudflare.
+            if (aws) return createAwsEc2Provider({ ...aws, env: aws.env ?? (env ? () => env : undefined) });
             return env ? createAwsEc2StubProvider(() => env) : awsEc2StubProvider;
         default: {
             const unknown: never = placement.provider;
@@ -50,10 +59,15 @@ export function providerForPlacement(placement: Pick<ResolvedPlacement, 'provide
     }
 }
 
+function isPlacementDb(db: PlacementExecutor): db is PlacementDb {
+    return typeof (db as Partial<PlacementDb>).transaction === 'function';
+}
+
 export async function resolveComputeProvider(
     db: PlacementExecutor,
     computer: ComputerRef,
     env: Env = process.env,
+    aws: Omit<AwsProviderDeps, 'db' | 'env'> = {},
 ): Promise<ComputeProvider> {
     if (!isPlacementReadEnabled(env)) return cloudflareComputeProvider;
     const placement = await readPlacement(db, computer.computerId);
@@ -62,5 +76,5 @@ export async function resolveComputeProvider(
     if (placement.record && placement.record.ownerUserId !== computer.userId.toLowerCase()) {
         throw new PlacementOwnerError(placement.record.computerId);
     }
-    return providerForPlacement(placement, env);
+    return providerForPlacement(placement, env, isPlacementDb(db) ? { ...aws, db, env: () => env } : undefined);
 }
