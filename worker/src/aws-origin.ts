@@ -9,9 +9,12 @@
  *         the zone from a Worker-side allowlist only; everything unknown fails closed with
  *         502 `aws_origin_unavailable`. Cloudflare routing does not pass through this module.
  *
- * Browser traffic reaches an AWS computer on `aws-<port>-<sandboxId>.<preview zone>`. The
+ * Browser traffic reaches an AWS computer on `aws-<port>-<sandboxId>-aws.<preview zone>`. The
  * leading letters keep the SDK's `<port>-<id>-<token>` preview parser and the bridge
- * parser (`<port>-<id>-app|code`) from ever matching it. The browser authenticates with
+ * parser (`<port>-<id>-app|code`) from ever matching it. The fixed `-aws` suffix lets one
+ * narrow route (`*-aws.<zone>/*`, wrangler.toml) claim these hosts: Cloudflare route
+ * wildcards may only lead, and without a fixed suffix the zone's `*.<zone>/*` catch-all
+ * (another Worker) would answer them. The browser authenticates with
  * the same sandbox-bound bootstrap token → `ezil_preview` cookie as the Cloudflare
  * bridges, but FAIL CLOSED: no configured secret means 401, never the local-dev bypass.
  *
@@ -191,20 +194,23 @@ export async function verifyGatewayHeader(
   return timingSafeEqualHex(await hmacHex(controlKey, payload), m[2]!) ? { ok: true } : { ok: false, error: 'gw_bad_mac' };
 }
 
-/** `aws-<port>-<sandboxId>.<zoneRoot>` → its parts, or null for every other hostname. */
+/** The route token: browser hosts end in `-aws.<zoneRoot>` (wrangler.toml `*-aws.<zone>/*`). */
+export const AWS_BROWSER_ROUTE_TOKEN = 'aws';
+
+/** `aws-<port>-<sandboxId>-aws.<zoneRoot>` → its parts, or null for every other hostname. */
 export function parseAwsBrowserHost(hostname: string, zoneRoot: string): { port: number; sandboxId: string } | null {
   const host = hostname.toLowerCase();
   const suffix = `.${zoneRoot.toLowerCase()}`;
   if (!zoneRoot || !host.endsWith(suffix)) return null;
   const label = host.slice(0, -suffix.length);
-  const m = /^aws-(\d{4,5})-(guac-[a-z0-9]{1,16}-[a-z0-9]{1,16})$/.exec(label);
+  const m = /^aws-(\d{4,5})-(guac-[a-z0-9]{1,16}-[a-z0-9]{1,16})-aws$/.exec(label);
   if (!m) return null;
   const port = Number(m[1]);
   return AWS_EDGE_PORTS.includes(port) ? { port, sandboxId: m[2]! } : null;
 }
 
 export function awsBrowserUrl(port: number, sandboxId: string, zoneRoot: string, bootstrapToken: string, path = '/'): string {
-  const u = new URL(`https://aws-${port}-${sandboxId}.${zoneRoot}/preview-bootstrap`);
+  const u = new URL(`https://aws-${port}-${sandboxId}-${AWS_BROWSER_ROUTE_TOKEN}.${zoneRoot}/preview-bootstrap`);
   u.searchParams.set('token', bootstrapToken);
   u.searchParams.set('path', path);
   return u.toString();

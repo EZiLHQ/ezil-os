@@ -255,6 +255,16 @@ zone_name = "ezil.org"
 pattern = "*-code.ezil.org/*"
 zone_name = "ezil.org"
 
+# AWS computers' browser hosts: `aws-<port>-<sandboxId>-aws.ezil.org` (worker/src/aws-origin.ts).
+# Same narrow-suffix rule as above; the existing proxied `*.ezil.org` wildcard record covers
+# DNS. Inert until AWS_ROUTING_ENABLED: every AWS route answers 404 before then. The AWS
+# ORIGIN hosts (`c-<sandboxId>-g<n>-e<n>.ezil.org`) need no route: the Worker creates their
+# proxied CNAMEs to `<tunnel>.cfargotunnel.com`, and its own same-zone fetch() goes to that
+# origin, bypassing every Worker route (no `global_fetch_strictly_public` flag).
+[[routes]]
+pattern = "*-aws.ezil.org/*"
+zone_name = "ezil.org"
+
 # HMAC secret for authenticating EBuilder → Worker calls.
 # Set in production with:  wrangler secret put SANDBOX_HMAC_SECRET
 # When unset (local dev), the Worker skips HMAC verification (v1 only; v2
@@ -389,4 +399,8 @@ zone_name = "ezil.work"
 
 [[env.staging.routes]]
 pattern = "*-code.ezil.work/*"
+zone_name = "ezil.work"
+
+[[env.staging.routes]]
+pattern = "*-aws.ezil.work/*"
 zone_name = "ezil.work"

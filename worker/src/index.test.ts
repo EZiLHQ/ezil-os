@@ -956,7 +956,7 @@ describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => 
     // loudly: a token with no route (silent 404 in production) and a route
     // with no token (a stale binding this Worker no longer serves).
     expect(new Set(patterns)).toEqual(
-      new Set(['*-app.ezil.org/*', '*-desktop.ezil.org/*', '*-nekodesktop.ezil.org/*', '*-code.ezil.org/*']),
+      new Set(['*-app.ezil.org/*', '*-desktop.ezil.org/*', '*-nekodesktop.ezil.org/*', '*-code.ezil.org/*', '*-aws.ezil.org/*']),
     );
     // Never the bare zone wildcard — that would shadow `sandbox.ezil.org` /
     // `neko.ezil.org` (and everything else on the zone), which is exactly the
@@ -967,8 +967,9 @@ describe('preview zone routing: index.ts and wrangler.toml cannot drift', () => 
   it('routes NOTHING this Worker cannot mint (no stale/orphan route bindings)', async () => {
     if (routesDisabled) return;
     const { portFor, appPortFor, codePortFor } = await import('./desktop-mode');
+    const { AWS_BROWSER_ROUTE_TOKEN } = await import('./aws-origin');
     const tokens = new Set(
-      [portFor('guacamole').token, portFor('neko').token, appPortFor('neko')?.token, codePortFor('neko')?.token].filter(
+      [portFor('guacamole').token, portFor('neko').token, appPortFor('neko')?.token, codePortFor('neko')?.token, AWS_BROWSER_ROUTE_TOKEN].filter(
         (t): t is string => typeof t === 'string',
       ),
     );

@@ -137,7 +137,7 @@ describe('AWS routing disabled (the default): behaviour unchanged', () => {
     expect((await worker.fetch(await signed('POST', '/internal/aws/tunnels', tunnelBody), e())).status).toBe(404);
   });
   it('an AWS browser hostname answers 404 aws_routing_disabled', async () => {
-    const res = await worker.fetch(new Request(`https://aws-8181-${SID}.ezil.work/`), e());
+    const res = await worker.fetch(new Request(`https://aws-8181-${SID}-aws.ezil.work/`), e());
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ ok: false, error: 'aws_routing_disabled' });
   });
@@ -172,7 +172,7 @@ describe('AWS routing enabled: tunnel → preview → bootstrap → signed origi
     expect(host.bad).toEqual([]);
     globalThis.fetch = realFetch;
     const boot = new URL(pv.guacamoleUrl!);
-    expect(boot.hostname).toBe(`aws-8181-${SID}.ezil.work`);
+    expect(boot.hostname).toBe(`aws-8181-${SID}-aws.ezil.work`);
 
     const b = await worker.fetch(new Request(boot.toString()), e);
     expect(b.status).toBe(302);
@@ -185,17 +185,17 @@ describe('AWS routing enabled: tunnel → preview → bootstrap → signed origi
     }) as typeof fetch;
     const now = Math.floor(Date.now() / 1000);
     // First visit: the auto-connect redirect adds neko's usr/embed and a non-secret pwd placeholder.
-    const r = await worker.fetch(new Request(`https://aws-8181-${SID}.ezil.work/index.html`, { headers: { cookie } }), e);
+    const r = await worker.fetch(new Request(`https://aws-8181-${SID}-aws.ezil.work/index.html`, { headers: { cookie } }), e);
     expect(r.status).toBe(302);
     expect(r.headers.get('location')).toBe('/index.html?usr=EZiL&pwd=ezil-preview&embed=1');
     expect(seen.length).toBe(0);
-    const d = await worker.fetch(new Request(`https://aws-8181-${SID}.ezil.work/index.html?usr=EZiL&pwd=ezil-preview&embed=1`, { headers: { cookie } }), e);
+    const d = await worker.fetch(new Request(`https://aws-8181-${SID}-aws.ezil.work/index.html?usr=EZiL&pwd=ezil-preview&embed=1`, { headers: { cookie } }), e);
     expect(d.status).toBe(200);
     expect(seen[0]!.url).toBe(`https://c-${SID}-g1-e2.${ORIGIN_ZONE}/__p/8181/index.html?usr=EZiL&pwd=ezil-preview&embed=1`);
     const v = await verifyGatewayHeader(seen[0]!.headers.get('x-ezil-gw'), KEY, { computerId: CID, generation: 1, leaseEpoch: 2 }, 'GET', '/__p/8181/index.html', now);
     expect(v).toEqual({ ok: true });
     expect(seen[0]!.headers.get('x-forwarded-host')).toBe(boot.hostname);
-    const codeHost = `aws-8443-${SID}.ezil.work`;
+    const codeHost = `aws-8443-${SID}-aws.ezil.work`;
     for (const upgrade of [false, true]) {
       const headers = new Headers({
         cookie, origin: `https://${codeHost}`, host: 'evil.example',
@@ -245,7 +245,7 @@ describe('AWS routing enabled: tunnel → preview → bootstrap → signed origi
       if (target === 'websocket') headers.set('upgrade', 'websocket');
       const request = target === 'preview'
         ? await signed('POST', '/sandbox/preview', previewBody)
-        : new Request(`https://aws-8443-${SID}.ezil.work/vscode`, { headers });
+        : new Request(`https://aws-8443-${SID}-aws.ezil.work/vscode`, { headers });
       expect((await worker.fetch(request, e)).status).toBe(502);
       expect(checks).toBe(2);
       expect(forwarded).toBe(0);

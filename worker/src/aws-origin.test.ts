@@ -107,11 +107,13 @@ describe('origin naming and the zone allowlist', () => {
 describe('Cloudflare hostnames are never claimed (regression)', () => {
   const cfHosts = [
     ROOT, `8181-${SID}-nekodesktop.${ROOT}`, `8080-${SID}-desktop.${ROOT}`, `3002-${SID}-app.${ROOT}`,
-    `8443-${SID}-code.${ROOT}`, `aws-9223-${SID}.${ROOT}`, `aws-8181-${SID}.other.org`, `aws-8181-${SID.toUpperCase()}x.${ROOT}`,
+    `8443-${SID}-code.${ROOT}`, `aws-9223-${SID}-aws.${ROOT}`, `aws-8181-${SID}-aws.other.org`, `aws-8181-${SID.toUpperCase()}x-aws.${ROOT}`,
+    // Without the route suffix the zone catch-all owns the host: never claim it.
+    `aws-8181-${SID}.${ROOT}`, `aws-8181-${SID}-awsx.${ROOT}`, `x-aws-8181-${SID}-aws.${ROOT}`,
   ];
   it('parseAwsBrowserHost returns null for every CF preview, bridge and foreign host', () => {
     for (const h of cfHosts) expect(parseAwsBrowserHost(h, ROOT)).toBeNull();
-    expect(parseAwsBrowserHost(`aws-8181-${SID}.${ROOT}`, ROOT)).toEqual({ port: 8181, sandboxId: SID });
+    expect(parseAwsBrowserHost(`aws-8181-${SID}-aws.${ROOT}`, ROOT)).toEqual({ port: 8181, sandboxId: SID });
   });
   it('handleAwsBrowserHost returns null (caller dispatch unchanged) and never fetches', async () => {
     const f = captureFetch();
@@ -131,13 +133,13 @@ describe('Cloudflare hostnames are never claimed (regression)', () => {
 describe('proxyToAwsOrigin', () => {
   it('signs the /__p/<port> path, strips client gw/auth/preview-cookie, keeps other cookies and query', async () => {
     const f = captureFetch();
-    const req = new Request(`https://aws-8443-${SID}.${ROOT}/vscode/a?folder=/root`, {
+    const req = new Request(`https://aws-8443-${SID}-aws.${ROOT}/vscode/a?folder=/root`, {
       method: 'POST', body: 'payload',
       headers: {
         [AWS_GATEWAY_HEADER]: 'gw1.1.forged', 'x-ezil-auth': 'v2.x.y', cookie: `ezil_preview=abc; vscode-tkn=keep`,
         host: 'evil.example', 'x-forwarded-host': 'evil.example, another.example',
         'x-forwarded-proto': 'http', forwarded: 'host=evil.example;proto=http',
-        origin: `https://aws-8443-${SID}.${ROOT}`,
+        origin: `https://aws-8443-${SID}-aws.${ROOT}`,
       },
     });
     const now = 1791964800;
@@ -148,10 +150,10 @@ describe('proxyToAwsOrigin', () => {
     const h = new Headers(init.headers);
     expect(h.get('x-ezil-auth')).toBeNull();
     expect(h.get('host')).toBeNull();
-    expect(h.get('x-forwarded-host')).toBe(`aws-8443-${SID}.${ROOT}`);
+    expect(h.get('x-forwarded-host')).toBe(`aws-8443-${SID}-aws.${ROOT}`);
     expect(h.get('x-forwarded-proto')).toBeNull();
     expect(h.get('forwarded')).toBeNull();
-    expect(h.get('origin')).toBe(`https://aws-8443-${SID}.${ROOT}`);
+    expect(h.get('origin')).toBe(`https://aws-8443-${SID}-aws.${ROOT}`);
     expect(h.get('cookie')).toBe('vscode-tkn=keep');
     expect(await verifyGatewayHeader(h.get(AWS_GATEWAY_HEADER), KEY, record(), 'POST', '/__p/8443/vscode/a', now)).toEqual({ ok: true });
     expect(init.redirect).toBe('manual');
@@ -159,11 +161,11 @@ describe('proxyToAwsOrigin', () => {
   });
   it('a WebSocket upgrade keeps its Upgrade header; GET carries no body', async () => {
     const f = captureFetch();
-    const req = new Request(`https://aws-8181-${SID}.${ROOT}/api/ws`, { headers: { upgrade: 'websocket', connection: 'Upgrade' } });
+    const req = new Request(`https://aws-8181-${SID}-aws.${ROOT}/api/ws`, { headers: { upgrade: 'websocket', connection: 'Upgrade' } });
     await proxyToAwsOrigin(req, new URL(req.url), record(), ZONE, 8181, f.fetch, 1791964800);
     const h = new Headers(f.calls[0]!.init.headers);
     expect(h.get('upgrade')).toBe('websocket');
-    expect(h.get('x-forwarded-host')).toBe(`aws-8181-${SID}.${ROOT}`);
+    expect(h.get('x-forwarded-host')).toBe(`aws-8181-${SID}-aws.${ROOT}`);
     expect(f.calls[0]!.init.body).toBeUndefined();
   });
   it('a port outside the edge set or a bad control key fails closed without fetching', async () => {
@@ -176,7 +178,7 @@ describe('proxyToAwsOrigin', () => {
 });
 
 describe('handleAwsBrowserHost', () => {
-  const host = `aws-8181-${SID}.${ROOT}`;
+  const host = `aws-8181-${SID}-aws.${ROOT}`;
   const deps = (over: Partial<Parameters<typeof handleAwsBrowserHost>[2]> = {}) => {
     const f = captureFetch();
     return { f, d: { routingEnabled: true, zone: ZONE, secrets: [SECRET], zoneRoot: ROOT, lookup: async () => record(), fetch: f.fetch, nowMs: Date.now, ...over } };
@@ -314,9 +316,9 @@ describe('handleAwsPreview', () => {
     const res = await handleAwsPreview(claims(), deps());
     const body = (await res.json()) as Record<string, string>;
     expect(body.provider).toBe('aws-ec2');
-    expect(new URL(body.guacamoleUrl!).hostname).toBe(`aws-8181-${SID}.${ROOT}`);
-    expect(new URL(body.codePreviewUrl!).hostname).toBe(`aws-8443-${SID}.${ROOT}`);
-    expect(new URL(body.appPreviewUrl!).hostname).toBe(`aws-3002-${SID}.${ROOT}`);
+    expect(new URL(body.guacamoleUrl!).hostname).toBe(`aws-8181-${SID}-aws.${ROOT}`);
+    expect(new URL(body.codePreviewUrl!).hostname).toBe(`aws-8443-${SID}-aws.${ROOT}`);
+    expect(new URL(body.appPreviewUrl!).hostname).toBe(`aws-3002-${SID}-aws.${ROOT}`);
     expect(JSON.stringify(body)).not.toContain(vectors.controlKeyBase64);
   });
   it('no secret: 401', async () => {
