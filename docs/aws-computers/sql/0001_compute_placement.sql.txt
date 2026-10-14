@@ -31,6 +31,10 @@ CREATE TABLE public.ezil_computer_placements (
   enroll_expires_at timestamptz NULL,
   lease_until timestamptz NULL,
   presence_at timestamptz NULL,
+  fence_token uuid NULL,
+  lifecycle_job_id uuid NULL,
+  lifecycle_digest text NULL,
+  last_error text NULL,
   updated_at timestamptz NOT NULL
 );
 CREATE INDEX ezil_computer_placements_computer_idx ON public.ezil_computer_placements (computer_id);

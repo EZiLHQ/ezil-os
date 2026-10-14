@@ -41,7 +41,8 @@ describe('placement SQL is inside the hosted additive grammar', () => {
             'computer_id uuid', 'owner_user_id uuid', 'provider text', 'workspace_store text', 'generation bigint', 'lease_epoch bigint',
             'state text', 'region text', 'zone_id text', 'instance_id text', 'instance_type text', 'volume_id text',
             'fs_uuid uuid', 'tunnel_id text', 'enroll_nonce_hash text', 'enroll_expires_at timestamptz',
-            'lease_until timestamptz', 'presence_at timestamptz', 'updated_at timestamptz',
+            'lease_until timestamptz', 'presence_at timestamptz', 'fence_token uuid', 'lifecycle_job_id uuid',
+            'lifecycle_digest text', 'last_error text', 'updated_at timestamptz',
         ]);
         expect(columns('ezil_compute_usage')).toEqual([
             'computer_id uuid', 'user_id uuid', 'instance_id text', 'instance_type text', 'started_at timestamptz',

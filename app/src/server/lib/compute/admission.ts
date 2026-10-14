@@ -130,12 +130,33 @@ export function decideAdmission(input: {
 
 export type AdmissionRequest =
     /** `userId` is the AUTHENTICATED session user; on create it becomes `owner_user_id`. */
-    | { kind: 'lease'; userId: string; computerId: string; expected: { generation: number; leaseEpoch: number }; leaseUntil: Date; replace?: boolean }
+    | {
+          kind: 'lease';
+          userId: string;
+          computerId: string;
+          expected: { generation: number; leaseEpoch: number };
+          leaseUntil: Date;
+          replace?: boolean;
+          /** Recorded in the lease's own compare-and-swap (this boot's job, fence and enrollment nonce hash). */
+          fields?: PlacementFields;
+      }
     /**
      * `tier` sizes the computer (`AWS_TIERS`); admission, not the caller,
      * chooses its region, so `fields.region` / `fields.instanceType` are ignored.
      */
-    | { kind: 'create'; userId: string; computerId: string; tier: AwsTier; fields?: PlacementFields };
+    | {
+          kind: 'create';
+          userId: string;
+          computerId: string;
+          tier: AwsTier;
+          fields?: PlacementFields;
+          /**
+           * Fields that depend on the region admission chose (the provision's job,
+           * digest and zone), computed inside the admission transaction once the
+           * region is known. Throwing aborts the transaction: nothing is written.
+           */
+          fieldsFor?: (region: string) => PlacementFields;
+      };
 
 export type AdmissionOutcome =
     | { admitted: true; placement: Placement }
@@ -180,11 +201,18 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
                       expected: request.expected,
                       leaseUntil: request.leaseUntil,
                       replace: request.replace,
+                      fields: request.fields,
                   })
                 : await createAwsPlacement(tx, lock, ticket, {
                       computerId: request.computerId,
                       ownerUserId: request.userId,
-                      fields: { ...request.fields, region: decision.region!, instanceType: instanceTypeForTier(request.tier) },
+                      fields: {
+                          ...request.fields,
+                          ...request.fieldsFor?.(decision.region!),
+                          // Admission's own decisions always win over caller-supplied fields.
+                          region: decision.region!,
+                          instanceType: instanceTypeForTier(request.tier),
+                      },
                   });
         if (!result.ok) return { admitted: false, reason: result.reason === 'illegal_transition' ? 'cas_conflict' : result.reason };
         return { admitted: true, placement: result.placement };

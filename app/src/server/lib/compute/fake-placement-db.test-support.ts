@@ -98,6 +98,10 @@ export function placementRow(over: Row & { computer_id: string }): Row {
         enroll_expires_at: null,
         lease_until: null,
         presence_at: null,
+        fence_token: null,
+        lifecycle_job_id: null,
+        lifecycle_digest: null,
+        last_error: null,
         updated_at: new Date('2026-10-01T00:00:00Z'),
         ...over,
     };
@@ -214,11 +218,20 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
             case 'cas': {
                 const m = text.match(/SET\s+([\s\S]*?)\s+WHERE\s+([\s\S]*?)\s+RETURNING/);
                 if (!m) throw new Error('fake db: unparsed update');
+                // `col = $n` (equality) and `col > $n::timestamptz` (a deadline, compared as instants).
                 const where = m[2]!.split(/\s+AND\s+/).map((pred) => {
-                    const w = pred.trim().match(/^(\w+) = (\$\d+(?:::\w+)?)$/);
+                    const w = pred.trim().match(/^(\w+) (=|>) (\$\d+(?:::\w+)?)$/);
                     if (!w) throw new Error(`fake db: unsupported predicate ${pred}`);
-                    return [w[1]!, value(w[2]!, params)] as const;
+                    if (w[2] === '>' && !w[3]!.endsWith('::timestamptz')) throw new Error(`fake db: unsupported comparison ${pred}`);
+                    return [w[1]!, value(w[3]!, params), w[2] as '=' | '>'] as const;
                 });
+                const instant = (v: unknown) => (v === null || v === undefined ? NaN : new Date(v as string | Date).getTime());
+                const matches = (r: Row, [col, v, op]: (typeof where)[number]) =>
+                    op === '>'
+                        ? instant(r[col]) > instant(v)
+                        : col === 'computer_id' || col === 'owner_user_id'
+                          ? uuidEq(r[col], v)
+                          : r[col] !== null && r[col] !== undefined && String(r[col]) === String(v);
                 const sets = m[1]!.split(/,\s*/).map((assign) => {
                     const inc = assign.match(/^(\w+) = (\w+) \+ (\$\d+)$/);
                     if (inc) return (r: Row) => (r[inc[1]!] = Number(r[inc[2]!]) + Number(value(inc[3]!, params)));
@@ -227,7 +240,7 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                     return (r: Row) => (r[set[1]!] = value(set[2]!.trim(), params));
                 });
                 // Atomic match-and-apply, like row-locked UPDATE re-evaluation.
-                const hit = placements.filter((r) => where.every(([col, v]) => (col === 'computer_id' || col === 'owner_user_id' ? uuidEq(r[col], v) : String(r[col]) === String(v))));
+                const hit = placements.filter((r) => where.every((w) => matches(r, w)));
                 for (const r of hit) {
                     const before = { ...r };
                     sets.forEach((apply) => apply(r));

@@ -11,6 +11,7 @@ import { AWS_STATE_FOR, createAwsEc2Provider, type AwsProviderDeps, type Lifecyc
 import type { AwsTier } from './aws-config';
 import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
+import { nonceHashOf } from './aws-enroll';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { PLACEMENT_STATES, PlacementOwnerError, readPlacement, transitionPlacementAsReconciler, type Placement, type PlacementState } from './placement';
 
@@ -34,8 +35,16 @@ const env = (over: Record<string, string> = {}) => ({
     EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '2',
     EZIL_AWS_MAX_RUNNING_US_EAST_1: '2',
     [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify(DEPLOYMENTS),
+    EZIL_AWS_ENROLL_URL: ENROLL_URL,
     ...over,
 });
+
+const ENROLL_URL = 'https://app.example.test/api/compute/aws/enroll';
+/** Deterministic nonce bytes: 32 × 0x07 → base64url 'BwcH…' (43 chars). */
+const NONCE_BYTES = Buffer.alloc(32, 7);
+const NONCE = NONCE_BYTES.toString('base64url');
+/** The host lease JSON a launch's user data carries (lease.py). */
+const leaseOf = (userData: string | null) => JSON.parse(Buffer.from(userData!, 'base64').toString('utf8')) as Record<string, unknown>;
 
 function recordingStarter(fail = false) {
     const calls: { region: string; stateMachineArn: string; name: string; intent: LifecycleIntent; digest: string }[] = [];
@@ -59,7 +68,7 @@ function setup(seed: Parameters<typeof createFakePlacementDb>[0] = {}, over: Par
         newId: () => crypto.randomUUID(),
         starter: 'starter' in over ? over.starter : rec.starter,
         tierFor: 'tierFor' in over ? over.tierFor : async () => over.tier ?? 'free',
-        enrollment: 'enrollment' in over ? over.enrollment : { issue: async () => ({ userData: 'ZXppbC1ub25jZQ==' }) },
+        randomBytes: over.randomBytes ?? (() => Buffer.from(NONCE_BYTES)),
     });
     return { ...fake, ...rec, provider };
 }
@@ -83,7 +92,9 @@ describe('configuration refusals happen before any statement', () => {
     it.each([
         ['no tier source', { tierFor: undefined }, 'aws_tier_unavailable'],
         ['tier source fails', { tierFor: async () => { throw new Error('billing down'); } }, 'aws_tier_unavailable'],
-        ['no enrollment issuer', { enrollment: undefined }, 'aws_enrollment_unavailable'],
+        ['no enrollment URL', { e: env({ EZIL_AWS_ENROLL_URL: '' }) }, 'aws_enrollment_unavailable'],
+        ['a plain-http enrollment URL', { e: env({ EZIL_AWS_ENROLL_URL: 'http://app.example.test/api/compute/aws/enroll' }) }, 'aws_enrollment_unavailable'],
+        ['an enrollment URL on another path', { e: env({ EZIL_AWS_ENROLL_URL: 'https://app.example.test/api/other' }) }, 'aws_enrollment_unavailable'],
     ] as const)('new computer with %s → %s and no placement written', async (_n, over, code) => {
         const { provider, placements, calls } = setup({}, over as never);
         expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: code, retryable: false });
@@ -103,7 +114,7 @@ describe('ensure: a new computer', () => {
         expect(call).toMatchObject({ region: 'us-east-1', stateMachineArn: DEPLOYMENTS['us-east-1'].stateMachineVersionArn, name: `computer-${call!.intent.jobId}` });
         expect(call!.intent).toMatchObject({
             operation: 'provision', computerId: C1, instanceType: 't3a.medium', dataVolumeGiB: 20, leaseEpoch: 1, targetGeneration: 1,
-            providerInstanceId: null, dataVolumeId: null, userData: 'ZXppbC1ub25jZQ==', deployment: DEPLOYMENTS['us-east-1'],
+            providerInstanceId: null, dataVolumeId: null, deployment: DEPLOYMENTS['us-east-1'],
         });
     });
 
@@ -121,12 +132,13 @@ describe('ensure: a new computer', () => {
         expect(calls).toEqual([]);
     });
 
-    it('a region deployment that does not allow the tier type: the intent is refused and the placement does not stay PROVISIONING', async () => {
+    it('a region deployment that does not allow the tier type: the intent is refused inside admission and NO row is written', async () => {
         const e = env({ [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ ...DEPLOYMENTS, 'ap-south-1': fixtureDeployment('ap-south-1', ['m6i.large']) }) });
-        const { provider, placements, calls } = setup({}, { e });
+        const { provider, placements, calls, statements } = setup({}, { e });
         expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ ok: false, errorCode: 'aws_intent_invalid' });
-        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+        expect(placements).toEqual([]);
         expect(calls).toEqual([]);
+        expect(statements.some((st) => st.sql === 'ROLLBACK')).toBe(true);
     });
 
     it('StartExecution refused → the placement is UNCONFIRMED, never a PROVISIONING row without an execution', async () => {
@@ -136,10 +148,48 @@ describe('ensure: a new computer', () => {
         expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
     });
 
-    it('enrollment failure after admission → UNCONFIRMED, nothing started', async () => {
-        const { provider, placements, calls } = setup({}, { enrollment: { issue: async () => { throw new Error('no nonce'); } } });
-        expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toMatchObject({ errorCode: 'aws_enrollment_unavailable' });
-        expect(placements[0]).toMatchObject({ state: 'UNCONFIRMED' });
+});
+
+describe('C-6 nonce issue at provision (step 1)', () => {
+    it('the launch user data carries the one-time nonce; the row holds ONLY its sha256 and a ≤10 min deadline, written by the same insert', async () => {
+        const { provider, placements, calls, statements } = setup();
+        await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        const lease = leaseOf(calls[0]!.intent.userData);
+        expect(lease).toEqual({
+            v: 1, computerId: C1, fsUuid: placements[0]!.fs_uuid, generation: 1, leaseEpoch: 1, nonce: NONCE, provision: true, enrollUrl: ENROLL_URL,
+        });
+        expect(placements[0]).toMatchObject({ enroll_nonce_hash: nonceHashOf(NONCE), enroll_expires_at: new Date(NOW.getTime() + 600_000).toISOString() });
+        // The plaintext is never written: no statement parameter holds it.
+        expect(JSON.stringify(statements.map((st) => st.params))).not.toContain(NONCE);
+        // One insert, carrying hash, deadline, fence, job and digest together.
+        const insert = statements.find((st) => st.sql.includes('placement:insert'))!;
+        for (const col of ['enroll_nonce_hash', 'enroll_expires_at', 'fence_token', 'lifecycle_job_id', 'lifecycle_digest', 'fs_uuid', 'zone_id']) expect(insert.sql).toContain(col);
+    });
+
+    it('the row records the job, digest and fence of exactly the execution that was started', async () => {
+        const { provider, placements, calls } = setup();
+        await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        expect(placements[0]).toMatchObject({
+            lifecycle_job_id: calls[0]!.intent.jobId, lifecycle_digest: calls[0]!.digest, fence_token: calls[0]!.intent.fenceToken,
+            zone_id: DEPLOYMENTS['ap-south-1'].zoneId, region: 'ap-south-1',
+        });
+        expect(calls[0]!.name).toBe(`computer-${calls[0]!.intent.jobId}`);
+    });
+
+    it('every provision gets a fresh nonce (two computers, two different hashes)', async () => {
+        const C2 = 'c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2';
+        let n = 0;
+        const { provider, placements } = setup({ computers: [{ id: C1, user_id: U1 }, { id: C2, user_id: U2 }] }, { randomBytes: () => Buffer.alloc(32, ++n) });
+        await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts);
+        await provider.ensure(ctx, { userId: U2, computerId: C2 }, opts);
+        expect(placements).toHaveLength(2);
+        expect(placements[0]!.enroll_nonce_hash).not.toBe(placements[1]!.enroll_nonce_hash);
+    });
+
+    it('a short random source is refused before any write', async () => {
+        const { provider, placements, calls } = setup({}, { randomBytes: () => Buffer.alloc(16, 1) });
+        await expect(provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).rejects.toThrow('32 random bytes');
+        expect(placements).toEqual([]);
         expect(calls).toEqual([]);
     });
 });

@@ -154,3 +154,48 @@ export function readAwsAdmissionConfig(env: Env = process.env): AwsAdmissionConf
     const kill = env.EZIL_AWS_KILL_SWITCH;
     return { enabled: true, killSwitch: kill !== undefined && kill !== '0', caps: caps as AwsAdmissionCaps, regions: regions.regions };
 }
+
+// ── Enrollment and wake (C-6) ────────────────────────────────────────────
+
+/** Where hosts post their C-6 enrollment: `https://<app host>/api/compute/aws/enroll`, nothing else. */
+export const AWS_ENROLL_URL_ENV = 'EZIL_AWS_ENROLL_URL';
+export const AWS_ENROLL_PATH = '/api/compute/aws/enroll';
+
+/** The configured enrollment URL, or null when unset or anything but a plain HTTPS URL to the enroll path. */
+export function readAwsEnrollUrl(env: Env): string | null {
+    const raw = env[AWS_ENROLL_URL_ENV]?.trim();
+    if (!raw) return null;
+    let url: URL;
+    try {
+        url = new URL(raw);
+    } catch {
+        return null;
+    }
+    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || (url.port !== '' && url.port !== '443')) return null;
+    if (url.pathname !== AWS_ENROLL_PATH || !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/.test(url.hostname)) return null;
+    return `https://${url.hostname}${AWS_ENROLL_PATH}`;
+}
+
+/**
+ * How a STOPPED computer wakes.
+ * - `replace` (default): a NEW instance boots on the retained data volume
+ *   (generation + 1). Its launch user data carries this epoch's one-time
+ *   enrollment nonce, so it needs no permission beyond the launch.
+ * - `start`: the SAME instance is started in place. Its nonce must be written
+ *   into user data while it is stopped (`ModifyInstanceAttribute`, userData only),
+ *   which the lifecycle deployment enables with `features.userDataNonce` only
+ *   after the staging proof. Without that, a started host has no nonce and can
+ *   never enroll, so `start` is refused unless the operator declares the
+ *   feature on (`EZIL_AWS_LIFECYCLE_USERDATA_NONCE=1`, mirroring the deployed
+ *   lifecycle settings).
+ */
+export const AWS_WAKE_MODE_ENV = 'EZIL_AWS_WAKE_MODE';
+export const AWS_USERDATA_NONCE_ENV = 'EZIL_AWS_LIFECYCLE_USERDATA_NONCE';
+export type AwsWakeMode = 'replace' | 'start';
+
+export function readAwsWakeMode(env: Env): { ok: true; mode: AwsWakeMode } | { ok: false; invalid: string } {
+    const raw = env[AWS_WAKE_MODE_ENV];
+    if (raw === undefined || raw === 'replace') return { ok: true, mode: 'replace' };
+    if (raw === 'start') return env[AWS_USERDATA_NONCE_ENV] === '1' ? { ok: true, mode: 'start' } : { ok: false, invalid: AWS_USERDATA_NONCE_ENV };
+    return { ok: false, invalid: AWS_WAKE_MODE_ENV };
+}

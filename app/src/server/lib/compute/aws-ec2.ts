@@ -7,10 +7,15 @@
  * - `createAwsEc2Provider`: the real lifecycle path. It reads and writes
  *   placements only through `placement.ts`/`admission.ts`, and starts
  *   lifecycle executions only through an injected `LifecycleStarter`. With a
- *   missing starter, tier source or enrollment issuer it refuses BEFORE any
+ *   missing starter, tier source or enrollment URL it refuses BEFORE any
  *   write (`aws_lifecycle_unconfigured`, `aws_tier_unavailable`,
  *   `aws_enrollment_unavailable`), so a half-configured deployment never
  *   leaves a placement without an execution.
+ *
+ * C-6 enrollment material is issued HERE, for every boot that launches or
+ * starts an instance: a one-time nonce whose sha256 and deadline are written
+ * in the SAME statement as the placement change that admits the boot, and
+ * whose plaintext goes only into that intent's user data (`aws-enroll.ts`).
  *
  * Persistence model: the computer's disk is a retained EBS data volume.
  * Stop/idle = instance stopped (no running services; EBS only). Wake = cold
@@ -19,11 +24,20 @@
  * answers `capacity_unavailable`, it never moves the computer.
  */
 
-import { randomUUID } from 'node:crypto';
+import { randomBytes as nodeRandomBytes, randomUUID } from 'node:crypto';
 
 import { runAdmission, type AdmissionRefusal } from './admission';
-import { AWS_TIER_DATA_GIB, isAwsComputersEnabled, readAwsAdmissionConfig, type AwsTier, type Env } from './aws-config';
-import { buildLifecycleWork, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleDeployment, type LifecycleIntent, type LifecycleOperation } from './aws-intent';
+import { AWS_TIER_DATA_GIB, instanceTypeForTier, isAwsComputersEnabled, readAwsAdmissionConfig, readAwsEnrollUrl, type AwsTier, type Env } from './aws-config';
+import { buildEnrollmentUserData, EnrollmentUserDataError, issueEnrollmentNonce } from './aws-enroll';
+import {
+    buildLifecycleWork,
+    LifecycleIntentInvalidError,
+    readLifecycleDeployments,
+    type LifecycleDeployment,
+    type LifecycleIntent,
+    type LifecycleOperation,
+    type LifecycleWork,
+} from './aws-intent';
 import { PlacementOwnerError, readPlacement, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
 import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult } from './provider';
 
@@ -78,11 +92,6 @@ export interface LifecycleStarter {
     start(region: string, work: { stateMachineArn: string; name: string; input: string }): Promise<void>;
 }
 
-/** C-6 one-time enrollment material for a launch (host agent `enroll.py`). Lane A3. */
-export interface EnrollmentIssuer {
-    issue(placement: Placement): Promise<{ userData: string }>;
-}
-
 export interface AwsProviderDeps {
     db: PlacementDb;
     env?: () => Env;
@@ -92,7 +101,8 @@ export interface AwsProviderDeps {
     starter?: LifecycleStarter;
     /** The user's entitlement (free / plus). Never defaulted. */
     tierFor?: (userId: string) => Promise<AwsTier>;
-    enrollment?: EnrollmentIssuer;
+    /** Source of the enrollment nonce's 32 bytes (tests make it deterministic). */
+    randomBytes?: (n: number) => Buffer;
     /** Lease length on a wake. */
     leaseSeconds?: number;
 }
@@ -125,16 +135,19 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
     const now = deps.now ?? (() => new Date());
     const newId = deps.newId ?? (() => randomUUID());
     const leaseSeconds = deps.leaseSeconds ?? 3600;
+    const randomBytes = deps.randomBytes ?? nodeRandomBytes;
 
     /** Flag, admission config and every configured region's deployment, or the refusal code. */
-    const configured = (): { ok: true; e: Env; deployments: Record<string, LifecycleDeployment> } | { ok: false; code: string } => {
+    const configured = ():
+        | { ok: true; e: Env; deployments: Record<string, LifecycleDeployment>; enrollUrl: string | null }
+        | { ok: false; code: string } => {
         const e = env();
         if (!isAwsComputersEnabled(e)) return { ok: false, code: AWS_DISABLED };
         const config = readAwsAdmissionConfig(e);
         if (!config.enabled) return { ok: false, code: config.reason };
         const d = readLifecycleDeployments(e, config.regions.map((r) => r.name));
         if (!d.ok) return { ok: false, code: 'aws_config_invalid' };
-        return { ok: true, e, deployments: d.deployments };
+        return { ok: true, e, deployments: d.deployments, enrollUrl: readAwsEnrollUrl(e) };
     };
 
     /** The caller's own aws-ec2 placement, or null when there is none. Another owner is NOT_FOUND upstream. */
@@ -169,12 +182,12 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         userData: extra.userData,
     });
 
-    /** Build and start; on any failure undo the placement step that preceded it. */
-    const launch = async (owner: string, p: Placement, intent: LifecycleIntent, undo: PlacementState): Promise<'started' | 'invalid' | 'failed'> => {
+    /** Build and start; on any failure undo the placement step that preceded it. A prebuilt `work` is started as is. */
+    const launch = async (owner: string, p: Placement, intent: LifecycleIntent | LifecycleWork, undo: PlacementState): Promise<'started' | 'invalid' | 'failed'> => {
         const region = p.region!;
-        let work;
+        let work: LifecycleWork;
         try {
-            work = buildLifecycleWork(intent);
+            work = 'input' in intent ? intent : buildLifecycleWork(intent);
         } catch (error) {
             if (!(error instanceof LifecycleIntentInvalidError)) throw error;
             await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: owner, expected: p, to: undo });
@@ -203,27 +216,68 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             const placement = await ownPlacement(c);
 
             if (!placement) {
-                if (!deps.tierFor || !deps.enrollment) return notReady(deps.tierFor ? 'aws_enrollment_unavailable' : 'aws_tier_unavailable');
+                if (!deps.tierFor) return notReady('aws_tier_unavailable');
+                const enrollUrl = cfg.enrollUrl;
+                if (!enrollUrl) return notReady('aws_enrollment_unavailable');
                 let tier: AwsTier;
                 try {
                     tier = await deps.tierFor(c.userId);
                 } catch {
                     return notReady('aws_tier_unavailable');
                 }
-                const admitted = await runAdmission(deps.db, { kind: 'create', userId: c.userId, computerId: c.computerId, tier }, { env: cfg.e, now });
+                // Everything the provision's intent needs is known before the insert: an
+                // AWS row starts at generation 1, lease epoch 1 (the provision is its first
+                // lease; the first wake leases 2, C-3/C-4), and admission names the region.
+                // So the intent is built INSIDE the admission transaction, and its job,
+                // digest, fence and nonce hash are written by the same insert. An intent
+                // the helper would refuse aborts the transaction: no row is ever written
+                // without an execution to answer it.
+                const computerId = c.computerId.toLowerCase();
+                const fsUuid = newId();
+                const fenceToken = newId();
+                const nonce = issueEnrollmentNonce(now(), randomBytes);
+                let work: LifecycleWork | undefined;
+                let admitted;
+                try {
+                    admitted = await runAdmission(
+                        deps.db,
+                        {
+                            kind: 'create',
+                            userId: c.userId,
+                            computerId: c.computerId,
+                            tier,
+                            fieldsFor: (region) => {
+                                const deployment = cfg.deployments[region];
+                                if (!deployment) throw new LifecycleIntentInvalidError();
+                                const userData = buildEnrollmentUserData({
+                                    computerId, volumeId: null, fsUuid, generation: 1, leaseEpoch: 1, nonce: nonce.nonce, provision: true, enrollUrl,
+                                });
+                                work = buildLifecycleWork({
+                                    schemaVersion: 1, jobId: newId(), computerId, revision: 1, operation: 'provision', targetGeneration: 1, fenceToken,
+                                    providerInstanceId: null, dataVolumeId: null, previousGeneration: null, previousInstanceId: null, previousFenceToken: null,
+                                    deployment, instanceType: instanceTypeForTier(tier), dataVolumeGiB: AWS_TIER_DATA_GIB[tier], leaseEpoch: 1, userData,
+                                });
+                                return {
+                                    zoneId: deployment.zoneId, fsUuid, fenceToken,
+                                    enrollNonceHash: nonce.nonceHash, enrollExpiresAt: nonce.expiresAt,
+                                    lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest,
+                                };
+                            },
+                        },
+                        { env: cfg.e, now },
+                    );
+                } catch (error) {
+                    if (error instanceof LifecycleIntentInvalidError || error instanceof EnrollmentUserDataError) return notReady('aws_intent_invalid');
+                    throw error;
+                }
                 if (!admitted.admitted) return refusal(admitted.reason);
                 const p = admitted.placement;
-                let userData: string;
-                try {
-                    ({ userData } = await deps.enrollment.issue(p));
-                } catch {
+                // The row must be exactly what the intent was built for (generation 1, epoch 1).
+                if (!work || p.generation !== 1 || p.leaseEpoch !== work.intent.leaseEpoch || p.lifecycleJobId !== work.intent.jobId) {
                     await transitionPlacement(deps.db, { computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'UNCONFIRMED' });
-                    return notReady('aws_enrollment_unavailable');
+                    return notReady('aws_intent_invalid');
                 }
-                // A provision is the computer's first lease: the row was created at epoch 1 and the
-                // intent carries exactly the row's epoch, so the first wake leases 2 (C-3/C-4).
-                const intent = intentFor(p, 'provision', cfg.deployments[p.region!]!, { userData, dataVolumeGiB: AWS_TIER_DATA_GIB[tier], leaseEpoch: p.leaseEpoch });
-                const r = await launch(c.userId, p, intent, 'UNCONFIRMED');
+                const r = await launch(c.userId, p, work, 'UNCONFIRMED');
                 return r === 'started' ? notReady('computer_starting', true) : notReady(r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed');
             }
 
