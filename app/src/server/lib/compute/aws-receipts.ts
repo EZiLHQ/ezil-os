@@ -17,9 +17,13 @@ import { z } from 'zod';
 import { AWS_TIERS, isAwsComputersEnabled, readAwsAdmissionConfig, readAwsRegions, type AwsAdmissionCaps, type AwsTier, type Env } from './aws-config';
 import type { LifecycleStarter } from './aws-ec2';
 import { awsSandboxId, type Ec2EnrollmentDescriber, type TunnelClient } from './aws-enroll';
+import { isDefiniteAwsRefusal, isExecutionAbsent } from './aws-errors';
 import { buildLifecycleWork, currentGenerationIntent, LifecycleIntentInvalidError, readLifecycleDeployments, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
 import {
     ENROLLMENT_SUCCEEDED,
+    LIFECYCLE_START_FAILED,
+    lifecycleStartUnknownUndo,
+    markLifecycleStartUnknown,
     claimAwsPlacementsPendingRetire,
     claimAwsPlacementsToReconcile,
     PlacementIntegrityError,
@@ -103,6 +107,52 @@ export interface ReceiptDeps {
     executions?: LifecycleExecutionReader;
     /** GW-1, to fence (delete) a stopped generation's tunnel. */
     tunnels?: TunnelClient;
+    /** Re-starts a recorded stop/retire whose start never reached Step Functions (`settleUnknownStart`). */
+    starter?: LifecycleStarter;
+    /** Clock for the settle window of an unknown start; tests inject it. */
+    clock?: () => Date;
+    /** Backoff between StartExecution attempts; tests inject an instant one. */
+    sleep?: (ms: number) => Promise<void>;
+}
+
+// ── Starting a recorded job (StartExecution) ─────────────────────────────
+
+/** StartExecution attempts per start (the first plus retries) when the answer is lost. */
+export const START_ATTEMPTS = 3;
+const START_BACKOFF_MS = [250, 1000] as const;
+/**
+ * How long a recorded job may stay unknown to DescribeExecution before its start is KNOWN
+ * never to have reached Step Functions (a lost request, not a lost answer).
+ */
+export const START_SETTLE_MS = 5 * 60_000;
+
+const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * StartExecution of a RECORDED job. Its name is `computer-<jobId>` and its input is
+ * fixed by the job's digest, so repeating it is idempotent: Step Functions returns the
+ * running execution, or the starter treats `ExecutionAlreadyExists` as success.
+ * - `started`: it was accepted (on some attempt).
+ * - `refused`: AWS answered with a refusal (`isDefiniteAwsRefusal`): nothing runs.
+ * - `unknown`: no attempt got an answer (5xx, timeout, connection lost): the execution
+ *   may be running. Never treat this as a refusal.
+ */
+export async function startLifecycleJob(
+    starter: LifecycleStarter,
+    region: string,
+    work: Pick<LifecycleWork, 'stateMachineArn' | 'name' | 'input'>,
+    sleep: (ms: number) => Promise<void> = defaultSleep,
+): Promise<'started' | 'refused' | 'unknown'> {
+    for (let attempt = 1; ; attempt++) {
+        try {
+            await starter.start(region, { stateMachineArn: work.stateMachineArn, name: work.name, input: work.input });
+            return 'started';
+        } catch (error) {
+            if (isDefiniteAwsRefusal(error)) return 'refused';
+            if (attempt >= START_ATTEMPTS) return 'unknown';
+            await sleep(START_BACKOFF_MS[Math.min(attempt - 1, START_BACKOFF_MS.length - 1)]!);
+        }
+    }
 }
 
 /**
@@ -130,8 +180,12 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     let e;
     try {
         e = await deps.executions.describe(p.region!, lifecycleExecutionArn(deployment, p.lifecycleJobId));
-    } catch {
-        return; // Unknown: report the current state, try again on the next poll.
+    } catch (error) {
+        // No such execution, for a job whose start got no answer: once that is settled, the
+        // request never reached Step Functions (`settleUnknownStart`). Otherwise unknown:
+        // report the current state, try again on the next poll.
+        if (isExecutionAbsent(error)) await settleUnknownStart(deps, p, deployment);
+        return;
     }
     if (e.status === 'RUNNING') return;
     if (e.status !== 'SUCCEEDED') {
@@ -207,16 +261,54 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     }
 }
 
+/**
+ * The recorded job of an in-flight placement whose start got no answer
+ * (`lifecycle_start_unknown:<undo>`, `markLifecycleStartUnknown`) and which Step Functions
+ * does not know (`ExecutionDoesNotExist`). Before `START_SETTLE_MS` a start may still
+ * appear: nothing changes. After it, the start is known not to have happened:
+ * - a stop or retire carries no secret, so its exact job is rebuilt from the placement
+ *   (digest-checked: the same name and input) and started again; still no answer re-marks
+ *   it (a new settle window); a refusal falls through to the undo;
+ * - a provision or wake carries its boot's enrollment nonce, which is never stored, so it
+ *   cannot be rebuilt: the placement goes to the recorded undo state, job cleared, exactly
+ *   where a refused StartExecution would have left it.
+ */
+async function settleUnknownStart(deps: ReceiptDeps, p: Placement, deployment: LifecycleDeployment): Promise<void> {
+    const undo = lifecycleStartUnknownUndo(p);
+    if (!undo || !p.lifecycleJobId || !p.lifecycleDigest || !p.region) return;
+    if ((deps.clock ?? (() => new Date()))().getTime() - p.updatedAt.getTime() < START_SETTLE_MS) return;
+    const operation = p.state === 'DRAINING' || p.state === 'STOPPING' ? 'stop' : p.state === 'RETIRING' ? 'retire' : null;
+    if (operation && deps.starter) {
+        let work: LifecycleWork | null = null;
+        try {
+            const rebuilt = buildLifecycleWork(currentGenerationIntent(p, operation, deployment, { jobId: p.lifecycleJobId, userData: null, leaseEpoch: p.leaseEpoch }));
+            if (rebuilt.digest === p.lifecycleDigest) work = rebuilt;
+        } catch (error) {
+            if (!(error instanceof LifecycleIntentInvalidError)) throw error;
+        }
+        if (work) {
+            const outcome = await startLifecycleJob(deps.starter, p.region, work, deps.sleep);
+            if (outcome === 'started') return; // The next look follows the execution.
+            if (outcome === 'unknown') {
+                await markLifecycleStartUnknown(deps.db, { computerId: p.computerId, expected: p, undo });
+                return;
+            }
+        }
+    }
+    await transitionPlacementAsReconciler(deps.db, {
+        computerId: p.computerId, expected: p, to: undo, fields: { lifecycleJobId: null, lifecycleDigest: null, lastError: LIFECYCLE_START_FAILED },
+    });
+}
+
 // ── Guest-initiated idle stop (R9) ───────────────────────────────────────
 
 export interface GuestStopDeps extends ReceiptDeps {
     /** Read-only EC2 describe in the placement's region (the app caller's enrollment describer). */
     describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'>;
-    starter?: LifecycleStarter;
     /** Lower-case uuid v4. */
     newId?: () => string;
-    /** The background pass's clock (session limits); tests inject it. */
-    clock?: () => Date;
+    /** Set when the pass's time budget ran out: stop before the next placement. */
+    signal?: AbortSignal;
 }
 
 /**
@@ -266,11 +358,15 @@ async function startStopAsReconciler(deps: GuestStopDeps, p: Placement, deployme
         computerId: p.computerId, expected: p, to: 'DRAINING', fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: reason },
     });
     if (!draining.ok) return false;
-    try {
-        await deps.starter.start(p.region, { stateMachineArn: work.stateMachineArn, name: work.name, input: work.input });
-    } catch {
+    const outcome = await startLifecycleJob(deps.starter, p.region, work, deps.sleep);
+    if (outcome === 'refused') {
         await transitionPlacementAsReconciler(deps.db, { computerId: p.computerId, expected: draining.placement, to: 'UNCONFIRMED', fields: { lastError: 'guest_stop_start_failed' } });
         return false;
+    }
+    if (outcome === 'unknown') {
+        // It may be running: stay DRAINING with the job, the receipt path follows or settles it.
+        await markLifecycleStartUnknown(deps.db, { computerId: p.computerId, expected: draining.placement, undo: 'UNCONFIRMED' });
+        return true;
     }
     await transitionPlacementAsReconciler(deps.db, { computerId: p.computerId, expected: draining.placement, to: 'STOPPING' });
     return true;
@@ -358,6 +454,7 @@ export async function reconcileAwsFleet(
     // One usage read per pass, only when caps can bind and a row may be RUNNING.
     const usage = policy?.caps && claimed.length > 0 ? policy.usage ?? (await readMonthUsage(deps.db, policy.now, utcMonthStart(policy.now))) : undefined;
     for (const { computerId } of claimed) {
+        if (deps.signal?.aborted) break; // Out of budget: the rest rotate to the next pass.
         try {
             const { record } = await readPlacement(deps.db, computerId);
             const deployment = record && record.provider === 'aws-ec2' ? deployments[record.region ?? ''] : undefined;
@@ -400,14 +497,14 @@ export async function startRetireAsReconciler(deps: GuestStopDeps, p: Placement,
         computerId: p.computerId, expected: p, to: 'RETIRING', fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
     });
     if (!retiring.ok) return false;
-    try {
-        await deps.starter.start(p.region, { stateMachineArn: work.stateMachineArn, name: work.name, input: work.input });
-    } catch {
+    const outcome = await startLifecycleJob(deps.starter, p.region, work, deps.sleep);
+    if (outcome === 'refused') {
         await transitionPlacementAsReconciler(deps.db, {
             computerId: p.computerId, expected: retiring.placement, to: p.state, fields: { lifecycleJobId: null, lifecycleDigest: null, lastError: 'retire_start_failed' },
         });
         return false;
     }
+    if (outcome === 'unknown') await markLifecycleStartUnknown(deps.db, { computerId: p.computerId, expected: retiring.placement, undo: p.state });
     return true;
 }
 
@@ -465,14 +562,14 @@ export async function recoverDeletedAwsPlacement(
         computerId: p.computerId, expected: current, to: 'RETIRING', fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
     });
     if (!retiring.ok) return 'skipped';
-    try {
-        await deps.starter.start(p.region, { stateMachineArn: work.stateMachineArn, name: work.name, input: work.input });
-    } catch {
+    const outcome = await startLifecycleJob(deps.starter, p.region, work, deps.sleep);
+    if (outcome === 'refused') {
         await transitionPlacementAsReconciler(deps.db, {
             computerId: p.computerId, expected: retiring.placement, to: 'UNCONFIRMED', fields: { lifecycleJobId: null, lifecycleDigest: null, lastError: 'retire_start_failed' },
         });
         return 'skipped';
     }
+    if (outcome === 'unknown') await markLifecycleStartUnknown(deps.db, { computerId: p.computerId, expected: retiring.placement, undo: 'UNCONFIRMED' });
     return 'retire_started';
 }
 
@@ -494,6 +591,7 @@ export async function reconcileDeletedAwsComputers(
     let retired = 0;
     let stuck = 0;
     for (const { computerId } of await claimAwsPlacementsPendingRetire(deps.db, limit)) {
+        if (deps.signal?.aborted) break; // Out of budget: the rest rotate to the next pass.
         try {
             const { record } = await readPlacement(deps.db, computerId);
             const deployment = record && record.provider === 'aws-ec2' ? deployments[record.region ?? ''] : undefined;
@@ -531,6 +629,8 @@ export async function runAwsBackgroundReconcile(
     if (!d.ok) return { ok: true, skipped: 'aws_config_invalid' };
     const deleted = await reconcileDeletedAwsComputers(deps, d.deployments);
     // Lapsed leases and reached hour caps are stopped here too, for computers nobody touches.
-    const fleet = await reconcileAwsFleet(deps, d.deployments, FLEET_RECONCILE_LIMIT, { now: (deps.clock ?? (() => new Date()))(), caps: sessionLimitCaps(env) });
+    const fleet = deps.signal?.aborted
+        ? { checked: 0, stopsStarted: 0, limitStops: 0 }
+        : await reconcileAwsFleet(deps, d.deployments, FLEET_RECONCILE_LIMIT, { now: (deps.clock ?? (() => new Date()))(), caps: sessionLimitCaps(env) });
     return { ok: true, deleted, fleet };
 }

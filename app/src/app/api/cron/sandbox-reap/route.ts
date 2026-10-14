@@ -137,7 +137,7 @@ export async function GET(req: Request): Promise<Response> {
             : {}),
         // AWS on: drive deleted AWS computers to RETIRED and settle the fleet (its own job).
         ...(isAwsComputersEnabled(process.env)
-            ? { awsReconcile: () => runAwsBackgroundReconcile(process.env, { db: db as unknown as PlacementDb, ...defaultAwsCollaborators(process.env) }) }
+            ? { awsReconcile: (signal: AbortSignal) => runAwsBackgroundReconcile(process.env, { db: db as unknown as PlacementDb, ...defaultAwsCollaborators(process.env), signal }) }
             : {}),
         deriveSandboxName: (userId, computerId) => {
             const sandboxName = deriveGuacamoleSandboxId(userId, computerId);

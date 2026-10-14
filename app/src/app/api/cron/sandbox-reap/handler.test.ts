@@ -393,3 +393,47 @@ describe('the stale cutoff is bound as an ISO timestamptz, never a raw Date', ()
         expect(text).toMatch(/last_opened_at < \$1::timestamptz/);
     });
 });
+
+describe('Codex 4277262205: an AWS outage can never starve the Cloudflare reaper', () => {
+    const secret = 'x'.repeat(32);
+    const STALE = [{ id: 'c-1', user_id: 'u-1', last_opened_at: new Date('2026-01-01T00:00:00Z') }];
+
+    it('the reap runs while the AWS pass is still in flight (the two jobs are concurrent)', async () => {
+        let finishAws!: (v: unknown) => void;
+        const awsReconcile = vi.fn(() => new Promise<unknown>((resolve) => { finishAws = resolve; }));
+        const terminate = vi.fn().mockResolvedValue({ ok: true, terminated: true });
+        const db = makeDb(STALE);
+        const pending = handleSandboxReap(req(`Bearer ${secret}`), baseDeps({
+            cronSecret: secret, db, awsReconcile, checkRunning: vi.fn().mockResolvedValue(true), terminate,
+        }));
+        await vi.waitFor(() => expect(terminate).toHaveBeenCalledTimes(1));
+        finishAws({ ok: true, fleet: { checked: 3 } });
+        const body = await (await pending).json();
+        expect(body).toMatchObject({ ok: true, reaped: 1, aws: { ok: true, fleet: { checked: 3 } } });
+    });
+
+    it('an AWS pass that hangs past its budget is cut off: aborted, reported as a timeout, and the reap result stands', async () => {
+        let seen: AbortSignal | undefined;
+        const awsReconcile = vi.fn((signal: AbortSignal) => {
+            seen = signal;
+            return new Promise<unknown>(() => {}); // never settles: an AWS outage
+        });
+        const terminate = vi.fn().mockResolvedValue({ ok: true, terminated: true });
+        const res = await handleSandboxReap(req(`Bearer ${secret}`), baseDeps({
+            cronSecret: secret, db: makeDb(STALE), awsReconcile, awsBudgetMs: 20, checkRunning: vi.fn().mockResolvedValue(true), terminate,
+        }));
+        expect(res.status).toBe(200);
+        expect(await res.json()).toMatchObject({ ok: true, reaped: 1, aws: { ok: false, error: 'aws_reconcile_timeout' } });
+        expect(terminate).toHaveBeenCalledTimes(1);
+        expect(seen?.aborted).toBe(true);
+    });
+
+    it('a pass that finishes inside its budget is not aborted', async () => {
+        let seen: AbortSignal | undefined;
+        const awsReconcile = vi.fn(async (signal: AbortSignal) => { seen = signal; return { ok: true }; });
+        const body = await (await handleSandboxReap(req(`Bearer ${secret}`), baseDeps({ cronSecret: secret, awsReconcile, awsBudgetMs: 5_000 }))).json();
+        expect(body).toMatchObject({ ok: true, aws: { ok: true } });
+        expect(seen?.aborted).toBe(false);
+    });
+});
+

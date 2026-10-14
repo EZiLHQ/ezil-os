@@ -198,8 +198,12 @@ export interface SandboxReapDeps {
      * deleted AWS computers to RETIRED and settles the live fleet. Its own job: it runs
      * after the bearer check whatever the reap kill switch says (that switch governs
      * Cloudflare reaping only), and a failure is reported in `aws`, never blocking the reap.
+     * It runs CONCURRENTLY with the reap, under `awsBudgetMs`: past it the signal is aborted
+     * and the summary is `aws_reconcile_timeout`.
      */
-    awsReconcile?(): Promise<unknown>;
+    awsReconcile?(signal: AbortSignal): Promise<unknown>;
+    /** The AWS pass's hard budget; defaults to `AWS_RECONCILE_BUDGET_MS`. */
+    awsBudgetMs?: number;
     /** Derive the sandbox name for a (userId, computerId) pair — MUST match
      * `deriveGuacamoleSandboxId`/`deriveSandboxId`. Injected rather than
      * imported directly so tests never need a real HMAC/Worker config. */
@@ -234,19 +238,47 @@ export async function handleSandboxReap(req: Request, deps: SandboxReapDeps): Pr
     const authHeader = req.headers.get('authorization');
     if (authHeader !== `Bearer ${deps.cronSecret}`) return NOT_FOUND();
 
-    let aws: SandboxReapResponseBody['aws'];
-    if (deps.awsReconcile) {
-        try {
-            aws = await deps.awsReconcile();
-        } catch (err) {
-            console.error('[sandbox-reap] aws reconcile failed', { m: String((err as Error)?.message ?? err) });
-            aws = { ok: false, error: 'aws_reconcile_failed' };
-        }
-    }
+    // Two independent jobs, run CONCURRENTLY: the AWS pass under its own hard budget, so a
+    // slow or failing AWS can never delay or disable the Cloudflare billing backstop below.
+    const awsPass = deps.awsReconcile ? runAwsPassWithBudget(deps.awsReconcile, deps.awsBudgetMs ?? AWS_RECONCILE_BUDGET_MS) : Promise.resolve(undefined);
+    const [reap, aws] = await Promise.all([reapCloudflare(deps), awsPass]);
+    const body: SandboxReapResponseBody = { ...reap.body, ...(aws !== undefined ? { aws } : {}) };
+    return Response.json(body, { status: reap.status });
+}
 
+/** The AWS pass's share of the route's `maxDuration` (90 s); the Cloudflare reaper runs alongside it. */
+export const AWS_RECONCILE_BUDGET_MS = 60_000;
+
+/**
+ * Run the AWS background reconcile with a hard deadline: past `budgetMs` its signal is
+ * aborted (the pass stops before its next placement) and the summary is
+ * `aws_reconcile_timeout`, whatever it was doing. A throw is `aws_reconcile_failed`.
+ */
+async function runAwsPassWithBudget(run: (signal: AbortSignal) => Promise<unknown>, budgetMs: number): Promise<unknown> {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<unknown>((resolve) => {
+        timer = setTimeout(() => {
+            controller.abort();
+            console.error('[sandbox-reap] aws reconcile out of budget', { budgetMs });
+            resolve({ ok: false, error: 'aws_reconcile_timeout' });
+        }, budgetMs);
+    });
+    const pass = run(controller.signal).catch((err: unknown) => {
+        console.error('[sandbox-reap] aws reconcile failed', { m: String((err as Error)?.message ?? err) });
+        return { ok: false, error: 'aws_reconcile_failed' };
+    });
+    try {
+        return await Promise.race([pass, deadline]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/** The Cloudflare reap (everything below the bearer check except the AWS pass). */
+async function reapCloudflare(deps: SandboxReapDeps): Promise<{ status: number; body: SandboxReapResponseBody }> {
     if (reapCronDisabled(deps.killSwitch)) {
-        const body: SandboxReapResponseBody = { ok: true, skipped: true, reason: 'kill_switch_disabled', ...(aws !== undefined ? { aws } : {}) };
-        return Response.json(body);
+        return { status: 200, body: { ok: true, skipped: true, reason: 'kill_switch_disabled' } };
     }
 
     const now = (deps.now ?? (() => new Date()))();
@@ -323,17 +355,9 @@ export async function handleSandboxReap(req: Request, deps: SandboxReapDeps): Pr
             }
         }
 
-        const body: SandboxReapResponseBody = {
-            ok: true,
-            candidates: candidates.length,
-            reaped,
-            results,
-            ...(aws !== undefined ? { aws } : {}),
-        };
-        return Response.json(body);
+        return { status: 200, body: { ok: true, candidates: candidates.length, reaped, results } };
     } catch (err) {
         console.error('[sandbox-reap] cron run failed', { m: String((err as Error)?.message ?? err) });
-        const body: SandboxReapResponseBody = { ok: false, error: 'internal_error', ...(aws !== undefined ? { aws } : {}) };
-        return Response.json(body, { status: 500 });
+        return { status: 500, body: { ok: false, error: 'internal_error' } };
     }
 }
