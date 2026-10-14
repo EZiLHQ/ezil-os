@@ -325,7 +325,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         // The stop's job and digest are recorded by the same compare-and-swap that starts draining.
         const draining = await transitionPlacement(deps.db, {
             computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'DRAINING',
-            fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
+            fields: { enrollConsumedHash: null, enrollExpiresAt: null, lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
         });
         if (!draining.ok) return { ok: false, terminated: false, outcome: 'cas_conflict' };
         const d = draining.placement;
@@ -354,7 +354,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         }
         const retiring = await transitionPlacement(deps.db, {
             computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'RETIRING',
-            fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
+            fields: { enrollConsumedHash: null, enrollExpiresAt: null, lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
         });
         if (!retiring.ok) return { ok: false, terminated: false, outcome: 'cas_conflict' };
         const r = await launch(c.userId, retiring.placement, work, p.state);
@@ -426,7 +426,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                                 });
                                 return {
                                     zoneId: deployment.zoneId, fsUuid, fenceToken,
-                                    enrollNonceHash: nonce.nonceHash, enrollExpiresAt: nonce.expiresAt,
+                                    enrollNonceHash: nonce.nonceHash, enrollExpiresAt: nonce.expiresAt, enrollConsumedHash: null,
                                     lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest,
                                     // The provision is the first lease: it has a deadline like every wake.
                                     leaseUntil: new Date(now().getTime() + leaseSeconds * 1000),
@@ -505,6 +505,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                                 fenceToken,
                                 enrollNonceHash: nonce.nonceHash,
                                 enrollExpiresAt: nonce.expiresAt,
+                                enrollConsumedHash: null, // the previous epoch's proof never outlives it
                                 lifecycleJobId: work.intent.jobId,
                                 lifecycleDigest: work.digest,
                                 lastError: null,

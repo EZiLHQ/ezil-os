@@ -351,7 +351,14 @@ export async function handleAwsEnrollment(deps: EnrollDeps, raw: unknown): Promi
     const pending = !p.enrollNonceHash && p.lastError === ENROLLMENT_PENDING && p.instanceId !== null;
     if (!(replay ? REPLAYABLE_STATES : ENROLLABLE_STATES).includes(p.state)) return refuse(403, 'enroll_state');
     if (p.generation !== body.generation || p.leaseEpoch !== body.leaseEpoch) return refuse(403, 'enroll_stale_epoch');
-    if (!replay && !pending) {
+    if (replay || pending) {
+        // C-6: the nonce binds enrollment to the one boot that received it. Consume moved its hash to
+        // `enrollConsumedHash`; recovery still requires that nonce, inside its window, before ANY
+        // Worker call. The identity document alone (replayable by whoever holds a copy) never suffices.
+        if (!p.enrollConsumedHash || !p.enrollExpiresAt) return refuse(409, 'enroll_nonce_consumed');
+        if (!sameHash(nonceHash, p.enrollConsumedHash)) return refuse(403, 'enroll_nonce_invalid');
+        if (p.enrollExpiresAt.getTime() <= now.getTime()) return refuse(403, 'enroll_nonce_expired');
+    } else {
         if (!p.enrollNonceHash || !p.enrollExpiresAt) return refuse(403, 'enroll_nonce_invalid');
         if (!sameHash(nonceHash, p.enrollNonceHash)) return refuse(403, 'enroll_nonce_invalid');
         if (p.enrollExpiresAt.getTime() <= now.getTime()) return refuse(403, 'enroll_nonce_expired');

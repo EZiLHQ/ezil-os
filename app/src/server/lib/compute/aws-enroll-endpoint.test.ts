@@ -166,7 +166,9 @@ describe('a valid enrollment', () => {
         const { enroll, placements, tunnels, described } = setup();
         const r = await enroll();
         expect(r).toEqual({ status: 200, body: { tunnelToken: TOKEN, controlKey: KEY.toString('base64'), sandboxId: SID, zone: 'ezil.org' } });
-        expect(placements[0]).toMatchObject({ enroll_nonce_hash: null, enroll_expires_at: null, instance_id: DOC.instanceId, volume_id: 'vol-11111111111111111', state: 'STARTING', last_error: placement.ENROLLMENT_SUCCEEDED });
+        // Single use: the nonce hash moved to the consumed proof; its deadline stays as that proof's window.
+        expect(placements[0]).toMatchObject({ enroll_nonce_hash: null, enroll_consumed_hash: nonceHashOf(NONCE), instance_id: DOC.instanceId, volume_id: 'vol-11111111111111111', state: 'STARTING', last_error: placement.ENROLLMENT_SUCCEEDED });
+        expect(placements[0]!.enroll_expires_at).toEqual(booting().enroll_expires_at);
         expect(described).toEqual([{ region: 'ap-south-1', instanceId: DOC.instanceId }]);
         expect(tunnels).toEqual([
             {
@@ -189,7 +191,8 @@ describe('a valid enrollment', () => {
         const { enroll } = setup([booting()], { tunnels: w.client });
         expect((await enroll()).status).toBe(200);
         const other = Buffer.alloc(32, 6).toString('base64url');
-        expect(await enroll(hostBody({ nonce: other }))).toEqual({ status: 409, body: { error: 'enroll_nonce_consumed' } });
+        // Refused by the consumed-nonce proof before any Worker call (C-6).
+        expect(await enroll(hostBody({ nonce: other }))).toEqual({ status: 403, body: { error: 'enroll_nonce_invalid' } });
         expect(w.created).toHaveLength(1);
     });
 
@@ -495,9 +498,55 @@ describe('after the nonce is consumed', () => {
         expect((await s.enroll()).status).toBe(503);
         const before = { ...s.placements[0] };
         const other = Buffer.alloc(32, 6).toString('base64url');
-        expect(await s.enroll(hostBody({ nonce: other }))).toEqual({ status: 409, body: { error: 'enroll_nonce_consumed' } });
+        expect(await s.enroll(hostBody({ nonce: other }))).toEqual({ status: 403, body: { error: 'enroll_nonce_invalid' } });
         expect(w.created).toHaveLength(1);
         expect(s.placements[0]).toEqual(before);
+    });
+
+    // Lead review of 1b0b070: recovery is bound to the consumed NONCE, not just the (replayable)
+    // identity document. The proof is checked before ANY Worker call, create or replay.
+    it('C-6: pending + valid identity document + WRONG nonce never reaches the Worker (neither create nor replay)', async () => {
+        const s = setup([booting({ enroll_nonce_hash: null, enroll_consumed_hash: nonceHashOf(NONCE), instance_id: DOC.instanceId, last_error: placement.ENROLLMENT_PENDING })]);
+        const calls: TunnelRequest[] = [];
+        s.deps.tunnels = { createTunnel: async (_o, req) => (calls.push(req), { ok: true, tunnelToken: TOKEN }), deleteTunnel: async () => ({ ok: true }) };
+        const other = Buffer.alloc(32, 6).toString('base64url');
+        expect(await s.enroll(hostBody({ nonce: other }))).toEqual({ status: 403, body: { error: 'enroll_nonce_invalid' } });
+        expect(calls).toEqual([]);
+        expect(s.described).toEqual([]); // refused before the describe too
+    });
+
+    it('C-6: a pending recovery after the window (enroll_expires_at) is refused before any Worker call', async () => {
+        const s = setup([booting({
+            enroll_nonce_hash: null, enroll_consumed_hash: nonceHashOf(NONCE), instance_id: DOC.instanceId, last_error: placement.ENROLLMENT_PENDING,
+            enroll_expires_at: new Date(NOW.getTime() - 1),
+        })]);
+        const calls: TunnelRequest[] = [];
+        s.deps.tunnels = { createTunnel: async (_o, req) => (calls.push(req), { ok: true, tunnelToken: TOKEN }), deleteTunnel: async () => ({ ok: true }) };
+        expect(await s.enroll()).toEqual({ status: 403, body: { error: 'enroll_nonce_expired' } });
+        expect(calls).toEqual([]);
+    });
+
+    it('C-6: a pending row without the consumed proof (legacy/cleared) cannot be recovered', async () => {
+        const s = setup([booting({ enroll_nonce_hash: null, enroll_consumed_hash: null, instance_id: DOC.instanceId, last_error: placement.ENROLLMENT_PENDING })]);
+        const calls: TunnelRequest[] = [];
+        s.deps.tunnels = { createTunnel: async (_o, req) => (calls.push(req), { ok: true, tunnelToken: TOKEN }), deleteTunnel: async () => ({ ok: true }) };
+        expect(await s.enroll()).toEqual({ status: 409, body: { error: 'enroll_nonce_consumed' } });
+        expect(calls).toEqual([]);
+    });
+
+    it('C-6: a SUCCEEDED replay with the wrong nonce is refused before any Worker call too', async () => {
+        const s = setup([booting({ enroll_nonce_hash: null, enroll_consumed_hash: nonceHashOf(NONCE), instance_id: DOC.instanceId, last_error: placement.ENROLLMENT_SUCCEEDED })]);
+        const calls: TunnelRequest[] = [];
+        s.deps.tunnels = { createTunnel: async (_o, req) => (calls.push(req), { ok: true, tunnelToken: TOKEN }), deleteTunnel: async () => ({ ok: true }) };
+        const other = Buffer.alloc(32, 6).toString('base64url');
+        expect(await s.enroll(hostBody({ nonce: other }))).toEqual({ status: 403, body: { error: 'enroll_nonce_invalid' } });
+        expect(calls).toEqual([]);
+    });
+
+    it('a failed finish clears the consumed proof (a failed enrollment is never recoverable)', async () => {
+        const s = setup([booting()], { tunnel: async () => ({ ok: false, status: 502, code: 'tunnel_create_failed' }) });
+        expect((await s.enroll()).status).toBe(502);
+        expect(s.placements[0]).toMatchObject({ enroll_consumed_hash: null, enroll_expires_at: null, last_error: placement.ENROLLMENT_FAILED });
     });
 
     it.each(['generation', 'lease_epoch'] as const)('GW-1 completion cannot mark a newer %s successful', async (counter) => {

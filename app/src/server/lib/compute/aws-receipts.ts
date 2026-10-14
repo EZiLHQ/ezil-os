@@ -263,7 +263,7 @@ async function startStopAsReconciler(deps: GuestStopDeps, p: Placement, deployme
     }
     // Same order as a user stop: the job is recorded first, so the authority check finds it.
     const draining = await transitionPlacementAsReconciler(deps.db, {
-        computerId: p.computerId, expected: p, to: 'DRAINING', fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: reason },
+        computerId: p.computerId, expected: p, to: 'DRAINING', fields: { enrollConsumedHash: null, enrollExpiresAt: null, lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: reason },
     });
     if (!draining.ok) return false;
     try {
@@ -397,7 +397,7 @@ export async function startRetireAsReconciler(deps: GuestStopDeps, p: Placement,
         throw error;
     }
     const retiring = await transitionPlacementAsReconciler(deps.db, {
-        computerId: p.computerId, expected: p, to: 'RETIRING', fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
+        computerId: p.computerId, expected: p, to: 'RETIRING', fields: { enrollConsumedHash: null, enrollExpiresAt: null, lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
     });
     if (!retiring.ok) return false;
     try {
@@ -462,7 +462,7 @@ export async function recoverDeletedAwsPlacement(
         current = recovering.placement;
     }
     const retiring = await transitionPlacementAsReconciler(deps.db, {
-        computerId: p.computerId, expected: current, to: 'RETIRING', fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
+        computerId: p.computerId, expected: current, to: 'RETIRING', fields: { enrollConsumedHash: null, enrollExpiresAt: null, lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
     });
     if (!retiring.ok) return 'skipped';
     try {

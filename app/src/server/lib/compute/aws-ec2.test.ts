@@ -279,7 +279,7 @@ describe('lease epochs: a provisioned computer can wake (C-3/C-4 disk-marker fen
 
 describe('ensure: wake by replace (default): a NEW instance on the SAME volume, same region', () => {
     it('STOPPED → leased (generation + 1, epoch + 1, new fence, nonce hash) → replace intent → STARTING', async () => {
-        const { provider, placements, calls, statements } = setup({ placements: [stopped({ generation: 3, lease_epoch: 7 })] });
+        const { provider, placements, calls, statements } = setup({ placements: [stopped({ generation: 3, lease_epoch: 7, enroll_consumed_hash: 'c'.repeat(64), enroll_expires_at: new Date('2026-10-14T12:00:00Z') })] });
         expect(await provider.ensure(ctx, { userId: U1, computerId: C1 }, opts)).toEqual({ ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true });
         expect(calls).toHaveLength(1);
         expect(calls[0]).toMatchObject({ region: 'ap-south-1', stateMachineArn: DEPLOYMENTS['ap-south-1'].stateMachineVersionArn });
@@ -295,6 +295,7 @@ describe('ensure: wake by replace (default): a NEW instance on the SAME volume, 
         expect(placements[0]).toMatchObject({
             state: 'STARTING', generation: 4, lease_epoch: 8, region: 'ap-south-1', fence_token: i.fenceToken, instance_id: null,
             enroll_nonce_hash: nonceHashOf(NONCE), lifecycle_job_id: i.jobId, lifecycle_digest: calls[0]!.digest,
+            enroll_consumed_hash: null, // the previous epoch's consumed proof never outlives it
         });
         expect(JSON.stringify(statements.map((st) => st.params))).not.toContain(NONCE);
         // The nonce hash, fence and job are written by the LEASE compare-and-swap itself.
@@ -434,12 +435,14 @@ describe('wake mode configuration', () => {
 
 describe('stop and status', () => {
     it('RUNNING → DRAINING (job recorded) → stop intent with the generation fence → STOPPING; not confirmed until the receipt', async () => {
-        const { provider, placements, calls } = setup({ placements: [stopped({ state: 'RUNNING', lease_epoch: 4 })] });
+        const { provider, placements, calls } = setup({ placements: [stopped({ state: 'RUNNING', lease_epoch: 4, enroll_consumed_hash: 'c'.repeat(64), enroll_expires_at: new Date('2026-10-14T12:00:00Z') })] });
         expect(await provider.stop(ctx, { userId: U1, computerId: C1 }, 'user')).toEqual({ ok: false, terminated: false, outcome: 'stopping' });
         expect(calls[0]!.intent).toMatchObject({
             operation: 'stop', providerInstanceId: 'i-11111111111111111', dataVolumeId: 'vol-11111111111111111', leaseEpoch: 4, fenceToken: FENCE, userData: null,
         });
         expect(placements[0]).toMatchObject({ state: 'STOPPING', lifecycle_job_id: calls[0]!.intent.jobId, lifecycle_digest: calls[0]!.digest });
+        // A stop ends the boot: the consumed-nonce proof and its window go with it.
+        expect(placements[0]).toMatchObject({ enroll_consumed_hash: null, enroll_expires_at: null });
     });
 
     it('a RUNNING row without its generation fence is not stopped through the lifecycle', async () => {
@@ -526,11 +529,11 @@ describe('Codex #3: computer.delete retires an AWS computer before it is soft-de
     });
 
     it('a RUNNING computer starts its retire at once (the retire job stops it gracefully, then terminates): one delete', async () => {
-        const { provider, placements, calls } = setup({ placements: [stopped({ state: 'RUNNING', lease_epoch: 4 })] });
+        const { provider, placements, calls } = setup({ placements: [stopped({ state: 'RUNNING', lease_epoch: 4, enroll_consumed_hash: 'c'.repeat(64), enroll_expires_at: new Date('2026-10-14T12:00:00Z') })] });
         expect(await provider.terminate(ctx, me)).toEqual({ ok: false, terminated: false, outcome: 'retiring' });
         expect(AWS_RETIREMENT_UNDERWAY).toContain('retiring');
         expect(calls.map((c) => c.intent.operation)).toEqual(['retire']);
-        expect(placements[0]).toMatchObject({ state: 'RETIRING', lifecycle_job_id: calls[0]!.intent.jobId });
+        expect(placements[0]).toMatchObject({ state: 'RETIRING', lifecycle_job_id: calls[0]!.intent.jobId, enroll_consumed_hash: null, enroll_expires_at: null });
     });
 
     it('a refused retire StartExecution of a RUNNING computer goes back to RUNNING (nothing ran) and is not "underway"', async () => {

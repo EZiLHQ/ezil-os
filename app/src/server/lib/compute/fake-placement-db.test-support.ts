@@ -96,6 +96,7 @@ export function placementRow(over: Row & { computer_id: string }): Row {
         tunnel_id: null,
         enroll_nonce_hash: null,
         enroll_expires_at: null,
+        enroll_consumed_hash: null,
         lease_until: null,
         presence_at: null,
         fence_token: null,
