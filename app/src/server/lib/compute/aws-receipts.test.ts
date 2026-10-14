@@ -258,9 +258,9 @@ describe('failed executions', () => {
 describe('one computer, end to end (fake AWS; real admission, provider, enrollment and receipts)', () => {
     it('provision → enroll → RUNNING → stop → STOPPED (fenced) → wake by replace → enroll → RUNNING', async () => {
         // The scripted provider: every execution succeeds with the receipt its intent implies.
-        let s!: ReturnType<typeof setup>;
         const instanceFor = (i: LifecycleIntent) => (i.operation === 'provision' || i.operation === 'replace' ? I_NEW : i.providerInstanceId!);
-        s = setup([], (arn) => {
+        // The reader runs only after setup returned, so it may refer to `s`.
+        const s: ReturnType<typeof setup> = setup([], (arn) => {
             const job = arn.split(':computer-')[1]!;
             const st = s.starts.find((x) => x.intent.jobId === job)!;
             const i = st.intent;
