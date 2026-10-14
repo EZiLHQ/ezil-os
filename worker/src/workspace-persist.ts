@@ -179,6 +179,8 @@ export interface MigratedHead {
   migratedAt: string;
   /** The exported snapshot, still addressable. */
   exported: { generation: string; chunkGeneration: string; previousChunkGeneration?: string; sha256: string; entries: number };
+  /** The head etag this marker replaced: lets a retried commit recognise its own marker. */
+  exportedEtag?: string;
 }
 /** Marker under a prefix while an export runs: garbage collection is suspended. Outside the chunk-key pattern. */
 export const MIGRATING_FLAG = '.ezil-snapshots/migrating.json';
@@ -193,7 +195,8 @@ export function parseMigratedHead(raw: string): MigratedHead | null {
   if (!(MIGRATION_TARGETS as readonly unknown[]).includes(m.targetProvider) || typeof m.migratedAt !== 'string'
     || !Number.isFinite(Date.parse(m.migratedAt)) || !e || !GENERATION.test(e.generation) || !GENERATION.test(e.chunkGeneration)
     || (e.previousChunkGeneration !== undefined && !GENERATION.test(e.previousChunkGeneration))
-    || !HASH.test(e.sha256) || !Number.isInteger(e.entries) || e.entries < 0 || e.entries > MAX_ENTRIES) {
+    || !HASH.test(e.sha256) || !Number.isInteger(e.entries) || e.entries < 0 || e.entries > MAX_ENTRIES
+    || (m.exportedEtag !== undefined && (typeof m.exportedEtag !== 'string' || m.exportedEtag === '' || m.exportedEtag.length > 256))) {
     throw new Error('invalid migrated head');
   }
   return m;
@@ -207,6 +210,17 @@ export async function readHead(bucket: Pick<HydrateR2BucketLike, 'get'>, prefix:
   const snapshot = parseSnapshot(raw);
   if (!body.etag) throw new Error('snapshot manifest etag missing');
   return { snapshot, etag: body.etag };
+}
+
+/**
+ * Whether the migrated marker under `prefix` is the one a commit with these parameters
+ * wrote (same target, replacing the same exported head): a retried commit then treats that
+ * step as done instead of failing `already_migrated`.
+ */
+export async function isOwnMigratedHead(bucket: Pick<HydrateR2BucketLike, 'get'>, prefix: string,
+  targetProvider: MigrationTarget, expectedEtag: string): Promise<boolean> {
+  const m = await readMigratedHead(bucket, prefix);
+  return !!m && m.targetProvider === targetProvider && m.exportedEtag === expectedEtag;
 }
 
 /** The migrated marker under `prefix`, or null when the head is absent or an ordinary snapshot. */
@@ -239,6 +253,7 @@ export async function writeMigratedHead(deps: {
     migratedAt: (deps.now ?? new Date()).toISOString(),
     exported: { generation: s.generation, chunkGeneration: s.chunkGeneration ?? s.generation,
       ...(s.previousChunkGeneration ? { previousChunkGeneration: s.previousChunkGeneration } : {}), sha256: s.sha256, entries: s.entries },
+    exportedEtag: current.etag,
   };
   const put = await bucket.put(`${prefix}/${SNAPSHOT_HEAD}`, encoder.encode(JSON.stringify(head)), { onlyIf: { etagMatches: current.etag } });
   return put ? { ok: true, head } : { ok: false, reason: 'head_moved' };

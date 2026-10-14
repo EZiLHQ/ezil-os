@@ -89,12 +89,13 @@ afterEach(() => { globalThis.fetch = realFetch; });
  * API) plus a fake Cloudflare Realtime TURN API. Records what the Worker sent.
  */
 interface FakeHost {
-  configured: boolean; desktop: string; ice: string; relayExpiresAt: number;
+  configured: boolean; desktop: string; ice: string; relayExpiresAt: number; screen: { width: number; height: number };
   pushed?: { neko: { user: string; admin: string }; backend: Array<{ urls: string[] }> };
   turnCalls: number; bad: string[]; paths: string[];
 }
 function installAwsHost(over: Partial<FakeHost> = {}): FakeHost {
-  const h: FakeHost = { configured: false, desktop: 'absent', ice: 'none', relayExpiresAt: Date.now() + 1_200_000, turnCalls: 0, bad: [], paths: [], ...over };
+  const h: FakeHost = { configured: false, desktop: 'absent', ice: 'none', relayExpiresAt: Date.now() + 1_200_000,
+    screen: { width: 1280, height: 720 }, turnCalls: 0, bad: [], paths: [], ...over };
   const runtimeId = 'c'.repeat(32);
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input));
@@ -124,6 +125,15 @@ function installAwsHost(over: Partial<FakeHost> = {}): FakeHost {
     if (url.pathname === '/__p/8181/api/relay' && method === 'POST') {
       h.relayExpiresAt = (JSON.parse(body) as { expiresAt: number }).expiresAt;
       return j({ runtimeId, expiresAt: h.relayExpiresAt });
+    }
+    if (url.pathname === '/__p/8181/api/room/screen') {
+      if (headers.get('authorization') !== 'Bearer t') { h.bad.push('screen auth'); return j({}, 401); }
+      if (method === 'POST') {
+        const b = JSON.parse(body) as { width: number; height: number };
+        h.screen = { width: b.width, height: b.height };
+        return j({});
+      }
+      return j(h.screen);
     }
     if (url.pathname === '/__p/8181/api/logout') return j({});
     return j({ ok: false }, 404);
@@ -320,6 +330,85 @@ describe('AWS desktop relay through the hook (aws-ice)', () => {
     expect(((await renewed.json()) as { expiresAt: number }).expiresAt).toBe(host.relayExpiresAt);
     expect(host.paths).toContain('POST /__p/8181/api/relay');
     expect(host.bad).toEqual([]);
+  });
+
+  /** Records every touch of the Cloudflare Sandbox namespace; any use throws. */
+  function sandboxRecorder() {
+    const opened: string[] = [];
+    const ns = new Proxy({}, { get: (_t, p) => {
+      if (typeof p === 'string') opened.push(p);
+      return () => { throw new Error('cloudflare sandbox opened'); };
+    } });
+    return { opened, ns };
+  }
+
+  it('focus for an AWS computer is refused as unsupported and never opens a Cloudflare sandbox', async () => {
+    const rec = sandboxRecorder();
+    const e = relayEnv({ Sandbox: rec.ns });
+    await withTunnel(e);
+    const host = installAwsHost({ configured: true, desktop: 'running', ice: 'applied' });
+    expect((await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e)).status).toBe(200);
+    const res = await worker.fetch(await signed('POST', `/sandbox/${SID}/focus`, JSON.stringify({ app: 'code' })), e);
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ ok: false, error: 'focus_unsupported' });
+    expect(rec.opened).toEqual([]);
+    expect(host.bad).toEqual([]);
+  });
+
+  it('screen read and resize for an AWS computer go to its neko through the gateway, never a Cloudflare sandbox', async () => {
+    const rec = sandboxRecorder();
+    const e = relayEnv({ Sandbox: rec.ns });
+    await withTunnel(e);
+    const host = installAwsHost({ configured: true, desktop: 'running', ice: 'applied', screen: { width: 1024, height: 768 } });
+    expect((await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e)).status).toBe(200);
+    const read = await worker.fetch(await signed('GET', `/sandbox/${SID}/screen`, ''), e);
+    expect(read.status).toBe(200);
+    expect(await read.json()).toEqual({ ok: true, sandboxId: SID, width: 1024, height: 768 });
+    const set = await worker.fetch(await signed('POST', `/sandbox/${SID}/screen`, JSON.stringify({ width: 1920, height: 1080 })), e);
+    expect(set.status).toBe(200);
+    expect(await set.json()).toMatchObject({ ok: true, width: 1920, height: 1080 });
+    expect(host.screen).toEqual({ width: 1920, height: 1080 });
+    expect(host.paths).toContain('POST /__p/8181/api/room/screen');
+    expect(rec.opened).toEqual([]);
+    expect(host.bad).toEqual([]);
+  });
+
+  it('screen for an AWS computer whose desktop is not running yet is screen_starting (no neko call)', async () => {
+    const rec = sandboxRecorder();
+    const e = relayEnv({ Sandbox: rec.ns });
+    await withTunnel(e);
+    const host = installAwsHost({ configured: true, desktop: 'running', ice: 'applied' });
+    expect((await worker.fetch(await signed('POST', '/sandbox/preview', previewBody), e)).status).toBe(200);
+    host.desktop = 'starting';
+    host.paths.length = 0;
+    const res = await worker.fetch(await signed('GET', `/sandbox/${SID}/screen`, ''), e);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ ok: false, sandboxId: SID, error: 'screen_starting' });
+    expect(host.paths.some((p) => p.includes('/api/'))).toBe(false);
+    expect(rec.opened).toEqual([]);
+  });
+
+  it('focus and screen with v2 claims for ANOTHER sandbox are refused before any host call', async () => {
+    const rec = sandboxRecorder();
+    const e = relayEnv({ Sandbox: rec.ns });
+    await withTunnel(e);
+    const host = installAwsHost({ configured: true, desktop: 'running', ice: 'applied' });
+    const other = claims({ sandboxId: 'guac-u0a0a0a0a0a0a0a0-1b0b0b0b0b0b4b0b' });
+    expect((await worker.fetch(await signed('POST', `/sandbox/${SID}/focus`, JSON.stringify({ app: 'code' }), other), e)).status).toBe(401);
+    expect((await worker.fetch(await signed('GET', `/sandbox/${SID}/screen`, '', other), e)).status).toBe(401);
+    expect(host.paths).toEqual([]);
+    expect(rec.opened).toEqual([]);
+  });
+
+  it('positive control: with AWS routing on, a computer WITHOUT a tunnel keeps the Cloudflare path', async () => {
+    const rec = sandboxRecorder();
+    const e = relayEnv({ Sandbox: rec.ns });
+    installAwsHost();
+    const cf = 'guac-u0a0a0a0a0a0a0a0-2b0b0b0b0b0b4b0b';
+    const c = claims({ sandboxId: cf, provider: 'cloudflare' });
+    await worker.fetch(await signed('POST', `/sandbox/${cf}/focus`, JSON.stringify({ app: 'code' }), c), e);
+    await worker.fetch(await signed('GET', `/sandbox/${cf}/screen`, '', c), e);
+    expect(rec.opened.length).toBeGreaterThan(0);
   });
 
   it('relay-refresh with v2 claims for ANOTHER sandbox is refused before any host call', async () => {
