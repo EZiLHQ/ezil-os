@@ -104,6 +104,13 @@ export interface LifecycleStarter {
     start(region: string, work: { stateMachineArn: string; name: string; input: string }): Promise<void>;
 }
 
+/** terminate: a retire job is recorded and running (or its receipt is pending). */
+export const AWS_RETIRING = 'retiring';
+/** terminate: a stop job is recorded; the background reconcile retires the computer once it is STOPPED. */
+export const AWS_RETIRE_AFTER_STOP = 'retire_after_stop';
+/** Outcomes after which `computer.delete` may soft-delete: a lifecycle job that ends the instance is durably recorded. */
+export const AWS_RETIREMENT_UNDERWAY: readonly string[] = [AWS_RETIRING, AWS_RETIRE_AFTER_STOP];
+
 export interface AwsProviderDeps {
     db: PlacementDb;
     env?: () => Env;
@@ -288,9 +295,10 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
     };
 
     /**
-     * Retire a STOPPED placement (§6, R11): the lifecycle terminates its instance and
-     * keeps the data volume for the retention window. Not confirmed until its receipt
-     * marks it RETIRED. A refused StartExecution puts it back to STOPPED.
+     * Retire a STOPPED or RUNNING placement (§6, R11): the lifecycle stops a running
+     * instance gracefully (OS shutdown, so the host flushes), terminates it and keeps
+     * the data volume for the retention window. Not confirmed until its receipt marks it
+     * RETIRED. A refused StartExecution puts it back to the state it came from.
      */
     const startRetire = async (c: ComputerRef, p: Placement, deployment: LifecycleDeployment): Promise<TerminateResult> => {
         if (!p.instanceId || !p.volumeId || !p.fenceToken || !p.instanceType) {
@@ -308,9 +316,9 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
         });
         if (!retiring.ok) return { ok: false, terminated: false, outcome: 'cas_conflict' };
-        const r = await launch(c.userId, retiring.placement, work, 'STOPPED');
+        const r = await launch(c.userId, retiring.placement, work, p.state);
         if (r !== 'started') return { ok: false, terminated: false, outcome: r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed' };
-        return { ok: false, terminated: false, outcome: 'retiring' };
+        return { ok: false, terminated: false, outcome: AWS_RETIRING };
     };
 
     return {
@@ -507,9 +515,12 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         /**
          * computer.delete (§6, R11). ok only once nothing can still run: no placement
          * (never provisioned), or the placement RETIRED (instance terminated, volume
-         * kept for the retention window). A RUNNING computer is stopped first, a STOPPED
-         * one retired; every other state answers not-ready and the delete is refused,
-         * so a computer is never soft-deleted while its instance can still run.
+         * kept for the retention window). A RUNNING or STOPPED computer starts its
+         * retire job here. `AWS_RETIREMENT_UNDERWAY` outcomes say a lifecycle job that
+         * ends the instance is durably recorded on the placement: the delete may then
+         * soft-delete, and the background reconcile (aws-receipts.ts
+         * `reconcileDeletedAwsComputers`, run by the sandbox-reap cron) drives it to
+         * RETIRED. Every other state answers not-ready and the delete is refused.
          */
         async terminate(_ctx, c): Promise<TerminateResult> {
             const cfg = configured();
@@ -523,10 +534,12 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                 if (!deps.starter) return { ok: false, terminated: false, outcome: 'aws_lifecycle_unconfigured', error: 'aws_lifecycle_unconfigured' };
                 const deployment = cfg.deployments[p.region ?? ''];
                 if (!deployment) return { ok: false, terminated: false, outcome: 'region_not_configured', error: 'region_not_configured' };
-                return p.state === 'RUNNING' ? startStop(c, p, deployment) : startRetire(c, p, deployment);
+                return startRetire(c, p, deployment);
             }
             const state = AWS_STATE_FOR[p.state];
-            if (p.state === 'RETIRING') return { ok: false, terminated: false, outcome: 'retiring' };
+            if (p.state === 'RETIRING' && p.lifecycleJobId) return { ok: false, terminated: false, outcome: AWS_RETIRING };
+            // A recorded stop: once its receipt lands STOPPED, the reconcile retires a deleted computer.
+            if ((p.state === 'DRAINING' || p.state === 'STOPPING') && p.lifecycleJobId) return { ok: false, terminated: false, outcome: AWS_RETIRE_AFTER_STOP };
             if (state === 'starting') return { ok: false, terminated: false, outcome: 'computer_starting' };
             if (state === 'stopping') return { ok: false, terminated: false, outcome: 'stopping' };
             return { ok: false, terminated: false, outcome: p.state === 'RECOVERING' || p.state === 'UNCONFIRMED' ? 'computer_recovering' : 'computer_unavailable' };

@@ -140,10 +140,14 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 - First boot: `PROVISIONING → RUNNING`. The infra provision launches and boots the instance, so the user's first open
   goes straight in, and the receipt lands RUNNING. `PROVISIONING → STOPPED` stays for a provision that ends stopped.
 - Failure path: `UNCONFIRMED → RECOVERING → STOPPED`.
-- Retirement: `STOPPED → RETIRING → RETIRED → PURGE_ELIGIBLE`. `computer.delete` drives it: a RUNNING computer is
-  stopped first, a STOPPED one gets the lifecycle `retire` job (instance terminated, data volume kept), and the
-  delete is refused until the receipt lands RETIRED. A computer with no placement deletes at once. A refused
-  retire `StartExecution` goes back to STOPPED. The purge itself is a separate operator action (§6).
+- Retirement: `RUNNING | STOPPED → RETIRING → RETIRED → PURGE_ELIGIBLE`. ONE `computer.delete` is enough: a
+  RUNNING or STOPPED computer gets the lifecycle `retire` job (a running instance is stopped gracefully first, then
+  terminated; the data volume is kept), and once that job — or an already-recorded stop — is on the placement the
+  row is soft-deleted. The sandbox-reap cron's AWS job (`runAwsBackgroundReconcile`) then applies receipts for
+  every placement whose computer is soft-deleted or gone, starts the retire of one that reached STOPPED, and fences
+  the tunnel before RETIRED. Booting, recovering and unconfirmed states refuse the delete. A computer with no
+  placement deletes at once. A refused retire `StartExecution` returns to the state it came from and the delete is
+  refused. The purge itself is a separate operator action (§6).
 - Guest-initiated idle stop (R9): the host stops its own instance with no lifecycle job. `status`, `ensure` and
   `terminate` read the instance's EC2 state (the app caller's region-scoped `DescribeInstances`); a RUNNING row
   whose instance is stopping or stopped gets the ORDINARY lifecycle `stop`, which the helper confirms at once, so

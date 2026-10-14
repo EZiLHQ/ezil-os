@@ -50,8 +50,9 @@ engine's own `additiveSQL`, so it cannot drift outside the hosted grammar.
    Cloudflare, and only AWS admission writes an `aws-ec2` row. Set both together with
    `EZIL_AWS_COMPUTERS_ENABLED`, after the tables exist. SINCE should be the moment you
    set them, so only computers the listed users create from then on go to AWS (older
-   ones may hold an R2 workspace). Deleting an AWS computer is refused until retire is
-   implemented (`terminate` answers `aws_not_supported`).
+   ones may hold an R2 workspace). Deleting an AWS computer starts its retire and
+   completes in one delete; the sandbox-reap cron finishes the retirement in the
+   background (docs/AWS-COMPUTERS.md, Retirement).
 
 ## Usage ledger (`ezil_compute_usage`)
 

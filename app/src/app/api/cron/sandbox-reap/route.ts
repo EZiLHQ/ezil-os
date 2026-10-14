@@ -5,9 +5,12 @@ import {
     newCorrelationId,
     resolveCloudflareGuacamoleConfig,
 } from '@/server/lib/cloudflare-guacamole-provider';
-import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
+import { defaultAwsCollaborators } from '@/server/api/routers/compute-dispatch';
+import { isAwsComputersEnabled, isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
+import { runAwsBackgroundReconcile } from '@/server/lib/compute/aws-receipts';
 import { createCloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
-import { readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
+import { noNonCloudflarePlacement, readPlacement, type PlacementDb, type PlacementExecutor } from '@/server/lib/compute/placement';
+import { sql } from 'drizzle-orm';
 import type { ComputerRef } from '@/server/lib/compute/provider';
 import { handleSandboxReap } from './handler';
 
@@ -126,7 +129,15 @@ export async function GET(req: Request): Promise<Response> {
         // (an AWS host idle-stops itself). Reads go through placement.ts, the one
         // module that names the placement table (C-2). Off: no read, as before.
         ...(isPlacementReadEnabled(process.env)
-            ? { providerOf: async (computerId: string) => (await readPlacement(db as unknown as PlacementExecutor, computerId)).provider }
+            ? {
+                providerOf: async (computerId: string) => (await readPlacement(db as unknown as PlacementExecutor, computerId)).provider,
+                // In SQL, before the LIMIT: AWS rows never fill the candidate window.
+                candidateFilter: noNonCloudflarePlacement(sql`ezil_computers.id`),
+            }
+            : {}),
+        // AWS on: drive deleted AWS computers to RETIRED and settle the fleet (its own job).
+        ...(isAwsComputersEnabled(process.env)
+            ? { awsReconcile: () => runAwsBackgroundReconcile(process.env, { db: db as unknown as PlacementDb, ...defaultAwsCollaborators(process.env) }) }
             : {}),
         deriveSandboxName: (userId, computerId) => {
             const sandboxName = deriveGuacamoleSandboxId(userId, computerId);

@@ -13,9 +13,14 @@ import { AWS_IDENTITY_CERTS_ENV } from './aws-identity';
 import { LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
 import fx from './aws-identity.fixtures.json';
-import { applyLifecycleReceipt, lifecycleExecutionArn, lifecycleFailureCode, nextInstanceTypeAfterCapacity, type LifecycleExecutionReader } from './aws-receipts';
+import {
+    applyLifecycleReceipt, lifecycleExecutionArn, lifecycleFailureCode, nextInstanceTypeAfterCapacity, reconcileDeletedAwsComputers, runAwsBackgroundReconcile,
+    type LifecycleExecutionReader,
+} from './aws-receipts';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
-import { ENROLLMENT_FAILED, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, PlacementOwnerError, readPlacement } from './placement';
+import {
+    ENROLLMENT_FAILED, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, listAwsPlacementsPendingRetire, PlacementOwnerError, readPlacement, RETIRE_PENDING_STATES,
+} from './placement';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const U2 = '22222222-2222-4222-8222-222222222222';
@@ -390,13 +395,24 @@ describe('Codex #5: the usage ledger is written by confirmed receipts (hour caps
 describe('retire receipts (computer.delete)', () => {
     const retiring = (over: Record<string, unknown> = {}) => row({ state: 'RETIRING', instance_id: I_NEW, enroll_nonce_hash: null, enroll_expires_at: null, ...over });
 
-    it('RETIRING + retired receipt → RETIRED, job cleared, volume kept, any open usage row closed; no tunnel call (fenced at stop)', async () => {
+    it('RETIRING + retired receipt → tunnel fenced, then RETIRED, job cleared, volume kept, any open usage row closed', async () => {
         const open = { computer_id: C1, user_id: U1, instance_id: I_NEW, instance_type: 't3a.medium', started_at: NOW, stopped_at: null, egress_bytes: null, observed_by: 'x', updated_at: NOW };
         const { status, placements, usage, deleted } = setup([retiring()], { status: 'SUCCEEDED', output: receiptOf({ state: 'retired' }) }, { usage: [open] });
         expect(await status()).toMatchObject({ placementState: 'RETIRED' });
         expect(placements[0]).toMatchObject({ state: 'RETIRED', lifecycle_job_id: null, volume_id: VOL, instance_id: I_NEW });
         expect(usage[0]).toMatchObject({ stopped_at: NOW });
-        expect(deleted).toEqual([]);
+        // A retire may start from RUNNING (Codex 4275269627): its tunnel must not outlive the instance.
+        expect(deleted).toEqual([{ owner: { userId: U1 }, req: { computerId: C1, sandboxId: 'guac-1111111111114111-c1c1c1c1c1c14c1c', generation: 2, leaseEpoch: 3 } }]);
+    });
+
+    it('a retire whose tunnel fence fails stays RETIRING (job kept) and completes on the next look', async () => {
+        const s = setup([retiring()], { status: 'SUCCEEDED', output: receiptOf({ state: 'retired' }) });
+        s.tunnels.deleteTunnel = async () => ({ ok: false, status: 502 });
+        await s.status();
+        expect(s.placements[0]).toMatchObject({ state: 'RETIRING', lifecycle_job_id: JOB });
+        s.tunnels.deleteTunnel = async () => ({ ok: true });
+        await s.status();
+        expect(s.placements[0]).toMatchObject({ state: 'RETIRED', lifecycle_job_id: null });
     });
 
     it.each([['stopped'], ['running']])('a %s receipt for a retire job is a conflict (UNCONFIRMED)', async (state) => {
@@ -500,5 +516,95 @@ describe('one computer, end to end (fake AWS; real admission, provider, enrollme
         expect(s.placements[0]).toMatchObject({ generation: 2, lease_epoch: 2, volume_id: VOL, enroll_nonce_hash: null, lifecycle_job_id: null });
         // Every boot's tunnel was created once, for its own generation and epoch.
         expect(s.created).toMatchObject([{ generation: 1, leaseEpoch: 1 }, { generation: 2, leaseEpoch: 2 }]);
+    });
+});
+
+describe('Codex 4275269627: a deleted AWS computer is retired in the background (one user delete)', () => {
+    const DELETED = [{ id: C1, user_id: U1, deleted_at: NOW }];
+    const ready = (over: Record<string, unknown> = {}) =>
+        row({ state: 'STOPPED', instance_id: I_NEW, lifecycle_job_id: null, lifecycle_digest: null, enroll_nonce_hash: null, enroll_expires_at: null, ...over });
+    function bg(rows: Record<string, unknown>[], computers: { id: string; user_id: string; deleted_at?: Date | null }[], exec: Exec = { status: 'RUNNING' }, failStart = false) {
+        const fake = createFakePlacementDb({ placements: rows, computers }, { clock: () => NOW });
+        const starts: { region: string; intent: LifecycleIntent }[] = [];
+        const starter: LifecycleStarter = {
+            async start(region, work) {
+                if (failStart) throw new Error('StartExecution refused');
+                starts.push({ region, intent: JSON.parse((JSON.parse(work.input) as { document: string }).document) });
+            },
+        };
+        const fenced: unknown[] = [];
+        const tunnels: TunnelClient = {
+            createTunnel: async () => ({ ok: true, tunnelToken: 'tok-' + 'x'.repeat(30) }),
+            deleteTunnel: async (_o, req) => (fenced.push(req), { ok: true }),
+        };
+        let n = 0;
+        const deps = {
+            db: fake.db, tunnels, starter, newId: () => `aaaaaaaa-aaaa-4aaa-8aaa-${String(++n).padStart(12, '0')}`,
+            executions: { describe: async () => exec } as LifecycleExecutionReader,
+        };
+        return { ...fake, deps, starts, fenced };
+    }
+    const deployments = { 'ap-south-1': D };
+
+    it.each(['STOPPED', 'RUNNING'] as const)('a deleted computer that is %s gets its retire started (RETIRING, job recorded)', async (state) => {
+        const b = bg([ready({ state })], DELETED);
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 1, retiresStarted: 1, retired: 0 });
+        expect(b.starts.map((x) => x.intent.operation)).toEqual(['retire']);
+        expect(b.starts[0]!.intent).toMatchObject({ providerInstanceId: I_NEW, dataVolumeId: VOL, targetGeneration: 2, leaseEpoch: 3, fenceToken: FENCE });
+        expect(b.placements[0]).toMatchObject({ state: 'RETIRING', lifecycle_job_id: b.starts[0]!.intent.jobId });
+    });
+
+    it('a recorded stop whose receipt landed: fenced → STOPPED, then the retire starts, in one pass', async () => {
+        const b = bg([ready({ state: 'STOPPING', lifecycle_job_id: JOB, lifecycle_digest: DIGEST })], DELETED, { status: 'SUCCEEDED', output: receiptOf({ state: 'stopped' }) });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toMatchObject({ retiresStarted: 1 });
+        expect(b.fenced).toHaveLength(1);
+        expect(b.placements[0]).toMatchObject({ state: 'RETIRING' });
+    });
+
+    it('RETIRING + retired receipt → RETIRED (counted), nothing new started', async () => {
+        const b = bg([ready({ state: 'RETIRING', lifecycle_job_id: JOB, lifecycle_digest: DIGEST })], DELETED, { status: 'SUCCEEDED', output: receiptOf({ state: 'retired' }) });
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 1, retiresStarted: 0, retired: 1 });
+        expect(b.starts).toEqual([]);
+        expect(b.placements[0]).toMatchObject({ state: 'RETIRED', lifecycle_job_id: null });
+    });
+
+    it('a LIVE computer is never retired by the background pass', async () => {
+        const b = bg([ready()], [{ id: C1, user_id: U1, deleted_at: null }]);
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toEqual({ checked: 0, retiresStarted: 0, retired: 0 });
+        expect(b.starts).toEqual([]);
+        expect(b.placements[0]).toMatchObject({ state: 'STOPPED' });
+    });
+
+    it('a computer row that is gone (account deletion cascade) is retired too', async () => {
+        const b = bg([ready()], []);
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toMatchObject({ retiresStarted: 1 });
+    });
+
+    it('a refused StartExecution returns the placement to where it was, job cleared, retire_start_failed', async () => {
+        const b = bg([ready({ state: 'RUNNING' })], DELETED, { status: 'RUNNING' }, true);
+        expect(await reconcileDeletedAwsComputers(b.deps, deployments)).toMatchObject({ retiresStarted: 0 });
+        expect(b.placements[0]).toMatchObject({ state: 'RUNNING', lifecycle_job_id: null, last_error: 'retire_start_failed' });
+    });
+
+    it('the cron job: AWS off answers skipped with no statement; on, it retires deleted computers', async () => {
+        const off = bg([ready()], DELETED);
+        expect(await runAwsBackgroundReconcile(env({ EZIL_AWS_COMPUTERS_ENABLED: '0' }), off.deps)).toEqual({ ok: true, skipped: 'aws_disabled' });
+        expect(off.statements).toEqual([]);
+        const on = bg([ready()], DELETED);
+        expect(await runAwsBackgroundReconcile(env(), on.deps)).toMatchObject({ ok: true, deleted: { retiresStarted: 1 } });
+        expect(on.placements[0]).toMatchObject({ state: 'RETIRING' });
+    });
+});
+
+describe('retire-pending SQL (the fake answers by tag; the text is pinned here, run on real Postgres 16 in review)', () => {
+    it('LEFT JOINs the computer row and keeps only deleted or missing ones, oldest change first, bounded', async () => {
+        const fake = createFakePlacementDb({ placements: [], computers: [] });
+        await listAwsPlacementsPendingRetire(fake.db, 500);
+        const text = fake.statements[0]!.sql.replace(/\s+/g, ' ');
+        expect(text).toMatch(/\/\* placement:retire-pending \*\//);
+        expect(text).toMatch(/LEFT JOIN public\.ezil_computers c ON c\.id = p\.computer_id/);
+        expect(text).toMatch(/WHERE p\.provider = 'aws-ec2' AND p\.state IN \(\$1, \$2, \$3, \$4, \$5\) AND \(c\.id IS NULL OR c\.deleted_at IS NOT NULL\)/);
+        expect(text).toMatch(/ORDER BY p\.updated_at ASC LIMIT \$6/);
+        expect(fake.statements[0]!.params).toEqual([...RETIRE_PENDING_STATES, 100]);
     });
 });
