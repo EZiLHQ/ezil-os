@@ -11,9 +11,9 @@
  *
  * 🔴 This file MIRRORS the infra schema (the app does not import infra code;
  * app CI installs no infra dependencies). `aws-intent.test.ts` pins the
- * built documents against `aws-intent.fixtures.json`, which the infra side
- * must parse with `parseLifecycleWork` unchanged. A drift on either side
- * fails one of the two.
+ * built documents against `aws-intent.fixtures.json`, and infra's
+ * `test/app-intent-contract.test.ts` parses every fixture with the real
+ * `parseLifecycleWork`. A drift on either side fails one of the two.
  *
  * No AWS SDK and no network here: building an intent never starts anything.
  */
@@ -21,13 +21,17 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 
-import { AWS_REGION_PATTERN, AWS_TIERS, type Env } from './aws-config';
+import { AWS_REGION_PATTERN, type Env } from './aws-config';
 
 /** JSON object: region → that region's lifecycle deployment (the infra stack's outputs). */
 export const LIFECYCLE_DEPLOYMENTS_ENV = 'EZIL_AWS_LIFECYCLE_DEPLOYMENTS';
 
-/** Every type a tier may record, plus the benchmark type; the deployment may narrow it, never extend it. */
-export const KNOWN_INSTANCE_TYPES: readonly string[] = [...new Set([...Object.values(AWS_TIERS).flat(), 'c6i.xlarge'])];
+/**
+ * Infra's closed allowlist (`INSTANCE_TYPES`, deployment.ts), in its order: every
+ * type a tier may record, plus the benchmark type. A deployment may narrow it,
+ * never extend it. aws-intent.test.ts checks that every tier type is listed.
+ */
+export const KNOWN_INSTANCE_TYPES: readonly string[] = ['t3a.medium', 't3.medium', 'm6i.large', 'c6i.xlarge'];
 
 const ZONE_ID_PATTERN = /^[a-z]{2,4}\d-az\d+$/;
 const DIRECTION: Record<string, string> = {
@@ -39,6 +43,25 @@ function zoneIdPrefix(region: string): string {
     const [geo, direction, number] = region.split('-') as [string, string, string];
     return `${geo}${DIRECTION[direction]}${number}`;
 }
+
+/** Infra `zoneIdMatchesRegion`. */
+function zoneIdMatchesRegion(zoneId: string, region: string): boolean {
+    return ZONE_ID_PATTERN.test(zoneId) && AWS_REGION_PATTERN.test(region) && zoneId.startsWith(`${zoneIdPrefix(region)}-az`);
+}
+
+/**
+ * Infra `RESERVED_NAMESPACES` / `NamespaceSchema`: lowercase letters and digits
+ * only (no '-', so `ezil-<ns>-*` never matches another namespace's names), and
+ * never a name reserved for identity or operator resources.
+ */
+const RESERVED_NAMESPACES: readonly string[] = ['identity', 'operators', 'operator', 'admin', 'root', 'ops', 'deploy', 'boundary', 'aws', 'service'];
+const NamespaceSchema = z
+    .string()
+    .regex(/^[a-z][a-z0-9]{0,20}$/)
+    .refine((n) => !RESERVED_NAMESPACES.includes(n), { message: 'reserved_namespace' });
+
+/** Infra `machineName`: the state machine's name inside a version ARN (`…:stateMachine:<name>:<version>`). */
+const machineName = (versionArn: string) => versionArn.slice(0, versionArn.lastIndexOf(':')).split(':').at(-1) ?? '';
 
 const StorageSchema = z
     .object({
@@ -59,7 +82,7 @@ export const LifecycleDeploymentSchema = z
         launchTemplateId: z.string().regex(/^lt-[a-f0-9]{17}$/),
         launchTemplateVersion: z.string().regex(/^[1-9][0-9]{0,9}$/),
         amiId: z.string().regex(/^ami-[a-f0-9]{17}$/),
-        namespace: z.string().regex(/^[a-z][a-z0-9-]{0,30}$/),
+        namespace: NamespaceSchema,
         instanceTypes: z
             .array(z.string().refine((t) => KNOWN_INSTANCE_TYPES.includes(t), { message: 'unknown_instance_type' }))
             .min(1)
@@ -69,8 +92,12 @@ export const LifecycleDeploymentSchema = z
         stateMachineVersionArn: z.string(),
     })
     .strict()
+    // Same refinements as infra's LifecycleDeploymentSchema, in the same order.
     .superRefine((d, ctx) => {
-        if (!d.zoneId.startsWith(`${zoneIdPrefix(d.region)}-az`)) ctx.addIssue({ code: 'custom', path: ['zoneId'], message: 'zone_not_in_region' });
+        if (!zoneIdMatchesRegion(d.zoneId, d.region)) ctx.addIssue({ code: 'custom', path: ['zoneId'], message: 'zone_not_in_region' });
+        // Exec-role IAM scopes state machines to ezil-<ns>-* names.
+        if (!machineName(d.stateMachineVersionArn).startsWith(`ezil-${d.namespace}-`))
+            ctx.addIssue({ code: 'custom', path: ['stateMachineVersionArn'], message: 'machine_name_not_in_namespace' });
         if (new Set(d.instanceTypes).size !== d.instanceTypes.length) ctx.addIssue({ code: 'custom', path: ['instanceTypes'], message: 'duplicate_instance_type' });
         const matches = {
             dataKeyArn: new RegExp(`^arn:aws:kms:${d.region}:${d.accountId}:key/[a-f0-9-]{36}$`),
@@ -135,7 +162,7 @@ export const LifecycleIntentSchema = z
         previousInstanceId: instance.nullable(),
         previousFenceToken: uuid.nullable(),
         deployment: LifecycleDeploymentSchema,
-        instanceType: z.string(),
+        instanceType: z.string().refine((t) => KNOWN_INSTANCE_TYPES.includes(t), { message: 'unknown_instance_type' }),
         dataVolumeGiB: z.number().int().min(1).max(16384).nullable(),
         leaseEpoch: positive,
         userData: z.string().max(4096).regex(base64).nullable(),
