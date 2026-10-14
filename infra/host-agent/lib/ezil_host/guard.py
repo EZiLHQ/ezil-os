@@ -50,12 +50,8 @@ def _root_devices():
     return devices
 
 
-def provision_volume(cfg):
-    """Resolve exactly one non-root EBS disk, then verify its EC2 attachment name."""
-    name = cfg.dataDeviceName
-    if not isinstance(name, str) or not re.fullmatch(r"/dev/[A-Za-z0-9]+", name):
-        raise Refused("data_device_name_invalid")
-    roots = _root_devices()
+def _ebs_candidates(cfg, roots):
+    """Attached non-root EBS disks as {(volume-id, device)}."""
     candidates = set()
     for link in glob.glob(os.path.join(cfg.deviceByIdDir, "nvme-Amazon_Elastic_Block_Store_vol*")):
         serial = re.fullmatch(r"nvme-Amazon_Elastic_Block_Store_vol([0-9a-f]{8,17})",
@@ -71,6 +67,15 @@ def provision_volume(cfg):
             raise Refused("volume_device_not_block", dev)
         if _device_number(st.st_rdev) not in roots:
             candidates.add(("vol-" + serial[1], dev))
+    return candidates
+
+
+def provision_volume(cfg):
+    """Resolve exactly one non-root EBS disk, then verify its EC2 attachment name."""
+    name = cfg.dataDeviceName
+    if not isinstance(name, str) or not re.fullmatch(r"/dev/[A-Za-z0-9]+", name):
+        raise Refused("data_device_name_invalid")
+    candidates = _ebs_candidates(cfg, _root_devices())
     if len(candidates) != 1:
         raise Refused("provision_volume_candidates",
                       f"expected one attached non-root EBS data volume; found {len(candidates)}")
@@ -92,8 +97,44 @@ def provision_volume(cfg):
     return volume_id
 
 
+def _volume_link(cfg, volume_id):
+    return os.path.join(cfg.deviceByIdDir, "nvme-Amazon_Elastic_Block_Store_" + volume_id.replace("-", ""))
+
+
+def _await_volume(cfg, attached):
+    """Bounded wait for the data volume. The lifecycle attaches it only once EC2 reports the
+    instance running (infra/app-computers/lib/lifecycle/helper.ts), so this host chain can
+    start first. Returns when `attached()` holds or the wait ends; the caller then resolves
+    (or refuses) exactly as without the wait."""
+    deadline = time.monotonic() + float(cfg.get("volumeWaitSeconds", 300))
+    interval = float(cfg.get("volumeWaitIntervalSeconds", 2))
+    while not attached() and time.monotonic() < deadline:
+        time.sleep(interval)
+
+
+def wait_provision_volume(cfg):
+    """`provision_volume`, after a bounded wait for any non-root EBS disk to attach."""
+    roots = _root_devices()
+    _await_volume(cfg, lambda: bool(_ebs_candidates(cfg, roots)))
+    return provision_volume(cfg)
+
+
+def wait_device_for_volume(cfg, volume_id):
+    """`device_for_volume`, after a bounded wait for the volume's by-id link."""
+    link = _volume_link(cfg, volume_id)
+
+    def attached():
+        try:
+            os.path.realpath(link, strict=True)
+            return True
+        except (OSError, TypeError):
+            return False
+    _await_volume(cfg, attached)
+    return device_for_volume(cfg, volume_id)
+
+
 def device_for_volume(cfg, volume_id):
-    link = os.path.join(cfg.deviceByIdDir, "nvme-Amazon_Elastic_Block_Store_" + volume_id.replace("-", ""))
+    link = _volume_link(cfg, volume_id)
     try:
         dev = os.path.realpath(link, strict=True)
     except (OSError, TypeError):
@@ -120,7 +161,7 @@ def mount_opts(path):
 
 
 def mount_data(cfg, lease, mode="ro"):
-    dev = device_for_volume(cfg, lease["volumeId"])
+    dev = wait_device_for_volume(cfg, lease["volumeId"])
     uuid = fs_uuid(dev)
     if uuid is None:
         if not lease.get("provision"):

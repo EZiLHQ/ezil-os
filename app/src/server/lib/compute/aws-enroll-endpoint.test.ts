@@ -29,6 +29,7 @@ import { readPlacement } from './placement';
 import * as placement from './placement';
 import { mintPreviewTokenV2 } from './preview-token-v2';
 import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
+import { verifyPreviewTokenV2 } from '../../../../../worker/src/hmac';
 
 const U1 = '11111111-1111-4111-8111-111111111111';
 const C1 = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1';
@@ -184,7 +185,7 @@ describe('a valid enrollment', () => {
     it('a second unexplained miss is bounded and is not reported as a consumed nonce', async () => {
         const s = setup();
         const consume = vi.spyOn(placement, 'consumeEnrollmentNonce').mockResolvedValue({ ok: false, reason: 'cas_conflict' });
-        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_conflict' } });
+        expect(await s.enroll()).toEqual({ status: 503, body: { error: 'enroll_conflict', retryable: true } });
         expect(consume).toHaveBeenCalledTimes(2);
         expect(s.placements[0]!.enroll_nonce_hash).toBe(nonceHashOf(NONCE));
         expect(s.tunnels).toEqual([]);
@@ -245,6 +246,8 @@ describe('every refusal changes nothing (nonce kept, no tunnel)', () => {
         ['instance of another namespace', [[booting()], { view: liveView({ tags: generationTags({ 'ezil:stage': 'other' }) }) }], hostBody(), 403, 'enroll_instance_mismatch'],
         ['no public address', [[booting()], { view: liveView({ publicIp: null }) }], hostBody(), 403, 'enroll_instance_mismatch'],
         ['data volume not attached', [[booting()], { view: liveView({ volumes: [] }) }], hostBody(), 403, 'enroll_volume_mismatch'],
+        ["instance still pending in EC2's view", [[booting()], { view: liveView({ state: 'pending' }) }], hostBody(), 403, 'enroll_instance_not_running'],
+        ['provision: data volume not visible yet', [[booting({ state: 'PROVISIONING', volume_id: null })], { view: liveView({ volumes: [] }) }], hostBody(), 403, 'enroll_volume_mismatch'],
         ['data volume marked delete-on-termination', [[booting()], { view: liveView({ volumes: [{ volumeId: 'vol-11111111111111111', deleteOnTermination: true, tags: generationTags() }] }) }], hostBody(), 403, 'enroll_volume_mismatch'],
         [
             'provision with two candidate data volumes',
@@ -253,10 +256,17 @@ describe('every refusal changes nothing (nonce kept, no tunnel)', () => {
         ],
     ];
 
-    it.each(cases)('%s → %i %s', async (_n, args, body, status, error) => {
+    // Nothing consumed AND it may clear on its own: the host keeps its nonce and retries
+    // (enroll.py). Every other refusal is final: the host wipes the nonce.
+    const RETRYABLE = new Set([
+        'flag off', 'no describe client', 'no tunnel client', 'no region certificate',
+        'data volume not attached', "instance still pending in EC2's view", 'provision: data volume not visible yet',
+    ]);
+
+    it.each(cases)('%s → %i %s', async (name, args, body, status, error) => {
         const { enroll, placements, tunnels, described } = setup(...args);
         const before = placements.map((r) => ({ ...r }));
-        expect(await enroll(body)).toEqual({ status, body: { error } });
+        expect(await enroll(body)).toEqual({ status, body: RETRYABLE.has(name) ? { error, retryable: true } : { error } });
         if (error === 'instance_mismatch') expect(described).toEqual([]);
         expect(placements).toEqual(before);
         expect(tunnels).toEqual([]);
@@ -287,14 +297,14 @@ describe('every refusal changes nothing (nonce kept, no tunnel)', () => {
 
     it.each([() => Buffer.alloc(16), () => { throw new Error('random'); }])('a broken random source leaves the nonce intact', async (randomBytes) => {
         const s = setup([booting()], { randomBytes });
-        expect(await s.enroll()).toEqual({ status: 500, body: { error: 'enroll_failed' } });
+        expect(await s.enroll()).toEqual({ status: 500, body: { error: 'enroll_failed', retryable: true } });
         expect(s.placements[0]!.enroll_nonce_hash).toBe(nonceHashOf(NONCE));
         expect(s.tunnels).toEqual([]);
     });
 
     it('a describe failure is 503 and changes nothing', async () => {
         const { enroll, placements } = setup([booting()], { describer: { describeForEnrollment: async () => { throw new Error('throttled'); } } });
-        expect(await enroll()).toEqual({ status: 503, body: { error: 'enroll_describe_unavailable' } });
+        expect(await enroll()).toEqual({ status: 503, body: { error: 'enroll_describe_unavailable', retryable: true } });
         expect(placements[0]).toMatchObject({ enroll_nonce_hash: nonceHashOf(NONCE) });
     });
 });
@@ -307,7 +317,7 @@ describe('the browser zone the host is told (EZIL_AWS_BROWSER_ZONE)', () => {
             if (zone === undefined) delete (e as Record<string, string>)[AWS_BROWSER_ZONE_ENV];
             else e[AWS_BROWSER_ZONE_ENV] = zone;
             const { enroll, placements, tunnels } = setup([booting()], { e });
-            expect(await enroll()).toEqual({ status: 503, body: { error: 'enroll_unavailable' } });
+            expect(await enroll()).toEqual({ status: 503, body: { error: 'enroll_unavailable', retryable: true } });
             expect(placements[0]).toMatchObject({ enroll_nonce_hash: nonceHashOf(NONCE), instance_id: null });
             expect(tunnels).toEqual([]);
         },
@@ -407,7 +417,7 @@ describe('createWorkerTunnelClient (GW-1 over HTTPS)', () => {
         expect(seen[0]!.init).toMatchObject({ method: 'POST', body: JSON.stringify(req), redirect: 'error' });
         const want = mintPreviewTokenV2(
             SECRET,
-            { ts: Math.floor(NOW.getTime() / 1000), sandboxId: req.sandboxId, computerId: C1, userId: U1, provider: 'aws-ec2', store: '', generation: 2, leaseEpoch: 3 },
+            { ts: NOW.getTime(), sandboxId: req.sandboxId, computerId: C1, userId: U1, provider: 'aws-ec2', store: '', generation: 2, leaseEpoch: 3 },
             { method: 'POST', path: TUNNELS_PATH, body: JSON.stringify(req) },
         );
         expect((seen[0]!.init.headers as Record<string, string>)['x-ezil-auth']).toBe(want);
@@ -420,6 +430,21 @@ describe('createWorkerTunnelClient (GW-1 over HTTPS)', () => {
     ])('%s is a failure', async (_n, response, want) => {
         const client = createWorkerTunnelClient({ workerUrl: 'https://w.example.test', secret: SECRET, fetch: (async () => response) as unknown as typeof fetch });
         expect(await client.createTunnel({ userId: U1 }, req)).toEqual(want);
+    });
+
+    // Codex 4275269636: the Worker compares claims.ts with Date.now() (ms). A seconds stamp is
+    // ~55 years "old" and every tunnel call was refused hmac_token_expired.
+    it.each(['POST', 'DELETE'] as const)('%s: the Worker\'s own verifier accepts the envelope at the same instant', async (method) => {
+        const seen: RequestInit[] = [];
+        const client = createWorkerTunnelClient({
+            workerUrl: 'https://w.example.test', secret: SECRET, now: () => NOW,
+            fetch: (async (_u: string, init: RequestInit) => (seen.push(init), new Response(JSON.stringify({ tunnelToken: TOKEN, deleted: true }), { status: 200 }))) as typeof fetch,
+        });
+        if (method === 'POST') await client.createTunnel({ userId: U1 }, req);
+        else await client.deleteTunnel({ userId: U1 }, { computerId: C1, sandboxId: req.sandboxId, generation: 2, leaseEpoch: 3 });
+        const headers = seen[0]!.headers as Record<string, string>;
+        const verdict = await verifyPreviewTokenV2(headers['x-ezil-auth'], SECRET, { method, path: TUNNELS_PATH, body: String(seen[0]!.body) }, NOW.getTime());
+        expect(verdict).toMatchObject({ ok: true, claims: { provider: 'aws-ec2', sandboxId: req.sandboxId, computerId: C1, userId: U1, generation: 2, leaseEpoch: 3 } });
     });
 
     it('DELETE carries only the fence fields', async () => {

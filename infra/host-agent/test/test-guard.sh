@@ -128,4 +128,16 @@ check "marker write order: fsync(tmp) -> rename(tmp, marker) -> fsync(data root)
     /fsync\(/ && index($0, "<" mp ">") && st==2 {st=3}
     END {exit st==3 ? 0 : 1}' "$T/strace.out"
 agent g data-down >/dev/null
+
+# --- the lifecycle attaches the data volume only once the instance runs (helper.ts): the
+#     guard waits for its by-id link, bounded (volumeWaitSeconds=4 here), instead of failing
+LINK="$H/byid/nvme-Amazon_Elastic_Block_Store_${VOL_ID//-/}"
+rm -f "$LINK"; lease 2 13 false
+( sleep 1; ln -sfn "$DEV" "$LINK" ) & ATT=$!
+check "volume attached ~1 s after the guard started: the guard waits for it and mounts it" agent g guard
+wait "$ATT"; agent g data-down >/dev/null
+rm -f "$LINK"; lease 2 14 false
+t0=$(date +%s); expect_refuse "volume never attached: refused when the bounded wait ends" volume_device_missing agent g guard; t1=$(date +%s)
+check "...after waiting, within the bound" bash -c "[ $((t1 - t0)) -ge 3 ] && [ $((t1 - t0)) -le 15 ]"
+ln -sfn "$DEV" "$LINK"
 summary "C-4 guard + fail-closed boot order"

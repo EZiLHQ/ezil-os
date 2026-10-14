@@ -82,6 +82,9 @@ assert '/var/lib/cloud/instances/*/obj.pkl' in c and '/run/cloud-init/instance-d
 pyunit() { (cd "$HA/test" && python3 -m unittest -q "$@"); }
 check "canary: default off, public console schema, persistence and lifecycle ordering" pyunit test_canary
 check "enroll: the app's browser-host binding (sandboxId, zone) lands in the lease; a malformed one stores nothing" pyunit test_enroll_routing
+check "enroll: the nonce is re-sent only after an answer that consumed nothing; bounded; kept when retrying ends" pyunit test_boot_retries.EnrollRetry
+check "guard: waits, bounded, for the late-attached data volume (wake link, provision disk)" pyunit test_boot_retries.VolumeWait
+check "lease: IMDS transport errors retried, bounded; HTTP refusals final" pyunit test_boot_retries.ImdsRetry
 check "history: env + read-only profile.d make an open terminal append each command (real pty bash)" pyunit test_history_stop.HistoryInjection
 check "history: a still-running command is saved when the terminal shell is hung up before the stop" pyunit test_history_stop.HangupBeforeStop
 check "hangup: a shell outside the container pid namespace is never signalled; membership read after the pidfd pin" pyunit test_history_stop.HangupScope

@@ -63,6 +63,8 @@ host_new() {
  "cloudflaredBin": "$H/stub/cloudflared", "containerId": "${TAG}-$h", "netnsName": "${TAG}-$h",
  "cgroupsPath": "system.slice:${TAG}:$h", "networkMode": "none",
  "idle": {"inactivitySeconds": 3, "load1Busy": 1000, "intervalSeconds": 1, "flushTimeoutSeconds": 20},
+ "enrollRetrySeconds": 3, "enrollRetryInitialSeconds": 0.2, "volumeWaitSeconds": 4, "volumeWaitIntervalSeconds": 0.2,
+ "imdsRetrySeconds": 2,
  "shutdownCmd": ["$HA/test/stub-shutdown", "$H/run/shutdown-called"], "stopWarnSeconds": 1,
  "userDataCopies": ["$H/cloud/user-data.txt", "$H/cloud/instances/*/user-data.txt", "$H/cloud/instances/*/user-data.txt.i",
                     "$H/cloud/instances/*/obj.pkl", "$H/cloud/run/instance-data-sensitive.json"]}

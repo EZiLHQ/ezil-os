@@ -80,6 +80,22 @@ def app(sock, d, cert, key):
             raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             with open(os.path.join(d, "enroll-requests.jsonl"), "ab") as f:
                 f.write(raw + b"\n")
+            # Answers that consumed nothing (the host keeps its nonce and retries, bounded):
+            # the app's `retryable: true`, and a platform 5xx page the app did not author.
+            if os.path.exists(os.path.join(d, "retry-always")):
+                return self._send(503, {"error": "enroll_describe_unavailable", "retryable": True})
+            for once, code, obj in (("retry-once", 503, {"error": "enroll_describe_unavailable", "retryable": True}),
+                                    ("platform-502-once", 502, None)):
+                if os.path.exists(os.path.join(d, once)):
+                    os.unlink(os.path.join(d, once))
+                    if obj is not None:
+                        return self._send(code, obj)
+                    page = b"<html><body>502 Bad Gateway</body></html>"
+                    self.send_response(code)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", str(len(page)))
+                    self.end_headers()
+                    return self.wfile.write(page)
             try:
                 b = json.loads(raw)
                 with open(os.path.join(d, "expect.json")) as f:
