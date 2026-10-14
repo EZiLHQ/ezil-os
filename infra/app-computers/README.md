@@ -53,13 +53,16 @@ The example files in `config/` hold public placeholders only.
 
 The file is `{ settings, authorityKeyArn, notificationsEnabled?, recoveryVersionArn?, recoveryEnabled? }`.
 `settings.deployment` is `LifecycleDeploymentSchema` (`lib/lifecycle/deployment.ts`). For the
-full shape, see `config/lifecycle.example.json`.
+full shape, see `config/lifecycle.example.json`. The app builds intents with a mirrored copy of
+this schema (`app/src/server/lib/compute/aws-intent.ts`). `test/app-intent-contract.test.ts`
+parses every app fixture with the real `parseLifecycleWork`, so a rule added here without the
+app copy fails that test.
 
 | Field | Rule |
 |---|---|
 | `region`, `zoneId` | same rules as the foundation; one ZoneId per lifecycle deployment |
 | `subnetId` | the foundation subnet for that ZoneId |
-| `instanceTypes` | a non-empty subset of the closed allowlist `{t3a.medium, t3.medium, m6i.large, c6i.xlarge}`. A deployment can narrow it, never extend it. To serve the free tier it must list `t3a.medium` (and `t3.medium` as the fallback). |
+| `instanceTypes` | a non-empty subset of the closed allowlist `{t3a.medium, t3.medium, m6i.large, c6i.xlarge}`. A deployment can narrow it, never extend it. To serve the free tier it must list `t3a.medium` (and `t3.medium` as the fallback); `config/lifecycle.example.json` lists both tiers' types plus the benchmark type. |
 | `storage.rootGiB` | root disk size (default 20) |
 | `storage.dataMinGiB`, `storage.dataMaxGiB` | allowed data-volume range (defaults 20 and 100) |
 | ARNs | must name the configured region and account |

@@ -11,6 +11,8 @@
       "amiId": "ami-00000000000000000",
       "namespace": "pilot",
       "instanceTypes": [
+        "t3a.medium",
+        "t3.medium",
         "m6i.large",
         "c6i.xlarge"
       ],
