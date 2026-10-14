@@ -108,7 +108,8 @@ export const PLACEMENT_TRANSITIONS: Readonly<Record<PlacementState, readonly Pla
     STOPPING: ['STOPPED', 'UNCONFIRMED'],
     UNCONFIRMED: ['RECOVERING'],
     RECOVERING: ['STOPPED', 'UNCONFIRMED'],
-    RETIRING: ['RETIRED', 'UNCONFIRMED'],
+    // RETIRING → STOPPED is the undo of a retire whose StartExecution was refused: nothing ran.
+    RETIRING: ['RETIRED', 'STOPPED', 'UNCONFIRMED'],
     RETIRED: ['PURGE_ELIGIBLE'],
     PURGE_ELIGIBLE: [],
     WARMING: ['READY', 'UNCONFIRMED'],
@@ -640,14 +641,86 @@ export async function transitionPlacement(
  */
 export async function transitionPlacementAsReconciler(
     db: PlacementDb,
-    input: { computerId: string; expected: CasExpectation & Partial<Pick<Placement, 'instanceId' | 'lastError'>>; to: PlacementState; fields?: PlacementFields },
+    input: {
+        computerId: string;
+        expected: CasExpectation & Partial<Pick<Placement, 'instanceId' | 'lastError'>>;
+        to: PlacementState;
+        fields?: PlacementFields;
+        /** Usage-ledger write tied to THIS transition: same transaction, only when the CAS won. */
+        usage?: UsageEffect;
+    },
 ): Promise<TransitionResult> {
     if (!PLACEMENT_TRANSITIONS[input.expected.state]?.includes(input.to)) return { ok: false, reason: 'illegal_transition' };
-    return db.transaction((tx) =>
-        casInTx(tx, input.computerId, input.expected, input.to, { generation: 0, leaseEpoch: 0 }, input.fields ?? {},
-            { instanceId: input.expected.instanceId, lastError: input.expected.lastError }),
-    );
+    return db.transaction(async (tx) => {
+        const r = await casInTx(tx, input.computerId, input.expected, input.to, { generation: 0, leaseEpoch: 0 }, input.fields ?? {},
+            { instanceId: input.expected.instanceId, lastError: input.expected.lastError });
+        if (r.ok && input.usage) await applyUsageInTx(tx, r.placement, input.usage);
+        return r;
+    });
 }
+
+// ── Usage ledger writes (R9) ─────────────────────────────────────────────
+
+/**
+ * What a confirmed lifecycle receipt means for the usage ledger. Written only by
+ * `transitionPlacementAsReconciler`, in the SAME transaction as the CAS that applied
+ * the receipt, so only the transition's winner writes and each run is recorded once.
+ *
+ * - `open`: the receipt confirmed this instance running. Any other open row of the
+ *   computer is closed first (a replaced instance is gone); a row already open for
+ *   this instance is kept, so re-applying is a no-op. `startedAt` is when the
+ *   lifecycle job started (its execution start), else the database clock.
+ * - `close`: the receipt confirmed the computer's instance stopped or retired.
+ *
+ * Egress is NOT measured: `egress_bytes` is always written NULL, so the egress caps
+ * do not bind yet (usage.ts). Only the hour caps are real.
+ */
+export type UsageEffect =
+    | { kind: 'open'; instanceId: string; instanceType: string; startedAt: Date | null; observedBy: string }
+    | { kind: 'close'; observedBy: string };
+
+async function applyUsageInTx(tx: PlacementExecutor, p: Placement, effect: UsageEffect): Promise<void> {
+    const computerId = canonicalId(p.computerId);
+    if (effect.kind === 'close') {
+        await tx.execute(sql`/* placement:usage-close */ UPDATE public.ezil_compute_usage
+            SET stopped_at = now(), observed_by = ${effect.observedBy}, updated_at = now()
+            WHERE computer_id = ${computerId}::uuid AND stopped_at IS NULL`);
+        return;
+    }
+    await tx.execute(sql`/* placement:usage-close-other */ UPDATE public.ezil_compute_usage
+        SET stopped_at = now(), observed_by = ${effect.observedBy}, updated_at = now()
+        WHERE computer_id = ${computerId}::uuid AND stopped_at IS NULL AND instance_id <> ${effect.instanceId}`);
+    await tx.execute(sql`/* placement:usage-open */ INSERT INTO public.ezil_compute_usage
+            (computer_id, user_id, instance_id, instance_type, started_at, stopped_at, egress_bytes, observed_by, updated_at)
+        SELECT ${computerId}::uuid, ${canonicalId(p.ownerUserId)}::uuid, ${effect.instanceId}, ${effect.instanceType},
+            COALESCE(${effect.startedAt ? effect.startedAt.toISOString() : null}::timestamptz, now()), NULL, NULL, ${effect.observedBy}, now()
+        WHERE NOT EXISTS (SELECT 1 FROM public.ezil_compute_usage
+            WHERE computer_id = ${computerId}::uuid AND instance_id = ${effect.instanceId} AND stopped_at IS NULL)`);
+}
+
+/**
+ * Reconciler input (aws-receipts.ts `reconcileAwsFleet`): aws-ec2 placements that may
+ * hold running capacity — RUNNING (a guest may have stopped its instance) and the
+ * states waiting on a lifecycle receipt. Oldest change first, bounded.
+ */
+export async function listAwsPlacementsToReconcile(db: PlacementExecutor, limit: number): Promise<{ computerId: string; ownerUserId: string }[]> {
+    const states = sql.join(RECONCILABLE_STATES.map((s) => sql`${s}`), sql`, `);
+    const rows = rowsOf(
+        await db.execute(sql`/* placement:reconcile-list */ SELECT computer_id::text AS computer_id, owner_user_id::text AS owner_user_id
+            FROM public.ezil_computer_placements
+            WHERE provider = 'aws-ec2' AND state IN (${states})
+            ORDER BY updated_at ASC
+            LIMIT ${Math.max(1, Math.min(Math.trunc(limit), 100))}`),
+    );
+    return rows.map((r) => {
+        const computerId = String(r.computer_id);
+        if (!UUID.test(computerId) || typeof r.owner_user_id !== 'string' || !UUID.test(r.owner_user_id)) throw new PlacementIntegrityError('invalid_row', computerId);
+        return { computerId, ownerUserId: r.owner_user_id };
+    });
+}
+
+/** States `listAwsPlacementsToReconcile` returns: RUNNING plus every state waiting on a receipt. */
+export const RECONCILABLE_STATES: readonly PlacementState[] = ['RUNNING', 'PROVISIONING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING', 'RETIRING'];
 
 /**
  * `STOPPED → LEASED`, reserving `lease_epoch + 1` (and `generation + 1` for a

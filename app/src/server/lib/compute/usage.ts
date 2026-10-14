@@ -8,8 +8,12 @@
  * - Egress: `egress_bytes` is one total per row with no time breakdown, so it
  *   cannot be clipped. A row's whole egress counts in EVERY month the row
  *   overlaps: a row spanning a boundary is over-counted, which is the safe
- *   direction for a cap. NULL (not yet observed) counts as 0 — an open item:
- *   the cap is only as fresh as the last observation.
+ *   direction for a cap.
+ * - 🔴 EGRESS IS NOT MEASURED YET. Nothing writes `egress_bytes` (the receipt
+ *   path always writes NULL, placement.ts `UsageEffect`), and NULL counts as 0,
+ *   so the egress caps are configured but NEVER bind. Only the hour caps are
+ *   enforced (rows are opened and closed by lifecycle receipts). Measuring egress
+ *   outside the guest is open work (docs/AWS-COMPUTERS.md C-2, §4).
  */
 
 import type { UsageRow } from './placement';

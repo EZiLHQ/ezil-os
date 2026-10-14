@@ -257,14 +257,15 @@ export function createSfnExecutionReader(sfnFor: (region: string) => RegionalCli
             const { client, account } = sfnFor(region);
             if (m[1] !== region) throw new AwsClientError('aws_config', false, 'ExecutionRegionMismatch');
             if (m[2] !== account) throw new AwsClientError('aws_config', false, 'ExecutionAccountMismatch');
-            let out: { status?: string; output?: string; error?: string; cause?: string };
+            let out: { status?: string; output?: string; error?: string; cause?: string; startDate?: Date };
             try {
                 out = (await client.send(new DescribeExecutionCommand({ executionArn }))) as typeof out;
             } catch (error) {
                 throw toAwsClientError(error);
             }
             if (typeof out.status !== 'string') throw new AwsClientError('aws_error', false, 'DescribeExecutionNoStatus');
-            return { status: out.status, output: out.output ?? null, error: out.error ?? null, cause: out.cause ?? null };
+            const startDate = out.startDate instanceof Date && Number.isFinite(out.startDate.getTime()) ? out.startDate : null;
+            return { status: out.status, output: out.output ?? null, error: out.error ?? null, cause: out.cause ?? null, startDate };
         },
     };
 }

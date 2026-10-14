@@ -176,9 +176,17 @@ describe('Step Functions starter', () => {
 });
 
 describe('Step Functions execution reader', () => {
+    it('passes the execution start through (it dates the usage row) and drops an invalid one', async () => {
+        const started = new Date('2026-10-14T05:00:00Z');
+        for (const [startDate, expected] of [[started, started], [new Date('nope'), null], ['2026-10-14', null]] as const) {
+            const sfn = fakeSender(async () => ({ status: 'SUCCEEDED', startDate }));
+            expect((await createSfnExecutionReader(regional(sfn)).describe(R, EXECUTION)).startDate).toEqual(expected);
+        }
+    });
+
     it('describes exactly the named execution and normalizes absent fields to null', async () => {
         const sfn = fakeSender(() => ({ status: 'SUCCEEDED', output: '{"ok":1}' }));
-        await expect(createSfnExecutionReader(regional(sfn)).describe(R, EXECUTION)).resolves.toEqual({ status: 'SUCCEEDED', output: '{"ok":1}', error: null, cause: null });
+        await expect(createSfnExecutionReader(regional(sfn)).describe(R, EXECUTION)).resolves.toEqual({ status: 'SUCCEEDED', output: '{"ok":1}', error: null, cause: null, startDate: null });
         expect(cmdName(sfn.calls[0])).toBe('DescribeExecutionCommand');
         expect(input(sfn.calls[0])).toEqual({ executionArn: EXECUTION });
     });

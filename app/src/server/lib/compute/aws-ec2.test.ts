@@ -58,8 +58,11 @@ function recordingStarter(fail = false) {
     return { starter, calls };
 }
 
-function setup(seed: Parameters<typeof createFakePlacementDb>[0] = {}, over: Partial<AwsProviderDeps> & { e?: Record<string, string>; tier?: AwsTier; failStart?: boolean } = {}) {
-    const fake = createFakePlacementDb({ computers: [{ id: C1, user_id: U1 }], ...seed });
+function setup(
+    seed: Parameters<typeof createFakePlacementDb>[0] = {},
+    over: Partial<AwsProviderDeps> & { e?: Record<string, string>; tier?: AwsTier; failStart?: boolean; dbClock?: () => Date } = {},
+) {
+    const fake = createFakePlacementDb({ computers: [{ id: C1, user_id: U1 }], ...seed }, over.dbClock ? { clock: over.dbClock } : {});
     const rec = recordingStarter(over.failStart);
     const provider = createAwsEc2Provider({
         db: fake.db,
@@ -69,6 +72,9 @@ function setup(seed: Parameters<typeof createFakePlacementDb>[0] = {}, over: Par
         starter: 'starter' in over ? over.starter : rec.starter,
         tierFor: 'tierFor' in over ? over.tierFor : async () => over.tier ?? 'free',
         randomBytes: over.randomBytes ?? (() => Buffer.from(NONCE_BYTES)),
+        ...(over.executions ? { executions: over.executions } : {}),
+        ...(over.describer ? { describer: over.describer } : {}),
+        ...(over.tunnels ? { tunnels: over.tunnels } : {}),
     });
     return { ...fake, ...rec, provider };
 }
@@ -463,10 +469,150 @@ describe('stop and status', () => {
         }
     });
 
-    it('activity, restart and terminate refuse explicitly (host-side presence; retire lands with retention)', async () => {
+    it('activity and restart refuse explicitly (host-side presence)', async () => {
         const { provider } = setup({ placements: [stopped()] });
         expect(await provider.activity(ctx, { userId: U1, computerId: C1 }, { lastInputAgoMs: 0 })).toEqual({ ok: false, error: 'aws_not_supported' });
         expect(await provider.restart(ctx, { userId: U1, computerId: C1 })).toMatchObject({ ok: false, error: 'aws_not_supported' });
-        expect(await provider.terminate(ctx, { userId: U1, computerId: C1 })).toMatchObject({ ok: false, terminated: false });
+    });
+});
+
+/** A Step Functions reader whose answer the test sets; receipts are built from the job the provider started. */
+function scriptedExecutions() {
+    let answer: { status: string; output?: string | null; startDate?: Date | null } = { status: 'RUNNING' };
+    const executions: NonNullable<AwsProviderDeps['executions']> = { describe: async () => answer };
+    const succeed = (call: { intent: LifecycleIntent; digest: string }, state: 'running' | 'stopped' | 'retired', startDate: Date | null = null) => {
+        answer = {
+            status: 'SUCCEEDED', startDate,
+            output: JSON.stringify({
+                schemaVersion: 1, jobId: call.intent.jobId, digest: call.digest, computerId: call.intent.computerId, generation: call.intent.targetGeneration,
+                leaseEpoch: call.intent.leaseEpoch, fenceToken: call.intent.fenceToken, instanceId: call.intent.providerInstanceId, volumeId: call.intent.dataVolumeId, state,
+            }),
+        };
+    };
+    return { executions, succeed };
+}
+
+describe('Codex #3: computer.delete retires an AWS computer before it is soft-deleted', () => {
+    const me = { userId: U1, computerId: C1 };
+
+    it('no placement (never provisioned): ok at once, nothing written or started', async () => {
+        const { provider, placements, calls } = setup();
+        expect(await provider.terminate(ctx, me)).toEqual({ ok: true, terminated: true, outcome: 'no_placement' });
+        expect(placements).toEqual([]);
+        expect(calls).toEqual([]);
+    });
+
+    it('STOPPED → RETIRING with a retire intent of the current generation (volume kept); not ok until the receipt', async () => {
+        const { provider, placements, calls } = setup({ placements: [stopped({ lease_epoch: 4 })] });
+        expect(await provider.terminate(ctx, me)).toEqual({ ok: false, terminated: false, outcome: 'retiring' });
+        expect(calls).toHaveLength(1);
+        expect(calls[0]!.intent).toMatchObject({
+            operation: 'retire', providerInstanceId: 'i-11111111111111111', dataVolumeId: 'vol-11111111111111111', fenceToken: FENCE, leaseEpoch: 4,
+            targetGeneration: 1, userData: null, dataVolumeGiB: null,
+        });
+        expect(placements[0]).toMatchObject({ state: 'RETIRING', lifecycle_job_id: calls[0]!.intent.jobId, lifecycle_digest: calls[0]!.digest });
+    });
+
+    it('the retired receipt lands RETIRED and only then is the delete ok', async () => {
+        const { executions, succeed } = scriptedExecutions();
+        const { provider, placements, calls } = setup({ placements: [stopped({ lease_epoch: 4 })] }, { executions });
+        expect(await provider.terminate(ctx, me)).toMatchObject({ ok: false, outcome: 'retiring' });
+        expect(await provider.terminate(ctx, me)).toMatchObject({ ok: false, outcome: 'retiring' }); // execution still running
+        succeed(calls[0]!, 'retired');
+        expect(await provider.terminate(ctx, me)).toEqual({ ok: true, terminated: true, outcome: 'retired' });
+        expect(placements[0]).toMatchObject({ state: 'RETIRED', lifecycle_job_id: null, volume_id: 'vol-11111111111111111' });
+        expect(calls).toHaveLength(1);
+    });
+
+    it('a RUNNING computer is stopped first, never retired while it runs', async () => {
+        const { provider, placements, calls } = setup({ placements: [stopped({ state: 'RUNNING', lease_epoch: 4 })] });
+        expect(await provider.terminate(ctx, me)).toEqual({ ok: false, terminated: false, outcome: 'stopping' });
+        expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
+        expect(placements[0]).toMatchObject({ state: 'STOPPING' });
+    });
+
+    it('a refused retire StartExecution goes back to STOPPED (nothing ran)', async () => {
+        const { provider, placements } = setup({ placements: [stopped({ lease_epoch: 2 })] }, { failStart: true });
+        expect(await provider.terminate(ctx, me)).toMatchObject({ ok: false, outcome: 'aws_lifecycle_start_failed' });
+        expect(placements[0]).toMatchObject({ state: 'STOPPED' });
+    });
+
+    it.each([
+        ['UNCONFIRMED', 'computer_recovering'], ['RECOVERING', 'computer_recovering'], ['STARTING', 'computer_starting'], ['STOPPING', 'stopping'],
+    ] as const)('%s refuses the delete with %s and starts nothing', async (state, outcome) => {
+        const { provider, calls } = setup({ placements: [stopped({ state })] });
+        expect(await provider.terminate(ctx, me)).toEqual({ ok: false, terminated: false, outcome });
+        expect(calls).toEqual([]);
+    });
+
+    it("another user's placement is not retired (NOT_FOUND upstream)", async () => {
+        const { provider, calls } = setup({ placements: [stopped({ owner_user_id: U2 })] });
+        await expect(provider.terminate(ctx, me)).rejects.toBeInstanceOf(PlacementOwnerError);
+        expect(calls).toEqual([]);
+    });
+});
+
+describe('Codex #6: a guest-initiated idle stop is reconciled into the placement', () => {
+    const me = { userId: U1, computerId: C1 };
+    const describerSaying = (state: string | 'throw' | null) => {
+        const asked: string[] = [];
+        const describer: NonNullable<AwsProviderDeps['describer']> = {
+            async describeForEnrollment(region, instanceId) {
+                asked.push(`${region} ${instanceId}`);
+                if (state === 'throw') throw new Error('throttled');
+                return state === null ? null : ({ instanceId, state } as never);
+            },
+        };
+        return { describer, asked };
+    };
+
+    it.each(['stopped', 'stopping'])('status: RUNNING but EC2 says %s → the ordinary stop runs through the lifecycle', async (ec2) => {
+        const { describer, asked } = describerSaying(ec2);
+        const { provider, placements, calls } = setup({ placements: [stopped({ state: 'RUNNING', lease_epoch: 4 })] }, { describer });
+        expect(await provider.status(ctx, me)).toMatchObject({ state: 'stopping', placementState: 'STOPPING' });
+        expect(asked).toEqual(['ap-south-1 i-11111111111111111']);
+        expect(calls).toHaveLength(1);
+        expect(calls[0]!.intent).toMatchObject({ operation: 'stop', providerInstanceId: 'i-11111111111111111', fenceToken: FENCE, leaseEpoch: 4 });
+        expect(placements[0]).toMatchObject({ state: 'STOPPING', lifecycle_job_id: calls[0]!.intent.jobId });
+    });
+
+    it('…and its stopped receipt lands STOPPED, after which an open wakes it', async () => {
+        const { describer } = describerSaying('stopped');
+        const { executions, succeed } = scriptedExecutions();
+        const { provider, placements, calls } = setup({ placements: [stopped({ state: 'RUNNING', lease_epoch: 4 })] }, { describer, executions });
+        await provider.status(ctx, me);
+        succeed(calls[0]!, 'stopped');
+        expect(await provider.status(ctx, me)).toMatchObject({ state: 'stopped', placementState: 'STOPPED' });
+        expect(placements[0]).toMatchObject({ state: 'STOPPED', lifecycle_job_id: null });
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ ok: false, errorCode: 'computer_starting', retryable: true });
+        expect(calls.map((c) => c.intent.operation)).toEqual(['stop', 'replace']);
+    });
+
+    it('ensure on an idle-stopped RUNNING row answers "stopping" (the shell keeps waking), never ok', async () => {
+        const { describer } = describerSaying('stopped');
+        const { provider, calls } = setup({ placements: [stopped({ state: 'RUNNING', lease_epoch: 2 })] }, { describer });
+        expect(await provider.ensure(ctx, me, opts)).toEqual({ ok: false, error: 'computer_stopping', errorCode: 'computer_stopping', retryable: true });
+        expect(calls.map((c) => c.intent.operation)).toEqual(['stop']);
+    });
+
+    it.each([['running'], ['pending'], ['throw'], [null]] as const)('EC2 says %s → nothing changes', async (ec2) => {
+        const { describer } = describerSaying(ec2);
+        const { provider, placements, calls } = setup({ placements: [stopped({ state: 'RUNNING' })] }, { describer });
+        expect(await provider.ensure(ctx, me, opts)).toEqual({ ok: true });
+        expect(calls).toEqual([]);
+        expect(placements[0]).toMatchObject({ state: 'RUNNING' });
+    });
+
+    it('a capacity refusal settles the fleet: another user\'s idle-stopped row is stopped, freeing its slot', async () => {
+        const C2 = 'c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2';
+        const { describer, asked } = describerSaying('stopped');
+        const { provider, placements, calls } = setup(
+            { placements: [stopped({ computer_id: C2, owner_user_id: U2, state: 'RUNNING', lease_epoch: 2 })], computers: [{ id: C1, user_id: U1 }, { id: C2, user_id: U2 }] },
+            { describer, e: env({ AWS_MAX_RUNNING: '1' }) },
+        );
+        expect(await provider.ensure(ctx, me, opts)).toMatchObject({ ok: false, errorCode: 'capacity_unavailable' });
+        expect(asked).toEqual(['ap-south-1 i-11111111111111111']);
+        expect(calls.map((c) => [c.intent.operation, c.intent.computerId])).toEqual([['stop', C2]]);
+        expect(placements.find((r) => r.computer_id === C2)).toMatchObject({ state: 'STOPPING', owner_user_id: U2 });
     });
 });

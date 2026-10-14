@@ -38,9 +38,10 @@ import {
     type AwsWakeMode,
     type Env,
 } from './aws-config';
-import { buildEnrollmentUserData, EnrollmentUserDataError, issueEnrollmentNonce, type TunnelClient } from './aws-enroll';
+import { buildEnrollmentUserData, EnrollmentUserDataError, issueEnrollmentNonce, type Ec2EnrollmentDescriber, type TunnelClient } from './aws-enroll';
 import {
     buildLifecycleWork,
+    currentGenerationIntent,
     LifecycleIntentInvalidError,
     readLifecycleDeployments,
     type LifecycleDeployment,
@@ -49,8 +50,8 @@ import {
     type LifecycleWork,
 } from './aws-intent';
 import { ENROLLMENT_FAILED, PlacementOwnerError, readPlacement, transitionPlacement, type Placement, type PlacementDb, type PlacementState } from './placement';
-import { applyLifecycleReceipt, type LifecycleExecutionReader } from './aws-receipts';
-import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult } from './provider';
+import { applyLifecycleReceipt, reconcileAwsFleet, reconcileGuestStop, type LifecycleExecutionReader } from './aws-receipts';
+import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult, TerminateResult } from './provider';
 
 export const AWS_DISABLED = 'aws_disabled';
 
@@ -118,6 +119,11 @@ export interface AwsProviderDeps {
     executions?: LifecycleExecutionReader;
     /** GW-1, to fence (delete) a stopped generation's tunnel. */
     tunnels?: TunnelClient;
+    /**
+     * Read-only EC2 describe (the enrollment describer). Catches a guest-initiated idle
+     * stop (R9), which no lifecycle job reports. Without it such a stop is never seen.
+     */
+    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'>;
     /** Lease length on a wake. */
     leaseSeconds?: number;
 }
@@ -175,36 +181,13 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         return record;
     };
 
-    /**
-     * A start or stop of the placement's CURRENT generation. Its fence token is the
-     * one that generation's instance and volume are tagged with (`fenceToken`):
-     * the helper refuses any other (`lifecycle_volume_invalid`), so it is never
-     * re-minted here.
-     */
+    /** A start, stop or retire of the placement's CURRENT generation (`currentGenerationIntent`). */
     const sameGenerationIntent = (
         p: Placement,
-        operation: Extract<LifecycleOperation, 'start' | 'stop'>,
+        operation: Extract<LifecycleOperation, 'start' | 'stop' | 'retire'>,
         deployment: LifecycleDeployment,
         extra: { userData: string | null; leaseEpoch: number },
-    ): LifecycleIntent => ({
-        schemaVersion: 1,
-        jobId: newId(),
-        computerId: p.computerId.toLowerCase(),
-        revision: 1,
-        operation,
-        targetGeneration: p.generation,
-        fenceToken: p.fenceToken!,
-        providerInstanceId: p.instanceId,
-        dataVolumeId: p.volumeId,
-        previousGeneration: null,
-        previousInstanceId: null,
-        previousFenceToken: null,
-        deployment,
-        instanceType: p.instanceType ?? '',
-        dataVolumeGiB: null,
-        leaseEpoch: extra.leaseEpoch,
-        userData: extra.userData,
-    });
+    ): LifecycleIntent => currentGenerationIntent(p, operation, deployment, { jobId: newId(), ...extra });
 
     /**
      * Wake by REPLACE (C-3): a new instance of the placement's type boots on the
@@ -260,6 +243,76 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
     const refusal = (reason: string): EnsureResult =>
         (CAPACITY_REFUSALS as readonly string[]).includes(reason) ? notReady('capacity_unavailable', false, reason) : notReady(reason);
 
+    const reconcileDeps = () => ({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels, describer: deps.describer, starter: deps.starter, newId });
+
+    /**
+     * The caller's own placement, settled: its current receipt applied, then a
+     * guest-initiated idle stop caught (aws-receipts.ts). Returns it re-read.
+     */
+    const reconcileOwn = async (c: ComputerRef, p: Placement, deployments: Record<string, LifecycleDeployment>): Promise<Placement> => {
+        const deployment = deployments[p.region ?? ''];
+        if (!deployment || p.provider !== 'aws-ec2') return p;
+        await applyLifecycleReceipt(reconcileDeps(), p, deployment);
+        let fresh = (await ownPlacement(c)) ?? p;
+        if (await reconcileGuestStop(reconcileDeps(), fresh, deployment)) fresh = (await ownPlacement(c)) ?? fresh;
+        return fresh;
+    };
+
+    /** A capacity refusal may be idle-stopped rows still counted as running: settle the fleet, then refuse. */
+    const capacityRefusal = async (reason: string, deployments: Record<string, LifecycleDeployment>): Promise<EnsureResult> => {
+        if ((CAPACITY_REFUSALS as readonly string[]).includes(reason)) await reconcileAwsFleet(reconcileDeps(), deployments);
+        return refusal(reason);
+    };
+
+    /** Stop the caller's RUNNING placement through the lifecycle. Not confirmed until its receipt marks it STOPPED. */
+    const startStop = async (c: ComputerRef, p: Placement, deployment: LifecycleDeployment): Promise<StopResult> => {
+        if (!p.instanceId || !p.volumeId || !p.fenceToken) return { ok: false, terminated: false, outcome: 'aws_placement_incomplete', error: 'aws_placement_incomplete' };
+        let work: LifecycleWork;
+        try {
+            work = buildLifecycleWork(sameGenerationIntent(p, 'stop', deployment, { userData: null, leaseEpoch: p.leaseEpoch }));
+        } catch (error) {
+            if (!(error instanceof LifecycleIntentInvalidError)) throw error;
+            return { ok: false, terminated: false, outcome: 'aws_intent_invalid', error: 'aws_intent_invalid' };
+        }
+        // The stop's job and digest are recorded by the same compare-and-swap that starts draining.
+        const draining = await transitionPlacement(deps.db, {
+            computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'DRAINING',
+            fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
+        });
+        if (!draining.ok) return { ok: false, terminated: false, outcome: 'cas_conflict' };
+        const d = draining.placement;
+        const r = await launch(c.userId, d, work, 'UNCONFIRMED');
+        if (r !== 'started') return { ok: false, terminated: false, outcome: r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed' };
+        await transitionPlacement(deps.db, { computerId: d.computerId, ownerUserId: c.userId, expected: d, to: 'STOPPING' });
+        return { ok: false, terminated: false, outcome: 'stopping' };
+    };
+
+    /**
+     * Retire a STOPPED placement (§6, R11): the lifecycle terminates its instance and
+     * keeps the data volume for the retention window. Not confirmed until its receipt
+     * marks it RETIRED. A refused StartExecution puts it back to STOPPED.
+     */
+    const startRetire = async (c: ComputerRef, p: Placement, deployment: LifecycleDeployment): Promise<TerminateResult> => {
+        if (!p.instanceId || !p.volumeId || !p.fenceToken || !p.instanceType) {
+            return { ok: false, terminated: false, outcome: 'aws_placement_incomplete', error: 'aws_placement_incomplete' };
+        }
+        let work: LifecycleWork;
+        try {
+            work = buildLifecycleWork(sameGenerationIntent(p, 'retire', deployment, { userData: null, leaseEpoch: p.leaseEpoch }));
+        } catch (error) {
+            if (!(error instanceof LifecycleIntentInvalidError)) throw error;
+            return { ok: false, terminated: false, outcome: 'aws_intent_invalid', error: 'aws_intent_invalid' };
+        }
+        const retiring = await transitionPlacement(deps.db, {
+            computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'RETIRING',
+            fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
+        });
+        if (!retiring.ok) return { ok: false, terminated: false, outcome: 'cas_conflict' };
+        const r = await launch(c.userId, retiring.placement, work, 'STOPPED');
+        if (r !== 'started') return { ok: false, terminated: false, outcome: r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed' };
+        return { ok: false, terminated: false, outcome: 'retiring' };
+    };
+
     return {
         kind: 'aws-ec2',
 
@@ -268,7 +321,9 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             if (!cfg.ok) return notReady(cfg.code);
             // Refuse before any write when a later step could not run.
             if (!deps.starter) return notReady('aws_lifecycle_unconfigured');
-            const placement = await ownPlacement(c);
+            const found = await ownPlacement(c);
+            // Settle an existing placement first: a receipt may have landed, or its host idle-stopped itself.
+            const placement = found && found.provider === 'aws-ec2' ? await reconcileOwn(c, found, cfg.deployments) : found;
 
             if (!placement) {
                 if (!deps.tierFor) return notReady('aws_tier_unavailable');
@@ -325,7 +380,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     if (error instanceof LifecycleIntentInvalidError || error instanceof EnrollmentUserDataError) return notReady('aws_intent_invalid');
                     throw error;
                 }
-                if (!admitted.admitted) return refusal(admitted.reason);
+                if (!admitted.admitted) return capacityRefusal(admitted.reason, cfg.deployments);
                 const p = admitted.placement;
                 // The row must be exactly what the intent was built for (generation 1, epoch 1).
                 if (!work || p.generation !== 1 || p.leaseEpoch !== work.intent.leaseEpoch || p.lifecycleJobId !== work.intent.jobId) {
@@ -398,7 +453,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                         },
                         { env: cfg.e, now },
                     );
-                    if (!leased.admitted) return leased.reason === 'cas_conflict' ? notReady('computer_starting', true) : refusal(leased.reason);
+                    if (!leased.admitted) return leased.reason === 'cas_conflict' ? notReady('computer_starting', true) : capacityRefusal(leased.reason, cfg.deployments);
                     const p = leased.placement;
                     // A replace cannot be undone by compare-and-swap (the generation already moved):
                     // a refused StartExecution leaves it for recovery (UNCONFIRMED). A start-in-place
@@ -427,11 +482,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             if (!cfg.ok) return { ok: false, error: cfg.code };
             let p = await ownPlacement(c);
             if (!p || p.provider !== 'aws-ec2') return { ok: false, error: 'aws_placement_missing' };
-            const deployment = cfg.deployments[p.region ?? ''];
-            if (deployment) {
-                await applyLifecycleReceipt({ db: deps.db, executions: deps.executions, tunnels: deps.tunnels }, p, deployment);
-                p = (await ownPlacement(c)) ?? p;
-            }
+            p = await reconcileOwn(c, p, cfg.deployments);
             const state = AWS_STATE_FOR[p.state];
             return { ok: state !== 'error', ...(state === 'error' ? { error: `placement_${p.state.toLowerCase()}` } : {}), state, placementState: p.state, region: p.region };
         },
@@ -444,35 +495,41 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
             if (!p || p.provider !== 'aws-ec2') return { ok: false, terminated: false, outcome: 'aws_placement_missing', error: 'aws_placement_missing' };
             if (p.state === 'STOPPED') return { ok: true, terminated: false, outcome: 'already_stopped' };
             if (p.state !== 'RUNNING') return { ok: false, terminated: false, outcome: `placement_${p.state.toLowerCase()}` };
-            if (!p.instanceId || !p.volumeId || !p.fenceToken) return { ok: false, terminated: false, outcome: 'aws_placement_incomplete', error: 'aws_placement_incomplete' };
             const deployment = cfg.deployments[p.region ?? ''];
             if (!deployment) return { ok: false, terminated: false, outcome: 'region_not_configured', error: 'region_not_configured' };
-            let work: LifecycleWork;
-            try {
-                work = buildLifecycleWork(sameGenerationIntent(p, 'stop', deployment, { userData: null, leaseEpoch: p.leaseEpoch }));
-            } catch (error) {
-                if (!(error instanceof LifecycleIntentInvalidError)) throw error;
-                return { ok: false, terminated: false, outcome: 'aws_intent_invalid', error: 'aws_intent_invalid' };
-            }
-            // The stop's job and digest are recorded by the same compare-and-swap that starts draining.
-            const draining = await transitionPlacement(deps.db, {
-                computerId: p.computerId, ownerUserId: c.userId, expected: p, to: 'DRAINING',
-                fields: { lifecycleJobId: work.intent.jobId, lifecycleDigest: work.digest, lastError: null },
-            });
-            if (!draining.ok) return { ok: false, terminated: false, outcome: 'cas_conflict' };
-            const d = draining.placement;
-            const r = await launch(c.userId, d, work, 'UNCONFIRMED');
-            if (r !== 'started') return { ok: false, terminated: false, outcome: r === 'invalid' ? 'aws_intent_invalid' : 'aws_lifecycle_start_failed' };
-            await transitionPlacement(deps.db, { computerId: d.computerId, ownerUserId: c.userId, expected: d, to: 'STOPPING' });
-            // Not confirmed until the execution's receipt marks the placement STOPPED.
-            return { ok: false, terminated: false, outcome: 'stopping' };
+            return startStop(c, p, deployment);
         },
 
         // Presence on AWS is reported by the host agent through the tunnel (P5); the
         // reaper never stops an AWS computer (the host idle-stops itself).
         activity: async () => ({ ok: false, error: 'aws_not_supported' }),
         restart: async () => ({ ok: false, outcome: 'aws_not_supported', error: 'aws_not_supported' }),
-        // Retire keeps the volume (§6); it lands with the retire intent and the retention flow.
-        terminate: async () => ({ ok: false, terminated: false, outcome: 'aws_not_supported', error: 'aws_not_supported' }),
+        /**
+         * computer.delete (§6, R11). ok only once nothing can still run: no placement
+         * (never provisioned), or the placement RETIRED (instance terminated, volume
+         * kept for the retention window). A RUNNING computer is stopped first, a STOPPED
+         * one retired; every other state answers not-ready and the delete is refused,
+         * so a computer is never soft-deleted while its instance can still run.
+         */
+        async terminate(_ctx, c): Promise<TerminateResult> {
+            const cfg = configured();
+            if (!cfg.ok) return { ok: false, terminated: false, outcome: cfg.code, error: cfg.code };
+            const found = await ownPlacement(c);
+            if (!found) return { ok: true, terminated: true, outcome: 'no_placement' };
+            if (found.provider !== 'aws-ec2') return { ok: false, terminated: false, outcome: 'provider_mismatch', error: 'provider_mismatch' };
+            const p = await reconcileOwn(c, found, cfg.deployments);
+            if (p.state === 'RETIRED' || p.state === 'PURGE_ELIGIBLE') return { ok: true, terminated: true, outcome: 'retired' };
+            if (p.state === 'RUNNING' || p.state === 'STOPPED') {
+                if (!deps.starter) return { ok: false, terminated: false, outcome: 'aws_lifecycle_unconfigured', error: 'aws_lifecycle_unconfigured' };
+                const deployment = cfg.deployments[p.region ?? ''];
+                if (!deployment) return { ok: false, terminated: false, outcome: 'region_not_configured', error: 'region_not_configured' };
+                return p.state === 'RUNNING' ? startStop(c, p, deployment) : startRetire(c, p, deployment);
+            }
+            const state = AWS_STATE_FOR[p.state];
+            if (p.state === 'RETIRING') return { ok: false, terminated: false, outcome: 'retiring' };
+            if (state === 'starting') return { ok: false, terminated: false, outcome: 'computer_starting' };
+            if (state === 'stopping') return { ok: false, terminated: false, outcome: 'stopping' };
+            return { ok: false, terminated: false, outcome: p.state === 'RECOVERING' || p.state === 'UNCONFIRMED' ? 'computer_recovering' : 'computer_unavailable' };
+        },
     };
 }

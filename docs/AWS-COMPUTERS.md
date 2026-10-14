@@ -123,8 +123,13 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 - **Single writer includes reconcilers.** The EC2 state-change reconciler and the usage
   observer write only through the placement module (`app/src/server/lib/compute/placement.ts`).
   A test fails if any other file names these tables.
-- **Usage windows.** Each usage row covers one observation window. Egress is attributed per
-  row, and a new row starts at each month boundary, so monthly egress needs no clipping.
+- **Usage windows.** One row per instance run. A confirmed `running` receipt opens it, in the same
+  transaction as the placement transition, dated from the lifecycle job's start (the safe direction for a
+  cap); a confirmed `stopped` or `retired` receipt closes it. A replace closes the old instance's open row.
+  Hours are clipped to the month in `usage.ts`.
+- **Egress is not measured yet.** No writer fills `egress_bytes` (it is always NULL), so the monthly egress
+  caps do not bind: they are configured and validated, but every egress total is 0. Only the hour caps are
+  enforced. The out-of-guest measurement (CloudWatch `NetworkOut`) is open work.
 - **Registration.** The SQL is kept as `docs/aws-computers/sql/*.sql.txt` until the founder
   rehearses it and registers it in the migration manifest with observed digests. An
   unregistered `.sql` file anywhere in the repository fails `validate`.
@@ -135,7 +140,16 @@ ALTER TABLE public.ezil_compute_usage ENABLE ROW LEVEL SECURITY;
 - First boot: `PROVISIONING → RUNNING`. The infra provision launches and boots the instance, so the user's first open
   goes straight in, and the receipt lands RUNNING. `PROVISIONING → STOPPED` stays for a provision that ends stopped.
 - Failure path: `UNCONFIRMED → RECOVERING → STOPPED`.
-- Retirement: `RETIRING → RETIRED → PURGE_ELIGIBLE`. The purge itself is a separate operator action (§6).
+- Retirement: `STOPPED → RETIRING → RETIRED → PURGE_ELIGIBLE`. `computer.delete` drives it: a RUNNING computer is
+  stopped first, a STOPPED one gets the lifecycle `retire` job (instance terminated, data volume kept), and the
+  delete is refused until the receipt lands RETIRED. A computer with no placement deletes at once. A refused
+  retire `StartExecution` goes back to STOPPED. The purge itself is a separate operator action (§6).
+- Guest-initiated idle stop (R9): the host stops its own instance with no lifecycle job. `status`, `ensure` and
+  `terminate` read the instance's EC2 state (the app caller's region-scoped `DescribeInstances`); a RUNNING row
+  whose instance is stopping or stopped gets the ORDINARY lifecycle `stop`, which the helper confirms at once, so
+  the receipt path fences the tunnel, closes the usage row and lands STOPPED. A capacity refusal runs the same
+  check across the fleet (`reconcileAwsFleet`, bounded), so idle-stopped rows cannot exhaust running capacity.
+  The EC2 observation never writes STOPPED itself.
 - Stage B slots: `WARMING → READY → CLAIMED → terminated`.
 
 **Lifecycle authority (app)**
@@ -394,7 +408,7 @@ volume as hostile input.
 | Region deployments | `EZIL_AWS_LIFECYCLE_DEPLOYMENTS`: JSON keyed by region, each the lifecycle stack's deployment record (`stateMachineVersionArn` pinned to a version). A configured region without one disables AWS |
 | Computers per user | 1 |
 | Instance-hours | monthly aggregate cap, including idle running and pool hours; per-user cap |
-| Egress | monthly GB caps per user and aggregate, measured outside the guest (CloudWatch `NetworkOut`) |
+| Egress | monthly GB caps per user and aggregate, to be measured outside the guest (CloudWatch `NetworkOut`). **Not enforced yet:** nothing writes `egress_bytes`, so these caps never bind (C-2) |
 | Storage | volume size allowlist; growth capped |
 | Cap configuration | `EZIL_AWS_{USER,GLOBAL}_MONTHLY_HOURS`, `EZIL_AWS_{USER,GLOBAL}_MONTHLY_EGRESS_GB`; strict integers, no defaults, malformed or absent disables admission. Pilot: global hours 600 |
 | Kill switch | `EZIL_AWS_KILL_SWITCH=1`: admission off → recovery workflow disabled → graceful stop of every instance → deny-start policy attached; no volume deleted |

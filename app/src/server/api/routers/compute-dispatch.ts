@@ -45,11 +45,15 @@ export type RoutedComputer =
  * `ensure`/`stop` refuse BEFORE any write (`aws_lifecycle_unconfigured`) —
  * never Cloudflare. This is the ONE place the routers get them from.
  */
-export function defaultAwsCollaborators(env: Env = process.env): Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels'> {
+export function defaultAwsCollaborators(env: Env = process.env): Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer'> {
     if (!isAwsComputersEnabled(env)) return {};
-    const { starter, executions } = sharedAwsSdkCollaborators(env);
+    const { starter, executions, describer } = sharedAwsSdkCollaborators(env);
     const tunnels = workerTunnelClientFromEnv(env) ?? undefined;
-    return { ...(starter ? { starter } : {}), ...(executions ? { executions } : {}), ...(tunnels ? { tunnels } : {}) };
+    return {
+        ...(starter ? { starter } : {}), ...(executions ? { executions } : {}), ...(tunnels ? { tunnels } : {}),
+        // The read-only EC2 describe that catches a guest-initiated idle stop (R9).
+        ...(describer ? { describer } : {}),
+    };
 }
 
 export interface RouteOptions {
@@ -57,7 +61,7 @@ export interface RouteOptions {
     /** Where a user's paid entitlement is read from. None in this app today → every AWS computer is `free`. */
     entitlements?: EntitlementReader;
     /** Overrides `defaultAwsCollaborators(env)` (tests). */
-    aws?: Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'randomBytes' | 'now' | 'newId' | 'leaseSeconds'>;
+    aws?: Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer' | 'randomBytes' | 'now' | 'newId' | 'leaseSeconds'>;
 }
 
 /** The AWS provider deps the routers supply: the collaborators plus the tier source. */
